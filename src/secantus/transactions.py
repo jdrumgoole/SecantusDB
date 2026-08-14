@@ -45,6 +45,7 @@ its (retryable) commit on different pooled connections.
 from __future__ import annotations
 
 import contextlib
+import copy
 import enum
 import threading
 import time
@@ -53,6 +54,37 @@ from typing import Any
 
 # mongod default is transactionLifetimeLimitSeconds=60.
 DEFAULT_LIFETIME_SECONDS = 60.0
+
+# How long a retryable-write record is kept. mongod expires these with the
+# same 30-minute sweep it uses for transaction records; a driver that retries
+# later than this re-executes, which is exactly mongod's behaviour too.
+_RETRYABLE_RECORD_LIFETIME_SECONDS = 30 * 60.0
+
+# Backstop on record count so a client minting unbounded sessions cannot grow
+# the map without limit. Oldest-first eviction.
+_RETRYABLE_RECORD_MAX = 10_000
+
+
+def _is_recordable_reply(reply: dict[str, Any]) -> bool:
+    """Whether ``reply`` represents a write that fully took effect.
+
+    Only those are replayable. A failed or partially-failed write must
+    re-execute on retry: caching an error would make a transient failure
+    permanent, and caching a partial batch would report missing documents as
+    written.
+    """
+    if not isinstance(reply, dict):
+        return False
+    try:
+        if float(reply.get("ok", 0)) != 1.0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    # A writeConcernError means the write applied but replication of it did
+    # not confirm. mongod still records the statement — the retry must not
+    # apply it twice — so this is deliberately NOT a disqualifier.
+    return not reply.get("writeErrors")
+
 
 TRANSIENT_LABEL = "TransientTransactionError"
 
@@ -174,6 +206,12 @@ class TransactionRegistry:
         # Newest txnNumber ever seen per session (transactions and
         # retryable writes share the per-session sequence).
         self._last_number: dict[bytes, int] = {}
+        # Retryable-write records: (lsid_bytes, txnNumber) -> (reply, stored_at).
+        # mongod keeps the equivalent in ``config.transactions`` so a driver's
+        # automatic retry gets the ORIGINAL reply instead of re-applying the
+        # write. Without it a retried ``{$inc: {n: 1}}`` increments twice while
+        # both replies claim ``nModified: 1`` — silent corruption.
+        self._retryable: dict[tuple[bytes, int], tuple[dict[str, Any], float, bytes]] = {}
         self._lock = threading.Lock()
         self._commit = commit_func or (lambda txn: None)
         self._rollback = rollback_func or (lambda txn: None)
@@ -299,6 +337,73 @@ class TransactionRegistry:
             last = self._last_number.get(lsid_bytes, 0)
             if txn_number > last:
                 self._last_number[lsid_bytes] = txn_number
+
+    # -- retryable-write records -----------------------------------------
+
+    def retryable_reply(
+        self, lsid_bytes: bytes, txn_number: int, identity: bytes
+    ) -> dict[str, Any] | None:
+        """The stored reply for an already-executed retryable write, if any.
+
+        A driver retries with the SAME ``lsid`` + ``txnNumber`` after a network
+        blip, a ``writeConcernError``, or a stepdown. mongod recognises the
+        repeat and replays its stored reply rather than executing the write a
+        second time; returning ``None`` here means "not seen before, run it".
+
+        ``identity`` must match the recorded command too. A retry re-sends a
+        byte-identical command, so a mismatch means the key was reused for a
+        DIFFERENT write — and replaying one command's reply for another would
+        be worse than the double-apply this exists to prevent. On a mismatch
+        we execute normally rather than serve the wrong answer.
+        """
+        with self._lock:
+            self._prune_retryable_locked()
+            entry = self._retryable.get((lsid_bytes, txn_number))
+            if entry is None or entry[2] != identity:
+                return None
+            return copy.deepcopy(entry[0])
+
+    def record_retryable(
+        self, lsid_bytes: bytes, txn_number: int, identity: bytes, reply: dict[str, Any]
+    ) -> None:
+        """Store ``reply`` as the outcome of this retryable write.
+
+        Only *successful* writes are recorded. A write that failed did not
+        take effect, so its retry must genuinely re-execute — caching the
+        failure would turn a transient error into a permanent one. Partial
+        batch failures (``writeErrors`` present) are likewise not recorded:
+        mongod tracks per-statement ids and would retry only the missing
+        documents, which we do not model, so the whole batch re-runs exactly
+        as it does today rather than being wrongly reported as complete.
+        """
+        if not _is_recordable_reply(reply):
+            return
+        with self._lock:
+            self._retryable[(lsid_bytes, txn_number)] = (
+                copy.deepcopy(reply),
+                self._time(),
+                identity,
+            )
+            self._prune_retryable_locked()
+
+    def _prune_retryable_locked(self) -> None:
+        """Drop records past their lifetime, and cap total size.
+
+        Called on every lookup / record, so an idle server sheds them without
+        a background sweeper — the same opportunistic pattern the oplog and
+        TTL pruning use. The cap is a backstop against a client that never
+        stops minting sessions.
+        """
+        now = self._time()
+        cutoff = now - _RETRYABLE_RECORD_LIFETIME_SECONDS
+        stale = [k for k, (_r, at, _i) in self._retryable.items() if at < cutoff]
+        for k in stale:
+            self._retryable.pop(k, None)
+        excess = len(self._retryable) - _RETRYABLE_RECORD_MAX
+        if excess > 0:
+            oldest = sorted(self._retryable.items(), key=lambda kv: kv[1][1])[:excess]
+            for k, _v in oldest:
+                self._retryable.pop(k, None)
 
     # -- bulk lifecycle --------------------------------------------------
 

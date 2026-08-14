@@ -305,8 +305,8 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **DATA CORRUPTION: retryable writes are not idempotent — a retried write
-  is APPLIED TWICE, silently, on BOTH servers.** Found 2026-08-13 while
+- [~] **DATA CORRUPTION: retryable writes were not idempotent — FIXED on the
+  PYTHON server; the RUST server is still affected.** Found 2026-08-13 while
   triaging the C gauge's `/command_monitoring/unified/writeConcernError`.
 
   mongod persists the outcome of every retryable write keyed by
@@ -348,8 +348,38 @@ These are explicit non-goals. Don't add them without a reason.
   others would be worse than the current honest-but-wrong behaviour, because
   it would look fixed.
 
-  Until it lands, the C gauge's `writeConcernError` test stays red on both
-  servers: it retries an insert and expects the retry to be recognised.
+  **Status (2026-08-13).** The Python server now keeps the record: dispatch
+  looks up `(lsid, txnNumber)` plus a digest of the command body before
+  executing a retryable write, replays the stored reply on a match, and
+  records the outcome on the way out (`TransactionRegistry.retryable_reply` /
+  `record_retryable`). Verified over the wire: a retried `$inc` now leaves 1,
+  a retried insert no longer self-collides with `E11000`, and a retried
+  `$push` appends once.
+
+  Three deliberate limits, none of which make it *look* fixed while being
+  broken:
+
+  * **Only fully-successful writes are recorded.** A failed or partially-failed
+    write (`writeErrors` present) is not, so its retry genuinely re-executes —
+    caching a failure would make a transient error permanent. A
+    `writeConcernError` IS recorded: the write applied, only its replication
+    did not confirm, so a retry must not apply it twice.
+  * **No per-statement-id granularity.** mongod records each statement in a
+    batch, so a partially-applied `insert` batch retries only the missing
+    documents. We record whole-command outcomes, so a partially-failed batch
+    re-runs entirely — exactly as it does today, not worse.
+  * **The command identity is part of the key.** If the same
+    `(lsid, txnNumber)` is presented with a *different* command we execute
+    rather than replay, because serving one write's reply for another would be
+    worse than the double-apply this prevents. (Found the hard way: pymongo
+    OVERRIDES an explicit `lsid` on `db.command()` with its own implicit
+    session, so hand-built probes collide on one session.)
+
+  **Still open: the Rust server has the same bug**, reproduced identically
+  (`final stored value: 2` where mongod gives 1). Porting it means the same
+  record keyed on `(lsid, txnNumber, identity)` in the Rust command dispatch.
+  Until that lands the two servers disagree, and the C gauge's
+  `writeConcernError` test stays red against the Rust server.
 
 - [ ] **`invoke concurrency-refresh` needs a genuinely quiet box AND a spread
   audit before its output is trusted.** Two consecutive refresh runs
