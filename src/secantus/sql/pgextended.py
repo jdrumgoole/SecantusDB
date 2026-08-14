@@ -43,6 +43,14 @@ class Prepared:
     # reports both (psycopg's prepared-statement cache matches on the text).
     query: str = ""
     created: Any = None
+    # The result shape (name, oid) captured at this statement's first
+    # execution — PG's "cached plan" identity. A later execution whose shape
+    # differs (DDL changed the table under a SELECT *) raises `cached plan
+    # must not change result type` (0A000) until the client re-prepares,
+    # exactly like PG. The ErrorResponse carries ROUTINE=RevalidateCachedQuery
+    # because pgjdbc's transparent re-prepare-and-retry (willHealViaReparse)
+    # matches on that field, not the SQLSTATE.
+    plan_shape: list[tuple[str, int]] | None = None
 
 
 @dataclass
@@ -1239,6 +1247,22 @@ class ExtendedSession:
             return pgwire.empty_query_response()
         if not portal.executed:
             bound = self._bound(portal)
+            # PG's cached-plan revalidation happens at PLANNING time — before
+            # any side effect. A data-modifying CTE (`WITH x AS (INSERT …)
+            # SELECT *`) whose result shape changed must raise WITHOUT running
+            # the INSERT (pgjdbc's AutoRollback WITH_INSERT_SELECT matrix
+            # counts the rows). Shape via the read-only describe path.
+            prep_ = portal.prepared
+            if prep_.name and prep_.plan_shape is not None:
+                pre_cols = self._describe_columns(bound)
+                if pre_cols:
+                    pre_shape = [(c.name, c.pg_oid) for c in pre_cols]
+                    if pre_shape != prep_.plan_shape:
+                        raise errors.SQLError(
+                            "0A000",
+                            "cached plan must not change result type",
+                            diag={"R": "RevalidateCachedQuery"},
+                        )
             # pg_stat_activity (#137): mark this backend active with its query for
             # the duration of execution; it stays as the last query when idle.
             sess = self.session
@@ -1251,6 +1275,13 @@ class ExtendedSession:
                 )
             finally:
                 sess.state = "idle"
+            # First execution captures the plan identity (see
+            # Prepared.plan_shape); later executions are checked BEFORE
+            # running, above. Named statements only: PG re-plans unnamed
+            # statements per Bind and never raises this for them.
+            res_cols = getattr(portal.result, "columns", None)
+            if prep_.name and res_cols and prep_.plan_shape is None:
+                prep_.plan_shape = [(c.name, c.pg_oid) for c in res_cols]
             portal.executed = True
             portal.offset = 0
         res = portal.result

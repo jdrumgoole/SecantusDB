@@ -288,3 +288,63 @@ def test_extended_protocol_with_more_than_32767_params(client):
     pd = next(m for m in msgs if m.type == "t")
     assert pgwire.parse_parameter_description(pd.payload) == [25] * n
     assert rows(msgs) == [[b"tail"]]
+
+
+# --------------------------------------------------------------------------- #
+# Cached-plan revalidation (PG's "cached plan must not change result type")
+# --------------------------------------------------------------------------- #
+
+
+def test_named_statement_shape_change_raises_0a000(server):
+    psycopg = pytest.importorskip("psycopg")
+    host, port = server.address
+    with psycopg.connect(
+        host=host, port=port, dbname="db", user="joe", autocommit=True, prepare_threshold=0
+    ) as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE cp (a int)")
+        cur.execute("INSERT INTO cp VALUES (1)")
+        cur.execute("SELECT * FROM cp", prepare=True)
+        assert cur.fetchall() == [(1,)]
+        cur.execute("ALTER TABLE cp ADD COLUMN b int")
+        with pytest.raises(psycopg.errors.FeatureNotSupported) as e:
+            cur.execute("SELECT * FROM cp", prepare=True)
+        # pgjdbc's transparent re-prepare matches on the ROUTINE field, not
+        # the SQLSTATE — it must be present and spelled exactly.
+        assert e.value.diag.source_function == "RevalidateCachedQuery"
+        assert "cached plan must not change result type" in str(e.value)
+
+
+def test_unnamed_statement_replans_silently(server):
+    psycopg = pytest.importorskip("psycopg")
+    host, port = server.address
+    with psycopg.connect(host=host, port=port, dbname="db", user="joe", autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE cp2 (a int)")
+        cur.execute("INSERT INTO cp2 VALUES (1)")
+        # prepare=False → the unnamed statement: PG re-plans per Bind and
+        # never raises the cached-plan error.
+        cur.execute("SELECT * FROM cp2", prepare=False)
+        cur.execute("ALTER TABLE cp2 ADD COLUMN b int")
+        cur.execute("SELECT * FROM cp2", prepare=False)
+        assert cur.fetchall() == [(1, None)]
+
+
+def test_revalidation_raises_before_cte_side_effects(server):
+    psycopg = pytest.importorskip("psycopg")
+    host, port = server.address
+    with psycopg.connect(
+        host=host, port=port, dbname="db", user="joe", autocommit=True, prepare_threshold=0
+    ) as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE cp3 (a int)")
+        cur.execute("INSERT INTO cp3 VALUES (1)")
+        sql = "WITH ins AS (INSERT INTO cp3 (a) VALUES (%s) RETURNING a) SELECT * FROM cp3"
+        cur.execute(sql, (99,), prepare=True)
+        cur.execute("ALTER TABLE cp3 ADD COLUMN b int")
+        with pytest.raises(psycopg.errors.FeatureNotSupported):
+            cur.execute(sql, (100,), prepare=True)
+        # The revalidation happens at planning time — the CTE's INSERT must
+        # NOT have run (PG parity; pgjdbc's AutoRollback matrix counts rows).
+        cur.execute("SELECT count(*) FROM cp3")
+        assert cur.fetchall() == [(2,)]
