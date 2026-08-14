@@ -276,6 +276,9 @@ pub trait Storage: Send + Sync {
         _let_vars: &Document,
         _collation: Option<&Collation>,
         _validator: Option<&Document>,
+        // `validationLevel: "moderate"` — exempt docs that ALREADY failed the
+        // validator from update-time validation (inserts stay validated).
+        _validator_moderate: bool,
         _want_post_image: bool,
     ) -> Result<UpdateOutcome, StorageError> {
         self.update_matching(db, coll, filter, update, multi, upsert)
@@ -299,6 +302,9 @@ pub trait Storage: Send + Sync {
         _let_vars: &Document,
         _collation: Option<&Collation>,
         _validator: Option<&Document>,
+        // `validationLevel: "moderate"` — exempt docs that ALREADY failed the
+        // validator from update-time validation (inserts stay validated).
+        _validator_moderate: bool,
         _want_post_image: bool,
     ) -> Result<UpdateOutcome, StorageError> {
         Err(StorageError::WriteError {

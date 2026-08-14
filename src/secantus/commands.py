@@ -488,7 +488,25 @@ def _active_validator(opts: Mapping[str, Any], *, bypass: bool = False) -> dict[
     action = opts.get("validationAction", "error")
     if action in ("warn", "off"):
         return None
+    # ``validationLevel: "off"`` disables validation entirely, whatever the
+    # action says — mongod checks the level first. Previously the level was
+    # stored by ``create`` / ``collMod`` and then never consulted, so a
+    # collection explicitly opted OUT of validation still had it enforced.
+    if opts.get("validationLevel") == "off":
+        return None
     return validator
+
+
+def _validation_is_moderate(opts: Mapping[str, Any]) -> bool:
+    """Whether ``validationLevel: "moderate"`` is in force.
+
+    Under ``moderate`` mongod applies the validator to inserts and to updates
+    of documents that ALREADY satisfy it, but exempts documents that were
+    already invalid when the validator was introduced — the level exists so a
+    validator can be added to a collection with legacy rows without freezing
+    them. ``strict`` (the default) validates every write.
+    """
+    return opts.get("validationLevel") == "moderate"
 
 
 def _validate_doc_against_collection(
@@ -2495,6 +2513,7 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 let=let,
                 collation=spec.get("collation"),
                 validator=validator_spec if validator_active else None,
+                validator_moderate=_validation_is_moderate(coll_opts_for_validation),
                 journal=_wants_journal(doc),
             )
         except DocumentValidationError as exc:

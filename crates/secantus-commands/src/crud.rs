@@ -273,7 +273,12 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .get_collection_options(&db, &coll)
             .map_err(command_error)?;
         let action = opts.get_str("validationAction").unwrap_or("error");
-        if action == "warn" || action == "off" {
+        // `validationLevel: "off"` disables validation entirely, whatever the
+        // action says — mongod checks the level first. The level was stored by
+        // `create` / `collMod` and then never consulted, so a collection
+        // explicitly opted OUT of validation still had it enforced.
+        let level_off = opts.get_str("validationLevel").unwrap_or("strict") == "off";
+        if level_off || action == "warn" || action == "off" {
             None
         } else {
             opts.get("validator").and_then(Bson::as_document).cloned()
@@ -617,12 +622,24 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         None
     } else {
         let action = opts.get_str("validationAction").unwrap_or("error");
-        if action == "warn" || action == "off" {
+        // `validationLevel: "off"` disables validation entirely, whatever the
+        // action says — mongod checks the level first. The level was stored by
+        // `create` / `collMod` and then never consulted, so a collection
+        // explicitly opted OUT of validation still had it enforced.
+        let level_off = opts.get_str("validationLevel").unwrap_or("strict") == "off";
+        if level_off || action == "warn" || action == "off" {
             None
         } else {
             opts.get("validator").and_then(Bson::as_document).cloned()
         }
     };
+    // `validationLevel: "moderate"` applies the validator to inserts and to
+    // updates of documents that ALREADY satisfy it, but exempts documents that
+    // were already invalid when the validator was introduced — the level exists
+    // so a validator can be added to a collection with legacy rows without
+    // freezing them.
+    let validator_moderate = opts.get_str("validationLevel").unwrap_or("strict") == "moderate";
+
     // mongod 7.0 restricts updates on a timeseries collection to the metaField
     // only. `ts_meta` is `Some(metaField)` for a timeseries collection (an empty
     // string when no metaField is declared — then nothing is updatable).
@@ -723,6 +740,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 &let_vars,
                 collation.as_ref(),
                 validator.as_ref(),
+                validator_moderate,
                 false,
             )
         } else {
@@ -746,6 +764,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 &let_vars,
                 collation.as_ref(),
                 validator.as_ref(),
+                validator_moderate,
                 false,
             )
         };

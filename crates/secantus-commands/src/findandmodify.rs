@@ -107,17 +107,25 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     // raw-command callers.
     let bypass = bool_field(doc, "bypassDocumentValidation", false)
         || bool_field(doc, "bypass_document_validation", false);
+    let val_opts = storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .map_err(command_error)?;
+    // `validationLevel: "moderate"` exempts documents that ALREADY failed the
+    // validator from update-time validation; `"off"` disables it entirely.
+    // Both were stored by `create` / `collMod` and then never consulted here.
+    let validator_moderate = val_opts.get_str("validationLevel").unwrap_or("strict") == "moderate";
     let validator = if bypass {
         None
     } else {
-        let opts = storage
-            .get_collection_options(&ctx.db_name, &coll)
-            .map_err(command_error)?;
-        let action = opts.get_str("validationAction").unwrap_or("error");
-        if action == "warn" || action == "off" {
+        let action = val_opts.get_str("validationAction").unwrap_or("error");
+        let level_off = val_opts.get_str("validationLevel").unwrap_or("strict") == "off";
+        if level_off || action == "warn" || action == "off" {
             None
         } else {
-            opts.get("validator").and_then(Bson::as_document).cloned()
+            val_opts
+                .get("validator")
+                .and_then(Bson::as_document)
+                .cloned()
         }
     };
 
@@ -182,6 +190,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                         &let_vars,
                         collation.as_ref(),
                         validator.as_ref(),
+                        validator_moderate,
                         return_new,
                     )
                 } else {
@@ -200,6 +209,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                         &let_vars,
                         collation.as_ref(),
                         validator.as_ref(),
+                        validator_moderate,
                         return_new,
                     )
                 } {
@@ -307,6 +317,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                 &let_vars,
                 collation.as_ref(),
                 validator.as_ref(),
+                validator_moderate,
                 return_new,
             )
         } else {
@@ -325,6 +336,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                 &let_vars,
                 collation.as_ref(),
                 validator.as_ref(),
+                validator_moderate,
                 return_new,
             )
         };
