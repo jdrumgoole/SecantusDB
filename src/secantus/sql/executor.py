@@ -11,7 +11,6 @@ from __future__ import annotations
 import contextlib
 import functools
 import operator
-import os
 import threading
 import weakref
 from typing import Any
@@ -2070,12 +2069,6 @@ def _execute_update_materialized(
     # test_sync_commit_serializes_with_bare_statements). Inside a snapshot
     # transaction the mid-window commit surfaces as a write conflict and the
     # statement retries from a fresh read.
-    # TEMPORARY (remove before merge): SECANTUS_STRADDLE_TXN=0 disables the
-    # snapshot-transaction wrap so the CI pair-sampler can catch the pre-fix
-    # loss in the wild — the in-vivo confirmation that this mechanism is the
-    # one the CI lanes were hitting.
-    if os.environ.get("SECANTUS_STRADDLE_TXN", "1") == "0":
-        return _execute_update_materialized_body(plan, storage, db, catalog, session)
     if session is not None and getattr(session, "txn_handle", None) is None:
         from secantus.storage import WriteConflictError, _is_wt_rollback
 

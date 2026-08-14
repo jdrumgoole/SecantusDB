@@ -5663,7 +5663,15 @@ distinct problems, triaged from the run logs:
   subprocess, then opens the restored dir with the Python `Storage` in the
   worker. Next occurrence: capture per-worker RSS + the worker's pid before
   death, and check whether the restore subprocess or the WT open is the
-  killer. Until then: 1-in-3, unreproduced.
+  killer. Until then: 1-in-3, unreproduced. **Second occurrence
+  2026-08-14 ~22:43 local:** TWO workers (gw0, gw2) died "Not properly
+  terminated" at ~99% of a local full run (branch ungate-pipeline-txn,
+  runtime code identical to a green run 90 min earlier), again no .ips
+  (the only segfault report in the window is the intentional nested
+  test_boom), machine at load ~6-9 with a parallel CI-watch session; the
+  post-crash-overrun watchdog killed the stalled controller 1200s later.
+  No jetsam/kernel kill in `log show`. Still SIGKILL-shaped and
+  unattributed; the RSS/pid capture plan stands.
 - [ ] **Residual straddle window: generated-column / expression-index
   recompute in the non-materialized UPDATE path.** Same shape as the
   resolved lost-update straddle but narrower surface: `execute_update`'s
@@ -5694,9 +5702,17 @@ distinct problems, triaged from the run logs:
   it. Lessons kept from the hunt: sequential A/B rounds were worthless
   (every "conviction"/"exoneration" flipped with the sampling window); only
   the paired same-runner sampler (scripts/race_pair_sampler.py, kept) and
-  finally the deterministic gated-find harness settled it. Both racing
-  tests keep their instrumented asserts (per-worker rowcounts +
-  pgextended.COUNTERS deltas). Residual oddity, not a bug: CI psycopg sent
+  finally the deterministic gated-find harness settled it. **In-vivo
+  confirmation (2026-08-14, PR #865 round 2):** with a temporary
+  `SECANTUS_STRADDLE_TXN=0` gate re-opening the race and the pair-sampler
+  A/B-ing fix-on vs fix-off on all 20 CI lanes, a Windows lane caught the
+  loss fix-OFF (1/6, n=39, the exact mixed-mode signature: 20 implicit
+  txns opened, every statement reporting UPDATE 1) while fix-ON on the
+  same runner scored 0/6 — and fix-ON never lost across 168 paired
+  samples. The gate and the sampler workflow steps were then removed;
+  the sampler script stays for reuse. Both racing tests keep their
+  instrumented asserts (per-worker rowcounts + pgextended.COUNTERS
+  deltas). Residual oddity, not a bug: CI psycopg sent
   360/400 parameterless statements via the extended protocol while local
   psycopg sends them all via simple 'Q' — environment-dependent protocol
   selection is why CI hit the mixed-mode window and local stress never did.
