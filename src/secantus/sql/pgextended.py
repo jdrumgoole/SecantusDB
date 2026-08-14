@@ -1031,11 +1031,11 @@ class ExtendedSession:
     def __init__(self, storage: Any, session: Session) -> None:
         self.storage = storage
         self.session = session
-        # Set by the server loop: whether another Execute is already
-        # buffered before the next Sync (multi-statement pipeline).
-        self.peek_more_pipelined = lambda: False
-        # Statements executed inside the current implicit transaction.
+        # Statements executed inside the current implicit transaction, and
+        # the last one's bound AST (the Sync-time commit retry re-runs it
+        # when a single-statement pipeline loses a commit race).
         self._implicit_stmts = 0
+        self._last_implicit_bound = None
         self.catalog = Catalog(storage)
         self.prepared: dict[str, Prepared] = {}
         self.portals: dict[str, Portal] = {}
@@ -1252,20 +1252,45 @@ class ExtendedSession:
         session = self.session
         if session.txn_handle is None or not session.txn_is_implicit:
             return
-        try:
-            if session.txn_failed:
-                engine._rollback_txn(self.storage, session)
-            else:
-                engine._commit_txn(self.storage, self.session.database, self.catalog, session)
-        except errors.SQLError:
-            # The pipeline's effects are lost — that must be an ERROR the
-            # client sees (silently swallowing one lost a committed-looking
-            # increment on the Windows lane), so re-raise after clearing the
-            # transaction state; Sync's caller turns it into an ErrorResponse
-            # ahead of ReadyForQuery.
-            with contextlib.suppress(Exception):
-                engine._rollback_txn(self.storage, session)
-            raise
+        while True:
+            try:
+                if session.txn_failed:
+                    engine._rollback_txn(self.storage, session)
+                else:
+                    engine._commit_txn(self.storage, self.session.database, self.catalog, session)
+                return
+            except errors.SQLError as exc:
+                # A commit-time serialization loss on a SINGLE-statement
+                # pipeline (plain autocommit traffic) re-runs the statement in
+                # a fresh implicit transaction — the already-sent
+                # CommandComplete becomes true, exactly like the internal
+                # retry the per-statement path used to do. Only write
+                # statements can lose a commit race, so re-running never
+                # changes rows a client already received.
+                if (
+                    exc.sqlstate == "40001"
+                    and self._implicit_stmts == 1
+                    and self._last_implicit_bound is not None
+                ):
+                    with contextlib.suppress(Exception):
+                        engine._rollback_txn(self.storage, session)
+                    session.txn_handle = self.storage.begin_user_transaction()
+                    session.txn_failed = False
+                    session.txn_is_implicit = True
+                    engine.run_statement(
+                        self.storage,
+                        self.session.database,
+                        self._last_implicit_bound,
+                        session,
+                        self.catalog,
+                    )
+                    continue
+                # A multi-statement pipeline's effects are gone — the client
+                # must see the ERROR (silently swallowing one lost a
+                # committed-looking increment on the Windows lane).
+                with contextlib.suppress(Exception):
+                    engine._rollback_txn(self.storage, session)
+                raise
 
     def _describe(self, payload: bytes) -> bytes:
         kind, name = pgwire.parse_describe(payload)
@@ -1382,33 +1407,7 @@ class ExtendedSession:
                 sess.state = "idle"
             if self.session.txn_is_implicit:
                 self._implicit_stmts += 1
-                # A single-statement pipeline (nothing further buffered before
-                # the Sync) commits HERE, where the statement can still be
-                # re-run if the commit itself loses a write-write race — the
-                # result bytes haven't been sent yet, so the retry is
-                # invisible. Multi-statement pipelines stay open for Sync.
-                if self._implicit_stmts == 1 and not self.peek_more_pipelined():
-                    while True:
-                        try:
-                            engine._commit_txn(
-                                self.storage, self.session.database, self.catalog, self.session
-                            )
-                            break
-                        except errors.SQLError as exc:
-                            if exc.sqlstate != "40001":
-                                raise
-                            with contextlib.suppress(Exception):
-                                engine._rollback_txn(self.storage, self.session)
-                            self.session.txn_handle = self.storage.begin_user_transaction()
-                            self.session.txn_failed = False
-                            self.session.txn_is_implicit = True
-                            portal.result = engine.run_statement(
-                                self.storage,
-                                self.session.database,
-                                bound,
-                                self.session,
-                                self.catalog,
-                            )
+                self._last_implicit_bound = bound
             # First execution captures the plan identity (see
             # Prepared.plan_shape); later executions are checked BEFORE
             # running, above. Named statements only: PG re-plans unnamed
