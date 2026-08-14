@@ -1134,6 +1134,34 @@ fn run_with_txn_envelope(
     if name == "commitTransaction" || name == "abortTransaction" {
         return run_handler(handler, doc, ctx);
     }
+    // A transaction's concerns are fixed when it starts: `readConcern` may ride
+    // only the FIRST statement, and `writeConcern` belongs on commit/abort,
+    // never on a statement. mongod rejects both with InvalidOptions (72); we
+    // accepted and silently ignored them, so a caller could believe a statement
+    // ran at a concern it did not. Drivers guard this client-side (the
+    // transactions spec marks these `isClientError: true`), so no gauge covers
+    // it — it matters for raw-command callers. Messages are mongod's verbatim,
+    // from the spec corpus the drivers vendor.
+    if doc.get("writeConcern").is_some() {
+        return CommandError::new(
+            72,
+            "InvalidOptions",
+            "Cannot set write concern after starting a transaction",
+        )
+        .into_reply();
+    }
+    let starting = matches!(
+        doc.get("startTransaction"),
+        Some(Bson::Boolean(true)) | Some(Bson::Int32(1)) | Some(Bson::Int64(1))
+    );
+    if !starting && doc.get("readConcern").is_some() {
+        return CommandError::new(
+            72,
+            "InvalidOptions",
+            "Cannot set read concern after starting a transaction",
+        )
+        .into_reply();
+    }
     let start = matches!(
         doc.get("startTransaction"),
         Some(Bson::Boolean(true)) | Some(Bson::Int32(1)) | Some(Bson::Int64(1))

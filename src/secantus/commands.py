@@ -859,6 +859,45 @@ def _refresh_sessions(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any
     return {"ok": 1.0}
 
 
+def _reject_in_txn_concerns(doc: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Reject per-operation read/write concerns on an in-transaction statement.
+
+    A transaction's concerns are fixed when it starts: ``readConcern`` may ride
+    only the FIRST statement (the one carrying ``startTransaction: true``), and
+    ``writeConcern`` belongs on ``commitTransaction`` / ``abortTransaction``,
+    never on a statement. mongod rejects both with ``InvalidOptions`` (72); we
+    accepted and silently ignored them, so a caller could believe a statement
+    ran at a concern it did not.
+
+    Drivers guard this client-side — the transactions spec marks these cases
+    ``isClientError: true`` — so no driver gauge exercises it. It matters for
+    anyone issuing raw commands, which is exactly the audience that cannot
+    tell us apart from mongod any other way.
+
+    Messages are mongod's verbatim, taken from the transactions spec corpus
+    the drivers vendor (``client-bulkWrite.json``).
+    """
+    if doc.get("writeConcern") is not None:
+        return {
+            "ok": 0.0,
+            "errmsg": "Cannot set write concern after starting a transaction",
+            "code": 72,
+            "codeName": "InvalidOptions",
+        }
+    # ``readConcern`` is legal on the statement that STARTS the transaction —
+    # that is how a transaction's read concern is chosen at all — so only a
+    # continuing statement is rejected.
+    starting = doc.get("startTransaction") in (True, 1)
+    if not starting and doc.get("readConcern") is not None:
+        return {
+            "ok": 0.0,
+            "errmsg": "Cannot set read concern after starting a transaction",
+            "code": 72,
+            "codeName": "InvalidOptions",
+        }
+    return None
+
+
 def _txn_envelope(doc: dict[str, Any]) -> tuple[bytes | None, int | None]:
     """Extract ``(lsid_bytes, txnNumber)`` from a command's transaction
     envelope; either is None when absent or malformed."""
@@ -6926,6 +6965,9 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         if lsid_bytes is not None and txn_number is not None:
             if doc.get("autocommit") is False:
                 if name not in ("commitTransaction", "abortTransaction"):
+                    concern_err = _reject_in_txn_concerns(doc)
+                    if concern_err is not None:
+                        return concern_err
                     txn, txn_err = _resolve_txn_statement(name, doc, ctx, lsid_bytes, txn_number)
                     if txn_err is not None:
                         return txn_err
