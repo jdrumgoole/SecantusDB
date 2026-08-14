@@ -5664,7 +5664,23 @@ distinct problems, triaged from the run logs:
   worker. Next occurrence: capture per-worker RSS + the worker's pid before
   death, and check whether the restore subprocess or the WT open is the
   killer. Until then: 1-in-3, unreproduced.
-- [ ] **Degradation-triggered lost-update race in the SIMPLE-protocol
+- [ ] **Lost-update cluster (2026-08-14): UNRESOLVED but extensively bounded;
+  pipeline implicit txn exonerated by paired sampling.** Final evidence:
+  1-3 increments lost in the two 'Q'-protocol racing tests across ~7 CI
+  runs in two time-windows, on several intermediate diagnostic heads of
+  the #856/#865 lineage; NEVER reproduced locally (15x stress, CPU
+  burners, exact --randomly-seed shard replay, whole-file sequences,
+  injected 25ms read-write windows all clean) and never on the final
+  head: 5 sequential green runs plus a same-runner same-minute PAIRED
+  sampler (scripts/race_pair_sampler.py) scoring **0/48 losses feature-ON
+  and 0/48 feature-OFF**. Sequential A/B rounds were worthless here —
+  every earlier "conviction" and "exoneration" flipped with the sampling
+  window; only the paired design controlled the confounds. Both racing
+  tests now carry asserts that print per-worker rowcounts + per-test
+  implicit-txn deltas, so any recurrence names its mechanism. If it
+  recurs: run the pair sampler on the failing head via a temporary
+  workflow step (see git history of this entry for the step shape).
+  Original (superseded) analysis: **Degradation-triggered lost-update race in the SIMPLE-protocol
   autocommit path (pre-existing; NOT the pipeline implicit txn).** The
   2026-08-14 evidence matrix: 4 feature-ON rounds in the degraded-runner
   window (same hours as the disk-reclaim infra failures) lost 1-3
