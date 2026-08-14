@@ -306,8 +306,11 @@ def _info_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> l
             "table_catalog": db,
             # Real PG homes a temp table in its session's pg_temp_N schema
             # with type LOCAL TEMPORARY, so schema-filtered reflection
-            # (table_schema = 'public') never lists it.
-            "table_schema": "pg_temp_1" if t.temp else _table_schema_name(t.name),
+            # (table_schema = 'public') never lists it. The schema is the
+            # name's own per-session pg_temp_<n> prefix.
+            "table_schema": (_table_schema_name(t.name) if "." in t.name else "pg_temp_1")
+            if t.temp
+            else _table_schema_name(t.name),
             "table_name": _bare_table_name(t.name),
             "table_type": "LOCAL TEMPORARY" if t.temp else "BASE TABLE",
         }

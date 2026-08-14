@@ -213,8 +213,11 @@ def execute_create_table(
     if catalog.exists(db, plan.table.name):
         if plan.if_not_exists:
             return SQLResult(command_tag="CREATE TABLE")
-        raise errors.duplicate_table(plan.table.name)
-    if "." in plan.table.name:
+        # A temp table's catalog key carries its session namespace; the error
+        # names the bare relation like real PG ('relation "foo" already exists').
+        name = plan.table.name
+        raise errors.duplicate_table(name.split(".", 1)[1] if plan.table.temp else name)
+    if "." in plan.table.name and not plan.table.temp:
         schema = plan.table.name.split(".", 1)[0]
         if not catalog.schema_exists(db, schema):
             raise errors.SQLError("3F000", f'schema "{schema}" does not exist')
@@ -903,7 +906,10 @@ def _validate_write_row(doc: dict[str, Any], table: Any, ctx: Any) -> None:
 
 
 def _table_schema(table: Any) -> str:
-    return "pg_temp_1" if getattr(table, "temp", False) else "public"
+    if getattr(table, "temp", False):
+        name = getattr(table, "name", "")
+        return name.split(".", 1)[0] if name.startswith("pg_temp_") else "pg_temp_1"
+    return "public"
 
 
 def _validate_check_option(

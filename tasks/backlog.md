@@ -2502,35 +2502,32 @@ to end rather than assuming. They cluster into:
 * **Assorted** — `TestConnExecBatchDeferredError`,
   `TestConnExecBatchImplicitTransaction`, `TestConnDeallocate*`, and others.
 
-#### Temp tables: a partial diagnosis, deliberately left unfinished
+#### Temp tables: concurrent namespacing FIXED; pgx causality still open
 
-13 of the 29 failing tests do `create temporary table foo`, and at least one
-(`TestConnCopyFrom`) fails with `relation "foo" already exists (42P07)`
-BEFORE any COPY runs. That looked like "temp tables aren't session-scoped".
-**Measuring narrowed it twice, and the first framing was wrong:**
+The confirmed gap — two simultaneously-open connections each doing
+`create temporary table bar(a int4)` had the second fail `42P07` because we
+shared one temp namespace — is **fixed**: every session now gets its own
+lazily-allocated `pg_temp_<n>` namespace (catalog keys carry the prefix),
+unqualified names resolve temp-first ahead of `public` (so a session's temp
+table shadows a permanent one, like real PG), explicit `pg_temp.<name>`
+resolves to the session's own namespace, and COPY / extended-protocol
+Describe resolve through the same path. `tests/test_sql_temp_namespacing.py`
+pins all of it, including the two-concurrent-psycopg-connections repro.
 
-* **Sequential connections work.** Create a temp table on conn1, close it,
-  create the same name on conn2 → both succeed.
-  `engine.drop_session_temp_tables` (called from `pgserver.py:385` on
-  disconnect) does its job. Temp tables are NOT unimplemented.
-* **Concurrent sessions collide.** Two simultaneously-open connections each
-  doing `create temporary table bar(a int4)` → the second fails `42P07`.
-  Postgres gives every session its own temp schema; we share one namespace.
-  **This is a real divergence and the narrow, confirmed gap.**
+**Still NOT established:** that the shared namespace caused the pgx `pgconn`
+failures. pgx closes each connection with `defer closeConn`, and sequential
+reuse already worked — so something else may be leaving `foo` behind. The
+other candidate is a test that terminates its connection abnormally
+(`TestConnCopyFromConnectionTerminated` is itself in the failing set) leaking
+the table for later tests, which would point at cleanup-on-abnormal-disconnect.
+Re-run the pgx `pgconn` gauge before treating the temp-table cluster as done.
 
-**What is NOT established:** that either of the above causes the pgx failures.
-pgx closes each connection with `defer closeConn`, and sequential reuse works
-— so something else is leaving `foo` behind. The most likely candidate is a
-test that terminates its connection abnormally (`TestConnCopyFromConnection
-Terminated` is itself in the failing set) leaking the table for later tests,
-which would point at cleanup-on-abnormal-disconnect rather than namespacing.
-**Confirm which before fixing either** — picking the wrong one repairs
-something real and moves the gauge not at all.
-
-Existing machinery to build on, all present and working: `Session.temp_tables`
-(`session.py:311`), `engine.drop_session_temp_tables` (`engine.py:49`), the
-disconnect hook (`pgserver.py:385`), and the `pg_table_is_visible` lowering
-that already respects per-session visibility (`planner.py:1204`).
+Residual namespacing caveats (deliberate): stale `pg_temp_<n>.*` catalog
+entries from a crashed process are not purged at startup (the namespace
+counter is pid-seeded, so re-mint collisions are vanishingly unlikely, but
+the dead entries linger invisibly until a same-named session drops them);
+RBAC grants and `pg_namespace` don't know per-session namespaces
+(`pg_namespace` still lists a single `pg_temp_1` row).
 
 #### Reproductions
 
@@ -2542,10 +2539,6 @@ cd vendor/pgx && PGX_TEST_DATABASE="host=127.0.0.1 port=15435 dbname=postgres us
 
 # whole package (~130s)
 ... go test -count=1 -timeout=600s ./pgconn/
-
-# the confirmed concurrent-temp-table gap, no gauge needed
-two open psycopg connections, each: create temporary table bar(a int4)
-  -> second raises 42P07; Postgres allows both
 ```
 
 

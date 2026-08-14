@@ -1349,6 +1349,12 @@ def describe_statement(
 def _describe_statement(
     storage: Any, db: str, stmt: exp.Expression, session: Session, catalog: Catalog
 ) -> list[ColumnDesc] | None:
+    if not isinstance(stmt, exp.Command):
+        # Describe plans without executing, so it needs the same search_path /
+        # temp-namespace resolution _run_statement applies at execute time —
+        # else a SELECT on a temp table describes as NoData while Execute
+        # emits DataRows (a protocol violation).
+        planner.qualify_from_search_path(stmt, catalog, db, session)
     if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "FETCH":
         # A binary server cursor's ``FETCH … FROM <name>`` rides the extended
         # protocol; Describe must report the cursor's columns (else Execute
@@ -1674,6 +1680,11 @@ def copy_plan(
     target = files[0].name.upper() if files else ""
     if target not in ("STDIN", "STDOUT"):
         raise errors.feature_not_supported("COPY only supports STDIN / STDOUT")
+    # COPY rides the wire server's own path, not _run_statement, so it must
+    # resolve search_path / the session's temp namespace itself — ``COPY foo
+    # FROM STDIN`` after ``CREATE TEMP TABLE foo`` targets the temp table.
+    if session is not None:
+        planner.qualify_from_search_path(stmt, catalog, db, session)
     to_stdout = not bool(stmt.args.get("kind"))  # kind True = FROM, False = TO
     fmt, delimiter, null, header = _copy_options(stmt)
     if delimiter is None:
@@ -1890,6 +1901,7 @@ def _run_statement(
     if isinstance(stmt, exp.Create):
         kind = (stmt.args.get("kind") or "TABLE").upper()
         if kind == "TABLE":
+            planner.qualify_temp_create_target(stmt, session)
             plan = planner.plan_create_table(stmt)
             res = executor.execute_create_table(plan, catalog, storage, db)
             if plan.table.temp:
