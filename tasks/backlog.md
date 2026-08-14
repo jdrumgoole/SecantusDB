@@ -305,8 +305,8 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
-- [~] **DATA CORRUPTION: retryable writes were not idempotent — FIXED on the
-  PYTHON server; the RUST server is still affected.** Found 2026-08-13 while
+- [x] **DATA CORRUPTION: retryable writes were not idempotent — FIXED on BOTH
+  servers (#844 Python, #850 Rust).** Found 2026-08-13 while
   triaging the C gauge's `/command_monitoring/unified/writeConcernError`.
 
   mongod persists the outcome of every retryable write keyed by
@@ -375,11 +375,18 @@ These are explicit non-goals. Don't add them without a reason.
     OVERRIDES an explicit `lsid` on `db.command()` with its own implicit
     session, so hand-built probes collide on one session.)
 
-  **Still open: the Rust server has the same bug**, reproduced identically
-  (`final stored value: 2` where mongod gives 1). Porting it means the same
-  record keyed on `(lsid, txnNumber, identity)` in the Rust command dispatch.
-  Until that lands the two servers disagree, and the C gauge's
-  `writeConcernError` test stays red against the Rust server.
+  **The Rust server is fixed too** (#850, 2026-08-14): the same record, keyed
+  on `(lsid, txnNumber, identity)`, lives in `TransactionRegistry`
+  (`crates/secantus-commands/src/transactions.rs`) and is consulted from
+  `run_with_txn_envelope`. Verified at the WIRE level against a release
+  `secantusd-rs` — a retried `$inc` leaves 1 (was 2) and a retried insert no
+  longer self-collides with `E11000`. The digest algorithm deliberately
+  differs from Python's (SHA-256-truncated vs SHA-1): records are per-process
+  and never shared, so only "same command => same identity" matters.
+
+  The two servers agree again and the three limits above apply to both. The C
+  gauge's `writeConcernError` test should now pass on both — worth confirming
+  on the next gauge refresh rather than assuming.
 
 - [ ] **`invoke concurrency-refresh` needs a genuinely quiet box AND a spread
   audit before its output is trusted.** Two consecutive refresh runs
