@@ -1894,6 +1894,19 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     if (
         value is not None
         and isinstance(node.to, exp.ObjectIdentifier)
+        and str(node.to.this).upper() == "REGPROC"
+    ):
+        # ``'pg_catalog.array_in'::regproc`` — PG resolves the function and
+        # renders it UNQUALIFIED when it is visible on the search path, which
+        # is how pgjdbc's ``typinput = 'pg_catalog.array_in'::regproc``
+        # matches pg_type's stored ``array_in``. A numeric operand is already
+        # an oid and passes through.
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return str(value).rsplit(".", 1)[-1]
+    if (
+        value is not None
+        and isinstance(node.to, exp.ObjectIdentifier)
         and str(node.to.this).upper() == "REGTYPE"
     ):
         oid_operand: int | None = None
