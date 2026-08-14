@@ -1273,21 +1273,31 @@ def _bson_safe_json(value: Any) -> Any:
     return value
 
 
-def _render_json(value: Any) -> str:
+def _render_json(value: Any, compact: bool = False) -> str:
     """Render a stored JSON value as text. Identical to ``json.dumps`` except
     that a ``Decimal128`` (an int that overflowed BSON's int64 — see
-    ``_bson_safe_json``) renders as a bare number, not a quoted string."""
+    ``_bson_safe_json``) renders as a bare number, not a quoted string.
+
+    Default spacing is jsonb's canonical form (``{"a": 1, "b": 2}`` — space
+    after colon and comma, like real PG). ``compact`` drops the spaces for
+    plain ``json`` columns: PG preserves a json value's input text verbatim,
+    and machine-written JSON is compact, so compact re-rendering reproduces
+    the typical input byte-for-byte (a hand-spaced literal still normalises —
+    the parsed storage shape can't be fully verbatim; tasks/backlog.md)."""
+    isep, ksep = (",", ":") if compact else (", ", ": ")
     if isinstance(value, bson.Decimal128):
         return str(value.to_decimal())
     if isinstance(value, Decimal):
         # ``to_py`` unwraps a top-level Decimal128 column value to Decimal.
         return str(value)
     if isinstance(value, list):
-        return "[" + ", ".join(_render_json(v) for v in value) + "]"
+        return "[" + isep.join(_render_json(v, compact) for v in value) + "]"
     if isinstance(value, dict):
         return (
             "{"
-            + ", ".join(f"{_json.dumps(str(k))}: {_render_json(v)}" for k, v in value.items())
+            + isep.join(
+                f"{_json.dumps(str(k))}{ksep}{_render_json(v, compact)}" for k, v in value.items()
+            )
             + "}"
         )
     return _json.dumps(value, default=str)
@@ -1313,10 +1323,12 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
     if is_array_tag(tag) and isinstance(value, (list, tuple)):
         elem = array_element_tag(tag)
         return _render_pg_array(value, elem).encode("utf-8")
-    if tag == "json":
+    if tag in ("json", "json_plain"):
         # A JSON value renders as JSON text whatever its top-level type — a bare
         # ``true`` / ``"str"`` must not fall through to the bool/str renderers.
-        return _render_json(value).encode("utf-8")
+        # "json_plain" is an internal render-only tag: a plain ``json`` (oid
+        # 114) column renders compact, jsonb keeps its canonical spacing.
+        return _render_json(value, compact=(tag == "json_plain")).encode("utf-8")
     if isinstance(value, bool):
         return b"t" if value else b"f"
     if isinstance(value, (bytes, bytearray)):

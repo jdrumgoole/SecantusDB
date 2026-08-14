@@ -301,3 +301,40 @@ def test_failed_copy_then_valid_copy_succeeds(client):
     assert _tag(msgs) == "COPY 1"
     rows = [m for m in client.query("SELECT id, name FROM t WHERE id = 7") if m.type == "D"]
     assert len(rows) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Plain ``json`` (oid 114) renders compact — machine-written JSON is compact,
+# so compact re-rendering reproduces the typical input byte-for-byte (real PG
+# keeps a json value's text verbatim; our parsed storage can't, see
+# tasks/backlog.md). jsonb keeps PG's canonical spacing ({"a": 1, "b": 2}).
+
+
+def _one_cell(client: PGClient, sql: str) -> bytes:
+    client.send(pgwire.build_query(sql))
+    for m in client.read_until_ready():
+        if m.type == "D":
+            return pgwire.parse_data_row(m.payload)[0]
+    raise AssertionError("no DataRow")
+
+
+def test_copy_to_stdout_json_is_compact(client):
+    # The pgx TestConnCopyToSmall shape: compact json in, identical bytes out.
+    client.query("CREATE TABLE j (id int4, g json)")
+    client.query("""INSERT INTO j VALUES (1, '{"abc":"def","foo":"bar"}')""")
+    data = _copy_out(client, "COPY j TO STDOUT")
+    assert data == b'1\t{"abc":"def","foo":"bar"}\n'
+
+
+def test_copy_query_to_stdout_json_is_compact(client):
+    client.query("CREATE TABLE jq (id int4, g json)")
+    client.query("""INSERT INTO jq VALUES (1, '{"a":[1,2],"b":null}')""")
+    data = _copy_out(client, "COPY (SELECT g FROM jq) TO STDOUT")
+    assert data == b'{"a":[1,2],"b":null}\n'
+
+
+def test_select_json_is_compact_but_jsonb_keeps_canonical_spacing(client):
+    client.query("CREATE TABLE j2 (g json, h jsonb)")
+    client.query("""INSERT INTO j2 VALUES ('{"a":1,"b":[1,2]}', '{"a":1,"b":[1,2]}')""")
+    assert _one_cell(client, "SELECT g FROM j2") == b'{"a":1,"b":[1,2]}'
+    assert _one_cell(client, "SELECT h FROM j2") == b'{"a": 1, "b": [1, 2]}'
