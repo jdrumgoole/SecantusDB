@@ -382,6 +382,11 @@ def _dispatch(
 
 
 def _begin_txn(storage: Any, session: Session, modes: list | None = None) -> SQLResult:
+    # An explicit BEGIN inside an extended-protocol IMPLICIT transaction takes
+    # it over (PG semantics): same handle, now a real block.
+    if session.txn_handle is not None and session.txn_is_implicit:
+        session.txn_is_implicit = False
+        return SQLResult(command_tag="BEGIN")
     # A nested BEGIN is a no-op in Postgres (it warns and stays in the block).
     if session.txn_handle is None:
         session.txn_handle = storage.begin_user_transaction()
@@ -488,6 +493,7 @@ def _end_txn_state(session: Session) -> None:
     """Clear all per-transaction session state at the end of a block."""
     session.txn_handle = None
     session.txn_failed = False
+    session.txn_is_implicit = False
     session.savepoints = []
     session.pending_notifies = []  # NOTIFYs in the block are flushed (commit) or dropped (rollback)
     session.reset_deferred()
@@ -1443,6 +1449,25 @@ def _describe_statement(
         if srf_plan.count_star:
             return [ColumnDesc(srf_plan.count_alias, "int8", typemap.PG_OID["int8"])]
         return executor._out_column_descs(srf_plan.out_columns, storage, db)
+    if table_node is None and stmt.args.get("from_") is not None:
+        # A FROM of derived tables only — ``(VALUES …) AS t1 (…) LEFT JOIN
+        # (VALUES …) AS t2 (…)`` (pgjdbc's OuterJoinSyntaxTest; CrystalReports
+        # emits this via the {oj} escape). No ``exp.Table`` anywhere, so the
+        # branches above skipped it and the constant path below errors —
+        # Describe answered NoData while Execute emitted DataRows, a protocol
+        # violation pgjdbc rejects. Planning is side-effect-free (derived
+        # tables materialize at execution), so derive the shape from the plan.
+        try:
+            desugared = stmt.copy()
+            planner.desugar_join_using(desugared)
+            plan = planner.plan_pipeline_select(desugared, db, catalog, storage, session=session)
+            if getattr(plan, "count_star", False):
+                return [ColumnDesc(plan.count_alias, "int8", typemap.PG_OID["int8"])]
+            return executor._tagged_out_column_descs(
+                plan.out_columns, getattr(plan, "out_enum_types", None) or {}, storage, db
+            )
+        except (errors.SQLError, TypeError, ValueError, AttributeError):
+            return None
     if table_node is None or stmt.args.get("from_") is None:
         # find() descends into subqueries — a FROM-less outer SELECT (WHERE
         # EXISTS …) describes via the constant path, same as _run_select.

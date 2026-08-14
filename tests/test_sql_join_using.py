@@ -93,3 +93,16 @@ class TestStarMerge:
 
     def test_on_join_star_unchanged(self, db):
         assert db("SELECT * FROM a JOIN b ON a.k = b.k") == [(1, "x", 1, "p")]
+
+
+def test_double_paren_join_chain_with_table_wrapped_values(db):
+    """CrystalReports' ``{oj (((...)))}`` shape: extra grouping parens nest
+    join-less Subquery wrappers AND make sqlglot parse the aliased VALUES as
+    a Table wrapping the Values node — both peeled by the planner now."""
+    rows = db(
+        "select t1.id, t2.id, t3.id"
+        " from (((values (1, 'one'), (2, 'two')) as t1 (id, text)"
+        " left outer join (values (1, 'a'), (3, 'b')) as t2 (id, text) on (t1.id = t2.id))"
+        " left outer join (values (1, '1'), (4, '2')) as t3 (id, text) on (t2.id = t3.id))"
+    )
+    assert rows == [(1, 1, 1), (2, None, None)]
