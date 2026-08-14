@@ -355,6 +355,10 @@ def test_revalidation_raises_before_cte_side_effects(server):
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.skipif(
+    __import__("os").environ.get("SECANTUS_PIPELINE_TXN", "0") == "0",
+    reason="pipeline implicit txn gated off (SECANTUS_PIPELINE_TXN)",
+)
 def test_pipeline_error_rolls_back_earlier_statements(server):
     psycopg = pytest.importorskip("psycopg")
     host, port = server.address
@@ -378,6 +382,10 @@ def test_pipeline_error_rolls_back_earlier_statements(server):
         assert cur.fetchall() == [(2,)]
 
 
+@pytest.mark.skipif(
+    __import__("os").environ.get("SECANTUS_PIPELINE_TXN", "0") == "0",
+    reason="pipeline implicit txn gated off (SECANTUS_PIPELINE_TXN)",
+)
 def test_pipeline_success_commits_at_sync(server):
     psycopg = pytest.importorskip("psycopg")
     host, port = server.address

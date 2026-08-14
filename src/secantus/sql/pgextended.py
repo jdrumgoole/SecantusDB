@@ -18,6 +18,7 @@ import datetime as _dt
 import decimal
 import ipaddress as _ipaddress
 import logging
+import os
 import struct
 import uuid as _uuid
 from dataclasses import dataclass, field
@@ -839,6 +840,13 @@ def _result_value(
     return pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding)
 
 
+#: CI-bisect gate for the pipeline implicit-transaction feature: set
+#: SECANTUS_PIPELINE_TXN=0 to run the pre-#856 per-statement autocommit path
+#: (isolates whether the feature correlates with the intermittent
+#: dual-protocol lost-increment failures its PR lanes show).
+_PIPELINE_TXN_ENABLED = os.environ.get("SECANTUS_PIPELINE_TXN", "0") != "0"
+
+
 def _wants_implicit_txn(stmt: Any) -> bool:
     """Whether an extended-protocol statement should open the implicit
     transaction. Transaction-control statements manage blocks themselves, and
@@ -1348,7 +1356,11 @@ class ExtendedSession:
             # BatchFailureTest counts the surviving rows). Open it lazily on
             # the first Execute outside a block; Sync settles it.
             first_in_implicit = False
-            if self.session.txn_handle is None and _wants_implicit_txn(bound):
+            if (
+                _PIPELINE_TXN_ENABLED
+                and self.session.txn_handle is None
+                and _wants_implicit_txn(bound)
+            ):
                 self.session.txn_handle = self.storage.begin_user_transaction()
                 self.session.txn_failed = False
                 self.session.txn_is_implicit = True
