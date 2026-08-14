@@ -348,3 +348,68 @@ def test_revalidation_raises_before_cte_side_effects(server):
         # NOT have run (PG parity; pgjdbc's AutoRollback matrix counts rows).
         cur.execute("SELECT count(*) FROM cp3")
         assert cur.fetchall() == [(2,)]
+
+
+# --------------------------------------------------------------------------- #
+# Implicit transaction across a pipeline (statements before one Sync)
+# --------------------------------------------------------------------------- #
+
+
+def test_pipeline_error_rolls_back_earlier_statements(server):
+    psycopg = pytest.importorskip("psycopg")
+    host, port = server.address
+    with psycopg.connect(host=host, port=port, dbname="db", user="joe", autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE bu (id text PRIMARY KEY)")
+        cur.execute("INSERT INTO bu VALUES ('key-2')")
+        # One pipeline, one Sync: PG runs the statements in ONE implicit
+        # transaction, so the mid-pipeline dup key discards key-1 too
+        # (pgjdbc's BatchFailureTest counts exactly this).
+        with pytest.raises(psycopg.errors.UniqueViolation), conn.pipeline():
+            c = conn.cursor()
+            c.execute("INSERT INTO bu VALUES ('key-1')")
+            c.execute("INSERT INTO bu VALUES ('key-2')")
+            c.execute("INSERT INTO bu VALUES ('key-3')")
+        cur.execute("SELECT id FROM bu ORDER BY id")
+        assert cur.fetchall() == [("key-2",)]
+        # Autocommit single statements are unaffected.
+        cur.execute("INSERT INTO bu VALUES ('key-9')")
+        cur.execute("SELECT count(*) FROM bu")
+        assert cur.fetchall() == [(2,)]
+
+
+def test_pipeline_success_commits_at_sync(server):
+    psycopg = pytest.importorskip("psycopg")
+    host, port = server.address
+    with psycopg.connect(host=host, port=port, dbname="db", user="joe", autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE bu2 (id int)")
+        with conn.pipeline():
+            c = conn.cursor()
+            c.execute("INSERT INTO bu2 VALUES (1)")
+            c.execute("INSERT INTO bu2 VALUES (2)")
+        cur.execute("SELECT count(*) FROM bu2")
+        assert cur.fetchall() == [(2,)]
+
+
+# --------------------------------------------------------------------------- #
+# Describe over derived-VALUES joins (pgjdbc's {oj} shapes)
+# --------------------------------------------------------------------------- #
+
+
+def test_describe_derived_values_join(server):
+    psycopg = pytest.importorskip("psycopg")
+    host, port = server.address
+    with psycopg.connect(
+        host=host, port=port, dbname="db", user="joe", autocommit=True, prepare_threshold=0
+    ) as conn:
+        cur = conn.cursor()
+        sql = (
+            "select t1.id as t1_id, t2.text as t2_text"
+            " from (values (1, 'one'), (2, 'two')) as t1 (id, text)"
+            " left outer join (values (1, 'a'), (3, 'b')) as t2 (id, text)"
+            " on (t1.id = t2.id)"
+        )
+        cur.execute(sql, prepare=True)
+        assert [d.name for d in cur.description] == ["t1_id", "t2_text"]
+        assert cur.fetchall() == [(1, "a"), (2, None)]

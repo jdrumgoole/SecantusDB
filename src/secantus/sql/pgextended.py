@@ -13,6 +13,7 @@ returning the bytes to send back. On error it enters the protocol's
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import decimal
 import ipaddress as _ipaddress
@@ -838,6 +839,37 @@ def _result_value(
     return pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding)
 
 
+def _wants_implicit_txn(stmt: Any) -> bool:
+    """Whether an extended-protocol statement should open the implicit
+    transaction. Transaction-control statements manage blocks themselves, and
+    statements PG refuses inside any transaction block (VACUUM …) must keep
+    running bare — PG treats a lone pipelined statement as its own implicit
+    transaction, which our per-statement autocommit already provides."""
+    from sqlglot import exp as _exp
+
+    if stmt is None:
+        return False
+    if isinstance(stmt, (_exp.Transaction, _exp.Commit, _exp.Rollback)):
+        return False
+    if isinstance(stmt, _exp.Command):
+        head = str(stmt.this or "").strip().upper()
+        return head not in (
+            "BEGIN",
+            "START",
+            "COMMIT",
+            "END",
+            "ROLLBACK",
+            "ABORT",
+            "VACUUM",
+            "SAVEPOINT",
+            "RELEASE",
+            "PREPARE",
+            "DEALLOCATE",
+            "DISCARD",
+        )
+    return True
+
+
 def _column_formats(result_formats: list[int], ncols: int) -> list[int]:
     """Expand Bind's result-format codes to one per column."""
     if not result_formats:
@@ -1012,6 +1044,7 @@ class ExtendedSession:
         """Handle one extended-protocol message; return the bytes to send."""
         if msg_type == "S":  # Sync — always answered, clears any error state
             self.skip_until_sync = False
+            self._settle_implicit_txn()
             return pgwire.ready_for_query(self.session.txn_status())
         if self.skip_until_sync:
             return b""  # discard everything until the next Sync
@@ -1197,6 +1230,24 @@ class ExtendedSession:
             return pgwire.decode_text(value, self.session.wire_encoding)
         return value
 
+    def _settle_implicit_txn(self) -> None:
+        """Commit (or roll back, if poisoned) the implicit transaction at
+        Sync — the pipeline boundary. Explicit blocks (BEGIN took over) are
+        untouched."""
+        session = self.session
+        if session.txn_handle is None or not session.txn_is_implicit:
+            return
+        try:
+            if session.txn_failed:
+                engine._rollback_txn(self.storage, session)
+            else:
+                engine._commit_txn(self.storage, self.session.database, self.catalog, session)
+        except errors.SQLError:
+            # A commit failure surfaces as an aborted transaction; the state
+            # is cleared either way so the next pipeline starts fresh.
+            with contextlib.suppress(Exception):
+                engine._rollback_txn(self.storage, session)
+
     def _describe(self, payload: bytes) -> bytes:
         kind, name = pgwire.parse_describe(payload)
         if kind == "S":
@@ -1247,6 +1298,17 @@ class ExtendedSession:
             return pgwire.empty_query_response()
         if not portal.executed:
             bound = self._bound(portal)
+            # Statements pipelined before a Sync run in ONE implicit
+            # transaction in PG — a later error rolls back the earlier
+            # statements' effects (pgjdbc's batch semantics depend on it:
+            # BatchFailureTest counts the surviving rows). Open it lazily on
+            # the first Execute outside a block; Sync settles it.
+            first_in_implicit = False
+            if self.session.txn_handle is None and _wants_implicit_txn(bound):
+                self.session.txn_handle = self.storage.begin_user_transaction()
+                self.session.txn_failed = False
+                self.session.txn_is_implicit = True
+                first_in_implicit = True
             # PG's cached-plan revalidation happens at PLANNING time — before
             # any side effect. A data-modifying CTE (`WITH x AS (INSERT …)
             # SELECT *`) whose result shape changed must raise WITHOUT running
@@ -1270,9 +1332,32 @@ class ExtendedSession:
             sess.current_query = bound.sql(dialect="postgres") if bound is not None else ""
             sess.query_start = _dt.datetime.now(_dt.timezone.utc)
             try:
-                portal.result = engine.run_statement(
-                    self.storage, self.session.database, bound, self.session, self.catalog
-                )
+                while True:
+                    try:
+                        portal.result = engine.run_statement(
+                            self.storage, self.session.database, bound, self.session, self.catalog
+                        )
+                        break
+                    except errors.SQLError as exc:
+                        # The FIRST statement of an implicit transaction that
+                        # loses a write-write race retries in a fresh implicit
+                        # transaction — client-visible behavior identical to
+                        # the per-statement autocommit path it replaced
+                        # (PG's read-committed doesn't surface these either).
+                        # Later pipeline statements can't retry (their
+                        # predecessors would be silently re-run) and surface
+                        # 40001 like PG's serialization failure.
+                        if (
+                            exc.sqlstate != "40001"
+                            or not first_in_implicit
+                            or not self.session.txn_is_implicit
+                        ):
+                            raise
+                        with contextlib.suppress(Exception):
+                            engine._rollback_txn(self.storage, self.session)
+                        self.session.txn_handle = self.storage.begin_user_transaction()
+                        self.session.txn_failed = False
+                        self.session.txn_is_implicit = True
             finally:
                 sess.state = "idle"
             # First execution captures the plan identity (see

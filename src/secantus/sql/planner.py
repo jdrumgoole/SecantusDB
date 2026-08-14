@@ -4845,11 +4845,18 @@ def unwrap_paren_join_from(stmt: exp.Select) -> None:
         isinstance(node, exp.Subquery)
         and not node.alias
         and isinstance(node.this, (exp.Table, exp.Subquery))
-        and node.this.args.get("joins")
     ):
         inner = node.this
-        joins = inner.args.pop("joins", None) or []
-        stmt.set("joins", joins + (stmt.args.get("joins") or []))
+        # Joins can sit on the INNER node (``FROM (a JOIN b)``) or on the
+        # grouping Subquery ITSELF (``FROM ((a JOIN b) JOIN c)`` attaches the
+        # c-join to the outer parens; extra grouping layers — CrystalReports'
+        # {oj (((…))) } shape — nest join-less wrappers that still must peel).
+        # Hoist both, inner-first (their join order in the original text).
+        # A wrapper whose inner is a SELECT is a derived table missing its
+        # alias and is left for the error path (the isinstance gate above).
+        joins = (inner.args.pop("joins", None) or []) + (node.args.pop("joins", None) or [])
+        if joins:
+            stmt.set("joins", joins + (stmt.args.get("joins") or []))
         frm.set("this", inner)
         node = inner
 
@@ -7361,6 +7368,13 @@ def _resolve_source(
     named by the alias before running the main pipeline)."""
     if isinstance(node, exp.Lateral):
         raise errors.feature_not_supported("LATERAL cannot be the first FROM item")
+    if isinstance(node, exp.Table) and isinstance(node.this, exp.Values):
+        # Extra grouping parens make sqlglot parse ``((VALUES …) AS t (…))``
+        # as a Table WRAPPING the Values (CrystalReports' {oj (((…)))} shape)
+        # — move the alias onto the Values node and take the normal branch.
+        inner = node.this
+        inner.set("alias", node.args.get("alias"))
+        node = inner
     if isinstance(node, exp.Values):
         # ``FROM (VALUES (…), …) AS alias(c1, c2)`` — a constant derived table.
         # Column names from the alias list, tags inferred from the first row.

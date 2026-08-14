@@ -5499,6 +5499,16 @@ distinct problems, triaged from the run logs:
   worker. Next occurrence: capture per-worker RSS + the worker's pid before
   death, and check whether the restore subprocess or the WT open is the
   killer. Until then: 1-in-3, unreproduced.
+- [x] **RESOLVED: BatchFailureTest (48) + BatchExecuteTest (8) — pipelined
+  statements now form one implicit transaction until Sync** (PG semantics:
+  mid-pipeline error rolls back the whole pipeline; BEGIN takes over; first
+  statement retries write-races internally so plain autocommit is
+  unchanged). Both classes fully green. **OuterJoinSyntaxTest (6) also
+  resolved**: Describe over derived-VALUES joins + multi-layer grouping-paren
+  unwrap + Table-wrapped-VALUES normalization. BatchDeadlockTest (6) is a
+  DIFFERENT issue (pgjdbc round-trip counting: "Sync should not fire per
+  row" — the driver syncs per row for generated-keys batches based on
+  something we advertise; needs a driver-side trace).
 - [x] **RESOLVED: AutoRollbackTest — server-side cached-plan revalidation**
   (no capture needed — the variant matrix pinned it): pgjdbc's transparent
   re-prepare (`willHealViaReparse`) matches the ErrorResponse's

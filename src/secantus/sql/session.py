@@ -324,6 +324,11 @@ class Session:
     # 25P02 until the block ends — Postgres semantics).
     txn_handle: Any = None
     txn_failed: bool = False
+    #: The open transaction was started IMPLICITLY by the extended protocol
+    #: (statements pipelined before a Sync form one transaction in PG —
+    #: pgjdbc's batches rely on a mid-batch error rolling back the whole
+    #: pipeline). Sync commits/rolls it back; an explicit BEGIN takes it over.
+    txn_is_implicit: bool = False
     # Open savepoints, innermost last. Each is a ``_Savepoint`` carrying the
     # pre-image snapshot (collection -> docs) captured on the first write to that
     # collection after the savepoint was established, so ROLLBACK TO can restore.
