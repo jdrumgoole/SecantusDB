@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import socket
+import struct as _struct
 
 import pytest
 
@@ -338,3 +339,65 @@ def test_select_json_is_compact_but_jsonb_keeps_canonical_spacing(client):
     client.query("""INSERT INTO j2 VALUES ('{"a":1,"b":[1,2]}', '{"a":1,"b":[1,2]}')""")
     assert _one_cell(client, "SELECT g FROM j2") == b'{"a":1,"b":[1,2]}'
     assert _one_cell(client, "SELECT h FROM j2") == b'{"a": 1, "b": [1, 2]}'
+
+
+# --------------------------------------------------------------------------- #
+# The legacy bare-keyword form ``COPY t FROM STDIN BINARY`` (pre-9.0 syntax,
+# still emitted by pgx) parses as a value-less COPY parameter; it must select
+# the binary format, not fall through to the text parser (which rejected the
+# PGCOPY stream with 22021 invalid-byte-sequence).
+
+_PGCOPY_SIG = b"PGCOPY\n\xff\r\n\x00"
+
+
+def _pgcopy_stream(rows: list[tuple[int, str]]) -> bytes:
+    buf = bytearray(_PGCOPY_SIG + _struct.pack("!ii", 0, 0))
+    for a, b in rows:
+        raw = b.encode()
+        buf += _struct.pack("!h", 2)
+        buf += _struct.pack("!i", 4) + _struct.pack("!i", a)
+        buf += _struct.pack("!i", len(raw)) + raw
+    buf += _struct.pack("!h", -1)
+    return bytes(buf)
+
+
+def test_copy_from_stdin_bare_binary_keyword(client):
+    # The pgx TestConnCopyFromBinary shape, scaled down.
+    client.query("CREATE TABLE bb (a int4, b varchar)")
+    rows = [(i, f"foo {i} bar") for i in range(50)]
+    client.send(pgwire.build_query("COPY bb (a, b) FROM STDIN BINARY;"))
+    g = client.read_message()
+    assert g.type == "G", f"expected CopyInResponse, got {g.type}"
+    # A binary CopyInResponse advertises format 1 for every column.
+    overall = g.payload[0]
+    assert overall == 1
+    client.send(pgwire.copy_data(_pgcopy_stream(rows)))
+    client.send(pgwire.copy_done())
+    msgs = client.read_until_ready()
+    assert _tag(msgs) == "COPY 50"
+    out = [m for m in client.query("SELECT a, b FROM bb ORDER BY a") if m.type == "D"]
+    assert len(out) == 50
+    first = pgwire.parse_data_row(out[0].payload)
+    assert first == [b"0", b"foo 0 bar"]
+
+
+def test_copy_to_stdout_bare_binary_keyword(client):
+    client.query("CREATE TABLE bo (a int4)")
+    client.query("INSERT INTO bo VALUES (7)")
+    client.send(pgwire.build_query("COPY bo TO STDOUT BINARY"))
+    h = client.read_message()
+    assert h.type == "H"  # CopyOutResponse
+    assert h.payload[0] == 1  # binary overall format
+    data = bytearray()
+    while True:
+        m = client.read_message()
+        if m.type == "d":
+            data += m.payload
+        elif m.type == "c":
+            break
+    client.read_until_ready()
+    assert bytes(data).startswith(_PGCOPY_SIG)
+    # One row: int16 nfields=1, int32 len=4, int4 value 7, int16 -1 trailer.
+    body = bytes(data)[len(_PGCOPY_SIG) + 8 :]
+    one_row = _struct.pack("!h", 1) + _struct.pack("!i", 4) + _struct.pack("!i", 7)
+    assert body == one_row + _struct.pack("!h", -1)

@@ -1800,6 +1800,10 @@ def _copy_options(stmt: exp.Copy) -> tuple[str, str | None, str | None, bool]:
         )
         if key == "FORMAT":
             fmt = str(val_text).lower()
+        elif key == "BINARY":
+            # The legacy bare-keyword form (``COPY t FROM STDIN BINARY``,
+            # pre-9.0 syntax pgx still emits) parses as a value-less param.
+            fmt = "binary"
         elif key == "CSV":
             fmt = "csv"
             # The legacy ``WITH CSV HEADER`` bundles HEADER as the CSV param's
