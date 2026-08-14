@@ -1041,6 +1041,61 @@ fn txn_envelope(doc: &Document) -> (Option<Vec<u8>>, Option<i64>) {
 /// `autocommit: false` + `lsid` + `txnNumber` envelope it resolves / runs inside
 /// the transaction; a bare `txnNumber` (retryable write) just advances the
 /// session sequence; everything else runs the handler directly.
+/// Commands mongod records a retryable-write result for. Drivers only attach a
+/// `txnNumber` to genuinely retryable operations (single-document writes) —
+/// `updateMany` / `deleteMany` are excluded by the spec and arrive without one
+/// — so the envelope alone is nearly sufficient. Naming the commands anyway
+/// keeps a stray `txnNumber` on a read from being cached and replayed.
+const RETRYABLE_WRITE_COMMANDS: &[&str] = &["insert", "update", "delete", "findAndModify"];
+
+/// Envelope fields a driver legitimately varies between the original attempt
+/// and its retry (gossip, routing, the session envelope itself). Excluded from
+/// the identity digest so a genuine retry still matches.
+const RETRY_IDENTITY_IGNORED: &[&str] = &[
+    "lsid",
+    "txnNumber",
+    "$clusterTime",
+    "$db",
+    "$readPreference",
+    "readConcern",
+    "writeConcern",
+    "apiVersion",
+    "apiStrict",
+    "apiDeprecationErrors",
+    "comment",
+];
+
+/// A stable digest of the write this command represents.
+///
+/// Two attempts of the same retryable write are byte-identical apart from the
+/// envelope fields above, so this matches on a genuine retry and differs when
+/// the `(lsid, txnNumber)` key has been reused for another write. Mirrors the
+/// Python server's `_retry_identity`.
+fn retry_identity(doc: &Document) -> [u8; 20] {
+    use sha2::{Digest, Sha256};
+
+    let mut body = Document::new();
+    for (k, v) in doc.iter() {
+        if !RETRY_IDENTITY_IGNORED.contains(&k.as_str()) {
+            body.insert(k.clone(), v.clone());
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    let payload = match body.to_writer(&mut buf) {
+        Ok(()) => buf.as_slice(),
+        // Unencodable body: fall back to a debug rendering. It only has to be
+        // consistent for a given command, not canonical.
+        Err(_) => {
+            buf = format!("{body:?}").into_bytes();
+            buf.as_slice()
+        }
+    };
+    let full = Sha256::digest(payload);
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&full[..20]);
+    out
+}
+
 fn run_with_txn_envelope(
     name: &str,
     handler: Handler,
@@ -1059,7 +1114,21 @@ fn run_with_txn_envelope(
         // Retryable write: consumes the session's txnNumber sequence (and aborts
         // an older in-progress transaction), then runs normally.
         registry.on_retryable_write(&lsid, txn_number);
-        return run_handler(handler, doc, ctx);
+        if !RETRYABLE_WRITE_COMMANDS.contains(&name) {
+            return run_handler(handler, doc, ctx);
+        }
+        // If this exact (lsid, txnNumber) already ran THIS command, replay the
+        // stored reply instead of executing the write again. Without it a
+        // retried `{$inc: {n: 1}}` applies twice while both replies claim
+        // `nModified: 1` — silent corruption on a path every driver exercises
+        // automatically after a network blip.
+        let identity = retry_identity(doc);
+        if let Some(cached) = registry.retryable_reply(&lsid, txn_number, &identity) {
+            return cached;
+        }
+        let result = run_handler(handler, doc, ctx);
+        registry.record_retryable(&lsid, txn_number, identity, &result);
+        return result;
     }
     // commit/abort carry the same envelope but are controls (own handlers).
     if name == "commitTransaction" || name == "abortTransaction" {
