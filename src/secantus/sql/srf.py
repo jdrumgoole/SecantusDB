@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from sqlglot import exp
@@ -366,15 +367,54 @@ def _as_json_list(val: Any) -> list[Any]:
     return list(doc) if isinstance(doc, (list, tuple)) else []
 
 
+def _coerce_series_bound(val: Any) -> Any:
+    """Parse a numeric-looking string bound into a number.
+
+    Only strings are touched, and only when they parse cleanly — anything else
+    is returned unchanged so the caller's type check still rejects genuinely
+    unsupported bounds with its own error. Integers are preferred over Decimal
+    so the common `generate_series(1, $1)` yields int8 rows rather than numeric.
+    """
+    if not isinstance(val, str):
+        return val
+    text = val.strip()
+    if not text:
+        return val
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return Decimal(text)
+    except (InvalidOperation, ValueError):
+        return val
+
+
 def _generate_series(start: Any, stop: Any, step: Any) -> tuple[list[Any], str]:
     """``generate_series(start, stop[, step])`` — inclusive of both ends. Numeric
     ranges (int / numeric step) and date / timestamp ranges (an ``interval``
     step) are both supported."""
     if start is None or stop is None:
         return [], "int8"
+    # An untyped parameter (`generate_series(1, $1)` with `$1` sent as text)
+    # arrives as a string: the wire gave no type OID, so nothing upstream
+    # coerced it. Postgres infers the parameter's type from the argument
+    # position and parses it as an integer, so a numeric-looking string is a
+    # number here too. Without this, pgx's `ensureConnValid` helper — which
+    # runs exactly that query and is called at the end of 66 pgconn tests —
+    # failed, taking otherwise-passing tests down with it.
+    #
+    # Runs before the temporal branch so a coerced bound is what that branch
+    # sees. Note this does NOT rescue a quoted third argument
+    # (`generate_series(1, 10, '3')`): sqlglot parses that into an `Interval`
+    # node at parse time, so the step arrives already an interval and never
+    # reaches this coercion. That is a separate parser-level quirk.
+    start = _coerce_series_bound(start)
+    stop = _coerce_series_bound(stop)
+    step = _coerce_series_bound(step)
     if _is_temporal(start) or intervals.is_interval(step):
         return _generate_series_temporal(start, stop, step)
-    if not isinstance(start, (int, float)) or not isinstance(stop, (int, float)):
+    if not isinstance(start, (int, float, Decimal)) or not isinstance(stop, (int, float, Decimal)):
         raise errors.feature_not_supported(
             "generate_series is supported for integer / numeric or "
             "date / timestamp (with interval step) ranges only"
