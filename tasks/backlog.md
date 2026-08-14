@@ -5499,7 +5499,24 @@ distinct problems, triaged from the run logs:
   worker. Next occurrence: capture per-worker RSS + the worker's pid before
   death, and check whether the restore subprocess or the WT open is the
   killer. Until then: 1-in-3, unreproduced.
-- [x] **RESOLVED: BatchFailureTest (48) + BatchExecuteTest (8) — pipelined
+- [ ] **Pipeline implicit transaction: gated OFF pending a lost-update
+  mechanism hunt.** The feature (statements before one Sync = one implicit
+  txn; enables BatchFailureTest 184/184 + BatchExecuteTest 140/140) is
+  convicted by CI A/B of causing intermittent SILENT lost updates in plain
+  autocommit traffic: control PR #861 (pure main + instrumented test) ran 3
+  clean rounds while the feature-on branch failed racing lanes 4-for-4, and
+  a feature-off bisect round on the same branch went green. The mechanism is
+  NOT direct — the failing statements are parameter-less simple-protocol
+  traffic (verified by in-process trace: the settle path never runs for
+  them), all statements report UPDATE 1 (post-report loss), thread-leak
+  checks are clean, and nothing reproduces locally even at 15x stress under
+  CPU burners. Enable with SECANTUS_PIPELINE_TXN=1. Next: run the racing
+  test on CI with feature ON plus a server-side settle/commit counter dumped
+  at teardown to see whether the implicit txn machinery fires AT ALL during
+  the losing runs (if yes, the protocol assumption is wrong on CI; if no,
+  the coupling is via storage-level state — snapshot pinning or session
+  reuse — and the counter narrows which).
+- [x] **PARTIALLY RESOLVED (gated): BatchFailureTest (48) + BatchExecuteTest (8) — pipelined
   statements now form one implicit transaction until Sync** (PG semantics:
   mid-pipeline error rolls back the whole pipeline; BEGIN takes over; first
   statement retries write-races internally so plain autocommit is
