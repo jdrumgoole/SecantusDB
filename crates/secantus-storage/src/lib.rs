@@ -9549,6 +9549,11 @@ impl Storage {
     /// operators / `let` / `collation` / `validator` / capped collections route
     /// to Python at the engine-selection layer).
     #[allow(clippy::too_many_arguments)]
+    /// Update at the default `strict` validation level.
+    ///
+    /// Thin wrapper over [`Storage::update_matching_leveled`]; see it for the
+    /// `moderate` behaviour.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_matching(
         &self,
         db: &str,
@@ -9561,6 +9566,46 @@ impl Storage {
         let_vars: &Document,
         coll_opt: Option<&Collation>,
         validator: Option<&Document>,
+        want_post_image: bool,
+    ) -> Result<UpdateOutcome> {
+        self.update_matching_leveled(
+            db,
+            coll,
+            filter,
+            update,
+            multi,
+            upsert,
+            array_filters,
+            let_vars,
+            coll_opt,
+            validator,
+            false,
+            want_post_image,
+        )
+    }
+
+    /// Update with the collection's `validationLevel` taken into account.
+    ///
+    /// `validator_moderate` is `validationLevel: "moderate"`: exempt documents
+    /// that ALREADY failed the validator from update-time validation (inserts
+    /// stay validated). [`Storage::update_matching`] is the strict-level
+    /// wrapper, kept so the many callers that have no validator at all — tests,
+    /// PITR replay, the adapter's plain path — need not thread a flag that
+    /// cannot affect them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_matching_leveled(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        update: &Document,
+        multi: bool,
+        upsert: bool,
+        array_filters: &[Document],
+        let_vars: &Document,
+        coll_opt: Option<&Collation>,
+        validator: Option<&Document>,
+        validator_moderate: bool,
         want_post_image: bool,
     ) -> Result<UpdateOutcome> {
         // Operator-/replacement-form update. `is_replacement` (no `$`-prefixed
@@ -9586,6 +9631,7 @@ impl Storage {
             upsert,
             is_replacement,
             validator,
+            validator_moderate,
             want_post_image,
             &|doc, up| {
                 // mongod rejects any update that would change the immutable `_id`
@@ -9623,6 +9669,9 @@ impl Storage {
         let_vars: &Document,
         coll_opt: Option<&Collation>,
         validator: Option<&Document>,
+        // `validationLevel: "moderate"` — exempt documents that ALREADY failed
+        // the validator from update-time validation (inserts are still checked).
+        validator_moderate: bool,
         want_post_image: bool,
     ) -> Result<UpdateOutcome> {
         self.update_matching_core(
@@ -9635,6 +9684,7 @@ impl Storage {
             upsert,
             false,
             validator,
+            validator_moderate,
             want_post_image,
             &|doc, _up| {
                 let out = secantus_core::aggregate::apply_pipeline(
@@ -9677,6 +9727,9 @@ impl Storage {
         upsert: bool,
         is_replacement: bool,
         validator: Option<&Document>,
+        // `validationLevel: "moderate"` — exempt documents that ALREADY failed
+        // the validator from update-time validation (inserts are still checked).
+        validator_moderate: bool,
         want_post_image: bool,
         transform: &dyn Fn(&Document, bool) -> Result<Document>,
     ) -> Result<UpdateOutcome> {
@@ -9697,6 +9750,7 @@ impl Storage {
                 upsert,
                 is_replacement,
                 validator,
+                validator_moderate,
                 transform,
             );
         }
@@ -9710,6 +9764,7 @@ impl Storage {
             upsert,
             is_replacement,
             validator,
+            validator_moderate,
             want_post_image,
             transform,
         )
@@ -9738,6 +9793,8 @@ impl Storage {
         upsert: bool,
         is_replacement: bool,
         validator: Option<&Document>,
+        // `validationLevel: "moderate"` — see `update_matching_core`.
+        validator_moderate: bool,
         transform: &dyn Fn(&Document, bool) -> Result<Document>,
     ) -> Result<UpdateOutcome> {
         let (matched, modified) = {
@@ -9782,6 +9839,7 @@ impl Storage {
                                 coll_opt,
                                 is_replacement,
                                 validator,
+                                validator_moderate,
                                 transform,
                             )
                         })
@@ -9808,6 +9866,7 @@ impl Storage {
                 upsert,
                 is_replacement,
                 validator,
+                validator_moderate,
                 false,
                 transform,
             );
@@ -9836,6 +9895,8 @@ impl Storage {
         coll_opt: Option<&Collation>,
         is_replacement: bool,
         validator: Option<&Document>,
+        // `validationLevel: "moderate"` — see `update_matching_core`.
+        validator_moderate: bool,
         transform: &dyn Fn(&Document, bool) -> Result<Document>,
     ) -> Result<(usize, usize, usize)> {
         let ns = format!("{db}.{coll}");
@@ -9885,7 +9946,13 @@ impl Storage {
                 continue;
             }
             if let Some(v) = validator {
-                if !query_matches(&new, v, &Document::new(), None).unwrap_or(true) {
+                let new_ok = query_matches(&new, v, &Document::new(), None).unwrap_or(true);
+                // `moderate` exempts a doc that ALREADY failed the validator
+                // before this update; one that currently satisfies it is still
+                // held to it, so an update cannot break a valid doc.
+                let was_already_invalid = validator_moderate
+                    && !query_matches(&doc, v, &Document::new(), None).unwrap_or(true);
+                if !new_ok && !was_already_invalid {
                     return Err(StorageError::DocumentValidationFailure);
                 }
             }
@@ -9959,6 +10026,9 @@ impl Storage {
         upsert: bool,
         is_replacement: bool,
         validator: Option<&Document>,
+        // `validationLevel: "moderate"` — exempt documents that ALREADY failed
+        // the validator from update-time validation (inserts are still checked).
+        validator_moderate: bool,
         want_post_image: bool,
         transform: &dyn Fn(&Document, bool) -> Result<Document>,
     ) -> Result<UpdateOutcome> {
@@ -10014,7 +10084,12 @@ impl Storage {
                         // validator the query engine can't evaluate is treated as
                         // passing (lenient), matching the insert path.
                         if let Some(v) = validator {
-                            if !query_matches(&new, v, &Document::new(), None).unwrap_or(true) {
+                            let new_ok =
+                                query_matches(&new, v, &Document::new(), None).unwrap_or(true);
+                            // `moderate`: see the sibling update site above.
+                            let was_already_invalid = validator_moderate
+                                && !query_matches(&doc, v, &Document::new(), None).unwrap_or(true);
+                            if !new_ok && !was_already_invalid {
                                 return Err(StorageError::DocumentValidationFailure);
                             }
                         }

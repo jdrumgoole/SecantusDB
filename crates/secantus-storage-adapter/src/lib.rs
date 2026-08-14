@@ -286,11 +286,12 @@ impl CmdStorage for StorageAdapter {
         let_vars: &Document,
         collation: Option<&Collation>,
         validator: Option<&Document>,
+        validator_moderate: bool,
         want_post_image: bool,
     ) -> Result<UpdateOutcome, StorageError> {
         let o = self
             .inner
-            .update_matching(
+            .update_matching_leveled(
                 db,
                 coll,
                 filter,
@@ -301,6 +302,7 @@ impl CmdStorage for StorageAdapter {
                 let_vars,
                 collation,
                 validator,
+                validator_moderate,
                 want_post_image,
             )
             .map_err(map_err)?;
@@ -324,6 +326,7 @@ impl CmdStorage for StorageAdapter {
         let_vars: &Document,
         collation: Option<&Collation>,
         validator: Option<&Document>,
+        validator_moderate: bool,
         want_post_image: bool,
     ) -> Result<UpdateOutcome, StorageError> {
         let o = self
@@ -338,6 +341,7 @@ impl CmdStorage for StorageAdapter {
                 let_vars,
                 collation,
                 validator,
+                validator_moderate,
                 want_post_image,
             )
             .map_err(map_err)?;

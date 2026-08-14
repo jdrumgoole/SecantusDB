@@ -5358,6 +5358,7 @@ class Storage:
         let: dict[str, Any] | None = None,
         collation: Any = None,
         validator: dict[str, Any] | None = None,
+        validator_moderate: bool = False,
         journal: bool = False,
         return_post_images: bool = False,
     ) -> dict[str, Any]:
@@ -5377,6 +5378,7 @@ class Storage:
                 let=let,
                 collation=collation,
                 validator=validator,
+                validator_moderate=validator_moderate,
                 journal=journal,
                 return_post_images=return_post_images,
             )
@@ -5391,6 +5393,7 @@ class Storage:
             let=let,
             collation=collation,
             validator=validator,
+            validator_moderate=validator_moderate,
             journal=journal,
             return_post_images=return_post_images,
         )
@@ -5407,6 +5410,7 @@ class Storage:
         let: dict[str, Any] | None,
         collation: Any,
         validator: dict[str, Any] | None,
+        validator_moderate: bool = False,
         journal: bool,
         return_post_images: bool,
     ) -> dict[str, Any]:
@@ -5451,6 +5455,7 @@ class Storage:
                     let=let,
                     collation_obj=collation_obj,
                     validator=validator,
+                    validator_moderate=validator_moderate,
                     journal=journal,
                     want_posts=post_images is not None,
                 )
@@ -5477,6 +5482,7 @@ class Storage:
                 let=let,
                 collation=collation,
                 validator=validator,
+                validator_moderate=validator_moderate,
                 journal=journal,
                 return_post_images=return_post_images,
             )
@@ -5503,6 +5509,7 @@ class Storage:
         let: dict[str, Any] | None,
         collation_obj: Any,
         validator: dict[str, Any] | None,
+        validator_moderate: bool = False,
         journal: bool,
         want_posts: bool,
     ) -> tuple[int, int, int, list[dict[str, Any]]]:
@@ -5555,7 +5562,18 @@ class Storage:
                     let=let,
                 )
                 if new != doc:
-                    if validator is not None and not matches(new, validator):
+                    # ``validationLevel: "moderate"`` exempts a document that
+                    # ALREADY failed the validator before this update — the level
+                    # exists so a validator can be added to a collection with
+                    # legacy rows without freezing them. A doc that currently
+                    # SATISFIES the validator is still held to it, so an update
+                    # cannot break a valid doc.
+                    was_already_invalid = validator_moderate and not matches(doc, validator)
+                    if (
+                        validator is not None
+                        and not matches(new, validator)
+                        and not was_already_invalid
+                    ):
                         raise DocumentValidationError(new.get("_id"))
                     conflict = self._unique_conflict(
                         db, coll, new, indexes, exclude_recordid=recordid, partials=partials
@@ -5638,6 +5656,7 @@ class Storage:
         let: dict[str, Any] | None = None,
         collation: Any = None,
         validator: dict[str, Any] | None = None,
+        validator_moderate: bool = False,
         journal: bool = False,
         return_post_images: bool = False,
     ) -> dict[str, Any]:
@@ -5711,7 +5730,15 @@ class Storage:
                     # rejects updates whose result fails the predicate.
                     # Caller passes ``None`` to skip
                     # (``bypassDocumentValidation: true``).
-                    if validator is not None and not matches(new, validator):
+                    # ``moderate``: see the chunked path above. BOTH update
+                    # paths enforce, and patching only one left single-document
+                    # updates — the common case — still rejecting.
+                    was_already_invalid = validator_moderate and not matches(doc, validator)
+                    if (
+                        validator is not None
+                        and not matches(new, validator)
+                        and not was_already_invalid
+                    ):
                         raise DocumentValidationError(new.get("_id"))
                     # _id is immutable, so the row's RecordId is the right write
                     # target and its id_key is unchanged. For timeseries the
