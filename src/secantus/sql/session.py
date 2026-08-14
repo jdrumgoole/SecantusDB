@@ -8,10 +8,19 @@ through ``run_sql`` so session functions (``current_database()``,
 
 from __future__ import annotations
 
+import itertools
+import os
 import threading
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
+
+# Per-session temp-namespace numbers (``pg_temp_<n>`` — real PG mints one
+# schema per backend). Seeded from the pid like the wire server's backend_pid
+# sequence, so a namespace left behind by a crashed process (temp catalog
+# entries persist in storage until their session drops them) is vanishingly
+# unlikely to be re-minted and collide with its stale tables.
+_TEMP_SCHEMA_SEQ = itertools.count((os.getpid() & 0x7FFFFF) << 8 | 1)
 
 # Short form for the ``server_version`` ParameterStatus (libpq parses the
 # leading number to gate features); the long banner is what ``version()``
@@ -305,10 +314,15 @@ class Session:
     # ``secantus.rbac.check_privilege`` — the same model the Mongo server uses.
     authz_active: bool = False
     roles: list[Any] = field(default_factory=list)
-    # Temp tables this session created (``(db, name)``) — dropped at connection
-    # teardown by ``engine.drop_session_temp_tables`` (PG drops temp tables at
-    # session end; embedded ``run_sql`` sessions live for the process).
+    # Temp tables this session created (``(db, name)``, name carrying the
+    # ``pg_temp_<n>.`` prefix) — dropped at connection teardown by
+    # ``engine.drop_session_temp_tables`` (PG drops temp tables at session
+    # end; embedded ``run_sql`` sessions live for the process).
     temp_tables: set[tuple[str, str]] = field(default_factory=set)
+    # This session's private temp namespace (``pg_temp_<n>``), allocated
+    # lazily on first use — real PG gives every backend its own temp schema,
+    # which is what keeps concurrent sessions' same-named temp tables apart.
+    temp_schema: str | None = None
     # SET ROLE / SET SESSION AUTHORIZATION (#128). ``user`` is the *session user*
     # — the login identity, changed only by SET SESSION AUTHORIZATION. ``role`` is
     # the *current role* override set by SET ROLE (None = current role tracks the
@@ -580,6 +594,12 @@ class Session:
         if self.txn_handle is None:
             return b"I"
         return b"E" if self.txn_failed else b"T"
+
+    def ensure_temp_schema(self) -> str:
+        """This session's temp namespace, allocating it on first use."""
+        if self.temp_schema is None:
+            self.temp_schema = f"pg_temp_{next(_TEMP_SCHEMA_SEQ)}"
+        return self.temp_schema
 
     @property
     def search_path(self) -> list[str]:

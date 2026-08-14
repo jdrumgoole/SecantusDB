@@ -1212,8 +1212,9 @@ def _expr_to_filter(
             expression=exp.Literal.string("t"),
         )
         session = getattr(subctx, "session", None)
+        # temp_tables carries the pg_temp_<n>. prefix; pg_class relname is bare.
         own = sorted(
-            name
+            name.split(".", 1)[1] if "." in name else name
             for (tdb, name) in (getattr(session, "temp_tables", None) or ())
             if subctx is None or tdb == subctx.db
         )
@@ -1788,7 +1789,12 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
     fks = _extract_foreign_keys(schema, table_name)
     checks, uniques = _extract_constraints(schema, table_name)
     props = stmt.args.get("properties")
-    is_temp = bool(props) and any(isinstance(p, exp.TemporaryProperty) for p in props.expressions)
+    # A pg_temp_<n>-homed name is temp even without the TEMP keyword — CREATE
+    # TABLE pg_temp.t is a temp table in real PG (the qualifier was rewritten
+    # to the session's namespace by qualify_from_search_path).
+    is_temp = (
+        bool(props) and any(isinstance(p, exp.TemporaryProperty) for p in props.expressions)
+    ) or table_name.startswith("pg_temp_")
     table = TableDef(
         name=table_name,
         collection=table_name,
@@ -4667,23 +4673,65 @@ def qualify_from_search_path(stmt: exp.Expression, catalog: Any, db: str, sessio
     name cannot land in different schemas.
 
     Names bound by a CTE in scope are left alone — they shadow real relations.
+
+    The session's private temp namespace (``pg_temp_<n>``) participates the way
+    real PG's does: an explicit ``pg_temp.<name>`` qualifier is rewritten to the
+    session's own namespace, and — unless the user placed ``pg_temp`` explicitly
+    on the path — an unqualified name is tried against the temp namespace FIRST,
+    so a session's temp table shadows a permanent one of the same name.
     """
     path = [s for s in session.search_path if s != "public"]
-    if not path:
-        return
+    temp_ns = getattr(session, "temp_schema", None)
     cte_names = {cte.alias_or_name.lower() for cte in stmt.find_all(exp.CTE) if cte.alias_or_name}
     skip = _create_target(stmt)
+    temp_first = temp_ns is not None and "pg_temp" not in path
     for table in stmt.find_all(exp.Table):
-        if table.args.get("db") is not None or not table.name:
+        if not table.name:
+            continue
+        schema_arg = table.args.get("db")
+        if schema_arg is not None:
+            # ``pg_temp.<name>`` means *this session's* temp namespace. A create
+            # target resolves here too — CREATE TABLE pg_temp.t IS a temp table
+            # (the engine's qualify_temp_create_target handles the temp flag).
+            if schema_arg.name == "pg_temp":
+                table.set("db", exp.to_identifier(session.ensure_temp_schema()))
             continue
         if table.name.lower() in cte_names or table is skip:
+            continue
+        if temp_first and catalog.get(db, f"{temp_ns}.{table.name}") is not None:
+            table.set("db", exp.to_identifier(temp_ns))
             continue
         if catalog.get(db, table.name) is not None:
             continue
         for schema in path:
-            if catalog.get(db, f"{schema}.{table.name}") is not None:
-                table.set("db", exp.to_identifier(schema))
+            resolved = temp_ns if schema == "pg_temp" and temp_ns is not None else schema
+            if catalog.get(db, f"{resolved}.{table.name}") is not None:
+                table.set("db", exp.to_identifier(resolved))
                 break
+
+
+def qualify_temp_create_target(stmt: exp.Create, session: Any) -> None:
+    """Home a ``CREATE TEMP TABLE`` target in the session's private temp
+    namespace (``pg_temp_<n>``) by qualifying the target node in place, so
+    concurrent sessions' same-named temp tables land on distinct catalog keys
+    — real PG gives every backend its own temp schema. An explicit ``pg_temp``
+    qualifier was already rewritten by ``qualify_from_search_path``; a TEMP
+    keyword aimed at any other schema is rejected like real PG."""
+    target = _create_target(stmt)
+    if target is None:
+        return
+    props = stmt.args.get("properties")
+    is_temp_kw = bool(props) and any(
+        isinstance(p, exp.TemporaryProperty) for p in props.expressions
+    )
+    if not is_temp_kw:
+        return
+    schema = target.args.get("db")
+    sname = schema.name if schema is not None else None
+    if sname is None:
+        target.set("db", exp.to_identifier(session.ensure_temp_schema()))
+    elif sname != getattr(session, "temp_schema", None):
+        raise errors.SQLError("42P16", "cannot create temporary relation in non-temporary schema")
 
 
 def _lookup_table_def(
