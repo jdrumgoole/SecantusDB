@@ -240,3 +240,64 @@ def test_copy_query_from_stdin_rejected(client):
     assert m.type == "E"
     assert pgwire.parse_error_response(m.payload)["C"] == "42601"
     client.read_until_ready()
+
+
+# --------------------------------------------------------------------------- #
+# Copy frames arriving outside a COPY operation are discarded (pgx streams
+# CopyData concurrently with the COPY command, so the frames land after the
+# command already failed). Real PG accepts and ignores stray CopyData /
+# CopyDone / CopyFail per the protocol spec; routing them into the extended
+# protocol raised 08P01 and poisoned the connection.
+
+
+def test_copy_data_after_failed_copy_is_discarded(client):
+    # pgx's CopyFrom shape: the command and the data are pumped without
+    # waiting for CopyInResponse. The COPY fails (42P01), then the stray
+    # frames must be dropped and the connection stay usable.
+    client.send(pgwire.build_query("COPY nosuchtable FROM STDIN"))
+    client.send(pgwire.copy_data(b"id\t0\n"))
+    client.send(pgwire.copy_done())
+    msgs = client.read_until_ready()
+    errs = [m for m in msgs if m.type == "E"]
+    assert len(errs) == 1
+    assert pgwire.parse_error_response(errs[0].payload)["C"] == "42P01"
+    tags = [m.type for m in client.query("SELECT 1")]
+    assert "D" in tags and tags[-1] == "Z"
+
+
+def test_copy_data_after_syntax_error_is_discarded(client):
+    # The pgx TestConnCopyFromQuerySyntaxError shape: the "COPY" command is
+    # not even SQL, and 1000 rows are streamed regardless.
+    client.send(pgwire.build_query("cropy t FROM STDIN WITH (FORMAT csv)"))
+    for i in range(1000):
+        client.send(pgwire.copy_data(f'{i},"foo {i} bar"\n'.encode()))
+    client.send(pgwire.copy_done())
+    msgs = client.read_until_ready()
+    errs = [m for m in msgs if m.type == "E"]
+    assert len(errs) == 1
+    assert pgwire.parse_error_response(errs[0].payload)["C"] == "42601"
+    tags = [m.type for m in client.query("SELECT 1")]
+    assert "D" in tags and tags[-1] == "Z"
+
+
+def test_stray_copy_fail_is_discarded(client):
+    client.send(pgwire.build_query("COPY nosuchtable FROM STDIN"))
+    client.send(pgwire.copy_fail("client gave up"))
+    msgs = client.read_until_ready()
+    assert [m.type for m in msgs if m.type == "E"] == ["E"]
+    tags = [m.type for m in client.query("SELECT 1")]
+    assert "D" in tags and tags[-1] == "Z"
+
+
+def test_failed_copy_then_valid_copy_succeeds(client):
+    # The pgx TestConnCopyFromDataWriteAfterErrorAndReturn shape: a failed
+    # COPY (with data still streaming in) followed by a valid COPY on the
+    # same connection.
+    client.send(pgwire.build_query("COPY nosuchtable FROM STDIN"))
+    client.send(pgwire.copy_data(b"id\t0\n"))
+    client.send(pgwire.copy_done())
+    client.read_until_ready()
+    msgs = _copy_in(client, "COPY t FROM STDIN", b"7\tcarol\tt\n")
+    assert _tag(msgs) == "COPY 1"
+    rows = [m for m in client.query("SELECT id, name FROM t WHERE id = 7") if m.type == "D"]
+    assert len(rows) == 1
