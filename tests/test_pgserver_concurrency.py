@@ -186,8 +186,8 @@ def test_autocommit_computed_updates_lose_no_increments(server):
 
         n = c.execute("SELECT n FROM ctr").fetchone()[0]
         assert n == WORKERS * per_worker, (
-            f"lost increments: n={n}, per-worker rowcounts={outcomes}, "
-            f"implicit-txn counters={pgextended.COUNTERS}"
+            f"lost increments: n={n}, implicit-txn counters={pgextended.COUNTERS}, "
+            f"per-worker rowcounts={outcomes}"
         )
 
 
@@ -433,6 +433,6 @@ def test_dual_protocol_txn_vs_autocommit_stall_is_bounded(server):
         from secantus.sql import pgextended
 
         assert n == 40, (
-            f"lost increments: n={n}, per-worker rowcounts={outcomes}, "
-            f"implicit-txn counters={pgextended.COUNTERS}"
+            f"lost increments: n={n}, implicit-txn counters={pgextended.COUNTERS}, "
+            f"per-worker rowcounts={outcomes}"
         )
