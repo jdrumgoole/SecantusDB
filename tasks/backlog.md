@@ -2476,16 +2476,16 @@ threading into `wt_config`.)
 
 ### pgx gauge — `pgconn` findings and next steps (2026-08-14)
 
-**Where it stands: `pgconn` is at 13 failures** (of 216 tests): 86 → 29 after
-the `generate_series` untyped-bound fix (#862), 29 → 23 after per-session
-temp-table namespacing (#866, re-measured 2026-08-14 at `7cab7a3a`), 23 → 20
-after the stray-CopyData drain fix (#868), 20 → 18 after plain-json compact
-rendering (#869), 18 → 17 after the legacy bare `COPY … BINARY` keyword fix
-(#870), and 17 → 13 after wire CancelRequest support (each fix's affected
-tests verified individually against the fixed server; re-run the whole
-package for the next full count). The other three
-pgx packages were already clean (`bgreader` 6/6, `ctxwatch` 6/6, `pgproto3`
-171/172), so `pgconn` is the whole gauge gap.
+**Where it stands: `pgconn` is at 12 failures** (of 216 tests, full-package
+run measured 2026-08-15 at `b8b1b171`): 86 → 29 after the `generate_series`
+untyped-bound fix (#862), 29 → 23 after per-session temp-table namespacing
+(#866), 23 → 20 after the stray-CopyData drain fix (#868), 20 → 18 after
+plain-json compact rendering (#869), 18 → 17 after the legacy bare
+`COPY … BINARY` keyword fix (#870), 17 → 13 after wire CancelRequest support
+(#871), and the full re-run measured 12 — `TestConnExecBatchImplicitTransaction`
+also passes now (pipeline implicit-transaction work, #856 line). The other
+three pgx packages were already clean (`bgreader` 6/6, `ctxwatch` 6/6,
+`pgproto3` 171/172), so `pgconn` is the whole gauge gap.
 
 **What the 86 → 29 fix was, and why it was worth so much.** pgx's
 `ensureConnValid` helper (`pgconn/helper_test.go:28`) runs
@@ -2498,7 +2498,7 @@ the reusable part: in this gauge, a shared test helper can make one gap look
 like a whole subsystem. Read the actual failure text before believing the
 test names.**
 
-**The remaining 13 cluster into:**
+**The remaining 12 (full-package re-run, 2026-08-15) cluster into:**
 
 * **COPY residuals (2)** — the temp-table mode is gone. Fixed so far: the
   stray-frame cluster (`TestConnCopyFromQuerySyntaxError` /
@@ -2533,14 +2533,15 @@ test names.**
   the `Stress_N` subtests), `TestConnCancelRequest`,
   `TestConnContextCanceledCancelsRunningQueryOnServer`,
   `TestConnCopyToCanceled`.
-* **Assorted (12)** — `TestConnExecBatchImplicitTransaction`,
-  `TestConnExecParamsMaxNumberOfParams` / `...PreparedMaxNumberOfParams` /
-  `...PreparedTooManyParams`, `TestConnPrepareSyntaxError`,
-  `TestConnExecMultipleQueriesError`, `TestConnExecStatementNetworkUsage`,
+* **Assorted (11)** — `TestConnExecParamsMaxNumberOfParams` /
+  `...PreparedMaxNumberOfParams` / `...PreparedTooManyParams`,
+  `TestConnPrepareSyntaxError`, `TestConnExecMultipleQueriesError`,
+  `TestConnExecStatementNetworkUsage`,
   `TestConnLargeResponseWhileWritingDoesNotDeadlock`,
   `TestConnWaitForNotification` (120 s timeout), `TestConnectProtocolVersion32`,
   `TestConnectWithValidateConnectTargetSessionAttrsReadWrite`,
-  `TestPipelinePrepareError`.
+  `TestPipelinePrepareError`. (`TestConnExecBatchImplicitTransaction` passes
+  as of the 2026-08-15 re-run.)
 
 #### Temp tables: concurrent namespacing FIXED and CONFIRMED as the cluster's cause
 
