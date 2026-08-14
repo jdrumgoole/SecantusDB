@@ -556,6 +556,7 @@ class SecantusPGServer:
     def _query_loop(self, conn: socket.socket, session: Session) -> None:
         # Per-connection extended-protocol state (prepared statements + portals).
         ext = ExtendedSession(self.storage, session)
+        ext.peek_more_pipelined = lambda: _peek_execute_before_sync(conn)
         while not self._stop_event.is_set():
             # idle_in_transaction_session_timeout: while a transaction is open,
             # bound the wait for the next command; exceeding it aborts the
@@ -1024,6 +1025,40 @@ def main(argv: list[str] | None = None) -> int:
     server.start()
     stopped.wait()
     return 0
+
+
+def _peek_execute_before_sync(conn: Any) -> bool:
+    """Whether the client has ALREADY sent another Execute before the next
+    Sync (i.e. this is a multi-statement pipeline — pgjdbc batches arrive in
+    one write). Non-destructive: MSG_PEEK on plain sockets, ``pending()`` on
+    TLS. Incomplete frames read conservatively as "no" — an early implicit
+    commit is indistinguishable from the client pausing mid-pipeline."""
+    try:
+        if hasattr(conn, "pending"):  # TLS: decrypted-but-unread bytes only
+            n = conn.pending()
+            if not n:
+                return False
+            data = conn.recv(n, socket.MSG_PEEK)  # type: ignore[arg-type]
+        else:
+            conn.setblocking(False)
+            try:
+                data = conn.recv(65536, socket.MSG_PEEK)
+            finally:
+                conn.setblocking(True)
+    except (OSError, ValueError):
+        return False
+    off = 0
+    while off + 5 <= len(data):
+        mtype = data[off : off + 1]
+        (length,) = struct.unpack_from("!i", data, off + 1)
+        if length < 4:
+            return False
+        if mtype == b"S":
+            return False
+        if mtype == b"E":
+            return True
+        off += 1 + length
+    return False
 
 
 if __name__ == "__main__":

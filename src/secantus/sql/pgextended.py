@@ -1031,6 +1031,11 @@ class ExtendedSession:
     def __init__(self, storage: Any, session: Session) -> None:
         self.storage = storage
         self.session = session
+        # Set by the server loop: whether another Execute is already
+        # buffered before the next Sync (multi-statement pipeline).
+        self.peek_more_pipelined = lambda: False
+        # Statements executed inside the current implicit transaction.
+        self._implicit_stmts = 0
         self.catalog = Catalog(storage)
         self.prepared: dict[str, Prepared] = {}
         self.portals: dict[str, Portal] = {}
@@ -1044,7 +1049,17 @@ class ExtendedSession:
         """Handle one extended-protocol message; return the bytes to send."""
         if msg_type == "S":  # Sync — always answered, clears any error state
             self.skip_until_sync = False
-            self._settle_implicit_txn()
+            try:
+                self._settle_implicit_txn()
+            except errors.SQLError as exc:
+                # A failed pipeline commit: the client must learn its
+                # statements' effects are gone — ErrorResponse, then the
+                # ReadyForQuery Sync always gets.
+                return pgwire.error_response(
+                    exc.sqlstate,
+                    exc.message,
+                    encoding=self.session.wire_encoding,
+                ) + pgwire.ready_for_query(self.session.txn_status())
             return pgwire.ready_for_query(self.session.txn_status())
         if self.skip_until_sync:
             return b""  # discard everything until the next Sync
@@ -1243,10 +1258,14 @@ class ExtendedSession:
             else:
                 engine._commit_txn(self.storage, self.session.database, self.catalog, session)
         except errors.SQLError:
-            # A commit failure surfaces as an aborted transaction; the state
-            # is cleared either way so the next pipeline starts fresh.
+            # The pipeline's effects are lost — that must be an ERROR the
+            # client sees (silently swallowing one lost a committed-looking
+            # increment on the Windows lane), so re-raise after clearing the
+            # transaction state; Sync's caller turns it into an ErrorResponse
+            # ahead of ReadyForQuery.
             with contextlib.suppress(Exception):
                 engine._rollback_txn(self.storage, session)
+            raise
 
     def _describe(self, payload: bytes) -> bytes:
         kind, name = pgwire.parse_describe(payload)
@@ -1308,6 +1327,7 @@ class ExtendedSession:
                 self.session.txn_handle = self.storage.begin_user_transaction()
                 self.session.txn_failed = False
                 self.session.txn_is_implicit = True
+                self._implicit_stmts = 0
                 first_in_implicit = True
             # PG's cached-plan revalidation happens at PLANNING time — before
             # any side effect. A data-modifying CTE (`WITH x AS (INSERT …)
@@ -1360,6 +1380,35 @@ class ExtendedSession:
                         self.session.txn_is_implicit = True
             finally:
                 sess.state = "idle"
+            if self.session.txn_is_implicit:
+                self._implicit_stmts += 1
+                # A single-statement pipeline (nothing further buffered before
+                # the Sync) commits HERE, where the statement can still be
+                # re-run if the commit itself loses a write-write race — the
+                # result bytes haven't been sent yet, so the retry is
+                # invisible. Multi-statement pipelines stay open for Sync.
+                if self._implicit_stmts == 1 and not self.peek_more_pipelined():
+                    while True:
+                        try:
+                            engine._commit_txn(
+                                self.storage, self.session.database, self.catalog, self.session
+                            )
+                            break
+                        except errors.SQLError as exc:
+                            if exc.sqlstate != "40001":
+                                raise
+                            with contextlib.suppress(Exception):
+                                engine._rollback_txn(self.storage, self.session)
+                            self.session.txn_handle = self.storage.begin_user_transaction()
+                            self.session.txn_failed = False
+                            self.session.txn_is_implicit = True
+                            portal.result = engine.run_statement(
+                                self.storage,
+                                self.session.database,
+                                bound,
+                                self.session,
+                                self.catalog,
+                            )
             # First execution captures the plan identity (see
             # Prepared.plan_shape); later executions are checked BEFORE
             # running, above. Named statements only: PG re-plans unnamed
