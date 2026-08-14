@@ -171,14 +171,24 @@ def test_autocommit_computed_updates_lose_no_increments(server):
         c.execute("INSERT INTO ctr VALUES (1, 0)")
     per_worker = 50
 
+    outcomes: dict[int, list[str]] = {}
+
     def worker(i: int) -> None:
+        log = outcomes.setdefault(i, [])
         with connect(server) as c:
             for _ in range(per_worker):
-                c.execute("UPDATE ctr SET n = n + 1 WHERE id = 1")
+                cur = c.execute("UPDATE ctr SET n = n + 1 WHERE id = 1")
+                log.append(str(cur.rowcount))
 
     run_workers(WORKERS, worker)
     with connect(server) as c:
-        assert c.execute("SELECT n FROM ctr").fetchone() == (WORKERS * per_worker,)
+        from secantus.sql import pgextended
+
+        n = c.execute("SELECT n FROM ctr").fetchone()[0]
+        assert n == WORKERS * per_worker, (
+            f"lost increments: n={n}, per-worker rowcounts={outcomes}, "
+            f"implicit-txn counters={pgextended.COUNTERS}"
+        )
 
 
 def test_transactional_increments_retry_to_exact_total(server):
