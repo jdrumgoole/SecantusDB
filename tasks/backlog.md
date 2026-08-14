@@ -2474,6 +2474,78 @@ threading into `wt_config`.)
 
 ## SQL / PostgreSQL interface — P0 spike limitations
 
+### SQL / PostgreSQL section — survey (2026-08-14)
+
+**The headline count is wrong by 4x.** The section carries 126 unchecked
+`- [ ]` items, which reads as 126 open problems. It is not: **95 of them are
+completed work whose headline literally says "landed" / "shipped" / "FIXED"**
+and whose box was never ticked. CLAUDE.md says to delete an item's line when
+it is fixed; that has not been happening here, and the section has become a
+changelog wearing a to-do list's clothes.
+
+**Two entries were actively misleading, not merely stale.** `CHECK / UNIQUE
+constraints — declared, reflected, NOT enforced` (b91) and `Foreign keys —
+declared, reflected, NOT enforced` (b81) are contradicted by a LATER entry,
+`Enforcement made uniform across all write paths` (b98). Measured against the
+real engine rather than trusting either:
+
+```
+CHECK    violate -> SQLError: new row for relation "c1" violates check constraint "c1_n_check"
+UNIQUE   dup     -> SQLError: duplicate key value violates unique constraint "u1_n_key"
+NOT NULL null    -> SQLError: null value in column "n" violates not-null constraint
+FK       orphan  -> SQLError: insert or update on table "ch1" violates foreign key constraint
+```
+
+All four are enforced, with Postgres-shaped messages. A reader skimming for
+data-integrity risk would have found two entries announcing that constraints
+are not enforced — the single most alarming thing a database backlog can say —
+and both are false. That is worse than a stale checkbox: it misdirects
+attention away from real problems.
+
+**After removing landed work and status notes, ~17 items are genuinely open.**
+They cluster into four groups, in the order I would tackle them:
+
+1. **Shared-storage constraints (won't fix at this layer)** — sub-millisecond
+   timestamp fidelity (~11 gauge tests) and `numeric` beyond 34 significant
+   digits. Both are consequences of storing SQL values as BSON, the same
+   representation the Mongo side reads. Fixing either means diverging SQL
+   storage from the dual-protocol reflected-table path. These should be moved
+   OUT of the open list into "out of scope with reasoning" — they are
+   decisions, not tasks.
+
+2. **Driver-gauge clusters** — pgjdbc, pgtest, and pgx each have a bucket of
+   remaining failures. This is the same shape as the Mongo-side gauge work
+   that took driver conformance from 53 real failures to ~2, and the same
+   method applies: read the actual failure output, cluster by root cause, and
+   expect one cause to explain many failures.
+
+3. **Protocol/semantic gaps with real users** — query pipelining, streaming
+   COPY OUT abort, cross-connection async NOTIFY delivery, write-conflict
+   retry (40001) semantics, and `SAVEPOINT` as a no-op. SAVEPOINT is the one
+   I would look at first: silently accepting a savepoint and then not rolling
+   back to it can lose a caller's intent without an error, which is the
+   pattern behind the retryable-write corruption found earlier this session.
+
+4. **Correctness edges** — cross-type comparisons returning false where
+   Postgres raises `42883`, the `HAVING` general-shape residual, and
+   `DatatypeMismatch` on untyped parameters.
+
+**Recommended first action is not a code change.** Reconcile the section:
+delete or tick the 95 landed items, move the two shared-storage constraints
+to the out-of-scope section, and correct the two false "NOT enforced"
+headlines. That takes the section from 126 apparent problems to ~17 real
+ones, and removes two entries that actively point away from where the risk
+is. Only then is a prioritised implementation plan worth writing, because
+only then does the list describe reality.
+
+**Method note.** Every claim above was checked against the engine or the
+file, not inferred from the entry text. The two "NOT enforced" entries are
+the fourth, fifth and sixth stale-or-wrong backlog claims found this session
+(after the two transaction divergences, the php-lib "out of scope" reading,
+and the `maxMessageSizeBytes` framing). The pattern is consistent enough to
+be worth naming: **this backlog's prose is a hypothesis, not evidence.**
+
+
 - [ ] **Cross-type comparisons evaluate to false instead of erroring.** A per-row
   predicate comparing incompatible types (`int_col = substr(text_col, 1, 1)`)
   quietly matches nothing; real Postgres raises `42883 operator does not exist:
