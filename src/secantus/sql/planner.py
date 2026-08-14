@@ -4707,6 +4707,121 @@ def _lookup_table_def(
     return None
 
 
+def expand_using_star(stmt: exp.Select, catalog: Any, db: str) -> None:
+    """Expand a lone ``SELECT *`` over USING joins into Postgres' merged list.
+
+    ``SELECT * FROM a JOIN b USING (k)`` returns the join column ONCE (from
+    the left side; the right side for RIGHT joins; ``COALESCE`` for FULL),
+    then each source's remaining columns in FROM order. Our star expansion
+    emitted ``k`` once per side. Rewriting the AST here — one site, before
+    planning — beats teaching every star-expansion path about join shapes.
+
+    Sound-not-complete: anything unusual (mixed ON/USING chains, non-table
+    sources, unknown tables, ``tbl.*``, extra select items, outer sides in a
+    multi-join chain) bails and keeps the old expansion.
+    """
+    if len(stmt.expressions) != 1 or not isinstance(stmt.expressions[0], exp.Star):
+        return
+    from_node = stmt.args.get("from_")
+    joins = stmt.args.get("joins") or []
+    if from_node is None or not joins or not all(j.args.get("using") for j in joins):
+        return
+    if len(joins) > 1 and any(j.side for j in joins):
+        return  # outer sides in a chain: merge-source rules get positional; bail
+
+    def resolve(node: exp.Expression) -> tuple[str, Any] | None:
+        if not isinstance(node, exp.Table) or not isinstance(node.this, exp.Identifier):
+            return None
+        td = catalog.get(db, node.name) if catalog is not None else None
+        if td is None:
+            return None
+        return (node.alias or node.name, td)
+
+    base = resolve(from_node.this)
+    if base is None:
+        return
+    sources = [base]
+    for j in joins:
+        r = resolve(j.this)
+        if r is None:
+            return
+        sources.append(r)
+    cols_of = {alias: [c.name for c in td.columns] for alias, td in sources}
+
+    # Merged USING columns, in first-use order; each must exist in the left
+    # accumulation and the join's right side, or we bail.
+    merged: list[str] = []
+    for i, j in enumerate(joins):
+        right_alias = sources[i + 1][0]
+        left_aliases = [a for a, _ in sources[: i + 1]]
+        for u in j.args["using"]:
+            name = u.name
+            if name not in cols_of[right_alias] or not any(
+                name in cols_of[a] for a in left_aliases
+            ):
+                return
+            if name not in merged:
+                merged.append(name)
+
+    def qcol(alias: str, name: str) -> exp.Column:
+        return exp.column(name, table=alias)
+
+    out: list[exp.Expression] = []
+    for name in merged:
+        holders = [a for a, _ in sources if name in cols_of[a]]
+        side = joins[0].side if len(joins) == 1 else None
+        if side == "FULL":
+            out.append(
+                exp.alias_(
+                    exp.Coalesce(
+                        this=qcol(holders[0], name),
+                        expressions=[qcol(h, name) for h in holders[1:]],
+                    ),
+                    name,
+                )
+            )
+        elif side == "RIGHT":
+            out.append(exp.alias_(qcol(holders[-1], name), name))
+        else:
+            out.append(exp.alias_(qcol(holders[0], name), name))
+    for alias, _td in sources:
+        for name in cols_of[alias]:
+            if name not in merged:
+                out.append(qcol(alias, name))
+    stmt.set("expressions", out)
+
+
+def expand_table_stars(stmt: exp.Select, catalog: Any, db: str) -> None:
+    """Expand ``tbl.*`` select items over a JOIN into explicit columns.
+
+    The join planner resolves select items column-by-column and crashed on a
+    table-qualified star (``column "*" does not exist``). Postgres expands it
+    to the table's columns in order — and does NOT merge USING columns for
+    ``tbl.*`` (only the bare ``*`` merges). Bails per-item when the source
+    isn't a resolvable plain table."""
+    joins = stmt.args.get("joins") or []
+    from_node = stmt.args.get("from_")
+    if from_node is None or not joins:
+        return
+    if not any(
+        isinstance(e, exp.Column) and isinstance(e.this, exp.Star) for e in stmt.expressions
+    ):
+        return
+    defs: dict[str, Any] = {}
+    for node in [from_node.this] + [j.this for j in joins]:
+        if isinstance(node, exp.Table) and isinstance(node.this, exp.Identifier):
+            td = catalog.get(db, node.name) if catalog is not None else None
+            if td is not None:
+                defs[node.alias or node.name] = td
+    out: list[exp.Expression] = []
+    for e in stmt.expressions:
+        if isinstance(e, exp.Column) and isinstance(e.this, exp.Star) and e.table in defs:
+            out.extend(exp.column(c.name, table=e.table) for c in defs[e.table].columns)
+        else:
+            out.append(e)
+    stmt.set("expressions", out)
+
+
 def unwrap_paren_join_from(stmt: exp.Select) -> None:
     """Hoist a parenthesized join out of FROM, in place.
 

@@ -79,13 +79,17 @@ class TestUnaffectedJoinForms:
         assert db("SELECT count(*) FROM a, b") == [(4,)]
 
 
-class TestKnownDivergence:
-    def test_star_does_not_merge_the_joined_column(self, db):
-        """Postgres merges the USING column, returning ``(1, 'x', 'p')``. We
-        emit it once per side. The join *rows* are correct — this is only the
-        star-expansion column list, and suppressing the duplicate means
-        touching every star-expansion path in the planner. Recorded in
-        tasks/backlog.md; this test pins the current shape so the day it is
-        fixed the change is deliberate and visible.
-        """
-        assert db("SELECT * FROM a JOIN b USING (k)") == [(1, "x", 1, "p")]
+class TestStarMerge:
+    def test_star_merges_the_joined_column(self, db):
+        """Postgres merges the USING column: ``SELECT *`` returns ``k`` once
+        (from the left side), then each source's remaining columns. Fixed by
+        ``planner.expand_using_star`` — a single pre-desugar AST rewrite —
+        after being pinned as a known divergence."""
+        assert db("SELECT * FROM a JOIN b USING (k)") == [(1, "x", "p")]
+
+    def test_tbl_star_does_not_merge(self, db):
+        """``a.*`` is NOT merged by Postgres — only the bare ``*`` is."""
+        assert db("SELECT a.* FROM a JOIN b USING (k)") == [(1, "x")]
+
+    def test_on_join_star_unchanged(self, db):
+        assert db("SELECT * FROM a JOIN b ON a.k = b.k") == [(1, "x", 1, "p")]

@@ -2583,13 +2583,12 @@ shared storage engine or building large new protocol subsystems:
     the sole FROM item). Clearing it took `PGObjectGetTest`,
     `PGObjectSetTest`, `GeometricTest` and `SearchPathLookupTest` with it and
     moved the gauge 92.5% → 93.7%. One divergence from that work remains:
-    - **`SELECT *` over a `USING` join does not merge the joined column.**
-      Postgres returns `(1, 'x', 'p')` for `SELECT * FROM a JOIN b USING (k)`;
-      we emit `k` once per side, `(1, 'x', 1, 'p')`. The join *rows* are
-      correct — this is star expansion only, and suppressing the duplicate
-      means touching every star-expansion path in the planner (there are a
-      dozen, one per join shape). Pinned by
-      `tests/test_sql_join_using.py::TestKnownDivergence`.
+    - ~~**`SELECT *` over a `USING` join does not merge the joined column.**~~
+      RESOLVED (2026-08-14): `planner.expand_using_star` rewrites the lone
+      star into the merged column list BEFORE `desugar_join_using` erases the
+      USING marker — one site, not a dozen. `tbl.*` over joins (which
+      crashed) expands via `expand_table_stars`. Pinned by
+      `tests/test_sql_join_using.py::TestStarMerge`.
     Multi-entry `search_path` resolution landed separately and moved none of
     these.
   - **`pg_type` has no array-type rows.** `typarray` on a scalar type points
