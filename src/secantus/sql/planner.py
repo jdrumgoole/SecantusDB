@@ -395,6 +395,13 @@ def _coerce_cast(value: Any, datatype: exp.Expression | None) -> Any:
         return value
     if isinstance(datatype, exp.ObjectIdentifier) and str(datatype.this).upper() == "REGCLASS":
         return _regclass_oid(value)
+    if isinstance(datatype, exp.ObjectIdentifier) and str(datatype.this).upper() == "REGPROC":
+        # ``'pg_catalog.array_in'::regproc`` in a pushdown constant — PG
+        # renders search-path-visible functions UNQUALIFIED, which is what
+        # pg_type.typinput stores (pgjdbc's is_array probe compares them).
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return str(value).rsplit(".", 1)[-1]
     if isinstance(datatype, exp.ObjectIdentifier) and str(datatype.this).upper() == "REGTYPE":
         # ``'name'::regtype`` in a pushdown constant — resolve to the type oid
         # (built-ins and, via the planning subctx, user-declared types).

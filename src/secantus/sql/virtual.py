@@ -1922,6 +1922,8 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
         row.setdefault("typrelid", 0)
         row.setdefault("typarray", 0)
         row.setdefault("typdelim", ",")
+        # Scalar / composite / enum rows are not arrays: no element type.
+        row.setdefault("typelem", 0)
         # typinput is the type's input function. Drivers do not call it; they
         # compare it to array_in to decide whether a type is an array —
         # pgjdbc's TypeInfoCache asks for ``typinput = 'pg_catalog.array_in'
@@ -1932,6 +1934,33 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
             "typinput",
             "array_in" if str(row.get("typname", "")).startswith("_") else f"{row['typname']}in",
         )
+    # Every type that advertises a ``typarray`` gets the paired array-type ROW
+    # — real pg_type has one per scalar (``_int4`` etc.), and a driver
+    # resolving an array type by the oid it read from ``typarray`` (pgjdbc's
+    # TypeInfoCache, psycopg's TypeInfo.fetch) found nothing here before.
+    # ``typelem`` points back at the element; arrays of arrays don't exist in
+    # PG, so the array row's own typarray is 0.
+    array_rows = [
+        {
+            "oid": row["typarray"],
+            "typname": f"_{row['typname']}",
+            "typcollation": 0,
+            "typnamespace": row.get("typnamespace", _NS_OIDS["pg_catalog"]),
+            "typbasetype": 0,
+            "typtypmod": -1,
+            "typnotnull": False,
+            "typdefault": None,
+            "typtype": "b",
+            "typrelid": 0,
+            "typarray": 0,
+            "typelem": row["oid"],
+            "typdelim": ",",
+            "typinput": "array_in",
+        }
+        for row in rows
+        if row.get("typarray")
+    ]
+    rows.extend(array_rows)
     return rows
 
 
@@ -2532,6 +2561,7 @@ _register(
         ("relreplident", "text"),
         ("reloftype", "int4"),
         ("relkind", "text"),
+        ("relacl", "text"),
         ("relpersistence", "text"),
         ("relam", "int4"),
         ("reloptions", "text"),
@@ -2837,6 +2867,7 @@ _register(
         ("typtype", "text"),
         ("typrelid", "int4"),
         ("typarray", "int4"),
+        ("typelem", "int4"),
         ("typdelim", "text"),
         ("typinput", "text"),
     ],

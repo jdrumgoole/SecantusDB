@@ -2592,6 +2592,17 @@ shared storage engine or building large new protocol subsystems:
       `tests/test_sql_join_using.py::TestKnownDivergence`.
     Multi-entry `search_path` resolution landed separately and moved none of
     these.
+  - ~~**`pg_type` has no array-type rows.**~~ RESOLVED (2026-08-14): every
+    type with a `typarray` gets the paired array row (`_<name>`, `typelem`
+    back-pointer, `typinput = array_in`); `typelem` column added; `::regproc`
+    strips the schema like PG (planner + scalar cast paths). EnumTest's
+    enum-array resolution works; cross-checked green on the psycopg/pg8000
+    local suites. Named residuals, all separate features: pgjdbc
+    `enumArrayArray` (nested enum-array resolution returns no rows — needs
+    the exact TypeInfoCache query captured), `testNonStandardBounds`
+    (negative array subscripts `intarr[-1]` unsupported in the planner),
+    `testUnknownArrayType` (fails beyond the now-present `relacl` — next
+    probe is the exact metadata query). Original entry:
   - **`pg_type` has no array-type rows.** `typarray` on a scalar type points
     at an oid (int4 → 1007) that has no row of its own, so a driver resolving
     an array type by oid finds nothing. `typinput` now exists and reports
