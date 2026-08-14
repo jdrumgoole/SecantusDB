@@ -342,3 +342,43 @@ def test_computed_projection_over_catalog_table():
         assert res.rows == [(1,)]
     finally:
         st.close()
+
+
+def test_generate_series_accepts_untyped_text_bounds():
+    """A bound arriving as text is parsed as a number, as Postgres does.
+
+    An untyped parameter (`generate_series(1, $1)` with `$1` sent without a
+    type OID) reaches the SRF as a string — nothing upstream coerced it,
+    because the wire gave no type. Postgres infers the parameter's type from
+    the argument position and parses it as an integer.
+
+    This is not academic: pgx's `ensureConnValid` helper runs exactly that
+    query and is called at the end of 66 `pgconn` tests, so rejecting it took
+    otherwise-passing tests down with it. Fixing it moved that package from 86
+    failures to 29.
+    """
+    assert _rows("select generate_series(1, '3')") == [(1,), (2,), (3,)]
+    assert _rows("select generate_series('1', '3')") == [(1,), (2,), (3,)]
+    # A numeric step still works alongside coerced bounds.
+    assert _rows("select generate_series('1', '10', 3)") == [(1,), (4,), (7,), (10,)]
+
+    # NOT covered, deliberately: a QUOTED third argument
+    # (`generate_series(1, 10, '3')`). sqlglot parses that into an `Interval`
+    # node at parse time, so it arrives as an interval and never reaches this
+    # coercion — a separate parser-level quirk, not this fix's job. Recorded
+    # here rather than silently omitted.
+
+
+def test_generate_series_still_rejects_non_numeric_bounds():
+    """Coercion is narrow: only strings that parse cleanly become numbers.
+
+    Guards the over-permissive direction — a bound that is genuinely not a
+    number must still raise, not silently yield an empty or nonsense series.
+    """
+    import pytest as _pytest
+
+    from secantus.sql import errors
+
+    with _pytest.raises(errors.SQLError) as exc:
+        _rows("select generate_series('a', 'b')")
+    assert "integer / numeric" in str(exc.value)
