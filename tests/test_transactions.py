@@ -15,6 +15,7 @@ import pymongo
 import pytest
 from pymongo import MongoClient
 from pymongo.errors import OperationFailure
+from pymongo.read_concern import ReadConcern
 
 from secantus import SecantusDBServer
 
@@ -401,3 +402,68 @@ def test_transaction_too_large_for_cache(tmp_path):
             assert coll.count_documents({}) == 16
         finally:
             client.close()
+
+
+def test_write_concern_inside_transaction_is_rejected(client) -> None:
+    """A per-operation ``writeConcern`` inside a transaction is InvalidOptions.
+
+    A transaction's write concern is fixed at commit time, so mongod refuses
+    one on a statement (code 72). We accepted and silently ignored it, letting
+    a caller believe a statement ran at a concern it did not.
+
+    Drivers guard this client-side — the transactions spec marks these cases
+    ``isClientError: true`` — so no driver gauge exercises it; this is the
+    raw-command path, which is exactly where fidelity is otherwise untested.
+    """
+    from pymongo.errors import OperationFailure
+
+    db = client["txn_wc"]
+    db.create_collection("c")
+    with client.start_session() as sess:
+        sess.start_transaction()
+        with pytest.raises(OperationFailure) as exc:
+            db.command(
+                {
+                    "insert": "c",
+                    "documents": [{"_id": 1}],
+                    "writeConcern": {"w": 1},
+                },
+                session=sess,
+            )
+        assert exc.value.code == 72
+        assert "Cannot set write concern after starting a transaction" in str(exc.value)
+        sess.abort_transaction()
+
+
+def test_read_concern_on_a_continuing_statement_is_rejected(client) -> None:
+    """``readConcern`` may ride only the statement that STARTS a transaction."""
+    from pymongo.errors import OperationFailure
+
+    db = client["txn_rc"]
+    db.create_collection("c")
+    with client.start_session() as sess:
+        sess.start_transaction()
+        db.command({"insert": "c", "documents": [{"_id": 1}]}, session=sess)
+        with pytest.raises(OperationFailure) as exc:
+            db.command(
+                {"find": "c", "readConcern": {"level": "local"}},
+                session=sess,
+            )
+        assert exc.value.code == 72
+        assert "Cannot set read concern after starting a transaction" in str(exc.value)
+        sess.abort_transaction()
+
+
+def test_read_concern_on_the_first_statement_is_allowed(client) -> None:
+    """The starting statement MAY carry a readConcern — that is how a
+    transaction's read concern gets chosen at all.
+
+    Guards the over-rejection direction: a blanket ban would break every
+    transaction that sets a read concern, which is the normal way to open one.
+    """
+    db = client["txn_rc_ok"]
+    db.create_collection("c")
+    with client.start_session() as sess:
+        with sess.start_transaction(read_concern=ReadConcern("local")):
+            db.c.insert_one({"_id": 1}, session=sess)
+        assert db.c.count_documents({}) == 1
