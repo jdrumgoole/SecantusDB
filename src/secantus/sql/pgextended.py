@@ -702,10 +702,10 @@ def _encode_value(
     if isinstance(value, dict) and ("empty" in value or ("lower" in value and "upper" in value)):
         return _encode_range_generic(value, encoding)
     if oid == 114:  # plain json: binary form is the bare JSON text (no header)
-        return pgwire.transcode_out(typemap.to_pg_text(value, "json"), encoding) or b""
+        return pgwire.transcode_out(typemap.to_pg_text(value, "json_plain"), encoding) or b""
     if (
         isinstance(value, dict)
-        and tag != "json"
+        and tag not in ("json", "json_plain")
         and not any(k in value for k in ("hstore", "interval", "tsvector", "tsquery"))
     ):
         # A residual dict is a composite record (an array-of-composite element
@@ -837,6 +837,8 @@ def _result_value(
 ) -> bytes | None:
     if fmt == 1:
         return _encode_value(value, oid, tag, encoding)
+    if oid == 114 and tag == "json":  # plain json renders compact
+        tag = "json_plain"
     return pgwire.transcode_out(typemap.to_pg_text(value, tag), encoding)
 
 

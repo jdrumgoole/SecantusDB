@@ -1766,7 +1766,12 @@ def _copy_query_rows(
     values so the per-type binary encoders see native values."""
     result = _run_query(select, storage, db, catalog, session or Session(database=db))
     columns = [c.name for c in result.columns]
-    tags = [c.type_tag for c in result.columns]
+    # A plain ``json`` output column (oid 114) renders compact ("json_plain"
+    # is a render-only tag; jsonb keeps PG's canonical spacing).
+    tags = [
+        "json_plain" if c.pg_oid == 114 and c.type_tag == "json" else c.type_tag
+        for c in result.columns
+    ]
     oids = [c.pg_oid for c in result.columns]
     if not render_text:
         return columns, None, list(result.rows), tags, oids
@@ -1860,6 +1865,8 @@ def copy_extract(
             col = plan.table.column(name)
             field = col.field if col is not None else name
             tag = col.type_tag if col is not None else "any"
+            if col is not None and getattr(col, "json_plain", False):
+                tag = "json_plain"  # plain json renders compact
             value = get_path(doc, field)
             if value is None:
                 cells.append(None)

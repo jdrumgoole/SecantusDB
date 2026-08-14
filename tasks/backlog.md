@@ -2476,13 +2476,14 @@ threading into `wt_config`.)
 
 ### pgx gauge — `pgconn` findings and next steps (2026-08-14)
 
-**Where it stands: `pgconn` is at 20 failures** (of 216 tests): 86 → 29 after
+**Where it stands: `pgconn` is at 18 failures** (of 216 tests): 86 → 29 after
 the `generate_series` untyped-bound fix (#862), 29 → 23 after per-session
-temp-table namespacing (#866, re-measured 2026-08-14 at `7cab7a3a`), and
-23 → 20 after the stray-CopyData drain fix (the three affected tests verified
-individually against the fixed server; re-run the whole package for the next
-full count). The other three pgx packages were already clean (`bgreader` 6/6,
-`ctxwatch` 6/6, `pgproto3` 171/172), so `pgconn` is the whole gauge gap.
+temp-table namespacing (#866, re-measured 2026-08-14 at `7cab7a3a`), 23 → 20
+after the stray-CopyData drain fix (#868), and 20 → 18 after plain-json
+compact rendering (each fix's affected tests verified individually against
+the fixed server; re-run the whole package for the next full count). The
+other three pgx packages were already clean (`bgreader` 6/6, `ctxwatch` 6/6,
+`pgproto3` 171/172), so `pgconn` is the whole gauge gap.
 
 **What the 86 → 29 fix was, and why it was worth so much.** pgx's
 `ensureConnValid` helper (`pgconn/helper_test.go:28`) runs
@@ -2495,25 +2496,27 @@ the reusable part: in this gauge, a shared test helper can make one gap look
 like a whole subsystem. Read the actual failure text before believing the
 test names.**
 
-**The remaining 20 (post-#866 re-measure, minus the CopyData-drain fix)
-cluster into:**
+**The remaining 18 cluster into:**
 
-* **COPY residuals (5)** — the temp-table mode is gone; these are real COPY
-  bugs, each with its failure text read. (The stray-frame cluster —
-  `TestConnCopyFromQuerySyntaxError` / `...QueryNoTableError` /
-  `...DataWriteAfterErrorAndReturn`, `08P01 unexpected message type 'd'` —
-  is FIXED: the wire server now accepts and discards CopyData / CopyDone /
-  CopyFail arriving outside a COPY operation, like real PG's PostgresMain;
-  all three verified passing against the fixed server.)
+* **COPY residuals (3)** — the temp-table mode is gone; these are real COPY
+  bugs, each with its failure text read. Fixed so far: the stray-frame
+  cluster (`TestConnCopyFromQuerySyntaxError` / `...QueryNoTableError` /
+  `...DataWriteAfterErrorAndReturn`, `08P01 unexpected message type 'd'`) —
+  the wire server now accepts and discards CopyData / CopyDone / CopyFail
+  arriving outside a COPY operation, like real PG's PostgresMain (#868); and
+  `TestConnCopyToSmall` / `...Large` — a plain ``json`` (oid 114) column now
+  renders compact (`{"abc":"def"}`), reproducing typical machine-written
+  input byte-for-byte, while jsonb keeps PG's canonical spacing. (Full
+  verbatim ``json`` text preservation is deliberately NOT implemented: the
+  parsed-subdocument storage shape is what lets `col->>'k'` filters push
+  down as dotted-path Mongo filters, so a hand-spaced json literal still
+  re-renders normalised — compact.)
   - `TestConnCopyFromBinary`: binary-format COPY FROM is decoded as text →
     `22021 invalid byte sequence for encoding "utf-8"`.
   - `TestConnCopyFromNoticeResponseReceivedMidStream`: NOT a COPY bug —
     fails at setup on `create function ... returns trigger ... language
     plpgsql` + `CREATE TRIGGER` (`0A000 command CREATE is not supported`,
     verified 2026-08-14); needs trigger + `tsvector`/`to_tsvector` support.
-  - `TestConnCopyToSmall` / `...Large`: COPY TO renders jsonb with spaces
-    (`{"abc": "def"}`) where PG's canonical text form is compact
-    (`{"abc":"def"}`).
   - `TestConnCopyToCanceled`: cancel-request handling (next cluster).
 * **Cancel-request handling (3, unchanged)** —
   `TestCancelRequestContextWatcherHandler` (incl. 10 `Stress_N` subtests),

@@ -927,7 +927,13 @@ def _render_result(res: Any, encoding: str | None = "utf-8", session: Any = None
             [(c.name, c.pg_oid, c.typmod, c.table_oid, c.attnum) for c in res.columns],
             encoding=encoding,
         )
-        tags = [c.type_tag for c in res.columns]
+        # A plain ``json`` column (oid 114) renders compact; jsonb (3802)
+        # keeps PG's canonical spacing. The oid is the only place the result
+        # shape distinguishes them ("json_plain" is a render-only tag).
+        tags = [
+            "json_plain" if c.pg_oid == 114 and c.type_tag == "json" else c.type_tag
+            for c in res.columns
+        ]
         for row in res.rows:
             out += pgwire.data_row(
                 [
