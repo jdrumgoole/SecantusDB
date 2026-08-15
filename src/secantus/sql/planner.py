@@ -1727,6 +1727,11 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
         if isinstance(coldef, (exp.CheckColumnConstraint, exp.UniqueColumnConstraint)):
             # Table-level CHECK / UNIQUE — collected by _extract_constraints below.
             continue
+        if isinstance(coldef, exp.ExcludeColumnConstraint):
+            # ``EXCLUDE (col WITH =, ...)`` — equality-only exclusion is
+            # collected by _extract_constraints; any other operator rejects
+            # there (a GiST range exclusion has no unique-index equivalent).
+            continue
         if not isinstance(coldef, exp.ColumnDef):
             raise errors.feature_not_supported(f"unsupported table element: {coldef.sql()}")
         serial_tag = _serial_tag(coldef.args["kind"])
@@ -1999,7 +2004,34 @@ def _extract_constraints(
             checks.append(make_check_constraint(coldef, table_name, None))
         elif isinstance(coldef, exp.UniqueColumnConstraint):  # table-level unnamed UNIQUE (...)
             uniques.append(make_unique_constraint(coldef, table_name, None))
+        elif isinstance(coldef, exp.ExcludeColumnConstraint):
+            uniques.append(_make_exclusion_constraint(coldef, table_name))
     return checks, uniques
+
+
+def _make_exclusion_constraint(
+    coldef: exp.ExcludeColumnConstraint, table_name: str
+) -> UniqueConstraint:
+    """``EXCLUDE (col WITH =, ...)`` — the equality-only form is unique
+    enforcement with PG's exclusion identity: violation 23P01, default name
+    ``<table>_<col>_excl``. Any non-``=`` operator (a real GiST range
+    exclusion) stays unsupported."""
+    params = coldef.this
+    cols: list[str] = []
+    for item in params.args.get("columns") or []:
+        target = item.this if isinstance(item, exp.WithOperator) else item
+        op = item.args.get("op") if isinstance(item, exp.WithOperator) else None
+        op_text = (op.name if op is not None else "=").strip()
+        if op_text != "=":
+            raise errors.feature_not_supported(
+                f"EXCLUDE with operator {op_text} is not supported (equality only)"
+            )
+        if isinstance(target, exp.Ordered):
+            target = target.this
+        cols.append(_column_name(target))
+    bare = table_name.split(".", 1)[1] if "." in table_name else table_name
+    name = f"{bare}_{'_'.join(cols)}_excl"
+    return UniqueConstraint(name=name, columns=tuple(cols), exclusion=True)
 
 
 def _with_pk(col: Column, pk_names: list[str]) -> Column:
@@ -2177,7 +2209,7 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
                 f"generated column",
             )
         if raw is None and not col.nullable:
-            raise errors.not_null_violation(name)
+            raise errors.not_null_violation(name, table.name)
         if col.composite_type is not None and raw is not None:
             value = _composite_value(raw, col)
         else:
@@ -2201,7 +2233,7 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
             val = scalar.evaluate(_parse_default_expr(col.default_expr), _default_col_scope, ctx)
             _set_doc_field(doc, col.field, typemap.coerce(val, col.type_tag))
         elif not col.nullable:
-            raise errors.not_null_violation(col.name)
+            raise errors.not_null_violation(col.name, table.name)
     _canonicalize_composite_id(doc, table)
     return doc
 
@@ -3514,7 +3546,7 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
             computed.append((col.field, col.type_tag, assign.expression))
             continue
         if raw is None and not col.nullable:
-            raise errors.not_null_violation(col_name)
+            raise errors.not_null_violation(col_name, table.name)
         if col.composite_type is not None and raw is not None:
             set_doc[col.field] = _composite_value(raw, col)
         else:

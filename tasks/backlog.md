@@ -5754,6 +5754,19 @@ distinct problems, triaged from the run logs:
   (Sampler: scratchpad `worker_sampler.py` pattern — ps proctitle + RSS
   every 5s, lsof fds every 30s; the `[pytest-xdist running] <nodeid>`
   proctitle is what names each worker's in-flight test.)
+  **Occurrence 4 (2026-08-15 ~19:40): NOT the pytest-timeout mechanism.**
+  Two workers died mid-`test_rust_binary_pitr` (the crashitem hook named
+  `test_rust_binary_v2_archive_base_snapshot_and_restore` and
+  `test_rust_binary_preserve_oplog` instantly — the diagnostics work) but
+  the log carries NO pytest-timeout dump, and the file now uses
+  `method="signal"` which fails the test rather than exiting the worker —
+  so something ELSE hard-kills workers running these tests under load.
+  Audited clean: the secantusd-rs shutdown path sends no group signals;
+  the tests SIGTERM only their own unreaped child (Popen guards pid
+  reuse). Rerun-clean on a quiet machine, as always. Next lead: dtrace /
+  ktrace signal-delivery capture on the workers during a contended run,
+  and check whether the WT open of the restored dir can abort() without a
+  crash report.
 
 ## DateTest: four distinct date offsets (2026-08-03)
 
