@@ -2762,13 +2762,18 @@ shared storage engine or building large new protocol subsystems:
     failures. Trading a batch-semantics divergence for broken concurrent
     autocommit writes is the worse deal, so this waits for block-and-retry
     write-conflict handling and should land immediately after it.
-  - **`_pg_expandarray`** (28, `UpdateableResultTest`): the (x, n) row shape is
-    implemented in `srf.py`, but the CALL SITES pgjdbc emits are not
-    recognised — a schema-qualified function in FROM position
-    (`information_schema._pg_expandarray(i.indkey)`) and the composite-value
-    form `(…).n` / `(…).x`, including inside a derived table used in a JOIN ON.
-    Needs FROM-position parsing of qualified/leading-underscore function names
-    plus composite-value field access on an SRF column.
+  - ~~**`_pg_expandarray`** (28, `UpdateableResultTest`)~~ — RESOLVED
+    (2026-08-15, #904): select-list record SRFs (bare composite + immediate
+    `(SRF(x)).n` field access, lockstep multi-reference expansion),
+    `(col).field` in JOIN ON, and search_path-aware `pg_table_is_visible`
+    (the WHERE lowering hardcoded the default namespaces, hiding every
+    user-schema relation after `SET search_path`). Both pgjdbc metadata
+    queries (getPrimaryKeys / getPrimaryUniqueKeys) run verbatim.
+    UpdateableResultTest's four residuals are separate features: datetime
+    micros-vs-millis (BSON millisecond ceiling), serial
+    RETURN_GENERATED_KEYS, oid-column updatability, and the two metadata
+    classes' setup blockers (`COMMENT ON FUNCTION`, composite `CREATE
+    TYPE`).
   - ~~**`relation "" does not exist`** (73)~~ — FIXED. It was pgjdbc's
     `TypeInfoCache` type-lookup query, and reduced to two independent bugs,
     both now closed (`JOIN … USING` cross-joining, and an SRF usable only as
