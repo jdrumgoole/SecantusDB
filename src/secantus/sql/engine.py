@@ -493,14 +493,19 @@ def _commit_txn(storage: Any, db: str, catalog: Catalog, session: Session) -> SQ
         except Exception:
             storage.abort_user_transaction(handle)
             _end_txn_state(session)
+            session.restore_txn_gucs()  # the block rolled back — SETs unwind
             raise
     _end_txn_state(session)
     if handle is None:
+        session.txn_gucs = {}
         return SQLResult(command_tag="COMMIT")  # no open block — Postgres warns, returns COMMIT
     if failed:
-        # COMMIT of an aborted block actually rolls back (and tags ROLLBACK).
+        # COMMIT of an aborted block actually rolls back (and tags ROLLBACK) —
+        # the block's plain SETs unwind like any rollback.
+        session.restore_txn_gucs()
         storage.abort_user_transaction(handle)
         return SQLResult(command_tag="ROLLBACK")
+    session.txn_gucs = {}  # COMMIT keeps the block's plain SETs
     storage.commit_user_transaction(handle)
     if session.notify_hub is not None:
         for channel, payload in buffered_notifies:
@@ -523,7 +528,8 @@ def _end_txn_state(session: Session) -> None:
 
 def _rollback_txn(storage: Any, session: Session) -> SQLResult:
     handle = session.txn_handle
-    _end_txn_state(session)
+    _end_txn_state(session)  # unwinds SET LOCAL first (LOCAL sits atop txn SET)
+    session.restore_txn_gucs()  # then unwind the block's plain SETs
     if handle is not None:
         storage.abort_user_transaction(handle)
     return SQLResult(command_tag="ROLLBACK")
@@ -2238,7 +2244,10 @@ _NOOP_WORDS = {"DISCARD"}
 #: Commands sqlglot mis-parses as bare Alias/Column expressions but that ARE
 #: real statements with handlers in this engine. Anything else expression-
 #: shaped at the top level is garbage input, rejected 42601 like real PG.
-_EXPRESSION_COMMAND_WORDS = {"CLOSE", "DISCARD", "DEALLOCATE"}
+# SAVEPOINT / RELEASE also parse as a bare Alias ("SAVEPOINT AS sp1") and are
+# rescued by dispatch's _savepoint_command — the Parse-time garbage guard
+# (#876) must not reject them (pgjdbc's setSavepoint broke exactly that way).
+_EXPRESSION_COMMAND_WORDS = {"CLOSE", "DISCARD", "DEALLOCATE", "SAVEPOINT", "RELEASE"}
 
 
 def is_nonstatement_expression(stmt: exp.Expression) -> bool:
@@ -4761,6 +4770,10 @@ def _run_set(stmt: exp.Set, session: Session) -> SQLResult:
                         "22023", f'invalid value for parameter "client_encoding": "{value}"'
                     )
                 value = canonical
+            if session.txn_handle is not None:
+                # A plain SET inside a block unwinds on ROLLBACK (PG semantics);
+                # capture the pre-SET value before overwriting.
+                session.record_txn_guc(name)
             session.settings[name] = str(value)
         if name in REPORTABLE_GUCS:
             reported.append((name, str(value)))
