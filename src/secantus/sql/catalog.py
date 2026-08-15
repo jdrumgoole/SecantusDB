@@ -23,6 +23,7 @@ from secantus.sql import errors
 CATALOG_COLLECTION = "__sql_catalog__"
 VIEW_COLLECTION = "__sql_views__"
 MATVIEW_COLLECTION = "__sql_matviews__"
+TRIGGER_COLLECTION = "__sql_triggers__"
 SEQUENCE_COLLECTION = "__sql_sequences__"
 
 #: How many sequence values one persisted write pre-allocates (see the
@@ -124,6 +125,7 @@ ALL_CATALOG_COLLECTIONS = (
     DOMAIN_COLLECTION,
     COMPOSITE_COLLECTION,
     FUNCTION_COLLECTION,
+    TRIGGER_COLLECTION,
     POLICY_COLLECTION,
     RLS_COLLECTION,
     COLUMN_GRANT_COLLECTION,
@@ -604,6 +606,28 @@ class Catalog:
 
     def drop_view(self, db: str, name: str) -> bool:
         return self._storage.delete_matching(db, VIEW_COLLECTION, {"_id": name}) > 0
+
+    # -- triggers ----------------------------------------------------------- #
+    # BEFORE INSERT FOR EACH ROW triggers (the supported shape). Keyed by
+    # (table, name) — PG trigger names are per-table.
+
+    def put_trigger(self, db: str, doc: dict[str, Any]) -> None:
+        key = f"{doc['table']}::{doc['name']}"
+        self._storage.delete_matching(db, TRIGGER_COLLECTION, {"_id": key})
+        self._storage.insert(db, TRIGGER_COLLECTION, [{**doc, "_id": key}])
+
+    def trigger_exists(self, db: str, table: str, name: str) -> bool:
+        key = f"{table}::{name}"
+        return bool(self._storage.find_matching(db, TRIGGER_COLLECTION, {"_id": key}))
+
+    def triggers_for_table(self, db: str, table: str) -> list[dict[str, Any]]:
+        return sorted(
+            self._storage.find_matching(db, TRIGGER_COLLECTION, {"table": table}),
+            key=lambda t: t.get("name", ""),
+        )
+
+    def drop_triggers_for_table(self, db: str, table: str) -> None:
+        self._storage.delete_matching(db, TRIGGER_COLLECTION, {"table": table})
 
     def list_views(self, db: str) -> list[str]:
         docs = self._storage.find_matching(db, VIEW_COLLECTION, {})

@@ -2016,9 +2016,11 @@ def _run_statement(
         if kind == "TYPE":
             return _create_type(stmt, db, catalog)
         if kind == "FUNCTION":
-            return _create_function(stmt, db, catalog)
+            return _create_function(stmt, db, catalog, session)
         if kind == "SCHEMA":
             return _create_schema(stmt, db, catalog)
+        if kind == "TRIGGER" and "lo_manage" not in stmt.sql(dialect="postgres").lower():
+            return _create_trigger(stmt, db, catalog, session)
         if kind == "TRIGGER" and "lo_manage" in stmt.sql(dialect="postgres").lower():
             # contrib/lo's orphan-cleanup trigger, created verbatim by
             # LO-managing clients (pgjdbc's BlobTransactionTest). Accepted as
@@ -3653,24 +3655,43 @@ def _function_param_types(udf: exp.Expression) -> list[str | None]:
     return types
 
 
-def _create_function(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
+def _create_function(
+    stmt: exp.Create, db: str, catalog: Catalog, session: Session | None = None
+) -> SQLResult:
     """``CREATE [OR REPLACE] FUNCTION name(params) RETURNS t AS $$ body $$
     LANGUAGE sql`` — store the parsed body for the scalar evaluator to invoke."""
     udf = stmt.this
     name = udf.this.name
+    # A pg_temp-homed function keys under the session's temp namespace (the
+    # qualify pass already rewrote the ``pg_temp`` qualifier on the Table
+    # node) — CREATE TRIGGER resolves ``pg_temp.fn()`` against the same key.
+    fn_schema = udf.this.args.get("db")
+    if fn_schema is not None and fn_schema.name.startswith("pg_temp_"):
+        name = f"{fn_schema.name}.{name}"
     params = _function_params(udf)
     nargs = len(params)
 
     language = "sql"
     return_tag = None
     is_table = False
+    returns_trigger = False
     for prop in stmt.args.get("properties").expressions if stmt.args.get("properties") else []:
         if isinstance(prop, exp.LanguageProperty):
             language = str(prop.this.name if hasattr(prop.this, "name") else prop.this).lower()
         elif isinstance(prop, exp.ReturnsProperty):
             is_table = bool(prop.args.get("is_table"))
             if isinstance(prop.this, exp.DataType):
-                return_tag = typemap.type_tag_for_sql(prop.this)
+                kind = prop.this.args.get("kind")
+                if (
+                    prop.this.this == exp.DataType.Type.USERDEFINED
+                    and isinstance(kind, exp.Identifier)
+                    and kind.name.lower() == "trigger"
+                ):
+                    # ``RETURNS trigger`` (planner pre-parse quotes it so
+                    # sqlglot accepts the statement).
+                    returns_trigger = True
+                else:
+                    return_tag = typemap.type_tag_for_sql(prop.this)
 
     if language == "c" and stmt.this.this.name.lower() == "lo_manage":
         # contrib/lo's orphan-cleanup trigger function, created verbatim by
@@ -3709,9 +3730,78 @@ def _create_function(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
             "is_table": is_table,
             "body": body,
             "language": language,
+            "returns_trigger": returns_trigger,
         },
     )
     return SQLResult(command_tag="CREATE FUNCTION")
+
+
+def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Session) -> SQLResult:
+    """``CREATE TRIGGER name BEFORE INSERT ON table FOR EACH ROW EXECUTE
+    PROCEDURE fn()`` — the supported shape (pgx's tsvector-maintenance
+    trigger). Every other timing / event / level is rejected faithfully
+    rather than stored-and-never-fired, which would lie about user triggers."""
+    trigger_name = stmt.this.name
+    props = stmt.args.get("properties")
+    tp = next(
+        (p for p in (props.expressions if props else []) if isinstance(p, exp.TriggerProperties)),
+        None,
+    )
+    if tp is None:
+        raise errors.feature_not_supported("CREATE TRIGGER shape is not supported")
+    timing = str(tp.args.get("timing") or "").upper()
+    for_each = str(tp.args.get("for_each") or "").upper()
+    events = [
+        str(e.this).upper() for e in tp.args.get("events") or [] if isinstance(e, exp.TriggerEvent)
+    ]
+    table_node = tp.args.get("table")
+    if timing != "BEFORE" or for_each != "ROW" or events != ["INSERT"] or table_node is None:
+        raise errors.feature_not_supported("only BEFORE INSERT FOR EACH ROW triggers are supported")
+    tname = planner.qualified_table_name(table_node)
+    if catalog.get(db, tname) is None:
+        raise errors.undefined_table(tname)
+    execute = tp.args.get("execute")
+    fn_name = None
+    target = execute.this if execute is not None else None
+    if isinstance(target, exp.Dot):
+        qualifier = target.this.name if isinstance(target.this, exp.Identifier) else None
+        leaf = target.expression
+        leaf_name = leaf.name if hasattr(leaf, "name") else None
+        if qualifier == "pg_temp":
+            # ``EXECUTE PROCEDURE pg_temp.fn()`` — the Dot is not a Table
+            # node, so the temp-namespace qualify pass never rewrote it.
+            fn_name = f"{session.ensure_temp_schema()}.{leaf_name}"
+        elif qualifier is not None and qualifier.startswith("pg_temp_"):
+            fn_name = f"{qualifier}.{leaf_name}"
+        elif qualifier in (None, "public"):
+            fn_name = leaf_name
+        else:
+            fn_name = f"{qualifier}.{leaf_name}"
+    elif target is not None and hasattr(target, "name"):
+        fn_name = target.name
+    if not fn_name:
+        raise errors.feature_not_supported("CREATE TRIGGER EXECUTE shape is not supported")
+    func = catalog.get_function(db, fn_name, 0)
+    if func is None:
+        raise errors.SQLError("42883", f"function {fn_name}() does not exist")
+    if not func.get("returns_trigger") or func.get("language") != "plpgsql":
+        raise errors.SQLError("42P17", f"function {fn_name} must return type trigger")
+    if catalog.trigger_exists(db, tname, trigger_name):
+        raise errors.SQLError(
+            "42710", f'trigger "{trigger_name}" for relation "{tname}" already exists'
+        )
+    catalog.put_trigger(
+        db,
+        {
+            "name": trigger_name,
+            "table": tname,
+            "timing": timing,
+            "event": "INSERT",
+            "level": "ROW",
+            "function": fn_name,
+        },
+    )
+    return SQLResult(command_tag="CREATE TRIGGER")
 
 
 def _drop_function(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
@@ -4313,6 +4403,10 @@ class _CTECatalog(Catalog):
     def __init__(self, base: Catalog, ctes: dict[str, TableDef]) -> None:
         self._base = base
         self._ctes = ctes
+        # Inherited Catalog methods (trigger lookups, sequences, …) read
+        # self._storage directly — share the base's so they behave exactly
+        # like the base catalog rather than crashing on a missing attribute.
+        self._storage = base._storage
 
     def get(self, db: str, table: str) -> TableDef | None:
         if table in self._ctes:

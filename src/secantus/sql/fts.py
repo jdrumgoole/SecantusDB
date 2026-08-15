@@ -41,6 +41,12 @@ class TSQueryError(ValueError):
     """A malformed ``tsquery`` text."""
 
 
+#: Real PG silently refuses to index words longer than 2046 bytes (with a
+#: client NOTICE we don't emit) — to_tsvector of a 10 kB token yields an
+#: empty tsvector, which pgx's trigger-maintenance test relies on.
+_MAX_LEXEME_LEN = 2046
+
+
 def _lexemes(text: str) -> list[str]:
     """Tokenise text into normalised lexemes (lower-case words, stop-words kept so
     the caller can decide — positions count every token in Postgres)."""
@@ -52,7 +58,7 @@ def to_tsvector(text: str) -> dict[str, Any]:
     mapped to their 1-based positions."""
     positions: dict[str, list[int]] = {}
     for pos, lex in enumerate(_lexemes(text), start=1):
-        if lex in _STOPWORDS:
+        if lex in _STOPWORDS or len(lex) > _MAX_LEXEME_LEN:
             continue
         positions.setdefault(lex, []).append(pos)
     return {"tsvector": positions}

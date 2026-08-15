@@ -250,6 +250,7 @@ def execute_drop_table(
         if plan.if_exists:
             return SQLResult(command_tag="DROP TABLE")
         raise errors.undefined_table(plan.name)
+    catalog.drop_triggers_for_table(db, plan.name)  # triggers die with the table
     catalog.drop(db, plan.name)
     storage.drop_collection(db, table.collection)
     # Drop any sequences the table owned (SERIAL columns).
@@ -807,6 +808,52 @@ def _returning_result(
     return SQLResult(command_tag=command_tag, columns=columns, rows=rows, rowcount=rowcount)
 
 
+def _fire_before_insert_triggers(
+    plan: Any, storage: Any, db: str, catalog: Any, session: Any
+) -> list[dict[str, Any]]:
+    """Run BEFORE INSERT FOR EACH ROW triggers over the planned rows.
+
+    Each row becomes a column-name-keyed NEW record for the plpgsql trigger
+    function, which may mutate fields (``new.ts := to_tsvector(new.t)``) or
+    return NULL to skip the row — PG's BEFORE-trigger semantics. The returned
+    record is written back through each column's storage field."""
+    if catalog is None or getattr(plan.table, "reflected", False):
+        return plan.docs
+    triggers = [
+        t
+        for t in catalog.triggers_for_table(db, plan.table.name)
+        if t.get("timing") == "BEFORE" and t.get("event") == "INSERT"
+    ]
+    if not triggers:
+        return plan.docs
+    from secantus.paths import set_path
+    from secantus.sql import plpgsql, scalar
+
+    ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    out: list[dict[str, Any]] = []
+    for doc in plan.docs:
+        record: dict[str, Any] | None = {c.name: get_path(doc, c.field) for c in plan.table.columns}
+        for trg in triggers:
+            func = catalog.get_function(db, trg["function"], 0)
+            if func is None:
+                raise errors.SQLError("42883", f"function {trg['function']}() does not exist")
+            record = plpgsql.invoke_trigger(func, record, ctx)
+            if record is None:
+                break  # RETURN NULL: skip this row
+        if record is None:
+            continue
+        for c in plan.table.columns:
+            value = record.get(c.name)
+            # Structured values (tsvector / jsonb dicts) pass through as-is;
+            # scalars get best-effort coercion to the column type.
+            if value is not None and not isinstance(value, dict):
+                with contextlib.suppress(errors.SQLError, ValueError, TypeError):
+                    value = typemap.coerce(value, c.type_tag)
+            set_path(doc, c.field, value)
+        out.append(doc)
+    return out
+
+
 @_serialized_write
 def execute_insert(
     plan: planner.InsertPlan,
@@ -817,6 +864,7 @@ def execute_insert(
 ) -> SQLResult:
     if plan.on_conflict is not None:
         return _execute_insert_on_conflict(plan, storage, db, catalog, session)
+    plan.docs = _fire_before_insert_triggers(plan, storage, db, catalog, session)
     _assign_sequences(plan.docs, plan.table, db, catalog, session)
     if plan.check_option is not None:
         from secantus.sql import scalar
