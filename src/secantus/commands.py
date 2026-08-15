@@ -46,6 +46,7 @@ from secantus.rbac import (
     A_CHANGE_PASSWORD,
     A_COLL_MOD,
     A_COLL_STATS,
+    A_CONFIGURE_FAIL_POINT,
     A_CREATE_COLLECTION,
     A_CREATE_INDEX,
     A_CREATE_ROLE,
@@ -6028,7 +6029,8 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "find": (A_FIND, SCOPE_COLLECTION),
     "count": (A_FIND, SCOPE_COLLECTION),
     "distinct": (A_FIND, SCOPE_COLLECTION),
-    # $out/$merge stages do their own write-action checks at stage time.
+    # Secondary namespaces ($out/$merge/$lookup/$graphLookup/$unionWith)
+    # are checked pre-execution by _pipeline_secondary_requirements.
     "aggregate": (A_FIND, SCOPE_COLLECTION),
     "mapReduce": (A_FIND, SCOPE_COLLECTION),
     "mapreduce": (A_FIND, SCOPE_COLLECTION),
@@ -6091,6 +6093,9 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     "getParameter": (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
     "getLog": (A_GET_LOG, SCOPE_CLUSTER),
     "currentOp": (A_INPROG, SCOPE_CLUSTER),
+    # Fault injection is a server-wide DoS lever (e.g. closeConnection on
+    # every find); require an explicit cluster-admin grant under --auth.
+    "configureFailPoint": (A_CONFIGURE_FAIL_POINT, SCOPE_CLUSTER),
     "killOp": (A_KILLOP, SCOPE_CLUSTER),
     "fsync": (A_FSYNC, SCOPE_CLUSTER),
     "profile": (A_ENABLE_PROFILER, SCOPE_DATABASE),
@@ -6164,6 +6169,51 @@ def _resource_for_command(
         if isinstance(ns, str) and "." in ns:
             return ns.split(".", 1)[0], False
     return default_db, False
+
+
+def _pipeline_secondary_requirements(doc: dict[str, Any], default_db: str) -> list[tuple[str, str]]:
+    """The (action, db) grants a pipeline needs beyond the primary ``find``.
+
+    mongod authorizes a pipeline's secondary namespaces before execution:
+    ``$out`` needs insert+remove on its target, ``$merge`` insert+update,
+    and the read-side stages (``$lookup`` / ``$graphLookup`` /
+    ``$unionWith``) need find on the foreign namespace. Sub-pipelines
+    (``$lookup.pipeline``, ``$unionWith.pipeline``, ``$facet`` branches)
+    are walked recursively. RBAC here is db-granular, so requirements
+    resolve to (action, db) pairs.
+    """
+    reqs: list[tuple[str, str]] = []
+
+    def walk(pipeline: Any) -> None:
+        if not isinstance(pipeline, list):
+            return
+        for stage in pipeline:
+            if not isinstance(stage, Mapping):
+                continue
+            for op, spec in stage.items():
+                if op == "$out":
+                    db = default_db
+                    if isinstance(spec, Mapping) and isinstance(spec.get("db"), str):
+                        db = spec["db"]
+                    reqs.append((A_INSERT, db))
+                    reqs.append((A_REMOVE, db))
+                elif op == "$merge":
+                    db = default_db
+                    into = spec.get("into") if isinstance(spec, Mapping) else spec
+                    if isinstance(into, Mapping) and isinstance(into.get("db"), str):
+                        db = into["db"]
+                    reqs.append((A_INSERT, db))
+                    reqs.append((A_UPDATE, db))
+                elif op in ("$lookup", "$graphLookup", "$unionWith"):
+                    reqs.append((A_FIND, default_db))
+                    if isinstance(spec, Mapping):
+                        walk(spec.get("pipeline"))
+                elif op == "$facet" and isinstance(spec, Mapping):
+                    for sub in spec.values():
+                        walk(sub)
+
+    walk(doc.get("pipeline"))
+    return list(dict.fromkeys(reqs))
 
 
 def command_name(doc: dict[str, Any]) -> str:
@@ -6898,6 +6948,30 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                     "code": 13,
                     "codeName": "Unauthorized",
                 }
+            # A pipeline's secondary namespaces carry their own privilege
+            # requirements ($out/$merge write, $lookup-family read) — the
+            # primary (find, primary-collection) grant alone must not
+            # authorize writes to or reads from other namespaces.
+            if name == "aggregate":
+                for extra_action, extra_db in _pipeline_secondary_requirements(
+                    doc, ctx.db_name or "admin"
+                ):
+                    if not check_privilege(
+                        ctx.connection_auth.effective_roles,
+                        extra_action,
+                        target_db=extra_db,
+                        cluster=False,
+                        role_resolver=ctx.storage.get_role,
+                    ):
+                        return {
+                            "ok": 0.0,
+                            "errmsg": (
+                                f"not authorized on {extra_db} to execute "
+                                f"aggregation stage (action: {extra_action})"
+                            ),
+                            "code": 13,
+                            "codeName": "Unauthorized",
+                        }
     # Failpoint match — short-circuit with ``errorCode`` before the
     # handler runs, or fall through and remember a ``writeConcernError``
     # to attach to the successful response. ``configureFailPoint``

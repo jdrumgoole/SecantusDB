@@ -112,6 +112,10 @@ A_TOP = "top"
 A_KILLOP = "killop"
 A_FSYNC = "fsync"
 A_ENABLE_PROFILER = "enableProfiler"
+# configureFailPoint arms server-wide fault injection (a DoS lever), so it
+# needs an explicit cluster-admin grant — mongod gates the same command
+# behind enableTestCommands AND a privileged role.
+A_CONFIGURE_FAIL_POINT = "configureFailPoint"
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +224,7 @@ _CLUSTER_ADMIN_EXTRA_ACTIONS: frozenset[str] = frozenset(
         A_FSYNC,
         A_DROP_DATABASE,
         A_KILLOP,
+        A_CONFIGURE_FAIL_POINT,
     }
 )
 
