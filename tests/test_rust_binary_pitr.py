@@ -34,7 +34,12 @@ import pytest
 # thread-method kill then took the whole worker down (the "worker death"
 # cluster). Budget for the measured worst case; genuine hangs still die, just
 # later, and the banner read above fails fast with a reason.
-pytestmark = pytest.mark.timeout(1200)
+pytestmark = pytest.mark.timeout(1200, method="signal")
+# method="signal": these tests run subprocess/pymongo calls on the worker's
+# main thread, so SIGALRM can interrupt them — the timeout then FAILS THE
+# TEST with a traceback instead of the global thread-method's os._exit,
+# which kills the whole xdist worker ("Not properly terminated") and cost
+# four "worker death" investigations before the mechanism was pinned.
 
 pymongo = pytest.importorskip("pymongo")
 
