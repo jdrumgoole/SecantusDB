@@ -5726,7 +5726,14 @@ distinct problems, triaged from the run logs:
   test_boom), machine at load ~6-9 with a parallel CI-watch session; the
   post-crash-overrun watchdog killed the stalled controller 1200s later.
   No jetsam/kernel kill in `log show`. Still SIGKILL-shaped and
-  unattributed; the RSS/pid capture plan stands.
+  unattributed; the RSS/pid capture plan stands. **Third occurrence
+  2026-08-15 ~01:00: THREE workers (gw2, gw5, gw3) at ~99% of a local
+  full run, again no .ips, again rerun-clean. Negative repro result: 5
+  rounds of the four rust-binary/server test files alone (-n4, 89 tests
+  per round) are clean — the death needs full-suite tail conditions,
+  pointing at accumulated state (fds / RSS / WT homes) rather than any
+  single test. Next step is a full-suite run under a per-worker RSS+fd
+  sampler sidecar.**
 - [ ] **Residual straddle window: generated-column / expression-index
   recompute in the non-materialized UPDATE path.** Same shape as the
   resolved lost-update straddle but narrower surface: `execute_update`'s
