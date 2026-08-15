@@ -2579,6 +2579,29 @@ cd vendor/pgx && PGX_TEST_DATABASE="host=127.0.0.1 port=15435 dbname=postgres us
 ```
 
 
+### SQL-gauge re-baseline sweep (2026-08-15, at `36937245`)
+
+Run after the pgx campaign to harvest gains and regression-check the
+shared-surface changes (parse errors, startup GUCs, reply shapes,
+`generate_series` int4, notifications, triggers):
+
+- **sqlalchemy**: 978 P / 0 F / 447 S — clean, no regression.
+- **sqllogictest**: 52/60 files, 8 expected divergences, 0 unexpected —
+  identical to the committed report.
+- **pgtest**: 10/58 files — identical to the committed report (an older
+  backlog entry said 8/58; that was stale). Still the next big corpus.
+- **psycopg**: per-file failure signature matches the committed 99.0%
+  baseline everywhere EXCEPT two REAL regressions the sweep caught from
+  the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
+  prefix, and self-referencing FKs in CREATE TEMP TABLE pointing at a
+  nonexistent bare name (deferred checks silently never fired). Both
+  fixed in this slice; ``tests/test_errors.py`` back to its baseline
+  signature. (A 125-failure ``test_typing.py`` cluster in the sweep run
+  was venv-artifact — mypy example files — not server behaviour;
+  ``test_generators.py::test_cancel`` now times out instead of failing
+  fast, consistent with cancel support landing — worth a look in the
+  next official run.)
+
 ### SQL / PostgreSQL section — survey (2026-08-14)
 
 **The headline count is wrong by 4x.** The section carries 126 unchecked

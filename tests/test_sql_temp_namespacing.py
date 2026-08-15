@@ -224,3 +224,30 @@ class TestWireConcurrency:
             c.execute("CREATE TEMP TABLE ext (a int4)")
             c.execute("INSERT INTO ext VALUES (%s)", (42,))
             assert c.execute("SELECT a FROM ext WHERE a = %s", (42,)).fetchall() == [(42,)]
+
+
+class TestNamespacingFallout:
+    # Two regressions the psycopg gauge caught after the namespacing landed
+    # (its test_diag_attr_values / test_diag_from_commit): error diagnostics
+    # leaked the pg_temp_<n>. catalog prefix into the TABLE NAME field, and a
+    # SELF-referencing FK inside CREATE TEMP TABLE captured its target by the
+    # pre-rewrite bare name, so enforcement never found the relation.
+    def test_diag_table_name_is_bare(self, dsn):
+        with psycopg.connect(dsn, autocommit=True) as c:
+            c.execute("create temp table texc (data int constraint chk1 check (data = 1))")
+            with pytest.raises(psycopg.errors.CheckViolation) as ei:
+                c.execute("insert into texc values (2)")
+            assert ei.value.diag.table_name == "texc"
+            assert ei.value.diag.schema_name.startswith("pg_temp")
+            assert ei.value.diag.constraint_name == "chk1"
+
+    def test_self_referencing_deferred_fk_fires_at_commit(self, dsn):
+        with psycopg.connect(dsn) as c:
+            cur = c.cursor()
+            cur.execute(
+                "create temp table tdef (data int primary key, "
+                "ref int references tdef (data) deferrable initially deferred)"
+            )
+            cur.execute("insert into tdef values (1, 2)")
+            with pytest.raises(psycopg.errors.ForeignKeyViolation):
+                c.commit()

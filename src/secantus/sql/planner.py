@@ -14,6 +14,7 @@ Only the P0 subset is handled; anything outside it raises a
 from __future__ import annotations
 
 import contextvars
+import dataclasses
 import datetime as _dt
 import functools
 import json
@@ -1801,6 +1802,18 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
         # column. Fine for the spike.
         pass
     fks = _extract_foreign_keys(schema, table_name)
+    # A SELF-referencing FK captured the target by its spelled name, which for
+    # a temp table is the bare pre-rewrite name (``references test_deferred``
+    # inside ``CREATE TEMP TABLE test_deferred`` — the target's pg_temp_<n>.
+    # rewrite happens on the create target, and the reference can't resolve
+    # through the catalog because the table doesn't exist yet). Point it at
+    # the table's own final name so enforcement finds the right relation.
+    if "." in table_name:
+        bare = table_name.split(".", 1)[1]
+        fks = [
+            dataclasses.replace(fk, ref_table=table_name) if fk.ref_table == bare else fk
+            for fk in fks
+        ]
     checks, uniques = _extract_constraints(schema, table_name)
     props = stmt.args.get("properties")
     # A pg_temp_<n>-homed name is temp even without the TEMP keyword — CREATE
