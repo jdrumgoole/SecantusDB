@@ -376,6 +376,12 @@ def _dispatch(
     # authorization active (wire server with require_auth + per-user roles);
     # transaction control and savepoints above are exempt and already returned.
     authz.authorize(stmt, session, storage, catalog)
+    # Secondary-read gate: a write statement's source clause (INSERT...SELECT,
+    # UPDATE...FROM, DELETE...USING, CREATE TABLE...AS SELECT, subqueries) reads
+    # tables the primary write privilege doesn't cover — each needs its own
+    # ``find`` (SELECT) grant, or a write-only role could exfiltrate them
+    # (#785, #881).
+    authz.authorize_source_reads(stmt, session, storage, catalog)
 
     # Read-only enforcement: a write inside a READ ONLY transaction (or under
     # ``default_transaction_read_only = on``) fails with PG's 25006. The

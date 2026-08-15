@@ -177,6 +177,50 @@ def _touched_columns(stmt: exp.Expression, table: str, catalog: Any, db: str) ->
     return None
 
 
+def _primary_write_target(stmt: exp.Expression) -> str | None:
+    """The single table a write statement mutates (the one its write privilege
+    covers), even when the statement also reads other tables. Unlike
+    ``_target_table`` this does *not* bail on multi-table statements — it is used
+    only to exclude the write target from the set of tables that need a *read*
+    grant. ``CREATE TABLE ... AS`` counts its new table as the write target."""
+    if isinstance(stmt, exp.Insert):
+        tbl = stmt.this
+        if isinstance(tbl, exp.Schema):
+            tbl = tbl.this
+        return tbl.name if isinstance(tbl, exp.Table) else None
+    if isinstance(stmt, exp.Update):
+        tbl = stmt.args.get("this")
+        return tbl.name if isinstance(tbl, exp.Table) else None
+    if isinstance(stmt, exp.Delete):
+        tbl = stmt.this
+        return tbl.name if isinstance(tbl, exp.Table) else None
+    if isinstance(stmt, exp.Create):
+        tbl = stmt.this
+        if isinstance(tbl, exp.Schema):
+            tbl = tbl.this
+        return tbl.name if isinstance(tbl, exp.Table) else None
+    return None
+
+
+def _source_read_tables(stmt: exp.Expression) -> set[str]:
+    """Base tables ``stmt`` READS as a source, needing a ``find`` (SELECT) grant
+    beyond the primary write privilege: the ``SELECT`` behind ``INSERT ... SELECT``
+    and ``CREATE TABLE ... AS SELECT``, the ``FROM`` of ``UPDATE ... FROM``, the
+    ``USING`` of ``DELETE ... USING``, and any subquery. Without this a principal
+    holding only a write grant on the target could exfiltrate an unrelated table's
+    rows through the source clause (issues #785, #881).
+
+    CTE names are excluded (they're query-local, not base tables). The primary
+    write target is excluded — its own privilege is checked separately; a
+    self-referential ``INSERT INTO a SELECT * FROM a`` therefore isn't charged a
+    read grant, an accepted narrowing (the actor already writes ``a``, so no
+    *other* table leaks)."""
+    tables = {t.name for t in stmt.find_all(exp.Table)}
+    ctes = {c.alias_or_name for c in stmt.find_all(exp.CTE)}
+    target = _primary_write_target(stmt)
+    return {t for t in tables - ctes if t and t != target}
+
+
 def _table_grant_allows(stmt: exp.Expression, action: str, session: Session, catalog: Any) -> bool:
     """Whether recorded grants cover ``action`` on ``stmt``'s target table for this
     session — a whole-table grant, or (finer) a column grant on *every* column the
@@ -227,3 +271,45 @@ def authorize(stmt: exp.Expression, session: Session, storage: Any, catalog: Any
     if not cluster and _table_grant_allows(stmt, action, session, catalog):
         return
     raise errors.insufficient_privilege(session.database, action)
+
+
+def _find_grant_allows(table: str, session: Session, catalog: Any, resolver: Any) -> bool:
+    """Whether ``session`` may read ``table``: a db-wide ``find`` role, or a
+    table-level SELECT grant."""
+    if rbac.check_privilege(
+        session.roles,
+        rbac.A_FIND,
+        target_db=session.database,
+        role_resolver=resolver,
+    ):
+        return True
+    if catalog is None:
+        return False
+    grantees = _grantee_identities(session)
+    return bool(catalog.has_table_privilege(session.database, table, grantees, "SELECT"))
+
+
+def authorize_source_reads(
+    stmt: exp.Expression, session: Session, storage: Any, catalog: Any = None
+) -> None:
+    """Enforce a ``find`` (SELECT) grant on every table a write statement reads
+    as a *source* — the ``SELECT`` behind ``INSERT ... SELECT`` /
+    ``CREATE TABLE ... AS``, the ``FROM`` of ``UPDATE ... FROM``, the ``USING``
+    of ``DELETE ... USING``, and subqueries. The primary write privilege is
+    checked by :func:`authorize`; this closes the secondary-read bypass (#785,
+    #881) where a write-only grant leaked an unrelated table's rows through the
+    source clause. No-op unless authorization is active."""
+    if not session.authz_active:
+        return
+    # Only WRITE statements have a "source read beyond the write target". A
+    # plain SELECT's own read authorization is handled by `authorize` (which
+    # honours table- and column-level SELECT grants); running the whole-table
+    # source gate over it would wrongly reject a column-granted read.
+    if not isinstance(stmt, (exp.Insert, exp.Update, exp.Delete, exp.Merge, exp.Create)):
+        return
+    if isinstance(stmt, exp.Create) and stmt.args.get("expression") is None:
+        return  # a plain CREATE TABLE with no AS-SELECT source reads nothing
+    resolver = getattr(storage, "get_role", None)
+    for table in sorted(_source_read_tables(stmt)):
+        if not _find_grant_allows(table, session, catalog, resolver):
+            raise errors.insufficient_privilege(session.database, rbac.A_FIND)
