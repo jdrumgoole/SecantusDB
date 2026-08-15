@@ -194,7 +194,7 @@ impl RustServer {
     /// is joined.
     fn stop(&mut self, py: Python<'_>) {
         if let Some(mut running) = self.running.take() {
-            py.allow_threads(|| running.stop());
+            py.detach(|| running.stop());
         }
     }
 

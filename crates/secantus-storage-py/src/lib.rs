@@ -74,7 +74,7 @@ fn unwrap_id(id_bytes: &[u8]) -> PyResult<Bson> {
 }
 
 fn bytes(py: Python<'_>, b: Vec<u8>) -> Py<PyBytes> {
-    PyBytes::new_bound(py, &b).unbind()
+    PyBytes::new(py, &b).unbind()
 }
 
 fn doc_list(py: Python<'_>, docs: Vec<Vec<u8>>) -> Vec<Py<PyBytes>> {
@@ -577,7 +577,7 @@ impl RustStorage {
     /// tail seq. The change-stream tailable `getMore` waits here instead of on a
     /// Python `threading.Condition`.
     fn wait_for_oplog(&self, py: Python<'_>, after_seq: i64, timeout_ms: u64) -> i64 {
-        py.allow_threads(|| self.inner.wait_for_oplog(after_seq, timeout_ms))
+        py.detach(|| self.inner.wait_for_oplog(after_seq, timeout_ms))
     }
 
     /// Wake every `wait_for_oplog` waiter without advancing the oplog (e.g. on
@@ -716,6 +716,6 @@ fn _secantus_storage(m: &Bound<'_, PyModule>) -> PyResult<()> {
          collections / documents / indexes / oplog, behind the BSON byte seam.",
     )?;
     m.add_class::<RustStorage>()?;
-    m.add("EngineFallback", m.py().get_type_bound::<EngineFallback>())?;
+    m.add("EngineFallback", m.py().get_type::<EngineFallback>())?;
     Ok(())
 }
