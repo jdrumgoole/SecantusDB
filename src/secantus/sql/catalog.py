@@ -281,6 +281,10 @@ class UniqueConstraint:
     deferrable: bool = False
     initially_deferred: bool = False
     comment: str | None = None  # COMMENT ON CONSTRAINT
+    # An ``EXCLUDE (col WITH =, ...)`` constraint: equality-only exclusion is
+    # unique enforcement with a different violation (23P01, PG's
+    # exclusion_violation) and reflected contype 'x'.
+    exclusion: bool = False
 
 
 @dataclass(frozen=True)
@@ -454,6 +458,7 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "deferrable": uq.deferrable,
                 "initially_deferred": uq.initially_deferred,
                 "comment": uq.comment,
+                "exclusion": uq.exclusion,
             }
             for uq in table.unique_constraints
         ],
@@ -528,6 +533,7 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 deferrable=bool(uq.get("deferrable", False)),
                 initially_deferred=bool(uq.get("initially_deferred", False)),
                 comment=uq.get("comment"),
+                exclusion=bool(uq.get("exclusion", False)),
             )
             for uq in doc.get("unique_constraints", [])
         ],

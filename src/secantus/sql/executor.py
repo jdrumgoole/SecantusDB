@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import operator
+import re
 import threading
 import weakref
 from typing import Any
@@ -900,10 +901,34 @@ def execute_insert(
 
 def _raise_write_error(err: dict[str, Any], table: planner.TableDef) -> None:
     if err.get("code") == 11000:
-        raise errors.unique_violation(
-            f'duplicate key value violates unique constraint on "{table.name}"'
+        constraint = _dup_key_constraint_name(err, table)
+        uq = next((u for u in table.unique_constraints if u.name == constraint), None)
+        if uq is not None and uq.exclusion:
+            raise errors.SQLError(
+                "23P01",
+                f'conflicting key value violates exclusion constraint "{constraint}"',
+                diag=_error_diag(table, n=constraint),
+            )
+        raise errors.SQLError(
+            "23505",
+            f'duplicate key value violates unique constraint "{constraint}"',
+            diag=_error_diag(table, n=constraint),
         )
     raise errors.SQLError("XX000", err.get("errmsg", "insert failed"))
+
+
+def _dup_key_constraint_name(err: dict[str, Any], table: planner.TableDef) -> str:
+    """The violated constraint's PG name from a storage duplicate-key error:
+    the ``_id`` index is the primary key; any other index name maps back
+    through the ``unique_index_name`` scheme to the declared constraint."""
+    m = re.search(r"index: (\S+) dup key", err.get("errmsg", ""))
+    index_name = m.group(1) if m else ""
+    if index_name in ("", "_id_"):
+        return table.pk_constraint_name()
+    for uq in table.unique_constraints:
+        if unique_index_name(uq.name) == index_name or uq.name == index_name:
+            return uq.name
+    return index_name
 
 
 @functools.lru_cache(maxsize=256)
@@ -934,7 +959,7 @@ def _validate_write_row(doc: dict[str, Any], table: Any, ctx: Any) -> None:
                 "23502",
                 f'null value in column "{col.name}" of relation "{table.name}" '
                 "violates not-null constraint",
-                diag={"s": _table_schema(table), "t": _table_relname(table), "c": col.name},
+                diag=_error_diag(table, c=col.name),
             )
     if not table.check_constraints:
         return
@@ -949,24 +974,31 @@ def _validate_write_row(doc: dict[str, Any], table: Any, ctx: Any) -> None:
             raise errors.SQLError(
                 "23514",
                 f'new row for relation "{table.name}" violates check constraint "{ck.name}"',
-                diag={"s": _table_schema(table), "t": _table_relname(table), "n": ck.name},
+                diag=_error_diag(table, n=ck.name),
             )
 
 
 def _table_schema(table: Any) -> str:
+    name = getattr(table, "name", "")
     if getattr(table, "temp", False):
-        name = getattr(table, "name", "")
         return name.split(".", 1)[0] if name.startswith("pg_temp_") else "pg_temp_1"
-    return "public"
+    return name.split(".", 1)[0] if "." in name else "public"
 
 
-def _table_relname(table: Any) -> str:
-    """The bare relation name for error diagnostics — PG's TABLE NAME diag
-    field never carries a schema prefix (the schema rides in its own field),
-    and a temp table's catalog key does (``pg_temp_<n>.t``). psycopg's
-    test_diag_attr_values asserts exactly this split."""
+def _bare_table_name(table: Any) -> str:
     name = getattr(table, "name", "")
     return name.split(".", 1)[1] if "." in name else name
+
+
+def _error_diag(table: Any, **extra: str) -> dict[str, str]:
+    """PG's ErrorResponse identity fields for a constraint violation on
+    ``table``: s=schema, t=bare table name, plus any of c(olumn)/
+    n(constraint)/d(atatype) the caller supplies. pgjdbc's
+    ``ServerErrorMessage`` surfaces these via getSchema()/getTable()/...."""
+    diag = {"s": _table_schema(table), "t": _bare_table_name(table)}
+    diag.update({k: v for k, v in extra.items() if v})
+    return diag
+
 
 
 def _validate_check_option(
@@ -1117,6 +1149,11 @@ def _validate_domain_columns(
                         "23514",
                         f"value for domain {col.domain_type} violates check "
                         f'constraint "{check["name"]}"',
+                        diag={
+                            "s": "public",
+                            "d": str(col.domain_type),
+                            "n": str(check["name"]),
+                        },
                     )
 
 
@@ -1254,8 +1291,17 @@ def _hashable_id(value: Any) -> Any:
     return value
 
 
-def _uq_violation(uq: Any) -> errors.SQLError:
-    return errors.unique_violation(f'duplicate key value violates unique constraint "{uq.name}"')
+def _uq_violation(uq: Any, table: Any = None) -> errors.SQLError:
+    diag = _error_diag(table, n=uq.name) if table is not None else {"n": uq.name}
+    if getattr(uq, "exclusion", False):
+        return errors.SQLError(
+            "23P01",
+            f'conflicting key value violates exclusion constraint "{uq.name}"',
+            diag=diag,
+        )
+    return errors.SQLError(
+        "23505", f'duplicate key value violates unique constraint "{uq.name}"', diag=diag
+    )
 
 
 def _maybe_defer(session: Any, kind: str, table_name: str, constraint: Any) -> bool:
@@ -1318,7 +1364,7 @@ def _validate_unique_rows(
             if violated:
                 if _maybe_defer(session, "unique", table.name, uq):
                     continue
-                raise _uq_violation(uq)
+                raise _uq_violation(uq, table)
             seen[uq.name].add(key)
 
 
@@ -2243,6 +2289,7 @@ def _execute_update_materialized_body(
                     "23505",
                     "duplicate key value violates unique constraint "
                     f'"{table.pk_constraint_name()}"',
+                    diag=_error_diag(table, n=table.pk_constraint_name()),
                 )
             seen.add(new_h)
         # Delete every matched row, then insert the re-keyed rows (a PK swap needs
@@ -2365,9 +2412,11 @@ def _validate_fk_child_rows(
             if not storage.find_matching(db, parent.collection, probe, limit=1):
                 if _maybe_defer(session, "fk", table.name, fk):
                     continue
-                raise errors.foreign_key_violation(
+                raise errors.SQLError(
+                    "23503",
                     f'insert or update on table "{table.name}" violates foreign key '
-                    f'constraint "{fk.name}"'
+                    f'constraint "{fk.name}"',
+                    diag=_error_diag(table, n=fk.name),
                 )
 
 
@@ -2406,7 +2455,7 @@ def _recheck_unique(table: Any, cname: str, storage: Any, db: str) -> None:
         if any(v is None for v in key):
             continue
         if key in seen:
-            raise _uq_violation(uq)
+            raise _uq_violation(uq, table)
         seen.add(key)
 
 
@@ -2424,9 +2473,11 @@ def _recheck_fk(table: Any, cname: str, storage: Any, db: str, catalog: Any) -> 
             continue
         probe = _parent_probe(fk, parent, values)
         if not storage.find_matching(db, parent.collection, probe, limit=1):
-            raise errors.foreign_key_violation(
+            raise errors.SQLError(
+                "23503",
                 f'insert or update on table "{table.name}" violates foreign key '
-                f'constraint "{fk.name}"'
+                f'constraint "{fk.name}"',
+                diag=_error_diag(table, n=fk.name),
             )
 
 
@@ -2475,9 +2526,11 @@ def _enforce_fk_on_parent_delete(
                 continue
             action = (fk.on_delete or "NO ACTION").upper()
             if action in ("NO ACTION", "RESTRICT"):
-                raise errors.foreign_key_violation(
+                raise errors.SQLError(
+                    "23503",
                     f'update or delete on table "{parent.name}" violates foreign key '
-                    f'constraint "{fk.name}" on table "{child.name}"'
+                    f'constraint "{fk.name}" on table "{child.name}"',
+                    diag=_error_diag(child, n=fk.name),
                 )
             if action == "CASCADE":
                 _enforce_fk_on_parent_delete(children, child, storage, db, catalog, _depth + 1)
@@ -2524,9 +2577,11 @@ def _enforce_fk_on_parent_update(
                 continue
             action = (fk.on_update or "NO ACTION").upper()
             if action in ("NO ACTION", "RESTRICT"):
-                raise errors.foreign_key_violation(
+                raise errors.SQLError(
+                    "23503",
                     f'update or delete on table "{parent.name}" violates foreign key '
-                    f'constraint "{fk.name}" on table "{child.name}"'
+                    f'constraint "{fk.name}" on table "{child.name}"',
+                    diag=_error_diag(child, n=fk.name),
                 )
             if action == "CASCADE":
                 new_set = {child.field_for(c): v for c, v in zip(fk.columns, new, strict=False)}
