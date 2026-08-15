@@ -42,6 +42,8 @@ jobs:
   # workflow at parse time — found the hard way).
   plan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       matrix: ${{ steps.pick.outputs.matrix }}
     steps:
@@ -71,6 +73,14 @@ jobs:
     name: ${{ matrix.driver.name }}
     needs: plan
     runs-on: ubuntu-latest
+    # Least privilege: this job checks out the repo and then runs a dozen
+    # third-party driver toolchains (Go modules, npm, Maven/Gradle, gems,
+    # crates, PHP builds, the .NET SDK) whose transitive dependencies don't
+    # carry this repo's SHA-pinning discipline. An explicit grant keeps the
+    # job's token read-only regardless of the org/repo default. Artifact
+    # upload needs no contents write.
+    permissions:
+      contents: read
     # A wedged gauge must fail fast, not burn the 6-hour default: the rust
     # gauge spent two consecutive weekly runs crawling to the 6h kill (cold
     # cargo cache + per-filter timeouts compounding — see rust_validation/
