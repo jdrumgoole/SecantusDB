@@ -1376,6 +1376,31 @@ fn authorize(name: &str, doc: &Document, ctx: &CommandContext) -> Result<(), Com
                     ),
                 ));
             }
+            // A pipeline's secondary namespaces carry their own privilege
+            // requirements ($out/$merge write, $lookup-family read) — the
+            // primary (find, primary-collection) grant alone must not
+            // authorize writes to or reads from other namespaces. Mirrors
+            // commands.py's _pipeline_secondary_requirements check.
+            if name == "aggregate" {
+                for (extra_action, extra_db) in pipeline_secondary_requirements(doc, &ctx.db_name) {
+                    if !rbac::check_privilege_resolved(
+                        &roles,
+                        extra_action,
+                        Some(&extra_db),
+                        false,
+                        Some(&resolver),
+                    ) {
+                        return Err(CommandError::new(
+                            13,
+                            "Unauthorized",
+                            format!(
+                                "not authorized on {extra_db} to execute \
+                                 aggregation stage (action: {extra_action})"
+                            ),
+                        ));
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -1474,8 +1499,86 @@ fn command_action(name: &str) -> Option<(&'static str, &'static str)> {
         "getCmdLineOpts" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
         "getParameter" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
         "getLog" => (A_GET_LOG, SCOPE_CLUSTER),
+        // Fault injection is a server-wide DoS lever (e.g. closeConnection on
+        // every find); require an explicit cluster-admin grant under --auth.
+        "configureFailPoint" => (A_CONFIGURE_FAIL_POINT, SCOPE_CLUSTER),
         _ => return None,
     })
+}
+
+/// The `(action, db)` grants a pipeline needs beyond the primary `find`:
+/// `$out` insert+remove on its target, `$merge` insert+update, and the
+/// read-side stages (`$lookup` / `$graphLookup` / `$unionWith`) find on the
+/// foreign namespace. Sub-pipelines (`$lookup.pipeline`,
+/// `$unionWith.pipeline`, `$facet` branches) are walked recursively. RBAC is
+/// db-granular, so requirements resolve to `(action, db)` pairs. Mirrors
+/// `commands.py::_pipeline_secondary_requirements`.
+fn pipeline_secondary_requirements(
+    doc: &Document,
+    default_db: &str,
+) -> Vec<(&'static str, String)> {
+    let mut reqs: Vec<(&'static str, String)> = Vec::new();
+
+    fn walk(pipeline: &Bson, default_db: &str, reqs: &mut Vec<(&'static str, String)>) {
+        use rbac::{A_FIND, A_INSERT, A_REMOVE, A_UPDATE};
+        let Bson::Array(stages) = pipeline else {
+            return;
+        };
+        for stage in stages {
+            let Bson::Document(stage) = stage else {
+                continue;
+            };
+            for (op, spec) in stage.iter() {
+                match op.as_str() {
+                    "$out" => {
+                        let db = match spec {
+                            Bson::Document(d) => d.get_str("db").unwrap_or(default_db).to_string(),
+                            _ => default_db.to_string(),
+                        };
+                        reqs.push((A_INSERT, db.clone()));
+                        reqs.push((A_REMOVE, db));
+                    }
+                    "$merge" => {
+                        let into = match spec {
+                            Bson::Document(d) => d.get("into"),
+                            _ => None,
+                        };
+                        let db = match into {
+                            Some(Bson::Document(d)) => {
+                                d.get_str("db").unwrap_or(default_db).to_string()
+                            }
+                            _ => default_db.to_string(),
+                        };
+                        reqs.push((A_INSERT, db.clone()));
+                        reqs.push((A_UPDATE, db));
+                    }
+                    "$lookup" | "$graphLookup" | "$unionWith" => {
+                        reqs.push((A_FIND, default_db.to_string()));
+                        if let Bson::Document(d) = spec {
+                            if let Some(sub) = d.get("pipeline") {
+                                walk(sub, default_db, reqs);
+                            }
+                        }
+                    }
+                    "$facet" => {
+                        if let Bson::Document(d) = spec {
+                            for (_, sub) in d.iter() {
+                                walk(sub, default_db, reqs);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if let Some(pipeline) = doc.get("pipeline") {
+        walk(pipeline, default_db, &mut reqs);
+    }
+    reqs.sort();
+    reqs.dedup();
+    reqs
 }
 
 /// Resolve the `(target_db, cluster_flag)` an action operates on. Cluster-scoped
@@ -1665,6 +1768,42 @@ mod tests {
     fn command_name_is_first_key() {
         assert_eq!(command_name(&doc! {"ping": 1, "$db": "admin"}), "ping");
         assert_eq!(command_name(&Document::new()), "");
+    }
+
+    #[test]
+    fn pipeline_secondary_requirements_walks_all_stage_shapes() {
+        let doc = doc! {"aggregate": "orders", "pipeline": [
+            {"$match": {"v": 1}},
+            {"$out": {"db": "warehouse", "coll": "t"}},
+            {"$merge": {"into": "t2"}},
+            {"$unionWith": {"coll": "c2", "pipeline": [
+                {"$merge": {"into": {"db": "x", "coll": "y"}}},
+            ]}},
+            {"$facet": {"branch": [
+                {"$lookup": {"from": "f", "localField": "a", "foreignField": "b", "as": "z"}},
+            ]}},
+        ]};
+        let reqs = pipeline_secondary_requirements(&doc, "shop");
+        for want in [
+            (rbac::A_INSERT, "warehouse"),
+            (rbac::A_REMOVE, "warehouse"),
+            (rbac::A_INSERT, "shop"),
+            (rbac::A_UPDATE, "shop"),
+            (rbac::A_INSERT, "x"),
+            (rbac::A_UPDATE, "x"),
+            (rbac::A_FIND, "shop"),
+        ] {
+            assert!(
+                reqs.contains(&(want.0, want.1.to_string())),
+                "missing {want:?} in {reqs:?}"
+            );
+        }
+        // A plain read pipeline demands nothing extra.
+        assert!(pipeline_secondary_requirements(
+            &doc! {"aggregate": "orders", "pipeline": [{"$match": {}}]},
+            "shop"
+        )
+        .is_empty());
     }
 
     #[test]
