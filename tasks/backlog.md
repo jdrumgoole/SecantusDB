@@ -2480,15 +2480,18 @@ threading into `wt_config`.)
 **Where it stands: `pgconn` is at 4 stable failures** (of 216 tests;
 full-package re-run measured 2026-08-15 at `f2891c28`, three runs). The
 chain: 86 → 29 (#862) → 23 (#866) → 20 (#868) → 18 (#869) → 17 (#870) →
-12 (#871, measured) → 8 (#873) → 5 (#876) → 4 (#877). One additional test,
-`TestDeadlineContextWatcherHandler`, is LOAD-SENSITIVE, not broken: its
-"DeadlineExceeded with DeadlineDelay" subtest gives a 250 ms pg_sleep a
-600 ms total budget, passes 5/5 isolated against the same daemon, and
-misses the margin only under the full package's 16-way parallel load on a
-busy interactive desktop (WindowServer pinned during the runs; a leaked
-debug process was also found and killed mid-measurement — see
-orphaned-process caveats). Re-measure on a quiet machine before treating
-it as a server defect. The stable four: 86 → 29 after the `generate_series`
+12 (#871, measured) → 8 (#873) → 5 (#876) → 4 (#877). Two additional tests are
+LOAD-SENSITIVE, not broken — the ctxwatch timing-budget pair,
+`TestDeadlineContextWatcherHandler` and (less often)
+`TestCancelRequestContextWatcherHandler`: both give short pg_sleep queries
+sub-second cancel/deadline budgets, pass repeatedly in isolation against
+the same daemon (3/3 and 5/5 across measurement rounds, including at
+moderate load), and miss their margins only under the full package's
+16-way parallel load against the GIL-bound Python server on this shared
+desktop (2026-08-15: flickered in 2 of 5 full runs; one earlier round was
+also polluted by a leaked debug process, since killed). The Python server
+is not a perf target (throughput/latency work goes to the Rust server) —
+re-measure on a quiet machine before treating either as a server defect. The stable four: 86 → 29 after the `generate_series`
 untyped-bound fix (#862), 29 → 23 after per-session temp-table namespacing
 (#866), 23 → 20 after the stray-CopyData drain fix (#868), 20 → 18 after
 plain-json compact rendering (#869), 18 → 17 after the legacy bare
