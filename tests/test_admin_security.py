@@ -75,6 +75,40 @@ async def test_geo_page_escapes_malicious_document_id(server, http: AsyncClient)
     assert "\\u003c/script\\u003e" in r.text
 
 
+async def test_collections_page_alpine_directives_use_row_indices(
+    server, http: AsyncClient
+) -> None:
+    """A collection name with a quote must not reach the Alpine.js expression
+    context (issue #835): Jinja's HTML-entity escaping is undone by the
+    browser's attribute decoding before Alpine compiles the string with
+    ``new Function``, so `'` in a name broke out of the toggle-key literal
+    and executed script on page render. The toggle keys are row indices now —
+    no attacker-controlled string in any directive."""
+    evil = "x') ? alert(document.cookie) : (open === 'y"
+    client = MongoClient(server.uri)
+    try:
+        client["xss_db"][evil].insert_one({"_id": 1})
+    finally:
+        client.close()
+
+    r = await http.get("/db/xss_db", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    import re
+
+    # The security property: no Alpine directive (@click / x-show) may carry
+    # the collection name — toggle keys are integer row indices, so the name
+    # never reaches the `new Function` expression context.
+    directives = re.findall(r'(?:@click|x-show)="[^"]*"', r.text)
+    assert directives, "expected some Alpine directives on the page"
+    for d in directives:
+        assert "alert" not in d, f"collection name leaked into directive: {d}"
+    # The toggle keys are the row index, not the name.
+    assert "'mod-1'" in r.text and "'ren-1'" in r.text
+    # The name still renders (escaped) in the row's link/text so the page is
+    # usable — just never in a directive.
+    assert "&#39;) ? alert(document.cookie)" in r.text
+
+
 async def test_geo_page_without_token_rejected(http: AsyncClient) -> None:
     """The geo route is token-gated like every other data page."""
     r = await http.get("/db/xss_db/locs/geo")
