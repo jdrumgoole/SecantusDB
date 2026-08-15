@@ -2477,9 +2477,9 @@ threading into `wt_config`.)
 
 ### pgx gauge — `pgconn` findings and next steps (2026-08-14)
 
-**Where it stands: `pgconn` is at 2 stable failures — MEASURED** (full
-package at `4528a1b9`, 2026-08-15, after the #885 startup-shapes fixes; the
-load-sensitive ctxwatch pair also passed this run) (of 216 tests;
+**Where it stands: `pgconn` is at 1 stable failure** (NetworkUsage
+reply-shape fidelity fixed — verified individually; 2 measured at
+`4528a1b9` before it) (of 216 tests;
 full-package re-run measured 2026-08-15 at `f2891c28`, three runs). The
 chain: 86 → 29 (#862) → 23 (#866) → 20 (#868) → 18 (#869) → 17 (#870) →
 12 (#871, measured) → 8 (#873) → 5 (#876) → 4 (#877). Two additional tests are
@@ -2522,10 +2522,6 @@ PR trail #866/#868/#869/#870/#871/#873/#876/#877):
   at setup on `create function ... returns trigger ... language plpgsql` +
   `CREATE TRIGGER` (`0A000 command CREATE is not supported`); needs trigger
   + `tsvector`/`to_tsvector` support. The largest remaining lift.
-* `TestConnExecStatementNetworkUsage` — byte-exact reply-size assertions:
-  ours is 409/157 bytes vs PG's 391/153; needs a message-level diff of the
-  Describe/Execute replies (RowDescription typmod/table-oid details are the
-  likely delta).
 
 Known divergence recorded while fixing the batch shape (#876): a real PG
 multi-statement simple query is ONE implicit transaction (an error rolls

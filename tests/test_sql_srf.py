@@ -382,3 +382,42 @@ def test_generate_series_still_rejects_non_numeric_bounds():
     with _pytest.raises(errors.SQLError) as exc:
         _rows("select generate_series('a', 'b')")
     assert "integer / numeric" in str(exc.value)
+
+
+class TestSeriesResultTyping:
+    # pgx's NetworkUsage test byte-counts the reply: PG's generate_series
+    # picks its overload from the argument types, so int4-range bounds yield
+    # int4 rows (oid 23, 4-byte binary cells), not int8.
+    def test_int4_bounds_type_int4(self):
+        res = _run("select n from generate_series(1, 3) n")
+        assert res.columns[0].type_tag == "int4"
+        assert res.columns[0].pg_oid == 23
+
+    def test_int8_bounds_type_int8(self):
+        res = _run("select n from generate_series(2147483648, 2147483650) n")
+        assert res.columns[0].type_tag == "int8"
+        assert res.columns[0].pg_oid == 20
+
+    def test_describe_matches_execute_for_param_bound(self):
+        # Describe-time ($1 unbound) and execute-time typing must agree — a
+        # RowDescription claiming int8 over 4-byte int4 cells breaks binary
+        # clients. Known int4-range bounds decide int4 both times.
+        from secantus.sql import srf as _srf
+
+        assert _srf._generate_series(1, None, None) == ([], "int4")
+        assert _srf._generate_series(2147483648, None, None) == ([], "int8")
+
+
+class TestOutputNameFidelity:
+    def test_duplicate_unaliased_names_repeat_verbatim(self):
+        # Real PG repeats ?column? for every unaliased expression — never
+        # ?column?_2 (pgx's NetworkUsage test byte-counts the names).
+        assert _cols("select 'a', 'b', 1, 2 from generate_series(1, 1) n") == [
+            "?column?",
+            "?column?",
+            "?column?",
+            "?column?",
+        ]
+
+    def test_array_cast_named_after_element_type(self):
+        assert _cols("select '{foo}'::text[] from generate_series(1, 1) n") == ["text"]
