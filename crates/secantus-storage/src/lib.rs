@@ -4056,10 +4056,15 @@ impl Storage {
         // saw the bytes and the CI async-oplog lane hit the raw cache error
         // the budget exists to prevent). The entries carry the full
         // documents, so their byte volume is the budget input; harvested by
-        // `with_user_transaction`.
+        // `with_user_transaction`. Pre-image bytes are charged too: in async
+        // mode they ride the same per-handle `pending_async` buffer, so
+        // without this the buffer (and heap) could grow unbounded for the
+        // life of a pre-image-enabled transaction even though the entries
+        // themselves stay within budget (#750).
         if !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
-            let sz: u64 = entries.iter().map(oplog_entry_size).sum();
-            PENDING_DIRTY_BYTES.with(|c| c.set(c.get() + sz));
+            let entry_sz: u64 = entries.iter().map(oplog_entry_size).sum();
+            let preimage_sz: u64 = pre_images.iter().flatten().map(|p| p.len() as u64).sum();
+            PENDING_DIRTY_BYTES.with(|c| c.set(c.get() + entry_sz + preimage_sz));
         }
         // Async oplog (prototype): inside an autocommit write statement, buffer
         // the entries instead of writing them in this transaction. They are minted
@@ -5241,7 +5246,11 @@ fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     // blocking writers; prune is best-effort, so a slightly stale count/view is
     // fine — writers only append *higher* seqs, never touch the old rows here.
     let tables = oplog_all_tables();
-    let live_count = ctx.oplog.lock().unwrap().live_count;
+    let live_count = ctx
+        .oplog
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .live_count;
     let excess = (live_count - ctx.max_entries.load(Ordering::Relaxed) as i64).max(0) as usize;
 
     // Cheap early-out: under the cap, the only reason to prune is retention,
@@ -5340,7 +5349,10 @@ fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
         }
     }
     // Keep the live-count honest for the next sweep's sizing.
-    ctx.oplog.lock().unwrap().live_count -= doomed.len() as i64;
+    ctx.oplog
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .live_count -= doomed.len() as i64;
     Ok(doomed.len())
 }
 
