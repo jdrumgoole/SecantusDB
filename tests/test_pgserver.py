@@ -395,3 +395,30 @@ def test_protocol_30_gets_no_negotiation(client):
 def test_show_server_version_num(client):
     res = parse_results(client.query("SHOW server_version_num"))
     assert res["results"][0]["rows"] == [[b"150000"]]
+
+
+def test_startup_parameter_applies_any_guc(server):
+    # Real PG accepts any run-time GUC as a startup parameter. pgx's
+    # target_session_attrs=read-write probe ships
+    # default_transaction_read_only=on at startup and expects SHOW
+    # transaction_read_only to reflect it (and writes to fail 25006).
+    host, port = server.address
+    c = PGClient(host, port)
+    c.sock.sendall(
+        pgwire.build_startup_message(
+            {
+                "user": "secantus",
+                "database": "testdb",
+                "default_transaction_read_only": "on",
+            }
+        )
+    )
+    c._read_until_ready()
+    try:
+        res = parse_results(c.query("SHOW transaction_read_only"))
+        assert res["results"][0]["rows"] == [[b"on"]]
+        msgs = c.query("CREATE TABLE ro_probe (a int4)")
+        errs = [m for m in msgs if m.type == "E"]
+        assert errs and pgwire.parse_error_response(errs[0].payload)["C"] == "25006"
+    finally:
+        c.close()
