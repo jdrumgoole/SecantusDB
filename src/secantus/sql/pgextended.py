@@ -1155,6 +1155,12 @@ class ExtendedSession:
         if len(stmts) > 1:
             raise errors.syntax_error("cannot insert multiple commands into a prepared statement")
         stmt = stmts[0] if stmts else None
+        if stmt is not None and engine.is_nonstatement_expression(stmt):
+            # Garbage input ("SYNTAX ERROR") parses as a bare expression;
+            # real PG rejects it AT PARSE TIME — pgx's Prepare and pipelined
+            # SendPrepare both expect the ErrorResponse here, not at Execute.
+            near = stmt.sql(dialect="postgres").split(None, 1)[0]
+            raise errors.syntax_error(f'syntax error at or near "{near[:40]}"')
         count = planner.parameter_count(stmt) if stmt is not None else 0
         if isinstance(stmt, exp.Select):
             # pg_typeof($N) types from the OIDs the client declares here in

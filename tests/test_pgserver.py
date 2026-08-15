@@ -305,3 +305,37 @@ def test_stop_drains_handler_threads_before_storage_close(tmp_path, caplog):
         st.close()
     assert not [r for r in caplog.records if "close failed" in r.message]
     c.sock.close()
+
+
+# --------------------------------------------------------------------------- #
+# Statement-shaped garbage is a syntax error, and a mid-batch error still
+# streams the earlier statements' results — both PG parse/exec error shapes
+# pinned by pgx (PrepareSyntaxError / PipelinePrepareError /
+# ExecMultipleQueriesError).
+
+
+def test_bare_expression_is_a_syntax_error(client):
+    # sqlglot parses "SYNTAX ERROR" as an aliased column expression; a bare
+    # expression is not a statement and real PG rejects it with 42601.
+    msgs = client.query("SYNTAX ERROR")
+    errs = [m for m in msgs if m.type == "E"]
+    assert len(errs) == 1
+    assert pgwire.parse_error_response(errs[0].payload)["C"] == "42601"
+    res = parse_results(client.query("SELECT 1"))
+    assert res["results"][0]["rows"] == [[b"1"]]
+
+
+def test_multi_statement_error_streams_completed_results(client):
+    # select 1 runs and its rows arrive; select 1/0 errors 22012; the third
+    # statement never executes — exactly real PG's simple-protocol shape.
+    msgs = client.query("select 1; select 1/0; select 2")
+    types = [m.type for m in msgs]
+    data = [m for m in msgs if m.type == "D"]
+    errs = [m for m in msgs if m.type == "E"]
+    assert len(data) == 1 and pgwire.parse_data_row(data[0].payload) == [b"1"]
+    assert len(errs) == 1
+    assert pgwire.parse_error_response(errs[0].payload)["C"] == "22012"
+    # The first statement completed (its CommandComplete precedes the error);
+    # nothing from the third statement follows the ErrorResponse.
+    assert types.index("C") < types.index("E")
+    assert types[-1] == "Z"
