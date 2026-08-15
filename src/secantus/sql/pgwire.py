@@ -67,6 +67,10 @@ def recv_exactly(sock: socket.socket, n: int) -> bytes:
 @dataclass
 class StartupMessage:
     params: dict[str, str]
+    #: The protocol version the client requested (major 3, any minor). The
+    #: server answers anything newer than 3.0 with NegotiateProtocolVersion
+    #: and continues at 3.0, like real PG.
+    protocol: int = PROTOCOL_VERSION_3
 
 
 @dataclass
@@ -111,7 +115,10 @@ def read_startup_packet(sock: socket.socket) -> StartupPacket:
             # ``unpack_from`` read past the buffer → ``struct.error``.
             pid, secret = struct.unpack_from("!ii", body, 4)
             return CancelRequest(pid=pid, secret=secret)
-        if code != PROTOCOL_VERSION_3:
+        if code >> 16 != 3:
+            # Major version 3 is the only one we speak. A newer MINOR (pgx's
+            # MaxProtocolVersion "3.2" sends 196610) is fine — the caller
+            # answers NegotiateProtocolVersion and continues at 3.0.
             raise PGProtocolError(f"unsupported protocol/startup code {code}")
         # Remainder is a run of NUL-terminated key/value strings, ending with
         # an empty key (a lone NUL). A key or value that isn't valid UTF-8
@@ -125,7 +132,7 @@ def read_startup_packet(sock: socket.socket) -> StartupPacket:
                 break
             params[key] = parts[i + 1].decode("utf-8")
             i += 2
-        return StartupMessage(params=params)
+        return StartupMessage(params=params, protocol=code)
     except (struct.error, UnicodeDecodeError) as exc:
         raise PGProtocolError(f"malformed startup packet: {exc}") from exc
 
@@ -562,9 +569,22 @@ def portal_suspended() -> bytes:
     return _msg("s", b"")
 
 
-def build_startup_message(params: dict[str, str]) -> bytes:
+def negotiate_protocol_version(newest: int, unrecognized: list[str]) -> bytes:
+    """NegotiateProtocolVersion ('v'): the newest minor protocol the server
+    supports plus any ``_pq_.*`` startup options it did not recognize. Real PG
+    sends this as the FIRST response when the client asks for a newer minor
+    (pgx's MaxProtocolVersion "3.2"), then both sides continue at the
+    negotiated version."""
+    payload = bytearray(_INT32.pack(newest))
+    payload += _INT32.pack(len(unrecognized))
+    for name in unrecognized:
+        payload += _cstr(name)
+    return _msg("v", bytes(payload))
+
+
+def build_startup_message(params: dict[str, str], protocol: int = PROTOCOL_VERSION_3) -> bytes:
     """Client-side helper (used by tests): assemble a StartupMessage."""
-    body = bytearray(_INT32.pack(PROTOCOL_VERSION_3))
+    body = bytearray(_INT32.pack(protocol))
     for k, v in params.items():
         body += _cstr(k) + _cstr(v)
     body += b"\x00"

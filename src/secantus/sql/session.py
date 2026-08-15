@@ -32,6 +32,9 @@ VERSION_STRING = "PostgreSQL 15.0 (SecantusDB) on x86_64-pc-linux-gnu, compiled 
 # SET them. Enough to satisfy the common introspection probes.
 GUC_DEFAULTS: dict[str, str] = {
     "server_version": SERVER_VERSION,
+    # The integer form clients compare against (major*10000 + minor); pgx's
+    # protocol-3.2 test reads it to decide the expected secret-key length.
+    "server_version_num": "150000",
     "server_encoding": "UTF8",
     "client_encoding": "UTF8",
     "DateStyle": "ISO, MDY",

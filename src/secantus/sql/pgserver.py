@@ -438,6 +438,14 @@ class SecantusPGServer:
             startup = packet
             break
 
+        # A newer minor protocol (pgx's MaxProtocolVersion "3.2" sends
+        # 196610) or unrecognized ``_pq_.*`` startup options get real PG's
+        # answer: NegotiateProtocolVersion FIRST — newest minor we speak plus
+        # the unknown option names — then the handshake continues at 3.0.
+        pq_options = [k for k in startup.params if k.startswith("_pq_.")]
+        if startup.protocol != pgwire.PROTOCOL_VERSION_3 or pq_options:
+            io.sendall(pgwire.negotiate_protocol_version(pgwire.PROTOCOL_VERSION_3, pq_options))
+
         db = startup.params.get("database") or startup.params.get("user") or self.default_database
         user = startup.params.get("user", "secantus")
         application_name = startup.params.get("application_name", "")
