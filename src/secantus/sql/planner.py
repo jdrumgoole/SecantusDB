@@ -10637,7 +10637,82 @@ def _resolve_group_by_ordinals(root: exp.Expression) -> None:
 _ESTRING_SIMPLE = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
 
 
-def _decode_estrings(sql: str) -> str:
+#: A dollar-quote tag: ``$$`` or ``$tag$`` where the tag starts with a letter /
+#: underscore and may continue with digits (``$A0$``, ``$_0$``) — PG's rule.
+_DOLLAR_TAG_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+
+
+def _strip_nested_block_comments(sql: str) -> str:
+    """Strip block comments when (and only when) any of them NEST.
+
+    PostgreSQL nests ``/* /* */ */``; sqlglot's tokenizer does not, so a nested
+    comment mis-tokenizes into stray operators (``/*/*/*/**/*/*/*/`` became
+    ``* *``). Non-nested comments are left for sqlglot (it keeps them as
+    trivia). Strings, quoted identifiers, dollar-quoted bodies, and line
+    comments are skipped, mirroring ``_decode_estrings``'s scanner."""
+    out: list[str] = []
+    i, n = 0, len(sql)
+    nested = False
+    while i < n:
+        c = sql[i]
+        if c == "-" and sql[i : i + 2] == "--":  # line comment
+            j = sql.find("\n", i)
+            j = n if j == -1 else j + 1
+            out.append(sql[i:j])
+            i = j
+        elif c == "/" and sql[i : i + 2] == "/*":  # block comment — count depth
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if sql[j : j + 2] == "/*":
+                    depth += 1
+                    nested = True
+                    j += 2
+                elif sql[j : j + 2] == "*/":
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            out.append(" ")
+            i = j
+        elif c == '"' or c == "'":  # quoted identifier / plain literal
+            q = c
+            j = i + 1
+            while j < n:
+                if sql[j] == q:
+                    if sql[j + 1 : j + 2] == q:
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            out.append(sql[i:j])
+            i = j
+        elif (
+            c == "$"
+            and (m := _DOLLAR_TAG_RE.match(sql, i))
+            and not (i and (sql[i - 1].isalnum() or sql[i - 1] in "_$"))
+        ):  # dollar-quoted body
+            tag = m.group(0)
+            j = sql.find(tag, i + len(tag))
+            j = n if j == -1 else j + len(tag)
+            out.append(sql[i:j])
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out) if nested else sql
+
+
+def decode_nonstandard_strings(sql: str) -> str:
+    """``standard_conforming_strings = off``: every plain ``'…'`` literal
+    treats backslash as an escape character, exactly like ``E'…'``. Rewrite
+    them all (and E-strings) to standard literals before parsing. Called by the
+    engine/wire layers when the session GUC is off — ``parse`` itself is
+    session-independent (and cached), so the transform happens on the text."""
+    return _decode_estrings(sql, nonstandard=True)
+
+
+def _decode_estrings(sql: str, *, nonstandard: bool = False) -> str:
     """Rewrite every ``E'…'`` escape-string literal into an equivalent standard
     literal BEFORE sqlglot parses.
 
@@ -10674,13 +10749,23 @@ def _decode_estrings(sql: str) -> str:
                 j += 1
             out.append(sql[i:j])
             i = j
-        elif c == "$" and (m := re.match(r"\$[A-Za-z_]*\$", sql[i:])):  # dollar quote
+        elif (
+            c == "$"
+            and (m := _DOLLAR_TAG_RE.match(sql, i))
+            and not (i and (sql[i - 1].isalnum() or sql[i - 1] in "_$"))
+        ):  # dollar quote (tag may carry digits after the first char: $A0$, $_0$)
             tag = m.group(0)
             j = sql.find(tag, i + len(tag))
             j = n if j == -1 else j + len(tag)
             out.append(sql[i:j])
             i = j
         elif c == "'":  # plain literal — skip over '' doubling
+            if nonstandard:
+                # standard_conforming_strings=off: backslash escapes apply in
+                # plain literals too — decode with the E-string grammar.
+                value, i = _consume_estring(sql, i + 1)
+                out.append("'" + value.replace("'", "''") + "'")
+                continue
             j = i + 1
             while j < n:
                 if sql[j] == "'":
@@ -10889,11 +10974,20 @@ def _parse_uncached(sql: str) -> list[exp.Expression]:
     # Decode E'…' escape strings ourselves — sqlglot's half-decoding is lossy.
     if "e'" in sql or "E'" in sql:
         sql = _decode_estrings(sql)
+    # PG nests block comments; sqlglot doesn't — strip them when they nest.
+    if "/*" in sql:
+        sql = _strip_nested_block_comments(sql)
     try:
         stmts = [s for s in sqlglot.parse(_normalize_params(sql), read="postgres") if s is not None]
         for s in stmts:
             _fold_unquoted_identifiers(s)
             _resolve_group_by_ordinals(s)
+            # Dollar-quoted strings tokenize as RawString — downstream code
+            # (scalar, typemap, every literal path) only knows Literal, so
+            # normalize in place: the value is identical, only the quoting
+            # style differed.
+            for raw in list(s.find_all(exp.RawString)):
+                raw.replace(exp.Literal.string(raw.this))
         return stmts
     except (sqlglot.errors.ParseError, sqlglot.errors.TokenError) as exc:
         raise errors.syntax_error(str(exc).splitlines()[0]) from exc

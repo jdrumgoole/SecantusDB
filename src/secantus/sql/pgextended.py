@@ -1149,6 +1149,8 @@ class ExtendedSession:
 
     def _parse(self, payload: bytes) -> bytes:
         name, query, oids = pgwire.parse_parse(payload, self.session.wire_encoding)
+        if self.session.get_setting("standard_conforming_strings").lower() in ("off", "false", "0"):
+            query = planner.decode_nonstandard_strings(query)
         stmts = planner.parse(query)
         if len(stmts) > 1:
             raise errors.syntax_error("cannot insert multiple commands into a prepared statement")

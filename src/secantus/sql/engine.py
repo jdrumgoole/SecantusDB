@@ -85,6 +85,8 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
         if two_phase is not None:
             return [two_phase]
         results: list[SQLResult] = []
+        if session.get_setting("standard_conforming_strings").lower() in ("off", "false", "0"):
+            sql = planner.decode_nonstandard_strings(sql)
         for stmt in planner.parse(sql):
             result = _normalize_result(_dispatch(stmt, storage, db, catalog, session))
             _drain_plpgsql_notices(session, result)
@@ -329,7 +331,15 @@ def _dispatch(
     undoes their writes), and a statement that errors poisons the block until it
     ends (Postgres' aborted-transaction semantics).
     """
+    # ``now()`` / CURRENT_TIMESTAMP are transaction-stable in Postgres (every
+    # call in a transaction sees the same instant; autocommit statements are
+    # their own transaction). Reset the frozen clock at each statement start
+    # unless an explicit block is open — scalar's ``_utcnow`` freezes the first
+    # value it derives into ``session.txn_now``.
+    if session.txn_handle is None:
+        session.txn_now = None
     if isinstance(stmt, exp.Transaction):
+        session.txn_now = None  # BEGIN starts a fresh transaction clock
         return _begin_txn(storage, session, stmt.args.get("modes") or [])
     if isinstance(stmt, exp.Commit):
         return _commit_txn(storage, db, catalog, session)
@@ -1899,6 +1909,62 @@ def copy_extract_raw(storage: Any, db: str, plan: CopyPlan) -> list[list]:
     return out
 
 
+def _run_create_table_as(
+    stmt: exp.Create,
+    source: exp.Expression,
+    storage: Any,
+    db: str,
+    catalog: Catalog,
+    session: Session,
+) -> SQLResult:
+    """``CREATE [TEMP] TABLE name AS <query>`` — run the query once, create the
+    table with the result's inferred column names/types, insert the rows, and
+    report PG's CTAS tag (``SELECT <n>``, which drivers read as the row count).
+    """
+    while isinstance(source, exp.Subquery):
+        source = source.this
+    if not isinstance(source, (exp.Select, exp.SetOperation)):
+        raise errors.feature_not_supported("CREATE TABLE AS requires a SELECT source")
+    name = planner.qualified_table_name(stmt.this)
+    if stmt.args.get("exists") and catalog.get(db, name) is not None:
+        return SQLResult(command_tag="CREATE TABLE AS")
+    result = _run_query(source, storage, db, catalog, session)
+    seen: set[str] = set()
+    coldefs: list[str] = []
+    for i, c in enumerate(result.columns):
+        cname = c.name or f"column{i + 1}"
+        if cname in seen:
+            raise errors.SQLError("42701", f'column "{cname}" specified more than once')
+        seen.add(cname)
+        tname = typemap.SQL_TYPE_NAME.get(c.type_tag) or (
+            c.type_tag if c.type_tag in typemap.PG_OID else "text"
+        )
+        coldefs.append('"' + cname.replace('"', '""') + '" ' + tname)
+    props = stmt.args.get("properties")
+    temp = bool(props) and any(isinstance(e, exp.TemporaryProperty) for e in props.expressions)
+    quoted = ".".join('"' + part.replace('"', '""') + '"' for part in name.split("."))
+    create_sql = (
+        "CREATE "
+        + ("TEMPORARY " if temp else "")
+        + "TABLE "
+        + quoted
+        + " ("
+        + ", ".join(coldefs)
+        + ")"
+    )
+    created = planner.parse(create_sql)[0]
+    planner.qualify_temp_create_target(created, session)
+    create_plan = planner.plan_create_table(created)
+    executor.execute_create_table(create_plan, catalog, storage, db)
+    if create_plan.table.temp:
+        session.temp_tables.add((db, create_plan.table.name))
+    table = _require_table(catalog, db, create_plan.table.name, storage)
+    insert_stmt = exp.Insert(this=exp.to_table(quoted))
+    plan = planner.plan_insert_rows(insert_stmt, table, result.rows)
+    inserted = executor.execute_insert(plan, storage, db, catalog, session).rowcount
+    return SQLResult(command_tag=f"SELECT {inserted}", rowcount=inserted)
+
+
 def _run_statement(
     stmt: exp.Expression, storage: Any, db: str, catalog: Catalog, session: Session
 ) -> SQLResult:
@@ -1912,6 +1978,9 @@ def _run_statement(
     if isinstance(stmt, exp.Create):
         kind = (stmt.args.get("kind") or "TABLE").upper()
         if kind == "TABLE":
+            source = stmt.args.get("expression")
+            if source is not None and not isinstance(stmt.this, exp.Schema):
+                return _run_create_table_as(stmt, source, storage, db, catalog, session)
             planner.qualify_temp_create_target(stmt, session)
             plan = planner.plan_create_table(stmt)
             res = executor.execute_create_table(plan, catalog, storage, db)
@@ -3013,7 +3082,7 @@ def _run_truncate(stmt: exp.TruncateTable, storage: Any, db: str, catalog: Catal
     exists = bool(stmt.args.get("exists"))  # TRUNCATE … IF EXISTS
     named: list[str] = []
     for t in stmt.args.get("expressions") or []:
-        name = t.name
+        name = planner.qualified_table_name(t)
         if catalog.get(db, name) is None and reflect.reflect(storage, db, name) is None:
             if exists:
                 continue
