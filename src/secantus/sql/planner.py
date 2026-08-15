@@ -10608,7 +10608,7 @@ _DO_BLOCK_RE = re.compile(
 #: Reject a statement string longer than this before handing it to sqlglot. 1 MB
 #: is far larger than any real query yet small enough that a flood of oversized
 #: statements can't pin the parser.
-MAX_SQL_LENGTH = 1_000_000
+MAX_SQL_LENGTH = 16_000_000
 
 
 def _resolve_group_by_ordinals(root: exp.Expression) -> None:
@@ -10823,7 +10823,10 @@ def parse(sql: str) -> list[exp.Expression]:
 def _parse_uncached(sql: str) -> list[exp.Expression]:
     # Cap the statement length before parsing — a cheap upper bound on parse cost
     # so a flood of oversized statements can't pin CPU (the Mongo wire has
-    # analogous 16/48 MB size ceilings). 1 MB is far above any real query. (#194)
+    # analogous 16/48 MB size ceilings). 16 MB matches the Mongo document
+    # ceiling; the earlier 1 MB cap was falsified by a REAL query shape —
+    # pgx's 65535-parameter statements are ~1.04 MB and real PG accepts up
+    # to its 1 GB message limit. (#194)
     if len(sql) > MAX_SQL_LENGTH:
         raise errors.program_limit_exceeded(
             f"statement too long: {len(sql)} bytes exceeds the {MAX_SQL_LENGTH}-byte limit"

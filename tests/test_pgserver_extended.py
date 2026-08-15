@@ -421,3 +421,16 @@ def test_describe_derived_values_join(server):
         cur.execute(sql, prepare=True)
         assert [d.name for d in cur.description] == ["t1_id", "t2_text"]
         assert cur.fetchall() == [(1, "a"), (2, None)]
+
+
+def test_parameter_description_wraps_int16_count_like_pg():
+    # PG's ParameterDescription count field is int16 and WRAPS for >=65536
+    # parameters (pq_sendint16); pgproto3 ignores the count and infers it
+    # from the message length. 65536 oids must not raise struct.error, and
+    # every oid must be present in the body.
+    from secantus.sql import pgwire
+
+    msg = pgwire.parameter_description([25] * 65536)
+    # 1 type byte + int32 length + int16 (wrapped to 0) + 65536 * int32 oids
+    assert len(msg) == 1 + 4 + 2 + 65536 * 4
+    assert msg[5:7] == b"\x00\x00"  # 65536 & 0xFFFF == 0

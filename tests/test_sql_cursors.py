@@ -221,3 +221,14 @@ def test_cursor_row_count_is_capped(storage, session, monkeypatch):
     with pytest.raises(SQLError) as ei:
         q(storage, session, "DECLARE big CURSOR FOR SELECT id FROM t")
     assert ei.value.sqlstate == "54000"
+
+
+def test_parse_accepts_megabyte_scale_statement():
+    # The old 1 MB cap was falsified by a REAL query shape: pgx's
+    # 65535-parameter statements are ~1.04 MB (real PG accepts up to its
+    # 1 GB message limit). A statement over the old cap must parse.
+    from secantus.sql import planner
+
+    literal = "x" * 1_100_000
+    stmts = planner.parse(f"SELECT length('{literal}')")
+    assert len(stmts) == 1
