@@ -5,7 +5,7 @@
 //! small cache.
 
 use bson::{doc, Bson, Document};
-use secantus_storage::{Storage, StorageError};
+use secantus_storage::{Storage, StorageError, StorageOptions};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -63,6 +63,49 @@ fn transaction_dirty_budget_guard() {
     let (inserted, errors) = st.insert("app", "c", docs, true).unwrap();
     assert_eq!(inserted, 32);
     assert!(errors.is_empty());
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn async_transaction_dirty_budget_bounds_pending_async() {
+    // #750: in async-oplog mode a transaction's statements buffer their oplog
+    // entries in `UserTransactionHandle::pending_async` for the whole
+    // transaction lifetime. Those bytes are charged to the same dirty budget as
+    // the sync path (the accounting runs BEFORE the async buffering branch), so
+    // an oversized async transaction trips `TransactionTooLargeForCache` rather
+    // than growing the buffer without bound.
+    let home = temp_home();
+    let st = Storage::open_with_options(
+        home.to_str().unwrap(),
+        &StorageOptions {
+            wt_config: Some(secantus_storage::wt_config("128M", 1000, false, "10MB")),
+            oplog_async: Some(true),
+            ..StorageOptions::default()
+        },
+    )
+    .unwrap();
+    let filler = "x".repeat(1024 * 1024);
+    let mut txn = st.begin_user_transaction().unwrap();
+    let mut tripped = false;
+    for i in 0..32i64 {
+        let doc_bytes = enc(&doc! {"_id": i, "pad": filler.clone()});
+        match st.with_user_transaction(&mut txn, || st.insert("app", "c", vec![doc_bytes], true)) {
+            Ok(inner) => {
+                inner.unwrap();
+            }
+            Err(StorageError::TransactionTooLargeForCache) => {
+                tripped = true;
+                break;
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+    assert!(
+        tripped,
+        "an oversized async transaction must trip the dirty budget, not buffer unbounded"
+    );
+    st.rollback_user_transaction(&mut txn).unwrap();
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
