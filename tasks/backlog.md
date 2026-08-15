@@ -2477,7 +2477,8 @@ threading into `wt_config`.)
 
 ### pgx gauge — `pgconn` findings and next steps (2026-08-14)
 
-**Where it stands: `pgconn` is at 4 stable failures** (of 216 tests;
+**Where it stands: `pgconn` is at 2 stable failures** (protocol-3.2
+negotiation and the target_session_attrs probe fixed; previous headline: 4) (of 216 tests;
 full-package re-run measured 2026-08-15 at `f2891c28`, three runs). The
 chain: 86 → 29 (#862) → 23 (#866) → 20 (#868) → 18 (#869) → 17 (#870) →
 12 (#871, measured) → 8 (#873) → 5 (#876) → 4 (#877). Two additional tests are
@@ -2524,11 +2525,6 @@ PR trail #866/#868/#869/#870/#871/#873/#876/#877):
   ours is 409/157 bytes vs PG's 391/153; needs a message-level diff of the
   Describe/Execute replies (RowDescription typmod/table-oid details are the
   likely delta).
-* `TestConnectProtocolVersion32` — the client requests wire protocol 3.2;
-  needs `NegotiateProtocolVersion` support in the startup path.
-* `TestConnectWithValidateConnectTargetSessionAttrsReadWrite` — the
-  `target_session_attrs=read-write` probe shape; failure text is a bare
-  "expected not nil", needs the probe traced.
 
 Known divergence recorded while fixing the batch shape (#876): a real PG
 multi-statement simple query is ONE implicit transaction (an error rolls

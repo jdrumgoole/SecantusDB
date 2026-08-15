@@ -438,6 +438,14 @@ class SecantusPGServer:
             startup = packet
             break
 
+        # A newer minor protocol (pgx's MaxProtocolVersion "3.2" sends
+        # 196610) or unrecognized ``_pq_.*`` startup options get real PG's
+        # answer: NegotiateProtocolVersion FIRST — newest minor we speak plus
+        # the unknown option names — then the handshake continues at 3.0.
+        pq_options = [k for k in startup.params if k.startswith("_pq_.")]
+        if startup.protocol != pgwire.PROTOCOL_VERSION_3 or pq_options:
+            io.sendall(pgwire.negotiate_protocol_version(pgwire.PROTOCOL_VERSION_3, pq_options))
+
         db = startup.params.get("database") or startup.params.get("user") or self.default_database
         user = startup.params.get("user", "secantus")
         application_name = startup.params.get("application_name", "")
@@ -500,19 +508,23 @@ class SecantusPGServer:
         # sends ``TimeZone`` this way (the JVM zone in the POSIX-inverted
         # spelling PG expects) — dropping it left every pgjdbc session on UTC,
         # which shifted date reads a day for clients west of Greenwich
-        # (DateTest's timestamptz x GMT-N failures). Applied for the GUCs SET
-        # supports; unknown parameters stay ignored like before.
+        # (DateTest's timestamptz x GMT-N failures). ALL parameters are
+        # applied, like real PG — pgx's target_session_attrs=read-write probe
+        # ships ``default_transaction_read_only=on`` at startup and expects
+        # ``SHOW transaction_read_only`` to reflect it. ``_pq_.*`` protocol
+        # options are handled by the NegotiateProtocolVersion path, not GUCs.
         for raw_name, raw_value in startup.params.items():
             if raw_name in ("user", "database", "options", "replication"):
                 continue
+            if raw_name.startswith("_pq_."):
+                continue
             guc = sql_session.canonical_guc_name(raw_name)
-            if guc in sql_session.REPORTABLE_GUCS or guc == "IntervalStyle":
-                value = raw_value
-                if guc == "TimeZone":
-                    value = sql_session.canonical_timezone_setting(value)
-                elif guc == "client_encoding":
-                    value = sql_session.canonical_client_encoding(value) or value
-                session.settings[guc] = value
+            value = raw_value
+            if guc == "TimeZone":
+                value = sql_session.canonical_timezone_setting(value)
+            elif guc == "client_encoding":
+                value = sql_session.canonical_client_encoding(value) or value
+            session.settings[guc] = value
 
         out = bytearray()
         out += pgwire.authentication_ok()
