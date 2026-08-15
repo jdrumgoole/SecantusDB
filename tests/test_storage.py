@@ -945,6 +945,109 @@ def test_ddl_and_crud_never_deadlock_and_index_stays_complete(storage: Storage) 
         _ddl_crud_round(storage, "app", f"c{r}", writers=4, per_writer=25)
 
 
+def _drop_ddl_crud_round(
+    storage: Storage, db: str, coll: str, writers: int, per_writer: int
+) -> None:
+    """One race round: N fresh writer threads vs a concurrent dropIndex on the
+    same collection — the drop-direction twin of `_ddl_crud_round` (#635)."""
+    storage.insert(db, coll, [{"_id": k, "x": k % 5} for k in range(20)])
+    storage.create_index(db, coll, "x_1", {"x": 1})
+    barrier = threading.Barrier(writers + 1)
+    errors: list[BaseException] = []
+
+    def writer(i: int) -> None:
+        try:
+            barrier.wait()
+            base = 1000 + i * per_writer
+            for k in range(per_writer):
+                storage.insert(db, coll, [{"_id": base + k, "x": (base + k) % 5}])
+        except BaseException as exc:  # noqa: BLE001 - surfaced after join
+            errors.append(exc)
+
+    def dropper() -> None:
+        try:
+            barrier.wait()
+            storage.drop_index(db, coll, "x_1")
+        except BaseException as exc:  # noqa: BLE001 - surfaced after join
+            errors.append(exc)
+
+    threads = [threading.Thread(target=dropper)]
+    threads += [threading.Thread(target=writer, args=(i,)) for i in range(writers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+        assert not t.is_alive(), (
+            "thread did not finish within 60s — deadlock between dropIndex and a "
+            "concurrent write (check the _coll_lock/_lock ordering)"
+        )
+    assert not errors, f"worker failures: {errors!r}"
+
+    # Every doc is still reachable by a plain scan (the drop removed the index,
+    # not data), and no index-entry rows survive for the dropped index.
+    total = 20 + writers * per_writer
+    assert storage.count_matching(db, coll, {}) == total
+    from secantus.storage import _IDX_ENTRIES_TABLE
+
+    survivors = storage._collect_prefix(_IDX_ENTRIES_TABLE, (db, coll, "x_1"))
+    assert survivors == [], f"dropIndex left {len(survivors)} orphaned entry rows"
+
+
+def test_drop_index_and_crud_never_deadlock_or_orphan_entries(storage: Storage) -> None:
+    """Concurrent dropIndex + writes must neither deadlock nor leave the dropped
+    index's entry rows behind. Guards the #635 drop-direction race: before
+    `drop_index`/`drop_all_indexes` took `_coll_lock`, a write interleaving the
+    entry-table snapshot-then-delete could survive as an orphaned entry."""
+    for r in range(4):
+        _drop_ddl_crud_round(storage, "app", f"d{r}", writers=4, per_writer=25)
+
+
+def test_bare_emit_failure_does_not_freeze_the_visible_tail(storage: Storage) -> None:
+    """#714: if a bare (autocommit) oplog emit's write loop raises, the minted
+    seq range must still leave `_oplog_in_flight` — otherwise
+    `oplog_visible_tail_seq` clamps at that seq forever and change streams
+    server-wide freeze. A DDL write is the bare path; we force its emit to throw
+    and assert the tail recovers."""
+    storage.insert("app", "c", [{"_id": 1}])
+    tail_before = storage.oplog_visible_tail_seq()
+    assert not storage._oplog_in_flight
+
+    # Force the next oplog cursor write to raise, mid bare-path emit.
+    real_cursor = storage._cursor
+    from secantus.storage import _OPLOG_TABLE
+
+    class _Boom(Exception):
+        pass
+
+    def _boom_cursor(table, *a, **k):
+        cur = real_cursor(table, *a, **k)
+        if table == _OPLOG_TABLE:
+
+            class _Wrap:
+                def __setitem__(self, *_):
+                    raise _Boom("injected oplog write failure")
+
+                def __getattr__(self, n):
+                    return getattr(cur, n)
+
+            return _Wrap()
+        return cur
+
+    storage._cursor = _boom_cursor
+    try:
+        with pytest.raises(_Boom):
+            # create_collection goes through the bare `_emit_oplog` path.
+            storage.create_collection("app", "fresh")
+    finally:
+        storage._cursor = real_cursor
+
+    # The minted range was released despite the failure — nothing pinned.
+    assert not storage._oplog_in_flight, "a failed bare emit leaked an in-flight range"
+    # A subsequent successful write advances the tail past where it froze.
+    storage.insert("app", "c", [{"_id": 2}])
+    assert storage.oplog_visible_tail_seq() > tail_before
+
+
 def test_frame_doc_value_layout_and_roundtrip() -> None:
     """The doc-table value frame is ``[u32-LE id_key_len][id_key][blob]`` — byte
     for byte what the Rust server writes (RecordId step 4a), so a store written by

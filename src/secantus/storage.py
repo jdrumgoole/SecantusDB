@@ -2541,44 +2541,54 @@ class Storage:
             if pending is None:
                 pending = self._tls.pending_minted = []
             pending.append((start_seq, start_seq + n))
-        op_cur = self._cursor(_OPLOG_TABLE)
-        pre_cur = None
+        # Mint-to-deregister must be exception-safe on the bare autocommit
+        # path: if the cursor-write loop or the opportunistic prune raises (a
+        # WT write error / WT_ROLLBACK under contention — expected, not
+        # exotic), the minted range must still leave ``_oplog_in_flight``.
+        # Otherwise ``oplog_visible_tail_seq`` clamps at that seq for the life
+        # of the process and change streams server-wide silently freeze — a
+        # self-inflicted DoS (#714). A deferred emit's range is owned by its
+        # transaction's commit/rollback, so it is NOT deregistered here.
         last_seq = 0
-        for i, (entry, pre) in enumerate(zip(entries, pre_images, strict=True)):
-            seq = start_seq + i
-            entry_with_ts = dict(entry)
-            if "ts" not in entry_with_ts:
-                entry_with_ts["ts"] = ts_range[i]
-            if "wall" not in entry_with_ts:
-                entry_with_ts["wall"] = _dt.datetime.now(_dt.timezone.utc)
-            op_cur[seq] = bson.encode(entry_with_ts)
-            if pre is not None:
-                if pre_cur is None:
-                    pre_cur = self._cursor(_PREIMAGE_TABLE)
-                pre_cur[seq] = pre
-            last_seq = seq
-        # ``_persist_oplog_meta`` was called here on every emit, but
-        # under concurrent writers it WT-rollbacks half the time —
-        # every writer hits the same single ``"state"`` meta row.
-        # The meta row is purely a recovery optimisation; if it's
-        # stale, ``_load_oplog_meta``'s fallback scans the oplog
-        # table for the actual max seq. So we now persist only on
-        # close + on prune_oplog, both of which are rare. The seq
-        # mint itself is durable because the actual oplog rows are
-        # written on every emit.
-        self._oplog_live_count += len(entries)
-        self._oplog_emit_count += len(entries)
-        if self._oplog_emit_count >= _OPLOG_PRUNE_INTERVAL:
-            self._oplog_emit_count = 0
-            self._prune_oplog_locked(now=self._time())
-        if not deferred:
-            # Bare autocommit emit: the cursor writes above committed on
-            # their own, so the minted range resolves here (deregister +
-            # notify). A deferred emit's range resolves at its
-            # transaction's commit/rollback instead.
-            self._deregister_minted([(start_seq, start_seq + n)])
-        with self._oplog_cv:
-            self._oplog_cv.notify_all()
+        try:
+            op_cur = self._cursor(_OPLOG_TABLE)
+            pre_cur = None
+            for i, (entry, pre) in enumerate(zip(entries, pre_images, strict=True)):
+                seq = start_seq + i
+                entry_with_ts = dict(entry)
+                if "ts" not in entry_with_ts:
+                    entry_with_ts["ts"] = ts_range[i]
+                if "wall" not in entry_with_ts:
+                    entry_with_ts["wall"] = _dt.datetime.now(_dt.timezone.utc)
+                op_cur[seq] = bson.encode(entry_with_ts)
+                if pre is not None:
+                    if pre_cur is None:
+                        pre_cur = self._cursor(_PREIMAGE_TABLE)
+                    pre_cur[seq] = pre
+                last_seq = seq
+            # ``_persist_oplog_meta`` was called here on every emit, but
+            # under concurrent writers it WT-rollbacks half the time —
+            # every writer hits the same single ``"state"`` meta row.
+            # The meta row is purely a recovery optimisation; if it's
+            # stale, ``_load_oplog_meta``'s fallback scans the oplog
+            # table for the actual max seq. So we now persist only on
+            # close + on prune_oplog, both of which are rare. The seq
+            # mint itself is durable because the actual oplog rows are
+            # written on every emit.
+            self._oplog_live_count += len(entries)
+            self._oplog_emit_count += len(entries)
+            if self._oplog_emit_count >= _OPLOG_PRUNE_INTERVAL:
+                self._oplog_emit_count = 0
+                self._prune_oplog_locked(now=self._time())
+        finally:
+            if not deferred:
+                # Bare autocommit emit: the cursor writes above committed on
+                # their own, so the minted range resolves here (deregister +
+                # notify) even if the body raised. A deferred emit's range
+                # resolves at its transaction's commit/rollback instead.
+                self._deregister_minted([(start_seq, start_seq + n)])
+            with self._oplog_cv:
+                self._oplog_cv.notify_all()
         return last_seq
 
     @staticmethod
@@ -6762,7 +6772,12 @@ class Storage:
     def drop_index(self, db: str, coll: str, name: str) -> bool:
         if name == _ID_INDEX_NAME:
             return False
-        with self._lock:
+        # LOCK ORDER: `_coll_lock` BEFORE `_lock` (the canonical order, same as
+        # `create_index`). Without the per-collection lock a concurrent
+        # insert/update/delete landing between the entry-table snapshot and its
+        # deletion is invisible to both, the drop-direction twin of the
+        # create_index race #632 closed (#635).
+        with self._coll_lock(db, coll), self._lock:
             # Mutating scanners read the current rows before deleting/rewriting
             # them; a snapshot pinned by an earlier positioned cursor on
             # this connection thread would hide rows committed by other
@@ -6881,7 +6896,10 @@ class Storage:
         return out
 
     def drop_all_indexes(self, db: str, coll: str) -> int:
-        with self._lock:
+        # LOCK ORDER: `_coll_lock` BEFORE `_lock`, as `create_index` /
+        # `drop_index` — the per-collection lock keeps a concurrent CRUD writer
+        # from racing the index-entry snapshot-then-delete (#635).
+        with self._coll_lock(db, coll), self._lock:
             # Mutating scanners read the current rows before deleting/rewriting
             # them; a snapshot pinned by an earlier positioned cursor on
             # this connection thread would hide rows committed by other
