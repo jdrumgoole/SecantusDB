@@ -2910,17 +2910,17 @@ shared storage engine or building large new protocol subsystems:
   decimal / char / inet / varbit files each stop at their first divergent
   output). Re-run per fix; grow toward the full 54-file corpus like the
   psycopg gauge's 42%→91% climb.
-- [ ] **pgx gauge — pgconn clusters** (`invoke validate-pgx`, baseline 291 P /
-  87 F / 22 S = 77.0%, `docs/validation-report-pgx.md`): the two big pgconn
-  clusters are **pipeline mode** (`Pipeline*` — Sync-less batching over the
-  extended protocol; ~30 tests incl. flush/partial-read shapes) and the
-  **CancelRequest context watcher** (12 — wire cancel handling), plus
-  result-reader capacity/`nil` edge details and `TestTrace`. pgproto3 is
-  99.4% (one codec edge). Fix cluster-by-cluster and re-run, like the
-  psycopg/SQLAlchemy gauges. **2026-08-14: the `pgconn` package alone is at
-  23 F / 216 after #862 + #866** — current per-cluster reads in the "pgx
-  gauge — `pgconn` findings" section above; the full-gauge % needs a
-  `validate-pgx` re-run to restate.
+- [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
+  **2026-08-15 official run at `303c793d`: 364 P / 14 F / 22 S = 96.3%**,
+  up from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn
+  campaign (#866 #868–#871 #873 #876 #877 #885 #891). `pgproto3` is now
+  **100%** (172/172 — the codec edge is gone), `bgreader`/`ctxwatch` clean.
+  The 14 failure entries collapse to ONE stable failure —
+  `TestConnCopyFromNoticeResponseReceivedMidStream` (needs plpgsql trigger
+  functions + `tsvector`/`to_tsvector`, the last real feature gap) — plus
+  the three load-sensitive ctxwatch/cancel timing families, which flaked
+  hard in this run's busy-desktop conditions (see the load-sensitivity note
+  in the pgconn findings section; re-measure on a quiet machine).
 - [ ] **Sub-millisecond timestamp fidelity** (the one declared SQLAlchemy-gauge
   divergence — `datetime_microseconds` closed in
   `sqlalchemy_validation/requirements.py`): BSON datetimes are int64
