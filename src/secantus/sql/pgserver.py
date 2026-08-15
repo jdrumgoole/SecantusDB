@@ -700,6 +700,30 @@ class SecantusPGServer:
             if notifications or reply:
                 conn.sendall(notifications + (reply or b""))
 
+    def _authorize_lo_write(self, session: Session) -> None:
+        """Gate a mutating Fastpath large-object call with the same RBAC +
+        read-only-transaction checks engine dispatch applies to a table write.
+        Large objects are database-scoped (no per-object owner), so RBAC is at
+        db granularity: a write needs a role granting a write action (``insert``
+        — ``readWrite`` covers it) on the connection's database. No-op unless
+        authorization is active, matching the statement path."""
+        from secantus import rbac
+
+        if session.get_setting("transaction_read_only") == "on":
+            raise errors.SQLError(
+                "25006", "cannot execute lo_* write function in a read-only transaction"
+            )
+        if not session.authz_active:
+            return
+        resolver = getattr(self.storage, "get_role", None)
+        if not rbac.check_privilege(
+            session.roles,
+            rbac.A_INSERT,
+            target_db=session.database,
+            role_resolver=resolver,
+        ):
+            raise errors.insufficient_privilege(session.database, rbac.A_INSERT)
+
     def _handle_fastpath(self, session: Session, payload: bytes) -> bytes:
         """One Fastpath FunctionCall ('F') cycle: FunctionCallResponse ('V') +
         ReadyForQuery, or ErrorResponse + ReadyForQuery. pgjdbc's LargeObject
@@ -709,6 +733,13 @@ class SecantusPGServer:
 
         try:
             fn_oid, args = pgwire.parse_function_call(payload)
+            # The Fastpath sub-protocol bypasses the statement pipeline, so the
+            # RBAC gate and read-only-transaction check that engine dispatch
+            # applies to ordinary writes must be applied here too — otherwise a
+            # write-privilege-less session (or one inside BEGIN READ ONLY) could
+            # create/write/truncate/unlink large objects via Fastpath (#836).
+            if largeobjects.is_write_call(fn_oid):
+                self._authorize_lo_write(session)
             result = largeobjects.call(
                 fn_oid, args, storage=self.storage, db=session.database, session=session
             )

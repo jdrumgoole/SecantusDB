@@ -452,7 +452,21 @@ def _write_statement_verb(stmt: exp.Expression) -> str | None:
         return f"ALTER {kind}".strip()
     if isinstance(stmt, exp.Grant):
         return "GRANT"
+    # A SELECT/statement calling a mutating large-object function
+    # (`SELECT lo_unlink(oid)`, `INSERT ... VALUES (lo_creat(-1))`) writes even
+    # though its top node isn't a DML verb — `_write_statement_verb` classifying
+    # it as a read let it slip the read-only-transaction gate (#836).
+    for fn in stmt.find_all(exp.Anonymous):
+        if str(fn.this).lower() in _MUTATING_LO_FUNCS:
+            return "lo_* write function"
     return None
+
+
+# Large-object functions that mutate stored data when invoked as ordinary
+# SQL scalars (the ones `scalar.py` actually implements) — used to hold the
+# read-only-transaction gate over the `SELECT lo_unlink(...)` path that skips
+# the Fastpath sub-protocol (#836).
+_MUTATING_LO_FUNCS: frozenset[str] = frozenset({"lo_creat", "lo_create", "lo_unlink"})
 
 
 _TXN_ISOLATION_RE = re.compile(
