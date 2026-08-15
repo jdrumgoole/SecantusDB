@@ -381,6 +381,11 @@ class Session:
     # drained by the owning connection thread. ``pending_notifies`` buffers NOTIFYs
     # issued inside an open transaction block (delivered at COMMIT).
     notify_hub: Any = None
+    # Number of channels this session LISTENs on, maintained by NotifyHub
+    # under its lock. The wire server's read loop checks it before EVERY
+    # message read to decide whether to poll for notification pushes — a
+    # plain int read, so the hot path takes no shared lock.
+    listen_count: int = 0
     _notify_lock: Any = field(default_factory=threading.Lock)
     _notify_deliveries: deque = field(default_factory=deque)
     pending_notifies: list[tuple[str, str]] = field(default_factory=list)
