@@ -8,8 +8,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import bson
+
 DEFAULT_IDLE_TTL_SECONDS = 600.0  # matches MongoDB's 10-minute cursor TTL.
 TAILABLE_IDLE_TTL_SECONDS = 1800.0  # 30 min — change-stream clients legitimately idle.
+
+# Byte budget for a single cursor batch (mongod's 16MB reply-document cap).
+# An unspecified getMore batchSize means "as many documents as fit in 16MB" —
+# the 101-document default applies only to a find/aggregate FIRST batch.
+MAX_GETMORE_BATCH_BYTES = 16 * 1024 * 1024
 
 # Hard cap on simultaneous live cursors. Without this, a malicious or
 # buggy client can open cursors with `no_cursor_timeout=True` (or a low
@@ -191,7 +198,9 @@ class CursorRegistry:
             entry.last_access = self._time()
             return entry
 
-    def next_batch(self, cursor_id: int, batch_size: int) -> tuple[list[dict[str, Any]], bool]:
+    def next_batch(
+        self, cursor_id: int, batch_size: int, max_bytes: int | None = None
+    ) -> tuple[list[dict[str, Any]], bool]:
         with self._lock:
             self._prune_locked()
             entry = self._cursors.get(cursor_id)
@@ -199,6 +208,19 @@ class CursorRegistry:
                 raise CursorNotFound(cursor_id)
             if batch_size <= 0:
                 batch_size = len(entry.remaining)
+            if max_bytes is not None:
+                # Byte-budget the batch like mongod's 16MB reply cap: stop
+                # before the doc that would overflow, but always take at least
+                # one so the drain makes progress.
+                take = 0
+                total = 0
+                for d in entry.remaining[:batch_size]:
+                    size = len(bson.encode(d))
+                    if take > 0 and total + size > max_bytes:
+                        break
+                    total += size
+                    take += 1
+                batch_size = take
             batch = entry.remaining[:batch_size]
             entry.remaining = entry.remaining[batch_size:]
             exhausted = not entry.remaining

@@ -26,6 +26,7 @@ These work end-to-end but cut corners.
 
 Specific items that were left out of the slice that introduced their feature area.
 
+- [ ] **find/aggregate firstBatch is count-capped but not byte-capped**: the getMore-default-batch slice gave `getMore` mongod's 16MB byte budget (both servers), but a FIRST batch is still capped only at its document count — `find` with `batchSize: 101` over 1MB documents assembles a ~101MB reply where mongod stops at 16MB and keeps the cursor. Apply the same byte budget in `find.rs::split_into_cursor` / `split_docs_into_cursor` (blob lengths are free) and `commands.py::_split_into_cursor` (needs encode-to-measure). Low urgency: drivers rarely combine a large explicit batchSize with megabyte documents, and the default 101-doc first batch only overflows with >160KB average docs.
 - [ ] **Admin UI saved-connections / settings page**: Slice 11 of the admin UI shipped schema sampler / logs viewer / geo viewer but skipped the planned `/settings` page with saved Mongo URIs and a manual dark/light toggle. The CLI today takes a single `--uri` per launch, so saved connections are bookmark-only (you can't switch targets after start). When the launcher gains hot-swap support, revisit this page — it's likely a small SQLite-backed list reusing the existing `~/.secantus/admin.db` store.
 
 ### 3.1 Authentication

@@ -23,7 +23,9 @@ use std::time::{Duration, Instant};
 use bson::{doc, Bson, Document};
 
 use crate::util::as_i64;
-use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
+use crate::{
+    CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE, MAX_GETMORE_BATCH_BYTES,
+};
 
 /// Idle TTL for ordinary cursors — MongoDB's 10-minute default.
 pub const DEFAULT_IDLE_TTL_SECONDS: f64 = 600.0;
@@ -285,14 +287,17 @@ impl CursorRegistry {
         })
     }
 
-    /// Drain up to `batch_size` documents (`<= 0` ⇒ all remaining). Returns the
-    /// batch and whether the cursor is now exhausted. An exhausted *non-tailable*
-    /// cursor is removed; a tailable cursor persists across empty batches and
-    /// always reports `exhausted == false` (`cursors.py::next_batch`).
+    /// Drain up to `batch_size` documents (`<= 0` ⇒ all remaining), never more
+    /// than `max_bytes` of encoded BSON (but always at least one document, so a
+    /// drain makes progress). Returns the batch and whether the cursor is now
+    /// exhausted. An exhausted *non-tailable* cursor is removed; a tailable
+    /// cursor persists across empty batches and always reports
+    /// `exhausted == false` (`cursors.py::next_batch`).
     pub fn next_batch(
         &self,
         cursor_id: i64,
         batch_size: i64,
+        max_bytes: usize,
     ) -> Result<(Vec<Vec<u8>>, bool), CursorError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.prune_locked(&mut inner);
@@ -307,7 +312,15 @@ impl CursorRegistry {
             } else {
                 batch_size as usize
             };
-            let take = want.min(e.remaining.len());
+            let mut take = 0usize;
+            let mut bytes = 0usize;
+            for blob in e.remaining.iter().take(want.min(e.remaining.len())) {
+                if take > 0 && bytes + blob.len() > max_bytes {
+                    break;
+                }
+                bytes += blob.len();
+                take += 1;
+            }
             let batch: Vec<Vec<u8>> = e.remaining.drain(..take).collect();
             let exhausted = e.remaining.is_empty();
             if e.tailable || !exhausted {
@@ -563,11 +576,11 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .and_then(as_i64)
         .ok_or_else(|| CommandError::new(2, "BadValue", "getMore requires a cursor id"))?;
     let coll = doc.get("collection").and_then(Bson::as_str).unwrap_or("");
-    let batch_size = doc
-        .get("batchSize")
-        .and_then(as_i64)
-        .filter(|&b| b > 0)
-        .unwrap_or(DEFAULT_BATCH_SIZE as i64);
+    // Tri-state like `find`'s, but the absent-default differs: mongod's 101
+    // applies only to the FIRST batch — an unspecified getMore batchSize means
+    // "fill up to 16MB". Only the tailable path keeps the small default (its
+    // events arrive incrementally off the oplog).
+    let batch_size = doc.get("batchSize").and_then(as_i64).filter(|&b| b > 0);
     let ns = format!("{}.{}", ctx.db_name, coll);
     let cursors = ctx.cursors()?;
 
@@ -609,7 +622,9 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let mut closed;
         let mut fatal;
         loop {
-            match cursors.tailable_next_batch(cursor_id, batch_size) {
+            match cursors
+                .tailable_next_batch(cursor_id, batch_size.unwrap_or(DEFAULT_BATCH_SIZE as i64))
+            {
                 Ok((b, p, c, f)) => {
                     batch = b;
                     position = p;
@@ -694,10 +709,11 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         return Ok(doc! { "cursor": cursor_doc, "ok": 1.0 });
     }
 
-    let (batch, exhausted) = match cursors.next_batch(cursor_id, batch_size) {
-        Ok(x) => x,
-        Err(_) => return Ok(cursor_not_found(cursor_id)),
-    };
+    let (batch, exhausted) =
+        match cursors.next_batch(cursor_id, batch_size.unwrap_or(0), MAX_GETMORE_BATCH_BYTES) {
+            Ok(x) => x,
+            Err(_) => return Ok(cursor_not_found(cursor_id)),
+        };
     // The registry already holds the batch as pre-encoded blobs; hand them to
     // the server (`ctx.pending_batch`) to splice onto the wire without the
     // decode→re-encode round-trip `docs_to_bson` would cost. The reply carries
@@ -815,18 +831,21 @@ mod tests {
         let docs: Vec<Vec<u8>> = (0..5).map(|i| enc(&doc! {"_id": i})).collect();
         let id = reg.register("t.c", docs).unwrap();
         assert_eq!(reg.len(), 1);
-        let (b1, ex1) = reg.next_batch(id, 2).unwrap();
+        let (b1, ex1) = reg.next_batch(id, 2, usize::MAX).unwrap();
         assert_eq!(b1.len(), 2);
         assert!(!ex1);
-        let (b2, ex2) = reg.next_batch(id, 2).unwrap();
+        let (b2, ex2) = reg.next_batch(id, 2, usize::MAX).unwrap();
         assert_eq!(b2.len(), 2);
         assert!(!ex2);
-        let (b3, ex3) = reg.next_batch(id, 2).unwrap();
+        let (b3, ex3) = reg.next_batch(id, 2, usize::MAX).unwrap();
         assert_eq!(b3.len(), 1);
         assert!(ex3, "exhausted on the final partial batch");
         // Exhausted non-tailable cursor is gone.
         assert_eq!(reg.len(), 0);
-        assert_eq!(reg.next_batch(id, 2), Err(CursorError::NotFound(id)));
+        assert_eq!(
+            reg.next_batch(id, 2, usize::MAX),
+            Err(CursorError::NotFound(id))
+        );
     }
 
     #[test]
@@ -834,9 +853,31 @@ mod tests {
         let reg = CursorRegistry::new();
         let docs: Vec<Vec<u8>> = (0..3).map(|i| enc(&doc! {"_id": i})).collect();
         let id = reg.register("t.c", docs).unwrap();
-        let (b, ex) = reg.next_batch(id, 0).unwrap();
+        let (b, ex) = reg.next_batch(id, 0, usize::MAX).unwrap();
         assert_eq!(b.len(), 3);
         assert!(ex);
+    }
+
+    #[test]
+    fn byte_budget_caps_a_batch_but_always_makes_progress() {
+        let reg = CursorRegistry::new();
+        let docs: Vec<Vec<u8>> = (0..4)
+            .map(|i| enc(&doc! {"_id": i, "pad": "x".repeat(100)}))
+            .collect();
+        let per_doc = docs[0].len();
+        let id = reg.register("t.c", docs).unwrap();
+        // Budget for two docs: the drain stops before the third.
+        let (b1, ex1) = reg.next_batch(id, 0, per_doc * 2).unwrap();
+        assert_eq!(b1.len(), 2);
+        assert!(!ex1);
+        // A budget smaller than one document still yields one doc (progress).
+        let (b2, ex2) = reg.next_batch(id, 0, 1).unwrap();
+        assert_eq!(b2.len(), 1);
+        assert!(!ex2);
+        // Explicit count limit still byte-capped.
+        let (b3, ex3) = reg.next_batch(id, 5, per_doc).unwrap();
+        assert_eq!(b3.len(), 1);
+        assert!(ex3);
     }
 
     #[test]
@@ -878,7 +919,7 @@ mod tests {
             .unwrap();
         assert!(id > (1i64 << 32));
         // Draining a tailable cursor never exhausts/removes it.
-        let (b, ex) = reg.next_batch(id, 10).unwrap();
+        let (b, ex) = reg.next_batch(id, 10, usize::MAX).unwrap();
         assert!(b.is_empty());
         assert!(!ex);
         assert_eq!(reg.len(), 1);
@@ -966,7 +1007,10 @@ mod tests {
         // Advance past the TTL; the next operation prunes it.
         *clock.lock().unwrap_or_else(|e| e.into_inner()) = 1000.0;
         assert_eq!(reg.len(), 0);
-        assert_eq!(reg.next_batch(id, 1), Err(CursorError::NotFound(id)));
+        assert_eq!(
+            reg.next_batch(id, 1, usize::MAX),
+            Err(CursorError::NotFound(id))
+        );
     }
 
     #[test]
