@@ -2477,10 +2477,12 @@ threading into `wt_config`.)
 
 ### pgx gauge — `pgconn` findings and next steps (2026-08-14)
 
-**Where it stands: `pgconn` is at 0 stable failures** (the triggers +
-tsvector build closed `TestConnCopyFromNoticeResponseReceivedMidStream`,
-verified individually; only the load-sensitive ctxwatch timing families
-remain — re-run the package for the confirming count) (of 216 tests;
+**Where it stands: `pgconn` is at 0 stable failures — MEASURED, package
+CLOSED** (full run at `03d5c63b`, 2026-08-15, after the triggers +
+tsvector build #901: the only failure was the documented load-sensitive
+`TestDeadlineContextWatcherHandler`; the official full-gauge run reads
+**376 P / 2 F / 22 S = 99.5%**, from 77.0% at the 2026-08-14 baseline —
+`pgconn` 99.0%, `pgproto3`/`bgreader`/`ctxwatch` 100%) (of 216 tests;
 full-package re-run measured 2026-08-15 at `f2891c28`, three runs). The
 chain: 86 → 29 (#862) → 23 (#866) → 20 (#868) → 18 (#869) → 17 (#870) →
 12 (#871, measured) → 8 (#873) → 5 (#876) → 4 (#877). Two additional tests are
@@ -2914,16 +2916,14 @@ shared storage engine or building large new protocol subsystems:
   output). Re-run per fix; grow toward the full 54-file corpus like the
   psycopg gauge's 42%→91% climb.
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
-  **2026-08-15 official run at `303c793d`: 364 P / 14 F / 22 S = 96.3%**,
-  up from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn
-  campaign (#866 #868–#871 #873 #876 #877 #885 #891). `pgproto3` is now
-  **100%** (172/172 — the codec edge is gone), `bgreader`/`ctxwatch` clean.
-  The 14 failure entries collapse to ONE stable failure —
-  `TestConnCopyFromNoticeResponseReceivedMidStream` (needs plpgsql trigger
-  functions + `tsvector`/`to_tsvector`, the last real feature gap) — plus
-  the three load-sensitive ctxwatch/cancel timing families, which flaked
-  hard in this run's busy-desktop conditions (see the load-sensitivity note
-  in the pgconn findings section; re-measure on a quiet machine).
+  **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,
+  from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn campaign
+  (#866 #868–#871 #873 #876 #877 #885 #891 #901). Every package is at its
+  ceiling: `pgconn` 99.0% (0 stable failures — the 2 failure entries are
+  the single load-sensitive `TestDeadlineContextWatcherHandler` family,
+  documented in the pgconn findings section), `pgproto3` / `bgreader` /
+  `ctxwatch` 100%. Remaining work is only the load-sensitivity
+  re-measurement on a quiet machine.
 - [ ] **Sub-millisecond timestamp fidelity** (the one declared SQLAlchemy-gauge
   divergence — `datetime_microseconds` closed in
   `sqlalchemy_validation/requirements.py`): BSON datetimes are int64
