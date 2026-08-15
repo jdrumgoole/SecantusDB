@@ -573,6 +573,36 @@ class SecantusPGServer:
             )
             return False
 
+    def _read_next_message(
+        self, conn: socket.socket, session: Session, txn_deadline: float | None
+    ) -> pgwire.Message:
+        """Block for the next frontend message, pushing async notifications.
+
+        Real PG delivers LISTEN/NOTIFY to an IDLE connection without waiting
+        for its next query (pgx's ``WaitForNotification`` just blocks reading
+        the socket). A session listening on any channel therefore waits in
+        short slices, flushing queued notifications between them — its own
+        thread does the socket write, so writes stay serialized. Sessions with
+        no LISTENs (the overwhelming default) keep the pure blocking read: no
+        busy-wake. ``txn_deadline`` carries idle_in_transaction_session_timeout
+        across the poll slices; reaching it raises TimeoutError to the caller
+        (which aborts the transaction exactly as before)."""
+        while True:
+            timeout: float | None = None
+            if txn_deadline is not None:
+                timeout = max(0.001, txn_deadline - time.monotonic())
+            if self._notify.is_listening(session):
+                timeout = 0.25 if timeout is None else min(timeout, 0.25)
+            conn.settimeout(timeout)
+            try:
+                return pgwire.read_message(conn)
+            except TimeoutError:
+                if txn_deadline is not None and time.monotonic() >= txn_deadline:
+                    raise
+                pending = self._pending_notification_bytes(session)
+                if pending:
+                    conn.sendall(pending)
+
     def _query_loop(self, conn: socket.socket, session: Session) -> None:
         # Per-connection extended-protocol state (prepared statements + portals).
         ext = ExtendedSession(self.storage, session)
@@ -581,17 +611,18 @@ class SecantusPGServer:
             # bound the wait for the next command; exceeding it aborts the
             # transaction and terminates the connection (25P03), like PG.
             idle_ms = _idle_in_txn_timeout_ms(session)
-            if idle_ms and session.txn_handle is not None:
-                conn.settimeout(idle_ms / 1000.0)
-            else:
-                conn.settimeout(None)
+            txn_deadline = (
+                time.monotonic() + idle_ms / 1000.0
+                if idle_ms and session.txn_handle is not None
+                else None
+            )
             # Never go idle holding a read snapshot: an idle connection whose
             # last statement left its thread session with a positioned cursor
             # pins WT's oldest-transaction horizon for every other connection
             # (the pgjdbc CopyLargeFileTest wedge). Release before blocking.
             self.storage.release_thread_snapshot()
             try:
-                msg = pgwire.read_message(conn)
+                msg = self._read_next_message(conn, session, txn_deadline)
             except TimeoutError:
                 if session.txn_handle is not None:
                     with contextlib.suppress(Exception):

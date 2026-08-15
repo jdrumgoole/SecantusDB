@@ -5,10 +5,12 @@ folding. (The end-to-end wire delivery is covered in test_pgserver_pg8000.py.)
 
 from __future__ import annotations
 
+import psycopg
 import pytest
 
 from secantus.sql import run_sql
 from secantus.sql.pgnotify import NotifyHub
+from secantus.sql.pgserver import SecantusPGServer
 from secantus.sql.session import Session
 from secantus.storage import Storage
 
@@ -172,3 +174,82 @@ def test_embedded_no_hub_is_noop(st):
     assert _run(st, s, "LISTEN chan").command_tag == "LISTEN"
     assert _run(st, s, "NOTIFY chan, 'x'").command_tag == "NOTIFY"
     assert _run(st, s, "UNLISTEN chan").command_tag == "UNLISTEN"
+
+
+# --------------------------------------------------------------------------- #
+# Async wire delivery: real PG pushes a notification to an IDLE listening
+# connection without waiting for its next query (pgx's WaitForNotification
+# and psycopg's notifies() both just block reading the socket). Listening
+# sessions poll in short slices and flush queued notifications from their own
+# thread; non-listeners keep the pure blocking read.
+
+
+@pytest.fixture()
+def wire_server(tmp_path):
+    srv = SecantusPGServer(storage_path=str(tmp_path), port=0)
+    srv.start()
+    try:
+        yield srv
+    finally:
+        srv.stop()
+
+
+@pytest.fixture()
+def wire_dsn(wire_server):
+    host, port = wire_server.address
+    return f"host={host} port={port} dbname=test user=test password=test"
+
+
+def test_idle_listener_receives_pushed_notification(wire_dsn):
+    with (
+        psycopg.connect(wire_dsn, autocommit=True) as listener,
+        psycopg.connect(wire_dsn, autocommit=True) as notifier,
+    ):
+        listener.execute("listen foo")
+        notifier.execute("notify foo, 'bar'")
+        got = list(listener.notifies(timeout=5, stop_after=1))
+        assert len(got) == 1
+        assert got[0].channel == "foo" and got[0].payload == "bar"
+
+
+def test_notification_arrives_while_already_waiting(wire_dsn):
+    import threading
+    import time as _time
+
+    with (
+        psycopg.connect(wire_dsn, autocommit=True) as listener,
+        psycopg.connect(wire_dsn, autocommit=True) as notifier,
+    ):
+        listener.execute("listen ping")
+        t = threading.Thread(
+            target=lambda: (_time.sleep(0.6), notifier.execute("notify ping, 'later'"))
+        )
+        t.start()
+        got = list(listener.notifies(timeout=5, stop_after=1))
+        t.join()
+        assert [n.payload for n in got] == ["later"]
+
+
+def test_idle_in_txn_timeout_still_fires_for_listener(tmp_path):
+    srv = SecantusPGServer(storage_path=str(tmp_path), port=0, idle_in_transaction_timeout_s=0.5)
+    srv.start()
+    try:
+        host, port = srv.address
+        dsn = f"host={host} port={port} dbname=test user=test password=test"
+        with psycopg.connect(dsn, autocommit=True) as c:
+            c.execute("listen chan")
+            c.execute("begin")
+            import time as _time
+
+            _time.sleep(1.2)
+            # The idle-in-transaction deadline must survive the notification
+            # poll slices: the server killed the connection with 25P03.
+            # Windows can discard the buffered FATAL on the server's close
+            # (WSAECONNABORTED), so a bare connection error is accepted too —
+            # the contract under test is that the connection is dead.
+            with pytest.raises(
+                (psycopg.errors.IdleInTransactionSessionTimeout, psycopg.OperationalError)
+            ):
+                c.execute("select 1")
+    finally:
+        srv.stop()

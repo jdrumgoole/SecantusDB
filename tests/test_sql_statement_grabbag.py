@@ -158,11 +158,17 @@ class TestStableNow:
         assert b >= a  # distinct statements re-derive the clock
 
     def test_frozen_across_transaction(self, storage, session):
+        import time as _time
+
         run(storage, session, "BEGIN")
         a = one(storage, session, "select now()")
         b = one(storage, session, "select now()")
         run(storage, session, "COMMIT")
         assert a == b
+        # Outrun Windows py3.10's ~15.6 ms system-clock tick — two
+        # transactions inside one tick read identical now() values, which
+        # this assertion would misread as "frozen across transactions".
+        _time.sleep(0.02)
         assert one(storage, session, "select now()") != a
 
     def test_interval_roundtrip_is_exact(self, storage, session):
