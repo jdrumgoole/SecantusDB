@@ -418,6 +418,9 @@ class Session:
     # the value to restore at transaction end (the pre-``SET LOCAL`` session value,
     # or None if it wasn't set). Reverted in ``engine._end_txn_state``.
     local_gucs: dict = field(default_factory=dict)
+    # Pre-SET values of GUCs set with a plain ``SET`` inside the open
+    # transaction block — unwound on ROLLBACK, discarded on COMMIT.
+    txn_gucs: dict = field(default_factory=dict)
     # Advisory locks (``pg_advisory_lock`` family, #135). Single-node: a lock is
     # always granted immediately, so we only *track* what this session holds so
     # ``pg_advisory_unlock`` reports truthfully and ``pg_catalog.pg_locks``
@@ -559,6 +562,25 @@ class Session:
                 out[(classid, objid, objsubid, mode)] = True
         return list(out.keys())
 
+    def record_txn_guc(self, name: str) -> None:
+        """Capture a GUC's pre-``SET`` value when a plain ``SET`` runs inside a
+        transaction block — PG unwinds those on ROLLBACK (and keeps them on
+        COMMIT). Captured once per GUC per transaction."""
+        if name not in self.txn_gucs:
+            self.txn_gucs[name] = self.settings.get(name)
+
+    def restore_txn_gucs(self) -> None:
+        """ROLLBACK's unwind of plain in-transaction ``SET``s, re-reporting
+        GUC_REPORT parameters so the client's ParameterStatus cache reverts."""
+        for name, prior in self.txn_gucs.items():
+            if prior is None:
+                self.settings.pop(name, None)
+            else:
+                self.settings[name] = prior
+            if name in REPORTABLE_GUCS:
+                self.pending_parameter_status.append((name, self.get_setting(name)))
+        self.txn_gucs = {}
+
     def set_local(self, name: str, value: str) -> None:
         """``SET LOCAL name = value`` (#136) — applies for the rest of the current
         transaction only. Records the value to restore at transaction end (captured
@@ -575,6 +597,12 @@ class Session:
                 self.settings.pop(name, None)
             else:
                 self.settings[name] = prior
+            if name in REPORTABLE_GUCS:
+                # PG re-reports a GUC_REPORT parameter when the transaction's
+                # SET LOCAL unwinds — without this the client's ParameterStatus
+                # cache keeps the local value forever (pgjdbc's
+                # transactionalParameters* trio).
+                self.pending_parameter_status.append((name, self.get_setting(name)))
         self.local_gucs = {}
 
     def all_settings(self) -> dict[str, str]:

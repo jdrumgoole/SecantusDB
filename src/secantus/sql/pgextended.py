@@ -1069,18 +1069,26 @@ class ExtendedSession:
         """Handle one extended-protocol message; return the bytes to send."""
         if msg_type == "S":  # Sync — always answered, clears any error state
             self.skip_until_sync = False
+            out = bytearray()
             try:
                 self._settle_implicit_txn()
             except errors.SQLError as exc:
                 # A failed pipeline commit: the client must learn its
                 # statements' effects are gone — ErrorResponse, then the
                 # ReadyForQuery Sync always gets.
-                return pgwire.error_response(
+                out += pgwire.error_response(
                     exc.sqlstate,
                     exc.message,
                     encoding=self.session.wire_encoding,
-                ) + pgwire.ready_for_query(self.session.txn_status())
-            return pgwire.ready_for_query(self.session.txn_status())
+                )
+            # Settling the implicit transaction may have unwound SET LOCALs;
+            # PG re-reports GUC_REPORT parameters at transaction end, so the
+            # client's ParameterStatus cache reverts too (pgjdbc's
+            # transactionalParameters* trio reads it right after Sync).
+            for pname, pvalue in self.session.pending_parameter_status:
+                out += pgwire.parameter_status(pname, pvalue)
+            self.session.pending_parameter_status = []
+            return bytes(out) + pgwire.ready_for_query(self.session.txn_status())
         if self.skip_until_sync:
             return b""  # discard everything until the next Sync
         if msg_type == "H":  # Flush — we send eagerly, nothing to flush

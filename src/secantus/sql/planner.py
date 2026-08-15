@@ -10579,8 +10579,8 @@ _NEGSCALE_RE = re.compile(r"(::\s*(?:numeric|decimal)\s*\(\s*\d+\s*,\s*)-\s*(\d+
 # pure keywords (letters/commas/whitespace), so a compound statement never
 # matches and falls through to sqlglot.
 _BEGIN_CHARACTERISTICS_RE = re.compile(
-    r"^\s*(?:BEGIN|START\s+TRANSACTION)(?:\s+(?:WORK|TRANSACTION))?\s+"
-    r"(?P<tail>(?:ISOLATION|READ|NOT|DEFERRABLE)[A-Za-z,\s]*?)\s*;?\s*$",
+    r"^\s*(?:BEGIN|START\s+TRANSACTION)(?:\s+(?:WORK|TRANSACTION))?"
+    r"(?:\s+(?P<tail>(?:ISOLATION|READ|NOT|DEFERRABLE)[A-Za-z,\s]*?))?\s*;?\s*$",
     re.IGNORECASE,
 )
 
@@ -10929,7 +10929,8 @@ def _parse_uncached(sql: str) -> list[exp.Expression]:
         return [exp.Command(this="MOVE", expression=exp.Literal.string(move.group("tail")))]
     begin = _BEGIN_CHARACTERISTICS_RE.match(sql)
     if begin is not None:
-        return [exp.Transaction(modes=[begin.group("tail")])]
+        tail = begin.group("tail")
+        return [exp.Transaction(modes=[tail] if tail else [])]
     # LISTEN / NOTIFY / UNLISTEN — sqlglot mis-parses these; carry the raw text
     # as a Command the engine's pubsub handler executes. (run_sql intercepts
     # them pre-parse; this covers the extended-protocol Parse path.)
