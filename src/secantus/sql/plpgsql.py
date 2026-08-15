@@ -326,6 +326,26 @@ class _Parser:
                 expr = self._raw(lo, self.i)
                 self.i += 1
                 return Assign(name, expr)
+            # record-field assignment:  new.field := expr  (a trigger function
+            # mutating its NEW row).
+            dot, fld, op = self._peek(1), self._peek(2), self._peek(3)
+            if (
+                dot is not None
+                and dot.kind == "sym"
+                and dot.val == "."
+                and fld is not None
+                and fld.kind == "word"
+                and op is not None
+                and op.kind == "sym"
+                and op.val in (":=", "=")
+            ):
+                name = f"{tok.val}.{fld.val}"
+                self.i += 4
+                lo = self.i
+                self._skip_to_semi()
+                expr = self._raw(lo, self.i)
+                self.i += 1
+                return Assign(name, expr)
         if self._is_kw(tok, "select"):
             return self._parse_select_stmt()
         if self._is_kw(tok, "insert", "update", "delete", "with"):
@@ -562,6 +582,15 @@ class _Runner:
 
     def _run_stmt(self, st: Any, env: dict[str, Any]) -> None:
         if isinstance(st, Assign):
+            if "." in st.name:
+                # ``new.field := expr`` — mutate a record variable's field (a
+                # BEFORE ROW trigger shaping its NEW row).
+                base, _, fld = st.name.lower().partition(".")
+                record = env.get(base)
+                if not isinstance(record, dict):
+                    raise errors.SQLError("42703", f'"{st.name}" is not a known variable')
+                record[fld] = self._eval(st.expr, env)
+                return
             if st.name.lower() not in env and st.name.lower() not in self.types:
                 raise errors.SQLError("42703", f'"{st.name}" is not a known variable')
             val = self._eval(st.expr, env)
@@ -618,10 +647,18 @@ class _Runner:
 
     def _scope(self, env: dict[str, Any]):
         def scope(col: Any) -> Any:
-            if isinstance(col, exp.Column) and not col.table:
-                nm = col.name.lower()
-                if nm in env:
-                    return env[nm]
+            if isinstance(col, exp.Column):
+                if col.table:
+                    # ``new.t`` — a record variable's field (trigger NEW row).
+                    record = env.get(col.table.lower())
+                    if isinstance(record, dict):
+                        key = col.name.lower()
+                        if key in record:
+                            return record[key]
+                else:
+                    nm = col.name.lower()
+                    if nm in env:
+                        return env[nm]
             raise errors.SQLError("42703", f'column "{getattr(col, "name", col)}" does not exist')
 
         return scope
@@ -683,6 +720,24 @@ def _truthy(value: Any) -> bool:
     if value is None:
         return False
     return bool(value)
+
+
+def invoke_trigger(func: dict, new_record: dict, ctx: scalar.ScalarContext) -> dict | None:
+    """Run a ``RETURNS trigger`` plpgsql function for a BEFORE ROW event.
+
+    ``new_record`` is the row as a column-name-keyed dict, bound to the
+    function's ``NEW`` variable — the body may read fields (``new.t``), assign
+    them (``new.ts := …``), and ``RETURN NEW``. Returns the (possibly mutated)
+    record, or None when the function returned NULL — PG's "skip this row"."""
+    block = parse(func["body"])
+    runner = _Runner(ctx, [], func)
+    env: dict[str, Any] = {"new": dict(new_record)}
+    result = runner.run(block, env)
+    if result is None:
+        return None
+    if not isinstance(result, dict):
+        raise errors.SQLError("42804", "trigger function must return NEW or NULL")
+    return result
 
 
 def invoke(func: dict, args: list[Any], ctx: scalar.ScalarContext) -> Any:

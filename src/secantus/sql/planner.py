@@ -10558,6 +10558,9 @@ UNCOMMENT_SENTINEL = "\x00__secantus_uncomment__"
 # Only a whole ``COMMENT ON … IS NULL`` statement — anchored so a query's
 # ``WHERE x IS NULL`` is never touched.
 _COMMENT_NULL_RE = re.compile(r"(?is)^(\s*COMMENT\s+ON\b.*\bIS\s+)NULL(\s*;?\s*)$")
+_CREATE_FUNCTION_RE = re.compile(r"\bcreate\s+(?:or\s+replace\s+)?function\b", re.I)
+_RETURNS_TRIGGER_RE = re.compile(r"(\breturns\s+)trigger\b", re.I)
+
 # sqlglot parses COPY's options only in the ``WITH (…)`` spelling; the bare
 # ``COPY … TO STDOUT (FORMAT csv)`` form (what psycopg emits) needs the WITH
 # inserted. Anchored on the STDIN/STDOUT target and a known option keyword so a
@@ -10977,6 +10980,11 @@ def _parse_uncached(sql: str) -> list[exp.Expression]:
     sql = _COMMENT_NULL_RE.sub(lambda m: f"{m.group(1)}'{UNCOMMENT_SENTINEL}'{m.group(2)}", sql)
     # ``COPY … TO STDOUT (FORMAT csv)`` — insert the WITH sqlglot requires.
     sql = _COPY_BARE_OPTIONS_RE.sub(r"\1 WITH (", sql)
+    # ``CREATE FUNCTION … RETURNS trigger`` — sqlglot rejects the bare
+    # pseudo-type; quoting it parses as a user-defined type whose identity
+    # ``_create_function`` recognizes.
+    if _CREATE_FUNCTION_RE.search(sql):
+        sql = _RETURNS_TRIGGER_RE.sub(r'\1"trigger"', sql)
     # sqlglot can't parse a negative numeric scale (``::numeric(2,-3)``) —
     # rewrite it to a sentinel value the typmod encoder undoes (the cast
     # evaluator ignores precision/scale, so only the descriptor sees it).

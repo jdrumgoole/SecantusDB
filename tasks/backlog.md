@@ -2477,9 +2477,10 @@ threading into `wt_config`.)
 
 ### pgx gauge — `pgconn` findings and next steps (2026-08-14)
 
-**Where it stands: `pgconn` is at 1 stable failure** (NetworkUsage
-reply-shape fidelity fixed — verified individually; 2 measured at
-`4528a1b9` before it) (of 216 tests;
+**Where it stands: `pgconn` is at 0 stable failures** (the triggers +
+tsvector build closed `TestConnCopyFromNoticeResponseReceivedMidStream`,
+verified individually; only the load-sensitive ctxwatch timing families
+remain — re-run the package for the confirming count) (of 216 tests;
 full-package re-run measured 2026-08-15 at `f2891c28`, three runs). The
 chain: 86 → 29 (#862) → 23 (#866) → 20 (#868) → 18 (#869) → 17 (#870) →
 12 (#871, measured) → 8 (#873) → 5 (#876) → 4 (#877). Two additional tests are
@@ -2518,10 +2519,12 @@ test names.**
 delete-when-fixed rule — the narratives live in `docs/changelog.md` and the
 PR trail #866/#868/#869/#870/#871/#873/#876/#877):
 
-* `TestConnCopyFromNoticeResponseReceivedMidStream` — NOT a COPY bug: fails
-  at setup on `create function ... returns trigger ... language plpgsql` +
-  `CREATE TRIGGER` (`0A000 command CREATE is not supported`); needs trigger
-  + `tsvector`/`to_tsvector` support. The largest remaining lift.
+* (none — the trigger/tsvector build landed BEFORE INSERT FOR EACH ROW
+  triggers with plpgsql NEW records. Scope limits, deliberate: AFTER /
+  UPDATE / DELETE / statement-level triggers stay rejected 0A000; a
+  `pg_temp.`-homed trigger FUNCTION lingers in the catalog after its
+  session ends (its trigger and temp table are torn down; the orphaned
+  function entry is invisible to other sessions' bare-name lookups).
 
 Known divergence recorded while fixing the batch shape (#876): a real PG
 multi-statement simple query is ONE implicit transaction (an error rolls
