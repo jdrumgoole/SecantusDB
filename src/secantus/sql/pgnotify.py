@@ -47,6 +47,13 @@ class NotifyHub:
             for listeners in self._channels.values():
                 listeners.pop(id(session), None)
 
+    def is_listening(self, session: Any) -> bool:
+        """Whether ``session`` listens on any channel — the wire server's idle
+        loop polls (and pushes queued notifications) only for listeners, so a
+        connection that never LISTENed keeps its pure blocking read."""
+        with self._lock:
+            return any(id(session) in listeners for listeners in self._channels.values())
+
     def notify(self, channel: str, payload: str, pid: int) -> None:
         """Deliver a notification to every session listening on ``channel`` by
         appending to each one's delivery queue (drained by its own thread)."""

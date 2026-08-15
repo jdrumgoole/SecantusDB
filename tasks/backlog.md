@@ -2477,9 +2477,10 @@ threading into `wt_config`.)
 
 ### pgx gauge — `pgconn` findings and next steps (2026-08-14)
 
-**Where it stands: `pgconn` is at 5 failures** (of 216 tests; 12 measured
+**Where it stands: `pgconn` is at 4 failures** (of 216 tests; 12 measured
 2026-08-15 at `b8b1b171`, −4 statement-cap fix, −3 parse/exec error shapes,
-each verified individually): 86 → 29 after the `generate_series`
+−1 async notification push, each verified individually; re-run the whole
+package for the next full count): 86 → 29 after the `generate_series`
 untyped-bound fix (#862), 29 → 23 after per-session temp-table namespacing
 (#866), 23 → 20 after the stray-CopyData drain fix (#868), 20 → 18 after
 plain-json compact rendering (#869), 18 → 17 after the legacy bare
@@ -2552,9 +2553,18 @@ test names.**
   multi-statement simple query is ONE implicit transaction (the error
   rolls back earlier statements' writes); ours runs per-statement
   autocommit, so earlier writes survive. No gauge test observes it yet.
-* **Assorted (4)** — `TestConnExecStatementNetworkUsage`,
-  `TestConnWaitForNotification` (120 s timeout),
-  `TestConnectProtocolVersion32`,
+* **Async notification push — FIXED.** `TestConnWaitForNotification`
+  timed out because LISTEN/NOTIFY delivery was piggybacked on the query
+  cycle; a client that just blocks reading (pgx `WaitForNotification`,
+  psycopg `notifies()`) never got the payload. Listening sessions now
+  wait in ~250 ms slices and flush queued notifications from their own
+  thread; non-listeners keep the pure blocking read (no busy-wake), and
+  the idle-in-txn deadline survives the slices. Verified passing.
+* **Assorted (3)** — `TestConnExecStatementNetworkUsage` (byte-exact
+  reply-size assertions: ours is 409/157 bytes vs PG's 391/153 — needs a
+  message-level diff of the Describe/Execute replies),
+  `TestConnectProtocolVersion32` (client asks for protocol 3.2; needs
+  NegotiateProtocolVersion),
   `TestConnectWithValidateConnectTargetSessionAttrsReadWrite`.
   (`TestConnExecBatchImplicitTransaction` passes as of the 2026-08-15
   re-run.)
