@@ -2695,8 +2695,12 @@ def _cast_output_name(target: exp.Expression) -> str | None:
     if ident is not None and ident[0] in _CAST_TYPNAME_BY_OID:
         return _CAST_TYPNAME_BY_OID[ident[0]]
     tag = typemap.type_tag_for_sql(target.to)
-    if tag is None or "[]" in tag:
+    if tag is None:
         return None
+    if tag.endswith("[]"):
+        # PG names an array-cast column after the ELEMENT typname:
+        # ``'{a}'::text[]`` yields a column named ``text``.
+        return tag[:-2]
     return tag
 
 
@@ -5091,7 +5095,11 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
     out_enum_types: dict[int, str] = {}
     out_exprs: list[exp.Expression] = []
     alias_exprs: dict[str, exp.Expression] = {}
-    names = _NameAllocator()
+    # No name uniquifying here: the evaluated executor extracts row values
+    # POSITIONALLY (zip with out_exprs), so duplicate output names are pure
+    # display — and real PG repeats them verbatim (``select 'a', 'b'`` is
+    # ``?column?, ?column?``, never ``?column?_2``; pgx's NetworkUsage test
+    # byte-counts the RowDescription).
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
         inner = e.this if isinstance(e, exp.Alias) else e
@@ -5099,7 +5107,7 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
             for col in table.columns:
                 if col.enum_type is not None:
                     out_enum_types[len(out_columns)] = col.enum_type
-                out_columns.append((names.fresh(col.name), col.type_tag))
+                out_columns.append((col.name, col.type_tag))
                 out_exprs.append(exp.column(col.name))
             continue
         name = alias or (
@@ -5110,7 +5118,7 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
         enum_name = _projected_enum_type(inner, table)
         if enum_name is not None:
             out_enum_types[len(out_columns)] = enum_name
-        out_columns.append((names.fresh(name), _infer_scalar_tag(inner, resolve)))
+        out_columns.append((name, _infer_scalar_tag(inner, resolve)))
         out_exprs.append(inner)
         if alias is not None:
             alias_exprs[alias] = inner

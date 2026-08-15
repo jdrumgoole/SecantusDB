@@ -395,6 +395,17 @@ def _generate_series(start: Any, stop: Any, step: Any) -> tuple[list[Any], str]:
     ranges (int / numeric step) and date / timestamp ranges (an ``interval``
     step) are both supported."""
     if start is None or stop is None:
+        # Describe-time: a parameter bound is still unbound (None). Type from
+        # the bounds we DO know, with the same int4/int8 rule as below, so the
+        # RowDescription a Describe reports matches the DataRow a later
+        # Execute sends. (A later $1 outside int32 range would make execute
+        # rows int8 under an int4 describe — real PG errors on that input
+        # outright, having typed the parameter int4 at parse.)
+        known = [
+            b for b in (_coerce_series_bound(start), _coerce_series_bound(stop)) if b is not None
+        ]
+        if all(isinstance(b, int) and -(2**31) <= b < 2**31 for b in known):
+            return [], "int4"
         return [], "int8"
     # An untyped parameter (`generate_series(1, $1)` with `$1` sent as text)
     # arrives as a string: the wire gave no type OID, so nothing upstream
@@ -432,7 +443,17 @@ def _generate_series(start: Any, stop: Any, step: Any) -> tuple[list[Any], str]:
         while cur >= stop:
             out.append(cur)
             cur += step
-    tag = "int8" if all(isinstance(v, int) for v in out) else "numeric"
+    if all(isinstance(v, int) for v in out):
+        # PG picks the overload from the ARGUMENT types: int4 bounds yield
+        # int4 rows, an int8 bound yields int8. The wire gives us values, not
+        # declared types, so int32-range bounds mean int4 (an explicit
+        # small-valued ::int8 bound diverges — PG would say int8; accepted).
+        int4_bounds = all(
+            b is None or (isinstance(b, int) and -(2**31) <= b < 2**31) for b in (start, stop, step)
+        )
+        tag = "int4" if int4_bounds else "int8"
+    else:
+        tag = "numeric"
     return out, tag
 
 
