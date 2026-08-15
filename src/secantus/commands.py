@@ -34,7 +34,7 @@ from secantus.auth import (
     derive_credentials,
 )
 from secantus.connreg import ConnectionRegistry
-from secantus.cursors import CursorNotFound, CursorRegistry
+from secantus.cursors import MAX_GETMORE_BATCH_BYTES, CursorNotFound, CursorRegistry
 from secantus.expressions import ExpressionError, UnknownExpressionOperatorError
 from secantus.failpoints import FailPointRegistry, is_resumable_change_stream_code
 from secantus.geo import GeoError
@@ -4011,7 +4011,13 @@ def _change_stream_cursor_doc(
 def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     cursor_id = int(doc["getMore"])
     coll = doc.get("collection", "")
-    batch_size = int(doc.get("batchSize", 0) or 0) or DEFAULT_BATCH_SIZE
+    # mongod's 101-document default applies only to a find/aggregate FIRST
+    # batch: an unspecified getMore batchSize means "as many documents as fit
+    # in 16MB", so a full scan drains in ~2 round trips, not count/101. Only
+    # the tailable path keeps the small default (its events arrive
+    # incrementally off the oplog).
+    raw_batch_size = int(doc.get("batchSize", 0) or 0)
+    batch_size = raw_batch_size or DEFAULT_BATCH_SIZE
     max_time_ms = int(doc.get("maxTimeMS", 0) or 0)
     ns = _ns(ctx.db_name, coll)
     try:
@@ -4041,7 +4047,9 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         }
     if not entry.tailable:
         try:
-            batch, exhausted = ctx.cursors.next_batch(cursor_id, batch_size)
+            batch, exhausted = ctx.cursors.next_batch(
+                cursor_id, raw_batch_size, max_bytes=MAX_GETMORE_BATCH_BYTES
+            )
         except CursorNotFound:
             return {
                 "ok": 0.0,

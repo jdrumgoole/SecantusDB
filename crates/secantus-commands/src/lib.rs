@@ -66,7 +66,14 @@ pub const SERVER_VERSION: &str = "7.0.0";
 /// `versionArray` companion to [`SERVER_VERSION`].
 pub const SERVER_VERSION_ARRAY: [i32; 4] = [7, 0, 0, 0];
 /// Default cursor batch size when the client doesn't specify one.
+///
+/// This is the FIRST-batch default only. mongod's 101-document default applies
+/// to `find` / `aggregate` first batches; an unspecified `batchSize` on a
+/// `getMore` means "as many documents as fit in [`MAX_GETMORE_BATCH_BYTES`]",
+/// so a full scan drains in ~2 round trips, not `count / 101`.
 pub const DEFAULT_BATCH_SIZE: i32 = 101;
+/// Byte budget for a single cursor batch (mongod's 16MB reply-document cap).
+pub const MAX_GETMORE_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
 /// Valid `readConcern.level` values (`commands.py::_VALID_READ_CONCERN_LEVELS`).
 const VALID_READ_CONCERN_LEVELS: [&str; 5] =
