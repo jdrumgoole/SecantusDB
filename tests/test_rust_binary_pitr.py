@@ -27,6 +27,15 @@ except ImportError:  # pragma: no cover - Windows
 
 import pytest
 
+# These tests are disk-I/O bound end-to-end (real durable WiredTiger in the
+# binary, snapshot + restore): ~8s solo, but the documented contention factor
+# under a full parallel suite is 15-35x (see _restore), and with TWO suites on
+# one machine the global 600s deadline was reachable — pytest-timeout's
+# thread-method kill then took the whole worker down (the "worker death"
+# cluster). Budget for the measured worst case; genuine hangs still die, just
+# later, and the banner read above fails fast with a reason.
+pytestmark = pytest.mark.timeout(1200)
+
 pymongo = pytest.importorskip("pymongo")
 
 from secantus import SecantusDBServer  # noqa: E402
@@ -148,6 +157,34 @@ def test_rust_binary_restore_missing_source_errors(tmp_path: pathlib.Path) -> No
 _BANNER = re.compile(r"secantusd-rs listening on (\S+):(\d+)")
 
 
+def _read_banner_line(proc: subprocess.Popen, timeout: float = 120.0) -> str:
+    """Read the server's banner line with a deadline.
+
+    A bare ``proc.stdout.readline()`` blocks forever if the binary wedges at
+    startup, and the per-test 600s pytest-timeout then kills the WORKER
+    (``method = "thread"`` exits via ``os._exit`` → xdist "Not properly
+    terminated", no traceback, no crash report) — the 2026-08-14/15
+    "worker death" cluster. Fail inside the test instead, with the reason.
+    """
+    import threading
+
+    result: dict[str, str] = {}
+
+    def _read() -> None:
+        assert proc.stdout is not None
+        result["line"] = proc.stdout.readline()
+
+    t = threading.Thread(target=_read, daemon=True)
+    t.start()
+    t.join(timeout)
+    if "line" not in result:
+        raise AssertionError(
+            f"secantusd-rs printed no banner within {timeout}s "
+            f"(pid={proc.pid}, alive={proc.poll() is None})"
+        )
+    return result["line"]
+
+
 def test_rust_binary_v2_archive_base_snapshot_and_restore(tmp_path: pathlib.Path) -> None:
     """End-to-end PITR v2 on the Rust server: a server started with
     --oplog-archive-dir takes a base snapshot via secantusAdmin.archiveBaseSnapshot,
@@ -171,8 +208,9 @@ def test_rust_binary_v2_archive_base_snapshot_and_restore(tmp_path: pathlib.Path
     )
     try:
         assert proc.stdout is not None
-        m = _BANNER.search(proc.stdout.readline())
-        assert m, "no listening banner"
+        line = _read_banner_line(proc)
+        m = _BANNER.search(line)
+        assert m, f"no listening banner in: {line!r}"
         host, port = m.group(1), int(m.group(2))
         client = pymongo.MongoClient(
             host, port, directConnection=True, serverSelectionTimeoutMS=5000

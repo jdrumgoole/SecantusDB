@@ -5702,132 +5702,31 @@ distinct problems, triaged from the run logs:
   (renames of huge collections are rare); bounded today only by luck of
   cache headroom. The `drop_target=true` purge inside rename shares the
   shape.
-- [ ] **One unexplained xdist worker death in `test_rust_binary_pitr.py`
-  (2026-08-13, during the 0.6.0b10 release runs).** In one of three
-  full-suite runs on a quiet machine, worker gw0 died hard while running
-  `test_rust_binary_v2_archive_base_snapshot_and_restore` — no macOS crash
-  report (so no segfault/abort: a SIGKILL or hard `_exit`), xdist replaced
-  the worker and the suite continued (test reported FAILED). The other two
-  quiet runs and a solo run were green. NOT the same event as the release
-  wedge that day (that was CPU contention from a parallel session's suite),
-  and NOT the `Python-*.ips` segfault reports from those windows — all
-  three of those are `test_crash_stall_watchdog.py`'s INTENTIONAL nested
-  `test_boom` segfault (thread name in the .ips names it), which fires on
-  every full run; treat those reports as noise when diagnosing. The test
-  spawns `secantusd-rs`, SIGTERMs it, runs `secantusdb restore` in a
-  subprocess, then opens the restored dir with the Python `Storage` in the
-  worker. Next occurrence: capture per-worker RSS + the worker's pid before
-  death, and check whether the restore subprocess or the WT open is the
-  killer. Until then: 1-in-3, unreproduced. **Second occurrence
-  2026-08-14 ~22:43 local:** TWO workers (gw0, gw2) died "Not properly
-  terminated" at ~99% of a local full run (branch ungate-pipeline-txn,
-  runtime code identical to a green run 90 min earlier), again no .ips
-  (the only segfault report in the window is the intentional nested
-  test_boom), machine at load ~6-9 with a parallel CI-watch session; the
-  post-crash-overrun watchdog killed the stalled controller 1200s later.
-  No jetsam/kernel kill in `log show`. Still SIGKILL-shaped and
-  unattributed; the RSS/pid capture plan stands. **Third occurrence
-  2026-08-15 ~01:00: THREE workers (gw2, gw5, gw3) at ~99% of a local
-  full run, again no .ips, again rerun-clean. Negative repro result: 5
-  rounds of the four rust-binary/server test files alone (-n4, 89 tests
-  per round) are clean — the death needs full-suite tail conditions,
-  pointing at accumulated state (fds / RSS / WT homes) rather than any
-  single test. Next step is a full-suite run under a per-worker RSS+fd
-  sampler sidecar.**
-- [ ] **Residual straddle window: generated-column / expression-index
-  recompute in the non-materialized UPDATE path.** Same shape as the
-  resolved lost-update straddle but narrower surface: `execute_update`'s
-  per-row gen-col recompute (find post-image → compute → per-row `$set`)
-  runs as bare reads + autocommit writes, so a Sync-commit landing between
-  the read and the write could be overwritten. Unproven in practice (needs
-  a table with generated columns AND mixed-protocol concurrent writers).
-  Fix would be the same snapshot-txn wrapper `_execute_update_materialized`
-  now uses; kept out of the straddle-fix PR to keep its blast radius
-  verifiable.
-- [x] **RESOLVED: Lost-update cluster (2026-08-14) — mixed-mode straddle,
-  mechanism proven and pinned deterministically.** A pipelined implicit
-  transaction's Sync-commit runs *outside* the statement-write lock, so it
-  can land inside a bare autocommit computed-update's read-compute-write
-  window; the bare write then opened a fresh WT batch transaction whose
-  snapshot already *included* that commit — no conflict, silent overwrite,
-  lost increment. Reproduced deterministically by gating
-  `Storage.find_matching` (now the permanent regression test
-  `test_sync_commit_serializes_with_bare_statements` in
-  tests/test_pgserver_concurrency.py). Fix: the non-transactional
-  materialized-update path (`executor._execute_update_materialized`) wraps
-  the whole read-compute-write in ONE WT snapshot transaction, so a
-  mid-window commit surfaces as a write conflict and the statement retries
-  from a fresh read (retry loop handles SQLSTATE 40001, WriteConflictError,
-  and raw WT_ROLLBACK). A first fix attempt — committing the settle under
-  the statement lock — deadlocked (the bare writer retries its WT conflict
-  unboundedly *while holding* the lock the committer needs); don't revisit
-  it. Lessons kept from the hunt: sequential A/B rounds were worthless
-  (every "conviction"/"exoneration" flipped with the sampling window); only
-  the paired same-runner sampler (scripts/race_pair_sampler.py, kept) and
-  finally the deterministic gated-find harness settled it. **In-vivo
-  confirmation (2026-08-14, PR #865 round 2):** with a temporary
-  `SECANTUS_STRADDLE_TXN=0` gate re-opening the race and the pair-sampler
-  A/B-ing fix-on vs fix-off on all 20 CI lanes, a Windows lane caught the
-  loss fix-OFF (1/6, n=39, the exact mixed-mode signature: 20 implicit
-  txns opened, every statement reporting UPDATE 1) while fix-ON on the
-  same runner scored 0/6 — and fix-ON never lost across 168 paired
-  samples. The gate and the sampler workflow steps were then removed;
-  the sampler script stays for reuse. Both racing tests keep their
-  instrumented asserts (per-worker rowcounts + pgextended.COUNTERS
-  deltas). Residual oddity, not a bug: CI psycopg sent
-  360/400 parameterless statements via the extended protocol while local
-  psycopg sends them all via simple 'Q' — environment-dependent protocol
-  selection is why CI hit the mixed-mode window and local stress never did.
-- [x] **PARTIALLY RESOLVED (gated): BatchFailureTest (48) + BatchExecuteTest (8) — pipelined
-  statements now form one implicit transaction until Sync** (PG semantics:
-  mid-pipeline error rolls back the whole pipeline; BEGIN takes over; first
-  statement retries write-races internally so plain autocommit is
-  unchanged). Both classes fully green. **OuterJoinSyntaxTest (6) also
-  resolved**: Describe over derived-VALUES joins + multi-layer grouping-paren
-  unwrap + Table-wrapped-VALUES normalization. BatchDeadlockTest (6) is a
-  DIFFERENT issue (pgjdbc round-trip counting: "Sync should not fire per
-  row" — the driver syncs per row for generated-keys batches based on
-  something we advertise; needs a driver-side trace).
-- [x] **RESOLVED: AutoRollbackTest — server-side cached-plan revalidation**
-  (no capture needed — the variant matrix pinned it): pgjdbc's transparent
-  re-prepare (`willHealViaReparse`) matches the ErrorResponse's
-  **ROUTINE=RevalidateCachedQuery** field, not the SQLSTATE; and PG raises at
-  PLANNING time, before a data-modifying CTE's side effects. With both in
-  place (raise-until-reparse on named statements, pre-execution shape check
-  via the describe path, unnamed statements exempt), AutoRollbackTest is
-  **1056/1056**. Original entry: pgjdbc's autosave matrix
-  expects `cached plan must not change result type` (0A000) from the server
-  when a NAMED prepared statement's result shape changed under DDL. A
-  prototype (2026-08-13, on the extended-protocol Execute path: capture
-  `(name, oid)` shape per named statement at first execute, raise 0A000 +
-  replan on mismatch) fixed the shape probe itself (verified with psycopg:
-  raise once, succeed on retry, unchanged shapes unaffected) but moved
-  AutoRollbackTest **8 -> 28** — the error fires in matrix variants where
-  pgjdbc expects success, so PG's raise condition is narrower than
-  shape-changed-on-named-statement (suspects: pgjdbc's flushCacheOnDdl
-  discarding + re-preparing under the same name, DISCARD/DEALLOCATE ALL not
-  clearing our `pgextended.prepared` map, or PG raising only for
-  generic-plan statements). Next step: capture ONE failing variant's wire
-  exchange (Parse/Bind/Execute/Close sequence with statement names) against
-  real PG and us — the capture-first method that settled DateTest. The
-  prototype diff is small and correct-in-isolation; re-apply it once the
-  condition is pinned.
-- [x] **RESOLVED: `pgjdbc` weekly lane is red by construction** — the lane
-  now exits by baseline comparison (`pgjdbc_validation/baseline.py` +
-  committed `baseline.json`); red means a regression vs the documented
-  standing-failure set, nothing else. Regenerate the baseline with
-  `--update` in the PR that fixes gauge tests. Original entry: 2026-08-03 was its
-  first weekly run; the failures in its log (`ArrayTest`, `AutoRollbackTest`,
-  …) are inside the ~347 documented standing failures of the 93.7% baseline
-  (§ "pgjdbc gauge — remaining clusters"), not new. The lane fails because
-  `pgjdbc_validation/runner.py` returns **gradle's raw exit code**, and
-  gradle exits non-zero while ANY test fails — so until the remaining
-  clusters reach 100%, the lane can never be green and its red tells you
-  nothing. Fix needs a baseline-aware exit (compare the JUnit-XML failure
-  set / pass-rate against the committed report and fail only on
-  regression — the policy of what counts as a regression is worth a
-  deliberate call, not an inline guess). Until then, read the pgjdbc lane's
-  report artifact, not its conclusion.
+- [x] **RESOLVED: the xdist "worker death" cluster (2026-08-13 → 08-15) is
+  pytest-timeout's thread-method kill on starved-but-healthy tests.** Root
+  cause proven with an RSS/proctitle sampler sidecar: two workers entered
+  `test_rust_binary_pitr.py` tests at 02:39:40 and died at 02:49:34-40 —
+  exactly the 600s per-test deadline later. `timeout_method = "thread"`
+  exits the worker via `os._exit` → xdist reports "Not properly
+  terminated", no traceback, no .ips (it's a clean exit, not a crash), and
+  the timeout's stack dump is swallowed by xdist capture (attached to a
+  test report that never completes). The tests weren't hung: they are
+  disk-I/O-bound (documented 15-35x slowdown under ONE parallel suite in
+  `_restore`'s comment) and the machine was running TWO full suites, which
+  made 600s reachable. Every earlier signature matches: deaths at ~99%
+  (the slow rust-binary tail), multiple workers in the same instant (xdist
+  hands out the same file's tests together), never reproducible in
+  isolation (5×89 clean), rerun-clean, SIGKILL-shaped-but-reportless.
+  Fixes: `pytest_handlecrashitem` hook in tests/conftest.py names the
+  crashed test + a memory snapshot the moment a worker dies (the summary
+  that would have named it is exactly what the post-crash watchdog
+  preempts); `test_rust_binary_pitr.py` gets a 1200s file timeout budgeted
+  for the measured contention worst case, and its banner
+  `stdout.readline()` is deadline-bounded so a genuinely wedged binary
+  fails in-test with a reason instead of eating the whole budget.
+  (Sampler: scratchpad `worker_sampler.py` pattern — ps proctitle + RSS
+  every 5s, lsof fds every 30s; the `[pytest-xdist running] <nodeid>`
+  proctitle is what names each worker's in-flight test.)
 
 ## DateTest: four distinct date offsets (2026-08-03)
 

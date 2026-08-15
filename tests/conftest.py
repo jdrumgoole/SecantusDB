@@ -295,6 +295,30 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
 
 
 @pytest.hookimpl(optionalhook=True)
+def pytest_handlecrashitem(crashitem: str, report: object, sched: object) -> None:
+    """Name the test a crashed worker was running, the moment it crashes.
+
+    The stall watchdog can kill a post-crash run before pytest's summary
+    prints, and the summary is the only place xdist's "worker crashed while
+    running X" failure reports would otherwise appear — three worker-death
+    occurrences (2026-08-14/15) left no record of WHICH tests the dead
+    workers were on. This dumps the crashed item immediately, plus a memory
+    snapshot for the SIGKILL-no-.ips hypothesis (fd/RSS exhaustion).
+    """
+    sys.stderr.write(f"\n=== crashed worker was running: {crashitem} ===\n")
+    try:
+        import resource
+        import subprocess
+
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+        free = next((ln for ln in vm.splitlines() if "free" in ln), "")
+        sys.stderr.write(f"controller maxrss={rss_mb:.0f}MB; {free.strip()}\n")
+    except Exception:
+        pass
+
+
+@pytest.hookimpl(optionalhook=True)
 def pytest_testnodedown(node: object, error: object) -> None:
     """Record a dead worker so the stall report can name it.
 
