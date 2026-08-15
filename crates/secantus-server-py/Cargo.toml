@@ -19,7 +19,7 @@ name = "_secantus_server"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
 secantus-storage = { path = "../secantus-storage" }
 secantus-storage-adapter = { path = "../secantus-storage-adapter" }
 secantus-commands = { path = "../secantus-commands" }

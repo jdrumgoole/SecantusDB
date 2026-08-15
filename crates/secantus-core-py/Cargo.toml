@@ -16,5 +16,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 bson = { workspace = true }
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
 secantus-core = { path = "../secantus-core" }
