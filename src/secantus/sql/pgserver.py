@@ -22,6 +22,7 @@ import itertools
 import logging
 import os
 import secrets
+import select
 import signal
 import socket
 import ssl
@@ -605,15 +606,27 @@ class SecantusPGServer:
                 timeout = max(0.001, txn_deadline - time.monotonic())
             if self._notify.is_listening(session):
                 timeout = 0.25 if timeout is None else min(timeout, 0.25)
-            conn.settimeout(timeout)
-            try:
+            # Wait for readability with `select`, NOT a socket read timeout.
+            # A read timeout can fire mid-frame — after `read_message` has
+            # consumed the type byte or part of the length/payload — and the
+            # bytes already read are then silently discarded, desyncing the
+            # wire stream so every subsequent byte is misread (#882). `select`
+            # only decides WHEN to look; once the socket is readable we read a
+            # COMPLETE frame with a blocking recv, so a poll wakeup can never
+            # truncate a frame. Ordinary network jitter that delays a frame's
+            # tail just blocks the recv until it arrives, exactly as the
+            # non-listening default path already does.
+            ready, _, _ = select.select([conn], [], [], timeout)
+            if ready:
+                conn.settimeout(None)
                 return pgwire.read_message(conn)
-            except TimeoutError:
-                if txn_deadline is not None and time.monotonic() >= txn_deadline:
-                    raise
-                pending = self._pending_notification_bytes(session)
-                if pending:
-                    conn.sendall(pending)
+            # Woke with no data: honour the idle-in-transaction deadline, then
+            # flush any queued LISTEN/NOTIFY deliveries and poll again.
+            if txn_deadline is not None and time.monotonic() >= txn_deadline:
+                raise TimeoutError
+            pending = self._pending_notification_bytes(session)
+            if pending:
+                conn.sendall(pending)
 
     def _query_loop(self, conn: socket.socket, session: Session) -> None:
         # Per-connection extended-protocol state (prepared statements + portals).
