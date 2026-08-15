@@ -1226,12 +1226,26 @@ def _expr_to_filter(
                     expressions=[exp.Literal.string(n) for n in own],
                 ),
             )
-        # Search-path visibility: an unqualified lookup sees only the default
-        # namespaces (public / pg_catalog / information_schema) plus the
-        # session's own pg_temp — a relation in a user schema is invisible
-        # until schema-qualified, exactly like real PG with the default
-        # search_path. Namespace oids mirror virtual._NS_OIDS / _PG_TEMP_NS_OID.
-        visible_ns = [2200, 11, 13000, 99]
+        # Search-path visibility: the relation's namespace must be on the
+        # session's search_path (plus the implicit pg_catalog /
+        # information_schema / session pg_temp). The path is resolved to
+        # namespace oids per-session — a hardcoded default-path list hid every
+        # user-schema relation the moment ``SET search_path TO schema1`` ran
+        # (pgjdbc's same-table-name-in-two-schemas updatable-resultset probe).
+        # Default namespace oids mirror virtual._NS_OIDS / _PG_TEMP_NS_OID.
+        visible_ns = [11, 13000, 99]
+        path = list(getattr(session, "search_path", None) or ["public"])
+        if subctx is not None and getattr(subctx, "catalog", None) is not None:
+            from secantus.sql import virtual as _virtual
+
+            schema_oid_map = _virtual._schema_oids(subctx.db, subctx.catalog)
+        else:
+            schema_oid_map = {}
+        for schema in path:
+            if schema == "public":
+                visible_ns.append(2200)
+            elif schema in schema_oid_map:
+                visible_ns.append(schema_oid_map[schema])
         vis = exp.And(
             this=vis,
             expression=exp.In(
@@ -7031,6 +7045,19 @@ class _OnTranslator:
         if isinstance(node, exp.In) and node.args.get("expressions"):
             elems = [self.expr(e) for e in node.args["expressions"]]
             return {"$in": [self.expr(node.this), elems]}
+        # ``(col).field`` — composite-value access on a record column (the
+        # ``(i.keys).x`` term in pgjdbc's index-metadata join). A record cell
+        # is a subdocument, so the access is just the dotted field path; only
+        # the NEW (being-joined) side lowers this way — an outer composite
+        # would need its full path let-bound.
+        if (
+            isinstance(node, exp.Dot)
+            and isinstance(node.this, exp.Paren)
+            and isinstance(node.this.this, exp.Column)
+        ):
+            base = self.expr(node.this.this)
+            if isinstance(base, str) and base.startswith("$") and not base.startswith("$$"):
+                return f"{base}.{node.expression.name}"
         for cls, op in self._OPS.items():
             if isinstance(node, cls):
                 return {op: [self.expr(node.this), self.expr(node.expression)]}

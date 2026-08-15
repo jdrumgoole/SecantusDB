@@ -2499,12 +2499,152 @@ def _pg_typeof_table(storage: Any, db: str, catalog: Catalog, table_node: exp.Ta
         return None
 
 
+def _record_srf_call(node: exp.Expression) -> exp.Expression | None:
+    """The record-SRF call inside ``node`` when node IS such a call — either a
+    bare ``Anonymous`` (``_pg_expandarray(x)``) or the schema-qualified
+    ``Dot(Identifier(information_schema), Anonymous(...))`` sqlglot produces."""
+    if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Anonymous):
+        node = node.expression
+    if isinstance(node, exp.Anonymous) and srf._is_record_srf(node):
+        return node
+    return None
+
+
+def _projection_record_srf_spec(stmt: exp.Select) -> dict | None:
+    """Detect record SRFs in the projection list; None when there are none (or
+    a shape we don't expand — nested uses fall through to the normal error).
+
+    Recognized projection shapes:
+    * ``[alias =] SRF(arr)`` — a composite (x, n) column, one row per element;
+    * ``[alias =] (SRF(arr)).<field>`` — immediate field access.
+
+    Multiple references to the same call (same argument text) expand in
+    lockstep from ONE evaluation, PG's multi-SRF row pairing for the identical-
+    call case (different-argument SRFs pad with NULLs to the longest).
+    """
+    if stmt.args.get("group") or stmt.args.get("distinct") or stmt.args.get("having"):
+        return None
+    plan: list[tuple] = []
+    keys: dict[str, exp.Expression] = {}  # arg-sql -> arg expression
+    found = False
+    for e in stmt.expressions:
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        target = e.this if isinstance(e, exp.Alias) else e
+        call = _record_srf_call(target)
+        if call is not None:
+            arg = call.expressions[0] if call.expressions else exp.Null()
+            key = arg.sql(dialect="postgres")
+            keys.setdefault(key, arg)
+            name = alias or str(call.this).rsplit(".", 1)[-1].lower()
+            plan.append(("record", key, name))
+            found = True
+            continue
+        if isinstance(target, exp.Dot) and isinstance(target.this, exp.Paren):
+            call = _record_srf_call(target.this.this)
+            if call is not None:
+                field = target.expression.name.lower()
+                if field not in ("x", "n"):
+                    return None
+                arg = call.expressions[0] if call.expressions else exp.Null()
+                key = arg.sql(dialect="postgres")
+                keys.setdefault(key, arg)
+                plan.append(("field", key, alias or field, field))
+                found = True
+                continue
+        if list(
+            srf._is_record_srf(n) for n in target.find_all(exp.Anonymous) if srf._is_record_srf(n)
+        ):
+            return None  # record SRF nested somewhere we don't expand
+        plan.append(("copy", e))
+    if not found:
+        return None
+    return {"stmt": stmt, "plan": plan, "keys": keys}
+
+
+def _run_selectlist_srf(
+    spec: dict, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """Execute a SELECT whose projection list contains record SRFs: run the
+    query with each SRF call replaced by its ARRAY argument, then expand each
+    result row to one row per element, building the composite / field cells."""
+    stmt: exp.Select = spec["stmt"]
+    plan = spec["plan"]
+    inner = stmt.copy()
+    projections: list[exp.Expression] = []
+    copy_idx: dict[int, int] = {}  # plan position -> inner column index
+    for pos, op in enumerate(plan):
+        if op[0] == "copy":
+            copy_idx[pos] = len(projections)
+            projections.append(op[1].copy())
+    key_idx: dict[str, int] = {}
+    for k, arg in spec["keys"].items():
+        key_idx[k] = len(projections)
+        projections.append(
+            exp.Alias(this=arg.copy(), alias=exp.to_identifier(f"__srf_arg{len(key_idx)}"))
+        )
+    inner.set("expressions", projections)
+    res = _run_select(inner, storage, db, catalog, session)
+
+    out_rows: list[tuple] = []
+    for row in res.rows:
+        elems: dict[str, list] = {}
+        for k, idx in key_idx.items():
+            v = row[idx]
+            elems[k] = list(v) if isinstance(v, (list, tuple)) else []
+        height = max((len(v) for v in elems.values()), default=0)
+        # PG: an SRF returning zero rows eliminates the input row entirely.
+        for i in range(height):
+            cells: list = []
+            for pos, op in enumerate(plan):
+                if op[0] == "copy":
+                    cells.append(row[copy_idx[pos]])
+                elif op[0] == "record":
+                    items = elems[op[1]]
+                    if i < len(items):
+                        cells.append(typemap.RecordValue((("x", items[i]), ("n", i + 1))))
+                    else:
+                        cells.append(None)
+                else:  # field
+                    items = elems[op[1]]
+                    field = op[3]
+                    if i >= len(items):
+                        cells.append(None)
+                    else:
+                        cells.append(items[i] if field == "x" else i + 1)
+            out_rows.append(tuple(cells))
+
+    columns: list[ColumnDesc] = []
+    for pos, op in enumerate(plan):
+        if op[0] == "copy":
+            columns.append(res.columns[copy_idx[pos]])
+        elif op[0] == "record":
+            columns.append(ColumnDesc(op[2], "composite", typemap.PG_OID["composite"]))
+        else:
+            name = op[2]
+            if op[3] == "n":
+                columns.append(ColumnDesc(name, "int4", typemap.PG_OID["int4"]))
+            else:
+                columns.append(ColumnDesc(name, "any", 0))
+    return SQLResult(
+        command_tag=f"SELECT {len(out_rows)}",
+        columns=columns,
+        rows=out_rows,
+        rowcount=len(out_rows),
+    )
+
+
 def _run_select(
     stmt: exp.Select, storage: Any, db: str, catalog: Catalog, session: Session
 ) -> SQLResult:
     _validate_locks(stmt)  # FOR UPDATE / SHARE: single-node no-op, but OF-targets validated.
     planner.unwrap_paren_join_from(stmt)  # FROM (a JOIN b) — grouping parens, not a derived table
     planner.rewrite_pg_typeof(stmt, _pg_typeof_table(storage, db, catalog, stmt.find(exp.Table)))
+    # A record SRF (``information_schema._pg_expandarray``) in the SELECT list —
+    # pgjdbc's DatabaseMetaData PK/index queries put it there, both bare
+    # (composite column) and with immediate field access (``(SRF(x)).n``).
+    srf_expansion = _projection_record_srf_spec(stmt)
+    if srf_expansion is not None:
+        return _run_selectlist_srf(srf_expansion, storage, db, catalog, session)
     # A base-less set-returning function as the row source: ``FROM generate_series(…)``
     # / ``FROM unnest(…)`` / … or a bare ``SELECT generate_series(…)``.
     srf_source = srf.from_source(stmt) or srf.fromless_projection(stmt)

@@ -421,3 +421,168 @@ class TestOutputNameFidelity:
 
     def test_array_cast_named_after_element_type(self):
         assert _cols("select '{foo}'::text[] from generate_series(1, 1) n") == ["text"]
+
+
+class TestSelectListRecordSrf:
+    """``_pg_expandarray`` in the SELECT list — the call sites pgjdbc's
+    DatabaseMetaData PK/index queries emit: bare composite column, immediate
+    ``(SRF(x)).n`` field access, and both in one projection expanding in
+    lockstep. Rows multiply per element; empty arrays eliminate the row."""
+
+    @pytest.fixture
+    def st(self, tmp_path):
+        s = Storage(str(tmp_path))
+        try:
+            sess = Session(database=DB)
+            run_sql(s, DB, "CREATE TABLE t (id int, arr int[])", session=sess)
+            run_sql(
+                s,
+                DB,
+                "INSERT INTO t VALUES (1, ARRAY[10,20]), (2, ARRAY[30]), (3, ARRAY[]::int[])",
+                session=sess,
+            )
+            yield s
+        finally:
+            s.close()
+
+    def test_bare_composite_column(self, st):
+        res = _run(
+            "SELECT id, information_schema._pg_expandarray(arr) AS keys FROM t ORDER BY id",
+            st=st,
+        )
+        assert res.rows == [
+            (1, {"x": 10, "n": 1}),
+            (1, {"x": 20, "n": 2}),
+            (2, {"x": 30, "n": 1}),
+        ]
+        assert [c.name for c in res.columns] == ["id", "keys"]
+
+    def test_field_access_form(self, st):
+        res = _run(
+            "SELECT id, (information_schema._pg_expandarray(arr)).n AS seq FROM t ORDER BY id",
+            st=st,
+        )
+        assert res.rows == [(1, 1), (1, 2), (2, 1)]
+
+    def test_lockstep_expansion(self, st):
+        res = _run(
+            "SELECT (information_schema._pg_expandarray(arr)).n AS seq, "
+            "information_schema._pg_expandarray(arr) AS keys FROM t WHERE id = 1",
+            st=st,
+        )
+        assert res.rows == [(1, {"x": 10, "n": 1}), (2, {"x": 20, "n": 2})]
+
+    def test_fromless(self, st):
+        res = _run("SELECT information_schema._pg_expandarray(ARRAY[7,8]) AS k", st=st)
+        assert res.rows == [({"x": 7, "n": 1},), ({"x": 8, "n": 2},)]
+
+    def test_composite_access_through_derived_table(self, st):
+        res = _run(
+            "SELECT (sub.keys).x, (sub.keys).n FROM "
+            "(SELECT information_schema._pg_expandarray(ARRAY[10,20]) AS keys) sub",
+            st=st,
+        )
+        assert res.rows == [(10, 1), (20, 2)]
+
+    def test_pgjdbc_get_primary_keys_shape(self, st):
+        sess = Session(database=DB)
+        run_sql(st, DB, "CREATE TABLE pkt2 (p int, q int, PRIMARY KEY (p, q))", session=sess)
+        res = _run(
+            "SELECT result.COLUMN_NAME, result.KEY_SEQ, result.PK_NAME FROM "
+            "(SELECT a.attname AS COLUMN_NAME, "
+            " (information_schema._pg_expandarray(con.conkey)).n AS KEY_SEQ, "
+            " con.conname AS PK_NAME, "
+            " information_schema._pg_expandarray(con.conkey) AS KEYS, "
+            " a.attnum AS A_ATTNUM "
+            "FROM pg_catalog.pg_constraint con "
+            " JOIN pg_catalog.pg_class ct ON (con.conrelid = ct.oid) "
+            " JOIN pg_catalog.pg_attribute a ON (a.attrelid = ct.oid) "
+            "WHERE con.contype = 'p' AND ct.relname = 'pkt2') result "
+            "where result.A_ATTNUM = (result.KEYS).x "
+            "ORDER BY result.key_seq",
+            st=st,
+        )
+        assert res.rows == [("p", 1, "pkt2_pkey"), ("q", 2, "pkt2_pkey")]
+
+    def test_pgjdbc_index_keys_join_shape(self, st):
+        sess = Session(database=DB)
+        run_sql(st, DB, "CREATE TABLE pkt (a int, b text, PRIMARY KEY (a))", session=sess)
+        res = _run(
+            "SELECT a.attname FROM pg_catalog.pg_class ct "
+            " JOIN pg_catalog.pg_attribute a ON (ct.oid = a.attrelid) "
+            " JOIN (SELECT i.indexrelid, i.indrelid, i.indisprimary, "
+            "        information_schema._pg_expandarray(i.indkey) AS keys "
+            "       FROM pg_catalog.pg_index i) i "
+            "   ON (a.attnum = (i.keys).x AND a.attrelid = i.indrelid) "
+            "WHERE ct.relname = 'pkt' AND i.indisprimary ORDER BY a.attnum",
+            st=st,
+        )
+        assert res.rows == [("a",)]
+
+
+class TestSearchPathVisibility:
+    """``pg_table_is_visible`` honours the session's search_path — both in
+    WHERE position (lowered to a namespace filter) and as a projected value —
+    so pgjdbc's getPrimaryUniqueKeys disambiguates same-named tables across
+    schemas (UpdateableResultTest.testUpdateableWithSameTableNameInMultipleSchemas)."""
+
+    @pytest.fixture
+    def st(self, tmp_path):
+        s = Storage(str(tmp_path))
+        try:
+            sess = Session(database=DB)
+            for ddl in (
+                "CREATE SCHEMA schema1",
+                "CREATE SCHEMA schema2",
+                "CREATE TABLE schema1.same_name (id int PRIMARY KEY, val text)",
+                "CREATE TABLE schema2.same_name (id2 int PRIMARY KEY, val text)",
+            ):
+                run_sql(s, DB, ddl, session=sess)
+            yield s
+        finally:
+            s.close()
+
+    def _pk_columns(self, st, sess):
+        q = (
+            "SELECT a.attname FROM pg_catalog.pg_class ct "
+            " JOIN pg_catalog.pg_attribute a ON (ct.oid = a.attrelid) "
+            " JOIN pg_catalog.pg_index i ON (a.attrelid = i.indrelid) "
+            " JOIN (SELECT i2.indrelid AS rid, "
+            "        information_schema._pg_expandarray(i2.indkey) AS keys "
+            "       FROM pg_catalog.pg_index i2) k "
+            "   ON (a.attnum = (k.keys).x AND a.attrelid = k.rid) "
+            "WHERE i.indisprimary AND pg_catalog.pg_table_is_visible(ct.oid) "
+            "  AND ct.relname = 'same_name'"
+        )
+        return run_sql(st, DB, q, session=sess)[-1].rows
+
+    def test_where_position_follows_search_path(self, st):
+        sess = Session(database=DB)
+        run_sql(st, DB, "SET search_path TO schema1", session=sess)
+        assert self._pk_columns(st, sess) == [("id",)]
+        run_sql(st, DB, "SET search_path TO schema2", session=sess)
+        assert self._pk_columns(st, sess) == [("id2",)]
+
+    def test_projection_position_follows_search_path(self, st):
+        sess = Session(database=DB)
+        run_sql(st, DB, "SET search_path TO schema1", session=sess)
+        rows = run_sql(
+            st,
+            DB,
+            "SELECT pg_catalog.pg_table_is_visible(oid) FROM pg_catalog.pg_class "
+            "WHERE relname = 'same_name' ORDER BY relnamespace",
+            session=sess,
+        )[-1].rows
+        assert rows == [(True,), (False,)]
+
+    def test_default_path_still_sees_public(self, st):
+        sess = Session(database=DB)
+        run_sql(st, DB, "CREATE TABLE pub_t (a int PRIMARY KEY)", session=sess)
+        rows = run_sql(
+            st,
+            DB,
+            "SELECT relname FROM pg_catalog.pg_class "
+            "WHERE pg_catalog.pg_table_is_visible(oid) AND relname = 'pub_t'",
+            session=sess,
+        )[-1].rows
+        assert rows == [("pub_t",)]

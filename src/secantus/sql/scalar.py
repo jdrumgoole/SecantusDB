@@ -3046,6 +3046,34 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
             out.append(c)
             i += 1
         return "".join(out)
+    if name == "pg_table_is_visible" and ctx is not None:
+        # Visibility per search_path: the relation is visible when its schema
+        # is the FIRST schema on the path holding a relation of that name —
+        # pgjdbc's getPrimaryUniqueKeys uses it to disambiguate same-named
+        # tables across schemas when no explicit schema was passed.
+        from secantus.sql import virtual as _virtual
+
+        oid = typemap.unwrap_numeric(args[0]) if args else None
+        if oid is None:
+            return None
+        db = ctx.db
+        name_by_oid = {v: k for k, v in _virtual._table_oids(db, ctx.catalog).items()}
+        qualified = name_by_oid.get(int(oid))
+        if qualified is None:
+            return False
+        rel_schema = _virtual._table_schema_name(qualified)
+        bare = _virtual._bare_table_name(qualified)
+        for schema in ctx.session.search_path:
+            probe = bare if schema == "public" else f"{schema}.{bare}"
+            if ctx.catalog.get(db, probe) is not None:
+                return schema == rel_schema
+        return False
+    if name in ("current_database", "current_catalog") and ctx is not None:
+        # Reachable in any expression context (pgjdbc's getPrimaryKeys derived
+        # table computes ``current_database() AS TABLE_CAT`` over a join).
+        return getattr(ctx.session, "database", None)
+    if name == "current_schema" and ctx is not None:
+        return getattr(ctx.session, "current_schema", None)
     if (
         name in ("pg_terminate_backend", "pg_cancel_backend", "pg_backend_pid", "pg_sleep")
         and ctx is not None
