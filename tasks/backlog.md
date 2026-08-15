@@ -2477,8 +2477,9 @@ threading into `wt_config`.)
 
 ### pgx gauge — `pgconn` findings and next steps (2026-08-14)
 
-**Where it stands: `pgconn` is at 2 stable failures** (protocol-3.2
-negotiation and the target_session_attrs probe fixed; previous headline: 4) (of 216 tests;
+**Where it stands: `pgconn` is at 2 stable failures — MEASURED** (full
+package at `4528a1b9`, 2026-08-15, after the #885 startup-shapes fixes; the
+load-sensitive ctxwatch pair also passed this run) (of 216 tests;
 full-package re-run measured 2026-08-15 at `f2891c28`, three runs). The
 chain: 86 → 29 (#862) → 23 (#866) → 20 (#868) → 18 (#869) → 17 (#870) →
 12 (#871, measured) → 8 (#873) → 5 (#876) → 4 (#877). Two additional tests are
