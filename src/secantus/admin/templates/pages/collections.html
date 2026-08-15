@@ -86,16 +86,16 @@
             <button
               type="button"
               class="btn-secondary"
-              @click="open = (open === 'mod-{{ c.name }}' ? null : 'mod-{{ c.name }}')"
+              @click="open = (open === 'mod-{{ loop.index }}' ? null : 'mod-{{ loop.index }}')"
             >Modify</button>
             <button
               type="button"
               class="btn-secondary"
-              @click="open = (open === 'ren-{{ c.name }}' ? null : 'ren-{{ c.name }}')"
+              @click="open = (open === 'ren-{{ loop.index }}' ? null : 'ren-{{ loop.index }}')"
             >Rename</button>
           </td>
         </tr>
-        <tr x-show="open === 'mod-{{ c.name }}'" x-cloak>
+        <tr x-show="open === 'mod-{{ loop.index }}'" x-cloak>
           <td colspan="6">
             <form method="post" action="/db/{{ db_name }}/{{ c.name }}/collmod">
               <div class="filter-controls">
@@ -118,7 +118,7 @@
             </form>
           </td>
         </tr>
-        <tr x-show="open === 'ren-{{ c.name }}'" x-cloak>
+        <tr x-show="open === 'ren-{{ loop.index }}'" x-cloak>
           <td colspan="6">
             <form method="post" action="/db/{{ db_name }}/{{ c.name }}/rename">
               <div class="filter-controls">
