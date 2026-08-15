@@ -19,6 +19,674 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.6.0b11] — 2026-08-15
+
+### A silent lost update caught in the act, pipelined batches with real transaction semantics, and query cancellation
+
+The headline of this release is a data-integrity fix that took three CI
+platforms, a paired A/B sampler, and a deterministic race harness to pin
+down. Statements a client pipelines before a single Sync now run in one
+implicit transaction, exactly as PostgreSQL treats them — pgjdbc's
+184-variant BatchFailureTest depends on a failed batch rolling back its
+earlier inserts, and both batch classes now pass in full. Making that
+correct exposed a genuine race: an implicit transaction's commit lands
+outside the statement lock, and a concurrent autocommit computed update
+(`SET n = n + 1`) whose read-compute-write window it straddled would
+silently overwrite it while still reporting `UPDATE 1`. The fix runs the
+whole computed update as one storage snapshot transaction, so a
+mid-window commit surfaces as a write conflict and the statement retries
+from a fresh read — proven by a paired fix-on/fix-off sampler catching
+the loss in the wild on the exact runner conditions that first exposed it.
+
+The PostgreSQL surface took two more long-standing steps. The wire
+cancel sub-protocol is honoured — a CancelRequest verifies the
+BackendKeyData secret and interrupts the target's running statement with
+PG's `57014`, which is what JDBC's `setQueryTimeout` and pgx's
+context cancellation lean on. And named prepared statements revalidate
+their cached plan under DDL, raising `cached plan must not change result
+type` with the routine field pgjdbc's transparent re-prepare matches on
+— its 1056-variant AutoRollbackTest matrix now passes in full. Around
+them: dollar-quoted strings and nested block comments parse everywhere,
+`CREATE TABLE AS SELECT` works, `now()` is transaction-stable,
+LISTEN/NOTIFY pushes to idle connections asynchronously, and per-session
+temp-table namespacing matches PG's `pg_temp_<n>` scheme.
+
+On the MongoDB side, the default `getMore` batch now fills mongod's 16MB
+envelope instead of stopping at 101 documents — a large cursor drain
+that took dozens of round trips now takes one — and retryable writes
+are idempotent across reconnects on both servers, with `failGetMore`
+carrying the resumable-error label change streams expect.
+
+### Prepared statements revalidate their cached plan, like Postgres
+
+A named server-prepared statement whose result shape changed under DDL
+(a `SELECT *` after `ALTER TABLE ADD COLUMN`) now raises PostgreSQL's
+`cached plan must not change result type` (0A000) instead of silently
+re-planning — and it raises at planning time, before any side effect, so
+a data-modifying CTE's INSERT does not run. The ErrorResponse carries
+`ROUTINE=RevalidateCachedQuery`, which is the field (not the SQLSTATE)
+pgjdbc's transparent re-prepare-and-retry matches on; without it every
+recoverable case surfaced the raw error. Unnamed statements re-plan per
+Bind and never raise, matching PG. pgjdbc's AutoRollbackTest — the
+1056-variant autosave × DDL × transaction matrix — now passes in full.
+
+#### Fixed
+- Named prepared statements: result-shape changes under DDL raise 0A000
+  with the RevalidateCachedQuery routine field, before side effects;
+  first execution captures the plan identity; unnamed statements are
+  exempt.
+
+### Query cancellation: the wire CancelRequest is honoured
+
+The PostgreSQL cancel sub-protocol — a client opens a fresh connection
+and sends the (pid, secret) pair from BackendKeyData to cancel the query
+running on its main connection — was parsed and silently dropped, and
+`pg_sleep` ran as an uninterruptible `time.sleep`. Drivers lean on this
+machinery for statement timeouts and context cancellation: pgx sends a
+CancelRequest whenever a context is cancelled mid-query.
+
+CancelRequest now fires the target session's cancel event (after
+verifying the secret), and cancellation points observe it and raise PG's
+`57014 canceling statement due to user request` while the connection
+stays fully usable — cancel is not terminate. `pg_sleep` is such a point
+in every context (FROM-less and per-row), `pg_cancel_backend` now
+cancels instead of closing the target's connection (matching real PG;
+`pg_terminate_backend` still closes), and a cancel that lands while the
+session is idle is discarded, like real PG. In support of pgx's
+liveness-poll shape, `pg_stat_activity` now reports an
+extended-protocol statement's original text with `$1` placeholders
+intact — the bound render inlined parameter values, which both leaked
+them and made a `query like $1` poll match its own row.
+
+#### Fixed
+
+- `sql/pgserver.py` / `sql/session.py`: CancelRequest verifies the
+  BackendKeyData secret and fires the target session's cancel event;
+  stale cancels are discarded at the next statement's start.
+- `sql/functions.py` / `sql/scalar.py`: `pg_sleep` waits interruptibly
+  and raises 57014 on cancel, in FROM-less and per-row contexts alike
+  (per-row numeric arguments arrive as Decimal128 and are now coerced);
+  `pg_cancel_backend` cancels the target's running query without closing
+  its connection.
+- `sql/pgextended.py`: `pg_stat_activity.query` shows the prepared
+  statement's original text (placeholders intact), not the
+  parameter-inlined render.
+
+### The legacy COPY ... BINARY keyword selects the binary format
+
+`COPY t FROM STDIN BINARY` — the pre-9.0 bare-keyword spelling that pgx
+still emits — parses as a value-less COPY parameter, which the option
+reader did not recognise. The format stayed "text", so the client's
+PGCOPY binary stream was fed to the text parser and rejected with
+`22021 invalid byte sequence for encoding "utf-8"`. The same applied to
+`COPY t TO STDOUT BINARY`.
+
+The bare `BINARY` keyword now selects the binary format on both COPY
+directions, riding the existing PGCOPY parse/encode machinery that the
+`WITH (FORMAT binary)` spelling already used.
+
+#### Fixed
+
+- `sql/engine.py`: `_copy_options` recognises the value-less `BINARY`
+  COPY parameter (legacy pre-9.0 syntax) as `FORMAT binary` for both
+  COPY FROM and COPY TO.
+
+### Stray COPY frames no longer poison the connection
+
+Drivers that stream COPY data concurrently with the command — pgx's
+`CopyFrom` pumps `CopyData` without waiting for the server's
+`CopyInResponse` — kept sending frames after the COPY command itself had
+already failed (a syntax error, a missing table). The wire server routed
+those stray frames into the extended-protocol dispatch, answered
+`08P01 unexpected message type 'd'`, and left the connection in a
+discard-until-Sync state that a simple-protocol client can never clear:
+one failed COPY wedged the connection for good.
+
+Real PostgreSQL accepts and silently discards `CopyData`, `CopyDone`,
+and `CopyFail` messages that arrive outside a COPY operation, exactly so
+that this optimistic-streaming pattern stays safe. The wire server now
+does the same, so a failed COPY reports its error and the connection
+remains fully usable — including an immediately following valid COPY.
+
+#### Fixed
+
+- `sql/pgserver.py`: `CopyData` / `CopyDone` / `CopyFail` frames arriving
+  outside a COPY operation are accepted and discarded, matching
+  PostgreSQL's `PostgresMain` behaviour, instead of raising `08P01` and
+  poisoning the extended-protocol state.
+
+### Change streams resume when the server says a getMore failed resumably
+
+Drivers decide whether to resume a change stream by looking for the
+`ResumableChangeStreamError` label on the error a `getMore` returns. mongod
+attaches that label from inside its change-stream machinery, which is why
+the drivers' own test suites reach for the `failGetMoreAfterCursorCheckout`
+failpoint to provoke one. SecantusDB's Python server ignored that failpoint
+entirely — the `getMore` simply succeeded, no error was raised, and no
+resume ever happened. The Rust server already handled it, so the two
+servers disagreed about whether a stream should recover.
+
+The distinction between the two failpoints is deliberate and is now pinned
+by tests: `failGetMoreAfterCursorCheckout` with a resumable code resumes the
+stream, while plain `failCommand` with the *same* code does not, because it
+short-circuits before the change-stream path and carries only the labels the
+failpoint itself named. Stamping the label unconditionally would silently
+swallow errors that callers expect to see.
+
+#### Fixed
+
+- The Python server honours `failGetMoreAfterCursorCheckout` and stamps
+  `ResumableChangeStreamError` on the sixteen error codes mongod treats as
+  resumable, matching the Rust server's table exactly. libmongoc's
+  `change-streams-resume-errorLabels` now passes.
+
+### `generate_series` accepts an untyped parameter as a bound
+
+`select generate_series(1, $1)` — with the parameter sent without a type OID,
+as clients routinely do — was rejected outright. Nothing upstream had coerced
+the value, because the wire never said what type it was, so the bound arrived
+as text and the function refused it as a non-numeric range. Real PostgreSQL
+infers the parameter's type from the argument position and reads it as an
+integer.
+
+The cost of this was out of all proportion to the gap. The pgx driver's test
+suite calls that exact query in a helper that runs at the end of 66 of its
+connection tests, to check the connection is still usable. Every one of those
+tests failed at the final step, regardless of what it was actually testing —
+which made a single missing coercion look like sixty-six unrelated bugs.
+
+#### Fixed
+
+- A numeric-looking text bound (or step) is parsed as a number, so
+  `generate_series` works with untyped parameters. Bounds that are genuinely
+  not numbers still raise, and `numeric` bounds are now accepted alongside
+  int and float. The pgx `pgconn` package goes from 86 failures to 29.
+
+### A full scan now drains in two round trips, like mongod
+
+MongoDB's 101-document cursor default applies only to a query's first
+batch — a `getMore` with no `batchSize` fills its reply with as many
+documents as fit in 16MB. Both servers were reusing the 101-document
+default on every `getMore`, so draining a collection cost one round
+trip per 101 documents; a 10,000-document full scan paid ~100 round
+trips where mongod pays two. That round-trip tax was the entirety of
+the benchmark's remaining full-scan gap to mongod: with the corrected
+default the Rust server's `find` full scan lands at parity with
+mongod on the same box.
+
+Both servers now fill an unspecified `getMore` batch up to mongod's
+16MB budget (always at least one document, so a drain makes
+progress), and an explicit `batchSize` is byte-capped the same way —
+a batch stops before the document that would push the reply past
+16MB, and the cursor stays open for the remainder. Tailable
+change-stream cursors keep the small incremental default.
+
+#### Fixed
+
+- `getMore` without `batchSize` returned 101 documents per batch on
+  both servers instead of filling the reply to mongod's 16MB budget —
+  a full collection scan paid `count / 101` wire round trips instead
+  of ~2. (`crates/secantus-commands/src/cursors.rs`,
+  `src/secantus/commands.py::_get_more`)
+- A `getMore` with an explicit `batchSize` could assemble a reply of
+  unbounded size; batches are now capped at 16MB of documents with
+  the cursor kept open for the remainder, matching mongod.
+
+### INSERT rows can fill a column prefix, like Postgres
+
+`INSERT INTO t VALUES (1, 2)` into a three-column table is legal
+PostgreSQL — the row fills a prefix of the columns and the rest take
+their defaults. The SQL server required an exact arity match, which broke
+pgjdbc's rewritten batch inserts (`reWriteBatchedInserts=true` collapses a
+repeated INSERT into one multi-VALUES statement without a column list)
+and several JDBC tests that insert partial rows. Too many expressions is
+still an error, and an explicit column list still requires an exact
+match, both with PostgreSQL's wording. pgjdbc's
+BatchedInsertReWriteEnabledTest (60) and TimeTest now pass in full.
+
+#### Fixed
+- A VALUES row shorter than the table's column list (no explicit column
+  list) fills the leading columns; remaining columns take DEFAULT/NULL.
+
+### Dollar quotes, nested comments, CTAS, stable now(), and the JDBC escape functions
+
+A grab-bag of SQL-surface fixes driven by pgjdbc's StatementTest and
+PreparedStatementTest. Dollar-quoted string literals now work in any
+expression position — including digit-bearing tags (`$A0$`) and
+tag-vs-content ambiguity (`$B$;$b$B$`) — and nested block comments
+(`/* /* */ */`, which PostgreSQL nests) parse correctly. With
+`standard_conforming_strings = off`, plain string literals honour
+backslash escapes exactly like `E''` strings.
+
+`now()` and `CURRENT_TIMESTAMP` are now transaction-stable: every call
+in a statement (and across an explicit transaction block) returns the
+same instant, as in PostgreSQL — so interval round-trips like
+`extract(second from ((interval '3s' + now()) - now()))` are exact.
+`CREATE [TEMP] TABLE … AS SELECT` ships with PG's `SELECT <n>` command
+tag, and `TRUNCATE` resolves schema-qualified and session-temp table
+names. The scalar-function surface behind JDBC's `{fn …}` escapes is
+complete: the trig family (`acos` through `atan2`, hyperbolics, degree
+variants), `replace`, numeric-aware `power` and `trunc(x, n)`, and
+`to_char`'s word tokens (`Day` / `Dy` / `Month` / `Mon`).
+
+#### Added
+- Dollar-quoted string literals (`$$…$$`, `$tag$…$tag$`) in expressions.
+- `CREATE [TEMP] TABLE … AS SELECT` (CTAS) with `IF NOT EXISTS`.
+- Trig/hyperbolic scalar functions, `atan2`, `cot`, degree variants,
+  `replace(text, from, to)`.
+- `standard_conforming_strings = off` backslash-escape semantics.
+
+#### Fixed
+- Nested block comments mis-tokenized into stray operators.
+- `now()` / `CURRENT_TIMESTAMP` drifted between calls in one statement.
+- `power` / `trunc` raised TypeError on numeric-vs-double operand mixes.
+- `TRUNCATE` dropped the schema qualifier, missing temp and
+  schema-qualified tables.
+- `to_char` rendered `'Day'` as `'5ay'` (the `D` token matched first).
+
+### Plain json columns render compact, jsonb keeps its canonical spacing
+
+PostgreSQL treats `json` and `jsonb` output differently: a `json` value's
+text is preserved verbatim from input, while `jsonb` re-renders in its
+canonical spaced form (`{"a": 1, "b": 2}`). SecantusDB rendered both from
+the parsed stored value with jsonb's spacing, so a client that inserted
+compact JSON into a `json` column — which is what every machine-serialized
+payload looks like — got visibly different bytes back from `SELECT` and
+`COPY TO`.
+
+A plain `json` (oid 114) column now renders compact (`{"abc":"def"}`)
+across the simple protocol, the extended protocol (text and binary
+formats), and both COPY TO forms, reproducing typical input byte-for-byte;
+`jsonb` keeps PG's canonical spacing. Full verbatim text preservation is
+deliberately out of scope: the parsed-subdocument storage shape is what
+lets json-path filters push down to indexed storage lookups, so a
+hand-spaced `json` literal still re-renders normalised.
+
+#### Fixed
+
+- `sql/typemap.py` / `sql/pgserver.py` / `sql/pgextended.py` /
+  `sql/engine.py`: plain `json` (oid 114) result columns render compact in
+  DataRows (text + binary), `COPY table TO STDOUT`, and
+  `COPY (SELECT …) TO STDOUT`; jsonb rendering is unchanged.
+
+### The notification-push check stays off the hot path
+
+The async LISTEN/NOTIFY push decides per message read whether a session
+is a listener. That check took the server-wide notify-hub lock and
+scanned the channel registry — on every message, on every connection, a
+shared lock on the whole server's hottest path. It now reads a
+per-session counter maintained by the hub at LISTEN / UNLISTEN time: a
+plain attribute read, no lock, no scan.
+
+#### Changed
+
+- `sql/pgnotify.py` / `sql/session.py`: `is_listening` reads
+  `Session.listen_count` (maintained under the hub lock by
+  `listen` / `unlisten` / `unlisten_all`) instead of locking and
+  scanning the channel registry per message read.
+
+### 65535-parameter statements work; the 1 MB statement cap was too small
+
+The parser guarded against oversized statements with a 1 MB length cap
+(a parse-cost DoS guardrail). The premise — "1 MB is far above any real
+query" — turned out to be false: a statement using the extended
+protocol's full 65535 parameters (`values ($1::text), … ($65535::text)`,
+the shape pgx's max-parameter tests exercise) is ~1.04 MB of SQL, and
+real PostgreSQL accepts statements up to its 1 GB message limit. The cap
+now stands at 16 MB — the same ceiling as the MongoDB document size —
+which keeps parse cost bounded while accepting every legitimate shape.
+
+`ParameterDescription` also now wraps its int16 parameter count for
+65536-and-up parameters exactly like real PG does (`pq_sendint16`),
+instead of crashing the encoder: preparing a 65536-parameter statement
+succeeds server-side, with the client responsible for the
+65535-parameter execution limit, matching PostgreSQL's behaviour.
+
+#### Fixed
+
+- `sql/planner.py`: `MAX_SQL_LENGTH` raised 1 MB → 16 MB.
+- `sql/pgwire.py`: `parameter_description` wraps the int16 count for
+  ≥65536 parameters instead of raising `struct.error`.
+
+### Notifications reach idle connections without waiting for a query
+
+LISTEN/NOTIFY delivery was piggybacked on the query cycle: a queued
+notification was written to the listener's socket only when that
+connection next issued a command. A client that just blocks reading the
+socket — pgx's `WaitForNotification`, psycopg's `notifies()` — waited
+forever, because real PostgreSQL pushes notifications to idle
+connections asynchronously.
+
+Listening sessions now wait for their next command in short slices and
+flush queued notifications between them, from the connection's own
+thread so socket writes stay serialized. Sessions with no LISTENs — the
+overwhelming default — keep the pure blocking read, so there is no
+busy-wake cost for ordinary connections, and the
+idle-in-transaction-session-timeout deadline is preserved across the
+poll slices.
+
+#### Fixed
+
+- `sql/pgserver.py`: the idle read loop pushes queued notifications to
+  listening sessions (~250 ms delivery latency) instead of holding them
+  until the next query cycle.
+- `sql/pgnotify.py`: `NotifyHub.is_listening` — the poll applies only to
+  sessions with at least one active LISTEN.
+
+### Garbage SQL fails at parse time, and multi-statement errors stream partial results
+
+sqlglot is a permissive parser: it reads `bad` as a column reference and
+`SYNTAX ERROR` as an aliased expression, so preparing or executing a
+non-statement quietly "succeeded" where real PostgreSQL raises a syntax
+error. A bare expression at the top level is now rejected at parse time
+with PG's `42601 syntax error at or near "..."` across every entry point
+— simple protocol, extended-protocol Parse, and pipelined Parse.
+
+A multi-statement simple query (`select 1; select 1/0; select 2`) also
+now matches PG's streaming shape: the completed statements' results are
+delivered before the ErrorResponse, and the statements after the error
+never run. Previously a mid-batch error discarded the already-computed
+results, so the client saw only the error.
+
+#### Fixed
+
+- `sql/engine.py`: top-level bare expressions raise `42601`; the
+  expression-shaped commands sqlglot mis-parses the same way (`CLOSE`,
+  `DISCARD`, `DEALLOCATE`) are exempted and keep working.
+- `sql/pgextended.py`: the extended protocol's Parse applies the same
+  check, so Prepare and pipelined SendPrepare error at parse time like
+  real PG.
+- `sql/engine.py` / `sql/pgserver.py`: a mid-batch `SQLError` carries the
+  completed statements' results, and the wire layer renders them before
+  the ErrorResponse, like real PG.
+
+### pg_type grows real array-type rows
+
+Every type that advertises a `typarray` now has the paired array-type row
+in `pg_catalog.pg_type` — `_int4` with `typelem = 23` and friends, for
+built-ins, enums, domains, composites and table row types — where before
+the advertised oid resolved to nothing. The `typelem` column exists at
+all now, `'pg_catalog.array_in'::regproc` strips the schema the way
+PostgreSQL renders search-path-visible functions (so pgjdbc's standard
+is-array probe matches), and `pg_class` carries a `relacl` column (null,
+single-user server). pgjdbc's EnumTest enum-array resolution now works;
+psycopg's `TypeInfo.fetch` finds array types by oid.
+
+#### Added
+- Array-type rows in `pg_type` (typname `_<elem>`, `typelem`,
+  `typinput = array_in`) for every type with a `typarray`.
+- `pg_type.typelem`, `pg_class.relacl` columns; `::regproc` casts.
+
+### The pgjdbc weekly lane's red now means something
+
+The weekly pgjdbc gauge returned gradle's raw exit code, and gradle exits
+non-zero while any test fails — so with ~200 documented standing failures
+the lane was red by construction and its conclusion carried no signal. The
+lane now compares the run's failures against a committed baseline
+(`pgjdbc_validation/baseline.json`, seeded from the latest weekly run) and
+fails only on regression: a failing test the baseline doesn't list, or a
+parameterized test failing more times than recorded. Runs with fewer
+failures stay green and print the newly-passing entries so the baseline can
+be tightened (`python -m pgjdbc_validation.baseline --update`).
+
+#### Changed
+- `pgjdbc_validation/runner.py` exits by baseline comparison, not gradle's
+  raw code; a gradle failure that produced no test results at all is still
+  a hard failure, and a truncated run still refuses a verdict (124).
+
+#### Added
+- `pgjdbc_validation/baseline.py` (compare / verdict / `--update` CLI) and
+  the committed `baseline.json` (204 standing failures, 2026-08-11 weekly).
+
+### Pipelined statements run in one implicit transaction, like Postgres
+
+Statements a client pipelines before a single Sync now run in ONE
+implicit transaction, exactly as PostgreSQL treats them: a mid-pipeline
+error rolls back the earlier statements' effects, a clean Sync commits
+them, and an explicit BEGIN inside the pipeline takes the transaction
+over. pgjdbc's batch semantics depend on this — a failed batch must not
+leave its earlier inserts behind — and its 184-variant BatchFailureTest
+and 140-variant BatchExecuteTest both now pass in full. The first
+statement of a pipeline retries internally on write-write races, so
+single-statement autocommit behaves exactly as before.
+
+Two describe/planner gaps closed alongside: SELECTs joining derived
+VALUES tables (no real table anywhere) now Describe their shape instead
+of answering NoData before emitting rows (a protocol violation pgjdbc
+rejects), and CrystalReports' `{oj ((( … )))}` grouping-paren join
+chains plan correctly. pgjdbc's OuterJoinSyntaxTest passes in full.
+
+#### Fixed
+- Extended protocol: implicit transaction from first pipelined statement
+  to Sync (commit / rollback-on-error at Sync; BEGIN takeover;
+  transaction-control and VACUUM-class statements exempt).
+- Describe over joins of derived VALUES tables returns the row shape.
+- Grouping parens around join chains unwrap through multiple layers, and
+  an aliased VALUES parsed as a Table-wrapped node normalizes.
+
+- A mixed-mode lost-update race the implicit transaction exposed: a
+  pipeline's Sync-commit could land inside a bare autocommit computed
+  update's read-compute-write window and be silently overwritten (every
+  statement still reported `UPDATE 1`). Computed updates outside a
+  transaction block now run their whole read-compute-write as one
+  storage snapshot transaction, so a mid-window commit surfaces as a
+  write conflict and the statement retries from a fresh read. Pinned by
+  a deterministic regression test.
+
+#### Changed
+- The feature is ON by default (`SECANTUS_PIPELINE_TXN=0` is an escape
+  hatch).
+
+### A retried write no longer applies twice
+
+Every official MongoDB driver retries a failed write automatically, resending
+it with the same session id and transaction number after a network blip or a
+write-concern error. Real MongoDB remembers that it already ran the statement
+and hands back the original answer. SecantusDB did not: it ran the write a
+second time.
+
+For an insert this was noisy — the retry collided with its own first attempt
+and raised a duplicate-key error. For anything non-idempotent it was silent
+and much worse. A retried `{$inc: {n: 1}}` incremented twice, a retried
+`$push` appended twice, and in both cases the client was told exactly one
+document had been modified. Nothing surfaced an error; the data was simply
+wrong.
+
+The Python server now keeps a record of each completed retryable write and
+replays it when the same write arrives again. Only writes that fully took
+effect are recorded — a failed one must genuinely re-run, or a momentary
+error would become a permanent one.
+
+#### Fixed
+
+- Retryable writes are idempotent on the Python server: `insert`, `update`,
+  `delete` and `findAndModify` carrying a session's transaction number are
+  executed once, and a retry replays the original reply.
+
+#### Known limitations
+
+- The **Rust server still applies retried writes twice**; the same fix has yet
+  to be ported. See `tasks/backlog.md` §5.
+- Records are whole-command, not per-statement, so a partially-failed batch
+  re-runs in full rather than retrying only its missing documents.
+- Records expire after 30 minutes, matching MongoDB's own sweep.
+
+### Rust server: renaming a huge collection can no longer wedge the engine
+
+`renameCollection` re-keyed every row in one WiredTiger statement
+transaction — the same unbounded-dirty-content livelock class as the
+(already fixed) one-transaction drop purge, and the last DDL path that
+could wedge the engine on a collection larger than the cache's dirty
+budget. The rename is now a chunked two-phase move that reuses the drop
+tombstones: tombstone the destination, copy the rows across in bounded
+transactions (fresh RecordIds preserving insertion order, index entries
+and unique claims rebuilt per batch), then one small switch transaction
+registers the destination, unregisters the source, moves the tombstone,
+and emits the rename oplog entry, and the source's rows purge in bounded
+batches. Both crash windows recover through the existing open-time
+tombstone recovery — on either server — as a plain drop: a crash
+mid-copy purges the partial destination (the rename never happened); a
+crash after the switch purges the leftover source (it did). A
+deterministic regression test renames a collection larger than a small
+cache — the shape that previously spun forever.
+
+#### Fixed
+- Rust server: `renameCollection` of a collection larger than the WT
+  cache's dirty budget livelocked the engine (one unbounded re-key
+  transaction + unbounded write-conflict retry); now a chunked two-phase
+  move with crash-safe tombstone recovery. Inside a user transaction the
+  atomic single-transaction path remains, bounded by the transaction
+  dirty-budget guard. The batched copy also drops the old whole-collection
+  in-memory materialization.
+
+### The Rust server stops applying retried writes twice
+
+The Python server learned to recognise a retried write; the Rust server had
+not, so the two disagreed about something as basic as whether a write
+happened once or twice. A driver that retried after a network blip — which
+every official driver does automatically — would silently double a
+`$inc` against the Rust server while the Python server handled it correctly.
+
+Both servers now keep the same record and apply the same rules, so a retry
+replays the original reply rather than re-running the write.
+
+#### Fixed
+
+- Retryable writes are idempotent on the Rust server, matching the Python
+  server: `insert`, `update`, `delete` and `findAndModify` carrying a
+  session's transaction number execute once, and a retry replays the stored
+  reply. Verified over the wire against a release build — a retried `$inc`
+  leaves 1 where it previously left 2.
+
+### Concurrent sessions get their own temp-table namespaces
+
+Postgres gives every backend a private `pg_temp_<n>` schema, so two open
+connections can each `CREATE TEMPORARY TABLE bar` without colliding.
+SecantusDB's SQL server shared one namespace: the second concurrent create
+failed with `42P07 relation "bar" already exists`, a real divergence that
+connection-pooled applications and driver test suites hit immediately.
+
+Each session now allocates its own `pg_temp_<n>` namespace the first time it
+creates a temp table. Unqualified names resolve against the session's temp
+namespace ahead of `public` — so a temp table shadows a permanent one of the
+same name, exactly like real Postgres — and an explicit `pg_temp.<name>`
+qualifier resolves to the session's own namespace (`CREATE TABLE pg_temp.t`
+creates a temp table, and `CREATE TEMP TABLE` aimed at any other schema is
+rejected with `42P16`). COPY and extended-protocol Describe resolve through
+the same path, temp-table SERIAL sequences are per-session too, and
+`pg_class` / `information_schema.tables` report the bare relation name under
+its session's temp schema.
+
+#### Fixed
+
+- `sql/session.py`: per-session `pg_temp_<n>` namespace, allocated lazily on
+  first temp-table creation (pid-seeded so a crashed process's stale entries
+  can't collide with a new one's).
+- `sql/planner.py`: `qualify_from_search_path` resolves the session temp
+  namespace first (unless `pg_temp` is placed explicitly on `search_path`),
+  rewrites `pg_temp.<name>` to the session's namespace, and
+  `qualify_temp_create_target` homes `CREATE TEMP TABLE` targets there;
+  `pg_table_is_visible` lowers against bare relnames.
+- `sql/engine.py`: `copy_plan` and extended-protocol Describe apply the same
+  search-path / temp-namespace resolution as execution.
+- `sql/executor.py`: duplicate temp-table errors name the bare relation
+  (`relation "bar" already exists`); error diagnostics report the session's
+  actual `pg_temp_<n>` schema.
+
+### Read and write concerns inside a transaction are refused, not ignored
+
+A transaction's concerns are settled when it begins: its read concern rides
+the statement that starts it, and its write concern belongs to the commit.
+Attaching either to a statement in the middle is meaningless, and real
+MongoDB says so with an `InvalidOptions` error. SecantusDB accepted them and
+quietly did nothing, so a caller could believe a statement had run at a
+durability or isolation level it never had.
+
+Drivers already refuse this on the client side, which is why no driver test
+suite ever caught it. It surfaces for anyone issuing raw commands — the one
+audience with no other way to tell us apart from a real server.
+
+#### Fixed
+
+- A `writeConcern` on an in-transaction statement is rejected with
+  `InvalidOptions` (72) on both servers, matching MongoDB's wording.
+- A `readConcern` on a statement that continues (rather than starts) a
+  transaction is likewise rejected. The starting statement may still carry
+  one, since that is how a transaction's read concern is chosen.
+
+### JDBC clients get their real time zone
+
+A pgjdbc connection tells the server its JVM time zone through a `TimeZone`
+**startup parameter** — and the PG server dropped it, leaving every JDBC
+session on UTC. For clients west of Greenwich that shifted date reads back a
+day (`1950-02-07` came back `1950-02-06`). Startup GUC parameters are now
+applied and echoed in the opening ParameterStatus burst, the way PostgreSQL
+treats them.
+
+Four smaller conformance gaps closed with it: `SET timezone = 'gmt-3'` now
+reports the normalized `GMT-3` spelling (pgjdbc's ParameterStatus parser is
+case-sensitive and silently fell back to UTC on the lowercase echo);
+POSIX-style zone specs accept minutes (`GMT+3:30` is UTC-03:30, pgjdbc's
+half-hour-zone test); `tstz::text` casts render the session-zone offset and
+`tz::text` renders PostgreSQL's `+01` spelling; and a BC-era timestamptz
+literal without an offset is stamped with the session zone's offset so the
+stored instant is correct. pgjdbc's TimezoneTest is now **16/16** and
+DateTest **192/192** — and this time measured with a fixed tally (the
+release-note claim that DateTest was already clear traced to an XML-parsing
+bug in the measurement script, not the server).
+
+#### Fixed
+- `TimeZone` (and other reportable GUCs) sent as startup parameters are
+  applied to the session and reported in the initial ParameterStatus burst.
+- `TimeZone` values normalize to PostgreSQL's reported spelling
+  (`gmt-3` → `GMT-3`).
+- POSIX GMT/UTC offsets accept minutes and seconds (`GMT+3:30`).
+- `timestamptz::text` renders the session-zone offset; `timetz::text`
+  renders whole-hour offsets as `+01`.
+- An out-of-range (BC) timestamptz literal without an offset takes the
+  session zone's offset instead of UTC.
+
+### SELECT * over a USING join merges the join column, like Postgres
+
+`SELECT * FROM a JOIN b USING (k)` now returns `k` once — from the left
+side (the right for RIGHT joins, `COALESCE` for FULL) — followed by each
+source's remaining columns, exactly as PostgreSQL expands it. Previously
+the star emitted the column once per side, a long-pinned divergence. The
+fix is one AST rewrite before the USING-to-ON desugar, not a change to
+every star-expansion path. `tbl.*` items over joins also work now (they
+previously crashed with `column "*" does not exist`), and — matching
+Postgres — `tbl.*` does NOT merge; only the bare `*` does.
+
+#### Fixed
+- Bare `*` over `USING` joins merges the join columns (left / right /
+  coalesce per join side; chained USING joins in the all-inner case).
+- `tbl.*` in a join select expands to the table's columns instead of
+  crashing.
+
+### `validationLevel` finally does something
+
+A collection can tell the server how strictly to apply its validator, and
+SecantusDB recorded the answer and then ignored it. `validationLevel: "off"`
+— an explicit request for no validation at all — still had every write
+checked. `"moderate"` behaved like `"strict"`, which defeats the reason the
+level exists: it lets you attach a validator to a collection that already
+holds rows predating it, without freezing those rows. Under our behaviour
+those legacy documents became un-updatable.
+
+Both levels now work, on both servers. `off` disables validation outright.
+`moderate` exempts a document that ALREADY failed the validator from
+update-time checks, while a document that currently satisfies it is still
+held to it — so an update can no longer turn a valid document invalid, and
+inserts are validated as before.
+
+#### Fixed
+
+- `validationLevel: "off"` disables document validation on the Python and
+  Rust servers.
+- `validationLevel: "moderate"` exempts already-invalid documents from
+  update-time validation on both servers, on the single-document and
+  multi-document update paths and through `findAndModify`.
+
 ## [0.6.0b10] — 2026-08-13
 
 ### Large objects over Fastpath, a drop that can't wedge the engine, and TCP_NODELAY everywhere

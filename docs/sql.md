@@ -1368,6 +1368,14 @@ COMMENT ON COLUMN users.email IS 'primary contact address';
 COMMENT ON COLUMN users.email IS NULL;   -- remove the comment
 ```
 
+### `CREATE TABLE AS` (CTAS)
+
+`CREATE [TEMP] TABLE name AS SELECT ...` runs the query once, creates the
+table with the result's inferred column names and types, and inserts the
+rows, reporting PG's `SELECT <n>` command tag (which drivers surface as the
+update count). `IF NOT EXISTS` skips both the create and the query's
+side effects when the table already exists.
+
 ## Views (`CREATE VIEW`)
 
 A view is a stored `SELECT` that reads like the table it stands for. `CREATE
@@ -2978,10 +2986,25 @@ promptly; a listener that goes completely silent won't observe them until its
 next round-trip.
 
 **Simplifications:** duplicate `(channel, payload)` notifications within one
-transaction are not collapsed (Postgres collapses them); `LISTEN` / `UNLISTEN`
-take effect immediately rather than at commit; and there is no out-of-band push
-to a fully-idle connection (notifications are attached to the next query
-response, not delivered asynchronously mid-idle).
+transaction are not collapsed (Postgres collapses them), and `LISTEN` /
+`UNLISTEN` take effect immediately rather than at commit. Idle connections
+receive notifications asynchronously, like real PG: a listener blocked in
+`psycopg`'s `connection.notifies()` (or any driver waiting on the socket)
+wakes when another connection commits a `NOTIFY`, with no query needed.
+
+## Query cancellation
+
+The wire cancel sub-protocol is honoured. A client opens a fresh connection
+and sends a CancelRequest carrying the `(pid, secret)` pair from its main
+connection's BackendKeyData; the server verifies the secret and interrupts
+that session's running statement with PostgreSQL's `57014 canceling
+statement due to user request`. The cancelled connection stays fully usable
+— cancel is not terminate. This is the machinery JDBC's
+`Statement.setQueryTimeout`, psycopg's `Connection.cancel()`, and pgx's
+context cancellation drive. `pg_cancel_backend(pid)` cancels the target's
+running query the same way (`pg_terminate_backend` still closes the
+connection), and a cancel that arrives while the session is idle is
+discarded, as in real PG.
 
 ## Prepared statements (`PREPARE` / `EXECUTE` / `DEALLOCATE`)
 
