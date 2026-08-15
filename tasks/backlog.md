@@ -2477,10 +2477,18 @@ threading into `wt_config`.)
 
 ### pgx gauge — `pgconn` findings and next steps (2026-08-14)
 
-**Where it stands: `pgconn` is at 4 failures** (of 216 tests; 12 measured
-2026-08-15 at `b8b1b171`, −4 statement-cap fix, −3 parse/exec error shapes,
-−1 async notification push, each verified individually; re-run the whole
-package for the next full count): 86 → 29 after the `generate_series`
+**Where it stands: `pgconn` is at 4 stable failures** (of 216 tests;
+full-package re-run measured 2026-08-15 at `f2891c28`, three runs). The
+chain: 86 → 29 (#862) → 23 (#866) → 20 (#868) → 18 (#869) → 17 (#870) →
+12 (#871, measured) → 8 (#873) → 5 (#876) → 4 (#877). One additional test,
+`TestDeadlineContextWatcherHandler`, is LOAD-SENSITIVE, not broken: its
+"DeadlineExceeded with DeadlineDelay" subtest gives a 250 ms pg_sleep a
+600 ms total budget, passes 5/5 isolated against the same daemon, and
+misses the margin only under the full package's 16-way parallel load on a
+busy interactive desktop (WindowServer pinned during the runs; a leaked
+debug process was also found and killed mid-measurement — see
+orphaned-process caveats). Re-measure on a quiet machine before treating
+it as a server defect. The stable four: 86 → 29 after the `generate_series`
 untyped-bound fix (#862), 29 → 23 after per-session temp-table namespacing
 (#866), 23 → 20 after the stray-CopyData drain fix (#868), 20 → 18 after
 plain-json compact rendering (#869), 18 → 17 after the legacy bare
@@ -2501,73 +2509,28 @@ the reusable part: in this gauge, a shared test helper can make one gap look
 like a whole subsystem. Read the actual failure text before believing the
 test names.**
 
-**The remaining 12 (full-package re-run, 2026-08-15) cluster into:**
+**The four stable failures** (fixed clusters deleted per the
+delete-when-fixed rule — the narratives live in `docs/changelog.md` and the
+PR trail #866/#868/#869/#870/#871/#873/#876/#877):
 
-* **COPY residuals (2)** — the temp-table mode is gone. Fixed so far: the
-  stray-frame cluster (`TestConnCopyFromQuerySyntaxError` /
-  `...QueryNoTableError` / `...DataWriteAfterErrorAndReturn`, `08P01
-  unexpected message type 'd'`) — the wire server now accepts and discards
-  CopyData / CopyDone / CopyFail arriving outside a COPY operation, like
-  real PG's PostgresMain (#868); `TestConnCopyToSmall` / `...Large` — a
-  plain ``json`` (oid 114) column now renders compact (`{"abc":"def"}`),
-  while jsonb keeps PG's canonical spacing (#869; full verbatim ``json``
-  text preservation deliberately NOT implemented — the parsed-subdocument
-  storage shape is what lets `col->>'k'` filters push down as dotted-path
-  Mongo filters, so a hand-spaced json literal still re-renders normalised);
-  and `TestConnCopyFromBinary` — the legacy bare-keyword `COPY t FROM STDIN
-  BINARY` spelling (a value-less COPY parameter sqlglot parses but
-  `_copy_options` ignored) now selects the binary format on both COPY
-  directions instead of feeding the PGCOPY stream to the text decoder
-  (`22021`).
-  - `TestConnCopyFromNoticeResponseReceivedMidStream`: NOT a COPY bug —
-    fails at setup on `create function ... returns trigger ... language
-    plpgsql` + `CREATE TRIGGER` (`0A000 command CREATE is not supported`,
-    verified 2026-08-14); needs trigger + `tsvector`/`to_tsvector` support.
-* **Cancel-request handling — FIXED.** The wire CancelRequest sub-protocol
-  is honoured (secret verified against BackendKeyData, target session's
-  cancel event fired; `pg_sleep` is an interruptible cancellation point in
-  every context; `pg_cancel_backend` cancels without closing; idle cancels
-  discarded like real PG). `pg_stat_activity` now shows an
-  extended-protocol statement's ORIGINAL text with `$1` placeholders —
-  the bound render made pgx's `query like $1` liveness poll match its own
-  row forever, which was the last piece of
-  `TestConnContextCanceledCancelsRunningQueryOnServer`. All four cancel
-  tests verified passing: `TestCancelRequestContextWatcherHandler` (incl.
-  the `Stress_N` subtests), `TestConnCancelRequest`,
-  `TestConnContextCanceledCancelsRunningQueryOnServer`,
-  `TestConnCopyToCanceled`.
-* **Statement-length cap — FIXED.** `TestConnExecParamsMaxNumberOfParams` /
-  `...PreparedMaxNumberOfParams` / `...PreparedTooManyParams` /
-  `TestConnLargeResponseWhileWritingDoesNotDeadlock` all failed on OUR OWN
-  guardrail: `54000 statement too long: … exceeds the 1000000-byte limit`.
-  The 65535-parameter shape is ~1.04 MB of legitimate SQL; `MAX_SQL_LENGTH`
-  is now 16 MB (parse ~2 s/MB keeps the DoS bound real) and
-  `parameter_description` wraps its int16 count for ≥65536 params like PG's
-  `pq_sendint16`. All four verified passing.
-* **Parse/exec error shapes — FIXED.** `TestConnPrepareSyntaxError` /
-  `TestPipelinePrepareError` (sqlglot parsed `SYNTAX ERROR` / `bad` as bare
-  expressions; a top-level non-statement now raises 42601) and
-  `TestConnExecMultipleQueriesError` (a mid-batch error now streams the
-  completed statements' results before the ErrorResponse, like real PG).
-  All three verified passing. NOTE the txn divergence stays: a real PG
-  multi-statement simple query is ONE implicit transaction (the error
-  rolls back earlier statements' writes); ours runs per-statement
-  autocommit, so earlier writes survive. No gauge test observes it yet.
-* **Async notification push — FIXED.** `TestConnWaitForNotification`
-  timed out because LISTEN/NOTIFY delivery was piggybacked on the query
-  cycle; a client that just blocks reading (pgx `WaitForNotification`,
-  psycopg `notifies()`) never got the payload. Listening sessions now
-  wait in ~250 ms slices and flush queued notifications from their own
-  thread; non-listeners keep the pure blocking read (no busy-wake), and
-  the idle-in-txn deadline survives the slices. Verified passing.
-* **Assorted (3)** — `TestConnExecStatementNetworkUsage` (byte-exact
-  reply-size assertions: ours is 409/157 bytes vs PG's 391/153 — needs a
-  message-level diff of the Describe/Execute replies),
-  `TestConnectProtocolVersion32` (client asks for protocol 3.2; needs
-  NegotiateProtocolVersion),
-  `TestConnectWithValidateConnectTargetSessionAttrsReadWrite`.
-  (`TestConnExecBatchImplicitTransaction` passes as of the 2026-08-15
-  re-run.)
+* `TestConnCopyFromNoticeResponseReceivedMidStream` — NOT a COPY bug: fails
+  at setup on `create function ... returns trigger ... language plpgsql` +
+  `CREATE TRIGGER` (`0A000 command CREATE is not supported`); needs trigger
+  + `tsvector`/`to_tsvector` support. The largest remaining lift.
+* `TestConnExecStatementNetworkUsage` — byte-exact reply-size assertions:
+  ours is 409/157 bytes vs PG's 391/153; needs a message-level diff of the
+  Describe/Execute replies (RowDescription typmod/table-oid details are the
+  likely delta).
+* `TestConnectProtocolVersion32` — the client requests wire protocol 3.2;
+  needs `NegotiateProtocolVersion` support in the startup path.
+* `TestConnectWithValidateConnectTargetSessionAttrsReadWrite` — the
+  `target_session_attrs=read-write` probe shape; failure text is a bare
+  "expected not nil", needs the probe traced.
+
+Known divergence recorded while fixing the batch shape (#876): a real PG
+multi-statement simple query is ONE implicit transaction (an error rolls
+back earlier statements' writes); ours runs per-statement autocommit, so
+earlier writes survive. No gauge test observes it yet.
 
 #### Temp tables: concurrent namespacing FIXED and CONFIRMED as the cluster's cause
 
