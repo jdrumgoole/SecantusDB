@@ -934,7 +934,7 @@ def _validate_write_row(doc: dict[str, Any], table: Any, ctx: Any) -> None:
                 "23502",
                 f'null value in column "{col.name}" of relation "{table.name}" '
                 "violates not-null constraint",
-                diag={"s": _table_schema(table), "t": table.name, "c": col.name},
+                diag={"s": _table_schema(table), "t": _table_relname(table), "c": col.name},
             )
     if not table.check_constraints:
         return
@@ -949,7 +949,7 @@ def _validate_write_row(doc: dict[str, Any], table: Any, ctx: Any) -> None:
             raise errors.SQLError(
                 "23514",
                 f'new row for relation "{table.name}" violates check constraint "{ck.name}"',
-                diag={"s": _table_schema(table), "t": table.name, "n": ck.name},
+                diag={"s": _table_schema(table), "t": _table_relname(table), "n": ck.name},
             )
 
 
@@ -958,6 +958,15 @@ def _table_schema(table: Any) -> str:
         name = getattr(table, "name", "")
         return name.split(".", 1)[0] if name.startswith("pg_temp_") else "pg_temp_1"
     return "public"
+
+
+def _table_relname(table: Any) -> str:
+    """The bare relation name for error diagnostics — PG's TABLE NAME diag
+    field never carries a schema prefix (the schema rides in its own field),
+    and a temp table's catalog key does (``pg_temp_<n>.t``). psycopg's
+    test_diag_attr_values asserts exactly this split."""
+    name = getattr(table, "name", "")
+    return name.split(".", 1)[1] if "." in name else name
 
 
 def _validate_check_option(
