@@ -2476,8 +2476,9 @@ threading into `wt_config`.)
 
 ### pgx gauge — `pgconn` findings and next steps (2026-08-14)
 
-**Where it stands: `pgconn` is at 12 failures** (of 216 tests, full-package
-run measured 2026-08-15 at `b8b1b171`): 86 → 29 after the `generate_series`
+**Where it stands: `pgconn` is at 8 failures** (of 216 tests; 12 measured
+2026-08-15 at `b8b1b171`, then −4 from the statement-cap fix, verified
+individually): 86 → 29 after the `generate_series`
 untyped-bound fix (#862), 29 → 23 after per-session temp-table namespacing
 (#866), 23 → 20 after the stray-CopyData drain fix (#868), 20 → 18 after
 plain-json compact rendering (#869), 18 → 17 after the legacy bare
@@ -2533,15 +2534,23 @@ test names.**
   the `Stress_N` subtests), `TestConnCancelRequest`,
   `TestConnContextCanceledCancelsRunningQueryOnServer`,
   `TestConnCopyToCanceled`.
-* **Assorted (11)** — `TestConnExecParamsMaxNumberOfParams` /
-  `...PreparedMaxNumberOfParams` / `...PreparedTooManyParams`,
-  `TestConnPrepareSyntaxError`, `TestConnExecMultipleQueriesError`,
-  `TestConnExecStatementNetworkUsage`,
-  `TestConnLargeResponseWhileWritingDoesNotDeadlock`,
-  `TestConnWaitForNotification` (120 s timeout), `TestConnectProtocolVersion32`,
+* **Statement-length cap — FIXED.** `TestConnExecParamsMaxNumberOfParams` /
+  `...PreparedMaxNumberOfParams` / `...PreparedTooManyParams` /
+  `TestConnLargeResponseWhileWritingDoesNotDeadlock` all failed on OUR OWN
+  guardrail: `54000 statement too long: … exceeds the 1000000-byte limit`.
+  The 65535-parameter shape is ~1.04 MB of legitimate SQL; `MAX_SQL_LENGTH`
+  is now 16 MB (parse ~2 s/MB keeps the DoS bound real) and
+  `parameter_description` wraps its int16 count for ≥65536 params like PG's
+  `pq_sendint16`. All four verified passing.
+* **Assorted (7)** — `TestConnPrepareSyntaxError` (Parse of `SYNTAX ERROR`
+  is ACCEPTED — sqlglot parses it as an expression; must be 42601),
+  `TestConnExecMultipleQueriesError`, `TestConnExecStatementNetworkUsage`,
+  `TestConnWaitForNotification` (120 s timeout),
+  `TestConnectProtocolVersion32`,
   `TestConnectWithValidateConnectTargetSessionAttrsReadWrite`,
-  `TestPipelinePrepareError`. (`TestConnExecBatchImplicitTransaction` passes
-  as of the 2026-08-15 re-run.)
+  `TestPipelinePrepareError` (pipeline Parse of bad SQL must error).
+  (`TestConnExecBatchImplicitTransaction` passes as of the 2026-08-15
+  re-run.)
 
 #### Temp tables: concurrent namespacing FIXED and CONFIRMED as the cluster's cause
 

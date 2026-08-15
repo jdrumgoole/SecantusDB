@@ -545,7 +545,10 @@ def close_complete() -> bytes:
 
 
 def parameter_description(type_oids: list[int]) -> bytes:
-    payload = bytearray(_UINT16.pack(len(type_oids)))
+    # The count field is int16 and WRAPS for >=65536 parameters, exactly like
+    # real PG (pq_sendint16) — pgproto3 ignores it and infers the count from
+    # the message length, which is why PG can "accept" a 65536-param Parse.
+    payload = bytearray(_UINT16.pack(len(type_oids) & 0xFFFF))
     for oid in type_oids:
         payload += _INT32.pack(oid)
     return _msg("t", bytes(payload))
