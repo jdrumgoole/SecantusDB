@@ -2477,9 +2477,9 @@ threading into `wt_config`.)
 
 ### pgx gauge — `pgconn` findings and next steps (2026-08-14)
 
-**Where it stands: `pgconn` is at 8 failures** (of 216 tests; 12 measured
-2026-08-15 at `b8b1b171`, then −4 from the statement-cap fix, verified
-individually): 86 → 29 after the `generate_series`
+**Where it stands: `pgconn` is at 5 failures** (of 216 tests; 12 measured
+2026-08-15 at `b8b1b171`, −4 statement-cap fix, −3 parse/exec error shapes,
+each verified individually): 86 → 29 after the `generate_series`
 untyped-bound fix (#862), 29 → 23 after per-session temp-table namespacing
 (#866), 23 → 20 after the stray-CopyData drain fix (#868), 20 → 18 after
 plain-json compact rendering (#869), 18 → 17 after the legacy bare
@@ -2543,13 +2543,19 @@ test names.**
   is now 16 MB (parse ~2 s/MB keeps the DoS bound real) and
   `parameter_description` wraps its int16 count for ≥65536 params like PG's
   `pq_sendint16`. All four verified passing.
-* **Assorted (7)** — `TestConnPrepareSyntaxError` (Parse of `SYNTAX ERROR`
-  is ACCEPTED — sqlglot parses it as an expression; must be 42601),
-  `TestConnExecMultipleQueriesError`, `TestConnExecStatementNetworkUsage`,
+* **Parse/exec error shapes — FIXED.** `TestConnPrepareSyntaxError` /
+  `TestPipelinePrepareError` (sqlglot parsed `SYNTAX ERROR` / `bad` as bare
+  expressions; a top-level non-statement now raises 42601) and
+  `TestConnExecMultipleQueriesError` (a mid-batch error now streams the
+  completed statements' results before the ErrorResponse, like real PG).
+  All three verified passing. NOTE the txn divergence stays: a real PG
+  multi-statement simple query is ONE implicit transaction (the error
+  rolls back earlier statements' writes); ours runs per-statement
+  autocommit, so earlier writes survive. No gauge test observes it yet.
+* **Assorted (4)** — `TestConnExecStatementNetworkUsage`,
   `TestConnWaitForNotification` (120 s timeout),
   `TestConnectProtocolVersion32`,
-  `TestConnectWithValidateConnectTargetSessionAttrsReadWrite`,
-  `TestPipelinePrepareError` (pipeline Parse of bad SQL must error).
+  `TestConnectWithValidateConnectTargetSessionAttrsReadWrite`.
   (`TestConnExecBatchImplicitTransaction` passes as of the 2026-08-15
   re-run.)
 

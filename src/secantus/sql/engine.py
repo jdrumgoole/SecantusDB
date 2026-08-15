@@ -87,10 +87,19 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
         results: list[SQLResult] = []
         if session.get_setting("standard_conforming_strings").lower() in ("off", "false", "0"):
             sql = planner.decode_nonstandard_strings(sql)
-        for stmt in planner.parse(sql):
-            result = _normalize_result(_dispatch(stmt, storage, db, catalog, session))
-            _drain_plpgsql_notices(session, result)
-            results.append(result)
+        try:
+            for stmt in planner.parse(sql):
+                result = _normalize_result(_dispatch(stmt, storage, db, catalog, session))
+                _drain_plpgsql_notices(session, result)
+                results.append(result)
+        except errors.SQLError as exc:
+            # Real PG streams each statement's results as it executes, so a
+            # mid-batch error still delivers the EARLIER statements' rows
+            # before the ErrorResponse (pgx's ExecMultipleQueriesError counts
+            # them). Carry the completed results on the exception for the
+            # wire layer; embedded callers see the same raise as before.
+            exc.partial_results = results
+            raise
         return results
 
 
@@ -2205,10 +2214,13 @@ def _run_statement(
     if noop is not None:
         return SQLResult(command_tag=noop)
 
-    if isinstance(stmt, (exp.Column, exp.Identifier, exp.Literal, exp.Anonymous)):
-        # Garbage input ("wat") parses as a bare column/identifier expression,
-        # not a statement — Postgres raises a syntax error, and clients map
-        # 42601 to ProgrammingError (0A000 maps to NotSupportedError).
+    if is_nonstatement_expression(stmt):
+        # Garbage input ("wat", "SYNTAX ERROR") parses as a bare column /
+        # aliased expression, not a statement — Postgres raises a syntax
+        # error, and clients map 42601 to ProgrammingError (0A000 maps to
+        # NotSupportedError). The expression-shaped COMMANDS sqlglot
+        # mis-parses the same way (CLOSE / DISCARD / DEALLOCATE) were
+        # already handled above and are exempted by the predicate.
         raise errors.SQLError("42601", f'syntax error at or near "{stmt.sql()[:40]}"')
     if isinstance(stmt, exp.Copy):
         # COPY reaching the generic dispatcher means it wasn't the sole
@@ -2222,6 +2234,24 @@ def _run_statement(
 
 
 _NOOP_WORDS = {"DISCARD"}
+
+#: Commands sqlglot mis-parses as bare Alias/Column expressions but that ARE
+#: real statements with handlers in this engine. Anything else expression-
+#: shaped at the top level is garbage input, rejected 42601 like real PG.
+_EXPRESSION_COMMAND_WORDS = {"CLOSE", "DISCARD", "DEALLOCATE"}
+
+
+def is_nonstatement_expression(stmt: exp.Expression) -> bool:
+    """True when ``stmt`` is a bare expression posing as a statement — the
+    shape sqlglot produces for garbage input like ``bad`` or ``SYNTAX ERROR``.
+    Real PG rejects these at parse time (42601); the extended protocol's
+    Parse uses this predicate so pgx's Prepare("SYNTAX ERROR") errors there,
+    not silently at Execute."""
+    if not isinstance(stmt, (exp.Column, exp.Identifier, exp.Literal, exp.Anonymous, exp.Alias)):
+        return False
+    head = stmt.this if isinstance(stmt, exp.Alias) else stmt
+    name = head.name if isinstance(head, exp.Column) else None
+    return not (name is not None and name.upper() in _EXPRESSION_COMMAND_WORDS)
 
 
 def _noop_command_word(stmt: exp.Expression) -> str | None:

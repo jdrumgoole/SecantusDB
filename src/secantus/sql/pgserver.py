@@ -731,6 +731,10 @@ class SecantusPGServer:
                 for res in results:
                     out += _render_result(res, session.wire_encoding, session)
         except errors.SQLError as exc:
+            # A mid-batch error in a multi-statement query still delivers the
+            # completed statements' results first, like real PG's streaming.
+            for res in getattr(exc, "partial_results", None) or []:
+                out += _render_result(res, session.wire_encoding, session)
             out += pgwire.error_response(
                 exc.sqlstate,
                 exc.message,

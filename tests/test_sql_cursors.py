@@ -232,3 +232,17 @@ def test_parse_accepts_megabyte_scale_statement():
     literal = "x" * 1_100_000
     stmts = planner.parse(f"SELECT length('{literal}')")
     assert len(stmts) == 1
+
+
+def test_bare_expressions_are_syntax_errors(storage, session):
+    # sqlglot parses bare words as column/aliased expressions; a
+    # non-statement must be PG's 42601, not silently accepted (pgx
+    # Prepare("SYNTAX ERROR")). The expression-shaped COMMANDS sqlglot
+    # mis-parses the same way (CLOSE / DISCARD / DEALLOCATE) stay working.
+    from secantus.sql import engine
+
+    for sql in ("bad", "SYNTAX ERROR", "asdf"):
+        with pytest.raises(SQLError) as ei:
+            engine.run_sql(storage, session.database, sql, session=session)
+        assert ei.value.sqlstate == "42601"
+    assert engine.run_sql(storage, session.database, "DISCARD ALL", session=session)
