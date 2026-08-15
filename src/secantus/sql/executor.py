@@ -1000,7 +1000,6 @@ def _error_diag(table: Any, **extra: str) -> dict[str, str]:
     return diag
 
 
-
 def _validate_check_option(
     docs: list[dict[str, Any]], check_option: Any, table: Any, ctx: Any
 ) -> None:
