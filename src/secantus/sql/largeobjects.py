@@ -226,6 +226,23 @@ def _fd(session: Any, raw: bytes) -> dict[str, Any]:
     return desc
 
 
+# Fastpath functions that MUTATE stored large-object data (create / write /
+# truncate / delete). Used by the pgserver Fastpath handler to apply the same
+# RBAC + read-only-transaction gates a table write goes through, which the
+# Fastpath sub-protocol otherwise skips (#836). `lo_open` is excluded: it only
+# builds a descriptor — the actual mutation happens in `lowrite`/`lo_truncate`,
+# which are gated here and additionally require the descriptor's INV_WRITE mode.
+_WRITE_LO_FUNCS: frozenset[str] = frozenset(
+    {"lo_creat", "lo_create", "lowrite", "lo_truncate", "lo_truncate64", "lo_unlink"}
+)
+
+
+def is_write_call(fn_oid: int) -> bool:
+    """Whether the Fastpath function with this OID mutates stored large-object
+    data (so it needs a write privilege and is barred in a read-only transaction)."""
+    return _OID_TO_NAME.get(fn_oid) in _WRITE_LO_FUNCS
+
+
 def call(fn_oid: int, args: list[bytes], *, storage: Any, db: str, session: Any) -> bytes:
     """Execute one Fastpath function call; returns the binary result value."""
     name = _OID_TO_NAME.get(fn_oid)

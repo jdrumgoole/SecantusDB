@@ -94,8 +94,20 @@ def required_privilege(stmt: exp.Expression) -> tuple[str, bool] | None:
         # can't smuggle a write past the gate.
         if stmt.find(exp.Insert, exp.Update, exp.Delete, exp.Merge) is not None:
             return (rbac.A_UPDATE, False)
+        # A mutating large-object scalar (``SELECT lo_unlink(oid)`` /
+        # ``lo_creat`` / ``lo_create``) writes despite the SELECT top — a
+        # find-only role must not run it (#836).
+        for fn in stmt.find_all(exp.Anonymous):
+            if str(fn.this).lower() in _MUTATING_LO_FUNCS:
+                return (rbac.A_INSERT, False)
         return (rbac.A_FIND, False)
     return None
+
+
+# Large-object scalar functions that mutate stored data (the ones `scalar.py`
+# implements). A statement calling one needs a write grant even when its top
+# node is a SELECT (#836).
+_MUTATING_LO_FUNCS: frozenset[str] = frozenset({"lo_creat", "lo_create", "lo_unlink"})
 
 
 # Data actions that a table-level GRANT can authorize, and the SQL privilege
