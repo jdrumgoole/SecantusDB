@@ -2827,6 +2827,29 @@ shared storage engine or building large new protocol subsystems:
   - **AutoRollbackTest savepoint/autosave semantics** (~24): `autosave`
     modes and `flushCacheOnDeallocate` / `DEALLOCATE ALL` behaviour around
     failed statements in a transaction.
+  - **StatementTest / PreparedStatementTest residuals (2026-08-15)** — the
+    grabbag slice fixed dollar quotes, nested comments, non-standard
+    strings, the `{fn}` scalar surface, stable `now()`, CTAS, and
+    TRUNCATE qualification. Still failing, each a separate feature:
+    `parsingSemiColons` (CREATE RULE — rewrite rules unimplemented);
+    `warningsAreAvailableAsap` / `closeInProgressStatement(Protocol32)` /
+    `concurrentWarningReadAndClear` (mid-statement NOTICE streaming +
+    blocking LOCK TABLE + plpgsql FOR; the Protocol32 variant additionally
+    needs NegotiateProtocolVersion for a 3.2 StartupMessage);
+    `setQueryTimeout{,WithSleep,OnPrepared}` (query cancel — a parallel
+    session's cancel-request worktree owns this; this slice deliberately
+    backed out its own overlapping implementation);
+    `testDoubleQuestionMark` (`?-` prefix / `?#` infix geometric operators
+    — sqlglot can't tokenize either, needs a parser extension, and the
+    `lseg '...'` / `box '...'` typed-literal prefix syntax doesn't parse
+    outside `point`);
+    `testNumeric` (1000-digit numerics exceed Decimal128's 34 significant
+    digits — a storage-representation ceiling, cast/round-trip truncates);
+    `testUnknownSetObject` (extended-protocol strictness: a varchar-typed
+    param inserting into an interval column must raise 42804; our insert
+    coercion doesn't see the param's declared OID);
+    `testSetObjectBigDecimalWithScale` (was the TRUNCATE qualifier bug —
+    expected fixed by this slice, verify on the next gauge run).
   - ~~**Large objects** (11, `BlobTest`)~~ — FIXED (the `pg-large-objects`
     slice): the Fastpath sub-protocol + `lo_*` built-ins landed
     (`secantus/sql/largeobjects.py`), plus the surrounding pieces pgjdbc's
@@ -5724,7 +5747,14 @@ distinct problems, triaged from the run logs:
   test_boom), machine at load ~6-9 with a parallel CI-watch session; the
   post-crash-overrun watchdog killed the stalled controller 1200s later.
   No jetsam/kernel kill in `log show`. Still SIGKILL-shaped and
-  unattributed; the RSS/pid capture plan stands.
+  unattributed; the RSS/pid capture plan stands. **Third occurrence
+  2026-08-15 ~01:00: THREE workers (gw2, gw5, gw3) at ~99% of a local
+  full run, again no .ips, again rerun-clean. Negative repro result: 5
+  rounds of the four rust-binary/server test files alone (-n4, 89 tests
+  per round) are clean — the death needs full-suite tail conditions,
+  pointing at accumulated state (fds / RSS / WT homes) rather than any
+  single test. Next step is a full-suite run under a per-worker RSS+fd
+  sampler sidecar.**
 - [ ] **Residual straddle window: generated-column / expression-index
   recompute in the non-materialized UPDATE path.** Same shape as the
   resolved lost-update straddle but narrower surface: `execute_update`'s

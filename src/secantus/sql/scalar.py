@@ -21,6 +21,7 @@ import datetime as _dt
 import decimal
 import json
 import math
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -687,11 +688,15 @@ def _unary(fn: Callable[[Any], Any]) -> Callable[[exp.Expression, Scope, ScalarC
 
 
 def _eval_round(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
-    v = evaluate(node.this, scope, ctx)
+    v = typemap.unwrap_numeric(evaluate(node.this, scope, ctx))
     if v is None:
         return None
     dec = node.args.get("decimals")
     ndigits = int(evaluate(dec, scope, ctx)) if dec is not None else 0
+    if isinstance(v, decimal.Decimal):
+        # PG rounds numeric half-away-from-zero; Python's round() is
+        # banker's rounding, wrong for e.g. round(2.5) and round(3.125, 2).
+        return v.quantize(decimal.Decimal(1).scaleb(-ndigits), rounding=decimal.ROUND_HALF_UP)
     return round(v, ndigits)
 
 
@@ -971,15 +976,82 @@ def _eval_overlay(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any
     return text[: i - 1] + rep_text + text[i - 1 + span :]
 
 
+#: PG's one-argument trig/hyperbolic functions (radian- and degree-flavored).
+_TRIG_FUNCS: dict[str, Any] = {
+    "acos": math.acos,
+    "asin": math.asin,
+    "atan": math.atan,
+    "cos": math.cos,
+    "sin": math.sin,
+    "tan": math.tan,
+    "cot": lambda v: 1.0 / math.tan(v),
+    "sinh": math.sinh,
+    "cosh": math.cosh,
+    "tanh": math.tanh,
+    "asinh": math.asinh,
+    "acosh": math.acosh,
+    "atanh": math.atanh,
+    "acosd": lambda v: math.degrees(math.acos(v)),
+    "asind": lambda v: math.degrees(math.asin(v)),
+    "atand": lambda v: math.degrees(math.atan(v)),
+    "cosd": lambda v: math.cos(math.radians(v)),
+    "sind": lambda v: math.sin(math.radians(v)),
+    "tand": lambda v: math.tan(math.radians(v)),
+    "cotd": lambda v: 1.0 / math.tan(math.radians(v)),
+}
+
+
+def _num_unary(fn: Any) -> Any:
+    """A one-numeric-argument handler: unwraps Decimal128/numeric wrappers to a
+    float-compatible value before calling ``fn`` (trig on numeric is double)."""
+
+    def handler(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+        v = typemap.unwrap_numeric(evaluate(node.this, scope, ctx))
+        return None if v is None else fn(float(v))
+
+    return handler
+
+
+def _eval_atan2(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    y = typemap.unwrap_numeric(evaluate(node.this, scope, ctx))
+    x = typemap.unwrap_numeric(evaluate(node.expression, scope, ctx))
+    return None if y is None or x is None else math.atan2(float(y), float(x))
+
+
+def _eval_replace_fn(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    src_v = evaluate(node.this, scope, ctx)
+    from_v = evaluate(node.expression, scope, ctx)
+    to_v = evaluate(node.args.get("replacement"), scope, ctx)
+    if src_v is None or from_v is None or to_v is None:
+        return None
+    return _as_text(src_v).replace(_as_text(from_v), _as_text(to_v))
+
+
+def _pow_mixed(b: Any, e: Any) -> Any:
+    """``power`` / ``^`` with numeric-vs-double operand mixes: same-kind
+    operands compute natively (Decimal ** int stays exact); a mix that Python
+    can't combine (Decimal128, Decimal-vs-float) computes in float — PG's
+    numeric ^ double is double."""
+    b = typemap.unwrap_numeric(b)
+    e = typemap.unwrap_numeric(e)
+    try:
+        return b**e
+    except (TypeError, decimal.InvalidOperation):
+        return float(b) ** float(e)
+
+
 def _eval_trunc(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     """``trunc(x [, n])`` — truncate toward zero to ``n`` decimal places (0 default)."""
-    v = evaluate(node.this, scope, ctx)
+    v = typemap.unwrap_numeric(evaluate(node.this, scope, ctx))
     if v is None:
         return None
     dec = node.args.get("decimals")
     n = int(evaluate(dec, scope, ctx)) if dec is not None else 0
     if n == 0:
         return math.trunc(v)
+    if isinstance(v, decimal.Decimal):
+        # Decimal-exact truncation (``trunc(3.1294::numeric, 2)`` -> 3.12).
+        return v.quantize(decimal.Decimal(1).scaleb(-n), rounding=decimal.ROUND_DOWN)
     factor = 10.0**n
     return math.trunc(v * factor) / factor
 
@@ -1174,6 +1246,38 @@ _PG_WORD_TOKENS = [
 ]
 
 
+_WORD_TIME_TOKEN_RE = re.compile(r"(?i)(month|mon|day|dy)")
+_WORD_TIME_DIRECTIVES = {"month": "%B", "mon": "%b", "day": "%A", "dy": "%a"}
+
+
+def _repair_time_format(fmt: str) -> str:
+    """Undo sqlglot's partial PG→strftime format conversion and redo it with
+    the word tokens handled.
+
+    sqlglot's postgres TIME_MAPPING knows no ``Day`` / ``Month`` tokens, so
+    ``to_char(ts, 'Day')`` arrives here as ``%uay`` (the ``D`` matched alone).
+    Reverse-map back to the original PG template, replace the word tokens with
+    sentinels, forward-map the rest, then substitute the strftime directives.
+    A format with no word tokens round-trips unchanged."""
+    from sqlglot.dialects.postgres import Postgres as _PG
+    from sqlglot.time import format_time as _format_time
+
+    recovered = _format_time(fmt, _PG.INVERSE_TIME_MAPPING) or fmt
+    subs: list[str] = []
+
+    def _stash(m: re.Match) -> str:
+        subs.append(_WORD_TIME_DIRECTIVES[m.group(0).lower()])
+        return f"\x00{len(subs) - 1}\x00"
+
+    masked = _WORD_TIME_TOKEN_RE.sub(_stash, recovered)
+    if not subs:
+        return fmt
+    mapped = _format_time(masked, _PG.TIME_MAPPING) or masked
+    for i, directive in enumerate(subs):
+        mapped = mapped.replace(f"\x00{i}\x00", directive)
+    return mapped
+
+
 def _eval_to_char(node: exp.TimeToStr, scope: Scope, ctx: ScalarContext) -> Any:
     """``to_char(ts, 'YYYY-MM-DD HH24:MI:SS')`` (timestamps) or
     ``to_char(1234.5, '999,999.99')`` (numbers) -> a formatted string."""
@@ -1193,6 +1297,7 @@ def _eval_to_char(node: exp.TimeToStr, scope: Scope, ctx: ScalarContext) -> Any:
     ts = _as_datetime(src)
     if not isinstance(ts, _dt.datetime):
         ts = _dt.datetime(ts.year, ts.month, ts.day)
+    fmt = _repair_time_format(fmt)
     out, i = [], 0
     up = fmt.upper()
     while i < len(fmt):
@@ -1212,7 +1317,14 @@ def _eval_to_char(node: exp.TimeToStr, scope: Scope, ctx: ScalarContext) -> Any:
 
 
 def _utcnow(ctx: ScalarContext | None) -> _dt.datetime:
-    return _dt.datetime.now(_dt.timezone.utc)
+    session = getattr(ctx, "session", None) if ctx is not None else None
+    if session is None:
+        return _dt.datetime.now(_dt.timezone.utc)
+    frozen = getattr(session, "txn_now", None)
+    if frozen is None:
+        frozen = _dt.datetime.now(_dt.timezone.utc)
+        session.txn_now = frozen
+    return frozen
 
 
 def _fmt_current_time(ctx: ScalarContext | None) -> str:
@@ -1311,7 +1423,7 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
     exp.Pow: lambda n, s, c: (
         None
         if (b := evaluate(n.this, s, c)) is None or (e := evaluate(n.expression, s, c)) is None
-        else b**e
+        else _pow_mixed(b, e)
     ),
     exp.Substring: _eval_substring,
     exp.Nullif: _eval_nullif,
@@ -1344,6 +1456,21 @@ for _cls_name, _handler in (
     ("Exp", _unary(math.exp)),
     ("Degrees", _unary(math.degrees)),
     ("Radians", _unary(math.radians)),
+    ("Acos", _num_unary(math.acos)),
+    ("Asin", _num_unary(math.asin)),
+    ("Atan", _num_unary(math.atan)),
+    ("Cos", _num_unary(math.cos)),
+    ("Cot", _num_unary(lambda v: 1.0 / math.tan(v))),
+    ("Sin", _num_unary(math.sin)),
+    ("Tan", _num_unary(math.tan)),
+    ("Sinh", _num_unary(math.sinh)),
+    ("Cosh", _num_unary(math.cosh)),
+    ("Tanh", _num_unary(math.tanh)),
+    ("Asinh", _num_unary(math.asinh)),
+    ("Acosh", _num_unary(math.acosh)),
+    ("Atanh", _num_unary(math.atanh)),
+    ("Atan2", _eval_atan2),
+    ("Replace", _eval_replace_fn),
     ("Factorial", _unary(lambda v: math.factorial(int(v)))),
     ("Extract", _eval_extract),
     ("TimestampTrunc", _eval_date_trunc),
@@ -2611,6 +2738,19 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
     if name == "log10":
         v = args[0] if args else None
         return None if v is None else math.log10(v)
+    if name in _TRIG_FUNCS:
+        v = typemap.unwrap_numeric(args[0]) if args else None
+        return None if v is None else _TRIG_FUNCS[name](float(v))
+    if name == "atan2":
+        y = typemap.unwrap_numeric(args[0]) if args else None
+        x = typemap.unwrap_numeric(args[1]) if len(args) > 1 else None
+        return None if y is None or x is None else math.atan2(float(y), float(x))
+    if name == "replace":
+        if len(args) != 3:
+            raise errors.SQLError("42883", "function replace() requires 3 arguments")
+        if any(a is None for a in args):
+            return None
+        return _as_text(args[0]).replace(_as_text(args[1]), _as_text(args[2]))
     if name in typemap._RANGE_TAGS:
         # ``int4range(lo, hi [, bounds])`` etc. -> a range subdocument.
         from secantus.sql import ranges as _ranges

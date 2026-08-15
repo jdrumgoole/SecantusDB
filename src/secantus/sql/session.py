@@ -314,6 +314,11 @@ class Session:
     # ``secantus.rbac.check_privilege`` — the same model the Mongo server uses.
     authz_active: bool = False
     roles: list[Any] = field(default_factory=list)
+    # The transaction-stable ``now()`` instant (PG freezes now()/
+    # CURRENT_TIMESTAMP for the whole transaction). Cleared at each
+    # statement start outside a block and at BEGIN; set lazily by
+    # ``scalar._utcnow`` on first use.
+    txn_now: Any = None
     # Temp tables this session created (``(db, name)``, name carrying the
     # ``pg_temp_<n>.`` prefix) — dropped at connection teardown by
     # ``engine.drop_session_temp_tables`` (PG drops temp tables at session
