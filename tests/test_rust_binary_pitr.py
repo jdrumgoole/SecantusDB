@@ -80,11 +80,35 @@ _BINARY_SERIAL_LOCK = pathlib.Path(tempfile.gettempdir()) / "secantus-rust-binar
 
 @pytest.fixture(autouse=True)
 def _serialize_binary_tests():
+    # BOUNDED, non-blocking acquisition. The original blocking flock was the
+    # xdist "worker death" root cause: with two suites sharing this
+    # machine-wide lock, workers queued here for over 600s — and the GLOBAL
+    # thread-method pytest-timeout (which governs fixture waits; the file's
+    # 1200s signal marker does not) killed them via os._exit with the dump
+    # swallowed by capture: "Not properly terminated", no traceback, no
+    # crash report. Occurrences 1-6 in tasks/backlog.md all match — every
+    # victim had been in this file's tests for exactly ~600s. A bounded
+    # poll turns a starved wait into a NAMED failure at 480s, far inside
+    # every timeout budget, and keeps the worker alive.
     if fcntl is None:
         yield
         return
+    import time as _time
+
+    deadline = _time.monotonic() + 480.0
     with open(_BINARY_SERIAL_LOCK, "w") as fh:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if _time.monotonic() > deadline:
+                    raise AssertionError(
+                        "timed out waiting 480s for the machine-wide rust-binary "
+                        "test lock — another pytest run (parallel suite?) is "
+                        "holding it; rerun when the machine is quieter"
+                    ) from None
+                _time.sleep(0.5)
         try:
             yield
         finally:
@@ -120,7 +144,9 @@ def _restore(
 def test_rust_binary_restores_python_server_data(tmp_path: pathlib.Path) -> None:
     data = tmp_path / "pydata"
     with SecantusDBServer(port=0, storage_path=str(data)) as srv:
-        coll = pymongo.MongoClient(srv.uri, directConnection=True)["app"]["c"]
+        coll = pymongo.MongoClient(srv.uri, directConnection=True, socketTimeoutMS=120000)["app"][
+            "c"
+        ]
         coll.insert_many([{"_id": 1, "v": 1}, {"_id": 2, "v": 2}])
         coll.update_one({"_id": 1}, {"$set": {"v": 100, "tag": "x"}})
         coll.delete_one({"_id": 2})
@@ -137,7 +163,9 @@ def test_rust_binary_restores_python_server_data(tmp_path: pathlib.Path) -> None
 def test_rust_binary_restore_to_timestamp(tmp_path: pathlib.Path) -> None:
     data = tmp_path / "pydata"
     with SecantusDBServer(port=0, storage_path=str(data)) as srv:
-        coll = pymongo.MongoClient(srv.uri, directConnection=True)["app"]["c"]
+        coll = pymongo.MongoClient(srv.uri, directConnection=True, socketTimeoutMS=120000)["app"][
+            "c"
+        ]
         coll.insert_many([{"_id": 1}, {"_id": 2}])
 
     # The timestamp after the two inserts, read from the stopped data dir.
@@ -218,7 +246,14 @@ def test_rust_binary_v2_archive_base_snapshot_and_restore(tmp_path: pathlib.Path
         assert m, f"no listening banner in: {line!r}"
         host, port = m.group(1), int(m.group(2))
         client = pymongo.MongoClient(
-            host, port, directConnection=True, serverSelectionTimeoutMS=5000
+            host,
+            port,
+            directConnection=True,
+            serverSelectionTimeoutMS=5000,
+            # A wedged server must surface as a NAMED network timeout, not an
+            # unbounded hang the per-test timeout kills silently (the last
+            # un-fixed worker-death shape: the flock HOLDER dying mid-test).
+            socketTimeoutMS=120000,
         )
         client["app"]["c"].insert_many([{"_id": 1}, {"_id": 2}, {"_id": 3}])
         reply = client["admin"].command(
@@ -250,7 +285,9 @@ def test_rust_binary_preserve_oplog(tmp_path: pathlib.Path) -> None:
     default leaves it empty (Phase R, R5b)."""
     data = tmp_path / "pydata"
     with SecantusDBServer(port=0, storage_path=str(data)) as srv:
-        coll = pymongo.MongoClient(srv.uri, directConnection=True)["app"]["c"]
+        coll = pymongo.MongoClient(srv.uri, directConnection=True, socketTimeoutMS=120000)["app"][
+            "c"
+        ]
         coll.insert_many([{"_id": 1}, {"_id": 2}, {"_id": 3}])
 
     carried = tmp_path / "carried"

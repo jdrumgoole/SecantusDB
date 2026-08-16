@@ -97,6 +97,46 @@ if "wiredtiger" not in sys.modules and importlib.util.find_spec("wiredtiger") is
 _SAFE_TMP_RETENTION = frozenset({"all"})
 
 
+def _install_sigtrace() -> None:
+    """SECANTUS_SIGTRACE=1: log receipt of catchable terminating signals to a
+    per-pid file, then die with the default action — evidence for the xdist
+    worker-death hunt (backlog: 'group-kill' theory). A worker that dies
+    WITHOUT a log line was SIGKILLed (uncatchable) or crashed in C; one that
+    logs SIGTERM names the signal, and phase B (SA_SIGINFO) can then chase
+    the sender pid. Python-level handlers run even when the main thread is
+    blocked in a syscall (PEP 475 runs handlers before retrying on EINTR).
+    """
+    import contextlib as _contextlib
+    import signal as _signal
+    import tempfile as _tempfile
+    import time as _time
+
+    trace_dir = os.environ.get("SECANTUS_SIGTRACE_DIR") or _tempfile.gettempdir()
+
+    def _log_and_die(signo: int, frame: object) -> None:
+        try:
+            with open(os.path.join(trace_dir, f"sigtrace-{os.getpid()}.log"), "a") as fh:
+                fh.write(
+                    f"{_time.strftime('%H:%M:%S')} pid={os.getpid()} got signal "
+                    f"{signo} ({_signal.Signals(signo).name}) "
+                    f"test={os.environ.get('PYTEST_CURRENT_TEST', '?')}\n"
+                )
+        finally:
+            _signal.signal(signo, _signal.SIG_DFL)
+            os.kill(os.getpid(), signo)
+
+    for signo in (
+        _signal.SIGTERM,
+        _signal.SIGINT,
+        _signal.SIGHUP,
+        _signal.SIGQUIT,
+        _signal.SIGUSR1,
+        _signal.SIGUSR2,
+    ):
+        with _contextlib.suppress(OSError, ValueError):
+            _signal.signal(signo, _log_and_die)
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Refuse to run under a ``tmp_path_retention_policy`` that deletes tmp
     dirs mid-session.
@@ -119,6 +159,8 @@ def pytest_configure(config: pytest.Config) -> None:
     aggressive cleanup, run it in its own pytest invocation instead of
     flipping this policy globally.
     """
+    if os.environ.get("SECANTUS_SIGTRACE") == "1":
+        _install_sigtrace()
     # Start the session stall watcher (see the block below). Done here rather
     # than in a fixture because fixtures run only in xdist WORKERS, and the
     # controller is exactly the process that wedges.
