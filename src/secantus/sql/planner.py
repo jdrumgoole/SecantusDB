@@ -11217,13 +11217,21 @@ def _parse_uncached(sql: str) -> list[exp.Expression]:
     multi_drop = _MULTI_DROP_TABLE_RE.match(sql)
     if multi_drop is not None and "," in multi_drop.group("names"):
         # ``DROP TABLE [IF EXISTS] a, b, c`` — sqlglot can't parse the
-        # multi-name form (pgbench -i emits it); expand to one DROP per name.
+        # multi-name form (pgbench -i emits it). ONE statement in PG: one
+        # CommandComplete tag (pgtest errors:9), and without IF EXISTS the
+        # whole drop fails before any table goes. The engine executes each
+        # parsed Drop inside a single MULTIDROP_TABLE command.
         head = "DROP TABLE " + ("IF EXISTS " if multi_drop.group("if_exists") else "")
-        return [
-            sqlglot.parse_one(head + name.strip(), read="postgres")
-            for name in multi_drop.group("names").split(",")
-            if name.strip()
-        ]
+        cmd = exp.Command(this="MULTIDROP_TABLE", expression=exp.Literal.string(sql))
+        cmd.set(
+            "drops",
+            [
+                sqlglot.parse_one(head + name.strip(), read="postgres")
+                for name in multi_drop.group("names").split(",")
+                if name.strip()
+            ],
+        )
+        return [cmd]
     if COMMENT_CONSTRAINT_RE.match(sql):
         return [exp.Command(this="COMMENT_CONSTRAINT", expression=exp.Literal.string(sql))]
     # ``DO $$ … $$ [language plpgsql]`` — the body is handled by the engine's

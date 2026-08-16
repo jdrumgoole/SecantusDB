@@ -42,9 +42,20 @@ def test_multi_name_drop_table(storage, session):
     for n in ("a", "b", "c"):
         run(storage, session, f"CREATE TABLE {n} (id int primary key)")
     res = run_sql(storage, DB, "DROP TABLE IF EXISTS a, b, c, nope", session=session)
-    assert res[-1].command_tag == "DROP TABLE"
+    # ONE statement in PG: one result, one tag (pgtest errors:9 reads the
+    # simple-query reply byte-for-byte).
+    assert [r.command_tag for r in res] == ["DROP TABLE"]
     with pytest.raises(SQLError):
         run(storage, session, "SELECT 1 FROM b")
+
+
+def test_multi_name_drop_is_atomic_without_if_exists(storage, session):
+    # Without IF EXISTS every name must resolve BEFORE anything drops.
+    run(storage, session, "CREATE TABLE md_c (id int primary key)")
+    with pytest.raises(SQLError) as exc:
+        run(storage, session, "DROP TABLE md_c, md_missing")
+    assert exc.value.sqlstate == "42P01"
+    assert list(run(storage, session, "SELECT count(*) FROM md_c").rows[0]) == [0]
 
 
 def test_vacuum_accepted(storage, session):

@@ -2658,12 +2658,18 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   names its output column after the TYPE (SELECT 'hi'::te → column
   te), and RowDescription reports typlen 4 for minted enum oids
   (PG stores enum values as 4-byte oids; the [65000, 66000) range
-  check in pgwire is pinned to catalog's bases by a test). Corpus:
-  29 unexpected failures; green: aborted_txn, array, batch_stmt,
-  bind_and_resolve, json, json_array, char, citext, copy,
-  copy_file_upload, decimal, enum (+2). Next: `errors`, `execute`
-  (`multiple_active_portals` needs fresh-state isolation — leftover
-  `mytable`/`ltree` deps). Iterate file-by-file.
+  check in pgwire is pinned to catalog's bases by a test). Slice 13
+  greened `errors`: multi-name DROP TABLE is ONE statement — one
+  CommandComplete tag, and without IF EXISTS every name must resolve
+  before anything drops (a MULTIDROP_TABLE command wrapping the
+  per-name Drop nodes); Bind rejects format codes other than 0/1
+  with 08P01 before BindComplete; the FK ConstraintName error field
+  already passed unchanged. Corpus: 28 unexpected failures; green:
+  aborted_txn, array, batch_stmt, bind_and_resolve, json,
+  json_array, char, citext, copy, copy_file_upload, decimal, enum,
+  errors (+2). Next: `execute`, `float` (`multiple_active_portals`
+  needs fresh-state isolation — leftover `mytable`/`ltree` deps).
+  Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``

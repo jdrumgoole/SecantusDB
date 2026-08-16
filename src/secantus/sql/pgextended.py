@@ -1375,6 +1375,11 @@ class ExtendedSession:
         prep = self.prepared.get(stmt_name)
         if prep is None:
             raise errors.SQLError("26000", f'prepared statement "{stmt_name}" does not exist')
+        for code in (formats or []) + (result_formats or []):
+            if code not in (0, 1):
+                # PG validates format codes at Bind — 0 (text) and 1 (binary)
+                # only (pgtest errors:95 sends ResultFormatCodes 2..5).
+                raise errors.SQLError("08P01", f"unsupported format code: {code}")
         if raw_values and isinstance(prep.stmt, exp.Copy):
             summary = "COPY (SELECT) TO STDOUT" if not prep.stmt.args.get("kind") else "COPY"
             raise errors.SQLError(

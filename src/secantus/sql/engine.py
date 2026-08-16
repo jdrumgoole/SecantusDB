@@ -2504,6 +2504,18 @@ def _run_statement(
             return _drop_domain_command(stmt, db, catalog)
         if verb == "COMMENT_CONSTRAINT":
             return _comment_constraint_command(stmt, db, catalog)
+        if verb == "MULTIDROP_TABLE":
+            # ``DROP TABLE a, b`` — one statement, one tag; without IF EXISTS
+            # every name must resolve BEFORE anything drops (PG atomicity).
+            drops = stmt.args.get("drops") or []
+            for d in drops:
+                if not d.args.get("exists"):
+                    plan = planner.plan_drop_table(d)
+                    if catalog.get(db, plan.name) is None:
+                        raise errors.undefined_table(plan.name)
+            for d in drops:
+                executor.execute_drop_table(planner.plan_drop_table(d), catalog, storage, db)
+            return SQLResult(command_tag="DROP TABLE")
         if verb == "VACUUM":
             # Nothing to vacuum in a surrogate store; accept like real PG
             # (pgbench -i runs ``vacuum analyze`` unconditionally).
