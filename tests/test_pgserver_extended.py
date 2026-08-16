@@ -637,3 +637,78 @@ def test_binary_array_wrong_known_elem_oid_is_42804(client):
         pgwire.build_execute("", 0),
     )
     assert error_code(msgs) == "08P01"
+
+
+def test_regclass_param_describes_as_oid_2205(client):
+    # pgtest bind_and_resolve:29 — a $1::REGCLASS parameter must describe
+    # as regclass (oid 2205), not fall through to text.
+    msgs = client.exchange(
+        pgwire.build_parse("s_reg", "SELECT $1::REGCLASS::INT8", []),
+        pgwire.build_describe("S", "s_reg"),
+    )
+    pd = next(m for m in msgs if m.type == "t")
+    import struct as _s
+
+    assert _s.unpack_from("!i", pd.payload, 2)[0] == 2205
+
+
+def test_portal_bound_in_txn_snapshots_before_later_ddl(client):
+    # pgtest bind_and_resolve:132 — a portal bound inside an explicit txn
+    # captures its snapshot at Bind: a later same-txn ALTER ... RENAME is
+    # invisible, so the held portal still reads the old relname.
+    client.exchange(
+        pgwire.build_parse("", "CREATE TABLE snapt (a int)", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    client.exchange(
+        pgwire.build_parse("", "BEGIN", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    client.exchange(
+        pgwire.build_parse("s_snap", "SELECT relname FROM pg_class WHERE oid = $1::regclass", []),
+        pgwire.build_bind("p_snap", "s_snap", [b"snapt"]),
+    )
+    client.exchange(
+        pgwire.build_parse("", "ALTER TABLE snapt RENAME TO snapt2", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    msgs = client.exchange(pgwire.build_execute("p_snap", 0))
+    assert rows(msgs) == [[b"snapt"]]
+    client.exchange(
+        pgwire.build_parse("", "COMMIT", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+
+
+def test_failing_select_in_txn_errors_at_execute_not_bind(client):
+    # The eager bind-time snapshot run must not surface errors at Bind — PG
+    # reports execution errors at Execute, after BindComplete.
+    client.exchange(
+        pgwire.build_parse("", "BEGIN", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT 1/0", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    tps = types(msgs)
+    assert "1" in tps and "2" in tps  # ParseComplete + BindComplete first
+    assert error_code(msgs) == "22012"
+    # The block is poisoned only by the Execute-time failure.
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT 1", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert error_code(msgs) == "25P02"
+    client.exchange(
+        pgwire.build_parse("", "ROLLBACK", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
