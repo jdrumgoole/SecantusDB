@@ -2848,6 +2848,17 @@ shared storage engine or building large new protocol subsystems:
     only becomes observable once array rows exist, and both should be fixed
     together. Widening `pg_type` touches every gauge that reads the catalog
     (psycopg especially), so measure across gauges, not just pgjdbc.
+  - **Metadata classes, revealed by the setup unlock (2026-08-16)** — the
+    COMMENT ON FUNCTION + rowtype-column fixes let four classes run; what
+    they revealed, biggest first: ResultSetMetaDataTest 28F in four
+    clusters (composite columns must report Types.STRUCT/2002 via a
+    pg_type-visible composite oid, not OTHER/1111 — 12F; base
+    column/table names empty in RowDescription for some shapes — 8F;
+    typmod metadata ignored: timestamp(3) precision and varchar(n)
+    display size — 8F). DatabaseMetaDataTest needs a queryable
+    `pg_description` RELATION (comments are stored but not exposed as a
+    catalog table). RefCursorTest/RefCursorFetchTest need plpgsql
+    `OPEN <cursor> FOR ...` (refcursor support — a real feature).
   - **AutoRollbackTest savepoint/autosave semantics** (~24): `autosave`
     modes and `flushCacheOnDeallocate` / `DEALLOCATE ALL` behaviour around
     failed statements in a transaction.

@@ -153,6 +153,19 @@ def _resolve_user_type_column(col: Any, catalog: Catalog, db: str) -> Any:
         )
     domain = catalog.get_domain(db, name)
     if domain is None:
+        # A TABLE's name is also its ROW TYPE (typtype 'c') in PG — a column
+        # declared ``col rsmd1`` where rsmd1 is a table stores that row shape
+        # (pgjdbc's ResultSetMetaDataTest builds its compositetest this way).
+        rel = catalog.get(db, name)
+        if rel is not None and getattr(rel, "columns", None):
+            fields = tuple((c.name, c.type_tag, None) for c in rel.columns)
+            return dataclasses.replace(
+                col,
+                enum_type=None,
+                composite_type=name,
+                composite_fields=fields,
+                type_tag="composite",
+            )
         raise errors.SQLError("42704", f'type "{name}" does not exist')
     inherit_default = not col.has_default and bool(domain.get("has_default"))
     return dataclasses.replace(
@@ -374,6 +387,31 @@ def execute_comment(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLRe
             dataclasses.replace(c, comment=text) if c.name == cname else c for c in table.columns
         ]
         catalog.replace(db, table)
+        return SQLResult(command_tag="COMMENT")
+    if kind == "FUNCTION":
+        # ``COMMENT ON FUNCTION f([argtypes]) IS '…'`` — store on the function
+        # doc for pg_description reflection. The arg list picks the overload
+        # by arity; the bare-name form comments the sole overload.
+        node = stmt.this
+        nargs: int | None = None
+        if isinstance(node, exp.UserDefinedFunction):
+            nargs = len(node.args.get("expressions") or [])
+            node = node.this
+        fname = node.name.lower()
+        target = None
+        if nargs is not None:
+            target = catalog.get_function(db, fname, nargs)
+        else:
+            matches = [f for f in catalog.list_functions(db) if f["name"].lower() == fname]
+            if len(matches) == 1:
+                target = matches[0]
+            elif len(matches) > 1:
+                raise errors.SQLError("42725", f'function name "{fname}" is not unique')
+        if target is None:
+            raise errors.SQLError("42883", f"function {fname} does not exist")
+        target = {k: v for k, v in target.items() if k != "_id"}
+        target["comment"] = text
+        catalog.put_function(db, target)
         return SQLResult(command_tag="COMMENT")
     raise errors.feature_not_supported(f"COMMENT ON {kind} is not supported")
 
