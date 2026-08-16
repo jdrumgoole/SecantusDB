@@ -87,12 +87,33 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
         results: list[SQLResult] = []
         if session.get_setting("standard_conforming_strings").lower() in ("off", "false", "0"):
             sql = planner.decode_nonstandard_strings(sql)
+        stmts = planner.parse(sql)
+        # A MULTI-statement simple query runs in ONE implicit transaction,
+        # like real PG: a mid-batch error rolls back the earlier statements'
+        # writes (their result rows were already streamed — PG streams too),
+        # and an explicit BEGIN inside the batch takes the transaction over
+        # while COMMIT/ROLLBACK end it (the remainder starts a fresh implicit
+        # one). Pinned by the pgtest batch_stmt corpus.
+        implicit = len(stmts) > 1 and session.txn_handle is None
+        if implicit:
+            session.txn_handle = storage.begin_user_transaction()
+            session.txn_failed = False
+            session.txn_is_implicit = True
         try:
-            for stmt in planner.parse(sql):
+            for stmt in stmts:
+                if implicit and session.txn_handle is None:
+                    session.txn_handle = storage.begin_user_transaction()
+                    session.txn_failed = False
+                    session.txn_is_implicit = True
                 result = _normalize_result(_dispatch(stmt, storage, db, catalog, session))
                 _drain_plpgsql_notices(session, result)
                 results.append(result)
+            if implicit and session.txn_handle is not None and session.txn_is_implicit:
+                _commit_txn(storage, db, catalog, session)
         except errors.SQLError as exc:
+            if implicit and session.txn_handle is not None and session.txn_is_implicit:
+                with contextlib.suppress(Exception):
+                    _rollback_txn(storage, session)
             # Real PG streams each statement's results as it executes, so a
             # mid-batch error still delivers the EARLIER statements' rows
             # before the ErrorResponse (pgx's ExecMultipleQueriesError counts
@@ -393,6 +414,11 @@ def _dispatch(
     if session.get_setting("transaction_read_only") == "on":
         verb = _write_statement_verb(stmt)
         if verb is not None:
+            if session.txn_handle is not None:
+                # Any error inside a transaction block poisons it (RFQ 'E')
+                # — this gate raises BEFORE the wrapped execution whose
+                # except-clause normally sets the flag.
+                session.txn_failed = True
             raise errors.SQLError("25006", f"cannot execute {verb} in a read-only transaction")
 
     if session.txn_handle is not None:
@@ -407,10 +433,17 @@ def _dispatch(
 
 
 def _begin_txn(storage: Any, session: Session, modes: list | None = None) -> SQLResult:
-    # An explicit BEGIN inside an extended-protocol IMPLICIT transaction takes
-    # it over (PG semantics): same handle, now a real block.
+    # An explicit BEGIN inside an IMPLICIT transaction (extended-protocol
+    # pipeline or a multi-statement simple batch) takes it over (PG
+    # semantics): same handle, now a real block — and the BEGIN's
+    # characteristics still apply (``BEGIN READ ONLY`` mid-batch must make
+    # the following INSERT fail 25006; pgtest batch_stmt pins it).
     if session.txn_handle is not None and session.txn_is_implicit:
         session.txn_is_implicit = False
+        for name, value in _parse_txn_characteristics(
+            " ".join(str(m) for m in (modes or []))
+        ).items():
+            session.set_local(name, value)
         return SQLResult(command_tag="BEGIN")
     # A nested BEGIN is a no-op in Postgres (it warns and stays in the block).
     if session.txn_handle is None:

@@ -2596,16 +2596,18 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   43 → 40 failing files; slice 2 fixed the XX000-leak class (malformed
   binary array params → 08P01, malformed array-literal casts → 22P02 —
   files advance internally, count still 40). Known next divergences:
-  slice 3 greened `array` (nested constructors now recurse to the base
-  array type) and landed the `::JSON[]` 199/114 identities; slice 4
-  greened `json` AND `json_array` — plain-json casts of recoverable text
-  now echo the client's bytes VERBATIM (scalar and array elements),
-  which NARROWS the documented verbatim divergence to table-stored json
-  columns only; jsonb binary params are version/UTF-8-validated (08P01/
-  22021) and known-type element-oid mismatches are 42804. Corpus: 37
-  unexpected failures; green so far: aborted_txn, array, json,
-  json_array (+1 from slice 1). Next: `batch_stmt`, `bind_and_resolve`,
-  `char`, `citext`. Iterate file-by-file.
+  slices 3–4 greened `array`, `json`, `json_array` (nested-constructor
+  typing; JSON[] 199/114 identities; VERBATIM plain-json echo narrowing
+  that divergence to table-stored columns; jsonb binary validation;
+  42804/08P01 element-oid split). Slice 5 greened `batch_stmt` and
+  CLOSED the recorded batch-transaction divergence: a multi-statement
+  simple query is now ONE implicit transaction (mid-batch errors roll
+  back earlier writes; BEGIN takes over with its characteristics —
+  READ ONLY gates + poisons; COMMIT splits), with a top-level-semicolon
+  segment-parse fallback for batches sqlglot rejects whole. Corpus: 36
+  unexpected failures; green: aborted_txn, array, batch_stmt, json,
+  json_array (+1). Next: `bind_and_resolve`, `char`, `citext`, `copy`.
+  Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
