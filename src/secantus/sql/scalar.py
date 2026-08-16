@@ -1960,6 +1960,24 @@ def _operand_is_json(node: exp.Expression) -> bool:
     return isinstance(node, exp.Cast) and typemap.type_tag_for_sql(node.to) == "json"
 
 
+def _plain_json_operand_text(operand: exp.Expression) -> str | None:
+    """The raw text under a plain-JSON cast, when recoverable: a string
+    literal (``'{"a": 1}'::JSON``) or the substituted ``::jsonb`` cast a
+    JsonText parameter becomes. None otherwise (computed values keep the
+    parsed path)."""
+    node = operand
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if isinstance(node, exp.Cast):
+        inner_tag = typemap.type_tag_for_sql(node.to) if node.to is not None else None
+        if inner_tag == "json":
+            return _plain_json_operand_text(node.this)
+        return None
+    if isinstance(node, exp.Literal) and node.is_string:
+        return node.this
+    return None
+
+
 def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     value = evaluate(node.this, scope, ctx)
     # ``'ok'::mood`` — a cast to a declared enum validates the label (22P02) and
@@ -2073,6 +2091,23 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
                 "22P02", f'invalid input syntax for type oid: "{value}"'
             ) from None
     if value is not None and to_tag_early == "json":
+        # A PLAIN-json cast target (::JSON, oid 114) echoes its input text
+        # VERBATIM in PG. When the operand's raw text is recoverable — a
+        # string literal, or the substituted ::jsonb cast of a JsonText
+        # parameter — validate it parses (22P02) and carry it as JsonText so
+        # rendering emits the client's own bytes. jsonb (and computed JSON
+        # values) keep the parsed form and canonical rendering.
+        ident = typemap.cast_type_identity(node.to) if node.to is not None else None
+        if ident is not None and ident[0] == 114:
+            raw = _plain_json_operand_text(node.this)
+            if raw is not None:
+                try:
+                    typemap.coerce(raw, "json")
+                except ValueError as e:
+                    raise errors.SQLError(
+                        "22P02", f"invalid input syntax for type json: {raw[:80]!r}"
+                    ) from e
+                return typemap.JsonText(raw)
         # ``'{"a":1}'::jsonb`` parses into a real JSON value so ``->`` navigation
         # and rendering see a dict/list, not raw text (which would double-encode).
         if isinstance(value, (dict, list, bool, int, float)):
@@ -2250,6 +2285,30 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     # elements never compares equal to array[…] of real range values).
     if value is not None and typemap.is_array_tag(to):
         elem_tag = typemap.array_element_tag(to)
+        # A plain ``::JSON[]`` cast keeps each element's text VERBATIM, like
+        # the scalar ::JSON rule — PG's json preserves input bytes and the
+        # pgtest corpus reads the binary array elements byte-for-byte.
+        ident = typemap.cast_type_identity(node.to) if node.to is not None else None
+        if ident is not None and ident[0] == 199 and isinstance(value, str):
+            try:
+                elems = typemap._parse_pg_array_literal(value)
+            except ValueError as e:
+                raise errors.SQLError("22P02", f'malformed array literal: "{value}"') from e
+
+            def _wrap(v):
+                if isinstance(v, list):
+                    return [_wrap(x) for x in v]
+                if v is None:
+                    return None
+                try:
+                    typemap.coerce(v, "json")
+                except ValueError as e:
+                    raise errors.SQLError(
+                        "22P02", f"invalid input syntax for type json: {str(v)[:80]!r}"
+                    ) from e
+                return typemap.JsonText(v)
+
+            return _wrap(elems)
         if elem_tag in typemap._RANGE_TAGS or elem_tag in typemap._MULTIRANGE_TAGS:
             return typemap.coerce(value, to)
         # An array-literal string cast (``'{a,b,c}'::text[]``) materialises the
