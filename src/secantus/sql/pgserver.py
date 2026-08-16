@@ -684,6 +684,13 @@ class SecantusPGServer:
                 # (PostgresMain); routing them to the extended-protocol
                 # dispatch instead raised 08P01 and poisoned the connection.
                 continue
+            if ext.skip_until_sync and msg.type in ("Q", "F"):
+                # An errored extended-protocol pipeline discards EVERYTHING
+                # until Sync — including interleaved simple Query messages
+                # (PG's ignore_till_sync; the pgtest corpus pins the shape:
+                # "the SELECT 1 queries should be ignored and should not
+                # return ReadyForQuery").
+                continue
             if msg.type == "F":  # Fastpath FunctionCall (pgjdbc large objects)
                 conn.sendall(self._handle_fastpath(session, msg.payload))
                 continue

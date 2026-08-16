@@ -1065,6 +1065,48 @@ class ExtendedSession:
         # Session) can list this connection's prepared statements.
         session.wire_prepared = self.prepared
 
+    _TXN_EXIT_RE = None  # compiled lazily below
+
+    def _targets_txn_exit(self, msg_type: str, payload: bytes) -> bool:
+        """Whether this message names/contains a transaction-exit statement
+        (COMMIT / ROLLBACK / ABORT / END) — permitted inside an aborted
+        transaction, like PG's IsTransactionExitStmt."""
+        import re as _re
+
+        if ExtendedSession._TXN_EXIT_RE is None:
+            ExtendedSession._TXN_EXIT_RE = _re.compile(r"^\s*(commit|rollback|abort|end)\b", _re.I)
+        try:
+            if msg_type == "P":
+                _name, query, _oids = pgwire.parse_parse(payload, self.session.wire_encoding)
+                return bool(ExtendedSession._TXN_EXIT_RE.match(query))
+            if msg_type == "B":
+                # Bind starts with two NUL-terminated names: portal, statement.
+                parts = payload.split(b"\x00", 2)
+                stmt_name = parts[1].decode("utf-8", "replace") if len(parts) > 1 else ""
+                prep = self.prepared.get(stmt_name)
+            elif msg_type == "E":
+                portal_name, _max = pgwire.parse_execute(payload)
+                portal = self.portals.get(portal_name)
+                prep = portal.prepared if portal is not None else None
+            else:  # "D"
+                kind, name = pgwire.parse_describe(payload)
+                if kind == "S":
+                    prep = self.prepared.get(name)
+                else:
+                    portal = self.portals.get(name)
+                    prep = portal.prepared if portal is not None else None
+            stmt = getattr(prep, "stmt", None)
+            if stmt is None:
+                return False
+            return isinstance(stmt, (exp.Commit, exp.Rollback)) or (
+                isinstance(stmt, exp.Command)
+                and bool(ExtendedSession._TXN_EXIT_RE.match(str(stmt.this or "")))
+            )
+        except Exception:
+            # A malformed payload takes the normal path and surfaces its own
+            # parse error rather than a misleading 25P02.
+            return True
+
     def process(self, msg_type: str, payload: bytes) -> bytes:
         """Handle one extended-protocol message; return the bytes to send."""
         if msg_type == "S":  # Sync — always answered, clears any error state
@@ -1093,6 +1135,24 @@ class ExtendedSession:
             return b""  # discard everything until the next Sync
         if msg_type == "H":  # Flush — we send eagerly, nothing to flush
             return b""
+        if (
+            msg_type in ("P", "B", "D", "E")
+            and self.session.txn_failed
+            and self.session.txn_handle is not None
+            and not self.session.txn_is_implicit
+            and not self._targets_txn_exit(msg_type, payload)
+        ):
+            # An ABORTED explicit transaction rejects every extended-protocol
+            # step with 25P02 until it ends — except the transaction-exit
+            # statements themselves (COMMIT/ROLLBACK), exactly PG's
+            # IsTransactionExitStmt carve-out (the pgtest corpus pins the
+            # Parse-in-aborted-txn shape).
+            self.skip_until_sync = True
+            return pgwire.error_response(
+                "25P02",
+                "current transaction is aborted, commands ignored until end of transaction block",
+                encoding=self.session.wire_encoding,
+            )
         try:
             # Parse/Bind/Describe read the catalog (pg_typeof rewrites, minted
             # user-type oid resolution, RowDescription) — inside an open

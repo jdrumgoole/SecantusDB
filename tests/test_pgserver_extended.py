@@ -434,3 +434,86 @@ def test_parameter_description_wraps_int16_count_like_pg():
     # 1 type byte + int32 length + int16 (wrapped to 0) + 65536 * int32 oids
     assert len(msg) == 1 + 4 + 2 + 65536 * 4
     assert msg[5:7] == b"\x00\x00"  # 65536 & 0xFFFF == 0
+
+
+# --------------------------------------------------------------------------- #
+# Aborted-transaction pipeline semantics (the pgtest aborted_txn corpus):
+# extended-protocol steps in an ABORTED explicit transaction fail 25P02 —
+# except the transaction-exit statements (COMMIT/ROLLBACK), PG's
+# IsTransactionExitStmt carve-out — and an errored pipeline discards even
+# interleaved simple Query messages until Sync (PG's ignore_till_sync).
+
+
+def _abort_txn(c):
+    c.exchange(
+        pgwire.build_parse("", "BEGIN", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    msgs = c.exchange(
+        pgwire.build_parse("", "SELECT 1/0", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert error_code(msgs) is not None
+
+
+def test_parse_in_aborted_txn_is_25P02(client):
+    _abort_txn(client)
+    msgs = client.exchange(pgwire.build_parse("s1", "SELECT 1", []))
+    assert error_code(msgs) == "25P02"
+    client.exchange(
+        pgwire.build_parse("", "ROLLBACK", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    ok = client.exchange(
+        pgwire.build_parse("", "SELECT 1", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert rows(ok) == [[b"1"]]
+
+
+def test_parse_rollback_allowed_in_aborted_txn(client):
+    _abort_txn(client)
+    msgs = client.exchange(
+        pgwire.build_parse("rb", "ROLLBACK", []),
+        pgwire.build_bind("", "rb", []),
+        pgwire.build_execute("", 0),
+    )
+    assert error_code(msgs) is None
+    ok = client.exchange(
+        pgwire.build_parse("", "SELECT 1", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert rows(ok) == [[b"1"]]
+
+
+def test_errored_pipeline_discards_interleaved_simple_query(client):
+    client.exchange(
+        pgwire.build_parse("", "CREATE TABLE uq_pipe (n int unique)", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    client.exchange(
+        pgwire.build_parse("", "INSERT INTO uq_pipe VALUES (1)", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    # Duplicate insert errors mid-pipeline; the interleaved simple Query must
+    # be discarded entirely (no DataRow, no extra ReadyForQuery) — PG's
+    # ignore_till_sync, pinned by the pgtest aborted_txn corpus.
+    client.sock.sendall(
+        pgwire.build_parse("", "INSERT INTO uq_pipe VALUES (1)", [])
+        + pgwire.build_bind("", "", [])
+        + pgwire.build_execute("", 0)
+        + pgwire.build_query("SELECT 99")
+        + pgwire.build_sync()
+    )
+    msgs = client._read_until_ready()
+    assert error_code(msgs) == "23505"
+    tps = types(msgs)
+    assert "D" not in tps
+    assert tps.count("Z") == 1
