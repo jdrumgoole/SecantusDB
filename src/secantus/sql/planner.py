@@ -3898,6 +3898,19 @@ def infer_parameter_types(
                 if fname in typemap._RANGE_TAGS or fname in typemap._MULTIRANGE_TAGS:
                     oids[idx] = typemap.PG_OID[fname]
                     continue
+            elif isinstance(other, exp.Column) and catalog is not None and db is not None:
+                # citext ships its OWN operator family, so PG's parse analysis
+                # types an unknown param compared against a citext column as
+                # citext (the pgtest citext corpus reads 90008). Other column
+                # types keep the text default — the same corpus pins a "char"
+                # comparison param at 25, so this is citext-only on purpose.
+                cname = other.name
+                for tbl in stmt.find_all(exp.Table):
+                    t = catalog.get(db, tbl.name)
+                    col = t.column(cname) if t is not None else None
+                    if col is not None and col.type_tag == "citext":
+                        oids[idx] = typemap.PG_OID["citext"]
+                        break
         if target is None:
             continue
         # ``$1::REGCLASS`` and friends parse as ObjectIdentifier, not
