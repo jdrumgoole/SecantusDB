@@ -2869,16 +2869,26 @@ shared storage engine or building large new protocol subsystems:
     only becomes observable once array rows exist, and both should be fixed
     together. Widening `pg_type` touches every gauge that reads the catalog
     (psycopg especially), so measure across gauges, not just pgjdbc.
-  - **Metadata classes, revealed by the setup unlock (2026-08-16)** — the
-    COMMENT ON FUNCTION + rowtype-column fixes let four classes run; what
-    they revealed, biggest first: ResultSetMetaDataTest 28F in four
-    clusters (composite columns must report Types.STRUCT/2002 via a
-    pg_type-visible composite oid, not OTHER/1111 — 12F; base
-    column/table names empty in RowDescription for some shapes — 8F;
-    typmod metadata ignored: timestamp(3) precision and varchar(n)
-    display size — 8F). DatabaseMetaDataTest needs a queryable
-    `pg_description` RELATION (comments are stored but not exposed as a
-    catalog table). RefCursorTest/RefCursorFetchTest need plpgsql
+  - **Metadata classes, revealed by the setup unlock (2026-08-16)** —
+    ResultSetMetaDataTest is now a clean 60/60 (STRUCT oids + base-column
+    identity + declared typmods, PR #920). DatabaseMetaDataTest's setup
+    is fully unblocked (pg_description DML + operator DDL + PK USING
+    INDEX + composite arrays + OUT-param arity): 74 pass, 82F across 18
+    clusters (2026-08-16 run), biggest first: MaxIndexKeys via missing
+    `pg_am`/`pg_settings` catalog data (18F, kills all FK metadata);
+    assorted boolean asserts needing per-test triage (16F);
+    `pg_proc.proargmodes` column (6F); quoted-uppercase output aliases
+    like `"TABLE_TYPE"` erroring instead of resolving (6F + 4F
+    "DATA_TYPE" — likely one alias-resolution bug); COMMENT ON TYPE (6F)
+    and COMMENT ON INDEX (2F) unsupported; `pg_class.reltuples` column
+    (4F); ACL reflection: getTablePrivileges empty for tables/views/
+    matviews (6F); domainColumnSize typmod not flowing through domain
+    columns (2F); customArrayTypeInfo array-elem typname (2F); indexInfo
+    mixed expression+column multi-key index (2F); catalogs list missing
+    "postgres" (2F); pg_get_keywords() in-context (2F);
+    getColumnsCharOctetLength (2F); ALTER TABLE DROP of a quoted
+    ``"name"`` column mis-parsed as `DROP name` (2F).
+    RefCursorTest/RefCursorFetchTest need plpgsql
     `OPEN <cursor> FOR ...` (refcursor support — a real feature).
   - **AutoRollbackTest savepoint/autosave semantics** (~24): `autosave`
     modes and `flushCacheOnDeallocate` / `DEALLOCATE ALL` behaviour around

@@ -103,6 +103,12 @@ DOMAIN_COLLECTION = "__sql_domains__"
 COMPOSITE_COLLECTION = "__sql_composites__"
 FUNCTION_COLLECTION = "__sql_functions__"
 POLICY_COLLECTION = "__sql_policies__"
+# Direct DML against the pg_description virtual relation (suppressed derived
+# rows + extra rows) — see ``virtual._pg_description``.
+DESCRIPTION_DELTA_COLLECTION = "__sql_description_delta__"
+# User-defined operators (CREATE OPERATOR) — registered so the DDL round-trips;
+# expression evaluation does not consult them.
+OPERATOR_COLLECTION = "__sql_operators__"
 RLS_COLLECTION = "__sql_rls__"
 COLUMN_GRANT_COLLECTION = "__sql_column_grants__"
 
@@ -129,6 +135,8 @@ ALL_CATALOG_COLLECTIONS = (
     POLICY_COLLECTION,
     RLS_COLLECTION,
     COLUMN_GRANT_COLLECTION,
+    DESCRIPTION_DELTA_COLLECTION,
+    OPERATOR_COLLECTION,
 )
 
 
@@ -1116,6 +1124,24 @@ class Catalog:
         key = self._function_key(doc["name"], doc["nargs"])
         self._storage.delete_matching(db, FUNCTION_COLLECTION, {"_id": key})
         self._storage.insert(db, FUNCTION_COLLECTION, [{"_id": key, **doc}])
+
+    @staticmethod
+    def _operator_key(name: str, left: str, right: str) -> str:
+        return f"{name}/{left.lower()}/{right.lower()}"
+
+    def put_operator(self, db: str, doc: dict[str, Any]) -> None:
+        key = self._operator_key(doc["name"], doc["leftarg"], doc["rightarg"])
+        self._storage.delete_matching(db, OPERATOR_COLLECTION, {"_id": key})
+        self._storage.insert(db, OPERATOR_COLLECTION, [{"_id": key, **doc}])
+
+    def get_operator(self, db: str, name: str, left: str, right: str) -> dict[str, Any] | None:
+        key = self._operator_key(name, left, right)
+        docs = self._storage.find_matching(db, OPERATOR_COLLECTION, {"_id": key}, limit=1)
+        return docs[0] if docs else None
+
+    def drop_operator(self, db: str, name: str, left: str, right: str) -> bool:
+        key = self._operator_key(name, left, right)
+        return self._storage.delete_matching(db, OPERATOR_COLLECTION, {"_id": key}) > 0
 
     def get_function(self, db: str, name: str, nargs: int) -> dict[str, Any] | None:
         key = self._function_key(name, nargs)

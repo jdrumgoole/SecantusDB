@@ -1239,6 +1239,81 @@ def _run_delete_using(
     return SQLResult(command_tag=f"DELETE {n}", rowcount=n)
 
 
+def _targets_pg_description(stmt: exp.Expression, catalog: Catalog, db: str) -> bool:
+    """A DML statement writing the ``pg_description`` virtual relation (bare or
+    ``pg_catalog``-qualified), unless a real user table shadows the name."""
+    node = stmt.this if isinstance(stmt.this, exp.Table) else stmt.find(exp.Table)
+    if node is None or node.name.lower() != "pg_description":
+        return False
+    schema = node.args.get("db")
+    if schema is not None and schema.name.lower() != "pg_catalog":
+        return False
+    return schema is not None or catalog.get(db, "pg_description") is None
+
+
+def _run_pg_description_dml(
+    stmt: exp.Update | exp.Delete, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult:
+    """UPDATE / DELETE against ``pg_description``, persisted as a delta over the
+    derived comment rows (see ``virtual._pg_description``).
+
+    Real PG lets a superuser edit the catalog directly; DatabaseMetaDataTest's
+    setup moves a function comment onto a table's oid to manufacture a
+    duplicate-description row and prove the metadata queries' classoid guards.
+    Matched rows are suppressed by key and re-emitted with the assignments
+    applied (UPDATE) or just suppressed (DELETE)."""
+    from secantus.sql.catalog import DESCRIPTION_DELTA_COLLECTION
+
+    rows = virtual._pg_description(db, session, storage, catalog)
+    where = stmt.args.get("where")
+    sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+
+    def scope_for(row: dict[str, Any]):
+        def scope(node: Any) -> Any:
+            if node.name in row:
+                return row[node.name]
+            raise errors.SQLError("42703", f'column "{node.name}" does not exist')
+
+        return scope
+
+    matched: list[dict[str, Any]] = []
+    for row in rows:
+        if where is None or scalar._truthy(scalar.evaluate(where.this, scope_for(row), sctx)):
+            matched.append(row)
+    docs: list[dict[str, Any]] = []
+    for row in matched:
+        key = f"{row['objoid']}/{row['classoid']}/{row['objsubid']}"
+        docs.append({"_id": f"s/{key}", "kind": "suppress", "key": key})
+        if isinstance(stmt, exp.Update):
+            new_row = dict(row)
+            for assign in stmt.expressions:
+                col = assign.this.name
+                if col not in new_row:
+                    raise errors.SQLError("42703", f'column "{col}" does not exist')
+                value = scalar.evaluate(assign.expression, scope_for(row), sctx)
+                new_row[col] = int(value) if col != "description" else value
+            new_key = f"{new_row['objoid']}/{new_row['classoid']}/{new_row['objsubid']}"
+            docs.append(
+                {
+                    "_id": f"e/{new_key}",
+                    "kind": "extra",
+                    "objoid": new_row["objoid"],
+                    "classoid": new_row["classoid"],
+                    "objsubid": new_row["objsubid"],
+                    "description": new_row["description"],
+                }
+            )
+        else:
+            # DELETE also drops a previously-inserted extra row with this key.
+            storage.delete_matching(db, DESCRIPTION_DELTA_COLLECTION, {"_id": f"e/{key}"})
+    for doc in docs:
+        storage.delete_matching(db, DESCRIPTION_DELTA_COLLECTION, {"_id": doc["_id"]})
+    if docs:
+        storage.insert(db, DESCRIPTION_DELTA_COLLECTION, docs)
+    verb = "UPDATE" if isinstance(stmt, exp.Update) else "DELETE"
+    return SQLResult(command_tag=f"{verb} {len(matched)}", rowcount=len(matched))
+
+
 def _run_update_from(
     stmt: exp.Update, storage: Any, db: str, catalog: Catalog, session: Session
 ) -> SQLResult:
@@ -2251,6 +2326,8 @@ def _run_statement(
         return _run_insert(stmt, storage, db, catalog, session, check_option=check_pred)
 
     if isinstance(stmt, exp.Update):
+        if _targets_pg_description(stmt, catalog, db):
+            return _run_pg_description_dml(stmt, storage, db, catalog, session)
         if stmt.args.get("from_") is not None:
             return _run_update_from(stmt, storage, db, catalog, session)
         table = _require_table(
@@ -2261,6 +2338,8 @@ def _run_statement(
         return executor.execute_update(plan, storage, db, catalog, session)
 
     if isinstance(stmt, exp.Delete):
+        if _targets_pg_description(stmt, catalog, db):
+            return _run_pg_description_dml(stmt, storage, db, catalog, session)
         if stmt.args.get("using"):
             return _run_delete_using(stmt, storage, db, catalog, session)
         table = _require_table(
@@ -2322,6 +2401,10 @@ def _run_statement(
             return _create_extension_command(stmt)
         if verb == "DROP" and _command_text(stmt).lstrip().upper().startswith("EXTENSION"):
             return _drop_extension_command(stmt)
+        if verb == "CREATE" and _command_text(stmt).lstrip().upper().startswith("OPERATOR"):
+            return _create_operator_command(stmt, db, catalog)
+        if verb == "DROP" and _command_text(stmt).lstrip().upper().startswith("OPERATOR"):
+            return _drop_operator_command(stmt, db, catalog)
         if verb == "CREATE" and _command_text(stmt).lstrip().upper().startswith("POLICY"):
             return _create_policy_command(stmt, storage, db, catalog)
         if verb == "DROP" and _command_text(stmt).lstrip().upper().startswith("POLICY"):
@@ -3137,6 +3220,19 @@ def _run_mixed_alter_table(
     segments = _split_top_level_commas(m.group("rest"))
     combined: exp.Alter | None = None
     for seg in segments:
+        pk_using = _ADD_PK_USING_INDEX_RE.match(seg)
+        if pk_using is not None:
+            if len(segments) != 1:
+                raise errors.feature_not_supported(
+                    "ADD PRIMARY KEY USING INDEX cannot be combined with other actions"
+                )
+            return _add_pk_using_index(
+                _unquote_ident(m.group("name")),
+                _unquote_ident(pk_using.group("index")),
+                storage,
+                db,
+                catalog,
+            )
         parsed = planner.parse(prefix + seg)
         node = parsed[0] if parsed else None
         if not isinstance(node, exp.Alter):
@@ -3148,6 +3244,37 @@ def _run_mixed_alter_table(
     if combined is None:
         raise errors.feature_not_supported(f"ALTER TABLE not supported: {text}")
     return _run_statement(combined, storage, db, catalog, session)
+
+
+_ADD_PK_USING_INDEX_RE = re.compile(
+    r'(?is)^ADD\s+(?:CONSTRAINT\s+(?:"[^"]+"|\w+)\s+)?PRIMARY\s+KEY\s+'
+    r'USING\s+INDEX\s+(?P<index>"[^"]+"|\w+)$'
+)
+
+
+def _add_pk_using_index(
+    table_name: str, index_name: str, storage: Any, db: str, catalog: Catalog
+) -> SQLResult:
+    """``ALTER TABLE t ADD PRIMARY KEY USING INDEX idx`` — promote an existing
+    unique index to the table's primary key (the constraint takes the index's
+    name, like real PG). The key columns come from the index's key spec;
+    INCLUDE columns stay non-key."""
+    table = _require_table(catalog, db, table_name, storage)
+    index = next(
+        (ix for ix in storage.list_indexes(db, table.collection) if ix.get("name") == index_name),
+        None,
+    )
+    if index is None:
+        raise errors.SQLError(
+            "42704", f'index "{index_name}" for table "{table_name}" does not exist'
+        )
+    if not index.get("unique"):
+        raise errors.SQLError("42809", f'"{index_name}" is not a unique index')
+    field_to_col = {c.field: c.name for c in table.columns}
+    pk_cols = [field_to_col.get(f, f) for f in (index.get("key") or {})]
+    executor._add_primary_key(table, pk_cols, index_name, storage, db)
+    catalog.replace(db, table, old_name=table.name)
+    return SQLResult(command_tag="ALTER TABLE")
 
 
 # CREATE/DROP/ALTER ROLE | USER | GROUP arrive as a Command; the tail carries the
@@ -3867,6 +3994,54 @@ def _drop_extension_command(stmt: exp.Command) -> SQLResult:
     return SQLResult(command_tag="DROP EXTENSION")
 
 
+_OPERATOR_NAME = r"[+\-*/<>=~!@#%^&|`?]+"
+_CREATE_OPERATOR_RE = re.compile(
+    rf"^OPERATOR\s+(?P<name>{_OPERATOR_NAME})\s*\((?P<opts>.*)\)\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_DROP_OPERATOR_RE = re.compile(
+    rf"^OPERATOR\s+(?P<ifclause>IF\s+EXISTS\s+)?(?P<name>{_OPERATOR_NAME})\s*"
+    r"\(\s*(?P<left>[^,]+?)\s*,\s*(?P<right>[^)]+?)\s*\)\s*(?:CASCADE|RESTRICT)?\s*;?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _create_operator_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLResult:
+    """``CREATE OPERATOR & (LEFTARG = numeric, RIGHTARG = integer, PROCEDURE =
+    f6)`` — registered in the catalog so the DDL round-trips (pgjdbc's
+    DatabaseMetaDataTest creates one in setup); expression evaluation does not
+    consult user operators."""
+    m = _CREATE_OPERATOR_RE.match(_command_text(stmt).strip())
+    if m is None:
+        raise errors.syntax_error(f"unparseable CREATE OPERATOR: {stmt.sql()}")
+    opts: dict[str, str] = {}
+    for part in m.group("opts").split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            opts[k.strip().lower()] = v.strip()
+    proc = opts.get("procedure") or opts.get("function")
+    left, right = opts.get("leftarg"), opts.get("rightarg")
+    if proc is None or left is None or right is None:
+        raise errors.syntax_error("CREATE OPERATOR needs LEFTARG, RIGHTARG and PROCEDURE")
+    if not any(f["name"] == proc.lower() and f["nargs"] == 2 for f in catalog.list_functions(db)):
+        raise errors.SQLError("42883", f"function {proc}({left}, {right}) does not exist")
+    catalog.put_operator(
+        db,
+        {"name": m.group("name"), "leftarg": left, "rightarg": right, "procedure": proc},
+    )
+    return SQLResult(command_tag="CREATE OPERATOR")
+
+
+def _drop_operator_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLResult:
+    m = _DROP_OPERATOR_RE.match(_command_text(stmt).strip())
+    if m is None:
+        raise errors.syntax_error(f"unparseable DROP OPERATOR: {stmt.sql()}")
+    name, left, right = m.group("name"), m.group("left"), m.group("right")
+    if not catalog.drop_operator(db, name, left, right) and m.group("ifclause") is None:
+        raise errors.SQLError("42883", f"operator does not exist: {left} {name} {right}")
+    return SQLResult(command_tag="DROP OPERATOR")
+
+
 # ``TYPE <name> AS RANGE (<options>)`` — the Command tail of a CREATE that
 # sqlglot can't parse. Options are ``key = value`` pairs; only ``subtype``
 # affects behaviour (collation / opclass / canonical are accepted, ignored).
@@ -3941,6 +4116,21 @@ def _function_params(udf: exp.Expression) -> list[str | None]:
     return names
 
 
+def _function_input_nargs(udf: exp.Expression) -> int:
+    """The number of INPUT parameters (IN / INOUT / VARIADIC) — PG's function
+    identity excludes OUT-only parameters, so ``f3(IN a int, INOUT b varchar,
+    OUT c timestamptz)`` is ``f3(int, varchar)`` to DROP FUNCTION and callers."""
+    n = 0
+    for p in udf.expressions or []:
+        out_only = False
+        for c in p.args.get("constraints") or [] if isinstance(p, exp.ColumnDef) else []:
+            if isinstance(c, exp.InOutColumnConstraint):
+                out_only = bool(c.args.get("output")) and not bool(c.args.get("input_"))
+        if not out_only:
+            n += 1
+    return n
+
+
 def _function_param_types(udf: exp.Expression) -> list[str | None]:
     """Parameter type tags of a ``CREATE FUNCTION`` signature (positional), for
     ``pg_proc`` / ``information_schema.parameters`` reflection. Unknown → None."""
@@ -3965,7 +4155,7 @@ def _create_function(
     if fn_schema is not None and fn_schema.name.startswith("pg_temp_"):
         name = f"{fn_schema.name}.{name}"
     params = _function_params(udf)
-    nargs = len(params)
+    nargs = _function_input_nargs(udf)
 
     language = "sql"
     return_tag = None

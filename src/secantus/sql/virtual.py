@@ -1181,6 +1181,7 @@ def _pg_attrdef(db: str, session: Session, storage: Any, catalog: Catalog) -> li
 
 _PG_CLASS_OID = 1259  # the OID of the pg_class catalog itself (classoid for relations)
 _PG_CONSTRAINT_CLASSOID = 2606  # pg_constraint catalog OID (classoid for constraint comments)
+_PG_PROC_CLASSOID = 1255  # pg_proc catalog OID (classoid for function comments)
 
 
 def _pg_description(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -1236,6 +1237,42 @@ def _pg_description(db: str, session: Session, storage: Any, catalog: Catalog) -
                     "description": comment,
                 }
             )
+    # COMMENT ON FUNCTION rows (classoid pg_proc), keyed by the minted pg_proc
+    # oid so ``objoid = 'name'::regproc`` predicates resolve.
+    fn_oids = _function_oids(db, catalog)
+    for f in _functions(db, catalog):
+        comment = f.get("comment")
+        if comment is not None:
+            rows.append(
+                {
+                    "objoid": fn_oids[f"{f['name']}/{f['nargs']}"],
+                    "classoid": _PG_PROC_CLASSOID,
+                    "objsubid": 0,
+                    "description": comment,
+                }
+            )
+    # Direct DML against pg_description (DatabaseMetaDataTest's setup moves a
+    # function comment onto a table's oid to manufacture a duplicate row) is
+    # persisted as a delta over the derived rows: suppressed original keys
+    # plus replacement/inserted rows.
+    from secantus.sql.catalog import DESCRIPTION_DELTA_COLLECTION
+
+    delta = storage.find_matching(db, DESCRIPTION_DELTA_COLLECTION, {})
+    if delta:
+        suppressed = {d["key"] for d in delta if d.get("kind") == "suppress"}
+        rows = [
+            r for r in rows if f"{r['objoid']}/{r['classoid']}/{r['objsubid']}" not in suppressed
+        ]
+        for d in delta:
+            if d.get("kind") == "extra":
+                rows.append(
+                    {
+                        "objoid": d["objoid"],
+                        "classoid": d["classoid"],
+                        "objsubid": d["objsubid"],
+                        "description": d["description"],
+                    }
+                )
     return rows
 
 
