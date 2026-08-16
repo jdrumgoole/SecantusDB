@@ -2589,7 +2589,13 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
 - **sqllogictest**: 52/60 files, 8 expected divergences, 0 unexpected —
   identical to the committed report.
 - **pgtest**: 10/58 files — identical to the committed report (an older
-  backlog entry said 8/58; that was stale). Still the next big corpus.
+  backlog entry said 8/58; that was stale). Campaign started 2026-08-16:
+  the `aborted_txn` file's two protocol gaps (25P02 for extended steps in
+  aborted transactions with the COMMIT/ROLLBACK carve-out;
+  `ignore_till_sync` covering interleaved simple Query) took the corpus
+  43 → 40 failing files. Next targets: `array`, `batch_stmt`,
+  `bind_and_resolve`, `char` — iterate file-by-file, first divergence at
+  a time.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
