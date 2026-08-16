@@ -10338,6 +10338,7 @@ def _build_evaluated_join(
     out_columns: list[tuple[str, str]] = []
     out_enum_types: dict[int, str] = {}
     out_exprs: list[exp.Expression] = []
+    alias_exprs: dict[str, exp.Expression] = {}
     names = _NameAllocator()
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
@@ -10359,12 +10360,28 @@ def _build_evaluated_join(
             out_enum_types[len(out_columns)] = src_col.enum_type
         out_columns.append((names.fresh(name), _infer_scalar_tag(inner, resolve)))
         out_exprs.append(inner)
+        if alias is not None:
+            alias_exprs[alias] = inner
 
+    # ORDER BY may name a SELECT output alias (``ORDER BY "TABLE_TYPE"`` in
+    # pgjdbc's getTables) or an ordinal — Postgres resolves both to the output
+    # expression, and ``resolve`` only knows input columns, so a computed
+    # output alias must be substituted here or sorting raises 42703.
     order: list[tuple[exp.Expression, int, bool]] = []
     order_node = stmt.args.get("order")
     if order_node is not None:
         for o in order_node.expressions:
-            order.append((o.this, -1 if o.args.get("desc") else 1, _nulls_first(o)))
+            term = o.this
+            if isinstance(term, exp.Column) and not term.table and term.name in alias_exprs:
+                term = alias_exprs[term.name]
+            elif (
+                isinstance(term, exp.Literal)
+                and not term.is_string
+                and str(term.name).isdigit()
+                and 1 <= int(term.name) <= len(out_exprs)
+            ):
+                term = out_exprs[int(term.name) - 1]
+            order.append((term, -1 if o.args.get("desc") else 1, _nulls_first(o)))
     limit, skip = _limit_skip(stmt)
     # A correlated / EXISTS WHERE wasn't pushed into the pipeline (see
     # ``_build_join_pipeline``); carry it for per-joined-row evaluation.

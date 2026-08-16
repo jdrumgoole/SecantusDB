@@ -926,6 +926,8 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
             "relreplident": "d",
             "reloftype": 0,
             "reloptions": None,
+            # -1 = "no estimate yet" (PG's initial value; we never analyze).
+            "reltuples": -1.0,
         }
         for t in tables
     ]
@@ -941,6 +943,7 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
                 "relpersistence": "p",
                 "relam": _BTREE_AM_OID,
                 "reloptions": None,
+                "reltuples": -1.0,
             }
         )
     # Views are pg_class rows too (relkind 'v') — SQLAlchemy's get_view_names
@@ -1430,6 +1433,8 @@ def _pg_proc(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
             "pronargdefaults": 0,
             "proargtypes": argtypes,
             "proargnames": None,
+            "proargmodes": None,
+            "proallargtypes": None,
             "prosrc": name,
             "prokind": "f",
             "proretset": False,
@@ -1453,6 +1458,8 @@ def _pg_proc(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 "pronargdefaults": 0,
                 "proargtypes": argtypes,
                 "proargnames": names or None,
+                "proargmodes": None,
+                "proallargtypes": None,
                 "prosrc": fn.get("body"),
                 "prokind": "f",
                 "proretset": bool(fn.get("is_table")),
@@ -2612,6 +2619,7 @@ _register(
         ("relam", "int4"),
         ("reloptions", "text"),
         ("reltype", "int4"),
+        ("reltuples", "float4"),
     ],
     _pg_class,
 )
@@ -2858,6 +2866,8 @@ _register(
         ("pronargdefaults", "int4"),
         ("proargtypes", "text"),
         ("proargnames", "text[]"),
+        ("proargmodes", "text[]"),
+        ("proallargtypes", "text[]"),
         ("prosrc", "text"),
         ("prokind", "text"),
         ("proretset", "bool"),
