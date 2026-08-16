@@ -578,3 +578,62 @@ def test_plain_json_array_keeps_199(client):
     rd = next(m for m in msgs if m.type == "T")
     end = rd.payload.index(b"\x00", 2)
     assert _s.unpack_from("!i", rd.payload, end + 7)[0] == 199
+
+
+def test_jsonb_binary_param_version_checks(client):
+    # pgtest json corpus: an empty binary JSONB payload (no version byte) and
+    # an unknown version byte are both rejected, never silently accepted.
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT $1::JSONB", []),
+        pgwire.build_bind("", "", [b""], param_formats=[1]),
+        pgwire.build_execute("", 0),
+    )
+    assert error_code(msgs) == "08P01"
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT $1::JSONB", []),
+        pgwire.build_bind("", "", [b"\x02\x22\x22"], param_formats=[1]),
+        pgwire.build_execute("", 0),
+    )
+    assert error_code(msgs) == "08P01"
+
+
+def test_plain_json_echoes_verbatim(client):
+    # PG's json preserves input bytes: SELECT $1::JSON round-trips the
+    # client's own spacing (jsonb would normalise) — pgtest json:102.
+    spaced = b'{"key": "val"}'
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT $1::JSON", []),
+        pgwire.build_bind("", "", [spaced]),
+        pgwire.build_execute("", 0),
+    )
+    assert rows(msgs) == [[spaced]]
+
+
+def test_plain_json_array_elements_verbatim(client):
+    # Array elements keep their text too (pgtest json_array:124).
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT $1::JSON[]", []),
+        pgwire.build_bind("", "", [b'{"{\\"a\\": {}}"}']),
+        pgwire.build_execute("", 0),
+    )
+    assert rows(msgs) == [[b'{"{\\"a\\": {}}"}']]
+
+
+def test_binary_array_wrong_known_elem_oid_is_42804(client):
+    # A jsonb[] payload (elem oid 3802) bound as json[] (declared 199) is
+    # PG's 42804 datatype mismatch (pgtest json_array:246)…
+    payload = bytes.fromhex("000000000000000000000eda")
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT $1::JSON[]", [199]),
+        pgwire.build_bind("", "", [payload], param_formats=[1]),
+        pgwire.build_execute("", 0),
+    )
+    assert error_code(msgs) == "42804"
+    # …while a GARBAGE embedded oid stays the structural 08P01 (array:8).
+    bogus = bytes.fromhex("0000000100000000010101010000000100000000")
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT $1::INTERVAL[]", []),
+        pgwire.build_bind("", "", [bogus], param_formats=[1]),
+        pgwire.build_execute("", 0),
+    )
+    assert error_code(msgs) == "08P01"

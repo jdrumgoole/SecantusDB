@@ -159,8 +159,17 @@ def _decode_uuid(b: bytes) -> str:
 
 def _decode_jsonb(b: bytes) -> str:
     """Binary ``jsonb`` — a 1-byte version header, then JSON text. Wrapped as
-    ``JsonText`` so substitution casts it back to a parsed JSON value."""
-    return typemap.JsonText(bytes(b[1:]).decode("utf-8"))
+    ``JsonText`` so substitution casts it back to a parsed JSON value. An
+    empty payload (no version byte) or an unknown version is rejected like
+    real PG — the pgtest corpus pins both as errors, not silent acceptance."""
+    if len(b) < 1:
+        raise errors.SQLError("08P01", "insufficient data left in message")
+    if b[0] != 1:
+        raise errors.SQLError("08P01", f"unsupported jsonb version number {b[0]}")
+    try:
+        return typemap.JsonText(bytes(b[1:]).decode("utf-8"))
+    except UnicodeDecodeError as e:
+        raise errors.SQLError("22021", 'invalid byte sequence for encoding "UTF8"') from e
 
 
 # Range/multirange binary flags (Postgres' rangetypes.h).
@@ -686,8 +695,26 @@ def _encode_array(
     return bytes(out)
 
 
-def _decode_array(raw: bytes, encoding: str | None = "utf-8") -> list:
+def _decode_array(
+    raw: bytes, encoding: str | None = "utf-8", expected_elem_oid: int | None = None
+) -> list:
     try:
+        if expected_elem_oid is not None and len(raw) >= 12:
+            embedded = struct.unpack_from("!i", raw, 8)[0]
+            if (
+                embedded
+                and embedded != expected_elem_oid
+                and (embedded in typemap.OID_TO_TAG or embedded in _BINARY)
+            ):
+                # The declared array type and the payload's embedded element
+                # oid disagree on a KNOWN type (a jsonb[] payload bound as
+                # json[]) — PG's 42804 datatype mismatch. A garbage/unknown
+                # embedded oid falls through to the structural decode, whose
+                # truncation surfaces as 08P01 — the pgtest corpus pins both.
+                raise errors.SQLError(
+                    "42804",
+                    f"wrong element type: expected oid {expected_elem_oid}, got {embedded}",
+                )
         return _decode_array_inner(raw, encoding)
     except (struct.error, IndexError) as e:
         # A truncated / structurally-bogus binary array parameter (the pgtest
@@ -1088,7 +1115,8 @@ def _decode_param(raw: bytes | None, fmt: int, oid: int, encoding: str | None = 
         # A user-type array oid (a registered enum's array dumper binds with the
         # minted array oid); the embedded element oid is unknown to _BINARY, so
         # elements fall back to text — which IS an enum's value form.
-        items = _decode_array(raw, encoding)
+        expected = _ARRAY_ELEM_BY_OID.get(oid)
+        items = _decode_array(raw, encoding, expected[0] if expected else None)
         arr = _ARRAY_ELEM_BY_OID.get(oid)
         if arr is not None and arr[1] not in ("text", "citext", "json"):
             # Typed binary arrays substitute through a ``::tag[]`` cast so

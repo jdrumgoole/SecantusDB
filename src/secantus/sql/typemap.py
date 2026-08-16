@@ -1362,7 +1362,12 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
         # A JSON value renders as JSON text whatever its top-level type — a bare
         # ``true`` / ``"str"`` must not fall through to the bool/str renderers.
         # "json_plain" is an internal render-only tag: a plain ``json`` (oid
-        # 114) column renders compact, jsonb keeps its canonical spacing.
+        # 114) column renders compact, jsonb keeps its canonical spacing. A
+        # JsonText value is the client's own text, echoed VERBATIM — PG's
+        # plain json preserves input bytes (``SELECT $1::JSON`` round-trips
+        # exactly; the pgtest corpus compares them byte-for-byte).
+        if isinstance(value, JsonText):
+            return str(value).encode("utf-8")
         return _render_json(value, compact=(tag == "json_plain")).encode("utf-8")
     if isinstance(value, bool):
         return b"t" if value else b"f"

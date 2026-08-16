@@ -2596,14 +2596,16 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   43 → 40 failing files; slice 2 fixed the XX000-leak class (malformed
   binary array params → 08P01, malformed array-literal casts → 22P02 —
   files advance internally, count still 40). Known next divergences:
-  slice 3 greened `array` (nested constructors typed text[] — now
-  recurse to the base array type) and finished `json_array`'s oids
-  (`::JSON[]` keeps 199/114 end-to-end); `json_array` itself is recorded
-  as an EXPECTED divergence — its last stanza needs verbatim json text
-  (a hand-spaced element re-renders compact), the documented
-  parsed-storage tradeoff. Corpus: 38 unexpected failures. Next: `json`
-  (json:8 — an empty binary JSONB parameter must be 08P01), `batch_stmt`,
-  `bind_and_resolve`, `char`. Iterate file-by-file.
+  slice 3 greened `array` (nested constructors now recurse to the base
+  array type) and landed the `::JSON[]` 199/114 identities; slice 4
+  greened `json` AND `json_array` — plain-json casts of recoverable text
+  now echo the client's bytes VERBATIM (scalar and array elements),
+  which NARROWS the documented verbatim divergence to table-stored json
+  columns only; jsonb binary params are version/UTF-8-validated (08P01/
+  22021) and known-type element-oid mismatches are 42804. Corpus: 37
+  unexpected failures; green so far: aborted_txn, array, json,
+  json_array (+1 from slice 1). Next: `batch_stmt`, `bind_and_resolve`,
+  `char`, `citext`. Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
