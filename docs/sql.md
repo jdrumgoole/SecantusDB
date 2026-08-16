@@ -257,6 +257,20 @@ SELECT price, at FROM m;
 -- price -> Decimal('19.99'),  at -> datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC)
 ```
 
+Two **precision ceilings** follow from the BSON storage forms and are
+permanent divergences from real Postgres:
+
+- **Timestamps hold milliseconds, not microseconds.** BSON datetimes are
+  millisecond-precision, so `timestamp` / `timestamptz` values truncate
+  the microsecond digits real Postgres keeps:
+  `'2020-01-02 03:04:05.123456'` comes back as `… 03:04:05.123000`.
+  (pgjdbc's `TimestampTest` / `UpdateableResultTest` assert microsecond
+  round-trips and fail on exactly this.)
+- **`numeric` holds at most 34 significant digits.** Values are stored
+  as IEEE 754-2008 Decimal128, so a wider `numeric` rounds to 34
+  significant digits where real Postgres keeps arbitrary precision.
+  (pgjdbc's `NumericTransfer2Test` asserts wider round-trips.)
+
 ### Evolving a table (`ALTER TABLE`)
 
 `ALTER TABLE` rewrites the catalog entry and, where the data must follow, the

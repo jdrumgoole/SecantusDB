@@ -2851,10 +2851,14 @@ shared storage engine or building large new protocol subsystems:
     user-schema relation after `SET search_path`). Both pgjdbc metadata
     queries (getPrimaryKeys / getPrimaryUniqueKeys) run verbatim.
     UpdateableResultTest's four residuals are separate features: datetime
-    micros-vs-millis (BSON millisecond ceiling), serial
-    RETURN_GENERATED_KEYS, oid-column updatability, and the two metadata
-    classes' setup blockers (`COMMENT ON FUNCTION`, composite `CREATE
-    TYPE`).
+    micros-vs-millis (BSON millisecond ceiling — now documented in
+    `docs/sql.md` "Precision ceilings" alongside the Decimal128 34-digit
+    numeric ceiling; both are permanent divergences, not fixable bugs),
+    serial RETURN_GENERATED_KEYS, oid-column updatability, and the two
+    metadata classes' setup blockers (`COMMENT ON FUNCTION`, composite
+    `CREATE TYPE`) — the setup blockers themselves are now fixed.
+    BatchDeadlockTest is green (8 pass, 8 upstream-`@Disabled` skips) —
+    the old 6F cleared with the pipeline implicit-transaction work.
   - ~~**`relation "" does not exist`** (73)~~ — FIXED. It was pgjdbc's
     `TypeInfoCache` type-lookup query, and reduced to two independent bugs,
     both now closed (`JOIN … USING` cross-joining, and an SRF usable only as
