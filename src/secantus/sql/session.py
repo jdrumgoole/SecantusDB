@@ -59,6 +59,10 @@ GUC_DEFAULTS: dict[str, str] = {
     "default_transaction_isolation": "read committed",
     "default_transaction_read_only": "off",
     "default_transaction_deferrable": "off",
+    # PG's compile-time INDEX_MAX_KEYS default. pgjdbc reads it once per
+    # connection (getMaxIndexKeys) and every FK/primary-key metadata call
+    # errors out if the pg_settings row is absent.
+    "max_index_keys": "32",
 }
 
 # Postgres encoding name (canonicalised: upper, no -_/ separators) -> Python

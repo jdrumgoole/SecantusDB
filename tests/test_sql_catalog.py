@@ -508,3 +508,80 @@ def test_catalog_builders_survive_a_table_appearing_mid_scan(storage, session, b
     q(storage, session, "CREATE TABLE create_and_drop_table (id int PRIMARY KEY, v text)")
     racing = _RacingCatalog(Catalog(storage), "create_and_drop_table")
     assert isinstance(getattr(virtual, builder)(DB, session, storage, racing), list)
+
+
+def test_max_index_keys_setting(storage, session):
+    # pgjdbc's getMaxIndexKeys reads this once per connection; every FK /
+    # primary-key metadata call errors if the row is absent.
+    res = q(
+        storage, session, "SELECT setting FROM pg_catalog.pg_settings WHERE name='max_index_keys'"
+    )
+    assert res.rows == [("32",)]
+
+
+def test_pg_proc_arg_mode_columns(storage, session):
+    # pgjdbc's getFunctionColumns selects proargmodes / proallargtypes; NULL is
+    # a valid value (no OUT params) but the columns must exist.
+    q(storage, session, "CREATE FUNCTION f1(int) RETURNS int AS 'SELECT 1' LANGUAGE sql")
+    res = q(
+        storage,
+        session,
+        "SELECT proargmodes, proallargtypes FROM pg_proc WHERE proname='f1'",
+    )
+    assert res.rows == [(None, None)]
+
+
+def test_pg_class_reltuples(storage, session):
+    # pgjdbc's getIndexInfo reads ci.reltuples as CARDINALITY; -1 is PG's
+    # "no estimate yet" initial value.
+    q(storage, session, "CREATE TABLE rt (a int PRIMARY KEY)")
+    res = q(storage, session, "SELECT reltuples FROM pg_class WHERE relname='rt'")
+    assert res.rows == [(-1.0,)]
+
+
+def test_join_order_by_computed_output_alias(storage, session):
+    # pgjdbc's getTables ORDER BY "TABLE_TYPE" names a computed (CASE) output
+    # alias; the evaluated-join planner must substitute the select expression
+    # (input-column resolution alone raises 42703).
+    q(storage, session, "CREATE TABLE ta (x int)")
+    q(storage, session, "CREATE TABLE tb (y int)")
+    q(storage, session, "INSERT INTO ta VALUES (1)")
+    q(storage, session, "INSERT INTO ta VALUES (2)")
+    q(storage, session, "INSERT INTO tb VALUES (1)")
+    q(storage, session, "INSERT INTO tb VALUES (2)")
+    res = q(
+        storage,
+        session,
+        "SELECT CASE a.x WHEN 1 THEN 'one' ELSE 'two' END AS \"AA\""
+        ' FROM ta a, tb b WHERE a.x = b.y ORDER BY "AA" DESC',
+    )
+    assert res.rows == [("two",), ("one",)]
+    # ordinals resolve the same way
+    res = q(
+        storage,
+        session,
+        "SELECT CASE a.x WHEN 1 THEN 'one' ELSE 'two' END"
+        " FROM ta a, tb b WHERE a.x = b.y ORDER BY 1",
+    )
+    assert res.rows == [("one",), ("two",)]
+
+
+def test_pgjdbc_get_tables_query_shape(storage, session):
+    # The structural skeleton of pgjdbc's getTables: comma-join + LEFT JOIN
+    # pg_description + CASE-computed "TABLE_TYPE" + quoted-alias ORDER BY.
+    q(storage, session, "CREATE TABLE mdt (id int4)")
+    q(storage, session, "COMMENT ON TABLE mdt IS 'a comment'")
+    res = q(
+        storage,
+        session,
+        'SELECT n.nspname AS "TABLE_SCHEM", c.relname AS "TABLE_NAME",'
+        " CASE c.relkind WHEN 'r' THEN 'TABLE' ELSE NULL END AS \"TABLE_TYPE\","
+        ' d.description AS "REMARKS"'
+        " FROM pg_catalog.pg_namespace n, pg_catalog.pg_class c"
+        " LEFT JOIN pg_catalog.pg_description d ON (c.oid = d.objoid"
+        " AND d.objsubid = 0 and d.classoid = 'pg_class'::regclass)"
+        " WHERE c.relnamespace = n.oid AND n.nspname LIKE 'public'"
+        " AND c.relkind = 'r'"
+        ' ORDER BY "TABLE_TYPE","TABLE_SCHEM","TABLE_NAME"',
+    )
+    assert res.rows == [("public", "mdt", "TABLE", "a comment")]
