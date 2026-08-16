@@ -10673,6 +10673,71 @@ _BEGIN_CHARACTERISTICS_RE = re.compile(
     re.IGNORECASE,
 )
 
+
+def _split_top_level_semicolons(sql: str) -> list[str]:
+    """Split a multi-statement string on semicolons OUTSIDE quotes, dollar
+    quotes and comments — the batch fallback when sqlglot rejects the string
+    as a whole but the individual statements parse (``BEGIN READ ONLY``
+    mid-batch takes the regex path only per-statement)."""
+    parts: list[str] = []
+    buf: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    break
+                j += 1
+            buf.append(sql[i : j + 1])
+            i = j + 1
+            continue
+        if c == '"':
+            j = sql.find('"', i + 1)
+            j = n - 1 if j < 0 else j
+            buf.append(sql[i : j + 1])
+            i = j + 1
+            continue
+        if c == "$":
+            m = re.match(r"\$[A-Za-z_0-9]*\$", sql[i:])
+            if m is not None:
+                tag = m.group(0)
+                end = sql.find(tag, i + len(tag))
+                end = n if end < 0 else end + len(tag)
+                buf.append(sql[i:end])
+                i = end
+                continue
+        if c == "-" and sql[i : i + 2] == "--":
+            j = sql.find("\n", i)
+            j = n if j < 0 else j + 1
+            buf.append(sql[i:j])
+            i = j
+            continue
+        if c == "/" and sql[i : i + 2] == "/*":
+            j = sql.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            buf.append(sql[i:j])
+            i = j
+            continue
+        if c == ";":
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    part = "".join(buf).strip()
+    if part:
+        parts.append(part)
+    return parts
+
+
 # ``SET TRANSACTION <characteristics>`` — the keyword tail, like BEGIN's.
 _SET_TRANSACTION_RE = re.compile(
     r"^\s*SET\s+TRANSACTION\s+(?P<tail>(?:ISOLATION|READ|NOT|DEFERRABLE)[A-Za-z,\s]*?)\s*;?\s*$",
@@ -11084,7 +11149,22 @@ def _parse_uncached(sql: str) -> list[exp.Expression]:
     if "/*" in sql:
         sql = _strip_nested_block_comments(sql)
     try:
-        stmts = [s for s in sqlglot.parse(_normalize_params(sql), read="postgres") if s is not None]
+        try:
+            stmts = [
+                s for s in sqlglot.parse(_normalize_params(sql), read="postgres") if s is not None
+            ]
+        except sqlglot.errors.ParseError:
+            # A batch whose INDIVIDUAL statements we can parse (some only via
+            # the regex fallbacks above — ``BEGIN READ ONLY`` mid-batch is the
+            # pgtest shape) still fails as one string. Split on top-level
+            # semicolons and parse each segment through the full entry point.
+            segments = _split_top_level_semicolons(sql)
+            if len(segments) <= 1:
+                raise
+            out: list[exp.Expression] = []
+            for seg in segments:
+                out.extend(_parse_uncached(seg))
+            return out
         for s in stmts:
             _fold_unquoted_identifiers(s)
             _resolve_group_by_ordinals(s)

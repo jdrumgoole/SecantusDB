@@ -422,3 +422,42 @@ def test_startup_parameter_applies_any_guc(server):
         assert errs and pgwire.parse_error_response(errs[0].payload)["C"] == "25006"
     finally:
         c.close()
+
+
+# --------------------------------------------------------------------------- #
+# A multi-statement simple query is ONE implicit transaction (real PG; the
+# pgtest batch_stmt corpus pins every shape below): a mid-batch error rolls
+# back the earlier statements' writes; BEGIN inside the batch takes the
+# transaction over (its characteristics included); COMMIT ends it and the
+# remainder starts a fresh implicit transaction.
+
+
+def test_batch_error_rolls_back_earlier_writes(client):
+    client.query("CREATE TABLE batch_a (n int4)")
+    msgs = client.query("INSERT INTO batch_a VALUES(1); SELECT 1/0; INSERT INTO batch_a VALUES(2);")
+    tags = [pgwire.parse_command_complete(m.payload) for m in msgs if m.type == "C"]
+    assert tags == ["INSERT 0 1"]  # first statement's result streamed
+    errs = [m for m in msgs if m.type == "E"]
+    assert pgwire.parse_error_response(errs[0].payload)["C"] == "22012"
+    res = parse_results(client.query("SELECT count(*) FROM batch_a"))
+    assert res["results"][0]["rows"] == [[b"0"]]  # rolled back
+
+
+def test_commit_in_batch_splits_transactions(client):
+    client.query("CREATE TABLE batch_b (n int4)")
+    client.query("INSERT INTO batch_b VALUES(1); COMMIT; SELECT 1/0;")
+    res = parse_results(client.query("SELECT count(*) FROM batch_b"))
+    assert res["results"][0]["rows"] == [[b"1"]]  # committed before the error
+
+
+def test_begin_read_only_takeover_in_batch(client):
+    client.query("CREATE TABLE batch_c (n int4)")
+    msgs = client.query(
+        "INSERT INTO batch_c VALUES(6); BEGIN READ ONLY; INSERT INTO batch_c VALUES(7); COMMIT;"
+    )
+    errs = [m for m in msgs if m.type == "E"]
+    assert pgwire.parse_error_response(errs[0].payload)["C"] == "25006"
+    assert msgs[-1].payload == b"E"  # ReadyForQuery: failed transaction block
+    client.query("COMMIT")  # ends the failed block (rolls back)
+    res = parse_results(client.query("SELECT count(*) FROM batch_c"))
+    assert res["results"][0]["rows"] == [[b"0"]]  # INSERT 6 rolled back too
