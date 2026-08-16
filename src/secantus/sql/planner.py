@@ -2756,6 +2756,8 @@ def _cast_output_name(target: exp.Expression) -> str | None:
     tag = typemap.type_tag_for_sql(target.to)
     if tag is None:
         return None
+    if tag == "char1":
+        return "char"  # pg_type.typname for oid 18 is the bare word
     if tag.endswith("[]"):
         # PG names an array-cast column after the ELEMENT typname:
         # ``'{a}'::text[]`` yields a column named ``text``.
@@ -9976,6 +9978,7 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
                 "json",
                 "aclitem",
                 "name",
+                "char1",
             )
             or _mapped in typemap._GEO_TAGS
         ):
@@ -10676,6 +10679,53 @@ _COPY_BARE_OPTIONS_RE = re.compile(
 # A ``::numeric(p,-s)`` cast — the only spot Postgres syntax allows a negative
 # scale. Anchored on the ``::`` cast so a matching text inside a string literal
 # isn't touched.
+def _rewrite_quoted_char_types(sql: str) -> str:
+    """Replace the QUOTED ``"char"`` type spelling (PG's internal one-byte
+    type, oid 18) with the ``pg_char_1`` sentinel before parse — sqlglot
+    collapses the quoted spelling into plain CHAR in both cast and column-def
+    positions, losing the identity. Token-context aware so a ``"char"``
+    column NAME, alias, or string literal is never touched: rewrites after
+    ``::``, after ``AS`` only inside a CAST(...), and after an identifier in a
+    CREATE/ALTER statement (a column def's type position)."""
+    from sqlglot.tokens import TokenType
+
+    try:
+        tokens = sqlglot.tokenize(sql, read="postgres")
+    except Exception:
+        return sql
+    is_ddl = bool(tokens) and tokens[0].token_type in (TokenType.CREATE, TokenType.ALTER)
+    spans: list[tuple[int, int]] = []
+    for i, tok in enumerate(tokens):
+        if tok.text != "char" or sql[tok.start : tok.end + 1] != '"char"':
+            continue
+        if i == 0:
+            continue
+        ptt = tokens[i - 1].token_type
+        if ptt == TokenType.DCOLON:
+            spans.append((tok.start, tok.end + 1))
+        elif ptt == TokenType.ALIAS:
+            # ``CAST(expr AS "char")`` vs an ``AS "char"`` output alias: walk
+            # back to the paren opening this depth and require CAST before it.
+            depth = 0
+            for j in range(i - 2, -1, -1):
+                jtt = tokens[j].token_type
+                if jtt == TokenType.R_PAREN:
+                    depth += 1
+                elif jtt == TokenType.L_PAREN:
+                    if depth == 0:
+                        if j > 0 and tokens[j - 1].text.upper() in ("CAST", "TRY_CAST"):
+                            spans.append((tok.start, tok.end + 1))
+                        break
+                    depth -= 1
+        elif is_ddl and ptt in (TokenType.VAR, TokenType.IDENTIFIER):
+            # ``CREATE TABLE t (c "char" ...)`` — the type follows the column
+            # name. A quoted "char" COLUMN name follows ``(`` or ``,`` instead.
+            spans.append((tok.start, tok.end + 1))
+    for start, end in reversed(spans):
+        sql = sql[:start] + "pg_char_1" + sql[end:]
+    return sql
+
+
 _NEGSCALE_RE = re.compile(r"(::\s*(?:numeric|decimal)\s*\(\s*\d+\s*,\s*)-\s*(\d+)(\s*\))", re.I)
 
 # ``BEGIN`` / ``START TRANSACTION`` with transaction characteristics — sqlglot
@@ -11158,6 +11208,8 @@ def _parse_uncached(sql: str) -> list[exp.Expression]:
     sql = _NEGSCALE_RE.sub(
         lambda m: f"{m.group(1)}{typemap.NEGSCALE_SENTINEL + int(m.group(2))}{m.group(3)}", sql
     )
+    if '"char"' in sql:
+        sql = _rewrite_quoted_char_types(sql)
     # Decode E'…' escape strings ourselves — sqlglot's half-decoding is lossy.
     if "e'" in sql or "E'" in sql:
         sql = _decode_estrings(sql)

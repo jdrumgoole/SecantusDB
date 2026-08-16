@@ -351,6 +351,7 @@ def ready_for_query(status: bytes = b"I") -> bytes:
 # internal_size). Variable-width types report -1.
 _TYPLEN: dict[int, int] = {
     16: 1,  # bool
+    18: 1,  # "char" (PG's internal one-byte type)
     20: 8,  # int8
     21: 2,  # int2
     23: 4,  # int4
@@ -614,9 +615,11 @@ def build_bind(
     statement: str,
     params: list[bytes | None],
     param_formats: list[int] | None = None,
+    result_formats: list[int] | None = None,
 ) -> bytes:
     """Client-side helper: 'B' Bind (params text by default; pass
-    ``param_formats`` for binary parameters), text results."""
+    ``param_formats`` for binary parameters / ``result_formats`` for binary
+    results)."""
     payload = bytearray(_cstr(portal) + _cstr(statement))
     if param_formats:
         payload += _INT16.pack(len(param_formats))
@@ -630,7 +633,12 @@ def build_bind(
             payload += _INT32.pack(-1)
         else:
             payload += _INT32.pack(len(p)) + p
-    payload += _INT16.pack(0)  # zero result format codes => all results text
+    if result_formats:
+        payload += _INT16.pack(len(result_formats))
+        for f in result_formats:
+            payload += _INT16.pack(f)
+    else:
+        payload += _INT16.pack(0)  # zero result format codes => all results text
     return _msg("B", bytes(payload))
 
 

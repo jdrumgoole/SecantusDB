@@ -2610,11 +2610,23 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   snapshots — a portal bound inside an explicit txn runs eagerly at Bind
   (read-only SELECTs only; errors stay at Execute after BindComplete;
   cached-plan revalidation still trips 0A000 at Execute), so later
-  same-txn DDL can't change what the held portal returns. Corpus: 35
-  unexpected failures; green: aborted_txn, array, batch_stmt,
-  bind_and_resolve, json, json_array (+1). Next: `char`, `citext`,
-  `copy` (`multiple_active_portals` needs fresh-state isolation —
-  leftover `mytable`/`ltree` deps). Iterate file-by-file.
+  same-txn DDL can't change what the held portal returns. Slice 7
+  greened `char` (one documented divergence: char:250 pins crdb's
+  TableOID=105 with no ignore_table_oids — impossible for any non-crdb
+  server; recorded in EXPECTED_DIVERGENCES): the QUOTED `"char"`
+  spelling now maps to PG's internal one-byte type — oid 18, typlen 1,
+  column name `char` — via a token-context pre-parse rewrite to the
+  `pg_char_1` sentinel (sqlglot collapses the quoted spelling into
+  plain CHAR in both cast and column-def positions; the rewrite fires
+  after `::`, after AS only inside CAST(...), and in CREATE/ALTER
+  column-type position, never on aliases/column names/string
+  literals). Input truncates to ONE character; empty/zero-byte input
+  stores NULL; `0::"char"` is the zero byte (binary render 0x00);
+  binary param/result codecs added. Corpus: 34 unexpected failures;
+  green: aborted_txn, array, batch_stmt, bind_and_resolve, json,
+  json_array, char (+2). Next: `citext`, `copy`
+  (`multiple_active_portals` needs fresh-state isolation — leftover
+  `mytable`/`ltree` deps). Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
