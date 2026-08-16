@@ -758,6 +758,15 @@ def _out_column_descs(
             from secantus.sql import virtual
 
             minted = virtual._composite_oids(db, Catalog(storage)).get(col.composite_type)
+            if minted is None:
+                # A column typed by a TABLE's row type: report the table's
+                # rowtype oid — its pg_type row has typtype 'c', which is what
+                # pgjdbc's getSQLType maps to java.sql.Types.STRUCT (generic
+                # RECORD/2249 mapped to OTHER — ResultSetMetaDataTest's
+                # testComposite trio).
+                minted = virtual._table_rowtype_oids(db, Catalog(storage)).get(
+                    col.composite_type
+                )
             if minted is not None:
                 oid = minted
         if getattr(col, "enum_type", None) is not None and storage is not None and db is not None:

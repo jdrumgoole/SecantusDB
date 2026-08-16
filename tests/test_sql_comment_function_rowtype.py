@@ -65,3 +65,23 @@ class TestTableRowtypeColumn:
         with pytest.raises(errors.SQLError) as e:
             run_sql(st, DB, "CREATE TABLE t (col no_such_type)", session=sess)
         assert e.value.sqlstate == "42704"
+
+
+class TestRowtypeColumnDescribesAsStruct:
+    def test_rowtype_column_reports_typtype_c_oid(self, st):
+        # pgjdbc maps a column oid to java.sql.Types.STRUCT only when its
+        # pg_type row has typtype 'c'; generic RECORD (2249) maps to OTHER —
+        # ResultSetMetaDataTest's testComposite trio.
+        sess = Session(database=DB)
+        run_sql(st, DB, "CREATE TABLE rsmd1 (a int primary key, b text)", session=sess)
+        run_sql(st, DB, "CREATE TABLE compositetest (col rsmd1)", session=sess)
+        res = run_sql(st, DB, "SELECT col FROM compositetest", session=sess)[-1]
+        oid = res.columns[0].pg_oid
+        assert oid != 2249
+        rows = run_sql(
+            st,
+            DB,
+            f"SELECT typname, typtype FROM pg_catalog.pg_type WHERE oid = {oid}",
+            session=sess,
+        )[-1].rows
+        assert rows == [("rsmd1", "c")]
