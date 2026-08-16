@@ -877,3 +877,35 @@ def test_binary_numeric_invalid_dscale_is_22P03(client):
     )
     assert error_code(msgs) == "22P03"
     assert "2" not in types(msgs)  # error fires AT Bind — no BindComplete
+
+
+def test_enum_oid_range_matches_catalog_bases():
+    # pgwire.row_description reports typlen 4 for oids in [65000, 66000) —
+    # the minted user-ENUM range. Pin the duplicated constants to catalog's.
+    from secantus.sql.catalog import DOMAIN_TYPE_OID_BASE, ENUM_TYPE_OID_BASE
+
+    assert ENUM_TYPE_OID_BASE == 65000
+    assert DOMAIN_TYPE_OID_BASE == 66000
+
+
+def test_enum_cast_names_column_and_typlen_4(client):
+    # pgtest enum:64 — SELECT 'hi'::te names the column after the enum type
+    # and reports DataTypeSize 4 (PG stores enum values as 4-byte oids).
+    client.exchange(
+        pgwire.build_parse("", "CREATE TYPE te AS ENUM ('hi', 'hello')", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT 'hi'::te", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_describe("P", ""),
+        pgwire.build_execute("", 0),
+    )
+    rd = next(m for m in msgs if m.type == "T")
+    import struct as _s
+
+    end = rd.payload.index(b"\x00", 2)
+    assert rd.payload[2:end] == b"te"
+    assert _s.unpack_from("!h", rd.payload, end + 11)[0] == 4  # typlen
+    assert rows(msgs) == [[b"hi"]]

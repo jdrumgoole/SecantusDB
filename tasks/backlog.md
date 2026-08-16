@@ -2654,9 +2654,14 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   exponent -32768 and rendered 0.000…0 — the #38139 regression
   payload), and a dscale outside PG's NUMERIC_DSCALE_MASK (0x3FFF)
   raises 22P03 at Bind like numeric_recv (the corpus sends 0xFFF0).
-  Corpus: 30 unexpected failures; green: aborted_txn, array,
-  batch_stmt, bind_and_resolve, json, json_array, char, citext,
-  copy, copy_file_upload, decimal (+2). Next: `enum`, `errors`
+  Slice 12 greened `enum`: an unaliased cast to a user-defined type
+  names its output column after the TYPE (SELECT 'hi'::te → column
+  te), and RowDescription reports typlen 4 for minted enum oids
+  (PG stores enum values as 4-byte oids; the [65000, 66000) range
+  check in pgwire is pinned to catalog's bases by a test). Corpus:
+  29 unexpected failures; green: aborted_txn, array, batch_stmt,
+  bind_and_resolve, json, json_array, char, citext, copy,
+  copy_file_upload, decimal, enum (+2). Next: `errors`, `execute`
   (`multiple_active_portals` needs fresh-state isolation — leftover
   `mytable`/`ltree` deps). Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
