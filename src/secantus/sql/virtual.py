@@ -1812,13 +1812,19 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
     # psycopg's ``TypeInfo.fetch(conn, "<table>")`` resolves it (and its
     # ``typarray``) to register the table-row array loader.
     table_oids = _table_oids(db, catalog)
+    schema_oids = _schema_oids(db, catalog)
     for tname, rowtype_oid in _table_rowtype_oids(db, catalog).items():
+        # A schema-qualified table's row type: bare typname + its schema's
+        # namespace oid — pgjdbc's TypeInfoCache resolves ``typname = 'x'``
+        # against the search_path's nspnames (SearchPathLookupTest).
         rows.append(
             {
                 "oid": rowtype_oid,
-                "typname": tname,
+                "typname": _bare_table_name(tname),
                 "typcollation": 0,
-                "typnamespace": _NS_OIDS["public"],
+                "typnamespace": schema_oids.get(_table_schema_name(tname), _NS_OIDS["public"])
+                if "." in tname
+                else _NS_OIDS["public"],
                 "typbasetype": 0,
                 "typtypmod": -1,
                 "typnotnull": False,

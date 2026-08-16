@@ -290,6 +290,9 @@ def _strip_leap_second(text: str) -> tuple[str, bool]:
     return text[: m.start()] + m.group("hm") + ":59" + text[m.end() :], True
 
 
+_SLASH_DATE_RE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{1,4})(?:\s+(.*))?$")
+
+
 def parse_iso_datetime(v: Any) -> _dt.datetime:
     """``datetime.fromisoformat`` widened for PG-accepted spellings.
 
@@ -301,6 +304,21 @@ def parse_iso_datetime(v: Any) -> _dt.datetime:
     s = str(v).strip().replace("Z", "+00:00")
     if s.lower() == "epoch":
         return _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+    if "/" in s:
+        # Slash-format date per the session's DateStyle field order:
+        # '8/10/7777' is Aug 10 under MDY (the default), Oct 8 under DMY —
+        # PG's non-ISO input form (pgjdbc's ResultSetTest.testTimestamp).
+        m = _SLASH_DATE_RE.match(s)
+        if m:
+            a, b, year, rest = m.groups()
+            from secantus.sql.typemap import _render_session
+
+            session = _render_session.get()
+            style = (session.get_setting("DateStyle") if session is not None else "") or ""
+            dmy = "DMY" in style.upper()
+            month, day = (b, a) if dmy else (a, b)
+            iso = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+            return parse_iso_datetime(iso + ((" " + rest) if rest else ""))
     s, leap = _strip_leap_second(s)
     if leap:
         # Parsed as :59 and rolled forward, which is what Postgres does with a

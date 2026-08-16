@@ -527,8 +527,49 @@ def _encode_numeric(value: Any) -> bytes:
 # value arrives in its *storage* form (canonical text for date/time/net/uuid,
 # subdocuments for interval/range/multirange). Text/varchar/json binary is just
 # the UTF-8 text bytes; jsonb (3802) prefixes a version byte.
+def _geo_nums(value: Any) -> list[float]:
+    """Every float in a geometric value's canonical text spelling, in order."""
+    import re as _re
+
+    return [float(x) for x in _re.findall(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", str(value))]
+
+
+def _encode_geo_floats(n: int) -> Any:
+    def enc(value: Any) -> bytes:
+        nums = _geo_nums(value)
+        if len(nums) != n:
+            raise ValueError(f"geometric value {value!r} does not have {n} numbers")
+        return struct.pack(f"!{n}d", *nums)
+
+    return enc
+
+
+def _encode_geo_path(value: Any) -> bytes:
+    text = str(value)
+    closed = not text.startswith("[")
+    nums = _geo_nums(value)
+    pts = len(nums) // 2
+    return struct.pack("!Bi", 1 if closed else 0, pts) + struct.pack(f"!{len(nums)}d", *nums)
+
+
+def _encode_geo_polygon(value: Any) -> bytes:
+    nums = _geo_nums(value)
+    pts = len(nums) // 2
+    return struct.pack("!i", pts) + struct.pack(f"!{len(nums)}d", *nums)
+
+
 _OUT_BINARY = {
     16: _encode_bool,  # bool
+    # Geometric results (Postgres' ``*_send`` layouts — the mirror of the
+    # ``_GEO_BINARY`` parameter decoders above). pgjdbc's binary-mode
+    # getObject constructs PGpoint/PGbox/... from these.
+    600: _encode_geo_floats(2),  # point
+    601: _encode_geo_floats(4),  # lseg
+    602: _encode_geo_path,  # path
+    603: _encode_geo_floats(4),  # box
+    604: _encode_geo_polygon,  # polygon
+    628: _encode_geo_floats(3),  # line
+    718: _encode_geo_floats(3),  # circle
     17: lambda v: bytes(v),  # bytea
     20: lambda v: struct.pack("!q", int(typemap.unwrap_numeric(v))),  # int8
     21: lambda v: struct.pack("!h", int(typemap.unwrap_numeric(v))),  # int2
