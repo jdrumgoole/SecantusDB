@@ -3898,6 +3898,12 @@ def infer_parameter_types(
                     continue
         if target is None:
             continue
+        # ``$1::JSON`` / ``$1::JSON[]`` keep the plain-json identities
+        # (114 / 199) — the collapsed tag would report jsonb's 3802/3807.
+        ident = typemap.cast_type_identity(target)
+        if ident is not None and ident[0] in (114, 199):
+            oids[idx] = ident[0]
+            continue
         tag = typemap.type_tag_for_sql(target)
         oid = typemap.PG_OID.get(tag) if tag is not None else None
         if oid is None and typemap.is_array_tag(tag):
@@ -9715,6 +9721,14 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     # ``array[x::inet, …]`` — a bare array constructor types as its elements'
     # array type when an element's tag is knowable (a cast or nested literal).
     if isinstance(node, exp.Array) and node.expressions:
+        nested = next((e for e in node.expressions if isinstance(e, exp.Array)), None)
+        if nested is not None:
+            # ``ARRAY[ARRAY[1], …]`` — a multidimensional array keeps its BASE
+            # array type: PG has ONE array oid per element type regardless of
+            # dimensionality (the pgtest corpus reads the binary element oid).
+            inner = _infer_scalar_tag(nested, resolve)
+            if typemap.is_array_tag(inner):
+                return inner
         first = next((e for e in node.expressions if isinstance(e, exp.Cast)), None)
         elem_tag = typemap.type_tag_for_sql(first.to) if first is not None else None
         if elem_tag and not typemap.is_array_tag(elem_tag) and f"{elem_tag}[]" in typemap.PG_OID:

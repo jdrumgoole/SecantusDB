@@ -2596,10 +2596,14 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   43 → 40 failing files; slice 2 fixed the XX000-leak class (malformed
   binary array params → 08P01, malformed array-literal casts → 22P02 —
   files advance internally, count still 40). Known next divergences:
-  binary ARRAY results encode elements as text oids where PG uses the
-  element type (array:53), and an inferred JSON[] parameter reports the
-  jsonb-array oid 3807 where PG says 199 (json_array:92 — the
-  json/jsonb collapse again, parameter-side). Iterate file-by-file.
+  slice 3 greened `array` (nested constructors typed text[] — now
+  recurse to the base array type) and finished `json_array`'s oids
+  (`::JSON[]` keeps 199/114 end-to-end); `json_array` itself is recorded
+  as an EXPECTED divergence — its last stanza needs verbatim json text
+  (a hand-spaced element re-renders compact), the documented
+  parsed-storage tradeoff. Corpus: 38 unexpected failures. Next: `json`
+  (json:8 — an empty binary JSONB parameter must be 08P01), `batch_stmt`,
+  `bind_and_resolve`, `char`. Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``

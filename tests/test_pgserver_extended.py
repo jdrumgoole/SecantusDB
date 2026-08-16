@@ -542,3 +542,39 @@ def test_malformed_array_literal_cast_is_22P02(client):
         pgwire.build_execute("", 0),
     )
     assert error_code(msgs) == "22P02"
+
+
+def test_multidim_array_keeps_base_type(client):
+    # ARRAY[ARRAY[1], ARRAY[2]] is int4[] — PG has ONE array oid per element
+    # type regardless of dimensionality (pgtest array:53 reads the binary
+    # element oid; we typed nested constructors text[]).
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT ARRAY[ARRAY[1], ARRAY[2]]", []),
+        pgwire.build_describe("S", ""),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    rd = next(m for m in msgs if m.type == "T")
+    import struct as _s
+
+    end = rd.payload.index(b"\x00", 2)
+    typoid = _s.unpack_from("!i", rd.payload, end + 7)[0]
+    assert typoid == 1007  # int4[]
+
+
+def test_plain_json_array_keeps_199(client):
+    # $1::JSON[] keeps plain-json identities: parameter oid 199, row oid 199
+    # (the collapsed tag would report jsonb's 3807 — pgtest json_array:92).
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT $1::JSON[]", []),
+        pgwire.build_describe("S", ""),
+        pgwire.build_bind("", "", [b'{"{}"}']),
+        pgwire.build_execute("", 0),
+    )
+    pd = next(m for m in msgs if m.type == "t")
+    import struct as _s
+
+    assert _s.unpack_from("!i", pd.payload, 2)[0] == 199
+    rd = next(m for m in msgs if m.type == "T")
+    end = rd.payload.index(b"\x00", 2)
+    assert _s.unpack_from("!i", rd.payload, end + 7)[0] == 199
