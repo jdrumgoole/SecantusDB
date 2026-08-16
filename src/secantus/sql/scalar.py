@@ -2061,7 +2061,23 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         # an oid and passes through.
         if isinstance(value, int) and not isinstance(value, bool):
             return value
-        return str(value).rsplit(".", 1)[-1]
+        name = str(value).rsplit(".", 1)[-1]
+        # A user function resolves to its minted pg_proc oid (rendered as the
+        # name, comparing equal to both the oid and the name — RegClassValue),
+        # so ``objoid = 'bar'::regproc`` predicates against pg_description
+        # match numerically like real PG. Ambiguous overloads keep the bare
+        # name (real PG errors; nothing downstream needs that today).
+        if ctx.catalog is not None and ctx.db is not None:
+            from secantus.sql import virtual
+
+            oids = [
+                oid
+                for key, oid in virtual._function_oids(ctx.db, ctx.catalog).items()
+                if key.rsplit("/", 1)[0] == name.lower()
+            ]
+            if len(oids) == 1:
+                return typemap.RegClassValue(oids[0], name)
+        return name
     if (
         value is not None
         and isinstance(node.to, exp.ObjectIdentifier)

@@ -136,8 +136,19 @@ def _resolve_user_type_column(col: Any, catalog: Catalog, db: str) -> Any:
     if catalog.enum_exists(db, name):
         return col
     if typemap.is_array_tag(col.type_tag):
-        # Only enum arrays are supported as user-type array columns; a
-        # composite/domain rewrite would lose the array shape.
+        # An array of a declared composite (``custom[]`` — pgjdbc's
+        # DatabaseMetaDataTest customtable) stores a list of subdocuments and
+        # reports the composite's minted array-companion oid. Other user-type
+        # arrays (domains) stay unsupported.
+        composite = catalog.get_composite(db, name)
+        if composite is not None:
+            return dataclasses.replace(
+                col,
+                enum_type=None,
+                composite_type=name,
+                composite_fields=tuple(composite),
+                type_tag="composite[]",
+            )
         raise errors.SQLError("42704", f'type "{name}[]" does not exist')
     composite = catalog.get_composite(db, name)
     if composite is not None:
@@ -773,7 +784,12 @@ def _out_column_descs(
                 # testComposite trio).
                 minted = virtual._table_rowtype_oids(db, Catalog(storage)).get(col.composite_type)
             if minted is not None:
-                oid = minted
+                # A composite-array column reports the minted array-companion
+                # oid, same scheme as enum arrays.
+                if typemap.is_array_tag(col.type_tag):
+                    oid = minted + USER_TYPE_ARRAY_OID_OFFSET
+                else:
+                    oid = minted
         if getattr(col, "enum_type", None) is not None and storage is not None and db is not None:
             if enum_oids is None:
                 enum_oids = Catalog(storage).enum_type_oids(db)
