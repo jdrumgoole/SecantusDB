@@ -28,7 +28,7 @@ from typing import Any
 import bson
 from sqlglot import exp
 
-from secantus.sql import engine, errors, pggeo, pgwire, planner, typemap
+from secantus.sql import copyfmt, engine, errors, pggeo, pgwire, planner, typemap
 from secantus.sql.catalog import ENUM_TYPE_OID_BASE, USER_TYPE_ARRAY_OID_OFFSET, Catalog
 from secantus.sql.session import Session
 
@@ -1351,6 +1351,12 @@ class ExtendedSession:
         bad = planner.indeterminate_parameter(stmt, oids)
         if bad is not None:
             raise errors.SQLError("42P18", f"could not determine data type of parameter ${bad}")
+        if isinstance(stmt, exp.Copy):
+            # PG's parse analysis gives COPY zero parameters — placeholders
+            # inside the query survive to Execute, where an unbound one is
+            # 42P02 (the pgtest copy corpus pins both error shapes).
+            count = 0
+            oids = []
         self.prepared[name] = Prepared(
             name, stmt, oids, count, query=query, created=_dt.datetime.now(_dt.timezone.utc)
         )
@@ -1361,6 +1367,13 @@ class ExtendedSession:
         prep = self.prepared.get(stmt_name)
         if prep is None:
             raise errors.SQLError("26000", f'prepared statement "{stmt_name}" does not exist')
+        if raw_values and isinstance(prep.stmt, exp.Copy):
+            summary = "COPY (SELECT) TO STDOUT" if not prep.stmt.args.get("kind") else "COPY"
+            raise errors.SQLError(
+                "08P01",
+                f"bind message supplies {len(raw_values)} parameters, but requires 0",
+                diag={"D": f'statement summary "{summary}"'},
+            )
         values: list[Any] = []
         for i, raw in enumerate(raw_values):
             if not formats:
@@ -1573,6 +1586,54 @@ class ExtendedSession:
         formats = _column_formats(portal.result_formats, len(cols)) if cols else None
         return self._row_desc_or_no_data(cols, formats)
 
+    def _execute_copy_out(self, portal: Portal) -> bytes:
+        """``COPY (query) TO STDOUT`` through the extended protocol (pgtest's
+        copy corpus): CopyOutResponse + one CopyData per row + CopyDone +
+        CommandComplete, all in the Execute reply. COPY FROM (and binary TO)
+        keep the simple-protocol-only rejection."""
+        stmt = portal.prepared.stmt
+        unbound = next(stmt.find_all(exp.Parameter), None)
+        if unbound is not None:
+            raise errors.SQLError("42P02", f"there is no parameter ${unbound.name}")
+        plan = engine.copy_plan(
+            stmt, self.storage, self.session.database, self.catalog, self.session
+        )
+        if not plan.to_stdout or plan.fmt == "binary":
+            raise errors.SQLError(
+                "42601", "COPY ... TO/FROM STDIN/STDOUT must be a standalone statement"
+            )
+        if self.session.txn_handle is not None:
+            with self.storage.use_user_transaction(self.session.txn_handle):
+                rows = engine.copy_extract(
+                    self.storage, self.session.database, self.catalog, self.session, plan
+                )
+        else:
+            rows = engine.copy_extract(
+                self.storage, self.session.database, self.catalog, self.session, plan
+            )
+        out = bytearray(pgwire.copy_out_response(len(plan.columns)))
+        chunks: list[str] = []
+        if plan.fmt == "csv":
+            if plan.header:
+                chunks.append(
+                    copyfmt.format_csv(
+                        [], delimiter=plan.delimiter, null=plan.null, header=plan.columns
+                    )
+                )
+            chunks += [
+                copyfmt.format_csv([row], delimiter=plan.delimiter, null=plan.null) for row in rows
+            ]
+        else:
+            chunks += [
+                copyfmt.format_text([row], delimiter=plan.delimiter, null=plan.null) for row in rows
+            ]
+        for chunk in chunks:
+            if chunk:
+                out += pgwire.copy_data(pgwire.encode_text(chunk, self.session.wire_encoding))
+        out += pgwire.copy_done()
+        out += pgwire.command_complete(f"COPY {len(rows)}")
+        return bytes(out)
+
     def _execute(self, payload: bytes) -> bytes:
         # A cancel that landed between statements is discarded, like real PG
         # (mirrors the simple protocol's clear in _handle_query).
@@ -1583,6 +1644,8 @@ class ExtendedSession:
             raise errors.SQLError("34000", f'portal "{portal_name}" does not exist')
         if portal.prepared.stmt is None:
             return pgwire.empty_query_response()
+        if isinstance(portal.prepared.stmt, exp.Copy):
+            return self._execute_copy_out(portal)
         if not portal.executed:
             bound = self._bound(portal)
             # Statements pipelined before a Sync run in ONE implicit

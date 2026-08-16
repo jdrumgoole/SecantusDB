@@ -1906,6 +1906,8 @@ class CopyPlan:
     delimiter: str
     null: str
     header: bool
+    #: CSV ESCAPE character (None = PG default: the quote char, i.e. "" doubling).
+    escape: str | None = None
     # For ``COPY (SELECT …) TO STDOUT``: the pre-rendered copy-stream cells of the
     # query result (query-form COPY is dump-only; ``table`` is None).
     query_rows: list[list] | None = None
@@ -1933,7 +1935,7 @@ def copy_plan(
     if session is not None:
         planner.qualify_from_search_path(stmt, catalog, db, session)
     to_stdout = not bool(stmt.args.get("kind"))  # kind True = FROM, False = TO
-    fmt, delimiter, null, header = _copy_options(stmt)
+    fmt, delimiter, null, header, escape = _copy_options(stmt)
     if delimiter is None:
         delimiter = "," if fmt == "csv" else "\t"
     if null is None:
@@ -1955,6 +1957,7 @@ def copy_plan(
             delimiter,
             null,
             header,
+            escape=escape,
             query_rows=query_rows,
             query_raw_rows=raw_rows,
             col_tags=tags,
@@ -1993,6 +1996,7 @@ def copy_plan(
         delimiter,
         null,
         header,
+        escape=escape,
         col_tags=col_tags,
         col_oids=col_oids,
     )
@@ -2035,35 +2039,70 @@ def _copy_query_rows(
     return columns, rows, None, tags, oids
 
 
-def _copy_options(stmt: exp.Copy) -> tuple[str, str | None, str | None, bool]:
-    """Parse ``FORMAT`` / ``CSV`` / ``DELIMITER`` / ``NULL`` / ``HEADER`` from a
-    COPY statement's parameter list."""
-    fmt, delimiter, null, header = "text", None, None, False
+def _copy_options(stmt: exp.Copy) -> tuple[str, str | None, str | None, bool, str | None]:
+    """Parse ``FORMAT`` / ``CSV`` / ``BINARY`` / ``DELIMITER`` / ``NULL`` /
+    ``HEADER`` / ``ESCAPE`` from a COPY statement's parameter list.
+
+    sqlglot mangles the legacy un-parenthesized option syntax (``CSV NULL 'NS'
+    DELIMITER '|'`` parses as CSV(expression=Null()) + Var(NS)(expression=
+    DELIMITER) + Var(|)), so the params are flattened back into a token stream
+    and scanned keyword-by-keyword — value keywords consume the next token.
+    ESCAPE and HEADER are CSV-only (PG's 0A000, pinned by the pgtest copy
+    corpus; PG 15's text-format HEADER is not modelled)."""
+    tokens: list[str] = []
     for p in stmt.args.get("params") or []:
-        key = str(getattr(p.this, "name", p.this)).upper()
-        val = p.args.get("expression")
-        val_text = (
-            val.this if isinstance(val, exp.Literal) else (val.name if val is not None else "")
-        )
+        for node in (p.this, p.args.get("expression")):
+            if node is None:
+                continue
+            if isinstance(node, exp.Null):
+                tokens.append("NULL")
+            elif isinstance(node, exp.Literal):
+                tokens.append(str(node.this))
+            else:
+                tokens.append(str(getattr(node, "name", node)))
+    fmt, delimiter, null, header, escape = "text", None, None, False, None
+    i = 0
+
+    def take_value() -> str:
+        nonlocal i
+        if i < len(tokens):
+            v = tokens[i]
+            i += 1
+            return v
+        return ""
+
+    while i < len(tokens):
+        key = tokens[i].upper()
+        i += 1
         if key == "FORMAT":
-            fmt = str(val_text).lower()
+            fmt = take_value().lower()
         elif key == "BINARY":
             # The legacy bare-keyword form (``COPY t FROM STDIN BINARY``,
-            # pre-9.0 syntax pgx still emits) parses as a value-less param.
+            # pre-9.0 syntax pgx still emits).
             fmt = "binary"
         elif key == "CSV":
             fmt = "csv"
-            # The legacy ``WITH CSV HEADER`` bundles HEADER as the CSV param's
-            # expression rather than a separate parameter.
-            if str(val_text).upper() == "HEADER":
-                header = True
-        elif key == "DELIMITER":
-            delimiter = str(val_text)
-        elif key == "NULL":
-            null = str(val_text)
         elif key == "HEADER":
-            header = str(val_text).lower() not in ("false", "off", "0")
-    return fmt, delimiter, null, header
+            header = True
+            if i < len(tokens):
+                nxt = tokens[i].upper()
+                if nxt in ("TRUE", "FALSE", "ON", "OFF", "0", "1"):
+                    header = nxt not in ("FALSE", "OFF", "0")
+                    i += 1
+        elif key == "DELIMITER":
+            delimiter = take_value()
+        elif key == "NULL":
+            null = take_value()
+        elif key == "ESCAPE":
+            escape = take_value()
+    if escape is not None:
+        if fmt != "csv":
+            raise errors.feature_not_supported("COPY escape available only in CSV mode")
+        if len(escape) != 1:
+            raise errors.SQLError("22023", "COPY escape must be a single one-byte character")
+    if header and fmt != "csv":
+        raise errors.feature_not_supported("COPY HEADER available only in CSV mode")
+    return fmt, delimiter, null, header, escape
 
 
 def _parse_bool_text(cell: str) -> bool:

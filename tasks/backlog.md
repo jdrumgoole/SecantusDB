@@ -2629,11 +2629,25 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   binary param/result codecs are the text bytes, and an unknown param
   compared against a citext COLUMN infers 90008 (citext-only on
   purpose — its own operator family; the char corpus pins a "char"
-  comparison param at 25). Corpus: 33 unexpected failures; green:
-  aborted_txn, array, batch_stmt, bind_and_resolve, json, json_array,
-  char, citext (+2). Next: `copy`, `copy_file_upload`
-  (`multiple_active_portals` needs fresh-state isolation — leftover
-  `mytable`/`ltree` deps). Iterate file-by-file.
+  comparison param at 25). Slice 9 greened `copy` (1187 lines, the
+  biggest file): CSV parsing rewritten as PG's CopyReadAttributesCSV
+  state machine (quoting decides NULL-ness — quoted "N" with NULL 'N'
+  is the string N; quoted empty is ''; custom ESCAPE chars; a \\.
+  line ends CSV data; unterminated quote → 22P04); COPY TO CSV
+  force-quotes empty strings; _copy_options re-scans sqlglot's
+  mangled legacy option syntax as a token stream (CSV NULL 'NS'
+  DELIMITER '|'); ESCAPE/HEADER are CSV-only (0A000); text-mode
+  \\xHH/\\OOO byte escapes decode; COPY (query) TO STDOUT works via
+  the extended protocol (NoData + CopyOutResponse/CopyData/CopyDone
+  in Execute; COPY takes 0 params — binding any is 08P01 with the
+  statement-summary detail; an unbound $1 at Execute is 42P02);
+  crdb's inline INDEX(...) table element is accepted-and-skipped and
+  ADD COLUMN ... NOT VISIBLE parses as a normal column. Corpus: 32
+  unexpected failures; green: aborted_txn, array, batch_stmt,
+  bind_and_resolve, json, json_array, char, citext, copy (+2). Next:
+  `copy_file_upload`, `decimal` (`multiple_active_portals` needs
+  fresh-state isolation — leftover `mytable`/`ltree` deps). Iterate
+  file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
