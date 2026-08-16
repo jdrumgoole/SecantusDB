@@ -922,7 +922,11 @@ class SecantusPGServer:
                 ) from None
             if plan.fmt == "csv":
                 rows = copyfmt.parse_csv(
-                    data, delimiter=plan.delimiter, null=plan.null, header=plan.header
+                    data,
+                    delimiter=plan.delimiter,
+                    null=plan.null,
+                    header=plan.header,
+                    escape=plan.escape,
                 )
             else:
                 rows = copyfmt.parse_text(data, delimiter=plan.delimiter, null=plan.null)

@@ -1732,6 +1732,13 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
             # collected by _extract_constraints; any other operator rejects
             # there (a GiST range exclusion has no unique-index equivalent).
             continue
+        if isinstance(coldef, exp.Anonymous) and str(coldef.this).upper() == "INDEX":
+            # crdb-style inline ``INDEX (...)`` table element (also MySQL DDL;
+            # the pgtest copy corpus creates one on an expression). The table
+            # is created without the secondary index — inline index elements
+            # are an optimization hint here, not a constraint (see
+            # tasks/backlog.md).
+            continue
         if not isinstance(coldef, exp.ColumnDef):
             raise errors.feature_not_supported(f"unsupported table element: {coldef.sql()}")
         serial_tag = _serial_tag(coldef.args["kind"])
@@ -10745,6 +10752,11 @@ def _rewrite_quoted_char_types(sql: str) -> str:
     return sql
 
 
+#: crdb's ``ADD COLUMN ... NOT VISIBLE`` modifier (the pgtest copy corpus
+#: uses it in an unmarked stanza) — sqlglot can't parse it; the column is
+#: added as a normal visible column.
+_NOT_VISIBLE_RE = re.compile(r"(\bADD\s+COLUMN\s+[^,']*?)\s+NOT\s+VISIBLE\b", re.I)
+
 _NEGSCALE_RE = re.compile(r"(::\s*(?:numeric|decimal)\s*\(\s*\d+\s*,\s*)-\s*(\d+)(\s*\))", re.I)
 
 # ``BEGIN`` / ``START TRANSACTION`` with transaction characteristics — sqlglot
@@ -11229,6 +11241,8 @@ def _parse_uncached(sql: str) -> list[exp.Expression]:
     )
     if '"char"' in sql:
         sql = _rewrite_quoted_char_types(sql)
+    if "visible" in sql.lower():
+        sql = _NOT_VISIBLE_RE.sub(r"\1", sql)
     # Decode E'…' escape strings ourselves — sqlglot's half-decoding is lossy.
     if "e'" in sql or "E'" in sql:
         sql = _decode_estrings(sql)

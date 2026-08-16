@@ -805,3 +805,48 @@ def test_citext_reports_oid_90008(client):
     end2 = rd.payload.index(b"\x00", end + 19)  # second column: t
     assert _s.unpack_from("!i", rd.payload, end2 + 7)[0] == 90008
     assert rows(msgs) == [[b"1", b"Hi"]]
+
+
+def test_copy_to_stdout_via_extended_protocol(client):
+    # pgtest copy corpus: COPY (query) TO STDOUT through Parse/Bind/Describe/
+    # Execute — NoData at Describe, then CopyOutResponse + CopyData + CopyDone
+    # + CommandComplete in the Execute reply.
+    msgs = client.exchange(
+        pgwire.build_parse("", "COPY (select 1) TO STDOUT", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_describe("P", ""),
+        pgwire.build_execute("", 0),
+    )
+    tps = types(msgs)
+    assert tps == ["1", "2", "n", "H", "d", "c", "C", "Z"]
+    d = next(m for m in msgs if m.type == "d")
+    assert d.payload == b"1\n"
+    assert command_tag(msgs) == "COPY 1"
+
+
+def test_copy_bind_with_parameters_is_08P01(client):
+    # PG's parse analysis gives COPY zero parameters; binding any is 08P01
+    # with the statement-summary detail (pgtest copy corpus, keepErrMessage).
+    msgs = client.exchange(
+        pgwire.build_parse("", "COPY (select $1::int) TO STDOUT", []),
+        pgwire.build_bind("", "", [b"1"]),
+        pgwire.build_execute("", 0),
+    )
+    err = next(m for m in msgs if m.type == "E")
+    fields = pgwire.parse_error_response(err.payload)
+    assert fields.get("C") == "08P01"
+    assert fields.get("M") == "bind message supplies 1 parameters, but requires 0"
+    assert fields.get("D") == 'statement summary "COPY (SELECT) TO STDOUT"'
+
+
+def test_copy_unbound_placeholder_is_42P02(client):
+    msgs = client.exchange(
+        pgwire.build_parse("", "COPY (select $1::int) TO STDOUT", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert types(msgs)[:2] == ["1", "2"]  # BindComplete precedes the error
+    err = next(m for m in msgs if m.type == "E")
+    fields = pgwire.parse_error_response(err.payload)
+    assert fields.get("C") == "42P02"
+    assert fields.get("M") == "there is no parameter $1"
