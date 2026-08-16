@@ -1522,6 +1522,14 @@ def _describe_statement(
     if table_node is None or stmt.args.get("from_") is None:
         # find() descends into subqueries — a FROM-less outer SELECT (WHERE
         # EXISTS …) describes via the constant path, same as _run_select.
+        # Volatile calls must NOT be evaluated at Describe time: the constant
+        # planner evaluates the projection, so ``Describe select pg_sleep(5)``
+        # SLEPT (and a cancel arriving mid-sleep was swallowed into NoData
+        # while Execute later emitted a DataRow — the protocol violation
+        # pgjdbc's setQueryTimeout tests crashed on), and ``nextval`` would
+        # draw a sequence value. Derive their shapes statically instead.
+        if _volatile_call_shape(stmt) is not None:
+            return _volatile_call_shape(stmt)
         try:
             plan = planner.plan_constant_select(stmt, session, storage, catalog, db)
         except errors.SQLError:
@@ -1571,6 +1579,82 @@ def _describe_statement(
     # oid and attnum. This is the path the extended protocol describes through,
     # which is the one a JDBC updatable ResultSet reads to resolve column names.
     return executor._out_column_descs(select_plan.out_columns, storage, db, table)
+
+
+#: Result type tags of volatile / blocking session functions, for Describe:
+#: evaluating them at Describe time would sleep, draw sequence values, or
+#: take locks. Shapes here mirror what Execute actually returns.
+_VOLATILE_FN_TAGS = {
+    "pg_sleep": "text",
+    "nextval": "int8",
+    "setval": "int8",
+    "currval": "int8",
+    "lastval": "int8",
+    "set_config": "text",
+    "pg_terminate_backend": "bool",
+    "pg_cancel_backend": "bool",
+    "pg_advisory_lock": "text",
+    "pg_advisory_unlock": "bool",
+    "pg_try_advisory_lock": "bool",
+    "lo_creat": "oid",
+    "lo_create": "oid",
+    "lo_unlink": "int4",
+}
+
+
+def _volatile_call_shape(stmt: exp.Select) -> list[ColumnDesc] | None:
+    """When any projection calls a volatile function, the whole statement's
+    shape derived statically (None when no volatile call is present, or when
+    a projection mixes one into an expression we can't type)."""
+    calls_volatile = False
+    out: list[ColumnDesc] = []
+    for e in stmt.expressions:
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        target = e.this if isinstance(e, exp.Alias) else e
+        while isinstance(target, exp.Paren):
+            target = target.this
+        if isinstance(target, exp.Dot) and isinstance(target.expression, exp.Anonymous):
+            target = target.expression
+        if isinstance(target, exp.Anonymous):
+            fname = str(target.this).rsplit(".", 1)[-1].lower()
+            if fname in _VOLATILE_FN_TAGS:
+                calls_volatile = True
+                tag = _VOLATILE_FN_TAGS[fname]
+                out.append(ColumnDesc(alias or fname, tag, typemap.PG_OID.get(tag, 25)))
+                continue
+        if any(
+            str(f.this).rsplit(".", 1)[-1].lower() in _VOLATILE_FN_TAGS
+            for f in target.find_all(exp.Anonymous)
+        ):
+            return None  # volatile call nested in an untypeable expression
+        out.append(None)  # placeholder: typed below only if needed
+    if not calls_volatile:
+        return None
+    # Type the non-volatile projections without evaluating: literals and casts.
+    for i, e in enumerate(stmt.expressions):
+        if out[i] is not None:
+            continue
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        target = e.this if isinstance(e, exp.Alias) else e
+        while isinstance(target, exp.Paren):
+            target = target.this
+        if isinstance(target, exp.Literal):
+            if target.is_string:
+                out[i] = ColumnDesc(alias or "?column?", "text", 705)
+            else:
+                text = str(target.this)
+                tag = "numeric" if "." in text else "int4"
+                out[i] = ColumnDesc(alias or "?column?", tag, typemap.PG_OID[tag])
+        elif isinstance(target, exp.Cast) and target.to is not None:
+            tag = typemap.type_tag_for_sql(target.to) or "text"
+            out[i] = ColumnDesc(
+                alias or planner._cast_output_name(target) or "?column?",
+                tag,
+                typemap.PG_OID.get(tag, 25),
+            )
+        else:
+            return None
+    return out  # type: ignore[return-value]
 
 
 def _describe_constant_shape(stmt: exp.Select) -> list[ColumnDesc] | None:

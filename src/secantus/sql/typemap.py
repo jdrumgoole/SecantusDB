@@ -532,6 +532,33 @@ class TypedList(list):
         self.elem_tag = elem_tag
 
 
+class RegClassValue(int):
+    """A resolved ``regclass`` value: numerically the relation's pg_class oid
+    (so ``c.oid = 'name'::regclass`` joins work), rendered as the relation
+    name like real PG (``SELECT 'pub'::regclass`` prints ``pub``)."""
+
+    relname: str
+
+    def __new__(cls, oid: int, relname: str) -> RegClassValue:
+        self = super().__new__(cls, oid)
+        self.relname = relname
+        return self
+
+    def __str__(self) -> str:  # text render shows the name, not the oid
+        return self.relname
+
+    def __eq__(self, other: Any) -> bool:
+        # ``pg_typeof(x) = 'name'::regtype``: pg_typeof rewrites to the pretty
+        # type-name STRING at plan time, so a reg-value must compare equal to
+        # its own name as well as to its oid (PG compares oids; the string leg
+        # is our plan-time representation meeting the resolved cast).
+        if isinstance(other, str):
+            return other == self.relname
+        return int(self) == other if isinstance(other, int) else NotImplemented
+
+    __hash__ = int.__hash__
+
+
 class RecordValue(dict):
     """An anonymous ``row(…)`` record value: an f1..fN dict that ALSO carries
     each field's SQL type oid (0 = derive from the Python value). The binary
@@ -1312,6 +1339,8 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
     """
     if value is None:
         return None
+    if isinstance(value, RegClassValue):
+        return value.relname.encode("utf-8")
     if tag == "timetz" or isinstance(value, TimeTzText):
         from secantus.sql import datetimes as _datetimes
 

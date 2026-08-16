@@ -2056,6 +2056,9 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
             if name is None:
                 raise errors.SQLError("42704", f"type with OID {oid_operand} does not exist")
             return name
+        resolved = _resolve_regtype(str(value), ctx)
+        if resolved is not None:
+            return resolved
         return typemap.normalize_regtype(str(value))
     # ``'[1,10)'::int4range`` — parse a range text literal into its subdocument.
     to = node.to.sql(dialect="postgres").lower().strip() if node.to is not None else ""
@@ -2330,10 +2333,85 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
             and not isinstance(inner.this, exp.Null)
         ):
             return "null"
-    # Otherwise we don't model regclass/oid identity types; evaluating the inner
-    # value is enough for the catalog queries that use casts (compared / discarded,
-    # never round-tripped through a real type).
+    # ``'name'::regclass`` / ``'schema.name'::regclass`` — resolve to the
+    # relation's pg_class oid (a RegClassValue: numerically the oid, rendered
+    # as the name). pgjdbc's SearchPathLookupTest joins ``c.oid =
+    # ?::regclass`` with qualified names; the bare string never matched.
+    if to == "regclass" and isinstance(value, str) and ctx is not None:
+        return _resolve_regclass(value, ctx)
+    # Otherwise we don't model the remaining oid identity types; evaluating the
+    # inner value is enough for the catalog queries that use casts (compared /
+    # discarded, never round-tripped through a real type).
     return value
+
+
+def _resolve_regtype(text: str, ctx: ScalarContext | None) -> Any:
+    """``'name'::regtype`` resolved to a numeric type oid where we can: base
+    types by their canonical tag, and table ROW types (qualified or via the
+    search_path) by their minted rowtype oid — what pgjdbc's TypeInfoCache
+    compares against (SearchPathLookupTest). None -> keep the legacy
+    name-string behaviour."""
+    cleaned = " ".join(str(text).strip().split())
+    base = cleaned.split("(", 1)[0].strip().lower()
+    tag = typemap._REGTYPE_SPELLINGS.get(base)
+    if tag is not None and tag in typemap.PG_OID:
+        return typemap.RegClassValue(typemap.PG_OID[tag], typemap.SQL_TYPE_NAME.get(tag, tag))
+    if ctx is None or ctx.catalog is None:
+        return None
+    from secantus.sql import virtual
+
+    def _unquote(part: str) -> str:
+        part = part.strip()
+        if part.startswith('"') and part.endswith('"'):
+            return part[1:-1].replace('""', '"')
+        return part.lower()
+
+    parts = [_unquote(p) for p in cleaned.split(".", 1)]
+    rowtypes = virtual._table_rowtype_oids(ctx.db, ctx.catalog)
+    candidates: list[str] = []
+    if len(parts) == 2:
+        schema, bare = parts
+        candidates.append(bare if schema == "public" else f"{schema}.{bare}")
+    else:
+        bare = parts[0]
+        for schema in list(getattr(ctx.session, "search_path", None) or ["public"]):
+            candidates.append(bare if schema == "public" else f"{schema}.{bare}")
+    for cand in candidates:
+        if cand in rowtypes:
+            return typemap.RegClassValue(rowtypes[cand], cand.rsplit(".", 1)[-1])
+    return None
+
+
+def _resolve_regclass(text: str, ctx: ScalarContext) -> Any:
+    """Resolve a relation name (optionally schema-qualified, optionally
+    quoted) to its pg_class oid, following the session search_path for bare
+    names — raising PG's 42P01 when nothing matches."""
+    from secantus.sql import virtual
+
+    def _unquote(part: str) -> str:
+        part = part.strip()
+        if part.startswith('"') and part.endswith('"'):
+            return part[1:-1].replace('""', '"')
+        return part.lower()
+
+    parts = [_unquote(p) for p in text.split(".", 1)]
+    db = ctx.db
+    oids = virtual._table_oids(db, ctx.catalog)
+    candidates: list[str] = []
+    if len(parts) == 2:
+        schema, bare = parts
+        candidates.append(bare if schema == "public" else f"{schema}.{bare}")
+    else:
+        bare = parts[0]
+        path = list(getattr(ctx.session, "search_path", None) or ["public"])
+        for schema in path:
+            candidates.append(bare if schema == "public" else f"{schema}.{bare}")
+        if "public" not in path:
+            pass  # PG: not on path -> not visible unqualified
+    for cand in candidates:
+        if cand in oids:
+            return typemap.RegClassValue(oids[cand], cand.rsplit(".", 1)[-1])
+    raise errors.SQLError("42P01", f'relation "{text}" does not exist')
 
 
 def _bit_cast_length(datatype: exp.DataType | None) -> int | None:
@@ -3068,6 +3146,18 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
             if ctx.catalog.get(db, probe) is not None:
                 return schema == rel_schema
         return False
+    if name == "array_fill":
+        # ``array_fill(value, ARRAY[d1, d2, ...])`` — an array of the given
+        # dimensions with every element set to value (lower-bounds arg
+        # unsupported). pgjdbc's ResultSetTest builds bulk rows with it.
+        if len(args) < 2:
+            raise errors.SQLError("42883", "array_fill() requires a value and dimensions")
+        fill = args[0]
+        dims = args[1] if isinstance(args[1], (list, tuple)) else []
+        out: Any = fill
+        for d in reversed([int(x) for x in dims]):
+            out = [out] * d if d >= 0 else []
+        return out if isinstance(out, list) else [out]
     if name in ("current_database", "current_catalog") and ctx is not None:
         # Reachable in any expression context (pgjdbc's getPrimaryKeys derived
         # table computes ``current_database() AS TABLE_CAT`` over a join).
