@@ -765,6 +765,12 @@ def cast_type_identity(datatype: exp.DataType) -> tuple[int, int] | None:
     the target isn't a modifier-bearing type."""
     if datatype.this == exp.DataType.Type.ARRAY:
         inner = datatype.args.get("expressions") or []
+        if inner and isinstance(inner[0], exp.DataType) and inner[0].this == exp.DataType.Type.JSON:
+            # ``::JSON[]`` keeps the plain-json ARRAY identity (199), like the
+            # scalar ``::json`` → 114 below — the tag collapses json into
+            # jsonb, but the wire oids (and the binary array's element oid)
+            # differ, and the pgtest corpus reads them byte-for-byte.
+            return (199, -1)
         if inner and isinstance(inner[0], exp.DataType):
             elem = cast_type_identity(inner[0])
             if elem is not None:

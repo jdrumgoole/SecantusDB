@@ -11,4 +11,12 @@ green while the failure is a documented gap rather than a regression.
 EXCLUDE: set[str] = set()
 
 #: file -> reason. A file listed here that PASSES is reported loudly.
-EXPECTED_DIVERGENCES: dict[str, str] = {}
+EXPECTED_DIVERGENCES: dict[str, str] = {
+    "json_array": (
+        "json values are stored parsed (that shape is what lets ->> filters "
+        "push down to indexed storage lookups), so a hand-spaced json element "
+        "re-renders compact where PG echoes the client's text verbatim "
+        "(json_array:124). Deliberate — see tasks/backlog.md; everything else "
+        "in the file (plain-JSON[] oids 199/114, binary array headers) passes."
+    ),
+}
