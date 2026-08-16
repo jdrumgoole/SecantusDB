@@ -85,3 +85,42 @@ class TestRowtypeColumnDescribesAsStruct:
             session=sess,
         )[-1].rows
         assert rows == [("rsmd1", "c")]
+
+
+class TestResultDescriptorFidelity:
+    """RowDescription metadata pgjdbc's ResultSetMetaData derives:
+    base-column identity survives aliases and computed siblings, and
+    declared type identities (varchar(n) oid+typmod, timestamp(p),
+    numeric(p,s)) ride the descriptors."""
+
+    @pytest.fixture
+    def sess(self, st):
+        sess = Session(database=DB)
+        run_sql(
+            st,
+            DB,
+            "CREATE TABLE rsmd1 (a int primary key, b text, c decimal(10,2))",
+            session=sess,
+        )
+        return sess
+
+    def test_base_column_identity_with_computed_sibling(self, st, sess):
+        res = run_sql(st, DB, "SELECT a,b,c,a+c AS total, b AS d FROM rsmd1", session=sess)[-1]
+        by_name = {c.name: c for c in res.columns}
+        assert by_name["a"].attnum == 1 and by_name["a"].table_oid > 0
+        assert by_name["b"].attnum == 2
+        assert by_name["d"].attnum == 2  # alias resolves to its base column
+        assert by_name["total"].attnum == 0 and by_name["total"].table_oid == 0
+
+    def test_declared_type_identity(self, st, sess):
+        run_sql(
+            st,
+            DB,
+            "CREATE TABLE tt (vc varchar(5), ts3 timestamp(3), n numeric(10,2))",
+            session=sess,
+        )
+        res = run_sql(st, DB, "SELECT vc, ts3, n FROM tt", session=sess)[-1]
+        vc, ts3, n = res.columns
+        assert (vc.pg_oid, vc.typmod) == (1043, 9)  # varchar(5): n+4
+        assert (ts3.pg_oid, ts3.typmod) == (1114, 3)
+        assert (n.pg_oid, n.typmod) == (1700, ((10 << 16) | 2) + 4)

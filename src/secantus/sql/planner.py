@@ -4035,6 +4035,11 @@ class EvaluatedSelectPlan:
     # Rich ``JOIN LATERAL`` sources (subquery with its own join/group/aggregate),
     # expanded nested-loop per outer row by the executor after the pipeline runs.
     lateral_joins: list[LateralJoin] = field(default_factory=list)
+    # The single base TableDef when the plan came from a one-table SELECT —
+    # lets the descriptor builder attribute bare-column outputs to their
+    # source table/attnum (RowDescription base-column identity, which JDBC's
+    # getBaseColumnName resolves through). None for joins.
+    base_table: Any = None
 
 
 def _evaluated_enum_orders(
@@ -5216,6 +5221,7 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
     )
     return EvaluatedSelectPlan(
         base_collection=table.collection,
+        base_table=table,
         base_filter=base_filter,
         pipeline=[],
         out_columns=out_columns,
