@@ -1363,7 +1363,54 @@ class ExtendedSession:
                 continue
             values.append(self._check_enum_param(oid, value))
         self.portals[portal] = Portal(portal, prep, values, result_formats=result_formats)
+        self._maybe_snapshot_execute(self.portals[portal])
         return pgwire.bind_complete()
+
+    def _maybe_snapshot_execute(self, portal: Portal) -> None:
+        """PG portals capture their snapshot at Bind: a portal bound inside an
+        explicit transaction block keeps returning bind-time rows even when
+        later same-transaction statements (DDL, writes) change the data
+        underneath (pgtest's bind_and_resolve renames the table mid-block and
+        still reads the old relname through the held portal). Surrogate: run
+        read-only SELECT portals eagerly at Bind and stream the materialized
+        rows at Execute. Errors must NOT surface here — PG reports execution
+        errors at Execute, after BindComplete — so a failed eager run leaves
+        the portal lazy and restores the block's aborted flag for Execute to
+        trip for real."""
+        session = self.session
+        if session.txn_handle is None or session.txn_is_implicit:
+            return
+        stmt = portal.prepared.stmt
+        if not isinstance(stmt, (exp.Select, exp.SetOperation)):
+            return
+        if stmt.find(exp.Insert, exp.Update, exp.Delete) is not None:
+            return  # data-modifying CTE: side effects belong to Execute
+        try:
+            bound = self._bound(portal)
+        except errors.SQLError:
+            return
+        prior_failed = session.txn_failed
+        try:
+            # Mirror _execute's cached-plan revalidation: a named statement
+            # whose result shape changed must raise 0A000 at Execute, so a
+            # shape mismatch stays lazy instead of running here.
+            prep = portal.prepared
+            if prep.name and prep.plan_shape is not None:
+                pre_cols = self._describe_columns(bound)
+                if pre_cols and [(c.name, c.pg_oid) for c in pre_cols] != prep.plan_shape:
+                    return
+            portal.result = engine.run_statement(
+                self.storage, session.database, bound, session, self.catalog
+            )
+        except Exception:
+            session.txn_failed = prior_failed
+            portal.result = None
+            return
+        res_cols = getattr(portal.result, "columns", None)
+        if prep.name and res_cols and prep.plan_shape is None:
+            prep.plan_shape = [(c.name, c.pg_oid) for c in res_cols]
+        portal.executed = True
+        portal.offset = 0
 
     def _check_enum_param(self, oid: int, value: Any) -> Any:
         """Resolve a parameter declared with a minted user-type oid: an enum

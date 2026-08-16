@@ -3898,6 +3898,22 @@ def infer_parameter_types(
                     continue
         if target is None:
             continue
+        # ``$1::REGCLASS`` and friends parse as ObjectIdentifier, not
+        # DataType — map the reg-pseudotype oids directly (the pgtest
+        # bind_and_resolve corpus reads ParameterDescription byte-for-byte).
+        if isinstance(target, exp.ObjectIdentifier):
+            reg_oid = {
+                "REGCLASS": 2205,
+                "REGTYPE": 2206,
+                "REGPROC": 24,
+                "REGPROCEDURE": 2202,
+                "REGNAMESPACE": 4089,
+                "REGROLE": 4096,
+                "OID": 26,
+            }.get(str(target.this).upper())
+            if reg_oid:
+                oids[idx] = reg_oid
+            continue
         # ``$1::JSON`` / ``$1::JSON[]`` keep the plain-json identities
         # (114 / 199) — the collapsed tag would report jsonb's 3802/3807.
         ident = typemap.cast_type_identity(target)

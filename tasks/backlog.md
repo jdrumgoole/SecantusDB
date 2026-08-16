@@ -2604,10 +2604,17 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   simple query is now ONE implicit transaction (mid-batch errors roll
   back earlier writes; BEGIN takes over with its characteristics —
   READ ONLY gates + poisons; COMMIT splits), with a top-level-semicolon
-  segment-parse fallback for batches sqlglot rejects whole. Corpus: 36
-  unexpected failures; green: aborted_txn, array, batch_stmt, json,
-  json_array (+1). Next: `bind_and_resolve`, `char`, `citext`, `copy`.
-  Iterate file-by-file.
+  segment-parse fallback for batches sqlglot rejects whole. Slice 6
+  greened `bind_and_resolve`: reg-pseudotype parameter oids
+  (`$1::REGCLASS` → 2205 in ParameterDescription) and bind-time portal
+  snapshots — a portal bound inside an explicit txn runs eagerly at Bind
+  (read-only SELECTs only; errors stay at Execute after BindComplete;
+  cached-plan revalidation still trips 0A000 at Execute), so later
+  same-txn DDL can't change what the held portal returns. Corpus: 35
+  unexpected failures; green: aborted_txn, array, batch_stmt,
+  bind_and_resolve, json, json_array (+1). Next: `char`, `citext`,
+  `copy` (`multiple_active_portals` needs fresh-state isolation —
+  leftover `mytable`/`ltree` deps). Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
