@@ -646,6 +646,16 @@ def _encode_array(
 
 
 def _decode_array(raw: bytes, encoding: str | None = "utf-8") -> list:
+    try:
+        return _decode_array_inner(raw, encoding)
+    except (struct.error, IndexError) as e:
+        # A truncated / structurally-bogus binary array parameter (the pgtest
+        # corpus sends a bad element oid with no element data) is PG's 08P01,
+        # never an internal error.
+        raise errors.SQLError("08P01", "insufficient data left in message") from e
+
+
+def _decode_array_inner(raw: bytes, encoding: str | None = "utf-8") -> list:
     """Decode a binary array parameter to a (possibly nested) Python list."""
     ndim, _has_null, elem_oid = struct.unpack_from("!iii", raw, 0)
     if ndim == 0:
