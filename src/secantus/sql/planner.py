@@ -2760,6 +2760,16 @@ def _cast_output_name(target: exp.Expression) -> str | None:
     ident = typemap.cast_type_identity(target.to)
     if ident is not None and ident[0] in _CAST_TYPNAME_BY_OID:
         return _CAST_TYPNAME_BY_OID[ident[0]]
+    if target.to.this == exp.DataType.Type.USERDEFINED:
+        # PG names an unaliased cast to a user-defined type (enum, composite,
+        # domain) after the TYPE name — ``SELECT 'hi'::te`` yields a column
+        # named ``te`` (pgtest enum corpus).
+        kind = target.to.args.get("kind")
+        if kind is not None:
+            name = str(getattr(kind, "this", kind)).strip('"').lower()
+            # The quoted-"char" cast rewrites to the pg_char_1 sentinel
+            # pre-parse; its typname is the bare word (oid 18).
+            return "char" if name == "pg_char_1" else name
     tag = typemap.type_tag_for_sql(target.to)
     if tag is None:
         return None

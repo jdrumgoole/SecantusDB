@@ -387,7 +387,14 @@ def row_description(
         payload += _INT32.pack(col[3] if len(col) > 3 else 0)  # source table OID
         payload += _INT16.pack(col[4] if len(col) > 4 else 0)  # source column attnum
         payload += _INT32.pack(type_oid)
-        payload += _INT16.pack(_TYPLEN.get(type_oid, -1))  # type size
+        if 65000 <= type_oid < 66000:
+            # Minted user-ENUM type oids (catalog.ENUM_TYPE_OID_BASE range —
+            # pinned by a test). PG stores enum values as 4-byte oids and
+            # reports typlen 4 (pgtest enum corpus); user-function oids share
+            # this range but never appear as a column's type oid.
+            payload += _INT16.pack(4)
+        else:
+            payload += _INT16.pack(_TYPLEN.get(type_oid, -1))  # type size
         payload += _INT32.pack(typmod)  # type modifier
         payload += _INT16.pack(formats[i] if formats is not None else 0)  # 0=text, 1=binary
     return _msg("T", bytes(payload))
