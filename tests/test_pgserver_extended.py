@@ -850,3 +850,30 @@ def test_copy_unbound_placeholder_is_42P02(client):
     fields = pgwire.parse_error_response(err.payload)
     assert fields.get("C") == "42P02"
     assert fields.get("M") == "there is no parameter $1"
+
+
+def test_binary_numeric_zero_with_many_zero_groups_renders_0(client):
+    # pgtest decimal:29 — 8192 all-zero base-10000 digit groups with dscale 0
+    # must render "0", not 0.000…0 (scaleb of a zero keeps the huge negative
+    # exponent unless the decoder quantizes to dscale unconditionally).
+    import struct as _s
+
+    payload = _s.pack("!HhHH", 8192, 0, 0, 0) + b"\x00\x00" * 8192
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT $1::decimal", []),
+        pgwire.build_bind("", "", [payload], param_formats=[1]),
+        pgwire.build_execute("", 0),
+    )
+    assert rows(msgs) == [[b"0"]]
+
+
+def test_binary_numeric_invalid_dscale_is_22P03(client):
+    # pgtest decimal:121 — dscale 0xFFF0 (a negative int16) is outside PG's
+    # NUMERIC_DSCALE_MASK; numeric_recv rejects it with 22P03 at Bind.
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT $1::decimal", []),
+        pgwire.build_bind("", "", [bytes.fromhex("000100010000FFF00001")], param_formats=[1]),
+        pgwire.build_execute("", 0),
+    )
+    assert error_code(msgs) == "22P03"
+    assert "2" not in types(msgs)  # error fires AT Bind — no BindComplete
