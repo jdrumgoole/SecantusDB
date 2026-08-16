@@ -2642,12 +2642,18 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   in Execute; COPY takes 0 params — binding any is 08P01 with the
   statement-summary detail; an unbound $1 at Execute is 42P02);
   crdb's inline INDEX(...) table element is accepted-and-skipped and
-  ADD COLUMN ... NOT VISIBLE parses as a normal column. Corpus: 32
-  unexpected failures; green: aborted_txn, array, batch_stmt,
-  bind_and_resolve, json, json_array, char, citext, copy (+2). Next:
-  `copy_file_upload`, `decimal` (`multiple_active_portals` needs
-  fresh-state isolation — leftover `mytable`/`ltree` deps). Iterate
-  file-by-file.
+  ADD COLUMN ... NOT VISIBLE parses as a normal column. Slice 10
+  greened `copy_file_upload`: unknown COPY option keywords (crdb's
+  ``WITH destination = 'nodelocal://…'``) now raise PG's 42601 at
+  parse, before the target table resolves (was 42P01), via a
+  known-keyword allowlist in the option scanner; the legit ``QUOTE``
+  option is wired for real while at it (custom CSV quote char in
+  parse + render, CSV-only 0A000 gate, 22023 for multi-char).
+  Corpus: 31 unexpected failures; green: aborted_txn, array,
+  batch_stmt, bind_and_resolve, json, json_array, char, citext,
+  copy, copy_file_upload (+2). Next: `decimal`, `enum`
+  (`multiple_active_portals` needs fresh-state isolation — leftover
+  `mytable`/`ltree` deps). Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``

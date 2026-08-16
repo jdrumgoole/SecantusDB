@@ -1953,6 +1953,8 @@ class CopyPlan:
     header: bool
     #: CSV ESCAPE character (None = PG default: the quote char, i.e. "" doubling).
     escape: str | None = None
+    #: CSV QUOTE character (None = PG default double-quote).
+    quote: str | None = None
     # For ``COPY (SELECT …) TO STDOUT``: the pre-rendered copy-stream cells of the
     # query result (query-form COPY is dump-only; ``table`` is None).
     query_rows: list[list] | None = None
@@ -1980,7 +1982,7 @@ def copy_plan(
     if session is not None:
         planner.qualify_from_search_path(stmt, catalog, db, session)
     to_stdout = not bool(stmt.args.get("kind"))  # kind True = FROM, False = TO
-    fmt, delimiter, null, header, escape = _copy_options(stmt)
+    fmt, delimiter, null, header, escape, quote = _copy_options(stmt)
     if delimiter is None:
         delimiter = "," if fmt == "csv" else "\t"
     if null is None:
@@ -2003,6 +2005,7 @@ def copy_plan(
             null,
             header,
             escape=escape,
+            quote=quote,
             query_rows=query_rows,
             query_raw_rows=raw_rows,
             col_tags=tags,
@@ -2042,6 +2045,7 @@ def copy_plan(
         null,
         header,
         escape=escape,
+        quote=quote,
         col_tags=col_tags,
         col_oids=col_oids,
     )
@@ -2084,7 +2088,9 @@ def _copy_query_rows(
     return columns, rows, None, tags, oids
 
 
-def _copy_options(stmt: exp.Copy) -> tuple[str, str | None, str | None, bool, str | None]:
+def _copy_options(
+    stmt: exp.Copy,
+) -> tuple[str, str | None, str | None, bool, str | None, str | None]:
     """Parse ``FORMAT`` / ``CSV`` / ``BINARY`` / ``DELIMITER`` / ``NULL`` /
     ``HEADER`` / ``ESCAPE`` from a COPY statement's parameter list.
 
@@ -2093,7 +2099,13 @@ def _copy_options(stmt: exp.Copy) -> tuple[str, str | None, str | None, bool, st
     DELIMITER) + Var(|)), so the params are flattened back into a token stream
     and scanned keyword-by-keyword — value keywords consume the next token.
     ESCAPE and HEADER are CSV-only (PG's 0A000, pinned by the pgtest copy
-    corpus; PG 15's text-format HEADER is not modelled)."""
+    corpus; PG 15's text-format HEADER is not modelled).
+
+
+    An option keyword outside PG's COPY grammar (crdb's ``WITH destination =
+    'nodelocal://…'``) is a 42601 syntax error, raised here — BEFORE the
+    target table resolves — so the error class matches real PG (the pgtest
+    copy_file_upload corpus pins 42601, not 42P01)."""
     tokens: list[str] = []
     for p in stmt.args.get("params") or []:
         for node in (p.this, p.args.get("expression")):
@@ -2105,7 +2117,7 @@ def _copy_options(stmt: exp.Copy) -> tuple[str, str | None, str | None, bool, st
                 tokens.append(str(node.this))
             else:
                 tokens.append(str(getattr(node, "name", node)))
-    fmt, delimiter, null, header, escape = "text", None, None, False, None
+    fmt, delimiter, null, header, escape, quote = "text", None, None, False, None, None
     i = 0
 
     def take_value() -> str:
@@ -2140,6 +2152,21 @@ def _copy_options(stmt: exp.Copy) -> tuple[str, str | None, str | None, bool, st
             null = take_value()
         elif key == "ESCAPE":
             escape = take_value()
+        elif key == "QUOTE":
+            quote = take_value()
+        elif key == "ENCODING":
+            take_value()  # accepted; the wire encoding governs the payload
+        elif key in ("FREEZE", "OIDS"):
+            pass  # legacy bare keywords, no-ops here
+        else:
+            # PG's COPY grammar rejects unknown option keywords at parse —
+            # crdb's ``WITH destination = '…'`` lands here.
+            raise errors.syntax_error(f'syntax error at or near "{key.lower()}"')
+    if quote is not None:
+        if fmt != "csv":
+            raise errors.feature_not_supported("COPY quote available only in CSV mode")
+        if len(quote) != 1:
+            raise errors.SQLError("22023", "COPY quote must be a single one-byte character")
     if escape is not None:
         if fmt != "csv":
             raise errors.feature_not_supported("COPY escape available only in CSV mode")
@@ -2147,7 +2174,7 @@ def _copy_options(stmt: exp.Copy) -> tuple[str, str | None, str | None, bool, st
             raise errors.SQLError("22023", "COPY escape must be a single one-byte character")
     if header and fmt != "csv":
         raise errors.feature_not_supported("COPY HEADER available only in CSV mode")
-    return fmt, delimiter, null, header, escape
+    return fmt, delimiter, null, header, escape, quote
 
 
 def _parse_bool_text(cell: str) -> bool:

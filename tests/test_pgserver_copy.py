@@ -401,3 +401,27 @@ def test_copy_to_stdout_bare_binary_keyword(client):
     body = bytes(data)[len(_PGCOPY_SIG) + 8 :]
     one_row = _struct.pack("!h", 1) + _struct.pack("!i", 4) + _struct.pack("!i", 7)
     assert body == one_row + _struct.pack("!h", -1)
+
+
+def test_unknown_copy_option_is_syntax_error(client):
+    # crdb's ``WITH destination = 'nodelocal://…'`` (pgtest copy_file_upload):
+    # PG's COPY grammar rejects unknown option keywords at parse — 42601,
+    # raised BEFORE the target table resolves (not 42P01).
+    msgs = client.query("COPY nowhere FROM STDIN WITH destination = 'nodelocal://self/f.csv'")
+    err = next(m for m in msgs if m.type == "E")
+    assert pgwire.parse_error_response(err.payload).get("C") == "42601"
+
+
+def test_copy_csv_custom_quote_roundtrip(client):
+    client.send(pgwire.build_query("COPY t (id, name) FROM STDIN CSV QUOTE '|'"))
+    assert client.read_message().type == "G"
+    client.send(pgwire.copy_data(b"1,|a,b|\n"))
+    client.send(pgwire.copy_done())
+    msgs = client.read_until_ready()
+    assert _tag(msgs) == "COPY 1"
+    rows = [
+        pgwire.parse_data_row(m.payload)
+        for m in client.query("SELECT name FROM t WHERE id = 1")
+        if m.type == "D"
+    ]
+    assert rows == [[b"a,b"]]

@@ -96,3 +96,8 @@ def test_text_hex_and_octal_escapes():
         ["2", "twoT"],
         ["3", "ab\tcd"],
     ]
+
+
+def test_csv_custom_quote_char():
+    assert copyfmt.parse_csv("1,|a,b|\n", quote="|") == [["1", "a,b"]]
+    assert copyfmt.format_csv([["1", "a,b"]], quote="|") == "1,|a,b|\n"
