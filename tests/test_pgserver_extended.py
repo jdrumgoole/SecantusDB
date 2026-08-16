@@ -712,3 +712,60 @@ def test_failing_select_in_txn_errors_at_execute_not_bind(client):
         pgwire.build_bind("", "", []),
         pgwire.build_execute("", 0),
     )
+
+
+def test_quoted_char_cast_reports_oid_18(client):
+    # pgtest char:42 — the QUOTED "char" spelling is PG's internal one-byte
+    # type: column named char, oid 18, size 1 (unquoted char stays bpchar).
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT 'a'::\"char\"", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_describe("P", ""),
+        pgwire.build_execute("", 0),
+    )
+    rd = next(m for m in msgs if m.type == "T")
+    import struct as _s
+
+    end = rd.payload.index(b"\x00", 2)
+    assert rd.payload[2:end] == b"char"
+    assert _s.unpack_from("!i", rd.payload, end + 7)[0] == 18
+    assert _s.unpack_from("!h", rd.payload, end + 11)[0] == 1  # size 1
+    assert rows(msgs) == [[b"a"]]
+
+
+def test_quoted_char_column_truncates_and_nulls(client):
+    # pgtest char corpus: a "char" column truncates input to ONE character,
+    # and empty / zero-byte input stores NULL.
+    client.exchange(
+        pgwire.build_parse("", 'CREATE TABLE chart (a int, b "char")', []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    ins = pgwire.build_parse("ins_c", "INSERT INTO chart VALUES ($1, $2)", [])
+    msgs = client.exchange(ins, pgwire.build_describe("S", "ins_c"))
+    pd = next(m for m in msgs if m.type == "t")
+    import struct as _s
+
+    assert _s.unpack_from("!i", pd.payload, 2 + 4)[0] == 18  # $2 -> "char"
+    for i, val in ((1, b"eee"), (2, b""), (3, b"\xe2\x98\x83")):  # snowman
+        client.exchange(
+            pgwire.build_bind("", "ins_c", [str(i).encode(), val]),
+            pgwire.build_execute("", 0),
+        )
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT b FROM chart ORDER BY a", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert rows(msgs) == [[b"e"], [None], ["☃".encode()]]
+
+
+def test_quoted_char_zero_cast_binary_result(client):
+    # pgtest char:201 — 0::"char" is the zero byte; binary result format
+    # carries it as one 0x00 byte (not SQL NULL).
+    msgs = client.exchange(
+        pgwire.build_parse("", 'SELECT 0::"char"', []),
+        pgwire.build_bind("", "", [], result_formats=[1]),
+        pgwire.build_execute("", 0),
+    )
+    assert rows(msgs) == [[b"\x00"]]

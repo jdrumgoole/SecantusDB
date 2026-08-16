@@ -271,9 +271,22 @@ _GEO_BINARY: dict[int, Any] = {
 # to str and rides column-type coercion; libpq clients (psycopg) send many types
 # in binary. Types whose storage form is canonical text (time / inet / uuid /
 # interval / ranges …) decode to that text and ride the same coercion path.
+def _decode_char1(b: bytes) -> str | None:
+    # "char" binary form is the raw byte(s). Empty / zero byte is the NULL
+    # surrogate (the pgtest char corpus reads both back as SQL NULL).
+    if b in (b"", b"\x00"):
+        return None
+    try:
+        s = b.decode("utf-8")
+    except UnicodeDecodeError:
+        s = b.decode("latin-1")
+    return s[0]
+
+
 _BINARY = {
     16: lambda b: b == b"\x01",  # bool
     17: lambda b: bytes(b),  # bytea
+    18: _decode_char1,  # "char" (one byte)
     20: lambda b: struct.unpack("!q", b)[0],  # int8
     21: lambda b: struct.unpack("!h", b)[0],  # int2
     23: lambda b: struct.unpack("!i", b)[0],  # int4
@@ -580,6 +593,7 @@ _OUT_BINARY = {
     628: _encode_geo_floats(3),  # line
     718: _encode_geo_floats(3),  # circle
     17: lambda v: bytes(v),  # bytea
+    18: lambda v: str(v).encode("utf-8"),  # "char" — raw byte(s), \0 included
     20: lambda v: struct.pack("!q", int(typemap.unwrap_numeric(v))),  # int8
     21: lambda v: struct.pack("!h", int(typemap.unwrap_numeric(v))),  # int2
     23: lambda v: struct.pack("!i", int(typemap.unwrap_numeric(v))),  # int4

@@ -37,6 +37,10 @@ from sqlglot import exp
 PG_OID: dict[str, int] = {
     "bool": 16,
     "bytea": 17,
+    # PG's internal one-byte "char" (quoted; pg_type.typname = char, oid 18).
+    # Distinct from char(n)/bpchar: size 1, truncates to one character on
+    # input, and an empty/zero-byte input stores NULL (pgtest char corpus).
+    "char1": 18,
     "int8": 20,
     "int2": 21,
     "int4": 23,
@@ -256,7 +260,12 @@ def builtin_tag_for_name(name: str) -> str | None:
     type; psycopg's own test fixtures build DDL exactly this way
     (``sql.Identifier(info.name)``), so quoted built-in names must resolve
     before the enum/domain fallback."""
-    key = " ".join(str(name).strip().strip('"').lower().split())
+    raw = str(name).strip()
+    if raw == '"char"' or raw == "'char'":
+        # The QUOTED spelling names PG's internal one-byte type (oid 18);
+        # the unquoted keyword spelling stays bpchar/text below.
+        return "char1"
+    key = " ".join(raw.strip('"').lower().split())
     if key.endswith("[]"):
         elem = builtin_tag_for_name(key[:-2])
         return f"{elem}[]" if elem is not None and f"{elem}[]" in PG_OID else None
@@ -737,6 +746,10 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
         return "date"
     if base in _GEO_TAGS:
         return base
+    if base == "pg_char_1":
+        # planner.parse rewrites a ::"char" cast to this sentinel (sqlglot
+        # collapses the quoted spelling into plain CHAR, losing the identity).
+        return "char1"
     if base == "citext":
         return "citext"
     if base == "aclitem":
@@ -1184,6 +1197,17 @@ def coerce(value: Any, tag: str) -> Any:
         # citext stores the original text verbatim (case preserved for display);
         # the case-insensitivity is applied by the query planner, not on write.
         return str(value)
+    if tag == "char1":
+        # PG's internal one-byte "char": input truncates to ONE character
+        # (crdb's UTF-8-character rule, pinned by the pgtest char corpus),
+        # and an empty string / zero byte stores NULL (the corpus reads
+        # both back as SQL NULL).
+        if isinstance(value, int) and not isinstance(value, bool):
+            value = chr(value) if 0 <= value < 0x110000 else str(value)
+        s = str(value)
+        if s in ("", "\x00"):
+            return None
+        return s[0]
     if tag == "bool":
         if isinstance(value, str):
             # A text-format bound parameter / literal arrives as Postgres' bool

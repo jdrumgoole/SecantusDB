@@ -11,4 +11,13 @@ green while the failure is a documented gap rather than a regression.
 EXCLUDE: set[str] = set()
 
 #: file -> reason. A file listed here that PASSES is reported loudly.
-EXPECTED_DIVERGENCES: dict[str, str] = {}
+EXPECTED_DIVERGENCES: dict[str, str] = {
+    "char": (
+        "char:250 pins TableOID=105 — crdb's deterministic descriptor id, "
+        "with no ignore_table_oids directive on that stanza. Real PostgreSQL "
+        "reports its own pg_class oid there too (installation-specific), so "
+        "the stanza can't pass against any non-crdb server. Everything else "
+        "in the file is green (oid-18 \"char\": casts, columns, params, "
+        "1-char truncation, NULL for empty/zero-byte, binary format)."
+    ),
+}

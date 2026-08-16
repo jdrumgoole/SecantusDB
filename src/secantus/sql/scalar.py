@@ -1719,6 +1719,19 @@ def _cast_scalar(value: Any, tag: str) -> Any:
     is str-vs-int false) and the binary result format (the wire layer would
     send text bytes in a column whose RowDescription claims a numeric OID)."""
     value = _unwrap_decimal(value)
+    if tag == "char1":
+        # PG's internal one-byte "char": an int cast is chr(i) — 0::"char" IS
+        # the zero byte, kept as a value (its binary render is 0x00); text
+        # input truncates to one character and '' becomes NULL, matching the
+        # input-conversion rule in typemap.coerce (pgtest char corpus).
+        if isinstance(value, bool):
+            value = int(value)
+        if isinstance(value, int):
+            if not 0 <= value <= 255:
+                raise errors.SQLError("22003", '"char" out of range')
+            return chr(value)
+        s = str(value)
+        return None if s == "" else s[0]
     if tag in ("int2", "int4", "int8"):
         if isinstance(value, bool):
             return int(value)
@@ -2355,6 +2368,7 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         "float8",
         "numeric",
         "bool",
+        "char1",
     ):
         return _cast_scalar(value, to_tag)
     # ``ts::text`` renders through the session-aware datetime renderer (TimeZone
