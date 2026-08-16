@@ -909,3 +909,31 @@ def test_enum_cast_names_column_and_typlen_4(client):
     assert rd.payload[2:end] == b"te"
     assert _s.unpack_from("!h", rd.payload, end + 11)[0] == 4  # typlen
     assert rows(msgs) == [[b"hi"]]
+
+
+def test_invalid_format_code_is_08P01_at_bind(client):
+    # pgtest errors:95 — format codes other than 0/1 are a protocol
+    # violation, rejected at Bind before BindComplete.
+    import struct as _s
+
+    payload = (
+        b"p0\x00s0\x00"
+        + _s.pack("!h", 1)
+        + _s.pack("!h", 0)
+        + _s.pack("!H", 1)
+        + _s.pack("!i", 1)
+        + b"x"
+        + _s.pack("!h", 3)
+        + _s.pack("!h", 0)
+        + _s.pack("!h", 2)
+        + _s.pack("!h", 5)
+    )
+    from secantus.sql.pgwire import _msg
+
+    msgs = client.exchange(
+        pgwire.build_parse("s0", "select $1", []),
+        _msg("B", payload),
+        pgwire.build_execute("p0", 0),
+    )
+    assert error_code(msgs) == "08P01"
+    assert "2" not in types(msgs)  # no BindComplete
