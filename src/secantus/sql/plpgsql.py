@@ -14,16 +14,18 @@ and ORM-/migration-generated functions actually use:
 - embedded SQL: ``SELECT … INTO var[, …] …`` (assigns the query's first row to the
   targets), ``PERFORM query`` (runs a query for its side effects), and bare
   ``INSERT`` / ``UPDATE`` / ``DELETE`` statements;
-- ``NULL ;`` no-op.
+- ``NULL ;`` no-op;
+- refcursors: ``OPEN <cursor> FOR <query>`` (materializes into a session
+  cursor named like PG's unnamed portals) and ``CLOSE <cursor>``.
 
 A bare identifier in an expression or embedded query that matches a declared
 variable or a function parameter resolves to that value; everything else is left
 for the ordinary SQL machinery to resolve (table columns, functions, subqueries).
 
 **Out of scope** (raises ``feature_not_supported`` / ``0A000``): loops
-(``LOOP`` / ``WHILE`` / ``FOR``), ``RAISE``, ``RETURN QUERY`` / ``RETURN NEXT``
-(set-returning functions), ``CASE`` statements, cursors, exception handlers
-(``EXCEPTION WHEN``), and dynamic ``EXECUTE``.
+(``LOOP`` / ``WHILE`` / ``FOR``), ``RETURN QUERY`` / ``RETURN NEXT``
+(set-returning functions), ``CASE`` statements, ``OPEN … FOR EXECUTE``,
+exception handlers (``EXCEPTION WHEN``), and dynamic ``EXECUTE``.
 """
 
 from __future__ import annotations
@@ -171,6 +173,20 @@ class Raise:
 
 
 @dataclass
+class OpenCursor:
+    """``OPEN <var> FOR <query>`` — materialize the query into a server-side
+    cursor and bind the variable to its generated name."""
+
+    var: str
+    query: str
+
+
+@dataclass
+class CloseCursor:
+    var: str
+
+
+@dataclass
 class SqlExec:
     query: str  # a bare INSERT/UPDATE/DELETE/SELECT run for side effects
 
@@ -311,6 +327,29 @@ class _Parser:
             return SqlExec(query)
         if self._is_kw(tok, "raise"):
             return self._parse_raise()
+        if self._is_kw(tok, "open"):
+            # OPEN <var> FOR <query>;  — bind a refcursor variable to a
+            # materialized server-side cursor. (The parameterized
+            # ``OPEN c FOR EXECUTE`` form is not supported.)
+            var_tok = self._peek(1)
+            for_tok = self._peek(2)
+            if var_tok is None or var_tok.kind != "word" or not self._is_kw(for_tok, "for"):
+                raise errors.feature_not_supported(
+                    "plpgsql OPEN supports only the OPEN <cursor> FOR <query> form"
+                )
+            self.i += 3
+            lo = self.i
+            self._skip_to_semi()
+            query = self._raw(lo, self.i)
+            self.i += 1
+            return OpenCursor(var_tok.val, query)
+        if self._is_kw(tok, "close"):
+            var_tok = self._peek(1)
+            if var_tok is None or var_tok.kind != "word":
+                raise errors.feature_not_supported("plpgsql CLOSE requires a cursor variable")
+            self.i += 2
+            self._consume_optional_semi()
+            return CloseCursor(var_tok.val)
         if self._is_kw(tok, "loop", "while", "for", "case", "execute", "foreach"):
             raise errors.feature_not_supported(
                 f"plpgsql statement {tok.val.upper()} is not supported"
@@ -634,7 +673,43 @@ class _Runner:
             if st.query.strip():
                 self._run_sql(st.query, env)
             return
+        if isinstance(st, OpenCursor):
+            self._open_cursor(st, env)
+            return
+        if isinstance(st, CloseCursor):
+            session = getattr(self.ctx, "session", None)
+            name = env.get(st.var.lower())
+            if session is None or not isinstance(name, str) or name not in session.cursors:
+                raise errors.SQLError("34000", f'cursor "{st.var}" does not exist')
+            del session.cursors[name]
+            return
         raise errors.feature_not_supported(f"plpgsql: cannot execute {type(st).__name__}")
+
+    def _open_cursor(self, st: OpenCursor, env: dict[str, Any]) -> None:
+        """Materialize ``OPEN <var> FOR <query>`` into a session cursor named
+        like PG's unnamed portals and bind the variable to that name — the
+        caller FETCHes from it by name (pgjdbc's refcursor round-trip)."""
+        from secantus.sql import engine as _engine
+
+        c = self.ctx
+        session = getattr(c, "session", None)
+        if session is None:
+            raise errors.feature_not_supported("plpgsql OPEN needs a session")
+        seq = getattr(session, "refcursor_seq", 0) + 1
+        session.refcursor_seq = seq
+        name = f"<unnamed portal {seq}>"
+        stmt = sqlglot.parse_one(st.query, read="postgres")
+        stmt = self._inline(stmt, env)
+        _engine.materialize_cursor(
+            name,
+            stmt,
+            c.storage,
+            c.db,
+            c.catalog,
+            session,
+            statement=f"OPEN {st.var} FOR {st.query}",
+        )
+        env[st.var.lower()] = name
 
     # -- expression + embedded-SQL evaluation -------------------------------- #
 

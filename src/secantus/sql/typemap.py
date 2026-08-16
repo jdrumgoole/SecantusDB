@@ -89,6 +89,9 @@ PG_OID: dict[str, int] = {
     "interval": 1186,
     # UUID type (rendered as the canonical lower-case hyphenated string).
     "uuid": 2950,
+    # Refcursor: a server-side cursor's name (plpgsql OPEN … FOR). The value is
+    # the name text; the oid is what tells a driver to FETCH from it.
+    "refcursor": 1790,
     # Money type (a Decimal rendered as ``$1,234.56``).
     "money": 790,
     # Geometric types (stored as canonical Postgres text).
@@ -735,6 +738,8 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
     base = name.split("(", 1)[0].strip()
     if base == "bit varying":
         return "varbit"
+    if base == "refcursor":
+        return "refcursor"
     if base in _BIT_TAGS:
         return base
     if base == "interval" or base.startswith("interval "):

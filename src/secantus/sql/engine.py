@@ -786,7 +786,45 @@ def _declare_cursor(
         # (``wat``) or a DDL/DML statement is a syntax error (42601 →
         # ProgrammingError), not 0A000.
         raise errors.syntax_error("DECLARE CURSOR must specify a SELECT query")
-    result = _run_query(stmts[0], storage, db, catalog, session)
+    materialize_cursor(
+        name,
+        stmts[0],
+        storage,
+        db,
+        catalog,
+        session,
+        statement=f"DECLARE {tail}",
+        hold=hold,
+        scrollable=scrollable,
+        skip_cap_check=True,
+    )
+    return SQLResult(command_tag="DECLARE CURSOR")
+
+
+def materialize_cursor(
+    name: str,
+    stmt: exp.Expression,
+    storage: Any,
+    db: str,
+    catalog: Catalog,
+    session: Session,
+    *,
+    statement: str,
+    hold: bool = False,
+    scrollable: bool | None = None,
+    skip_cap_check: bool = False,
+) -> None:
+    """Run ``stmt`` and store its rows as a named session cursor — the shared
+    tail of ``DECLARE … CURSOR FOR`` and plpgsql's ``OPEN <var> FOR``."""
+    if (
+        not skip_cap_check
+        and name not in session.cursors
+        and len(session.cursors) >= MAX_CURSORS_PER_SESSION
+    ):
+        raise errors.program_limit_exceeded(
+            f"too many open cursors (limit {MAX_CURSORS_PER_SESSION}); CLOSE some first"
+        )
+    result = _run_query(stmt, storage, db, catalog, session)
     rows = list(result.rows)
     # Cap the materialized row set a single cursor retains (SecantusDB cursors
     # are eager, unlike mongod's lazy ones). Bounds the memory one connection can
@@ -802,10 +840,9 @@ def _declare_cursor(
         pos=-1,
         hold=hold,
         scrollable=scrollable,
-        statement=f"DECLARE {tail}",
+        statement=statement,
         created=_dt.datetime.now(_dt.timezone.utc),
     )
-    return SQLResult(command_tag="DECLARE CURSOR")
 
 
 _FETCH_DIRECTIONS = frozenset(
@@ -818,10 +855,18 @@ def _parse_fetch(tail: str) -> tuple[str, int | None, str]:
     of forward / backward / absolute / relative; ``count`` is the row count (None =
     ALL). The cursor name is the final token; an optional ``FROM`` / ``IN`` before
     it is dropped."""
-    toks = tail.split()
-    if not toks:
-        raise errors.syntax_error("FETCH requires a cursor name")
-    name = _unquote_ident(toks.pop())
+    # A quoted trailing cursor name may contain spaces — plpgsql refcursors
+    # are named like PG's ``<unnamed portal 1>`` and pgjdbc FETCHes them
+    # double-quoted, so a naive whitespace split would truncate the name.
+    quoted = re.search(r'"((?:[^"]|"")*)"\s*$', tail.strip())
+    if quoted is not None:
+        name = quoted.group(1).replace('""', '"')
+        toks = tail.strip()[: quoted.start()].split()
+    else:
+        toks = tail.split()
+        if not toks:
+            raise errors.syntax_error("FETCH requires a cursor name")
+        name = _unquote_ident(toks.pop())
     if toks and toks[-1].upper() in ("FROM", "IN"):
         toks.pop()
     spec = [t.upper() for t in toks]
