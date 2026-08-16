@@ -77,6 +77,11 @@ _PG_EPOCH_DATE = _dt.date(2000, 1, 1)
 def _decode_numeric(b: bytes) -> Decimal:
     """Decode Postgres' binary ``numeric`` (base-10000 digits)."""
     ndigits, weight, sign, dscale = struct.unpack_from("!HhHH", b, 0)
+    if dscale > 0x3FFF:
+        # PG's numeric_recv rejects a scale outside NUMERIC_DSCALE_MASK —
+        # the pgtest decimal corpus sends dscale=0xFFF0 (a negative int16)
+        # and expects 22P03 at Bind.
+        raise errors.SQLError("22P03", 'invalid scale in external "numeric" value')
     digits = [struct.unpack_from("!H", b, 8 + 2 * i)[0] for i in range(ndigits)]
     if sign == 0xC000:  # NaN
         return Decimal("NaN")
@@ -96,7 +101,10 @@ def _decode_numeric(b: bytes) -> Decimal:
     if sign == 0x4000:
         value = value.copy_negate()  # context-free: ``-value`` rounds to context prec
     # Round to the declared display scale so 19.99 doesn't become 19.9900...
-    return value.quantize(Decimal(1).scaleb(-dscale), context=dctx) if dscale else value
+    # — ALWAYS, including dscale=0: a zero built from N zero digit-groups
+    # carries exponent -4N (scaleb of 0 keeps it), and skipping the quantize
+    # rendered 0 as 0.000…0 (pgtest decimal:29, the 8192-group regression).
+    return value.quantize(Decimal(1).scaleb(-dscale), context=dctx)
 
 
 def _decode_timestamptz(b: bytes) -> _dt.datetime:

@@ -2649,9 +2649,14 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   known-keyword allowlist in the option scanner; the legit ``QUOTE``
   option is wired for real while at it (custom CSV quote char in
   parse + render, CSV-only 0A000 gate, 22023 for multi-char).
-  Corpus: 31 unexpected failures; green: aborted_txn, array,
+  Slice 11 greened `decimal`: the binary-numeric decoder always
+  quantizes to dscale (a zero built from 8192 zero digit-groups kept
+  exponent -32768 and rendered 0.000…0 — the #38139 regression
+  payload), and a dscale outside PG's NUMERIC_DSCALE_MASK (0x3FFF)
+  raises 22P03 at Bind like numeric_recv (the corpus sends 0xFFF0).
+  Corpus: 30 unexpected failures; green: aborted_txn, array,
   batch_stmt, bind_and_resolve, json, json_array, char, citext,
-  copy, copy_file_upload (+2). Next: `decimal`, `enum`
+  copy, copy_file_upload, decimal (+2). Next: `enum`, `errors`
   (`multiple_active_portals` needs fresh-state isolation — leftover
   `mytable`/`ltree` deps). Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
