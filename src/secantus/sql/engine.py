@@ -1548,7 +1548,12 @@ def _describe_statement(
             if getattr(plan, "count_star", False):
                 return [ColumnDesc(plan.count_alias, "int8", typemap.PG_OID["int8"])]
             return executor._tagged_out_column_descs(
-                plan.out_columns, getattr(plan, "out_enum_types", None) or {}, storage, db
+                plan.out_columns,
+                getattr(plan, "out_enum_types", None) or {},
+                storage,
+                db,
+                out_exprs=getattr(plan, "out_exprs", None),
+                base_table=getattr(plan, "base_table", None),
             )
         except (errors.SQLError, TypeError, ValueError, AttributeError):
             return None
@@ -1581,7 +1586,12 @@ def _describe_statement(
     if planner.select_needs_pipeline(stmt):
         pplan = planner.plan_pipeline_select(stmt, db, catalog, storage)
         return executor._tagged_out_column_descs(
-            pplan.out_columns, pplan.out_enum_types, storage, db
+            pplan.out_columns,
+            pplan.out_enum_types,
+            storage,
+            db,
+            out_exprs=getattr(pplan, "out_exprs", None),
+            base_table=getattr(pplan, "base_table", None),
         )
     schema = table_node.args.get("db")
     schema_name = schema.name if schema is not None else None

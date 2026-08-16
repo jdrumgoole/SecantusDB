@@ -745,6 +745,13 @@ def _out_column_descs(
     out: list[ColumnDesc] = []
     for name, col in cols:
         oid = typemap.PG_OID.get(col.type_tag, 25)
+        # A declared identity (varchar/bpchar fold to text for storage but
+        # reflect their real oid; numeric/timestamp precision rides the
+        # atttypmod) — JDBC derives display size and scale from these.
+        decl = getattr(col, "decl_oid", None)
+        if decl:
+            oid = decl
+        typmod = getattr(col, "typmod", -1)
         if getattr(col, "json_plain", False):
             oid = 114  # a ``json`` (not jsonb) column keeps the plain-json oid
         if (
@@ -758,6 +765,13 @@ def _out_column_descs(
             from secantus.sql import virtual
 
             minted = virtual._composite_oids(db, Catalog(storage)).get(col.composite_type)
+            if minted is None:
+                # A column typed by a TABLE's row type: report the table's
+                # rowtype oid — its pg_type row has typtype 'c', which is what
+                # pgjdbc's getSQLType maps to java.sql.Types.STRUCT (generic
+                # RECORD/2249 mapped to OTHER — ResultSetMetaDataTest's
+                # testComposite trio).
+                minted = virtual._table_rowtype_oids(db, Catalog(storage)).get(col.composite_type)
             if minted is not None:
                 oid = minted
         if getattr(col, "enum_type", None) is not None and storage is not None and db is not None:
@@ -777,6 +791,7 @@ def _out_column_descs(
                 name,
                 col.type_tag,
                 oid,
+                typmod,
                 table_oid=table_oid if attnum else 0,
                 attnum=attnum,
             )
@@ -789,12 +804,24 @@ def _tagged_out_column_descs(
     enum_types: dict[int, str],
     storage: Any,
     db: str | None,
+    *,
+    out_exprs: list | None = None,
+    base_table: Any = None,
 ) -> list[ColumnDesc]:
     """Describe ``(out_name, type_tag)`` output pairs (the pipeline/evaluated
     plans' string-tag form). ``enum_types`` maps output positions to enum type
     names — the tag alone can't carry the identity (labels are stored as text) —
-    so those positions resolve the minted enum oid like `_out_column_descs`."""
+    so those positions resolve the minted enum oid like `_out_column_descs`.
+
+    ``out_exprs`` + ``base_table`` (single-table evaluated plans) attribute
+    bare-column outputs to their source table/attnum — JDBC's
+    getBaseColumnName resolves aliases through these RowDescription fields,
+    and a computed projection in the list must not strip the identity from
+    its plain-column siblings (ResultSetMetaDataTest's base-column asserts)."""
+    from sqlglot import exp as _exp
+
     enum_oids: dict[str, int] | None = None
+    table_oid, attnums = _source_column_identity(base_table, storage, db)
     out: list[ColumnDesc] = []
     for i, (name, tag) in enumerate(cols):
         oid = typemap.PG_OID.get(tag, 25)
@@ -807,7 +834,31 @@ def _tagged_out_column_descs(
                 oid = (
                     enum_oid + USER_TYPE_ARRAY_OID_OFFSET if typemap.is_array_tag(tag) else enum_oid
                 )
-        out.append(ColumnDesc(name, tag, oid))
+        attnum = 0
+        typmod = -1
+        if table_oid and out_exprs is not None and i < len(out_exprs):
+            expr = out_exprs[i]
+            if isinstance(expr, _exp.Column):
+                attnum = attnums.get(expr.name, 0)
+                if attnum:
+                    # The evaluated plans carry only string tags, so the
+                    # declared identity (varchar's 1043, numeric's precision
+                    # typmod) comes from the base table's column def.
+                    src = base_table.columns[attnum - 1]
+                    decl = getattr(src, "decl_oid", None)
+                    if decl and enum_types.get(i) is None:
+                        oid = decl
+                    typmod = getattr(src, "typmod", -1)
+        out.append(
+            ColumnDesc(
+                name,
+                tag,
+                oid,
+                typmod,
+                table_oid=table_oid if attnum else 0,
+                attnum=attnum,
+            )
+        )
     return out
 
 
@@ -2142,7 +2193,14 @@ def execute_evaluated_select(
     """Run a SELECT whose list / ORDER BY needs per-row evaluation (scalar /
     set-returning functions, CASE, correlated subqueries)."""
     rows = _evaluated_value_rows(plan, storage, db, sctx)
-    columns = _tagged_out_column_descs(plan.out_columns, plan.out_enum_types, storage, db)
+    columns = _tagged_out_column_descs(
+        plan.out_columns,
+        plan.out_enum_types,
+        storage,
+        db,
+        out_exprs=plan.out_exprs,
+        base_table=getattr(plan, "base_table", None),
+    )
     out_rows = [
         tuple(typemap.to_py(v, tag) for v, (_, tag) in zip(row, plan.out_columns, strict=True))
         for row in rows
