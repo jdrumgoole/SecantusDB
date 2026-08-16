@@ -23,6 +23,15 @@ from secantus.storage import Storage
 DB = "d"
 
 
+@pytest.fixture(autouse=True)
+def _reset_render_session():
+    # Tests below bind the render session for DateStyle-aware parsing; the
+    # contextvar must not leak into other tests sharing the xdist worker
+    # (a leaked session made tsrange renders grow +00:00 offsets on CI).
+    yield
+    typemap.set_render_session(None)
+
+
 @pytest.fixture
 def st(tmp_path):
     s = Storage(str(tmp_path))
