@@ -2895,8 +2895,13 @@ shared storage engine or building large new protocol subsystems:
     "postgres" (2F); pg_get_keywords() in-context (2F);
     getColumnsCharOctetLength (2F); ALTER TABLE DROP of a quoted
     ``"name"`` column mis-parsed as `DROP name` (2F).
-    RefCursorTest/RefCursorFetchTest need plpgsql
-    `OPEN <cursor> FOR ...` (refcursor support — a real feature).
+    RefCursorTest is 8/8 after the plpgsql OPEN/refcursor slice;
+    RefCursorFetchTest is blocked at class setup on **aggregates over an
+    SRF row source** — its seeding INSERT runs `string_agg(…) FROM
+    generate_series(1, 4096)` in a scalar subquery, and only `count(*)`
+    currently evaluates over a generate_series FROM (`sum(g)` /
+    `array_agg(g)` / `string_agg(…)` all fail "expected a column" /
+    "group_concat() is not supported in this context").
   - **AutoRollbackTest savepoint/autosave semantics** (~24): `autosave`
     modes and `flushCacheOnDeallocate` / `DEALLOCATE ALL` behaviour around
     failed statements in a transaction.
