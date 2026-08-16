@@ -1,9 +1,9 @@
 {
- "generated": "2026-08-15",
+ "generated": "2026-08-16",
  "sources": [
   "pgjdbc-raw.json"
  ],
- "total": 77,
+ "total": 58,
  "failures": {
   "org.postgresql.test.jdbc2.ArrayTest::testNonStandardBounds()": 2,
   "org.postgresql.test.jdbc2.ArrayTest::testUnknownArrayType()": 2,
@@ -18,9 +18,7 @@
   "org.postgresql.test.jdbc2.DatabaseMetaDataPropertiesTest::values()": 1,
   "org.postgresql.test.jdbc2.DatabaseMetaDataTest::initializationError": 1,
   "org.postgresql.test.jdbc2.EnumTest::enumArrayArray()": 2,
-  "org.postgresql.test.jdbc2.GeometricTest::testPGbox()": 1,
   "org.postgresql.test.jdbc2.GeometricTest::testPGline()": 2,
-  "org.postgresql.test.jdbc2.GeometricTest::testPGpoint()": 1,
   "org.postgresql.test.jdbc2.LoginTimeoutInterruptTest::loginTimeoutInterruptsAuthPluginSleep()": 1,
   "org.postgresql.test.jdbc2.NumericTransfer2Test::receiveValue()": 4,
   "org.postgresql.test.jdbc2.PreparedStatementTest::testDoubleQuestionMark()": 2,
@@ -30,25 +28,10 @@
   "org.postgresql.test.jdbc2.RefCursorTest::initializationError": 1,
   "org.postgresql.test.jdbc2.ResultSetMetaDataTest::initializationError": 1,
   "org.postgresql.test.jdbc2.ResultSetTest::testRowResultPositioning()": 2,
-  "org.postgresql.test.jdbc2.ResultSetTest::testTimestamp()": 2,
-  "org.postgresql.test.jdbc2.SearchPathLookupTest::searchPathBackwardsCompatibleLookup()": 1,
-  "org.postgresql.test.jdbc2.SearchPathLookupTest::searchPathHiddenLookup()": 1,
-  "org.postgresql.test.jdbc2.SearchPathLookupTest::searchPathNormalLookup()": 1,
-  "org.postgresql.test.jdbc2.ServerErrorTest::testCheckConstraint()": 1,
-  "org.postgresql.test.jdbc2.ServerErrorTest::testColumn()": 1,
-  "org.postgresql.test.jdbc2.ServerErrorTest::testDatatype()": 1,
-  "org.postgresql.test.jdbc2.ServerErrorTest::testExclusionConstraint()": 1,
-  "org.postgresql.test.jdbc2.ServerErrorTest::testForeignKeyConstraint()": 1,
-  "org.postgresql.test.jdbc2.ServerErrorTest::testNotNullConstraint()": 1,
-  "org.postgresql.test.jdbc2.ServerErrorTest::testPrimaryKey()": 1,
-  "org.postgresql.test.jdbc2.SharedTimerRefCountTest::multipleCancels()": 1,
   "org.postgresql.test.jdbc2.StatementTest::closeInProgressStatement()": 1,
   "org.postgresql.test.jdbc2.StatementTest::closeInProgressStatementProtocol32()": 1,
   "org.postgresql.test.jdbc2.StatementTest::concurrentWarningReadAndClear()": 1,
   "org.postgresql.test.jdbc2.StatementTest::parsingSemiColons()": 1,
-  "org.postgresql.test.jdbc2.StatementTest::setQueryTimeout()": 1,
-  "org.postgresql.test.jdbc2.StatementTest::setQueryTimeoutOnPrepared()": 1,
-  "org.postgresql.test.jdbc2.StatementTest::setQueryTimeoutWithSleep()": 1,
   "org.postgresql.test.jdbc2.StatementTest::warningsAreAvailableAsap()": 1,
   "org.postgresql.test.jdbc2.TimestampTest::testGetTimestampWOTZ()": 2,
   "org.postgresql.test.jdbc2.TimestampTest::testGetTimestampWTZ()": 2,
@@ -57,7 +40,6 @@
   "org.postgresql.test.jdbc2.UpdateableResultTest::testOidUpdatable()": 1,
   "org.postgresql.test.jdbc2.UpdateableResultTest::testReturnSerial()": 1,
   "org.postgresql.test.jdbc2.UpdateableResultTest::testUpdateRowWithLocalDateTime()": 1,
-  "org.postgresql.test.jdbc2.UpdateableResultTest::testUpdateRowWithOffsetDateTime()": 1,
-  "org.postgresql.test.jdbc2.UpdateableResultTest::testUpdateableWithSameTableNameInMultipleSchemas()": 1
+  "org.postgresql.test.jdbc2.UpdateableResultTest::testUpdateRowWithOffsetDateTime()": 1
  }
 }

@@ -2,7 +2,7 @@
 
 - SecantusDB (Python server) 0.6.0b11
 - suite: vendor/pgjdbc @ 3297557c6a80 (Gradle `:postgresql:test`, unmodified; 60s JUnit default timeout injected)
-- generated: 2026-08-15 15:03 UTC
+- generated: 2026-08-16 10:14 UTC
 
 | test class | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
@@ -40,7 +40,7 @@
 | jdbc2.DriverTest | 16 | 0 | 1 | 17 | 100.0% |
 | jdbc2.EncodingTest | 3 | 0 | 0 | 3 | 100.0% |
 | jdbc2.EnumTest | 2 | 2 | 0 | 4 | 50.0% |
-| jdbc2.GeometricTest | 10 | 4 | 0 | 14 | 71.4% |
+| jdbc2.GeometricTest | 12 | 2 | 0 | 14 | 85.7% |
 | jdbc2.GetXXXTest | 2 | 0 | 0 | 2 | 100.0% |
 | jdbc2.IntervalTest | 26 | 0 | 0 | 26 | 100.0% |
 | jdbc2.JBuilderTest | 1 | 0 | 0 | 1 | 100.0% |
@@ -63,14 +63,14 @@
 | jdbc2.ReplaceProcessingTest | 9 | 0 | 0 | 9 | 100.0% |
 | jdbc2.ResultSetMetaDataTest | 0 | 1 | 0 | 1 | 0.0% |
 | jdbc2.ResultSetRefreshTest | 2 | 0 | 0 | 2 | 100.0% |
-| jdbc2.ResultSetTest | 80 | 4 | 0 | 84 | 95.2% |
-| jdbc2.SearchPathLookupTest | 0 | 3 | 0 | 3 | 0.0% |
+| jdbc2.ResultSetTest | 82 | 2 | 0 | 84 | 97.6% |
+| jdbc2.SearchPathLookupTest | 3 | 0 | 0 | 3 | 100.0% |
 | jdbc2.ServerCursorTest | 2 | 0 | 0 | 2 | 100.0% |
-| jdbc2.ServerErrorTest | 0 | 7 | 0 | 7 | 0.0% |
+| jdbc2.ServerErrorTest | 7 | 0 | 0 | 7 | 100.0% |
 | jdbc2.ServerPreparedStmtTest | 13 | 0 | 0 | 13 | 100.0% |
-| jdbc2.SharedTimerRefCountTest | 0 | 1 | 0 | 1 | 0.0% |
+| jdbc2.SharedTimerRefCountTest | 1 | 0 | 0 | 1 | 100.0% |
 | jdbc2.SocketTimeoutTest | 1 | 0 | 0 | 1 | 100.0% |
-| jdbc2.StatementTest | 34 | 8 | 0 | 42 | 81.0% |
+| jdbc2.StatementTest | 37 | 5 | 0 | 42 | 88.1% |
 | jdbc2.StringTypeUnspecifiedArrayTest | 2 | 0 | 0 | 2 | 100.0% |
 | jdbc2.TimeTest | 3 | 0 | 0 | 3 | 100.0% |
 | jdbc2.TimestampTest | 6 | 8 | 0 | 14 | 42.9% |
@@ -79,11 +79,11 @@
 | jdbc2.TransactionRoundtripTest | 6 | 0 | 0 | 6 | 100.0% |
 | jdbc2.TransactionStateTest | 19 | 0 | 0 | 19 | 100.0% |
 | jdbc2.TypeCacheDLLStressTest | 1 | 0 | 0 | 1 | 100.0% |
-| jdbc2.UpdateableResultTest | 31 | 5 | 0 | 36 | 86.1% |
+| jdbc2.UpdateableResultTest | 32 | 4 | 0 | 36 | 88.9% |
 | jdbc2.UpsertTest | 32 | 0 | 0 | 32 | 100.0% |
-| **total** | **5493** | **77** | **28** | **5598** | **98.6%** |
+| **total** | **5512** | **58** | **28** | **5598** | **99.0%** |
 
-## Failures (77)
+## Failures (58)
 
 - `jdbc2.ArrayTest :: testNonStandardBounds()`
 - `jdbc2.ArrayTest :: testNonStandardBounds()`
@@ -108,10 +108,8 @@
 - `jdbc2.DatabaseMetaDataTest :: initializationError`
 - `jdbc2.EnumTest :: enumArrayArray()`
 - `jdbc2.EnumTest :: enumArrayArray()`
-- `jdbc2.GeometricTest :: testPGbox()`
 - `jdbc2.GeometricTest :: testPGline()`
 - `jdbc2.GeometricTest :: testPGline()`
-- `jdbc2.GeometricTest :: testPGpoint()`
 - `jdbc2.LoginTimeoutInterruptTest :: loginTimeoutInterruptsAuthPluginSleep()`
 - `jdbc2.NumericTransfer2Test :: receiveValue()`
 - `jdbc2.NumericTransfer2Test :: receiveValue()`
@@ -128,26 +126,10 @@
 - `jdbc2.ResultSetMetaDataTest :: initializationError`
 - `jdbc2.ResultSetTest :: testRowResultPositioning()`
 - `jdbc2.ResultSetTest :: testRowResultPositioning()`
-- `jdbc2.ResultSetTest :: testTimestamp()`
-- `jdbc2.ResultSetTest :: testTimestamp()`
-- `jdbc2.SearchPathLookupTest :: searchPathBackwardsCompatibleLookup()`
-- `jdbc2.SearchPathLookupTest :: searchPathHiddenLookup()`
-- `jdbc2.SearchPathLookupTest :: searchPathNormalLookup()`
-- `jdbc2.ServerErrorTest :: testCheckConstraint()`
-- `jdbc2.ServerErrorTest :: testColumn()`
-- `jdbc2.ServerErrorTest :: testDatatype()`
-- `jdbc2.ServerErrorTest :: testExclusionConstraint()`
-- `jdbc2.ServerErrorTest :: testForeignKeyConstraint()`
-- `jdbc2.ServerErrorTest :: testNotNullConstraint()`
-- `jdbc2.ServerErrorTest :: testPrimaryKey()`
-- `jdbc2.SharedTimerRefCountTest :: multipleCancels()`
 - `jdbc2.StatementTest :: closeInProgressStatement()`
 - `jdbc2.StatementTest :: closeInProgressStatementProtocol32()`
 - `jdbc2.StatementTest :: concurrentWarningReadAndClear()`
 - `jdbc2.StatementTest :: parsingSemiColons()`
-- `jdbc2.StatementTest :: setQueryTimeout()`
-- `jdbc2.StatementTest :: setQueryTimeoutOnPrepared()`
-- `jdbc2.StatementTest :: setQueryTimeoutWithSleep()`
 - `jdbc2.StatementTest :: warningsAreAvailableAsap()`
 - `jdbc2.TimestampTest :: testGetTimestampWOTZ()`
 - `jdbc2.TimestampTest :: testGetTimestampWOTZ()`
@@ -161,4 +143,3 @@
 - `jdbc2.UpdateableResultTest :: testReturnSerial()`
 - `jdbc2.UpdateableResultTest :: testUpdateRowWithLocalDateTime()`
 - `jdbc2.UpdateableResultTest :: testUpdateRowWithOffsetDateTime()`
-- `jdbc2.UpdateableResultTest :: testUpdateableWithSameTableNameInMultipleSchemas()`
