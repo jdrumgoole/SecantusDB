@@ -613,10 +613,17 @@ def build_bind(
     portal: str,
     statement: str,
     params: list[bytes | None],
+    param_formats: list[int] | None = None,
 ) -> bytes:
-    """Client-side helper: 'B' Bind with all params in text format, text results."""
+    """Client-side helper: 'B' Bind (params text by default; pass
+    ``param_formats`` for binary parameters), text results."""
     payload = bytearray(_cstr(portal) + _cstr(statement))
-    payload += _INT16.pack(0)  # zero format codes => all params text
+    if param_formats:
+        payload += _INT16.pack(len(param_formats))
+        for f in param_formats:
+            payload += _INT16.pack(f)
+    else:
+        payload += _INT16.pack(0)  # zero format codes => all params text
     payload += _UINT16.pack(len(params))
     for p in params:
         if p is None:

@@ -517,3 +517,28 @@ def test_errored_pipeline_discards_interleaved_simple_query(client):
     tps = types(msgs)
     assert "D" not in tps
     assert tps.count("Z") == 1
+
+
+def test_malformed_binary_array_param_is_08P01(client):
+    # The pgtest array corpus shape: a binary INTERVAL[] parameter whose
+    # header carries a bogus element oid and no element data. PG answers
+    # 08P01 (insufficient data left in message); this leaked XX000.
+    bogus = bytes.fromhex("0000000100000000010101010000000100000000")
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT $1::INTERVAL[]", []),
+        pgwire.build_bind("", "", [bogus], param_formats=[1]),
+        pgwire.build_execute("", 0),
+    )
+    assert error_code(msgs) == "08P01"
+
+
+def test_malformed_array_literal_cast_is_22P02(client):
+    # The pgtest json_array corpus shape: an empty-string text parameter
+    # cast to JSON[]. PG answers 22P02 (malformed array literal); this
+    # leaked XX000.
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT $1::JSON[]", []),
+        pgwire.build_bind("", "", [b""]),
+        pgwire.build_execute("", 0),
+    )
+    assert error_code(msgs) == "22P02"

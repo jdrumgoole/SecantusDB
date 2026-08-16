@@ -2593,9 +2593,13 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   the `aborted_txn` file's two protocol gaps (25P02 for extended steps in
   aborted transactions with the COMMIT/ROLLBACK carve-out;
   `ignore_till_sync` covering interleaved simple Query) took the corpus
-  43 → 40 failing files. Next targets: `array`, `batch_stmt`,
-  `bind_and_resolve`, `char` — iterate file-by-file, first divergence at
-  a time.
+  43 → 40 failing files; slice 2 fixed the XX000-leak class (malformed
+  binary array params → 08P01, malformed array-literal casts → 22P02 —
+  files advance internally, count still 40). Known next divergences:
+  binary ARRAY results encode elements as text oids where PG uses the
+  element type (array:53), and an inferred JSON[] parameter reports the
+  jsonb-array oid 3807 where PG says 199 (json_array:92 — the
+  json/jsonb collapse again, parameter-side). Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``

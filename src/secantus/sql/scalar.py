@@ -2256,7 +2256,13 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         # inet[] param). Coerce by the canonical tag (``to`` is the rendered
         # SQL spelling: ``int[]``, whose element name isn't an internal tag).
         if isinstance(value, (str, list, tuple)):
-            return typemap.coerce(value, to_tag_early if to_tag_early is not None else to)
+            try:
+                return typemap.coerce(value, to_tag_early if to_tag_early is not None else to)
+            except ValueError as e:
+                # PG's 22P02 for a malformed array literal ('' :: JSON[]) —
+                # the pgtest corpus pins the SQLSTATE; letting the ValueError
+                # escape surfaced an internal XX000.
+                raise errors.SQLError("22P02", f'malformed array literal: "{value}"') from e
     # Bit-string casts: ``::bit(n)`` / ``::varbit`` (from a '0'/'1' string or an
     # integer) and ``bit::int``.
     to_tag = typemap.type_tag_for_sql(node.to) if node.to is not None else None
