@@ -771,9 +771,7 @@ def _out_column_descs(
                 # pgjdbc's getSQLType maps to java.sql.Types.STRUCT (generic
                 # RECORD/2249 mapped to OTHER — ResultSetMetaDataTest's
                 # testComposite trio).
-                minted = virtual._table_rowtype_oids(db, Catalog(storage)).get(
-                    col.composite_type
-                )
+                minted = virtual._table_rowtype_oids(db, Catalog(storage)).get(col.composite_type)
             if minted is not None:
                 oid = minted
         if getattr(col, "enum_type", None) is not None and storage is not None and db is not None:
@@ -837,13 +835,28 @@ def _tagged_out_column_descs(
                     enum_oid + USER_TYPE_ARRAY_OID_OFFSET if typemap.is_array_tag(tag) else enum_oid
                 )
         attnum = 0
+        typmod = -1
         if table_oid and out_exprs is not None and i < len(out_exprs):
             expr = out_exprs[i]
             if isinstance(expr, _exp.Column):
                 attnum = attnums.get(expr.name, 0)
+                if attnum:
+                    # The evaluated plans carry only string tags, so the
+                    # declared identity (varchar's 1043, numeric's precision
+                    # typmod) comes from the base table's column def.
+                    src = base_table.columns[attnum - 1]
+                    decl = getattr(src, "decl_oid", None)
+                    if decl and enum_types.get(i) is None:
+                        oid = decl
+                    typmod = getattr(src, "typmod", -1)
         out.append(
             ColumnDesc(
-                name, tag, oid, table_oid=table_oid if attnum else 0, attnum=attnum
+                name,
+                tag,
+                oid,
+                typmod,
+                table_oid=table_oid if attnum else 0,
+                attnum=attnum,
             )
         )
     return out

@@ -16,3 +16,7 @@ and length typmod (display size), `timestamp(p)` its precision,
   selects; aliases resolve to their source column.
 - varchar/bpchar report their declared oid + typmod; timestamp(p) and
   numeric(p,s) typmods flow to RowDescription.
+- Extended-protocol Describe (PreparedStatement.getMetaData) reports the
+  same base-column identity and typmods as execution — the pipeline
+  Describe path sent 0/0/-1, so prepared-statement metadata lost what
+  the simple protocol carried.

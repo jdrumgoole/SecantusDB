@@ -112,6 +112,30 @@ class TestResultDescriptorFidelity:
         assert by_name["d"].attnum == 2  # alias resolves to its base column
         assert by_name["total"].attnum == 0 and by_name["total"].table_oid == 0
 
+    def test_describe_carries_base_column_identity(self, st, sess):
+        """Extended-protocol Describe (pgjdbc PreparedStatement.getMetaData)
+        routes through the pipeline planner for a computed projection — the
+        descriptors must attribute bare columns the same as execution."""
+        import sqlglot
+
+        from secantus.sql import engine
+        from secantus.sql.catalog import Catalog
+
+        stmt = sqlglot.parse_one("SELECT a,b,c,a+c AS total, b AS d FROM rsmd1", read="postgres")
+        descs = engine.describe_statement(st, DB, stmt, sess, Catalog(st))
+        by_name = {c.name: c for c in descs}
+        assert by_name["a"].attnum == 1 and by_name["a"].table_oid > 0
+        assert by_name["d"].attnum == 2
+        assert by_name["total"].attnum == 0 and by_name["total"].table_oid == 0
+        assert by_name["c"].typmod == ((10 << 16) | 2) + 4
+
+    def test_evaluated_result_carries_declared_typmod(self, st, sess):
+        """The computed sibling forces the evaluated executor; the numeric
+        column's declared precision typmod must survive that path too."""
+        res = run_sql(st, DB, "SELECT a, c, a+c AS total FROM rsmd1", session=sess)[-1]
+        by_name = {c.name: c for c in res.columns}
+        assert by_name["c"].typmod == ((10 << 16) | 2) + 4
+
     def test_declared_type_identity(self, st, sess):
         run_sql(
             st,
