@@ -2622,9 +2622,16 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   column-type position, never on aliases/column names/string
   literals). Input truncates to ONE character; empty/zero-byte input
   stores NULL; `0::"char"` is the zero byte (binary render 0x00);
-  binary param/result codecs added. Corpus: 34 unexpected failures;
-  green: aborted_txn, array, batch_stmt, bind_and_resolve, json,
-  json_array, char (+2). Next: `citext`, `copy`
+  binary param/result codecs added. Slice 8 greened `citext`: citext
+  now rides crdb's stable placeholder oid 90008 (like hstore's 16935 —
+  the extension has no fixed catalog oid; the old citext-as-25 entry
+  was omitted only because 25 collided with text in OID_TO_TAG),
+  binary param/result codecs are the text bytes, and an unknown param
+  compared against a citext COLUMN infers 90008 (citext-only on
+  purpose — its own operator family; the char corpus pins a "char"
+  comparison param at 25). Corpus: 33 unexpected failures; green:
+  aborted_txn, array, batch_stmt, bind_and_resolve, json, json_array,
+  char, citext (+2). Next: `copy`, `copy_file_upload`
   (`multiple_active_portals` needs fresh-state isolation — leftover
   `mytable`/`ltree` deps). Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%

@@ -769,3 +769,39 @@ def test_quoted_char_zero_cast_binary_result(client):
         pgwire.build_execute("", 0),
     )
     assert rows(msgs) == [[b"\x00"]]
+
+
+def test_citext_reports_oid_90008(client):
+    # pgtest citext corpus: citext rides crdb's stable placeholder oid 90008
+    # (the extension has no fixed catalog oid) in ParameterDescription and
+    # RowDescription; INSERT targets AND comparisons against a citext column
+    # both infer it; equality stays case-insensitive; binary params are the
+    # text bytes.
+    client.exchange(
+        pgwire.build_parse("", "CREATE TABLE cit (id int4 PRIMARY KEY, t citext)", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    msgs = client.exchange(
+        pgwire.build_parse("ins_cit", "INSERT INTO cit (t, id) VALUES ($1, $2)", []),
+        pgwire.build_describe("S", "ins_cit"),
+        pgwire.build_bind("", "ins_cit", [b"Hi", b"\x00\x00\x00\x01"], param_formats=[1, 1]),
+        pgwire.build_execute("", 0),
+    )
+    pd = next(m for m in msgs if m.type == "t")
+    assert pgwire.parse_parameter_description(pd.payload) == [90008, 23]
+    msgs = client.exchange(
+        pgwire.build_parse("sel_cit", "SELECT id, t FROM cit WHERE t = $1", []),
+        pgwire.build_describe("S", "sel_cit"),
+        pgwire.build_bind("", "sel_cit", [b"hi"]),
+        pgwire.build_execute("", 0),
+    )
+    pd = next(m for m in msgs if m.type == "t")
+    assert pgwire.parse_parameter_description(pd.payload) == [90008]
+    rd = next(m for m in msgs if m.type == "T")
+    import struct as _s
+
+    end = rd.payload.index(b"\x00", 2)  # first column: id
+    end2 = rd.payload.index(b"\x00", end + 19)  # second column: t
+    assert _s.unpack_from("!i", rd.payload, end2 + 7)[0] == 90008
+    assert rows(msgs) == [[b"1", b"Hi"]]

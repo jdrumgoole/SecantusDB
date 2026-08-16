@@ -105,12 +105,15 @@ PG_OID: dict[str, int] = {
     # PG_TYPENAME, so ``to_regtype('hstore')`` stays NULL and SQLAlchemy's psycopg
     # connect-time hstore probe is a no-op (it must not register a fictional type).
     "hstore": 16935,
-    # citext (contrib): case-insensitive text. Stored (and sent on the wire) as
-    # plain text — the case-folding is a query-planner behaviour, not a value shape.
-    # It intentionally has NO PG_OID entry: the wire layer's ``PG_OID.get(tag, 25)``
-    # already reports the text OID (25) for it, and adding an explicit ``citext: 25``
-    # would collide with ``text: 25`` in the inverted OID→typename map (making
-    # ``format_type(25)`` resolve to "citext" instead of "text").
+    # citext (contrib): case-insensitive text, stored as plain text — the
+    # case-folding is a query-planner behaviour, not a value shape. Like
+    # hstore, the extension has no fixed catalog OID, so we use crdb's stable
+    # placeholder 90008 (the pgtest citext corpus reads it byte-for-byte in
+    # ParameterDescription and RowDescription; drivers treat the unknown OID
+    # as text). A distinct OID also keeps the inverted OID→typename map
+    # collision-free — ``format_type(25)`` still resolves to "text" (an
+    # explicit ``citext: 25`` was the old reason this entry didn't exist).
+    "citext": 90008,
     # xml (a real built-in type, OID 142). Stored as its text; validated
     # well-formed on cast / coerce.
     "xml": 142,

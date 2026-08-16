@@ -287,6 +287,7 @@ _BINARY = {
     16: lambda b: b == b"\x01",  # bool
     17: lambda b: bytes(b),  # bytea
     18: _decode_char1,  # "char" (one byte)
+    90008: lambda b: b.decode("utf-8"),  # citext — binary form is the text
     20: lambda b: struct.unpack("!q", b)[0],  # int8
     21: lambda b: struct.unpack("!h", b)[0],  # int2
     23: lambda b: struct.unpack("!i", b)[0],  # int4
@@ -594,6 +595,7 @@ _OUT_BINARY = {
     718: _encode_geo_floats(3),  # circle
     17: lambda v: bytes(v),  # bytea
     18: lambda v: str(v).encode("utf-8"),  # "char" — raw byte(s), \0 included
+    90008: lambda v: str(v).encode("utf-8"),  # citext — text bytes
     20: lambda v: struct.pack("!q", int(typemap.unwrap_numeric(v))),  # int8
     21: lambda v: struct.pack("!h", int(typemap.unwrap_numeric(v))),  # int2
     23: lambda v: struct.pack("!i", int(typemap.unwrap_numeric(v))),  # int4
