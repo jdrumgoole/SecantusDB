@@ -926,6 +926,7 @@ class SecantusPGServer:
                     delimiter=plan.delimiter,
                     null=plan.null,
                     header=plan.header,
+                    quote=plan.quote or '"',
                     escape=plan.escape,
                 )
             else:
@@ -962,11 +963,18 @@ class SecantusPGServer:
             if plan.header:
                 chunks.append(
                     copyfmt.format_csv(
-                        [], delimiter=plan.delimiter, null=plan.null, header=plan.columns
+                        [],
+                        delimiter=plan.delimiter,
+                        null=plan.null,
+                        header=plan.columns,
+                        quote=plan.quote or '"',
                     )
                 )
             chunks += [
-                copyfmt.format_csv([row], delimiter=plan.delimiter, null=plan.null) for row in rows
+                copyfmt.format_csv(
+                    [row], delimiter=plan.delimiter, null=plan.null, quote=plan.quote or '"'
+                )
+                for row in rows
             ]
         else:
             chunks += [
