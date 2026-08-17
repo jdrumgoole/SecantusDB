@@ -2984,7 +2984,13 @@ shared storage engine or building large new protocol subsystems:
     and COMMENT ON INDEX (2F) unsupported; `pg_class.reltuples` column
     (4F); ACL reflection: getTablePrivileges empty for tables/views/
     matviews (6F); domainColumnSize typmod not flowing through domain
-    columns (2F); customArrayTypeInfo array-elem typname (2F); indexInfo
+    columns (2F) — DESIGN: capture the base type's declared typmod at
+    CREATE DOMAIN (reuse `_decl_identity(kind)` → {decl_oid, typmod}),
+    store it on the domain doc (additive field, default -1), and in
+    `_pg_attribute` set a domain-typed column's `atttypmod` from the
+    domain's stored typmod so pgjdbc's getColumns derives COLUMN_SIZE
+    (varbit(3)->3, numeric(8,3)->8/scale 3; int-domain's 10 is int4's
+    fixed precision, already right); customArrayTypeInfo array-elem typname (2F); indexInfo
     mixed expression+column multi-key index (2F); catalogs list missing
     "postgres" (2F); pg_get_keywords() in-context (2F);
     getColumnsCharOctetLength (2F); ALTER TABLE DROP of a quoted
