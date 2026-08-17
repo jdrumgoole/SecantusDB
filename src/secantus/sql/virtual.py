@@ -1981,14 +1981,19 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
         base_tag = domain.get("base_tag") if domain else None
         default = domain.get("default") if domain else None
         typname, nsoid = _split_user_type_name(name, schema_oids)
+        base_oid = (domain.get("base_oid") if domain else None) or typemap.PG_OID.get(
+            base_tag or "", 25
+        )
         rows.append(
             {
                 "oid": oid,
                 "typname": typname,
                 "typcollation": 0,
                 "typnamespace": nsoid,
-                "typbasetype": typemap.PG_OID.get(base_tag or "", 25),
-                "typtypmod": -1,
+                "typbasetype": base_oid,
+                # The base type's declared typmod (``varbit(3)`` → 3), which
+                # getColumns reads as a domain column's COLUMN_SIZE.
+                "typtypmod": int(domain.get("typmod", -1)) if domain else -1,
                 "typnotnull": bool(domain.get("not_null")) if domain else False,
                 "typdefault": None if default is None else str(default),
                 "typtype": "d",
