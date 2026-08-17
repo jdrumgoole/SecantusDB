@@ -356,6 +356,13 @@ _TYPLEN: dict[int, int] = {
     21: 2,  # int2
     23: 4,  # int4
     26: 4,  # oid
+    # The reg* pseudo-types are oid-width too (pgtest oid corpus).
+    24: 4,  # regproc
+    2202: 4,  # regprocedure
+    2205: 4,  # regclass
+    2206: 4,  # regtype
+    4089: 4,  # regnamespace
+    4096: 4,  # regrole
     700: 4,  # float4
     701: 8,  # float8
     1082: 4,  # date

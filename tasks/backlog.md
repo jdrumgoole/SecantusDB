@@ -2715,9 +2715,14 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   subtest needs row-LAZY portal execution** — pg_sleep evaluated per
   fetched row with a cumulative statement_timeout across
   Execute-resumes; our portals materialize fully at first Execute,
-  so the timeout can't fire mid-drain. Corpus: 21 unexpected
-  failures (file still counts, advanced internally). Next: `oid`,
-  `param_status`. Iterate file-by-file.
+  so the timeout can't fire mid-drain. Slice 22 greened `oid`: the
+  reg* pseudo-types (regproc 24, regprocedure 2202, regclass 2205,
+  regtype 2206, regnamespace 4089, regrole 4096) ride the oid wire
+  form — typlen 4 in RowDescription and a 4-byte unsigned binary
+  decode (raw bytes echoed through before), with a wrong-length
+  payload rejected 08P01 like PG's oidrecv. Corpus: 20 unexpected
+  failures. Next: `param_status`, `parameter_description`. Iterate
+  file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
