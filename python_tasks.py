@@ -16,7 +16,11 @@ cross-cutting (they target either server) rather than Python-server dev tasks.
 
 from __future__ import annotations
 
+import getpass
+import os
+import re
 import shlex
+import shutil
 
 from invoke.context import Context
 from invoke.tasks import task
@@ -197,6 +201,102 @@ def clean(c: Context) -> None:
             continue
     if swept:
         print(f"clean: swept {swept} stale gauge tempdir(s) older than 1h under {base}")
+
+    reaped, freed = _sweep_stale_pytest_tmp(base)
+    if reaped:
+        print(
+            f"clean: reaped {reaped} abandoned pytest tempdir(s) "
+            f"({freed / 1024**3:.1f} GiB) under {base}"
+        )
+
+
+#: How many numbered pytest dirs to keep, mirroring pytest's own retention.
+_PYTEST_TMP_KEEP = 3
+
+
+def _sweep_stale_pytest_tmp(base: str) -> tuple[int, int]:
+    """Delete abandoned ``pytest-of-<user>/pytest-NNNN`` trees; return
+    ``(count, bytes_freed)``.
+
+    This suite pins ``tmp_path_retention_policy = "all"`` on purpose — deleting
+    a passed test's ``tmp_path`` mid-session races WiredTiger's background
+    threads into ``WT_PANIC`` (see ``tests/conftest.py``) — so every run leaves
+    its per-test WiredTiger databases behind, ~1.7 GiB a run. Reclaiming them
+    is pytest's job: it keeps the newest few and ``rmtree``s the rest.
+
+    That janitor stops working the moment a run dies abnormally. pytest writes
+    the owning PID into a ``.lock`` beside each dir and removes it in an
+    ``atexit`` hook, so a run killed by SIGKILL — or by this suite's own stall
+    watchdog, which calls ``os._exit(70)`` — leaves the lock behind, and pytest
+    then treats that dir as live for a full ``LOCK_TIMEOUT`` (3 days). The
+    backlog compounds: the bigger it gets the longer the exit-time cleanup
+    takes, so more runs are killed mid-cleanup, each leaving another stale
+    lock. One dev box reached 241 dirs / 391 GiB that way, and every pytest
+    invocation on it paid an unbounded exit-time ``rmtree``.
+
+    A lock's PID makes liveness decidable now instead of in three days: if the
+    process is gone, the lock is stale and the tree is garbage. Dirs whose
+    owner is still running are left strictly alone, as are the newest
+    ``_PYTEST_TMP_KEEP``.
+    """
+    root = os.path.join(base, f"pytest-of-{getpass.getuser()}")
+    if not os.path.isdir(root):
+        return (0, 0)
+    numbered = [
+        os.path.join(root, name)
+        for name in os.listdir(root)
+        if re.fullmatch(r"pytest-\d+", name) and os.path.isdir(os.path.join(root, name))
+    ]
+    # Never touch symlinks (``pytest-current``) or the root itself.
+    numbered = [p for p in numbered if not os.path.islink(p)]
+    numbered.sort(key=lambda p: os.stat(p).st_mtime, reverse=True)
+
+    reaped = freed = 0
+    for path in numbered[_PYTEST_TMP_KEEP:]:
+        if _pytest_tmp_owner_alive(path):
+            continue
+        try:
+            freed += _dir_size(path)
+            shutil.rmtree(path, ignore_errors=True)
+            reaped += 1
+        except OSError:
+            continue
+    return (reaped, freed)
+
+
+def _pytest_tmp_owner_alive(path: str) -> bool:
+    """Whether the pytest run that owns ``path`` is still running.
+
+    No lock file means nobody claimed it (or the owner exited cleanly and
+    removed it) — garbage either way. A lock whose PID no longer exists is
+    stale. Anything unreadable is treated as ALIVE: refusing to delete is the
+    safe direction when the evidence is unclear.
+    """
+    lock = os.path.join(path, ".lock")
+    try:
+        pid = int(open(lock).read().strip())
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by someone else
+    return True
+
+
+def _dir_size(path: str) -> int:
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path, onerror=lambda _e: None):
+        for name in filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                continue
+    return total
 
 
 @task(
