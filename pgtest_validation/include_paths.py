@@ -12,6 +12,14 @@ EXCLUDE: set[str] = set()
 
 #: file -> reason. A file listed here that PASSES is reported loudly.
 EXPECTED_DIVERGENCES: dict[str, str] = {
+    "jsonpath": (
+        "jsonpath:36/:76 expect crdb's BINARY jsonpath form — version byte + "
+        "the SINGLE-QUOTED text ('$' -> 01272427). Real PostgreSQL's "
+        "jsonpath_send emits the version byte + the canonical text WITHOUT "
+        "outer quotes (0124), which is what we send. Everything else in the "
+        "file is green (oid 4072, canonical $.\"abc\" text, 42601 on an "
+        "empty path, jsonb_path_query)."
+    ),
     "int2vector": (
         "int2vector:26 expects indoption={2} for a plain primary key — "
         "crdb's NULLS-FIRST pkey representation. Real PostgreSQL reports 0 "

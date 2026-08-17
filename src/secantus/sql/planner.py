@@ -2758,8 +2758,12 @@ def _cast_output_name(target: exp.Expression) -> str | None:
     corpus). None when the ``?column?`` fallback stands."""
     if isinstance(target, exp.Array):
         return "array"
-    if isinstance(target, exp.Anonymous) and str(target.this).upper() == "ROW":
-        return "row"
+    if isinstance(target, exp.Anonymous):
+        if str(target.this).upper() == "ROW":
+            return "row"
+        # PG names an unaliased function-call column after the function
+        # (``SELECT jsonb_path_query(…)`` → column ``jsonb_path_query``).
+        return str(target.this).rsplit(".", 1)[-1].lower() or None
     if not isinstance(target, exp.Cast) or target.to is None:
         return None
     ident = typemap.cast_type_identity(target.to)
@@ -10020,6 +10024,7 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
                 "aclitem",
                 "name",
                 "char1",
+                "jsonpath",
             )
             or _mapped in typemap._GEO_TAGS
         ):

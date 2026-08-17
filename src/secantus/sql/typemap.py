@@ -118,6 +118,9 @@ PG_OID: dict[str, int] = {
     # collision-free — ``format_type(25)`` still resolves to "text" (an
     # explicit ``citext: 25`` was the old reason this entry didn't exist).
     "citext": 90008,
+    # SQL/JSON path expressions, stored as PG's canonical text form
+    # (jsonpath.canonicalize). Real catalog oid.
+    "jsonpath": 4072,
     # xml (a real built-in type, OID 142). Stored as its text; validated
     # well-formed on cast / coerce.
     "xml": 142,
@@ -257,6 +260,7 @@ _REGTYPE_SPELLINGS: dict[str, str] = {
     # ``"oid"[]`` DDL can't survive sqlglot's OID keyword; ``planner.parse``
     # rewrites it to this quoted spelling, which resolves back here.
     "secantus_oid": "oid",
+    "jsonpath": "jsonpath",
 }
 
 
@@ -761,6 +765,8 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
         return "char1"
     if base == "citext":
         return "citext"
+    if base == "jsonpath":
+        return "jsonpath"
     if base == "aclitem":
         return "aclitem"
     if base == "name":
@@ -1206,6 +1212,13 @@ def coerce(value: Any, tag: str) -> Any:
         # citext stores the original text verbatim (case preserved for display);
         # the case-insensitivity is applied by the query planner, not on write.
         return str(value)
+    if tag == "jsonpath":
+        from secantus.sql import jsonpath as _jsonpath
+
+        try:
+            return _jsonpath.canonicalize(str(value))
+        except _jsonpath.JsonPathError as exc:
+            raise ValueError(str(exc)) from exc
     if tag == "char1":
         # PG's internal one-byte "char": input truncates to ONE character
         # (crdb's UTF-8-character rule, pinned by the pgtest char corpus),

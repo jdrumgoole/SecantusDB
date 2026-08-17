@@ -2691,9 +2691,17 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   the BINARY wire form of int2vector is now a real int2 ARRAY —
   elemoid 21, 2-byte elements, lower bound 1 (crdb #111907's
   regression class; the text "0" leaked through binary result
-  format before). Corpus: 23 unexpected failures. Next: `jsonpath`,
-  `ltree` (`multiple_active_portals` needs fresh-state isolation —
-  leftover `mytable`/`ltree` deps). Iterate file-by-file.
+  format before). Slice 19 took `jsonpath` to its documented
+  divergence only: the jsonpath TYPE landed (oid 4072, canonical
+  member quoting via jsonpath.canonicalize — $.abc → $."abc" — 42601
+  on an empty path, binary = version byte + PG's UNQUOTED canonical
+  text; the corpus's quoted binary form is crdb's, recorded in
+  EXPECTED_DIVERGENCES); jsonb_path_query coerces a string first arg
+  to jsonb like PG's implicit cast; unaliased function-call columns
+  are named after the function (PG rule — was ?column?). Corpus: 22
+  unexpected failures. Next: `ltree`, `multiple_active_portals`
+  (needs fresh-state isolation — leftover `mytable`/`ltree` deps).
+  Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
