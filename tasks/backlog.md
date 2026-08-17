@@ -2670,10 +2670,16 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   errors (+2). Slice 14 greened `execute`: Describe(P) of a
   wire-parsed ``EXECUTE name(args)`` resolves the UNDERLYING
   SQL-level prepared statement and reports ITS shape (a SELECT's
-  RowDescription, not NoData). Corpus: 27 unexpected failures —
-  green now also includes execute. Next: `float`, `implicit_txn`
-  (`multiple_active_portals` needs fresh-state isolation — leftover
-  `mytable`/`ltree` deps). Iterate file-by-file.
+  RowDescription, not NoData). Slice 15 greened `float`: float4
+  casts narrow to single precision and float4out renders the
+  shortest float32 round-trip (0.33333334, arrays included via the
+  element tag); extra_float_digits < 1 reduces %g precision for both
+  float widths; SET with a NEGATIVE value no longer drops the sign
+  (Neg's .name is the bare inner literal); bare ARRAY[…]/ROW(…)
+  constructors name their columns array/row. Corpus: 26 unexpected
+  failures — green now also includes float. Next: `implicit_txn`,
+  `inet` (`multiple_active_portals` needs fresh-state isolation —
+  leftover `mytable`/`ltree` deps). Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``

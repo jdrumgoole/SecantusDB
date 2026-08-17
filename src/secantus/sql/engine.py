@@ -5455,6 +5455,10 @@ def _run_set(stmt: exp.Set, session: Session) -> SQLResult:
         value_node = inner.expression
         if isinstance(value_node, exp.Literal):
             value = value_node.this
+        elif isinstance(value_node, exp.Neg) and isinstance(value_node.this, exp.Literal):
+            # ``SET extra_float_digits = -1`` — Neg's .name is the BARE inner
+            # literal, which silently dropped the sign (pgtest float corpus).
+            value = f"-{value_node.this.this}"
         else:
             value = value_node.name or value_node.sql()
         # SET LOCAL applies only until the end of the current transaction. Outside
