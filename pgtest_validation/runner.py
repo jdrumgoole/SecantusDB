@@ -6,9 +6,18 @@
 2. Stage the runner files verbatim into the committed Go driver module
    (``pgtest_validation/go/crdbshim/pkg/testutils/pgtest`` — gitignored) and
    the include-filtered corpus into ``.validation/pgtest-corpus``.
-3. Spawn a fresh daemon, run ``go test -json -run TestPGTest`` with
-   ``PGTEST_DATADIR`` / ``PGTEST_ADDR`` / ``PGTEST_USER``; the JSON stream
-   lands in ``.validation/pgtest-raw.json`` for ``generate_report.py``.
+3. For EACH corpus file, spawn a fresh daemon and run
+   ``go test -json -run 'TestPGTest/^<file>$'`` with ``PGTEST_DATADIR`` /
+   ``PGTEST_ADDR`` / ``PGTEST_USER``; the JSON streams are concatenated into
+   ``.validation/pgtest-raw.json`` for ``generate_report.py``.
+
+   A daemon per FILE is required, not an optimisation: the corpus assumes a
+   clean database per file (several files ``CREATE TABLE t0`` / ``t`` with no
+   preceding DROP), so one shared server makes later files fail on debris from
+   earlier ones — ``execute`` leaves ``t0`` behind and ``prepare`` then failed
+   42P07 even though it passes alone. Upstream crdb runs its own suite with
+   ``WalkWithNewServer`` (a server per file) for exactly this reason; our Go
+   driver can't spawn the Python daemon itself, so the loop lives here.
 
 Run via ``uv run python -m invoke validate-pgtest``.
 """
@@ -111,15 +120,25 @@ def _stage() -> None:
             shutil.copyfile(f, CORPUS / f.name)
 
 
-def main() -> int:
-    if shutil.which("go") is None:
-        print("the pgtest gauge requires the Go toolchain (`go` on PATH)", file=sys.stderr)
-        return 2
+def _run_pattern(name: str) -> str:
+    """The ``go test -run`` pattern selecting exactly corpus file ``name``.
 
-    _fetch_checkout()
-    _stage()
-    RAW_OUT.parent.mkdir(exist_ok=True)
+    Anchored on purpose: an unanchored ``TestPGTest/copy`` also selects
+    ``copy_file_upload``, which would run that file against the wrong
+    (already-dirtied) daemon and double-report it.
+    """
+    return f"TestPGTest/^{name}$"
 
+
+def _corpus_files() -> list[str]:
+    """The corpus file names the gauge runs, in stable (sorted) order."""
+    return sorted(p.name for p in CORPUS.iterdir() if p.is_file())
+
+
+def _run_one(name: str, out) -> int:
+    """Run one corpus file against a FRESH daemon, appending its ``go test
+    -json`` stream to ``out``. Returns the go-test exit code (1 = the file
+    failed, which the report consumes; other codes are infrastructure)."""
     host = "127.0.0.1"
     port = _pick_ephemeral_port()
     storage_dir = tempfile.mkdtemp(prefix="secantus-pgtest-gauge-")
@@ -141,7 +160,6 @@ def main() -> int:
     try:
         _wait_for_listener(host, port)
         _verify_secantus_identity(host, port)
-
         env = {
             **os.environ,
             "PGTEST_DATADIR": str(CORPUS),
@@ -155,13 +173,12 @@ def main() -> int:
             f"-timeout={GO_TEST_TIMEOUT}",
             "-json",
             "-run",
-            "TestPGTest",
+            _run_pattern(name),
             "./...",
         ]
-        with RAW_OUT.open("wb") as out:
-            proc = subprocess.run(
-                cmd, cwd=GO_DIR, env=env, stdout=out, timeout=SUBPROCESS_TIMEOUT_SECONDS
-            )
+        proc = subprocess.run(
+            cmd, cwd=GO_DIR, env=env, stdout=out, timeout=SUBPROCESS_TIMEOUT_SECONDS
+        )
         return proc.returncode
     finally:
         daemon.terminate()
@@ -169,6 +186,30 @@ def main() -> int:
             daemon.wait(timeout=10)
         except subprocess.TimeoutExpired:
             daemon.kill()
+        shutil.rmtree(storage_dir, ignore_errors=True)
+
+
+def main() -> int:
+    if shutil.which("go") is None:
+        print("the pgtest gauge requires the Go toolchain (`go` on PATH)", file=sys.stderr)
+        return 2
+
+    _fetch_checkout()
+    _stage()
+    RAW_OUT.parent.mkdir(exist_ok=True)
+
+    files = _corpus_files()
+    if not files:
+        print(f"no corpus files under {CORPUS}", file=sys.stderr)
+        return 2
+    worst = 0
+    with RAW_OUT.open("wb") as out:
+        for name in files:
+            rc = _run_one(name, out)
+            # A failing FILE is rc 1 and expected; anything else (build error,
+            # timeout) is infrastructure and should surface as the exit code.
+            worst = rc if rc not in (0, 1) else max(worst, rc)
+    return worst
 
 
 if __name__ == "__main__":
