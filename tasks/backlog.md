@@ -2732,8 +2732,16 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   real change; savepoints snapshot the GUCs so ROLLBACK TO SAVEPOINT
   reverts and re-reports them; the transaction-end and ERROR-time
   unwinds report case-insensitively ordered, including is_superuser
-  when the role reverts. Corpus: 19 unexpected failures. Next:
-  `parameter_description`, `portals`. Iterate file-by-file.
+  when the role reverts. Slice 24 greened `parameter_description`:
+  PG's FigureColname precedence (a cast's OPERAND names the column, so
+  `n::int4` is `n` while `2::int8` stays `int8`); `SET col = $N` and
+  `col = $N` type the parameter from the COLUMN (uuid 2950,
+  timestamptz 1184 — the old branch was citext/ltree-only; `"char"`
+  stays text, which the char corpus pins); one-type-per-parameter
+  conflicts raise 42883 (`lower($1)` with `$1::int`); a gap in
+  parameter numbering (`SELECT $2 > 0`) and a bare parameter as the
+  only CASE result raise 42P18. Corpus: 18 unexpected failures. Next:
+  `portals`, `prepare`. Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``

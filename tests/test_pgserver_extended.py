@@ -163,11 +163,19 @@ def test_describe_statement_reports_params_and_columns(client):
         pgwire.build_describe("S", "sel"),
     )
     pd = next(m for m in msgs if m.type == "t")
-    # An undeclared parameter resolves to text (25), matching Postgres' parse
-    # analysis — clients re-dump their parameters per this reply, and echoing
-    # 0 back left binary unknown-type params undecodable.
-    assert pgwire.parse_parameter_description(pd.payload) == [25]
+    # ``age > $1`` types the parameter from the COLUMN (int4 = 23), like PG's
+    # parse analysis. A parameter with no such context still resolves to text
+    # (25) rather than 0 — clients re-dump their parameters per this reply,
+    # and echoing 0 back left binary unknown-type params undecodable.
+    assert pgwire.parse_parameter_description(pd.payload) == [23]
     assert row_description(msgs) == ["id", "name"]
+    # No column context (the parameter feeds a concatenation) → text.
+    nc = client.exchange(
+        pgwire.build_parse("nc", "SELECT id FROM users WHERE name = $1 || 'x'"),
+        pgwire.build_describe("S", "nc"),
+    )
+    pd = next(m for m in nc if m.type == "t")
+    assert pgwire.parse_parameter_description(pd.payload) == [25]
 
 
 def test_null_parameter_binds_to_sql_null(client):
@@ -1369,3 +1377,73 @@ def test_savepoint_rollback_reverts_and_reports_gucs(client):
         pgwire.build_bind("", "", []),
         pgwire.build_execute("", 0),
     )
+
+
+def test_cast_of_column_keeps_the_column_name(client):
+    # pgtest parameter_description:14 — PG's FigureColname recurses into a
+    # cast's operand first, so ``n::int4`` is named ``n`` (a literal cast like
+    # ``2::int8`` still yields the typname).
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT n::int4 FROM generate_series(0, 1) n", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_describe("P", ""),
+        pgwire.build_execute("", 0),
+    )
+    rd = next(m for m in msgs if m.type == "T")
+    assert rd.payload[2 : rd.payload.index(b"\x00", 2)] == b"n"
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT 2::int8", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_describe("P", ""),
+        pgwire.build_execute("", 0),
+    )
+    rd = next(m for m in msgs if m.type == "T")
+    assert rd.payload[2 : rd.payload.index(b"\x00", 2)] == b"int8"
+
+
+def test_column_typed_parameters_in_update(client):
+    # pgtest parameter_description — ``SET col = $N`` and ``WHERE col = $N``
+    # type the parameter as the COLUMN's type.
+    client.exchange(
+        pgwire.build_parse("", "CREATE TABLE ptab (a uuid PRIMARY KEY, b timestamptz)", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    msgs = client.exchange(
+        pgwire.build_parse("u1", "UPDATE ptab SET b = $1 WHERE a = $2", []),
+        pgwire.build_describe("S", "u1"),
+    )
+    pd = next(m for m in msgs if m.type == "t")
+    assert pgwire.parse_parameter_description(pd.payload) == [1184, 2950]
+
+
+def test_conflicting_parameter_type_is_42883(client):
+    # One type per parameter: ``$1::int`` pins int4, so ``lower($1)`` cannot
+    # resolve (pgtest parameter_description:40).
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT lower($1), $1::int", []),
+        pgwire.build_describe("S", ""),
+    )
+    assert error_code(msgs) == "42883"
+
+
+def test_parameter_numbering_gap_is_42P18(client):
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT $2 > 0", []),
+        pgwire.build_describe("S", ""),
+    )
+    assert error_code(msgs) == "42P18"
+
+
+def test_bare_parameter_case_result_is_42P18(client):
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT 3 + CASE (4) WHEN 4 THEN $1 END", []),
+        pgwire.build_describe("S", ""),
+    )
+    assert error_code(msgs) == "42P18"
+    # A typed sibling branch resolves the CASE, so this one is fine.
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT CASE WHEN true THEN $1 ELSE 'x' END", []),
+        pgwire.build_describe("S", ""),
+    )
+    assert error_code(msgs) is None

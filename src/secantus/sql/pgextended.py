@@ -1397,6 +1397,11 @@ class ExtendedSession:
             near = stmt.sql(dialect="postgres").split(None, 1)[0]
             raise errors.syntax_error(f'syntax error at or near "{near[:40]}"')
         count = planner.parameter_count(stmt) if stmt is not None else 0
+        # Checked on the RAW statement, before the pg_typeof rewrite below
+        # folds parameters out of the AST (that looked like a gap).
+        gap = planner.parameter_numbering_gap(stmt)
+        if gap is not None:
+            raise errors.SQLError("42P18", f"could not determine data type of parameter ${gap}")
         if isinstance(stmt, exp.Select):
             # pg_typeof($N) types from the OIDs the client declares here in
             # Parse — after Bind substitutes values that information is gone.
@@ -1423,6 +1428,11 @@ class ExtendedSession:
         bad = planner.indeterminate_parameter(stmt, oids)
         if bad is not None:
             raise errors.SQLError("42P18", f"could not determine data type of parameter ${bad}")
+        # One type per parameter: a type pinned by one use can make another use
+        # unresolvable (``lower($1)`` with ``$1::int``) — PG's 42883.
+        clash = planner.conflicting_parameter_use(stmt, oids)
+        if clash is not None:
+            raise errors.SQLError("42883", f"function {clash[0]}({clash[1]}) does not exist")
         if isinstance(stmt, exp.Copy):
             # PG's parse analysis gives COPY zero parameters — placeholders
             # inside the query survive to Execute, where an unbound one is
