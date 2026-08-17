@@ -970,3 +970,36 @@ def test_execute_of_sql_prepare_describes_underlying_shape(client):
     assert rd.payload[2:end] == b"c0"
     assert _s.unpack_from("!i", rd.payload, end + 7)[0] == 20  # int8
     assert rows(msgs) == [[b"1"]]
+
+
+def test_float4_renders_shortest_single_precision(client):
+    # pgtest float corpus — float4out is the shortest SINGLE-precision
+    # round-trip; float8 keeps the double form. Arrays follow element tags.
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT (1/3.0)::float4, (1/3.0)::float8", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert rows(msgs) == [[b"0.33333334", b"0.3333333333333333"]]
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT ARRAY[(1/3.0)::float4, 'inf'::float4]", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert rows(msgs) == [[b"{0.33333334,Infinity}"]]
+
+
+def test_negative_extra_float_digits_reduces_precision(client):
+    # SET extra_float_digits = -N reduces %g precision (PG's float_out);
+    # the negative value itself must survive SET parsing (Neg node).
+    client.exchange(
+        pgwire.build_parse("", "SET extra_float_digits = -1", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT (1/3.0)::float4, (1/3.0)::float8", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert rows(msgs) == [[b"0.33333", b"0.33333333333333"]]

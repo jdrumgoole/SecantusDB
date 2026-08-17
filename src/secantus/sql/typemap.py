@@ -26,6 +26,7 @@ import decimal as _decimal
 import json as _json
 import math as _math
 import re as _re
+import struct as _struct
 from decimal import Decimal
 from typing import Any
 
@@ -1379,6 +1380,11 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
         return None
     if isinstance(value, RegClassValue):
         return value.relname.encode("utf-8")
+    if tag == "float4" and isinstance(value, float):
+        # float4out renders at SINGLE precision — shortest round-trip by
+        # default, %.{6+efd}g when extra_float_digits is negative (pgtest
+        # float corpus; array elements come through _render_pg_array).
+        return _render_pg_float4(value).encode("ascii")
     if tag == "timetz" or isinstance(value, TimeTzText):
         from secantus.sql import datetimes as _datetimes
 
@@ -1508,16 +1514,51 @@ def _render_pg_numeric(value: Decimal) -> str:
     return format(value, "f")
 
 
+def _extra_float_digits() -> int:
+    """The active session's extra_float_digits GUC (PG 12+ default 1 =
+    shortest round-trip; negative values reduce %g precision)."""
+    session = _render_session.get()
+    if session is None:
+        return 1
+    try:
+        return int(session.get_setting("extra_float_digits") or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
 def _render_pg_float(value: float) -> str:
-    """Postgres ``float8out`` text: shortest round-trip form, no ``.0`` on an
-    integral value (``12`` not ``12.0``), and PG's ``NaN`` / ``Infinity`` /
-    ``-Infinity`` spellings (Python's are ``nan`` / ``inf``)."""
+    """Postgres ``float8out`` text: shortest round-trip form (no ``.0`` on an
+    integral value), PG's ``NaN`` / ``Infinity`` / ``-Infinity`` spellings,
+    and ``%.{15+efd}g`` when extra_float_digits is negative (pgtest float
+    corpus pins efd -1 / -15)."""
     if _math.isnan(value):
         return "NaN"
     if _math.isinf(value):
         return "Infinity" if value > 0 else "-Infinity"
+    efd = _extra_float_digits()
+    if efd < 1:
+        return f"{value:.{max(1, 15 + efd)}g}"
     s = repr(value)
     return s[:-2] if s.endswith(".0") else s
+
+
+def _render_pg_float4(value: float) -> str:
+    """Postgres ``float4out``: the shortest decimal that round-trips to the
+    same single-precision value, or ``%.{6+efd}g`` when extra_float_digits
+    is negative."""
+    if _math.isnan(value):
+        return "NaN"
+    if _math.isinf(value):
+        return "Infinity" if value > 0 else "-Infinity"
+    efd = _extra_float_digits()
+    if efd < 1:
+        return f"{value:.{max(1, 6 + efd)}g}"
+    packed = _struct.pack("!f", value)
+    for p in range(1, 10):
+        s = f"{value:.{p}g}"
+        if _struct.pack("!f", float(s)) == packed:
+            return s
+    return f"{value:.9g}"
 
 
 def parse_pg_record_literal(text: str) -> list[str | None]:

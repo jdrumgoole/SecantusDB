@@ -1752,12 +1752,20 @@ def _cast_scalar(value: Any, tag: str) -> Any:
         if isinstance(value, bool):
             return value
         if isinstance(value, (int, float, Decimal)):
-            return float(value)
-        if isinstance(value, str):
+            value = float(value)
+        elif isinstance(value, str):
             try:
-                return float(value.strip())
+                value = float(value.strip())
             except ValueError:
                 raise _invalid_input(tag, value) from None
+        else:
+            return value
+        if tag == "float4":
+            # PG narrows at the cast — the narrowed double is what compares,
+            # stores, and renders (float4out's shortest form needs it).
+            import struct as _st
+
+            return _st.unpack("!f", _st.pack("!f", value))[0]
         return value
     if tag == "numeric":
         if isinstance(value, bool):

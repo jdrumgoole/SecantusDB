@@ -2753,8 +2753,13 @@ _CAST_TYPNAME_BY_OID = {
 def _cast_output_name(target: exp.Expression) -> str | None:
     """PG names an unaliased top-level cast's output column after the target
     type's ``typname`` — ``SELECT 2::int8`` yields a column named ``int8``,
-    ``'x'::varchar`` yields ``varchar``. None when ``target`` isn't a cast or
-    the name isn't a plain scalar typname (the ``?column?`` fallback stands)."""
+    ``'x'::varchar`` yields ``varchar`` — and constructor keywords after
+    themselves (``ARRAY[…]`` → ``array``, ``ROW(…)`` → ``row``; pgtest float
+    corpus). None when the ``?column?`` fallback stands."""
+    if isinstance(target, exp.Array):
+        return "array"
+    if isinstance(target, exp.Anonymous) and str(target.this).upper() == "ROW":
+        return "row"
     if not isinstance(target, exp.Cast) or target.to is None:
         return None
     ident = typemap.cast_type_identity(target.to)
