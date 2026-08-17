@@ -1185,6 +1185,7 @@ def _pg_attrdef(db: str, session: Session, storage: Any, catalog: Catalog) -> li
 _PG_CLASS_OID = 1259  # the OID of the pg_class catalog itself (classoid for relations)
 _PG_CONSTRAINT_CLASSOID = 2606  # pg_constraint catalog OID (classoid for constraint comments)
 _PG_PROC_CLASSOID = 1255  # pg_proc catalog OID (classoid for function comments)
+_PG_TYPE_CLASSOID = 1247  # pg_type catalog OID (classoid for type/domain comments)
 
 
 def _pg_description(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -1254,6 +1255,37 @@ def _pg_description(db: str, session: Session, storage: Any, catalog: Catalog) -
                     "description": comment,
                 }
             )
+    # COMMENT ON DOMAIN rows (classoid pg_type) — obj_description(oid,
+    # 'pg_type') is how pgjdbc's getUDTs reads a domain's REMARKS.
+    lister = getattr(catalog, "get_domain", None)
+    if lister is not None:
+        for dom_name, dom_oid in catalog.domain_type_oids(db).items():
+            dom = catalog.get_domain(db, dom_name)
+            comment = dom.get("comment") if dom else None
+            if comment is not None:
+                rows.append(
+                    {
+                        "objoid": dom_oid,
+                        "classoid": _PG_TYPE_CLASSOID,
+                        "objsubid": 0,
+                        "description": comment,
+                    }
+                )
+    # COMMENT ON INDEX rows — stored by name, resolved to the index relation's
+    # oid here (minted oids can reshuffle as indexes come and go).
+    index_comments = getattr(catalog, "index_comments", lambda _db: {})(db)
+    if index_comments:
+        for ix in _index_relations(db, storage, catalog):
+            comment = index_comments.get(ix["relname"])
+            if comment is not None:
+                rows.append(
+                    {
+                        "objoid": ix["indexrelid"],
+                        "classoid": _PG_CLASS_OID,
+                        "objsubid": 0,
+                        "description": comment,
+                    }
+                )
     # Direct DML against pg_description (DatabaseMetaDataTest's setup moves a
     # function comment onto a table's oid to manufacture a duplicate row) is
     # persisted as a delta over the derived rows: suppressed original keys

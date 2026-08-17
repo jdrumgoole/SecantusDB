@@ -2831,6 +2831,37 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
     if name == "pg_get_serial_sequence":
         # No serial-sequence resolution surface.
         return None
+    if name in ("obj_description", "col_description"):
+        # ``obj_description(oid[, 'catalog'])`` / ``col_description(oid,
+        # attnum)`` — look the comment up in the derived pg_description rows
+        # (pgjdbc's getUDTs reads domain/type REMARKS through the former).
+        if ctx.storage is None or ctx.db is None or not args:
+            return None
+        oid_arg = args[0]
+        if not isinstance(oid_arg, int) or isinstance(oid_arg, bool):
+            return None
+        from secantus.sql import virtual
+
+        classoids = {"pg_class": 1259, "pg_type": 1247, "pg_proc": 1255, "pg_constraint": 2606}
+        want_class = None
+        subid = 0
+        if name == "obj_description" and len(args) > 1 and args[1] is not None:
+            want_class = classoids.get(str(args[1]).rsplit(".", 1)[-1])
+        elif name == "col_description":
+            want_class = 1259
+            if len(args) > 1 and isinstance(args[1], int):
+                subid = args[1]
+        session = getattr(ctx, "session", None)
+        from secantus.sql.catalog import Catalog as _Catalog
+
+        for row in virtual._pg_description(ctx.db, session, ctx.storage, _Catalog(ctx.storage)):
+            if (
+                row["objoid"] == int(oid_arg)
+                and row["objsubid"] == subid
+                and (want_class is None or row["classoid"] == want_class)
+            ):
+                return row["description"]
+        return None
     if name == "regexp_matches":
         # Postgres regexp_matches is set-returning; in a scalar context we return
         # the first match's capture groups as a text[] (whole match if no groups),
