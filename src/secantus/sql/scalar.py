@@ -1719,6 +1719,13 @@ def _cast_scalar(value: Any, tag: str) -> Any:
     is str-vs-int false) and the binary result format (the wire layer would
     send text bytes in a column whose RowDescription claims a numeric OID)."""
     value = _unwrap_decimal(value)
+    if tag == "jsonpath":
+        from secantus.sql import jsonpath as _jsonpath
+
+        try:
+            return _jsonpath.canonicalize(str(value))
+        except _jsonpath.JsonPathError as exc:
+            raise errors.SQLError("42601", str(exc)) from None
     if tag == "char1":
         # PG's internal one-byte "char": an int cast is chr(i) — 0::"char" IS
         # the zero byte, kept as a value (its binary render is 0x00); text
@@ -2393,6 +2400,7 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         "numeric",
         "bool",
         "char1",
+        "jsonpath",
     ):
         return _cast_scalar(value, to_tag)
     # ``ts::text`` renders through the session-aware datetime renderer (TimeZone
@@ -3210,6 +3218,15 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         path = args[1] if len(args) > 1 else None
         if doc is None or path is None:
             return None
+        if isinstance(doc, str):
+            # A string literal coerces to jsonb, like PG's implicit cast
+            # (pgtest jsonpath corpus calls jsonb_path_query('{"a": true}', …)).
+            try:
+                doc = json.loads(doc)
+            except ValueError:
+                raise errors.SQLError(
+                    "22P02", f"invalid input syntax for type json: {doc!r}"
+                ) from None
         try:
             if name == "jsonb_path_exists":
                 return _jsonpath.exists(doc, _as_text(path))

@@ -1075,3 +1075,50 @@ def test_int2vector_binary_result_is_int2_array(client):
         pgwire.build_execute("", 0),
     )
     assert rows(msgs) == [[bytes.fromhex("0000000100000000000000150000000100000001000000020000")]]
+
+
+def test_jsonpath_type_and_canonical_text(client):
+    # pgtest jsonpath corpus — oid 4072, canonical member quoting, 42601 on
+    # an empty path, and PG-true binary (version byte + UNQUOTED text; the
+    # corpus's quoted expectation is crdb's, in EXPECTED_DIVERGENCES).
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT '$.abc'::JSONPATH", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_describe("P", ""),
+        pgwire.build_execute("", 0),
+    )
+    rd = next(m for m in msgs if m.type == "T")
+    import struct as _s
+
+    end = rd.payload.index(b"\x00", 2)
+    assert rd.payload[2:end] == b"jsonpath"
+    assert _s.unpack_from("!i", rd.payload, end + 7)[0] == 4072
+    assert rows(msgs) == [[b'$."abc"']]
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT ''::JSONPATH", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert error_code(msgs) == "42601"
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT '$'::JSONPATH", []),
+        pgwire.build_bind("", "", [], result_formats=[1]),
+        pgwire.build_execute("", 0),
+    )
+    assert rows(msgs) == [[b"\x01$"]]
+
+
+def test_jsonb_path_query_names_column_and_returns_jsonb(client):
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT jsonb_path_query('{\"a\": true}', '$.a')", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_describe("P", ""),
+        pgwire.build_execute("", 0),
+    )
+    rd = next(m for m in msgs if m.type == "T")
+    import struct as _s
+
+    end = rd.payload.index(b"\x00", 2)
+    assert rd.payload[2:end] == b"jsonb_path_query"
+    assert _s.unpack_from("!i", rd.payload, end + 7)[0] == 3802
+    assert rows(msgs) == [[b"true"]]
