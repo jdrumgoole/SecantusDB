@@ -293,6 +293,34 @@ _PYTEST_SUMMARY = re.compile(
     re.M,
 )
 
+# pytest's progress percentage reaches 100% only once EVERY test has been
+# reported, so it proves the session finished its run even when the wedge
+# beats the summary line to stdout. Observed 2026-08-17: a nested run's
+# captured stdout was `bringing up nodes...` + `.` + `[100%]` and then the
+# process never exited — the summary-only tolerance below could not match it
+# and every occurrence escalated to a release-blocking TimeoutExpired.
+_PYTEST_PROGRESS_DONE = re.compile(r"\[\s*100%\]")
+
+#: Unambiguous whole-output markers that the nested session had a crash.
+_PYTEST_CRASH_MARKERS = ("node down", "crashed", "internal error", "INTERNALERROR")
+
+
+def _progress_says_failed(text: str) -> bool:
+    """Whether pytest's ``-q`` progress output reports a failure.
+
+    Only the progress CHARACTERS are inspected (the run of ``.``/``F``/``E``/
+    ``s``/``x`` before the percentage), never the whole stream — a tmp path or
+    a warning line containing an ``F`` must not read as a failed test.
+    """
+    for line in text.splitlines():
+        m = _PYTEST_PROGRESS_DONE.search(line)
+        if m is None:
+            continue
+        marks = line[: m.start()].strip()
+        if any(c in marks for c in "FE"):
+            return True
+    return any(mark in text for mark in _PYTEST_CRASH_MARKERS)
+
 
 def _run_tolerating_teardown_wedge(
     cmd: list[str], *, cwd: Path, env: dict[str, str], timeout: int
@@ -303,10 +331,17 @@ def _run_tolerating_teardown_wedge(
     summary and then hang in interpreter / xdist shutdown without ever exiting.
     That is the very "wedged after its last test" case the crash watchdog exists
     to detect, so it is not a test failure here: the session finished, the
-    faulthandler files are written, the verdict is in the summary. When it
-    happens, kill the hung process and synthesize the return code from the
-    summary line instead of raising ``TimeoutExpired``. A hang with *no* summary
-    (genuinely stuck mid-run) still raises — that is a real failure.
+    faulthandler files are written, and the verdict is recoverable. When it
+    happens, kill the hung process and synthesize the return code instead of
+    raising ``TimeoutExpired``.
+
+    The wedge does not always beat the summary to stdout — it can land BETWEEN
+    the last test being reported and the summary being written, which a
+    summary-only tolerance misses. So the completion evidence is either the
+    summary line or pytest's ``[100%]`` progress marker (which only appears
+    once every test has been reported); with the marker alone the return code
+    comes from the failure markers in the progress output. A hang with
+    *neither* (genuinely stuck mid-run) still raises — that is a real failure.
     """
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd, env=env
@@ -320,12 +355,18 @@ def _run_tolerating_teardown_wedge(
             out, err = proc.communicate(timeout=30)
         except subprocess.TimeoutExpired:
             out, err = "", ""
-        m = _PYTEST_SUMMARY.search(out or "")
-        if m is None:
-            raise  # no summary → the session never finished; a real hang
-        summary = m.group("body")
-        rc = 1 if ("failed" in summary or "error" in summary) else 0
-        return subprocess.CompletedProcess(cmd, rc, out, err)
+        text = out or ""
+        m = _PYTEST_SUMMARY.search(text)
+        if m is not None:
+            summary = m.group("body")
+            rc = 1 if ("failed" in summary or "error" in summary) else 0
+            return subprocess.CompletedProcess(cmd, rc, out, err)
+        if _PYTEST_PROGRESS_DONE.search(text):
+            # Every test was reported, then the session wedged before writing
+            # its summary. Read the verdict off the progress output instead.
+            rc = 1 if _progress_says_failed(text) else 0
+            return subprocess.CompletedProcess(cmd, rc, out, err)
+        raise  # neither summary nor a finished run → a real hang
 
 
 # The nested `pytest -n 2` sessions below spawn several extra processes each. If
@@ -422,3 +463,56 @@ def test_faulthandler_dir_captures_a_worker_crash(tmp_path: Path) -> None:
     )
     joined = "\n".join(dumps)
     assert "Fatal Python error" in joined or "Segmentation fault" in joined, joined[:400]
+
+
+# --- the wedge tolerance itself ------------------------------------------- #
+
+
+def test_wedge_tolerance_accepts_a_finished_run_without_a_summary(tmp_path: Path) -> None:
+    """A session that reported every test then hung before its summary is a
+    post-completion wedge, not a mid-run hang.
+
+    Observed 2026-08-17: the nested run's stdout was ``bringing up nodes...``
+    + ``.`` + ``[100%]`` and the process never exited, so the summary-only
+    tolerance escalated to TimeoutExpired and blocked the suite.
+    """
+    script = tmp_path / "wedge.py"
+    script.write_text(
+        "import sys, time\n"
+        "sys.stdout.write('bringing up nodes...\\n\\n.')\n"
+        "sys.stdout.write(' ' * 40 + '[100%]\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(300)\n"
+    )
+    result = _run_tolerating_teardown_wedge(
+        [sys.executable, str(script)], cwd=tmp_path, env=dict(os.environ), timeout=5
+    )
+    assert result.returncode == 0
+    assert "[100%]" in result.stdout
+
+
+def test_wedge_tolerance_reports_failure_from_progress_marks(tmp_path: Path) -> None:
+    script = tmp_path / "wedge_fail.py"
+    script.write_text(
+        "import sys, time\n"
+        "sys.stdout.write('.F' + ' ' * 40 + '[100%]\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(300)\n"
+    )
+    result = _run_tolerating_teardown_wedge(
+        [sys.executable, str(script)], cwd=tmp_path, env=dict(os.environ), timeout=5
+    )
+    assert result.returncode == 1
+
+
+def test_wedge_tolerance_still_raises_on_a_mid_run_hang(tmp_path: Path) -> None:
+    """No summary AND no finished run — a genuine hang stays a failure."""
+    script = tmp_path / "stuck.py"
+    script.write_text(
+        "import sys, time\nsys.stdout.write('bringing up nodes...\\n')\n"
+        "sys.stdout.flush()\ntime.sleep(300)\n"
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_tolerating_teardown_wedge(
+            [sys.executable, str(script)], cwd=tmp_path, env=dict(os.environ), timeout=5
+        )
