@@ -1034,3 +1034,21 @@ def test_nested_begin_warns_25001_with_pg_fields(client):
         pgwire.build_bind("", "", []),
         pgwire.build_execute("", 0),
     )
+
+
+def test_binary_inet_error_classes(client):
+    # pgtest inet corpus — a truncated binary inet payload is 08P01; a bad
+    # family or address length is 22P03 (PG's inet_recv classes; XX000
+    # leaked before).
+    for payload, code in (
+        (b"", "08P01"),
+        (bytes.fromhex("020000000000"), "22P03"),
+        (bytes.fromhex("030000000000"), "22P03"),
+        (bytes.fromhex("060000000000"), "22P03"),
+    ):
+        msgs = client.exchange(
+            pgwire.build_parse("", "SELECT $1::INET", []),
+            pgwire.build_bind("", "", [payload], param_formats=[1]),
+            pgwire.build_execute("", 0),
+        )
+        assert error_code(msgs) == code, (payload.hex(), error_code(msgs))

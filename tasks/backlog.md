@@ -2681,10 +2681,13 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   with the BEGIN tag but emits PG's WARNING notice — 25001 with the
   File/Routine identity fields (xact.c / BeginTransactionBlock),
   which the notice plumbing now carries (SQLResult.notices accepts
-  (severity, message[, sqlstate[, file[, routine]]])). Corpus: 25
-  unexpected failures — green now also includes implicit_txn. Next:
-  `inet`, `int2vector` (`multiple_active_portals` needs fresh-state
-  isolation — leftover `mytable`/`ltree` deps). Iterate
+  (severity, message[, sqlstate[, file[, routine]]])). Slice 17
+  greened `inet`: malformed binary inet payloads get PG's error
+  classes — a truncated header is 08P01, a bad family or address
+  length is 22P03 (inet_recv; XX000 leaked before). Corpus: 24
+  unexpected failures — green now also includes inet. Next:
+  `int2vector`, `jsonpath` (`multiple_active_portals` needs
+  fresh-state isolation — leftover `mytable`/`ltree` deps). Iterate
   file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from

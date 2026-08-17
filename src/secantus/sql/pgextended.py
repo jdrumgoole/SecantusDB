@@ -151,8 +151,20 @@ def _decode_interval(b: bytes) -> dict:
 
 
 def _decode_inet(b: bytes) -> str:
-    """Binary ``inet`` / ``cidr`` — family, bits, is_cidr, nbytes, address."""
-    _family, bits, _is_cidr, nb = struct.unpack_from("!BBBB", b, 0)
+    """Binary ``inet`` / ``cidr`` — family, bits, is_cidr, nbytes, address.
+    Malformed payloads get PG's error classes (pgtest inet corpus): a
+    truncated header is 08P01; a bad family or address length is 22P03."""
+    if len(b) < 4:
+        raise errors.SQLError("08P01", "insufficient data left in message")
+    family, bits, _is_cidr, nb = struct.unpack_from("!BBBB", b, 0)
+    if family == 2:  # PGSQL_AF_INET
+        expected = 4
+    elif family == 3:  # PGSQL_AF_INET6
+        expected = 16
+    else:
+        raise errors.SQLError("22P03", 'invalid address family in external "inet" value')
+    if nb != expected or len(b) < 4 + nb:
+        raise errors.SQLError("22P03", 'invalid length in external "inet" value')
     addr = _ipaddress.ip_address(bytes(b[4 : 4 + nb]))
     return f"{addr}/{bits}"
 
