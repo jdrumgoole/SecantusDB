@@ -2418,10 +2418,17 @@ def _pg_enum(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
 
 
 def _pg_database(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    # The connected database plus ``postgres`` — the maintenance database every
+    # real PG cluster carries and the one JDBC clients enumerate through
+    # (pgjdbc's getCatalogs asserts both are present). We deliberately do NOT
+    # enumerate ``storage.list_databases()`` here: that set is the MongoDB-wire
+    # namespace and includes cross-protocol names like ``local`` that a PG
+    # client must never see as a connectable catalog.
+    names = [db] if db == "postgres" else [db, "postgres"]
     return [
         {
-            "oid": 1,
-            "datname": db,
+            "oid": 1 + i,
+            "datname": name,
             "datallowconn": True,
             "datdba": 10,
             "encoding": 6,
@@ -2429,6 +2436,7 @@ def _pg_database(db: str, session: Session, storage: Any, catalog: Catalog) -> l
             "datctype": "C",
             "datacl": None,
         }
+        for i, name in enumerate(names)
     ]
 
 
