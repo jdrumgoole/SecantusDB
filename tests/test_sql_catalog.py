@@ -717,3 +717,20 @@ def test_function_wrapped_string_agg(storage, session):
         (b"ab",)
     ]
     assert q(storage, session, "SELECT upper(string_agg(b, '-')) FROM wsa").rows == [("61-62",)]
+
+
+def test_pg_database_includes_postgres_maintenance_db(storage, session):
+    # pgjdbc's getCatalogs asserts both the connected db and "postgres" are
+    # present and the list is sorted; a PG client must never see MongoDB-side
+    # names like "local" as a connectable catalog.
+    rows = q(
+        storage,
+        session,
+        'SELECT datname AS "TABLE_CAT" FROM pg_catalog.pg_database'
+        " WHERE datallowconn = true ORDER BY datname",
+    ).rows
+    names = [r[0] for r in rows]
+    assert "postgres" in names
+    assert DB in names
+    assert "local" not in names
+    assert names == sorted(names)
