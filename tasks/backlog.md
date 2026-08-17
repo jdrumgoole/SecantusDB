@@ -2761,18 +2761,18 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   check sits AFTER the COPY-specific 08P01, whose error carries PG's
   statement-summary Detail — putting it first regressed the `copy`
   file, which the full-corpus re-run caught.
-  **Gauge-harness limitation found (next piece of work): our runner
-  shares ONE daemon across all 58 corpus files, but the corpus assumes
-  a clean database per file** — `execute` leaves table `t0` behind and
-  `prepare:163` then fails `CREATE TABLE t0` with 42P07, even though
-  `prepare` passes in isolation. Upstream crdb's harness has
-  `WalkWithNewServer` (per-file server) for exactly this; our Go driver
-  uses `WalkWithRunningServer` because the Go test can't spawn our
-  Python daemon. Fix: loop per file in `pgtest_validation/runner.py`,
-  fresh daemon each, concatenating the `-json` streams. Until then the
-  full-run count is INFLATED by cross-file pollution. Corpus: 16
-  unexpected failures (`prepare` passes isolated). Next: the runner
-  isolation fix, then `prepared_stmt_invalidation`.
+  **Gauge-harness limitation FIXED (runner isolation):** the runner
+  now spawns a FRESH daemon per corpus file (anchored
+  `-run TestPGTest/^<file>$`, `-json` streams concatenated), because the
+  corpus assumes a clean database per file — `execute` leaves table
+  `t0` behind, so `prepare` and `copy` failed in a shared-daemon run
+  while passing alone. Upstream crdb uses a per-file server for the
+  same reason. **The report is now the honest measurement: 37/64 pass,
+  4 expected divergences, 18 unexpected failures, 5 skipped** (campaign
+  start: 10/58 pass, 43 unexpected). The 58→64 denominator shift is
+  real: files that used to fail on line 1 now get far enough to emit
+  their subtest events. Next: `prepared_stmt_invalidation`, then
+  `row_description` / `set` / `typing`.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
