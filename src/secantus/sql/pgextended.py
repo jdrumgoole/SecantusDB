@@ -1868,8 +1868,6 @@ class ExtendedSession:
         if self.session.pending_parameter_status:
             status += self.session.pending_parameter_status
             self.session.pending_parameter_status = []
-        for pname, pvalue in status:
-            out += pgwire.parameter_status(pname, pvalue)
         if _is_row_returning(res):
             rows = res.rows
             cols = res.columns
@@ -1896,6 +1894,11 @@ class ExtendedSession:
                 out += pgwire.command_complete(res.command_tag)
         else:
             out += pgwire.command_complete(res.command_tag)
+        # PG reports GUC changes AFTER the command's completion message, like
+        # the simple-query path (pgtest param_status pins the order; a wire
+        # test caught this path lagging behind that fix).
+        for pname, pvalue in status:
+            out += pgwire.parameter_status(pname, pvalue)
         return bytes(out)
 
     def _close(self, payload: bytes) -> bytes:

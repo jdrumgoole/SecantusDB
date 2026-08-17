@@ -2720,9 +2720,20 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   regtype 2206, regnamespace 4089, regrole 4096) ride the oid wire
   form — typlen 4 in RowDescription and a 4-byte unsigned binary
   decode (raw bytes echoed through before), with a wrong-length
-  payload rejected 08P01 like PG's oidrecv. Corpus: 20 unexpected
-  failures. Next: `param_status`, `parameter_description`. Iterate
-  file-by-file.
+  payload rejected 08P01 like PG's oidrecv. Slice 23 greened
+  `param_status` (350 lines, :7 → green): ParameterStatus now follows
+  the command's CommandComplete in BOTH protocol paths; a numeric SET
+  TIME ZONE reports PG's POSIX spec (`+6` → `<+06>-06`, sign inverted
+  after the label); IntervalStyle and is_superuser joined
+  REPORTABLE_GUCS (IntervalStyle lowercased); DateStyle reports
+  canonically as `<style>, <order>` regardless of written order;
+  `SET LOCAL TIME ZONE` honours LOCAL scope and canonicalizes;
+  SET ROLE / `SET [LOCAL] role =` report is_superuser, but only on a
+  real change; savepoints snapshot the GUCs so ROLLBACK TO SAVEPOINT
+  reverts and re-reports them; the transaction-end and ERROR-time
+  unwinds report case-insensitively ordered, including is_superuser
+  when the role reverts. Corpus: 19 unexpected failures. Next:
+  `parameter_description`, `portals`. Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``

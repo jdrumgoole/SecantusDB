@@ -147,8 +147,41 @@ REPORTABLE_GUCS = frozenset(
         "application_name",
         "standard_conforming_strings",
         "search_path",
+        # PG reports these too (pgtest param_status reads them after SET /
+        # SET LOCAL / SET ROLE and on the transaction-end unwind).
+        "IntervalStyle",
+        "is_superuser",
     }
 )
+
+#: GUCs whose reported value PG lowercases (enum GUCs — ``IntervalStyle =
+#: 'ISO_8601'`` reports ``iso_8601``).
+_LOWERCASE_REPORTED_GUCS = frozenset({"IntervalStyle"})
+
+
+#: DateStyle output styles, in PG's reported spelling.
+_DATESTYLE_STYLES = {"iso": "ISO", "postgres": "Postgres", "sql": "SQL", "german": "German"}
+_DATESTYLE_ORDERS = ("MDY", "DMY", "YMD")
+
+
+def canonical_guc_value(name: str, value: str) -> str:
+    """The value PG stores/reports for GUC ``name`` (canonical spelling)."""
+    if name in _LOWERCASE_REPORTED_GUCS:
+        return str(value).strip().strip("'\"").lower()
+    if name == "DateStyle":
+        # PG reports DateStyle as ``<style>, <order>`` regardless of the order
+        # they were written in (``YMD, ISO`` -> ``ISO, YMD``; pgtest
+        # param_status). A single-component SET passes through so the other
+        # half keeps its current value, like PG's merge.
+        parts = [p.strip() for p in str(value).strip().strip("'\"").split(",") if p.strip()]
+        style = next(
+            (_DATESTYLE_STYLES[p.lower()] for p in parts if p.lower() in _DATESTYLE_STYLES), None
+        )
+        order = next((p.upper() for p in parts if p.upper() in _DATESTYLE_ORDERS), None)
+        if style is not None and order is not None:
+            return f"{style}, {order}"
+    return value
+
 
 # GUC names are case-insensitive; SET / SHOW / ParameterStatus all resolve to
 # the canonical spelling (``set timezone`` must hit ``TimeZone``'s default,
@@ -175,7 +208,28 @@ def canonical_timezone_setting(value: str) -> str:
         return low.upper()
     if low.startswith(("gmt+", "gmt-", "utc+", "utc-")):
         return v[:3].upper() + v[3:]
-    return v
+    posix = _numeric_offset_zone(v)
+    return posix if posix is not None else v
+
+
+def _numeric_offset_zone(value: str) -> str | None:
+    """PG renders a NUMERIC ``SET TIME ZONE`` offset as a POSIX zone spec:
+    ``+6`` -> ``<+06>-06``, ``-11.5`` -> ``<-11:30>+11:30``. The label keeps
+    the ISO sign; the offset AFTER it is POSIX-style, i.e. sign-inverted
+    (pgtest param_status pins both spellings). None when ``value`` isn't a
+    bare number."""
+    try:
+        hours = float(value)
+    except ValueError:
+        return None
+    if not -16 <= hours <= 16:  # PG's numeric TimeZone range
+        return None
+    sign = "-" if hours < 0 else "+"
+    total_minutes = round(abs(hours) * 60)
+    hh, mm = divmod(total_minutes, 60)
+    body = f"{hh:02d}" if mm == 0 else f"{hh:02d}:{mm:02d}"
+    inverted = "+" if sign == "-" else "-"
+    return f"<{sign}{body}>{inverted}{body}"
 
 
 def canonical_guc_name(name: str) -> str:
@@ -191,6 +245,10 @@ class _Savepoint:
 
     name: str
     snapshots: dict[str, list] = field(default_factory=dict)
+    #: Every GUC's value when this savepoint was established. ROLLBACK TO
+    #: SAVEPOINT reverts GUCs set after it and re-reports the GUC_REPORT ones
+    #: (pgtest param_status), exactly like PG's per-subtransaction GUC stack.
+    gucs: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -581,9 +639,38 @@ class Session:
                 self.settings.pop(name, None)
             else:
                 self.settings[name] = prior
+        self._report_restored(list(self.txn_gucs))
+        self.txn_gucs = {}
+
+    def _report_restored(self, names: list[str]) -> None:
+        """Queue ParameterStatus for the GUC_REPORT parameters among ``names``
+        after an unwind. PG orders them case-insensitively by name, and a
+        reverted ``role`` also re-reports ``is_superuser`` (pgtest
+        param_status reads the whole list after ROLLBACK / COMMIT)."""
+        reportable = {n for n in names if n in REPORTABLE_GUCS}
+        if any(n.lower() == "role" for n in names):
+            self.role = self.settings.get("role") or None
+            is_super = self.role is None or self.role == (self.login_user or self.user)
+            value = "on" if is_super else "off"
+            if self.settings.get("is_superuser") != value:
+                self.settings["is_superuser"] = value
+                reportable.add("is_superuser")
+        for name in sorted(reportable, key=str.lower):
+            self.pending_parameter_status.append((name, self.get_setting(name)))
+
+    def restore_savepoint_gucs(self, snapshot: dict[str, str]) -> None:
+        """Revert to a savepoint's GUC snapshot, re-reporting the GUC_REPORT
+        parameters whose value changed (PG orders them case-insensitively by
+        name)."""
+        changed = [
+            name
+            for name in set(snapshot) | set(self.settings)
+            if snapshot.get(name) != self.settings.get(name)
+        ]
+        self.settings = dict(snapshot)
+        for name in sorted(changed, key=str.lower):
             if name in REPORTABLE_GUCS:
                 self.pending_parameter_status.append((name, self.get_setting(name)))
-        self.txn_gucs = {}
 
     def set_local(self, name: str, value: str) -> None:
         """``SET LOCAL name = value`` (#136) — applies for the rest of the current
@@ -601,12 +688,10 @@ class Session:
                 self.settings.pop(name, None)
             else:
                 self.settings[name] = prior
-            if name in REPORTABLE_GUCS:
-                # PG re-reports a GUC_REPORT parameter when the transaction's
-                # SET LOCAL unwinds — without this the client's ParameterStatus
-                # cache keeps the local value forever (pgjdbc's
-                # transactionalParameters* trio).
-                self.pending_parameter_status.append((name, self.get_setting(name)))
+        # PG re-reports GUC_REPORT parameters when the transaction's SET LOCALs
+        # unwind — without this the client's ParameterStatus cache keeps the
+        # local value forever (pgjdbc's transactionalParameters* trio).
+        self._report_restored(list(self.local_gucs))
         self.local_gucs = {}
 
     def all_settings(self) -> dict[str, str]:
