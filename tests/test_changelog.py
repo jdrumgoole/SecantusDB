@@ -150,3 +150,41 @@ The first.
     assert releases[0].title == "Work in flight"
     assert releases[1].version == "0.1.0"
     assert not releases[1].is_unreleased
+
+
+def test_lede_stops_at_the_next_section_heading() -> None:
+    """A release's lede ends at the SECOND ``###`` heading.
+
+    Collated ``changelog.d`` fragments each contribute their own ``###``
+    section, and the lede used to swallow all of them (it only stopped at the
+    first ``####``), so generated blog posts carried a stray technical heading
+    and its prose after the marketing lede.
+    """
+    from changelog import parse
+
+    text = """# Changelog
+
+## [1.2.3b4] — 2026-01-02
+
+### The headline
+
+Lede paragraph one.
+
+Lede paragraph two.
+
+### A collated fragment's own section
+
+This prose belongs to the fragment, not the lede.
+
+#### Fixed
+
+- something
+"""
+    release = parse.find_release(parse.parse_text(text), "1.2.3b4")
+    assert release is not None
+    assert release.title == "The headline"
+    assert "Lede paragraph one." in release.lede
+    assert "Lede paragraph two." in release.lede
+    assert "belongs to the fragment" not in release.lede
+    assert "###" not in release.lede
+    assert release.sections["Fixed"] == ["- something"]
