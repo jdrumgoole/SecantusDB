@@ -3037,8 +3037,12 @@ shared storage engine or building large new protocol subsystems:
     like `"TABLE_TYPE"` erroring instead of resolving (6F + 4F
     "DATA_TYPE" — likely one alias-resolution bug); COMMENT ON TYPE (6F)
     and COMMENT ON INDEX (2F) unsupported; `pg_class.reltuples` column
-    (4F); ACL reflection: getTablePrivileges empty for tables/views/
-    matviews (6F); domainColumnSize typmod not flowing through domain
+    (4F); ACL reflection: getTablePrivileges for tables/views/matviews
+    FIXED (relowner→role oid + relacl materialization); the remaining ACL
+    piece is **columnPrivileges** (2F) — getColumnPrivileges over the
+    system catalog `pg_statistic`, which needs pg_statistic modeled as a
+    queryable relation with columns in pg_class/pg_attribute;
+    domainColumnSize typmod not flowing through domain
     columns (2F) — DESIGN: capture the base type's declared typmod at
     CREATE DOMAIN (reuse `_decl_identity(kind)` → {decl_oid, typmod}),
     store it on the domain doc (additive field, default -1), and in
