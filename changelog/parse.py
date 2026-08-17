@@ -80,6 +80,7 @@ def parse_text(text: str) -> list[Release]:
     current_section: str | None = None
     lede_lines: list[str] = []
     seen_title = False
+    lede_done = False
 
     for raw in lines:
         line = raw.rstrip()
@@ -88,6 +89,7 @@ def parse_text(text: str) -> list[Release]:
             _flush_lede(current, lede_lines, seen_title)
             lede_lines = []
             seen_title = False
+            lede_done = False
             current_section = None
             current = Release(
                 version=m_header.group("version"),
@@ -101,9 +103,18 @@ def parse_text(text: str) -> list[Release]:
             # Pre-amble (file-level header, intro paragraphs) — skip.
             continue
         m_title = _TITLE_RE.match(line)
-        if m_title and not seen_title:
-            current.title = m_title.group("title")
-            seen_title = True
+        if m_title:
+            if not seen_title:
+                current.title = m_title.group("title")
+                seen_title = True
+            else:
+                # A SECOND ``###`` starts a sibling section (a collated
+                # changelog.d fragment), so the lede ends here. Without this
+                # the lede swallowed every following section's prose and the
+                # generated blog post carried a stray technical heading.
+                _flush_lede(current, lede_lines, seen_title)
+                lede_lines = []
+                lede_done = True
             continue
         m_sub = _SUBSECTION_RE.match(line)
         if m_sub:
@@ -130,7 +141,7 @@ def parse_text(text: str) -> list[Release]:
             # ``### title`` are skipped because seen_title is False
             # then; we only start collecting once the title has been
             # seen.
-            if seen_title:
+            if seen_title and not lede_done:
                 lede_lines.append(raw)
 
     _flush_lede(current, lede_lines, seen_title)
