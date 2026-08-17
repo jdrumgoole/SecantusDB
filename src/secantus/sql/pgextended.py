@@ -1896,12 +1896,23 @@ class ExtendedSession:
                         for v, f, c in zip(row, fmts, cols, strict=False)
                     ]
                 )
-            if max_rows > 0 and end < len(rows):
-                portal.offset = end
+            delivered = end - portal.offset
+            portal.offset = end
+            tag = res.command_tag
+            if tag.startswith("SELECT "):
+                # A portal Execute's CommandComplete counts the rows THAT
+                # Execute delivered, not the portal's total — the final,
+                # drained Execute reports ``SELECT 0`` (pgtest portals).
+                tag = f"SELECT {delivered}"
+            if max_rows > 0 and delivered == max_rows:
+                # PG cannot know the portal is exhausted until an Execute
+                # fetches beyond the last row: delivering EXACTLY max_rows
+                # always suspends, even when nothing remains, and the
+                # CommandComplete comes from the next Execute (pgtest
+                # portals). Fewer than max_rows means the end was reached.
                 out += pgwire.portal_suspended()
             else:
-                portal.offset = end
-                out += pgwire.command_complete(res.command_tag)
+                out += pgwire.command_complete(tag)
         else:
             out += pgwire.command_complete(res.command_tag)
         # PG reports GUC changes AFTER the command's completion message, like

@@ -2740,8 +2740,22 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   stays text, which the char corpus pins); one-type-per-parameter
   conflicts raise 42883 (`lower($1)` with `$1::int`); a gap in
   parameter numbering (`SELECT $2 > 0`) and a bare parameter as the
-  only CASE result raise 42P18. Corpus: 18 unexpected failures. Next:
-  `portals`, `prepare`. Iterate file-by-file.
+  only CASE result raise 42P18. Slice 25 advanced `portals`
+  :147 → :1182 of 1550 (now a documented divergence): an Execute
+  delivering EXACTLY MaxRows always sends PortalSuspended — PG can't
+  know the portal is exhausted until an Execute fetches past the last
+  row — and each Execute's CommandComplete counts the rows THAT
+  Execute delivered (the drained one reports `SELECT 0`; a slice-21
+  test of mine had asserted the portal total). **:1182 is a
+  fidelity-conflict divergence**: the stanza compares the
+  CHECK-violation MESSAGE and pins crdb's wording; ours is real
+  PostgreSQL's, so matching would be a regression.
+  **Consequence to remember: the stanzas AFTER :1182 are not
+  exercised** — they cover 34000 'unknown portal' (already
+  implemented) and 42P03 'cursor "p" already exists as portal'
+  (NOT implemented — a DECLARE colliding with an open portal name).
+  Corpus: 17 unexpected failures. Next: `prepare`,
+  `prepared_stmt_invalidation`. Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
