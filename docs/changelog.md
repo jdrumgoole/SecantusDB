@@ -19,6 +19,1228 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.6.0b12] — 2026-08-17
+
+### Three privilege-escalation holes closed, and the PostgreSQL wire corpus from 10 files to 37
+
+Three ways a caller could reach data its grants didn't cover are now shut.
+An aggregation pipeline could sidestep role-based access control outright,
+so a user with no read grant on a collection could still read it through
+`$lookup`; a SQL write statement could read tables it held no SELECT grant
+on, because only the write target was authorized; and large-object writes
+honoured neither RBAC nor read-only transactions. Each is closed with tests
+that assert the denial, not just the happy path. The admin UI also stopped
+treating collection names as markup — a name containing a script tag is now
+escaped wherever it is rendered — and the Rust storage crates moved to PyO3
+0.29, clearing two RUSTSEC advisories.
+
+The PostgreSQL wire protocol had its largest single push so far, measured by
+running CockroachDB's byte-exact `pgtest` corpus unmodified: **37 of 64
+corpus files now pass, up from 10, with unexpected failures down from 43 to
+18.** Portals behave like PostgreSQL's — they die at transaction end, refuse
+a duplicate name inside a block, block a DROP of a table they still read, and
+suspend on exactly their row limit instead of guessing that the data ran out.
+GUC reporting follows PG's ordering and spellings, including savepoint-scoped
+reverts and the report that accompanies an error. Parameter typing follows
+PG's parse analysis, so a placeholder compared against a column takes that
+column's type and genuinely unresolvable placeholders are rejected rather than
+silently coerced. COPY reached byte-exact CSV fidelity, and `jsonpath`,
+`ltree`, and PostgreSQL's internal one-byte `"char"` joined the type system.
+
+Driver-facing depth grew alongside it: BEFORE INSERT row triggers with
+plpgsql `NEW` records, plpgsql refcursors (`OPEN … FOR`, `CLOSE`, `FETCH` by
+portal name), set-returning functions in the select list, EXCLUDE
+constraints, and a long list of catalog and metadata gaps that pgjdbc's
+`DatabaseMetaData` suite reads. Two measurement fixes are worth naming
+because they change what the numbers mean: the pgtest gauge now runs each
+corpus file against a fresh server, as upstream does — sharing one server let
+debris from an earlier file fail two later ones — and the crash-diagnostic
+test harness now recognises a nested run that finished its tests before
+hanging in teardown, which had been failing releases on a passing suite.
+
+### Aborted-transaction pipeline semantics match PG
+
+Two wire-protocol fundamentals pinned by CockroachDB's pgtest corpus
+(the `aborted_txn` file). Inside an ABORTED explicit transaction, every
+extended-protocol step — Parse, Bind, Describe, Execute — now fails with
+`25P02` until the transaction ends, with PG's transaction-exit carve-out
+(`COMMIT` / `ROLLBACK` statements still parse and execute, or a client
+could never leave the aborted block). Previously a Parse in an aborted
+transaction quietly succeeded.
+
+And an errored extended-protocol pipeline now discards **everything**
+until Sync — including interleaved simple Query messages, matching PG's
+`ignore_till_sync`. Previously a `Query` slipped through the discard and
+executed (answering `25P02` and an extra ReadyForQuery the client never
+expected).
+
+#### Fixed
+
+- `sql/pgextended.py`: 25P02 for extended steps in an aborted explicit
+  transaction, with the COMMIT/ROLLBACK exemption.
+- `sql/pgserver.py`: `ignore_till_sync` covers interleaved simple Query
+  (and Fastpath) messages in an errored pipeline.
+
+### Admin UI: collection names can no longer inject script
+
+The collections page built its per-row modify/rename toggle keys by
+splicing the collection name straight into an Alpine.js directive
+(`@click`, `x-show`). Jinja HTML-escaped the name, but the browser
+decodes those entities back before Alpine compiles the attribute as a
+JavaScript expression via `new Function`, so a collection name
+containing a single quote — no character restriction exists on
+collection names — broke out of the toggle-key literal and ran
+arbitrary script in the admin operator's authenticated session on page
+render. Because the Mongo wire port is unauthenticated by default, this
+was a pivot from an anonymous wire client to the admin UI's session.
+
+The toggle keys are now the loop's row index (an integer), so no
+attacker-controlled string ever reaches the Alpine expression context.
+The name still renders, safely escaped, in the row's link, form
+actions, and rename field.
+
+#### Security
+
+- Stored XSS on the admin collections page: a collection name with a
+  `'` executed script in the operator's session on render (#835). Row
+  toggle keys are now integer indices, keeping the name out of every
+  Alpine.js directive.
+
+### ALTER TABLE … DROP without the COLUMN keyword
+
+`ALTER TABLE t DROP name` — the keywordless column-drop form real
+Postgres accepts — no longer errors. sqlglot parses the action as a raw
+Command; the executor now recognises `DROP [IF EXISTS] <col>
+[CASCADE|RESTRICT]` there and applies the standard drop-column action.
+(pgjdbc's DatabaseMetaDataTest droppedColumns.)
+
+#### Fixed
+- Keywordless `ALTER TABLE … DROP <col>` (quoted or bare, IF EXISTS,
+  CASCADE/RESTRICT tails).
+
+### Multi-statement batches are one implicit transaction, like Postgres
+
+A multi-statement simple query now runs in a single implicit
+transaction, matching real PG: a mid-batch error rolls back the earlier
+statements' writes (their result rows were already streamed — PG
+streams too), an explicit `BEGIN` inside the batch takes the
+transaction over — its characteristics included, so `BEGIN READ ONLY`
+makes a following write fail `25006` and poison the block — and
+`COMMIT`/`ROLLBACK` end it with the remainder starting a fresh implicit
+transaction. Previously each statement ran in its own autocommit
+transaction, so a failed batch left earlier writes behind — a recorded
+semantic divergence, now closed (pinned by the pgtest `batch_stmt`
+corpus, which is fully green).
+
+In support: a batch whose statements only parse individually (``BEGIN
+READ ONLY`` mid-batch needs the regex fallback) now splits at top-level
+semicolons — respecting quotes, dollar-quotes, and comments — and
+parses each segment through the full entry point.
+
+#### Fixed
+
+- `sql/engine.py`: `run_sql` wraps multi-statement batches in an
+  implicit transaction with PG's takeover/settle rules; BEGIN takeover
+  applies the BEGIN's characteristics; the read-only gate poisons an
+  open block.
+- `sql/planner.py`: top-level-semicolon segment fallback when a batch
+  fails to parse as one string.
+
+### Binary numeric wire fidelity
+
+Two fixes in the binary `numeric` parameter decoder, both pinned by the
+pgtest `decimal` corpus file (now fully green). A zero encoded with
+thousands of zero digit-groups — CockroachDB's #38139 regression payload
+uses 8192 of them — now renders as `0` instead of `0.000…0`: the decoder
+quantizes to the declared display scale unconditionally, where previously a
+dscale of 0 skipped the quantize and `scaleb` on a zero kept the huge
+negative exponent. And a declared scale outside PostgreSQL's
+NUMERIC_DSCALE_MASK (for example `0xFFF0`, a negative int16 reinterpreted)
+is rejected at Bind with PG's 22P03 `invalid scale in external "numeric"
+value`, instead of silently producing an absurd quantization.
+
+#### Fixed
+- Binary numeric zeros with non-canonical digit-group padding render as `0`.
+- Out-of-range binary numeric dscale raises 22P03 at Bind (was accepted).
+
+### Bind validates its parameter count
+
+A Bind message must supply exactly as many parameters as the prepared
+statement has, and the parameter types the client declared at Parse count
+even when the query text uses fewer placeholders — declaring three and
+binding one now raises PostgreSQL's 08P01 instead of silently executing with
+whatever arrived. COPY keeps its own 08P01 (with PG's statement-summary
+detail) for the same mistake. The pgtest `prepare` corpus file pins both and
+is now green.
+
+#### Fixed
+- Bind accepted a parameter count that disagreed with the prepared
+  statement's.
+
+### citext gets a real wire oid
+
+citext columns and parameters now report oid 90008 — the stable placeholder
+CockroachDB uses for the extension type, mirroring how hstore rides 16935 —
+instead of collapsing into text's oid 25. ParameterDescription infers it for
+INSERT targets and for unknown parameters compared against a citext column
+(citext only: it ships its own operator family, unlike types that resolve
+comparisons through text), RowDescription reports it for citext columns, and
+binary parameter/result formats carry the text bytes. Case-insensitive
+matching is unchanged. The pgtest `citext` corpus file pins the whole
+exchange byte-for-byte and is now green.
+
+#### Changed
+- citext's wire oid: 25 → 90008 (drivers treat the unknown oid as text, so
+  text-mode round-trips are unaffected).
+
+#### Added
+- Binary param/result codecs for citext (raw text bytes).
+- Comparison-against-citext-column parameter inference (oid 90008).
+
+### COMMENT ON DOMAIN / INDEX and obj_description()
+
+Two more COMMENT targets and the lookup function that reads them.
+`COMMENT ON DOMAIN` stores on the domain (surfacing in `pg_description`
+under classoid `pg_type`), `COMMENT ON INDEX` stores by index name
+(resolved to the index relation's oid at read time), and
+`obj_description(oid[, 'catalog'])` / `col_description(oid, attnum)`
+look comments up the way pgjdbc's getUDTs and getIndexInfo do. `IS
+NULL` removes a comment on both new targets.
+
+#### Added
+- `COMMENT ON DOMAIN d IS '…' | NULL` (sqlglot Command fallback path).
+- `COMMENT ON INDEX i IS '…' | NULL` with pg_description reflection.
+- `obj_description` / `col_description` scalar functions.
+
+### COMMENT ON FUNCTION and table row types as column types
+
+`COMMENT ON FUNCTION f(args)` (and the bare-name form) stores the
+comment on the function's catalog entry, and a column may now be
+declared with a table's name as its type — in PostgreSQL every table is
+also a composite row type, so `CREATE TABLE t (col other_table)` stores
+that row shape and supports `(col).field` access. These were the two
+setup blockers behind four pgjdbc DatabaseMetaData/ResultSetMetaData/
+RefCursor test classes whose entire suites died in class setup;
+ResultSetMetaDataTest alone now runs its 60-test matrix.
+
+#### Added
+- `COMMENT ON FUNCTION` (parenthesised and bare-name forms; 42883 for
+  unknown functions, 42725 for ambiguous overloads).
+- Columns typed by a table's row type.
+
+### COPY reaches byte-exact CSV fidelity
+
+COPY's CSV codec now mirrors PostgreSQL's own parser: quoting decides
+NULL-ness (a quoted `"N"` under `NULL 'N'` is the string N, a quoted empty
+field is the empty string, and only unquoted cells match the null token),
+custom `ESCAPE` characters work inside quoted fields, a `\.` line terminates
+the data stream, an unterminated quoted field raises 22P04, and COPY TO CSV
+force-quotes empty strings so they stay distinct from NULL. The legacy
+un-parenthesized option syntax (`CSV NULL 'NS' DELIMITER '|'`) parses
+correctly, ESCAPE and HEADER outside CSV mode raise PG's 0A000, and
+text-format `\xHH` / octal byte escapes decode on COPY FROM. COPY (query)
+TO STDOUT also works through the extended query protocol now — Describe
+answers NoData and Execute streams CopyOutResponse/CopyData/CopyDone — with
+PG's exact error shapes for parameters (COPY takes none: binding any is
+08P01 with the statement-summary detail; an unbound placeholder at Execute
+is 42P02). The pgtest `copy` corpus file (1187 lines) pins all of it and is
+fully green.
+
+#### Added
+- Extended-protocol `COPY (query) TO STDOUT` (Parse/Bind/Describe/Execute).
+- CSV `ESCAPE` character support and `\.` terminator handling.
+- Text-format `\xHH` / `\OOO` byte-escape decoding on COPY FROM.
+- crdb-style inline `INDEX (...)` table elements are accepted (index
+  skipped); `ADD COLUMN ... NOT VISIBLE` parses as a normal column.
+
+#### Fixed
+- Quoted CSV cells equal to the NULL token no longer read back as NULL.
+- COPY TO CSV writes empty strings as `""` (previously indistinguishable
+  from NULL).
+- Legacy COPY option lists (`CSV NULL 'NS' DELIMITER '|'`) no longer
+  mis-parse into default delimiters.
+- ESCAPE/HEADER without CSV raise 0A000 instead of silently entering copy
+  mode (which deadlocked the connection).
+
+### COPY option validation and custom CSV quote characters
+
+COPY now validates its option keywords against PostgreSQL's grammar: an
+unknown keyword (for example CockroachDB's `WITH destination = '…'` upload
+extension) raises PG's 42601 syntax error at parse time, before the target
+table is resolved — previously it fell through to a misleading 42P01. The
+`QUOTE` option is also implemented for real: a custom CSV quote character
+applies to both COPY FROM parsing and COPY TO rendering, is rejected outside
+CSV mode with PG's 0A000, and a multi-character quote raises 22023. The
+pgtest `copy_file_upload` corpus file pins the 42601 shape and is now green.
+
+#### Added
+- `COPY … CSV QUOTE 'x'` — custom quote characters in both directions;
+  `ENCODING`/`FREEZE`/`OIDS` accepted as no-ops.
+
+#### Fixed
+- Unknown COPY option keywords raise 42601 (syntax error), not 42P01.
+
+### DatabaseMetaData catalog gaps: max_index_keys, proargmodes, reltuples, output-alias ORDER BY
+
+Four of DatabaseMetaDataTest's failure clusters, all catalog or planner
+gaps. `pg_settings` now carries `max_index_keys` (32 — pgjdbc reads it
+once per connection and every foreign-key metadata call died without
+it). `pg_proc` gains `proargmodes` / `proallargtypes` (NULL — no OUT
+params recorded) so getFunctionColumns runs. `pg_class` gains
+`reltuples` (−1, PG's "no estimate yet") so getIndexInfo's CARDINALITY
+reads. And ORDER BY naming a computed output alias in a join query —
+pgjdbc's getTables sorts by the CASE-computed `"TABLE_TYPE"` — now
+resolves through the select list like the single-table and grouped
+paths already did, instead of raising 42703.
+
+#### Added
+- `pg_settings.max_index_keys` (32), `pg_proc.proargmodes` /
+  `proallargtypes`, `pg_class.reltuples` (−1).
+
+#### Fixed
+- Evaluated-join ORDER BY resolves computed output aliases and ordinals
+  (`ORDER BY "TABLE_TYPE"`, `ORDER BY 1`) instead of erroring 42703.
+
+### Describe stops executing volatile functions, regclass resolves, and more
+
+The extended protocol's Describe no longer *executes* volatile functions
+to learn a statement's shape: `Describe select pg_sleep(5)` actually
+slept (and a CancelRequest arriving mid-sleep was swallowed into a
+NoData reply while Execute later emitted a DataRow — the protocol
+violation JDBC's `setQueryTimeout` crashed on), and a Describe of
+`nextval(...)` drew a sequence value. Known volatile session functions
+now describe from a static type table, cancellation interrupts Execute
+where it belongs, and the sequence is untouched until execution.
+
+`'name'::regclass` resolves to the relation's pg_class oid — including
+schema-qualified spellings and search_path resolution for bare names —
+while still rendering as the relation name, so metadata queries joining
+`c.oid = ?::regclass` work (pgjdbc's SearchPathLookupTest). Slash-format
+timestamp input (`'8/10/7777'`) parses per the session's DateStyle field
+order (MDY/DMY), `array_fill(value, ARRAY[dims])` lands, and geometric
+results (point, lseg, box, path, polygon, line, circle) have binary-mode
+encoders, completing pgjdbc's binary PGpoint/PGbox round-trips.
+
+#### Added
+- `regclass` casts resolve names to pg_class oids (42P01 when unknown);
+  `regtype` casts resolve base types and table row types to pg_type oids,
+  with search_path resolution and bare-typname rowtype rows in pg_type.
+- Slash-format DateStyle-aware timestamp input.
+- `array_fill` (value + dimensions form).
+- Binary result encoders for the seven geometric types.
+
+#### Fixed
+- Describe evaluates no volatile function (pg_sleep, nextval, setval,
+  set_config, lo_*, advisory locks); cancels land in Execute with 57014.
+
+### Enum casts describe like PostgreSQL's
+
+An unaliased cast to a user-defined type now names its output column after
+the type — `SELECT 'hi'::te` yields a column named `te`, matching PG's rule
+for enums, composites, and domains — and RowDescription reports
+DataTypeSize 4 for enum-typed columns, mirroring how PostgreSQL stores enum
+values as 4-byte oids. The pgtest `enum` corpus file pins both shapes and
+is now green.
+
+#### Fixed
+- `SELECT 'x'::myenum` reported `?column?` with size -1; now the type name
+  with typlen 4.
+
+### Constraint violations carry PG's error-identity fields, and EXCLUDE lands
+
+Every constraint violation the SQL engine raises now attaches the
+ErrorResponse identity fields real PostgreSQL sends — schema, table,
+column, constraint, and datatype — which drivers surface through
+psycopg's `diag` and pgjdbc's `ServerErrorMessage`. Duplicate keys name
+the violated constraint (the declared PK name, not a synthesized one),
+NOT NULL violations name the column, domain CHECK failures name the
+domain and its check constraint, and foreign-key violations name the
+referencing table. pgjdbc's ServerErrorTest — which asserts exactly
+these fields for six violation kinds — passes in full.
+
+`EXCLUDE (col WITH =, ...)` table constraints are supported in their
+equality-only form: enforcement is a unique index under the hood, but a
+conflict raises PostgreSQL's `23P01 exclusion_violation` with the
+`<table>_<col>_excl` constraint name. Non-equality exclusion operators
+(the GiST range forms) keep the honest "not supported" error.
+
+#### Added
+- ErrorResponse diagnostic fields (s/t/c/n/d) on unique, not-null,
+  check, domain-check, foreign-key, and exclusion violations.
+- Equality-only `EXCLUDE` table constraints, violating with 23P01.
+
+#### Fixed
+- Duplicate-key errors name the violated constraint instead of the
+  table; schema-qualified tables report schema and bare name separately.
+
+### EXECUTE portals describe their underlying statement
+
+Describing a portal bound to a wire-parsed `EXECUTE name(args)` — the
+SQL-level PREPARE/EXECUTE flow driven through the extended protocol — now
+resolves the underlying prepared statement and reports its result shape: a
+prepared SELECT answers with its RowDescription instead of NoData, so
+clients no longer receive DataRows without a preceding row description. The
+pgtest `execute` corpus file pins the exchange and is now green.
+
+#### Fixed
+- `Describe(P)` of an `EXECUTE` portal returned NoData for row-returning
+  prepared statements.
+
+### Set-returning functions in the SELECT list, and search_path-aware visibility
+
+`information_schema._pg_expandarray` now works in the SELECT list — bare
+(a composite `(x, n)` column, one output row per array element) and with
+immediate field access (`(SRF(arr)).n`), with multiple references to the
+same call expanding in lockstep and empty arrays eliminating the row,
+as PostgreSQL does. Composite field access `(col).x` also lowers inside
+JOIN ON conditions. Together these are the exact call sites pgjdbc's
+`DatabaseMetaData.getPrimaryKeys` / `getPrimaryUniqueKeys` queries emit,
+which back JDBC updatable ResultSets.
+
+`pg_table_is_visible()` now honours the session's `search_path` instead
+of a hardcoded default-namespace list — `SET search_path TO schema1`
+previously made every user-schema relation invisible to the predicate,
+so a same-named table in two schemas could not be disambiguated (the
+pgjdbc updatable-resultset probe hit exactly this). The function also
+works as a projected value in any expression context, alongside
+`current_database()` / `current_schema()`.
+
+#### Added
+- Record SRFs in the SELECT list (`_pg_expandarray`), FROM-ful and
+  FROM-less, with lockstep multi-reference expansion.
+- `(col).field` composite access in JOIN ON.
+- `current_database()` / `current_catalog` / `current_schema` /
+  `pg_table_is_visible()` in per-row expression contexts.
+
+#### Fixed
+- `pg_table_is_visible` WHERE lowering follows the session search_path
+  (was a hardcoded public/pg_catalog list).
+
+### Foreign-key metadata: conindid, referential-action codes, and a 3x faster $unwind
+
+pgjdbc's getImportedKeys/getExportedKeys/getCrossReference returned
+zero rows: a foreign key's `pg_constraint.conindid` was 0, and the
+metadata query joins `pkic.oid = con.conindid` to name the referenced
+PK index — the join silently emptied every FK result. FK rows now point
+conindid at the referenced table's PK index and carry the one-letter
+`confupdtype` / `confdeltype` referential-action codes (CASCADE 'c',
+SET NULL 'n', SET DEFAULT 'd', RESTRICT 'r', NO ACTION 'a').
+
+The same query exposed an aggregation hot spot: `$unwind` deepcopied
+every fanned-out doc, dominating high-fanout join pipelines (the FK
+query is a 9-way join). When no stage in the pipeline (including nested
+$lookup/$facet/$unionWith sub-pipelines) mutates docs in place, unwind
+now fans out with shallow top-level copies — every writing stage
+deepcopies its input first, so shared subtrees are never corrupted.
+~3x on the FK metadata query; benefits MongoDB-side aggregations with
+the same shape.
+
+#### Fixed
+- `pg_constraint.conindid` on FK rows (was 0); new `confupdtype` /
+  `confdeltype` columns.
+- `$unwind` shallow fast path gated on pipeline mutation analysis
+  ($fill / $densify anywhere in the pipeline keep the deepcopy path).
+
+### Single-precision float fidelity
+
+float4 values now behave like PostgreSQL's: a cast to float4 narrows the
+value to single precision, and its text form is the shortest decimal that
+round-trips at that precision — `(1/3.0)::float4` prints `0.33333334`, in
+arrays too — while float8 keeps the full double form. The
+`extra_float_digits` GUC's negative range now works for both widths
+(`%.{15+n}g` / `%.{6+n}g`, as PG renders when shortest-output is turned
+down), which also uncovered that `SET` silently dropped the minus sign from
+negative values. Bare `ARRAY[…]` and `ROW(…)` constructors now name their
+output columns `array` and `row` like PG. The pgtest `float` corpus file
+pins all of it and is now green.
+
+#### Fixed
+- float4 rendered at double precision (`0.3333333333333333` instead of
+  `0.33333334`).
+- `SET guc = -1` stored `1` — the sign vanished in value extraction.
+- Unaliased ARRAY/ROW constructor columns were named `?column?`.
+
+### Binary inet parameters reject malformed payloads like PostgreSQL
+
+A malformed binary `inet` parameter now raises PostgreSQL's error classes
+instead of leaking an internal XX000: a truncated header is 08P01
+(insufficient data), and a bad address family or address length is 22P03
+(invalid binary representation), matching `inet_recv`. The pgtest `inet`
+corpus file pins all four shapes and is now green.
+
+#### Fixed
+- Empty / truncated / bad-family binary inet parameters surfaced XX000.
+
+### Binary int2vector results encode as int2 arrays
+
+Requesting an `int2vector` column (pg_index's indkey/indoption) in binary
+result format now yields PostgreSQL's wire form — an int2 array with
+element oid 21, 2-byte elements, and lower bound 1 — where previously the
+text rendering leaked through the binary format. Binary pgwire clients
+decoding index metadata get well-formed arrays. The pgtest `int2vector`
+corpus file pins the encoding byte-for-byte (its expected indoption VALUE
+is CockroachDB's NULLS-FIRST 2 where PostgreSQL — and SecantusDB — report
+0; recorded as an expected divergence).
+
+#### Fixed
+- Binary-format int2vector results carried text bytes.
+
+### PG's internal one-byte "char" type
+
+The quoted `"char"` spelling now names PostgreSQL's internal one-byte type
+(oid 18, typlen 1) instead of collapsing into `char(n)`/text: casts report a
+column named `char` with oid 18, table columns declared `"char"` describe and
+bind parameters with oid 18, input values truncate to one character, an
+empty string or zero byte stores SQL NULL, `0::"char"` produces the zero
+byte (rendered as one `0x00` byte in binary result format), and binary
+parameter/result codecs carry the raw byte. sqlglot loses the quoting — the
+quoted and unquoted spellings both parse as plain CHAR — so the planner
+rewrites the quoted form to an internal sentinel type name before parse,
+token-context aware: it fires after `::`, after `AS` only inside `CAST(...)`,
+and in a CREATE/ALTER column-type position, never on aliases, column names,
+or string literals. The pgtest `char` corpus file pins the whole surface
+byte-for-byte (its one remaining stanza expects CockroachDB's deterministic
+TableOID and cannot pass against any non-crdb server; recorded as an
+expected divergence).
+
+#### Added
+- `"char"` (quoted, oid 18) as a first-class column and cast type: 1-char
+  truncation, NULL for empty/zero-byte input, `int::"char"` as chr(i) with
+  22003 out-of-range, binary param/result wire codecs, typlen 1 in
+  RowDescription.
+
+#### Fixed
+- `SELECT 'a'::"char"` reported oid 25 with a `bpchar` column name; it now
+  reports oid 18, size 1, named `char` (pgtest `char:42`).
+
+### The jsonpath type
+
+`::jsonpath` casts now produce a real jsonpath value: oid 4072 on the wire,
+PostgreSQL's canonical text form (`$.abc` renders `$."abc"`, subscripts and
+filters re-render canonically), a 42601 syntax error on an empty path, and
+the binary format PostgreSQL sends — a version byte followed by the
+canonical text. `jsonb_path_query` accepts a string first argument by
+coercing it to jsonb like PG's implicit cast, and unaliased function-call
+output columns are now named after the function (`SELECT jsonb_path_query(…)`
+yields a column named `jsonb_path_query`, PG's rule) instead of `?column?`.
+The pgtest `jsonpath` corpus file pins everything except its two binary
+stanzas, which expect CockroachDB's single-quoted binary wrapping where
+PostgreSQL (and SecantusDB) send the unquoted text — recorded as an
+expected divergence.
+
+#### Added
+- The `jsonpath` type: canonical text rendering, oid 4072, binary codec.
+
+#### Fixed
+- `jsonb_path_query('{"a": true}', '$.a')` returned NULL — the string
+  document never coerced to jsonb.
+- Unaliased function-call columns were named `?column?`.
+
+### The ltree type
+
+`ltree` columns and casts now work: stored as a validated dotted label path
+(alphanumeric/underscore labels), reported on the wire at oid 90010 — the
+stable placeholder CockroachDB uses for the extension type, mirroring
+citext's 90008 — with ParameterDescription inference for INSERT targets and
+for unknown parameters compared against an ltree column, and the binary
+parameter/result format PostgreSQL's extension uses (a version byte
+followed by the text). The pgtest `ltree` corpus file pins the whole
+exchange byte-for-byte and is now green.
+
+#### Added
+- The `ltree` type: text storage with label validation, oid 90010, binary
+  codec, parameter inference.
+
+### Multidimensional arrays keep their base type; JSON[] keeps oid 199
+
+Two array-typing fixes from the pgtest corpus. A nested array
+constructor (`ARRAY[ARRAY[1], ARRAY[2]]`) typed as `text[]` — its
+binary wire form carried text elements where PG uses ONE array oid per
+element type regardless of dimensionality, so clients read integer
+arrays as strings. The tag inference now recurses into nested
+constructors, and the multidimensional binary encoding carries the
+element type's oid and binary cells.
+
+And `::JSON[]` now keeps the plain-json array identity end-to-end —
+parameter descriptions and row descriptions report oid 199 (not
+jsonb-array's 3807), and the binary array header carries element oid
+114 — extending the earlier scalar `::json` → 114 rule to arrays. The
+one remaining `json_array` corpus divergence (a hand-spaced json
+element re-rendering compact where PG echoes the client's text
+verbatim) is the documented parsed-storage tradeoff, now recorded as an
+expected divergence in the gauge.
+
+#### Fixed
+
+- `sql/planner.py`: nested array constructors type as their base array
+  type; `$1::JSON` / `$1::JSON[]` parameter inference keeps the
+  plain-json oids.
+- `sql/typemap.py`: `cast_type_identity` reports 199 for `::JSON[]`.
+- `pgtest_validation/include_paths.py`: `json_array` recorded as an
+  expected divergence (verbatim-json, deliberate).
+
+### Multi-name DROP TABLE and Bind format-code validation
+
+`DROP TABLE a, b, c` now behaves as the single statement it is in
+PostgreSQL: one CommandComplete tag instead of one per table, and — without
+IF EXISTS — every name must resolve before anything is dropped, so a
+missing table aborts the whole statement with 42P01 and leaves the others
+intact. Separately, Bind now rejects parameter/result format codes other
+than 0 (text) and 1 (binary) with PG's 08P01 protocol violation before
+BindComplete. Both shapes are pinned by the pgtest `errors` corpus file,
+now green (its foreign-key ConstraintName error-field expectations already
+passed unchanged).
+
+#### Fixed
+- Multi-name DROP TABLE emitted one tag per table and dropped
+  left-to-right before failing on a missing name.
+- Invalid Bind format codes were silently accepted.
+
+### Nested BEGIN warns like PostgreSQL
+
+Issuing BEGIN inside an already-open transaction block now completes with
+the BEGIN tag while emitting PostgreSQL's exact warning — a NoticeResponse
+with severity WARNING, SQLSTATE 25001, "there is already a transaction in
+progress", and PG's source-identity fields (File xact.c, Routine
+BeginTransactionBlock) — and the open block survives untouched. The notice
+plumbing gained optional sqlstate/file/routine fields along the way. The
+pgtest `implicit_txn` corpus file reads the warning's fields byte-for-byte
+and is now green.
+
+#### Fixed
+- A nested BEGIN in an explicit block completed silently, with no warning.
+
+### Reply-shape fidelity: repeated ?column?, array-cast names, int4 series
+
+Three small divergences that pgx's byte-exact network-usage test caught
+in one reply:
+
+Real PostgreSQL repeats duplicate output column names verbatim —
+`select 'a', 'b'` describes as `?column?, ?column?` — where we suffixed
+them (`?column?_2`). The evaluated-select path now keeps PG's names
+(its row extraction is positional, so uniquifying was never
+load-bearing there). An unaliased array cast is named after its ELEMENT
+typname, like PG (`'{a}'::text[]` yields a column named `text`). And
+`generate_series` with int4-range bounds now yields int4 rows (oid 23,
+4-byte binary cells) instead of int8, matching PG's overload selection
+— with describe-time (unbound parameter) and execute-time typing
+agreeing, so a RowDescription never claims int8 over int4 cells.
+
+#### Fixed
+
+- `sql/planner.py`: the evaluated-select path stops uniquifying display
+  names; `_cast_output_name` names array casts after the element type.
+- `sql/srf.py`: `generate_series` types int4 for int32-range bounds
+  (int8 otherwise), consistently between Describe and Execute.
+
+### Malformed parameters get proper SQLSTATEs, never internal errors
+
+Two parameter-decode crashes surfaced by the pgtest byte-exact corpus:
+a binary array parameter with a structurally-bogus header (bad element
+oid, missing element data) and an empty-string text parameter cast to
+an array type (`''::JSON[]`) both escaped as internal `XX000` errors. A
+malformed parameter is client input, and PG classifies it precisely:
+truncated binary data is `08P01` (insufficient data left in message),
+and a bad array literal is `22P02` (malformed array literal). Both
+paths now raise the right SQLSTATE through the normal error machinery.
+
+#### Fixed
+
+- `sql/pgextended.py`: structurally-invalid binary array parameters
+  raise `08P01` instead of an internal error.
+- `sql/scalar.py`: a malformed array-literal cast raises `22P02`
+  instead of an internal error.
+- `sql/pgwire.py`: the test-side `build_bind` helper accepts binary
+  parameter format codes.
+
+### GUC reporting matches PostgreSQL
+
+ParameterStatus messages now follow the command's CommandComplete (both the
+simple and extended protocol paths) rather than preceding it, and the values
+themselves are reported the way PostgreSQL reports them: a numeric
+`SET TIME ZONE` becomes a POSIX zone spec (`+6` → `<+06>-06`, `-11.5` →
+`<-11:30>+11:30`), DateStyle always reads `<style>, <order>` no matter which
+order it was written in, and IntervalStyle lowercases. IntervalStyle and
+is_superuser are now reported GUCs, so a role switch tells the client its
+superuser status changed — once, on a real change. Transaction-scoped
+reverts report too: savepoints snapshot GUC state so ROLLBACK TO SAVEPOINT
+restores and re-reports whatever changed after it, an error that aborts a
+block reverts its SET LOCALs immediately (with the reports alongside the
+error, as PG sends them), and every unwind list is ordered
+case-insensitively by name. `SET LOCAL TIME ZONE` also honours LOCAL scope
+instead of leaking past the transaction. The pgtest `param_status` corpus
+file pins all of this and is now green.
+
+#### Added
+- IntervalStyle and is_superuser as reported GUCs; savepoint-scoped GUC
+  snapshots.
+
+#### Fixed
+- ParameterStatus was sent before CommandComplete.
+- Numeric time-zone offsets were echoed verbatim instead of as POSIX specs.
+- DateStyle echoed the written component order.
+- `SET LOCAL TIME ZONE` persisted past the transaction.
+
+### Parameter typing follows PostgreSQL's parse analysis
+
+Prepared-statement parameters now take their types the way PostgreSQL's parse
+analysis assigns them. A parameter compared or assigned against a column gets
+that column's type — `UPDATE t SET ts = $1 WHERE id = $2` describes as
+timestamptz and uuid rather than text — where previously only citext and ltree
+columns did this. Conflicting uses are rejected instead of silently
+succeeding: because a parameter has exactly one type, `SELECT lower($1), $1::int`
+raises 42883 (no `lower(integer)`), a gap in the numbering (`SELECT $2 > 0`,
+with no `$1`) raises 42P18, and a bare parameter as a CASE's only result
+raises 42P18 too — while a CASE with a typed sibling branch still resolves.
+Unaliased column names also follow PG's `FigureColname` precedence: a cast
+takes its operand's name when it has one (`n::int4` is `n`), falling back to
+the type name only for nameless operands (`2::int8` is `int8`). The pgtest
+`parameter_description` corpus file pins all of it and is now green.
+
+#### Added
+- Column-derived parameter types for assignments and comparisons.
+- 42883 / 42P18 rejections for unresolvable parameter typings.
+
+#### Fixed
+- A cast of a column reported the type name instead of the column name.
+
+### getCatalogs lists the postgres maintenance database
+
+`pg_database` now reports the connected database plus `postgres` — the
+maintenance database every real PG cluster carries and the one JDBC
+clients enumerate through. pgjdbc's `getCatalogs` asserts both are
+present and sorted. MongoDB-wire namespace names (e.g. `local`) are
+deliberately kept out of the PG catalog — a PG client must never see
+them as a connectable catalog.
+
+#### Fixed
+- `pg_database` / `getCatalogs` includes `postgres` (deduped when the
+  connection is already to `postgres`).
+
+### DatabaseMetaDataTest setup unblocked: pg_description DML, operator DDL, PK USING INDEX
+
+`pg_description` now carries COMMENT ON FUNCTION rows (classoid
+`pg_proc`), `'name'::regproc` resolves a user function to its pg_proc
+oid (still rendering as the bare name), and UPDATE / DELETE statements
+targeting `pg_description` work — persisted as a delta over the derived
+comment rows. Real Postgres lets a superuser edit the catalog directly;
+pgjdbc's DatabaseMetaDataTest setup does exactly that (moving a function
+comment onto a table's oid to prove the metadata queries' classoid
+guards), and the whole ~90-test class aborted at setup without it. The
+same setup also needed `CREATE OPERATOR` / `DROP OPERATOR` (registered
+DDL; expression evaluation doesn't consult user operators) and
+`ALTER TABLE … ADD PRIMARY KEY USING INDEX` (promotes an existing
+unique index to the primary key, taking the index's name).
+
+#### Added
+- Function-comment rows in `pg_description` (objoid = pg_proc oid,
+  classoid 1255).
+- `'name'::regproc` resolves unique user functions to their minted oid,
+  comparing equal to both the oid and the name.
+- UPDATE / DELETE against `pg_description` (suppress + re-emit delta,
+  persisted per database, savepoint-aware via the catalog snapshot set).
+- `CREATE OPERATOR name (LEFTARG = …, RIGHTARG = …, PROCEDURE = …)` and
+  `DROP OPERATOR [IF EXISTS] name (left, right)`.
+- `ALTER TABLE … ADD PRIMARY KEY USING INDEX idx` — validates the index
+  is unique, re-keys rows, reflects the PK constraint under the index's
+  name in `pg_constraint`.
+- Array-of-composite columns (`custom[]`) — stored as subdocument lists,
+  reporting the composite's minted array-companion oid.
+
+#### Fixed
+- OUT-only parameters no longer count toward a function's signature:
+  `f3(IN a int, INOUT b varchar, OUT c timestamptz)` is `f3(int,
+  varchar)` to DROP FUNCTION and callers, matching PG's identity rule.
+
+### pg_get_keywords(), aggregates over SRF row sources, and <> ALL(array)
+
+`pg_get_keywords()` joins the SRF family (word / catcode / barelabel /
+catdesc / baredesc; ~100 PG-specific keywords incl. `reindex`), the
+record-SRF machinery now handles any column count (it assumed two), and
+aggregates over an SRF row source work — `SELECT string_agg(word, ',')
+FROM pg_get_keywords()` is pgjdbc's getSQLKeywords query, previously
+"not supported in this context". The planner rewrites an
+aggregate-over-SRF select into the derived-subquery shape the pipeline
+already handles; scalar subqueries whose FROM is an SRF route through
+the engine the way ordered/grouped subqueries do; `x <> ALL(array)` /
+`= ALL(array)` evaluate in scalar contexts; and a function-wrapped
+`string_agg` (`decode(string_agg(…), 'hex')`) registers like the plain
+form instead of erroring.
+
+#### Added
+- `pg_get_keywords()` SRF; `= ALL` / `<> ALL` over array values.
+
+#### Fixed
+- Aggregates over `FROM generate_series(…)` / other SRF sources
+  (previously only `count(*)` worked).
+- Scalar subqueries with an SRF FROM (`(SELECT string_agg(…) FROM
+  generate_series(…))`).
+- Function-wrapped `string_agg` in the computed-projection paths.
+- Record SRFs with more than two columns.
+
+### LISTEN connections no longer desync on a fragmented client write
+
+A connection holding an active `LISTEN` waits for its next command in short
+0.25-second slices so queued notifications flush promptly. That wait was a
+socket read *timeout*, which could fire in the middle of reading a frame —
+after the type byte or partway through the length or payload — and the bytes
+already read were silently discarded. The next read then re-synchronized on
+the wrong byte offset and misread the rest of the stream, so a legitimate but
+slightly slow or fragmented client write (ordinary network jitter, not just a
+malicious client) got the connection dropped with a spurious protocol error.
+
+The idle-poll wait now uses `select` to wait for readability and only reads a
+complete frame once the socket has data, with a blocking recv — so a poll
+wakeup can never truncate a frame. A frame whose tail is delayed simply blocks
+the recv until it arrives, exactly as the non-listening default path already
+did. Async NOTIFY delivery to an idle listener is unchanged.
+
+#### Fixed
+
+- A `LISTEN`-holding connection could desync its PostgreSQL wire stream when a
+  frame's bytes straddled the 0.25s notification-poll window, dropping the
+  connection on ordinary network jitter (#882). The poll now waits with
+  `select` and reads whole frames only.
+
+### plpgsql refcursors: OPEN … FOR, CLOSE, and FETCH by portal name
+
+plpgsql functions can now declare `refcursor` variables, bind them with
+`OPEN <cursor> FOR <query>`, `CLOSE` them, and return them. An OPEN
+materializes the query into a session cursor named like PG's unnamed
+portals (`<unnamed portal N>`); the returned name is typed `refcursor`
+(oid 1790) on the wire, which is what tells a driver to fetch the
+result set with `FETCH ALL IN "<name>"` — the exact round-trip pgjdbc's
+CallableStatement performs for `{? = call f()}` on a
+refcursor-returning function. FETCH/MOVE now also accept quoted cursor
+names containing spaces, which the unnamed-portal naming requires.
+
+#### Added
+- plpgsql `OPEN <cursor> FOR <query>` and `CLOSE <cursor>` statements;
+  `refcursor` declarations and returns (the `OPEN … FOR EXECUTE` form
+  stays unsupported).
+- The `refcursor` type (oid 1790) in result descriptors.
+
+#### Fixed
+- `FETCH`/`MOVE` with a double-quoted cursor name containing spaces no
+  longer truncates the name at the last space.
+
+### PostgreSQL portal semantics
+
+Named portals now behave like PostgreSQL's: re-binding a portal name that is
+still live inside the same explicit transaction raises 42P03 "portal already
+exists" (the unnamed portal keeps its silent replace), portals are destroyed
+at transaction end — a suspended portal resumed after its implicit
+transaction settled at Sync answers 34000 — and DROP TABLE refuses with
+55006 while an undrained portal in the session still reads the table,
+poisoning the block. Interleaved suspended portals (multiple active portals
+draining alternately under MaxRows) work across the board. Nine of the
+pgtest `multiple_active_portals` subtests pin these shapes; the file's
+remaining subtests need row-lazy portal execution (tracked in the backlog).
+
+#### Fixed
+- Re-binding a live named portal silently replaced it.
+- Suspended portals survived transaction end.
+- DROP TABLE succeeded under active portals reading the table.
+
+### Portal Execute suspension and row counts
+
+An Execute that delivers exactly its MaxRows now always answers
+PortalSuspended, even when the portal happens to be exhausted — PostgreSQL
+cannot know it reached the end until a later Execute fetches past the last
+row, and clients that loop until CommandComplete depend on that. Each
+Execute's CommandComplete also reports the number of rows *that* Execute
+returned rather than the portal's running total, so the final drained
+Execute reports `SELECT 0`. The pgtest `portals` corpus file exercises 1182
+of its 1550 lines against this (it stops at a stanza that pins
+CockroachDB's CHECK-violation message text where we emit PostgreSQL's;
+recorded as an expected divergence).
+
+#### Fixed
+- An Execute delivering exactly MaxRows sent CommandComplete instead of
+  PortalSuspended when no rows remained.
+- Portal CommandComplete counted the portal's total rows, not the rows the
+  Execute delivered.
+
+### PyO3 bindings on 0.29, clearing two RUSTSEC advisories
+
+The three PyO3 binding crates (`secantus-core-py`, `secantus-server-py`,
+`secantus-storage-py`) move from PyO3 0.22 to 0.29, clearing
+RUSTSEC-2025-0020 (buffer overflow in `PyString::from_object`, fixed
+≥0.24.1) and RUSTSEC-2026-0177 (missing `Sync` bound on
+`PyCFunction::new_closure`, fixed ≥0.29.0). Neither vulnerable API was
+called anywhere in the tree, so this was dependency-currency debt rather
+than a reachable vector — but it retires the two advisories the
+`cargo audit` CI gate had been baselining, so the gate now runs with an
+empty ignore list and fails on any newly disclosed advisory.
+
+Because the bindings were already written against PyO3's `Bound<'py, T>`
+smart-pointer API, the migration was mechanical: the deprecated
+`PyBytes::new_bound` / `get_type_bound` methods drop their `_bound` suffix
+and `Python::allow_threads` becomes `Python::detach` (0.29's attach/detach
+terminology). The `_secantus_core` engine bindings stay byte-for-byte
+identical to pure Python — the full parity corpus (1705 cases) passes
+unchanged.
+
+#### Changed
+
+- PyO3 bumped 0.22 → 0.29 across the three binding crates; `cargo audit`'s
+  `--ignore RUSTSEC-2025-0020 --ignore RUSTSEC-2026-0177` entries removed
+  (#584).
+
+#### Security
+
+- Cleared RUSTSEC-2025-0020 and RUSTSEC-2026-0177 (both in PyO3 <0.29).
+
+### Worker-death root cause: a silently overwritten pytestmark
+
+The remaining xdist worker deaths ("Not properly terminated", killing
+the whole suite) traced to a Python footgun: `tests/test_rust_binary_
+pitr.py` assigned `pytestmark` twice, and the second assignment (the
+binary-availability skipif) silently discarded the first — the
+`timeout(1200, method="signal")` mark added by the original worker-
+death fix. The file's disk-bound PITR tests therefore still ran under
+the global 600s thread-method timeout, whose expiry `os._exit`s the
+worker mid-test: no signal trace (nothing catchable is delivered), no
+faulthandler dump, just a dead worker. Diagnosed with the env-gated
+signal tracer on a quiet machine after co-load theories were falsified.
+The marks now live in one combined list, and a meta-test walks every
+test module's AST rejecting double `pytestmark` assignment.
+
+#### Fixed
+- `test_rust_binary_pitr.py`: both marks (signal-method 1200s timeout +
+  skipif) applied via a single `pytestmark` list.
+- New `tests/test_meta_pytestmark.py` guard against the overwrite
+  pattern anywhere in the suite.
+- `test_rust_binary_pitr.py` tests now schedule on a single xdist worker
+  (`xdist_group`), so the machine-wide serialization flock never
+  contends within one suite — cross-worker queuing on it starved tests
+  to the fixture's 480s deadline under full-suite disk contention.
+
+### Aggregation pipelines can no longer sidestep RBAC
+
+With access control enabled, aggregate's privilege check covered only
+the primary collection — a principal holding nothing but `find` on one
+collection could overwrite any namespace in any database via `$out` or
+`$merge`, and read foreign namespaces via the `$lookup` family, with no
+grant on the target. Both servers now resolve a pipeline's
+secondary-namespace requirements before execution, the same model
+mongod uses: `$out` demands insert+remove on its target, `$merge`
+insert+update, and `$lookup` / `$graphLookup` / `$unionWith` demand
+find — with sub-pipelines and `$facet` branches walked recursively.
+An unauthorized stage is rejected with `Unauthorized` (13) before the
+pipeline touches anything.
+
+`configureFailPoint` — a server-wide fault-injection lever that could
+close every client's connection — previously required no privilege at
+all under `--auth`. It now demands a cluster-admin grant on both
+servers, mirroring mongod's rule that test commands require a
+privileged role.
+
+#### Security
+
+- aggregate `$out`/`$merge` could write to (drop and replace) any
+  namespace, and `$lookup`/`$graphLookup`/`$unionWith` could read any
+  same-db namespace, with only a `find` grant on the primary collection
+  (#783). Both servers now check per-stage privileges pre-execution.
+- `configureFailPoint` was missing from both servers' RBAC action
+  tables, so any authenticated principal — even one with zero roles —
+  could arm a server-wide DoS failpoint (#806). It now requires a
+  cluster-admin grant (`clusterAdmin` or `root`).
+
+### reg* pseudo-types on the wire
+
+The registry pseudo-types — regclass, regtype, regproc, regprocedure,
+regnamespace, regrole — now use PostgreSQL's oid wire representation: a
+4-byte unsigned integer in binary format, and DataTypeSize 4 in
+RowDescription. Previously a binary parameter of one of these types passed
+its raw bytes through untouched, so a client sending the standard 4-byte
+form got the bytes back instead of the numeric value. A payload of any
+other length is rejected with 08P01, matching PG's `oidrecv`. The pgtest
+`oid` corpus file pins all of it and is now green.
+
+#### Fixed
+- Binary reg* / oid parameters echoed raw bytes instead of decoding.
+- reg* columns reported variable width instead of typlen 4.
+
+### Regclass parameter oids and bind-time portal snapshots
+
+A `$1::REGCLASS` parameter (and the other reg-pseudotype casts — regtype,
+regproc, regprocedure, regnamespace, regrole, oid) now describes with its
+real oid (2205 for regclass) in ParameterDescription instead of falling
+through to text. And a portal bound inside an explicit transaction block now
+captures its results at Bind, matching PG's portal-snapshot semantics: a
+later same-transaction DDL statement (for example `ALTER TABLE … RENAME`)
+no longer changes what a held portal returns at Execute. Execution errors
+still surface at Execute, after BindComplete, and cached-plan revalidation
+still raises 0A000 at Execute. Both shapes are pinned byte-for-byte by the
+pgtest `bind_and_resolve` corpus file, now fully green.
+
+#### Fixed
+- `$1::REGCLASS` and sibling reg-pseudotype casts report their parameter
+  oids in ParameterDescription (pgtest `bind_and_resolve:29`).
+- Portals bound inside an explicit transaction execute eagerly at Bind
+  (read-only SELECTs only), so later same-transaction DDL is invisible to
+  the held portal (pgtest `bind_and_resolve:132`).
+
+### BEFORE INSERT row triggers, with plpgsql NEW records
+
+`CREATE TRIGGER … BEFORE INSERT ON t FOR EACH ROW EXECUTE PROCEDURE fn()`
+now works end-to-end: a plpgsql `RETURNS trigger` function receives the
+row as its `NEW` record, may read fields (`new.t`), assign them
+(`new.ts := to_tsvector(new.t)`), and `RETURN NEW` — or `RETURN NULL` to
+skip the row, exactly PG's BEFORE-trigger semantics. Triggers fire on
+every insert path (INSERT and COPY FROM), die with their table, and
+`pg_temp.`-qualified trigger functions resolve to the session's private
+namespace. This is the tsvector-maintenance shape pgx's COPY test
+exercises — the last stable failure in the pgconn package.
+
+Every other trigger shape — AFTER, UPDATE/DELETE events,
+statement-level — stays faithfully rejected rather than
+stored-and-never-fired. In support: `RETURNS trigger` parses (sqlglot
+rejects the bare pseudo-type; the planner quotes it pre-parse), and
+`to_tsvector` now refuses words longer than 2046 characters like real
+PG, so a 10 kB token yields an empty tsvector instead of a giant lexeme.
+
+#### Added
+
+- `sql/engine.py` / `sql/catalog.py`: CREATE TRIGGER (BEFORE INSERT ROW)
+  with catalog storage, function validation (42P17 for non-trigger
+  functions, 42710 duplicates), and trigger-drops-with-table.
+- `sql/plpgsql.py`: record-field assignment (`new.f := …`), qualified
+  record reads (`new.f`), and `invoke_trigger` with PG's
+  NEW/NULL-return semantics.
+- `sql/executor.py`: BEFORE INSERT row triggers fire over every planned
+  row in the shared insert path (INSERT and COPY).
+
+#### Fixed
+
+- `sql/fts.py`: lexemes longer than 2046 characters are not indexed,
+  like real PG.
+
+### ResultSetMetaData fidelity: STRUCT oids, base columns, declared typmods
+
+Three metadata gaps JDBC's ResultSetMetaData surfaces. A column typed by
+a table's row type describes with the table's rowtype oid (typtype 'c' —
+drivers map it to `Types.STRUCT`; the generic RECORD oid mapped to
+OTHER). Bare-column outputs carry their source table oid and attnum even
+when the SELECT list mixes in computed expressions, and an aliased
+column resolves to its base column — `getBaseColumnName` works. Declared
+type identities ride the descriptors: `varchar(n)` reports its real oid
+and length typmod (display size), `timestamp(p)` its precision,
+`numeric(p,s)` its packed precision/scale.
+
+#### Fixed
+- Table-rowtype columns: rowtype oid (typtype 'c'), not RECORD/2249.
+- Base-column table_oid/attnum on evaluated (computed-projection)
+  selects; aliases resolve to their source column.
+- varchar/bpchar report their declared oid + typmod; timestamp(p) and
+  numeric(p,s) typmods flow to RowDescription.
+- Extended-protocol Describe (PreparedStatement.getMetaData) reports the
+  same base-column identity and typmods as execution — the pipeline
+  Describe path sent 0/0/-1, so prepared-statement metadata lost what
+  the simple protocol carried.
+
+### Rust storage: bounded async-oplog buffers and poison-tolerant oplog locks
+
+Two defence-in-depth fixes to the Rust storage engine's oplog path.
+
+In async-oplog mode a multi-document transaction buffers every statement's
+oplog entry — and, when pre-images are enabled, the pre-image bytes — on
+the transaction handle for its whole lifetime. The entry bytes were already
+charged to the transaction dirty budget (so an oversized transaction trips
+`TransactionTooLargeForCache`), but the pre-image bytes were not, leaving
+that half of the buffer able to grow unbounded within the 60-second
+transaction-lifetime window. Pre-image bytes are now charged to the same
+budget, so the whole buffer is bounded.
+
+Two `self.oplog.lock().unwrap()` sites in the oplog-prune path used the
+non-poison-tolerant form that the rest of the codebase had been swept clear
+of — a panic while that lock was held would have permanently poisoned the
+single mutex every write's oplog emission (and therefore change streams)
+depends on. Both now use the poison-tolerant `unwrap_or_else(|e|
+e.into_inner())`, and a source-scanning test guards `crates/secantus-storage`
+and `crates/secantus-commands` against the pattern's reintroduction.
+
+#### Fixed
+
+- Async-oplog transactions now charge buffered pre-image bytes to the
+  transaction dirty budget, so `pending_async` cannot grow the heap without
+  bound (#750).
+- The two oplog-prune mutex lock sites are poison-tolerant, matching every
+  other lock on the server-wide oplog mutex; a held-lock panic no longer
+  wedges oplog emission server-wide (#593). A `tests/` guard fails CI if the
+  bare `.lock().unwrap()` pattern returns to either crate.
+
+### Large-object writes now honour RBAC and read-only transactions
+
+PostgreSQL's large-object API reaches the server two ways that both skip
+the ordinary statement pipeline — the Fastpath sub-protocol (pgjdbc's
+`LargeObjectManager`) and the SQL-callable `lo_*` scalars — so neither the
+RBAC gate nor the read-only-transaction check applied to them. A session
+with no write privilege, or one inside `BEGIN READ ONLY`, could still
+create, write, truncate, or unlink large objects.
+
+Mutating Fastpath calls (`lo_creat`/`lo_create`/`lowrite`/`lo_truncate`/
+`lo_unlink`) now pass the same write-privilege check and read-only gate a
+table write goes through (large objects are database-scoped, so RBAC is at
+db granularity — a write action such as `insert`, which `readWrite`
+grants). The `SELECT lo_unlink(...)` scalar path is likewise classified as
+a write, so it needs a write grant and is refused inside a read-only
+transaction. Read calls and ordinary queries are unaffected.
+
+#### Security
+
+- The Fastpath large-object sub-protocol dispatched `lo_*` writes with no
+  authorization or read-only-transaction check (#836). Mutating calls are
+  now gated in `_handle_fastpath`.
+- The SQL-callable `lo_creat`/`lo_create`/`lo_unlink` scalars slipped the
+  read-only gate (a bare `SELECT` reads as non-write) and the write-RBAC
+  check. They are now classified as writes on both paths.
+
+### SQL writes can no longer read tables they weren't granted
+
+The SQL server's per-statement RBAC authorized only a write statement's
+primary target table — the table a subquery, `FROM`, `USING`, or
+`AS SELECT` clause *read from* was never checked. A principal holding
+nothing but an `INSERT` grant on one table could run
+`INSERT INTO granted SELECT * FROM secret RETURNING *` and receive
+`secret`'s rows in the response, defeating the finer-grained
+table/column grant model the SQL layer exists to provide.
+
+Every table a write statement reads as a source now requires its own
+`find` (SELECT) grant — db-wide role or table-level `GRANT SELECT` —
+across `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
+`CREATE TABLE ... AS SELECT`, and subqueries. CTE names are excluded
+(query-local, not base tables) and a self-referential
+`INSERT INTO a SELECT ... FROM a` is not charged an extra read grant
+(the actor already writes `a`, so no *other* table leaks). Plain
+`SELECT`s are unaffected — their reads, including column-level grants,
+are authorized exactly as before.
+
+#### Security
+
+- `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`, and
+  subqueries checked RBAC only on the primary write target, so a
+  write-only grant leaked an unrelated table's rows through the source
+  clause (#785).
+- `CREATE TABLE ... AS SELECT` authorized only `CREATE` on the new
+  table, never a read grant on its `SELECT` source, so a create-capable
+  role could copy out any table (#881).
+
+### dropIndex is race-safe and a failed oplog emit no longer freezes change streams
+
+Two storage-layer robustness fixes on the Python server.
+
+`drop_index` and `drop_all_indexes` took only the global storage lock, not
+the per-collection lock that CRUD writers coordinate against — the same gap
+that was closed for `create_index` but left open on the drop side. A write
+landing between an index's entry-table snapshot and its deletion could
+survive as an orphaned entry row. Both now take `_coll_lock` before `_lock`,
+the canonical order.
+
+The bare (autocommit) oplog-emit path deregistered its minted sequence range
+at the end of the method with no surrounding `try`/`finally`. Every DDL write
+goes through it, and if the cursor-write loop or the opportunistic prune
+raised — a WiredTiger write error or `WT_ROLLBACK` under contention, both
+expected — the minted range was never removed from the in-flight set, so the
+change-stream visible tail clamped at that sequence for the life of the
+process and change streams server-wide silently stopped advancing. The
+mint-to-deregister region is now exception-safe.
+
+#### Fixed
+
+- `drop_index` / `drop_all_indexes` now hold the per-collection lock, so a
+  concurrent insert/update/delete can't leave an orphaned index entry behind
+  (#635).
+- A failed bare oplog emit no longer strands its minted sequence range in the
+  in-flight set — the change-stream visible tail recovers instead of freezing
+  server-wide until restart (#714).
+
+### Temp-namespacing fallout: bare diag names, self-referencing FKs
+
+The psycopg gauge caught two regressions from the per-session temp-table
+namespacing. Error diagnostics leaked the `pg_temp_<n>.` catalog prefix
+into the TABLE NAME field, where real PG reports the bare relation name
+(the schema rides in its own field). And a SELF-referencing foreign key
+inside `CREATE TEMP TABLE` captured its target by the pre-rewrite bare
+name — the table doesn't exist yet when references resolve — so the
+constraint pointed at a nonexistent relation and never fired, including
+`DEFERRABLE INITIALLY DEFERRED` checks at COMMIT.
+
+Diagnostics now report the bare relname, and a self-referencing FK is
+pointed at the table's own final (rewritten) name at plan time.
+
+#### Fixed
+
+- `sql/executor.py`: NOT NULL / CHECK diagnostics report the bare
+  relation name; the temp schema stays in the schema field.
+- `sql/planner.py`: `CREATE TABLE` re-points self-referencing FKs at the
+  table's final name after the temp-namespace rewrite.
+
+### Transaction-scoped GUC unwinding, and SAVEPOINT survives the parse guard
+
+Three PostgreSQL-semantics fixes surfaced by re-baselining the pgjdbc
+gauge after 0.6.0b11. A plain `SET` inside a transaction block now
+unwinds on `ROLLBACK` (and on `COMMIT` of a failed block) while
+surviving a successful `COMMIT`, exactly as PostgreSQL scopes it — and
+whenever a `SET LOCAL` or rolled-back `SET` unwinds a GUC_REPORT
+parameter, the server re-reports it via ParameterStatus so the client's
+cached view reverts too (pgjdbc reads `getParameterStatus` straight
+from that cache; all three of its transactionalParameters tests now
+pass, and the extended-protocol Sync response delivers the revert for
+autocommit implicit transactions).
+
+The Parse-time bare-expression guard introduced with the pgx
+parse-error work no longer rejects `SAVEPOINT name` / `RELEASE
+SAVEPOINT name` — sqlglot parses both as a bare alias expression, which
+the guard mistook for garbage, breaking JDBC's `Connection.setSavepoint`
+outright. Bare `START TRANSACTION` (no characteristics tail) now opens
+a block like `BEGIN`; only the `READ ONLY`-style suffixed forms parsed
+before.
+
+#### Fixed
+- Plain `SET` in a transaction block: kept on COMMIT, unwound on
+  ROLLBACK / failed-block COMMIT, with ParameterStatus re-reports.
+- `SET LOCAL` unwind re-reports GUC_REPORT parameters (Sync-response
+  delivery on the extended protocol).
+- `SAVEPOINT` / `RELEASE SAVEPOINT` pass the extended protocol's
+  garbage guard (pgjdbc setSavepoint regression, #876).
+- Bare `START TRANSACTION` opens a transaction block.
+
+### Plain json echoes the client's bytes verbatim; jsonb params validated
+
+The pgtest corpus' json files pinned four fidelities. PG's plain `json`
+preserves input text byte-for-byte — `SELECT $1::JSON` returns exactly
+what the client sent, spacing and all, where jsonb normalises. Casts of
+recoverable text (a string literal, or a json parameter's substituted
+form) now validate the JSON parses and then carry the client's own text
+through to the wire, for scalars and for `JSON[]` array elements alike.
+This narrows the previously-documented verbatim-json divergence to
+table-stored json columns only (their parsed storage shape is what
+powers `->>` filter pushdown); parameter echoes and literals now
+round-trip byte-exact like real PG.
+
+Binary jsonb parameters are validated like PG: an empty payload (no
+version byte) or an unknown version number is `08P01`, and invalid
+UTF-8 inside is `22021` — all previously accepted silently. And a
+binary array parameter whose embedded element oid names a KNOWN type
+that disagrees with the declared array type (a jsonb[] payload bound as
+json[]) is PG's `42804` datatype mismatch, while a garbage element oid
+stays the structural `08P01`.
+
+The `json` and `json_array` corpus files are fully green —
+`json_array`'s expected-divergence entry is removed because the
+divergence no longer exists.
+
+#### Fixed
+
+- `sql/scalar.py` / `sql/typemap.py`: verbatim `JsonText` carry-through
+  for plain-JSON casts, scalar and array-element.
+- `sql/pgextended.py`: jsonb binary version/empty/UTF-8 validation;
+  known-type element-oid mismatch → 42804.
+- `pgtest_validation/include_paths.py`: `json_array` expected-divergence
+  entry removed.
+
 ### Newer wire-protocol minors negotiate down instead of dropping the connection
 
 A client that opened with any protocol version other than exactly 3.0

@@ -1004,6 +1004,57 @@ Postgres, which folds them. The dominant citext uses (case-insensitive lookups,
 uniqueness, and sorted listings) are faithful; case-folding aggregation grouping
 is a known limitation. citext indexing is also out of scope.
 
+### Label paths (`ltree`)
+
+`ltree` columns store a dotted label path (alphanumeric / underscore labels) and
+are reported on the wire at oid 90010 — the placeholder CockroachDB uses for the
+extension type, since `ltree` has no fixed catalog oid:
+
+```sql
+CREATE TABLE t (id int4 PRIMARY KEY, path ltree NOT NULL);
+INSERT INTO t VALUES (1, 'A.B');
+SELECT id FROM t WHERE path = 'A.B';   -- 1
+```
+
+Values are validated on write (a malformed path is rejected), and a parameter
+compared against an `ltree` column is typed as `ltree` by parse analysis, so
+binary-format parameters (a version byte followed by the text, as the extension
+sends) decode correctly. The path *operators* (`@>`, `<@`, `~`, `lquery`) are out
+of scope — storage, comparison, and the wire representation are what SecantusDB
+models.
+
+### SQL/JSON paths (`jsonpath`)
+
+A `jsonpath` value stores PostgreSQL's canonical text form of a path expression
+(oid 4072). Member accessors are always quoted on output, as PG renders them:
+
+```sql
+SELECT '$.abc'::jsonpath;                        -- $."abc"
+SELECT jsonb_path_query('{"a": true}', '$.a');   -- true
+SELECT ''::jsonpath;                             -- ERROR 42601 (syntax error)
+```
+
+The binary format is a version byte followed by the canonical text. The path
+language itself is the subset `jsonb_path_query` / `jsonb_path_exists` / `@?` /
+`@@` accept — see *jsonb containment, existence, and functions* below.
+
+### The internal one-byte type (`"char"`)
+
+The **quoted** `"char"` spelling is PostgreSQL's internal one-byte type (oid 18,
+typlen 1) — distinct from `char(n)` / `bpchar`, and used by catalog columns:
+
+```sql
+CREATE TABLE a (i int4 PRIMARY KEY, b "char");
+INSERT INTO a VALUES (1, 'eee');   -- stored as 'e' (truncated to one character)
+INSERT INTO a VALUES (2, '');      -- stored as NULL
+SELECT 'a'::"char";                -- column named char, oid 18, size 1
+SELECT 0::"char";                  -- the zero byte
+```
+
+Input truncates to a single character, an empty string or zero byte stores NULL,
+and an integer cast yields that code point (out of range raises `22003`). The
+unquoted `char` keyword still means `char(n)` / `bpchar`.
+
 ### XML (`xml`)
 
 `xml` columns store XML text (validated well-formed on write) and support the
