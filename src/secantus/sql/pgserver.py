@@ -836,6 +836,15 @@ class SecantusPGServer:
                 diag=getattr(exc, "diag", None),
                 position=getattr(exc, "position", None) or _error_position(exc, sql),
             )
+            if session.txn_handle is not None and session.local_gucs:
+                # An error aborts the transaction, so its SET LOCALs revert
+                # NOW and PG reports them right after the ErrorResponse
+                # (pgtest param_status). The later ROLLBACK then has nothing
+                # left to unwind, matching PG's silent rollback there.
+                session.restore_local_gucs()
+                for pname, pvalue in session.pending_parameter_status:
+                    out += pgwire.parameter_status(pname, pvalue)
+                session.pending_parameter_status = []
         except Exception:  # pragma: no cover - defensive
             logger.exception("error executing SQL")
             # Don't leak the raw Python exception text to the wire client — the
@@ -1058,8 +1067,6 @@ def _render_result(res: Any, encoding: str | None = "utf-8", session: Any = None
         # Reportable GUCs changed mid-statement by set_config().
         status += session.pending_parameter_status
         session.pending_parameter_status = []
-    for name, value in status:
-        out += pgwire.parameter_status(name, value)
     if res.columns or res.command_tag.startswith("SELECT"):
         out += pgwire.row_description(
             [(c.name, c.pg_oid, c.typmod, c.table_oid, c.attnum) for c in res.columns],
@@ -1080,6 +1087,10 @@ def _render_result(res: Any, encoding: str | None = "utf-8", session: Any = None
                 ]
             )
     out += pgwire.command_complete(res.command_tag)
+    # PG reports GUC changes AFTER the command's CommandComplete, just before
+    # ReadyForQuery (pgtest param_status reads the order byte-for-byte).
+    for name, value in status:
+        out += pgwire.parameter_status(name, value)
     return bytes(out)
 
 

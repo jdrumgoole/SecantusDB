@@ -648,7 +648,7 @@ def _savepoint_command(stmt: exp.Expression) -> tuple[str, str] | None:
 def _savepoint(name: str, session: Session) -> SQLResult:
     if session.txn_handle is None:
         raise errors.SQLError("25P01", "SAVEPOINT can only be used in transaction blocks")
-    session.savepoints.append(_Savepoint(name=name))
+    session.savepoints.append(_Savepoint(name=name, gucs=dict(session.settings)))
     return SQLResult(command_tag="SAVEPOINT")
 
 
@@ -705,6 +705,9 @@ def _rollback_to_savepoint(name: str, storage: Any, db: str, session: Session) -
     # and its snapshots still hold the pre-``name`` state).
     del session.savepoints[idx + 1 :]
     session.txn_failed = False
+    # GUCs set after the savepoint revert with it, and the GUC_REPORT ones are
+    # re-reported (pgtest param_status reads them after ROLLBACK TO SAVEPOINT).
+    session.restore_savepoint_gucs(session.savepoints[idx].gucs)
     return SQLResult(command_tag="ROLLBACK")
 
 
@@ -5566,14 +5569,18 @@ def _run_set(stmt: exp.Set, session: Session) -> SQLResult:
         is_local = isinstance(item, exp.SetItem) and str(item.args.get("kind") or "").upper() == (
             "LOCAL"
         )
+        # Canonicalize ONCE, before the local/session split — the report at the
+        # bottom must carry the same spelling that was stored (pgtest
+        # param_status reads SET LOCAL's DateStyle report).
+        if name.lower() in ("timezone", "time zone"):
+            value = sql_session.canonical_timezone_setting(str(value))
+        value = sql_session.canonical_guc_value(name, str(value))
         if is_local:
             if session.txn_handle is not None:
                 session.set_local(name, str(value))
             else:
                 continue  # SET LOCAL outside a transaction — no lasting effect
         else:
-            if name.lower() in ("timezone", "time zone"):
-                value = sql_session.canonical_timezone_setting(str(value))
             if name.lower() == "client_encoding":
                 # Canonicalise (SHOW / ParameterStatus report the PG spelling)
                 # and reject encodings the wire layer can't convert.
@@ -5588,6 +5595,13 @@ def _run_set(stmt: exp.Set, session: Session) -> SQLResult:
                 # capture the pre-SET value before overwriting.
                 session.record_txn_guc(name)
             session.settings[name] = str(value)
+        if name.lower() == "role":
+            # ``SET [LOCAL] role = 'x'`` is the GUC spelling of SET ROLE: it
+            # switches the current role, so PG reports is_superuser with it
+            # (pgtest param_status uses this spelling inside a block).
+            ident = _unquote_ident(str(value))
+            session.role = None if ident.upper() in ("NONE", "DEFAULT") else ident
+            reported.extend(_superuser_status(session))
         if name in REPORTABLE_GUCS:
             reported.append((name, str(value)))
     return SQLResult(command_tag="SET", parameter_status=reported)
@@ -5624,6 +5638,19 @@ def _can_assume_identity(session: Session, target: str) -> bool:
     return target in role_names or "root" in role_names
 
 
+def _superuser_status(session: Session) -> list[tuple[str, str]]:
+    """``is_superuser`` ParameterStatus for the session's CURRENT identity, but
+    only when it changed — PG reports the GUC on a role switch and stays quiet
+    when the role is re-set to what it already was (pgtest param_status sends
+    the same SET ROLE twice and expects one report)."""
+    is_super = session.role is None or session.role == (session.login_user or session.user)
+    value = "on" if is_super else "off"
+    if session.settings.get("is_superuser") == value:
+        return []
+    session.settings["is_superuser"] = value
+    return [("is_superuser", value)]
+
+
 def _run_authorization_command(verb: str, tail: str, session: Session) -> SQLResult | None:
     """``SET ROLE`` / ``SET SESSION AUTHORIZATION`` and their ``RESET`` forms, which
     change the session's current role / session user (#128). Returns None if the
@@ -5633,12 +5660,12 @@ def _run_authorization_command(verb: str, tail: str, session: Session) -> SQLRes
         if key == "ROLE":
             session.role = None
             session.settings.pop("role", None)
-            return SQLResult(command_tag="RESET")
+            return SQLResult(command_tag="RESET", parameter_status=_superuser_status(session))
         if key == "SESSION AUTHORIZATION":
             session.user = session.login_user or session.user
             session.role = None
             session.settings.pop("role", None)
-            return SQLResult(command_tag="RESET")
+            return SQLResult(command_tag="RESET", parameter_status=_superuser_status(session))
         return None
     if verb != "SET":
         return None
@@ -5669,7 +5696,7 @@ def _run_authorization_command(verb: str, tail: str, session: Session) -> SQLRes
                 raise errors.SQLError("42501", f'permission denied to set role "{ident}"')
             session.role = ident
             session.settings["role"] = ident
-        return SQLResult(command_tag="SET")
+        return SQLResult(command_tag="SET", parameter_status=_superuser_status(session))
     m = _SET_TIME_ZONE_RE.match(tail)
     if m is not None:
         # ``SET TIME ZONE <value>`` takes no ``=``/``TO``, so the generic
@@ -5679,8 +5706,18 @@ def _run_authorization_command(verb: str, tail: str, session: Session) -> SQLRes
         if raw.upper() in ("DEFAULT", "LOCAL"):
             value = sql_session.GUC_DEFAULTS.get("TimeZone", "UTC")
         else:
-            value = _unquote_ident(raw)
-        session.settings["TimeZone"] = value
+            # Canonicalize like the generic SET path: a numeric offset becomes
+            # PG's POSIX zone spec (``+6`` -> ``<+06>-06``), GMT/UTC prefixes
+            # uppercase (pgtest param_status reads the reported value).
+            value = sql_session.canonical_timezone_setting(_unquote_ident(raw))
+        # ``SET LOCAL TIME ZONE`` reverts at the end of the transaction, like
+        # the generic SET LOCAL path (the corpus rolls one back).
+        if tail.lstrip().upper().startswith("LOCAL") and session.txn_handle is not None:
+            session.set_local("TimeZone", value)
+        else:
+            if session.txn_handle is not None:
+                session.record_txn_guc("TimeZone")
+            session.settings["TimeZone"] = value
         return SQLResult(command_tag="SET", parameter_status=[("TimeZone", value)])
     return None
 

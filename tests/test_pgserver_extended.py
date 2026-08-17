@@ -1288,3 +1288,84 @@ def test_reg_pseudotypes_binary_and_typlen(client):
             pgwire.build_execute("", 0),
         )
         assert error_code(msgs) == "08P01"
+
+
+def _params(msgs):
+    out = []
+    for m in msgs:
+        if m.type == "S":
+            parts = m.payload.split(b"\x00")
+            out.append((parts[0].decode(), parts[1].decode()))
+    return out
+
+
+def test_parameter_status_follows_command_complete(client):
+    # pgtest param_status:7 — PG reports GUC changes AFTER the command's
+    # CommandComplete, just before ReadyForQuery.
+    msgs = client.exchange(
+        pgwire.build_parse("", "SET application_name = 'pgtest'", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    tps = [m.type for m in msgs if m.type in ("C", "S", "Z")]
+    assert tps == ["C", "S", "Z"]
+    assert _params(msgs) == [("application_name", "pgtest")]
+
+
+def test_numeric_time_zone_reports_posix_spec(client):
+    # pgtest param_status — a numeric offset reports PG's POSIX zone spec,
+    # with the sign inverted after the label.
+    msgs = client.exchange(
+        pgwire.build_parse("", "SET TIME ZONE +6", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert _params(msgs) == [("TimeZone", "<+06>-06")]
+    msgs = client.exchange(
+        pgwire.build_parse("", "SET TIME ZONE -11.5", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert _params(msgs) == [("TimeZone", "<-11:30>+11:30")]
+
+
+def test_datestyle_and_intervalstyle_reported_canonically(client):
+    msgs = client.exchange(
+        pgwire.build_parse("", "SET DateStyle = 'YMD, ISO'", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert _params(msgs) == [("DateStyle", "ISO, YMD")]
+    msgs = client.exchange(
+        pgwire.build_parse("", "SET IntervalStyle = 'ISO_8601'", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert _params(msgs) == [("IntervalStyle", "iso_8601")]
+
+
+def test_savepoint_rollback_reverts_and_reports_gucs(client):
+    # pgtest param_status — GUCs set after a savepoint revert with it and the
+    # reverted GUC_REPORT ones are re-reported, ordered case-insensitively.
+    for sql in ("BEGIN", "SET LOCAL TIME ZONE 'Australia/Adelaide'", "SAVEPOINT s1"):
+        client.exchange(
+            pgwire.build_parse("", sql, []),
+            pgwire.build_bind("", "", []),
+            pgwire.build_execute("", 0),
+        )
+    client.exchange(
+        pgwire.build_parse("", "SET LOCAL TIME ZONE 'Australia/Perth'", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    msgs = client.exchange(
+        pgwire.build_parse("", "ROLLBACK TO SAVEPOINT s1", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert ("TimeZone", "Australia/Adelaide") in _params(msgs)
+    client.exchange(
+        pgwire.build_parse("", "ROLLBACK", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
