@@ -494,7 +494,16 @@ def _check_portal_table_pin(session: Session, table_name: str) -> None:
         stmt = p.bound_stmt if p.bound_stmt is not None else getattr(p.prepared, "stmt", None)
         if stmt is None:
             continue
-        if p.executed and p.result is not None:
+        # Only an ACTIVE READ CURSOR pins a table against DROP — PG's "being
+        # used" is about open cursors, not other statements. A write portal
+        # (DML / DDL — crucially the ``DROP TABLE`` being executed right now,
+        # which carries the table as its own target and otherwise pinned itself
+        # → the DatabaseMetaDataTest setup regression) never pins, and neither
+        # does a portal that has not been executed (a prepared-but-unopened
+        # cursor holds nothing).
+        if _write_statement_verb(stmt) is not None or not p.executed:
+            continue
+        if p.result is not None:
             rows = getattr(p.result, "rows", None)
             if rows is not None and p.offset >= len(rows):
                 continue  # drained

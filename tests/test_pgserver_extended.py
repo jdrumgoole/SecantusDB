@@ -1261,6 +1261,50 @@ def test_drop_table_with_active_portal_is_55006(client):
     )
 
 
+def test_drop_table_own_portal_does_not_self_pin(client):
+    # Regression: the DROP TABLE portal carries the table as its own target, so
+    # the active-cursor guard used to count the DROP being executed as a "query
+    # using the table" and refuse it (55006), breaking pgjdbc's
+    # DatabaseMetaDataTest setup which drops via the extended protocol. Only an
+    # active READ cursor pins — a write portal (the DROP itself) does not.
+    client.exchange(
+        pgwire.build_parse("", "CREATE TABLE selfpin (x int)", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    msgs = client.exchange(
+        pgwire.build_parse("", "DROP TABLE IF EXISTS selfpin CASCADE", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert error_code(msgs) is None
+
+
+def test_drop_table_after_drained_portal_succeeds(client):
+    # A fully-fetched SELECT portal no longer pins the table.
+    client.exchange(
+        pgwire.build_parse("", "CREATE TABLE drained (x int)", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    client.exchange(
+        pgwire.build_parse("", "INSERT INTO drained VALUES (1)", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    client.exchange(
+        pgwire.build_parse("dq", "SELECT * FROM drained", []),
+        pgwire.build_bind("dp", "dq", []),
+        pgwire.build_execute("dp", 0),  # 0 = fetch all → drained
+    )
+    msgs = client.exchange(
+        pgwire.build_parse("", "DROP TABLE drained", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert error_code(msgs) is None
+
+
 def test_reg_pseudotypes_binary_and_typlen(client):
     # pgtest oid corpus — the reg* pseudo-types ride the oid wire form: a
     # 4-byte unsigned int, typlen 4 in RowDescription; a wrong-length
