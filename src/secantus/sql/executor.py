@@ -642,6 +642,27 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
             else:
                 raise errors.feature_not_supported(f"unsupported ADD CONSTRAINT: {action.sql()}")
         return
+    if type(action).__name__ == "Command":
+        # ``ALTER TABLE t DROP name`` (no COLUMN keyword — valid PG; pgjdbc's
+        # droppedColumns test) exceeds sqlglot's action parser and lands here
+        # as a raw Command. Re-parse with the keyword and apply that action.
+        import re as _re
+
+        from secantus.sql import planner as _planner
+
+        m = _re.match(
+            r"(?is)^\s*DROP\s+(?!COLUMN\b|CONSTRAINT\b)(?P<ie>IF\s+EXISTS\s+)?"
+            r'(?P<col>"[^"]+"|[A-Za-z_]\w*)\s*(?:CASCADE|RESTRICT)?\s*$',
+            action.sql(),
+        )
+        if m is not None:
+            ie = "IF EXISTS " if m.group("ie") else ""
+            reparsed = _planner.parse(
+                f'ALTER TABLE "{table.name}" DROP COLUMN {ie}{m.group("col")}'
+            )[0]
+            for sub in reparsed.args.get("actions") or []:
+                _apply_alter_action(sub, table, storage, db)
+            return
     raise errors.feature_not_supported(f"unsupported ALTER TABLE action: {action.sql()}")
 
 

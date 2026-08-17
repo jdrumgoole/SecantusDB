@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from secantus.sql import run_sql
+from secantus.sql import errors, run_sql
 from secantus.sql.session import Session
 from secantus.storage import Storage
 
@@ -157,3 +157,18 @@ def test_set_and_drop_not_null_unaffected(storage, session):
         "SELECT is_nullable FROM information_schema.columns "
         "WHERE table_name = 't' AND column_name = 'v'",
     ) == [("YES",)]
+
+
+def test_drop_column_without_keyword(storage, session):
+    # ``ALTER TABLE t DROP name`` (no COLUMN keyword) is valid PG — pgjdbc's
+    # droppedColumns test uses it; sqlglot parses the action as a raw Command.
+    q(storage, session, "CREATE TABLE dropbare (id int4, name text, colour text)")
+    q(storage, session, "INSERT INTO dropbare VALUES (1, 'n', 'red')")
+    assert q(storage, session, "ALTER TABLE dropbare DROP name").command_tag == "ALTER TABLE"
+    assert q(storage, session, 'ALTER TABLE dropbare DROP "colour"').command_tag == "ALTER TABLE"
+    assert rows(storage, session, "SELECT * FROM dropbare") == [(1,)]
+    assert (
+        q(storage, session, "ALTER TABLE dropbare DROP IF EXISTS nope").command_tag == "ALTER TABLE"
+    )
+    with pytest.raises(errors.SQLError):
+        q(storage, session, "ALTER TABLE dropbare DROP nope")
