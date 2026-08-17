@@ -1052,3 +1052,26 @@ def test_binary_inet_error_classes(client):
             pgwire.build_execute("", 0),
         )
         assert error_code(msgs) == code, (payload.hex(), error_code(msgs))
+
+
+def test_int2vector_binary_result_is_int2_array(client):
+    # pgtest int2vector corpus (crdb #111907): the binary wire form of
+    # int2vector is an int2 ARRAY — elemoid 21, 2-byte elements, lower
+    # bound 1. (The corpus file's expected indoption VALUE is crdb's 2;
+    # PG and we report 0 — recorded in EXPECTED_DIVERGENCES.)
+    client.exchange(
+        pgwire.build_parse("", "CREATE TABLE i2v (a int primary key, b text)", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    msgs = client.exchange(
+        pgwire.build_parse(
+            "",
+            "select i.indoption from pg_index i join pg_class c "
+            "on i.indrelid = c.oid where c.relname = 'i2v'",
+            [],
+        ),
+        pgwire.build_bind("", "", [], result_formats=[1]),
+        pgwire.build_execute("", 0),
+    )
+    assert rows(msgs) == [[bytes.fromhex("0000000100000000000000150000000100000001000000020000")]]

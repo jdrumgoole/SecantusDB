@@ -291,6 +291,20 @@ _GEO_BINARY: dict[int, Any] = {
 # to str and rides column-type coercion; libpq clients (psycopg) send many types
 # in binary. Types whose storage form is canonical text (time / inet / uuid /
 # interval / ranges …) decode to that text and ride the same coercion path.
+def _encode_int2vector(v: Any) -> bytes:
+    """Binary ``int2vector`` — the wire form is an int2 ARRAY (elemoid 21,
+    lower bound 1); the stored form is the space-separated text ("0", "1 2").
+    Binary pgwire clients decode pg_index.indoption/indkey through this
+    (pgtest int2vector corpus; crdb #111907 shipped int8 elements once)."""
+    vals = [int(x) for x in v] if isinstance(v, (list, tuple)) else [int(x) for x in str(v).split()]
+    if not vals:
+        return struct.pack("!iii", 0, 0, 21)
+    out = bytearray(struct.pack("!iiiii", 1, 0, 21, len(vals), 1))
+    for x in vals:
+        out += struct.pack("!ih", 2, x)
+    return bytes(out)
+
+
 def _decode_char1(b: bytes) -> str | None:
     # "char" binary form is the raw byte(s). Empty / zero byte is the NULL
     # surrogate (the pgtest char corpus reads both back as SQL NULL).
@@ -615,6 +629,7 @@ _OUT_BINARY = {
     718: _encode_geo_floats(3),  # circle
     17: lambda v: bytes(v),  # bytea
     18: lambda v: str(v).encode("utf-8"),  # "char" — raw byte(s), \0 included
+    22: lambda v: _encode_int2vector(v),  # int2vector — an int2[] wire array
     90008: lambda v: str(v).encode("utf-8"),  # citext — text bytes
     20: lambda v: struct.pack("!q", int(typemap.unwrap_numeric(v))),  # int8
     21: lambda v: struct.pack("!h", int(typemap.unwrap_numeric(v))),  # int2

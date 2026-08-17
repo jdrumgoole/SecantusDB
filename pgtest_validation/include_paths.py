@@ -12,6 +12,14 @@ EXCLUDE: set[str] = set()
 
 #: file -> reason. A file listed here that PASSES is reported loudly.
 EXPECTED_DIVERGENCES: dict[str, str] = {
+    "int2vector": (
+        "int2vector:26 expects indoption={2} for a plain primary key — "
+        "crdb's NULLS-FIRST pkey representation. Real PostgreSQL reports 0 "
+        "(ASC, NULLS LAST), and so do we; matching crdb's 2 would corrupt "
+        "SQLAlchemy index reflection. The BINARY int2vector encoding the "
+        "stanza actually regression-tests (int2 array elements, elemoid 21 "
+        "— crdb #111907 shipped int8 once) is implemented and correct."
+    ),
     "char": (
         "char:250 pins TableOID=105 — crdb's deterministic descriptor id, "
         "with no ignore_table_oids directive on that stanza. Real PostgreSQL "
