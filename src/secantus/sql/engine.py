@@ -478,6 +478,29 @@ def _begin_txn(storage: Any, session: Session, modes: list | None = None) -> SQL
     )
 
 
+def _check_portal_table_pin(session: Session, table_name: str) -> None:
+    """PG refuses DROP TABLE while an ACTIVE portal in this session still
+    reads the table — 55006, and the block poisons (pgtest
+    multiple_active_portals). A fully-drained portal no longer pins."""
+    portals = getattr(session, "wire_portals", None) or {}
+    for p in portals.values():
+        stmt = p.bound_stmt if p.bound_stmt is not None else getattr(p.prepared, "stmt", None)
+        if stmt is None:
+            continue
+        if p.executed and p.result is not None:
+            rows = getattr(p.result, "rows", None)
+            if rows is not None and p.offset >= len(rows):
+                continue  # drained
+        if any(t.name == table_name for t in stmt.find_all(exp.Table)):
+            if session.txn_handle is not None:
+                session.txn_failed = True
+            raise errors.SQLError(
+                "55006",
+                f'cannot DROP TABLE "{table_name}" because it is being used by '
+                "active queries in this session",
+            )
+
+
 def _write_statement_verb(stmt: exp.Expression) -> str | None:
     """The verb PG names in its 25006 error when ``stmt`` writes, else None.
 
@@ -592,6 +615,13 @@ def _end_txn_state(session: Session) -> None:
     session.restore_local_gucs()  # SET LOCAL reverts at end of transaction
     session.release_xact_advisory_locks()  # pg_advisory_xact_lock* release at txn end
     _close_non_hold_cursors(session)  # WITHOUT HOLD cursors close at end of txn
+    # PG destroys portals at transaction end — clearing here (not only at the
+    # extended protocol's Sync) covers blocks ended through the simple-query
+    # path, and removes any chance of a recycled txn-handle id() matching a
+    # stale portal's token (pgtest multiple_active_portals).
+    portals = getattr(session, "wire_portals", None)
+    if portals:
+        portals.clear()
 
 
 def _rollback_txn(storage: Any, session: Session) -> SQLResult:
@@ -2403,7 +2433,9 @@ def _run_statement(
     if isinstance(stmt, exp.Drop):
         kind = (stmt.args.get("kind") or "TABLE").upper()
         if kind == "TABLE":
-            return executor.execute_drop_table(planner.plan_drop_table(stmt), catalog, storage, db)
+            plan = planner.plan_drop_table(stmt)
+            _check_portal_table_pin(session, plan.name)
+            return executor.execute_drop_table(plan, catalog, storage, db)
         if kind == "INDEX":
             return executor.execute_drop_index(planner.plan_drop_index(stmt), catalog, storage, db)
         if kind == "VIEW":
@@ -2541,10 +2573,10 @@ def _run_statement(
             # every name must resolve BEFORE anything drops (PG atomicity).
             drops = stmt.args.get("drops") or []
             for d in drops:
-                if not d.args.get("exists"):
-                    plan = planner.plan_drop_table(d)
-                    if catalog.get(db, plan.name) is None:
-                        raise errors.undefined_table(plan.name)
+                plan = planner.plan_drop_table(d)
+                _check_portal_table_pin(session, plan.name)
+                if not d.args.get("exists") and catalog.get(db, plan.name) is None:
+                    raise errors.undefined_table(plan.name)
             for d in drops:
                 executor.execute_drop_table(planner.plan_drop_table(d), catalog, storage, db)
             return SQLResult(command_tag="DROP TABLE")

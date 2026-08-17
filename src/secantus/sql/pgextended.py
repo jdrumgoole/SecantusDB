@@ -66,6 +66,12 @@ class Portal:
     executed: bool = False
     # Bind's result-format codes (0=text, 1=binary): [] all-text, [c] all-c, else per-col.
     result_formats: list[int] = field(default_factory=list)
+    #: id() of the explicit transaction handle this portal was bound inside,
+    #: or None. Re-binding a NAMED portal still live in the SAME explicit
+    #: transaction is PG's 42P03 (pgtest multiple_active_portals); portals
+    #: from other/implicit cycles keep the permissive replace this server
+    #: has always done (clients re-use portal names across Sync cycles).
+    txn_token: int | None = None
 
 
 # Postgres binary timestamps count microseconds from 2000-01-01 00:00:00 UTC;
@@ -1198,6 +1204,10 @@ class ExtendedSession:
         # pg_prepared_statements virtual tables (whose builders only see the
         # Session) can list this connection's prepared statements.
         session.wire_prepared = self.prepared
+        # Expose live portals too — DROP TABLE must refuse while an active
+        # portal in this session still reads the table (PG's 55006; pgtest
+        # multiple_active_portals).
+        session.wire_portals = self.portals
 
     _TXN_EXIT_RE = None  # compiled lazily below
 
@@ -1257,6 +1267,13 @@ class ExtendedSession:
                     exc.message,
                     encoding=self.session.wire_encoding,
                 )
+            # PG destroys portals at transaction end: once the implicit
+            # cycle settles (and no explicit block remains open), suspended
+            # portals are gone — a later Execute is 34000 (pgtest
+            # multiple_active_portals). An open explicit block keeps its
+            # portals alive across Sync.
+            if self.session.txn_handle is None:
+                self.portals.clear()
             # Settling the implicit transaction may have unwound SET LOCALs;
             # PG re-reports GUC_REPORT parameters at transaction end, so the
             # client's ParameterStatus cache reverts too (pgjdbc's
@@ -1411,6 +1428,26 @@ class ExtendedSession:
                 # PG validates format codes at Bind — 0 (text) and 1 (binary)
                 # only (pgtest errors:95 sends ResultFormatCodes 2..5).
                 raise errors.SQLError("08P01", f"unsupported format code: {code}")
+        existing = self.portals.get(portal)
+        if (
+            portal
+            and existing is not None
+            and self.session.txn_handle is not None
+            and not self.session.txn_is_implicit
+            and existing.txn_token == id(self.session.txn_handle)
+        ):
+            summary = (prep.query or "").strip().rstrip(";")
+            raise errors.SQLError(
+                "42P03",
+                f'portal "{portal}" already exists',
+                diag={
+                    "D": (
+                        f'statement name "{stmt_name}"\n--\n'
+                        f'portal name "{portal}"\n--\n'
+                        f'statement summary "{summary}"'
+                    )
+                },
+            )
         if raw_values and isinstance(prep.stmt, exp.Copy):
             summary = "COPY (SELECT) TO STDOUT" if not prep.stmt.args.get("kind") else "COPY"
             raise errors.SQLError(
@@ -1435,7 +1472,14 @@ class ExtendedSession:
                 values.append(planner.VOID_BIND)
                 continue
             values.append(self._check_enum_param(oid, value))
-        self.portals[portal] = Portal(portal, prep, values, result_formats=result_formats)
+        token = (
+            id(self.session.txn_handle)
+            if self.session.txn_handle is not None and not self.session.txn_is_implicit
+            else None
+        )
+        self.portals[portal] = Portal(
+            portal, prep, values, result_formats=result_formats, txn_token=token
+        )
         self._maybe_snapshot_execute(self.portals[portal])
         return pgwire.bind_complete()
 
@@ -1624,7 +1668,7 @@ class ExtendedSession:
             cursor = self.session.cursors.get(name)
             if cursor is not None:
                 return self._row_desc_or_no_data(list(cursor.columns))
-            raise errors.SQLError("34000", f'portal "{name}" does not exist')
+            raise errors.SQLError("34000", f'unknown portal "{name}"')
         cols = self._describe_columns(self._bound(portal))
         _apply_param_result_oids(cols, portal.prepared)
         formats = _column_formats(portal.result_formats, len(cols)) if cols else None
@@ -1692,7 +1736,7 @@ class ExtendedSession:
         portal_name, max_rows = pgwire.parse_execute(payload)
         portal = self.portals.get(portal_name)
         if portal is None:
-            raise errors.SQLError("34000", f'portal "{portal_name}" does not exist')
+            raise errors.SQLError("34000", f'unknown portal "{portal_name}"')
         if portal.prepared.stmt is None:
             return pgwire.empty_query_response()
         if isinstance(portal.prepared.stmt, exp.Copy):

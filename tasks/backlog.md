@@ -2704,10 +2704,20 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   90008), stored as validated dotted-label text, binary = version
   byte + text, INSERT-target and comparison inference (the
   citext-only comparison branch is now the {citext, ltree} operator-
-  family set). Corpus: 21 unexpected failures. Next:
-  `multiple_active_portals` (its ltree dep is now met — remaining
-  blocker is leftover `mytable` state), `oid`. Iterate
-  file-by-file.
+  family set). Slice 21 advanced `multiple_active_portals`
+  :137 → :681 (9 of 18 subtests): PG portal semantics landed —
+  re-binding a NAMED portal live in the same explicit txn is 42P03
+  (with crdb's detail shape), portals DIE at transaction end
+  (cleared in _end_txn_state and at Sync when no block remains; a
+  post-Sync Execute is 34000 "unknown portal"), and DROP TABLE
+  refuses 55006 while an undrained portal in the session reads the
+  table. **Remaining blocker (architectural): the query_timeout
+  subtest needs row-LAZY portal execution** — pg_sleep evaluated per
+  fetched row with a cumulative statement_timeout across
+  Execute-resumes; our portals materialize fully at first Execute,
+  so the timeout can't fire mid-drain. Corpus: 21 unexpected
+  failures (file still counts, advanced internally). Next: `oid`,
+  `param_status`. Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
