@@ -937,3 +937,36 @@ def test_invalid_format_code_is_08P01_at_bind(client):
     )
     assert error_code(msgs) == "08P01"
     assert "2" not in types(msgs)  # no BindComplete
+
+
+def test_execute_of_sql_prepare_describes_underlying_shape(client):
+    # pgtest execute:70 — Describe(P) of a wire-parsed ``EXECUTE name(...)``
+    # reports the UNDERLYING prepared SELECT's RowDescription, not NoData.
+    client.exchange(
+        pgwire.build_parse("", "CREATE TABLE t0 (c0 int8)", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    client.exchange(
+        pgwire.build_parse("", "INSERT INTO t0 VALUES (1)", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    client.exchange(
+        pgwire.build_parse("", "PREPARE sq (int8) AS SELECT * FROM t0 WHERE c0 = $1", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    msgs = client.exchange(
+        pgwire.build_parse("sq_stmt", "EXECUTE sq(1)", []),
+        pgwire.build_bind("sq_portal", "sq_stmt", []),
+        pgwire.build_describe("P", "sq_portal"),
+        pgwire.build_execute("sq_portal", 0),
+    )
+    rd = next(m for m in msgs if m.type == "T")
+    import struct as _s
+
+    end = rd.payload.index(b"\x00", 2)
+    assert rd.payload[2:end] == b"c0"
+    assert _s.unpack_from("!i", rd.payload, end + 7)[0] == 20  # int8
+    assert rows(msgs) == [[b"1"]]

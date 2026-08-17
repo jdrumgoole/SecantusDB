@@ -2667,9 +2667,13 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   already passed unchanged. Corpus: 28 unexpected failures; green:
   aborted_txn, array, batch_stmt, bind_and_resolve, json,
   json_array, char, citext, copy, copy_file_upload, decimal, enum,
-  errors (+2). Next: `execute`, `float` (`multiple_active_portals`
-  needs fresh-state isolation — leftover `mytable`/`ltree` deps).
-  Iterate file-by-file.
+  errors (+2). Slice 14 greened `execute`: Describe(P) of a
+  wire-parsed ``EXECUTE name(args)`` resolves the UNDERLYING
+  SQL-level prepared statement and reports ITS shape (a SELECT's
+  RowDescription, not NoData). Corpus: 27 unexpected failures —
+  green now also includes execute. Next: `float`, `implicit_txn`
+  (`multiple_active_portals` needs fresh-state isolation — leftover
+  `mytable`/`ltree` deps). Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
