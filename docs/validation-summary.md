@@ -1,6 +1,6 @@
 # Cross-Driver Conformance Summary
 
-Generated 2026-08-11 — SecantusDB 0.6.0b9. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 13 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
+Generated 2026-08-17 — SecantusDB 0.6.0b11. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 13 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
 
 **Failures split into two columns**: *Failed* counts tests that actually need a fix on SecantusDB; *Expected* counts tests with a documented reason for failing (driver-side cascade, out-of-scope feature, single-node-topology assumption, known intermittent flake). The expected list lives in `validation_summary/expected_failures.py` and each entry carries a rationale. Adjusted pass rate = passes ÷ (passes + actual failures).
 
@@ -8,20 +8,20 @@ Generated 2026-08-11 — SecantusDB 0.6.0b9. Each per-driver gauge runs the driv
 
 | Driver | Language | Driver version | Tests run | Passed | Failed | Expected | Skipped | Pass rate | Adjusted |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| `pymongo` | Python | `f2103a95870a` | 1501 | 1021 | 5 | 0 | 475 | 99.5% | 99.5% |
-| `pymongo (async)` | Python | `f2103a95870a` | 1423 | 926 | 6 | 0 | 491 | 99.4% | 99.4% |
+| `pymongo` | Python | `f2103a95870a` | 1501 | 1021 | 0 | 5 | 475 | 99.5% | 100.0% |
+| `pymongo (async)` | Python | `f2103a95870a` | 1423 | 926 | 0 | 6 | 491 | 99.4% | 100.0% |
 | `mongo-java-driver` | Java | `cb45be6bb147` | 900 | 446 | 0 | 1 | 453 | 99.8% | 100.0% |
 | `mongo-kotlin-driver` | Kotlin | `cb45be6bb147` | 538 | 294 | 0 | 0 | 244 | 100.0% | 100.0% |
 | `mongo-go-driver` | Go | `fd85a834c40e` | 453 | 401 | 0 | 0 | 52 | 100.0% | 100.0% |
 | `mongo-node-driver` | Node.js | `7e53685952f2` | 364 | 358 | 0 | 1 | 5 | 99.7% | 100.0% |
 | `mongo-ruby-driver` | Ruby | `f68d676643c1` | 283 | 258 | 0 | 1 | 24 | 99.6% | 100.0% |
 | `mongo-rust-driver` | Rust | `12dd49bf18bb` | 105 | 105 | 0 | 0 | 0 | 100.0% | 100.0% |
-| `mongo-php-library` | PHP | `12e56461166d` | 2221 | 2145 | 39 | 0 | 37 | 98.2% | 98.2% |
+| `mongo-php-library` | PHP | `12e56461166d` | 2221 | 2184 | 0 | 0 | 37 | 100.0% | 100.0% |
 | `mongo-php-driver` | PHP | `e81b318a33dc` | 270 | 247 | 0 | 0 | 23 | 100.0% | 100.0% |
-| `mongo-c-driver` | C | `57dba9c04991` | 841 | 739 | 3 | 8 | 91 | 98.5% | 99.6% |
+| `mongo-c-driver` | C | `57dba9c04991` | 841 | 740 | 2 | 8 | 91 | 98.7% | 99.7% |
 | `mongo-cxx-driver` | C++ | `24852b68a3d1` | 899 | 890 | 0 | 0 | 9 | 100.0% | 100.0% |
 | `mongo-csharp-driver` | C# | `8297e62d7f2b` | 228 | 202 | 0 | 0 | 26 | 100.0% | 100.0% |
-| **All drivers** | — | — | **10026** | **8032** | **53** | **11** | **1930** | **99.2%** | **99.3%** |
+| **All drivers** | — | — | **10026** | **8072** | **2** | **22** | **1930** | **99.7%** | **100.0%** |
 
 ## Per-driver scope
 
@@ -42,6 +42,23 @@ Generated 2026-08-11 — SecantusDB 0.6.0b9. Each per-driver gauge runs the driv
 ## Expected failures
 
 These tests fail for documented reasons that have no SecantusDB-side fix (driver-internal behaviour we can't influence, features intentionally out of scope, single-node topology assumptions in tests that assume a 3-node replica set, etc.). Each entry has a rationale in `validation_summary/expected_failures.py`. If you fix one of these gaps, delete its entry there.
+
+### `pymongo` (5)
+
+- **vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_hashed** — Hashed indexes are intentionally out of scope per CLAUDE.md. `createIndexes` rejects them explicitly with `CannotCreateIndex` (67) 'hashed indexes are not supported by SecantusDB' — a faithful not-supported error, which is the documented preference over a half-implemented index type.
+- **vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_text** — Text indexes are intentionally out of scope per CLAUDE.md (same gap as the node gauge's text-search test). `createIndexes` rejects them with `CannotCreateIndex` (67) 'text indexes are not supported by SecantusDB'.
+- **vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_maxtime_ms_message** — Blocked by `$where`, not by the behaviour under test. The test builds a deliberately slow query with `find({'$where': delay(...)})` and asserts the resulting timeout error names the configured timeouts. SecantusDB rejects `$where` up front (BadValue 2), so the command fails before any timeout can elapse. NOTE: this leaves the maxTimeMS *error-message* shape unverified by this gauge rather than known-good — it is untested here, not proven correct.
+- **vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_to_list_csot_applied** — Blocked by `$where`, same as `test_maxtime_ms_message`: the test delays the query with `find({'$where': delay(1)})` and asserts the raised error carries `.timeout == True`. `$where` is rejected up front, so the error is a BadValue rather than a timeout. NOTE: CSOT behaviour is therefore unverified by this gauge, not confirmed.
+- **vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_where** — `$where` runs server-side JavaScript and SecantusDB ships no JS runtime, so it is rejected with `BadValue` (2) 'unsupported top-level operator: $where'. Out of scope per tasks/backlog.md §4 — supporting it would mean embedding a JS engine as mongod does.
+
+### `pymongo (async)` (6)
+
+- **vendor/pymongo-tests/test/asynchronous/test_collection.py::AsyncTestCollection::test_index_hashed** — Hashed indexes are intentionally out of scope per CLAUDE.md. `createIndexes` rejects them explicitly with `CannotCreateIndex` (67) 'hashed indexes are not supported by SecantusDB' — a faithful not-supported error, which is the documented preference over a half-implemented index type.
+- **vendor/pymongo-tests/test/asynchronous/test_collection.py::AsyncTestCollection::test_index_text** — Text indexes are intentionally out of scope per CLAUDE.md (same gap as the node gauge's text-search test). `createIndexes` rejects them with `CannotCreateIndex` (67) 'text indexes are not supported by SecantusDB'.
+- **vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_maxtime_ms_message** — Blocked by `$where`, not by the behaviour under test. The test builds a deliberately slow query with `find({'$where': delay(...)})` and asserts the resulting timeout error names the configured timeouts. SecantusDB rejects `$where` up front (BadValue 2), so the command fails before any timeout can elapse. NOTE: this leaves the maxTimeMS *error-message* shape unverified by this gauge rather than known-good — it is untested here, not proven correct.
+- **vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_to_list_csot_applied** — Blocked by `$where`, same as `test_maxtime_ms_message`: the test delays the query with `find({'$where': delay(1)})` and asserts the raised error carries `.timeout == True`. `$where` is rejected up front, so the error is a BadValue rather than a timeout. NOTE: CSOT behaviour is therefore unverified by this gauge, not confirmed.
+- **vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_where** — `$where` runs server-side JavaScript and SecantusDB ships no JS runtime, so it is rejected with `BadValue` (2) 'unsupported top-level operator: $where'. Out of scope per tasks/backlog.md §4 — supporting it would mean embedding a JS engine as mongod does.
+- **vendor/pymongo-tests/test/asynchronous/test_read_preferences.py::TestMongosAndReadPreference::test_read_preference_hedge_deprecated** — Async-only, and never reaches the wire: the test constructs `PrimaryPreferred(hedge={'enabled': True})` and asserts a `DeprecationWarning` is raised by the driver's own constructor. Purely client-side pymongo behaviour, dependent on the ambient warning filters — no server can influence the outcome.
 
 ### `mongo-java-driver` (1)
 

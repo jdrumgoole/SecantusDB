@@ -1,6 +1,6 @@
 # pymongo Validation Report
 
-Generated 2026-08-12 — SecantusDB 0.6.0b9 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-08-17 — SecantusDB 0.6.0b11 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate` to refresh. The pass rate is the best honest measure of how close SecantusDB is to a complete MongoDB surrogate for the in-scope wire-protocol surface; gaps are the to-do list.
 
