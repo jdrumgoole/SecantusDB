@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from secantus.sql import run_sql
+from secantus.sql import errors, run_sql
 from secantus.sql.session import Session
 from secantus.storage import Storage
 
@@ -635,3 +635,46 @@ def test_pgjdbc_get_imported_keys_shape(storage, session):
         ("a", "x", 1, "fkt_x_fkey", "pkt_pkey"),
         ("b", "y", 2, "fkt_x_fkey", "pkt_pkey"),
     ]
+
+
+def test_comment_on_domain_and_obj_description(storage, session):
+    # pgjdbc's getUDTs reads a domain's REMARKS via obj_description(oid,
+    # 'pg_type'); COMMENT ON DOMAIN arrives as a sqlglot Command fallback,
+    # including the IS NULL removal (rewritten to the uncomment sentinel).
+    q(storage, session, "CREATE DOMAIN testint8 AS int8")
+    assert q(storage, session, "comment on domain testint8 is 'jdbc123'").command_tag == "COMMENT"
+    res = q(
+        storage,
+        session,
+        "SELECT obj_description(t.oid, 'pg_type') FROM pg_type t WHERE t.typname = 'testint8'",
+    )
+    assert res.rows == [("jdbc123",)]
+    q(storage, session, "comment on domain testint8 is NULL")
+    res = q(
+        storage,
+        session,
+        "SELECT obj_description(t.oid, 'pg_type') FROM pg_type t WHERE t.typname = 'testint8'",
+    )
+    assert res.rows == [(None,)]
+
+
+def test_comment_on_index_reflects_in_pg_description(storage, session):
+    # remarkIndexInfo: getIndexInfo LEFT JOINs pg_description on the index
+    # relation's oid to read REMARKS.
+    q(storage, session, "CREATE TABLE ct (a int primary key)")
+    q(storage, session, "CREATE INDEX idx_name ON ct (a)")
+    assert (
+        q(storage, session, "comment on index idx_name is 'index_comment'").command_tag == "COMMENT"
+    )
+    res = q(
+        storage,
+        session,
+        "SELECT d.description FROM pg_class ci"
+        " LEFT JOIN pg_description d ON (ci.oid = d.objoid)"
+        " WHERE ci.relname = 'idx_name'",
+    )
+    assert res.rows == [("index_comment",)]
+
+    with pytest.raises(errors.SQLError) as e:
+        q(storage, session, "comment on index no_such_index is 'x'")
+    assert e.value.sqlstate == "42704"

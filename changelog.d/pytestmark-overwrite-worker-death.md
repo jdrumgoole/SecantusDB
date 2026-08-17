@@ -18,3 +18,7 @@ test module's AST rejecting double `pytestmark` assignment.
   skipif) applied via a single `pytestmark` list.
 - New `tests/test_meta_pytestmark.py` guard against the overwrite
   pattern anywhere in the suite.
+- `test_rust_binary_pitr.py` tests now schedule on a single xdist worker
+  (`xdist_group`), so the machine-wide serialization flock never
+  contends within one suite — cross-worker queuing on it starved tests
+  to the fixture's 480s deadline under full-suite disk contention.

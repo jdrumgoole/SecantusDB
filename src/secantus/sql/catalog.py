@@ -109,6 +109,9 @@ DESCRIPTION_DELTA_COLLECTION = "__sql_description_delta__"
 # User-defined operators (CREATE OPERATOR) — registered so the DDL round-trips;
 # expression evaluation does not consult them.
 OPERATOR_COLLECTION = "__sql_operators__"
+# COMMENT ON INDEX comments, keyed by index name (resolved to the index
+# relation's oid at pg_description read time — minted oids can reshuffle).
+INDEX_COMMENT_COLLECTION = "__sql_index_comments__"
 RLS_COLLECTION = "__sql_rls__"
 COLUMN_GRANT_COLLECTION = "__sql_column_grants__"
 
@@ -137,6 +140,7 @@ ALL_CATALOG_COLLECTIONS = (
     COLUMN_GRANT_COLLECTION,
     DESCRIPTION_DELTA_COLLECTION,
     OPERATOR_COLLECTION,
+    INDEX_COMMENT_COLLECTION,
 )
 
 
@@ -1449,6 +1453,27 @@ class Catalog:
         for i, doc in enumerate(sorted(docs, key=lambda d: d["domain"])):
             out[doc["domain"]] = doc.get("oid", DOMAIN_TYPE_OID_BASE + i)
         return out
+
+    def set_domain_comment(self, db: str, name: str, comment: str | None) -> bool:
+        doc = self.get_domain(db, name)
+        if doc is None:
+            return False
+        doc = {k: v for k, v in doc.items() if k != "_id"}
+        doc["comment"] = comment
+        self._storage.delete_matching(db, DOMAIN_COLLECTION, {"_id": name})
+        self._storage.insert(db, DOMAIN_COLLECTION, [{"_id": name, **doc}])
+        return True
+
+    def set_index_comment(self, db: str, name: str, comment: str | None) -> None:
+        self._storage.delete_matching(db, INDEX_COMMENT_COLLECTION, {"_id": name})
+        if comment is not None:
+            self._storage.insert(db, INDEX_COMMENT_COLLECTION, [{"_id": name, "comment": comment}])
+
+    def index_comments(self, db: str) -> dict[str, str]:
+        return {
+            d["_id"]: d["comment"]
+            for d in self._storage.find_matching(db, INDEX_COMMENT_COLLECTION, {})
+        }
 
     def get_domain(self, db: str, name: str) -> dict[str, Any] | None:
         docs = self._storage.find_matching(db, DOMAIN_COLLECTION, {"_id": name}, limit=1)

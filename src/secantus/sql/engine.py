@@ -2519,6 +2519,8 @@ def _run_statement(
             return _drop_domain_command(stmt, db, catalog)
         if verb == "COMMENT_CONSTRAINT":
             return _comment_constraint_command(stmt, db, catalog)
+        if verb == "COMMENT" and _command_text(stmt).lstrip().upper().startswith("ON DOMAIN"):
+            return _comment_domain_command(stmt, db, catalog)
         if verb == "MULTIDROP_TABLE":
             # ``DROP TABLE a, b`` — one statement, one tag; without IF EXISTS
             # every name must resolve BEFORE anything drops (PG atomicity).
@@ -4087,6 +4089,30 @@ def _create_extension_command(stmt: exp.Command) -> SQLResult:
     if name not in _AVAILABLE_EXTENSIONS:
         raise errors.feature_not_supported(f'extension "{name}" is not available')
     return SQLResult(command_tag="CREATE EXTENSION")
+
+
+_COMMENT_DOMAIN_RE = re.compile(
+    r"(?is)^ON\s+DOMAIN\s+(?P<name>\"[^\"]+\"|\w+)\s+IS\s+(?P<value>NULL|'(?:[^']|'')*')\s*;?\s*$"
+)
+
+
+def _comment_domain_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLResult:
+    """``COMMENT ON DOMAIN d IS '…'`` (sqlglot Command fallback) — store on the
+    domain doc; surfaces via pg_description (classoid pg_type) and
+    obj_description, which is how pgjdbc's getUDTs reads REMARKS."""
+    m = _COMMENT_DOMAIN_RE.match(_command_text(stmt).strip())
+    if m is None:
+        raise errors.syntax_error(f"unparseable COMMENT ON DOMAIN: {stmt.sql()}")
+    name = _unquote_ident(m.group("name")).lower()
+    raw = m.group("value")
+    text = None if raw.upper() == "NULL" else raw[1:-1].replace("''", "'")
+    if text == planner.UNCOMMENT_SENTINEL:
+        # planner.parse rewrites ``IS NULL`` into this sentinel literal so the
+        # exp.Comment path can tell removal from absence; decode it here too.
+        text = None
+    if not catalog.set_domain_comment(db, name, text):
+        raise errors.SQLError("42704", f'type "{name}" does not exist')
+    return SQLResult(command_tag="COMMENT")
 
 
 def _comment_constraint_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLResult:

@@ -424,6 +424,21 @@ def execute_comment(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLRe
         target["comment"] = text
         catalog.put_function(db, target)
         return SQLResult(command_tag="COMMENT")
+    if kind == "INDEX":
+        # ``COMMENT ON INDEX idx IS '…'`` — stored keyed by index name and
+        # surfaced through pg_description on the index relation's oid
+        # (pgjdbc's getIndexInfo REMARKS join; remarkIndexInfo).
+        iname = stmt.this.name
+        known = {
+            ix.get("name")
+            for tn in catalog.list_tables(db)
+            if (t := catalog.get(db, tn)) is not None
+            for ix in storage.list_indexes(db, t.collection)
+        }
+        if iname not in known:
+            raise errors.SQLError("42704", f'relation "{iname}" does not exist')
+        catalog.set_index_comment(db, iname, text)
+        return SQLResult(command_tag="COMMENT")
     raise errors.feature_not_supported(f"COMMENT ON {kind} is not supported")
 
 

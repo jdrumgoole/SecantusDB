@@ -79,6 +79,12 @@ _BIN = _binary_path()
 pytestmark = [
     _TIMEOUT_MARK,
     pytest.mark.skipif(_BIN is None, reason="secantusdb binary not built"),
+    # All of this file's tests schedule on ONE worker (--dist=loadgroup), so
+    # the machine-wide serialization flock never contends WITHIN a suite —
+    # cross-worker queuing on it is what starved tests to the fixture's 480s
+    # deadline under full-suite disk contention. The flock stays to guard
+    # against a parallel worktree session's suite.
+    pytest.mark.xdist_group("rust_binary_serial"),
 ]
 
 # Each test here spawns a full secantusd-rs server plus a restore subprocess. Run
@@ -147,9 +153,11 @@ def _restore(
         # the full parallel suite it contends for disk I/O with the other xdist
         # workers' WiredTiger activity and sits in uninterruptible I/O wait —
         # always progressing (never hung; verified by sampling the process state),
-        # just 15-35x slower. Size the timeout for that worst case; a genuine hang
-        # still fails it by never completing.
-        timeout=600,
+        # historically 15-35x slower, with a measured ~90x outlier (600s cap
+        # exceeded, 2026-08-17; the same run passed solo in 6.9s). Size for that
+        # tail while staying inside the file's 1200s timeout marker; a genuine
+        # hang still fails it by never completing.
+        timeout=900,
     )
 
 
