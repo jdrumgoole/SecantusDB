@@ -4601,6 +4601,11 @@ def _create_domain_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLR
         raise errors.feature_not_supported(
             f'unsupported base type for domain "{name}": {kind.sql()}'
         )
+    # The base type's declared identity — a domain over ``varbit(3)`` /
+    # ``numeric(8,3)`` carries the length/precision on the domain's pg_type
+    # (typtypmod), which is where getColumns reads COLUMN_SIZE for a domain
+    # column. Captured before the constraint loop reassigns ``kind``.
+    base_ident = planner._decl_identity(kind) if isinstance(kind, exp.DataType) else {}
     not_null = False
     checks: list[dict[str, str]] = []
     has_default, default = False, None
@@ -4626,6 +4631,8 @@ def _create_domain_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLR
         checks=checks,
         has_default=has_default,
         default=default,
+        typmod=base_ident.get("typmod", -1),
+        base_oid=base_ident.get("decl_oid"),
     )
     return SQLResult(command_tag="CREATE DOMAIN")
 

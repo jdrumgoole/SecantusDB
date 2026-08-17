@@ -1490,6 +1490,8 @@ class Catalog:
         checks: list[dict[str, Any]] | None = None,
         has_default: bool = False,
         default: Any = None,
+        typmod: int = -1,
+        base_oid: int | None = None,
     ) -> None:
         self._storage.delete_matching(db, DOMAIN_COLLECTION, {"_id": name})
         self._storage.insert(
@@ -1504,6 +1506,11 @@ class Catalog:
                     "checks": list(checks or []),
                     "has_default": bool(has_default),
                     "default": default,
+                    # The base type's declared typmod / oid (``varbit(3)`` →
+                    # typmod 3), surfaced as the domain's pg_type.typtypmod /
+                    # typbasetype so getColumns reports COLUMN_SIZE.
+                    "typmod": int(typmod),
+                    "base_oid": base_oid,
                     "oid": self._mint_user_type_oid(
                         db, "domain_oid_counter", DOMAIN_TYPE_OID_BASE, DOMAIN_COLLECTION
                     ),
