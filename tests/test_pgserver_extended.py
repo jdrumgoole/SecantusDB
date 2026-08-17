@@ -1003,3 +1003,34 @@ def test_negative_extra_float_digits_reduces_precision(client):
         pgwire.build_execute("", 0),
     )
     assert rows(msgs) == [[b"0.33333", b"0.33333333333333"]]
+
+
+def test_nested_begin_warns_25001_with_pg_fields(client):
+    # pgtest implicit_txn:49 — BEGIN inside an explicit block completes with
+    # the BEGIN tag but emits a WARNING NoticeResponse carrying PG's exact
+    # identity fields (25001, xact.c, BeginTransactionBlock); the block
+    # survives.
+    client.exchange(
+        pgwire.build_parse("", "BEGIN", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    msgs = client.exchange(
+        pgwire.build_parse("", "BEGIN", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    notice = next(m for m in msgs if m.type == "N")
+    fields = pgwire.parse_error_response(notice.payload)
+    assert fields.get("S") == "WARNING"
+    assert fields.get("C") == "25001"
+    assert fields.get("M") == "there is already a transaction in progress"
+    assert fields.get("F") == "xact.c"
+    assert fields.get("R") == "BeginTransactionBlock"
+    assert command_tag(msgs) == "BEGIN"
+    assert msgs[-1].payload == b"T"  # still in the block
+    client.exchange(
+        pgwire.build_parse("", "ROLLBACK", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )

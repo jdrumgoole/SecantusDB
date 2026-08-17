@@ -497,6 +497,8 @@ def notice_response(
     severity: str = "NOTICE",
     sqlstate: str = "00000",
     encoding: str | None = "utf-8",
+    file: str | None = None,
+    routine: str | None = None,
 ) -> bytes:
     payload = (
         b"S"
@@ -508,9 +510,12 @@ def notice_response(
         + b"M"
         + encode_text(message, encoding, lossy=True)
         + b"\x00"
-        + b"\x00"
     )
-    return _msg("N", payload)
+    if file is not None:
+        payload += b"F" + _cstr(file)
+    if routine is not None:
+        payload += b"R" + _cstr(routine)
+    return _msg("N", payload + b"\x00")
 
 
 def copy_in_response(column_count: int, *, binary: bool = False) -> bytes:

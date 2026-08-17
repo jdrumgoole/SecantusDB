@@ -1041,12 +1041,17 @@ class SecantusPGServer:
 def _render_result(res: Any, encoding: str | None = "utf-8", session: Any = None) -> bytes:
     """Serialise one ``SQLResult`` to its backend messages."""
     out = bytearray()
-    for severity, message in getattr(res, "notices", ()) or ():
+    for notice in getattr(res, "notices", ()) or ():
+        severity, message = notice[0], notice[1]
         out += pgwire.notice_response(
             message,
             severity=severity,
-            sqlstate="01000" if severity == "WARNING" else "00000",
+            sqlstate=(
+                notice[2] if len(notice) > 2 else ("01000" if severity == "WARNING" else "00000")
+            ),
             encoding=encoding,
+            file=notice[3] if len(notice) > 3 else None,
+            routine=notice[4] if len(notice) > 4 else None,
         )
     status = list(res.parameter_status)
     if session is not None and session.pending_parameter_status:
