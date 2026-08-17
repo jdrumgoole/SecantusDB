@@ -2684,11 +2684,16 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   (severity, message[, sqlstate[, file[, routine]]])). Slice 17
   greened `inet`: malformed binary inet payloads get PG's error
   classes — a truncated header is 08P01, a bad family or address
-  length is 22P03 (inet_recv; XX000 leaked before). Corpus: 24
-  unexpected failures — green now also includes inet. Next:
-  `int2vector`, `jsonpath` (`multiple_active_portals` needs
-  fresh-state isolation — leftover `mytable`/`ltree` deps). Iterate
-  file-by-file.
+  length is 22P03 (inet_recv; XX000 leaked before). Slice 18 greened
+  `int2vector` (one documented divergence: the corpus expects crdb's
+  indoption=2 NULLS-FIRST pkey value; PG and we report 0 — matching
+  2 would corrupt SQLAlchemy reflection; in EXPECTED_DIVERGENCES):
+  the BINARY wire form of int2vector is now a real int2 ARRAY —
+  elemoid 21, 2-byte elements, lower bound 1 (crdb #111907's
+  regression class; the text "0" leaked through binary result
+  format before). Corpus: 23 unexpected failures. Next: `jsonpath`,
+  `ltree` (`multiple_active_portals` needs fresh-state isolation —
+  leftover `mytable`/`ltree` deps). Iterate file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
