@@ -259,9 +259,20 @@ def test_wire_level_cross_connection_exclusion(tmp_path):
             assert c2.execute("SELECT pg_try_advisory_lock(21)").fetchone() == (False,)
             c1.execute("SELECT pg_advisory_unlock(21)")
             assert c2.execute("SELECT pg_try_advisory_lock(21)").fetchone() == (True,)
-        # Both connections closed — a fresh one can take either key.
+        # Both connections closed — a fresh one can take either key. The
+        # server releases a dropped connection's holds in ITS OWN connection
+        # thread's teardown, which the client's close() does not wait for, so
+        # poll for the release instead of assuming it is instantaneous (a
+        # bare assert here failed on a loaded CI runner: c3 probed before the
+        # server had reaped c2).
         with psycopg.connect(dsn, autocommit=True) as c3:
-            assert c3.execute("SELECT pg_try_advisory_lock(21)").fetchone() == (True,)
+            deadline = time.monotonic() + 10
+            while True:
+                got = c3.execute("SELECT pg_try_advisory_lock(21)").fetchone()
+                if got == (True,) or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+            assert got == (True,)
     finally:
         srv.stop()
         st.close()
