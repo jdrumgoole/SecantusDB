@@ -1478,3 +1478,33 @@ def test_exact_max_rows_suspends_then_reports_zero(client):
         pgwire.build_bind("", "", []),
         pgwire.build_execute("", 0),
     )
+
+
+def test_bind_parameter_count_must_match_declared(client):
+    # pgtest prepare — Bind must supply exactly as many parameters as the
+    # prepared statement has, and DECLARED oids count even when the query uses
+    # fewer placeholders (three declared, one used → a one-parameter Bind is
+    # 08P01).
+    msgs = client.exchange(
+        pgwire.build_parse("s3", "SELECT $1", [1043, 1043, 1043]),
+        pgwire.build_bind("p3", "s3", [b"a", b"b", b"c"]),
+        pgwire.build_execute("p3", 0),
+    )
+    assert rows(msgs) == [[b"a"]]
+    msgs = client.exchange(
+        pgwire.build_bind("p3", "s3", [b"a"]),
+        pgwire.build_execute("p3", 0),
+    )
+    err = next(m for m in msgs if m.type == "E")
+    fields = pgwire.parse_error_response(err.payload)
+    assert fields.get("C") == "08P01"
+    assert fields.get("M") == "bind message supplies 1 parameters, but requires 3"
+    # A COPY still reports its own 08P01, with PG's statement-summary Detail.
+    msgs = client.exchange(
+        pgwire.build_parse("", "COPY (select $1::int) TO STDOUT", []),
+        pgwire.build_bind("", "", [b"1"]),
+        pgwire.build_execute("", 0),
+    )
+    fields = pgwire.parse_error_response(next(m for m in msgs if m.type == "E").payload)
+    assert fields.get("C") == "08P01"
+    assert "statement summary" in fields.get("D", "")

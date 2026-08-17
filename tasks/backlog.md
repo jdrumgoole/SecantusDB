@@ -2754,8 +2754,25 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   exercised** — they cover 34000 'unknown portal' (already
   implemented) and 42P03 'cursor "p" already exists as portal'
   (NOT implemented — a DECLARE colliding with an open portal name).
-  Corpus: 17 unexpected failures. Next: `prepare`,
-  `prepared_stmt_invalidation`. Iterate file-by-file.
+  Corpus: 17 unexpected failures. Slice 26 greened `prepare`: Bind now
+  requires exactly as many parameters as the prepared statement has,
+  and DECLARED oids count even when the query uses fewer placeholders
+  (three declared / one used → a one-parameter Bind is 08P01). The
+  check sits AFTER the COPY-specific 08P01, whose error carries PG's
+  statement-summary Detail — putting it first regressed the `copy`
+  file, which the full-corpus re-run caught.
+  **Gauge-harness limitation found (next piece of work): our runner
+  shares ONE daemon across all 58 corpus files, but the corpus assumes
+  a clean database per file** — `execute` leaves table `t0` behind and
+  `prepare:163` then fails `CREATE TABLE t0` with 42P07, even though
+  `prepare` passes in isolation. Upstream crdb's harness has
+  `WalkWithNewServer` (per-file server) for exactly this; our Go driver
+  uses `WalkWithRunningServer` because the Go test can't spawn our
+  Python daemon. Fix: loop per file in `pgtest_validation/runner.py`,
+  fresh daemon each, concatenating the `-json` streams. Until then the
+  full-run count is INFLATED by cross-file pollution. Corpus: 16
+  unexpected failures (`prepare` passes isolated). Next: the runner
+  isolation fix, then `prepared_stmt_invalidation`.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``

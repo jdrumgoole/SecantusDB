@@ -1481,6 +1481,17 @@ class ExtendedSession:
                 f"bind message supplies {len(raw_values)} parameters, but requires 0",
                 diag={"D": f'statement summary "{summary}"'},
             )
+        # PG requires Bind to supply exactly as many parameters as the prepared
+        # statement has — the DECLARED oids count even when the query uses
+        # fewer (pgtest prepare declares three for a one-placeholder query and
+        # rejects a one-parameter Bind). Checked AFTER the COPY case above,
+        # whose error carries PG's statement-summary Detail.
+        expected = max(len(prep.param_oids), prep.param_count)
+        if len(raw_values) != expected:
+            raise errors.SQLError(
+                "08P01",
+                f"bind message supplies {len(raw_values)} parameters, but requires {expected}",
+            )
         values: list[Any] = []
         for i, raw in enumerate(raw_values):
             if not formats:
