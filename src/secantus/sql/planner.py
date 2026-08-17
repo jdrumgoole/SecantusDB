@@ -6033,6 +6033,19 @@ def _plan_grouping_sets_window_select(
             field_tags[fname] = "json"
             agg_field_names.append(fname)
             return fname
+        sa = _string_agg_arg(node)
+        if sa is not None:
+            # A function-wrapped ``string_agg`` (``decode(string_agg(…),
+            # 'hex')`` — RefCursorFetchTest's seeding INSERT) reaches the
+            # computed-projection registrar; push the values and join with the
+            # separator in the reduction, like the plain string_agg path does.
+            sa_expr, sep = sa
+            fname = names.fresh("string_agg")
+            accumulators[fname] = {"$push": _agg_arg_to_expr(sa_expr, table)}
+            reductions[fname] = _string_agg_project(fname, sep)
+            field_tags[fname] = "text"
+            agg_field_names.append(fname)
+            return fname
         agg = _aggregate_of(node)
         if agg is None:
             raise errors.feature_not_supported(f"unsupported aggregate: {node.sql()}")
@@ -6622,6 +6635,19 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
             fname = names.fresh("array_agg")
             accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
             field_tags[fname] = "json"
+            agg_field_names.append(fname)
+            return fname
+        sa = _string_agg_arg(node)
+        if sa is not None:
+            # A function-wrapped ``string_agg`` (``decode(string_agg(…),
+            # 'hex')`` — RefCursorFetchTest's seeding INSERT) reaches the
+            # computed-projection registrar; push the values and join with the
+            # separator in the reduction, like the plain string_agg path does.
+            sa_expr, sep = sa
+            fname = names.fresh("string_agg")
+            accumulators[fname] = {"$push": _agg_arg_to_expr(sa_expr, table)}
+            reductions[fname] = _string_agg_project(fname, sep)
+            field_tags[fname] = "text"
             agg_field_names.append(fname)
             return fname
         agg = _aggregate_of(node)

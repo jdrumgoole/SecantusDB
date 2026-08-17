@@ -45,6 +45,7 @@ _NAMED_SRFS = frozenset(
         "json_each",
         "jsonb_each_text",
         "json_each_text",
+        "pg_get_keywords",
     }
 )
 
@@ -64,11 +65,125 @@ _RECORD_SRFS = frozenset(
         # ``(_pg_expandarray(x)).n`` — so this is not reachable from those
         # queries. See tasks/backlog.md.
         "_pg_expandarray",
+        # pg_get_keywords() -> (word, catcode, barelabel, catdesc, baredesc):
+        # the server's keyword list; pgjdbc's getSQLKeywords string_aggs it.
+        "pg_get_keywords",
     }
 )
 
 #: Per-record-SRF default column names (the jsonb_each family is key/value).
-_RECORD_SRF_COLUMNS = {"_pg_expandarray": ["x", "n"]}
+_RECORD_SRF_COLUMNS = {
+    "_pg_expandarray": ["x", "n"],
+    "pg_get_keywords": ["word", "catcode", "barelabel", "catdesc", "baredesc"],
+}
+
+#: The PG-specific keyword list served by ``pg_get_keywords()`` — the words a
+#: JDBC client can't find in SQL:2003 (pgjdbc filters that standard set out and
+#: asserts ``reindex`` survives). catcode: R reserved, U unreserved.
+_PG_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("abort", "U"),
+    ("analyse", "R"),
+    ("analyze", "R"),
+    ("attach", "U"),
+    ("backward", "U"),
+    ("cluster", "U"),
+    ("comment", "U"),
+    ("concurrently", "R"),
+    ("conflict", "U"),
+    ("copy", "U"),
+    ("cost", "U"),
+    ("csv", "U"),
+    ("current_catalog", "R"),
+    ("current_schema", "R"),
+    ("delimiter", "U"),
+    ("detach", "U"),
+    ("discard", "U"),
+    ("do", "R"),
+    ("enum", "U"),
+    ("explain", "U"),
+    ("extension", "U"),
+    ("family", "U"),
+    ("forward", "U"),
+    ("freeze", "R"),
+    ("greatest", "U"),
+    ("handler", "U"),
+    ("header", "U"),
+    ("ilike", "R"),
+    ("immutable", "U"),
+    ("inherit", "U"),
+    ("inherits", "U"),
+    ("isnull", "R"),
+    ("lateral", "R"),
+    ("least", "U"),
+    ("limit", "R"),
+    ("listen", "U"),
+    ("load", "U"),
+    ("lock", "U"),
+    ("logged", "U"),
+    ("mode", "U"),
+    ("move", "U"),
+    ("notify", "U"),
+    ("notnull", "R"),
+    ("nowait", "U"),
+    ("off", "U"),
+    ("offset", "R"),
+    ("oids", "U"),
+    ("owned", "U"),
+    ("owner", "U"),
+    ("parallel", "U"),
+    ("passing", "U"),
+    ("password", "U"),
+    ("plans", "U"),
+    ("policy", "U"),
+    ("prepared", "U"),
+    ("procedural", "U"),
+    ("publication", "U"),
+    ("refresh", "U"),
+    ("reindex", "U"),
+    ("rename", "U"),
+    ("replica", "U"),
+    ("reset", "U"),
+    ("restart", "U"),
+    ("returning", "R"),
+    ("rule", "U"),
+    ("setof", "U"),
+    ("share", "U"),
+    ("show", "U"),
+    ("skip", "U"),
+    ("snapshot", "U"),
+    ("stable", "U"),
+    ("standalone", "U"),
+    ("storage", "U"),
+    ("stored", "U"),
+    ("strict", "U"),
+    ("subscription", "U"),
+    ("support", "U"),
+    ("sysid", "U"),
+    ("tables", "U"),
+    ("tablespace", "U"),
+    ("truncate", "U"),
+    ("trusted", "U"),
+    ("unlisten", "U"),
+    ("unlogged", "U"),
+    ("vacuum", "U"),
+    ("valid", "U"),
+    ("validate", "U"),
+    ("validator", "U"),
+    ("variadic", "R"),
+    ("verbose", "R"),
+    ("volatile", "U"),
+    ("whitespace", "U"),
+    ("xmlattributes", "U"),
+    ("xmlconcat", "U"),
+    ("xmlelement", "U"),
+    ("xmlexists", "U"),
+    ("xmlforest", "U"),
+    ("xmlparse", "U"),
+    ("xmlpi", "U"),
+    ("xmlroot", "U"),
+    ("xmlserialize", "U"),
+    ("yes", "U"),
+)
 
 
 def _is_record_srf(node: exp.Expression) -> bool:
@@ -326,6 +441,14 @@ def _record_values(node: exp.Expression, ctx: Any) -> tuple[list[tuple[Any, Any]
     if name == "_pg_expandarray":
         items_list = list(value) if isinstance(value, (list, tuple)) else []
         return [(v, i) for i, v in enumerate(items_list, start=1)], ["any", "int4"]
+    if name == "pg_get_keywords":
+        return [(word, code, False, None, None) for word, code in _PG_KEYWORDS], [
+            "text",
+            "text",
+            "bool",
+            "text",
+            "text",
+        ]
     doc = _as_json(value)
     items = list(doc.items()) if isinstance(doc, dict) else []
     if name in ("jsonb_each_text", "json_each_text"):
@@ -515,19 +638,22 @@ def _build_record(source: SrfSource, ctx: Any) -> tuple[list[dict[str, Any]], Ta
     # single-column SRF, where ``AS g`` names the lone column).
     names = list(source.column_aliases) if source.column_aliases else list(default_names)
     names += default_names[len(names) :]  # pad if fewer aliases than columns
+    width = len(default_names)
     columns = [
         Column(name=names[i], type_tag=tags[i], field=names[i], pk=False, nullable=True)
-        for i in range(2)
+        for i in range(width)
     ]
     ord_col = None
     if source.ordinality:
-        ord_col = source.column_aliases[2] if len(source.column_aliases) > 2 else "ordinality"
+        ord_col = (
+            source.column_aliases[width] if len(source.column_aliases) > width else "ordinality"
+        )
         columns.append(
             Column(name=ord_col, type_tag="int8", field=ord_col, pk=False, nullable=True)
         )
     rows: list[dict[str, Any]] = []
-    for i, (k, v) in enumerate(pairs, start=1):
-        row = {names[0]: k, names[1]: v}
+    for i, rec in enumerate(pairs, start=1):
+        row = {names[j]: rec[j] for j in range(width)}
         if ord_col is not None:
             row[ord_col] = i
         rows.append(row)

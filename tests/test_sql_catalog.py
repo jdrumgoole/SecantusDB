@@ -678,3 +678,42 @@ def test_comment_on_index_reflects_in_pg_description(storage, session):
     with pytest.raises(errors.SQLError) as e:
         q(storage, session, "comment on index no_such_index is 'x'")
     assert e.value.sqlstate == "42704"
+
+
+def test_pg_get_keywords_and_sql_keywords_query(storage, session):
+    # pgjdbc's getSQLKeywords: string_agg over the keywords SRF with a
+    # <> ALL array filter. reindex must be present (the test asserts it).
+    res = q(
+        storage,
+        session,
+        "SELECT string_agg(word, ',') FROM pg_catalog.pg_get_keywords()"
+        " WHERE word <> ALL ('{abort,do}'::text[])",
+    )
+    words = res.rows[0][0].split(",")
+    assert "reindex" in words
+    assert "abort" not in words and "do" not in words
+    assert len(words) == len(set(words))
+
+
+def test_aggregates_over_srf_from(storage, session):
+    assert q(storage, session, "SELECT sum(g) FROM generate_series(1, 3) g").rows == [(6,)]
+    assert q(storage, session, "SELECT string_agg('ab', '') FROM generate_series(1, 3)").rows == [
+        ("ababab",)
+    ]
+    assert q(storage, session, "SELECT array_agg(g) FROM generate_series(1,3) g").rows == [
+        ([1, 2, 3],)
+    ]
+
+
+def test_scalar_subquery_over_srf(storage, session):
+    res = q(storage, session, "SELECT (SELECT string_agg('ab', '') FROM generate_series(1, 3))")
+    assert res.rows == [("ababab",)]
+
+
+def test_function_wrapped_string_agg(storage, session):
+    q(storage, session, "CREATE TABLE wsa (b text)")
+    q(storage, session, "INSERT INTO wsa VALUES ('61'), ('62')")
+    assert q(storage, session, "SELECT decode(string_agg(b, ''), 'hex') FROM wsa").rows == [
+        (b"ab",)
+    ]
+    assert q(storage, session, "SELECT upper(string_agg(b, '-')) FROM wsa").rows == [("61-62",)]

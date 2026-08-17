@@ -2966,12 +2966,15 @@ shared storage engine or building large new protocol subsystems:
     getColumnsCharOctetLength (2F); ALTER TABLE DROP of a quoted
     ``"name"`` column mis-parsed as `DROP name` (2F).
     RefCursorTest is 8/8 after the plpgsql OPEN/refcursor slice;
-    RefCursorFetchTest is blocked at class setup on **aggregates over an
-    SRF row source** — its seeding INSERT runs `string_agg(…) FROM
-    generate_series(1, 4096)` in a scalar subquery, and only `count(*)`
-    currently evaluates over a generate_series FROM (`sum(g)` /
-    `array_agg(g)` / `string_agg(…)` all fail "expected a column" /
-    "group_concat() is not supported in this context").
+    RefCursorFetchTest: aggregates over SRF row sources now work
+    (sum/string_agg/array_agg over generate_series, incl. in scalar
+    subqueries), but the class's seeding INSERT still fails one layer
+    deeper — its string_agg ARGUMENT is
+    `lpad(to_hex(width_bucket(random(),0,1,256)-1),2,'0')` and
+    `_agg_arg_to_expr` can't compile lpad/to_hex/width_bucket/random
+    into pipeline expressions ("unsupported array_agg argument").
+    Either extend the pipeline expression vocabulary or evaluate
+    aggregate args per row in Python on the derived path.
   - **AutoRollbackTest savepoint/autosave semantics** (~24): `autosave`
     modes and `flushCacheOnDeallocate` / `DEALLOCATE ALL` behaviour around
     failed statements in a transaction.
