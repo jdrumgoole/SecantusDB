@@ -29,6 +29,7 @@ from secantus.sql import (
     rls,
     scalar,
     srf,
+    typecheck,
     typemap,
     virtual,
 )
@@ -2386,6 +2387,14 @@ def _run_statement(
         planner.expand_using_star(stmt, catalog, db)
         planner.expand_table_stars(stmt, catalog, db)
     planner.desugar_join_using(stmt)
+    # Postgres resolves comparison operators during parse analysis, so a
+    # cross-category comparison (``text_col = 42``) is a 42883 before any row
+    # is read — not a predicate that matches nothing. Sound-but-incomplete:
+    # a no-op for anything it cannot decide (see secantus.sql.typecheck).
+    # Skipped on the CTE re-entry path — a materialized CTE's TableDef carries
+    # types inferred from its own result shape, not declared ones.
+    if not isinstance(catalog, _CTECatalog):
+        typecheck.check_statement(stmt, catalog, db)
     if isinstance(stmt, exp.Create):
         kind = (stmt.args.get("kind") or "TABLE").upper()
         if kind == "TABLE":

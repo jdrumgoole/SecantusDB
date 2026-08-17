@@ -271,6 +271,29 @@ permanent divergences from real Postgres:
   significant digits where real Postgres keeps arbitrary precision.
   (pgjdbc's `NumericTransfer2Test` asserts wider round-trips.)
 
+#### Comparing incompatible types is an error, not an empty result
+
+Postgres resolves a comparison operator while it *analyses* a statement, so
+comparing a `text` column against an integer fails before any row is read:
+
+```sql
+SELECT * FROM users WHERE name = 42;
+-- ERROR:  operator does not exist: text = integer   (SQLSTATE 42883)
+```
+
+An untyped literal is not a type — Postgres resolves it to the other operand —
+so `name = '42'` and `age = '42'` both keep working, as does any numeric-vs-numeric
+or date-vs-timestamp pair. The check covers the six binary comparison operators
+on **declared** tables, across four type categories (numeric / string / boolean /
+date-time). It is deliberately conservative: bound parameters, subqueries,
+arithmetic, most function results, CTEs, derived tables and views are left to
+run, because a wrong `42883` would break a working query.
+
+Reflected tables (see "Reflected tables and jsonb", below) are
+exempt. Their column types come from sampling documents, so a field may be typed
+`text` while holding integers — comparing across BSON types is the point of the
+dual-protocol path, and stays permissive there.
+
 ### Evolving a table (`ALTER TABLE`)
 
 `ALTER TABLE` rewrites the catalog entry and, where the data must follow, the

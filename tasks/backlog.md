@@ -2873,13 +2873,43 @@ and the `maxMessageSizeBytes` framing). The pattern is consistent enough to
 be worth naming: **this backlog's prose is a hypothesis, not evidence.**
 
 
-- [ ] **Cross-type comparisons evaluate to false instead of erroring.** A per-row
-  predicate comparing incompatible types (`int_col = substr(text_col, 1, 1)`)
-  quietly matches nothing; real Postgres raises `42883 operator does not exist:
-  bigint = text` at plan time. The scalar evaluator's Python `==` absorbs the
-  mismatch. Faithful behaviour needs type-aware comparison in the evaluator —
-  weigh against the dual-protocol reflected-table case where cross-BSON-type
-  comparison is deliberate.
+- [ ] **Cross-type comparisons: the remaining lenient pairs.** The plan-time
+  42883 analysis shipped in `src/secantus/sql/typecheck.py` — a comparison
+  between two *confidently-typed* operands drawn from two different categories
+  (numeric / string / boolean / date-time) now raises `42883 operator does not
+  exist: text = integer` before any row is read, on declared tables. What is
+  still deliberately lenient, and why:
+  - **Reflected (schema-on-read) tables are exempt wholesale.** A reflected
+    column's type comes from sampling 50 documents, so a heterogeneous BSON
+    field can be declared `text` while holding integers; the dual-protocol
+    path *wants* the cross-BSON-type comparison. This is not a gap to close —
+    it is the correct answer for that table kind.
+  - **Categories not modelled**: `bytea`, `uuid`, `json`, `money`, `oid`,
+    `interval`, `time`/`timetz`, `"char"`, arrays, ranges, geo, network, bit.
+    Several of those pairs genuinely error in Postgres (`bytea = text`,
+    `uuid = text`, `interval = integer`), but the implicit-cast graph is
+    subtler and a false 42883 is worse than the lenient FALSE.
+  - **Same-category pairs Postgres still rejects**: `enum = text` (an enum
+    column carries the `text` tag here), `citext = name`. Lenient by design.
+  - **Operand shapes not typed**: bound parameters, subqueries, arithmetic,
+    `||`, `CASE`, and every function outside the small text-preserving /
+    int-returning allowlist. Also `IN`-lists and `BETWEEN` (only the six binary
+    comparison operators are analysed).
+  - **Statement shapes skipped**: CTEs, derived tables, set operations, table
+    functions in FROM, views, and any comparison nested inside a subquery
+    scope. Also **FROM-less selects** (`SELECT 'a'::text = 1`) — the analysis
+    is driven by declared column types, and constant-only expressions are most
+    of what the psycopg / SQLAlchemy gauges evaluate, so widening to them wants
+    its own gauge run.
+  - **`UPDATE … SET col = expr`** is an assignment, not a comparison: Postgres
+    reports an unassignable value as `42804 datatype_mismatch` under
+    assignment-cast rules. Still unimplemented — a `SET text_col = 42` is
+    silently coerced.
+  - **Not yet verified against the psycopg / sqllogictest / SQLAlchemy
+    gauges** (`invoke validate-psycopg` / `validate-slt` /
+    `validate-sqlalchemy`). The 2812-test `tests/test_sql*.py` suite and the
+    418-test `tests/test_pgserver*.py` suite are green, but the vendored
+    gauges are the only population large enough to expose a false 42883.
 
 The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike of
 `tasks/sql-postgres-plan.md`. Known gaps, to close in later phases:

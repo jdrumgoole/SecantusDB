@@ -302,6 +302,24 @@ def test_undefined_table_sqlstate(server):
         conn.execute("SELECT * FROM nonexistent")
 
 
+def test_cross_type_comparison_sqlstate(server):
+    """Comparing a text column against an integer is a parse-analysis failure in
+    Postgres, so psycopg must see ``42883 undefined_function`` — not an empty
+    result set. ``= '42'`` (an untyped literal) must keep working."""
+    with connect(server, autocommit=True) as conn:
+        conn.execute("CREATE TABLE ct (id bigint primary key, name text, age int)")
+        conn.execute("INSERT INTO ct (id, name, age) VALUES (1, '42', 42)")
+        with pytest.raises(psycopg.errors.UndefinedFunction) as ei:
+            conn.execute("SELECT id FROM ct WHERE name = 42")
+        assert ei.value.sqlstate == "42883"
+        assert "operator does not exist: text = integer" in str(ei.value)
+    with connect(server, autocommit=True) as conn:
+        assert conn.execute("SELECT id FROM ct WHERE name = '42'").fetchall() == [(1,)]
+        assert conn.execute("SELECT id FROM ct WHERE age = 42").fetchall() == [(1,)]
+        # A bound parameter is typed from the column, so this resolves too.
+        assert conn.execute("SELECT id FROM ct WHERE name = %s", ("42",)).fetchall() == [(1,)]
+
+
 # -- SQLAlchemy via the psycopg dialect -------------------------------------- #
 
 
