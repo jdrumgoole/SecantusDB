@@ -460,7 +460,22 @@ def _begin_txn(storage: Any, session: Session, modes: list | None = None) -> SQL
             " ".join(str(m) for m in (modes or []))
         ).items():
             session.set_local(name, value)
-    return SQLResult(command_tag="BEGIN")
+        return SQLResult(command_tag="BEGIN")
+    # A nested BEGIN inside an EXPLICIT block: PG warns 25001, keeps the
+    # block, and still completes with the BEGIN tag — the pgtest
+    # implicit_txn corpus reads the WARNING's File/Routine fields.
+    return SQLResult(
+        command_tag="BEGIN",
+        notices=[
+            (
+                "WARNING",
+                "there is already a transaction in progress",
+                "25001",
+                "xact.c",
+                "BeginTransactionBlock",
+            )
+        ],
+    )
 
 
 def _write_statement_verb(stmt: exp.Expression) -> str | None:

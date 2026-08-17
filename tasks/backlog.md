@@ -2676,10 +2676,16 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   element tag); extra_float_digits < 1 reduces %g precision for both
   float widths; SET with a NEGATIVE value no longer drops the sign
   (Neg's .name is the bare inner literal); bare ARRAY[…]/ROW(…)
-  constructors name their columns array/row. Corpus: 26 unexpected
-  failures — green now also includes float. Next: `implicit_txn`,
-  `inet` (`multiple_active_portals` needs fresh-state isolation —
-  leftover `mytable`/`ltree` deps). Iterate file-by-file.
+  constructors name their columns array/row. Slice 16 greened
+  `implicit_txn`: a nested BEGIN inside an explicit block completes
+  with the BEGIN tag but emits PG's WARNING notice — 25001 with the
+  File/Routine identity fields (xact.c / BeginTransactionBlock),
+  which the notice plumbing now carries (SQLResult.notices accepts
+  (severity, message[, sqlstate[, file[, routine]]])). Corpus: 25
+  unexpected failures — green now also includes implicit_txn. Next:
+  `inet`, `int2vector` (`multiple_active_portals` needs fresh-state
+  isolation — leftover `mytable`/`ltree` deps). Iterate
+  file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
