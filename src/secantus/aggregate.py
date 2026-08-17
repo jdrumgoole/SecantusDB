@@ -71,6 +71,14 @@ class PipelineContext:
     # request's ``collation`` argument; ``None`` keeps default
     # codepoint comparison.
     collation: Any = None
+    # Cleared (sticky) by ``apply_pipeline`` when any stage — including nested
+    # $lookup/$facet/$unionWith sub-pipelines — mutates docs in place ($fill's
+    # locf/linear and $densify write through set_path without copying). While
+    # True, ``$unwind`` may produce shallow top-level copies that share
+    # unmutated subtrees instead of deepcopying every fanned-out doc — the
+    # dominant cost of high-fanout join pipelines (pgjdbc's getImportedKeys
+    # 9-way join). Never flips back to True on a ctx once cleared.
+    shared_unwind_ok: bool = True
     # The aggregate command's request body (minus the ``$db`` /
     # ``lsid`` envelope fields). Surfaced by ``$currentOp`` as the
     # ``command`` sub-doc on the self-row mongo-node-driver's
@@ -135,9 +143,34 @@ def apply_pipeline(
                         code=40601,
                         code_name="Location40601",
                     )
+    if ctx.shared_unwind_ok and _pipeline_mutates_in_place(pipeline):
+        ctx.shared_unwind_ok = False
     for stage in pipeline:
         docs = _apply_stage(stage, docs, ctx)
     return docs
+
+
+def _pipeline_mutates_in_place(pipeline: Any) -> bool:
+    """Whether any stage (recursing into $lookup / $facet / $unionWith
+    sub-pipelines) writes through docs without copying — the gate for
+    ``$unwind``'s shared shallow-copy fast path."""
+    if not isinstance(pipeline, list):
+        return False
+    for stage in pipeline:
+        if not isinstance(stage, Mapping):
+            continue
+        if "$fill" in stage or "$densify" in stage:
+            return True
+        for key in ("$lookup", "$unionWith"):
+            spec = stage.get(key)
+            if isinstance(spec, Mapping) and _pipeline_mutates_in_place(spec.get("pipeline")):
+                return True
+        facet = stage.get("$facet")
+        if isinstance(facet, Mapping):
+            for sub in facet.values():
+                if _pipeline_mutates_in_place(sub):
+                    return True
+    return False
 
 
 def _apply_stage(
@@ -725,32 +758,40 @@ def _stage_unwind(
         )
     path = raw_path.lstrip("$")
 
+    # Fast path: a top-level unwind field in a pipeline with no in-place
+    # mutating stage (see PipelineContext.shared_unwind_ok) fans out with a
+    # shallow dict copy — every stage that writes docs deepcopies its input
+    # first, so shared subtrees are never corrupted. High-fanout join
+    # pipelines spend nearly all their time in this deepcopy otherwise.
+    shallow = _ctx.shared_unwind_ok and "." not in path
+    _copy = (lambda d: dict(d)) if shallow else copy.deepcopy
+
     result: list[dict[str, Any]] = []
     for doc in docs:
         value = get_path(doc, path)
         if isinstance(value, list):
             if not value:
                 if preserve_null:
-                    new = copy.deepcopy(doc)
+                    new = _copy(doc)
                     unset_path(new, path)
                     if include_index:
                         new[include_index] = None
                     result.append(new)
                 continue
             for i, elem in enumerate(value):
-                new = copy.deepcopy(doc)
+                new = _copy(doc)
                 set_path(new, path, elem)
                 if include_index:
                     new[include_index] = i
                 result.append(new)
         elif value is None:
             if preserve_null:
-                new = copy.deepcopy(doc)
+                new = _copy(doc)
                 if include_index:
                     new[include_index] = None
                 result.append(new)
         else:
-            new = copy.deepcopy(doc)
+            new = _copy(doc)
             if include_index:
                 new[include_index] = None
             result.append(new)
