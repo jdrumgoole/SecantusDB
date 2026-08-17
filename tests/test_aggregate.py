@@ -1804,3 +1804,36 @@ def test_bucket_validation_and_no_silent_data_loss() -> None:
         with pytest.raises(AggregateError) as exc:
             apply_pipeline(docs, [{"$bucket": spec}])
         assert exc.value.code == code, spec
+
+
+def test_unwind_shared_fastpath_does_not_alias_siblings():
+    """$unwind's shallow fast path (no in-place-mutating stage in the
+    pipeline) must not let a later writing stage corrupt sibling rows or the
+    source docs through shared subtrees."""
+    from secantus.aggregate import PipelineContext, apply_pipeline
+
+    docs = [{"a": [1, 2, 3], "sub": {"k": "v"}}]
+    out = apply_pipeline(
+        docs, [{"$unwind": "$a"}, {"$addFields": {"sub.k": "$a"}}], PipelineContext()
+    )
+    assert [d["sub"]["k"] for d in out] == [1, 2, 3]
+    assert docs[0]["sub"]["k"] == "v"
+
+
+def test_unwind_deepcopies_when_pipeline_contains_fill():
+    """$fill mutates docs in place, so a pipeline containing it (even nested
+    in a $facet) must disable the shared-unwind fast path."""
+    from secantus.aggregate import PipelineContext, _pipeline_mutates_in_place
+
+    assert _pipeline_mutates_in_place([{"$fill": {}}])
+    assert _pipeline_mutates_in_place([{"$facet": {"f": [{"$densify": {}}]}}])
+    assert _pipeline_mutates_in_place([{"$lookup": {"pipeline": [{"$fill": {}}]}}])
+    assert not _pipeline_mutates_in_place([{"$unwind": "$a"}, {"$match": {}}])
+    ctx = PipelineContext()
+    try:
+        from secantus.aggregate import apply_pipeline
+
+        apply_pipeline([{"x": 1}], [{"$fill": {"sortBy": {"x": 1}, "output": {}}}], ctx)
+    except Exception:
+        pass
+    assert ctx.shared_unwind_ok is False

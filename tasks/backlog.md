@@ -2928,6 +2928,12 @@ shared storage engine or building large new protocol subsystems:
     clusters (2026-08-16 run), biggest first: MaxIndexKeys via missing
     `pg_am`/`pg_settings` catalog data (18F, kills all FK metadata);
     assorted boolean asserts needing per-test triage (16F);
+    **FK metadata queries are correct but slow** — getImportedKeys'
+    9-way comma-join runs ~16s at max_index_keys=32 (was a 13-min
+    hang + zero rows before the conindid/confupdtype + shared-unwind
+    fixes); the residual needs staged predicate pushdown in the join
+    builder (lower lowerable WHERE conjuncts between $lookup stages
+    instead of one terminal $match over the cross product);
     `pg_proc.proargmodes` column (6F); quoted-uppercase output aliases
     like `"TABLE_TYPE"` erroring instead of resolving (6F + 4F
     "DATA_TYPE" — likely one alias-resolution bug); COMMENT ON TYPE (6F)
@@ -5868,3 +5874,14 @@ distinct problems, triaged from the run logs:
   visible failure inside every timeout budget; the worker survives.
   Diagnostics kept: `pytest_handlecrashitem` (names crashed tests) and the
   env-gated `SECANTUS_SIGTRACE=1` signal-receipt tracer in conftest.
+  **Coda (2026-08-17, the ACTUAL last piece): the file's
+  `timeout(1200, method="signal")` marker never applied at all** — a
+  second bare `pytestmark =` assignment (the binary-availability skipif,
+  lower in the module) silently OVERWROTE the first, so the PITR test
+  BODIES still ran under the global 600s thread-method timeout and a
+  slow-disk run os._exit'd the worker mid-test (two more deaths,
+  2026-08-16/17, same test, quiet machine, sigtrace silent, faulthandler
+  empty — the os._exit signature). Both marks now ride one combined
+  `pytestmark` list, and `tests/test_meta_pytestmark.py` walks every test
+  module's AST rejecting double assignment so the overwrite pattern can't
+  recur anywhere.

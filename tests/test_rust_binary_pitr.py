@@ -34,7 +34,16 @@ import pytest
 # thread-method kill then took the whole worker down (the "worker death"
 # cluster). Budget for the measured worst case; genuine hangs still die, just
 # later, and the banner read above fails fast with a reason.
-pytestmark = pytest.mark.timeout(1200, method="signal")
+# NOTE: applied in the combined ``pytestmark`` list below — a second bare
+# ``pytestmark =`` assignment silently OVERWRITES the first (module attribute,
+# last write wins), which is exactly how this timeout mark was lost and the
+# global 600s thread-method timeout came back to os._exit workers
+# ("Not properly terminated", no signal trace, no faulthandler dump).
+# method="signal" needs SIGALRM (POSIX-only); Windows falls back to the
+# thread method at the same 1200s budget — still overriding the global 600s.
+_TIMEOUT_MARK = pytest.mark.timeout(
+    1200, method="signal" if hasattr(signal, "SIGALRM") else "thread"
+)
 # method="signal": these tests run subprocess/pymongo calls on the worker's
 # main thread, so SIGALRM can interrupt them — the timeout then FAILS THE
 # TEST with a traceback instead of the global thread-method's os._exit,
@@ -67,7 +76,10 @@ def _binary_path() -> pathlib.Path | None:
 
 
 _BIN = _binary_path()
-pytestmark = pytest.mark.skipif(_BIN is None, reason="secantusdb binary not built")
+pytestmark = [
+    _TIMEOUT_MARK,
+    pytest.mark.skipif(_BIN is None, reason="secantusdb binary not built"),
+]
 
 # Each test here spawns a full secantusd-rs server plus a restore subprocess. Run
 # concurrently across xdist workers, several heavy restores contend hard enough

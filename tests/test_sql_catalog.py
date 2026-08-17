@@ -585,3 +585,53 @@ def test_pgjdbc_get_tables_query_shape(storage, session):
         ' ORDER BY "TABLE_TYPE","TABLE_SCHEM","TABLE_NAME"',
     )
     assert res.rows == [("public", "mdt", "TABLE", "a comment")]
+
+
+def test_pg_constraint_fk_conindid_and_action_codes(storage, session):
+    # A foreign key's conindid points at the referenced table's PK index and
+    # carries the one-letter referential-action codes — pgjdbc's
+    # getImportedKeys joins pkic.oid = con.conindid and decodes
+    # confupdtype/confdeltype; conindid 0 silently empties the result.
+    q(storage, session, "CREATE TABLE pkt (a int, b int, PRIMARY KEY (a, b))")
+    q(
+        storage,
+        session,
+        "CREATE TABLE fkt (x int, y int, FOREIGN KEY (x, y) REFERENCES pkt (a, b)"
+        " ON DELETE CASCADE ON UPDATE SET NULL)",
+    )
+    res = q(
+        storage,
+        session,
+        "SELECT con.conindid, con.confupdtype, con.confdeltype, pkic.relname"
+        " FROM pg_constraint con, pg_class pkic"
+        " WHERE con.contype = 'f' AND pkic.oid = con.conindid",
+    )
+    assert res.rows == [(res.rows[0][0], "n", "c", "pkt_pkey")]
+
+
+def test_pgjdbc_get_imported_keys_shape(storage, session):
+    # The core of pgjdbc's getImportedKeys: position-joined conkey/confkey
+    # via generate_series, PK index join through conindid. Two rows for a
+    # two-column FK, KEY_SEQ 1 and 2.
+    q(storage, session, "CREATE TABLE pkt (a int, b int, PRIMARY KEY (a, b))")
+    q(storage, session, "CREATE TABLE fkt (x int, y int, FOREIGN KEY (x, y) REFERENCES pkt (a, b))")
+    res = q(
+        storage,
+        session,
+        "SELECT pka.attname, fka.attname, pos.n, con.conname, pkic.relname"
+        " FROM pg_catalog.pg_class pkc, pg_catalog.pg_attribute pka,"
+        " pg_catalog.pg_class fkc, pg_catalog.pg_attribute fka,"
+        " pg_catalog.pg_constraint con, pg_catalog.generate_series(1, 4) pos(n),"
+        " pg_catalog.pg_class pkic"
+        " WHERE pkc.oid = pka.attrelid AND pka.attnum = con.confkey[pos.n]"
+        " AND con.confrelid = pkc.oid"
+        " AND fkc.oid = fka.attrelid AND fka.attnum = con.conkey[pos.n]"
+        " AND con.conrelid = fkc.oid AND con.contype = 'f'"
+        " AND (pkic.relkind = 'i' OR pkic.relkind = 'I') AND pkic.oid = con.conindid"
+        " AND fkc.relname = 'fkt'"
+        " ORDER BY pos.n",
+    )
+    assert res.rows == [
+        ("a", "x", 1, "fkt_x_fkey", "pkt_pkey"),
+        ("b", "y", 2, "fkt_x_fkey", "pkt_pkey"),
+    ]

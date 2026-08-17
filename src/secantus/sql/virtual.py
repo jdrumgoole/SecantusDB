@@ -2210,6 +2210,16 @@ def _pg_range(db: str, session: Session, storage: Any, catalog: Catalog) -> list
     return rows
 
 
+def _fk_action_code(action: str | None) -> str:
+    """pg_constraint's one-letter referential-action code."""
+    return {
+        "CASCADE": "c",
+        "SET NULL": "n",
+        "SET DEFAULT": "d",
+        "RESTRICT": "r",
+    }.get((action or "").upper(), "a")
+
+
 def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     # Primary-key constraints (contype 'p'), one per table with a PK, keyed to
     # the implicit PK index via conindid, plus declared foreign keys (contype
@@ -2217,6 +2227,14 @@ def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) ->
     # is an index, not a constraint), so contype 'u'/'c' rows are absent.
     rows: list[dict] = []
     oid = _PK_CON_OID_BASE
+    # A foreign key's conindid points at the referenced table's PK index —
+    # pgjdbc's getImportedKeys joins ``pkic.oid = con.conindid`` to read the
+    # PK_NAME, so a 0 here silently empties every FK metadata result.
+    pk_index_by_rel = {
+        ix["indrelid"]: ix["indexrelid"]
+        for ix in _index_relations(db, storage, catalog)
+        if ix["primary"]
+    }
     for ix in _index_relations(db, storage, catalog):
         if not ix["primary"]:
             continue
@@ -2243,13 +2261,15 @@ def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) ->
                 "conname": fk["conname"],
                 "conrelid": fk["conrelid"],
                 "confrelid": fk["confrelid"],
-                "conindid": 0,
+                "conindid": pk_index_by_rel.get(fk["confrelid"], 0),
                 "contype": "f",
                 "contypid": 0,
                 "condeferrable": fk["fk"].deferrable,
                 "condeferred": fk["fk"].initially_deferred,
                 "conkey": fk["conkey"],
                 "confkey": fk["confkey"],
+                "confupdtype": _fk_action_code(fk["fk"].on_update),
+                "confdeltype": _fk_action_code(fk["fk"].on_delete),
             }
         )
     for uq in _unique_constraints(db, catalog):
@@ -2955,6 +2975,8 @@ _register(
         ("condeferred", "bool"),
         ("conkey", "json"),
         ("confkey", "json"),
+        ("confupdtype", "text"),
+        ("confdeltype", "text"),
     ],
     _pg_constraint,
 )
