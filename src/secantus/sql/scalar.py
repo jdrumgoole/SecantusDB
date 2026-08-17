@@ -293,6 +293,29 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
             haystack = [haystack]
         hit = any(_unwrap_decimal(v) == needle for v in haystack)
         return hit if isinstance(node, exp.EQ) else not hit
+    if isinstance(node, (exp.EQ, exp.NEQ)) and any(
+        isinstance(side, exp.Anonymous) and str(side.this).upper() == "ALL"
+        for side in (node.this, node.expression)
+    ):
+        # ``x <> ALL(<array expr>)`` — true when x differs from every element
+        # (pgjdbc's getSQLKeywords filters the SQL:2003 words this way).
+        # sqlglot parses the ALL as an Anonymous call, unlike ANY.
+        allnode = (
+            node.this
+            if isinstance(node.this, exp.Anonymous) and str(node.this.this).upper() == "ALL"
+            else node.expression
+        )
+        other = node.expression if allnode is node.this else node.this
+        inner = allnode.expressions[0] if allnode.expressions else None
+        haystack = evaluate(inner, scope, ctx) if inner is not None else None
+        needle = _unwrap_decimal(evaluate(other, scope, ctx))
+        if haystack is None or needle is None:
+            return None
+        if not isinstance(haystack, (list, tuple)):
+            haystack = [haystack]
+        if isinstance(node, exp.EQ):
+            return all(_unwrap_decimal(v) == needle for v in haystack)
+        return all(_unwrap_decimal(v) != needle for v in haystack)
     if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
         return _eval_compare(node, scope, ctx)
     if isinstance(node, exp.Exists):
@@ -4009,6 +4032,7 @@ def _eval_subquery(node: exp.Expression, outer: Scope, ctx: ScalarContext) -> An
             or select.args.get("offset")
             or select.args.get("group")
             or select.args.get("joins")
+            or _select_from_is_srf(select)
         )
     ):
         from secantus.sql import planner as _planner
@@ -4044,6 +4068,19 @@ def _eval_subquery(node: exp.Expression, outer: Scope, ctx: ScalarContext) -> An
     for scope in _inner_row_scopes(select, outer, ctx):
         return evaluate(proj, scope, ctx)
     return None
+
+
+def _select_from_is_srf(select: exp.Select) -> bool:
+    """Whether the subquery's FROM is a table-function row source — the
+    row-scope walk can't materialize one (``(SELECT string_agg(…) FROM
+    generate_series(…))`` — RefCursorFetchTest's seeding INSERT), so it
+    routes through the engine like ordered/grouped subqueries do."""
+    from secantus.sql import srf as _srf
+
+    try:
+        return _srf.from_source(select) is not None
+    except Exception:  # pragma: no cover - malformed FROM shapes
+        return False
 
 
 def _eval_exists(node: exp.Exists, outer: Scope, ctx: ScalarContext) -> bool:

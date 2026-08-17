@@ -3118,6 +3118,29 @@ def _run_srf_select(
     of the query (projection / WHERE / ORDER BY / LIMIT) over it via the normal
     select planner + executor."""
     sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+
+    def _toplevel_agg(e: exp.Expression) -> bool:
+        # Only aggregates belonging to THIS select — one inside a scalar
+        # subquery projection aggregates the subquery's rows, not the SRF's.
+        return any(agg.find_ancestor(exp.Select) is stmt for agg in e.find_all(exp.AggFunc))
+
+    if stmt.args.get("from_") is not None and any(_toplevel_agg(e) for e in stmt.expressions):
+        # An aggregate over an SRF row source (``SELECT string_agg(word, ',')
+        # FROM pg_get_keywords() …`` — pgjdbc's getSQLKeywords) exceeds the
+        # single-table SRF planner. The derived-table pipeline handles
+        # aggregates over materialized rows already, so wrap the SRF FROM in a
+        # subquery and re-dispatch through the normal query path.
+        rewritten = stmt.copy()
+        from_node = rewritten.args["from_"]
+        srf_table = from_node.this
+        alias = (
+            srf_table.alias if hasattr(srf_table, "alias") and srf_table.alias else "srf_agg_src"
+        )
+        inner = exp.Select(expressions=[exp.Star()])
+        inner.set("from_", exp.From(this=srf_table.copy()))
+        sub = exp.Subquery(this=inner, alias=exp.TableAlias(this=exp.to_identifier(alias)))
+        rewritten.set("from_", exp.From(this=sub))
+        return _run_query(rewritten, storage, db, catalog, session)
     rows, tdef = srf.build(source, sctx)
     query = stmt
     if stmt.args.get("from_") is None:
@@ -3129,8 +3152,12 @@ def _run_srf_select(
     backend = virtual.MemoryBackend(rows)
     if planner._stmt_needs_evaluation(query):
         # A computed projection (``SELECT x * 2 FROM generate_series(…) t(x)``)
-        # needs per-row evaluation over the materialized rows.
-        mem_sctx = scalar.ScalarContext(storage=backend, catalog=catalog, db=db, session=session)
+        # needs per-row evaluation over the materialized rows. The rows ride in
+        # via ``backend``; the scalar context keeps the REAL storage so a
+        # scalar subquery in the projection can dispatch through the engine
+        # (``SELECT (SELECT string_agg(…) FROM generate_series(…)) FROM
+        # generate_series(…)`` — RefCursorFetchTest's seeding INSERT).
+        mem_sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
         return executor.execute_evaluated_select(
             planner._build_evaluated_single(query, tdef), backend, db, mem_sctx
         )
