@@ -2766,6 +2766,19 @@ def _cast_output_name(target: exp.Expression) -> str | None:
         return str(target.this).rsplit(".", 1)[-1].lower() or None
     if not isinstance(target, exp.Cast) or target.to is None:
         return None
+    # PG's FigureColname recurses into the cast's OPERAND first: a name the
+    # operand supplies wins over the type name, so ``n::int4`` is ``n`` and
+    # ``f()::int`` is ``f`` — only a nameless operand (a literal, an
+    # expression) falls back to the typname (pgtest parameter_description).
+    inner = target.this
+    while isinstance(inner, exp.Paren):
+        inner = inner.this
+    if isinstance(inner, exp.Column):
+        return inner.name or None
+    if isinstance(inner, (exp.Cast, exp.Array, exp.Anonymous)):
+        nested = _cast_output_name(inner)
+        if nested is not None:
+            return nested
     ident = typemap.cast_type_identity(target.to)
     if ident is not None and ident[0] in _CAST_TYPNAME_BY_OID:
         return _CAST_TYPNAME_BY_OID[ident[0]]
@@ -3819,12 +3832,57 @@ _COMPARISON_NODES = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)
 _VARIADIC_ANY_FUNCS = frozenset({"concat", "concat_ws", "format"})
 
 
-def indeterminate_parameter(stmt: exp.Expression | None, oids: list[int]) -> int | None:
-    """The 1-based index of an untyped parameter passed directly to a VARIADIC
-    "any" function (``concat($1, $2)`` with no declared type), or None. Real
-    Postgres rejects the Parse with 42P18."""
+def parameter_numbering_gap(stmt: exp.Expression | None) -> int | None:
+    """The lowest parameter number a statement SKIPS (``SELECT $2 > 0`` never
+    mentions ``$1``), or None. Nothing can type the missing one, so PG rejects
+    the Parse with 42P18 (pgtest parameter_description).
+
+    Must run on the RAW parsed statement: later rewrites (``pg_typeof($1)``
+    folds its argument to a type name) remove parameters from the AST and
+    would look like a gap.
+    """
     if stmt is None:
         return None
+    used: set[int] = set()
+    for param in stmt.find_all(exp.Parameter):
+        try:
+            used.add(int(param.name))
+        except (TypeError, ValueError):
+            continue
+    if not used:
+        return None
+    missing = [n for n in range(1, max(used)) if n not in used]
+    return missing[0] if missing else None
+
+
+def indeterminate_parameter(stmt: exp.Expression | None, oids: list[int]) -> int | None:
+    """The 1-based index of a parameter PG cannot type at Parse, or None.
+
+    Two cases, both 42P18 in real Postgres: an untyped parameter passed
+    directly to a VARIADIC "any" function (``concat($1, $2)``), and a GAP in
+    the parameter numbering — ``SELECT $2 > 0`` never mentions ``$1``, so
+    nothing can type it (pgtest parameter_description)."""
+    if stmt is None:
+        return None
+    # A bare parameter as a CASE result with NO typed sibling branch has no
+    # type context at all — PG can't resolve the CASE's type (pgtest
+    # parameter_description). A CASE with another concrete branch resolves
+    # from that branch, so those are left alone.
+    for case in stmt.find_all(exp.Case):
+        results = [i.args.get("true") for i in case.args.get("ifs") or []]
+        if case.args.get("default") is not None:
+            results.append(case.args["default"])
+        results = [r for r in results if r is not None]
+        params = [r for r in results if isinstance(r, exp.Parameter)]
+        if not params or len(params) != len(results):
+            continue  # no bare-parameter result, or a typed sibling resolves it
+        for r in params:
+            try:
+                idx = int(r.name)
+            except (TypeError, ValueError):
+                continue
+            if idx >= 1 and (idx > len(oids) or not oids[idx - 1]):
+                return idx
     calls: list[exp.Expression] = [
         c for c in stmt.find_all(exp.Anonymous) if str(c.this).lower() in _VARIADIC_ANY_FUNCS
     ]
@@ -3838,6 +3896,78 @@ def indeterminate_parameter(stmt: exp.Expression | None, oids: list[int]) -> int
                     continue
                 if idx >= 1 and (idx > len(oids) or not oids[idx - 1]):
                     return idx
+    return None
+
+
+#: Text-only functions: PG has no numeric/date overload, so a parameter whose
+#: type another use already pinned to a non-text type makes the call resolve to
+#: nothing — 42883 undefined_function.
+_TEXT_ONLY_FUNC_NODES = (exp.Lower, exp.Upper, exp.Trim, exp.Length, exp.Initcap)
+#: Non-text parameter oids that cannot feed a text-only function.
+_NON_TEXT_PARAM_OIDS = frozenset({16, 17, 20, 21, 23, 26, 700, 701, 1082, 1083, 1114, 1184, 1700})
+_OID_PG_NAME = {
+    16: "boolean",
+    17: "bytea",
+    20: "bigint",
+    21: "smallint",
+    23: "integer",
+    26: "oid",
+    700: "real",
+    701: "double precision",
+    1082: "date",
+    1083: "time",
+    1114: "timestamp",
+    1184: "timestamp with time zone",
+    1700: "numeric",
+}
+
+
+def _column_param_oid(cname: str, stmt: exp.Expression, catalog: Any, db: str) -> int | None:
+    """The parameter oid PG assigns from a comparison/assignment against column
+    ``cname`` in ``stmt``'s tables, or None. ``"char"`` (oid 18) deliberately
+    yields None: the pgtest char corpus pins such a parameter at text."""
+    for tbl in stmt.find_all(exp.Table):
+        t = catalog.get(db, tbl.name)
+        col = t.column(cname) if t is not None else None
+        if col is None:
+            continue
+        tag = col.type_tag
+        if tag == "char1":
+            return None
+        if getattr(col, "json_plain", False):
+            return 114
+        oid = typemap.PG_OID.get(tag)
+        if oid is None and typemap.is_array_tag(tag):
+            oid = typemap._ARRAY_PG_OID.get(typemap.array_element_tag(tag))
+        return oid
+    return None
+
+
+def conflicting_parameter_use(
+    stmt: exp.Expression | None, oids: list[int]
+) -> tuple[str, str] | None:
+    """``(function, type_name)`` when a parameter whose type is already pinned
+    to a non-text type is passed to a text-only function, else None.
+
+    PG gives each parameter ONE type, so ``select lower($1) … $1::int`` can't
+    resolve ``lower(integer)`` and fails 42883 (pgtest
+    parameter_description). We only flag types something else PINNED — an
+    untyped parameter still defaults to text and resolves fine."""
+    if stmt is None:
+        return None
+    for call in stmt.find_all(*_TEXT_ONLY_FUNC_NODES):
+        arg = call.this
+        while isinstance(arg, exp.Paren):
+            arg = arg.this
+        if not isinstance(arg, exp.Parameter):
+            continue
+        try:
+            idx = int(arg.name) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < len(oids) and oids[idx] in _NON_TEXT_PARAM_OIDS:
+            fname = type(call).__name__.lower()
+            return (fname, _OID_PG_NAME.get(oids[idx], str(oids[idx])))
     return None
 
 
@@ -3896,6 +4026,24 @@ def infer_parameter_types(
                             if getattr(col, "json_plain", False)
                             else typemap.PG_OID.get(col.type_tag, 0)
                         )
+    # UPDATE ... SET col = $N — the assignment target's column type, like PG.
+    if isinstance(stmt, exp.Update) and catalog is not None and db is not None:
+        for assign in stmt.args.get("expressions") or []:
+            if not isinstance(assign, exp.EQ):
+                continue
+            target, value = assign.this, assign.expression
+            while isinstance(value, exp.Paren):
+                value = value.this
+            if not (isinstance(target, exp.Column) and isinstance(value, exp.Parameter)):
+                continue
+            try:
+                idx = int(value.name) - 1
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < count and not oids[idx]:
+                oid = _column_param_oid(target.name, stmt, catalog, db)
+                if oid:
+                    oids[idx] = oid
     for param in stmt.find_all(exp.Parameter):
         try:
             idx = int(param.name) - 1
@@ -3925,19 +4073,15 @@ def infer_parameter_types(
                     oids[idx] = typemap.PG_OID[fname]
                     continue
             elif isinstance(other, exp.Column) and catalog is not None and db is not None:
-                # citext and ltree ship their OWN operator families, so PG's
-                # parse analysis types an unknown param compared against such a
-                # column as the column's type (the pgtest citext/ltree corpora
-                # read 90008/90010). Other column types keep the text default —
-                # the char corpus pins a "char" comparison param at 25, so the
-                # set is deliberately small.
-                cname = other.name
-                for tbl in stmt.find_all(exp.Table):
-                    t = catalog.get(db, tbl.name)
-                    col = t.column(cname) if t is not None else None
-                    if col is not None and col.type_tag in ("citext", "ltree"):
-                        oids[idx] = typemap.PG_OID[col.type_tag]
-                        break
+                # ``col = $N`` types the parameter as the COLUMN's type, like
+                # PG's parse analysis (pgtest parameter_description reads uuid
+                # 2950 and timestamptz 1184 this way; citext/ltree corpora read
+                # their extension oids). ``"char"`` is the one exception the
+                # corpus pins at text — PG resolves that comparison through
+                # text rather than the one-byte type.
+                oid = _column_param_oid(other.name, stmt, catalog, db)
+                if oid:
+                    oids[idx] = oid
         if target is None:
             continue
         # ``$1::REGCLASS`` and friends parse as ObjectIdentifier, not
