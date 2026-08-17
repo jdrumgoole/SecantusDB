@@ -3080,9 +3080,10 @@ shared storage engine or building large new protocol subsystems:
     piece is **columnPrivileges** (2F) — getColumnPrivileges over the
     system catalog `pg_statistic`, which needs pg_statistic modeled as a
     queryable relation with columns in pg_class/pg_attribute;
-    domainColumnSize FIXED (domain pg_type carries
-    the base type's typtypmod/typbasetype); int-domain's 10 is int4's
-    fixed precision, already right); customArrayTypeInfo array-elem typname (2F); indexInfo
+    domainColumnSize FIXED (domain pg_type carries the base type's
+    typtypmod/typbasetype; int-domain's 10 is int4's fixed precision,
+    already right); customArrayTypeInfo FIXED (composite column oids +
+    collision-avoiding array type names); indexInfo
     mixed expression+column multi-key index (2F); catalogs list missing
     "postgres" (2F); pg_get_keywords() in-context (2F);
     getColumnsCharOctetLength (2F); ALTER TABLE DROP of a quoted
