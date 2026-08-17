@@ -152,10 +152,16 @@ def _storage_conflicts_as_sqlstate() -> Iterator[None]:
     except errors.SQLError:
         raise
     except Exception as exc:
+        from secantus.aggregate import AggregateError
         from secantus.storage import WriteConflictError, _is_wt_rollback
 
         if isinstance(exc, WriteConflictError) or _is_wt_rollback(exc):
             raise errors.serialization_failure() from exc
+        if isinstance(exc, AggregateError):
+            # The pipeline hit a hard limit (an unbounded cross-product cap) —
+            # surface it as a clean SQLSTATE 54000 (program_limit_exceeded)
+            # instead of a generic XX000 internal error.
+            raise errors.SQLError("54000", str(exc)) from exc
         raise
 
 

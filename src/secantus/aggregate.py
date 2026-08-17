@@ -4,6 +4,7 @@ import copy
 import datetime as _dt
 import decimal as _decimal
 import math
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
@@ -47,6 +48,26 @@ class AggregateError(Exception):
 # message naming Atlas; the driver index-management spec tests assert only that
 # the error mentions "Atlas". Shared with ``commands.py`` so the stage and the
 # commands stay in lockstep.
+#: Hard ceiling on documents materialized by a single pipeline stage. A join
+#: whose predicates can't be pushed into the ``$lookup`` degenerates into a
+#: cartesian product (an unkeyed comma-join over system catalogs — pgjdbc's
+#: getImportedKeys for multi-column FKs ballooned to 183GB and OS-killed the
+#: server). This bounds the blast radius: the pipeline fails with a clear error
+#: instead of exhausting memory. Generous enough that real aggregations never
+#: hit it; override with ``SECANTUS_MAX_PIPELINE_DOCS`` for a stress harness.
+MAX_PIPELINE_DOCS = int(os.environ.get("SECANTUS_MAX_PIPELINE_DOCS", 5_000_000))
+
+
+def _pipeline_overflow(stage: str) -> AggregateError:
+    return AggregateError(
+        f"{stage} would materialize more than {MAX_PIPELINE_DOCS} documents in one "
+        "stage — the query degenerated into an unbounded cross product; add a join "
+        "predicate the planner can push down, or raise SECANTUS_MAX_PIPELINE_DOCS",
+        code=292,
+        code_name="QueryExceededMemoryLimitNoDiskUseAllowed",
+    )
+
+
 SEARCH_INDEX_ATLAS_MSG = (
     "Using Atlas Search Database Commands and the $listSearchIndexes aggregation "
     "stage requires additional configuration. Please connect to Atlas or an "
@@ -147,6 +168,9 @@ def apply_pipeline(
         ctx.shared_unwind_ok = False
     for stage in pipeline:
         docs = _apply_stage(stage, docs, ctx)
+        if len(docs) > MAX_PIPELINE_DOCS:
+            name = next(iter(stage)) if isinstance(stage, Mapping) and stage else "stage"
+            raise _pipeline_overflow(name)
     return docs
 
 
@@ -768,6 +792,12 @@ def _stage_unwind(
 
     result: list[dict[str, Any]] = []
     for doc in docs:
+        # Fail fast mid-fanout: an unkeyed join's $unwind multiplies row counts
+        # per stage, so the balloon must be caught while materializing, not only
+        # after (a single stage can otherwise reach tens of GB before the loop's
+        # post-stage check runs).
+        if len(result) > MAX_PIPELINE_DOCS:
+            raise _pipeline_overflow("$unwind")
         value = get_path(doc, path)
         if isinstance(value, list):
             if not value:
