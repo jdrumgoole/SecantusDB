@@ -901,6 +901,18 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
     tables, oids = _tables_with_oids(db, catalog)
     matviews = _matview_names(db, catalog)
     schema_oids = _schema_oids(db, catalog)
+    # Every relation is owned by the connecting user (they created it). Report
+    # that role's oid as relowner — hardcoding PG's bootstrap-superuser oid 10
+    # broke pgjdbc's getTablePrivileges join (``c.relowner = r.oid`` against the
+    # minted role oid). relacl is the materialized ACL, or NULL when untouched.
+    owner_name = getattr(session, "user", None)
+    owner_oid = _role_oid_map(db, session, catalog).get(owner_name, 10) if owner_name else 10
+
+    def _relacl(name: str) -> str | None:
+        if owner_name is None:
+            return None
+        return catalog.relation_acl_text(db, _bare_table_name(name), owner_name)
+
     rows = [
         {
             "oid": oids[t.name],
@@ -913,7 +925,8 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
             # (relpersistence != 't') hides them, exactly as real PG does.
             "relpersistence": "t" if t.temp else "p",
             "relam": _HEAP_AM_OID,
-            "relowner": 10,
+            "relowner": owner_oid,
+            "relacl": _relacl(t.name),
             "reltoastrelid": 0,
             "relchecks": len(t.check_constraints),
             "relhasindex": True,
@@ -959,6 +972,8 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
                 "relkind": "v",
                 "relpersistence": "p",
                 "relam": 0,
+                "relowner": owner_oid,
+                "relacl": _relacl(name),
                 "reloptions": None,
             }
         )

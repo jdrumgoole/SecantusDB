@@ -2621,10 +2621,10 @@ def _run_statement(
         return _run_command(stmt, session, storage, db, catalog)
 
     if isinstance(stmt, exp.Grant):
-        return _run_grant(stmt, storage, db, catalog, revoke=False)
+        return _run_grant(stmt, storage, db, catalog, session, revoke=False)
 
     if isinstance(stmt, exp.Revoke):
-        return _run_grant(stmt, storage, db, catalog, revoke=True)
+        return _run_grant(stmt, storage, db, catalog, session, revoke=True)
 
     # CLOSE cursor / CLOSE ALL parses as a bare Alias (``CLOSE AS name``).
     close = _close_cursor_target(stmt)
@@ -3588,7 +3588,13 @@ def _grant_principals(stmt: exp.Expression) -> list[str]:
 
 
 def _run_grant(
-    stmt: exp.Expression, storage: Any, db: str, catalog: Catalog, *, revoke: bool
+    stmt: exp.Expression,
+    storage: Any,
+    db: str,
+    catalog: Catalog,
+    session: Session | None = None,
+    *,
+    revoke: bool,
 ) -> SQLResult:
     """``GRANT``/``REVOKE`` <privs> ``ON`` <table> ``TO``/``FROM`` <role> ... —
     persist per-``(table, grantee)`` table privileges the authz gate enforces.
@@ -3607,6 +3613,7 @@ def _run_grant(
     # The table must exist (declared or reflectable) — mirrors CREATE INDEX.
     if catalog.get(db, table_name) is None and reflect.reflect(storage, db, table_name) is None:
         raise errors.undefined_table(table_name)
+    owner = getattr(session, "user", None) if session is not None else None
     for grantee in _grant_principals(stmt):
         if table_privs:
             if revoke:
@@ -3619,6 +3626,22 @@ def _run_grant(
                     table_privs,
                     grant_option=bool(stmt.args.get("grant_option")),
                 )
+            # Any table-level grant/revoke MATERIALIZES the relation's ACL
+            # (relacl flips from NULL to an aclitem array). The owner's implicit
+            # privileges become explicit and adjust when the operation targets
+            # the owner — so ``REVOKE ALL … FROM <owner>`` leaves the owner with
+            # nothing (pg's getTablePrivileges then reports no rows).
+            if owner is not None:
+                state = catalog._relation_acl_state(db, table_name)
+                held = (
+                    {p.upper() for p in state["owner_privs"]}
+                    if state is not None
+                    else set(catalog.TABLE_PRIVILEGES)
+                )
+                if grantee.lower() == owner.lower():
+                    delta = {p.upper() for p in table_privs}
+                    held = (held - delta) if revoke else (held | delta)
+                catalog.materialize_relation_owner_privileges(db, table_name, owner, sorted(held))
         for column, privs in column_privs.items():
             if revoke:
                 catalog.revoke_column_privileges(db, table_name, grantee, column, privs)

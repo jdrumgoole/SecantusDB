@@ -112,6 +112,13 @@ OPERATOR_COLLECTION = "__sql_operators__"
 # COMMENT ON INDEX comments, keyed by index name (resolved to the index
 # relation's oid at pg_description read time — minted oids can reshuffle).
 INDEX_COMMENT_COLLECTION = "__sql_index_comments__"
+# Per-relation ACL materialization state. A relation the user never GRANTed /
+# REVOKEd on has NO row here and reports ``relacl`` NULL — real PG's "default"
+# ACL, which a driver reads as the owner holding every privilege implicitly.
+# The first grant/revoke *materializes* the ACL: a row appears whose
+# ``owner_privs`` is the owner's retained privilege set (``REVOKE ALL FROM
+# <owner>`` empties it), and per-grantee privileges come from GRANT_COLLECTION.
+RELATION_ACL_COLLECTION = "__sql_relation_acl__"
 RLS_COLLECTION = "__sql_rls__"
 COLUMN_GRANT_COLLECTION = "__sql_column_grants__"
 
@@ -141,6 +148,7 @@ ALL_CATALOG_COLLECTIONS = (
     DESCRIPTION_DELTA_COLLECTION,
     OPERATOR_COLLECTION,
     INDEX_COMMENT_COLLECTION,
+    RELATION_ACL_COLLECTION,
 )
 
 
@@ -984,6 +992,64 @@ class Catalog:
     def list_table_grants(self, db: str) -> list[dict[str, Any]]:
         """Every table grant in ``db`` (for ``information_schema`` reflection)."""
         return self._storage.find_matching(db, GRANT_COLLECTION, {})
+
+    #: PG aclitem privilege letters (pg_class.relacl text form) — the subset a
+    #: table can carry, in the order real PG emits them.
+    _ACL_LETTERS = (
+        ("INSERT", "a"),
+        ("SELECT", "r"),
+        ("UPDATE", "w"),
+        ("DELETE", "d"),
+        ("TRUNCATE", "D"),
+        ("REFERENCES", "x"),
+        ("TRIGGER", "t"),
+    )
+
+    def materialize_relation_owner_privileges(
+        self, db: str, table: str, owner: str, privileges: list[str] | None
+    ) -> None:
+        """Record the owner's retained privileges on ``table`` — the act of
+        touching the ACL. ``privileges=None`` seeds the owner's full implicit
+        set (first GRANT to a third party); a list (possibly empty) is the set
+        left after a REVOKE / GRANT that targeted the owner. Presence of the
+        row is what flips ``relacl`` from NULL to a materialized array."""
+        privs = list(self.TABLE_PRIVILEGES) if privileges is None else list(privileges)
+        ordered = [p for p in self.TABLE_PRIVILEGES if p in {x.upper() for x in privs}]
+        self._storage.delete_matching(db, RELATION_ACL_COLLECTION, {"_id": table})
+        self._storage.insert(
+            db, RELATION_ACL_COLLECTION, [{"_id": table, "owner": owner, "owner_privs": ordered}]
+        )
+
+    def _relation_acl_state(self, db: str, table: str) -> dict[str, Any] | None:
+        docs = self._storage.find_matching(db, RELATION_ACL_COLLECTION, {"_id": table}, limit=1)
+        return docs[0] if docs else None
+
+    def relation_acl_text(self, db: str, table: str, owner: str) -> str | None:
+        """The ``pg_class.relacl`` text (aclitem[] literal) for ``table``, or
+        None when the ACL was never touched (real PG's default → a driver reads
+        the owner as implicitly holding everything). Once materialized, emit the
+        owner's retained privileges plus every recorded per-grantee grant."""
+        grants = self.get_table_grants(db, table)
+        state = self._relation_acl_state(db, table)
+        if not grants and state is None:
+            return None  # untouched — implicit owner privileges
+        owner_privs = state["owner_privs"] if state is not None else list(self.TABLE_PRIVILEGES)
+
+        def item(grantee: str, privs: list[str]) -> str:
+            held = {p.upper() for p in privs}
+            letters = "".join(ch for name, ch in self._ACL_LETTERS if name in held)
+            # An empty grantee name is PUBLIC in the aclitem form (``=r/owner``).
+            who = "" if grantee.upper() == "PUBLIC" else grantee
+            return f"{who}={letters}/{owner}"
+
+        entries: list[str] = []
+        if owner_privs:
+            entries.append(item(owner, owner_privs))
+        for doc in grants:
+            if doc["grantee"] == owner:
+                continue  # the owner's row is driven by owner_privs above
+            entries.append(item(doc["grantee"], doc.get("privileges", [])))
+        return "{" + ",".join(entries) + "}"
 
     def has_table_privilege(self, db: str, table: str, grantees: set[str], privilege: str) -> bool:
         """Whether any identity in ``grantees`` (a user + its role names, plus
