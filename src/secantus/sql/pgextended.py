@@ -1514,9 +1514,30 @@ class ExtendedSession:
             if self.session.txn_handle is not None and not self.session.txn_is_implicit
             else None
         )
-        self.portals[portal] = Portal(
-            portal, prep, values, result_formats=result_formats, txn_token=token
-        )
+        new_portal = Portal(portal, prep, values, result_formats=result_formats, txn_token=token)
+        # PG revalidates a named statement's cached plan during BIND: a result
+        # shape that changed under DDL raises 0A000 INSTEAD of BindComplete, so
+        # no portal is created (pgtest prepared_stmt_invalidation compares the
+        # reply without ignoring BindComplete; aborted_txn ignores it, so Bind
+        # satisfies both). Revalidating here also keeps it ahead of any side
+        # effect, which is what the data-modifying-CTE case needs.
+        if prep.name and prep.plan_shape is not None:
+            shape = None
+            try:
+                cols = self._describe_columns(self._bound(new_portal))
+                shape = [(c.name, c.pg_oid) for c in cols] if cols else None
+            except errors.SQLError:
+                # A statement we can't describe here (a missing relation, say)
+                # surfaces its own error at Execute — don't mask it with a
+                # cached-plan complaint. Only a SHAPE we could read counts.
+                shape = None
+            if shape is not None and shape != prep.plan_shape:
+                raise errors.SQLError(
+                    "0A000",
+                    "cached plan must not change result type",
+                    diag={"R": "RevalidateCachedQuery"},
+                )
+        self.portals[portal] = new_portal
         self._maybe_snapshot_execute(self.portals[portal])
         return pgwire.bind_complete()
 

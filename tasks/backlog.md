@@ -2771,8 +2771,16 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   4 expected divergences, 18 unexpected failures, 5 skipped** (campaign
   start: 10/58 pass, 43 unexpected). The 58→64 denominator shift is
   real: files that used to fail on line 1 now get far enough to emit
-  their subtest events. Next: `prepared_stmt_invalidation`, then
-  `row_description` / `set` / `typing`.
+  their subtest events. Slice 27 greened
+  `prepared_stmt_invalidation`: PG revalidates a named statement's
+  cached plan during BIND, so a shape changed by DDL raises 0A000
+  INSTEAD of BindComplete and no portal is created (we raised it at
+  Execute, after BindComplete). `aborted_txn` ignores BindComplete, so
+  Bind-time satisfies both files, and it keeps the check ahead of any
+  side effect (the data-modifying-CTE case). Report: 38/64 pass, 17
+  unexpected. Next: `row_description`, `set`, `typing`, `tuple`,
+  `unknown`, `varbit`, `void`, `procedure`, `timezone`; the geo trio
+  (`box2d` / `pgvector` / `spatial`) needs crdb extension types.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``

@@ -1508,3 +1508,40 @@ def test_bind_parameter_count_must_match_declared(client):
     fields = pgwire.parse_error_response(next(m for m in msgs if m.type == "E").payload)
     assert fields.get("C") == "08P01"
     assert "statement summary" in fields.get("D", "")
+
+
+def test_cached_plan_revalidation_fires_at_bind(client):
+    # pgtest prepared_stmt_invalidation:87 — a named statement whose result
+    # shape changed under DDL raises 0A000 INSTEAD of BindComplete, so no
+    # portal is created. (The aborted_txn corpus ignores BindComplete, so
+    # Bind-time satisfies both files.)
+    client.exchange(
+        pgwire.build_parse("", "CREATE TABLE dropc (f1 int, f2 text)", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    client.exchange(
+        pgwire.build_parse("", "INSERT INTO dropc VALUES (1, 'hello')", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    first = client.exchange(
+        pgwire.build_parse("s1", "SELECT * FROM dropc WHERE f1 = $1", []),
+        pgwire.build_bind("p1", "s1", [b"1"]),
+        pgwire.build_execute("p1", 0),
+    )
+    assert rows(first) == [[b"1", b"hello"]]
+    client.exchange(
+        pgwire.build_parse("", "ALTER TABLE dropc DROP COLUMN f1", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    msgs = client.exchange(
+        pgwire.build_bind("p1", "s1", [b"1"]),
+        pgwire.build_execute("p1", 0),
+    )
+    err = next(m for m in msgs if m.type == "E")
+    fields = pgwire.parse_error_response(err.payload)
+    assert fields.get("C") == "0A000"
+    assert fields.get("R") == "RevalidateCachedQuery"
+    assert "2" not in types(msgs)  # no BindComplete — the error replaces it
