@@ -1565,6 +1565,21 @@ def _describe_statement(
         return list(cur.columns) if cur is not None else None
     if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "MOVE":
         return None  # MOVE returns no rows
+    if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "EXECUTE":
+        # ``EXECUTE name(args)`` through the extended protocol: Describe must
+        # report the UNDERLYING prepared statement's shape — a SELECT's
+        # RowDescription, not NoData (pgtest execute:70).
+        m = _EXECUTE_TAIL.match(_command_tail(stmt))
+        entry = session.prepared.get(_unquote_ident(m.group("name"))) if m else None
+        if entry is None:
+            return None
+        query, _count = entry
+        args = _execute_args(m.group("args"))
+        try:
+            bound = _bind_parameter_nodes(query, args)
+        except errors.SQLError:
+            bound = query.copy()
+        return _describe_statement(storage, db, bound, session, catalog)
     if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "SHOW":
         oid = typemap.PG_OID["text"]
         if _show_name(stmt).upper() == "ALL":
