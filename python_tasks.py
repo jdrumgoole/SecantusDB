@@ -274,11 +274,40 @@ def _pytest_tmp_owner_alive(path: str) -> bool:
     """
     lock = os.path.join(path, ".lock")
     try:
-        pid = int(open(lock).read().strip())
+        with open(lock) as fh:
+            pid = int(fh.read().strip())
     except FileNotFoundError:
         return False
     except (OSError, ValueError):
         return True
+    return _pid_alive(pid)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether ``pid`` names a running process — cross-platform.
+
+    POSIX uses the ``kill(pid, 0)`` idiom. Windows ``os.kill`` rejects signal 0
+    with ``OSError [WinError 87]`` regardless of whether the pid exists (a plain
+    ``OSError``, so the POSIX handlers below never saw it — this reaped nothing
+    and failed the stale-lock test on Windows), so query the process handle
+    instead. An unreadable / ambiguous result is treated as ALIVE — refusing to
+    delete is the safe direction."""
+    if os.name == "nt":  # pragma: no cover - exercised only on Windows CI
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False  # no such process (or access denied → treat as gone)
+        try:
+            code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == STILL_ACTIVE
+            return True
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
