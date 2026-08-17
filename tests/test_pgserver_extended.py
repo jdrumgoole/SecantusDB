@@ -212,7 +212,14 @@ def test_execute_with_max_rows_suspends_portal(client):
             pgwire.build_bind("p", "ins", [str(i).encode(), b"x", b"20"]),
             pgwire.build_execute("p"),
         )
-    # Bind a SELECT portal, then Execute it in two slices via max_rows.
+    # PG portals live until their transaction ends, so resuming across a
+    # Sync needs an explicit block (outside one the portal dies at Sync and
+    # a later Execute is 34000 — pgtest multiple_active_portals).
+    client.exchange(
+        pgwire.build_parse("", "BEGIN"),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute(""),
+    )
     msgs = client.exchange(
         pgwire.build_parse("sel", "SELECT id FROM users ORDER BY id"),
         pgwire.build_bind("pg", "sel", []),
@@ -225,6 +232,14 @@ def test_execute_with_max_rows_suspends_portal(client):
     more = client.exchange(pgwire.build_execute("pg", max_rows=2))
     assert rows(more) == [[b"3"]]
     assert command_tag(more) == "SELECT 3"
+    client.exchange(
+        pgwire.build_parse("", "COMMIT"),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute(""),
+    )
+    # Outside a block the portal is gone after Sync.
+    dead = client.exchange(pgwire.build_execute("pg", max_rows=2))
+    assert error_code(dead) == "34000"
 
 
 def test_bind_to_closed_statement_errors(client):
@@ -1151,3 +1166,86 @@ def test_ltree_reports_oid_90010(client):
     pd = next(m for m in msgs if m.type == "t")
     assert pgwire.parse_parameter_description(pd.payload) == [90010]
     assert rows(msgs) == [[b"1", b"A.B"]]
+
+
+def test_duplicate_named_portal_in_txn_is_42P03(client):
+    # pgtest multiple_active_portals — re-binding a NAMED portal still live
+    # in the same explicit transaction is PG's 42P03, with crdb's detail
+    # shape; the block poisons and COMMIT reports ROLLBACK.
+    client.exchange(
+        pgwire.build_parse("", "BEGIN", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    client.exchange(
+        pgwire.build_parse("q1", "SELECT 1", []),
+        pgwire.build_bind("dp", "q1", []),
+    )
+    msgs = client.exchange(
+        pgwire.build_parse("q2", "SELECT 2", []),
+        pgwire.build_bind("dp", "q2", []),
+        pgwire.build_execute("dp", 0),
+    )
+    err = next(m for m in msgs if m.type == "E")
+    fields = pgwire.parse_error_response(err.payload)
+    assert fields.get("C") == "42P03"
+    assert fields.get("M") == 'portal "dp" already exists'
+    assert 'statement name "q2"' in fields.get("D", "")
+    msgs = client.exchange(
+        pgwire.build_parse("", "COMMIT", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert command_tag(msgs) == "ROLLBACK"
+
+
+def test_portal_dies_at_implicit_txn_end(client):
+    # pgtest multiple_active_portals — a portal suspended outside an
+    # explicit block dies at Sync; a later Execute is 34000 with crdb's
+    # message shape.
+    client.exchange(
+        pgwire.build_parse("qs", "SELECT * FROM generate_series(1, 5)", []),
+        pgwire.build_bind("ps", "qs", []),
+        pgwire.build_execute("ps", 1),
+    )
+    msgs = client.exchange(pgwire.build_execute("ps", 1))
+    err = next(m for m in msgs if m.type == "E")
+    fields = pgwire.parse_error_response(err.payload)
+    assert fields.get("C") == "34000"
+    assert fields.get("M") == 'unknown portal "ps"'
+
+
+def test_drop_table_with_active_portal_is_55006(client):
+    # pgtest multiple_active_portals — DROP TABLE while a suspended portal
+    # in the same session still reads the table refuses with PG's 55006.
+    client.exchange(
+        pgwire.build_parse("", "CREATE TABLE pin_t (x int)", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    client.exchange(
+        pgwire.build_parse("", "INSERT INTO pin_t VALUES (1),(2)", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    client.exchange(
+        pgwire.build_parse("", "BEGIN", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    client.exchange(
+        pgwire.build_parse("qp", "SELECT * FROM pin_t", []),
+        pgwire.build_bind("pp", "qp", []),
+        pgwire.build_execute("pp", 1),
+    )
+    msgs = client.exchange(
+        pgwire.build_parse("", "DROP TABLE pin_t", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    assert error_code(msgs) == "55006"
+    client.exchange(
+        pgwire.build_parse("", "ROLLBACK", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
