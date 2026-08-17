@@ -14,8 +14,10 @@ in-process.
 from __future__ import annotations
 
 import contextlib
+import getpass
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -34,6 +36,37 @@ import pytest
 _STALL_EXIT_CODE = 70
 
 _CONFTEST_UNDER_TEST = Path(__file__).parent / "conftest.py"
+
+
+def _isolated_basetemp_args(tmp_path: Path) -> list[str]:
+    """``--basetemp`` args that keep a nested session out of the SHARED temp root.
+
+    Without ``--basetemp``, every pytest process picks its base directory through
+    ``make_numbered_dir_with_cleanup``, which **registers an atexit hook** that
+    ``rmtree``s every stale ``$TMPDIR/pytest-of-<user>/pytest-NNNN`` except the
+    newest three (``_pytest/pathlib.py``). On a dev box that backlog is the
+    leftovers of every earlier suite run — hundreds of trees full of WiredTiger
+    databases — so the hook grinds through millions of ``unlink()`` calls inside
+    ``Py_FinalizeEx``, minutes AFTER the session printed its summary.
+
+    Measured 2026-08-17 against this file's own nested command, with 238 stale
+    numbered dirs in the shared root: nested tests 0.55s, process wall clock
+    **252.96s**, and ``sample`` of the wedged pid showed 1479 of 1559 samples in
+    ``Py_FinalizeEx → atexit_callfuncs → os.unlink``. That is the long-standing
+    "every nested test passed, then the process never exited" hang that
+    SIGKILLed these tests at their subprocess budget. It is intermittent because
+    the first run to pay the cost drains the backlog for the next one — the same
+    command three times in a row took 252.96s, 11.95s, 0.60s.
+
+    An explicit basetemp skips ``make_numbered_dir_with_cleanup`` altogether
+    (``TempPathFactory.getbasetemp``), so a nested run neither pays for nor adds
+    to that backlog: its temp tree lives under the outer test's ``tmp_path`` and
+    is cleaned up with it. xdist workers were always immune — xdist hands each
+    one ``--basetemp <controller basetemp>/popen-gwN`` — so only the nested
+    CONTROLLER ever wedged, and it wedged *after* writing its summary, which is
+    the post-summary shape ``_run_tolerating_teardown_wedge`` was built for.
+    """
+    return ["--basetemp", str(tmp_path / "basetemp")]
 
 
 def _run_nested_pytest(
@@ -68,6 +101,7 @@ def _run_nested_pytest(
         "--timeout-method=thread",
         "-q",
     ]
+    cmd += _isolated_basetemp_args(tmp_path)
     if xdist:
         cmd.append("--max-worker-restart=3")
 
@@ -260,13 +294,13 @@ def _run_nested_with_fault_dir(
 ) -> subprocess.CompletedProcess[str]:
     """Nested pytest session with ``SECANTUS_FAULTHANDLER_DIR`` armed.
 
-    The nested-run budget (200s) needs real headroom over the seconds it
-    takes on an idle box: under the full 12-worker parallel suite this test's
-    nested ``pytest -n 2`` (its own workers + embedded servers) can be
-    CPU-starved for minutes before printing a summary — the 120s it used to
-    get produced release-blocking TimeoutExpired flakes with 5044 green
-    tests around them. The outer ``@pytest.mark.timeout(300)`` marks leave
-    room for this budget plus the post-kill summary parse."""
+    The nested-run budget (200s) is generous on purpose, but it is NOT there to
+    absorb CPU starvation — that theory was measured and refuted. What used to
+    eat the budget was pytest's shared-temp-root cleanup running in the nested
+    session's ``atexit`` (see ``_isolated_basetemp_args``, which now removes it:
+    252.96s of ``unlink()`` for a 0.55s test run). The outer
+    ``@pytest.mark.timeout(360)`` marks leave room for this budget plus the
+    post-kill verdict parse."""
     (tmp_path / "conftest.py").write_text(_CONFTEST_UNDER_TEST.read_text())
     (tmp_path / "test_nested.py").write_text(textwrap.dedent(body))
     env = dict(os.environ)
@@ -274,6 +308,7 @@ def _run_nested_with_fault_dir(
     cmd = [sys.executable, "-m", "pytest", str(tmp_path)]
     cmd += ["-n", "2"] if xdist else ["-p", "no:xdist"]
     cmd += ["-p", "no:randomly", "-p", "no:cacheprovider", "-o", "addopts=", "-q"]
+    cmd += _isolated_basetemp_args(tmp_path)
     if xdist:
         cmd += ["--max-worker-restart", max_worker_restart]
     with _nested_run_lock():
@@ -322,6 +357,22 @@ def _progress_says_failed(text: str) -> bool:
     return any(mark in text for mark in _PYTEST_CRASH_MARKERS)
 
 
+def _kill_process_group(proc: subprocess.Popen[str]) -> None:
+    """SIGKILL the nested session *and* its xdist workers.
+
+    ``proc.kill()`` kills only the controller. Its workers are grandchildren that
+    inherited the stdout/stderr PIPES, so an orphaned worker holds the write ends
+    open and the recovery ``communicate()`` never sees EOF — it times out too and
+    the harness then reports empty output, discarding the very progress marks the
+    tolerance below reads its verdict from. One ``killpg`` (the Popen above asks
+    for its own session) reaps the whole nested tree instead.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, AttributeError):  # already reaped, or no killpg (Windows)
+        proc.kill()
+
+
 def _run_tolerating_teardown_wedge(
     cmd: list[str], *, cwd: Path, env: dict[str, str], timeout: int
 ) -> subprocess.CompletedProcess[str]:
@@ -344,13 +395,20 @@ def _run_tolerating_teardown_wedge(
     *neither* (genuinely stuck mid-run) still raises — that is a real failure.
     """
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd, env=env
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=cwd,
+        env=env,
+        # Own process group so the kill below reaps the nested xdist WORKERS too.
+        start_new_session=True,
     )
     try:
         out, err = proc.communicate(timeout=timeout)
         return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        _kill_process_group(proc)
         try:
             out, err = proc.communicate(timeout=30)
         except subprocess.TimeoutExpired:
@@ -463,6 +521,62 @@ def test_faulthandler_dir_captures_a_worker_crash(tmp_path: Path) -> None:
     )
     joined = "\n".join(dumps)
     assert "Fatal Python error" in joined or "Segmentation fault" in joined, joined[:400]
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win"), reason="TMPDIR steers the temp root on POSIX only"
+)
+def test_nested_sessions_stay_out_of_the_shared_pytest_temp_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A nested session must not enrol in pytest's SHARED numbered-tmp cleanup.
+
+    This is the root cause of the long-standing intermittent hang in the two
+    tests above. Without ``--basetemp`` a pytest process picks its base dir via
+    ``make_numbered_dir_with_cleanup``, which registers an ``atexit`` hook that
+    ``rmtree``s every stale ``$TMPDIR/pytest-of-<user>/pytest-NNNN`` bar the
+    newest three. With the hundreds of WiredTiger-laden leftovers a dev box
+    accumulates, that hook ran for **252.96s** after a nested run whose tests
+    took 0.55s — ``sample`` of the wedged pid put 1479 of 1559 samples in
+    ``Py_FinalizeEx → atexit_callfuncs → os.unlink``. Every nested test passes,
+    then the process never exits: exactly the reported symptom, and intermittent
+    because the first run to pay the cost drains the backlog (252.96s, then
+    11.95s, then 0.60s for the same command).
+
+    Pinned with sentinel stale dirs in a private temp root: an enrolled session
+    deletes all but the newest three of them, an isolated one leaves all five.
+    Serial (``xdist=False``) on purpose — the enrolment is controller-side, so
+    this proves it in ~1s without spinning up a second worker pair. The nested
+    test asks for ``tmp_path`` so the session really does build a basetemp.
+    """
+    temp_root = tmp_path / "tmproot"
+    shared = temp_root / f"pytest-of-{getpass.getuser()}"
+    shared.mkdir(parents=True)
+    shared.chmod(0o700)  # pytest rejects a group/world-readable shared root
+    # More than keep=3 dirs, so the low-numbered ones are cleanup candidates.
+    stale = [shared / f"pytest-{n}" for n in range(1, 6)]
+    for d in stale:
+        (d / "leftover").mkdir(parents=True)
+    monkeypatch.setenv("TMPDIR", str(temp_root))
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    result = _run_nested_with_fault_dir(
+        run_dir,
+        """
+        def test_ok(tmp_path):
+            assert tmp_path.is_dir()
+        """,
+        fault_dir=run_dir / "fh",
+        xdist=False,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    deleted = [d.name for d in stale if not d.exists()]
+    assert not deleted, (
+        f"the nested session enrolled in the SHARED temp root and deleted {deleted}; "
+        "on a real dev box that atexit rmtree runs for minutes after the last test "
+        "and wedges the run past its subprocess budget"
+    )
 
 
 # --- the wedge tolerance itself ------------------------------------------- #
