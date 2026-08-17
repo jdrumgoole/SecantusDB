@@ -136,3 +136,44 @@ def test_composite_result_oid_is_record():
 
 def test_bad_field_type_errors(storage, session):
     assert sqlstate(storage, session, "CREATE TYPE bad AS (x notatype)") == "0A000"
+
+
+def test_composite_column_atttypid_and_array_typename_collision(storage, session):
+    # pgjdbc's customArrayTypeInfo: composite columns report their minted oid
+    # (not RECORD), and a composite array type name avoids collision with an
+    # existing type of that name — custom[]'s type is __custom because the
+    # composite _custom already claims _custom.
+    run(storage, session, "CREATE TYPE custom AS (i int)")
+    run(storage, session, "CREATE TYPE _custom AS (f float)")
+    run(
+        storage,
+        session,
+        "CREATE TABLE customtable (c1 custom, c2 _custom, c3 custom[], c4 _custom[])",
+    )
+    rows = run(
+        storage,
+        session,
+        "SELECT a.attname, t.typname FROM pg_attribute a"
+        " JOIN pg_class c ON a.attrelid = c.oid"
+        " JOIN pg_type t ON a.atttypid = t.oid"
+        " WHERE c.relname = 'customtable' AND a.attnum > 0 ORDER BY a.attnum",
+    ).rows
+    assert rows == [
+        ("c1", "custom"),
+        ("c2", "_custom"),
+        ("c3", "__custom"),
+        ("c4", "___custom"),
+    ]
+
+
+def test_scalar_array_type_names_unaffected(storage, session):
+    run(storage, session, "CREATE TABLE it (a int[], t text[])")
+    rows = run(
+        storage,
+        session,
+        "SELECT a.attname, ty.typname FROM pg_attribute a"
+        " JOIN pg_class c ON a.attrelid = c.oid"
+        " JOIN pg_type ty ON a.atttypid = ty.oid"
+        " WHERE c.relname = 'it' AND a.attnum > 0 ORDER BY a.attnum",
+    ).rows
+    assert rows == [("a", "_int4"), ("t", "_text")]

@@ -1082,6 +1082,23 @@ def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> 
                 typoid = domain_oids.get(col.domain_type, 25)
             elif col.enum_type is not None:
                 typoid = enum_oids.get(col.enum_type, 25)
+            elif getattr(col, "composite_type", None) is not None:
+                # A composite (or composite-array) column reports its type's
+                # minted oid, not generic RECORD/2249 — so getColumns' typname
+                # join resolves ``custom`` / ``_custom`` (pgjdbc's
+                # customArrayTypeInfo; psycopg composite reflection).
+                ct = col.composite_type
+                minted = _composite_oids(db, catalog).get(ct) or _table_rowtype_oids(
+                    db, catalog
+                ).get(ct)
+                if minted is not None:
+                    typoid = (
+                        minted + USER_TYPE_ARRAY_OID_OFFSET
+                        if typemap.is_array_tag(col.type_tag)
+                        else minted
+                    )
+                else:
+                    typoid = col.decl_oid or typemap.PG_OID.get(col.type_tag, 25)
             else:
                 typoid = col.decl_oid or typemap.PG_OID.get(col.type_tag, 25)
             rows.append(
@@ -2045,10 +2062,28 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
     # TypeInfoCache, psycopg's TypeInfo.fetch) found nothing here before.
     # ``typelem`` points back at the element; arrays of arrays don't exist in
     # PG, so the array row's own typarray is 0.
+    #
+    # Array type names are ``_<element>`` — but when that collides with an
+    # EXISTING type name (a user composite literally named ``_custom`` shadows
+    # the array type of ``custom``), real PG prepends more underscores until
+    # unique (``__custom``). pgjdbc's customArrayTypeInfo reads exactly this.
+    # Assign array names in oid order — PG names an array type when its element
+    # type is created, so an earlier-created (lower-oid) element claims the
+    # shorter name (``custom`` created before ``_custom`` → ``custom``'s array
+    # is ``__custom``, ``_custom``'s array is ``___custom``).
+    taken = {r["typname"] for r in rows}
+    array_name_by_oid: dict[int, str] = {}
+    for row in sorted(rows, key=lambda r: r["oid"]):
+        name = f"_{row['typname']}"
+        while name in taken:
+            name = f"_{name}"
+        taken.add(name)
+        array_name_by_oid[row["typarray"]] = name
+
     array_rows = [
         {
             "oid": row["typarray"],
-            "typname": f"_{row['typname']}",
+            "typname": array_name_by_oid[row["typarray"]],
             "typcollation": 0,
             "typnamespace": row.get("typnamespace", _NS_OIDS["pg_catalog"]),
             "typbasetype": 0,
