@@ -3065,12 +3065,12 @@ shared storage engine or building large new protocol subsystems:
     clusters (2026-08-16 run), biggest first: MaxIndexKeys via missing
     `pg_am`/`pg_settings` catalog data (18F, kills all FK metadata);
     assorted boolean asserts needing per-test triage (16F);
-    **FK metadata queries are correct but slow** — getImportedKeys'
-    9-way comma-join runs ~16s at max_index_keys=32 (was a 13-min
-    hang + zero rows before the conindid/confupdtype + shared-unwind
-    fixes); the residual needs staged predicate pushdown in the join
-    builder (lower lowerable WHERE conjuncts between $lookup stages
-    instead of one terminal $match over the cross product);
+    **FK metadata queries** — getImportedKeys' 9-way comma-join FIXED:
+    comma-joins are now keyed from WHERE equalities (was a 13-min hang /
+    zero rows, then ~16s, then a 183GB OOM once the class ran past the
+    #944 setup regression — now completes in ms), plus a hard per-stage
+    materialization cap that surfaces 54000 instead of OOMing on any
+    residual cross product;
     `pg_proc.proargmodes` column (6F); quoted-uppercase output aliases
     like `"TABLE_TYPE"` erroring instead of resolving (6F + 4F
     "DATA_TYPE" — likely one alias-resolution bug); COMMENT ON TYPE (6F)

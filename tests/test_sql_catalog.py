@@ -734,3 +734,49 @@ def test_pg_database_includes_postgres_maintenance_db(storage, session):
     assert DB in names
     assert "local" not in names
     assert names == sorted(names)
+
+
+def test_comma_join_is_keyed_not_cartesian(storage, session):
+    # A multi-table comma-join with join predicates in WHERE must key each
+    # $lookup instead of cross-producting — pgjdbc's getImportedKeys over the
+    # catalogs otherwise materializes billions of rows (183GB OOM). It now
+    # completes and returns the FK's key columns with their positions.
+    q(storage, session, "CREATE TABLE pk (a int, b int, PRIMARY KEY (a, b))")
+    q(
+        storage,
+        session,
+        "CREATE TABLE fk (x int, y int, FOREIGN KEY (x, y) REFERENCES pk(a, b))",
+    )
+    res = q(
+        storage,
+        session,
+        "SELECT pka.attname, fka.attname, pos.n"
+        " FROM pg_catalog.pg_namespace pkn, pg_catalog.pg_class pkc,"
+        " pg_catalog.pg_attribute pka, pg_catalog.pg_namespace fkn,"
+        " pg_catalog.pg_class fkc, pg_catalog.pg_attribute fka,"
+        " pg_catalog.pg_constraint con, pg_catalog.generate_series(1, 32) pos(n),"
+        " pg_catalog.pg_class pkic"
+        " WHERE pkn.oid = pkc.relnamespace AND pkc.oid = pka.attrelid"
+        " AND pka.attnum = con.confkey[pos.n] AND con.confrelid = pkc.oid"
+        " AND fkn.oid = fkc.relnamespace AND fkc.oid = fka.attrelid"
+        " AND fka.attnum = con.conkey[pos.n] AND con.conrelid = fkc.oid"
+        " AND con.contype = 'f' AND pkic.oid = con.conindid"
+        " ORDER BY pos.n",
+    )
+    assert res.rows == [("a", "x", 1), ("b", "y", 2)]
+
+
+def test_comma_join_semantics_preserved(storage, session):
+    q(storage, session, "CREATE TABLE ca (id int, x int)")
+    q(storage, session, "CREATE TABLE cb (id int, aid int)")
+    q(storage, session, "CREATE TABLE cc (id int, bid int)")
+    q(storage, session, "INSERT INTO ca VALUES (1, 10), (2, 20)")
+    q(storage, session, "INSERT INTO cb VALUES (100, 1), (200, 2)")
+    q(storage, session, "INSERT INTO cc VALUES (1000, 100), (2000, 200)")
+    res = q(
+        storage,
+        session,
+        "SELECT ca.x, cc.id FROM ca, cb, cc"
+        " WHERE ca.id = cb.aid AND cb.id = cc.bid AND ca.x = 10 ORDER BY cc.id",
+    )
+    assert res.rows == [(10, 1000)]
