@@ -311,6 +311,15 @@ def _encode_int2vector(v: Any) -> bytes:
     return bytes(out)
 
 
+def _decode_oid(b: bytes) -> int:
+    """Binary ``oid`` (and the reg* pseudo-types): a 4-byte unsigned int. A
+    payload of any other length is a protocol violation, like PG's oidrecv
+    (pgtest oid corpus sends a 2-byte and a 6-byte one)."""
+    if len(b) != 4:
+        raise errors.SQLError("08P01", "insufficient data left in message")
+    return struct.unpack("!I", b)[0]
+
+
 def _decode_char1(b: bytes) -> str | None:
     # "char" binary form is the raw byte(s). Empty / zero byte is the NULL
     # surrogate (the pgtest char corpus reads both back as SQL NULL).
@@ -334,7 +343,14 @@ _BINARY = {
     21: lambda b: struct.unpack("!h", b)[0],  # int2
     23: lambda b: struct.unpack("!i", b)[0],  # int4
     25: lambda b: b.decode("utf-8"),  # text
-    26: lambda b: struct.unpack("!I", b)[0],  # oid (unsigned)
+    26: lambda b: _decode_oid(b),  # oid (unsigned)
+    # reg* pseudo-types ride the oid wire form: a 4-byte unsigned integer.
+    24: lambda b: _decode_oid(b),  # regproc
+    2202: lambda b: _decode_oid(b),  # regprocedure
+    2205: lambda b: _decode_oid(b),  # regclass
+    2206: lambda b: _decode_oid(b),  # regtype
+    4089: lambda b: _decode_oid(b),  # regnamespace
+    4096: lambda b: _decode_oid(b),  # regrole
     114: lambda b: typemap.JsonText(b.decode("utf-8")),  # json — binary form is the text
     700: lambda b: struct.unpack("!f", b)[0],  # float4
     701: lambda b: struct.unpack("!d", b)[0],  # float8

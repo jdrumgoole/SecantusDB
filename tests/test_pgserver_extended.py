@@ -1249,3 +1249,42 @@ def test_drop_table_with_active_portal_is_55006(client):
         pgwire.build_bind("", "", []),
         pgwire.build_execute("", 0),
     )
+
+
+def test_reg_pseudotypes_binary_and_typlen(client):
+    # pgtest oid corpus — the reg* pseudo-types ride the oid wire form: a
+    # 4-byte unsigned int, typlen 4 in RowDescription; a wrong-length
+    # payload is 08P01 (PG's oidrecv), not raw bytes echoed back.
+    msgs = client.exchange(
+        pgwire.build_parse("", "SELECT $1, $2, $3, $4, $5", [2205, 4089, 24, 2206, 26]),
+        pgwire.build_describe("S", ""),
+        pgwire.build_bind(
+            "",
+            "",
+            [
+                bytes.fromhex("01000029"),
+                bytes.fromhex("0100002a"),
+                bytes.fromhex("0100002b"),
+                bytes.fromhex("0100002c"),
+                bytes.fromhex("ffffffff"),
+            ],
+            param_formats=[1, 1, 1, 1, 1],
+        ),
+        pgwire.build_execute("", 0),
+    )
+    assert rows(msgs) == [[b"16777257", b"16777258", b"16777259", b"16777260", b"4294967295"]]
+    rd = next(m for m in msgs if m.type == "T")
+    import struct as _s
+
+    off = 2
+    for _ in range(5):
+        end = rd.payload.index(b"\x00", off)
+        assert _s.unpack_from("!h", rd.payload, end + 11)[0] == 4  # typlen
+        off = end + 19
+    for bad in (bytes.fromhex("0029"), bytes.fromhex("010000290000")):
+        msgs = client.exchange(
+            pgwire.build_parse("", "SELECT $1", [2205]),
+            pgwire.build_bind("", "", [bad], param_formats=[1]),
+            pgwire.build_execute("", 0),
+        )
+        assert error_code(msgs) == "08P01"
