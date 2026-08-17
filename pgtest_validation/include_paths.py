@@ -12,6 +12,19 @@ EXCLUDE: set[str] = set()
 
 #: file -> reason. A file listed here that PASSES is reported loudly.
 EXPECTED_DIVERGENCES: dict[str, str] = {
+    "portals": (
+        "portals:1182 compares the CHECK-violation MESSAGE with "
+        "keepErrMessage and pins crdb's wording ('failed to satisfy CHECK "
+        "constraint (a > 1.0:::FLOAT8)'). We emit real PostgreSQL's ('new row "
+        "for relation \"t\" violates check constraint \"t_a_check\"'), which is "
+        "what psycopg/pgjdbc users parse — matching crdb would be a fidelity "
+        "REGRESSION. Everything up to :1182 passes (1182 of 1550 lines, "
+        "including PortalSuspended-on-exact-MaxRows and per-Execute row "
+        "counts). NOTE: the stanzas after :1182 are therefore NOT exercised — "
+        "they cover 34000 'unknown portal' (already implemented, slice 21) and "
+        "42P03 'cursor \"p\" already exists as portal' (NOT implemented). See "
+        "tasks/backlog.md."
+    ),
     "jsonpath": (
         "jsonpath:36/:76 expect crdb's BINARY jsonpath form — version byte + "
         "the SINGLE-QUOTED text ('$' -> 01272427). Real PostgreSQL's "

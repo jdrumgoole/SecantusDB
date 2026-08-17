@@ -236,10 +236,12 @@ def test_execute_with_max_rows_suspends_portal(client):
     )
     assert rows(msgs) == [[b"1"], [b"2"]]
     assert any(m.type == "s" for m in msgs)  # PortalSuspended
-    # A second Execute on the same portal drains the rest.
+    # A second Execute on the same portal drains the rest. Its
+    # CommandComplete counts the rows THAT Execute delivered (one), not the
+    # portal's total — PG's per-Execute count, pinned by pgtest portals.
     more = client.exchange(pgwire.build_execute("pg", max_rows=2))
     assert rows(more) == [[b"3"]]
-    assert command_tag(more) == "SELECT 3"
+    assert command_tag(more) == "SELECT 1"
     client.exchange(
         pgwire.build_parse("", "COMMIT"),
         pgwire.build_bind("", "", []),
@@ -1447,3 +1449,32 @@ def test_bare_parameter_case_result_is_42P18(client):
         pgwire.build_describe("S", ""),
     )
     assert error_code(msgs) is None
+
+
+def test_exact_max_rows_suspends_then_reports_zero(client):
+    # pgtest portals — PG cannot know a portal is exhausted until an Execute
+    # fetches past the last row: an Execute delivering EXACTLY MaxRows always
+    # suspends, and the next one reports CommandComplete with the rows IT
+    # delivered (SELECT 0).
+    client.exchange(
+        pgwire.build_parse("", "BEGIN", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    client.exchange(
+        pgwire.build_parse("pq", "SELECT * FROM generate_series(1, 2)", []),
+        pgwire.build_bind("pp", "pq", []),
+    )
+    first = client.exchange(pgwire.build_execute("pp", 1))
+    assert rows(first) == [[b"1"]] and any(m.type == "s" for m in first)
+    second = client.exchange(pgwire.build_execute("pp", 1))
+    # The second row exhausts the data, but PG still suspends here.
+    assert rows(second) == [[b"2"]] and any(m.type == "s" for m in second)
+    third = client.exchange(pgwire.build_execute("pp", 1))
+    assert rows(third) == []
+    assert command_tag(third) == "SELECT 0"
+    client.exchange(
+        pgwire.build_parse("", "ROLLBACK", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
