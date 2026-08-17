@@ -8049,6 +8049,68 @@ def _append_forward_join(
     amap[join_alias] = ("join", join_table)
 
 
+def _key_comma_joins_from_where(stmt: exp.Select, base_alias: str) -> None:
+    """Push simple cross-table equalities from WHERE onto comma-join ON clauses.
+
+    A pure comma-join (``FROM a, b, …`` — no ON, no outer side) compiles to an
+    UNKEYED ``$lookup`` that returns the entire foreign collection per outer row
+    (a cartesian product), with the join predicates applied only by the terminal
+    WHERE ``$match``. Over several catalog tables that intermediate is
+    astronomical (pgjdbc's getImportedKeys for multi-column FKs reached 183GB).
+
+    For each comma-join, move the WHERE equalities of the form ``joined.col =
+    available.col`` (both plain columns, the other side an ALREADY-available
+    alias) onto that join's ON, so the ``$lookup`` is keyed. Comma-joins are
+    INNER, so relocating an equality from the terminal ``$match`` onto the
+    inner-join ON is result-preserving. Residual predicates (single-table
+    filters, array-subscript / expression joins) stay in WHERE. Idempotent — a
+    re-plan finds the joins already carry an ON and does nothing."""
+    joins = stmt.args.get("joins") or []
+    where = stmt.args.get("where")
+    if where is None or not any(j.args.get("on") is None and not j.args.get("side") for j in joins):
+        return
+    conjuncts = _and_conjuncts(where.this)
+    available = {base_alias}
+    consumed: set[int] = set()
+    for jn in joins:
+        alias = _join_source_alias(jn.this)
+        if jn.args.get("on") is not None or jn.args.get("side") or alias is None:
+            if alias is not None:
+                available.add(alias)
+            continue
+        keys: list[exp.Expression] = []
+        for i, c in enumerate(conjuncts):
+            if (
+                i in consumed
+                or not isinstance(c, exp.EQ)
+                or not isinstance(c.this, exp.Column)
+                or not isinstance(c.expression, exp.Column)
+            ):
+                continue
+            la, ra = c.this.table or None, c.expression.table or None
+            if (la == alias and ra in available and ra != alias) or (
+                ra == alias and la in available and la != alias
+            ):
+                keys.append(c)
+                consumed.add(i)
+        if keys:
+            on = keys[0].copy()
+            for k in keys[1:]:
+                on = exp.And(this=on, expression=k.copy())
+            jn.set("on", on)
+        available.add(alias)
+    if not consumed:
+        return
+    remaining = [c for i, c in enumerate(conjuncts) if i not in consumed]
+    if remaining:
+        new_where = remaining[0].copy()
+        for c in remaining[1:]:
+            new_where = exp.And(this=new_where, expression=c.copy())
+        stmt.set("where", exp.Where(this=new_where))
+    else:
+        stmt.set("where", None)
+
+
 def _build_join_pipeline(
     stmt: exp.Select, db: str, catalog: Any, storage: Any
 ) -> tuple[
@@ -8108,6 +8170,11 @@ def _build_join_pipeline(
 
     amap: dict[str, tuple[str, TableDef]] = {base_alias: ("base", base)}
     pipeline: list[dict[str, Any]] = []
+
+    # Key comma-joins from WHERE before building stages: an unkeyed comma-join
+    # $lookup returns the WHOLE foreign collection (a cartesian product), so a
+    # multi-table comma-join over the catalogs explodes (getImportedKeys 183GB).
+    _key_comma_joins_from_where(stmt, base_alias)
 
     # Each JOIN compiles to a $lookup + $unwind. The lookup's localField may point
     # into an already-joined alias (a chain like a⋈b⋈c where c joins on b), which
