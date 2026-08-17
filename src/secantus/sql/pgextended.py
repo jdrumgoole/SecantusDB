@@ -323,6 +323,7 @@ _BINARY = {
     18: _decode_char1,  # "char" (one byte)
     90008: lambda b: b.decode("utf-8"),  # citext — binary form is the text
     4072: lambda b: b[1:].decode("utf-8"),  # jsonpath: skip the version byte
+    90010: lambda b: b[1:].decode("utf-8"),  # ltree: version byte + text
     20: lambda b: struct.unpack("!q", b)[0],  # int8
     21: lambda b: struct.unpack("!h", b)[0],  # int2
     23: lambda b: struct.unpack("!i", b)[0],  # int4
@@ -632,6 +633,7 @@ _OUT_BINARY = {
     18: lambda v: str(v).encode("utf-8"),  # "char" — raw byte(s), \0 included
     22: lambda v: _encode_int2vector(v),  # int2vector — an int2[] wire array
     4072: lambda v: b"\x01" + str(v).encode("utf-8"),  # jsonpath: version + text
+    90010: lambda v: b"\x01" + str(v).encode("utf-8"),  # ltree: version + text
     90008: lambda v: str(v).encode("utf-8"),  # citext — text bytes
     20: lambda v: struct.pack("!q", int(typemap.unwrap_numeric(v))),  # int8
     21: lambda v: struct.pack("!h", int(typemap.unwrap_numeric(v))),  # int2

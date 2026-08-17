@@ -2699,9 +2699,15 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   EXPECTED_DIVERGENCES); jsonb_path_query coerces a string first arg
   to jsonb like PG's implicit cast; unaliased function-call columns
   are named after the function (PG rule — was ?column?). Corpus: 22
-  unexpected failures. Next: `ltree`, `multiple_active_portals`
-  (needs fresh-state isolation — leftover `mytable`/`ltree` deps).
-  Iterate file-by-file.
+  unexpected failures. Slice 20 greened `ltree`: the ltree type
+  landed on crdb's stable placeholder oid 90010 (like citext's
+  90008), stored as validated dotted-label text, binary = version
+  byte + text, INSERT-target and comparison inference (the
+  citext-only comparison branch is now the {citext, ltree} operator-
+  family set). Corpus: 21 unexpected failures. Next:
+  `multiple_active_portals` (its ltree dep is now met — remaining
+  blocker is leftover `mytable` state), `oid`. Iterate
+  file-by-file.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``

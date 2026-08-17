@@ -121,6 +121,10 @@ PG_OID: dict[str, int] = {
     # SQL/JSON path expressions, stored as PG's canonical text form
     # (jsonpath.canonicalize). Real catalog oid.
     "jsonpath": 4072,
+    # ltree (contrib): a dotted label path, stored as text. Like citext and
+    # hstore, no fixed catalog oid — crdb's stable placeholder (pgtest ltree
+    # corpus reads it in ParameterDescription and RowDescription).
+    "ltree": 90010,
     # xml (a real built-in type, OID 142). Stored as its text; validated
     # well-formed on cast / coerce.
     "xml": 142,
@@ -261,6 +265,7 @@ _REGTYPE_SPELLINGS: dict[str, str] = {
     # rewrites it to this quoted spelling, which resolves back here.
     "secantus_oid": "oid",
     "jsonpath": "jsonpath",
+    "ltree": "ltree",
 }
 
 
@@ -767,6 +772,8 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
         return "citext"
     if base == "jsonpath":
         return "jsonpath"
+    if base == "ltree":
+        return "ltree"
     if base == "aclitem":
         return "aclitem"
     if base == "name":
@@ -1084,6 +1091,10 @@ def _as_session_instant(value: _dt.datetime) -> _dt.datetime:
     return value
 
 
+#: An ltree label path: alphanumeric/underscore labels joined by dots.
+_LTREE_RE = _re.compile(r"[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*")
+
+
 def coerce(value: Any, tag: str) -> Any:
     """Coerce a Python literal to the BSON value stored for column ``tag``.
 
@@ -1219,6 +1230,11 @@ def coerce(value: Any, tag: str) -> Any:
             return _jsonpath.canonicalize(str(value))
         except _jsonpath.JsonPathError as exc:
             raise ValueError(str(exc)) from exc
+    if tag == "ltree":
+        s_ = str(value)
+        if not _LTREE_RE.fullmatch(s_):
+            raise ValueError(f"ltree syntax error at character 1: {s_!r}")
+        return s_
     if tag == "char1":
         # PG's internal one-byte "char": input truncates to ONE character
         # (crdb's UTF-8-character rule, pinned by the pgtest char corpus),
