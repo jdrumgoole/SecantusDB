@@ -19,7 +19,7 @@ TESTS_DIR = pathlib.Path(__file__).parent
 def test_no_module_assigns_pytestmark_twice() -> None:
     offenders: list[str] = []
     for path in sorted(TESTS_DIR.glob("*.py")):
-        tree = ast.parse(path.read_text(), filename=str(path))
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         count = sum(
             1
             for node in tree.body

@@ -39,7 +39,11 @@ import pytest
 # last write wins), which is exactly how this timeout mark was lost and the
 # global 600s thread-method timeout came back to os._exit workers
 # ("Not properly terminated", no signal trace, no faulthandler dump).
-_TIMEOUT_MARK = pytest.mark.timeout(1200, method="signal")
+# method="signal" needs SIGALRM (POSIX-only); Windows falls back to the
+# thread method at the same 1200s budget — still overriding the global 600s.
+_TIMEOUT_MARK = pytest.mark.timeout(
+    1200, method="signal" if hasattr(signal, "SIGALRM") else "thread"
+)
 # method="signal": these tests run subprocess/pymongo calls on the worker's
 # main thread, so SIGALRM can interrupt them — the timeout then FAILS THE
 # TEST with a traceback instead of the global thread-method's os._exit,
