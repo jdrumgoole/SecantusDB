@@ -3925,17 +3925,18 @@ def infer_parameter_types(
                     oids[idx] = typemap.PG_OID[fname]
                     continue
             elif isinstance(other, exp.Column) and catalog is not None and db is not None:
-                # citext ships its OWN operator family, so PG's parse analysis
-                # types an unknown param compared against a citext column as
-                # citext (the pgtest citext corpus reads 90008). Other column
-                # types keep the text default — the same corpus pins a "char"
-                # comparison param at 25, so this is citext-only on purpose.
+                # citext and ltree ship their OWN operator families, so PG's
+                # parse analysis types an unknown param compared against such a
+                # column as the column's type (the pgtest citext/ltree corpora
+                # read 90008/90010). Other column types keep the text default —
+                # the char corpus pins a "char" comparison param at 25, so the
+                # set is deliberately small.
                 cname = other.name
                 for tbl in stmt.find_all(exp.Table):
                     t = catalog.get(db, tbl.name)
                     col = t.column(cname) if t is not None else None
-                    if col is not None and col.type_tag == "citext":
-                        oids[idx] = typemap.PG_OID["citext"]
+                    if col is not None and col.type_tag in ("citext", "ltree"):
+                        oids[idx] = typemap.PG_OID[col.type_tag]
                         break
         if target is None:
             continue

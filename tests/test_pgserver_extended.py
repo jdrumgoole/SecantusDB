@@ -1122,3 +1122,32 @@ def test_jsonb_path_query_names_column_and_returns_jsonb(client):
     assert rd.payload[2:end] == b"jsonb_path_query"
     assert _s.unpack_from("!i", rd.payload, end + 7)[0] == 3802
     assert rows(msgs) == [[b"true"]]
+
+
+def test_ltree_reports_oid_90010(client):
+    # pgtest ltree corpus: ltree rides crdb's stable placeholder oid 90010
+    # (no fixed catalog oid, like citext/hstore); INSERT targets and
+    # comparisons against an ltree column infer it; the binary format is a
+    # version byte + the label-path text.
+    client.exchange(
+        pgwire.build_parse("", "CREATE TABLE lt (id int4 PRIMARY KEY, t ltree)", []),
+        pgwire.build_bind("", "", []),
+        pgwire.build_execute("", 0),
+    )
+    msgs = client.exchange(
+        pgwire.build_parse("ins_lt", "INSERT INTO lt (t, id) VALUES ($1, $2)", []),
+        pgwire.build_describe("S", "ins_lt"),
+        pgwire.build_bind("", "ins_lt", [b"A.B", b"1"]),
+        pgwire.build_execute("", 0),
+    )
+    pd = next(m for m in msgs if m.type == "t")
+    assert pgwire.parse_parameter_description(pd.payload) == [90010, 23]
+    msgs = client.exchange(
+        pgwire.build_parse("sel_lt", "SELECT id, t FROM lt WHERE t = $1", []),
+        pgwire.build_describe("S", "sel_lt"),
+        pgwire.build_bind("", "sel_lt", [b"\x01A.B"], param_formats=[1]),
+        pgwire.build_execute("", 0),
+    )
+    pd = next(m for m in msgs if m.type == "t")
+    assert pgwire.parse_parameter_description(pd.payload) == [90010]
+    assert rows(msgs) == [[b"1", b"A.B"]]
