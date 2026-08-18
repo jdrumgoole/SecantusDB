@@ -3222,15 +3222,45 @@ shared storage engine or building large new protocol subsystems:
   within a connection; the pubsub registry needs to fan out to other
   sessions' pending-notification queues and wake a blocked reader.
 - [ ] **pgtest gauge — wire-fidelity clusters** (`invoke validate-pgtest`,
-  baseline 8/58 files, `docs/validation-report-pgtest.md`): the corpus is
-  byte-exact per message, and each file stops at its first mismatch, so
-  fixes compound. First clusters from the baseline stream: ErrorResponse
-  field mismatches (~5 files — SQLSTATE/severity shapes under `until`
-  blocks), RowDescription details (DataTypeSize/TypeModifier for specific
-  types), CommandTag spellings, and per-type text renderings (array /
-  decimal / char / inet / varbit files each stop at their first divergent
-  output). Re-run per fix; grow toward the full 54-file corpus like the
-  psycopg gauge's 42%→91% climb.
+  **43/65 files pass** at `docs/validation-report-pgtest.md` — 7 expected
+  divergences, 10 unexpected failures, 5 skipped): the corpus is byte-exact
+  per message, and each file stops at its first mismatch, so fixes compound.
+  Recently landed: `void` (pg_sleep → void oid 2278), `set` (dotted custom
+  GUCs), `varbit` (binary bit/varbit `varbit_recv` framing), `unknown`
+  (oid-705 params resolved from context). Expected divergences added:
+  `spatial` / `box2d` / `pgvector` (PostGIS + pgvector extension types, out
+  of scope). Remaining 10 unexpected failures, triaged:
+  - **`timezone`** — first stanza pins timetz `DataTypeSize` **0** (crdb's
+    value); real PostgreSQL (and we) report the fixed 12-byte typlen. Almost
+    certainly a crdb-vs-PG divergence like `char`/`int2vector`, but the file
+    stops at its *first* stanza, so nothing past it is verified — needs a
+    real-PG confirmation before marking expected (don't lie the size to 0).
+  - **`typing`** — the non-crdb path expects `SELECT id FROM t WHERE v = $1`
+    (v varchar, `$1` declared uuid 2950 / bool 16) to ErrorResponse. We
+    return `SELECT 0` (silent success): the comparison type-checker doesn't
+    see the *param's declared OID*, so it never detects the cross-type
+    `varchar = uuid` clash. Even fixed we'd emit PG's `42883` "operator does
+    not exist", while the corpus pins crdb's `22023` "unsupported comparison
+    operator" via keepErrMessage — so the file can't pass, but the silent
+    success is a real gap worth closing (thread the declared param OID into
+    the WHERE type-check).
+  - **`row_description`** — `SELECT a, c FROM …` over base-table columns:
+    we report `TableAttributeNumber` 0, PG reports the source column's attnum
+    (1). Needs output-column → base-column attnum provenance in the
+    RowDescription builder (`ignore_table_oids` zeroes TableOID but keeps
+    attnum, so the attnum must be right).
+  - **`tuple`** — `SELECT (1::int2, 2::int4, 3::int8, null) AS row`: an
+    anonymous ROW/record constructor → `0A000 unsupported scalar
+    expression`. Needs record-type construction + the binary record result
+    encoding.
+  - **`procedure`** — `CREATE PROCEDURE … LANGUAGE plpgsql` with `INOUT`
+    params + `CALL`. Real PG feature, medium-large (procedures, CALL, INOUT
+    result rows).
+  - **`multiple_active_portals` / `…/query_timeout`** — portal query
+    cancel/timeout; overlaps the cancel-request work another session owns.
+  - **`schema_changes_implicit_txn` / `…/triggers`** — trigger DDL + schema
+    change visibility inside implicit txns.
+  - **`pgjdbc`** — the pgjdbc-specific corpus (many features; large).
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
   **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,
   from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn campaign
