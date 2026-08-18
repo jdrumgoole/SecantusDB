@@ -476,6 +476,12 @@ class Session:
     # CancelRequest must echo.
     cancel_event: threading.Event = field(default_factory=threading.Event)
     cancel_key: int = 0
+    # ``statement_timeout`` enforcement: the monotonic deadline for the current
+    # statement / extended-protocol message batch, or None when unset. Armed at
+    # the first statement of a batch (kept across the batch so a slow statement
+    # later in it still times out) and cleared at the batch boundary (Sync /
+    # simple-query end). ``pg_sleep`` and other cancellation points check it.
+    statement_deadline: float | None = None
     # SET LOCAL (#136): GUCs set with ``SET LOCAL`` inside a transaction, mapped to
     # the value to restore at transaction end (the pre-``SET LOCAL`` session value,
     # or None if it wasn't set). Reverted in ``engine._end_txn_state``.
@@ -726,6 +732,40 @@ class Session:
         """The Python codec for this connection's ``client_encoding``, or None
         for SQL_ASCII (no conversion — bytes pass through)."""
         return python_codec_for(self.get_setting("client_encoding"))
+
+    def statement_timeout_seconds(self) -> float:
+        """The ``statement_timeout`` GUC as seconds (0 = disabled). A bare number
+        is milliseconds (PG's default unit); an ``s`` / ``min`` / ``h`` / ``ms``
+        suffix is honoured."""
+        raw = str(self.get_setting("statement_timeout") or "").strip().lower()
+        if not raw or raw in ("0", "0ms"):
+            return 0.0
+        units = (("ms", 0.001), ("min", 60.0), ("h", 3600.0), ("s", 1.0))
+        for suffix, scale in units:
+            if raw.endswith(suffix):
+                try:
+                    return float(raw[: -len(suffix)].strip()) * scale
+                except ValueError:
+                    return 0.0
+        try:
+            return float(raw) / 1000.0  # bare number == milliseconds
+        except ValueError:
+            return 0.0
+
+    def arm_statement_deadline(self) -> None:
+        """Start the ``statement_timeout`` clock for the current statement /
+        message batch if one is configured and not already running. Kept across
+        an extended-protocol batch so a slow statement later in it still trips."""
+        if self.statement_deadline is not None:
+            return
+        timeout = self.statement_timeout_seconds()
+        if timeout > 0:
+            import time as _time
+
+            self.statement_deadline = _time.monotonic() + timeout
+
+    def clear_statement_deadline(self) -> None:
+        self.statement_deadline = None
 
     def txn_status(self) -> bytes:
         """The ReadyForQuery status byte: idle / in-transaction / failed."""
