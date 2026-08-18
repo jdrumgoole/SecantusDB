@@ -44,6 +44,7 @@ pub mod find;
 pub mod findandmodify;
 pub mod handshake;
 pub mod logbuf;
+pub mod mapreduce;
 pub mod rbac;
 pub mod roles;
 pub mod storage;
@@ -387,6 +388,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "delete" => crud::delete,
         "count" => crud::count,
         "distinct" => distinct::distinct,
+        "mapReduce" | "mapreduce" => mapreduce::map_reduce,
         "findAndModify" | "findandmodify" => findandmodify::find_and_modify,
         "find" => find::find,
         "aggregate" => aggregate::aggregate,
@@ -1459,7 +1461,9 @@ fn is_no_privilege_command(name: &str) -> bool {
 fn command_action(name: &str) -> Option<(&'static str, &'static str)> {
     use rbac::*;
     Some(match name {
-        "find" | "count" | "distinct" | "aggregate" => (A_FIND, SCOPE_COLLECTION),
+        "find" | "count" | "distinct" | "aggregate" | "mapReduce" | "mapreduce" => {
+            (A_FIND, SCOPE_COLLECTION)
+        }
         "insert" => (A_INSERT, SCOPE_COLLECTION),
         "update" => (A_UPDATE, SCOPE_COLLECTION),
         "delete" => (A_REMOVE, SCOPE_COLLECTION),
