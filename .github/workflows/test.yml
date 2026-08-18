@@ -209,6 +209,17 @@ jobs:
           ' > /tmp/disk-reclaim.log 2>&1 &
           echo "reclaim detached as pid $!"
 
+      - name: Register the MongoDB apt repository (Linux)
+        # Registering the repo BEFORE the install step means one ``apt-get
+        # update`` covers both it and the Ubuntu indexes — the second update we
+        # used to run re-fetched every index for no new information.
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
+            https://www.mongodb.org/static/pgp/server-8.0.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
+
       - name: Install toolchain and MongoDB CLI tools (Linux)
         # swig (for the vendored WT build) plus mongosh + Database Tools so the
         # CLI-tool conformance tests (tests/test_mongosh.py,
@@ -218,16 +229,10 @@ jobs:
         # intentionally omitted: the mongosh tests skip on win32 by design
         # (PowerShell --eval quoting), leaving only marginal coverage for a
         # slow, flake-prone choco install.
-        #
-        # Registering the MongoDB repo BEFORE the single ``apt-get update``
-        # merges what used to be two separate update+install steps — the second
-        # ``apt-get update`` was re-fetching every index for no new information.
         if: runner.os == 'Linux'
-        run: |
-          curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
-          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
-          sudo apt-get update
-          sudo apt-get install -y swig mongodb-mongosh mongodb-database-tools
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig mongodb-mongosh mongodb-database-tools
 
       - name: Install toolchain and MongoDB CLI tools (macOS)
         # The macOS half of the step above. Installing mongosh + Database Tools
@@ -855,17 +860,24 @@ jobs:
           ' > /tmp/disk-reclaim.log 2>&1 &
           echo "reclaim detached as pid $!"
 
+      - name: Register the MongoDB apt repository (Linux)
+        # Registered before the install so one ``apt-get update`` covers it and
+        # the Ubuntu indexes — see the ``test`` job's twin.
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
+            https://www.mongodb.org/static/pgp/server-8.0.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
+
       - name: Install toolchain and MongoDB CLI tools (Linux)
         # Same rationale as the ``test`` job: without mongosh + Database Tools
         # the CLI-tool conformance tests skip, and the durable pass must cover
-        # exactly what the fast pass covers. Single ``apt-get update`` for the
-        # same reason too.
+        # exactly what the fast pass covers.
         if: runner.os == 'Linux'
-        run: |
-          curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
-          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
-          sudo apt-get update
-          sudo apt-get install -y swig mongodb-mongosh mongodb-database-tools
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig mongodb-mongosh mongodb-database-tools
 
       - name: Install toolchain and MongoDB CLI tools (macOS)
         # macOS half — see the ``test`` job's twin.
@@ -1132,7 +1144,9 @@ jobs:
           git submodule update --init vendor/wiredtiger
 
       - name: Install swig
-        run: sudo apt-get update && sudo apt-get install -y swig
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
@@ -1345,7 +1359,9 @@ jobs:
       # swig builds WT's Python module; clang/libclang for secantus-wt's bindgen;
       # ninja is the generator the WT ExternalProject forces.
       - name: Install toolchain
-        run: sudo apt-get update && sudo apt-get install -y swig clang libclang-dev llvm-dev ninja-build
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig clang libclang-dev llvm-dev ninja-build
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
@@ -1610,7 +1626,9 @@ jobs:
 
       - name: Install toolchain (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y swig clang libclang-dev llvm-dev ninja-build
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig clang libclang-dev llvm-dev ninja-build
 
       - name: Install toolchain (macOS)
         if: runner.os == 'macOS'
