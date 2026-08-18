@@ -3299,9 +3299,14 @@ shared storage engine or building large new protocol subsystems:
     bind params validated with PG's exact errors (08P01/42804/22P03), a
     RECORD (2249) param rejected 0A000, and `$1::user_type` inferring the
     minted oid.
-  - **`procedure`** — `CREATE PROCEDURE … LANGUAGE plpgsql` with `INOUT`
-    params + `CALL`. Real PG feature, medium-large (procedures, CALL, INOUT
-    result rows).
+  - ~~**`procedure`**~~ — FEATURE IMPLEMENTED, file now an expected divergence:
+    `CREATE PROCEDURE` (IN/OUT/INOUT argmodes, either order), `CALL` returning
+    OUT/INOUT params as the result row over simple + extended protocols, plpgsql
+    body (INSERT + RAISE NOTICE) and `COMMIT`/`ROLLBACK` inside a procedure, and
+    `DROP PROCEDURE` all work. The file can't be byte-green because its `RAISE
+    NOTICE` stanzas pin crdb's internal source fields (`File:builtins.go`,
+    `Routine:func401`), which the runner doesn't normalize and no non-crdb server
+    emits (real PG sends `pl_exec.c`/`exec_stmt_raise`).
   - **`multiple_active_portals` / `…/query_timeout`** — portal query
     cancel/timeout; overlaps the cancel-request work another session owns.
   - **`schema_changes_implicit_txn` / `…/triggers`** — trigger DDL + schema

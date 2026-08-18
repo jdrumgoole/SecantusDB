@@ -4512,6 +4512,163 @@ def _create_function(
     return SQLResult(command_tag="CREATE FUNCTION")
 
 
+_PROC_MODE_KW = {"in", "out", "inout", "variadic"}
+
+
+def _parse_proc_params(params_text: str) -> list[dict]:
+    """Parse a procedure parameter list into ``[{name, mode, type_tag}]``.
+    Postgres accepts the argmode before OR after the name (``a INOUT int`` and
+    ``INOUT a int`` are both valid); a bare ``type`` is an unnamed IN param."""
+    out: list[dict] = []
+    for part in _split_top_level_commas(params_text):
+        part = part.strip()
+        if not part:
+            continue
+        toks = part.split()
+        mode = "IN"
+        kept: list[str] = []
+        for t in toks:
+            if t.lower() in _PROC_MODE_KW and mode == "IN":
+                mode = t.upper()
+            else:
+                kept.append(t)
+        name = None
+        type_toks = kept
+        if len(kept) >= 2:
+            name, type_toks = kept[0], kept[1:]
+        tag = None
+        if type_toks:
+            try:
+                dt = sqlglot.parse_one(f"CAST(NULL AS {' '.join(type_toks)})", read="postgres").to
+                tag = typemap.type_tag_for_sql(dt)
+            except Exception:  # noqa: BLE001 — unknown type spelling → text
+                tag = None
+        out.append(
+            {"name": name.strip('"') if name else None, "mode": mode, "type_tag": tag or "text"}
+        )
+    return out
+
+
+def _create_procedure(raw: str, db: str, catalog: Catalog, session: Session | None) -> SQLResult:
+    """``CREATE [OR REPLACE] PROCEDURE name(params) [LANGUAGE x] AS <body>`` —
+    parsed here (not via sqlglot, which rejects the ``a INOUT int`` argmode) and
+    stored like a function with ``is_procedure`` + per-param modes."""
+    text = raw.strip().rstrip(";").strip()
+    m = re.match(r"(?is)^create\s+(?P<repl>or\s+replace\s+)?procedure\s+", text)
+    if m is None:
+        raise errors.syntax_error("malformed CREATE PROCEDURE")
+    or_replace = bool(m.group("repl"))
+    nm = re.match(r'(?is)\s*(?P<name>"[^"]+"|[\w.]+)\s*\(', text[m.end() :])
+    if nm is None:
+        raise errors.syntax_error("CREATE PROCEDURE requires a parameter list")
+    name = nm.group("name").strip('"')
+    pos = m.end() + nm.end()  # just past the opening '('
+    depth, i = 1, pos
+    while i < len(text) and depth:
+        depth += 1 if text[i] == "(" else -1 if text[i] == ")" else 0
+        i += 1
+    params = _parse_proc_params(text[pos : i - 1])
+    rest = text[i:]
+    lang_m = re.search(r"(?is)\blanguage\s+(?P<lang>\w+)", rest)
+    language = lang_m.group("lang").lower() if lang_m else "sql"
+    if language not in ("sql", "plpgsql"):
+        raise errors.feature_not_supported(
+            f"CREATE PROCEDURE LANGUAGE {language} is not supported (only sql / plpgsql)"
+        )
+    body_re = r"(?is)\bas\s+(?P<body>\$(?P<tag>\w*)\$.*?\$(?P=tag)\$|'(?:[^']|'')*')"
+    body_m = re.search(body_re, rest)
+    if body_m is None:
+        raise errors.syntax_error("CREATE PROCEDURE requires an AS body")
+    body_raw = body_m.group("body")
+    if body_raw.startswith("$"):
+        body = re.sub(r"(?is)^\$\w*\$(.*)\$\w*\$$", r"\1", body_raw)
+    else:
+        body = body_raw[1:-1].replace("''", "'")
+    body = body.strip()
+    if language == "plpgsql":
+        from secantus.sql import plpgsql
+
+        plpgsql.parse(body)
+    nargs = sum(1 for p in params if p["mode"] in ("IN", "INOUT", "VARIADIC"))
+    if not or_replace and catalog.function_exists(db, name, nargs):
+        raise errors.SQLError("42723", f'function "{name}" already exists with same argument types')
+    catalog.put_function(
+        db,
+        {
+            "name": name,
+            "nargs": nargs,
+            "params": [p["name"] for p in params],
+            "param_types": [p["type_tag"] for p in params],
+            "param_modes": [p["mode"] for p in params],
+            "return_tag": None,
+            "is_table": False,
+            "body": body,
+            "language": language,
+            "returns_trigger": False,
+            "is_procedure": True,
+        },
+    )
+    return SQLResult(command_tag="CREATE PROCEDURE")
+
+
+def _drop_procedure(raw: str, db: str, catalog: Catalog) -> SQLResult:
+    """``DROP PROCEDURE [IF EXISTS] name`` — no arg list needed; drops the single
+    stored procedure of that name."""
+    m = re.match(
+        r'(?is)^\s*drop\s+procedure\s+(?P<exists>if\s+exists\s+)?(?P<name>"[^"]+"|[\w.]+)', raw
+    )
+    if m is None:
+        raise errors.syntax_error("malformed DROP PROCEDURE")
+    name = m.group("name").strip('"')
+    dropped = False
+    for fn in catalog.list_functions(db):
+        if fn.get("is_procedure") and fn.get("name", "").lower() == name.lower():
+            dropped = catalog.drop_function(db, name, fn["nargs"])
+            break
+    if not dropped and not m.group("exists"):
+        raise errors.SQLError("42883", f'procedure "{name}" does not exist')
+    return SQLResult(command_tag="DROP PROCEDURE")
+
+
+def _call_procedure(
+    tail: str, session: Session, storage: Any, db: str, catalog: Catalog
+) -> SQLResult:
+    """``CALL name(args)`` — run the procedure body; its OUT / INOUT parameters
+    (after execution) form the single result row, like Postgres."""
+    from secantus.sql import plpgsql, scalar
+
+    m = re.match(r'(?is)^\s*(?P<name>"[^"]+"|[\w.]+)\s*\((?P<args>.*)\)\s*;?\s*$', tail.strip())
+    if m is None:
+        raise errors.syntax_error(f"malformed CALL statement: {tail}")
+    name = m.group("name").strip('"')
+    ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    arg_vals: list[Any] = []
+    args_text = m.group("args").strip()
+    if args_text:
+        for part in _split_top_level_commas(args_text):
+            node = sqlglot.parse_one(f"SELECT {part}", read="postgres").expressions[0]
+            arg_vals.append(scalar.evaluate(node, planner._const_scope, ctx))
+    func = catalog.get_function(db, name, len(arg_vals))
+    if func is None or not func.get("is_procedure"):
+        raise errors.SQLError("42883", f"procedure {name} does not exist")
+    if func.get("language") == "plpgsql":
+        env = plpgsql.invoke_procedure(func, arg_vals, ctx)
+    else:
+        raise errors.feature_not_supported("only LANGUAGE plpgsql procedures are callable")
+    params = func.get("params") or []
+    modes = func.get("param_modes") or []
+    types = func.get("param_types") or []
+    cols: list[ColumnDesc] = []
+    vals: list[Any] = []
+    for pname, mode, tag in zip(params, modes, types, strict=False):
+        if mode in ("OUT", "INOUT"):
+            cols.append(ColumnDesc(pname or "?column?", tag, typemap.PG_OID.get(tag, 25)))
+            vals.append(env.get(str(pname).lower()) if pname else None)
+    if cols:
+        return SQLResult(command_tag="CALL", columns=cols, rows=[tuple(vals)], rowcount=1)
+    return SQLResult(command_tag="CALL")
+
+
 def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Session) -> SQLResult:
     """``CREATE TRIGGER name BEFORE INSERT ON table FOR EACH ROW EXECUTE
     PROCEDURE fn()`` — the supported shape (pgx's tsvector-maintenance
@@ -5912,6 +6069,15 @@ def _run_command(
         if handled is not None:
             return handled
         raise errors.syntax_error(f'syntax error at or near "{str(raw)[:40]}"')
+    if verb == "CREATE_PROCEDURE":
+        raw = stmt.expression.this if isinstance(stmt.expression, exp.Literal) else ""
+        return _create_procedure(str(raw), db, catalog, session)
+    if verb == "DROP_PROCEDURE":
+        raw = stmt.expression.this if isinstance(stmt.expression, exp.Literal) else ""
+        return _drop_procedure(str(raw), db, catalog)
+    if verb == "CALL":
+        tail = stmt.expression.this if isinstance(stmt.expression, exp.Literal) else ""
+        return _call_procedure(str(tail), session, storage, db, catalog)
     arg = stmt.expression
     if isinstance(arg, exp.Literal):
         name = arg.this

@@ -52,6 +52,18 @@ EXPECTED_DIVERGENCES: dict[str, str] = {
         "JOIN and through a VIEW, char(n) blank padding on the wire, and "
         "attnum stability across ALTER COLUMN TYPE."
     ),
+    "procedure": (
+        "procedure:66 (and the extended-protocol CALL after it) compare the "
+        "NoticeResponse of a plpgsql `RAISE NOTICE` and pin crdb's internal "
+        "source-location fields — `File:builtins.go, Routine:func401` — which the "
+        "runner does NOT normalize (it only zeroes Line). No non-crdb server can "
+        "emit crdb's Go source refs (real PostgreSQL sends `pl_exec.c` / "
+        "`exec_stmt_raise`), so the stanza can't pass against any non-crdb server. "
+        "Everything else is green: CREATE PROCEDURE with an `a INOUT int` argmode, "
+        "CALL returning the INOUT value as the result row, the plpgsql body "
+        "(INSERT + RAISE NOTICE), COMMIT/ROLLBACK inside the procedure, and DROP "
+        "PROCEDURE — over both the simple and extended protocols."
+    ),
     "typing": (
         "typing's two non-crdb stanzas both use keepErrMessage and pin crdb's "
         "wording for a mixed-type comparison: 22023 'unsupported comparison "
