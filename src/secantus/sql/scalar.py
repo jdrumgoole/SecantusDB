@@ -377,8 +377,21 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return _eval_bracket(node, scope, ctx)
     if isinstance(node, exp.Array):  # ARRAY[...] constructor -> a Python list
         return [evaluate(e, scope, ctx) for e in node.expressions]
+    if isinstance(node, exp.Tuple):
+        # A parenthesized multi-value tuple ``(a, b, …)`` in a scalar position is
+        # an anonymous record constructor — the same shape as ``ROW(a, b, …)``,
+        # keeping each field's SQL type oid (from the argument AST) for the
+        # binary record encoding.
+        vals = [evaluate(e, scope, ctx) for e in node.expressions]
+        rec = typemap.RecordValue((f"f{i + 1}", v) for i, v in enumerate(vals))
+        rec.field_oids = tuple(_row_field_oid(e) for e in node.expressions)
+        return rec
     if isinstance(node, exp.Interval):  # interval '1 day' (added to / subtracted
         return _eval_interval(node, scope, ctx)  # from a date via _Interval.__radd__)
+    if isinstance(node, exp.Collate):
+        # ``expr COLLATE "en_US"`` — collation affects comparison/sort order, not
+        # the value; evaluate the operand and drop the collation.
+        return evaluate(node.this, scope, ctx)
     typed = _SCALAR_FUNC_NODES.get(type(node))
     if typed is not None:
         return typed(node, scope, ctx)
@@ -2639,9 +2652,15 @@ def _row_field_oid(arg: exp.Expression) -> int:
     """The SQL type oid a ``row(…)`` argument carries into the record, or 0
     when it must be derived from the runtime value."""
     node = arg
-    while isinstance(node, exp.Paren):
+    while isinstance(node, (exp.Paren, exp.Collate)):
         node = node.this
     if isinstance(node, exp.Cast):
+        # A length/precision-bearing target (char/varchar/numeric/…) carries its
+        # distinct oid (1042/1043/…), which the bare tag → PG_OID path collapses
+        # to text (25); prefer the cast's full identity.
+        ident = typemap.cast_type_identity(node.to)
+        if ident is not None:
+            return ident[0]
         tag = typemap.type_tag_for_sql(node.to)
         if tag is not None:
             return typemap.PG_OID.get(tag, 0)
@@ -2657,6 +2676,8 @@ def _row_field_oid(arg: exp.Expression) -> int:
         return _row_field_oid(node.this)
     if isinstance(node, exp.Boolean):
         return 16
+    if isinstance(node, exp.Null):
+        return 705  # a bare NULL in a record is the unknown type
     return 0
 
 

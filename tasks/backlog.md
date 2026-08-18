@@ -3294,10 +3294,11 @@ shared storage engine or building large new protocol subsystems:
     (1). Needs output-column → base-column attnum provenance in the
     RowDescription builder (`ignore_table_oids` zeroes TableOID but keeps
     attnum, so the attnum must be right).
-  - **`tuple`** — `SELECT (1::int2, 2::int4, 3::int8, null) AS row`: an
-    anonymous ROW/record constructor → `0A000 unsupported scalar
-    expression`. Needs record-type construction + the binary record result
-    encoding.
+  - ~~**`tuple`**~~ — GREENED: the `(a, b, …)` anonymous record constructor
+    (binary + text output preserving per-field type oids), binary composite
+    bind params validated with PG's exact errors (08P01/42804/22P03), a
+    RECORD (2249) param rejected 0A000, and `$1::user_type` inferring the
+    minted oid.
   - **`procedure`** — `CREATE PROCEDURE … LANGUAGE plpgsql` with `INOUT`
     params + `CALL`. Real PG feature, medium-large (procedures, CALL, INOUT
     result rows).

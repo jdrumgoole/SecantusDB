@@ -950,6 +950,71 @@ def _binary_record_to_text(
     return "(" + ",".join(parts) + ")"
 
 
+def _oid_typname(oid: int) -> str:
+    """The pg_type ``typname`` an error message names for ``oid`` (``16`` ->
+    ``boolean``); ``-`` for an oid we don't know, matching PG's rendering."""
+    tag = typemap.OID_TO_TAG.get(oid)
+    return typemap.SQL_TYPE_NAME.get(tag, tag) if tag is not None else "-"
+
+
+def _decode_binary_composite(raw: bytes, fields: list, encoding: str | None = "utf-8") -> str:
+    """Decode a binary record parameter for a DECLARED composite type, validating
+    it against the type's field list and raising PG's exact wire errors (the
+    pgtest ``tuple`` corpus pins them via keepErrMessage). Returns the record
+    TEXT literal so the value rides the existing composite text-cast path."""
+    n_expected = len(fields)
+    if len(raw) < 4:
+        raise errors.SQLError("08P01", "insufficient data left in message")
+    (nfields,) = struct.unpack_from("!i", raw, 0)
+    off = 4
+    if nfields != n_expected:
+        raise errors.SQLError("42804", f"wrong number of columns: {nfields}, expected {n_expected}")
+    parts: list[Any] = []
+    for i, fld in enumerate(fields):
+        expected_oid = typemap.PG_OID.get(fld[1], 0)
+        if len(raw) - off < 4:
+            raise errors.SQLError("08P01", "insufficient data left in message")
+        (oid,) = struct.unpack_from("!i", raw, off)
+        off += 4
+        if oid != expected_oid:
+            raise errors.SQLError(
+                "42804",
+                f"binary data has type {oid} ({_oid_typname(oid)}) instead of "
+                f"expected {expected_oid} ({_oid_typname(expected_oid)}) in record column {i + 1}",
+            )
+        if len(raw) - off < 4:
+            raise errors.SQLError("08P01", "insufficient data left in message")
+        (length,) = struct.unpack_from("!i", raw, off)
+        off += 4
+        if length < 0:
+            parts.append(None)  # NULL element
+            continue
+        if len(raw) - off < length:
+            raise errors.SQLError("22P03", "insufficient data left in message")
+        payload = bytes(raw[off : off + length])
+        off += length
+        # A fixed-width type recv that runs out of bytes (a 0-length bool) is PG's
+        # 08P01 "no data left in message".
+        if oid == 16 and length < 1:
+            raise errors.SQLError("08P01", "no data left in message")
+        decoder = _BINARY.get(oid)
+        if decoder is not None:
+            parts.append(decoder(payload))
+        else:
+            parts.append(pgwire.decode_text(payload, encoding))
+    rendered: list[str] = []
+    for val, fld in zip(parts, fields, strict=True):
+        if val is None:
+            rendered.append("")
+            continue
+        out = typemap.to_pg_text(val, fld[1])
+        text = out.decode("utf-8") if out is not None else str(val)
+        if text == "" or any(ch in text for ch in ',()"\\') or any(ch.isspace() for ch in text):
+            text = '"' + text.replace("\\", "\\\\").replace('"', '""') + '"'
+        rendered.append(text)
+    return "(" + ",".join(rendered) + ")"
+
+
 def _encode_record(value: dict, encoding: str | None = "utf-8") -> bytes:
     """PG binary record: int32 nfields, then per field int32 type oid +
     int32 length (-1 NULL) + data. A ``RecordValue`` carries its fields'
@@ -959,7 +1024,10 @@ def _encode_record(value: dict, encoding: str | None = "utf-8") -> bytes:
     out = bytearray(struct.pack("!i", len(value)))
     for i, v in enumerate(value.values()):
         if v is None:
-            out += struct.pack("!ii", 25, -1)
+            # A NULL field still carries its declared type oid (a bare NULL in an
+            # anonymous record is unknown/705); fall back to text when untyped.
+            null_oid = declared[i] if i < len(declared) and declared[i] else 25
+            out += struct.pack("!ii", null_oid, -1)
             continue
         oid, tag = _py_value_field_oid(v)
         if i < len(declared) and declared[i]:
@@ -1161,6 +1229,11 @@ _TEXT_PARAM = {
 def _decode_param(raw: bytes | None, fmt: int, oid: int, encoding: str | None = "utf-8") -> Any:
     if raw is None:
         return None
+    if oid == 2249:
+        # The generic RECORD / anonymous composite type has no field types, so a
+        # value can't be parsed into it — PG rejects at Bind (a declared
+        # composite type carries a minted oid and decodes fine; only 2249 here).
+        raise errors.SQLError("0A000", "input of anonymous composite types is not implemented")
     if fmt == 0:  # text
         text = _reject_nul(pgwire.decode_text(raw, encoding))
         if oid in (114, 3802):
@@ -1648,17 +1721,14 @@ class ExtendedSession:
             if isinstance(value, bytes):  # binary enum form IS the label bytes
                 value = pgwire.decode_text(value, self.session.wire_encoding)
             return scalar.validate_enum_label(enum, value)
-        if self.catalog.get_composite(db, name) is not None:
+        composite_fields = self.catalog.get_composite(db, name)
+        if composite_fields is not None:
             if isinstance(value, bytes):
-                # A nested composite field embeds ITS composite's user oid —
-                # the predicate lets the decoder recurse instead of trying to
-                # UTF-8-decode raw binary record bytes.
-                def _is_composite(field_oid: int) -> bool:
-                    fname = virtual.user_type_name(db, self.catalog, field_oid)
-                    return fname is not None and self.catalog.get_composite(db, fname) is not None
-
-                value = _binary_record_to_text(
-                    value, self.session.wire_encoding, is_composite_oid=_is_composite
+                # Validate the binary record against the declared field list and
+                # raise PG's exact wire errors (pgtest tuple corpus); a well-formed
+                # payload becomes the record text for the composite text-cast path.
+                value = _decode_binary_composite(
+                    value, composite_fields, self.session.wire_encoding
                 )
             return typemap.TaggedText(str(value), virtual.quote_type_name(name))
         rng = getattr(self.catalog, "get_range_type", None)

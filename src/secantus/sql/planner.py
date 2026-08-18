@@ -4138,6 +4138,22 @@ def infer_parameter_types(
         oid = typemap.PG_OID.get(tag) if tag is not None else None
         if oid is None and typemap.is_array_tag(tag):
             oid = typemap._ARRAY_PG_OID.get(typemap.array_element_tag(tag))
+        if (
+            oid is None
+            and catalog is not None
+            and db is not None
+            and isinstance(target, exp.DataType)
+            and target.this == exp.DataType.Type.USERDEFINED
+        ):
+            # ``$1::r`` where ``r`` is a user-declared type (composite / enum /
+            # domain / range) — resolve to its minted oid so a BINARY param
+            # decodes through the type's record layout, not as raw text.
+            from secantus.sql import virtual
+
+            kind = target.args.get("kind")
+            uname = str(getattr(kind, "this", kind)).strip('"') if kind is not None else None
+            if uname:
+                oid = virtual.user_type_oid(db, catalog, uname)
         if oid:
             oids[idx] = oid
     return oids
@@ -10186,6 +10202,9 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         return str(node.this).lower()
     # ``row(...)`` -> an anonymous record.
     if isinstance(node, exp.Anonymous) and str(node.this).lower() == "row":
+        return "composite"
+    # ``(a, b, …)`` parenthesized tuple — an anonymous record constructor.
+    if isinstance(node, exp.Tuple):
         return "composite"
     # ``range_merge(a, b)`` -> the operands' range type.
     if isinstance(node, exp.Anonymous) and str(node.this).lower() == "range_merge":
