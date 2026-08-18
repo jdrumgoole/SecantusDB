@@ -2557,6 +2557,30 @@ def _column_for_order_node(
     return None
 
 
+def _source_table_attnum(
+    node: exp.Expression, amap: dict[str, tuple[str, TableDef]]
+) -> tuple[TableDef, int] | None:
+    """Resolve a bare column to its ``(TableDef, 1-based attnum)`` across a join's
+    alias map, mirroring `_column_for_order_node`'s qualified-then-unqualified
+    lookup so provenance names the same table the value came from. None when the
+    term isn't a bare column of one of the joined tables."""
+    if not isinstance(node, exp.Column):
+        return None
+    name = node.name
+    if node.table:
+        entry = amap.get(node.table)
+        if entry is None:
+            return None
+        tdefs = [entry[1]]
+    else:
+        tdefs = [tdef for _alias, (_role, tdef) in amap.items()]
+    for tdef in tdefs:
+        for i, c in enumerate(tdef.columns, start=1):
+            if c.name == name:
+                return tdef, i
+    return None
+
+
 def _emit_pipeline_sort(
     pipeline: list[dict[str, Any]],
     terms: list[tuple[str, int, bool]],
@@ -4192,6 +4216,11 @@ class PipelineSelectPlan:
     # the scalar in Python (the aggregation engine has no ``$sortArray``). Each
     # entry is ``(output_field, kind, fraction)`` — ``fraction`` None for mode.
     post_aggregates: list[tuple[str, str, float | None]] = field(default_factory=list)
+    # Per output position, the ``(TableDef, 1-based attnum)`` the column came
+    # from, or None for a computed / unattributable output. A join has no single
+    # base table, so this is how RowDescription still carries each output's base
+    # column identity (pgtest's row_description asserts it across a JOIN).
+    out_sources: list[tuple[Any, int] | None] = field(default_factory=list)
 
 
 @dataclass
@@ -4240,8 +4269,12 @@ class EvaluatedSelectPlan:
     # The single base TableDef when the plan came from a one-table SELECT —
     # lets the descriptor builder attribute bare-column outputs to their
     # source table/attnum (RowDescription base-column identity, which JDBC's
-    # getBaseColumnName resolves through). None for joins.
+    # getBaseColumnName resolves through). None for joins, which carry the
+    # same identity per output position in ``out_sources`` instead.
     base_table: Any = None
+    # Per output position, the ``(TableDef | ViewSource, 1-based attnum)`` the
+    # column came from, or None for a computed / unattributable output.
+    out_sources: list[tuple[Any, int] | None] = field(default_factory=list)
 
 
 def _evaluated_enum_orders(
@@ -5197,10 +5230,74 @@ def plan_pipeline_select(
     token = _pipeline_subctx.set(
         SubqueryCtx(storage=storage, db=db, catalog=catalog, session=session)
     )
+    # Resolved BEFORE planning: planning flattens ``FROM (subquery) AS v`` into
+    # the subquery itself, so the view reference is gone by the time the plan
+    # comes back.
+    view_positions = _view_source_positions(stmt, db, catalog)
     try:
-        return _plan_pipeline_select(stmt, db, catalog, storage)
+        plan = _plan_pipeline_select(stmt, db, catalog, storage)
     finally:
         _pipeline_subctx.reset(token)
+    if view_positions is not None:
+        _attribute_view_source(plan, *view_positions)
+    return plan
+
+
+@dataclass(frozen=True)
+class ViewSource:
+    """A view relation standing as an output column's provenance. Carries only
+    the name — the pg_class oid is minted in ``virtual``, which the descriptor
+    builder resolves (a view has no ``TableDef``)."""
+
+    name: str
+
+
+def _view_source_positions(
+    stmt: exp.Select, db: str, catalog: Any
+) -> tuple[str, dict[str, int]] | None:
+    """``(view_name, {column_name: 1-based position})`` when ``stmt`` selects from
+    exactly one expanded view, else None.
+
+    A view is expanded into an inline subquery before planning, which loses the
+    relation identity Postgres reports in RowDescription — a view's columns carry
+    the view's own oid and its own 1-based positions, not the underlying tables'.
+    The expansion keeps the view's name as the subquery alias, and the stored
+    definition round-trips to exactly the subquery body, so an exact-SQL match
+    identifies the source without mistaking a user subquery that happens to be
+    aliased like a view.
+    """
+    # sqlglot spells the arg ``from_``; older versions used ``from``.
+    from_node = stmt.args.get("from_") or stmt.args.get("from")
+    if from_node is None or stmt.args.get("joins"):
+        return None
+    src = from_node.this
+    if not isinstance(src, exp.Subquery) or not src.alias:
+        return None
+    getter = getattr(catalog, "get_view", None)
+    vdef = getter(db, src.alias) if getter is not None else None
+    if vdef is None or src.this.sql(dialect="postgres") != vdef:
+        return None
+    try:
+        view_select = sqlglot.parse_one(vdef, read="postgres")
+        names = view_select.named_selects
+    except Exception:  # pragma: no cover - a stored definition that won't reparse
+        return None
+    return src.alias, {n: i + 1 for i, n in enumerate(names)}
+
+
+def _attribute_view_source(plan: Any, view_name: str, positions: dict[str, int]) -> None:
+    """Point ``plan``'s outputs at the view relation they were selected from.
+
+    This OVERRIDES any table-level attribution already on the plan: planning a
+    view over a join can flatten down to the view body's own plan, whose columns
+    were attributed to the underlying tables. Postgres reports the view.
+    """
+    if not hasattr(plan, "out_sources"):
+        return
+    plan.out_sources = [
+        (ViewSource(view_name), positions[name]) if name in positions else None
+        for name, _tag in plan.out_columns
+    ]
 
 
 def _plan_pipeline_select(
@@ -8564,18 +8661,20 @@ def _plan_join_select(
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
     out_enum_types: dict[int, str] = {}
+    out_sources: list[tuple[Any, int] | None] = []
     names = _NameAllocator()
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
         inner = e.this if isinstance(e, exp.Alias) else e
         if isinstance(inner, exp.Star):
             for a, (role, tdef) in amap.items():
-                for c in tdef.columns:
+                for i, c in enumerate(tdef.columns, start=1):
                     name = names.fresh(c.name)
                     project[name] = f"${c.field if role == 'base' else f'{a}.{c.field}'}"
                     if c.enum_type is not None:
                         out_enum_types[len(out_columns)] = c.enum_type
                     out_columns.append((name, c.type_tag))
+                    out_sources.append((tdef, i))
             continue
         path, tag = resolve(inner)
         name = names.fresh(alias or _column_name(inner))
@@ -8584,9 +8683,16 @@ def _plan_join_select(
         if src_col is not None and src_col.enum_type is not None:
             out_enum_types[len(out_columns)] = src_col.enum_type
         out_columns.append((name, tag))
+        out_sources.append(_source_table_attnum(inner, amap))
     _append_join_tail(pipeline, stmt, resolve, project, out_columns, amap)
     return PipelineSelectPlan(
-        base.collection, {}, pipeline, out_columns, out_enum_types=out_enum_types, derived=derived
+        base.collection,
+        {},
+        pipeline,
+        out_columns,
+        out_enum_types=out_enum_types,
+        derived=derived,
+        out_sources=out_sources,
     )
 
 
@@ -10668,6 +10774,10 @@ def _build_evaluated_join(
         where=residual,
         distinct_on=don,
         enum_orders=enum_orders,
+        # A computed output in the list (which is what routed this join to the
+        # evaluator) must not strip the base-column identity from its plain
+        # siblings — they still name a real column of a real table.
+        out_sources=[_source_table_attnum(e, amap) for e in out_exprs],
     )
 
 

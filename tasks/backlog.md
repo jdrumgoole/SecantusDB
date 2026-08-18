@@ -2800,9 +2800,20 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   Execute, after BindComplete). `aborted_txn` ignores BindComplete, so
   Bind-time satisfies both files, and it keeps the check ahead of any
   side effect (the data-modifying-CTE case). Report: 38/64 pass, 17
-  unexpected. Next: `row_description`, `set`, `typing`, `tuple`,
-  `unknown`, `varbit`, `void`, `procedure`, `timezone`; the geo trio
-  (`box2d` / `pgvector` / `spatial`) needs crdb extension types.
+  unexpected. Slice 28 took `row_description` to its last stanza
+  (recorded as the 5th expected divergence — its final directive sends
+  crdb-only `::STRING` / `::STRING(2)` with no `crdb_only` marker, and
+  real PG 14 rejects both with `42704 type "string" does not exist`,
+  probed). Four fixes: JOIN and view result columns now carry base-column
+  identity (`out_sources` per output position, replacing the single
+  `base_table`), `CREATE VIEW v (cols…)` no longer registers the view
+  under an EMPTY name while reporting success (the column list parses as
+  a `Schema` node wrapping the name — every reference to such a view
+  failed 42P01), `char(n)` blank-pads on the wire, and `ALTER COLUMN …
+  TYPE` recomputes the declared oid/typmod instead of inheriting the old
+  one. Next: `set`, `typing`, `tuple`, `unknown`, `varbit`, `void`,
+  `procedure`, `timezone`; the geo trio (`box2d` / `pgvector` /
+  `spatial`) needs crdb extension types.
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
@@ -3254,6 +3265,21 @@ shared storage engine or building large new protocol subsystems:
   shape outside those still raises `0A000`. The systemic fix is a
   HAVING-residual route mirroring the WHERE probes (the group-window paths
   already carry `residual_having` for subqueries).
+- [ ] **`char(n)` / `varchar(n)` declared length is not enforced**: an overlong
+  value is stored and returned intact, where PG raises `22001 value too long
+  for type character(8)` / `character varying(3)` (probed against 14 —
+  trailing-blank-only overflow is the one accepted case). Found while adding
+  blank padding for `char(n)` (slice 28). Related, from the same probe: the
+  padding is applied on the way OUT (`typemap.blank_pad`, at both wire render
+  paths) rather than on the way in, which is what keeps `length()`,
+  comparison, and `::text` seeing the unpadded value as PG does — but it means
+  `octet_length()` reports the unpadded byte count (PG reports the padded one),
+  and `char(n)[]` array elements are not padded.
+- [ ] **`::STRING` is accepted**: the crdb type alias parses and behaves as
+  `text`, where PG raises `42704 type "string" does not exist` (probed against
+  14). Harmless but a divergence; noted while recording the `row_description`
+  expected divergence, whose final stanza depends on crdb's `STRING(2)` →
+  `varchar` truncation.
 - [ ] **Multi-way comma-join performance**: sqllogictest `select4.test`/`select5.test`
   4-way joins with equi-WHEREs exceed 300s — the pipeline nests `$lookup`s without
   pushing the WHERE's equi-conditions into the lookup stages.

@@ -1398,6 +1398,28 @@ def _render_json(value: Any, compact: bool = False) -> str:
     return _json.dumps(value, default=str)
 
 
+#: pg_type oid of ``character(n)`` / ``bpchar``.
+BPCHAR_OID = 1042
+
+
+def blank_pad(value: Any, pg_oid: int, typmod: int) -> Any:
+    """Blank-pad a ``character(n)`` value to its declared width for output.
+
+    ``char(n)`` is a *blank-padded* type: Postgres stores and sends ``'hello'``
+    in a ``char(8)`` column as ``'hello   '`` (pgtest's row_description reads the
+    padded DataRow). The padding is applied on the way out rather than on the way
+    in, because the semantics that matter internally are the unpadded ones —
+    ``length()`` ignores trailing blanks, comparison ignores them, and casting to
+    ``text`` strips them, all of which fall out for free when the stored value
+    stays unpadded. ``atttypmod`` is the declared width + 4; a bare ``char``
+    (typmod -1) has no width to pad to.
+    """
+    if pg_oid != BPCHAR_OID or typmod <= 4 or not isinstance(value, str):
+        return value
+    width = typmod - 4
+    return value.ljust(width) if len(value) < width else value
+
+
 def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
     """Render a (already ``to_py``-normalised) result value as Postgres text.
 

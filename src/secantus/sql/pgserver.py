@@ -1079,11 +1079,15 @@ def _render_result(res: Any, encoding: str | None = "utf-8", session: Any = None
             "json_plain" if c.pg_oid == 114 and c.type_tag == "json" else c.type_tag
             for c in res.columns
         ]
+        # (oid, typmod) per column so a ``char(n)`` value goes out blank-padded.
+        widths = [(c.pg_oid, c.typmod) for c in res.columns]
         for row in res.rows:
             out += pgwire.data_row(
                 [
-                    pgwire.transcode_out(typemap.to_pg_text(v, t), encoding)
-                    for v, t in zip(row, tags, strict=False)
+                    pgwire.transcode_out(
+                        typemap.to_pg_text(typemap.blank_pad(v, w[0], w[1]), t), encoding
+                    )
+                    for v, t, w in zip(row, tags, widths, strict=False)
                 ]
             )
     out += pgwire.command_complete(res.command_tag)

@@ -1753,6 +1753,7 @@ def _describe_statement(
                 db,
                 out_exprs=getattr(plan, "out_exprs", None),
                 base_table=getattr(plan, "base_table", None),
+                out_sources=getattr(plan, "out_sources", None) or None,
             )
         except (errors.SQLError, TypeError, ValueError, AttributeError):
             return None
@@ -1791,6 +1792,7 @@ def _describe_statement(
             db,
             out_exprs=getattr(pplan, "out_exprs", None),
             base_table=getattr(pplan, "base_table", None),
+            out_sources=getattr(pplan, "out_sources", None) or None,
         )
     schema = table_node.args.get("db")
     schema_name = schema.name if schema is not None else None

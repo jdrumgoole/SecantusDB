@@ -1078,6 +1078,15 @@ Input truncates to a single character, an empty string or zero byte stores NULL,
 and an integer cast yields that code point (out of range raises `22003`). The
 unquoted `char` keyword still means `char(n)` / `bpchar`.
 
+### Blank padding (`char(n)`)
+
+`char(n)` is a blank-padded type: a shorter value is sent to the client padded
+out to the declared width, so `'hello'` in a `char(8)` column arrives as
+`'hello   '`. The padding is presentation only — `length()` ignores trailing
+blanks (it reports 5, not 8), comparison ignores them, and casting to `text`
+strips them, matching Postgres. The declared length is **not** enforced on
+write: an overlong value is stored as given, where Postgres raises `22001`.
+
 ### XML (`xml`)
 
 `xml` columns store XML text (validated well-formed on write) and support the
@@ -1481,6 +1490,23 @@ SELECT a.name FROM active_users a JOIN orders o ON o.user_id = a.id;
 DROP VIEW active_users;
 DROP VIEW IF EXISTS active_users;                  -- no error if absent
 ```
+
+A view may name its own columns, which override the query's output names
+positionally:
+
+```sql
+CREATE VIEW v (v1, v2) AS SELECT a, tab1_a FROM tab1 JOIN tab2 ON tab1.a = tab2.tab1_a;
+CREATE VIEW vfew (x) AS SELECT a, b FROM t;        -- `b` keeps its own name
+```
+
+Supplying more names than the query has columns raises `42601`. A `SELECT *`
+body has its columns resolved once, when the view is created, so a column added
+to the underlying table afterwards does not appear in the view — the same as
+Postgres.
+
+A view's result columns identify themselves as belonging to the *view*: they
+carry the view's `pg_class` oid and their position within the view, not the
+positions they occupy in the underlying tables.
 
 Views reflect through `pg_class` (`relkind = 'v'`), `pg_get_viewdef()`, and
 `information_schema.views`, so SQLAlchemy's `get_view_names()` and

@@ -442,20 +442,111 @@ def execute_comment(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLRe
     raise errors.feature_not_supported(f"COMMENT ON {kind} is not supported")
 
 
+def _view_star_columns(select: Any, catalog: Catalog, storage: Any, db: str) -> list[Any]:
+    """``select``'s output expressions with any ``*`` expanded to real columns.
+
+    A declared column list has to be matched up positionally against the view's
+    output columns, so ``CREATE VIEW v (v1, v2) AS SELECT * FROM t`` has to know
+    what ``*`` stands for. Postgres resolves the star once, at creation — adding
+    a column to ``t`` afterwards does NOT add it to ``v`` (probed against 14) —
+    so freezing the expansion here matches it. Raises when a star's source isn't
+    a plain table (a subquery / VALUES / SRF), rather than guessing.
+    """
+    from sqlglot import exp as _exp
+
+    from secantus.sql import reflect
+
+    out: list[Any] = []
+    for e in select.expressions:
+        is_star = isinstance(e, _exp.Star) or (
+            isinstance(e, _exp.Column) and isinstance(e.this, _exp.Star)
+        )
+        if not is_star:
+            out.append(e)
+            continue
+        qualifier = e.table if isinstance(e, _exp.Column) else None
+        # This statement's OWN sources: ``find_all`` would also descend into a
+        # subquery in the WHERE and expand that table's columns into the view.
+        from_node = select.args.get("from_") or select.args.get("from")
+        holders = ([from_node] if from_node is not None else []) + list(
+            select.args.get("joins") or []
+        )
+        sources = [h.this for h in holders if isinstance(h.this, _exp.Table)]
+        if not sources or len(sources) != len(holders):
+            raise errors.feature_not_supported(
+                "CREATE VIEW with a column list over a non-table source is not supported"
+            )
+        for src in sources:
+            alias = src.alias or src.name
+            if qualifier and alias != qualifier:
+                continue
+            qn = planner.qualified_table_name(src)
+            tdef = catalog.get(db, qn) or reflect.reflect(storage, db, qn)
+            if tdef is None:
+                raise errors.SQLError("42P01", f'relation "{qn}" does not exist')
+            for c in tdef.columns:
+                out.append(_exp.column(c.name, table=alias))
+    return out
+
+
+def _apply_view_column_names(
+    select: Any, names: list[str], catalog: Catalog, storage: Any, db: str
+) -> Any:
+    """Rename ``select``'s outputs to the view's declared column names.
+
+    Postgres applies them positionally and stores the rewritten query — a view
+    declared ``v (x)`` over ``SELECT a, b`` renders as ``SELECT a AS x, b``, so
+    surplus outputs keep their own names while surplus *names* are an error
+    (both probed against 14).
+    """
+    from sqlglot import exp as _exp
+
+    exprs = _view_star_columns(select, catalog, storage, db)
+    if len(names) > len(exprs):
+        raise errors.SQLError("42601", "CREATE VIEW specifies more column names than columns")
+    aliased = list(exprs)
+    for i, nm in enumerate(names):
+        inner = aliased[i]
+        inner = inner.this if isinstance(inner, _exp.Alias) else inner
+        aliased[i] = _exp.alias_(inner.copy(), nm)
+    out = select.copy()
+    out.set("expressions", aliased)
+    return out
+
+
 def execute_create_view(
     stmt: Any, catalog: Catalog, storage: Any, db: str, check_option: str | None = None
 ) -> SQLResult:
-    """``CREATE [OR REPLACE] VIEW v AS SELECT … [WITH [LOCAL|CASCADED] CHECK
-    OPTION]`` — store the SELECT definition. Querying the view expands it as a
-    subquery (see ``engine._expand_views``); ``check_option`` (``"LOCAL"`` /
-    ``"CASCADED"``) is enforced on write-through against each written row."""
-    name = planner.qualified_table_name(stmt.this)
+    """``CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT … [WITH [LOCAL|CASCADED]
+    CHECK OPTION]`` — store the SELECT definition. Querying the view expands it
+    as a subquery (see ``engine._expand_views``); ``check_option`` (``"LOCAL"`` /
+    ``"CASCADED"``) is enforced on write-through against each written row.
+
+    A declared column list parses as a ``Schema`` node wrapping the name, so the
+    name is unwrapped from it — reading it straight off produced an empty view
+    name, and the view was filed under "" while CREATE VIEW still reported
+    success (every later reference then failed as an undefined relation)."""
+    from sqlglot import exp as _exp
+
+    name_node = stmt.this
+    column_names: list[str] = []
+    if isinstance(name_node, _exp.Schema):
+        column_names = [c.name for c in name_node.expressions]
+        name_node = name_node.this
+    name = planner.qualified_table_name(name_node)
     replace = bool(stmt.args.get("replace"))
     if catalog.exists(db, name):
         raise errors.SQLError("42P07", f'relation "{name}" already exists')
     if not replace and catalog.get_view(db, name) is not None:
         raise errors.SQLError("42P07", f'relation "{name}" already exists')
-    catalog.put_view(db, name, stmt.expression.sql(dialect="postgres"), check_option=check_option)
+    body = stmt.expression
+    if column_names:
+        if not isinstance(body, _exp.Select):
+            raise errors.feature_not_supported(
+                "CREATE VIEW with a column list is supported for SELECT bodies only"
+            )
+        body = _apply_view_column_names(body, column_names, catalog, storage, db)
+    catalog.put_view(db, name, body.sql(dialect="postgres"), check_option=check_option)
     return SQLResult(command_tag="CREATE VIEW")
 
 
@@ -571,12 +662,18 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
         if col is None:
             raise errors.undefined_column(name)
         if action.args.get("dtype") is not None:  # TYPE t — retype in the catalog
-            tag = typemap.type_tag_for_sql(action.args["dtype"])
+            dtype = action.args["dtype"]
+            tag = typemap.type_tag_for_sql(dtype)
             if tag is None:
-                raise errors.feature_not_supported(
-                    f"unsupported column type: {action.args['dtype'].sql()}"
-                )
-            new_col = dataclasses.replace(col, type_tag=tag)
+                raise errors.feature_not_supported(f"unsupported column type: {dtype.sql()}")
+            # The declared identity has to be recomputed, not inherited: a column
+            # retyped from ``char(8)`` to ``text`` kept reporting bpchar/12 in
+            # RowDescription (pgtest row_description reads it after an ALTER).
+            identity = typemap.cast_type_identity(dtype)
+            decl_oid, typmod = identity if identity is not None else (None, -1)
+            new_col = dataclasses.replace(
+                col, type_tag=tag, decl_oid=decl_oid, typmod=typmod, json_plain=decl_oid == 114
+            )
         elif action.args.get("default") is not None:  # SET DEFAULT <literal | expr>
             node = action.args["default"]
             has_def, value = planner._literal_default(node, col.type_tag)
@@ -777,6 +874,18 @@ def _source_column_identity(table: Any, storage: Any, db: str | None) -> tuple[i
     return oid, {c.name: i + 1 for i, c in enumerate(table.columns)}
 
 
+def _view_oid(name: str, storage: Any, db: str | None) -> int:
+    """The minted pg_class oid for view ``name``, or 0 when it can't be resolved."""
+    if storage is None or db is None:
+        return 0
+    from secantus.sql import virtual
+
+    try:
+        return virtual._view_oids(db, Catalog(storage)).get(name, 0)
+    except Exception:  # pragma: no cover - catalog unavailable
+        return 0
+
+
 def _out_column_descs(
     cols: list[tuple[str, Any]], storage: Any, db: str | None, table: Any = None
 ) -> list[ColumnDesc]:
@@ -859,6 +968,7 @@ def _tagged_out_column_descs(
     *,
     out_exprs: list | None = None,
     base_table: Any = None,
+    out_sources: list[tuple[Any, int] | None] | None = None,
 ) -> list[ColumnDesc]:
     """Describe ``(out_name, type_tag)`` output pairs (the pipeline/evaluated
     plans' string-tag form). ``enum_types`` maps output positions to enum type
@@ -869,11 +979,30 @@ def _tagged_out_column_descs(
     bare-column outputs to their source table/attnum — JDBC's
     getBaseColumnName resolves aliases through these RowDescription fields,
     and a computed projection in the list must not strip the identity from
-    its plain-column siblings (ResultSetMetaDataTest's base-column asserts)."""
+    its plain-column siblings (ResultSetMetaDataTest's base-column asserts).
+
+    ``out_sources`` carries the same identity per output position for plans with
+    no single base table (a JOIN): ``(TableDef, attnum)`` or None. It takes
+    precedence over the ``base_table`` derivation where both are present."""
     from sqlglot import exp as _exp
 
     enum_oids: dict[str, int] | None = None
     table_oid, attnums = _source_column_identity(base_table, storage, db)
+    identities: dict[int, tuple[int, dict[str, int]]] = {}
+
+    def _identity_of(tdef: Any) -> tuple[int, dict[str, int]]:
+        """``_source_column_identity`` memoised per joined table (the oid lookup
+        reflects the whole catalog, so a wide join would repeat it per column).
+        A ``ViewSource`` resolves through the view oid range instead — a view has
+        no ``TableDef``, but it is a relation and reports its own pg_class oid."""
+        key = id(tdef)
+        if key not in identities:
+            if isinstance(tdef, planner.ViewSource):
+                identities[key] = (_view_oid(tdef.name, storage, db), {})
+            else:
+                identities[key] = _source_column_identity(tdef, storage, db)
+        return identities[key]
+
     out: list[ColumnDesc] = []
     for i, (name, tag) in enumerate(cols):
         oid = typemap.PG_OID.get(tag, 25)
@@ -888,26 +1017,34 @@ def _tagged_out_column_descs(
                 )
         attnum = 0
         typmod = -1
-        if table_oid and out_exprs is not None and i < len(out_exprs):
+        src_table = base_table
+        col_table_oid = table_oid
+        if out_sources is not None and i < len(out_sources) and out_sources[i] is not None:
+            src_table, src_attnum = out_sources[i]  # type: ignore[misc]
+            col_table_oid, _ = _identity_of(src_table)
+            attnum = src_attnum if col_table_oid else 0
+        elif col_table_oid and out_exprs is not None and i < len(out_exprs):
             expr = out_exprs[i]
             if isinstance(expr, _exp.Column):
                 attnum = attnums.get(expr.name, 0)
-                if attnum:
-                    # The evaluated plans carry only string tags, so the
-                    # declared identity (varchar's 1043, numeric's precision
-                    # typmod) comes from the base table's column def.
-                    src = base_table.columns[attnum - 1]
-                    decl = getattr(src, "decl_oid", None)
-                    if decl and enum_types.get(i) is None:
-                        oid = decl
-                    typmod = getattr(src, "typmod", -1)
+        src_columns = getattr(src_table, "columns", None)
+        if attnum and src_columns and attnum <= len(src_columns):
+            # The evaluated plans carry only string tags, so the declared
+            # identity (varchar's 1043, numeric's precision typmod) comes from
+            # the source table's column def. A view source has no column defs —
+            # its outputs keep the tag-derived identity.
+            src = src_columns[attnum - 1]
+            decl = getattr(src, "decl_oid", None)
+            if decl and enum_types.get(i) is None:
+                oid = decl
+            typmod = getattr(src, "typmod", -1)
         out.append(
             ColumnDesc(
                 name,
                 tag,
                 oid,
                 typmod,
-                table_oid=table_oid if attnum else 0,
+                table_oid=col_table_oid if attnum else 0,
                 attnum=attnum,
             )
         )
@@ -2230,7 +2367,13 @@ def execute_pipeline_select(
         synthesized = _empty_implicit_aggregate_row(remaining, ctx)
         if synthesized is not None:
             result = _apply_post_aggregates(plan, synthesized)
-    columns = _tagged_out_column_descs(plan.out_columns, plan.out_enum_types, storage, db)
+    columns = _tagged_out_column_descs(
+        plan.out_columns,
+        plan.out_enum_types,
+        storage,
+        db,
+        out_sources=getattr(plan, "out_sources", None) or None,
+    )
     rows = [
         tuple(typemap.to_py(doc.get(name), tag) for name, tag in plan.out_columns) for doc in result
     ]
@@ -2252,6 +2395,7 @@ def execute_evaluated_select(
         db,
         out_exprs=plan.out_exprs,
         base_table=getattr(plan, "base_table", None),
+        out_sources=getattr(plan, "out_sources", None) or None,
     )
     out_rows = [
         tuple(typemap.to_py(v, tag) for v, (_, tag) in zip(row, plan.out_columns, strict=True))

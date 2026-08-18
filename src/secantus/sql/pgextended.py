@@ -1924,7 +1924,13 @@ class ExtendedSession:
             for row in rows[portal.offset : end]:
                 out += pgwire.data_row(
                     [
-                        _result_value(v, f, c.pg_oid, c.type_tag, self.session.wire_encoding)
+                        _result_value(
+                            typemap.blank_pad(v, c.pg_oid, c.typmod),
+                            f,
+                            c.pg_oid,
+                            c.type_tag,
+                            self.session.wire_encoding,
+                        )
                         for v, f, c in zip(row, fmts, cols, strict=False)
                     ]
                 )
