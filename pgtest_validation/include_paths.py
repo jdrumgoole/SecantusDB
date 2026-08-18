@@ -49,4 +49,24 @@ EXPECTED_DIVERGENCES: dict[str, str] = {
         "in the file is green (oid-18 \"char\": casts, columns, params, "
         "1-char truncation, NULL for empty/zero-byte, binary format)."
     ),
+    "spatial": (
+        "PostGIS GEOMETRY/GEOGRAPHY — an extension type outside SecantusDB's "
+        "core-PostgreSQL SQL scope (the surrogate models MongoDB, not PostGIS). "
+        "A GEOMETRY value can't round-trip its EWKB binary form; an untyped "
+        "binary GEOMETRY parameter now surfaces a faithful 22P03 rather than a "
+        "generic internal error, but the type itself is not implemented."
+    ),
+    "box2d": (
+        "PostGIS BOX2D — an extension type outside SecantusDB's core-PostgreSQL "
+        "SQL scope. The ``::BOX2D`` cast falls through to a text passthrough, so "
+        "the binary result is the text form rather than PostGIS's four-float8 "
+        "box encoding. Out of scope, like GEOMETRY (see ``spatial``)."
+    ),
+    "pgvector": (
+        "The pgvector VECTOR type — an extension outside SecantusDB's "
+        "core-PostgreSQL SQL scope. A ``VECTOR`` column is rejected with a "
+        "faithful 0A000 (unsupported column type), which is correct emulation "
+        "of a server without the extension installed, but the corpus expects a "
+        "working vector type."
+    ),
 }
