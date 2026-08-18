@@ -105,6 +105,14 @@ jobs:
           "TMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "TEMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Register the MongoDB apt repository (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
+            https://www.mongodb.org/static/pgp/server-8.0.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
+
       - name: Install toolchain and MongoDB CLI tools (Linux)
         # MUST match the ``test`` job's toolchain exactly. The whole point of a
         # per-platform durations file is that it reflects what actually runs on
@@ -112,11 +120,9 @@ jobs:
         # lane, every cross-driver smoke would record as a ~0s skip and the
         # shards would be packed as though those minutes did not exist.
         if: runner.os == 'Linux'
-        run: |
-          curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
-          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
-          sudo apt-get update
-          sudo apt-get install -y swig mongodb-mongosh mongodb-database-tools
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig mongodb-mongosh mongodb-database-tools
 
       - name: Install swig (Windows)
         if: runner.os == 'Windows'

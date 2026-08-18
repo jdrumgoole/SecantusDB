@@ -106,14 +106,18 @@ jobs:
           submodules: recursive   # vendor/wiredtiger + the per-driver vendored submodule
 
       - name: Install swig
-        run: sudo apt-get update && sudo apt-get install -y swig
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig
 
       # The Rust-server gauge builds the _secantus_storage / _secantus_server
       # extensions inside the wheel build: bindgen needs libclang, the WT
       # ExternalProject forces Ninja, and the cargo build needs a Rust toolchain.
       - name: Install storage-engine toolchain
         if: contains(matrix.driver.name, 'rust-server')
-        run: sudo apt-get install -y clang libclang-dev llvm-dev ninja-build
+        uses: ./.github/actions/apt-install
+        with:
+          packages: clang libclang-dev llvm-dev ninja-build
 
       - name: Install Rust toolchain
         if: contains(matrix.driver.name, 'rust-server')
@@ -146,11 +150,15 @@ jobs:
       # The sql-stress smoke drives unmodified pgbench + psql.
       - name: Install pgbench + psql
         if: matrix.driver.name == 'sql-stress'
-        run: sudo apt-get update && sudo apt-get install -y postgresql-contrib postgresql-client
+        uses: ./.github/actions/apt-install
+        with:
+          packages: postgresql-contrib postgresql-client
 
       - name: Install C-driver build toolchain
         if: matrix.driver.name == 'c' || matrix.driver.name == 'c-rust-server'
-        run: sudo apt-get install -y cmake libssl-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: cmake libssl-dev
 
       - name: Cache test-libmongoc build
         if: matrix.driver.name == 'c' || matrix.driver.name == 'c-rust-server'
@@ -169,7 +177,9 @@ jobs:
       # C++17 compiler (preinstalled), and OpenSSL headers.
       - name: Install C++-driver build toolchain
         if: matrix.driver.name == 'cxx' || matrix.driver.name == 'cxx-rust-server'
-        run: sudo apt-get install -y cmake libssl-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: cmake libssl-dev
 
       - name: Cache libmongoc install + mongocxx build
         if: matrix.driver.name == 'cxx' || matrix.driver.name == 'cxx-rust-server'

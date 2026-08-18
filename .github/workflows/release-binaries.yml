@@ -134,7 +134,9 @@ jobs:
       # WT's (unused-here) Python module that its CMake still configures.
       - name: Install toolchain (Linux)
         if: matrix.os == 'linux'
-        run: sudo apt-get update && sudo apt-get install -y swig clang libclang-dev llvm-dev ninja-build
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig clang libclang-dev llvm-dev ninja-build
 
       - name: Install toolchain (macOS)
         if: matrix.os == 'macos'

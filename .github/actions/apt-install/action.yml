@@ -1,0 +1,95 @@
+name: apt-install
+description: >
+  Install Debian packages with a bounded per-attempt timeout and retries, so a
+  stalled Ubuntu mirror fails fast and is retried instead of hanging the job.
+
+# WHY THIS EXISTS
+#
+# The hosted runners resolve archive.ubuntu.com through an Azure mirror list
+# (/etc/apt/apt-mirrors.txt). When that mirror is unreachable apt logs a run of
+# ``Ign:`` lines, falls back to archive.ubuntu.com — and can then sit on a
+# half-open connection indefinitely. apt's own default is to wait, so the job
+# does not fail: it HANGS until the job timeout kills it, burning the entire
+# budget and reporting as "cancelled", which reads like someone cancelled the
+# run rather than a network fault.
+#
+# Observed three times in one evening on the mongosh/database-tools step, each
+# costing a 30-minute timeout, each passing on a plain re-run:
+#
+#     02:29:32  Get:5 https://archive.ubuntu.com/ubuntu noble-security InRelease
+#     02:58:58  ##[error]The operation was canceled.
+#
+# A retry loop alone does not fix this — you cannot retry a command that never
+# returns. The fix is a per-attempt ``timeout`` (so a stall becomes a failure)
+# plus retries around it, plus apt's own transport timeouts so most stalls are
+# caught below even that ceiling.
+
+inputs:
+  packages:
+    description: Space-separated package names to install.
+    required: true
+  attempts:
+    description: How many times to try the update+install pair.
+    required: false
+    default: "3"
+  attempt-timeout:
+    description: >
+      Seconds one attempt (update, then install) may take before it is killed
+      and retried. Well above a healthy run — a warm runner does this in well
+      under a minute — and far below the job timeout it used to consume.
+    required: false
+    default: "240"
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        APT_PACKAGES: ${{ inputs.packages }}
+        APT_ATTEMPTS: ${{ inputs.attempts }}
+        APT_ATTEMPT_TIMEOUT: ${{ inputs.attempt-timeout }}
+      run: |
+        set -uo pipefail
+
+        # Bound each individual transfer too, so a black-holed mirror errors out
+        # (and moves to the next mirror) rather than sitting on the socket.
+        # Acquire::Retries lets apt re-try a failed index on its own first.
+        apt_opts=(
+          -o Acquire::Retries=3
+          -o Acquire::http::Timeout=20
+          -o Acquire::https::Timeout=20
+          -o Acquire::ftp::Timeout=20
+        )
+
+        attempt=1
+        while :; do
+          echo "::group::apt-get attempt ${attempt}/${APT_ATTEMPTS}"
+          # -k 10: if the timeout's TERM is ignored (apt holding a lock), follow
+          # up with KILL 10s later so the attempt cannot outlive its budget.
+          if sudo timeout -k 10 "${APT_ATTEMPT_TIMEOUT}" apt-get "${apt_opts[@]}" update \
+            && sudo timeout -k 10 "${APT_ATTEMPT_TIMEOUT}" apt-get "${apt_opts[@]}" install -y ${APT_PACKAGES}; then
+            echo "::endgroup::"
+            exit 0
+          fi
+          rc=$?
+          echo "::endgroup::"
+          # 124 is timeout(1)'s "killed at the deadline" — i.e. the mirror stall
+          # this action exists for, as opposed to a genuine package error.
+          if [ "${rc}" -eq 124 ]; then
+            reason="timed out after ${APT_ATTEMPT_TIMEOUT}s (mirror stall)"
+          else
+            reason="exited ${rc}"
+          fi
+          if [ "${attempt}" -ge "${APT_ATTEMPTS}" ]; then
+            echo "::error::apt-get ${reason}; giving up after ${APT_ATTEMPTS} attempts"
+            exit 1
+          fi
+          backoff=$((attempt * 15))
+          echo "apt-get ${reason}; retrying in ${backoff}s"
+          # A stalled mirror is often a whole-index problem: drop the partial
+          # lists so the retry re-fetches cleanly rather than resuming a
+          # half-written state.
+          sudo rm -rf /var/lib/apt/lists/partial
+          sleep "${backoff}"
+          attempt=$((attempt + 1))
+        done
