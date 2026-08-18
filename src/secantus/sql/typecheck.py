@@ -84,6 +84,23 @@ _CATEGORY: dict[str, str] = {
     "timestamptz": "datetime",
 }
 
+#: Categories for types that only ever arrive as a DECLARED parameter type —
+#: a column of one of these is judged through ``_CATEGORY`` above, but a
+#: ``Parse`` that declares ``$1`` as one of them makes the comparison decidable
+#: even though no column carries the tag. Each is its own category: Postgres has
+#: no implicit cast between them and text/numeric, which is exactly why
+#: ``varchar_col = $1::uuid`` is an error rather than a no-match.
+_PARAM_CATEGORY: dict[str, str] = {
+    "uuid": "uuid",
+    "bytea": "bytea",
+    "inet": "inet",
+    "cidr": "inet",
+    "macaddr": "macaddr",
+    "json": "json",
+    "jsonb": "json",
+    "xml": "xml",
+}
+
 #: Human-facing Postgres spelling for the error message, per tag.
 _PG_NAME = {
     "int2": "smallint",
@@ -99,6 +116,14 @@ _PG_NAME = {
     "date": "date",
     "timestamp": "timestamp without time zone",
     "timestamptz": "timestamp with time zone",
+}
+
+#: Postgres spellings for the declared types whose storage tag folds into
+#: another (``varchar`` / ``bpchar`` both store as ``text``). The error message
+#: names the DECLARED type, so a varchar column reads "character varying".
+_DECL_OID_NAME: dict[int, str] = {
+    1042: "character",
+    1043: "character varying",
 }
 
 #: Operator spelling for the error message.
@@ -133,9 +158,33 @@ _INT_RETURNING = (exp.Length,)
 class _Resolver:
     """Column-name -> ``Column`` resolution over a statement's FROM tables."""
 
-    def __init__(self, tables: list[tuple[str | None, TableDef]], shadowed: frozenset[str]) -> None:
+    def __init__(
+        self,
+        tables: list[tuple[str | None, TableDef]],
+        shadowed: frozenset[str],
+        param_oids: list[int] | None = None,
+    ) -> None:
         self._tables = tables
         self._shadowed = shadowed
+        #: Parameter type OIDs as resolved at Parse, indexed from $1. Empty
+        #: when the statement is being checked without them (the execution
+        #: path), which leaves every parameter unknown as before.
+        self._param_oids = param_oids or []
+
+    def param_type(self, index: int) -> tuple[str, str] | None:
+        """``(category, display_name)`` for ``$index``'s DECLARED type, or None
+        when it wasn't declared (oid 0 — Postgres' ``unknown``, which takes the
+        other operand's type) or isn't a type we judge."""
+        if index < 1 or index > len(self._param_oids):
+            return None
+        oid = self._param_oids[index - 1]
+        if not oid:
+            return None
+        tag = typemap.OID_TO_TAG.get(oid)
+        if tag is None:
+            return None
+        cat = _CATEGORY.get(tag) or _PARAM_CATEGORY.get(tag)
+        return (cat, _describe(tag)) if cat is not None else None
 
     def column(self, node: exp.Column) -> Column | None:
         qualifier = node.table or None
@@ -195,7 +244,9 @@ def _table_sources(stmt: exp.Expression) -> list[exp.Expression] | None:
     return sources
 
 
-def _resolver(stmt: exp.Expression, catalog: Any, db: str) -> _Resolver | None:
+def _resolver(
+    stmt: exp.Expression, catalog: Any, db: str, param_oids: list[int] | None = None
+) -> _Resolver | None:
     """A resolver over ``stmt``'s FROM tables, or None when any source is not a
     plain declared non-reflected table."""
     sources = _table_sources(stmt)
@@ -216,7 +267,7 @@ def _resolver(stmt: exp.Expression, catalog: Any, db: str) -> _Resolver | None:
         tables.append((src.alias or None, table))
     if not tables:
         return None
-    return _Resolver(tables, _output_aliases(stmt))
+    return _Resolver(tables, _output_aliases(stmt), param_oids)
 
 
 def _output_aliases(stmt: exp.Expression) -> frozenset[str]:
@@ -259,8 +310,10 @@ def _static_type(node: exp.Expression, resolver: _Resolver) -> tuple[str, str] |
         # An enum / domain column stores its base type's tag but Postgres names
         # the declared type in the message ("operator does not exist: mood =
         # integer"). Both are implicitly coercible to the base, so the category
-        # verdict is the base type's either way.
-        declared = col.enum_type or col.domain_type
+        # verdict is the base type's either way. varchar / bpchar fold to the
+        # text tag for storage the same way, and Postgres names THEM too —
+        # "character varying = uuid", not "text = uuid".
+        declared = col.enum_type or col.domain_type or _DECL_OID_NAME.get(col.decl_oid or 0)
         return (cat, declared or _describe(col.type_tag))
     if isinstance(node, exp.Cast):
         to = node.to
@@ -279,6 +332,11 @@ def _static_type(node: exp.Expression, resolver: _Resolver) -> tuple[str, str] |
         return ("numeric", "integer" if _looks_integral(node.name) else "numeric")
     if isinstance(node, _INT_RETURNING):
         return ("numeric", "integer")
+    if isinstance(node, exp.Parameter):
+        try:
+            return resolver.param_type(int(node.name))
+        except (TypeError, ValueError):
+            return None
     if isinstance(node, _TEXT_PRESERVING):
         arg = node.this
         inner = _static_type(arg, resolver) if arg is not None else None
@@ -318,12 +376,14 @@ def _has_nested_query(node: exp.Expression, root: exp.Expression) -> bool:
     return False
 
 
-def check_statement(stmt: exp.Expression, catalog: Any, db: str) -> None:
+def check_statement(
+    stmt: exp.Expression, catalog: Any, db: str, *, param_oids: list[int] | None = None
+) -> None:
     """Raise 42883 when ``stmt`` contains a comparison Postgres could not
     resolve. A no-op for every statement shape or operand pair the analysis
     cannot decide soundly — see the module docstring."""
     try:
-        _analyse(stmt, catalog, db)
+        _analyse(stmt, catalog, db, param_oids)
     except errors.SQLError:
         raise
     except Exception:
@@ -333,7 +393,9 @@ def check_statement(stmt: exp.Expression, catalog: Any, db: str) -> None:
         return
 
 
-def _analyse(stmt: exp.Expression, catalog: Any, db: str) -> None:
+def _analyse(
+    stmt: exp.Expression, catalog: Any, db: str, param_oids: list[int] | None = None
+) -> None:
     if not isinstance(stmt, (exp.Select, exp.Update, exp.Delete)):
         return
     if any(True for _ in stmt.find_all(exp.Select, exp.Subquery)) and not isinstance(
@@ -341,7 +403,7 @@ def _analyse(stmt: exp.Expression, catalog: Any, db: str) -> None:
     ):
         # A subquery inside UPDATE/DELETE brings scopes we don't model.
         return
-    resolver = _resolver(stmt, catalog, db)
+    resolver = _resolver(stmt, catalog, db, param_oids)
     if resolver is None:
         return
     assignments = _set_assignments(stmt)
