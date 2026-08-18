@@ -221,6 +221,36 @@ impl Session {
         self.txn(unsafe { (*self.ptr).checkpoint }, config)
     }
 
+    /// Why WiredTiger rolled this session's transaction back
+    /// (`WT_SESSION::get_rollback_reason`), or None when it has no reason to
+    /// report.
+    ///
+    /// A `WT_ROLLBACK` is not one condition: it is *either* a genuine
+    /// write-write conflict with a concurrent operation *or* the engine
+    /// abandoning a transaction whose own dirty content it cannot evict. Only
+    /// the reason string separates them, and they deserve different errors —
+    /// the first is retryable, the second is not (retrying it just rebuilds the
+    /// same unevictable pile). This is the same call mongod uses to raise
+    /// `TransactionTooLargeForCache`.
+    ///
+    /// Valid only immediately after the failing call, before any further use of
+    /// the session: WiredTiger overwrites the buffer on the next operation.
+    pub fn rollback_reason(&self) -> Option<String> {
+        let f = unsafe { (*self.ptr).get_rollback_reason }?;
+        let raw = unsafe { f(self.ptr) };
+        if raw.is_null() {
+            return None;
+        }
+        let text = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
     fn txn(
         &self,
         f: Option<unsafe extern "C" fn(*mut sys::WT_SESSION, *const c_char) -> c_int>,
