@@ -5608,7 +5608,14 @@ def _run_set(stmt: exp.Set, session: Session) -> SQLResult:
         inner = item.this if isinstance(item, exp.SetItem) else item
         if not isinstance(inner, exp.EQ):
             raise errors.feature_not_supported(f"unsupported SET item: {item.sql()}")
-        name = sql_session.canonical_guc_name(inner.this.name)
+        # A custom (extension) GUC is spelled ``namespace.name`` and parses as a
+        # Column whose ``table`` part is the namespace — reconstruct the full
+        # dotted name so SHOW (which reads the whole literal) can find it.
+        lhs = inner.this
+        if isinstance(lhs, exp.Column) and lhs.table:
+            name = sql_session.canonical_guc_name(f"{lhs.table}.{lhs.name}")
+        else:
+            name = sql_session.canonical_guc_name(lhs.name)
         value_node = inner.expression
         if isinstance(value_node, exp.Literal):
             value = value_node.this

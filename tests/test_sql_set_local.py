@@ -27,6 +27,14 @@ def _run(storage, session, sql):
     return run_sql(storage, DB, sql, session=session)[-1]
 
 
+def test_custom_namespaced_guc_roundtrips(storage):
+    # A custom (extension) GUC ``namespace.name`` parses with the namespace as the
+    # LHS column's table part; SET must keep the full dotted name so SHOW finds it.
+    sess = Session(database=DB)
+    _run(storage, sess, "SET custom_option.session_setting = 'abc'")
+    assert _run(storage, sess, "SHOW custom_option.session_setting").rows == [("abc",)]
+
+
 def test_set_local_reverts_at_commit(storage):
     sess = Session(database=DB)
     _run(storage, sess, "BEGIN")

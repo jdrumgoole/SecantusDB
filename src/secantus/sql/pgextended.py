@@ -320,6 +320,27 @@ def _decode_oid(b: bytes) -> int:
     return struct.unpack("!I", b)[0]
 
 
+def _decode_varbit(b: bytes) -> str:
+    """Binary bit / varbit (PG's varbit_recv): an int32 bit length followed by
+    ceil(bits/8) data bytes, decoded to the canonical '0'/'1' string. Reading
+    past the parameter buffer is 08P01 (insufficient data — an empty binary
+    param can't even hold the 4-byte length); leaving bytes unconsumed is 22P03
+    ("incorrect binary data format in bind parameter"), matching PG's binary
+    bind-parameter framing (pgtest varbit corpus)."""
+    if len(b) < 4:
+        raise errors.SQLError("08P01", "insufficient data left in message")
+    bitlen = struct.unpack("!i", b[:4])[0]
+    if bitlen < 0:
+        raise errors.SQLError("22P03", "invalid length in external bit string")
+    nbytes = (bitlen + 7) // 8
+    if len(b) - 4 < nbytes:
+        raise errors.SQLError("08P01", "insufficient data left in message")
+    if len(b) - 4 != nbytes:
+        raise errors.SQLError("22P03", "incorrect binary data format in bind parameter")
+    bits = "".join(f"{byte:08b}" for byte in b[4 : 4 + nbytes])
+    return bits[:bitlen]
+
+
 def _decode_char1(b: bytes) -> str | None:
     # "char" binary form is the raw byte(s). Empty / zero byte is the NULL
     # surrogate (the pgtest char corpus reads both back as SQL NULL).
@@ -336,6 +357,8 @@ _BINARY = {
     16: lambda b: b == b"\x01",  # bool
     17: lambda b: bytes(b),  # bytea
     18: _decode_char1,  # "char" (one byte)
+    1560: _decode_varbit,  # bit(n)
+    1562: _decode_varbit,  # varbit / bit varying
     90008: lambda b: b.decode("utf-8"),  # citext — binary form is the text
     4072: lambda b: b[1:].decode("utf-8"),  # jsonpath: skip the version byte
     90010: lambda b: b[1:].decode("utf-8"),  # ltree: version byte + text

@@ -159,7 +159,8 @@ def _evaluate_named(name: str, args: list[Any], session: Session) -> tuple[str, 
         if session.cancel_event.wait(max(0.0, min(seconds, 30.0))):
             session.cancel_event.clear()
             raise errors.SQLError("57014", "canceling statement due to user request")
-        return ("pg_sleep", "", "text")
+        # PG types pg_sleep as void (oid 2278, typlen 4), value NULL on the wire.
+        return ("pg_sleep", None, "void")
     if name in ("pg_is_in_recovery",):
         return (name, False, "bool")
     if name in ("pg_terminate_backend", "pg_cancel_backend"):
