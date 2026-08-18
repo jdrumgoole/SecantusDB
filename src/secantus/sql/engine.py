@@ -1629,6 +1629,12 @@ def _describe_statement(
         return list(cur.columns) if cur is not None else None
     if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "MOVE":
         return None  # MOVE returns no rows
+    if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "CALL":
+        # A CALL portal describes as its procedure's OUT/INOUT params (a single
+        # RowDescription), or NoData when it has none — WITHOUT running the body
+        # (so a procedure that COMMITs internally emits no stray RowDescriptions;
+        # pgjdbc's #158771).
+        return _call_out_columns(_command_tail(stmt), db, catalog)
     if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "EXECUTE":
         # ``EXECUTE name(args)`` through the extended protocol: Describe must
         # report the UNDERLYING prepared statement's shape — a SELECT's
@@ -2714,12 +2720,17 @@ def is_nonstatement_expression(stmt: exp.Expression) -> bool:
 
 
 def _noop_command_word(stmt: exp.Expression) -> str | None:
-    """Return the no-op command word (DISCARD) or None."""
+    """The command tag for a no-op ``DISCARD`` statement, or None. Postgres
+    echoes the target in the tag — ``DISCARD ALL`` / ``DISCARD PLANS`` /
+    ``DISCARD SEQUENCES`` / ``DISCARD TEMP`` (``TEMPORARY`` folds to ``TEMP``)."""
     head = stmt.this if isinstance(stmt, exp.Alias) else stmt
     name = head.name if isinstance(head, exp.Column) else None
-    if name is not None and name.upper() in _NOOP_WORDS:
-        return name.upper()
-    return None
+    if name is None or name.upper() not in _NOOP_WORDS:
+        return None
+    target = stmt.alias.upper() if isinstance(stmt, exp.Alias) and stmt.alias else ""
+    if target == "TEMPORARY":
+        target = "TEMP"
+    return f"{name.upper()} {target}".strip()
 
 
 # ---------------------------------------------------------------------------
@@ -4591,7 +4602,10 @@ def _create_procedure(raw: str, db: str, catalog: Catalog, session: Session | No
         from secantus.sql import plpgsql
 
         plpgsql.parse(body)
-    nargs = sum(1 for p in params if p["mode"] in ("IN", "INOUT", "VARIADIC"))
+    # CALL supplies an argument for every parameter, including OUT ones (a
+    # placeholder), so a procedure is keyed by its TOTAL parameter count — that
+    # is what the CALL-site lookup matches.
+    nargs = len(params)
     if not or_replace and catalog.function_exists(db, name, nargs):
         raise errors.SQLError("42723", f'function "{name}" already exists with same argument types')
     catalog.put_function(
@@ -4657,18 +4671,45 @@ def _call_procedure(
         env = plpgsql.invoke_procedure(func, arg_vals, ctx)
     else:
         raise errors.feature_not_supported("only LANGUAGE plpgsql procedures are callable")
+    cols = _procedure_out_columns(func)
+    if cols:
+        params = func.get("params") or []
+        modes = func.get("param_modes") or []
+        vals = [
+            env.get(str(pname).lower()) if pname else None
+            for pname, mode in zip(params, modes, strict=False)
+            if mode in ("OUT", "INOUT")
+        ]
+        return SQLResult(command_tag="CALL", columns=cols, rows=[tuple(vals)], rowcount=1)
+    return SQLResult(command_tag="CALL")
+
+
+def _procedure_out_columns(func: dict) -> list[ColumnDesc]:
+    """The result-row columns of a CALL: the procedure's OUT / INOUT parameters,
+    in declaration order (empty for a procedure with no output params)."""
     params = func.get("params") or []
     modes = func.get("param_modes") or []
     types = func.get("param_types") or []
-    cols: list[ColumnDesc] = []
-    vals: list[Any] = []
-    for pname, mode, tag in zip(params, modes, types, strict=False):
-        if mode in ("OUT", "INOUT"):
-            cols.append(ColumnDesc(pname or "?column?", tag, typemap.PG_OID.get(tag, 25)))
-            vals.append(env.get(str(pname).lower()) if pname else None)
-    if cols:
-        return SQLResult(command_tag="CALL", columns=cols, rows=[tuple(vals)], rowcount=1)
-    return SQLResult(command_tag="CALL")
+    return [
+        ColumnDesc(pname or "?column?", tag, typemap.PG_OID.get(tag, 25))
+        for pname, mode, tag in zip(params, modes, types, strict=False)
+        if mode in ("OUT", "INOUT")
+    ]
+
+
+def _call_out_columns(tail: str, db: str, catalog: Catalog) -> list[ColumnDesc] | None:
+    """Result columns for a ``CALL name(args)`` WITHOUT executing it — the
+    procedure's OUT/INOUT params, or None (NoData) when it has none or isn't a
+    known procedure (extended-protocol Describe of a CALL portal)."""
+    m = re.match(r'(?is)^\s*(?P<name>"[^"]+"|[\w.]+)\s*\((?P<args>.*)\)\s*;?\s*$', tail.strip())
+    if m is None:
+        return None
+    args_text = m.group("args").strip()
+    nargs = len(_split_top_level_commas(args_text)) if args_text else 0
+    func = catalog.get_function(db, m.group("name").strip('"'), nargs)
+    if func is None or not func.get("is_procedure"):
+        return None
+    return _procedure_out_columns(func) or None
 
 
 def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Session) -> SQLResult:

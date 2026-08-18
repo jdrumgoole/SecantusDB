@@ -51,6 +51,55 @@ def test_create_call_inout_procedure(storage, session):
     assert q(storage, session, "SELECT * FROM temp").rows == [(1,)]
 
 
+def test_out_params_form_the_result_row(storage, session):
+    # OUT params (CALL passes placeholders for them) become the result row;
+    # COMMITs inside the body are accepted and execution continues.
+    q(storage, session, "CREATE TABLE tout (a INT)")
+    q(
+        storage,
+        session,
+        "CREATE OR REPLACE PROCEDURE po(OUT val INT, OUT val1 INT) LANGUAGE plpgsql AS "
+        "$$ BEGIN INSERT INTO tout VALUES (1); val = 1; val1 = 2; COMMIT; COMMIT; END; $$",
+    )
+    r = q(storage, session, "CALL po(NULL, NULL)")
+    assert r.command_tag == "CALL"
+    assert [c.name for c in r.columns] == ["val", "val1"]
+    assert r.rows == [(1, 2)]
+    # An OUT-param procedure that never assigns them returns NULLs.
+    q(
+        storage,
+        session,
+        "CREATE OR REPLACE PROCEDURE pn(OUT val INT, OUT val1 INT) LANGUAGE plpgsql AS "
+        "$$ BEGIN INSERT INTO tout VALUES (2); COMMIT; END; $$",
+    )
+    assert q(storage, session, "CALL pn(NULL, NULL)").rows == [(None, None)]
+
+
+def test_call_describe_shape(storage, session):
+    # Extended-protocol Describe of a CALL portal reports the OUT/INOUT params
+    # (RowDescription) or NoData — without running the body (pgjdbc #158771).
+    from secantus.sql import engine, planner
+
+    q(storage, session, "CREATE TABLE td (a INT)")
+    q(
+        storage,
+        session,
+        "CREATE PROCEDURE pd_out(OUT v INT) LANGUAGE plpgsql AS $$ BEGIN v = 5; END; $$",
+    )
+    q(storage, session, "CREATE PROCEDURE pd_void() LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$")
+    from secantus.sql.catalog import Catalog
+
+    cat = Catalog(storage)
+    out = engine.describe_statement(
+        storage, DB, planner.parse("CALL pd_out(NULL)")[0], session, cat
+    )
+    assert out is not None and [c.name for c in out] == ["v"]
+    assert (
+        engine.describe_statement(storage, DB, planner.parse("CALL pd_void()")[0], session, cat)
+        is None
+    )
+
+
 def test_argmode_before_name(storage, session):
     # Postgres accepts the argmode before the name too (``INOUT a int``).
     q(storage, session, "CREATE TABLE t2(a INT)")

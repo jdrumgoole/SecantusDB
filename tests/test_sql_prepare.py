@@ -181,3 +181,13 @@ def test_prepared_statements_are_per_session(tmp_path):
         assert exc.value.sqlstate == "26000"
     finally:
         st.close()
+
+
+def test_discard_tag_echoes_target(fresh):
+    # PG echoes the DISCARD target in the CommandComplete tag.
+    st, sess = fresh
+    assert _run(st, sess, "DISCARD ALL").command_tag == "DISCARD ALL"
+    assert _run(st, sess, "DISCARD PLANS").command_tag == "DISCARD PLANS"
+    assert _run(st, sess, "DISCARD SEQUENCES").command_tag == "DISCARD SEQUENCES"
+    assert _run(st, sess, "DISCARD TEMP").command_tag == "DISCARD TEMP"
+    assert _run(st, sess, "DISCARD TEMPORARY").command_tag == "DISCARD TEMP"

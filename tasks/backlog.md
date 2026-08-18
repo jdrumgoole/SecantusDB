@@ -3325,7 +3325,17 @@ shared storage engine or building large new protocol subsystems:
     zone offset with seconds (`+01:01:03`); the session-TimeZone timestamptz
     rendering (historical LMT `-05:50:36`), GMT-N upper-casing, and binary
     time-type encodings all already worked.
-  - **`pgjdbc`** — the pgjdbc-specific corpus (many features; large).
+  - ~~**`pgjdbc`**~~ — GREENED: `DISCARD <target>` command tags, a simple
+    `Query` mid-pipeline committing the pending extended-protocol implicit
+    transaction (pgjdbc's autosave interleave), and stored-procedure OUT
+    parameters (keyed by total param count, OUT/INOUT params forming the CALL
+    result row and the extended `Describe`-portal shape without running the
+    body — pgjdbc #158771).
+  - Only `multiple_active_portals` / `…/query_timeout` (query cancel — another
+    session owns the cancel-request work) remains an unexpected failure; the
+    rest are documented expected divergences (`char`, `int2vector`, `jsonpath`,
+    `portals`, `typing`, `row_description`, `procedure`, `spatial`, `box2d`,
+    `pgvector`).
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
   **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,
   from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn campaign
