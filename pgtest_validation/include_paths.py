@@ -41,6 +41,17 @@ EXPECTED_DIVERGENCES: dict[str, str] = {
         "stanza actually regression-tests (int2 array elements, elemoid 21 "
         "— crdb #111907 shipped int8 once) is implemented and correct."
     ),
+    "row_description": (
+        "row_description:376 sends `SELECT 'foo'::STRING, 'bar'::STRING(2)` "
+        "with NO crdb_only marker and expects crdb's STRING aliases (text/25 "
+        "and varchar/1043 typmod 6, truncating 'bar' to 'ba'). Real PostgreSQL "
+        "14 rejects both casts outright — `ERROR: 42704 type \"string\" does "
+        "not exist` (probed) — so the stanza can't pass against any non-crdb "
+        "server, and matching crdb's varchar(2) truncation would diverge from "
+        "PG. Everything before :376 is green: base-column identity across a "
+        "JOIN and through a VIEW, char(n) blank padding on the wire, and "
+        "attnum stability across ALTER COLUMN TYPE."
+    ),
     "char": (
         "char:250 pins TableOID=105 — crdb's deterministic descriptor id, "
         "with no ignore_table_oids directive on that stanza. Real PostgreSQL "
