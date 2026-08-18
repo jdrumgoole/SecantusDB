@@ -2845,9 +2845,22 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   the folded storage tag. Known gap left behind: the same comparison
   written as a *cast* (`v = $1::uuid`) is still unjudged — `_CATEGORY`
   covers the cast path and doesn't model uuid/bytea/json/inet, which
-  only `_PARAM_CATEGORY` does. Remaining files: `tuple`, `procedure`,
-  `timezone` (`set`, `unknown`, `varbit`, `void` greened by #971; the
-  geo trio `box2d` / `pgvector` / `spatial` reclassified by #973).
+  only `_PARAM_CATEGORY` does. Slice 30 **greened `timezone`** outright
+  (no divergence): a UTC offset may carry SECONDS — the pre-standard-time
+  LMT zones have them (Dublin -00:25:21) and PG preserves them, where we
+  raised `22007`. `timetz` now accepts them and renders PG's exact
+  narrowing ladder: seconds kept when non-zero even with 00 minutes
+  (`+01:00:03` stays wide), dropped when zero, then a zero minutes field
+  dropped too (`+01:01:00` -> `+01:01`, `+01:00:00` -> `+01`); a cast to
+  plain `time` still discards the whole zone. All probed against PG 14.
+  Remaining files: `tuple` (anonymous row constructors — `SELECT (1::int2,
+  2::int4, 3::int8, null)` is `0A000 unsupported scalar expression`) and
+  `procedure` (`CREATE PROCEDURE p(a INOUT INT) … LANGUAGE plpgsql` fails
+  `42601` at the INOUT parameter). Both are features, not fidelity
+  touch-ups — each needs its own slice, and `procedure` may be better
+  recorded as out of scope than half-implemented. (`set`, `unknown`,
+  `varbit`, `void` greened by #971; the geo trio `box2d` / `pgvector` /
+  `spatial` reclassified by #973.)
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``

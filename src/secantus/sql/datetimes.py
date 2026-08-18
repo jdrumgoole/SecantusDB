@@ -341,8 +341,12 @@ def parse_iso_datetime(v: Any) -> _dt.datetime:
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TIME_RE = re.compile(r"^(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d+))?)?$")
+#: A UTC offset may carry SECONDS, not just minutes — Postgres accepts and
+#: preserves ``+01:01:03`` (probed against 14; the historical LMT zones that
+#: predate standard time are where such offsets come from).
 _TIMETZ_RE = re.compile(
-    r"^(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d+))?)?\s*([+-]\d{1,2}(?::?\d{2})?)$"
+    r"^(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d+))?)?\s*"
+    r"([+-]\d{1,2}(?::?\d{2})?(?::?\d{2})?)$"
 )
 
 
@@ -424,7 +428,7 @@ def _fmt_time(hh: int, mm: int, ss: int, frac: str) -> str:
 
 
 # A trailing zone offset / era marker on a time-of-day string.
-_TZ_SUFFIX_RE = re.compile(r"(?i)\s*(?:[+-]\d{1,2}(?::?\d{2})?|Z)?(?:\s+BC)?\s*$")
+_TZ_SUFFIX_RE = re.compile(r"(?i)\s*(?:[+-]\d{1,2}(?::?\d{2})?(?::?\d{2})?|Z)?(?:\s+BC)?\s*$")
 _TS_TIME_TAIL_RE = re.compile(
     r"^\d{1,7}-\d{1,2}-\d{1,2}[ T](?P<time>\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)"
 )
@@ -500,19 +504,33 @@ def parse_timetz(value: Any, default_offset: str = "+00:00") -> str:
 
 
 def _normalize_offset(off: str) -> str:
+    """Canonicalise a UTC offset to ``+HH:MM`` — or ``+HH:MM:SS`` when it
+    carries non-zero seconds, which Postgres keeps rather than rounding away."""
     sign = off[0]
     rest = off[1:].replace(":", "")
     hours = int(rest[:2])
     minutes = int(rest[2:4]) if len(rest) > 2 else 0
+    seconds = int(rest[4:6]) if len(rest) > 4 else 0
+    if seconds:
+        return f"{sign}{hours:02d}:{minutes:02d}:{seconds:02d}"
     return f"{sign}{hours:02d}:{minutes:02d}"
 
 
 def render_timetz(value: Any) -> str:
-    """A stored timetz (canonical ``HH:MM:SS[.f]+HH:MM``) in Postgres' output
-    spelling: a zero-minute offset renders as ``+01``, not ``+01:00`` —
+    """A stored timetz (canonical ``HH:MM:SS[.f]+HH:MM[:SS]``) in Postgres'
+    output spelling: a zero-minute offset renders as ``+01``, not ``+01:00`` —
     clients compare the text (pgjdbc's TimezoneTest asserts ``15:00:00+01``).
-    Non-zero minutes keep the wide form (``+05:30``)."""
+    Non-zero minutes keep the wide form (``+05:30``).
+
+    An offset carrying seconds keeps them and stops there: Postgres renders
+    ``+01:00:03`` in full, so the zero-minute trim must not fire (probed
+    against 14, alongside ``+01:01:00`` -> ``+01:01`` and ``+01:00:00`` ->
+    ``+01``)."""
     text = str(value)
+    if len(text) >= 9 and text[-3] == ":" and text[-6] == ":" and text[-9] in "+-":
+        # ``+HH:MM:SS`` — the canonical form only carries seconds when they are
+        # non-zero, so there is nothing to trim.
+        return text
     if len(text) >= 6 and text[-3] == ":" and text[-2:] == "00" and text[-6] in "+-":
         return text[:-3]
     return text

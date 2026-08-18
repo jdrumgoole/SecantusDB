@@ -43,6 +43,31 @@ def test_parse_timetz():
     assert datetimes.parse_timetz("14:30:00-0530") == "14:30:00-05:30"
 
 
+# A UTC offset may carry SECONDS — the historical local-mean-time zones that
+# predate standard time have them, and Postgres accepts and preserves them.
+# Every expectation below was probed against a real PostgreSQL 14.
+@pytest.mark.parametrize(
+    ("literal", "rendered"),
+    [
+        ("00:00:00+01:01:03", "00:00:00+01:01:03"),  # seconds kept
+        ("00:00:00-01:01:03", "00:00:00-01:01:03"),  # ... and while negative
+        ("00:00:00+01:00:03", "00:00:00+01:00:03"),  # kept even with 00 minutes
+        ("00:00:00+01:01:00", "00:00:00+01:01"),  # zero seconds dropped
+        ("00:00:00+01:00:00", "00:00:00+01"),  # then zero minutes dropped
+        ("00:00:00+01:01", "00:00:00+01:01"),  # the pre-existing forms
+        ("15:00:00+01", "15:00:00+01"),
+    ],
+)
+def test_timetz_offset_seconds_round_trip(literal, rendered):
+    assert datetimes.render_timetz(datetimes.parse_timetz(literal)) == rendered
+
+
+def test_time_ignores_an_offset_carrying_seconds():
+    # `time` drops the zone entirely, offset seconds included (PostgreSQL 14:
+    # '00:00:00+01:01:03'::time is 00:00:00).
+    assert datetimes.parse_time("00:00:00+01:01:03") == "00:00:00"
+
+
 def test_is_date_value():
     assert datetimes.is_date_value("2020-01-15") is True
     assert datetimes.is_date_value(dt.date(2020, 1, 1)) is True

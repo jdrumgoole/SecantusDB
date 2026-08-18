@@ -117,6 +117,31 @@ def test_timetz_text_keeps_nonzero_minutes(storage, session):
     ]
 
 
+def test_timetz_keeps_an_offset_carrying_seconds(storage, session):
+    # pgtest's `timezone` corpus reads this back byte-for-byte: an offset with
+    # seconds (the historical LMT zones have them) is preserved, not rejected
+    # and not rounded to minutes. Probed against PostgreSQL 14.
+    assert q(storage, session, "SELECT '00:00:00+01:01:03'::timetz::text").rows == [
+        ("00:00:00+01:01:03",)
+    ]
+    assert q(storage, session, "SELECT '00:00:00+01:00:03'::timetz::text").rows == [
+        ("00:00:00+01:00:03",)
+    ]
+    # Zero seconds collapse back to the narrow forms.
+    assert q(storage, session, "SELECT '00:00:00+01:01:00'::timetz::text").rows == [
+        ("00:00:00+01:01",)
+    ]
+    assert q(storage, session, "SELECT '00:00:00+01:00:00'::timetz::text").rows == [
+        ("00:00:00+01",)
+    ]
+
+
+def test_timetz_column_round_trips_an_offset_with_seconds(storage, session):
+    q(storage, session, "CREATE TABLE tzsec (tz timetz)")
+    q(storage, session, "INSERT INTO tzsec VALUES ('00:00:00+01:01:03')")
+    assert q(storage, session, "SELECT tz::text FROM tzsec").rows == [("00:00:00+01:01:03",)]
+
+
 # --------------------------------------------------------------------------- #
 # BC / wide timestamptz under a session zone
 # --------------------------------------------------------------------------- #
