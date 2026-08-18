@@ -43,6 +43,16 @@ def test_parse_timetz():
     assert datetimes.parse_timetz("14:30:00-0530") == "14:30:00-05:30"
 
 
+def test_parse_timetz_sub_minute_offset():
+    # A zone offset can carry seconds (historical LMT zones); it round-trips.
+    assert datetimes.parse_timetz("00:00:00+01:01:03") == "00:00:00+01:01:03"
+    assert datetimes.render_timetz("00:00:00+01:01:03") == "00:00:00+01:01:03"
+    # Whole-minute and whole-hour offsets still drop their trailing :00 groups.
+    assert datetimes.render_timetz("00:00:00+01:00") == "00:00:00+01"
+    assert datetimes.render_timetz("00:00:00+05:30") == "00:00:00+05:30"
+    assert datetimes.split_timetz("00:00:00+01:01:03") == ("00:00:00", "+01:01:03")
+
+
 def test_is_date_value():
     assert datetimes.is_date_value("2020-01-15") is True
     assert datetimes.is_date_value(dt.date(2020, 1, 1)) is True
