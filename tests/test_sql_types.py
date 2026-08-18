@@ -251,6 +251,18 @@ def test_untyped_empty_multirange_binary_param():
     assert typemap.coerce("{}", "nummultirange") == {"multirange": []}
 
 
+def test_untyped_binary_param_non_text_is_22P03():
+    # A binary payload for an untyped (oid 0) parameter that isn't valid text —
+    # e.g. an EWKB GEOMETRY value for a type we don't model — surfaces a
+    # faithful 22P03, not a leaked UnicodeDecodeError (generic XX000).
+    from secantus.sql import errors
+
+    ewkb = bytes.fromhex("0101000020E6100000000000000000F03F000000000000F03F")
+    with pytest.raises(errors.SQLError) as e:
+        pgextended._decode_param(ewkb, 1, 0)
+    assert e.value.sqlstate == "22P03"
+
+
 def test_three_valued_logic_in_per_row_where():
     st = Storage(":memory:")
     try:

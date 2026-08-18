@@ -1201,8 +1201,15 @@ def _decode_param(raw: bytes | None, fmt: int, oid: int, encoding: str | None = 
         # coerces correctly against any multirange column.
         return "{}"
     if oid in (0, 25, 1043):
-        # Binary text is still text in the client's encoding.
-        return _reject_nul(pgwire.decode_text(raw, encoding))
+        # Binary text is still text in the client's encoding. A binary payload
+        # for an *untyped* (oid 0) parameter — e.g. ``$1::GEOMETRY`` for a type
+        # we don't model, which PG would have resolved and decoded with the
+        # type's recv function — may not be valid text; surface PG's faithful
+        # 22P03 rather than leaking a UnicodeDecodeError as a generic XX000.
+        try:
+            return _reject_nul(pgwire.decode_text(raw, encoding))
+        except UnicodeDecodeError as exc:
+            raise errors.SQLError("22P03", "invalid binary representation") from exc
     decoder = _BINARY.get(oid)
     if decoder is not None:
         return decoder(raw)
