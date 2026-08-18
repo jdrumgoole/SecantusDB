@@ -16,6 +16,7 @@ from typing import Any
 
 import bson
 
+from secantus.sql import subms
 from secantus.sql.catalog import Column, TableDef
 
 SAMPLE_SIZE = 50
@@ -62,6 +63,11 @@ def reflect(storage: Any, db: str, coll: str) -> TableDef | None:
     inferred: dict[str, str] = {}
     for doc in docs:
         for key, value in doc.items():
+            # A `__`-prefixed hidden storage field (an expression index's
+            # materialised value, a timestamp's sub-millisecond remainder) is
+            # not a column and must not be reflected as one.
+            if subms.is_companion_field(key):
+                continue
             if key not in inferred and value is not None:
                 inferred[key] = _infer_tag(value)
     # Ensure _id leads, then first-seen order for the rest.

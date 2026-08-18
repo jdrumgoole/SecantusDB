@@ -19,7 +19,7 @@ from typing import Any
 import bson
 
 from secantus.paths import get_path, has_path
-from secantus.sql import errors, planner, typemap
+from secantus.sql import errors, planner, subms, typemap
 from secantus.sql.catalog import USER_TYPE_ARRAY_OID_OFFSET, Catalog
 from secantus.sql.result import ColumnDesc, SQLResult
 
@@ -886,6 +886,20 @@ def _view_oid(name: str, storage: Any, db: str | None) -> int:
         return 0
 
 
+def _with_subms(doc: dict[str, Any], col: Any) -> Any:
+    """``col``'s stored value with its sub-millisecond remainder added back.
+
+    BSON dates hold whole milliseconds, so a ``timestamp`` column's microseconds
+    are carried in a hidden companion field (see `secantus.sql.subms`). Only the
+    paths that still have the whole document can restore them — a value already
+    projected through the aggregation pipeline has lost the companion.
+    """
+    value = get_path(doc, col.field)
+    if getattr(col, "type_tag", None) not in subms.SUBMS_TAGS:
+        return value
+    return subms.merge(value, doc.get(subms.companion_field(col.field)))
+
+
 def _out_column_descs(
     cols: list[tuple[str, Any]], storage: Any, db: str | None, table: Any = None
 ) -> list[ColumnDesc]:
@@ -1075,7 +1089,7 @@ def _returning_result(
 
     def cell(doc: dict[str, Any], col: Any, expr: Any) -> Any:
         if expr is None:
-            return typemap.to_py(get_path(doc, col.field), col.type_tag)
+            return typemap.to_py(_with_subms(doc, col), col.type_tag)
         from secantus.sql import scalar
 
         def scope(node: Any) -> Any:
@@ -1799,9 +1813,7 @@ def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult
         # get_path walks dotted field paths (jsonb navigation); a plain field
         # name resolves to a top-level lookup.
         rows.append(
-            tuple(
-                typemap.to_py(get_path(doc, col.field), col.type_tag) for _, col in plan.out_columns
-            )
+            tuple(typemap.to_py(_with_subms(doc, col), col.type_tag) for _, col in plan.out_columns)
         )
     return SQLResult(
         command_tag=f"SELECT {len(rows)}", columns=columns, rows=rows, rowcount=len(rows)
@@ -1860,7 +1872,7 @@ def execute_correlated_select(
 
     columns = _out_column_descs(plan.out_columns, storage, db, getattr(plan, "table", None))
     rows = [
-        tuple(typemap.to_py(get_path(doc, col.field), col.type_tag) for _, col in plan.out_columns)
+        tuple(typemap.to_py(_with_subms(doc, col), col.type_tag) for _, col in plan.out_columns)
         for doc in matched
     ]
     return SQLResult(
