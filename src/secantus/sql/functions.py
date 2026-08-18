@@ -156,7 +156,21 @@ def _evaluate_named(name: str, args: list[Any], session: Session) -> tuple[str, 
         # str() first: the per-row scalar path hands numerics over as
         # Decimal128, which float() rejects directly.
         seconds = float(str(args[0])) if args and args[0] is not None else 0.0
-        if session.cancel_event.wait(max(0.0, min(seconds, 30.0))):
+        sleep_for = max(0.0, min(seconds, 30.0))
+        deadline = session.statement_deadline
+        if deadline is not None:
+            import time as _time
+
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                raise errors.SQLError("57014", "canceling statement due to statement timeout")
+            if sleep_for > remaining:
+                # statement_timeout fires partway through this sleep.
+                if session.cancel_event.wait(remaining):
+                    session.cancel_event.clear()
+                    raise errors.SQLError("57014", "canceling statement due to user request")
+                raise errors.SQLError("57014", "canceling statement due to statement timeout")
+        if session.cancel_event.wait(sleep_for):
             session.cancel_event.clear()
             raise errors.SQLError("57014", "canceling statement due to user request")
         # PG types pg_sleep as void (oid 2278, typlen 4), value NULL on the wire.

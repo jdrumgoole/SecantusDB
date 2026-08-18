@@ -12,6 +12,31 @@ EXCLUDE: set[str] = set()
 
 #: file -> reason. A file listed here that PASSES is reported loudly.
 EXPECTED_DIVERGENCES: dict[str, str] = {
+    "multiple_active_portals": (
+        "A CockroachDB pausable-portal test. Two of its subtests can't pass "
+        "against a non-crdb server: (1) `query_timeout` expects a portal paged "
+        "MaxRows:1 to emit N DataRows and THEN a 57014 statement-timeout on the "
+        "next pull — that incremental behaviour needs LAZY per-row portal "
+        "evaluation, but SecantusDB materialises a portal's result eagerly "
+        "(statement_timeout IS enforced for simple / single-statement queries, "
+        "just not row-by-row across a paged portal); (2) "
+        "`interleave_with_unpausable_portal` pins crdb's `0A000 unimplemented: "
+        "the statement for a pausable portal must be a read-only SELECT` error "
+        "(with a go.crdb.dev hint) for interleaving a non-read-only portal — "
+        "real PostgreSQL interleaves those fine and emits no such error. Every "
+        "other subtest passes (select_from_individual_resources, "
+        "select_from_same_table, bind_to_an_existing_active_portal, "
+        "not_in_explicit_transaction, drop_table_when_there_are_dependent_"
+        "active_portals, different_portals_bind_to_the_same_statement, "
+        "more_complicated_stmts, not_supported_statements)."
+    ),
+    "multiple_active_portals/query_timeout": (
+        "Expects a portal paged MaxRows:1 to emit several DataRows and then a "
+        "57014 statement-timeout on the next pull — needs LAZY per-row portal "
+        "evaluation; SecantusDB materialises a portal's result eagerly, so "
+        "statement_timeout (which IS enforced for simple / single-statement "
+        "queries) can't page a portal row-by-row against the deadline."
+    ),
     "portals": (
         "portals:1182 compares the CHECK-violation MESSAGE with "
         "keepErrMessage and pins crdb's wording ('failed to satisfy CHECK "

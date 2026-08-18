@@ -812,6 +812,9 @@ class SecantusPGServer:
         # A cancel that landed while idle is discarded — PG only cancels the
         # query that is running when the cancel is processed.
         session.cancel_event.clear()
+        # Arm statement_timeout for this query (kept if a batch already armed it,
+        # e.g. an extended portal whose Executes bracket this simple query).
+        session.arm_statement_deadline()
         # pg_stat_activity (#137): this backend is 'active' with ``sql`` while the
         # query runs; it stays as the last query (state 'idle') afterwards.
         session.state = "active"
@@ -870,6 +873,8 @@ class SecantusPGServer:
         # NOTIFY, or one from another connection) before ReadyForQuery, matching
         # Postgres, so the client picks them up in this same query exchange.
         out += self._pending_notification_bytes(session)
+        # A simple query completes its own batch — the statement_timeout resets.
+        session.clear_statement_deadline()
         # The ReadyForQuery status reflects the transaction block (I/T/E).
         out += pgwire.ready_for_query(session.txn_status())
         session.state = "idle"  # query done; pg_stat_activity shows it idle (#137)

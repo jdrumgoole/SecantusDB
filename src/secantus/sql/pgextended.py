@@ -1400,6 +1400,8 @@ class ExtendedSession:
             for pname, pvalue in self.session.pending_parameter_status:
                 out += pgwire.parameter_status(pname, pvalue)
             self.session.pending_parameter_status = []
+            # Sync ends the message batch — the statement_timeout clock resets.
+            self.session.clear_statement_deadline()
             return bytes(out) + pgwire.ready_for_query(self.session.txn_status())
         if self.skip_until_sync:
             return b""  # discard everything until the next Sync
@@ -1437,6 +1439,9 @@ class ExtendedSession:
                 if msg_type == "D":
                     return self._describe(payload)
             if msg_type == "E":
+                # Arm statement_timeout for the batch on the first Execute (kept
+                # until Sync, so a slow statement later in the batch still trips).
+                self.session.arm_statement_deadline()
                 return self._execute(payload)
             if msg_type == "C":
                 return self._close(payload)
@@ -1681,6 +1686,7 @@ class ExtendedSession:
         except errors.SQLError:
             return
         prior_failed = session.txn_failed
+        session.arm_statement_deadline()  # the eager run respects statement_timeout too
         try:
             # Mirror _execute's cached-plan revalidation: a named statement
             # whose result shape changed must raise 0A000 at Execute, so a

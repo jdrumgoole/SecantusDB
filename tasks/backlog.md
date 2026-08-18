@@ -3314,8 +3314,14 @@ shared storage engine or building large new protocol subsystems:
     NOTICE` stanzas pin crdb's internal source fields (`File:builtins.go`,
     `Routine:func401`), which the runner doesn't normalize and no non-crdb server
     emits (real PG sends `pl_exec.c`/`exec_stmt_raise`).
-  - **`multiple_active_portals` / `…/query_timeout`** — portal query
-    cancel/timeout; overlaps the cancel-request work another session owns.
+  - ~~**`multiple_active_portals` / `…/query_timeout`**~~ — now an expected
+    divergence (crdb pausable-portal test). `statement_timeout` is now ENFORCED
+    (57014) for simple / single-statement queries — a real feature — but
+    `query_timeout` expects a MaxRows:1-paged portal to emit N rows then time
+    out on the next pull, which needs LAZY per-row portal evaluation (we
+    materialise eagerly); and `interleave_with_unpausable_portal` pins crdb's
+    `0A000 unimplemented pausable portal` error (go.crdb.dev hint) that real PG
+    doesn't produce. Both classified expected.
   - ~~**`schema_changes_implicit_txn` / `…/triggers`**~~ — GREENED: the only
     gap was `DROP TRIGGER` (CREATE TRIGGER + firing already worked, and the
     autocommit-during-bind subtest already passed); `DROP TRIGGER [IF EXISTS]
@@ -3331,11 +3337,10 @@ shared storage engine or building large new protocol subsystems:
     parameters (keyed by total param count, OUT/INOUT params forming the CALL
     result row and the extended `Describe`-portal shape without running the
     body — pgjdbc #158771).
-  - Only `multiple_active_portals` / `…/query_timeout` (query cancel — another
-    session owns the cancel-request work) remains an unexpected failure; the
-    rest are documented expected divergences (`char`, `int2vector`, `jsonpath`,
-    `portals`, `typing`, `row_description`, `procedure`, `spatial`, `box2d`,
-    `pgvector`).
+  - NO unexpected failures remain. Every non-passing file is a documented
+    expected divergence: `char`, `int2vector`, `jsonpath`, `portals`, `typing`,
+    `row_description`, `procedure`, `spatial`, `box2d`, `pgvector`,
+    `multiple_active_portals` (+ its `query_timeout` subtest).
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
   **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,
   from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn campaign
