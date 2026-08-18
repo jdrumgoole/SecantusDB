@@ -327,6 +327,14 @@ class _Parser:
             return SqlExec(query)
         if self._is_kw(tok, "raise"):
             return self._parse_raise()
+        if self._is_kw(tok, "commit", "rollback"):
+            # Transaction control inside a procedure. In the CALL's autocommit
+            # context there is no in-flight block to end, so this is a no-op that
+            # lets execution continue (a data-changing procedure that relies on a
+            # mid-body COMMIT/ROLLBACK boundary is a documented simplification).
+            self.i += 1
+            self._consume_optional_semi()
+            return SqlExec("")
         if self._is_kw(tok, "open"):
             # OPEN <var> FOR <query>;  — bind a refcursor variable to a
             # materialized server-side cursor. (The parameterized
@@ -832,3 +840,18 @@ def invoke(func: dict, args: list[Any], ctx: scalar.ScalarContext) -> Any:
         with contextlib.suppress(errors.SQLError, ValueError, TypeError):
             result = typemap.coerce(result, return_tag)
     return result
+
+
+def invoke_procedure(func: dict, args: list[Any], ctx: scalar.ScalarContext) -> dict[str, Any]:
+    """Run a ``LANGUAGE plpgsql`` PROCEDURE body and return the final variable
+    environment — the caller reads the OUT / INOUT parameter values from it to
+    build the CALL result row. A procedure has no RETURN value."""
+    block = parse(func["body"])
+    env: dict[str, Any] = {}
+    runner = _Runner(ctx, args, func)
+    params = func.get("params") or []
+    for i, name in enumerate(params):
+        if name is not None and i < len(args):
+            env[str(name).lower()] = args[i]
+    runner.run(block, env)
+    return env

@@ -3846,6 +3846,15 @@ def parameter_count(stmt: exp.Expression) -> int:
             indices.append(int(param.name))
         except (TypeError, ValueError):
             continue
+    # ``CALL proc($1)`` is kept as a raw Command; its ``$N`` placeholders live in
+    # the tail text, invisible to ``find_all`` — scan them so the extended
+    # protocol binds the parameter. Restricted to CALL: other Command tails
+    # (``PREPARE … AS SELECT $1``) carry ``$N`` that belong to an EMBEDDED query,
+    # not to the command's own bind parameters.
+    if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "CALL":
+        tail = stmt.args.get("expression")
+        if isinstance(tail, exp.Literal):
+            indices += [int(n) for n in re.findall(r"\$(\d+)", str(tail.this))]
     return max(indices, default=0)
 
 
@@ -11098,6 +11107,10 @@ UNCOMMENT_SENTINEL = "\x00__secantus_uncomment__"
 # ``WHERE x IS NULL`` is never touched.
 _COMMENT_NULL_RE = re.compile(r"(?is)^(\s*COMMENT\s+ON\b.*\bIS\s+)NULL(\s*;?\s*)$")
 _CREATE_FUNCTION_RE = re.compile(r"\bcreate\s+(?:or\s+replace\s+)?function\b", re.I)
+#: CREATE [OR REPLACE] PROCEDURE — routed to a Command so the engine's regex
+#: parser handles it (sqlglot rejects the ``a INOUT int`` argmode syntax).
+_CREATE_PROCEDURE_RE = re.compile(r"(?is)^\s*create\s+(?:or\s+replace\s+)?procedure\b")
+_DROP_PROCEDURE_RE = re.compile(r"(?is)^\s*drop\s+procedure\b")
 _RETURNS_TRIGGER_RE = re.compile(r"(\breturns\s+)trigger\b", re.I)
 
 # sqlglot parses COPY's options only in the ``WITH (…)`` spelling; the bare
@@ -11620,6 +11633,13 @@ def _parse_uncached(sql: str) -> list[exp.Expression]:
     do_m = _DO_BLOCK_RE.match(sql)
     if do_m is not None:
         return [exp.Command(this="DO", expression=exp.Literal.string(do_m.group("body")))]
+    # CREATE [OR REPLACE] PROCEDURE / DROP PROCEDURE — sqlglot rejects the
+    # ``a INOUT int`` argmode syntax, so carry the raw text to the engine's
+    # regex-driven handlers.
+    if _CREATE_PROCEDURE_RE.match(sql):
+        return [exp.Command(this="CREATE_PROCEDURE", expression=exp.Literal.string(sql))]
+    if _DROP_PROCEDURE_RE.match(sql):
+        return [exp.Command(this="DROP_PROCEDURE", expression=exp.Literal.string(sql))]
     # ``SET TRANSACTION <characteristics>`` — sqlglot rejects some spellings
     # (``SET TRANSACTION DEFERRABLE``); route every form to the Command SET
     # handler, which applies the characteristics to the open transaction.
