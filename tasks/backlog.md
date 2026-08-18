@@ -3282,11 +3282,11 @@ shared storage engine or building large new protocol subsystems:
   (oid-705 params resolved from context). Expected divergences added:
   `spatial` / `box2d` / `pgvector` (PostGIS + pgvector extension types, out
   of scope). Remaining 10 unexpected failures, triaged:
-  - **`timezone`** — first stanza pins timetz `DataTypeSize` **0** (crdb's
-    value); real PostgreSQL (and we) report the fixed 12-byte typlen. Almost
-    certainly a crdb-vs-PG divergence like `char`/`int2vector`, but the file
-    stops at its *first* stanza, so nothing past it is verified — needs a
-    real-PG confirmation before marking expected (don't lie the size to 0).
+  - ~~**`timezone`**~~ — GREENED: the timetz size stanzas use
+    `ignore_data_type_sizes`, so the real gap was a `timetz` zone offset with
+    seconds (`+01:01:03`) being rejected; session-TimeZone timestamptz
+    rendering (incl. historical LMT `-05:50:36`), GMT-N upper-casing, and the
+    binary time-type encodings already worked.
   - **`typing`** — the non-crdb path expects `SELECT id FROM t WHERE v = $1`
     (v varchar, `$1` declared uuid 2950 / bool 16) to ErrorResponse. We
     return `SELECT 0` (silent success): the comparison type-checker doesn't
@@ -3320,11 +3320,11 @@ shared storage engine or building large new protocol subsystems:
     gap was `DROP TRIGGER` (CREATE TRIGGER + firing already worked, and the
     autocommit-during-bind subtest already passed); `DROP TRIGGER [IF EXISTS]
     name ON table` now removes the trigger.
-  - **`timezone`** — timezone-aware rendering: timetz with a sub-minute offset
-    (`+01:01:03`) is rejected (needs offset-seconds parsing), and timestamptz
-    isn't rendered CONVERTED to the session TimeZone (America/Chicago 1882 →
-    the historical LMT `-05:50:36`, an offset with seconds), plus GMT-N
-    uppercasing and binary time-type result encodings. A multi-part feature.
+  - ~~**`timezone`**~~ — GREENED: it turned out the timetz size stanzas use
+    `ignore_data_type_sizes`, so the only real gap was accepting a `timetz`
+    zone offset with seconds (`+01:01:03`); the session-TimeZone timestamptz
+    rendering (historical LMT `-05:50:36`), GMT-N upper-casing, and binary
+    time-type encodings all already worked.
   - **`pgjdbc`** — the pgjdbc-specific corpus (many features; large).
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
   **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,

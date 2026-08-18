@@ -342,7 +342,7 @@ def parse_iso_datetime(v: Any) -> _dt.datetime:
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TIME_RE = re.compile(r"^(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d+))?)?$")
 _TIMETZ_RE = re.compile(
-    r"^(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d+))?)?\s*([+-]\d{1,2}(?::?\d{2})?)$"
+    r"^(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d+))?)?\s*([+-]\d{1,2}(?::?\d{2})?(?::\d{2})?)$"
 )
 
 
@@ -504,18 +504,27 @@ def _normalize_offset(off: str) -> str:
     rest = off[1:].replace(":", "")
     hours = int(rest[:2])
     minutes = int(rest[2:4]) if len(rest) > 2 else 0
+    seconds = int(rest[4:6]) if len(rest) > 4 else 0
+    # A sub-minute zone offset keeps its seconds (historical LMT zones, e.g.
+    # '00:00:00+01:01:03'::timetz); a whole-minute offset stays HH:MM.
+    if seconds:
+        return f"{sign}{hours:02d}:{minutes:02d}:{seconds:02d}"
     return f"{sign}{hours:02d}:{minutes:02d}"
 
 
 def render_timetz(value: Any) -> str:
-    """A stored timetz (canonical ``HH:MM:SS[.f]+HH:MM``) in Postgres' output
-    spelling: a zero-minute offset renders as ``+01``, not ``+01:00`` —
-    clients compare the text (pgjdbc's TimezoneTest asserts ``15:00:00+01``).
-    Non-zero minutes keep the wide form (``+05:30``)."""
+    """A stored timetz (canonical ``HH:MM:SS[.f]+HH:MM[:SS]``) in Postgres'
+    output spelling: trailing all-zero offset groups are dropped, so ``+01:00``
+    renders ``+01`` (pgjdbc's TimezoneTest asserts ``15:00:00+01``) while
+    ``+05:30`` and a sub-minute ``+01:01:03`` keep their groups."""
     text = str(value)
-    if len(text) >= 6 and text[-3] == ":" and text[-2:] == "00" and text[-6] in "+-":
-        return text[:-3]
-    return text
+    idx = max(text.rfind("+"), text.rfind("-"))
+    if idx <= 0:
+        return text
+    base, sign, groups = text[:idx], text[idx], text[idx + 1 :].split(":")
+    while len(groups) > 1 and groups[-1] == "00":
+        groups.pop()
+    return base + sign + ":".join(groups)
 
 
 def render_date(value: Any) -> str:
@@ -544,7 +553,8 @@ def is_timetz_value(v: Any) -> bool:
 def split_timetz(v: Any) -> tuple[str, str]:
     """A ``timetz`` split into its canonical (time-of-day, offset) halves."""
     text = parse_timetz(v)
-    return text[:-6], text[-6:]
+    idx = max(text.rfind("+"), text.rfind("-"))
+    return text[:idx], text[idx:]
 
 
 def to_date_obj(v: Any) -> _dt.date:
