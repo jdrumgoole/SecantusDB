@@ -695,6 +695,21 @@ class SecantusPGServer:
                 conn.sendall(self._handle_fastpath(session, msg.payload))
                 continue
             if msg.type == "Q":  # simple Query
+                # A simple Query mid-pipeline commits any pending extended-protocol
+                # IMPLICIT transaction, then runs in its own (pgjdbc's autosave
+                # interleave: the earlier Execute's work commits, so re-executing
+                # a unique insert now conflicts). An explicit BEGIN block stays
+                # open — `_settle_implicit_txn` only touches implicit ones.
+                try:
+                    ext._settle_implicit_txn()
+                except errors.SQLError as exc:
+                    conn.sendall(
+                        pgwire.error_response(
+                            exc.sqlstate, exc.message, encoding=session.wire_encoding
+                        )
+                        + pgwire.ready_for_query(session.txn_status())
+                    )
+                    continue
                 try:
                     sql = pgwire.parse_query(msg.payload, session.wire_encoding)
                 except UnicodeDecodeError:
