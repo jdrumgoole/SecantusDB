@@ -263,6 +263,27 @@ def test_untyped_binary_param_non_text_is_22P03():
     assert e.value.sqlstate == "22P03"
 
 
+def test_length_qualified_char_casts_truncate_and_pad():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+
+        def one(sql):
+            r = run_sql(st, "d", sql, session=sess)[-1]
+            return r.rows[0][0], r.columns[0].pg_oid, r.columns[0].typmod
+
+        # varchar(n) truncates the value; identity is varchar (1043), typmod n+4.
+        assert one("SELECT 'bar'::VARCHAR(2)") == ("ba", 1043, 6)
+        # char(n) truncates AND blank-pads to n.
+        assert one("SELECT 'bar'::CHAR(2)") == ("ba", 1042, 6)
+        assert one("SELECT 'a'::CHAR(4)") == ("a   ", 1042, 8)
+        # Bare text/varchar impose no limit.
+        assert one("SELECT 'foobar'::TEXT") == ("foobar", 25, -1)
+        assert one("SELECT 'foobar'::VARCHAR") == ("foobar", 1043, -1)
+    finally:
+        st.close()
+
+
 def test_three_valued_logic_in_per_row_where():
     st = Storage(":memory:")
     try:

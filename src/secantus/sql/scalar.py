@@ -2413,6 +2413,17 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
 
         n = _bitstr.to_int(str(value))
         return float(n) if to_tag in ("float4", "float8") else n
+    # Length-qualified character casts: ``varchar(n)`` / crdb ``STRING(n)``
+    # truncate to n characters; ``char(n)`` / ``bpchar(n)`` also right-pad with
+    # spaces. Bare ``text`` / ``varchar`` impose no limit (helper returns None).
+    if isinstance(value, str):
+        char_len = _char_cast_length(node.to)
+        if char_len is not None:
+            length, blank_padded = char_len
+            out = value[:length]
+            if blank_padded and len(out) < length:
+                out = out.ljust(length)
+            return out
     # Concrete scalar targets convert the value (``'1'::int`` -> 1).
     if value is not None and to_tag in (
         "int2",
@@ -2558,6 +2569,36 @@ def _bit_cast_length(datatype: exp.DataType | None) -> int | None:
         if isinstance(lit, exp.Literal) and not lit.is_string:
             try:
                 return int(lit.this)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+#: DataType.Type names of the blank-padded character type ``char(n)`` /
+#: ``character(n)`` / ``bpchar`` — a cast to these truncates AND right-pads with
+#: spaces to the declared length. ``varchar(n)`` truncates only. Bare ``TEXT``
+#: is deliberately absent: real PostgreSQL has no ``text(n)`` (crdb's
+#: length-qualified ``STRING(n)`` parses as one but is a crdb-only alias PG
+#: rejects, so we leave it untouched — see the pgtest row_description divergence).
+_BLANK_PADDED_CHAR_TYPES = frozenset({"CHAR", "NCHAR", "BPCHAR"})
+_VARLEN_CHAR_TYPES = frozenset({"VARCHAR", "NVARCHAR"})
+
+
+def _char_cast_length(datatype: exp.DataType | None) -> tuple[int, bool] | None:
+    """``(length, blank_padded)`` for a length-qualified character cast target —
+    ``varchar(n)`` truncates to ``n``; ``char(n)`` / ``bpchar(n)`` additionally
+    right-pad with spaces. None when the target isn't a length-qualified
+    character type (bare ``text`` / ``varchar`` impose no limit)."""
+    if datatype is None:
+        return None
+    name = getattr(datatype.this, "name", None)
+    if name not in _BLANK_PADDED_CHAR_TYPES and name not in _VARLEN_CHAR_TYPES:
+        return None
+    for p in datatype.args.get("expressions") or []:
+        lit = p.this if isinstance(p, exp.DataTypeParam) else p
+        if isinstance(lit, exp.Literal) and not lit.is_string:
+            try:
+                return int(lit.this), name in _BLANK_PADDED_CHAR_TYPES
             except (TypeError, ValueError):
                 return None
     return None
