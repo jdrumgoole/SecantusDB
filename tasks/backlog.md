@@ -953,6 +953,28 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ## 7. Python → Rust rewrite (in progress)
 
+### 7.0 Cache-pressure rollback has no end-to-end test
+
+`WT_ROLLBACK` is two conditions wearing one code — a genuine write-write
+conflict (retryable → `WriteConflict`) and WiredTiger abandoning a transaction
+whose own dirty content it cannot evict (NOT retryable →
+`TransactionTooLargeForCache`). `Session::rollback_reason()` now separates them
+at all three sites that mint the error, which is what stopped
+`transaction_dirty_budget_guard` flaking in CI (the post-statement dirty-budget
+guard can be beaten by the engine when its per-statement estimate undershoots).
+
+**The concurrency branch is covered end-to-end** (`concurrent_writes.rs` drives a
+real conflict inside a user transaction against real WiredTiger and asserts it
+stays a `WriteConflict`) and the classifier is unit-tested against the reason
+strings WT emits. **The cache-pressure branch is not** — forcing WiredTiger to be
+the one that rolls back needs the guard out of the way, and the guard is derived
+from the connection's `cache_size` with no override. 80 runs under 8-way
+concurrency plus 10 CPU burners on a 12-core Mac did not reproduce it; the CI
+runner's slower I/O and tighter RAM are what tip it. To close this, add a
+`StorageOptions` override for the dirty budget, set it absurdly high in a test,
+and assert the oversized transaction reports `TransactionTooLargeForCache`
+(not `WriteConflict`) when WT rolls it back.
+
 ### 7.1 Rust server performance and security review (2026-06-16) — CLOSED
 
 Items identified during a security/performance audit of the Rust server. Fixed in

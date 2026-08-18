@@ -1452,14 +1452,63 @@ impl std::fmt::Display for StorageError {
     }
 }
 impl std::error::Error for StorageError {}
+/// Whether a WiredTiger rollback reason names cache pressure rather than a
+/// concurrency race. WT phrases it as the oldest pinned transaction being
+/// rolled back for eviction, or plain cache overflow, depending on version —
+/// match on the distinguishing words rather than a whole sentence.
+fn rollback_reason_is_cache_pressure(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    r.contains("eviction") || r.contains("cache")
+}
+
+/// Turn a WiredTiger rollback reason into the error it deserves: cache
+/// pressure is `TransactionTooLargeForCache` (not retryable — a retry rebuilds
+/// the same unevictable pile), anything else is the retryable `WriteConflict`.
+/// An absent reason stays a `WriteConflict`, the safe default: it keeps the
+/// retry behaviour every caller already has.
+fn classify_rollback(reason: Option<String>) -> StorageError {
+    match reason {
+        Some(r) if rollback_reason_is_cache_pressure(&r) => {
+            StorageError::TransactionTooLargeForCache
+        }
+        _ => StorageError::WriteConflict,
+    }
+}
+
+/// The active user transaction's rollback reason, if a statement of one is
+/// running on this thread. Read immediately after a failing call, which is the
+/// only point WiredTiger's buffer still holds this transaction's reason.
+fn active_txn_rollback_reason() -> Option<String> {
+    let p = ACTIVE_TXN_SESSION.with(|c| c.get());
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: identical to `op_session` — `with_user_transaction` installs this
+    // pointer to a `Session` it owns for the strict duration of the statement
+    // running on THIS thread, and we are inside that statement (the error being
+    // converted came out of it).
+    unsafe { &*p }.rollback_reason()
+}
+
 impl From<WtError> for StorageError {
     fn from(e: WtError) -> Self {
-        // A `WT_ROLLBACK` means the write lost a concurrency race — surface it as
-        // a dedicated `WriteConflict` so the command layer can map it to mongod's
-        // 112 (+ the transient label inside a transaction) rather than a generic
-        // internal error.
+        // A `WT_ROLLBACK` is two different conditions wearing one code. Usually
+        // the write lost a concurrency race — surface that as `WriteConflict` so
+        // the command layer maps it to mongod's 112 (+ the transient label
+        // inside a transaction), and a retry can win.
+        //
+        // But inside a multi-document transaction WiredTiger also returns
+        // `WT_ROLLBACK` when it gives up on a transaction whose own dirty
+        // content it cannot evict — the very condition the dirty-budget guard
+        // exists to report. That one is NOT retryable: a retry rebuilds the same
+        // unevictable pile. It is also a race with our own guard, which is
+        // checked after each statement and so can be beaten by the engine when
+        // the per-statement estimate undershoots (this is what made
+        // `transaction_dirty_budget_guard` flaky in CI). Asking WiredTiger why
+        // it rolled back settles it either way, and reports the same
+        // `TransactionTooLargeForCache` mongod does.
         if e.is_rollback() {
-            StorageError::WriteConflict
+            classify_rollback(active_txn_rollback_reason())
         } else {
             StorageError::Wt(e)
         }
@@ -3888,6 +3937,10 @@ impl Storage {
         match f() {
             Ok(v) => {
                 if let Err(e) = session.commit_transaction(None) {
+                    // Ask WHY before rolling back — the reason buffer belongs
+                    // to the failing transaction and does not survive the next
+                    // call on this session.
+                    let why = session.rollback_reason();
                     let _ = session.rollback_transaction(None);
                     if async_mode {
                         IN_ASYNC_STMT.with(|f| f.set(false));
@@ -3895,7 +3948,7 @@ impl Storage {
                     }
                     const EINVAL: i32 = 22;
                     if e.is_rollback() || e.code == EINVAL {
-                        return Err(StorageError::WriteConflict);
+                        return Err(classify_rollback(why));
                     }
                     return Err(e.into());
                 }
@@ -5589,6 +5642,9 @@ impl Storage {
             handle.began = false;
             if began {
                 if let Err(e) = session.commit_transaction(None) {
+                    // Read WHY first: the reason belongs to the failing
+                    // transaction and the next call on this session clears it.
+                    let why = session.rollback_reason();
                     // The transaction is dead either way — its rows can never
                     // appear, so its minted ranges leave the in-flight window
                     // (the visible tail must not stay pinned on the corpse)
@@ -5612,7 +5668,7 @@ impl Storage {
                     // isn't a conflict is a durability signal.
                     const EINVAL: i32 = 22;
                     if e.is_rollback() || e.code == EINVAL {
-                        return Err(StorageError::WriteConflict);
+                        return Err(classify_rollback(why));
                     }
                     return Err(e.into());
                 }
@@ -12016,6 +12072,43 @@ mod tests {
     //! `test_indexes.py` sees identical bytes. No WiredTiger needed.
     use super::*;
     use bson::doc;
+
+    /// The rollback-reason classifier that decides whether a `WT_ROLLBACK` was
+    /// cache pressure (not retryable — `TransactionTooLargeForCache`) or a
+    /// concurrency race (retryable — `WriteConflict`). The strings are the ones
+    /// WiredTiger actually emits across the versions we link.
+    #[test]
+    fn cache_pressure_rollback_reasons_are_recognised() {
+        for reason in [
+            "oldest pinned transaction ID rolled back for eviction",
+            "transaction rolled back because of cache overflow",
+            "Cache capacity has overflown",
+        ] {
+            assert!(
+                rollback_reason_is_cache_pressure(reason),
+                "should read as cache pressure: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrency_rollback_reasons_stay_write_conflicts() {
+        // These must NOT be re-mapped: they are genuine races between
+        // operations, and the caller's retry is what resolves them. Calling one
+        // of these TransactionTooLargeForCache would turn a retryable conflict
+        // into a hard, non-retryable error.
+        for reason in [
+            "conflict between concurrent operations",
+            "conflict with a prepared update",
+            "transaction requires rollback: WT_ROLLBACK",
+            "",
+        ] {
+            assert!(
+                !rollback_reason_is_cache_pressure(reason),
+                "should stay a write conflict: {reason}"
+            );
+        }
+    }
 
     /// A tombstone left by a crash mid-purge (phase 1 committed: registry row
     /// gone, rows orphaned) is finished at the next open — the orphan rows
