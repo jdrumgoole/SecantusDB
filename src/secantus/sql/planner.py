@@ -3988,7 +3988,11 @@ def infer_parameter_types(
     if stmt is None:
         return declared
     count = parameter_count(stmt)
-    oids = list(declared) + [0] * (count - len(declared))
+    # An explicitly-declared ``unknown`` (oid 705) is treated like an undeclared
+    # parameter: PG's parse analysis resolves it from context (a target column,
+    # a cast, a compared operand) rather than echoing 705 back in
+    # ParameterDescription (pgtest ``unknown`` corpus).
+    oids = [0 if o == 705 else o for o in declared] + [0] * (count - len(declared))
     # INSERT: an untyped parameter in a VALUES cell takes the target column's
     # type, like PG's parse analysis (``insert into t (j) values ($1)`` with a
     # jsonb column types $1 jsonb).

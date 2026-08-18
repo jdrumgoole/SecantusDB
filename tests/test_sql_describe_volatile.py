@@ -58,6 +58,13 @@ class TestDescribeVolatile:
         assert time.monotonic() - t0 < 1.0, "Describe executed pg_sleep"
         assert reply[:1] == b"T", "Describe must answer RowDescription, not NoData"
 
+    def test_pg_sleep_returns_void(self, st):
+        # PG types pg_sleep as void (oid 2278) with a NULL value, not text.
+        res = run_sql(st, DB, "select pg_sleep(0)", session=Session(database=DB))[-1]
+        assert res.columns[0].pg_oid == 2278
+        assert res.columns[0].type_tag == "void"
+        assert res.rows[0][0] is None
+
     def test_nextval_describe_draws_no_value(self, st):
         sess = Session(database=DB)
         run_sql(st, DB, "CREATE SEQUENCE seq1", session=sess)

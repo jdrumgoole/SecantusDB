@@ -178,6 +178,22 @@ def test_describe_statement_reports_params_and_columns(client):
     assert pgwire.parse_parameter_description(pd.payload) == [25]
 
 
+def test_unknown_param_oids_resolve_from_target_columns(client):
+    # A client that declares its parameters as ``unknown`` (oid 705) — as some
+    # drivers do — gets them resolved from the INSERT target columns, like PG's
+    # parse analysis, not echoed back as 705 (pgtest ``unknown``).
+    _create_users(client)
+    msgs = client.exchange(
+        pgwire.build_parse(
+            "u", "INSERT INTO users VALUES ($1, $2, $3)", param_oids=[705, 705, 705]
+        ),
+        pgwire.build_describe("S", "u"),
+    )
+    pd = next(m for m in msgs if m.type == "t")
+    # id bigint (20), name text (25), age int4 (23).
+    assert pgwire.parse_parameter_description(pd.payload) == [20, 25, 23]
+
+
 def test_null_parameter_binds_to_sql_null(client):
     _create_users(client)
     client.exchange(

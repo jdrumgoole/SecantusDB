@@ -138,6 +138,9 @@ PG_OID: dict[str, int] = {
     "aclitem": 1033,
     # name — the 63-byte identifier type (values travel as text).
     "name": 19,
+    # void — the result type of a function called for its side effect only
+    # (pg_sleep). typlen 4, value NULL on the wire (pgtest void corpus).
+    "void": 2278,
 }
 
 # Full-text search type tags — stored as subdocuments, rendered as their PG text.

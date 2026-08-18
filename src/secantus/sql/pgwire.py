@@ -373,6 +373,7 @@ _TYPLEN: dict[int, int] = {
     1266: 12,  # timetz
     2950: 16,  # uuid
     790: 8,  # money
+    2278: 4,  # void (pg_sleep)
 }
 
 
