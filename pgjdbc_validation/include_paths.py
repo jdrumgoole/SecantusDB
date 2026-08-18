@@ -19,9 +19,19 @@ INCLUDE_PACKAGES = [
 
 #: Simple class names excluded from the run, with reasons.
 EXCLUDE_CLASSES: dict[str, str] = {
-    # Blocks forever in getNotifications(): a NOTIFY sent on connection B is
-    # not delivered to connection A's endless-timeout poll — cross-connection
-    # async notify delivery, tracked in tasks/backlog.md. A JUnit timeout
-    # cannot interrupt the non-interruptible socket read.
-    "NotifyTest": "cross-connection async NOTIFY delivery hangs the endless-timeout poll",
+    # Excluded when cross-connection NOTIFY did not reach a blocked reader.
+    # **That capability now works** (measured 2026-08-18): with one psycopg
+    # connection blocked in `notifies()` — both with a timeout and with the
+    # endless form, which is this exclusion's case — a `NOTIFY` issued on a
+    # second connection is delivered. The read loop polls listeners on a 0.25s
+    # `select` slice and flushes queued deliveries (`pgserver`
+    # `_read_next_message`).
+    #
+    # Still excluded because that is not proof about *pgjdbc*: this test was
+    # never re-run after the fix, and if it does still hang, a JUnit timeout
+    # cannot interrupt the non-interruptible socket read — it would wedge the
+    # whole weekly gauge for GRADLE_TIMEOUT_SECONDS rather than fail. To clear
+    # it, delete this entry and run the gauge once: `uv run python -m
+    # pgjdbc_validation.runner`.
+    "NotifyTest": "cross-connection NOTIFY works (verified via psycopg); needs one pgjdbc run to confirm",
 }

@@ -5420,7 +5420,19 @@ def _plan_pipeline_select(
         # evaluated executor.
         plan = _plan_group_window_select(stmt, table)
     elif grouped:
-        plan = _plan_group_select(stmt, table)
+        # A HAVING shape the `$match` lowerer can't express is not a hard
+        # 0A000: re-plan through the evaluated path, which carries HAVING as a
+        # per-grouped-row residual (the route the HAVING-subquery case already
+        # takes). The copy is taken first because planning mutates the tree
+        # (aggregates are replaced by their computed-field references), so the
+        # re-plan needs a pristine statement.
+        having_backup = stmt.copy() if stmt.args.get("having") is not None else None
+        try:
+            plan = _plan_group_select(stmt, table)
+        except errors.SQLError as exc:
+            if exc.sqlstate != "0A000" or having_backup is None:
+                raise
+            plan = _plan_group_window_select(having_backup, table)
     elif _stmt_needs_evaluation(stmt) or _distinct_on(stmt) or where_needs_per_row(stmt, table):
         # DISTINCT ON needs the evaluated path's sort-then-keep-first-per-key;
         # a WHERE the pushdown can't lower (column arithmetic in a comparison,
@@ -6997,9 +7009,25 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
                 node.replace(exp.column(register_agg(node)))
             residual_having = having.this
         else:
-            having_match = _having_to_match(
-                having.this, table, accumulators, agg_fields, group_cols, names, reductions
-            )
+            try:
+                having_match = _having_to_match(
+                    having.this, table, accumulators, agg_fields, group_cols, names, reductions
+                )
+            except errors.SQLError as exc:
+                # Only "we can't lower this shape" (0A000) falls back — a real
+                # user error (42803 "must appear in the GROUP BY clause", say)
+                # has to surface, not be silently deferred to a residual that
+                # would then evaluate it as a plain expression.
+                if exc.sqlstate != "0A000":
+                    raise
+                # The same route the HAVING-subquery case takes: rewrite the
+                # aggregates to their computed fields and evaluate the predicate
+                # per grouped row. This is what keeps a HAVING shape the $match
+                # lowerer doesn't cover from being a hard 0A000.
+                for node in _outer_agg_nodes(having.this):
+                    node.replace(exp.column(register_agg(node)))
+                residual_having = having.this
+                having_match = None
 
     pipeline: list[dict[str, Any]] = [{"$group": {"_id": group_id, **accumulators}}]
     if reductions:

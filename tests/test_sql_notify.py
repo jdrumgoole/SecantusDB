@@ -230,6 +230,42 @@ def test_notification_arrives_while_already_waiting(wire_dsn):
         assert [n.payload for n in got] == ["later"]
 
 
+def test_endless_poll_is_woken_by_another_connection(wire_dsn):
+    """A listener blocked with NO timeout is still woken by another connection.
+
+    This is the shape pgjdbc's `NotifyTest` uses (`getNotifications(0)`, wait
+    forever) and the reason that class is excluded from the pgjdbc gauge. The
+    two tests above both pass a timeout, so the endless form — where nothing
+    but the server's own push can end the wait — was untested.
+
+    The wait runs on a daemon thread with a join deadline so a regression fails
+    this test instead of hanging the suite, exactly what the JUnit version
+    cannot do (a JUnit timeout can't interrupt that socket read).
+    """
+    import threading
+    import time as _time
+
+    with (
+        psycopg.connect(wire_dsn, autocommit=True) as listener,
+        psycopg.connect(wire_dsn, autocommit=True) as notifier,
+    ):
+        listener.execute("listen endless")
+        got: list[str] = []
+
+        def wait_forever() -> None:
+            for n in listener.notifies():  # no timeout
+                got.append(n.payload)
+                break
+
+        t = threading.Thread(target=wait_forever, daemon=True)
+        t.start()
+        _time.sleep(0.5)  # let it reach the blocking read
+        notifier.execute("notify endless, 'woken'")
+        t.join(timeout=10)
+        assert not t.is_alive(), "the endless poll was never woken"
+        assert got == ["woken"]
+
+
 def test_idle_in_txn_timeout_still_fires_for_listener(tmp_path):
     srv = SecantusPGServer(storage_path=str(tmp_path), port=0, idle_in_transaction_timeout_s=0.5)
     srv.start()
