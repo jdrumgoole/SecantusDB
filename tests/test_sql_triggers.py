@@ -155,6 +155,27 @@ $$ language plpgsql""",
         run(storage, session, "insert into s1 (t) values ('quick brown fox')")
         assert run(storage, session, "select ts from s1").rows == [(None,)]
 
+    def test_drop_trigger_stops_firing(self, storage, session):
+        self._setup(storage, session)
+        run(storage, session, "insert into s1 (t) values ('the cat')")
+        assert run(storage, session, "drop trigger trg on s1").command_tag == "DROP TRIGGER"
+        # After the drop the trigger no longer fires — ts stays NULL.
+        run(storage, session, "insert into s1 (t) values ('the dog')")
+        rows = run(storage, session, "select t, ts from s1 order by t").rows
+        assert rows == [("the cat", {"tsvector": {"cat": [2]}}), ("the dog", None)]
+
+    def test_drop_missing_trigger_is_42704(self, storage, session):
+        run(storage, session, "create table s3 (n int4)")
+        with pytest.raises(SQLError) as ei:
+            run(storage, session, "drop trigger nope on s3")
+        assert ei.value.sqlstate == "42704"
+
+    def test_drop_trigger_if_exists(self, storage, session):
+        run(storage, session, "create table s4 (n int4)")
+        assert (
+            run(storage, session, "drop trigger if exists nope on s4").command_tag == "DROP TRIGGER"
+        )
+
     def test_overlong_words_index_empty_like_pg(self, storage, session):
         self._setup(storage, session)
         big = "x" * 10001
