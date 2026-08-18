@@ -2811,9 +2811,21 @@ shared-surface changes (parse errors, startup GUCs, reply shapes,
   a `Schema` node wrapping the name — every reference to such a view
   failed 42P01), `char(n)` blank-pads on the wire, and `ALTER COLUMN …
   TYPE` recomputes the declared oid/typmod instead of inheriting the old
-  one. Next: `set`, `typing`, `tuple`, `unknown`, `varbit`, `void`,
-  `procedure`, `timezone`; the geo trio (`box2d` / `pgvector` /
-  `spatial`) needs crdb extension types.
+  one. Slice 29 took `typing` to its ceiling (recorded as an expected
+  divergence — both its non-crdb stanzas use `keepErrMessage` to pin
+  crdb's `22023 unsupported comparison operator: <varchar> = <uuid>`,
+  where real PG 14 raises `42883 operator does not exist: character
+  varying = uuid`, probed). The behaviour those stanzas regression-test
+  IS now implemented: a comparison against a parameter whose DECLARED
+  type has no operator against the other operand raises 42883 **at
+  Parse** (the only place the declared OIDs are known), instead of
+  silently matching no rows; the message names the declared type, not
+  the folded storage tag. Known gap left behind: the same comparison
+  written as a *cast* (`v = $1::uuid`) is still unjudged — `_CATEGORY`
+  covers the cast path and doesn't model uuid/bytea/json/inet, which
+  only `_PARAM_CATEGORY` does. Remaining files: `tuple`, `procedure`,
+  `timezone` (`set`, `unknown`, `varbit`, `void` greened by #971; the
+  geo trio `box2d` / `pgvector` / `spatial` reclassified by #973).
 - **psycopg**: per-file failure signature matches the committed 99.0%
   baseline everywhere EXCEPT two REAL regressions the sweep caught from
   the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``

@@ -52,6 +52,17 @@ EXPECTED_DIVERGENCES: dict[str, str] = {
         "JOIN and through a VIEW, char(n) blank padding on the wire, and "
         "attnum stability across ALTER COLUMN TYPE."
     ),
+    "typing": (
+        "typing's two non-crdb stanzas both use keepErrMessage and pin crdb's "
+        "wording for a mixed-type comparison: 22023 'unsupported comparison "
+        "operator: <varchar> = <uuid>' (and <varchar> = <bool>). Real "
+        "PostgreSQL 14 raises 42883 'operator does not exist: character "
+        "varying = uuid' (probed), which is what we now emit — matching crdb "
+        "would be a fidelity REGRESSION, same as the portals file. The "
+        "behaviour the stanzas actually regression-test (a DECLARED parameter "
+        "type making the comparison unresolvable AT PARSE, rather than a "
+        "predicate that silently matches nothing) is implemented and correct."
+    ),
     "char": (
         "char:250 pins TableOID=105 — crdb's deterministic descriptor id, "
         "with no ignore_table_oids directive on that stanza. Real PostgreSQL "

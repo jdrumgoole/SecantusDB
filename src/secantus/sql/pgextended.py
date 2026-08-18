@@ -1456,6 +1456,19 @@ class ExtendedSession:
         clash = planner.conflicting_parameter_use(stmt, oids)
         if clash is not None:
             raise errors.SQLError("42883", f"function {clash[0]}({clash[1]}) does not exist")
+        # Postgres resolves comparison operators during parse analysis, so a
+        # parameter DECLARED as a type that has no operator against the column
+        # it is compared with (``varchar_col = $1`` with ``$1`` uuid) is a 42883
+        # here, at Parse — not a predicate that matches nothing at Execute. The
+        # execution path runs the same analysis without parameter types; only
+        # Parse knows the declared OIDs. Sound-but-incomplete, and a no-op for
+        # anything it cannot decide (see secantus.sql.typecheck).
+        if stmt is not None:
+            from secantus.sql import typecheck
+
+            typecheck.check_statement(
+                stmt, self.catalog, self.session.database, param_oids=list(oids)
+            )
         if isinstance(stmt, exp.Copy):
             # PG's parse analysis gives COPY zero parameters — placeholders
             # inside the query survive to Execute, where an unbound one is
