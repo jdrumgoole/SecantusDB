@@ -3316,8 +3316,15 @@ shared storage engine or building large new protocol subsystems:
     emits (real PG sends `pl_exec.c`/`exec_stmt_raise`).
   - **`multiple_active_portals` / `…/query_timeout`** — portal query
     cancel/timeout; overlaps the cancel-request work another session owns.
-  - **`schema_changes_implicit_txn` / `…/triggers`** — trigger DDL + schema
-    change visibility inside implicit txns.
+  - ~~**`schema_changes_implicit_txn` / `…/triggers`**~~ — GREENED: the only
+    gap was `DROP TRIGGER` (CREATE TRIGGER + firing already worked, and the
+    autocommit-during-bind subtest already passed); `DROP TRIGGER [IF EXISTS]
+    name ON table` now removes the trigger.
+  - **`timezone`** — timezone-aware rendering: timetz with a sub-minute offset
+    (`+01:01:03`) is rejected (needs offset-seconds parsing), and timestamptz
+    isn't rendered CONVERTED to the session TimeZone (America/Chicago 1882 →
+    the historical LMT `-05:50:36`, an offset with seconds), plus GMT-N
+    uppercasing and binary time-type result encodings. A multi-part feature.
   - **`pgjdbc`** — the pgjdbc-specific corpus (many features; large).
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
   **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,

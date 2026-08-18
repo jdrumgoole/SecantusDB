@@ -655,6 +655,13 @@ class Catalog:
     def drop_triggers_for_table(self, db: str, table: str) -> None:
         self._storage.delete_matching(db, TRIGGER_COLLECTION, {"table": table})
 
+    def drop_trigger(self, db: str, table: str, name: str) -> bool:
+        key = f"{table}::{name}"
+        if not self._storage.find_matching(db, TRIGGER_COLLECTION, {"_id": key}):
+            return False
+        self._storage.delete_matching(db, TRIGGER_COLLECTION, {"_id": key})
+        return True
+
     def list_views(self, db: str) -> list[str]:
         docs = self._storage.find_matching(db, VIEW_COLLECTION, {})
         return sorted(d["view"] for d in docs)

@@ -2477,6 +2477,8 @@ def _run_statement(
             return _drop_type(stmt, db, catalog)
         if kind == "FUNCTION":
             return _drop_function(stmt, db, catalog)
+        if kind == "TRIGGER":
+            return _drop_trigger(stmt, db, catalog)
         if kind == "SCHEMA":
             return _drop_schema(stmt, db, catalog, storage)
         raise errors.feature_not_supported(f"DROP {kind} is not supported")
@@ -4735,6 +4737,25 @@ def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Sessio
         },
     )
     return SQLResult(command_tag="CREATE TRIGGER")
+
+
+def _drop_trigger(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
+    """``DROP TRIGGER [IF EXISTS] name ON table`` — sqlglot carries the ``ON
+    table`` in the ``cluster`` OnProperty. Removes the stored trigger (triggers
+    are keyed per-table)."""
+    trigger_name = stmt.this.name
+    on_prop = stmt.args.get("cluster")
+    target = on_prop.this if isinstance(on_prop, exp.OnProperty) else None
+    if target is None:
+        raise errors.syntax_error("DROP TRIGGER requires ON <table>")
+    tname = planner.qualified_table_name(target) if isinstance(target, exp.Table) else target.name
+    if not catalog.drop_trigger(db, tname, trigger_name):
+        if stmt.args.get("exists"):
+            return SQLResult(command_tag="DROP TRIGGER")
+        raise errors.SQLError(
+            "42704", f'trigger "{trigger_name}" for relation "{tname}" does not exist'
+        )
+    return SQLResult(command_tag="DROP TRIGGER")
 
 
 def _drop_function(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
