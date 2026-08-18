@@ -2266,6 +2266,26 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
             if first is not None:
                 elem = typemap.type_tag_for_sql(first.to) or "text"
         return typemap._render_pg_array(value, elem)
+    if to_tag_early == "text" and isinstance(value, (bool, int, float, Decimal)):
+        # A cast to text must PRODUCE text. Leaving the number alone made the
+        # value compare as a number — `count(*)::text = '2'` was false because
+        # it compared 2 to '2' — which is a wrong answer, not a rendering
+        # nicety (rendering hid it: the wire spelling of 2 and '2' is the same
+        # bytes). Postgres' own spellings, probed against 14: 2 -> '2',
+        # 2.0::float8 -> '2', 2.5 -> '2.5', 2.50::numeric -> '2.50' (scale
+        # kept), 1e20 -> '1e+20'. `to_pg_text` already renders all of those;
+        # bool is the one exception — it is the DataRow's 't'/'f' there, while
+        # `true::text` is 'true'.
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, Decimal):
+            tag = "numeric"
+        elif isinstance(value, float):
+            tag = "float8"
+        else:
+            tag = "int8"
+        rendered = typemap.to_pg_text(value, tag)
+        return rendered.decode("utf-8") if isinstance(rendered, bytes) else str(value)
     if value is not None and to_tag_early == "bytea":
         from secantus.sql import bytea as _bytea
 

@@ -3260,12 +3260,19 @@ shared storage engine or building large new protocol subsystems:
     It now carries forward to `24:00:00` as Postgres does, and time arithmetic
     goes through `datetimes.time_micros` because that boundary value does not
     fit in a Python `datetime.time`.
-- [ ] **Cross-connection async NOTIFY delivery**: a `NOTIFY` issued on one
-  connection is not delivered to another connection's
-  `getNotifications()` poll, so pgjdbc's `NotifyTest` blocks forever
-  (excluded from the gauge with a reason). LISTEN/NOTIFY works
-  within a connection; the pubsub registry needs to fan out to other
-  sessions' pending-notification queues and wake a blocked reader.
+- [ ] **Cross-connection async NOTIFY — WORKS; only the pgjdbc re-run is
+  outstanding.** Measured 2026-08-18: with one psycopg connection blocked in
+  `notifies()` (both the timeout form and the endless form, which is what
+  pgjdbc's `NotifyTest` uses), a `NOTIFY` on a second connection IS delivered.
+  `NotifyHub.notify` fans out to every listening session's queue and
+  `pgserver._read_next_message` polls listeners on a 0.25s `select` slice and
+  flushes them — the "needs to fan out and wake a blocked reader" work this
+  entry described is done (the `select`-based poll from #882 is what closed
+  it). `NotifyTest` stays excluded from the pgjdbc gauge only because it has
+  never been re-run since: if it did still hang, a JUnit timeout cannot
+  interrupt that socket read and it would wedge the weekly gauge. Closing this
+  is one gauge run — drop the `EXCLUDE_CLASSES` entry and run
+  `pgjdbc_validation.runner`.
 - [ ] **pgtest gauge — wire-fidelity clusters** (`invoke validate-pgtest`,
   **43/65 files pass** at `docs/validation-report-pgtest.md` — 7 expected
   divergences, 10 unexpected failures, 5 skipped): the corpus is byte-exact
@@ -3323,12 +3330,16 @@ shared storage engine or building large new protocol subsystems:
   columns (int64-µs or a sub-ms side channel) weighed against the
   dual-protocol document view. The gauge otherwise passes 731/731 executed
   tests (100%).
-- [ ] **HAVING general-shape residual**: the HAVING lowerers now cover
-  comparisons, `IS [NOT] NULL` (incl. computed group-key operands),
-  `[NOT] IN` over group keys, and always-unknown NULL-operand folds — but any
-  shape outside those still raises `0A000`. The systemic fix is a
-  HAVING-residual route mirroring the WHERE probes (the group-window paths
-  already carry `residual_having` for subqueries).
+- [x] **HAVING general-shape residual — DONE.** Any shape the `$match` lowerer
+  can't express now falls back to the per-grouped-row residual route the
+  HAVING-subquery case already used, instead of raising `0A000`: the plain
+  group planner re-plans through `_plan_group_window_select` on a 0A000 (on a
+  pristine copy — planning mutates the tree), and the group-window planner
+  catches it inline. Only 0A000 falls back; a real user error (42803 "must
+  appear in the GROUP BY clause") still surfaces. Nine of ten surveyed shapes
+  used to fail — `NOT (...)`, `BETWEEN`, `count(*) * 2`, `sum(n) + count(*)`,
+  `abs(sum(n))`, `CASE`, `coalesce`, `max - min`, `count(*)::text` — and all
+  ten now match PostgreSQL 14 row for row.
 - [ ] **`char(n)` / `varchar(n)` declared length is not enforced**: an overlong
   value is stored and returned intact, where PG raises `22001 value too long
   for type character(8)` / `character varying(3)` (probed against 14 —
@@ -3344,6 +3355,15 @@ shared storage engine or building large new protocol subsystems:
   14). Harmless but a divergence; noted while recording the `row_description`
   expected divergence, whose final stanza depends on crdb's `STRING(2)` →
   `varchar` truncation.
+- [ ] **Casts to text beyond the scalar numerics.** `_eval_cast` now converts
+  int / float / Decimal / bool to Postgres' own text spellings (probed against
+  14: `2.0::float8` -> `2`, `2.50::numeric` keeps its scale, `true` -> `true`
+  not the wire form `t`), which is what made `count(*)::text = '2'` compare as
+  text instead of silently matching nothing. Not audited: the same conversion
+  through the PUSHDOWN path — `SELECT n::text FROM t` still returns the number
+  (harmless on the wire, since the rendered bytes match, but a pushdown
+  comparison against a text literal would have the original bug) — and the
+  non-scalar targets (interval, bit, geo) that fall through unchanged.
 - [ ] **Multi-way comma-join performance**: sqllogictest `select4.test`/`select5.test`
   4-way joins with equi-WHEREs exceed 300s — the pipeline nests `$lookup`s without
   pushing the WHERE's equi-conditions into the lookup stages.
