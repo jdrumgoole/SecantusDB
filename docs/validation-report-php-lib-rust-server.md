@@ -1,6 +1,6 @@
 # mongo-php-library Validation Report
 
-Generated 2026-08-11 — SecantusDB 0.6.0b9 vs mongo-php-library 12e56461166d (`vendor/mongo-php-library/`).
+Generated 2026-08-19 — SecantusDB 0.6.0b12 vs mongo-php-library 12e56461166d (`vendor/mongo-php-library/`).
 
 Run `uv run python -m invoke validate-php-lib` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver / mongo-java-driver / mongo-ruby-driver gauges for the official high-level PHP library — the `mongodb/mongodb` package Laravel + Symfony applications build on.
 
@@ -9,54 +9,24 @@ Run `uv run python -m invoke validate-php-lib` to refresh. The pass rate is the 
 | Category | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `tests/Builder` | 732 | 0 | 0 | 732 | 100.0% |
-| `tests/Collection` | 124 | 35 | 1 | 160 | 78.0% |
+| `tests/Collection` | 159 | 0 | 1 | 160 | 100.0% |
 | `tests/Command` | 53 | 0 | 0 | 53 | 100.0% |
 | `tests/Comparator` | 31 | 0 | 0 | 31 | 100.0% |
 | `tests/Database` | 70 | 0 | 0 | 70 | 100.0% |
-| `tests/Functions` | 0 | 2 | 2 | 4 | 0.0% |
+| `tests/Functions` | 0 | 0 | 4 | 4 | — |
 | `tests/Model` | 141 | 1 | 0 | 142 | 99.3% |
-| `tests/Operation` | 1900 | 2 | 36 | 1938 | 99.9% |
-| **Overall** | **3051** | **40** | **39** | **3130** | **98.7%** |
+| `tests/Operation` | 1902 | 0 | 36 | 1938 | 100.0% |
+| **Overall** | **3088** | **1** | **41** | **3130** | **100.0%** |
 
-Run time: 4.00s.
+Run time: 2.98s.
 
-## Failures (40)
+## Failures (1)
 
 First 30 failed cases for triage:
 
 ```
-tests/Operation :: MongoDB\Tests\Operation\AggregateFunctionalTest::testReadPreferenceWithinTransaction
-tests/Operation :: MongoDB\Tests\Operation\FindFunctionalTest::testReadPreferenceWithinTransaction
-tests/Collection :: MongoDB\Tests\Collection\CodecCollectionFunctionalTest::testFindOneAndReplace with data set "BSON type map"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testAggregateWithinTransaction
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testFindWithinTransaction
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "read-only aggregate"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "bulkWrite insertOne"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "countDocuments"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "deleteMany"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "deleteOne"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "distinct"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "find"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "findOne"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "findOneAndDelete"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "findOneAndReplace"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "findOneAndUpdate"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "insertMany"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "insertOne"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "replaceOne"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "updateMany"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodDoesNotInheritReadWriteConcernInTransaction with data set "updateOne"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "bulkWrite insertOne"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "deleteMany"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "deleteOne"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "findOneAndDelete"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "findOneAndReplace"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "findOneAndUpdate"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "insertMany"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "insertOne"
-tests/Collection :: MongoDB\Tests\Collection\CollectionFunctionalTest::testMethodInTransactionWithWriteConcernOption with data set "replaceOne"
+tests/Model :: MongoDB\Tests\Model\IndexInfoFunctionalTest::testIsText
 ```
-... and 10 more (see JUnit XML).
 
 ## How this is generated
 
