@@ -1405,6 +1405,42 @@ def _render_json(value: Any, compact: bool = False) -> str:
 BPCHAR_OID = 1042
 
 
+#: pg_type oid of ``character varying``.
+VARCHAR_OID = 1043
+
+
+def enforce_declared_length(value: Any, pg_oid: int | None, typmod: int, column: str = "") -> Any:
+    """Apply a ``char(n)`` / ``varchar(n)`` declared length, Postgres-style.
+
+    Over-length input is an ERROR — `22001 value too long for type character
+    varying(3)` — not a silent truncation. The one exception is an overflow made
+    only of TRAILING BLANKS, which Postgres trims to fit: `'abc  '` into a
+    `varchar(3)` stores `'abc'`, while `'abcd'` is refused (both probed against
+    14). A database that quietly stored a value violating its own declared
+    schema would be lying about the column.
+
+    Returns the value to store (possibly blank-trimmed); raises on overflow.
+    ``atttypmod`` is the declared width + 4; anything without one is unbounded.
+    """
+    if pg_oid not in (BPCHAR_OID, VARCHAR_OID) or typmod <= 4 or not isinstance(value, str):
+        return value
+    width = typmod - 4
+    if len(value) <= width:
+        return value
+    trimmed = value.rstrip(" ")
+    if len(trimmed) <= width:
+        # Only trailing blanks overflowed — Postgres trims rather than refuses.
+        return value[:width] if len(trimmed) < width else trimmed
+    from secantus.sql import errors
+
+    name = "character varying" if pg_oid == VARCHAR_OID else "character"
+    raise errors.SQLError(
+        "22001",
+        f"value too long for type {name}({width})",
+        diag={"c": column} if column else None,
+    )
+
+
 def blank_pad(value: Any, pg_oid: int, typmod: int) -> Any:
     """Blank-pad a ``character(n)`` value to its declared width for output.
 

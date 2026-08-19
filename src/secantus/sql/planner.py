@@ -2221,6 +2221,12 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
             value = _composite_value(raw, col)
         else:
             value = typemap.coerce(raw, col.type_tag)
+            # A declared char(n) / varchar(n) width is enforced, not ignored —
+            # storing an over-length value would violate the column's own
+            # schema. Trailing-blank overflow trims, like Postgres.
+            value = typemap.enforce_declared_length(
+                value, getattr(col, "decl_oid", None), getattr(col, "typmod", -1), col.name
+            )
         _set_doc_field(doc, col.field, value, col.type_tag)
         provided.add(name)
     # An omitted column takes its DEFAULT if it has one; otherwise a NOT NULL
@@ -3237,6 +3243,49 @@ def _returning_columns(
     return items
 
 
+def _where_has_text_cast_comparison(node: exp.Expression, table: TableDef | None = None) -> bool:
+    """Whether the WHERE compares a COLUMN cast to text against something.
+
+    The pushdown compares the stored value and does not apply the cast, so
+    `WHERE n::text = '2'` lowered to a filter on the raw int and matched
+    NOTHING (Postgres returns the row). The scalar evaluator does apply it
+    (`scalar._eval_cast` renders numbers, decimals, Decimal128 and booleans with
+    Postgres' spellings), so routing these to per-row evaluation is correct; the
+    cost is losing index pushdown for a predicate that could not have used it
+    correctly anyway.
+
+    Deliberately narrow, because per-row evaluation is a whole different
+    execution path:
+
+    * the cast operand must be a COLUMN. A cast on a LITERAL needs nothing — the
+      value is already text — and claiming those broke SQLAlchemy's reflection,
+      which filters with `relkind = ANY(ARRAY[CAST('v' AS VARCHAR)])`;
+    * a column that is ALREADY text is skipped too: casting text to text cannot
+      change the comparison, so there is nothing to fix and no reason to pay for
+      the slower path.
+    """
+    for cmp_node in node.find_all(exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE):
+        for side in (cmp_node.this, cmp_node.expression):
+            inner = side
+            while isinstance(inner, exp.Paren):
+                inner = inner.this
+            if not isinstance(inner, exp.Cast):
+                continue
+            if typemap.type_tag_for_sql(inner.to) != "text":
+                continue
+            operand = inner.this
+            while isinstance(operand, exp.Paren):
+                operand = operand.this
+            if not isinstance(operand, exp.Column):
+                continue
+            if table is not None:
+                col = table.column(_column_name(operand))
+                if col is not None and col.type_tag == "text":
+                    continue
+            return True
+    return False
+
+
 def where_needs_per_row(
     stmt: exp.Select,
     table: TableDef | None = None,
@@ -3258,6 +3307,8 @@ def where_needs_per_row(
     if catalog is not None and _where_has_udf(node, catalog, db):
         return True
     if table is not None and _where_has_range_predicate(node, table):
+        return True
+    if _where_has_text_cast_comparison(node, table):
         return True
     if table is not None and _where_has_net_predicate(node, table):
         return True
@@ -3623,6 +3674,10 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
             raise errors.not_null_violation(col_name, table.name)
         if col.composite_type is not None and raw is not None:
             set_doc[col.field] = _composite_value(raw, col)
+        elif col.decl_oid in (typemap.BPCHAR_OID, typemap.VARCHAR_OID):
+            set_doc[col.field] = typemap.enforce_declared_length(
+                typemap.coerce(raw, col.type_tag), col.decl_oid, col.typmod, col.name
+            )
         elif col.type_tag in subms.SUBMS_TAGS:
             stored, companion, remainder = subms.subms_update_ops(
                 col.field, typemap.coerce(raw, col.type_tag)

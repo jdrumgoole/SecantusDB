@@ -2279,6 +2279,13 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
             if first is not None:
                 elem = typemap.type_tag_for_sql(first.to) or "text"
         return typemap._render_pg_array(value, elem)
+    if isinstance(value, bson.Decimal128) and to_tag_early == "text":
+        # `numeric` is STORED as a BSON Decimal128, so the value reaching a
+        # predicate is a Decimal128 rather than a Decimal — without this the
+        # cast fell through and `WHERE d::text = '2.50'` compared a Decimal128
+        # against a string. `to_decimal()` keeps the declared scale ('2.50'
+        # stays '2.50', as Postgres renders it).
+        value = value.to_decimal()
     if to_tag_early == "text" and isinstance(value, (bool, int, float, Decimal)):
         # A cast to text must PRODUCE text. Leaving the number alone made the
         # value compare as a number — `count(*)::text = '2'` was false because

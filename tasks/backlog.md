@@ -3353,30 +3353,33 @@ shared storage engine or building large new protocol subsystems:
   used to fail — `NOT (...)`, `BETWEEN`, `count(*) * 2`, `sum(n) + count(*)`,
   `abs(sum(n))`, `CASE`, `coalesce`, `max - min`, `count(*)::text` — and all
   ten now match PostgreSQL 14 row for row.
-- [ ] **`char(n)` / `varchar(n)` declared length is not enforced**: an overlong
-  value is stored and returned intact, where PG raises `22001 value too long
-  for type character(8)` / `character varying(3)` (probed against 14 —
-  trailing-blank-only overflow is the one accepted case). Found while adding
-  blank padding for `char(n)` (slice 28). Related, from the same probe: the
-  padding is applied on the way OUT (`typemap.blank_pad`, at both wire render
-  paths) rather than on the way in, which is what keeps `length()`,
-  comparison, and `::text` seeing the unpadded value as PG does — but it means
-  `octet_length()` reports the unpadded byte count (PG reports the padded one),
-  and `char(n)[]` array elements are not padded.
+- [x] **`char(n)` / `varchar(n)` declared length — ENFORCED.** An over-length
+  value now raises `22001 value too long for type character varying(3)` /
+  `character(3)` on INSERT and UPDATE, instead of being stored intact (a column
+  holding data that violates its own declared schema). Trailing-blank overflow
+  is trimmed rather than refused, matching PostgreSQL 14 (`'abc  '` into
+  `varchar(3)` stores `'abc'`; `'abcd'` is refused) — `typemap.enforce_declared_length`.
+  Still open from the same probe: `octet_length()` on a `char(n)` reports the
+  UNPADDED byte count (the padding is applied at render, not in storage), and
+  `char(n)[]` array elements are not padded.
+
+
 - [ ] **`::STRING` is accepted**: the crdb type alias parses and behaves as
   `text`, where PG raises `42704 type "string" does not exist` (probed against
   14). Harmless but a divergence; noted while recording the `row_description`
   expected divergence, whose final stanza depends on crdb's `STRING(2)` →
   `varchar` truncation.
-- [ ] **Casts to text beyond the scalar numerics.** `_eval_cast` now converts
-  int / float / Decimal / bool to Postgres' own text spellings (probed against
-  14: `2.0::float8` -> `2`, `2.50::numeric` keeps its scale, `true` -> `true`
-  not the wire form `t`), which is what made `count(*)::text = '2'` compare as
-  text instead of silently matching nothing. Not audited: the same conversion
-  through the PUSHDOWN path — `SELECT n::text FROM t` still returns the number
-  (harmless on the wire, since the rendered bytes match, but a pushdown
-  comparison against a text literal would have the original bug) — and the
-  non-scalar targets (interval, bit, geo) that fall through unchanged.
+- [x] **Casts to text — the predicate path is closed too.** `_eval_cast`
+  converts int / float / Decimal / **Decimal128** / bool to Postgres' text
+  spellings, and a WHERE comparing a cast-to-text now routes to per-row
+  evaluation (`_where_has_text_cast_comparison`) instead of pushing a filter
+  that compared the raw stored value — `WHERE n::text = '2'` matched NOTHING
+  before. Decimal128 mattered specifically because `numeric` is stored as one,
+  so `WHERE d::text = '2.50'` was comparing a Decimal128 against a string.
+  Still unconverted: non-scalar cast targets (interval, bit, geo), which fall
+  through unchanged.
+
+
 - [ ] **Multi-way comma-join performance — much improved, `select4`/`select5`
   still over the 300s cap.** Two pushdowns landed (see
   `_push_single_table_predicates` / `_key_comma_joins_from_where`):
