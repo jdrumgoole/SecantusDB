@@ -568,18 +568,28 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
   cxx pair has no parseable `Overall` row (its report format differs — worth a
   look, not a known regression).
 
-  The one genuine regression was **java: 445/99.6% vs 446/99.8%**, and the
-  failure sets were *disjoint* — the Rust server PASSES the `ClientMetadataTest`
-  the Python server fails, and failed two `mapReduce` tests instead
-  (`MongoCollectionTest#testMapReduceWithGenerics`,
-  `UnifiedWriteConcernTest#default-write-concern-3.4`) because `mapReduce` was
-  simply not in the Rust dispatch table (→ `59 CommandNotFound`).
-  `secantus-commands::mapreduce` closes it: the same no-JS-engine port the
-  Python server ships (canonical `emit(this.<field>, 1)` + `values.length` →
-  `$group` count, double-typed `value`, `{out: {inline: 1}}` gate, empty-but-ok
-  otherwise). **Not yet re-measured against the Java gauge** — that needs a JVM
-  + Gradle run against a freshly built `secantusd-rs`; the port is unit-tested
-  case-for-case against the Python implementation that passes those two tests.
+  **The java gap is CLOSED — re-measured 2026-08-19 at 447 / 0 / 100.0%**, the
+  same as the Python server. It took two fixes, and the second only became
+  visible once the first landed:
+
+  1. `mapReduce` was not in the Rust dispatch table at all (→ `59
+     CommandNotFound`), failing `MongoCollectionTest#testMapReduceWithGenerics`
+     and `UnifiedWriteConcernTest#default-write-concern-3.4`. Ported in
+     `secantus-commands::mapreduce` — the same no-JS-engine translation the
+     Python server ships. Re-measured: both pass, 445 → 446.
+
+  2. That exposed `GeoJsonFiltersFunctionalSpecification#$nearSphere`, which had
+     been masked. The Java driver's
+     `Filters.nearSphere(field, point, maxDistance, minDistance)` sends
+     `$minDistance: null` when no minimum is given, and `geo::parse_near_spec`
+     treated a BSON null as an unsupported construct — so the Rust server
+     REJECTED the whole query ("uses a construct the Rust server does not
+     support") where the Python server answered it. A null now reads as absent,
+     mirroring `query._opt_number`; a non-number is still refused. 446 → 447.
+
+  Both were parity bugs of the same shape: the Rust port was stricter than the
+  Python original about input it should have ignored. Worth remembering when
+  porting the remaining surface — the gauges catch these, unit tests do not.
 
 **Leftover storage work folded in** (was Phase-4 tail): re-home `$lookup` /
 `$geoNear` / `$out` / `$merge` storage-backed aggregation into `secantus-storage`
