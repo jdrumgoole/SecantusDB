@@ -3273,74 +3273,39 @@ shared storage engine or building large new protocol subsystems:
   interrupt that socket read and it would wedge the weekly gauge. Closing this
   is one gauge run — drop the `EXCLUDE_CLASSES` entry and run
   `pgjdbc_validation.runner`.
-- [ ] **pgtest gauge — wire-fidelity clusters** (`invoke validate-pgtest`,
-  **43/65 files pass** at `docs/validation-report-pgtest.md` — 7 expected
-  divergences, 10 unexpected failures, 5 skipped): the corpus is byte-exact
-  per message, and each file stops at its first mismatch, so fixes compound.
-  Recently landed: `void` (pg_sleep → void oid 2278), `set` (dotted custom
-  GUCs), `varbit` (binary bit/varbit `varbit_recv` framing), `unknown`
-  (oid-705 params resolved from context). Expected divergences added:
-  `spatial` / `box2d` / `pgvector` (PostGIS + pgvector extension types, out
-  of scope). Remaining 10 unexpected failures, triaged:
-  - ~~**`timezone`**~~ — GREENED: the timetz size stanzas use
-    `ignore_data_type_sizes`, so the real gap was a `timetz` zone offset with
-    seconds (`+01:01:03`) being rejected; session-TimeZone timestamptz
-    rendering (incl. historical LMT `-05:50:36`), GMT-N upper-casing, and the
-    binary time-type encodings already worked.
-  - **`typing`** — the non-crdb path expects `SELECT id FROM t WHERE v = $1`
-    (v varchar, `$1` declared uuid 2950 / bool 16) to ErrorResponse. We
-    return `SELECT 0` (silent success): the comparison type-checker doesn't
-    see the *param's declared OID*, so it never detects the cross-type
-    `varchar = uuid` clash. Even fixed we'd emit PG's `42883` "operator does
-    not exist", while the corpus pins crdb's `22023` "unsupported comparison
-    operator" via keepErrMessage — so the file can't pass, but the silent
-    success is a real gap worth closing (thread the declared param OID into
-    the WHERE type-check).
-  - **`row_description`** — `SELECT a, c FROM …` over base-table columns:
-    we report `TableAttributeNumber` 0, PG reports the source column's attnum
-    (1). Needs output-column → base-column attnum provenance in the
-    RowDescription builder (`ignore_table_oids` zeroes TableOID but keeps
-    attnum, so the attnum must be right).
-  - ~~**`tuple`**~~ — GREENED: the `(a, b, …)` anonymous record constructor
-    (binary + text output preserving per-field type oids), binary composite
-    bind params validated with PG's exact errors (08P01/42804/22P03), a
-    RECORD (2249) param rejected 0A000, and `$1::user_type` inferring the
-    minted oid.
-  - ~~**`procedure`**~~ — FEATURE IMPLEMENTED, file now an expected divergence:
-    `CREATE PROCEDURE` (IN/OUT/INOUT argmodes, either order), `CALL` returning
-    OUT/INOUT params as the result row over simple + extended protocols, plpgsql
-    body (INSERT + RAISE NOTICE) and `COMMIT`/`ROLLBACK` inside a procedure, and
-    `DROP PROCEDURE` all work. The file can't be byte-green because its `RAISE
-    NOTICE` stanzas pin crdb's internal source fields (`File:builtins.go`,
-    `Routine:func401`), which the runner doesn't normalize and no non-crdb server
-    emits (real PG sends `pl_exec.c`/`exec_stmt_raise`).
-  - ~~**`multiple_active_portals` / `…/query_timeout`**~~ — now an expected
-    divergence (crdb pausable-portal test). `statement_timeout` is now ENFORCED
-    (57014) for simple / single-statement queries — a real feature — but
-    `query_timeout` expects a MaxRows:1-paged portal to emit N rows then time
-    out on the next pull, which needs LAZY per-row portal evaluation (we
-    materialise eagerly); and `interleave_with_unpausable_portal` pins crdb's
-    `0A000 unimplemented pausable portal` error (go.crdb.dev hint) that real PG
-    doesn't produce. Both classified expected.
-  - ~~**`schema_changes_implicit_txn` / `…/triggers`**~~ — GREENED: the only
-    gap was `DROP TRIGGER` (CREATE TRIGGER + firing already worked, and the
-    autocommit-during-bind subtest already passed); `DROP TRIGGER [IF EXISTS]
-    name ON table` now removes the trigger.
-  - ~~**`timezone`**~~ — GREENED: it turned out the timetz size stanzas use
-    `ignore_data_type_sizes`, so the only real gap was accepting a `timetz`
-    zone offset with seconds (`+01:01:03`); the session-TimeZone timestamptz
-    rendering (historical LMT `-05:50:36`), GMT-N upper-casing, and binary
-    time-type encodings all already worked.
-  - ~~**`pgjdbc`**~~ — GREENED: `DISCARD <target>` command tags, a simple
-    `Query` mid-pipeline committing the pending extended-protocol implicit
-    transaction (pgjdbc's autosave interleave), and stored-procedure OUT
-    parameters (keyed by total param count, OUT/INOUT params forming the CALL
-    result row and the extended `Describe`-portal shape without running the
-    body — pgjdbc #158771).
-  - NO unexpected failures remain. Every non-passing file is a documented
-    expected divergence: `char`, `int2vector`, `jsonpath`, `portals`, `typing`,
-    `row_description`, `procedure`, `spatial`, `box2d`, `pgvector`,
-    `multiple_active_portals` (+ its `query_timeout` subtest).
+- [x] **pgtest gauge — CAMPAIGN COMPLETE.** `docs/validation-report-pgtest.md`:
+  **49/66 files pass, 12 expected divergences, ZERO unexpected failures**
+  (5 skipped), from 43 unexpected failures when the campaign started
+  2026-08-16. Every file that does not pass is a documented crdb-vs-PG conflict,
+  each with its reason inline in `pgtest_validation/include_paths.py`.
+
+  The divergences fall into two kinds, and neither is fixable without making
+  SecantusDB *less* faithful to PostgreSQL:
+
+  * **crdb internals pinned by the corpus** — `char` (crdb's deterministic
+    TableOID), `int2vector` (crdb's NULLS-FIRST pkey indoption), `procedure`
+    (crdb's NoticeResponse `File`/`Routine` = `builtins.go`/`func401`; real PG
+    emits `exec_stmt_raise`/`pl_exec.c`, probed), `portals` and `typing`
+    (`keepErrMessage` pinning crdb's error wording where PG's differs).
+  * **crdb-only surface** — `row_description`'s `::STRING` casts (PG: `42704`),
+    `jsonpath`'s binary form, and the extension types `spatial` / `box2d` /
+    `pgvector`.
+
+  Fixes that landed along the way, in order: 25P02 aborted-transaction rules,
+  binary-param error classes, batch/segment parse, portal lifetime + snapshots,
+  citext, COPY, decimal, enum, execute, float4, error fields, inet, cached-plan
+  revalidation at Bind, base-column identity across joins/views/retypes,
+  parameter-type resolution at Parse, timetz sub-minute offsets, `void`, `set`,
+  `varbit`, `unknown`, row constructors, and CREATE PROCEDURE / CALL.
+
+  **Note for re-runs:** drive the runner directly —
+  `PYTHONPATH=. .venv/bin/python -m pgtest_validation.runner` then
+  `... -m pgtest_validation.generate_report .validation/pgtest-raw.json
+  docs/validation-report-pgtest.md`. `invoke validate-pgtest` spawns the daemon
+  without `PYTHONPATH` and dies with "pg daemon did not become ready within
+  15s" (the same wrapper issue the psycopg gauge has).
+
+
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
   **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,
   from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn campaign
