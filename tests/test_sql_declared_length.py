@@ -126,3 +126,42 @@ class TestTextCastInWhere:
         # The per-row route must only claim predicates that need it.
         storage, session = table
         assert run(storage, session, "SELECT n FROM t WHERE n = 2").rows == [(2,)]
+
+
+class TestLengthFunctionsAndTextCasts:
+    """Two functions that answered the wrong thing for every non-bit input, and
+    a cast that leaked internals. All expectations probed against PostgreSQL 14."""
+
+    @pytest.fixture
+    def storage_session(self, storage, session):
+        return storage, session
+
+    @pytest.mark.parametrize(
+        ("sql", "expected"),
+        [
+            # octet_length / bit_length were dispatched to the BIT-STRING
+            # implementations for every input, so octet_length('abc') answered
+            # (3+7)//8 = 1 and bit_length('abc') answered 3.
+            ("SELECT octet_length('abc')", 3),
+            ("SELECT bit_length('abc')", 24),
+            # Encoded bytes, not characters: 'é' is one character, two bytes.
+            ("SELECT octet_length('é')", 2),
+            ("SELECT bit_length('é')", 16),
+            ("SELECT length('é')", 1),
+            # The bit-string forms must keep their own semantics.
+            ("SELECT octet_length(B'1010')", 1),
+            ("SELECT bit_length(B'1010')", 4),
+        ],
+    )
+    def test_length_functions_match_postgres(self, storage_session, sql, expected):
+        storage, session = storage_session
+        assert run(storage, session, sql).rows == [(expected,)]
+
+    def test_an_interval_cast_to_text_is_postgres_text(self, storage_session):
+        # This used to hand the client our internal subdocument —
+        # '{"interval": {"months": 0, "days": 1, ...}}'.
+        storage, session = storage_session
+        run(storage, session, "CREATE TABLE iv (i INTERVAL)")
+        run(storage, session, "INSERT INTO iv VALUES ('1 day')")
+        assert run(storage, session, "SELECT i::text FROM iv").rows == [("1 day",)]
+        assert run(storage, session, "SELECT (INTERVAL '2 hours')::text").rows == [("02:00:00",)]

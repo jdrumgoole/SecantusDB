@@ -29,3 +29,23 @@ does in Postgres.
   trimmed, as Postgres does.
 - A comparison against a cast to `text` (`WHERE n::text = '2'`) matches the rows
   Postgres matches, including for `numeric` columns.
+
+### Length functions, and an interval cast that leaked internals
+
+`octet_length` and `bit_length` were answering for bit strings no matter what
+you gave them, so `octet_length('abc')` came back as 1 and `bit_length('abc')`
+as 3 — Postgres says 3 and 24. Both now measure a string's encoded bytes, which
+also makes them correct for multi-byte text (`octet_length('é')` is 2 while
+`length('é')` is 1), and both keep their bit-string meaning for actual bit
+values.
+
+Casting an `interval` to text handed back the internal storage form —
+`{"interval": {"months": 0, "days": 1, ...}}` — rather than `1 day`. It now
+renders the same way an interval column already did on its way to a client.
+
+#### Fixed
+
+- `octet_length()` / `bit_length()` return Postgres' answers for text and
+  bytea, and keep bit-string semantics for bit values.
+- `interval::text` renders Postgres' interval text instead of the internal
+  representation.

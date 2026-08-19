@@ -3359,16 +3359,29 @@ shared storage engine or building large new protocol subsystems:
   holding data that violates its own declared schema). Trailing-blank overflow
   is trimmed rather than refused, matching PostgreSQL 14 (`'abc  '` into
   `varchar(3)` stores `'abc'`; `'abcd'` is refused) — `typemap.enforce_declared_length`.
-  Still open from the same probe: `octet_length()` on a `char(n)` reports the
-  UNPADDED byte count (the padding is applied at render, not in storage), and
-  `char(n)[]` array elements are not padded.
+  The `octet_length()` note that sat here turned out to understate the problem:
+  `octet_length` and `bit_length` were dispatched to the BIT-STRING
+  implementations for EVERY input, so `octet_length('abc')` answered
+  `(3+7)//8 = 1` and `bit_length('abc')` answered 3 (PG: 3 and 24). Both now
+  measure encoded bytes for text and keep the bit semantics for bit values.
+  Still open, and genuinely narrow: `octet_length()` on a `char(n)` returns the
+  unpadded count (4 in PG for `'xy'::char(4)`) because padding is applied at
+  render, not in storage — the scalar evaluator has no access to the declared
+  width; and `char(n)[]` elements are not padded.
 
 
-- [ ] **`::STRING` is accepted**: the crdb type alias parses and behaves as
-  `text`, where PG raises `42704 type "string" does not exist` (probed against
-  14). Harmless but a divergence; noted while recording the `row_description`
-  expected divergence, whose final stanza depends on crdb's `STRING(2)` →
-  `varchar` truncation.
+- [x] **`::STRING` — WON'T FIX, and here is why.** The crdb type alias parses
+  and behaves as `text`, where PG raises `42704 type "string" does not exist`.
+  Rejecting it is not worth doing: sqlglot normalises `STRING` to `TEXT` at
+  parse time, so by the time the planner sees the cast it is indistinguishable
+  from a real `::text` — detecting it would mean sniffing the raw SQL string,
+  which is fragile (a column named `string`, a literal containing `::STRING`)
+  for a spelling no PostgreSQL client emits. The only thing that asks for it is
+  crdb's own corpus, which is already a recorded divergence
+  (`row_description`). Accepting a non-PG alias is a permissiveness, not a
+  wrong answer.
+
+
 - [x] **Casts to text — the predicate path is closed too.** `_eval_cast`
   converts int / float / Decimal / **Decimal128** / bool to Postgres' text
   spellings, and a WHERE comparing a cast-to-text now routes to per-row
@@ -3376,8 +3389,11 @@ shared storage engine or building large new protocol subsystems:
   that compared the raw stored value — `WHERE n::text = '2'` matched NOTHING
   before. Decimal128 mattered specifically because `numeric` is stored as one,
   so `WHERE d::text = '2.50'` was comparing a Decimal128 against a string.
-  Still unconverted: non-scalar cast targets (interval, bit, geo), which fall
-  through unchanged.
+  `interval::text` is fixed too — it used to hand the client our INTERNAL
+  subdocument (`{"interval": {"months": 0, "days": 1, ...}}`) instead of
+  Postgres' `1 day`; it now renders through `intervals.render`, the same path
+  the wire layer uses for an interval column. `bit::text` was already correct.
+  Still unconverted: geo and other composite targets.
 
 
 - [ ] **Multi-way comma-join performance — much improved, `select4`/`select5`

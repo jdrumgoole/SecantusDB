@@ -1444,6 +1444,20 @@ def _eval_decode(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     return _bytea.decode(text, _as_text(evaluate(fmt, scope, ctx)))
 
 
+def _bit_length_of(v: Any) -> Any:
+    """``bit_length`` across the three input kinds Postgres accepts."""
+    if v is None:
+        return None
+    if isinstance(v, (bytes, bytearray)):
+        return 8 * len(v)
+    from secantus.sql import bitstr as _bitstr
+
+    text = _as_text(v)
+    if _bitstr.is_bit_value(v):
+        return len(text)
+    return 8 * len(text.encode("utf-8"))
+
+
 _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], Any]] = {
     # ``upper`` / ``lower`` are overloaded: a range operand yields its bound, any
     # other operand is the string case-shift.
@@ -1524,11 +1538,11 @@ for _cls_name, _handler in (
     ("Chr", _eval_chr),
     ("StrPosition", _eval_str_position),
     ("Overlay", _eval_overlay),
-    # ``bit_length`` — a bytea's byte count x8, else a bit string's bit count.
-    (
-        "BitLength",
-        _unary(lambda v: 8 * len(v) if isinstance(v, (bytes, bytearray)) else len(_as_text(v))),
-    ),
+    # ``bit_length`` — a bytea's byte count x8, a bit string's bit count, and
+    # for text 8x its ENCODED byte count (`bit_length('abc')` is 24, not 3;
+    # probed against PostgreSQL 14). Text used to fall through to the
+    # bit-string branch and answer its character count.
+    ("BitLength", _unary(_bit_length_of)),
     # Interval functions with dedicated sqlglot nodes.
     ("MakeInterval", _eval_make_interval),
     ("JustifyDays", _eval_justify("justify_days")),
@@ -2279,6 +2293,15 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
             if first is not None:
                 elem = typemap.type_tag_for_sql(first.to) or "text"
         return typemap._render_pg_array(value, elem)
+    if to_tag_early == "text" and isinstance(value, dict) and "interval" in value:
+        # An interval is stored as a subdocument. Casting one to text used to
+        # fall through unchanged, so a client running `SELECT i::text` received
+        # our INTERNAL representation — `{"interval": {"months": 0, "days": 1,
+        # ...}}` — instead of Postgres' `1 day`. Render it the way the wire
+        # layer already renders an interval column.
+        from secantus.sql import intervals as _intervals
+
+        return _intervals.render(value)
     if isinstance(value, bson.Decimal128) and to_tag_early == "text":
         # `numeric` is STORED as a BSON Decimal128, so the value reaching a
         # predicate is a Decimal128 rather than a Decimal — without this the
@@ -3210,6 +3233,16 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         if v is None:
             return None
         bits = str(v)
+        # These were dispatched to the BIT-STRING implementations for every
+        # input, so `octet_length('abc')` answered (3+7)//8 = 1 instead of 3 —
+        # wrong for every string that is not a bit literal. The bit forms apply
+        # only to an actual bit value; text measures its ENCODED bytes, which is
+        # what makes `octet_length('é')` 2 while `length('é')` is 1 (probed
+        # against PostgreSQL 14, along with bit_length('abc') = 24 and
+        # octet_length(B'1010') = 1).
+        if name in ("bit_length", "octet_length") and not _bitstr.is_bit_value(v):
+            encoded = len(bits.encode("utf-8"))
+            return encoded if name == "octet_length" else 8 * encoded
         if name == "bit_length":
             return _bitstr.bit_length(bits)
         if name == "octet_length":
