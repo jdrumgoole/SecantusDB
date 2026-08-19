@@ -1,5 +1,12 @@
 # Phase R — PITR for the Rust server (implementation plan)
 
+> **DELIVERED — the "proposed, for review" status line is wrong (audited
+> 2026-08-20).** Phase R shipped: `crates/secantus-storage/src/replay.rs` and
+> `pitr_archive.rs` both exist, and cross-server restore is covered by
+> `tests/test_rust_pitr_cross_server.py` + `tests/test_rust_binary_pitr.py`.
+> `tasks/backlog.md` §3.5 records it as complete and is the current record. Kept
+> for the design reasoning and the prereq audit table.
+
 Status: **proposed, for review.** Scopes porting point-in-time recovery to the
 Rust server so the standalone `secantusdb` binary can back up and restore, at
 parity with the Python server (which completed PITR in 0.5.4b4–b6:
