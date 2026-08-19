@@ -3350,14 +3350,34 @@ shared storage engine or building large new protocol subsystems:
   documented in the pgconn findings section), `pgproto3` / `bgreader` /
   `ctxwatch` 100%. Remaining work is only the load-sensitivity
   re-measurement on a quiet machine.
-- [ ] **Sub-millisecond timestamp fidelity** (the one declared SQLAlchemy-gauge
-  divergence — `datetime_microseconds` closed in
-  `sqlalchemy_validation/requirements.py`): BSON datetimes are int64
-  milliseconds, so a SQL `timestamp` column round-trips microseconds truncated.
-  A fix needs a storage-representation change for SQL-declared timestamp
-  columns (int64-µs or a sub-ms side channel) weighed against the
-  dual-protocol document view. The gauge otherwise passes 731/731 executed
-  tests (100%).
+- [ ] **Sub-millisecond timestamps — READS are precise; PREDICATES are not.**
+  BSON has no sub-ms date (a date is int64 milliseconds; `Timestamp` is
+  seconds+ordinal, an internal replication type), so the remainder is stored
+  beside the date in a hidden `__us_<field>` companion — see
+  `src/secantus/sql/subms.py` and the "Sub-millisecond timestamps" section of
+  `docs/sql.md`. INSERT / UPDATE / SELECT / RETURNING round-trip microseconds,
+  `SELECT *` and reflection hide the companion, and every write resolves it (a
+  whole-millisecond UPDATE *removes* it — a stale remainder would report a time
+  that was never stored).
+
+  **Still open, in rough order of value:**
+  1. **Predicates are millisecond-blind.** `WHERE t = '…123456'` matches nothing
+     and rows inside one millisecond sort arbitrarily — unchanged from before
+     the companion existed (verified against `main`), but now the fix is
+     possible: lower a comparison against BOTH fields
+     (`{t: <trunc>, __us_t: <rem>}` for equality; an `$or` of "later
+     millisecond" OR "same millisecond and larger remainder" for ranges) and add
+     the companion as a sort tiebreaker (missing sorts lowest, which is 0 — the
+     right answer).
+  2. **Pipeline-shaped reads truncate.** GROUP BY / JOIN / DISTINCT read a
+     *projected* document, and the companion was never projected. Each `$project`
+     the planner builds would need to carry it, and a GROUP BY on a timestamp
+     would need it in the group key to avoid merging rows that differ only in
+     microseconds.
+  3. **COPY and the Rust server** don't write the companion — they truncate, as
+     before. Not wrong, just not precise.
+
+
 - [x] **HAVING general-shape residual — DONE.** Any shape the `$match` lowerer
   can't express now falls back to the per-grouped-row residual route the
   HAVING-subquery case already used, instead of raising `0A000`: the plain

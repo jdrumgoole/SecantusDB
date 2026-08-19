@@ -257,19 +257,61 @@ SELECT price, at FROM m;
 -- price -> Decimal('19.99'),  at -> datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC)
 ```
 
-Two **precision ceilings** follow from the BSON storage forms and are
-permanent divergences from real Postgres:
+One **precision ceiling** follows from the BSON storage forms and is a
+permanent divergence from real Postgres:
 
-- **Timestamps hold milliseconds, not microseconds.** BSON datetimes are
-  millisecond-precision, so `timestamp` / `timestamptz` values truncate
-  the microsecond digits real Postgres keeps:
-  `'2020-01-02 03:04:05.123456'` comes back as `… 03:04:05.123000`.
-  (pgjdbc's `TimestampTest` / `UpdateableResultTest` assert microsecond
-  round-trips and fail on exactly this.)
 - **`numeric` holds at most 34 significant digits.** Values are stored
   as IEEE 754-2008 Decimal128, so a wider `numeric` rounds to 34
   significant digits where real Postgres keeps arbitrary precision.
   (pgjdbc's `NumericTransfer2Test` asserts wider round-trips.)
+
+#### Sub-millisecond timestamps
+
+A BSON date (`0x09`) is a signed 64-bit count of **milliseconds** — there is no
+sub-millisecond date type in MongoDB at all (`Timestamp`, `0x11`, is coarser
+still: seconds plus an ordinal, reserved for replication). A Postgres
+`timestamp` carries microseconds, so it does not fit.
+
+SecantusDB keeps the BSON date and stores the leftover microseconds beside it,
+in a hidden companion field named `__us_<field>`:
+
+```sql
+CREATE TABLE ts (id bigint PRIMARY KEY, t timestamp);
+INSERT INTO ts VALUES (1, '2026-08-18 12:00:00.123456');
+SELECT t FROM ts;   -- 2026-08-18 12:00:00.123456
+```
+
+The document a **Mongo client** sees is:
+
+```javascript
+{ _id: 1, t: ISODate("2026-08-18T12:00:00.123Z"), __us_t: 456 }
+```
+
+`t` is an ordinary BSON date holding whole milliseconds — exactly what was
+stored before this existed — and `__us_t` holds the remaining 0–999
+microseconds. Points worth knowing:
+
+- **The companion is only written when it is non-zero.** A timestamp that lands
+  on a whole millisecond (the common case) adds no extra field.
+- **It is not a column.** `__`-prefixed keys are SecantusDB's convention for
+  hidden storage fields, so the companion never appears in `SELECT *`, in
+  `information_schema`, or in the columns reflected from a schema-on-read
+  collection.
+- **Every write resolves it.** An `UPDATE` to a whole-millisecond value
+  *removes* the companion rather than leaving the old one behind — a stale
+  remainder would report a time that was never stored.
+- **It is data, not metadata.** A Mongo client writing to the same collection
+  directly can set or omit `__us_t` freely; a value outside 0–999 is ignored on
+  read rather than trusted.
+
+**The remaining limitation: predicates are still millisecond-blind.** The stored
+date is truncated, so `WHERE` and `ORDER BY` on a timestamp column compare only
+whole milliseconds. A sub-millisecond literal matches nothing
+(`WHERE t = '…12:00:00.123456'` returns no rows even for the row above, whereas
+`'…12:00:00.123'` matches it), and two rows within the same millisecond sort in
+an unspecified order. Closing that means lowering comparisons against both
+fields and adding the companion as a sort tiebreaker; until then reads are
+precise and predicates are not.
 
 #### Comparing incompatible types is an error, not an empty result
 

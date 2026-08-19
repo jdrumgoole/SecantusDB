@@ -32,7 +32,7 @@ import sqlglot
 from sqlglot import exp
 
 from secantus.paths import set_path
-from secantus.sql import errors, ranges, typemap
+from secantus.sql import errors, ranges, subms, typemap
 from secantus.sql.catalog import (
     CheckConstraint,
     Column,
@@ -2221,7 +2221,7 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
             value = _composite_value(raw, col)
         else:
             value = typemap.coerce(raw, col.type_tag)
-        _set_doc_field(doc, col.field, value)
+        _set_doc_field(doc, col.field, value, col.type_tag)
         provided.add(name)
     # An omitted column takes its DEFAULT if it has one; otherwise a NOT NULL
     # omission is a violation. A sequence-backed column (SERIAL / DEFAULT
@@ -2232,13 +2232,13 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
         if col.sequence is not None or col.generated is not None:
             continue  # filled by the executor (sequence draw / computed expr)
         if col.has_default:
-            _set_doc_field(doc, col.field, typemap.coerce(col.default, col.type_tag))
+            _set_doc_field(doc, col.field, typemap.coerce(col.default, col.type_tag), col.type_tag)
         elif col.default_expr is not None:
             from secantus.sql import scalar
 
             ctx = scalar.ScalarContext(storage=None, catalog=None, db="", session=None)
             val = scalar.evaluate(_parse_default_expr(col.default_expr), _default_col_scope, ctx)
-            _set_doc_field(doc, col.field, typemap.coerce(val, col.type_tag))
+            _set_doc_field(doc, col.field, typemap.coerce(val, col.type_tag), col.type_tag)
         elif not col.nullable:
             raise errors.not_null_violation(col.name, table.name)
     _canonicalize_composite_id(doc, table)
@@ -2290,10 +2290,17 @@ def _build_composite(raw: Any, fields: Any, type_name: str) -> dict[str, Any]:
     return out
 
 
-def _set_doc_field(doc: dict[str, Any], field: str, value: Any) -> None:
+def _set_doc_field(doc: dict[str, Any], field: str, value: Any, tag: str | None = None) -> None:
     """Assign a column's value to its storage field. A composite-PK column has a
     dotted field (``_id.<name>``) that builds a subdocument ``_id``; a plain field
-    is a direct key."""
+    is a direct key.
+
+    A ``timestamp`` value carries microseconds a BSON date cannot hold, so its
+    sub-millisecond remainder is split off into a hidden companion field — see
+    `secantus.sql.subms`, and note the invariant there: the companion is
+    resolved on EVERY write, never left stale."""
+    if tag in subms.SUBMS_TAGS and "." not in field:
+        value = subms.carry_subms(doc, field, value)
     if "." in field:
         set_path(doc, field, value)
     else:
@@ -3561,6 +3568,8 @@ def _composite_subfield_target(target: exp.Expression, table: TableDef):
 
 def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
     set_doc: dict[str, Any] = {}
+    # Companion fields to remove — see the invariant in `secantus.sql.subms`.
+    unset_fields: list[str] = []
     rekey = False
     computed: list[tuple[str, str, Any]] = []
     for assign in stmt.expressions:
@@ -3614,12 +3623,27 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
             raise errors.not_null_violation(col_name, table.name)
         if col.composite_type is not None and raw is not None:
             set_doc[col.field] = _composite_value(raw, col)
+        elif col.type_tag in subms.SUBMS_TAGS:
+            stored, companion, remainder = subms.subms_update_ops(
+                col.field, typemap.coerce(raw, col.type_tag)
+            )
+            set_doc[col.field] = stored
+            if remainder is not None:
+                set_doc[companion] = remainder
+            else:
+                # No remainder: the companion must GO, or the row keeps the
+                # microseconds of whatever it held before this update.
+                unset_fields.append(companion)
         else:
             set_doc[col.field] = typemap.coerce(raw, col.type_tag)
     return UpdatePlan(
         table=table,
         filter=_where_filter(stmt, table),
-        update={"$set": set_doc},
+        update=(
+            {"$set": set_doc, "$unset": {f: "" for f in unset_fields}}
+            if unset_fields
+            else {"$set": set_doc}
+        ),
         returning=_returning_columns(stmt, table),
         rekey=rekey,
         computed=computed,
