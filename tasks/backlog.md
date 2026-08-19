@@ -4,6 +4,20 @@ A living list of things SecantusDB does not yet implement faithfully. Update whe
 
 Each item should have enough context for a future session to pick it up cold: what's there now, what's missing, why it was deferred.
 
+**Markers are load-bearing — `- [ ]` means open work, `- [x]` means a finished
+record kept for its detail.** When a slice lands, flip its box in the same commit.
+An audit on 2026-08-20 found 107 of 178 open-marked items were finished work whose
+box was never flipped, which made the board unreadable: a session scanning for
+`- [ ]` could not tell the real tasks from the archive.
+
+**Correct a superseded entry rather than adding a newer one beside it.** The same
+audit found entries asserting limitations the engine had not had for months —
+"Foreign keys … NOT enforced" sat a few hundred lines above "FOREIGN KEY
+enforcement on write landed". **Reproduce an item before working it** (a probe, the
+failing test, the query); several "open" items were already fixed, and the wrong
+ones were wrong in the direction that costs most — they described work as missing
+when it existed.
+
 ---
 
 ## 1. Stubs (canned responses, no real semantics)
@@ -16,9 +30,9 @@ These commands accept the request and return a wire-valid response, but the resp
 
 These work end-to-end but cut corners.
 
-- [ ] **`$bucketAuto` `granularity` rounding — SHIPPED, hex-exact on both servers (2026-07-19).** The prior "1-ULP blocker" was a wrong-constants artifact: mongod stores each preferred-number series as **integer-valued doubles** (R5 = `{10,16,25,40,63}`, not normalised `0.63`-style literals) and computes `series_element * multiplier` (multiplier a power of 10), which reproduces its non-standard ULPs (`63 * 0.1 = 6.300000000000001`) bit-for-bit in Python and Rust f64. Ported `roundUp` / `roundDown` (double path) verbatim from `granularity_rounder_preferred_numbers.cpp` + the `populateNextBucket` boundary walk (first min = `roundDown(dataMin)`, every other boundary = `roundUp(chunkMax)` with the absorb-below-boundary loop; `std::round(nDocs/nBuckets)` bucket size), plus the POWERSOF2 rounder. Both engines: `secantus.aggregate._bucket_auto_granular` (`_BUCKET_AUTO_SERIES` + `_round_up/down_series` + `_round_up/down_pow2`) and `secantus-core` `group::bucket_auto_granular`. **Verified hex-exact vs a live mongod 7.0.12 oracle** (1200+ cases across all 13 granularities × scales × bucket counts, incl. edges: zeros, exact-boundary values, +inf, single bucket); Rust pinned to Python by a 400-case parity fuzz. Value validation reproduces mongod's codes on the Python server — non-numeric 40258, NaN 40259, negative 40260 (name errors 40261/40257 already shipped) — and defers on the Rust server (BadValue, the standing error-code gap). **Remaining sub-limitation:** a **Decimal128**-valued groupBy defers/rejects (code 2) rather than running mongod's separate Decimal128 rounder — the standing Decimal128 precision deferral; the double/int path (the common case) is complete.
+- [x] **`$bucketAuto` `granularity` rounding — SHIPPED, hex-exact on both servers (2026-07-19).** The prior "1-ULP blocker" was a wrong-constants artifact: mongod stores each preferred-number series as **integer-valued doubles** (R5 = `{10,16,25,40,63}`, not normalised `0.63`-style literals) and computes `series_element * multiplier` (multiplier a power of 10), which reproduces its non-standard ULPs (`63 * 0.1 = 6.300000000000001`) bit-for-bit in Python and Rust f64. Ported `roundUp` / `roundDown` (double path) verbatim from `granularity_rounder_preferred_numbers.cpp` + the `populateNextBucket` boundary walk (first min = `roundDown(dataMin)`, every other boundary = `roundUp(chunkMax)` with the absorb-below-boundary loop; `std::round(nDocs/nBuckets)` bucket size), plus the POWERSOF2 rounder. Both engines: `secantus.aggregate._bucket_auto_granular` (`_BUCKET_AUTO_SERIES` + `_round_up/down_series` + `_round_up/down_pow2`) and `secantus-core` `group::bucket_auto_granular`. **Verified hex-exact vs a live mongod 7.0.12 oracle** (1200+ cases across all 13 granularities × scales × bucket counts, incl. edges: zeros, exact-boundary values, +inf, single bucket); Rust pinned to Python by a 400-case parity fuzz. Value validation reproduces mongod's codes on the Python server — non-numeric 40258, NaN 40259, negative 40260 (name errors 40261/40257 already shipped) — and defers on the Rust server (BadValue, the standing error-code gap). **Remaining sub-limitation:** a **Decimal128**-valued groupBy defers/rejects (code 2) rather than running mongod's separate Decimal128 rounder — the standing Decimal128 precision deferral; the double/int path (the common case) is complete.
 - [ ] **`_id` numeric type bridge** — works for finite int/float/Decimal128. `bool` is deliberately not numeric. NaN and infinity `_id` values fall through to the BSON-blob path; behavior is unspecified.
-- [ ] **`top` counters are always zero** — the command returns the mongod shape (one `totals` entry per namespace, `total`/`readLock`/`writeLock`/per-op sections) and mongotop renders it like an idle server, but SecantusDB doesn't instrument per-namespace operation timing, so every `{time, count}` is `0`. Real counters would need per-ns accounting in `Metrics` threaded through dispatch.
+- [ ] **`top`: zero counters on the Python server, and the command is MISSING on the Rust server** (re-probed 2026-08-20). Python returns the mongod shape (one `totals` entry per namespace, `total`/`readLock`/`writeLock`/per-op sections) and mongotop renders it like an idle server, but nothing instruments per-namespace operation timing, so every `{time, count}` is `0`. Real counters would need per-ns accounting in `Metrics` threaded through dispatch. **The Rust server answers `top` with code 59 CommandNotFound** — this entry previously read as a both-servers stopgap and hid that gap. `mongotop` against the Rust server therefore fails outright rather than rendering an idle server; the zero-counter shape is the cheap fix, real counters the honest one.
 - ~~**`renameCollection` cross-process safety**~~ structurally guaranteed by WiredTiger (b34). Within-process atomicity is the storage `RLock`. Cross-process exclusion is `WiredTiger.lock` — a second `wiredtiger_open` on the same path fails with ``WT_ERROR Resource busy`` before any state is touched, so concurrent writers across processes / worktrees can't exist in the first place. See `tests/test_storage_exclusion.py`.
 - ~~**`createIndexes` collation**~~ shipped (single-field b25 + compound b27). `sortkey.encode_value_directed` takes a `collation` kwarg; index entries are written under the index's stored collation; single-field equality / range / `$in` (`_find_leading_field_index`), compound bare-equality (`_pick_compound_eq_index`), and compound prefix + trailing-operator (`_pick_compound_range_index`) all thread collation through and gate by exact match. Unique-probe path reads each index's stored collation too. Strength 1/2/3 + `caseLevel` work uniformly across single- and compound-field indexes; `numericOrdering` still falls back to COLLSCAN at every level (would need a length-prefixed digit-run encoding to stay byte-sortable). See `docs/indexes.md` "Per-index collation".
 
@@ -53,7 +67,7 @@ Single-node change streams are implemented and conformant for typical pymongo `w
   `showExpandedEvents`; added the `modify` branch. A `showExpandedEvents` watch
   now sees `createIndexes` / `dropIndexes` / `modify`, and a default watch
   suppresses them.
-- [ ] **Read concern / write concern semantics** — accepted on the wire for compatibility, otherwise ignored.
+- [ ] **Read concern / write concern semantics** — read concern is accepted and ignored. **Write concern is NOT merely ignored** (re-probed 2026-08-20): an unsatisfiable `w` is rejected exactly as mongod rejects it, `{code: 100, codeName: "CannotSatisfyWriteConcern", errmsg: "Not enough data-bearing nodes"}`, on **both** servers — `w: 2` against a one-member set raises rather than silently succeeding. That is the faithful behaviour, and the ruby-gauge `w:2` expected-fail below is a consequence of it. What remains genuinely accept-and-ignore is `j` / `wtimeout` / `w: "majority"` durability semantics, which a single node satisfies trivially.
 - [x] **C-driver (`libmongoc`) change-stream gauge tests — NOW RUNNING.** The
   `/change_stream` + `/change_streams` suites were excluded because the C
   fixture bootstraps them through `test_framework_replset_member_count()`,
@@ -943,7 +957,17 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 - [ ] **Admin UI polish bundle** — small fixes that don't deserve individual entries; address opportunistically when touching nearby code. (Currently no entries — the bundle was cleared in `admin-ui-rest`, May 2026. Drop new ones here as they show up.)
 - [x] **Admin surface for `collMod` / `createCollection` / validators / `renameCollection` / custom-role creation — SHIPPED.** `/db/{db}` grew a create-collection form plus per-row Modify (`collMod`) and Rename (`renameCollection`, including a cross-database `otherdb.name` target and `dropTarget`); `/roles` grew a create form (`createRole`) and a Drop button on custom roles only. Options are one Extended-JSON document rather than a field per option, so a server-version-dependent option set (validators, capped sizing, pre/post images) can't be capped by a stale form. All are PRG with 303 so a refresh can't replay the DDL.
 - [x] **Change-stream page resume-token / `fullDocument` controls — SHIPPED.** `/changestream` now carries `fullDocument`, `fullDocumentBeforeChange`, `resumeAfter`, `startAfter`, `startAtOperationTime` and a pipeline filter, in a collapsed options panel; the `open` frame echoes which options took effect, and each event grew a **Resume from here** button that closes the copy-token loop (the page previously offered "Copy resume token" with nowhere to paste it). Options round-trip through the URL so a shared link reproduces the same stream.
-- [ ] **`validationLevel` is accepted and ignored on BOTH servers** (found 2026-08-11 while adding the admin `collMod` panel). `validationAction` is now honoured end-to-end on both — `warn` / `off` accept the write, `error` rejects with 121, and `collMod` persists both options — but `validationLevel` is only *stored*, never consulted: `"off"` should disable validation entirely and `"moderate"` should exempt documents that were already invalid before the validator existed. Both servers are equally wrong, so parity holds and no gauge regresses; fixing it means touching `_active_validator` in `commands.py` **and** the matching gate in `crates/secantus-commands/src/crud.rs` together, plus `$out`/`$merge` in both `aggregate` layers.
+- [x] **`validationLevel` is honoured on BOTH servers — the 2026-08-11 entry was
+  wrong; re-probed 2026-08-20.** The claim was that the level is stored but never
+  consulted. It is consulted, and correctly. Probed over the wire on both servers:
+  create with `validator: {n: {$gte: 0}}`, `validationAction: "error"`,
+  `validationLevel: "moderate"`; insert a valid doc; sneak an invalid one in under
+  `validationLevel: "off"`; switch back to `moderate`. Updating the **already-valid**
+  doc to an invalid value is rejected with 121, and updating the **already-invalid**
+  doc is accepted — which is exactly mongod's `moderate` rule and is
+  indistinguishable from `strict` only if the level were being ignored. Identical
+  results from the Python server and the Rust binary. `"off"` demonstrably disables
+  validation too (that is how the invalid doc got in). Nothing to fix.
 - [ ] **The SQL / PostgreSQL-wire server has no admin UI at all**, and this is now an explicit scoping decision rather than an accident: `client.check_supported_uri` rejects a `postgresql://` target with a message saying so. If a SQL admin surface is ever wanted it needs its own console — every page here is pymongo-driven.
 - [ ] **`StarletteDeprecationWarning` from fastapi's testclient import** — the six
   admin websocket tests each emit "Using `httpx` with `starlette.testclient` is
@@ -2199,11 +2223,14 @@ session tests + the go harness race below.
   mtest harness under full-gauge load, not suppressible at the runner and not a server bug.
   **Accepted**, same as the Python-server verdict in §5. See the top-section entry for the
   full 2026-06-26 evidence.
-  - [ ] *Minor, separate:* the `secantusdb` binary doesn't accept `--noop-heartbeat-seconds`
-    (stripped by `gauge_common._PYTHON_ONLY_FLAGS` for the Rust server), so the go gauge
-    runs Rust without periodic noop heartbeats. Not the cause here (the `resume_token_
-    updated_on_empty_batch` test that needs it is in the skip list), but worth adding the
-    flag to the binary for gauge parity.
+  - [ ] *Minor, separate — the CAUSE has changed; re-probed 2026-08-20.* The go gauge
+    still runs the Rust server without periodic noop heartbeats, but no longer because
+    the binary lacks the flag: `secantusd-rs --help` lists `--noop-heartbeat-seconds S`,
+    `crates/secantus-server/src/args.rs:268` parses it, and the daemon starts cleanly
+    with it. What still drops it is `gauge_common._PYTHON_ONLY_FLAGS` (line 45), which
+    strips the flag for the Rust server. **The fix is now deleting one line from that
+    set**, not adding a flag to the binary — and then confirming the go gauge still
+    passes with heartbeats on.
 
 ### 7.5 Remaining Rust-server feature gaps (defer audit, 2026-06-26)
 
@@ -3623,7 +3650,7 @@ shared storage engine or building large new protocol subsystems:
   `$reduce` in the group `$project` (`_string_agg_project`) that joins the pushed array skipping NULL
   elements (NULL when all-NULL) — wired into the single-table, join, and grouping-set planners with the
   routing predicates updated. Tests: `tests/test_sql_string_agg.py`.
-- [ ] **Regex / string scalar functions landed** (b129): `regexp_replace(src, pat, repl [,flags])`
+- [x] **Regex / string scalar functions landed** (b129): `regexp_replace(src, pat, repl [,flags])`
   (Python `re.sub`; `g` flag → global, `i`/`m`/`s`/`x` supported; PG `\&` whole-match → Python `\g<0>`,
   `\1`–`\9` pass through), `split_part(str, delim, n)` (1-based; negative counts from the end (PG14+);
   out-of-range → `''`), `translate(str, from, to)` (per-char map; extra `from` chars deleted),
@@ -3636,7 +3663,7 @@ shared storage engine or building large new protocol subsystems:
   yields every match, without it at most the first, and no match / NULL input yields no rows. The scalar
   path (`scalar.py`) is retained for a `regexp_matches` nested inside a larger expression or appearing
   alongside other projections (multi-target-list), where it still returns the first match's `text[]`.
-- [ ] **Math / numeric scalar functions landed** (b130): `trunc(x [,n])` (truncate toward zero;
+- [x] **Math / numeric scalar functions landed** (b130): `trunc(x [,n])` (truncate toward zero;
   numeric), `sqrt` / `cbrt` (real cube root via `copysign` so negatives work), `sign` (−1/0/1,
   operand kind preserved), `ln`, `log(x)` (base-10 in PG) / `log(b, x)` / `log10` (base-10/2 use the
   exact `math.log10`/`log2` so `log10(1000) == 3.0`), `exp`, `pi()`, `degrees`, `radians`,
@@ -3645,7 +3672,7 @@ shared storage engine or building large new protocol subsystems:
   Output types wired in `planner._infer_scalar_tag` (float8 for the transcendental/root funcs,
   numeric for trunc/sign/factorial, int8 for gcd/lcm). `mod` / `power` / `abs` / `ceil` / `floor` /
   `round` were already present.
-- [ ] **Composite types landed** (b131): `CREATE TYPE name AS (field type, …)` stores an ordered
+- [x] **Composite types landed** (b131): `CREATE TYPE name AS (field type, …)` stores an ordered
   `(field, type_tag)` list in the `__sql_composites__` catalog collection (`Catalog.create_composite`
   / `get_composite` / `composite_exists` / `drop_composite` / `list_composites`). A composite-typed
   column carries `composite_type` + `composite_fields` on its `Column` (resolved from the type at
@@ -3657,7 +3684,7 @@ shared storage engine or building large new protocol subsystems:
   record text literal `(f1,f2)` (`typemap._render_pg_composite`, RECORD oid 2249). Reflected via
   `pg_type` (`typtype = 'c'`, oid base 67000 in `virtual._composite_oids`). WHERE/UPDATE access and
   `pg_attribute` reflection landed in b134 (below). **Remaining limitation:** no nested composites.
-- [ ] **Composite type follow-ups landed** (b134): closed the b131 gaps. (1) `(col).field` in a WHERE
+- [x] **Composite type follow-ups landed** (b134): closed the b131 gaps. (1) `(col).field` in a WHERE
   predicate — `planner._composite_access_parts` (Paren-gated `Dot(Paren(Column), Identifier)` so a
   schema-qualified `pg_catalog.x` Dot is never misread) feeds `_field`/`_is_field_node`, lowering to a
   dotted Mongo path `col.field`. (2) UPDATE targets — `SET col.field = v` (`_composite_subfield_target`
@@ -3668,7 +3695,7 @@ shared storage engine or building large new protocol subsystems:
   row per field, so `pg_type.typrelid → pg_class.oid → pg_attribute.attrelid` resolves field names /
   oids (`psql \dT+`, SQLAlchemy). Added the `typrelid` column to the pg_type schema and `reltype` to
   pg_class.
-- [ ] **Nested composite types landed** (b139): a composite type whose own field is another composite,
+- [x] **Nested composite types landed** (b139): a composite type whose own field is another composite,
   closing the b134 gap. Composite field entries became recursive 3-tuples `(name, tag, subfields)` —
   `subfields` is None for a scalar field or the referenced type's fields for a composite field (embedded
   at `CREATE TYPE` time by `engine._composite_fields_from_schema`, which now takes `catalog`/`db` and
@@ -3686,7 +3713,7 @@ shared storage engine or building large new protocol subsystems:
   plus a pg8000 wire test. **Limitation:** pg8000's own record parser mis-splits a *doubly*-nested
   anonymous record on the wire (a client-side limitation — the emitted text is byte-exact Postgres);
   single-level composite fields decode cleanly.
-- [ ] **Statistical + bitwise aggregates landed** (b136): `stddev`/`stddev_samp`/`stddev_pop`,
+- [x] **Statistical + bitwise aggregates landed** (b136): `stddev`/`stddev_samp`/`stddev_pop`,
   `variance`/`var_samp`(=variance)/`var_pop`, and `bit_and`/`bit_or`/`bit_xor` (`every` already aliased
   `bool_and`). Added the dedicated sqlglot nodes to `planner._AGG_CLASSES` (via a version-tolerant
   getattr loop). stddev lowers to Mongo's native `$stdDevSamp`/`$stdDevPop` accumulators (newly
@@ -3701,7 +3728,7 @@ shared storage engine or building large new protocol subsystems:
   resolver), and `every()` is recognised as `bool_and` in `_join_aggregate_of`. **Limitations:**
   `every()`/`bool_and` still require a boolean **column** argument, not a boolean expression; a
   whole-table aggregate over an **empty** table returns no row (pre-existing, except `count`).
-- [ ] **Range types landed** (b137): `int4range`/`int8range`/`numrange`/`tsrange`/`daterange`. A new
+- [x] **Range types landed** (b137): `int4range`/`int8range`/`numrange`/`tsrange`/`daterange`. A new
   self-contained `secantus/sql/ranges.py` (build/parse/render/compare) stores a range as a subdocument
   `{"lower","upper","lower_inc","upper_inc"}` (or `{"empty": true}`); discrete types canonicalise to the
   half-open `[)` form (`(1,10]` → `[2,11)`). Wired through every layer: `typemap` (PG OIDs 3904/3906/3908/
@@ -3719,7 +3746,7 @@ shared storage engine or building large new protocol subsystems:
   SQL surface) and a pg8000 wire test. **Limitations:** the `@>`/`<@`/`&&` operators run a COLLSCAN
   per-row (no lowered Mongo filter / index); multirange types, range GiST indexes, and the extra range
   functions are unimplemented (**range algebra + multirange landed b140, below**).
-- [ ] **Range algebra + multirange landed** (b140): the range set operators and the `range_agg` aggregate
+- [x] **Range algebra + multirange landed** (b140): the range set operators and the `range_agg` aggregate
   + multirange types (`int4multirange`/`int8multirange`/`nummultirange`/`tsmultirange`/`datemultirange`).
   `ranges.py` gained `merge` (range_merge, spans gaps), `intersect` (`*`), `union` (`+`, raises if
   non-contiguous), `difference` (`-`, raises if it splits), `adjacent` (`-|-`), and a multirange layer
@@ -3744,7 +3771,7 @@ shared storage engine or building large new protocol subsystems:
   now unions `_RANGE_TAGS | _MULTIRANGE_TAGS`). Tests: `tests/test_sql_multirange_ops.py`. **Not yet:**
   `range_intersect_agg`, multirange extraction functions, range_agg over a JOIN or GROUPING SETS, and
   range GiST indexes.
-- [ ] **Full-text search landed** (b141): `tsvector` / `tsquery` types + `to_tsvector` / `to_tsquery` /
+- [x] **Full-text search landed** (b141): `tsvector` / `tsquery` types + `to_tsvector` / `to_tsquery` /
   `plainto_tsquery`, the `@@` match operator, and `ts_rank`. New self-contained `secantus/sql/fts.py`:
   `to_tsvector` → `{"tsvector": {lexeme: [pos, …]}}` (lower-cased tokens, English stop-words dropped, 1-based
   positions); `to_tsquery` (a recursive-descent parser over `& | !` + parens) / `plainto_tsquery` →
@@ -3763,7 +3790,7 @@ shared storage engine or building large new protocol subsystems:
   fixed english config, **no stemming** (`cats` ≠ `cat`), `ts_rank` is a match-count not cover-density;
   weights (`:A` / `setweight`), prefix (`cat:*`), phrase (`<->`), `ts_headline`, and GIN/GiST FTS indexes
   are out of scope.
-- [ ] **Network address types landed** (b142): `inet` / `cidr` / `macaddr` types, the `<<` / `>>` / `&&`
+- [x] **Network address types landed** (b142): `inet` / `cidr` / `macaddr` types, the `<<` / `>>` / `&&`
   subnet-containment/overlap operators, and the `host` / `masklen` / `network` / `netmask` / `broadcast` /
   `abbrev` / `family` / `hostmask` accessor functions. New self-contained `secantus/sql/net.py` stores values
   as canonical text (`inet`/`cidr` as `addr/masklen`, `macaddr` as `xx:xx:xx:xx:xx:xx`) and parses with
@@ -3779,7 +3806,7 @@ shared storage engine or building large new protocol subsystems:
   `tests/test_sql_net.py` (29: pure net + SQL surface) plus a pg8000 wire test. **Simplifications:** the `<<=`
   / `>>=` (contain-or-equal) operators aren't parsed by sqlglot, and `inet ± int` arithmetic, `macaddr8`, and
   GiST network indexes are out of scope.
-- [ ] **Bit-string types landed** (b143): `bit(n)` / `varbit` types, `B'…'` literals, the bitwise operators
+- [x] **Bit-string types landed** (b143): `bit(n)` / `varbit` types, `B'…'` literals, the bitwise operators
   `&` / `|` / `#` / `~` / `<<` / `>>`, `||` concat, and `length` / `bit_length` / `octet_length` / `get_bit` /
   `set_bit` plus `int`↔`bit` casts. New self-contained `secantus/sql/bitstr.py` stores values as a canonical
   '0'/'1' string; `normalize` pads/truncates, `from_int`/`to_int`, `band`/`bor`/`bxor`/`bnot`,
@@ -3796,7 +3823,7 @@ shared storage engine or building large new protocol subsystems:
   (declared length not tracked at storage — only explicit `::bit(n)` casts pad); a stored bit column can't be
   re-read via `::int` (only a `B'…'` literal or `::bit` cast is treated as a bit source); bit indexes are out
   of scope.
-- [ ] **Interval type landed** (b144): the `interval` type (stored as `{"interval": {"months", "days",
+- [x] **Interval type landed** (b144): the `interval` type (stored as `{"interval": {"months", "days",
   "micros"}}`), interval literals (`interval '1 day'` / `'1 year 2 mons 3 days 04:05:06'` / `interval '1'
   day`), interval/date arithmetic (`interval ± interval`, `interval * n`, `date ± interval`, `timestamp -
   timestamp -> interval`, unary `-`), and the functions `make_interval` / `justify_days` / `justify_hours` /
@@ -3812,7 +3839,7 @@ shared storage engine or building large new protocol subsystems:
   FROM-less interval funcs. Tests: `tests/test_sql_interval.py` (22: pure intervals + SQL surface) plus a
   pg8000 wire test. **Simplifications:** days are treated as 24h (no DST-aware arithmetic), the verbose `@`
   input grammar (beyond a trailing `ago`) isn't parsed, and interval indexes are out of scope.
-- [ ] **Full-text search follow-ups landed** (b145): prefix (`cat:*`), phrase (`foo <-> bar` / `foo <N> bar`),
+- [x] **Full-text search follow-ups landed** (b145): prefix (`cat:*`), phrase (`foo <-> bar` / `foo <N> bar`),
   `phraseto_tsquery`, and `ts_headline` added to `secantus/sql/fts.py`. The `_TSQueryParser` gained a
   `_parse_phrase` level (phrase binds between `&` and factor) and a `:*` prefix suffix; `matches` / `ts_rank`
   now walk token positions (`_end_positions` / `_phrase_positions` / `_count_hits`) so adjacency queries work
@@ -3824,7 +3851,7 @@ shared storage engine or building large new protocol subsystems:
   queries. Tests: `tests/test_sql_fts.py` (+14, now 33) plus a pg8000 wire test. **Simplifications:**
   `ts_headline` returns the whole document (no fragment windowing), and lexeme weights (`:A` / `setweight` /
   weighted `ts_rank`) remain out of scope (the tsvector stores no per-lexeme weight).
-- [ ] **UUID type landed** (b146): the `uuid` type + `gen_random_uuid()` / `uuid_generate_v4()` /
+- [x] **UUID type landed** (b146): the `uuid` type + `gen_random_uuid()` / `uuid_generate_v4()` /
   `uuid_generate_v1()` generators, uuid literals / casts (hyphenated, bare-hex, and `{braced}` forms all
   canonicalise to the lower-case hyphenated string), and equality / ordering that lower to a Mongo filter (no
   per-row eval — the value stores as its canonical string). New self-contained `secantus/sql/uuidtype.py`
@@ -3838,7 +3865,7 @@ shared storage engine or building large new protocol subsystems:
   SQL surface) plus a pg8000 wire test. **Simplifications:** only v4 (random) UUIDs are generated
   (`uuid_generate_v1` returns a v4, not a real time-based v1); no `uuid-ossp` namespace functions
   (`uuid_generate_v3` / `v5`).
-- [ ] **date / time / timetz distinct types landed** (b147): `date` / `time` / `timetz` are now distinct
+- [x] **date / time / timetz distinct types landed** (b147): `date` / `time` / `timetz` are now distinct
   types (previously `date` collapsed to `timestamptz`), reporting the correct wire OIDs (1082 / 1083 / 1266)
   for driver/ORM reflection. New self-contained `secantus/sql/datetimes.py` stores them as canonical text
   (`date` `YYYY-MM-DD`, `time` `HH:MM:SS[.ffffff]`, `timetz` with an offset) — BSON has no date-only /
@@ -3855,7 +3882,7 @@ shared storage engine or building large new protocol subsystems:
   plus a pg8000 wire test. **Simplifications:** `time(p)` precision isn't rounded, `timetz` preserves the
   literal's offset without converting, and mixing a bare `timestamp` with a `date` in one arithmetic
   expression isn't supported (cast one side).
-- [ ] **money type + to_char numeric formatting landed** (b148): the `money` type (OID 790, stored as a
+- [x] **money type + to_char numeric formatting landed** (b148): the `money` type (OID 790, stored as a
   2-decimal `Decimal128`, rendered `$1,234.56`) with literals / casts (`'$1,234.56'::money`, `(1234.56)` →
   negative) and arithmetic (`money ± money` / `money * n` → money, `money / money` → float8); plus numeric
   `to_char(numeric, fmt)` supporting `9` / `0` / `.` / `,` / `$` / `L` / `S` / `MI` / `PR` / `FM`. New
@@ -3870,7 +3897,7 @@ shared storage engine or building large new protocol subsystems:
   `$`-only currency (no locale), `to_char` omits `EEEE` / `RN` / `V` / `TH` / non-ASCII locale patterns, and
   `ORDER BY` on a money/decimal *column* relies on the storage engine's sort (the in-memory `FakeStorage`
   can't compare raw `Decimal128`).
-- [ ] **Geometric types landed** (b149): the core Postgres geometric types `point` / `box` / `circle` /
+- [x] **Geometric types landed** (b149): the core Postgres geometric types `point` / `box` / `circle` /
   `polygon` / `lseg` (and the `line` / `path` spellings — stored/canonicalised but not operated on), stored as
   their canonical Postgres text (`(1,2)`, `(2,2),(0,0)`, `<(0,0),5>`, `((0,0),(1,0),(1,1))`, `[(0,0),(1,1)]`),
   with the operators `<->` (distance → float8), `@>` (contains) / `<@` (contained by) / `&&` (overlaps) → bool.
@@ -3885,7 +3912,7 @@ shared storage engine or building large new protocol subsystems:
   `tests/test_sql_geo.py` (19: pure pggeo + SQL surface) plus a pg8000 wire test. **Out of scope:** the infinite
   `line` type and open/closed `path` distinction for operators, the `#` / `##` / `?-` / `?|` positional operators,
   and geometric indexes.
-- [ ] **bytea functions + literal forms landed** (b150): the `bytea` binary type already round-tripped (OID 17,
+- [x] **bytea functions + literal forms landed** (b150): the `bytea` binary type already round-tripped (OID 17,
   `coerce` → `bson.Binary`, `to_py` → `bytes`, `to_pg_text` → the `\x…` hex form); this slice adds the literal
   parsing and function surface. New self-contained `secantus/sql/bytea.py` (`parse` — hex `\x…` **and** escape form;
   `encode` / `decode` for `hex` / `base64` / `escape`; `get_byte` / `set_byte`; `concat`). Wired through `typemap`
@@ -3898,7 +3925,7 @@ shared storage engine or building large new protocol subsystems:
   Tests: `tests/test_sql_bytea.py` (27: pure bytea + SQL surface) plus a pg8000 wire test. **Out of scope:** the
   `bytea_output = escape` server setting (output is always hex) and the digest functions (`md5`/`sha256`, crypto
   extensions).
-- [ ] **hstore key/value type landed** (b153): the `hstore` contrib type — a flat string→string map (NULL values
+- [x] **hstore key/value type landed** (b153): the `hstore` contrib type — a flat string→string map (NULL values
   allowed), stored as a **tagged** subdocument `{"hstore": {…}}` so it stays distinct from a plain `jsonb` object
   (the `->` / `@>` / `<@` / `?` / `?&` / `?|` / `||` operators are all spelled the same as jsonb's). New
   self-contained `secantus/sql/hstore.py` (`parse` / `render` / `is_hstore` / `as_map`; the operators
@@ -3915,7 +3942,7 @@ shared storage engine or building large new protocol subsystems:
   filter). Tests: `tests/test_sql_hstore.py` (25: pure hstore + SQL surface) plus a pg8000 wire test. **Out of
   scope:** the set-returning `each`/`skeys`/`svals` forms (the `akeys`/`avals` arrays cover the need), GiST/GIN
   indexing, and the `#=`/`%%`/`%#` record operators.
-- [ ] **citext case-insensitive text landed** (b154): the `citext` contrib type — text stored verbatim (case
+- [x] **citext case-insensitive text landed** (b154): the `citext` contrib type — text stored verbatim (case
   preserved for display) but compared / sorted case-insensitively. The case-folding is a **query-planner behaviour**,
   not a value shape (a citext value is an ordinary string, so it can't be tagged like hstore without breaking text
   rendering) — so it's driven off the column's `type_tag == "citext"`. Wired through `typemap` (OID 25 / the text OID
@@ -3928,7 +3955,7 @@ shared storage engine or building large new protocol subsystems:
   `SELECT DISTINCT` on a citext column group case-**sensitively** (`Alice` ≠ `alice`), unlike real Postgres — the
   dominant citext uses (case-insensitive equality / uniqueness / range / sort) are faithful, but case-folding
   aggregation grouping isn't wired yet. citext indexing is out of scope.
-- [ ] **xml type + basic functions landed** (b155): the `xml` type (real builtin, OID 142) stored as its text and
+- [x] **xml type + basic functions landed** (b155): the `xml` type (real builtin, OID 142) stored as its text and
   validated well-formed on cast / coerce, plus the constructor / extraction functions. New self-contained
   `secantus/sql/xmltype.py` (`is_well_formed` / `parse` / `element` / `forest` / `concat` / `xpath`); XML parsing +
   serialization go through the stdlib `xml.etree.ElementTree` (no external dep; external entities disabled → no XXE).
@@ -3942,7 +3969,7 @@ shared storage engine or building large new protocol subsystems:
   `text()` / `@attr` step, a leading `//tag` descendant search) — not full XPath 1.0 (no namespaces / predicates /
   functions); the `xmltable` table function, the `xmlagg` aggregate, and the document/content-node distinction are
   out of scope.
-- [ ] **Full-text search ranking landed** (b166): two parts. (1) **`websearch_to_tsquery`** (`secantus/sql/fts.py`)
+- [x] **Full-text search ranking landed** (b166): two parts. (1) **`websearch_to_tsquery`** (`secantus/sql/fts.py`)
   — parses a web-search-style query (bare words AND'd, `"quoted phrases"` → adjacency via `phraseto_tsquery`, the
   bare word `or` → OR, leading `-` → NOT); registered in the four FTS dispatch sites (scalar `_call_func`, planner
   value-expr + `_infer_scalar_tag` → tsquery, `functions._SCALAR_EVAL_ANON`). (2) **ORDER BY output-alias
@@ -3953,7 +3980,7 @@ shared storage engine or building large new protocol subsystems:
   The rest of the FTS ranking surface already existed: `ts_rank` / `ts_rank_cd`, `ts_headline`, `phraseto_tsquery`,
   and `ORDER BY ts_rank(…)` (repeated expression). **Simplifications (unchanged):** `ts_rank_cd` == `ts_rank` (a
   monotonic match-count, not cover-density); fixed config; no stemming; no lexeme weights.
-- [ ] **generate_series + base-less FROM-clause SRFs landed** (b163): a set-returning function as the *whole* row
+- [x] **generate_series + base-less FROM-clause SRFs landed** (b163): a set-returning function as the *whole* row
   source. New `secantus/sql/srf.py`: `from_source` (a base-less `FROM generate_series(…)` / `FROM unnest(…)` /
   `jsonb_array_elements` / `jsonb_object_keys` / `regexp_split_to_table`, incl. `WITH ORDINALITY` and `AS t(cols)`)
   and `fromless_projection` (a bare `SELECT generate_series(…)`). `engine._run_srf_select` materializes the generated
@@ -3970,7 +3997,7 @@ shared storage engine or building large new protocol subsystems:
   a base-less SRF isn't supported yet (the SRF path uses `plan_select`, not the pipeline planner) — wrap in a
   subquery/CTE or generate into a table first. The `FROM t, <srf>(…)` *join* form is unchanged (pipeline planner's
   `_unnest_join_stage`).
-- [ ] **SQL functions (CREATE FUNCTION) landed** (b162): `CREATE [OR REPLACE] FUNCTION name(params) RETURNS t AS $$
+- [x] **SQL functions (CREATE FUNCTION) landed** (b162): `CREATE [OR REPLACE] FUNCTION name(params) RETURNS t AS $$
   body $$ LANGUAGE sql` + `DROP FUNCTION`. sqlglot parses these as `exp.Create`/`exp.Drop` with `kind=FUNCTION`
   (body = a `Heredoc` for `$$…$$` or a string `Literal`). `catalog.put_function`/`get_function`/`drop_function`
   persist to a new `__sql_functions__` collection keyed `name/nargs` (overload by arity). `engine._create_function`
@@ -3997,7 +4024,7 @@ shared storage engine or building large new protocol subsystems:
   limitation). **Still simplifications:** a *multi-statement* `LANGUAGE sql` body is still rejected (deferred — the
   other flagged site at `engine._create_function`); a set-returning (`SETOF`/`TABLE`) function yields only its first
   row in a scalar context.
-- [ ] **Arrays of the new types + array ops landed** (b161): two parts. (1) **Array type OIDs** — `typemap._ARRAY_PG_OID`
+- [x] **Arrays of the new types + array ops landed** (b161): two parts. (1) **Array type OIDs** — `typemap._ARRAY_PG_OID`
   gains the real Postgres array-type OIDs for the newer element types (`uuid[]` 2951, `inet[]`/`cidr[]`/`macaddr[]`,
   `date[]`/`time[]`/`timetz[]`, `interval[]`, `bit[]`/`varbit[]`, `money[]`, `xml[]`, `json[]`→jsonb 3807, the
   geometric arrays, and the range arrays), so a driver decodes the elements natively (pg8000 gives a `uuid[]` back as
@@ -4010,7 +4037,7 @@ shared storage engine or building large new protocol subsystems:
   an array-typed operand. Tests: `tests/test_sql_array_ops.py` (10) + a pg8000 wire test. **Simplifications:** array
   element equality is Python `==` (no cross-type array coercion beyond the element coerce); `citext[]` / `hstore[]`
   fall back to the text array OID (those element types have no fixed catalog OID); arrays stay one level deep.
-- [ ] **EXPLAIN for the SQL layer landed** (b158): `EXPLAIN [ANALYZE] [(options)] <statement>` returns a `QUERY
+- [x] **EXPLAIN for the SQL layer landed** (b158): `EXPLAIN [ANALYZE] [(options)] <statement>` returns a `QUERY
   PLAN` text column. New `secantus/sql/explain.py`: `parse_options` splits the tail (both the bare `EXPLAIN ANALYZE
   VERBOSE <stmt>` word form and the parenthesised `(ANALYZE, FORMAT JSON)` form); `_build_node` walks the parsed
   statement into a plan-node dict; `_text_lines` / `_json_node` render the indented tree or Postgres' single-row
@@ -4026,7 +4053,7 @@ shared storage engine or building large new protocol subsystems:
   actual rows but no per-node timing; `BUFFERS`/`SETTINGS`/`COSTS`/`TIMING` accepted-and-ignored; only `FORMAT
   TEXT`/`JSON` (others → `0A000`); pipeline-query plans name the top operation coarsely rather than reproducing
   Postgres' full plan-node tree.
-- [ ] **PREPARE / EXECUTE / DEALLOCATE landed** (b157): SQL-level prepared statements on the session. `PREPARE name
+- [x] **PREPARE / EXECUTE / DEALLOCATE landed** (b157): SQL-level prepared statements on the session. `PREPARE name
   [(argtypes)] AS <query>` parses the query (with its `$N` placeholders) and stashes `(query_ast, param_count)` on
   the new `Session.prepared` dict; `EXECUTE name [(args)]` parses the args (`SELECT <args>` wrapper → expression
   nodes), substitutes them for the `$N` `exp.Parameter` nodes (`_bind_parameter_nodes`, node-for-node so casts /
@@ -4040,7 +4067,7 @@ shared storage engine or building large new protocol subsystems:
   Distinct from the extended wire protocol's Parse/Bind portals (`pgextended.py`) — a driver's own `%s` binding
   never touches these. Tests: `tests/test_sql_prepare.py` (14) + a pg8000 wire test. **Simplification:** unquoted
   statement names aren't folded to lower case (matches the existing DECLARE CURSOR name handling).
-- [ ] **LISTEN / NOTIFY / UNLISTEN landed** (b156): cross-connection async pub/sub on the PG wire server. New
+- [x] **LISTEN / NOTIFY / UNLISTEN landed** (b156): cross-connection async pub/sub on the PG wire server. New
   `secantus/sql/pgnotify.py` (`NotifyHub` — a server-wide channel → listening-session registry, keyed by
   `id(session)` since `Session` is an unhashable dataclass). New `pgwire.notification_response` ('A'). `Session`
   gains `notify_hub`, a thread-safe inbound `_notify_deliveries` deque (drained by the owning connection thread —
@@ -4058,7 +4085,7 @@ shared storage engine or building large new protocol subsystems:
   a two-connection pg8000 wire test. **Simplifications:** duplicate `(channel, payload)` notifications in one txn
   aren't collapsed (Postgres collapses them); LISTEN/UNLISTEN take effect immediately, not at commit; and there is
   no out-of-band async push to a fully-idle connection (notifications ride the next query response).
-- [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
+- [x] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same
   `$push` array and are already typed `json` here) so every group-plan + detection site lights up
@@ -4076,7 +4103,7 @@ shared storage engine or building large new protocol subsystems:
   record SRF — the current SRF executor emits a single value per row, so a multi-column record SRF
   needs an executor change); `FILTER (WHERE …)` on the jsonb aggregates; the default output label for
   an un-aliased `jsonb_agg` is `array_agg` (cosmetic).
-- [ ] **SQL/JSON path queries landed** (b135): a compact `jsonpath` evaluator in `secantus/sql/jsonpath.py`
+- [x] **SQL/JSON path queries landed** (b135): a compact `jsonpath` evaluator in `secantus/sql/jsonpath.py`
   (tokenizer + recursive-descent parser + evaluator) powering `jsonb_path_query` / `jsonb_path_query_array`
   / `jsonb_path_exists` / `jsonb_path_match` (via `scalar._call_func`) and the `@?` (`exp.JSONBPathExists`)
   / `@@` (`exp.MatchAgainst` — sqlglot puts the path in `this`, the doc in `expressions[0]`) operators
@@ -4090,7 +4117,7 @@ shared storage engine or building large new protocol subsystems:
   genuinely set-returning in PG but returns only the **first** match in a scalar SELECT (use
   `jsonb_path_query_array` for the set); `@?`/`@@` in a WHERE predicate go through the scalar path
   (COLLSCAN), not a lowered Mongo filter.
-- [ ] **Date/time scalar functions landed** (b132): `extract(field FROM ts)` / `date_part('field', ts)`
+- [x] **Date/time scalar functions landed** (b132): `extract(field FROM ts)` / `date_part('field', ts)`
   (year/month/day/hour/minute/second/quarter/dow[Sun=0]/isodow[Mon=1]/doy/week/epoch → numeric),
   `date_trunc('unit', ts)` (year/quarter/month/week[→Monday]/day/hour/minute/second → timestamptz),
   `to_char(ts, fmt)` (text), interval arithmetic `ts ± interval '…'`, and `now()` / `current_timestamp`
@@ -4105,7 +4132,7 @@ shared storage engine or building large new protocol subsystems:
   `to_char` full weekday names (`Day`/`Dy`) mis-render because sqlglot greedily eats the leading `D`
   during normalisation; date/time functions in a `WHERE` predicate go through COLLSCAN + the scalar
   path (not lowered to a Mongo filter), same as other computed predicates.
-- [ ] **String round-out scalar functions landed** (b133): `lpad`/`rpad` (pad or truncate to a length,
+- [x] **String round-out scalar functions landed** (b133): `lpad`/`rpad` (pad or truncate to a length,
   default fill space), `left`/`right` (prefix/suffix; a negative count drops from the far end — `left`
   via `s[:n]`, `right` via `s[-i:]` with an `i==0 → ''` guard), `repeat`, `reverse`, `initcap`
   (`str.title()`), `ascii`/`chr`, `position(sub IN str)` / `strpos(str, sub)` (1-based, 0 if absent),
@@ -4114,7 +4141,7 @@ shared storage engine or building large new protocol subsystems:
   reverse/initcap/chr/overlay → text; ascii/strpos/position → int4). **Limitation:** `initcap` uses
   Python `str.title()`, which matches Postgres for ASCII words but can differ on apostrophes
   (`"o'brien"` → `"O'Brien"` vs PG `"O'Brien"` — same here, but exotic Unicode word boundaries may drift).
-- [ ] **Aggregate in-call `ORDER BY` landed** (b128): `array_agg(x ORDER BY y [DESC])` /
+- [x] **Aggregate in-call `ORDER BY` landed** (b128): `array_agg(x ORDER BY y [DESC])` /
   `string_agg(x, sep ORDER BY y)` order the aggregated values. sqlglot keeps the ORDER BY as an
   `exp.Order` wrapping the value (the old "sqlglot drops it" note was wrong). `planner._agg_order_spec`
   unwraps it into `(value, [(key, direction, nulls_first), …])`; `_sorted_agg_push` emits a `$push` of
@@ -4132,7 +4159,7 @@ shared storage engine or building large new protocol subsystems:
   materialization (`_run_subplan_to_docs`) so the `{v, k}` push pairs never leak — this also closed a
   latent b127 gap where an ordered-set agg inside a derived table (e.g. SQLAlchemy's index reflection,
   which does `array_agg(attname ORDER BY …)` over a derived table) leaked its raw pushed array.
-- [ ] **Ordered-set aggregates landed** (b127): `percentile_cont(f)` / `percentile_disc(f)` / `mode()`
+- [x] **Ordered-set aggregates landed** (b127): `percentile_cont(f)` / `percentile_disc(f)` / `mode()`
   via `WITHIN GROUP (ORDER BY expr)` (sqlglot `exp.WithinGroup`). `planner._ordered_set_agg` detects them
   (wired into `select_needs_pipeline` + the two `has_aggregate` routing predicates); `_plan_group_select`
   collects the ORDER BY values into a `$push` accumulator and records a `PipelineSelectPlan.post_aggregates`
@@ -4144,7 +4171,7 @@ shared storage engine or building large new protocol subsystems:
   engine has no `$sortArray`.) **Not supported:** ordered-set aggs over a JOIN (single-table + whole-table
   only), and — like all pipeline aggregates — a whole-table aggregate over zero input rows returns no row
   rather than one NULL row.
-- [ ] **WHERE: column-to-column + arithmetic + non-correlated subqueries landed.** `column OP
+- [x] **WHERE: column-to-column + arithmetic + non-correlated subqueries landed.** `column OP
   literal` keeps the indexable `{field: {op: val}}` fast path. A comparison where neither side is
   a constant — `qty > shipped`, `price < cost * 1.5` — lowers to a Mongo `{$expr: {$op: [...]}}`
   (`planner._to_agg_expr`), with `+`/`-`/`*`/`/` arithmetic over columns and literals nesting
@@ -4183,7 +4210,7 @@ shared storage engine or building large new protocol subsystems:
   used as a *pushdown* filter (`WHERE amt = abs(target)`) works in GROUP BY / JOIN pipelines too (it
   rides the shared `_expr_to_filter` / `_to_agg_expr` lowering, same as the single-table path; an
   unlowerable function like `substr` stays `0A000`). Still `0A000`: `<@`-style structural predicates.
-- [ ] **`RETURNING` landed** (b46). `INSERT` / `UPDATE` / `DELETE … RETURNING <proj>` projects the
+- [x] **`RETURNING` landed** (b46). `INSERT` / `UPDATE` / `DELETE … RETURNING <proj>` projects the
   affected rows back as a result set (`planner._returning_columns` reuses the SELECT projection
   vocabulary `_out_columns`: `*`, columns, aliases, jsonb nav). `execute_insert` pins an `_id` on
   each doc before insert so the in-hand list is the authoritative inserted set; `execute_update`
@@ -4195,7 +4222,7 @@ shared storage engine or building large new protocol subsystems:
   against a scope over that row (arithmetic, `||`, function calls, `CASE`, …). Works for INSERT /
   UPDATE (post-image) / DELETE and `INSERT … ON CONFLICT`. A subquery inside `RETURNING` isn't
   supported (the eval ctx has no catalog/session).
-- [ ] **Set operations landed** (b47). `UNION` / `INTERSECT` / `EXCEPT` (+ `ALL` variants, chained)
+- [x] **Set operations landed** (b47). `UNION` / `INTERSECT` / `EXCEPT` (+ `ALL` variants, chained)
   in `engine._run_set_operation`: each arm runs through the full SELECT path, rows are combined
   with multiset semantics (`_combine_setop_rows` / `_multiset_filter` — DISTINCT collapses to set
   semantics, `ALL` keeps min-count for INTERSECT / left-minus-right for EXCEPT), output columns
@@ -4212,7 +4239,7 @@ shared storage engine or building large new protocol subsystems:
   (columns/types taken verbatim from the first arm); a set-op / `VALUES` `ORDER BY` accepts only an
   output-column name or ordinal, not an arbitrary expression (`42703`) — Postgres rejects the latter too.
   (`VALUES` as a FROM-clause derived table is a separate, still-open path.)
-- [ ] **Non-recursive CTEs landed** (b49). `WITH name AS (...) [, ...] <query>` in
+- [x] **Non-recursive CTEs landed** (b49). `WITH name AS (...) [, ...] <query>` in
   `engine._run_with`: each CTE is materialized to rows (run through `_run_query`) and registered as
   an ephemeral collection on a `CatalogBackend`, with a `_CTECatalog` overlay mapping CTE names to
   TableDefs built from each inner query's result shape; the `WITH` is stripped (`node.pop()`) and the
@@ -4242,7 +4269,7 @@ shared storage engine or building large new protocol subsystems:
   before an `INSERT`/`UPDATE`/`DELETE` also works (the recursive CTE materializes first, then the write
   body dispatches). Not modeled: statement-level snapshot semantics (each data-modifying CTE sees the
   effects of earlier ones rather than a single pre-statement snapshot) and `WITH CHECK OPTION`.
-- [ ] **`INSERT … SELECT` landed** (b50). `INSERT INTO t [(cols)] SELECT …` routes through
+- [x] **`INSERT … SELECT` landed** (b50). `INSERT INTO t [(cols)] SELECT …` routes through
   `engine._run_insert`: the source query (a SELECT / set operation; may join / aggregate / CTE) runs
   via `_run_query`, and its result rows map positionally onto the target columns through the shared
   `planner._insert_doc` (same coercion / NOT NULL / PK→`_id` path as VALUES, factored out alongside
@@ -4250,7 +4277,7 @@ shared storage engine or building large new protocol subsystems:
   `RETURNING` works (the source is materialized first, so a self-insert reads a stable snapshot).
   A leading `WITH` before an `INSERT` / `UPDATE` / `DELETE` / **`MERGE`** (b204, #169 added MERGE) all
   work — the CTEs materialise, then the write runs against the CTE-aware backend + catalog overlay.
-- [ ] **Window functions landed** (b51). `func(...) OVER (PARTITION BY … ORDER BY …)` routes through
+- [x] **Window functions landed** (b51). `func(...) OVER (PARTITION BY … ORDER BY …)` routes through
   the evaluated-select path (a window expr already trips `_stmt_needs_evaluation`). `secantus.sql.window`
   computes each window over the fetched rows — partition (repr-keyed groups), order within partition
   (stable multi-key sort), then apply the function — and stores the value on each doc under a synthetic
@@ -4285,7 +4312,7 @@ shared storage engine or building large new protocol subsystems:
   landed everywhere** (b208): the simple pushdown path resolves a standalone output alias to its input
   column (`_rewrite_order_by_aliases`, a real column of the same name wins per Postgres precedence);
   the evaluated / group-window paths already resolved aliases.
-- [ ] **`INSERT … ON CONFLICT` landed** (b52). `INSERT … ON CONFLICT (cols) DO NOTHING | DO UPDATE SET …
+- [x] **`INSERT … ON CONFLICT` landed** (b52). `INSERT … ON CONFLICT (cols) DO NOTHING | DO UPDATE SET …
   [WHERE …]` via `planner._plan_on_conflict` (an `OnConflict` on `InsertPlan`) + `executor.
   _execute_insert_on_conflict`: each proposed row probes the conflict target with `find_matching`; a
   clean row inserts, a conflicting row is skipped (`DO NOTHING`) or updated in place (`DO UPDATE`). SET
@@ -4297,7 +4324,7 @@ shared storage engine or building large new protocol subsystems:
   `_fields_for_constraint` resolves the name against the table's `unique_constraints` (by name) or the
   primary key (by its Postgres default name `<table>_pkey`) to the arbiter's storage fields; an unknown
   name raises `42704`. **Still unsupported:** `DO UPDATE` with no conflict target (→ `42601`).
-- [ ] **`MERGE` landed** (b74). `MERGE INTO target [alias] USING source [alias] ON <cond> WHEN [NOT]
+- [x] **`MERGE` landed** (b74). `MERGE INTO target [alias] USING source [alias] ON <cond> WHEN [NOT]
   MATCHED [AND <cond>] THEN UPDATE SET … | DELETE | INSERT [(cols)] VALUES (…) | DO NOTHING` via
   `engine._run_merge`. Per source row it scans the target snapshot (loaded once at MERGE start) for rows
   the `ON` condition matches, then applies the first `WHEN` of the right kind whose optional `AND`
@@ -4325,7 +4352,7 @@ shared storage engine or building large new protocol subsystems:
   (RESTRICT / CASCADE / SET NULL) fire via `executor._enforce_fk_on_parent_update` when the referenced
   column changes — mirroring the plain UPDATE re-key path (#157). **Limitations:** an unqualified column
   ambiguous between target and source resolves to the target.
-- [ ] **Join DML landed (#162/#163, b199).** `DELETE FROM t USING src[, …] WHERE <join>` and
+- [x] **Join DML landed (#162/#163, b199).** `DELETE FROM t USING src[, …] WHERE <join>` and
   `UPDATE t SET … FROM src[, …] WHERE <join>` bring in other tables. `engine._run_statement` routes an
   UPDATE with `args["from_"]` → `_run_update_from` and a DELETE with `args["using"]` → `_run_delete_using`.
   Both collect source rows via `_collect_dml_sources` (reusing `_merge_source`, so a source may be a table
@@ -4339,7 +4366,7 @@ shared storage engine or building large new protocol subsystems:
   silently ignored — `DELETE … USING` deleted every target row (data-loss bug).** Limitations: a target
   row matched by multiple sources still updates from the *first* combination (Postgres leaves this
   unspecified); no self-join of the target back into the source list.
-- [ ] **Small cleanups landed** (b58). (1) A FROM-less `SELECT` now evaluates constant *expressions*
+- [x] **Small cleanups landed** (b58). (1) A FROM-less `SELECT` now evaluates constant *expressions*
   (arithmetic, `||`, function calls, `CASE` …) via `scalar.evaluate` against an empty scope
   (`_const_scope`), not just bare literals + info functions; (2) a FROM-less `SELECT … WHERE <const>`
   is honoured — a false predicate yields zero rows (`ConstantSelectPlan.emit`), so a recursive-CTE
@@ -4347,7 +4374,7 @@ shared storage engine or building large new protocol subsystems:
   (contained-by) operator lands in its pushable `const <@ field` form (== `field @> const`,
   `_jsonb_contains_filter`); the reverse `field <@ const` (subset-of-a-constant) form now runs as a
   COLLSCAN + residual — **landed in #149, b191 (see the jsonb-functions entry above).**
-- [ ] **WHERE subqueries in the pipeline paths landed** (b59). The single-table pushdown always threaded
+- [x] **WHERE subqueries in the pipeline paths landed** (b59). The single-table pushdown always threaded
   a `SubqueryCtx`, but the pipeline planners (JOIN / GROUP BY / evaluated / DISTINCT) called
   `_where_filter` from many places without one, so a WHERE scalar/`IN` subquery there was `0A000`.
   `plan_pipeline_select` now publishes the context via a planning-scoped `contextvars.ContextVar`
@@ -4365,7 +4392,7 @@ shared storage engine or building large new protocol subsystems:
   (`_select_projects_subquery`) routes to the evaluated group path. The one remaining gap is a correlated
   subquery in **HAVING** (`HAVING agg > (SELECT … WHERE t.k = outer.k)`) → `0A000`, since HAVING lowers to
   a post-`$group` `$match` with no per-group subquery evaluation.
-- [ ] **`ORDER BY` NULL placement landed** (b54). Postgres orders NULL as the largest value (ASC →
+- [x] **`ORDER BY` NULL placement landed** (b54). Postgres orders NULL as the largest value (ASC →
   NULLs last, DESC → NULLs first) with `NULLS FIRST`/`NULLS LAST` overriding; Mongo sort treats
   NULL/missing as the *smallest*, so the SQL layer no longer delegates NULL placement to storage.
   `planner._nulls_first` reads sqlglot's per-term flag (already PG-defaulted); the single-table,
@@ -4376,7 +4403,7 @@ shared storage engine or building large new protocol subsystems:
   (`planner._emit_pipeline_sort`), then `$unset`. **Note:** index-accelerated ORDER BY+LIMIT pushdown
   no longer applies to a single-table ordered SELECT (correctness over the storage-side sort
   optimisation — the SQL layer is a dev/test surface).
-- [ ] **Array columns landed** (b111). A `<type>[]` column stores a native BSON array; `ARRAY[…]` and
+- [x] **Array columns landed** (b111). A `<type>[]` column stores a native BSON array; `ARRAY[…]` and
   `'{…}'` literals coerce in (`typemap._parse_pg_array_literal` / `coerce`), results render as Postgres
   array text (`_render_pg_array`) with the array type OID in `PG_OID` so a driver decodes back to a list.
   `<value> = ANY(col)` → array membership, `col @> ARRAY[…]` → containment (reuses the jsonb `$all` path),
@@ -4416,9 +4443,14 @@ shared storage engine or building large new protocol subsystems:
   **Remaining unnest limitations:** the base-less form (`FROM unnest(ARRAY[…])` with no other table) →
   `42703` (use the SELECT-list `SELECT unnest(…)` form); `WITH ORDINALITY` and multi-array `unnest(a, b)`
   unsupported.
-- [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
-  `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
-- [ ] **Composite primary keys landed** (b117): a `PRIMARY KEY (a, b)` maps to a subdocument `_id: {a, b}`
+- [x] ~~**No transactions, no parameters, no prepared statements.**~~ All three shipped;
+  this was a P0-spike survey line that outlived its subject (verified 2026-08-20).
+  `BEGIN`/`INSERT`/`ROLLBACK` really rolls back on a real WT user-transaction (probe:
+  0 rows after), `PREPARE p (int) AS SELECT … WHERE id = $1` + `EXECUTE p (1)` returns
+  the row, and the extended query protocol is the pgserver's normal path. Live detail
+  is in "Transactions: single-connection atomicity; savepoints are real" and
+  "PREPARE / EXECUTE / DEALLOCATE landed (b157)" further down this section.
+- [x] **Composite primary keys landed** (b117): a `PRIMARY KEY (a, b)` maps to a subdocument `_id: {a, b}`
   (each PK column's `Column.field` is `_id.<name>`), so uniqueness rides the storage `_id` index exactly
   like a single-column PK. `planner._with_pk` maps the fields; `_insert_doc` builds the `_id` subdoc via
   `set_path` and `_canonicalize_composite_id` fixes its key order to the PK declaration order (Mongo treats
@@ -4437,7 +4469,7 @@ shared storage engine or building large new protocol subsystems:
   renaming a composite-PK column via `ALTER TABLE` doesn't rewrite the `_id.<name>` subdoc key (edge case);
   a SERIAL/identity column inside a composite PK is untested. (A computed PK — `SET id = <expr>` — now works,
   including a PK swap; see the UPDATE-SET-expression entry below.)
-- [ ] **`UPDATE ... SET col = <expr>` — per-row computed assignment landed (#159, b198).** A SET RHS that isn't
+- [x] **`UPDATE ... SET col = <expr>` — per-row computed assignment landed (#159, b198).** A SET RHS that isn't
   a literal (arithmetic, a column reference, `||`, a function call — `SET n = n + 1`, `SET a = b`, `SET s =
   upper(s)`) is collected into `UpdatePlan.computed` (`(field, type_tag, expr)`) by `plan_update` (via
   `_try_literal`), and `executor._execute_update_materialized` evaluates each against the **old** row (a
@@ -4447,9 +4479,12 @@ shared storage engine or building large new protocol subsystems:
   fast bulk `$set` path. Tests: `tests/test_sql_update_expr.py`. **Limitations:** a computed *composite-type*
   subfield is coerced as a scalar (nested composite value not rebuilt); a SET RHS that is a correlated
   subquery over another table isn't modelled.
-- [ ] **`numeric`/`json`/`bytea` partial.** `numeric` round-trips via Decimal128; `json`
-  passes dicts/lists through without a real `jsonb` operator surface; `bytea` is hex-string
-  in / `bytes` out. Full `jsonb` navigation (`->`/`->>`/`#>`) is P6.
+- [x] ~~**`numeric`/`json`/`bytea` partial.**~~ Superseded (verified 2026-08-20). The
+  `jsonb` half is simply wrong now: `->`, `->>`, `#>` and `@>` all evaluate — probed
+  against `'{"a": {"b": 42}, "tags": ["x"]}'`, they return `{'b': 42}`, `42`, `42` and
+  the containing row respectively. See "jsonb operator surface landed" and "SQL/JSON
+  path queries landed (b135)". `numeric` still round-trips via Decimal128 and its real
+  residual limit — 34 significant digits — has its own entry above.
 - [ ] **Catalog surface: joins landed, column-level reflection still missing.**
   `information_schema.tables`/`.columns`/`.schemata` and `pg_catalog.pg_class`/
   `pg_namespace`/`pg_type`/`pg_database` are served as virtual tables, and JOINs / GROUP BY
@@ -4487,7 +4522,7 @@ shared storage engine or building large new protocol subsystems:
   and the MERGE handlers, so every path enforces identically. Closes the MERGE-bypass and ON-CONFLICT
   secondary-constraint gaps noted in the b94/b95/b96 entries. **Still open:** deferred constraints
   aren't modeled (all checks are immediate — a future slice).
-- [ ] **Aggregate `FILTER (WHERE cond)` landed** (b126): `agg(...) FILTER (WHERE cond)` scopes an
+- [x] **Aggregate `FILTER (WHERE cond)` landed** (b126): `agg(...) FILTER (WHERE cond)` scopes an
   aggregate to matching rows. sqlglot parses it as `exp.Filter(this=<agg>, expression=Where(cond))`;
   the aggregate detectors (`_aggregate_of` / `_array_agg_arg` / `_string_agg_arg` / `_join_aggregate_of`)
   peel the Filter, and `_agg_filter_where` + `_filter_cond_to_agg` lower the predicate to a Mongo
@@ -4511,7 +4546,7 @@ shared storage engine or building large new protocol subsystems:
   `DISTINCT` count/sum/avg `FILTER` under GROUPING SETS also works (b211). **Not supported (→ `0A000`):**
   `FILTER` with an in-aggregate `ORDER BY` (the sorted-push path would need the sentinel threaded through
   the executor finish).
-- [ ] **`ALTER DOMAIN` landed** (b125): `ADD [CONSTRAINT c] CHECK (…) [NOT VALID]`, `DROP CONSTRAINT
+- [x] **`ALTER DOMAIN` landed** (b125): `ADD [CONSTRAINT c] CHECK (…) [NOT VALID]`, `DROP CONSTRAINT
   [IF EXISTS] c`, `SET DEFAULT expr` / `DROP DEFAULT`, `SET NOT NULL` / `DROP NOT NULL`, and `RENAME TO
   new`. Handled in `engine._alter_domain_command` (Command-parsed; catalog `update_domain`). `ADD …
   CHECK` and `SET NOT NULL` **re-validate every existing row** of every column typed with the domain
@@ -4521,7 +4556,7 @@ shared storage engine or building large new protocol subsystems:
   auto-names `<domain>_check[N]`; a duplicate explicit name → `42710`. `RENAME TO` re-keys the domain
   and repoints every referencing column's `domain_type` (columns track domains by name). **Not modeled:**
   `VALIDATE CONSTRAINT` (no-op accept — we validate eagerly), `RENAME CONSTRAINT`, dependency tracking.
-- [ ] **POSIX regex-match operators landed** (b124): `~` / `~*` / `!~` / `!~*` in WHERE lower to a Mongo
+- [x] **POSIX regex-match operators landed** (b124): `~` / `~*` / `!~` / `!~*` in WHERE lower to a Mongo
   `$regex` filter (`planner._expr_to_filter`, next to the LIKE handler; the pattern is a raw regex,
   *not* LIKE-translated, and matches unanchored — `re.search` semantics — like Postgres). `~*` adds
   `$options: "i"`; `!~` / `!~*` parse as `Not(RegexpLike/RegexpILike)` and negate through the existing
@@ -4531,7 +4566,7 @@ shared storage engine or building large new protocol subsystems:
   **Limitation:** `!~` / `!~*` inherit the layer's existing NULL-in-negation divergence (a NULL row
   leaks into the negated result, shared with `!=` / `NOT LIKE`; the positive `~` correctly excludes
   NULL) — a broader NULL-semantics fix, not regex-specific.
-- [ ] **`CREATE DOMAIN` landed** (b122): a named base type with its own `NOT NULL` / `CHECK` (and
+- [x] **`CREATE DOMAIN` landed** (b122): a named base type with its own `NOT NULL` / `CHECK` (and
   optional `DEFAULT`). `CREATE DOMAIN name AS base [DEFAULT expr] [ [CONSTRAINT c] { NOT NULL | CHECK
   (…) } … ]` and `DROP DOMAIN [IF EXISTS] name` arrive as `exp.Command` (sqlglot doesn't model the
   grammar) and are handled in `engine._create_domain_command` / `_drop_domain_command`; the base type +
@@ -4550,7 +4585,7 @@ shared storage engine or building large new protocol subsystems:
   supported (→ `0A000`, same gap as table CHECKs); `ALTER DOMAIN` (add/drop constraint, set default) and
   domain-on-domain aren't modeled; `DROP DOMAIN` doesn't check for dependent columns (no RESTRICT/CASCADE
   dependency tracking).
-- [ ] **FOREIGN KEY enforcement on write landed** (b96): referential integrity is now enforced both
+- [x] **FOREIGN KEY enforcement on write landed** (b96): referential integrity is now enforced both
   ways (`23503`, `errors.foreign_key_violation`). **Child side** (`executor._validate_fk_child_rows`,
   wired into `execute_insert` + the UPDATE post-image path): an INSERT/UPDATE row whose FK columns are
   all non-NULL must have a matching parent row — MATCH SIMPLE, so a NULL in any FK column exempts the
@@ -4567,7 +4602,7 @@ shared storage engine or building large new protocol subsystems:
   via `enforce_insert_rows` / `enforce_update_images`, parent-side FK on a MERGE UPDATE via
   `_enforce_fk_on_parent_update`, and parent-side on a MERGE DELETE via `enforce_parent_delete` — see the
   MERGE bullet.)
-- [ ] **UNIQUE enforcement on write landed** (b95): `INSERT` / `UPDATE` on a **declared** table now
+- [x] **UNIQUE enforcement on write landed** (b95): `INSERT` / `UPDATE` on a **declared** table now
   reject a write that would create two rows sharing a value for a declared UNIQUE constraint (`23505`,
   `executor._validate_unique_rows`). NULLs are distinct — a row with any NULL in a constraint's columns
   is exempt (matches Postgres default, no `NULLS NOT DISTINCT`). Duplicates *within* an INSERT/UPDATE
@@ -4579,7 +4614,7 @@ shared storage engine or building large new protocol subsystems:
   DISTINCT`. (Historical note, now closed by #67: `INSERT … ON CONFLICT` catches a secondary UNIQUE — the
   clean-insert branch runs `enforce_insert_rows` over every UNIQUE constraint, not just the arbiter — and
   `MERGE` writes enforce through the same shared helpers.)
-- [ ] **CHECK + NOT NULL enforcement on write landed** (b94): `INSERT` / `UPDATE` on a **declared**
+- [x] **CHECK + NOT NULL enforcement on write landed** (b94): `INSERT` / `UPDATE` on a **declared**
   table now enforce NOT NULL (`23502`) and CHECK (`23514`) against the post-image — a violating write is
   rejected and the table left unchanged (`executor._validate_write_row` / `_validate_rows` /
   `_validate_update_post_images`). NOT NULL skips the PK column (storage auto-assigns `_id`). CHECK
@@ -4593,7 +4628,13 @@ shared storage engine or building large new protocol subsystems:
   rolled back unless inside an explicit transaction block (per-statement atomicity only for the failing
   statement). (Historical note, now closed: UNIQUE (#64) / FOREIGN KEY (#65) are enforced, and `MERGE`
   writes go through the shared enforcement helpers (#67), not a bypass.)
-- [ ] **CHECK / UNIQUE constraints — declared, reflected, NOT enforced** (b91): column-level (`col int
+- [x] **CHECK / UNIQUE constraints — declared, reflected, and ENFORCED** (b91 declared them;
+  b98 made enforcement uniform across every write path — headline corrected 2026-08-20, the
+  "NOT enforced" wording had survived the slice that fixed it). Probed live: `INSERT` of `-5`
+  into `n int CHECK (n > 0)` raises `23514 new row for relation "t" violates check constraint
+  "t_n_check"`, and a duplicate into `e text UNIQUE` raises `23505 duplicate key value violates
+  unique constraint "t_e_key"` — Postgres' SQLSTATEs and message wording. The declaration /
+  reflection detail below is still accurate: column-level (`col int
   CHECK (col > 0)` / `col text UNIQUE`), table-level named (`CONSTRAINT c CHECK (...)` / `... UNIQUE (a,
   b)`), and table-level unnamed CHECK/UNIQUE are parsed by `planner._extract_constraints`, stored on
   `TableDef.check_constraints` (`catalog.CheckConstraint`) / `TableDef.unique_constraints`
@@ -4609,7 +4650,7 @@ shared storage engine or building large new protocol subsystems:
   enforced:** no CHECK-predicate validation, no UNIQUE-duplicate rejection on write — schema-shape
   record only. **Limitations:** CHECK columns aren't listed in `constraint_column_usage` (the
   predicate isn't parsed for referenced columns).
-- [ ] **`ALTER TABLE … ADD CONSTRAINT CHECK/UNIQUE` + `DROP CONSTRAINT` landed** (b93): `ADD
+- [x] **`ALTER TABLE … ADD CONSTRAINT CHECK/UNIQUE` + `DROP CONSTRAINT` landed** (b93): `ADD
   [CONSTRAINT name] CHECK (…)` / `UNIQUE (…)` and unnamed `ADD UNIQUE (…)` append to
   `TableDef.check_constraints` / `unique_constraints` via `executor._apply_alter_action` (reusing
   `planner.make_check_constraint` / `make_unique_constraint`, factored out of `_extract_constraints`);
@@ -4618,7 +4659,7 @@ shared storage engine or building large new protocol subsystems:
   name → `42704` unless IF EXISTS). Still not enforced. **Limitations:** unnamed `ADD CHECK (…)` isn't
   accepted (sqlglot can't parse it — a CHECK needs an explicit `CONSTRAINT name`); no `ALTER CONSTRAINT`
   / `VALIDATE CONSTRAINT`.
-- [ ] **Materialized-view polish landed** (b99): `WITH NO DATA` registers a matview unpopulated (a
+- [x] **Materialized-view polish landed** (b99): `WITH NO DATA` registers a matview unpopulated (a
   `populated` flag in the `__sql_matviews__` registry doc — `catalog.matview_populated` /
   `set_matview_populated`); querying an unpopulated matview errors `55000`
   (`object_not_in_prerequisite_state`, checked in `engine._run_select`), and its first `REFRESH` marks
@@ -4636,7 +4677,7 @@ shared storage engine or building large new protocol subsystems:
   inside a WITH. **Limitations:** the unpopulated check only fires for a matview in the query's primary
   FROM (not a secondary JOIN position); no real `CONCURRENTLY` snapshot isolation; still no indexes on
   the snapshot.
-- [ ] **Materialized views landed** (b97): `CREATE MATERIALIZED VIEW name AS SELECT …` runs the SELECT
+- [x] **Materialized views landed** (b97): `CREATE MATERIALIZED VIEW name AS SELECT …` runs the SELECT
   and stores a **snapshot** of its rows in a backing collection (named after the matview) plus the
   definition text in a per-db `__sql_matviews__` registry (`catalog.put_matview` / `get_matview` /
   `drop_matview` / `list_matviews`). The snapshot's shape is registered as a catalog `TableDef` (columns
@@ -4653,7 +4694,7 @@ shared storage engine or building large new protocol subsystems:
   `WITH NO DATA` / `WITH DATA` *are* modeled — an unpopulated matview raises `55000` on scan until its
   first `REFRESH` — and `REFRESH … CONCURRENTLY` + a unique index on the snapshot + `ALTER MATERIALIZED
   VIEW … RENAME TO` are supported; other `ALTER MATERIALIZED VIEW` subcommands remain `0A000`.)
-- [ ] **`CREATE VIEW` / `DROP VIEW` landed** (b87): a view is a stored `SELECT` persisted as its query
+- [x] **`CREATE VIEW` / `DROP VIEW` landed** (b87): a view is a stored `SELECT` persisted as its query
   text in a per-db `__sql_views__` collection (`catalog.put_view` / `get_view` / `drop_view` /
   `list_views`). `CREATE [OR REPLACE] VIEW` and `DROP VIEW [IF EXISTS]` dispatch on `exp.Create` /
   `exp.Drop` kind `'VIEW'` (`executor.execute_create_view` / `execute_drop_view`). Querying a view
@@ -4685,7 +4726,7 @@ shared storage engine or building large new protocol subsystems:
   query re-reads the base tables); no `CASCADE`/`RESTRICT` on `DROP`; no column-list aliasing (`CREATE VIEW
   v (a, b) AS …`); CHECK OPTION cascades only one level (a CASCADED view over another CHECK OPTION view
   doesn't re-check the inner condition); aliased / expression projections aren't updatable.
-- [ ] **`COMMENT ON TABLE` / `COLUMN` landed** (b86): the comment is stored on `TableDef.comment` /
+- [x] **`COMMENT ON TABLE` / `COLUMN` landed** (b86): the comment is stored on `TableDef.comment` /
   `Column.comment` (persisted in the catalog doc) by `executor.execute_comment` (dispatched on
   `exp.Comment`), surfaced through `virtual._pg_description` (table comment → `objsubid 0`, column
   comment → the column's attnum, `classoid` = pg_class 1259). SQLAlchemy's `get_table_comment()` and
@@ -4694,7 +4735,11 @@ shared storage engine or building large new protocol subsystems:
   NULL` statement — anchored so a query's `WHERE x IS NULL` is untouched — to an `UNCOMMENT_SENTINEL`
   the executor reads as removal). `get_table_comment`'s join needs `'pg_catalog.pg_class'::regclass`, so
   `_coerce_cast` now maps a `regclass` cast of a catalog relation name to its OID (`_REGCLASS_OIDS`).
-- [ ] **Foreign keys — declared, reflected, NOT enforced** (b81): column-level `col type REFERENCES
+- [x] **Foreign keys — declared, reflected, and ENFORCED** (b81 declared them; b98 made
+  enforcement uniform — headline corrected 2026-08-20, same stale-wording problem as the
+  CHECK/UNIQUE entry). Probed live: inserting a child row whose `pid` has no parent raises
+  `23503 insert or update on table "child" violates foreign key constraint "child_pid_fkey"`.
+  The declaration / reflection detail below is still accurate: column-level `col type REFERENCES
   t(c)` and table-level `FOREIGN KEY (c) REFERENCES t(c)` (incl. `ON DELETE` / `ON UPDATE` actions and
   the columnless `REFERENCES t` → target-PK form) are parsed by `planner._extract_foreign_keys`, stored
   on `TableDef.foreign_keys` (`catalog.ForeignKey`), and persisted in the catalog doc. Reflection:
@@ -4708,14 +4753,14 @@ shared storage engine or building large new protocol subsystems:
   name] FOREIGN KEY` landed in b85 (see below). **Limitations:** `MATCH` renders as the default.
   (FK enforcement + referential actions landed in later slices; `DEFERRABLE` is captured and
   honoured — see "Constraint enforcement" and "Deferred constraints" below.)
-- [ ] **`ALTER TABLE … ADD [CONSTRAINT name] FOREIGN KEY` landed** (b85): parsed as `exp.AddConstraint`
+- [x] **`ALTER TABLE … ADD [CONSTRAINT name] FOREIGN KEY` landed** (b85): parsed as `exp.AddConstraint`
   (a bare `ForeignKey` or a named `Constraint` wrapping one) in `executor._apply_alter_action`, which
   appends a `catalog.ForeignKey` (via `planner._make_fk`, now taking an optional constraint name) to
   the table and persists it through `Catalog.replace`. Reflects exactly like a CREATE TABLE FK
   (`information_schema.referential_constraints`, `pg_constraint` contype='f', SQLAlchemy
   `get_foreign_keys()`). Non-FK `ADD CONSTRAINT` (CHECK / UNIQUE) → `feature_not_supported`. Still not
   enforced.
-- [ ] **Deferred constraints landed** (b100): `UNIQUE` / `FOREIGN KEY` declared `DEFERRABLE` /
+- [x] **Deferred constraints landed** (b100): `UNIQUE` / `FOREIGN KEY` declared `DEFERRABLE` /
   `INITIALLY DEFERRED` are parsed (`planner._deferrable_flags`), stored on `catalog.UniqueConstraint` /
   `ForeignKey` (`deferrable` / `initially_deferred`), and reflected via `pg_constraint.condeferrable` /
   `condeferred` and `information_schema.table_constraints.is_deferrable` / `initially_deferred`. When a
@@ -4727,7 +4772,7 @@ shared storage engine or building large new protocol subsystems:
   deferral state (`deferred_all` / `deferred_names` / `pending_deferred`) resets at end of transaction.
   **Limitations:** re-check is a whole-constraint rescan (not per-row). (The named-FK parsing gap this
   note used to describe was fixed in b101 — see "Named FK constraint parsing" below.)
-- [ ] **Named FK constraint parsing landed** (b101): `planner._extract_foreign_keys` now handles a
+- [x] **Named FK constraint parsing landed** (b101): `planner._extract_foreign_keys` now handles a
   table-level `CONSTRAINT n FOREIGN KEY (cols) REFERENCES …` (sqlglot wraps it in an `exp.Constraint`
   whose `expressions` hold the `exp.ForeignKey`) — previously not parsed into a FK **at all** — and a
   column-level `col … CONSTRAINT n REFERENCES …` now keeps the explicit name (read from the
@@ -4736,7 +4781,7 @@ shared storage engine or building large new protocol subsystems:
   the name through `_make_fk`; composite columns, `ON DELETE`/`ON UPDATE`, and `DEFERRABLE` all carry
   through. Enforcement + reflection + named `SET CONSTRAINTS` all light up under the real name. Tests:
   `tests/test_sql_foreign_keys.py`.
-- [ ] **SERIAL columns + sequences landed** (b102): `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` columns
+- [x] **SERIAL columns + sequences landed** (b102): `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` columns
   (int + implicit NOT NULL + owned sequence `<table>_<col>_seq`), `CREATE SEQUENCE` / `DROP SEQUENCE`
   (`START WITH` / `INCREMENT BY` / `MINVALUE` / `MAXVALUE` / `CYCLE`), `DEFAULT nextval('seq')`, and the
   `nextval` / `currval` / `setval` / `lastval` functions. Sequence state persists in a per-db
@@ -4752,7 +4797,7 @@ shared storage engine or building large new protocol subsystems:
   different connections (acceptable for the dev/test surface; the storage RLock keeps each write
   atomic); no `ALTER SEQUENCE`, no `CACHE`, no `OWNED BY`, and an explicit value into a SERIAL column
   doesn't bump the sequence (matches Postgres).
-- [ ] **SQL-level roles landed** (b103): `CREATE ROLE` / `CREATE USER` / `ALTER ROLE` / `DROP ROLE`
+- [x] **SQL-level roles landed** (b103): `CREATE ROLE` / `CREATE USER` / `ALTER ROLE` / `DROP ROLE`
   (all arrive as `exp.Command`; parsed by `engine._run_role_command` / `_parse_role_attrs` — `LOGIN` /
   `SUPERUSER` / `CREATEDB` / `CREATEROLE` / `INHERIT` / `REPLICATION` + `NO…` negations, `PASSWORD`,
   `CONNECTION LIMIT`; `USER` implies LOGIN). Stored in a per-db `__sql_roles__` collection
@@ -4765,7 +4810,7 @@ shared storage engine or building large new protocol subsystems:
   users** (constructor `users={}`), no `pg_authid` / `pg_auth_members` / role-membership graph, password
   not stored (only a `password_set` flag), and roles live in the connection's db rather than being
   cluster-wide.
-- [ ] **Enforced table-level GRANT/REVOKE landed** (#127, b167): `GRANT`/`REVOKE` of
+- [x] **Enforced table-level GRANT/REVOKE landed** (#127, b167): `GRANT`/`REVOKE` of
   `SELECT`/`INSERT`/`UPDATE`/`DELETE` (or `ALL`) `ON <table> TO/FROM <role>` (`exp.Grant`/`exp.Revoke`
   with a `Table` securable) persist per-`(table, grantee)` in `__sql_grants__`
   (`Catalog.grant_table_privileges` / `revoke_table_privileges` / `get_table_grants` /
@@ -4783,7 +4828,7 @@ shared storage engine or building large new protocol subsystems:
   enforced (no such ops); no table-owner tracking (owners aren't auto-granted — the seeding/trust-mode
   session is unrestricted anyway); grant target must be a single identifiable table (multi-table /
   subquery statements get no table-grant fallback). Not ported to the Rust server.
-- [ ] **SET ROLE / SET SESSION AUTHORIZATION landed** (#128, b168): `SET [SESSION|LOCAL] ROLE { name |
+- [x] **SET ROLE / SET SESSION AUTHORIZATION landed** (#128, b168): `SET [SESSION|LOCAL] ROLE { name |
   NONE | DEFAULT }`, `SET [SESSION|LOCAL] SESSION AUTHORIZATION { name | DEFAULT }`, and their `RESET`
   forms (all arrive as `exp.Command`; handled by `engine._run_authorization_command`). `Session.role` is
   the current-role override (SET ROLE), `Session.user` the session user (SET SESSION AUTHORIZATION),
@@ -4800,7 +4845,7 @@ shared storage engine or building large new protocol subsystems:
   transaction (behaves like `SET`); the Mongo RBAC db-level gate still uses the login's `session.roles`
   (SET ROLE changes the table-grant identity + `current_user`, not the underlying db-wide Mongo role
   bindings). Not ported to the Rust server.
-- [ ] **Row-level security (RLS) landed** (#129, b169): `ALTER TABLE t {ENABLE|DISABLE|FORCE|NO FORCE}
+- [x] **Row-level security (RLS) landed** (#129, b169): `ALTER TABLE t {ENABLE|DISABLE|FORCE|NO FORCE}
   ROW LEVEL SECURITY` + `CREATE POLICY name ON t [AS PERMISSIVE|RESTRICTIVE] [FOR cmd] [TO roles]
   [USING (expr)] [WITH CHECK (expr)]` + `DROP POLICY [IF EXISTS] name ON t` (all `exp.Command`;
   regex-parsed in `engine._alter_rls_command` / `_create_policy_command` / `_drop_policy_command`,
@@ -4821,7 +4866,7 @@ shared storage engine or building large new protocol subsystems:
   recorded but behaves like `ENABLE` (no owner to force against); RLS DDL itself needs no privilege (any authenticated
   user can add/alter policies — no ownership check); policies over the pipeline/set-operation/CTE paths aren't injected
   (only the direct single-table SELECT/UPDATE/DELETE dispatch). Not ported to the Rust server.
-- [ ] **UDF reflection landed** (#130, b170): `CREATE FUNCTION` (#124) definitions now surface through
+- [x] **UDF reflection landed** (#130, b170): `CREATE FUNCTION` (#124) definitions now surface through
   `pg_catalog.pg_proc` (`virtual._pg_proc`: oid / proname / pronamespace / prolang=14 / prorettype /
   pronargs / proargtypes / proargnames / prosrc / prokind='f' / proretset), `information_schema.routines`
   + `.parameters` (`_info_routines` / `_info_parameters`), and `pg_get_functiondef` /
@@ -4835,7 +4880,7 @@ shared storage engine or building large new protocol subsystems:
   `proargmodes` / `proargdefaults` (all params reflect as `IN`, no defaults); `is_deterministic` is a
   fixed `NO`; overloads share a `proname` but get distinct oids/`specific_name`. Not ported to the Rust
   server.
-- [ ] **Column-level privileges landed** (#131, b171): `GRANT`/`REVOKE` `SELECT`/`INSERT`/`UPDATE (col,
+- [x] **Column-level privileges landed** (#131, b171): `GRANT`/`REVOKE` `SELECT`/`INSERT`/`UPDATE (col,
   …)` `ON t` (the `GrantPrivilege.expressions` column list) persist per-`(table, grantee, column)` in
   `__sql_column_grants__` (`Catalog.grant_column_privileges` / `revoke_column_privileges` /
   `get_column_grants` / `list_column_grants` / `has_column_privilege`; `engine._grant_privileges` now
@@ -4851,7 +4896,7 @@ shared storage engine or building large new protocol subsystems:
   role or table grant); `count(*)`/no-column-ref SELECTs fall back to table-level (can't be authorized by
   a column grant alone); `REFERENCES`/`TRIGGER` column privileges aren't enforced; `is_grantable` always
   `NO`. Not ported to the Rust server.
-- [ ] **IDENTITY columns + ALTER SEQUENCE landed** (b104): `GENERATED { ALWAYS | BY DEFAULT } AS
+- [x] **IDENTITY columns + ALTER SEQUENCE landed** (b104): `GENERATED { ALWAYS | BY DEFAULT } AS
   IDENTITY [(START WITH n INCREMENT BY n)]` columns (`planner._identity_spec`) reuse the SERIAL sequence
   machinery — an owned `<table>_<col>_seq`, NOT NULL, auto-filled on omit. `Column.identity` is
   `"always"` / `"by_default"`; ALWAYS rejects a user-supplied value with `428C9` but accepts the
@@ -4863,7 +4908,7 @@ shared storage engine or building large new protocol subsystems:
   columns. Tests: `tests/test_sql_identity.py`. **Limitations:** no `OVERRIDING SYSTEM VALUE` (so an
   ALWAYS column can't be force-overridden), no `ALTER TABLE … ADD/DROP/SET GENERATED`, no
   `ALTER SEQUENCE … OWNED BY` / `RESTART` distinction from `is_called` edge cases beyond the basic reset.
-- [ ] **Enum types landed** (b107): `CREATE TYPE name AS ENUM ('a', …)` / `DROP TYPE [IF EXISTS]` store
+- [x] **Enum types landed** (b107): `CREATE TYPE name AS ENUM ('a', …)` / `DROP TYPE [IF EXISTS]` store
   the label list in a per-db `__sql_enums__` collection (`Catalog.create_enum` / `get_enum` / `drop_enum`
   / `list_enums`); dispatched from `engine._create_type` / `_drop_type`. An enum-typed column
   (`Column.enum_type`, stored as `text`) is detected in `plan_create_table` via `_enum_type_name` (a
@@ -4890,7 +4935,7 @@ shared storage engine or building large new protocol subsystems:
   result columns still describe as `text` 25; enum-cast oids ride constant selects only (a cast inside a
   table SELECT's projection types by the column machinery); no `pg_type` row for the paired `_name`
   array type itself (only `typarray` on the base row); `mood[]` table columns aren't supported.
-- [ ] **`ALTER TYPE … ADD VALUE` + enum-aware ORDER BY landed** (b112): `ALTER TYPE name ADD VALUE
+- [x] **`ALTER TYPE … ADD VALUE` + enum-aware ORDER BY landed** (b112): `ALTER TYPE name ADD VALUE
   [IF NOT EXISTS] 'label' [BEFORE|AFTER 'other']` (arrives as a `Command`, parsed by
   `engine._ALTER_TYPE_ADD_RE` → `Catalog.alter_enum_add_value`) inserts a new label into the enum's
   ordered label list at the end or relative to a neighbour; duplicate → `42710` (unless `IF NOT EXISTS`),
@@ -4908,7 +4953,7 @@ shared storage engine or building large new protocol subsystems:
   by `_order_key_fn` in `executor.execute_correlated_select`). Tests: `tests/test_sql_enum_order.py`,
   `tests/test_sql_correlated_extras.py`. **Limitations:** `ALTER TYPE RENAME VALUE` / composite-type
   alters → `0A000`.
-- [ ] **Generated columns landed** (b108): `GENERATED ALWAYS AS (expr) STORED` columns
+- [x] **Generated columns landed** (b108): `GENERATED ALWAYS AS (expr) STORED` columns
   (`planner._generated_expr` stores the rendered SQL on `Column.generated`). Computed from the row's
   other columns on every write by `executor._apply_generated_columns` (evaluates the expr via
   `scalar.evaluate` with a column→field scope, reusing the CHECK-constraint machinery) — runs before
@@ -4920,7 +4965,7 @@ shared storage engine or building large new protocol subsystems:
   same row (no subqueries / volatile functions guard); no `ALTER TABLE … ADD COLUMN … GENERATED` (the
   ALTER ADD path doesn't parse the constraint yet); a generated column isn't re-derived if the underlying
   data was written directly via the Mongo API (SQL writes only).
-- [ ] **COPY FROM/TO STDIN/STDOUT landed** (b109): the `COPY` bulk-load / dump sub-protocol over the
+- [x] **COPY FROM/TO STDIN/STDOUT landed** (b109): the `COPY` bulk-load / dump sub-protocol over the
   wire (`psql \copy`, `pg_dump`). `pgwire` gained `copy_in_response` ('G') / `copy_out_response` ('H') /
   `copy_data` ('d') / `copy_done` ('c') / `copy_fail` ('f'); `pgserver._handle_copy` / `_copy_in` /
   `_copy_out` drive the streaming (detected in `_handle_query` when the single parsed statement is
@@ -4950,7 +4995,7 @@ shared storage engine or building large new protocol subsystems:
   Mongo filter back to a SQL predicate for `pg_get_expr` isn't done); a partial predicate that doesn't
   lower to a field filter (e.g. a function call) would raise at CREATE rather than degrade to a full
   index.
-- [ ] **`DISTINCT ON` + `LATERAL` joins landed** (b82). **`DISTINCT ON (exprs)`** keeps the first row
+- [x] **`DISTINCT ON` + `LATERAL` joins landed** (b82). **`DISTINCT ON (exprs)`** keeps the first row
   per distinct value of `exprs` in ORDER BY order (single-table + join) — routed through the evaluated
   path (`planner._distinct_on`, `EvaluatedSelectPlan.distinct_on`, dedup in `executor._evaluated_value_rows`);
   before this it was silently mistreated as plain full-row DISTINCT. **`LATERAL`** (comma / `CROSS JOIN
@@ -4974,7 +5019,7 @@ shared storage engine or building large new protocol subsystems:
   (see §aggregate note above); `count`-style aggregates and `LEFT JOIN LATERAL` are unaffected.
   `DISTINCT ON` doesn't enforce Postgres' "ORDER BY must start with the DISTINCT ON exprs" rule
   (lenient — keeps whatever the sort order gives).
-- [ ] **`GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` landed** (b83, single-table). Enumerated grouping
+- [x] **`GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` landed** (b83, single-table). Enumerated grouping
   sets (`planner._grouping_sets`: ROLLUP → prefixes, CUBE → all subsets, explicit GROUPING SETS as
   written, a leading plain `GROUP BY a, …` as a prefix in every set) are each compiled to a
   `$group`+`$project` branch (`_grouping_set_branch`; group columns absent from a set project as
@@ -5026,7 +5071,7 @@ shared storage engine or building large new protocol subsystems:
   **Limitations:** a subquery in `HAVING` alongside a window over GROUPING SETS → `0A000`; a correlated /
   per-row WHERE with GROUPING SETS over a JOIN → `feature_not_supported`. (An in-aggregate `ORDER BY` under
   GROUPING SETS, single-table or over a JOIN, now works — b224.)
-- [ ] **Expression over an aggregate landed (#167, b202):** a SELECT item that *wraps* an aggregate
+- [x] **Expression over an aggregate landed (#167, b202):** a SELECT item that *wraps* an aggregate
   (`sum(x) + 1`, `round(avg(x), 2)`, `sum(x) - min(x)`) is now supported — `_select_has_computed_aggregate`
   routes it to the window-aware `_plan_group_window_select`, which rewrites each aggregate to its `$group`
   output field and evaluates the wrapping expression per grouped row via the evaluated executor (the same
@@ -5034,7 +5079,7 @@ shared storage engine or building large new protocol subsystems:
   keys (`GROUP BY lower(name)`, `GROUP BY a + b`) work (single-table + JOIN) via
   `_computed_group_keys` / `_lower_computed_group_keys`; a key using an unlowerable function (`substr`)
   stays `0A000`.
-- [ ] **ORDER BY completeness in GROUP BY / pipeline queries landed** (b210): a pipeline `ORDER BY` now
+- [x] **ORDER BY completeness in GROUP BY / pipeline queries landed** (b210): a pipeline `ORDER BY` now
   accepts a **positional reference** (`ORDER BY 1`, `ORDER BY 2 DESC` → the Nth select item; out-of-range
   → `42P10`) and an **aggregate / computed expression that matches a select-list item** (`ORDER BY
   count(*) DESC`, `ORDER BY sum(x)` when that aggregate is selected). `_append_sort_limit` now takes the
@@ -5049,7 +5094,7 @@ shared storage engine or building large new protocol subsystems:
   `out_columns` so the executor drops it from the output; `_resolve_order_output` maps the term's SQL to
   the hidden field. Still `0A000`: a non-aggregate computed ORDER BY expression not in the select list,
   and ORDER BY an unselected aggregate under GROUPING SETS (the union branches don't share hidden fields).
-- [ ] **`ALTER TABLE` landed** (b80): `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`
+- [x] **`ALTER TABLE` landed** (b80): `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`
   (`$unset`s the field on every doc), `RENAME COLUMN` (`$rename`s a non-PK field; a PK rename keeps
   the `_id` field and only changes the SQL name), `RENAME TO` (renames the table *and* moves the
   backing collection via `Storage.rename_collection`, so the old name stops resolving — otherwise the
@@ -5065,7 +5110,7 @@ shared storage engine or building large new protocol subsystems:
   single-ALTER path. Homogeneous lists (all-ADD / all-DROP) already parsed natively and were unaffected.
   Handles `IF EXISTS` and preserves data through a mid-list `RENAME COLUMN`. Tests: `test_sql_alter.py`
   (`test_multi_action_*`).
-- [ ] **Literal column DEFAULTs + `ALTER COLUMN TYPE` / `SET`/`DROP DEFAULT` landed** (b84). `Column`
+- [x] **Literal column DEFAULTs + `ALTER COLUMN TYPE` / `SET`/`DROP DEFAULT` landed** (b84). `Column`
   gained `has_default` / `default`; a literal DEFAULT (number / string / bool / NULL) from `CREATE
   TABLE` (`planner._column_default`) or `ALTER COLUMN SET DEFAULT` is filled in for an omitted column
   in `_insert_doc`. `ALTER COLUMN … TYPE t` updates the catalog `type_tag` (new inserts/reads use it;
@@ -5122,7 +5167,7 @@ shared storage engine or building large new protocol subsystems:
   and it isn't wired into the extended protocol's Portal machinery (it's a SQL-level cursor, like
   psycopg's named server-side cursors). DDL is transactional via BEGIN/COMMIT/ROLLBACK. Cross-connection
   isolation is the WT engine's job (the test double only models atomicity).
-- [ ] **Row-locking clauses landed** (#132, b172): `SELECT … FOR UPDATE | FOR SHARE | FOR NO KEY UPDATE
+- [x] **Row-locking clauses landed** (#132, b172): `SELECT … FOR UPDATE | FOR SHARE | FOR NO KEY UPDATE
   | FOR KEY SHARE` with `NOWAIT` / `SKIP LOCKED` / `OF <table>` (sqlglot `stmt.args["locks"]` =
   `[exp.Lock]`) are **accepted as single-node no-ops** that return the rows — so SQLAlchemy's
   `with_for_update()` works. Honored across every SELECT shape (plain / join / group / distinct / CTE /
@@ -5135,7 +5180,7 @@ shared storage engine or building large new protocol subsystems:
   aggregate / `DISTINCT` / set-op / group is accepted rather than rejected as Postgres would; OF-target
   validation is only applied on the direct single-table/JOIN `_run_select` path (set-op/pipeline locks
   aren't re-validated). Not ported to the Rust server.
-- [ ] **TRUNCATE TABLE landed** (#133, b173): `TRUNCATE [TABLE] t [, …] [RESTART | CONTINUE IDENTITY]
+- [x] **TRUNCATE TABLE landed** (#133, b173): `TRUNCATE [TABLE] t [, …] [RESTART | CONTINUE IDENTITY]
   [CASCADE | RESTRICT] [IF EXISTS]` (sqlglot `exp.TruncateTable`: `expressions` = tables, `identity` =
   RESTART/CONTINUE, `option` = CASCADE/RESTRICT) → `engine._run_truncate`. Empties each table via
   `storage.delete_matching(db, coll, {})` (index entries maintained). `RESTART IDENTITY` resets each
@@ -5150,7 +5195,7 @@ shared storage engine or building large new protocol subsystems:
   identities unless they're also named; runs within the session transaction (rolls back with it) but
   isn't the O(1) file-truncate a real engine does — it's a bulk `delete_matching`. Not ported to the
   Rust server.
-- [ ] **Index / constraint reflection for `\d` landed** (#134, b174): `pg_catalog.pg_indexes`
+- [x] **Index / constraint reflection for `\d` landed** (#134, b174): `pg_catalog.pg_indexes`
   (`virtual._pg_indexes`) lists one row per index (`schemaname`/`tablename`/`indexname`/`tablespace`=NULL/
   `indexdef`) and `pg_get_indexdef(oid)` (`virtual.indexdef_for_oid`, wired in `scalar._call_func` +
   registered in `functions._SCALAR_EVAL_ANON`) both render `CREATE [UNIQUE] INDEX <name> ON public.<table>
@@ -5166,7 +5211,7 @@ shared storage engine or building large new protocol subsystems:
   but the expression text isn't rendered); expression/functional index columns reflect only when every
   key field maps to a declared column (index over a raw field is skipped); no `INCLUDE`/opclass/collation
   detail in `indexdef`. Not ported to the Rust server.
-- [ ] **Advisory locks landed** (#135, b175): the `pg_advisory_lock` family — `pg_advisory_lock` /
+- [x] **Advisory locks landed** (#135, b175): the `pg_advisory_lock` family — `pg_advisory_lock` /
   `pg_advisory_unlock` / `pg_advisory_unlock_all` plus the `_shared`, `_xact_`, and `pg_try_*` variants
   (eleven functions total) — as **session-tracked single-node no-op locking**. All parse as `exp.Anonymous`;
   registered in `functions._SCALAR_EVAL_ANON` so FROM-less `SELECT pg_advisory_*(…)` routes to
@@ -5186,7 +5231,7 @@ shared storage engine or building large new protocol subsystems:
   *this* connection's advisory locks (no cross-backend visibility) and no non-advisory lock types
   (relation/tuple/transactionid rows); `objsubid`/`tuple` reflect as `int4` (no `int2` type tag). Not ported
   to the Rust server.
-- [ ] **SET LOCAL + SHOW ALL / pg_settings landed** (#136, b176): `SET LOCAL name = value`
+- [x] **SET LOCAL + SHOW ALL / pg_settings landed** (#136, b176): `SET LOCAL name = value`
   (sqlglot `exp.SetItem(kind=LOCAL)`) applies a GUC only for the rest of the current transaction and
   reverts at COMMIT/ROLLBACK (`Session.set_local` / `restore_local_gucs`, hooked in
   `engine._end_txn_state`); outside a transaction it has no lasting effect (Postgres warns and drops it).
@@ -5201,7 +5246,7 @@ shared storage engine or building large new protocol subsystems:
   ROLLBACK (real Postgres reverts transactional GUCs); the txn-end revert of a *reportable* GUC (search_path
   etc.) doesn't emit a compensating `ParameterStatus`; `pg_settings` metadata is coarse (generic category,
   empty short_desc, NULL unit/min/max/enumvals, no per-GUC context). Not ported to the Rust server.
-- [ ] **Monitoring views (pg_stat_activity) landed** (#137, b177): `pg_catalog.pg_stat_activity` (one row
+- [x] **Monitoring views (pg_stat_activity) landed** (#137, b177): `pg_catalog.pg_stat_activity` (one row
   per live backend) + `pg_catalog.pg_stat_database` (per-db backend count) reflect a new server-level
   `session.ActivityRegistry` — `SecantusPGServer` registers each connection's `Session` on connect and
   unregisters on disconnect (parallel to the `_notify`/`_conns` pattern), assigns a unique per-connection
@@ -5217,7 +5262,7 @@ shared storage engine or building large new protocol subsystems:
   `pg_stat_activity` omits live `xact_start` / `state_change` / `wait_event*` / `leader_pid` /
   `backend_xid` (NULL); `client_port` is NULL and `client_addr` is text (not `inet`); COPY sub-protocol and
   the initial handshake don't update `state`. Not ported to the Rust server.
-- [ ] **Role membership (GRANT role TO role) landed** (#138, b178): `GRANT <roles> TO <members> [WITH
+- [x] **Role membership (GRANT role TO role) landed** (#138, b178): `GRANT <roles> TO <members> [WITH
   ADMIN OPTION]` / `REVOKE [ADMIN OPTION FOR] <roles> FROM <members> [CASCADE|RESTRICT]` — role-membership
   grants parse as `exp.Command` (no `ON` target, unlike privilege grants which are `exp.Grant`), routed by
   `engine._run_role_membership` (regex-split the tail; a Command carrying `ON` is a privilege grant → no-op
@@ -5249,7 +5294,7 @@ shared storage engine or building large new protocol subsystems:
   (BSON decodes naive); the wire path is now tz-aware. `tests/test_sql_datetime_funcs.py` +
   `test_sql_spike.py` carry a small UTC-normalising shim (commented, referencing #141) so they assert the
   PG-correct tz-aware instant; remove the shim when #141 lands. **(Resolved in b181 — see below.)**
-- [ ] **Two-phase commit (PREPARE TRANSACTION) landed** (#139, b180): `PREPARE TRANSACTION 'gid'` /
+- [x] **Two-phase commit (PREPARE TRANSACTION) landed** (#139, b180): `PREPARE TRANSACTION 'gid'` /
   `COMMIT PREPARED 'gid'` / `ROLLBACK PREPARED 'gid'`. Handled *before* sqlglot in `run_sql`
   (`engine._maybe_two_phase` / `_TWO_PHASE_RE`) because sqlglot can't parse `COMMIT`/`ROLLBACK PREPARED` at
   all and `PREPARE TRANSACTION` collides with the SQL-level `PREPARE name AS` (#121). `PREPARE` detaches the
@@ -5328,7 +5373,7 @@ shared storage engine or building large new protocol subsystems:
   argument and truncates the interval, zeroing every component finer than `unit` (years > months > days > time;
   `_date_trunc_interval` in `scalar.py`). Result types as `interval` (`_infer_scalar_tag`). `week` is not a valid
   unit for an interval (→ `0A000`, matching Postgres). SQL-layer only — no Rust parity impact.
-- [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
+- [x] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by
   scanning the catalog and calls `drop_index` (`42704` when absent). Indexes now reflect back
@@ -5461,11 +5506,14 @@ recorded in that slice's changelog fragment. Still open:
   both named `${Python3_EXECUTABLE}`, which under a PEP 517 build is the
   isolated build env's interpreter — a fresh temp path on every build — so the
   patch and configure stamps were invalidated every time. Local half is fixed
-  (interpreter passed by file + `REALPATH`; rebuild 37 s -> 1.3 s). CI still
-  pays it in full because every job starts from a fresh checkout with no build
-  dir; that needs a build-dir cache, whose design and the source-patching
-  hazard it must avoid are in `tasks/wt-build-cache-plan.md`. Windows is still
-  unstabilised there (venv pythons are copies, so `REALPATH` is a no-op).
+  (interpreter passed by file + `REALPATH`; rebuild 37 s -> 1.3 s). **The CI half is
+  fixed too — corrected 2026-08-20.** The build-dir cache this entry called for was
+  built and is live: `test.yml` carries a "Restore the WiredTiger build"
+  `actions/cache` step on `path: build`, keyed on runner OS + image version + WT rev
+  + config + interpreter, deliberately with no `restore-keys` so a near-miss cold-builds
+  rather than reusing objects from a different compiler. The immediately following item
+  (#562) records the follow-up fix. **What actually remains:** Windows is still
+  unstabilised (venv pythons are copies, so `REALPATH` is a no-op).
 - [x] ~~**The WiredTiger build cache restores but the test lanes rebuild anyway.**~~
   ANSWERED and fixed (#562). scikit-build-core writes `Python3_EXECUTABLE` into
   the TOP-LEVEL CMakeCache, and under PEP 517 that is the isolated build env — a
