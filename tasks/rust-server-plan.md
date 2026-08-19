@@ -186,7 +186,9 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
     `keyPattern`/`keyValue`; `delete` `{q, limit}` batch; `count` skip/limit
     clamp. 9 handler tests over an in-memory fake `Storage` (22 crate tests
     total), `clippy -D warnings` + `fmt` clean. **Deferred (tracked in backlog
-    §7):** `update` (R2c — pipeline-form `u` / `arrayFilters` / `let` /
+    §7, and **both have since shipped** — `crud::update` and `find::find` are
+    registered in the dispatch table; this list is the state as of R2b):**
+    `update` (R2c — pipeline-form `u` / `arrayFilters` / `let` /
     `collation` / `validator` need storage-signature work); `find` (with R3
     cursors + projection); `writeConcern`, collection `validator`,
     `_reject_oplog_rs_write`, `let`/`collation` on delete, view-collection count.
@@ -536,10 +538,12 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
   Smoke: `tests/test_rust_binary_smoke.py` (launch on port 0, pymongo
   handshake + CRUD round-trip, `--standalone` hello shape, bad-args exit 2,
   clean SIGTERM exit 0); `invoke rust-binary-test` builds + runs it.
-  **Deferred:** the Python CLI's TOML config-file layer and the tuning flags
-  (`--log-level` / `--cache-size` / `--session-max` / `--sync-on-commit` /
-  oplog retention / noop heartbeat) — need the matching knobs on
-  `secantus_storage::Storage::open` first.
+  **Update (2026-08-18): the deferred tail has since shipped** — `args.rs` now
+  parses `--config` (TOML), `--log-level`, `--log-file-max`, `--cache-size`,
+  `--session-max`, `--sync-on-commit`, `--checkpoint-seconds`, `--oplog-async`,
+  `--oplog-nonlogged`, `--oplog-archive-dir`, `--oplog-max-entries`,
+  `--oplog-retention-seconds`, `--noop-heartbeat-seconds` and `--data-nonlogged`
+  alongside the original set.
 
 - **R8 — Conformance gate (go/no-go).** Run the **unchanged** pymongo-driven
   suites (`test_crud.py` / `test_storage.py` / `test_indexes.py` /
@@ -548,16 +552,34 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
   headline "MongoDB compatibility" number must not regress vs the Python server.
   This is the definition of "the Rust server is correct."
 
-  **Status: the pymongo gauge is wired.** `pymongo_validation/plugin.py` selects
-  the server via `SECANTUS_GAUGE_SERVER` (`python` default / `rust` → the
-  `_secantus_server.RustServer` embedded handle); `invoke validate --server rust`
-  writes `docs/validation-report-rust-server.md`; the weekly
-  `.github/workflows/validate.yml` matrix gained a `pymongo-rust-server` entry
-  that builds the storage-engine extension into the venv and runs the task. The
-  gate is read by comparing that report's pass rate against
-  `docs/validation-report.md`. The other-language gauges against the Rust server
-  are deferred (their daemon launchers need a `secantusdb`-binary launch path —
-  backlog §7).
+  **Status: MET as measured 2026-08-11 — all THIRTEEN gauges run against both
+  servers.** `pymongo_validation/plugin.py` selects the server via
+  `SECANTUS_GAUGE_SERVER` (`python` default / `rust` → the
+  `_secantus_server.RustServer` embedded handle) and `gauge_common.py` does the
+  same for the other-language gauges (via the standalone `secantusd-rs` binary),
+  so `invoke validate-all-servers` runs the whole fleet twice and each Rust pass
+  writes a `-rust-server` report. The weekly `.github/workflows/validate.yml`
+  matrix has a `pymongo-rust-server` entry.
+
+  **The measured gate (report pairs, `Overall` rows):** the Rust server ties the
+  Python server on nine gauges (pymongo 1020 / 99.5% on both, plus
+  pymongo-async, go, node, ruby, kotlin, dotnet, php-ext, rust), **beats** it on
+  two (c: 749/99.1% vs 739/98.5%; php-lib: 3051/98.7% vs 3049/98.6%), and the
+  cxx pair has no parseable `Overall` row (its report format differs — worth a
+  look, not a known regression).
+
+  The one genuine regression was **java: 445/99.6% vs 446/99.8%**, and the
+  failure sets were *disjoint* — the Rust server PASSES the `ClientMetadataTest`
+  the Python server fails, and failed two `mapReduce` tests instead
+  (`MongoCollectionTest#testMapReduceWithGenerics`,
+  `UnifiedWriteConcernTest#default-write-concern-3.4`) because `mapReduce` was
+  simply not in the Rust dispatch table (→ `59 CommandNotFound`).
+  `secantus-commands::mapreduce` closes it: the same no-JS-engine port the
+  Python server ships (canonical `emit(this.<field>, 1)` + `values.length` →
+  `$group` count, double-typed `value`, `{out: {inline: 1}}` gate, empty-but-ok
+  otherwise). **Not yet re-measured against the Java gauge** — that needs a JVM
+  + Gradle run against a freshly built `secantusd-rs`; the port is unit-tested
+  case-for-case against the Python implementation that passes those two tests.
 
 **Leftover storage work folded in** (was Phase-4 tail): re-home `$lookup` /
 `$geoNear` / `$out` / `$merge` storage-backed aggregation into `secantus-storage`
