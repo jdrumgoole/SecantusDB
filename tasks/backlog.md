@@ -1,6 +1,6 @@
 # Backlog: stubs, stopgaps, and deferred work
 
-A living list of things SecantusDB does not yet implement faithfully. Update when you stub something, when you defer a slice, or when you discover a limitation in production code. Don't add items here that already have a fix in flight — those belong in tasks/todo.md.
+A living list of things SecantusDB does not yet implement faithfully. Update when you stub something, when you defer a slice, or when you discover a limitation in production code. Don't add items here that already have a fix in flight — those live on the branch and PR doing the fixing. (This line used to point at `tasks/todo.md`; that file is the *delivered* Admin UI plan, not a general in-flight list.)
 
 Each item should have enough context for a future session to pick it up cold: what's there now, what's missing, why it was deferred.
 

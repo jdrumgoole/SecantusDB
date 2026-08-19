@@ -1,5 +1,14 @@
 # Plan: connection-handling thread pool
 
+> **NOT STARTED — check the scope decision before picking this up (audited
+> 2026-08-20).** No pool exists; `SecantusDBServer` still runs one daemon thread per
+> connection (CLAUDE.md describes it that way, and `src/secantus/server.py` has no
+> `ThreadPool`). Unlike most stale plans here this one was never delivered under
+> another name — but its motivation is Python-server scalability, and
+> `tasks/backlog.md` records that **the Python server is not a perf target;
+> throughput and latency work goes to the Rust server.** Treat as an open design
+> document, not queued work.
+
 Branch: `claude/server-thread-pool-arch-dwbeR`
 
 ## Goal

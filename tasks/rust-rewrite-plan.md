@@ -1,5 +1,12 @@
 # Plan: Rewriting the SecantusDB server core in Rust
 
+> **HISTORICAL — superseded (audited 2026-08-20).** This plan is built on the
+> *in-process selectable-engine* model (`SECANTUS_ENGINE=python|rust|auto`, the
+> `secantus.engine` shims, the `EngineFallback` adapter). That model was retired
+> in favour of **two separate servers**, and CLAUDE.md names
+> `tasks/rust-server-plan.md` as the authoritative plan. Kept for the design
+> reasoning and the measurements; do not take its next-steps as current work.
+
 Status: **in progress.** This document is the strategy: an order, a set of
 seams, and the decisions behind them.
 
