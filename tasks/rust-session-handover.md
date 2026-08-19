@@ -1,5 +1,22 @@
 # Rust-server session handover
 
+> **STALE SNAPSHOT — one instruction in it is now actively wrong (audited
+> 2026-08-20).**
+>
+> **Do not follow its version-bump rule.** It says to bump the Rust version "for
+> any `crates/**` change" and the Python version "for `src/secantus/**`". CLAUDE.md
+> now says the opposite, deliberately: **no version bumps in feature PRs, either
+> server** — both are assigned at release time, because a PR that picks a version
+> at branch time is stale by merge time and collides with every other concurrent
+> PR on that one line.
+>
+> Every version it cites is far out of date too: it snapshots Rust
+> `0.5.3-beta.19` and Python `0.5.3b11`; the tree is at `0.5.3-beta.160` and
+> `0.6.0b12`. Its parallel-session coordination note ("keep Rust work in
+> `crates/`") also predates the claim-by-pushed-branch protocol in CLAUDE.md.
+>
+> `tasks/rust-server-plan.md` is the authoritative roadmap and is current.
+
 Snapshot for resuming the **Rust server** work on another machine. (This is the
 session that builds the Rust server under `crates/`; a parallel session works the
 **Python** server under `src/secantus/` + change streams — keep Rust work in

@@ -1,5 +1,18 @@
 # Plan: replace WiredTiger's SWIG Python bindings (production write throughput)
 
+> **SUPERSEDED — not started, and deliberately so (audited 2026-08-20).** The goal
+> was to replace WiredTiger's SWIG Python bindings to lift *Python-server* write
+> throughput. `src/secantus/storage.py:35` still does `import wiredtiger as wt`, so
+> none of it was built, and it should not be: the throughput answer became **the
+> Rust server**. `tasks/backlog.md` reaches the same conclusion from the other end —
+> it measures `wiredtiger/packing.py` dominating Python inserts, calls it "the known
+> 'use the Rust server for throughput' gap", and closes with "Not worth it now."
+> Kept for the profiling data.
+>
+> Note its opening paragraph credits the `wt-concurrency` work as merged in
+> `cad49c14` — that is accurate, and it is the evidence that corrected this audit's
+> first reading of `tasks/wt-concurrency-plan.md`.
+
 Branch: `wt-bindings` · Worktree: `../SecantusDB-wt-bindings`
 
 ## Why this exists

@@ -1,5 +1,25 @@
 # Plan: unlock real WiredTiger write concurrency
 
+> **LARGELY DELIVERED — boxes were never ticked (audited 2026-08-20).** Do not
+> read this file's 29 unticked boxes as open work. The core of it shipped in
+> `cad49c14` ("Merge wt-concurrency: lock decomposition + profile diagnostic +
+> plan") and has been built on since (e.g. #898, coll-lock `drop_index`):
+> `Storage` today has `_coll_locks` / `_coll_locks_mutex` / `_coll_lock()`
+> (storage.py:1616, 1962) and `_oplog_seq_lock` (storage.py:1587), and Phase 0's
+> harness — `bench/concurrency.py`, `invoke concurrency` / `concurrency-refresh`,
+> `tests/test_concurrency.py` — all exist.
+>
+> **The plan's own names never landed** — no `SchemaLock`, no `_schema_snapshot`,
+> no `_mint_oplog_seq_range`, no `acquire_shared`; the delivered design reached
+> the same goal by a different route, which is why a name-based check reports the
+> work as missing. (This audit made exactly that mistake first.) Boxes are left
+> unticked rather than bulk-ticked because mapping each one onto the delivered
+> design needs a reader who knows the lock path.
+>
+> Scope note: 63 `with self._lock` sites remain, and that is not a backlog item —
+> `tasks/backlog.md` records that **the Python server is not a perf target;
+> throughput and latency work goes to the Rust server.**
+
 Branch: TBD (`wt-concurrency`) · Worktree: `../SecantusDB-wt-concurrency`
 
 ## Goal

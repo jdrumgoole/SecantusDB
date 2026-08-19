@@ -1,5 +1,12 @@
 # Driver-validation parallelization plan
 
+> **DELIVERED (audited 2026-08-20).** The parallel gauge runner exists:
+> `invoke validate-all --jobs` (tasks.py:1545, default 4) fans the thirteen driver
+> gauges out concurrently, `validate-all-servers` (1649) does both servers, and the
+> per-gauge tasks take `--jobs` too. The concurrency ceiling this plan worried about
+> is now a documented rule in CLAUDE.md — keep `--jobs` at 4 or fewer, because
+> beyond that the daemons contend and timing-sensitive driver tests flake.
+
 Goal: cut wall-clock on the five driver-conformance gauges (`pymongo`,
 `go`, `node`, `java`, `ruby`) without compromising the property that
 each gauge runs unmodified upstream driver tests against a real
