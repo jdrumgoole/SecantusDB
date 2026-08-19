@@ -294,9 +294,17 @@ fn parse_near_spec(
     sibling_min: Option<&Bson>,
     default_spherical: bool,
 ) -> Result<((f64, f64), Option<f64>, Option<f64>, bool, bool), Fallback> {
+    // A BSON null reads as ABSENT, not as an unsupported construct. The Java
+    // driver's `Filters.nearSphere(field, point, maxDistance, minDistance)`
+    // sends `$minDistance: null` when the caller passes no minimum, and
+    // treating that as a Fallback made the Rust server reject the whole query
+    // ("uses a construct the Rust server does not support") where the Python
+    // server returns the matching document — the last failure in the
+    // java-vs-Rust gauge. Mirrors `query._opt_number`, which returns None for
+    // None and only rejects a non-number.
     let opt_number = |b: Option<&Bson>| -> Result<Option<f64>, Fallback> {
         match b {
-            None => Ok(None),
+            None | Some(Bson::Null) => Ok(None),
             Some(v) => num(v).map(Some).ok_or(Fallback),
         }
     };
@@ -498,6 +506,56 @@ mod tests {
     }
     fn xy(x: f64, y: f64) -> Bson {
         Bson::Array(vec![Bson::Double(x), Bson::Double(y)])
+    }
+
+    /// The Java driver sends `$minDistance: null` when `Filters.nearSphere` is
+    /// called with no minimum. A null must read as ABSENT — rejecting it made
+    /// the Rust server refuse the whole query while the Python server answered
+    /// it, which was the last java-vs-Rust gauge failure.
+    #[test]
+    fn a_null_distance_bound_reads_as_absent() {
+        let point = Bson::Document(doc! {"type": "Point", "coordinates": [1.0, 1.0]});
+        let near = doc! {
+            "$geometry": {"type": "Point", "coordinates": [1.01, 1.01]},
+            "$maxDistance": 10000.0,
+            "$minDistance": Bson::Null,
+        };
+        assert!(
+            op_geo_near(&[Some(&point)], &Bson::Document(near), None, None, true).unwrap(),
+            "a null $minDistance must not reject the query"
+        );
+    }
+
+    #[test]
+    fn a_null_max_distance_is_also_absent() {
+        // Absent means unbounded, so a far-away point still matches.
+        let point = Bson::Document(doc! {"type": "Point", "coordinates": [40.0, 40.0]});
+        let near = doc! {
+            "$geometry": {"type": "Point", "coordinates": [1.0, 1.0]},
+            "$maxDistance": Bson::Null,
+        };
+        assert!(op_geo_near(&[Some(&point)], &Bson::Document(near), None, None, true).unwrap());
+    }
+
+    #[test]
+    fn a_non_numeric_distance_bound_still_falls_back() {
+        // Only NULL is forgiven — a string is still an unsupported construct,
+        // as it is on the Python side.
+        let point = Bson::Document(doc! {"type": "Point", "coordinates": [1.0, 1.0]});
+        let near = doc! {
+            "$geometry": {"type": "Point", "coordinates": [1.01, 1.01]},
+            "$maxDistance": "far",
+        };
+        assert!(op_geo_near(&[Some(&point)], &Bson::Document(near), None, None, true).is_err());
+    }
+
+    #[test]
+    fn a_null_sibling_bound_reads_as_absent_too() {
+        // The legacy pair form lifts the bounds to sibling keys.
+        let point = xy(1.0, 1.0);
+        let near = Bson::Array(vec![Bson::Double(1.01), Bson::Double(1.01)]);
+        let null = Bson::Null;
+        assert!(op_geo_near(&[Some(&point)], &near, Some(&null), Some(&null), false).unwrap());
     }
 
     #[test]
