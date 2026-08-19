@@ -1,6 +1,6 @@
 # mongo-c-driver Validation Report
 
-Generated 2026-08-11 — SecantusDB 0.6.0b9 vs mongo-c-driver 57dba9c (`vendor/mongo-c-driver/`).
+Generated 2026-08-19 — SecantusDB 0.6.0b12 vs mongo-c-driver 57dba9c (`vendor/mongo-c-driver/`).
 
 Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** driver (`libmongoc`) is the lowest-level official client — and (with the Go and PHP-extension gauges) one of the strictest wire-protocol checks.
 
@@ -9,8 +9,8 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | Suite | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `/BulkOperation` | 92 | 1 | 10 | 103 | 98.9% |
-| `/Client` | 96 | 8 | 17 | 121 | 92.3% |
-| `/Collection` | 145 | 0 | 12 | 157 | 100.0% |
+| `/Client` | 96 | 8 | 15 | 119 | 92.3% |
+| `/Collection` | 144 | 0 | 12 | 156 | 100.0% |
 | `/Cursor` | 70 | 0 | 0 | 70 | 100.0% |
 | `/Database` | 19 | 0 | 0 | 19 | 100.0% |
 | `/ReadConcern` | 6 | 0 | 0 | 6 | 100.0% |
@@ -19,7 +19,7 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | `/WriteConcern` | 11 | 0 | 2 | 13 | 100.0% |
 | `/bulkwrite` | 0 | 0 | 13 | 13 | 100.0% |
 | `/change_stream` | 7 | 0 | 18 | 25 | 100.0% |
-| `/change_streams` | 10 | 1 | 0 | 11 | 90.9% |
+| `/change_streams` | 11 | 0 | 0 | 11 | 100.0% |
 | `/collection-management` | 5 | 0 | 0 | 5 | 100.0% |
 | `/command_monitoring` | 33 | 1 | 1 | 35 | 97.1% |
 | `/crud` | 160 | 0 | 12 | 172 | 100.0% |
@@ -28,9 +28,9 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | `/gridfs_old` | 32 | 0 | 2 | 34 | 100.0% |
 | `/index-management` | 6 | 0 | 0 | 6 | 100.0% |
 | `/long_namespace` | 7 | 0 | 2 | 9 | 100.0% |
-| **Overall** | **739** | **11** | **91** | **841** | **98.5%** |
+| **Overall** | **739** | **10** | **89** | **838** | **98.7%** |
 
-## Failures (11)
+## Failures (10)
 
 First 30 failed tests for triage:
 
@@ -45,7 +45,6 @@ First 30 failed tests for triage:
 /Client/last_write_date_absent/pooled
 /BulkOperation/OP_MSG/max_msg_size
 /command_monitoring/unified/writeConcernError
-/change_streams/unified/change-streams-resume-errorLabels
 ```
 
 ## How this is generated

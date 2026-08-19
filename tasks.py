@@ -1565,6 +1565,7 @@ def validate_all(c: Context, server: str = "python", jobs: int = 4) -> None:
     import concurrent.futures
     import subprocess
     import sys
+    import threading
 
     if server not in ("python", "rust"):
         raise SystemExit(f"--server must be 'python' or 'rust', got {server!r}")
@@ -1585,15 +1586,28 @@ def validate_all(c: Context, server: str = "python", jobs: int = 4) -> None:
         ("dotnet", "validate-dotnet"),
     ]
 
+    # `java` and `kotlin` both drive `./gradlew` inside the SAME vendored
+    # monorepo (`vendor/mongo-java-driver` — the Kotlin driver ships in it), so
+    # running them concurrently contends on Gradle's project lock and one dies
+    # with "Gradle Test Executor … failed to execute tests" +
+    # "SmokeTests#initializationError". That is a HARNESS failure that reports
+    # as 0 passed / 2 failed — a plausible-looking 0.0% pass rate that would go
+    # straight onto the website's driver panel. Observed 2026-08-19 at
+    # `--jobs 4`; the same commit measured 294 / 0 / 100.0% when kotlin ran
+    # alone. Serialise the pair against each other (they still overlap freely
+    # with the other eleven).
+    gradle_lock = threading.Lock()
+    GRADLE_GAUGES = {"java", "kotlin"}
+
     def _run(name_task: tuple[str, str]) -> tuple[str, int]:
         name, task_name = name_task
         # Stream stdout/stderr directly so the user gets live progress.
         # We don't capture — interleaving is the price of parallelism.
-        result = subprocess.run(
-            ["uv", "run", "--no-sync", "python", "-m", "invoke", task_name, "--server", server],
-            check=False,
-        )
-        return name, result.returncode
+        cmd = ["uv", "run", "--no-sync", "python", "-m", "invoke", task_name, "--server", server]
+        if name in GRADLE_GAUGES:
+            with gradle_lock:
+                return name, subprocess.run(cmd, check=False).returncode
+        return name, subprocess.run(cmd, check=False).returncode
 
     # Parallel by default. Earlier parallel attempts flaked, but the cause
     # was an ephemeral-port TOCTOU race in the runners — each picked a free
