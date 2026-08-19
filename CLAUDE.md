@@ -243,6 +243,29 @@ After every push (to a feature branch via PR — the default — or to `main`), 
 
 ## Conventions for changes here
 
+- **Claim a backlog item before working it — the claim is a PUSHED branch.**
+  This repo runs several parallel sessions against one `tasks/backlog.md`, and
+  the same item repeatedly got picked up twice: `set` and `timetz` in the pgtest
+  campaign, plus `tuple` and `procedure`, were each built independently by two
+  sessions and one copy thrown away. Before starting an item:
+  1. `git fetch origin --prune`, then `git ls-remote --heads origin` and
+     `gh pr list --state open`. A branch or open PR matching the item means
+     another session holds it — pick something else.
+  2. **Re-verify the item is still open by reproducing it** — run the corpus
+     file, the failing test, the query. The backlog lags reality: several
+     "open" items here had already been fixed by a parallel session, and two
+     others *understated* the bug (`octet_length` was filed as a `char(n)`
+     padding nit when it was wrong for every string input). Never implement
+     from the backlog text alone.
+  3. Claim it by creating the branch and **pushing it immediately, before the
+     first real commit** — `git push -u origin <branch>` on an empty branch, or
+     open a draft PR. An unpushed local branch is invisible to every other
+     session and claims nothing. The repo already uses one branch per slice;
+     the only change is that the push moves to the start.
+  4. Release by merging and deleting the branch (see the teardown bullet
+     below), or by deleting your own branch if you abandon the item.
+  5. **Never delete or force-push another session's claim branch**, however
+     stale it looks. Report it and let Joe decide.
 - **Batch several slices into ONE branch and PR — do not run the full suite per
   small feature.** The suite is ~6,000 tests and 12–13 minutes; running it after
   every one-file change makes the ceremony cost dwarf the work. Nine
