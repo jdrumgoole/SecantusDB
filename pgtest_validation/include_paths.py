@@ -89,6 +89,19 @@ EXPECTED_DIVERGENCES: dict[str, str] = {
         "(INSERT + RAISE NOTICE), COMMIT/ROLLBACK inside the procedure, and DROP "
         "PROCEDURE — over both the simple and extended protocols."
     ),
+    "procedure": (
+        "procedure:68 pins the NoticeResponse's SOURCE-LOCATION fields to "
+        "crdb's own Go internals — File=\"builtins.go\", Routine=\"func401\" "
+        "— with no crdb_only marker. Those fields name the server's own source "
+        "file and function, so they are unmatchable by any other "
+        "implementation: real PostgreSQL 14 emits Routine=exec_stmt_raise, "
+        "File=pl_exec.c (probed), and SecantusDB leaves them empty rather than "
+        "fabricate a C source location it does not have. Everything the stanza "
+        "actually regression-tests works: CREATE PROCEDURE ... LANGUAGE "
+        "plpgsql, CALL p(), and the three RAISE NOTICE messages (foo / bar / "
+        "baz) arriving in order with SQLSTATE 00000, followed by "
+        "CommandComplete CALL."
+    ),
     "typing": (
         "typing's two non-crdb stanzas both use keepErrMessage and pin crdb's "
         "wording for a mixed-type comparison: 22023 'unsupported comparison "

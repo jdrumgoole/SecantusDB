@@ -953,27 +953,28 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ## 7. Python → Rust rewrite (in progress)
 
-### 7.0 Cache-pressure rollback has no end-to-end test
+### 7.0 Cache-pressure rollback — CI exercises it now
 
-`WT_ROLLBACK` is two conditions wearing one code — a genuine write-write
-conflict (retryable → `WriteConflict`) and WiredTiger abandoning a transaction
-whose own dirty content it cannot evict (NOT retryable →
-`TransactionTooLargeForCache`). `Session::rollback_reason()` now separates them
-at all three sites that mint the error, which is what stopped
-`transaction_dirty_budget_guard` flaking in CI (the post-statement dirty-budget
-guard can be beaten by the engine when its per-statement estimate undershoots).
+`WT_ROLLBACK` is two conditions wearing one code: a write-write conflict
+(retryable → `WriteConflict`) and WiredTiger abandoning a transaction whose own
+dirty content it cannot evict (NOT retryable → `TransactionTooLargeForCache`).
+`Session::rollback_reason()` separates them at all three sites that mint the
+error (#981).
 
-**The concurrency branch is covered end-to-end** (`concurrent_writes.rs` drives a
-real conflict inside a user transaction against real WiredTiger and asserts it
-stays a `WriteConflict`) and the classifier is unit-tested against the reason
-strings WT emits. **The cache-pressure branch is not** — forcing WiredTiger to be
-the one that rolls back needs the guard out of the way, and the guard is derived
-from the connection's `cache_size` with no override. 80 runs under 8-way
-concurrency plus 10 CPU burners on a 12-core Mac did not reproduce it; the CI
-runner's slower I/O and tighter RAM are what tip it. To close this, add a
-`StorageOptions` override for the dirty budget, set it absurdly high in a test,
-and assert the oversized transaction reports `TransactionTooLargeForCache`
-(not `WriteConflict`) when WT rolls it back.
+This entry recorded that the cache-pressure branch had no end-to-end coverage,
+because it could not be reproduced on a fast machine (80 runs under 8-way
+concurrency plus 10 CPU burners did not trigger it). **It has since fired for
+real on a loaded CI runner**, which both confirmed the classification works and
+exposed the last piece: the condition can surface at EITHER level — our own
+post-statement guard returns it as the outer `Err`, while an engine-side
+rollback during the statement returns it as the INNER one. `txn_budget.rs`
+accepted only the outer, so it panicked on the inner. It now accepts both.
+
+So the branch is exercised, just not deterministically: CI is where it happens.
+A `StorageOptions` override for the dirty budget would still let a test force
+the engine to lose the race on demand, which is worth having if this area
+changes again.
+
 
 ### 7.1 Rust server performance and security review (2026-06-16) — CLOSED
 
@@ -3273,74 +3274,39 @@ shared storage engine or building large new protocol subsystems:
   interrupt that socket read and it would wedge the weekly gauge. Closing this
   is one gauge run — drop the `EXCLUDE_CLASSES` entry and run
   `pgjdbc_validation.runner`.
-- [ ] **pgtest gauge — wire-fidelity clusters** (`invoke validate-pgtest`,
-  **43/65 files pass** at `docs/validation-report-pgtest.md` — 7 expected
-  divergences, 10 unexpected failures, 5 skipped): the corpus is byte-exact
-  per message, and each file stops at its first mismatch, so fixes compound.
-  Recently landed: `void` (pg_sleep → void oid 2278), `set` (dotted custom
-  GUCs), `varbit` (binary bit/varbit `varbit_recv` framing), `unknown`
-  (oid-705 params resolved from context). Expected divergences added:
-  `spatial` / `box2d` / `pgvector` (PostGIS + pgvector extension types, out
-  of scope). Remaining 10 unexpected failures, triaged:
-  - ~~**`timezone`**~~ — GREENED: the timetz size stanzas use
-    `ignore_data_type_sizes`, so the real gap was a `timetz` zone offset with
-    seconds (`+01:01:03`) being rejected; session-TimeZone timestamptz
-    rendering (incl. historical LMT `-05:50:36`), GMT-N upper-casing, and the
-    binary time-type encodings already worked.
-  - **`typing`** — the non-crdb path expects `SELECT id FROM t WHERE v = $1`
-    (v varchar, `$1` declared uuid 2950 / bool 16) to ErrorResponse. We
-    return `SELECT 0` (silent success): the comparison type-checker doesn't
-    see the *param's declared OID*, so it never detects the cross-type
-    `varchar = uuid` clash. Even fixed we'd emit PG's `42883` "operator does
-    not exist", while the corpus pins crdb's `22023` "unsupported comparison
-    operator" via keepErrMessage — so the file can't pass, but the silent
-    success is a real gap worth closing (thread the declared param OID into
-    the WHERE type-check).
-  - **`row_description`** — `SELECT a, c FROM …` over base-table columns:
-    we report `TableAttributeNumber` 0, PG reports the source column's attnum
-    (1). Needs output-column → base-column attnum provenance in the
-    RowDescription builder (`ignore_table_oids` zeroes TableOID but keeps
-    attnum, so the attnum must be right).
-  - ~~**`tuple`**~~ — GREENED: the `(a, b, …)` anonymous record constructor
-    (binary + text output preserving per-field type oids), binary composite
-    bind params validated with PG's exact errors (08P01/42804/22P03), a
-    RECORD (2249) param rejected 0A000, and `$1::user_type` inferring the
-    minted oid.
-  - ~~**`procedure`**~~ — FEATURE IMPLEMENTED, file now an expected divergence:
-    `CREATE PROCEDURE` (IN/OUT/INOUT argmodes, either order), `CALL` returning
-    OUT/INOUT params as the result row over simple + extended protocols, plpgsql
-    body (INSERT + RAISE NOTICE) and `COMMIT`/`ROLLBACK` inside a procedure, and
-    `DROP PROCEDURE` all work. The file can't be byte-green because its `RAISE
-    NOTICE` stanzas pin crdb's internal source fields (`File:builtins.go`,
-    `Routine:func401`), which the runner doesn't normalize and no non-crdb server
-    emits (real PG sends `pl_exec.c`/`exec_stmt_raise`).
-  - ~~**`multiple_active_portals` / `…/query_timeout`**~~ — now an expected
-    divergence (crdb pausable-portal test). `statement_timeout` is now ENFORCED
-    (57014) for simple / single-statement queries — a real feature — but
-    `query_timeout` expects a MaxRows:1-paged portal to emit N rows then time
-    out on the next pull, which needs LAZY per-row portal evaluation (we
-    materialise eagerly); and `interleave_with_unpausable_portal` pins crdb's
-    `0A000 unimplemented pausable portal` error (go.crdb.dev hint) that real PG
-    doesn't produce. Both classified expected.
-  - ~~**`schema_changes_implicit_txn` / `…/triggers`**~~ — GREENED: the only
-    gap was `DROP TRIGGER` (CREATE TRIGGER + firing already worked, and the
-    autocommit-during-bind subtest already passed); `DROP TRIGGER [IF EXISTS]
-    name ON table` now removes the trigger.
-  - ~~**`timezone`**~~ — GREENED: it turned out the timetz size stanzas use
-    `ignore_data_type_sizes`, so the only real gap was accepting a `timetz`
-    zone offset with seconds (`+01:01:03`); the session-TimeZone timestamptz
-    rendering (historical LMT `-05:50:36`), GMT-N upper-casing, and binary
-    time-type encodings all already worked.
-  - ~~**`pgjdbc`**~~ — GREENED: `DISCARD <target>` command tags, a simple
-    `Query` mid-pipeline committing the pending extended-protocol implicit
-    transaction (pgjdbc's autosave interleave), and stored-procedure OUT
-    parameters (keyed by total param count, OUT/INOUT params forming the CALL
-    result row and the extended `Describe`-portal shape without running the
-    body — pgjdbc #158771).
-  - NO unexpected failures remain. Every non-passing file is a documented
-    expected divergence: `char`, `int2vector`, `jsonpath`, `portals`, `typing`,
-    `row_description`, `procedure`, `spatial`, `box2d`, `pgvector`,
-    `multiple_active_portals` (+ its `query_timeout` subtest).
+- [x] **pgtest gauge — CAMPAIGN COMPLETE.** `docs/validation-report-pgtest.md`:
+  **49/66 files pass, 12 expected divergences, ZERO unexpected failures**
+  (5 skipped), from 43 unexpected failures when the campaign started
+  2026-08-16. Every file that does not pass is a documented crdb-vs-PG conflict,
+  each with its reason inline in `pgtest_validation/include_paths.py`.
+
+  The divergences fall into two kinds, and neither is fixable without making
+  SecantusDB *less* faithful to PostgreSQL:
+
+  * **crdb internals pinned by the corpus** — `char` (crdb's deterministic
+    TableOID), `int2vector` (crdb's NULLS-FIRST pkey indoption), `procedure`
+    (crdb's NoticeResponse `File`/`Routine` = `builtins.go`/`func401`; real PG
+    emits `exec_stmt_raise`/`pl_exec.c`, probed), `portals` and `typing`
+    (`keepErrMessage` pinning crdb's error wording where PG's differs).
+  * **crdb-only surface** — `row_description`'s `::STRING` casts (PG: `42704`),
+    `jsonpath`'s binary form, and the extension types `spatial` / `box2d` /
+    `pgvector`.
+
+  Fixes that landed along the way, in order: 25P02 aborted-transaction rules,
+  binary-param error classes, batch/segment parse, portal lifetime + snapshots,
+  citext, COPY, decimal, enum, execute, float4, error fields, inet, cached-plan
+  revalidation at Bind, base-column identity across joins/views/retypes,
+  parameter-type resolution at Parse, timetz sub-minute offsets, `void`, `set`,
+  `varbit`, `unknown`, row constructors, and CREATE PROCEDURE / CALL.
+
+  **Note for re-runs:** drive the runner directly —
+  `PYTHONPATH=. .venv/bin/python -m pgtest_validation.runner` then
+  `... -m pgtest_validation.generate_report .validation/pgtest-raw.json
+  docs/validation-report-pgtest.md`. `invoke validate-pgtest` spawns the daemon
+  without `PYTHONPATH` and dies with "pg daemon did not become ready within
+  15s" (the same wrapper issue the psycopg gauge has).
+
+
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
   **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,
   from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn campaign
@@ -3388,30 +3354,49 @@ shared storage engine or building large new protocol subsystems:
   used to fail — `NOT (...)`, `BETWEEN`, `count(*) * 2`, `sum(n) + count(*)`,
   `abs(sum(n))`, `CASE`, `coalesce`, `max - min`, `count(*)::text` — and all
   ten now match PostgreSQL 14 row for row.
-- [ ] **`char(n)` / `varchar(n)` declared length is not enforced**: an overlong
-  value is stored and returned intact, where PG raises `22001 value too long
-  for type character(8)` / `character varying(3)` (probed against 14 —
-  trailing-blank-only overflow is the one accepted case). Found while adding
-  blank padding for `char(n)` (slice 28). Related, from the same probe: the
-  padding is applied on the way OUT (`typemap.blank_pad`, at both wire render
-  paths) rather than on the way in, which is what keeps `length()`,
-  comparison, and `::text` seeing the unpadded value as PG does — but it means
-  `octet_length()` reports the unpadded byte count (PG reports the padded one),
-  and `char(n)[]` array elements are not padded.
-- [ ] **`::STRING` is accepted**: the crdb type alias parses and behaves as
-  `text`, where PG raises `42704 type "string" does not exist` (probed against
-  14). Harmless but a divergence; noted while recording the `row_description`
-  expected divergence, whose final stanza depends on crdb's `STRING(2)` →
-  `varchar` truncation.
-- [ ] **Casts to text beyond the scalar numerics.** `_eval_cast` now converts
-  int / float / Decimal / bool to Postgres' own text spellings (probed against
-  14: `2.0::float8` -> `2`, `2.50::numeric` keeps its scale, `true` -> `true`
-  not the wire form `t`), which is what made `count(*)::text = '2'` compare as
-  text instead of silently matching nothing. Not audited: the same conversion
-  through the PUSHDOWN path — `SELECT n::text FROM t` still returns the number
-  (harmless on the wire, since the rendered bytes match, but a pushdown
-  comparison against a text literal would have the original bug) — and the
-  non-scalar targets (interval, bit, geo) that fall through unchanged.
+- [x] **`char(n)` / `varchar(n)` declared length — ENFORCED.** An over-length
+  value now raises `22001 value too long for type character varying(3)` /
+  `character(3)` on INSERT and UPDATE, instead of being stored intact (a column
+  holding data that violates its own declared schema). Trailing-blank overflow
+  is trimmed rather than refused, matching PostgreSQL 14 (`'abc  '` into
+  `varchar(3)` stores `'abc'`; `'abcd'` is refused) — `typemap.enforce_declared_length`.
+  The `octet_length()` note that sat here turned out to understate the problem:
+  `octet_length` and `bit_length` were dispatched to the BIT-STRING
+  implementations for EVERY input, so `octet_length('abc')` answered
+  `(3+7)//8 = 1` and `bit_length('abc')` answered 3 (PG: 3 and 24). Both now
+  measure encoded bytes for text and keep the bit semantics for bit values.
+  Still open, and genuinely narrow: `octet_length()` on a `char(n)` returns the
+  unpadded count (4 in PG for `'xy'::char(4)`) because padding is applied at
+  render, not in storage — the scalar evaluator has no access to the declared
+  width; and `char(n)[]` elements are not padded.
+
+
+- [x] **`::STRING` — WON'T FIX, and here is why.** The crdb type alias parses
+  and behaves as `text`, where PG raises `42704 type "string" does not exist`.
+  Rejecting it is not worth doing: sqlglot normalises `STRING` to `TEXT` at
+  parse time, so by the time the planner sees the cast it is indistinguishable
+  from a real `::text` — detecting it would mean sniffing the raw SQL string,
+  which is fragile (a column named `string`, a literal containing `::STRING`)
+  for a spelling no PostgreSQL client emits. The only thing that asks for it is
+  crdb's own corpus, which is already a recorded divergence
+  (`row_description`). Accepting a non-PG alias is a permissiveness, not a
+  wrong answer.
+
+
+- [x] **Casts to text — the predicate path is closed too.** `_eval_cast`
+  converts int / float / Decimal / **Decimal128** / bool to Postgres' text
+  spellings, and a WHERE comparing a cast-to-text now routes to per-row
+  evaluation (`_where_has_text_cast_comparison`) instead of pushing a filter
+  that compared the raw stored value — `WHERE n::text = '2'` matched NOTHING
+  before. Decimal128 mattered specifically because `numeric` is stored as one,
+  so `WHERE d::text = '2.50'` was comparing a Decimal128 against a string.
+  `interval::text` is fixed too — it used to hand the client our INTERNAL
+  subdocument (`{"interval": {"months": 0, "days": 1, ...}}`) instead of
+  Postgres' `1 day`; it now renders through `intervals.render`, the same path
+  the wire layer uses for an interval column. `bit::text` was already correct.
+  Still unconverted: geo and other composite targets.
+
+
 - [ ] **Multi-way comma-join performance — much improved, `select4`/`select5`
   still over the 300s cap.** Two pushdowns landed (see
   `_push_single_table_predicates` / `_key_comma_joins_from_where`):

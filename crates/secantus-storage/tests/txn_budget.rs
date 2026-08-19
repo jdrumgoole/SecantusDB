@@ -35,14 +35,27 @@ fn transaction_dirty_budget_guard() {
     let mut tripped = false;
     for i in 0..32i64 {
         let doc_bytes = enc(&doc! {"_id": i, "pad": filler.clone()});
+        // The budget can trip at EITHER level, and both are correct:
+        //
+        //   * the OUTER Err is our own post-statement guard, sized from the
+        //     cache;
+        //   * the INNER Err is WiredTiger hitting its dirty limit DURING the
+        //     statement and rolling back, which the rollback-reason check maps
+        //     to the same error.
+        //
+        // Accepting only the outer one made this test fail on a loaded runner
+        // whenever the engine got there first — the flake the rollback-reason
+        // classification was written for. It cannot be reproduced on a fast
+        // machine (80 runs under 8-way concurrency did not), so CI is where
+        // this branch actually gets exercised.
         match st.with_user_transaction(&mut txn, || st.insert("app", "c", vec![doc_bytes], true)) {
-            Ok(inner) => {
-                inner.unwrap();
-            }
-            Err(StorageError::TransactionTooLargeForCache) => {
+            Ok(Ok(_)) => {}
+            Ok(Err(StorageError::TransactionTooLargeForCache))
+            | Err(StorageError::TransactionTooLargeForCache) => {
                 tripped = true;
                 break;
             }
+            Ok(Err(inner)) => panic!("unexpected error from the statement: {inner}"),
             Err(other) => panic!("unexpected error: {other}"),
         }
     }
