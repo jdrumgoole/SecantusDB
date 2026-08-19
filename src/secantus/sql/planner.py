@@ -8227,7 +8227,14 @@ def _append_forward_join(
     amap[join_alias] = ("join", join_table)
 
 
-def _key_comma_joins_from_where(stmt: exp.Select, base_alias: str) -> None:
+def _key_comma_joins_from_where(
+    stmt: exp.Select,
+    base_alias: str,
+    base: TableDef | None = None,
+    db: str | None = None,
+    catalog: Any = None,
+    storage: Any = None,
+) -> None:
     """Push simple cross-table equalities from WHERE onto comma-join ON clauses.
 
     A pure comma-join (``FROM a, b, …`` — no ON, no outer side) compiles to an
@@ -8250,6 +8257,33 @@ def _key_comma_joins_from_where(stmt: exp.Select, base_alias: str) -> None:
     conjuncts = _and_conjuncts(where.this)
     available = {base_alias}
     consumed: set[int] = set()
+    # Which alias owns each column NAME. The sqllogictest corpus writes its join
+    # equalities unqualified (``WHERE a3=b9``, not ``t3.a3=t9.b9``), so without
+    # this every comma join stayed unkeyed and the plan degenerated into the
+    # cartesian product this function exists to prevent. Only UNAMBIGUOUS names
+    # are usable: a name declared by two joined tables can't be attributed, and
+    # guessing would key the join on the wrong table.
+    owner_of: dict[str, str | None] = {}
+    if catalog is not None and db is not None:
+        defs: list[tuple[str, TableDef]] = []
+        if base is not None:
+            defs.append((base_alias, base))
+        for jn in joins:
+            src = jn.this
+            a = _join_source_alias(src)
+            if a is None or not isinstance(src, exp.Table):
+                continue
+            tdef = _lookup_table_def(catalog, db, src, storage)
+            if tdef is not None:
+                defs.append((a, tdef))
+        for alias, tdef in defs:
+            for col in tdef.columns:
+                # None marks "ambiguous" — seen under more than one alias.
+                owner_of[col.name] = None if col.name in owner_of else alias
+
+    def alias_of(node: exp.Column) -> str | None:
+        return node.table or owner_of.get(node.name)
+
     for jn in joins:
         alias = _join_source_alias(jn.this)
         if jn.args.get("on") is not None or jn.args.get("side") or alias is None:
@@ -8265,16 +8299,24 @@ def _key_comma_joins_from_where(stmt: exp.Select, base_alias: str) -> None:
                 or not isinstance(c.expression, exp.Column)
             ):
                 continue
-            la, ra = c.this.table or None, c.expression.table or None
+            la, ra = alias_of(c.this), alias_of(c.expression)
             if (la == alias and ra in available and ra != alias) or (
                 ra == alias and la in available and la != alias
             ):
                 keys.append(c)
                 consumed.add(i)
         if keys:
-            on = keys[0].copy()
-            for k in keys[1:]:
-                on = exp.And(this=on, expression=k.copy())
+            # QUALIFY the relocated columns. The equality may have arrived
+            # unqualified (`a3=b9`), and an ON clause has to say which side is
+            # local and which is foreign for the `$lookup` to be keyed at all.
+            def qualified(node: exp.Column) -> exp.Column:
+                owner = alias_of(node)
+                return exp.column(node.name, table=owner) if owner else node.copy()
+
+            on: exp.Expression | None = None
+            for k in keys:
+                eq = exp.EQ(this=qualified(k.this), expression=qualified(k.expression))
+                on = eq if on is None else exp.And(this=on, expression=eq)
             jn.set("on", on)
         available.add(alias)
     if not consumed:
@@ -8352,7 +8394,7 @@ def _build_join_pipeline(
     # Key comma-joins from WHERE before building stages: an unkeyed comma-join
     # $lookup returns the WHOLE foreign collection (a cartesian product), so a
     # multi-table comma-join over the catalogs explodes (getImportedKeys 183GB).
-    _key_comma_joins_from_where(stmt, base_alias)
+    _key_comma_joins_from_where(stmt, base_alias, base, db, catalog, storage)
 
     # Each JOIN compiles to a $lookup + $unwind. The lookup's localField may point
     # into an already-joined alias (a chain like a⋈b⋈c where c joins on b), which
@@ -8365,8 +8407,201 @@ def _build_join_pipeline(
     # A correlated / EXISTS WHERE is left for per-row evaluation (see
     # ``_build_evaluated_join``); only a pushdown-able WHERE becomes a ``$match``.
     if where is not None and not where_needs_per_row(stmt) and _join_where_lowerable(stmt, resolve):
-        pipeline.append({"$match": _expr_to_filter(where.this, resolve, _pipeline_subctx.get())})
+        filt = _expr_to_filter(where.this, resolve, _pipeline_subctx.get())
+        residual = _push_single_table_predicates(filt, pipeline, amap, base_alias)
+        if residual:
+            pipeline.append({"$match": residual})
     return base, amap, resolve, pipeline, derived
+
+
+def _filter_field_keys(value: Any) -> list[str]:
+    """Every field key a (possibly nested) filter fragment touches.
+
+    Operator keys are structural, not fields, so they are walked through rather
+    than collected — what comes back is the set of document paths the fragment
+    constrains.
+    """
+    out: list[str] = []
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k.startswith("$"):
+                out.extend(_filter_field_keys(v))
+            else:
+                out.append(k)
+    elif isinstance(value, list):
+        for item in value:
+            out.extend(_filter_field_keys(item))
+    return out
+
+
+def _sole_filter_owner(
+    value: Any, amap: dict[str, tuple[str, TableDef]], base_alias: str | None
+) -> str | None:
+    """The one alias every field in ``value`` belongs to, or None if it spans
+    tables (or touches nothing attributable)."""
+    owners: set[str] = set()
+    keys = _filter_field_keys(value)
+    if not keys:
+        return None
+    for key in keys:
+        prefix, _, rest = key.partition(".")
+        if rest and prefix in amap:
+            owners.add(prefix)
+        elif not rest and prefix not in amap:
+            owners.add(base_alias or "")
+        else:
+            return None
+        if len(owners) > 1:
+            return None
+    return next(iter(owners)) if owners else None
+
+
+def _strip_alias_prefix(value: Any, alias: str) -> Any:
+    """``value`` with a leading ``alias.`` removed from every field key — the
+    lookup sub-pipeline runs against that collection, so its own paths apply."""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if k.startswith("$"):
+                out[k] = _strip_alias_prefix(v, alias)
+            else:
+                out[k[len(alias) + 1 :] if k.startswith(f"{alias}.") else k] = v
+        return out
+    if isinstance(value, list):
+        return [_strip_alias_prefix(item, alias) for item in value]
+    return value
+
+
+def _flatten_and(filt: dict[str, Any]) -> list[dict[str, Any]]:
+    """``filt`` as a list of single-key conjuncts, flattening nested ``$and``.
+
+    A filter carrying an OR arrives as one ``{"$and": [...]}`` key, which would
+    otherwise be judged as a single (table-spanning) conjunct.
+    """
+    out: list[dict[str, Any]] = []
+    for key, value in filt.items():
+        if key == "$and" and isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    out.extend(_flatten_and(item))
+        else:
+            out.append({key: value})
+    return out
+
+
+def _merge_frags(frags: list[dict[str, Any]]) -> dict[str, Any]:
+    """Recombine conjunct fragments, using ``$and`` only when a key repeats (two
+    predicates on one field can't share a dict key)."""
+    out: dict[str, Any] = {}
+    extra: list[dict[str, Any]] = []
+    for frag in frags:
+        for key, value in frag.items():
+            if key in out:
+                extra.append({key: value})
+            else:
+                out[key] = value
+    if extra:
+        first = dict(out)
+        out = (
+            {"$and": [first, *extra]}
+            if first
+            else ({"$and": extra} if len(extra) > 1 else extra[0])
+        )
+    return out
+
+
+def _push_single_table_predicates(
+    filt: dict[str, Any],
+    pipeline: list[dict[str, Any]],
+    amap: dict[str, tuple[str, TableDef]],
+    base_alias: str | None,
+) -> dict[str, Any]:
+    """Move each single-table WHERE conjunct to the stage that produces its rows,
+    returning whatever must still be matched after the join.
+
+    A comma join whose WHERE conjuncts each constrain ONE table is a cross
+    product in disguise — sqllogictest's ``select4`` is full of them::
+
+        SELECT b7, d5+18+d5, c2 FROM t7, t2, t5
+         WHERE c5=733 AND a2 IN (...) AND 460=e7
+
+    There is no join condition at all. Matching after the ``$lookup``s means
+    materialising |t7| x |t2| x |t5| rows to return a handful: growth measured
+    cubic in table size (27k rows 0.09s, 216k 0.56s, 1M 2.53s), so the corpus's
+    ~700-row tables are ~343M rows — the >300s in the backlog. Filtering each
+    table as it enters collapses that to the product of the SURVIVING rows.
+
+    Only a conjunct attributable to exactly one table moves:
+
+    * a bare (unprefixed) key belongs to the base table and becomes a ``$match``
+      ahead of the first ``$lookup``;
+    * an ``<alias>.<path>`` key moves into that alias's ``$lookup``
+      sub-pipeline, prefix stripped (the sub-pipeline runs against the foreign
+      collection, so the remainder is that collection's own path);
+    * an operator subtree (``$or`` / ``$nor`` / ``$expr``) moves when EVERY field
+      it touches belongs to one table — sqllogictest constrains a table with
+      nothing but ``(e9=245 OR 35=e9 OR 799=e9)``, and leaving that behind left
+      the table both unfiltered and unjoined;
+    * anything else stays behind — a subtree spanning tables cannot be decided by
+      either table alone, and a prefix that is not a joined alias is just a
+      dotted field of the base table.
+
+    A top-level ``$and`` is FLATTENED first. Whenever the WHERE contains an OR,
+    the whole filter arrives as a single ``{"$and": [...]}`` key; treating that as
+    one conjunct made it span tables, so nothing moved — not even the plain
+    single-table equalities beside it.
+
+    **A left join's lookup is never pushed into.** WHERE runs after the join, so
+    a predicate on the right table of a LEFT JOIN must delete the outer row;
+    filtering inside the lookup would leave that row with nulls and KEEP it.
+    Only an alias whose ``$unwind`` is non-preserving (an inner join) qualifies.
+    """
+    inner_aliases = {
+        str(st["$unwind"]["path"]).lstrip("$")
+        for st in pipeline
+        if isinstance(st.get("$unwind"), dict)
+        and not st["$unwind"].get("preserveNullAndEmptyArrays", False)
+    }
+
+    per_frags: dict[str, list[dict[str, Any]]] = {}
+    base_frags: list[dict[str, Any]] = []
+    residual_frags: list[dict[str, Any]] = []
+
+    for frag in _flatten_and(filt):
+        ((key, value),) = frag.items()
+        if key.startswith("$"):
+            owner = _sole_filter_owner(value, amap, base_alias)
+            if owner is not None and owner != base_alias and owner in inner_aliases:
+                per_frags.setdefault(owner, []).append({key: _strip_alias_prefix(value, owner)})
+            elif owner is not None and owner == base_alias:
+                base_frags.append(frag)
+            else:
+                residual_frags.append(frag)
+            continue
+        prefix, _, rest = key.partition(".")
+        if rest and prefix in amap and prefix != base_alias and prefix in inner_aliases:
+            per_frags.setdefault(prefix, []).append({rest: value})
+        elif not rest and prefix not in amap:
+            base_frags.append(frag)
+        else:
+            residual_frags.append(frag)
+
+    for stage in pipeline:
+        lookup = stage.get("$lookup")
+        if not isinstance(lookup, dict):
+            continue
+        pushed = per_frags.pop(str(lookup.get("as")), None)
+        if pushed:
+            lookup.setdefault("pipeline", []).insert(0, {"$match": _merge_frags(pushed)})
+    # An alias whose $lookup wasn't found keeps its predicate rather than losing it.
+    for alias, frags in per_frags.items():
+        for frag in frags:
+            for path, value in frag.items():
+                residual_frags.append({f"{alias}.{path}": value})
+
+    if base_frags:
+        pipeline.insert(0, {"$match": _merge_frags(base_frags)})
+    return _merge_frags(residual_frags)
 
 
 def _build_outer_join_pipeline(

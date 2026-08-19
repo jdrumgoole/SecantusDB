@@ -3412,9 +3412,38 @@ shared storage engine or building large new protocol subsystems:
   (harmless on the wire, since the rendered bytes match, but a pushdown
   comparison against a text literal would have the original bug) — and the
   non-scalar targets (interval, bit, geo) that fall through unchanged.
-- [ ] **Multi-way comma-join performance**: sqllogictest `select4.test`/`select5.test`
-  4-way joins with equi-WHEREs exceed 300s — the pipeline nests `$lookup`s without
-  pushing the WHERE's equi-conditions into the lookup stages.
+- [ ] **Multi-way comma-join performance — much improved, `select4`/`select5`
+  still over the 300s cap.** Two pushdowns landed (see
+  `_push_single_table_predicates` / `_key_comma_joins_from_where`):
+
+  1. **Single-table WHERE conjuncts move to the stage that produces their rows**
+     — a bare key into a `$match` ahead of the first `$lookup`, an
+     `<alias>.<path>` key into that `$lookup`'s sub-pipeline, and an operator
+     subtree (`$or`) when every field it touches is one table's. A top-level
+     `$and` is flattened first: any WHERE containing an OR arrives as ONE
+     `{"$and": [...]}` key, which read as table-spanning and blocked every
+     conjunct beside it. Measured on 3 tables with one constant each: was cubic
+     in table size (27k-row product 0.09s, 216k 0.56s, 1M 2.53s), now flat —
+     a 343M-row product answers in 0.01s.
+  2. **Unqualified cross-table equalities now key the comma joins.**
+     `_key_comma_joins_from_where` only matched `c.this.table`, and the corpus
+     writes `WHERE a3=b9`, not `t3.a3=t9.b9` — so every comma join stayed
+     unkeyed and became a cartesian product. It now resolves an unqualified
+     column to its owning alias through the catalog (unambiguous names only) and
+     qualifies the relocated ON.
+
+  **Not sound to push into a LEFT join's lookup** — WHERE runs after the join, so
+  a predicate on the right table must delete the outer row; only an alias whose
+  `$unwind` is non-preserving is eligible. Verified against PostgreSQL 14 across
+  11 shapes incl. the LEFT-join traps and a cross-table OR.
+
+  **Remaining:** both files now run instead of failing fast, but still exceed the
+  runner's 300s cap (`select4` reached the 5M-doc guard on a 6-way join before
+  the OR push; both now time out). The queries are well-constrained — the 6-way
+  one expects 30 values — so what is left is the join *strategy*: unkeyed
+  lookups materialise their whole foreign side per outer row. Index-backed or
+  streaming lookups are the next step, not more predicate motion. They stay out
+  of `slt_validation` INCLUDE until then.
 
 - [ ] **Wire server: simple + extended protocol, trust + SCRAM auth, optional TLS.**
   `pgserver.py` speaks v3 startup, simple `Query` (P1), extended `Parse`/`Bind`/
