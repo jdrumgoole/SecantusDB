@@ -70,8 +70,15 @@ runs:
             && sudo timeout -k 10 "${APT_ATTEMPT_TIMEOUT}" apt-get "${apt_opts[@]}" install -y ${APT_PACKAGES}; then
             echo "::endgroup::"
             exit 0
+          else
+            # Capture INSIDE the else. After `if cmd; then …; fi` with a false
+            # condition and no else branch, `$?` is the `if` statement's own
+            # status — 0 — not the command's. Reading it after `fi` reported
+            # every failure as "exited 0" and hid the timeout classification
+            # below (observed on a real mirror stall: three 240s timeouts all
+            # logged as "exited 0").
+            rc=$?
           fi
-          rc=$?
           echo "::endgroup::"
           # 124 is timeout(1)'s "killed at the deadline" — i.e. the mirror stall
           # this action exists for, as opposed to a genuine package error.
@@ -90,6 +97,16 @@ runs:
           # lists so the retry re-fetches cleanly rather than resuming a
           # half-written state.
           sudo rm -rf /var/lib/apt/lists/partial
+          # Retrying the SAME dead mirror just burns another timeout. The
+          # runner images resolve archive.ubuntu.com through an Azure mirror
+          # list (/etc/apt/apt-mirrors.txt); when that host black-holes, every
+          # attempt stalls identically. After the first failure, pin apt to the
+          # canonical archive so the retry talks to a different host.
+          if [ -f /etc/apt/apt-mirrors.txt ] && [ "${attempt}" -eq 1 ]; then
+            echo "first attempt failed — pinning apt to archive.ubuntu.com"
+            echo "http://archive.ubuntu.com/ubuntu/	priority:1" \
+              | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
           sleep "${backoff}"
           attempt=$((attempt + 1))
         done
