@@ -953,27 +953,28 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ## 7. Python → Rust rewrite (in progress)
 
-### 7.0 Cache-pressure rollback has no end-to-end test
+### 7.0 Cache-pressure rollback — CI exercises it now
 
-`WT_ROLLBACK` is two conditions wearing one code — a genuine write-write
-conflict (retryable → `WriteConflict`) and WiredTiger abandoning a transaction
-whose own dirty content it cannot evict (NOT retryable →
-`TransactionTooLargeForCache`). `Session::rollback_reason()` now separates them
-at all three sites that mint the error, which is what stopped
-`transaction_dirty_budget_guard` flaking in CI (the post-statement dirty-budget
-guard can be beaten by the engine when its per-statement estimate undershoots).
+`WT_ROLLBACK` is two conditions wearing one code: a write-write conflict
+(retryable → `WriteConflict`) and WiredTiger abandoning a transaction whose own
+dirty content it cannot evict (NOT retryable → `TransactionTooLargeForCache`).
+`Session::rollback_reason()` separates them at all three sites that mint the
+error (#981).
 
-**The concurrency branch is covered end-to-end** (`concurrent_writes.rs` drives a
-real conflict inside a user transaction against real WiredTiger and asserts it
-stays a `WriteConflict`) and the classifier is unit-tested against the reason
-strings WT emits. **The cache-pressure branch is not** — forcing WiredTiger to be
-the one that rolls back needs the guard out of the way, and the guard is derived
-from the connection's `cache_size` with no override. 80 runs under 8-way
-concurrency plus 10 CPU burners on a 12-core Mac did not reproduce it; the CI
-runner's slower I/O and tighter RAM are what tip it. To close this, add a
-`StorageOptions` override for the dirty budget, set it absurdly high in a test,
-and assert the oversized transaction reports `TransactionTooLargeForCache`
-(not `WriteConflict`) when WT rolls it back.
+This entry recorded that the cache-pressure branch had no end-to-end coverage,
+because it could not be reproduced on a fast machine (80 runs under 8-way
+concurrency plus 10 CPU burners did not trigger it). **It has since fired for
+real on a loaded CI runner**, which both confirmed the classification works and
+exposed the last piece: the condition can surface at EITHER level — our own
+post-statement guard returns it as the outer `Err`, while an engine-side
+rollback during the statement returns it as the INNER one. `txn_budget.rs`
+accepted only the outer, so it panicked on the inner. It now accepts both.
+
+So the branch is exercised, just not deterministically: CI is where it happens.
+A `StorageOptions` override for the dirty budget would still let a test force
+the engine to lose the race on demand, which is worth having if this area
+changes again.
+
 
 ### 7.1 Rust server performance and security review (2026-06-16) — CLOSED
 
