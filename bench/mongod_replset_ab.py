@@ -50,7 +50,9 @@ ARMS: tuple[tuple[str, bool, str], ...] = (
 
 
 def _mongod() -> str:
-    found = shutil.which("mongod")
+    # See bench/concurrency.py: same override, so the oplog-tax arm can be
+    # measured against the same mongod build as the throughput arm.
+    found = os.environ.get("SECANTUS_MONGOD_BIN") or shutil.which("mongod")
     if found:
         return found
     for cand in ("/opt/homebrew/bin/mongod",):

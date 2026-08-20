@@ -9,12 +9,14 @@
 > continues.** That is the standing direction — not an aspiration attached to a
 > closed question.
 >
-> Which matters because the **VERDICT (2026-07-22) below concludes the opposite**:
-> that write-parity is not reachable for this architecture. It is already annotated
-> as superseded in part — measured under hidden CPU contention, and its claim that
-> no per-op lever exists was falsified by shipped #608. Treat it as evidence to
-> argue with, not a decision to stop. Its absolute numbers should not be quoted
-> without a fresh measurement on a quiet, pinned box.
+> The **VERDICT (2026-07-22)** further down concluded the opposite — that
+> write-parity is not reachable for this architecture. It was **retracted on
+> 2026-08-20** after a clean re-measure: it compared a Rust server writing an oplog
+> against a mongod keeping none, and both of its decisive observations (a flat gap,
+> both servers peaking at 4 writers) fail to reproduce. The honest gap is 2.4x at one
+> writer rising to 3.7x at eight — a shape that says contention, which is the
+> addressable kind. The section is kept, retracted in place, with the original
+> preserved.
 
 Status: **active** (2026-07-21). Consolidates the measured findings of the
 sharded-oplog / bounded-prune / doc-sharding / RecordId / WAL investigation so
@@ -97,6 +99,76 @@ contaminated machine produced.
 
 ---
 
+## VERDICT (2026-07-22) — RETRACTED 2026-08-20: the comparison was not like-for-like
+
+> **This section's conclusion was wrong, and the reason is worth more than the
+> conclusion was.** It is retracted rather than deleted, and kept in full at the
+> bottom, because "parity is unreachable" was quoted for a month.
+
+**What it got wrong.** The Rust server writes an oplog on every insert. The mongod it
+was measured against — `bench/concurrency.py`'s arm — runs **standalone, no
+`--replSet`, so it keeps no oplog at all**. The entire difference was then attributed
+to per-operation execution efficiency.
+
+Re-measured 2026-08-20 at `cfd5b352`, pinned detached worktree, 3 reps per point,
+spread under 2%, box verified quiet before and after:
+
+| writers | Rust | mongod 6.0.16 standalone | mongod 8.3.4 standalone | mongod 8.3.4 `replset-w1` | honest gap | VERDICT claimed |
+|---|---|---|---|---|---|---|
+| 1 | 37,308/s | 112,472/s | 118,403/s | 88,785/s | **2.38×** | 5.0× |
+| 2 | 56,620/s | 205,918/s | 216,085/s | 156,321/s | **2.76×** | 7.0× |
+| 4 | 76,629/s | 381,492/s | 392,856/s | 257,678/s | **3.36×** | 6.1× |
+| 8 | 91,729/s | 500,649/s | 499,335/s | 339,677/s | **3.70×** | 5.7× |
+
+`replset-w1` is the only like-for-like arm — oplog double-write, no fsync wait, which
+`bench/mongod_replset_ab.py` documents as "the closest semantic match to SecantusDB's
+synchronous oplog". mongod's own oplog tax is large: 119,336 → 88,785 at one writer,
+and → 12,354 under the default `w:majority` (a journal fsync per acknowledged batch).
+The same measurement against 6.0.16 gives 2.27× → 3.36×, so the conclusion does not
+depend on the mongod version.
+
+**Both decisive observations fail.**
+
+1. ~~"The gap is a flat ~5–6× at every writer count — the signature of a
+   *per-operation efficiency* gap, NOT a scaling/contention problem."~~ **It is not
+   flat.** It rises monotonically, 2.38× → 3.70× (and 3.01× → 5.46× even on the old
+   unfair standalone comparison). A gap that widens with writer count is the signature
+   of precisely what this ruled out. At 1 writer, where contention is absent, the true
+   per-op multiple is **~2.4×**, not 5×.
+2. ~~"Both servers peak at 4 writers and *drop* at 8 (Rust 1.82×, mongod 2.24×)."~~
+   Both scale through 8: **Rust 2.46×, mongod 4.45×**. The old table's mongod
+   8-writer figure (169,322/s) was *lower* than its own 4-writer figure — an inversion
+   that does not reproduce at all (8w now measures 500,649/s). That inversion is the
+   fingerprint of the CPU contention this section was already annotated as suffering.
+
+**What this changes.** The problem is a **~2.4× per-op gap plus a scaling gap that
+widens under concurrency**. The scaling half is the addressable kind — it is exactly
+where lock decomposition and RecordId work bite, the levers this section dismissed on
+the grounds that "contention fixes cannot close a flat per-op multiple". That premise
+was false, so the dismissal does not follow.
+
+**On the mongod version.** Both the old table and this re-measure used **6.0.16**:
+`/opt/homebrew/bin/mongod` is a symlink created 2024-08-07 to `mongodb-community@6.0`
+and unchanged since, so `shutil.which("mongod")` resolved identically then and now —
+version is not a confound between them. **8.3.4 is installed but unlinked**, so every
+benchmark in this repo has measured a two-year-old mongod. Now measured: 8.3.4 is
+**1.00×–1.05× of 6.0.16** across the writer range. The target has not moved, and the
+stale default cost us nothing — but pin the binary deliberately from here
+(`SECANTUS_MONGOD_BIN`) rather than inheriting whatever PATH gives.
+
+**Not retracted:** the shipped wins are real (Phase-0 single-writer 10,250 → 22,479 →
+37,308 today, ~3.6× over the baseline), and both servers do share a scaling *shape*.
+What is retracted is the load-bearing sentence: "**parity is a property of the
+execution engine, not a lever we can pull**".
+
+**Reproduce:** `bench/parity_remeasure.py` refuses to run on a loaded box or an
+attached branch, pins and records the mongod binary + version per arm, waits for load
+to decay before judging the box, and marks the artifact untrusted if the box or the
+tree moved under it. Artifacts: `bench/results/parity-remeasure/`.
+
+<details>
+<summary>Original 2026-07-22 section, retained verbatim for the record</summary>
+
 ## VERDICT (2026-07-22): mongod write-parity is NOT reachable for this architecture
 
 > **⚠️ Superseded in part — see the 2026-07-23 UPDATE above.** Measured under hidden
@@ -129,6 +201,8 @@ Every avenue in §3 was tried and measured to its ceiling; none touches the
 per-op multiple. **Parity is a property of the execution engine, not a lever we can
 pull.** The session's wins still doubled single-writer (Phase-0 baseline 10,250 →
 22,479, ~2.2×) — real, shipped, and worthwhile — but parity is out of reach.
+
+</details>
 
 ---
 

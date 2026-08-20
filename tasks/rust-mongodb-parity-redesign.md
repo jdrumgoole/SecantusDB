@@ -9,12 +9,13 @@
 > continues.** That is the standing direction — not an aspiration attached to a
 > closed question.
 >
-> Which matters because the **VERDICT (2026-07-22) below concludes the opposite**:
-> that write-parity is not reachable for this architecture. It is already annotated
-> as superseded in part — measured under hidden CPU contention, and its claim that
-> no per-op lever exists was falsified by shipped #608. Treat it as evidence to
-> argue with, not a decision to stop. Its absolute numbers should not be quoted
-> without a fresh measurement on a quiet, pinned box.
+> Relevant history: the **VERDICT (2026-07-22)** in
+> `tasks/rust-parity-forward-plan.md` concluded that write-parity is not reachable
+> for this architecture. It was **retracted on 2026-08-20** — it compared a Rust
+> server writing an oplog against a mongod keeping none, and neither of its decisive
+> observations reproduces. The honest gap is 2.4x at one writer rising to 3.7x at
+> eight, a scaling shape rather than a flat per-op wall. Don't let a stale quotation
+> of that verdict stop work planned here.
 
 Status: **active** (2026-07-20). Goal set by Joe: "redesign the rust server so it
 approaches MongoDB performance, ignore previous simplicity goals." The global-lock

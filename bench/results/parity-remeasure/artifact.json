@@ -1,0 +1,195 @@
+{
+  "captured": "2026-08-20T01:38:54.862270+00:00",
+  "sha_before": "cfd5b35292ff5b197e4ce9cf518e37b701bfcd32",
+  "sha_after": "cfd5b35292ff5b197e4ce9cf518e37b701bfcd32",
+  "sha_stable": true,
+  "mongod_version": "db version v6.0.16",
+  "mongod_arm": "standalone (no --replSet, no oplog) \u2014 see oplog_tax for the fair comparison",
+  "writers": "1,2,4,8",
+  "duration_s": 30.0,
+  "runs": 3,
+  "box_checks": [
+    {
+      "phase": "before",
+      "load": 2.80810546875,
+      "load_immediate": 2.80810546875,
+      "settle_s": 0.0,
+      "stray": [],
+      "verdict": "quiet"
+    },
+    {
+      "phase": "after",
+      "load": 3.943359375,
+      "load_immediate": 7.33740234375,
+      "settle_s": 180.0,
+      "stray": [],
+      "verdict": "quiet"
+    }
+  ],
+  "trusted": true,
+  "elapsed_s": 2526.2,
+  "results": {
+    "concurrency_rc": 0,
+    "concurrency": {
+      "rust": {
+        "server": "rust",
+        "binary": null,
+        "version": null,
+        "data": {
+          "meta": {
+            "duration": 30.0,
+            "batch": 100,
+            "writers": [
+              1,
+              2,
+              4,
+              8
+            ],
+            "shared_collection": false,
+            "runs": 3
+          },
+          "servers": {
+            "rust": {
+              "runs_docs_per_sec": [
+                [
+                  37277.5,
+                  37307.7,
+                  37494.1
+                ],
+                [
+                  57181.5,
+                  56379.5,
+                  56620.3
+                ],
+                [
+                  76532.5,
+                  77330.7,
+                  76628.7
+                ],
+                [
+                  92023.3,
+                  91633.7,
+                  91729.3
+                ]
+              ],
+              "docs_per_sec": [
+                37307.7,
+                56620.3,
+                76628.7,
+                91729.3
+              ]
+            }
+          }
+        },
+        "rc": 0
+      },
+      "mongod6": {
+        "server": "mongod",
+        "binary": "/opt/homebrew/Cellar/mongodb-community@6.0/6.0.16/bin/mongod",
+        "version": "db version v6.0.16",
+        "data": {
+          "meta": {
+            "duration": 30.0,
+            "batch": 100,
+            "writers": [
+              1,
+              2,
+              4,
+              8
+            ],
+            "shared_collection": false,
+            "runs": 3
+          },
+          "servers": {
+            "mongod": {
+              "runs_docs_per_sec": [
+                [
+                  109084.3,
+                  112472.1,
+                  112479.8
+                ],
+                [
+                  206418.3,
+                  205907.9,
+                  205917.6
+                ],
+                [
+                  381492.2,
+                  379790.2,
+                  385289.8
+                ],
+                [
+                  502551.5,
+                  499642.2,
+                  500648.9
+                ]
+              ],
+              "docs_per_sec": [
+                112472.1,
+                205917.6,
+                381492.2,
+                500648.9
+              ]
+            }
+          }
+        },
+        "rc": 0
+      },
+      "mongod8": {
+        "server": "mongod",
+        "binary": "/opt/homebrew/Cellar/mongodb-community/8.3.4/bin/mongod",
+        "version": "db version v8.3.4",
+        "data": {
+          "meta": {
+            "duration": 30.0,
+            "batch": 100,
+            "writers": [
+              1,
+              2,
+              4,
+              8
+            ],
+            "shared_collection": false,
+            "runs": 3
+          },
+          "servers": {
+            "mongod": {
+              "runs_docs_per_sec": [
+                [
+                  115740.5,
+                  118403.4,
+                  119191.5
+                ],
+                [
+                  216085.3,
+                  220376.3,
+                  215811.2
+                ],
+                [
+                  390434.0,
+                  393126.4,
+                  392855.9
+                ],
+                [
+                  499334.8,
+                  498739.2,
+                  503133.3
+                ]
+              ],
+              "docs_per_sec": [
+                118403.4,
+                216085.3,
+                392855.9,
+                499334.8
+              ]
+            }
+          }
+        },
+        "rc": 0
+      }
+    },
+    "oplog_tax_mongod": "/opt/homebrew/Cellar/mongodb-community/8.3.4/bin/mongod",
+    "oplog_tax_rc": 0,
+    "oplog_tax_tail": "  load 7.99 > 5.0, waiting...\n  load 6.44 > 5.0, waiting...\n  load 5.17 > 5.0, waiting...\nrep0 standalone  1w=118,002, 2w=219,738, 4w=392,985, 8w=498,198\n  load 8.40 > 5.0, waiting...\n  load 6.69 > 5.0, waiting...\n  load 5.43 > 5.0, waiting...\nrep0 replset     1w=12,489, 2w=20,551, 4w=41,436, 8w=70,333\nrep0 replset-w1  1w=88,785, 2w=156,321, 4w=258,753, 8w=340,757\n  load 7.07 > 5.0, waiting...\n  load 5.66 > 5.0, waiting...\nrep1 standalone  1w=119,336, 2w=220,569, 4w=396,839, 8w=498,327\n  load 8.03 > 5.0, waiting...\n  load 6.39 > 5.0, waiting...\n  load 5.19 > 5.0, waiting...\nrep1 replset     1w=12,354, 2w=20,200, 4w=41,325, 8w=72,771\nrep1 replset-w1  1w=86,008, 2w=157,171, 4w=256,721, 8w=334,377\n  load 8.58 > 5.0, waiting...\n  load 7.12 > 5.0, waiting...\n  load 6.14 > 5.0, waiting...\n  load 5.44 > 5.0, waiting...\nrep2 standalone  1w=120,596, 2w=221,509, 4w=391,689, 8w=501,541\n  load 6.57 > 5.0, waiting...\n  load 5.27 > 5.0, waiting...\nrep2 replset     1w=12,163, 2w=20,263, 4w=41,617, 8w=69,473\nrep2 replset-w1  1w=89,161, 2w=154,801, 4w=257,678, 8w=339,677\n\n=== medians (docs/s) ===\nstandalone  1w=119,336, 2w=220,569, 4w=392,985, 8w=498,327\nreplset     1w=12,354, 2w=20,263, 4w=41,436, 8w=70,333\nreplset-w1  1w=88,785, 2w=156,321, 4w=257,678, 8w=339,677\n"
+  }
+}
