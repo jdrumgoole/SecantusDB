@@ -1,5 +1,12 @@
 # RecordId step 4 — Python-server mirror: implementation plan
 
+> **DELIVERED (audited 2026-08-20).** The Python server mirrors the Rust RecordId
+> scheme byte-for-byte: `src/secantus/storage.py` carries ~86 RecordId /
+> `_frame_doc_value` references and CLAUDE.md documents the shared layout as
+> "byte-identical to the Rust server's layout (cross-server backup / PITR
+> portability)". Cross-server restore is covered by
+> `tests/test_rust_pitr_cross_server.py`. Kept for the porting sequence.
+
 **Goal.** Bring `src/secantus/storage.py` (+ `src/secantus/commands.py`) to the
 **byte-identical** RecordId on-disk scheme the Rust server already ships (steps
 1–3). Cross-server backup / PITR portability requires every stored byte to match,

@@ -1,5 +1,13 @@
 # RecordId keying — incremental implementation plan
 
+> **DELIVERED (audited 2026-08-20).** The RecordId keying scheme shipped on the
+> Rust server and is now the documented on-disk layout in CLAUDE.md: the doc table
+> keys on `(db, coll, RecordId)`, `secantus_natural_seq` is the `_id` index, and
+> `table:secantus_natural` is no longer written — which is precisely this plan's
+> 4-writes-to-3 write-amplification cut. A store in the older format is refused at
+> open (`IncompatibleStorageFormatError`). Kept for the measurements and the
+> step sequencing.
+
 **Goal:** cut write amplification from **4 WT writes/doc → 3** by keying the doc
 table on a monotonic per-collection **RecordId** (the existing nat-seq) instead of
 `id_key`. Measured earlier at **+15% concurrency** (prototype); the clean re-measure
