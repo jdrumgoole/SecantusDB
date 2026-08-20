@@ -1,5 +1,12 @@
 # WiredTiger build-cache plan
 
+> **DELIVERED (audited 2026-08-20).** The build-dir cache this plan designed is
+> live: `.github/workflows/test.yml` carries a "Restore the WiredTiger build"
+> `actions/cache` step on `path: build` (5 occurrences across the lanes), keyed on
+> runner OS + image version + WT rev + config + interpreter, and deliberately with
+> **no `restore-keys`** — the plan's own central hazard, since a partial hit is
+> exactly the stale-object state to forbid. Kept for that design reasoning.
+
 Goal: stop every CI job rebuilding vendored WiredTiger from source, worth
 ~100 s on each of 13 jobs. Written after the CI work that took the `Tests`
 workflow from 18m00 to 7m49 (#486, #501, #503, #507); this is the largest

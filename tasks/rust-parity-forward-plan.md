@@ -1,5 +1,21 @@
 # Rust server → mongod write performance: state & forward plan
 
+> **STILL ACTIVE — confirmed by Joe, 2026-08-20.** These two plans stay live
+> **until Rust-server / mongod performance parity is achieved.** Recorded here
+> because a status line reading "active (2026-07-2x)" invites each later audit to
+> ask whether it still is; it does, and the exit criterion is parity, not a date.
+>
+> **Joe's position, stated 2026-08-20: parity IS achievable, and the investigation
+> continues.** That is the standing direction — not an aspiration attached to a
+> closed question.
+>
+> Which matters because the **VERDICT (2026-07-22) below concludes the opposite**:
+> that write-parity is not reachable for this architecture. It is already annotated
+> as superseded in part — measured under hidden CPU contention, and its claim that
+> no per-op lever exists was falsified by shipped #608. Treat it as evidence to
+> argue with, not a decision to stop. Its absolute numbers should not be quoted
+> without a fresh measurement on a quiet, pinned box.
+
 Status: **active** (2026-07-21). Consolidates the measured findings of the
 sharded-oplog / bounded-prune / doc-sharding / RecordId / WAL investigation so
 future work builds on data, not guesses. The exhaustive session log lives in

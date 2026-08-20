@@ -1,6 +1,10 @@
 # SQL server external conformance gauges plan
 
-**Status: first two gauges landed; portfolio open.** G1 (sqllogictest —
+**Status: SIX gauges landed; portfolio open** (headline corrected 2026-08-20 — it
+still said "first two" while four more had shipped). `tasks.py` defines
+`validate-slt`, `validate-psycopg`, `validate-sqlalchemy`, `validate-pgjdbc`,
+`validate-pgx` and `validate-pgtest`. The per-gauge state below is current and
+richer than this line; what had gone stale was only the count. G1 (sqllogictest —
 `invoke validate-slt`, 26/30 files, 4 declared divergences,
 `docs/validation-report-slt.md`) and G2 (psycopg's unmodified suite —
 `invoke validate-psycopg`, 91.3% at last full run, weekly in `validate.yml`,

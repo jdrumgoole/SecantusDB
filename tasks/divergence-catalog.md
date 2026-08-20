@@ -1,5 +1,15 @@
 # mongod-fidelity divergence catalog (2026-07-18)
 
+> **AUDITED 2026-08-20 — two duplicate rows removed.** `$gte`/`$lte: null` and
+> `$exists` Python-truthiness were each listed **twice** in Tier 1: once struck as
+> FIXED (#484) and once, a few lines below, as live work. Anyone burning down Tier 1
+> in order would have tried to re-fix them. Both were re-probed before deletion and
+> are genuinely fixed — `{a: {$gte: null}}` matches both `{a: null}` and a missing
+> field (as `$eq: null` does), and `$exists` uses mongod truthiness (`""` and `[]`
+> are truthy, `0` is not). The file's own rule is right and worth restating: **when
+> a row is fixed, delete it** — striking it through leaves the text greppable and it
+> comes back as a duplicate.
+
 Found by a parallel read-only probe sweep (3 discovery agents, mongod 7.0.12 on
 distinct ports vs SecantusDB's pure Python engines). Each row is a **confirmed**
 behavioural divergence. This is the working queue for the type-coercion / argument-
@@ -29,10 +39,6 @@ The already-shipped sweep (bool-reject, whole-double accept, substr numeric args
   default now errors (7158303) instead of dropping the doc; full spec validation
   added (40192-40200). Both engines. (The `$bucketAuto` / unsorted-etc. Tier-2
   `$bucket` rows below are also covered.)
-- **`$gte`/`$lte: null`** doesn't match null+missing (mongod matches, like `$eq:null`)
-  → wrong query results. **Verified.** (query.py / .rs)
-- **`$exists` Python-truthiness** (`""`/`[]`/`{}` treated falsy; mongod: only
-  `false`/`0`/`null` are falsy) → wrong results. **Verified.** (query.py / .rs)
 - ~~**`$group` accumulator coerces string→number**~~ **FIXED (#491):** `$sum`/`$avg`
   ignore non-numeric operands (string/bool/null/missing) — all-non-numeric group →
   `0` / `null`; `$min`/`$max` order mixed types by BSON cross-type order and skip
