@@ -108,34 +108,51 @@ def _rust_binary() -> str:
 def _server_argv(server: str, port: int, storage_path: Path) -> list[str]:
     if server == "python":
         return [
-            sys.executable, "-m", "secantus",
-            "--host", "127.0.0.1",
-            "--port", str(port),
-            "--storage-path", str(storage_path),
-            "--log-level", "WARNING",
+            sys.executable,
+            "-m",
+            "secantus",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--storage-path",
+            str(storage_path),
+            "--log-level",
+            "WARNING",
         ]
     if server in ("rust", "rust-async"):
         argv = [
             _rust_binary(),
-            "--host", "127.0.0.1",
-            "--port", str(port),
-            "--storage-path", str(storage_path),
-            "--log-level", "WARNING",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--storage-path",
+            str(storage_path),
+            "--log-level",
+            "WARNING",
         ]
         if server == "rust-async":
             argv += ["--oplog-async", "--oplog-nonlogged"]
         return argv
     if server == "mongod":
-        mongod = shutil.which("mongod")
+        # SECANTUS_MONGOD_BIN pins a specific mongod, mirroring SECANTUSDB_BIN
+        # for the Rust arm. `which("mongod")` on this box resolves to a 2024
+        # symlink to mongodb-community@6.0 (6.0.16) while 8.3.4 is installed and
+        # unlinked, so the default arm silently measures a two-year-old server.
+        mongod = os.environ.get("SECANTUS_MONGOD_BIN") or shutil.which("mongod")
         if not mongod:
             raise SystemExit(
                 "mongod not on PATH — install Community Server or skip --server mongod"
             )
         return [
             mongod,
-            "--bind_ip", "127.0.0.1",
-            "--port", str(port),
-            "--dbpath", str(storage_path),
+            "--bind_ip",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--dbpath",
+            str(storage_path),
             "--quiet",
         ]
     raise SystemExit(f"unknown server {server!r}")
@@ -190,12 +207,19 @@ def run_writers(
             log_f = log_path.open("w")
             collection = collection_prefix if shared_collection else f"{collection_prefix}{i}"
             argv = [
-                sys.executable, "-m", "bench.load_writer",
-                "--uri", uri,
-                "--db", db,
-                "--collection", collection,
-                "--batch-size", str(batch),
-                "--progress-every", "0",
+                sys.executable,
+                "-m",
+                "bench.load_writer",
+                "--uri",
+                uri,
+                "--db",
+                db,
+                "--collection",
+                collection,
+                "--batch-size",
+                str(batch),
+                "--progress-every",
+                "0",
             ]
             p = subprocess.Popen(
                 argv,
@@ -303,10 +327,7 @@ def run_concurrency_sweep(
         for n, total, elapsed in results:
             rate = total / elapsed if elapsed > 0 else 0.0
             scaling = (rate / baseline_rate) if baseline_rate else float("nan")
-            print(
-                f"{n:<8} {total:>14,d} {elapsed:>9.2f}s {rate:>12,.0f} "
-                f"{scaling:>11.2f}x"
-            )
+            print(f"{n:<8} {total:>14,d} {elapsed:>9.2f}s {rate:>12,.0f} {scaling:>11.2f}x")
         print("=" * 72)
         if baseline_rate:
             print(
@@ -334,33 +355,60 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Phase 0 of the WT concurrency plan."
         ),
     )
-    p.add_argument("--duration", type=float, default=DEFAULT_DURATION,
-                   help=f"Wall-clock seconds per writer count (default: {DEFAULT_DURATION:.0f}).")
-    p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH,
-                   help=f"Documents per insert call (default: {DEFAULT_BATCH}).")
-    p.add_argument("--writers", default=DEFAULT_WRITERS,
-                   help=f"Comma-separated writer counts (default: {DEFAULT_WRITERS}).")
-    p.add_argument("--shared-collection", action="store_true",
-                   help="All writers target the same collection (max contention).")
-    p.add_argument("--server-log", default="",
-                   help="Append the server's stdout/stderr to this file "
-                        "(default: discarded) — the harness's own diagnosis tool "
-                        "when writers report server errors.")
-    p.add_argument("--server", default="python",
-                   choices=["python", "rust", "rust-async", "mongod", "all"],
-                   help="Which server to drive (default: python). "
-                        "'rust-async' is the Rust server's opt-in async + "
-                        "non-logged oplog stack. 'all' sweeps python, rust, "
-                        "rust-async, and mongod back-to-back and prints a "
-                        "combined table.")
-    p.add_argument("--runs", type=int, default=1,
-                   help="Interleaved full sweeps; the reported rate per "
-                        "(server, writers) is the median across runs "
-                        "(default: 1).")
-    p.add_argument("--json", default="",
-                   help="Write the median rates as JSON to this path — the "
-                        "input for bench.concurrency_chart, which refreshes "
-                        "the concurrency graphs on the website and in the docs.")
+    p.add_argument(
+        "--duration",
+        type=float,
+        default=DEFAULT_DURATION,
+        help=f"Wall-clock seconds per writer count (default: {DEFAULT_DURATION:.0f}).",
+    )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH,
+        help=f"Documents per insert call (default: {DEFAULT_BATCH}).",
+    )
+    p.add_argument(
+        "--writers",
+        default=DEFAULT_WRITERS,
+        help=f"Comma-separated writer counts (default: {DEFAULT_WRITERS}).",
+    )
+    p.add_argument(
+        "--shared-collection",
+        action="store_true",
+        help="All writers target the same collection (max contention).",
+    )
+    p.add_argument(
+        "--server-log",
+        default="",
+        help="Append the server's stdout/stderr to this file "
+        "(default: discarded) — the harness's own diagnosis tool "
+        "when writers report server errors.",
+    )
+    p.add_argument(
+        "--server",
+        default="python",
+        choices=["python", "rust", "rust-async", "mongod", "all"],
+        help="Which server to drive (default: python). "
+        "'rust-async' is the Rust server's opt-in async + "
+        "non-logged oplog stack. 'all' sweeps python, rust, "
+        "rust-async, and mongod back-to-back and prints a "
+        "combined table.",
+    )
+    p.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        help="Interleaved full sweeps; the reported rate per "
+        "(server, writers) is the median across runs "
+        "(default: 1).",
+    )
+    p.add_argument(
+        "--json",
+        default="",
+        help="Write the median rates as JSON to this path — the "
+        "input for bench.concurrency_chart, which refreshes "
+        "the concurrency graphs on the website and in the docs.",
+    )
     return p.parse_args(argv)
 
 
@@ -409,9 +457,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     servers = list(ALL_SERVERS) if args.server == "all" else [args.server]
     runs = max(1, args.runs)
-    runs_rates: dict[str, list[list[float]]] = {
-        s: [[] for _ in writers_list] for s in servers
-    }
+    runs_rates: dict[str, list[list[float]]] = {s: [[] for _ in writers_list] for s in servers}
     for run in range(runs):
         if runs > 1:
             print(f"### run {run + 1}/{runs}\n")
@@ -428,9 +474,7 @@ def main(argv: list[str] | None = None) -> int:
                 return rc
             for i, (_n, total, elapsed) in enumerate(results):
                 runs_rates[server][i].append(total / elapsed if elapsed > 0 else 0.0)
-    medians = {
-        s: [statistics.median(per_n) for per_n in runs_rates[s]] for s in servers
-    }
+    medians = {s: [statistics.median(per_n) for per_n in runs_rates[s]] for s in servers}
     if len(servers) > 1 or runs > 1:
         label = "median docs/s" if runs > 1 else "docs/s"
         print("=" * 72)
