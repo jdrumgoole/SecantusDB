@@ -124,8 +124,9 @@ spread under 2%, box verified quiet before and after:
 `bench/mongod_replset_ab.py` documents as "the closest semantic match to SecantusDB's
 synchronous oplog". mongod's own oplog tax is large: 119,336 → 88,785 at one writer,
 and → 12,354 under the default `w:majority` (a journal fsync per acknowledged batch).
-The same measurement against 6.0.16 gives 2.27× → 3.36×, so the conclusion does not
-depend on the mongod version.
+The same measurement against 6.0.16 gives 2.27× → 3.36× (a separate earlier run,
+artifacts in `bench/results/parity-remeasure-run1-mongod6/`), so the conclusion does
+not depend on the mongod version.
 
 **Both decisive observations fail.**
 
