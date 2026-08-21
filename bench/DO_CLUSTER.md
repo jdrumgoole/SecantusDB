@@ -246,6 +246,7 @@ same key and `known_hosts` the harness uses.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--duration SECS` | `120` | Length of the timed phase |
+| `--repeat N` | `1` | Measurement passes; engines interleave within each pass and the report gives medians plus spread |
 | `--workers N` | `16` | Load threads per client droplet (so 32 across the cluster) |
 | `--op-mix SPEC` | `insert=70,find=20,update=10` | Weighted operation mix |
 | `--doc-bytes N` | `8192` | Payload bytes per document |
@@ -425,6 +426,36 @@ Ratios are printed in their own senses — throughput above 1.0 is faster,
 latency below 1.0 is quicker — because conflating those two directions is how
 benchmark tables mislead.
 
+### Repeating a measurement
+
+`--repeat N` runs the whole thing N times. The engines **interleave within
+each pass** rather than each running to completion in turn, so thermal drift,
+a noisy neighbour, or anything else that changes over the run lands on both
+engines roughly equally instead of penalising whichever went last:
+
+```
+pass 1: secantusdb, mongod
+pass 2: secantusdb, mongod
+pass 3: secantusdb, mongod
+```
+
+Every figure in the report is then a **median**, not a mean — one pass
+disrupted by a checkpoint stall or a busy neighbour should not drag the
+headline, and with small N a mean is exactly what an outlier hijacks. A
+**spread** column reports `(max - min) / median`, which is the number that says
+whether the median is worth quoting at all, and a per-pass table shows the raw
+figures in the order they actually ran.
+
+A measured example — three passes at 60 s each:
+
+| engine | ops/s (median) | spread | pass 1 | pass 2 | pass 3 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| secantusdb | 7,704 | 3.4% | 7,704 | 7,760 | 7,498 |
+| mongod | 15,850 | 1.1% | 15,850 | 16,003 | 15,824 |
+
+Spreads of 1-3% mean the medians are solid. A double-digit spread is the
+report telling you not to quote the number until you have found out why.
+
 **Numbers are comparable within a run, not across clusters.** Two different
 `c-4` droplets can sit on different host generations; an identical SecantusDB
 build measured 6,230 ops/s on one cluster and 8,244 on another. That is
@@ -440,7 +471,7 @@ Artifacts land in `bench/results/do/<run-id>/`:
 | File | Contents |
 | --- | --- |
 | `comparison.md` | The side-by-side table and ratios (when more than one engine ran) |
-| `<engine>-summary.md` | Each engine's own rendered report |
+| `<engine>-summary.md` | Each engine's own rendered report (`<engine>-pass<N>-…` when repeating) |
 | `<engine>-summary.json` | The same data, machine-readable, stable enough to build tooling on |
 | `<engine>-client-1.json`, `<engine>-client-2.json` | Each client's raw report, including full histograms |
 | `<engine>-server-sample.json` | Per-second server CPU / RSS / free-memory trace |
@@ -626,9 +657,9 @@ binaries still executable), including `--purge-snapshots`.
 
 ## Limitations
 
-- **One pass per engine per run.** Two passes reproduced the headline ratio to
-  within 1%, but the harness has no built-in repeat-and-median mode; run it
-  more than once by hand if a result looks marginal.
+- **A single pass reports no spread.** `--repeat 1` (the default) is one
+  measurement per engine, so nothing tells you how stable it was. Use
+  `--repeat 3` or more before quoting a number that matters.
 - Single server droplet only — SecantusDB is single-node by design, so there
   is nothing to shard or replicate across.
 - The agent measures `insert` / `find` / `update`. Aggregation, change

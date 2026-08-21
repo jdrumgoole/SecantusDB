@@ -24,7 +24,7 @@ const BOOL_FLAGS: [&str; 7] = [
     "--no-suspend",
 ];
 
-const VALUE_FLAGS: [&str; 24] = [
+const VALUE_FLAGS: [&str; 25] = [
     "--prefix",
     "--region",
     "--server-size",
@@ -38,6 +38,7 @@ const VALUE_FLAGS: [&str; 24] = [
     "--agent-ref",
     "--engine",
     "--mongod-version",
+    "--repeat",
     "--duration",
     "--workers",
     "--op-mix",
@@ -93,6 +94,8 @@ ENGINES (deploy, run, all)
 
 WORKLOAD (run, all)
   --duration SECS      Timed seconds                       [120]
+  --repeat N           Measurement passes; engines are interleaved within
+                       each pass and the report gives medians + spread   [1]
   --workers N          Load threads per client droplet     [16]
   --op-mix SPEC        e.g. insert=100 or insert=70,find=20,update=10
   --doc-bytes N        Payload bytes per document          [8192]
@@ -148,6 +151,7 @@ fn build_opts(args: &Args) -> BenchResult<Opts> {
         agent_ref: args.str_or("--agent-ref", ""),
         engines: Engine::parse_list(&args.str_or("--engine", "both"))?,
         mongod_version: args.str_or("--mongod-version", "8.0"),
+        repeat: args.usize_or("--repeat", 1)?.max(1),
         duration: args.f64_or("--duration", 120.0)?,
         workers: args.usize_or("--workers", 16)?,
         op_mix: args.str_or("--op-mix", "insert=70,find=20,update=10"),

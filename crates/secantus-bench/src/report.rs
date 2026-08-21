@@ -435,7 +435,101 @@ pub fn render_summary(s: &Summary) -> String {
     lines.join("\n")
 }
 
-/// Side-by-side comparison of two or more engines from the same run.
+/// The median of a set of samples. Even counts average the middle two.
+///
+/// Median rather than mean: one pass disrupted by a noisy neighbour or a
+/// checkpoint stall should not drag the headline, and with small N a mean is
+/// exactly what an outlier hijacks.
+pub fn median(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    }
+}
+
+/// Relative spread of a set of samples: `(max - min) / median`, as a
+/// percentage. This is the number that says whether the median means anything.
+pub fn spread_pct(values: &[f64]) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let mid = median(values);
+    if mid <= 0.0 {
+        return 0.0;
+    }
+    let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+    round1((max - min) / mid * 100.0)
+}
+
+/// One engine's results across every pass of a run.
+pub struct EngineRuns {
+    pub engine: crate::engine::Engine,
+    pub passes: Vec<Summary>,
+}
+
+impl EngineRuns {
+    fn ops_per_sec(&self) -> Vec<f64> {
+        self.passes
+            .iter()
+            .map(|s| s.aggregate.ops_per_sec)
+            .collect()
+    }
+
+    fn latencies(&self) -> Vec<LatencySummary> {
+        self.passes.iter().map(overall_latency).collect()
+    }
+
+    fn median_latency(&self) -> LatencySummary {
+        let lats = self.latencies();
+        let pick = |f: fn(&LatencySummary) -> f64| median(&lats.iter().map(f).collect::<Vec<_>>());
+        LatencySummary {
+            count: self.passes.iter().map(|s| s.aggregate.ops).sum(),
+            mean_ms: pick(|l| l.mean_ms),
+            min_ms: pick(|l| l.min_ms),
+            p50_ms: pick(|l| l.p50_ms),
+            p90_ms: pick(|l| l.p90_ms),
+            p99_ms: pick(|l| l.p99_ms),
+            p999_ms: pick(|l| l.p999_ms),
+            max_ms: pick(|l| l.max_ms),
+        }
+    }
+
+    fn median_cpu(&self) -> Option<f64> {
+        let cpus: Vec<f64> = self
+            .passes
+            .iter()
+            .filter_map(|s| s.server.sample.cpu_busy_pct_mean)
+            .collect();
+        if cpus.is_empty() {
+            None
+        } else {
+            Some(median(&cpus))
+        }
+    }
+
+    fn median_op_rate(&self, op: &str) -> Option<f64> {
+        let rates: Vec<f64> = self
+            .passes
+            .iter()
+            .filter_map(|s| s.per_op.get(op).map(|o| o.ops_per_sec))
+            .collect();
+        if rates.is_empty() {
+            None
+        } else {
+            Some(median(&rates))
+        }
+    }
+}
+
+/// Side-by-side comparison of the engines in a run.
 ///
 /// The ratio row is the point of the whole harness: same hardware, same
 /// clients, same workload, same network — so a difference is the database and
@@ -443,13 +537,18 @@ pub fn render_summary(s: &Summary) -> String {
 /// with throughput above 1.0 meaning faster and latency below 1.0 meaning
 /// quicker, because those are opposite senses and conflating them is how
 /// benchmark tables mislead.
-pub fn render_comparison(run_id: &str, results: &[(crate::engine::Engine, Summary)]) -> String {
+///
+/// With more than one pass every figure is a **median**, and a spread column
+/// reports `(max - min) / median` so the reader can see whether the medians are
+/// worth quoting at all.
+pub fn render_comparison(run_id: &str, results: &[EngineRuns]) -> String {
+    let passes = results.first().map(|r| r.passes.len()).unwrap_or(0);
     let mut lines = vec![
         "# SecantusDB vs MongoDB — three-droplet benchmark".to_string(),
         String::new(),
         format!("run           {run_id}"),
     ];
-    if let Some((_, first)) = results.first() {
+    if let Some(first) = results.first().and_then(|r| r.passes.first()) {
         let srv = &first.server;
         lines.push(format!(
             "server        {} ({} vCPU, {} MB)  {}",
@@ -460,36 +559,60 @@ pub fn render_comparison(run_id: &str, results: &[(crate::engine::Engine, Summar
             first.clients.count, first.clients.size, first.clients.workers_each
         ));
         lines.push(format!(
-            "workload      {}  {} B docs  batch={}  {:.0}s per engine",
+            "workload      {}  {} B docs  batch={}  {:.0}s per engine per pass",
             first.workload.op_mix,
             first.workload.doc_bytes,
             first.workload.batch_size,
             first.workload.duration_s
         ));
         lines.push(format!("cache         {} (both engines)", srv.cache_size));
+        lines.push(format!(
+            "passes        {passes}{}",
+            if passes > 1 {
+                " (engines interleaved; figures below are medians)"
+            } else {
+                ""
+            }
+        ));
     }
     lines.push(String::new());
-    lines.push(
-        "| engine | version | ops/s | docs/s | errors | p50 ms | p99 ms | p99.9 ms | server CPU |"
-            .to_string(),
-    );
-    lines.push("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |".to_string());
+    if passes > 1 {
+        lines.push(
+            "| engine | version | ops/s (median) | spread | p50 ms | p99 ms | p99.9 ms | server CPU |"
+                .to_string(),
+        );
+        lines.push("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |".to_string());
+    } else {
+        lines.push(
+            "| engine | version | ops/s | errors | p50 ms | p99 ms | p99.9 ms | server CPU |"
+                .to_string(),
+        );
+        lines.push("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |".to_string());
+    }
 
-    for (engine, s) in results {
-        let lat = overall_latency(s);
-        let cpu = s
-            .server
-            .sample
-            .cpu_busy_pct_mean
+    for run in results {
+        let lat = run.median_latency();
+        let cpu = run
+            .median_cpu()
             .map(|v| format!("{v:.1}%"))
             .unwrap_or("-".to_string());
+        let version = run
+            .passes
+            .first()
+            .map(|s| short_version(&s.server.version))
+            .unwrap_or("unknown".to_string());
+        let rates = run.ops_per_sec();
+        let third = if passes > 1 {
+            format!("{:.1}%", spread_pct(&rates))
+        } else {
+            thousands(run.passes.first().map(|s| s.aggregate.errors).unwrap_or(0))
+        };
         lines.push(format!(
-            "| **{}** | {} | **{:.0}** | {:.0} | {} | {:.2} | {:.2} | {:.2} | {} |",
-            engine.name(),
-            short_version(&s.server.version),
-            s.aggregate.ops_per_sec,
-            s.aggregate.docs_per_sec,
-            thousands(s.aggregate.errors),
+            "| **{}** | {} | **{:.0}** | {} | {:.2} | {:.2} | {:.2} | {} |",
+            run.engine.name(),
+            version,
+            median(&rates),
+            third,
             lat.p50_ms,
             lat.p99_ms,
             lat.p999_ms,
@@ -497,22 +620,38 @@ pub fn render_comparison(run_id: &str, results: &[(crate::engine::Engine, Summar
         ));
     }
 
+    if passes > 1 {
+        lines.push(String::new());
+        lines.push("Per pass (ops/s), in the order they ran:".to_string());
+        lines.push(String::new());
+        let header: Vec<String> = (1..=passes).map(|i| format!("pass {i}")).collect();
+        lines.push(format!("| engine | {} |", header.join(" | ")));
+        lines.push(format!("| --- | {} |", vec!["---:"; passes].join(" | ")));
+        for run in results {
+            let cells: Vec<String> = run
+                .ops_per_sec()
+                .iter()
+                .map(|v| format!("{v:.0}"))
+                .collect();
+            lines.push(format!("| {} | {} |", run.engine.name(), cells.join(" | ")));
+        }
+    }
+
     if results.len() == 2 {
-        let (a_engine, a) = &results[0];
-        let (b_engine, b) = &results[1];
-        let (la, lb) = (overall_latency(a), overall_latency(b));
+        let (a, b) = (&results[0], &results[1]);
+        let (la, lb) = (a.median_latency(), b.median_latency());
         lines.push(String::new());
         lines.push(format!(
             "**{} relative to {}** — throughput >1.0 is faster, latency <1.0 is quicker:",
-            a_engine.name(),
-            b_engine.name()
+            a.engine.name(),
+            b.engine.name()
         ));
         lines.push(String::new());
         lines.push("| metric | ratio |".to_string());
         lines.push("| --- | ---: |".to_string());
         lines.push(format!(
             "| throughput (ops/s) | {} |",
-            ratio(a.aggregate.ops_per_sec, b.aggregate.ops_per_sec)
+            ratio(median(&a.ops_per_sec()), median(&b.ops_per_sec()))
         ));
         lines.push(format!("| p50 latency | {} |", ratio(la.p50_ms, lb.p50_ms)));
         lines.push(format!("| p99 latency | {} |", ratio(la.p99_ms, lb.p99_ms)));
@@ -521,21 +660,24 @@ pub fn render_comparison(run_id: &str, results: &[(crate::engine::Engine, Summar
             ratio(la.p999_ms, lb.p999_ms)
         ));
         for name in OP_NAMES {
-            if let (Some(x), Some(y)) = (a.per_op.get(name), b.per_op.get(name)) {
-                lines.push(format!(
-                    "| {name} throughput | {} |",
-                    ratio(x.ops_per_sec, y.ops_per_sec)
-                ));
+            if let (Some(x), Some(y)) = (a.median_op_rate(name), b.median_op_rate(name)) {
+                lines.push(format!("| {name} throughput | {} |", ratio(x, y)));
             }
         }
     }
 
     let warned: Vec<String> = results
         .iter()
-        .flat_map(|(e, s)| {
-            s.warnings
-                .iter()
-                .map(move |w| format!("[{}] {w}", e.name()))
+        .flat_map(|r| {
+            r.passes.iter().enumerate().flat_map(move |(i, s)| {
+                s.warnings.iter().map(move |w| {
+                    if r.passes.len() > 1 {
+                        format!("[{} pass {}] {w}", r.engine.name(), i + 1)
+                    } else {
+                        format!("[{}] {w}", r.engine.name())
+                    }
+                })
+            })
         })
         .collect();
     if !warned.is_empty() {
@@ -660,15 +802,19 @@ mod comparison_tests {
         }
     }
 
+    fn one(engine: Engine, name: &str, ops: f64, p50: f64, p99: f64, cpu: f64) -> EngineRuns {
+        EngineRuns {
+            engine,
+            passes: vec![summary(name, ops, p50, p99, cpu)],
+        }
+    }
+
     #[test]
     fn the_ratio_row_states_throughput_and_latency_in_their_own_senses() {
         // secantus does 2x the throughput at half the p50: 2.00x and 0.50x.
         let results = vec![
-            (
-                Engine::Secantus,
-                summary("secantusdb", 8000.0, 2.0, 20.0, 90.0),
-            ),
-            (Engine::Mongod, summary("mongod", 4000.0, 4.0, 40.0, 70.0)),
+            one(Engine::Secantus, "secantusdb", 8000.0, 2.0, 20.0, 90.0),
+            one(Engine::Mongod, "mongod", 4000.0, 4.0, 40.0, 70.0),
         ];
         let text = render_comparison("R", &results);
         assert!(text.contains("| throughput (ops/s) | 2.00x |"), "{text}");
@@ -682,11 +828,8 @@ mod comparison_tests {
     #[test]
     fn both_engines_appear_with_their_versions_and_cpu() {
         let results = vec![
-            (
-                Engine::Secantus,
-                summary("secantusdb", 8000.0, 2.0, 20.0, 90.0),
-            ),
-            (Engine::Mongod, summary("mongod", 4000.0, 4.0, 40.0, 70.0)),
+            one(Engine::Secantus, "secantusdb", 8000.0, 2.0, 20.0, 90.0),
+            one(Engine::Mongod, "mongod", 4000.0, 4.0, 40.0, 70.0),
         ];
         let text = render_comparison("R", &results);
         assert!(text.contains("secantusdb"));
@@ -698,21 +841,19 @@ mod comparison_tests {
 
     #[test]
     fn a_single_engine_needs_no_ratio_row() {
-        let results = vec![(
-            Engine::Secantus,
-            summary("secantusdb", 8000.0, 2.0, 20.0, 90.0),
-        )];
-        let text = render_comparison("R", &results);
-        assert!(!text.contains("relative to"));
+        let results = vec![one(Engine::Secantus, "secantusdb", 8000.0, 2.0, 20.0, 90.0)];
+        assert!(!render_comparison("R", &results).contains("relative to"));
     }
 
     #[test]
     fn warnings_from_either_engine_are_attributed_and_kept() {
-        let mut a = summary("secantusdb", 8000.0, 2.0, 20.0, 90.0);
-        a.warnings.push("client-1 CPU was 93% busy".into());
-        let mut b = summary("mongod", 4000.0, 4.0, 40.0, 70.0);
-        b.warnings.push("17 operations errored".into());
-        let text = render_comparison("R", &[(Engine::Secantus, a), (Engine::Mongod, b)]);
+        let mut a = one(Engine::Secantus, "secantusdb", 8000.0, 2.0, 20.0, 90.0);
+        a.passes[0]
+            .warnings
+            .push("client-1 CPU was 93% busy".into());
+        let mut b = one(Engine::Mongod, "mongod", 4000.0, 4.0, 40.0, 70.0);
+        b.passes[0].warnings.push("17 operations errored".into());
+        let text = render_comparison("R", &[a, b]);
         assert!(
             text.contains("[secantusdb] client-1 CPU was 93% busy"),
             "{text}"
@@ -723,11 +864,8 @@ mod comparison_tests {
     #[test]
     fn a_zero_baseline_reports_na_rather_than_infinity() {
         let results = vec![
-            (
-                Engine::Secantus,
-                summary("secantusdb", 8000.0, 2.0, 20.0, 90.0),
-            ),
-            (Engine::Mongod, summary("mongod", 0.0, 0.0, 0.0, 0.0)),
+            one(Engine::Secantus, "secantusdb", 8000.0, 2.0, 20.0, 90.0),
+            one(Engine::Mongod, "mongod", 0.0, 0.0, 0.0, 0.0),
         ];
         let text = render_comparison("R", &results);
         assert!(text.contains("n/a"), "{text}");
@@ -737,13 +875,12 @@ mod comparison_tests {
     #[test]
     fn overall_latency_weights_clients_by_their_op_count() {
         let mut s = summary("secantusdb", 8000.0, 2.0, 20.0, 90.0);
-        // Skew the clients: 3000 ops at p50 4ms and 1000 ops at p50 8ms
-        // should weight to 5ms, not the unweighted 6ms.
-        let entries: Vec<String> = s.per_client.keys().cloned().collect();
-        s.per_client.get_mut(&entries[0]).unwrap().ops = 3000;
-        s.per_client.get_mut(&entries[0]).unwrap().latency.p50_ms = 4.0;
-        s.per_client.get_mut(&entries[1]).unwrap().ops = 1000;
-        s.per_client.get_mut(&entries[1]).unwrap().latency.p50_ms = 8.0;
+        // 3000 ops at p50 4ms and 1000 at p50 8ms weight to 5ms, not 6ms.
+        let keys: Vec<String> = s.per_client.keys().cloned().collect();
+        s.per_client.get_mut(&keys[0]).unwrap().ops = 3000;
+        s.per_client.get_mut(&keys[0]).unwrap().latency.p50_ms = 4.0;
+        s.per_client.get_mut(&keys[1]).unwrap().ops = 1000;
+        s.per_client.get_mut(&keys[1]).unwrap().latency.p50_ms = 8.0;
         assert_eq!(overall_latency(&s).p50_ms, 5.0);
     }
 
@@ -755,5 +892,95 @@ mod comparison_tests {
             "0.5.3-beta.160"
         );
         assert_eq!(short_version("  "), "unknown");
+    }
+
+    // --- repeat / median ---------------------------------------------------
+
+    #[test]
+    fn median_takes_the_middle_and_averages_an_even_pair() {
+        assert_eq!(median(&[3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(median(&[1.0, 2.0, 3.0, 4.0]), 2.5);
+        assert_eq!(median(&[7.0]), 7.0);
+        assert_eq!(median(&[]), 0.0);
+    }
+
+    #[test]
+    fn an_outlier_pass_cannot_hijack_the_median() {
+        // A single disrupted pass (200) must not drag the headline; the mean
+        // would read 800, the median reads 600.
+        let values = [600.0, 600.0, 200.0, 600.0, 1400.0];
+        assert_eq!(median(&values), 600.0);
+    }
+
+    #[test]
+    fn spread_reports_the_relative_range() {
+        assert_eq!(spread_pct(&[100.0, 110.0]), 9.5); // 10 / 105
+        assert_eq!(spread_pct(&[100.0, 100.0, 100.0]), 0.0);
+        assert_eq!(spread_pct(&[100.0]), 0.0); // one pass has no spread
+    }
+
+    #[test]
+    fn multiple_passes_report_medians_a_spread_and_a_per_pass_table() {
+        let runs = vec![
+            EngineRuns {
+                engine: Engine::Secantus,
+                passes: vec![
+                    summary("secantusdb", 8000.0, 2.0, 20.0, 90.0),
+                    summary("secantusdb", 9000.0, 2.0, 20.0, 90.0),
+                    summary("secantusdb", 8500.0, 2.0, 20.0, 90.0),
+                ],
+            },
+            EngineRuns {
+                engine: Engine::Mongod,
+                passes: vec![
+                    summary("mongod", 4000.0, 4.0, 40.0, 70.0),
+                    summary("mongod", 4400.0, 4.0, 40.0, 70.0),
+                    summary("mongod", 4200.0, 4.0, 40.0, 70.0),
+                ],
+            },
+        ];
+        let text = render_comparison("R", &runs);
+        assert!(
+            text.contains("passes        3 (engines interleaved"),
+            "{text}"
+        );
+        assert!(text.contains("ops/s (median)"), "{text}");
+        // medians 8500 and 4200 -> 2.02x, not the 2.00x of the first pass.
+        assert!(text.contains("**8500**"), "{text}");
+        assert!(text.contains("**4200**"), "{text}");
+        assert!(text.contains("| throughput (ops/s) | 2.02x |"), "{text}");
+        // The per-pass table has to show the order they actually ran in.
+        assert!(text.contains("| pass 1 | pass 2 | pass 3 |"), "{text}");
+        assert!(
+            text.contains("| secantusdb | 8000 | 9000 | 8500 |"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn warnings_from_a_repeat_run_name_the_pass() {
+        let mut runs = vec![EngineRuns {
+            engine: Engine::Secantus,
+            passes: vec![
+                summary("secantusdb", 8000.0, 2.0, 20.0, 90.0),
+                summary("secantusdb", 8000.0, 2.0, 20.0, 90.0),
+            ],
+        }];
+        runs[0].passes[1]
+            .warnings
+            .push("17 operations errored".into());
+        let text = render_comparison("R", &runs);
+        assert!(
+            text.contains("[secantusdb pass 2] 17 operations errored"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_single_pass_still_shows_errors_rather_than_a_spread_column() {
+        let results = vec![one(Engine::Secantus, "secantusdb", 8000.0, 2.0, 20.0, 90.0)];
+        let text = render_comparison("R", &results);
+        assert!(text.contains("| errors |"), "{text}");
+        assert!(!text.contains("spread"), "{text}");
     }
 }
