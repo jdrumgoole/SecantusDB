@@ -5400,6 +5400,70 @@ shared storage engine or building large new protocol subsystems:
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.
 
+## p99.9 write-tail convoy (found by the three-droplet harness, 2026-08-21)
+
+The three-droplet DigitalOcean comparison put SecantusDB at **0.46-0.49x
+mongod's throughput but 9.8-11.3x its p99.9 latency** — a far worse ratio in
+the tail than in the median (1.5x at p50, 3.7x at p99). The tail, not the
+average, is the gap. Investigated with `do-client --slow-ms`, which records
+every operation over a threshold **with its timestamp** (the histogram throws
+time away, which is exactly what a tail diagnosis needs back).
+
+**Reproduces locally**, so it is an engine property rather than a network or
+cloud artifact: on macOS over loopback the shape is the same (p50 0.18ms →
+p99.9 8.4ms, 47x; the droplet measured 48x).
+
+What the evidence says:
+
+- **The read path is clean.** 8 concurrent readers: p50 0.14ms, p99.9 0.31ms —
+  a 2x spread. There is no read tail to fix.
+- **The write path owns it.** 8 concurrent inserters: p50 0.18ms, p99.9 8.4ms —
+  45x.
+- **It is concurrency, not per-write cost.** Insert-only sweep, 8 KiB docs:
+
+  | writers | ops/s | per-writer | p50 ms | p99.9 ms | ratio |
+  | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | 12,853 | 12,853 | 0.07 | 0.36 | 5x |
+  | 2 | 22,535 | 11,268 | 0.08 | 0.68 | 9x |
+  | 4 | 32,513 | 8,128 | 0.11 | **4.83** | **45x** |
+  | 8 | 36,583 | 4,573 | 0.19 | 8.26 | 44x |
+  | 16 | 42,144 | 2,634 | 0.29 | 9.92 | 34x |
+
+  The tail jumps **7x between 2 and 4 writers** while the median barely moves
+  (0.08 → 0.11ms), and per-writer throughput collapses over the same range.
+  That is a convoy: writers queue behind a shared resource, and when one holds
+  it long every other writer waits. The slow-op traces confirm it directly —
+  **every large stall hits all 8 workers within the same few milliseconds**,
+  at irregular intervals (2.8s, 5.2s, 4.7s, 3.4s, 25.0s, 1.8s, ...), which
+  also rules out a fixed-period background task.
+
+Ruled out by experiment (each a 60s local run, p99.9 vs a 7.39ms baseline):
+
+- **Checkpoints** — `--checkpoint-seconds 3600`: 7.84ms, no improvement.
+- **WT log preallocation** — `log=(...,prealloc=true)`: 7.84ms, none.
+- **WT log file size** — `file_max=1GB` (vs the 128MB default, which at
+  ~200MB/s of log traffic rolls about twice a second): 7.97ms, none.
+- **Oplog pruning** (`OPLOG_PRUNE_INTERVAL = 1000` against a 100k cap, which a
+  fast writer blows through in seconds) — effectively disabling it left p99.9
+  at 7.07ms, but cut the worst single stall from 126ms to 26ms. It is a
+  max-outlier contributor, not the p99.9 driver.
+
+The one lever found: **`--oplog-async` cuts p99.9 by 24%** (7.39 → 5.60ms) and
+removes 42% of the stalls. Every write emits an oplog entry under a single
+process-wide `Arc<Mutex<OplogState>>` (`secantus-storage/src/lib.rs`), which
+is a serialization point across all collections and all connections, so that
+is one identified strand of the convoy — but not all of it, since the async
+path still leaves a 31x spread.
+
+- [ ] **Next steps**: (a) attribute the residual convoy — the 2→4 writer cliff
+  suggests a resource with small fixed concurrency (WT is configured
+  `eviction=(threads_min=4,threads_max=4)`); (b) consider whether the global
+  oplog mutex can become per-collection or batched, since `--oplog-async`
+  already shows what removing it from the critical path is worth; (c) decide
+  whether `--oplog-async` should be the default. Reproduce any of this with
+  `do-client --slow-ms 5` plus `tasks/` notes; relates to the residual item in
+  the section below and to `tasks/wt-concurrency-plan.md`.
+
 ## Concurrent-writer contention (found by bench.concurrency, 2026-07-16)
 
 - ~~Shared oplog-meta row hotspot~~ and ~~5s WriteConflict deadline~~ —

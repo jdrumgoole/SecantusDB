@@ -15,6 +15,21 @@ use crate::histogram::{round1, round3, Histogram, LatencySummary};
 use crate::opmix::OP_NAMES;
 use crate::CLIENT_ROLES;
 
+/// One operation that exceeded the `--slow-ms` threshold.
+///
+/// The histogram deliberately throws time away, which is exactly what a tail
+/// investigation needs back: whether the slow operations arrive periodically
+/// (a checkpoint, a prune, a flush) or at random (lock contention, eviction)
+/// is the first fork in the diagnosis, and only timestamps answer it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlowOp {
+    /// Unix epoch seconds when the operation *completed*.
+    pub t: f64,
+    pub op: String,
+    pub ms: f64,
+    pub worker: usize,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct OpStats {
     pub count: u64,
@@ -54,6 +69,10 @@ pub struct ClientReport {
     pub ops: BTreeMap<String, OpStats>,
     pub first_errors: Vec<String>,
     pub worker_failures: Vec<String>,
+    /// Operations slower than `--slow-ms`, in completion order. Empty when the
+    /// threshold is 0 (the default), so normal runs pay nothing for it.
+    #[serde(default)]
+    pub slow_ops: Vec<SlowOp>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -982,5 +1001,52 @@ mod comparison_tests {
         let text = render_comparison("R", &results);
         assert!(text.contains("| errors |"), "{text}");
         assert!(!text.contains("spread"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod slow_op_tests {
+    use super::*;
+
+    #[test]
+    fn slow_ops_round_trip_through_json() {
+        let report = ClientReport {
+            client_id: "c1".into(),
+            slow_ops: vec![
+                SlowOp {
+                    t: 1000.5,
+                    op: "insert".into(),
+                    ms: 42.25,
+                    worker: 3,
+                },
+                SlowOp {
+                    t: 1000.6,
+                    op: "find".into(),
+                    ms: 7.5,
+                    worker: 1,
+                },
+            ],
+            ..ClientReport::default()
+        };
+        let text = serde_json::to_string(&report).unwrap();
+        let back: ClientReport = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.slow_ops.len(), 2);
+        assert_eq!(back.slow_ops[0].op, "insert");
+        assert_eq!(back.slow_ops[0].ms, 42.25);
+        assert_eq!(back.slow_ops[0].worker, 3);
+    }
+
+    #[test]
+    fn a_report_without_slow_ops_still_parses() {
+        // Reports written before --slow-ms existed, and every run with the
+        // feature off, carry no `slow_ops` key at all.
+        let json = r#"{"client_id":"c1","hostname":"h","uri":"u","workers":1,
+            "duration_s":1.0,"requested_start_at":0.0,"actual_start_at":0.0,
+            "start_skew_s":0.0,"measured_window_s":1.0,"op_mix":"insert=100",
+            "batch_size":1,"doc_bytes":8,"preload":0,"client_cpu_busy_pct":null,
+            "totals":{"ops":1,"docs":1,"errors":0,"ops_per_sec":1.0,"docs_per_sec":1.0},
+            "ops":{},"first_errors":[],"worker_failures":[]}"#;
+        let back: ClientReport = serde_json::from_str(json).unwrap();
+        assert!(back.slow_ops.is_empty());
     }
 }
