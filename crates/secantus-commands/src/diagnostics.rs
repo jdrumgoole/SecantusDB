@@ -15,6 +15,7 @@
 use bson::spec::BinarySubtype;
 use bson::{doc, Binary, Bson, Document};
 
+use crate::util::command_error;
 use crate::{CommandContext, HandlerResult, SERVER_VERSION};
 
 /// `startSession` — mint a logical session id.
@@ -197,6 +198,54 @@ fn known_params() -> Document {
         ],
         "version": SERVER_VERSION,
     }
+}
+
+/// `top` — per-namespace operation counters, mongod-shaped.
+///
+/// SecantusDB does not instrument per-namespace operation timing, so every
+/// counter is zero and `mongotop` renders the all-zero table it shows for an
+/// idle mongod. The shape is what mongo-tools' decoder requires: a `note` key it
+/// skips explicitly, then one entry per namespace holding
+/// `total`/`readLock`/`writeLock` plus the per-op sections, each `{time, count}`.
+///
+/// Ported from `commands.py::_top`, which shipped first. Until this landed the
+/// Rust server answered `top` with CommandNotFound (59), so `mongotop` failed
+/// outright against it rather than rendering an idle server — a gap the Python
+/// entry's "counters are always zero" wording hid.
+pub fn top(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    if ctx.db_name != "admin" {
+        return Ok(doc! {
+            "ok": 0.0,
+            "errmsg": "top may only be run against the admin database.",
+            "code": 13_i32,
+            "codeName": "Unauthorized",
+        });
+    }
+    const SECTIONS: [&str; 8] = [
+        "total",
+        "readLock",
+        "writeLock",
+        "queries",
+        "getmore",
+        "insert",
+        "update",
+        "remove",
+    ];
+    let storage = ctx.storage()?;
+    let mut totals = doc! { "note": "all times in microseconds" };
+    for db in storage.list_databases().map_err(command_error)? {
+        for coll in storage.list_collections(&db).map_err(command_error)? {
+            let mut ns = Document::new();
+            for section in SECTIONS {
+                ns.insert(section, doc! { "time": 0_i64, "count": 0_i64 });
+            }
+            // `commands` is a section too; kept out of the array above only
+            // because the name would read oddly beside the per-op verbs.
+            ns.insert("commands", doc! { "time": 0_i64, "count": 0_i64 });
+            totals.insert(format!("{db}.{coll}"), ns);
+        }
+    }
+    Ok(doc! { "totals": totals, "ok": 1.0 })
 }
 
 #[cfg(test)]
@@ -394,6 +443,16 @@ mod tests {
         assert!(dispatch(&doc! {"hostInfo": 1}, &mut ctx())
             .get_document("system")
             .is_ok());
+
+        // `top` outside the admin database is refused exactly as commands.py
+        // refuses it. The Rust server answered CommandNotFound before this
+        // landed, so mongotop failed outright rather than showing an idle table.
+        // (The test context defaults to `admin`, so name a user db explicitly.)
+        let mut user_db = ctx();
+        user_db.db_name = "shop".to_string();
+        let refused = dispatch(&doc! {"top": 1}, &mut user_db);
+        assert_eq!(refused.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(refused.get_i32("code").unwrap(), 13);
         assert_eq!(
             dispatch(&doc! {"getLog": "global"}, &mut ctx())
                 .get_i32("totalLinesWritten")

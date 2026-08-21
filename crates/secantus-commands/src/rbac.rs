@@ -53,6 +53,7 @@ pub const A_DROP_ROLE: &str = "dropRole";
 
 pub const A_SERVER_STATUS: &str = "serverStatus";
 pub const A_HOST_INFO: &str = "hostInfo";
+pub const A_TOP: &str = "top";
 pub const A_GET_CMD_LINE_OPTS: &str = "getCmdLineOpts";
 pub const A_GET_LOG: &str = "getLog";
 pub const A_INPROG: &str = "inprog";
@@ -128,6 +129,7 @@ const CLUSTER_MONITOR_ACTIONS: &[&str] = &[
     A_LIST_DATABASES,
     A_SERVER_STATUS,
     A_HOST_INFO,
+    A_TOP,
     A_GET_CMD_LINE_OPTS,
     A_GET_LOG,
     A_INPROG,
