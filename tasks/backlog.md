@@ -109,12 +109,17 @@ Single-node change streams are implemented and conformant for typical pymongo `w
   reads is `standalone_or_rs_secondary_or_mongos` and we can only offer the
   primary, the same class as the pymongo/ruby secondary-readPreference
   expected-reds. Still open and genuinely fixable: `/Client/ipv6` ×2 (we bind
-  `127.0.0.1` only, so the test's `::1` ping fails),
-  `/BulkOperation/OP_MSG/max_msg_size` (we split into 2 commands where mongod
-  sends 1, though `maxMessageSizeBytes`/`maxWriteBatchSize` match mongod exactly at
-  48000000/100000, so it is our batching logic), and
-  `/command_monitoring/unified/writeConcernError` (`failCommand` ignores the
-  `writeConcernError` field).
+  `127.0.0.1` only, so the test's `::1` ping fails) and
+  `/command_monitoring/unified/writeConcernError`, which unlike the "flaky, not
+  deterministic" note above **reproduces every time when run alone** — worth
+  re-triaging rather than trusting either description.
+  **`/BulkOperation/OP_MSG/max_msg_size` is NOT in that list, and this audit
+  briefly claimed it was.** Run by its exact name it PASSES, both forked and
+  `--no-fork`, exactly as the 2026-08-11 re-diagnosis above says. It appeared to
+  fail here only because the reproducer appended a `*` to the pattern, pulling in
+  its `/BulkOperation/OP_MSG/*` siblings and reproducing the accumulated-state
+  interference that entry already documents. The lesson is the entry's own: the
+  framing "the server doesn't split" is wrong and chasing it wastes time.
 - [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
 
 ### 3.3 MongoDB CLI / tool conformance tests
