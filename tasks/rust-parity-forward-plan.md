@@ -147,6 +147,38 @@ where lock decomposition and RecordId work bite, the levers this section dismiss
 the grounds that "contention fixes cannot close a flat per-op multiple". That premise
 was false, so the dismissal does not follow.
 
+### Reads are already at parity — the gap is write-path-specific (2026-08-20)
+
+Everything above is insert-only, so on its own it cannot tell a *write-path* problem
+apart from general execution inefficiency. Measured with `bench/read_remeasure.py`
+(4 readers, 20,000-doc seed, 20 s × 3 reps **interleaved across arms** so thermal
+drift hits each equally; contended phase adds 8 insert writers):
+
+| arm | reads alone | contended by 8 writers | retained | vs Rust |
+|---|---|---|---|---|
+| Rust | 1,683.1 find-batches/s | 668.4/s | 39.7% | — |
+| mongod 6.0.16 | 1,619.5/s | 631.3/s | 39.2% | 1.04× slower |
+| mongod 8.3.4 | 1,652.7/s | 645.0/s | 39.1% | 1.02× slower |
+
+**On reads the Rust server is at parity — marginally ahead, by 2–4%.** Rep spread is
+~1% (Rust 1683/1695/1677; mongod8 1656/1649/1653), so the ordering is stable even if
+the margin is too small to claim as a win. Read retention under write load is
+identical across all three (~39%), i.e. reads degrade under concurrent writes the
+same way on both engines.
+
+That is the decisive test the write-only data could not perform: **a server 2.4×–3.7×
+behind on writes but level on reads does not have a general per-operation efficiency
+deficit.** The retracted verdict's "parity is a property of the execution engine"
+cannot survive a read path that is already at parity on the same engine, same box,
+same client. Whatever the write gap is, it lives in the write path — oplog write,
+index maintenance, commit — which is where work can be aimed.
+
+**Caution, recorded because it caught this audit out.** A 4 s smoke with a 2,000-doc
+seed showed Rust *ahead* on retention (44.7% vs 31.4%) and *behind* on absolute reads.
+Neither survived at full scale: with 20,000 docs and 20 s reps, retention equalised
+and the absolute ordering flipped. Short runs on small seeds do not predict this
+workload — do not quote a smoke.
+
 **On the mongod version.** Both the old table and this re-measure used **6.0.16**:
 `/opt/homebrew/bin/mongod` is a symlink created 2024-08-07 to `mongodb-community@6.0`
 and unchanged since, so `shutil.which("mongod")` resolved identically then and now —
@@ -161,10 +193,11 @@ stale default cost us nothing — but pin the binary deliberately from here
 What is retracted is the load-bearing sentence: "**parity is a property of the
 execution engine, not a lever we can pull**".
 
-**Reproduce:** `bench/parity_remeasure.py` refuses to run on a loaded box or an
-attached branch, pins and records the mongod binary + version per arm, waits for load
-to decay before judging the box, and marks the artifact untrusted if the box or the
-tree moved under it. Artifacts: `bench/results/parity-remeasure/`.
+**Reproduce:** `bench/parity_remeasure.py` (writes) and `bench/read_remeasure.py`
+(reads / mixed) both refuse to run on a loaded box or an attached branch, pin and
+record the mongod binary + version per arm, wait for load to decay before judging the
+box, and mark the artifact untrusted if the box or the tree moved under it. Artifacts:
+`bench/results/parity-remeasure/` and `bench/results/read-remeasure/`.
 
 <details>
 <summary>Original 2026-07-22 section, retained verbatim for the record</summary>

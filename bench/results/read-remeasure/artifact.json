@@ -1,0 +1,115 @@
+{
+  "captured": "2026-08-20T10:58:24.919568+00:00",
+  "sha_before": "cfd5b35292ff5b197e4ce9cf518e37b701bfcd32",
+  "sha_after": "cfd5b35292ff5b197e4ce9cf518e37b701bfcd32",
+  "workload": {
+    "readers": 4,
+    "writers": 8,
+    "duration_s": 20.0,
+    "seed_docs": 20000,
+    "reps": 3
+  },
+  "box_checks": [
+    {
+      "phase": "before",
+      "load": 2.1953125,
+      "load_immediate": 2.1953125,
+      "settle_s": 0.0,
+      "stray": [],
+      "verdict": "quiet"
+    },
+    {
+      "phase": "after",
+      "load": 3.9912109375,
+      "load_immediate": 3.9912109375,
+      "settle_s": 180.0,
+      "stray": [],
+      "verdict": "quiet"
+    }
+  ],
+  "trusted": true,
+  "elapsed_s": 369.9,
+  "results": {
+    "rust": {
+      "binary": null,
+      "version": null,
+      "reps": [
+        {
+          "alone_batches_per_s": 1683.1,
+          "contended_batches_per_s": 676.3,
+          "retained_pct": 40.2,
+          "rep": 0
+        },
+        {
+          "alone_batches_per_s": 1694.9,
+          "contended_batches_per_s": 668.4,
+          "retained_pct": 39.4,
+          "rep": 1
+        },
+        {
+          "alone_batches_per_s": 1677.1,
+          "contended_batches_per_s": 665.6,
+          "retained_pct": 39.7,
+          "rep": 2
+        }
+      ],
+      "median_alone": 1683.1,
+      "median_contended": 668.4,
+      "median_retained_pct": 39.7
+    },
+    "mongod6": {
+      "binary": "/opt/homebrew/Cellar/mongodb-community@6.0/6.0.16/bin/mongod",
+      "version": "db version v6.0.16",
+      "reps": [
+        {
+          "alone_batches_per_s": 1635.7,
+          "contended_batches_per_s": 644.5,
+          "retained_pct": 39.4,
+          "rep": 0
+        },
+        {
+          "alone_batches_per_s": 1609.0,
+          "contended_batches_per_s": 631.3,
+          "retained_pct": 39.2,
+          "rep": 1
+        },
+        {
+          "alone_batches_per_s": 1619.5,
+          "contended_batches_per_s": 626.0,
+          "retained_pct": 38.7,
+          "rep": 2
+        }
+      ],
+      "median_alone": 1619.5,
+      "median_contended": 631.3,
+      "median_retained_pct": 39.2
+    },
+    "mongod8": {
+      "binary": "/opt/homebrew/Cellar/mongodb-community/8.3.4/bin/mongod",
+      "version": "db version v8.3.4",
+      "reps": [
+        {
+          "alone_batches_per_s": 1655.5,
+          "contended_batches_per_s": 655.9,
+          "retained_pct": 39.6,
+          "rep": 0
+        },
+        {
+          "alone_batches_per_s": 1649.1,
+          "contended_batches_per_s": 645.0,
+          "retained_pct": 39.1,
+          "rep": 1
+        },
+        {
+          "alone_batches_per_s": 1652.7,
+          "contended_batches_per_s": 630.5,
+          "retained_pct": 38.1,
+          "rep": 2
+        }
+      ],
+      "median_alone": 1652.7,
+      "median_contended": 645.0,
+      "median_retained_pct": 39.1
+    }
+  }
+}
