@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -70,19 +71,34 @@ Arm = tuple[str, str | None]
 
 
 # ----------------------------------------------------------- mongod discovery
+def parse_version_banner(text: str) -> str | None:
+    """`8.3.4` from `db version v8.3.4`, or None if it isn't a mongod banner.
+
+    Split out from the subprocess call so the parsing can be tested without
+    executing anything — the first version of this only existed inside
+    `mongod_version`, and testing it meant writing `#!/bin/sh` stubs that Windows
+    cannot run, which turned every discovery test red on that platform.
+    """
+    m = re.search(r"db version v?(\d+\.\d+\.\d+)", text)
+    return m.group(1) if m else None
+
+
 def mongod_version(binary: str) -> str | None:
-    """`8.3.4` from `db version v8.3.4`, or None if the binary won't report."""
+    """Ask a binary for its version. None if it won't run or isn't mongod."""
     try:
         out = subprocess.run(
             [binary, "--version"], capture_output=True, text=True, timeout=30
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
-    m = re.search(r"db version v?(\d+\.\d+\.\d+)", out)
-    return m.group(1) if m else None
+    return parse_version_banner(out)
 
 
-def discover_mongods(explicit: list[str] | None = None) -> dict[str, Arm]:
+def discover_mongods(
+    explicit: list[str] | None = None,
+    *,
+    probe: Callable[[str], str | None] = mongod_version,
+) -> dict[str, Arm]:
     """Find every usable mongod and label each arm by its own version.
 
     Version-derived labels (`mongod-8.3.4`) rather than positional ones
@@ -93,6 +109,9 @@ def discover_mongods(explicit: list[str] | None = None) -> dict[str, Arm]:
     Explicit paths win outright; otherwise PATH plus MONGOD_SEARCH_GLOBS. Results
     are deduped by realpath, so a Homebrew symlink and its Cellar target do not
     become two arms measuring one binary.
+
+    `probe` is injectable so tests can exercise the selection rules without
+    executing a binary — executable stubs are not portable across platforms.
     """
     candidates: list[str] = []
     if explicit:
@@ -109,13 +128,17 @@ def discover_mongods(explicit: list[str] | None = None) -> dict[str, Arm]:
     seen: set[str] = set()
     for cand in candidates:
         path = Path(cand)
-        if not path.exists() or not os.access(path, os.X_OK):
+        if not path.exists():
+            continue
+        # X_OK is meaningless on Windows (it reports every existing file as
+        # executable), so it filters on POSIX and the probe catches the rest.
+        if os.name != "nt" and not os.access(path, os.X_OK):
             continue
         real = str(path.resolve())
         if real in seen:
             continue
         seen.add(real)
-        version = mongod_version(real)
+        version = probe(real)
         if version is None:
             continue
         # First binary to claim a version wins; a later duplicate of the same
@@ -124,9 +147,13 @@ def discover_mongods(explicit: list[str] | None = None) -> dict[str, Arm]:
     return arms
 
 
-def build_arms(explicit: list[str] | None = None) -> dict[str, Arm]:
+def build_arms(
+    explicit: list[str] | None = None,
+    *,
+    probe: Callable[[str], str | None] = mongod_version,
+) -> dict[str, Arm]:
     """The Rust server plus one arm per discovered mongod version."""
-    return {"rust": ("rust", None), **discover_mongods(explicit)}
+    return {"rust": ("rust", None), **discover_mongods(explicit, probe=probe)}
 
 
 def newest_mongod(arms: dict[str, Arm]) -> str | None:
