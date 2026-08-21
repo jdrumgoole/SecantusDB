@@ -9,6 +9,7 @@ use secantus_bench::cluster::{
     Config, DEFAULT_CLIENT_SIZE, DEFAULT_IMAGE, DEFAULT_PREFIX, DEFAULT_REGION, DEFAULT_SERVER_SIZE,
 };
 use secantus_bench::doapi::{token_from_env, Api};
+use secantus_bench::engine::Engine;
 use secantus_bench::ops::{self, Opts};
 use secantus_bench::remote::default_ssh_key;
 use secantus_bench::{BenchResult, ALL_ROLES};
@@ -23,7 +24,7 @@ const BOOL_FLAGS: [&str; 7] = [
     "--no-suspend",
 ];
 
-const VALUE_FLAGS: [&str; 22] = [
+const VALUE_FLAGS: [&str; 24] = [
     "--prefix",
     "--region",
     "--server-size",
@@ -35,6 +36,8 @@ const VALUE_FLAGS: [&str; 22] = [
     "--server-version",
     "--server-ref",
     "--agent-ref",
+    "--engine",
+    "--mongod-version",
     "--duration",
     "--workers",
     "--op-mix",
@@ -48,7 +51,7 @@ const VALUE_FLAGS: [&str; 22] = [
     "--deploy",
 ];
 
-const USAGE: &str = r#"do-cluster — three-droplet DigitalOcean benchmark for the SecantusDB Rust server
+const USAGE: &str = r#"do-cluster — three-droplet DigitalOcean benchmark: SecantusDB vs MongoDB
 
 USAGE
   do-cluster <command> [options]
@@ -81,6 +84,12 @@ DEPLOY (deploy, all)
   --server-version TAG Release tag for `release`           [latest secantusdb-v*]
   --server-ref REF     Pushed git ref for `source`         [HEAD]
   --agent-ref REF      Pushed git ref the load agent builds from     [HEAD]
+
+ENGINES (deploy, run, all)
+  --engine WHICH       both (default) | secantus | mongod | a comma list.
+                       `both` runs SecantusDB then MongoDB back-to-back on the
+                       same droplets and prints a side-by-side comparison.
+  --mongod-version V   MongoDB major version to install               [8.0]
 
 WORKLOAD (run, all)
   --duration SECS      Timed seconds                       [120]
@@ -137,6 +146,8 @@ fn build_opts(args: &Args) -> BenchResult<Opts> {
         server_version: args.str_or("--server-version", "latest"),
         server_ref: args.str_or("--server-ref", ""),
         agent_ref: args.str_or("--agent-ref", ""),
+        engines: Engine::parse_list(&args.str_or("--engine", "both"))?,
+        mongod_version: args.str_or("--mongod-version", "8.0"),
         duration: args.f64_or("--duration", 120.0)?,
         workers: args.usize_or("--workers", 16)?,
         op_mix: args.str_or("--op-mix", "insert=70,find=20,update=10"),

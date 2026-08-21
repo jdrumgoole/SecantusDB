@@ -20,6 +20,7 @@
 pub mod argv;
 pub mod cluster;
 pub mod doapi;
+pub mod engine;
 pub mod histogram;
 pub mod mongo;
 pub mod opmix;

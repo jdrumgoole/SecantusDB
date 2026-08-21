@@ -13,9 +13,32 @@ pub fn state_dir() -> PathBuf {
     let base = std::env::var("SECANTUS_BENCH_STATE")
         .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("bench/.do-state"));
+        .unwrap_or_else(|| repo_root().join("bench/.do-state"));
     let _ = std::fs::create_dir_all(&base);
     base
+}
+
+/// The repository root, so state and results land in the same place whether
+/// the binary was launched from the repo root or from `crates/` by cargo.
+///
+/// A cwd-relative default scattered a second `bench/.do-state` under
+/// `crates/secantus-bench/` and got it committed.
+pub fn repo_root() -> PathBuf {
+    if let Ok(dir) = std::env::var("SECANTUS_BENCH_ROOT") {
+        return PathBuf::from(dir);
+    }
+    let out = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output();
+    if let Ok(out) = out {
+        if out.status.success() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !path.is_empty() {
+                return PathBuf::from(path);
+            }
+        }
+    }
+    PathBuf::from(".")
 }
 
 pub fn known_hosts() -> PathBuf {
