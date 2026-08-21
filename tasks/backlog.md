@@ -5400,7 +5400,7 @@ shared storage engine or building large new protocol subsystems:
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.
 
-## Why mongod's tail is better: 42x fewer dirty cache bytes per byte written (2026-08-21)
+## RETRACTED: the "42x dirty cache bytes" comparison was a counter artifact (2026-08-21)
 
 The cache sweep proved the tail is governed by cache pressure, but not why
 mongod holds p99.9 at 10.75ms where SecantusDB reaches 121ms **at the same 4G
@@ -5422,9 +5422,14 @@ the window (SecantusDB 11.95 GB, mongod 27.70 GB), so raw counters mislead:
 | pages selected for eviction, unevictable | 132 | 9.4 | 14x |
 | eviction-worker pages | 9,214 | 5,205 | 2x |
 
-**SecantusDB dirties 42x more cache per byte of data written.** Dirty cache
-bytes is precisely the quantity the cache sweep showed governs the tail, so
-this is the mechanism behind the gap, and it explains every earlier result:
+> **RETRACTED.** The `bytes dirty in the cache cumulative` counter does not
+> account for every table's writes, so this comparison measured counter
+> coverage rather than work. See "Why the dirty-bytes comparison is void"
+> below. The cache *sweep* (cache size versus tail) is a black-box measurement
+> and stands; this counter-based comparison does not.
+
+The original claim, kept for the record: SecantusDB dirties 42x more cache per
+byte of data written, which would explain every earlier result:
 more cache helps (more headroom before the trigger), smaller documents help
 more (less dirty per op), no eviction knob helps (the problem is upstream of
 eviction), and bounding concurrency does not help (it does not reduce dirty
@@ -5440,7 +5445,7 @@ Two supporting details worth noting:
   the stall is threads blocking on reads because the cache cannot hold the
   working set, rather than threads conscripted into writing pages out.
 
-### Split by table: 95% of it is the oplog
+### Split by table (also void — same artifact)
 
 Per-table dirty bytes, same workload (`statistics_log=(...,sources=("file:"))`
 — note `sources` accepts `file:`, not `table:`). Insert-only, 8 writers, 40s,
@@ -5457,9 +5462,8 @@ Total 11.99 GB = 1.11x logical, against the connection-level counter's 1.12x —
 the two instruments agree, which is the cross-check that makes the split
 trustworthy.
 
-**The oplog dirties 63x more cache than the document table whose writes it is
-recording.** Since dirty cache bytes is the proven driver of the tail, the
-oplog table is the target. It is also why `--oplog-async` was the single
+That split is **not** evidence the oplog does 63x more work — see below. It is
+the same counter-coverage artifact. It is also why `--oplog-async` was the single
 biggest lever found (-24%): it is the only change so far that touches the table
 responsible for 95% of the pressure.
 
@@ -5479,15 +5483,47 @@ row is an artifact, not a fix: 8 KiB values stop fitting the leaf and spill to
 overflow items, which the dirty-bytes counter does not see, and the tail gets
 *worse*. So the theory is disproven and the +19% tuning is not to blame.
 
-- [ ] **Why does the oplog dirty ~1.06x logical when the documents table
-  dirties 0.02x?** Both receive a full copy of every document, so the asymmetry
-  is the open question and the next thing to chase. Candidates: the oplog is
-  sharded 2 ways against the documents table's 16 (far more contention on the
-  same tail pages); the oplog's append-only key order versus the documents
-  table's RecordId order; or a difference in how often each table's tail page
-  is reconciled and re-dirtied. Per-table `cache: pages written from cache` and
-  `btree: reconciliation` counters are already in the same stats file and would
-  separate these without any code change.
+### Why the dirty-bytes comparison is void
+
+Chasing the oplog/documents asymmetry answered it. Adding `cache: bytes written
+from cache` alongside the dirty counter, same workload:
+
+| writers | table | dirty GB | **written GB** | written/dirty |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | oplog | 3.97 | **4.46** | 1.1x |
+| 1 | documents | 0.00 | **4.31** | **1,289x** |
+| 8 | oplog | 12.91 | **12.76** | 1.0x |
+| 8 | documents | 0.24 | **12.39** | **51x** |
+
+**The documents table writes essentially the same bytes as the oplog** — which
+is exactly right, since both hold a full copy of every document — while its
+cumulative-dirty counter reads ~zero. The write volumes are symmetric and
+credible; the dirty accounting is not. `bytes dirty in the cache cumulative`
+simply does not cover that table's writes.
+
+Consequences, stated plainly:
+
+- The **"oplog is 95% of dirty bytes"** split is an artifact of counter
+  coverage, not evidence that the oplog does 63x the work. Retracted.
+- The **"42x more dirty bytes than mongod"** comparison is worse: if mongod's
+  collection writes are similarly uncounted, that number compared how well each
+  engine's tables are instrumented, not how much cache they dirty. **Retracted.**
+- What survives: `bytes written from cache` shows the oplog and the documents
+  table each writing ~1x logical, so **~2x total** — which independently agrees
+  with the WAL measurement (2.04x from file sizes) and with the doc +
+  full-document-oplog-entry reasoning. That much is consistent across three
+  instruments.
+
+The mechanism behind mongod's better tail at the same cache size is therefore
+**still unexplained**. The cache sweep stands (tail is governed by cache
+headroom); what does not stand is any counter-based claim about *why*
+SecantusDB reaches the eviction trigger sooner.
+
+- [ ] **Re-do the comparison with a counter that covers both engines.**
+  `cache: bytes written from cache` per table is symmetric and trustworthy on
+  the SecantusDB side; the same counter on mongod's collection and oplog tables
+  would give a like-for-like write-volume comparison. That is the measurement
+  the 42x claim should have been built on.
 
 **Methodology note**: the run above used the default `repeat` payload, which
 mongod's snappy WAL compression crushes — that inflates the WAL row
