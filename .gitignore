@@ -102,3 +102,9 @@ crates/secantus-server-py/Cargo.lock
 .playwright-mcp/
 docs-rust/_build/
 faulthandler-dumps/
+
+# Three-droplet DigitalOcean benchmark (crates/secantus-bench): per-run result
+# directories and the harness's own ssh known_hosts / scratch files. Curated
+# results can still be force-added; ad-hoc runs stay out of the tree.
+bench/.do-state/
+bench/results/do/
