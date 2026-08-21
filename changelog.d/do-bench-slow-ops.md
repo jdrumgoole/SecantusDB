@@ -25,8 +25,23 @@ quickly, and the full finding with its evidence is recorded in
 - Checkpoints, WiredTiger log preallocation, and log file size were each ruled
   out by experiment; oplog pruning turned out to drive the worst single outlier
   (126ms → 26ms when disabled) but not p99.9.
-- `--oplog-async` recovers 24% of the tail and removes 42% of the stalls,
-  implicating the process-wide oplog mutex as one strand of the convoy.
+- The root cause is **WiredTiger cache pressure**: the tail scales inversely
+  with cache headroom (52x spread at a 512M cache, 7x at 8G) while throughput
+  and median latency stay flat. Shrinking the documents instead of growing the
+  cache does the same thing, so it is the rate dirty data fills the cache that
+  governs the tail.
+- There is **no WiredTiger config-only fix**. Every eviction knob tried either
+  did nothing (thread count) or made the tail worse while costing throughput
+  (dirty and updates thresholds).
+- On the droplets both engines ran the **same 4G cache**, yet mongod held p99.9
+  at 10.75ms where SecantusDB reached 121ms. The structural difference is
+  admission control: MongoDB bounds concurrent storage-engine write
+  transactions so excess writers queue outside the engine, while SecantusDB
+  lets every connection thread dive straight into WiredTiger. The harness data
+  prices the trade — capping writers at 4 rather than 16 costs 23% of
+  throughput and halves the tail.
+- `--oplog-async` recovers a further 24% of the tail and removes 42% of the
+  stalls, independently of the cache story.
 
 #### Added
 

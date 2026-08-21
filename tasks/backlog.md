@@ -5400,26 +5400,24 @@ shared storage engine or building large new protocol subsystems:
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.
 
-## p99.9 write-tail convoy (found by the three-droplet harness, 2026-08-21)
+## p99.9 write-tail: WiredTiger cache pressure, unthrottled (2026-08-21)
 
-The three-droplet DigitalOcean comparison put SecantusDB at **0.46-0.49x
-mongod's throughput but 9.8-11.3x its p99.9 latency** — a far worse ratio in
-the tail than in the median (1.5x at p50, 3.7x at p99). The tail, not the
-average, is the gap. Investigated with `do-client --slow-ms`, which records
-every operation over a threshold **with its timestamp** (the histogram throws
+The three-droplet comparison put SecantusDB at **0.46-0.49x mongod's throughput
+but 9.8-11.3x its p99.9 latency** — far worse in the tail than at the median
+(1.5x p50, 3.7x p99). Investigated with `do-client --slow-ms`, which records
+every operation over a threshold **with its timestamp** (a histogram throws
 time away, which is exactly what a tail diagnosis needs back).
 
-**Reproduces locally**, so it is an engine property rather than a network or
-cloud artifact: on macOS over loopback the shape is the same (p50 0.18ms →
-p99.9 8.4ms, 47x; the droplet measured 48x).
+**Reproduces locally**, so it is an engine property, not a network or cloud
+artifact: macOS over loopback shows the same shape (47x p50→p99.9 against the
+droplets' 48x). Every experiment below is therefore a free local run.
 
-What the evidence says:
+### Where it lives
 
-- **The read path is clean.** 8 concurrent readers: p50 0.14ms, p99.9 0.31ms —
-  a 2x spread. There is no read tail to fix.
-- **The write path owns it.** 8 concurrent inserters: p50 0.18ms, p99.9 8.4ms —
-  45x.
-- **It is concurrency, not per-write cost.** Insert-only sweep, 8 KiB docs:
+- **Not the read path.** 8 concurrent readers: p50 0.14ms, p99.9 0.31ms — a 2x
+  spread. There is no read tail.
+- **The write path, and it is concurrency rather than per-write cost.**
+  Insert-only, 8 KiB docs, local:
 
   | writers | ops/s | per-writer | p50 ms | p99.9 ms | ratio |
   | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -5429,40 +5427,81 @@ What the evidence says:
   | 8 | 36,583 | 4,573 | 0.19 | 8.26 | 44x |
   | 16 | 42,144 | 2,634 | 0.29 | 9.92 | 34x |
 
-  The tail jumps **7x between 2 and 4 writers** while the median barely moves
-  (0.08 → 0.11ms), and per-writer throughput collapses over the same range.
-  That is a convoy: writers queue behind a shared resource, and when one holds
-  it long every other writer waits. The slow-op traces confirm it directly —
-  **every large stall hits all 8 workers within the same few milliseconds**,
-  at irregular intervals (2.8s, 5.2s, 4.7s, 3.4s, 25.0s, 1.8s, ...), which
-  also rules out a fixed-period background task.
+  The tail jumps 7x between 2 and 4 writers while the median barely moves.
+  Slow-op traces show **every large stall hitting all workers within the same
+  few milliseconds**, at irregular gaps (2.8s, 5.2s, 25.0s, 1.8s, ...) — a
+  convoy behind a shared resource, and not a fixed-period background task.
 
-Ruled out by experiment (each a 60s local run, p99.9 vs a 7.39ms baseline):
+### Root cause: cache pressure
 
-- **Checkpoints** — `--checkpoint-seconds 3600`: 7.84ms, no improvement.
-- **WT log preallocation** — `log=(...,prealloc=true)`: 7.84ms, none.
-- **WT log file size** — `file_max=1GB` (vs the 128MB default, which at
-  ~200MB/s of log traffic rolls about twice a second): 7.97ms, none.
-- **Oplog pruning** (`OPLOG_PRUNE_INTERVAL = 1000` against a 100k cap, which a
-  fast writer blows through in seconds) — effectively disabling it left p99.9
-  at 7.07ms, but cut the worst single stall from 126ms to 26ms. It is a
-  max-outlier contributor, not the p99.9 driver.
+Cache sweep, 8 writers, insert-only, 8 KiB docs — throughput and p50 are flat;
+**only the tail moves**:
 
-The one lever found: **`--oplog-async` cuts p99.9 by 24%** (7.39 → 5.60ms) and
-removes 42% of the stalls. Every write emits an oplog entry under a single
-process-wide `Arc<Mutex<OplogState>>` (`secantus-storage/src/lib.rs`), which
-is a serialization point across all collections and all connections, so that
-is one identified strand of the convoy — but not all of it, since the async
-path still leaves a 31x spread.
+| cache | ops/s | p50 ms | p99.9 ms | ratio |
+| ---: | ---: | ---: | ---: | ---: |
+| 512M | 35,391 | 0.18 | 9.28 | 52x |
+| 1G | 37,648 | 0.18 | 8.26 | 46x |
+| 2G | 39,324 | 0.18 | 2.96 | 16x |
+| 4G | 39,022 | 0.18 | 1.66 | 9x |
+| 8G | 38,910 | 0.18 | 1.29 | 7x |
 
-- [ ] **Next steps**: (a) attribute the residual convoy — the 2→4 writer cliff
-  suggests a resource with small fixed concurrency (WT is configured
-  `eviction=(threads_min=4,threads_max=4)`); (b) consider whether the global
-  oplog mutex can become per-collection or batched, since `--oplog-async`
-  already shows what removing it from the critical path is worth; (c) decide
-  whether `--oplog-async` should be the default. Reproduce any of this with
-  `do-client --slow-ms 5` plus `tasks/` notes; relates to the residual item in
-  the section below and to `tasks/wt-concurrency-plan.md`.
+Shrinking the data instead of growing the cache does the same thing (256B docs
+instead of 8 KiB: p99.9 8.26 → 0.37ms, -96%), confirming it is the *rate dirty
+data fills the cache* that governs the tail, not the absolute data size — every
+run above writes ~14 GB regardless.
+
+### Ruled out by experiment
+
+Each a 45-60s local run against an 8.26ms baseline:
+
+| suspect | test | p99.9 |
+| --- | --- | --- |
+| Checkpoints | `--checkpoint-seconds 3600` | no change |
+| WT log preallocation | `log=(...,prealloc=true)` | no change |
+| WT log file size | `file_max=1GB` vs 128MB | no change |
+| **WT logging entirely** | `--data-nonlogged --oplog-nonlogged` | **no change** |
+| Eviction thread count | 4 → 8 threads | +2% (none) |
+| Eviction dirty thresholds | `dirty_target=5,trigger=10` | **+19% (worse)** |
+| Eviction dirty thresholds | `dirty_target=1,trigger=5` | **+16% (worse)**, -19% throughput |
+| Eviction updates thresholds | `updates_target=2,trigger=5` | **+16% (worse)** |
+| Oplog pruning | effectively disabled | unchanged, but worst stall 126ms → 26ms |
+
+There is **no WiredTiger config-only fix**: every eviction knob either did
+nothing or made it worse while costing throughput.
+
+### Why mongod does better on identical hardware
+
+On the droplets both engines ran with the **same 4G cache** and the same
+workload, yet mongod held p99.9 at 10.75ms where SecantusDB reached 121ms. So
+this is not "SecantusDB needs a bigger cache" — it is that mongod degrades
+gracefully under the same pressure and SecantusDB does not.
+
+The structural difference is **admission control**. MongoDB bounds the number
+of concurrent storage-engine write transactions (the ticket system, reduced
+further under cache pressure), so excess writers queue *outside* the engine
+instead of piling in and being conscripted into eviction work. SecantusDB has
+no such bound: every connection thread dives straight into WiredTiger.
+
+The harness data already prices that trade-off. Going from 16 concurrent
+writers to 4 costs **23% of throughput and halves the tail**; going to 2 costs
+46% of throughput for a **93%** tail reduction.
+
+### Where to go next
+
+- [ ] **Admission control** — bound concurrent write transactions (mongod's
+  ticket equivalent). This is the fix the evidence points at: it is what turns
+  a catastrophic tail into bounded queueing, and the sweep above shows the
+  throughput cost is modest.
+- [ ] **`--oplog-async` as a default** — worth 24% of the tail and 42% of the
+  stalls on its own, independently of the cache story. Every write currently
+  passes through one process-wide `Arc<Mutex<OplogState>>`.
+- [ ] **Cache defaulting** — the daemon caps at 4G; the sweep shows the tail is
+  governed by cache headroom versus write rate, so the default deserves
+  revisiting (and documenting) rather than being a fixed number.
+
+Reproduce any of this with `do-client --slow-ms 5` (see `bench/DO_CLUSTER.md`
+"Diagnosing a tail"). Relates to the residual item in the section below and to
+`tasks/wt-concurrency-plan.md`.
 
 ## Concurrent-writer contention (found by bench.concurrency, 2026-07-16)
 
