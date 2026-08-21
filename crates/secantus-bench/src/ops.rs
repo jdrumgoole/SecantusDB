@@ -600,13 +600,18 @@ pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Summary> {
     );
 
     let sample_out = "/tmp/server-sample.json";
+    // The sampler covers the barrier wait plus the whole load window, and
+    // finishes just after it. It writes its JSON only on completion, so the
+    // orchestrator waits for the file below rather than racing it — the first
+    // live run scp'd 4s early and reported "sampler produced nothing" for a
+    // sampler that was working perfectly.
+    let sample_seconds = opts.duration + opts.start_delay + 2.0;
     ssh(
         &cfg.ssh_key,
         &server_ip,
         &format!(
-            "nohup {REMOTE_DIR}/do-client sample --duration {:.0} --interval 1 \
-             --process secantusd-rs --out {sample_out} >/tmp/sample.log 2>&1 & echo started",
-            opts.duration + opts.start_delay + 5.0
+            "nohup {REMOTE_DIR}/do-client sample --duration {sample_seconds:.0} --interval 1 \
+             --process secantusd-rs --out {sample_out} >/tmp/sample.log 2>&1 & echo started"
         ),
         false,
     )?;
@@ -654,6 +659,25 @@ pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Summary> {
     }
 
     let mut sample = SampleSummary::default();
+    // Give the sampler its remaining seconds to land the file.
+    let landed = remote::wait_until(
+        || {
+            ssh_raw(
+                &cfg.ssh_key,
+                &server_ip,
+                &format!("test -f {sample_out} && echo ok"),
+            )
+            .map(|o| o.stdout.trim() == "ok")
+            .unwrap_or(false)
+        },
+        Duration::from_secs(90),
+        Duration::from_secs(2),
+    );
+    if !landed {
+        failures.push(format!(
+            "server sampler never wrote {sample_out} (see /tmp/sample.log)"
+        ));
+    }
     let sample_local = outdir.join("server-sample.json");
     match scp_from(&cfg.ssh_key, &server_ip, sample_out, &sample_local)
         .and_then(|_| std::fs::read_to_string(&sample_local).map_err(|e| e.to_string()))

@@ -30,6 +30,7 @@ It is written in Rust and lives in `crates/secantus-bench`, as two binaries:
 - [Benchmarking unreleased code](#benchmarking-unreleased-code)
 - [Worked examples](#worked-examples)
 - [Troubleshooting](#troubleshooting)
+- [Verified](#verified)
 - [Limitations](#limitations)
 
 ---
@@ -535,15 +536,32 @@ and re-provision.
 
 ---
 
+## Verified
+
+Run against a live account on 2026-08-21: one `c-4` server and two `c-2`
+clients in `lon1`, `secantusd-rs 0.5.3-beta.160` from the published release,
+16 workers per client, 8 KiB documents, the default 70/20/10 mix, 120 s.
+
+| | |
+| --- | --- |
+| Aggregate | **6,230 ops/s**, 747,699 operations, **0 errors** |
+| Latency | p50 3.4-3.7 ms, p99 26-27 ms, p99.9 91-111 ms |
+| Server | 82.9% mean CPU, 99.0% peak, of 4 vCPU; 6.13 GiB peak RSS |
+| Clients | 5% and 7% CPU — ample headroom, so the server was the limit |
+| Network | 0.6-0.9 ms RTT over the private VPC |
+
+Two consecutive runs agreed to within 0.16% (6,220 and 6,230 ops/s), and the
+clients' low CPU alongside the server's saturated CPU is the shape a valid
+server benchmark should have: the instrument was nowhere near its limit.
+
+---
+
 ## Limitations
 
-- **Not yet exercised against a live DigitalOcean account.** The provisioning
-  and deployment paths are written against the documented v2 API but have not
-  been run end-to-end for real. The load agent, the wire client, the
-  cross-machine aggregation and the reporting *have* been verified against a
-  local `secantusd-rs`, including confirming with an independent driver that
-  every reported insert reached storage. Expect to fix small things on the
-  first live run.
+- **Two paths remain unexercised.** The harness has been run end-to-end
+  against a live DigitalOcean account (see [Verified](#verified) below), but
+  `--server-build source` and the `snapshot` / `power-off` teardown modes have
+  not been. `destroy` — the default — is verified.
 - Single server droplet only — SecantusDB is single-node by design, so there
   is nothing to shard or replicate across.
 - The agent measures `insert` / `find` / `update`. Aggregation, change

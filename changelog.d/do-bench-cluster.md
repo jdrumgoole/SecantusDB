@@ -27,6 +27,12 @@ load windows failed to overlap, when the server sat idle enough that the
 bottleneck must be elsewhere, and when the server process died during the run
 — which invalidates the run outright.
 
+Verified against a live DigitalOcean account: one `c-4` server and two `c-2`
+clients in `lon1` sustained **6,230 operations per second with zero errors**
+over 120 seconds, with the server at 82.9% mean CPU and the clients at 5-7% —
+the shape a valid server benchmark should have, since the instrument was
+nowhere near its own limit. Two consecutive runs agreed to within 0.16%.
+
 #### Added
 
 - `crates/secantus-bench`, a new WiredTiger-free workspace member shipping two
