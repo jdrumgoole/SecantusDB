@@ -5400,6 +5400,65 @@ shared storage engine or building large new protocol subsystems:
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.
 
+## The WAL is uncompressed: 2x logical data, and 22% of the tail (2026-08-21)
+
+Measured with `do-client --payload random` (per-document entropy — see the
+correction below). 20,000 x 8 KiB documents = 160 MB logical, WAL bytes
+sampled while the server was still running:
+
+| config | WAL | x logical |
+| --- | ---: | ---: |
+| SecantusDB, random payload | 327,072 KB | **2.04x** |
+| SecantusDB, repeated payload | 327,072 KB | **2.04x** |
+| mongod, random payload | 141,864 KB | 0.89x |
+| mongod, repeated payload | 8,244 KB | **0.05x** |
+| SecantusDB, random + `compressor=zlib` | 125,040 KB | **0.78x** |
+
+**SecantusDB writes byte-identical WAL volume for random and repeated
+payloads.** That is proof the WAL is uncompressed: `wt_config` sets
+`log=(enabled=true,file_max=...,prealloc=false)` and never names a compressor,
+while mongod defaults to `--wiredTigerJournalCompressor snappy`.
+
+The 2.04x itself is expected and matches mongod — every insert logs the
+document row *and* a full-document oplog entry, which is what mongod's oplog
+does too. The difference is purely that mongod compresses the result and
+SecantusDB does not. On the compressible payload the benchmarks elsewhere in
+this file used, that is **2.04x against 0.05x — roughly 40x the write I/O for
+the same workload.**
+
+### It is worth a fifth of the tail
+
+Turning on WAL compression (8 writers, 1G cache, 8 KiB docs, medians of two
+passes):
+
+| WAL | ops/s | p50 ms | p99.9 ms |
+| --- | ---: | ---: | ---: |
+| uncompressed (today) | 36,285 | 0.19 | 8.45 |
+| `compressor=zlib` | 34,365 | 0.20 | **6.62** |
+
+**-22% p99.9 for -5% throughput** — a far better trade than the admission
+control prototype (-12% tail for -22% throughput), and it composes with
+`--oplog-async` (-24%) since they attack different parts of the write path.
+It does not *fix* the tail (33x p50→p99.9 remains), but it is the second real
+lever found.
+
+- [ ] **Configure a WAL compressor.** `zlib` is already linked into the
+  vendored WiredTiger (`HAVE_BUILTIN_EXTENSION_ZLIB`) and is what the data
+  tables use, so this is a connection-string change, not a build change.
+  mongod uses snappy; zlib measured well here. Worth pairing with the
+  `log_file_max` rotation fix above — together they are ~19x the disk and ~22%
+  of the tail for ~5% of throughput.
+
+### Correction: `--payload random` was not measuring what it claimed
+
+First implementation generated **one** random payload per worker and reused it
+for every document. Each document was incompressible internally and every
+document was identical, so WiredTiger's block compression — which spans many
+records — crushed the lot: 20,000 x 8 KiB "random" documents produced an 8.8 MB
+table and preloaded in 1.2s. The first amplification numbers taken with it
+(a 96x WAL reduction from zlib) were an artifact and are void. Fixed to derive
+the payload per document; the numbers above are the corrected ones.
+
 ## The 2GB WAL default costs 19x the disk for no throughput (2026-08-21)
 
 Measured while chasing write amplification: **SecantusDB leaves 674 MB on disk

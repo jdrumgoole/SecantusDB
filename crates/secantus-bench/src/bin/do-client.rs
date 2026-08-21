@@ -105,7 +105,11 @@ fn connect(addr: &str, db: &str) -> BenchResult<Conn> {
 // -- setup ------------------------------------------------------------------
 
 fn cmd_setup(a: &LoadArgs) -> BenchResult<()> {
-    let payload = make_payload(a.payload, a.doc_bytes, a.seed.wrapping_add(1));
+    // Payload is derived per document (see `make_payload`): one shared random
+    // string is incompressible within a document but perfectly compressible
+    // across them, which hides the real storage cost.
+    let payload_for =
+        |n: i64| make_payload(a.payload, a.doc_bytes, a.seed.wrapping_add(n as u64 + 1));
     let mut conn = connect(&a.addr, &a.db)?;
     let started = Instant::now();
     let mut preloaded = 0i64;
@@ -121,7 +125,7 @@ fn cmd_setup(a: &LoadArgs) -> BenchResult<()> {
         while n < a.preload {
             let chunk = std::cmp::min(500, a.preload - n) as usize;
             let docs = (0..chunk)
-                .map(|i| make_document(n + i as i64, &payload))
+                .map(|i| make_document(n + i as i64, &payload_for(n + i as i64)))
                 .collect();
             conn.insert(&coll, docs)?;
             n += chunk as i64;
@@ -154,11 +158,9 @@ fn run_worker(a: &LoadArgs, worker: usize) -> BenchResult<WorkerResult> {
     // make --seed fail to reproduce a run.
     let client_offset: u64 = a.client_id.bytes().map(u64::from).sum();
     let mut rng = rand::rngs::StdRng::seed_from_u64(a.seed + worker as u64 * 7919 + client_offset);
-    let payload = make_payload(
-        a.payload,
-        a.doc_bytes,
-        a.seed.wrapping_add(worker as u64 + 1),
-    );
+    let worker_seed = a.seed.wrapping_add(worker as u64 * 1_000_003 + 1);
+    let payload_for =
+        |n: i64| make_payload(a.payload, a.doc_bytes, worker_seed.wrapping_add(n as u64));
     let mix = parse_op_mix(&a.op_mix)?;
     let mut conn = connect(&a.addr, &a.db)?;
     let coll = collection_name(&a.prefix, &a.client_id, worker);
@@ -201,7 +203,7 @@ fn run_worker(a: &LoadArgs, worker: usize) -> BenchResult<WorkerResult> {
         let outcome = match op {
             Op::Insert => {
                 let batch: Vec<_> = (0..a.batch_size.max(1))
-                    .map(|i| make_document(high + i as i64, &payload))
+                    .map(|i| make_document(high + i as i64, &payload_for(high + i as i64)))
                     .collect();
                 let n_docs = batch.len() as u64;
                 conn.insert(&coll, batch).map(|_| n_docs)
