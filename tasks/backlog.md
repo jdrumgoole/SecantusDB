@@ -118,8 +118,28 @@ Single-node change streams are implemented and conformant for typical pymongo `w
   properly; `tests/test_server_bind_family.py`. That is a genuine capability gain
   and not a gauge fix.) The one genuinely open C failure is
   `/command_monitoring/unified/writeConcernError`, which unlike the "flaky, not
-  deterministic" note above **reproduces every time when run alone** — worth
-  re-triaging rather than trusting either description.
+  deterministic" note above **reproduces every time when run alone**. Re-triaged
+  2026-08-21 and **four plausible causes were ruled out by probing** — record these
+  so the next attempt does not re-walk them:
+  1. *`failCommand` ignores `writeConcernError`* — false. `failpoints.py` supports
+     it and `commands.py:7205` attaches it to the successful reply.
+  2. *The failpoint's `errorLabels` are dropped on the WCE path* — false, they are
+     attached at `commands.py:7207`.
+  3. *Our reply shape is wrong* — false. Probed against the spec's exact failpoint,
+     we return `{ok: 1.0, n: 1, errorLabels: ["RetryableWriteError"],
+     writeConcernError: {code: 91}}`, which matches the `commandSucceededEvent`
+     the spec expects field for field.
+  4. *Retryable-write idempotency is missing, so the driver's retry hits
+     DuplicateKey* — false. Two inserts of the same document with the same
+     `lsid` + `txnNumber` both return `n: 1` and leave one document.
+  The spec expects **two** `commandStartedEvent`s, i.e. the driver retries after
+  the retryable WCE and the retry succeeds. pymongo does not retry here at all (it
+  raises `WriteConcernError`), so the divergence is most likely in *when libmongoc
+  decides a write is retryable* — topology classification from a `Single`-topology
+  URI is the obvious next thing to check, not the reply contents. One residual
+  fidelity nit found on the way: we answer `codeName: "Location91"` where 91 is
+  `ShutdownInProgress`; harmless for retry decisions (they key on the code) but
+  wrong.
   **`/BulkOperation/OP_MSG/max_msg_size` is NOT in that list, and this audit
   briefly claimed it was.** Run by its exact name it PASSES, both forked and
   `--no-fork`, exactly as the 2026-08-11 re-diagnosis above says. It appeared to
