@@ -94,6 +94,27 @@ Single-node change streams are implemented and conformant for typical pymongo `w
   `/Collection/aggregate/secondary` need a real SECONDARY, which a single-node
   surrogate has not got (multi-node is out of scope) — rationale recorded in
   `c_validation/include_paths.py::SKIP_TESTS`.
+  **Follow-up 2026-08-21: the `replSetGetStatus` half of this was Rust-only until
+  now.** The entry above reads as a server-wide fix, but only
+  `handshake.rs::repl_set_get_status` reported the roster; `commands.py` kept
+  answering the standalone error, so the Python server went on claiming
+  `setName: secantus` in `hello` while telling `replSetGetStatus` it was "not
+  running with --replSet". libmongoc counts `members` to classify the topology, so
+  it treated the Python server as standalone and ran standalone-only tests against
+  it — `/Client/last_write_date_absent{,/pooled}` asserted no `lastWriteDate` and
+  found the replica-set-shaped one our `hello` supplies. Porting the roster to
+  Python drops those two (now correctly `skip`), which is why the Python list was
+  10 and the Rust list 7. **Triage of the remainder, reproduced 2026-08-21:**
+  `/Client/select_server` ×4 is *inherent* — it asserts the server selected for
+  reads is `standalone_or_rs_secondary_or_mongos` and we can only offer the
+  primary, the same class as the pymongo/ruby secondary-readPreference
+  expected-reds. Still open and genuinely fixable: `/Client/ipv6` ×2 (we bind
+  `127.0.0.1` only, so the test's `::1` ping fails),
+  `/BulkOperation/OP_MSG/max_msg_size` (we split into 2 commands where mongod
+  sends 1, though `maxMessageSizeBytes`/`maxWriteBatchSize` match mongod exactly at
+  48000000/100000, so it is our batching logic), and
+  `/command_monitoring/unified/writeConcernError` (`failCommand` ignores the
+  `writeConcernError` field).
 - [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
 
 ### 3.3 MongoDB CLI / tool conformance tests

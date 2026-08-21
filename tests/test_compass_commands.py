@@ -58,17 +58,55 @@ def test_instance_detail_probes(client: MongoClient) -> None:
     assert "argv" in cmd_line and "parsed" in cmd_line
 
 
-def test_repl_set_get_status_standalone_error(client: MongoClient) -> None:
-    """``replSetGetStatus`` must answer like a standalone mongod —
-    ``NoReplicationEnabled`` (76) with the canonical "not running with
-    --replSet" message — not CommandNotFound. Driver test harnesses
-    special-case that exact message to mean "standalone, skip the
-    replica-set-only paths"; a bare code-59 aborts them (libmongoc's
-    ``test_framework_replset_member_count`` is the motivating case)."""
-    with pytest.raises(OperationFailure) as exc:
-        client.admin.command("replSetGetStatus")
-    assert exc.value.code == 76
-    assert "not running with --replSet" in str(exc.value)
+def test_repl_set_get_status_agrees_with_hello(client: MongoClient) -> None:
+    """``replSetGetStatus`` must report the same replica set ``hello`` advertises.
+
+    Real mongod is never both a replica-set primary and "not running with
+    --replSet", but that is exactly what this server used to answer: ``hello``
+    supplied ``setName: secantus`` while ``replSetGetStatus`` returned the
+    standalone error. libmongoc's ``test_framework_replset_member_count`` counts
+    ``members`` to classify the topology, so zero members made it treat the server
+    as standalone and run standalone-only tests — which is how
+    ``/Client/last_write_date_absent`` came to run and fail, asserting no
+    ``lastWriteDate`` against a replica-set-shaped ``hello`` that supplies one.
+    The Rust server shipped this first; see ``handshake.rs::repl_set_get_status``.
+    """
+    hello = client.admin.command("hello")
+    status = client.admin.command("replSetGetStatus")
+
+    assert status["ok"] == 1.0
+    assert status["set"] == hello["setName"], "the two answers must name the same set"
+    assert status["myState"] == 1
+
+    assert len(status["members"]) == 1, "single-node surrogate reports exactly one member"
+    member = status["members"][0]
+    assert member["stateStr"] == "PRIMARY"
+    assert member["self"] is True
+    assert member["health"] == 1.0
+    # The roster's member must be the same node `hello` calls itself, or a driver
+    # would try to reach a host that does not exist.
+    assert member["name"] == hello["me"]
+
+
+def test_repl_set_get_status_standalone_error(tmp_path) -> None:
+    """With no set name this really is a standalone, and the honest answer stands.
+
+    ``NoReplicationEnabled`` (76) with mongod's canonical wording — not
+    CommandNotFound. Harnesses special-case that exact message to mean
+    "standalone, skip the replica-set-only paths"; a bare code-59 aborts them.
+    """
+    with SecantusDBServer(
+        port=0, storage_path=str(tmp_path / "standalone"), replica_set_name=None
+    ) as srv:
+        mc = MongoClient(srv.uri, serverSelectionTimeoutMS=2000, directConnection=True)
+        try:
+            assert "setName" not in mc.admin.command("hello")
+            with pytest.raises(OperationFailure) as exc:
+                mc.admin.command("replSetGetStatus")
+            assert exc.value.code == 76
+            assert "not running with --replSet" in str(exc.value)
+        finally:
+            mc.close()
 
 
 def test_atlas_version_returns_command_not_found(client: MongoClient) -> None:
