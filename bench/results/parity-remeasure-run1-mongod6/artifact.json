@@ -1,0 +1,126 @@
+{
+  "captured": "2026-08-20T00:54:11.547165+00:00",
+  "sha_before": "cfd5b35292ff5b197e4ce9cf518e37b701bfcd32",
+  "sha_after": "cfd5b35292ff5b197e4ce9cf518e37b701bfcd32",
+  "sha_stable": true,
+  "mongod_version": "db version v6.0.16",
+  "mongod_arm": "standalone (no --replSet, no oplog) \u2014 see oplog_tax for the fair comparison",
+  "writers": "1,2,4,8",
+  "duration_s": 30.0,
+  "runs": 3,
+  "box_checks": [
+    {
+      "phase": "before",
+      "load": 2.15771484375,
+      "stray": [],
+      "verdict": "quiet"
+    },
+    {
+      "phase": "after",
+      "load": 7.22021484375,
+      "stray": [],
+      "verdict": "LOADED"
+    }
+  ],
+  "trusted": false,
+  "elapsed_s": 2078.6,
+  "results": {
+    "concurrency_rc": 0,
+    "concurrency": {
+      "rust": {
+        "meta": {
+          "duration": 30.0,
+          "batch": 100,
+          "writers": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "shared_collection": false,
+          "runs": 3
+        },
+        "servers": {
+          "rust": {
+            "runs_docs_per_sec": [
+              [
+                37146.8,
+                36541.6,
+                35933.9
+              ],
+              [
+                56274.8,
+                56207.2,
+                54380.9
+              ],
+              [
+                75471.9,
+                75407.3,
+                75117.4
+              ],
+              [
+                88654.0,
+                89771.4,
+                87558.2
+              ]
+            ],
+            "docs_per_sec": [
+              36541.6,
+              56207.2,
+              75407.3,
+              88654.0
+            ]
+          }
+        }
+      },
+      "mongod": {
+        "meta": {
+          "duration": 30.0,
+          "batch": 100,
+          "writers": [
+            1,
+            2,
+            4,
+            8
+          ],
+          "shared_collection": false,
+          "runs": 3
+        },
+        "servers": {
+          "mongod": {
+            "runs_docs_per_sec": [
+              [
+                105514.5,
+                108953.2,
+                107402.0
+              ],
+              [
+                199372.8,
+                201587.3,
+                200776.9
+              ],
+              [
+                366058.4,
+                363961.3,
+                366030.7
+              ],
+              [
+                475011.0,
+                470622.6,
+                472007.6
+              ]
+            ],
+            "docs_per_sec": [
+              107402.0,
+              200776.9,
+              366030.7,
+              472007.6
+            ]
+          }
+        }
+      }
+    },
+    "oplog_tax_rc": 0,
+    "oplog_tax_tail": "  load 8.19 > 5.0, waiting...\n  load 6.61 > 5.0, waiting...\n  load 5.51 > 5.0, waiting...\nrep0 standalone  1w=108,744, 2w=202,136, 4w=365,412, 8w=473,625\n  load 9.48 > 5.0, waiting...\n  load 7.75 > 5.0, waiting...\n  load 6.25 > 5.0, waiting...\n  load 5.08 > 5.0, waiting...\nrep0 replset     1w=12,587, 2w=20,198, 4w=41,584, 8w=71,688\nrep0 replset-w1  1w=81,369, 2w=145,463, 4w=239,391, 8w=288,818\n  load 6.89 > 5.0, waiting...\n  load 5.66 > 5.0, waiting...\nrep1 standalone  1w=112,088, 2w=205,501, 4w=385,545, 8w=497,825\n  load 7.40 > 5.0, waiting...\n  load 5.90 > 5.0, waiting...\nrep1 replset     1w=12,649, 2w=20,257, 4w=41,817, 8w=73,068\nrep1 replset-w1  1w=83,063, 2w=148,826, 4w=245,679, 8w=308,875\n  load 7.34 > 5.0, waiting...\n  load 5.94 > 5.0, waiting...\nrep2 standalone  1w=112,855, 2w=207,962, 4w=384,407, 8w=500,432\n  load 6.90 > 5.0, waiting...\n  load 5.53 > 5.0, waiting...\nrep2 replset     1w=12,289, 2w=20,343, 4w=41,673, 8w=70,791\nrep2 replset-w1  1w=82,791, 2w=147,895, 4w=246,869, 8w=297,471\n\n=== medians (docs/s) ===\nstandalone  1w=112,088, 2w=205,501, 4w=384,407, 8w=497,825\nreplset     1w=12,587, 2w=20,257, 4w=41,673, 8w=71,688\nreplset-w1  1w=82,791, 2w=147,895, 4w=245,679, 8w=297,471\n"
+  }
+}
