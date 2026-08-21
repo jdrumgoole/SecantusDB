@@ -403,6 +403,7 @@ _DO_CLUSTER = (
         "duration": "Timed seconds of load (default: 120).",
         "workers": "Load processes per client droplet (default: 16).",
         "op-mix": "Weighted op mix, e.g. 'insert=100' or 'insert=70,find=20,update=10'.",
+        "repeat": "Measurement passes (default 1); >1 interleaves engines and reports medians.",
         "doc-bytes": "Payload bytes per document (default: 8192).",
         "batch-size": "Documents per insert call (default: 1).",
         "region": "DigitalOcean region (default: lon1).",
@@ -420,6 +421,7 @@ def do_bench(
     duration: float = 120.0,
     workers: int = 16,
     op_mix: str = "insert=70,find=20,update=10",
+    repeat: int = 1,
     doc_bytes: int = 8192,
     batch_size: int = 1,
     region: str = "lon1",
@@ -453,6 +455,7 @@ def do_bench(
         f" --duration {float(duration)}"
         f" --workers {int(workers)}"
         f" --op-mix {shlex.quote(op_mix)}"
+        f" --repeat {int(repeat)}"
         f" --doc-bytes {int(doc_bytes)}"
         f" --batch-size {int(batch_size)}"
         f" --region {shlex.quote(region)}"
@@ -517,6 +520,7 @@ def do_deploy(
         "workers": "Load processes per client droplet (default: 16).",
         "op-mix": "Weighted op mix (default: insert=70,find=20,update=10).",
         "engine": "Which databases to measure: both (default) | secantus | mongod.",
+        "repeat": "Measurement passes (default 1); >1 interleaves engines and reports medians.",
         "sync-on-commit": "Start the server with --sync-on-commit (fsync every commit).",
     },
 )
@@ -526,6 +530,7 @@ def do_run(
     workers: int = 16,
     op_mix: str = "insert=70,find=20,update=10",
     engine: str = "both",
+    repeat: int = 1,
     sync_on_commit: bool = False,
 ) -> None:
     """Run the timed benchmark against already-deployed droplets.
@@ -538,6 +543,7 @@ def do_run(
         f" --duration {float(duration)} --workers {int(workers)}"
         f" --op-mix {shlex.quote(op_mix)}"
         f" --engine {shlex.quote(engine)}"
+        f" --repeat {int(repeat)}"
     )
     if sync_on_commit:
         cmd += " --sync-on-commit"

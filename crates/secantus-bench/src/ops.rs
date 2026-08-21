@@ -15,7 +15,7 @@ use crate::doapi::{github_json, resolve_release_asset, Api};
 use crate::engine::Engine;
 use crate::remote::{self, in_parallel, remote_script, scp_from, scp_to, ssh, ssh_raw};
 use crate::report::{
-    build_summary, render_comparison, render_summary, ClientReport, ClientsInfo, Rtt,
+    build_summary, render_comparison, render_summary, ClientReport, ClientsInfo, EngineRuns, Rtt,
     SampleSummary, ServerInfo, Summary, SummaryInputs, WorkloadInfo,
 };
 use crate::timefmt::{iso8601, now_epoch_secs, run_id};
@@ -34,6 +34,7 @@ pub struct Opts {
     pub agent_ref: String,
     pub engines: Vec<Engine>,
     pub mongod_version: String,
+    pub repeat: usize,
     pub duration: f64,
     pub workers: usize,
     pub op_mix: String,
@@ -540,7 +541,7 @@ fn client_load_args(opts: &Opts, addr: &str, role: &str) -> String {
 /// The engines run **sequentially on the same droplets**: same cores, same
 /// network, same clients, same workload, one after the other. That is the
 /// whole value of the harness — the only variable left is the database.
-pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Vec<(Engine, Summary)>> {
+pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Vec<EngineRuns>> {
     for role in ALL_ROLES {
         let node =
             node_for(nodes, role).ok_or(format!("missing droplet {role} — run `up` first."))?;
@@ -557,26 +558,50 @@ pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Vec<(Engin
     let outdir = results_root().join(&run);
     std::fs::create_dir_all(&outdir).map_err(|e| format!("creating {}: {e}", outdir.display()))?;
 
-    let mut results: Vec<(Engine, Summary)> = Vec::new();
-    for engine in &opts.engines {
-        println!("\n=== {} ===", engine.name());
-        let summary = run_one_engine(opts, nodes, *engine, &run, &outdir)?;
-        let text = render_summary(&summary);
-        println!();
-        println!("{text}");
-        std::fs::write(outdir.join(format!("{}-summary.md", engine.name())), &text)
+    let passes = opts.repeat.max(1);
+    let mut collected: Vec<EngineRuns> = opts
+        .engines
+        .iter()
+        .map(|e| EngineRuns {
+            engine: *e,
+            passes: Vec::new(),
+        })
+        .collect();
+
+    // Engines are interleaved WITHIN each pass rather than run to completion
+    // one at a time. Thermal drift, a noisy neighbour, or anything else that
+    // changes over the run then lands on both engines roughly equally instead
+    // of penalising whichever went last.
+    for pass in 1..=passes {
+        for (idx, engine) in opts.engines.iter().enumerate() {
+            if passes > 1 {
+                println!("\n=== {} (pass {pass}/{passes}) ===", engine.name());
+            } else {
+                println!("\n=== {} ===", engine.name());
+            }
+            let summary = run_one_engine(opts, nodes, *engine, &run, &outdir, pass)?;
+            let text = render_summary(&summary);
+            println!();
+            println!("{text}");
+            let stem = if passes > 1 {
+                format!("{}-pass{pass}", engine.name())
+            } else {
+                engine.name().to_string()
+            };
+            std::fs::write(outdir.join(format!("{stem}-summary.md")), &text)
+                .map_err(|e| format!("writing summary: {e}"))?;
+            std::fs::write(
+                outdir.join(format!("{stem}-summary.json")),
+                serde_json::to_string_pretty(&summary)
+                    .map_err(|e| format!("serialising summary: {e}"))?,
+            )
             .map_err(|e| format!("writing summary: {e}"))?;
-        std::fs::write(
-            outdir.join(format!("{}-summary.json", engine.name())),
-            serde_json::to_string_pretty(&summary)
-                .map_err(|e| format!("serialising summary: {e}"))?,
-        )
-        .map_err(|e| format!("writing summary: {e}"))?;
-        results.push((*engine, summary));
+            collected[idx].passes.push(summary);
+        }
     }
 
-    if results.len() > 1 {
-        let comparison = render_comparison(&run, &results);
+    if collected.len() > 1 || passes > 1 {
+        let comparison = render_comparison(&run, &collected);
         std::fs::write(outdir.join("comparison.md"), &comparison)
             .map_err(|e| format!("writing comparison.md: {e}"))?;
         println!();
@@ -584,17 +609,24 @@ pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Vec<(Engin
     }
     println!("\nartifacts: {}", outdir.display());
     let _ = api;
-    Ok(results)
+    Ok(collected)
 }
 
 /// One engine's full measurement: restart it clean, preload, load, collect.
+#[allow(clippy::too_many_arguments)]
 fn run_one_engine(
     opts: &Opts,
     nodes: &[Node],
     engine: Engine,
     run: &str,
     outdir: &std::path::Path,
+    pass: usize,
 ) -> BenchResult<Summary> {
+    let stem = if opts.repeat.max(1) > 1 {
+        format!("{}-pass{pass}", engine.name())
+    } else {
+        engine.name().to_string()
+    };
     let cfg = &opts.cfg;
     let server = node_for(nodes, SERVER_ROLE).expect("checked by the caller");
     let server_ip = server.public();
@@ -751,7 +783,7 @@ fn run_one_engine(
 
     let mut results: BTreeMap<String, ClientReport> = BTreeMap::new();
     for node in &client_nodes {
-        let local = outdir.join(format!("{}-{}.json", engine.name(), node.role));
+        let local = outdir.join(format!("{stem}-{}.json", node.role));
         match scp_from(&cfg.ssh_key, &node.public(), "/tmp/result.json", &local)
             .and_then(|_| std::fs::read_to_string(&local).map_err(|e| e.to_string()))
             .and_then(|text| serde_json::from_str::<ClientReport>(&text).map_err(|e| e.to_string()))
@@ -782,7 +814,7 @@ fn run_one_engine(
             "server sampler never wrote {sample_out} (see /tmp/sample.log)"
         ));
     }
-    let sample_local = outdir.join(format!("{}-server-sample.json", engine.name()));
+    let sample_local = outdir.join(format!("{stem}-server-sample.json"));
     match scp_from(&cfg.ssh_key, &server_ip, sample_out, &sample_local)
         .and_then(|_| std::fs::read_to_string(&sample_local).map_err(|e| e.to_string()))
         .and_then(|text| serde_json::from_str::<Value>(&text).map_err(|e| e.to_string()))
@@ -807,15 +839,11 @@ fn run_one_engine(
         &server_ip,
         &format!("journalctl -u {} --no-pager -n 200", engine.service()),
     ) {
-        let _ = std::fs::write(
-            outdir.join(format!("{}-journal.log", engine.name())),
-            journal.stdout,
-        );
+        let _ = std::fs::write(outdir.join(format!("{stem}-journal.log")), journal.stdout);
     }
     if alive != "active" {
         failures.push(format!(
-            "{} service is {alive:?} after the run — see {}-journal.log",
-            engine.name(),
+            "{} service is {alive:?} after the run — see {stem}-journal.log",
             engine.name()
         ));
     }
