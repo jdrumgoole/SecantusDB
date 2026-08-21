@@ -31,6 +31,7 @@ table; the conclusion is a human's.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -42,22 +43,104 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-LOAD_CEILING = 4.0  # tasks/rust-parity-forward-plan.md "Standing lesson"
 
-# `which("mongod")` on this box is a 2024 symlink to mongodb-community@6.0, so
-# every benchmark to date has measured a two-year-old server while 8.3.4 sat
-# installed and unlinked. Naming both explicitly makes the target version a
-# recorded choice instead of an accident of PATH.
-MONGOD_6 = "/opt/homebrew/Cellar/mongodb-community@6.0/6.0.16/bin/mongod"
-MONGOD_8 = "/opt/homebrew/Cellar/mongodb-community/8.3.4/bin/mongod"
+# tasks/rust-parity-forward-plan.md "Standing lesson": never trust a number from a
+# box with load >= 4 — measured on a 12-core Mac, so scale it rather than baking in
+# the constant. A 4-core CI box and a 64-core server do not mean the same thing by
+# "load 4". `--load-ceiling` overrides.
+DEFAULT_LOAD_CEILING = max(2.0, (os.cpu_count() or 4) / 3.0)
+LOAD_CEILING = DEFAULT_LOAD_CEILING
 
-# label -> (bench.concurrency --server value, explicit binary or None for PATH)
-ARMS: dict[str, tuple[str, str | None]] = {
-    "rust": ("rust", None),
-    "mongod6": ("mongod", MONGOD_6),
-    "mongod8": ("mongod", MONGOD_8),
-    "mongod": ("mongod", None),  # whatever PATH gives — the historical arm
-}
+# Where mongod builds hide, in discovery order. `which("mongod")` alone is not
+# enough and quietly picks the wrong one: on the original box it was a 2024 symlink
+# to mongodb-community@6.0 while 8.3.4 sat installed and unlinked, so every
+# benchmark measured a two-year-old server without saying so. Globs are tried in
+# turn and every hit is kept, so multi-version boxes get one arm per version.
+MONGOD_SEARCH_GLOBS = (
+    "/opt/homebrew/Cellar/mongodb-community*/*/bin/mongod",  # macOS Homebrew
+    "/usr/local/Cellar/mongodb-community*/*/bin/mongod",  # macOS Homebrew (Intel)
+    "/usr/bin/mongod",  # Debian/Ubuntu packages
+    "/usr/local/bin/mongod",
+    "/opt/mongodb*/bin/mongod",  # tarball installs
+    "/opt/mongodb/*/bin/mongod",
+)
+
+# A `bench.concurrency --server` value plus an explicit binary (None = use PATH).
+Arm = tuple[str, str | None]
+
+
+# ----------------------------------------------------------- mongod discovery
+def mongod_version(binary: str) -> str | None:
+    """`8.3.4` from `db version v8.3.4`, or None if the binary won't report."""
+    try:
+        out = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=30
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"db version v?(\d+\.\d+\.\d+)", out)
+    return m.group(1) if m else None
+
+
+def discover_mongods(explicit: list[str] | None = None) -> dict[str, Arm]:
+    """Find every usable mongod and label each arm by its own version.
+
+    Version-derived labels (`mongod-8.3.4`) rather than positional ones
+    (`mongod6`/`mongod8`) because the label then travels with the artifact and
+    means the same thing on every machine — the previous hardcoded pair silently
+    produced no mongod arms at all anywhere but the box they were written on.
+
+    Explicit paths win outright; otherwise PATH plus MONGOD_SEARCH_GLOBS. Results
+    are deduped by realpath, so a Homebrew symlink and its Cellar target do not
+    become two arms measuring one binary.
+    """
+    candidates: list[str] = []
+    if explicit:
+        candidates.extend(explicit)
+    else:
+        if env_bin := os.environ.get("SECANTUS_MONGOD_BIN"):
+            candidates.append(env_bin)
+        if on_path := shutil.which("mongod"):
+            candidates.append(on_path)
+        for pattern in MONGOD_SEARCH_GLOBS:
+            candidates.extend(sorted(glob.glob(pattern)))
+
+    arms: dict[str, Arm] = {}
+    seen: set[str] = set()
+    for cand in candidates:
+        path = Path(cand)
+        if not path.exists() or not os.access(path, os.X_OK):
+            continue
+        real = str(path.resolve())
+        if real in seen:
+            continue
+        seen.add(real)
+        version = mongod_version(real)
+        if version is None:
+            continue
+        # First binary to claim a version wins; a later duplicate of the same
+        # version adds nothing but wall-clock.
+        arms.setdefault(f"mongod-{version}", ("mongod", real))
+    return arms
+
+
+def build_arms(explicit: list[str] | None = None) -> dict[str, Arm]:
+    """The Rust server plus one arm per discovered mongod version."""
+    return {"rust": ("rust", None), **discover_mongods(explicit)}
+
+
+def newest_mongod(arms: dict[str, Arm]) -> str | None:
+    """Binary of the highest-versioned mongod arm — the default oplog-tax target.
+
+    Sorted by parsed version tuple, not string, so 8.3.4 beats 10.0.0 only if it
+    really is newer (`"10" < "8"` lexically).
+    """
+    versioned = [
+        (tuple(int(p) for p in label.removeprefix("mongod-").split(".")), binary)
+        for label, (_server, binary) in arms.items()
+        if label.startswith("mongod-") and binary
+    ]
+    return max(versioned)[1] if versioned else None
 
 
 # --------------------------------------------------------------- box hygiene
@@ -151,16 +234,30 @@ def main() -> int:
         "--runs", type=int, default=3, help="repeats per writer count; median is what counts"
     )
     ap.add_argument(
-        "--servers", default="rust,mongod6,mongod8", help="comma-separated arm labels from ARMS"
+        "--servers",
+        default="",
+        help="comma-separated arm labels to run (default: rust + every discovered mongod)",
+    )
+    ap.add_argument(
+        "--mongod",
+        action="append",
+        metavar="PATH",
+        help="explicit mongod binary; repeatable. Overrides discovery entirely.",
+    )
+    ap.add_argument(
+        "--load-ceiling",
+        type=float,
+        default=DEFAULT_LOAD_CEILING,
+        help=f"refuse to measure at or above this 1-min load (default {DEFAULT_LOAD_CEILING:.1f} "
+        "= cores/3)",
     )
     ap.add_argument(
         "--skip-oplog-tax", action="store_true", help="skip the mongod standalone-vs-replset arm"
     )
     ap.add_argument(
         "--oplog-tax-mongod",
-        default=MONGOD_8,
-        help="mongod binary for the oplog-tax arm "
-        "(default 8.3.4; 6.0.16 was measured in the prior run)",
+        default=None,
+        help="mongod binary for the oplog-tax arm (default: the newest discovered)",
     )
     ap.add_argument(
         "--force",
@@ -168,6 +265,23 @@ def main() -> int:
         help="measure even on a loaded box (marks the artifact untrusted)",
     )
     args = ap.parse_args()
+
+    global LOAD_CEILING
+    LOAD_CEILING = args.load_ceiling
+
+    arms = build_arms(args.mongod)
+    labels = [s.strip() for s in args.servers.split(",") if s.strip()] or list(arms)
+    unknown = [lb for lb in labels if lb not in arms]
+    if unknown:
+        raise SystemExit(
+            f"unknown arm(s) {unknown}; discovered: {list(arms)}. "
+            "Pass --mongod PATH to name a binary explicitly."
+        )
+    if not any(lb.startswith("mongod") for lb in labels):
+        raise SystemExit(
+            "no mongod arm to compare against — none found on PATH or in "
+            f"{list(MONGOD_SEARCH_GLOBS)}. Pass --mongod PATH."
+        )
 
     if not is_detached():
         raise SystemExit(
@@ -204,8 +318,8 @@ def main() -> int:
     #    rather than bolting a later arm onto earlier results.
     rc = 0
     sweeps: dict[str, object] = {}
-    for label in [s.strip() for s in args.servers.split(",") if s.strip()]:
-        server, binary = ARMS.get(label, (label, None))
+    for label in labels:
+        server, binary = arms[label]
         env_extra = {}
         version = None
         if binary:
@@ -254,7 +368,8 @@ def main() -> int:
     #    like-for-like comparison against the Rust server, which always writes an
     #    oplog — the standalone arm above keeps none at all.
     if not args.skip_oplog_tax:
-        tax_env = {"SECANTUS_MONGOD_BIN": args.oplog_tax_mongod} if args.oplog_tax_mongod else {}
+        tax_bin = args.oplog_tax_mongod or newest_mongod(arms)
+        tax_env = {"SECANTUS_MONGOD_BIN": tax_bin} if tax_bin else {}
         rc2, tail = run(
             [
                 sys.executable,
@@ -268,7 +383,7 @@ def main() -> int:
             args.out / "oplog_tax.log",
             env_extra=tax_env,
         )
-        results["oplog_tax_mongod"] = args.oplog_tax_mongod or "PATH"
+        results["oplog_tax_mongod"] = tax_bin or "PATH"
         results["oplog_tax_rc"] = rc2
         results["oplog_tax_tail"] = tail[-4000:]
 
