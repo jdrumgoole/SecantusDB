@@ -246,9 +246,20 @@ class SecantusDBServer:
     def start(self) -> None:
         if self._socket is not None:
             raise RuntimeError("server is already started")
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Resolve the family from the host rather than hardcoding AF_INET, which
+        # made the server IPv4-only: `host="::1"` failed at bind with a bare
+        # `gaierror`, and there was no way to serve an IPv6 client at all.
+        # getaddrinfo also handles hostnames, and AI_PASSIVE gives the right
+        # wildcard address when the caller passes "" (INADDR_ANY / in6addr_any).
+        family, socktype, proto, _canon, sockaddr = socket.getaddrinfo(
+            self.host or None,
+            self.port,
+            type=socket.SOCK_STREAM,
+            flags=socket.AI_PASSIVE,
+        )[0]
+        sock = socket.socket(family, socktype, proto)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.host, self.port))
+        sock.bind(sockaddr)
         sock.listen()
         self._socket = sock
         self.host, self.port = sock.getsockname()[:2]
