@@ -5400,6 +5400,63 @@ shared storage engine or building large new protocol subsystems:
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.
 
+## The 2GB WAL default costs 19x the disk for no throughput (2026-08-21)
+
+Measured while chasing write amplification: **SecantusDB leaves 674 MB on disk
+where mongod leaves 41 MB for the same 320 MB of documents** (40,000 x 8 KiB,
+clean shutdown, `du` of the data directory).
+
+The data files are not the problem — they are *smaller* than mongod's, because
+zlib beats snappy on this content:
+
+| engine | payload | total | WAL | data files |
+| --- | --- | ---: | ---: | ---: |
+| secantusdb | repeated char | 674 MB | 639 MB | 19 MB |
+| mongod | repeated char | 41 MB | 16 MB | 24 MB |
+| secantusdb | random | 691 MB | 639 MB | 37 MB |
+| mongod | random | 82 MB | 11 MB | 70 MB |
+
+It is entirely the write-ahead log: **639 MB against mongod's 11-16 MB**.
+
+**Cause.** The daemon defaults `--log-file-max` to 2GB (chosen so a sustained
+writer rotates rarely). WiredTiger can only reclaim *completed* log files, so a
+workload that writes 639 MB of WAL has produced exactly **one, still-active**
+file — nothing is reclaimable until 2 GB has been written. mongod's 100 MB
+files rotate several times over the same workload and are removed after each
+checkpoint. Confirmed by varying only that flag:
+
+| `--log-file-max` | WAL retained | total on disk |
+| --- | ---: | ---: |
+| 2GB (default) | 639 MB | **674 MB** |
+| 128MB | 32 KB | **35 MB** |
+| 64MB | 32 KB | **35 MB** |
+
+At 128 MB the total is 19x smaller *and beats mongod* (35 MB vs 82 MB).
+
+**The 2GB default buys nothing measurable.** A separate experiment varying only
+the log file size (128MB vs 1GB, 8 writers, 45s) moved throughput 35,984 →
+36,264 ops/s, under 1% and inside run-to-run noise, and left p99.9 unchanged.
+
+Also note the WAL is ~2x the logical data (639 MB for 320 MB of documents),
+consistent with every insert logging both the document row and a
+full-document oplog entry — the write-amplification hypothesis for the tail,
+now with a number attached.
+
+- [ ] **Change the `log_file_max` default** from `2GB` to something that
+  rotates (mongod uses 100 MB; 128 MB measured clean here). One line in
+  `secantus-server/src/config.rs`. Deliberately NOT changed here: it is a
+  durability-adjacent default and belongs in its own reviewed slice, but the
+  evidence is unambiguous — 19x the disk for under 1% of throughput.
+- [ ] Re-check whether the full-document oplog entry can be trimmed, now that
+  the WAL cost of it is visible (2x logical data).
+
+**Methodology note**: this measurement is only meaningful with `--payload
+random`. `do-client`'s default payload is a repeated character, which both
+engines compress to nearly nothing — a bytes-on-disk comparison on it measures
+the compressor, not the engine. The throughput numbers elsewhere in this file
+used the repeated payload; both engines saw the same easy data, so the
+comparison is fair, but it is not representative of incompressible workloads.
+
 ## p99.9 write-tail: WiredTiger cache pressure, unthrottled (2026-08-21)
 
 The three-droplet comparison put SecantusDB at **0.46-0.49x mongod's throughput

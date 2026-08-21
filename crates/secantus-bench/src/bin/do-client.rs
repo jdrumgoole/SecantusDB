@@ -23,14 +23,14 @@ use std::time::{Duration, Instant};
 use rand::{Rng, SeedableRng};
 use secantus_bench::argv::Args;
 use secantus_bench::histogram::{round1, round3, Histogram};
-use secantus_bench::mongo::{make_document, Conn};
+use secantus_bench::mongo::{make_document, make_payload, Conn, Payload};
 use secantus_bench::opmix::{parse_op_mix, pick, Op, OP_NAMES};
 use secantus_bench::report::{ClientReport, OpStats, SlowOp, Totals};
 use secantus_bench::timefmt::now_epoch_secs;
 use secantus_bench::BenchResult;
 
 const BOOL_FLAGS: [&str; 2] = ["--keep-data", "--version"];
-const VALUE_FLAGS: [&str; 14] = [
+const VALUE_FLAGS: [&str; 15] = [
     "--addr",
     "--client-id",
     "--db",
@@ -45,6 +45,7 @@ const VALUE_FLAGS: [&str; 14] = [
     "--seed",
     "--out",
     "--slow-ms",
+    "--payload",
 ];
 const EXTRA_SAMPLE_FLAGS: [&str; 2] = ["--interval", "--process"];
 
@@ -67,6 +68,7 @@ struct LoadArgs {
     out: String,
     keep_data: bool,
     slow_ms: f64,
+    payload: Payload,
 }
 
 fn load_args(args: &Args) -> BenchResult<LoadArgs> {
@@ -86,6 +88,7 @@ fn load_args(args: &Args) -> BenchResult<LoadArgs> {
         out: args.str_or("--out", "/tmp/do-client-result.json"),
         keep_data: args.has("--keep-data"),
         slow_ms: args.f64_or("--slow-ms", 0.0)?,
+        payload: Payload::parse(&args.str_or("--payload", "repeat"))?,
     })
 }
 
@@ -102,7 +105,7 @@ fn connect(addr: &str, db: &str) -> BenchResult<Conn> {
 // -- setup ------------------------------------------------------------------
 
 fn cmd_setup(a: &LoadArgs) -> BenchResult<()> {
-    let payload = "x".repeat(a.doc_bytes);
+    let payload = make_payload(a.payload, a.doc_bytes, a.seed.wrapping_add(1));
     let mut conn = connect(&a.addr, &a.db)?;
     let started = Instant::now();
     let mut preloaded = 0i64;
@@ -151,7 +154,11 @@ fn run_worker(a: &LoadArgs, worker: usize) -> BenchResult<WorkerResult> {
     // make --seed fail to reproduce a run.
     let client_offset: u64 = a.client_id.bytes().map(u64::from).sum();
     let mut rng = rand::rngs::StdRng::seed_from_u64(a.seed + worker as u64 * 7919 + client_offset);
-    let payload = "x".repeat(a.doc_bytes);
+    let payload = make_payload(
+        a.payload,
+        a.doc_bytes,
+        a.seed.wrapping_add(worker as u64 + 1),
+    );
     let mix = parse_op_mix(&a.op_mix)?;
     let mut conn = connect(&a.addr, &a.db)?;
     let coll = collection_name(&a.prefix, &a.client_id, worker);
@@ -511,6 +518,7 @@ Usage: do-client <setup|run|sample> [options]
           [--doc-bytes N] [--preload N] [--op-mix SPEC] [--batch-size N] [--keep-data]
   run     (the same options) --duration SECS [--start-at EPOCH] [--seed N] [--out PATH]
           [--slow-ms MS]   record every op at or above MS with its timestamp
+          [--payload repeat|random]  payload entropy; random for storage measurements
   sample  [--duration SECS] [--interval SECS] [--process NAME] [--out PATH]
 ";
 
