@@ -158,6 +158,7 @@ fn run(cli: CliArgs) -> Result<(), String> {
         oplog_nonlogged: cli.oplog_nonlogged,
         data_nonlogged: cli.data_nonlogged,
         checkpoint_seconds: cli.checkpoint_seconds,
+        write_tickets: cli.write_tickets,
         ..StorageOptions::default()
     };
     let mut storage = Storage::open_with_options(&cli.storage_path, &opts)

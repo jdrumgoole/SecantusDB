@@ -5469,6 +5469,44 @@ Each a 45-60s local run against an 8.26ms baseline:
 There is **no WiredTiger config-only fix**: every eviction knob either did
 nothing or made it worse while costing throughput.
 
+### Admission control: prototyped, measured, and NOT the answer
+
+`--write-tickets N` (default 0 = off) bounds how many writes are inside the
+storage engine at once; the rest queue outside it. Implemented in
+`secantus-storage/src/admission.rs` — a Mutex+Condvar permit pool with a
+thread-local re-entrancy guard so a multi-document transaction rides one ticket
+instead of deadlocking against itself, and RAII release so a panicking write
+cannot leak a permit and wedge the pool.
+
+It works, and it does **not** fix the tail. Three interleaved passes, 512M
+cache (maximum pressure), 16 client writers, insert-only, medians:
+
+| tickets | ops/s | p50 ms | p99.9 ms | worst stall ms |
+| ---: | ---: | ---: | ---: | ---: |
+| off | 40,097 | 0.28 | 11.58 | 150.8 |
+| 4 | 31,319 | 0.44 | **10.18** | **102.1** |
+
+**-22% throughput to buy -12% p99.9 and -32% on the worst stall.** A poor
+trade. At a 1G cache with 16 writers it was worse still: 8 tickets gave -8%,
+4 tickets -1%, and 2 tickets made the tail *35% worse* while halving
+throughput.
+
+One genuine benefit: with tickets the tail becomes **perfectly repeatable**
+(10.18ms on all three passes, against 11.33-12.99ms unbounded). Bounding
+concurrency buys predictability, not speed.
+
+**Why the hypothesis failed.** Capping engine concurrency relocates the queue
+rather than removing it. A client holding 16 requests in flight still waits for
+all 16; moving 12 of them from a WiredTiger eviction stall into a condvar queue
+barely changes what the client's stopwatch sees. Compare: reducing the *client*
+to 4 writers gave p99.9 4.83ms, while 16 clients throttled to 4 tickets gave
+~10ms at similar throughput. Same engine concurrency, very different
+client-observed tail — the difference is offered load, not admission.
+
+So the flag stays **off by default** and is kept as a diagnostic and a
+predictability knob, not as a fix. It should not be enabled hoping for a faster
+tail.
+
 ### Why mongod does better on identical hardware
 
 On the droplets both engines ran with the **same 4G cache** and the same
@@ -5476,22 +5514,34 @@ workload, yet mongod held p99.9 at 10.75ms where SecantusDB reached 121ms. So
 this is not "SecantusDB needs a bigger cache" — it is that mongod degrades
 gracefully under the same pressure and SecantusDB does not.
 
-The structural difference is **admission control**. MongoDB bounds the number
-of concurrent storage-engine write transactions (the ticket system, reduced
-further under cache pressure), so excess writers queue *outside* the engine
-instead of piling in and being conscripted into eviction work. SecantusDB has
-no such bound: every connection thread dives straight into WiredTiger.
+Admission control was the obvious explanation and it has now been **tested and
+rejected** (above): bounding engine concurrency buys almost nothing.
 
-The harness data already prices that trade-off. Going from 16 concurrent
-writers to 4 costs **23% of throughput and halves the tail**; going to 2 costs
-46% of throughput for a **93%** tail reduction.
+The leading remaining hypothesis is **write amplification**. Every SecantusDB
+insert writes the document row, a **full-document oplog entry**, and the index
+entries — the `insert()` comment in `secantus-storage` puts it at 2-3x the
+message bytes. mongod's oplog entry for an insert is the document too, but the
+totals differ, and dirty bytes per operation is precisely the quantity the
+cache sweep shows the tail is governed by. If SecantusDB dirties materially
+more cache per insert than mongod does, it reaches the eviction trigger sooner
+at any given cache size — which is exactly the observed behaviour, and would
+explain why more cache helps, why smaller documents help even more, and why no
+eviction knob or concurrency bound does.
+
+That `--oplog-async` independently recovers 24% of the tail is consistent with
+it: the oplog is a large share of the write volume.
+
+**Next measurement**: bytes written to disk per insert, SecantusDB versus
+mongod, at a fixed document size. That is a direct test and it has not been
+run.
 
 ### Where to go next
 
-- [ ] **Admission control** — bound concurrent write transactions (mongod's
-  ticket equivalent). This is the fix the evidence points at: it is what turns
-  a catastrophic tail into bounded queueing, and the sweep above shows the
-  throughput cost is modest.
+- [x] ~~**Admission control**~~ — prototyped as `--write-tickets` and measured;
+  it is not the fix (see above). Kept, off by default, as a diagnostic and a
+  tail-predictability knob.
+- [ ] **Measure write amplification** — bytes on disk per insert, SecantusDB
+  versus mongod at a fixed document size. The leading hypothesis, and untested.
 - [ ] **`--oplog-async` as a default** — worth 24% of the tail and 42% of the
   stalls on its own, independently of the cache story. Every write currently
   passes through one process-wide `Arc<Mutex<OplogState>>`.
