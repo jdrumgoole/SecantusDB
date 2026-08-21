@@ -34,8 +34,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bench.parity_remeasure import (
-    ARMS,
+    DEFAULT_LOAD_CEILING,
+    MONGOD_SEARCH_GLOBS,
     REPO,
+    build_arms,
     check_box,
     head_sha,
     is_detached,
@@ -74,7 +76,23 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--out", type=Path, default=REPO / "bench" / "results" / "read-remeasure")
-    ap.add_argument("--arms", default="rust,mongod6,mongod8")
+    ap.add_argument(
+        "--arms",
+        default="",
+        help="comma-separated arm labels (default: rust + every discovered mongod)",
+    )
+    ap.add_argument(
+        "--mongod",
+        action="append",
+        metavar="PATH",
+        help="explicit mongod binary; repeatable. Overrides discovery entirely.",
+    )
+    ap.add_argument(
+        "--load-ceiling",
+        type=float,
+        default=DEFAULT_LOAD_CEILING,
+        help=f"refuse to measure at or above this 1-min load (default {DEFAULT_LOAD_CEILING:.1f})",
+    )
     ap.add_argument("--readers", type=int, default=4)
     ap.add_argument("--writers", type=int, default=8, help="write load for the contended phase")
     ap.add_argument("--duration", type=float, default=20.0)
@@ -90,6 +108,21 @@ def main() -> int:
         raise SystemExit(f"Rust binary not built at {binary}")
     if not shutil.which("mongod"):
         raise SystemExit("mongod not on PATH")
+
+    import bench.parity_remeasure as _pr
+
+    _pr.LOAD_CEILING = args.load_ceiling
+
+    arms = build_arms(args.mongod)
+    labels = [a.strip() for a in args.arms.split(",") if a.strip()] or list(arms)
+    unknown = [lb for lb in labels if lb not in arms]
+    if unknown:
+        raise SystemExit(f"unknown arm(s) {unknown}; discovered: {list(arms)}")
+    if not any(lb.startswith("mongod") for lb in labels):
+        raise SystemExit(
+            "no mongod arm to compare against — none found on PATH or in "
+            f"{list(MONGOD_SEARCH_GLOBS)}. Pass --mongod PATH."
+        )
 
     args.out.mkdir(parents=True, exist_ok=True)
     sha_before = head_sha()
@@ -107,10 +140,10 @@ def main() -> int:
     # Interleave reps across arms (rep 0 for every arm, then rep 1, ...) so a slow
     # thermal drift over the run hits every arm equally instead of penalising
     # whichever happened to be measured last.
-    per_arm_reps: dict[str, list[dict]] = {a: [] for a in args.arms.split(",") if a}
+    per_arm_reps: dict[str, list[dict]] = {lb: [] for lb in labels}
     for rep in range(args.reps):
         for label in list(per_arm_reps):
-            server, mongod_bin = ARMS.get(label, (label, None))
+            server, mongod_bin = arms[label]
             env_extra = {}
             if mongod_bin:
                 if not Path(mongod_bin).exists():
@@ -153,7 +186,7 @@ def main() -> int:
         if not reps:
             results[label] = {"error": "no parseable reps"}
             continue
-        server, mongod_bin = ARMS.get(label, (label, None))
+        server, mongod_bin = arms[label]
         version = None
         if mongod_bin:
             version = subprocess.run(
