@@ -106,3 +106,13 @@ uv run --no-sync python -m bench.compare_servers --n 10000 --reps 5
 Requires `mongod` on `PATH` (Community Server is enough; `--no-mongod` skips
 it and compares the two SecantusDB servers only). On macOS:
 `brew tap mongodb/brew && brew install mongodb-community`.
+
+## Measuring over a real network
+
+The numbers above are single-host: server and client share one machine, so
+the "network" is loopback and the load generator competes with the database
+for the same cores. For a deployment-shaped measurement — one server droplet,
+two separate client droplets, real NICs between them — see
+[`bench/DO_CLUSTER.md`](https://github.com/jdrumgoole/SecantusDB/blob/main/bench/DO_CLUSTER.md),
+a DigitalOcean harness that provisions the machines, runs the benchmark, and
+parks them afterwards.

@@ -299,8 +299,7 @@ def concurrency(
         "duration": "Wall-clock seconds per writer count (default: 30).",
         "writers": 'Comma-separated writer counts (default: "1,2,4,8").',
         "runs": "Interleaved sweeps to median over (default: 3).",
-        "skip-bench": "Re-render the graphs from the committed results "
-                      "JSON without re-measuring.",
+        "skip-bench": "Re-render the graphs from the committed results JSON without re-measuring.",
     },
 )
 def concurrency_refresh(
@@ -386,6 +385,159 @@ def rw_harness(
     if sync_on_commit:
         cmd += " --sync-on-commit"
     c.run(cmd, pty=True)
+
+
+# The harness is Rust (crates/secantus-bench): a `do-cluster` orchestrator and a
+# `do-client` load agent. `cargo run` keeps it building from source so a local
+# edit is picked up, and --release matters — a debug-build load agent would
+# measure the agent, not the server.
+_DO_CLUSTER = (
+    "cargo run --quiet --release --manifest-path crates/Cargo.toml "
+    "-p secantus-bench --bin do-cluster --"
+)
+
+
+@task(
+    name="do-bench",
+    help={
+        "duration": "Timed seconds of load (default: 120).",
+        "workers": "Load processes per client droplet (default: 16).",
+        "op-mix": "Weighted op mix, e.g. 'insert=100' or 'insert=70,find=20,update=10'.",
+        "doc-bytes": "Payload bytes per document (default: 8192).",
+        "batch-size": "Documents per insert call (default: 1).",
+        "region": "DigitalOcean region (default: lon1).",
+        "server-size": "Server droplet size (default: c-4, dedicated CPU).",
+        "client-size": "Client droplet size (default: c-2).",
+        "build": "Server binary: 'release' (published tarball) or 'source' (build on the droplet).",
+        "suspend-mode": "After the run: destroy (default) | snapshot | power-off.",
+        "no-suspend": "Leave the droplets running afterwards.",
+    },
+)
+def do_bench(
+    c: Context,
+    duration: float = 120.0,
+    workers: int = 16,
+    op_mix: str = "insert=70,find=20,update=10",
+    doc_bytes: int = 8192,
+    batch_size: int = 1,
+    region: str = "lon1",
+    server_size: str = "c-4",
+    client_size: str = "c-2",
+    build: str = "release",
+    suspend_mode: str = "destroy",
+    no_suspend: bool = False,
+) -> None:
+    """Full three-droplet DigitalOcean benchmark: up -> deploy -> run -> suspend.
+
+    Provisions one server droplet running ``secantusd-rs`` and two client
+    droplets driving load at it across a private VPC, so the load generator
+    is not competing with the database for the same cores and the network is
+    a real NIC rather than loopback. Requires ``DIGITALOCEAN_TOKEN``.
+
+    Costs real money for as long as the droplets exist, so the run destroys
+    them afterwards by default — a *powered-off* DigitalOcean droplet still
+    bills at full price. Use ``--suspend-mode snapshot`` to keep the
+    installed software as a cheap image and skip the next redeploy, or
+    ``--no-suspend`` to leave the cluster up. ``invoke do-status`` prints the
+    live rate for whatever is currently allocated.
+    """
+    cmd = (
+        f"{_DO_CLUSTER} all"
+        f" --duration {float(duration)}"
+        f" --workers {int(workers)}"
+        f" --op-mix {shlex.quote(op_mix)}"
+        f" --doc-bytes {int(doc_bytes)}"
+        f" --batch-size {int(batch_size)}"
+        f" --region {shlex.quote(region)}"
+        f" --server-size {shlex.quote(server_size)}"
+        f" --client-size {shlex.quote(client_size)}"
+        f" --server-build {shlex.quote(build)}"
+        f" --mode {shlex.quote(suspend_mode)}"
+    )
+    if no_suspend:
+        cmd += " --no-suspend"
+    c.run(cmd, pty=True)
+
+
+@task(
+    name="do-up",
+    help={"region": "DigitalOcean region (default: lon1).", "fresh": "Ignore existing snapshots."},
+)
+def do_up(c: Context, region: str = "lon1", fresh: bool = False) -> None:
+    """Create (or wake) the three benchmark droplets and leave them running."""
+    cmd = f"{_DO_CLUSTER} up --region {shlex.quote(region)}"
+    if fresh:
+        cmd += " --fresh"
+    c.run(cmd, pty=True)
+
+
+@task(
+    name="do-deploy",
+    help={
+        "build": "'release' (published tarball, default) or 'source' (build on the droplet).",
+        "version": "Release tag for --build release (default: latest secantusdb-v*).",
+        "ref": "Git ref for --build source (default: HEAD, which must already be pushed).",
+    },
+)
+def do_deploy(c: Context, build: str = "release", version: str = "latest", ref: str = "") -> None:
+    """Install the server binary and the client load agents on the droplets."""
+    cmd = (
+        f"{_DO_CLUSTER} deploy"
+        f" --server-build {shlex.quote(build)} --server-version {shlex.quote(version)}"
+    )
+    if ref:
+        cmd += f" --server-ref {shlex.quote(ref)}"
+    c.run(cmd, pty=True)
+
+
+@task(
+    name="do-run",
+    help={
+        "duration": "Timed seconds of load (default: 120).",
+        "workers": "Load processes per client droplet (default: 16).",
+        "op-mix": "Weighted op mix (default: insert=70,find=20,update=10).",
+        "sync-on-commit": "Start the server with --sync-on-commit (fsync every commit).",
+    },
+)
+def do_run(
+    c: Context,
+    duration: float = 120.0,
+    workers: int = 16,
+    op_mix: str = "insert=70,find=20,update=10",
+    sync_on_commit: bool = False,
+) -> None:
+    """Run the timed benchmark against already-deployed droplets."""
+    cmd = (
+        f"{_DO_CLUSTER} run"
+        f" --duration {float(duration)} --workers {int(workers)}"
+        f" --op-mix {shlex.quote(op_mix)}"
+    )
+    if sync_on_commit:
+        cmd += " --sync-on-commit"
+    c.run(cmd, pty=True)
+
+
+@task(
+    name="do-suspend",
+    help={"mode": "destroy (default) | snapshot | power-off — see the module docstring."},
+)
+def do_suspend(c: Context, mode: str = "destroy") -> None:
+    """Park the benchmark droplets until the next test.
+
+    ``destroy`` (default) keeps nothing and bills nothing; ``snapshot``
+    destroys the droplets while keeping the installed software as a cheap
+    image; ``power-off`` resumes in seconds but keeps billing at full price.
+    """
+    c.run(
+        f"{_DO_CLUSTER} suspend --mode {shlex.quote(mode)}",
+        pty=True,
+    )
+
+
+@task(name="do-status")
+def do_status(c: Context) -> None:
+    """Show which benchmark droplets exist, their state, and the live hourly cost."""
+    c.run(f"{_DO_CLUSTER} status", pty=True)
 
 
 @task(
