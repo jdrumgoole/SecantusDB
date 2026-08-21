@@ -475,9 +475,14 @@ therefore `destroy`:
 
 | `--mode` | Resume | Ongoing cost | Use when |
 | --- | --- | --- | --- |
-| `destroy` (default) | full reprovision + deploy (~10 min) | **nothing** | done for now |
-| `snapshot` | a few minutes | snapshot storage only | testing again in weeks |
-| `power-off` | ~30 s | **full price** | testing again within hours |
+| `destroy` (default) | full reprovision + deploy | **nothing** | done for now |
+| `snapshot` | ~2 min, software intact | snapshot storage only | testing again in weeks |
+| `power-off` | ~1 min, software intact | **full price** | testing again within hours |
+
+Measured on a three-droplet cluster: `power-off` took 1m03s to resume with the
+public IPs unchanged; `snapshot` took 1m44s to image and destroy, then 2m09s
+to restore — with the installed binaries executable on arrival, so `run` works
+immediately and `all --deploy auto` skips deployment.
 
 `snapshot` powers each droplet off, images it, destroys it, and prunes the
 previous image so snapshots do not accumulate. A later `up` restores droplets
@@ -613,15 +618,14 @@ engines individually within 1% of the first pass.
 Also verified live: provisioning, VPC and firewall, SSH, cloud-init, the
 release-binary deploy, the on-droplet source build (`--server-build source`,
 vendored WiredTiger and all), the on-droplet agent build, result collection,
-and `destroy` teardown.
+and **all three teardown modes** — `destroy`, `power-off` (resume with IPs and
+software intact), and `snapshot` (image, destroy, then restore with the
+binaries still executable), including `--purge-snapshots`.
 
 ---
 
 ## Limitations
 
-- **The `snapshot` and `power-off` teardown modes are unexercised.**
-  `destroy` — the default — is verified live, as is everything else in the
-  provisioning and deployment path.
 - **One pass per engine per run.** Two passes reproduced the headline ratio to
   within 1%, but the harness has no built-in repeat-and-median mode; run it
   more than once by hand if a result looks marginal.

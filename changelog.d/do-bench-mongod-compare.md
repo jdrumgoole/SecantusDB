@@ -37,6 +37,12 @@ reproduced the ratio exactly, with each engine within 1% of its first result.
 
 #### Fixed
 
+- `up` reported every droplet it touched as needing a deploy, including ones
+  it had just woken from a power-off or restored from a snapshot — which
+  already carry their software. It now distinguishes freshly created droplets
+  ("run `deploy` before `run`") from woken ones ("`run` directly, no deploy
+  needed").
+
 - The harness's state and results directories were resolved relative to the
   current directory, so running it through `cargo` from `crates/` created a
   second `bench/.do-state` there (one copy reached git). Both now anchor to the

@@ -232,14 +232,18 @@ pub fn cmd_up(api: &Api, opts: &mut Opts) -> BenchResult<Vec<Node>> {
     };
 
     let mut nodes: Vec<Node> = Vec::new();
-    let mut touched: Vec<String> = Vec::new();
+    // `created` droplets are bare and need a deploy; `woken` ones already have
+    // their software on disk. Telling the user to deploy after a power-off
+    // resume, or after a snapshot restore, is wasted work.
+    let mut created: Vec<String> = Vec::new();
+    let mut woken: Vec<String> = Vec::new();
     for role in ALL_ROLES {
         if let Some(node) = node_for(&existing, role) {
             if node.status() == "off" {
                 println!("powering on {}", node.name());
                 let action = droplet_action(api, node.id(), &json!({"type": "power_on"}))?;
                 wait_action(api, action, Duration::from_secs(900))?;
-                touched.push(role.to_string());
+                woken.push(role.to_string());
             } else {
                 println!("{} already {}", node.name(), node.status());
             }
@@ -286,7 +290,13 @@ pub fn cmd_up(api: &Api, opts: &mut Opts) -> BenchResult<Vec<Node>> {
             role: role.to_string(),
             droplet,
         });
-        touched.push(role.to_string());
+        // A droplet restored from a snapshot arrives with its software, so it
+        // counts as woken rather than bare.
+        if snap.is_some() {
+            woken.push(role.to_string());
+        } else {
+            created.push(role.to_string());
+        }
     }
 
     // Close the unauthenticated-wire-port window as early as possible: the
@@ -309,7 +319,7 @@ pub fn cmd_up(api: &Api, opts: &mut Opts) -> BenchResult<Vec<Node>> {
         }
         ready.push(node);
     }
-    for role in &touched {
+    for role in created.iter().chain(woken.iter()) {
         if let Some(node) = node_for(&ready, role) {
             remote::forget_host(&node.public());
         }
@@ -348,10 +358,16 @@ pub fn cmd_up(api: &Api, opts: &mut Opts) -> BenchResult<Vec<Node>> {
             node.status()
         );
     }
-    if !touched.is_empty() {
+    if !created.is_empty() {
         println!(
-            "\ntouched: {} — run `deploy` before `run`.",
-            touched.join(", ")
+            "\nfreshly created: {} — run `deploy` before `run`.",
+            created.join(", ")
+        );
+    }
+    if !woken.is_empty() {
+        println!(
+            "\nwoken with their software intact: {} — `run` directly, no deploy needed.",
+            woken.join(", ")
         );
     }
     Ok(ready)
