@@ -5440,14 +5440,54 @@ Two supporting details worth noting:
   the stall is threads blocking on reads because the cache cannot hold the
   working set, rather than threads conscripted into writing pages out.
 
-- [ ] **Find where the dirty bytes come from.** 42x is far more than the 2x
-  that doc + full-document oplog entry explains, so most of it is elsewhere.
-  Candidates, cheapest first: (a) SecantusDB dirties three tables per insert
-  (document row, oplog, index entries) where mongod dirties two; (b) page
-  layout / key locality — the per-table `leaf_page_max` and `split_pct` settings
-  versus mongod's; (c) reconciliation cadence. Measure per-table dirty bytes
-  with the same statistics cursor (`statistics:table:...`) to split the 42x by
-  table before changing anything.
+### Split by table: 95% of it is the oplog
+
+Per-table dirty bytes, same workload (`statistics_log=(...,sources=("file:"))`
+— note `sources` accepts `file:`, not `table:`). Insert-only, 8 writers, 40s,
+10.77 GB logical written:
+
+| table family | dirty GB | share | x logical |
+| --- | ---: | ---: | ---: |
+| **oplog** | **11.39** | **95.0%** | 1.06x |
+| index_entries | 0.23 | 1.9% | 0.02x |
+| natural_seq (`_id` index) | 0.19 | 1.6% | 0.02x |
+| documents (the actual data) | 0.18 | 1.5% | 0.02x |
+
+Total 11.99 GB = 1.11x logical, against the connection-level counter's 1.12x —
+the two instruments agree, which is the cross-check that makes the split
+trustworthy.
+
+**The oplog dirties 63x more cache than the document table whose writes it is
+recording.** Since dirty cache bytes is the proven driver of the tail, the
+oplog table is the target. It is also why `--oplog-async` was the single
+biggest lever found (-24%): it is the only change so far that touches the table
+responsible for 95% of the pressure.
+
+**Page size is NOT the explanation.** The oplog is created with
+`leaf_page_max=128KB, split_pct=100` (Finding-13 append tuning, +19% at 8
+writers), so "large pages re-dirtied on every append" was the obvious theory.
+Tested with `SECANTUS_OPLOG_TABLE_EXTRA`:
+
+| oplog `leaf_page_max` | ops/s | p99.9 ms | oplog dirty | x logical |
+| --- | ---: | ---: | ---: | ---: |
+| 128KB (today) | 32,348 | 8.26 | 11.24 GB | 1.06x |
+| 32KB | 32,180 | 8.26 | 10.99 GB | 1.04x |
+| 16KB | 31,640 | **10.69** | 0.05 GB | 0.00x |
+
+128KB and 32KB are indistinguishable — same tail, same dirty bytes. The 16KB
+row is an artifact, not a fix: 8 KiB values stop fitting the leaf and spill to
+overflow items, which the dirty-bytes counter does not see, and the tail gets
+*worse*. So the theory is disproven and the +19% tuning is not to blame.
+
+- [ ] **Why does the oplog dirty ~1.06x logical when the documents table
+  dirties 0.02x?** Both receive a full copy of every document, so the asymmetry
+  is the open question and the next thing to chase. Candidates: the oplog is
+  sharded 2 ways against the documents table's 16 (far more contention on the
+  same tail pages); the oplog's append-only key order versus the documents
+  table's RecordId order; or a difference in how often each table's tail page
+  is reconciled and re-dirtied. Per-table `cache: pages written from cache` and
+  `btree: reconciliation` counters are already in the same stats file and would
+  separate these without any code change.
 
 **Methodology note**: the run above used the default `repeat` payload, which
 mongod's snappy WAL compression crushes — that inflates the WAL row
