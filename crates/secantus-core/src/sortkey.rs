@@ -143,8 +143,13 @@ fn encode_number_from_parts(p: &DecimalParts) -> Vec<u8> {
     if digits.len() % 2 == 1 {
         digits.push(0);
     }
+    // `digits` was padded to an even length just above, so the `as_chunks`
+    // remainder (`.1`) is always empty and the pairing is exhaustive — same
+    // semantics as the `chunks_exact(2)` this replaces.
     let mut pairs: Vec<u8> = digits
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| c[0] * 10 + c[1] + 1)
         .collect();
     if p.sign < 0 {
