@@ -5400,6 +5400,216 @@ shared storage engine or building large new protocol subsystems:
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.
 
+## The 2GB WAL default costs 19x the disk for no throughput (2026-08-21)
+
+Measured while chasing write amplification: **SecantusDB leaves 674 MB on disk
+where mongod leaves 41 MB for the same 320 MB of documents** (40,000 x 8 KiB,
+clean shutdown, `du` of the data directory).
+
+The data files are not the problem — they are *smaller* than mongod's, because
+zlib beats snappy on this content:
+
+| engine | payload | total | WAL | data files |
+| --- | --- | ---: | ---: | ---: |
+| secantusdb | repeated char | 674 MB | 639 MB | 19 MB |
+| mongod | repeated char | 41 MB | 16 MB | 24 MB |
+| secantusdb | random | 691 MB | 639 MB | 37 MB |
+| mongod | random | 82 MB | 11 MB | 70 MB |
+
+It is entirely the write-ahead log: **639 MB against mongod's 11-16 MB**.
+
+**Cause.** The daemon defaults `--log-file-max` to 2GB (chosen so a sustained
+writer rotates rarely). WiredTiger can only reclaim *completed* log files, so a
+workload that writes 639 MB of WAL has produced exactly **one, still-active**
+file — nothing is reclaimable until 2 GB has been written. mongod's 100 MB
+files rotate several times over the same workload and are removed after each
+checkpoint. Confirmed by varying only that flag:
+
+| `--log-file-max` | WAL retained | total on disk |
+| --- | ---: | ---: |
+| 2GB (default) | 639 MB | **674 MB** |
+| 128MB | 32 KB | **35 MB** |
+| 64MB | 32 KB | **35 MB** |
+
+At 128 MB the total is 19x smaller *and beats mongod* (35 MB vs 82 MB).
+
+**The 2GB default buys nothing measurable.** A separate experiment varying only
+the log file size (128MB vs 1GB, 8 writers, 45s) moved throughput 35,984 →
+36,264 ops/s, under 1% and inside run-to-run noise, and left p99.9 unchanged.
+
+Also note the WAL is ~2x the logical data (639 MB for 320 MB of documents),
+consistent with every insert logging both the document row and a
+full-document oplog entry — the write-amplification hypothesis for the tail,
+now with a number attached.
+
+- [ ] **Change the `log_file_max` default** from `2GB` to something that
+  rotates (mongod uses 100 MB; 128 MB measured clean here). One line in
+  `secantus-server/src/config.rs`. Deliberately NOT changed here: it is a
+  durability-adjacent default and belongs in its own reviewed slice, but the
+  evidence is unambiguous — 19x the disk for under 1% of throughput.
+- [ ] Re-check whether the full-document oplog entry can be trimmed, now that
+  the WAL cost of it is visible (2x logical data).
+
+**Methodology note**: this measurement is only meaningful with `--payload
+random`. `do-client`'s default payload is a repeated character, which both
+engines compress to nearly nothing — a bytes-on-disk comparison on it measures
+the compressor, not the engine. The throughput numbers elsewhere in this file
+used the repeated payload; both engines saw the same easy data, so the
+comparison is fair, but it is not representative of incompressible workloads.
+
+## p99.9 write-tail: WiredTiger cache pressure, unthrottled (2026-08-21)
+
+The three-droplet comparison put SecantusDB at **0.46-0.49x mongod's throughput
+but 9.8-11.3x its p99.9 latency** — far worse in the tail than at the median
+(1.5x p50, 3.7x p99). Investigated with `do-client --slow-ms`, which records
+every operation over a threshold **with its timestamp** (a histogram throws
+time away, which is exactly what a tail diagnosis needs back).
+
+**Reproduces locally**, so it is an engine property, not a network or cloud
+artifact: macOS over loopback shows the same shape (47x p50→p99.9 against the
+droplets' 48x). Every experiment below is therefore a free local run.
+
+### Where it lives
+
+- **Not the read path.** 8 concurrent readers: p50 0.14ms, p99.9 0.31ms — a 2x
+  spread. There is no read tail.
+- **The write path, and it is concurrency rather than per-write cost.**
+  Insert-only, 8 KiB docs, local:
+
+  | writers | ops/s | per-writer | p50 ms | p99.9 ms | ratio |
+  | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | 12,853 | 12,853 | 0.07 | 0.36 | 5x |
+  | 2 | 22,535 | 11,268 | 0.08 | 0.68 | 9x |
+  | 4 | 32,513 | 8,128 | 0.11 | **4.83** | **45x** |
+  | 8 | 36,583 | 4,573 | 0.19 | 8.26 | 44x |
+  | 16 | 42,144 | 2,634 | 0.29 | 9.92 | 34x |
+
+  The tail jumps 7x between 2 and 4 writers while the median barely moves.
+  Slow-op traces show **every large stall hitting all workers within the same
+  few milliseconds**, at irregular gaps (2.8s, 5.2s, 25.0s, 1.8s, ...) — a
+  convoy behind a shared resource, and not a fixed-period background task.
+
+### Root cause: cache pressure
+
+Cache sweep, 8 writers, insert-only, 8 KiB docs — throughput and p50 are flat;
+**only the tail moves**:
+
+| cache | ops/s | p50 ms | p99.9 ms | ratio |
+| ---: | ---: | ---: | ---: | ---: |
+| 512M | 35,391 | 0.18 | 9.28 | 52x |
+| 1G | 37,648 | 0.18 | 8.26 | 46x |
+| 2G | 39,324 | 0.18 | 2.96 | 16x |
+| 4G | 39,022 | 0.18 | 1.66 | 9x |
+| 8G | 38,910 | 0.18 | 1.29 | 7x |
+
+Shrinking the data instead of growing the cache does the same thing (256B docs
+instead of 8 KiB: p99.9 8.26 → 0.37ms, -96%), confirming it is the *rate dirty
+data fills the cache* that governs the tail, not the absolute data size — every
+run above writes ~14 GB regardless.
+
+### Ruled out by experiment
+
+Each a 45-60s local run against an 8.26ms baseline:
+
+| suspect | test | p99.9 |
+| --- | --- | --- |
+| Checkpoints | `--checkpoint-seconds 3600` | no change |
+| WT log preallocation | `log=(...,prealloc=true)` | no change |
+| WT log file size | `file_max=1GB` vs 128MB | no change |
+| **WT logging entirely** | `--data-nonlogged --oplog-nonlogged` | **no change** |
+| Eviction thread count | 4 → 8 threads | +2% (none) |
+| Eviction dirty thresholds | `dirty_target=5,trigger=10` | **+19% (worse)** |
+| Eviction dirty thresholds | `dirty_target=1,trigger=5` | **+16% (worse)**, -19% throughput |
+| Eviction updates thresholds | `updates_target=2,trigger=5` | **+16% (worse)** |
+| Oplog pruning | effectively disabled | unchanged, but worst stall 126ms → 26ms |
+
+There is **no WiredTiger config-only fix**: every eviction knob either did
+nothing or made it worse while costing throughput.
+
+### Admission control: prototyped, measured, and NOT the answer
+
+`--write-tickets N` (default 0 = off) bounds how many writes are inside the
+storage engine at once; the rest queue outside it. Implemented in
+`secantus-storage/src/admission.rs` — a Mutex+Condvar permit pool with a
+thread-local re-entrancy guard so a multi-document transaction rides one ticket
+instead of deadlocking against itself, and RAII release so a panicking write
+cannot leak a permit and wedge the pool.
+
+It works, and it does **not** fix the tail. Three interleaved passes, 512M
+cache (maximum pressure), 16 client writers, insert-only, medians:
+
+| tickets | ops/s | p50 ms | p99.9 ms | worst stall ms |
+| ---: | ---: | ---: | ---: | ---: |
+| off | 40,097 | 0.28 | 11.58 | 150.8 |
+| 4 | 31,319 | 0.44 | **10.18** | **102.1** |
+
+**-22% throughput to buy -12% p99.9 and -32% on the worst stall.** A poor
+trade. At a 1G cache with 16 writers it was worse still: 8 tickets gave -8%,
+4 tickets -1%, and 2 tickets made the tail *35% worse* while halving
+throughput.
+
+One genuine benefit: with tickets the tail becomes **perfectly repeatable**
+(10.18ms on all three passes, against 11.33-12.99ms unbounded). Bounding
+concurrency buys predictability, not speed.
+
+**Why the hypothesis failed.** Capping engine concurrency relocates the queue
+rather than removing it. A client holding 16 requests in flight still waits for
+all 16; moving 12 of them from a WiredTiger eviction stall into a condvar queue
+barely changes what the client's stopwatch sees. Compare: reducing the *client*
+to 4 writers gave p99.9 4.83ms, while 16 clients throttled to 4 tickets gave
+~10ms at similar throughput. Same engine concurrency, very different
+client-observed tail — the difference is offered load, not admission.
+
+So the flag stays **off by default** and is kept as a diagnostic and a
+predictability knob, not as a fix. It should not be enabled hoping for a faster
+tail.
+
+### Why mongod does better on identical hardware
+
+On the droplets both engines ran with the **same 4G cache** and the same
+workload, yet mongod held p99.9 at 10.75ms where SecantusDB reached 121ms. So
+this is not "SecantusDB needs a bigger cache" — it is that mongod degrades
+gracefully under the same pressure and SecantusDB does not.
+
+Admission control was the obvious explanation and it has now been **tested and
+rejected** (above): bounding engine concurrency buys almost nothing.
+
+The leading remaining hypothesis is **write amplification**. Every SecantusDB
+insert writes the document row, a **full-document oplog entry**, and the index
+entries — the `insert()` comment in `secantus-storage` puts it at 2-3x the
+message bytes. mongod's oplog entry for an insert is the document too, but the
+totals differ, and dirty bytes per operation is precisely the quantity the
+cache sweep shows the tail is governed by. If SecantusDB dirties materially
+more cache per insert than mongod does, it reaches the eviction trigger sooner
+at any given cache size — which is exactly the observed behaviour, and would
+explain why more cache helps, why smaller documents help even more, and why no
+eviction knob or concurrency bound does.
+
+That `--oplog-async` independently recovers 24% of the tail is consistent with
+it: the oplog is a large share of the write volume.
+
+**Next measurement**: bytes written to disk per insert, SecantusDB versus
+mongod, at a fixed document size. That is a direct test and it has not been
+run.
+
+### Where to go next
+
+- [x] ~~**Admission control**~~ — prototyped as `--write-tickets` and measured;
+  it is not the fix (see above). Kept, off by default, as a diagnostic and a
+  tail-predictability knob.
+- [ ] **Measure write amplification** — bytes on disk per insert, SecantusDB
+  versus mongod at a fixed document size. The leading hypothesis, and untested.
+- [ ] **`--oplog-async` as a default** — worth 24% of the tail and 42% of the
+  stalls on its own, independently of the cache story. Every write currently
+  passes through one process-wide `Arc<Mutex<OplogState>>`.
+- [ ] **Cache defaulting** — the daemon caps at 4G; the sweep shows the tail is
+  governed by cache headroom versus write rate, so the default deserves
+  revisiting (and documenting) rather than being a fixed number.
+
+Reproduce any of this with `do-client --slow-ms 5` (see `bench/DO_CLUSTER.md`
+"Diagnosing a tail"). Relates to the residual item in the section below and to
+`tasks/wt-concurrency-plan.md`.
+
 ## Concurrent-writer contention (found by bench.concurrency, 2026-07-16)
 
 - ~~Shared oplog-meta row hotspot~~ and ~~5s WriteConflict deadline~~ —

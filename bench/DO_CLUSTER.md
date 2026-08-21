@@ -259,6 +259,7 @@ same key and `known_hosts` the harness uses.
 | `--keep-data` | off | Do not wipe the server's data directory before the run |
 | `--start-delay SECS` | `20` | Lead time before the shared start barrier |
 | `--keep-server-running` | off | Leave the server up after the run, for manual poking |
+| `--slow-ms MS` | off | Record every operation at or above MS **with its timestamp**, for tail diagnosis |
 
 ### Teardown (`suspend`, `destroy`, `all`)
 
@@ -389,6 +390,29 @@ Latency is accumulated into a log-linear histogram (64 sub-buckets per octave,
 under 1% bucket error) rather than a sample array. Histograms merge by adding
 counts, which is what lets one report combine every worker across both
 droplets into a single set of percentiles.
+
+### Diagnosing a tail
+
+A histogram deliberately throws time away, which is the one thing a tail
+investigation needs back: whether slow operations arrive *periodically* (a
+checkpoint, a prune, a flush) or *at random* (lock contention, eviction) is the
+first fork in the diagnosis.
+
+`--slow-ms MS` records every operation at or above the threshold with its
+completion timestamp, worker id and operation type, into a `slow_ops` array in
+the client's JSON report. It costs nothing when off (the default) and only
+touches the slow path when on.
+
+```bash
+do-client run --addr HOST:27017 --client-id c1 --workers 8 \
+    --duration 90 --slow-ms 5 --out /tmp/result.json
+```
+
+Grouping those timestamps into stall events answers the question immediately.
+This is how the p99.9 write-tail convoy in `tasks/backlog.md` was found: every
+large stall hit *all* workers within the same few milliseconds, at irregular
+intervals — which ruled out any fixed-period background task and pointed at a
+shared resource instead.
 
 ---
 

@@ -23,14 +23,14 @@ use std::time::{Duration, Instant};
 use rand::{Rng, SeedableRng};
 use secantus_bench::argv::Args;
 use secantus_bench::histogram::{round1, round3, Histogram};
-use secantus_bench::mongo::{make_document, Conn};
+use secantus_bench::mongo::{make_document, make_payload, Conn, Payload};
 use secantus_bench::opmix::{parse_op_mix, pick, Op, OP_NAMES};
-use secantus_bench::report::{ClientReport, OpStats, Totals};
+use secantus_bench::report::{ClientReport, OpStats, SlowOp, Totals};
 use secantus_bench::timefmt::now_epoch_secs;
 use secantus_bench::BenchResult;
 
 const BOOL_FLAGS: [&str; 2] = ["--keep-data", "--version"];
-const VALUE_FLAGS: [&str; 13] = [
+const VALUE_FLAGS: [&str; 15] = [
     "--addr",
     "--client-id",
     "--db",
@@ -44,6 +44,8 @@ const VALUE_FLAGS: [&str; 13] = [
     "--start-at",
     "--seed",
     "--out",
+    "--slow-ms",
+    "--payload",
 ];
 const EXTRA_SAMPLE_FLAGS: [&str; 2] = ["--interval", "--process"];
 
@@ -65,6 +67,8 @@ struct LoadArgs {
     seed: u64,
     out: String,
     keep_data: bool,
+    slow_ms: f64,
+    payload: Payload,
 }
 
 fn load_args(args: &Args) -> BenchResult<LoadArgs> {
@@ -83,6 +87,8 @@ fn load_args(args: &Args) -> BenchResult<LoadArgs> {
         seed: args.usize_or("--seed", 0)? as u64,
         out: args.str_or("--out", "/tmp/do-client-result.json"),
         keep_data: args.has("--keep-data"),
+        slow_ms: args.f64_or("--slow-ms", 0.0)?,
+        payload: Payload::parse(&args.str_or("--payload", "repeat"))?,
     })
 }
 
@@ -99,7 +105,7 @@ fn connect(addr: &str, db: &str) -> BenchResult<Conn> {
 // -- setup ------------------------------------------------------------------
 
 fn cmd_setup(a: &LoadArgs) -> BenchResult<()> {
-    let payload = "x".repeat(a.doc_bytes);
+    let payload = make_payload(a.payload, a.doc_bytes, a.seed.wrapping_add(1));
     let mut conn = connect(&a.addr, &a.db)?;
     let started = Instant::now();
     let mut preloaded = 0i64;
@@ -140,6 +146,7 @@ struct WorkerResult {
     errors: [u64; 3],
     hists: [Histogram; 3],
     first_errors: Vec<String>,
+    slow_ops: Vec<SlowOp>,
 }
 
 fn run_worker(a: &LoadArgs, worker: usize) -> BenchResult<WorkerResult> {
@@ -147,7 +154,11 @@ fn run_worker(a: &LoadArgs, worker: usize) -> BenchResult<WorkerResult> {
     // make --seed fail to reproduce a run.
     let client_offset: u64 = a.client_id.bytes().map(u64::from).sum();
     let mut rng = rand::rngs::StdRng::seed_from_u64(a.seed + worker as u64 * 7919 + client_offset);
-    let payload = "x".repeat(a.doc_bytes);
+    let payload = make_payload(
+        a.payload,
+        a.doc_bytes,
+        a.seed.wrapping_add(worker as u64 + 1),
+    );
     let mix = parse_op_mix(&a.op_mix)?;
     let mut conn = connect(&a.addr, &a.db)?;
     let coll = collection_name(&a.prefix, &a.client_id, worker);
@@ -157,6 +168,10 @@ fn run_worker(a: &LoadArgs, worker: usize) -> BenchResult<WorkerResult> {
     let mut errors = [0u64; 3];
     let mut hists = [Histogram::new(), Histogram::new(), Histogram::new()];
     let mut first_errors: Vec<String> = Vec::new();
+    // Bounded so a pathological run cannot exhaust memory; 200k outliers is
+    // far more than any diagnosis needs.
+    let mut slow_ops: Vec<SlowOp> = Vec::new();
+    const SLOW_CAP: usize = 200_000;
 
     // `n` values already present: the preload, plus whatever this worker
     // inserts as it goes. Reads and updates select uniformly from that range.
@@ -201,7 +216,16 @@ fn run_worker(a: &LoadArgs, worker: usize) -> BenchResult<WorkerResult> {
                 if op == Op::Insert {
                     high += n_docs as i64;
                 }
-                hists[idx].record(t0.elapsed().as_secs_f64() * 1e6);
+                let elapsed_ms = t0.elapsed().as_secs_f64() * 1e3;
+                if a.slow_ms > 0.0 && elapsed_ms >= a.slow_ms && slow_ops.len() < SLOW_CAP {
+                    slow_ops.push(SlowOp {
+                        t: now_epoch_secs(),
+                        op: op.name().to_string(),
+                        ms: (elapsed_ms * 1000.0).round() / 1000.0,
+                        worker,
+                    });
+                }
+                hists[idx].record(elapsed_ms * 1e3);
                 counts[idx] += 1;
                 docs[idx] += n_docs;
             }
@@ -228,6 +252,7 @@ fn run_worker(a: &LoadArgs, worker: usize) -> BenchResult<WorkerResult> {
         errors,
         hists,
         first_errors,
+        slow_ops,
     })
 }
 
@@ -261,6 +286,7 @@ fn cmd_run(a: &LoadArgs) -> BenchResult<()> {
     let mut docs = [0u64; 3];
     let mut errors = [0u64; 3];
     let mut first_errors: Vec<String> = Vec::new();
+    let mut slow_ops: Vec<SlowOp> = Vec::new();
     for res in &workers {
         for i in 0..3 {
             counts[i] += res.counts[i];
@@ -269,7 +295,10 @@ fn cmd_run(a: &LoadArgs) -> BenchResult<()> {
             merged[i].merge(&res.hists[i]);
         }
         first_errors.extend(res.first_errors.iter().cloned());
+        slow_ops.extend(res.slow_ops.iter().cloned());
     }
+    // Completion order across all workers, so periodicity is readable.
+    slow_ops.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
 
     // The measured window is the span each worker actually drove load for, not
     // this process's wall clock (which includes the barrier wait). Workers share
@@ -329,6 +358,7 @@ fn cmd_run(a: &LoadArgs) -> BenchResult<()> {
         ops: ops_map,
         first_errors: first_errors.into_iter().take(10).collect(),
         worker_failures: failures.clone(),
+        slow_ops,
     };
 
     let text =
@@ -487,6 +517,8 @@ Usage: do-client <setup|run|sample> [options]
   setup   --addr HOST:PORT --client-id ID [--db D] [--prefix P] [--workers N]
           [--doc-bytes N] [--preload N] [--op-mix SPEC] [--batch-size N] [--keep-data]
   run     (the same options) --duration SECS [--start-at EPOCH] [--seed N] [--out PATH]
+          [--slow-ms MS]   record every op at or above MS with its timestamp
+          [--payload repeat|random]  payload entropy; random for storage measurements
   sample  [--duration SECS] [--interval SECS] [--process NAME] [--out PATH]
 ";
 

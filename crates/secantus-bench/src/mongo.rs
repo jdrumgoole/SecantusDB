@@ -214,9 +214,108 @@ pub fn make_document(n: i64, payload: &str) -> Document {
     doc! { "n": n, "c": 0i32, "payload": payload }
 }
 
+/// How to fill the payload.
+///
+/// This is not a cosmetic choice. Both engines compress their tables (zlib
+/// here, snappy in mongod), so a payload of one repeated character compresses
+/// to almost nothing and any measurement of bytes-on-disk becomes a
+/// measurement of the compressor. `Random` is the honest setting whenever
+/// storage volume matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Payload {
+    /// A single repeated character — highly compressible.
+    Repeat,
+    /// Pseudo-random bytes — effectively incompressible.
+    Random,
+}
+
+impl Payload {
+    pub fn parse(name: &str) -> crate::BenchResult<Payload> {
+        match name {
+            "repeat" => Ok(Payload::Repeat),
+            "random" => Ok(Payload::Random),
+            other => Err(format!(
+                "unknown --payload {other:?} (expected: repeat | random)"
+            )),
+        }
+    }
+}
+
+/// Build a payload of `bytes` characters.
+///
+/// `Random` draws from a printable alphabet so the value stays a BSON string
+/// (matching `Repeat`'s shape exactly — only the entropy differs), seeded so a
+/// run is reproducible.
+pub fn make_payload(kind: Payload, bytes: usize, seed: u64) -> String {
+    match kind {
+        Payload::Repeat => "x".repeat(bytes),
+        Payload::Random => {
+            const ALPHABET: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            // xorshift64*: no dependency, and good enough that the bytes do not
+            // compress. The point is entropy, not cryptography.
+            let mut state = seed | 1;
+            let mut out = String::with_capacity(bytes);
+            for _ in 0..bytes {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                let v = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                out.push(ALPHABET[(v >> 33) as usize % ALPHABET.len()] as char);
+            }
+            out
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_random_payload_does_not_compress_like_a_repeated_one() {
+        // The whole reason the option exists: a repeated character makes any
+        // bytes-on-disk measurement a measurement of the compressor.
+        let repeated = make_payload(Payload::Repeat, 4096, 1);
+        let random = make_payload(Payload::Random, 4096, 1);
+        assert_eq!(repeated.len(), 4096);
+        assert_eq!(random.len(), 4096);
+        assert_eq!(
+            repeated
+                .chars()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1
+        );
+        // A high distinct-character count is a cheap proxy for entropy.
+        assert!(
+            random
+                .chars()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 50,
+            "random payload looks non-random"
+        );
+    }
+
+    #[test]
+    fn a_random_payload_is_reproducible_for_a_given_seed() {
+        assert_eq!(
+            make_payload(Payload::Random, 64, 7),
+            make_payload(Payload::Random, 64, 7)
+        );
+        assert_ne!(
+            make_payload(Payload::Random, 64, 7),
+            make_payload(Payload::Random, 64, 8)
+        );
+    }
+
+    #[test]
+    fn payload_kinds_parse_and_reject_nonsense() {
+        assert_eq!(Payload::parse("repeat").unwrap(), Payload::Repeat);
+        assert_eq!(Payload::parse("random").unwrap(), Payload::Random);
+        assert!(Payload::parse("gzip").is_err());
+    }
 
     #[test]
     fn documents_carry_the_payload_and_counter() {

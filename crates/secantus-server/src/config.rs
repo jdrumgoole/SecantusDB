@@ -70,6 +70,7 @@ pub struct ResolvedConfig {
     pub oplog_nonlogged: Option<bool>,
     pub data_nonlogged: Option<bool>,
     pub checkpoint_seconds: Option<u64>,
+    pub write_tickets: Option<usize>,
 
     // ---- [tls] -------------------------------------------------------
     pub tls_cert_file: Option<String>,
@@ -100,6 +101,7 @@ impl Default for ResolvedConfig {
             oplog_nonlogged: None,
             data_nonlogged: None,
             checkpoint_seconds: None,
+            write_tickets: None,
             tls_cert_file: None,
             tls_key_file: None,
             tls_ca_file: None,
@@ -133,6 +135,7 @@ pub struct ConfigOverrides {
     pub oplog_nonlogged: Option<bool>,
     pub data_nonlogged: Option<bool>,
     pub checkpoint_seconds: Option<u64>,
+    pub write_tickets: Option<usize>,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
     pub tls_ca_file: Option<String>,
@@ -184,6 +187,9 @@ impl ConfigOverrides {
         }
         if let Some(v) = self.data_nonlogged {
             base.data_nonlogged = Some(v);
+        }
+        if let Some(v) = self.write_tickets {
+            base.write_tickets = Some(v);
         }
         if let Some(v) = self.checkpoint_seconds {
             base.checkpoint_seconds = Some(v);
@@ -367,6 +373,9 @@ pub fn parse_str(text: &str, label: &str) -> Result<ConfigOverrides, String> {
                     out.oplog_nonlogged = Some(as_bool(val, "storage", key, label)?)
                 }
                 "data_nonlogged" => out.data_nonlogged = Some(as_bool(val, "storage", key, label)?),
+                "write_tickets" => {
+                    out.write_tickets = Some(as_u64(val, "storage", key, label)? as usize)
+                }
                 "checkpoint_seconds" => {
                     out.checkpoint_seconds = Some(as_u64(val, "storage", key, label)?)
                 }
