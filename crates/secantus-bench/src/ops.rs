@@ -12,15 +12,16 @@ use crate::cluster::{
     wait_ssh, Config, Node, CLOUD_INIT,
 };
 use crate::doapi::{github_json, resolve_release_asset, Api};
+use crate::engine::Engine;
 use crate::remote::{self, in_parallel, remote_script, scp_from, scp_to, ssh, ssh_raw};
 use crate::report::{
-    build_summary, render_summary, ClientReport, ClientsInfo, Rtt, SampleSummary, ServerInfo,
-    Summary, SummaryInputs, WorkloadInfo,
+    build_summary, render_comparison, render_summary, ClientReport, ClientsInfo, Rtt,
+    SampleSummary, ServerInfo, Summary, SummaryInputs, WorkloadInfo,
 };
 use crate::timefmt::{iso8601, now_epoch_secs, run_id};
 use crate::BenchResult;
-use crate::{ALL_ROLES, CLIENT_ROLES, GITHUB_REPO, REMOTE_DIR, SERVER_BIN, SERVER_DATA};
-use crate::{SERVER_PORT, SERVER_ROLE, SERVICE};
+use crate::{ALL_ROLES, CLIENT_ROLES, GITHUB_REPO, REMOTE_DIR, SERVER_BIN};
+use crate::{SERVER_PORT, SERVER_ROLE};
 
 /// Everything the subcommands read, assembled from the CLI by the binary.
 #[derive(Debug, Clone)]
@@ -31,6 +32,8 @@ pub struct Opts {
     pub server_version: String,
     pub server_ref: String,
     pub agent_ref: String,
+    pub engines: Vec<Engine>,
+    pub mongod_version: String,
     pub duration: f64,
     pub workers: usize,
     pub op_mix: String,
@@ -53,7 +56,7 @@ pub struct Opts {
 pub fn results_root() -> PathBuf {
     std::env::var("SECANTUS_BENCH_RESULTS")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("bench/results/do"))
+        .unwrap_or_else(|_| remote::repo_root().join("bench/results/do"))
 }
 
 // -- remote scripts ---------------------------------------------------------
@@ -136,6 +139,35 @@ cd crates
 cargo build --release --locked -p secantus-bench --bin do-client
 install -m 0755 target/release/do-client "$REMOTE_DIR/do-client"
 "$REMOTE_DIR/do-client" --version
+"#;
+
+/// Install MongoDB Community from the official apt repository.
+///
+/// The comparison is only worth anything against a real `mongod` from
+/// MongoDB's own packages — not a distro fork and not a container image with
+/// its own tuning. The version is pinned by `--mongod-version` so a rerun
+/// months later compares against the same thing.
+const INSTALL_MONGOD: &str = r#"
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+if command -v mongod >/dev/null 2>&1; then
+  mongod --version | head -1
+  echo "mongod already installed"
+  exit 0
+fi
+apt-get install -y -qq gnupg curl ca-certificates >/dev/null
+curl -fsSL "https://pgp.mongodb.com/server-${MONGOD_VERSION}.asc" \
+  | gpg --dearmor -o "/usr/share/keyrings/mongodb-server-${MONGOD_VERSION}.gpg"
+codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-${MONGOD_VERSION}.gpg ] \
+https://repo.mongodb.org/apt/ubuntu ${codename}/mongodb-org/${MONGOD_VERSION} multiverse" \
+  > "/etc/apt/sources.list.d/mongodb-org-${MONGOD_VERSION}.list"
+apt-get update -qq
+apt-get install -y -qq mongodb-org >/dev/null
+# The distro unit would fight the one this harness installs.
+systemctl stop mongod 2>/dev/null || true
+systemctl disable mongod 2>/dev/null || true
+mongod --version | head -1
 "#;
 
 const UNIT_TEMPLATE: &str = r#"[Unit]
@@ -381,6 +413,20 @@ pub fn cmd_deploy(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<()> {
         )?;
     }
 
+    if opts.engines.contains(&Engine::Mongod) {
+        println!(
+            "installing MongoDB {} on the server droplet ...",
+            opts.mongod_version
+        );
+        remote_script(
+            &cfg.ssh_key,
+            &server_ip,
+            INSTALL_MONGOD,
+            &[("MONGOD_VERSION", opts.mongod_version.clone())],
+            true,
+        )?;
+    }
+
     // Build the agent once, on the first client, then distribute it. Compiling
     // it three times would be three times the wait for a byte-identical binary.
     let builder = node_for(nodes, CLIENT_ROLES[0]).ok_or("missing client-1 droplet")?;
@@ -473,8 +519,12 @@ fn client_load_args(opts: &Opts, addr: &str, role: &str) -> String {
     )
 }
 
-pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Summary> {
-    let cfg = &opts.cfg;
+/// Run the benchmark against every selected engine and report the comparison.
+///
+/// The engines run **sequentially on the same droplets**: same cores, same
+/// network, same clients, same workload, one after the other. That is the
+/// whole value of the harness — the only variable left is the database.
+pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Vec<(Engine, Summary)>> {
     for role in ALL_ROLES {
         let node =
             node_for(nodes, role).ok_or(format!("missing droplet {role} — run `up` first."))?;
@@ -485,47 +535,98 @@ pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Summary> {
             ));
         }
     }
-    let server = node_for(nodes, SERVER_ROLE).expect("checked above");
-    let server_ip = server.public();
-    let addr = format!("{}:{}", server.private(), SERVER_PORT);
 
     let started = now_epoch_secs();
     let run = run_id(started);
     let outdir = results_root().join(&run);
     std::fs::create_dir_all(&outdir).map_err(|e| format!("creating {}: {e}", outdir.display()))?;
 
+    let mut results: Vec<(Engine, Summary)> = Vec::new();
+    for engine in &opts.engines {
+        println!("\n=== {} ===", engine.name());
+        let summary = run_one_engine(opts, nodes, *engine, &run, &outdir)?;
+        let text = render_summary(&summary);
+        println!();
+        println!("{text}");
+        std::fs::write(outdir.join(format!("{}-summary.md", engine.name())), &text)
+            .map_err(|e| format!("writing summary: {e}"))?;
+        std::fs::write(
+            outdir.join(format!("{}-summary.json", engine.name())),
+            serde_json::to_string_pretty(&summary)
+                .map_err(|e| format!("serialising summary: {e}"))?,
+        )
+        .map_err(|e| format!("writing summary: {e}"))?;
+        results.push((*engine, summary));
+    }
+
+    if results.len() > 1 {
+        let comparison = render_comparison(&run, &results);
+        std::fs::write(outdir.join("comparison.md"), &comparison)
+            .map_err(|e| format!("writing comparison.md: {e}"))?;
+        println!();
+        println!("{comparison}");
+    }
+    println!("\nartifacts: {}", outdir.display());
+    let _ = api;
+    Ok(results)
+}
+
+/// One engine's full measurement: restart it clean, preload, load, collect.
+fn run_one_engine(
+    opts: &Opts,
+    nodes: &[Node],
+    engine: Engine,
+    run: &str,
+    outdir: &std::path::Path,
+) -> BenchResult<Summary> {
+    let cfg = &opts.cfg;
+    let server = node_for(nodes, SERVER_ROLE).expect("checked by the caller");
+    let server_ip = server.public();
+    let addr = format!("{}:{}", server.private(), SERVER_PORT);
+
     let cache_size = if opts.cache_size.is_empty() {
         auto_cache_size(server.memory_mb())
     } else {
         opts.cache_size.clone()
     };
-    let mut exec_start = format!(
-        "{SERVER_BIN} --host {} --port {SERVER_PORT} --storage-path {SERVER_DATA} \
-         --cache-size {cache_size} --log-level INFO",
-        server.private()
-    );
+    let mut extra = String::new();
     if opts.sync_on_commit {
-        exec_start.push_str(" --sync-on-commit");
+        extra.push_str(engine.sync_on_commit_flag());
     }
-    if opts.standalone {
-        exec_start.push_str(" --standalone");
+    if opts.standalone && engine == Engine::Secantus {
+        extra.push_str(" --standalone");
     }
-    if !opts.server_flags.is_empty() {
-        exec_start.push(' ');
-        exec_start.push_str(&opts.server_flags);
+    if !opts.server_flags.is_empty() && engine == Engine::Secantus {
+        extra.push(' ');
+        extra.push_str(&opts.server_flags);
     }
+    let exec_start = engine.exec_start(&server.private(), SERVER_PORT, &cache_size, extra.trim());
 
-    let unit_path = remote::state_dir().join(format!("{SERVICE}.service"));
+    let unit_path = remote::state_dir().join(format!("{}.service", engine.service()));
     std::fs::write(
         &unit_path,
-        UNIT_TEMPLATE.replace("@EXEC_START@", &exec_start),
+        UNIT_TEMPLATE
+            .replace("@EXEC_START@", &exec_start)
+            .replace("@DESCRIPTION@", engine.name()),
     )
     .map_err(|e| format!("writing the unit file: {e}"))?;
     scp_to(
         &cfg.ssh_key,
         &server_ip,
         &unit_path,
-        &format!("/etc/systemd/system/{SERVICE}.service"),
+        &format!("/etc/systemd/system/{}.service", engine.service()),
+    )?;
+
+    // Only one engine may hold the port. Stop both, then start this one.
+    ssh(
+        &cfg.ssh_key,
+        &server_ip,
+        &format!(
+            "systemctl stop {} {} 2>/dev/null || true",
+            Engine::Secantus.service(),
+            Engine::Mongod.service()
+        ),
+        false,
     )?;
 
     println!("starting the server: {exec_start}");
@@ -534,8 +635,8 @@ pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Summary> {
         &server_ip,
         START_SERVER,
         &[
-            ("SERVICE", SERVICE.to_string()),
-            ("SERVER_DATA", SERVER_DATA.to_string()),
+            ("SERVICE", engine.service().to_string()),
+            ("SERVER_DATA", engine.data_dir().to_string()),
             ("BIND_HOST", server.private()),
             ("PORT", SERVER_PORT.to_string()),
             (
@@ -549,17 +650,11 @@ pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Summary> {
         ],
         true,
     )?;
-    let version = ssh_raw(
-        &cfg.ssh_key,
-        &server_ip,
-        &format!("cat {REMOTE_DIR}/VERSION 2>/dev/null || true"),
-    )
-    .map(|o| o.stdout.trim().to_string())
-    .unwrap_or_default();
+    let version = engine_version(cfg, &server_ip, engine);
 
     let mut network: BTreeMap<String, Rtt> = BTreeMap::new();
     for role in CLIENT_ROLES {
-        let node = node_for(nodes, role).expect("checked above");
+        let node = node_for(nodes, role).expect("checked by the caller");
         let out = ssh_raw(
             &cfg.ssh_key,
             &node.public(),
@@ -577,7 +672,7 @@ pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Summary> {
     );
     let client_nodes: Vec<&Node> = CLIENT_ROLES
         .iter()
-        .map(|r| node_for(nodes, r).expect("checked above"))
+        .map(|r| node_for(nodes, r).expect("checked by the caller"))
         .collect();
     for result in in_parallel(&client_nodes, |node| {
         let cmd = format!(
@@ -590,9 +685,6 @@ pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Summary> {
         result?;
     }
 
-    // Both clients sleep until the same wall-clock instant, so the server sees
-    // one overlapping load window rather than two staggered ones. The droplets
-    // run chrony, and each client reports the start skew it actually achieved.
     let start_at = now_epoch_secs() + opts.start_delay;
     println!(
         "running {:.0}s of load, starting in {:.0}s ...",
@@ -600,18 +692,15 @@ pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Summary> {
     );
 
     let sample_out = "/tmp/server-sample.json";
-    // The sampler covers the barrier wait plus the whole load window, and
-    // finishes just after it. It writes its JSON only on completion, so the
-    // orchestrator waits for the file below rather than racing it — the first
-    // live run scp'd 4s early and reported "sampler produced nothing" for a
-    // sampler that was working perfectly.
     let sample_seconds = opts.duration + opts.start_delay + 2.0;
     ssh(
         &cfg.ssh_key,
         &server_ip,
         &format!(
-            "nohup {REMOTE_DIR}/do-client sample --duration {sample_seconds:.0} --interval 1 \
-             --process secantusd-rs --out {sample_out} >/tmp/sample.log 2>&1 & echo started"
+            "rm -f {sample_out}; nohup {REMOTE_DIR}/do-client sample \
+             --duration {sample_seconds:.0} --interval 1 --process {} --out {sample_out} \
+             >/tmp/sample.log 2>&1 & echo started",
+            engine.process()
         ),
         false,
     )?;
@@ -646,7 +735,7 @@ pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Summary> {
 
     let mut results: BTreeMap<String, ClientReport> = BTreeMap::new();
     for node in &client_nodes {
-        let local = outdir.join(format!("{}.json", node.role));
+        let local = outdir.join(format!("{}-{}.json", engine.name(), node.role));
         match scp_from(&cfg.ssh_key, &node.public(), "/tmp/result.json", &local)
             .and_then(|_| std::fs::read_to_string(&local).map_err(|e| e.to_string()))
             .and_then(|text| serde_json::from_str::<ClientReport>(&text).map_err(|e| e.to_string()))
@@ -659,7 +748,6 @@ pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Summary> {
     }
 
     let mut sample = SampleSummary::default();
-    // Give the sampler its remaining seconds to land the file.
     let landed = remote::wait_until(
         || {
             ssh_raw(
@@ -678,7 +766,7 @@ pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Summary> {
             "server sampler never wrote {sample_out} (see /tmp/sample.log)"
         ));
     }
-    let sample_local = outdir.join("server-sample.json");
+    let sample_local = outdir.join(format!("{}-server-sample.json", engine.name()));
     match scp_from(&cfg.ssh_key, &server_ip, sample_out, &sample_local)
         .and_then(|_| std::fs::read_to_string(&sample_local).map_err(|e| e.to_string()))
         .and_then(|text| serde_json::from_str::<Value>(&text).map_err(|e| e.to_string()))
@@ -691,31 +779,35 @@ pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Summary> {
         Err(e) => failures.push(format!("server sampler produced nothing ({e})")),
     }
 
-    // The server must still be up. A dead service invalidates the numbers, and
-    // that is the headline, not a footnote.
     let alive = ssh_raw(
         &cfg.ssh_key,
         &server_ip,
-        &format!("systemctl is-active {SERVICE} || true"),
+        &format!("systemctl is-active {} || true", engine.service()),
     )
     .map(|o| o.stdout.trim().to_string())
     .unwrap_or_default();
     if let Ok(journal) = ssh_raw(
         &cfg.ssh_key,
         &server_ip,
-        &format!("journalctl -u {SERVICE} --no-pager -n 200"),
+        &format!("journalctl -u {} --no-pager -n 200", engine.service()),
     ) {
-        let _ = std::fs::write(outdir.join("server-journal.log"), journal.stdout);
+        let _ = std::fs::write(
+            outdir.join(format!("{}-journal.log", engine.name())),
+            journal.stdout,
+        );
     }
     if alive != "active" {
         failures.push(format!(
-            "server service is {alive:?} after the run — see server-journal.log"
+            "{} service is {alive:?} after the run — see {}-journal.log",
+            engine.name(),
+            engine.name()
         ));
     }
 
     let summary = build_summary(SummaryInputs {
-        run_id: run.clone(),
+        run_id: run.to_string(),
         generated_at: iso8601(now_epoch_secs()),
+        engine: engine.name().to_string(),
         server: ServerInfo {
             name: server.name(),
             size: cfg.server_size.clone(),
@@ -746,26 +838,25 @@ pub fn cmd_run(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<Summary> {
         failures,
     });
 
-    let json_text =
-        serde_json::to_string_pretty(&summary).map_err(|e| format!("serialising summary: {e}"))?;
-    std::fs::write(outdir.join("summary.json"), &json_text)
-        .map_err(|e| format!("writing summary.json: {e}"))?;
-    let text = render_summary(&summary);
-    std::fs::write(outdir.join("summary.md"), &text)
-        .map_err(|e| format!("writing summary.md: {e}"))?;
-    println!();
-    println!("{text}");
-    println!("\nartifacts: {}", outdir.display());
-
     if !opts.keep_server_running {
         let _ = ssh_raw(
             &cfg.ssh_key,
             &server_ip,
-            &format!("systemctl stop {SERVICE} || true"),
+            &format!("systemctl stop {} || true", engine.service()),
         );
     }
-    let _ = api;
     Ok(summary)
+}
+
+/// The engine's own reported version, so the report names exactly what ran.
+fn engine_version(cfg: &Config, server_ip: &str, engine: Engine) -> String {
+    let cmd = match engine {
+        Engine::Secantus => format!("cat {REMOTE_DIR}/VERSION 2>/dev/null || true"),
+        Engine::Mongod => "mongod --version 2>/dev/null | head -1 || true".to_string(),
+    };
+    ssh_raw(&cfg.ssh_key, server_ip, &cmd)
+        .map(|o| o.stdout.trim().to_string())
+        .unwrap_or_default()
 }
 
 // -- suspend / status / ssh -------------------------------------------------

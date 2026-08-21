@@ -138,6 +138,8 @@ pub struct Aggregate {
 pub struct Summary {
     pub run_id: String,
     pub generated_at: String,
+    /// Which database produced these numbers.
+    pub engine: String,
     pub server: ServerInfo,
     pub clients: ClientsInfo,
     pub workload: WorkloadInfo,
@@ -151,6 +153,7 @@ pub struct Summary {
 pub struct SummaryInputs {
     pub run_id: String,
     pub generated_at: String,
+    pub engine: String,
     pub server: ServerInfo,
     pub clients: ClientsInfo,
     pub workload: WorkloadInfo,
@@ -278,6 +281,7 @@ pub fn build_summary(input: SummaryInputs) -> Summary {
     Summary {
         run_id: input.run_id,
         generated_at: input.generated_at,
+        engine: input.engine,
         server: input.server,
         clients: input.clients,
         workload: input.workload,
@@ -309,7 +313,7 @@ fn thousands(n: u64) -> String {
 pub fn render_summary(s: &Summary) -> String {
     let srv = &s.server;
     let mut lines = vec![
-        "# SecantusDB three-droplet benchmark".to_string(),
+        format!("# {} — three-droplet benchmark", s.engine),
         String::new(),
         format!("run           {}", s.run_id),
         format!(
@@ -429,4 +433,327 @@ pub fn render_summary(s: &Summary) -> String {
         }
     }
     lines.join("\n")
+}
+
+/// Side-by-side comparison of two or more engines from the same run.
+///
+/// The ratio row is the point of the whole harness: same hardware, same
+/// clients, same workload, same network — so a difference is the database and
+/// nothing else. Ratios are stated as "first engine relative to <baseline>",
+/// with throughput above 1.0 meaning faster and latency below 1.0 meaning
+/// quicker, because those are opposite senses and conflating them is how
+/// benchmark tables mislead.
+pub fn render_comparison(run_id: &str, results: &[(crate::engine::Engine, Summary)]) -> String {
+    let mut lines = vec![
+        "# SecantusDB vs MongoDB — three-droplet benchmark".to_string(),
+        String::new(),
+        format!("run           {run_id}"),
+    ];
+    if let Some((_, first)) = results.first() {
+        let srv = &first.server;
+        lines.push(format!(
+            "server        {} ({} vCPU, {} MB)  {}",
+            srv.size, srv.vcpus, srv.memory_mb, srv.region
+        ));
+        lines.push(format!(
+            "clients       {} x {}, {} workers each",
+            first.clients.count, first.clients.size, first.clients.workers_each
+        ));
+        lines.push(format!(
+            "workload      {}  {} B docs  batch={}  {:.0}s per engine",
+            first.workload.op_mix,
+            first.workload.doc_bytes,
+            first.workload.batch_size,
+            first.workload.duration_s
+        ));
+        lines.push(format!("cache         {} (both engines)", srv.cache_size));
+    }
+    lines.push(String::new());
+    lines.push(
+        "| engine | version | ops/s | docs/s | errors | p50 ms | p99 ms | p99.9 ms | server CPU |"
+            .to_string(),
+    );
+    lines.push("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |".to_string());
+
+    for (engine, s) in results {
+        let lat = overall_latency(s);
+        let cpu = s
+            .server
+            .sample
+            .cpu_busy_pct_mean
+            .map(|v| format!("{v:.1}%"))
+            .unwrap_or("-".to_string());
+        lines.push(format!(
+            "| **{}** | {} | **{:.0}** | {:.0} | {} | {:.2} | {:.2} | {:.2} | {} |",
+            engine.name(),
+            short_version(&s.server.version),
+            s.aggregate.ops_per_sec,
+            s.aggregate.docs_per_sec,
+            thousands(s.aggregate.errors),
+            lat.p50_ms,
+            lat.p99_ms,
+            lat.p999_ms,
+            cpu
+        ));
+    }
+
+    if results.len() == 2 {
+        let (a_engine, a) = &results[0];
+        let (b_engine, b) = &results[1];
+        let (la, lb) = (overall_latency(a), overall_latency(b));
+        lines.push(String::new());
+        lines.push(format!(
+            "**{} relative to {}** — throughput >1.0 is faster, latency <1.0 is quicker:",
+            a_engine.name(),
+            b_engine.name()
+        ));
+        lines.push(String::new());
+        lines.push("| metric | ratio |".to_string());
+        lines.push("| --- | ---: |".to_string());
+        lines.push(format!(
+            "| throughput (ops/s) | {} |",
+            ratio(a.aggregate.ops_per_sec, b.aggregate.ops_per_sec)
+        ));
+        lines.push(format!("| p50 latency | {} |", ratio(la.p50_ms, lb.p50_ms)));
+        lines.push(format!("| p99 latency | {} |", ratio(la.p99_ms, lb.p99_ms)));
+        lines.push(format!(
+            "| p99.9 latency | {} |",
+            ratio(la.p999_ms, lb.p999_ms)
+        ));
+        for name in OP_NAMES {
+            if let (Some(x), Some(y)) = (a.per_op.get(name), b.per_op.get(name)) {
+                lines.push(format!(
+                    "| {name} throughput | {} |",
+                    ratio(x.ops_per_sec, y.ops_per_sec)
+                ));
+            }
+        }
+    }
+
+    let warned: Vec<String> = results
+        .iter()
+        .flat_map(|(e, s)| {
+            s.warnings
+                .iter()
+                .map(move |w| format!("[{}] {w}", e.name()))
+        })
+        .collect();
+    if !warned.is_empty() {
+        lines.push(String::new());
+        lines.push("## Warnings".to_string());
+        lines.push(String::new());
+        lines.extend(warned.into_iter().map(|w| format!("- {w}")));
+    }
+    lines.join("\n")
+}
+
+/// The all-operations latency view across both client droplets.
+///
+/// Each client's percentiles are weighted by its operation count. That is
+/// exact when the clients are balanced (they are, by construction — identical
+/// droplets running identical work) and close otherwise. The exact merge would
+/// need the raw histograms, which live in the per-client JSON alongside this
+/// summary for anyone who wants to recompute it.
+fn overall_latency(s: &Summary) -> LatencySummary {
+    let total: u64 = s.per_client.values().map(|c| c.ops).sum();
+    if total == 0 {
+        return LatencySummary::default();
+    }
+    let weighted = |f: fn(&PerClient) -> f64| -> f64 {
+        let sum: f64 = s.per_client.values().map(|c| f(c) * c.ops as f64).sum();
+        crate::histogram::round3(sum / total as f64)
+    };
+    LatencySummary {
+        count: total,
+        mean_ms: weighted(|c| c.latency.mean_ms),
+        min_ms: s
+            .per_client
+            .values()
+            .map(|c| c.latency.min_ms)
+            .fold(f64::INFINITY, f64::min),
+        p50_ms: weighted(|c| c.latency.p50_ms),
+        p90_ms: weighted(|c| c.latency.p90_ms),
+        p99_ms: weighted(|c| c.latency.p99_ms),
+        p999_ms: weighted(|c| c.latency.p999_ms),
+        max_ms: s
+            .per_client
+            .values()
+            .map(|c| c.latency.max_ms)
+            .fold(0.0, f64::max),
+    }
+}
+
+fn ratio(a: f64, b: f64) -> String {
+    if b <= 0.0 {
+        return "n/a".to_string();
+    }
+    format!("{:.2}x", a / b)
+}
+
+/// Version strings are long ("db version v8.0.4"); keep the table readable.
+fn short_version(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+    trimmed
+        .split_whitespace()
+        .last()
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+#[cfg(test)]
+mod comparison_tests {
+    use super::*;
+    use crate::engine::Engine;
+
+    fn summary(engine: &str, ops_per_sec: f64, p50: f64, p99: f64, cpu: f64) -> Summary {
+        let mut per_client = BTreeMap::new();
+        for role in CLIENT_ROLES {
+            per_client.insert(
+                role.to_string(),
+                PerClient {
+                    ops: 1000,
+                    ops_per_sec: ops_per_sec / 2.0,
+                    latency: LatencySummary {
+                        count: 1000,
+                        p50_ms: p50,
+                        p99_ms: p99,
+                        p999_ms: p99 * 2.0,
+                        ..LatencySummary::default()
+                    },
+                    ..PerClient::default()
+                },
+            );
+        }
+        let mut per_op = BTreeMap::new();
+        per_op.insert(
+            "insert".to_string(),
+            PerOp {
+                count: 2000,
+                ops_per_sec,
+                latency: LatencySummary::default(),
+            },
+        );
+        Summary {
+            run_id: "R".into(),
+            engine: engine.into(),
+            server: ServerInfo {
+                version: format!("v{engine}-1.2.3"),
+                cache_size: "4G".into(),
+                sample: SampleSummary {
+                    cpu_busy_pct_mean: Some(cpu),
+                    ncpu: Some(4),
+                    ..SampleSummary::default()
+                },
+                ..ServerInfo::default()
+            },
+            aggregate: Aggregate {
+                ops: 2000,
+                ops_per_sec,
+                ..Aggregate::default()
+            },
+            per_client,
+            per_op,
+            ..Summary::default()
+        }
+    }
+
+    #[test]
+    fn the_ratio_row_states_throughput_and_latency_in_their_own_senses() {
+        // secantus does 2x the throughput at half the p50: 2.00x and 0.50x.
+        let results = vec![
+            (
+                Engine::Secantus,
+                summary("secantusdb", 8000.0, 2.0, 20.0, 90.0),
+            ),
+            (Engine::Mongod, summary("mongod", 4000.0, 4.0, 40.0, 70.0)),
+        ];
+        let text = render_comparison("R", &results);
+        assert!(text.contains("| throughput (ops/s) | 2.00x |"), "{text}");
+        assert!(text.contains("| p50 latency | 0.50x |"), "{text}");
+        assert!(text.contains("| p99 latency | 0.50x |"), "{text}");
+        assert!(text.contains("| insert throughput | 2.00x |"), "{text}");
+        // The reader must not have to guess which direction is good.
+        assert!(text.contains("throughput >1.0 is faster, latency <1.0 is quicker"));
+    }
+
+    #[test]
+    fn both_engines_appear_with_their_versions_and_cpu() {
+        let results = vec![
+            (
+                Engine::Secantus,
+                summary("secantusdb", 8000.0, 2.0, 20.0, 90.0),
+            ),
+            (Engine::Mongod, summary("mongod", 4000.0, 4.0, 40.0, 70.0)),
+        ];
+        let text = render_comparison("R", &results);
+        assert!(text.contains("secantusdb"));
+        assert!(text.contains("mongod"));
+        assert!(text.contains("90.0%"));
+        assert!(text.contains("70.0%"));
+        assert!(text.contains("cache         4G (both engines)"));
+    }
+
+    #[test]
+    fn a_single_engine_needs_no_ratio_row() {
+        let results = vec![(
+            Engine::Secantus,
+            summary("secantusdb", 8000.0, 2.0, 20.0, 90.0),
+        )];
+        let text = render_comparison("R", &results);
+        assert!(!text.contains("relative to"));
+    }
+
+    #[test]
+    fn warnings_from_either_engine_are_attributed_and_kept() {
+        let mut a = summary("secantusdb", 8000.0, 2.0, 20.0, 90.0);
+        a.warnings.push("client-1 CPU was 93% busy".into());
+        let mut b = summary("mongod", 4000.0, 4.0, 40.0, 70.0);
+        b.warnings.push("17 operations errored".into());
+        let text = render_comparison("R", &[(Engine::Secantus, a), (Engine::Mongod, b)]);
+        assert!(
+            text.contains("[secantusdb] client-1 CPU was 93% busy"),
+            "{text}"
+        );
+        assert!(text.contains("[mongod] 17 operations errored"), "{text}");
+    }
+
+    #[test]
+    fn a_zero_baseline_reports_na_rather_than_infinity() {
+        let results = vec![
+            (
+                Engine::Secantus,
+                summary("secantusdb", 8000.0, 2.0, 20.0, 90.0),
+            ),
+            (Engine::Mongod, summary("mongod", 0.0, 0.0, 0.0, 0.0)),
+        ];
+        let text = render_comparison("R", &results);
+        assert!(text.contains("n/a"), "{text}");
+        assert!(!text.contains("inf"), "{text}");
+    }
+
+    #[test]
+    fn overall_latency_weights_clients_by_their_op_count() {
+        let mut s = summary("secantusdb", 8000.0, 2.0, 20.0, 90.0);
+        // Skew the clients: 3000 ops at p50 4ms and 1000 ops at p50 8ms
+        // should weight to 5ms, not the unweighted 6ms.
+        let entries: Vec<String> = s.per_client.keys().cloned().collect();
+        s.per_client.get_mut(&entries[0]).unwrap().ops = 3000;
+        s.per_client.get_mut(&entries[0]).unwrap().latency.p50_ms = 4.0;
+        s.per_client.get_mut(&entries[1]).unwrap().ops = 1000;
+        s.per_client.get_mut(&entries[1]).unwrap().latency.p50_ms = 8.0;
+        assert_eq!(overall_latency(&s).p50_ms, 5.0);
+    }
+
+    #[test]
+    fn long_version_strings_are_shortened_for_the_table() {
+        assert_eq!(short_version("db version v8.0.4"), "v8.0.4");
+        assert_eq!(
+            short_version("secantusd-rs 0.5.3-beta.160"),
+            "0.5.3-beta.160"
+        );
+        assert_eq!(short_version("  "), "unknown");
+    }
 }
