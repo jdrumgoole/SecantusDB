@@ -19,6 +19,16 @@ vendored WiredTiger and is what the data tables use — cuts p99.9 latency by
 control prototype, and it composes with `--oplog-async`. The recommendation is
 in `tasks/backlog.md`; no default is changed here.
 
+WiredTiger's own statistics then answered the question the whole investigation
+had left open — why mongod's tail is better at the *same* cache size.
+Normalised per GB of data written, **SecantusDB dirties 42x more cache bytes
+than mongod**, along with 25x the application-thread disk reads. Dirty cache
+bytes is exactly the quantity the earlier cache sweep proved governs the tail,
+so that is the mechanism; it also explains why more cache helped, why smaller
+documents helped more, and why no eviction knob or concurrency bound helped at
+all. Where the 42x comes from is the next question, and it is written up with
+candidates in `tasks/backlog.md`.
+
 #### Fixed
 
 - `--payload random` now varies per document, so a random dataset is actually

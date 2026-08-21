@@ -5400,6 +5400,60 @@ shared storage engine or building large new protocol subsystems:
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.
 
+## Why mongod's tail is better: 42x fewer dirty cache bytes per byte written (2026-08-21)
+
+The cache sweep proved the tail is governed by cache pressure, but not why
+mongod holds p99.9 at 10.75ms where SecantusDB reaches 121ms **at the same 4G
+cache**. WiredTiger's own statistics answer it. Both engines are WiredTiger, so
+the same counters are directly comparable — enable with
+`statistics=(fast),statistics_log=(wait=1,json=true)` (via
+`SECANTUS_WT_CONFIG_EXTRA` here, `--wiredTigerEngineConfigString` on mongod),
+which needs no code and writes per-second JSON into the data directory.
+
+45s of insert-only load, 8 writers, 1G cache, 8 KiB documents. **Normalised per
+GB of logical data written** — the two engines did different amounts of work in
+the window (SecantusDB 11.95 GB, mongod 27.70 GB), so raw counters mislead:
+
+| counter, per GB of data written | SecantusDB | mongod | ratio |
+| --- | ---: | ---: | ---: |
+| **dirty cache bytes** | **1.12 GB** | **0.03 GB** | **42x** |
+| WAL bytes | 2.09 GB | 0.06 GB | 34x |
+| application-thread disk reads | 1,772 | 72 | 25x |
+| pages selected for eviction, unevictable | 132 | 9.4 | 14x |
+| eviction-worker pages | 9,214 | 5,205 | 2x |
+
+**SecantusDB dirties 42x more cache per byte of data written.** Dirty cache
+bytes is precisely the quantity the cache sweep showed governs the tail, so
+this is the mechanism behind the gap, and it explains every earlier result:
+more cache helps (more headroom before the trigger), smaller documents help
+more (less dirty per op), no eviction knob helps (the problem is upstream of
+eviction), and bounding concurrency does not help (it does not reduce dirty
+bytes per operation).
+
+Two supporting details worth noting:
+
+- The WAL row independently reproduces the uncompressed-log finding above:
+  2.09 GB per GB logical here versus 2.04x measured directly. A useful
+  cross-check that the instrument agrees with the file sizes.
+- Application threads do **more disk reads** (25x), not more eviction writes —
+  SecantusDB's app-thread page *writes* were actually lower than mongod's. So
+  the stall is threads blocking on reads because the cache cannot hold the
+  working set, rather than threads conscripted into writing pages out.
+
+- [ ] **Find where the dirty bytes come from.** 42x is far more than the 2x
+  that doc + full-document oplog entry explains, so most of it is elsewhere.
+  Candidates, cheapest first: (a) SecantusDB dirties three tables per insert
+  (document row, oplog, index entries) where mongod dirties two; (b) page
+  layout / key locality — the per-table `leaf_page_max` and `split_pct` settings
+  versus mongod's; (c) reconciliation cadence. Measure per-table dirty bytes
+  with the same statistics cursor (`statistics:table:...`) to split the 42x by
+  table before changing anything.
+
+**Methodology note**: the run above used the default `repeat` payload, which
+mongod's snappy WAL compression crushes — that inflates the WAL row
+specifically. The dirty-cache row is not affected by WAL compression, and it is
+the row that matters.
+
 ## The WAL is uncompressed: 2x logical data, and 22% of the tail (2026-08-21)
 
 Measured with `do-client --payload random` (per-document entropy — see the
