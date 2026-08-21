@@ -18,8 +18,9 @@ use crate::BenchResult;
 
 pub const API_BASE: &str = "https://api.digitalocean.com/v2";
 
-pub const TOKEN_ENV_VARS: [&str; 3] = [
+pub const TOKEN_ENV_VARS: [&str; 4] = [
     "DIGITALOCEAN_TOKEN",
+    "DO_TOKEN",
     "DIGITALOCEAN_ACCESS_TOKEN",
     "DO_API_TOKEN",
 ];
@@ -92,30 +93,7 @@ impl Api {
 
     fn curl(&self, method: &str, url: &str, body: Option<&Value>) -> BenchResult<(u32, String)> {
         let mut cmd = Command::new("curl");
-        cmd.args([
-            "--silent",
-            "--show-error",
-            "--config",
-            "-",
-            // Print the status on its own trailing line so the body stays intact.
-            "--write-out",
-            "\n%{http_code}",
-            "--max-time",
-            "120",
-            "-X",
-            method,
-        ]);
-        if let Some(value) = body {
-            cmd.args([
-                "-H",
-                "Content-Type: application/json",
-                "--data-binary",
-                "@-",
-            ]);
-            // With a body on stdin the header config must go via a file
-            // instead; keep both off argv by writing the config first.
-            let _ = value;
-        }
+        cmd.args(curl_argv(method));
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -124,15 +102,9 @@ impl Api {
             .map_err(|e| format!("spawning curl failed: {e}"))?;
         {
             let stdin = child.stdin.as_mut().ok_or("curl stdin unavailable")?;
-            writeln!(stdin, "url = \"{url}\"").map_err(|e| format!("curl stdin: {e}"))?;
-            writeln!(stdin, "header = \"Authorization: Bearer {}\"", self.token)
+            stdin
+                .write_all(curl_config(url, &self.token, body).as_bytes())
                 .map_err(|e| format!("curl stdin: {e}"))?;
-            if let Some(value) = body {
-                writeln!(stdin, "header = \"Content-Type: application/json\"")
-                    .map_err(|e| format!("curl stdin: {e}"))?;
-                writeln!(stdin, "data = {}", json_config_literal(value))
-                    .map_err(|e| format!("curl stdin: {e}"))?;
-            }
         }
         let out = child
             .wait_with_output()
@@ -170,6 +142,46 @@ impl Api {
             page += 1;
         }
     }
+}
+
+/// The curl argv. Everything else — URL, auth, content type, request body —
+/// travels on **stdin** via `--config -`, so the token never lands in `ps`
+/// output.
+///
+/// Nothing here may consume stdin. An earlier version added `--data-binary @-`
+/// for requests with a body, which fought `--config -` for the same stdin: the
+/// config won, the body arrived empty, and DigitalOcean answered 415. The body
+/// belongs in the config's own `data` entry, never on argv.
+fn curl_argv(method: &str) -> Vec<String> {
+    [
+        "--silent",
+        "--show-error",
+        "--config",
+        "-",
+        // Print the status on its own trailing line so the body stays intact.
+        "--write-out",
+        "\n%{http_code}",
+        "--max-time",
+        "120",
+        "-X",
+        method,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// The curl config fed to stdin: URL, auth header, and — for requests that
+/// carry one — the JSON content type and body.
+fn curl_config(url: &str, token: &str, body: Option<&Value>) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("url = \"{url}\"\n"));
+    out.push_str(&format!("header = \"Authorization: Bearer {token}\"\n"));
+    if let Some(value) = body {
+        out.push_str("header = \"Content-Type: application/json\"\n");
+        out.push_str(&format!("data = {}\n", json_config_literal(value)));
+    }
+    out
 }
 
 /// curl's config parser needs a quoted, backslash-escaped literal.
@@ -314,6 +326,42 @@ mod tests {
         let (body, status) = split_status("line1\nline2\n404").unwrap();
         assert_eq!(body, "line1\nline2");
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn curl_argv_never_consumes_stdin() {
+        // `--config -` owns stdin. Anything else reading `@-` or `-` would
+        // race it and silently send an empty body (observed: HTTP 415).
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            let argv = curl_argv(method);
+            assert!(!argv
+                .iter()
+                .any(|a| a == "--data-binary" || a == "--data" || a == "-d"));
+            assert!(!argv.iter().any(|a| a == "@-"));
+            assert!(argv.contains(&method.to_string()));
+        }
+    }
+
+    #[test]
+    fn a_request_with_a_body_declares_json_and_carries_it_in_the_config() {
+        let body = json!({"name": "x"});
+        let config = curl_config("https://example/v2/droplets", "tok", Some(&body));
+        assert!(config.contains("header = \"Content-Type: application/json\""));
+        assert!(config.contains(r#"data = "{\"name\":\"x\"}""#));
+        assert!(config.contains("header = \"Authorization: Bearer tok\""));
+    }
+
+    #[test]
+    fn a_request_without_a_body_sends_no_content_type_or_data() {
+        let config = curl_config("https://example/v2/droplets", "tok", None);
+        assert!(!config.contains("Content-Type"));
+        assert!(!config.contains("data ="));
+    }
+
+    #[test]
+    fn the_token_never_reaches_argv() {
+        assert!(!curl_argv("POST").iter().any(|a| a.contains("secret-token")));
+        assert!(curl_config("https://example", "secret-token", None).contains("secret-token"));
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub struct Opts {
     pub server_build: String,
     pub server_version: String,
     pub server_ref: String,
+    pub agent_ref: String,
     pub duration: f64,
     pub workers: usize,
     pub op_mix: String,
@@ -184,6 +185,9 @@ exit 1
 // -- up ---------------------------------------------------------------------
 
 pub fn cmd_up(api: &Api, opts: &mut Opts) -> BenchResult<Vec<Node>> {
+    // Before anything is created: prove the key can actually authenticate.
+    // Finding out afterwards means paying for droplets nobody can reach.
+    remote::assert_key_usable(&opts.cfg.ssh_key)?;
     opts.cfg.ssh_cidr = normalise_ssh_cidr(&opts.cfg.ssh_cidr, &detect_public_ip)?;
     let cfg = opts.cfg.clone();
     let key_id = ensure_ssh_key(api, &cfg)?;
@@ -328,9 +332,20 @@ pub fn cmd_deploy(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<()> {
     let server = node_for(nodes, SERVER_ROLE).ok_or("missing server droplet — run `up` first.")?;
     let server_ip = server.public();
 
-    let agent_ref = if opts.server_build == "source" {
+    // The load agent is built from the harness's OWN source, never from the
+    // server's release tag. The two are independent — the server is what is
+    // being measured, the agent is the instrument — and the agent crate does
+    // not exist at older server tags at all.
+    let agent_ref = if opts.agent_ref.is_empty() {
+        git_head()?
+    } else {
+        opts.agent_ref.clone()
+    };
+    assert_pushed(&agent_ref)?;
+
+    if opts.server_build == "source" {
         let git_ref = if opts.server_ref.is_empty() {
-            git_head()?
+            agent_ref.clone()
         } else {
             opts.server_ref.clone()
         };
@@ -343,12 +358,11 @@ pub fn cmd_deploy(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<()> {
             &[
                 ("REMOTE_DIR", REMOTE_DIR.to_string()),
                 ("SERVER_BIN", SERVER_BIN.to_string()),
-                ("SERVER_REF", git_ref.clone()),
+                ("SERVER_REF", git_ref),
                 ("REPO", GITHUB_REPO.to_string()),
             ],
             true,
         )?;
-        git_ref
     } else {
         let (tag, tarball, sha) = resolve_release_asset(&opts.server_version, &|p| github_json(p))?;
         println!("installing the server binary from release {tag}");
@@ -361,12 +375,11 @@ pub fn cmd_deploy(api: &Api, opts: &Opts, nodes: &[Node]) -> BenchResult<()> {
                 ("SERVER_BIN", SERVER_BIN.to_string()),
                 ("TARBALL_URL", tarball),
                 ("SHA_URL", sha),
-                ("TAG", tag.clone()),
+                ("TAG", tag),
             ],
             true,
         )?;
-        tag
-    };
+    }
 
     // Build the agent once, on the first client, then distribute it. Compiling
     // it three times would be three times the wait for a byte-identical binary.

@@ -433,22 +433,25 @@ pub fn droplet_action(api: &Api, droplet_id: i64, body: &Value) -> BenchResult<i
 }
 
 pub fn wait_ssh(cfg: &Config, ip: &str, timeout: Duration) -> BenchResult<()> {
-    let ok = remote::wait_until(
-        || {
-            remote::ssh_raw(&cfg.ssh_key, ip, "true")
-                .map(|o| o.status == 0)
-                .unwrap_or(false)
-        },
-        timeout,
-        Duration::from_secs(5),
-    );
-    if ok {
-        Ok(())
-    } else {
-        Err(format!(
-            "ssh to {ip} never came up within {:.0}s",
-            timeout.as_secs_f64()
-        ))
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(out) = remote::ssh_raw(&cfg.ssh_key, ip, "true") {
+            if out.status == 0 {
+                return Ok(());
+            }
+            // A refused connection means "still booting"; a rejected key means
+            // "never going to work". Only the first is worth waiting out.
+            if let Some(reason) = remote::terminal_ssh_failure(&out.stderr) {
+                return Err(format!("ssh to {ip}: {reason}"));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "ssh to {ip} never came up within {:.0}s",
+                timeout.as_secs_f64()
+            ));
+        }
+        std::thread::sleep(Duration::from_secs(5));
     }
 }
 

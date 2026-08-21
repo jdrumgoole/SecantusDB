@@ -26,15 +26,23 @@ pub fn known_hosts() -> PathBuf {
     path
 }
 
+/// Key preference order.
+///
+/// `secantus-bench` comes first on purpose: an automated harness needs a key it
+/// can use without a passphrase prompt, and a personal `id_*` key very often
+/// has one. A dedicated key also limits what a passphrase-free key can reach —
+/// throwaway benchmark droplets and nothing else.
+pub const KEY_PREFERENCE: [&str; 3] = ["secantus-bench", "id_ed25519", "id_rsa"];
+
 pub fn default_ssh_key() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
-    for name in ["id_ed25519", "id_rsa"] {
+    for name in KEY_PREFERENCE {
         let candidate = Path::new(&home).join(".ssh").join(name);
         if candidate.exists() && Path::new(&format!("{}.pub", candidate.display())).exists() {
             return candidate;
         }
     }
-    Path::new(&home).join(".ssh").join("id_ed25519")
+    Path::new(&home).join(".ssh").join(KEY_PREFERENCE[0])
 }
 
 fn ssh_opts(key: &Path) -> Vec<String> {
@@ -186,6 +194,86 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+/// Distinguish "the droplet is still booting" (worth retrying) from "this can
+/// never succeed" (stop now and say why).
+///
+/// Retrying a rejected key for the full timeout wasted seven minutes and then
+/// reported a timeout, which points at the wrong thing entirely.
+pub fn terminal_ssh_failure(stderr: &str) -> Option<String> {
+    if stderr.contains("Permission denied (publickey") {
+        return Some(
+            "the droplet rejected the SSH key. Either the private key is passphrase-protected \
+             and not loaded into ssh-agent (BatchMode cannot prompt for a passphrase) — fix with \
+             `ssh-add <key>` — or the droplet was created before this key reached the account, in \
+             which case destroy and re-provision. `--ssh-key` can point at a passphrase-free key."
+                .to_string(),
+        );
+    }
+    if stderr.contains("Host key verification failed") {
+        return Some(format!(
+            "host key verification failed. The harness keeps its own known_hosts at {}; \
+             deleting that file is safe and it will re-learn on the next connection.",
+            known_hosts().display()
+        ));
+    }
+    None
+}
+
+/// Check that a private key can actually authenticate *before* anything is
+/// provisioned.
+///
+/// A key that needs a passphrase and is not in the agent cannot be used by an
+/// automated harness. Discovering that after three droplets exist means paying
+/// for machines you cannot reach.
+pub fn assert_key_usable(key: &Path) -> BenchResult<()> {
+    if !key.exists() {
+        return Err(format!(
+            "no private key at {}. Generate one (ssh-keygen -t ed25519 -N '' -f {}) or pass \
+             --ssh-key.",
+            key.display(),
+            key.display()
+        ));
+    }
+    // An empty passphrase succeeds here only for an unencrypted key.
+    let derived = Command::new("ssh-keygen")
+        .args(["-y", "-P", "", "-f", &key.display().to_string()])
+        .output()
+        .map_err(|e| format!("running ssh-keygen: {e}"))?;
+    if derived.status.success() {
+        return Ok(());
+    }
+    // Encrypted: usable only if the agent already holds it.
+    let fingerprint = Command::new("ssh-keygen")
+        .args(["-lf", &format!("{}.pub", key.display())])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let fingerprint = fingerprint
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("")
+        .to_string();
+    let agent = Command::new("ssh-add")
+        .arg("-l")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    if !fingerprint.is_empty() && agent.contains(&fingerprint) {
+        return Ok(());
+    }
+    Err(format!(
+        "{} is passphrase-protected and is not loaded in ssh-agent, so this harness cannot use \
+         it (every connection runs with BatchMode=yes, which cannot prompt).\n\
+         Either load it:   ssh-add {}\n\
+         or use a dedicated passphrase-free key for the benchmark cluster:\n\
+        \x20 ssh-keygen -t ed25519 -N '' -f ~/.ssh/secantus-bench -C secantus-bench\n\
+        \x20 ... then pass --ssh-key ~/.ssh/secantus-bench",
+        key.display(),
+        key.display()
+    ))
+}
+
 /// Run `f` over `items` concurrently, preserving order.
 ///
 /// The two client droplets must be driven simultaneously or the run measures
@@ -284,5 +372,46 @@ mod tests {
         assert_eq!(out[0].as_ref().unwrap(), &10);
         assert!(out[1].is_err());
         assert_eq!(out[2].as_ref().unwrap(), &30);
+    }
+}
+
+#[cfg(test)]
+mod ssh_failure_tests {
+    use super::*;
+
+    #[test]
+    fn a_rejected_key_is_terminal_and_explains_the_passphrase_case() {
+        let reason = terminal_ssh_failure("root@1.2.3.4: Permission denied (publickey).").unwrap();
+        assert!(reason.contains("ssh-add"));
+        assert!(reason.contains("--ssh-key"));
+    }
+
+    #[test]
+    fn a_host_key_mismatch_is_terminal_and_names_the_file() {
+        let reason = terminal_ssh_failure("Host key verification failed.").unwrap();
+        assert!(reason.contains("known_hosts"));
+    }
+
+    #[test]
+    fn a_still_booting_droplet_is_not_terminal() {
+        // These must keep retrying — the droplet simply is not up yet.
+        for transient in [
+            "ssh: connect to host 1.2.3.4 port 22: Connection refused",
+            "ssh: connect to host 1.2.3.4 port 22: Operation timed out",
+            "kex_exchange_identification: Connection closed by remote host",
+            "",
+        ] {
+            assert!(
+                terminal_ssh_failure(transient).is_none(),
+                "{transient:?} should retry"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_key_is_reported_before_provisioning() {
+        let err = assert_key_usable(Path::new("/nonexistent/key")).unwrap_err();
+        assert!(err.contains("no private key"));
+        assert!(err.contains("ssh-keygen"));
     }
 }

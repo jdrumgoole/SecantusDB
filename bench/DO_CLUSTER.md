@@ -66,11 +66,27 @@ of an equivalent pymongo agent at the same worker count.
    export DIGITALOCEAN_TOKEN=dop_v1_...
    ```
 
-   `DIGITALOCEAN_ACCESS_TOKEN` and `DO_API_TOKEN` are also accepted.
+   `DO_TOKEN`, `DIGITALOCEAN_ACCESS_TOKEN` and `DO_API_TOKEN` are also
+   accepted, so an existing shell export works unchanged.
 
-2. **An SSH keypair** at `~/.ssh/id_ed25519` (or pass `--ssh-key`). The
-   harness uploads the public half to your DigitalOcean account if it isn't
-   already there, matching on the key body rather than the name.
+2. **An SSH keypair the harness can use without a passphrase prompt.** Every
+   connection runs with `BatchMode=yes`, which cannot prompt, so a
+   passphrase-protected key only works if it is already loaded into
+   `ssh-agent`. The harness checks this *before* provisioning anything and
+   stops with instructions rather than billing you for droplets it cannot
+   reach.
+
+   Keys are looked for in this order — `~/.ssh/secantus-bench`,
+   `~/.ssh/id_ed25519`, `~/.ssh/id_rsa` — or pass `--ssh-key`. A dedicated
+   benchmark key is the recommended setup, because it needs no passphrase and
+   grants access to nothing but throwaway droplets:
+
+   ```bash
+   ssh-keygen -t ed25519 -N '' -f ~/.ssh/secantus-bench -C secantus-bench
+   ```
+
+   The public half is uploaded to your DigitalOcean account if it isn't
+   already there, matched on the key body rather than the name.
 
 3. **`curl`, `ssh`, `scp`, `git`, and a Rust toolchain** on your machine.
    That is all — no `doctl`, no Terraform, no cloud SDK. The harness talks to
@@ -139,10 +155,16 @@ Two halves:
    it at `/usr/local/bin/secantusd-rs`. With `--server-build source` it
    instead clones the repo on the droplet and builds `secantusd-rs` from a
    pushed git ref, vendored WiredTiger and all.
-2. **The load agent.** Builds `do-client` on the *first* client droplet from
-   the same git ref, then pulls the binary back and pushes it to the other
-   client and to the server. Compiling once and distributing means every
-   machine runs a byte-identical agent and only one pays the build.
+2. **The load agent.** Builds `do-client` on the *first* client droplet, then
+   pulls the binary back and pushes it to the other client and to the server.
+   Compiling once and distributing means every machine runs a byte-identical
+   agent and only one pays the build.
+
+   The agent is built from the harness's **own** source — your current `HEAD`,
+   or `--agent-ref` — never from the server's release tag. The two are
+   independent: the server is what is being measured, the agent is the
+   instrument, and the agent crate does not exist at older server tags at all.
+   The ref must be pushed, since the droplet clones it from GitHub.
 
 ### `run`
 
@@ -188,7 +210,7 @@ same key and `known_hosts` the harness uses.
 | `--server-size SLUG` | `c-4` | Server droplet plan |
 | `--client-size SLUG` | `c-2` | Client droplet plan |
 | `--image SLUG` | `ubuntu-24-04-x64` | Base image |
-| `--ssh-key PATH` | `~/.ssh/id_ed25519` | Private key; the `.pub` beside it is uploaded |
+| `--ssh-key PATH` | first of `secantus-bench`, `id_ed25519`, `id_rsa` in `~/.ssh` | Private key; the `.pub` beside it is uploaded |
 | `--ssh-cidr CIDR` | your public IP `/32` | Who may reach port 22. A bare IP is accepted and widened to `/32` |
 
 ### Provisioning (`up`, `resume`, `all`)
@@ -204,6 +226,7 @@ same key and `known_hosts` the harness uses.
 | `--server-build MODE` | `release` | `release` installs a published binary; `source` builds on the droplet |
 | `--server-version TAG` | `latest` | Which `secantusdb-v*` release to install |
 | `--server-ref REF` | `HEAD` | Which pushed git ref to build for `--server-build source` |
+| `--agent-ref REF` | `HEAD` | Which pushed git ref the **load agent** is built from |
 
 ### Workload (`run`, `all`)
 
@@ -236,7 +259,7 @@ same key and `known_hosts` the harness uses.
 
 | Variable | Purpose |
 | --- | --- |
-| `DIGITALOCEAN_TOKEN` | **Required.** Also `DIGITALOCEAN_ACCESS_TOKEN`, `DO_API_TOKEN` |
+| `DIGITALOCEAN_TOKEN` | **Required.** Also `DO_TOKEN`, `DIGITALOCEAN_ACCESS_TOKEN`, `DO_API_TOKEN` |
 | `GITHUB_TOKEN` | Optional; only lifts GitHub's 60/hour anonymous rate limit |
 | `SECANTUS_BENCH_RESULTS` | Where run artifacts land (default `bench/results/do`) |
 | `SECANTUS_BENCH_STATE` | Harness `known_hosts` and scratch files (default `bench/.do-state`) |
@@ -490,12 +513,22 @@ re-provision; do not measure across the public interface.
 Common causes: a data directory left by an incompatible build (drop
 `--keep-data`), or a cache size larger than the droplet's RAM.
 
-**`<ref> is not on any remote branch`** — `--server-build source` clones from
-GitHub. Push the branch first.
+**`<ref> is not on any remote branch`** — the droplets clone from GitHub, both
+for `--server-build source` and for the load agent. Push the branch first.
 
 **Host key verification failures** — the harness keeps its own `known_hosts`
 under `bench/.do-state/`. Deleting that file is safe; it re-learns on the next
 connection.
+
+**`is passphrase-protected and is not loaded in ssh-agent`** — the pre-flight
+refusing to provision droplets it could not reach. Either `ssh-add` the key, or
+create the dedicated passphrase-free key shown in
+[Prerequisites](#prerequisites).
+
+**`the droplet rejected the SSH key`** — the key is not in the droplet's
+`authorized_keys`. DigitalOcean injects keys only at creation time, so a
+droplet made before the key reached your account can never accept it: destroy
+and re-provision.
 
 **A run was interrupted** — nothing is cleaned up automatically. Run
 `invoke do-status`, then `invoke do-suspend`.

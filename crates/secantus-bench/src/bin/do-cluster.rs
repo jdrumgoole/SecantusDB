@@ -23,7 +23,7 @@ const BOOL_FLAGS: [&str; 7] = [
     "--no-suspend",
 ];
 
-const VALUE_FLAGS: [&str; 21] = [
+const VALUE_FLAGS: [&str; 22] = [
     "--prefix",
     "--region",
     "--server-size",
@@ -34,6 +34,7 @@ const VALUE_FLAGS: [&str; 21] = [
     "--server-build",
     "--server-version",
     "--server-ref",
+    "--agent-ref",
     "--duration",
     "--workers",
     "--op-mix",
@@ -69,7 +70,7 @@ CLUSTER OPTIONS (all commands)
   --server-size SLUG   Server droplet plan                 [c-4]
   --client-size SLUG   Client droplet plan                 [c-2]
   --image SLUG         Base image                          [ubuntu-24-04-x64]
-  --ssh-key PATH       Private key                         [~/.ssh/id_ed25519]
+  --ssh-key PATH       Private key      [~/.ssh/secantus-bench, id_ed25519, id_rsa]
   --ssh-cidr CIDR      Who may SSH in           [this machine's public IP /32]
 
 PROVISIONING (up, resume, all)
@@ -79,6 +80,7 @@ DEPLOY (deploy, all)
   --server-build MODE  release | source                    [release]
   --server-version TAG Release tag for `release`           [latest secantusdb-v*]
   --server-ref REF     Pushed git ref for `source`         [HEAD]
+  --agent-ref REF      Pushed git ref the load agent builds from     [HEAD]
 
 WORKLOAD (run, all)
   --duration SECS      Timed seconds                       [120]
@@ -109,7 +111,7 @@ BILLING
   seconds but keeps charging full price.
 
 ENVIRONMENT
-  DIGITALOCEAN_TOKEN   Required (also DIGITALOCEAN_ACCESS_TOKEN, DO_API_TOKEN).
+  DIGITALOCEAN_TOKEN   Required (also DO_TOKEN, DIGITALOCEAN_ACCESS_TOKEN, DO_API_TOKEN).
   GITHUB_TOKEN         Optional; only lifts GitHub's anonymous rate limit.
   SECANTUS_BENCH_RESULTS  Where run artifacts land   [bench/results/do]
   SECANTUS_BENCH_STATE    known_hosts + scratch      [bench/.do-state]
@@ -134,6 +136,7 @@ fn build_opts(args: &Args) -> BenchResult<Opts> {
         server_build: args.str_or("--server-build", "release"),
         server_version: args.str_or("--server-version", "latest"),
         server_ref: args.str_or("--server-ref", ""),
+        agent_ref: args.str_or("--agent-ref", ""),
         duration: args.f64_or("--duration", 120.0)?,
         workers: args.usize_or("--workers", 16)?,
         op_mix: args.str_or("--op-mix", "insert=70,find=20,update=10"),
