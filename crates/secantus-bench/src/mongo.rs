@@ -246,6 +246,12 @@ impl Payload {
 /// `Random` draws from a printable alphabet so the value stays a BSON string
 /// (matching `Repeat`'s shape exactly — only the entropy differs), seeded so a
 /// run is reproducible.
+///
+/// **Vary `seed` per document.** A single random payload reused across every
+/// document is incompressible *within* a document and perfectly compressible
+/// *across* them, which is not what "random" is for: WiredTiger compresses
+/// blocks holding many records, so 20,000 identical 8 KiB payloads collapsed
+/// to an 8 MB table and made a storage measurement meaningless.
 pub fn make_payload(kind: Payload, bytes: usize, seed: u64) -> String {
     match kind {
         Payload::Repeat => "x".repeat(bytes),
@@ -336,5 +342,31 @@ mod tests {
             .to_writer(&mut large)
             .unwrap();
         assert!(large.len() - small.len() >= 8000);
+    }
+}
+
+#[cfg(test)]
+mod payload_entropy_tests {
+    use super::*;
+
+    #[test]
+    fn different_seeds_give_substantially_different_payloads() {
+        // The bug this guards: one payload reused for every document is
+        // incompressible WITHIN a document and perfectly compressible ACROSS
+        // documents, so a storage measurement reads the compressor instead of
+        // the engine. Per-document seeds are what make a random dataset random.
+        let a = make_payload(Payload::Random, 512, 1);
+        let b = make_payload(Payload::Random, 512, 2);
+        let differing = a.chars().zip(b.chars()).filter(|(x, y)| x != y).count();
+        assert!(differing > 400, "only {differing}/512 characters differ");
+    }
+
+    #[test]
+    fn a_repeated_payload_is_identical_regardless_of_seed() {
+        // `repeat` is the comparability default; its content must not drift.
+        assert_eq!(
+            make_payload(Payload::Repeat, 64, 1),
+            make_payload(Payload::Repeat, 64, 999)
+        );
     }
 }

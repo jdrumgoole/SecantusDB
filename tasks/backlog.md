@@ -5400,6 +5400,195 @@ shared storage engine or building large new protocol subsystems:
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.
 
+## RETRACTED: the "42x dirty cache bytes" comparison was a counter artifact (2026-08-21)
+
+The cache sweep proved the tail is governed by cache pressure, but not why
+mongod holds p99.9 at 10.75ms where SecantusDB reaches 121ms **at the same 4G
+cache**. WiredTiger's own statistics answer it. Both engines are WiredTiger, so
+the same counters are directly comparable — enable with
+`statistics=(fast),statistics_log=(wait=1,json=true)` (via
+`SECANTUS_WT_CONFIG_EXTRA` here, `--wiredTigerEngineConfigString` on mongod),
+which needs no code and writes per-second JSON into the data directory.
+
+45s of insert-only load, 8 writers, 1G cache, 8 KiB documents. **Normalised per
+GB of logical data written** — the two engines did different amounts of work in
+the window (SecantusDB 11.95 GB, mongod 27.70 GB), so raw counters mislead:
+
+| counter, per GB of data written | SecantusDB | mongod | ratio |
+| --- | ---: | ---: | ---: |
+| **dirty cache bytes** | **1.12 GB** | **0.03 GB** | **42x** |
+| WAL bytes | 2.09 GB | 0.06 GB | 34x |
+| application-thread disk reads | 1,772 | 72 | 25x |
+| pages selected for eviction, unevictable | 132 | 9.4 | 14x |
+| eviction-worker pages | 9,214 | 5,205 | 2x |
+
+> **RETRACTED.** The `bytes dirty in the cache cumulative` counter does not
+> account for every table's writes, so this comparison measured counter
+> coverage rather than work. See "Why the dirty-bytes comparison is void"
+> below. The cache *sweep* (cache size versus tail) is a black-box measurement
+> and stands; this counter-based comparison does not.
+
+The original claim, kept for the record: SecantusDB dirties 42x more cache per
+byte of data written, which would explain every earlier result:
+more cache helps (more headroom before the trigger), smaller documents help
+more (less dirty per op), no eviction knob helps (the problem is upstream of
+eviction), and bounding concurrency does not help (it does not reduce dirty
+bytes per operation).
+
+Two supporting details worth noting:
+
+- The WAL row independently reproduces the uncompressed-log finding above:
+  2.09 GB per GB logical here versus 2.04x measured directly. A useful
+  cross-check that the instrument agrees with the file sizes.
+- Application threads do **more disk reads** (25x), not more eviction writes —
+  SecantusDB's app-thread page *writes* were actually lower than mongod's. So
+  the stall is threads blocking on reads because the cache cannot hold the
+  working set, rather than threads conscripted into writing pages out.
+
+### Split by table (also void — same artifact)
+
+Per-table dirty bytes, same workload (`statistics_log=(...,sources=("file:"))`
+— note `sources` accepts `file:`, not `table:`). Insert-only, 8 writers, 40s,
+10.77 GB logical written:
+
+| table family | dirty GB | share | x logical |
+| --- | ---: | ---: | ---: |
+| **oplog** | **11.39** | **95.0%** | 1.06x |
+| index_entries | 0.23 | 1.9% | 0.02x |
+| natural_seq (`_id` index) | 0.19 | 1.6% | 0.02x |
+| documents (the actual data) | 0.18 | 1.5% | 0.02x |
+
+Total 11.99 GB = 1.11x logical, against the connection-level counter's 1.12x —
+the two instruments agree, which is the cross-check that makes the split
+trustworthy.
+
+That split is **not** evidence the oplog does 63x more work — see below. It is
+the same counter-coverage artifact. It is also why `--oplog-async` was the single
+biggest lever found (-24%): it is the only change so far that touches the table
+responsible for 95% of the pressure.
+
+**Page size is NOT the explanation.** The oplog is created with
+`leaf_page_max=128KB, split_pct=100` (Finding-13 append tuning, +19% at 8
+writers), so "large pages re-dirtied on every append" was the obvious theory.
+Tested with `SECANTUS_OPLOG_TABLE_EXTRA`:
+
+| oplog `leaf_page_max` | ops/s | p99.9 ms | oplog dirty | x logical |
+| --- | ---: | ---: | ---: | ---: |
+| 128KB (today) | 32,348 | 8.26 | 11.24 GB | 1.06x |
+| 32KB | 32,180 | 8.26 | 10.99 GB | 1.04x |
+| 16KB | 31,640 | **10.69** | 0.05 GB | 0.00x |
+
+128KB and 32KB are indistinguishable — same tail, same dirty bytes. The 16KB
+row is an artifact, not a fix: 8 KiB values stop fitting the leaf and spill to
+overflow items, which the dirty-bytes counter does not see, and the tail gets
+*worse*. So the theory is disproven and the +19% tuning is not to blame.
+
+### Why the dirty-bytes comparison is void
+
+Chasing the oplog/documents asymmetry answered it. Adding `cache: bytes written
+from cache` alongside the dirty counter, same workload:
+
+| writers | table | dirty GB | **written GB** | written/dirty |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | oplog | 3.97 | **4.46** | 1.1x |
+| 1 | documents | 0.00 | **4.31** | **1,289x** |
+| 8 | oplog | 12.91 | **12.76** | 1.0x |
+| 8 | documents | 0.24 | **12.39** | **51x** |
+
+**The documents table writes essentially the same bytes as the oplog** — which
+is exactly right, since both hold a full copy of every document — while its
+cumulative-dirty counter reads ~zero. The write volumes are symmetric and
+credible; the dirty accounting is not. `bytes dirty in the cache cumulative`
+simply does not cover that table's writes.
+
+Consequences, stated plainly:
+
+- The **"oplog is 95% of dirty bytes"** split is an artifact of counter
+  coverage, not evidence that the oplog does 63x the work. Retracted.
+- The **"42x more dirty bytes than mongod"** comparison is worse: if mongod's
+  collection writes are similarly uncounted, that number compared how well each
+  engine's tables are instrumented, not how much cache they dirty. **Retracted.**
+- What survives: `bytes written from cache` shows the oplog and the documents
+  table each writing ~1x logical, so **~2x total** — which independently agrees
+  with the WAL measurement (2.04x from file sizes) and with the doc +
+  full-document-oplog-entry reasoning. That much is consistent across three
+  instruments.
+
+The mechanism behind mongod's better tail at the same cache size is therefore
+**still unexplained**. The cache sweep stands (tail is governed by cache
+headroom); what does not stand is any counter-based claim about *why*
+SecantusDB reaches the eviction trigger sooner.
+
+- [ ] **Re-do the comparison with a counter that covers both engines.**
+  `cache: bytes written from cache` per table is symmetric and trustworthy on
+  the SecantusDB side; the same counter on mongod's collection and oplog tables
+  would give a like-for-like write-volume comparison. That is the measurement
+  the 42x claim should have been built on.
+
+**Methodology note**: the run above used the default `repeat` payload, which
+mongod's snappy WAL compression crushes — that inflates the WAL row
+specifically. The dirty-cache row is not affected by WAL compression, and it is
+the row that matters.
+
+## The WAL is uncompressed: 2x logical data, and 22% of the tail (2026-08-21)
+
+Measured with `do-client --payload random` (per-document entropy — see the
+correction below). 20,000 x 8 KiB documents = 160 MB logical, WAL bytes
+sampled while the server was still running:
+
+| config | WAL | x logical |
+| --- | ---: | ---: |
+| SecantusDB, random payload | 327,072 KB | **2.04x** |
+| SecantusDB, repeated payload | 327,072 KB | **2.04x** |
+| mongod, random payload | 141,864 KB | 0.89x |
+| mongod, repeated payload | 8,244 KB | **0.05x** |
+| SecantusDB, random + `compressor=zlib` | 125,040 KB | **0.78x** |
+
+**SecantusDB writes byte-identical WAL volume for random and repeated
+payloads.** That is proof the WAL is uncompressed: `wt_config` sets
+`log=(enabled=true,file_max=...,prealloc=false)` and never names a compressor,
+while mongod defaults to `--wiredTigerJournalCompressor snappy`.
+
+The 2.04x itself is expected and matches mongod — every insert logs the
+document row *and* a full-document oplog entry, which is what mongod's oplog
+does too. The difference is purely that mongod compresses the result and
+SecantusDB does not. On the compressible payload the benchmarks elsewhere in
+this file used, that is **2.04x against 0.05x — roughly 40x the write I/O for
+the same workload.**
+
+### It is worth a fifth of the tail
+
+Turning on WAL compression (8 writers, 1G cache, 8 KiB docs, medians of two
+passes):
+
+| WAL | ops/s | p50 ms | p99.9 ms |
+| --- | ---: | ---: | ---: |
+| uncompressed (today) | 36,285 | 0.19 | 8.45 |
+| `compressor=zlib` | 34,365 | 0.20 | **6.62** |
+
+**-22% p99.9 for -5% throughput** — a far better trade than the admission
+control prototype (-12% tail for -22% throughput), and it composes with
+`--oplog-async` (-24%) since they attack different parts of the write path.
+It does not *fix* the tail (33x p50→p99.9 remains), but it is the second real
+lever found.
+
+- [ ] **Configure a WAL compressor.** `zlib` is already linked into the
+  vendored WiredTiger (`HAVE_BUILTIN_EXTENSION_ZLIB`) and is what the data
+  tables use, so this is a connection-string change, not a build change.
+  mongod uses snappy; zlib measured well here. Worth pairing with the
+  `log_file_max` rotation fix above — together they are ~19x the disk and ~22%
+  of the tail for ~5% of throughput.
+
+### Correction: `--payload random` was not measuring what it claimed
+
+First implementation generated **one** random payload per worker and reused it
+for every document. Each document was incompressible internally and every
+document was identical, so WiredTiger's block compression — which spans many
+records — crushed the lot: 20,000 x 8 KiB "random" documents produced an 8.8 MB
+table and preloaded in 1.2s. The first amplification numbers taken with it
+(a 96x WAL reduction from zlib) were an artifact and are void. Fixed to derive
+the payload per document; the numbers above are the corrected ones.
+
 ## The 2GB WAL default costs 19x the disk for no throughput (2026-08-21)
 
 Measured while chasing write amplification: **SecantusDB leaves 674 MB on disk
