@@ -35,6 +35,7 @@ pub struct Opts {
     pub engines: Vec<Engine>,
     pub mongod_version: String,
     pub repeat: usize,
+    pub payload: String,
     pub duration: f64,
     pub workers: usize,
     pub op_mix: String,
@@ -527,12 +528,13 @@ fn assert_pushed(git_ref: &str) -> BenchResult<()> {
 fn client_load_args(opts: &Opts, addr: &str, role: &str) -> String {
     format!(
         "--addr {addr} --client-id {role} --workers {} --doc-bytes {} --preload {} \
-         --op-mix {} --batch-size {}",
+         --op-mix {} --batch-size {} --payload {}",
         opts.workers,
         opts.doc_bytes,
         opts.preload,
         remote::shell_quote(&opts.op_mix),
-        opts.batch_size
+        opts.batch_size,
+        remote::shell_quote(&opts.payload)
     )
 }
 

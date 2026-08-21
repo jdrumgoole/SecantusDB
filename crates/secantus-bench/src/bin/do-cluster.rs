@@ -24,7 +24,7 @@ const BOOL_FLAGS: [&str; 7] = [
     "--no-suspend",
 ];
 
-const VALUE_FLAGS: [&str; 25] = [
+const VALUE_FLAGS: [&str; 26] = [
     "--prefix",
     "--region",
     "--server-size",
@@ -39,6 +39,7 @@ const VALUE_FLAGS: [&str; 25] = [
     "--engine",
     "--mongod-version",
     "--repeat",
+    "--payload",
     "--duration",
     "--workers",
     "--op-mix",
@@ -99,6 +100,9 @@ WORKLOAD (run, all)
   --workers N          Load threads per client droplet     [16]
   --op-mix SPEC        e.g. insert=100 or insert=70,find=20,update=10
   --doc-bytes N        Payload bytes per document          [8192]
+  --payload KIND       repeat | random. Both engines compress, so `repeat`
+                       measures the compressor; use `random` whenever
+                       storage volume or cross-engine fairness matters. [repeat]
   --batch-size N       Documents per insert                [1]
   --preload N          Docs preloaded per worker           [10000]
   --cache-size SIZE    WiredTiger cache            [half the droplet's RAM]
@@ -152,6 +156,7 @@ fn build_opts(args: &Args) -> BenchResult<Opts> {
         engines: Engine::parse_list(&args.str_or("--engine", "both"))?,
         mongod_version: args.str_or("--mongod-version", "8.0"),
         repeat: args.usize_or("--repeat", 1)?.max(1),
+        payload: args.str_or("--payload", "repeat"),
         duration: args.f64_or("--duration", 120.0)?,
         workers: args.usize_or("--workers", 16)?,
         op_mix: args.str_or("--op-mix", "insert=70,find=20,update=10"),
