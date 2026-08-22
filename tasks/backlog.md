@@ -6880,12 +6880,19 @@ distinct problems, triaged from the run logs:
   (cleared, still fails), and any particular branch (fails identically on bare
   `origin/main`).
 
-  **It is macOS-specific.** PR #1020's CI ran the full suite on
-  ubuntu-latest across all four shards and every Python version, green —
-  while the same commit fails locally on darwin. That matches the macOS-only
-  character of several entries in this family and narrows the suspect list to
-  platform-specific behaviour (fd limits, APFS, or the macOS WT build) rather
-  than the restore logic itself.
+  **CI never reproduces it, and the reason looks like worker count, not
+  platform.** PR #1020 was green on every lane — including `test` and
+  `test-durable` on **macos-14**, four shards each — while the same commit
+  fails locally on darwin. So it is *not* simply macOS-specific.
+
+  The distinguishing variable is how the suite is run. CI splits it into four
+  shards per job, so each pytest process drives only a quarter of the tests
+  with a handful of xdist workers; locally it is one process at `-n auto` =
+  **12 workers on a 12-core machine**, every one holding a WiredTiger cache.
+  Sharded CI never reaches that pressure. That fits the cache-pressure
+  hypothesis below and suggests the reproduction needs a high worker count
+  rather than a particular OS — worth confirming by running the full unsharded
+  suite at `-n 12` on a Linux box before assuming platform involvement.
 
   **Prime suspect: an unbounded retry under cache-pressure `WT_ROLLBACK`,** the
   same shape as the chunked-drop/rename entry above — restore replays the
