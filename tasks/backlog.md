@@ -6856,6 +6856,42 @@ distinct problems, triaged from the run logs:
   (renames of huge collections are rare); bounded today only by luck of
   cache headroom. The `drop_target=true` purge inside rename shares the
   shape.
+- [ ] **`secantusd-rs restore` wedges under full-suite parallelism —
+  `test_rust_binary_pitr.py::test_rust_binary_v2_archive_base_snapshot_and_restore`
+  (observed 2026-08-22, reproduces on `origin/main` at `c5e338aa`).** The
+  `restore` *subprocess* hits its 900s `subprocess.TimeoutExpired` — a wedge in
+  the restore path, not a wrong result. It is NOT the flock/worker-death family
+  above (that was fixed): the test holds its lock fine and the child process
+  simply never returns.
+
+  Reproduction is context-dependent and consistent, which is what makes it
+  interesting:
+
+  | context | result |
+  |---|---|
+  | the test alone, `-n0` | passes, 6.5s |
+  | the whole file, `-n auto` | passes, 12.7s |
+  | `tests/test_rust_binary_pitr.py` + `test_rust_pitr_cross_server.py` | passes, 14.9s |
+  | **the full suite, `-n auto` (12 workers)** | **hangs, 900s timeout (3/4 runs)** |
+
+  So it needs the *rest of the suite* running concurrently — ~12 worker
+  processes each holding a WiredTiger cache. Ruled out: machine load (fails on
+  a quiet box, load 1.79), disk space (615 GB free), accumulated pytest temp
+  (cleared, still fails), and my branch (fails identically on bare
+  `origin/main`).
+
+  **Prime suspect: an unbounded retry under cache-pressure `WT_ROLLBACK`,** the
+  same shape as the chunked-drop/rename entry above — restore replays the
+  archive in one or few large transactions, and under memory pressure from a
+  dozen sibling WT caches a rollback-retry loop would spin rather than fail.
+  That is a guess and has not been confirmed; the next step is to sample the
+  wedged `secantusd-rs restore` pid (native `sample`, see the WT stall toolkit)
+  during a full-suite run and get its stack, which names the loop directly.
+
+  This is a **durability path** — restore is how a user gets their data back —
+  so a bounded, loud failure is the minimum acceptable behaviour even if the
+  underlying pressure cannot be avoided.
+
 - [x] **RESOLVED (for real this time): the xdist "worker death" cluster
   (2026-08-13 → 08-16) — workers starved on the machine-wide rust-binary
   test flock until the GLOBAL 600s thread-method pytest-timeout os._exit'd
