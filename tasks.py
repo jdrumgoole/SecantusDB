@@ -544,7 +544,7 @@ def release_benchmark(
         "runs": "Interleaved sweeps to median over (default: 3).",
         "keep": "Leave the droplet running instead of destroying it.",
         "git-ref": "Pushed git ref to build and measure (default: HEAD).",
-        "size": "Server droplet plan (default: c-16 — see the docstring).",
+        "size": "Server droplet plan (default: s-8vcpu-16gb — see the docstring).",
     },
 )
 def do_perf(
@@ -556,7 +556,7 @@ def do_perf(
     runs: int = 3,
     keep: bool = False,
     git_ref: str = "",
-    size: str = "c-16",
+    size: str = "s-8vcpu-16gb",
 ) -> None:
     """Measure per-operation latency and writer scaling on a DigitalOcean droplet.
 
@@ -576,16 +576,23 @@ def do_perf(
     and talk to them over loopback, so a client droplet would add nothing but
     a NIC.
 
-    **The default plan is c-16, not the cluster default c-4, because the
-    scaling sweep needs more cores than it has writers.** At eight writers the
-    harness runs eight writer processes *plus* the server; on four vCPUs that
-    measures core starvation rather than write scaling. Measured directly:
-    mongod -- unchanged code, the control -- scaled 4.19x at eight writers on
-    a 12-core laptop and only 1.78x on a c-4 droplet. Every engine was
+    **The default plan is s-8vcpu-16gb, not the cluster default c-4, because
+    the scaling sweep needs more cores than it has writers.** At eight writers
+    the harness runs eight writer processes *plus* the server; on four vCPUs
+    that measures core starvation rather than write scaling. Measured directly:
+    mongod -- unchanged code, the control -- scaled 4.19x at eight writers on a
+    12-core machine and only 1.78x on a c-4 droplet. Every engine was
     compressed the same way, so the whole sweep was a CPU-count artefact.
-    Keep vCPUs >= 2x the largest writer count.
 
-    Costs roughly $1 and takes about an hour, most of it building WiredTiger
+    Aim for vCPUs >= 2x the largest writer count. **This account tier caps at
+    8 vCPU** (`c-16` returns HTTP 422 "size is currently restricted"), so a
+    1,2,4,8 sweep on a droplet runs 9 processes on 8 cores and still
+    under-reports the eight-writer row. Either cap `--writers` at 1,2,4, or
+    run the *scaling* sweep on a quiet workstation with more cores and use the
+    mongod control to prove it was quiet. The per-operation latency half has
+    no such constraint -- it is single-client and not core-bound.
+
+    Costs roughly $0.60 and takes about an hour, most of it building WiredTiger
     and the Rust server from source.
 
     Writes ``bench/results/latency.json`` and ``bench/results/concurrency.json``,
