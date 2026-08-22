@@ -41,7 +41,10 @@ LEADS_WITH_OPEN = re.compile(r"^\*\*OPEN\b", re.IGNORECASE)
 def open_items() -> list[tuple[int, str]]:
     """(line number, headline) for every `- [ ]` item in the backlog."""
     items = []
-    for lineno, line in enumerate(BACKLOG.read_text().splitlines(), 1):
+    # Explicit UTF-8: the backlog is full of em dashes and "×", and Windows
+    # defaults `read_text()` to cp1252, which dies on them with a
+    # UnicodeDecodeError. Caught by the Windows CI lane, not locally.
+    for lineno, line in enumerate(BACKLOG.read_text(encoding="utf-8").splitlines(), 1):
         m = OPEN_ITEM.match(line)
         if m:
             items.append((lineno, m.group("body")[:HEADLINE_CHARS]))
