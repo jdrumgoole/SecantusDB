@@ -32,7 +32,9 @@ use crate::util::{
     as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, docs_to_bson,
     encode_docs, resolve_let_vars,
 };
-use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
+use crate::{
+    CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE, MAX_GETMORE_BATCH_BYTES,
+};
 
 /// Producer for a tailable cursor on a capped collection (`find` with
 /// `tailable: true`). Each `produce` scans the collection for documents whose
@@ -562,12 +564,30 @@ pub(crate) fn split_into_cursor(
     ns: &str,
     cursors: &CursorRegistry,
 ) -> Result<(Vec<Vec<u8>>, i64), CommandError> {
-    let take = if batch_size < 0 {
+    let mut take = if batch_size < 0 {
         DEFAULT_BATCH_SIZE as usize
     } else {
         batch_size as usize
     }
     .min(docs.len());
+    // Byte-budget the FIRST batch as well as getMore. mongod caps every reply at
+    // 16MB and keeps the cursor open for the rest; capping on document count
+    // alone made `find` with `batchSize: 25` over 1MB documents return a 25MB
+    // reply with an exhausted cursor, where mongod returns 15MB and a live
+    // cursor id (measured against 6.0.16). Blob lengths are already known here,
+    // so this costs nothing. Always take at least one document, matching
+    // `CursorRegistry::next_batch`, so an oversized document still makes
+    // progress instead of returning an empty batch forever.
+    let mut bytes = 0usize;
+    let mut fitted = 0usize;
+    for blob in docs.iter().take(take) {
+        if fitted > 0 && bytes + blob.len() > MAX_GETMORE_BATCH_BYTES {
+            break;
+        }
+        bytes += blob.len();
+        fitted += 1;
+    }
+    take = fitted;
     let remaining = docs.split_off(take);
     if remaining.is_empty() {
         return Ok((docs, 0));
@@ -872,4 +892,66 @@ fn project_to_docs(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod first_batch_byte_cap_tests {
+    use super::split_into_cursor;
+    use crate::cursors::CursorRegistry;
+    use crate::MAX_GETMORE_BATCH_BYTES;
+
+    /// A blob of `n` bytes standing in for an encoded document.
+    fn blob(n: usize) -> Vec<u8> {
+        vec![0u8; n]
+    }
+
+    #[test]
+    fn first_batch_stops_under_the_reply_cap() {
+        // 25 x 1MiB with batchSize 25: the count cap alone would return all 25
+        // and exhaust the cursor. mongod 6.0.16, measured, returns 15 documents
+        // (15.0 MiB) and a live cursor id.
+        let reg = CursorRegistry::new();
+        let docs: Vec<Vec<u8>> = (0..25).map(|_| blob(1024 * 1024)).collect();
+        let (first, cursor_id) = split_into_cursor(docs, 25, "t.big", &reg).unwrap();
+
+        let bytes: usize = first.iter().map(|b| b.len()).sum();
+        assert!(
+            bytes <= MAX_GETMORE_BATCH_BYTES,
+            "reply exceeded the 16MB cap"
+        );
+        assert!(
+            first.len() < 25,
+            "the count cap alone would have taken all 25"
+        );
+        assert_ne!(cursor_id, 0, "the remainder must stay behind a live cursor");
+    }
+
+    #[test]
+    fn a_single_oversized_document_still_makes_progress() {
+        // Never hand back an empty batch with documents pending — that hangs a
+        // client. Matches CursorRegistry::next_batch's "at least one" rule.
+        let reg = CursorRegistry::new();
+        let docs: Vec<Vec<u8>> = (0..2).map(|_| blob(12 * 1024 * 1024)).collect();
+        let (first, cursor_id) = split_into_cursor(docs, 2, "t.huge", &reg).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_ne!(cursor_id, 0);
+    }
+
+    #[test]
+    fn small_documents_are_governed_by_the_count_cap() {
+        let reg = CursorRegistry::new();
+        let docs: Vec<Vec<u8>> = (0..500).map(|_| blob(64)).collect();
+        let (first, cursor_id) = split_into_cursor(docs, 101, "t.small", &reg).unwrap();
+        assert_eq!(first.len(), 101, "the common path must not change");
+        assert_ne!(cursor_id, 0);
+    }
+
+    #[test]
+    fn everything_fitting_exhausts_the_cursor() {
+        let reg = CursorRegistry::new();
+        let docs: Vec<Vec<u8>> = (0..5).map(|_| blob(64)).collect();
+        let (first, cursor_id) = split_into_cursor(docs, 101, "t.small", &reg).unwrap();
+        assert_eq!(first.len(), 5);
+        assert_eq!(cursor_id, 0);
+    }
 }

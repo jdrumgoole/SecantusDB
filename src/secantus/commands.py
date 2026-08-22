@@ -573,8 +573,27 @@ def _split_into_cursor(
     # is registered so the next getMore can find the docs.
     if batch_size < 0:
         batch_size = DEFAULT_BATCH_SIZE
-    first = docs[:batch_size]
-    remaining = docs[batch_size:]
+    take = min(batch_size, len(docs))
+    # Byte-budget the FIRST batch too, not just getMore. mongod caps every reply
+    # at 16MB and keeps the cursor open for the rest; we used to cap the first
+    # batch on document count alone, so `find` with `batchSize: 25` over 1MB
+    # documents assembled a 25MB reply and exhausted the cursor where mongod
+    # returns 15MB and hands back a live cursor id. Same algorithm as
+    # `CursorRegistry.next_batch`: stop before the document that would overflow,
+    # but always take at least one so a single oversized doc still makes
+    # progress rather than hanging the client on an empty batch forever.
+    if take:
+        total = 0
+        fitted = 0
+        for doc in docs[:take]:
+            size = len(bson.encode(doc))
+            if fitted > 0 and total + size > MAX_GETMORE_BATCH_BYTES:
+                break
+            total += size
+            fitted += 1
+        take = fitted
+    first = docs[:take]
+    remaining = docs[take:]
     if not remaining:
         return first, 0
     cursor_id = cursors.register(namespace, remaining)
@@ -704,22 +723,85 @@ def _ping(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
 _NO_REPLICATION_ENABLED = 76  # mongod's NoReplicationEnabled error code
 
 
-def _repl_set_get_status(_doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
-    # SecantusDB is a single-node surrogate: it advertises itself as a
-    # replica-set primary in `hello` (so pymongo's change-stream topology
-    # accepts it), but it is not a real replica set and has no member roster
-    # to report. Return exactly what a standalone mongod returns for
-    # `replSetGetStatus` — `NoReplicationEnabled` with the canonical
-    # "not running with --replSet" message. Drivers and their test harnesses
-    # special-case this message to mean "standalone, skip replica-set-only
-    # behaviour" (e.g. libmongoc's `test_framework_replset_member_count`),
-    # whereas a bare CommandNotFound (code 59) is treated as an unexpected
-    # error and aborts the harness.
+def _repl_set_get_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    # When a set name is configured, `hello` already advertises this node as a
+    # single-node replica-set primary (that is what makes drivers accept change
+    # streams). Report a matching one-member roster here rather than the
+    # standalone error, so the two answers agree — real mongod is never both a
+    # replica-set primary and "not running with --replSet".
+    #
+    # Driver harnesses read the roster to decide whether replica-set-only
+    # behaviour is available: libmongoc's `test_framework_replset_member_count`
+    # counts `members`, and with zero it classifies the server as standalone and
+    # runs standalone-only tests against it — which is how
+    # `/Client/last_write_date_absent` came to run here and fail, asserting that a
+    # standalone reports no `lastWriteDate` while our replica-set-shaped `hello`
+    # supplies one.
+    #
+    # With no set name (`replica_set_name=None`) this is a genuine standalone and
+    # `NoReplicationEnabled` is still the honest answer; harnesses special-case
+    # that message to mean "skip replica-set-only behaviour", whereas a bare
+    # CommandNotFound (59) is an unexpected error that aborts them.
+    #
+    # Mirrors `crates/secantus-commands/src/handshake.rs::repl_set_get_status`,
+    # which shipped this on the Rust server first.
+    if not ctx.replica_set_name or ctx.server_address is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "not running with --replSet",
+            "code": _NO_REPLICATION_ENABLED,
+            "codeName": "NoReplicationEnabled",
+        }
+
+    addr = f"{ctx.server_address[0]}:{ctx.server_address[1]}"
+    ts = ctx.storage.current_cluster_time()
+    now = _dt.datetime.now(_dt.timezone.utc)
+    optime = {"ts": ts, "t": 1}
     return {
-        "ok": 0.0,
-        "errmsg": "not running with --replSet",
-        "code": _NO_REPLICATION_ENABLED,
-        "codeName": "NoReplicationEnabled",
+        "set": ctx.replica_set_name,
+        "date": now,
+        "myState": 1,
+        "term": 1,
+        "syncSourceHost": "",
+        "syncSourceId": -1,
+        "heartbeatIntervalMillis": 2000,
+        "majorityVoteCount": 1,
+        "writeMajorityCount": 1,
+        "votingMembersCount": 1,
+        "writableVotingMembersCount": 1,
+        "optimes": {
+            "lastCommittedOpTime": optime,
+            "lastCommittedWallTime": now,
+            "readConcernMajorityOpTime": optime,
+            "appliedOpTime": optime,
+            "durableOpTime": optime,
+            "lastAppliedWallTime": now,
+            "lastDurableWallTime": now,
+        },
+        "lastStableRecoveryTimestamp": ts,
+        "members": [
+            {
+                "_id": 0,
+                "name": addr,
+                "health": 1.0,
+                "state": 1,
+                "stateStr": "PRIMARY",
+                "uptime": 0,
+                "optime": optime,
+                "optimeDate": now,
+                "lastAppliedWallTime": now,
+                "lastDurableWallTime": now,
+                "syncSourceHost": "",
+                "syncSourceId": -1,
+                "infoMessage": "",
+                "electionTime": ts,
+                "electionDate": now,
+                "configVersion": 1,
+                "configTerm": 1,
+                "self": True,
+            }
+        ],
+        "ok": 1.0,
     }
 
 
