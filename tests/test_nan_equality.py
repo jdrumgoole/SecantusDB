@@ -15,8 +15,6 @@ for each of the matching cases below.
 
 from __future__ import annotations
 
-import math
-
 import pytest
 from bson.decimal128 import Decimal128
 from pymongo import MongoClient
