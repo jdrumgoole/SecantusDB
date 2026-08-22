@@ -23,13 +23,6 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ### Writes got a lot faster, and we built the rig that proved it
 
-> `0.6.0b13` was tagged but never published: its macOS wheel failed
-> `delocate`'s deployment-target check, because Homebrew's liblz4 targets
-> macOS 14 while the wheel targets macOS 11. Accepting it would have dropped
-> Apple Silicon users on macOS 11–13, so the compressor's lz4 dependency is
-> now built from source at the wheel's own target instead. No `0.6.0b13`
-> artefacts exist on PyPI.
-
 The block compressor changed from zlib to lz4, and it is the largest single
 performance change this engine has had. Profiling the daemon under sustained
 write load found **65% of server CPU inside zlib's `deflate`**, on
@@ -61,6 +54,13 @@ composite-array catalog types, and a long list of cast, length and comparison
 fixes that bring `psql`, JDBC and SQLAlchemy closer to behaving as they do
 against a real PostgreSQL.
 
+
+**Note on `0.6.0b13`:** it was tagged but never published — its macOS
+wheel failed `delocate`'s deployment-target check, because Homebrew's
+`liblz4` targets macOS 14 while the wheel targets macOS 11. Accepting it
+would have dropped Apple Silicon users on macOS 11–13, so the lz4
+dependency is now built from source at the wheel's own target. No
+`0.6.0b13` artefacts exist on PyPI.
 
 ### getTablePrivileges reflects relation ownership and ACLs
 
