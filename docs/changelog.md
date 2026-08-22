@@ -19,9 +19,16 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
-## [0.6.0b13] — 2026-08-22
+## [0.6.0b14] — 2026-08-22
 
 ### Writes got a lot faster, and we built the rig that proved it
+
+> `0.6.0b13` was tagged but never published: its macOS wheel failed
+> `delocate`'s deployment-target check, because Homebrew's liblz4 targets
+> macOS 14 while the wheel targets macOS 11. Accepting it would have dropped
+> Apple Silicon users on macOS 11–13, so the compressor's lz4 dependency is
+> now built from source at the wheel's own target instead. No `0.6.0b13`
+> artefacts exist on PyPI.
 
 The block compressor changed from zlib to lz4, and it is the largest single
 performance change this engine has had. Profiling the daemon under sustained
