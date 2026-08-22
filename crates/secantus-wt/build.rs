@@ -96,6 +96,24 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib={l}");
     }
 
+    // `SECANTUS_WT_EXTRA_COMPRESSORS=1` matches the CMake option of the same
+    // name: when WiredTiger is built with the snappy / lz4 / zstd builtin
+    // extensions, its static library references those libraries and they have
+    // to be linked here too. Off by default, because requiring three more
+    // system libraries on every build platform is a dependency decision rather
+    // than a build flag. `SECANTUS_WT_EXTRA_LIBDIR` adds a search path for
+    // them (e.g. Homebrew's /opt/homebrew/lib).
+    println!("cargo:rerun-if-env-changed=SECANTUS_WT_EXTRA_COMPRESSORS");
+    println!("cargo:rerun-if-env-changed=SECANTUS_WT_EXTRA_LIBDIR");
+    if env::var_os("SECANTUS_WT_EXTRA_COMPRESSORS").is_some() && target_os != "windows" {
+        if let Ok(dir) = env::var("SECANTUS_WT_EXTRA_LIBDIR") {
+            println!("cargo:rustc-link-search=native={dir}");
+        }
+        for l in ["snappy", "lz4", "zstd"] {
+            println!("cargo:rustc-link-lib=dylib={l}");
+        }
+    }
+
     let header = format!("{inc}/wiredtiger.h");
     println!("cargo:rerun-if-changed={header}");
     let bindings = bindgen::Builder::default()

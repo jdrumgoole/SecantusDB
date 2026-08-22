@@ -167,8 +167,29 @@ endif()
 # (macOS SDK + manylinux/musllinux). Windows has no default libz, so WT builds
 # there without the compressor (the storage layer omits the block_compressor
 # clause on Windows too — see secantus-storage BOOTSTRAP).
+# OFF by default: enabling the extra compressors makes WiredTiger's builtin
+# extensions reference libsnappy / liblz4 / libzstd, which then have to be
+# present at link time and on every build platform. That is a dependency
+# decision, not an experiment knob, so the default build is unchanged.
+#
+# Turn it ON (with `SECANTUS_WT_EXTRA_COMPRESSORS=1` in the environment for the
+# Rust link step) to reproduce the compressor sweep in tasks/backlog.md.
+# Profiling the daemon under sustained write load put **65% of server CPU
+# inside zlib's `deflate`** on WiredTiger's page-reconciliation path, and
+# swapping zlib for lz4 measured +86% throughput and -97% p99.9 on
+# incompressible data, +15% / -88% on compressible. mongod defaults to snappy
+# for exactly this reason.
+option(SECANTUS_WT_EXTRA_COMPRESSORS
+       "Build WiredTiger with snappy/lz4/zstd block compressors alongside zlib"
+       OFF)
 if(WIN32)
     set(WT_ZLIB_ARG "")
+elseif(SECANTUS_WT_EXTRA_COMPRESSORS)
+    set(WT_ZLIB_ARG
+        -DHAVE_BUILTIN_EXTENSION_ZLIB=ON
+        -DHAVE_BUILTIN_EXTENSION_SNAPPY=ON
+        -DHAVE_BUILTIN_EXTENSION_LZ4=ON
+        -DHAVE_BUILTIN_EXTENSION_ZSTD=ON)
 else()
     set(WT_ZLIB_ARG -DHAVE_BUILTIN_EXTENSION_ZLIB=ON)
 endif()

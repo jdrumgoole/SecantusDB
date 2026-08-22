@@ -598,13 +598,27 @@ fn data_tables_nonlogged() -> bool {
     std::env::var_os("SECANTUS_DATA_NONLOGGED").is_some()
 }
 
-/// Table-create config for a data table, honouring [`data_tables_nonlogged`].
+/// Table-create config for a data table, honouring [`data_tables_nonlogged`]
+/// and the `SECANTUS_DATA_TABLE_EXTRA` experiment hook.
+///
+/// The hook mirrors `SECANTUS_OPLOG_TABLE_EXTRA`: appended last, and
+/// WiredTiger takes the last occurrence of a duplicated key, so a clause here
+/// overrides the default. Create-time only — existing stores keep their
+/// config. Added to make `block_compressor` sweepable per table, which is the
+/// open question behind the profile finding that 65% of server CPU is zlib.
 fn data_table_cfg(base: &str, nonlogged: bool) -> String {
-    if nonlogged {
+    let mut cfg = if nonlogged {
         format!("{base},log=(enabled=false)")
     } else {
         base.to_string()
+    };
+    if let Ok(extra) = std::env::var("SECANTUS_DATA_TABLE_EXTRA") {
+        if !extra.is_empty() {
+            cfg.push(',');
+            cfg.push_str(&extra);
+        }
     }
+    cfg
 }
 
 /// Bootstrap-create config for `name`. Everything follows [`data_table_cfg`]

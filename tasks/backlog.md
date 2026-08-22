@@ -5460,18 +5460,66 @@ compress than zlib, at a worse ratio. SecantusDB pays zlib CPU on every page
 reconciliation, on a 4-vCPU box, while mongod pays snappy CPU. That is a strong
 candidate for the bulk of the 3.7x throughput gap *and* the tail.
 
-- [ ] **Build WiredTiger with snappy / lz4 / zstd and sweep the block
-  compressor.** Today `CMakeLists.txt` enables only
-  `HAVE_BUILTIN_EXTENSION_ZLIB`, so this is a build-flag change (add
-  `HAVE_BUILTIN_EXTENSION_SNAPPY` / `_LZ4` / `_ZSTD`) before the compressor can
-  even be selected at runtime. Then sweep `block_compressor` per table —
-  documents, oplog and index tables independently, since they have different
-  ratios and different read/write mixes. Measure throughput AND p99.9: the
-  whole point is that zlib wins on ratio and loses on CPU, and the current
-  configuration only ever measured the ratio side.
-  Expect this to be the largest single lever available, and note it interacts
-  with the uncompressed-WAL finding above — a cheap compressor may make WAL
-  compression affordable too.
+### DONE — and it is the largest lever measured in this project
+
+Built WiredTiger with the snappy / lz4 / zstd builtin extensions
+(`-DSECANTUS_WT_EXTRA_COMPRESSORS=ON`, plus
+`SECANTUS_WT_EXTRA_COMPRESSORS=1` / `SECANTUS_WT_EXTRA_LIBDIR` for the Rust
+link step — both opt-in, the default build is untouched) and swept
+`block_compressor` on the document *and* oplog tables via the existing
+`SECANTUS_OPLOG_TABLE_EXTRA` hook plus a new `SECANTUS_DATA_TABLE_EXTRA` one.
+8 writers, 1G cache, 8 KiB documents, 45s:
+
+**Incompressible payload** (`--payload random`):
+
+| compressor | ops/s | vs zlib | p50 ms | p99.9 ms | vs zlib | disk |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| zlib (today) | 19,752 | — | 0.16 | 105.98 | — | 19.7 GB |
+| snappy | 36,087 | **+83%** | 0.20 | 3.60 | **-97%** | 46.7 GB |
+| **lz4** | **36,709** | **+86%** | 0.20 | **3.47** | **-97%** | 37.8 GB |
+| zstd | 34,169 | +73% | 0.20 | 7.90 | -93% | 32.9 GB |
+
+**Compressible payload** (`--payload repeat`, zlib's best case):
+
+| compressor | ops/s | vs zlib | p99.9 ms | vs zlib | disk |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| zlib (today) | 36,830 | — | 8.38 | — | 28.6 GB |
+| snappy | 42,064 | +14% | 1.11 | -87% | 33.1 GB |
+| **lz4** | **42,255** | **+15%** | **1.05** | **-88%** | 32.7 GB |
+| zstd | 41,146 | +12% | 2.19 | -74% | 31.8 GB |
+
+**lz4 wins on both axes in both regimes.** Nearly double the throughput and a
+30x better tail on incompressible data; +15% and -88% even where zlib's ratio
+should shine. The cost is disk: 1.9x on incompressible content, but only 1.14x
+on compressible — and zstd is the middle option (+73%/+12% throughput, 1.67x /
+1.11x disk) if disk matters more than the last of the tail.
+
+This closes the loop on the whole investigation. It is why 65% of server CPU
+was `deflate`, why the tail was CPU-bound, why more cache helped (fewer
+evictions to compress), why eviction tuning did not (the work is CPU), and it
+is a large part of why mongod — which defaults to snappy — was 3.7x faster with
+a 72x better tail.
+
+It also revises Finding 13. "Never turn oplog compression off — throughput
+craters to 19%" is correct and still stands: uncompressed pages mean more
+eviction IO. But that measured **zlib versus none**, and concluded compression
+was load-bearing. The real axis is **which** compressor: zlib is the wrong
+point on the CPU/IO curve for this engine on small-core machines.
+
+- [ ] **Decide and ship a compressor change.** The measurement is unambiguous;
+  what remains is a dependency and compatibility decision, not a performance
+  question: (a) lz4/snappy/zstd become build-time dependencies on every
+  platform the wheels target (they are already ubiquitous — manylinux, musl,
+  macOS SDK and Windows all have options, but it needs checking per target);
+  (b) `block_compressor` is **create-time sticky**, so existing stores keep
+  zlib and only new tables get the new default — a mixed store must keep the
+  zlib extension linked to stay readable; (c) pick the default per table, since
+  documents and oplog have different read/write mixes, and consider exposing
+  `--block-compressor` so a disk-constrained deployment can choose zlib.
+- [ ] Re-run the three-droplet MongoDB comparison after the change. The
+  published 0.27x throughput / 72x p99.9 figures were measured with zlib; if
+  the sweep holds on Linux they should move substantially, and
+  `docs/benchmark.md` needs updating with them.
 
 ## RETRACTED: the "42x dirty cache bytes" comparison was a counter artifact (2026-08-21)
 
