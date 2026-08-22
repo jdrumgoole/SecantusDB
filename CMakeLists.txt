@@ -194,14 +194,14 @@ if(WIN32)
     set(WT_ZLIB_ARG "")
 elseif(SECANTUS_WT_EXTRA_COMPRESSORS)
     set(WT_ZLIB_ARG
-        -DHAVE_BUILTIN_EXTENSION_ZLIB=ON
-        -DHAVE_BUILTIN_EXTENSION_LZ4=ON
-        -DHAVE_BUILTIN_EXTENSION_SNAPPY=ON
-        -DHAVE_BUILTIN_EXTENSION_ZSTD=ON)
+        -DENABLE_ZLIB=OFF -DHAVE_BUILTIN_EXTENSION_ZLIB=ON
+        -DENABLE_LZ4=OFF -DHAVE_BUILTIN_EXTENSION_LZ4=ON
+        -DENABLE_SNAPPY=OFF -DHAVE_BUILTIN_EXTENSION_SNAPPY=ON
+        -DENABLE_ZSTD=OFF -DHAVE_BUILTIN_EXTENSION_ZSTD=ON)
 else()
     set(WT_ZLIB_ARG
-        -DHAVE_BUILTIN_EXTENSION_ZLIB=ON
-        -DHAVE_BUILTIN_EXTENSION_LZ4=ON)
+        -DENABLE_ZLIB=OFF -DHAVE_BUILTIN_EXTENSION_ZLIB=ON
+        -DENABLE_LZ4=OFF -DHAVE_BUILTIN_EXTENSION_LZ4=ON)
 endif()
 
 ExternalProject_Add(wiredtiger_ext
@@ -253,8 +253,15 @@ ExternalProject_Add(wiredtiger_ext
         # images (self-contained), but not by default on Windows. Cuts the
         # per-doc disk-write volume that bounds steady-state write throughput;
         # mongod defaults to snappy, a follow-up can bundle that for the CPU win.
-        # (builtin-only — WT rejects ENABLE_ZLIB + HAVE_BUILTIN_EXTENSION_ZLIB
-        # together; the builtin flag both finds libz and statically links it.)
+        # (builtin-only — WT rejects ENABLE_<lib> + HAVE_BUILTIN_EXTENSION_<lib>
+        # together; the builtin flag both finds the library and statically links
+        # it. The paired `-DENABLE_<lib>=OFF` is deliberate belt-and-braces:
+        # WT only defaults ENABLE_LZ4 off when the builtin flag is already set,
+        # so a build directory configured BEFORE the builtin flag was added —
+        # where liblz4 was present and auto-detected — carries ENABLE_LZ4=ON in
+        # its CMake cache and the next configure dies on the conflict. Passing
+        # it explicitly makes a stale cache harmless; fresh CI containers never
+        # saw it, a developer's incremental tree does.)
         ${WT_ZLIB_ARG}
         # Belt-and-braces with BUILD_COMMAND below; ENABLE_CPPSUITE=OFF
         # also short-circuits the configure-time SWIG/Catch2 lookups.
