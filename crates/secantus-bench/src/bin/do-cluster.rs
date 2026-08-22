@@ -64,6 +64,8 @@ COMMANDS
   deploy        Install the server binary and build/distribute the load agent.
   run           Run the timed benchmark and collect the results.
   all           up -> deploy (only what's missing) -> run -> suspend.
+  perf          Per-operation latency + concurrent-writer scaling, on the server
+                droplet. Refreshes bench/results/{latency,concurrency}.json.
   suspend       Tear the cluster down (see --mode). Default: destroy.
   destroy       Alias for `suspend --mode destroy`.
   status        What exists, its power state, and the live hourly cost.
@@ -86,6 +88,13 @@ DEPLOY (deploy, all)
   --server-version TAG Release tag for `release`           [latest secantusdb-v*]
   --server-ref REF     Pushed git ref for `source`         [HEAD]
   --agent-ref REF      Pushed git ref the load agent builds from     [HEAD]
+
+PERF (perf)
+  --perf-n N           Documents per latency workload             [10000]
+  --perf-reps N        Reps to median over per workload           [5]
+  --perf-writers LIST  Writer counts for the scaling sweep        [1,2,4,8]
+  --server-ref REF     Pushed git ref to build and measure        [HEAD]
+  (--duration and --repeat set the sweep's seconds-per-point and interleaved runs)
 
 ENGINES (deploy, run, all)
   --engine WHICH       both (default) | secantus | mongod | a comma list.
@@ -176,6 +185,9 @@ fn build_opts(args: &Args) -> BenchResult<Opts> {
         purge_snapshots: args.has("--purge-snapshots"),
         deploy: args.str_or("--deploy", "auto"),
         suspend_after: !args.has("--no-suspend"),
+        perf_n: args.usize_or("--perf-n", 10_000)?,
+        perf_reps: args.usize_or("--perf-reps", 5)?.max(1),
+        perf_writers: args.str_or("--perf-writers", "1,2,4,8"),
     })
 }
 
@@ -212,6 +224,7 @@ fn dispatch(command: &str, args: &Args) -> BenchResult<()> {
             ops::cmd_run(&api, &opts, &nodes).map(|_| ())
         }
         "all" => ops::cmd_all(&api, &mut opts),
+        "perf" => ops::cmd_perf(&api, &mut opts),
         "suspend" => ops::cmd_suspend(&api, &opts),
         "destroy" => {
             opts.mode = args.str_or("--mode", "destroy");
@@ -257,7 +270,10 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             // Only worth saying for commands that can leave droplets behind —
             // and never for a failure that happened before the API was reached.
-            let provisions = matches!(command.as_str(), "up" | "resume" | "deploy" | "run" | "all");
+            let provisions = matches!(
+                command.as_str(),
+                "up" | "resume" | "deploy" | "run" | "all" | "perf"
+            );
             if provisions && !e.starts_with("No DigitalOcean API token") {
                 eprintln!(
                     "\nIf droplets were created before this failed they are still allocated and \

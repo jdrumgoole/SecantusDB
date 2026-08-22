@@ -32,6 +32,8 @@ Ctrl-C aborts cleanly between reps.
 from __future__ import annotations
 
 import argparse
+import json
+import platform
 import shutil
 import signal
 import socket
@@ -42,6 +44,7 @@ import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -330,6 +333,57 @@ def _median_run(make_client: Any, n: int, reps: int) -> dict[str, float]:
     return {k: statistics.median(v) for k, v in samples.items()}
 
 
+# Display labels for each workload key, matching what the chart generator and
+# the published tables expect. Kept next to WORKLOADS so the two can't drift.
+JSON_LABELS = {
+    "insert": "insert (10k docs)",
+    "find_indexed_range": "find indexed range",
+    "find_all": "find full scan",
+    "find_filtered_scan": "find filtered scan",
+    "update_many_half": "update_many (half)",
+    "aggregate_group": "aggregate $group",
+    "aggregate_multistage": "aggregate multi-stage",
+    "delete_many_half": "delete_many (half)",
+    "change_stream_drain": "change-stream drain",
+}
+
+
+def _write_json(
+    path: Path,
+    mongod: dict[str, float],
+    rust: dict[str, float],
+    py: dict[str, float],
+    args: argparse.Namespace,
+) -> None:
+    """Write results in the ``bench/results/latency.json`` schema.
+
+    That file feeds ``bench.latency_chart``, which rewrites the published
+    table and SVG in ``docs/benchmark.md`` and the website's
+    ``performance.html``. Emitting it directly removes a hand-transcription
+    step that was previously the only way to get from this harness to the
+    published numbers -- and hand-copying 27 figures is exactly the kind of
+    step that silently publishes a typo.
+    """
+    payload = {
+        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "host": f"{platform.system()} {platform.machine()}",
+        "source": f"bench.compare_servers --n {args.n} --reps {args.reps}",
+        "workloads": [
+            {
+                "key": k,
+                "label": JSON_LABELS[k],
+                "md_label": JSON_LABELS[k],
+                "mongod_ms": round(mongod[k] * 1000, 2),
+                "rust_ms": round(rust[k] * 1000, 2),
+                "py_ms": round(py[k] * 1000, 2),
+            }
+            for k in WORKLOADS
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
     parser = argparse.ArgumentParser(
@@ -345,6 +399,11 @@ def main(argv: list[str] | None = None) -> int:
         "--mongo-uri", default="", help="existing mongod URI (default: spawn a throwaway mongod)"
     )
     parser.add_argument("--no-mongod", action="store_true", help="skip the mongod comparison")
+    parser.add_argument(
+        "--json",
+        default="",
+        help="also write results to this path in bench/results/latency.json schema",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -412,6 +471,13 @@ def main(argv: list[str] | None = None) -> int:
         for k in WORKLOADS:
             r, p = rust[k] * 1000, py[k] * 1000
             print(f"{k:<22}{r:>19.2f}{p:>16.2f}{(p / r if r else float('nan')):>9.1f}x")
+
+    if args.json:
+        if mongod is None:
+            print("--json needs the mongod column; nothing written.", file=sys.stderr)
+            return 2
+        _write_json(Path(args.json), mongod, rust, py, args)
+        print(f"\nwrote {args.json}")
     return 0
 
 

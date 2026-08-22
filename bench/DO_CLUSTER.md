@@ -31,6 +31,7 @@ It is written in Rust and lives in `crates/secantus-bench`, as two binaries:
 - [The workload](#the-workload)
 - [Comparing against MongoDB](#comparing-against-mongodb)
 - [Reading the report](#reading-the-report)
+- [Per-operation latency and writer scaling](#per-operation-latency-and-writer-scaling-perf)
 - [At release time](#at-release-time)
 - [Cost and teardown](#cost-and-teardown)
 - [Benchmarking unreleased code](#benchmarking-unreleased-code)
@@ -188,6 +189,13 @@ probes the droplets and skips deployment when the binaries are already there,
 so a snapshot-restored cluster goes straight to measuring. Teardown runs even
 if the benchmark fails — a failed run that leaves three droplets billing is a
 worse outcome than the failure.
+
+### `perf`
+
+Measures per-operation latency and concurrent-writer scaling on the server
+droplet, refreshing `bench/results/latency.json` and
+`bench/results/concurrency.json`. Uses only the server droplet. See
+[Per-operation latency and writer scaling](#per-operation-latency-and-writer-scaling-perf).
 
 ### `suspend` / `destroy`
 
@@ -522,6 +530,49 @@ headline misleading is detected and printed under the table:
 | *not every client reported* | The aggregate is partial | Check that client's stderr in the run output |
 
 ---
+
+## Per-operation latency and writer scaling (`perf`)
+
+`do-cluster perf` (or `invoke do-perf`) measures the *other* two published
+benchmarks on droplet hardware: per-operation latency (`bench.compare_servers`)
+and concurrent-writer scaling (`bench.concurrency`).
+
+```bash
+invoke do-perf                       # ~1 hour, ~$0.40, droplet destroyed after
+invoke do-perf --keep                # leave it running to iterate
+invoke do-perf --count 50000 --writers 1,2,4,8,16
+```
+
+Unlike the throughput benchmark, this uses **only the server droplet**. Both
+harnesses spawn all three engines themselves and drive them over loopback —
+that is what makes them per-operation *engine* measurements rather than network
+measurements — so a client droplet would contribute nothing but a NIC.
+
+It writes `bench/results/latency.json` and `bench/results/concurrency.json`,
+the two files the chart generators read:
+
+```bash
+uv run --no-sync python -m bench.latency_chart
+uv run --no-sync python -m bench.concurrency_chart --results bench/results/concurrency.json
+```
+
+Both rewrite marker-delimited blocks in `docs/benchmark.md`,
+`docs/concurrency.md` and the website's `performance.html`. The prose around
+each chart is hand-maintained — the generators print the fresh headline ranges
+so you can check the sentences against them.
+
+### Why not just run these locally?
+
+Because a developer machine cannot be trusted for them, and the failure is
+silent. A run taken immediately after a parallel `cargo`/`cmake` build recorded
+*mongod itself* at 2.5x its own baseline (insert 66.7 ms → 185.4 ms); since the
+workloads run sequentially while load decays, the ratios were skewed too,
+showing a fabricated 0.3x on `find_indexed_range`. Nothing in the output
+indicated a problem — the table looked entirely normal.
+
+**`mongod` is the control.** It is measured in the same run and does not change
+between releases, so compare it against the previous `latency.json` before
+believing anything. If mongod moved, the machine moved.
 
 ## At release time
 

@@ -20,7 +20,7 @@ use crate::report::{
 };
 use crate::timefmt::{iso8601, now_epoch_secs, run_id};
 use crate::BenchResult;
-use crate::{ALL_ROLES, CLIENT_ROLES, GITHUB_REPO, REMOTE_DIR, SERVER_BIN};
+use crate::{ALL_ROLES, CLIENT_ROLES, GITHUB_REPO, PERF_DIR, REMOTE_DIR, SERVER_BIN};
 use crate::{SERVER_PORT, SERVER_ROLE};
 
 /// Everything the subcommands read, assembled from the CLI by the binary.
@@ -53,6 +53,12 @@ pub struct Opts {
     pub purge_snapshots: bool,
     pub deploy: String,
     pub suspend_after: bool,
+    /// Documents per workload for `bench.compare_servers` (its `--n`).
+    pub perf_n: usize,
+    /// Reps to median over for `bench.compare_servers` (its `--reps`).
+    pub perf_reps: usize,
+    /// Writer counts for `bench.concurrency` (its `--writers`).
+    pub perf_writers: String,
 }
 
 pub fn results_root() -> PathBuf {
@@ -170,6 +176,84 @@ apt-get install -y -qq mongodb-org >/dev/null
 systemctl stop mongod 2>/dev/null || true
 systemctl disable mongod 2>/dev/null || true
 mongod --version | head -1
+"#;
+
+/// Provision the server droplet to run the *Python* benchmark harnesses.
+///
+/// `docs/benchmark.md` and the website's performance page publish two figures
+/// that this harness could not previously produce: per-operation latency
+/// (`bench.compare_servers`) and concurrent-writer scaling
+/// (`bench.concurrency`). Both were measured on a developer laptop, where a
+/// Spotlight indexer or a parallel build silently moves every number -- one
+/// such run made *mongod itself* 2.5x slower than its own baseline. A quiet,
+/// dedicated droplet is the only place these are worth measuring.
+///
+/// Both harnesses drive all three engines over loopback on ONE machine, which
+/// is what makes them per-operation engine measurements rather than network
+/// measurements. So this runs entirely on the server droplet; the client
+/// droplets are not involved.
+const PERF_PROVISION: &str = r#"
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq build-essential cmake ninja-build swig clang libclang-dev llvm-dev \
+  python3-dev git pkg-config >/dev/null
+if ! command -v cargo >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+fi
+. "$HOME/.cargo/env"
+if ! command -v uv >/dev/null 2>&1; then
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+fi
+export PATH="$HOME/.local/bin:$PATH"
+mkdir -p "$REMOTE_DIR"
+rm -rf "$PERF_DIR"
+git clone --quiet "https://github.com/$REPO.git" "$PERF_DIR"
+cd "$PERF_DIR"
+git checkout --quiet "$PERF_REF"
+git submodule update --init --depth 1 vendor/wiredtiger
+# One build produces both halves the harnesses need: the `secantus` Python
+# package and the `_secantus_server` extension (the embedded Rust server).
+SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON uv build --wheel --out-dir dist-perf
+uv venv --python 3.12 .venv-perf
+VIRTUAL_ENV="$PERF_DIR/.venv-perf" uv pip install --quiet "$(ls dist-perf/*.whl | head -1)" pymongo
+# `bench.concurrency` drives the standalone binary, not the embedded handle.
+wt=$(ls -d "$PWD"/build/*/wt-build 2>/dev/null | head -1)
+if [ -z "$wt" ] || [ ! -f "$wt/include/wiredtiger.h" ]; then
+  echo "vendored WiredTiger not found under build/*/wt-build" >&2
+  exit 1
+fi
+export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
+cargo build --release --locked --manifest-path crates/secantusdb/Cargo.toml
+bin=$(find crates/secantusdb/target -maxdepth 3 -type f -name secantusd-rs | head -1)
+install -m 0755 "$bin" /usr/local/bin/secantusd-rs
+"$PERF_DIR/.venv-perf/bin/python" -c "import _secantus_server as s; print('embedded server', s.__version__)"
+echo "perf environment ready at $PERF_REF"
+"#;
+
+/// Run both Python harnesses on the server droplet and leave machine-readable
+/// results next to each other.
+///
+/// The systemd units this harness installs for the throughput benchmark bind
+/// the same ports these harnesses want, so they are stopped first -- and a
+/// running `secantusd-rs` or `mongod` would also be competing for CPU, which
+/// is precisely the contamination the droplet exists to avoid.
+const PERF_RUN: &str = r#"
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+cd "$PERF_DIR"
+systemctl stop secantusd-rs 2>/dev/null || true
+systemctl stop mongod 2>/dev/null || true
+sleep 2
+mkdir -p bench/results
+PY="$PERF_DIR/.venv-perf/bin/python"
+echo "=== per-operation latency ==="
+"$PY" -m bench.compare_servers --n "$PERF_N" --reps "$PERF_REPS" \
+  --json bench/results/latency.json
+echo "=== concurrent-writer scaling ==="
+"$PY" -m bench.concurrency --server all --duration "$PERF_DURATION" \
+  --writers "$PERF_WRITERS" --runs "$PERF_RUNS" --json bench/results/concurrency.json
+echo "perf run complete"
 "#;
 
 const UNIT_TEMPLATE: &str = r#"[Unit]
@@ -906,6 +990,97 @@ fn engine_version(cfg: &Config, server_ip: &str, engine: Engine) -> String {
 }
 
 // -- suspend / status / ssh -------------------------------------------------
+
+/// Measure per-operation latency and concurrent-writer scaling on the server
+/// droplet, then pull both results files back into `bench/results/`.
+///
+/// This is the droplet counterpart of `invoke compare-servers` +
+/// `invoke concurrency-refresh`. Those two run on whatever machine the
+/// developer happens to be sitting at, which is where the published numbers
+/// have historically gone wrong: a background build or an OS indexer moves
+/// every column at once, and nothing in the output says so. Here the machine
+/// is dedicated and idle, and `mongod` -- measured in the same run -- is the
+/// control that proves it.
+///
+/// Only the server droplet is used. Both harnesses spawn all three engines
+/// themselves and talk to them over loopback, so a client droplet would add
+/// nothing but a NIC.
+pub fn cmd_perf(api: &Api, opts: &mut Opts) -> BenchResult<()> {
+    let nodes = cmd_up(api, opts)?;
+    let cfg = &opts.cfg;
+    let server = node_for(&nodes, SERVER_ROLE).ok_or("missing server droplet — run `up` first.")?;
+    let server_ip = server.public();
+
+    let perf_ref = if opts.server_ref.is_empty() {
+        git_head()?
+    } else {
+        opts.server_ref.clone()
+    };
+    assert_pushed(&perf_ref)?;
+
+    println!("provisioning the perf environment at {perf_ref} (this takes 15-25 minutes) ...");
+    remote_script(
+        &cfg.ssh_key,
+        &server_ip,
+        PERF_PROVISION,
+        &[
+            ("REMOTE_DIR", REMOTE_DIR.to_string()),
+            ("PERF_DIR", PERF_DIR.to_string()),
+            ("PERF_REF", perf_ref.clone()),
+            ("REPO", GITHUB_REPO.to_string()),
+        ],
+        true,
+    )?;
+
+    println!("installing mongod (the control for both harnesses) ...");
+    remote_script(
+        &cfg.ssh_key,
+        &server_ip,
+        INSTALL_MONGOD,
+        &[("MONGOD_VERSION", opts.mongod_version.clone())],
+        true,
+    )?;
+
+    println!("running both harnesses (this takes 30-40 minutes) ...");
+    remote_script(
+        &cfg.ssh_key,
+        &server_ip,
+        PERF_RUN,
+        &[
+            ("PERF_DIR", PERF_DIR.to_string()),
+            ("PERF_N", opts.perf_n.to_string()),
+            ("PERF_REPS", opts.perf_reps.to_string()),
+            ("PERF_DURATION", opts.duration.to_string()),
+            ("PERF_WRITERS", opts.perf_writers.clone()),
+            ("PERF_RUNS", opts.repeat.to_string()),
+        ],
+        true,
+    )?;
+
+    // Land them where the chart generators already look, so the follow-up is
+    // just `python -m bench.latency_chart` / `bench.concurrency_chart`.
+    let local_results = remote::repo_root().join("bench/results");
+    std::fs::create_dir_all(&local_results)
+        .map_err(|e| format!("could not create {}: {e}", local_results.display()))?;
+    for name in ["latency.json", "concurrency.json"] {
+        let remote_path = format!("{PERF_DIR}/bench/results/{name}");
+        let local_path = local_results.join(name);
+        remote::scp_from(&cfg.ssh_key, &server_ip, &remote_path, &local_path)?;
+        println!("  fetched {} -> {}", name, local_path.display());
+    }
+
+    println!(
+        "\nresults written. Regenerate the published charts with:\n  \
+         uv run --no-sync python -m bench.latency_chart\n  \
+         uv run --no-sync python -m bench.concurrency_chart --results bench/results/concurrency.json\n\
+         then review the hand-maintained prose around each chart."
+    );
+
+    if opts.suspend_after {
+        cmd_suspend(api, opts)?;
+    }
+    Ok(())
+}
 
 pub fn power_off(api: &Api, node: &Node) -> BenchResult<()> {
     if node.status() == "off" {

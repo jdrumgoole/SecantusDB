@@ -36,6 +36,11 @@ pub const ALL_ROLES: [&str; 3] = ["server", "client-1", "client-2"];
 
 pub const SERVER_PORT: u16 = 27017;
 pub const REMOTE_DIR: &str = "/opt/secantus-bench";
+
+/// Where `cmd_perf` checks out and builds the repo on the server droplet.
+/// Kept separate from [`REMOTE_DIR`]'s own `src/` checkout so a perf run and a
+/// throughput run can share a droplet without clobbering each other's build.
+pub const PERF_DIR: &str = "/opt/secantus-perf";
 pub const SERVER_BIN: &str = "/usr/local/bin/secantusd-rs";
 pub const SERVER_DATA: &str = "/var/lib/secantus-bench";
 pub const SERVICE: &str = "secantus-bench";
