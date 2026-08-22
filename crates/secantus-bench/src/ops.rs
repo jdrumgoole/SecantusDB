@@ -93,8 +93,11 @@ const DEPLOY_SERVER_SOURCE: &str = r#"
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
+# liblz4-dev is required: lz4 is the default block compressor, so the
+# vendored WiredTiger build sets HAVE_BUILTIN_EXTENSION_LZ4 and fails
+# configure without it.
 apt-get install -y -qq build-essential cmake ninja-build swig clang libclang-dev llvm-dev \
-  python3-dev git pkg-config >/dev/null
+  python3-dev git pkg-config liblz4-dev >/dev/null
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 fi
@@ -196,8 +199,11 @@ const PERF_PROVISION: &str = r#"
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
+# liblz4-dev is required: lz4 is the default block compressor, so the
+# vendored WiredTiger build sets HAVE_BUILTIN_EXTENSION_LZ4 and fails
+# configure without it.
 apt-get install -y -qq build-essential cmake ninja-build swig clang libclang-dev llvm-dev \
-  python3-dev git pkg-config >/dev/null
+  python3-dev git pkg-config liblz4-dev >/dev/null
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 fi
