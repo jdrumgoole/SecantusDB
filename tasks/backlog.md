@@ -6877,8 +6877,15 @@ distinct problems, triaged from the run logs:
   So it needs the *rest of the suite* running concurrently — ~12 worker
   processes each holding a WiredTiger cache. Ruled out: machine load (fails on
   a quiet box, load 1.79), disk space (615 GB free), accumulated pytest temp
-  (cleared, still fails), and my branch (fails identically on bare
+  (cleared, still fails), and any particular branch (fails identically on bare
   `origin/main`).
+
+  **It is macOS-specific.** PR #1020's CI ran the full suite on
+  ubuntu-latest across all four shards and every Python version, green —
+  while the same commit fails locally on darwin. That matches the macOS-only
+  character of several entries in this family and narrows the suspect list to
+  platform-specific behaviour (fd limits, APFS, or the macOS WT build) rather
+  than the restore logic itself.
 
   **Prime suspect: an unbounded retry under cache-pressure `WT_ROLLBACK`,** the
   same shape as the chunked-drop/rename entry above — restore replays the
