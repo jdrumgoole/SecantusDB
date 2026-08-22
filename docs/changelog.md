@@ -17,6 +17,8 @@ Versioning](https://semver.org/spec/v2.0.0.html), but while we're in
 beta the patch number `bN` rolls forward on every PyPI-visible push;
 the API surface itself is shaped by Semantic Versioning intent.
 
+## [Unreleased]
+
 ## [0.6.0b13] — 2026-08-22
 
 ### Writes got a lot faster, and we built the rig that proved it
