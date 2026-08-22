@@ -5506,16 +5506,25 @@ eviction IO. But that measured **zlib versus none**, and concluded compression
 was load-bearing. The real axis is **which** compressor: zlib is the wrong
 point on the CPU/IO curve for this engine on small-core machines.
 
-- [ ] **Decide and ship a compressor change.** The measurement is unambiguous;
-  what remains is a dependency and compatibility decision, not a performance
-  question: (a) lz4/snappy/zstd become build-time dependencies on every
-  platform the wheels target (they are already ubiquitous — manylinux, musl,
-  macOS SDK and Windows all have options, but it needs checking per target);
-  (b) `block_compressor` is **create-time sticky**, so existing stores keep
-  zlib and only new tables get the new default — a mixed store must keep the
-  zlib extension linked to stay readable; (c) pick the default per table, since
-  documents and oplog have different read/write mixes, and consider exposing
-  `--block-compressor` so a disk-constrained deployment can choose zlib.
+- [x] ~~**Decide and ship a compressor change**~~ — **SHIPPED: lz4 is the
+  default** (2026-08-22). The document and oplog table configs now name
+  `block_compressor=lz4`; WiredTiger builds lz4 alongside zlib by default
+  (snappy/zstd stay behind `SECANTUS_WT_EXTRA_COMPRESSORS`), `liblz4-dev` /
+  `brew lz4` / `lz4-devel` / `lz4-dev` were added to every wheel and CI build
+  step that compiles WiredTiger, and `secantus-wt/build.rs` links lz4 and
+  auto-detects Homebrew's lib directory on macOS (Apple ships no liblz4, and
+  it is not on the default linker path).
+  **zlib remains linked deliberately** and must stay so: `block_compressor` is
+  recorded per table at create time, so a store written before this switch has
+  zlib tables. Verified end to end — a store created by the old binary was
+  opened by the new one, 201,982 documents read back with zero errors, and new
+  writes added an lz4 table alongside the 11 zlib ones. A unit test
+  (`zlib_must_remain_available_for_legacy_tables`) records why the extension
+  cannot be dropped as a cleanup.
+- [ ] **Consider exposing `--block-compressor`** so a disk-constrained
+  deployment can opt back to zlib (1.9x less disk on incompressible content),
+  and consider a per-table default — documents and oplog have different
+  read/write mixes and the sweep measured them together.
 - [ ] Re-run the three-droplet MongoDB comparison after the change. The
   published 0.27x throughput / 72x p99.9 figures were measured with zlib; if
   the sweep holds on Linux they should move substantially, and

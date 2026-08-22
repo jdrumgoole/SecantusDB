@@ -31,13 +31,30 @@ mean more eviction I/O. But that compared zlib against *none*. The real axis is
 *which* compressor, and zlib sits at the wrong point on the CPU/IO curve for
 this engine.
 
-No default is changed here — which compressor to ship is a dependency and
-on-disk-compatibility decision (`block_compressor` is create-time sticky), and
-it is scoped in `tasks/backlog.md`.
+**lz4 is now the default.** New document and oplog tables are created with it;
+snappy and zstd measured close enough that they stay behind an opt-in build
+flag rather than becoming two more link dependencies.
+
+Existing data is safe. `block_compressor` is recorded per table at create time,
+so a store written before this change has zlib tables — and zlib therefore
+stays linked, deliberately and permanently. Verified end to end: a store
+created by the previous release was opened by the new build, 201,982 documents
+read back with zero errors, and subsequent writes added an lz4 table alongside
+the existing zlib ones. A unit test records why the zlib extension must not be
+removed as a tidy-up.
+
+The trade is disk: expect roughly 1.9x the footprint on incompressible content
+and 1.14x on compressible. A `--block-compressor` flag for deployments that
+would rather have the space is tracked in `tasks/backlog.md`.
+
+#### Changed
+
+- **The default block compressor is now lz4** for the document and oplog
+  tables. zlib remains built and linked so existing stores stay readable.
 
 #### Added
 
 - `SECANTUS_WT_EXTRA_COMPRESSORS` CMake option and matching build.rs env hook
-  (with `SECANTUS_WT_EXTRA_LIBDIR`) to build and link snappy / lz4 / zstd.
+  (with `SECANTUS_WT_EXTRA_LIBDIR`) to additionally build snappy and zstd.
 - `SECANTUS_DATA_TABLE_EXTRA`, a create-time config hook for the document
   tables, mirroring the existing `SECANTUS_OPLOG_TABLE_EXTRA`.

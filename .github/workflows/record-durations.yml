@@ -122,7 +122,7 @@ jobs:
         if: runner.os == 'Linux'
         uses: ./.github/actions/apt-install
         with:
-          packages: swig mongodb-mongosh mongodb-database-tools
+          packages: swig liblz4-dev mongodb-mongosh mongodb-database-tools
 
       - name: Install swig (Windows)
         if: runner.os == 'Windows'

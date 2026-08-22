@@ -179,19 +179,29 @@ endif()
 # swapping zlib for lz4 measured +86% throughput and -97% p99.9 on
 # incompressible data, +15% / -88% on compressible. mongod defaults to snappy
 # for exactly this reason.
+# lz4 is the DEFAULT block compressor (see secantus-storage's table configs);
+# zlib is built alongside it and is NOT optional, because `block_compressor` is
+# recorded per table at create time — a store created before the switch has
+# zlib tables that can only be opened while the zlib extension is linked.
+#
+# snappy and zstd stay opt-in: they measured close to lz4 and adding two more
+# link dependencies to every wheel target for no further gain is not worth it.
+# Turn them on to reproduce the sweep in tasks/backlog.md.
 option(SECANTUS_WT_EXTRA_COMPRESSORS
-       "Build WiredTiger with snappy/lz4/zstd block compressors alongside zlib"
+       "Also build the snappy and zstd block compressors (lz4 + zlib always build)"
        OFF)
 if(WIN32)
     set(WT_ZLIB_ARG "")
 elseif(SECANTUS_WT_EXTRA_COMPRESSORS)
     set(WT_ZLIB_ARG
         -DHAVE_BUILTIN_EXTENSION_ZLIB=ON
-        -DHAVE_BUILTIN_EXTENSION_SNAPPY=ON
         -DHAVE_BUILTIN_EXTENSION_LZ4=ON
+        -DHAVE_BUILTIN_EXTENSION_SNAPPY=ON
         -DHAVE_BUILTIN_EXTENSION_ZSTD=ON)
 else()
-    set(WT_ZLIB_ARG -DHAVE_BUILTIN_EXTENSION_ZLIB=ON)
+    set(WT_ZLIB_ARG
+        -DHAVE_BUILTIN_EXTENSION_ZLIB=ON
+        -DHAVE_BUILTIN_EXTENSION_LZ4=ON)
 endif()
 
 ExternalProject_Add(wiredtiger_ext
