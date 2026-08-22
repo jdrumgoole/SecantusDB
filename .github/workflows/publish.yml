@@ -129,6 +129,7 @@ jobs:
           # seconds when already present.
           CIBW_BEFORE_ALL_MACOS: brew install ccache
           CIBW_ENVIRONMENT_MACOS: >-
+            CMAKE_PREFIX_PATH=/usr/local/secantus-lz4
             CMAKE_C_COMPILER_LAUNCHER=ccache
             CMAKE_CXX_COMPILER_LAUNCHER=ccache
             SKBUILD_CMAKE_DEFINE="SECANTUS_BUILD_STORAGE_ENGINE=ON"

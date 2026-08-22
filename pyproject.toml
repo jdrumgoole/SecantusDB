@@ -312,8 +312,15 @@ command -v cargo >/dev/null 2>&1 || (curl --proto '=https' --tlsv1.2 -sSf https:
 # parses WiredTiger's headers into broken bindings (missing WT_CURSOR fields);
 # bindgen auto-discovers Xcode's libclang, which is what the storage-engine CI
 # job uses successfully. `brew install` is idempotent.
+#
+# lz4 is built from source rather than `brew install lz4` (tools/build_lz4_macos.sh).
+# Homebrew builds for the runner's own OS, so its liblz4 carries a minimum
+# target of macOS 14 and `delocate` refuses to bundle it into a wheel targeting
+# macOS 11 — accepting it would mean raising the wheel's floor to 14 and
+# dropping every Apple Silicon user on macOS 11-13. The script builds a STATIC
+# liblz4 at the wheel's own deployment target, so there is no dylib to bundle.
 archs = ["arm64"]
-before-build = "brew install swig lz4 && (command -v cargo >/dev/null 2>&1 || brew install rust)"
+before-build = "brew install swig && (command -v cargo >/dev/null 2>&1 || brew install rust) && bash tools/build_lz4_macos.sh"
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]

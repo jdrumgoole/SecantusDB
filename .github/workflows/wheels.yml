@@ -42,18 +42,28 @@ permissions:
 jobs:
   build_wheels:
     name: Build ${{ matrix.platform }} wheels
+    # dispatch_only entries (macOS) run on manual invocation, never on push.
+    if: ${{ !matrix.dispatch_only || github.event_name == 'workflow_dispatch' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # macOS (macos-14 / arm64) is intentionally absent from this
-          # continuous matrix: the runner queue is scarce and the from-source
-          # WiredTiger build is slow/flaky, so it's too costly to run on every
-          # push. macOS wheels ARE built and validated at release time
-          # (publish.yml's matrix still includes macos-14 / macos-arm64).
+          # macOS (macos-14 / arm64) stays out of the PUSH-triggered matrix:
+          # the runner queue is scarce and the from-source WiredTiger build is
+          # slow, so it's too costly on every push. It IS included on
+          # `workflow_dispatch`, because "validated only at release time" is how
+          # a macOS-only wheel break reaches a release tag: the lz4 compressor
+          # switch passed every pre-release lane and then failed the macOS wheel
+          # in publish.yml, on a `delocate` deployment-target rejection nothing
+          # else could have caught. Run this workflow manually before any change
+          # that touches the wheel build.
           # macos-x86_64 (macos-13) is unsupported regardless — Apple Silicon
           # is the active target.
+          - os: macos-14
+            platform: macos-arm64
+            cibw_archs: arm64
+            dispatch_only: true
           - os: ubuntu-22.04
             platform: linux-x86_64
             cibw_archs: x86_64
@@ -135,6 +145,7 @@ jobs:
             SECANTUS_CARGO_TARGET=/host_ccache/cargo-target
           CIBW_BEFORE_ALL_MACOS: brew install ccache
           CIBW_ENVIRONMENT_MACOS: >-
+            CMAKE_PREFIX_PATH=/usr/local/secantus-lz4
             CMAKE_C_COMPILER_LAUNCHER=ccache
             CMAKE_CXX_COMPILER_LAUNCHER=ccache
             SKBUILD_CMAKE_DEFINE="SECANTUS_BUILD_STORAGE_ENGINE=ON"
