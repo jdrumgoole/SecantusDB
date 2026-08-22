@@ -64,6 +64,8 @@ pub struct CliArgs {
     pub oplog_nonlogged: Option<bool>,
     pub data_nonlogged: Option<bool>,
     pub checkpoint_seconds: Option<u64>,
+    /// Admission control: cap on concurrent engine writes (0 / None = off).
+    pub write_tickets: Option<usize>,
 }
 
 /// TLS options in plain-data form (the lib's [`TlsOptions`] is not `PartialEq`,
@@ -113,6 +115,7 @@ impl CliArgs {
             oplog_nonlogged: cfg.oplog_nonlogged,
             data_nonlogged: cfg.data_nonlogged,
             checkpoint_seconds: cfg.checkpoint_seconds,
+            write_tickets: cfg.write_tickets,
         })
     }
 
@@ -249,6 +252,13 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             }
             "--cache-size" => o.cache_size = Some(take_value("--cache-size")?),
             "--log-file-max" => o.log_file_max = Some(take_value("--log-file-max")?),
+            "--write-tickets" => {
+                let raw = take_value("--write-tickets")?;
+                o.write_tickets = Some(
+                    raw.parse::<usize>()
+                        .map_err(|_| format!("--write-tickets: {raw:?} is not a number"))?,
+                );
+            }
             "--session-max" => {
                 let raw = take_value("--session-max")?;
                 o.session_max = Some(raw.parse::<u32>().map_err(|_| {
@@ -374,6 +384,12 @@ OPTIONS:
                                  load = higher throughput; files are sparse.)
     --session-max N              WiredTiger session_max — concurrent WT session
                                  cap (default: 1000)
+    --write-tickets N            Admission control: cap on writes concurrently
+                                 inside the storage engine; further writers
+                                 queue OUTSIDE it. 0 = unlimited (default).
+                                 Bounds the p99.9 tail under write saturation,
+                                 which unbounded concurrency does not — see
+                                 tasks/backlog.md. Start near the core count.
     --sync-on-commit             Fsync the WT log on every transaction commit
                                  (closes the writeConcern j:true durability gap
                                  at a throughput cost; off by default)

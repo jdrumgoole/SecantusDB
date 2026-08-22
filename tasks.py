@@ -403,12 +403,16 @@ _DO_CLUSTER = (
         "duration": "Timed seconds of load (default: 120).",
         "workers": "Load processes per client droplet (default: 16).",
         "op-mix": "Weighted op mix, e.g. 'insert=100' or 'insert=70,find=20,update=10'.",
+        "repeat": "Measurement passes (default 1); >1 interleaves engines and reports medians.",
+        "payload": "Document payload: repeat (default, compressible) | random (incompressible).",
         "doc-bytes": "Payload bytes per document (default: 8192).",
         "batch-size": "Documents per insert call (default: 1).",
         "region": "DigitalOcean region (default: lon1).",
         "server-size": "Server droplet size (default: c-4, dedicated CPU).",
         "client-size": "Client droplet size (default: c-2).",
         "build": "Server binary: 'release' (published tarball) or 'source' (build on the droplet).",
+        "engine": "Which databases to measure: both (default) | secantus | mongod.",
+        "mongod-version": "MongoDB major version to install for the comparison (default: 8.0).",
         "suspend-mode": "After the run: destroy (default) | snapshot | power-off.",
         "no-suspend": "Leave the droplets running afterwards.",
     },
@@ -418,21 +422,28 @@ def do_bench(
     duration: float = 120.0,
     workers: int = 16,
     op_mix: str = "insert=70,find=20,update=10",
+    repeat: int = 1,
+    payload: str = "repeat",
     doc_bytes: int = 8192,
     batch_size: int = 1,
     region: str = "lon1",
     server_size: str = "c-4",
     client_size: str = "c-2",
     build: str = "release",
+    engine: str = "both",
+    mongod_version: str = "8.0",
     suspend_mode: str = "destroy",
     no_suspend: bool = False,
 ) -> None:
     """Full three-droplet DigitalOcean benchmark: up -> deploy -> run -> suspend.
 
-    Provisions one server droplet running ``secantusd-rs`` and two client
-    droplets driving load at it across a private VPC, so the load generator
-    is not competing with the database for the same cores and the network is
-    a real NIC rather than loopback. Requires ``DIGITALOCEAN_TOKEN``.
+    Provisions one server droplet and two client droplets driving load at it
+    across a private VPC, so the load generator is not competing with the
+    database for the same cores and the network is a real NIC rather than
+    loopback. By default it measures **SecantusDB and a real MongoDB
+    back-to-back on the same droplets** and prints a side-by-side comparison;
+    ``--engine secantus`` or ``--engine mongod`` runs just one. Requires
+    ``DIGITALOCEAN_TOKEN``.
 
     Costs real money for as long as the droplets exist, so the run destroys
     them afterwards by default — a *powered-off* DigitalOcean droplet still
@@ -446,12 +457,16 @@ def do_bench(
         f" --duration {float(duration)}"
         f" --workers {int(workers)}"
         f" --op-mix {shlex.quote(op_mix)}"
+        f" --repeat {int(repeat)}"
+        f" --payload {shlex.quote(payload)}"
         f" --doc-bytes {int(doc_bytes)}"
         f" --batch-size {int(batch_size)}"
         f" --region {shlex.quote(region)}"
         f" --server-size {shlex.quote(server_size)}"
         f" --client-size {shlex.quote(client_size)}"
         f" --server-build {shlex.quote(build)}"
+        f" --engine {shlex.quote(engine)}"
+        f" --mongod-version {shlex.quote(mongod_version)}"
         f" --mode {shlex.quote(suspend_mode)}"
     )
     if no_suspend:
@@ -479,11 +494,22 @@ def do_up(c: Context, region: str = "lon1", fresh: bool = False) -> None:
         "ref": "Git ref for --build source (default: HEAD, which must already be pushed).",
     },
 )
-def do_deploy(c: Context, build: str = "release", version: str = "latest", ref: str = "") -> None:
-    """Install the server binary and the client load agents on the droplets."""
+def do_deploy(
+    c: Context,
+    build: str = "release",
+    version: str = "latest",
+    ref: str = "",
+    engine: str = "both",
+) -> None:
+    """Install the database(s) and the client load agents on the droplets.
+
+    ``--engine both`` (the default) also installs MongoDB Community on the
+    server droplet so the comparison run has something to compare against.
+    """
     cmd = (
         f"{_DO_CLUSTER} deploy"
         f" --server-build {shlex.quote(build)} --server-version {shlex.quote(version)}"
+        f" --engine {shlex.quote(engine)}"
     )
     if ref:
         cmd += f" --server-ref {shlex.quote(ref)}"
@@ -496,6 +522,8 @@ def do_deploy(c: Context, build: str = "release", version: str = "latest", ref: 
         "duration": "Timed seconds of load (default: 120).",
         "workers": "Load processes per client droplet (default: 16).",
         "op-mix": "Weighted op mix (default: insert=70,find=20,update=10).",
+        "engine": "Which databases to measure: both (default) | secantus | mongod.",
+        "repeat": "Measurement passes (default 1); >1 interleaves engines and reports medians.",
         "sync-on-commit": "Start the server with --sync-on-commit (fsync every commit).",
     },
 )
@@ -504,13 +532,21 @@ def do_run(
     duration: float = 120.0,
     workers: int = 16,
     op_mix: str = "insert=70,find=20,update=10",
+    engine: str = "both",
+    repeat: int = 1,
     sync_on_commit: bool = False,
 ) -> None:
-    """Run the timed benchmark against already-deployed droplets."""
+    """Run the timed benchmark against already-deployed droplets.
+
+    With the default ``--engine both`` this measures SecantusDB and MongoDB
+    back-to-back on the same droplets and prints the comparison.
+    """
     cmd = (
         f"{_DO_CLUSTER} run"
         f" --duration {float(duration)} --workers {int(workers)}"
         f" --op-mix {shlex.quote(op_mix)}"
+        f" --engine {shlex.quote(engine)}"
+        f" --repeat {int(repeat)}"
     )
     if sync_on_commit:
         cmd += " --sync-on-commit"

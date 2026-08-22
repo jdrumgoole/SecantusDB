@@ -136,11 +136,11 @@ jobs:
         if: matrix.os == 'linux'
         uses: ./.github/actions/apt-install
         with:
-          packages: swig clang libclang-dev llvm-dev ninja-build
+          packages: swig clang libclang-dev llvm-dev ninja-build liblz4-dev
 
       - name: Install toolchain (macOS)
         if: matrix.os == 'macos'
-        run: brew install swig ninja
+        run: brew install swig ninja lz4
 
       # The three Windows steps below are lifted verbatim from test.yml's
       # `storage-engine` job, which builds this same static WiredTiger + binary

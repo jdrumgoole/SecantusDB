@@ -9,6 +9,7 @@ use secantus_bench::cluster::{
     Config, DEFAULT_CLIENT_SIZE, DEFAULT_IMAGE, DEFAULT_PREFIX, DEFAULT_REGION, DEFAULT_SERVER_SIZE,
 };
 use secantus_bench::doapi::{token_from_env, Api};
+use secantus_bench::engine::Engine;
 use secantus_bench::ops::{self, Opts};
 use secantus_bench::remote::default_ssh_key;
 use secantus_bench::{BenchResult, ALL_ROLES};
@@ -23,7 +24,7 @@ const BOOL_FLAGS: [&str; 7] = [
     "--no-suspend",
 ];
 
-const VALUE_FLAGS: [&str; 22] = [
+const VALUE_FLAGS: [&str; 26] = [
     "--prefix",
     "--region",
     "--server-size",
@@ -35,6 +36,10 @@ const VALUE_FLAGS: [&str; 22] = [
     "--server-version",
     "--server-ref",
     "--agent-ref",
+    "--engine",
+    "--mongod-version",
+    "--repeat",
+    "--payload",
     "--duration",
     "--workers",
     "--op-mix",
@@ -48,7 +53,7 @@ const VALUE_FLAGS: [&str; 22] = [
     "--deploy",
 ];
 
-const USAGE: &str = r#"do-cluster — three-droplet DigitalOcean benchmark for the SecantusDB Rust server
+const USAGE: &str = r#"do-cluster — three-droplet DigitalOcean benchmark: SecantusDB vs MongoDB
 
 USAGE
   do-cluster <command> [options]
@@ -82,11 +87,22 @@ DEPLOY (deploy, all)
   --server-ref REF     Pushed git ref for `source`         [HEAD]
   --agent-ref REF      Pushed git ref the load agent builds from     [HEAD]
 
+ENGINES (deploy, run, all)
+  --engine WHICH       both (default) | secantus | mongod | a comma list.
+                       `both` runs SecantusDB then MongoDB back-to-back on the
+                       same droplets and prints a side-by-side comparison.
+  --mongod-version V   MongoDB major version to install               [8.0]
+
 WORKLOAD (run, all)
   --duration SECS      Timed seconds                       [120]
+  --repeat N           Measurement passes; engines are interleaved within
+                       each pass and the report gives medians + spread   [1]
   --workers N          Load threads per client droplet     [16]
   --op-mix SPEC        e.g. insert=100 or insert=70,find=20,update=10
   --doc-bytes N        Payload bytes per document          [8192]
+  --payload KIND       repeat | random. Both engines compress, so `repeat`
+                       measures the compressor; use `random` whenever
+                       storage volume or cross-engine fairness matters. [repeat]
   --batch-size N       Documents per insert                [1]
   --preload N          Docs preloaded per worker           [10000]
   --cache-size SIZE    WiredTiger cache            [half the droplet's RAM]
@@ -137,6 +153,10 @@ fn build_opts(args: &Args) -> BenchResult<Opts> {
         server_version: args.str_or("--server-version", "latest"),
         server_ref: args.str_or("--server-ref", ""),
         agent_ref: args.str_or("--agent-ref", ""),
+        engines: Engine::parse_list(&args.str_or("--engine", "both"))?,
+        mongod_version: args.str_or("--mongod-version", "8.0"),
+        repeat: args.usize_or("--repeat", 1)?.max(1),
+        payload: args.str_or("--payload", "repeat"),
         duration: args.f64_or("--duration", 120.0)?,
         workers: args.usize_or("--workers", 16)?,
         op_mix: args.str_or("--op-mix", "insert=70,find=20,update=10"),

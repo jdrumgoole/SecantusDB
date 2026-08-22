@@ -43,6 +43,7 @@ use secantus_core::sortkey::{self, COMPOUND_SEP};
 use secantus_core::{get_path, get_path_values};
 use secantus_wt::{Connection, Cursor, Session, WtError};
 
+pub mod admission;
 pub mod changestreams;
 pub mod pitr_archive;
 pub mod replay;
@@ -112,6 +113,10 @@ pub struct StorageOptions {
     /// Stable-checkpoint cadence in seconds for the data-nonlogged mode
     /// (`SECANTUS_CHECKPOINT_SECONDS`, default 60).
     pub checkpoint_seconds: Option<u64>,
+    /// Admission control: cap on writes concurrently inside the storage
+    /// engine. `None` / 0 disables it (the default), preserving today's
+    /// behaviour exactly. See [`crate::admission`] for why this exists.
+    pub write_tickets: Option<usize>,
 }
 
 /// Opaque handle for a multi-document transaction. Owns a **dedicated** WT
@@ -593,13 +598,27 @@ fn data_tables_nonlogged() -> bool {
     std::env::var_os("SECANTUS_DATA_NONLOGGED").is_some()
 }
 
-/// Table-create config for a data table, honouring [`data_tables_nonlogged`].
+/// Table-create config for a data table, honouring [`data_tables_nonlogged`]
+/// and the `SECANTUS_DATA_TABLE_EXTRA` experiment hook.
+///
+/// The hook mirrors `SECANTUS_OPLOG_TABLE_EXTRA`: appended last, and
+/// WiredTiger takes the last occurrence of a duplicated key, so a clause here
+/// overrides the default. Create-time only — existing stores keep their
+/// config. Added to make `block_compressor` sweepable per table, which is the
+/// open question behind the profile finding that 65% of server CPU is zlib.
 fn data_table_cfg(base: &str, nonlogged: bool) -> String {
-    if nonlogged {
+    let mut cfg = if nonlogged {
         format!("{base},log=(enabled=false)")
     } else {
         base.to_string()
+    };
+    if let Ok(extra) = std::env::var("SECANTUS_DATA_TABLE_EXTRA") {
+        if !extra.is_empty() {
+            cfg.push(',');
+            cfg.push_str(&extra);
+        }
     }
+    cfg
 }
 
 /// Bootstrap-create config for `name`. Everything follows [`data_table_cfg`]
@@ -1295,26 +1314,41 @@ pub fn wt_config(
     cfg
 }
 
-// zlib block compression on the value-heavy tables (document blobs live in the
-// doc / oplog / preimage tables) — cuts the per-doc disk-write volume that bounds
-// steady-state write throughput (measured +25% single-writer and ~2× multi-writer
-// scaling on compressible data), mirroring mongod's compress-by-default. The WT
-// build links the builtin zlib extension (HAVE_BUILTIN_EXTENSION_ZLIB) on macOS +
-// Linux, where libz is present; **Windows** WT is built without it (no default
-// libz), so the compressor clause is omitted there — a `block_compressor=zlib`
-// table create would fail with "unknown compressor". Set at create time; existing
-// uncompressed tables keep their format (WT stores it in metadata).
+// Block compression on the value-heavy tables (document blobs live in the doc /
+// oplog / preimage tables) — cuts the per-doc disk-write volume that bounds
+// steady-state write throughput, mirroring mongod's compress-by-default.
+//
+// **lz4, not zlib** (2026-08-22). Compression is a CPU/IO trade and only the IO
+// side had ever been measured. Profiling the daemon under sustained write load
+// put **65% of server CPU inside zlib's `deflate`**, on WiredTiger's
+// page-reconciliation path — which is also why the p99.9 tail was CPU-bound
+// rather than IO-bound. Sweeping the compressor (8 writers, 1G cache, 8 KiB
+// docs) measured lz4 at **+86% throughput and -97% p99.9 on incompressible
+// data, +15% / -88% on compressible** — winning on both axes in both regimes,
+// at 1.9x / 1.14x the disk. mongod defaults to snappy for the same reason;
+// snappy and zstd measured close to lz4 and stay opt-in build flags rather
+// than two more link dependencies. See tasks/backlog.md.
+//
+// **zlib remains linked and must stay that way.** `block_compressor` is
+// recorded per table at create time, so a store created before this switch has
+// zlib tables; dropping the extension would make that data unreadable. Only
+// newly created tables get lz4, and a mixed store is fine.
+//
+// **Windows** WT is built without either compressor (no default libz), so the
+// clause is omitted there — a `block_compressor=` table create would fail with
+// "unknown compressor". Set at create time; existing tables keep their format
+// (WT stores it in metadata).
 // RecordId keying: the doc table is keyed by (db, coll, RecordId:i64) — the
 // monotonic per-collection insertion seq — not by id_key. This puts the table in
 // insertion order (so the `secantus_natural` forward table is dropped) and cuts
 // write amplification 4->3. `secantus_natural_seq` (id_key -> RecordId) is the
 // `_id` index. See tasks/rust-recordid-plan.md.
 #[cfg(not(target_os = "windows"))]
-const DOC_TABLE_CFG: &str = "key_format=SSq,value_format=u,block_compressor=zlib";
+const DOC_TABLE_CFG: &str = "key_format=SSq,value_format=u,block_compressor=lz4";
 #[cfg(target_os = "windows")]
 const DOC_TABLE_CFG: &str = "key_format=SSq,value_format=u";
 #[cfg(not(target_os = "windows"))]
-const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u,block_compressor=zlib";
+const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u,block_compressor=lz4";
 #[cfg(target_os = "windows")]
 const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u";
 
@@ -2334,6 +2368,8 @@ pub struct Storage {
     /// namespace stays stable across drop+recreate so in-flight writers and
     /// DDL always contend on the same mutex. Mirrors `storage._coll_locks`.
     coll_locks: Mutex<CollLocks>,
+    /// Bounds concurrent engine writes. Disabled unless `write_tickets` is set.
+    write_tickets: crate::admission::Tickets,
     /// Namespace-DDL generation: bumped after a committed `drop_collection` /
     /// `drop_database` / `rename_collection` / `drop_index` / `drop_all_indexes`.
     /// Lock-free multi-row readers snapshot it before their scan and re-run the
@@ -3676,6 +3712,7 @@ impl Storage {
             home: home.to_string(),
             lock: Mutex::new(()),
             coll_locks: Mutex::new(HashMap::new()),
+            write_tickets: crate::admission::Tickets::new(opts.write_tickets.unwrap_or(0)),
             ddl_generation: AtomicU64::new(0),
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
             oplog_shards_created,
@@ -5521,6 +5558,21 @@ impl Storage {
         }
     }
 
+    /// Take an admission ticket for the duration of one engine write.
+    ///
+    /// A no-op when admission control is disabled (the default) or when this
+    /// thread is already admitted, so nested writes inside a multi-document
+    /// transaction ride the outer ticket instead of deadlocking against it.
+    #[inline]
+    fn admit_write(&self) -> crate::admission::Ticket<'_> {
+        self.write_tickets.acquire()
+    }
+
+    /// Writes currently admitted, and the cap. Diagnostics / tests.
+    pub fn write_admission(&self) -> (usize, usize) {
+        (self.write_tickets.in_flight(), self.write_tickets.limit())
+    }
+
     /// Open a dedicated WT session for a new multi-document transaction. The WT
     /// `begin_transaction` is deferred to the first `with_user_transaction`.
     pub fn begin_user_transaction(&self) -> Result<UserTransactionHandle> {
@@ -5743,6 +5795,7 @@ impl Storage {
     }
 
     pub fn insert_one(&self, db: &str, coll: &str, doc_bytes: &[u8]) -> Result<Vec<u8>> {
+        let _admit = self.admit_write();
         self.retry_write_conflicts("insert_one", || {
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -5828,6 +5881,7 @@ impl Storage {
         docs: Vec<Vec<u8>>,
         ordered: bool,
     ) -> Result<(usize, Vec<Document>)> {
+        let _admit = self.admit_write();
         // One wire message never runs as ONE statement transaction: its dirty
         // content (doc rows + full-doc oplog entries + index entries, ~2-3x
         // the message bytes) is unevictable until commit, and a 48MB-class
@@ -6178,6 +6232,7 @@ impl Storage {
 
     /// Delete the document with `_id == id`. Returns `false` if absent.
     pub fn delete_by_id(&self, db: &str, coll: &str, id: &Bson) -> Result<bool> {
+        let _admit = self.admit_write();
         self.retry_write_conflicts("delete_by_id", || {
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -9636,6 +9691,7 @@ impl Storage {
         validator: Option<&Document>,
         want_post_image: bool,
     ) -> Result<UpdateOutcome> {
+        let _admit = self.admit_write();
         self.update_matching_leveled(
             db,
             coll,
@@ -9676,6 +9732,7 @@ impl Storage {
         validator_moderate: bool,
         want_post_image: bool,
     ) -> Result<UpdateOutcome> {
+        let _admit = self.admit_write();
         // Operator-/replacement-form update. `is_replacement` (no `$`-prefixed
         // top-level key) drives the oplog shape: a replacement emits the whole
         // doc in `o`, an operator update a `{$v:2, diff}`. Positional operators
@@ -9742,6 +9799,7 @@ impl Storage {
         validator_moderate: bool,
         want_post_image: bool,
     ) -> Result<UpdateOutcome> {
+        let _admit = self.admit_write();
         self.update_matching_core(
             db,
             coll,
@@ -10319,6 +10377,7 @@ impl Storage {
         let_vars: &Document,
         coll_opt: Option<&Collation>,
     ) -> Result<usize> {
+        let _admit = self.admit_write();
         // Unbounded deletes (limit == 0, deleteMany) outside a user
         // transaction run CHUNKED — the matched set's index-entry removals
         // plus pre-images are unbounded dirty content in one transaction
@@ -12184,6 +12243,34 @@ mod tests {
     #[test]
     fn wt_config_matches_default() {
         assert_eq!(wt_config("4G", 1000, false, "128MB"), DEFAULT_CONFIG);
+    }
+
+    /// New tables are created with lz4 — the compressor sweep measured it at
+    /// +86% throughput and -97% p99.9 against zlib (tasks/backlog.md).
+    #[test]
+    fn value_heavy_tables_default_to_lz4() {
+        for cfg in [DOC_TABLE_CFG, QU_COMPRESSED_CFG] {
+            #[cfg(not(target_os = "windows"))]
+            assert!(cfg.contains("block_compressor=lz4"), "{cfg}");
+            #[cfg(target_os = "windows")]
+            assert!(!cfg.contains("block_compressor"), "{cfg}");
+        }
+    }
+
+    /// `block_compressor` is recorded per table at CREATE time, so a store
+    /// written before the lz4 switch has zlib tables and can only be opened
+    /// while the zlib extension is still linked. Dropping zlib from the
+    /// WiredTiger build would make existing user data unreadable — this test
+    /// exists so that stays a deliberate decision rather than a cleanup.
+    #[test]
+    fn zlib_must_remain_available_for_legacy_tables() {
+        let cfg = wt_config("4G", 1000, false, "128MB");
+        // The connection config never names a compressor; availability comes
+        // from the WiredTiger build (HAVE_BUILTIN_EXTENSION_ZLIB in
+        // CMakeLists.txt) and the link libs in secantus-wt/build.rs. Assert the
+        // contract the storage layer depends on: nothing here pins the engine
+        // to a single compressor, so a mixed zlib/lz4 store stays openable.
+        assert!(!cfg.contains("block_compressor"), "{cfg}");
     }
 
     /// `extract_key_format` pulls the format token out of a WT metadata line,

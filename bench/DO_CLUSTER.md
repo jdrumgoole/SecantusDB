@@ -1,9 +1,13 @@
-# Three-droplet DigitalOcean benchmark
+# Three-droplet DigitalOcean benchmark: SecantusDB vs MongoDB
 
 A benchmark harness that provisions **three DigitalOcean droplets** — one
-running the standalone `secantusd-rs` server, two driving load at it over a
-private VPC — runs a coordinated measurement, collects the results, and tears
-the cluster down.
+running a database, two driving load at it over a private VPC — runs a
+coordinated measurement, and tears the cluster down.
+
+It measures **SecantusDB and a real MongoDB server back-to-back on the same
+droplets**, and reports them side by side with a ratio. Same cores, same
+network, same clients, same workload, one after the other: the only variable
+left is the database.
 
 It is written in Rust and lives in `crates/secantus-bench`, as two binaries:
 
@@ -25,6 +29,7 @@ It is written in Rust and lives in `crates/secantus-bench`, as two binaries:
 - [Security model](#security-model)
 - [How a run works](#how-a-run-works)
 - [The workload](#the-workload)
+- [Comparing against MongoDB](#comparing-against-mongodb)
 - [Reading the report](#reading-the-report)
 - [Cost and teardown](#cost-and-teardown)
 - [Benchmarking unreleased code](#benchmarking-unreleased-code)
@@ -229,11 +234,19 @@ same key and `known_hosts` the harness uses.
 | `--server-ref REF` | `HEAD` | Which pushed git ref to build for `--server-build source` |
 | `--agent-ref REF` | `HEAD` | Which pushed git ref the **load agent** is built from |
 
+### Engines (`deploy`, `run`, `all`)
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--engine WHICH` | `both` | `both`, `secantus`, `mongod`, or a comma list |
+| `--mongod-version V` | `8.0` | MongoDB major version to install from MongoDB's apt repo |
+
 ### Workload (`run`, `all`)
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--duration SECS` | `120` | Length of the timed phase |
+| `--repeat N` | `1` | Measurement passes; engines interleave within each pass and the report gives medians plus spread |
 | `--workers N` | `16` | Load threads per client droplet (so 32 across the cluster) |
 | `--op-mix SPEC` | `insert=70,find=20,update=10` | Weighted operation mix |
 | `--doc-bytes N` | `8192` | Payload bytes per document |
@@ -246,6 +259,7 @@ same key and `known_hosts` the harness uses.
 | `--keep-data` | off | Do not wipe the server's data directory before the run |
 | `--start-delay SECS` | `20` | Lead time before the shared start barrier |
 | `--keep-server-running` | off | Leave the server up after the run, for manual poking |
+| `--slow-ms MS` | off | Record every operation at or above MS **with its timestamp**, for tail diagnosis |
 
 ### Teardown (`suspend`, `destroy`, `all`)
 
@@ -377,6 +391,101 @@ under 1% bucket error) rather than a sample array. Histograms merge by adding
 counts, which is what lets one report combine every worker across both
 droplets into a single set of percentiles.
 
+### Diagnosing a tail
+
+A histogram deliberately throws time away, which is the one thing a tail
+investigation needs back: whether slow operations arrive *periodically* (a
+checkpoint, a prune, a flush) or *at random* (lock contention, eviction) is the
+first fork in the diagnosis.
+
+`--slow-ms MS` records every operation at or above the threshold with its
+completion timestamp, worker id and operation type, into a `slow_ops` array in
+the client's JSON report. It costs nothing when off (the default) and only
+touches the slow path when on.
+
+```bash
+do-client run --addr HOST:27017 --client-id c1 --workers 8 \
+    --duration 90 --slow-ms 5 --out /tmp/result.json
+```
+
+Grouping those timestamps into stall events answers the question immediately.
+This is how the p99.9 write-tail convoy in `tasks/backlog.md` was found: every
+large stall hit *all* workers within the same few milliseconds, at irregular
+intervals — which ruled out any fixed-period background task and pointed at a
+shared resource instead.
+
+---
+
+## Comparing against MongoDB
+
+`--engine` selects what runs:
+
+| Value | Effect |
+| --- | --- |
+| `both` (default) | SecantusDB, then MongoDB, back-to-back; prints a comparison |
+| `secantus` | SecantusDB only |
+| `mongod` | MongoDB only |
+
+MongoDB is installed on the server droplet from **MongoDB's own apt
+repository** — not a distro fork, not a container image with its own tuning.
+`--mongod-version` picks the major version (default `8.0`) so a rerun months
+later still compares against the same thing.
+
+What is held identical, deliberately:
+
+- the same droplets, in the same order, minutes apart;
+- the same bind address and port, so the firewall rule and the client command
+  line never change;
+- the same WiredTiger cache size — one `--cache-size` drives SecantusDB's
+  `--cache-size` and mongod's `--wiredTigerCacheSizeGB`;
+- the same clients, worker count, document size, and operation mix;
+- an empty data directory for each engine, each in its own path.
+
+The engines run **sequentially, never concurrently**: two databases sharing
+four cores would measure contention rather than either engine. `--engine both`
+runs SecantusDB first, so if the comparison arm fails the primary number has
+already been taken.
+
+Ratios are printed in their own senses — throughput above 1.0 is faster,
+latency below 1.0 is quicker — because conflating those two directions is how
+benchmark tables mislead.
+
+### Repeating a measurement
+
+`--repeat N` runs the whole thing N times. The engines **interleave within
+each pass** rather than each running to completion in turn, so thermal drift,
+a noisy neighbour, or anything else that changes over the run lands on both
+engines roughly equally instead of penalising whichever went last:
+
+```
+pass 1: secantusdb, mongod
+pass 2: secantusdb, mongod
+pass 3: secantusdb, mongod
+```
+
+Every figure in the report is then a **median**, not a mean — one pass
+disrupted by a checkpoint stall or a busy neighbour should not drag the
+headline, and with small N a mean is exactly what an outlier hijacks. A
+**spread** column reports `(max - min) / median`, which is the number that says
+whether the median is worth quoting at all, and a per-pass table shows the raw
+figures in the order they actually ran.
+
+A measured example — three passes at 60 s each:
+
+| engine | ops/s (median) | spread | pass 1 | pass 2 | pass 3 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| secantusdb | 7,704 | 3.4% | 7,704 | 7,760 | 7,498 |
+| mongod | 15,850 | 1.1% | 15,850 | 16,003 | 15,824 |
+
+Spreads of 1-3% mean the medians are solid. A double-digit spread is the
+report telling you not to quote the number until you have found out why.
+
+**Numbers are comparable within a run, not across clusters.** Two different
+`c-4` droplets can sit on different host generations; an identical SecantusDB
+build measured 6,230 ops/s on one cluster and 8,244 on another. That is
+exactly why both engines are measured on the *same* droplets minutes apart,
+and why a cross-cluster figure should never be quoted as a change.
+
 ---
 
 ## Reading the report
@@ -385,11 +494,12 @@ Artifacts land in `bench/results/do/<run-id>/`:
 
 | File | Contents |
 | --- | --- |
-| `summary.md` | The rendered report (also printed to your terminal) |
-| `summary.json` | The same data, machine-readable, stable enough to build tooling on |
-| `client-1.json`, `client-2.json` | Each client's raw report, including full histograms |
-| `server-sample.json` | Per-second server CPU / RSS / free-memory trace |
-| `server-journal.log` | The last 200 journal lines from the server service |
+| `comparison.md` | The side-by-side table and ratios (when more than one engine ran) |
+| `<engine>-summary.md` | Each engine's own rendered report (`<engine>-pass<N>-…` when repeating) |
+| `<engine>-summary.json` | The same data, machine-readable, stable enough to build tooling on |
+| `<engine>-client-1.json`, `<engine>-client-2.json` | Each client's raw report, including full histograms |
+| `<engine>-server-sample.json` | Per-second server CPU / RSS / free-memory trace |
+| `<engine>-journal.log` | The last 200 journal lines from that engine's service |
 
 The summary shows per-client and aggregate throughput, per-operation latency
 percentiles, server CPU and peak RSS, and the measured round-trip time.
@@ -420,9 +530,14 @@ therefore `destroy`:
 
 | `--mode` | Resume | Ongoing cost | Use when |
 | --- | --- | --- | --- |
-| `destroy` (default) | full reprovision + deploy (~10 min) | **nothing** | done for now |
-| `snapshot` | a few minutes | snapshot storage only | testing again in weeks |
-| `power-off` | ~30 s | **full price** | testing again within hours |
+| `destroy` (default) | full reprovision + deploy | **nothing** | done for now |
+| `snapshot` | ~2 min, software intact | snapshot storage only | testing again in weeks |
+| `power-off` | ~1 min, software intact | **full price** | testing again within hours |
+
+Measured on a three-droplet cluster: `power-off` took 1m03s to resume with the
+public IPs unchanged; `snapshot` took 1m44s to image and destroy, then 2m09s
+to restore — with the installed binaries executable on arrival, so `run` works
+immediately and `all --deploy auto` skips deployment.
 
 `snapshot` powers each droplet off, images it, destroys it, and prunes the
 previous image so snapshots do not accumulate. A later `up` restores droplets
@@ -539,33 +654,44 @@ and re-provision.
 ## Verified
 
 Run against a live account on 2026-08-21: one `c-4` server and two `c-2`
-clients in `lon1`, `secantusd-rs 0.5.3-beta.160` from the published release,
-16 workers per client, 8 KiB documents, the default 70/20/10 mix, 120 s.
+clients in `lon1`, 16 workers per client, 8 KiB documents, the default
+70/20/10 mix, 120 s per engine, 4 GB WiredTiger cache for both.
 
-| | |
-| --- | --- |
-| Aggregate | **6,230 ops/s**, 747,699 operations, **0 errors** |
-| Latency | p50 3.4-3.7 ms, p99 26-27 ms, p99.9 91-111 ms |
-| Server | 82.9% mean CPU, 99.0% peak, of 4 vCPU; 6.13 GiB peak RSS |
-| Clients | 5% and 7% CPU — ample headroom, so the server was the limit |
-| Network | 0.6-0.9 ms RTT over the private VPC |
+| engine | version | ops/s | errors | p50 ms | p99 ms | p99.9 ms | server CPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| secantusdb | 0.5.3-beta.160 | 8,244 | 0 | 2.33 | 25.07 | 114.03 | 83.2% |
+| mongod | v8.0.29 | 17,984 | 0 | 1.49 | 6.94 | 11.58 | 84.5% |
 
-Two consecutive runs agreed to within 0.16% (6,220 and 6,230 ops/s), and the
-clients' low CPU alongside the server's saturated CPU is the shape a valid
-server benchmark should have: the instrument was nowhere near its limit.
+**SecantusDB relative to MongoDB: 0.46x throughput**, 1.57x p50 latency,
+3.61x p99, 9.84x p99.9. The gap is widest in the tail.
+
+Both engines saturated the same server (83-85% mean CPU) while the clients sat
+at 12-15%, so both numbers are server-bound and the comparison is fair. A
+second back-to-back pass reproduced it: 8,212 vs 17,829, the same 0.46x — the
+engines individually within 1% of the first pass.
+
+Also verified live: provisioning, VPC and firewall, SSH, cloud-init, the
+release-binary deploy, the on-droplet source build (`--server-build source`,
+vendored WiredTiger and all), the on-droplet agent build, result collection,
+and **all three teardown modes** — `destroy`, `power-off` (resume with IPs and
+software intact), and `snapshot` (image, destroy, then restore with the
+binaries still executable), including `--purge-snapshots`.
 
 ---
 
 ## Limitations
 
-- **Two paths remain unexercised.** The harness has been run end-to-end
-  against a live DigitalOcean account (see [Verified](#verified) below), but
-  `--server-build source` and the `snapshot` / `power-off` teardown modes have
-  not been. `destroy` — the default — is verified.
+- **A single pass reports no spread.** `--repeat 1` (the default) is one
+  measurement per engine, so nothing tells you how stable it was. Use
+  `--repeat 3` or more before quoting a number that matters.
 - Single server droplet only — SecantusDB is single-node by design, so there
   is nothing to shard or replicate across.
 - The agent measures `insert` / `find` / `update`. Aggregation, change
   streams, and transactions would each need their own operation type.
+- MongoDB is run as a standalone `mongod`, which is the like-for-like
+  comparison: SecantusDB is single-node by design. A real replica set would
+  pay replication costs SecantusDB never pays, which would flatter SecantusDB
+  rather than inform.
 - The agent is not a real driver, so it does not measure driver-side cost.
   That is deliberate (see [Why three machines](#why-three-machines)), but it
   means these numbers are a *server* ceiling, not an application forecast.
