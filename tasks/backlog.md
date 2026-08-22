@@ -51,7 +51,22 @@ These work end-to-end but cut corners.
 
 Specific items that were left out of the slice that introduced their feature area.
 
-- [ ] **find/aggregate firstBatch is count-capped but not byte-capped**: the getMore-default-batch slice gave `getMore` mongod's 16MB byte budget (both servers), but a FIRST batch is still capped only at its document count — `find` with `batchSize: 101` over 1MB documents assembles a ~101MB reply where mongod stops at 16MB and keeps the cursor. Apply the same byte budget in `find.rs::split_into_cursor` / `split_docs_into_cursor` (blob lengths are free) and `commands.py::_split_into_cursor` (needs encode-to-measure). Low urgency: drivers rarely combine a large explicit batchSize with megabyte documents, and the default 101-doc first batch only overflows with >160KB average docs.
+- [x] **find/aggregate firstBatch is byte-capped — FIXED 2026-08-22 (both servers).**
+  `getMore` had mongod's 16MB reply budget; a FIRST batch was capped on document
+  count alone, so `find` with `batchSize: 25` over 1MB documents assembled a 25MB
+  reply and exhausted the cursor. Measured against a live mongod 6.0.16 on the same
+  data: mongod returns 15 documents (15.0 MiB) and a live cursor id; we returned 25
+  documents (25.0 MiB) and `id: 0`. Both servers now apply the same budget
+  `CursorRegistry.next_batch` already used — stop before the document that would
+  overflow, always take at least one so an oversized document still makes progress —
+  in `commands.py::_split_into_cursor` (encode-to-measure) and
+  `find.rs::split_into_cursor` (blob lengths already known, so free). Both now
+  answer 15 / 15.0 MiB / cursor open, matching mongod exactly.
+  **Not covered:** `find.rs::split_docs_into_cursor`, the projected/aggregate path
+  that carries decoded `Document`s rather than blobs. Measuring there means encoding
+  each document purely to size it — real overhead on the Rust server's hot path for
+  a case (megabyte documents *and* a projection) that no driver has hit. Left
+  deliberately, recorded rather than silently skipped.
 - ~~**Three-droplet DigitalOcean benchmark: no repeat-and-median mode**~~ — shipped. `--repeat N` interleaves the engines within each pass (so drift lands on both equally) and reports medians plus a `(max - min) / median` spread column and a per-pass table. Measured 3.4% spread for secantusdb and 1.1% for mongod over three 60s passes. The whole harness is now live-verified: provisioning, VPC + firewall, SSH, cloud-init, both deploy routes, both engines, repeat/median, and all three teardown modes. See `bench/DO_CLUSTER.md`.
 - [ ] **SecantusDB is 0.27x mongod on incompressible data; p99.9 is 72x worse (2026-08-21)**: the three-droplet comparison on identical `c-4` hardware, **8 KiB incompressible documents**, 70/20/10 mix, 16 workers x 2 client droplets, 4G WT cache both, three interleaved 90s passes (spreads 3.6% / 3.9%): secantusd-rs 0.5.3-beta.160 at **3,993 ops/s against mongod 8.0.29's 14,937**, p50 2.41ms vs 1.73ms, p99 64ms vs 10ms, **p99.9 1,303ms vs 18ms**. Both server-CPU-bound at 80-83% with clients idle, so the comparison is fair. **Supersedes the earlier 0.46x / 9.8-11.3x figure**, which was measured with the default `repeat` payload — a single repeated character that both engines compress away, and that flattered SecantusDB because mongod's snappy-compressed journal benefits far more than SecantusDB's uncompressed one. Published in `docs/benchmark.md`. Reproduce with `invoke do-bench --repeat 3 --payload random`. The tail is the weak point: p50 is within 1.4x, so typical operations are competitive; it is the worst 0.1% that collapses. Relates to the uncompressed-WAL and cache-pressure entries above and to the write-path gap in §7.
 - [ ] **OPEN — Admin UI saved-connections / settings page**: Slice 11 of the admin UI shipped schema sampler / logs viewer / geo viewer but skipped the planned `/settings` page with saved Mongo URIs and a manual dark/light toggle. The CLI today takes a single `--uri` per launch, so saved connections are bookmark-only (you can't switch targets after start). When the launcher gains hot-swap support, revisit this page — it's likely a small SQLite-backed list reusing the existing `~/.secantus/admin.db` store.

@@ -573,8 +573,27 @@ def _split_into_cursor(
     # is registered so the next getMore can find the docs.
     if batch_size < 0:
         batch_size = DEFAULT_BATCH_SIZE
-    first = docs[:batch_size]
-    remaining = docs[batch_size:]
+    take = min(batch_size, len(docs))
+    # Byte-budget the FIRST batch too, not just getMore. mongod caps every reply
+    # at 16MB and keeps the cursor open for the rest; we used to cap the first
+    # batch on document count alone, so `find` with `batchSize: 25` over 1MB
+    # documents assembled a 25MB reply and exhausted the cursor where mongod
+    # returns 15MB and hands back a live cursor id. Same algorithm as
+    # `CursorRegistry.next_batch`: stop before the document that would overflow,
+    # but always take at least one so a single oversized doc still makes
+    # progress rather than hanging the client on an empty batch forever.
+    if take:
+        total = 0
+        fitted = 0
+        for doc in docs[:take]:
+            size = len(bson.encode(doc))
+            if fitted > 0 and total + size > MAX_GETMORE_BATCH_BYTES:
+                break
+            total += size
+            fitted += 1
+        take = fitted
+    first = docs[:take]
+    remaining = docs[take:]
     if not remaining:
         return first, 0
     cursor_id = cursors.register(namespace, remaining)
