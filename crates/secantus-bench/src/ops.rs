@@ -1109,11 +1109,44 @@ pub fn power_off(api: &Api, node: &Node) -> BenchResult<()> {
     Ok(())
 }
 
+/// Delete every droplet snapshot belonging to this cluster's prefix.
+///
+/// Snapshots outlive the droplets they came from and keep billing as storage,
+/// so cleaning them up must not depend on a droplet existing -- "no droplets"
+/// is exactly the state you are in when you go looking for leftovers.
+fn purge_snapshots(api: &Api, cfg: &Config) -> BenchResult<usize> {
+    let mut deleted = 0;
+    for snap in api.paged("/snapshots", "snapshots", "&resource_type=droplet")? {
+        let name = snap.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if name.starts_with(&cfg.prefix) {
+            println!("deleting snapshot {name}");
+            let id = snap.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            api.request("DELETE", &format!("/snapshots/{id}"), None)?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
 pub fn cmd_suspend(api: &Api, opts: &Opts) -> BenchResult<()> {
     let cfg = &opts.cfg;
     let nodes = discover(api, cfg)?;
     if nodes.is_empty() {
         println!("nothing to suspend — no droplets found");
+        // --purge-snapshots must still run: snapshots outlive their droplets
+        // and keep billing, so this is precisely when a user reaches for it.
+        // Short-circuiting here reported success while deleting nothing.
+        if opts.purge_snapshots {
+            let n = purge_snapshots(api, cfg)?;
+            println!(
+                "{}",
+                match n {
+                    0 => "no snapshots matched this cluster's prefix.".to_string(),
+                    1 => "1 snapshot deleted; nothing is billing.".to_string(),
+                    n => format!("{n} snapshots deleted; nothing is billing."),
+                }
+            );
+        }
         return Ok(());
     }
 
@@ -1174,14 +1207,7 @@ pub fn cmd_suspend(api: &Api, opts: &Opts) -> BenchResult<()> {
                 api.request("DELETE", &format!("/droplets/{}", node.id()), None)?;
             }
             if opts.purge_snapshots {
-                for snap in api.paged("/snapshots", "snapshots", "&resource_type=droplet")? {
-                    let name = snap.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    if name.starts_with(&cfg.prefix) {
-                        println!("deleting snapshot {name}");
-                        let id = snap.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                        api.request("DELETE", &format!("/snapshots/{id}"), None)?;
-                    }
-                }
+                purge_snapshots(api, cfg)?;
             }
             println!(
                 "\ndroplets destroyed. Nothing is billing. The next `up` provisions bare droplets,\n\
