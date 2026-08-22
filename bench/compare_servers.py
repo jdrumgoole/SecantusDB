@@ -32,6 +32,7 @@ Ctrl-C aborts cleanly between reps.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import platform
 import shutil
@@ -324,10 +325,29 @@ def _change_stream_drain(client: pymongo.MongoClient, n: int) -> float:
     return elapsed
 
 
-def _median_run(make_client: Any, n: int, reps: int) -> dict[str, float]:
+# The mongod build every ratio on this page is expressed against. Captured at
+# run time rather than assumed: mongod is the denominator of every published
+# "xmongod" figure, so a change of reference moves every ratio for reasons that
+# have nothing to do with SecantusDB. Measuring on droplets (mongod 8.0) rather
+# than a laptop (6.0) did exactly that -- 8.0 inserts materially faster, so the
+# ratios worsened while our own absolute numbers held steady.
+_MONGOD_VERSION = {"version": "unknown"}
+
+
+def _capture_mongod_version(client: pymongo.MongoClient) -> None:
+    # A version probe must never fail a benchmark run.
+    with contextlib.suppress(Exception):
+        _MONGOD_VERSION["version"] = str(client.server_info().get("version", "unknown"))
+
+
+def _median_run(
+    make_client: Any, n: int, reps: int, *, capture_version: bool = False
+) -> dict[str, float]:
     samples: dict[str, list[float]] = {}
     for _ in range(reps):
         with make_client() as client:
+            if capture_version:
+                _capture_mongod_version(client)
             for k, v in _run_workloads(client, n).items():
                 samples.setdefault(k, []).append(v)
     return {k: statistics.median(v) for k, v in samples.items()}
@@ -368,6 +388,7 @@ def _write_json(
         "generated": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "host": f"{platform.system()} {platform.machine()}",
         "source": f"bench.compare_servers --n {args.n} --reps {args.reps}",
+        "mongod_version": _MONGOD_VERSION["version"],
         "workloads": [
             {
                 "key": k,
@@ -422,7 +443,12 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"workload n={args.n}, median of {args.reps} reps, on-disk WiredTiger, via pymongo\n")
     mongod = (
-        _median_run(lambda: _mongod_client(args.mongo_uri or None), args.n, args.reps)
+        _median_run(
+            lambda: _mongod_client(args.mongo_uri or None),
+            args.n,
+            args.reps,
+            capture_version=True,
+        )
         if use_mongod
         else None
     )
