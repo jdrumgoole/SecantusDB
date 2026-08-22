@@ -24,7 +24,7 @@ const BOOL_FLAGS: [&str; 7] = [
     "--no-suspend",
 ];
 
-const VALUE_FLAGS: [&str; 26] = [
+const VALUE_FLAGS: [&str; 29] = [
     "--prefix",
     "--region",
     "--server-size",
@@ -35,6 +35,9 @@ const VALUE_FLAGS: [&str; 26] = [
     "--server-build",
     "--server-version",
     "--server-ref",
+    "--perf-n",
+    "--perf-reps",
+    "--perf-writers",
     "--agent-ref",
     "--engine",
     "--mongod-version",
@@ -283,5 +286,70 @@ fn main() -> ExitCode {
             }
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `--flag` documented in USAGE must be registered in BOOL_FLAGS or
+    /// VALUE_FLAGS.
+    ///
+    /// The parser rejects unknown flags outright (accepting one would silently
+    /// swallow the following flag as its value), so a flag that is documented
+    /// but unregistered fails at run time with "unknown flag" -- after the
+    /// operator has typed a command they had every reason to believe was
+    /// valid. That is exactly how `--perf-n` shipped: added to USAGE and to
+    /// Opts, but not to VALUE_FLAGS, and the gap only surfaced when a droplet
+    /// run was invoked for real.
+    #[test]
+    fn every_documented_flag_is_registered() {
+        let mut missing = Vec::new();
+        for line in USAGE.lines() {
+            for token in line.split_whitespace() {
+                // Only the flag column, not prose mentions: USAGE indents flag
+                // definitions, so a flag token starts the trimmed line.
+                if !token.starts_with("--") || token.len() < 4 {
+                    continue;
+                }
+                if line.trim_start() != line && line.trim_start().starts_with(token) {
+                    let name = token.trim_end_matches(',');
+                    if !BOOL_FLAGS.contains(&name) && !VALUE_FLAGS.contains(&name) {
+                        missing.push(name.to_string());
+                    }
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "documented in USAGE but not registered as a flag: {missing:?}"
+        );
+    }
+
+    /// The `perf` subcommand's own flags parse end to end.
+    #[test]
+    fn perf_flags_parse() {
+        let argv: Vec<String> = [
+            "perf",
+            "--perf-n",
+            "5000",
+            "--perf-reps",
+            "3",
+            "--perf-writers",
+            "1,2,4",
+            "--mode",
+            "destroy",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let args = Args::parse(&argv, &BOOL_FLAGS, &VALUE_FLAGS).expect("perf flags must parse");
+        assert_eq!(args.command, "perf");
+        assert_eq!(args.usize_or("--perf-n", 10_000).unwrap(), 5_000);
+        assert_eq!(args.usize_or("--perf-reps", 5).unwrap(), 3);
+        assert_eq!(args.str_or("--perf-writers", "1,2,4,8"), "1,2,4");
     }
 }
