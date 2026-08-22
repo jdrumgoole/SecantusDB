@@ -265,6 +265,16 @@ def run_writers(
             log_path.unlink(missing_ok=True)
 
 
+def _stop_server(server_proc: subprocess.Popen[bytes]) -> None:
+    """Terminate a benchmark server, escalating to SIGKILL if it will not go."""
+    server_proc.terminate()
+    try:
+        server_proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        server_proc.kill()
+        server_proc.wait()
+
+
 def run_concurrency_sweep(
     *,
     writers_list: list[int],
@@ -274,23 +284,35 @@ def run_concurrency_sweep(
     server: str = "python",
     server_log: Path | None = None,
 ) -> tuple[int, list[tuple[int, int, float]]]:
-    storage = Path(tempfile.mkdtemp(prefix="bench-concurrency-"))
-    port = _free_port()
-    server_proc = _spawn_server(port, storage, server, server_log)
-    try:
-        if not _wait_listen("127.0.0.1", port, timeout=30):
-            print("ERROR: server didn't come up", file=sys.stderr)
-            return 2, []
-        uri = f"mongodb://127.0.0.1:{port}/"
-        coll_mode = "shared collection" if shared_collection else "per-writer collections"
-        print(
-            f"server: {server} @ {uri}    duration: {duration:.0f}s/run    "
-            f"batch: {batch}    mode: {coll_mode}\n"
-        )
+    coll_mode = "shared collection" if shared_collection else "per-writer collections"
+    print(
+        f"server: {server}    duration: {duration:.0f}s/run    "
+        f"batch: {batch}    mode: {coll_mode}    store: fresh per row\n"
+    )
 
-        results: list[tuple[int, int, float]] = []  # (n, total_succeeded, elapsed)
-        for n in writers_list:
-            print(f"running {n} writer{'s' if n != 1 else ''}...", flush=True)
+    results: list[tuple[int, int, float]] = []  # (n, total_succeeded, elapsed)
+    for n in writers_list:
+        print(f"running {n} writer{'s' if n != 1 else ''}...", flush=True)
+        # A FRESH store and server per row. Sharing one store across the
+        # sweep made every row measure a different database: with 8,192-byte
+        # documents, rows 1-4 leave tens of GB behind, so the 8-writer row
+        # wrote into a store several times the size the 1-writer row saw.
+        # That is a confound in a measurement whose entire purpose is to
+        # isolate writer count, and it biases scaling downwards -- later
+        # rows look worse partly because their tree is bigger.
+        #
+        # It was also a hard failure: on a 48GB droplet the accumulated
+        # store exhausted the disk mid-sweep and WiredTiger took the
+        # documented ENOSPC WT_PANIC ("the process must exit and restart"),
+        # killing the row. Per-row stores bound peak usage to one row.
+        row_storage = Path(tempfile.mkdtemp(prefix=f"bench-concurrency-n{n}-"))
+        port = _free_port()
+        server_proc = _spawn_server(port, row_storage, server, server_log)
+        try:
+            if not _wait_listen("127.0.0.1", port, timeout=30):
+                print("ERROR: server didn't come up", file=sys.stderr)
+                return 2, []
+            uri = f"mongodb://127.0.0.1:{port}/"
             # Unique prefix per row: fresh collections, no drops (see
             # run_writers' note on why drops must never touch the window).
             stats, elapsed = run_writers(
@@ -302,49 +324,45 @@ def run_concurrency_sweep(
                 collection_prefix=f"{DEFAULT_COLLECTION_PREFIX}n{n}_",
                 shared_collection=shared_collection,
             )
-            total = sum(s[1] for s in stats if s)
-            unparsed = sum(1 for s in stats if s is None)
-            if unparsed:
-                print(f"  WARN: {unparsed}/{n} writers produced no parseable summary", flush=True)
-            results.append((n, total, elapsed))
-            per_writer_rate = (total / n / elapsed) if elapsed > 0 else 0.0
-            print(
-                f"  total: {total:>10,d} docs in {elapsed:6.2f}s   "
-                f"({per_writer_rate:>8,.0f} docs/s/writer)\n",
-                flush=True,
-            )
+        finally:
+            _stop_server(server_proc)
+            shutil.rmtree(row_storage, ignore_errors=True)
 
-        # Summary
-        baseline_rate = None
-        if results and results[0][0] == 1:
-            n0, total0, elapsed0 = results[0]
-            baseline_rate = total0 / elapsed0 if elapsed0 > 0 else 0.0
+        total = sum(s[1] for s in stats if s)
+        unparsed = sum(1 for s in stats if s is None)
+        if unparsed:
+            print(f"  WARN: {unparsed}/{n} writers produced no parseable summary", flush=True)
+        results.append((n, total, elapsed))
+        per_writer_rate = (total / n / elapsed) if elapsed > 0 else 0.0
+        print(
+            f"  total: {total:>10,d} docs in {elapsed:6.2f}s   "
+            f"({per_writer_rate:>8,.0f} docs/s/writer)\n",
+            flush=True,
+        )
 
-        col1, col2, col3, col4, col5 = "writers", "total", "wall", "docs/s", "scaling"
-        print("=" * 72)
-        print(f"{col1:<8} {col2:>14} {col3:>10} {col4:>12} {col5:>12}")
-        print("-" * 72)
-        for n, total, elapsed in results:
-            rate = total / elapsed if elapsed > 0 else 0.0
-            scaling = (rate / baseline_rate) if baseline_rate else float("nan")
-            print(f"{n:<8} {total:>14,d} {elapsed:>9.2f}s {rate:>12,.0f} {scaling:>11.2f}x")
-        print("=" * 72)
-        if baseline_rate:
-            print(
-                "\ninterpretation: scaling > 1.0x means concurrent writers "
-                "increase total throughput;"
-                "\n                scaling < 1.0x means contention is making "
-                "things worse than serial execution.\n"
-            )
-        return 0, results
-    finally:
-        server_proc.terminate()
-        try:
-            server_proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            server_proc.kill()
-            server_proc.wait()
-        shutil.rmtree(storage, ignore_errors=True)
+    # Summary
+    baseline_rate = None
+    if results and results[0][0] == 1:
+        n0, total0, elapsed0 = results[0]
+        baseline_rate = total0 / elapsed0 if elapsed0 > 0 else 0.0
+
+    col1, col2, col3, col4, col5 = "writers", "total", "wall", "docs/s", "scaling"
+    print("=" * 72)
+    print(f"{col1:<8} {col2:>14} {col3:>10} {col4:>12} {col5:>12}")
+    print("-" * 72)
+    for n, total, elapsed in results:
+        rate = total / elapsed if elapsed > 0 else 0.0
+        scaling = (rate / baseline_rate) if baseline_rate else float("nan")
+        print(f"{n:<8} {total:>14,d} {elapsed:>9.2f}s {rate:>12,.0f} {scaling:>11.2f}x")
+    print("=" * 72)
+    if baseline_rate:
+        print(
+            "\ninterpretation: scaling > 1.0x means concurrent writers "
+            "increase total throughput;"
+            "\n                scaling < 1.0x means contention is making "
+            "things worse than serial execution.\n"
+        )
+    return 0, results
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

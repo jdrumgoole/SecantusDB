@@ -535,6 +535,90 @@ def release_benchmark(
 
 
 @task(
+    name="do-perf",
+    help={
+        "count": "Documents per latency workload (default: 10000).",
+        "reps": "Reps to median over per latency workload (default: 5).",
+        "duration": "Seconds per writer count in the scaling sweep (default: 30).",
+        "writers": 'Writer counts for the scaling sweep (default: "1,2,4,8").',
+        "runs": "Interleaved sweeps to median over (default: 3).",
+        "keep": "Leave the droplet running instead of destroying it.",
+        "git-ref": "Pushed git ref to build and measure (default: HEAD).",
+        "size": "Server droplet plan (default: s-8vcpu-16gb — see the docstring).",
+    },
+)
+def do_perf(
+    c: Context,
+    count: int = 10000,
+    reps: int = 5,
+    duration: float = 30.0,
+    writers: str = "1,2,4,8",
+    runs: int = 3,
+    keep: bool = False,
+    git_ref: str = "",
+    size: str = "s-8vcpu-16gb",
+) -> None:
+    """Measure per-operation latency and writer scaling on a DigitalOcean droplet.
+
+    The droplet counterpart of ``compare-servers`` + ``concurrency-refresh``.
+    Those run on whatever machine you happen to be sitting at, and that is
+    where the published numbers have gone wrong: a background build or an OS
+    indexer moves every column at once and nothing in the output says so. One
+    such run made *mongod itself* 2.5x slower than its own baseline, which
+    would have published a fabricated regression.
+
+    A droplet is dedicated and idle, and because ``mongod`` is measured in the
+    same run it is the control that proves it: if mongod's numbers drift from
+    the previous ``bench/results/latency.json``, the machine moved, not the
+    engine.
+
+    Only the server droplet is used -- both harnesses spawn all three engines
+    and talk to them over loopback, so a client droplet would add nothing but
+    a NIC.
+
+    **The default plan is s-8vcpu-16gb, not the cluster default c-4, because
+    the scaling sweep needs more cores than it has writers.** At eight writers
+    the harness runs eight writer processes *plus* the server; on four vCPUs
+    that measures core starvation rather than write scaling. Measured directly:
+    mongod -- unchanged code, the control -- scaled 4.19x at eight writers on a
+    12-core machine and only 1.78x on a c-4 droplet. Every engine was
+    compressed the same way, so the whole sweep was a CPU-count artefact.
+
+    Aim for vCPUs >= 2x the largest writer count. **This account tier caps at
+    8 vCPU** (`c-16` returns HTTP 422 "size is currently restricted"), so a
+    1,2,4,8 sweep on a droplet runs 9 processes on 8 cores and still
+    under-reports the eight-writer row. Either cap `--writers` at 1,2,4, or
+    run the *scaling* sweep on a quiet workstation with more cores and use the
+    mongod control to prove it was quiet. The per-operation latency half has
+    no such constraint -- it is single-client and not core-bound.
+
+    Costs roughly $0.60 and takes about an hour, most of it building WiredTiger
+    and the Rust server from source.
+
+    Writes ``bench/results/latency.json`` and ``bench/results/concurrency.json``,
+    then regenerate the published charts with ``bench.latency_chart`` and
+    ``bench.concurrency_chart``.
+    """
+    cmd = (
+        f"{_DO_CLUSTER} perf"
+        f" --server-size {shlex.quote(size)}"
+        f" --perf-n {int(count)}"
+        f" --perf-reps {int(reps)}"
+        f" --duration {float(duration)}"
+        f" --perf-writers {shlex.quote(writers)}"
+        f" --repeat {int(runs)}"
+    )
+    if git_ref:
+        cmd += f" --server-ref {shlex.quote(git_ref)}"
+    cmd += " --no-suspend" if keep else " --mode destroy"
+    print(
+        "Droplet perf run: per-operation latency + concurrent-writer scaling on\n"
+        "dedicated hardware. mongod is measured alongside as the control.\n"
+    )
+    c.run(cmd, pty=True)
+
+
+@task(
     name="do-up",
     help={"region": "DigitalOcean region (default: lon1).", "fresh": "Ignore existing snapshots."},
 )
