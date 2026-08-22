@@ -475,6 +475,66 @@ def do_bench(
 
 
 @task(
+    name="release-benchmark",
+    help={
+        "duration": "Seconds per engine per pass (default: 90).",
+        "workers": "Load processes per client droplet (default: 16).",
+        "repeat": "Interleaved measurement passes (default: 3).",
+        "keep": "Leave the droplets running afterwards (default: destroy them).",
+    },
+)
+def release_benchmark(
+    c: Context,
+    duration: float = 90.0,
+    workers: int = 16,
+    repeat: int = 3,
+    keep: bool = False,
+) -> None:
+    """Re-measure SecantusDB against MongoDB for a release, on real hardware.
+
+    `docs/benchmark.md` publishes a head-to-head throughput and latency
+    comparison against a real ``mongod``. It is prose with numbers in it, so it
+    goes stale silently: nothing in the test suite fails when the engine gets
+    faster, and a release that improves performance ships a page that
+    understates it. (Exactly that happened when lz4 replaced zlib as the block
+    compressor — the published figures were measured the day before, with the
+    old compressor.)
+
+    This task provisions the three droplets, deploys both engines, runs the
+    comparison with **release settings** — incompressible payloads and three
+    interleaved passes, so the medians are defensible — prints the numbers, and
+    destroys the cluster. Requires ``DIGITALOCEAN_TOKEN``; costs roughly $0.25
+    and takes about 45 minutes, most of it deployment.
+
+    ``--payload random`` is not optional here. Both engines compress, so the
+    default repeated-character payload measures the compressor rather than the
+    engine, and it flatters whichever side compresses harder.
+
+    **Cut the Rust binary release first.** This deploys the newest published
+    ``secantusdb-v*`` release, so running it before that tag exists measures the
+    *previous* build — which is exactly the staleness the task is meant to
+    prevent. Pass ``--server-build source`` via ``do-cluster`` instead if you
+    need to measure an unreleased ref.
+    """
+    cmd = (
+        f"{_DO_CLUSTER} all"
+        f" --duration {float(duration)}"
+        f" --workers {int(workers)}"
+        f" --repeat {int(repeat)}"
+        " --payload random"
+        " --engine both"
+        " --deploy auto"
+    )
+    cmd += " --no-suspend" if keep else " --mode destroy"
+    print(
+        "Release benchmark: 3 interleaved passes per engine on incompressible\n"
+        "documents. Copy the comparison table into docs/benchmark.md's\n"
+        '"Over a real network, against a real MongoDB" section when it finishes.\n'
+    )
+    c.run(cmd, pty=True)
+
+
+@task(
     name="do-up",
     help={"region": "DigitalOcean region (default: lon1).", "fresh": "Ignore existing snapshots."},
 )

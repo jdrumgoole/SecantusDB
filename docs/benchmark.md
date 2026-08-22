@@ -118,40 +118,40 @@ client droplets, real NICs between them — and runs **SecantusDB and a real
 `mongod` back-to-back on the same hardware**, interleaved across passes so
 drift lands on both equally.
 
-Measured 2026-08-21 on DigitalOcean `lon1`: a `c-4` server (4 dedicated vCPU,
+Measured 2026-08-22 on DigitalOcean `lon1`: a `c-4` server (4 dedicated vCPU,
 8 GB) and two `c-2` clients, 16 workers each, 8 KiB **incompressible**
 documents, a 70/20/10 insert/find/update mix, 4 GB WiredTiger cache for both
 engines, three interleaved 90-second passes:
 
 | engine | version | ops/s (median) | spread | p50 | p99 | p99.9 | server CPU |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| SecantusDB | 0.5.3-beta.160 | **3,993** | 3.6% | 2.41 ms | 64 ms | **1,303 ms** | 83.1% |
-| mongod | 8.0.29 | **14,937** | 3.9% | 1.73 ms | 10 ms | **18 ms** | 80.3% |
+| SecantusDB | 0.5.3-beta.161 | **11,099** | 3.1% | 2.06 ms | 15 ms | **37 ms** | 78.3% |
+| mongod | 8.0.29 | **14,772** | 1.5% | 1.71 ms | 10 ms | **18 ms** | 80.2% |
 
-**SecantusDB reaches roughly a quarter of MongoDB's throughput on this
-workload (0.27x), and its tail latency is far worse — 6x at p99 and 72x at
-p99.9.** Both engines saturated the same server (80-83% CPU) while the clients
-sat idle, so both figures are server-bound and the comparison is fair. Run-to-
-run spread was under 4%.
+**SecantusDB reaches about three quarters of MongoDB's throughput on this
+workload (0.75x), with p50 latency within 1.2x and p99.9 within 2.0x.** Both
+engines saturated the same server (78-80% CPU) while the clients sat idle, so
+both figures are server-bound and the comparison is fair. Run-to-run spread was
+about 3%.
 
-That is the honest number and we would rather publish it than a flattering
-one. Two caveats, in both directions:
+That is a large improvement on the previous release, which measured 0.27x
+throughput and **72x** the p99.9 latency. The difference is the block
+compressor: profiling found 65% of server CPU inside zlib's `deflate`, and
+switching the default to lz4 took SecantusDB from 3,993 to 11,099 ops/s and cut
+p99.9 from 1,303 ms to 37 ms on this benchmark. The remaining gap is real but
+no longer dominated by one cause.
 
-- **The payload matters enormously.** These documents are incompressible. The
-  same benchmark on compressible documents puts SecantusDB at 0.46x rather
-  than 0.27x, because MongoDB's snappy-compressed journal benefits far more
-  than SecantusDB's **uncompressed** one. Real workloads sit somewhere between.
-- **Two causes are identified and unfixed.** SecantusDB's write-ahead log is
-  uncompressed (mongod's defaults to snappy), and its 2 GB log-file cap means
-  WiredTiger never reclaims a completed log file during a normal run.
-  Enabling log compression measured a 22% cut in p99.9 for 5% of throughput.
-  Both are configuration-level and are tracked in
-  [`tasks/backlog.md`](https://github.com/jdrumgoole/SecantusDB/blob/main/tasks/backlog.md).
+Caveats, in both directions:
 
-The tail is the honest weak point: SecantusDB's p50 is within 1.4x of
-MongoDB's, so typical operations are competitive, but under sustained write
-saturation the worst 0.1% of operations are far slower. If your workload is
-write-heavy and latency-sensitive at the tail, run a real `mongod`.
+- **The payload matters.** These documents are incompressible. On compressible
+  documents both engines do better and the ratio shifts, because compression
+  ratio starts paying for itself. Real workloads sit somewhere between.
+- **This is one workload shape.** Write-heavy, small documents, single-node, no
+  secondary indexes beyond `_id` and the benchmark's own. It is a useful
+  comparison, not a general claim.
+- **Tail latency is still the weaker axis.** p50 is close; p99.9 is 2x. If your
+  workload is write-heavy and latency-sensitive at the tail, measure with your
+  own data before switching.
 
 Reproduce with `invoke do-bench --repeat 3 --payload random` (needs a
 DigitalOcean API token; the harness provisions, measures and destroys).

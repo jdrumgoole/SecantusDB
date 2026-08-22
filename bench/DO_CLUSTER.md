@@ -31,6 +31,7 @@ It is written in Rust and lives in `crates/secantus-bench`, as two binaries:
 - [The workload](#the-workload)
 - [Comparing against MongoDB](#comparing-against-mongodb)
 - [Reading the report](#reading-the-report)
+- [At release time](#at-release-time)
 - [Cost and teardown](#cost-and-teardown)
 - [Benchmarking unreleased code](#benchmarking-unreleased-code)
 - [Worked examples](#worked-examples)
@@ -519,6 +520,48 @@ headline misleading is detected and printed under the table:
 | *server CPU averaged only N%* | The bottleneck is elsewhere | Client capacity, the network, or a serialised path in the server |
 | *server service is 'failed'* | The database died during the run | The run is invalid. Diagnose before re-measuring |
 | *not every client reported* | The aggregate is partial | Check that client's stderr in the run output |
+
+---
+
+## At release time
+
+`docs/benchmark.md` publishes a head-to-head comparison against a real
+`mongod`. It is prose with numbers in it, so it goes stale **silently** — no
+test fails when the engine gets faster, and a release that improves performance
+ships a page understating it. That is not hypothetical: the published figures
+were measured the day before lz4 replaced zlib as the block compressor, so the
+release that nearly doubled write throughput shipped the old numbers.
+
+`invoke release-benchmark` is the release-time re-measurement:
+
+```bash
+export DIGITALOCEAN_TOKEN=dop_v1_...
+invoke release-benchmark
+```
+
+It provisions the cluster, deploys both engines, runs **three interleaved
+passes on incompressible payloads**, prints the comparison, and destroys
+everything. About 45 minutes and $0.25, most of it deployment.
+
+Then paste the comparison table into `docs/benchmark.md`'s "Over a real
+network, against a real MongoDB" section, along with the date and the versions
+of both engines.
+
+Two settings are deliberate and should not be relaxed for speed:
+
+- **`--payload random`.** Both engines compress, so the default
+  repeated-character payload measures the compressor rather than the engine —
+  and it flatters whichever side compresses harder. The published ratio moved
+  from 0.46x to 0.27x purely by switching to incompressible data.
+- **`--repeat 3`.** A single pass carries no spread, so nothing tells you
+  whether the median is worth quoting. Three passes with a sub-5% spread is the
+  bar for a published number.
+
+**Cut the Rust binary release first.** `release-benchmark` deploys the newest
+published `secantusdb-v*` release by default, so running it before that tag
+exists measures the *previous* build. Either tag the binary release first (the
+normal order — the binary track is quick) or pass `--server-build source` to
+build the current ref on the droplet, which adds about 20 minutes.
 
 ---
 
