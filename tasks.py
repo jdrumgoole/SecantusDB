@@ -509,6 +509,12 @@ def release_benchmark(
     ``--payload random`` is not optional here. Both engines compress, so the
     default repeated-character payload measures the compressor rather than the
     engine, and it flatters whichever side compresses harder.
+
+    **Cut the Rust binary release first.** This deploys the newest published
+    ``secantusdb-v*`` release, so running it before that tag exists measures the
+    *previous* build — which is exactly the staleness the task is meant to
+    prevent. Pass ``--server-build source`` via ``do-cluster`` instead if you
+    need to measure an unreleased ref.
     """
     cmd = (
         f"{_DO_CLUSTER} all"

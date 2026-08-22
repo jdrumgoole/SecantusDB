@@ -557,8 +557,11 @@ Two settings are deliberate and should not be relaxed for speed:
   whether the median is worth quoting. Three passes with a sub-5% spread is the
   bar for a published number.
 
-Run it **after** the version bump lands on `main`, so the measured build is the
-one being released.
+**Cut the Rust binary release first.** `release-benchmark` deploys the newest
+published `secantusdb-v*` release by default, so running it before that tag
+exists measures the *previous* build. Either tag the binary release first (the
+normal order — the binary track is quick) or pass `--server-build source` to
+build the current ref on the droplet, which adds about 20 minutes.
 
 ---
 

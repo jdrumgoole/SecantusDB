@@ -27,7 +27,11 @@ write load found **65% of server CPU inside zlib's `deflate`**, on
 WiredTiger's page-reconciliation path — which is also why tail latency was
 CPU-bound rather than I/O-bound. Swapping the compressor measured **+86%
 write throughput and a 97% cut in p99.9 latency** on incompressible data, and
-+15% / −88% on compressible data where zlib's ratio is at its best. Existing
++15% / −88% on compressible data where zlib's ratio is at its best. End to end
+on the three-droplet rig that is now part of the release process, that took
+SecantusDB from 3,993 to **11,099 operations per second** and cut p99.9 latency
+from 1,303 ms to **37 ms** — closing the gap to a real `mongod` from 0.27x
+throughput to 0.75x, and from 72x its tail latency to 2.0x. Existing
 data is safe: `block_compressor` is recorded per table at create time, so
 stores written before this release keep their zlib tables and zlib stays
 linked permanently to read them.
