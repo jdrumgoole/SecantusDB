@@ -544,6 +544,7 @@ def release_benchmark(
         "runs": "Interleaved sweeps to median over (default: 3).",
         "keep": "Leave the droplet running instead of destroying it.",
         "git-ref": "Pushed git ref to build and measure (default: HEAD).",
+        "size": "Server droplet plan (default: c-16 — see the docstring).",
     },
 )
 def do_perf(
@@ -555,6 +556,7 @@ def do_perf(
     runs: int = 3,
     keep: bool = False,
     git_ref: str = "",
+    size: str = "c-16",
 ) -> None:
     """Measure per-operation latency and writer scaling on a DigitalOcean droplet.
 
@@ -572,8 +574,19 @@ def do_perf(
 
     Only the server droplet is used -- both harnesses spawn all three engines
     and talk to them over loopback, so a client droplet would add nothing but
-    a NIC. Costs roughly $0.40 and takes about an hour, most of it building
-    WiredTiger and the Rust server from source.
+    a NIC.
+
+    **The default plan is c-16, not the cluster default c-4, because the
+    scaling sweep needs more cores than it has writers.** At eight writers the
+    harness runs eight writer processes *plus* the server; on four vCPUs that
+    measures core starvation rather than write scaling. Measured directly:
+    mongod -- unchanged code, the control -- scaled 4.19x at eight writers on
+    a 12-core laptop and only 1.78x on a c-4 droplet. Every engine was
+    compressed the same way, so the whole sweep was a CPU-count artefact.
+    Keep vCPUs >= 2x the largest writer count.
+
+    Costs roughly $1 and takes about an hour, most of it building WiredTiger
+    and the Rust server from source.
 
     Writes ``bench/results/latency.json`` and ``bench/results/concurrency.json``,
     then regenerate the published charts with ``bench.latency_chart`` and
@@ -581,6 +594,7 @@ def do_perf(
     """
     cmd = (
         f"{_DO_CLUSTER} perf"
+        f" --server-size {shlex.quote(size)}"
         f" --perf-n {int(count)}"
         f" --perf-reps {int(reps)}"
         f" --duration {float(duration)}"
