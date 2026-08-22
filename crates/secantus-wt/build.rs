@@ -114,13 +114,16 @@ fn main() {
         // liblz4 is a default link library now, and Apple ships none in the
         // SDK, so the search path has to be found rather than assumed.
         //
-        // The wheel build's own static build comes first: `brew install lz4`
-        // produces a dylib targeting the runner's OS (macOS 14), which
-        // `delocate` refuses to bundle into a wheel targeting macOS 11 — see
-        // tools/build_lz4_macos.sh. Homebrew's prefixes remain the fallback for
-        // a plain developer `cargo build`, where no wheel is being produced and
-        // the deployment target does not matter.
-        for prefix in ["/usr/local/secantus-lz4/lib", "/opt/homebrew/lib", "/usr/local/lib"] {
+        // The wheel build supplies its own static liblz4 via
+        // SECANTUS_WT_EXTRA_LIBDIR: `brew install lz4` produces a dylib
+        // targeting the runner's OS (macOS 14), which `delocate` refuses to
+        // bundle into a wheel targeting macOS 11 — see
+        // tools/build_lz4_macos.sh. Homebrew's prefixes are the fallback for a
+        // plain developer `cargo build`, where no wheel is produced and the
+        // deployment target does not matter.
+        // The wheel build points SECANTUS_WT_EXTRA_LIBDIR at its own static
+        // build (handled above); these are the developer fallbacks.
+        for prefix in ["/opt/homebrew/lib", "/usr/local/lib"] {
             let has_static = std::path::Path::new(&format!("{prefix}/liblz4.a")).exists();
             let has_dylib = std::path::Path::new(&format!("{prefix}/liblz4.dylib")).exists();
             if has_static || has_dylib {

@@ -15,7 +15,10 @@
 set -euo pipefail
 
 LZ4_VERSION="${LZ4_VERSION:-1.10.0}"
-PREFIX="${LZ4_PREFIX:-/usr/local/secantus-lz4}"
+# $HOME, not /usr/local: the macOS runner's /usr/local is root-owned
+# (Homebrew lives in /opt/homebrew on Apple Silicon), so a plain mkdir there
+# fails with "Permission denied" and there is no reason to need sudo.
+PREFIX="${LZ4_PREFIX:-$HOME/.secantus-lz4}"
 TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
 
 if [ -f "$PREFIX/lib/liblz4.a" ]; then
