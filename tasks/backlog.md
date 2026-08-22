@@ -5589,7 +5589,7 @@ table and preloaded in 1.2s. The first amplification numbers taken with it
 (a 96x WAL reduction from zlib) were an artifact and are void. Fixed to derive
 the payload per document; the numbers above are the corrected ones.
 
-## The 2GB WAL default costs 19x the disk for no throughput (2026-08-21)
+## The 2GB WAL default costs 19x the disk — for up to 19% of throughput (2026-08-21, corrected 08-22)
 
 Measured while chasing write amplification: **SecantusDB leaves 674 MB on disk
 where mongod leaves 41 MB for the same 320 MB of documents** (40,000 x 8 KiB,
@@ -5631,11 +5631,20 @@ consistent with every insert logging both the document row and a
 full-document oplog entry — the write-amplification hypothesis for the tail,
 now with a number attached.
 
-- [ ] **Change the `log_file_max` default** from `2GB` to something that
-  rotates (mongod uses 100 MB; 128 MB measured clean here). One line in
-  `secantus-server/src/config.rs`. Deliberately NOT changed here: it is a
-  durability-adjacent default and belongs in its own reviewed slice, but the
-  evidence is unambiguous — 19x the disk for under 1% of throughput.
+- [ ] **`log_file_max`: a disk-versus-throughput trade, NOT a free win**
+  (corrected 2026-08-22). The measurement above stands — 2GB retains 19x the
+  disk because WiredTiger reclaims only *completed* log files. But the claim
+  that it costs "under 1% of throughput" was wrong: `tasks/rust-perf-findings.md`
+  records a prior sweep of `file_max` 128MB→2GB measuring **+13-19% at 4-8
+  writers**, which is why the 2GB default was chosen. That sweep ran on Linux
+  under IO-bound conditions; the "<1%" reading here was macOS with a
+  compressible payload, where the log volume — and therefore the rotation cost
+  — was a fraction of the real thing.
+  So the real question is what a deployment should prefer: ~19x the journal
+  footprint, or up to ~19% of write throughput. Probably a **documented flag
+  with a smaller default** rather than a silent 2GB, since a user who does not
+  know the trade exists currently gets the disk-hungry end of it by default.
+  Re-measure on Linux with `--payload random` before deciding.
 - [ ] Re-check whether the full-document oplog entry can be trimmed, now that
   the WAL cost of it is visible (2x logical data).
 
