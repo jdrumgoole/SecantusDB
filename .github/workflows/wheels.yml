@@ -42,37 +42,29 @@ permissions:
 jobs:
   build_wheels:
     name: Build ${{ matrix.platform }} wheels
-    # dispatch_only entries (macOS) run on manual invocation, never on push.
-    if: ${{ !matrix.dispatch_only || github.event_name == 'workflow_dispatch' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # macOS (macos-14 / arm64) stays out of the PUSH-triggered matrix:
-          # the runner queue is scarce and the from-source WiredTiger build is
-          # slow, so it's too costly on every push. It IS included on
-          # `workflow_dispatch`, because "validated only at release time" is how
-          # a macOS-only wheel break reaches a release tag: the lz4 compressor
-          # switch passed every pre-release lane and then failed the macOS wheel
-          # in publish.yml, on a `delocate` deployment-target rejection nothing
-          # else could have caught. Run this workflow manually before any change
-          # that touches the wheel build.
-          # macos-x86_64 (macos-13) is unsupported regardless — Apple Silicon
-          # is the active target.
-          - os: macos-14
-            platform: macos-arm64
-            cibw_archs: arm64
-            dispatch_only: true
-          - os: ubuntu-22.04
-            platform: linux-x86_64
-            cibw_archs: x86_64
-          - os: ubuntu-22.04-arm
-            platform: linux-aarch64
-            cibw_archs: aarch64
-          - os: windows-2022
-            platform: windows-x86_64
-            cibw_archs: AMD64
+        # macOS (macos-14 / arm64) stays out of the PUSH-triggered matrix: the
+        # runner queue is scarce and the from-source WiredTiger build is slow,
+        # so it's too costly on every push. It IS included on
+        # `workflow_dispatch`, because "validated only at release time" is how a
+        # macOS-only wheel break reaches a release tag: the lz4 compressor
+        # switch passed every pre-release lane and then failed the macOS wheel
+        # in publish.yml, on a `delocate` deployment-target rejection that
+        # nothing else could have caught. Run this workflow manually before any
+        # change touching the wheel build.
+        #
+        # Selected with fromJSON rather than a per-entry `if:` — the `matrix`
+        # context is not available in a job-level `if`, which GitHub rejects at
+        # parse time ("Unrecognized named-value: 'matrix'").
+        #
+        # macos-x86_64 (macos-13) is unsupported regardless — Apple Silicon is
+        # the active target.
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch'
+          && '[{"os":"macos-14","platform":"macos-arm64","cibw_archs":"arm64"},{"os":"ubuntu-22.04","platform":"linux-x86_64","cibw_archs":"x86_64"},{"os":"ubuntu-22.04-arm","platform":"linux-aarch64","cibw_archs":"aarch64"},{"os":"windows-2022","platform":"windows-x86_64","cibw_archs":"AMD64"}]'
+          || '[{"os":"ubuntu-22.04","platform":"linux-x86_64","cibw_archs":"x86_64"},{"os":"ubuntu-22.04-arm","platform":"linux-aarch64","cibw_archs":"aarch64"},{"os":"windows-2022","platform":"windows-x86_64","cibw_archs":"AMD64"}]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Checkout the WiredTiger submodule
