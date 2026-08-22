@@ -107,12 +107,51 @@ Requires `mongod` on `PATH` (Community Server is enough; `--no-mongod` skips
 it and compares the two SecantusDB servers only). On macOS:
 `brew tap mongodb/brew && brew install mongodb-community`.
 
-## Measuring over a real network
+## Over a real network, against a real MongoDB
 
 The numbers above are single-host: server and client share one machine, so
 the "network" is loopback and the load generator competes with the database
-for the same cores. For a deployment-shaped measurement — one server droplet,
-two separate client droplets, real NICs between them — see
-[`bench/DO_CLUSTER.md`](https://github.com/jdrumgoole/SecantusDB/blob/main/bench/DO_CLUSTER.md),
-a DigitalOcean harness that provisions the machines, runs the benchmark, and
-parks them afterwards.
+for the same cores. The harness in
+[`bench/DO_CLUSTER.md`](https://github.com/jdrumgoole/SecantusDB/blob/main/bench/DO_CLUSTER.md)
+measures the deployment shape instead — one server droplet, two separate
+client droplets, real NICs between them — and runs **SecantusDB and a real
+`mongod` back-to-back on the same hardware**, interleaved across passes so
+drift lands on both equally.
+
+Measured 2026-08-21 on DigitalOcean `lon1`: a `c-4` server (4 dedicated vCPU,
+8 GB) and two `c-2` clients, 16 workers each, 8 KiB **incompressible**
+documents, a 70/20/10 insert/find/update mix, 4 GB WiredTiger cache for both
+engines, three interleaved 90-second passes:
+
+| engine | version | ops/s (median) | spread | p50 | p99 | p99.9 | server CPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SecantusDB | 0.5.3-beta.160 | **3,993** | 3.6% | 2.41 ms | 64 ms | **1,303 ms** | 83.1% |
+| mongod | 8.0.29 | **14,937** | 3.9% | 1.73 ms | 10 ms | **18 ms** | 80.3% |
+
+**SecantusDB reaches roughly a quarter of MongoDB's throughput on this
+workload (0.27x), and its tail latency is far worse — 6x at p99 and 72x at
+p99.9.** Both engines saturated the same server (80-83% CPU) while the clients
+sat idle, so both figures are server-bound and the comparison is fair. Run-to-
+run spread was under 4%.
+
+That is the honest number and we would rather publish it than a flattering
+one. Two caveats, in both directions:
+
+- **The payload matters enormously.** These documents are incompressible. The
+  same benchmark on compressible documents puts SecantusDB at 0.46x rather
+  than 0.27x, because MongoDB's snappy-compressed journal benefits far more
+  than SecantusDB's **uncompressed** one. Real workloads sit somewhere between.
+- **Two causes are identified and unfixed.** SecantusDB's write-ahead log is
+  uncompressed (mongod's defaults to snappy), and its 2 GB log-file cap means
+  WiredTiger never reclaims a completed log file during a normal run.
+  Enabling log compression measured a 22% cut in p99.9 for 5% of throughput.
+  Both are configuration-level and are tracked in
+  [`tasks/backlog.md`](https://github.com/jdrumgoole/SecantusDB/blob/main/tasks/backlog.md).
+
+The tail is the honest weak point: SecantusDB's p50 is within 1.4x of
+MongoDB's, so typical operations are competitive, but under sustained write
+saturation the worst 0.1% of operations are far slower. If your workload is
+write-heavy and latency-sensitive at the tail, run a real `mongod`.
+
+Reproduce with `invoke do-bench --repeat 3 --payload random` (needs a
+DigitalOcean API token; the harness provisions, measures and destroys).

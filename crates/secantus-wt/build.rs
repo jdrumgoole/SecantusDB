@@ -86,14 +86,47 @@ fn main() {
     // libwiredtiger_static — references libz's inflate/deflate. libz is a system
     // library on macOS (SDK) and Linux (manylinux/musl ship zlib).
     let sys_libs: &[&str] = match target_os.as_str() {
-        "linux" => &["pthread", "rt", "dl", "z"],
-        "macos" => &["pthread", "dl", "z"],
+        "linux" => &["pthread", "rt", "dl", "z", "lz4"],
+        "macos" => &["pthread", "dl", "z", "lz4"],
         "windows" => &[],
         // Other POSIX targets (the BSDs etc.): pthread is the safe baseline.
         _ => &["pthread"],
     };
     for l in sys_libs {
         println!("cargo:rustc-link-lib=dylib={l}");
+    }
+
+    // lz4 is in `sys_libs` above because it is the default block compressor and
+    // WiredTiger's builtin extension references it. zlib stays linked too: a
+    // store created before the lz4 switch has zlib tables, and
+    // `block_compressor` is recorded at create time, so dropping zlib would
+    // make existing data unreadable.
+    //
+    // `SECANTUS_WT_EXTRA_COMPRESSORS=1` matches the CMake option of the same
+    // name and adds snappy + zstd, which are opt-in only.
+    // `SECANTUS_WT_EXTRA_LIBDIR` adds a search path (e.g. Homebrew's
+    // /opt/homebrew/lib) for any of them.
+    println!("cargo:rerun-if-env-changed=SECANTUS_WT_EXTRA_COMPRESSORS");
+    println!("cargo:rerun-if-env-changed=SECANTUS_WT_EXTRA_LIBDIR");
+    if let Ok(dir) = env::var("SECANTUS_WT_EXTRA_LIBDIR") {
+        println!("cargo:rustc-link-search=native={dir}");
+    } else if target_os == "macos" {
+        // liblz4 is a default link library now, and on macOS it comes from
+        // Homebrew, whose lib directory is NOT on the default linker path
+        // (Apple ships no liblz4 in the SDK). Add whichever prefix actually
+        // has it — /opt/homebrew on Apple Silicon, /usr/local on Intel — so a
+        // plain `cargo build` works without the caller exporting anything.
+        for prefix in ["/opt/homebrew/lib", "/usr/local/lib"] {
+            if std::path::Path::new(&format!("{prefix}/liblz4.dylib")).exists() {
+                println!("cargo:rustc-link-search=native={prefix}");
+                break;
+            }
+        }
+    }
+    if env::var_os("SECANTUS_WT_EXTRA_COMPRESSORS").is_some() && target_os != "windows" {
+        for l in ["snappy", "zstd"] {
+            println!("cargo:rustc-link-lib=dylib={l}");
+        }
     }
 
     let header = format!("{inc}/wiredtiger.h");

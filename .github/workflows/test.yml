@@ -232,7 +232,7 @@ jobs:
         if: runner.os == 'Linux'
         uses: ./.github/actions/apt-install
         with:
-          packages: swig mongodb-mongosh mongodb-database-tools
+          packages: swig liblz4-dev mongodb-mongosh mongodb-database-tools
 
       - name: Install toolchain and MongoDB CLI tools (macOS)
         # The macOS half of the step above. Installing mongosh + Database Tools
@@ -244,7 +244,7 @@ jobs:
         # swig is what the vendored WT build needs on top.
         if: runner.os == 'macOS'
         run: |
-          brew install swig
+          brew install swig lz4
           brew tap mongodb/brew
           # Homebrew now refuses to load formulae from an untrusted third-party
           # tap ("Refusing to load formula mongodb/brew/mongodb-database-tools
@@ -877,13 +877,13 @@ jobs:
         if: runner.os == 'Linux'
         uses: ./.github/actions/apt-install
         with:
-          packages: swig mongodb-mongosh mongodb-database-tools
+          packages: swig liblz4-dev mongodb-mongosh mongodb-database-tools
 
       - name: Install toolchain and MongoDB CLI tools (macOS)
         # macOS half — see the ``test`` job's twin.
         if: runner.os == 'macOS'
         run: |
-          brew install swig
+          brew install swig lz4
           brew tap mongodb/brew
           # Homebrew now refuses to load formulae from an untrusted third-party
           # tap ("Refusing to load formula mongodb/brew/mongodb-database-tools
@@ -1146,7 +1146,7 @@ jobs:
       - name: Install swig
         uses: ./.github/actions/apt-install
         with:
-          packages: swig
+          packages: swig liblz4-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
@@ -1361,7 +1361,7 @@ jobs:
       - name: Install toolchain
         uses: ./.github/actions/apt-install
         with:
-          packages: swig clang libclang-dev llvm-dev ninja-build
+          packages: swig clang libclang-dev llvm-dev ninja-build liblz4-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
@@ -1628,7 +1628,7 @@ jobs:
         if: runner.os == 'Linux'
         uses: ./.github/actions/apt-install
         with:
-          packages: swig clang libclang-dev llvm-dev ninja-build
+          packages: swig clang libclang-dev llvm-dev ninja-build liblz4-dev
 
       - name: Install toolchain (macOS)
         if: runner.os == 'macOS'

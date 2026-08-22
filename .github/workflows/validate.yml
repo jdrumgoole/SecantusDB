@@ -108,7 +108,7 @@ jobs:
       - name: Install swig
         uses: ./.github/actions/apt-install
         with:
-          packages: swig
+          packages: swig liblz4-dev
 
       # The Rust-server gauge builds the _secantus_storage / _secantus_server
       # extensions inside the wheel build: bindgen needs libclang, the WT

@@ -42,7 +42,7 @@ Specific items that were left out of the slice that introduced their feature are
 
 - [ ] **find/aggregate firstBatch is count-capped but not byte-capped**: the getMore-default-batch slice gave `getMore` mongod's 16MB byte budget (both servers), but a FIRST batch is still capped only at its document count — `find` with `batchSize: 101` over 1MB documents assembles a ~101MB reply where mongod stops at 16MB and keeps the cursor. Apply the same byte budget in `find.rs::split_into_cursor` / `split_docs_into_cursor` (blob lengths are free) and `commands.py::_split_into_cursor` (needs encode-to-measure). Low urgency: drivers rarely combine a large explicit batchSize with megabyte documents, and the default 101-doc first batch only overflows with >160KB average docs.
 - ~~**Three-droplet DigitalOcean benchmark: no repeat-and-median mode**~~ — shipped. `--repeat N` interleaves the engines within each pass (so drift lands on both equally) and reports medians plus a `(max - min) / median` spread column and a per-pass table. Measured 3.4% spread for secantusdb and 1.1% for mongod over three 60s passes. The whole harness is now live-verified: provisioning, VPC + firewall, SSH, cloud-init, both deploy routes, both engines, repeat/median, and all three teardown modes. See `bench/DO_CLUSTER.md`.
-- [ ] **SecantusDB is 0.46x mongod on a networked mixed workload (2026-08-21)**: the first three-droplet comparison on identical `c-4` hardware measured secantusd-rs 0.5.3-beta.160 at **8,244 ops/s vs mongod 8.0.29's 17,984** (8 KiB docs, 70/20/10 insert/find/update, 16 workers x 2 client droplets, 4G WT cache both). Latency is where it hurts: 1.57x at p50, **3.61x at p99, 9.84x at p99.9** — the tail, not the median, is the problem. Both engines were server-CPU-bound at ~84% with clients idle at 12-15%, so this is a real engine gap, not a harness artifact, and it reproduced within 1% on a second pass. Reproduce with `invoke do-bench`. Relates to the write-path gap in §7.
+- [ ] **SecantusDB is 0.27x mongod on incompressible data; p99.9 is 72x worse (2026-08-21)**: the three-droplet comparison on identical `c-4` hardware, **8 KiB incompressible documents**, 70/20/10 mix, 16 workers x 2 client droplets, 4G WT cache both, three interleaved 90s passes (spreads 3.6% / 3.9%): secantusd-rs 0.5.3-beta.160 at **3,993 ops/s against mongod 8.0.29's 14,937**, p50 2.41ms vs 1.73ms, p99 64ms vs 10ms, **p99.9 1,303ms vs 18ms**. Both server-CPU-bound at 80-83% with clients idle, so the comparison is fair. **Supersedes the earlier 0.46x / 9.8-11.3x figure**, which was measured with the default `repeat` payload — a single repeated character that both engines compress away, and that flattered SecantusDB because mongod's snappy-compressed journal benefits far more than SecantusDB's uncompressed one. Published in `docs/benchmark.md`. Reproduce with `invoke do-bench --repeat 3 --payload random`. The tail is the weak point: p50 is within 1.4x, so typical operations are competitive; it is the worst 0.1% that collapses. Relates to the uncompressed-WAL and cache-pressure entries above and to the write-path gap in §7.
 - [ ] **Admin UI saved-connections / settings page**: Slice 11 of the admin UI shipped schema sampler / logs viewer / geo viewer but skipped the planned `/settings` page with saved Mongo URIs and a manual dark/light toggle. The CLI today takes a single `--uri` per launch, so saved connections are bookmark-only (you can't switch targets after start). When the launcher gains hot-swap support, revisit this page — it's likely a small SQLite-backed list reusing the existing `~/.secantus/admin.db` store.
 
 ### 3.1 Authentication
@@ -5400,6 +5400,136 @@ shared storage engine or building large new protocol subsystems:
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.
 
+## The tail is CPU-bound, and 65% of the CPU is zlib (2026-08-22)
+
+Profiled on the DigitalOcean droplets — deliberately Linux, not macOS, and
+with `--payload random`, because two earlier wrong calls this session came from
+generalising a compressible-payload macOS reading to a Linux droplet.
+
+### The stalls are on-CPU, not blocked
+
+Sampling every server thread's scheduler state and wait-channel every 20ms
+(`/proc/<pid>/task/*/stat` + `wchan`) and intersecting with the client's
+`--slow-ms 50` stall windows — 4,729 samples, 1,886 stalls:
+
+| | outside stalls | inside stalls |
+| --- | ---: | ---: |
+| **R** (running) | 2.1% | **75.8%** |
+| S (sleeping) | 97.8% | 23.2% |
+| **D** (uninterruptible / disk I/O) | 0.1% | **0.9%** |
+| futex (lock wait) | 26.7% | 17.0% |
+
+**During a stall the threads are on the CPU**, disk I/O is negligible, and lock
+waiting *falls*. That retires the "threads blocking on disk reads because the
+cache cannot hold the working set" reading recorded earlier in this file — the
+stalls are compute, not I/O and not contention.
+
+### The compute is zlib
+
+`perf record` on the server during the same workload, by shared object:
+
+| shared object | CPU |
+| --- | ---: |
+| **libz.so (zlib deflate)** | **65.5%** |
+| libc | 7.0% |
+| kernel | 10.7% |
+| secantusd-rs itself | 16.6% |
+
+**Two thirds of the server's CPU is block compression.** Every symbol at the
+top of the profile is `deflate` under WiredTiger's page reconciliation.
+
+### This ties every earlier observation together
+
+Application threads conscripted into eviction spend that time in `deflate`, so:
+more cache helps (fewer evictions to compress), smaller documents help more
+(less to compress), eviction *thread count* does not help (the box has 4 vCPU
+and the work is CPU-bound), admission control does not help (it does not reduce
+total compression work), and the tail is worst exactly when the cache is
+smallest.
+
+### The lever nobody has pulled: a cheaper compressor
+
+Finding 13 concluded "never turn oplog compression off — 8w throughput craters
+to 19%", and that is correct: uncompressed pages mean more eviction IO. But
+that tested **zlib versus none**. The real choice is **zlib versus a cheaper
+compressor**, and it has never been measured.
+
+mongod defaults to **snappy** for collections precisely because it sits at a
+different point on the CPU/IO curve — roughly an order of magnitude cheaper to
+compress than zlib, at a worse ratio. SecantusDB pays zlib CPU on every page
+reconciliation, on a 4-vCPU box, while mongod pays snappy CPU. That is a strong
+candidate for the bulk of the 3.7x throughput gap *and* the tail.
+
+### DONE — and it is the largest lever measured in this project
+
+Built WiredTiger with the snappy / lz4 / zstd builtin extensions
+(`-DSECANTUS_WT_EXTRA_COMPRESSORS=ON`, plus
+`SECANTUS_WT_EXTRA_COMPRESSORS=1` / `SECANTUS_WT_EXTRA_LIBDIR` for the Rust
+link step — both opt-in, the default build is untouched) and swept
+`block_compressor` on the document *and* oplog tables via the existing
+`SECANTUS_OPLOG_TABLE_EXTRA` hook plus a new `SECANTUS_DATA_TABLE_EXTRA` one.
+8 writers, 1G cache, 8 KiB documents, 45s:
+
+**Incompressible payload** (`--payload random`):
+
+| compressor | ops/s | vs zlib | p50 ms | p99.9 ms | vs zlib | disk |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| zlib (today) | 19,752 | — | 0.16 | 105.98 | — | 19.7 GB |
+| snappy | 36,087 | **+83%** | 0.20 | 3.60 | **-97%** | 46.7 GB |
+| **lz4** | **36,709** | **+86%** | 0.20 | **3.47** | **-97%** | 37.8 GB |
+| zstd | 34,169 | +73% | 0.20 | 7.90 | -93% | 32.9 GB |
+
+**Compressible payload** (`--payload repeat`, zlib's best case):
+
+| compressor | ops/s | vs zlib | p99.9 ms | vs zlib | disk |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| zlib (today) | 36,830 | — | 8.38 | — | 28.6 GB |
+| snappy | 42,064 | +14% | 1.11 | -87% | 33.1 GB |
+| **lz4** | **42,255** | **+15%** | **1.05** | **-88%** | 32.7 GB |
+| zstd | 41,146 | +12% | 2.19 | -74% | 31.8 GB |
+
+**lz4 wins on both axes in both regimes.** Nearly double the throughput and a
+30x better tail on incompressible data; +15% and -88% even where zlib's ratio
+should shine. The cost is disk: 1.9x on incompressible content, but only 1.14x
+on compressible — and zstd is the middle option (+73%/+12% throughput, 1.67x /
+1.11x disk) if disk matters more than the last of the tail.
+
+This closes the loop on the whole investigation. It is why 65% of server CPU
+was `deflate`, why the tail was CPU-bound, why more cache helped (fewer
+evictions to compress), why eviction tuning did not (the work is CPU), and it
+is a large part of why mongod — which defaults to snappy — was 3.7x faster with
+a 72x better tail.
+
+It also revises Finding 13. "Never turn oplog compression off — throughput
+craters to 19%" is correct and still stands: uncompressed pages mean more
+eviction IO. But that measured **zlib versus none**, and concluded compression
+was load-bearing. The real axis is **which** compressor: zlib is the wrong
+point on the CPU/IO curve for this engine on small-core machines.
+
+- [x] ~~**Decide and ship a compressor change**~~ — **SHIPPED: lz4 is the
+  default** (2026-08-22). The document and oplog table configs now name
+  `block_compressor=lz4`; WiredTiger builds lz4 alongside zlib by default
+  (snappy/zstd stay behind `SECANTUS_WT_EXTRA_COMPRESSORS`), `liblz4-dev` /
+  `brew lz4` / `lz4-devel` / `lz4-dev` were added to every wheel and CI build
+  step that compiles WiredTiger, and `secantus-wt/build.rs` links lz4 and
+  auto-detects Homebrew's lib directory on macOS (Apple ships no liblz4, and
+  it is not on the default linker path).
+  **zlib remains linked deliberately** and must stay so: `block_compressor` is
+  recorded per table at create time, so a store written before this switch has
+  zlib tables. Verified end to end — a store created by the old binary was
+  opened by the new one, 201,982 documents read back with zero errors, and new
+  writes added an lz4 table alongside the 11 zlib ones. A unit test
+  (`zlib_must_remain_available_for_legacy_tables`) records why the extension
+  cannot be dropped as a cleanup.
+- [ ] **Consider exposing `--block-compressor`** so a disk-constrained
+  deployment can opt back to zlib (1.9x less disk on incompressible content),
+  and consider a per-table default — documents and oplog have different
+  read/write mixes and the sweep measured them together.
+- [ ] Re-run the three-droplet MongoDB comparison after the change. The
+  published 0.27x throughput / 72x p99.9 figures were measured with zlib; if
+  the sweep holds on Linux they should move substantially, and
+  `docs/benchmark.md` needs updating with them.
+
 ## RETRACTED: the "42x dirty cache bytes" comparison was a counter artifact (2026-08-21)
 
 The cache sweep proved the tail is governed by cache pressure, but not why
@@ -5589,7 +5719,7 @@ table and preloaded in 1.2s. The first amplification numbers taken with it
 (a 96x WAL reduction from zlib) were an artifact and are void. Fixed to derive
 the payload per document; the numbers above are the corrected ones.
 
-## The 2GB WAL default costs 19x the disk for no throughput (2026-08-21)
+## The 2GB WAL default costs 19x the disk — for up to 19% of throughput (2026-08-21, corrected 08-22)
 
 Measured while chasing write amplification: **SecantusDB leaves 674 MB on disk
 where mongod leaves 41 MB for the same 320 MB of documents** (40,000 x 8 KiB,
@@ -5631,11 +5761,20 @@ consistent with every insert logging both the document row and a
 full-document oplog entry — the write-amplification hypothesis for the tail,
 now with a number attached.
 
-- [ ] **Change the `log_file_max` default** from `2GB` to something that
-  rotates (mongod uses 100 MB; 128 MB measured clean here). One line in
-  `secantus-server/src/config.rs`. Deliberately NOT changed here: it is a
-  durability-adjacent default and belongs in its own reviewed slice, but the
-  evidence is unambiguous — 19x the disk for under 1% of throughput.
+- [ ] **`log_file_max`: a disk-versus-throughput trade, NOT a free win**
+  (corrected 2026-08-22). The measurement above stands — 2GB retains 19x the
+  disk because WiredTiger reclaims only *completed* log files. But the claim
+  that it costs "under 1% of throughput" was wrong: `tasks/rust-perf-findings.md`
+  records a prior sweep of `file_max` 128MB→2GB measuring **+13-19% at 4-8
+  writers**, which is why the 2GB default was chosen. That sweep ran on Linux
+  under IO-bound conditions; the "<1%" reading here was macOS with a
+  compressible payload, where the log volume — and therefore the rotation cost
+  — was a fraction of the real thing.
+  So the real question is what a deployment should prefer: ~19x the journal
+  footprint, or up to ~19% of write throughput. Probably a **documented flag
+  with a smaller default** rather than a silent 2GB, since a user who does not
+  know the trade exists currently gets the disk-hungry end of it by default.
+  Re-measure on Linux with `--payload random` before deciding.
 - [ ] Re-check whether the full-document oplog entry can be trimmed, now that
   the WAL cost of it is visible (2x logical data).
 
