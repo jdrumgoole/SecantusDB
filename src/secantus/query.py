@@ -583,10 +583,32 @@ def _eq_numeric_aware(a: Any, b: Any, collation: Collation | None = None) -> boo
     if isinstance(a, _dt.datetime) and isinstance(b, _dt.datetime):
         a2, b2 = _coerce_datetime(a, b)
         return a2 == b2
+    # NaN equals NaN for query purposes. IEEE says otherwise and Python follows
+    # IEEE, but mongod matches `{x: NaN}` against a stored NaN — probed against
+    # 6.0.16. Without this a document inserted with `_id: NaN` can never be found
+    # by its own `_id` again, which is the worst form of the bug: the write is
+    # accepted and the row is then unreachable by key. Checked BEFORE the
+    # `_coerce_numeric` early return below, which bails for two same-type floats
+    # and so never reached this.
+    if _is_nan(a) and _is_nan(b):
+        return True
     a2, b2 = _coerce_numeric(a, b)
     if a2 is a:
         return False
     return a2 == b2
+
+
+def _is_nan(v: Any) -> bool:
+    """True for a float or Decimal128 NaN, False for anything else."""
+    if isinstance(v, float):
+        return math.isnan(v)
+    to_dec = getattr(v, "to_decimal", None)
+    if to_dec is not None:
+        try:
+            return to_dec().is_nan()
+        except (ValueError, ArithmeticError):
+            return False
+    return False
 
 
 def _op_matches(values: list[Any], op: str, arg: Any, collation: Collation | None = None) -> bool:
