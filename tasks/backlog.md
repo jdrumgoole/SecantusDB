@@ -5400,6 +5400,79 @@ shared storage engine or building large new protocol subsystems:
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.
 
+## The tail is CPU-bound, and 65% of the CPU is zlib (2026-08-22)
+
+Profiled on the DigitalOcean droplets — deliberately Linux, not macOS, and
+with `--payload random`, because two earlier wrong calls this session came from
+generalising a compressible-payload macOS reading to a Linux droplet.
+
+### The stalls are on-CPU, not blocked
+
+Sampling every server thread's scheduler state and wait-channel every 20ms
+(`/proc/<pid>/task/*/stat` + `wchan`) and intersecting with the client's
+`--slow-ms 50` stall windows — 4,729 samples, 1,886 stalls:
+
+| | outside stalls | inside stalls |
+| --- | ---: | ---: |
+| **R** (running) | 2.1% | **75.8%** |
+| S (sleeping) | 97.8% | 23.2% |
+| **D** (uninterruptible / disk I/O) | 0.1% | **0.9%** |
+| futex (lock wait) | 26.7% | 17.0% |
+
+**During a stall the threads are on the CPU**, disk I/O is negligible, and lock
+waiting *falls*. That retires the "threads blocking on disk reads because the
+cache cannot hold the working set" reading recorded earlier in this file — the
+stalls are compute, not I/O and not contention.
+
+### The compute is zlib
+
+`perf record` on the server during the same workload, by shared object:
+
+| shared object | CPU |
+| --- | ---: |
+| **libz.so (zlib deflate)** | **65.5%** |
+| libc | 7.0% |
+| kernel | 10.7% |
+| secantusd-rs itself | 16.6% |
+
+**Two thirds of the server's CPU is block compression.** Every symbol at the
+top of the profile is `deflate` under WiredTiger's page reconciliation.
+
+### This ties every earlier observation together
+
+Application threads conscripted into eviction spend that time in `deflate`, so:
+more cache helps (fewer evictions to compress), smaller documents help more
+(less to compress), eviction *thread count* does not help (the box has 4 vCPU
+and the work is CPU-bound), admission control does not help (it does not reduce
+total compression work), and the tail is worst exactly when the cache is
+smallest.
+
+### The lever nobody has pulled: a cheaper compressor
+
+Finding 13 concluded "never turn oplog compression off — 8w throughput craters
+to 19%", and that is correct: uncompressed pages mean more eviction IO. But
+that tested **zlib versus none**. The real choice is **zlib versus a cheaper
+compressor**, and it has never been measured.
+
+mongod defaults to **snappy** for collections precisely because it sits at a
+different point on the CPU/IO curve — roughly an order of magnitude cheaper to
+compress than zlib, at a worse ratio. SecantusDB pays zlib CPU on every page
+reconciliation, on a 4-vCPU box, while mongod pays snappy CPU. That is a strong
+candidate for the bulk of the 3.7x throughput gap *and* the tail.
+
+- [ ] **Build WiredTiger with snappy / lz4 / zstd and sweep the block
+  compressor.** Today `CMakeLists.txt` enables only
+  `HAVE_BUILTIN_EXTENSION_ZLIB`, so this is a build-flag change (add
+  `HAVE_BUILTIN_EXTENSION_SNAPPY` / `_LZ4` / `_ZSTD`) before the compressor can
+  even be selected at runtime. Then sweep `block_compressor` per table —
+  documents, oplog and index tables independently, since they have different
+  ratios and different read/write mixes. Measure throughput AND p99.9: the
+  whole point is that zlib wins on ratio and loses on CPU, and the current
+  configuration only ever measured the ratio side.
+  Expect this to be the largest single lever available, and note it interacts
+  with the uncompressed-WAL finding above — a cheap compressor may make WAL
+  compression affordable too.
+
 ## RETRACTED: the "42x dirty cache bytes" comparison was a counter artifact (2026-08-21)
 
 The cache sweep proved the tail is governed by cache pressure, but not why
