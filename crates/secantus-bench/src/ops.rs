@@ -309,6 +309,17 @@ exit 1
 // -- up ---------------------------------------------------------------------
 
 pub fn cmd_up(api: &Api, opts: &mut Opts) -> BenchResult<Vec<Node>> {
+    cmd_up_roles(api, opts, &ALL_ROLES)
+}
+
+/// Provision (or wake) only `roles`.
+///
+/// `perf` needs the server droplet alone: both Python harnesses spawn every
+/// engine themselves and drive them over loopback, so a client droplet
+/// contributes nothing but its hourly cost. DigitalOcean bills a droplet for
+/// existing rather than running, so two idle `c-2` clients are ~$0.13/hour of
+/// pure waste on a run that takes about an hour -- every release.
+pub fn cmd_up_roles(api: &Api, opts: &mut Opts, roles: &[&str]) -> BenchResult<Vec<Node>> {
     // Before anything is created: prove the key can actually authenticate.
     // Finding out afterwards means paying for droplets nobody can reach.
     remote::assert_key_usable(&opts.cfg.ssh_key)?;
@@ -329,7 +340,7 @@ pub fn cmd_up(api: &Api, opts: &mut Opts) -> BenchResult<Vec<Node>> {
     // resume, or after a snapshot restore, is wasted work.
     let mut created: Vec<String> = Vec::new();
     let mut woken: Vec<String> = Vec::new();
-    for role in ALL_ROLES {
+    for role in roles {
         if let Some(node) = node_for(&existing, role) {
             if node.status() == "off" {
                 println!("powering on {}", node.name());
@@ -1012,7 +1023,9 @@ fn engine_version(cfg: &Config, server_ip: &str, engine: Engine) -> String {
 /// themselves and talk to them over loopback, so a client droplet would add
 /// nothing but a NIC.
 pub fn cmd_perf(api: &Api, opts: &mut Opts) -> BenchResult<()> {
-    let nodes = cmd_up(api, opts)?;
+    // Server droplet only -- see `cmd_up_roles`. Provisioning the clients too
+    // would pay for two machines this command never connects to.
+    let nodes = cmd_up_roles(api, opts, &[SERVER_ROLE])?;
     let cfg = &opts.cfg;
     let server = node_for(&nodes, SERVER_ROLE).ok_or("missing server droplet — run `up` first.")?;
     let server_ip = server.public();
