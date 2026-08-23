@@ -3316,14 +3316,108 @@ fn archive_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
 /// then a startable WiredTiger home. Free function (no live `Storage` needed) so
 /// the restore path can rebuild a fresh directory. Mirrors Python
 /// `extract_backup_archive`.
+/// Chunk size for sparse extraction. Large enough that the all-zero test is
+/// cheap per byte, small enough that a partly-zero chunk wastes little.
+const SPARSE_CHUNK: usize = 256 * 1024;
+
+/// Extract one tar entry, punching holes instead of writing runs of zeros.
+///
+/// A WiredTiger backup contains `WiredTigerLog.*`, which WT **preallocates to
+/// `log_file_max`** — 2 GiB here. Almost all of it is zeros, so it compresses
+/// to nothing (a 100-document store archives to 2.0 MB) and then expands to
+/// 2.0 GB on restore. Measured: every PITR restore wrote 2 GB regardless of
+/// database size, 99.8% of its time blocked in `write(2)`, which took 0.84s on
+/// an idle disk and 858s when a dozen other processes shared the volume.
+///
+/// Seeking past a zero run leaves a hole that reads back as zeros, so the
+/// restored file is **byte-identical** — this changes only how it reaches the
+/// disk, never what WiredTiger later reads. The final `set_len` matters: a file
+/// whose tail is all zeros would otherwise end short, because seeking past the
+/// end does not itself extend a file.
+fn unpack_entry_sparse<R: std::io::Read>(
+    entry: &mut tar::Entry<'_, R>,
+    dst: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let size = entry.header().size()?;
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::File::create(dst)?;
+    let mut buf = vec![0u8; SPARSE_CHUNK];
+    let mut pending_hole: u64 = 0;
+
+    loop {
+        let n = entry.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if buf[..n].iter().all(|&b| b == 0) {
+            // Defer the seek: consecutive zero chunks coalesce into one hole.
+            pending_hole += n as u64;
+        } else {
+            if pending_hole > 0 {
+                file.seek(SeekFrom::Current(pending_hole as i64))?;
+                pending_hole = 0;
+            }
+            file.write_all(&buf[..n])?;
+        }
+    }
+
+    // Holes at EOF do not extend the file, so set the length explicitly.
+    file.set_len(size)?;
+    file.flush()?;
+    Ok(())
+}
+
+/// Unpack `archive` into `target`, writing regular files sparsely.
+///
+/// Mirrors `tar::Archive::unpack` for the entry kinds a WiredTiger backup
+/// contains (regular files and directories) and delegates anything else to the
+/// tar crate, so an unexpected entry type keeps its normal handling rather than
+/// being silently dropped.
+fn unpack_sparse<R: std::io::Read>(
+    archive: &mut tar::Archive<R>,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        // Refuse absolute paths and `..` traversal, as tar's own unpack does.
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsafe path in backup archive: {}", path.display()),
+            ));
+        }
+        let dst = target.join(&path);
+        match entry.header().entry_type() {
+            tar::EntryType::Directory => {
+                std::fs::create_dir_all(&dst)?;
+            }
+            tar::EntryType::Regular => {
+                unpack_entry_sparse(&mut entry, &dst)?;
+            }
+            _ => {
+                entry.unpack_in(target)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn extract_backup_archive(archive_path: &str, target_dir: &str) -> Result<()> {
     std::fs::create_dir_all(target_dir).map_err(|e| archive_err("extract_backup_archive", e))?;
     let file =
         std::fs::File::open(archive_path).map_err(|e| archive_err("extract_backup_archive", e))?;
     let dec = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(dec);
-    archive
-        .unpack(target_dir)
+    unpack_sparse(&mut archive, std::path::Path::new(target_dir))
         .map_err(|e| archive_err("extract_backup_archive", e))?;
     Ok(())
 }
@@ -3407,8 +3501,7 @@ pub fn extract_backup_archive_ex(
     // Pass 2: extract.
     let file = std::fs::File::open(&abs_archive).map_err(|e| archive_err("restoreArchive", e))?;
     let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(file));
-    ar.unpack(target)
-        .map_err(|e| archive_err("restoreArchive", e))?;
+    unpack_sparse(&mut ar, target).map_err(|e| archive_err("restoreArchive", e))?;
 
     let abs_target = std::fs::canonicalize(target)
         .map_err(|e| archive_err("restoreArchive", e))?

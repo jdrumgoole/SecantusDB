@@ -6880,55 +6880,50 @@ distinct problems, triaged from the run logs:
   (renames of huge collections are rare); bounded today only by luck of
   cache headroom. The `drop_target=true` purge inside rename shares the
   shape.
-- [ ] **`secantusd-rs restore` wedges under full-suite parallelism —
-  `test_rust_binary_pitr.py::test_rust_binary_v2_archive_base_snapshot_and_restore`
-  (observed 2026-08-22, reproduces on `origin/main` at `c5e338aa`).** The
-  `restore` *subprocess* hits its 900s `subprocess.TimeoutExpired` — a wedge in
-  the restore path, not a wrong result. It is NOT the flock/worker-death family
-  above (that was fixed): the test holds its lock fine and the child process
-  simply never returns.
+- [x] **RESOLVED 2026-08-23: PITR restore wrote 2 GB regardless of database
+  size — backup extraction now punches holes instead of writing runs of
+  zeros.** WiredTiger preallocates `WiredTigerLog.0000000001` to
+  `log_file_max` (2 GiB). It is almost entirely zeros, so it compressed to
+  nothing and expanded to full size: a 100-document store archived to 2.0 MB
+  and restored to 2.0 GB.
 
-  Reproduction is context-dependent and consistent, which is what makes it
-  interesting:
+  Symptom was `test_rust_binary_pitr.py::test_rust_binary_v2_archive_base_snapshot_and_restore`
+  intermittently hitting its 900s `subprocess.TimeoutExpired`. Diagnosed by
+  sampling the live process rather than inferring: both stacks 60s apart were
+  identical, **99.8% of samples blocked in `write(2)`** under
+  `extract_backup_archive` → `tar::entry::unpack`, at 2.7% CPU (2.10s → 3.71s
+  across 60 wall-seconds). Not a deadlock and not a retry loop — plain I/O.
+  Those 2 GB took 0.84s on an idle disk and 858s with 12 xdist workers sharing
+  the volume, which is why it straddled the timeout instead of failing
+  consistently.
 
-  | context | result |
-  |---|---|
-  | the test alone, `-n0` | passes, 6.5s |
-  | the whole file, `-n auto` | passes, 12.7s |
-  | `tests/test_rust_binary_pitr.py` + `test_rust_pitr_cross_server.py` | passes, 14.9s |
-  | **the full suite, `-n auto` (12 workers)** | **hangs, 900s timeout (3/4 runs)** |
+  Fix (`unpack_sparse` / `unpack_entry_sparse` in `secantus-storage`): read
+  each entry in 256 KiB chunks and `seek` past all-zero chunks (coalescing
+  consecutive runs) instead of writing them, then `set_len` to the header size
+  — seeking past EOF does not itself extend a file, so a zero-tailed file would
+  otherwise end short. **Extraction-side only**: holes read back as zeros, so
+  the restored bytes are identical and WiredTiger cannot tell the difference.
+  Both extraction paths (`extract_backup_archive`,
+  `extract_backup_archive_ex`) share it, and it reimplements tar's absolute /
+  `..` path guard, which replacing `Archive::unpack` would otherwise have
+  dropped.
 
-  So it needs the *rest of the suite* running concurrently — ~12 worker
-  processes each holding a WiredTiger cache. Ruled out: machine load (fails on
-  a quiet box, load 1.79), disk space (615 GB free), accumulated pytest temp
-  (cleared, still fails), and any particular branch (fails identically on bare
-  `origin/main`).
+  Measured after: restored directory **2.0 GB → 276 KB** on disk, restore
+  2.59s, PITR suites 10 passed in 14.6s, and restores under the full parallel
+  suite now finish in **5-6s** rather than 858s.
 
-  **CI never reproduces it, and the reason looks like worker count, not
-  platform.** PR #1020 was green on every lane — including `test` and
-  `test-durable` on **macos-14**, four shards each — while the same commit
-  fails locally on darwin. So it is *not* simply macOS-specific.
+  Pinned by `crates/secantus-storage/tests/sparse_extract.rs`: an all-zero log
+  restores byte-identical *and* verifiably sparse (asserted via
+  `MetadataExt::blocks()` — without that the test would pass even if the fix
+  did nothing), mixed content with interior holes and a zero tail round-trips
+  exactly, and traversal paths stay refused.
 
-  The distinguishing variable is how the suite is run. CI splits it into four
-  shards per job, so each pytest process drives only a quarter of the tests
-  with a handful of xdist workers; locally it is one process at `-n auto` =
-  **12 workers on a 12-core machine**, every one holding a WiredTiger cache.
-  Sharded CI never reaches that pressure. That fits the cache-pressure
-  hypothesis below and suggests the reproduction needs a high worker count
-  rather than a particular OS — worth confirming by running the full unsharded
-  suite at `-n 12` on a Linux box before assuming platform involvement.
-
-  **Prime suspect: an unbounded retry under cache-pressure `WT_ROLLBACK`,** the
-  same shape as the chunked-drop/rename entry above — restore replays the
-  archive in one or few large transactions, and under memory pressure from a
-  dozen sibling WT caches a rollback-retry loop would spin rather than fail.
-  That is a guess and has not been confirmed; the next step is to sample the
-  wedged `secantusd-rs restore` pid (native `sample`, see the WT stall toolkit)
-  during a full-suite run and get its stack, which names the loop directly.
-
-  This is a **durability path** — restore is how a user gets their data back —
-  so a bounded, loud failure is the minimum acceptable behaviour even if the
-  underlying pressure cannot be avoided.
+  Note the trade-off that created it: `log_file_max` was raised to 2 GB for a
+  measured +13-19% write-throughput win (`tasks/rust-perf-findings.md`). That
+  gain is real and is kept; only the backup's handling of the mostly-empty log
+  changed. Still open as a smaller follow-on: `restore_from_archive_dir`
+  extracts a *second* full copy into a tempdir when a newer base snapshot
+  exists, which is now cheap but still redundant.
 
 - [x] **RESOLVED (for real this time): the xdist "worker death" cluster
   (2026-08-13 → 08-16) — workers starved on the machine-wide rust-binary
