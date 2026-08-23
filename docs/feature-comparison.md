@@ -62,7 +62,7 @@ command set. The divergences:
 | Command | MongoDB | Python server | Rust server |
 | --- | --- | --- | --- |
 | `mapReduce` | ⚠️ deprecated | ⚠️ `{out: {inline: 1}}` only; canonical emit/count patterns translated (no JS runtime) | ❌ |
-| `top` | ✅ | ⚠️ correct shape, counters always 0 | ❌ |
+| `top` | ✅ | ⚠️ correct shape, counters always 0 | ⚠️ correct shape, counters always 0 |
 | `serverStatus` | ✅ | ⚠️ version + mostly-zeroed metrics | ⚠️ smaller subset still |
 | `dbStats` / `collStats` | ✅ | ✅ real counts/sizes from the WT tables | ⚠️ `dataSize` used for size fields |
 | `replSetGetStatus` | ✅ | ⚠️ single-node persona reply | ⚠️ single-node persona reply |
