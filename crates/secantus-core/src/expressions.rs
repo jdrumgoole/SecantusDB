@@ -913,7 +913,13 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
     if (0..len).contains(&resolved) {
         Ok(a[resolved as usize].clone())
     } else {
-        Ok(Bson::Null)
+        // Out of range evaluates to MISSING, not null, so `$project` omits the
+        // field. `Bson::Undefined` is this engine's missing marker and the
+        // project stage already skips it. Probed against mongod 6.0.16 on
+        // `[1, 2]`: index 9 and index -9 both give `{_id: 1}` with no field,
+        // while a missing/null input array really is null. Mirrors
+        // `expressions.py::_array_elem_at`.
+        Ok(Bson::Undefined)
     }
 }
 

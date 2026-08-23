@@ -412,6 +412,27 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **OPEN — Rust server: `$sum`/`$avg` FAIL OUTRIGHT when any Decimal128 is in
+  the group (found 2026-08-23 by a three-way differential).** Not a wrong answer —
+  an error: `aggregation pipeline uses a stage or operator not supported by the
+  Rust server`. Narrowed by probing the Rust binary directly: `$sum` over plain
+  ints answers 3; adding a `bool` or a `null` still answers; adding **one**
+  Decimal128 value, or an all-Decimal128 collection, errors. Python and mongod both
+  answer. This is the standing "Decimal128 edges defer to Python" deferral, but on
+  the standalone Rust server a defer has nowhere to go, so it surfaces as a failed
+  aggregation — a `$group` over a collection that happens to contain one Decimal128
+  simply does not work there. Closing it means real Decimal128 arithmetic in the
+  Rust accumulators (a decimal crate), not a shim.
+- [ ] **OPEN — cross-type `sort` order differs between our two servers AND from
+  mongod (found 2026-08-23).** Sorting `["10", 10, [1,2,3], {a:1}, [], [[]]]` by that
+  field ascending: mongod `[5, 3, 2, 1, 4, 6]`, Python `[2, 1, 4, 5, 3, 6]`, Rust
+  `[2, 1, 4, 5, 6, 3]`. **Python and Rust disagreeing is a bug on its own terms**,
+  independent of mongod — the two servers must order identically or a client that
+  switches servers silently reorders. Both also differ from mongod's BSON cross-type
+  ordering for arrays vs scalars. Touches `sortkey` / `ordering` on the Python side
+  and the Rust comparison path; scoped as its own slice rather than folded into an
+  aggregation batch.
+
 - [x] **DATA CORRUPTION: retryable writes were not idempotent — FIXED on BOTH
   servers (#844 Python, #850 Rust).** Found 2026-08-13 while
   triaging the C gauge's `/command_monitoring/unified/writeConcernError`.

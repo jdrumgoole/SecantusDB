@@ -1071,7 +1071,7 @@ def _hashable_with_collation(value: Any, collation: Any) -> Any:
 def _finalize(bucket: dict[str, Any]) -> dict[str, Any]:
     for k, v in list(bucket.items()):
         if isinstance(v, dict) and "_avg_total" in v and "_avg_n" in v:
-            bucket[k] = v["_avg_total"] / v["_avg_n"] if v["_avg_n"] else None
+            bucket[k] = _avg_divide(v["_avg_total"], v["_avg_n"])
         elif isinstance(v, dict) and "_std_vals" in v:
             bucket[k] = _std_dev(v["_std_vals"], pop=v["_std_pop"])
         elif isinstance(v, dict) and "_nelem_vals" in v:
@@ -1125,6 +1125,25 @@ def _is_acc_number(v: Any) -> bool:
     return isinstance(v, (int, float, Decimal128, _decimal.Decimal)) and not isinstance(v, bool)
 
 
+def _avg_divide(total: Any, n: int) -> Any:
+    """Finalise a running $avg, keeping Decimal128 in the decimal domain.
+
+    mongod's $avg over Decimal128 values answers a Decimal128; dividing through
+    Python float would both narrow the type and lose precision.
+    """
+    if not n:
+        return None
+    if isinstance(total, Decimal128):
+        # Decimal128 carries 34 significant digits; Python's default decimal
+        # context is 28, which silently truncated the quotient to 27 and left us
+        # short of mongod (…333333333333333 vs our …333333333). Widen the context
+        # for the division only.
+        with _decimal.localcontext() as ctx:
+            ctx.prec = 34
+            return Decimal128(total.to_decimal() / _decimal.Decimal(n))
+    return total / n
+
+
 def _acc_sum(
     bucket: dict[str, Any], field: str, arg: Any, doc: Mapping[str, Any], vars: dict[str, Any]
 ) -> None:
@@ -1157,7 +1176,12 @@ def _acc_avg(
     v = evaluate(arg, doc, vars)
     if not _is_acc_number(v):
         return  # mongod averages only numeric values
-    state["_avg_total"] += v
+    # `bson_add`, not `+=`: a raw Python add throws
+    # `TypeError: unsupported operand type(s) for +=: 'float' and 'Decimal128'`
+    # the moment a group mixes Decimal128 with any other numeric type, and that
+    # escaped as a bare "internal server error" to the client. $sum already used
+    # bson_add; $avg was simply missed.
+    state["_avg_total"] = bson_add(state["_avg_total"], v)
     state["_avg_n"] += 1
 
 
