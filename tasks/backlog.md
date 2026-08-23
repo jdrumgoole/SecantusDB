@@ -6856,45 +6856,50 @@ distinct problems, triaged from the run logs:
   (renames of huge collections are rare); bounded today only by luck of
   cache headroom. The `drop_target=true` purge inside rename shares the
   shape.
-- [ ] **ROOT-CAUSED 2026-08-22: every PITR base snapshot expands to 2 GB
-  regardless of database size, because WiredTiger preallocates
-  `WiredTigerLog.0000000001` at `log_file_max` (2 GiB).** Measured on a store
-  holding 100 documents: the archive is **2.0 MB compressed and 2.0 GB
-  extracted** — a 1000x expansion, of which 2,147,483,648 bytes is a single
-  almost-entirely-zero log file. Zeros compress to nothing and expand to full
-  size, so the archive looks tiny and the restore is enormous.
+- [x] **RESOLVED 2026-08-23: PITR restore wrote 2 GB regardless of database
+  size — backup extraction now punches holes instead of writing runs of
+  zeros.** WiredTiger preallocates `WiredTigerLog.0000000001` to
+  `log_file_max` (2 GiB). It is almost entirely zeros, so it compressed to
+  nothing and expanded to full size: a 100-document store archived to 2.0 MB
+  and restored to 2.0 GB.
 
-  Found by sampling the wedged process (the symptom was
-  `test_rust_binary_pitr.py::test_rust_binary_v2_archive_base_snapshot_and_restore`
-  hitting its 900s `subprocess.TimeoutExpired` under full-suite parallelism).
-  Both stacks, 60s apart, were identical: **99.8% of samples blocked in
-  `write(2)`** under `extract_backup_archive` → `tar::entry::unpack`, at 2.7%
-  CPU (2.10s → 3.71s of CPU across 60 wall-seconds). Not a deadlock and not a
-  retry loop — plain I/O. On an idle disk those 2 GB extract in 0.84s; with 12
-  xdist workers saturating the same APFS volume it took **858s**, which is why
-  it straddles the timeout and fails intermittently.
+  Symptom was `test_rust_binary_pitr.py::test_rust_binary_v2_archive_base_snapshot_and_restore`
+  intermittently hitting its 900s `subprocess.TimeoutExpired`. Diagnosed by
+  sampling the live process rather than inferring: both stacks 60s apart were
+  identical, **99.8% of samples blocked in `write(2)`** under
+  `extract_backup_archive` → `tar::entry::unpack`, at 2.7% CPU (2.10s → 3.71s
+  across 60 wall-seconds). Not a deadlock and not a retry loop — plain I/O.
+  Those 2 GB took 0.84s on an idle disk and 858s with 12 xdist workers sharing
+  the volume, which is why it straddled the timeout instead of failing
+  consistently.
 
-  **This is not a test-only problem.** Every restore writes 2 GB minimum
-  whatever the database size, and `restore_from_archive_dir` extracts a
-  *second* full copy into `tempfile::tempdir()` when a newer base snapshot
-  exists — so peak temp usage is ~4 GB to restore 100 documents. It also
-  interacts with the accumulating-store class of bug: on a 48 GB droplet a
-  handful of concurrent restores would exhaust the disk.
+  Fix (`unpack_sparse` / `unpack_entry_sparse` in `secantus-storage`): read
+  each entry in 256 KiB chunks and `seek` past all-zero chunks (coalescing
+  consecutive runs) instead of writing them, then `set_len` to the header size
+  — seeking past EOF does not itself extend a file, so a zero-tailed file would
+  otherwise end short. **Extraction-side only**: holes read back as zeros, so
+  the restored bytes are identical and WiredTiger cannot tell the difference.
+  Both extraction paths (`extract_backup_archive`,
+  `extract_backup_archive_ex`) share it, and it reimplements tar's absolute /
+  `..` path guard, which replacing `Archive::unpack` would otherwise have
+  dropped.
+
+  Measured after: restored directory **2.0 GB → 276 KB** on disk, restore
+  2.59s, PITR suites 10 passed in 14.6s, and restores under the full parallel
+  suite now finish in **5-6s** rather than 858s.
+
+  Pinned by `crates/secantus-storage/tests/sparse_extract.rs`: an all-zero log
+  restores byte-identical *and* verifiably sparse (asserted via
+  `MetadataExt::blocks()` — without that the test would pass even if the fix
+  did nothing), mixed content with interior holes and a zero tail round-trips
+  exactly, and traversal paths stay refused.
 
   Note the trade-off that created it: `log_file_max` was raised to 2 GB for a
   measured +13-19% write-throughput win (`tasks/rust-perf-findings.md`). That
-  gain is real; the backup-size cost was simply never noticed.
-
-  Fix options, cheapest first:
-  - **Skip preallocated log files in the backup.** WiredTiger's backup cursor
-    lists the log files it needs; a freshly-restored store does not need 2 GB
-    of zeros. Verify against WT's requirements before trusting this.
-  - **Store the log sparsely / truncate the tail**, so extraction writes only
-    the used prefix.
-  - **Lower `log_file_max` for archived stores only**, keeping the throughput
-    win on live ones.
-  - Failing all of the above, at minimum stop extracting the archive **twice**
-    in `restore_from_archive_dir`.
+  gain is real and is kept; only the backup's handling of the mostly-empty log
+  changed. Still open as a smaller follow-on: `restore_from_archive_dir`
+  extracts a *second* full copy into a tempdir when a newer base snapshot
+  exists, which is now cheap but still redundant.
 
 - [x] **RESOLVED (for real this time): the xdist "worker death" cluster
   (2026-08-13 → 08-16) — workers starved on the machine-wide rust-binary
