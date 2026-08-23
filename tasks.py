@@ -584,13 +584,16 @@ def do_perf(
     12-core machine and only 1.78x on a c-4 droplet. Every engine was
     compressed the same way, so the whole sweep was a CPU-count artefact.
 
-    Aim for vCPUs >= 2x the largest writer count. **This account tier caps at
-    8 vCPU** (`c-16` returns HTTP 422 "size is currently restricted"), so a
-    1,2,4,8 sweep on a droplet runs 9 processes on 8 cores and still
-    under-reports the eight-writer row. Either cap `--writers` at 1,2,4, or
-    run the *scaling* sweep on a quiet workstation with more cores and use the
-    mongod control to prove it was quiet. The per-operation latency half has
-    no such constraint -- it is single-client and not core-bound.
+    **Keep vCPUs >= the largest writer count.** An earlier note here demanded
+    2x; measurement showed that is too conservative. mongod -- the control --
+    scales 4.96x at eight writers on this 8-vCPU plan, against 4.65x on a
+    12-core workstation and only 1.78x on a 4-vCPU c-4. So 1:1 is fine and 2:1
+    oversubscription is what breaks; `s-8vcpu-16gb` measures an eight-writer
+    sweep honestly.
+
+    Absolute throughput is much lower than on a fast workstation (the cores
+    are slower), but the *scaling ratio* -- what the page reports -- holds.
+    Always check mongod against its own previous run before believing a sweep.
 
     Costs roughly $0.60 and takes about an hour, most of it building WiredTiger
     and the Rust server from source.
