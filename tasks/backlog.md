@@ -412,6 +412,20 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **OPEN — Rust server: `$inc`/`$mul` FAIL OUTRIGHT on Decimal128 (2026-08-23).**
+  Found by a three-way update-operator differential. `{$inc: {n: 1}}` against a
+  Decimal128 field, or with a Decimal128 operand, returns a WriteError (code 2)
+  where Python and mongod both compute the answer. Same underlying gap as the
+  `$sum`/`$avg` Decimal128 failure recorded above — the standing "Decimal128 edges
+  defer to Python" deferral, which on a standalone server has nowhere to defer to.
+  **That one gap is now known to break four operators**, so closing it (real
+  decimal arithmetic in the Rust accumulators/updaters) buys more than it looks.
+- [ ] **OPEN — Rust server: wrong error CODE for non-numeric `$inc`/`$mul`
+  (2026-08-23).** `{$inc: {n: 1}}` against a null or string field answers code 2
+  (BadValue) where mongod and the Python server answer 14 (TypeMismatch). The
+  refusal is right; only the code is wrong. This is the standing Rust error-code
+  gap, now with a concrete reproduction.
+
 - [ ] **OPEN — Rust server: `$sum`/`$avg` FAIL OUTRIGHT when any Decimal128 is in
   the group (found 2026-08-23 by a three-way differential).** Not a wrong answer —
   an error: `aggregation pipeline uses a stage or operator not supported by the
@@ -1113,11 +1127,16 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   results from the Python server and the Rust binary. `"off"` demonstrably disables
   validation too (that is how the invalid doc got in). Nothing to fix.
 - [ ] **The SQL / PostgreSQL-wire server has no admin UI at all**, and this is now an explicit scoping decision rather than an accident: `client.check_supported_uri` rejects a `postgresql://` target with a message saying so. If a SQL admin surface is ever wanted it needs its own console — every page here is pymongo-driven.
-- [ ] **`StarletteDeprecationWarning` from fastapi's testclient import** — the six
-  admin websocket tests each emit "Using `httpx` with `starlette.testclient` is
-  deprecated; install `httpx2`" from fastapi's own import shim. The last warnings
-  in the default suite. Fix is a dev-dependency bump (fastapi/starlette/httpx2)
-  in its own PR — no runtime code involved.
+- [x] **`StarletteDeprecationWarning` — FIXED 2026-08-23; the suite is warning-free.**
+  starlette's `TestClient` prefers `httpx2` and emits
+  "Using `httpx` with `starlette.testclient` is deprecated" on every construction
+  when only `httpx` is importable (`starlette/testclient.py:47`). Six of them, from
+  the admin websocket tests — the last warnings in the default suite. Adding
+  `httpx2>=2.12` to the **dev** extra silences them: verified by re-running
+  `tests/test_admin_skeleton.py`, 137 passed with no warnings section at all.
+  Test-only on purpose — nothing under `src/secantus` imports `httpx` at runtime,
+  so it does not belong in the `admin` / `opsboard` extras (which declare `httpx`
+  for the same TestClient reason).
 
 ## 7. Python → Rust rewrite (in progress)
 

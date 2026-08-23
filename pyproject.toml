@@ -43,6 +43,13 @@ dev = [
     # ``--splits N --group K`` against the per-platform files in ci/durations/;
     # see .github/workflows/record-durations.yml for how those are produced.
     "pytest-split>=0.10",
+    # starlette's TestClient prefers httpx2 and emits a
+    # StarletteDeprecationWarning on every construction when only httpx is
+    # importable ("Using `httpx` with `starlette.testclient` is deprecated").
+    # That was the last warning left in the default suite — six of them, from
+    # the admin websocket tests. Test-only: nothing under src/secantus imports
+    # httpx at runtime, so this does not belong in the admin/opsboard extras.
+    "httpx2>=2.12",
     "trustme>=1.2",  # ephemeral CA + self-signed certs for tests/test_tls.py
     "sqlglot>=25",  # SQL parser for the secantus.sql tests (mirrors the [sql] extra)
     "pg8000>=1.31",  # pure-Python Postgres driver: real-driver gauge for the SQL server
