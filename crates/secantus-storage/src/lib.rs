@@ -38,8 +38,9 @@ use s2::rect::Rect;
 use s2::region::RegionCoverer;
 use secantus_core::collation::Collation;
 use secantus_core::diff::compute_update_description;
+use secantus_core::order;
 use secantus_core::query::matches as query_matches;
-use secantus_core::sortkey::{self, COMPOUND_SEP};
+use secantus_core::sortkey::{self, COMPOUND_SEP, RANK_MINKEY};
 use secantus_core::{get_path, get_path_values};
 use secantus_wt::{Connection, Cursor, Session, WtError};
 
@@ -1821,6 +1822,25 @@ fn pack_entry(kb: &[u8], recordid: i64) -> Vec<u8> {
 /// it). A trailing half that is not exactly 8 bytes is a step-1-format entry;
 /// callers must never see one (`reject_legacy_index_entry_format` refuses such a
 /// store at open), so it is reported as `None` rather than silently mis-read.
+/// Whether an index entry's key is a whole-array key rather than an element key.
+///
+/// The first byte of an encoded value is its type rank; escaping only rewrites
+/// `0x00`, which no rank byte is. A descending column is encoded byte-inverted, so
+/// the rank arrives as `0xFF - rank`.
+fn is_whole_array_key(escaped_key: &[u8], idx_dir: i32) -> bool {
+    match escaped_key.first() {
+        None => false,
+        Some(&first) => {
+            let expected = if idx_dir >= 0 {
+                sortkey::RANK_ARRAY
+            } else {
+                0xFF - sortkey::RANK_ARRAY
+            };
+            first == expected
+        }
+    }
+}
+
 fn unpack_entry(packed: &[u8]) -> (&[u8], Option<i64>) {
     match packed.windows(2).position(|w| w == ENTRY_SEP) {
         Some(i) => {
@@ -2243,10 +2263,32 @@ fn multi_sort_spec(sort: Option<&Document>) -> Option<Vec<(String, i32)>> {
 /// The byte-sortable compound key for `doc` under a sort `spec` — the same
 /// encoding the index walk produces, so the COLLSCAN post-sort yields mongod's
 /// cross-type order consistent with the accelerated path.
+/// Byte key for an in-memory sort. **Not an index entry** — the only two callers
+/// are the post-fetch sorts below, so the empty-array special case here never
+/// reaches disk and the persisted rank scheme is untouched.
 fn sort_key(doc: &Document, spec: &[(String, i32)], coll: Option<&Collation>) -> Result<Vec<u8>> {
     let mut parts = Vec::with_capacity(spec.len());
     for (f, d) in spec {
         let v = get_path(doc, f).cloned().unwrap_or(Bson::Null);
+        // mongod sorts an array-valued field by one representative element: its
+        // minimum ascending, its maximum descending. Comparing whole arrays put
+        // every array after every scalar and disagreed with our own index path,
+        // where a multikey index's per-element entries already produced mongod's
+        // order. Mirrors `ordering.py::_array_sort_value`.
+        let v = order::array_sort_value(v, *d < 0).ok_or(StorageError::UnsupportedValue)?;
+        // An empty array has no representative element; mongod sorts it between
+        // MinKey and Null. The persisted rank bytes cannot express that, so emit a
+        // key just above bare MinKey — inverted for a descending column, matching
+        // `encode_value_directed`'s own convention.
+        if matches!(v, Bson::Undefined) {
+            let bytes = if *d < 0 {
+                vec![0xFF - RANK_MINKEY, 0x00]
+            } else {
+                vec![RANK_MINKEY, 0xFF]
+            };
+            parts.push(bytes);
+            continue;
+        }
         // Collation-aware sort: a strength/caseLevel collation folds string keys
         // before encoding. A collation the encoder can't reproduce (non-ASCII /
         // numericOrdering) surfaces as UnsupportedValue → command BadValue.
@@ -9604,6 +9646,7 @@ impl Storage {
                             coll,
                             &idx_name,
                             sort_dir != idx_dir,
+                            idx_dir,
                         )?
                     }
                     None => self.scan_blobs_natural(&session, db, coll)?,
@@ -9613,7 +9656,7 @@ impl Storage {
                 match self.compound_index_for_sort(&session, db, coll, &multi)? {
                     Some((idx_name, reverse)) => {
                         in_sort_order = true;
-                        self.walk_index_in_order(&session, db, coll, &idx_name, reverse)?
+                        self.walk_index_in_order(&session, db, coll, &idx_name, reverse, 1)?
                     }
                     None => self.scan_blobs_natural(&session, db, coll)?,
                 }
@@ -10875,7 +10918,7 @@ impl Storage {
                         break;
                     }
                 }
-                let mut docs = self.walk_index_in_order(session, db, coll, name, false)?;
+                let mut docs = self.walk_index_in_order(session, db, coll, name, false, 1)?;
                 let in_order = match (&leading, sort_field) {
                     (Some((f, _)), Some(sf)) => f == sf,
                     _ => false,
@@ -10897,6 +10940,7 @@ impl Storage {
         coll: &str,
         name: &str,
         reverse: bool,
+        idx_dir: i32,
     ) -> Result<Vec<Vec<u8>>> {
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         cur.set_key_sssu(db, coll, name, b"");
@@ -10917,9 +10961,20 @@ impl Storage {
             if d != db || c != coll || n != name {
                 break;
             }
-            let (_esc, row_id) = unpack_entry(&packed);
+            let (esc, row_id) = unpack_entry(&packed);
+            // Skip WHOLE-ARRAY entries. A multikey index writes one entry per
+            // element plus one for the whole array, and the whole-array key sorts
+            // in the Array slot — after every scalar. Walking backward hits those
+            // first, and the first-occurrence dedup in `docs_by_recordids` then
+            // picks documents by their whole-array key instead of by their maximum
+            // element, which is what mongod orders by. Ascending never showed it:
+            // element entries come first there. This walk is used only for
+            // ordering; whole-array equality lookups take a different path and
+            // still need those entries. Mirrors `storage.py::_is_whole_array_key`.
             if let Some(rid) = row_id {
-                recordids.push(rid);
+                if !is_whole_array_key(esc, idx_dir) {
+                    recordids.push(rid);
+                }
             }
             more = cur.next()?;
         }

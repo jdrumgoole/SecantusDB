@@ -37,7 +37,7 @@ mod densify;
 mod fill;
 mod group;
 mod numeric;
-mod order;
+pub mod order;
 mod paths;
 mod regexutil;
 mod windowfields;

@@ -215,14 +215,23 @@ def test_sort_cross_type_order(storage: Storage) -> None:
     )
     out = storage.find_matching("db", "c", {}, sort={"v": 1})
     ids = [d["_id"] for d in out]
-    # MongoDB order: null < numbers < string < object < array < ObjectId < bool
+    # MongoDB cross-type order for SCALARS:
+    #   null < numbers < string < object < ObjectId < bool
+    #
+    # An ARRAY does not take a type slot of its own. mongod sorts an array-valued
+    # field by its minimum element (ascending), so `[1, 2]` sorts as the number 1
+    # and lands among the numbers — before string and object, not after them.
+    # This previously asserted `object < array`, the whole-array model we used to
+    # implement; mongod 6.0.16 on these exact seven documents returns
+    # [4, 5, 2, 1, 6, 7, 3].
     pos = {i: ids.index(i) for i in range(1, 8)}
     assert pos[4] < pos[2]  # null < num
     assert pos[2] < pos[1]  # num < string
     assert pos[1] < pos[6]  # string < object
-    assert pos[6] < pos[5]  # object < array
-    assert pos[5] < pos[7]  # array < ObjectId
+    assert pos[6] < pos[7]  # object < ObjectId
     assert pos[7] < pos[3]  # ObjectId < bool
+    assert pos[5] < pos[2]  # array [1,2] -> min 1 -> before the scalar 5
+    assert ids == [4, 5, 2, 1, 6, 7, 3], "must match mongod exactly"
 
 
 def test_reopen_clamps_seq_counters_past_stale_meta(tmp_path) -> None:

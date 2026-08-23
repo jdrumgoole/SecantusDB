@@ -293,12 +293,14 @@ fn sort_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
     let mut keyed: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
     for d in docs {
         let mut keys = Vec::with_capacity(fields.len());
-        for (path, _) in &fields {
+        for (path, rev) in &fields {
             let v = paths::get_path(&d, path).cloned().unwrap_or(Bson::Null);
             if !order::is_sortable(&v) {
                 return Err(Fallback);
             }
-            keys.push(v);
+            // mongod sorts an array-valued field by one representative element:
+            // its minimum ascending, its maximum descending.
+            keys.push(order::array_sort_value(v, *rev).ok_or(Fallback)?);
         }
         keyed.push((keys, d));
     }

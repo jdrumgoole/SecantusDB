@@ -16,12 +16,12 @@ use bson::{Bson, Document};
 use crate::collation::{self, Collation};
 
 // Type ranks — must match secantus.sortkey.
-const RANK_MINKEY: u8 = 1;
+pub const RANK_MINKEY: u8 = 1;
 const RANK_NULL: u8 = 2;
 const RANK_NUMBER: u8 = 3;
 const RANK_STRING: u8 = 4;
 const RANK_DOCUMENT: u8 = 5;
-const RANK_ARRAY: u8 = 6;
+pub const RANK_ARRAY: u8 = 6;
 const RANK_BINDATA: u8 = 7;
 const RANK_OBJECTID: u8 = 8;
 const RANK_BOOL: u8 = 9;
