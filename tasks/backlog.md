@@ -6921,9 +6921,30 @@ distinct problems, triaged from the run logs:
   Note the trade-off that created it: `log_file_max` was raised to 2 GB for a
   measured +13-19% write-throughput win (`tasks/rust-perf-findings.md`). That
   gain is real and is kept; only the backup's handling of the mostly-empty log
-  changed. Still open as a smaller follow-on: `restore_from_archive_dir`
-  extracts a *second* full copy into a tempdir when a newer base snapshot
-  exists, which is now cheap but still redundant.
+  changed.
+
+  **The second-extraction follow-on is closed as not-worth-fixing, by
+  measurement (2026-08-23).** `restore_from_archive_dir` does extract a second
+  copy into a tempdir when a newer base snapshot exists, but with sparse
+  extraction it costs nothing measurable: an interleaved A/B over 7 pairs put a
+  restore that takes the branch at median **2.87s** against **2.86s** for one
+  that does not — inside run-to-run noise.
+
+  Two traps worth recording, because both produced confident wrong answers on
+  the way there:
+
+  - A decomposition putting `Storage::open` at 1.6-2.3s was **measured on a
+    store whose 2 GB log had been extracted by system `tar`**, i.e. fully
+    written, where a real restore's is now sparse. The component measurement
+    did not reflect the composed path.
+  - Sequential before/after readings showed a 4.1-5.1s "regression" that was
+    entirely the release rebuild run immediately beforehand. Interleaving the
+    two binaries so load drift hits both equally showed +0.3%.
+
+  A `durable: Some(false)` open for that throwaway store was written, measured
+  at +0.3%, and reverted: it changes durability semantics on a restore path for
+  no measurable gain.
+
 
 - [x] **RESOLVED (for real this time): the xdist "worker death" cluster
   (2026-08-13 → 08-16) — workers starved on the machine-wide rust-binary
