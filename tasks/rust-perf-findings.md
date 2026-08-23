@@ -1103,3 +1103,41 @@ Measurement note for future micro-opts on this box: with a parallel
 session active the practical noise floor is ±2-3% even at load<4 —
 sub-2% effects need paired designs (per-pair deltas, sign tests), not
 mean comparison.
+
+## Finding 19 — the 11 Aug → 23 Aug benchmark deltas: one real speedup, one phantom regression (2026-08-23)
+
+Refreshing the published benchmarks showed the Rust server's per-operation
+numbers moving in both directions against the 2026-08-11 table. Both were run
+down by interleaved A/B against a rebuilt binary from `5f00e01c` (the commit
+whose results that table records), with **both binaries linked against the same
+WiredTiger build** so the storage engine is held constant.
+
+| workload | 11 Aug published | measured now | verdict |
+|---|---|---|---|
+| `find_all` (10k) | 17.38 ms | 13.39 → **6.57 ms** | **real, 2.04x** |
+| `insert` (10k) | 76.81 ms | 73.45 → **74.32 ms** | **not real, +1.2%** |
+
+**The read speedup is `51ac8f30` (#875, 2026-08-15), and it was already
+claimed.** `getMore` reused mongod's 101-document *first-batch* default on
+every batch, so a 10k-document scan paid ~100 round trips where mongod pays 2.
+Bisect over 191 commits was unambiguous: two tight clusters (~12.1 ms and
+~6.6 ms) with nothing between, so a single commit. The commit message's own
+figure ("7.1 ms vs mongod 6.9 ms, 2 batches") matches what reproduces today.
+The published table was simply measured four days before the fix landed and
+stayed stale for over a week — the staleness `invoke do-perf` now guards.
+
+**The write "regression" was an artefact of comparing across sessions.**
+`76.81 ms` and `83.95 ms` came from two benchmark runs days apart, not an
+interleaved comparison. Alternating the two binaries in one session puts them
+at 73.45 vs 74.32 ms with fully overlapping spreads. This is the third time in
+one day that sequential before/after readings manufactured a difference that
+interleaving erased (see also the restore "regression" of 4.1-5.1 s that was a
+release rebuild, and the fabricated 0.3x ratio from benchmarking after a
+parallel build).
+
+**Method note.** Both endpoints were driven through the *standalone binary*
+with a purpose-built scan/insert harness rather than `bench.compare_servers`,
+so a bisect step costs one `cargo build -p secantusdb` (~30 s) instead of a
+full extension rebuild. Old commits need `RUSTFLAGS="-L native=/opt/homebrew/lib
+-l lz4"` because their `build.rs` predates lz4 linking while the shared WT
+build has the compressor built in.
