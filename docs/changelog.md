@@ -19,6 +19,306 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.6.0b15] — 2026-08-23
+
+### Restores stopped writing 2 GB for a 2 MB backup
+
+A point-in-time restore used to write 2 GB to disk no matter how little data it
+was restoring. WiredTiger preallocates its log file to 2 GiB, that file is
+almost entirely zeros, and zeros compress to nothing but expand to everything —
+so a database holding 100 documents archived to 2.0 MB and restored to 2.0 GB.
+Restores now write sparsely: the same bytes, holes instead of zero-runs, a
+restored directory of 276 KB, and a restore that took 858 seconds on a busy
+disk now takes under three.
+
+The second thread in this release is how performance gets measured at all. The
+published figures used to be whatever someone last remembered to re-run, on a
+developer laptop — where a background build or an OS indexer shifts every
+column at once and nothing in the output says so. They are now measured on
+dedicated cloud instances as part of cutting the release they describe, against
+a current `mongod`. Tail latency relative to `mongod` improved from 2.04x to
+**1.48x**, three per-operation workloads now beat it outright, and the numbers
+on the site are the numbers for the build you can download.
+
+The rest is correctness work across both servers: `$avg` on Decimal128,
+`_id: NaN` lookups, `$arrayElemAt` inventing nulls, array-field sorts that
+depended on whether an index happened to exist, a first batch that ignored
+mongod's 16 MB reply cap, IPv6 binding, `top` on the Rust server, and
+`replSetGetStatus` agreeing with `hello`.
+
+
+### Sorting on an array field no longer depends on whether an index exists
+
+MongoDB sorts an array-valued field by one representative element: its minimum
+ascending, its maximum descending. SecantusDB compared whole arrays, which placed
+every array after every scalar.
+
+That was wrong against mongod, but the sharper problem was closer to home. A
+multikey index writes one entry per element, so an index scan already produced
+mongod's ordering — meaning the same query returned a different order depending on
+whether an index happened to exist. An index is supposed to change speed, never
+results.
+
+The in-memory sort now uses the same representative element the index path does,
+and an empty array sorts between MinKey and null as mongod places it.
+
+#### Fixed
+
+- `sort` on an array-valued field orders by the array's minimum element ascending
+  and its maximum descending, so indexed and unindexed sorts agree with each other
+  and with mongod in both directions. `tests/test_array_sort_order.py`.
+- The index scan no longer lets a multikey index's whole-array entry decide sort
+  position. Those entries exist to answer equality against a whole array; they were
+  being hit first on a backward walk and steering the descending order.
+
+- The Rust server matches, on all four paths. Its `find` sort builds a byte key
+  through the same encoder that writes index entries, so the empty-array case is
+  handled locally in the sort key rather than by renumbering the persisted ranks.
+
+### `$avg` no longer crashes on Decimal128, and `$arrayElemAt` stops inventing nulls
+
+A `$group` whose `$avg` saw a Decimal128 alongside any other numeric type threw an
+unhandled `TypeError` out of the accumulator, which reached the client as a bare
+"internal server error". `$sum` had always used the type-preserving `bson_add`;
+`$avg` used a raw `+=` and was simply missed.
+
+Fixing the crash uncovered a second bug beneath it: the average came back with 27
+significant digits where mongod gives 34, because Python's default decimal context
+is 28 while Decimal128 carries 34. Widened for the division, the result is now
+byte-identical to mongod.
+
+Separately, `$arrayElemAt` with an out-of-range index returned null on both
+servers. mongod evaluates it to *missing*, so `$project` omits the field entirely —
+we were adding a field mongod does not send. A missing or null input array really
+is null, and that is unchanged.
+
+#### Fixed
+
+- `$avg` over Decimal128 returns a full-precision Decimal128 instead of raising
+  `TypeError`. `tests/test_avg_decimal128.py`.
+- `$arrayElemAt` out of range evaluates to missing on both servers, so `$project`
+  omits the field as mongod does.
+
+### Benchmark numbers now come from the release they describe
+
+The published performance figures were re-measured as part of cutting
+`secantusdb-v0.5.3-beta.162`, on dedicated cloud instances against
+**mongod 8.0.29** — so for the first time they describe the build you can
+actually download, rather than whatever was current when someone last
+remembered to re-run them.
+
+#### Changed
+
+- **Tail latency improved substantially**: p99.9 against mongod moved from
+  2.04× to **1.48×** on the head-to-head. Throughput is flat at 0.73× (was
+  0.75×, inside the 2.1% run-to-run spread).
+- **Three per-operation rows now beat mongod** — filtered scan 0.85×, indexed
+  range 0.92×, change-stream drain 0.93× — and full scan is at parity.
+- Concurrency figures are now measured on the same cloud instance as
+  everything else rather than a workstation. Absolute throughput is lower
+  because those cores are slower; the scaling ratios the page reports are
+  better, and `mongod` — the control — scales 4.96× there against 4.65× on the
+  workstation, confirming the instance is not core-starved.
+
+### Concurrency sweep gives each row its own store
+
+`bench.concurrency` shared one store across the whole writer sweep, so every
+row measured a different database. With 8,192-byte documents the 1-, 2- and
+4-writer rows leave tens of gigabytes behind, and the 8-writer row wrote into a
+tree several times the size the 1-writer row saw. In a measurement whose sole
+purpose is to isolate writer count, that is a confound — and it biases scaling
+*downwards*, because later rows look worse partly for having a bigger tree.
+
+It was also a hard failure. On a 48 GB droplet the accumulated store exhausted
+the disk mid-sweep and WiredTiger took its documented ENOSPC panic — "the
+process must exit and restart: WT_PANIC" — killing the writers. The harness
+correctly refused to report a row measured with a missing writer rather than
+publishing a silently-low number.
+
+Each row now provisions a fresh store and server, bounding peak disk to a
+single row.
+
+#### Changed
+
+- Published concurrency figures are **not comparable across this change**: rows
+  after the first previously carried the accumulated weight of every row before
+  them, so scaling was understated. The next published sweep re-baselines.
+
+### Published benchmarks now measure on dedicated hardware
+
+The per-operation latency and concurrent-writer scaling figures on
+`docs/benchmark.md`, `docs/concurrency.md` and the website's performance page
+were measured on a developer laptop. That is not a trustworthy place to measure
+one, and the failure mode is silent: a background build or an OS indexer moves
+every column at once and nothing in the output says so. One run taken straight
+after a parallel compile recorded *mongod itself* at 2.5x its own baseline, and
+because the workloads run sequentially while load decays, the ratios were
+skewed too — it reported a fabricated 0.3x where the honest figure was 0.8x.
+The table looked entirely normal.
+
+#### Added
+
+- `do-cluster perf` / `invoke do-perf` — runs both Python benchmark harnesses
+  on a DigitalOcean droplet and pulls `bench/results/latency.json` and
+  `bench/results/concurrency.json` back for the chart generators. Uses only the
+  server droplet: both harnesses spawn all three engines and drive them over
+  loopback, which is what makes them per-operation *engine* measurements rather
+  than network measurements, so a client droplet would add nothing but a NIC.
+- `bench.compare_servers --json PATH` — writes results directly in the
+  `latency.json` schema. Publishing these numbers previously required
+  hand-transcribing 27 figures into that file.
+- `bench/DO_CLUSTER.md` documents the command, and records why `mongod` is the
+  control: it is measured in the same run and does not change between releases,
+  so if its numbers drift from the previous results file, the machine moved and
+  not the engine.
+
+### A find's first batch now respects mongod's 16MB reply cap
+
+`getMore` already stopped at mongod's 16MB reply budget; a find or aggregate
+**first** batch did not. It was capped on document count alone, so
+`find` with `batchSize: 25` over 1MB documents assembled a 25MB reply and
+exhausted the cursor. Measured against a real mongod 6.0.16 on the same data,
+mongod returns 15 documents (15.0 MiB) and hands back a live cursor id.
+
+Both servers now apply the same budget the cursor registry already used: stop
+before the document that would overflow, but always take at least one, so a
+single oversized document still makes progress rather than returning an empty
+batch forever. On the Rust server the blob lengths are already known, so this
+costs nothing on the hot path.
+
+#### Fixed
+
+- `find` / `aggregate` first batches stop under the 16MB reply cap and keep the
+  cursor open for the remainder, matching mongod. Python and Rust both, covered
+  by `tests/test_first_batch_byte_cap.py` and unit tests in
+  `secantus-commands::find`.
+
+### A document with `_id: NaN` can be found again
+
+Writing `{_id: NaN}` succeeded and then the document was unreachable by its own
+key: `find({_id: NaN})` matched nothing while the row sat in the collection. The
+same held for any field — `{x: NaN}` never matched a stored NaN.
+
+IEEE 754 says NaN is not equal to itself and Python and Rust both follow it, but
+mongod matches `{x: NaN}` against a stored NaN. Storage was never at fault:
+`sortkey.encode_value` already gives NaN a stable encoding, so the index entry was
+correct all along. Only the equality matcher was wrong, on both servers.
+
+The rule is confined to equality. Range operators and sort keep IEEE semantics, so
+NaN still sorts below every other number and `$gt: NaN` still matches nothing.
+
+#### Fixed
+
+- `{field: NaN}` and `{_id: NaN}` match a stored NaN on both servers, across
+  double and Decimal128 and between the two, matching mongod 6.0.16. Covered by
+  `tests/test_nan_equality.py` and a `secantus-core` unit test that also pins the
+  ordering behaviour left unchanged.
+
+### PITR restore no longer writes 2 GB for a tiny database
+
+Every point-in-time restore wrote 2 GB to disk regardless of how much data it
+was restoring. WiredTiger preallocates its log file to `log_file_max` (2 GiB)
+and that file is almost entirely zeros, so it compressed to nothing inside the
+backup and expanded to full size on the way out: a database holding 100
+documents archived to 2.0 MB and restored to 2.0 GB.
+
+#### Fixed
+
+- Backup extraction writes files sparsely, seeking past runs of zeros instead
+  of writing them. The restored bytes are unchanged — holes read back as zeros
+  — so this changes only how a restore reaches the disk, never what WiredTiger
+  subsequently reads. A restored directory drops from **2.0 GB to 276 KB**, and
+  a restore that took 858 seconds on a busy disk now takes seconds.
+
+### `replSetGetStatus` now agrees with `hello` on the Python server
+
+SecantusDB advertises itself as a single-node `secantus` replica-set primary so
+that drivers accept change streams. The Python server said so in `hello` — and
+then, asked `replSetGetStatus`, replied "not running with --replSet". Real mongod
+is never both, and drivers notice: libmongoc's test framework counts the member
+roster to decide what kind of server it is talking to, saw nothing, concluded
+standalone, and ran standalone-only tests against a server presenting itself as a
+replica set.
+
+The Rust server fixed this months ago; the Python server never got the port. It
+does now, gated the same way — with a set name configured, `replSetGetStatus`
+reports the one-member PRIMARY roster matching `hello`; started with
+`replica_set_name=None` it is a genuine standalone and the honest
+`NoReplicationEnabled` error stands.
+
+#### Fixed
+
+- `replSetGetStatus` on the Python server reports a one-member PRIMARY roster
+  consistent with `hello`, instead of the standalone `NoReplicationEnabled`
+  error, whenever a replica-set name is configured. Ported from
+  `crates/secantus-commands/src/handshake.rs`.
+- Two mongo-c-driver gauge failures on the Python server —
+  `/Client/last_write_date_absent` and its pooled variant — now report `skip`
+  rather than failing. They are standalone-only tests that libmongoc should never
+  have run against us, and it only did because the roster was empty.
+
+### Republished the performance numbers, measured properly
+
+Every figure on the benchmark and concurrency pages has been re-measured. The
+per-operation latency table now comes from a dedicated cloud instance against
+**mongod 8.0.29**; the writer-scaling sweep from a quiet 12-core workstation,
+verified by two independent runs agreeing to within 1.2%.
+
+#### Changed
+
+- **Latency ratios look worse, and SecantusDB is not the reason.** The
+  reference moved from mongod 6.0.16 to 8.0.29. Every "×mongod" figure is a
+  ratio, so a faster denominator lowers the score: insert reads 2.0× where it
+  read 1.4×, while SecantusDB's own absolute timing barely moved. Publishing
+  against a three-major-version-old mongod flattered us. The results file now
+  records the mongod version so this cannot silently recur.
+- **Concurrency scaling looks better, and that is a fixed measurement rather
+  than a faster engine.** The sweep used to share one store across every writer
+  count, so later rows carried everything the earlier rows wrote. Removing that
+  lifted every engine — including mongod, unchanged code, by 14% at eight
+  writers. The Rust server now measures 3.0× scaling at eight writers.
+
+### `top` works on the Rust server
+
+`mongotop` failed outright against the Rust server: `top` answered code 59
+CommandNotFound, so the tool errored instead of rendering a table. The backlog
+entry describing this said "counters are always zero", which read as though it
+covered both servers and hid the fact that one of them did not implement the
+command at all.
+
+It does now, ported from `commands.py::_top` — one `totals` entry per namespace,
+the `note` key mongo-tools skips, `total`/`readLock`/`writeLock` plus the per-op
+sections each `{time, count}`, and the same code-13 refusal outside the `admin`
+database.
+
+The counters themselves are still zero on both servers: nothing instruments
+per-namespace operation timing, so `mongotop` renders an idle server. That half
+stays open and is recorded as such.
+
+#### Fixed
+
+- `top` on the Rust server returns the mongod-shaped reply instead of
+  CommandNotFound, so `mongotop` runs against it. Covered by a
+  `secantus-commands` unit test pinning the non-admin refusal.
+
+### The server is no longer IPv4-only
+
+`SecantusDBServer` created its listening socket with a hardcoded
+`socket.AF_INET`, so an IPv6 host was not merely unserved — it failed at bind
+with a bare `gaierror` ("nodename nor servname provided") that gave no clue the
+address family was the problem. Nothing in the suite bound a non-IPv4 host, so it
+went unnoticed.
+
+The family now comes from `getaddrinfo`, which also handles hostnames and gives
+the correct wildcard address for an empty host. `host="::1"` serves a full
+round-trip; IPv4 behaviour is unchanged.
+
+#### Fixed
+
+- `SecantusDBServer(host="::1", ...)` binds and serves instead of raising
+  `gaierror`. Covered by `tests/test_server_bind_family.py`, which drives a real
+  insert and read-back over both families.
+
 ## [0.6.0b14] — 2026-08-22
 
 ### Writes got a lot faster, and we built the rig that proved it
