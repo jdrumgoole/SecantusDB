@@ -375,6 +375,7 @@ markers = [
     "perf: performance regression tests (run via `invoke perf`, not in default suite)",
     "online: tests that hit the public internet (run via `invoke validate-readme` or `pytest -m online`, not in default suite)",
     "slow: long-running benchmarks / scaling regressions (run via `pytest -m slow`, not in default suite)",
+    "differential: same operation against SecantusDB and a real mongod (skipped when no mongod is on PATH; run via `pytest -m differential`)",
 ]
 
 [tool.ruff]
