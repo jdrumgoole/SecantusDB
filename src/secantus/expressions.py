@@ -2313,10 +2313,17 @@ def _op_array_elem_at(arg: Any, ctx: _Ctx) -> Any:
         arr, f"$arrayElemAt's first argument must be an array, but is {_bson_type_name(arr)}", 28689
     )
     if not isinstance(arr, list) or not isinstance(idx, int):
+        # A missing / null input array really is null — probed against mongod
+        # 6.0.16: `{$arrayElemAt: ["$nope", 0]}` projects `r: null`.
         return None
     if -len(arr) <= idx < len(arr):
         return arr[idx]
-    return None
+    # An in-bounds array with an out-of-range index evaluates to MISSING, not
+    # null, so `$project` omits the field entirely. mongod on `[1, 2]`:
+    # index 9 and index -9 both yield `{_id: 1}` with no `r` at all, while
+    # index 0 yields `r: 1`. We returned null, which added a field mongod does
+    # not send.
+    return MISSING
 
 
 def _reject_non_array(v: Any, message: str, code: int) -> None:

@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from secantus.expressions import ExpressionError, evaluate
+from secantus.expressions import MISSING, ExpressionError, evaluate
 
 
 def test_literal_passthrough() -> None:
@@ -287,7 +287,14 @@ def test_array_elem_at() -> None:
     doc = {"a": [10, 20, 30]}
     assert evaluate({"$arrayElemAt": ["$a", 0]}, doc) == 10
     assert evaluate({"$arrayElemAt": ["$a", -1]}, doc) == 30
-    assert evaluate({"$arrayElemAt": ["$a", 99]}, doc) is None
+    # Out of range evaluates to MISSING, not null, so `$project` omits the field.
+    # This used to assert `is None`, which added a field mongod does not send —
+    # probed against mongod 6.0.16, where index 99 and index -99 on `[1, 2]` both
+    # project `{_id: 1}` with no field at all.
+    assert evaluate({"$arrayElemAt": ["$a", 99]}, doc) is MISSING
+    assert evaluate({"$arrayElemAt": ["$a", -99]}, doc) is MISSING
+    # A missing or null input array really is null, and is unchanged.
+    assert evaluate({"$arrayElemAt": ["$nope", 0]}, doc) is None
 
 
 def test_first_last_slice_reverse() -> None:
