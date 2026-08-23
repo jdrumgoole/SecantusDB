@@ -423,16 +423,34 @@ These are explicit non-goals. Don't add them without a reason.
   aggregation — a `$group` over a collection that happens to contain one Decimal128
   simply does not work there. Closing it means real Decimal128 arithmetic in the
   Rust accumulators (a decimal crate), not a shim.
-- [ ] **OPEN — cross-type `sort` order differs between our two servers AND from
-  mongod (found 2026-08-23).** Sorting `["10", 10, [1,2,3], {a:1}, [], [[]]]` by that
-  field ascending: mongod `[5, 3, 2, 1, 4, 6]`, Python `[2, 1, 4, 5, 3, 6]`, Rust
-  `[2, 1, 4, 5, 6, 3]`. **Python and Rust disagreeing is a bug on its own terms**,
-  independent of mongod — the two servers must order identically or a client that
-  switches servers silently reorders. Both also differ from mongod's BSON cross-type
-  ordering for arrays vs scalars. Touches `sortkey` / `ordering` on the Python side
-  and the Rust comparison path; scoped as its own slice rather than folded into an
-  aggregation batch.
-
+- [x] **Array sort order — FIXED on BOTH servers, all four paths (2026-08-23).**
+  mongod sorts an ARRAY-valued field by one representative element: its minimum
+  ascending, its maximum descending. Verified on mongod 6.0.16 with
+  `[[1,100], [5,9], 6, [7]]` — ascending `[1,100] < [5,9] < 6 < [7]` (minima
+  1 < 5 < 6 < 7), descending by maxima 100 > 9 > 7 > 6. An empty array has no
+  representative and sorts between MinKey and Null. We compared whole arrays, which
+  put every array after every scalar.
+  **The sharper bug was internal:** a multikey index writes one entry per element,
+  so an IXSCAN already produced mongod's ordering while the in-memory sort did not —
+  *the same query returned a different order depending on whether an index existed*.
+  An index must change speed, never results.
+  **A second, distinct defect showed up in the descending index walk.** Multikey
+  indexes also write a WHOLE-ARRAY entry, and that key sorts in the Array slot,
+  after every scalar. A backward walk hit those first, so the first-occurrence dedup
+  picked documents by their whole-array key rather than their maximum element —
+  which happened to reproduce insertion order and made it look inexplicable.
+  Ascending never showed it because element entries come first there.
+  **Fixed in four places:** `ordering.py::_array_sort_value` (Python in-memory),
+  `storage.py::_walk_index_in_order` + `_is_whole_array_key` (Python index walk),
+  `order.rs::array_sort_value` with `aggregate.rs`'s `$sort` stage and
+  `storage/lib.rs::sort_key` (Rust in-memory), and `walk_index_in_order` +
+  `is_whole_array_key` (Rust index walk). Whole-array entries are dropped only from
+  the ORDERING walk — they exist to answer `{x: [5, 9]}` equality, which takes a
+  different path and is covered by its own test on both servers.
+  The Rust empty-array marker is `Bson::Undefined` (pymongo never encodes it, so it
+  cannot collide) with a rank between MinKey and Null; the persisted index rank
+  bytes were deliberately NOT renumbered, and the storage `sort_key` special case
+  is safe because its only two callers are in-memory sorts.
 - [x] **DATA CORRUPTION: retryable writes were not idempotent — FIXED on BOTH
   servers (#844 Python, #850 Rust).** Found 2026-08-13 while
   triaging the C gauge's `/command_monitoring/unified/writeConcernError`.

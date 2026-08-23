@@ -48,7 +48,12 @@ from secantus.geo_index import (
 from secantus.paths import get_path, get_path_values
 from secantus.projection import apply_projection_batch
 from secantus.query import matches
-from secantus.sortkey import COMPOUND_SEP, encode_value, encode_value_directed
+from secantus.sortkey import (
+    COMPOUND_SEP,
+    RANK_ARRAY,
+    encode_value,
+    encode_value_directed,
+)
 from secantus.update import apply_update, find_positional_matches
 
 _GEO_2DSPHERE = "2dsphere"
@@ -396,6 +401,20 @@ def _pack_entry(kb: bytes, recordid: int) -> bytes:
     ``pack_entry``.
     """
     return _escape_kb(kb) + _ENTRY_SEP + recordid.to_bytes(8, "big", signed=True)
+
+
+def _is_whole_array_key(escaped_key: bytes, idx_dir: int) -> bool:
+    """Whether an index entry's key is a whole-array key rather than an element.
+
+    The first byte of an encoded value is its type rank (see `sortkey`), and
+    escaping only rewrites `\x00`, which no rank byte is. A descending column is
+    encoded byte-inverted, so the rank arrives as `0xFF - rank` there.
+    """
+    if not escaped_key:
+        return False
+    first = escaped_key[0]
+    expected = RANK_ARRAY if idx_dir >= 0 else 0xFF - RANK_ARRAY
+    return first == expected
 
 
 def _unpack_entry(packed: bytes) -> tuple[bytes, int | None]:
@@ -4720,7 +4739,9 @@ class Storage:
                         # If the index direction matches the sort direction,
                         # walk forward; if it's opposite, walk backward.
                         reverse = sort_dir != idx_dir
-                        candidates = self._walk_index_in_order(db, coll, idx_name, reverse=reverse)
+                        candidates = self._walk_index_in_order(
+                            db, coll, idx_name, reverse=reverse, idx_dir=idx_dir
+                        )
                         in_sort_order = True
                 # Multi-field sort acceleration: when sort has 2+ fields and
                 # filter is empty, try to find a compound index whose key
@@ -5020,8 +5041,24 @@ class Storage:
         return None
 
     def _walk_index_in_order(
-        self, db: str, coll: str, name: str, *, reverse: bool = False
+        self, db: str, coll: str, name: str, *, reverse: bool = False, idx_dir: int = 1
     ) -> list[dict[str, Any]]:
+        """Documents in index order, for sort acceleration.
+
+        **Whole-array entries are skipped.** A multikey index writes one entry per
+        array element *plus* one for the whole array, and the whole-array key sorts
+        in the Array type slot — after every scalar. Walking backward therefore hits
+        those first, and the first-occurrence dedup below then picked documents by
+        their whole-array key instead of by their maximum element, which is what
+        mongod orders by. (Ascending never showed it: the element entries come
+        first there, so dedup naturally picked the minimum.)
+
+        Concretely, with `[{x: [5,9]}, {x: [1,100]}, {x: [7]}, {x: 6}]` and an
+        ascending index, descending returned insertion order rather than
+        `[1,100] < [5,9] < [7] < 6` by maxima. The whole-array entries exist to
+        answer equality against a whole array (`{x: [5, 9]}`) and have no business
+        deciding sort position, so this walk — used only for ordering — drops them.
+        """
         c = self._cursor(_IDX_ENTRIES_TABLE)
         c.set_key(db, coll, name, b"")
         rc = c.search_near()
@@ -5035,8 +5072,8 @@ class Storage:
             if (k[0], k[1], k[2]) != (db, coll, name):
                 break
             packed = bytes(k[3])
-            _esc, row_id = _unpack_entry(packed)
-            if row_id is not None:
+            esc, row_id = _unpack_entry(packed)
+            if row_id is not None and not _is_whole_array_key(esc, idx_dir):
                 recordids.append(row_id)
             if c.next() != 0:
                 break
