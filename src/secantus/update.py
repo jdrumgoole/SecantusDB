@@ -52,6 +52,32 @@ class UpdateError(Exception):
         self.code = code
 
 
+def _is_inc_numeric(v: Any) -> bool:
+    """Whether `$inc` / `$mul` may operate on an existing field value.
+
+    mongod's numeric type for arithmetic is int32 / int64 / double / Decimal128.
+    `bool` is deliberately excluded even though Python treats it as an int —
+    mongod answers TypeMismatch (14) for `$inc` against `true`.
+    """
+    from bson import Decimal128, Int64
+
+    if isinstance(v, bool):
+        return False
+    return isinstance(v, (int, float, Int64, Decimal128))
+
+
+def _addtoset_equal(a: Any, b: Any) -> bool:
+    """mongod's `$addToSet` membership test: exact, field-order-sensitive.
+
+    Delegates to the query matcher's equality so the two can never drift — the
+    same rule decides whether `{a: <doc>}` matches and whether `$addToSet` treats
+    the value as already present.
+    """
+    from secantus.query import _eq_numeric_aware
+
+    return _eq_numeric_aware(a, b)
+
+
 def _bson_type_name(v: Any) -> str:
     """mongod's type vocabulary for update parse-error messages."""
     from bson import Decimal128, Int64
@@ -682,11 +708,18 @@ def _apply_op(
                     current: Any = 0
                 else:
                     current = get_path(doc, concrete)
-                    if current is None:
+                    # Every non-numeric type is refused, not just null. This used
+                    # to check `is None` alone, so a string field reached
+                    # `bson_add` and raised a bare `ValueError: invalid literal
+                    # for int()` that escaped as "internal server error" (code 1),
+                    # and a bool silently incremented — `{n: true}` became `n: 2`
+                    # where mongod refuses. bool is checked explicitly because
+                    # Python makes it a subclass of int.
+                    if not _is_inc_numeric(current):
                         raise UpdateError(
                             f"Cannot apply $inc to a value of non-numeric type. "
                             f"{{{concrete}}} has the field '{concrete.split('.')[-1]}' "
-                            f"of non-numeric type null",
+                            f"of non-numeric type {_bson_type_name(current)}",
                             code=14,
                         )
                 # bson_add preserves the BSON numeric type (mongod widens
@@ -701,11 +734,14 @@ def _apply_op(
                     current = 0
                 else:
                     current = get_path(doc, concrete)
-                    if current is None:
+                    # Same defect as `$inc` had: checking only `is None` let a
+                    # string reach `bson_mul` (bare ValueError -> "internal server
+                    # error") and silently multiplied a bool.
+                    if not _is_inc_numeric(current):
                         raise UpdateError(
                             f"Cannot apply $mul to a value of non-numeric type. "
                             f"{{{concrete}}} has the field '{concrete.split('.')[-1]}' "
-                            f"of non-numeric type null",
+                            f"of non-numeric type {_bson_type_name(current)}",
                             code=14,
                         )
                 set_path(doc, concrete, bson_mul(current, factor))
@@ -754,7 +790,16 @@ def _apply_op(
                 if _is_each_modifier(value) and not isinstance(value["$each"], list):
                     raise UpdateError("$each must be an array")
                 for elem in to_add:
-                    if elem not in arr:
+                    # `elem not in arr` uses Python `==`, which compares dicts
+                    # ORDER-INSENSITIVELY. mongod does not: `{y: 2, x: 1}` is a
+                    # different value from `{x: 1, y: 2}` and gets added as a
+                    # separate element. Probed against 6.0.16, where the reordered
+                    # doc yields `[{x:1,y:2}, {y:2,x:1}]` and a query for the
+                    # reordered form matches nothing. Our query matcher already
+                    # gets this right (`query._eq_numeric_aware` walks pairs in
+                    # order); `$addToSet` was the odd one out, silently dropping
+                    # an element mongod keeps.
+                    if not any(_addtoset_equal(elem, existing) for existing in arr):
                         arr.append(elem)
                 set_path(doc, concrete, arr)
     elif op == "$pull":
