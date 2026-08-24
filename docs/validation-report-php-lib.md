@@ -18,7 +18,7 @@ Run `uv run python -m invoke validate-php-lib` to refresh. The pass rate is the 
 | `tests/Operation` | 1902 | 0 | 36 | 1938 | 100.0% |
 | **Overall** | **3088** | **1** | **41** | **3130** | **100.0%** |
 
-Run time: 3.18s.
+Run time: 4.58s.
 
 ## Failures (1)
 
