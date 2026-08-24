@@ -119,6 +119,12 @@ NUMS = [
     {"_id": 7},
 ]
 
+# 34-significant-digit decimals — the width a 28-digit context silently ate.
+DECIMALS_34 = [
+    {"_id": 1, "x": Decimal128("1.000000000000000000000000000000001")},
+    {"_id": 2, "x": Decimal128("1")},
+]
+
 ARRAYS = [
     {"_id": 1, "x": [5, 9]},
     {"_id": 2, "x": [1, 100]},
@@ -153,6 +159,79 @@ QUERY_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
         "arrayelemat-out-of-range-is-missing",
         [{"_id": 1, "a": [1, 2]}],
         lambda db: list(db.c.aggregate([{"$project": {"r": {"$arrayElemAt": ["$a", 9]}}}])),
+    ),
+    # Decimal128 carries 34 significant digits. Comparing `str(...)` rather
+    # than the value is deliberate: it catches both lost precision and a lost
+    # quantum (`5.00` vs `5`), which compare equal as numbers.
+    (
+        "sum-decimal-keeps-34-digits",
+        DECIMALS_34,
+        lambda db: [
+            str(d["s"]) for d in db.c.aggregate([{"$group": {"_id": None, "s": {"$sum": "$x"}}}])
+        ],
+    ),
+    (
+        "avg-decimal-keeps-34-digits",
+        DECIMALS_34,
+        lambda db: [
+            str(d["s"]) for d in db.c.aggregate([{"$group": {"_id": None, "s": {"$avg": "$x"}}}])
+        ],
+    ),
+    (
+        "sum-decimal-preserves-quantum",
+        [{"_id": 1, "x": Decimal128("2.50")}, {"_id": 2, "x": Decimal128("0.10")}],
+        lambda db: [
+            str(d["s"]) for d in db.c.aggregate([{"$group": {"_id": None, "s": {"$sum": "$x"}}}])
+        ],
+    ),
+    (
+        "sum-decimal-mixed-with-double",
+        [{"_id": 1, "x": Decimal128("1.5")}, {"_id": 2, "x": 3.0}],
+        lambda db: [
+            str(d["s"]) for d in db.c.aggregate([{"$group": {"_id": None, "s": {"$sum": "$x"}}}])
+        ],
+    ),
+    # mongod uses two *different* double→decimal conversions: the accumulators
+    # take the exact binary value, while $inc/$mul/$toDecimal take 15
+    # significant digits. These two cases and `inc-decimal-by-double-*` below
+    # pin both halves — they answer differently for the same operand.
+    (
+        "sum-double-uses-the-exact-binary-value",
+        [{"_id": 1, "x": Decimal128("0")}, {"_id": 2, "x": 0.1}],
+        lambda db: [
+            str(d["s"]) for d in db.c.aggregate([{"$group": {"_id": None, "s": {"$sum": "$x"}}}])
+        ],
+    ),
+    (
+        "sum-integral-double-keeps-exponent-zero",
+        [{"_id": 1, "x": Decimal128("0")}, {"_id": 2, "x": 1e10}],
+        lambda db: [
+            str(d["s"]) for d in db.c.aggregate([{"$group": {"_id": None, "s": {"$sum": "$x"}}}])
+        ],
+    ),
+    (
+        "todecimal-double-uses-15-digits",
+        [{"_id": 1, "x": 0.1}],
+        lambda db: [
+            str(d["r"]) for d in db.c.aggregate([{"$project": {"r": {"$toDecimal": "$x"}}}])
+        ],
+    ),
+    (
+        "todecimal-double-terminating-still-pads-to-15",
+        [{"_id": 1, "x": 4.125}],
+        lambda db: [
+            str(d["r"]) for d in db.c.aggregate([{"$project": {"r": {"$toDecimal": "$x"}}}])
+        ],
+    ),
+    (
+        "convert-to-decimal-matches-todecimal",
+        [{"_id": 1, "x": 4.125}],
+        lambda db: [
+            str(d["r"])
+            for d in db.c.aggregate(
+                [{"$project": {"r": {"$convert": {"input": "$x", "to": "decimal"}}}}]
+            )
+        ],
     ),
 ]
 
@@ -197,6 +276,46 @@ UPDATE_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
         "min-is-cross-type-not-numeric-only",
         [{"_id": 1, "n": "x"}],
         lambda db: db.c.update_one({"_id": 1}, {"$min": {"n": 5}}) and db.c.find_one({"_id": 1}),
+    ),
+    (
+        "inc-decimal-keeps-34-digits",
+        [{"_id": 1, "n": Decimal128("1.000000000000000000000000000000001")}],
+        lambda db: (
+            db.c.update_one({"_id": 1}, {"$inc": {"n": Decimal128("1")}})
+            and str(db.c.find_one({"_id": 1})["n"])
+        ),
+    ),
+    (
+        "inc-decimal-preserves-quantum",
+        [{"_id": 1, "n": Decimal128("2.50")}],
+        lambda db: (
+            db.c.update_one({"_id": 1}, {"$inc": {"n": Decimal128("0.10")}})
+            and str(db.c.find_one({"_id": 1})["n"])
+        ),
+    ),
+    (
+        "mul-decimal-preserves-quantum",
+        [{"_id": 1, "n": Decimal128("2.50")}],
+        lambda db: (
+            db.c.update_one({"_id": 1}, {"$mul": {"n": Decimal128("2")}})
+            and str(db.c.find_one({"_id": 1})["n"])
+        ),
+    ),
+    (
+        "mul-decimal-rounds-half-even-past-34-digits",
+        [{"_id": 1, "n": Decimal128("1.234567890123456789012345678901234")}],
+        lambda db: (
+            db.c.update_one({"_id": 1}, {"$mul": {"n": Decimal128("9.999")}})
+            and str(db.c.find_one({"_id": 1})["n"])
+        ),
+    ),
+    (
+        "inc-decimal-by-double-takes-the-double-quantum",
+        [{"_id": 1, "n": Decimal128("1.5")}],
+        lambda db: (
+            db.c.update_one({"_id": 1}, {"$inc": {"n": 3.0}})
+            and str(db.c.find_one({"_id": 1})["n"])
+        ),
     ),
 ]
 

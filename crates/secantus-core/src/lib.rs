@@ -33,6 +33,7 @@ pub mod update;
 // Internal shared helpers — implementation details of the engines above, not
 // part of the crate's public surface (kept crate-private so their deliberate
 // `Result<_, ()>` "defer" signals stay internal rather than public API).
+mod decimal;
 mod densify;
 mod fill;
 mod group;

@@ -21,7 +21,7 @@ from secantus.expressions import (
     evaluate,
     evaluate_or_missing,
 )
-from secantus.numerics import bson_add
+from secantus.numerics import bson_sum
 from secantus.paths import get_path, set_path, unset_path
 from secantus.query import QueryError, matches
 
@@ -1155,7 +1155,7 @@ def _acc_sum(
     # bson_add preserves the BSON numeric type (int32 < int64 < double <
     # decimal128) so a $sum over Int64 values stays Int64 rather than
     # narrowing to int32 on the wire.
-    bucket[field] = bson_add(bucket[field], increment)
+    bucket[field] = bson_sum(bucket[field], increment)
 
 
 def _acc_count(
@@ -1181,7 +1181,7 @@ def _acc_avg(
     # the moment a group mixes Decimal128 with any other numeric type, and that
     # escaped as a bare "internal server error" to the client. $sum already used
     # bson_add; $avg was simply missed.
-    state["_avg_total"] = bson_add(state["_avg_total"], v)
+    state["_avg_total"] = bson_sum(state["_avg_total"], v)
     state["_avg_n"] += 1
 
 

@@ -1168,19 +1168,18 @@ fn expr_acc_values(arg: &Bson, ctx: &Ctx) -> Result<Vec<Bson>, Fallback> {
 }
 
 fn op_expr_sum(arg: &Bson, ctx: &Ctx) -> R {
-    // Reuses the group-accumulator `Num` width logic (int32 < int64 < double);
-    // a Decimal128 element defers to Python; non-numeric elements are ignored.
+    // Reuses the group-accumulator `Num` width logic (int32 < int64 < double <
+    // decimal); non-numeric elements are ignored.
     let mut running = crate::group::Num::Int { v: 0, wide: false };
     for v in expr_acc_values(arg, ctx)? {
         match v {
-            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => {
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
                 running = running.add(&v).map_err(|_| Fallback)?;
             }
-            Bson::Decimal128(_) => return Err(Fallback),
             _ => {} // bool / string / null / doc / array -> ignored
         }
     }
-    running.to_bson().map_err(|_| Fallback)
+    running.into_bson().map_err(|_| Fallback)
 }
 
 fn op_expr_avg(arg: &Bson, ctx: &Ctx) -> R {
@@ -1188,11 +1187,10 @@ fn op_expr_avg(arg: &Bson, ctx: &Ctx) -> R {
     let mut count: i64 = 0;
     for v in expr_acc_values(arg, ctx)? {
         match v {
-            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => {
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
                 total = total.add(&v).map_err(|_| Fallback)?;
                 count += 1;
             }
-            Bson::Decimal128(_) => return Err(Fallback),
             _ => {}
         }
     }
@@ -1207,6 +1205,12 @@ fn op_expr_avg(arg: &Bson, ctx: &Ctx) -> R {
             v as f64
         }
         crate::group::Num::Float(f) => f,
+        // Stay in the decimal domain — an f64 divide would narrow the type and
+        // drop digits.
+        crate::group::Num::Dec(d) => {
+            return crate::decimal::to_bson(&crate::decimal::div_int(&d, count).ok_or(Fallback)?)
+                .ok_or(Fallback);
+        }
     };
     Ok(Bson::Double(tf / count as f64))
 }
@@ -2856,9 +2860,13 @@ fn op_to_decimal(arg: &Bson, ctx: &Ctx) -> R {
         Bson::Int32(n) => decimal_from_str(&n.to_string()),
         Bson::Int64(n) => decimal_from_str(&n.to_string()),
         Bson::Boolean(b) => decimal_from_str(if b { "1" } else { "0" }),
-        // Shortest round-trip text matches Python's `repr(float)` so the
-        // Decimal128 payload agrees bit-for-bit.
-        Bson::Double(d) if d.is_finite() => decimal_from_str(&format!("{d:?}")),
+        // mongod converts a double at a fixed 15 significant digits, so
+        // `$toDecimal: 4.125` is `4.12500000000000` — the shortest round-trip
+        // text would answer `4.125`, a different quantum. (The `$sum`/`$avg`
+        // accumulators use a *different* rule; see `crate::decimal`.)
+        Bson::Double(d) if d.is_finite() => crate::decimal::from_bson(&Bson::Double(d))
+            .and_then(|v| crate::decimal::to_bson(&v))
+            .ok_or(Fallback),
         Bson::String(ref s) => decimal_from_str(s),
         _ => Err(Fallback),
     }
@@ -2985,7 +2993,15 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
             Bson::Boolean(b) => decimal_conv(if *b { "1" } else { "0" }),
             Bson::Int32(n) => decimal_conv(&n.to_string()),
             Bson::Int64(n) => decimal_conv(&n.to_string()),
-            Bson::Double(d) if d.is_finite() => decimal_conv(&format!("{d:?}")),
+            // 15 significant digits, as `$toDecimal` — mongod-probed 6.0.16.
+            Bson::Double(d) if d.is_finite() => {
+                match crate::decimal::from_bson(&Bson::Double(*d))
+                    .and_then(|v| crate::decimal::to_bson(&v))
+                {
+                    Some(b) => Conv::Ok(b),
+                    None => Conv::Unsupported,
+                }
+            }
             Bson::String(s) => decimal_conv(s),
             _ => Conv::Unsupported,
         },
