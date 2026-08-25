@@ -6938,7 +6938,7 @@ distinct problems, triaged from the run logs:
   (renames of huge collections are rare); bounded today only by luck of
   cache headroom. The `drop_target=true` purge inside rename shares the
   shape.
-- [ ] **PARTIALLY FIXED 2026-08-25: change streams — an awaitData `getMore`
+- [ ] **OPEN — half fixed 2026-08-25: change streams, an awaitData `getMore`
   with NO `maxTimeMS` waits 1s, so an event that happens during the wait comes
   back to a client that asked "is anything ready right now?".** Surfaced as
   mongo-go-driver's `TestChangeStream_ReplicaSet/try_next/one_getMore_sent`
