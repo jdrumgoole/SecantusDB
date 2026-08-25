@@ -2634,6 +2634,46 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   update-parity cases.)
 - [ ] **Aggregate gaps found by the three-way differential (2026-07-10, both
   servers).**
+  **2026-08-25 re-run (44 stages/operators, both servers vs mongod 6.0.16):
+  two real bugs found and FIXED, one new gap characterised.**
+  - *FIXED — a missing field path emitted `null` instead of being omitted.*
+    `{$project: {z: "$nope"}}`, `{$project: {z: "$n.k"}}` with `n.k` absent, and
+    `{$addFields: {z: "$nope"}}` all wrote `z: null`; mongod omits the key. So
+    did a document literal — `{$project: {z: {w: "$nope"}}}` gave `{z: {w: null}}`
+    where mongod gives `{z: {}}`. Silent wrong data: every document carried a key
+    mongod never sends, inverting a client's `"z" in doc` test. Both engines
+    already had the MISSING marker and both stages already skipped it — they
+    never *received* it, because plain `evaluate` answers null for an absent
+    path. Fixed with a separate field-value evaluator
+    (`expressions.evaluate_or_missing` / `expressions::eval_field_value`),
+    deliberately NOT by changing `evaluate`: a missing path is still `null` as an
+    *operator argument* (`{$add: ["$nope", 1]}` is 1), and only *missing* in
+    field-value position. Both rules are pinned in
+    `tests/test_mongod_differential.py`.
+  - *FIXED — `$bucket` emitted empty buckets.* mongod emits a bucket only when
+    something landed in it, boundary buckets and `default` alike (probed:
+    boundaries `[0,2,4,8]` over values 1 and 7 answer `_id: 0` and `_id: 4`,
+    omitting `_id: 2`). An unused `default` surfaced as a bare `{_id: "other"}`
+    with no `count` at all. The Rust side had *deliberately* reproduced the bug
+    to match the buggy Python, comment and all; both moved together.
+  - *OPEN (new, characterised) — aggregation runtime errors lack mongod's
+    wrapper prefix.* Codes match; the message doesn't. mongod picks one of three
+    wrappers by **when** the error fires, which is decided by constant folding:
+    an all-literal expression folds at optimize time and gets
+    `Failed to optimize pipeline :: caused by :: <msg>`, while any field
+    reference defers to runtime and gets
+    `PlanExecutor error during aggregation :: caused by :: <msg>`. Probed both
+    ways on the same operators (`{$divide: [1, 0]}` vs `{$divide: ["$a", 0]}`;
+    `{$ln: -1}` vs `{$ln: "$neg"}`). Parse-time errors have their own wrappers
+    (`Invalid $project :: caused by ::`, which we already emit). Closing it means
+    modelling "does this expression subtree reference a field path or variable",
+    which is tractable but is message text only — deliberately not attempted in
+    the 2026-08-25 pass rather than half-implemented.
+  - *NOT a bug:* `$group` output order differs from mongod. Confirmed identical
+    as sets, and mongod's own order **changed between two runs of the same
+    pipeline** — it is genuinely unspecified. Any test comparing `$group` output
+    must sort first.
+
   **`$stdDevPop` last-ULP vs mongod** — both servers agree with each other but
   differ from mongod in the final ULP (e.g. `2.357022603955158` vs mongod's
   `2.3570226039551585`); mongod uses a different summation order. Precision-only,

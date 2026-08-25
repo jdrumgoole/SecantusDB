@@ -79,8 +79,31 @@ def _eval(expr: Any, ctx: _Ctx) -> Any:
             (key,) = expr.keys()
             if key.startswith("$"):
                 return _apply_op(key, expr[key], ctx)
-        return {k: _eval(v, ctx) for k, v in expr.items()}
+        # A document *literal*. Each member sits in field-value position, so a
+        # member whose value is an absent field path is dropped rather than
+        # written as null — mongod answers `{z: {}}` for
+        # `{$project: {z: {w: "$nope"}}}`, not `{z: {w: null}}`.
+        out: dict[str, Any] = {}
+        for k, v in expr.items():
+            value = _eval_field_value(v, ctx)
+            if value is not MISSING:
+                out[k] = value
+        return out
     return expr
+
+
+def _eval_field_value(expr: Any, ctx: _Ctx) -> Any:
+    """Evaluate in *field-value* position, where an absent path is MISSING.
+
+    Differs from :func:`_eval` only for a bare field-path string: as an
+    operator argument a missing path is `null` (`{$add: ["$nope", 1]}` is 1),
+    but as the value of a projected/added field it is *missing* and the key is
+    omitted. Keeping the two distinct is why this isn't folded into `_eval`.
+    """
+    if isinstance(expr, str) and expr.startswith("$") and not expr.startswith("$$"):
+        d = ctx.doc if isinstance(ctx.doc, dict) else dict(ctx.doc)
+        return get_path(d, expr[1:], default=MISSING)
+    return _eval(expr, ctx)
 
 
 _REMOVE_SENTINEL: Any = object()

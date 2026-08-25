@@ -64,6 +64,13 @@ pub fn evaluate(doc: &Document, expr: &Bson, vars: &Document) -> R {
     eval(expr, &Ctx { doc, vars })
 }
 
+/// [`evaluate`] in *field-value* position — an absent field path yields the
+/// missing marker (`Bson::Undefined`) so `$project` / `$addFields` omit the key
+/// instead of writing null. Mirrors `expressions.py::evaluate_or_missing`.
+pub fn evaluate_or_missing(doc: &Document, expr: &Bson, vars: &Document) -> R {
+    eval_field_value(expr, &Ctx { doc, vars })
+}
+
 /// MongoDB truthiness (`secantus.expressions._bool` / `query._truthy`): null is
 /// false, numbers are nonzero, everything else (incl. strings/arrays/docs/
 /// Decimal128) is true.
@@ -105,14 +112,42 @@ fn eval(expr: &Bson, ctx: &Ctx) -> R {
                     return apply_op(key, val, ctx);
                 }
             }
+            // A document *literal*. Each member is in field-value position, so
+            // a member whose value is an absent field path is dropped rather
+            // than written as null: mongod answers `{z: {}}` for
+            // `{$project: {z: {w: "$nope"}}}`, not `{z: {w: null}}`.
             let mut out = Document::new();
             for (k, v) in d {
-                out.insert(k.clone(), eval(v, ctx)?);
+                let value = eval_field_value(v, ctx)?;
+                if !matches!(value, Bson::Undefined) {
+                    out.insert(k.clone(), value);
+                }
             }
             Ok(Bson::Document(out))
         }
         other => Ok(other.clone()),
     }
+}
+
+/// Evaluate in *field-value* position, where an absent path is the missing
+/// marker (`Bson::Undefined`) rather than null.
+///
+/// Differs from [`eval`] only for a bare field-path string: as an operator
+/// argument a missing path is null (`{$add: ["$nope", 1]}` is 1), but as the
+/// value of a projected/added field it is *missing* and the key is omitted.
+/// Keeping the two distinct is why this isn't folded into `eval`.
+/// Mirrors `expressions.py::_eval_field_value`.
+fn eval_field_value(expr: &Bson, ctx: &Ctx) -> R {
+    if let Bson::String(s) = expr {
+        if !s.starts_with("$$") {
+            if let Some(path) = s.strip_prefix('$') {
+                return Ok(paths::get_path(ctx.doc, path)
+                    .cloned()
+                    .unwrap_or(Bson::Undefined));
+            }
+        }
+    }
+    eval(expr, ctx)
 }
 
 fn resolve_var(name: &str, ctx: &Ctx) -> R {
