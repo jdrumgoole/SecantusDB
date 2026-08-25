@@ -4102,6 +4102,16 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     raw_batch_size = int(doc.get("batchSize", 0) or 0)
     batch_size = raw_batch_size or DEFAULT_BATCH_SIZE
     max_time_ms = int(doc.get("maxTimeMS", 0) or 0)
+    # An EXPLICIT ``maxTimeMS: 0`` is not the same as an absent one, and the
+    # value alone cannot tell them apart. mongod returns immediately on an
+    # explicit zero (a non-blocking poll) and waits indefinitely when the
+    # field is absent. Drivers rely on the difference: the Go driver's
+    # ``TryNext`` sends ``maxTimeMS: 0`` for exactly one non-blocking
+    # getMore, and blocking there let a later event -- in the failing case
+    # the watched collection's own drop, written by test teardown -- land
+    # inside our wait and come back as an event the client had already
+    # been told did not exist.
+    no_wait = "maxTimeMS" in doc and max_time_ms <= 0
     ns = _ns(ctx.db_name, coll)
     try:
         entry = ctx.cursors.get(cursor_id)
@@ -4185,7 +4195,7 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     except _CappedPositionLost:
         ctx.cursors.kill([cursor_id])
         return _capped_position_lost_reply()
-    if not entry.remaining and entry.await_data and not entry.invalidated:
+    if not entry.remaining and entry.await_data and not entry.invalidated and not no_wait:
         # PyMongo does not always pass maxTimeMS on getMore for change streams;
         # real mongod treats that as "wait indefinitely". We bound the wait so
         # the connection thread can be reaped on shutdown.
