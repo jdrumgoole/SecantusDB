@@ -6949,60 +6949,79 @@ distinct problems, triaged from the run logs:
   (renames of huge collections are rare); bounded today only by luck of
   cache headroom. The `drop_target=true` purge inside rename shares the
   shape.
-- [ ] **Change streams: `TryNext` occasionally returns an event on an idle
-  collection — `mongo-go-driver`'s
-  `TestChangeStream_ReplicaSet/try_next/one_getMore_sent`, ~2 runs in 3
-  (2026-08-25).** The Go driver's contract is that `TryNext` sends exactly one
-  `getMore` and returns `false` when nothing is ready. With no events generated
-  at all, our server returned a document:
+- [ ] **OPEN — half fixed 2026-08-25: change streams, an awaitData `getMore`
+  with NO `maxTimeMS` waits 1s, so an event that happens during the wait comes
+  back to a client that asked "is anything ready right now?".** Surfaced as
+  mongo-go-driver's `TestChangeStream_ReplicaSet/try_next/one_getMore_sent`
+  failing intermittently: `TryNext returned true on iteration 1` with no events
+  generated at all.
 
-      change_stream_test.go:421
-        Error:    Should be false
-        Messages: TryNext returned true on iteration 1
+  **Root-caused by reading the kept oplog** (`SECANTUS_GAUGE_KEEP_STORAGE=1`).
+  The subtest occupies exactly two oplog entries — `seq=32 create` of the
+  watched collection, `seq=33 drop` of it by mtest teardown. The drop is the one
+  entry that passes `_scope_matches` and is not gated behind
+  `show_expanded_events`, and it lands *inside* our wait window, so the getMore
+  returns `drop` + `invalidate` for an event that had not happened when the
+  client asked.
 
-  This is a **conformance bug in an in-scope feature**, not one of the
-  documented out-of-scope divergences (hashed/text indexes, `$where`, CSOT
-  message shape). It first appeared between the 2026-08-19 and 2026-08-25 gauge
-  runs; the only commit touching cursors/changestreams/commands in that window
-  is #1010 (`replSetGetStatus`), which has no plausible connection.
+  **Fixed (this entry's first half):** an explicit `maxTimeMS: 0` no longer
+  blocks. `max_time_ms = int(doc.get("maxTimeMS", 0) or 0)` made an explicit
+  zero indistinguishable from an absent field, and both fell to the 1s default;
+  mongod returns immediately on an explicit zero. The Rust server was already
+  correct (`unwrap_or(1000)` — "a zero deadline polls exactly once"), so this
+  also closed a two-server parity gap. Pinned by
+  `tests/test_getmore_maxtimems_zero.py` (3 tests, each verified to fail with
+  the fix reverted). Go-gauge failure rate went **2-in-3 → 1-in-3**.
 
-  **It is a race, not deterministic** — 2 failures in 3 `validate-go` runs.
-  (An earlier note here called it deterministic on 2/2; the third run passed.)
+  **Still open, but NOT for the reason first filed here.** The Go driver's
+  `TryNext` sends **no `maxTimeMS` at all` (confirmed by instrumenting the
+  server: `has_maxTimeMS=False`), so it gets the 1s default wait. This entry
+  originally claimed that was the remaining bug and that fixing it meant
+  choosing between pymongo (wants the wait) and Go (wants a prompt return).
 
-  Ruled out, each by direct experiment:
+  **A probe of real mongod 6.0.16 falsifies that.** Same three scenarios,
+  single-node replica set, drop injected 150 ms into the wait:
 
-  | hypothesis | result |
-  |---|---|
-  | reproducible in Python (watch + poll twice) | no — passes |
-  | prior writes to another collection in the same db | no |
-  | same collection name dropped and recreated | no |
-  | unrelated collection created mid-stream | no |
-  | collection created *after* the watch opens | no |
-  | raw wire `aggregate` + bare `getMore` | no — empty batches |
-  | the Go subtest alone, or its whole suite alone | no — passes |
-  | collection-scope filter doing prefix matching | no — `_scope_matches` is exact equality |
+  | scenario | mongod | SecantusDB (post-fix) |
+  |---|---|---|
+  | no `maxTimeMS`, nothing happens | 1003 ms, 0 docs | 1s default — matches |
+  | no `maxTimeMS`, drop at 150 ms | 166 ms, `drop`+`invalidate` | matches |
+  | `maxTimeMS: 0`, drop at 150 ms | 0 ms, 0 docs | matches |
 
-  The mtest collection names contain slashes and one is a strict prefix of
-  another (`.../try_next` vs `.../try_next/one_getMore_sent`), which is why the
-  prefix hypothesis was worth checking; it is not the cause.
+  So the 1s default is **correct** — mongod does the same — and mongod also
+  returns a drop that happens during the wait. There is no semantic conflict
+  between the drivers, and **the default must not be changed.**
 
-  **Do not reproduce it by running `go test ./internal/integration/...`
-  directly** — that is not equivalent to the gauge, which applies
-  `SKIP_PATTERNS`. A raw full-package run produces ~177 failures and a
-  completely different profile.
+  **Timing matches too**, so it is not a "we are slower" artefact either. Same
+  sequence against both, single-node RS mongod vs SecantusDB:
 
-  **Next step, now tractable:** `SECANTUS_GAUGE_KEEP_STORAGE=1 invoke
-  validate-go` keeps the daemon's data directory (added for this
-  investigation). Re-run until it fails, then read the oplog from the kept
-  path:
+      mongod       aggregate=  1.6ms firstBatch=0  getMore=1002.9ms docs=0
+      secantusdb   aggregate=  0.6ms firstBatch=0  getMore=1002.5ms docs=0
 
-      from secantus.storage import Storage
-      s = Storage("<kept path>")
-      s.read_oplog(start_seq=1, limit=50)   # -> [(seq, entry), ...]
+  So on every dimension probed — the wait length, whether a mid-wait drop is
+  returned, explicit-zero handling, `firstBatch` emptiness, and the wall-clock
+  of both calls — SecantusDB is now indistinguishable from mongod, yet the Go
+  gauge still fails ~1 run in 3 and mongod never does.
 
-  The entry our `getMore` returned will name itself. `ns` distinguishes a
-  scope leak from a start-position error; `op == "n"` would mean a noop
-  heartbeat surfaced as an event instead of silently advancing position.
+  What that leaves, in rough order of likelihood:
+
+  - **A cursor from the preceding subtest.** `try_next/existing_non-empty_batch`
+    defers `closeStream`; if its cursor is still open and its collection is
+    dropped by teardown, an interaction between the two streams is plausible.
+    The failing assertion is on the *second* `TryNext`, and both subtests use
+    the same connection pool.
+  - **An extra `getMore`.** The test also calls `verifyOneGetmoreSent`; if our
+    replies ever make the driver issue a second one, the second could catch the
+    teardown drop legitimately.
+  - **Reply framing on a killed cursor** — a late reply landing in the socket
+    after `TryNext` gave up would desynchronise the connection.
+
+  Next step: capture the *driver-side* command monitoring (the Go test harness
+  can log started/succeeded events) for a failing run, rather than more
+  server-side probing — the server has now been shown to match mongod, so the
+  divergence is likelier in what the driver is asked to do than in what we
+  answer. Reproduce with `SECANTUS_GAUGE_KEEP_STORAGE=1 invoke validate-go` in
+  a loop.
 
 - [x] **RESOLVED 2026-08-23: PITR restore wrote 2 GB regardless of database
   size — backup extraction now punches holes instead of writing runs of
