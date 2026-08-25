@@ -29,7 +29,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
-from bson import Decimal128, Int64
+from bson import Decimal128, Int64, ObjectId
 from pymongo import MongoClient
 from pymongo.database import Database
 
@@ -131,6 +131,22 @@ ARRAYS = [
     {"_id": 3, "x": [7]},
     {"_id": 4, "x": 6},
 ]
+
+
+def _err(db: Database, flt: dict, update: dict) -> str:
+    """`(code, errmsg)` of a failed update, as a comparable string.
+
+    Comparing the *message* as well as the code is the point: the code was
+    already right here, and the message was not.
+    """
+    from pymongo.errors import OperationFailure, WriteError
+
+    try:
+        db.c.update_one(flt, update)
+        return "OK"
+    except (WriteError, OperationFailure) as exc:
+        return f"{exc.code}: {exc.details.get('errmsg')}"
+
 
 QUERY_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ("eq-numeric-unifies-types", NUMS, lambda db: sorted(d["_id"] for d in db.c.find({"x": 5}))),
@@ -271,6 +287,39 @@ UPDATE_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
             db.c.update_one({"_id": 1}, {"$inc": {"n": 1}})
             and type(db.c.find_one({"_id": 1})["n"]).__name__
         ),
+    ),
+    # The `$inc`/`$mul` type error: mongod puts the *document's `_id`* in the
+    # braces, not the field being incremented. We rendered `{n}` where mongod
+    # renders `{_id: 1}` — the right code (14) on a message no real server emits.
+    (
+        "inc-type-error-message-names-the-doc-id",
+        [{"_id": 1, "n": "x"}],
+        lambda db: _err(db, {"_id": 1}, {"$inc": {"n": 1}}),
+    ),
+    (
+        "inc-type-error-on-null-field",
+        [{"_id": 1, "n": None}],
+        lambda db: _err(db, {"_id": 1}, {"$inc": {"n": 1}}),
+    ),
+    (
+        "mul-type-error-message-names-the-doc-id",
+        [{"_id": 1, "n": "x"}],
+        lambda db: _err(db, {"_id": 1}, {"$mul": {"n": 2}}),
+    ),
+    (
+        "inc-type-error-with-objectid-id",
+        [{"_id": ObjectId("60a0b0c0d0e0f00102030405"), "n": "x"}],
+        lambda db: _err(db, {}, {"$inc": {"n": 1}}),
+    ),
+    (
+        "inc-type-error-dotted-path-names-the-leaf",
+        [{"_id": 1, "a": {"b": "x"}}],
+        lambda db: _err(db, {"_id": 1}, {"$inc": {"a.b": 1}}),
+    ),
+    (
+        "inc-non-numeric-operand-message",
+        [{"_id": 1, "n": 1}],
+        lambda db: _err(db, {"_id": 1}, {"$inc": {"n": "x"}}),
     ),
     (
         "min-is-cross-type-not-numeric-only",

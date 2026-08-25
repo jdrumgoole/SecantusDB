@@ -864,6 +864,12 @@ fn map_err(e: WtError) -> StorageError {
         // Bad hint / unsupported query construct → BadValue (2), the same code
         // the Python server surfaces for these at the command layer.
         WtError::BadHint(m) => StorageError::WriteError { code: 2, errmsg: m },
+        // A named refusal (non-numeric $inc/$mul) → mongod's TypeMismatch (14),
+        // not the generic BadValue the plain defer would produce.
+        WtError::UpdateTypeMismatch(m) => StorageError::WriteError {
+            code: 14,
+            errmsg: m,
+        },
         WtError::QueryUnsupported => StorageError::WriteError {
             code: 2,
             errmsg: "query uses a construct the Rust server does not support".to_string(),

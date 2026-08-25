@@ -430,11 +430,22 @@ These are explicit non-goals. Don't add them without a reason.
   earned its keep immediately: it caught a denormal-vs-large pairing that the
   ad-hoc fuzz had missed, where the exact-alignment width was one digit short.
   `SECANTUS_DECIMAL_FUZZ_SCALE=N` cranks it for hunting.
-- [ ] **OPEN — Rust server: wrong error CODE for non-numeric `$inc`/`$mul`
-  (2026-08-23).** `{$inc: {n: 1}}` against a null or string field answers code 2
-  (BadValue) where mongod and the Python server answer 14 (TypeMismatch). The
-  refusal is right; only the code is wrong. This is the standing Rust error-code
-  gap, now with a concrete reproduction.
+- [x] **`$inc`/`$mul` type errors — FIXED on BOTH servers (2026-08-25).** The
+  Rust server answered code 2 (BadValue) where mongod answers 14 (TypeMismatch),
+  because the engine's `Fallback` is opaque — it means "run Python", which the
+  standalone Rust server cannot do. Fixed with a standalone validator,
+  `update::arith_type_error`, mirroring the existing
+  `query::json_schema_keyword_error` pattern: it names the errors we *can* name
+  and leaves `Fallback` for the ones we can't. New `StorageError::
+  UpdateTypeMismatch` carries it; the adapter maps it to code 14.
+  **The same investigation found a second, unrecorded bug**: the *Python*
+  server's message was wrong. mongod puts the **document's `_id`** in the braces
+  (`{_id: 1} has the field 'n' …`); we rendered the field path (`{n} has …`) —
+  the right code attached to a message no real server emits. Both servers now
+  match mongod byte-for-byte on code *and* message, verified three-way against
+  the real `secantusd-rs` binary (6 shapes: non-numeric field / operand, `$inc`
+  and `$mul`, ObjectId `_id`, dotted paths). Pinned by 6 cases in
+  `tests/test_mongod_differential.py` and 4 unit tests in `secantus-core`.
 
 - [x] **Rust `$sum`/`$avg` over Decimal128 — SHIPPED (2026-08-24).** Folded into
   the Decimal128 arithmetic item above; a `$group` over a collection containing a
@@ -2562,7 +2573,17 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   raises a generic `BadValue` (2) on these error paths because the Rust core signals
   `Fallback` rather than a coded error — same class as the unrecognized-operator
   nit. A faithful fix needs the `Fallback` type to carry an optional mongod code (or
-  per-operator error emission in the command layer). **Now native on the Rust
+  per-operator error emission in the command layer).
+  **There is now a worked template for closing these one family at a time**
+  (2026-08-25): rather than widening `Fallback` (which touches every `Err`
+  site in the engine), add a *standalone validator* alongside the operator —
+  `update::arith_type_error` for `$inc`/`$mul`, mirroring the older
+  `query::json_schema_keyword_error` — that names the errors it can name and
+  leaves `Fallback` for genuinely unimplemented constructs. Plumbing is a
+  `StorageError` variant carrying the message plus one arm in the adapter's
+  code table. `$inc`/`$mul` are closed this way; the remaining families
+  (`$stdDev*` / `$median` / `$percentile` argument validation, the log-family
+  domain errors, unrecognized operators) can follow the same shape. **Now native on the Rust
   server:** `$stdDevPop` /
   `$stdDevSamp` accumulators (0.5.3-beta.135 / 0.5.4b163 — Python already had them;
   both engines aligned to a naive-fold + multiply + `sqrt` computation so they agree
