@@ -26,6 +26,7 @@ use std::collections::HashMap;
 
 use bson::{doc, Bson, Document};
 
+use crate::decimal;
 use crate::numeric::{as_float_like, as_int_like, int_promoted_to_bson, is_int64};
 use crate::paths::{self, get_path, has_path};
 use crate::{expressions, query};
@@ -341,9 +342,20 @@ fn arith(current: &Bson, operand: &Bson, mul: bool) -> R<Bson> {
     if matches!(operand, Bson::Boolean(_)) {
         return Err(Fallback);
     }
-    // Decimal128 has no Python arithmetic support (raises) -> defer.
+    // Decimal dominates the widening order (int32 < int64 < double < decimal),
+    // so either side being decimal puts the whole operation in the decimal
+    // domain — computed exactly at decimal128's 34 digits, quantum preserved.
     if matches!(current, Bson::Decimal128(_)) || matches!(operand, Bson::Decimal128(_)) {
-        return Err(Fallback);
+        let (a, b) = (
+            decimal::from_bson(current).ok_or(Fallback)?,
+            decimal::from_bson(operand).ok_or(Fallback)?,
+        );
+        let r = if mul {
+            decimal::mul(&a, &b)
+        } else {
+            decimal::add(&a, &b)
+        };
+        return decimal::to_bson(&r.ok_or(Fallback)?).ok_or(Fallback);
     }
     if let (Some(a), Some(b)) = (as_int_like(current), as_int_like(operand)) {
         let r = if mul {

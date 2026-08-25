@@ -2762,7 +2762,10 @@ def _convert_value(value: Any, target: Any) -> Any:
         if isinstance(value, int):
             return Decimal128(Decimal(value))
         if isinstance(value, float):
-            return Decimal128(Decimal(repr(value)))
+            # 15 significant digits, as `$toDecimal` — mongod-probed 6.0.16.
+            from secantus.numerics import decimal_from_double
+
+            return Decimal128(decimal_from_double(value))
         if isinstance(value, str):
             if len(value) > _MAX_INT_STR_DIGITS:
                 raise ExpressionError(
@@ -2808,7 +2811,12 @@ def _op_to_decimal(arg: Any, ctx: _Ctx) -> Any:
     if isinstance(value, Decimal128):
         return value
     if isinstance(value, (int, float)):
-        return Decimal128(Decimal(repr(value) if isinstance(value, float) else value))
+        from secantus.numerics import decimal_from_double
+
+        # mongod converts a double at 15 significant digits; ints stay exact.
+        return Decimal128(
+            decimal_from_double(value) if isinstance(value, float) else Decimal(value)
+        )
     if isinstance(value, str):
         try:
             return Decimal128(value)
@@ -3149,12 +3157,12 @@ def _expr_is_number(v: Any) -> bool:
 
 
 def _op_expr_sum(arg: Any, ctx: _Ctx) -> Any:
-    from secantus.numerics import bson_add
+    from secantus.numerics import bson_sum
 
     total: Any = 0
     for x in _expr_acc_values(arg, ctx):
         if _expr_is_number(x):
-            total = bson_add(total, x)
+            total = bson_sum(total, x)
     return total
 
 

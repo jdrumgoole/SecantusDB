@@ -412,31 +412,42 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **OPEN — Rust server: `$inc`/`$mul` FAIL OUTRIGHT on Decimal128 (2026-08-23).**
-  Found by a three-way update-operator differential. `{$inc: {n: 1}}` against a
-  Decimal128 field, or with a Decimal128 operand, returns a WriteError (code 2)
-  where Python and mongod both compute the answer. Same underlying gap as the
-  `$sum`/`$avg` Decimal128 failure recorded above — the standing "Decimal128 edges
-  defer to Python" deferral, which on a standalone server has nowhere to defer to.
-  **That one gap is now known to break four operators**, so closing it (real
-  decimal arithmetic in the Rust accumulators/updaters) buys more than it looks.
+- [x] **Decimal128 arithmetic — SHIPPED on BOTH servers, all four operators
+  (2026-08-24).** `$inc` / `$mul` / `$sum` / `$avg` now compute natively in Rust
+  instead of erroring, and the **Python server's silent 28-digit truncation is
+  fixed**: `_combine` ran in Python's default decimal context, so every stored
+  decimal lost six of decimal128's 34 digits
+  (`Decimal128("1.000000000000000000000000000000001") + 1` answered
+  `2.000000000000000000000000000`). New `crates/secantus-core/src/decimal.rs`
+  implements exact sign/coefficient/exponent arithmetic — add (preferred exponent
+  `min(e1,e2)`), multiply (`e1+e2`), and divide-by-count for `$avg` — with a
+  single round-half-even to 34 digits, preserving **quantum** (`2.50 + 0.10` is
+  `2.60`, `2.50 * 2` is `5.00`). Three-way verified against mongod 6.0.16
+  (`tests/test_mongod_differential.py`, 30 cases) and pinned to the Python engine
+  by `tests/test_rust_decimal_parity.py` — a **seeded generative fuzz** that is
+  now a standing gate, not a scratchpad script. It asserts both agreement *and*
+  zero deferrals (a deferral is fatal on the standalone Rust server), and it
+  earned its keep immediately: it caught a denormal-vs-large pairing that the
+  ad-hoc fuzz had missed, where the exact-alignment width was one digit short.
+  `SECANTUS_DECIMAL_FUZZ_SCALE=N` cranks it for hunting.
 - [ ] **OPEN — Rust server: wrong error CODE for non-numeric `$inc`/`$mul`
   (2026-08-23).** `{$inc: {n: 1}}` against a null or string field answers code 2
   (BadValue) where mongod and the Python server answer 14 (TypeMismatch). The
   refusal is right; only the code is wrong. This is the standing Rust error-code
   gap, now with a concrete reproduction.
 
-- [ ] **OPEN — Rust server: `$sum`/`$avg` FAIL OUTRIGHT when any Decimal128 is in
-  the group (found 2026-08-23 by a three-way differential).** Not a wrong answer —
-  an error: `aggregation pipeline uses a stage or operator not supported by the
-  Rust server`. Narrowed by probing the Rust binary directly: `$sum` over plain
-  ints answers 3; adding a `bool` or a `null` still answers; adding **one**
-  Decimal128 value, or an all-Decimal128 collection, errors. Python and mongod both
-  answer. This is the standing "Decimal128 edges defer to Python" deferral, but on
-  the standalone Rust server a defer has nowhere to go, so it surfaces as a failed
-  aggregation — a `$group` over a collection that happens to contain one Decimal128
-  simply does not work there. Closing it means real Decimal128 arithmetic in the
-  Rust accumulators (a decimal crate), not a shim.
+- [x] **Rust `$sum`/`$avg` over Decimal128 — SHIPPED (2026-08-24).** Folded into
+  the Decimal128 arithmetic item above; a `$group` over a collection containing a
+  Decimal128 now answers on the Rust server instead of failing the pipeline.
+  Uncovered while fixing it: mongod uses **two different** double→decimal
+  conversions — accumulators take the double's exact binary value
+  (`$sum` of `0.1` contributes `0.1000000000000000055511151231257827`) while
+  `$inc`/`$mul`/`$toDecimal` take 15 significant digits (`0.100000000000000`).
+  Both servers now reproduce the split. `$toDecimal` and `$convert: {to:
+  "decimal"}` were *separately* wrong in all four implementations (both
+  operators × both servers) — each used shortest-round-trip text, so
+  `$toDecimal: 4.125` answered `4.125` where mongod answers `4.12500000000000`.
+  Caught by the engine-parity suite, not by review.
 - [x] **Array sort order — FIXED on BOTH servers, all four paths (2026-08-23).**
   mongod sorts an ARRAY-valued field by one representative element: its minimum
   ascending, its maximum descending. Verified on mongod 6.0.16 with
