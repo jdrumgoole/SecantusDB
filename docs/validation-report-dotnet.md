@@ -1,6 +1,6 @@
 # mongo-csharp-driver Validation Report
 
-Generated 2026-08-19 — SecantusDB 0.6.0b12 vs mongo-csharp-driver 8297e62 (`vendor/mongo-csharp-driver/`).
+Generated 2026-08-24 — SecantusDB 0.6.0b15 vs mongo-csharp-driver 8297e62 (`vendor/mongo-csharp-driver/`).
 
 Run `uv run python -m invoke validate-dotnet` to refresh. The official MongoDB **C# / .NET** driver — its xUnit integration suite (`MongoDB.Driver.Tests`) run unmodified against an embedded SecantusDB daemon via `dotnet test`.
 

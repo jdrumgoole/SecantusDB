@@ -118,7 +118,8 @@ def main() -> int:
     host = "127.0.0.1"
     storage_dir = tempfile.mkdtemp(prefix="secantus-go-gauge-")
     print(
-        f"go_validation: storage tempdir {storage_dir} (will be cleaned up)",
+        f"go_validation: storage tempdir {storage_dir}"
+        + ("" if os.environ.get("SECANTUS_GAUGE_KEEP_STORAGE") == "1" else " (will be cleaned up)"),
         file=sys.stderr,
     )
     daemon_cmd = [
@@ -309,7 +310,20 @@ def main() -> int:
             daemon.wait()
         # Surface daemon stderr only on test failures, otherwise suppress noise.
         # (Daemon stdout was sent to /dev/null.)
-        shutil.rmtree(storage_dir, ignore_errors=True)
+        #
+        # SECANTUS_GAUGE_KEEP_STORAGE=1 leaves the data directory behind. A
+        # driver-side assertion tells you a test failed but not what the server
+        # sent, and some failures only reproduce under the *whole* gauge run --
+        # so by the time you have a failure worth explaining, the oplog that
+        # produced it has already been deleted. Keeping it is the difference
+        # between reading the offending entry and guessing at it.
+        if os.environ.get("SECANTUS_GAUGE_KEEP_STORAGE") == "1":
+            print(
+                f"go_validation: KEEPING storage tempdir {storage_dir}",
+                file=sys.stderr,
+            )
+        else:
+            shutil.rmtree(storage_dir, ignore_errors=True)
 
     return 0
 

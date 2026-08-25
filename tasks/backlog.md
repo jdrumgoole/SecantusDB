@@ -6938,6 +6938,61 @@ distinct problems, triaged from the run logs:
   (renames of huge collections are rare); bounded today only by luck of
   cache headroom. The `drop_target=true` purge inside rename shares the
   shape.
+- [ ] **Change streams: `TryNext` occasionally returns an event on an idle
+  collection — `mongo-go-driver`'s
+  `TestChangeStream_ReplicaSet/try_next/one_getMore_sent`, ~2 runs in 3
+  (2026-08-25).** The Go driver's contract is that `TryNext` sends exactly one
+  `getMore` and returns `false` when nothing is ready. With no events generated
+  at all, our server returned a document:
+
+      change_stream_test.go:421
+        Error:    Should be false
+        Messages: TryNext returned true on iteration 1
+
+  This is a **conformance bug in an in-scope feature**, not one of the
+  documented out-of-scope divergences (hashed/text indexes, `$where`, CSOT
+  message shape). It first appeared between the 2026-08-19 and 2026-08-25 gauge
+  runs; the only commit touching cursors/changestreams/commands in that window
+  is #1010 (`replSetGetStatus`), which has no plausible connection.
+
+  **It is a race, not deterministic** — 2 failures in 3 `validate-go` runs.
+  (An earlier note here called it deterministic on 2/2; the third run passed.)
+
+  Ruled out, each by direct experiment:
+
+  | hypothesis | result |
+  |---|---|
+  | reproducible in Python (watch + poll twice) | no — passes |
+  | prior writes to another collection in the same db | no |
+  | same collection name dropped and recreated | no |
+  | unrelated collection created mid-stream | no |
+  | collection created *after* the watch opens | no |
+  | raw wire `aggregate` + bare `getMore` | no — empty batches |
+  | the Go subtest alone, or its whole suite alone | no — passes |
+  | collection-scope filter doing prefix matching | no — `_scope_matches` is exact equality |
+
+  The mtest collection names contain slashes and one is a strict prefix of
+  another (`.../try_next` vs `.../try_next/one_getMore_sent`), which is why the
+  prefix hypothesis was worth checking; it is not the cause.
+
+  **Do not reproduce it by running `go test ./internal/integration/...`
+  directly** — that is not equivalent to the gauge, which applies
+  `SKIP_PATTERNS`. A raw full-package run produces ~177 failures and a
+  completely different profile.
+
+  **Next step, now tractable:** `SECANTUS_GAUGE_KEEP_STORAGE=1 invoke
+  validate-go` keeps the daemon's data directory (added for this
+  investigation). Re-run until it fails, then read the oplog from the kept
+  path:
+
+      from secantus.storage import Storage
+      s = Storage("<kept path>")
+      s.read_oplog(start_seq=1, limit=50)   # -> [(seq, entry), ...]
+
+  The entry our `getMore` returned will name itself. `ns` distinguishes a
+  scope leak from a start-position error; `op == "n"` would mean a noop
+  heartbeat surfaced as an event instead of silently advancing position.
+
 - [x] **RESOLVED 2026-08-23: PITR restore wrote 2 GB regardless of database
   size — backup extraction now punches holes instead of writing runs of
   zeros.** WiredTiger preallocates `WiredTigerLog.0000000001` to
