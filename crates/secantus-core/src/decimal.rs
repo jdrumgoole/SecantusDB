@@ -27,11 +27,20 @@ use bson::Bson;
 /// decimal128's coefficient width.
 const MAX_DIGITS: usize = 34;
 
-/// How wide an exactly-aligned intermediate may get before we hand the
-/// operation to Python. Only pathological exponent spreads (`1e300 + 1e-300`)
-/// reach it; staying exact below this bound is what removes the sticky-bit
-/// class of rounding bugs.
-const WORK_DIGITS: usize = 400;
+/// How wide an exactly-aligned intermediate may get before we give up.
+///
+/// Sized to span decimal128's *entire* exponent range (`-6176 ..= 6111`) plus a
+/// full 34-digit coefficient, so no pair of representable values can exceed it
+/// and the exact-alignment strategy never has to fall back. That matters more
+/// than the memory: a deferral is fatal on the standalone Rust server, which
+/// has no Python to defer to. The generative parity fuzz caught the previous
+/// 400-digit bound doing exactly that — a denormal double (`5e-324`, which
+/// converts to roughly `E-357`) summed against an `E+25` decimal needs 401
+/// digits to align, one past the old limit.
+///
+/// The wide buffers are only allocated for genuinely extreme spreads; ordinary
+/// magnitudes touch a few dozen digits.
+const WORK_DIGITS: usize = 12_400;
 
 /// mongod converts a double to decimal128 at a fixed 15 significant digits.
 const DOUBLE_SIG_DIGITS: usize = 15;
@@ -682,7 +691,18 @@ mod tests {
     }
 
     #[test]
-    fn absurd_exponent_spread_defers() {
-        assert!(add(&d("1E+500"), &d("1E-500")).is_none());
+    fn enormous_exponent_spread_still_computes() {
+        // Nothing representable as decimal128 may defer — the Rust server has
+        // no Python to fall back to. The tiny addend survives only as a
+        // rounding influence, which is exactly CPython's answer at prec 34.
+        assert_eq!(
+            add_s("1E+500", "1E-500"),
+            "1.000000000000000000000000000000000E+500"
+        );
+        // The denormal-vs-large pairing the parity fuzz found.
+        let tiny = from_bson_accumulator(&Bson::Double(5e-324)).unwrap();
+        assert!(add(&tiny, &d("9.949442263900951E+25")).is_some());
+        // Both ends of decimal128's exponent range at once.
+        assert!(add(&d("1E+6111"), &d("1E-6176")).is_some());
     }
 }

@@ -423,9 +423,13 @@ These are explicit non-goals. Don't add them without a reason.
   `min(e1,e2)`), multiply (`e1+e2`), and divide-by-count for `$avg` — with a
   single round-half-even to 34 digits, preserving **quantum** (`2.50 + 0.10` is
   `2.60`, `2.50 * 2` is `5.00`). Three-way verified against mongod 6.0.16
-  (`tests/test_mongod_differential.py`, 28 cases) and pinned to the Python engine
-  by ~450k fuzz comparisons plus corpus cases in the update/aggregate parity
-  suites.
+  (`tests/test_mongod_differential.py`, 30 cases) and pinned to the Python engine
+  by `tests/test_rust_decimal_parity.py` — a **seeded generative fuzz** that is
+  now a standing gate, not a scratchpad script. It asserts both agreement *and*
+  zero deferrals (a deferral is fatal on the standalone Rust server), and it
+  earned its keep immediately: it caught a denormal-vs-large pairing that the
+  ad-hoc fuzz had missed, where the exact-alignment width was one digit short.
+  `SECANTUS_DECIMAL_FUZZ_SCALE=N` cranks it for hunting.
 - [ ] **OPEN — Rust server: wrong error CODE for non-numeric `$inc`/`$mul`
   (2026-08-23).** `{$inc: {n: 1}}` against a null or string field answers code 2
   (BadValue) where mongod and the Python server answer 14 (TypeMismatch). The

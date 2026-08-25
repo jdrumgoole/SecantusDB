@@ -53,3 +53,10 @@ several hundred thousand randomised comparisons.
   (`add` / `mul` / `div_int`, parse and render, both double-conversion rules).
 - Decimal arithmetic cases in `tests/test_mongod_differential.py`, plus corpus
   cases in the update and aggregate Rust/Python parity suites.
+- `tests/test_rust_decimal_parity.py` — a seeded generative parity fuzz over
+  decimal arithmetic, the accumulators, and the conversions. It found three of
+  the bugs fixed here that review and hand-written cases both missed, and it
+  asserts two properties: that the engines agree, *and* that the Rust engine
+  never defers on a decimal (a deferral is fatal on the standalone Rust server,
+  which has no Python to fall back to). Scale it up with
+  `SECANTUS_DECIMAL_FUZZ_SCALE=50` when hunting.
