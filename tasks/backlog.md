@@ -7037,12 +7037,29 @@ distinct problems, triaged from the run logs:
   - **Reply framing on a killed cursor** — a late reply landing in the socket
     after `TryNext` gave up would desynchronise the connection.
 
-  Next step: capture the *driver-side* command monitoring (the Go test harness
-  can log started/succeeded events) for a failing run, rather than more
-  server-side probing — the server has now been shown to match mongod, so the
-  divergence is likelier in what the driver is asked to do than in what we
-  answer. Reproduce with `SECANTUS_GAUGE_KEEP_STORAGE=1 invoke validate-go` in
-  a loop.
+  **Driver-side env logging does NOT work here — do not retry it.** The Go
+  driver supports `MONGODB_LOG_COMMAND=debug` / `MONGODB_LOG_PATH` /
+  `MONGODB_LOG_MAX_DOCUMENT_LENGTH`, and running the gauge under them
+  reproduced the failure on attempt 4 with a 282,280-line log — but the log
+  contains only **2 `getMore` command events in total**, neither for the failing
+  test. `mtest` constructs its own clients, so the env-configured logger never
+  applies to them. Six gauge runs (~25 min) to establish that.
+
+  A driver-side view therefore needs either a patch to the vendored tree — which
+  the gauge explicitly forbids ("zero modifications to the vendored go-driver
+  tree"), and which would make the result unreproducible for anyone else — or a
+  standalone Go program that replicates the mtest sequence *and* the
+  surrounding load, since the failure does not occur with the subtest or its
+  suite run alone.
+
+  Remaining candidates, unchanged and still unexamined:
+
+  - the preceding subtest (`try_next/existing_non-empty_batch`) defers
+    `closeStream`; its cursor may still be open on the shared pool when
+    `one_getMore_sent` runs, and its collection is dropped by teardown;
+  - a second `getMore` being issued (the test also asserts exactly one was
+    sent, via `verifyOneGetmoreSent`);
+  - a reply landing after the driver abandoned the request.
 
 - [x] **RESOLVED 2026-08-23: PITR restore wrote 2 GB regardless of database
   size — backup extraction now punches holes instead of writing runs of
