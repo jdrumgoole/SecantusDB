@@ -4755,9 +4755,17 @@ def _aggregate_change_stream(
                 token = ev.get("_id")
                 if token is None or not any(token == t for t in tokens_in):
                     raise changestreams.ChangeStreamFatalError(
+                        # mongod's exact wording. libmongoc's
+                        # `_test_resume_token_error` asserts on the final
+                        # sentence, and the Rust server already carries it —
+                        # this message was the Python server's own paraphrase,
+                        # which ended "unusable for resuming" and so failed the
+                        # C gauge's /change_stream/live/{missing,invalid}_resume_token.
                         "Encountered an event whose _id field, which contains the "
                         "resume token, was modified by the pipeline. Modifying the "
-                        "_id field of an event makes it unusable for resuming"
+                        "_id field of an event makes it impossible to resume the "
+                        "stream from that point. Only transformations that retain "
+                        "the unmodified _id field are allowed."
                     )
         return events
 
