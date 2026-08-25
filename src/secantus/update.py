@@ -105,7 +105,10 @@ def _bson_type_name(v: Any) -> str:
 
 def _render_bson_scalar(v: Any) -> str:
     """A mongod-ish rendering of a scalar for an error message: ``true`` /
-    ``false`` / ``null`` lowercase, strings double-quoted, else ``str()``."""
+    ``false`` / ``null`` lowercase, strings double-quoted, ObjectId in its
+    constructor form, else ``str()``."""
+    from bson import ObjectId
+
     if v is True:
         return "true"
     if v is False:
@@ -114,7 +117,25 @@ def _render_bson_scalar(v: Any) -> str:
         return "null"
     if isinstance(v, str):
         return f'"{v}"'
+    if isinstance(v, ObjectId):
+        # `str(ObjectId)` is the bare hex; mongod prints `ObjectId('…')`, and
+        # this is the *default* `_id` type, so it's the common case in the
+        # `$inc`/`$mul` type-error message below.
+        return f"ObjectId('{v}')"
     return str(v)
+
+
+def _render_doc_id(doc: Mapping[str, Any]) -> str:
+    """The ``{_id: …}`` prefix mongod puts in an `$inc`/`$mul` type error.
+
+    Probed vs mongod 6.0.16: the braces hold the *document's `_id`*, not the
+    field being incremented — `{_id: 1} has the field 'n' …`. We used to render
+    the field path there (`{n} has the field 'n' …`), which is the right code
+    (14) attached to a message no real server ever emits.
+    """
+    if "_id" not in doc:
+        return "{}"
+    return f"{{_id: {_render_bson_scalar(doc['_id'])}}}"
 
 
 def _require_numeric_operand(verb: str, path: str, value: Any) -> None:
@@ -718,7 +739,7 @@ def _apply_op(
                     if not _is_inc_numeric(current):
                         raise UpdateError(
                             f"Cannot apply $inc to a value of non-numeric type. "
-                            f"{{{concrete}}} has the field '{concrete.split('.')[-1]}' "
+                            f"{_render_doc_id(doc)} has the field '{concrete.split('.')[-1]}' "
                             f"of non-numeric type {_bson_type_name(current)}",
                             code=14,
                         )
@@ -740,7 +761,7 @@ def _apply_op(
                     if not _is_inc_numeric(current):
                         raise UpdateError(
                             f"Cannot apply $mul to a value of non-numeric type. "
-                            f"{{{concrete}}} has the field '{concrete.split('.')[-1]}' "
+                            f"{_render_doc_id(doc)} has the field '{concrete.split('.')[-1]}' "
                             f"of non-numeric type {_bson_type_name(current)}",
                             code=14,
                         )

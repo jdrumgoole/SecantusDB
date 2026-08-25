@@ -1410,6 +1410,10 @@ pub enum StorageError {
     /// `create_index` was asked to re-create an existing index *name* with a
     /// different key spec.
     IndexKeySpecsConflict(String),
+    /// An update the engine refused for a reason mongod names exactly — today
+    /// a non-numeric `$inc` / `$mul`, which mongod answers with TypeMismatch
+    /// (14). Distinct from `QueryUnsupported`, which means "can't evaluate".
+    UpdateTypeMismatch(String),
     /// A query filter used a construct the Rust query engine can't evaluate
     /// (the `matches` "defer to Python" signal). The server's engine selection
     /// is responsible for not routing such queries to the Rust storage.
@@ -1460,6 +1464,7 @@ impl std::fmt::Display for StorageError {
             StorageError::CreateIndexUnsupported(m) => write!(f, "{m}"),
             StorageError::IndexOptionsConflict(m) => write!(f, "{m}"),
             StorageError::IndexKeySpecsConflict(m) => write!(f, "{m}"),
+            StorageError::UpdateTypeMismatch(m) => write!(f, "{m}"),
             StorageError::QueryUnsupported => {
                 write!(f, "query construct not supported by the Rust query engine")
             }
@@ -9905,7 +9910,16 @@ impl Storage {
                 }
                 let pos = secantus_core::update::find_positional_matches(doc, filter);
                 secantus_core::update::apply_update_with(doc, update, up, array_filters, &pos)
-                    .map_err(|_| StorageError::QueryUnsupported)
+                    .map_err(|_| {
+                        // Prefer the error mongod actually names. A bare defer
+                        // becomes a generic BadValue (2) on this server, which
+                        // has no Python to fall back to, where mongod answers
+                        // TypeMismatch (14).
+                        match secantus_core::update::arith_type_error(doc, update) {
+                            Some(m) => StorageError::UpdateTypeMismatch(m),
+                            None => StorageError::QueryUnsupported,
+                        }
+                    })
             },
         )
     }

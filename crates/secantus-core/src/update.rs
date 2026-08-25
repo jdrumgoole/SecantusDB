@@ -953,8 +953,179 @@ pub fn apply_update_with(
     }
 }
 
+/// The exact mongod error for a `$inc` / `$mul` the engine refused on type
+/// grounds, or `None` if this update fails for some other (deferrable) reason.
+///
+/// The engine's `Fallback` is deliberately opaque — it means "run the Python
+/// engine", which is right on the Python server but useless on the standalone
+/// Rust server, where a defer has nowhere to go and surfaced as a generic
+/// `BadValue` (2). mongod answers `TypeMismatch` (14) here. So this mirrors the
+/// `query::json_schema_keyword_error` pattern: a standalone validator that
+/// names the errors we *can* name, leaving `Fallback` for the ones we can't.
+///
+/// Messages are verbatim from a mongod 6.0.16 probe and match
+/// `secantus.update`'s wording exactly, both shapes:
+///
+/// * non-numeric operand — `Cannot increment with non-numeric argument: {n: "x"}`
+/// * non-numeric field   — `Cannot apply $inc to a value of non-numeric type.
+///   {_id: 1} has the field 'n' of non-numeric type string`
+pub fn arith_type_error(doc: &Document, update: &Document) -> Option<String> {
+    for (op, payload) in update.iter() {
+        let verb = match op.as_str() {
+            "$inc" => "increment",
+            "$mul" => "multiply",
+            _ => continue,
+        };
+        let Bson::Document(fields) = payload else {
+            continue;
+        };
+        for (path, operand) in fields.iter() {
+            // mongod validates the whole update before touching a document, so
+            // the operand check fires first and wins over the field check.
+            if !is_arith_numeric(operand) {
+                return Some(format!(
+                    "Cannot {verb} with non-numeric argument: {{{path}: {}}}",
+                    render_scalar(operand)
+                ));
+            }
+            // Positional / arrayFilter paths expand per document; leave those to
+            // the normal defer rather than guess at the concrete path.
+            if path.contains("$[") || path.contains(".$") {
+                continue;
+            }
+            // A *missing* field is fine — mongod treats it as 0 and applies the
+            // delta. Only a present, non-numeric field is a TypeMismatch.
+            if let Some(current) = get_path(doc, path) {
+                if !is_arith_numeric(current) {
+                    let leaf = path.rsplit('.').next().unwrap_or(path);
+                    return Some(format!(
+                        "Cannot apply {op} to a value of non-numeric type. \
+                         {} has the field '{leaf}' of non-numeric type {}",
+                        render_doc_id(doc),
+                        query::bson_type_name(current)
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// mongod's numeric domain for `$inc` / `$mul`: int32 / int64 / double /
+/// decimal. Bool is deliberately excluded — mongod refuses `$inc` by `true`.
+fn is_arith_numeric(v: &Bson) -> bool {
+    matches!(
+        v,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+    )
+}
+
+/// A scalar as mongod renders it inside an error message.
+fn render_scalar(v: &Bson) -> String {
+    match v {
+        Bson::Boolean(b) => b.to_string(),
+        Bson::Null => "null".to_string(),
+        Bson::String(s) => format!("\"{s}\""),
+        Bson::ObjectId(o) => format!("ObjectId('{o}')"),
+        Bson::Int32(n) => n.to_string(),
+        Bson::Int64(n) => n.to_string(),
+        Bson::Double(d) => d.to_string(),
+        Bson::Decimal128(d) => d.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The `{_id: …}` prefix mongod puts in the non-numeric-field message. It is the
+/// *document's* `_id`, not the field being incremented.
+fn render_doc_id(doc: &Document) -> String {
+    match doc.get("_id") {
+        Some(id) => format!("{{_id: {}}}", render_scalar(id)),
+        None => "{}".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    // --- arith_type_error: messages verbatim from a mongod 6.0.16 probe ---
+
+    #[test]
+    fn arith_type_error_names_a_non_numeric_field() {
+        let doc = doc! {"_id": 1, "n": "x"};
+        assert_eq!(
+            super::arith_type_error(&doc, &doc! {"$inc": {"n": 1}}).unwrap(),
+            "Cannot apply $inc to a value of non-numeric type. \
+             {_id: 1} has the field 'n' of non-numeric type string"
+        );
+        assert_eq!(
+            super::arith_type_error(&doc! {"_id": 1, "n": Bson::Null}, &doc! {"$inc": {"n": 1}})
+                .unwrap(),
+            "Cannot apply $inc to a value of non-numeric type. \
+             {_id: 1} has the field 'n' of non-numeric type null"
+        );
+        assert_eq!(
+            super::arith_type_error(&doc, &doc! {"$mul": {"n": 2}}).unwrap(),
+            "Cannot apply $mul to a value of non-numeric type. \
+             {_id: 1} has the field 'n' of non-numeric type string"
+        );
+    }
+
+    #[test]
+    fn arith_type_error_names_a_non_numeric_operand() {
+        let doc = doc! {"_id": 1, "n": 1};
+        assert_eq!(
+            super::arith_type_error(&doc, &doc! {"$inc": {"n": "x"}}).unwrap(),
+            "Cannot increment with non-numeric argument: {n: \"x\"}"
+        );
+        // Bool is not numeric for mongod even though it coerces elsewhere.
+        assert_eq!(
+            super::arith_type_error(&doc, &doc! {"$inc": {"n": true}}).unwrap(),
+            "Cannot increment with non-numeric argument: {n: true}"
+        );
+        assert_eq!(
+            super::arith_type_error(&doc, &doc! {"$mul": {"n": "x"}}).unwrap(),
+            "Cannot multiply with non-numeric argument: {n: \"x\"}"
+        );
+    }
+
+    #[test]
+    fn arith_type_error_is_silent_when_the_update_is_fine() {
+        // Numeric field, numeric operand.
+        assert!(
+            super::arith_type_error(&doc! {"_id": 1, "n": 1}, &doc! {"$inc": {"n": 1}}).is_none()
+        );
+        // A *missing* field is treated as 0 by mongod, not an error.
+        assert!(super::arith_type_error(&doc! {"_id": 1}, &doc! {"$inc": {"n": 1}}).is_none());
+        // Not an arithmetic operator at all.
+        assert!(
+            super::arith_type_error(&doc! {"_id": 1, "n": "x"}, &doc! {"$set": {"n": 2}}).is_none()
+        );
+        // Decimal is numeric here.
+        let dec = Bson::Decimal128("2.5".parse().unwrap());
+        assert!(
+            super::arith_type_error(&doc! {"_id": 1, "n": dec}, &doc! {"$inc": {"n": 1}}).is_none()
+        );
+    }
+
+    #[test]
+    fn arith_type_error_renders_the_documents_own_id() {
+        // The braces hold the doc's `_id`, not the incremented field — the bug
+        // that made our message unlike any real server's.
+        let oid: bson::oid::ObjectId = "60a0b0c0d0e0f00102030405".parse().unwrap();
+        let msg = super::arith_type_error(&doc! {"_id": oid, "n": "x"}, &doc! {"$inc": {"n": 1}})
+            .unwrap();
+        assert!(
+            msg.contains("{_id: ObjectId('60a0b0c0d0e0f00102030405')}"),
+            "got: {msg}"
+        );
+        // Dotted path reports the leaf field name.
+        let msg = super::arith_type_error(
+            &doc! {"_id": 1, "a": {"b": "x"}},
+            &doc! {"$inc": {"a.b": 1}},
+        )
+        .unwrap();
+        assert!(msg.contains("has the field 'b'"), "got: {msg}");
+    }
+
     use super::*;
     use bson::doc;
 
