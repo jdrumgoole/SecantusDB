@@ -6962,21 +6962,55 @@ distinct problems, triaged from the run logs:
   `tests/test_getmore_maxtimems_zero.py` (3 tests, each verified to fail with
   the fix reverted). Go-gauge failure rate went **2-in-3 → 1-in-3**.
 
-  **Still open:** the Go driver's `TryNext` sends **no `maxTimeMS` at all**
-  (confirmed by instrumenting the server: `has_maxTimeMS=False`), so it still
-  gets the 1s default wait and can still catch the teardown drop.
+  **Still open, but NOT for the reason first filed here.** The Go driver's
+  `TryNext` sends **no `maxTimeMS` at all` (confirmed by instrumenting the
+  server: `has_maxTimeMS=False`), so it gets the 1s default wait. This entry
+  originally claimed that was the remaining bug and that fixing it meant
+  choosing between pymongo (wants the wait) and Go (wants a prompt return).
 
-  Fixing that half is a **decision, not a patch**, because two drivers want
-  opposite things from the same absent field:
+  **A probe of real mongod 6.0.16 falsifies that.** Same three scenarios,
+  single-node replica set, drop injected 150 ms into the wait:
 
-  - pymongo omits `maxTimeMS` on change-stream getMore and relies on the server
-    waiting — `test_aggregate_cursor_blocks` and the capped-tailable tests
-    depend on it, and CLAUDE.md documents the 1s default as deliberate.
-  - the Go driver omits it and expects a prompt return.
+  | scenario | mongod | SecantusDB (post-fix) |
+  |---|---|---|
+  | no `maxTimeMS`, nothing happens | 1003 ms, 0 docs | 1s default — matches |
+  | no `maxTimeMS`, drop at 150 ms | 166 ms, `drop`+`invalidate` | matches |
+  | `maxTimeMS: 0`, drop at 150 ms | 0 ms, 0 docs | matches |
 
-  So the work is: establish what mongod actually does for an awaitData getMore
-  with no `maxTimeMS` (probe a real mongod — see the three-way probe memory),
-  then match it and re-run **both** gauges. Do not simply drop the 1s default.
+  So the 1s default is **correct** — mongod does the same — and mongod also
+  returns a drop that happens during the wait. There is no semantic conflict
+  between the drivers, and **the default must not be changed.**
+
+  **Timing matches too**, so it is not a "we are slower" artefact either. Same
+  sequence against both, single-node RS mongod vs SecantusDB:
+
+      mongod       aggregate=  1.6ms firstBatch=0  getMore=1002.9ms docs=0
+      secantusdb   aggregate=  0.6ms firstBatch=0  getMore=1002.5ms docs=0
+
+  So on every dimension probed — the wait length, whether a mid-wait drop is
+  returned, explicit-zero handling, `firstBatch` emptiness, and the wall-clock
+  of both calls — SecantusDB is now indistinguishable from mongod, yet the Go
+  gauge still fails ~1 run in 3 and mongod never does.
+
+  What that leaves, in rough order of likelihood:
+
+  - **A cursor from the preceding subtest.** `try_next/existing_non-empty_batch`
+    defers `closeStream`; if its cursor is still open and its collection is
+    dropped by teardown, an interaction between the two streams is plausible.
+    The failing assertion is on the *second* `TryNext`, and both subtests use
+    the same connection pool.
+  - **An extra `getMore`.** The test also calls `verifyOneGetmoreSent`; if our
+    replies ever make the driver issue a second one, the second could catch the
+    teardown drop legitimately.
+  - **Reply framing on a killed cursor** — a late reply landing in the socket
+    after `TryNext` gave up would desynchronise the connection.
+
+  Next step: capture the *driver-side* command monitoring (the Go test harness
+  can log started/succeeded events) for a failing run, rather than more
+  server-side probing — the server has now been shown to match mongod, so the
+  divergence is likelier in what the driver is asked to do than in what we
+  answer. Reproduce with `SECANTUS_GAUGE_KEEP_STORAGE=1 invoke validate-go` in
+  a loop.
 
 - [x] **RESOLVED 2026-08-23: PITR restore wrote 2 GB regardless of database
   size — backup extraction now punches holes instead of writing runs of
