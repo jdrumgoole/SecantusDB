@@ -574,6 +574,23 @@ indicated a problem — the table looked entirely normal.
 between releases, so compare it against the previous `latency.json` before
 believing anything. If mongod moved, the machine moved.
 
+## Refreshing the published table
+
+`release-benchmark` writes `bench/results/do/<run>/comparison.md`. The published
+head-to-head table in `docs/benchmark.md` is generated from it:
+
+```bash
+uv run python -m bench.head_to_head_chart          # newest run
+uv run python -m bench.head_to_head_chart --check  # exit 1 if the page is stale
+```
+
+This used to be a copy-and-paste step, and it went stale twice — once leaving a
+post-lz4 droplet section above a pre-lz4 latency table, and once running two
+releases behind while the header above it named a different mongod. Both times
+nothing failed, because prose with numbers in it rots quietly.
+`tests/test_benchmark_table_fresh.py` now runs the `--check` form, so the suite
+fails instead.
+
 ## At release time
 
 `docs/benchmark.md` publishes a head-to-head comparison against a real
