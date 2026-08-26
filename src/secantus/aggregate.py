@@ -425,9 +425,14 @@ def _project_one(
             if value is not None or _path_present(doc, path):
                 set_path(result, path, copy.deepcopy(value))
         for key, expr in computed.items():
-            value = evaluate(expr, doc, vars)
+            # `evaluate_or_missing`, not `evaluate`: a *direct field path* that
+            # doesn't exist (`{z: "$nope"}`) evaluates to MISSING in mongod and
+            # the key is omitted. Plain `evaluate` answers None, which emitted
+            # `z: null` on every document — an extra key mongod never sends, so
+            # a client testing `"z" in doc` saw the opposite of the truth.
+            value = evaluate_or_missing(expr, doc, vars)
             # A computed field that resolves to the "missing" marker (an
-            # absent field via ``$getField`` / an explicit ``$$REMOVE``) is
+            # absent field path, ``$getField``, or an explicit ``$$REMOVE``) is
             # omitted from the output, matching mongod — never emitted as null.
             if value is MISSING:
                 continue
@@ -466,8 +471,10 @@ def _add_fields_one(
 ) -> dict[str, Any]:
     result = copy.deepcopy(doc)
     for path, expr in spec.items():
-        value = evaluate(expr, doc, vars)
-        # A field that resolves to the "missing" marker (absent field via
+        # See `_project_one`: a direct field path that doesn't exist is MISSING,
+        # not null, and mongod omits the key rather than adding it.
+        value = evaluate_or_missing(expr, doc, vars)
+        # A field that resolves to the "missing" marker (absent field path,
         # ``$getField`` / ``$$REMOVE``) is dropped rather than written —
         # matching mongod's ``$addFields``, which removes an existing field
         # when its new value is the missing/``$$REMOVE`` value.
@@ -2114,6 +2121,15 @@ def _stage_bucket(
 
     result: list[dict[str, Any]] = []
     for key, bucket_docs in buckets.items():
+        # mongod emits a bucket only when something landed in it — boundary
+        # buckets and the `default` bucket alike (probed 6.0.16: boundaries
+        # [0,2,4,8] over values 1 and 7 answer `_id: 0` and `_id: 4`, with the
+        # empty `_id: 2` omitted). We pre-create every bucket to keep them in
+        # boundary order, so the empty ones have to be dropped here; otherwise
+        # an unused `default` surfaced as a bare `{_id: "other"}` with no
+        # `count` at all, since the accumulator never ran to seed it.
+        if not bucket_docs:
+            continue
         bucket: dict[str, Any] = {"_id": key}
         for field_name, accumulator in output_spec.items():
             for d in bucket_docs:

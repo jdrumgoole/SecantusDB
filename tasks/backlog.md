@@ -18,6 +18,64 @@ failing test, the query); several "open" items were already fixed, and the wrong
 ones were wrong in the direction that costs most — they described work as missing
 when it existed.
 
+## Triage: what is actually broken (2026-08-26)
+
+The `- [ ]` count is not a work estimate. A pass over every open item found it
+mixes real defects with scope decisions, upstream bugs, performance work, and
+finished work whose box was never flipped. **Of 78 open items, 26 are real,
+fixable defects.** The rest will not be "fixed" in the sense the checkbox
+implies.
+
+| category | n | meaning |
+|---|---|---|
+| **DEFECT** | 26 | Real divergence from mongod / PostgreSQL. Ours to fix. |
+| **STATUS** | 13 | Finished work or a description of shipped behaviour; nothing pending. Kept for the detail. |
+| **WONTFIX** | 12 | Deliberate scope decision — multi-node, alternative auth, a BSON representation limit. Will not change. |
+| **PERF** | 11 | Throughput / latency / measurement. Real, but a different class from correctness. |
+| **CHORE** | 9 | Infra, CI, release, one-time configuration. |
+| **UPSTREAM** | 5 | Driver or test-harness artifacts, not server bugs. |
+| **FEATURE** | 2 | Planned capability never built (not a divergence). |
+
+### The 26 defects, grouped by root cause
+
+**SQL / PostgreSQL wire (10)** — the largest concentration by far:
+cross-type lenient pairs; query pipelining; CancelRequest; streaming COPY OUT
+abort; `test_return_untyped` DatatypeMismatch; write-conflict retry (40001 vs
+PG's real semantics); pgjdbc remaining clusters; pgx gauge tail; sub-millisecond
+timestamp *predicates*; jsonb operator gap. Plus the catalog's missing
+column-level reflection, `SET search_path` not affecting name resolution,
+deferred constraints unmodelled, and partial-index `pg_get_expr` rendering.
+
+**Rust server errors where Python defers (5)** — *one root cause, not five*:
+widen the query matcher; widen the update operators; storage-backed pipeline
+stages (`$lookup` / `$graphLookup` / `$geoNear` / `$out` / `$merge`); remaining
+date-operator defers; and the generic-`BadValue` error-code class. The Rust
+server has no Python to fall back to, so every unported construct surfaces as an
+error rather than a slower answer. `update::arith_type_error` (2026-08-25) is
+the worked template for closing the error-code half.
+
+**Mongo-side correctness (6)**: `top` counters always zero; the C-driver
+`writeConcernError` failure; `$meta` projection values; the aggregation
+error-wrapper prefix (characterised 2026-08-25, needs constant-fold modelling);
+change-stream awaitData with no `maxTimeMS`; multi-document update/delete
+chunking.
+
+**Transactions (1)**: the user-transaction dirty-budget guard, Python side.
+
+### Reading this list
+
+Line numbers drift, so items are identified by headline above rather than by
+number. Two standing rules, both learned the hard way:
+
+- **Reproduce an item before working it.** This pass found five entries
+  describing slices that had already shipped (`#140`–`#144`), now flipped to
+  `[x]`. Earlier passes found entries asserting limitations the engine had not
+  had for months.
+- **"The engines agree" is not "the engines are correct."** The `$bucket`
+  empty-bucket bug (fixed 2026-08-25) had the Rust engine *deliberately*
+  reproducing the Python bug, comment and all, with parity green throughout.
+  Only a live mongod settles correctness.
+
 ---
 
 ## 1. Stubs (canned responses, no real semantics)
@@ -2634,6 +2692,46 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   update-parity cases.)
 - [ ] **Aggregate gaps found by the three-way differential (2026-07-10, both
   servers).**
+  **2026-08-25 re-run (44 stages/operators, both servers vs mongod 6.0.16):
+  two real bugs found and FIXED, one new gap characterised.**
+  - *FIXED — a missing field path emitted `null` instead of being omitted.*
+    `{$project: {z: "$nope"}}`, `{$project: {z: "$n.k"}}` with `n.k` absent, and
+    `{$addFields: {z: "$nope"}}` all wrote `z: null`; mongod omits the key. So
+    did a document literal — `{$project: {z: {w: "$nope"}}}` gave `{z: {w: null}}`
+    where mongod gives `{z: {}}`. Silent wrong data: every document carried a key
+    mongod never sends, inverting a client's `"z" in doc` test. Both engines
+    already had the MISSING marker and both stages already skipped it — they
+    never *received* it, because plain `evaluate` answers null for an absent
+    path. Fixed with a separate field-value evaluator
+    (`expressions.evaluate_or_missing` / `expressions::eval_field_value`),
+    deliberately NOT by changing `evaluate`: a missing path is still `null` as an
+    *operator argument* (`{$add: ["$nope", 1]}` is 1), and only *missing* in
+    field-value position. Both rules are pinned in
+    `tests/test_mongod_differential.py`.
+  - *FIXED — `$bucket` emitted empty buckets.* mongod emits a bucket only when
+    something landed in it, boundary buckets and `default` alike (probed:
+    boundaries `[0,2,4,8]` over values 1 and 7 answer `_id: 0` and `_id: 4`,
+    omitting `_id: 2`). An unused `default` surfaced as a bare `{_id: "other"}`
+    with no `count` at all. The Rust side had *deliberately* reproduced the bug
+    to match the buggy Python, comment and all; both moved together.
+  - *OPEN (new, characterised) — aggregation runtime errors lack mongod's
+    wrapper prefix.* Codes match; the message doesn't. mongod picks one of three
+    wrappers by **when** the error fires, which is decided by constant folding:
+    an all-literal expression folds at optimize time and gets
+    `Failed to optimize pipeline :: caused by :: <msg>`, while any field
+    reference defers to runtime and gets
+    `PlanExecutor error during aggregation :: caused by :: <msg>`. Probed both
+    ways on the same operators (`{$divide: [1, 0]}` vs `{$divide: ["$a", 0]}`;
+    `{$ln: -1}` vs `{$ln: "$neg"}`). Parse-time errors have their own wrappers
+    (`Invalid $project :: caused by ::`, which we already emit). Closing it means
+    modelling "does this expression subtree reference a field path or variable",
+    which is tractable but is message text only — deliberately not attempted in
+    the 2026-08-25 pass rather than half-implemented.
+  - *NOT a bug:* `$group` output order differs from mongod. Confirmed identical
+    as sets, and mongod's own order **changed between two runs of the same
+    pipeline** — it is genuinely unspecified. Any test comparing `$group` output
+    must sort first.
+
   **`$stdDevPop` last-ULP vs mongod** — both servers agree with each other but
   differ from mongod in the final ULP (e.g. `2.357022603955158` vs mongod's
   `2.3570226039551585`); mongod uses a different summation order. Precision-only,
@@ -5474,7 +5572,7 @@ shared storage engine or building large new protocol subsystems:
   REVOKE are accepted but ignored (no dependency tracking); a membership referencing a name that isn't a
   declared role or the connecting user reflects with `oid 0` (won't join to `pg_roles`); no cycle detection.
   Not ported to the Rust server.
-- [ ] **FakeStorage removed — all SQL/PG tests on real Storage** (#140, b179): the legacy `tests/sqlfake.py`
+- [x] **FakeStorage removed — all SQL/PG tests on real Storage** (#140, b179): the legacy `tests/sqlfake.py`
   mock is deleted; every SQL / pg-server test now drives the real WiredTiger `Storage(str(tmp_path))` with a
   `try: yield finally: s.close()` fixture. The migration surfaced (and this slice fixed) four real bugs the
   mock had masked: (1) `query._coerce_datetime` — a tz-aware SQL literal vs a tz-naive-UTC stored datetime
@@ -5509,7 +5607,7 @@ shared storage engine or building large new protocol subsystems:
   persists to `pg_twophase`); the statements work only over the **simple query protocol** (the extended
   Parse/Bind path routes a bound AST through `run_statement`, bypassing the pre-parse interceptor — same
   constraint as LISTEN/NOTIFY). Not ported to the Rust server.
-- [ ] **Embedded run_sql returns tz-aware `timestamptz` (#141, b181):** a stored `timestamptz` decodes
+- [x] **Embedded run_sql returns tz-aware `timestamptz` (#141, b181):** a stored `timestamptz` decodes
   tz-naive UTC from BSON, so the embedded `run_sql` result used to hand back a naive datetime while the wire
   path already rendered it tz-aware — an embedded/wire inconsistency, and the naive value silently
   mis-compared against a tz-aware literal. `engine._normalize_result` now tags naive `timestamptz` /
@@ -5525,7 +5623,7 @@ shared storage engine or building large new protocol subsystems:
   the divergence. A real naive-`timestamp` type (tag + OID 1114 + render/coerce/round-trip) is a larger
   slice — **now landed in #143, b183 (see below).** (The related WHERE `timestamptz_col = '…+00:00'` /
   `::timestamptz` filter-coercion quirk is **fixed in #142, b182** — see below.)
-- [ ] **timestamptz WHERE-equality bridges naive/aware (#142, b182):** `WHERE ts = '…+00:00'` /
+- [x] **timestamptz WHERE-equality bridges naive/aware (#142, b182):** `WHERE ts = '…+00:00'` /
   `= '…'::timestamptz` used to match **nothing** — the equality path (`query._eq_numeric_aware`, shared by
   bare equality / `$eq` / `$in` / `$ne`) did numeric coercion but not the tz-aware/naive datetime alignment
   the range operators already had (`_try_cmp` → `_coerce_datetime`), so a tz-aware SQL literal never equalled
@@ -5538,7 +5636,7 @@ shared storage engine or building large new protocol subsystems:
   from the Rust `eq_scalar` (which compares `Bson::DateTime` millis). Tests: `test_query.py`
   ::test_datetime_naive_aware_equality_same_instant + `test_sql_datetime_types.py`
   ::test_timestamptz_where_equality_matches_offset_literal / _uses_index.
-- [ ] **Distinct naive `timestamp` type (#143, b183):** `TIMESTAMP` / `DATETIME` (and `::timestamp` casts,
+- [x] **Distinct naive `timestamp` type (#143, b183):** `TIMESTAMP` / `DATETIME` (and `::timestamp` casts,
   `timestamp '…'` literals, `date + interval` / `timestamp + interval` arithmetic) now type as a distinct
   **`timestamp`** tag (OID 1114, `timestamp without time zone`) instead of collapsing to `timestamptz`
   (1184) — matching Postgres, which types those naive. Only explicit `TIMESTAMPTZ` /
@@ -5555,7 +5653,7 @@ shared storage engine or building large new protocol subsystems:
   test_cast_timestamptz_to_timestamp_strips_tz / test_timestamp_array_naive`. SQL-layer change only — no Rust
   parity impact (the Rust engines cover query/update/expr/aggregate, not the SQL type mapping). **Follow-up
   (`date_trunc` argument typing) landed in #144, b184 — see below.**
-- [ ] **date_trunc preserves argument tz-ness (#144, b184):** `date_trunc(unit, src)` now types as the
+- [x] **date_trunc preserves argument tz-ness (#144, b184):** `date_trunc(unit, src)` now types as the
   tz-ness of `src` — `date_trunc(text, timestamptz) -> timestamptz`, `date_trunc(text, timestamp) -> timestamp`
   (a `date` argument casts to naive timestamp) — instead of always `timestamptz`. `planner._infer_scalar_tag`
   threads the argument tag through the `TimestampTrunc` node (`CurrentTimestamp` / `now()` stay `timestamptz`);

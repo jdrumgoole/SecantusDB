@@ -1099,9 +1099,8 @@ pub fn sort_by_count_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R
 
 /// Accumulate `output_spec` over `docs` into a single bucket with a fixed
 /// `_id` (shared by `$bucket`). Mirrors the per-bucket `_accumulate` /
-/// `_finalize` loop in `_stage_bucket`. Caller guarantees `docs` is non-empty
-/// (an empty `$bucket` bucket emits only `{_id}` — the accumulator fields are
-/// never created, matching the pure code).
+/// `_finalize` loop in `_stage_bucket`. Caller guarantees `docs` is non-empty —
+/// an empty bucket is not emitted at all.
 fn accumulate_into(
     id: Bson,
     output_spec: &Document,
@@ -1254,14 +1253,17 @@ pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Do
 
     let mut out = Vec::with_capacity(keys.len());
     for (key, bucket_docs) in keys.into_iter().zip(placed) {
+        // mongod emits a bucket only when something landed in it — boundary
+        // buckets and `default` alike (probed 6.0.16: boundaries [0,2,4,8] over
+        // values 1 and 7 answer `_id: 0` and `_id: 4`, omitting the empty
+        // `_id: 2`). Buckets are pre-created to keep boundary order, so the
+        // empty ones are dropped here. This previously emitted a bare `{_id}`
+        // with no accumulator fields, faithfully reproducing the pure-Python
+        // bug; both are fixed together.
         if bucket_docs.is_empty() {
-            // Empty bucket: only `_id` (accumulator fields are never created).
-            let mut doc = Document::new();
-            doc.insert("_id".to_string(), key);
-            out.push(doc);
-        } else {
-            out.push(accumulate_into(key, output_spec, &bucket_docs, vars)?);
+            continue;
         }
+        out.push(accumulate_into(key, output_spec, &bucket_docs, vars)?);
     }
     Ok(out)
 }

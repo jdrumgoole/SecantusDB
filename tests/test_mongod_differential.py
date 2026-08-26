@@ -171,6 +171,56 @@ QUERY_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
             str(d["a"]) for d in db.c.aggregate([{"$group": {"_id": None, "a": {"$avg": "$x"}}}])
         ],
     ),
+    # A field path that doesn't resolve is MISSING, not null: mongod omits the
+    # key. We emitted `z: null` on every document — an extra key mongod never
+    # sends, so a client testing `"z" in doc` saw the opposite of the truth.
+    (
+        "project-missing-path-omits-the-key",
+        [{"_id": 1, "n": {"k": 1}}, {"_id": 2, "n": {}}, {"_id": 3}],
+        lambda db: list(db.c.aggregate([{"$project": {"z": "$nope"}}, {"$sort": {"_id": 1}}])),
+    ),
+    (
+        "project-missing-nested-path-omits-the-key",
+        [{"_id": 1, "n": {"k": 1}}, {"_id": 2, "n": {}}, {"_id": 3}],
+        lambda db: list(db.c.aggregate([{"$project": {"z": "$n.k"}}, {"$sort": {"_id": 1}}])),
+    ),
+    (
+        "addfields-missing-path-omits-the-key",
+        [{"_id": 1, "a": 1}, {"_id": 2}],
+        lambda db: list(db.c.aggregate([{"$addFields": {"z": "$nope"}}, {"$sort": {"_id": 1}}])),
+    ),
+    (
+        "document-literal-drops-missing-member",
+        [{"_id": 1, "a": 1}],
+        lambda db: list(db.c.aggregate([{"$project": {"z": {"w": "$nope"}}}])),
+    ),
+    # ...but a missing path is still *null* as an operator argument, which is a
+    # different rule and was already right. Pinned so the fix above can't
+    # over-reach into operator arguments.
+    (
+        "missing-path-is-null-as-an-operator-argument",
+        [{"_id": 1, "a": 1}],
+        lambda db: list(db.c.aggregate([{"$project": {"z": {"$add": ["$nope", 1]}}}])),
+    ),
+    # $bucket emits a bucket only when something landed in it — boundary
+    # buckets and `default` alike. An unused default surfaced as a bare
+    # `{_id: "other"}` with no `count`.
+    (
+        "bucket-omits-the-empty-default",
+        [{"_id": 1, "a": 5}, {"_id": 2, "a": 6}],
+        lambda db: list(
+            db.c.aggregate(
+                [{"$bucket": {"groupBy": "$a", "boundaries": [0, 4, 8], "default": "other"}}]
+            )
+        ),
+    ),
+    (
+        "bucket-omits-an-empty-middle-bucket",
+        [{"_id": 1, "a": 1}, {"_id": 2, "a": 7}],
+        lambda db: list(
+            db.c.aggregate([{"$bucket": {"groupBy": "$a", "boundaries": [0, 2, 4, 8]}}])
+        ),
+    ),
     (
         "arrayelemat-out-of-range-is-missing",
         [{"_id": 1, "a": [1, 2]}],
