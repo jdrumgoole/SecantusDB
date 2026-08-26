@@ -1,6 +1,6 @@
 # Benchmark: both servers vs mongod
 
-Generated 2026-08-22 on a dedicated DigitalOcean droplet (4 vCPU, x86-64
+Generated 2026-08-26 on a dedicated DigitalOcean instance (8 vCPU, x86-64
 Linux), against **mongod 8.0.31**, via `invoke do-perf`.
 
 All three servers use the **same WiredTiger storage engine** — mongod ships
@@ -19,8 +19,9 @@ each server is. Dataset is 10,000 small docs.
 Two things changed at once, and both move the ratios without any change to
 SecantusDB:
 
-- **The reference moved from mongod 6.0.16 to 8.0.29.** Every `×mongod` figure
-  is a ratio, so a faster denominator makes us look worse. mongod 8.0 is
+- **The reference moved from mongod 6.0.16 to the 8.0 line** (8.0.31 as of this
+  run; the harness installs the latest 8.0.x). Every `×mongod` figure is a
+  ratio, so a faster denominator makes us look worse. mongod 8.0 is
   substantially quicker at inserts, and that alone accounts for most of the
   change — SecantusDB's own absolute timings barely moved.
 - **The machine moved from a developer laptop to a dedicated droplet.** A
@@ -132,28 +133,27 @@ client droplets, real NICs between them — and runs **SecantusDB and a real
 `mongod` back-to-back on the same hardware**, interleaved across passes so
 drift lands on both equally.
 
-Measured 2026-08-22 on DigitalOcean `lon1`: a `c-4` server (4 dedicated vCPU,
+Measured 2026-08-26 on DigitalOcean `lon1`: a `c-4` server (4 dedicated vCPU,
 8 GB) and two `c-2` clients, 16 workers each, 8 KiB **incompressible**
 documents, a 70/20/10 insert/find/update mix, 4 GB WiredTiger cache for both
 engines, three interleaved 90-second passes:
 
 | engine | version | ops/s (median) | spread | p50 | p99 | p99.9 | server CPU |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| SecantusDB | 0.5.3-beta.161 | **11,099** | 3.1% | 2.06 ms | 15 ms | **37 ms** | 78.3% |
-| mongod | 8.0.29 | **14,772** | 1.5% | 1.71 ms | 10 ms | **18 ms** | 80.2% |
+| SecantusDB | 0.5.3-beta.163 | **9,338** | 3.1% | 2.48 ms | 16.76 ms | **37.34 ms** | 78.9% |
+| mongod | 8.0.31 | **12,698** | 2.6% | 1.92 ms | 12.48 ms | **31.62 ms** | 78.0% |
 
 **SecantusDB reaches about three quarters of MongoDB's throughput on this
-workload (0.75x), with p50 latency within 1.2x and p99.9 within 2.0x.** Both
-engines saturated the same server (78-80% CPU) while the clients sat idle, so
+workload (0.74x), with p50 latency within 1.3x and p99.9 within 1.2x.** Both
+engines saturated the same server (78-79% CPU) while the clients sat idle, so
 both figures are server-bound and the comparison is fair. Run-to-run spread was
 about 3%.
 
-That is a large improvement on the previous release, which measured 0.27x
-throughput and **72x** the p99.9 latency. The difference is the block
-compressor: profiling found 65% of server CPU inside zlib's `deflate`, and
-switching the default to lz4 took SecantusDB from 3,993 to 11,099 ops/s and cut
-p99.9 from 1,303 ms to 37 ms on this benchmark. The remaining gap is real but
-no longer dominated by one cause.
+Tail latency is where this has moved most. Two releases ago the p99.9 ratio was
+**2.0x**; it is now **1.18x**. Before the block compressor changed it was
+**72x** — profiling found 65% of server CPU inside zlib's `deflate`, and
+switching the default to lz4 cut p99.9 from 1,303 ms to 37 ms in one step. What
+remains is a real throughput gap, no longer dominated by any single cause.
 
 Caveats, in both directions:
 
