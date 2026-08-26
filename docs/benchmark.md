@@ -133,21 +133,21 @@ client droplets, real NICs between them — and runs **SecantusDB and a real
 `mongod` back-to-back on the same hardware**, interleaved across passes so
 drift lands on both equally.
 
-Measured 2026-08-26 on DigitalOcean `lon1`: a `c-4` server (4 dedicated vCPU,
-8 GB) and two `c-2` clients, 16 workers each, 8 KiB **incompressible**
-documents, a 70/20/10 insert/find/update mix, 4 GB WiredTiger cache for both
-engines, three interleaved 90-second passes:
+<!-- head-to-head:begin -->
+Measured 2026-08-26 on DigitalOcean `lon1`: a `c-4 (4 vCPU, 8192 MB)` server and 2 x c-2, 16 workers each, 8 KiB **incompressible**
+documents, a 70/20/10 insert/find/update mix, a 4G WiredTiger cache for
+both engines, and 3 interleaved passes:
 
 | engine | version | ops/s (median) | spread | p50 | p99 | p99.9 | server CPU |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | SecantusDB | 0.5.3-beta.163 | **9,338** | 3.1% | 2.48 ms | 16.76 ms | **37.34 ms** | 78.9% |
 | mongod | 8.0.31 | **12,698** | 2.6% | 1.92 ms | 12.48 ms | **31.62 ms** | 78.0% |
 
-**SecantusDB reaches about three quarters of MongoDB's throughput on this
-workload (0.74x), with p50 latency within 1.3x and p99.9 within 1.2x.** Both
-engines saturated the same server (78-79% CPU) while the clients sat idle, so
-both figures are server-bound and the comparison is fair. Run-to-run spread was
-about 3%.
+**SecantusDB reaches 0.74x of MongoDB's throughput on this workload, with p50
+latency within 1.29x and p99.9 within 1.18x.** Both engines saturated the same
+server while the clients sat idle, so both figures are server-bound and the
+comparison is fair. Run-to-run spread was about 3.1%.
+<!-- head-to-head:end -->
 
 Tail latency is where this has moved most. Two releases ago the p99.9 ratio was
 **2.0x**; it is now **1.18x**. Before the block compressor changed it was
