@@ -148,6 +148,32 @@ def _err(db: Database, flt: dict, update: dict) -> str:
         return f"{exc.code}: {exc.details.get('errmsg')}"
 
 
+def _agg_err(db: Database, pipeline: list) -> str:
+    """`(code, errmsg)` of a failed aggregation, as a comparable string.
+
+    mongod wraps a *runtime* aggregation error in
+    ``PlanExecutor error during aggregation :: caused by :: <msg>`` (and a
+    constant-folded one in ``Failed to optimize pipeline :: caused by ::``).
+    We emit the bare message — a separately tracked gap, since reproducing the
+    choice means modelling mongod's constant folding for message text alone.
+    Strip the wrapper on both sides so these cases assert the code and the
+    message that matter, not the known-missing prefix.
+    """
+    from pymongo.errors import OperationFailure
+
+    try:
+        return f"ok:{len(list(db.c.aggregate(pipeline)))}"
+    except OperationFailure as exc:
+        msg = str(exc.details.get("errmsg", ""))
+        for wrapper in (
+            "PlanExecutor error during aggregation :: caused by :: ",
+            "Failed to optimize pipeline :: caused by :: ",
+        ):
+            if msg.startswith(wrapper):
+                msg = msg[len(wrapper) :]
+        return f"{exc.code}: {msg}"
+
+
 QUERY_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ("eq-numeric-unifies-types", NUMS, lambda db: sorted(d["_id"] for d in db.c.find({"x": 5}))),
     ("eq-true-is-not-one", NUMS, lambda db: sorted(d["_id"] for d in db.c.find({"x": 1}))),
@@ -205,6 +231,82 @@ QUERY_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     # $bucket emits a bucket only when something landed in it — boundary
     # buckets and `default` alike. An unused default surfaced as a bare
     # `{_id: "other"}` with no `count`.
+    # $stdDev* counts only int/long/double/decimal. bool, null, string, array
+    # and document values are silently skipped, and mongod ALWAYS emits the
+    # field — `null` when the group held no numeric value. Summing every value
+    # raised a bare TypeError that escaped as "internal server error" (code 1),
+    # and an all-non-numeric group omitted the key entirely.
+    (
+        "stddev-non-numeric-is-skipped-not-fatal",
+        [{"_id": 1, "a": 5}, {"_id": 2, "a": "x"}, {"_id": 3, "a": 7}],
+        lambda db: list(db.c.aggregate([{"$group": {"_id": None, "s": {"$stdDevPop": "$a"}}}])),
+    ),
+    (
+        "stddev-no-numeric-value-is-null-not-absent",
+        [{"_id": 1, "a": "x"}, {"_id": 2, "a": "y"}],
+        lambda db: list(db.c.aggregate([{"$group": {"_id": None, "s": {"$stdDevPop": "$a"}}}])),
+    ),
+    (
+        "stddev-missing-field-is-null-not-absent",
+        [{"_id": 1, "b": 1}],
+        lambda db: list(db.c.aggregate([{"$group": {"_id": None, "s": {"$stdDevPop": "$a"}}}])),
+    ),
+    (
+        "stddev-bool-is-not-numeric",
+        [{"_id": 1, "a": True}, {"_id": 2, "a": False}],
+        lambda db: list(db.c.aggregate([{"$group": {"_id": None, "s": {"$stdDevPop": "$a"}}}])),
+    ),
+    (
+        "stddev-decimal-answers-a-double",
+        [{"_id": 1, "a": Decimal128("5")}, {"_id": 2, "a": Decimal128("7")}],
+        lambda db: list(db.c.aggregate([{"$group": {"_id": None, "s": {"$stdDevPop": "$a"}}}])),
+    ),
+    (
+        "stddev-samp-single-value-is-null",
+        [{"_id": 1, "a": 5}],
+        lambda db: list(db.c.aggregate([{"$group": {"_id": None, "s": {"$stdDevSamp": "$a"}}}])),
+    ),
+    # $densify: a doc whose field is null/missing does not participate — mongod
+    # emits it unchanged (nulls sort first) and densifies the rest. Sorting the
+    # raw list raised a bare TypeError that escaped as "internal server error"
+    # (code 1) — a crash where mongod answers.
+    (
+        "densify-null-field-passes-through",
+        [{"_id": 1, "a": 1}, {"_id": 2, "a": None}, {"_id": 3, "a": 5}],
+        lambda db: [
+            (d.get("_id"), d.get("a"))
+            for d in db.c.aggregate(
+                [{"$densify": {"field": "a", "range": {"step": 1, "bounds": "full"}}}]
+            )
+        ],
+    ),
+    (
+        "densify-missing-field-passes-through",
+        [{"_id": 1, "a": 1}, {"_id": 2, "x": 9}, {"_id": 3, "a": 5}],
+        lambda db: [
+            (d.get("_id"), d.get("a"))
+            for d in db.c.aggregate(
+                [{"$densify": {"field": "a", "range": {"step": 1, "bounds": "full"}}}]
+            )
+        ],
+    ),
+    (
+        "densify-non-numeric-field-is-rejected",
+        [{"_id": 1, "a": 1}, {"_id": 2, "a": "s"}],
+        lambda db: _agg_err(
+            db, [{"$densify": {"field": "a", "range": {"step": 1, "bounds": "full"}}}]
+        ),
+    ),
+    (
+        "densify-all-null-emits-them-unchanged",
+        [{"_id": 1, "a": None}, {"_id": 2, "a": None}],
+        lambda db: [
+            (d.get("_id"), d.get("a"))
+            for d in db.c.aggregate(
+                [{"$densify": {"field": "a", "range": {"step": 1, "bounds": "full"}}}]
+            )
+        ],
+    ),
     (
         "bucket-omits-the-empty-default",
         [{"_id": 1, "a": 5}, {"_id": 2, "a": 6}],

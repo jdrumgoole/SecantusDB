@@ -475,13 +475,23 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
             }
         }
         Acc::StdDev { values, .. } => {
-            // Python appends every non-null value; a non-numeric would then blow
-            // up `sum(values)` at finalize, so we defer such a group to Python
-            // (which raises). `null` is skipped. Bool counts as 0/1 (Python sums
-            // bools as ints) — matches the pure evaluator.
+            // mongod counts only int / long / double / decimal. bool, null,
+            // string, array and document values are silently *skipped*, not
+            // errors (probed 6.0.16: `$stdDevPop` over [5, "x", 7] is 1.0, and
+            // over bools alone is null).
+            //
+            // This used to defer the whole group on any non-numeric, with a
+            // comment saying Python would raise — which it did, with a bare
+            // TypeError that escaped as "internal server error". It also folded
+            // bool to 0/1 "matching the pure evaluator", which mongod does not.
+            // Both sides are fixed together.
             let v = eval(arg, doc, vars)?;
-            if !is_null(&v) {
-                values.push(numeric_f64(&v).ok_or(())?);
+            // `percentile_f64` is the same domain (int/long/double/decimal,
+            // bool and NaN excluded) and handles Decimal128, which
+            // `numeric_f64` does not — mongod answers a double even for decimal
+            // input (probed: $stdDevPop over Decimal128 5 and 7 is 1.0).
+            if let Some(f) = percentile_f64(&v) {
+                values.push(f);
             }
         }
         Acc::Percentile {
@@ -674,19 +684,6 @@ fn nelem_result(kind: NElemKind, n: usize, vals: Vec<Bson>) -> R<Vec<Bson>> {
     }
 }
 
-/// A numeric value as `f64` for `$stdDev*`: int / long / double, plus bool as
-/// `0.0`/`1.0` (Python folds bools into the numeric sum). Anything else → `None`,
-/// so the caller defers the group to Python (whose `sum()` would raise).
-fn numeric_f64(b: &Bson) -> Option<f64> {
-    match b {
-        Bson::Int32(n) => Some(*n as f64),
-        Bson::Int64(n) => Some(*n as f64),
-        Bson::Double(d) => Some(*d),
-        Bson::Boolean(x) => Some(if *x { 1.0 } else { 0.0 }),
-        _ => None,
-    }
-}
-
 /// Population / sample standard deviation, mirroring the pure `_std_dev`: `None`
 /// for an empty set, and additionally for a sample (`pop == false`) with < 2
 /// values (population of a single value is `0.0`). Squares with plain
@@ -792,13 +789,11 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
                 out.insert(field.to_string(), Bson::Document(merged));
             }
             Acc::StdDev { values, pop } => {
-                // No numeric value seen -> the pure code never creates the bucket
-                // key, so the field is absent. Otherwise `_std_dev` may still be
-                // null (sample of a single value), which the pure code writes.
-                if !values.is_empty() {
-                    let v = std_dev(&values, pop).map_or(Bson::Null, Bson::Double);
-                    out.insert(field.to_string(), v);
-                }
+                // mongod always emits the field, answering `null` when the group
+                // held no numeric value. Omitting it (which the pure code also
+                // did) dropped a key mongod always sends.
+                let v = std_dev(&values, pop).map_or(Bson::Null, Bson::Double);
+                out.insert(field.to_string(), v);
             }
             Acc::Percentile {
                 is_median,
@@ -1786,7 +1781,10 @@ mod tests {
         );
         assert_eq!(out[0].get("p"), Some(&Bson::Double((8.0f64 / 3.0).sqrt())));
         assert_eq!(out[0].get("s"), Some(&Bson::Double(2.0)));
-        // Single value: pop -> 0.0, samp -> null. All-missing -> field absent.
+        // Single value: pop -> 0.0, samp -> null. All-missing -> field present
+        // and null: mongod always emits the key (probed 6.0.16). This assertion
+        // used to require the field be *absent*, pinning the bug it was meant to
+        // guard.
         let out2 = g(
             bson::bson!({
                 "_id": Bson::Null,
@@ -1797,7 +1795,7 @@ mod tests {
         );
         assert_eq!(out2[0].get("p"), Some(&Bson::Double(0.0)));
         assert_eq!(out2[0].get("s"), Some(&Bson::Null));
-        assert!(out2[0].get("m").is_none());
+        assert_eq!(out2[0].get("m"), Some(&Bson::Null));
     }
 
     #[test]

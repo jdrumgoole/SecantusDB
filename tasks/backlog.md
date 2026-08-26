@@ -46,13 +46,33 @@ timestamp *predicates*; jsonb operator gap. Plus the catalog's missing
 column-level reflection, `SET search_path` not affecting name resolution,
 deferred constraints unmodelled, and partial-index `pg_get_expr` rendering.
 
-**Rust server errors where Python defers (5)** — *one root cause, not five*:
-widen the query matcher; widen the update operators; storage-backed pipeline
-stages (`$lookup` / `$graphLookup` / `$geoNear` / `$out` / `$merge`); remaining
-date-operator defers; and the generic-`BadValue` error-code class. The Rust
-server has no Python to fall back to, so every unported construct surfaces as an
-error rather than a slower answer. `update::arith_type_error` (2026-08-25) is
-the worked template for closing the error-code half.
+**Rust server errors where Python defers — MEASURED 2026-08-26, and the five
+entries describing it are largely stale.** A three-way probe of 45
+query / update / aggregate constructs against the standalone `secantusd-rs`
+binary answered **42 correctly**. Everything the five entries name as missing is
+in fact working on the Rust server: `$lookup`, `$graphLookup`, `$out`, `$merge`,
+`$unionWith`, `$setWindowFields`, `$fill`, `$redact`, `$sample`, `$indexStats`,
+`$collStats`, `$dateToString`, `$dateFromString`, `$dateTrunc`, `$regexFind`,
+`$toDate`, `$bit`, `$currentDate`, `$pull` with a condition, `$pullAll`,
+`$addToSet` `$each`, `$push` `$slice`/`$sort`, positional `$[]` updates,
+pipeline-form updates, `$expr`, `$jsonSchema`, `$bitsAllSet`, `$mod`,
+`$elemMatch`, regex with options, `$geoWithin`.
+
+Of the 3 failures, **none was Rust-specific** — the Python server failed all
+three too:
+  - `$where` and `$function` need a JavaScript engine. Neither server has one;
+    this is a scope decision, not a porting gap. **Reclassify as WONTFIX.**
+  - `$densify` over a null / missing / non-numeric field: the *Python* server
+    **crashed** (`TypeError: '<' not supported between 'NoneType' and 'int'`
+    escaping as "internal server error", code 1) and Rust deferred to it with a
+    comment saying "Python sort raises". FIXED on both 2026-08-26.
+
+What genuinely remains of this class is the **error-code half only**: a
+construct the Rust engine can't do surfaces as generic `BadValue` (2) rather
+than mongod's typed code — e.g. `$densify` on a string field answers 2 where
+mongod answers 5733201. `update::arith_type_error` (2026-08-25) is the worked
+template. The porting half is done; do not plan a campaign around it without
+re-measuring first.
 
 **Mongo-side correctness (6)**: `top` counters always zero; the C-driver
 `writeConcernError` failure; `$meta` projection values; the aggregation
@@ -75,6 +95,25 @@ number. Two standing rules, both learned the hard way:
   empty-bucket bug (fixed 2026-08-25) had the Rust engine *deliberately*
   reproducing the Python bug, comment and all, with parity green throughout.
   Only a live mongod settles correctness.
+
+  **This is a searchable pattern, and sweeping it was 4-for-4 (2026-08-26).**
+  Where a Rust comment justifies behaviour by what the *Python* engine does —
+  rather than by what mongod does — the Python behaviour is often itself the
+  bug, and the Rust deferral exists only to preserve it. Four found this way:
+  `$bucket` empty buckets ("matching the pure code"), Decimal128 arithmetic
+  ("no Python arithmetic support (raises)" — false), `$densify` on a null field
+  ("Python sort raises" — a crash), and `$stdDev*` on non-numeric input
+  ("would then blow up `sum(values)` … defer to Python (which raises)" — also a
+  crash, plus bool folded to 0/1 "matching the pure evaluator", which mongod
+  does not do). Two were crash-class.
+
+  Greps that found them:
+  `"which the pure code"`, `"matching the pure evaluator"`, `"Python .* raises"`
+  near an `Err(Fallback)`. The *benign* form cites mongod in the same breath
+  ("mongod-faithful", "mongod ignores null elements") — those checked out.
+  **`$stdDevPop`'s Rust unit test asserted the buggy behaviour**
+  (`get("m").is_none()`), so the test pinned the bug it was meant to guard;
+  expect that when fixing this class.
 
 ---
 

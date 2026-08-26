@@ -677,7 +677,29 @@ def _stage_densify(
 
     out: list[dict[str, Any]] = []
     for key in insertion_order:
-        partition_docs = sorted(grouped[key], key=lambda d: get_path(d, field))
+        # A doc whose densify field is null or absent does NOT participate:
+        # mongod passes it through at its BSON sort position (null sorts before
+        # numbers) and densifies only the rest. Sorting the raw list crashed
+        # here with a bare `TypeError: '<' not supported between instances of
+        # 'NoneType' and 'int'`, which escaped as "internal server error"
+        # (code 1) — a crash where mongod answers.
+        passthrough = [d for d in grouped[key] if not _densify_participates(d, field)]
+        participants = [d for d in grouped[key] if _densify_participates(d, field)]
+        for d in participants:
+            value = get_path(d, field)
+            if not _densify_value_ok(value):
+                # mongod-probed 6.0.16: a non-numeric, non-date value is
+                # rejected outright rather than skipped.
+                raise AggregateError(
+                    "Densify field type must be numeric or a date",
+                    code=5733201,
+                    code_name="Location5733201",
+                )
+        # Null / missing sort before every number and date, so they lead.
+        out.extend(passthrough)
+        if not participants:
+            continue
+        partition_docs = sorted(participants, key=lambda d: get_path(d, field))
         partition_carry = {f: get_path(partition_docs[0], f) for f in partition_fields}
         if isinstance(bounds, list) and len(bounds) == 2:
             lo, hi = bounds[0], bounds[1]
@@ -686,6 +708,22 @@ def _stage_densify(
             hi = get_path(partition_docs[-1], field)
         out.extend(_densify_partition(field, partition_docs, lo, hi, step, partition_carry))
     return out
+
+
+def _densify_participates(doc: Mapping[str, Any], field: str) -> bool:
+    """Whether a doc takes part in densification at all.
+
+    mongod ignores a doc whose densify field is missing or null — it is emitted
+    unchanged and contributes neither a bound nor a step.
+    """
+    return get_path(doc, field, default=None) is not None
+
+
+def _densify_value_ok(value: Any) -> bool:
+    """mongod's densify domain: numeric or date. `bool` is not numeric here."""
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (int, float, _dt.datetime, Decimal128))
 
 
 def _densify_fill_range(
@@ -1110,7 +1148,7 @@ def _std_dev(values: list[Any], *, pop: bool) -> float | None:
         return None
     total = 0.0
     for x in values:
-        total += x  # bool folds to 0.0/1.0, matching the Rust engine
+        total += x  # values are pre-filtered to floats by the accumulator
     mean = total / n
     denom = n if pop else n - 1
     acc = 0.0
@@ -1121,6 +1159,20 @@ def _std_dev(values: list[Any], *, pop: bool) -> float | None:
 
 
 _AccHandler = Callable[[dict[str, Any], str, Any, Mapping[str, Any], dict[str, Any]], None]
+
+
+def _std_dev_operand(v: Any) -> float:
+    """A `$stdDev*` input as the float the fold works on.
+
+    mongod answers a double even for decimal input (probed 6.0.16: `$stdDevPop`
+    over Decimal128 5 and 7 is `1.0`), so decimals convert here rather than
+    widening the accumulator.
+    """
+    if isinstance(v, Decimal128):
+        return float(v.to_decimal())
+    if isinstance(v, _decimal.Decimal):
+        return float(v)
+    return float(v)
 
 
 def _is_acc_number(v: Any) -> bool:
@@ -1286,13 +1338,20 @@ def _acc_std(
     pop: bool,
 ) -> None:
     v = evaluate(arg, doc, vars)
-    if v is None:
-        return
+    # Create the state even when this doc contributes nothing: mongod always
+    # emits the field, answering `null` when the group held no numeric value.
+    # Creating it lazily meant an all-non-numeric group *omitted* the field.
     state = bucket.get(field)
     if not isinstance(state, dict) or "_std_vals" not in state:
         state = {"_std_vals": [], "_std_pop": pop}
         bucket[field] = state
-    state["_std_vals"].append(v)
+    # mongod counts only int / long / double / decimal; bool, null, string,
+    # array and document values are silently skipped, not errors. Appending
+    # them raised a bare `TypeError: unsupported operand type(s) for +=:
+    # 'float' and 'str'` in `_std_dev`, which escaped as "internal server
+    # error" (code 1) — a crash where mongod answers.
+    if _is_acc_number(v):
+        state["_std_vals"].append(_std_dev_operand(v))
 
 
 def _percentile_spec(arg: Any, op: str) -> tuple[Any, list[float] | None]:
