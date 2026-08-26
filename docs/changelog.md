@@ -19,6 +19,264 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.6.0b16] — 2026-08-26
+
+### The drivers found the bugs this time
+
+Six of the nine entries below started as a driver-conformance failure rather
+than a failing unit test, and two of them could only have been found that way.
+The C driver asserts on the *exact text* of the error a change stream returns
+when a pipeline modifies the event `_id`; SecantusDB returned the right code
+with its own paraphrase, so the assertion failed and pymongo — which never
+checks that string — had been passing it for months. The Go driver sends
+`maxTimeMS: 0` to mean "tell me what is ready right now"; SecantusDB treated an
+explicit zero the same as an absent field and waited a second, long enough for
+an unrelated event to land inside the wait and be handed back to a client that
+had asked what was ready when it asked.
+
+Both are the sort of divergence a permissive client never notices and a strict
+one fails on immediately. In each case the Rust server was already right and
+the Python server carried its own approximation, which is a useful thing to
+know: when the two disagree, the Rust side has usually been checked against
+mongod more recently.
+
+Alongside those, arithmetic got stricter. `$inc` and `$mul` now reject
+non-numeric operands with mongod's own error text instead of returning 500s or
+writing silently, and Decimal128 arithmetic is exact on both servers rather
+than routed through binary floating point. A differential harness that compares
+every operator against a live `mongod` — the thing that turned up nine of these
+— is now part of the test suite rather than a one-off script.
+
+Tail latency improved as well: p99.9 relative to `mongod` moved from 1.48× to
+**1.18×**, measured on dedicated cloud instances as part of cutting this
+release.
+
+
+### Tail latency improved again
+
+Re-measured as part of cutting `secantusdb-v0.5.3-beta.163`, on dedicated cloud
+instances against a real `mongod`.
+
+#### Changed
+
+- **p99.9 latency relative to mongod: 1.48× → 1.18×.** In absolute terms our
+  p99.9 fell from 49.10 ms to 37.34 ms (−24%) while mongod's moved −5%, so the
+  gain is ours rather than the reference moving. Throughput is flat at 0.74×
+  (was 0.73×, inside the 3.1% pass spread).
+- **Two per-operation rows now beat mongod** — indexed range 0.91×, full scan
+  0.96× — with filtered scan and the change-stream drain at parity. The Rust
+  server's overall range narrowed from 0.8×–2.9× to **0.9×–2.4×**.
+- The reference moved from **mongod 8.0.29 to 8.0.31** (the gauge installs the
+  latest 8.0.x). The results file records the version, so the change is
+  traceable rather than silent.
+
+### Decimal128 arithmetic is exact on both servers
+
+Stored decimals were quietly losing precision. `$inc`, `$mul`, `$sum` and `$avg`
+ran in Python's default decimal context, which carries 28 significant digits —
+but Decimal128 carries 34. Every arithmetic result on a decimal field was
+silently truncated by six digits: incrementing
+`1.000000000000000000000000000000001` by one answered
+`2.000000000000000000000000000`, dropping the trailing digit a real MongoDB
+server keeps. Nothing errored and nothing warned; the value simply came back
+shorter than it went in. The same four operators failed outright on the Rust
+server, which had no decimal arithmetic at all and rejected the write or the
+pipeline rather than answering.
+
+Both servers now compute decimals exactly. The Rust engine gained a
+sign/coefficient/exponent implementation that adds, multiplies and divides
+without an intermediate binary float, rounding half-even to 34 digits exactly
+once and only when a result genuinely needs it. Crucially it preserves the
+*quantum*: Decimal128 distinguishes `5.00` from `5`, so `2.50 + 0.10` is `2.60`
+and `2.50 * 2` is `5.00`, matching MongoDB rather than collapsing to a
+normalised form.
+
+Getting there turned up a genuine MongoDB quirk worth knowing about: the server
+uses two different rules for turning a double into a decimal. The accumulators
+take the double's exact binary value, so `$sum` of `0.1` contributes
+`0.1000000000000000055511151231257827`, while `$inc`, `$mul` and `$toDecimal`
+round to 15 significant digits and contribute `0.100000000000000`. Both rules
+are now reproduced on both servers, `$toDecimal` included — it had been using
+neither. All of this is verified against a live mongod 6.0.16 rather than
+asserted from documentation, and the two engines are pinned to each other by
+several hundred thousand randomised comparisons.
+
+#### Fixed
+
+- `$inc` / `$mul` / `$sum` / `$avg` no longer truncate Decimal128 results to 28
+  significant digits; all 34 are kept, with IEEE 754-2008 preferred exponents so
+  the quantum survives (`2.50 + 0.10` → `2.60`, `2.50 * 2` → `5.00`).
+- The Rust server computes these four operators over Decimal128 instead of
+  failing. Previously a `$group` over a collection containing a single decimal
+  value failed the whole pipeline, and `$inc` on a decimal field returned a
+  write error.
+- `$toDecimal` and `$convert: {to: "decimal"}` convert a double at MongoDB's 15
+  significant digits (`0.1` → `0.100000000000000`, `4.125` →
+  `4.12500000000000`) rather than its shortest round-trip text, and round from
+  the exact binary value so denormals match (`5e-324` →
+  `4.94065645841247E-324`). All four implementations — both operators on both
+  servers — were previously wrong, each in its own way.
+- `$sum` / `$avg` convert a double by its exact binary value, matching MongoDB's
+  separate accumulator rule.
+
+#### Added
+
+- `crates/secantus-core/src/decimal.rs` — exact decimal128 arithmetic
+  (`add` / `mul` / `div_int`, parse and render, both double-conversion rules).
+- Decimal arithmetic cases in `tests/test_mongod_differential.py`, plus corpus
+  cases in the update and aggregate Rust/Python parity suites.
+- `tests/test_rust_decimal_parity.py` — a seeded generative parity fuzz over
+  decimal arithmetic, the accumulators, and the conversions. It found three of
+  the bugs fixed here that review and hand-written cases both missed, and it
+  asserts two properties: that the engines agree, *and* that the Rust engine
+  never defers on a decimal (a deferral is fatal on the standalone Rust server,
+  which has no Python to fall back to). Scale it up with
+  `SECANTUS_DECIMAL_FUZZ_SCALE=50` when hunting.
+
+### The Go gauge can keep its data directory for debugging
+
+`SECANTUS_GAUGE_KEEP_STORAGE=1 invoke validate-go` leaves the daemon's storage
+behind instead of deleting it.
+
+#### Added
+
+- A driver-side assertion tells you a test failed but not what the server sent,
+  and some gauge failures only reproduce under the *whole* run — so by the time
+  there is a failure worth explaining, the oplog that produced it has already
+  been removed. Keeping it is the difference between reading the offending
+  entry and guessing at it.
+
+### An explicit `maxTimeMS: 0` no longer blocks
+
+`getMore` treated an explicit `maxTimeMS: 0` the same as an absent one, because
+`doc.get("maxTimeMS", 0)` yields `0` for both — so a poll that asked for no
+waiting got the one-second default anyway.
+
+#### Fixed
+
+- mongod distinguishes the two: an explicit zero is a non-blocking poll, an
+  absent field means wait. Drivers rely on it, and blocking there does not
+  merely slow the call down — it changes the answer, because an event occurring
+  during the wait comes back to a client that asked what was ready *now*. Found
+  via mongo-go-driver's change-stream suite, where a collection dropped by test
+  teardown surfaced as a `drop` event the client had just been told did not
+  exist. The Rust server already behaved correctly, so this also closes a
+  two-server parity gap.
+
+### The test suite is warning-free again
+
+starlette's `TestClient` prefers `httpx2` and warns on every construction when
+only `httpx` is importable. Six of those warnings came from the admin websocket
+tests, and they were the last ones left in the default suite.
+
+Adding `httpx2` to the dev extra silences them. It is test-only on purpose:
+nothing under `src/secantus` imports `httpx` at runtime.
+
+#### Changed
+
+- `httpx2>=2.12` added to the `dev` extra. Refreshing the lock also pulled in its
+  dependencies (`httpcore2`, `httpx2-jsfetch`, `truststore`) and moved `idna`
+  3.13 → 3.19.
+
+### `$inc` / `$mul` type errors now match MongoDB exactly
+
+Incrementing a non-numeric field is an error on every MongoDB server, and both
+SecantusDB servers already refused it — but neither reported it the way MongoDB
+does, in two different ways.
+
+The Rust server answered `BadValue` (code 2) where MongoDB answers
+`TypeMismatch` (14). The cause is structural: the shared operator engine signals
+"I can't handle this, run the Python engine" with a single opaque value, which is
+the right answer on the Python server and a dead end on the standalone Rust
+server, where there is no Python to fall back to. Every such signal collapsed
+into one generic code. The fix adds a small validator that names the errors we
+can name — the same shape an existing `$jsonSchema` validator already uses —
+leaving the opaque signal for constructs that genuinely aren't implemented.
+
+Chasing that turned up a second problem nobody had recorded: the Python server's
+*message* was wrong. MongoDB identifies the offending document by its `_id`
+(`{_id: 1} has the field 'n' of non-numeric type string`); we printed the field
+path instead (`{n} has the field 'n' …`). The code was right, so it had gone
+unnoticed — the text simply wasn't one any real server produces.
+
+Both servers now match MongoDB byte-for-byte on code and message, checked
+three-way against a live `mongod` and the standalone Rust binary.
+
+#### Fixed
+
+- The Rust server answers `TypeMismatch` (14), not `BadValue` (2), for `$inc` /
+  `$mul` against a non-numeric field or with a non-numeric argument.
+- The Python server's type-error message identifies the document by `_id`, as
+  MongoDB does, including `ObjectId('…')` rendering and the leaf field name for
+  dotted paths.
+
+### The differential that found nine bugs is now part of the suite
+
+The 2026-08 backlog audit found nine real defects — three that surfaced an
+unhandled exception as "internal server error", three that silently wrote or
+returned wrong data, one where adding an index changed query results, and two
+missing capabilities. Every one came from running the same operation against
+SecantusDB and a real mongod and comparing. None came from reading the backlog,
+whose entries for those areas were absent, stale, or wrong.
+
+That comparison lived in a scratchpad script. It is now `tests/test_mongod_
+differential.py`: small independent cases, mongod as the oracle, errors compared
+as values because a wrong error code is a real divergence too.
+
+It skips when no `mongod` is on PATH — the same convention the mongosh and
+database-tools tests already use — so it is free on machines without MongoDB
+installed and gives real coverage where it exists.
+
+#### Added
+
+- `tests/test_mongod_differential.py`, 16 cases covering every bug the audit
+  found, plus a `differential` pytest marker (`pytest -m differential`).
+
+### The resume-token error now carries mongod's wording
+
+A change stream whose pipeline modifies the event `_id` is rejected with error
+280 on both servers — but the Python server's message was its own paraphrase,
+ending "makes it unusable for resuming".
+
+#### Fixed
+
+- The Python server now returns mongod's exact text, including the sentence
+  drivers assert on: *"Only transformations that retain the unmodified `_id`
+  field are allowed."* The Rust server already carried it. `libmongoc` checks
+  that string, so the paraphrase failed
+  `/change_stream/live/missing_resume_token` and `/invalid_resume_token` in the
+  C gauge — 758 passed / 10 failed → **760 passed / 8 failed** (98.7% → 99.0%).
+  pymongo does not assert on the message, so only a stricter driver could
+  surface it.
+
+### `$inc` on a string no longer 500s, and `$inc` on a bool no longer writes silently
+
+A three-way differential against a real mongod turned up three defects in the
+update operators.
+
+`$inc` against a string field raised an unhandled `ValueError` that reached the
+client as "internal server error"; mongod answers TypeMismatch. `$inc` against a
+boolean silently computed a number, because Python treats `bool` as a subclass of
+`int` — that one wrote wrong data rather than failing, which is worse. `$mul` had
+both defects identically. Every non-numeric type is now refused with mongod's code
+14, and the document is left untouched.
+
+`$addToSet` compared documents with Python `==`, which ignores field order. mongod
+does not: `{y: 2, x: 1}` is a different value from `{x: 1, y: 2}` and gets appended
+as a separate element. Our query matcher already had this right, so `$addToSet` was
+disagreeing with our own equality rule; it now delegates to the matcher so the two
+cannot drift.
+
+`$min` and `$max` are deliberately unchanged — unlike `$inc`/`$mul` they accept any
+type and use BSON cross-type ordering, which was verified against the same mongod.
+
+#### Fixed
+
+- `$inc` / `$mul` against a string, bool, null, array or document answer
+  TypeMismatch (14) instead of an internal error or a silent write.
+- `$addToSet` treats field-reordered documents as distinct, matching mongod and our
+  own query matcher. `tests/test_update_type_rules.py`.
+
 ## [0.6.0b15] — 2026-08-23
 
 ### Restores stopped writing 2 GB for a 2 MB backup
