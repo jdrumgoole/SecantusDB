@@ -391,9 +391,20 @@ fn extract_change_stream_pipeline(doc: &Document) -> Result<Vec<Bson>, CommandEr
                 14,
                 "TypeMismatch",
                 // mongod's exact wording, which libmongoc asserts on.
-                "Each element of the 'pipeline' array must be an object",
+                crate::aggregate::PIPELINE_ELEMENT_MSG,
             ));
         };
+        if s.len() != 1 {
+            // A document of the wrong arity is Location40323, distinct from the
+            // TypeMismatch above. Without this, `{}` fell through to the
+            // unrecognised-stage branch below as the empty name `''`, and a
+            // multi-key stage was accepted outright.
+            return Err(CommandError::new(
+                40323,
+                "Location40323",
+                crate::aggregate::STAGE_ARITY_MSG,
+            ));
+        }
         let name = s.keys().next().map(String::as_str).unwrap_or("");
         if name == "$changeStream" {
             return Err(CommandError::new(
@@ -498,4 +509,54 @@ fn cursor_batch_size(doc: &Document) -> i64 {
         .and_then(|c| c.get("batchSize"))
         .and_then(as_i64)
         .unwrap_or(DEFAULT_BATCH_SIZE as i64)
+}
+
+#[cfg(test)]
+mod malformed_cs_pipeline_tests {
+    use super::*;
+    use bson::doc;
+
+    fn err_for(stage: Bson) -> CommandError {
+        let d = doc! {"pipeline": [Bson::Document(doc! {"$changeStream": {}}), stage]};
+        extract_change_stream_pipeline(&d).expect_err("malformed stage should be rejected")
+    }
+
+    #[test]
+    fn non_document_stage_is_type_mismatch() {
+        for bad in [
+            Bson::Int32(42),
+            Bson::String("stage".into()),
+            Bson::Array(vec![Bson::Int32(1)]),
+            Bson::Null,
+        ] {
+            let err = err_for(bad.clone());
+            assert_eq!(err.code, 14, "{bad:?}");
+            assert_eq!(
+                err.errmsg,
+                crate::aggregate::PIPELINE_ELEMENT_MSG,
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// `{}` previously fell through to the unrecognised-stage branch as the
+    /// empty name `''` (40324); a multi-key stage was accepted outright.
+    #[test]
+    fn wrong_arity_stage_is_location_40323() {
+        for bad in [doc! {}, doc! {"$match": {}, "$project": {"x": 1}}] {
+            let err = err_for(Bson::Document(bad.clone()));
+            assert_eq!(err.code, 40323, "{bad:?}");
+            assert_eq!(err.errmsg, crate::aggregate::STAGE_ARITY_MSG, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn well_formed_stage_still_accepted() {
+        let d = doc! {"pipeline": [
+            Bson::Document(doc! {"$changeStream": {}}),
+            Bson::Document(doc! {"$match": {"operationType": "insert"}}),
+        ]};
+        let out = extract_change_stream_pipeline(&d).expect("valid stage must pass");
+        assert_eq!(out.len(), 1);
+    }
 }
