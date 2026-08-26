@@ -29,6 +29,14 @@ if TYPE_CHECKING:
     from secantus.storage import Storage
 
 
+# mongod's exact arity error for a stage document that isn't a single
+# ``{operator: spec}`` pair -- both an empty ``{}`` and a multi-key stage.
+# Probed identical on mongod 6.0.16 and 8.3.4. Note the trailing period and
+# the dedicated code: it is Location40323, NOT the generic 14 TypeMismatch
+# that a wrong *element type* gets.
+STAGE_ARITY_MSG = "A pipeline stage specification object must contain exactly one field."
+
+
 class AggregateError(Exception):
     """Pipeline-validation error. ``code``/``code_name`` default to the
     generic user-facing mapping (14 TypeMismatch) but raise sites may
@@ -202,8 +210,14 @@ def _apply_stage(
     docs: list[dict[str, Any]],
     ctx: PipelineContext,
 ) -> list[dict[str, Any]]:
+    if not isinstance(stage, Mapping):
+        # mongod's exact wording and code (14 TypeMismatch); libmongoc's
+        # /change_stream/accepts_array asserts on this string. Without the
+        # type check ``len(stage)`` raised TypeError on e.g. ``pipeline: [42]``
+        # and the client saw a bare "internal server error".
+        raise AggregateError("Each element of the 'pipeline' array must be an object")
     if len(stage) != 1:
-        raise AggregateError("each pipeline stage must have exactly one key")
+        raise AggregateError(STAGE_ARITY_MSG, code=40323, code_name="Location40323")
     name, spec = next(iter(stage.items()))
     if name in _ATLAS_ONLY_STAGES:
         # Atlas-only stage on a non-Atlas deployment — mongod fails it with a
@@ -4330,8 +4344,10 @@ def validate_stage_names(pipeline: list[Any]) -> None:
     before any document flows — change streams need the 40324 at
     ``aggregate`` time, not lazily at the first ``getMore``)."""
     for stage in pipeline:
-        if not isinstance(stage, Mapping) or len(stage) != 1:
-            raise AggregateError("each pipeline stage must have exactly one key")
+        if not isinstance(stage, Mapping):
+            raise AggregateError("Each element of the 'pipeline' array must be an object")
+        if len(stage) != 1:
+            raise AggregateError(STAGE_ARITY_MSG, code=40323, code_name="Location40323")
         name = next(iter(stage))
         if name in _ATLAS_ONLY_STAGES:
             # Atlas-only stage — reject with the Atlas message at parse time

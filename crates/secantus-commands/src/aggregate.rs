@@ -370,6 +370,17 @@ const ATLAS_STAGES: &[&str] = &[
     "$vectorSearch",
 ];
 
+/// mongod's error when a `pipeline` element is not a BSON document. Code 14
+/// (TypeMismatch); libmongoc's `/change_stream/accepts_array` asserts on the
+/// wording verbatim. Probed identical on mongod 6.0.16 and 8.3.4.
+pub const PIPELINE_ELEMENT_MSG: &str = "Each element of the 'pipeline' array must be an object";
+
+/// mongod's error when a stage *is* a document but isn't a single
+/// `{operator: spec}` pair -- both an empty `{}` and a multi-key stage. Note
+/// the trailing period, and that it is Location40323, not the generic 14.
+pub const STAGE_ARITY_MSG: &str =
+    "A pipeline stage specification object must contain exactly one field.";
+
 pub const SEARCH_INDEX_ATLAS_MSG: &str = "Using Atlas Search Database Commands and the \
 $listSearchIndexes aggregation stage requires additional configuration. Please connect to Atlas \
 or an Atlas-compatible deployment to use this feature.";
@@ -468,11 +479,14 @@ fn validate_project_exprs(pipeline: &[Bson]) -> Result<(), CommandError> {
 
 fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError> {
     for stage in pipeline {
+        // Both of these used to `continue`, so a malformed element sailed past
+        // validation: `pipeline: [42]` reached execution and surfaced as a bare
+        // internal error, and a two-key stage was silently accepted.
         let Some(d) = stage.as_document() else {
-            continue;
+            return Err(CommandError::new(14, "TypeMismatch", PIPELINE_ELEMENT_MSG));
         };
         if d.len() != 1 {
-            continue;
+            return Err(CommandError::new(40323, "Location40323", STAGE_ARITY_MSG));
         }
         let name = stage_name(stage);
         if ATLAS_STAGES.contains(&name) {
@@ -1999,5 +2013,57 @@ mod current_op_metadata_tests {
         let rows = apply_source_stage("$currentOp", "db", None, &doc! {}, Some(&m));
         assert!(rows[0].get("appName").is_none());
         assert!(rows[0].get_document("clientMetadata").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod malformed_pipeline_tests {
+    use super::*;
+    use bson::doc;
+
+    /// Values probed against real mongod (6.0.16 and 8.3.4 agree): every
+    /// non-document element of `pipeline` is 14 TypeMismatch with one wording.
+    #[test]
+    fn non_document_element_is_type_mismatch() {
+        for bad in [
+            Bson::Int32(42),
+            Bson::String("stage".into()),
+            Bson::Array(vec![Bson::String("nested".into())]),
+            Bson::Null,
+            Bson::Double(3.5),
+            Bson::Boolean(true),
+        ] {
+            let err = validate_stage_names(std::slice::from_ref(&bad))
+                .expect_err(&format!("{bad:?} should be rejected"));
+            assert_eq!(err.code, 14, "{bad:?}");
+            assert_eq!(err.code_name, "TypeMismatch", "{bad:?}");
+            assert_eq!(err.errmsg, PIPELINE_ELEMENT_MSG, "{bad:?}");
+        }
+    }
+
+    /// A document of the wrong arity is a *different* error from the wrong
+    /// type: Location40323, with a trailing period.
+    #[test]
+    fn wrong_arity_stage_is_location_40323() {
+        for bad in [
+            doc! {},
+            doc! {"$match": {}, "$count": "n"},
+            doc! {"$limit": 1, "$count": "n"},
+        ] {
+            let err = validate_stage_names(&[Bson::Document(bad.clone())])
+                .expect_err(&format!("{bad:?} should be rejected"));
+            assert_eq!(err.code, 40323, "{bad:?}");
+            assert_eq!(err.code_name, "Location40323", "{bad:?}");
+            assert_eq!(err.errmsg, STAGE_ARITY_MSG, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn well_formed_pipeline_still_validates() {
+        validate_stage_names(&[
+            Bson::Document(doc! {"$match": {"x": 1}}),
+            Bson::Document(doc! {"$count": "n"}),
+        ])
+        .expect("a valid pipeline must not be rejected");
     }
 }

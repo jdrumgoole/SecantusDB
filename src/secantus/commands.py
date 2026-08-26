@@ -4427,6 +4427,11 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             initial_filter: dict[str, Any] = {}
             if (
                 isinstance(first_stage, Mapping)
+                # Exactly one key: a malformed multi-key stage such as
+                # ``{"$match": {...}, "$count": "n"}`` must NOT be lifted --
+                # doing so dropped the whole stage, silently discarding the
+                # other operator and skipping the arity check that rejects it.
+                and len(first_stage) == 1
                 and "$match" in first_stage
                 and isinstance(first_stage["$match"], Mapping)
             ):
