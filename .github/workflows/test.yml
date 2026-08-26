@@ -440,15 +440,34 @@ jobs:
         # written and then fails the job.
         if: runner.os == 'Linux'
         run: |
-          for _ in $(seq 1 180); do
-            [ -f /tmp/disk-reclaim.done ] && break
-            sleep 1
+          # Wait on the RECLAIM ITSELF, not on a fixed deadline. The old
+          # version polled 180s and failed the whole workflow when the runner
+          # was merely slow -- which happened on 2026-08-26, taking out two
+          # shards of an otherwise green run. The rm walks hundreds of
+          # thousands of files; how long that takes is the runner's I/O, not
+          # anything this repo controls.
+          #
+          # Keep waiting while the reclaim is alive, fail FAST if it died
+          # without arming the sentinel (a real failure worth surfacing), and
+          # keep a generous absolute ceiling as a backstop.
+          deadline=$(( SECONDS + 600 ))
+          while [ ! -f /tmp/disk-reclaim.done ]; do
+            if ! pgrep -f 'rm -rf /usr/local/lib/android' >/dev/null 2>&1; then
+              sleep 2   # let a just-finished rm write the sentinel
+              [ -f /tmp/disk-reclaim.done ] && break
+              cat /tmp/disk-reclaim.log || true
+              echo "::error::disk reclaim exited without completing"
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              cat /tmp/disk-reclaim.log || true
+              echo "::error::disk reclaim still running after 600s"
+              exit 1
+            fi
+            sleep 2
           done
           cat /tmp/disk-reclaim.log || true
-          if [ ! -f /tmp/disk-reclaim.done ]; then
-            echo "::error::disk reclaim did not finish within 180s"
-            exit 1
-          fi
+          df -h /
 
       - name: Tests (group ${{ matrix.group }}/4)
         # ``--timeout=120 --timeout-method=thread`` catches deadline-
@@ -1068,15 +1087,34 @@ jobs:
         # including why this carries the same Linux gate as the arming step.
         if: runner.os == 'Linux'
         run: |
-          for _ in $(seq 1 180); do
-            [ -f /tmp/disk-reclaim.done ] && break
-            sleep 1
+          # Wait on the RECLAIM ITSELF, not on a fixed deadline. The old
+          # version polled 180s and failed the whole workflow when the runner
+          # was merely slow -- which happened on 2026-08-26, taking out two
+          # shards of an otherwise green run. The rm walks hundreds of
+          # thousands of files; how long that takes is the runner's I/O, not
+          # anything this repo controls.
+          #
+          # Keep waiting while the reclaim is alive, fail FAST if it died
+          # without arming the sentinel (a real failure worth surfacing), and
+          # keep a generous absolute ceiling as a backstop.
+          deadline=$(( SECONDS + 600 ))
+          while [ ! -f /tmp/disk-reclaim.done ]; do
+            if ! pgrep -f 'rm -rf /usr/local/lib/android' >/dev/null 2>&1; then
+              sleep 2   # let a just-finished rm write the sentinel
+              [ -f /tmp/disk-reclaim.done ] && break
+              cat /tmp/disk-reclaim.log || true
+              echo "::error::disk reclaim exited without completing"
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              cat /tmp/disk-reclaim.log || true
+              echo "::error::disk reclaim still running after 600s"
+              exit 1
+            fi
+            sleep 2
           done
           cat /tmp/disk-reclaim.log || true
-          if [ ! -f /tmp/disk-reclaim.done ]; then
-            echo "::error::disk reclaim did not finish within 180s"
-            exit 1
-          fi
+          df -h /
 
       - name: Durable-storage tests (group ${{ matrix.group }}/4)
         # The default suite above runs FAST (the test conftest sets
