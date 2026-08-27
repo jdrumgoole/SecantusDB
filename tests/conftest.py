@@ -323,6 +323,7 @@ _last_progress_at = time.monotonic()
 _stall_watch_armed = False
 _node_down: list[str] = []
 _first_node_down_at: float | None = None
+_seen_nodeids: set[str] = set()
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
@@ -334,6 +335,10 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     """
     global _last_progress_at
     _last_progress_at = time.monotonic()
+    # Which tests actually got as far as running. A test assigned to a worker
+    # that died is never dispatched anywhere else, so it never lands here --
+    # that gap is how ``_lost_test_report`` counts what a crash swallowed.
+    _seen_nodeids.add(report.nodeid)
 
 
 @pytest.hookimpl(optionalhook=True)
@@ -394,6 +399,71 @@ def pytest_testnodedown(node: object, error: object) -> None:
     )
     faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
     sys.stderr.flush()
+
+
+def _lost_test_report(
+    collected: int,
+    executed: int,
+    node_down: list[str],
+) -> str | None:
+    """The banner for a run that lost a worker, or ``None`` if it was clean.
+
+    Kept pure so it can be unit-tested without staging a real worker death.
+    """
+    if not node_down:
+        return None
+    missing = max(0, collected - executed)
+    lines = [
+        "",
+        "=" * 72,
+        "RUN INVALID -- an xdist worker died; this result proves nothing.",
+        "=" * 72,
+        f"workers lost: {len(node_down)}",
+    ]
+    lines += [f"  - {r}" for r in node_down]
+    lines.append(f"collected: {collected}   actually ran: {executed}   never ran: {missing}")
+    if missing:
+        lines.append(
+            f"{missing} test(s) were assigned to a dead worker and were never "
+            "re-dispatched, so nothing here says whether they pass."
+        )
+    lines += [
+        "",
+        "pytest's own summary above counts only the tests that DID run, and the",
+        "session would otherwise exit 0 -- a green-looking result hiding the gap.",
+        "Common cause on a dev box: a second `-n auto` suite (or another heavy",
+        "job) oversubscribing the machine, so the OS kills a worker. Re-run on a",
+        "quiet machine before trusting any result.",
+        "=" * 72,
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Fail a run that lost a worker, instead of exiting 0 on partial results.
+
+    Observed 2026-08-26: a contended box got a worker SIGKILLed ~2/3 of the way
+    through. xdist logged ``node down: Not properly terminated`` and an
+    ``INTERNALERROR``, then pytest printed ``4093 passed`` and exited **0** --
+    but 6257 tests had been collected, so ~2100 never ran at all. That is a
+    green light over an unmeasured suite, which is exactly the kind of signal
+    this repo must never hand back (CLAUDE.md: never discount an error).
+
+    The worker-death diagnostics already existed (see ``pytest_testnodedown``
+    and ``pytest_handlecrashitem``); what was missing was making the *exit
+    status* reflect them.
+    """
+    # Controller only -- workers have ``workerinput`` and their own exit path.
+    if hasattr(session.config, "workerinput"):
+        return
+    banner = _lost_test_report(session.testscollected, len(_seen_nodeids), _node_down)
+    if banner is None:
+        return
+    sys.stderr.write(banner)
+    sys.stderr.flush()
+    if exitstatus == 0:
+        session.exitstatus = 1
 
 
 def _stall_trigger(
