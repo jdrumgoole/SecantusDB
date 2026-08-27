@@ -222,7 +222,7 @@ Single-node change streams are implemented and conformant for typical pymongo `w
   Net C gauge 802 tests/10 fails -> 815/10 — same failures, 13 more tests.
   **All three follow-up gaps are now CLOSED** (`failGetMoreAfterCursorCheckout`
   + the `ResumableChangeStreamError` label): change-stream failures 3 -> 0, C
-  gauge 10 -> 7 fails / 99.1%, 31 change-stream tests passing. The remaining 7
+  gauge 10 -> 7 fails / 99.1%, 31 change-stream tests passing. **2026-08-27: `/change_stream/accepts_array` now passes too (PR #1058, malformed pipeline elements), taking the whole `/change_stream` suite to 0 failures; C gauge 761/7/70 = 99.1%, the 7 being the 4 `select_server` + 2 `ipv6` inherents and `writeConcernError`.** The remaining 7
   failures are the long-standing ones the **Python** server shares, so the C
   gauge is back to zero rust-only failures WITH change streams covered. **Skipped as inherent:**
   `/change_stream/live/read_prefs`, `/Client/command_secondary` and
@@ -275,6 +275,30 @@ Single-node change streams are implemented and conformant for typical pymongo `w
   fidelity nit found on the way: we answer `codeName: "Location91"` where 91 is
   `ShutdownInProgress`; harmless for retry decisions (they key on the code) but
   wrong.
+
+  **Re-probed 2026-08-27 (C gauge at HEAD 6ab4d115).** Two things confirmed, plus
+  one dead end recorded so it is not re-walked:
+  - The failure is at the *operation* level, verbatim: `error: expected success,
+    but got error: failCommand failpoint`. libmongoc surfaces our
+    `writeConcernError` as an `insertOne` error rather than retrying. This does
+    **not** contradict ruled-out cause 3 above — a correct reply shape and an
+    operation error are both true if the driver never retries, which is what the
+    evidence says. Our side re-read and still looks right: the failpoint carries
+    only `errorLabels` + `writeConcernError` (no `errorCode`), so the error branch
+    is skipped and the WCE + labels ride a successful reply
+    (`commands.py:7247-7250`); `mode.times` does decrement (`failpoints.py:193`);
+    and `hello` advertises `logicalSessionTimeoutMinutes` + a wire version that
+    permit retryable writes.
+  - **Dead end — do not repeat:** tracing the server by monkeypatching
+    `secantus.commands.dispatch` (or `secantus.server.dispatch`) logs NOTHING.
+    `server.py` does `from secantus.commands import dispatch` at import
+    (`server.py:22`) and calls the module global at 502/623/745/835, so a late
+    patch never reaches the running accept loop. A future attempt needs a
+    wire-level proxy or an in-tree hook, not a monkeypatch.
+  The open question is unchanged and still the right one: does libmongoc assign a
+  `txnNumber` for this write at all (i.e. does it classify a `Single`-topology URI
+  as retryable-write capable)? Answer that first — if no `txnNumber` arrives,
+  nothing about our reply can make it retry.
   **`/BulkOperation/OP_MSG/max_msg_size` is NOT in that list, and this audit
   briefly claimed it was.** Run by its exact name it PASSES, both forked and
   `--no-fork`, exactly as the 2026-08-11 re-diagnosis above says. It appeared to
