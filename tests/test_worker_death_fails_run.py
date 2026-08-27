@@ -134,15 +134,17 @@ def test_real_worker_death_prints_the_banner(tmp_path) -> None:
     (tmp_path / "test_victim.py").write_text(
         textwrap.dedent(
             """
-            import os, signal, time
+            import os, time
             import pytest
 
             @pytest.mark.parametrize("i", range(60))
             def test_ok(i):
                 # Take the whole worker down the way an OOM kill does: no
-                # exception, no report, the process simply stops.
+                # exception, no report, the process simply stops. os._exit
+                # skips all cleanup and exists on Windows too -- signal.SIGKILL
+                # does not, which is how this first went red in CI.
                 if i == 30:
-                    os.kill(os.getpid(), signal.SIGKILL)
+                    os._exit(1)
                 time.sleep(0.01)
                 assert True
             """
