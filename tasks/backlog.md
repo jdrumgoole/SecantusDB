@@ -46,6 +46,18 @@ timestamp *predicates*; jsonb operator gap. Plus the catalog's missing
 column-level reflection, `SET search_path` not affecting name resolution,
 deferred constraints unmodelled, and partial-index `pg_get_expr` rendering.
 
+**Probed 2026-08-27 — 2 of 8 sampled were already done.** Reproduced each
+rather than reading it. **Stale:** `CancelRequest` is fully implemented (`57014`
+plus a still-usable connection, 29 tests) and catalog column-level reflection is
+present (`information_schema.columns` *and* `pg_attribute`). **Confirmed still
+open:** COPY OUT abort (transaction stays `INTRANS` where PG gives `INERROR`),
+write-conflict `40001` (the second writer serialization-fails instead of
+blocking), `SET search_path` (ignored in name resolution), sub-millisecond
+predicates, and partial-index reflection (`pg_indexes.indexdef` drops the
+`WHERE`). jsonb's core operators (`@>` `?` `->>` `#>` `<@`) all answered — the
+named gap needs its specific case to reproduce. Same lesson as the Rust class:
+**the count overstates the work; reproduce before planning.**
+
 **Rust server errors where Python defers — MEASURED 2026-08-26, and the five
 entries describing it are largely stale.** A three-way probe of 45
 query / update / aggregate constructs against the standalone `secantusd-rs`
@@ -3393,12 +3405,18 @@ shared storage engine or building large new protocol subsystems:
   psycopg's pipeline mode batches many extended-protocol messages before a
   Sync; the server processes each `Sync` synchronously rather than tracking a
   pipeline-abort boundary. A real feature (its own subsystem), not a bug.
-- [ ] **CancelRequest handling (`test_generators::test_cancel`, and the
-  environmental `test_cancel_safe_*` "proxy didn't start listening: Errno 22"
-  harness failures).** The v3 CancelRequest startup packet is parsed but not
-  acted on (statements run synchronously, so there is no mid-query cancel
-  point to interrupt). The `test_cancel_safe_*` failures are a psycopg
-  test-harness socket-proxy issue on this machine, not a server behaviour.
+- [x] **CancelRequest handling — SHIPPED (verified 2026-08-27).**
+  (`test_generators::test_cancel`, and the environmental `test_cancel_safe_*`
+  "proxy didn't start listening: Errno 22" harness failures.)
+  ~~The v3 CancelRequest startup packet is parsed but not acted on (statements
+  run synchronously, so there is no mid-query cancel point to interrupt).~~
+  **That was stale.** Reproduced 2026-08-27: `cancel_safe()` against a running
+  `pg_sleep` raises `57014 QueryCanceled`, and the connection stays usable
+  afterwards (cancel is not terminate). `tests/test_pgserver_cancel.py` covers
+  the wire sub-protocol, `pg_cancel_backend`, and the `pg_sleep` / per-row /
+  FROM-less cancellation points; pgx's cancel cluster rides it. The
+  `test_cancel_safe_*` failures remain a psycopg test-harness socket-proxy
+  issue on this machine, not a server behaviour.
 - [ ] **Reject connections to non-existent databases (`test_pgconn_error`,
   `test_connect_bad`).** SecantusDB creates a database on demand (the
   ephemeral-db model shared with the Mongo server), so connecting to
@@ -3710,7 +3728,14 @@ shared storage engine or building large new protocol subsystems:
   that was never stored).
 
   **Still open, in rough order of value:**
-  1. **Predicates are millisecond-blind.** `WHERE t = '…123456'` matches nothing
+  1. **Predicates are millisecond-blind — and wrong in BOTH directions.**
+     Measured 2026-08-27 against a stored `…00.123456`: `WHERE t = '…123456'`
+     matches nothing (false negative — a row fails an equality on its *own
+     stored value*), **and `WHERE t = '…123'` matches it** (false positive — it
+     matches a value it is not equal to), and `WHERE t > '…123'` misses it.
+     `>= '…123'`, `> '…122'` and `< '…124'` are correct. This is silent wrong
+     *results*, not only lost precision, which is a higher severity than the
+     original wording implied. Original note: `WHERE t = '…123456'` matches nothing
      and rows inside one millisecond sort arbitrarily — unchanged from before
      the companion existed (verified against `main`), but now the fix is
      possible: lower a comparison against BOTH fields
@@ -4841,7 +4866,7 @@ shared storage engine or building large new protocol subsystems:
   the containing row respectively. See "jsonb operator surface landed" and "SQL/JSON
   path queries landed (b135)". `numeric` still round-trips via Decimal128 and its real
   residual limit — 34 significant digits — has its own entry above.
-- [ ] **OPEN — Catalog surface: joins landed, column-level reflection still missing.**
+- [ ] **OPEN — Catalog surface: joins landed; column-level reflection IS present (re-measured 2026-08-27).** The "column-level reflection still missing" wording below is stale: for a freshly created table `information_schema.columns` answers `[('a','integer'),('b','text')]` and `pg_attribute` the matching type OIDs (23/25). Whatever remains is narrower than the headline claimed — re-probe before working it.
   `information_schema.tables`/`.columns`/`.schemata` and `pg_catalog.pg_class`/
   `pg_namespace`/`pg_type`/`pg_database` are served as virtual tables, and JOINs / GROUP BY
   across them now execute (`virtual.CatalogBackend` + `planner._lookup_table_def`), so
