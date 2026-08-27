@@ -3669,7 +3669,15 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             }
     else:
         batch_size = DEFAULT_BATCH_SIZE
-    ns = f"{ctx.db_name}.$cmd.listIndexes.{coll}"
+    # mongod reports a listIndexes cursor under the PLAIN collection namespace
+    # (`db.coll`), not a `$cmd.` pseudo-namespace -- probed on 8.3.4. That is
+    # also what drivers put in the follow-up getMore's `collection` field, so a
+    # `$cmd.listIndexes.<coll>` namespace failed the getMore ownership check and
+    # made the second batch unreachable (CursorNotFound), i.e. listIndexes could
+    # not be paginated at all. Contrast `listCollections`, whose cursor really is
+    # `db.$cmd.listCollections` on mongod, and the collectionless `aggregate: 1`
+    # form, which really is `db.$cmd.aggregate` -- both already correct here.
+    ns = _ns(ctx.db_name, coll)
     first_batch, cursor_id = _split_into_cursor(indexes, batch_size, ns, ctx.cursors)
     return {
         "cursor": {

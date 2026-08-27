@@ -831,7 +831,15 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .collect();
         indexes = std::iter::once(clustered).chain(rest.drain(..)).collect();
     }
-    let ns = format!("{}.$cmd.listIndexes.{}", ctx.db_name, coll);
+    // mongod reports a listIndexes cursor under the PLAIN collection namespace
+    // (`db.coll`), not a `$cmd.` pseudo-namespace -- probed on 8.3.4. That is
+    // also what drivers put in the follow-up getMore's `collection` field, so a
+    // `$cmd.listIndexes.<coll>` namespace failed the getMore ownership check and
+    // made the second batch unreachable (CursorNotFound), i.e. listIndexes could
+    // not be paginated at all. Contrast `listCollections`, which really is
+    // `db.$cmd.listCollections` on mongod, and the collectionless `aggregate: 1`
+    // form, which really is `db.$cmd.aggregate` -- both already correct.
+    let ns = format!("{}.{}", ctx.db_name, coll);
     // Honour `cursor: {batchSize: N}` so a client asking for a small batch gets a
     // real getMore round-trip (the Go driver's
     // `TestIndexView/list/getMore_commands_are_monitored` asserts a getMore fires
