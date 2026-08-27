@@ -176,7 +176,36 @@ def main() -> int:
         # surface, but the package-wide kill no longer corrupts the
         # signal for unrelated work that just happened to be in
         # flight when the killer fired.
-        cmd = ["go", "test", "-json", "-count=1", "-timeout=30m"]
+        # ``-p 1``: run one test PACKAGE at a time.
+        #
+        # ``./internal/integration/...`` expands to three packages
+        # (``integration``, ``integration/mtest``, ``integration/unified``)
+        # and Go runs packages concurrently by default. All three share
+        # ``mtest.TestDB == "test"``, and ``mtest.Teardown()`` DROPS that
+        # database (``mtest/setup.go:239``).
+        #
+        # Because ``TestUnifiedSpec`` is in SKIP_PATTERNS, the ``unified``
+        # package has no work to do: its ``TestMain`` runs ``Setup()`` then
+        # ``Teardown()`` back to back and drops ``test`` within a second of
+        # starting -- concurrently with whatever ``integration`` is doing.
+        #
+        # That is what made ``TestChangeStream_ReplicaSet/try_next/
+        # one_getMore_sent`` fail ~1 run in 3: its ``TryNext`` sends a getMore
+        # with no ``maxTimeMS``, so the server waits its 1s default, and the
+        # other package's teardown ``dropDatabase`` landed inside that window.
+        # The server then correctly returned ``drop`` + ``invalidate`` for a
+        # drop that really had happened -- so ``TryNext`` returned true and the
+        # test's ``Should be false`` assertion fired. Verified by tracing every
+        # dispatched command during a reproduced failure: exactly one getMore,
+        # no overlapping cursors, and a ``getParameter '*'`` + ``dropDatabase``
+        # pair from a second connection interleaved mid-wait.
+        #
+        # This was NOT a server bug -- a mongod probe recorded in
+        # tasks/backlog.md shows mongod returns a mid-wait drop the same way.
+        # Serialising packages removes the cross-package interference without
+        # weakening any assertion or dropping the ``unified`` package's two
+        # genuine unit tests (TestEntityMap / TestMatches).
+        cmd = ["go", "test", "-json", "-count=1", "-timeout=30m", "-p", "1"]
         if SKIP_PATTERNS:
             # Go test's ``-skip`` is treated like ``-run``: at flag-
             # parse time the regexp is split at unbracketed-unparen'd

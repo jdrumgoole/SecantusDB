@@ -164,6 +164,8 @@ struct Shared {
     transactions: Arc<secantus_commands::transactions::TransactionRegistry>,
     /// Server-wide `configureFailPoint` registry, shared across connections.
     failpoints: Arc<secantus_commands::failpoints::FailPointRegistry>,
+    /// Server-wide per-namespace operation accounting, reported by `top`.
+    top_stats: Arc<secantus_commands::topstats::TopStats>,
     address: SocketAddr,
     next_conn_id: AtomicI64,
     next_reply_id: AtomicI64,
@@ -377,6 +379,7 @@ pub fn bind(
         cursors,
         transactions,
         failpoints: Arc::new(secantus_commands::failpoints::FailPointRegistry::new()),
+        top_stats: Arc::new(secantus_commands::topstats::TopStats::new()),
         address,
         next_conn_id: AtomicI64::new(1),
         next_reply_id: AtomicI64::new(1),
@@ -850,6 +853,7 @@ fn run_dispatch(
     // and reply with a wire-level `InternalError` instead of letting the panic
     // unwind the connection thread and drop the socket with no reply — matching
     // the Python server's dispatch-level catch-all.
+    let started = std::time::Instant::now();
     let reply =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(request, &mut ctx)))
             .unwrap_or_else(|_| {
@@ -860,6 +864,22 @@ fn run_dispatch(
                 d.insert("codeName", "InternalError");
                 d
             });
+    // `top` accounting. Only commands that name a collection are attributed to
+    // a namespace -- `ping` / `hello` / `serverStatus` / `listCollections`
+    // never appear in mongod's `top` output either.
+    if let Some(name) = request.keys().next() {
+        if let Some(coll) = secantus_commands::topstats::namespace_target(name, request) {
+            let ns = format!("{}.{}", ctx.db_name, coll);
+            let micros = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
+            shared.top_stats.record(&ns, name, micros);
+            // A successful drop resets the namespace's counters -- probed on
+            // mongod 8.3.4, where a dropped-and-recreated collection restarts
+            // from zero rather than carrying its history forward.
+            if name == "drop" && reply.get_f64("ok").unwrap_or(0.0) == 1.0 {
+                shared.top_stats.forget(&ns);
+            }
+        }
+    }
     // `pending_batch` is set by `find` / `getMore` to hand the reply's document
     // batch to the wire as pre-encoded blobs (spliced by `write_op_msg` /
     // `materialize_batch`) instead of an owned `Bson::Array` in the reply.
@@ -880,6 +900,7 @@ fn make_context(
         .with_conn_auth(conn_auth.clone())
         .with_conn_killer(shared.conn_killer.clone())
         .with_logs(shared.logs.clone())
+        .with_top_stats(shared.top_stats.clone())
         // `next_conn_id` starts at 1 and is bumped per accepted connection, so
         // it is the lifetime total plus one; `conns` holds the live sockets.
         .with_conn_stats(secantus_commands::ConnStats {

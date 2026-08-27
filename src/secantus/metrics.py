@@ -64,6 +64,60 @@ _COMMAND_BUCKET: dict[str, str] = {
 }
 
 
+# ``top`` section + lock kind per command name. Probed against real mongod
+# 8.3.4 rather than assumed -- the assumptions were wrong in four places:
+# ``aggregate``, ``count``, ``distinct`` and ``findAndModify`` all land in
+# ``commands``, NOT in ``queries``/``update``. mongod's ``queries`` section is
+# essentially just ``find``. Counts are per COMMAND, not per document (a
+# 3-document ``insert`` bumps the count by 1).
+_TOP_SECTION: dict[str, tuple[str, str]] = {
+    "find": ("queries", "readLock"),
+    "getMore": ("getmore", "readLock"),
+    "insert": ("insert", "writeLock"),
+    "update": ("update", "writeLock"),
+    "delete": ("remove", "writeLock"),
+}
+
+# Namespaced commands that take a write lock. Everything else falling through
+# to the ``commands`` bucket is a read. Probed: ``createIndexes`` /
+# ``dropIndexes`` / ``findAndModify`` are writeLock; ``aggregate`` / ``count``
+# / ``distinct`` / ``listIndexes`` / ``explain`` are readLock.
+_TOP_WRITE_COMMANDS: frozenset[str] = frozenset(
+    {
+        "createIndexes",
+        "dropIndexes",
+        "findAndModify",
+        "findandmodify",
+        "create",
+        "drop",
+        "renameCollection",
+        "collMod",
+        "convertToCapped",
+        "emptycapped",
+    }
+)
+
+TOP_SECTIONS: tuple[str, ...] = (
+    "total",
+    "readLock",
+    "writeLock",
+    "queries",
+    "getmore",
+    "insert",
+    "update",
+    "remove",
+    "commands",
+)
+
+
+def top_section_for(name: str) -> tuple[str, str]:
+    """``(section, lock)`` for a command name."""
+    known = _TOP_SECTION.get(name)
+    if known is not None:
+        return known
+    return ("commands", "writeLock" if name in _TOP_WRITE_COMMANDS else "readLock")
+
+
 @dataclass
 class Metrics:
     """Thread-safe per-server counters.
@@ -83,6 +137,9 @@ class Metrics:
     connections_total: int = 0
     requests: int = 0
     op_counters: _OpCounters = field(default_factory=_OpCounters)
+    # ``top`` accounting: namespace -> section -> [micros, count]. Lists rather
+    # than tuples so the hot path mutates in place instead of reallocating.
+    ns_top: dict[str, dict[str, list[int]]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     # ---- connection lifecycle ----------------------------------------------
@@ -109,6 +166,44 @@ class Metrics:
                 bucket,
                 getattr(self.op_counters, bucket) + 1,
             )
+
+    def record_namespace_op(self, namespace: str, name: str, micros: int) -> None:
+        """Accumulate one operation against ``top``'s per-namespace counters.
+
+        ``namespace`` is ``db.collection``. Called once per dispatched command
+        that names a collection; commands with no collection (``ping``,
+        ``hello``, ``serverStatus``) are not attributed to any namespace, which
+        is what mongod does.
+        """
+        if micros < 0:
+            micros = 0
+        section, lock_kind = top_section_for(name)
+        with self._lock:
+            entry = self.ns_top.get(namespace)
+            if entry is None:
+                entry = {s: [0, 0] for s in TOP_SECTIONS}
+                self.ns_top[namespace] = entry
+            for key in ("total", lock_kind, section):
+                slot = entry[key]
+                slot[0] += micros
+                slot[1] += 1
+
+    def forget_namespace(self, namespace: str) -> None:
+        """Drop a namespace's ``top`` counters.
+
+        Probed against mongod 8.3.4: dropping a collection resets its ``top``
+        entry, it does not keep accumulating across the drop.
+        """
+        with self._lock:
+            self.ns_top.pop(namespace, None)
+
+    def top_snapshot(self) -> dict[str, dict[str, dict[str, int]]]:
+        """Per-namespace ``top`` counters, in mongod's ``{time, count}`` shape."""
+        with self._lock:
+            return {
+                ns: {s: {"time": v[0], "count": v[1]} for s, v in sections.items()}
+                for ns, sections in self.ns_top.items()
+            }
 
     # ---- snapshot ----------------------------------------------------------
 

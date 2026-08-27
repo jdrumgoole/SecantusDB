@@ -48,6 +48,7 @@ pub mod mapreduce;
 pub mod rbac;
 pub mod roles;
 pub mod storage;
+pub mod topstats;
 pub mod transactions;
 mod util;
 
@@ -147,6 +148,9 @@ pub struct CommandContext {
     /// Live connection counts for `serverStatus.connections`, snapshotted by the
     /// server when it builds the context. `None` off-server (unit tests) ⇒ zeros.
     pub conn_stats: Option<ConnStats>,
+    /// Server-wide per-namespace operation accounting, read by `top`. `None`
+    /// off-server (unit tests) ⇒ `top` reports zeros, as it always used to.
+    pub top_stats: Option<Arc<topstats::TopStats>>,
     /// Set by a cursor-producing handler (`find` / `getMore`) to hand the
     /// server the reply's document batch as **pre-encoded blobs** instead of an
     /// owned `Bson::Array` inside the reply document. The reply the handler
@@ -200,6 +204,7 @@ impl CommandContext {
             conn_killer: None,
             logs: None,
             conn_stats: None,
+            top_stats: None,
             pending_batch: None,
             raw_insert_documents: None,
         }
@@ -249,6 +254,11 @@ impl CommandContext {
     }
 
     /// Attach this instant's connection counts (builder-style).
+    pub fn with_top_stats(mut self, stats: Arc<topstats::TopStats>) -> Self {
+        self.top_stats = Some(stats);
+        self
+    }
+
     pub fn with_conn_stats(mut self, stats: ConnStats) -> Self {
         self.conn_stats = Some(stats);
         self
