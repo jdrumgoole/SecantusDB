@@ -152,8 +152,27 @@ These work end-to-end but cut corners.
   `query.rs` — equality only, so ranges and sort keep IEEE semantics and NaN still
   sorts below every number with `$gt: NaN` matching nothing. Infinity was always
   fine. Covered by `tests/test_nan_equality.py` and a `secantus-core` unit test.
-- [ ] **OPEN — a cursor whose result count is an exact multiple of `batchSize`
-  closes one `getMore` early (both servers).** Probed against mongod 8.3.4
+- [ ] **OPEN — `listIndexes` pagination is broken: a second batch is unreachable
+  (Python server).** `listIndexes` with a `batchSize` smaller than the index
+  count returns a live cursor id, but the follow-up `getMore` fails with
+  `CursorNotFound` (code 43), so the remaining index specs cannot be retrieved at
+  all. mongod returns `[2, 1]` for three indexes at `batchSize: 2`; we return the
+  first batch and then error.
+
+  Reproduce (three indexes, `batchSize: 2`):
+
+      db.command({"listIndexes": "c", "cursor": {"batchSize": 2}})   # -> id != 0
+      db.command({"getMore": id, "collection": "c", "batchSize": 2}) # -> CursorNotFound
+
+  **Pre-existing, NOT a regression** — verified by reproducing it on `main`
+  unchanged while working the cursor-exhaustion slice below. Not folded into that
+  slice because it is an unrelated defect in the `listIndexes` cursor's
+  registration/lookup, not in the exhaustion rule. Most collections have few
+  enough indexes that the default batch covers them, which is presumably why it
+  has gone unnoticed.
+
+- [x] **RESOLVED 2026-08-27 — a cursor whose result count is an exact multiple of
+  `batchSize` closed one `getMore` early (both servers).** Probed against mongod 8.3.4
   (2026-08-27): with `batchSize: 2`, mongod keeps the cursor OPEN after draining
   it and requires one further `getMore` that returns an empty `nextBatch` with
   `id: 0`; SecantusDB sets `id: 0` on the batch that drains it.
@@ -169,11 +188,27 @@ These work end-to-end but cut corners.
   was right and the round-trip count was not.
 
   Matters because drivers observe round-trip counts directly — mongo-go-driver's
-  `verifyOneGetmoreSent` asserts on exactly that, and a driver that loops
-  "getMore until id == 0" sees a different number of calls against us than
-  against mongod. Not fixed here on purpose: `id: 0` on the draining batch is
-  load-bearing for a lot of existing cursor tests, so flipping it is its own
-  slice with its own full-suite run, not a rider on an unrelated branch.
+  `verifyOneGetmoreSent` asserts on exactly that.
+
+  **Fixed 2026-08-27.** The rule mongod actually follows: close only when the
+  result is KNOWN finished — the batch came up short, a `limit`/`singleBatch`
+  bounded it, or no `batchSize` was requested (which means "server default", and
+  mongod then drains and closes). A batch that exactly fills the request proves
+  nothing, so the cursor stays open.
+
+  **The rule is NOT uniform across commands, and assuming it was would have
+  broken two of them.** Probed on mongod 8.3.4: `find` and `aggregate` keep the
+  cursor open on an exact-fill batch, but `listIndexes` and `listCollections`
+  CLOSE — they enumerate a catalog whose size is known up front. Implemented as a
+  `bounded` flag on the cursor entry, set by the catalog commands and by
+  `find` under a positive `limit`.
+
+  Also wider than first filed here: it is not only "exact multiple across
+  getMores" but any batch that exactly drains, including the *first* (`2 docs,
+  batchSize 2` → mongod `[2, 0]`, we returned `[2]`).
+
+  Verified across 12 shapes on both servers (`tests/test_cursor_exhaustion_parity.py`,
+  19 tests, 6 of which fail with the fix reverted; 4 Rust unit tests).
 
 - [x] **RESOLVED 2026-08-27 — `top` reports real per-namespace counters on both servers.** `top` now answers on
   **both** servers with the mongod shape — one `totals` entry per namespace, a

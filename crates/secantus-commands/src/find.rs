@@ -520,7 +520,7 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             let (first_batch, cursor_id): (Vec<Bson>, i64) = if single_batch {
                 (projected.into_iter().map(Bson::Document).collect(), 0)
             } else {
-                split_docs_into_cursor(projected, batch_size, &ns, cursors)?
+                split_docs_into_cursor(projected, batch_size, &ns, cursors, limit > 0)?
             };
             Ok(doc! {
                 "cursor": {
@@ -536,7 +536,10 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             let (first, cursor_id) = if single_batch {
                 (docs, 0)
             } else {
-                split_into_cursor(docs, batch_size, &ns, cursors)?
+                // A positive `limit` bounds the result, so mongod closes the
+                // cursor the moment it is reached rather than spending a
+                // trailing empty getMore.
+                split_into_cursor(docs, batch_size, &ns, cursors, limit > 0)?
             };
             ctx.pending_batch = Some(crate::PendingBatch {
                 batch_field: "firstBatch",
@@ -563,6 +566,7 @@ pub(crate) fn split_into_cursor(
     batch_size: i64,
     ns: &str,
     cursors: &CursorRegistry,
+    bounded: bool,
 ) -> Result<(Vec<Vec<u8>>, i64), CommandError> {
     let mut take = if batch_size < 0 {
         DEFAULT_BATCH_SIZE as usize
@@ -589,11 +593,17 @@ pub(crate) fn split_into_cursor(
     }
     take = fitted;
     let remaining = docs.split_off(take);
-    if remaining.is_empty() {
+    // A batch that exactly fills the requested size proves nothing about what
+    // follows, so an unbounded cursor stays open even with nothing left -- the
+    // client spends one more getMore to see the empty batch, exactly as against
+    // mongod. Closing early made our round-trip count differ, which drivers
+    // observe directly.
+    let filled_exactly = batch_size > 0 && docs.len() == batch_size as usize;
+    if remaining.is_empty() && (bounded || !filled_exactly) {
         return Ok((docs, 0));
     }
     let cursor_id = cursors
-        .register(ns, remaining)
+        .register_bounded(ns, remaining, bounded)
         .map_err(|e| CommandError::new(1, "InternalError", format!("cursor registry: {e:?}")))?;
     Ok((docs, cursor_id))
 }
@@ -608,6 +618,7 @@ pub(crate) fn split_docs_into_cursor(
     batch_size: i64,
     ns: &str,
     cursors: &CursorRegistry,
+    bounded: bool,
 ) -> Result<(Vec<Bson>, i64), CommandError> {
     let take = if batch_size < 0 {
         DEFAULT_BATCH_SIZE as usize
@@ -616,12 +627,13 @@ pub(crate) fn split_docs_into_cursor(
     }
     .min(docs.len());
     let remaining = docs.split_off(take);
+    let filled_exactly = batch_size > 0 && docs.len() == batch_size as usize;
     let first: Vec<Bson> = docs.into_iter().map(Bson::Document).collect();
-    if remaining.is_empty() {
+    if remaining.is_empty() && (bounded || !filled_exactly) {
         return Ok((first, 0));
     }
     let cursor_id = cursors
-        .register(ns, encode_docs(remaining)?)
+        .register_bounded(ns, encode_docs(remaining)?, bounded)
         .map_err(|e| CommandError::new(1, "InternalError", format!("cursor registry: {e:?}")))?;
     Ok((first, cursor_id))
 }
@@ -912,7 +924,7 @@ mod first_batch_byte_cap_tests {
         // (15.0 MiB) and a live cursor id.
         let reg = CursorRegistry::new();
         let docs: Vec<Vec<u8>> = (0..25).map(|_| blob(1024 * 1024)).collect();
-        let (first, cursor_id) = split_into_cursor(docs, 25, "t.big", &reg).unwrap();
+        let (first, cursor_id) = split_into_cursor(docs, 25, "t.big", &reg, false).unwrap();
 
         let bytes: usize = first.iter().map(|b| b.len()).sum();
         assert!(
@@ -932,7 +944,7 @@ mod first_batch_byte_cap_tests {
         // client. Matches CursorRegistry::next_batch's "at least one" rule.
         let reg = CursorRegistry::new();
         let docs: Vec<Vec<u8>> = (0..2).map(|_| blob(12 * 1024 * 1024)).collect();
-        let (first, cursor_id) = split_into_cursor(docs, 2, "t.huge", &reg).unwrap();
+        let (first, cursor_id) = split_into_cursor(docs, 2, "t.huge", &reg, false).unwrap();
         assert_eq!(first.len(), 1);
         assert_ne!(cursor_id, 0);
     }
@@ -941,7 +953,7 @@ mod first_batch_byte_cap_tests {
     fn small_documents_are_governed_by_the_count_cap() {
         let reg = CursorRegistry::new();
         let docs: Vec<Vec<u8>> = (0..500).map(|_| blob(64)).collect();
-        let (first, cursor_id) = split_into_cursor(docs, 101, "t.small", &reg).unwrap();
+        let (first, cursor_id) = split_into_cursor(docs, 101, "t.small", &reg, false).unwrap();
         assert_eq!(first.len(), 101, "the common path must not change");
         assert_ne!(cursor_id, 0);
     }
@@ -950,7 +962,7 @@ mod first_batch_byte_cap_tests {
     fn everything_fitting_exhausts_the_cursor() {
         let reg = CursorRegistry::new();
         let docs: Vec<Vec<u8>> = (0..5).map(|_| blob(64)).collect();
-        let (first, cursor_id) = split_into_cursor(docs, 101, "t.small", &reg).unwrap();
+        let (first, cursor_id) = split_into_cursor(docs, 101, "t.small", &reg, false).unwrap();
         assert_eq!(first.len(), 5);
         assert_eq!(cursor_id, 0);
     }

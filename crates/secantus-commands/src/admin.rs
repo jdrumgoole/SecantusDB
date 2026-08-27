@@ -730,7 +730,7 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         .and_then(|c| c.get("batchSize"))
         .and_then(as_i64)
         .unwrap_or(DEFAULT_BATCH_SIZE as i64);
-    let (first, cid) = split_into_cursor(encode_docs(entries)?, batch_size, &ns, cursors)?;
+    let (first, cid) = split_into_cursor(encode_docs(entries)?, batch_size, &ns, cursors, true)?;
     Ok(doc! {
         "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
         "ok": 1.0,
@@ -862,7 +862,7 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )
         .into_reply());
     }
-    let (first, cid) = split_into_cursor(encode_docs(indexes)?, batch_size, &ns, cursors)?;
+    let (first, cid) = split_into_cursor(encode_docs(indexes)?, batch_size, &ns, cursors, true)?;
     Ok(doc! {
         "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
         "ok": 1.0,

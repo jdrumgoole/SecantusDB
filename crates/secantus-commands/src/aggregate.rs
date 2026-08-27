@@ -263,7 +263,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // The pipeline result is already decoded `Document`s. Send the `firstBatch`
     // straight to the wire as `Bson` and encode only the cursor remainder for the
     // registry — no encode→decode round-trip on the docs the client gets now.
-    let (first_batch, cursor_id) = split_docs_into_cursor(result, batch_size, &ns, cursors)?;
+    let (first_batch, cursor_id) = split_docs_into_cursor(result, batch_size, &ns, cursors, false)?;
     Ok(doc! {
         "cursor": {
             "firstBatch": first_batch,
