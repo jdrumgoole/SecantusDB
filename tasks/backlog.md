@@ -152,7 +152,30 @@ These work end-to-end but cut corners.
   `query.rs` — equality only, so ranges and sort keep IEEE semantics and NaN still
   sorts below every number with `$gt: NaN` matching nothing. Infinity was always
   fine. Covered by `tests/test_nan_equality.py` and a `secantus-core` unit test.
-- [ ] **OPEN — `top` counters are always zero (both servers).** `top` now answers on
+- [ ] **OPEN — a cursor whose result count is an exact multiple of `batchSize`
+  closes one `getMore` early (both servers).** Probed against mongod 8.3.4
+  (2026-08-27): with `batchSize: 2`, mongod keeps the cursor OPEN after draining
+  it and requires one further `getMore` that returns an empty `nextBatch` with
+  `id: 0`; SecantusDB sets `id: 0` on the batch that drains it.
+
+      4 docs   mongod    batches=[2, 2, 0]    getMores=2
+      4 docs   secantus  batches=[2, 2]       getMores=1
+      6 docs   mongod    batches=[2, 2, 2, 0] getMores=3
+      6 docs   secantus  batches=[2, 2, 2]    getMores=2
+
+  Only diverges when the count divides evenly — with a partial final batch both
+  servers agree (`5 docs -> [2, 2, 1]`). Found incidentally while differential-
+  testing `top`'s `getmore` counter, which is how it surfaced at all: the counter
+  was right and the round-trip count was not.
+
+  Matters because drivers observe round-trip counts directly — mongo-go-driver's
+  `verifyOneGetmoreSent` asserts on exactly that, and a driver that loops
+  "getMore until id == 0" sees a different number of calls against us than
+  against mongod. Not fixed here on purpose: `id: 0` on the draining batch is
+  load-bearing for a lot of existing cursor tests, so flipping it is its own
+  slice with its own full-suite run, not a rider on an unrelated branch.
+
+- [x] **RESOLVED 2026-08-27 — `top` reports real per-namespace counters on both servers.** `top` now answers on
   **both** servers with the mongod shape — one `totals` entry per namespace, a
   `note` key mongo-tools skips, and `total`/`readLock`/`writeLock` plus the per-op
   sections each `{time, count}` — and both refuse a non-admin database with code 13.
@@ -160,10 +183,30 @@ These work end-to-end but cut corners.
   59 CommandNotFound, so `mongotop` failed outright against the Rust server rather
   than rendering an idle one, a gap this entry's old "counters are always zero"
   wording hid by reading as if it described both servers.
-  **What remains** is the counters themselves: nothing instruments per-namespace
-  operation timing, so every `{time, count}` is `0` and mongotop renders an idle
-  server. Real counters need per-ns accounting in `Metrics` threaded through
-  dispatch on both sides.
+  **The counters now exist on both servers.** Python: `Metrics.record_namespace_op`
+  / `top_snapshot` (`metrics.py`), called from `dispatch` reusing the profiler's
+  existing clock read. Rust: a new `topstats::TopStats` on `Shared`, threaded into
+  every `CommandContext` and recorded around `dispatch`
+  (`secantus-server/src/lib.rs`).
+
+  **The section mapping was probed against real mongod 8.3.4, not assumed — and
+  the obvious assumptions were wrong in four places.** `aggregate`, `count`,
+  `distinct` and `findAndModify` all land in `commands`, NOT in `queries`/`update`;
+  mongod's `queries` section is essentially just `find`. Counts are per COMMAND,
+  not per document (a 50-document `insert` bumps the count by 1). `createIndexes` /
+  `dropIndexes` / `findAndModify` take `writeLock`; `aggregate` / `count` /
+  `distinct` / `listIndexes` / `explain` take `readLock`. A successful `drop`
+  RESETS the namespace's counters — mongod does not carry history across a drop,
+  which the first implementation here got backwards. Commands naming no collection
+  (`ping` / `hello` / `serverStatus` / `listCollections`) are not attributed.
+
+  One mongod oddity deliberately not reproduced: `collMod` bumps `total` but
+  neither `readLock` nor `writeLock`. We classify it as a write — noted rather than
+  special-cased, since the shape matters to mongotop and this asymmetry does not.
+
+  Differential against mongod 8.3.4 over a mixed workload matches on 8 of 9
+  sections; the 9th (`getmore`) differs only because of the separate
+  cursor-exhaustion divergence filed above, not because of the counter.
 - ~~**`renameCollection` cross-process safety**~~ structurally guaranteed by WiredTiger (b34). Within-process atomicity is the storage `RLock`. Cross-process exclusion is `WiredTiger.lock` — a second `wiredtiger_open` on the same path fails with ``WT_ERROR Resource busy`` before any state is touched, so concurrent writers across processes / worktrees can't exist in the first place. See `tests/test_storage_exclusion.py`.
 - ~~**`createIndexes` collation**~~ shipped (single-field b25 + compound b27). `sortkey.encode_value_directed` takes a `collation` kwarg; index entries are written under the index's stored collation; single-field equality / range / `$in` (`_find_leading_field_index`), compound bare-equality (`_pick_compound_eq_index`), and compound prefix + trailing-operator (`_pick_compound_range_index`) all thread collation through and gate by exact match. Unique-probe path reads each index's stored collation too. Strength 1/2/3 + `caseLevel` work uniformly across single- and compound-field indexes; `numericOrdering` still falls back to COLLSCAN at every level (would need a length-prefixed digit-run encoding to stay byte-sortable). See `docs/indexes.md` "Per-index collation".
 
@@ -7156,9 +7199,9 @@ distinct problems, triaged from the run logs:
   (renames of huge collections are rare); bounded today only by luck of
   cache headroom. The `drop_target=true` purge inside rename shares the
   shape.
-- [ ] **OPEN — half fixed 2026-08-25: change streams, an awaitData `getMore`
-  with NO `maxTimeMS` waits 1s, so an event that happens during the wait comes
-  back to a client that asked "is anything ready right now?".** Surfaced as
+- [x] **RESOLVED 2026-08-27 — and it was never a server bug. Change streams, an awaitData `getMore`
+  with NO `maxTimeMS` waits 1s; the Go gauge's own package concurrency dropped the
+  shared database inside that window.** Surfaced as
   mongo-go-driver's `TestChangeStream_ReplicaSet/try_next/one_getMore_sent`
   failing intermittently: `TryNext returned true on iteration 1` with no events
   generated at all.
@@ -7210,42 +7253,39 @@ distinct problems, triaged from the run logs:
   of both calls — SecantusDB is now indistinguishable from mongod, yet the Go
   gauge still fails ~1 run in 3 and mongod never does.
 
-  What that leaves, in rough order of likelihood:
+  **ROOT-CAUSED 2026-08-27 by tracing every dispatched command through a
+  reproduced failure (reproduced on the 2nd full-gauge attempt).** All three
+  hypotheses this entry previously listed — a leftover cursor from
+  `existing_non-empty_batch`, an extra `getMore`, and reply framing on a killed
+  cursor — are **wrong**. The trace shows exactly ONE `getMore` on the
+  change-stream cursor, no overlapping change-stream cursors, and clean framing.
 
-  - **A cursor from the preceding subtest.** `try_next/existing_non-empty_batch`
-    defers `closeStream`; if its cursor is still open and its collection is
-    dropped by teardown, an interaction between the two streams is plausible.
-    The failing assertion is on the *second* `TryNext`, and both subtests use
-    the same connection pool.
-  - **An extra `getMore`.** The test also calls `verifyOneGetmoreSent`; if our
-    replies ever make the driver issue a second one, the second could catch the
-    teardown drop legitimately.
-  - **Reply framing on a killed cursor** — a late reply landing in the socket
-    after `TryNext` gave up would desynchronise the connection.
+  The real cause is the gauge's own invocation. `./internal/integration/...`
+  expands to THREE packages (`integration`, `integration/mtest`,
+  `integration/unified`) and `go test` runs packages **concurrently** by default.
+  All three share `mtest.TestDB == "test"`, and `mtest.Teardown()` **drops that
+  database** (`mtest/setup.go:239`). Because `TestUnifiedSpec` is in our
+  `SKIP_PATTERNS`, the `unified` package has no work to do: its `TestMain` runs
+  `Setup()` then `Teardown()` back-to-back and drops `test` within a second of
+  starting — concurrently with `integration`. In the failing run the trace shows
+  a second connection issuing `getParameter '*'` (the `mtest` setup fingerprint)
+  then `dropDatabase`, landing 263 ms into the change-stream `getMore`; the
+  getMore correctly returned `drop` + `invalidate`, so `TryNext` returned true
+  and the test's `Should be false` assertion fired. In a passing run that same
+  pair lands *before* the `try_next` subtests start. A timing shift, nothing else.
 
-  **Driver-side env logging does NOT work here — do not retry it.** The Go
-  driver supports `MONGODB_LOG_COMMAND=debug` / `MONGODB_LOG_PATH` /
-  `MONGODB_LOG_MAX_DOCUMENT_LENGTH`, and running the gauge under them
-  reproduced the failure on attempt 4 with a 282,280-line log — but the log
-  contains only **2 `getMore` command events in total**, neither for the failing
-  test. `mtest` constructs its own clients, so the env-configured logger never
-  applies to them. Six gauge runs (~25 min) to establish that.
+  So the server was right all along — as the mongod probe above already implied:
+  mongod returns a mid-wait drop the same way. **Fixed gauge-side** by adding
+  `-p 1` to the `go test` invocation (`go_validation/runner.py`), serialising
+  packages so one package's teardown can no longer drop the database another
+  package is mid-stream on. No assertion weakened, no test skipped, and the
+  `unified` package's two genuine unit tests (`TestEntityMap`, `TestMatches`)
+  still run.
 
-  A driver-side view therefore needs either a patch to the vendored tree — which
-  the gauge explicitly forbids ("zero modifications to the vendored go-driver
-  tree"), and which would make the result unreproducible for anyone else — or a
-  standalone Go program that replicates the mtest sequence *and* the
-  surrounding load, since the failure does not occur with the subtest or its
-  suite run alone.
-
-  Remaining candidates, unchanged and still unexamined:
-
-  - the preceding subtest (`try_next/existing_non-empty_batch`) defers
-    `closeStream`; its cursor may still be open on the shared pool when
-    `one_getMore_sent` runs, and its collection is dropped by teardown;
-  - a second `getMore` being issued (the test also asserts exactly one was
-    sent, via `verifyOneGetmoreSent`);
-  - a reply landing after the driver abandoned the request.
+  Lesson worth keeping: a driver-gauge flake that survives a faithful
+  per-dimension comparison against mongod is a reason to instrument the
+  *harness*, not to keep hunting the server. Three plausible server-side
+  hypotheses sat in this entry for two days and all three were wrong.
 
 - [x] **RESOLVED 2026-08-23: PITR restore wrote 2 GB regardless of database
   size — backup extraction now punches holes instead of writing runs of

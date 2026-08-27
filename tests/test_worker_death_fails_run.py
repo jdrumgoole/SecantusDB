@@ -10,6 +10,7 @@ happen silently again.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import subprocess
 import sys
@@ -121,12 +122,24 @@ def test_hook_is_a_no_op_inside_a_worker(monkeypatch) -> None:
     assert session.exitstatus == 0
 
 
-def test_real_worker_death_prints_the_banner(tmp_path) -> None:
-    """A genuine SIGKILLed worker engages the machinery end to end.
+def test_real_worker_death_is_detected_end_to_end(tmp_path) -> None:
+    """A genuine dead worker is detected and the run does not silently succeed.
 
-    This asserts on the banner, not the exit code: xdist independently fails
-    this synthetic case, so a returncode assertion here would pass even with
-    the override removed (checked) and would be a false tripwire.
+    Two things this deliberately does NOT do.
+
+    It does not assert the exit code proves the override: xdist independently
+    fails this synthetic case, so a returncode assertion passes even with the
+    fix removed (checked). The override is pinned against the hook above.
+
+    It does not insist on the banner specifically. A post-crash run can wedge --
+    that is exactly why ``conftest`` carries a stall watchdog -- and when it
+    does, the watchdog kills the process before ``pytest_sessionfinish`` ever
+    runs, so no banner is printed. The first version of this test asserted only
+    on the banner with a 300s subprocess timeout, passed standalone, and then
+    hung for the full 300s inside a loaded full-suite run, because the wedge
+    path's default deadline is 1200s. Both outcomes prove the same thing -- the
+    worker death was noticed -- so either is accepted, and the nested run's
+    deadlines are bounded via env so it can never outlive our timeout.
     """
     (tmp_path / "conftest.py").write_text(
         (pathlib.Path(__file__).parent / "conftest.py").read_text()
@@ -150,13 +163,32 @@ def test_real_worker_death_prints_the_banner(tmp_path) -> None:
             """
         )
     )
+    env = dict(os.environ)
+    # Don't let the OUTER run's xdist/pytest state leak into the nested one --
+    # this test runs inside an xdist worker during a full-suite run, and that
+    # inherited state is the difference between the nested run finishing in ~1s
+    # standalone and wedging under load.
+    for leaked in (
+        "PYTEST_XDIST_WORKER",
+        "PYTEST_XDIST_WORKER_COUNT",
+        "PYTEST_XDIST_TESTRUNUID",
+        "PYTEST_CURRENT_TEST",
+        "PYTEST_ADDOPTS",
+    ):
+        env.pop(leaked, None)
+    # Bound the nested run so a post-crash wedge self-terminates well inside our
+    # subprocess timeout instead of sitting on conftest's 1200s default.
+    env["SECANTUS_POST_CRASH_SECONDS"] = "20"
+    env["SECANTUS_STALL_SECONDS"] = "60"
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", "-n", "4", str(tmp_path)],
         cwd=tmp_path,
+        env=env,
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=240,
     )
     out = proc.stdout + proc.stderr
-    assert "RUN INVALID" in out, f"banner missing:\n{out[-3000:]}"
-    assert proc.returncode != 0
+    assert proc.returncode != 0, f"a dead worker must not exit 0:\n{out[-3000:]}"
+    detected = "RUN INVALID" in out or "post-crash overrun" in out
+    assert detected, f"worker death went unreported:\n{out[-3000:]}"
