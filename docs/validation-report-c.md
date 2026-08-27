@@ -1,6 +1,6 @@
 # mongo-c-driver Validation Report
 
-Generated 2026-08-24 — SecantusDB 0.6.0b15 vs mongo-c-driver 57dba9c (`vendor/mongo-c-driver/`).
+Generated 2026-08-27 — SecantusDB 0.6.0b16 vs mongo-c-driver 57dba9c (`vendor/mongo-c-driver/`).
 
 Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** driver (`libmongoc`) is the lowest-level official client — and (with the Go and PHP-extension gauges) one of the strictest wire-protocol checks.
 
@@ -18,7 +18,7 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | `/WriteCommand` | 6 | 0 | 0 | 6 | 100.0% |
 | `/WriteConcern` | 13 | 0 | 0 | 13 | 100.0% |
 | `/bulkwrite` | 0 | 0 | 13 | 13 | 100.0% |
-| `/change_stream` | 20 | 3 | 2 | 25 | 87.0% |
+| `/change_stream` | 23 | 0 | 2 | 25 | 100.0% |
 | `/change_streams` | 11 | 0 | 0 | 11 | 100.0% |
 | `/collection-management` | 5 | 0 | 0 | 5 | 100.0% |
 | `/command_monitoring` | 33 | 1 | 1 | 35 | 97.1% |
@@ -28,16 +28,13 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | `/gridfs_old` | 32 | 0 | 2 | 34 | 100.0% |
 | `/index-management` | 6 | 0 | 0 | 6 | 100.0% |
 | `/long_namespace` | 8 | 0 | 1 | 9 | 100.0% |
-| **Overall** | **759** | **10** | **72** | **841** | **98.7%** |
+| **Overall** | **762** | **7** | **72** | **841** | **99.1%** |
 
-## Failures (10)
+## Failures (7)
 
 First 30 failed tests for triage:
 
 ```
-/change_stream/live/missing_resume_token
-/change_stream/live/invalid_resume_token
-/change_stream/accepts_array
 /Client/ipv6/single
 /Client/ipv6/single
 /Client/select_server/single
