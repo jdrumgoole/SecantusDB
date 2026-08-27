@@ -152,8 +152,8 @@ These work end-to-end but cut corners.
   `query.rs` — equality only, so ranges and sort keep IEEE semantics and NaN still
   sorts below every number with `$gt: NaN` matching nothing. Infinity was always
   fine. Covered by `tests/test_nan_equality.py` and a `secantus-core` unit test.
-- [ ] **OPEN — `listIndexes` pagination is broken: a second batch is unreachable
-  (Python server).** `listIndexes` with a `batchSize` smaller than the index
+- [x] **RESOLVED 2026-08-27 (#1067) — `listIndexes` pagination was broken: a second
+  batch was unreachable (BOTH servers, not just Python as first filed).** `listIndexes` with a `batchSize` smaller than the index
   count returns a live cursor id, but the follow-up `getMore` fails with
   `CursorNotFound` (code 43), so the remaining index specs cannot be retrieved at
   all. mongod returns `[2, 1]` for three indexes at `batchSize: 2`; we return the
@@ -164,12 +164,28 @@ These work end-to-end but cut corners.
       db.command({"listIndexes": "c", "cursor": {"batchSize": 2}})   # -> id != 0
       db.command({"getMore": id, "collection": "c", "batchSize": 2}) # -> CursorNotFound
 
-  **Pre-existing, NOT a regression** — verified by reproducing it on `main`
-  unchanged while working the cursor-exhaustion slice below. Not folded into that
-  slice because it is an unrelated defect in the `listIndexes` cursor's
-  registration/lookup, not in the exhaustion rule. Most collections have few
-  enough indexes that the default batch covers them, which is presumably why it
-  has gone unnoticed.
+  **Was pre-existing, NOT a regression** — reproduced on `main` unchanged while
+  working the cursor-exhaustion slice. Most collections have few enough indexes
+  that the default batch covers them, which is presumably why it went unnoticed.
+
+  **Root cause:** the cursor was registered under `db.$cmd.listIndexes.<coll>`,
+  while drivers put the plain collection name in the getMore's `collection`
+  field. The getMore ownership check — which exists so a guessed cursor id cannot
+  pull pages from a namespace the caller has no privilege on — compared the two
+  and rejected the continuation. The check was correct; the registered namespace
+  was not. mongod uses plain `db.coll`.
+
+  **NOT a blanket "drop the `$cmd` prefix"** — probed on mongod 8.3.4, the answer
+  differs per command and two of the three were already right:
+
+      listIndexes             ns = db.coll                   <- was wrong
+      listCollections         ns = db.$cmd.listCollections   <- already correct
+      aggregate: 1 (no coll)  ns = db.$cmd.aggregate         <- already correct
+
+  Fixed on both servers. Pinned by `tests/test_list_indexes_pagination.py`
+  (7 tests, 4 of which fail with the fix reverted), including one asserting the
+  cross-namespace ownership check still rejects a foreign `collection` — the fix
+  must not weaken the security property whose enforcement produced the symptom.
 
 - [x] **RESOLVED 2026-08-27 — a cursor whose result count is an exact multiple of
   `batchSize` closed one `getMore` early (both servers).** Probed against mongod 8.3.4
