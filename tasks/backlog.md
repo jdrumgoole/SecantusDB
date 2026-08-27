@@ -6815,15 +6815,27 @@ mention**:
   src ORDER BY u DESC` answers `0A000 feature not supported`; PG answers
   `9, 8, 7`. Erroring is arguably worse than the wrong order the entry
   describes, and it is the shape a real query is most likely to use.
-- **`_pg_expandarray(...).x` comes back as TEXT, not the element type.**
+- **`unnest` declared `int4` for EVERY array — FIXED 2026-08-27.** Chasing the
+  `.x` type led to a far worse bug one level up: `_infer_scalar_tag`'s SRF branch
+  returned a hardcoded `int4`, so `SELECT unnest(ARRAY['a','b'])` put `int4` in
+  the RowDescription and then sent `a`. psycopg did `int('a')` and raised
+  `ValueError: invalid literal for int() with base 10: 'a'` **client-side** —
+  the query failed outright for text, numeric and boolean arrays. Only integer
+  arrays worked, and only by luck. The branch now infers the array's element
+  type (and keeps `int4` for the subscript-yielding `generate_subscripts` /
+  `.n`). Verified against a live PostgreSQL 14 for text / numeric / bool / int;
+  pinned by `TestSrfElementTypes`.
+- **`_pg_expandarray(...).x` still comes back as TEXT (open).**
   `SELECT (information_schema._pg_expandarray(ARRAY[9,8,7])).x` gives
-  `'9','8','7'` where PG gives ints. `.n` is correctly an int, so only the value
-  field is affected. The executor's cell builder returns the raw element
-  (`executor._pg_expandarray_cell`); the coercion is in the *declared output
-  column type*, so the fix is element-type inference in the planner, not a cast
-  at the edge.
+  `'9','8','7'` where PG gives ints; `.n` is correct. The element-type inference
+  above does NOT reach it — the record-SRF field projection is typed by a
+  different path that assigns `any` (`pg_oid` 0) before
+  `_infer_scalar_tag` is consulted, so finding that path is the work. Narrow: it
+  affects only the `.x` field of one `information_schema` helper, which is
+  pgjdbc's `DatabaseMetaData` route.
 
-Both are unfixed. `unnest` without ORDER BY, and `.n`, match PG exactly.
+`unnest` ordering (above) and `.x` typing remain; `unnest` element types, `.n`,
+and `generate_subscripts` match PG exactly.
 
 ## Unquoted identifiers are not case-folded (2026-08-02) — FIXED
 

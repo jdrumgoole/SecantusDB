@@ -10832,9 +10832,25 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         return "numeric"
     srf = _srf_of(node)
     if srf is not None:
-        # jsonb_array_elements → json elements; jsonb_object_keys → text keys;
-        # unnest(indkey/indclass) → attnum/opclass oid; generate_subscripts → ord.
-        return {"jsonb_array_elements": "json", "jsonb_object_keys": "text"}.get(srf[0], "int4")
+        kind, array_expr = srf
+        # jsonb_array_elements → json elements; jsonb_object_keys → text keys.
+        fixed = {"jsonb_array_elements": "json", "jsonb_object_keys": "text"}.get(kind)
+        if fixed is not None:
+            return fixed
+        # A subscript is an int whatever the array holds.
+        if kind == "generate_subscripts" or kind.endswith("._n") or kind.endswith(".n"):
+            return "int4"
+        # `unnest(arr)` and `(_pg_expandarray(arr)).x` yield the array's ELEMENT
+        # type. This used to default to int4 for every array, which is a wire
+        # lie for anything else: the server declared int4 in the RowDescription
+        # and then sent `a` / `1.5` / `t`, so a strict client did `int('a')` and
+        # died. Only integer arrays worked, and only by luck.
+        elem = _infer_scalar_tag(array_expr, resolve)
+        if elem and elem.endswith("[]"):
+            return elem[:-2]
+        # Unknown element type: `any` lets the wire pick text rather than
+        # asserting a type the values may not honour.
+        return elem or "any"
     # A boolean-producing expression (IS NOT NULL, comparisons, AND/OR) must type
     # as bool, not text — else its value rides the wire as the string 'f'/'t' and
     # a driver reads ``if row["x"]`` as truthy (SQLAlchemy's duplicates_constraint).
