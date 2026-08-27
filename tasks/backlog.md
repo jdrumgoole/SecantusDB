@@ -6805,6 +6805,26 @@ Pinned by `tests/test_sql_pg_expandarray.py::TestFieldSelection::
 test_order_by_does_not_sort_expanded_rows` so the current shape is visible
 rather than assumed correct.
 
+**Re-measured 2026-08-27 against a LIVE PostgreSQL 14** (one is running on this
+machine — `host=127.0.0.1 port=5432`, and `SECANTUS_PG_ORACLE_DSN` points the
+sub-ms oracle test at it; the same trick works for any SQL probe). The entry
+above is confirmed, and the probe found **two further divergences it does not
+mention**:
+
+- **`ORDER BY <srf-alias> DESC` ERRORS.** `SELECT unnest(ARRAY[7,9,8]) AS u FROM
+  src ORDER BY u DESC` answers `0A000 feature not supported`; PG answers
+  `9, 8, 7`. Erroring is arguably worse than the wrong order the entry
+  describes, and it is the shape a real query is most likely to use.
+- **`_pg_expandarray(...).x` comes back as TEXT, not the element type.**
+  `SELECT (information_schema._pg_expandarray(ARRAY[9,8,7])).x` gives
+  `'9','8','7'` where PG gives ints. `.n` is correctly an int, so only the value
+  field is affected. The executor's cell builder returns the raw element
+  (`executor._pg_expandarray_cell`); the coercion is in the *declared output
+  column type*, so the fix is element-type inference in the planner, not a cast
+  at the edge.
+
+Both are unfixed. `unnest` without ORDER BY, and `.n`, match PG exactly.
+
 ## Unquoted identifiers are not case-folded (2026-08-02) — FIXED
 
 Postgres folds an unquoted identifier to lower case, so `AS TABLE_NAME` and a
