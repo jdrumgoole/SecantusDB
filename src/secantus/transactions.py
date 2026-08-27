@@ -184,6 +184,42 @@ def _cannot_restart(txn_number: int) -> dict[str, Any]:
     }
 
 
+def _strip_per_attempt_fields(reply: dict[str, Any]) -> dict[str, Any]:
+    """Deep-copy ``reply`` without the fields that describe THIS attempt only.
+
+    A ``writeConcernError`` is a property of the attempt, not of the stored
+    statement outcome: the write itself succeeded and only its durability
+    acknowledgement failed. Replaying it makes the driver's retry see the very
+    error it retried because of, so the retry "fails" too and the operation
+    surfaces as an error even though the write is safely applied.
+
+    Probed on mongod 8.3.4 (single-node replica set, ``failCommand`` with
+    ``errorLabels: ["RetryableWriteError"]`` + ``writeConcernError: {code: 91}``,
+    ``mode: {times: 1}``)::
+
+        attempt 1          n=1  writeConcernError=YES  errorLabels=[RetryableWriteError]
+        attempt 2 (retry)  n=1  writeConcernError=no   errorLabels=absent
+
+    We used to replay attempt 1 verbatim: the record is taken after the
+    cluster-time gossip fields are attached, with the deliberate intent that the
+    replay be byte-identical. Byte-identical is right for the write RESULT and
+    wrong for the attempt's own condition.
+
+    This is what kept libmongoc's ``/command_monitoring/unified/writeConcernError``
+    red. The long-standing theory was that the driver never classified the write
+    as retryable; tracing the commands showed the opposite -- it does assign a
+    ``txnNumber`` and it does retry, on a fresh connection -- and the retry got
+    the replayed ``writeConcernError`` back.
+
+    ``errorLabels`` goes with it: on a successful reply the only labels present
+    are the ones the write-concern error carried.
+    """
+    stripped = copy.deepcopy(reply)
+    stripped.pop("writeConcernError", None)
+    stripped.pop("errorLabels", None)
+    return stripped
+
+
 class TransactionRegistry:
     """Thread-safe map of ``lsid_bytes`` → most-recent :class:`Transaction`.
 
@@ -380,7 +416,7 @@ class TransactionRegistry:
             return
         with self._lock:
             self._retryable[(lsid_bytes, txn_number)] = (
-                copy.deepcopy(reply),
+                _strip_per_attempt_fields(reply),
                 self._time(),
                 identity,
             )

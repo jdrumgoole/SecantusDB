@@ -7172,10 +7172,18 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                     result["errorLabels"] = labels
                 return result
             if match.write_concern_error is not None:
-                wce = dict(match.write_concern_error)
-                wce.setdefault("errmsg", "failCommand failpoint")
-                wce.setdefault("codeName", _code_name_for(int(wce.get("code", 0))))
-                failpoint_wce = wce
+                # Echo the failpoint's writeConcernError VERBATIM. mongod does
+                # not synthesise anything here -- probed on 8.3.4, a failpoint
+                # carrying `{code: 91}` yields exactly `{code: 91}`, and one
+                # carrying `{code: 91, errmsg: "custom"}` yields both fields.
+                #
+                # We used to add `errmsg` and `codeName`, which the unified-spec
+                # matcher rejects: it compares nested documents by exact key
+                # count, so libmongoc's /command_monitoring/unified/
+                # writeConcernError failed with "expected 1 keys in document,
+                # got: 3". The synthesised `codeName` was wrong anyway -- it
+                # rendered 91 as "Location91" where 91 is ShutdownInProgress.
+                failpoint_wce = dict(match.write_concern_error)
                 failpoint_labels = match.error_labels
 
     # Multi-document transaction envelope. ``autocommit: false`` +

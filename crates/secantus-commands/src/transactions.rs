@@ -205,6 +205,31 @@ pub struct TransactionRegistry {
     clock: Clock,
 }
 
+/// Copy `reply` without the fields that describe THIS attempt only.
+///
+/// A `writeConcernError` is a property of the attempt, not of the stored
+/// statement outcome: the write succeeded and only its durability
+/// acknowledgement failed. Replaying it makes the driver's retry see the very
+/// error it retried because of, so the retry "fails" too and the operation
+/// surfaces as an error even though the write is safely applied.
+///
+/// Probed on mongod 8.3.4 (single-node replica set, `failCommand` with
+/// `errorLabels: ["RetryableWriteError"]` + `writeConcernError: {code: 91}`,
+/// `mode: {times: 1}`): attempt 1 carries both fields, the retry carries
+/// neither. This is what kept libmongoc's
+/// `/command_monitoring/unified/writeConcernError` red -- the driver DID
+/// classify the write as retryable and DID retry (both attempts carried
+/// `txnNumber: 1`, confirmed by tracing), but got the replayed error back.
+///
+/// `errorLabels` goes with it: on a successful reply the only labels present
+/// are the ones the write-concern error carried.
+fn strip_per_attempt_fields(reply: &Document) -> Document {
+    let mut out = reply.clone();
+    out.remove("writeConcernError");
+    out.remove("errorLabels");
+    out
+}
+
 impl TransactionRegistry {
     /// `commit` / `rollback` perform the storage-side WT work for a transaction;
     /// `clock` returns monotonic seconds (injectable for deterministic tests).
@@ -406,7 +431,7 @@ impl TransactionRegistry {
         let now = (self.clock)();
         inner.retryable.insert(
             (lsid_bytes.to_vec(), txn_number),
-            (reply.clone(), now, identity),
+            (strip_per_attempt_fields(reply), now, identity),
         );
         Self::prune_retryable(&mut inner, now);
     }
