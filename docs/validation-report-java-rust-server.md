@@ -1,6 +1,6 @@
 # mongo-java-driver Validation Report (Rust server)
 
-Generated 2026-08-19 — SecantusDB 0.6.0b12 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
+Generated 2026-08-24 — SecantusDB 0.6.0b15 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
 
 Run `uv run python -m invoke validate-java --server rust` to refresh. The same unmodified suite as `docs/validation-report-java.md`, pointed at the standalone **Rust server** (`secantusd-rs`) instead of the Python one — the gap between the two reports is part of the Rust server's remaining to-do list.
 

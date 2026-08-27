@@ -23,7 +23,7 @@ Run `uv run python -m invoke validate-php-ext` to refresh. This is the low-level
 | `tests/writeResult` | 19 | 0 | 4 | 23 | 100.0% |
 | **Overall** | **671** | **0** | **41** | **712** | **100.0%** |
 
-Run time: 135.63s.
+Run time: 48.66s.
 
 ## How this is generated
 

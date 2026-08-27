@@ -12,10 +12,19 @@ Run `uv run python -m invoke validate-java` to refresh. The pass rate is the ana
 
 | Module | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `driver-core__2` | 10 | 0 | 0 | 10 | 100.0% |
+| `driver-core__2` | 9 | 1 | 0 | 10 | 90.0% |
 | `driver-sync__0` | 360 | 0 | 400 | 760 | 100.0% |
-| `driver-sync__1` | 77 | 0 | 53 | 130 | 100.0% |
-| **Overall** | **447** | **0** | **453** | **900** | **100.0%** |
+| `driver-sync__1` | 76 | 1 | 53 | 130 | 98.7% |
+| **Overall** | **445** | **2** | **453** | **900** | **99.6%** |
+
+## Failures (2)
+
+First 30 failed tests for triage:
+
+```
+driver-sync__1 :: com.mongodb.client.ClientMetadataTest#client metadata is not propagated to the server: metadata append does not create new connections or close existing ones and no hello command is sent
+driver-core__2 :: com.mongodb.client.model.GeoJsonFiltersFunctionalSpecification#$near
+```
 
 ## How this is generated
 
