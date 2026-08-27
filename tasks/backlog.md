@@ -3728,7 +3728,19 @@ shared storage engine or building large new protocol subsystems:
   that was never stored).
 
   **Still open, in rough order of value:**
-  1. **Predicates are millisecond-blind — and wrong in BOTH directions.**
+  1. **Predicates — FIXED 2026-08-27.** Comparisons now lower against both the
+     truncated field and the `__us_` companion (`subms.cmp_filter`, wired into
+     the planner's EQ / NEQ / range sites), so `=`, `<>`, `<`, `<=`, `>`, `>=`
+     are microsecond-exact. Verified against a **live PostgreSQL 14** across 42
+     predicate/literal combinations over 8 rows — zero divergence — and pinned by
+     `test_subms_predicates_match_real_postgres`, which skips when no server is
+     reachable. Note `tests/test_sql_subms_timestamps.py` previously carried
+     `test_comparisons_remain_millisecond_blind`, which pinned the limitation
+     "so it stays visible" and thereby pinned two *wrong answers*; it is now
+     `test_comparisons_are_microsecond_exact`. **Still open here: ORDER BY**
+     within a single millisecond, which needs the companion as a sort
+     tiebreaker. Original note follows.
+     ~~Predicates are millisecond-blind — and wrong in BOTH directions.~~
      Measured 2026-08-27 against a stored `…00.123456`: `WHERE t = '…123456'`
      matches nothing (false negative — a row fails an equality on its *own
      stored value*), **and `WHERE t = '…123'` matches it** (false positive — it

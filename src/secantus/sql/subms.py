@@ -131,3 +131,85 @@ def has_subms(value: Any) -> bool:
     signal that a comparison against it cannot be answered by the stored date
     alone."""
     return isinstance(value, _dt.datetime) and bool(value.microsecond % 1000)
+
+
+def _companion_cmp(companion: str, op: str, remainder: int) -> dict[str, Any]:
+    """Compare the *companion* against ``remainder``, honouring the invariant
+    that an ABSENT companion means a remainder of zero.
+
+    Mongo's `{f: None}` matches missing-or-null, which is how "remainder is 0"
+    is expressed; `$gt` / `$lt` on a missing field match nothing, so the
+    zero-remainder cases have to be spelled out rather than left to the
+    operator.
+    """
+    if op == "$eq":
+        # Zero remainder: the companion must be absent, not merely <= 0. This is
+        # the false-positive half of the bug — `t = '…123'` matched a row storing
+        # `…123456`, because only the truncated field was compared.
+        return {companion: remainder} if remainder else {companion: None}
+    if op == "$gt":
+        # Nothing is greater than the maximum, and a missing companion (0) is
+        # never greater than a remainder >= 0.
+        return {companion: {"$gt": remainder}}
+    if op == "$gte":
+        if remainder == 0:
+            return {}  # every remainder is >= 0
+        return {companion: {"$gte": remainder}}
+    if op == "$lt":
+        if remainder == 0:
+            return _MATCH_NOTHING  # no remainder is < 0
+        return {"$or": [{companion: {"$lt": remainder}}, {companion: None}]}
+    if op == "$lte":
+        if remainder == 0:
+            return {companion: None}  # only a zero remainder is <= 0
+        return {"$or": [{companion: {"$lte": remainder}}, {companion: None}]}
+    raise ValueError(f"unsupported companion comparison {op!r}")
+
+
+#: A filter that matches no document (Mongo has no literal false).
+_MATCH_NOTHING: dict[str, Any] = {"$nor": [{}]}
+
+
+def cmp_filter(field: str, op: str, value: Any) -> dict[str, Any] | None:
+    """Lower ``field <op> value`` so the sub-millisecond remainder participates.
+
+    Returns ``None`` when the plain filter is already correct — a non-datetime
+    value, or one that lands on a whole millisecond for an operator whose
+    truncated form is exact.
+
+    Comparisons used to see only the truncated field, which was wrong in *both*
+    directions against a stored `…00.123456`: `= '…123456'` matched nothing (a
+    row failing an equality on its own stored value) while `= '…123'` matched
+    it. Ordering compares the millisecond first and the remainder only within
+    the same millisecond, which is what these `$or` shapes say.
+    """
+    if not isinstance(value, _dt.datetime):
+        return None
+    trunc, remainder = split(value)
+    companion = companion_field(field)
+
+    if op == "$eq":
+        return {"$and": [{field: trunc}, _companion_cmp(companion, "$eq", remainder)]}
+    if op == "$ne":
+        # `<>` must still exclude NULL/missing rows, which the caller guards;
+        # here we only negate the positive match.
+        return {"$nor": [{"$and": [{field: trunc}, _companion_cmp(companion, "$eq", remainder)]}]}
+    if op in ("$gt", "$gte"):
+        same_ms = _companion_cmp(companion, op, remainder)
+        return {
+            "$or": [
+                {field: {"$gt": trunc}},
+                {"$and": [{field: trunc}, same_ms]} if same_ms else {field: trunc},
+            ]
+        }
+    if op in ("$lt", "$lte"):
+        same_ms = _companion_cmp(companion, op, remainder)
+        if same_ms == _MATCH_NOTHING:
+            return {field: {"$lt": trunc}}
+        return {
+            "$or": [
+                {field: {"$lt": trunc}},
+                {"$and": [{field: trunc}, same_ms]} if same_ms else {field: trunc},
+            ]
+        }
+    return None

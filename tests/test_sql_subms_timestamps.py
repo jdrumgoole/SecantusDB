@@ -13,6 +13,7 @@ set or clear it.
 from __future__ import annotations
 
 import datetime as dt
+import os
 
 import pytest
 
@@ -142,22 +143,92 @@ class TestRoundTrip:
         assert "__us_t" not in [c.name for c in res.columns]
 
 
-def test_comparisons_remain_millisecond_blind(table):
-    """A KNOWN limitation, pinned so it stays visible.
+def test_comparisons_are_microsecond_exact(table):
+    """Comparisons see the remainder, not just the truncated millisecond.
 
-    The stored date is still truncated, so a WHERE/ORDER BY on a timestamp
-    column is answered at millisecond granularity — a sub-millisecond literal
-    matches nothing, exactly as it did before this representation existed.
-    Closing it means lowering comparisons against BOTH fields (and adding the
-    companion as a sort tiebreaker); until then the read path is precise and
-    the predicate path is not.
+    This test previously asserted the *opposite* — it was named
+    `test_comparisons_remain_millisecond_blind` and pinned the limitation "so it
+    stays visible", which meant it also pinned two wrong answers: a row failed an
+    equality on its own stored value, and matched a value it was not equal to.
+    Comparisons now lower against both the truncated field and the companion
+    (`subms.cmp_filter`), verified against a live PostgreSQL 14 across 42
+    predicate/literal combinations.
+
+    ORDER BY within a single millisecond is still millisecond-granular — the
+    companion is not yet a sort tiebreaker. That half remains open.
     """
     storage, session = table
     run(storage, session, f"INSERT INTO ts VALUES (1, '{US.isoformat(sep=' ')}')")
-    assert (
-        run(storage, session, f"SELECT id FROM ts WHERE t = '{US.isoformat(sep=' ')}'").rows == []
-    )
-    # The truncated literal does match — which is what the pushdown compares.
-    assert run(storage, session, "SELECT id FROM ts WHERE t = '2026-08-18 12:00:00.123'").rows == [
+    # A row matches an equality on its own stored value...
+    assert run(storage, session, f"SELECT id FROM ts WHERE t = '{US.isoformat(sep=' ')}'").rows == [
         (1,)
     ]
+    # ...and does NOT match the truncated literal it is not equal to.
+    assert run(storage, session, "SELECT id FROM ts WHERE t = '2026-08-18 12:00:00.123'").rows == []
+    # Ordering compares the millisecond first, the remainder only within it.
+    assert run(storage, session, "SELECT id FROM ts WHERE t > '2026-08-18 12:00:00.123'").rows == [
+        (1,)
+    ]
+    assert run(storage, session, "SELECT id FROM ts WHERE t < '2026-08-18 12:00:00.123'").rows == []
+    assert run(storage, session, "SELECT id FROM ts WHERE t <> '2026-08-18 12:00:00.123'").rows == [
+        (1,)
+    ]
+
+
+# --- differential against a real PostgreSQL, when one is reachable -----------
+
+_PG_DSN = os.environ.get("SECANTUS_PG_ORACLE_DSN", "host=127.0.0.1 port=5432 dbname=postgres")
+
+
+def _pg_oracle():
+    """A live PostgreSQL connection, or None. Never fails the suite."""
+    try:
+        import psycopg
+
+        return psycopg.connect(_PG_DSN, autocommit=True, connect_timeout=3)
+    except Exception:  # noqa: BLE001 — absence is the normal case in CI
+        return None
+
+
+@pytest.mark.skipif(_pg_oracle() is None, reason="no local PostgreSQL oracle")
+def test_subms_predicates_match_real_postgres(table):
+    """Every comparison shape answered exactly as PostgreSQL answers it.
+
+    The hand-derived expectations above say what we believe; this says what
+    PostgreSQL actually does. Skipped when no server is reachable, so it adds
+    coverage where one exists without making the suite depend on it.
+    Point it elsewhere with SECANTUS_PG_ORACLE_DSN.
+    """
+
+    storage, session = table
+    rows = [
+        "2026-08-18 12:00:00.000000",
+        "2026-08-18 12:00:00.000500",
+        "2026-08-18 12:00:00.123000",
+        "2026-08-18 12:00:00.123456",
+        "2026-08-18 12:00:00.123999",
+        "2026-08-18 12:00:00.124000",
+    ]
+    for i, v in enumerate(rows):
+        run(storage, session, f"INSERT INTO ts VALUES ({i}, '{v}')")
+
+    pg = _pg_oracle()
+    assert pg is not None
+    try:
+        pg.execute("drop table if exists subms_oracle")
+        pg.execute("create table subms_oracle (id int, t timestamp)")
+        for i, v in enumerate(rows):
+            pg.execute("insert into subms_oracle values (%s, %s)", (i, v))
+
+        literals = [rows[0], rows[1], "2026-08-18 12:00:00.123", rows[3], rows[4], rows[5]]
+        for op in ("=", "<>", ">", ">=", "<", "<="):
+            for lit in literals:
+                ours = run(
+                    storage, session, f"SELECT id FROM ts WHERE t {op} '{lit}' ORDER BY id"
+                ).rows
+                theirs = pg.execute(
+                    f"select id from subms_oracle where t {op} '{lit}' order by id"
+                ).fetchall()
+                assert [r[0] for r in ours] == [r[0] for r in theirs], f"t {op} '{lit}'"
+    finally:
+        pg.close()

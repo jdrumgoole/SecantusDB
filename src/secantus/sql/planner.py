@@ -586,6 +586,21 @@ def _default_col_scope(node: Any) -> Any:
 # WHERE -> Mongo filter
 # ---------------------------------------------------------------------------
 
+
+def _subms_cmp(field: str, op: str, value: Any, tag: str | None) -> dict[str, Any] | None:
+    """Sub-millisecond-aware comparison filter, or None to use the plain one.
+
+    A `timestamp` / `timestamptz` is stored truncated to whole milliseconds with
+    the remainder in a hidden companion (see `secantus.sql.subms`), so a
+    comparison that looks only at the stored field is blind to the last three
+    digits. Dotted paths are excluded for the same reason writes are: the
+    companion is only maintained for top-level fields.
+    """
+    if tag not in subms.SUBMS_TAGS or "." in field:
+        return None
+    return subms.cmp_filter(field, op, value)
+
+
 _CMP_OPS: dict[type, tuple[str, str]] = {
     # exp class -> (operator, operator-when-column-is-on-the-right)
     exp.GT: ("$gt", "$lt"),
@@ -1337,7 +1352,9 @@ def _expr_to_filter(
             field, tag = _field(pair[0], resolve)
             if tag == "citext":
                 return _citext_cmp_filter(field, "$eq", _literal(pair[1]))
-            return {field: typemap.coerce(_literal(pair[1]), tag)}
+            value = typemap.coerce(_literal(pair[1]), tag)
+            sub = _subms_cmp(field, "$eq", value, tag)
+            return sub if sub is not None else {field: value}
         return _null_guarded_expr_cmp("$eq", left, right, resolve)
 
     if isinstance(node, exp.NEQ):
@@ -1350,7 +1367,9 @@ def _expr_to_filter(
             # SQL ``<>`` is unknown (not true) for a NULL operand; Mongo's bare
             # ``$ne`` would match NULL/missing rows, so guard the field non-null.
             value = typemap.coerce(_literal(pair[1]), tag)
-            return {"$and": [{field: {"$ne": value}}, {field: {"$ne": None}}]}
+            sub = _subms_cmp(field, "$ne", value, tag)
+            negated = sub if sub is not None else {field: {"$ne": value}}
+            return {"$and": [negated, {field: {"$ne": None}}]}
         return _null_guarded_expr_cmp("$ne", left, right, resolve)
 
     for cls, (op, flipped) in _CMP_OPS.items():
@@ -1360,12 +1379,16 @@ def _expr_to_filter(
                 field, tag = _field(left, resolve)
                 if tag == "citext":
                     return _citext_cmp_filter(field, op, _literal(right))
-                return {field: {op: typemap.coerce(_literal(right), tag)}}
+                value = typemap.coerce(_literal(right), tag)
+                sub = _subms_cmp(field, op, value, tag)
+                return sub if sub is not None else {field: {op: value}}
             if _is_field_node(right) and _is_literalish(left):
                 field, tag = _field(right, resolve)
                 if tag == "citext":
                     return _citext_cmp_filter(field, flipped, _literal(left))
-                return {field: {flipped: typemap.coerce(_literal(left), tag)}}
+                value = typemap.coerce(_literal(left), tag)
+                sub = _subms_cmp(field, flipped, value, tag)
+                return sub if sub is not None else {field: {flipped: value}}
             return _null_guarded_expr_cmp(_EXPR_CMP[cls], left, right, resolve)
 
     if isinstance(node, exp.In):
