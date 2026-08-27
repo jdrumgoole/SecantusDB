@@ -62,6 +62,14 @@ class _Entry:
     # so ``kill_namespace`` leaves them untouched (it must not tombstone them
     # like a plain capped tailable).
     change_stream: bool = False
+    # True when the result set's size is KNOWN to the client-visible query --
+    # an explicit ``limit`` or ``singleBatch``. mongod closes such a cursor the
+    # moment the bound is reached, because nothing can follow. Without a bound
+    # it cannot know, so a batch that exactly fills ``batchSize`` leaves the
+    # cursor OPEN and costs one more empty ``getMore``. We hold the whole result
+    # in memory and therefore always "know" -- this flag is what stops us acting
+    # on knowledge mongod does not have.
+    bounded: bool = False
     # Set when the cursor's collection is dropped out from under a plain
     # (non-change-stream) tailable cursor (see ``kill_namespace``). The next
     # ``getMore`` surfaces a ``QueryPlanKilled`` "collection dropped" error
@@ -119,7 +127,13 @@ class CursorRegistry:
             del self._cursors[cid]
         self._last_prune = now
 
-    def register(self, namespace: str, remaining: list[dict[str, Any]]) -> int:
+    def register(
+        self,
+        namespace: str,
+        remaining: list[dict[str, Any]],
+        *,
+        bounded: bool = False,
+    ) -> int:
         with self._lock:
             self._prune_locked()
             if len(self._cursors) >= self.max_cursors:
@@ -136,7 +150,9 @@ class CursorRegistry:
                     break
             else:
                 raise RuntimeError("could not mint unique cursor id")
-            self._cursors[cursor_id] = _Entry(cursor_id, namespace, list(remaining), self._time())
+            self._cursors[cursor_id] = _Entry(
+                cursor_id, namespace, list(remaining), self._time(), bounded=bounded
+            )
             return cursor_id
 
     def register_tailable(
@@ -206,8 +222,18 @@ class CursorRegistry:
             entry = self._cursors.get(cursor_id)
             if entry is None:
                 raise CursorNotFound(cursor_id)
+            # A non-positive ``batchSize`` on getMore means "server default",
+            # i.e. the client named no size at all. Probed on mongod 8.3.4: it
+            # then drains the cursor AND closes it, because "the batch exactly
+            # filled the request" is meaningless when nothing was requested.
+            explicit_request = batch_size > 0
             if batch_size <= 0:
                 batch_size = len(entry.remaining)
+            # The size the CLIENT asked for, captured before the byte budget
+            # below can shrink ``batch_size`` to what actually fit. Comparing
+            # against the shrunk value made a short final batch look "full" and
+            # kept the cursor open for an extra empty round trip.
+            requested = batch_size
             if max_bytes is not None:
                 # Byte-budget the batch like mongod's 16MB reply cap: stop
                 # before the doc that would overflow, but always take at least
@@ -223,7 +249,19 @@ class CursorRegistry:
                 batch_size = take
             batch = entry.remaining[:batch_size]
             entry.remaining = entry.remaining[batch_size:]
-            exhausted = not entry.remaining
+            # mongod closes a cursor only when it KNOWS the result is finished:
+            # the batch came up short, or a `limit`/`singleBatch` bounded it. A
+            # batch that exactly fills the requested size proves nothing, so the
+            # cursor stays open and the client spends one more getMore to see an
+            # empty batch. We buffer the whole result and so could close early --
+            # doing that made our round-trip count differ from mongod's, which
+            # drivers observe directly (mongo-go-driver asserts on exactly that).
+            # ``not batch`` closes the trailing empty batch regardless of what
+            # was requested -- without it a zero-sized request against an empty
+            # buffer would leave the cursor open forever.
+            exhausted = not entry.remaining and (
+                entry.bounded or not explicit_request or not batch or len(batch) < requested
+            )
             if entry.tailable:
                 # Tailable cursors persist across empty batches.
                 entry.last_access = self._time()

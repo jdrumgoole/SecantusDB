@@ -566,7 +566,19 @@ def _split_into_cursor(
     batch_size: int,
     namespace: str,
     cursors: CursorRegistry,
+    *,
+    bounded: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
+    """Split ``docs`` into a first batch plus a cursor for the rest.
+
+    ``bounded`` says the result's size is knowable to the server up front, so a
+    batch that exactly drains it closes the cursor. Probed on mongod 8.3.4 and
+    the answer is NOT uniform across commands: ``listIndexes`` / ``listCollections``
+    close on an exact-fill batch (they enumerate a known catalog), while ``find``
+    and ``aggregate`` keep the cursor open and spend one more empty ``getMore``
+    (they cannot know a collection scan is finished until it comes up short).
+    A ``find`` with ``limit`` / ``singleBatch`` is bounded again.
+    """
     # ``batch_size == 0`` is a real value, not a "use default":
     # MongoDB defines it as "open the cursor with an empty
     # firstBatch and let the client pull via getMore". A cursor id
@@ -594,9 +606,15 @@ def _split_into_cursor(
         take = fitted
     first = docs[:take]
     remaining = docs[take:]
-    if not remaining:
+    # A batch that exactly fills the requested size proves nothing about what
+    # follows, so an unbounded cursor stays open even with nothing left -- the
+    # client spends one more getMore to see the empty batch, exactly as against
+    # mongod. Closing early made our round-trip counts differ, which drivers
+    # observe directly.
+    filled_exactly = batch_size > 0 and len(first) == batch_size
+    if not remaining and (bounded or not filled_exactly):
         return first, 0
-    cursor_id = cursors.register(namespace, remaining)
+    cursor_id = cursors.register(namespace, remaining, bounded=bounded)
     return first, cursor_id
 
 
@@ -2408,7 +2426,12 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if single_batch:
         first_batch, cursor_id = docs, 0
     else:
-        first_batch, cursor_id = _split_into_cursor(docs, batch_size, ns, ctx.cursors)
+        # A positive ``limit`` bounds the result, so mongod closes the cursor
+        # the moment the limit is reached rather than spending a trailing empty
+        # getMore (probed: `4 docs, batchSize 2, limit 4` -> [2, 2], id 0).
+        first_batch, cursor_id = _split_into_cursor(
+            docs, batch_size, ns, ctx.cursors, bounded=limit > 0
+        )
     return {
         # Cursor `id` MUST be int64 — the Go driver hard-fails int32 here.
         "cursor": {"firstBatch": first_batch, "id": bson.Int64(cursor_id), "ns": ns},
@@ -3546,7 +3569,7 @@ def _list_collections(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any
         raw_batch_size = doc.get("batchSize")
     batch_size = DEFAULT_BATCH_SIZE if raw_batch_size is None else int(raw_batch_size)
     ns = f"{ctx.db_name}.$cmd.listCollections"
-    first_batch, cursor_id = _split_into_cursor(batch, batch_size, ns, ctx.cursors)
+    first_batch, cursor_id = _split_into_cursor(batch, batch_size, ns, ctx.cursors, bounded=True)
 
     return {
         "cursor": {
@@ -3678,7 +3701,7 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # `db.$cmd.listCollections` on mongod, and the collectionless `aggregate: 1`
     # form, which really is `db.$cmd.aggregate` -- both already correct here.
     ns = _ns(ctx.db_name, coll)
-    first_batch, cursor_id = _split_into_cursor(indexes, batch_size, ns, ctx.cursors)
+    first_batch, cursor_id = _split_into_cursor(indexes, batch_size, ns, ctx.cursors, bounded=True)
     return {
         "cursor": {
             "firstBatch": first_batch,
