@@ -586,6 +586,21 @@ def _default_col_scope(node: Any) -> Any:
 # WHERE -> Mongo filter
 # ---------------------------------------------------------------------------
 
+
+def _subms_cmp(field: str, op: str, value: Any, tag: str | None) -> dict[str, Any] | None:
+    """Sub-millisecond-aware comparison filter, or None to use the plain one.
+
+    A `timestamp` / `timestamptz` is stored truncated to whole milliseconds with
+    the remainder in a hidden companion (see `secantus.sql.subms`), so a
+    comparison that looks only at the stored field is blind to the last three
+    digits. Dotted paths are excluded for the same reason writes are: the
+    companion is only maintained for top-level fields.
+    """
+    if tag not in subms.SUBMS_TAGS or "." in field:
+        return None
+    return subms.cmp_filter(field, op, value)
+
+
 _CMP_OPS: dict[type, tuple[str, str]] = {
     # exp class -> (operator, operator-when-column-is-on-the-right)
     exp.GT: ("$gt", "$lt"),
@@ -1337,7 +1352,9 @@ def _expr_to_filter(
             field, tag = _field(pair[0], resolve)
             if tag == "citext":
                 return _citext_cmp_filter(field, "$eq", _literal(pair[1]))
-            return {field: typemap.coerce(_literal(pair[1]), tag)}
+            value = typemap.coerce(_literal(pair[1]), tag)
+            sub = _subms_cmp(field, "$eq", value, tag)
+            return sub if sub is not None else {field: value}
         return _null_guarded_expr_cmp("$eq", left, right, resolve)
 
     if isinstance(node, exp.NEQ):
@@ -1350,7 +1367,9 @@ def _expr_to_filter(
             # SQL ``<>`` is unknown (not true) for a NULL operand; Mongo's bare
             # ``$ne`` would match NULL/missing rows, so guard the field non-null.
             value = typemap.coerce(_literal(pair[1]), tag)
-            return {"$and": [{field: {"$ne": value}}, {field: {"$ne": None}}]}
+            sub = _subms_cmp(field, "$ne", value, tag)
+            negated = sub if sub is not None else {field: {"$ne": value}}
+            return {"$and": [negated, {field: {"$ne": None}}]}
         return _null_guarded_expr_cmp("$ne", left, right, resolve)
 
     for cls, (op, flipped) in _CMP_OPS.items():
@@ -1360,12 +1379,16 @@ def _expr_to_filter(
                 field, tag = _field(left, resolve)
                 if tag == "citext":
                     return _citext_cmp_filter(field, op, _literal(right))
-                return {field: {op: typemap.coerce(_literal(right), tag)}}
+                value = typemap.coerce(_literal(right), tag)
+                sub = _subms_cmp(field, op, value, tag)
+                return sub if sub is not None else {field: {op: value}}
             if _is_field_node(right) and _is_literalish(left):
                 field, tag = _field(right, resolve)
                 if tag == "citext":
                     return _citext_cmp_filter(field, flipped, _literal(left))
-                return {field: {flipped: typemap.coerce(_literal(left), tag)}}
+                value = typemap.coerce(_literal(left), tag)
+                sub = _subms_cmp(field, flipped, value, tag)
+                return sub if sub is not None else {field: {flipped: value}}
             return _null_guarded_expr_cmp(_EXPR_CMP[cls], left, right, resolve)
 
     if isinstance(node, exp.In):
@@ -10809,9 +10832,25 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         return "numeric"
     srf = _srf_of(node)
     if srf is not None:
-        # jsonb_array_elements → json elements; jsonb_object_keys → text keys;
-        # unnest(indkey/indclass) → attnum/opclass oid; generate_subscripts → ord.
-        return {"jsonb_array_elements": "json", "jsonb_object_keys": "text"}.get(srf[0], "int4")
+        kind, array_expr = srf
+        # jsonb_array_elements → json elements; jsonb_object_keys → text keys.
+        fixed = {"jsonb_array_elements": "json", "jsonb_object_keys": "text"}.get(kind)
+        if fixed is not None:
+            return fixed
+        # A subscript is an int whatever the array holds.
+        if kind == "generate_subscripts" or kind.endswith("._n") or kind.endswith(".n"):
+            return "int4"
+        # `unnest(arr)` and `(_pg_expandarray(arr)).x` yield the array's ELEMENT
+        # type. This used to default to int4 for every array, which is a wire
+        # lie for anything else: the server declared int4 in the RowDescription
+        # and then sent `a` / `1.5` / `t`, so a strict client did `int('a')` and
+        # died. Only integer arrays worked, and only by luck.
+        elem = _infer_scalar_tag(array_expr, resolve)
+        if elem and elem.endswith("[]"):
+            return elem[:-2]
+        # Unknown element type: `any` lets the wire pick text rather than
+        # asserting a type the values may not honour.
+        return elem or "any"
     # A boolean-producing expression (IS NOT NULL, comparisons, AND/OR) must type
     # as bool, not text — else its value rides the wire as the string 'f'/'t' and
     # a driver reads ``if row["x"]`` as truthy (SQLAlchemy's duplicates_constraint).

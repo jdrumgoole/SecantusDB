@@ -10,6 +10,8 @@ gauge, and what ``UpdateableResultTest`` needs to identify a row to update.
 
 from __future__ import annotations
 
+import decimal
+
 import pytest
 
 from secantus.sql.engine import run_sql
@@ -122,3 +124,38 @@ class TestTheDriverQuery:
         # The whole record is carried as a composite, so the outer query can
         # still read a field off it.
         assert by_column["a"][5] == {"x": 1, "n": 1}
+
+
+class TestSrfElementTypes:
+    """`unnest` declares the ARRAY'S ELEMENT type, not a hardcoded int4.
+
+    The declared type used to be `int4` for every array, which is a wire lie for
+    anything else: the RowDescription said int4 and the server then sent `a` /
+    `1.5` / `t`, so a strict client did `int('a')` and raised
+    `ValueError: invalid literal for int() with base 10: 'a'` — client-side, in
+    psycopg, before the application ever saw a row. Only integer arrays worked,
+    and only by luck. Verified against a live PostgreSQL 14.
+    """
+
+    def test_text_array_elements_are_text(self, q):
+        assert q("SELECT unnest(ARRAY['a', 'b']) FROM src") == [("a",), ("b",)]
+
+    def test_numeric_array_elements_are_numeric(self, q):
+        assert q("SELECT unnest(ARRAY[1.5, 2.5]) FROM src") == [
+            (decimal.Decimal("1.5"),),
+            (decimal.Decimal("2.5"),),
+        ]
+
+    def test_bool_array_elements_are_bool(self, q):
+        assert q("SELECT unnest(ARRAY[true, false]) FROM src") == [(True,), (False,)]
+
+    def test_int_array_still_works(self, q):
+        assert q("SELECT unnest(ARRAY[9, 8]) FROM src") == [(9,), (8,)]
+
+    def test_a_subscript_is_an_int_whatever_the_array_holds(self, q):
+        # generate_subscripts and `.n` yield the position, not an element.
+        assert q("SELECT generate_subscripts(ARRAY['a', 'b'], 1) FROM src") == [(1,), (2,)]
+        assert q("SELECT (information_schema._pg_expandarray(ARRAY['a', 'b'])).n FROM src") == [
+            (1,),
+            (2,),
+        ]

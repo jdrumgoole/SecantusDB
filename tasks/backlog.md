@@ -3771,7 +3771,19 @@ shared storage engine or building large new protocol subsystems:
   that was never stored).
 
   **Still open, in rough order of value:**
-  1. **Predicates are millisecond-blind — and wrong in BOTH directions.**
+  1. **Predicates — FIXED 2026-08-27.** Comparisons now lower against both the
+     truncated field and the `__us_` companion (`subms.cmp_filter`, wired into
+     the planner's EQ / NEQ / range sites), so `=`, `<>`, `<`, `<=`, `>`, `>=`
+     are microsecond-exact. Verified against a **live PostgreSQL 14** across 42
+     predicate/literal combinations over 8 rows — zero divergence — and pinned by
+     `test_subms_predicates_match_real_postgres`, which skips when no server is
+     reachable. Note `tests/test_sql_subms_timestamps.py` previously carried
+     `test_comparisons_remain_millisecond_blind`, which pinned the limitation
+     "so it stays visible" and thereby pinned two *wrong answers*; it is now
+     `test_comparisons_are_microsecond_exact`. **Still open here: ORDER BY**
+     within a single millisecond, which needs the companion as a sort
+     tiebreaker. Original note follows.
+     ~~Predicates are millisecond-blind — and wrong in BOTH directions.~~
      Measured 2026-08-27 against a stored `…00.123456`: `WHERE t = '…123456'`
      matches nothing (false negative — a row fails an equality on its *own
      stored value*), **and `WHERE t = '…123'` matches it** (false positive — it
@@ -6835,6 +6847,38 @@ not be conflated.
 Pinned by `tests/test_sql_pg_expandarray.py::TestFieldSelection::
 test_order_by_does_not_sort_expanded_rows` so the current shape is visible
 rather than assumed correct.
+
+**Re-measured 2026-08-27 against a LIVE PostgreSQL 14** (one is running on this
+machine — `host=127.0.0.1 port=5432`, and `SECANTUS_PG_ORACLE_DSN` points the
+sub-ms oracle test at it; the same trick works for any SQL probe). The entry
+above is confirmed, and the probe found **two further divergences it does not
+mention**:
+
+- **`ORDER BY <srf-alias> DESC` ERRORS.** `SELECT unnest(ARRAY[7,9,8]) AS u FROM
+  src ORDER BY u DESC` answers `0A000 feature not supported`; PG answers
+  `9, 8, 7`. Erroring is arguably worse than the wrong order the entry
+  describes, and it is the shape a real query is most likely to use.
+- **`unnest` declared `int4` for EVERY array — FIXED 2026-08-27.** Chasing the
+  `.x` type led to a far worse bug one level up: `_infer_scalar_tag`'s SRF branch
+  returned a hardcoded `int4`, so `SELECT unnest(ARRAY['a','b'])` put `int4` in
+  the RowDescription and then sent `a`. psycopg did `int('a')` and raised
+  `ValueError: invalid literal for int() with base 10: 'a'` **client-side** —
+  the query failed outright for text, numeric and boolean arrays. Only integer
+  arrays worked, and only by luck. The branch now infers the array's element
+  type (and keeps `int4` for the subscript-yielding `generate_subscripts` /
+  `.n`). Verified against a live PostgreSQL 14 for text / numeric / bool / int;
+  pinned by `TestSrfElementTypes`.
+- **`_pg_expandarray(...).x` still comes back as TEXT (open).**
+  `SELECT (information_schema._pg_expandarray(ARRAY[9,8,7])).x` gives
+  `'9','8','7'` where PG gives ints; `.n` is correct. The element-type inference
+  above does NOT reach it — the record-SRF field projection is typed by a
+  different path that assigns `any` (`pg_oid` 0) before
+  `_infer_scalar_tag` is consulted, so finding that path is the work. Narrow: it
+  affects only the `.x` field of one `information_schema` helper, which is
+  pgjdbc's `DatabaseMetaData` route.
+
+`unnest` ordering (above) and `.x` typing remain; `unnest` element types, `.n`,
+and `generate_subscripts` match PG exactly.
 
 ## Unquoted identifiers are not case-folded (2026-08-02) — FIXED
 
