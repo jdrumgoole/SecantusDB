@@ -221,31 +221,183 @@ pub fn top(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "codeName": "Unauthorized",
         });
     }
-    const SECTIONS: [&str; 8] = [
-        "total",
-        "readLock",
-        "writeLock",
-        "queries",
-        "getmore",
-        "insert",
-        "update",
-        "remove",
-    ];
+    let stats = ctx.top_stats.clone();
     let storage = ctx.storage()?;
     let mut totals = doc! { "note": "all times in microseconds" };
     for db in storage.list_databases().map_err(command_error)? {
         for coll in storage.list_collections(&db).map_err(command_error)? {
+            let name = format!("{db}.{coll}");
+            let recorded = stats.as_ref().and_then(|s| s.snapshot_ns(&name));
             let mut ns = Document::new();
-            for section in SECTIONS {
-                ns.insert(section, doc! { "time": 0_i64, "count": 0_i64 });
+            for section in crate::topstats::TOP_SECTIONS {
+                let slot = recorded.as_ref().and_then(|r| r.get(section)).copied();
+                let slot = slot.unwrap_or_default();
+                ns.insert(section, doc! { "time": slot.micros, "count": slot.count });
             }
-            // `commands` is a section too; kept out of the array above only
-            // because the name would read oddly beside the per-op verbs.
-            ns.insert("commands", doc! { "time": 0_i64, "count": 0_i64 });
-            totals.insert(format!("{db}.{coll}"), ns);
+            totals.insert(name, ns);
         }
     }
     Ok(doc! { "totals": totals, "ok": 1.0 })
+}
+
+#[cfg(test)]
+mod top_counter_tests {
+    use super::*;
+    use crate::storage::{Storage, StorageError};
+    use crate::topstats::TopStats;
+    use std::sync::Arc;
+
+    /// Minimal catalog stub: `top` only walks databases and collections, so
+    /// the data-bearing methods are unreachable here.
+    struct OneCollection;
+    impl Storage for OneCollection {
+        fn list_databases(&self) -> Result<Vec<String>, StorageError> {
+            Ok(vec!["db".to_string()])
+        }
+        fn list_collections(&self, _db: &str) -> Result<Vec<String>, StorageError> {
+            Ok(vec!["c".to_string()])
+        }
+        fn insert(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _docs: Vec<Vec<u8>>,
+            _ordered: bool,
+        ) -> Result<(usize, Vec<Document>), StorageError> {
+            unreachable!("top does not insert")
+        }
+        fn update_matching(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _filter: &Document,
+            _update: &Document,
+            _multi: bool,
+            _upsert: bool,
+        ) -> Result<crate::storage::UpdateOutcome, StorageError> {
+            unreachable!("top does not update")
+        }
+        fn delete_matching(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _filter: &Document,
+            _limit: usize,
+        ) -> Result<usize, StorageError> {
+            unreachable!("top does not delete")
+        }
+        fn count_matching(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _filter: &Document,
+        ) -> Result<usize, StorageError> {
+            unreachable!("top does not count")
+        }
+        fn find(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _filter: &Document,
+            _sort: Option<&Document>,
+            _hint: Option<crate::storage::RawHint<'_>>,
+        ) -> Result<Vec<Vec<u8>>, StorageError> {
+            unreachable!("top does not find")
+        }
+    }
+
+    fn run_top(stats: Option<Arc<TopStats>>) -> Document {
+        let mut ctx = CommandContext::new(1).with_storage(Arc::new(OneCollection));
+        ctx.db_name = "admin".to_string();
+        if let Some(s) = stats {
+            ctx = ctx.with_top_stats(s);
+        }
+        let reply = top(&doc! {"top": 1}, &mut ctx).unwrap();
+        reply.get_document("totals").unwrap().clone()
+    }
+
+    #[test]
+    fn recorded_work_reaches_the_reply() {
+        let stats = Arc::new(TopStats::new());
+        stats.record("db.c", "insert", 100);
+        stats.record("db.c", "insert", 50);
+        stats.record("db.c", "find", 20);
+
+        let ns = run_top(Some(stats)).get_document("db.c").unwrap().clone();
+        assert_eq!(
+            ns.get_document("insert").unwrap().get_i64("count").unwrap(),
+            2
+        );
+        assert_eq!(
+            ns.get_document("insert").unwrap().get_i64("time").unwrap(),
+            150
+        );
+        assert_eq!(
+            ns.get_document("queries")
+                .unwrap()
+                .get_i64("count")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            ns.get_document("total").unwrap().get_i64("count").unwrap(),
+            3
+        );
+        assert_eq!(
+            ns.get_document("total").unwrap().get_i64("time").unwrap(),
+            170
+        );
+        // total == readLock + writeLock, as on mongod.
+        assert_eq!(
+            ns.get_document("readLock")
+                .unwrap()
+                .get_i64("count")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            ns.get_document("writeLock")
+                .unwrap()
+                .get_i64("count")
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn shape_is_unchanged_and_complete() {
+        let totals = run_top(Some(Arc::new(TopStats::new())));
+        assert_eq!(totals.get_str("note").unwrap(), "all times in microseconds");
+        let ns = totals.get_document("db.c").unwrap();
+        for section in crate::topstats::TOP_SECTIONS {
+            let sec = ns.get_document(section).unwrap();
+            assert!(sec.get_i64("time").is_ok(), "{section} missing time");
+            assert!(sec.get_i64("count").is_ok(), "{section} missing count");
+        }
+        assert_eq!(ns.len(), crate::topstats::TOP_SECTIONS.len());
+    }
+
+    #[test]
+    fn without_stats_every_counter_is_zero() {
+        // Off-server (unit-test) contexts have no counters wired; `top` must
+        // still answer with the full mongod shape rather than erroring.
+        let ns = run_top(None).get_document("db.c").unwrap().clone();
+        for section in crate::topstats::TOP_SECTIONS {
+            assert_eq!(
+                ns.get_document(section).unwrap().get_i64("count").unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn non_admin_db_is_still_refused() {
+        let mut ctx = CommandContext::new(1).with_storage(Arc::new(OneCollection));
+        ctx.db_name = "notadmin".to_string();
+        let reply = top(&doc! {"top": 1}, &mut ctx).unwrap();
+        assert_eq!(reply.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(reply.get_i32("code").unwrap(), 13);
+    }
 }
 
 #[cfg(test)]

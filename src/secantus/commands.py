@@ -39,7 +39,7 @@ from secantus.expressions import ExpressionError, UnknownExpressionOperatorError
 from secantus.failpoints import FailPointRegistry, is_resumable_change_stream_code
 from secantus.geo import GeoError
 from secantus.logbuf import LogBuffer
-from secantus.metrics import Metrics
+from secantus.metrics import TOP_SECTIONS, Metrics
 from secantus.projection import ProjectionError, apply_projection
 from secantus.query import QueryError, matches
 from secantus.rbac import (
@@ -1639,6 +1639,26 @@ def _server_status(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return base
 
 
+def _top_namespace_target(name: str, doc: Mapping[str, Any]) -> str | None:
+    """Collection this command acts on, or ``None`` if it isn't namespaced.
+
+    For most commands the first key's value IS the collection name. ``getMore``
+    is the exception: its first value is the cursor id and the collection rides
+    in ``collection``.
+    """
+    if name == "getMore":
+        # getMore's own value is the cursor id; the namespace rides alongside.
+        target = doc.get("collection")
+    elif name == "explain":
+        # mongod attributes an explain to the namespace of the explained
+        # command, which is nested one level down.
+        inner = doc.get("explain")
+        target = next(iter(inner.values()), None) if isinstance(inner, Mapping) else None
+    else:
+        target = doc.get(name)
+    return target if isinstance(target, str) and target else None
+
+
 def _top(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     """mongod-shaped ``top``: one entry per existing namespace.
 
@@ -1656,23 +1676,13 @@ def _top(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 13,
             "codeName": "Unauthorized",
         }
+    recorded = ctx.metrics.top_snapshot() if ctx.metrics is not None else {}
+    zero = {section: {"time": 0, "count": 0} for section in TOP_SECTIONS}
     totals: dict[str, Any] = {"note": "all times in microseconds"}
     for db in ctx.storage.list_databases():
         for coll in ctx.storage.list_collections(db):
-            totals[f"{db}.{coll}"] = {
-                section: {"time": 0, "count": 0}
-                for section in (
-                    "total",
-                    "readLock",
-                    "writeLock",
-                    "queries",
-                    "getmore",
-                    "insert",
-                    "update",
-                    "remove",
-                    "commands",
-                )
-            }
+            ns = f"{db}.{coll}"
+            totals[ns] = recorded.get(ns, zero)
     return {"totals": totals, "ok": 1.0}
 
 
@@ -7176,7 +7186,9 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             else:
                 ctx.transactions.on_retryable_write(lsid_bytes, txn_number)
     profile_eligible = _profile_eligible_command(name, doc)
-    start_ns = _time.monotonic_ns() if profile_eligible else 0
+    # Timed for the profiler and/or ``top``'s per-namespace counters.
+    _timed = profile_eligible or ctx.metrics is not None
+    start_ns = _time.monotonic_ns() if _timed else 0
     try:
         if txn is not None:
             result = _run_txn_statement(txn, handler, doc, ctx)
@@ -7244,6 +7256,19 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         _finish_txn_statement(ctx, txn, result)
     if profile_eligible:
         _maybe_record_profile(ctx, name, doc, result, start_ns)
+    if ctx.metrics is not None:
+        # ``top`` attributes work to a namespace, so only commands that name a
+        # collection count. mongod does the same -- ``ping`` / ``hello`` /
+        # ``serverStatus`` / ``listCollections`` never appear in its output.
+        _coll = _top_namespace_target(name, doc)
+        if _coll:
+            _ns = f"{ctx.db_name}.{_coll}"
+            ctx.metrics.record_namespace_op(_ns, name, (_time.monotonic_ns() - start_ns) // 1_000)
+            # A successful drop resets the namespace's counters -- probed on
+            # mongod 8.3.4, where a dropped-and-recreated collection restarts
+            # from zero rather than carrying its history forward.
+            if name == "drop" and result.get("ok", 0.0):
+                ctx.metrics.forget_namespace(_ns)
     if failpoint_wce is not None and result.get("ok", 0.0):
         result["writeConcernError"] = failpoint_wce
         if failpoint_labels:
