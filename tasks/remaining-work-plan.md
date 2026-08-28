@@ -1,8 +1,71 @@
 # Remaining work — a plan built on measurement, not on the backlog text
 
-> **Written 2026-08-27.** Read the "How this ages" section at the bottom before
-> trusting anything below. The dated *evidence* here is durable; the *priorities*
-> are a snapshot.
+> **Written 2026-08-27. State marked 2026-08-28.** Read the "How this ages"
+> section at the bottom before trusting anything below. The dated *evidence*
+> here is durable; the *priorities* are a snapshot.
+>
+> **Where we are:** Phase 0 **complete** (both halves). Phase 1 **~2 of 9 items**
+> substantially done. Phase 2 **not started**. 17 bugs fixed across the sweep,
+> six of them crash-class or silent wrong data.
+>
+> Phase 0 was scoped as bookkeeping and produced **six new bugs** alongside the
+> six stale claims it retired — so "verification" has been worth more than its
+> billing, and the per-item scoping in Phase 1 should still be treated as
+> provisional until each item is reproduced.
+
+## Start here on a fresh session
+
+Everything below assumes you have reproduced the item you are about to work.
+These are the things that cost time to rediscover.
+
+**Oracles — both are the point of this plan.**
+
+* `mongod` is on `PATH` (Homebrew `@6.0` symlink, reports 6.0.16). Start one on
+  `127.0.0.1:27019` and diff against it. `tests/test_mongod_differential.py`
+  (57 cases) is the standing harness; run it with `-m differential`.
+* **A live PostgreSQL 14 runs on this box** at `host=127.0.0.1 port=5432
+  dbname=postgres user=jdrumgoole`. `SECANTUS_PG_ORACLE_DSN` points
+  `test_subms_predicates_match_real_postgres` at it. It settled six SQL claims
+  in an afternoon; use it for every SQL question.
+
+**Provision a worktree venv COMPLETELY, including `_secantus_core`.** Its
+absence is silent: the 1600+ engine-parity tests do not collect and the suite
+still exits 0. That was caught only by comparing the pass count to a known
+baseline (6208 vs 7932). Recipe: `uv venv --python 3.12 .venv-test`, copy
+`wiredtiger/` from the main `.venv`, install the dev deps **plus** `anyio
+fastapi starlette trustme cryptography httpx pg8000 sqlalchemy
+sqlglot==30.12.0 psycopg[binary]==3.3.4`, then
+`uvx maturin build --release --manifest-path crates/secantus-core-py/Cargo.toml`
+and `uv pip install --reinstall` the wheel.
+
+**Gates that are easy to get wrong.**
+
+* `cargo clippy` is **not** `cargo test`. Both are needed after a Rust edit —
+  skipping the latter cost a red CI lane.
+* The WT-linked crates (`secantus-storage`, `-storage-adapter`, `-wt`,
+  `secantusdb`) are **excluded from the clean workspace**; gate them from their
+  own directories with `SECANTUS_WT_INCLUDE` / `SECANTUS_WT_LIB` pointed at a
+  built WT (`<repo>/build/*/wt-build`) and `LIBCLANG_PATH` at Xcode's.
+* Full suite: `PYTHONPATH=src .venv-test/bin/python -m pytest tests/ -n auto -q
+  --ignore=tests/test_perf_regression.py`. Expect ~8100 passed.
+* Never `pkill -f` by process name while a suite runs — it kills the suite's own
+  servers and invalidates the run.
+
+**Two failure patterns that recur, both greppable and both worth a sweep.**
+
+1. *A comment justifying behaviour by what the other engine does, rather than by
+   the oracle.* 4-for-4. The `$meta` defect was a single false claim — "mongod
+   result: just `_id`" — copied into both engines and then asserted by **eight
+   tests across three layers**. Parity stayed green because both engines were
+   wrong identically.
+2. *A test whose name or docstring asserts a limitation rather than a
+   behaviour.* 3-for-3. Expect to rewrite tests when closing a bug in this class;
+   they are pinning it.
+
+**"Flaky" is a description of a bug, not an excuse.** A Windows-only CI failure
+that looked environmental was `time.monotonic_ns()` at ~15.6 ms granularity
+making `top` report zero timings on that platform. It would have gone green on a
+re-run.
 
 ## Why this file exists rather than a longer backlog
 
@@ -56,22 +119,35 @@ array. Do not size an item without reproducing it.
 
 ---
 
-## Phase 0 — Verify before committing (do this first)
+## Phase 0 — Verify before committing — **COMPLETE (2026-08-28)**
 
 Cheap, and it has twice reclaimed more board than the work it replaced. Nothing
 below Phase 1 should start until its item is reproduced.
 
-- [ ] **Re-probe the Mongo-side classified items.** `top` counters, the C-driver
+- [x] **Re-probe the Mongo-side classified items — DONE.** `top` counters had
+      already been closed by another session (#1064); its *timings* were broken
+      on Windows and are fixed. `$meta` projection turned out **worse than
+      recorded** — it discarded the whole document — and is fixed. The remaining
+      named items (C-driver `writeConcernError`, change-stream `awaitData`,
+      multi-doc chunking, txn dirty-budget) are **not yet probed**; the first two
+      are externally visible, the last two need code-level checks.
+      *Original text:* `top` counters, the C-driver
       `writeConcernError` failure, `$meta` projection values, change-stream
       `awaitData` with no `maxTimeMS`, multi-document update/delete chunking
       (Python side), the user-transaction dirty-budget guard (Python side).
       Method: extend the three-way differential. Expect some to be stale.
-- [ ] **Re-probe the remaining SQL claims** against the live PostgreSQL:
+- [x] **Re-probe the remaining SQL claims — DONE.** 3 stale (deferred
+      constraints, catalog remainder, half the partial-index entry), 2 confirmed
+      (cross-type lenient pairs, `indpred`), and **3 new bugs** found and fixed
+      (`jsonb || jsonb` silent wrong data, `jsonb - key` crash, unsupported
+      operand pairs crash). *Original text:*
       `test_return_untyped[b]`, cross-type lenient pairs, the jsonb gap (core
       operators `@> ? ->> #> <@` were verified working — the named gap needs its
       specific case), the pgjdbc and pgx gauge tails, deferred constraints, the
       catalog remainder, partial-index `pg_get_expr`.
-- [ ] **Re-measure the five "Rust server errors where Python defers" entries.**
+- [x] **Re-measure the five "Rust server errors where Python defers" entries —
+      DONE (2026-08-26).** 42 of 45 constructs already correct; `$where` /
+      `$function` reclassified WONTFIX (need a JS engine). *Original text:*
       Measured ~90% closed. They should probably be rewritten or closed rather
       than worked.
 
@@ -84,23 +160,23 @@ than a map.
 
 Every item here was reproduced against an oracle in August 2026.
 
-### 1a. SQL/PostgreSQL correctness (highest density)
+### 1a. SQL/PostgreSQL correctness (highest density) — **2 of 7 done**
 
 | item | measured behaviour | note |
 |---|---|---|
-| `ORDER BY` over a set-returning function | array order, not sorted; **`ORDER BY <alias> DESC` errors `0A000`** where PG answers | the erroring shape is the one real queries use |
-| `_pg_expandarray(...).x` type | returns **text**, PG returns the element type | record-SRF field projection is typed by a path that assigns `any` *before* `_infer_scalar_tag`; finding that path is the work |
+| ~~`ORDER BY` over a set-returning function~~ **FIXED for `unnest`** (2026-08-28); the record-SRF field form still keeps array order | array order, not sorted; **`ORDER BY <alias> DESC` errors `0A000`** where PG answers | the erroring shape is the one real queries use |
+| `_pg_expandarray(...).x` type — **still open**; the attempt surfaced a *wider* bug (`unnest` declared `int4` for every array, failing outright on non-int ones) which **is** fixed | returns **text**, PG returns the element type | record-SRF field projection is typed by a path that assigns `any` *before* `_infer_scalar_tag`; finding that path is the work |
 | Write-conflict semantics | second writer gets `40001`; PG blocks and proceeds | clients that treat `40001` as fatal abort |
 | COPY OUT abort | transaction stays `INTRANS`; PG gives `INERROR` | needs interleaved client-abort detection |
 | `SET search_path` | recorded but ignored in name resolution | |
 | Partial-index reflection | `pg_indexes.indexdef` drops the `WHERE` clause | needs a Mongo-filter → SQL-predicate render |
-| `ORDER BY` within one millisecond | millisecond-granular | the *other half* of the sub-ms entry; predicates are fixed, sorting needs the companion as a tiebreaker |
+| `ORDER BY` within one millisecond — **still open**; sub-ms *predicates* are fixed (2026-08-27), the sort tiebreaker is not. Plan's cheapest next item | millisecond-granular | the *other half* of the sub-ms entry; predicates are fixed, sorting needs the companion as a tiebreaker |
 
 **Sequencing note.** The two SRF items are adjacent (same subsystem, and the
 `.x` path hunt likely surfaces the ORDER BY expansion point). Do them together.
 Sub-ms `ORDER BY` is adjacent to work already landed and should be cheap.
 
-### 1b. Mongo-side error fidelity
+### 1b. Mongo-side error fidelity — **0 of 2 done, 1 advanced**
 
 - [ ] **Aggregation runtime errors lack mongod's wrapper prefix.** Codes match;
       the message doesn't. mongod picks between
@@ -110,7 +186,7 @@ Sub-ms `ORDER BY` is adjacent to work already landed and should be cheap.
       reference doesn't (probed both ways on `$divide` and `$ln`). Closing it
       means modelling constant folding, for message text only.
       **Deliberately deferred**; listed so the analysis isn't redone.
-- [ ] **The Rust error-code class.** A construct the Rust engine can't do
+- [ ] **The Rust error-code class — PARTLY ADVANCED.** `update::arith_type_error` shipped as the worked template (2026-08-25); the class is not closed (e.g. `$densify` on a string still answers `BadValue` where mongod says `5733201`). A construct the Rust engine can't do
       surfaces as generic `BadValue` (2) rather than mongod's typed code — e.g.
       `$densify` on a string answers 2 where mongod answers 5733201.
       **`update::arith_type_error` is the worked template**: a standalone
@@ -121,7 +197,7 @@ Sub-ms `ORDER BY` is adjacent to work already landed and should be cheap.
 
 ---
 
-## Phase 2 — Keep the differential moving
+## Phase 2 — Keep the differential moving — **NOT STARTED**
 
 The differential's hit rate has been better than working the known list: eleven
 bugs from a handful of probes. These surfaces are **untouched**:

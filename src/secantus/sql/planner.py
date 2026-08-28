@@ -4394,6 +4394,14 @@ class EvaluatedSelectPlan:
     # ORDER BY index -> the enum's declared labels, when that ORDER BY term is an
     # enum column, so the executor sorts by declared order not lexically.
     enum_orders: dict[int, list[str]] = field(default_factory=dict)
+    # ORDER BY index -> the OUTPUT column index it refers to, when that output is
+    # produced by a set-returning function. Such a key cannot be computed from
+    # the source row: one row fans out to many, and every expanded row would
+    # share a single key (which is why `ORDER BY 1` over `unnest` used to return
+    # array order, and `ORDER BY <alias>` raised 0A000). The executor reads the
+    # key off the EXPANDED tuple instead. DISTINCT ON is deliberately NOT in
+    # here — that key is row-level and computed before expansion.
+    order_srf_output: dict[int, int] = field(default_factory=dict)
     # Rich ``JOIN LATERAL`` sources (subquery with its own join/group/aggregate),
     # expanded nested-loop per outer row by the executor after the pipeline runs.
     lateral_joins: list[LateralJoin] = field(default_factory=list)
@@ -4873,6 +4881,28 @@ def _ordered_set_agg(node: exp.Expression) -> tuple[str, float | None, exp.Expre
 #: SRF kinds that yield a composite record, so ``(srf(...)).field`` is valid on
 #: them. ``_srf_of`` tags those as ``"<kind>.<field>"``.
 _RECORD_SRF_KINDS = frozenset({"_pg_expandarray"})
+
+
+def _srf_output_index(
+    term: exp.Expression, out_exprs: list[exp.Expression], out_names: list[str]
+) -> int | None:
+    """The OUTPUT index an ORDER BY term names, when that output is an SRF.
+
+    `ORDER BY 1` (ordinal) and `ORDER BY u` (output alias / name) both resolve
+    onto the projection; when the target is a set-returning function the key has
+    to come from the *expanded* row, so the caller records the index rather than
+    substituting the expression. Returns None for every ordinary term.
+    """
+    if isinstance(term, exp.Literal) and not term.is_string and str(term.this).isdigit():
+        idx = int(term.this) - 1
+        if 0 <= idx < len(out_exprs) and _srf_of(out_exprs[idx]) is not None:
+            return idx
+        return None
+    if isinstance(term, exp.Column) and not term.table:
+        for idx, name in enumerate(out_names):
+            if name == term.name and idx < len(out_exprs) and _srf_of(out_exprs[idx]) is not None:
+                return idx
+    return None
 
 
 def _srf_of(node: exp.Expression) -> tuple[str, exp.Expression] | None:
@@ -5635,6 +5665,7 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
         if alias is not None:
             alias_exprs[alias] = inner
     order: list[tuple[exp.Expression, int, bool]] = []
+    order_srf_output: dict[int, int] = {}
     order_node = stmt.args.get("order")
     if order_node is not None:
         for o in order_node.expressions:
@@ -5642,16 +5673,20 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
             # 1-based output ordinal (``ORDER BY 1``) — Postgres resolves both
             # to that output expression, so sorting a computed column works.
             term = o.this
-            if isinstance(term, exp.Column) and not term.table and term.name in alias_exprs:
+            # An ORDER BY term that names an SRF-produced output is recorded by
+            # OUTPUT INDEX and resolved by the executor against the expanded
+            # tuple — it cannot be evaluated against the source row, where every
+            # expanded row would share one key.
+            srf_out = _srf_output_index(term, out_exprs, [n for n, _ in out_columns])
+            if srf_out is not None:
+                order_srf_output[len(order)] = srf_out
+            elif isinstance(term, exp.Column) and not term.table and term.name in alias_exprs:
                 term = alias_exprs[term.name]
             elif (
                 isinstance(term, exp.Literal)
                 and not term.is_string
                 and str(term.this).isdigit()
                 and 1 <= int(term.this) <= len(out_exprs)
-                # An SRF output can't be the sort key pre-expansion (one source
-                # row fans out to many); leave the ordinal to the executor.
-                and _srf_of(out_exprs[int(term.this) - 1]) is None
             ):
                 term = out_exprs[int(term.this) - 1]
             order.append((term, -1 if o.args.get("desc") else 1, _nulls_first(o)))
@@ -5662,6 +5697,7 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
         lambda node: table.column(_column_name(node)) if isinstance(node, exp.Column) else None,
     )
     return EvaluatedSelectPlan(
+        order_srf_output=order_srf_output,
         base_collection=table.collection,
         base_table=table,
         base_filter=base_filter,

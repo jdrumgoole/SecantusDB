@@ -7072,10 +7072,20 @@ sub-ms oracle test at it; the same trick works for any SQL probe). The entry
 above is confirmed, and the probe found **two further divergences it does not
 mention**:
 
-- **`ORDER BY <srf-alias> DESC` ERRORS.** `SELECT unnest(ARRAY[7,9,8]) AS u FROM
-  src ORDER BY u DESC` answers `0A000 feature not supported`; PG answers
-  `9, 8, 7`. Erroring is arguably worse than the wrong order the entry
-  describes, and it is the shape a real query is most likely to use.
+- **`ORDER BY` over `unnest` — FIXED 2026-08-28.** Both halves: `ORDER BY 1`
+  silently returned array order, and `ORDER BY <alias>` / `<alias> DESC` — the
+  shape a real query uses — answered `0A000 feature not supported`. One cause:
+  sort keys were computed per SOURCE row, *before* expansion, so every expanded
+  row shared a single key and a stable sort left array order untouched. Keys for
+  an SRF-produced output now come off the **expanded tuple**
+  (`EvaluatedSelectPlan.order_srf_output`, resolved in the executor's expansion
+  loop). `DISTINCT ON` deliberately stays row-level — the entry's own warning,
+  and its tests still pass. Verified against PostgreSQL 14 for ordinal, alias,
+  `DESC`, and text elements; pinned by `TestSrfOrdering`.
+  **Still open, narrower:** the *record*-SRF field form
+  `(information_schema._pg_expandarray(arr)).x` plans by a different route the
+  fix does not reach, so it keeps array order; and `(...).n AS n ... ORDER BY n`
+  answers `42703` (verified pre-existing, not introduced by the fix).
 - **`unnest` declared `int4` for EVERY array — FIXED 2026-08-27.** Chasing the
   `.x` type led to a far worse bug one level up: `_infer_scalar_tag`'s SRF branch
   returned a hardcoded `int4`, so `SELECT unnest(ARRAY['a','b'])` put `int4` in
