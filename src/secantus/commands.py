@@ -2248,6 +2248,12 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.storage import BadHint, MinMaxKeyError
 
     coll = doc["find"]
+    for _fld in ("limit", "skip", "batchSize"):
+        # mongod reports these under its IDL name, `FindCommandRequest.limit`,
+        # not `find.limit` -- probed, not guessed.
+        _err = _require_number_bson_field(doc.get(_fld), f"FindCommandRequest.{_fld}")
+        if _err is not None:
+            return _err
     for _fld in ("filter", "sort", "projection"):
         _err = _require_object_expected_field(doc.get(_fld), _fld)
         if _err is not None:
@@ -2814,7 +2820,7 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 ctx.db_name,
                 coll,
                 spec.get("q", {}),
-                limit=int(spec.get("limit", 0)),
+                limit=_delete_stmt_limit(spec.get("limit")),
                 let=let,
                 collation=spec.get("collation"),
                 journal=_wants_journal(doc),
@@ -2985,6 +2991,71 @@ def _require_object_bson_field(value: Any, field_path: str) -> dict[str, Any] | 
         "errmsg": (
             f"BSON field '{field_path}' is the wrong type "
             f"'{_bson_type_of(value)}', expected type 'object'"
+        ),
+        "code": 14,
+        "codeName": "TypeMismatch",
+    }
+
+
+_NUMERIC_TYPES_MSG = "'[long, int, decimal, double']"
+
+
+def _delete_stmt_limit(value: Any) -> int:
+    """A ``delete`` statement's ``limit``, mongod-style: 1 or unlimited.
+
+    mongod does NOT type-check this slot -- probed on 6.0.16, ``limit: {}`` /
+    ``"x"`` / ``[1]`` / ``0`` all succeed and delete every match, and only a
+    numeric ``1`` limits to one document. ``true`` counts as "not 1" even though
+    Python makes bool an int.
+
+    This is why the surrounding argument validation is per-slot rather than
+    per-class: the analogous ``find.limit`` IS a type error, so a blanket
+    "validate every numeric argument" rule would break this one. We used to call
+    ``int()`` on it and crash with "internal server error".
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)) and value == 1:
+        return 1
+    return 0
+
+
+def _require_number_bson_field(value: Any, field_path: str) -> dict[str, Any] | None:
+    """mongod's numeric-slot type error, or None if OK / absent.
+
+    The expected-types list is reproduced verbatim, unbalanced quotes and all:
+    mongod emits ``expected types '[long, int, decimal, double']``.
+
+    ``bool`` is rejected explicitly -- Python makes it a subclass of ``int``, so
+    without the guard ``limit: true`` would be read as ``limit: 1`` where mongod
+    answers "wrong type 'bool'".
+    """
+    if value is None:
+        return None
+    if not isinstance(value, bool) and isinstance(value, (int, float, bson.Decimal128)):
+        return None
+    return {
+        "ok": 0.0,
+        "errmsg": (
+            f"BSON field '{field_path}' is the wrong type "
+            f"'{_bson_type_of(value)}', expected types {_NUMERIC_TYPES_MSG}"
+        ),
+        "code": 14,
+        "codeName": "TypeMismatch",
+    }
+
+
+def _require_typed_bson_field(
+    value: Any, field_path: str, *, expected: str, ok: Callable[[Any], bool]
+) -> dict[str, Any] | None:
+    """mongod's singular ``expected type '<x>'`` form for one slot."""
+    if value is None or ok(value):
+        return None
+    return {
+        "ok": 0.0,
+        "errmsg": (
+            f"BSON field '{field_path}' is the wrong type "
+            f"'{_bson_type_of(value)}', expected type '{expected}'"
         ),
         "code": 14,
         "codeName": "TypeMismatch",
@@ -3767,6 +3838,14 @@ def _list_databases(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["listIndexes"]
+    _err = _require_typed_bson_field(
+        doc.get("cursor"),
+        "listIndexes.cursor",
+        expected="object",
+        ok=lambda v: isinstance(v, Mapping),
+    )
+    if _err is not None:
+        return _err
     indexes = ctx.storage.list_indexes(ctx.db_name, coll)
     if not indexes:
         return {
@@ -3848,6 +3927,14 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    _err = _require_typed_bson_field(
+        doc.get("indexes"),
+        "createIndexes.indexes",
+        expected="array",
+        ok=lambda v: isinstance(v, list),
+    )
+    if _err is not None:
+        return _err
     from secantus.storage import (
         CreateIndexUnsupported,
         GeoExtractError,
@@ -4503,6 +4590,19 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.storage import BadHint, IndexConflict
 
     coll = doc["aggregate"]
+    _cursor_opt = doc.get("cursor")
+    if _cursor_opt is not None and not isinstance(_cursor_opt, Mapping):
+        # mongod's own wording for this slot -- not the BSON-field form.
+        return {
+            "ok": 0.0,
+            "errmsg": "cursor field must be missing or an object",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    if isinstance(_cursor_opt, Mapping):
+        _err = _require_number_bson_field(_cursor_opt.get("batchSize"), "cursor.batchSize")
+        if _err is not None:
+            return _err
     pipeline = doc.get("pipeline", [])
     if not isinstance(pipeline, list):
         # A non-array pipeline reached the stage walker and crashed as
