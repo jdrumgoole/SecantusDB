@@ -51,6 +51,19 @@ timestamp *predicates*; jsonb operator gap. Plus the catalog's missing
 column-level reflection, `SET search_path` not affecting name resolution,
 deferred constraints unmodelled, and partial-index `pg_get_expr` rendering.
 
+**`top` timings were zero on Windows before 3.11 — FIXED 2026-08-28.** Not from
+a probe: CI's `windows/3.10` lane failed
+`test_top_counters.py::test_time_is_recorded_in_microseconds` with `assert 0 > 0`
+while the same commit was green locally and on `main`. Root cause is real, not a
+flake — `dispatch` measured with `time.monotonic_ns()`, which on Windows before
+3.11 is `GetTickCount64` at ~15.6 ms granularity, so any command faster than a
+tick measured ZERO elapsed and `// 1_000` reported 0 microseconds. `top`'s times
+were therefore useless on that platform, and the test caught it intermittently
+(it needs the insert to straddle a tick boundary to pass). Switched to
+`time.perf_counter_ns()`, the highest-resolution monotonic clock on every
+platform and the right one for measuring an interval. Introduced by #1064; found
+because a red CI lane was investigated rather than re-run.
+
 **Phase 0 SQL probe, 2026-08-28 — 3 more claims STALE, 3 NEW bugs found.**
 Ran every remaining SQL claim against the live PostgreSQL 14.
 

@@ -7227,7 +7227,14 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     profile_eligible = _profile_eligible_command(name, doc)
     # Timed for the profiler and/or ``top``'s per-namespace counters.
     _timed = profile_eligible or ctx.metrics is not None
-    start_ns = _time.monotonic_ns() if _timed else 0
+    # `perf_counter_ns`, not `monotonic_ns`: on Windows before 3.11,
+    # `time.monotonic()` is GetTickCount64 with ~15.6 ms granularity, so a fast
+    # command measures ZERO elapsed and `// 1_000` reports 0 microseconds. That
+    # made `top`'s times useless on that platform and failed
+    # `test_time_is_recorded_in_microseconds` intermittently on the
+    # windows/3.10 CI lane. `perf_counter` is the highest-resolution monotonic
+    # clock on every platform, which is what measuring an interval wants.
+    start_ns = _time.perf_counter_ns() if _timed else 0
     try:
         if txn is not None:
             result = _run_txn_statement(txn, handler, doc, ctx)
@@ -7302,7 +7309,9 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         _coll = _top_namespace_target(name, doc)
         if _coll:
             _ns = f"{ctx.db_name}.{_coll}"
-            ctx.metrics.record_namespace_op(_ns, name, (_time.monotonic_ns() - start_ns) // 1_000)
+            ctx.metrics.record_namespace_op(
+                _ns, name, (_time.perf_counter_ns() - start_ns) // 1_000
+            )
             # A successful drop resets the namespace's counters -- probed on
             # mongod 8.3.4, where a dropped-and-recreated collection restarts
             # from zero rather than carrying its history forward.
