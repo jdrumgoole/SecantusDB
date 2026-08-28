@@ -271,8 +271,8 @@ def test_meta_textscore_without_text_errors_40218() -> None:
 def test_meta_textscore_with_text_query_omits_field() -> None:
     doc = {"_id": 1, "a": 1}
     out = apply_projection(doc, {"score": {"$meta": "textScore"}}, {"$text": {"$search": "x"}})
-    # $meta field is omitted (not computed); inclusion projection keeps only _id.
-    assert out == {"_id": 1}
+    # The $meta field is omitted (not computed); the document is untouched.
+    assert out == {"_id": 1, "a": 1}
 
 
 def test_meta_textscore_with_nested_text_query() -> None:
@@ -282,14 +282,22 @@ def test_meta_textscore_with_nested_text_query() -> None:
         {"score": {"$meta": "textScore"}},
         {"$and": [{"a": 1}, {"$text": {"$search": "x"}}]},
     )
-    assert out == {"_id": 1}
+    assert out == {"_id": 1, "a": 1}
 
 
 def test_meta_recognized_unsupported_arg_omits_field() -> None:
+    """The `$meta` field is omitted, but the DOCUMENT is untouched.
+
+    These assertions used to read `{"_id": 1}`, i.e. `$meta` made the projection
+    inclusion-mode and discarded every other field. mongod treats `$meta` as a
+    value re-shaper that does not participate in inclusion/exclusion detection —
+    oracle-pinned 6.0.16: `find({}, {m: {$meta: "recordId"}})` answers the whole
+    document.
+    """
     doc = {"_id": 1, "a": 1, "b": 2}
     for arg in ("indexKey", "recordId", "sortKey"):
         out = apply_projection(doc, {"m": {"$meta": arg}})
-        assert out == {"_id": 1}
+        assert out == {"_id": 1, "a": 1, "b": 2}
 
 
 def test_meta_alongside_inclusion_field() -> None:
@@ -300,9 +308,11 @@ def test_meta_alongside_inclusion_field() -> None:
 
 
 def test_meta_excludes_id() -> None:
+    # `_id: 0` still drops the identifier, but the rest of the document stays —
+    # mongod-probed. This used to assert `{}`.
     doc = {"_id": 1, "a": 1}
     out = apply_projection(doc, {"_id": 0, "score": {"$meta": "recordId"}})
-    assert out == {}
+    assert out == {"a": 1}
 
 
 def test_validate_meta_projection_parse_time() -> None:

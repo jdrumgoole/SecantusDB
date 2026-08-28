@@ -2997,7 +2997,22 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   differ from mongod in the final ULP (e.g. `2.357022603955158` vs mongod's
   `2.3570226039551585`); mongod uses a different summation order. Precision-only,
   hard to match exactly — likely a permanent minor divergence.
-- [ ] **`$meta` projection values** (`{score: {$meta: "recordId"}}` / `"indexKey"` /
+- [ ] **OPEN (narrowed) — `$meta` projection values.** **A worse bug underneath
+  this one was FIXED 2026-08-28:** a `$meta` projection was treated as
+  *inclusion-mode*, so `find({}, {m: {$meta: "recordId"}})` answered `{_id: 1}`
+  — the caller's entire document silently discarded. mongod treats `$meta` as a
+  value re-shaper that does **not** participate in inclusion/exclusion
+  detection, exactly as `$slice` and positional already did here. Oracle-pinned
+  (6.0.16): meta-only → whole document; `_id: 0` + meta → whole document minus
+  `_id`; `a: 1` + meta → `{_id, a}`; `b: 0` + meta → exclusion. Both engines
+  fixed together — the Rust side carried the same wrong comment, which asserted
+  "result: just `_id`" as though it were mongod's behaviour. **What remains is
+  the original, narrower item:** the metadata value itself is not computed, so
+  the field is omitted where mongod returns a real `recordId` / `indexKey`
+  (`recordId` is now reachable — storage has one). Also `{$meta: "sortKey"}` in
+  a *find* projection answers rows where mongod errors code 2.
+
+  Original entry: (`{score: {$meta: "recordId"}}` / `"indexKey"` /
   `"sortKey"`) — the recognized-but-unsupported `$meta` args now validate clean on
   both servers and the field is **omitted** (partial, graceful degradation) rather
   than faithfully computed — mongod returns the actual index / record-id / sort-key
