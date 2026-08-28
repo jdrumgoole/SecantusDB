@@ -1,6 +1,6 @@
 # mongo-java-driver Validation Report
 
-Generated 2026-08-24 — SecantusDB 0.6.0b15 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
+Generated 2026-08-28 — SecantusDB 0.6.0b16 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
 
 Run `uv run python -m invoke validate-java` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver gauges for the official Java driver — the language enterprise MongoDB consumers most often use.
 
@@ -12,18 +12,17 @@ Run `uv run python -m invoke validate-java` to refresh. The pass rate is the ana
 
 | Module | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `driver-core__2` | 9 | 1 | 0 | 10 | 90.0% |
+| `driver-core__2` | 10 | 0 | 0 | 10 | 100.0% |
 | `driver-sync__0` | 360 | 0 | 400 | 760 | 100.0% |
 | `driver-sync__1` | 76 | 1 | 53 | 130 | 98.7% |
-| **Overall** | **445** | **2** | **453** | **900** | **99.6%** |
+| **Overall** | **446** | **1** | **453** | **900** | **99.8%** |
 
-## Failures (2)
+## Failures (1)
 
 First 30 failed tests for triage:
 
 ```
 driver-sync__1 :: com.mongodb.client.ClientMetadataTest#client metadata is not propagated to the server: metadata append does not create new connections or close existing ones and no hello command is sent
-driver-core__2 :: com.mongodb.client.model.GeoJsonFiltersFunctionalSpecification#$near
 ```
 
 ## How this is generated

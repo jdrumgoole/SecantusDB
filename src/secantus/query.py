@@ -810,8 +810,8 @@ def _parse_near_spec(
             cx, cy = geom["coordinates"]
             return (
                 (float(cx), float(cy)),
-                _opt_number(arg.get("$maxDistance"), "$maxDistance"),
-                _opt_number(arg.get("$minDistance"), "$minDistance"),
+                _opt_number(arg.get("$maxDistance", MISSING), "$maxDistance"),
+                _opt_number(arg.get("$minDistance", MISSING), "$minDistance"),
                 True,
                 False,  # GeoJSON form — distances are already in meters
             )
@@ -829,11 +829,11 @@ def _parse_near_spec(
         # from the siblings dict.
         if siblings is not None:
             if "$maxDistance" in siblings:
-                sibling_max = _opt_number(siblings["$maxDistance"], "$maxDistance")
+                sibling_max = _opt_number(siblings["$maxDistance"], "$maxDistance", code=16895)
                 if sibling_max is not None:
                     max_d = sibling_max
             if "$minDistance" in siblings:
-                min_d = _opt_number(siblings["$minDistance"], "$minDistance")
+                min_d = _opt_number(siblings["$minDistance"], "$minDistance", code=16893)
         # Legacy spec keeps the bound in its raw unit (input units for
         # ``$near``, radians-on-unit-sphere for ``$nearSphere``).
         # Conversion to the comparison currency (meters for spherical,
@@ -844,11 +844,30 @@ def _parse_near_spec(
     raise QueryError("$near must be a GeoJSON-shaped doc or a coordinate pair")
 
 
-def _opt_number(value: Any, label: str) -> float | None:
-    if value is None:
+def _opt_number(value: Any, label: str, code: int = 2) -> float | None:
+    """A ``$near`` distance bound, or ``None`` when the key is absent.
+
+    ``MISSING`` means the key was not supplied. An explicit ``null`` is NOT the
+    same thing -- probed on mongod 8.3.4, ``{$near: {..., $minDistance: null}}``
+    is rejected with ``$minDistance must be a number`` (code 2), where we used to
+    treat it as absent and run the query unbounded. Callers therefore pass
+    ``arg.get(key, MISSING)`` rather than ``arg.get(key)``.
+
+    Negative bounds are rejected too: mongod answers ``$minDistance must be
+    non-negative``. Strings and bools were already refused.
+
+    ``code`` differs by form, probed on mongod 8.3.4: the nested GeoJSON form
+    (``{$near: {$geometry: ..., $minDistance: x}}``) uses the generic BadValue
+    (2), while the legacy sibling form (``{geo: {$near: [x, y],
+    $maxDistance: x}}``) has dedicated codes -- 16895 for ``$maxDistance`` and
+    16893 for ``$minDistance``.
+    """
+    if value is MISSING:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise QueryError(f"{label} must be a number")
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise QueryError(f"{label} must be a number", code=code)
+    if value < 0:
+        raise QueryError(f"{label} must be non-negative", code=code)
     return float(value)
 
 
