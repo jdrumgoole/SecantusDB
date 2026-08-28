@@ -386,34 +386,56 @@ Specific items that were left out of the slice that introduced their feature are
   UNwrapped -- the wrapper must not spread to errors that do not depend on the
   stored document.
 
-- [ ] **OPEN — wrong-typed command arguments beyond the document class: 24 crashes
-  + 44 divergences (Python server).** The document-valued sweep landed (#1078,
+- [ ] **OPEN — wrong-typed command arguments beyond the document class: 0 crashes
+  + 42 divergences (Python server).** The document-valued sweep landed (#1078,
   56/56 clean, was 45 crashes). Extending it to more commands and to other
-  argument CLASSES found the problem is wider. Reproduce with
-  `tools/probes/arg_types_extended.py` (87 cases; run it against the mongod on
-  PATH, see `tools/probes/README.md`).
+  argument CLASSES found the problem is wider — but **the crash half of this
+  entry is now closed**: #1080 fixed all 24 slots that answered `internal server
+  error` (code 1), namely `find`'s `limit` / `skip` / `batchSize`, `aggregate`'s
+  `cursor` and `cursor.batchSize`, `listIndexes.cursor`, `createIndexes.indexes`,
+  and a `$match` stage whose spec is not a document.
 
-  **Still crashing as `internal server error` (code 1):**
+  **Re-measured 2026-08-28** with `tools/probes/arg_types_extended.py` against
+  the mongod on PATH (**6.0.16** — see `tools/probes/README.md` on probing the
+  version we advertise first): 87 cases, **0 crashes, 42 divergences**. The
+  breakdown below is the whole list — the probe used to cap its printout at 22
+  findings, which hid 20 of these (including every `$unwind` row) behind an
+  accurate count; the cap is gone.
 
-      createIndexes.indexes=<scalar>     mongod 14
-      listIndexes.cursor=<scalar>        mongod 14
-      aggregate.cursor=<scalar>          mongod 14
-      $match stage spec=<scalar>         mongod 15959
-      find.limit / .skip / .batchSize    mongod 14   (any non-number)
-      aggregate cursor.batchSize         mongod 14
-      delete.deletes.limit               mongod ACCEPTS -- see below
+  **Silently accepted where mongod errors (24).** Each slot diverges on every
+  wrong-typed value the sweep feeds it:
 
-  **Silently accepted where mongod errors (14):** `create.storageEngine`,
-  `collMod.index`, `aggregate.let`, `find.collation`, `find.let`.
+      create.storageEngine    5 / 'x' / True    mongod 14
+      collMod.index           5 / 'x' / True    mongod 14
+      aggregate.let           5 / 'x' / True    mongod 14
+      find.collation          5 / 'x' / True    mongod 14
+      find.let                5 / 'x' / True    mongod 14
+      find.maxTimeMS          {} / 'x' / [1]    mongod 2
+      find.singleBatch        {} / [1]          mongod 14
+      findAndModify.upsert    {} / [1]          mongod 14
+      update.updates.multi    {} / [1]          mongod 14
 
-  **Wrong code:** `$lookup` spec (mongod 9, we 14), `$group` spec (15947 vs 14),
-  `$sort` spec (15973 vs 15976), `find.min` / `.max` (14 vs 51174).
+  The last four are new to this summary rather than new behaviour — the earlier
+  count of "14" named only the five document-valued slots and missed the
+  numeric / boolean ones.
+
+  **Wrong code (18).** We error, but not with mongod's code:
+
+      find.min / find.max     5 / 'x' / True    mongod 14      we 51174
+      $lookup spec            5 / 'x' / True    mongod 9       we 14
+      $group spec             5 / 'x' / True    mongod 15947   we 14
+      $sort spec              5 / 'x' / True    mongod 15973   we 15976
+      $unwind spec            5 / [1]           mongod 15981   we 14
+      $unwind spec            {}                mongod 28812   we 28808
 
   **Do NOT implement this by pattern.** mongod's strictness is per-slot, not
   per-class: `delete.deletes.limit: {}` is ACCEPTED by mongod while the
   analogous `find.limit: {}` is a type error. Probing each slot is the only way
   to get it right — a blanket "validate every numeric argument" rule would
-  introduce a fresh divergence at `delete.limit`.
+  introduce a fresh divergence at `delete.limit`. #1080 hit that twice: it also
+  found `find`'s slots are reported under mongod's internal IDL name
+  (`FindCommandRequest.limit`, not `find.limit`), which no amount of reasoning
+  gets you.
 
   Same reason the landed slice needed four distinct message families rather than
   one: `find` says `Expected field filterto be of type object` (mongod's own

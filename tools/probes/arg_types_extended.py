@@ -113,7 +113,7 @@ if crashes:
         print(f"    {label:<34} mongod={mongo}")
 if diffs:
     print("\n  === divergences ===")
-    for label, mongo, ours in diffs[:22]:
+    for label, mongo, ours in diffs:
         print(f"    {label:<34} mongod={str(mongo):<16} secantus={ours}")
 sec.close()
 s.stop()
