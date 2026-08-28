@@ -38,7 +38,7 @@ version-dependent.
 | script | area | last result |
 |---|---|---|
 | `arg_types_documents.py` | document-valued command arguments | 56/56 clean (was 45 crashes) |
-| `arg_types_extended.py` | more commands + numeric/string/bool argument classes | **24 crashes, 44 divergences — open** |
+| `arg_types_extended.py` | more commands + numeric/string/bool argument classes | **0 crashes, 42 divergences — open** (crashes closed by #1080; re-measured 2026-08-28 vs mongod 6.0.16) |
 | `findandmodify_shapes.py` | findAndModify replies and argument validation | 18/18 clean (was 6 divergences) |
 | `update_operators.py` | update operator semantics and errors | clean except the filed items |
 | `update_path_conflicts.py` | overlapping update operator paths | 12/12 clean (was 8 wrong results) |
@@ -48,3 +48,7 @@ version-dependent.
 Keep each case tiny and independent: seed a document, run one operation, compare.
 A case that disagrees then names one behaviour, so the failure is actionable.
 Print only divergences — a probe that prints its passes buries its findings.
+**Print all of them, too:** two of these probes capped the printed list (`diffs[:22]`,
+`diffs[:14]`) while reporting an accurate total, so a reader who worked from the
+list silently missed findings — it happened, and cost a backlog entry that named
+two thirds of the divergences it claimed to enumerate.

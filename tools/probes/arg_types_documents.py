@@ -77,7 +77,7 @@ if crashes:
     print("  === crashes (internal server error) ===")
     for label, mongo, _ours in crashes:
         print(f"    {label:<34} mongod={mongo}")
-for label, mongo, ours in diffs[:14]:
+for label, mongo, ours in diffs:
     print(f"    {label:<34} mongod={str(mongo):<18} secantus={ours}")
 sec.close()
 s.stop()
