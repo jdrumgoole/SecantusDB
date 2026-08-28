@@ -322,6 +322,42 @@ Specific items that were left out of the slice that introduced their feature are
   UNwrapped -- the wrapper must not spread to errors that do not depend on the
   stored document.
 
+- [ ] **OPEN — wrong-typed command arguments beyond the document class: 24 crashes
+  + 44 divergences (Python server).** The document-valued sweep landed (#1078,
+  56/56 clean, was 45 crashes). Extending it to more commands and to other
+  argument CLASSES found the problem is wider. Reproduce with
+  `tools/probes/arg_types_extended.py` (87 cases; run it against the mongod on
+  PATH, see `tools/probes/README.md`).
+
+  **Still crashing as `internal server error` (code 1):**
+
+      createIndexes.indexes=<scalar>     mongod 14
+      listIndexes.cursor=<scalar>        mongod 14
+      aggregate.cursor=<scalar>          mongod 14
+      $match stage spec=<scalar>         mongod 15959
+      find.limit / .skip / .batchSize    mongod 14   (any non-number)
+      aggregate cursor.batchSize         mongod 14
+      delete.deletes.limit               mongod ACCEPTS -- see below
+
+  **Silently accepted where mongod errors (14):** `create.storageEngine`,
+  `collMod.index`, `aggregate.let`, `find.collation`, `find.let`.
+
+  **Wrong code:** `$lookup` spec (mongod 9, we 14), `$group` spec (15947 vs 14),
+  `$sort` spec (15973 vs 15976), `find.min` / `.max` (14 vs 51174).
+
+  **Do NOT implement this by pattern.** mongod's strictness is per-slot, not
+  per-class: `delete.deletes.limit: {}` is ACCEPTED by mongod while the
+  analogous `find.limit: {}` is a type error. Probing each slot is the only way
+  to get it right — a blanket "validate every numeric argument" rule would
+  introduce a fresh divergence at `delete.limit`.
+
+  Same reason the landed slice needed four distinct message families rather than
+  one: `find` says `Expected field filterto be of type object` (mongod's own
+  missing space), the CRUD commands say `BSON field '<path>' is the wrong type`,
+  `aggregate` says `'pipeline' option must be specified as an array`, and
+  `update`'s `u` accepts an object OR an array so a scalar is 9 while an array of
+  non-documents is 14.
+
 - [ ] **OPEN — Admin UI saved-connections / settings page**: Slice 11 of the admin UI shipped schema sampler / logs viewer / geo viewer but skipped the planned `/settings` page with saved Mongo URIs and a manual dark/light toggle. The CLI today takes a single `--uri` per launch, so saved connections are bookmark-only (you can't switch targets after start). When the launcher gains hot-swap support, revisit this page — it's likely a small SQLite-backed list reusing the existing `~/.secantus/admin.db` store.
 
 ### 3.1 Authentication
