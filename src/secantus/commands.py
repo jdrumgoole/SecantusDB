@@ -2248,6 +2248,10 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.storage import BadHint, MinMaxKeyError
 
     coll = doc["find"]
+    for _fld in ("filter", "sort", "projection"):
+        _err = _require_object_expected_field(doc.get(_fld), _fld)
+        if _err is not None:
+            return _err
     filter_ = doc.get("filter") or {}
     skip = int(doc.get("skip", 0) or 0)
     limit = int(doc.get("limit", 0) or 0)
@@ -2605,6 +2609,36 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     upserted: list[dict[str, Any]] = []
     write_errors: list[dict[str, Any]] = []
     for index, spec in enumerate(updates):
+        # A wrong-typed `q` used to reach the matcher and a wrong-typed `u` the
+        # update engine, both crashing as "internal server error". mongod names
+        # the dotted argument path.
+        _err = _require_object_bson_field(spec.get("q"), "update.updates.q")
+        if _err is not None:
+            return _err
+        _u = spec.get("u")
+        if isinstance(_u, list):
+            # An array `u` IS a pipeline, so its elements obey the pipeline rule
+            # -- the same one `aggregate` uses. mongod returns this as a
+            # command-level TypeMismatch, not a per-statement writeError.
+            for _stage in _u:
+                if not isinstance(_stage, Mapping):
+                    return {
+                        "ok": 0.0,
+                        "errmsg": "Each element of the 'pipeline' array must be an object",
+                        "code": 14,
+                        "codeName": "TypeMismatch",
+                    }
+        if _u is not None and not isinstance(_u, (Mapping, list)):
+            # `u` accepts an object OR an array (the pipeline form), so a scalar
+            # is FailedToParse rather than a type mismatch -- the same message
+            # findAndModify gives. An array whose ELEMENTS are wrong is a
+            # pipeline error (14) raised downstream, not here.
+            return {
+                "ok": 0.0,
+                "errmsg": "Update argument must be either an object or an array",
+                "code": 9,
+                "codeName": "FailedToParse",
+            }
         # MongoDB 8.0 added a ``sort`` option to update spec entries
         # (matches in sort order then updates the first). Pre-8.0 the
         # server rejects it as a parse error. We advertise wire
@@ -2772,6 +2806,9 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     n = 0
     write_errors: list[dict[str, Any]] = []
     for index, spec in enumerate(deletes):
+        _err = _require_object_bson_field(spec.get("q"), "delete.deletes.q")
+        if _err is not None:
+            return _err
         try:
             n += ctx.storage.delete_matching(
                 ctx.db_name,
@@ -2799,6 +2836,9 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     coll = doc["count"]
+    _err = _require_object_bson_field(doc.get("query"), "count.query")
+    if _err is not None:
+        return _err
     filter_ = doc.get("query") or {}
     # View support: if the collection is a view (``viewOn`` set),
     # run the view's pipeline + the count's query filter via the
@@ -2868,6 +2908,9 @@ def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
     coll = doc["distinct"]
     key = doc.get("key", "")
+    _err = _require_object_bson_field(doc.get("query"), "distinct.query")
+    if _err is not None:
+        return _err
     filter_ = doc.get("query") or {}
     if not isinstance(key, str):
         return {
@@ -2916,6 +2959,54 @@ def _key_present(doc: dict[str, Any], path: str) -> bool:
     return True
 
 
+def _bson_type_of(value: Any) -> str:
+    """mongod's type vocabulary, shared with the update parse errors."""
+    from secantus.update import _bson_type_name
+
+    return _bson_type_name(value)
+
+
+def _require_object_bson_field(value: Any, field_path: str) -> dict[str, Any] | None:
+    """mongod's ``BSON field '<path>' is the wrong type`` reply, or None if OK.
+
+    Used by the commands whose parser reports the full dotted argument path --
+    ``count.query``, ``distinct.query``, ``delete.deletes.q``,
+    ``update.updates.q``, ``findAndModify.query`` / ``.sort`` / ``.fields``.
+    Probed on mongod 6.0.16 and 8.3.4 (identical).
+
+    A wrong-typed argument used to reach code that dereferences it structurally
+    and raised AttributeError / TypeError, surfacing as a bare "internal server
+    error" (code 1). 45 of 56 probed argument slots did this.
+    """
+    if value is None or isinstance(value, Mapping):
+        return None
+    return {
+        "ok": 0.0,
+        "errmsg": (
+            f"BSON field '{field_path}' is the wrong type "
+            f"'{_bson_type_of(value)}', expected type 'object'"
+        ),
+        "code": 14,
+        "codeName": "TypeMismatch",
+    }
+
+
+def _require_object_expected_field(value: Any, field_name: str) -> dict[str, Any] | None:
+    """mongod's ``find``-family wording, or None if OK.
+
+    Note the missing space in ``filterto``: that is mongod's own message, not a
+    typo here, and fidelity means reproducing it.
+    """
+    if value is None or isinstance(value, Mapping):
+        return None
+    return {
+        "ok": 0.0,
+        "errmsg": f"Expected field {field_name}to be of type object",
+        "code": 14,
+        "codeName": "TypeMismatch",
+    }
+
+
 def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.storage import DocumentValidationError, GeoExtractError, IndexConflict
 
@@ -2929,6 +3020,10 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
     query = doc.get("query") or {}
     sort = doc.get("sort") or None
     fields = doc.get("fields") or None
+    for _fld in ("query", "sort", "fields"):
+        _err = _require_object_bson_field(doc.get(_fld), f"findAndModify.{_fld}")
+        if _err is not None:
+            return _err
     return_new = bool(doc.get("new", False))
     upsert = bool(doc.get("upsert", False))
     is_remove = bool(doc.get("remove", False))
@@ -4409,6 +4504,15 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
     coll = doc["aggregate"]
     pipeline = doc.get("pipeline", [])
+    if not isinstance(pipeline, list):
+        # A non-array pipeline reached the stage walker and crashed as
+        # "internal server error"; mongod names it as an option error.
+        return {
+            "ok": 0.0,
+            "errmsg": "'pipeline' option must be specified as an array",
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
     hint = doc.get("hint")
     # ``let`` user-vars threaded into the pipeline context so
     # ``$expr`` clauses inside ``$match`` and the aggregation
