@@ -22,7 +22,7 @@ import decimal
 import json
 import math
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -372,6 +372,24 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
 
         if _hstore.is_hstore(left) or _hstore.is_hstore(right):
             return _hstore.merge(_hstore.parse(left), _hstore.parse(right))
+        # ``jsonb || jsonb`` where BOTH sides are objects merges, right wins
+        # (PG-probed 14). This case fell through to the text fallback below,
+        # where `str(dict)` produced a PYTHON REPR: `'{"x":1}'::jsonb ||
+        # '{"y":2}'::jsonb` answered `{'x': 1}{'y': 2}` — single-quoted, not
+        # valid JSON, and silently wrong.
+        #
+        # STILL WRONG, deliberately out of scope here: the mixed shapes
+        # (array||array, object||array, array||scalar) take the list branch
+        # above. Their *values* are right, but the result is typed as a PG
+        # ARRAY, so `::text` renders `{1,2,3}` where PG renders the jsonb
+        # `[1, 2, 3]`. Fixing that is a typing change — the result of a jsonb
+        # concat has to carry the jsonb tag — not a value change here.
+        #
+        # Two jsonb *scalars* also stay on the text path deliberately: a Python
+        # str is indistinguishable from a text value at this point, and
+        # rerouting it would break ordinary `'a' || 'b'` concatenation.
+        if isinstance(left, Mapping) and isinstance(right, Mapping):
+            return {**dict(left), **dict(right)}
         return _as_text(left) + _as_text(right)
     if isinstance(node, exp.Bracket):
         return _eval_bracket(node, scope, ctx)
@@ -542,7 +560,96 @@ def _eval_arith(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         left = _num_from_text(left, right)
     elif isinstance(right, str) and _is_number(left):
         right = _num_from_text(right, left)
-    return _ARITH[type(node)](left, right)
+    # ``jsonb - key`` deletes; see `_jsonb_delete`. Checked here rather than in
+    # `_ARITH` because a Mapping/list left operand has no meaningful Python
+    # subtraction — `dict - str` raised a bare TypeError that escaped as an
+    # "internal server error" (XX000).
+    if isinstance(node, exp.Sub) and isinstance(left, (Mapping, list)):
+        return _jsonb_delete(left, right)
+    try:
+        return _ARITH[type(node)](left, right)
+    except TypeError:
+        # PG answers 42883 for an operator that does not exist for the operand
+        # pair (`'a'::text - 1`, `'\x01'::bytea + 1`). Python's TypeError used
+        # to escape as XX000 — an internal error where PG names the problem.
+        op = _ARITH_SYMBOL.get(type(node), "?")
+        raise errors.SQLError(
+            "42883",
+            f"operator does not exist: {_pg_operand_type(left)} {op} {_pg_operand_type(right)}",
+        ) from None
+
+
+#: The SQL spelling of each arithmetic node, for a 42883 message.
+_ARITH_SYMBOL: dict[type, str] = {
+    exp.Add: "+",
+    exp.Sub: "-",
+    exp.Mul: "*",
+    exp.Div: "/",
+    exp.Mod: "%",
+}
+
+
+def _pg_operand_type(v: Any) -> str:
+    """A PG type name for an operand, used only in the 42883 message."""
+    if v is None:
+        return "unknown"
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, int):
+        return "integer"
+    if isinstance(v, float):
+        return "double precision"
+    if isinstance(v, Decimal):
+        return "numeric"
+    if isinstance(v, (bytes, bytearray)):
+        return "bytea"
+    if isinstance(v, Mapping):
+        return "jsonb"
+    if isinstance(v, list):
+        return "array"
+    if isinstance(v, str):
+        return "text"
+    return type(v).__name__
+
+
+def _jsonb_delete(left: Any, right: Any) -> Any:
+    """``jsonb - key`` / ``- index`` / ``- key[]``. PG-probed 14:
+
+    * object ``-`` text  -> delete that key (a missing key is a no-op)
+    * array  ``-`` text  -> drop elements equal to that string
+    * array  ``-`` int   -> delete that index (negative counts from the end;
+      out of range is a no-op)
+    * either ``-`` text[] -> delete each in turn
+    * object ``-`` int   -> 22023 "cannot delete from object using integer index"
+    * scalar ``-`` any   -> 22023 "cannot delete from scalar"
+
+    This whole operator used to reach Python's ``-`` and die with a bare
+    ``TypeError`` that surfaced as an internal error (XX000).
+    """
+    if isinstance(right, list):
+        out = left
+        for key in right:
+            out = _jsonb_delete(out, key)
+        return out
+    if isinstance(left, Mapping):
+        if isinstance(right, bool) or not isinstance(right, str):
+            if isinstance(right, int):
+                raise errors.SQLError("22023", "cannot delete from object using integer index")
+            raise errors.SQLError("22023", "cannot delete from scalar")
+        out = dict(left)
+        out.pop(right, None)
+        return out
+    # A JSON array.
+    if isinstance(right, bool):
+        raise errors.SQLError("22023", "cannot delete from scalar")
+    if isinstance(right, int):
+        index = right if right >= 0 else len(left) + right
+        if 0 <= index < len(left):
+            return [*left[:index], *left[index + 1 :]]
+        return list(left)
+    if isinstance(right, str):
+        return [item for item in left if item != right]
+    raise errors.SQLError("22023", "cannot delete from scalar")
 
 
 def _is_number(v: Any) -> bool:

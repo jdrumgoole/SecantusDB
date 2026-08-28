@@ -593,8 +593,9 @@ def test_projection_meta_unknown_arg_is_17308(coll) -> None:
 def test_projection_meta_recognized_arg_omits_field(coll) -> None:
     coll.insert_one({"_id": 1, "a": 1, "b": 2})
     doc = coll.find_one({}, {"m": {"$meta": "indexKey"}})
-    # Recognized-but-unsupported $meta arg: field omitted, inclusion keeps _id.
-    assert doc == {"_id": 1}
+    # The $meta field is omitted (not computed), but the document is untouched —
+    # `$meta` is a value re-shaper, not an inclusion. mongod-probed 6.0.16.
+    assert doc == {"_id": 1, "a": 1, "b": 2}
 
 
 def test_small_batch_size_paginates_via_getmore(coll, server: SecantusDBServer) -> None:

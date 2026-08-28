@@ -231,6 +231,30 @@ QUERY_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     # $bucket emits a bucket only when something landed in it — boundary
     # buckets and `default` alike. An unused default surfaced as a bare
     # `{_id: "other"}` with no `count`.
+    # A `$meta` projection does NOT make the projection inclusion-mode — mongod
+    # treats it as a value re-shaper, like $slice. We forced a $meta-only spec
+    # into "inclusion of no fields", so asking for a metadata field silently
+    # discarded the caller's entire document.
+    (
+        "meta-projection-keeps-the-whole-document",
+        [{"_id": 1, "a": 1, "b": 2}],
+        lambda db: list(db.c.find({}, {"m": {"$meta": "indexKey"}})),
+    ),
+    (
+        "meta-projection-honours-id-exclusion",
+        [{"_id": 1, "a": 1, "b": 2}],
+        lambda db: list(db.c.find({}, {"_id": 0, "m": {"$meta": "indexKey"}})),
+    ),
+    (
+        "meta-alongside-an-inclusion-field",
+        [{"_id": 1, "a": 1, "b": 2}],
+        lambda db: list(db.c.find({}, {"a": 1, "m": {"$meta": "indexKey"}})),
+    ),
+    (
+        "meta-alongside-an-exclusion-field",
+        [{"_id": 1, "a": 1, "b": 2}],
+        lambda db: list(db.c.find({}, {"b": 0, "m": {"$meta": "indexKey"}})),
+    ),
     # $stdDev* counts only int/long/double/decimal. bool, null, string, array
     # and document values are silently skipped, and mongod ALWAYS emits the
     # field — `null` when the group held no numeric value. Summing every value

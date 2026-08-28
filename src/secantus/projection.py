@@ -355,23 +355,26 @@ def compile_projection(
     plan = _ProjectionPlan()
 
     # ``$meta`` projections validate at parse time (Location17308 for an unknown
-    # argument, Location40218 for ``textScore`` without a ``$text`` query). A
-    # ``$meta`` field is inclusion-mode in mongod, but SecantusDB doesn't compute
-    # the metadata — so the field is *omitted* (partial, graceful degradation).
-    # We drop the meta keys from the spec while remembering one was present: a
-    # spec that was *only* ``$meta`` fields becomes an inclusion projection of no
-    # fields (mongod result: just ``_id``, unless ``_id`` was excluded).
-    meta_present = any(_is_meta_spec(v) for v in spec.values())
-    if meta_present:
+    # argument, Location40218 for ``textScore`` without a ``$text`` query).
+    # SecantusDB doesn't compute the metadata, so the projected field is
+    # *omitted* — but the rest of the document is untouched.
+    #
+    # `$meta` does NOT participate in inclusion / exclusion mode detection, the
+    # same rule `$slice` and positional follow below (mongod treats all three as
+    # value re-shapers). Oracle-pinned against mongod 6.0.16:
+    #
+    #   {m: {$meta: X}}            -> the WHOLE document
+    #   {_id: 0, m: {$meta: X}}    -> whole document minus _id
+    #   {a: 1,   m: {$meta: X}}    -> {_id, a}   (the `a: 1` drives inclusion)
+    #   {b: 0,   m: {$meta: X}}    -> exclusion, driven by `b: 0`
+    #
+    # This used to force a `$meta`-only spec into an inclusion projection of no
+    # fields, on a comment asserting "mongod result: just `_id`" — which is
+    # simply not what mongod does. Asking for a metadata field silently threw
+    # away the caller's entire document.
+    if any(_is_meta_spec(v) for v in spec.values()):
         validate_meta_projection(spec, query)
         spec = {k: v for k, v in spec.items() if not _is_meta_spec(v)}
-        non_meta_non_id = any(k != "_id" for k in spec)
-        if not non_meta_non_id:
-            # Inclusion projection with no surviving field: keep only ``_id``
-            # (dropped when the spec excludes it via ``_id: 0``).
-            plan.kind = "meta_id_only"
-            plan.include_id = bool(spec.get("_id", 1))
-            return plan
 
     # Separate ``$slice`` and positional (``arr.$``) projections — they don't
     # participate in inclusion / exclusion mode detection (mongod treats them as
@@ -459,11 +462,6 @@ def apply_projection_plan(doc: dict[str, Any], plan: _ProjectionPlan) -> dict[st
     """The per-document half of a compiled projection — branch bodies verbatim
     from the pre-split ``apply_projection``."""
     slice_specs = plan.slice_specs
-    if plan.kind == "meta_id_only":
-        result: dict[str, Any] = {}
-        if plan.include_id and "_id" in doc:
-            result["_id"] = copy.deepcopy(doc["_id"])
-        return result
     if plan.kind == "positional":
         assert plan.doc_pred is not None
         return _apply_positional(

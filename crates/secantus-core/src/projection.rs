@@ -419,31 +419,28 @@ pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document
         return Ok(doc.clone());
     }
 
-    // A `$meta` field is inclusion-mode in mongod, but SecantusDB doesn't compute
-    // the metadata — so the field is *omitted* (partial degradation). Drop the
-    // meta keys; a spec that was *only* `$meta` fields becomes an inclusion of no
-    // fields (result: just `_id`, unless `_id` was excluded). Parse-time
-    // validation (Location17308 / 40218) lives in `find::projection_meta_error`.
+    // SecantusDB doesn't compute metadata, so a `$meta` field is *omitted* — but
+    // the rest of the document is untouched. `$meta` does NOT participate in
+    // inclusion / exclusion mode detection, the same rule `$slice` and
+    // positional follow (mongod treats all three as value re-shapers).
+    // Oracle-pinned against mongod 6.0.16:
+    //
+    //   {m: {$meta: X}}          -> the WHOLE document
+    //   {_id: 0, m: {$meta: X}}  -> whole document minus _id
+    //   {a: 1,   m: {$meta: X}}  -> {_id, a}   (the `a: 1` drives inclusion)
+    //   {b: 0,   m: {$meta: X}}  -> exclusion, driven by `b: 0`
+    //
+    // This used to force a `$meta`-only spec into an inclusion projection of no
+    // fields, mirroring a pure-Python comment that asserted "result: just
+    // `_id`" — which is not what mongod does. Asking for a metadata field
+    // silently discarded the caller's entire document. Parse-time validation
+    // (Location17308 / 40218) still lives in `find::projection_meta_error`.
     if spec.values().any(|v| meta_spec(v).is_some()) {
         let mut stripped = Document::new();
         for (k, v) in spec {
             if meta_spec(v).is_none() {
                 stripped.insert(k.clone(), v.clone());
             }
-        }
-        let non_meta_non_id = stripped.keys().any(|k| k != "_id");
-        if !non_meta_non_id {
-            let mut result = Document::new();
-            let include_id = match stripped.get("_id") {
-                None => true,
-                Some(v) => spec_truthy(v)?,
-            };
-            if include_id {
-                if let Some(id) = doc.get("_id") {
-                    result.insert("_id".to_string(), id.clone());
-                }
-            }
-            return Ok(result);
         }
         return apply_projection(doc, &stripped, query);
     }
@@ -792,13 +789,16 @@ mod tests {
 
     #[test]
     fn meta_only_field_omitted() {
-        // A recognized-but-unsupported $meta arg: field omitted, inclusion keeps _id.
+        // The $meta field is omitted (not computed), but the DOCUMENT is
+        // untouched: `$meta` is a value re-shaper, not an inclusion. This used
+        // to assert `{"_id": 1}`, pinning the bug where asking for a metadata
+        // field discarded the caller's document. mongod-probed 6.0.16.
         assert_eq!(
             proj(
                 doc! {"_id": 1, "a": 1, "b": 2},
                 doc! {"m": {"$meta": "indexKey"}}
             ),
-            doc! {"_id": 1}
+            doc! {"_id": 1, "a": 1, "b": 2}
         );
     }
 
@@ -815,12 +815,14 @@ mod tests {
 
     #[test]
     fn meta_excludes_id() {
+        // `_id: 0` drops the identifier; the rest of the document stays.
+        // Previously asserted `{}` — see `meta_only_field_omitted`.
         assert_eq!(
             proj(
                 doc! {"_id": 1, "a": 1},
                 doc! {"_id": 0, "score": {"$meta": "sortKey"}}
             ),
-            doc! {}
+            doc! {"a": 1}
         );
     }
 
