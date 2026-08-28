@@ -1,6 +1,6 @@
 # Cross-Driver Conformance Summary
 
-Generated 2026-08-27 — SecantusDB 0.6.0b16. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 13 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
+Generated 2026-08-28 — SecantusDB 0.6.0b16. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 13 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
 
 **Failures split into two columns**: *Failed* counts tests that actually need a fix on SecantusDB; *Expected* counts tests with a documented reason for failing (driver-side cascade, out-of-scope feature, single-node-topology assumption, known intermittent flake). The expected list lives in `validation_summary/expected_failures.py` and each entry carries a rationale. Adjusted pass rate = passes ÷ (passes + actual failures).
 
@@ -18,10 +18,10 @@ Generated 2026-08-27 — SecantusDB 0.6.0b16. Each per-driver gauge runs the dri
 | `mongo-rust-driver` | Rust | `12dd49bf18bb` | 105 | 105 | 0 | 0 | 0 | 100.0% | 100.0% |
 | `mongo-php-library` | PHP | `12e56461166d` | 2221 | 2184 | 0 | 0 | 37 | 100.0% | 100.0% |
 | `mongo-php-driver` | PHP | `e81b318a33dc` | 270 | 247 | 0 | 0 | 23 | 100.0% | 100.0% |
-| `mongo-c-driver` | C | `57dba9c04991` | 841 | 762 | 1 | 6 | 72 | 99.1% | 99.9% |
+| `mongo-c-driver` | C | `57dba9c04991` | 841 | 763 | 0 | 6 | 72 | 99.2% | 100.0% |
 | `mongo-cxx-driver` | C++ | `24852b68a3d1` | 899 | 890 | 0 | 0 | 9 | 100.0% | 100.0% |
 | `mongo-csharp-driver` | C# | `8297e62d7f2b` | 228 | 202 | 0 | 0 | 26 | 100.0% | 100.0% |
-| **All drivers** | — | — | **10026** | **8093** | **2** | **20** | **1911** | **99.7%** | **100.0%** |
+| **All drivers** | — | — | **10026** | **8094** | **1** | **20** | **1911** | **99.7%** | **100.0%** |
 
 ## Per-driver scope
 
