@@ -2254,10 +2254,22 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         _err = _require_number_bson_field(doc.get(_fld), f"FindCommandRequest.{_fld}")
         if _err is not None:
             return _err
-    for _fld in ("filter", "sort", "projection"):
-        _err = _require_object_expected_field(doc.get(_fld), _fld)
+    for _fld in ("filter", "sort", "projection", "collation"):
+        _err = _require_object_expected_field(doc, _fld)
         if _err is not None:
             return _err
+    # `let` is the OTHER object family on this same command, reported under
+    # mongod's IDL name like limit/skip/batchSize above -- `find.let` is not
+    # what it calls itself.
+    _err = _require_object_bson_field(doc.get("let"), "FindCommandRequest.let")
+    if _err is not None:
+        return _err
+    _err = _require_bool_value_field(doc, "singleBatch")
+    if _err is not None:
+        return _err
+    _err = _require_max_time_ms(doc)
+    if _err is not None:
+        return _err
     filter_ = doc.get("filter") or {}
     skip = int(doc.get("skip", 0) or 0)
     limit = int(doc.get("limit", 0) or 0)
@@ -2595,6 +2607,9 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     wc_err = _validate_write_concern(doc)
     if wc_err is not None:
         return wc_err
+    _err = _require_object_bson_field(doc.get("let"), "update.let")
+    if _err is not None:
+        return _err
     coll = doc["update"]
     oplog_err = _reject_oplog_rs_write(ctx, coll, "update")
     if oplog_err is not None:
@@ -2619,6 +2634,16 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # update engine, both crashing as "internal server error". mongod names
         # the dotted argument path.
         _err = _require_object_bson_field(spec.get("q"), "update.updates.q")
+        if _err is not None:
+            return _err
+        # Strict bool, unlike findAndModify's `upsert` two screens up, which
+        # takes a bool OR any number. Adjacent slots, different rules; probed.
+        _err = _require_typed_bson_field(
+            spec.get("multi"),
+            "update.updates.multi",
+            expected="bool",
+            ok=lambda v: isinstance(v, bool),
+        )
         if _err is not None:
             return _err
         _u = spec.get("u")
@@ -2797,6 +2822,9 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     wc_err = _validate_write_concern(doc)
     if wc_err is not None:
         return wc_err
+    _err = _require_object_bson_field(doc.get("let"), "delete.let")
+    if _err is not None:
+        return _err
     coll = doc["delete"]
     oplog_err = _reject_oplog_rs_write(ctx, coll, "delete")
     if oplog_err is not None:
@@ -3062,13 +3090,23 @@ def _require_typed_bson_field(
     }
 
 
-def _require_object_expected_field(value: Any, field_name: str) -> dict[str, Any] | None:
+def _require_object_expected_field(
+    doc: Mapping[str, Any], field_name: str
+) -> dict[str, Any] | None:
     """mongod's ``find``-family wording, or None if OK.
 
     Note the missing space in ``filterto``: that is mongod's own message, not a
     typo here, and fidelity means reproducing it.
+
+    Takes the command document rather than the value because this family
+    distinguishes ABSENT from an explicit ``null``: mongod accepts
+    ``{find: "c"}`` and rejects ``{find: "c", filter: null}`` (probed 6.0.16).
+    A ``doc.get(...)`` cannot tell those apart, so passing the value alone made
+    us accept the null form.
     """
-    if value is None or isinstance(value, Mapping):
+    if field_name not in doc:
+        return None
+    if isinstance(doc[field_name], Mapping):
         return None
     return {
         "ok": 0.0,
@@ -3078,12 +3116,100 @@ def _require_object_expected_field(value: Any, field_name: str) -> dict[str, Any
     }
 
 
+_BOOL_OR_NUMBER_TYPES_MSG = "'[bool, long, int, decimal, double]'"
+
+
+def _require_bool_value_field(doc: Mapping[str, Any], field_name: str) -> dict[str, Any] | None:
+    """mongod's ``find``-IDL boolean wording, or None if OK.
+
+    A third message family for the same class: ``find.singleBatch`` answers
+    ``Field 'singleBatch' should be a boolean value, but found: int`` where
+    ``update.updates.multi`` answers the ``BSON field`` form and
+    ``findAndModify.upsert`` accepts numbers outright. Per-slot, probed.
+
+    An explicit ``null`` is rejected here (``found: null``), unlike the
+    ``BSON field`` slots which accept it.
+    """
+    if field_name not in doc:
+        return None
+    value = doc[field_name]
+    if isinstance(value, bool):
+        return None
+    return {
+        "ok": 0.0,
+        "errmsg": (
+            f"Field '{field_name}' should be a boolean value, but found: {_bson_type_of(value)}"
+        ),
+        "code": 14,
+        "codeName": "TypeMismatch",
+    }
+
+
+def _require_bool_or_number_bson_field(value: Any, field_path: str) -> dict[str, Any] | None:
+    """``findAndModify.upsert``: a bool OR any number, or None if OK / absent.
+
+    mongod really does accept ``upsert: 1`` / ``0`` / ``1.5`` here (probed
+    6.0.16) while the neighbouring ``update.updates.multi`` takes a strict
+    ``bool`` and rejects ``multi: 1``. Two adjacent boolean-looking slots, two
+    different rules -- the reason this class is implemented per-slot.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, bson.Decimal128)):
+        return None
+    return {
+        "ok": 0.0,
+        "errmsg": (
+            f"BSON field '{field_path}' is the wrong type "
+            f"'{_bson_type_of(value)}', expected types {_BOOL_OR_NUMBER_TYPES_MSG}"
+        ),
+        "code": 14,
+        "codeName": "TypeMismatch",
+    }
+
+
+def _require_max_time_ms(doc: Mapping[str, Any]) -> dict[str, Any] | None:
+    """``maxTimeMS``: three distinct messages, and code 2 rather than 14.
+
+    Probed on 6.0.16 -- the only slot in this sweep that is not a
+    ``TypeMismatch``:
+
+        {} / "x" / [1] / true / null   2  maxTimeMS must be a number
+        1.5                            2  maxTimeMS has non-integral value
+        -1                             2  -1 value for maxTimeMS is out of range
+
+    ``Decimal128`` is accepted. An explicit ``null`` is rejected, absent is fine.
+    The upper bound was not probed, so it is not enforced here.
+    """
+    if "maxTimeMS" not in doc:
+        return None
+    value = doc["maxTimeMS"]
+    if isinstance(value, bool) or not isinstance(value, (int, float, bson.Decimal128)):
+        return _bad_value("maxTimeMS must be a number")
+    number = value.to_decimal() if isinstance(value, bson.Decimal128) else value
+    if number != int(number):
+        return _bad_value("maxTimeMS has non-integral value")
+    if number < 0:
+        return _bad_value(f"{int(number)} value for maxTimeMS is out of range")
+    return None
+
+
+def _bad_value(errmsg: str) -> dict[str, Any]:
+    return {"ok": 0.0, "errmsg": errmsg, "code": 2, "codeName": "BadValue"}
+
+
 def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.storage import DocumentValidationError, GeoExtractError, IndexConflict
 
     wc_err = _validate_write_concern(doc)
     if wc_err is not None:
         return wc_err
+    _err = _require_bool_or_number_bson_field(doc.get("upsert"), "findAndModify.upsert")
+    if _err is not None:
+        return _err
+    _err = _require_object_bson_field(doc.get("let"), "findAndModify.let")
+    if _err is not None:
+        return _err
     coll = doc["findAndModify"]
     oplog_err = _reject_oplog_rs_write(ctx, coll, "findAndModify")
     if oplog_err is not None:
@@ -3456,6 +3582,9 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     wc_err = _validate_write_concern(doc)
     if wc_err is not None:
         return wc_err
+    _err = _require_object_bson_field(doc.get("storageEngine"), "create.storageEngine")
+    if _err is not None:
+        return _err
     # Reject unknown top-level options on ``create``. Real mongod
     # surfaces unknown fields as ``Location40415`` (40415, IDLUnknownField).
     # mongo-ruby-driver's ``Collection#create ... a failed operation
@@ -3591,6 +3720,12 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     wc_err = _validate_write_concern(doc)
     if wc_err is not None:
         return wc_err
+    # Before the namespace check: mongod parses the command before executing
+    # it, so a wrong-typed `index` on a MISSING collection is still the type
+    # error, not NamespaceNotFound (probed 6.0.16).
+    _err = _require_object_bson_field(doc.get("index"), "collMod.index")
+    if _err is not None:
+        return _err
     coll = doc["collMod"]
     if not ctx.storage.collection_exists(ctx.db_name, coll):
         return {
@@ -4590,9 +4725,15 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.storage import BadHint, IndexConflict
 
     coll = doc["aggregate"]
+    _err = _require_object_bson_field(doc.get("let"), "aggregate.let")
+    if _err is not None:
+        return _err
     _cursor_opt = doc.get("cursor")
-    if _cursor_opt is not None and not isinstance(_cursor_opt, Mapping):
-        # mongod's own wording for this slot -- not the BSON-field form.
+    if "cursor" in doc and not isinstance(_cursor_opt, Mapping):
+        # mongod's own wording for this slot -- not the BSON-field form. The
+        # message says "missing or an object", and it means it: an explicit
+        # `cursor: null` is rejected where an absent one is fine, so this tests
+        # membership rather than `is not None`.
         return {
             "ok": 0.0,
             "errmsg": "cursor field must be missing or an object",

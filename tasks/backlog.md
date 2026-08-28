@@ -401,8 +401,10 @@ Specific items that were left out of the slice that introduced their feature are
   UNwrapped -- the wrapper must not spread to errors that do not depend on the
   stored document.
 
-- [ ] **OPEN — wrong-typed command arguments beyond the document class: 0 crashes
-  + 42 divergences (Python server).** The document-valued sweep landed (#1078,
+- [ ] **OPEN (narrowed to 18) — wrong-typed command arguments beyond the document
+  class (Python server).** **The 24 silently-accepted slots are FIXED
+  2026-08-28**; the 18 wrong-code ones remain, listed below. Sweep now reports
+  **0 crashes, 18 divergences** (was 24 + 44, then 0 + 42).** The document-valued sweep landed (#1078,
   56/56 clean, was 45 crashes). Extending it to more commands and to other
   argument CLASSES found the problem is wider — but **the crash half of this
   entry is now closed**: #1080 fixed all 24 slots that answered `internal server
@@ -417,24 +419,25 @@ Specific items that were left out of the slice that introduced their feature are
   findings, which hid 20 of these (including every `$unwind` row) behind an
   accurate count; the cap is gone.
 
-  **Silently accepted where mongod errors (24).** Each slot diverges on every
-  wrong-typed value the sweep feeds it:
+  **Silently accepted where mongod errors (24) — FIXED 2026-08-28.** All nine
+  slots now answer mongod's error, and `update.let` / `delete.let` /
+  `findAndModify.let` were probed and fixed alongside them. Nine slots needed
+  **six message families**, which is the entry's per-slot warning made concrete:
+  `findAndModify.upsert` takes a bool OR any number (`upsert: 1.5` is valid)
+  while the adjacent `update.updates.multi` is a strict bool that rejects
+  `multi: 1`; `find.let` reports as `FindCommandRequest.let` while every other
+  command's `let` uses its own name; `find.maxTimeMS` is code **2** with three
+  messages, the only non-TypeMismatch in the sweep. Six slots accept an explicit
+  `null`, three reject it.
 
-      create.storageEngine    5 / 'x' / True    mongod 14
-      collMod.index           5 / 'x' / True    mongod 14
-      aggregate.let           5 / 'x' / True    mongod 14
-      find.collation          5 / 'x' / True    mongod 14
-      find.let                5 / 'x' / True    mongod 14
-      find.maxTimeMS          {} / 'x' / [1]    mongod 2
-      find.singleBatch        {} / [1]          mongod 14
-      findAndModify.upsert    {} / [1]          mongod 14
-      update.updates.multi    {} / [1]          mongod 14
+  **Two further divergences found while probing, fixed with them:** an explicit
+  `null` was accepted for `find.filter` / `.sort` / `.projection` and for
+  `aggregate.cursor`, where mongod rejects it — `doc.get(...)` cannot tell an
+  absent option from a null one, so the null form slipped through the checks
+  #1078 and #1080 added. Pinned by `tests/test_arg_types_accepted_slots.py`
+  (79 tests), including one asserting `delete.deletes.limit` stays UNchecked.
 
-  The last four are new to this summary rather than new behaviour — the earlier
-  count of "14" named only the five document-valued slots and missed the
-  numeric / boolean ones.
-
-  **Wrong code (18).** We error, but not with mongod's code:
+  **Wrong code (18) — STILL OPEN.** We error, but not with mongod's code:
 
       find.min / find.max     5 / 'x' / True    mongod 14      we 51174
       $lookup spec            5 / 'x' / True    mongod 9       we 14
