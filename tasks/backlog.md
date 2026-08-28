@@ -51,6 +51,57 @@ timestamp *predicates*; jsonb operator gap. Plus the catalog's missing
 column-level reflection, `SET search_path` not affecting name resolution,
 deferred constraints unmodelled, and partial-index `pg_get_expr` rendering.
 
+**Phase 0 SQL probe, 2026-08-28 — 3 more claims STALE, 3 NEW bugs found.**
+Ran every remaining SQL claim against the live PostgreSQL 14.
+
+*Stale, now corrected:* **deferred constraints** (a `DEFERRABLE INITIALLY
+DEFERRED` FK is accepted inside the transaction and raises `23503` at COMMIT,
+exactly as PG); the **catalog remainder** (`pg_constraint` / `pg_index` /
+`pg_am` / `pg_opclass` and bool-expression typing all match); and half the
+**partial-index** entry (a function-call predicate is accepted, not rejected).
+
+*Confirmed open:* cross-type lenient pairs (6 of 7 skipped shapes diverge, as
+the entry says); `pg_index.indpred` reflecting NULL.
+
+*NEW, none of them recorded anywhere:*
+- **`jsonb || jsonb` over two objects was SILENTLY WRONG — FIXED 2026-08-28.**
+  It fell through to the text fallback, so `str(dict)` produced a *Python
+  repr*: `'{"x":1}'::jsonb || '{"y":2}'::jsonb` answered `{'x': 1}{'y': 2}` —
+  single-quoted, not valid JSON. Now merges with the right operand winning,
+  matching PG.
+- **`jsonb || jsonb` mixed shapes are typed as a PG ARRAY (open).**
+  `array||array`, `object||array`, `array||scalar` have the right *values* but
+  render `{1,2,3}` where PG renders the jsonb `[1, 2, 3]`. Fixing it means the
+  concat result carrying the jsonb tag — a typing change, not a value one.
+- **`jsonb - 'key'` raised `XX000` — FIXED 2026-08-28.** The operator reached
+  Python's `-` (`dict - str`) and the bare TypeError escaped as an internal
+  server error. `scalar._jsonb_delete` now implements PG's full rule set
+  (PG-probed 14): object − text deletes a key (missing = no-op), array − text
+  drops matching string elements, array − int deletes by index (negative counts
+  from the end, out-of-range = no-op), either − text[] deletes each, object −
+  int is `22023 cannot delete from object using integer index`, and a scalar is
+  `22023 cannot delete from scalar`.
+- **An unsupported operand pair raised `XX000` — FIXED 2026-08-28.** The tail of
+  `_eval_arith` did a raw Python operation, so `'\x01'::bytea + 1` died with
+  `TypeError: can't concat int to bytes`. It now answers PG's
+  `42883 operator does not exist: bytea + integer`.
+  **Partial, and worth stating exactly:** for the `test_return_untyped[b]` case
+  (`select %s::int + 1` with a `bytes` argument) we answer **42883** where PG
+  answers **42846** (`cannot cast type`). Both are typed 42xxx errors rather
+  than a crash, but they are not the same code — PG's is about the failed
+  *cast*, ours about the missing *operator*. Closing that gap means the cast
+  failing at bind time, before arithmetic is reached.
+- **`'a'::text - 1` answers `22P02`, not PG's `42883` (open).** The untyped-text
+  → number coercion (deliberate, for pgbench's typeless params) fires first and
+  reports an invalid numeric literal. Distinguishing a *typed* `::text` operand
+  from an unknown literal is exactly the "cross-type lenient pairs" entry, whose
+  skipped-shape list already names arithmetic operands. Not new.
+- **jsonb results that are ARRAYS are typed as a PG array (open).** Affects both
+  `||`'s mixed shapes and `-` on an array: `'[1,2,3]'::jsonb - 1` has the right
+  *value* but renders `{1,3}` where PG renders `[1, 3]`. One root cause — a
+  jsonb operation returning a Python list loses the jsonb tag — so both are one
+  fix: carry the tag through the operator result.
+
 **Probed 2026-08-27 — 2 of 8 sampled were already done.** Reproduced each
 rather than reading it. **Stale:** `CancelRequest` is fully implemented (`57014`
 plus a still-usable connection, 29 tests) and catalog column-level reflection is
@@ -5000,7 +5051,12 @@ shared storage engine or building large new protocol subsystems:
   the containing row respectively. See "jsonb operator surface landed" and "SQL/JSON
   path queries landed (b135)". `numeric` still round-trips via Decimal128 and its real
   residual limit — 34 significant digits — has its own entry above.
-- [ ] **OPEN — Catalog surface: joins landed; column-level reflection IS present (re-measured 2026-08-27).** The "column-level reflection still missing" wording below is stale: for a freshly created table `information_schema.columns` answers `[('a','integer'),('b','text')]` and `pg_attribute` the matching type OIDs (23/25). Whatever remains is narrower than the headline claimed — re-probe before working it.
+- [x] **Catalog surface — re-probed 2026-08-28, nothing divergent found.**
+  `pg_constraint`, `pg_index`, `pg_am`, `pg_opclass` and boolean-expression
+  typing (`conrelid IS NOT NULL` → `bool`) all match PostgreSQL 14 on a table
+  with a primary key and a unique constraint, as does column-level reflection
+  (re-measured 2026-08-27, below). Reopen with a specific failing query rather
+  than from the prose. The "column-level reflection still missing" wording below is stale: for a freshly created table `information_schema.columns` answers `[('a','integer'),('b','text')]` and `pg_attribute` the matching type OIDs (23/25). Whatever remains is narrower than the headline claimed — re-probe before working it.
   `information_schema.tables`/`.columns`/`.schemata` and `pg_catalog.pg_class`/
   `pg_namespace`/`pg_type`/`pg_database` are served as virtual tables, and JOINs / GROUP BY
   across them now execute (`virtual.CatalogBackend` + `planner._lookup_table_def`), so
@@ -5035,8 +5091,12 @@ shared storage engine or building large new protocol subsystems:
   `enforce_update_images` (UNIQUE excludes the rewritten rows), `enforce_parent_delete` (FK referential
   actions) — are reused by `execute_insert`, `_execute_insert_on_conflict`, `_apply_conflict_update`,
   and the MERGE handlers, so every path enforces identically. Closes the MERGE-bypass and ON-CONFLICT
-  secondary-constraint gaps noted in the b94/b95/b96 entries. **Still open:** deferred constraints
-  aren't modeled (all checks are immediate — a future slice).
+  secondary-constraint gaps noted in the b94/b95/b96 entries.
+  ~~**Still open:** deferred constraints aren't modeled (all checks are
+  immediate — a future slice).~~ **STALE — re-probed 2026-08-28 against
+  PostgreSQL 14.** A `DEFERRABLE INITIALLY DEFERRED` FK behaves exactly as PG:
+  the violating INSERT is accepted inside the transaction and `COMMIT` raises
+  `23503`. Both servers answered `accepted/commit-23503`, identically.
 - [x] **Aggregate `FILTER (WHERE cond)` landed** (b126): `agg(...) FILTER (WHERE cond)` scopes an
   aggregate to matching rows. sqlglot parses it as `exp.Filter(this=<agg>, expression=Where(cond))`;
   the aggregate detectors (`_aggregate_of` / `_array_agg_arg` / `_string_agg_arg` / `_join_aggregate_of`)
@@ -5507,9 +5567,13 @@ shared storage engine or building large new protocol subsystems:
   computed values (add a `GENERATED … STORED` column and index that). Tests:
   `tests/test_sql_partial_index.py`. **Limitations:** `pg_index.indpred` still reflects as NULL (the
   index works + accelerates, but SQLAlchemy's `get_indexes` won't report it as partial — rendering the
-  Mongo filter back to a SQL predicate for `pg_get_expr` isn't done); a partial predicate that doesn't
-  lower to a field filter (e.g. a function call) would raise at CREATE rather than degrade to a full
-  index.
+  Mongo filter back to a SQL predicate for `pg_get_expr` isn't done);
+  ~~a partial predicate that doesn't lower to a field filter (e.g. a function
+  call) would raise at CREATE rather than degrade to a full index.~~
+  **Re-probed 2026-08-28 against PostgreSQL 14: the second half is STALE** —
+  `CREATE INDEX … WHERE length(t) > 2` is accepted, same as PG. The `indpred`
+  half is **CONFIRMED still open**: `pg_index.indpred IS NOT NULL` answers
+  `false` where PG answers `true`.
 - [x] **`DISTINCT ON` + `LATERAL` joins landed** (b82). **`DISTINCT ON (exprs)`** keeps the first row
   per distinct value of `exprs` in ORDER BY order (single-table + join) — routed through the evaluated
   path (`planner._distinct_on`, `EvaluatedSelectPlan.distinct_on`, dedup in `executor._evaluated_value_rows`);
