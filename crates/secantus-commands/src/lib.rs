@@ -803,13 +803,31 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             // `system.profile` entry when the per-database level requires it.
             let start = profile_eligible(name, doc).then(std::time::Instant::now);
             let mut reply = run_with_txn_envelope(name, handler, doc, ctx);
-            // A failpoint-configured writeConcernError attaches to a successful reply.
+            // A failpoint-configured writeConcernError attaches to a successful reply,
+            // AND so do the failpoint's errorLabels. The labels are what make the
+            // write retryable in the driver's eyes: without `RetryableWriteError`
+            // libmongoc never retries, so the two commandStartedEvents that
+            // /command_monitoring/unified/writeConcernError expects never happen.
+            // Attaching the wce alone left that test red on this server even after
+            // the replay fix (#1069) cleared it on the Python server -- caught by
+            // running BOTH C lanes rather than assuming they moved together.
             if let Some(m) = &fp {
                 if let Some(wce) = &m.write_concern_error {
                     if reply.get_f64("ok").unwrap_or(0.0) == 1.0
                         && !reply.contains_key("writeConcernError")
                     {
                         reply.insert("writeConcernError", Bson::Document(wce.clone()));
+                        if !m.error_labels.is_empty() && !reply.contains_key("errorLabels") {
+                            reply.insert(
+                                "errorLabels",
+                                Bson::Array(
+                                    m.error_labels
+                                        .iter()
+                                        .map(|l| Bson::String(l.clone()))
+                                        .collect(),
+                                ),
+                            );
+                        }
                     }
                 }
             }

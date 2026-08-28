@@ -870,6 +870,11 @@ fn map_err(e: WtError) -> StorageError {
             code: 14,
             errmsg: m,
         },
+        // Overlapping operator paths → mongod's ConflictingUpdateOperators (40).
+        WtError::UpdatePathConflict(m) => StorageError::WriteError {
+            code: 40,
+            errmsg: m,
+        },
         WtError::QueryUnsupported => StorageError::WriteError {
             code: 2,
             errmsg: "query uses a construct the Rust server does not support".to_string(),

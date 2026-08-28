@@ -905,6 +905,13 @@ pub fn apply_update_with(
     if !array_filters_valid(array_filters, update) {
         return Err(Fallback); // invalid arrayFilters -> Python raises the exact code
     }
+    // An update whose operators touch overlapping paths is rejected by mongod
+    // (code 40) rather than applied. Defer so the Python engine raises the exact
+    // error; the Rust server names it via `path_conflict_error` (it has no
+    // Python to fall back to).
+    if conflicting_update_paths(update).is_some() {
+        return Err(Fallback);
+    }
     let has_op = update.keys().any(|k| k.starts_with('$'));
     if has_op {
         if !update.keys().all(|k| k.starts_with('$')) {
@@ -951,6 +958,66 @@ pub fn apply_update_with(
         }
         Ok(new)
     }
+}
+
+/// Returns the offending path and the conflict point when two operators target
+/// overlapping paths.
+///
+/// mongod refuses an update whose operators touch paths that are equal, or where
+/// one is a prefix of the other: `{$set: {a: 2}, $inc: {"a.b": 1}}` cannot be
+/// applied because `$set` replaces the very subtree `$inc` wants to walk into.
+/// Siblings and disjoint paths are fine. Mirrors
+/// `update._conflicting_update_paths`.
+///
+/// `$rename` claims BOTH ends -- it writes one and removes the other -- except
+/// when they are equal, which mongod reports with its own dedicated error.
+pub fn conflicting_update_paths(update: &Document) -> Option<(String, String)> {
+    let mut seen: Vec<Vec<String>> = Vec::new();
+    for (op, payload) in update.iter() {
+        let Bson::Document(fields) = payload else {
+            continue;
+        };
+        for (field, value) in fields.iter() {
+            let mut paths = vec![field.clone()];
+            if op == "$rename" {
+                if let Some(dest) = value.as_str() {
+                    if dest != field {
+                        paths.push(dest.to_string());
+                    }
+                }
+            }
+            // Check every path of this field against paths claimed EARLIER, then
+            // claim them all. A `$rename`'s source and destination must not be
+            // compared with each other: mongod gives an overlapping pair its own
+            // error ("must not be on the same path", code 2), not a code-40
+            // conflict.
+            let mut claimed: Vec<Vec<String>> = Vec::new();
+            for path in paths {
+                let parts: Vec<String> = path.split('.').map(str::to_string).collect();
+                for prev in &seen {
+                    let n = parts.len().min(prev.len());
+                    if parts[..n] == prev[..n] {
+                        let shorter = if prev.len() <= parts.len() {
+                            prev.join(".")
+                        } else {
+                            parts.join(".")
+                        };
+                        return Some((path, shorter));
+                    }
+                }
+                claimed.push(parts);
+            }
+            seen.extend(claimed);
+        }
+    }
+    None
+}
+
+/// mongod's message for a path conflict, if this update has one.
+pub fn path_conflict_error(update: &Document) -> Option<String> {
+    conflicting_update_paths(update).map(|(offending, at)| {
+        format!("Updating the path '{offending}' would create a conflict at '{at}'")
+    })
 }
 
 /// The exact mongod error for a `$inc` / `$mul` the engine refused on type
