@@ -155,13 +155,28 @@ mongod answers 5733201. `update::arith_type_error` (2026-08-25) is the worked
 template. The porting half is done; do not plan a campaign around it without
 re-measuring first.
 
-**Mongo-side correctness (6)**: `top` counters always zero; the C-driver
-`writeConcernError` failure; `$meta` projection values; the aggregation
-error-wrapper prefix (characterised 2026-08-25, needs constant-fold modelling);
-change-stream awaitData with no `maxTimeMS`; multi-document update/delete
-chunking.
+**Mongo-side correctness (6 as classified; 2 remain after the 2026-08-28
+sweep)**. Five of the seven listed here and under Transactions were already
+fixed when re-probed — the classification was written from the boxes, and the
+boxes lagged:
 
-**Transactions (1)**: the user-transaction dirty-budget guard, Python side.
+    top counters always zero            FIXED 2026-08-27 (#1064)
+    C-driver writeConcernError          FIXED 2026-08-28 (#1071)
+    change-stream awaitData, no maxTimeMS   never a server bug (2026-08-27)
+    multi-document update/delete chunking   FIXED 2026-08-09 (#795 / #798)
+    user-transaction dirty-budget guard     FIXED 2026-08-09 (#791 / #792)
+
+Genuinely open: **`$meta` projection values** (narrowed 2026-08-28 — the
+inclusion-mode bug under it is fixed; what is left is the uncomputed metadata
+value plus `{$meta: "sortKey"}` in a *find* projection answering rows where
+mongod errors code 2), and the **aggregation error-wrapper prefix**
+(characterised 2026-08-25, needs constant-fold modelling; deliberately
+deferred).
+
+Add to this class the item measured 2026-08-28 and filed in §3:
+**wrong-typed command arguments** — 0 crashes after #1080, but **42 divergences**
+remain (24 slots silently accepted where mongod errors, 18 answered with the
+wrong code).
 
 ### Reading this list
 
@@ -7304,8 +7319,10 @@ distinct problems, triaged from the run logs:
   `tests/batch_insert.rs::large_batch_insert_survives_a_small_cache`
   (35k × 1.1KB @ 128M cache) + ordered/unordered cross-chunk semantics
   tests.
-- [ ] **User (multi-document) transactions dirty-budget guard** — the
-  remaining member of the livelock class. **Python server: DONE
+- [x] **RESOLVED 2026-08-09 (both servers) — User (multi-document) transactions
+  dirty-budget guard** — the remaining member of the livelock class. *Box flipped
+  2026-08-28: the work landed in #791 / #792 three weeks before, and the entry
+  below already said DONE on both servers.* **Python server: DONE
   (txn-too-large-guard slice)** — `_emit_oplog`'s buffering branch tracks
   the transaction's approximate write volume (`handle.dirty_bytes`, from
   the full-doc oplog entries; engine dirty ≈ 2×) and raises past ~15% of
@@ -7326,7 +7343,9 @@ distinct problems, triaged from the run logs:
   **The dirty-cache livelock class is now closed on both servers**:
   chunked batch inserts (#787 / #789) + the transaction dirty budget
   (Python #791 / #792+#793).
-- [ ] **OPEN — Multi-document update/delete chunking** — the class's final member:
+- [x] **RESOLVED 2026-08-09 (both servers) — Multi-document update/delete chunking**
+  — the class's final member (Rust #795, Python #798). *Box flipped 2026-08-28;
+  the entry below already said DONE on both servers.*
   updateMany / deleteMany rewrite an unbounded matched set. **Rust server:
   DONE (rust-multiwrite-chunked slice)** — `update_matching_core` routes
   multi=true (outside user transactions) through a chunked driver: one
