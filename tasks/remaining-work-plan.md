@@ -4,7 +4,7 @@
 > section at the bottom before trusting anything below. The dated *evidence*
 > here is durable; the *priorities* are a snapshot.
 >
-> **Where we are:** Phase 0 **complete** (both halves). Phase 1 **~2 of 9 items**
+> **Where we are:** Phase 0 **complete** (both halves). Phase 1 **~2 of 10 items**
 > substantially done. Phase 2 **not started**. 17 bugs fixed across the sweep,
 > six of them crash-class or silent wrong data.
 >
@@ -127,10 +127,15 @@ below Phase 1 should start until its item is reproduced.
 - [x] **Re-probe the Mongo-side classified items — DONE.** `top` counters had
       already been closed by another session (#1064); its *timings* were broken
       on Windows and are fixed. `$meta` projection turned out **worse than
-      recorded** — it discarded the whole document — and is fixed. The remaining
-      named items (C-driver `writeConcernError`, change-stream `awaitData`,
-      multi-doc chunking, txn dirty-budget) are **not yet probed**; the first two
-      are externally visible, the last two need code-level checks.
+      recorded** — it discarded the whole document — and is fixed. **The other
+      four were probed 2026-08-28 and all four are closed:** the C-driver
+      `writeConcernError` (#1071), change-stream `awaitData` with no `maxTimeMS`
+      (never a server bug), multi-document update/delete chunking (#795 / #798)
+      and the txn dirty-budget guard (#791 / #792). The last two landed
+      **2026-08-09** and both entries already said "DONE on both servers" in
+      their own body text — the boxes had simply never been flipped, so they read
+      as open defects for three weeks. Flipped, with dates, in `backlog.md`.
+      **This class is down to two: `$meta` values, and the wrapper prefix.**
       *Original text:* `top` counters, the C-driver
       `writeConcernError` failure, `$meta` projection values, change-stream
       `awaitData` with no `maxTimeMS`, multi-document update/delete chunking
@@ -176,8 +181,23 @@ Every item here was reproduced against an oracle in August 2026.
 `.x` path hunt likely surfaces the ORDER BY expansion point). Do them together.
 Sub-ms `ORDER BY` is adjacent to work already landed and should be cheap.
 
-### 1b. Mongo-side error fidelity — **0 of 2 done, 1 advanced**
+### 1b. Mongo-side error fidelity — **0 of 3 done, 1 advanced**
 
+- [ ] **Wrong-typed command arguments — 42 measured divergences.** The most
+      concrete item on this page, and the only one already scoped case-by-case.
+      Probed 2026-08-28 against mongod 6.0.16: 87 cases, 0 crashes, **42
+      divergences** — 24 slots silently accepted where mongod errors
+      (`create.storageEngine`, `collMod.index`, `aggregate.let`,
+      `find.collation`, `find.let`, `find.maxTimeMS`, `find.singleBatch`,
+      `findAndModify.upsert`, `update.updates.multi`) and 18 answered with the
+      wrong code (`find.min`/`.max`, `$lookup`, `$group`, `$sort`, `$unwind`).
+      Full breakdown in `backlog.md` §3; reproduce with
+      `tools/probes/arg_types_extended.py`. Third PR of an arc whose first two
+      landed (#1078 the document class, #1080 the crashes). **Take the 24
+      silently-accepted first** — those are where a driver's bug sails through
+      unnoticed. **Probe each slot; do not pattern-match:**
+      `delete.deletes.limit` is accepted by mongod where the analogous
+      `find.limit` is a type error.
 - [ ] **Aggregation runtime errors lack mongod's wrapper prefix.** Codes match;
       the message doesn't. mongod picks between
       `Failed to optimize pipeline :: caused by ::` and
