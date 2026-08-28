@@ -2063,17 +2063,34 @@ def _evaluated_value_rows(
         omap = enum_ordinals.get(i)
         return omap.get(v, len(omap)) if omap is not None and v is not None else v
 
+    # ORDER BY terms that name an SRF-produced output are resolved against the
+    # EXPANDED tuple, not the source row: one row fans out to many, so a
+    # source-row key is identical across every expanded row and a stable sort
+    # leaves them in array order. `ORDER BY 1` over `unnest` used to do exactly
+    # that, and `ORDER BY <alias>` raised 0A000 instead.
+    srf_out = getattr(plan, "order_srf_output", {}) or {}
     scored: list[tuple[tuple[Any, ...], tuple[Any, ...], tuple[Any, ...]]] = []
     for doc in docs:
         scope = make_scope(doc)
-        keys = tuple(_order_key(oe, i, scope) for i, (oe, _, _) in enumerate(plan.order))
-        # DISTINCT ON key (row-level, evaluated before any SRF expansion).
+        base_keys = tuple(
+            None if i in srf_out else _order_key(oe, i, scope)
+            for i, (oe, _, _) in enumerate(plan.order)
+        )
+        # DISTINCT ON key (row-level, evaluated before any SRF expansion —
+        # deliberately NOT resolved against the expanded tuple).
         don_key = (
             tuple(repr(scalar.evaluate(e, scope, sctx)) for e in plan.distinct_on)
             if plan.distinct_on
             else ()
         )
         for vt in _expand_srf(plan, scope, sctx):
+            if srf_out:
+                keys = tuple(
+                    vt[srf_out[i]] if i in srf_out and srf_out[i] < len(vt) else base_keys[i]
+                    for i in range(len(base_keys))
+                )
+            else:
+                keys = base_keys
             scored.append((keys, don_key, vt))
 
     _pg_sort(scored, lambda r: r[0], [(direction, nf) for _, direction, nf in plan.order])

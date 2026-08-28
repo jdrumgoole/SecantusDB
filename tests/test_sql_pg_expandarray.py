@@ -96,12 +96,19 @@ class TestFieldSelection:
             (1, 7),
         ]
 
-    def test_order_by_does_not_sort_expanded_rows(self, q):
-        """Known divergence, pre-existing and not specific to this function:
-        ORDER BY keys are computed per SOURCE row, before the set-returning
-        function expands it, so every expanded row shares one key and they keep
-        array order. Postgres would return 7, 8, 9 here. `unnest` behaves the
-        same way — see tasks/backlog.md. Pinned so a fix is a deliberate change.
+    def test_order_by_does_not_yet_sort_record_srf_rows(self, q):
+        """STILL OPEN, and narrower than it was.
+
+        `ORDER BY` over a plain `unnest` now sorts the expanded rows (see
+        `TestSrfOrdering`), but the *record*-SRF field form —
+        `(information_schema._pg_expandarray(arr)).x` — takes a different
+        planning route that the fix does not reach, so it keeps array order.
+        Postgres returns 7, 8, 9 here. Ordering by an alias on that form is
+        worse: `(...).n AS n ... ORDER BY n` answers 42703, which predates this
+        change (verified against the unpatched tree).
+
+        Pinned at the CURRENT behaviour so the remaining gap stays visible —
+        and named so it cannot be mistaken for the intended one.
         """
         assert q(
             "SELECT (information_schema._pg_expandarray(ARRAY[9, 8, 7])).x FROM src ORDER BY 1"
@@ -159,3 +166,36 @@ class TestSrfElementTypes:
             (1,),
             (2,),
         ]
+
+
+class TestSrfOrdering:
+    """`ORDER BY` over `unnest`, by ordinal and by output alias.
+
+    Ordering by the alias — the form a real query uses — raised `0A000`
+    outright; ordering by ordinal silently returned array order. Both are the
+    same defect: the sort key has to come from the expanded row.
+    PG-probed 14.
+    """
+
+    def test_order_by_ordinal(self, q):
+        assert q("SELECT unnest(ARRAY[9,8,7]) AS u FROM src ORDER BY 1") == [(7,), (8,), (9,)]
+
+    def test_order_by_output_alias(self, q):
+        assert q("SELECT unnest(ARRAY[9,8,7]) AS u FROM src ORDER BY u") == [(7,), (8,), (9,)]
+
+    def test_order_by_alias_descending(self, q):
+        assert q("SELECT unnest(ARRAY[7,9,8]) AS u FROM src ORDER BY u DESC") == [
+            (9,),
+            (8,),
+            (7,),
+        ]
+
+    def test_text_elements_sort_as_text(self, q):
+        assert q("SELECT unnest(ARRAY['c','a','b']) AS u FROM src ORDER BY 1") == [
+            ("a",),
+            ("b",),
+            ("c",),
+        ]
+
+    def test_without_order_by_array_order_is_kept(self, q):
+        assert q("SELECT unnest(ARRAY[9,8,7]) FROM src") == [(9,), (8,), (7,)]
