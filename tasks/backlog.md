@@ -20,6 +20,11 @@ when it existed.
 
 ## Triage: what is actually broken (2026-08-26)
 
+> **Sequenced in `tasks/remaining-work-plan.md` (2026-08-27)** — which phase to
+> do in what order, what is confirmed by measurement versus merely classified,
+> and the four probe techniques that found every bug in the August sweep. That
+> file points here; **this file wins** if the two disagree.
+
 The `- [ ]` count is not a work estimate. A pass over every open item found it
 mixes real defects with scope decisions, upstream bugs, performance work, and
 finished work whose box was never flipped. **Of 78 open items, 26 are real,
