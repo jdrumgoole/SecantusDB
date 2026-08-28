@@ -789,13 +789,16 @@ mod tests {
 
     #[test]
     fn meta_only_field_omitted() {
-        // A recognized-but-unsupported $meta arg: field omitted, inclusion keeps _id.
+        // The $meta field is omitted (not computed), but the DOCUMENT is
+        // untouched: `$meta` is a value re-shaper, not an inclusion. This used
+        // to assert `{"_id": 1}`, pinning the bug where asking for a metadata
+        // field discarded the caller's document. mongod-probed 6.0.16.
         assert_eq!(
             proj(
                 doc! {"_id": 1, "a": 1, "b": 2},
                 doc! {"m": {"$meta": "indexKey"}}
             ),
-            doc! {"_id": 1}
+            doc! {"_id": 1, "a": 1, "b": 2}
         );
     }
 
@@ -812,12 +815,14 @@ mod tests {
 
     #[test]
     fn meta_excludes_id() {
+        // `_id: 0` drops the identifier; the rest of the document stays.
+        // Previously asserted `{}` — see `meta_only_field_omitted`.
         assert_eq!(
             proj(
                 doc! {"_id": 1, "a": 1},
                 doc! {"_id": 0, "score": {"$meta": "sortKey"}}
             ),
-            doc! {}
+            doc! {"a": 1}
         );
     }
 
