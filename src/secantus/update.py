@@ -52,6 +52,25 @@ class UpdateError(Exception):
         self.code = code
 
 
+# Update errors that depend on the STORED DOCUMENT -- discoverable only while
+# applying the update to a particular doc, as opposed to parse errors readable
+# from the update spec alone.
+#
+# mongod 8.3.4 wraps these in "Plan executor error during update :: caused by ::".
+# mongod 6.0.16 does NOT -- the message bodies and codes are identical, only the
+# wrapper differs. We advertise 7.0 (`buildInfo.version`, maxWireVersion 17) and
+# have no 7.0 to probe, and `tests/test_mongod_differential.py` runs whatever
+# mongod is on PATH -- 6.0.16 here. So the wrapper is deliberately NOT emitted:
+# adding it on the evidence of a version NEWER than the one we advertise broke
+# five live differential cases.
+#
+# The classification is still worth naming, so the helper stays: if the target
+# ever moves to a version that wraps, this is the single place to do it.
+def _exec_error(message: str, code: int) -> UpdateError:
+    """An execution-time update error (see the note above on the 8.3 wrapper)."""
+    return UpdateError(message, code=code)
+
+
 def _is_inc_numeric(v: Any) -> bool:
     """Whether `$inc` / `$mul` may operate on an existing field value.
 
@@ -802,7 +821,7 @@ def _apply_op(
                     # where mongod refuses. bool is checked explicitly because
                     # Python makes it a subclass of int.
                     if not _is_inc_numeric(current):
-                        raise UpdateError(
+                        raise _exec_error(
                             f"Cannot apply $inc to a value of non-numeric type. "
                             f"{_render_doc_id(doc)} has the field '{concrete.split('.')[-1]}' "
                             f"of non-numeric type {_bson_type_name(current)}",
@@ -824,7 +843,7 @@ def _apply_op(
                     # string reach `bson_mul` (bare ValueError -> "internal server
                     # error") and silently multiplied a bool.
                     if not _is_inc_numeric(current):
-                        raise UpdateError(
+                        raise _exec_error(
                             f"Cannot apply $mul to a value of non-numeric type. "
                             f"{_render_doc_id(doc)} has the field '{concrete.split('.')[-1]}' "
                             f"of non-numeric type {_bson_type_name(current)}",
@@ -859,7 +878,12 @@ def _apply_op(
                 elif isinstance(arr, list):
                     arr = list(arr)
                 else:
-                    raise UpdateError(f"$push on non-array at {concrete!r}")
+                    raise _exec_error(
+                        f"The field '{concrete}' must be an array but is of type "
+                        f"{_bson_type_name(arr)} in document {{_id: "
+                        f"{_render_bson_scalar(doc.get('_id'))}}}",
+                        code=2,
+                    )
                 set_path(doc, concrete, _apply_push(arr, value))
     elif op == "$addToSet":
         for path, value in payload.items():
@@ -870,7 +894,11 @@ def _apply_op(
                 elif isinstance(arr, list):
                     arr = list(arr)
                 else:
-                    raise UpdateError(f"$addToSet on non-array at {concrete!r}")
+                    raise _exec_error(
+                        f"Cannot apply $addToSet to non-array field. Field named "
+                        f"'{concrete}' has non-array type {_bson_type_name(arr)}",
+                        code=2,
+                    )
                 # `$each` adds each element (deduped); otherwise the value itself.
                 to_add = value["$each"] if _is_each_modifier(value) else [value]
                 if _is_each_modifier(value) and not isinstance(value["$each"], list):
@@ -899,7 +927,7 @@ def _apply_op(
                 elif has_path(doc, concrete):
                     # mongod: a present but non-array target errors; a missing
                     # field is a silent no-op.
-                    raise UpdateError("Cannot apply $pull to a non-array value", code=2)
+                    raise _exec_error("Cannot apply $pull to a non-array value", code=2)
     elif op == "$pullAll":
         for path, values in payload.items():
             if not isinstance(values, list):
@@ -909,7 +937,7 @@ def _apply_op(
                 if isinstance(arr, list):
                     arr[:] = [e for e in arr if not any(e == v for v in values)]
                 elif has_path(doc, concrete):
-                    raise UpdateError("Cannot apply $pull to a non-array value", code=2)
+                    raise _exec_error("Cannot apply $pull to a non-array value", code=2)
     elif op == "$pop":
         for path, direction in payload.items():
             # mongod validates the $pop argument (probed 7.0.12): a bool is
@@ -926,6 +954,17 @@ def _apply_op(
                 )
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 arr = get_path(doc, concrete, default=None)
+                # A PRESENT non-array is an error; a missing field or an empty
+                # array are no-ops. Probed on mongod 8.3.4: `$pop` against
+                # `{a: 5}` is code 14, while a missing `a` or `a: []` return
+                # nModified 0. We silently skipped all three, so an invalid
+                # update reported success.
+                if arr is not None and not isinstance(arr, list):
+                    raise _exec_error(
+                        f"Path '{concrete}' contains an element of non-array type "
+                        f"'{_bson_type_name(arr)}'",
+                        code=14,
+                    )
                 if isinstance(arr, list) and arr:
                     if direction == 1:
                         arr.pop()
