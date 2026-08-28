@@ -2947,7 +2947,40 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
     if is_remove and update is not None:
         return {
             "ok": 0.0,
-            "errmsg": "Cannot specify both update and remove=true",
+            # mongod 6.0.16's wording; 8.3.4 quotes the field names
+            # ("both an 'update' and 'remove'=true"). We advertise 7.0 and the
+            # live differential gate runs PATH mongod, so 6.0's form ships.
+            "errmsg": "Cannot specify both an update and remove=true",
+            "code": 9,
+            "codeName": "FailedToParse",
+        }
+    if is_remove and return_new:
+        # mongod rejects this rather than ignoring `new` -- a remove has no
+        # "after" document to return. We used to accept it and remove anyway.
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                "Cannot specify both new=true and remove=true; "
+                "'remove' always returns the deleted document"
+            ),
+            "code": 9,
+            "codeName": "FailedToParse",
+        }
+    if is_remove and upsert:
+        # Likewise: upserting and removing in one command is contradictory.
+        return {
+            "ok": 0.0,
+            "errmsg": "Cannot specify both upsert=true and remove=true ",
+            "code": 9,
+            "codeName": "FailedToParse",
+        }
+    if update is not None and not isinstance(update, (Mapping, list)):
+        # A non-document, non-array `update` reached `apply_update`, which did
+        # `update.keys()` and raised AttributeError -- surfacing as a bare
+        # "internal server error" (code 1). mongod parses the argument first.
+        return {
+            "ok": 0.0,
+            "errmsg": "Update argument must be either an object or an array",
             "code": 9,
             "codeName": "FailedToParse",
         }
@@ -3048,8 +3081,11 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
                     "value": value,
                     "ok": 1.0,
                 }
+            # A remove that matched nothing reports only `n`; an update that
+            # matched nothing also reports `updatedExisting: false`. Probed
+            # identical on mongod 6.0.16 and 8.3.4.
             return {
-                "lastErrorObject": {"n": 0, "updatedExisting": False},
+                "lastErrorObject": ({"n": 0} if is_remove else {"n": 0, "updatedExisting": False}),
                 "value": None,
                 "ok": 1.0,
             }
@@ -3081,7 +3117,11 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
             if fields:
                 value = apply_projection(value, fields)
             return {
-                "lastErrorObject": {"n": 1, "updatedExisting": True},
+                # A remove's lastErrorObject carries only `n`. `updatedExisting`
+                # describes an UPDATE and mongod omits it here -- probed
+                # identical on 6.0.16 and 8.3.4. We emitted it, so a driver
+                # reading the field saw an update-shaped reply for a delete.
+                "lastErrorObject": {"n": 1},
                 "value": value,
                 "ok": 1.0,
             }
