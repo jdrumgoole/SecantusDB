@@ -401,67 +401,49 @@ Specific items that were left out of the slice that introduced their feature are
   UNwrapped -- the wrapper must not spread to errors that do not depend on the
   stored document.
 
-- [ ] **OPEN (narrowed to 18) — wrong-typed command arguments beyond the document
-  class (Python server).** **The 24 silently-accepted slots are FIXED
-  2026-08-28**; the 18 wrong-code ones remain, listed below. Sweep now reports
-  **0 crashes, 18 divergences** (was 24 + 44, then 0 + 42).** The document-valued sweep landed (#1078,
-  56/56 clean, was 45 crashes). Extending it to more commands and to other
-  argument CLASSES found the problem is wider — but **the crash half of this
-  entry is now closed**: #1080 fixed all 24 slots that answered `internal server
-  error` (code 1), namely `find`'s `limit` / `skip` / `batchSize`, `aggregate`'s
-  `cursor` and `cursor.batchSize`, `listIndexes.cursor`, `createIndexes.indexes`,
-  and a `$match` stage whose spec is not a document.
+- [x] **RESOLVED 2026-08-28/29 — wrong-typed command arguments (Python server).
+  The sweep is 87/87 clean**, from 24 crashes + 44 divergences when it started.
+  Reproduce with `tools/probes/arg_types_extended.py` against the mongod on PATH
+  (6.0.16 — see `tools/probes/README.md` on probing the version we advertise).
 
-  **Re-measured 2026-08-28** with `tools/probes/arg_types_extended.py` against
-  the mongod on PATH (**6.0.16** — see `tools/probes/README.md` on probing the
-  version we advertise first): 87 cases, **0 crashes, 42 divergences**. The
-  breakdown below is the whole list — the probe used to cap its printout at 22
-  findings, which hid 20 of these (including every `$unwind` row) behind an
-  accurate count; the cap is gone.
+  Landed in four PRs, one per failure mode:
 
-  **Silently accepted where mongod errors (24) — FIXED 2026-08-28.** All nine
-  slots now answer mongod's error, and `update.let` / `delete.let` /
-  `findAndModify.let` were probed and fixed alongside them. Nine slots needed
-  **six message families**, which is the entry's per-slot warning made concrete:
-  `findAndModify.upsert` takes a bool OR any number (`upsert: 1.5` is valid)
-  while the adjacent `update.updates.multi` is a strict bool that rejects
-  `multi: 1`; `find.let` reports as `FindCommandRequest.let` while every other
-  command's `let` uses its own name; `find.maxTimeMS` is code **2** with three
-  messages, the only non-TypeMismatch in the sweep. Six slots accept an explicit
-  `null`, three reject it.
+      #1078  document-valued arguments        45 crashes -> 0   (56/56 clean)
+      #1080  numeric / cursor arguments       24 crashes -> 0
+      #1084  silently accepted (24 slots)     accepted   -> mongod's error
+      ....   wrong code (18 slots)            our code   -> mongod's code
 
-  **Two further divergences found while probing, fixed with them:** an explicit
-  `null` was accepted for `find.filter` / `.sort` / `.projection` and for
-  `aggregate.cursor`, where mongod rejects it — `doc.get(...)` cannot tell an
-  absent option from a null one, so the null form slipped through the checks
-  #1078 and #1080 added. Pinned by `tests/test_arg_types_accepted_slots.py`
-  (79 tests), including one asserting `delete.deletes.limit` stays UNchecked.
+  **The lesson, which is the reason this took four PRs and not one: mongod's
+  strictness is per-slot, not per-class.** Nine slots in the third tranche alone
+  needed six different message families. Cases that a blanket rule gets wrong,
+  all measured rather than reasoned:
 
-  **Wrong code (18) — STILL OPEN.** We error, but not with mongod's code:
+      delete.deletes.limit    NOT type-checked at all -- {} / "x" / [1] / 0 all
+                              accepted, meaning "no limit", while the analogous
+                              find.limit IS a type error
+      findAndModify.upsert    bool OR any number (upsert: 1.5 is valid), while
+                              the adjacent update.updates.multi is a strict bool
+                              that rejects multi: 1
+      find.let                reported as `FindCommandRequest.let`, mongod's
+                              internal IDL name, while update / delete /
+                              findAndModify / aggregate use their command name
+      find.maxTimeMS          code 2, not 14, with three distinct messages
+      find.min / .max         type-checked at PARSE time, before hint validation
+      explicit null           accepted by six slots, rejected by three
 
-      find.min / find.max     5 / 'x' / True    mongod 14      we 51174
-      $lookup spec            5 / 'x' / True    mongod 9       we 14
-      $group spec             5 / 'x' / True    mongod 15947   we 14
-      $sort spec              5 / 'x' / True    mongod 15973   we 15976
-      $unwind spec            5 / [1]           mongod 15981   we 14
-      $unwind spec            {}                mongod 28812   we 28808
+  Two conflated conditions were each doing two jobs and are now split (with the
+  correct half pinned so it cannot regress): `$sort` answered "must have at
+  least one sort key" for a spec that was not an object, and `$unwind` answered
+  "expected a string as the path" for a spec with no `path` at all.
 
-  **Do NOT implement this by pattern.** mongod's strictness is per-slot, not
-  per-class: `delete.deletes.limit: {}` is ACCEPTED by mongod while the
-  analogous `find.limit: {}` is a type error. Probing each slot is the only way
-  to get it right — a blanket "validate every numeric argument" rule would
-  introduce a fresh divergence at `delete.limit`. #1080 hit that twice: it also
-  found `find`'s slots are reported under mongod's internal IDL name
-  (`FindCommandRequest.limit`, not `find.limit`), which no amount of reasoning
-  gets you.
+  Pinned by `tests/test_command_arg_types.py`, `tests/test_arg_types_numeric.py`,
+  `tests/test_arg_types_accepted_slots.py` and
+  `tests/test_arg_types_wrong_codes.py`.
 
-  Same reason the landed slice needed four distinct message families rather than
-  one: `find` says `Expected field filterto be of type object` (mongod's own
-  missing space), the CRUD commands say `BSON field '<path>' is the wrong type`,
-  `aggregate` says `'pipeline' option must be specified as an array`, and
-  `update`'s `u` accepts an object OR an array so a scalar is 9 while an array of
-  non-documents is 14.
-
+  **NOT done: the Rust server has never been swept for this class.** Every
+  number above is the Python server. The probe drives whatever is on the wire,
+  so pointing it at `secantusd-rs` is the whole of the measurement — do that
+  before assuming either result.
 - [ ] **OPEN — Admin UI saved-connections / settings page**: Slice 11 of the admin UI shipped schema sampler / logs viewer / geo viewer but skipped the planned `/settings` page with saved Mongo URIs and a manual dark/light toggle. The CLI today takes a single `--uri` per launch, so saved connections are bookmark-only (you can't switch targets after start). When the launcher gains hot-swap support, revisit this page — it's likely a small SQLite-backed list reusing the existing `~/.secantus/admin.db` store.
 
 ### 3.1 Authentication

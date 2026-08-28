@@ -2254,7 +2254,10 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         _err = _require_number_bson_field(doc.get(_fld), f"FindCommandRequest.{_fld}")
         if _err is not None:
             return _err
-    for _fld in ("filter", "sort", "projection", "collation"):
+    # `min` / `max` are the same family: mongod type-checks them at parse time
+    # and answers 14 BEFORE any hint validation, where we reached the index
+    # bound-checker and answered 51174.
+    for _fld in ("filter", "sort", "projection", "collation", "min", "max"):
         _err = _require_object_expected_field(doc, _fld)
         if _err is not None:
             return _err

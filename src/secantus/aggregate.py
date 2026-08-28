@@ -348,7 +348,15 @@ def _validate_sort_spec(spec: Any) -> None:
     """mongod's `$sort` stage validation: at least one key (15976); each direction
     is 1 / -1 as an int or whole double, else a non-numeric value is "Illegal key"
     (15974) and a numeric non-±1 is "must be 1 … or -1" (15975)."""
-    if not isinstance(spec, Mapping) or not spec:
+    if not isinstance(spec, Mapping):
+        # A wrong-TYPED spec and an EMPTY one are different errors on mongod
+        # (15973 vs 15976); we answered 15976 for both.
+        raise AggregateError(
+            "the $sort key specification must be an object",
+            code=15973,
+            code_name="Location15973",
+        )
+    if not spec:
         raise AggregateError(
             "$sort stage must have at least one sort key",
             code=15976,
@@ -799,6 +807,12 @@ def _densify_canon(value: Any) -> Any:
     return value
 
 
+_UNWIND_NO_PATH = object()
+"""Absent `path` -- distinct from `path: null`, which is 28808 not 28812."""
+
+_UNWIND_OPTIONS = frozenset({"path", "preserveNullAndEmptyArrays", "includeArrayIndex"})
+
+
 def _stage_unwind(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -807,7 +821,16 @@ def _stage_unwind(
         raw_path: Any = spec
         preserve_null = False
     elif isinstance(spec, Mapping):
-        raw_path = spec.get("path")
+        unknown = next((k for k in spec if k not in _UNWIND_OPTIONS), None)
+        if unknown is not None:
+            # Ahead of the no-path check: mongod answers 28811 for
+            # `{$unwind: {other: 1}}`, not 28812 (probed).
+            raise AggregateError(
+                f"unrecognized option to $unwind stage: {unknown}",
+                code=28811,
+                code_name="Location28811",
+            )
+        raw_path = spec.get("path", _UNWIND_NO_PATH)
         preserve_raw = spec.get("preserveNullAndEmptyArrays", False)
         if not isinstance(preserve_raw, bool):
             raise AggregateError(
@@ -834,7 +857,21 @@ def _stage_unwind(
                     code_name="Location28822",
                 )
     else:
-        raise AggregateError("$unwind requires a path string or document spec")
+        raise AggregateError(
+            "expected either a string or an object as specification for "
+            f"$unwind stage, got {_bson_type_name(spec)}",
+            code=15981,
+            code_name="Location15981",
+        )
+    if raw_path is _UNWIND_NO_PATH or raw_path == "":
+        # Both an ABSENT `path` and an empty one are "no path specified" on
+        # mongod; only a path of the wrong TYPE is 28808. An empty string used
+        # to fall through to the missing-`$` check and answer 28818.
+        raise AggregateError(
+            "no path specified to $unwind stage",
+            code=28812,
+            code_name="Location28812",
+        )
     if not isinstance(raw_path, str):
         raise AggregateError(
             f"expected a string as the path for $unwind stage, got {_bson_type_name(raw_path)}",
@@ -1084,8 +1121,18 @@ def _replace_root_one(
 def _stage_group(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    if not isinstance(spec, Mapping) or "_id" not in spec:
-        raise AggregateError("$group requires an _id expression")
+    if not isinstance(spec, Mapping):
+        raise AggregateError(
+            "a group's fields must be specified in an object",
+            code=15947,
+            code_name="Location15947",
+        )
+    if "_id" not in spec:
+        raise AggregateError(
+            "a group specification must include an _id",
+            code=15955,
+            code_name="Location15955",
+        )
     id_expr = spec["_id"]
     accumulators = {k: v for k, v in spec.items() if k != "_id"}
     # Pre-compile accumulators once: each entry is (field, handler, arg) where
@@ -1731,7 +1778,11 @@ def _stage_lookup(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
-        raise AggregateError("$lookup requires a document spec")
+        raise AggregateError(
+            f"the $lookup stage specification must be an object, but found {_bson_type_name(spec)}",
+            code=9,
+            code_name="FailedToParse",
+        )
     from_coll = spec.get("from")
     as_field = spec.get("as")
     if not (isinstance(from_coll, str) and isinstance(as_field, str)):
