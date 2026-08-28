@@ -283,8 +283,8 @@ Specific items that were left out of the slice that introduced their feature are
   deliberately, recorded rather than silently skipped.
 - ~~**Three-droplet DigitalOcean benchmark: no repeat-and-median mode**~~ — shipped. `--repeat N` interleaves the engines within each pass (so drift lands on both equally) and reports medians plus a `(max - min) / median` spread column and a per-pass table. Measured 3.4% spread for secantusdb and 1.1% for mongod over three 60s passes. The whole harness is now live-verified: provisioning, VPC + firewall, SSH, cloud-init, both deploy routes, both engines, repeat/median, and all three teardown modes. See `bench/DO_CLUSTER.md`.
 - [ ] **SecantusDB is 0.27x mongod on incompressible data; p99.9 is 72x worse (2026-08-21)**: the three-droplet comparison on identical `c-4` hardware, **8 KiB incompressible documents**, 70/20/10 mix, 16 workers x 2 client droplets, 4G WT cache both, three interleaved 90s passes (spreads 3.6% / 3.9%): secantusd-rs 0.5.3-beta.160 at **3,993 ops/s against mongod 8.0.29's 14,937**, p50 2.41ms vs 1.73ms, p99 64ms vs 10ms, **p99.9 1,303ms vs 18ms**. Both server-CPU-bound at 80-83% with clients idle, so the comparison is fair. **Supersedes the earlier 0.46x / 9.8-11.3x figure**, which was measured with the default `repeat` payload — a single repeated character that both engines compress away, and that flattered SecantusDB because mongod's snappy-compressed journal benefits far more than SecantusDB's uncompressed one. Published in `docs/benchmark.md`. Reproduce with `invoke do-bench --repeat 3 --payload random`. The tail is the weak point: p50 is within 1.4x, so typical operations are competitive; it is the worst 0.1% that collapses. Relates to the uncompressed-WAL and cache-pressure entries above and to the write-path gap in §7.
-- [ ] **OPEN — update error messages: mongod wraps EXECUTION-time errors, we don't
-  (Python server).** Probed on mongod 8.3.4 while differential-testing the update
+- [x] **RESOLVED 2026-08-28 — update error messages: mongod wraps EXECUTION-time
+  errors, we didn't (BOTH servers).** Probed on mongod 8.3.4 while differential-testing the update
   operator family. mongod prefixes errors that depend on the STORED DOCUMENT with
   `Plan executor error during update :: caused by :: `, and leaves errors
   determinable from the update spec alone plain:
@@ -301,10 +301,21 @@ Specific items that were left out of the slice that introduced their feature are
   `$push on non-array at 'a'` where mongod answers code **2** with
   `The field 'a' must be an array but is of type int in document {_id: 1}`.
 
-  Not fixed alongside the path-conflict slice on purpose: encoding the rule means
-  classifying every raise site in `update.py` as parse-time or execution-time AND
-  verifying each message BODY against mongod (only `$inc`'s is confirmed to
-  match), which is its own slice with its own full-suite run.
+  **Fixed.** All six execution-time cases now match mongod byte-for-byte (they
+  were 0/6). `$inc` / `$mul` / `$pull` needed only the wrapper; `$push` and
+  `$addToSet` needed mongod's code (2, not 9) and message bodies as well.
+
+  **The probe also turned up a correctness bug the entry had not noticed:**
+  `$pop` on a non-array was a SILENT NO-OP on both servers -- `n: 1`, no write
+  error, document untouched -- where mongod answers code 14. The Rust engine had
+  the same gap (a non-array fell through its `if let Some(Bson::Array(..))`) and
+  now defers. A missing field and an empty array stay no-ops on both, as on
+  mongod.
+
+  Pinned by `tests/test_update_execution_errors.py` (15 tests, 7 of which fail
+  with the fix reverted), including one asserting parse-time errors stay
+  UNwrapped -- the wrapper must not spread to errors that do not depend on the
+  stored document.
 
 - [ ] **OPEN — Admin UI saved-connections / settings page**: Slice 11 of the admin UI shipped schema sampler / logs viewer / geo viewer but skipped the planned `/settings` page with saved Mongo URIs and a manual dark/light toggle. The CLI today takes a single `--uri` per launch, so saved connections are bookmark-only (you can't switch targets after start). When the launcher gains hot-swap support, revisit this page — it's likely a small SQLite-backed list reusing the existing `~/.secantus/admin.db` store.
 

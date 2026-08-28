@@ -629,6 +629,16 @@ fn apply_op(
         "$pop" => {
             for (path, dir) in payload {
                 for cpath in expand_path(result, path, filters, pos)? {
+                    // A PRESENT non-array is an ERROR on mongod ("Path 'a'
+                    // contains an element of non-array type 'int'", code 14); a
+                    // missing field or an empty array are no-ops. The `if let`
+                    // below silently skips all three, so an invalid update
+                    // reported success. Defer so Python raises the exact error.
+                    if let Some(v) = get_path(result, &cpath) {
+                        if !matches!(v, Bson::Array(_)) {
+                            return Err(Fallback);
+                        }
+                    }
                     if let Some(Bson::Array(a)) = get_path(result, &cpath) {
                         if a.is_empty() {
                             continue;
