@@ -20,6 +20,13 @@ from secantus import SecantusDBServer
 NOT_NUMBERS = [{}, "x", [1], True]
 
 
+def _bson_type_name(value: object) -> str:
+    """mongod's type vocabulary for the values this file feeds in."""
+    if isinstance(value, bool):
+        return "bool"
+    return {dict: "object", str: "string", list: "array"}[type(value)]
+
+
 @pytest.fixture
 def db(tmp_path):
     srv = SecantusDBServer(port=0, storage_path=str(tmp_path / "data"))
@@ -50,7 +57,7 @@ def test_find_numeric_slots(db, field, bad) -> None:
     assert err.code == 14
     assert err.details["errmsg"] == (
         f"BSON field 'FindCommandRequest.{field}' is the wrong type "
-        f"'{'bool' if isinstance(bad, bool) else {dict: 'object', str: 'string', list: 'array'}[type(bad)]}', "
+        f"'{_bson_type_name(bad)}', "
         "expected types '[long, int, decimal, double']"
     )
 
