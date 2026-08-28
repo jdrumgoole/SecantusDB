@@ -200,6 +200,9 @@ wheel.packages = ["src/secantus"]
 # vendor/wiredtiger contains GPL'd C source; cibuildwheel needs it.
 sdist.include = ["vendor/wiredtiger/**"]
 sdist.exclude = [
+    # Differential probes are a development tool (they need a live mongod
+    # alongside SecantusDB), same rationale as the gauge dirs below.
+    "tools/**",
     "vendor/wiredtiger/test/**",
     "vendor/wiredtiger/bench/**",
     "vendor/wiredtiger/examples/**",
