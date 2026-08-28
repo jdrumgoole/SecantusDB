@@ -181,23 +181,14 @@ Every item here was reproduced against an oracle in August 2026.
 `.x` path hunt likely surfaces the ORDER BY expansion point). Do them together.
 Sub-ms `ORDER BY` is adjacent to work already landed and should be cheap.
 
-### 1b. Mongo-side error fidelity — **0 of 3 done, 1 advanced**
+### 1b. Mongo-side error fidelity — **1 of 3 done, 1 advanced**
 
-- [ ] **Wrong-typed command arguments — 42 measured divergences.** The most
-      concrete item on this page, and the only one already scoped case-by-case.
-      Probed 2026-08-28 against mongod 6.0.16: 87 cases, 0 crashes, **42
-      divergences** — 24 slots silently accepted where mongod errors
-      (`create.storageEngine`, `collMod.index`, `aggregate.let`,
-      `find.collation`, `find.let`, `find.maxTimeMS`, `find.singleBatch`,
-      `findAndModify.upsert`, `update.updates.multi`) and 18 answered with the
-      wrong code (`find.min`/`.max`, `$lookup`, `$group`, `$sort`, `$unwind`).
-      Full breakdown in `backlog.md` §3; reproduce with
-      `tools/probes/arg_types_extended.py`. Third PR of an arc whose first two
-      landed (#1078 the document class, #1080 the crashes). **Take the 24
-      silently-accepted first** — those are where a driver's bug sails through
-      unnoticed. **Probe each slot; do not pattern-match:**
-      `delete.deletes.limit` is accepted by mongod where the analogous
-      `find.limit` is a type error.
+- [x] **Wrong-typed command arguments — DONE, sweep is 87/87 clean.** Was 24
+      crashes + 44 divergences; closed across four PRs (#1078 document-valued,
+      #1080 numeric/cursor, #1084 the 24 silently-accepted, plus the wrong-code
+      slice). Detail and the per-slot lessons are in `backlog.md` §3. **The Rust
+      server has not been swept for this class** — point the same probe at
+      `secantusd-rs` to find out; that measurement has never been taken.
 - [ ] **Aggregation runtime errors lack mongod's wrapper prefix.** Codes match;
       the message doesn't. mongod picks between
       `Failed to optimize pipeline :: caused by ::` and

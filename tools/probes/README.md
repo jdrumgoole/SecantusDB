@@ -38,7 +38,7 @@ version-dependent.
 | script | area | last result |
 |---|---|---|
 | `arg_types_documents.py` | document-valued command arguments | 56/56 clean (was 45 crashes) |
-| `arg_types_extended.py` | more commands + numeric/string/bool argument classes | **0 crashes, 42 divergences — open** (crashes closed by #1080; re-measured 2026-08-28 vs mongod 6.0.16) |
+| `arg_types_extended.py` | more commands + numeric/string/bool argument classes | **87/87 clean** (was 24 crashes + 44 divergences; closed by #1078 / #1080 / #1084 and the wrong-code slice) |
 | `findandmodify_shapes.py` | findAndModify replies and argument validation | 18/18 clean (was 6 divergences) |
 | `update_operators.py` | update operator semantics and errors | clean except the filed items |
 | `update_path_conflicts.py` | overlapping update operator paths | 12/12 clean (was 8 wrong results) |
