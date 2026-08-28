@@ -242,6 +242,14 @@ def _stage_match(
 ) -> list[dict[str, Any]]:
     from secantus.collation import parse as _parse_collation
 
+    if not isinstance(spec, Mapping):
+        # A non-document $match spec reached the matcher and crashed as
+        # "internal server error"; mongod names it with its own code.
+        raise AggregateError(
+            "the match filter must be an expression in an object",
+            code=15959,
+            code_name="Location15959",
+        )
     coll_obj = _parse_collation(ctx.collation)
     return [d for d in docs if matches(d, spec, vars=ctx.vars, collation=coll_obj)]
 
