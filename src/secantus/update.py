@@ -324,6 +324,64 @@ def apply_update_batch(
     return [apply_update(d, update, is_upsert=is_upsert) for d in docs]
 
 
+def _conflicting_update_paths(update: Mapping[str, Any]) -> tuple[str, str] | None:
+    """``(offending_path, conflict_point)`` if two operators target the same path.
+
+    mongod rejects an update whose operators touch paths where one is EQUAL TO or
+    a PREFIX OF another -- ``{$set: {a: 2}, $inc: {a.b: 1}}`` cannot be applied
+    because ``$set`` replaces the very subtree ``$inc`` wants to walk into.
+    Sibling and disjoint paths are fine.
+
+    Probed on mongod 8.3.4; the message names the SECOND path encountered and the
+    common prefix::
+
+        {$set: {a: 2},   $inc: {a: 1}}       path 'a'     conflict at 'a'
+        {$set: {a: 2},   $inc: {a.b: 1}}     path 'a.b'   conflict at 'a'
+        {$set: {a.b: 2}, $inc: {a: 1}}       path 'a'     conflict at 'a'
+        {$set: {a.b: 2}, $inc: {a.b.c: 1}}   path 'a.b.c' conflict at 'a.b'
+        {$rename: {a: b}, $set: {b: 9}}      path 'b'     conflict at 'b'
+
+    ``$rename`` claims BOTH its source and its destination -- it writes one and
+    removes the other, so either colliding with another operator is a conflict.
+
+    We used to apply every operator regardless and return a document mongod
+    would have refused to produce: ``{$set: {a: 2}, $inc: {a: 1}}`` yielded
+    ``{a: 3}``. Silently wrong, with no error to notice.
+    """
+    seen: list[tuple[str, tuple[str, ...]]] = []
+    for op, payload in update.items():
+        if not isinstance(payload, Mapping):
+            continue
+        for field in payload:
+            paths = [field]
+            if op == "$rename":
+                dest = payload.get(field)
+                # A self-rename is not a path conflict -- mongod has a dedicated
+                # error for it ("The source and target field for $rename must
+                # differ", code 2). Claiming both ends here would preempt that
+                # with a code-40 conflict instead.
+                if isinstance(dest, str) and dest != field:
+                    paths.append(dest)
+            # Check every path of this field against paths claimed EARLIER, then
+            # claim them all. A ``$rename``'s source and destination must not be
+            # compared with each other: mongod gives an overlapping pair its own
+            # error ("The source and target field for $rename must not be on the
+            # same path", code 2), not the code-40 conflict.
+            claimed = []
+            for path in paths:
+                parts = tuple(path.split("."))
+                for prev_path, prev_parts in seen:
+                    if prev_parts == parts:
+                        return path, prev_path
+                    n = min(len(parts), len(prev_parts))
+                    if parts[:n] == prev_parts[:n]:
+                        shorter = prev_path if len(prev_parts) <= len(parts) else path
+                        return path, shorter
+                claimed.append((path, parts))
+            seen.extend(claimed)
+    return None
+
+
 def apply_update(
     doc: dict[str, Any],
     update: Mapping[str, Any] | list[Mapping[str, Any]],
@@ -345,6 +403,13 @@ def apply_update(
     if has_op:
         if not all(k.startswith("$") for k in keys):
             raise UpdateError("update document cannot mix operators with replacement fields")
+        conflict = _conflicting_update_paths(update)
+        if conflict is not None:
+            offending, at = conflict
+            raise UpdateError(
+                f"Updating the path '{offending}' would create a conflict at '{at}'",
+                code=40,
+            )
         result = copy.deepcopy(doc)
         for op, payload in update.items():
             if op == "$setOnInsert" and not is_upsert:

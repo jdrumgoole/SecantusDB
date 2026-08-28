@@ -1414,6 +1414,8 @@ pub enum StorageError {
     /// a non-numeric `$inc` / `$mul`, which mongod answers with TypeMismatch
     /// (14). Distinct from `QueryUnsupported`, which means "can't evaluate".
     UpdateTypeMismatch(String),
+    /// Two update operators target overlapping paths (mongod: code 40).
+    UpdatePathConflict(String),
     /// A query filter used a construct the Rust query engine can't evaluate
     /// (the `matches` "defer to Python" signal). The server's engine selection
     /// is responsible for not routing such queries to the Rust storage.
@@ -1465,6 +1467,7 @@ impl std::fmt::Display for StorageError {
             StorageError::IndexOptionsConflict(m) => write!(f, "{m}"),
             StorageError::IndexKeySpecsConflict(m) => write!(f, "{m}"),
             StorageError::UpdateTypeMismatch(m) => write!(f, "{m}"),
+            StorageError::UpdatePathConflict(m) => write!(f, "{m}"),
             StorageError::QueryUnsupported => {
                 write!(f, "query construct not supported by the Rust query engine")
             }
@@ -9915,6 +9918,10 @@ impl Storage {
                         // becomes a generic BadValue (2) on this server, which
                         // has no Python to fall back to, where mongod answers
                         // TypeMismatch (14).
+                        if let Some(m) = secantus_core::update::path_conflict_error(update) {
+                            // Overlapping operator paths -> mongod's code 40.
+                            return StorageError::UpdatePathConflict(m);
+                        }
                         match secantus_core::update::arith_type_error(doc, update) {
                             Some(m) => StorageError::UpdateTypeMismatch(m),
                             None => StorageError::QueryUnsupported,
