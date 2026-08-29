@@ -1129,7 +1129,7 @@ These are explicit non-goals. Don't add them without a reason.
   a documented contract. Not chased for the same reason as above.
 
 - [ ] **The error surface is conformant to mongod 6.0, and diverges from 8.x in
-  18 known places (2026-08-29).** `src/secantus/commands.py` alone cites 6.0.16
+  23 known places (2026-08-29).** `src/secantus/commands.py` alone cites 6.0.16
   in 45 places, including error strings reproduced *verbatim, unbalanced quotes
   and all* (`expected types '[bool, long, int, decimal, double']` — mongod 6.0
   really does put the closing quote inside the bracket). Against mongod **8.2.1**
@@ -1147,14 +1147,22 @@ These are explicit non-goals. Don't add them without a reason.
   - plus **unknown-field errors** naming the IDL struct:
     `BSON field 'distinct.zz'` → `'distinctCommandRequest.zz'`.
 
+  - plus **IDL-parsed stages**: `$lookup` gained IDL parsing, so a missing `as`
+    is `40414 "BSON field '$lookup.as' is missing but a required field"` on 8.x
+    where 6.0 hand-writes `9 "must specify 'as' field for a $lookup"`; unknown
+    `$lookup` arguments likewise `9` → `40415`.
+
   `tests/test_mongod_differential.py` spawns whatever `mongod` is on PATH and
-  asserts EXACT equality, so on an 8.x box these read as 18 SecantusDB failures
-  when they are version differences. They are now gated by
-  `_VERSION_SENSITIVE_CASES` + `PROBED_MONGOD_SERIES` and skip with an explicit
-  reason off 6.0; on a 6.0 box every case still runs and asserts. **This hid a
-  real gap twice over:** CI installs mongosh and database-tools but *not*
-  `mongod`, so `@requires_mongod` skips the whole file there — the gate only
-  ever runs on a dev box, and only tells the truth on a 6.0 one.
+  asserts EXACT equality, so on an 8.x box these read as SecantusDB failures
+  when they are version differences. The whole file is now gated on
+  `PROBED_MONGOD_SERIES` and skips with an explicit reason off 6.0; on a 6.0 box
+  every case runs and asserts. **A per-case allow-list was tried first and
+  rejected:** it must be maintained by whoever adds a case, and they cannot see
+  the problem — dev boxes that run this are on 6.0, and CI installs mongosh and
+  database-tools but *not* `mongod`, so `@requires_mongod` skips the file there
+  entirely. In one afternoon three PRs added cases failing only on 8.2.1 (17,
+  then 1, then 5). **The cost of the file-level gate is real:** on a non-6.0 box
+  this file gives no coverage at all.
   **Decide before it drifts further:** either stay on 6.0 deliberately (and say
   so in the docs), or retarget to a supported server and update all 45 probe
   sites. Do not "fix" individual cases to match whatever mongod is local — that

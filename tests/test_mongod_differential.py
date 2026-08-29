@@ -42,64 +42,44 @@ MONGOD = shutil.which("mongod")
 requires_mongod = pytest.mark.skipif(MONGOD is None, reason="no mongod on PATH")
 
 
-# The mongod series every expectation in this file was probed against. The rest
-# of the codebase is probed the same way -- ``src/secantus/commands.py`` alone
-# cites 6.0.16 in 45 places, including error strings reproduced "verbatim,
-# unbalanced quotes and all".
-PROBED_MONGOD_SERIES = (6, 0)
-
-# Cases whose expected value is a mongod ERROR SURFACE that moved after 6.0.
+# Whether this gate can say anything at all on the server it found.
 #
-# This gate spawns whatever ``mongod`` is on PATH and asserts EXACT equality,
-# so a newer server turns a conformance check into a version diff. Observed
-# 6.0.16 -> 8.2.1, all four families at once:
+# Every expectation here is an EXACT match against mongod, and mongod's error
+# surface moves between majors. Observed 6.0.16 -> 8.2.1, all at once:
 #
 #   * negative cursor sizing   51024 Location51024 -> 2 BadValue
 #   * expected-type lists      '[bool, long, int, decimal, double']  (closing
 #                              quote INSIDE the bracket, a real 6.0 quirk)
 #                              -> '[int, decimal, long, bool, double]'
-#                              (well-formed, and reordered)
 #   * update / aggregate       bare message -> wrapped in "Plan executor error
-#     failures                 during update :: caused by :: " and "Executor
-#                              error during aggregate command on namespace: ..."
+#     failures                 during update :: caused by :: " / "Executor error
+#                              during aggregate command on namespace: ... "
 #   * null-valued arguments    rejected (10065) -> treated as absent
+#   * IDL-parsed stages        $lookup gained IDL parsing: hand-written
+#                              9 "must specify 'as' field for a $lookup" ->
+#                              40414 "BSON field '$lookup.as' is missing but a
+#                              required field"; unknown fields likewise 9 -> 40415
+#   * unknown-field errors     name the IDL struct: 'distinct.zz' ->
+#                              'distinctCommandRequest.zz'
 #
-# SecantusDB deliberately reproduces the 6.0 forms, so "fixing" these to match a
-# newer server would BREAK the target it is written against. They are therefore
-# skipped, not xfailed: on an unprobed server there is no correct answer to
-# assert, and an xpass on some third version would be just as misleading.
+# SecantusDB deliberately reproduces the 6.0 forms (commands.py alone cites
+# 6.0.16 in 45 places), so "fixing" a case to match a newer server would break
+# the target the code is written against.
 #
-# The 105 cases NOT listed here are version-stable and keep running everywhere.
-# When adding a case whose expectation is an error code or message text, check
-# it against a second major before assuming it belongs outside this set.
-_VERSION_SENSITIVE_CASES = frozenset(
-    {
-        # negative cursor-sizing values: Location51024 -> BadValue
-        "cursor-find-limit-negative",
-        "cursor-find-skip-negative",
-        "cursor-find-batchsize-negative",
-        "cursor-getmore-batchsize-negative",
-        "cursor-agg-cursor-batchsize-negative",
-        # expected-type list: ordering and the misplaced closing quote
-        "cursor-getmore-batchsize-string",
-        "fam-remove-wrong-type",
-        "fam-new-wrong-type",
-        # executor-error prefixes added after 6.0
-        "updatecmd-cmd-path-not-viable",
-        "update-inc-type-error-message-names-the-doc-id",
-        "update-inc-type-error-dotted-path-names-the-leaf",
-        "update-inc-type-error-on-null-field",
-        "update-inc-type-error-with-objectid-id",
-        "update-mul-type-error-message-names-the-doc-id",
-        "query-densify-non-numeric-field-is-rejected",
-        # null-valued arguments: rejected on 6.0, treated as absent later
-        "fam-arrayfilters-null",
-        "cursor-killcursors-null-cursors",
-        # unknown-field errors name the IDL struct, and it was renamed:
-        # "BSON field 'distinct.zz'" -> "BSON field 'distinctCommandRequest.zz'"
-        "hint-distinct-unknown-field",
-    }
-)
+# WHY THE WHOLE FILE, NOT A LIST OF KNOWN-VARIANT CASES. That was tried first.
+# It needs updating by whoever adds a case -- and they cannot see the problem:
+# the dev boxes that run this are on 6.0, and CI installs mongosh and
+# database-tools but NOT mongod, so @requires_mongod skips this file there
+# entirely. In one afternoon three separate PRs added cases that failed only on
+# 8.2.1 (17, then 1, then 5). A list that only a minority of boxes can maintain
+# rots into recurring false failures. Gating the file is self-maintaining: a new
+# case needs no thought, and the gate can never claim a divergence it cannot
+# actually judge.
+#
+# The cost is real: on a non-6.0 box this file provides no coverage. That is the
+# honest answer -- on an unprobed server an exact-match gate has no expectation
+# to assert. Run it on 6.0 (or retarget deliberately; see backlog.md 5).
+PROBED_MONGOD_SERIES = (6, 0)
 
 
 def _free_port() -> int:
@@ -1508,14 +1488,13 @@ def test_matches_mongod(
 ) -> None:
     """SecantusDB must answer exactly what mongod answers."""
     name, seed, op = case
-    case_id = f"{kind}-{name}"
-    if case_id in _VERSION_SENSITIVE_CASES and mongod_version != PROBED_MONGOD_SERIES:
+    if mongod_version != PROBED_MONGOD_SERIES:
         probed = ".".join(str(p) for p in PROBED_MONGOD_SERIES)
         found = ".".join(str(p) for p in mongod_version)
         pytest.skip(
-            f"{case_id} asserts a mongod {probed} error surface that changed in "
-            f"later servers; this box has mongod {found}. Not a SecantusDB "
-            f"divergence -- see _VERSION_SENSITIVE_CASES."
+            f"this gate asserts an exact match against mongod {probed}, and this "
+            f"box has mongod {found}; its error surface differs in ways that are "
+            f"not SecantusDB divergences. See PROBED_MONGOD_SERIES."
         )
     db_name = f"diff_{kind}_{name.replace('-', '_')}"
     ours = _run(secantus_uri, db_name, seed, op)
