@@ -2019,7 +2019,12 @@ def _stage_lookup_pipeline(
 
     out: list[dict[str, Any]] = []
     for doc in docs:
-        bound = {name: evaluate(expr, doc, ctx.vars) for name, expr in let_spec.items()}
+        # FIELD-VALUE position: a `let` var bound from an absent field stays
+        # MISSING rather than collapsing to null, so `$eq: ["$f", "$$v"]`
+        # against an explicitly-null foreign value is false the way mongod's
+        # is. Binding null made a document without the local field join rows
+        # mongod excludes.
+        bound = {name: evaluate_or_missing(expr, doc, ctx.vars) for name, expr in let_spec.items()}
         if isinstance(local_field, str) and isinstance(foreign_field, str):
             local_value = get_path(doc, local_field)
             if use_index:

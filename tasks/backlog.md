@@ -1090,6 +1090,23 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [x] **Missing-vs-null sweep — the confusion was real but NARROW (2026-08-29).**
+  Motivated by the Phase 2 campaign, where conflating an absent field with an
+  explicit null produced both `$graphLookup` bugs and the `$lookup` `let` gap.
+  25 shapes probed; **22 were already correct**, because the *query* language
+  genuinely does treat them alike (`{a: null}` matches a missing field — that
+  is mongod's rule, not our bug). The divergence was confined to the
+  **comparison operators**: `$eq: ["$absent", null]` answered true where mongod
+  answers false, a missing field did not rank below other values, and `$let` /
+  `$lookup`'s `let` bound it as null. All fixed, in both engines.
+  **The useful part is the scoping.** This was recorded during the `$lookup`
+  batch as needing "a missing sentinel in `expressions.py`, which touches every
+  operator" — it did not. The sentinel already existed (`evaluate_or_missing`,
+  used by accumulators and `$project`); only the comparisons failed to use it.
+  An estimate made from reading was wrong in the expensive direction, and one
+  probe corrected it. Same lesson as the `$graphLookup` "does not recurse"
+  misread earlier the same day.
+
 - [x] **Change-stream spec sweep — 13 of 13 shapes diverged, all fixed
   (2026-08-29).** Phase 2's fifth and last surface. One crash (a resume token
   that is valid hex but not valid BSON raised `InvalidBSON` as
