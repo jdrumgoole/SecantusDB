@@ -283,9 +283,43 @@ def _stage_count(
 
 
 def _fmt_stage_val(v: Any) -> str:
-    """Render a $limit/$skip argument the way mongod prints it in the error."""
+    """Render a $limit/$skip argument the way mongod prints it in the error.
+
+    mongod echoes the offending value shell-style, probed on 6.0.16:
+
+        "x"   ""   true   false   null   1.5
+        [ 1 ]   [ 1, "a" ]   []
+        { a: 1 }   {}
+        ObjectId('64b7…')      new Date(1767323045000)
+
+    This used to be `str()` / `repr()`, which renders a string bare (`x`) and an
+    array unspaced (`[1]`) — the CODE was right, so the differential sweep never
+    caught it (`arg_types_extended.py` compares codes only). Found 2026-08-29
+    while porting this validation to the Rust server, which forced the question
+    of what the message should actually say.
+    """
+    from bson import Decimal128, ObjectId
+
     if isinstance(v, bool):
         return "true" if v else "false"
+    if v is None:
+        return "null"
+    if isinstance(v, str):
+        return f'"{v}"'
+    if isinstance(v, ObjectId):
+        return f"ObjectId('{v}')"
+    if isinstance(v, _dt.datetime):
+        return f"new Date({int(v.timestamp() * 1000)})"
+    if isinstance(v, Decimal128):
+        return str(v)
+    if isinstance(v, (list, tuple)):
+        if not v:
+            return "[]"
+        return "[ " + ", ".join(_fmt_stage_val(x) for x in v) + " ]"
+    if isinstance(v, Mapping):
+        if not v:
+            return "{}"
+        return "{ " + ", ".join(f"{k}: {_fmt_stage_val(x)}" for k, x in v.items()) + " }"
     return repr(v) if isinstance(v, float) else str(v)
 
 
@@ -293,24 +327,38 @@ def _stage_nonneg_int(spec: Any, stage: str, code: int) -> int:
     """Validate a $limit/$skip argument like mongod: a whole-number double is
     accepted (coerced to int); a bool / non-number, a fractional double, and a
     negative value each raise `code` with mongod's exact per-case message."""
+    from bson import Decimal128
+
+    # `original` is what the message echoes: mongod prints the value the CLIENT
+    # sent, so a whole-float `-2.0` reports `-2.0` and not the `-2` we coerce it
+    # to below.
+    original = spec
+    is_decimal = isinstance(spec, Decimal128)
+    if is_decimal:
+        # mongod accepts a decimal here — `$skip: Decimal128("2")` runs — and
+        # gives a non-integral one its OWN message, distinct from a double's.
+        spec = float(spec.to_decimal())
     if isinstance(spec, bool) or not isinstance(spec, (int, float)):
         raise AggregateError(
             f"invalid argument to {stage} stage: Expected a number in: "
-            f"{stage}: {_fmt_stage_val(spec)}",
+            f"{stage}: {_fmt_stage_val(original)}",
             code=code,
         )
     if isinstance(spec, float):
         if not spec.is_integer():
+            # A fourth message family, and only for decimals (probed 6.0.16):
+            #   1.5             -> Expected an integer
+            #   Decimal("1.5")  -> Cannot represent as a 64-bit integer
+            reason = "Cannot represent as a 64-bit integer" if is_decimal else "Expected an integer"
             raise AggregateError(
-                f"invalid argument to {stage} stage: Expected an integer: "
-                f"{stage}: {_fmt_stage_val(spec)}",
+                f"invalid argument to {stage} stage: {reason}: {stage}: {_fmt_stage_val(original)}",
                 code=code,
             )
         spec = int(spec)
     if spec < 0:
         raise AggregateError(
             f"invalid argument to {stage} stage: Expected a non-negative number in: "
-            f"{stage}: {spec}",
+            f"{stage}: {_fmt_stage_val(original)}",
             code=code,
         )
     return spec

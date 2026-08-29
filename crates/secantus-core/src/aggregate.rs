@@ -434,6 +434,14 @@ fn stage_nonneg_int(spec: &Bson) -> R<usize> {
         Bson::Int32(n) => *n as i64,
         Bson::Int64(n) => *n,
         Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => *d as i64,
+        // A decimal IS a number here: mongod runs `$skip: Decimal128("2")`
+        // (probed 6.0.16), and the pure engine accepts it too, so deferring
+        // would answer a generic BadValue on the Rust server where mongod
+        // answers rows.
+        Bson::Decimal128(d) => match d.to_string().parse::<f64>() {
+            Ok(v) if v.is_finite() && v.fract() == 0.0 => v as i64,
+            _ => return Err(Fallback),
+        },
         _ => return Err(Fallback), // bool / fractional / non-number
     };
     if n < 0 {

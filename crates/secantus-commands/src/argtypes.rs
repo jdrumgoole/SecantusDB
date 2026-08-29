@@ -309,6 +309,13 @@ fn render_stage_value(v: &Bson) -> String {
             }
         }
         Bson::Null => "null".to_string(),
+        // Without this a decimal rendered as its debug form,
+        // `Decimal128(0f00...)`, instead of `1.5`.
+        Bson::Decimal128(d) => d.to_string(),
+        // Single quotes and a millisecond epoch -- mongod's shell forms, not
+        // Rust's debug ones (`ObjectId("…")` / `DateTime(2026-01-02 …)`).
+        Bson::ObjectId(oid) => format!("ObjectId('{oid}')"),
+        Bson::DateTime(d) => format!("new Date({})", d.timestamp_millis()),
         Bson::Array(a) if a.is_empty() => "[]".to_string(),
         Bson::Array(a) => format!(
             "[ {} ]",
@@ -318,6 +325,13 @@ fn render_stage_value(v: &Bson) -> String {
                 .join(", ")
         ),
         Bson::Document(d) if d.is_empty() => "{}".to_string(),
+        Bson::Document(d) => format!(
+            "{{ {} }}",
+            d.iter()
+                .map(|(k, v)| format!("{k}: {}", render_stage_value(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         other => format!("{other:?}"),
     }
 }
@@ -366,18 +380,62 @@ pub fn stage_spec_error(pipeline: &[Bson]) -> Option<(i32, String)> {
                 "the count field must be a non-empty string".to_string(),
             )),
             "$limit" | "$skip" => {
-                // 5107201 / 5107200. A whole-number double is fine; a bool is NOT
-                // a number even where the host language says otherwise.
+                // 5107201 / 5107200, and THREE cases, not one -- the first cut of
+                // this shipped only the type check, so `$skip: 1.5` and
+                // `$skip: -1` still fell through to the engine's Fallback and
+                // answered a generic BadValue. The sweep did not catch it because
+                // its corpus feeds only `{}` / `"x"` / `[1]`; the probe's reach is
+                // exactly its case list. Decimal128 IS a number here (mongod
+                // accepts `$skip: Decimal128("2")` -- probed).
                 let code = if name == "$limit" { 5107201 } else { 5107200 };
-                match spec {
-                    Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => None,
-                    _ => Some((
+                let n = match spec {
+                    Bson::Int32(v) => f64::from(*v),
+                    Bson::Int64(v) => *v as f64,
+                    Bson::Double(v) => *v,
+                    Bson::Decimal128(d) => d.to_string().parse::<f64>().unwrap_or(f64::NAN),
+                    _ => {
+                        return Some((
+                            code,
+                            format!(
+                                "invalid argument to {name} stage: Expected a number in: \
+                                 {name}: {}",
+                                render_stage_value(spec)
+                            ),
+                        ));
+                    }
+                };
+                if n.fract() != 0.0 {
+                    // A decimal gets its own wording here (probed 6.0.16):
+                    // 1.5 is "Expected an integer", Decimal128("1.5") is
+                    // "Cannot represent as a 64-bit integer".
+                    let reason = if matches!(spec, Bson::Decimal128(_)) {
+                        "Cannot represent as a 64-bit integer"
+                    } else {
+                        "Expected an integer"
+                    };
+                    Some((
                         code,
                         format!(
-                            "invalid argument to {name} stage: Expected a number in: {name}: {}",
+                            "invalid argument to {name} stage: {reason}: {name}: {}",
                             render_stage_value(spec)
                         ),
-                    )),
+                    ))
+                } else if name == "$limit" && n == 0.0 {
+                    // The engine defers this with a comment reading "Python
+                    // raises 15958" -- true on that server, meaningless here,
+                    // where the deferral became a generic BadValue. Name it.
+                    Some((15958, "the limit must be positive".to_string()))
+                } else if n < 0.0 {
+                    Some((
+                        code,
+                        format!(
+                            "invalid argument to {name} stage: Expected a non-negative number \
+                             in: {name}: {}",
+                            render_stage_value(spec)
+                        ),
+                    ))
+                } else {
+                    None
                 }
             }
             "$unwind" => match spec {
@@ -461,6 +519,19 @@ mod stage_tests {
             err_for("$skip", Bson::Document(doc! {})).1,
             "invalid argument to $skip stage: Expected a number in: $skip: {}"
         );
+        // Non-empty containers render recursively, shell-style.
+        assert_eq!(
+            err_for("$skip", Bson::Document(doc! {"a": 1})).1,
+            "invalid argument to $skip stage: Expected a number in: $skip: { a: 1 }"
+        );
+        assert_eq!(
+            err_for(
+                "$skip",
+                Bson::Array(vec![Bson::Int32(1), Bson::String("a".into())])
+            )
+            .1,
+            "invalid argument to $skip stage: Expected a number in: $skip: [ 1, \"a\" ]"
+        );
     }
 
     #[test]
@@ -470,6 +541,52 @@ mod stage_tests {
         // A well-formed spec is left alone.
         assert!(stage_spec_error(&[Bson::Document(doc! {"$unwind": "$a"})]).is_none());
         assert!(stage_spec_error(&[Bson::Document(doc! {"$unwind": {"path": "$a"}})]).is_none());
+    }
+
+    #[test]
+    fn limit_and_skip_have_three_cases_not_one() {
+        // The first cut shipped only the type check, so these two fell through
+        // to the engine's Fallback and answered a generic BadValue. The sweep
+        // corpus feeds only {} / "x" / [1], so it passed anyway.
+        assert_eq!(
+            err_for("$skip", Bson::Double(1.5)),
+            (
+                5107200,
+                "invalid argument to $skip stage: Expected an integer: $skip: 1.5".to_string()
+            )
+        );
+        assert_eq!(
+            err_for("$skip", Bson::Int32(-1)),
+            (
+                5107200,
+                "invalid argument to $skip stage: Expected a non-negative number in: $skip: -1"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            err_for("$limit", Bson::Double(-2.0)).1,
+            "invalid argument to $limit stage: Expected a non-negative number in: $limit: -2.0"
+        );
+    }
+
+    #[test]
+    fn a_zero_limit_is_named_not_deferred() {
+        assert_eq!(
+            err_for("$limit", Bson::Int32(0)),
+            (15958, "the limit must be positive".to_string())
+        );
+        // $skip: 0 is perfectly legal, and must stay so.
+        assert!(stage_spec_error(&[Bson::Document(doc! {"$skip": 0})]).is_none());
+    }
+
+    #[test]
+    fn a_decimal_is_a_number_here() {
+        // mongod ACCEPTS `$skip: Decimal128("2")` -- probed. Both servers used
+        // to reject it.
+        let two: bson::Decimal128 = "2".parse().unwrap();
+        assert!(stage_spec_error(&[Bson::Document(doc! {"$skip": two})]).is_none());
+        let frac: bson::Decimal128 = "1.5".parse().unwrap();
+        assert_eq!(err_for("$skip", Bson::Decimal128(frac)).0, 5107200);
     }
 
     #[test]
