@@ -3685,6 +3685,24 @@ def _values_match(a: Any, b: Any) -> bool:
     return a == b
 
 
+_CHANGE_STREAM_KNOWN_FIELDS = frozenset(
+    {
+        "fullDocument",
+        "fullDocumentBeforeChange",
+        "resumeAfter",
+        "startAfter",
+        "startAtOperationTime",
+        "allChangesForCluster",
+        "showExpandedEvents",
+        "showRawUpdateDescription",
+        "splitLargeChangeStreamEvents",
+        "allowToRunOnSystemNS",
+    }
+)
+_FULL_DOCUMENT_MODES = frozenset({"default", "updateLookup", "whenAvailable", "required"})
+_FULL_DOCUMENT_BEFORE_MODES = frozenset({"off", "whenAvailable", "required"})
+
+
 def _stage_change_stream(
     spec: Any, _docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -3698,7 +3716,12 @@ def _stage_change_stream(
     from secantus import changestreams
 
     if not isinstance(spec, Mapping):
-        raise AggregateError("$changeStream spec must be a document")
+        raise AggregateError(
+            f"$changeStream must take a nested object but found: $changeStream: "
+            f"{_render_arg(spec)}",
+            code=6188500,
+            code_name="Location6188500",
+        )
     ctx.change_stream = changestreams.parse_spec(spec)
     return []
 
