@@ -5891,8 +5891,12 @@ def _accumulator_for(
         if field is None:
             body = {"$cond": [filter_cond, 1, 0]} if filter_cond is not None else 1
             return {"$sum": body}, "int8"
-        # COUNT(col) counts non-null values.
-        matched = {"$ne": [val, None]}
+        # COUNT(col) counts non-null values. SQL NULL covers an ABSENT field
+        # too -- an unmatched outer-join row has no key for the non-driving
+        # side -- so `$ifNull` collapses missing and null together before the
+        # comparison. A bare `$ne: [x, null]` stopped covering the absent case
+        # once the expression engine learned mongod's missing-vs-null rule.
+        matched = {"$ne": [{"$ifNull": [val, None]}, None]}
         cond = {"$and": [filter_cond, matched]} if filter_cond is not None else matched
         return {"$sum": {"$cond": [cond, 1, 0]}}, "int8"
     if func == "sum":
@@ -5934,7 +5938,7 @@ def _accumulator(
         # shapes it can't lower).
         body = _agg_arg_to_expr(arg_node, table)
         if func == "count":  # COUNT(<expr>) counts non-null values (COUNT(NULL) is 0)
-            matched = {"$ne": [body, None]}
+            matched = {"$ne": [{"$ifNull": [body, None]}, None]}
             cond = {"$and": [filter_cond, matched]} if filter_cond is not None else matched
             return {"$sum": {"$cond": [cond, 1, 0]}}, "int8"
         if filter_cond is not None:
@@ -9289,7 +9293,7 @@ def _join_accumulator(
         # the way the single-table accumulator does.
         body = _to_agg_expr(arg, resolve)
         if func == "count":  # COUNT(<expr>) counts non-null values (COUNT(NULL) is 0)
-            matched = {"$ne": [body, None]}
+            matched = {"$ne": [{"$ifNull": [body, None]}, None]}
             cond = {"$and": [filter_cond, matched]} if filter_cond is not None else matched
             return {"$sum": {"$cond": [cond, 1, 0]}}, "int8"
         if filter_cond is not None:

@@ -133,7 +133,8 @@ fn eval(expr: &Bson, ctx: &Ctx) -> R {
 /// marker (`Bson::Undefined`) rather than null.
 ///
 /// Differs from [`eval`] only for a bare field-path string: as an operator
-/// argument a missing path is null (`{$add: ["$nope", 1]}` is 1), but as the
+/// argument a missing path is null, and arithmetic over null is null
+/// (`{$add: ["$nope", 1]}` is `null`, probed 6.0.16), but as the
 /// value of a projected/added field it is *missing* and the key is omitted.
 /// Keeping the two distinct is why this isn't folded into `eval`.
 /// Mirrors `expressions.py::_eval_field_value`.
@@ -643,21 +644,63 @@ fn op_bit_not(arg: &Bson, ctx: &Ctx) -> R {
 
 // --- comparison ---------------------------------------------------------
 
-fn eq_op(arg: &Bson, ctx: &Ctx, negate: bool) -> R {
-    let vals = eval_args(arg, ctx)?;
-    if vals.len() != 2 {
-        return Err(Fallback); // Python unpacks exactly 2 -> ValueError otherwise
+/// Comparison operands, evaluated in FIELD-VALUE position so a missing path
+/// stays `Bson::Undefined` instead of collapsing to null.
+///
+/// The comparison operators are the one place in the expression language where
+/// the difference is observable: `$eq: ["$absent", null]` is **false** on
+/// mongod while `$eq: ["$explicitNull", null]` is true, and a missing field
+/// ranks below every real value including MinKey (probed 6.0.16:
+/// `$cmp: ["$absent", MinKey]` is -1). Everywhere else an operator argument
+/// resolving to a missing path is simply null, which is why this is not
+/// `eval_field_value` for every operator.
+/// Mirrors `expressions.py::_cmp_operand`.
+fn cmp_operands(arg: &Bson, ctx: &Ctx) -> Result<Option<(Bson, Bson)>, Fallback> {
+    if let Bson::Array(items) = arg {
+        if items.len() == 2 {
+            return Ok(Some((
+                eval_field_value(&items[0], ctx)?,
+                eval_field_value(&items[1], ctx)?,
+            )));
+        }
     }
-    let e = py_eq(&vals[0], &vals[1])?;
+    Ok(None)
+}
+
+fn is_missing(v: &Bson) -> bool {
+    matches!(v, Bson::Undefined)
+}
+
+fn eq_op(arg: &Bson, ctx: &Ctx, negate: bool) -> R {
+    let (a, b) = match cmp_operands(arg, ctx)? {
+        Some(pair) => pair,
+        None => return Err(Fallback), // Python unpacks exactly 2 -> ValueError otherwise
+    };
+    // A missing field equals only another missing field.
+    let e = if is_missing(&a) || is_missing(&b) {
+        is_missing(&a) && is_missing(&b)
+    } else {
+        py_eq(&a, &b)?
+    };
     Ok(Bson::Boolean(if negate { !e } else { e }))
 }
 
 fn ord_op(arg: &Bson, ctx: &Ctx, pred: fn(Ordering) -> bool) -> R {
-    let vals = eval_args(arg, ctx)?;
-    if vals.len() != 2 {
-        return Err(Fallback);
+    let (a, b) = match cmp_operands(arg, ctx)? {
+        Some(pair) => pair,
+        None => return Err(Fallback),
+    };
+    if is_missing(&a) || is_missing(&b) {
+        let ord = if is_missing(&a) && is_missing(&b) {
+            Ordering::Equal
+        } else if is_missing(&a) {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+        return Ok(Bson::Boolean(pred(ord)));
     }
-    Ok(Bson::Boolean(match py_order(&vals[0], &vals[1])? {
+    Ok(Bson::Boolean(match py_order(&a, &b)? {
         Some(o) => pred(o),
         None => false, // Python `<`/`>` on incomparable operands raises -> False
     }))
@@ -1723,7 +1766,10 @@ fn op_let(arg: &Bson, ctx: &Ctx) -> R {
     // each other), then all are layered for the `in` expression.
     let mut vars = ctx.vars.clone();
     for (name, vexpr) in bindings {
-        let v = eval(vexpr, ctx)?;
+        // FIELD-VALUE position, so a var bound from an absent field stays
+        // missing rather than collapsing to null: mongod's `$eq: ["$$v", null]`
+        // is false when `$$v` came from a field the document does not have.
+        let v = eval_field_value(vexpr, ctx)?;
         vars.insert(name.clone(), v);
     }
     eval(
@@ -1903,6 +1949,20 @@ fn op_elements_true(arg: &Bson, ctx: &Ctx, all: bool) -> R {
 /// `$cmp`: three-way BSON-order comparison of two values → -1 / 0 / 1. Operands
 /// outside the sortable subset defer (Python's `_bson_lt` handles them).
 fn op_cmp(arg: &Bson, ctx: &Ctx) -> R {
+    // Field-value position, so a missing operand ranks below everything --
+    // `$cmp: ["$absent", null]` is -1 and `$cmp: ["$absent", "$alsoAbsent"]`
+    // is 0 (probed 6.0.16).
+    if let Some((a, b)) = cmp_operands(arg, ctx)? {
+        if is_missing(&a) || is_missing(&b) {
+            return Ok(Bson::Int32(if is_missing(&a) && is_missing(&b) {
+                0
+            } else if is_missing(&a) {
+                -1
+            } else {
+                1
+            }));
+        }
+    }
     let vals = eval_args(arg, ctx)?;
     if vals.len() != 2 || !vals.iter().all(crate::order::is_sortable) {
         return Err(Fallback);
