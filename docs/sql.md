@@ -2850,6 +2850,59 @@ After a failed statement inside a block, every command except `COMMIT` /
 `ROLLBACK` returns SQLSTATE `25P02` until the block ends; a `COMMIT` of an
 aborted block rolls back.
 
+### Isolation levels — read this before relying on `SERIALIZABLE`
+
+Every explicit transaction runs on the storage engine's **snapshot isolation**,
+which is what PostgreSQL calls `REPEATABLE READ`. `BEGIN ISOLATION LEVEL x` is
+accepted and echoed back for all three levels, but the level you *get* is always
+snapshot isolation. Measured against PostgreSQL 14:
+
+| what you write | PostgreSQL | SecantusDB |
+|---|---|---|
+| autocommit statements | second writer blocks, both writes land | **same** |
+| `BEGIN ISOLATION LEVEL REPEATABLE READ` | second writer gets `40001` | **same** |
+| `BEGIN ISOLATION LEVEL READ COMMITTED` | second writer blocks, both writes land | second writer gets `40001` |
+| `BEGIN ISOLATION LEVEL SERIALIZABLE` | one transaction aborts with `40001` | **both commit** |
+
+Two consequences are worth stating plainly.
+
+**`READ COMMITTED` inside an explicit transaction is stricter here than in
+PostgreSQL.** A write-write race that PostgreSQL would complete returns
+`40001 serialization_failure` instead, so a client that does not retry loses
+that write. Retrying on `40001` — what most drivers and ORMs already do — is
+enough. Statements *outside* an explicit transaction are unaffected: each is its
+own transaction, the second writer waits for the first and re-reads the
+committed value, exactly as PostgreSQL does.
+
+**`SERIALIZABLE` does not prevent write skew.** Snapshot isolation allows two
+transactions to each read what the other is about to change and both commit:
+
+```sql
+-- session A                          -- session B
+BEGIN ISOLATION LEVEL SERIALIZABLE;   BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT count(*) FROM ws               SELECT count(*) FROM ws
+  WHERE colour = 'black';               WHERE colour = 'white';
+UPDATE ws SET colour = 'white'        UPDATE ws SET colour = 'black'
+  WHERE colour = 'black';               WHERE colour = 'white';
+COMMIT;                               COMMIT;   -- PostgreSQL: 40001. Here: succeeds.
+```
+
+Both transactions commit and the two rows swap colours — an outcome no serial
+order of A and B could produce. If your application depends on `SERIALIZABLE` to
+hold an invariant across rows that each transaction only *reads*, that invariant
+is not enforced here. Use an explicit lock (`SELECT … FOR UPDATE`, an advisory
+lock) or a constraint the database can check directly.
+
+This mapping of `SERIALIZABLE` onto snapshot isolation is a deliberate choice
+and has precedent — Oracle has long done the same — but it is a real difference
+from PostgreSQL, which implements true serializable snapshot isolation. It is
+documented here rather than signalled at runtime so that drivers and ORMs that
+request the level keep working.
+
+All four rows of the table above are pinned by
+`tests/test_sql_isolation_level.py`, with the two divergent ones named
+`test_known_divergence_*`.
+
 ### Savepoints
 
 `SAVEPOINT name` / `ROLLBACK TO SAVEPOINT name` / `RELEASE SAVEPOINT name` give
