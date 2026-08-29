@@ -246,3 +246,64 @@ def test_delete_limit_is_still_not_type_checked(db, value) -> None:
     db.c.insert_one({"_id": 2, "a": 1})
     reply = db.command({"delete": "c", "deletes": [{"q": {}, "limit": value}]})
     assert reply["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# `null` is its own value class, and the sweep corpus did not contain it until
+# 2026-08-29. Widening it from 87 to 244 cases immediately found a CRASH here
+# and a wrong code next door -- the corpus is the coverage.
+# ---------------------------------------------------------------------------
+
+
+def test_create_indexes_rejects_a_null_indexes_list(db) -> None:
+    """This CRASHED as "internal server error" -- `for idx_spec in indexes`
+    over a None. mongod has its own code for the slot, and it is not 14."""
+    err = _err(db, {"createIndexes": "c", "indexes": None})
+    assert err.code == 10065
+    assert err.details["errmsg"] == "invalid parameter: expected an object (indexes)"
+
+
+@pytest.mark.parametrize("bad", [5, "x", True, [1]])
+def test_create_indexes_wrong_typed_list_is_not_the_null_code(db, bad) -> None:
+    """Two codes for one slot, split by null-ness: an explicit null is 10065,
+    a wrong-typed non-null is the ordinary 14."""
+    err = _err(db, {"createIndexes": "c", "indexes": bad})
+    assert err.code == 14
+
+
+def test_distinct_key_null_is_missing_not_wrong_typed(db) -> None:
+    """mongod treats an explicit null as ABSENT for a required field."""
+    err = _err(db, {"distinct": "c", "key": None})
+    assert err.code == 40414
+    assert err.details["errmsg"] == "BSON field 'distinct.key' is missing but a required field"
+
+
+@pytest.mark.parametrize("bad", [5, {}, [1], True])
+def test_distinct_key_wrong_type_names_the_path(db, bad) -> None:
+    err = _err(db, {"distinct": "c", "key": bad})
+    assert err.code == 14
+    assert err.details["errmsg"].startswith("BSON field 'distinct.key' is the wrong type")
+
+
+def test_find_min_max_reject_an_explicit_null(db) -> None:
+    """The Expected-field family rejects null; the BSON-field family accepts
+    it. `min`/`max` are the former, `let` the latter -- on the same command."""
+    for field in ("min", "max"):
+        err = _err(db, {"find": "c", field: None, "hint": {"a": 1}})
+        assert err.code == 14
+        assert err.details["errmsg"] == f"Expected field {field}to be of type object"
+    db.command({"find": "c", "let": None})  # accepted, same command
+
+
+def test_list_indexes_accepts_a_null_cursor(db) -> None:
+    """`listIndexes.cursor: null` is accepted while `aggregate.cursor: null` is
+    rejected -- the same option name on two commands, two rules."""
+    db.command({"listIndexes": "c", "cursor": None})
+    err = _err(db, {"aggregate": "c", "pipeline": [], "cursor": None})
+    assert err.code == 14
+
+
+def test_find_accepts_a_null_batch_size(db) -> None:
+    """Null means absent here."""
+    reply = db.command({"find": "c", "batchSize": None})
+    assert reply["ok"] == 1.0

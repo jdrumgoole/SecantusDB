@@ -159,6 +159,55 @@ pub fn require_bool_or_number(doc: &Document, field: &str, path: &str) -> Result
     }
 }
 
+/// `createIndexes.indexes`: mongod's own code and wording, and it rejects an
+/// explicit `null` (10065) rather than treating it as absent — unlike `let`.
+/// The Python server used to CRASH here (`'NoneType' object is not iterable`).
+pub fn require_index_specs(doc: &Document) -> Result<(), CommandError> {
+    match doc.get("indexes") {
+        Some(Bson::Array(_)) => Ok(()),
+        // Explicit null ONLY: mongod answers 10065 here, but a wrong-TYPED
+        // non-null is the ordinary array type error (14). Two codes for one
+        // slot, split by whether the value is null.
+        None | Some(Bson::Null) => Err(CommandError::new(
+            10065,
+            "Location10065",
+            "invalid parameter: expected an object (indexes)",
+        )),
+        Some(v) => Err(type_mismatch(format!(
+            "BSON field 'createIndexes.indexes' is the wrong type '{}', expected type 'array'",
+            bson_type_name(v)
+        ))),
+    }
+}
+
+/// A field inside one `createIndexes` spec. mongod quotes the WHOLE spec back
+/// and chains the reason, a message family of its own:
+///
+/// ```text
+/// Error in specification { key: null, name: "i" } :: caused by ::
+///   The field 'key' must be an object, but got null
+/// ```
+pub fn require_index_spec_field(
+    spec: &Document,
+    field: &str,
+    expected: &str,
+    ok: impl Fn(&Bson) -> bool,
+) -> Result<(), CommandError> {
+    let value = spec.get(field).unwrap_or(&Bson::Null);
+    if !matches!(spec.get(field), Some(Bson::Null) | None) && ok(value) {
+        return Ok(());
+    }
+    if spec.get(field).is_none() {
+        return Ok(()); // absent is a different error, raised downstream
+    }
+    Err(type_mismatch(format!(
+        "Error in specification {} :: caused by :: The field '{field}' must be {expected}, \
+         but got {}",
+        render_stage_value(&Bson::Document(spec.clone())),
+        bson_type_name(value)
+    )))
+}
+
 /// `maxTimeMS` — the only slot in the sweep that is not a `TypeMismatch`:
 /// code 2, with three distinct messages. `Decimal128` is accepted; an explicit
 /// null is rejected while absent is fine. No upper bound is enforced (unprobed).
@@ -197,6 +246,16 @@ pub fn require_max_time_ms(doc: &Document) -> Result<(), CommandError> {
 pub fn require_cursor_object(doc: &Document) -> Result<(), CommandError> {
     match doc.get("cursor") {
         None | Some(Bson::Document(_)) => Ok(()),
+        Some(_) => Err(type_mismatch("cursor field must be missing or an object")),
+    }
+}
+
+/// `listIndexes.cursor`, which — unlike `aggregate.cursor` two functions up —
+/// ACCEPTS an explicit `null` (probed 6.0.16). The same option name on two
+/// commands with two rules; sharing one validator was wrong.
+pub fn require_cursor_object_nullable(doc: &Document) -> Result<(), CommandError> {
+    match doc.get("cursor") {
+        None | Some(Bson::Null) | Some(Bson::Document(_)) => Ok(()),
         Some(_) => Err(type_mismatch("cursor field must be missing or an object")),
     }
 }

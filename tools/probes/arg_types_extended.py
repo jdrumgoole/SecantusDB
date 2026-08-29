@@ -11,9 +11,16 @@ crashes. This widens it two ways:
 import os
 import tempfile
 
+import datetime
+
 import pymongo
+from bson import Decimal128, ObjectId
 
 from secantus import SecantusDBServer
+
+#: Fixed non-scalar values, so a run is reproducible.
+OID = ObjectId("64b7f9a2c1d2e3f4a5b6c7d8")
+WHEN = datetime.datetime(2026, 1, 2, 3, 4, 5)
 
 MONGOD = os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041")
 
@@ -26,10 +33,18 @@ SERVER = os.environ.get("PROBE_SERVER")
 
 # For a slot expecting a document/array, feed scalars. For a slot expecting a
 # number, feed a document/string. For a string slot, feed a number/document.
-DOCISH = [5, "x", True]
-NUMISH = [{}, "x", [1]]
-STRISH = [5, {}, [1]]
-BOOLISH = [{}, [1]]
+#
+# **The corpus IS the coverage.** These lists were three values wide for a long
+# time, and "87/87 clean" was read as "argument validation is correct" when it
+# only ever meant "these 87 shapes are". The 2026-08-29 `$limit`/`$skip` work
+# proved it twice over: a fractional and a negative number each exposed a slot
+# answering a generic BadValue, and neither value was in the corpus. `null`,
+# `Decimal128`, `ObjectId` and dates were absent for the same reason. Widen
+# this list rather than trusting a green count from it.
+DOCISH = [5, "x", True, None, 1.5, -1, Decimal128("2"), OID, WHEN]
+NUMISH = [{}, "x", [1], None, True, OID, WHEN]
+STRISH = [5, {}, [1], None, True, 1.5, OID, WHEN]
+BOOLISH = [{}, [1], None, "x", 1.5, OID, WHEN]
 
 
 def cases():
@@ -39,7 +54,14 @@ def cases():
             f"createIndexes.key={b!r}",
             {"createIndexes": "c", "indexes": [{"key": b, "name": "i"}]},
         )
-        yield (f"create.storageEngine={b!r}", {"create": "newc", "storageEngine": b})
+        # A UNIQUE collection per case: `create` leaves the collection behind on
+        # the runs where the option is ACCEPTED, so a fixed name made every later
+        # case answer NamespaceExists (48) and read as a divergence. The probe was
+        # reporting its own leftover state as a server bug.
+        yield (
+            f"create.storageEngine={b!r}",
+            {"create": f"newc_{abs(hash(repr(b))) % 10000}", "storageEngine": b},
+        )
         yield (f"collMod.index={b!r}", {"collMod": "c", "index": b})
         yield (f"listIndexes.cursor={b!r}", {"listIndexes": "c", "cursor": b})
         yield (f"aggregate.cursor={b!r}", {"aggregate": "c", "pipeline": [], "cursor": b})

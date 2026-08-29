@@ -787,7 +787,8 @@ pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
 
 /// `listIndexes` — a cursor over the indexes of a collection.
 pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    argtypes::require_cursor_object(doc)?;
+    // Nullable here, unlike aggregate's -- mongod accepts `cursor: null`.
+    argtypes::require_cursor_object_nullable(doc)?;
     let coll = coll_arg(doc, "listIndexes")?;
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
@@ -974,12 +975,19 @@ fn is_falsy(v: &Bson) -> bool {
 pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `indexes` is an array of specs; a scalar there used to report ok:1 and
     // create NOTHING, so a driver believed an index existed that did not.
-    argtypes::require_array(doc, "indexes", "createIndexes.indexes")?;
+    // `indexes` has its own code (10065) and rejects an explicit null; the
+    // fields INSIDE a spec quote the whole spec back. Neither follows the
+    // generic families -- probed per slot.
+    argtypes::require_index_specs(doc)?;
     if let Some(bson::Bson::Array(specs)) = doc.get("indexes") {
         for spec in specs {
             if let bson::Bson::Document(spec) = spec {
-                argtypes::require_object(spec, "key", "createIndexes.key")?;
-                argtypes::require_string(spec, "name", "createIndexes.name")?;
+                argtypes::require_index_spec_field(spec, "key", "an object", |v| {
+                    matches!(v, bson::Bson::Document(_))
+                })?;
+                argtypes::require_index_spec_field(spec, "name", "a string", |v| {
+                    matches!(v, bson::Bson::String(_))
+                })?;
             }
         }
     }
