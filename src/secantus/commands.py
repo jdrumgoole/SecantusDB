@@ -3489,15 +3489,16 @@ def _unknown_find_and_modify_field(doc: Mapping[str, Any]) -> dict[str, Any] | N
 def _validate_array_filters_field(
     doc: Mapping[str, Any], field_name: str, field_path: str
 ) -> dict[str, Any] | None:
-    """``arrayFilters`` must be an array of documents. Probed 6.0.16::
+    """``arrayFilters`` must be an array of documents. Probed 8.2.1::
 
         {e: 1}   14  BSON field '<path>' is the wrong type 'object', expected type 'array'
         "x"      14  BSON field '<path>' is the wrong type 'string', expected type 'array'
         [5]      14  BSON field '<path>.0' is the wrong type 'int', expected type 'object'
-        null     10065  invalid parameter: expected an object (arrayFilters)
+        null     accepted -- an explicit null means ABSENT, and the update runs
 
-    An explicit ``null`` really does take a different, older code path than
-    every other wrong type -- hence the odd ``Location10065``.
+    On 6.0 an explicit ``null`` took an older code path and answered
+    ``10065 invalid parameter: expected an object (arrayFilters)``. 8.x treats
+    it as if the field had not been sent.
 
     We reported a *non-existent field path* here (``update.updates.arrayFilters.0``)
     naming the wrong type, on a command that has no ``updates`` array at all.
@@ -3506,12 +3507,8 @@ def _validate_array_filters_field(
         return None
     value = doc[field_name]
     if value is None:
-        return {
-            "ok": 0.0,
-            "errmsg": "invalid parameter: expected an object (arrayFilters)",
-            "code": 10065,
-            "codeName": "Location10065",
-        }
+        # 8.x: an explicit null is the same as not sending the field.
+        return None
     if isinstance(value, list):
         for i, entry in enumerate(value):
             if not isinstance(entry, Mapping):
@@ -4828,13 +4825,13 @@ def _kill_cursors(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         }
     raw_cursors = doc["cursors"]
     if raw_cursors is None:
-        # An explicit null takes mongod's older code path, as it does for
-        # ``findAndModify.arrayFilters``.
+        # 8.x treats an explicit null as the field being absent, so this lands
+        # on the required-field error rather than 6.0's older 10065 path.
         return {
             "ok": 0.0,
-            "errmsg": "invalid parameter: expected an object (cursors)",
-            "code": 10065,
-            "codeName": "Location10065",
+            "errmsg": "BSON field 'killCursors.cursors' is missing but a required field",
+            "code": 40414,
+            "codeName": "Location40414",
         }
     if not isinstance(raw_cursors, list):
         return {
@@ -5555,6 +5552,24 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     )
     try:
         docs = apply_pipeline(docs, pipeline, pipeline_ctx)
+    except (AggregateError, ExpressionError) as exc:
+        # Only EXECUTION-time failures take the prefix; parse errors stay bare
+        # (probed 8.2.1 -- see AggregateError.exec_error). ExpressionError is
+        # evaluation by definition, so it always qualifies. Deliberately applied
+        # HERE and not in ``dispatch``: the prefix names the namespace, and
+        # ``$expr`` in a plain ``find`` must not pick it up.
+        if not (isinstance(exc, ExpressionError) or getattr(exc, "exec_error", False)):
+            raise
+        _code = getattr(exc, "code", None) or 14
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"Executor error during aggregate command on namespace: "
+                f"{ctx.db_name}.{coll} :: caused by :: {exc}"
+            ),
+            "code": _code,
+            "codeName": getattr(exc, "code_name", None) or _code_name_for(_code),
+        }
     except IndexConflict as exc:
         # ``$merge whenMatched=fail`` raises this — surface mongod's
         # dup-key shape (code 11000 + keyPattern + keyValue) so the
