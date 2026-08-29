@@ -4007,9 +4007,17 @@ shared storage engine or building large new protocol subsystems:
      reachable. Note `tests/test_sql_subms_timestamps.py` previously carried
      `test_comparisons_remain_millisecond_blind`, which pinned the limitation
      "so it stays visible" and thereby pinned two *wrong answers*; it is now
-     `test_comparisons_are_microsecond_exact`. **Still open here: ORDER BY**
-     within a single millisecond, which needs the companion as a sort
-     tiebreaker. Original note follows.
+     `test_comparisons_are_microsecond_exact`. **ORDER BY — FIXED 2026-08-29**,
+     and it was two code paths, not one: the plain-column sort key
+     (`_order_key_fn`) and the projected-expression scope (`ORDER BY 2`,
+     DISTINCT ON, and anything evaluated through `_expand_srf`). The second
+     never went through the read-side merge at all, so `SELECT id, t … ORDER BY
+     2` also *returned* truncated times — an ordering bug hiding a value bug.
+     Both now read through one `_subms(doc, field)` helper. Six shapes verified
+     against the live PostgreSQL 14 (plain / DESC / alias / ordinal /
+     DISTINCT ON / LIMIT); 7 tests, all of which fail with the fix reverted.
+     Note LIMIT and DISTINCT ON returned wrong *rows*, not merely wrong order.
+     Original note follows.
      ~~Predicates are millisecond-blind — and wrong in BOTH directions.~~
      Measured 2026-08-27 against a stored `…00.123456`: `WHERE t = '…123456'`
      matches nothing (false negative — a row fails an equality on its *own
@@ -4030,6 +4038,24 @@ shared storage engine or building large new protocol subsystems:
      the planner builds would need to carry it, and a GROUP BY on a timestamp
      would need it in the group key to avoid merging rows that differ only in
      microseconds.
+
+     **Measured 2026-08-29 while fixing ORDER BY — three concrete cases, and
+     one is silent wrong data rather than lost precision:**
+
+         min(t) / max(t)                 return .123000 for a stored .123456
+         array_agg(id ORDER BY t)        orders at millisecond granularity
+         string_agg(id, ',' ORDER BY t)  same
+
+     All three are **pipeline accumulators** (`$min` / `$max` / the `{v, k}`
+     `$push` pair), so they run inside the Mongo aggregation over the stored
+     date and never see the companion — which is why the Python-side fix to
+     ORDER BY does not reach them. Closing this means the pushdown carrying the
+     companion, e.g. accumulating over a composite `{d: "$t", u: "$__us_t"}`
+     and unwrapping in the executor; note BSON document comparison ordering
+     makes the missing-companion case (whole-millisecond rows) the subtle part.
+     `min`/`max` should be treated as the priority: a query answering a
+     timestamp that was never stored is worse than one answering rows in the
+     wrong order.
   3. **COPY and the Rust server** don't write the companion — they truncate, as
      before. Not wrong, just not precise.
 
