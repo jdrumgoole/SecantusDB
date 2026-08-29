@@ -16,6 +16,15 @@ The audience is developers who want fast, ephemeral, in-process MongoDB behaviou
 
 ## Design constraints
 
+- **The error surface targets mongod 8.2.1.** Retargeted from 6.0.16 on
+  2026-08-29. `tests/test_mongod_differential.py` is the gate: it runs every
+  supported operation against a real `mongod` and asserts an *exact* match, and
+  it **skips off the probed series** (`PROBED_MONGOD_SERIES`) rather than
+  reporting version differences as divergences. Note CI installs `mongosh` and
+  `mongodb-database-tools` but **not `mongod`**, so that gate only ever runs on a
+  dev box — run it locally before changing an error message. Comments saying
+  "probed 6.0.16" without naming 8.x predate the retarget and were not
+  re-verified; re-probe before relying on one.
 - **`pymongo` is the conformance target.** Behaviour is "correct" when a `pymongo` client cannot tell SecantusDB apart from a real `mongod` for the operations it supports. When in doubt, write a test that runs the same code against `pymongo` → SecantusDB and `pymongo` → real MongoDB and assert the responses match.
 - **Wire-protocol fidelity over feature completeness.** Prefer returning a faithful "command not supported" error over a half-implemented feature that silently diverges from real server behaviour.
 - **Ease of use for the beginning programmer:** starting a server in a test should be one or two lines, with no external processes to manage.

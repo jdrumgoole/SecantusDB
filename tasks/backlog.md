@@ -1245,8 +1245,16 @@ These are explicit non-goals. Don't add them without a reason.
   array differs, and mongod's order reflects its internal traversal rather than
   a documented contract. Not chased for the same reason as above.
 
-- [ ] **The error surface is conformant to mongod 6.0, and diverges from 8.x in
-  23 known places (2026-08-29).** `src/secantus/commands.py` alone cites 6.0.16
+- [x] **RESOLVED (2026-08-29): retargeted to mongod 8.2.1.** All 150 differential
+  cases now pass against a live 8.2.1, both servers moved together, and
+  `PROBED_MONGOD_SERIES` is `(8, 2)`. **Still open:** 57 `probed 6.0.16`
+  comments across 11 source files were NOT re-verified against 8.2.1 — most of
+  that surface is version-stable, but they are evidence for the old target only.
+  Re-probe opportunistically and restamp them; `commands.py` carries a note
+  saying so. Original finding below.
+
+  **Original (2026-08-29): the error surface was conformant to mongod 6.0, and
+  diverged from 8.x in 23 known places.** `src/secantus/commands.py` alone cites 6.0.16
   in 45 places, including error strings reproduced *verbatim, unbalanced quotes
   and all* (`expected types '[bool, long, int, decimal, double']` — mongod 6.0
   really does put the closing quote inside the bracket). Against mongod **8.2.1**

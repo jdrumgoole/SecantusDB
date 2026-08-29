@@ -211,7 +211,7 @@ def test_distinct_rejects_an_unknown_field(db) -> None:
     silently dropped."""
     err = _err(db, {"distinct": "c", "key": "a", "zz": 1})
     assert err.code == 40415
-    assert err.details["errmsg"] == "BSON field 'distinct.zz' is an unknown field."
+    assert err.details["errmsg"] == "BSON field 'distinctCommandRequest.zz' is an unknown field."
 
 
 def test_distinct_still_works(db) -> None:

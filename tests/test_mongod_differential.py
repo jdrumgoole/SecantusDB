@@ -45,40 +45,41 @@ requires_mongod = pytest.mark.skipif(MONGOD is None, reason="no mongod on PATH")
 # Whether this gate can say anything at all on the server it found.
 #
 # Every expectation here is an EXACT match against mongod, and mongod's error
-# surface moves between majors. Observed 6.0.16 -> 8.2.1, all at once:
+# surface moves between majors, so the gate is only meaningful on the series the
+# codebase is probed against. Off that series it skips rather than reporting
+# version differences as SecantusDB divergences.
+#
+# The target was 6.0.16 until 2026-08-29 and is now 8.2.1. What moved, for
+# anyone reading an older comment or a 6.0 server:
 #
 #   * negative cursor sizing   51024 Location51024 -> 2 BadValue
 #   * expected-type lists      '[bool, long, int, decimal, double']  (closing
 #                              quote INSIDE the bracket, a real 6.0 quirk)
-#                              -> '[int, decimal, long, bool, double]'
-#   * update / aggregate       bare message -> wrapped in "Plan executor error
-#     failures                 during update :: caused by :: " / "Executor error
-#                              during aggregate command on namespace: ... "
-#   * null-valued arguments    rejected (10065) -> treated as absent
-#   * IDL-parsed stages        $lookup gained IDL parsing: hand-written
-#                              9 "must specify 'as' field for a $lookup" ->
-#                              40414 "BSON field '$lookup.as' is missing but a
-#                              required field"; unknown fields likewise 9 -> 40415
-#   * unknown-field errors     name the IDL struct: 'distinct.zz' ->
-#                              'distinctCommandRequest.zz'
-#
-# SecantusDB deliberately reproduces the 6.0 forms (commands.py alone cites
-# 6.0.16 in 45 places), so "fixing" a case to match a newer server would break
-# the target the code is written against.
+#                              -> properly quoted, and REORDERED PER FIELD
+#   * update failures          bare message -> "Plan executor error during
+#                              update :: caused by :: " (execution-time only)
+#   * aggregate failures       bare message -> "Executor error during aggregate
+#                              command on namespace: <ns> :: caused by :: "
+#                              (execution-time only -- a parse error stays bare)
+#   * null-valued arguments    rejected (10065) -> treated as ABSENT
+#   * IDL-parsed surfaces      $lookup and distinct moved to IDL parsing:
+#                              hand-written 9 -> 40414 / 40415 / 14, and the
+#                              field is named '$lookup.as' / the struct is
+#                              'distinctCommandRequest'
+#   * IDL code names           Location40414/40415 -> IDLFailedToParse /
+#                              IDLUnknownField
 #
 # WHY THE WHOLE FILE, NOT A LIST OF KNOWN-VARIANT CASES. That was tried first.
-# It needs updating by whoever adds a case -- and they cannot see the problem:
-# the dev boxes that run this are on 6.0, and CI installs mongosh and
-# database-tools but NOT mongod, so @requires_mongod skips this file there
-# entirely. In one afternoon three separate PRs added cases that failed only on
-# 8.2.1 (17, then 1, then 5). A list that only a minority of boxes can maintain
-# rots into recurring false failures. Gating the file is self-maintaining: a new
-# case needs no thought, and the gate can never claim a divergence it cannot
-# actually judge.
+# It needs updating by whoever adds a case, and they cannot see the problem: CI
+# installs mongosh and database-tools but NOT mongod, so @requires_mongod skips
+# this file there entirely, and a dev box on another series sees only false
+# failures. In one afternoon three PRs added cases that failed on the wrong
+# series. Gating the file is self-maintaining: a new case needs no thought, and
+# the gate can never claim a divergence it cannot actually judge.
 #
-# The cost is real: on a non-6.0 box this file provides no coverage. That is the
-# honest answer -- on an unprobed server an exact-match gate has no expectation
-# to assert. Run it on 6.0 (or retarget deliberately; see backlog.md 5).
+# The cost is real: on another series this file provides no coverage. That is
+# the honest answer -- on an unprobed server an exact-match gate has no
+# expectation to assert.
 PROBED_MONGOD_SERIES = (8, 2)
 
 

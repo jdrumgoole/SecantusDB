@@ -136,7 +136,7 @@ def test_valid_remove_and_update_still_work(db) -> None:
 # accepted and ignored. Everything below is probed, not inferred.
 # ---------------------------------------------------------------------------
 
-BOOL_OR_NUMBER = "expected types '[bool, long, int, decimal, double']"
+BOOL_OR_NUMBER = "expected types '[int, decimal, long, bool, double]'"
 
 
 def test_unknown_top_level_field_is_rejected(db) -> None:
@@ -147,7 +147,8 @@ def test_unknown_top_level_field_is_rejected(db) -> None:
     with pytest.raises(pymongo.errors.OperationFailure) as exc:
         _fam(db, query={"_id": 1}, update={"$set": {"n": 1}}, zz=1)
     assert exc.value.code == 40415
-    assert exc.value.details["codeName"] == "Location40415"
+    # 8.x gave 40415 a symbolic name; 6.0 rendered it as Location40415.
+    assert exc.value.details["codeName"] == "IDLUnknownField"
     assert str(exc.value).startswith("BSON field 'findAndModify.zz' is an unknown field.")
     assert db.c.find_one({"_id": 1})["n"] == 5, "the write must not have run"
 
@@ -205,14 +206,13 @@ def test_array_filters_element_type_error(db) -> None:
     )
 
 
-def test_null_array_filters_takes_mongods_older_code(db) -> None:
-    """An explicit null really does take a different code path from every other
-    wrong type here -- hence the odd Location10065."""
+def test_null_array_filters_reads_as_absent(db) -> None:
+    """On 6.0 an explicit null took an older path and answered Location10065.
+    8.x treats it as if the field had not been sent, so the update just runs."""
     db.c.insert_one({"_id": 1, "n": 5})
-    with pytest.raises(pymongo.errors.OperationFailure) as exc:
-        _fam(db, query={"_id": 1}, update={"$set": {"n": 1}}, arrayFilters=None)
-    assert exc.value.code == 10065
-    assert str(exc.value).startswith("invalid parameter: expected an object (arrayFilters)")
+    reply = _fam(db, query={"_id": 1}, update={"$set": {"n": 1}}, arrayFilters=None)
+    assert reply["lastErrorObject"]["updatedExisting"] is True
+    assert db.c.find_one({"_id": 1})["n"] == 1
 
 
 def test_missing_array_filter_identifier(db) -> None:

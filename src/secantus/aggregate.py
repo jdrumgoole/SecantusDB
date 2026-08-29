@@ -1499,7 +1499,7 @@ def _percentile_spec(arg: Any, op: str) -> tuple[Any, list[float] | None]:
         raise AggregateError(
             f"BSON field '{op}.method' is missing but a required field",
             code=40414,
-            code_name="Location40414",
+            code_name="IDLFailedToParse",
         )
     if arg["method"] != "approximate":
         raise AggregateError(
@@ -1511,7 +1511,7 @@ def _percentile_spec(arg: Any, op: str) -> tuple[Any, list[float] | None]:
         raise AggregateError(
             f"BSON field '{op}.input' is missing but a required field",
             code=40414,
-            code_name="Location40414",
+            code_name="IDLFailedToParse",
         )
     if op == "$median":
         return arg["input"], None
@@ -1519,7 +1519,7 @@ def _percentile_spec(arg: Any, op: str) -> tuple[Any, list[float] | None]:
         raise AggregateError(
             "BSON field '$percentile.p' is missing but a required field",
             code=40414,
-            code_name="Location40414",
+            code_name="IDLFailedToParse",
         )
     ps = arg["p"]
     if not isinstance(ps, list):
@@ -1905,7 +1905,7 @@ def _stage_lookup(
         raise AggregateError(
             f"BSON field '$lookup.{unknown}' is an unknown field.",
             code=40415,
-            code_name="Location40415",
+            code_name="IDLUnknownField",
         )
     from_coll = spec.get("from")
     as_field = spec.get("as")
@@ -1924,7 +1924,7 @@ def _stage_lookup(
         raise AggregateError(
             "BSON field '$lookup.as' is missing but a required field",
             code=40414,
-            code_name="Location40414",
+            code_name="IDLFailedToParse",
         )
     if not isinstance(as_field, str):
         raise AggregateError(

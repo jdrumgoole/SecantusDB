@@ -25,10 +25,11 @@ import pytest
 
 from secantus import SecantusDBServer
 
-# mongod 8.3.4 wraps these in "Plan executor error during update :: caused by ::";
-# 6.0.16 does not, and the bodies/codes are identical either way. We advertise 7.0
-# and the differential gate runs PATH mongod (6.0.16), so we emit the bare body.
-PREFIX = ""
+# mongod 8.x wraps EXECUTION-time update failures in "Plan executor error during
+# update :: caused by ::"; 6.0.16 does not, and the bodies/codes are identical
+# either way. The error surface now targets 8.x, so we emit the wrapper.
+# Parse-time errors are NOT wrapped -- see test_parse_time_errors_still_report.
+PREFIX = "Plan executor error during update :: caused by :: "
 
 
 @pytest.fixture

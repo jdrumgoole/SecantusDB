@@ -37,6 +37,18 @@ from secantus.auth import (
 from secantus.connreg import ConnectionRegistry
 from secantus.cursors import MAX_GETMORE_BATCH_BYTES, CursorNotFound, CursorRegistry
 from secantus.expressions import ExpressionError, UnknownExpressionOperatorError
+
+# CONFORMANCE TARGET: mongod 8.2.1 (retargeted from 6.0.16 on 2026-08-29).
+#
+# `tests/test_mongod_differential.py` is the gate: it runs every supported
+# operation against a real mongod and asserts an exact match, and it SKIPS off
+# the probed series rather than reporting version differences as bugs.
+#
+# Comments in this tree that say "probed 6.0.16" without also naming 8.x record
+# a probe taken against the OLD target and NOT re-verified against the new one.
+# They are not known to be wrong -- most of the surface is version-stable -- but
+# they are not evidence for current behaviour either. Re-probe before relying on
+# one, and update it to name 8.2.1 when you do. See tasks/backlog.md.
 from secantus.failpoints import FailPointRegistry, is_resumable_change_stream_code
 from secantus.geo import GeoError
 from secantus.logbuf import LogBuffer
@@ -3049,15 +3061,15 @@ def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # not as a type error -- probed 6.0.16.
         return {
             "ok": 0.0,
-            "errmsg": "BSON field 'distinct.key' is missing but a required field",
+            "errmsg": "BSON field 'distinctCommandRequest.key' is missing but a required field",
             "code": 40414,
-            "codeName": "Location40414",
+            "codeName": "IDLFailedToParse",
         }
     if not isinstance(key, str):
         return {
             "ok": 0.0,
             "errmsg": (
-                f"BSON field 'distinct.key' is the wrong type "
+                f"BSON field 'distinctCommandRequest.key' is the wrong type "
                 f"'{_bson_type_of(key)}', expected type 'string'"
             ),
             "code": 14,
@@ -3188,7 +3200,7 @@ def _require_number_bson_field(value: Any, field_path: str) -> dict[str, Any] | 
 # ignore it, so a misspelled option was silently dropped.
 #
 # ``hint`` is deliberately in the set even though mongod **6.0.16 rejects it**
-# (`BSON field 'distinct.hint' is an unknown field.`): MongoDB added a hint
+# (`BSON field 'distinctCommandRequest.hint' is an unknown field.`): MongoDB added a hint
 # option to `distinct` in a later release, so a current driver may legitimately
 # send it. Accepting is the safe direction for a field whose status changed --
 # unlike the rest of this set, where rejecting matches every version. The
@@ -3232,7 +3244,7 @@ def _unknown_command_field(
         "ok": 0.0,
         "errmsg": f"BSON field '{command}.{unknown}' is an unknown field.",
         "code": 40415,
-        "codeName": "Location40415",
+        "codeName": "IDLUnknownField",
     }
 
 
@@ -3482,7 +3494,7 @@ def _unknown_find_and_modify_field(doc: Mapping[str, Any]) -> dict[str, Any] | N
         "ok": 0.0,
         "errmsg": f"BSON field 'findAndModify.{unknown}' is an unknown field.",
         "code": 40415,
-        "codeName": "Location40415",
+        "codeName": "IDLUnknownField",
     }
 
 
@@ -4033,7 +4045,7 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "ok": 0.0,
             "errmsg": f"BSON field 'create.{unknown}' is an unknown field",
             "code": 40415,
-            "codeName": "Location40415",
+            "codeName": "IDLUnknownField",
         }
     coll = doc["create"]
     oplog_err = _reject_oplog_rs_write(ctx, coll, "create")
@@ -4586,7 +4598,7 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                     f"the field '{unknown_idx}' is an unknown field"
                 ),
                 "code": 40415,
-                "codeName": "Location40415",
+                "codeName": "IDLUnknownField",
             }
         # Canonicalise option-blob shape per mongod: falsy values for
         # ``hidden`` / ``sparse`` / ``unique`` are stripped (mongod stores
@@ -4814,14 +4826,14 @@ def _kill_cursors(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "ok": 0.0,
             "errmsg": f"BSON field 'killCursors.{unknown}' is an unknown field.",
             "code": 40415,
-            "codeName": "Location40415",
+            "codeName": "IDLUnknownField",
         }
     if "cursors" not in doc:
         return {
             "ok": 0.0,
             "errmsg": "BSON field 'killCursors.cursors' is missing but a required field",
             "code": 40414,
-            "codeName": "Location40414",
+            "codeName": "IDLFailedToParse",
         }
     raw_cursors = doc["cursors"]
     if raw_cursors is None:
@@ -4831,7 +4843,7 @@ def _kill_cursors(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "ok": 0.0,
             "errmsg": "BSON field 'killCursors.cursors' is missing but a required field",
             "code": 40414,
-            "codeName": "Location40414",
+            "codeName": "IDLFailedToParse",
         }
     if not isinstance(raw_cursors, list):
         return {
@@ -5053,7 +5065,7 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "ok": 0.0,
             "errmsg": f"BSON field 'getMore.{unknown}' is an unknown field.",
             "code": 40415,
-            "codeName": "Location40415",
+            "codeName": "IDLUnknownField",
         }
     # The cursor id must be a LONG -- an int32 is refused, which is the same
     # int64-strictness the Go and C drivers enforce on the reply side.
@@ -5073,7 +5085,7 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "ok": 0.0,
             "errmsg": "BSON field 'getMore.collection' is missing but a required field",
             "code": 40414,
-            "codeName": "Location40414",
+            "codeName": "IDLFailedToParse",
         }
     if not isinstance(doc["collection"], str):
         return {
@@ -5361,7 +5373,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "ok": 0.0,
                 "errmsg": f"BSON field 'cursor.{_unknown_cursor_key}' is an unknown field.",
                 "code": 40415,
-                "codeName": "Location40415",
+                "codeName": "IDLUnknownField",
             }
     elif "explain" not in doc:
         # ``cursor`` is REQUIRED, and its absence is a parse error rather than

@@ -30,13 +30,16 @@ use secantus_core::query::bson_type_name;
 
 use crate::CommandError;
 
-/// mongod's numeric-slot type list, reproduced verbatim — the unbalanced quote
-/// is mongod's own.
-const NUMERIC_TYPES: &str = "'[long, int, decimal, double']";
+/// mongod's numeric-slot type list, probed on 8.2.1. The ORDER is mongod's own
+/// and differs per field, so this is copied rather than derived. (6.0.16 also
+/// put the closing quote inside the bracket here; 8.x quotes it properly.)
+/// Mirrors `commands._NUMERIC_TYPES_MSG`.
+const NUMERIC_TYPES: &str = "'[decimal, int, double, long]'";
 
 /// `findAndModify.upsert` accepts a bool OR any number, unlike the strict-bool
-/// `update.updates.multi` beside it.
-const BOOL_OR_NUMBER_TYPES: &str = "'[bool, long, int, decimal, double]'";
+/// `update.updates.multi` beside it. Probed 8.2.1; note the order differs from
+/// `NUMERIC_TYPES` above. Mirrors `commands._BOOL_OR_NUMBER_TYPES_MSG`.
+const BOOL_OR_NUMBER_TYPES: &str = "'[int, decimal, long, bool, double]'";
 
 fn type_mismatch(errmsg: impl Into<String>) -> CommandError {
     CommandError::new(14, "TypeMismatch", errmsg.into())
