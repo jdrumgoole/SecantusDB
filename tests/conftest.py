@@ -97,6 +97,45 @@ if "wiredtiger" not in sys.modules and importlib.util.find_spec("wiredtiger") is
 _SAFE_TMP_RETENTION = frozenset({"all"})
 
 
+@pytest.fixture(scope="session")
+def _wt_template(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """One pristine WiredTiger home per xdist worker, built once.
+
+    ``tmp_path_factory`` is session-scoped and already per-worker, so each
+    worker process builds and owns exactly one template — no cross-worker
+    sharing, no lock, nothing to race.
+    """
+    # Imported lazily, NOT at module scope: tests/test_crash_stall_watchdog.py
+    # copies THIS FILE alone into a tmp dir and runs a nested pytest session
+    # against it, without wt_template.py alongside. A module-level import would
+    # break every one of those nested sessions at conftest load.
+    from wt_template import build_template
+
+    home = tmp_path_factory.mktemp("wt-template") / "home"
+    build_template(str(home))
+    return str(home)
+
+
+@pytest.fixture
+def wt_home(_wt_template: str, tmp_path) -> str:
+    """A per-test WiredTiger home CLONED from the template rather than created.
+
+    Cuts the per-test fixture floor from ~235 ms to ~127 ms by skipping the ~12
+    ``session.create`` calls (~9.7 ms each) that every test would otherwise pay
+    to build the same empty schema. Equivalence with a freshly-created home is
+    pinned by ``tests/test_wt_template.py``; the measurements behind it are in
+    ``tasks/rust-test-harness-investigation.md``.
+
+    Returns a subdirectory rather than ``tmp_path`` itself, so a test can still
+    use ``tmp_path`` for archives / exports without tripping over WT's files.
+    """
+    from wt_template import clone_template  # lazy — see _wt_template above
+
+    dest = tmp_path / "wt"
+    clone_template(_wt_template, str(dest))
+    return str(dest)
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Refuse to run under a ``tmp_path_retention_policy`` that deletes tmp
     dirs mid-session.

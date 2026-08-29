@@ -14,8 +14,8 @@ from pymongo import MongoClient
 from secantus import SecantusDBServer
 
 
-def test_hello_process_id_is_stable_across_calls(tmp_path):
-    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as srv:
+def test_hello_process_id_is_stable_across_calls(wt_home):
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         client = MongoClient(srv.uri, serverSelectionTimeoutMS=2000, directConnection=True)
         try:
             h1 = client.admin.command("hello")

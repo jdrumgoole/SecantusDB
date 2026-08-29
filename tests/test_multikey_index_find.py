@@ -41,14 +41,14 @@ from secantus import SecantusDBServer
 
 
 @pytest.fixture
-def collection(tmp_path):
+def collection(wt_home):
     """Fresh collection on an ephemeral SecantusDB instance.
 
     ``port=0`` plus a per-test ``storage_path`` — without the latter every
     xdist worker opens the same default ``./secantus-data`` and the runs
     collide.
     """
-    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as server:
+    with SecantusDBServer(port=0, storage_path=wt_home) as server:
         client = MongoClient(server.uri, directConnection=True)
         yield client["repro"]["wine_prices"]
         client.close()

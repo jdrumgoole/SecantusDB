@@ -20,12 +20,12 @@ from pymongo import MongoClient
 from secantus import SecantusDBServer
 
 
-def test_stop_drains_in_flight_change_stream_before_close(tmp_path) -> None:
+def test_stop_drains_in_flight_change_stream_before_close(wt_home) -> None:
     """A connection thread parked in a change-stream ``getMore`` is drained by
     ``stop()`` — woken via the shutdown signal and reaped — so it never touches
     WiredTiger after close. ``stop()`` returns promptly (it doesn't block on the
     cursor's full ``maxAwaitTimeMS``) and leaves no active connections."""
-    srv = SecantusDBServer(port=0, storage_path=str(tmp_path))
+    srv = SecantusDBServer(port=0, storage_path=wt_home)
     srv.start()
     mc = MongoClient(srv.uri, serverSelectionTimeoutMS=3000)
     cs = None
