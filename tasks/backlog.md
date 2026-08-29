@@ -507,7 +507,10 @@ Specific items that were left out of the slice that introduced their feature are
   proceeds". Measured three-way against PostgreSQL 14:
 
       autocommit write-write        pg blocks -> 111   us blocks -> 111   MATCH
-      explicit txn READ COMMITTED   pg blocks -> 111   us 40001  -> 101   DIVERGE
+      explicit txn READ COMMITTED   pg blocks -> 111   us blocks -> 111   MATCH*
+        (* FIXED 2026-08-29 for a transaction's FIRST write, which is the only
+           one WiredTiger lets us refresh a snapshot before; a later write still
+           answers 40001 rather than computing against a stale view)
       explicit txn REPEATABLE READ  pg 40001  -> 101   us 40001  -> 101   MATCH
       explicit txn SERIALIZABLE     pg 40001 (skew)    us BOTH COMMIT      DIVERGE
 
@@ -543,13 +546,43 @@ Specific items that were left out of the slice that introduced their feature are
   durable undo, crash recovery, GC, row locks), fixes the seam (four storage
   methods carry ~95% of SQL traffic, and the seam must sit ABOVE `Storage` so
   the Mongo side keeps mongod's snapshot isolation), and states kill criteria.
-  **Its recommendation is to do Phase 0 only** — a partial row-lock mode that
-  raises 40001 on a second write rather than answering wrongly — and re-decide
-  with that measurement. Do not start Phases 3–4 without reading §8.
+  **Phase 0 RAN 2026-08-29 and refuted the premise.** The partial row-lock mode
+  helps only transactions whose conflicting write is their FIRST. Measured:
+  our own SQL suite says 99.2% of writing transactions are single-write —
+  but psycopg's own transaction tests say **46.2%**, i.e. more than half of
+  upstream writing transactions write repeatedly. Both samples are biased in
+  opposite directions and neither is an application workload. So the
+  "ship the partial mode and stop" exit is **not** evidence-backed, and the
+  99% figure must not be quoted — it came from our tests. Do not start
+  Phases 3–4 without reading §8.
 
   All four rows are pinned by `tests/test_sql_isolation_level.py`, with the two
   divergent ones named `test_known_divergence_*` so they cannot be misread as
   conformance, plus an oracle test for the two that match.
+
+- [ ] **OPEN — `CREATE INDEX` is not undone by `ROLLBACK TO SAVEPOINT`.** Found
+  2026-08-29 while checking whether DDL is transactional at all. Measured
+  against PostgreSQL 14:
+
+      after a savepoint, then ROLLBACK TO SAVEPOINT
+        CREATE TABLE   undone      MATCH
+        DROP TABLE     undone      MATCH
+        ALTER TABLE    undone      MATCH
+        CREATE VIEW    undone      MATCH
+        CREATE INDEX   SURVIVES    pg removes it            <-- diverges
+
+      full ROLLBACK
+        CREATE INDEX / DROP INDEX  undone     MATCH
+
+  So index DDL IS transactional; it is not savepoint-aware. Cause is likely that
+  savepoints capture per-collection document pre-images (`sql/session.py`
+  `_Savepoint.snapshots`) and the index catalog is not part of that capture.
+
+  **`docs/sql.md` claimed the opposite and has been corrected**: it said DDL
+  "is **not** rolled back by `ROLLBACK TO SAVEPOINT` — only DML is", giving
+  `CREATE TABLE` as the example — which is precisely the case that DOES roll
+  back. The doc understated the engine everywhere except the one place it was
+  right.
 
 - [ ] **OPEN — an unresolvable bare relation is named with the schema we tried,
   not the name the user wrote.** Fallout from the search_path work above, and
