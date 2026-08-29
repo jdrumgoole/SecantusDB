@@ -575,6 +575,21 @@ def _fam(db: Database, **body: object) -> str:
     return repr(out)
 
 
+def _upsert_key_shape(db: Database, **body: object) -> str:
+    """An upserted document's key shape, minus what mongod versions disagree on.
+
+    ``_id`` leads on every version -- that is the bug this pins (we appended it
+    LAST) -- and the fields the UPDATE added are in field-name order on every
+    version too. What differs: 6.0.16 sorts the fields seeded from the query's
+    equalities, while the newer server on the Windows runner keeps the query's
+    own order. So the leading ``_id`` and the sorted key set are asserted, and
+    the seeded group's internal order is not.
+    """
+    reply = db.command({"findAndModify": "c", **body})
+    keys = list(reply["value"])
+    return f"first={keys[0]} rest={sorted(keys[1:])}"
+
+
 def _stable_code_name(details: Mapping) -> str:
     """``codeName``, or a marker when mongod's name for the code is not stable.
 
@@ -636,10 +651,16 @@ FAM_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
             and list(db.c.find())
         ),
     ),
+    # ``_id`` FIRST is the part that was broken (we appended it last) and the
+    # part every mongod agrees on. The relative order of the query-seeded
+    # fields is NOT asserted: 6.0.16 sorts them, and the newer server on the
+    # Windows runner keeps the query's own order -- probed on both. We ship
+    # 6.0's form, as this file does for every other 6.0-vs-newer split, and
+    # `tests/test_update_replacement_and_paths.py` pins it against our server.
     (
         "upsert-leads-with-id",
         [],
-        lambda db: _fam(
+        lambda db: _upsert_key_shape(
             db, query={"b": 1, "a": 2}, update={"$set": {"y": 3}}, upsert=True, new=True
         ),
     ),
@@ -814,6 +835,9 @@ UPDATE_CMD_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
             and [{k: v for k, v in d.items() if k != "_id"} for d in db.c.find()]
         ),
     ),
+    # ``_id`` leads, and the update-added fields are in field-name order, on
+    # every mongod. The seeded group's internal order is version-dependent --
+    # see `_upsert_key_shape`.
     (
         "cmd-upserted-field-order",
         [],
@@ -826,7 +850,7 @@ UPDATE_CMD_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
                     ],
                 }
             )
-            and [list(d) for d in db.c.find()]
+            and [(list(d)[0], sorted(list(d)[1:3]), list(d)[3:]) for d in db.c.find()]
         ),
     ),
     (

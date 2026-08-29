@@ -185,7 +185,17 @@ def test_upsert_from_a_dotted_query_nests(db) -> None:
 
 def test_upserted_field_order(db) -> None:
     """``_id``, then the query-seeded fields, then the update's -- each group
-    in field-name order (probed 6.0.16)."""
+    in field-name order (probed 6.0.16).
+
+    Two of these three are version-stable and one is not. ``_id`` leading is
+    the bug that was fixed (we appended it last) and holds on every mongod, as
+    does field-name order for the fields the UPDATE added. The **seeded**
+    group's order is 6.0.16's: the newer server on CI's Windows runner keeps
+    the query's own order instead. We ship 6.0's form, the convention this
+    project already applies to every other 6.0-vs-newer split, so this test
+    asserts it against our server while the live differential gate
+    deliberately does not assert that sub-part.
+    """
     db.c.update_one({"n": 1, "m": 2}, {"$set": {"z": 3, "a": 4}}, upsert=True)
     assert list(db.c.find_one()) == ["_id", "m", "n", "a", "z"]
 

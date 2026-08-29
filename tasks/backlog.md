@@ -839,6 +839,23 @@ These are explicit non-goals. Don't add them without a reason.
   send, so the full suite was green over it. `tests/test_mongod_differential.py` 57 → 93 cases;
   `tests/test_findandmodify_fidelity.py` and
   `tests/test_update_replacement_and_paths.py` pin the semantics.
+- [x] **The differential gate runs against DIFFERENT mongod versions per CI
+  lane, and two assertions were version-dependent (found by CI, 2026-08-29).**
+  The dev box has 6.0.16; the `windows-latest` runner image ships a newer
+  server, and `test-windows` failed twice on assertions that passed on macOS
+  and Linux. Neither was a flake. Both splits are worth knowing before adding
+  a differential case:
+  - **`codeName` for the high numeric codes is not stable.** 40415 is
+    `Location40415` on 6.0.16 (mongod's fallback rendering for a code with no
+    symbolic name) and `IDLUnknownField` on the newer server — same code, same
+    message. The *named* codes (2 / 9 / 14 / 28 / 40 / 66) are stable.
+    `_stable_code_name` now asserts the name only below code 10000.
+  - **An upserted document's query-seeded fields are ordered differently.**
+    6.0.16 sorts them (`{b: 1, a: 2}` upserts `{_id, a, b, …}`); the newer
+    server keeps the query's order (`{_id, b, a, …}`). `_id` leading, and
+    field-name order for the fields the *update* added, hold on both. We ship
+    6.0's form per this project's standing convention; the gate asserts only
+    the version-stable parts (`_upsert_key_shape`).
 - [ ] **A hint that names no index answers a shorter message than mongod's.**
   Code (2) and `codeName` (`BadValue`) match, and the causal sentence is the
   same — `hint provided does not correspond to an existing index` — but mongod
