@@ -444,6 +444,65 @@ Specific items that were left out of the slice that introduced their feature are
   number above is the Python server. The probe drives whatever is on the wire,
   so pointing it at `secantusd-rs` is the whole of the measurement — do that
   before assuming either result.
+- [ ] **OPEN — `test_tls_against_rust_server` flakes on the Windows runner
+  (first seen 2026-08-29, PR #1089).** `storage-engine (windows-latest)` failed
+  ONE of 86 tests with `ServerSelectionTimeoutError: No servers found yet,
+  Timeout: 5.0s` while pinging a TLS-enabled `RustServer`; a rerun of the same
+  job on the same commit passed. The PR that surfaced it changed only
+  `sql/planner.py` and its tests, so there is no causal path to the Rust
+  server's TLS listener.
+
+  **Not the known Windows `storage-engine` pattern** — that one is disk
+  exhaustion and shows `WT_PANIC` + `No space left on device` across a burst of
+  tests. This is a single test, no panic, no ENOSPC.
+
+  Most likely a genuinely tight budget: the test allows **5s** for a TLS
+  handshake against a freshly-spawned server on the slowest runner in the
+  matrix, and `tests/test_rust_server_smoke.py` uses the same 5000ms in seven
+  places. Per this repo's rule a flake is a bug, not noise — the fix is to give
+  the TLS case a budget matched to Windows (or wait for the listener rather than
+  race it), not to rerun it away. Recorded here because reruns hide it.
+
+- [ ] **OPEN — wrong-typed command arguments on the RUST SERVER: 78 of 87
+  divergences (measured 2026-08-29, first sweep ever).** The Python server's
+  four-PR sweep (#1078 / #1080 / #1084 / #1085) got that server to 87/87 clean.
+  The Rust server had never been measured. It is not close:
+
+      cases: 87   CRASHES (code 1): 0   divergences: 78
+      rust == python on only 9/87
+
+          54  accepted where mongod errors
+          24  generic BadValue (2) where mongod has a typed code
+
+  Reproduce: build the binary (`./inv rust-binary-build`), run it
+  (`secantusd-rs --port 27055 --storage-path DIR`), then
+  `PROBE_SERVER=mongodb://127.0.0.1:27055 PROBE_MONGOD=... uv run --no-sync
+  python tools/probes/arg_types_extended.py`. The probe now takes any server URI.
+
+  **"Accepted" understates it — the server reports success AND does the wrong
+  thing.** Probed against mongod on the same data:
+
+      createIndexes.indexes=5   mongod 14   rust: OK, and creates NO index
+      update.multi={}           mongod 14   rust: OK, updates 1 of 2 (multi=false)
+      findAndModify.upsert=[1]  mongod 14   rust: OK, no document created
+      find.limit='x'            mongod 14   rust: OK, limit ignored
+
+  The `createIndexes` case is the worst of them: a driver is told the index was
+  created when it was not, so anything relying on it — query plans, or an
+  application's uniqueness assumption — is silently wrong from then on.
+
+  **Two things NOT to conclude from this.** (1) The Rust server never crashes —
+  zero code-1 replies, where the Python server started at 45 then 24. Its wire
+  layer is *sturdier*; what it lacks is argument validation. (2) The 24 generic
+  `BadValue` answers are the already-filed "Rust error-code class" (see
+  `tasks/remaining-work-plan.md` §1b), now with a count rather than a single
+  `$densify` example — do not plan them as separate campaigns.
+
+  Sequencing note: the Python fixes are the worked template, and the per-slot
+  message families are already probed and written down in the entry above. The
+  hard-won rule applies unchanged — mongod's strictness is per-slot, so probe
+  each one; `delete.deletes.limit` must stay UNvalidated.
+
 - [ ] **OPEN — Admin UI saved-connections / settings page**: Slice 11 of the admin UI shipped schema sampler / logs viewer / geo viewer but skipped the planned `/settings` page with saved Mongo URIs and a manual dark/light toggle. The CLI today takes a single `--uri` per launch, so saved connections are bookmark-only (you can't switch targets after start). When the launcher gains hot-swap support, revisit this page — it's likely a small SQLite-backed list reusing the existing `~/.secantus/admin.db` store.
 
 ### 3.1 Authentication

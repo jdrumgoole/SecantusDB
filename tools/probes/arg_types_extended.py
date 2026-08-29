@@ -17,6 +17,13 @@ from secantus import SecantusDBServer
 
 MONGOD = os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041")
 
+#: Point the probe at a RUNNING server instead of an embedded Python one --
+#: this is how the Rust server gets swept (start `secantusd-rs --port N
+#: --storage-path DIR`, then `PROBE_SERVER=mongodb://127.0.0.1:N`). The probe
+#: drives the wire, so the server under test is just a URI; there is nothing
+#: Python-specific about it.
+SERVER = os.environ.get("PROBE_SERVER")
+
 # For a slot expecting a document/array, feed scalars. For a slot expecting a
 # number, feed a document/string. For a string slot, feed a number/document.
 DOCISH = [5, "x", True]
@@ -92,10 +99,16 @@ def run(cli, dbn, cmd):
         return ("ERR", getattr(e, "code", None))
 
 
-d = tempfile.mkdtemp()
-s = SecantusDBServer(port=0, storage_path=d)
-s.start()
-sec = pymongo.MongoClient(f"mongodb://{s.address[0]}:{s.address[1]}", directConnection=True)
+if SERVER:
+    s = None
+    sec = pymongo.MongoClient(SERVER, directConnection=True, serverSelectionTimeoutMS=8000)
+    print(f"  server under test: {SERVER}")
+else:
+    d = tempfile.mkdtemp()
+    s = SecantusDBServer(port=0, storage_path=d)
+    s.start()
+    sec = pymongo.MongoClient(f"mongodb://{s.address[0]}:{s.address[1]}", directConnection=True)
+    print("  server under test: embedded Python SecantusDBServer")
 mon = pymongo.MongoClient(MONGOD, directConnection=True, serverSelectionTimeoutMS=8000)
 crashes, diffs, total = [], [], 0
 for i, (label, cmd) in enumerate(cases()):
@@ -116,4 +129,5 @@ if diffs:
     for label, mongo, ours in diffs:
         print(f"    {label:<34} mongod={str(mongo):<16} secantus={ours}")
 sec.close()
-s.stop()
+if s is not None:
+    s.stop()
