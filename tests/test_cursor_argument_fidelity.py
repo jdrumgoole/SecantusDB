@@ -49,7 +49,7 @@ def _err(db, cmd):
     return exc.value
 
 
-NUMERIC_TYPES = "expected types '[long, int, decimal, double']"
+NUMERIC_TYPES = "expected types '[decimal, int, double, long]'"
 
 
 # --- the crashes ------------------------------------------------------------
@@ -89,20 +89,20 @@ def test_find_rejects_negative_sizing(db, field) -> None:
     ``or DEFAULT`` and became the default, and a negative ``limit`` returned
     the whole collection."""
     err = _err(db, {"find": "c", field: -3})
-    assert err.code == 51024
-    assert err.details["codeName"] == "Location51024"
+    assert err.code == 2
+    assert err.details["codeName"] == "BadValue"
     # The bare field name, not the IDL path the type error uses.
     assert err.details["errmsg"] == f"BSON field '{field}' value must be >= 0, actual value '-3'"
 
 
 def test_getmore_rejects_negative_batchsize(db) -> None:
     err = _err(db, {"getMore": _open(db), "collection": "c", "batchSize": -1})
-    assert err.code == 51024
+    assert err.code == 2
 
 
 def test_aggregate_rejects_negative_batchsize(db) -> None:
     err = _err(db, {"aggregate": "c", "pipeline": [], "cursor": {"batchSize": -1}})
-    assert err.code == 51024
+    assert err.code == 2
 
 
 @pytest.mark.parametrize("value", [0, 3, Int64(3), 3.0, 2.5, Decimal128("3"), None])
@@ -235,9 +235,12 @@ def test_killcursors_null_element_is_skipped(db) -> None:
     assert reply["cursorsNotFound"] == []
 
 
-def test_killcursors_null_cursors_takes_the_older_code(db) -> None:
+def test_killcursors_null_cursors_reads_as_a_missing_field(db) -> None:
+    """6.0 sent an explicit null down an older path (10065); 8.x treats it as
+    the field not being sent at all."""
     err = _err(db, {"killCursors": "c", "cursors": None})
-    assert err.code == 10065
+    assert err.code == 40414
+    assert "is missing but a required field" in str(err)
 
 
 def test_killcursors_rejects_an_unknown_field(db) -> None:

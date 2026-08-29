@@ -174,7 +174,7 @@ def test_find_and_modify_bool_flags_reject_non_numbers(db, field, bad) -> None:
     assert err.code == 14
     assert err.details["errmsg"] == (
         f"BSON field 'findAndModify.{field}' is the wrong type "
-        f"'{_bson_type_name(bad)}', expected types '[bool, long, int, decimal, double']"
+        f"'{_bson_type_name(bad)}', expected types '[int, decimal, long, bool, double]'"
     )
 
 
@@ -275,14 +275,19 @@ def test_distinct_key_null_is_missing_not_wrong_typed(db) -> None:
     """mongod treats an explicit null as ABSENT for a required field."""
     err = _err(db, {"distinct": "c", "key": None})
     assert err.code == 40414
-    assert err.details["errmsg"] == "BSON field 'distinct.key' is missing but a required field"
+    assert (
+        err.details["errmsg"]
+        == "BSON field 'distinctCommandRequest.key' is missing but a required field"
+    )
 
 
 @pytest.mark.parametrize("bad", [5, {}, [1], True])
 def test_distinct_key_wrong_type_names_the_path(db, bad) -> None:
     err = _err(db, {"distinct": "c", "key": bad})
     assert err.code == 14
-    assert err.details["errmsg"].startswith("BSON field 'distinct.key' is the wrong type")
+    assert err.details["errmsg"].startswith(
+        "BSON field 'distinctCommandRequest.key' is the wrong type"
+    )
 
 
 def test_find_min_max_reject_an_explicit_null(db) -> None:

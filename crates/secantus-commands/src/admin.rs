@@ -862,8 +862,10 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // as its deliberately-failing operation and asserts an OperationFailure.
     // Mirrors `commands._list_indexes`.
     if batch_size < 0 {
+        // 6.0 answered 51024 Location51024 here; 8.x answers 2 BadValue with
+        // the same message. Mirrors `commands._require_non_negative_number`.
         return Ok(CommandError::new(
-            51024,
+            2,
             "BadValue",
             format!("BSON field 'batchSize' value must be >= 0, actual value {batch_size}"),
         )
@@ -1872,7 +1874,7 @@ mod parity_tests {
         )
         .unwrap();
         let (code, name, msg) = err_of(&reply);
-        assert_eq!((code, name.as_str()), (51024, "BadValue"));
+        assert_eq!((code, name.as_str()), (2, "BadValue"));
         assert!(msg.contains("must be >= 0"), "{msg}");
     }
 

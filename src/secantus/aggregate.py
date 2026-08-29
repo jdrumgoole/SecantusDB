@@ -43,11 +43,23 @@ class AggregateError(Exception):
     pin mongod's specific code (e.g. 40324 for unrecognized stages)."""
 
     def __init__(
-        self, message: str, *, code: int | None = None, code_name: str | None = None
+        self,
+        message: str,
+        *,
+        code: int | None = None,
+        code_name: str | None = None,
+        exec_error: bool = False,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.code_name = code_name
+        # EXECUTION-time (per-document) failure rather than a pipeline-parse
+        # one. mongod wraps only these in "Executor error during aggregate
+        # command on namespace: <ns> :: caused by :: " -- probed 8.2.1, where
+        # $densify's field-type check and $divide-by-zero are wrapped but an
+        # unrecognized stage, a bad $sort spec and an unknown group operator
+        # are not. The command layer applies the prefix; it owns the namespace.
+        self.exec_error = exec_error
 
 
 # Atlas Search is an Atlas-only feature. A real non-Atlas mongod rejects the
@@ -640,7 +652,8 @@ def _stage_densify(
     if isinstance(raw_step, bool) or not isinstance(raw_step, (int, float)):
         raise AggregateError(
             f"BSON field '$densify.range.step' is the wrong type '{_bson_type_name(raw_step)}', "
-            "expected types '[int, decimal, double, long']",
+            # Probed on mongod 8.2.1; the order is per-field and is mongod's.
+            "expected types '[double, long, int, decimal]'",
             code=14,
             code_name="TypeMismatch",
         )
@@ -772,6 +785,7 @@ def _stage_densify(
                     "Densify field type must be numeric or a date",
                     code=5733201,
                     code_name="Location5733201",
+                    exec_error=True,
                 )
         # Null / missing sort before every number and date, so they lead.
         out.extend(passthrough)
@@ -1485,7 +1499,7 @@ def _percentile_spec(arg: Any, op: str) -> tuple[Any, list[float] | None]:
         raise AggregateError(
             f"BSON field '{op}.method' is missing but a required field",
             code=40414,
-            code_name="Location40414",
+            code_name="IDLFailedToParse",
         )
     if arg["method"] != "approximate":
         raise AggregateError(
@@ -1497,7 +1511,7 @@ def _percentile_spec(arg: Any, op: str) -> tuple[Any, list[float] | None]:
         raise AggregateError(
             f"BSON field '{op}.input' is missing but a required field",
             code=40414,
-            code_name="Location40414",
+            code_name="IDLFailedToParse",
         )
     if op == "$median":
         return arg["input"], None
@@ -1505,7 +1519,7 @@ def _percentile_spec(arg: Any, op: str) -> tuple[Any, list[float] | None]:
         raise AggregateError(
             "BSON field '$percentile.p' is missing but a required field",
             code=40414,
-            code_name="Location40414",
+            code_name="IDLFailedToParse",
         )
     ps = arg["p"]
     if not isinstance(ps, list):
@@ -1855,6 +1869,21 @@ def _render_arg(v: Any) -> str:
     return str(v)
 
 
+# mongod 8.x answers one sentence for every localField/foreignField pairing
+# mistake; 6.0 varied it by whether a `pipeline` was present.
+_LOOKUP_FIELD_PAIR_MSG = (
+    "$lookup requires both or neither of 'localField' and 'foreignField' to be specified"
+)
+
+
+def _lookup_wrong_type(field: str, value: Any, expected: str) -> str:
+    """The IDL wrong-type sentence 8.x uses for a $lookup argument."""
+    return (
+        f"BSON field '$lookup.{field}' is the wrong type "
+        f"'{_bson_type_name(value)}', expected type '{expected}'"
+    )
+
+
 def _stage_lookup(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -1864,18 +1893,19 @@ def _stage_lookup(
             code=9,
             code_name="FailedToParse",
         )
-    # mongod names the offending argument and answers FailedToParse (9). We
-    # answered TypeMismatch (14) with one of two generic sentences that named
-    # neither the field nor the problem, and accepted unknown arguments
-    # outright -- so a misspelled `foreignFeild` silently became a
-    # pipeline-less join over the whole foreign collection.
+    # 8.x parses $lookup through the IDL, so unknown / missing / wrong-typed
+    # arguments get the generic BSON-field wording rather than the hand-written
+    # sentences 6.0 used. `from` is the exception -- both its missing and its
+    # wrong-type errors are still hand-written (probed 8.2.1).
+    #
+    # The unknown-field check runs FIRST: probed with a spec that is both
+    # missing `as` and carries an unknown key, mongod answers 40415.
     unknown = next((k for k in spec if k not in _LOOKUP_KNOWN_FIELDS), None)
     if unknown is not None:
         raise AggregateError(
-            f"$lookup argument '{unknown}' must be a string, found "
-            f"{unknown}: {_render_arg(spec[unknown])}: {_bson_type_name(spec[unknown])}",
-            code=9,
-            code_name="FailedToParse",
+            f"BSON field '$lookup.{unknown}' is an unknown field.",
+            code=40415,
+            code_name="IDLUnknownField",
         )
     from_coll = spec.get("from")
     as_field = spec.get("as")
@@ -1892,14 +1922,15 @@ def _stage_lookup(
         )
     if as_field is None:
         raise AggregateError(
-            "must specify 'as' field for a $lookup", code=9, code_name="FailedToParse"
+            "BSON field '$lookup.as' is missing but a required field",
+            code=40414,
+            code_name="IDLFailedToParse",
         )
     if not isinstance(as_field, str):
         raise AggregateError(
-            f"$lookup argument 'as' must be a string, found as: "
-            f"{_render_arg(as_field)}: {_bson_type_name(as_field)}",
-            code=9,
-            code_name="FailedToParse",
+            _lookup_wrong_type("as", as_field, "string"),
+            code=14,
+            code_name="TypeMismatch",
         )
     if ctx.storage is None:
         raise AggregateError("$lookup requires storage context")
@@ -1909,20 +1940,16 @@ def _stage_lookup(
     for _name, _value in (("localField", local_field), ("foreignField", foreign_field)):
         if _value is not None and not isinstance(_value, str):
             raise AggregateError(
-                f"$lookup argument '{_name}' must be a string, found {_name}: "
-                f"{_render_arg(_value)}: {_bson_type_name(_value)}",
-                code=9,
-                code_name="FailedToParse",
+                _lookup_wrong_type(_name, _value, "string"),
+                code=14,
+                code_name="TypeMismatch",
             )
-    # Which message depends on whether a pipeline is present: without one,
-    # mongod complains that you gave it neither join form; with one, that you
-    # half-specified the field pair. Probed both ways.
+    # 6.0 used two different sentences here depending on whether a `pipeline`
+    # was present. 8.x uses this one for every shape -- half-specified pair with
+    # a pipeline, without one, and neither-pair-nor-pipeline (probed all three).
     if (local_field is None) != (foreign_field is None):
         raise AggregateError(
-            "$lookup requires both or neither of 'localField' and 'foreignField' to be specified"
-            if sub_pipeline is not None
-            else "$lookup requires either 'pipeline' or both 'localField' and "
-            "'foreignField' to be specified",
+            _LOOKUP_FIELD_PAIR_MSG,
             code=9,
             code_name="FailedToParse",
         )
@@ -1933,14 +1960,13 @@ def _stage_lookup(
     # "internal server error" (code 1).
     if let_spec is not None and not isinstance(let_spec, Mapping):
         raise AggregateError(
-            f"$lookup argument 'let: {_render_arg(let_spec)}' must be an object, "
-            f"is type {_bson_type_name(let_spec)}",
-            code=9,
-            code_name="FailedToParse",
+            _lookup_wrong_type("let", let_spec, "object"),
+            code=14,
+            code_name="TypeMismatch",
         )
     if sub_pipeline is not None and not isinstance(sub_pipeline, list):
         raise AggregateError(
-            "'pipeline' option must be specified as an array",
+            "A pipeline must be an array of objects",
             code=14,
             code_name="TypeMismatch",
         )
@@ -1950,8 +1976,7 @@ def _stage_lookup(
         )
     if local_field is None or foreign_field is None:
         raise AggregateError(
-            "$lookup requires either 'pipeline' or both 'localField' and "
-            "'foreignField' to be specified",
+            _LOOKUP_FIELD_PAIR_MSG,
             code=9,
             code_name="FailedToParse",
         )

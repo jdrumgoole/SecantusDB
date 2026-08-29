@@ -58,7 +58,7 @@ def test_find_numeric_slots(db, field, bad) -> None:
     assert err.details["errmsg"] == (
         f"BSON field 'FindCommandRequest.{field}' is the wrong type "
         f"'{_bson_type_name(bad)}', "
-        "expected types '[long, int, decimal, double']"
+        "expected types '[decimal, int, double, long]'"
     )
 
 

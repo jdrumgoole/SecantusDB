@@ -164,7 +164,7 @@ JOIN = {"from": "stock", "localField": "sku", "foreignField": "sku", "as": "s"}
 @pytest.mark.parametrize(
     "spec,code",
     [
-        ({"from": "stock", "let": 5, "pipeline": [], "as": "s"}, 9),
+        ({"from": "stock", "let": 5, "pipeline": [], "as": "s"}, 14),
         ({"from": "stock", "pipeline": 5, "as": "s"}, 14),
     ],
 )
@@ -183,23 +183,36 @@ def test_wrong_typed_let_and_pipeline_do_not_crash(db, spec, code) -> None:
 @pytest.mark.parametrize(
     "spec,fragment",
     [
+        # `from` keeps its hand-written errors on 8.x; everything else here
+        # moved to the IDL wording, which names the field as `$lookup.<name>`.
         ({"localField": "sku", "foreignField": "sku", "as": "s"}, "must specify 'pipeline'"),
-        ({"from": "stock", "localField": "sku", "foreignField": "sku"}, "must specify 'as'"),
+        (
+            {"from": "stock", "localField": "sku", "foreignField": "sku"},
+            "BSON field '$lookup.as' is missing but a required field",
+        ),
         (
             {"from": "stock", "localField": "sku", "as": "s"},
-            "requires either 'pipeline' or both",
+            "both or neither of 'localField' and 'foreignField'",
         ),
         ({"from": 5, "localField": "sku", "foreignField": "sku", "as": "s"}, "must be a string"),
-        ({"from": "stock", "localField": 5, "foreignField": "sku", "as": "s"}, "'localField'"),
-        ({"from": "stock", "localField": "sku", "foreignField": "sku", "as": 5}, "'as'"),
+        (
+            {"from": "stock", "localField": 5, "foreignField": "sku", "as": "s"},
+            "BSON field '$lookup.localField' is the wrong type",
+        ),
+        (
+            {"from": "stock", "localField": "sku", "foreignField": "sku", "as": 5},
+            "BSON field '$lookup.as' is the wrong type",
+        ),
     ],
 )
 def test_lookup_argument_errors_name_the_field(db, spec, fragment) -> None:
     """We answered TypeMismatch (14) with one of two generic sentences that
-    named neither the field nor the problem."""
+    named neither the field nor the problem. mongod 8.x parses $lookup through
+    the IDL, so most of these name the field as ``$lookup.<name>``; ``from`` is
+    the exception and keeps its hand-written wording."""
     _seed(db, ORDERS, STOCK)
     err = _err(db, [{"$lookup": spec}])
-    assert err.code in (9, 14)
+    assert err.code in (9, 14, 40414)
     assert fragment in str(err)
 
 
@@ -208,8 +221,8 @@ def test_unknown_lookup_argument_is_rejected(db) -> None:
     became a join over the whole foreign collection."""
     _seed(db, ORDERS, STOCK)
     err = _err(db, [{"$lookup": {**JOIN, "zz": 1}}])
-    assert err.code == 9
-    assert "$lookup argument 'zz'" in str(err)
+    assert err.code == 40415
+    assert "BSON field '$lookup.zz' is an unknown field." in str(err)
 
 
 # --- $lookup join semantics --------------------------------------------------

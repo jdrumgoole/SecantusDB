@@ -37,6 +37,18 @@ from secantus.auth import (
 from secantus.connreg import ConnectionRegistry
 from secantus.cursors import MAX_GETMORE_BATCH_BYTES, CursorNotFound, CursorRegistry
 from secantus.expressions import ExpressionError, UnknownExpressionOperatorError
+
+# CONFORMANCE TARGET: mongod 8.2.1 (retargeted from 6.0.16 on 2026-08-29).
+#
+# `tests/test_mongod_differential.py` is the gate: it runs every supported
+# operation against a real mongod and asserts an exact match, and it SKIPS off
+# the probed series rather than reporting version differences as bugs.
+#
+# Comments in this tree that say "probed 6.0.16" without also naming 8.x record
+# a probe taken against the OLD target and NOT re-verified against the new one.
+# They are not known to be wrong -- most of the surface is version-stable -- but
+# they are not evidence for current behaviour either. Re-probe before relying on
+# one, and update it to name 8.2.1 when you do. See tasks/backlog.md.
 from secantus.failpoints import FailPointRegistry, is_resumable_change_stream_code
 from secantus.geo import GeoError
 from secantus.logbuf import LogBuffer
@@ -2867,6 +2879,11 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             msg = str(exc)
             default_code = 66 if "immutable field" in msg else 9
             code = exc.code if exc.code is not None else default_code
+            # 8.x wraps EXECUTION-time failures the same way findAndModify
+            # does. On 6.0 only findAndModify carried the wrapper and the
+            # update command reported the bare message.
+            if exc.exec_error:
+                msg = f"Plan executor error during update :: caused by :: {msg}"
             write_errors.append({"index": index, "code": code, "errmsg": msg})
             if ordered:
                 break
@@ -3029,7 +3046,9 @@ def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.paths import get_path
 
     coll = doc["distinct"]
-    _err = _unknown_command_field(doc, "distinct", _DISTINCT_KNOWN_FIELDS)
+    # 8.x names the IDL STRUCT, not the command: 'distinctCommandRequest.zz',
+    # where 6.0 said 'distinct.zz'.
+    _err = _unknown_command_field(doc, "distinctCommandRequest", _DISTINCT_KNOWN_FIELDS)
     if _err is not None:
         return _err
     key = doc.get("key", "")
@@ -3042,15 +3061,15 @@ def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # not as a type error -- probed 6.0.16.
         return {
             "ok": 0.0,
-            "errmsg": "BSON field 'distinct.key' is missing but a required field",
+            "errmsg": "BSON field 'distinctCommandRequest.key' is missing but a required field",
             "code": 40414,
-            "codeName": "Location40414",
+            "codeName": "IDLFailedToParse",
         }
     if not isinstance(key, str):
         return {
             "ok": 0.0,
             "errmsg": (
-                f"BSON field 'distinct.key' is the wrong type "
+                f"BSON field 'distinctCommandRequest.key' is the wrong type "
                 f"'{_bson_type_of(key)}', expected type 'string'"
             ),
             "code": 14,
@@ -3128,7 +3147,7 @@ def _require_object_bson_field(value: Any, field_path: str) -> dict[str, Any] | 
     }
 
 
-_NUMERIC_TYPES_MSG = "'[long, int, decimal, double']"
+_NUMERIC_TYPES_MSG = "'[decimal, int, double, long]'"
 
 
 def _delete_stmt_limit(value: Any) -> int:
@@ -3155,7 +3174,8 @@ def _require_number_bson_field(value: Any, field_path: str) -> dict[str, Any] | 
     """mongod's numeric-slot type error, or None if OK / absent.
 
     The expected-types list is reproduced verbatim, unbalanced quotes and all:
-    mongod emits ``expected types '[long, int, decimal, double']``.
+    mongod 8.2.1 emits ``expected types '[decimal, int, double, long]'``; the
+    order is mongod's own and is not alphabetical or by width.
 
     ``bool`` is rejected explicitly -- Python makes it a subclass of ``int``, so
     without the guard ``limit: true`` would be read as ``limit: 1`` where mongod
@@ -3180,7 +3200,7 @@ def _require_number_bson_field(value: Any, field_path: str) -> dict[str, Any] | 
 # ignore it, so a misspelled option was silently dropped.
 #
 # ``hint`` is deliberately in the set even though mongod **6.0.16 rejects it**
-# (`BSON field 'distinct.hint' is an unknown field.`): MongoDB added a hint
+# (`BSON field 'distinctCommandRequest.hint' is an unknown field.`): MongoDB added a hint
 # option to `distinct` in a later release, so a current driver may legitimately
 # send it. Accepting is the safe direction for a field whose status changed --
 # unlike the rest of this set, where rejecting matches every version. The
@@ -3224,7 +3244,7 @@ def _unknown_command_field(
         "ok": 0.0,
         "errmsg": f"BSON field '{command}.{unknown}' is an unknown field.",
         "code": 40415,
-        "codeName": "Location40415",
+        "codeName": "IDLUnknownField",
     }
 
 
@@ -3254,13 +3274,16 @@ def _unresolvable_hint_error(ctx: CommandContext, coll: str, hint: Any) -> str |
 
 
 def _require_non_negative_number(value: Any, bare_name: str) -> dict[str, Any] | None:
-    """mongod's ``Location51024`` for a negative cursor-sizing value, else None.
+    """mongod's ``BadValue`` for a negative cursor-sizing value, else None.
 
     ``batchSize`` / ``limit`` / ``skip`` are all "must be >= 0" on ``find``,
-    ``getMore`` and ``aggregate``'s cursor spec (probed 6.0.16). Every one of
+    ``getMore`` and ``aggregate``'s cursor spec (probed 8.2.1). Every one of
     them was accepted here: a negative ``batchSize`` fell through Python's
     ``or DEFAULT`` and silently became the default, and a negative ``limit``
     returned the whole collection.
+
+    6.0 answered ``51024 Location51024`` here; 8.x answers ``2 BadValue`` with
+    the same message.
 
     Unlike the type error above, the message uses the BARE field name --
     ``BSON field 'batchSize'``, not the IDL path -- on all three commands.
@@ -3280,8 +3303,8 @@ def _require_non_negative_number(value: Any, bare_name: str) -> dict[str, Any] |
     return {
         "ok": 0.0,
         "errmsg": f"BSON field '{bare_name}' value must be >= 0, actual value '{rendered}'",
-        "code": 51024,
-        "codeName": "Location51024",
+        "code": 2,
+        "codeName": "BadValue",
     }
 
 
@@ -3328,11 +3351,14 @@ def _require_object_expected_field(
     }
 
 
-# mongod's own quoting, which is not what you would write: the closing quote
-# sits INSIDE the bracket. Verbatim from 6.0.16 --
-# ``expected types '[bool, long, int, decimal, double']``. We had the quote
-# outside, which is the sensible form and the wrong one.
-_BOOL_OR_NUMBER_TYPES_MSG = "'[bool, long, int, decimal, double']"
+# The per-field IDL type set, verbatim from mongod 8.2.1. The ORDER is mongod's
+# and differs per field (``findAndModify.remove`` and ``getMore.batchSize`` do
+# not agree), so each constant is probed, not derived.
+#
+# 6.0.16 also put the closing quote INSIDE the bracket here
+# (``'[bool, long, int, decimal, double']``); 8.x quotes it properly. If you are
+# reading this against a 6.0 server, that is why it does not match.
+_BOOL_OR_NUMBER_TYPES_MSG = "'[int, decimal, long, bool, double]'"
 
 
 def _require_bool_value_field(doc: Mapping[str, Any], field_name: str) -> dict[str, Any] | None:
@@ -3468,22 +3494,23 @@ def _unknown_find_and_modify_field(doc: Mapping[str, Any]) -> dict[str, Any] | N
         "ok": 0.0,
         "errmsg": f"BSON field 'findAndModify.{unknown}' is an unknown field.",
         "code": 40415,
-        "codeName": "Location40415",
+        "codeName": "IDLUnknownField",
     }
 
 
 def _validate_array_filters_field(
     doc: Mapping[str, Any], field_name: str, field_path: str
 ) -> dict[str, Any] | None:
-    """``arrayFilters`` must be an array of documents. Probed 6.0.16::
+    """``arrayFilters`` must be an array of documents. Probed 8.2.1::
 
         {e: 1}   14  BSON field '<path>' is the wrong type 'object', expected type 'array'
         "x"      14  BSON field '<path>' is the wrong type 'string', expected type 'array'
         [5]      14  BSON field '<path>.0' is the wrong type 'int', expected type 'object'
-        null     10065  invalid parameter: expected an object (arrayFilters)
+        null     accepted -- an explicit null means ABSENT, and the update runs
 
-    An explicit ``null`` really does take a different, older code path than
-    every other wrong type -- hence the odd ``Location10065``.
+    On 6.0 an explicit ``null`` took an older code path and answered
+    ``10065 invalid parameter: expected an object (arrayFilters)``. 8.x treats
+    it as if the field had not been sent.
 
     We reported a *non-existent field path* here (``update.updates.arrayFilters.0``)
     naming the wrong type, on a command that has no ``updates`` array at all.
@@ -3492,12 +3519,8 @@ def _validate_array_filters_field(
         return None
     value = doc[field_name]
     if value is None:
-        return {
-            "ok": 0.0,
-            "errmsg": "invalid parameter: expected an object (arrayFilters)",
-            "code": 10065,
-            "codeName": "Location10065",
-        }
+        # 8.x: an explicit null is the same as not sending the field.
+        return None
     if isinstance(value, list):
         for i, entry in enumerate(value):
             if not isinstance(entry, Mapping):
@@ -3560,8 +3583,9 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
     TypeMismatch for an unknown modifier (mongod: 9) and for a ``_id`` change
     (mongod: 66), and the driver-canonical handling keyed on those codes never
     fired. The ``update`` command has had this mapping for a while; this is the
-    same rule, plus the execution-error wrapper that ``findAndModify``
-    (uniquely, on 6.0.16) puts in front of its message.
+    same rule, plus the execution-error wrapper that ``findAndModify`` puts in
+    front of its message. On 6.0 findAndModify was alone in doing that; on 8.x
+    the ``update`` command wraps its execution errors too.
     """
     try:
         return _find_and_modify_impl(doc, ctx)
@@ -4021,7 +4045,7 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "ok": 0.0,
             "errmsg": f"BSON field 'create.{unknown}' is an unknown field",
             "code": 40415,
-            "codeName": "Location40415",
+            "codeName": "IDLUnknownField",
         }
     coll = doc["create"]
     oplog_err = _reject_oplog_rs_write(ctx, coll, "create")
@@ -4456,7 +4480,7 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             return {
                 "ok": 0.0,
                 "errmsg": f"BSON field 'batchSize' value must be >= 0, actual value {batch_size}",
-                "code": 51024,
+                "code": 2,
                 "codeName": "BadValue",
             }
     else:
@@ -4574,7 +4598,7 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                     f"the field '{unknown_idx}' is an unknown field"
                 ),
                 "code": 40415,
-                "codeName": "Location40415",
+                "codeName": "IDLUnknownField",
             }
         # Canonicalise option-blob shape per mongod: falsy values for
         # ``hidden`` / ``sparse`` / ``unique`` are stripped (mongod stores
@@ -4802,24 +4826,24 @@ def _kill_cursors(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "ok": 0.0,
             "errmsg": f"BSON field 'killCursors.{unknown}' is an unknown field.",
             "code": 40415,
-            "codeName": "Location40415",
+            "codeName": "IDLUnknownField",
         }
     if "cursors" not in doc:
         return {
             "ok": 0.0,
             "errmsg": "BSON field 'killCursors.cursors' is missing but a required field",
             "code": 40414,
-            "codeName": "Location40414",
+            "codeName": "IDLFailedToParse",
         }
     raw_cursors = doc["cursors"]
     if raw_cursors is None:
-        # An explicit null takes mongod's older code path, as it does for
-        # ``findAndModify.arrayFilters``.
+        # 8.x treats an explicit null as the field being absent, so this lands
+        # on the required-field error rather than 6.0's older 10065 path.
         return {
             "ok": 0.0,
-            "errmsg": "invalid parameter: expected an object (cursors)",
-            "code": 10065,
-            "codeName": "Location10065",
+            "errmsg": "BSON field 'killCursors.cursors' is missing but a required field",
+            "code": 40414,
+            "codeName": "IDLFailedToParse",
         }
     if not isinstance(raw_cursors, list):
         return {
@@ -5041,7 +5065,7 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "ok": 0.0,
             "errmsg": f"BSON field 'getMore.{unknown}' is an unknown field.",
             "code": 40415,
-            "codeName": "Location40415",
+            "codeName": "IDLUnknownField",
         }
     # The cursor id must be a LONG -- an int32 is refused, which is the same
     # int64-strictness the Go and C drivers enforce on the reply side.
@@ -5061,7 +5085,7 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "ok": 0.0,
             "errmsg": "BSON field 'getMore.collection' is missing but a required field",
             "code": 40414,
-            "codeName": "Location40414",
+            "codeName": "IDLFailedToParse",
         }
     if not isinstance(doc["collection"], str):
         return {
@@ -5349,7 +5373,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "ok": 0.0,
                 "errmsg": f"BSON field 'cursor.{_unknown_cursor_key}' is an unknown field.",
                 "code": 40415,
-                "codeName": "Location40415",
+                "codeName": "IDLUnknownField",
             }
     elif "explain" not in doc:
         # ``cursor`` is REQUIRED, and its absence is a parse error rather than
@@ -5540,6 +5564,24 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     )
     try:
         docs = apply_pipeline(docs, pipeline, pipeline_ctx)
+    except (AggregateError, ExpressionError) as exc:
+        # Only EXECUTION-time failures take the prefix; parse errors stay bare
+        # (probed 8.2.1 -- see AggregateError.exec_error). ExpressionError is
+        # evaluation by definition, so it always qualifies. Deliberately applied
+        # HERE and not in ``dispatch``: the prefix names the namespace, and
+        # ``$expr`` in a plain ``find`` must not pick it up.
+        if not (isinstance(exc, ExpressionError) or getattr(exc, "exec_error", False)):
+            raise
+        _code = getattr(exc, "code", None) or 14
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"Executor error during aggregate command on namespace: "
+                f"{ctx.db_name}.{coll} :: caused by :: {exc}"
+            ),
+            "code": _code,
+            "codeName": getattr(exc, "code_name", None) or _code_name_for(_code),
+        }
     except IndexConflict as exc:
         # ``$merge whenMatched=fail`` raises this — surface mongod's
         # dup-key shape (code 11000 + keyPattern + keyValue) so the
