@@ -117,3 +117,82 @@ def test_composite_pk_constraintdef(tmp_path):
         assert rows == [("PRIMARY KEY (a, b)",)]
     finally:
         s.close()
+
+
+# ---------------------------------------------------------------------------
+# Partial indexes. `indexdef` used to drop the WHERE clause entirely, so the
+# rendered statement claimed a FULL index — a tool recreating an index from
+# `pg_indexes` built the wrong one. The predicate is now reversed back to SQL.
+#
+# Every expectation below is PostgreSQL 14's own rendering, byte for byte,
+# including the parenthesisation and the `::text` cast on string literals.
+# ---------------------------------------------------------------------------
+
+
+def _indexdef(storage, name):
+    rows = _rows(storage, f"SELECT indexdef FROM pg_indexes WHERE indexname = '{name}'")
+    return rows[0][0] if rows else None
+
+
+@pytest.mark.parametrize(
+    "predicate,rendered",
+    [
+        ("b > 5", "(b > 5)"),
+        ("b >= 5", "(b >= 5)"),
+        ("b < 5", "(b < 5)"),
+        ("b <= 5", "(b <= 5)"),
+        ("b = 5", "(b = 5)"),
+        ("b IS NOT NULL", "(b IS NOT NULL)"),
+        ("b > 5 AND a < 2", "((b > 5) AND (a < 2))"),
+        ("b > 5 OR a < 2", "((b > 5) OR (a < 2))"),
+    ],
+)
+def test_partial_predicate_round_trips(storage, predicate, rendered):
+    run_sql(
+        storage, DB, f"CREATE INDEX pix ON t (a) WHERE {predicate}", session=Session(database=DB)
+    )
+    assert (
+        _indexdef(storage, "pix")
+        == f"CREATE INDEX pix ON public.t USING btree (a) WHERE {rendered}"
+    )
+
+
+def test_not_equal_round_trips_through_its_desugaring(storage):
+    """`b <> 5` is stored as an $and of "not equal" AND "not null" — the
+    lowering, not the user's predicate. PostgreSQL renders the original, so the
+    idiom is recognised rather than leaked."""
+    run_sql(storage, DB, "CREATE INDEX pix ON t (a) WHERE b <> 5", session=Session(database=DB))
+    assert _indexdef(storage, "pix").endswith(" WHERE (b <> 5)")
+
+
+def test_string_literals_carry_the_cast(storage):
+    """PostgreSQL prints `(s = 'x'::text)`, not `(s = 'x')`."""
+    q = Session(database=DB)
+    run_sql(storage, DB, "ALTER TABLE t ADD COLUMN s text", session=q)
+    run_sql(storage, DB, "CREATE INDEX pix ON t (a) WHERE s = 'x'", session=q)
+    assert _indexdef(storage, "pix").endswith(" WHERE (s = 'x'::text)")
+
+
+def test_a_quote_in_a_literal_is_escaped(storage):
+    q = Session(database=DB)
+    run_sql(storage, DB, "ALTER TABLE t ADD COLUMN s text", session=q)
+    run_sql(storage, DB, "CREATE INDEX pix ON t (a) WHERE s = 'O''Brien'", session=q)
+    assert _indexdef(storage, "pix").endswith(" WHERE (s = 'O''Brien'::text)")
+
+
+def test_unique_and_multi_column_partial_indexes(storage):
+    q = Session(database=DB)
+    run_sql(storage, DB, "CREATE UNIQUE INDEX upix ON t (a) WHERE b < 9", session=q)
+    run_sql(storage, DB, "CREATE INDEX mpix ON t (a, b) WHERE b >= 1", session=q)
+    assert _indexdef(storage, "upix") == (
+        "CREATE UNIQUE INDEX upix ON public.t USING btree (a) WHERE (b < 9)"
+    )
+    assert _indexdef(storage, "mpix") == (
+        "CREATE INDEX mpix ON public.t USING btree (a, b) WHERE (b >= 1)"
+    )
+
+
+def test_a_non_partial_index_gains_no_where_clause(storage):
+    """The guard: only partial indexes get a predicate."""
+    assert _indexdef(storage, "idx_a") == "CREATE INDEX idx_a ON public.t USING btree (a)"
+    assert " WHERE " not in _indexdef(storage, "uq_a")
