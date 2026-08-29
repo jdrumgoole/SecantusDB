@@ -444,6 +444,37 @@ Specific items that were left out of the slice that introduced their feature are
   number above is the Python server. The probe drives whatever is on the wire,
   so pointing it at `secantusd-rs` is the whole of the measurement — do that
   before assuming either result.
+- [x] **RESOLVED 2026-08-29 — the wrong-typed-argument corpus was three values
+  wide; widening it to 244 cases found a CRASH and 7 divergences on servers that
+  both read 87/87 clean.** `null`, fractional, negative, `Decimal128`,
+  `ObjectId` and date were all absent from `DOCISH`/`NUMISH`/`STRISH`/`BOOLISH`.
+  **The corpus is the coverage** — "87/87 clean" only ever meant "these 87
+  shapes are", and the entry above says so now.
+
+  **Python:** `createIndexes: {indexes: null}` CRASHED (`for idx_spec in
+  indexes` over a None) — the same crash class #1078 / #1080 closed, surviving
+  because the corpus held no null. Plus `distinct.key: null` answering 14.
+
+  **Rust:** five, all introduced the same day by generalising "null is
+  accepted" from the ONE slot that was probed (`let`) to slots where it is not.
+
+  **`null` is per-slot as sharply as every other value class:**
+
+      createIndexes.indexes  null -> 10065, wrong-typed non-null -> 14
+                             (two codes for one slot, split on null-ness)
+      distinct.key           null is MISSING (40414), not wrong-typed
+      find.min / .max        reject null; find.let ACCEPTS it, same command
+      listIndexes.cursor     accepts null; aggregate.cursor REJECTS it
+                             (same option name, two commands, two rules --
+                             they had been sharing one validator)
+
+  Also fixed a defect in the PROBE: `create.storageEngine` reused a fixed
+  collection name, so once a case was accepted every later one hit
+  NamespaceExists (48) and reported as a server divergence — the probe was
+  reporting its own leftover state as a bug.
+
+  Both servers now 244/244.
+
 - [ ] **OPEN — `test_tls_against_rust_server` flakes on the Windows runner
   (first seen 2026-08-29, PR #1089).** `storage-engine (windows-latest)` failed
   ONE of 86 tests with `ServerSelectionTimeoutError: No servers found yet,

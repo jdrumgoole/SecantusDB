@@ -3036,10 +3036,22 @@ def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if _err is not None:
         return _err
     filter_ = doc.get("query") or {}
+    if doc.get("key") is None:
+        # mongod treats an explicit null as ABSENT for a required field (40414),
+        # not as a type error -- probed 6.0.16.
+        return {
+            "ok": 0.0,
+            "errmsg": "BSON field 'distinct.key' is missing but a required field",
+            "code": 40414,
+            "codeName": "Location40414",
+        }
     if not isinstance(key, str):
         return {
             "ok": 0.0,
-            "errmsg": "distinct key must be a string",
+            "errmsg": (
+                f"BSON field 'distinct.key' is the wrong type "
+                f"'{_bson_type_of(key)}', expected type 'string'"
+            ),
             "code": 14,
             "codeName": "TypeMismatch",
         }
@@ -4493,6 +4505,16 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if oplog_err is not None:
         return oplog_err
     indexes = doc.get("indexes", [])
+    if indexes is None or not isinstance(indexes, (list, tuple)):
+        # mongod's own wording for this slot, and its own code -- an explicit
+        # null used to reach the `for idx_spec in indexes` loop and crash as
+        # "internal server error". Probed 6.0.16.
+        return {
+            "ok": 0.0,
+            "errmsg": "invalid parameter: expected an object (indexes)",
+            "code": 10065,
+            "codeName": "Location10065",
+        }
     # ``commitQuorum`` is a top-level option on ``createIndexes`` (not
     # per-index). MongoDB 4.4+ accepts an integer, ``"majority"``, or
     # ``"votingMembers"``; unknown strings trigger a write-concern-mode

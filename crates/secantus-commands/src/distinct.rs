@@ -18,10 +18,26 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "distinct")?;
     let key = match doc.get("key") {
         Some(Bson::String(s)) => s.clone(),
-        _ => {
-            return Ok(
-                CommandError::new(14, "TypeMismatch", "distinct key must be a string").into_reply(),
+        // An explicit null is MISSING to mongod, not wrong-typed: a required
+        // field that is absent answers 40414, not a TypeMismatch. Probed.
+        None | Some(Bson::Null) => {
+            return Ok(CommandError::new(
+                40414,
+                "Location40414",
+                "BSON field 'distinct.key' is missing but a required field",
             )
+            .into_reply())
+        }
+        Some(v) => {
+            return Ok(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field 'distinct.key' is the wrong type '{}', expected type 'string'",
+                    secantus_core::query::bson_type_name(v)
+                ),
+            )
+            .into_reply())
         }
     };
     let filter = doc_field(doc, "query");

@@ -247,8 +247,10 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         argtypes::require_number(doc, field, &format!("FindCommandRequest.{field}"))?;
     }
     argtypes::require_object(doc, "let", "FindCommandRequest.let")?;
-    argtypes::require_object(doc, "min", "FindCommandRequest.min")?;
-    argtypes::require_object(doc, "max", "FindCommandRequest.max")?;
+    // `min` / `max` are the Expected-field family, which REJECTS an explicit
+    // null -- not the BSON-field family, which accepts it. Probed.
+    argtypes::require_object_expected(doc, "min")?;
+    argtypes::require_object_expected(doc, "max")?;
     argtypes::require_bool_value(doc, "singleBatch")?;
     argtypes::require_max_time_ms(doc)?;
     // A view: translate the find into the equivalent aggregate over the base
@@ -336,6 +338,9 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // string) is a TypeMismatch — mongod rejects it, and the mongo-c-driver
     // find/batchSize test sends `{batchSize: 'foo'}` expecting a server error.
     let batch_size = match doc.get("batchSize") {
+        // An explicit null is ACCEPTED and means "absent" (probed): `as_i64`
+        // returns None for it, which used to fall into the type error below.
+        Some(Bson::Null) | None => DEFAULT_BATCH_SIZE as i64,
         Some(b) => match as_i64(b) {
             Some(n) => n,
             None => {
@@ -346,7 +351,6 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 ))
             }
         },
-        None => DEFAULT_BATCH_SIZE as i64,
     };
     let single_batch = bool_field(doc, "singleBatch", false);
     let tailable = bool_field(doc, "tailable", false);
