@@ -501,6 +501,50 @@ Specific items that were left out of the slice that introduced their feature are
   limitation in its name, and `test_create_does_not_bind_to_an_existing_relation
   _on_the_path` asserted something its own docstring contradicted.
 
+- [ ] **OPEN (re-measured 2026-08-29, and the entry was wrong in BOTH
+  directions) — the SQL engine provides ONE isolation level and reports back
+  whichever was asked for.** Filed as "second writer gets 40001; PG blocks and
+  proceeds". Measured three-way against PostgreSQL 14:
+
+      autocommit write-write        pg blocks -> 111   us blocks -> 111   MATCH
+      explicit txn READ COMMITTED   pg blocks -> 111   us 40001  -> 101   DIVERGE
+      explicit txn REPEATABLE READ  pg 40001  -> 101   us 40001  -> 101   MATCH
+      explicit txn SERIALIZABLE     pg 40001 (skew)    us BOTH COMMIT      DIVERGE
+
+  **Understated:** an unretried client does not merely see an error, it LOSES a
+  write (101 where PG gives 111). **Overstated:** autocommit — the common path —
+  already matches PG exactly, because each statement is its own transaction and
+  the second writer blocks and re-reads.
+
+  Root cause: every explicit transaction runs on WiredTiger's snapshot
+  isolation, which IS PostgreSQL's REPEATABLE READ. `BEGIN ISOLATION LEVEL x` is
+  honoured and echoed correctly (verified — an earlier claim that it was ignored
+  was a probe artifact: psycopg issues its own BEGIN unless the connection is in
+  autocommit, so the explicit one was a nested no-op).
+
+  **The SERIALIZABLE case is the one to weigh first.** We accept it, report
+  `serializable`, and permit **write skew**: two transactions each read what the
+  other is about to change, both commit, and the invariant the client used
+  SERIALIZABLE to protect is silently violated. PostgreSQL aborts one with
+  40001. Oracle has historically mapped SERIALIZABLE to snapshot isolation too,
+  so there is precedent — but it must be DOCUMENTED, not silent. Options:
+  (a) keep accepting and document loudly, (b) reject SERIALIZABLE outright
+  (safe, breaks drivers that request it), (c) report `repeatable read` when
+  serializable is requested (honest, diverges from PG's echo). **A product
+  decision, not a code one — ask before implementing.**
+
+  **READ COMMITTED inside an explicit transaction is a REDESIGN, not a fix.** It
+  needs a fresh snapshot per statement plus row-level blocking (PostgreSQL's
+  EvalPlanQual re-reads the committed row and re-applies). A WiredTiger
+  transaction has exactly one snapshot, so this means either a WT transaction
+  per statement with our own undo/redo above it, or a pessimistic row-lock
+  manager taken before the write so the conflict never happens. Do not attempt
+  it as a slice.
+
+  All four rows are pinned by `tests/test_sql_isolation_level.py`, with the two
+  divergent ones named `test_known_divergence_*` so they cannot be misread as
+  conformance, plus an oracle test for the two that match.
+
 - [ ] **OPEN — an unresolvable bare relation is named with the schema we tried,
   not the name the user wrote.** Fallout from the search_path work above, and
   the only part of it that still diverges. PG says `relation "onlypub" does not
