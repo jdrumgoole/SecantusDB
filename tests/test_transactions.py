@@ -281,9 +281,7 @@ def test_non_txn_writer_retries_until_commit(client, coll):
 def test_expired_transaction_is_reaped(wt_home):
     import time
 
-    with SecantusDBServer(
-        port=0, storage_path=wt_home, transaction_lifetime_seconds=0.5
-    ) as srv:
+    with SecantusDBServer(port=0, storage_path=wt_home, transaction_lifetime_seconds=0.5) as srv:
         mc = MongoClient(srv.uri, serverSelectionTimeoutMS=2000)
         try:
             c = mc["txndb"]["things"]
