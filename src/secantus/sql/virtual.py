@@ -180,6 +180,7 @@ def _indexes(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
                     "table": t.name,
                     "columns": [c.name for c in pk_cols],
                     "partial": False,
+                    "partial_filter": None,
                 }
             )
             oid += 1
@@ -210,6 +211,9 @@ def _indexes(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
                         "table": t.name,
                         "columns": [f"({ei.expr_sql.lower()})"],
                         "partial": bool(ix.get("partialFilterExpression")),
+                        # The expression itself, so `indexdef` can render the
+                        # WHERE clause rather than silently dropping it.
+                        "partial_filter": ix.get("partialFilterExpression"),
                     }
                 )
                 oid += 1
@@ -238,6 +242,9 @@ def _indexes(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
                     "table": t.name,
                     "columns": [_index_coldef(f, d, field_to_name) for f, d in key.items()],
                     "partial": bool(ix.get("partialFilterExpression")),
+                    # The expression itself, so `indexdef` can render the
+                    # WHERE clause rather than silently dropping it.
+                    "partial_filter": ix.get("partialFilterExpression"),
                 }
             )
             oid += 1
@@ -255,6 +262,7 @@ def _indexes(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
                 "table": uq["table"].name,
                 "columns": list(uq["columns"]),
                 "partial": False,
+                "partial_filter": None,
             }
         )
     return out
@@ -284,6 +292,100 @@ def _index_relations(db: str, storage: Any, catalog: Catalog) -> list[dict[str, 
     return [_relation_row(ix) for ix in _indexes(db, storage, catalog)]
 
 
+_PARTIAL_CMP = {"$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<=", "$ne": "<>"}
+
+
+def _partial_literal(value: Any) -> str | None:
+    """A stored filter value as PostgreSQL renders it inside an index predicate.
+
+    Note the cast on strings: PG prints `(s = 'x'::text)`, not `(s = 'x')`.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        escaped = value.replace("'", "''")
+        return f"'{escaped}'::text"
+    return None
+
+
+def _partial_clause(field: str, cond: Any) -> str | None:
+    """One `field: condition` pair as a parenthesised SQL comparison."""
+    if not isinstance(cond, dict):
+        lit = _partial_literal(cond)
+        return f"({field} = {lit})" if lit is not None else None
+    if len(cond) != 1:
+        return None
+    op, value = next(iter(cond.items()))
+    if op == "$ne" and value is None:
+        return f"({field} IS NOT NULL)"
+    sql_op = _PARTIAL_CMP.get(op)
+    if sql_op is None:
+        return None
+    lit = _partial_literal(value)
+    return f"({field} {sql_op} {lit})" if lit is not None else None
+
+
+def _render_partial_predicate(expr: Any) -> str | None:
+    """A stored `partialFilterExpression` back as a SQL predicate, or None.
+
+    Returns None for anything it cannot reproduce EXACTLY -- the caller then
+    omits the WHERE, which is what this did for every partial index before.
+    Rendering an approximation would be worse: `indexdef` is what tools read to
+    recreate an index, and a predicate that is close but wrong builds the wrong
+    index silently.
+
+    Shapes are those our own `CREATE INDEX ... WHERE` produces, verified against
+    PostgreSQL 14's own rendering:
+
+        {b: {$gt: 5}}                      -> (b > 5)
+        {b: 5}                             -> (b = 5)
+        {s: 'x'}                           -> (s = 'x'::text)
+        {b: {$ne: null}}                   -> (b IS NOT NULL)
+        {b: {$gt: 5}, a: {$lt: 2}}         -> ((b > 5) AND (a < 2))
+        {$or: [...]}                       -> ((b > 5) OR (a < 2))
+        {$and: [{b:{$ne:5}}, {b:{$ne:null}}]} -> (b <> 5)
+    """
+    if not isinstance(expr, dict) or not expr:
+        return None
+
+    # `b <> 5` lowers to an $and of "not equal" AND "not null" on one field; PG
+    # renders the original `(b <> 5)`. Recognised before the generic $and path
+    # so the idiom round-trips instead of leaking its desugaring.
+    if set(expr) == {"$and"} and isinstance(expr["$and"], list) and len(expr["$and"]) == 2:
+        first, second = expr["$and"]
+        if isinstance(first, dict) and isinstance(second, dict) and len(first) == len(second) == 1:
+            (f1, c1), (f2, c2) = next(iter(first.items())), next(iter(second.items()))
+            if (
+                f1 == f2
+                and isinstance(c1, dict)
+                and isinstance(c2, dict)
+                and c1.get("$ne") is not None
+                and c2.get("$ne", "missing") is None
+            ):
+                lit = _partial_literal(c1["$ne"])
+                if lit is not None:
+                    return f"({f1} <> {lit})"
+
+    for joiner, key in (("OR", "$or"), ("AND", "$and")):
+        if set(expr) == {key} and isinstance(expr[key], list) and expr[key]:
+            parts = [_render_partial_predicate(sub) for sub in expr[key]]
+            if any(p is None for p in parts):
+                return None
+            return "(" + f" {joiner} ".join(parts) + ")"
+
+    if any(k.startswith("$") for k in expr):
+        return None  # a document-level operator we do not model
+
+    clauses = [_partial_clause(f, c) for f, c in expr.items()]
+    if any(c is None for c in clauses):
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return "(" + " AND ".join(clauses) + ")"
+
+
 def indexdef_for_oid(db: str, storage: Any, catalog: Catalog, oid: int) -> str | None:
     """``pg_get_indexdef(oid)`` — reconstruct the ``CREATE INDEX`` statement for an
     index relation oid, or None when the oid isn't a known index."""
@@ -291,9 +393,14 @@ def indexdef_for_oid(db: str, storage: Any, catalog: Catalog, oid: int) -> str |
         if ix["indexrelid"] == oid:
             unique = "UNIQUE " if ix["unique"] else ""
             cols = ", ".join(ix["columns"])
-            return (
+            base = (
                 f"CREATE {unique}INDEX {ix['relname']} ON public.{ix['table']} USING btree ({cols})"
             )
+            # A partial index's predicate, reversed back to SQL. Without this the
+            # rendered statement claimed a FULL index -- a tool recreating from
+            # `indexdef` built the wrong one.
+            pred = _render_partial_predicate(ix.get("partial_filter"))
+            return f"{base} WHERE {pred}" if pred else base
     return None
 
 
