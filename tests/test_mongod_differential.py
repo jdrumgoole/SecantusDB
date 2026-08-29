@@ -25,7 +25,7 @@ import socket
 import subprocess
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -544,7 +544,296 @@ UPDATE_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ),
 ]
 
-ALL_CASES = [("query", c) for c in QUERY_CASES] + [("update", c) for c in UPDATE_CASES]
+
+def _fam(db: Database, **body: object) -> str:
+    """A ``findAndModify`` reply as a comparable string.
+
+    The RAW command, not pymongo's ``find_one_and_*`` wrappers: half of what
+    diverged in this sweep was the reply SHAPE -- ``lastErrorObject``'s keys,
+    the order of the fields in an upserted document -- which the wrappers hide.
+    An upsert-generated ``ObjectId`` differs per server by construction, so it
+    is replaced with a marker rather than compared.
+    """
+    from pymongo.errors import OperationFailure
+
+    cmd: dict = {"findAndModify": "c"}
+    cmd.update(body)
+    try:
+        reply = dict(db.command(cmd))
+    except OperationFailure as exc:
+        d = exc.details or {}
+        return f"{d.get('code')}/{d.get('codeName')}: {d.get('errmsg')!r}"
+    out = {k: reply[k] for k in ("lastErrorObject", "value") if k in reply}
+    leo = out.get("lastErrorObject")
+    if isinstance(leo, dict) and isinstance(leo.get("upserted"), ObjectId):
+        out["lastErrorObject"] = {**leo, "upserted": "<oid>"}
+    val = out.get("value")
+    if isinstance(val, dict) and isinstance(val.get("_id"), ObjectId):
+        # Rebuilt rather than updated in place so KEY ORDER is preserved --
+        # mongod leads an upserted document with ``_id`` and we did not.
+        out["value"] = {"_id": "<oid>", **{k: v for k, v in val.items() if k != "_id"}}
+    return repr(out)
+
+
+def _reply_keys(reply: Mapping) -> list[str]:
+    """A reply's field names, minus the cluster-time gossip.
+
+    SecantusDB advertises a replica set, so it attaches ``$clusterTime`` /
+    ``operationTime`` to every reply; the standalone ``mongod`` this gate
+    spawns does not. That difference is deliberate and is not what these
+    cases are about -- the ORDER of the real fields is.
+    """
+    return [k for k in reply if k not in ("$clusterTime", "operationTime")]
+
+
+FAM_SEED = [{"_id": 1, "n": 5, "s": "a", "arr": [1, 2, 3], "sub": {"k": 1}}]
+
+# ``findAndModify`` option combinations. A 49-shape probe against mongod
+# 6.0.16 found 14 divergences here, two of them silent wrong data: an empty
+# update document left every field in place (mongod reduces the document to
+# its ``_id``), and an upsert whose query used a dotted path stored a literal
+# key with a dot in it. The rest were arguments accepted and ignored, or error
+# codes flattened to 14 TypeMismatch on the way out.
+FAM_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    ("empty-update-is-a-replacement", FAM_SEED, lambda db: _fam(db, query={"_id": 1}, update={})),
+    (
+        "empty-update-leaves-only-the-id",
+        FAM_SEED,
+        lambda db: (
+            (db.command({"findAndModify": "c", "query": {"_id": 1}, "update": {}}))
+            and list(db.c.find())
+        ),
+    ),
+    (
+        "empty-pipeline-is-a-no-op",
+        FAM_SEED,
+        lambda db: (
+            (db.command({"findAndModify": "c", "query": {"_id": 1}, "update": []}))
+            and list(db.c.find())
+        ),
+    ),
+    (
+        "upsert-leads-with-id",
+        [],
+        lambda db: _fam(
+            db, query={"b": 1, "a": 2}, update={"$set": {"y": 3}}, upsert=True, new=True
+        ),
+    ),
+    (
+        "upsert-nests-a-dotted-query",
+        [],
+        lambda db: _fam(db, query={"sub.k": 77}, update={"$set": {"y": 1}}, upsert=True, new=True),
+    ),
+    (
+        "upsert-nests-a-deep-dotted-query",
+        [],
+        lambda db: _fam(db, query={"a.b.c": 5}, update={"$set": {"y": 1}}, upsert=True, new=True),
+    ),
+    (
+        "upsert-merges-dotted-query-and-update",
+        [],
+        lambda db: _fam(db, query={"a.b": 5}, update={"$set": {"a.c": 1}}, upsert=True, new=True),
+    ),
+    (
+        "upsert-orders-setoninsert-with-set",
+        [],
+        lambda db: _fam(
+            db,
+            query={"_id": 42},
+            update={"$setOnInsert": {"z": 1}, "$set": {"y": 2}},
+            upsert=True,
+            new=True,
+        ),
+    ),
+    ("unknown-top-level-field", FAM_SEED, lambda db: _fam(db, query={"_id": 1}, update={}, zz=1)),
+    (
+        "new-wrong-type",
+        FAM_SEED,
+        lambda db: _fam(db, query={"_id": 1}, update={"$set": {"n": 1}}, new="yes"),
+    ),
+    (
+        "new-numeric-zero-is-false",
+        FAM_SEED,
+        lambda db: _fam(db, query={"_id": 1}, update={"$set": {"n": 9}}, new=0),
+    ),
+    (
+        "new-numeric-one-is-true",
+        FAM_SEED,
+        lambda db: _fam(db, query={"_id": 1}, update={"$set": {"n": 9}}, new=1),
+    ),
+    (
+        "remove-wrong-type",
+        FAM_SEED,
+        lambda db: _fam(db, query={"_id": 1}, remove="yes"),
+    ),
+    (
+        "arrayfilters-not-an-array",
+        FAM_SEED,
+        lambda db: _fam(db, query={"_id": 1}, update={"$set": {"n": 1}}, arrayFilters={"e": 1}),
+    ),
+    (
+        "arrayfilters-element-not-a-document",
+        FAM_SEED,
+        lambda db: _fam(db, query={"_id": 1}, update={"$set": {"n": 1}}, arrayFilters=[5]),
+    ),
+    (
+        "arrayfilters-null",
+        FAM_SEED,
+        lambda db: _fam(db, query={"_id": 1}, update={"$set": {"n": 1}}, arrayFilters=None),
+    ),
+    (
+        "arrayfilters-unused-identifier",
+        FAM_SEED,
+        lambda db: _fam(
+            db, query={"_id": 1}, update={"$set": {"n": 1}}, arrayFilters=[{"e": {"$gt": 1}}]
+        ),
+    ),
+    (
+        "arrayfilters-identifier-with-no-filter",
+        FAM_SEED,
+        lambda db: _fam(db, query={"_id": 1}, update={"$set": {"arr.$[e]": 1}}),
+    ),
+    (
+        "hint-wrong-type",
+        FAM_SEED,
+        lambda db: _fam(db, query={"_id": 1}, update={"$set": {"n": 1}}, hint=5),
+    ),
+    # The error CODES, which all collapsed to 14 TypeMismatch on the way out of
+    # findAndModify -- the `update` command had the mapping, this one did not.
+    (
+        "unknown-modifier-code",
+        FAM_SEED,
+        lambda db: _fam(db, query={"_id": 1}, update={"$nope": {"n": 1}}),
+    ),
+    (
+        "operator-mixed-with-replacement-field",
+        FAM_SEED,
+        lambda db: _fam(db, query={"_id": 1}, update={"$set": {"n": 1}, "z": 2}),
+    ),
+    (
+        "immutable-id-code-and-wrapper",
+        FAM_SEED,
+        lambda db: _fam(db, query={"_id": 1}, update={"$set": {"_id": 9}}),
+    ),
+    (
+        "path-conflict-code",
+        FAM_SEED,
+        lambda db: _fam(db, query={"_id": 1}, update={"$set": {"a": 2}, "$inc": {"a.b": 1}}),
+    ),
+    (
+        "inc-type-error-is-wrapped",
+        [{"_id": 1, "n": "x"}],
+        lambda db: _fam(db, query={"_id": 1}, update={"$inc": {"n": 1}}),
+    ),
+    # PathNotViable: creating through a scalar. This SILENTLY did nothing --
+    # the update reported success and wrote no change.
+    (
+        "create-through-a-scalar",
+        FAM_SEED,
+        lambda db: _fam(db, query={"_id": 1}, update={"$set": {"n.x": 1}}),
+    ),
+    (
+        "create-through-a-nested-scalar",
+        [{"_id": 1, "a": {"b": 7}}],
+        lambda db: _fam(db, query={"_id": 1}, update={"$set": {"a.b.c": 1}}),
+    ),
+    (
+        "create-through-an-array-by-name",
+        [{"_id": 1, "a": [1]}],
+        lambda db: _fam(db, query={"_id": 1}, update={"$set": {"a.x": 9}}),
+    ),
+    (
+        "create-through-an-array-element",
+        [{"_id": 1, "a": [1]}],
+        lambda db: _fam(db, query={"_id": 1}, update={"$set": {"a.0.x": 9}}),
+    ),
+    (
+        "unset-through-a-scalar-is-allowed",
+        FAM_SEED,
+        lambda db: _fam(db, query={"_id": 1}, update={"$unset": {"n.x": ""}}, new=True),
+    ),
+    (
+        "out-of-range-index-pads",
+        [{"_id": 1, "a": [1]}],
+        lambda db: _fam(db, query={"_id": 1}, update={"$set": {"a.4": 9}}, new=True),
+    ),
+]
+
+# The same two silent-wrong-data rules through the plain ``update`` command,
+# which shares the code path -- plus its reply's field order, which puts
+# ``upserted`` / ``writeErrors`` BEFORE ``nModified``.
+UPDATE_CMD_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    (
+        "cmd-empty-update-is-a-replacement",
+        [{"_id": 1, "n": 5, "s": "a"}],
+        lambda db: (
+            {
+                k: v
+                for k, v in db.command(
+                    {"update": "c", "updates": [{"q": {"_id": 1}, "u": {}}]}
+                ).items()
+                if k not in ("$clusterTime", "operationTime")
+            },
+            list(db.c.find()),
+        ),
+    ),
+    (
+        "cmd-upsert-nests-a-dotted-query",
+        [],
+        lambda db: (
+            db.command(
+                {
+                    "update": "c",
+                    "updates": [{"q": {"sub.k": 77}, "u": {"$set": {"y": 1}}, "upsert": True}],
+                }
+            )
+            and [{k: v for k, v in d.items() if k != "_id"} for d in db.c.find()]
+        ),
+    ),
+    (
+        "cmd-upserted-field-order",
+        [],
+        lambda db: (
+            db.command(
+                {
+                    "update": "c",
+                    "updates": [
+                        {"q": {"n": 1, "m": 2}, "u": {"$set": {"z": 3, "a": 4}}, "upsert": True}
+                    ],
+                }
+            )
+            and [list(d) for d in db.c.find()]
+        ),
+    ),
+    (
+        "cmd-reply-field-order-with-write-errors",
+        [{"_id": 1, "n": 5}],
+        lambda db: _reply_keys(
+            db.command({"update": "c", "updates": [{"q": {"_id": 1}, "u": {"$nope": {"n": 1}}}]})
+        ),
+    ),
+    (
+        "cmd-unknown-modifier-message",
+        [{"_id": 1, "n": 5}],
+        lambda db: db.command(
+            {"update": "c", "updates": [{"q": {"_id": 1}, "u": {"$nope": {"n": 1}}}]}
+        )["writeErrors"][0],
+    ),
+    (
+        "cmd-path-not-viable",
+        [{"_id": 1, "n": 5}],
+        lambda db: db.command(
+            {"update": "c", "updates": [{"q": {"_id": 1}, "u": {"$set": {"n.x": 1}}}]}
+        )["writeErrors"][0],
+    ),
+]
+
+ALL_CASES = (
+    [("query", c) for c in QUERY_CASES]
+    + [("update", c) for c in UPDATE_CASES]
+    + [("fam", c) for c in FAM_CASES]
+    + [("updatecmd", c) for c in UPDATE_CMD_CASES]
+)
 
 
 @requires_mongod

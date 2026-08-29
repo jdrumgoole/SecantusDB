@@ -540,14 +540,16 @@ fn unsupported_update_modifier(u: &Document) -> Option<String> {
     if !u.keys().any(|k| k.starts_with('$')) {
         return None; // replacement-style update
     }
-    if !u.keys().all(|k| k.starts_with('$')) {
-        return Some("update document cannot mix operators with replacement fields".to_string());
-    }
+    // mongod has ONE complaint for both shapes -- an unrecognised `$`-operator
+    // and a document mixing operators with replacement fields -- and for the
+    // mixed one it names the bare field, no `$`: `Unknown modifier: z`.
+    // Probed 6.0.16.
     u.keys()
-        .find(|k| !KNOWN_UPDATE_OPS.contains(&k.as_str()))
+        .find(|k| !k.starts_with('$') || !KNOWN_UPDATE_OPS.contains(&k.as_str()))
         .map(|k| {
             format!(
-                "Unknown modifier: {k}. Expected a valid update modifier (e.g. $set, $unset, $inc, ...)"
+                "Unknown modifier: {k}. Expected a valid update modifier or \
+                 pipeline-style update specified as an array"
             )
         })
 }

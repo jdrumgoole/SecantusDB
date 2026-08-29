@@ -36,6 +36,40 @@ def walk_to_parent(doc: dict[str, Any], path: str, *, create: bool) -> tuple[Any
     return cur, parts[-1]
 
 
+def path_block(doc: dict[str, Any], path: str) -> tuple[str | None, Any, str] | None:
+    """What stops ``path`` from being created, or None if it can be.
+
+    Returns ``(container_key, container_value, field)`` where ``field`` is the
+    component that cannot be created and ``container_*`` describe the thing
+    standing in its way -- a scalar, or an array addressed by a non-numeric
+    component. mongod refuses these with ``PathNotViable`` (28); the caller
+    turns the triple into its message.
+
+    Creatable, and so ``None``: a missing intermediate (mongod makes the
+    sub-document), an out-of-range array index (mongod pads with nulls), and
+    the leaf itself whatever its current type -- setting a leaf overwrites.
+    """
+    parts = path.split(".")
+    cur: Any = doc
+    last_key: str | None = None
+    for i, part in enumerate(parts):
+        is_leaf = i == len(parts) - 1
+        if isinstance(cur, dict):
+            if part not in cur or is_leaf:
+                return None
+            last_key, cur = part, cur[part]
+        elif isinstance(cur, list):
+            if not part.isdigit():
+                return last_key, cur, part
+            idx = int(part)
+            if idx >= len(cur) or is_leaf:
+                return None
+            last_key, cur = part, cur[idx]
+        else:
+            return last_key, cur, part
+    return None
+
+
 def get_path(doc: dict[str, Any], path: str, default: Any = None) -> Any:
     parent, leaf = walk_to_parent(doc, path, create=False)
     if parent is None or leaf is None:
