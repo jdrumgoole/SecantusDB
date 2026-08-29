@@ -1084,6 +1084,44 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [x] **`$lookup` / `$graphLookup` sweep — 20 of 27 shapes diverged, headline
+  was a TRUNCATED traversal (2026-08-29).** `$graphLookup` stopped following
+  the chain at the first null `connectFromField`, so a four-document chain
+  returned one document **with no error**. Fixed: an explicit null link is
+  followed (it reaches explicitly-null `connectToField` documents), only a
+  *missing* link stops the walk, and a document that lacks the field is no
+  longer reachable from a null — the value was tested for `None`, which
+  conflated missing with null on both sides.
+  **A correction kept deliberately**: this was first written up as "does not
+  recurse at all". It does — the fixture happened to put a null on the first
+  hop. A chain without nulls walks, honours `maxDepth`, and handles an array
+  `startWith`. The lesson is about fixtures: a single unlucky fixture turned a
+  one-line guard into what looked like a missing feature, and would have scoped
+  a week of work that was not needed.
+  Also fixed: an empty-array `localField` matches null (BOTH join paths had it,
+  and the index path's comment asserted `$in: []` semantics the oracle
+  contradicts — a `$lookup` localField is not an `$in`); `as` is a PATH so
+  `as: "a.b"` nests (the same dotted-key bug as the upsert seed, third instance
+  of that class this campaign); two crashes (`let: 5`, `pipeline: 5`); unknown
+  arguments accepted on both stages; and a negative `maxDepth` that matched
+  nothing instead of erroring.
+- [ ] **A `$lookup` `let` binding cannot express MISSING.** For a document
+  without the local field, mongod binds `$$var` as *missing*, and
+  `$eq: ["$field", "$$var"]` against an explicitly-null foreign value is then
+  FALSE. Our evaluator resolves a missing path to `None`, so the two compare
+  equal and the join returns rows mongod excludes. Fixing it means a missing
+  sentinel in `expressions.py`, which touches every operator — deliberately not
+  attempted inside a join-semantics batch.
+- [ ] **`$lookup`'s `as` field ORDER when it overwrites an existing field.**
+  mongod moves the overwritten field to the END of the document; we keep its
+  original position. Left alone rather than guessed at: this campaign has
+  already hit two mongod-version splits on field ordering, and one version's
+  observation is not enough to act on.
+- [ ] **`$graphLookup`'s result array is in a different ORDER than mongod's.**
+  The SET of documents now matches exactly; only the order within the `as`
+  array differs, and mongod's order reflects its internal traversal rather than
+  a documented contract. Not chased for the same reason as above.
+
 - [x] **Index / query-planning sweep — the worst find of the Phase 2 campaign
   was a WRITE that should not have happened (2026-08-29).** `delete` and
   `update` take a per-statement `hint`; mongod refuses the statement when it

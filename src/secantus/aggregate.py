@@ -22,7 +22,7 @@ from secantus.expressions import (
     evaluate_or_missing,
 )
 from secantus.numerics import bson_sum
-from secantus.paths import get_path, set_path, unset_path
+from secantus.paths import get_path, has_path, set_path, unset_path
 from secantus.query import QueryError, matches
 
 if TYPE_CHECKING:
@@ -1822,6 +1822,39 @@ def _hashable(value: Any) -> Any:
     return value
 
 
+def _set_as_field(doc: dict[str, Any], as_field: str, value: Any) -> None:
+    """Write a ``$lookup`` / ``$graphLookup`` result at ``as``.
+
+    ``as`` is a PATH, not a key: ``as: "a.b"`` produces ``{a: {b: [...]}}``.
+    Assigning ``doc[as_field]`` stored a literal key containing a dot -- a
+    document mongod cannot produce and most drivers refuse to send. Same bug,
+    and same fix, as the dotted-equality upsert seed in ``storage.py``: wherever
+    a user-supplied path is used as a key, it has to go through ``set_path``.
+    """
+    if "." in as_field:
+        set_path(doc, as_field, value)
+    else:
+        doc[as_field] = value
+
+
+_LOOKUP_KNOWN_FIELDS = frozenset(
+    {"from", "localField", "foreignField", "as", "let", "pipeline", "unwinding"}
+)
+
+
+def _render_arg(v: Any) -> str:
+    """A value as mongod prints it inside a $lookup argument error."""
+    if isinstance(v, str):
+        return f'"{v}"'
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if v is None:
+        return "null"
+    return str(v)
+
+
 def _stage_lookup(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -1831,22 +1864,97 @@ def _stage_lookup(
             code=9,
             code_name="FailedToParse",
         )
+    # mongod names the offending argument and answers FailedToParse (9). We
+    # answered TypeMismatch (14) with one of two generic sentences that named
+    # neither the field nor the problem, and accepted unknown arguments
+    # outright -- so a misspelled `foreignFeild` silently became a
+    # pipeline-less join over the whole foreign collection.
+    unknown = next((k for k in spec if k not in _LOOKUP_KNOWN_FIELDS), None)
+    if unknown is not None:
+        raise AggregateError(
+            f"$lookup argument '{unknown}' must be a string, found "
+            f"{unknown}: {_render_arg(spec[unknown])}: {_bson_type_name(spec[unknown])}",
+            code=9,
+            code_name="FailedToParse",
+        )
     from_coll = spec.get("from")
     as_field = spec.get("as")
-    if not (isinstance(from_coll, str) and isinstance(as_field, str)):
-        raise AggregateError("$lookup requires from and as (strings)")
+    sub_pipeline = spec.get("pipeline")
+    if from_coll is None and sub_pipeline is None:
+        raise AggregateError(
+            "must specify 'pipeline' when 'from' is empty", code=9, code_name="FailedToParse"
+        )
+    if not isinstance(from_coll, str):
+        raise AggregateError(
+            f"$lookup 'from' field must be a string, but found {_bson_type_name(from_coll)}",
+            code=9,
+            code_name="FailedToParse",
+        )
+    if as_field is None:
+        raise AggregateError(
+            "must specify 'as' field for a $lookup", code=9, code_name="FailedToParse"
+        )
+    if not isinstance(as_field, str):
+        raise AggregateError(
+            f"$lookup argument 'as' must be a string, found as: "
+            f"{_render_arg(as_field)}: {_bson_type_name(as_field)}",
+            code=9,
+            code_name="FailedToParse",
+        )
     if ctx.storage is None:
         raise AggregateError("$lookup requires storage context")
 
-    sub_pipeline = spec.get("pipeline")
-    let_spec = spec.get("let") or {}
-    if sub_pipeline is not None:
-        return _stage_lookup_pipeline(ctx, docs, from_coll, as_field, let_spec, sub_pipeline, spec)
-
     local_field = spec.get("localField")
     foreign_field = spec.get("foreignField")
-    if not (isinstance(local_field, str) and isinstance(foreign_field, str)):
-        raise AggregateError("$lookup requires localField+foreignField, or pipeline form")
+    for _name, _value in (("localField", local_field), ("foreignField", foreign_field)):
+        if _value is not None and not isinstance(_value, str):
+            raise AggregateError(
+                f"$lookup argument '{_name}' must be a string, found {_name}: "
+                f"{_render_arg(_value)}: {_bson_type_name(_value)}",
+                code=9,
+                code_name="FailedToParse",
+            )
+    # Which message depends on whether a pipeline is present: without one,
+    # mongod complains that you gave it neither join form; with one, that you
+    # half-specified the field pair. Probed both ways.
+    if (local_field is None) != (foreign_field is None):
+        raise AggregateError(
+            "$lookup requires both or neither of 'localField' and 'foreignField' to be specified"
+            if sub_pipeline is not None
+            else "$lookup requires either 'pipeline' or both 'localField' and "
+            "'foreignField' to be specified",
+            code=9,
+            code_name="FailedToParse",
+        )
+
+    let_spec = spec.get("let")
+    # A wrong-typed `let` reached `.items()` and a wrong-typed `pipeline` was
+    # iterated -- both raised bare exceptions that escaped as
+    # "internal server error" (code 1).
+    if let_spec is not None and not isinstance(let_spec, Mapping):
+        raise AggregateError(
+            f"$lookup argument 'let: {_render_arg(let_spec)}' must be an object, "
+            f"is type {_bson_type_name(let_spec)}",
+            code=9,
+            code_name="FailedToParse",
+        )
+    if sub_pipeline is not None and not isinstance(sub_pipeline, list):
+        raise AggregateError(
+            "'pipeline' option must be specified as an array",
+            code=14,
+            code_name="TypeMismatch",
+        )
+    if sub_pipeline is not None:
+        return _stage_lookup_pipeline(
+            ctx, docs, from_coll, as_field, let_spec or {}, sub_pipeline, spec
+        )
+    if local_field is None or foreign_field is None:
+        raise AggregateError(
+            "$lookup requires either 'pipeline' or both 'localField' and "
+            "'foreignField' to be specified",
+            code=9,
+            code_name="FailedToParse",
+        )
 
     # Index-driven path: when the foreign collection has a non-multikey
     # single-field index on the foreign field, do per-outer-doc lookups
@@ -1862,7 +1970,7 @@ def _stage_lookup(
                 ctx.storage, ctx.db_name, from_coll, foreign_field, local_value
             )
             new = copy.deepcopy(doc)
-            new[as_field] = matches_list
+            _set_as_field(new, as_field, matches_list)
             out.append(new)
         return out
 
@@ -1874,7 +1982,7 @@ def _stage_lookup(
         local_value = get_path(doc, local_field)
         matches_list = _hash_join_lookup(local_value, foreign_docs, foreign_field, join_index)
         new = copy.deepcopy(doc)
-        new[as_field] = matches_list
+        _set_as_field(new, as_field, matches_list)
         out.append(new)
     return out
 
@@ -1931,7 +2039,7 @@ def _stage_lookup_pipeline(
         sub_ctx = ctx.with_vars(bound)
         joined = apply_pipeline(candidates, sub_pipeline, sub_ctx)
         new = copy.deepcopy(doc)
-        new[as_field] = joined
+        _set_as_field(new, as_field, joined)
         out.append(new)
     return out
 
@@ -1989,10 +2097,15 @@ def _index_join_lookup(
     single index lookup covers all elements.
     """
     if isinstance(local_value, list):
-        # Empty list never matches anything (mirrors mongod's $in: []
-        # semantics) — short-circuit instead of a wasted query.
+        # An EMPTY list matches NULL, not nothing. The comment here used to
+        # say "empty list never matches anything (mirrors mongod's $in: []
+        # semantics)" -- but a $lookup's localField is not an $in: mongod
+        # unwinds the array for matching and an empty one still joins against
+        # the null-valued foreign rows (probed 6.0.16). The two code paths
+        # agreed with each other and not with the oracle, which is why the
+        # index and hash-join halves both had it.
         if not local_value:
-            return []
+            return storage.find_matching(db, coll, {foreign_field: None})
         return storage.find_matching(db, coll, {foreign_field: {"$in": list(local_value)}})
     return storage.find_matching(db, coll, {foreign_field: local_value})
 
@@ -2035,7 +2148,12 @@ def _hash_join_lookup(
     foreign_field: str,
     idx: _LookupIndex,
 ) -> list[dict[str, Any]]:
-    lookups = list(local_value) if isinstance(local_value, list) else [local_value]
+    # An EMPTY array matches null, the same way a MISSING localField does --
+    # mongod unwinds the local array for matching, and an array with nothing in
+    # it still has to join against something. We produced no lookup keys at
+    # all, so `tags: []` matched nothing where mongod returns the null-valued
+    # foreign rows.
+    lookups = (list(local_value) or [None]) if isinstance(local_value, list) else [local_value]
     seen: set[int] = set()
     out: list[dict[str, Any]] = []
     local_unhashable = False
@@ -3441,11 +3559,40 @@ def _stage_bucket_auto(
     return out
 
 
+_GRAPH_LOOKUP_KNOWN_FIELDS = frozenset(
+    {
+        "from",
+        "startWith",
+        "connectFromField",
+        "connectToField",
+        "as",
+        "maxDepth",
+        "depthField",
+        "restrictSearchWithMatch",
+    }
+)
+
+
 def _stage_graph_lookup(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
-        raise AggregateError("$graphLookup requires a document spec")
+        raise AggregateError(
+            f"the $graphLookup stage specification must be an object, but found "
+            f"{_bson_type_name(spec)}",
+            code=9,
+            code_name="FailedToParse",
+        )
+    # Unknown arguments were accepted and ignored, so a misspelled option ran a
+    # traversal the caller had not asked for. mongod's codes here are its own
+    # Location numbers, not the generic ones.
+    unknown = next((k for k in spec if k not in _GRAPH_LOOKUP_KNOWN_FIELDS), None)
+    if unknown is not None:
+        raise AggregateError(
+            f"Unknown argument to $graphLookup: {unknown}",
+            code=40104,
+            code_name="Location40104",
+        )
     from_coll = spec.get("from")
     start_with = spec.get("startWith")
     connect_from = spec.get("connectFromField")
@@ -3458,8 +3605,26 @@ def _stage_graph_lookup(
     depth_field = spec.get("depthField")
     if not all(isinstance(x, str) for x in (from_coll, connect_from, connect_to, as_field)):
         raise AggregateError(
-            "$graphLookup requires from/connectFromField/connectToField/as as strings"
+            "$graphLookup requires 'from', 'as', 'startWith', 'connectFromField', "
+            "and 'connectToField' to be specified.",
+            code=40105,
+            code_name="Location40105",
         )
+    # A negative maxDepth was accepted and matched NOTHING -- every document got
+    # an empty array, which reads as "no connections" rather than "bad option".
+    if max_depth is not None:
+        if isinstance(max_depth, bool) or not isinstance(max_depth, (int, float)):
+            raise AggregateError(
+                f"maxDepth must be numeric, found type: {_bson_type_name(max_depth)}",
+                code=40100,
+                code_name="Location40100",
+            )
+        if max_depth < 0:
+            raise AggregateError(
+                f"maxDepth requires a nonnegative argument, found: {max_depth}",
+                code=40101,
+                code_name="Location40101",
+            )
     if ctx.storage is None:
         raise AggregateError("$graphLookup requires storage context")
     foreign = ctx.storage.find_matching(ctx.db_name, from_coll, {})
@@ -3476,6 +3641,14 @@ def _stage_graph_lookup(
                 fid = fdoc.get("_id")
                 if fid in seen_ids:
                     continue
+                # The connectTo field must EXIST to match. A document that
+                # simply lacks it is not reachable by a null link -- missing
+                # and null are different values here, and comparing
+                # ``get_path``'s None for both made every field-less document
+                # match a null (probed 6.0.16:
+                # ``null-link-missing-target-field`` returns only the seed).
+                if not has_path(fdoc, connect_to):
+                    continue
                 target = get_path(fdoc, connect_to)
                 if _values_match(value, target):
                     seen_ids.add(fid)
@@ -3483,16 +3656,21 @@ def _stage_graph_lookup(
                     if depth_field:
                         new_doc[depth_field] = depth
                     out_docs.append(new_doc)
-                    next_value = get_path(fdoc, connect_from)
-                    if next_value is not None:
-                        frontier.append((next_value, depth + 1))
+                    # An EXPLICIT null link is followed -- it reaches documents
+                    # whose connectTo field is explicitly null. Only a MISSING
+                    # link ends the walk. We tested the VALUE for None, which
+                    # conflated the two and truncated any chain that passed
+                    # through a null, silently returning a short answer: the
+                    # four-document chain in the probe came back as one.
+                    if has_path(fdoc, connect_from):
+                        frontier.append((get_path(fdoc, connect_from), depth + 1))
         return out_docs
 
     out: list[dict[str, Any]] = []
     for doc in docs:
         seed = evaluate(start_with, doc, ctx.vars)
         new = copy.deepcopy(doc)
-        new[as_field] = _walk(seed)
+        _set_as_field(new, as_field, _walk(seed))
         out.append(new)
     return out
 
