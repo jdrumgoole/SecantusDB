@@ -493,6 +493,81 @@ Specific items that were left out of the slice that introduced their feature are
 
   19 Rust unit tests. **Both servers are now 87/87 on this sweep.**
 
+- [x] **RESOLVED 2026-08-29 — `$limit` / `$skip` argument errors: mongod,
+  Python and Rust now agree on all 44 shapes.** Filed as one message-rendering
+  nit; probing the value space three-way found SIX problems, five of them not
+  the filed one:
+
+      $skip: 1.5              rust answered BadValue(2)   (gap in #1093)
+      $skip: -1               rust answered BadValue(2)   (same)
+      $skip: Decimal128("2")  mongod RUNS it; both servers rejected it
+      $skip: Decimal128("1.5") a FOURTH message family -- "Cannot represent as
+                              a 64-bit integer", not "Expected an integer"
+      $skip: -2.0             python echoed `-2`, the value it coerces to
+      $limit: 0               rust answered BadValue(2) where mongod says 15958
+
+  Rendering is now mongod's shell form on both servers: `"x"` / `true` / `null`
+  / `[ 1, "a" ]` / `{ a: 1 }` / `ObjectId('…')` / `new Date(<ms>)`, recursive
+  for nested containers.
+
+  **Two lessons worth keeping.** (1) The #1093 gaps at `1.5` / `-1` existed
+  because the sweep corpus feeds only `{}` / `"x"` / `[1]` — *the probe's reach
+  is exactly its case list*, and 87/87 was true and incomplete at once. (2)
+  `$limit: 0` was deferred in the core with the comment "Python raises 15958" —
+  the greppable "justified by the other engine, not by mongod" pattern, which
+  the plan records as 4-for-4 for hiding bugs. It is now 5-for-5: true on the
+  Python server, meaningless on a server with no Python, where the deferral
+  became a generic BadValue.
+
+- [ ] **OPEN — `test_tls_against_rust_server` flakes on the Windows runner
+  (first seen 2026-08-29, PR #1089).** `storage-engine (windows-latest)` failed
+  ONE of 86 tests with `ServerSelectionTimeoutError: No servers found yet,
+  Timeout: 5.0s` while pinging a TLS-enabled `RustServer`; a rerun of the same
+  job on the same commit passed. The PR that surfaced it changed only
+  `sql/planner.py` and its tests, so there is no causal path to the Rust
+  server's TLS listener.
+
+  **Not the known Windows `storage-engine` pattern** — that one is disk
+  exhaustion and shows `WT_PANIC` + `No space left on device` across a burst of
+  tests. This is a single test, no panic, no ENOSPC.
+
+  Most likely a genuinely tight budget: the test allows **5s** for a TLS
+  handshake against a freshly-spawned server on the slowest runner in the
+  matrix, and `tests/test_rust_server_smoke.py` uses the same 5000ms in seven
+  places. Per this repo's rule a flake is a bug, not noise — the fix is to give
+  the TLS case a budget matched to Windows (or wait for the listener rather than
+  race it), not to rerun it away. Recorded here because reruns hide it.
+
+- [x] **RESOLVED 2026-08-29 — wrong-typed command arguments on the RUST SERVER:
+  78 of 87 divergences -> 87/87 clean.** First swept the same day (the Python
+  server had reached 87/87 across #1078 / #1080 / #1084 / #1085; this server had
+  never been measured). Reproduce with `PROBE_SERVER` — see
+  `tools/probes/README.md`.
+
+  Fixed in two halves, matching the two failure modes:
+
+  **54 silently accepted** — new `secantus-commands::argtypes`, one validator per
+  message family, wired into `find` / `aggregate` / `createIndexes` / `create` /
+  `collMod` / `listIndexes` / `findAndModify` / `update`. Messages mirror the
+  Python server's, which are pinned byte-for-byte against a live mongod, so they
+  did not have to be re-derived. Every per-slot asymmetry carries across:
+  `findAndModify.upsert` takes a bool OR any number while `update.multi` rejects
+  `multi: 1`; `find.let` reports as `FindCommandRequest.let`; `maxTimeMS` is
+  code 2 with three messages; six slots accept an explicit null and three reject
+  it; `delete.deletes.limit` stays UNvalidated.
+
+  **24 generic `BadValue` (2)** — the "Rust error-code class"
+  (`tasks/remaining-work-plan.md` §1b), and the cause is structural:
+  `secantus-core` returns `Fallback` meaning "let the Python engine run this",
+  but this server has no Python, so it surfaced as BadValue. Closed with the
+  plan's named template (`update::arith_type_error`) rather than by widening
+  `Fallback`: a standalone `argtypes::stage_spec_error` naming the seven stages
+  it can name — `$lookup` 9, `$group` 15947, `$match` 15959, `$sort` 15973,
+  `$limit` 5107201, `$skip` 5107200, `$count` 40156, `$unwind` 15981 / 28812 —
+  and leaving everything else alone.
+
+  19 Rust unit tests. **Both servers are now 87/87 on this sweep.**
+
 - [ ] **OPEN — `$limit` / `$skip` stage-error messages render the offending value
   as a PYTHON repr (Python server).** Found 2026-08-29 while porting the above.
   mongod echoes the value shell-style — probed on 6.0.16:

@@ -1837,3 +1837,70 @@ def test_unwind_deepcopies_when_pipeline_contains_fill():
     except Exception:
         pass
     assert ctx.shared_unwind_ok is False
+
+
+# ---------------------------------------------------------------------------
+# $limit / $skip argument errors: mongod echoes the offending value shell-style,
+# and picks between FOUR messages. Found 2026-08-29 while porting this
+# validation to the Rust server -- the codes were already right, so the
+# differential sweep never saw it (it compares codes only).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value,rendered",
+    [
+        ("x", '"x"'),
+        ("", '""'),
+        (True, "true"),
+        (None, "null"),
+        ([1], "[ 1 ]"),
+        ([1, "a"], '[ 1, "a" ]'),
+        ([], "[]"),
+        ({}, "{}"),
+        ({"a": 1}, "{ a: 1 }"),
+        ([[1], {"b": 2}], "[ [ 1 ], { b: 2 } ]"),
+    ],
+)
+def test_skip_error_renders_the_value_the_way_mongod_does(value, rendered) -> None:
+    """It used to use `str()`/`repr()`, so a string came out bare (`x`) and an
+    array unspaced (`[1]`)."""
+    with pytest.raises(AggregateError) as exc:
+        apply_pipeline([{"_id": 1}], [{"$skip": value}])
+    assert exc.value.code == 5107200
+    assert str(exc.value) == (
+        f"invalid argument to $skip stage: Expected a number in: $skip: {rendered}"
+    )
+
+
+def test_negative_skip_echoes_the_value_as_sent() -> None:
+    """mongod prints what the client sent, so a whole float stays `-2.0`; we
+    reported the `-2` we coerce it to internally."""
+    with pytest.raises(AggregateError) as exc:
+        apply_pipeline([{"_id": 1}], [{"$skip": -2.0}])
+    assert str(exc.value) == (
+        "invalid argument to $skip stage: Expected a non-negative number in: $skip: -2.0"
+    )
+
+
+def test_decimal_skip_is_accepted() -> None:
+    """mongod runs `$skip: Decimal128("2")`; we used to reject it outright."""
+    from bson import Decimal128
+
+    out = apply_pipeline([{"_id": 1}, {"_id": 2}], [{"$skip": Decimal128("1")}])
+    assert [d["_id"] for d in out] == [2]
+
+
+def test_a_fractional_decimal_has_its_own_message() -> None:
+    """The fourth message family: a double says "Expected an integer", a decimal
+    says "Cannot represent as a 64-bit integer" (probed 6.0.16)."""
+    from bson import Decimal128
+
+    with pytest.raises(AggregateError) as exc:
+        apply_pipeline([{"_id": 1}], [{"$skip": Decimal128("1.5")}])
+    assert str(exc.value) == (
+        "invalid argument to $skip stage: Cannot represent as a 64-bit integer: $skip: 1.5"
+    )
+    with pytest.raises(AggregateError) as exc:
+        apply_pipeline([{"_id": 1}], [{"$skip": 1.5}])
+    assert str(exc.value) == ("invalid argument to $skip stage: Expected an integer: $skip: 1.5")
