@@ -208,13 +208,24 @@ Sub-ms `ORDER BY` is adjacent to work already landed and should be cheap.
 
 ---
 
-## Phase 2 — Keep the differential moving — **1 of 5 surfaces done**
+## Phase 2 — Keep the differential moving — **COMPLETE (5 of 5, 2026-08-29)**
 
 The differential's hit rate has been better than working the known list: eleven
 bugs from a handful of probes, and the `findAndModify` sweep below kept the rate
-up. These surfaces are still **untouched**:
+up. **All five surfaces are now done** (2026-08-29):
 
-- [ ] Change streams (resume tokens, `fullDocument` modes, invalidation)
+- [x] **Change streams (resume tokens, `fullDocument` modes, invalidation) —
+      DONE 2026-08-29 (#1104).** 13 shapes against a real replica-set mongod;
+      **all 13 diverged.** One crash (a resume token that is valid hex but not
+      valid BSON), and the rest overwhelmingly arguments ACCEPTED AND IGNORED —
+      the worst shape for a stream specifically, because the caller believes
+      they asked for something: a misspelled `fullDocument: "updateLookup"`
+      produced a stream without lookups, a wrong-typed `resumeAfter` one that
+      restarted from the beginning. Both reported success.
+      Method note: the validation belongs in `changestreams.parse_spec`, NOT in
+      the `$changeStream` pipeline stage — the `aggregate` command routes change
+      streams through its own path and never runs that stage, so a first attempt
+      in the stage handler had no effect at all.
 - [x] **Index and query planning (`explain` shapes, hint honouring, multikey)
       — behavioural half DONE 2026-08-29; `explain`'s stage vocabulary
       deliberately left whole (one scoped item in `backlog.md`).**
@@ -269,7 +280,17 @@ up. These surfaces are still **untouched**:
       rejects on the getMore. pymongo sends it anyway — its guard is a bitmask
       test (`flags & CursorType.TAILABLE_AWAIT` is `2 & 6 == 2`, truthy) — so
       the option it documents as ignored reaches the wire.
-- [ ] `$lookup` / `$graphLookup` forms (`let`/`pipeline`, nested)
+- [x] **`$lookup` / `$graphLookup` forms (`let`/`pipeline`, nested) — DONE
+      2026-08-29 (#1102).** 27 shapes, 20 diverged. The worst was a SHORT ANSWER
+      WITH NO ERROR: `$graphLookup` stopped following the chain at the first
+      null `connectFromField`, so a four-document chain returned one document.
+      Also: an empty-array `localField` matched nothing where mongod joins it
+      against null-valued rows (BOTH join paths, and the index path's comment
+      claimed `$in: []` semantics the oracle contradicts); `as` treated as a key
+      rather than a path; two crashes; unknown arguments accepted.
+      **Correction kept deliberately**: first written up as "does not recurse at
+      all" and scoped as a possible feature build. It recurses — the fixture put
+      a null on the first hop. The fix was a guard.
 
 Caveat worth stating plainly: this **adds** to the board rather than shrinking
 it. That is a feature — undiscovered wrong answers are worse than known ones —

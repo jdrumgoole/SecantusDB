@@ -1183,13 +1183,18 @@ These are explicit non-goals. Don't add them without a reason.
   of that class this campaign); two crashes (`let: 5`, `pipeline: 5`); unknown
   arguments accepted on both stages; and a negative `maxDepth` that matched
   nothing instead of erroring.
-- [ ] **A `$lookup` `let` binding cannot express MISSING.** For a document
-  without the local field, mongod binds `$$var` as *missing*, and
-  `$eq: ["$field", "$$var"]` against an explicitly-null foreign value is then
-  FALSE. Our evaluator resolves a missing path to `None`, so the two compare
-  equal and the join returns rows mongod excludes. Fixing it means a missing
-  sentinel in `expressions.py`, which touches every operator — deliberately not
-  attempted inside a join-semantics batch.
+- [x] **A `$lookup` `let` binding could not express MISSING — FIXED 2026-08-29
+  (#1107).** For a document without the local field, mongod binds `$$var` as
+  *missing*, so `$eq: ["$field", "$$var"]` against an explicitly-null foreign
+  value is FALSE; our evaluator resolved a missing path to `None`, the two
+  compared equal, and the join returned rows mongod excludes.
+  **The estimate recorded here was wrong, and kept because the error is the
+  lesson**: this said fixing it "means a missing sentinel in `expressions.py`,
+  which touches every operator". It did not. The sentinel already existed
+  (`evaluate_or_missing`, used by accumulators and `$project`) and only the
+  comparison operators failed to use it. An estimate made from READING was
+  wrong in the expensive direction and one probe corrected it — the second such
+  case that day, alongside the `$graphLookup` "does not recurse" misread.
 - [ ] **`$lookup`'s `as` field ORDER when it overwrites an existing field.**
   mongod moves the overwritten field to the END of the document; we keep its
   original position. Left alone rather than guessed at: this campaign has
