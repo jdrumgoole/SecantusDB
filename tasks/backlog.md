@@ -533,13 +533,19 @@ Specific items that were left out of the slice that introduced their feature are
   serializable is requested (honest, diverges from PG's echo). **A product
   decision, not a code one — ask before implementing.**
 
-  **READ COMMITTED inside an explicit transaction is a REDESIGN, not a fix.** It
-  needs a fresh snapshot per statement plus row-level blocking (PostgreSQL's
-  EvalPlanQual re-reads the committed row and re-applies). A WiredTiger
-  transaction has exactly one snapshot, so this means either a WT transaction
-  per statement with our own undo/redo above it, or a pessimistic row-lock
-  manager taken before the write so the conflict never happens. Do not attempt
-  it as a slice.
+  **READ COMMITTED inside an explicit transaction is a REDESIGN, not a fix —
+  scoped in `tasks/sql-mvcc-plan.md` (2026-08-29).** Both obvious designs fail:
+  WiredTiger's `reset_snapshot` is "an error … if the current transaction has
+  already written any data" (its own header), so per-statement snapshots inside
+  one WT transaction are impossible; and committing each statement separately
+  causes **dirty reads**, a worse violation than the 40001 it would fix. The
+  plan scopes the real answer (MVCC above WT: row versions, visibility filter,
+  durable undo, crash recovery, GC, row locks), fixes the seam (four storage
+  methods carry ~95% of SQL traffic, and the seam must sit ABOVE `Storage` so
+  the Mongo side keeps mongod's snapshot isolation), and states kill criteria.
+  **Its recommendation is to do Phase 0 only** — a partial row-lock mode that
+  raises 40001 on a second write rather than answering wrongly — and re-decide
+  with that measurement. Do not start Phases 3–4 without reading §8.
 
   All four rows are pinned by `tests/test_sql_isolation_level.py`, with the two
   divergent ones named `test_known_divergence_*` so they cannot be misread as
