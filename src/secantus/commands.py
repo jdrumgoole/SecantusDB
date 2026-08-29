@@ -1903,6 +1903,29 @@ def _validate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     inner = doc.get("explain") or {}
+    # A non-document ``explain`` argument, and an unknown or absent wrapped
+    # command, all used to produce a FABRICATED plan: a plausible-looking
+    # ``COLLSCAN`` over a namespace we invented, ``ok: 1``. That is worse than
+    # an error -- a client explaining a mistyped command name got a confident
+    # answer about a query that could never run.
+    if not isinstance(inner, Mapping):
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"BSON field 'explain.explain' is the wrong type "
+                f"'{_bson_type_of(doc.get('explain'))}', expected type 'object'"
+            ),
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    _inner_name = next(iter(inner), "")
+    if _inner_name not in _HANDLERS:
+        return {
+            "ok": 0.0,
+            "errmsg": f"Explain failed due to unknown command: {_inner_name}",
+            "code": 59,
+            "codeName": "CommandNotFound",
+        }
     coll = ""
     filter_: dict[str, Any] = {}
     sort = None
@@ -1971,22 +1994,39 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # invalid verbosity (``'invalid'``) and assert the response is a
     # ``MongoServerError`` — they fail silently if we accept the bad
     # value and return a normal explain doc.
-    if not isinstance(verbosity, str) or verbosity not in (
-        "queryPlanner",
-        "executionStats",
-        "allPlansExecution",
-    ):
+    # A NON-STRING verbosity is a type error, not a bad enum value -- mongod
+    # separates the two, and only the enum case is BadValue. We reported our
+    # own wording for both.
+    if not isinstance(verbosity, str):
         return {
             "ok": 0.0,
             "errmsg": (
-                f"verbosity {verbosity!r} not recognized; expected one of "
-                "['queryPlanner', 'executionStats', 'allPlansExecution']"
+                f"BSON field 'explain.verbosity' is the wrong type "
+                f"'{_bson_type_of(verbosity)}', expected type 'string'"
+            ),
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    if verbosity not in ("queryPlanner", "executionStats", "allPlansExecution"):
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"Enumeration value '{verbosity}' for field "
+                "'explain.verbosity' is not a valid value."
             ),
             "code": 2,
             "codeName": "BadValue",
         }
     namespace = _ns(ctx.db_name, coll) if coll else f"{ctx.db_name}.$cmd"
     if coll:
+        # A hint that names no index is fatal to the plan, and explain is the
+        # one command where that mattered most: it is what you run to CHECK a
+        # hint. `find` / `count` / `aggregate` all rejected it already, while
+        # explain quietly reported a COLLSCAN -- telling the caller their hint
+        # was fine AND that it was being ignored, in the same breath.
+        hint_err = _unresolvable_hint_error(ctx, coll, hint)
+        if hint_err is not None:
+            return _bad_value(hint_err)
         plan = ctx.storage.explain_plan(
             ctx.db_name, coll, filter_, sort=sort, hint=hint, collation=collation
         )
@@ -2667,6 +2707,14 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         )
         if _err is not None:
             return _err
+        hint_err = _unresolvable_hint_error(ctx, coll, spec.get("hint"))
+        if hint_err is not None:
+            # As on ``delete``: mongod refuses the statement rather than
+            # scanning, and we ignored the field and APPLIED the update.
+            write_errors.append({"index": index, "code": 2, "errmsg": hint_err})
+            if ordered:
+                break
+            continue
         _u = spec.get("u")
         if isinstance(_u, list):
             # An array `u` IS a pipeline, so its elements obey the pipeline rule
@@ -2871,6 +2919,17 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         _err = _require_object_bson_field(spec.get("q"), "delete.deletes.q")
         if _err is not None:
             return _err
+        hint_err = _unresolvable_hint_error(ctx, coll, spec.get("hint"))
+        if hint_err is not None:
+            # mongod refuses the STATEMENT -- `n: 0` and a writeError -- rather
+            # than falling back to a collection scan. We ignored the field
+            # entirely and DELETED the documents, so a caller who hinted a
+            # typo'd index name had their delete applied where MongoDB would
+            # have declined to run it.
+            write_errors.append({"index": index, "code": 2, "errmsg": hint_err})
+            if ordered:
+                break
+            continue
         try:
             n += ctx.storage.delete_matching(
                 ctx.db_name,
@@ -2969,6 +3028,9 @@ def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.paths import get_path
 
     coll = doc["distinct"]
+    _err = _unknown_command_field(doc, "distinct", _DISTINCT_KNOWN_FIELDS)
+    if _err is not None:
+        return _err
     key = doc.get("key", "")
     _err = _require_object_bson_field(doc.get("query"), "distinct.query")
     if _err is not None:
@@ -3099,6 +3161,83 @@ def _require_number_bson_field(value: Any, field_path: str) -> dict[str, Any] | 
         "code": 14,
         "codeName": "TypeMismatch",
     }
+
+
+# Fields the ``distinct`` command accepts. It used to accept ANY field and
+# ignore it, so a misspelled option was silently dropped.
+#
+# ``hint`` is deliberately in the set even though mongod **6.0.16 rejects it**
+# (`BSON field 'distinct.hint' is an unknown field.`): MongoDB added a hint
+# option to `distinct` in a later release, so a current driver may legitimately
+# send it. Accepting is the safe direction for a field whose status changed --
+# unlike the rest of this set, where rejecting matches every version. The
+# differential gate therefore probes an always-unknown field, not this one.
+_DISTINCT_KNOWN_FIELDS = frozenset(
+    {
+        "distinct",
+        "key",
+        "query",
+        "collation",
+        "hint",
+        "comment",
+        "maxTimeMS",
+        "readConcern",
+        "writeConcern",
+        "lsid",
+        "txnNumber",
+        "autocommit",
+        "startTransaction",
+        "stmtId",
+        "apiVersion",
+        "apiStrict",
+        "apiDeprecationErrors",
+    }
+)
+
+
+def _unknown_command_field(
+    doc: Mapping[str, Any], command: str, known: frozenset[str]
+) -> dict[str, Any] | None:
+    """mongod's ``Location40415`` for an unrecognised top-level field, else None.
+
+    ``$``-prefixed keys are accepted unconditionally -- they are the wire
+    envelope, and the same carve-out ``create`` / ``findAndModify`` /
+    ``getMore`` make.
+    """
+    unknown = next((k for k in doc if k not in known and not k.startswith("$")), None)
+    if unknown is None:
+        return None
+    return {
+        "ok": 0.0,
+        "errmsg": f"BSON field '{command}.{unknown}' is an unknown field.",
+        "code": 40415,
+        "codeName": "Location40415",
+    }
+
+
+def _unresolvable_hint_error(ctx: CommandContext, coll: str, hint: Any) -> str | None:
+    """The error message for a ``hint`` that names no index, else None.
+
+    ``delete`` and ``update`` take a per-statement ``hint`` and mongod refuses
+    the STATEMENT when it does not resolve -- ``n: 0`` plus a writeError --
+    rather than falling back to a collection scan. Both commands ignored the
+    field outright, so a caller who hinted a typo'd index name had their write
+    APPLIED where MongoDB declines to run it. That is the failure mode worth
+    naming: not a missing error, an operation that should not have happened.
+
+    ``hint: {}`` means "no hint", as on ``find``.
+    """
+    from secantus.storage import BadHint
+
+    if hint is None or (isinstance(hint, Mapping) and not hint):
+        return None
+    if not isinstance(hint, (str, Mapping)):
+        return "Hint must be a string or an object"
+    try:
+        ctx.storage.validate_hint(ctx.db_name, coll, hint)
+    except BadHint as exc:
+        return str(exc)
+    return None
 
 
 def _require_non_negative_number(value: Any, bare_name: str) -> dict[str, Any] | None:

@@ -215,7 +215,22 @@ bugs from a handful of probes, and the `findAndModify` sweep below kept the rate
 up. These surfaces are still **untouched**:
 
 - [ ] Change streams (resume tokens, `fullDocument` modes, invalidation)
-- [ ] Index and query planning (`explain` shapes, hint honouring, multikey)
+- [x] **Index and query planning (`explain` shapes, hint honouring, multikey)
+      — behavioural half DONE 2026-08-29; `explain`'s stage vocabulary
+      deliberately left whole (one scoped item in `backlog.md`).**
+      32 shapes probed. The find that matters: **`delete` and `update` ignored
+      their per-statement `hint` and PERFORMED the write** where mongod refuses
+      the statement — the only write-that-should-not-have-happened in the whole
+      campaign, and the two write paths were the only hint-bearing commands
+      still missing the check. Also: `explain` did not validate a hint (the
+      command you run to *check* one) and **fabricated** a `COLLSCAN` plan with
+      `ok: 1` for commands that do not exist; `{$natural: -1}` did not reverse;
+      `distinct` accepted any field.
+      **Read the raw count carefully** — 30 of 32 "diverged", but most is
+      `explain` output shape and one case is not a defect: we choose `a_-1`
+      where mongod chooses `a_1` for `{a: 5}`, which is a cost model, not a
+      wrong answer. Six behavioural items were the content. A differential
+      number is only as meaningful as its classification.
 - [x] **`findAndModify` (all option combinations) — DONE 2026-08-29.**
       49 combinations probed against mongod 6.0.16, **14 diverged**, all fixed.
       Method note worth reusing: compare the **raw command reply**, not

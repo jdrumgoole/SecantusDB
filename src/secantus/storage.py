@@ -594,6 +594,11 @@ class DuplicateKeyError(Exception):
         self.doc_id = doc_id
 
 
+# The resolved form of a `{$natural: -1}` hint. Distinct from "$natural" so
+# the walk direction survives resolution.
+_NATURAL_REVERSE = "$natural:-1"
+
+
 def _is_operator_expr(v: Any) -> bool:
     """True when ``v`` is a query OPERATOR expression (a non-empty dict
     whose keys all start with ``$``, e.g. ``{$gt: 5}``) — as opposed to
@@ -4876,6 +4881,17 @@ class Storage:
 
         return [d for d in docs if _in_bounds(d)]
 
+    def validate_hint(self, db: str, coll: str, hint: str | Mapping[str, Any]) -> None:
+        """Raise ``BadHint`` if ``hint`` names no index on this collection.
+
+        The public face of ``_resolve_hint`` for callers that need to CHECK a
+        hint without running a query -- ``delete`` and ``update``, where mongod
+        refuses the statement outright rather than falling back to a scan. They
+        previously ignored the field entirely and performed the write.
+        """
+        with self._lock:
+            self._resolve_hint(db, coll, hint)
+
     def _resolve_hint(self, db: str, coll: str, hint: str | Mapping[str, Any]) -> str:
         """Resolve ``hint`` to an index name (or ``$natural``).
 
@@ -4895,6 +4911,16 @@ class Storage:
             raise BadHint(f"hint {hint!r} does not correspond to an existing index")
         if isinstance(hint, Mapping):
             if list(hint) == ["$natural"]:
+                # The DIRECTION is part of the hint: `{$natural: -1}` walks the
+                # collection backwards (mongod returns [5,4,3,2,1] where
+                # `{$natural: 1}` returns [1,2,3,4,5]). Collapsing both to
+                # "$natural" dropped it, so a caller asking for reverse
+                # insertion order silently got forward order.
+                try:
+                    if int(hint["$natural"]) < 0:
+                        return _NATURAL_REVERSE
+                except (TypeError, ValueError):
+                    pass
                 return "$natural"
             if list(hint) == ["_id"] and int(hint["_id"]) == 1:
                 return _ID_INDEX_NAME
@@ -4918,9 +4944,12 @@ class Storage:
         True when the hint's leading field matches the sort field — in
         which case ``find_matching`` skips the post-sort step.
         """
-        if resolved == "$natural":
+        if resolved in ("$natural", _NATURAL_REVERSE):
             # $natural == insertion order (mongod's RecordId store order).
-            return [bson.decode(b) for _rid, _idk, b in self._scan_docs_natural(db, coll)], False
+            docs = [bson.decode(b) for _rid, _idk, b in self._scan_docs_natural(db, coll)]
+            if resolved == _NATURAL_REVERSE:
+                docs.reverse()
+            return docs, False
         if resolved == _ID_INDEX_NAME:
             # The doc table is keyed by RecordId (insertion order), so sort the
             # scan by ``id_key`` to reproduce an ``_id_`` index walk — the
@@ -5169,7 +5198,7 @@ class Storage:
                     resolved = self._resolve_hint(db, coll, hint)
                 except BadHint:
                     return {"kind": "COLLSCAN"}
-                if resolved == "$natural":
+                if resolved in ("$natural", _NATURAL_REVERSE):
                     return {"kind": "COLLSCAN"}
                 if resolved == _ID_INDEX_NAME:
                     direction = "forward"
