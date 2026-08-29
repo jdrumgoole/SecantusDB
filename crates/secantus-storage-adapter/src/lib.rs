@@ -875,6 +875,11 @@ fn map_err(e: WtError) -> StorageError {
             code: 40,
             errmsg: m,
         },
+        // Creating a field under a non-document → mongod's PathNotViable (28).
+        WtError::UpdatePathNotViable(m) => StorageError::WriteError {
+            code: 28,
+            errmsg: m,
+        },
         WtError::QueryUnsupported => StorageError::WriteError {
             code: 2,
             errmsg: "query uses a construct the Rust server does not support".to_string(),

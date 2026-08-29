@@ -208,20 +208,50 @@ Sub-ms `ORDER BY` is adjacent to work already landed and should be cheap.
 
 ---
 
-## Phase 2 — Keep the differential moving — **NOT STARTED**
+## Phase 2 — Keep the differential moving — **1 of 5 surfaces done**
 
 The differential's hit rate has been better than working the known list: eleven
-bugs from a handful of probes. These surfaces are **untouched**:
+bugs from a handful of probes, and the `findAndModify` sweep below kept the rate
+up. These surfaces are still **untouched**:
 
 - [ ] Change streams (resume tokens, `fullDocument` modes, invalidation)
 - [ ] Index and query planning (`explain` shapes, hint honouring, multikey)
-- [ ] `findAndModify` (all option combinations)
+- [x] **`findAndModify` (all option combinations) — DONE 2026-08-29.**
+      49 combinations probed against mongod 6.0.16, **14 diverged**, all fixed.
+      Method note worth reusing: compare the **raw command reply**, not
+      pymongo's `find_one_and_*` wrappers — half the divergences were in the
+      reply *shape* (`lastErrorObject`'s keys, the field order of an upserted
+      document), which the wrappers hide.
+      Two were silent wrong data and **both were shared with the plain
+      `update` command**, so probing one command found bugs in two: `update: {}`
+      is a replacement (mongod reduces the doc to its `_id`; we returned it
+      untouched) and an upsert from a dotted query (`{"sub.k": 77}`) stored a
+      literal dotted key that then failed to match its own query. A third,
+      `$set: {"n.x": 1}` against `{n: 5}`, silently did nothing where mongod
+      answers `PathNotViable` (28) — and the Rust port carried a
+      "Python walk returns None -> no-op" comment, making it the **fifth** hit
+      for the cross-referencing-comments pattern (now 5-for-5).
+      The rest were arguments accepted and ignored (`new` untyped, unknown
+      top-level fields, `hint`) or error codes flattened to `14 TypeMismatch`
+      on the way out of the command. `tests/test_mongod_differential.py`
+      57 → 93 cases.
 - [ ] Cursor / `getMore` semantics (batch sizing, `maxTimeMS`, tailable)
 - [ ] `$lookup` / `$graphLookup` forms (`let`/`pipeline`, nested)
 
 Caveat worth stating plainly: this **adds** to the board rather than shrinking
 it. That is a feature — undiscovered wrong answers are worse than known ones —
 but it does not make the count go down.
+
+Two message-only gaps were opened rather than closed by the findAndModify
+sweep; both are recorded in `backlog.md` and neither changes a code:
+
+- `hint` that names no index answers `BadValue` (2) with our short causal
+  sentence, where mongod prefixes a dump of the parsed plan (`error processing
+  query: ns=…Tree: _id $eq 1\nSort: {}\nProj: {}\n…`). Shared with `find` and
+  `count`, which have always answered the short form.
+- A `$`-prefixed unknown field (`$zz`) is accepted where mongod rejects it.
+  Deliberate: `$`-keys are the wire envelope, and the `create` command makes
+  the same carve-out.
 
 ---
 

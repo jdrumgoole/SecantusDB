@@ -324,6 +324,14 @@ fn walk_positional(
 
 /// `paths::set_path` with its list-growth-cap error mapped to our `Fallback`.
 fn set_path(doc: &mut Document, path: &str, value: Bson) -> R<()> {
+    // A dotted path that runs THROUGH a non-document cannot be created --
+    // mongod answers `PathNotViable` (28). `paths::set_path` returns silently
+    // in that case (as Python's did), so the update reported success and wrote
+    // nothing. Defer: the Python engine raises the exact error, and the
+    // standalone Rust server names it via `path_not_viable_error`.
+    if paths::path_block(doc, path).is_some() {
+        return Err(Fallback);
+    }
     paths::set_path(doc, path, value).map_err(|_| Fallback)
 }
 
@@ -909,9 +917,11 @@ pub fn apply_update_with(
     array_filters: &[Document],
     positional_matches: &Document,
 ) -> R<Document> {
-    if update.is_empty() {
-        return Ok(doc.clone());
-    }
+    // NO empty short-circuit: `update: {}` is a replacement with an empty
+    // document, so the stored doc is reduced to its `_id` (probed mongod
+    // 6.0.16, which reports `nModified: 1` for it). Returning `doc.clone()`
+    // here silently kept every field the client asked to drop. An empty
+    // *pipeline* is the genuine no-op, and is a different entry point.
     if !array_filters_valid(array_filters, update) {
         return Err(Fallback); // invalid arrayFilters -> Python raises the exact code
     }
@@ -1086,6 +1096,66 @@ pub fn arith_type_error(doc: &Document, update: &Document) -> Option<String> {
         }
     }
     None
+}
+
+/// The exact mongod error for an update that would create a field under a
+/// non-document, or `None` if this update fails for some other reason.
+///
+/// Same purpose as [`arith_type_error`]: a bare `Fallback` becomes a generic
+/// `BadValue` (2) on the standalone Rust server, where mongod answers
+/// `PathNotViable` (28). Message verbatim from a mongod 6.0.16 probe —
+/// `Cannot create field 'x' in element {n: 5}`, naming the component that
+/// cannot be created and the thing standing in its way.
+///
+/// `$unset` is skipped: it does not create, and mongod lets it walk a
+/// non-viable path as a no-op.
+pub fn path_not_viable_error(doc: &Document, update: &Document) -> Option<String> {
+    for (op, payload) in update.iter() {
+        if op == "$unset" || !op.starts_with('$') {
+            continue;
+        }
+        let Bson::Document(fields) = payload else {
+            continue;
+        };
+        for path in fields.keys() {
+            // Positional / arrayFilter paths expand per document; leave those
+            // to the normal defer rather than guess at the concrete path.
+            if path.contains("$[") || path.contains(".$") {
+                continue;
+            }
+            if let Some((key, container, field)) = paths::path_block(doc, path) {
+                let element = match key {
+                    Some(k) => format!("{{{k}: {}}}", render_value(container)),
+                    None => "{}".to_string(),
+                };
+                return Some(format!(
+                    "Cannot create field '{field}' in element {element}"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// `render_scalar` extended to arrays and sub-documents. mongod spaces the
+/// brackets — `[ 1 ]`, `{ a: 1 }` — in the `PathNotViable` message.
+fn render_value(v: &Bson) -> String {
+    match v {
+        Bson::Document(d) if d.is_empty() => "{}".to_string(),
+        Bson::Document(d) => {
+            let inner: Vec<String> = d
+                .iter()
+                .map(|(k, x)| format!("{k}: {}", render_value(x)))
+                .collect();
+            format!("{{ {} }}", inner.join(", "))
+        }
+        Bson::Array(a) if a.is_empty() => "[]".to_string(),
+        Bson::Array(a) => {
+            let inner: Vec<String> = a.iter().map(render_value).collect();
+            format!("[ {} ]", inner.join(", "))
+        }
+        _ => render_scalar(v),
+    }
 }
 
 /// mongod's numeric domain for `$inc` / `$mul`: int32 / int64 / double /

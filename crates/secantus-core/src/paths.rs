@@ -101,6 +101,53 @@ pub fn get_path_values<'a>(doc: &'a Document, path: &str) -> (Vec<&'a Bson>, boo
     (current, descended)
 }
 
+/// What stops `path` from being created against `doc`, or `None` if it can be:
+/// `(container_key, container_value, field)`, where `field` is the component
+/// that cannot be created. mongod refuses these with `PathNotViable` (28).
+/// Mirrors `secantus.paths.path_block`.
+///
+/// Creatable, so `None`: a missing intermediate (mongod makes the
+/// sub-document), an out-of-range array index (mongod pads with nulls), and the
+/// leaf itself whatever its current type.
+pub fn path_block<'a>(doc: &'a Document, path: &str) -> Option<(Option<String>, &'a Bson, String)> {
+    let parts: Vec<&str> = path.split('.').collect();
+    // The first component is resolved against the document; from then on we
+    // walk Bson values. A missing first component, or a single-component path
+    // (the leaf itself), is creatable either way.
+    let (mut last_key, mut cur): (Option<String>, &Bson) = match doc.get(parts[0]) {
+        Some(v) if parts.len() > 1 => (Some(parts[0].to_string()), v),
+        _ => return None,
+    };
+    for (i, part) in parts.iter().enumerate().skip(1) {
+        let is_leaf = i == parts.len() - 1;
+        match cur {
+            Bson::Document(d) => {
+                if !d.contains_key(*part) || is_leaf {
+                    return None;
+                }
+                last_key = Some((*part).to_string());
+                cur = d.get(*part).unwrap();
+            }
+            Bson::Array(a) => {
+                if !is_digits(part) {
+                    return Some((last_key, cur, (*part).to_string()));
+                }
+                let idx: usize = match part.parse() {
+                    Ok(v) => v,
+                    Err(_) => return Some((last_key, cur, (*part).to_string())),
+                };
+                if idx >= a.len() || is_leaf {
+                    return None;
+                }
+                last_key = Some((*part).to_string());
+                cur = &a[idx];
+            }
+            _ => return Some((last_key, cur, (*part).to_string())),
+        }
+    }
+    None
+}
+
 /// Hard cap on a numeric path index that would grow a list (mirrors
 /// `secantus.paths._MAX_LIST_GROW_INDEX`). Exceeding it is `Err(())` so callers
 /// can defer to Python (which raises `PathError`).
@@ -130,7 +177,11 @@ fn set_in_bson(cur: &mut Bson, parts: &[&str], value: Bson) -> Result<(), ()> {
     match cur {
         Bson::Document(d) => set_in_doc(d, parts, value),
         Bson::Array(arr) => set_in_array(arr, parts, value),
-        _ => Ok(()), // non-container intermediate -> Python walk returns None -> no-op
+        // A non-container intermediate is a silent no-op HERE because this is
+        // the shared setter, used by projection / aggregation as well. On the
+        // UPDATE path mongod refuses it (`PathNotViable`, 28) -- see
+        // `path_block`, which `update::set_path` consults first.
+        _ => Ok(()),
     }
 }
 
@@ -193,5 +244,45 @@ fn unset_in_bson(cur: &mut Bson, parts: &[&str]) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bson::doc;
+
+    /// mongod refuses to create a field under a non-document (`PathNotViable`,
+    /// 28); `set_path` returned silently instead, so the update reported
+    /// success and wrote nothing. Cases probed against mongod 6.0.16.
+    #[test]
+    fn path_block_names_what_is_in_the_way() {
+        let scalar = doc! {"n": 5};
+        let (key, _, field) = super::path_block(&scalar, "n.x").unwrap();
+        assert_eq!((key.as_deref(), field.as_str()), (Some("n"), "x"));
+
+        let nested = doc! {"a": {"b": 7}};
+        let (key, _, field) = super::path_block(&nested, "a.b.c").unwrap();
+        assert_eq!((key.as_deref(), field.as_str()), (Some("b"), "c"));
+
+        // An array addressed by a non-numeric component.
+        let arr = doc! {"a": [1]};
+        let (key, _, field) = super::path_block(&arr, "a.x").unwrap();
+        assert_eq!((key.as_deref(), field.as_str()), (Some("a"), "x"));
+
+        // Descending into a scalar array ELEMENT.
+        let (key, _, field) = super::path_block(&arr, "a.0.x").unwrap();
+        assert_eq!((key.as_deref(), field.as_str()), (Some("0"), "x"));
+    }
+
+    #[test]
+    fn creatable_paths_are_not_blocked() {
+        // A missing intermediate: mongod makes the sub-document.
+        assert!(super::path_block(&doc! {}, "n.x").is_none());
+        assert!(super::path_block(&doc! {"a": {}}, "a.b.c").is_none());
+        // An out-of-range index: mongod pads with nulls.
+        assert!(super::path_block(&doc! {"a": [1]}, "a.4").is_none());
+        // The leaf itself is overwritten, whatever its current type.
+        assert!(super::path_block(&doc! {"n": 5}, "n").is_none());
+        assert!(super::path_block(&doc! {"a": {"b": 7}}, "a.b").is_none());
     }
 }

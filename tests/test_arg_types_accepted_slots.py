@@ -155,13 +155,26 @@ def test_update_multi_is_a_strict_bool(db, bad) -> None:
     )
 
 
+@pytest.mark.parametrize("field", ["upsert", "new", "remove"])
 @pytest.mark.parametrize("bad", [{}, [1], "x"])
-def test_find_and_modify_upsert_rejects_non_numbers(db, bad) -> None:
-    err = _err(db, {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "upsert": bad})
+def test_find_and_modify_bool_flags_reject_non_numbers(db, field, bad) -> None:
+    """The closing quote sits INSIDE the bracket -- ``double']``, not
+    ``double]'``. Re-probed at byte level against mongod 6.0.16 on 2026-08-29
+    after this assertion and the server disagreed; the server was matching the
+    sensible form and mongod emits the odd one.
+
+    ``new`` and ``remove`` take the same rule as ``upsert`` and are covered
+    here too: ``new`` was not type-checked at all, so a string went through
+    Python truthiness and ``new: "no"`` returned the POST-image.
+    """
+    err = _err(
+        db,
+        {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, field: bad},
+    )
     assert err.code == 14
     assert err.details["errmsg"] == (
-        f"BSON field 'findAndModify.upsert' is the wrong type "
-        f"'{_bson_type_name(bad)}', expected types '[bool, long, int, decimal, double]'"
+        f"BSON field 'findAndModify.{field}' is the wrong type "
+        f"'{_bson_type_name(bad)}', expected types '[bool, long, int, decimal, double']"
     )
 
 

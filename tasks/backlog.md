@@ -866,6 +866,80 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [x] **`findAndModify` differential sweep — 14 of 49 combinations diverged,
+  all fixed (2026-08-29).** Phase 2 of `tasks/remaining-work-plan.md`. Probed
+  against mongod 6.0.16, comparing the **raw command reply** rather than
+  pymongo's `find_one_and_*` wrappers — half the divergences were in the reply
+  *shape* (`lastErrorObject`'s keys, an upserted document's field order), which
+  the wrappers hide. Three findings are worth carrying forward:
+  - **Two of the bugs were in the shared update path, not in `findAndModify`**,
+    so probing one command found bugs in two. `update: {}` is a *replacement*
+    (mongod reduces the document to its `_id`, `nModified: 1`); both write
+    commands short-circuited on a falsy update and kept every field the caller
+    asked to drop. And an upsert from a dotted query (`{"sub.k": 77}`) stored a
+    literal key with a dot in it — a document mongod cannot produce, which then
+    never matched the query that created it. When a command-level probe finds
+    something, re-run the shapes through the sibling commands.
+  - **`$set: {"n.x": 1}` against `{n: 5}` silently did nothing** where mongod
+    answers `PathNotViable` (28). The Rust port justified it with the comment
+    `non-container intermediate -> Python walk returns None -> no-op`, making
+    this the **fifth** hit for the cross-referencing-comments pattern (5-for-5;
+    see the triage block's greps).
+  - **`findAndModify` had no `UpdateError` mapping at all**, so every update
+    failure escaped to dispatch's generic handler as `14 TypeMismatch` — codes
+    9 / 40 / 66 / 28 all arrived wrong. The `update` command has had the mapping
+    for a while; the two had simply drifted. `codeName` was independently
+    broken: it was pinned to `TypeMismatch` even when the exception named its
+    own code, a pair mongod never sends.
+  Also fixed: `new` never type-checked (a string went through Python
+  truthiness, so `new: "no"` returned the post-image), unknown top-level fields
+  accepted, `hint` accepted and ignored, `arrayFilters` type errors naming a
+  field path this command does not have, and mongod's single "Unknown modifier"
+  wording.
+  **One more instance of "a test pinning the bug" (now 4-for-4):**
+  `test_arg_types_accepted_slots.py` asserted
+  `expected types '[bool, long, int, decimal, double]'` — the sensible quoting.
+  mongod emits `…double']`, with the closing quote **inside** the bracket;
+  re-probed at byte level to be sure, because a quote-position claim is easy to
+  get backwards. The test and the server had agreed on a string mongod does not
+  send, so the full suite was green over it. `tests/test_mongod_differential.py` 57 → 93 cases;
+  `tests/test_findandmodify_fidelity.py` and
+  `tests/test_update_replacement_and_paths.py` pin the semantics.
+- [x] **The differential gate runs against DIFFERENT mongod versions per CI
+  lane, and two assertions were version-dependent (found by CI, 2026-08-29).**
+  The dev box has 6.0.16; the `windows-latest` runner image ships a newer
+  server, and `test-windows` failed twice on assertions that passed on macOS
+  and Linux. Neither was a flake. Both splits are worth knowing before adding
+  a differential case:
+  - **`codeName` for the high numeric codes is not stable.** 40415 is
+    `Location40415` on 6.0.16 (mongod's fallback rendering for a code with no
+    symbolic name) and `IDLUnknownField` on the newer server — same code, same
+    message. The *named* codes (2 / 9 / 14 / 28 / 40 / 66) are stable.
+    `_stable_code_name` now asserts the name only below code 10000.
+  - **An upserted document's query-seeded fields are ordered differently.**
+    6.0.16 sorts them (`{b: 1, a: 2}` upserts `{_id, a, b, …}`); the newer
+    server keeps the query's order (`{_id, b, a, …}`). `_id` leading, and
+    field-name order for the fields the *update* added, hold on both. We ship
+    6.0's form per this project's standing convention; the gate asserts only
+    the version-stable parts (`_upsert_key_shape`).
+- [ ] **A hint that names no index answers a shorter message than mongod's.**
+  Code (2) and `codeName` (`BadValue`) match, and the causal sentence is the
+  same — `hint provided does not correspond to an existing index` — but mongod
+  prefixes a dump of the parsed plan: `error processing query:
+  ns=<db>.<coll>Tree: _id $eq 1\nSort: {}\nProj: {}\nCollation: { locale:
+  "simple" }\n planner returned error :: caused by :: …`. Reproducing it needs a
+  renderer for the parsed query tree, the sort, the projection and the
+  collation, which would diverge for anything but trivial filters. **Shared with
+  `find` and `count`**, which have always answered the short form; noticed on
+  `findAndModify` only because that command previously ignored `hint` entirely.
+  Message-only — no code, `codeName`, or behaviour differs.
+- [ ] **A `$`-prefixed unknown command field is accepted where mongod rejects
+  it.** mongod answers `Location40415` for `findAndModify.$zz` as it does for
+  any other unknown field; we accept every `$`-prefixed key unconditionally.
+  Deliberate, and the same carve-out `create` makes: `$`-keys are the wire
+  envelope (`$db`, `$clusterTime`, `$readPreference`, `$audit`, …) and an
+  allowlist that missed one would break a driver over a message nobody reads.
+  Revisit only with a driver-verified envelope list.
 - [x] **Decimal128 arithmetic — SHIPPED on BOTH servers, all four operators
   (2026-08-24).** `$inc` / `$mul` / `$sum` / `$avg` now compute natively in Rust
   instead of erroring, and the **Python server's silent 28-digit truncation is

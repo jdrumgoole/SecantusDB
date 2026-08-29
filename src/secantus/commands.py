@@ -167,9 +167,12 @@ _ERROR_CODE_NAMES: dict[int, str] = {
     14: "TypeMismatch",
     18: "AuthenticationFailed",
     26: "NamespaceNotFound",
+    28: "PathNotViable",
+    40: "ConflictingUpdateOperators",
     43: "CursorNotFound",
     50: "MaxTimeMSExpired",
     59: "CommandNotFound",
+    66: "ImmutableField",
     100: "UnsatisfiableWriteConcern",
     136: "CappedPositionLost",
 }
@@ -2813,11 +2816,18 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         if result["did_upsert"]:
             upserted.append({"index": index, "_id": result["upserted_id"]})
             n += 1
-    reply: dict[str, Any] = {"n": n, "nModified": n_modified, "ok": 1.0}
+    # Field order is mongod's: ``n``, then ``upserted`` / ``writeErrors`` if
+    # present, then ``nModified``, then ``ok`` (probed 6.0.16 both ways). BSON
+    # keeps the order on the wire, so a client comparing raw reply bytes -- the
+    # PHP library's codec tests do -- sees ours append the optional fields at
+    # the end instead.
+    reply: dict[str, Any] = {"n": n}
     if upserted:
         reply["upserted"] = upserted
     if write_errors:
         reply["writeErrors"] = write_errors
+    reply["nModified"] = n_modified
+    reply["ok"] = 1.0
     return reply
 
 
@@ -3119,7 +3129,11 @@ def _require_object_expected_field(
     }
 
 
-_BOOL_OR_NUMBER_TYPES_MSG = "'[bool, long, int, decimal, double]'"
+# mongod's own quoting, which is not what you would write: the closing quote
+# sits INSIDE the bracket. Verbatim from 6.0.16 --
+# ``expected types '[bool, long, int, decimal, double']``. We had the quote
+# outside, which is the sensible form and the wrong one.
+_BOOL_OR_NUMBER_TYPES_MSG = "'[bool, long, int, decimal, double']"
 
 
 def _require_bool_value_field(doc: Mapping[str, Any], field_name: str) -> dict[str, Any] | None:
@@ -3171,6 +3185,144 @@ def _require_bool_or_number_bson_field(value: Any, field_path: str) -> dict[str,
     }
 
 
+# Top-level fields the ``findAndModify`` command accepts. Anything else is
+# rejected with ``Location40415`` (40415, IDLUnknownField) -- probed 6.0.16,
+# which answers ``BSON field 'findAndModify.zz' is an unknown field.`` (with
+# the trailing period). We accepted anything and ran the write, so a
+# misspelled option -- ``fields`` typed as ``field``, ``new`` as ``returnNew``
+# -- was silently dropped and the caller got a correct-looking reply computed
+# under different options than they asked for.
+#
+# ``$``-prefixed keys are accepted unconditionally, as they are on ``create``:
+# mongod does reject those too, but they are the wire envelope and rejecting
+# them risks breaking a driver over a message nobody reads.
+_FIND_AND_MODIFY_KNOWN_FIELDS = frozenset(
+    {
+        "findAndModify",
+        "findandmodify",
+        # The operation itself.
+        "query",
+        "update",
+        "remove",
+        "new",
+        "upsert",
+        "sort",
+        "fields",
+        "arrayFilters",
+        "collation",
+        "let",
+        "hint",
+        "bypassDocumentValidation",
+        # Generic command options.
+        "writeConcern",
+        "comment",
+        "maxTimeMS",
+        # Wire envelope / session fields.
+        "lsid",
+        "txnNumber",
+        "txnRetryCounter",
+        "autocommit",
+        "startTransaction",
+        "stmtId",
+        "readConcern",
+        "apiVersion",
+        "apiStrict",
+        "apiDeprecationErrors",
+        "sampleId",
+        "encryptionInformation",
+        "mayBypassWriteBlocking",
+        "databaseVersion",
+        "shardVersion",
+        "allowImplicitCollectionCreation",
+    }
+)
+
+
+def _bson_flag(value: Any) -> bool:
+    """Truthiness of a validated bool-or-number flag, mongod's way.
+
+    ``bool(Decimal128("0"))`` is True in Python -- ``Decimal128`` has no
+    ``__bool__``, so every instance is truthy and ``new: Decimal128("0")``
+    would mean the opposite of what it says. Numbers compare against zero;
+    an absent or null flag is False.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, bson.Decimal128):
+        return value.to_decimal() != 0
+    if isinstance(value, (int, float)):
+        return value != 0
+    return bool(value)
+
+
+def _unknown_find_and_modify_field(doc: Mapping[str, Any]) -> dict[str, Any] | None:
+    """``Location40415`` for an unrecognised ``findAndModify`` field, else None."""
+    unknown = next(
+        (k for k in doc if k not in _FIND_AND_MODIFY_KNOWN_FIELDS and not k.startswith("$")),
+        None,
+    )
+    if unknown is None:
+        return None
+    return {
+        "ok": 0.0,
+        "errmsg": f"BSON field 'findAndModify.{unknown}' is an unknown field.",
+        "code": 40415,
+        "codeName": "Location40415",
+    }
+
+
+def _validate_array_filters_field(
+    doc: Mapping[str, Any], field_name: str, field_path: str
+) -> dict[str, Any] | None:
+    """``arrayFilters`` must be an array of documents. Probed 6.0.16::
+
+        {e: 1}   14  BSON field '<path>' is the wrong type 'object', expected type 'array'
+        "x"      14  BSON field '<path>' is the wrong type 'string', expected type 'array'
+        [5]      14  BSON field '<path>.0' is the wrong type 'int', expected type 'object'
+        null     10065  invalid parameter: expected an object (arrayFilters)
+
+    An explicit ``null`` really does take a different, older code path than
+    every other wrong type -- hence the odd ``Location10065``.
+
+    We reported a *non-existent field path* here (``update.updates.arrayFilters.0``)
+    naming the wrong type, on a command that has no ``updates`` array at all.
+    """
+    if field_name not in doc:
+        return None
+    value = doc[field_name]
+    if value is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "invalid parameter: expected an object (arrayFilters)",
+            "code": 10065,
+            "codeName": "Location10065",
+        }
+    if isinstance(value, list):
+        for i, entry in enumerate(value):
+            if not isinstance(entry, Mapping):
+                return {
+                    "ok": 0.0,
+                    "errmsg": (
+                        f"BSON field '{field_path}.{i}' is the wrong type "
+                        f"'{_bson_type_of(entry)}', expected type 'object'"
+                    ),
+                    "code": 14,
+                    "codeName": "TypeMismatch",
+                }
+        return None
+    return {
+        "ok": 0.0,
+        "errmsg": (
+            f"BSON field '{field_path}' is the wrong type "
+            f"'{_bson_type_of(value)}', expected type 'array'"
+        ),
+        "code": 14,
+        "codeName": "TypeMismatch",
+    }
+
+
 def _require_max_time_ms(doc: Mapping[str, Any]) -> dict[str, Any] | None:
     """``maxTimeMS``: three distinct messages, and code 2 rather than 14.
 
@@ -3202,17 +3354,70 @@ def _bad_value(errmsg: str) -> dict[str, Any]:
 
 
 def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
-    from secantus.storage import DocumentValidationError, GeoExtractError, IndexConflict
+    """``findAndModify``, with the update errors shaped the way mongod shapes them.
+
+    Update failures used to escape to ``dispatch``'s generic handler, which
+    reported every one of them as ``14 TypeMismatch`` -- so a client saw
+    TypeMismatch for an unknown modifier (mongod: 9) and for a ``_id`` change
+    (mongod: 66), and the driver-canonical handling keyed on those codes never
+    fired. The ``update`` command has had this mapping for a while; this is the
+    same rule, plus the execution-error wrapper that ``findAndModify``
+    (uniquely, on 6.0.16) puts in front of its message.
+    """
+    try:
+        return _find_and_modify_impl(doc, ctx)
+    except UpdateError as exc:
+        msg = str(exc)
+        code = exc.code if exc.code is not None else (66 if "immutable field" in msg else 9)
+        if exc.exec_error:
+            msg = f"Plan executor error during findAndModify :: caused by :: {msg}"
+        return {"ok": 0.0, "errmsg": msg, "code": code, "codeName": _code_name_for(code)}
+
+
+def _find_and_modify_impl(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    from secantus.storage import BadHint, DocumentValidationError, GeoExtractError, IndexConflict
 
     wc_err = _validate_write_concern(doc)
     if wc_err is not None:
         return wc_err
-    _err = _require_bool_or_number_bson_field(doc.get("upsert"), "findAndModify.upsert")
+    _err = _unknown_find_and_modify_field(doc)
     if _err is not None:
         return _err
+    # ``new`` and ``remove`` take the same bool-or-number rule as ``upsert``
+    # (probed 6.0.16: ``new: 1`` / ``1.5`` / ``null`` accepted, ``new: "yes"``
+    # / ``[1]`` / ``{}`` rejected). ``new`` was not checked at all, so a
+    # string went through Python's truthiness and ``new: "no"`` returned the
+    # POST-image -- the opposite of what the word says, with no error.
+    for _bool_field in ("upsert", "new", "remove"):
+        _err = _require_bool_or_number_bson_field(
+            doc.get(_bool_field), f"findAndModify.{_bool_field}"
+        )
+        if _err is not None:
+            return _err
     _err = _require_object_bson_field(doc.get("let"), "findAndModify.let")
     if _err is not None:
         return _err
+    _err = _validate_array_filters_field(doc, "arrayFilters", "findAndModify.arrayFilters")
+    if _err is not None:
+        return _err
+    # ``hint`` was accepted and then dropped on the floor, so a caller who
+    # hinted an index that does not exist got a silent collection scan and an
+    # ``ok: 1`` reply. mongod rejects it (BadValue), and honours it when it
+    # resolves. ``$natural`` is NOT a valid findAndModify hint -- probed
+    # 6.0.16, where it draws the same "does not correspond to an existing
+    # index" rejection as any other unknown name, unlike ``find``.
+    hint = doc.get("hint")
+    if hint is not None and not isinstance(hint, (str, Mapping)):
+        return {
+            "ok": 0.0,
+            "errmsg": "Hint must be a string or an object",
+            "code": 9,
+            "codeName": "FailedToParse",
+        }
+    if isinstance(hint, Mapping) and not hint:
+        hint = None  # ``hint: {}`` means "no hint", as it does on find
+    if hint == "$natural" or (isinstance(hint, Mapping) and list(hint) == ["$natural"]):
+        return _bad_value("hint provided does not correspond to an existing index")
     coll = doc["findAndModify"]
     oplog_err = _reject_oplog_rs_write(ctx, coll, "findAndModify")
     if oplog_err is not None:
@@ -3224,9 +3429,9 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
         _err = _require_object_bson_field(doc.get(_fld), f"findAndModify.{_fld}")
         if _err is not None:
             return _err
-    return_new = bool(doc.get("new", False))
-    upsert = bool(doc.get("upsert", False))
-    is_remove = bool(doc.get("remove", False))
+    return_new = _bson_flag(doc.get("new"))
+    upsert = _bson_flag(doc.get("upsert"))
+    is_remove = _bson_flag(doc.get("remove"))
     update = doc.get("update")
     # ``let`` user-vars threaded into the filter / update predicate.
     let = _resolve_let_vars(doc.get("let"))
@@ -3234,7 +3439,7 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
     # the update's ``$[<id>]`` positional refs resolve against. Used
     # by mongo-java-driver's ``findOneAndUpdate-arrayFilters``
     # tests — without plumbing through, the update raises
-    # ``UpdateError: arrayFilters has no entry for identifier 'i'``
+    # ``No array filter found for identifier 'i' in path '…'``
     # before reaching the actual array element.
     array_filters = doc.get("arrayFilters")
     collation = doc.get("collation")
@@ -3296,9 +3501,22 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
     # (``return_post_images``), never from a re-``find`` a concurrent writer
     # could land in front of.
     while True:
-        candidates = ctx.storage.find_matching(
-            ctx.db_name, coll, query, sort=sort, limit=1, let=let, collation=collation
-        )
+        try:
+            candidates = ctx.storage.find_matching(
+                ctx.db_name,
+                coll,
+                query,
+                sort=sort,
+                limit=1,
+                hint=hint,
+                let=let,
+                collation=collation,
+            )
+        except BadHint as exc:
+            # Same shape ``find`` and ``count`` already return for a hint that
+            # names no index. (mongod prefixes this with a dump of the parsed
+            # plan; we emit the causal sentence only -- see tasks/backlog.md.)
+            return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
 
         if not candidates:
             if upsert and not is_remove:
@@ -7656,11 +7874,18 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # AggregateError: 40324 for an unrecognized pipeline stage —
         # which leaves ``code`` as None when unset, hence the ``or``);
         # 14 TypeMismatch stays the default.
+        # ``codeName`` follows the ``code`` rather than being pinned to
+        # TypeMismatch. An exception that named its own code (9 FailedToParse,
+        # 66 ImmutableField, 40 ConflictingUpdateOperators) was reported with
+        # that code and the WRONG name -- ``code=9 codeName=TypeMismatch``,
+        # a pair mongod never sends. Only the default (no code at all) is
+        # 14/TypeMismatch.
+        _exc_code = getattr(exc, "code", None) or 14
         result = {
             "ok": 0.0,
             "errmsg": str(exc),
-            "code": getattr(exc, "code", None) or 14,
-            "codeName": getattr(exc, "code_name", None) or "TypeMismatch",
+            "code": _exc_code,
+            "codeName": getattr(exc, "code_name", None) or _code_name_for(_exc_code),
         }
     except Exception as exc:
         if _is_wt_rollback(exc):

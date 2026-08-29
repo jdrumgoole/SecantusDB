@@ -45,7 +45,7 @@ from secantus.geo_index import (
     s2_doc_covering,
     s2_query_covering,
 )
-from secantus.paths import get_path, get_path_values
+from secantus.paths import get_path, get_path_values, set_path
 from secantus.projection import apply_projection_batch
 from secantus.query import matches
 from secantus.sortkey import (
@@ -600,6 +600,28 @@ def _is_operator_expr(v: Any) -> bool:
     a literal subdocument equality value (``{f: 1, f2: 2}``). Used by the
     upsert seed extraction to tell the two apart."""
     return isinstance(v, dict) and len(v) > 0 and all(k.startswith("$") for k in v)
+
+
+def _order_upserted_doc(new: dict[str, Any], seeded: list[str]) -> dict[str, Any]:
+    """mongod's field order for an upserted document (probed 6.0.16).
+
+    ``_id`` first, then the fields seeded from the query's equalities in
+    field-name order, then whatever the update added, also in field-name
+    order. ``seeded`` is the query-derived top-level key list.
+
+    Ours came out in "query order, then update-document order, then ``_id``
+    appended last", so a ``findAndModify`` upsert handed the client a document
+    whose bytes mongod would never emit -- ``_id`` at the END, most visibly.
+    """
+    rest = {k: v for k, v in new.items() if k != "_id"}
+    from_query = sorted(k for k in rest if k in seeded)
+    from_update = sorted(k for k in rest if k not in seeded)
+    ordered: dict[str, Any] = {}
+    if "_id" in new:
+        ordered["_id"] = new["_id"]
+    for k in from_query + from_update:
+        ordered[k] = rest[k]
+    return ordered
 
 
 def _id_key(doc_id: Any) -> bytes:
@@ -5858,7 +5880,15 @@ class Storage:
                     break
             if matched == 0 and upsert:
                 seed: dict[str, Any] = {}
-                for k, v in filter.items():
+                # Sorted, because mongod's upserted document is ordered
+                # ``_id`` first, then the query-seeded fields in field-name
+                # order, then the update-applied ones in field-name order
+                # (probed 6.0.16: query ``{n: 1, m: 2}`` with ``$set:
+                # {z: 3, a: 4}`` upserts ``{_id, m, n, a, z}``). BSON field
+                # order is on the wire, so a client comparing raw bytes --
+                # mongo-php-library's codec tests do -- sees the difference.
+                for k in sorted(filter):
+                    v = filter[k]
                     # Seed bare-equality predicates into the upserted doc.
                     # A dict value is only skipped when it's an OPERATOR
                     # expression ({$gt: 5}); a literal subdocument value
@@ -5868,10 +5898,18 @@ class Storage:
                     # generating a fresh ObjectId instead.
                     if k.startswith("$") or _is_operator_expr(v):
                         continue
-                    seed[k] = v
+                    # A DOTTED equality names a nested path, and mongod
+                    # builds the nesting: ``{"a.b.c": 5}`` upserts
+                    # ``{a: {b: {c: 5}}}``. Assigning ``seed[k] = v`` stored a
+                    # literal key with dots in it — a document mongod cannot
+                    # produce and most drivers refuse to send, which then
+                    # never matched the very query that created it.
+                    set_path(seed, k, v)
+                seeded = list(seed)
                 new = apply_update(seed, update, is_upsert=True, array_filters=array_filters)
                 if "_id" not in new:
                     new["_id"] = bson.ObjectId()
+                new = _order_upserted_doc(new, seeded)
                 if validator is not None and not matches(new, validator):
                     raise DocumentValidationError(new.get("_id"))
                 upserted_id = new["_id"]
