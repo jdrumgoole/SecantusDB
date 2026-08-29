@@ -9,6 +9,8 @@ first in the path to prove resolution walks past it).
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from secantus.sql.engine import run_sql
@@ -72,16 +74,34 @@ class TestResolution:
         db("SET search_path TO s2, s1, public")
         assert db("SELECT a FROM t") == [(2,)]
 
-    def test_public_still_shadows_a_path_schema(self, db):
-        """A name that already resolves is never redirected — the pass only
-        consults the path when the bare key misses."""
+    def test_the_path_order_decides_which_schema_wins(self, db):
+        """Postgres walks search_path IN ORDER and takes the first schema that
+        holds the name.
+
+        This test used to be `test_public_still_shadows_a_path_schema` and
+        asserted the opposite — that a name resolving in `public` is never
+        redirected — which pinned the limitation rather than the behaviour.
+        Probed against PostgreSQL 14: with `s1, public` the answer is `s1.t`,
+        with `public, s1` it is `public.t`."""
         db("CREATE SCHEMA s1")
         db("CREATE TABLE s1.t(a int)")
         db("INSERT INTO s1.t VALUES (1)")
         db("CREATE TABLE t(a int)")
         db("INSERT INTO t VALUES (99)")
         db("SET search_path TO s1, public")
+        assert db("SELECT a FROM t") == [(1,)]
+        db("SET search_path TO public, s1")
         assert db("SELECT a FROM t") == [(99,)]
+
+    def test_a_relation_off_the_path_is_invisible(self, db):
+        """Not merely lower priority: PG answers `relation "x" does not exist`
+        for a public-only table when public is not on the path."""
+        db("CREATE SCHEMA s1")
+        db("CREATE TABLE onlypub(a int)")
+        db("INSERT INTO onlypub VALUES (9)")
+        db("SET search_path TO s1")
+        with pytest.raises(Exception, match="does not exist"):
+            db("SELECT a FROM onlypub")
 
     def test_unknown_name_still_errors(self, db):
         db("CREATE SCHEMA s1")
@@ -126,19 +146,32 @@ class TestWritesLandInTheResolvedSchema:
 
 
 class TestCreateTargetIsExempt:
-    def test_create_does_not_bind_to_an_existing_relation_on_the_path(self, db):
-        """Postgres creates into the path's first schema; it never resolves a
-        create target onto a same-named relation further along. Without this
-        exemption the CREATE silently aliased s1.t and the INSERT below landed
-        in it."""
+    def test_create_targets_the_paths_first_schema(self, db):
+        """Postgres creates into the path's FIRST schema, so a same-named
+        relation there is a conflict, not something to create alongside.
+
+        The previous version of this test asserted that the CREATE landed in
+        `public` and left `s1.t` alone — which contradicted its own docstring
+        and PostgreSQL, where this errors `relation "t" already exists`
+        (probed 14). Creating into `public` while every READ of the same name
+        resolved to `s1` also split writes from reads."""
         db("CREATE SCHEMA s1")
         db("CREATE TABLE s1.t(a int)")
         db("INSERT INTO s1.t VALUES (1), (2)")
         db("SET search_path TO s1, public")
-        db("CREATE TABLE t(a int)")
-        db("INSERT INTO t VALUES (777)")
-        assert db("SELECT a FROM t") == [(777,)]
-        assert db("SELECT a FROM s1.t ORDER BY a") == [(1,), (2,)]
+        with pytest.raises(Exception, match="already exists"):
+            db("CREATE TABLE t(a int)")
+
+    def test_create_lands_in_the_first_schema_when_free(self, db):
+        db("CREATE SCHEMA s1")
+        db("SET search_path TO s1, public")
+        db("CREATE TABLE fresh(a int)")
+        db("INSERT INTO fresh VALUES (5)")
+        # Readable qualified, and NOT present in public.
+        assert db("SELECT a FROM s1.fresh") == [(5,)]
+        db("SET search_path TO public")
+        with pytest.raises(Exception, match="does not exist"):
+            db("SELECT a FROM fresh")
 
     def test_create_index_target_does_resolve(self, db):
         """CREATE INDEX names an *existing* relation, so it is not exempt."""
@@ -209,3 +242,63 @@ class TestNestedAggregatesAreNotFolded:
         assert db("SELECT max(3)") == [(3,)]
         assert db("SELECT count(*) WHERE 1 = 2") == [(0,)]
         assert db("SELECT max(3) WHERE 1 = 2") == [(None,)]
+
+
+def _pg_oracle():
+    """A live PostgreSQL to check against, or None. Point elsewhere with
+    SECANTUS_PG_ORACLE_DSN."""
+    dsn = os.environ.get(
+        "SECANTUS_PG_ORACLE_DSN", "host=127.0.0.1 port=5432 dbname=postgres user=jdrumgoole"
+    )
+    try:
+        import psycopg
+
+        return psycopg.connect(dsn, autocommit=True, connect_timeout=3)
+    except Exception:
+        return None
+
+
+@pytest.mark.skipif(_pg_oracle() is None, reason="no local PostgreSQL oracle")
+def test_search_path_resolution_matches_real_postgres(db):
+    """The hand-derived expectations above say what we believe; this says what
+    PostgreSQL actually does. Every shape here diverged before 2026-08-29 —
+    ordering was ignored, and a name resolving in `public` could not be
+    redirected at all."""
+    setup = [
+        "DROP SCHEMA IF EXISTS sa CASCADE",
+        "DROP SCHEMA IF EXISTS sb CASCADE",
+        "DROP TABLE IF EXISTS t",
+        "CREATE SCHEMA sa",
+        "CREATE SCHEMA sb",
+        "CREATE TABLE sa.t (a int)",
+        "CREATE TABLE sb.t (a int)",
+        "CREATE TABLE t (a int)",
+        "INSERT INTO sa.t VALUES (1)",
+        "INSERT INTO sb.t VALUES (2)",
+        "INSERT INTO t VALUES (3)",
+    ]
+    shapes = [
+        ["SELECT a FROM t"],
+        ["SET search_path TO sa", "SELECT a FROM t"],
+        ["SET search_path TO sb", "SELECT a FROM t"],
+        ["SET search_path TO sb", "SET search_path TO sa", "SELECT a FROM t"],
+        ["SET search_path TO sa, public", "SELECT a FROM t"],
+        ["SET search_path TO public, sa", "SELECT a FROM t"],
+        ["SET search_path TO sa", "SELECT a FROM public.t"],
+    ]
+    pg = _pg_oracle()
+    assert pg is not None
+    try:
+        for stmt in setup:
+            pg.execute(stmt)
+        for stmt in setup:
+            db(stmt)
+        for shape in shapes:
+            for stmt in shape[:-1]:
+                pg.execute(stmt)
+                db(stmt)
+            theirs = [tuple(r) for r in pg.execute(shape[-1]).fetchall()]
+            ours = db(shape[-1])
+            assert ours == theirs, shape
+    finally:
+        pg.close()

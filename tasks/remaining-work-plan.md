@@ -173,7 +173,7 @@ Every item here was reproduced against an oracle in August 2026.
 | `_pg_expandarray(...).x` type — **still open**; the attempt surfaced a *wider* bug (`unnest` declared `int4` for every array, failing outright on non-int ones) which **is** fixed | returns **text**, PG returns the element type | record-SRF field projection is typed by a path that assigns `any` *before* `_infer_scalar_tag`; finding that path is the work |
 | Write-conflict semantics | second writer gets `40001`; PG blocks and proceeds | clients that treat `40001` as fatal abort |
 | COPY OUT abort | transaction stays `INTRANS`; PG gives `INERROR` | needs interleaved client-abort detection |
-| `SET search_path` | recorded but ignored in name resolution | |
+| ~~`SET search_path`~~ **FIXED 2026-08-29** — order decides, off-path relations are invisible, and CREATE targets the path's first schema | recorded but ignored in name resolution | two tests pinned the old behaviour and were rewritten |
 | Partial-index reflection | `pg_indexes.indexdef` drops the `WHERE` clause | needs a Mongo-filter → SQL-predicate render |
 | `ORDER BY` within one millisecond — **still open**; sub-ms *predicates* are fixed (2026-08-27), the sort tiebreaker is not. Plan's cheapest next item | millisecond-granular | the *other half* of the sub-ms entry; predicates are fixed, sorting needs the companion as a tiebreaker |
 

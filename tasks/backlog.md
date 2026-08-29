@@ -475,6 +475,42 @@ Specific items that were left out of the slice that introduced their feature are
 
   Both servers now 244/244.
 
+- [x] **RESOLVED 2026-08-29 — `SET search_path` is honoured in name
+  resolution.** Phase 1a. It was recorded (`SHOW search_path` was right) and
+  ignored when resolving a bare relation, because the resolver consulted the
+  path ONLY when the bare name missed, and stripped `public` from the path
+  outright. Verified against PostgreSQL 14 across 7 shapes.
+
+  **The first probe nearly declared the entry stale.** With one table named
+  `t`, `SET search_path TO sa; SELECT a FROM t` returns the right row either
+  way. Only a second table of the same name in another schema exposes it — a
+  reminder that a probe which cannot distinguish the two behaviours is not
+  evidence.
+
+  Three behaviours changed, each probed:
+  1. **Order decides.** `sa, public` and `public, sa` now resolve differently.
+  2. **An off-path relation is INVISIBLE**, not lower priority: a public-only
+     table with `search_path TO sa` errors 42P01, where we returned its rows.
+  3. **CREATE targets the path's FIRST schema.** With `s1, public` and `s1.t`
+     present, `CREATE TABLE t` is now `already exists` (42P07). It used to
+     create `public.t` while every READ of that name resolved to `s1.t` --
+     writes and reads landing in different schemas.
+
+  **Two tests pinned the old behaviour and were rewritten**, the class the plan
+  warns about: `test_public_still_shadows_a_path_schema` asserted the
+  limitation in its name, and `test_create_does_not_bind_to_an_existing_relation
+  _on_the_path` asserted something its own docstring contradicted.
+
+- [ ] **OPEN — an unresolvable bare relation is named with the schema we tried,
+  not the name the user wrote.** Fallout from the search_path work above, and
+  the only part of it that still diverges. PG says `relation "onlypub" does not
+  exist` / `relation "t" already exists`; we say `"sa.onlypub"` / `"s1.t"`. The
+  CODE is right in both (42P01 / 42P07) and the behaviour is right — this is
+  the relation name inside the message. Cause: resolution qualifies the node so
+  the lookup fails, and `errors.undefined_table` is handed the composed key by
+  five call sites in `executor.py` / `engine.py`. Fixing it means carrying the
+  as-written name to the error, not the resolved one.
+
 - [ ] **OPEN — `test_tls_against_rust_server` flakes on the Windows runner
   (first seen 2026-08-29, PR #1089).** `storage-engine (windows-latest)` failed
   ONE of 86 tests with `ServerSelectionTimeoutError: No servers found yet,
