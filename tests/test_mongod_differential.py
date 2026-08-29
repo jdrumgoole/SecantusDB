@@ -42,6 +42,66 @@ MONGOD = shutil.which("mongod")
 requires_mongod = pytest.mark.skipif(MONGOD is None, reason="no mongod on PATH")
 
 
+# The mongod series every expectation in this file was probed against. The rest
+# of the codebase is probed the same way -- ``src/secantus/commands.py`` alone
+# cites 6.0.16 in 45 places, including error strings reproduced "verbatim,
+# unbalanced quotes and all".
+PROBED_MONGOD_SERIES = (6, 0)
+
+# Cases whose expected value is a mongod ERROR SURFACE that moved after 6.0.
+#
+# This gate spawns whatever ``mongod`` is on PATH and asserts EXACT equality,
+# so a newer server turns a conformance check into a version diff. Observed
+# 6.0.16 -> 8.2.1, all four families at once:
+#
+#   * negative cursor sizing   51024 Location51024 -> 2 BadValue
+#   * expected-type lists      '[bool, long, int, decimal, double']  (closing
+#                              quote INSIDE the bracket, a real 6.0 quirk)
+#                              -> '[int, decimal, long, bool, double]'
+#                              (well-formed, and reordered)
+#   * update / aggregate       bare message -> wrapped in "Plan executor error
+#     failures                 during update :: caused by :: " and "Executor
+#                              error during aggregate command on namespace: ..."
+#   * null-valued arguments    rejected (10065) -> treated as absent
+#
+# SecantusDB deliberately reproduces the 6.0 forms, so "fixing" these to match a
+# newer server would BREAK the target it is written against. They are therefore
+# skipped, not xfailed: on an unprobed server there is no correct answer to
+# assert, and an xpass on some third version would be just as misleading.
+#
+# The 105 cases NOT listed here are version-stable and keep running everywhere.
+# When adding a case whose expectation is an error code or message text, check
+# it against a second major before assuming it belongs outside this set.
+_VERSION_SENSITIVE_CASES = frozenset(
+    {
+        # negative cursor-sizing values: Location51024 -> BadValue
+        "cursor-find-limit-negative",
+        "cursor-find-skip-negative",
+        "cursor-find-batchsize-negative",
+        "cursor-getmore-batchsize-negative",
+        "cursor-agg-cursor-batchsize-negative",
+        # expected-type list: ordering and the misplaced closing quote
+        "cursor-getmore-batchsize-string",
+        "fam-remove-wrong-type",
+        "fam-new-wrong-type",
+        # executor-error prefixes added after 6.0
+        "updatecmd-cmd-path-not-viable",
+        "update-inc-type-error-message-names-the-doc-id",
+        "update-inc-type-error-dotted-path-names-the-leaf",
+        "update-inc-type-error-on-null-field",
+        "update-inc-type-error-with-objectid-id",
+        "update-mul-type-error-message-names-the-doc-id",
+        "query-densify-non-numeric-field-is-rejected",
+        # null-valued arguments: rejected on 6.0, treated as absent later
+        "fam-arrayfilters-null",
+        "cursor-killcursors-null-cursors",
+        # unknown-field errors name the IDL struct, and it was renamed:
+        # "BSON field 'distinct.zz'" -> "BSON field 'distinctCommandRequest.zz'"
+        "hint-distinct-unknown-field",
+    }
+)
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -76,6 +136,21 @@ def mongod_uri() -> Iterator[str]:
         proc.terminate()
         proc.wait(timeout=30)
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+@pytest.fixture(scope="module")
+def mongod_version(mongod_uri: str) -> tuple[int, int]:
+    """``(major, minor)`` of the mongod this gate actually spawned.
+
+    Read from the running server rather than ``mongod --version`` so it
+    describes the process under test, not whatever else is on PATH.
+    """
+    client = MongoClient(mongod_uri, serverSelectionTimeoutMS=10000)
+    try:
+        version_array = client.admin.command("buildInfo")["versionArray"]
+    finally:
+        client.close()
+    return int(version_array[0]), int(version_array[1])
 
 
 @pytest.fixture(scope="module")
@@ -1234,9 +1309,20 @@ ALL_CASES = (
 
 @requires_mongod
 @pytest.mark.parametrize("kind,case", ALL_CASES, ids=[f"{k}-{c[0]}" for k, c in ALL_CASES])
-def test_matches_mongod(kind, case, secantus_uri: str, mongod_uri: str) -> None:
+def test_matches_mongod(
+    kind, case, secantus_uri: str, mongod_uri: str, mongod_version: tuple[int, int]
+) -> None:
     """SecantusDB must answer exactly what mongod answers."""
     name, seed, op = case
+    case_id = f"{kind}-{name}"
+    if case_id in _VERSION_SENSITIVE_CASES and mongod_version != PROBED_MONGOD_SERIES:
+        probed = ".".join(str(p) for p in PROBED_MONGOD_SERIES)
+        found = ".".join(str(p) for p in mongod_version)
+        pytest.skip(
+            f"{case_id} asserts a mongod {probed} error surface that changed in "
+            f"later servers; this box has mongod {found}. Not a SecantusDB "
+            f"divergence -- see _VERSION_SENSITIVE_CASES."
+        )
     db_name = f"diff_{kind}_{name.replace('-', '_')}"
     ours = _run(secantus_uri, db_name, seed, op)
     theirs = _run(mongod_uri, db_name, seed, op)

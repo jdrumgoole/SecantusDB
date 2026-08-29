@@ -1084,6 +1084,38 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **The error surface is conformant to mongod 6.0, and diverges from 8.x in
+  18 known places (2026-08-29).** `src/secantus/commands.py` alone cites 6.0.16
+  in 45 places, including error strings reproduced *verbatim, unbalanced quotes
+  and all* (`expected types '[bool, long, int, decimal, double']` — mongod 6.0
+  really does put the closing quote inside the bracket). Against mongod **8.2.1**
+  those same surfaces have moved, in four families:
+  - **negative cursor sizing** (`limit` / `skip` / `batchSize` / `getMore
+    .batchSize` / agg `cursor.batchSize`): 6.0 `51024 Location51024` → 8.x
+    `2 BadValue`.
+  - **expected-type lists** (`findAndModify.remove` / `.new`,
+    `getMore.batchSize`): reordered, and the misplaced closing quote fixed.
+  - **executor-error prefixes**: 8.x wraps update failures in `Plan executor
+    error during update :: caused by :: ` and aggregate failures in `Executor
+    error during aggregate command on namespace: <ns> :: caused by :: `.
+  - **null-valued arguments** (`findAndModify.arrayFilters`,
+    `killCursors.cursors`): rejected `10065` on 6.0, treated as *absent* on 8.x.
+  - plus **unknown-field errors** naming the IDL struct:
+    `BSON field 'distinct.zz'` → `'distinctCommandRequest.zz'`.
+
+  `tests/test_mongod_differential.py` spawns whatever `mongod` is on PATH and
+  asserts EXACT equality, so on an 8.x box these read as 18 SecantusDB failures
+  when they are version differences. They are now gated by
+  `_VERSION_SENSITIVE_CASES` + `PROBED_MONGOD_SERIES` and skip with an explicit
+  reason off 6.0; on a 6.0 box every case still runs and asserts. **This hid a
+  real gap twice over:** CI installs mongosh and database-tools but *not*
+  `mongod`, so `@requires_mongod` skips the whole file there — the gate only
+  ever runs on a dev box, and only tells the truth on a 6.0 one.
+  **Decide before it drifts further:** either stay on 6.0 deliberately (and say
+  so in the docs), or retarget to a supported server and update all 45 probe
+  sites. Do not "fix" individual cases to match whatever mongod is local — that
+  silently swaps which server we conform to.
+
 - [x] **Index / query-planning sweep — the worst find of the Phase 2 campaign
   was a WRITE that should not have happened (2026-08-29).** `delete` and
   `update` take a per-statement `hint`; mongod refuses the statement when it
