@@ -244,6 +244,62 @@ Both procedures are managed by skills — they auto-fire on the relevant trigger
 
 `tasks/backlog.md` is the canonical list of commands that are stubbed, features with simplified implementations, and work explicitly deferred from a slice. **Update it whenever you stub something, defer a slice, or discover a limitation. When you fix an item, delete its line.** Future sessions should treat that file as load-bearing — it's the only honest record of where SecantusDB's behaviour diverges from real MongoDB.
 
+## Finding bugs: run it against the oracle, don't reason about the source
+
+Every bug found in the 2026-08 sweeps came from **executing behaviour and
+comparing against a real server**, not from reading code or the backlog. Two
+oracles are on this box and both are cheap: `mongod` on `PATH` (Homebrew
+`@6.0`), and a live PostgreSQL 14 for the SQL side. The standing gate is
+`tests/test_mongod_differential.py` (`pytest -m differential`) — a probe that
+finds something belongs there, or the next session re-finds it.
+
+**Estimates from READING code have been unreliable; estimates from RUNNING it
+have not.** Four cases now, every one wrong in the expensive direction:
+
+- `_pg_expandarray(...).x` was called a planner slice and advised against — the
+  inference already existed, and a wider bug sat one level above it.
+- Two campaigns planned off the backlog text were **already substantially
+  done** when measured (42 of 45 Rust constructs; 2 of 8 SQL claims).
+- `$graphLookup` was written up as "does not recurse at all" and scoped as a
+  possible feature build. It recurses — the fixture happened to put a null on
+  the first hop. The fix was a one-line guard.
+- The missing-vs-null fix was sized as "a sentinel in `expressions.py`, which
+  touches every operator". The sentinel already existed; only the comparison
+  operators failed to use it.
+
+So: **reproduce an item before working it, and size it from a probe.** A
+fixture that is unlucky in one dimension can turn a narrow bug into what looks
+like a week of work.
+
+**Three bug shapes recur often enough to grep for.** Each has produced multiple
+real defects:
+
+- **A user-supplied path used as a dict key** (3 instances: the upsert seed,
+  `$lookup`'s `as`, `$graphLookup`'s `as`). Produces a document with a literal
+  dot in a key — one mongod cannot make, which then fails to match the query
+  that created it. Anything user-supplied that reaches a key needs `set_path`.
+- **A comment justifying behaviour by something other than the oracle**
+  (6 instances). "matching the pure evaluator", "mirrors mongod's `$in: []`
+  semantics", "Python walk returns None → no-op". The benign form cites mongod
+  *and* is right; the malignant form cites the other engine, or asserts a
+  mongod rule that a probe contradicts. One such comment was trusted enough to
+  write a test from, and the test failed against the real server.
+- **Missing conflated with null** (3 instances). `get_path` returns `None` for
+  both; `has_path` is what distinguishes them. mongod's rule differs by
+  language — the *query* language treats them alike (`{a: null}` matches a
+  missing field), the *expression* language does not (`$eq: ["$absent", null]`
+  is false).
+
+**Parity is not correctness.** The Rust parity suites pin the two engines to
+each other, so they are equally satisfied by both being wrong — that has
+happened (`$bucket`, `$densify`, `$stdDev*`). Parity catches drift within
+seconds; only the oracle says which side to move. Use both.
+
+**A green suite number means nothing without its baseline.** A worktree venv
+missing `_secantus_core` silently uncollects ~1700 parity tests and still exits
+0. Compare the count against the last known-good run before trusting it — that
+is the only thing that catches it.
+
 ## CI is load-bearing — failures are serious bugs, not flakes
 
 After every push (to a feature branch via PR — the default — or to `main`), check the corresponding GitHub Actions run and **resolve any failures before moving on**. CI is the source of truth — it catches cold-cache races, cross-platform / cross-Python drift, and missing-CI-extra gaps that local-only testing misses. Procedure (`gh run list`/`watch`/`view --log-failed`), the docs-only `paths-ignore` exception (markdown / LICENSE / `docs/**` commits skip CI by design), and the recurring-failure-pattern catalog (xdist install-state races, per-platform sysconf, `pytest-subtests` outcome accounting) all live in `/ci-check`. Add new patterns to that skill as they show up. **Watch the PR's CI run, not `main`'s** — with the branch+PR flow (see "Conventions" below) each branch is its own CI lane, so a parallel session's push can no longer cancel your run; a `cancelled` conclusion now means *you* superseded it with a newer push to the same branch.
