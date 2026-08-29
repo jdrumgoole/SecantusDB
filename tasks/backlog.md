@@ -4039,23 +4039,30 @@ shared storage engine or building large new protocol subsystems:
      would need it in the group key to avoid merging rows that differ only in
      microseconds.
 
-     **Measured 2026-08-29 while fixing ORDER BY — three concrete cases, and
-     one is silent wrong data rather than lost precision:**
+     **min / max / ordered aggregates — FIXED 2026-08-29.** These are pipeline
+     accumulators, so no Python-side change reached them: `min(t)` answered
+     `.123000` for a stored `.123456` — a timestamp that was never stored, not
+     merely a lost ordering. They now accumulate a sortable composite
+     `{__subms_d, __subms_u}` (`subms.composite_expr`, defaulted with `$ifNull`
+     so a whole-millisecond row is still comparable) which the executor merges
+     back. Covers `min` / `max` including `FILTER`, and the `{v, k}` ordered
+     push behind `array_agg(x ORDER BY t)` / `string_agg`, on both the
+     single-table and join paths.
 
-         min(t) / max(t)                 return .123000 for a stored .123456
-         array_agg(id ORDER BY t)        orders at millisecond granularity
-         string_agg(id, ',' ORDER BY t)  same
+     **HAVING had to move with it, and this is the part worth remembering.**
+     `HAVING min(t) > '…'` compares against the accumulator's output, so a
+     composite there needs the LITERAL lowered to the same shape
+     (`subms.composite_cmp_filter`). Without that the composite *regressed* the
+     one HAVING shape that used to work — `min(t) = '…122000'` was right only
+     because its literal happened to land on a whole millisecond. Measured
+     before and after across five operators: 3 were already wrong, 1 was right
+     by luck, and all 5 are right now. A fix in this area must re-measure
+     HAVING, not assume it.
 
-     All three are **pipeline accumulators** (`$min` / `$max` / the `{v, k}`
-     `$push` pair), so they run inside the Mongo aggregation over the stored
-     date and never see the companion — which is why the Python-side fix to
-     ORDER BY does not reach them. Closing this means the pushdown carrying the
-     companion, e.g. accumulating over a composite `{d: "$t", u: "$__us_t"}`
-     and unwrapping in the executor; note BSON document comparison ordering
-     makes the missing-companion case (whole-millisecond rows) the subtle part.
-     `min`/`max` should be treated as the priority: a query answering a
-     timestamp that was never stored is worse than one answering rows in the
-     wrong order.
+     Still open in this class: **GROUP BY on a timestamp** merges rows that
+     differ only in microseconds (the group key is still the truncated date),
+     and JOIN / DISTINCT projections still drop the companion.
+
   3. **COPY and the Rust server** don't write the companion — they truncate, as
      before. Not wrong, just not precise.
 

@@ -331,3 +331,134 @@ def test_subms_order_by_matches_real_postgres(ordered_table):
             assert [r[0] for r in ours] == [r[0] for r in theirs], f"ORDER BY t{suffix}"
     finally:
         pg.close()
+
+
+# ---------------------------------------------------------------------------
+# Aggregates. A BSON date cannot carry the remainder, so `min` / `max` and the
+# ordered-aggregate sort keys accumulate a `{__subms_d, __subms_u}` composite
+# inside the pipeline and the executor merges it back.
+#
+# `min(t)` returning a whole millisecond was the worst of this family: not a
+# lost ordering but a TIMESTAMP THAT WAS NEVER STORED.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def grouped_table(storage, session):
+    run(storage, session, "CREATE TABLE agg (id int, g text, t timestamp)")
+    for i, g, v in [
+        (1, "a", "2026-08-18 12:00:00.123900"),
+        (2, "a", "2026-08-18 12:00:00.123100"),
+        (3, "b", "2026-08-18 12:00:00.123500"),
+        (4, "b", "2026-08-18 12:00:00.122000"),
+    ]:
+        run(storage, session, f"INSERT INTO agg VALUES ({i}, '{g}', '{v}')")
+    run(storage, session, "INSERT INTO agg VALUES (5, 'c', NULL)")
+    return storage, session
+
+
+def test_min_max_keep_microseconds(grouped_table):
+    storage, session = grouped_table
+    rows = run(storage, session, "SELECT g, min(t), max(t) FROM agg GROUP BY g ORDER BY g").rows
+    assert [(r[0], r[1] and r[1].microsecond, r[2] and r[2].microsecond) for r in rows] == [
+        ("a", 123100, 123900),
+        ("b", 122000, 123500),
+        ("c", None, None),
+    ]
+
+
+def test_min_of_an_all_null_group_is_null(grouped_table):
+    """The composite must be NULL for a NULL row, not a document wrapping one --
+    otherwise the accumulator stops skipping it and every group gains a value."""
+    storage, session = grouped_table
+    rows = run(storage, session, "SELECT min(t) FROM agg WHERE g = 'c'").rows
+    assert rows == [(None,)]
+
+
+def test_min_with_filter_keeps_microseconds(grouped_table):
+    storage, session = grouped_table
+    rows = run(
+        storage,
+        session,
+        "SELECT g, min(t) FILTER (WHERE id <> 2) FROM agg GROUP BY g ORDER BY g",
+    ).rows
+    assert [(r[0], r[1] and r[1].microsecond) for r in rows] == [
+        ("a", 123900),
+        ("b", 122000),
+        ("c", None),
+    ]
+
+
+def test_array_agg_orders_by_microseconds(grouped_table):
+    storage, session = grouped_table
+    rows = run(
+        storage, session, "SELECT g, array_agg(id ORDER BY t) FROM agg GROUP BY g ORDER BY g"
+    ).rows
+    assert [(r[0], r[1]) for r in rows] == [("a", [2, 1]), ("b", [4, 3]), ("c", [5])]
+
+
+def test_string_agg_orders_by_microseconds(grouped_table):
+    storage, session = grouped_table
+    rows = run(
+        storage,
+        session,
+        "SELECT g, string_agg(id::text, ',' ORDER BY t) FROM agg GROUP BY g ORDER BY g",
+    ).rows
+    assert [(r[0], r[1]) for r in rows] == [("a", "2,1"), ("b", "4,3"), ("c", "5")]
+
+
+@pytest.mark.parametrize(
+    "predicate,expected",
+    [
+        ("min(t) > '2026-08-18 12:00:00.123000'", ["a"]),
+        ("min(t) >= '2026-08-18 12:00:00.123100'", ["a"]),
+        ("min(t) < '2026-08-18 12:00:00.123100'", ["b"]),
+        ("min(t) = '2026-08-18 12:00:00.122000'", ["b"]),
+        ("max(t) < '2026-08-18 12:00:00.123900'", ["b"]),
+    ],
+)
+def test_having_on_min_max_is_microsecond_exact(grouped_table, predicate, expected):
+    """HAVING compares against the accumulator's output, so the literal has to be
+    lowered into the composite shape too. Three of these five were already wrong
+    before the composite existed, and `= ` was right ONLY because its literal
+    happened to land on a whole millisecond -- so this parametrisation is what
+    keeps the composite from regressing the one case that used to work."""
+    storage, session = grouped_table
+    rows = run(storage, session, f"SELECT g FROM agg GROUP BY g HAVING {predicate} ORDER BY g").rows
+    assert [r[0] for r in rows] == expected
+
+
+def test_order_by_an_aggregate_still_works(grouped_table):
+    """`ORDER BY min(t)` sorts on the accumulator output; it must see a merged
+    datetime, not the raw composite."""
+    storage, session = grouped_table
+    rows = run(storage, session, "SELECT g FROM agg GROUP BY g ORDER BY min(t)").rows
+    assert [r[0] for r in rows] == ["b", "a", "c"]
+
+
+@pytest.mark.skipif(_pg_oracle() is None, reason="no local PostgreSQL oracle")
+def test_subms_aggregates_match_real_postgres(grouped_table):
+    storage, session = grouped_table
+    pg = _pg_oracle()
+    assert pg is not None
+    try:
+        pg.execute("drop table if exists subms_agg_oracle")
+        pg.execute("create table subms_agg_oracle (id int, g text, t timestamp)")
+        for i, g, v in [
+            (1, "a", "2026-08-18 12:00:00.123900"),
+            (2, "a", "2026-08-18 12:00:00.123100"),
+            (3, "b", "2026-08-18 12:00:00.123500"),
+            (4, "b", "2026-08-18 12:00:00.122000"),
+            (5, "c", None),
+        ]:
+            pg.execute("insert into subms_agg_oracle values (%s, %s, %s)", (i, g, v))
+        for sql in (
+            "select g, min(t), max(t) from {} group by g order by g",
+            "select g, array_agg(id order by t) from {} group by g order by g",
+            "select g from {} group by g having min(t) > '2026-08-18 12:00:00.123000' order by g",
+        ):
+            ours = [tuple(r) for r in run(storage, session, sql.format("agg")).rows]
+            theirs = [tuple(r) for r in pg.execute(sql.format("subms_agg_oracle")).fetchall()]
+            assert ours == theirs, sql
+    finally:
+        pg.close()
