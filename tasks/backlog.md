@@ -866,6 +866,58 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [x] **Index / query-planning sweep — the worst find of the Phase 2 campaign
+  was a WRITE that should not have happened (2026-08-29).** `delete` and
+  `update` take a per-statement `hint`; mongod refuses the statement when it
+  names no index (`n: 0` plus a writeError) rather than scanning. Both commands
+  ignored the field entirely and **performed the write**. Every other
+  hint-bearing command — `find`, `count`, `aggregate` — already rejected it, so
+  this was specifically the two write paths.
+  Also fixed: `explain` did not validate a hint (the one command you run to
+  *check* one); `explain` **fabricated** a plausible `COLLSCAN` plan with
+  `ok: 1` for an unknown command, an empty document, or a non-document
+  argument; `{$natural: -1}` did not reverse the scan (both directions
+  resolved to the same token, so reverse insertion order silently returned
+  forward order); `distinct` accepted any field and ignored it; and
+  `explain.verbosity` conflated a wrong *type* with an invalid *enum value*.
+  **A caution about this surface's raw numbers.** 30 of 32 probed shapes
+  "diverged", but most of that is `explain` OUTPUT SHAPE, and one case is not a
+  defect at all: we pick the `a_-1` index where mongod picks `a_1` for
+  `{a: 5}`. Both serve the query and return identical documents — that is
+  mongod's cost model, which this project has never claimed to reproduce.
+  Six behavioural items were the real content.
+- [ ] **`explain`'s stage vocabulary is flat.** mongod wraps the scan in the
+  stages that describe the query — `SORT` (with `sortPattern` / `memLimit` /
+  `type`), `LIMIT` (`limitAmount`), `SKIP` (`skipAmount`),
+  `PROJECTION_SIMPLE` (`transformBy`) — reports `direction` on `COLLSCAN`,
+  uses dedicated `IDHACK` / `COUNT_SCAN` / `DISTINCT_SCAN` +
+  `PROJECTION_COVERED` stages for `_id` equality, `count` and `distinct`,
+  populates `rejectedPlans`, normalises a multi-field `parsedQuery` into
+  `$and`, and carries top-level `explainVersion` / `serverParameters`. We emit
+  a single `COLLSCAN` / `FETCH(IXSCAN)` node plus a `filter` key mongod does
+  not put there, and `rejectedPlans` is always empty. **Consequence worth
+  naming:** a client reading `explain` to ask "is my sort served by an index?"
+  cannot tell, because the `SORT` stage that would answer it is never emitted.
+  Deliberately left whole rather than half-built — a partial stage tree
+  misleads more than a flat one. The IXSCAN node also omits `isPartial` /
+  `isSparse` / `isUnique`, which are cheap and could land first.
+- [ ] **`hint: "$natural"` as a STRING is accepted; mongod takes only the
+  document form** (`{$natural: 1}` / `{$natural: -1}`) and rejects the string
+  with `hint provided does not correspond to an existing index`. Ours is a
+  documented convenience (`docs/feature-comparison.md`) with several tests, and
+  pymongo's `.hint("$natural")` produces exactly that string — so a user doing
+  the natural thing gets an error from real MongoDB and a scan from us.
+  Recorded rather than changed: removing it is a user-visible break of a
+  documented feature, which is Joe's call, not a silent fix.
+- [ ] **`distinct.hint` is accepted although mongod 6.0.16 rejects it**
+  (`BSON field 'distinct.hint' is an unknown field.`). A later MongoDB release
+  added a `hint` option to `distinct`, so a current driver may legitimately
+  send it, and accepting is the safe direction for a field whose status changed
+  between versions. The unknown-field rejection added alongside this is probed
+  with an always-unknown field instead, so the differential gate does not
+  depend on which mongod a lane happens to have — see the two version splits
+  recorded below.
+
 - [x] **Cursor / `getMore` / `killCursors` argument sweep — 22 of 51 shapes
   diverged, four of them CRASHES, all fixed (2026-08-29).** Phase 2's second
   surface. The crashes: `getMore` with a string cursor id or a string

@@ -1068,12 +1068,167 @@ CURSOR_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ),
 ]
 
+
+def _write_hint(db: Database, cmd: dict) -> str:
+    """A write command's reply plus the surviving documents.
+
+    The point is the DOCUMENTS: `delete` / `update` used to ignore an
+    unresolvable hint and perform the write, where mongod refuses the
+    statement. The writeError's message carries mongod's planner dump, which we
+    do not reproduce (see tasks/backlog.md), so only its index and code are
+    compared -- the behaviour, not the prose.
+    """
+    reply = dict(db.command(cmd))
+    out = {k: v for k, v in reply.items() if k in ("n", "nModified")}
+    out["writeErrors"] = [
+        {"index": w.get("index"), "code": w.get("code")} for w in reply.get("writeErrors", [])
+    ]
+    out["docs"] = sorted(d["_id"] for d in db.c.find())
+    return repr(out)
+
+
+HINT_SEED = [{"_id": i, "a": i} for i in range(1, 6)]
+
+
+def _with_index(op):
+    """Create `a_1` before running `op` -- these cases need a resolvable hint
+    to exist so an UNresolvable one is the only variable."""
+
+    def wrapped(db: Database) -> object:
+        db.c.create_index([("a", 1)], name="a_1")
+        return op(db)
+
+    return wrapped
+
+
+# Hint honouring and explain's error handling. The find that matters here is a
+# WRITE that should not have happened: `delete` / `update` ignored their
+# per-statement `hint` and performed the write where mongod refuses the
+# statement.
+HINT_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    (
+        "delete-unresolvable-hint-does-not-delete",
+        HINT_SEED,
+        _with_index(
+            lambda db: _write_hint(
+                db, {"delete": "c", "deletes": [{"q": {}, "limit": 1, "hint": "nope"}]}
+            )
+        ),
+    ),
+    (
+        "update-unresolvable-hint-does-not-update",
+        HINT_SEED,
+        _with_index(
+            lambda db: _write_hint(
+                db,
+                {"update": "c", "updates": [{"q": {}, "u": {"$set": {"z": 1}}, "hint": "nope"}]},
+            )
+        ),
+    ),
+    (
+        "delete-resolvable-hint-still-deletes",
+        HINT_SEED,
+        _with_index(
+            lambda db: _write_hint(
+                db, {"delete": "c", "deletes": [{"q": {}, "limit": 1, "hint": "a_1"}]}
+            )
+        ),
+    ),
+    (
+        "unordered-batch-continues-past-a-bad-hint",
+        HINT_SEED,
+        _with_index(
+            lambda db: _write_hint(
+                db,
+                {
+                    "delete": "c",
+                    "ordered": False,
+                    "deletes": [
+                        {"q": {"_id": 1}, "limit": 1, "hint": "nope"},
+                        {"q": {"_id": 2}, "limit": 1},
+                    ],
+                },
+            )
+        ),
+    ),
+    # $natural direction.
+    (
+        "reverse-natural-hint",
+        HINT_SEED,
+        lambda db: [
+            d["_id"]
+            for d in db.command({"find": "c", "filter": {}, "hint": {"$natural": -1}})["cursor"][
+                "firstBatch"
+            ]
+        ],
+    ),
+    (
+        "forward-natural-hint",
+        HINT_SEED,
+        lambda db: [
+            d["_id"]
+            for d in db.command({"find": "c", "filter": {}, "hint": {"$natural": 1}})["cursor"][
+                "firstBatch"
+            ]
+        ],
+    ),
+    (
+        "sort-beats-reverse-natural",
+        HINT_SEED,
+        lambda db: [
+            d["_id"]
+            for d in db.command(
+                {"find": "c", "filter": {}, "hint": {"$natural": -1}, "sort": {"a": 1}}
+            )["cursor"]["firstBatch"]
+        ],
+    ),
+    # explain's error handling -- it used to FABRICATE a plan for these.
+    (
+        "explain-unknown-command",
+        HINT_SEED,
+        lambda db: _cursor_cmd(db, {"explain": {"nosuchcmd": "c"}, "verbosity": "queryPlanner"}),
+    ),
+    (
+        "explain-empty-command",
+        HINT_SEED,
+        lambda db: _cursor_cmd(db, {"explain": {}, "verbosity": "queryPlanner"}),
+    ),
+    (
+        "explain-non-document",
+        HINT_SEED,
+        lambda db: _cursor_cmd(db, {"explain": 5, "verbosity": "queryPlanner"}),
+    ),
+    (
+        "explain-verbosity-wrong-type",
+        HINT_SEED,
+        lambda db: _cursor_cmd(db, {"explain": {"find": "c"}, "verbosity": 5}),
+    ),
+    (
+        "explain-verbosity-bad-enum",
+        HINT_SEED,
+        lambda db: _cursor_cmd(db, {"explain": {"find": "c"}, "verbosity": "nope"}),
+    ),
+    # distinct's unknown fields. Probed with an ALWAYS-unknown name rather than
+    # `hint`, whose accepted/rejected status differs by mongod version.
+    (
+        "distinct-unknown-field",
+        HINT_SEED,
+        lambda db: _cursor_cmd(db, {"distinct": "c", "key": "a", "zz": 1}),
+    ),
+    (
+        "distinct-still-works",
+        HINT_SEED,
+        lambda db: sorted(db.command({"distinct": "c", "key": "a"})["values"]),
+    ),
+]
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
     + [("fam", c) for c in FAM_CASES]
     + [("updatecmd", c) for c in UPDATE_CMD_CASES]
     + [("cursor", c) for c in CURSOR_CASES]
+    + [("hint", c) for c in HINT_CASES]
 )
 
 
