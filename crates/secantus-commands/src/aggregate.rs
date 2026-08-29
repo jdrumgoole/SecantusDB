@@ -53,6 +53,7 @@
 
 use bson::{doc, Bson, Document};
 
+use crate::argtypes;
 use crate::find::split_docs_into_cursor;
 use crate::util::{
     as_i64, bool_field, collation_of, command_error, decode_docs, decode_docs_minimal, encode_docs,
@@ -63,6 +64,14 @@ use secantus_core::collation::Collation;
 
 /// `aggregate` — run a pipeline and return a cursor over the results.
 pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    // `cursor` means "missing or an object" literally: an explicit `cursor: null`
+    // is rejected where an absent one is fine. `let` is the BSON-field family.
+    argtypes::require_cursor_object(doc)?;
+    argtypes::require_object(doc, "let", "aggregate.let")?;
+    if let Some(bson::Bson::Document(c)) = doc.get("cursor") {
+        argtypes::require_number(c, "batchSize", "cursor.batchSize")?;
+    }
+    argtypes::require_max_time_ms(doc)?;
     // `aggregate: <coll>` (string) or `aggregate: 1` (collectionless).
     let coll = match doc.get("aggregate") {
         Some(Bson::String(s)) => Some(s.clone()),
@@ -84,6 +93,18 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // engine fallback produces. Parse-time, like the stage-name check.
     if let Err(e) = validate_project_exprs(&pipeline) {
         return Ok(e.into_reply());
+    }
+    // A wrong-TYPED stage spec: name it with mongod's own code rather than
+    // letting the engine's generic `Fallback` surface as BadValue (2). Seven
+    // stages, seven codes -- see `crate::argtypes::stage_spec_error`.
+    if let Some((code, errmsg)) = argtypes::stage_spec_error(&pipeline) {
+        // 9 is FailedToParse; the rest are mongod's anonymous `Location<n>` codes.
+        let code_name = if code == 9 {
+            "FailedToParse".to_string()
+        } else {
+            format!("Location{code}")
+        };
+        return Ok(CommandError::new(code, code_name, errmsg).into_reply());
     }
 
     // Inline `explain: true` on the aggregate command (the legacy flag, distinct

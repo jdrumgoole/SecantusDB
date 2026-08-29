@@ -22,11 +22,16 @@
 
 use bson::{doc, Bson, Document};
 
+use crate::argtypes;
 use crate::util::{bool_field, collation_of, command_error, doc_field, resolve_let_vars};
 use crate::{CommandContext, CommandError, HandlerResult, StorageError};
 
 /// `findAndModify` / `findandmodify`.
 pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    // `upsert` takes a bool OR any number here, unlike `update.updates.multi`.
+    argtypes::require_bool_or_number(doc, "upsert", "findAndModify.upsert")?;
+    argtypes::require_object(doc, "let", "findAndModify.let")?;
+    argtypes::require_max_time_ms(doc)?;
     let coll = match doc
         .get("findAndModify")
         .or_else(|| doc.get("findandmodify"))
