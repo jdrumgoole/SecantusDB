@@ -4059,9 +4059,25 @@ shared storage engine or building large new protocol subsystems:
      by luck, and all 5 are right now. A fix in this area must re-measure
      HAVING, not assume it.
 
-     Still open in this class: **GROUP BY on a timestamp** merges rows that
-     differ only in microseconds (the group key is still the truncated date),
-     and JOIN / DISTINCT projections still drop the companion.
+     **GROUP BY — FIXED 2026-08-29.** The group key was the truncated date, so
+     rows differing only in microseconds merged: three distinct times became two
+     groups, `count(*)` answered 3 where PG answers 2 and 1, `sum(id)` answered
+     6 where PG answers 4 and 2, and the emitted key was `.123000` — a time no
+     row held. So the aggregate VALUES were wrong, not just the key. The
+     `$group` `_id` now carries the composite (`_group_key_expr`, applied at the
+     four table-resolved and two join-resolved sites) and the executor unwraps
+     it one level into `_id`. **HAVING over a group key needed the same literal
+     lowering** as the min/max case — the gate is now "min/max accumulator OR
+     group-key column". Eight grouped shapes measured against PG: all eight were
+     wrong before, all eight right now.
+
+     **Still open: `SELECT DISTINCT` on a timestamp**, and it is BOTH halves —
+     two rows at `.123100` and `.123500` come back as ONE row reading `.123000`.
+     It is a third route: neither the Python-side dedup nor the grouped-output
+     dedup, but a projection that drops the companion before the dedup ever
+     runs, so neither the `scope` fix nor the group-key fix reaches it. Closing
+     it means the projection carrying the companion through to the dedup key.
+     JOIN / DISTINCT projections dropping the companion is the same root.
 
   3. **COPY and the Rust server** don't write the companion — they truncate, as
      before. Not wrong, just not precise.

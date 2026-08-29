@@ -462,3 +462,98 @@ def test_subms_aggregates_match_real_postgres(grouped_table):
             assert ours == theirs, sql
     finally:
         pg.close()
+
+
+# ---------------------------------------------------------------------------
+# GROUP BY. The group KEY was the truncated date, so rows differing only in
+# microseconds merged into one group -- which makes the aggregate values over
+# those groups wrong, not merely the key.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def keyed_table(storage, session):
+    run(storage, session, "CREATE TABLE gk (id int, t timestamp)")
+    for i, v in [
+        (1, "2026-08-18 12:00:00.123100"),
+        (2, "2026-08-18 12:00:00.123500"),
+        (3, "2026-08-18 12:00:00.123100"),
+        (4, "2026-08-18 12:00:00.122000"),
+    ]:
+        run(storage, session, f"INSERT INTO gk VALUES ({i}, '{v}')")
+    return storage, session
+
+
+def test_group_by_timestamp_does_not_merge_microseconds(keyed_table):
+    """Three distinct times used to collapse into two groups -- so `count(*)`
+    answered 3 where Postgres answers 2 and 1, and the emitted key was
+    `.123000`, a time no row held."""
+    storage, session = keyed_table
+    rows = run(storage, session, "SELECT t, count(*) FROM gk GROUP BY t ORDER BY t").rows
+    assert [(r[0].microsecond, r[1]) for r in rows] == [(122000, 1), (123100, 2), (123500, 1)]
+
+
+def test_aggregates_over_merged_groups_were_wrong(keyed_table):
+    """The value half of the same bug: a merged group summed rows that belong to
+    different groups."""
+    storage, session = keyed_table
+    rows = run(storage, session, "SELECT t, sum(id) FROM gk GROUP BY t ORDER BY t").rows
+    assert [(r[0].microsecond, r[1]) for r in rows] == [(122000, 4), (123100, 4), (123500, 2)]
+
+
+@pytest.mark.parametrize(
+    "predicate,expected",
+    [
+        ("t > '2026-08-18 12:00:00.123000'", [123100, 123500]),
+        ("t = '2026-08-18 12:00:00.123100'", [123100]),
+        ("t < '2026-08-18 12:00:00.123500'", [122000, 123100]),
+    ],
+)
+def test_having_on_a_timestamp_group_key(keyed_table, predicate, expected):
+    """A HAVING term over the GROUP BY key compares against the key, which is
+    now the composite -- so the literal needs the same lowering the min/max case
+    needed. All three shapes were wrong before."""
+    storage, session = keyed_table
+    rows = run(storage, session, f"SELECT t FROM gk GROUP BY t HAVING {predicate} ORDER BY t").rows
+    assert [r[0].microsecond for r in rows] == expected
+
+
+def test_order_by_a_timestamp_group_key(keyed_table):
+    storage, session = keyed_table
+    rows = run(storage, session, "SELECT t FROM gk GROUP BY t ORDER BY t DESC").rows
+    assert [r[0].microsecond for r in rows] == [123500, 123100, 122000]
+
+
+def test_group_by_with_a_where_clause(keyed_table):
+    storage, session = keyed_table
+    rows = run(
+        storage, session, "SELECT t, count(*) FROM gk WHERE id < 4 GROUP BY t ORDER BY t"
+    ).rows
+    assert [(r[0].microsecond, r[1]) for r in rows] == [(123100, 2), (123500, 1)]
+
+
+@pytest.mark.skipif(_pg_oracle() is None, reason="no local PostgreSQL oracle")
+def test_subms_group_by_matches_real_postgres(keyed_table):
+    storage, session = keyed_table
+    pg = _pg_oracle()
+    assert pg is not None
+    try:
+        pg.execute("drop table if exists subms_gk_oracle")
+        pg.execute("create table subms_gk_oracle (id int, t timestamp)")
+        for i, v in [
+            (1, "2026-08-18 12:00:00.123100"),
+            (2, "2026-08-18 12:00:00.123500"),
+            (3, "2026-08-18 12:00:00.123100"),
+            (4, "2026-08-18 12:00:00.122000"),
+        ]:
+            pg.execute("insert into subms_gk_oracle values (%s, %s)", (i, v))
+        for sql in (
+            "select t, count(*) from {} group by t order by t",
+            "select t, sum(id) from {} group by t order by t",
+            "select t from {} group by t having t > '2026-08-18 12:00:00.123000' order by t",
+        ):
+            ours = [tuple(r) for r in run(storage, session, sql.format("gk")).rows]
+            theirs = [tuple(r) for r in pg.execute(sql.format("subms_gk_oracle")).fetchall()]
+            assert ours == theirs, sql
+    finally:
+        pg.close()
