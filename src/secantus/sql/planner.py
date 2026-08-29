@@ -5787,14 +5787,18 @@ def _plan_distinct_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPl
         if isinstance(inner, exp.Star):
             for col in table.columns:
                 nm = names.fresh(col.name)
-                project[nm] = f"${col.field}"
+                # DISTINCT dedups on the PROJECTED value, so a timestamp has to
+                # be projected as the sub-millisecond composite -- projecting the
+                # truncated date merges rows that differ only in microseconds AND
+                # returns a time none of them held.
+                project[nm] = _group_key_expr(col.field, col.type_tag)
                 if col.enum_type is not None:
                     out_enum_types[len(out_columns)] = col.enum_type
                 out_columns.append((nm, col.type_tag))
             continue
         path, tag = _field(inner, resolve)
         nm = names.fresh(alias or _column_name(inner))
-        project[nm] = f"${path}"
+        project[nm] = _group_key_expr(path, tag)
         enum_name = _projected_enum_type(inner, table)
         if enum_name is not None:
             out_enum_types[len(out_columns)] = enum_name
@@ -5998,9 +6002,11 @@ def _register_distinct_agg(
     reduction's NULL filter drops — so only matching rows' distinct values count
     (SQL ``agg(DISTINCT x) FILTER (WHERE cond)`` semantics)."""
     set_name = names.fresh(f"{alias or func}__distinct")
-    accumulators[set_name] = {
-        "$addToSet": _push_filtered(value if field is None else f"${field}", fcond)
-    }
+    # `count(DISTINCT t)` dedups whatever the set collects, so a timestamp has to
+    # go in as the sub-millisecond composite -- collecting the truncated date
+    # counted two rows a millisecond apart as one value.
+    distinct_value = value if field is None else _group_key_expr(field, tag)
+    accumulators[set_name] = {"$addToSet": _push_filtered(distinct_value, fcond)}
     fname = names.fresh(alias or func)
     reductions[fname] = _distinct_reduction(func, f"${set_name}")
     return fname, _agg_out_tag(func, tag)

@@ -557,3 +557,98 @@ def test_subms_group_by_matches_real_postgres(keyed_table):
             assert ours == theirs, sql
     finally:
         pg.close()
+
+
+# ---------------------------------------------------------------------------
+# DISTINCT -- the fourth and last route in this family. It dedups on the
+# PROJECTED value, and the projection dropped the microseconds, so it both
+# merged rows and returned a time none of them held.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def distinct_table(storage, session):
+    run(storage, session, "CREATE TABLE dt (id int, g text, t timestamp)")
+    for i, g, v in [
+        (1, "x", "2026-08-18 12:00:00.123100"),
+        (2, "x", "2026-08-18 12:00:00.123500"),
+        (3, "y", "2026-08-18 12:00:00.123100"),
+        (4, "y", "2026-08-18 12:00:00.122000"),
+    ]:
+        run(storage, session, f"INSERT INTO dt VALUES ({i}, '{g}', '{v}')")
+    return storage, session
+
+
+def test_distinct_keeps_rows_a_microsecond_apart(distinct_table):
+    """Both halves of the bug: two values collapsed into one, and the survivor
+    read `.123000`, which no row held."""
+    storage, session = distinct_table
+    rows = run(storage, session, "SELECT DISTINCT t FROM dt ORDER BY t").rows
+    assert [r[0].microsecond for r in rows] == [122000, 123100, 123500]
+
+
+def test_distinct_over_several_columns(distinct_table):
+    storage, session = distinct_table
+    rows = run(storage, session, "SELECT DISTINCT g, t FROM dt ORDER BY g, t").rows
+    assert [(r[0], r[1].microsecond) for r in rows] == [
+        ("x", 123100),
+        ("x", 123500),
+        ("y", 122000),
+        ("y", 123100),
+    ]
+
+
+def test_distinct_star_keeps_microseconds(distinct_table):
+    storage, session = distinct_table
+    rows = run(storage, session, "SELECT DISTINCT * FROM dt ORDER BY id").rows
+    assert [r[2].microsecond for r in rows] == [123100, 123500, 123100, 122000]
+
+
+def test_distinct_orders_descending(distinct_table):
+    """The `$sort` runs over the composite, so ordering the deduped output has
+    to stay correct too."""
+    storage, session = distinct_table
+    rows = run(storage, session, "SELECT DISTINCT t FROM dt ORDER BY t DESC").rows
+    assert [r[0].microsecond for r in rows] == [123500, 123100, 122000]
+
+
+def test_count_distinct_counts_microsecond_distinct_values(distinct_table):
+    """A FIFTH path again: `count(DISTINCT t)` collects an `$addToSet` and
+    counts it, so the set has to hold composites. It answered 2 for three
+    distinct values."""
+    storage, session = distinct_table
+    rows = run(storage, session, "SELECT count(DISTINCT t) FROM dt").rows
+    assert rows == [(3,)]
+
+
+def test_distinct_with_where_and_limit(distinct_table):
+    storage, session = distinct_table
+    rows = run(storage, session, "SELECT DISTINCT t FROM dt WHERE id < 4 ORDER BY t LIMIT 2").rows
+    assert [r[0].microsecond for r in rows] == [123100, 123500]
+
+
+@pytest.mark.skipif(_pg_oracle() is None, reason="no local PostgreSQL oracle")
+def test_subms_distinct_matches_real_postgres(distinct_table):
+    storage, session = distinct_table
+    pg = _pg_oracle()
+    assert pg is not None
+    try:
+        pg.execute("drop table if exists subms_dt_oracle")
+        pg.execute("create table subms_dt_oracle (id int, g text, t timestamp)")
+        for i, g, v in [
+            (1, "x", "2026-08-18 12:00:00.123100"),
+            (2, "x", "2026-08-18 12:00:00.123500"),
+            (3, "y", "2026-08-18 12:00:00.123100"),
+            (4, "y", "2026-08-18 12:00:00.122000"),
+        ]:
+            pg.execute("insert into subms_dt_oracle values (%s, %s, %s)", (i, g, v))
+        for sql in (
+            "select distinct t from {} order by t",
+            "select distinct g, t from {} order by g, t",
+            "select count(distinct t) from {}",
+        ):
+            ours = [tuple(r) for r in run(storage, session, sql.format("dt")).rows]
+            theirs = [tuple(r) for r in pg.execute(sql.format("subms_dt_oracle")).fetchall()]
+            assert ours == theirs, sql
+    finally:
+        pg.close()

@@ -4071,13 +4071,24 @@ shared storage engine or building large new protocol subsystems:
      group-key column". Eight grouped shapes measured against PG: all eight were
      wrong before, all eight right now.
 
-     **Still open: `SELECT DISTINCT` on a timestamp**, and it is BOTH halves —
-     two rows at `.123100` and `.123500` come back as ONE row reading `.123000`.
-     It is a third route: neither the Python-side dedup nor the grouped-output
-     dedup, but a projection that drops the companion before the dedup ever
-     runs, so neither the `scope` fix nor the group-key fix reaches it. Closing
-     it means the projection carrying the companion through to the dedup key.
-     JOIN / DISTINCT projections dropping the companion is the same root.
+     **DISTINCT — FIXED 2026-08-29, and it was two routes.** `SELECT DISTINCT`
+     dedups on the PROJECTED value and the projection dropped the companion, so
+     two rows at `.123100` / `.123500` came back as ONE reading `.123000` — both
+     halves of the bug at once. The projection now emits the composite
+     (`_plan_distinct_select`, both the star and named-column branches) so the
+     dedup `$group` and the following `$sort` both see microseconds.
+     Separately, **`count(DISTINCT t)` was a FIFTH path**: an `$addToSet` whose
+     set held truncated dates, so it answered 2 for three distinct values;
+     `_register_distinct_agg` now collects the composite.
+
+     **This class is now closed across all five routes.** 39 shapes measured
+     against the live PostgreSQL 14 across four probes (read/ORDER BY,
+     accumulators, group key, DISTINCT) with zero divergences. The recurring
+     lesson: each route was invisible from the others, and each fix reached
+     exactly one of them — `scope` did not reach the accumulators, the
+     accumulators did not reach the group key, the group key did not reach
+     DISTINCT, and DISTINCT did not reach `count(DISTINCT …)`. A sixth is
+     possible; probe before claiming otherwise.
 
   3. **COPY and the Rust server** don't write the companion — they truncate, as
      before. Not wrong, just not precise.
