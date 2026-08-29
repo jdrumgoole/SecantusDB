@@ -22,6 +22,14 @@ The standing gate is `tests/test_mongod_differential.py` (`pytest -m
 differential`). A probe that finds something belongs there, or the next session
 re-finds it.
 
+**An area can look covered and never have been probed at all**, because the
+harness cannot reach it. That gate spawns a **standalone** mongod, and mongod
+refuses `$changeStream` on a standalone — so change streams sat outside every
+differential run until a probe stood up a replica set, and then 14 of 41 cases
+diverged on the first try. Before believing a surface is clean, check the
+harness can actually exercise it: "no findings" from a run that skips the
+surface is not evidence of anything.
+
 ## The recipe
 
 1. **Pick a surface with many option combinations** — a command's arguments, a
@@ -55,6 +63,28 @@ re-finds it.
 - **Known-missing wrappers.** mongod prefixes some errors
   (`PlanExecutor error during aggregation :: caused by ::`); strip it on both
   sides so the case asserts the code and message that matter.
+
+## Compare field ORDER too — equality will not show it to you
+
+`==` on a document ignores key order, so an ordering divergence is invisible to
+every content comparison. It stayed invisible here for the entire 2026-08
+campaign: when the change-stream probe added a second pass comparing
+`list(doc)`, **28 of 34** CRUD events turned out to be in the wrong order —
+`wallTime` misplaced, and `fullDocument` hoisted so that `_id` was not the
+first field. Nine event-construction sites had drifted because nothing had ever
+looked.
+
+Report it as its own dimension, not mixed into the content diff:
+
+    order = [(n, list(a), list(b)) for ... if list(a) != list(b)]
+
+Field order is what a driver renders and what a wire-level test can assert, so
+it is behaviour, not cosmetics. Note the tension with normalisation above:
+strip volatile *values*, never the key sequence.
+
+Fix it in **one** place — a canonical key list applied at the projection
+boundary — rather than at each construction site. Nine sites is how it drifted;
+one site is how it stays fixed.
 
 ## mongod versions differ, and only CI shows it
 
@@ -94,7 +124,7 @@ expensive direction:**
 An unlucky fixture in one dimension turns a narrow bug into what looks like a
 week of work. **Vary the fixture before believing a big diagnosis.**
 
-## Three bug shapes worth grepping for
+## Four bug shapes worth grepping for
 
 Each has produced multiple real defects:
 
@@ -108,7 +138,25 @@ Each has produced multiple real defects:
   asserting a mongod rule. The benign form cites mongod *and* is right; the
   malignant form cites the other engine, or states a mongod rule a probe
   contradicts. One such comment was trusted enough to write a test from, and
-  the test failed against the real server.
+  the test failed against the real server. **A test can pin an unverified claim
+  just as easily as a comment can**, and it then reads as proof: two tests
+  asserted that `fullDocument` sits immediately after `operationType` and had
+  passed for months. Nothing in that file could ever have checked it — it drives
+  our own server, the only one it can reach. mongod puts the field at index 4.
+  Both were written as *relative* assertions (`index("fullDocument") ==
+  index("operationType") + 1`), which is what let the wrong claim survive: pin
+  the measured key sequence instead, so the assertion breaks when reality
+  differs rather than staying true about the wrong thing.
+- **One exception class serving two different conditions** — that is where a
+  wrong code hides. `ChangeStreamFatalError` covered both "the pipeline stripped
+  the resume token" and "a required pre-/post-image was unavailable"; mongod
+  answers the first with 280 and the second with **47 `NoMatchingDocument` and
+  no error labels**. Because one class carried one code, the second condition
+  was wrong and nothing could see it — a backlog entry even recorded the code as
+  matching. When one error type covers more than one situation, assume the
+  oracle distinguishes them until measured. Fix it as a **subclass**: every
+  existing `except`/catch site and reply-shaping path keeps working while the
+  code, `codeName` and error labels come from the instance.
 - **Missing conflated with null** (3 instances). `get_path` returns `None` for
   both; `has_path` distinguishes them. mongod's rule **differs by language**:
   the *query* language treats them alike (`{a: null}` matches a missing field),
@@ -139,6 +187,13 @@ after changing an engine, run the oracle probe *and* `pytest -k parity`.
   Provision it (`uvx maturin build --release --manifest-path
   crates/secantus-core-py/Cargo.toml`, then `uv pip install --reinstall`) and
   check the number.
+- **A chained shell command reports the LAST command's exit, not the gate's.**
+  `./inv rust-gate > log 2>&1; echo "exit=$?"; tail -25 log` finishes with
+  `tail`, so the runner reports success whatever the gate did — a gate run with
+  **2 real failures** was reported as "exit code 0" and would have been merged
+  on that basis. Read the summary line (`N failed, M passed`), or check `$?` on
+  its own before anything else runs. Same family as piping into `tail`/`grep`,
+  which also swallows the status.
 - **Run the FULL suite, not the targeted files you reasoned about.** The
   missing-vs-null change broke six SQL outer-join tests three subsystems away —
   `COUNT(col)` must skip SQL NULLs, and an unmatched outer-join row represents

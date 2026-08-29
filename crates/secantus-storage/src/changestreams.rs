@@ -148,6 +148,36 @@ fn do_lookup(storage: &Storage, db: &str, coll: &str, doc_id: &Bson) -> Result<O
     }
 }
 
+/// mongod's wording for a missing required pre-/post-image.
+///
+/// Verbatim from 6.0.16 (measured 2026-08-29), including the `Executor error
+/// during getMore` wrapper it adds when the condition is hit while draining a
+/// cursor and the shell-style rendering of the offending event. Mirrors the
+/// Python server's `_required_image_message`.
+fn required_image_message(event: &Document, pre: bool) -> String {
+    let (secs, inc) = match event.get("clusterTime") {
+        Some(Bson::Timestamp(ts)) => (ts.time, ts.increment),
+        _ => (0, 0),
+    };
+    let ns = event.get_document("ns").ok();
+    let db = ns.and_then(|d| d.get_str("db").ok()).unwrap_or("");
+    let coll = ns.and_then(|d| d.get_str("coll").ok()).unwrap_or("");
+    let op = event.get_str("operationType").unwrap_or("");
+    let summary = format!(
+        "{{operationType: \"{op}\", ns: {{db: \"{db}\", coll: \"{coll}\"}}, \
+         clusterTime: Timestamp({secs}, {inc})}}"
+    );
+    let what = if pre {
+        "a pre-image for all update, delete and replace events, but the pre-image was not found"
+    } else {
+        "a post-image for all update events, but the post-image was not found"
+    };
+    format!(
+        "Executor error during getMore :: caused by :: Change stream was configured to \
+         require {what} for event: {summary}"
+    )
+}
+
 fn attach_full_document(
     event: &mut Document,
     op: &str,
@@ -186,9 +216,8 @@ fn attach_full_document(
             && !storage.pre_post_images_enabled(&db, &coll)?
         {
             if mode == FULL_DOC_REQUIRED {
-                return Err(StorageError::ChangeStreamFatal(format!(
-                    "the 'fullDocument: required' option requires \
-                     changeStreamPreAndPostImages to be enabled on the collection {ns}"
+                return Err(StorageError::ChangeStreamFatal(required_image_message(
+                    event, false,
                 )));
             }
             event.insert("fullDocument", Bson::Null);
@@ -207,9 +236,9 @@ fn attach_full_document(
                 event.insert("fullDocument", Bson::Document(d));
             }
             None if mode == FULL_DOC_REQUIRED => {
-                return Err(StorageError::ChangeStreamFatal(
-                    "fullDocument required but document not found".into(),
-                ));
+                return Err(StorageError::ChangeStreamFatal(required_image_message(
+                    event, false,
+                )));
             }
             None => {
                 event.insert("fullDocument", Bson::Null);
@@ -236,9 +265,9 @@ fn attach_full_document_before_change(
             );
         }
         None if mode == FULL_DOC_REQUIRED => {
-            return Err(StorageError::ChangeStreamFatal(
-                "fullDocumentBeforeChange required but pre-image not stored".into(),
-            ));
+            return Err(StorageError::ChangeStreamFatal(required_image_message(
+                event, true,
+            )));
         }
         None if mode == FULL_DOC_WHEN_AVAILABLE => {
             event.insert("fullDocumentBeforeChange", Bson::Null);
@@ -255,7 +284,66 @@ fn attach_full_document_before_change(
 /// `invalidate` after this event (drop on a watched collection, etc.). Mirrors
 /// `changestreams.project`.
 #[allow(clippy::too_many_arguments)]
+/// mongod's field order for a change event, measured against 6.0.16 on
+/// 2026-08-29 with `tools/probes/change_streams.py`. Order is invisible to a
+/// document comparison, which is how nine construction sites drifted out of it
+/// unnoticed. Keys not listed keep their relative position after these.
+/// Mirrors the Python server's `_EVENT_FIELD_ORDER`.
+const EVENT_FIELD_ORDER: &[&str] = &[
+    "_id",
+    "operationType",
+    "clusterTime",
+    "collectionUUID",
+    "wallTime",
+    "fullDocument",
+    "ns",
+    "to",
+    "documentKey",
+    "operationDescription",
+    "updateDescription",
+    "stateBeforeChange",
+    "fullDocumentBeforeChange",
+];
+
+/// Rebuild an event in mongod's field order. Applied once at projection's exit
+/// rather than by constructing each event type in order.
+fn order_event_fields(event: Document) -> Document {
+    let mut out = Document::new();
+    for key in EVENT_FIELD_ORDER {
+        if let Some(v) = event.get(*key) {
+            out.insert(*key, v.clone());
+        }
+    }
+    for (k, v) in event.iter() {
+        if !EVENT_FIELD_ORDER.contains(&k.as_str()) {
+            out.insert(k, v.clone());
+        }
+    }
+    out
+}
+
 pub fn project(
+    seq: i64,
+    oplog_entry: &Document,
+    storage: &Storage,
+    full_document_mode: &str,
+    full_document_before_change_mode: &str,
+    scope: &Scope,
+    show_expanded_events: bool,
+) -> Result<(Option<Document>, bool)> {
+    let (event, invalidates) = project_unordered(
+        seq,
+        oplog_entry,
+        storage,
+        full_document_mode,
+        full_document_before_change_mode,
+        scope,
+        show_expanded_events,
+    )?;
+    Ok((event.map(order_event_fields), invalidates))
+}
+
+fn project_unordered(
     seq: i64,
     oplog_entry: &Document,
     storage: &Storage,
@@ -311,11 +399,13 @@ pub fn project(
         event.insert("_id", Bson::Document(token));
         event.insert("operationType", op_type);
         event.insert("clusterTime", Bson::Timestamp(ts));
-        event.insert("ns", Bson::Document(ns_doc(&ns)));
-        event.insert("documentKey", Bson::Document(document_key));
+        // wallTime sits immediately after clusterTime, before ns (mongod
+        // 6.0.16, measured 2026-08-29).
         if let Some(w) = &wall {
             event.insert("wallTime", w.clone());
         }
+        event.insert("ns", Bson::Document(ns_doc(&ns)));
+        event.insert("documentKey", Bson::Document(document_key));
         // showExpandedEvents surfaces the collection UUID on CRUD events (mongod
         // 6.0+). The oplog entry carries it as `ui` (BinData 4).
         if show_expanded_events {
