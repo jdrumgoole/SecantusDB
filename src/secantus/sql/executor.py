@@ -2303,6 +2303,13 @@ def _apply_post_aggregates(plan: Any, result: list[dict[str, Any]]) -> list[dict
     (Python-side, since the aggregation engine can't sort). Shared by the top-level
     pipeline executor and derived-table materialization so the ``{v, k}`` push
     pairs never leak past either path."""
+    # A timestamp min/max accumulates a `{__subms_d, __subms_u}` composite (a
+    # BSON date cannot carry the remainder), so merge it back before anything
+    # downstream sees it.
+    for doc in result:
+        for key, value in doc.items():
+            if isinstance(value, dict) and subms.COMPOSITE_DATE in value:
+                doc[key] = subms.unwrap_composite(value)
     for field_name, kind, payload in getattr(plan, "post_aggregates", ()) or ():
         for doc in result:
             if kind in ("sorted_array", "sorted_string"):
@@ -2343,6 +2350,14 @@ def _sorted_agg_value(kind: str, payload: Any, pairs: Any) -> Any:
     return the ``v`` values as a list (``sorted_array``) or joined with the
     separator, skipping NULLs (``sorted_string`` — NULL when all values are NULL)."""
     items = list(pairs or [])
+    # A timestamp sort key rides as the sub-millisecond composite; merge it back
+    # so the keys are comparable datetimes (and microsecond-exact) before sorting.
+    for p in items:
+        keys = p.get("k")
+        if isinstance(keys, list) and any(
+            isinstance(k, dict) and subms.COMPOSITE_DATE in k for k in keys
+        ):
+            p["k"] = [subms.unwrap_composite(k) for k in keys]
     if kind == "sorted_array":
         specs = payload
         _pg_sort(items, lambda p: tuple(p.get("k") or []), specs)

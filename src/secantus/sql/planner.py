@@ -4644,6 +4644,25 @@ def _agg_order_spec(
     return value_node.this, terms
 
 
+def _sorted_agg_key(key: exp.Expression, table: TableDef) -> Any:
+    """One ``k`` element of an ordered aggregate's pushed pair.
+
+    A key naming a timestamp column pushes the sub-millisecond composite rather
+    than the stored date, so `array_agg(x ORDER BY t)` orders by microseconds
+    like Postgres instead of leaving rows inside one millisecond in storage
+    order. `_sorted_agg_value` merges the composite before it sorts.
+    """
+    if isinstance(key, exp.Column):
+        name = _column_name(key)
+        try:
+            tag = table.type_for(name)
+        except Exception:  # noqa: BLE001 -- not a resolvable column: lower as-is
+            tag = None
+        if tag in subms.SUBMS_TAGS:
+            return subms.composite_expr(table.field_for(name))
+    return _agg_arg_to_expr(key, table)
+
+
 def _sorted_agg_push(
     value_node: exp.Expression,
     terms: list[tuple[exp.Expression, int, bool]],
@@ -4654,9 +4673,23 @@ def _sorted_agg_push(
     return {
         "$push": {
             "v": _agg_arg_to_expr(value_node, table),
-            "k": [_agg_arg_to_expr(key, table) for key, _dir, _nf in terms],
+            "k": [_sorted_agg_key(key, table) for key, _dir, _nf in terms],
         }
     }
+
+
+def _sorted_agg_key_resolve(key: exp.Expression, resolve: Resolve) -> Any:
+    """`_sorted_agg_key` for the join path -- same rule, resolved through the
+    join's `Resolve` (which yields the dotted pipeline path and its tag, so the
+    companion lands at `b.__us_t` rather than `__us_b.t`)."""
+    if isinstance(key, exp.Column):
+        try:
+            path, tag = resolve(key)
+        except Exception:  # noqa: BLE001 -- unresolvable: lower as-is
+            path, tag = None, None
+        if path is not None and tag in subms.SUBMS_TAGS:
+            return subms.composite_expr(path)
+    return _to_agg_expr(key, resolve)
 
 
 def _sorted_agg_push_resolve(
@@ -4669,7 +4702,7 @@ def _sorted_agg_push_resolve(
     return {
         "$push": {
             "v": _to_agg_expr(value_node, resolve),
-            "k": [_to_agg_expr(key, resolve) for key, _dir, _nf in terms],
+            "k": [_sorted_agg_key_resolve(key, resolve) for key, _dir, _nf in terms],
         }
     }
 
@@ -5774,6 +5807,20 @@ def _plan_distinct_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPl
     )
 
 
+def _minmax_body(val: Any, field: str | None, tag: str | None, filter_cond: Any) -> Any:
+    """The value a ``$min`` / ``$max`` accumulates.
+
+    For a timestamp column that is the sortable composite (`subms.composite_expr`)
+    rather than the stored date: a BSON date holds whole milliseconds, so
+    accumulating it directly answers a time that was never stored -- `min(t)`
+    returned `.123000` for a stored `.123456`. The executor merges the composite
+    back on the way out.
+    """
+    if field is not None and tag in subms.SUBMS_TAGS:
+        val = subms.composite_expr(field)
+    return {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
+
+
 def _accumulator_for(
     func: str, field: str | None, tag: str | None, filter_cond: Any = None
 ) -> tuple[dict[str, Any], str]:
@@ -5803,10 +5850,10 @@ def _accumulator_for(
         body = {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
         return {"$avg": body}, _avg_tag(tag)
     if func in ("min", "bool_and"):
-        body = {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
+        body = _minmax_body(val, field, tag, filter_cond)
         return {"$min": body}, ("bool" if func == "bool_and" else (tag or "text"))
     if func in ("max", "bool_or"):
-        body = {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
+        body = _minmax_body(val, field, tag, filter_cond)
         return {"$max": body}, ("bool" if func == "bool_or" else (tag or "text"))
     if func in ("stddev", "stddev_samp"):
         # Native Mongo accumulators; a lone value yields NULL (Mongo returns null
@@ -7356,6 +7403,22 @@ def _having_to_match(
             term, lit, on_left = right, left, False
         field, tag = field_tag(term)
         value = typemap.coerce(_literal(lit), tag)
+        # A min/max over a timestamp accumulates the sub-millisecond composite,
+        # so the literal has to be compared in the same shape. Only min/max --
+        # a GROUP BY key (`_id.<col>`) is still the stored date, and lowering
+        # that here would compare a composite against a plain field.
+        _agg = _aggregate_of(term)
+        if tag in subms.SUBMS_TAGS and _agg is not None and _agg[0] in ("min", "max"):
+            if isinstance(node, exp.EQ):
+                _op = "$eq"
+            elif isinstance(node, exp.NEQ):
+                _op = "$ne"
+            else:
+                _cmp, _flip = _HAVING_CMP[type(node)]
+                _op = _cmp if on_left else _flip
+            _composite = subms.composite_cmp_filter(field, _op, value)
+            if _composite is not None:
+                return _composite
         if isinstance(node, exp.EQ):
             return {field: value}
         if isinstance(node, exp.NEQ):
@@ -10053,6 +10116,22 @@ def _join_having_to_match(
             term, lit, on_left = right, left, False
         field, tag = field_tag(term)
         value = typemap.coerce(_literal(lit), tag)
+        # A min/max over a timestamp accumulates the sub-millisecond composite,
+        # so the literal has to be compared in the same shape. Only min/max --
+        # a GROUP BY key (`_id.<col>`) is still the stored date, and lowering
+        # that here would compare a composite against a plain field.
+        _agg = _aggregate_of(term)
+        if tag in subms.SUBMS_TAGS and _agg is not None and _agg[0] in ("min", "max"):
+            if isinstance(node, exp.EQ):
+                _op = "$eq"
+            elif isinstance(node, exp.NEQ):
+                _op = "$ne"
+            else:
+                _cmp, _flip = _HAVING_CMP[type(node)]
+                _op = _cmp if on_left else _flip
+            _composite = subms.composite_cmp_filter(field, _op, value)
+            if _composite is not None:
+                return _composite
         if isinstance(node, exp.EQ):
             return {field: value}
         if isinstance(node, exp.NEQ):

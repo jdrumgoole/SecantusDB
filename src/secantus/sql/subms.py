@@ -56,6 +56,58 @@ def is_companion_field(name: str) -> bool:
     return name.startswith(_PREFIX)
 
 
+#: Keys of the sortable composite an aggregation accumulator carries. A BSON
+#: date cannot hold the remainder, so a pipeline `$min` / `$max` / ordered-push
+#: over a timestamp accumulates ``{__subms_d, __subms_u}`` instead and the
+#: executor merges it back. `__`-prefixed by the same convention as the
+#: companion field, so a real jsonb value cannot be mistaken for one.
+COMPOSITE_DATE = "__subms_d"
+COMPOSITE_US = "__subms_u"
+
+
+def companion_path(field: str) -> str:
+    """`companion_field` for a *pipeline path*: ``b.amt`` -> ``b.__us_amt``.
+
+    The companion sits beside its column inside the same sub-document, so the
+    prefix goes on the LAST segment, not the whole path. Getting this wrong on
+    a join would silently read a missing field and report whole milliseconds.
+    """
+    head, _, last = field.rpartition(".")
+    return f"{head}.{_PREFIX}{last}" if head else f"{_PREFIX}{last}"
+
+
+def composite_expr(field: str) -> dict[str, Any]:
+    """A Mongo aggregation expression producing the sortable composite for
+    ``field``, or NULL when the column is NULL so accumulators keep skipping it.
+
+    Ordering works because BSON compares documents field by field in order:
+    date first, then the 0-999 remainder. ``$ifNull`` on the companion is what
+    makes that total -- a whole-millisecond row has no companion, and without
+    the 0 default the two shapes would not be comparable.
+    """
+    return {
+        "$cond": [
+            {"$ifNull": [f"${field}", False]},
+            {
+                COMPOSITE_DATE: f"${field}",
+                COMPOSITE_US: {"$ifNull": [f"${companion_path(field)}", 0]},
+            },
+            None,
+        ]
+    }
+
+
+def unwrap_composite(value: Any) -> Any:
+    """Merge a ``{__subms_d, __subms_u}`` composite back into a datetime.
+
+    Anything else passes through, so this is safe to run over arbitrary result
+    values.
+    """
+    if isinstance(value, dict) and COMPOSITE_DATE in value:
+        return merge(value.get(COMPOSITE_DATE), value.get(COMPOSITE_US))
+    return value
+
+
 def split(value: Any) -> tuple[Any, int]:
     """``(value_as_stored, remainder_microseconds)``.
 
@@ -168,6 +220,43 @@ def _companion_cmp(companion: str, op: str, remainder: int) -> dict[str, Any]:
 
 #: A filter that matches no document (Mongo has no literal false).
 _MATCH_NOTHING: dict[str, Any] = {"$nor": [{}]}
+
+
+def composite_cmp_filter(base: str, op: str, value: Any) -> dict[str, Any] | None:
+    """`cmp_filter` for a field holding the accumulator COMPOSITE, not a stored
+    date beside a companion.
+
+    Simpler than `cmp_filter` because the composite always carries its
+    remainder: `composite_expr` defaults it to 0 with `$ifNull`, so none of the
+    "an absent companion means zero" special cases apply and the comparison is
+    a plain two-field lexicographic one.
+
+    Returns None for a non-datetime value, leaving the caller's plain filter.
+    """
+    if not isinstance(value, _dt.datetime):
+        return None
+    date_path = f"{base}.{COMPOSITE_DATE}"
+    us_path = f"{base}.{COMPOSITE_US}"
+    trunc, remainder = split(value)
+    if op == "$eq":
+        return {date_path: trunc, us_path: remainder}
+    if op == "$ne":
+        return {"$nor": [{"$and": [{date_path: trunc}, {us_path: remainder}]}]}
+    if op in ("$gt", "$gte"):
+        return {
+            "$or": [
+                {date_path: {"$gt": trunc}},
+                {"$and": [{date_path: trunc}, {us_path: {op: remainder}}]},
+            ]
+        }
+    if op in ("$lt", "$lte"):
+        return {
+            "$or": [
+                {date_path: {"$lt": trunc}},
+                {"$and": [{date_path: trunc}, {us_path: {op: remainder}}]},
+            ]
+        }
+    return None
 
 
 def cmp_filter(field: str, op: str, value: Any) -> dict[str, Any] | None:
