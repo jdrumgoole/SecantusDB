@@ -1297,6 +1297,199 @@ HINT_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ),
 ]
 
+LK_CHAIN = [
+    {"_id": 10, "sku": "a", "parent": None},
+    {"_id": 11, "sku": "b", "parent": "a"},
+    {"_id": 12, "sku": "c", "parent": "b"},
+    {"_id": 13, "sku": None, "parent": "c"},
+]
+
+_GRAPH = {
+    "from": "stock",
+    "startWith": "$sku",
+    "connectFromField": "parent",
+    "connectToField": "sku",
+    "as": "chain",
+}
+
+
+def _join(db: Database, stock: list[dict], pipeline: list) -> str:
+    """Run a join pipeline over `c` against a seeded `stock` collection.
+
+    The `as` array's ORDER is not compared -- mongod's reflects its internal
+    traversal rather than a documented contract, and this campaign has already
+    hit two version splits on ordering. The SET is what the joins are about.
+    """
+    from pymongo.errors import OperationFailure
+
+    db.stock.drop()
+    db.stock.insert_many([dict(d) for d in stock])
+    try:
+        out = list(db.c.aggregate(pipeline))
+    except OperationFailure as exc:
+        d = exc.details or {}
+        msg = str(d.get("errmsg", ""))
+        for w in (
+            "PlanExecutor error during aggregation :: caused by :: ",
+            "Failed to optimize pipeline :: caused by :: ",
+        ):
+            if msg.startswith(w):
+                msg = msg[len(w) :]
+        return f"{d.get('code')}: {msg!r}"
+    shaped = []
+    for doc in sorted(out, key=lambda d: d["_id"]):
+        joined = doc.get("chain", doc.get("s", doc.get("a", {}).get("b") if "a" in doc else None))
+        ids = sorted(j["_id"] for j in joined) if isinstance(joined, list) else joined
+        shaped.append((doc["_id"], ids))
+    return repr(shaped)
+
+
+# $lookup / $graphLookup. 27 shapes probed, 20 diverged -- the worst a
+# TRUNCATED traversal: $graphLookup stopped at the first null link, so a
+# four-document chain returned one document with no error.
+LOOKUP_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    (
+        "graph-null-link-continues",
+        [{"_id": 1, "sku": "a"}],
+        lambda db: _join(db, LK_CHAIN, [{"$graphLookup": _GRAPH}]),
+    ),
+    (
+        "graph-missing-link-stops",
+        [{"_id": 1, "sku": "a"}],
+        lambda db: _join(
+            db, [{"_id": 10, "sku": "a"}, {"_id": 11, "sku": None}], [{"$graphLookup": _GRAPH}]
+        ),
+    ),
+    (
+        "graph-null-link-skips-fieldless-doc",
+        [{"_id": 1, "sku": "a"}],
+        lambda db: _join(
+            db,
+            [{"_id": 10, "sku": "a", "parent": None}, {"_id": 11}],
+            [{"$graphLookup": _GRAPH}],
+        ),
+    ),
+    (
+        "graph-maxdepth",
+        [{"_id": 1, "sku": "a"}],
+        lambda db: _join(
+            db,
+            [
+                {"_id": 1, "sku": "a", "parent": "b"},
+                {"_id": 2, "sku": "b", "parent": "c"},
+                {"_id": 3, "sku": "c", "parent": "d"},
+            ],
+            [{"$graphLookup": {**_GRAPH, "maxDepth": 1}}],
+        ),
+    ),
+    (
+        "graph-negative-maxdepth",
+        [{"_id": 1, "sku": "a"}],
+        lambda db: _join(db, LK_CHAIN, [{"$graphLookup": {**_GRAPH, "maxDepth": -1}}]),
+    ),
+    (
+        "graph-unknown-argument",
+        [{"_id": 1, "sku": "a"}],
+        lambda db: _join(db, LK_CHAIN, [{"$graphLookup": {**_GRAPH, "zz": 1}}]),
+    ),
+    (
+        "graph-spec-not-a-document",
+        [{"_id": 1, "sku": "a"}],
+        lambda db: _join(db, LK_CHAIN, [{"$graphLookup": 5}]),
+    ),
+    (
+        "lookup-empty-array-matches-null",
+        [{"_id": 1, "tags": []}],
+        lambda db: _join(
+            db,
+            [{"_id": 10, "sku": "a"}, {"_id": 11, "sku": None}],
+            [
+                {
+                    "$lookup": {
+                        "from": "stock",
+                        "localField": "tags",
+                        "foreignField": "sku",
+                        "as": "s",
+                    }
+                }
+            ],
+        ),
+    ),
+    (
+        "lookup-dotted-as-nests",
+        [{"_id": 1, "sku": "a"}],
+        lambda db: _join(
+            db,
+            [{"_id": 10, "sku": "a"}],
+            [
+                {
+                    "$lookup": {
+                        "from": "stock",
+                        "localField": "sku",
+                        "foreignField": "sku",
+                        "as": "a.b",
+                    }
+                }
+            ],
+        ),
+    ),
+    (
+        "lookup-let-wrong-type",
+        [{"_id": 1, "sku": "a"}],
+        lambda db: _join(
+            db,
+            [{"_id": 10, "sku": "a"}],
+            [{"$lookup": {"from": "stock", "let": 5, "pipeline": [], "as": "s"}}],
+        ),
+    ),
+    (
+        "lookup-pipeline-wrong-type",
+        [{"_id": 1, "sku": "a"}],
+        lambda db: _join(
+            db,
+            [{"_id": 10, "sku": "a"}],
+            [{"$lookup": {"from": "stock", "pipeline": 5, "as": "s"}}],
+        ),
+    ),
+    (
+        "lookup-unknown-argument",
+        [{"_id": 1, "sku": "a"}],
+        lambda db: _join(
+            db,
+            [{"_id": 10, "sku": "a"}],
+            [
+                {
+                    "$lookup": {
+                        "from": "stock",
+                        "localField": "sku",
+                        "foreignField": "sku",
+                        "as": "s",
+                        "zz": 1,
+                    }
+                }
+            ],
+        ),
+    ),
+    (
+        "lookup-missing-as",
+        [{"_id": 1, "sku": "a"}],
+        lambda db: _join(
+            db,
+            [{"_id": 10, "sku": "a"}],
+            [{"$lookup": {"from": "stock", "localField": "sku", "foreignField": "sku"}}],
+        ),
+    ),
+    (
+        "lookup-half-specified-field-pair",
+        [{"_id": 1, "sku": "a"}],
+        lambda db: _join(
+            db,
+            [{"_id": 10, "sku": "a"}],
+            [{"$lookup": {"from": "stock", "localField": "sku", "as": "s"}}],
+        ),
+    ),
+]
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
@@ -1304,6 +1497,7 @@ ALL_CASES = (
     + [("updatecmd", c) for c in UPDATE_CMD_CASES]
     + [("cursor", c) for c in CURSOR_CASES]
     + [("hint", c) for c in HINT_CASES]
+    + [("lookup", c) for c in LOOKUP_CASES]
 )
 
 

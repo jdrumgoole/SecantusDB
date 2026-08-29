@@ -533,13 +533,19 @@ Specific items that were left out of the slice that introduced their feature are
   serializable is requested (honest, diverges from PG's echo). **A product
   decision, not a code one — ask before implementing.**
 
-  **READ COMMITTED inside an explicit transaction is a REDESIGN, not a fix.** It
-  needs a fresh snapshot per statement plus row-level blocking (PostgreSQL's
-  EvalPlanQual re-reads the committed row and re-applies). A WiredTiger
-  transaction has exactly one snapshot, so this means either a WT transaction
-  per statement with our own undo/redo above it, or a pessimistic row-lock
-  manager taken before the write so the conflict never happens. Do not attempt
-  it as a slice.
+  **READ COMMITTED inside an explicit transaction is a REDESIGN, not a fix —
+  scoped in `tasks/sql-mvcc-plan.md` (2026-08-29).** Both obvious designs fail:
+  WiredTiger's `reset_snapshot` is "an error … if the current transaction has
+  already written any data" (its own header), so per-statement snapshots inside
+  one WT transaction are impossible; and committing each statement separately
+  causes **dirty reads**, a worse violation than the 40001 it would fix. The
+  plan scopes the real answer (MVCC above WT: row versions, visibility filter,
+  durable undo, crash recovery, GC, row locks), fixes the seam (four storage
+  methods carry ~95% of SQL traffic, and the seam must sit ABOVE `Storage` so
+  the Mongo side keeps mongod's snapshot isolation), and states kill criteria.
+  **Its recommendation is to do Phase 0 only** — a partial row-lock mode that
+  raises 40001 on a second write rather than answering wrongly — and re-decide
+  with that measurement. Do not start Phases 3–4 without reading §8.
 
   All four rows are pinned by `tests/test_sql_isolation_level.py`, with the two
   divergent ones named `test_known_divergence_*` so they cannot be misread as
@@ -1083,6 +1089,44 @@ These are explicit non-goals. Don't add them without a reason.
 - ~~Tailable / awaitData cursors~~ — implemented for change streams (see "In scope" in `CLAUDE.md`) **and** for plain capped collections + `local.oplog.rs` (`commands._find_tailable` / `_find_tailable_oplog`, blocking `getMore` on the oplog condition variable). The producer re-applies the find filter (with `let` vars + collation) to follow-up inserts, advances its watermark by **RecordId** (insertion order — the same order capped eviction uses; an `id_key` watermark dropped and redelivered docs when `_id`s weren't monotonic), and raises `CappedPositionLost` (136) on rollover.
 
 ## 5. Known bugs and edge cases to watch
+
+- [x] **`$lookup` / `$graphLookup` sweep — 20 of 27 shapes diverged, headline
+  was a TRUNCATED traversal (2026-08-29).** `$graphLookup` stopped following
+  the chain at the first null `connectFromField`, so a four-document chain
+  returned one document **with no error**. Fixed: an explicit null link is
+  followed (it reaches explicitly-null `connectToField` documents), only a
+  *missing* link stops the walk, and a document that lacks the field is no
+  longer reachable from a null — the value was tested for `None`, which
+  conflated missing with null on both sides.
+  **A correction kept deliberately**: this was first written up as "does not
+  recurse at all". It does — the fixture happened to put a null on the first
+  hop. A chain without nulls walks, honours `maxDepth`, and handles an array
+  `startWith`. The lesson is about fixtures: a single unlucky fixture turned a
+  one-line guard into what looked like a missing feature, and would have scoped
+  a week of work that was not needed.
+  Also fixed: an empty-array `localField` matches null (BOTH join paths had it,
+  and the index path's comment asserted `$in: []` semantics the oracle
+  contradicts — a `$lookup` localField is not an `$in`); `as` is a PATH so
+  `as: "a.b"` nests (the same dotted-key bug as the upsert seed, third instance
+  of that class this campaign); two crashes (`let: 5`, `pipeline: 5`); unknown
+  arguments accepted on both stages; and a negative `maxDepth` that matched
+  nothing instead of erroring.
+- [ ] **A `$lookup` `let` binding cannot express MISSING.** For a document
+  without the local field, mongod binds `$$var` as *missing*, and
+  `$eq: ["$field", "$$var"]` against an explicitly-null foreign value is then
+  FALSE. Our evaluator resolves a missing path to `None`, so the two compare
+  equal and the join returns rows mongod excludes. Fixing it means a missing
+  sentinel in `expressions.py`, which touches every operator — deliberately not
+  attempted inside a join-semantics batch.
+- [ ] **`$lookup`'s `as` field ORDER when it overwrites an existing field.**
+  mongod moves the overwritten field to the END of the document; we keep its
+  original position. Left alone rather than guessed at: this campaign has
+  already hit two mongod-version splits on field ordering, and one version's
+  observation is not enough to act on.
+- [ ] **`$graphLookup`'s result array is in a different ORDER than mongod's.**
+  The SET of documents now matches exactly; only the order within the `as`
+  array differs, and mongod's order reflects its internal traversal rather than
+  a documented contract. Not chased for the same reason as above.
 
 - [ ] **The error surface is conformant to mongod 6.0, and diverges from 8.x in
   18 known places (2026-08-29).** `src/secantus/commands.py` alone cites 6.0.16
