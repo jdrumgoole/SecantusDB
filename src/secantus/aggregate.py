@@ -640,7 +640,8 @@ def _stage_densify(
     if isinstance(raw_step, bool) or not isinstance(raw_step, (int, float)):
         raise AggregateError(
             f"BSON field '$densify.range.step' is the wrong type '{_bson_type_name(raw_step)}', "
-            "expected types '[int, decimal, double, long']",
+            # Probed on mongod 8.2.1; the order is per-field and is mongod's.
+            "expected types '[double, long, int, decimal]'",
             code=14,
             code_name="TypeMismatch",
         )

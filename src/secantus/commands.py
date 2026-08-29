@@ -2866,6 +2866,11 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             msg = str(exc)
             default_code = 66 if "immutable field" in msg else 9
             code = exc.code if exc.code is not None else default_code
+            # 8.x wraps EXECUTION-time failures the same way findAndModify
+            # does. On 6.0 only findAndModify carried the wrapper and the
+            # update command reported the bare message.
+            if exc.exec_error:
+                msg = f"Plan executor error during update :: caused by :: {msg}"
             write_errors.append({"index": index, "code": code, "errmsg": msg})
             if ordered:
                 break
@@ -3028,7 +3033,9 @@ def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.paths import get_path
 
     coll = doc["distinct"]
-    _err = _unknown_command_field(doc, "distinct", _DISTINCT_KNOWN_FIELDS)
+    # 8.x names the IDL STRUCT, not the command: 'distinctCommandRequest.zz',
+    # where 6.0 said 'distinct.zz'.
+    _err = _unknown_command_field(doc, "distinctCommandRequest", _DISTINCT_KNOWN_FIELDS)
     if _err is not None:
         return _err
     key = doc.get("key", "")
@@ -3127,7 +3134,7 @@ def _require_object_bson_field(value: Any, field_path: str) -> dict[str, Any] | 
     }
 
 
-_NUMERIC_TYPES_MSG = "'[long, int, decimal, double']"
+_NUMERIC_TYPES_MSG = "'[decimal, int, double, long]'"
 
 
 def _delete_stmt_limit(value: Any) -> int:
@@ -3154,7 +3161,8 @@ def _require_number_bson_field(value: Any, field_path: str) -> dict[str, Any] | 
     """mongod's numeric-slot type error, or None if OK / absent.
 
     The expected-types list is reproduced verbatim, unbalanced quotes and all:
-    mongod emits ``expected types '[long, int, decimal, double']``.
+    mongod 8.2.1 emits ``expected types '[decimal, int, double, long]'``; the
+    order is mongod's own and is not alphabetical or by width.
 
     ``bool`` is rejected explicitly -- Python makes it a subclass of ``int``, so
     without the guard ``limit: true`` would be read as ``limit: 1`` where mongod
@@ -3253,13 +3261,16 @@ def _unresolvable_hint_error(ctx: CommandContext, coll: str, hint: Any) -> str |
 
 
 def _require_non_negative_number(value: Any, bare_name: str) -> dict[str, Any] | None:
-    """mongod's ``Location51024`` for a negative cursor-sizing value, else None.
+    """mongod's ``BadValue`` for a negative cursor-sizing value, else None.
 
     ``batchSize`` / ``limit`` / ``skip`` are all "must be >= 0" on ``find``,
-    ``getMore`` and ``aggregate``'s cursor spec (probed 6.0.16). Every one of
+    ``getMore`` and ``aggregate``'s cursor spec (probed 8.2.1). Every one of
     them was accepted here: a negative ``batchSize`` fell through Python's
     ``or DEFAULT`` and silently became the default, and a negative ``limit``
     returned the whole collection.
+
+    6.0 answered ``51024 Location51024`` here; 8.x answers ``2 BadValue`` with
+    the same message.
 
     Unlike the type error above, the message uses the BARE field name --
     ``BSON field 'batchSize'``, not the IDL path -- on all three commands.
@@ -3279,8 +3290,8 @@ def _require_non_negative_number(value: Any, bare_name: str) -> dict[str, Any] |
     return {
         "ok": 0.0,
         "errmsg": f"BSON field '{bare_name}' value must be >= 0, actual value '{rendered}'",
-        "code": 51024,
-        "codeName": "Location51024",
+        "code": 2,
+        "codeName": "BadValue",
     }
 
 
@@ -3327,11 +3338,14 @@ def _require_object_expected_field(
     }
 
 
-# mongod's own quoting, which is not what you would write: the closing quote
-# sits INSIDE the bracket. Verbatim from 6.0.16 --
-# ``expected types '[bool, long, int, decimal, double']``. We had the quote
-# outside, which is the sensible form and the wrong one.
-_BOOL_OR_NUMBER_TYPES_MSG = "'[bool, long, int, decimal, double']"
+# The per-field IDL type set, verbatim from mongod 8.2.1. The ORDER is mongod's
+# and differs per field (``findAndModify.remove`` and ``getMore.batchSize`` do
+# not agree), so each constant is probed, not derived.
+#
+# 6.0.16 also put the closing quote INSIDE the bracket here
+# (``'[bool, long, int, decimal, double']``); 8.x quotes it properly. If you are
+# reading this against a 6.0 server, that is why it does not match.
+_BOOL_OR_NUMBER_TYPES_MSG = "'[int, decimal, long, bool, double]'"
 
 
 def _require_bool_value_field(doc: Mapping[str, Any], field_name: str) -> dict[str, Any] | None:
@@ -3559,8 +3573,9 @@ def _find_and_modify(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]
     TypeMismatch for an unknown modifier (mongod: 9) and for a ``_id`` change
     (mongod: 66), and the driver-canonical handling keyed on those codes never
     fired. The ``update`` command has had this mapping for a while; this is the
-    same rule, plus the execution-error wrapper that ``findAndModify``
-    (uniquely, on 6.0.16) puts in front of its message.
+    same rule, plus the execution-error wrapper that ``findAndModify`` puts in
+    front of its message. On 6.0 findAndModify was alone in doing that; on 8.x
+    the ``update`` command wraps its execution errors too.
     """
     try:
         return _find_and_modify_impl(doc, ctx)
@@ -4455,7 +4470,7 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             return {
                 "ok": 0.0,
                 "errmsg": f"BSON field 'batchSize' value must be >= 0, actual value {batch_size}",
-                "code": 51024,
+                "code": 2,
                 "codeName": "BadValue",
             }
     else:

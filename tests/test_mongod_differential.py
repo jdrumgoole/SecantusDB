@@ -79,7 +79,7 @@ requires_mongod = pytest.mark.skipif(MONGOD is None, reason="no mongod on PATH")
 # The cost is real: on a non-6.0 box this file provides no coverage. That is the
 # honest answer -- on an unprobed server an exact-match gate has no expectation
 # to assert. Run it on 6.0 (or retarget deliberately; see backlog.md 5).
-PROBED_MONGOD_SERIES = (6, 0)
+PROBED_MONGOD_SERIES = (8, 2)
 
 
 def _free_port() -> int:
