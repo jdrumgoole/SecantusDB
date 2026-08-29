@@ -14,16 +14,18 @@ and ORM-/migration-generated functions actually use:
 - embedded SQL: ``SELECT … INTO var[, …] …`` (assigns the query's first row to the
   targets), ``PERFORM query`` (runs a query for its side effects), and bare
   ``INSERT`` / ``UPDATE`` / ``DELETE`` statements;
-- ``NULL ;`` no-op.
+- ``NULL ;`` no-op;
+- refcursors: ``OPEN <cursor> FOR <query>`` (materializes into a session
+  cursor named like PG's unnamed portals) and ``CLOSE <cursor>``.
 
 A bare identifier in an expression or embedded query that matches a declared
 variable or a function parameter resolves to that value; everything else is left
 for the ordinary SQL machinery to resolve (table columns, functions, subqueries).
 
 **Out of scope** (raises ``feature_not_supported`` / ``0A000``): loops
-(``LOOP`` / ``WHILE`` / ``FOR``), ``RAISE``, ``RETURN QUERY`` / ``RETURN NEXT``
-(set-returning functions), ``CASE`` statements, cursors, exception handlers
-(``EXCEPTION WHEN``), and dynamic ``EXECUTE``.
+(``LOOP`` / ``WHILE`` / ``FOR``), ``RETURN QUERY`` / ``RETURN NEXT``
+(set-returning functions), ``CASE`` statements, ``OPEN … FOR EXECUTE``,
+exception handlers (``EXCEPTION WHEN``), and dynamic ``EXECUTE``.
 """
 
 from __future__ import annotations
@@ -161,6 +163,27 @@ class If:
 class SqlInto:
     query: str  # SELECT text with the INTO clause removed
     targets: list[str]
+
+
+@dataclass
+class Raise:
+    level: str  # NOTICE / WARNING / INFO / LOG / DEBUG / EXCEPTION
+    template: str  # plpgsql format string ('%' = next argument)
+    arg_exprs: list[str]
+
+
+@dataclass
+class OpenCursor:
+    """``OPEN <var> FOR <query>`` — materialize the query into a server-side
+    cursor and bind the variable to its generated name."""
+
+    var: str
+    query: str
+
+
+@dataclass
+class CloseCursor:
+    var: str
 
 
 @dataclass
@@ -302,7 +325,40 @@ class _Parser:
             query = "SELECT " + self._raw(lo, self.i)
             self.i += 1
             return SqlExec(query)
-        if self._is_kw(tok, "raise", "loop", "while", "for", "case", "execute", "foreach"):
+        if self._is_kw(tok, "raise"):
+            return self._parse_raise()
+        if self._is_kw(tok, "commit", "rollback"):
+            # Transaction control inside a procedure. In the CALL's autocommit
+            # context there is no in-flight block to end, so this is a no-op that
+            # lets execution continue (a data-changing procedure that relies on a
+            # mid-body COMMIT/ROLLBACK boundary is a documented simplification).
+            self.i += 1
+            self._consume_optional_semi()
+            return SqlExec("")
+        if self._is_kw(tok, "open"):
+            # OPEN <var> FOR <query>;  — bind a refcursor variable to a
+            # materialized server-side cursor. (The parameterized
+            # ``OPEN c FOR EXECUTE`` form is not supported.)
+            var_tok = self._peek(1)
+            for_tok = self._peek(2)
+            if var_tok is None or var_tok.kind != "word" or not self._is_kw(for_tok, "for"):
+                raise errors.feature_not_supported(
+                    "plpgsql OPEN supports only the OPEN <cursor> FOR <query> form"
+                )
+            self.i += 3
+            lo = self.i
+            self._skip_to_semi()
+            query = self._raw(lo, self.i)
+            self.i += 1
+            return OpenCursor(var_tok.val, query)
+        if self._is_kw(tok, "close"):
+            var_tok = self._peek(1)
+            if var_tok is None or var_tok.kind != "word":
+                raise errors.feature_not_supported("plpgsql CLOSE requires a cursor variable")
+            self.i += 2
+            self._consume_optional_semi()
+            return CloseCursor(var_tok.val)
+        if self._is_kw(tok, "loop", "while", "for", "case", "execute", "foreach"):
             raise errors.feature_not_supported(
                 f"plpgsql statement {tok.val.upper()} is not supported"
             )
@@ -312,6 +368,26 @@ class _Parser:
             if nxt is not None and (nxt.kind == "sym" and nxt.val in (":=", "=")):
                 name = tok.val
                 self.i += 2
+                lo = self.i
+                self._skip_to_semi()
+                expr = self._raw(lo, self.i)
+                self.i += 1
+                return Assign(name, expr)
+            # record-field assignment:  new.field := expr  (a trigger function
+            # mutating its NEW row).
+            dot, fld, op = self._peek(1), self._peek(2), self._peek(3)
+            if (
+                dot is not None
+                and dot.kind == "sym"
+                and dot.val == "."
+                and fld is not None
+                and fld.kind == "word"
+                and op is not None
+                and op.kind == "sym"
+                and op.val in (":=", "=")
+            ):
+                name = f"{tok.val}.{fld.val}"
+                self.i += 4
                 lo = self.i
                 self._skip_to_semi()
                 expr = self._raw(lo, self.i)
@@ -328,6 +404,55 @@ class _Parser:
         raise errors.feature_not_supported(
             f"plpgsql statement starting with {tok.val!r} is not supported"
         )
+
+    def _parse_raise(self) -> Raise:
+        """``RAISE [level] 'format' [, expr]* ;`` — bare ``RAISE 'x'`` is an
+        EXCEPTION, exactly PG's default level."""
+        self.i += 1  # RAISE
+        level = "exception"
+        tok = self._peek()
+        if (
+            tok is not None
+            and tok.kind == "word"
+            and tok.val.lower() in ("debug", "log", "info", "notice", "warning", "exception")
+        ):
+            level = tok.val.lower()
+            self.i += 1
+        tok = self._peek()
+        if tok is None or tok.kind != "str":
+            raise errors.feature_not_supported("RAISE requires a string format in this interpreter")
+        template = tok.val
+        # The tokenizer keeps the literal's surrounding quotes and doubled
+        # inner quotes; RAISE wants the decoded text.
+        if len(template) >= 2 and template[0] == "'" and template[-1] == "'":
+            template = template[1:-1].replace("''", "'")
+        self.i += 1
+        arg_exprs: list[str] = []
+        while True:
+            tok = self._peek()
+            if tok is not None and tok.kind == "sym" and tok.val == ",":
+                self.i += 1
+                lo = self.i
+                # one expression: up to the next top-level comma or semicolon
+                depth = 0
+                while True:
+                    cur = self._peek()
+                    if cur is None:
+                        break
+                    if cur.kind == "sym" and cur.val == "(":
+                        depth += 1
+                    elif cur.kind == "sym" and cur.val == ")":
+                        depth -= 1
+                    elif depth == 0 and (
+                        cur.kind == "semi" or (cur.kind == "sym" and cur.val == ",")
+                    ):
+                        break
+                    self.i += 1
+                arg_exprs.append(self._raw(lo, self.i))
+                continue
+            break
+        self._consume_optional_semi()
+        return Raise(level.upper(), template, arg_exprs)
 
     def _consume_optional_semi(self) -> None:
         cur = self._peek()
@@ -504,6 +629,15 @@ class _Runner:
 
     def _run_stmt(self, st: Any, env: dict[str, Any]) -> None:
         if isinstance(st, Assign):
+            if "." in st.name:
+                # ``new.field := expr`` — mutate a record variable's field (a
+                # BEFORE ROW trigger shaping its NEW row).
+                base, _, fld = st.name.lower().partition(".")
+                record = env.get(base)
+                if not isinstance(record, dict):
+                    raise errors.SQLError("42703", f'"{st.name}" is not a known variable')
+                record[fld] = self._eval(st.expr, env)
+                return
             if st.name.lower() not in env and st.name.lower() not in self.types:
                 raise errors.SQLError("42703", f'"{st.name}" is not a known variable')
             val = self._eval(st.expr, env)
@@ -524,11 +658,66 @@ class _Runner:
         if isinstance(st, SqlInto):
             self._run_into(st, env)
             return
+        if isinstance(st, Raise):
+            parts = st.template.split("%")
+            vals = [self._eval(e, env) for e in st.arg_exprs]
+            msg = parts[0]
+            for i, part in enumerate(parts[1:]):
+                v = vals[i] if i < len(vals) else ""
+                msg += ("" if v is None else str(v)) + part
+            if st.level == "EXCEPTION":
+                raise errors.SQLError("P0001", msg)
+            # Side-channel to the enclosing statement's SQLResult: the engine
+            # drains ``session.plpgsql_notices`` into ``result.notices`` after
+            # each statement, and the wire layer emits NoticeResponse from
+            # there (pgjdbc's testRaiseNotice reads them via getWarnings()).
+            session = getattr(self.ctx, "session", None)
+            if session is not None:
+                if not hasattr(session, "plpgsql_notices"):
+                    session.plpgsql_notices = []
+                session.plpgsql_notices.append((st.level, msg))
+            return
         if isinstance(st, SqlExec):
             if st.query.strip():
                 self._run_sql(st.query, env)
             return
+        if isinstance(st, OpenCursor):
+            self._open_cursor(st, env)
+            return
+        if isinstance(st, CloseCursor):
+            session = getattr(self.ctx, "session", None)
+            name = env.get(st.var.lower())
+            if session is None or not isinstance(name, str) or name not in session.cursors:
+                raise errors.SQLError("34000", f'cursor "{st.var}" does not exist')
+            del session.cursors[name]
+            return
         raise errors.feature_not_supported(f"plpgsql: cannot execute {type(st).__name__}")
+
+    def _open_cursor(self, st: OpenCursor, env: dict[str, Any]) -> None:
+        """Materialize ``OPEN <var> FOR <query>`` into a session cursor named
+        like PG's unnamed portals and bind the variable to that name — the
+        caller FETCHes from it by name (pgjdbc's refcursor round-trip)."""
+        from secantus.sql import engine as _engine
+
+        c = self.ctx
+        session = getattr(c, "session", None)
+        if session is None:
+            raise errors.feature_not_supported("plpgsql OPEN needs a session")
+        seq = getattr(session, "refcursor_seq", 0) + 1
+        session.refcursor_seq = seq
+        name = f"<unnamed portal {seq}>"
+        stmt = sqlglot.parse_one(st.query, read="postgres")
+        stmt = self._inline(stmt, env)
+        _engine.materialize_cursor(
+            name,
+            stmt,
+            c.storage,
+            c.db,
+            c.catalog,
+            session,
+            statement=f"OPEN {st.var} FOR {st.query}",
+        )
+        env[st.var.lower()] = name
 
     # -- expression + embedded-SQL evaluation -------------------------------- #
 
@@ -541,10 +730,18 @@ class _Runner:
 
     def _scope(self, env: dict[str, Any]):
         def scope(col: Any) -> Any:
-            if isinstance(col, exp.Column) and not col.table:
-                nm = col.name.lower()
-                if nm in env:
-                    return env[nm]
+            if isinstance(col, exp.Column):
+                if col.table:
+                    # ``new.t`` — a record variable's field (trigger NEW row).
+                    record = env.get(col.table.lower())
+                    if isinstance(record, dict):
+                        key = col.name.lower()
+                        if key in record:
+                            return record[key]
+                else:
+                    nm = col.name.lower()
+                    if nm in env:
+                        return env[nm]
             raise errors.SQLError("42703", f'column "{getattr(col, "name", col)}" does not exist')
 
         return scope
@@ -608,6 +805,24 @@ def _truthy(value: Any) -> bool:
     return bool(value)
 
 
+def invoke_trigger(func: dict, new_record: dict, ctx: scalar.ScalarContext) -> dict | None:
+    """Run a ``RETURNS trigger`` plpgsql function for a BEFORE ROW event.
+
+    ``new_record`` is the row as a column-name-keyed dict, bound to the
+    function's ``NEW`` variable — the body may read fields (``new.t``), assign
+    them (``new.ts := …``), and ``RETURN NEW``. Returns the (possibly mutated)
+    record, or None when the function returned NULL — PG's "skip this row"."""
+    block = parse(func["body"])
+    runner = _Runner(ctx, [], func)
+    env: dict[str, Any] = {"new": dict(new_record)}
+    result = runner.run(block, env)
+    if result is None:
+        return None
+    if not isinstance(result, dict):
+        raise errors.SQLError("42804", "trigger function must return NEW or NULL")
+    return result
+
+
 def invoke(func: dict, args: list[Any], ctx: scalar.ScalarContext) -> Any:
     """Run a ``LANGUAGE plpgsql`` function and return its scalar result."""
     block = parse(func["body"])
@@ -625,3 +840,18 @@ def invoke(func: dict, args: list[Any], ctx: scalar.ScalarContext) -> Any:
         with contextlib.suppress(errors.SQLError, ValueError, TypeError):
             result = typemap.coerce(result, return_tag)
     return result
+
+
+def invoke_procedure(func: dict, args: list[Any], ctx: scalar.ScalarContext) -> dict[str, Any]:
+    """Run a ``LANGUAGE plpgsql`` PROCEDURE body and return the final variable
+    environment — the caller reads the OUT / INOUT parameter values from it to
+    build the CALL result row. A procedure has no RETURN value."""
+    block = parse(func["body"])
+    env: dict[str, Any] = {}
+    runner = _Runner(ctx, args, func)
+    params = func.get("params") or []
+    for i, name in enumerate(params):
+        if name is not None and i < len(args):
+            env[str(name).lower()] = args[i]
+    runner.run(block, env)
+    return env

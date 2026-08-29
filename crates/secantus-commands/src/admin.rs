@@ -30,6 +30,7 @@
 
 use bson::{doc, Bson, Document};
 
+use crate::argtypes;
 use crate::find::split_into_cursor;
 use crate::util::{
     as_i64, bool_field, coll_arg, collation_of, command_error, docs_to_bson, encode_docs,
@@ -73,7 +74,18 @@ fn collection_option_subset(doc: &Document) -> Document {
 
 /// `create` — create a collection, persisting recognised options.
 pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    // Before the namespace checks: mongod parses the command before executing it,
+    // so a wrong-typed option on a MISSING collection is still the type error.
+    argtypes::require_object(doc, "storageEngine", "create.storageEngine")?;
     let coll = coll_arg(doc, "create")?;
+    if let Some(unknown) = first_unknown_field(doc, CREATE_KNOWN_OPTIONS) {
+        return Ok(CommandError::new(
+            40415,
+            "Location40415",
+            format!("BSON field 'create.{unknown}' is an unknown field"),
+        )
+        .into_reply());
+    }
     // Build the options up front so they ride the `create` oplog entry (carried
     // by create_collection_with_options) — that's what lets PITR replay
     // reconstruct capped / validator / … rather than seeing a bare create.
@@ -146,6 +158,7 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// options into the collection's stored blob. Errors `NamespaceNotFound` (26)
 /// when the collection doesn't exist. (TTL-index `index` modification deferred.)
 pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    argtypes::require_object(doc, "index", "collMod.index")?;
     let coll = match doc.get("collMod").or_else(|| doc.get("collmod")) {
         Some(Bson::String(s)) => s.clone(),
         _ => {
@@ -489,15 +502,19 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "drop")?;
     let ns = format!("{}.{}", ctx.db_name, coll);
     let storage = ctx.storage()?;
-    let existed = storage
-        .drop_collection(&ctx.db_name, &coll)
-        .map_err(command_error)?;
-    // Dropping a collection kills its open cursors so a later getMore fails with
-    // CursorNotFound rather than serving stale snapshot rows (mongo-c-driver's
-    // error_document/getmore). Mirrors commands.py::_drop.
+    // Kill the collection's cursors BEFORE the storage drop, not after: the
+    // drop emits an oplog entry that wakes any awaitData getMore parked on a
+    // tailable cursor, and that getMore must observe the tombstone set here so
+    // it reports "collection dropped" instead of re-polling a collection that
+    // is already gone. Non-tailable cursors are removed outright, so a later
+    // getMore is CursorNotFound (mongo-c-driver's error_document/getmore).
+    // Mirrors commands.py::_drop.
     if let Ok(cursors) = ctx.cursors() {
         cursors.kill_namespace(&ns);
     }
+    let existed = storage
+        .drop_collection(&ctx.db_name, &coll)
+        .map_err(command_error)?;
     if !existed {
         // Modern mongod treats `drop` of a non-existent collection as an
         // idempotent success (`{ok: 1}`), not a NamespaceNotFound error. The
@@ -718,7 +735,7 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         .and_then(|c| c.get("batchSize"))
         .and_then(as_i64)
         .unwrap_or(DEFAULT_BATCH_SIZE as i64);
-    let (first, cid) = split_into_cursor(encode_docs(entries)?, batch_size, &ns, cursors)?;
+    let (first, cid) = split_into_cursor(encode_docs(entries)?, batch_size, &ns, cursors, true)?;
     Ok(doc! {
         "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
         "ok": 1.0,
@@ -770,6 +787,7 @@ pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
 
 /// `listIndexes` — a cursor over the indexes of a collection.
 pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    argtypes::require_cursor_object(doc)?;
     let coll = coll_arg(doc, "listIndexes")?;
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
@@ -819,7 +837,15 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .collect();
         indexes = std::iter::once(clustered).chain(rest.drain(..)).collect();
     }
-    let ns = format!("{}.$cmd.listIndexes.{}", ctx.db_name, coll);
+    // mongod reports a listIndexes cursor under the PLAIN collection namespace
+    // (`db.coll`), not a `$cmd.` pseudo-namespace -- probed on 8.3.4. That is
+    // also what drivers put in the follow-up getMore's `collection` field, so a
+    // `$cmd.listIndexes.<coll>` namespace failed the getMore ownership check and
+    // made the second batch unreachable (CursorNotFound), i.e. listIndexes could
+    // not be paginated at all. Contrast `listCollections`, which really is
+    // `db.$cmd.listCollections` on mongod, and the collectionless `aggregate: 1`
+    // form, which really is `db.$cmd.aggregate` -- both already correct.
+    let ns = format!("{}.{}", ctx.db_name, coll);
     // Honour `cursor: {batchSize: N}` so a client asking for a small batch gets a
     // real getMore round-trip (the Go driver's
     // `TestIndexView/list/getMore_commands_are_monitored` asserts a getMore fires
@@ -830,7 +856,19 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .and_then(|c| c.get("batchSize"))
         .and_then(as_i64)
         .unwrap_or(DEFAULT_BATCH_SIZE as i64);
-    let (first, cid) = split_into_cursor(encode_docs(indexes)?, batch_size, &ns, cursors)?;
+    // A negative batchSize is rejected, not clamped. mongo-ruby-driver's
+    // `Collection#indexes when a session is provided` uses `batch_size: -100`
+    // as its deliberately-failing operation and asserts an OperationFailure.
+    // Mirrors `commands._list_indexes`.
+    if batch_size < 0 {
+        return Ok(CommandError::new(
+            51024,
+            "BadValue",
+            format!("BSON field 'batchSize' value must be >= 0, actual value {batch_size}"),
+        )
+        .into_reply());
+    }
+    let (first, cid) = split_into_cursor(encode_docs(indexes)?, batch_size, &ns, cursors, true)?;
     Ok(doc! {
         "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
         "ok": 1.0,
@@ -934,6 +972,17 @@ fn is_falsy(v: &Bson) -> bool {
 }
 
 pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    // `indexes` is an array of specs; a scalar there used to report ok:1 and
+    // create NOTHING, so a driver believed an index existed that did not.
+    argtypes::require_array(doc, "indexes", "createIndexes.indexes")?;
+    if let Some(bson::Bson::Array(specs)) = doc.get("indexes") {
+        for spec in specs {
+            if let bson::Bson::Document(spec) = spec {
+                argtypes::require_object(spec, "key", "createIndexes.key")?;
+                argtypes::require_string(spec, "name", "createIndexes.name")?;
+            }
+        }
+    }
     let coll = coll_arg(doc, "createIndexes")?;
     let storage = ctx.storage()?;
     let specs: Vec<Bson> = match doc.get("indexes") {
@@ -983,6 +1032,20 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             .and_then(Bson::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| default_index_name(&key));
+        // Unknown fields on the spec itself are rejected, not ignored.
+        let spec_opts: Document = s
+            .iter()
+            .filter(|(k, _)| k.as_str() != "key" && k.as_str() != "name")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if let Some(unknown) = first_unknown_field(&spec_opts, INDEX_SPEC_KNOWN_OPTIONS) {
+            return Ok(CommandError::new(
+                40415,
+                "Location40415",
+                format!("Error in specification {s:?}: the field '{unknown}' is an unknown field"),
+            )
+            .into_reply());
+        }
         // Guard the index name against an embedded NUL before it reaches the
         // WT key encoder (see crate::nul_in_namespace / #139).
         if let Some(e) = crate::nul_in_namespace("index name", &name) {
@@ -1271,6 +1334,11 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     // `CursorRegistry::len` prunes idle cursors then counts the live ones — the
     // count rises while a batched cursor is open and drops on killCursors.
     let open_cursors = ctx.cursors().map(|c| c.len()).unwrap_or(0) as i64;
+    // Real counts when the server supplied them; zeros off-server (unit tests).
+    let conns = ctx.conn_stats.unwrap_or_default();
+    // Defaults to persistent when there is no storage (unit-test contexts),
+    // matching the Python server's fallback rather than erroring the command.
+    let persistent = ctx.storage().map(|s| !s.in_memory()).unwrap_or(true);
     Ok(doc! {
         "host": "secantus",
         "version": crate::SERVER_VERSION,
@@ -1284,6 +1352,43 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
                 "open": { "total": open_cursors, "pinned": 0i64, "noTimeout": 0i64 },
             },
         },
+        // mongo-c-driver's `/Client/exhaust_cursor/{single,pool}` read
+        // `connections.totalCreated` off serverStatus to check the connection
+        // pool wasn't cleared. Omitting the section made those fail with
+        // "'connections.totalCreated' field not found" — a serverStatus gap
+        // that looked like an exhaust-cursor bug. Mirrors the Python server's
+        // zeroed block; SecantusDB keeps no pool counters.
+        // Int32, not Int64: libmongoc reads these with `bson_lookup_int32`,
+        // which type-checks rather than coercing ("'connections.totalCreated'
+        // is not a int32"). The Python server emits plain ints, which encode
+        // as Int32, so it never hit this.
+        "connections": {
+            "current": conns.current as i32,
+            "available": 0i32,
+            "totalCreated": conns.total_created as i32,
+        },
+        "opcounters": {
+            "insert": 0i32, "query": 0i32, "update": 0i32,
+            "delete": 0i32, "getmore": 0i32, "command": 0i32,
+        },
+        // Storage-engine identity. Drivers gate real behaviour on this:
+        // mongo-php-library's `skipIfTransactionsNotSupported` reads
+        // `storageEngine.name` and throws "Could not determine server storage
+        // engine" when the key is absent, turning ~27 transaction tests into
+        // ERRORs instead of the clean skip the helper intends. Reporting
+        // "wiredTiger" is honest — SecantusDB is WiredTiger-backed, the same
+        // engine mongod uses. Kept byte-identical to the Python server's
+        // `_storage_engine_section`.
+        "storageEngine": {
+            "name": "wiredTiger",
+            "supportsCommittedReads": true,
+            "supportsPendingDrops": true,
+            "supportsSnapshotReadConcern": true,
+            "readOnly": false,
+            "persistent": persistent,
+            "backupCursorOpen": false,
+        },
+        "network": { "numRequests": 0i32, "bytesIn": 0i32, "bytesOut": 0i32 },
         // Categorical self-identification: real mongod never has this key.
         // Tooling (the conformance-gauge tripwire, ad-hoc smoke scripts)
         // checks it to prove it's talking to SecantusDB rather than an
@@ -1455,6 +1560,93 @@ pub fn profile(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
 }
 
+/// Options mongod's index-spec IDL accepts, plus the legacy / deprecated forms
+/// drivers still emit. Anything outside this set is an unknown field.
+/// Mirrors `commands._INDEX_SPEC_KNOWN_OPTIONS` — keep the two in step.
+const INDEX_SPEC_KNOWN_OPTIONS: &[&str] = &[
+    // Geometric / vector indexes.
+    "2dsphereIndexVersion",
+    "bits",
+    "min",
+    "max",
+    // Wildcard.
+    "wildcardProjection",
+    // Standard knobs.
+    "unique",
+    "sparse",
+    "hidden",
+    "background",
+    "expireAfterSeconds",
+    "partialFilterExpression",
+    "collation",
+    "storageEngine",
+    // Text — accepted on the wire even though text indexes are unsupported
+    // (storage rejects them with CreateIndexUnsupported).
+    "weights",
+    "default_language",
+    "language_override",
+    "textIndexVersion",
+    // Index format version + namespace (legacy drivers).
+    "v",
+    "ns",
+    // Haystack (deprecated).
+    "bucketSize",
+    // Removed in MongoDB 3.0; modern mongod accepts and silently ignores it,
+    // so a unique index over duplicate data still fails on the duplicate
+    // rather than on an unknown-field error.
+    "dropDups",
+];
+
+/// Top-level options the `create` command accepts, plus the wire-envelope
+/// fields a driver may attach. Mirrors `commands._CREATE_KNOWN_OPTIONS`.
+const CREATE_KNOWN_OPTIONS: &[&str] = &[
+    "create",
+    "capped",
+    "size",
+    "max",
+    "validator",
+    "validationAction",
+    "validationLevel",
+    "viewOn",
+    "pipeline",
+    "collation",
+    "expireAfterSeconds",
+    "timeseries",
+    "clusteredIndex",
+    "changeStreamPreAndPostImages",
+    "storageEngine",
+    "indexOptionDefaults",
+    "writeConcern",
+    "comment",
+    "maxTimeMS",
+    // mongorestore sends the source collection's full `_id_` spec.
+    "idIndex",
+    // Legacy / deprecated but tolerated.
+    "autoIndexId",
+    "flags",
+    // Non-`$`-prefixed envelope fields ( `$`-prefixed keys are accepted
+    // unconditionally by the caller).
+    "lsid",
+    "txnNumber",
+    "autocommit",
+    "startTransaction",
+    "readConcern",
+    "apiVersion",
+    "apiStrict",
+    "apiDeprecationErrors",
+];
+
+/// The first field of `doc` outside `known`, ignoring `$`-prefixed envelope
+/// keys. mongod surfaces an unknown field as `Location40415` (IDLUnknownField)
+/// rather than ignoring it, and driver suites rely on that: mongo-ruby-driver's
+/// "a failed operation using a session" shared specs provoke it deliberately by
+/// passing `invalid: true` and asserting an `OperationFailure`.
+fn first_unknown_field(doc: &Document, known: &[&str]) -> Option<String> {
+    doc.keys()
+        .find(|k| !k.starts_with('$') && !known.contains(&k.as_str()))
+        .cloned()
+}
+
 /// Split a `db.coll` namespace into `(db, coll)`.
 fn split_ns(ns: &str) -> (String, String) {
     match ns.split_once('.') {
@@ -1479,4 +1671,312 @@ fn default_index_name(key: &Document) -> String {
         })
         .collect::<Vec<_>>()
         .join("_")
+}
+
+/// `createSearchIndexes` / `updateSearchIndex` / `dropSearchIndex` — Atlas Search
+/// index management, an Atlas-only feature.
+///
+/// A real non-Atlas mongod *registers* these commands and fails them at
+/// execution with a message naming Atlas; the driver index-management spec
+/// tests assert only that the error mentions Atlas. Leaving them unregistered
+/// returns `CommandNotFound` (59) instead, which is what
+/// mongo-c-driver's `/index-management/{update,drop}SearchIndex` caught. The
+/// message is shared with the `$listSearchIndexes` stage so the two stay in
+/// lockstep. Mirrors `commands._search_index_not_supported`.
+pub fn search_index_not_supported(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+    Ok(CommandError::new(
+        115,
+        "CommandNotSupported",
+        crate::aggregate::SEARCH_INDEX_ATLAS_MSG,
+    )
+    .into_reply())
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    use bson::doc;
+
+    fn ctx() -> CommandContext {
+        let mut c = CommandContext::new(1);
+        c.db_name = "testdb".to_string();
+        c
+    }
+
+    fn err_of(reply: &Document) -> (i32, String, String) {
+        (
+            reply.get_i32("code").unwrap_or_default(),
+            reply.get_str("codeName").unwrap_or_default().to_string(),
+            reply.get_str("errmsg").unwrap_or_default().to_string(),
+        )
+    }
+
+    /// mongo-c-driver's `/index-management/{update,drop}SearchIndex` assert the
+    /// error names Atlas. Leaving the commands unregistered returned
+    /// `CommandNotFound` (59) instead.
+    #[test]
+    fn search_index_commands_report_atlas_not_command_not_found() {
+        for name in [
+            "createSearchIndexes",
+            "updateSearchIndex",
+            "dropSearchIndex",
+        ] {
+            assert!(
+                crate::lookup_for_test(name).is_some(),
+                "{name} must be registered, not CommandNotFound"
+            );
+        }
+        let reply = search_index_not_supported(&doc! {"dropSearchIndex": "c"}, &mut ctx()).unwrap();
+        let (code, name, msg) = err_of(&reply);
+        assert_eq!((code, name.as_str()), (115, "CommandNotSupported"));
+        assert!(
+            msg.contains("Atlas"),
+            "the driver specs assert on 'Atlas': {msg}"
+        );
+    }
+
+    /// mongo-ruby-driver's "a failed operation using a session" shared specs
+    /// pass `invalid: true` and assert an `OperationFailure`; silently
+    /// accepting the unknown field made them fail.
+    #[test]
+    fn create_rejects_an_unknown_top_level_option() {
+        let reply = create(&doc! {"create": "c", "invalid": true}, &mut ctx()).unwrap();
+        let (code, name, msg) = err_of(&reply);
+        assert_eq!((code, name.as_str()), (40415, "Location40415"));
+        assert!(msg.contains("create.invalid"), "{msg}");
+    }
+
+    #[test]
+    fn create_still_accepts_every_known_option_and_the_wire_envelope() {
+        // A `$`-prefixed envelope key and the non-`$` ones must pass through.
+        let d = doc! {
+            "create": "c", "capped": true, "size": 4096_i64, "max": 512_i64,
+            "lsid": {"id": "x"}, "$db": "testdb", "writeConcern": {"w": 1},
+        };
+        assert!(
+            first_unknown_field(&d, CREATE_KNOWN_OPTIONS).is_none(),
+            "known options must not trip the unknown-field check"
+        );
+    }
+
+    /// End to end through `createIndexes`, which is what the Ruby spec drives:
+    /// `view.create_one({random: 1}, invalid: true)`.
+    #[test]
+    fn create_indexes_rejects_an_unknown_spec_option() {
+        let mut c = ctx();
+        c = c.with_storage(std::sync::Arc::new(FakeStorage));
+        let reply = create_indexes(
+            &doc! {
+                "createIndexes": "specs",
+                "indexes": [{"key": {"random": 1}, "name": "random_1", "invalid": true}],
+            },
+            &mut c,
+        )
+        .unwrap();
+        let (code, name, msg) = err_of(&reply);
+        assert_eq!((code, name.as_str()), (40415, "Location40415"));
+        assert!(msg.contains("invalid"), "{msg}");
+    }
+
+    #[test]
+    fn create_indexes_accepts_a_valid_spec() {
+        let mut c = ctx();
+        c = c.with_storage(std::sync::Arc::new(FakeStorage));
+        let reply = create_indexes(
+            &doc! {
+                "createIndexes": "specs",
+                "indexes": [{"key": {"a": 1}, "name": "a_1", "unique": true}],
+            },
+            &mut c,
+        )
+        .unwrap();
+        assert_eq!(reply.get_f64("ok").unwrap_or(0.0), 1.0, "{reply:?}");
+    }
+
+    /// mongo-php-library's `skipIfTransactionsNotSupported` reads
+    /// `storageEngine.name`, and throws "Could not determine server storage
+    /// engine" when it is absent — erroring ~27 transaction tests rather than
+    /// skipping them. Must stay byte-identical to the Python server's
+    /// `_storage_engine_section`.
+    #[test]
+    fn server_status_reports_wiredtiger_storage_engine() {
+        let mut c = ctx();
+        c = c.with_cursors(std::sync::Arc::new(crate::CursorRegistry::new()));
+        let reply = server_status(&doc! {"serverStatus": 1}, &mut c).unwrap();
+        let engine = reply.get_document("storageEngine").expect("storageEngine");
+        assert_eq!(engine.get_str("name").unwrap(), "wiredTiger");
+        assert!(engine.get_bool("supportsCommittedReads").unwrap());
+        assert!(engine.get_bool("supportsSnapshotReadConcern").unwrap());
+        assert!(!engine.get_bool("readOnly").unwrap());
+        // No storage attached (unit context) falls back to persistent, matching
+        // the Python server rather than failing the command.
+        assert!(engine.get_bool("persistent").unwrap());
+    }
+
+    /// mongo-c-driver's `/Client/exhaust_cursor/{single,pool}` read
+    /// `connections.totalCreated` to check the pool wasn't cleared. Its absence
+    /// failed them with "field not found", which read as an exhaust-cursor bug.
+    #[test]
+    fn server_status_carries_the_sections_drivers_read() {
+        let mut c = ctx();
+        c = c.with_cursors(std::sync::Arc::new(crate::CursorRegistry::new()));
+        let reply = server_status(&doc! {"serverStatus": 1}, &mut c).unwrap();
+        let conns = reply.get_document("connections").expect("connections");
+        // Int32 specifically — libmongoc type-checks with bson_lookup_int32
+        // rather than coercing, so an Int64 zero fails just as hard as a
+        // missing field.
+        for f in ["totalCreated", "current", "available"] {
+            assert!(
+                matches!(conns.get(f), Some(bson::Bson::Int32(_))),
+                "connections.{f} must be Int32: {conns:?}"
+            );
+        }
+
+        // With real counters attached, the reported values are those — not
+        // zeros. The exhaust tests read `totalCreated` before and after opening
+        // a cursor and require it to have risen, so a constant is not enough.
+        let mut c2 = ctx();
+        c2 = c2
+            .with_cursors(std::sync::Arc::new(crate::CursorRegistry::new()))
+            .with_conn_stats(crate::ConnStats {
+                current: 3,
+                total_created: 7,
+            });
+        let reply2 = server_status(&doc! {"serverStatus": 1}, &mut c2).unwrap();
+        let conns2 = reply2.get_document("connections").unwrap();
+        assert_eq!(conns2.get_i32("totalCreated").unwrap(), 7);
+        assert_eq!(conns2.get_i32("current").unwrap(), 3);
+        assert!(reply.get_document("opcounters").is_ok());
+        assert!(reply.get_document("network").is_ok());
+    }
+
+    /// mongo-ruby-driver's `Collection#indexes when a session is provided` uses
+    /// `batch_size: -100` as its deliberately-failing operation.
+    #[test]
+    fn list_indexes_rejects_a_negative_batch_size() {
+        let mut c = ctx();
+        c = c
+            .with_storage(std::sync::Arc::new(FakeStorage))
+            .with_cursors(std::sync::Arc::new(crate::CursorRegistry::new()));
+        let reply = list_indexes(
+            &doc! {"listIndexes": "specs", "cursor": {"batchSize": -100_i32}},
+            &mut c,
+        )
+        .unwrap();
+        let (code, name, msg) = err_of(&reply);
+        assert_eq!((code, name.as_str()), (51024, "BadValue"));
+        assert!(msg.contains("must be >= 0"), "{msg}");
+    }
+
+    #[test]
+    fn list_indexes_still_accepts_a_zero_or_positive_batch_size() {
+        for bs in [0_i32, 2_i32] {
+            let mut c = ctx();
+            c = c
+                .with_storage(std::sync::Arc::new(FakeStorage))
+                .with_cursors(std::sync::Arc::new(crate::CursorRegistry::new()));
+            let reply = list_indexes(
+                &doc! {"listIndexes": "specs", "cursor": {"batchSize": bs}},
+                &mut c,
+            )
+            .unwrap();
+            assert_eq!(
+                reply.get_f64("ok").unwrap_or(0.0),
+                1.0,
+                "batchSize {bs}: {reply:?}"
+            );
+        }
+    }
+
+    /// Minimal in-memory `Storage`: only the methods without a default impl.
+    struct FakeStorage;
+
+    impl crate::Storage for FakeStorage {
+        fn insert(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _docs: Vec<Vec<u8>>,
+            _ordered: bool,
+        ) -> Result<(usize, Vec<Document>), crate::StorageError> {
+            Ok((0, Vec::new()))
+        }
+        fn update_matching(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _filter: &Document,
+            _update: &Document,
+            _multi: bool,
+            _upsert: bool,
+        ) -> Result<crate::UpdateOutcome, crate::StorageError> {
+            Ok(crate::UpdateOutcome::default())
+        }
+        fn delete_matching(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _filter: &Document,
+            _limit: usize,
+        ) -> Result<usize, crate::StorageError> {
+            Ok(0)
+        }
+        fn count_matching(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _filter: &Document,
+        ) -> Result<usize, crate::StorageError> {
+            Ok(0)
+        }
+        fn find(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _filter: &Document,
+            _sort: Option<&Document>,
+            _hint: Option<crate::storage::RawHint<'_>>,
+        ) -> Result<Vec<Vec<u8>>, crate::StorageError> {
+            Ok(Vec::new())
+        }
+        /// A non-empty result is what marks the namespace as existing — an
+        /// empty one is how `list_indexes` detects NamespaceNotFound.
+        fn list_indexes(
+            &self,
+            _db: &str,
+            _coll: &str,
+        ) -> Result<Vec<Document>, crate::StorageError> {
+            Ok(vec![doc! {"v": 2, "key": {"_id": 1}, "name": "_id_"}])
+        }
+    }
+
+    #[test]
+    fn index_spec_accepts_the_documented_options() {
+        for k in [
+            "unique",
+            "sparse",
+            "hidden",
+            "background",
+            "expireAfterSeconds",
+            "partialFilterExpression",
+            "collation",
+            "storageEngine",
+            "weights",
+            "v",
+            "ns",
+            "bucketSize",
+            "dropDups",
+            "2dsphereIndexVersion",
+            "bits",
+            "min",
+            "max",
+            "wildcardProjection",
+        ] {
+            let d = doc! { k: 1 };
+            assert!(
+                first_unknown_field(&d, INDEX_SPEC_KNOWN_OPTIONS).is_none(),
+                "{k} is a real mongod index option and must be accepted"
+            );
+        }
+    }
 }

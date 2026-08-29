@@ -258,3 +258,181 @@ fn drop_all_indexes_clears_registry() {
         assert_eq!(index_names(st, "app", "c"), vec!["_id_"]);
     });
 }
+
+// --------------------------------------------------------------------------- //
+// Unique-key claims (the WT-enforced uniqueness table)
+// --------------------------------------------------------------------------- //
+
+/// Uniqueness must not depend on a snapshot read. The entries table keys by
+/// sortkey + RecordId, so two different docs sharing an indexed value occupy
+/// two distinct WT keys and never collide — which is why the old probe could
+/// miss a value committed after the reader's snapshot. The claims table keys on
+/// the value alone, so WiredTiger refuses the second writer itself.
+#[test]
+fn a_second_doc_cannot_claim_a_held_unique_key() {
+    with_db(|st| {
+        st.create_index("app", "c", "k_1", &doc! {"k": 1}, &doc! {"unique": true})
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "k": "dup"}))
+            .unwrap();
+        let err = st
+            .insert_one("app", "c", &enc(&doc! {"_id": 2, "k": "dup"}))
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::DuplicateKey(_)),
+            "a different doc taking a held key must be refused: {err:?}"
+        );
+        // The rejected insert leaves nothing behind.
+        assert_eq!(st.count_matching("app", "c", &doc! {}, None).unwrap(), 1);
+    });
+}
+
+/// Deleting the owner releases its claim, so the value can be used again. A
+/// claim that outlived its row would reject a legitimate insert.
+#[test]
+fn deleting_the_owner_frees_its_unique_key() {
+    with_db(|st| {
+        st.create_index("app", "c", "k_1", &doc! {"k": 1}, &doc! {"unique": true})
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "k": "v"}))
+            .unwrap();
+        st.delete_matching("app", "c", &doc! {"_id": 1}, 0, &doc! {}, None)
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 2, "k": "v"}))
+            .expect("the freed key must be reusable");
+    });
+}
+
+/// Claims die with the collection. Nothing purged them on the Python side and a
+/// drop -> recreate -> re-insert cycle was falsely refused (#808); this pins the
+/// Rust side against the same class.
+#[test]
+fn dropping_the_collection_frees_its_unique_keys() {
+    with_db(|st| {
+        for _ in 0..3 {
+            st.create_index("app", "c", "k_1", &doc! {"k": 1}, &doc! {"unique": true})
+                .unwrap();
+            st.insert_one("app", "c", &enc(&doc! {"_id": 1, "k": "recycled"}))
+                .expect("each cycle must be able to re-take the value");
+            st.drop_collection("app", "c").unwrap();
+        }
+    });
+}
+
+/// Dropping the index frees its claims — the constraint is gone, so the value
+/// is unconstrained until the index is recreated.
+#[test]
+fn dropping_the_index_frees_its_unique_keys() {
+    with_db(|st| {
+        st.create_index("app", "c", "k_1", &doc! {"k": 1}, &doc! {"unique": true})
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "k": "v"}))
+            .unwrap();
+        st.drop_index("app", "c", "k_1").unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 2, "k": "v"}))
+            .expect("with no unique index the duplicate is allowed");
+    });
+}
+
+/// The bug this table exists for: a doc inside an OPEN user transaction holds a
+/// unique key, and a writer outside that transaction must not take the same
+/// key. The old check was a probe read through the writer's own snapshot, which
+/// cannot see the transaction's uncommitted write — so both wrote and the
+/// unique index silently held two docs.
+///
+/// Threaded on purpose: the holder must stay open *while* the other writer
+/// tries, which one thread cannot express — and the outside writer legitimately
+/// waits for the holder to resolve (mongod parks it the same way), so a
+/// sequential test deadlocks by construction rather than proving anything.
+#[test]
+fn a_writer_outside_a_transaction_cannot_take_a_key_it_holds() {
+    let home = temp_home();
+    let st = std::sync::Arc::new(Storage::open(home.to_str().unwrap()).unwrap());
+    st.create_index("app", "c", "k_1", &doc! {"k": 1}, &doc! {"unique": true})
+        .unwrap();
+
+    let holder = {
+        let st = std::sync::Arc::clone(&st);
+        std::thread::spawn(move || {
+            let mut txn = st.begin_user_transaction().unwrap();
+            st.with_user_transaction(&mut txn, || {
+                st.insert_one("app", "c", &enc(&doc! {"_id": 1, "k": "dup"}))
+            })
+            .unwrap()
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            st.commit_user_transaction(&mut txn).unwrap();
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let outside = st.insert_one("app", "c", &enc(&doc! {"_id": 2, "k": "dup"}));
+    holder.join().unwrap();
+
+    assert!(
+        outside.is_err(),
+        "a writer outside the transaction took a key it was holding — the unique \
+         index would then hold two docs"
+    );
+    assert_eq!(
+        st.count_matching("app", "c", &doc! {"k": "dup"}, None)
+            .unwrap(),
+        1,
+        "exactly one doc may hold the key"
+    );
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The mirror case: once the holder ROLLS BACK the key is free, and the outside
+/// writer must be allowed to take it. A claim surviving an abort would reject a
+/// legitimate insert — the false-rejection half of the same bug.
+#[test]
+fn rolling_back_the_holder_frees_the_key_for_others() {
+    let home = temp_home();
+    let st = std::sync::Arc::new(Storage::open(home.to_str().unwrap()).unwrap());
+    st.create_index("app", "c", "k_1", &doc! {"k": 1}, &doc! {"unique": true})
+        .unwrap();
+
+    let holder = {
+        let st = std::sync::Arc::clone(&st);
+        std::thread::spawn(move || {
+            let mut txn = st.begin_user_transaction().unwrap();
+            st.with_user_transaction(&mut txn, || {
+                st.insert_one("app", "c", &enc(&doc! {"_id": 1, "k": "dup"}))
+            })
+            .unwrap()
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            st.rollback_user_transaction(&mut txn).unwrap();
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let outside = st.insert_one("app", "c", &enc(&doc! {"_id": 2, "k": "dup"}));
+    holder.join().unwrap();
+
+    assert!(
+        outside.is_ok(),
+        "the rolled-back key must be reusable: {outside:?}"
+    );
+    assert_eq!(
+        st.count_matching("app", "c", &doc! {"k": "dup"}, None)
+            .unwrap(),
+        1
+    );
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A non-unique index takes no claims at all, so it never blocks a duplicate.
+#[test]
+fn a_non_unique_index_claims_nothing() {
+    with_db(|st| {
+        st.create_index("app", "c", "k_1", &doc! {"k": 1}, &doc! {})
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "k": "same"}))
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 2, "k": "same"}))
+            .expect("a non-unique index must allow duplicates");
+        assert_eq!(st.count_matching("app", "c", &doc! {}, None).unwrap(), 2);
+    });
+}

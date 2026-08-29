@@ -1,11 +1,35 @@
 # SQL server external conformance gauges plan
 
-**Status: proposed.** This document plans the SQL/Postgres analogue of the
-thirteen MongoDB driver gauges: comprehensive **external, unmodified** test
-suites run against the `SecantusPGServer` over a real `postgresql://…`
-connection, reported as pass/fail/skip counts the way `invoke validate` does
-for pymongo. It expands `tasks/sql-postgres-plan.md` §8's one-line
-`validate-postgres` sketch into a concrete gauge portfolio.
+**Status: SIX gauges landed; portfolio open** (headline corrected 2026-08-20 — it
+still said "first two" while four more had shipped). `tasks.py` defines
+`validate-slt`, `validate-psycopg`, `validate-sqlalchemy`, `validate-pgjdbc`,
+`validate-pgx` and `validate-pgtest`. The per-gauge state below is current and
+richer than this line; what had gone stale was only the count. G1 (sqllogictest —
+`invoke validate-slt`, 26/30 files, 4 declared divergences,
+`docs/validation-report-slt.md`) and G2 (psycopg's unmodified suite —
+`invoke validate-psycopg`, 91.3% at last full run, weekly in `validate.yml`,
+`docs/validation-report-psycopg.md`) are committed tooling; the §6 results log
+below records how they got there. Slice zero (§2) shipped along the way.
+G6 (SQLAlchemy's dialect-compliance suite — `invoke validate-sqlalchemy`,
+weekly in CI) landed 2026-07-31 at 572/738 (77.5%) and reached **978/978
+executed tests passing (100%, zero failures, zero errors)** the same day —
+including the whole schema-qualified surface (the `schemas` capability is
+open now that relations are namespaced per schema); the one closed
+capability is `datetime_microseconds` (the BSON millisecond divergence).
+**Every gauge in the portfolio (G1–G7) is now implemented.** G4 (pgx), G7
+(pgbench + psql), and the G1 `postgres-extended` second lane landed
+2026-07-31; G3 (pgtest) and G5 (pgjdbc) landed 2026-08-01. Remaining work
+is growth, not new gauges: raise each gauge's pass rate (per-gauge clusters
+in `tasks/backlog.md`) and widen include lists (the 622-file sqllogictest
+corpus, pgjdbc packages beyond `jdbc2`, pgx beyond pgconn/pgproto3).
+Npgsql stays unbuilt by choice — pgjdbc covers the same
+JDBC/ADO-style-client ground with a friendlier license and no
+type-preload connect gate; revisit only if .NET-specific coverage is
+wanted. This document plans the SQL/Postgres
+analogue of the thirteen MongoDB driver gauges: comprehensive **external,
+unmodified** test suites run against the `SecantusPGServer` over a real
+`postgresql://…` connection, reported as pass/fail/skip counts the way
+`invoke validate` does for pymongo.
 
 Research basis: a July 2026 survey of the Postgres-compatibility ecosystem —
 every candidate below was verified against its live repo (targeting mechanics,
@@ -245,24 +269,122 @@ suites refuse to run *anything*:
 
 ## 5. Rollout order
 
-1. **Slice zero** (§2): catalog bootstrap queries, `server_version` tuning,
-   SQLSTATE audit (`0A000` for unimplemented), `psql -E` checklist. Without
-   this, Npgsql/asyncpg/Postgrex won't run at all.
-2. **G1 sqllogictest** — vendor the corpus submodule, `cargo install
-   sqllogictest-bin` in the gauge env, `invoke validate-slt` with both
-   `postgres` and `postgres-extended` lanes, `-j 1`. Report per-file and
-   aggregate pass-%. Start with a curated include-list of files; grow.
-3. **G2 psycopg 3** — vendor `psycopg/psycopg` submodule, `invoke
-   validate-psycopg` with `PSYCOPG_TEST_DSN`, include/deselect lists +
-   `expected_failures` catalog, same shape as the pymongo gauge.
-4. **G3 pgtest wire corpus** — vendor cockroach's `pgtest` runner + testdata
-   (sparse checkout or a small extraction repo given monorepo size — decide
-   at implementation; license note in vendor README), `invoke validate-pgwire`.
-5. **G4 pgx**, then **G5 Npgsql or pgjdbc** (pick by which catalog gaps §2
-   surfaces first).
-6. **G7 SQLsmith + pgbench** as always-on stress/smoke (`invoke sql-stress`),
-   any time after slice zero.
-7. **G6 SQLAlchemy compliance suite** once SAVEPOINT/transactional-DDL land.
+1. **Slice zero** (§2): ✅ shipped incrementally through the G2 rounds (§6) —
+   type-OID fidelity, `pg_typeof`, TypeInfo catalog flows, enum/composite/range
+   OID minting, `0A000` for unimplemented features.
+2. **G1 sqllogictest** — ✅ landed (#417): corpus vendored at
+   `vendor/sqllogictest`, `invoke validate-slt` (preprocess → fresh daemon per
+   file → per-file report), curated 30-file include list in
+   `slt_validation/include_paths.py` with 4 declared divergences.
+   Weekly CI landed 2026-07-31 (`validate.yml` installs a pinned
+   `sqllogictest-bin 0.29.1` via cargo, cached by version). The
+   `postgres-extended` second lane landed the same day — every include file
+   now runs through BOTH wire protocols (52/60 lane-files pass; the 8 fails
+   are the 4 declared divergences × 2 lanes), and standing it up surfaced a
+   real extended-protocol bug: Describe of a SELECT-from-view answered
+   NoData while Execute emitted DataRows (a libpq protocol violation), fixed
+   by expanding views at describe time. **Still open**: growing toward the
+   622-file corpus.
+3. **G2 psycopg 3** — ✅ landed: `vendor/psycopg` submodule pinned to the
+   installed 3.3.4, `invoke validate-psycopg` via `PSYCOPG_TEST_DSN`,
+   include/deselect in `psycopg_validation/`, weekly in `validate.yml`.
+   Headline trajectory: 42% → 91.3% (§6).
+4. **G3 pgtest wire corpus** — ✅ landed (2026-08-01) as `invoke
+   validate-pgtest`: the extraction decision resolved by fetching BOTH the
+   corpus (`pkg/sql/pgwire/testdata/pgtest`) and cockroach's own
+   `pkg/testutils/pgtest` runner **verbatim** at a pinned commit via a
+   sparse blob-filtered clone at gauge time (~25 MB, cached under
+   `.validation/` — never vendored, which also keeps the CockroachDB
+   Software License out of the tree; noted in the package docstring). The
+   only committed Go code is ours: a thin `go test` driver + a 10-line
+   `skip` shim (`pgtest_validation/go/`). We present as non-crdb, so the
+   corpus' `crdb_only` exchanges self-skip. Weekly in `validate.yml`
+   (shares the Go toolchain step). Baseline: **8/58 files pass** — each
+   file stops at its first byte-level mismatch, so the number climbs
+   cluster-by-cluster like the psycopg gauge did (42% → 91%); first fix
+   already in (unaliased cast columns named after the type's `typname`,
+   `SELECT 2::int8` → column `int8`). Top clusters in the backlog.
+5. **G5 pgjdbc** — ✅ landed (2026-08-01): `invoke validate-pgjdbc` runs
+   the official JDBC driver's own suite unmodified from `vendor/pgjdbc`
+   (REL42.7.13), targeted through pgjdbc's stock `build.local.properties`
+   — which pgjdbc gitignores (`*.local.properties`), so writing it at gauge
+   time leaves the submodule pristine. Needs JDK 21 (its Gradle toolchain
+   requirement; CI reuses the java/kotlin `setup-java` + Gradle cache
+   steps). Scope starts at the `jdbc2` core package (75 classes enumerated
+   per-class, so `EXCLUDE_CLASSES` is effective — Gradle's `--tests` has no
+   exclude form); grow package by package. Baseline **4462 P / 1068 F
+   (80.7%)**, and the first fix took it to **4962 P / 568 F (89.7%)**: the
+   dominant cluster (528 failures, half the total) was one protocol bug —
+   Describe answered NoData for a CTE query while Execute emitted DataRows,
+   which pgjdbc rejects outright ("Received resultset tuples, but no field
+   structure for them"); data-modifying CTEs (`WITH x AS (INSERT …
+   RETURNING …) SELECT * FROM x`) hit it every time. Remaining clusters in
+   the backlog. Chosen over Npgsql for the BSD-2 license, the absent
+   type-preload connect gate, and toolchain reuse.
+6. **G4 pgx** — ✅ landed (2026-07-31): `invoke validate-pgx` runs the
+   vendored `vendor/pgx` (v5.9.2) `pgconn` + `pgproto3` packages unmodified
+   via `PGX_TEST_DATABASE`, weekly in `validate.yml` (shares the go gauge's
+   toolchain step). Baseline: **291 P / 87 F / 22 S (77.0%)** — pgproto3
+   codecs 99.4%, pgconn 55.7% with two clear clusters (pipeline mode, i.e.
+   Sync-less extended-protocol batching, and the CancelRequest context
+   watcher). `docs/validation-report-pgx.md`. **G5 Npgsql or pgjdbc** — ❌
+   not started (pick by which catalog gaps the pgx clusters surface first).
+6. **G7 pgbench + psql smoke** — ✅ landed (2026-07-31) as `invoke
+   sql-stress`: unmodified pgbench init (multi-name DROP, COPY, VACUUM,
+   ALTER TABLE ADD PRIMARY KEY — all of which the server now implements) +
+   TPC-B in all three protocol modes + a concurrent select-only lane + the
+   psql `\dt`/`\d`/`\di`/`\l`/`\dn` catalog smoke, **6/6 lanes clean**,
+   weekly in `validate.yml` (`docs/validation-report-sqlstress.md`). Write
+   lanes run single-client: under contention WT's optimistic concurrency
+   surfaces PG-SERIALIZABLE-style 40001s, which pgbench < 15 can't retry
+   (no `--max-tries`) — the 40001-retry model is a backlog item. SQLsmith
+   remains ❌ (needs a from-source build; revisit with `--max-tries`-capable
+   pgbench 15+).
+7. **G6 SQLAlchemy compliance suite** — ✅ landed (2026-07-31): `invoke
+   validate-sqlalchemy` runs `sqlalchemy.testing.suite` (nothing vendored — it
+   ships inside the sqlalchemy package) over `postgresql+psycopg` against a
+   daemon server, with capability declarations in
+   `sqlalchemy_validation/requirements.py` (`schemas` closed — tables aren't
+   namespaced per schema; see backlog). Baseline 572 P / 166 F (77.5%); now **731
+   passed / 0 failed / 679 skipped (100%)**, weekly in `validate.yml`,
+   `docs/validation-report-sqlalchemy.md`. The second round closed the
+   residual tail: FROM-less `WHERE EXISTS`, parenthesized union arms with
+   ORDER BY/LIMIT, set-operation / VALUES / FROM-less derived tables (the
+   insertmanyvalues sentinel shape), scalar subqueries that honor ORDER
+   BY/LIMIT (previously a silent wrong-answer), `nextval()` (any constant
+   expression) in INSERT VALUES, `INSERT … DEFAULT VALUES`, covering-index
+   INCLUDE metadata + reflection, and `CREATE SEQUENCE NO MINVALUE`.
+   `datetime_microseconds` is declared closed — BSON datetimes are int64
+   milliseconds and the dual-protocol document view is the product; the same
+   switch MySQL-family dialects close. The climb came
+   from: temp-table reflection semantics (relpersistence 't', session-scoped
+   visibility via `pg_table_is_visible` → own-session `Session.temp_tables`,
+   drop at connection teardown), typmod fidelity (`Column.decl_oid`/`typmod`
+   → pg_attribute + `format_type`), `pg_get_expr` passthrough (SERIAL
+   defaults → autoincrement), plain-view columns in pg_attribute (described
+   from the stored SELECT), constraint comments in pg_description,
+   `quote_ident` in `pg_get_constraintdef` (the whole BizarroCharacterTest
+   class), LIKE ESCAPE + computed patterns (incl. a Describe fallback that
+   strips an unlowerable WHERE), IS [NOT] DISTINCT FROM, numeric-cast
+   division (`CAST(15 AS NUMERIC)/10 = 1.5`), LIMIT/OFFSET expressions,
+   INSERT DEFAULT VALUES, CREATE SEQUENCE NO MINVALUE/MAXVALUE, and declared
+   composite-PK order. Standing it up forced three server
+   fixes: `CREATE/DROP EXTENSION` (citext / hstore / plpgsql accepted, others
+   0A000), `COMMENT ON CONSTRAINT` (check / unique / FK / PK), and a real
+   correctness bug — a table-level ``CONSTRAINT <name> PRIMARY KEY`` was
+   silently dropped (no `_id` mapping, no uniqueness); the declared PK name is
+   now honored end-to-end (enforcement, reflection, duplicate-key messages).
+   Nothing is deselected; the two DateTimeMicroseconds tests skip via the
+   closed `datetime_microseconds` capability (the one declared storage
+   divergence, tracked in the backlog). A third round opened `schemas`:
+   tables, views, and sequences in user schemas store under dotted catalog
+   keys (like user types), coexist with same-named public relations, reflect
+   under their own pg_namespace rows, and are invisible to unqualified
+   lookups (`pg_table_is_visible` enforces the default search path); the
+   runner pre-provisions `test_schema` / `test_schema_2` per SQLAlchemy's
+   README.unittests. The round also caught a real wrong-answer: sqlglot
+   parses ``NOT LIKE`` as ``Like(negate=True)``, which both engines ignored
+   — ``NOT LIKE`` behaved as ``LIKE``. 978/978 executed tests pass.
 
 Mechanics mirror the existing gauges throughout: daemon `SecantusPGServer`
 subprocess on an ephemeral port (ad-hoc reproducers on `127.0.0.1:55432` per

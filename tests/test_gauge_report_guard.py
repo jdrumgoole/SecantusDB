@@ -169,6 +169,17 @@ def test_every_gauge_guards_the_artifact_its_report_is_built_from() -> None:
             continue
         if "_validation.runner" not in body and "pymongo_validation.plugin" in body:
             continue  # the pymongo gauges run pytest inline, not a runner module
+        if name.endswith("-report"):
+            # A merge-only task renders from shard artifacts, not a runner.
+            # Its freshness guard is consume-on-merge: the shard raws are
+            # deleted after a successful render, so a re-run without fresh
+            # artifacts fails on the missing files instead of re-rendering
+            # yesterday's results — assert THAT guard is present instead.
+            assert ".unlink()" in body, (
+                f"{name} merges shard artifacts but never consumes them — "
+                "a re-run would re-render stale results under today's date"
+            )
+            continue
         tasks_seen += 1
         guard = re.search(r"_run_gauge\((.*?)\n    \)", body, re.S)
         assert guard, f"{name} calls generate_report without going through _run_gauge"
@@ -179,3 +190,21 @@ def test_every_gauge_guards_the_artifact_its_report_is_built_from() -> None:
             "generate_report reads — they have drifted apart"
         )
     assert tasks_seen >= 13, f"expected every driver gauge to be checked, saw {tasks_seen}"
+
+
+def test_pgtest_run_pattern_is_anchored_per_file() -> None:
+    """The pgtest gauge runs one corpus file per daemon, so its ``-run``
+    pattern must be anchored: an unanchored ``TestPGTest/copy`` also selects
+    ``copy_file_upload`` and would run it against an already-dirtied server.
+    """
+    import re
+
+    from pgtest_validation.runner import _run_pattern
+
+    pattern = _run_pattern("copy")
+    assert pattern == "TestPGTest/^copy$"
+    # Emulate go's per-element regexp matching: the second element must match
+    # "copy" and NOT "copy_file_upload".
+    elem = pattern.split("/", 1)[1]
+    assert re.search(elem, "copy")
+    assert not re.search(elem, "copy_file_upload")

@@ -166,3 +166,29 @@ def test_close_rolls_back_open_transactions(tmp_path):
         assert reopened.find_matching(DB, COLL, {}) == []
     finally:
         reopened.close()
+
+
+def test_transaction_dirty_budget_guard(tmp_path):
+    # A user transaction's statements all join one WT transaction, whose
+    # dirty content is unevictable until commit — unbounded, it livelocks
+    # the engine (the same stall class chunked inserts closed for plain
+    # batches). The guard trips before that: mongod's
+    # TransactionTooLargeForCache, sized off the cache (~15% here).
+    from secantus.storage import TransactionTooLargeError
+
+    s = Storage(str(tmp_path), cache_size="128M")
+    try:
+        h = s.begin_user_transaction()
+        big = {"pad": "x" * (1024 * 1024)}
+        with pytest.raises(TransactionTooLargeError), s.use_user_transaction(h):
+            for i in range(32):
+                s.insert(DB, COLL, [{"_id": i, **big}])
+        s.abort_user_transaction(h)
+        # The aborted transaction left nothing behind.
+        assert find_ids(s) == []
+        # A plain (non-transactional) write of the same volume is fine —
+        # chunked statement transactions keep it bounded.
+        inserted, errors = s.insert(DB, COLL, [{"_id": i, **big} for i in range(32)])
+        assert inserted == 32 and errors == []
+    finally:
+        s.close()

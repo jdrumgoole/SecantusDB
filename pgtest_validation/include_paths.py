@@ -1,0 +1,144 @@
+"""Which pgtest corpus files the gauge runs, and the expected divergences.
+
+Same model as the other gauges: the corpus is NEVER modified — divergence
+lives here. ``EXCLUDE`` names files not run at all (only for hangs or
+crdb-internals that can't produce a meaningful non-crdb run);
+``EXPECTED_DIVERGENCES`` maps a file to a one-line reason and keeps the gauge
+green while the failure is a documented gap rather than a regression.
+"""
+
+#: Corpus files skipped entirely (relative to testdata/pgtest).
+EXCLUDE: set[str] = set()
+
+#: file -> reason. A file listed here that PASSES is reported loudly.
+EXPECTED_DIVERGENCES: dict[str, str] = {
+    "multiple_active_portals": (
+        "A CockroachDB pausable-portal test. Two of its subtests can't pass "
+        "against a non-crdb server: (1) `query_timeout` expects a portal paged "
+        "MaxRows:1 to emit N DataRows and THEN a 57014 statement-timeout on the "
+        "next pull — that incremental behaviour needs LAZY per-row portal "
+        "evaluation, but SecantusDB materialises a portal's result eagerly "
+        "(statement_timeout IS enforced for simple / single-statement queries, "
+        "just not row-by-row across a paged portal); (2) "
+        "`interleave_with_unpausable_portal` pins crdb's `0A000 unimplemented: "
+        "the statement for a pausable portal must be a read-only SELECT` error "
+        "(with a go.crdb.dev hint) for interleaving a non-read-only portal — "
+        "real PostgreSQL interleaves those fine and emits no such error. Every "
+        "other subtest passes (select_from_individual_resources, "
+        "select_from_same_table, bind_to_an_existing_active_portal, "
+        "not_in_explicit_transaction, drop_table_when_there_are_dependent_"
+        "active_portals, different_portals_bind_to_the_same_statement, "
+        "more_complicated_stmts, not_supported_statements)."
+    ),
+    "multiple_active_portals/query_timeout": (
+        "Expects a portal paged MaxRows:1 to emit several DataRows and then a "
+        "57014 statement-timeout on the next pull — needs LAZY per-row portal "
+        "evaluation; SecantusDB materialises a portal's result eagerly, so "
+        "statement_timeout (which IS enforced for simple / single-statement "
+        "queries) can't page a portal row-by-row against the deadline."
+    ),
+    "portals": (
+        "portals:1182 compares the CHECK-violation MESSAGE with "
+        "keepErrMessage and pins crdb's wording ('failed to satisfy CHECK "
+        "constraint (a > 1.0:::FLOAT8)'). We emit real PostgreSQL's ('new row "
+        "for relation \"t\" violates check constraint \"t_a_check\"'), which is "
+        "what psycopg/pgjdbc users parse — matching crdb would be a fidelity "
+        "REGRESSION. Everything up to :1182 passes (1182 of 1550 lines, "
+        "including PortalSuspended-on-exact-MaxRows and per-Execute row "
+        "counts). NOTE: the stanzas after :1182 are therefore NOT exercised — "
+        "they cover 34000 'unknown portal' (already implemented, slice 21) and "
+        "42P03 'cursor \"p\" already exists as portal' (NOT implemented). See "
+        "tasks/backlog.md."
+    ),
+    "jsonpath": (
+        "jsonpath:36/:76 expect crdb's BINARY jsonpath form — version byte + "
+        "the SINGLE-QUOTED text ('$' -> 01272427). Real PostgreSQL's "
+        "jsonpath_send emits the version byte + the canonical text WITHOUT "
+        "outer quotes (0124), which is what we send. Everything else in the "
+        "file is green (oid 4072, canonical $.\"abc\" text, 42601 on an "
+        "empty path, jsonb_path_query)."
+    ),
+    "int2vector": (
+        "int2vector:26 expects indoption={2} for a plain primary key — "
+        "crdb's NULLS-FIRST pkey representation. Real PostgreSQL reports 0 "
+        "(ASC, NULLS LAST), and so do we; matching crdb's 2 would corrupt "
+        "SQLAlchemy index reflection. The BINARY int2vector encoding the "
+        "stanza actually regression-tests (int2 array elements, elemoid 21 "
+        "— crdb #111907 shipped int8 once) is implemented and correct."
+    ),
+    "row_description": (
+        "row_description:376 sends `SELECT 'foo'::STRING, 'bar'::STRING(2)` "
+        "with NO crdb_only marker and expects crdb's STRING aliases (text/25 "
+        "and varchar/1043 typmod 6, truncating 'bar' to 'ba'). Real PostgreSQL "
+        "14 rejects both casts outright — `ERROR: 42704 type \"string\" does "
+        "not exist` (probed) — so the stanza can't pass against any non-crdb "
+        "server, and matching crdb's varchar(2) truncation would diverge from "
+        "PG. Everything before :376 is green: base-column identity across a "
+        "JOIN and through a VIEW, char(n) blank padding on the wire, and "
+        "attnum stability across ALTER COLUMN TYPE."
+    ),
+    "procedure": (
+        "procedure:66 (and the extended-protocol CALL after it) compare the "
+        "NoticeResponse of a plpgsql `RAISE NOTICE` and pin crdb's internal "
+        "source-location fields — `File:builtins.go, Routine:func401` — which the "
+        "runner does NOT normalize (it only zeroes Line). No non-crdb server can "
+        "emit crdb's Go source refs (real PostgreSQL sends `pl_exec.c` / "
+        "`exec_stmt_raise`), so the stanza can't pass against any non-crdb server. "
+        "Everything else is green: CREATE PROCEDURE with an `a INOUT int` argmode, "
+        "CALL returning the INOUT value as the result row, the plpgsql body "
+        "(INSERT + RAISE NOTICE), COMMIT/ROLLBACK inside the procedure, and DROP "
+        "PROCEDURE — over both the simple and extended protocols."
+    ),
+    "procedure": (
+        "procedure:68 pins the NoticeResponse's SOURCE-LOCATION fields to "
+        "crdb's own Go internals — File=\"builtins.go\", Routine=\"func401\" "
+        "— with no crdb_only marker. Those fields name the server's own source "
+        "file and function, so they are unmatchable by any other "
+        "implementation: real PostgreSQL 14 emits Routine=exec_stmt_raise, "
+        "File=pl_exec.c (probed), and SecantusDB leaves them empty rather than "
+        "fabricate a C source location it does not have. Everything the stanza "
+        "actually regression-tests works: CREATE PROCEDURE ... LANGUAGE "
+        "plpgsql, CALL p(), and the three RAISE NOTICE messages (foo / bar / "
+        "baz) arriving in order with SQLSTATE 00000, followed by "
+        "CommandComplete CALL."
+    ),
+    "typing": (
+        "typing's two non-crdb stanzas both use keepErrMessage and pin crdb's "
+        "wording for a mixed-type comparison: 22023 'unsupported comparison "
+        "operator: <varchar> = <uuid>' (and <varchar> = <bool>). Real "
+        "PostgreSQL 14 raises 42883 'operator does not exist: character "
+        "varying = uuid' (probed), which is what we now emit — matching crdb "
+        "would be a fidelity REGRESSION, same as the portals file. The "
+        "behaviour the stanzas actually regression-test (a DECLARED parameter "
+        "type making the comparison unresolvable AT PARSE, rather than a "
+        "predicate that silently matches nothing) is implemented and correct."
+    ),
+    "char": (
+        "char:250 pins TableOID=105 — crdb's deterministic descriptor id, "
+        "with no ignore_table_oids directive on that stanza. Real PostgreSQL "
+        "reports its own pg_class oid there too (installation-specific), so "
+        "the stanza can't pass against any non-crdb server. Everything else "
+        "in the file is green (oid-18 \"char\": casts, columns, params, "
+        "1-char truncation, NULL for empty/zero-byte, binary format)."
+    ),
+    "spatial": (
+        "PostGIS GEOMETRY/GEOGRAPHY — an extension type outside SecantusDB's "
+        "core-PostgreSQL SQL scope (the surrogate models MongoDB, not PostGIS). "
+        "A GEOMETRY value can't round-trip its EWKB binary form; an untyped "
+        "binary GEOMETRY parameter now surfaces a faithful 22P03 rather than a "
+        "generic internal error, but the type itself is not implemented."
+    ),
+    "box2d": (
+        "PostGIS BOX2D — an extension type outside SecantusDB's core-PostgreSQL "
+        "SQL scope. The ``::BOX2D`` cast falls through to a text passthrough, so "
+        "the binary result is the text form rather than PostGIS's four-float8 "
+        "box encoding. Out of scope, like GEOMETRY (see ``spatial``)."
+    ),
+    "pgvector": (
+        "The pgvector VECTOR type — an extension outside SecantusDB's "
+        "core-PostgreSQL SQL scope. A ``VECTOR`` column is rejected with a "
+        "faithful 0A000 (unsupported column type), which is correct emulation "
+        "of a server without the extension installed, but the corpus expects a "
+        "working vector type."
+    ),
+}

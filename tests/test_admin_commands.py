@@ -195,6 +195,42 @@ def test_server_status_has_mem_section(client: MongoClient) -> None:
     assert mem["virtual"] >= 0
 
 
+# ---- serverStatus.storageEngine (php-library transaction gate) --------------
+
+
+def test_server_status_reports_wiredtiger_storage_engine(client: MongoClient) -> None:
+    """``storageEngine.name`` gates transaction tests in real driver suites.
+
+    mongo-php-library's ``skipIfTransactionsNotSupported`` reads this field
+    and raises ``UnexpectedValueException: Could not determine server storage
+    engine`` when it is missing — which errored ~27 of its transaction tests
+    instead of skipping or running them. SecantusDB really is WiredTiger-backed,
+    so the answer is honest rather than a placation.
+    """
+    out = client.admin.command("serverStatus")
+    engine = out["storageEngine"]
+    assert engine["name"] == "wiredTiger"
+    assert engine["supportsCommittedReads"] is True
+    assert engine["supportsSnapshotReadConcern"] is True
+    assert engine["readOnly"] is False
+    # An on-disk store is persistent; the :memory: case is asserted below.
+    assert engine["persistent"] is True
+
+
+def test_server_status_in_memory_store_is_not_persistent(tmp_path) -> None:
+    """An ``:memory:`` instance must not claim durability it does not have."""
+    from secantus import SecantusDBServer
+
+    with SecantusDBServer(port=0, storage_path=":memory:") as srv:
+        mc = MongoClient(srv.uri, serverSelectionTimeoutMS=2000)
+        try:
+            engine = mc.admin.command("serverStatus")["storageEngine"]
+            assert engine["name"] == "wiredTiger"
+            assert engine["persistent"] is False
+        finally:
+            mc.close()
+
+
 # ---- top ---------------------------------------------------------------------
 
 

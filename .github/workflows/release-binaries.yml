@@ -134,11 +134,13 @@ jobs:
       # WT's (unused-here) Python module that its CMake still configures.
       - name: Install toolchain (Linux)
         if: matrix.os == 'linux'
-        run: sudo apt-get update && sudo apt-get install -y swig clang libclang-dev llvm-dev ninja-build
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig clang libclang-dev llvm-dev ninja-build liblz4-dev
 
       - name: Install toolchain (macOS)
         if: matrix.os == 'macos'
-        run: brew install swig ninja
+        run: brew install swig ninja lz4
 
       # The three Windows steps below are lifted verbatim from test.yml's
       # `storage-engine` job, which builds this same static WiredTiger + binary

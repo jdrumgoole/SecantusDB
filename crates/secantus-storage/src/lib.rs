@@ -24,7 +24,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -38,11 +38,13 @@ use s2::rect::Rect;
 use s2::region::RegionCoverer;
 use secantus_core::collation::Collation;
 use secantus_core::diff::compute_update_description;
+use secantus_core::order;
 use secantus_core::query::matches as query_matches;
-use secantus_core::sortkey::{self, COMPOUND_SEP};
+use secantus_core::sortkey::{self, COMPOUND_SEP, RANK_MINKEY};
 use secantus_core::{get_path, get_path_values};
 use secantus_wt::{Connection, Cursor, Session, WtError};
 
+pub mod admission;
 pub mod changestreams;
 pub mod pitr_archive;
 pub mod replay;
@@ -71,6 +73,17 @@ enum OpSession<'a> {
     Txn(&'a Session),
 }
 
+/// Guard half of [`Storage::ddl_generation_scope`]: restores the DDL
+/// generation to even parity (DDL no longer in flight) on drop — every exit
+/// path, including errors and panics.
+struct DdlGenScope<'a>(&'a AtomicU64);
+
+impl Drop for DdlGenScope<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Release);
+    }
+}
+
 impl std::ops::Deref for OpSession<'_> {
     type Target = Session;
     fn deref(&self) -> &Session {
@@ -79,6 +92,32 @@ impl std::ops::Deref for OpSession<'_> {
             OpSession::Txn(s) => s,
         }
     }
+}
+
+/// Explicit per-store configuration for [`Storage::open_with_options`]. Every
+/// field's `None` defers to the matching `SECANTUS_*` env var (the historical
+/// process-wide switch); `Some` overrides it for THIS store only.
+#[derive(Debug, Default, Clone)]
+pub struct StorageOptions {
+    /// Raw WiredTiger connection config (`None` = the engine default).
+    pub wt_config: Option<String>,
+    /// Close-time checkpoint durability (`None` = env/test resolution).
+    pub durable: Option<bool>,
+    /// Async oplog drainer (`SECANTUS_OPLOG_ASYNC`).
+    pub oplog_async: Option<bool>,
+    /// Non-logged oplog/preimage tables (`SECANTUS_OPLOG_NONLOGGED`).
+    pub oplog_nonlogged: Option<bool>,
+    /// Log-only-the-oplog data tables with replay-on-open recovery
+    /// (`SECANTUS_DATA_NONLOGGED`); create-time for fresh stores, and an
+    /// existing store's recorded mode always wins.
+    pub data_nonlogged: Option<bool>,
+    /// Stable-checkpoint cadence in seconds for the data-nonlogged mode
+    /// (`SECANTUS_CHECKPOINT_SECONDS`, default 60).
+    pub checkpoint_seconds: Option<u64>,
+    /// Admission control: cap on writes concurrently inside the storage
+    /// engine. `None` / 0 disables it (the default), preserving today's
+    /// behaviour exactly. See [`crate::admission`] for why this exists.
+    pub write_tickets: Option<usize>,
 }
 
 /// Opaque handle for a multi-document transaction. Owns a **dedicated** WT
@@ -104,10 +143,24 @@ pub struct UserTransactionHandle {
     /// appear), and on `Drop` as a backstop so a reaped or leaked handle
     /// cannot pin the tail forever.
     minted_ranges: Vec<(i64, i64)>,
+    /// Async-mode oplog entries buffered by this transaction's statements
+    /// (`IN_ASYNC_STMT` is held across every `with_user_transaction` scope, so
+    /// emits park in `PENDING_OPLOG` and are harvested here instead of
+    /// reaching the drainer mid-transaction). Minted + enqueued only after
+    /// the WT commit succeeds; discarded on rollback / commit-failure / Drop
+    /// — a rolled-back transaction must never surface a change event or PITR
+    /// entry (it would be a ghost: an oplog row for data that never
+    /// committed). Always empty in sync mode.
+    pending_async: Vec<(OplogEntry, Option<Vec<u8>>)>,
     /// Clones of the storage's oplog state + condvar so deregistration works
     /// from `Drop` without a `Storage` borrow.
     oplog: Arc<Mutex<OplogState>>,
     oplog_cv: Arc<Condvar>,
+    /// Approximate bytes this transaction has written, accumulated from its
+    /// emitted oplog entries (which carry the full documents). Engine-side
+    /// dirty is roughly twice this; `with_user_transaction` enforces the
+    /// cache-derived budget against it after every statement.
+    dirty_bytes: u64,
 }
 
 impl UserTransactionHandle {
@@ -153,6 +206,13 @@ fn too_large_write_error(index: usize, size: usize) -> Document {
 }
 
 const COLL_TABLE: &str = "table:secantus_collections";
+/// Pending-drop tombstones: `(db, coll) -> b""`. Written in the same small
+/// transaction that unregisters a collection (phase 1 of a chunked drop);
+/// removed when the batched row purge (phase 2) completes. A tombstone left
+/// by a crash is finished at the next open — see `recover_pending_drops`.
+/// Additive to the shared on-disk layout (an older store simply lacks the
+/// table; nothing else reads it), same precedent as the unique-keys table.
+const TOMB_TABLE: &str = "table:secantus_drop_tombstones";
 /// Legacy single documents table. Retained for the on-disk upgrade read/migration
 /// (a store written by an older build has its rows here). New writes go to the
 /// per-collection shard tables — see `DOC_SHARDS` / `doc_table_for`.
@@ -201,6 +261,54 @@ type ScannedDoc = (i64, Vec<u8>, Vec<u8>);
 enum OplogEntry {
     Doc(Document),
     Raw(bson::RawDocumentBuf),
+}
+
+/// Per-statement-transaction bounds for the chunked multi-document write
+/// paths (`update_matching_core` multi=true, `delete_matching`), the same
+/// values the chunked insert uses: a matched set's rewrite volume is
+/// unbounded, and one transaction's dirty content is unevictable — see the
+/// chunk note on `Storage::insert`. mongod's updateMany/deleteMany are
+/// per-document write units and documented non-atomic, so the commit points
+/// are mongod-faithful, not a divergence.
+const WRITE_CHUNK_MAX_DOCS: usize = 1000;
+const WRITE_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Rows per statement transaction in a chunked collection purge (drop /
+/// dropDatabase phase 2). Purge deletes walk CONSECUTIVE keys, so a batch
+/// dirties few leaf pages; 4000 keeps each transaction far under the cache
+/// dirty trigger while bounding the number of commits for a large drop.
+const PURGE_CHUNK_MAX_ROWS: usize = 4000;
+
+/// Approximate encoded size of an oplog entry, for the user-transaction
+/// dirty budget. `Raw` is exact; `Doc` (the rare DDL / noop shapes) pays one
+/// encode.
+fn oplog_entry_size(e: &OplogEntry) -> u64 {
+    match e {
+        OplogEntry::Raw(buf) => buf.as_bytes().len() as u64,
+        OplogEntry::Doc(d) => bson::to_vec(d).map(|v| v.len()).unwrap_or(0) as u64,
+    }
+}
+
+/// Extract `cache_size=` from a WiredTiger connection config string, in bytes
+/// (K/M/G/T suffixes; the engine default 4G when absent/unparseable). Fuel
+/// for the transaction dirty budget.
+fn parse_cache_bytes(config: &str) -> u64 {
+    const DEFAULT: u64 = 4 * 1024 * 1024 * 1024;
+    let Some(pos) = config.find("cache_size=") else {
+        return DEFAULT;
+    };
+    let rest = &config[pos + "cache_size=".len()..];
+    let val = rest.split(',').next().unwrap_or("").trim();
+    let (num, mult) = match val.chars().last() {
+        Some('K') | Some('k') => (&val[..val.len() - 1], 1024u64),
+        Some('M') | Some('m') => (&val[..val.len() - 1], 1024u64.pow(2)),
+        Some('G') | Some('g') => (&val[..val.len() - 1], 1024u64.pow(3)),
+        Some('T') | Some('t') => (&val[..val.len() - 1], 1024u64.pow(4)),
+        _ => (val, 1u64),
+    };
+    num.parse::<f64>()
+        .map(|n| (n * mult as f64) as u64)
+        .unwrap_or(DEFAULT)
 }
 
 /// Frame a doc-table value as `[u32-LE id_key_len][id_key bytes][blob bytes]`.
@@ -258,7 +366,7 @@ fn unframe_doc_value(value: &[u8]) -> Result<(&[u8], &[u8])> {
 /// table to its per-collection shard (a store written before doc-sharding). A
 /// born-sharded store's legacy table is empty, so this is a quick no-op scan on
 /// open. Runs on the bootstrap session before the connection serves requests.
-fn migrate_legacy_docs(session: &Session) -> Result<()> {
+fn migrate_legacy_docs(session: &Session, data_nonlogged: bool) -> Result<()> {
     let src = session.open_cursor(DOC_TABLE, None)?;
     let mut rows: Vec<(String, String, Vec<u8>, Vec<u8>)> = Vec::new();
     let mut more = src.next()?;
@@ -284,7 +392,7 @@ fn migrate_legacy_docs(session: &Session) -> Result<()> {
         // Lazy shards: the target shard isn't created eagerly at open, so make it
         // before folding a legacy row into it (idempotent per shard).
         if made_shards.insert(shard.clone()) {
-            session.create(&shard, &data_table_cfg(DOC_TABLE_CFG))?;
+            session.create(&shard, &data_table_cfg(DOC_TABLE_CFG, data_nonlogged))?;
         }
         let dst = session.open_cursor(&shard, None)?;
         dst.set_key_ssq(db, coll, recordid);
@@ -405,6 +513,17 @@ fn reject_legacy_index_entry_format(session: &Session) -> Result<()> {
 
 const IDX_TABLE: &str = "table:secantus_indexes";
 const IDX_ENTRIES_TABLE: &str = "table:secantus_index_entries";
+/// Unique-index key claims: `(db, coll, index, escaped_sortkey) -> RecordId`.
+///
+/// The entries table cannot enforce uniqueness itself — its key carries the
+/// RecordId, so two different docs sharing an indexed value occupy two distinct
+/// WT keys and never collide. Uniqueness was therefore a *probe read*, which by
+/// construction cannot see a value committed after the caller's snapshot nor one
+/// an open transaction is holding uncommitted: a transaction and a concurrent
+/// writer could each insert the same value and both commit. This table keys on
+/// the value alone, so WiredTiger rejects the second claim itself. Mirrors the
+/// Python server's `_UNIQ_TABLE` (#775).
+const UNIQ_TABLE: &str = "table:secantus_unique_keys";
 
 /// Ceiling on the number of keys one doc may contribute to a compound index
 /// when more than one indexed field is array-valued (the cartesian product).
@@ -460,26 +579,60 @@ fn oplog_tables_nonlogged() -> bool {
     std::env::var_os("SECANTUS_OPLOG_NONLOGGED").is_some()
 }
 
-/// Measure-only structural probe (`SECANTUS_DATA_NONLOGGED=1`): create the
-/// DATA tables (doc shards + the bootstrap set) with `log=(enabled=false)`,
-/// i.e. checkpoint-durable only — the mongod architecture, which journals ONLY
-/// the oplog and recovers data by checkpoint + oplog replay. SecantusDB has no
-/// replay-on-open yet, so this is **CRASH-UNSAFE: a hard crash between
-/// checkpoints loses acknowledged writes.** Never set it outside a benchmark;
-/// it exists to measure whether the mongod split is the structural source of
-/// the oplog-retention gap (Finding 12 / the parity plan's Phase A′, which
-/// builds the recovery that would make this shippable).
+/// Phase A' (`SECANTUS_DATA_NONLOGGED=1`): create the DATA tables (doc
+/// shards + the bootstrap set, except the always-logged oplog-meta) with
+/// `log=(enabled=false)` — the mongod architecture, which journals ONLY the
+/// oplog and recovers data by checkpoint + oplog replay. **Crash recovery is
+/// implemented**: a periodic stable checkpoint anchors a marker
+/// (`stable_seq`) in the logged meta table, and `Storage::open` replays the
+/// (WAL-logged) oplog above the marker through the ordinary write paths,
+/// idempotently — proven by the hard-kill harness
+/// (`tests/test_crash_recovery.py`). The durability contract matches the
+/// logged default at each `sync_on_commit` setting: with per-commit fsync
+/// every acknowledged write survives `kill -9`; without it a hard crash can
+/// lose the unsynced WAL tail — in either mode. Consulted at store CREATE
+/// time only; existing stores keep their recorded mode (the marker).
 fn data_tables_nonlogged() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SECANTUS_DATA_NONLOGGED").is_some())
+    // Read fresh (no OnceLock): consulted only at store CREATE time — a cold
+    // path — and per-open freshness lets one test process exercise both
+    // modes via subprocess-scoped env.
+    std::env::var_os("SECANTUS_DATA_NONLOGGED").is_some()
 }
 
-/// Table-create config for a data table, honouring [`data_tables_nonlogged`].
-fn data_table_cfg(base: &str) -> String {
-    if data_tables_nonlogged() {
+/// Table-create config for a data table, honouring [`data_tables_nonlogged`]
+/// and the `SECANTUS_DATA_TABLE_EXTRA` experiment hook.
+///
+/// The hook mirrors `SECANTUS_OPLOG_TABLE_EXTRA`: appended last, and
+/// WiredTiger takes the last occurrence of a duplicated key, so a clause here
+/// overrides the default. Create-time only — existing stores keep their
+/// config. Added to make `block_compressor` sweepable per table, which is the
+/// open question behind the profile finding that 65% of server CPU is zlib.
+fn data_table_cfg(base: &str, nonlogged: bool) -> String {
+    let mut cfg = if nonlogged {
         format!("{base},log=(enabled=false)")
     } else {
         base.to_string()
+    };
+    if let Ok(extra) = std::env::var("SECANTUS_DATA_TABLE_EXTRA") {
+        if !extra.is_empty() {
+            cfg.push(',');
+            cfg.push_str(&extra);
+        }
+    }
+    cfg
+}
+
+/// Bootstrap-create config for `name`. Everything follows [`data_table_cfg`]
+/// EXCEPT the oplog-meta table, which must stay WAL-logged even in
+/// `SECANTUS_DATA_NONLOGGED` mode: it carries the **stable checkpoint marker**
+/// (`stable_seq` + the mode flag) that crash recovery replays from — a marker
+/// that rolled back with the data tables would be useless. It is a single tiny
+/// row per checkpoint; its logging cost is nil.
+fn bootstrap_table_cfg(name: &str, base: &str, data_nonlogged: bool) -> String {
+    if name == OPLOG_META_TABLE {
+        base.to_string()
+    } else {
+        data_table_cfg(base, data_nonlogged)
     }
 }
 
@@ -489,7 +642,7 @@ fn data_table_cfg(base: &str) -> String {
 /// duplicated key, so an appended clause overrides the default; same trick as
 /// `SECANTUS_WT_CONFIG_EXTRA` on the connection config). Create-time only:
 /// benchmarks start on fresh datadirs, existing stores keep their config.
-fn oplog_table_cfg() -> String {
+fn oplog_table_cfg(nonlogged: bool) -> String {
     // Append-workload btree tuning (Finding-13 winner, +19% at 8 writers):
     // rows arrive in strictly-ascending seq order and are never updated, so
     // fill pages fully before splitting (`split_pct=100`) and use larger
@@ -497,7 +650,7 @@ fn oplog_table_cfg() -> String {
     // the sweep measured compression-off cratering to 19% retention (bigger
     // uncompressed pages = more eviction IO; the constraint is IO volume,
     // not CPU). Create-time only: existing stores keep their config.
-    let mut cfg = if oplog_tables_nonlogged() {
+    let mut cfg = if nonlogged {
         format!("{QU_COMPRESSED_CFG},split_pct=100,leaf_page_max=128KB,log=(enabled=false)")
     } else {
         format!("{QU_COMPRESSED_CFG},split_pct=100,leaf_page_max=128KB")
@@ -553,13 +706,14 @@ fn ensure_oplog_shard(
     shards_created: &AtomicU32,
     session: &Session,
     start_seq: i64,
+    oplog_nonlogged: bool,
 ) -> Result<String> {
     // Same modulus as `oplog_shard_for_batch` (honours SECANTUS_OPLOG_SHARDS).
     let idx = start_seq.rem_euclid(oplog_route_shards());
     let shard = oplog_shard_name(idx);
     let bit = 1u32 << (idx as u32);
     if shards_created.load(Ordering::Relaxed) & bit == 0 {
-        session.create(&shard, &oplog_table_cfg())?;
+        session.create(&shard, &oplog_table_cfg(oplog_nonlogged))?;
         shards_created.fetch_or(bit, Ordering::Relaxed);
     }
     Ok(shard)
@@ -575,13 +729,16 @@ fn ensure_oplog_shard(
 /// old single-table walk.
 fn read_oplog_shards(
     session: &Session,
+    existing: u32,
     start_seq: i64,
     limit: usize,
 ) -> Result<Vec<(i64, Vec<u8>)>> {
-    Ok(read_oplog_shards_tagged(session, start_seq, limit)?
-        .into_iter()
-        .map(|(seq, _tbl, blob)| (seq, blob))
-        .collect())
+    Ok(
+        read_oplog_shards_tagged(session, existing, start_seq, limit)?
+            .into_iter()
+            .map(|(seq, _tbl, blob)| (seq, blob))
+            .collect(),
+    )
 }
 
 /// Every table an oplog reader / point-op must consider: the N shards followed by
@@ -595,12 +752,41 @@ fn oplog_all_tables() -> Vec<String> {
         .collect()
 }
 
+/// Probe which oplog shard tables actually exist, as a bitmask (bit i = shard
+/// i). Run once at open to seed `oplog_shards_created`: shards are created
+/// lazily on first write and the routing default touches only
+/// [`oplog_route_shards`] of the [`OPLOG_SHARDS`] possible tables, so on a
+/// typical store 14+ of the 17 tables an oplog merge "considers" do not
+/// exist. Pre-seeding lets every merge skip the absent ones outright instead
+/// of paying a failed `open_cursor` (a WT schema-table lookup + error build)
+/// per absent table per call — on the tailable-getMore read path and every
+/// prune sweep. The store is single-process, so a 0 bit after seeding means
+/// definitively absent until THIS process creates it (`ensure_oplog_shard`
+/// sets the bit).
+fn probe_existing_oplog_shards(session: &Session) -> u32 {
+    let mut mask = 0u32;
+    for i in 0..OPLOG_SHARDS {
+        if session.open_cursor(&oplog_shard_name(i), None).is_ok() {
+            mask |= 1u32 << (i as u32);
+        }
+    }
+    mask
+}
+
+/// Whether table index `i` of [`oplog_all_tables`] is known absent under
+/// `existing` (the shard-existence bitmask). The legacy table (index
+/// [`OPLOG_SHARDS`]) is boot-created unconditionally, so it is never skipped.
+fn oplog_table_absent(existing: u32, i: usize) -> bool {
+    i < OPLOG_SHARDS as usize && existing & (1u32 << (i as u32)) == 0
+}
+
 /// Like `read_oplog_shards` but also returns each row's source table index into
 /// `oplog_all_tables()` (0..OPLOG_SHARDS = shard, OPLOG_SHARDS = legacy). Prune
 /// uses the tag to delete each doomed row from its exact table instead of probing
 /// all of them.
 fn read_oplog_shards_tagged(
     session: &Session,
+    existing: u32,
     start_seq: i64,
     limit: usize,
 ) -> Result<Vec<(i64, usize, Vec<u8>)>> {
@@ -613,7 +799,14 @@ fn read_oplog_shards_tagged(
     let mut cursors: Vec<Option<Cursor>> = Vec::with_capacity(tables.len());
     // Current head seq of each shard cursor, or None once exhausted.
     let mut heads: Vec<Option<i64>> = Vec::with_capacity(tables.len());
-    for tbl in &tables {
+    for (i, tbl) in tables.iter().enumerate() {
+        if oplog_table_absent(existing, i) {
+            // Known-absent shard (existence mask): skip without the failed
+            // open_cursor probe; reads as empty, index alignment kept.
+            cursors.push(None);
+            heads.push(None);
+            continue;
+        }
         let cur = match session.open_cursor(tbl, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => {
@@ -685,14 +878,21 @@ fn read_oplog_shards_tagged(
 /// `excess.max(retention_batch)` rows exactly like the sweep it replaces.
 fn scan_doomed_oplog_keys(
     session: &Session,
+    existing: u32,
     excess: usize,
     cutoff: i64,
     retention_batch: usize,
+    ceiling: i64,
 ) -> Result<Vec<(i64, usize)>> {
     let tables = oplog_all_tables();
     let mut cursors: Vec<Option<Cursor>> = Vec::with_capacity(tables.len());
     let mut heads: Vec<Option<i64>> = Vec::with_capacity(tables.len());
-    for tbl in &tables {
+    for (i, tbl) in tables.iter().enumerate() {
+        if oplog_table_absent(existing, i) {
+            cursors.push(None);
+            heads.push(None);
+            continue;
+        }
         let cur = match session.open_cursor(tbl, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => {
@@ -724,6 +924,12 @@ fn scan_doomed_oplog_keys(
             }
         }
         let Some(i) = best else { break };
+        if best_seq >= ceiling {
+            // Phase A' clamp: entries at/above the stable-checkpoint seq are
+            // the crash-recovery source for a data-nonlogged store — never
+            // doomed, whatever the cap says. (ceiling is i64::MAX otherwise.)
+            break;
+        }
         let cur = cursors[i].as_ref().expect("selected shard has a cursor");
         if doomed.len() < excess {
             // Cap-doomed by position alone — no value read.
@@ -1066,7 +1272,14 @@ enum ResolvedHint {
 /// `file_max=128MB` is kept (see PR #575, mongod-parity Phase 1): with prealloc
 /// off, a production sustained-writer still gets 128 MB active segments while
 /// tiny test DBs cost only what they write.
-const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=256M,\
+/// `cache_size=4G` is a CAP, not an allocation: WiredTiger fills the cache
+/// lazily, so the thousands of tiny test instances a suite spins up stay
+/// small, while a sustained writer gets the headroom that measured as the
+/// strongest single write-throughput knob (+26% at 8 writers — an eviction-
+/// pressure lever; Findings 6/13). This matches the daemon's and the Python
+/// `RustServer` handle's 4G-cap default, closing the gap where an embedded
+/// library user hit eviction pressure the daemon never would.
+const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=4G,\
                               eviction=(threads_min=4,threads_max=4),\
                               log=(enabled=true,file_max=128MB,prealloc=false),\
                               transaction_sync=(enabled=false,method=fsync)";
@@ -1074,10 +1287,8 @@ const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=256M,\
 /// Build the WiredTiger connection config string from the tunable knobs the
 /// `secantusdb` daemon exposes (`--cache-size`, `--session-max`,
 /// `--sync-on-commit`). Mirrors `storage.py`'s config assembly and matches
-/// [`DEFAULT_CONFIG`] byte-for-byte for the engine defaults (`"256M"`, `1000`,
-/// `false`) — see the `wt_config_matches_default` test. The `secantusdb`
-/// binary passes the resolved `cache_size` (Python's default is `"1G"`), while
-/// the embedded / library default stays `256M` via [`Storage::open`].
+/// [`DEFAULT_CONFIG`] byte-for-byte for the engine defaults (`"4G"`, `1000`,
+/// `false`) — see the `wt_config_matches_default` test.
 pub fn wt_config(
     cache_size: &str,
     session_max: u32,
@@ -1104,26 +1315,41 @@ pub fn wt_config(
     cfg
 }
 
-// zlib block compression on the value-heavy tables (document blobs live in the
-// doc / oplog / preimage tables) — cuts the per-doc disk-write volume that bounds
-// steady-state write throughput (measured +25% single-writer and ~2× multi-writer
-// scaling on compressible data), mirroring mongod's compress-by-default. The WT
-// build links the builtin zlib extension (HAVE_BUILTIN_EXTENSION_ZLIB) on macOS +
-// Linux, where libz is present; **Windows** WT is built without it (no default
-// libz), so the compressor clause is omitted there — a `block_compressor=zlib`
-// table create would fail with "unknown compressor". Set at create time; existing
-// uncompressed tables keep their format (WT stores it in metadata).
+// Block compression on the value-heavy tables (document blobs live in the doc /
+// oplog / preimage tables) — cuts the per-doc disk-write volume that bounds
+// steady-state write throughput, mirroring mongod's compress-by-default.
+//
+// **lz4, not zlib** (2026-08-22). Compression is a CPU/IO trade and only the IO
+// side had ever been measured. Profiling the daemon under sustained write load
+// put **65% of server CPU inside zlib's `deflate`**, on WiredTiger's
+// page-reconciliation path — which is also why the p99.9 tail was CPU-bound
+// rather than IO-bound. Sweeping the compressor (8 writers, 1G cache, 8 KiB
+// docs) measured lz4 at **+86% throughput and -97% p99.9 on incompressible
+// data, +15% / -88% on compressible** — winning on both axes in both regimes,
+// at 1.9x / 1.14x the disk. mongod defaults to snappy for the same reason;
+// snappy and zstd measured close to lz4 and stay opt-in build flags rather
+// than two more link dependencies. See tasks/backlog.md.
+//
+// **zlib remains linked and must stay that way.** `block_compressor` is
+// recorded per table at create time, so a store created before this switch has
+// zlib tables; dropping the extension would make that data unreadable. Only
+// newly created tables get lz4, and a mixed store is fine.
+//
+// **Windows** WT is built without either compressor (no default libz), so the
+// clause is omitted there — a `block_compressor=` table create would fail with
+// "unknown compressor". Set at create time; existing tables keep their format
+// (WT stores it in metadata).
 // RecordId keying: the doc table is keyed by (db, coll, RecordId:i64) — the
 // monotonic per-collection insertion seq — not by id_key. This puts the table in
 // insertion order (so the `secantus_natural` forward table is dropped) and cuts
 // write amplification 4->3. `secantus_natural_seq` (id_key -> RecordId) is the
 // `_id` index. See tasks/rust-recordid-plan.md.
 #[cfg(not(target_os = "windows"))]
-const DOC_TABLE_CFG: &str = "key_format=SSq,value_format=u,block_compressor=zlib";
+const DOC_TABLE_CFG: &str = "key_format=SSq,value_format=u,block_compressor=lz4";
 #[cfg(target_os = "windows")]
 const DOC_TABLE_CFG: &str = "key_format=SSq,value_format=u";
 #[cfg(not(target_os = "windows"))]
-const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u,block_compressor=zlib";
+const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u,block_compressor=lz4";
 #[cfg(target_os = "windows")]
 const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u";
 
@@ -1132,6 +1358,7 @@ const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u";
 // identical so later sub-phases don't need a migration.
 const BOOTSTRAP: &[(&str, &str)] = &[
     (COLL_TABLE, "key_format=SS,value_format=u"),
+    (TOMB_TABLE, "key_format=SS,value_format=u"),
     (DOC_TABLE, DOC_TABLE_CFG),
     ("table:secantus_indexes", "key_format=SSS,value_format=u"),
     (
@@ -1139,6 +1366,10 @@ const BOOTSTRAP: &[(&str, &str)] = &[
         "key_format=SSSu,value_format=u",
     ),
     ("table:secantus_natural", "key_format=SSq,value_format=u"),
+    (
+        "table:secantus_unique_keys",
+        "key_format=SSSu,value_format=q",
+    ),
     (
         "table:secantus_natural_seq",
         "key_format=SSu,value_format=q",
@@ -1179,10 +1410,26 @@ pub enum StorageError {
     /// `create_index` was asked to re-create an existing index *name* with a
     /// different key spec.
     IndexKeySpecsConflict(String),
+    /// An update the engine refused for a reason mongod names exactly — today
+    /// a non-numeric `$inc` / `$mul`, which mongod answers with TypeMismatch
+    /// (14). Distinct from `QueryUnsupported`, which means "can't evaluate".
+    UpdateTypeMismatch(String),
+    /// Two update operators target overlapping paths (mongod: code 40).
+    UpdatePathConflict(String),
+    /// An update would create a field under a non-document -- mongod's
+    /// `PathNotViable` (28). Without this the refusal deferred, and a defer on
+    /// this server is a generic BadValue (2).
+    UpdatePathNotViable(String),
     /// A query filter used a construct the Rust query engine can't evaluate
     /// (the `matches` "defer to Python" signal). The server's engine selection
     /// is responsible for not routing such queries to the Rust storage.
     QueryUnsupported,
+    /// A multi-document transaction's buffered write volume exceeded the
+    /// cache-derived dirty budget (see `Storage::txn_dirty_limit`). Raised
+    /// BEFORE the transaction can pin enough unevictable dirty content to
+    /// livelock WiredTiger; the command layer maps it to mongod's
+    /// `TransactionTooLargeForCache` (313, no transient label).
+    TransactionTooLargeForCache,
     /// A `hint` did not resolve to an existing index (command layer maps this to
     /// a mongod `BadValue`).
     BadHint(String),
@@ -1223,9 +1470,16 @@ impl std::fmt::Display for StorageError {
             StorageError::CreateIndexUnsupported(m) => write!(f, "{m}"),
             StorageError::IndexOptionsConflict(m) => write!(f, "{m}"),
             StorageError::IndexKeySpecsConflict(m) => write!(f, "{m}"),
+            StorageError::UpdateTypeMismatch(m) => write!(f, "{m}"),
+            StorageError::UpdatePathConflict(m) => write!(f, "{m}"),
+            StorageError::UpdatePathNotViable(m) => write!(f, "{m}"),
             StorageError::QueryUnsupported => {
                 write!(f, "query construct not supported by the Rust query engine")
             }
+            StorageError::TransactionTooLargeForCache => write!(
+                f,
+                "Transaction is too large and will not fit in the storage engine cache"
+            ),
             StorageError::ImmutableField => write!(
                 f,
                 "Performing an update on the path '_id' would modify the immutable field '_id'"
@@ -1246,14 +1500,63 @@ impl std::fmt::Display for StorageError {
     }
 }
 impl std::error::Error for StorageError {}
+/// Whether a WiredTiger rollback reason names cache pressure rather than a
+/// concurrency race. WT phrases it as the oldest pinned transaction being
+/// rolled back for eviction, or plain cache overflow, depending on version —
+/// match on the distinguishing words rather than a whole sentence.
+fn rollback_reason_is_cache_pressure(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    r.contains("eviction") || r.contains("cache")
+}
+
+/// Turn a WiredTiger rollback reason into the error it deserves: cache
+/// pressure is `TransactionTooLargeForCache` (not retryable — a retry rebuilds
+/// the same unevictable pile), anything else is the retryable `WriteConflict`.
+/// An absent reason stays a `WriteConflict`, the safe default: it keeps the
+/// retry behaviour every caller already has.
+fn classify_rollback(reason: Option<String>) -> StorageError {
+    match reason {
+        Some(r) if rollback_reason_is_cache_pressure(&r) => {
+            StorageError::TransactionTooLargeForCache
+        }
+        _ => StorageError::WriteConflict,
+    }
+}
+
+/// The active user transaction's rollback reason, if a statement of one is
+/// running on this thread. Read immediately after a failing call, which is the
+/// only point WiredTiger's buffer still holds this transaction's reason.
+fn active_txn_rollback_reason() -> Option<String> {
+    let p = ACTIVE_TXN_SESSION.with(|c| c.get());
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: identical to `op_session` — `with_user_transaction` installs this
+    // pointer to a `Session` it owns for the strict duration of the statement
+    // running on THIS thread, and we are inside that statement (the error being
+    // converted came out of it).
+    unsafe { &*p }.rollback_reason()
+}
+
 impl From<WtError> for StorageError {
     fn from(e: WtError) -> Self {
-        // A `WT_ROLLBACK` means the write lost a concurrency race — surface it as
-        // a dedicated `WriteConflict` so the command layer can map it to mongod's
-        // 112 (+ the transient label inside a transaction) rather than a generic
-        // internal error.
+        // A `WT_ROLLBACK` is two different conditions wearing one code. Usually
+        // the write lost a concurrency race — surface that as `WriteConflict` so
+        // the command layer maps it to mongod's 112 (+ the transient label
+        // inside a transaction), and a retry can win.
+        //
+        // But inside a multi-document transaction WiredTiger also returns
+        // `WT_ROLLBACK` when it gives up on a transaction whose own dirty
+        // content it cannot evict — the very condition the dirty-budget guard
+        // exists to report. That one is NOT retryable: a retry rebuilds the same
+        // unevictable pile. It is also a race with our own guard, which is
+        // checked after each statement and so can be beaten by the engine when
+        // the per-statement estimate undershoots (this is what made
+        // `transaction_dirty_budget_guard` flaky in CI). Asking WiredTiger why
+        // it rolled back settles it either way, and reports the same
+        // `TransactionTooLargeForCache` mongod does.
         if e.is_rollback() {
-            StorageError::WriteConflict
+            classify_rollback(active_txn_rollback_reason())
         } else {
             StorageError::Wt(e)
         }
@@ -1532,6 +1835,25 @@ fn pack_entry(kb: &[u8], recordid: i64) -> Vec<u8> {
 /// it). A trailing half that is not exactly 8 bytes is a step-1-format entry;
 /// callers must never see one (`reject_legacy_index_entry_format` refuses such a
 /// store at open), so it is reported as `None` rather than silently mis-read.
+/// Whether an index entry's key is a whole-array key rather than an element key.
+///
+/// The first byte of an encoded value is its type rank; escaping only rewrites
+/// `0x00`, which no rank byte is. A descending column is encoded byte-inverted, so
+/// the rank arrives as `0xFF - rank`.
+fn is_whole_array_key(escaped_key: &[u8], idx_dir: i32) -> bool {
+    match escaped_key.first() {
+        None => false,
+        Some(&first) => {
+            let expected = if idx_dir >= 0 {
+                sortkey::RANK_ARRAY
+            } else {
+                0xFF - sortkey::RANK_ARRAY
+            };
+            first == expected
+        }
+    }
+}
+
 fn unpack_entry(packed: &[u8]) -> (&[u8], Option<i64>) {
     match packed.windows(2).position(|w| w == ENTRY_SEP) {
         Some(i) => {
@@ -1954,10 +2276,32 @@ fn multi_sort_spec(sort: Option<&Document>) -> Option<Vec<(String, i32)>> {
 /// The byte-sortable compound key for `doc` under a sort `spec` — the same
 /// encoding the index walk produces, so the COLLSCAN post-sort yields mongod's
 /// cross-type order consistent with the accelerated path.
+/// Byte key for an in-memory sort. **Not an index entry** — the only two callers
+/// are the post-fetch sorts below, so the empty-array special case here never
+/// reaches disk and the persisted rank scheme is untouched.
 fn sort_key(doc: &Document, spec: &[(String, i32)], coll: Option<&Collation>) -> Result<Vec<u8>> {
     let mut parts = Vec::with_capacity(spec.len());
     for (f, d) in spec {
         let v = get_path(doc, f).cloned().unwrap_or(Bson::Null);
+        // mongod sorts an array-valued field by one representative element: its
+        // minimum ascending, its maximum descending. Comparing whole arrays put
+        // every array after every scalar and disagreed with our own index path,
+        // where a multikey index's per-element entries already produced mongod's
+        // order. Mirrors `ordering.py::_array_sort_value`.
+        let v = order::array_sort_value(v, *d < 0).ok_or(StorageError::UnsupportedValue)?;
+        // An empty array has no representative element; mongod sorts it between
+        // MinKey and Null. The persisted rank bytes cannot express that, so emit a
+        // key just above bare MinKey — inverted for a descending column, matching
+        // `encode_value_directed`'s own convention.
+        if matches!(v, Bson::Undefined) {
+            let bytes = if *d < 0 {
+                vec![0xFF - RANK_MINKEY, 0x00]
+            } else {
+                vec![RANK_MINKEY, 0xFF]
+            };
+            parts.push(bytes);
+            continue;
+        }
         // Collation-aware sort: a strength/caseLevel collation folds string keys
         // before encoding. A collation the encoder can't reproduce (non-ASCII /
         // numericOrdering) surfaces as UnsupportedValue → command BadValue.
@@ -2079,14 +2423,23 @@ pub struct Storage {
     /// namespace stays stable across drop+recreate so in-flight writers and
     /// DDL always contend on the same mutex. Mirrors `storage._coll_locks`.
     coll_locks: Mutex<CollLocks>,
-    /// Serialises `prune_oplog` sweeps (the write-path opportunistic prune
-    /// and the public entry point). Deliberately NOT the global lock: the
-    /// opportunistic prune fires inside `emit_oplog` while the caller holds a
-    /// collection lock, and taking the global lock there would invert the
-    /// global→collection order (deadlock with DDL). Prune-vs-writer needs no
-    /// exclusion — writers only append strictly higher seqs and never touch
-    /// the old rows a prune dooms.
-    oplog_prune_lock: Mutex<()>,
+    /// Bounds concurrent engine writes. Disabled unless `write_tickets` is set.
+    write_tickets: crate::admission::Tickets,
+    /// Namespace-DDL generation: bumped after a committed `drop_collection` /
+    /// `drop_database` / `rename_collection` / `drop_index` / `drop_all_indexes`.
+    /// Lock-free multi-row readers snapshot it before their scan and re-run the
+    /// scan when it moved (see [`Self::with_ddl_generation_check`]): a scan
+    /// racing a namespace-level DDL may have walked a half-visible row set, and
+    /// because every DDL's row writes commit in ONE statement transaction, a
+    /// re-run whose generation held still is a consistent point-in-time answer.
+    ddl_generation: AtomicU64,
+    /// Dirty budget for one multi-document transaction: ~15% of the cache
+    /// (0.75 x WT's ~20% dirty-eviction trigger, the shape of mongod's
+    /// `TransactionTooLargeForCache` threshold). A transaction's dirty
+    /// content is unevictable, so letting one fill the dirty trigger
+    /// livelocks the engine — the same stall class the chunked inserts
+    /// closed for plain batches, which chunking cannot close here.
+    txn_dirty_limit: u64,
     /// Which oplog shard tables this process has already created (bit per shard
     /// index) — see [`ensure_oplog_shard`]. Shared with the async drainers.
     oplog_shards_created: Arc<AtomicU32>,
@@ -2105,18 +2458,18 @@ pub struct Storage {
     /// `lock`, so a waiting tailable getMore can't ABBA-deadlock the write path.
     /// `Arc` so the drainer can notify it after advancing `written_seq`.
     oplog_cv: Arc<Condvar>,
-    /// Retention window (seconds) and hard entry cap for `prune_oplog`. Mirrors
-    /// `storage.oplog_retention_seconds` / `oplog_max_entries`.
-    oplog_retention_seconds: i64,
-    oplog_max_entries: usize,
+    /// Prune sweep context (exclusivity lock + retention / entry-cap /
+    /// archive-dir tunables + the Phase-A' clamp pieces), shared with the
+    /// async drainer pool which owns the opportunistic cadence in async mode.
+    /// See [`PruneCtx`] / [`prune_oplog_sweep`].
+    prune_ctx: Arc<PruneCtx>,
+    /// The background oplog pruner (see [`spawn_oplog_pruner`]); joined on
+    /// Drop before the WT connection closes.
+    prune_join: Mutex<Option<JoinHandle<()>>>,
     /// Per-insert discriminator for timeseries doc-table keys (see
     /// `timeseries_doc_suffix`). Wraps at 16 bits; combined with a nanosecond
     /// timestamp it keeps duplicate-`_id` rows distinct across reopens.
     ts_suffix_counter: AtomicU64,
-    /// When set, `prune_oplog` archives the rows it is about to drop into a
-    /// durable oplog segment in this directory first (PITR v2). Mirrors
-    /// `storage.oplog_archive_dir`.
-    oplog_archive_dir: Option<String>,
     /// Whether to force a WiredTiger checkpoint on close (`Drop`). Mirrors the
     /// Python `Storage._durable` flag. WT's connection close does NOT implicitly
     /// checkpoint while logging is enabled, so without a close-time checkpoint a
@@ -2145,6 +2498,34 @@ pub struct Storage {
     /// clean close flushes the drainer before the checkpoint). `None` = the
     /// synchronous, atomic default.
     async_oplog: Option<Arc<AsyncOplog>>,
+    /// The store's resolved oplog-nonlogged mode: oplog/preimage shard
+    /// CREATEs use `log=(enabled=false)` when set (create-time-sticky, so it
+    /// only shapes shards this store is first to touch).
+    oplog_nonlogged: bool,
+    /// Phase A' checkpoint cadence override (`StorageOptions.checkpoint_seconds`);
+    /// `None` = `SECANTUS_CHECKPOINT_SECONDS` / 60.
+    checkpoint_seconds: Option<u64>,
+    /// Phase A': whether THIS store's data tables were created
+    /// `log=(enabled=false)` (checkpoint-durable, recovered by oplog replay).
+    /// Resolved from the stable marker for existing stores — the table config
+    /// is create-time-sticky, so the env var is only consulted for fresh
+    /// stores — and recorded in the marker at first checkpoint.
+    data_nonlogged: bool,
+    /// Highest oplog seq covered by the last stable checkpoint: the replay
+    /// floor after a crash and the prune clamp (entries above it are the
+    /// recovery source and must not be pruned). 0 until the first checkpoint.
+    stable_seq: Arc<AtomicI64>,
+    /// Periodic stable-checkpoint thread (data-nonlogged stores only; WT does
+    /// not checkpoint on its own under our config, and unlogged tables are
+    /// only as durable as their last checkpoint — the mongod cadence).
+    checkpoint_stop: Arc<AtomicBool>,
+    /// Set by a cap-blocked prune to demand an anchor ahead of the cadence:
+    /// the clamp forbids pruning entries above the stable seq, so without an
+    /// on-demand checkpoint a sustained writer would grow the oplog without
+    /// bound between periodic anchors. The thread honours it on its next
+    /// 250ms tick and clears it.
+    checkpoint_requested: Arc<AtomicBool>,
+    checkpoint_join: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
@@ -2159,7 +2540,16 @@ struct OplogState {
     next_nat_seq: i64,
     /// Oplog rows emitted since the last opportunistic prune. In-memory only
     /// (resets on open, like `storage._oplog_emit_count`); never persisted.
+    /// Drives the SYNC emit path's prune cadence; async mode uses
+    /// `persisted_count` instead (see [`record_persisted`]).
     emit_count: i64,
+    /// Async mode: oplog rows the drainer pool has persisted since the last
+    /// opportunistic prune. The cadence must follow rows LANDING, not rows
+    /// minting — a mint-side trigger can only doom already-persisted rows, so
+    /// drainer-queue lag escapes the sweep and the counter reset defers the
+    /// retry a whole interval, leaving the oplog unbounded when writes stop.
+    /// Always 0 in sync mode.
+    persisted_count: i64,
     /// Live oplog row count across all shards + the legacy table. Counted once on
     /// open, `+= n` on every `emit_oplog` / import, `-= doomed` on prune. Lets the
     /// opportunistic prune early-out (one ts read) when under the cap instead of
@@ -2209,6 +2599,21 @@ fn advance_written_seq(st: &mut OplogState, start: i64, n: i64) -> bool {
     advanced
 }
 
+/// Record `n` drainer-persisted entries and report whether the opportunistic
+/// prune cadence is due (every [`OPLOG_PRUNE_INTERVAL`] persisted rows) — the
+/// async-mode analogue of the sync emit path's `emit_count` trigger. Caller
+/// holds the `oplog` mutex; the drainer that crosses the boundary runs the
+/// sweep after releasing it.
+fn record_persisted(st: &mut OplogState, n: i64) -> bool {
+    st.persisted_count += n;
+    if st.persisted_count >= OPLOG_PRUNE_INTERVAL {
+        st.persisted_count = 0;
+        true
+    } else {
+        false
+    }
+}
+
 // --- async oplog (prototype) ---------------------------------------------
 
 thread_local! {
@@ -2237,6 +2642,11 @@ thread_local! {
     /// `rollback_user_transaction` deregister at the real resolution point.
     /// Empty (and untouched) in async mode and for bare autocommit emits.
     static PENDING_MINTED: RefCell<Vec<(i64, i64)>> = const { RefCell::new(Vec::new()) };
+    /// Bytes of oplog-entry payload emitted by the current user-transaction
+    /// statement — harvested onto the handle by `with_user_transaction` (the
+    /// same pattern as `PENDING_MINTED`) to enforce the transaction dirty
+    /// budget.
+    static PENDING_DIRTY_BYTES: Cell<u64> = const { Cell::new(0) };
 
     /// Set by `with_statement_txn` for the duration of a sync-mode autocommit
     /// write statement. When true, `emit_oplog_entries` parks its minted range
@@ -2325,6 +2735,89 @@ struct AsyncOplog {
     joins: Mutex<Vec<JoinHandle<()>>>,
 }
 
+/// Everything a prune sweep needs, shared between `Storage` (explicit
+/// `prune_oplog`, the sync emit path's opportunistic trigger) and the async
+/// drainer pool (which owns the opportunistic cadence in async mode — the
+/// sweep must run where rows LAND, or queue lag escapes it). The tunables are
+/// atomics / a mutex so `Storage`'s `&mut self` setters write through the
+/// `Arc` the drainers hold.
+struct PruneCtx {
+    conn: Arc<Connection>,
+    oplog: Arc<Mutex<OplogState>>,
+    /// Sweep exclusivity (NOT the storage global lock — see
+    /// [`prune_oplog_sweep`]'s lock-order note).
+    prune_lock: Mutex<()>,
+    /// Mirrors `storage.oplog_retention_seconds` / `oplog_max_entries` /
+    /// `oplog_archive_dir`.
+    retention_seconds: AtomicI64,
+    max_entries: AtomicUsize,
+    archive_dir: Mutex<Option<String>>,
+    /// Phase A' pieces: the sweep clamp below the stable checkpoint marker and
+    /// the demand-checkpoint signal when the clamp blocks a cap excess.
+    data_nonlogged: bool,
+    stable_seq: Arc<AtomicI64>,
+    checkpoint_requested: Arc<AtomicBool>,
+    /// Shard-existence mask (shared with `Storage.oplog_shards_created`) so
+    /// the sweep's merges skip known-absent shard tables.
+    shards_created: Arc<AtomicU32>,
+    /// Background-pruner wakeup: the write paths set the flag + notify when
+    /// the opportunistic cadence crosses (sync emit path and async drainers
+    /// alike — Finding 12 measured the inline sweep at ~36% of the sync
+    /// insert path under sustained cap pressure; the sweep belongs off every
+    /// hot path). The pruner thread also wakes periodically as a retention
+    /// backstop.
+    wake_flag: Mutex<bool>,
+    wake_cv: Condvar,
+    stop: AtomicBool,
+}
+
+/// Signal the background pruner that a sweep is due (opportunistic cadence
+/// crossing). Cheap: one small mutex + notify; the sweep itself runs on the
+/// pruner thread.
+fn signal_oplog_prune(ctx: &PruneCtx) {
+    let mut due = ctx.wake_flag.lock().unwrap_or_else(|e| e.into_inner());
+    *due = true;
+    ctx.wake_cv.notify_one();
+}
+
+/// Background oplog pruner: runs [`prune_oplog_sweep`] whenever a write path
+/// signals the opportunistic cadence (and every `PRUNE_BACKSTOP_SECS` as a
+/// retention backstop), keeping the sweep — its k-way key merge, PITR
+/// archiving, and per-row deletes — off the writer and drainer threads
+/// entirely. mongod's analogue is the OplogCapMaintainerThread, which does
+/// the same job for the same reason. Sweep failures are loud (a database
+/// never steps over a storage error) and retried on the next wake.
+fn spawn_oplog_pruner(ctx: Arc<PruneCtx>) -> JoinHandle<()> {
+    const PRUNE_BACKSTOP_SECS: u64 = 10;
+    thread::Builder::new()
+        .name("secantus-oplog-pruner".into())
+        .spawn(move || loop {
+            // Wait for a cadence signal, the backstop timeout, or stop; clear
+            // the flag under the lock either way. A timed-out wake with no
+            // signal is the retention backstop — the sweep runs regardless
+            // (it early-outs in one bounded read when there is nothing to do).
+            {
+                let guard = ctx.wake_flag.lock().unwrap_or_else(|e| e.into_inner());
+                let (mut guard, _timed_out) = ctx
+                    .wake_cv
+                    .wait_timeout_while(
+                        guard,
+                        std::time::Duration::from_secs(PRUNE_BACKSTOP_SECS),
+                        |due| !*due && !ctx.stop.load(Ordering::Acquire),
+                    )
+                    .unwrap_or_else(|e| e.into_inner());
+                *guard = false;
+            }
+            if ctx.stop.load(Ordering::Acquire) {
+                return;
+            }
+            if let Err(e) = prune_oplog_sweep(&ctx, None) {
+                eprintln!("secantus-storage: background oplog prune failed: {e:?}");
+            }
+        })
+        .expect("spawn secantus-oplog-pruner")
+}
+
 /// Shared state a drainer advances so change-stream tailers can observe progress:
 /// the `oplog` mutex (for `written_seq` + the completion tracker) + its condvar,
 /// plus the [`Backpressure`] budget it releases as batches land.
@@ -2336,6 +2829,11 @@ struct DrainerShared {
     backpressure: Arc<Backpressure>,
     /// Shared with `Storage.oplog_shards_created` — see [`ensure_oplog_shard`].
     shards_created: Arc<AtomicU32>,
+    /// The store's resolved oplog-nonlogged mode (table create config).
+    oplog_nonlogged: bool,
+    /// The opportunistic-prune context: the drainer that crosses the
+    /// persisted-rows cadence boundary runs the sweep (best-effort).
+    prune: Arc<PruneCtx>,
 }
 
 /// Spawn the background oplog drainer pool and return the handle committed writes
@@ -2346,6 +2844,8 @@ fn spawn_oplog_drainer(
     oplog: Arc<Mutex<OplogState>>,
     oplog_cv: Arc<Condvar>,
     shards_created: Arc<AtomicU32>,
+    oplog_nonlogged: bool,
+    prune: Arc<PruneCtx>,
 ) -> Arc<AsyncOplog> {
     // The cap is overridable via `SECANTUS_OPLOG_ASYNC_CAP_BYTES` (tuning + tests
     // that force backpressure with a tiny cap); a 0/invalid value keeps the default.
@@ -2372,6 +2872,8 @@ fn spawn_oplog_drainer(
         oplog_cv,
         backpressure: backpressure.clone(),
         shards_created,
+        oplog_nonlogged,
+        prune,
     };
     let mut txs = Vec::with_capacity(num_drainers);
     let mut joins = Vec::with_capacity(num_drainers);
@@ -2393,13 +2895,14 @@ fn spawn_oplog_drainer(
 fn write_drain_batch(
     session: &Session,
     shards_created: &AtomicU32,
+    oplog_nonlogged: bool,
     batch: &DrainBatch,
 ) -> Result<()> {
     session.begin_transaction(None)?;
     let res = (|| -> Result<()> {
         // Lazy shards: created on first touch only (bitmask; see
         // `ensure_oplog_shard`).
-        ensure_oplog_shard(shards_created, session, batch.start_seq)?;
+        ensure_oplog_shard(shards_created, session, batch.start_seq, oplog_nonlogged)?;
         let cur = session.open_cursor(&batch.shard, None)?;
         let mut pre_cur: Option<Cursor> = None;
         for (i, blob) in batch.blobs.iter().enumerate() {
@@ -2443,21 +2946,40 @@ fn persist_and_record(
     let start = batch.start_seq;
     let n = batch.blobs.len() as i64;
     let bytes = batch.bytes;
-    if let Err(e) = write_drain_batch(session, &shared.shards_created, &batch) {
+    if let Err(e) = write_drain_batch(
+        session,
+        &shared.shards_created,
+        shared.oplog_nonlogged,
+        &batch,
+    ) {
         eprintln!(
             "secantus-storage: async oplog drainer write failed at seq {start}: {e:?} (will retry)"
         );
         return Some(batch);
     }
     shared.backpressure.release(bytes);
-    let advanced = {
+    let (advanced, prune_due) = {
         let mut st = shared.oplog.lock().unwrap_or_else(|e| e.into_inner());
-        advance_written_seq(&mut st, start, n)
+        (
+            advance_written_seq(&mut st, start, n),
+            record_persisted(&mut st, n),
+        )
     };
     if advanced {
         shared.oplog_cv.notify_all();
     }
+    if prune_due {
+        run_drainer_prune(shared);
+    }
     None
+}
+
+/// Opportunistic prune signal from a drainer that just crossed the
+/// persisted-rows cadence boundary — hand the sweep to the background
+/// pruner so the drainer stays on its persist loop (a sweep here delayed
+/// draining and cost ~6% at 8 writers, Finding 17).
+fn run_drainer_prune(shared: &DrainerShared) {
+    signal_oplog_prune(&shared.prune);
 }
 
 /// Write a coalesced group of batches (possibly spanning several of this
@@ -2465,6 +2987,7 @@ fn persist_and_record(
 fn write_drain_batches(
     session: &Session,
     shards_created: &AtomicU32,
+    oplog_nonlogged: bool,
     batches: &[DrainBatch],
 ) -> Result<()> {
     session.begin_transaction(None)?;
@@ -2476,7 +2999,7 @@ fn write_drain_batches(
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
                     // Lazy shards: created on first touch only (bitmask).
-                    ensure_oplog_shard(shards_created, session, batch.start_seq)?;
+                    ensure_oplog_shard(shards_created, session, batch.start_seq, oplog_nonlogged)?;
                     e.insert(session.open_cursor(&batch.shard, None)?)
                 }
             };
@@ -2526,20 +3049,30 @@ fn persist_group(
         }
         return;
     }
-    match write_drain_batches(session, &shared.shards_created, &group) {
+    match write_drain_batches(
+        session,
+        &shared.shards_created,
+        shared.oplog_nonlogged,
+        &group,
+    ) {
         Ok(()) => {
             let bytes: usize = group.iter().map(|b| b.bytes).sum();
-            let advanced = {
+            let (advanced, prune_due) = {
                 let mut st = shared.oplog.lock().unwrap_or_else(|e| e.into_inner());
                 let mut adv = false;
+                let mut n = 0i64;
                 for b in &group {
                     adv |= advance_written_seq(&mut st, b.start_seq, b.blobs.len() as i64);
+                    n += b.blobs.len() as i64;
                 }
-                adv
+                (adv, record_persisted(&mut st, n))
             };
             shared.backpressure.release(bytes);
             if advanced {
                 shared.oplog_cv.notify_all();
+            }
+            if prune_due {
+                run_drainer_prune(shared);
             }
         }
         Err(e) => {
@@ -2690,6 +3223,26 @@ fn now_secs() -> i64 {
 /// Recover the oplog counters on open: the persisted meta row clamped UP to
 /// what the tables actually contain, else reconstruct from the newest oplog
 /// row. Mirrors `storage._load_oplog_meta`.
+/// Read the Phase-A' stable-checkpoint marker row: `(stable_seq,
+/// data_nonlogged)`, or `None` for a store that has never written one. The
+/// row lives in the (always WAL-logged) oplog-meta table under its own key so
+/// it never races the close-time "state" row.
+fn load_stable_marker(session: &Session) -> Option<(i64, bool)> {
+    let c = session.open_cursor(OPLOG_META_TABLE, None).ok()?;
+    c.set_key_s("stable");
+    if c.search().is_ok() {
+        let blob = c.get_value_u().ok()?;
+        let d = decode_doc(&blob).ok()?;
+        let seq = d
+            .get_i64("stable_seq")
+            .or_else(|_| d.get_i32("stable_seq").map(i64::from))
+            .ok()?;
+        let mode = d.get_bool("data_nonlogged").unwrap_or(false);
+        return Some((seq, mode));
+    }
+    None
+}
+
 fn load_oplog_meta(session: &Session) -> Result<OplogState> {
     let c = session.open_cursor(OPLOG_META_TABLE, None)?;
     c.set_key_s("state");
@@ -2721,6 +3274,7 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
                         .unwrap_or(1)
                         .max(scan_max_nat_seq(session) + 1),
                     emit_count: 0,
+                    persisted_count: 0,
                     live_count: count_oplog_entries(session),
                     written_seq: 0, // set to next_seq-1 by the caller (open)
                     done_ranges: BTreeMap::new(),
@@ -2757,6 +3311,7 @@ fn load_oplog_meta(session: &Session) -> Result<OplogState> {
         last_ts_ord: last_ord,
         next_nat_seq: scan_max_nat_seq(session) + 1,
         emit_count: 0,
+        persisted_count: 0,
         live_count: count_oplog_entries(session),
         written_seq: 0, // set to next_seq-1 by the caller (open)
         done_ranges: BTreeMap::new(),
@@ -2816,14 +3371,108 @@ fn archive_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
 /// then a startable WiredTiger home. Free function (no live `Storage` needed) so
 /// the restore path can rebuild a fresh directory. Mirrors Python
 /// `extract_backup_archive`.
+/// Chunk size for sparse extraction. Large enough that the all-zero test is
+/// cheap per byte, small enough that a partly-zero chunk wastes little.
+const SPARSE_CHUNK: usize = 256 * 1024;
+
+/// Extract one tar entry, punching holes instead of writing runs of zeros.
+///
+/// A WiredTiger backup contains `WiredTigerLog.*`, which WT **preallocates to
+/// `log_file_max`** — 2 GiB here. Almost all of it is zeros, so it compresses
+/// to nothing (a 100-document store archives to 2.0 MB) and then expands to
+/// 2.0 GB on restore. Measured: every PITR restore wrote 2 GB regardless of
+/// database size, 99.8% of its time blocked in `write(2)`, which took 0.84s on
+/// an idle disk and 858s when a dozen other processes shared the volume.
+///
+/// Seeking past a zero run leaves a hole that reads back as zeros, so the
+/// restored file is **byte-identical** — this changes only how it reaches the
+/// disk, never what WiredTiger later reads. The final `set_len` matters: a file
+/// whose tail is all zeros would otherwise end short, because seeking past the
+/// end does not itself extend a file.
+fn unpack_entry_sparse<R: std::io::Read>(
+    entry: &mut tar::Entry<'_, R>,
+    dst: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let size = entry.header().size()?;
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::File::create(dst)?;
+    let mut buf = vec![0u8; SPARSE_CHUNK];
+    let mut pending_hole: u64 = 0;
+
+    loop {
+        let n = entry.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if buf[..n].iter().all(|&b| b == 0) {
+            // Defer the seek: consecutive zero chunks coalesce into one hole.
+            pending_hole += n as u64;
+        } else {
+            if pending_hole > 0 {
+                file.seek(SeekFrom::Current(pending_hole as i64))?;
+                pending_hole = 0;
+            }
+            file.write_all(&buf[..n])?;
+        }
+    }
+
+    // Holes at EOF do not extend the file, so set the length explicitly.
+    file.set_len(size)?;
+    file.flush()?;
+    Ok(())
+}
+
+/// Unpack `archive` into `target`, writing regular files sparsely.
+///
+/// Mirrors `tar::Archive::unpack` for the entry kinds a WiredTiger backup
+/// contains (regular files and directories) and delegates anything else to the
+/// tar crate, so an unexpected entry type keeps its normal handling rather than
+/// being silently dropped.
+fn unpack_sparse<R: std::io::Read>(
+    archive: &mut tar::Archive<R>,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        // Refuse absolute paths and `..` traversal, as tar's own unpack does.
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsafe path in backup archive: {}", path.display()),
+            ));
+        }
+        let dst = target.join(&path);
+        match entry.header().entry_type() {
+            tar::EntryType::Directory => {
+                std::fs::create_dir_all(&dst)?;
+            }
+            tar::EntryType::Regular => {
+                unpack_entry_sparse(&mut entry, &dst)?;
+            }
+            _ => {
+                entry.unpack_in(target)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn extract_backup_archive(archive_path: &str, target_dir: &str) -> Result<()> {
     std::fs::create_dir_all(target_dir).map_err(|e| archive_err("extract_backup_archive", e))?;
     let file =
         std::fs::File::open(archive_path).map_err(|e| archive_err("extract_backup_archive", e))?;
     let dec = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(dec);
-    archive
-        .unpack(target_dir)
+    unpack_sparse(&mut archive, std::path::Path::new(target_dir))
         .map_err(|e| archive_err("extract_backup_archive", e))?;
     Ok(())
 }
@@ -2907,8 +3556,7 @@ pub fn extract_backup_archive_ex(
     // Pass 2: extract.
     let file = std::fs::File::open(&abs_archive).map_err(|e| archive_err("restoreArchive", e))?;
     let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(file));
-    ar.unpack(target)
-        .map_err(|e| archive_err("restoreArchive", e))?;
+    unpack_sparse(&mut ar, target).map_err(|e| archive_err("restoreArchive", e))?;
 
     let abs_target = std::fs::canonicalize(target)
         .map_err(|e| archive_err("restoreArchive", e))?
@@ -2925,6 +3573,45 @@ impl Drop for Storage {
     /// logged, never silent: in a database a close-time write error is a
     /// durability signal.
     fn drop(&mut self) {
+        // Stop the background oplog pruner first: it opens WT sessions, so it
+        // must be gone before the connection closes below. A parked pruner
+        // wakes on the notify; a mid-sweep one finishes its bounded sweep.
+        self.prune_ctx.stop.store(true, Ordering::Release);
+        {
+            let _g = self
+                .prune_ctx
+                .wake_flag
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.prune_ctx.wake_cv.notify_one();
+        }
+        if let Some(h) = self
+            .prune_join
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = h.join();
+        }
+        // Phase A': stop the periodic stable-checkpoint thread before any
+        // teardown (it holds no locks between ticks; a 250ms tick bounds the
+        // join). The close path below takes its own final checkpoint, and for
+        // a data-nonlogged store we anchor the stable marker with it so a
+        // clean close reopens with an empty replay gap.
+        self.checkpoint_stop.store(true, Ordering::Release);
+        if let Some(h) = self
+            .checkpoint_join
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = h.join();
+        }
+        if self.data_nonlogged {
+            if let Err(e) = self.stable_checkpoint() {
+                eprintln!("secantus-storage: close-time stable checkpoint failed: {e:?}");
+            }
+        }
         // Async oplog: flush the drainer pool BEFORE persisting meta / checkpointing,
         // so every committed write's oplog entry is on disk when the checkpoint
         // snapshots the tables (clean-close durability is preserved — only a hard
@@ -2983,6 +3670,15 @@ impl Drop for Storage {
 }
 
 impl Storage {
+    /// True when this store is the non-persistent (`in_memory=true`) variant.
+    ///
+    /// Read by `serverStatus.storageEngine.persistent`, which must not claim
+    /// durability an in-memory store does not have. Mirrors the Python
+    /// `Storage.in_memory` property.
+    pub fn in_memory(&self) -> bool {
+        self.in_memory
+    }
+
     /// Open (creating if needed) an on-disk database at `home` with the default
     /// SecantusDB WiredTiger config, bootstrapping the table schema.
     pub fn open(home: &str) -> Result<Storage> {
@@ -3007,19 +3703,50 @@ impl Storage {
         config: &str,
         durable: Option<bool>,
     ) -> Result<Storage> {
-        let durable = resolve_durable_from_env(durable);
+        Self::open_with_options(
+            home,
+            &StorageOptions {
+                wt_config: Some(config.to_string()),
+                durable,
+                ..StorageOptions::default()
+            },
+        )
+    }
+
+    /// Open with explicit, per-store options — the first-class form of what
+    /// the `SECANTUS_*` environment variables select process-wide. Every
+    /// `None` falls back to the corresponding env var (or the default), so
+    /// existing callers and the env-driven workflows keep working; an
+    /// explicit `Some` wins over the environment. This is what the Python
+    /// `RustServer(...)` kwargs and the `secantusd-rs` flags thread through.
+    pub fn open_with_options(home: &str, opts: &StorageOptions) -> Result<Storage> {
+        let config = opts
+            .wt_config
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CONFIG.to_string());
+        let config = config.as_str();
+        let durable = resolve_durable_from_env(opts.durable);
+        // Mode resolution: explicit option, else the env var each mode has
+        // always honoured. `oplog_nonlogged` / the data create-mode govern
+        // CREATE-time table configs (fresh stores; creates on existing tables
+        // are no-ops), `oplog_async` selects the drainer at every open.
+        let oplog_nonlogged = opts.oplog_nonlogged.unwrap_or_else(oplog_tables_nonlogged);
+        let data_create_mode = opts.data_nonlogged.unwrap_or_else(data_tables_nonlogged);
+        let oplog_async_on = opts
+            .oplog_async
+            .unwrap_or_else(|| std::env::var_os("SECANTUS_OPLOG_ASYNC").is_some());
         let in_memory = config.contains("in_memory=true");
         let conn = Arc::new(Connection::open(home, config)?);
         let mut state = {
             let boot = conn.open_session()?;
             for (name, fmt) in BOOTSTRAP {
-                boot.create(name, &data_table_cfg(fmt))?;
+                boot.create(name, &bootstrap_table_cfg(name, fmt, data_create_mode))?;
             }
             // The oplog is sharded across OPLOG_SHARDS btrees to spread append
             // contention (see OPLOG_SHARDS); the legacy single table stays
             // so a pre-shard store's entries remain readable. Config honours
             // SECANTUS_OPLOG_NONLOGGED (see `oplog_table_cfg`).
-            let opcfg = oplog_table_cfg();
+            let opcfg = oplog_table_cfg(oplog_nonlogged);
             boot.create(OPLOG_TABLE, &opcfg)?;
             boot.create(PREIMAGE_TABLE, &opcfg)?;
             // The documents shards (DOC_SHARDS) and oplog shards (OPLOG_SHARDS) are
@@ -3045,7 +3772,7 @@ impl Storage {
             reject_legacy_index_entry_format(&boot)?;
             // One-time: fold a pre-shard store's legacy documents rows into the
             // per-collection shards (no-op for a born-sharded store).
-            migrate_legacy_docs(&boot)?;
+            migrate_legacy_docs(&boot, data_create_mode)?;
             // Recover the oplog seq / timestamp counters from the meta row, or
             // reconstruct them by scanning the oplog table.
             load_oplog_meta(&boot)?
@@ -3067,37 +3794,109 @@ impl Storage {
         state.written_seq = state.next_seq - 1;
         let oplog = Arc::new(Mutex::new(state));
         let oplog_cv = Arc::new(Condvar::new());
-        let oplog_shards_created = Arc::new(AtomicU32::new(0));
-        // PROTOTYPE opt-in: spawn the background drainer when SECANTUS_OPLOG_ASYNC
-        // is set. The synchronous, atomic path is the default (`None`).
-        let async_oplog = if std::env::var_os("SECANTUS_OPLOG_ASYNC").is_some() {
+        // Seed the shard-existence mask by probing once at open (shards are
+        // lazy-created; on a typical store most of the 16 never exist), so
+        // every oplog merge skips the absent tables without a failed
+        // open_cursor per table per call. Single-process store: a 0 bit
+        // stays honest until this process itself creates the shard.
+        let oplog_shards_created = {
+            let session = conn.open_session()?;
+            Arc::new(AtomicU32::new(probe_existing_oplog_shards(&session)))
+        };
+        // Phase A': resolve the data-logging mode. The stable marker (written
+        // at every stable checkpoint) is authoritative for an existing store —
+        // table logging config is create-time-sticky, so flipping the env var
+        // on an existing store must not change the mode. A fresh store (no
+        // marker) takes the env var. In-memory stores have no crash story and
+        // stay in the plain mode. Resolved BEFORE the drainer pool spawns —
+        // the drainers' prune context needs the mode and the stable-marker
+        // pieces.
+        let marker = {
+            let session = conn.open_session()?;
+            load_stable_marker(&session)
+        };
+        let data_nonlogged = if in_memory {
+            false
+        } else {
+            match marker {
+                Some((_, mode)) => mode,
+                None => data_create_mode,
+            }
+        };
+        let stable_seq = Arc::new(AtomicI64::new(marker.map(|(s, _)| s).unwrap_or(0)));
+        let checkpoint_requested = Arc::new(AtomicBool::new(false));
+        let prune_ctx = Arc::new(PruneCtx {
+            conn: conn.clone(),
+            oplog: oplog.clone(),
+            prune_lock: Mutex::new(()),
+            retention_seconds: AtomicI64::new(3600),
+            max_entries: AtomicUsize::new(100_000),
+            archive_dir: Mutex::new(None),
+            data_nonlogged,
+            stable_seq: stable_seq.clone(),
+            checkpoint_requested: checkpoint_requested.clone(),
+            shards_created: oplog_shards_created.clone(),
+            wake_flag: Mutex::new(false),
+            wake_cv: Condvar::new(),
+            stop: AtomicBool::new(false),
+        });
+        let prune_join = Mutex::new(Some(spawn_oplog_pruner(prune_ctx.clone())));
+        // Opt-in: spawn the background drainer pool (option, else
+        // SECANTUS_OPLOG_ASYNC). The synchronous, atomic path is the default.
+        let async_oplog = if oplog_async_on {
             Some(spawn_oplog_drainer(
                 conn.clone(),
                 oplog.clone(),
                 oplog_cv.clone(),
                 oplog_shards_created.clone(),
+                oplog_nonlogged,
+                prune_ctx.clone(),
             ))
         } else {
             None
         };
-        Ok(Storage {
+        let mut storage = Storage {
             conn,
             home: home.to_string(),
             lock: Mutex::new(()),
             coll_locks: Mutex::new(HashMap::new()),
-            oplog_prune_lock: Mutex::new(()),
+            write_tickets: crate::admission::Tickets::new(opts.write_tickets.unwrap_or(0)),
+            ddl_generation: AtomicU64::new(0),
+            txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
             oplog_shards_created,
             enable_oplog: true,
             oplog,
             oplog_cv,
-            oplog_retention_seconds: 3600,
-            oplog_max_entries: 100_000,
+            prune_ctx,
+            prune_join,
             ts_suffix_counter: AtomicU64::new(0),
-            oplog_archive_dir: None,
-            durable,
+            // Unlogged data tables are only as durable as their last
+            // checkpoint, so the close-time checkpoint is NOT optional in this
+            // mode — a fast-storage (durable=false) clean close would lose
+            // acknowledged writes with no crash involved. Force it.
+            durable: durable || data_nonlogged,
             in_memory,
             async_oplog,
-        })
+            oplog_nonlogged,
+            checkpoint_seconds: opts.checkpoint_seconds,
+            data_nonlogged,
+            stable_seq,
+            checkpoint_stop: Arc::new(AtomicBool::new(false)),
+            checkpoint_requested,
+            checkpoint_join: Mutex::new(None),
+        };
+        if storage.data_nonlogged {
+            // Crash recovery: the data tables rolled back to the last stable
+            // checkpoint; the (WAL-logged) oplog has everything. Replay the
+            // gap idempotently, then re-anchor the stable point. On a clean
+            // close the gap is empty and this is a no-op.
+            storage.recover_from_oplog()?;
+            storage.spawn_stable_checkpoint_thread();
+        }
+        // Finish any chunked drop a crash interrupted (registry row already
+        // gone; the leftover rows must not resurface under a re-created name).
+        storage.recover_pending_drops()?;
+        Ok(storage)
     }
 
     /// Turn oplog emission on/off (mirrors `SecantusDBServer(enable_oplog=...)`).
@@ -3110,19 +3909,25 @@ impl Storage {
     /// to drop into a durable segment in `dir` first. `None` disables it. Mirrors
     /// `Storage(oplog_archive_dir=...)`.
     pub fn set_oplog_archive_dir(&mut self, dir: Option<String>) {
-        self.oplog_archive_dir = dir;
+        *self
+            .prune_ctx
+            .archive_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = dir;
     }
 
     /// Set the oplog retention window in seconds (default 3600). Mirrors
     /// `oplog_retention_seconds`.
     pub fn set_oplog_retention_seconds(&mut self, secs: i64) {
-        self.oplog_retention_seconds = secs;
+        self.prune_ctx
+            .retention_seconds
+            .store(secs, Ordering::Relaxed);
     }
 
     /// Set the oplog hard entry cap (default 100_000). Mirrors
     /// `oplog_max_entries`.
     pub fn set_oplog_max_entries(&mut self, n: usize) {
-        self.oplog_max_entries = n;
+        self.prune_ctx.max_entries.store(n, Ordering::Relaxed);
     }
 
     // --- locking (per-collection write locks + write-conflict retry) ---
@@ -3201,6 +4006,54 @@ impl Storage {
         }
     }
 
+    /// Enter a namespace-DDL scope: bumps `ddl_generation` to odd (DDL in
+    /// flight) and returns a guard whose drop bumps it back to even — on every
+    /// exit path, including errors, so the counter can never stick odd. The
+    /// caller must hold the global `lock` (all namespace DDL does), which
+    /// serialises scopes and makes the odd/even parity a reliable
+    /// "DDL-in-flight" signal for readers. Seqlock shape: the pre-bump (not
+    /// just a post-commit bump) is what closes the window where a reader
+    /// finishes a partial scan and checks the generation before the DDL
+    /// thread gets to bump it.
+    fn ddl_generation_scope(&self) -> DdlGenScope<'_> {
+        self.ddl_generation.fetch_add(1, Ordering::Release);
+        DdlGenScope(&self.ddl_generation)
+    }
+
+    /// Run a lock-free multi-row read, re-running it when a namespace-level
+    /// DDL (drop / rename / index drop) committed while the scan was in
+    /// flight. Without the check, a reader walking the shared tables mid-DDL
+    /// could return a *partial* result set — rows read before the DDL commit
+    /// spliced with the post-commit view of later keys. Every such DDL's row
+    /// writes commit in one statement transaction inside a
+    /// [`Self::ddl_generation_scope`], so a scan is consistent when the
+    /// generation was even (no DDL in flight) and unchanged across the scan.
+    /// Bounded (a DDL storm can't livelock a reader): after a few re-runs the
+    /// last result stands, which is the pre-check behaviour. Inside a user
+    /// transaction the pinned WT snapshot already gives a consistent view, so
+    /// the read runs once.
+    fn with_ddl_generation_check<T>(&self, mut f: impl FnMut() -> Result<T>) -> Result<T> {
+        const DDL_SCAN_RETRIES: usize = 5;
+        if self.in_user_txn() {
+            return f();
+        }
+        let mut attempts = 0;
+        loop {
+            let before = self.ddl_generation.load(Ordering::Acquire);
+            let out = f()?;
+            let after = self.ddl_generation.load(Ordering::Acquire);
+            if (before == after && before.is_multiple_of(2)) || attempts >= DDL_SCAN_RETRIES {
+                return Ok(out);
+            }
+            attempts += 1;
+            if after % 2 == 1 {
+                // A DDL is mid-flight — give its commit a moment before the
+                // rescan instead of spinning against it.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
     /// Run one write statement inside its own WT transaction (snapshot
     /// isolation): commit on success, roll back on error — unless the thread
     /// is inside a user transaction, in which case the statement joins it and
@@ -3269,6 +4122,10 @@ impl Storage {
         match f() {
             Ok(v) => {
                 if let Err(e) = session.commit_transaction(None) {
+                    // Ask WHY before rolling back — the reason buffer belongs
+                    // to the failing transaction and does not survive the next
+                    // call on this session.
+                    let why = session.rollback_reason();
                     let _ = session.rollback_transaction(None);
                     if async_mode {
                         IN_ASYNC_STMT.with(|f| f.set(false));
@@ -3276,7 +4133,7 @@ impl Storage {
                     }
                     const EINVAL: i32 = 22;
                     if e.is_rollback() || e.code == EINVAL {
-                        return Err(StorageError::WriteConflict);
+                        return Err(classify_rollback(why));
                     }
                     return Err(e.into());
                 }
@@ -3432,6 +4289,21 @@ impl Storage {
             return Ok(0);
         }
         debug_assert_eq!(pre_images.len(), entries.len());
+        // User-transaction dirty accounting — BEFORE the async-oplog branch,
+        // which early-returns after buffering (in async mode the guard never
+        // saw the bytes and the CI async-oplog lane hit the raw cache error
+        // the budget exists to prevent). The entries carry the full
+        // documents, so their byte volume is the budget input; harvested by
+        // `with_user_transaction`. Pre-image bytes are charged too: in async
+        // mode they ride the same per-handle `pending_async` buffer, so
+        // without this the buffer (and heap) could grow unbounded for the
+        // life of a pre-image-enabled transaction even though the entries
+        // themselves stay within budget (#750).
+        if !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
+            let entry_sz: u64 = entries.iter().map(oplog_entry_size).sum();
+            let preimage_sz: u64 = pre_images.iter().flatten().map(|p| p.len() as u64).sum();
+            PENDING_DIRTY_BYTES.with(|c| c.set(c.get() + entry_sz + preimage_sz));
+        }
         // Async oplog (prototype): inside an autocommit write statement, buffer
         // the entries instead of writing them in this transaction. They are minted
         // a seq and handed to the drainer by `with_statement_txn` after the data
@@ -3449,7 +4321,12 @@ impl Storage {
                 }
             });
             if !IN_ASYNC_STMT.with(|f| f.get()) {
-                self.drain_pending_oplog();
+                // Self-draining emit (noop heartbeat, DDL on a bare session):
+                // the mint happens right here, so the real seq is known and
+                // returned — matching the sync path's contract. Deferred
+                // emits (statement / user txn) mint at their commit and
+                // return 0.
+                return Ok(self.drain_pending_oplog());
             }
             return Ok(0);
         }
@@ -3472,7 +4349,12 @@ impl Storage {
         // (the locality that per-entry scatter destroyed). One cursor for the run.
         // Lazy shards: created on first touch only (the bitmask skips the
         // per-batch schema-lock `create` the old path paid on every emit).
-        let op_shard = ensure_oplog_shard(&self.oplog_shards_created, session, start)?;
+        let op_shard = ensure_oplog_shard(
+            &self.oplog_shards_created,
+            session,
+            start,
+            self.oplog_nonlogged,
+        )?;
         let cur = session.open_cursor(&op_shard, None)?;
         let mut pre_cur: Option<Cursor> = None;
         let wall_millis = now_millis();
@@ -3541,16 +4423,13 @@ impl Storage {
             }
         };
         // Opportunistically bound the oplog from write volume alone (mirrors
-        // `storage._emit_oplog`'s every-1000-emits prune). Sweep exclusivity
-        // comes from `oplog_prune_lock` inside `prune_oplog_inner` — the
-        // caller holds only its collection lock here, and the prune must not
-        // touch the global lock (lock order). Best-effort: the write already
-        // committed, so a prune failure must not fail the write — the next
-        // sweep retries.
+        // `storage._emit_oplog`'s every-1000-emits cadence) — but the SWEEP
+        // runs on the background pruner, not here: inline it was ~36% of the
+        // whole sync insert path under sustained cap pressure (Finding 12 —
+        // every insert paid a share of the k-way merge + per-row deletes).
+        // The signal is one small mutex + notify.
         if do_prune {
-            if let Err(e) = self.prune_oplog_inner(None) {
-                debug_assert!(false, "opportunistic prune_oplog failed: {e:?}");
-            }
+            signal_oplog_prune(&self.prune_ctx);
         }
         Ok(last)
     }
@@ -3561,14 +4440,28 @@ impl Storage {
     /// the seq space gapless: a rolled-back/retried write cleared its buffer
     /// before reaching this point, so it never minted. `wait_for_oplog` waits on
     /// the drainer's `written_seq`, so a tailer never reads past what is on disk.
-    fn drain_pending_oplog(&self) {
-        let Some(async_h) = self.async_oplog.clone() else {
-            return;
-        };
+    fn drain_pending_oplog(&self) -> i64 {
+        if self.async_oplog.is_none() {
+            return 0;
+        }
         let pending: Vec<(OplogEntry, Option<Vec<u8>>)> =
             PENDING_OPLOG.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        self.mint_and_enqueue(pending)
+    }
+
+    /// The mint-and-hand-off half of [`Self::drain_pending_oplog`], callable
+    /// with an explicit entry list — `commit_user_transaction` feeds it the
+    /// entries a transaction's statements buffered on the handle. MUST only be
+    /// called after the entries' data transaction has committed. Returns the
+    /// highest seq minted (0 when nothing was pending), so a self-draining
+    /// emit (noop heartbeat, DDL) can report its entry's real seq like the
+    /// sync path does.
+    fn mint_and_enqueue(&self, pending: Vec<(OplogEntry, Option<Vec<u8>>)>) -> i64 {
+        let Some(async_h) = self.async_oplog.clone() else {
+            return 0;
+        };
         if pending.is_empty() {
-            return;
+            return 0;
         }
         let n = pending.len();
         // No in-flight tracking: this mint happens AFTER the data commit and
@@ -3606,10 +4499,13 @@ impl Storage {
             blobs.push(blob);
             preimages.push(pre);
         }
+        // The opportunistic prune cadence lives with the DRAINERS in async
+        // mode (`record_persisted` — the sweep can only doom persisted rows,
+        // so a mint-side trigger lets queue lag escape it); here only the
+        // live-count is maintained.
         {
             let mut g = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
             g.live_count += n as i64;
-            g.emit_count += n as i64;
         }
         let bytes: usize = blobs.iter().map(Vec::len).sum::<usize>()
             + preimages
@@ -3640,6 +4536,7 @@ impl Storage {
                 "secantus-storage: async oplog drainer gone; {n} committed entries not persisted"
             );
         }
+        start + n as i64 - 1
     }
 
     /// Block until the oplog tail seq exceeds `after_seq` (a new entry landed),
@@ -3796,7 +4693,12 @@ impl Storage {
         // change-stream getMore path, so serialising it against every write
         // would needlessly throttle throughput.
         let session = self.conn.open_session()?;
-        let mut rows = read_oplog_shards(&session, start_seq, limit)?;
+        let mut rows = read_oplog_shards(
+            &session,
+            self.oplog_shards_created.load(Ordering::Relaxed),
+            start_seq,
+            limit,
+        )?;
         if let Some(cut) = rows.iter().position(|(seq, _)| *seq > max_seq) {
             rows.truncate(cut);
         }
@@ -3819,6 +4721,40 @@ impl Storage {
         }
     }
 
+    /// The seq a fresh change stream opens at: every write acknowledged
+    /// BEFORE this call resolves to a seq `<=` the returned value, so a watch
+    /// seeded here never surfaces pre-open events. Sync mode: the visible
+    /// tail as-is (an open transaction's in-flight mint pins it, and that is
+    /// correct — those events are post-open whenever the transaction
+    /// commits; waiting on them here would block opens behind long
+    /// transactions). Async mode: an acked write has *minted* (the writer
+    /// thread mints in `drain_pending_oplog` before replying) but may still
+    /// be queued at the drainer below `written_seq` — seeding at the raw
+    /// watermark surfaces those pre-open events after the open (observed as
+    /// pymongo's `test_kill_cursors` failing async-only). Wait for the
+    /// drainer to reach the minted tail captured at entry; bounded (5s) so a
+    /// dead drainer (already reported loudly) degrades an open instead of
+    /// hanging it.
+    pub fn oplog_open_seq(&self) -> i64 {
+        if self.async_oplog.is_none() {
+            return self.oplog_visible_tail_seq();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        let target = st.next_seq - 1;
+        while st.written_seq < target && std::time::Instant::now() < deadline {
+            let (g, _timed_out) = self
+                .oplog_cv
+                .wait_timeout(st, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner());
+            st = g;
+        }
+        // `target`, not `written_seq`: entries the drainer landed past the
+        // captured tail while we waited are concurrent-with-open writes, and
+        // a watch should deliver them.
+        target.min(st.written_seq).max(0)
+    }
+
     /// Whether `(db, coll)` is the synthetic `local.oplog.rs` view.
     fn is_oplog_rs(&self, db: &str, coll: &str) -> bool {
         self.enable_oplog && db == "local" && coll == "oplog.rs"
@@ -3838,6 +4774,17 @@ impl Storage {
         coll_opt: Option<&Collation>,
         vars: &Document,
     ) -> Result<Vec<Vec<u8>>> {
+        // Async oplog: an acknowledged write's entry may still be queued at
+        // the drainer; a mongod client that just got its ack and reads
+        // `local.oplog.rs` must see the entry (the oplog write is part of the
+        // acknowledged write there). Drain read-after-write lag before the
+        // scan. Sync mode: waits out any in-flight mints — same contract.
+        // Skipped inside a user transaction: this thread's own un-resolved
+        // emits would make `flush_oplog` wait on itself (mongod forbids
+        // reading `local` in a transaction anyway).
+        if !self.in_user_txn() {
+            self.flush_oplog();
+        }
         let rows = self.read_oplog(0, usize::MAX)?;
         let mut out: Vec<(Document, Vec<u8>)> = Vec::with_capacity(rows.len());
         for (_seq, blob) in rows {
@@ -3879,8 +4826,12 @@ impl Storage {
         // (+ the legacy table). Each shard's `next()` from the start lands on its
         // minimum.
         let session = self.conn.open_session()?;
+        let existing = self.oplog_shards_created.load(Ordering::Relaxed);
         let mut floor: Option<i64> = None;
         for s in 0..OPLOG_SHARDS {
+            if oplog_table_absent(existing, s as usize) {
+                continue; // existence mask: known-absent shard
+            }
             let cur = match session.open_cursor(&oplog_shard_name(s), None) {
                 Ok(c) => c,
                 Err(e) if e.is_missing_table() => continue, // lazy shards: absent = empty
@@ -3921,6 +4872,211 @@ impl Storage {
         Ok(())
     }
 
+    /// Phase A': write the stable marker at the CURRENT visible tail, then
+    /// checkpoint. Marker-before-checkpoint makes the marker conservative —
+    /// the checkpoint's data state covers at least every seq <= marker — and
+    /// conservative is safe because replay is idempotent (re-applied inserts
+    /// skip on duplicate `_id`, `$v:2` diffs are idempotent transformations,
+    /// deletes of absent docs are no-ops). Public so tests and tools can
+    /// force an anchor; the periodic thread calls it on the mongod cadence.
+    /// The seq the last stable checkpoint anchored (0 if none yet).
+    pub fn stable_checkpoint_seq(&self) -> i64 {
+        self.stable_seq.load(Ordering::Acquire)
+    }
+
+    pub fn stable_checkpoint(&self) -> Result<()> {
+        // ORDER IS LOAD-BEARING: capture the seq, CHECKPOINT, then write the
+        // marker. The marker row lives in the always-logged oplog-meta table,
+        // so it becomes crash-durable the moment its transaction hits the WAL
+        // — independently of the checkpoint. Written marker-first (as this
+        // used to be), a kill -9 in the window between the marker's WAL write
+        // and the checkpoint's completion recovers with a marker ABOVE the
+        // data the last checkpoint actually contained, and replay starts too
+        // high: every acked write between the old checkpoint and the marker
+        // is silently lost (caught live by the hard-kill harness, 2026-08-01
+        // — a mid-history hole, oplog rows all present). Checkpoint-first,
+        // the crash window leaves the OLD marker: replay covers extra
+        // already-applied entries, which `apply_replay_entry_idempotent`
+        // exists to absorb. Stale-marker is safe; eager-marker loses data.
+        let stable = self.oplog_visible_tail_seq();
+        self.checkpoint()?;
+        {
+            let session = self.conn.open_session()?;
+            let mut d = Document::new();
+            d.insert("stable_seq", stable);
+            d.insert("data_nonlogged", self.data_nonlogged);
+            let blob = encode_doc(&d)?;
+            let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
+            cur.set_key_s("stable");
+            cur.set_value_u(&blob);
+            cur.insert()?;
+        }
+        self.stable_seq.store(stable, Ordering::Release);
+        Ok(())
+    }
+
+    /// Phase A' crash recovery: replay oplog entries above the stable marker
+    /// into the data tables through the ordinary write paths (oplog emission
+    /// suppressed — the entries are already there), tolerating already-applied
+    /// work: the marker is deliberately conservative, so the window's prefix
+    /// may be present in the checkpointed data. Runs before the store serves.
+    fn recover_from_oplog(&mut self) -> Result<()> {
+        let floor = self.stable_seq.load(Ordering::Acquire);
+        let was_enabled = self.enable_oplog;
+        self.enable_oplog = false;
+        let mut next = floor + 1;
+        let mut applied = 0u64;
+        let mut skipped = 0u64;
+        let result = loop {
+            let rows = match self.read_oplog(next, 2000) {
+                Ok(r) => r,
+                Err(e) => break Err(e),
+            };
+            if rows.is_empty() {
+                break Ok(());
+            }
+            for (seq, blob) in &rows {
+                next = seq + 1;
+                let entry = match decode_doc(blob) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("secantus-storage: recover_from_oplog: undecodable entry at seq {seq}: {e:?}");
+                        skipped += 1;
+                        continue;
+                    }
+                };
+                match self.apply_replay_entry_idempotent(&entry) {
+                    Ok(true) => applied += 1,
+                    Ok(false) => skipped += 1,
+                    Err(e) => {
+                        self.enable_oplog = was_enabled;
+                        return Err(e);
+                    }
+                }
+            }
+        };
+        self.enable_oplog = was_enabled;
+        result?;
+        if applied > 0 || skipped > 0 {
+            eprintln!(
+                "secantus-storage: recover_from_oplog: replayed seqs {}..{} (applied {applied}, \
+                 already-present/skipped {skipped})",
+                floor + 1,
+                next - 1
+            );
+        }
+        // Re-anchor so the next crash replays only its own gap (and the prune
+        // clamp releases the window just replayed).
+        self.stable_checkpoint()
+    }
+
+    /// One replay entry, idempotently: a duplicate-`_id` insert means the
+    /// checkpoint already contained it (the marker is conservative) — skip.
+    /// DDL ('c') entries tolerate re-application errors the same way (a
+    /// create/rename of something that already exists IS the already-applied
+    /// case), but the skip is logged so a genuine replay failure is never
+    /// silent.
+    fn apply_replay_entry_idempotent(&self, entry: &Document) -> Result<bool> {
+        match replay::apply_entry(self, entry) {
+            Ok(b) => Ok(b),
+            Err(StorageError::DuplicateId) => Ok(false),
+            Err(e) if entry.get_str("op").ok() == Some("c") => {
+                eprintln!(
+                    "secantus-storage: recover_from_oplog: DDL entry re-application skipped ({:?}): {e:?}",
+                    entry.get_str("ns").unwrap_or("")
+                );
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Spawn the periodic stable-checkpoint thread (data-nonlogged stores).
+    /// Interval: `SECANTUS_CHECKPOINT_SECONDS` (default 60 — mongod's
+    /// cadence). Stopped + joined in `Drop` before the close checkpoint.
+    fn spawn_stable_checkpoint_thread(&self) {
+        let interval = self
+            .checkpoint_seconds
+            .filter(|n| *n > 0)
+            .or_else(|| {
+                std::env::var("SECANTUS_CHECKPOINT_SECONDS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|n| *n > 0)
+            })
+            .unwrap_or(60);
+        let stop = self.checkpoint_stop.clone();
+        let requested = self.checkpoint_requested.clone();
+        // The thread needs the storage's checkpoint machinery without owning
+        // the Storage: give it the raw pieces (connection + oplog state for
+        // the visible tail + the atomics), mirroring DrainerShared.
+        let conn = self.conn.clone();
+        let oplog = self.oplog.clone();
+        let stable_seq = self.stable_seq.clone();
+        let handle = thread::Builder::new()
+            .name("secantus-stable-checkpoint".into())
+            .spawn(move || {
+                let tick = std::time::Duration::from_millis(250);
+                let mut waited = std::time::Duration::ZERO;
+                let interval = std::time::Duration::from_secs(interval);
+                loop {
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(tick);
+                    waited += tick;
+                    let demanded = requested.swap(false, Ordering::AcqRel);
+                    if waited < interval && !demanded {
+                        continue;
+                    }
+                    waited = std::time::Duration::ZERO;
+                    // Checkpoint-BEFORE-marker, same as stable_checkpoint()
+                    // (see the invariant comment there): the marker is
+                    // WAL-durable the moment it is written, so writing it
+                    // ahead of the checkpoint opens a kill window where
+                    // recovery trusts a marker above the checkpointed data
+                    // and replay skips acked writes. Stale marker = safe
+                    // (idempotent over-replay); eager marker = data loss.
+                    let stable = {
+                        let st = oplog.lock().unwrap_or_else(|e| e.into_inner());
+                        if st.in_flight.is_empty() {
+                            st.next_seq - 1
+                        } else {
+                            *st.in_flight.keys().next().unwrap() - 1
+                        }
+                    };
+                    let write = (|| -> Result<()> {
+                        let session = conn.open_session()?;
+                        session.checkpoint(None)?;
+                        let mut d = Document::new();
+                        d.insert("stable_seq", stable);
+                        d.insert("data_nonlogged", true);
+                        let blob = encode_doc(&d)?;
+                        let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
+                        cur.set_key_s("stable");
+                        cur.set_value_u(&blob);
+                        cur.insert()?;
+                        Ok(())
+                    })();
+                    match write {
+                        Ok(()) => stable_seq.store(stable, Ordering::Release),
+                        // A checkpoint failure is a durability signal — loud,
+                        // never silent; the next tick retries.
+                        Err(e) => eprintln!("secantus-storage: stable checkpoint failed: {e:?}"),
+                    }
+                }
+            });
+        match handle {
+            Ok(h) => {
+                *self
+                    .checkpoint_join
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(h);
+            }
+            Err(e) => eprintln!("secantus-storage: could not spawn stable-checkpoint thread: {e}"),
+        }
+    }
+
     /// Force a checkpoint, then tar the consistent WiredTiger file set (enumerated
     /// by WiredTiger's `backup:` cursor) into `output_path` as a gzip stream, with
     /// an advisory `pitr-manifest.json` describing the oplog range it can recover
@@ -3929,6 +5085,12 @@ impl Storage {
     /// this archive (and vice versa).
     pub fn create_archive(&self, output_path: &str) -> Result<ArchiveInfo> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Async mode: entries handed to the drainer but not yet persisted are
+        // invisible to the checkpoint below — without this drain the archive's
+        // manifest would advertise an oplog range missing acknowledged writes.
+        // Sync mode: waits out any in-flight mint window (usually a no-op).
+        // The drainers never take `self.lock`, so waiting here cannot deadlock.
+        self.flush_oplog();
         let session = self.conn.open_session()?;
         // Durable, consistent snapshot first; the backup cursor enumerates the
         // files that make it up and WiredTiger holds them stable for the cursor's
@@ -3985,8 +5147,8 @@ impl Storage {
     /// segment in `archive_dir` before `prune_oplog` deletes them. Best-effort
     /// reads — a row that vanished concurrently is skipped.
     fn archive_doomed_oplog(
-        &self,
         session: &Session,
+        existing: u32,
         archive_dir: &str,
         doomed_sorted: &[i64],
     ) -> Result<()> {
@@ -3995,10 +5157,15 @@ impl Storage {
         // cursor cache; `search()` (a read) reports not-found honestly regardless
         // of overwrite mode.
         let tables = oplog_all_tables();
-        // Pre-open one cursor per table; a lazily-absent shard parks a `None`
-        // (reads as empty) — index stays aligned with `tables`.
+        // Pre-open one cursor per table; a known-absent (existence mask) or
+        // lazily-absent shard parks a `None` (reads as empty) — index stays
+        // aligned with `tables`.
         let mut op_curs: Vec<Option<Cursor>> = Vec::with_capacity(tables.len());
-        for name in &tables {
+        for (i, name) in tables.iter().enumerate() {
+            if oplog_table_absent(existing, i) {
+                op_curs.push(None);
+                continue;
+            }
             op_curs.push(match session.open_cursor(name, None) {
                 Ok(c) => Some(c),
                 Err(e) if e.is_missing_table() => None,
@@ -4094,7 +5261,7 @@ impl Storage {
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
-        ensure_collection(&session, db, coll)?;
+        ensure_collection(&session, db, coll, self.data_nonlogged)?;
         let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
         for (k, v) in opts {
             current.insert(k.clone(), v.clone());
@@ -4115,7 +5282,7 @@ impl Storage {
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
-        ensure_collection(&session, db, coll)?;
+        ensure_collection(&session, db, coll, self.data_nonlogged)?;
         let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
         for (k, v) in opts {
             current.insert(k.clone(), v.clone());
@@ -4158,7 +5325,7 @@ impl Storage {
         // only if still absent.
         let lock = self.coll_lock(db, coll);
         let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
-        ensure_collection(&session, db, coll)?;
+        ensure_collection(&session, db, coll, self.data_nonlogged)?;
         collection_uuid(&session, db, coll)
     }
 
@@ -4211,7 +5378,12 @@ impl Storage {
         // and all-table point-ops find rows regardless of placement; a single
         // contiguous append keeps the restore fast (per-seq routing would scatter).
         // Lazy shards: created on first touch only (bitmask).
-        let op_shard = ensure_oplog_shard(&self.oplog_shards_created, &session, rows[0].0)?;
+        let op_shard = ensure_oplog_shard(
+            &self.oplog_shards_created,
+            &session,
+            rows[0].0,
+            self.oplog_nonlogged,
+        )?;
         let cur = session.open_cursor(&op_shard, None)?;
         let mut pre_cur: Option<Cursor> = None;
         let mut max_seq = 0i64;
@@ -4264,109 +5436,165 @@ impl Storage {
     /// the wall clock). Returns the number of rows pruned. No background sweeper —
     /// the caller drives it. Mirrors `storage.prune_oplog` / `_prune_oplog_locked`.
     pub fn prune_oplog(&self, now: Option<i64>) -> Result<usize> {
+        // Async oplog: the sweep considers only PERSISTED rows, so an explicit
+        // prune racing the drainer dooms a timing-dependent subset of the
+        // acknowledged writes (observed as `v2_restore_reaches_before_pruned_floor`
+        // flaking on the async CI lane: cap-excess rows still queued at the
+        // drainer escaped the sweep, shifting the pruned count and the
+        // resulting floor). Drain first so an explicit prune — an admin op,
+        // never on the write path — deterministically covers every
+        // acknowledged write. The drainers' own opportunistic cadence calls
+        // the sweep directly, not this entry point, so they never self-wait
+        // here; async entries mint post-commit, so a user-transaction thread
+        // cannot self-wait either.
+        if self.async_oplog.is_some() {
+            self.flush_oplog();
+        }
         self.prune_oplog_inner(now)
     }
 
-    /// One prune sweep, exclusive with other sweeps via `oplog_prune_lock` —
-    /// NOT the global lock: the opportunistic write-path caller
-    /// (`emit_oplog`) holds a collection lock, and global-after-collection
-    /// would invert the lock order (deadlock with DDL). Pruner-vs-writer
-    /// needs no exclusion — writers only append strictly higher seqs and
-    /// never touch the old rows doomed here; the reads that could observe a
-    /// half-pruned range (`read_oplog`, resume) tolerate missing rows.
+    /// One prune sweep over the shared [`PruneCtx`]. See [`prune_oplog_sweep`].
     fn prune_oplog_inner(&self, now: Option<i64>) -> Result<usize> {
-        let _p = self
-            .oplog_prune_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
-        let when = now.unwrap_or_else(now_secs);
-        let cutoff = when - self.oplog_retention_seconds;
+        prune_oplog_sweep(&self.prune_ctx, now)
+    }
+}
 
-        // Phase 1 (lock-free): identify the doomed rows WITHOUT scanning the whole
-        // oplog — that full scan, every OPLOG_PRUNE_INTERVAL emits, was 77% of the
-        // single-writer write-path CPU (profile: scratchpad/profile_insert.sh). The
-        // live-count lets us size the sweep: `excess` is how many oldest rows must
-        // drop to get back under the entry cap; retention dooms a seq-ordered
-        // prefix on top of that. A fresh MVCC session reads consistently without
-        // blocking writers; prune is best-effort, so a slightly stale count/view is
-        // fine — writers only append *higher* seqs, never touch the old rows here.
-        let tables = oplog_all_tables();
-        let live_count = self.oplog.lock().unwrap().live_count;
-        let excess = (live_count - self.oplog_max_entries as i64).max(0) as usize;
+/// One prune sweep, exclusive with other sweeps via `PruneCtx::prune_lock` —
+/// NOT the storage global lock: the opportunistic write-path caller
+/// (`emit_oplog`) holds a collection lock, and global-after-collection
+/// would invert the lock order (deadlock with DDL). Pruner-vs-writer
+/// needs no exclusion — writers only append strictly higher seqs and
+/// never touch the old rows doomed here; the reads that could observe a
+/// half-pruned range (`read_oplog`, resume) tolerate missing rows. A free
+/// function over the shared context so the async drainer pool can run the
+/// sweep without a `Storage` borrow.
+fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
+    let _p = ctx.prune_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let existing = ctx.shards_created.load(Ordering::Relaxed);
+    let session = ctx.conn.open_session()?;
+    let when = now.unwrap_or_else(now_secs);
+    let cutoff = when - ctx.retention_seconds.load(Ordering::Relaxed);
 
-        // Cheap early-out: under the cap, the only reason to prune is retention,
-        // which dooms a seq-ordered prefix — so if the OLDEST live row is still
-        // in-window, nothing is doomed. One bounded merge read of a single row
-        // replaces the whole-oplog walk in the common steady state.
-        if excess == 0 {
-            match read_oplog_shards_tagged(&session, 0, 1)?.first() {
-                None => return Ok(0),
-                Some((_, _, blob)) => {
-                    if matches!(peek_entry_ts(blob), Some(ts) if i64::from(ts.time) >= cutoff) {
-                        return Ok(0);
-                    }
-                    // oldest is out-of-window (or undatable) — fall through to walk.
+    // Phase 1 (lock-free): identify the doomed rows WITHOUT scanning the whole
+    // oplog — that full scan, every OPLOG_PRUNE_INTERVAL emits, was 77% of the
+    // single-writer write-path CPU (profile: scratchpad/profile_insert.sh). The
+    // live-count lets us size the sweep: `excess` is how many oldest rows must
+    // drop to get back under the entry cap; retention dooms a seq-ordered
+    // prefix on top of that. A fresh MVCC session reads consistently without
+    // blocking writers; prune is best-effort, so a slightly stale count/view is
+    // fine — writers only append *higher* seqs, never touch the old rows here.
+    let tables = oplog_all_tables();
+    let live_count = ctx
+        .oplog
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .live_count;
+    let excess = (live_count - ctx.max_entries.load(Ordering::Relaxed) as i64).max(0) as usize;
+
+    // Cheap early-out: under the cap, the only reason to prune is retention,
+    // which dooms a seq-ordered prefix — so if the OLDEST live row is still
+    // in-window, nothing is doomed. One bounded merge read of a single row
+    // replaces the whole-oplog walk in the common steady state.
+    if excess == 0 {
+        match read_oplog_shards_tagged(&session, existing, 0, 1)?.first() {
+            None => return Ok(0),
+            Some((_, _, blob)) => {
+                if matches!(peek_entry_ts(blob), Some(ts) if i64::from(ts.time) >= cutoff) {
+                    return Ok(0);
                 }
+                // oldest is out-of-window (or undatable) — fall through to walk.
             }
         }
-
-        // Bounded KEY-ONLY walk of the oldest rows: a row is doomed if it's
-        // within the cap excess (position alone — no value read) OR past
-        // retention (its `ts` peeked only in the tail beyond the excess). Both
-        // doom a seq-ordered prefix, so the scan stops at the first row that is
-        // neither, bounded by max(excess, RETENTION_SCAN_BATCH); retention rows
-        // beyond that drain on later sweeps. The merge carries each row's
-        // source table so phase 2 deletes from exactly that table. At a
-        // sustained write load past the cap the old full-value merge
-        // (`read_oplog_shards_tagged`) copied ~8 MB of blobs per sweep just to
-        // learn the doomed seqs — ~36% of the whole sync insert path
-        // (Finding 12); keys are all the cap trim needs.
-        let doomed = scan_doomed_oplog_keys(&session, excess, cutoff, RETENTION_SCAN_BATCH)?;
-        if doomed.is_empty() {
-            return Ok(0);
-        }
-        let doomed_seqs: Vec<i64> = doomed.iter().map(|(s, _)| *s).collect();
-
-        // PITR v2: archive the soon-to-be-dropped rows to a durable segment
-        // *before* deleting them, so recovery can still reach a time before the
-        // new oplog floor.
-        if let Some(archive_dir) = self.oplog_archive_dir.clone() {
-            self.archive_doomed_oplog(&session, &archive_dir, &doomed_seqs)?;
-        }
-
-        // Phase 2: the deletes. Sweep exclusivity is already held
-        // (`oplog_prune_lock`, taken at the top); no other lock is needed —
-        // concurrent writers only ever append higher seqs. Each doomed row is
-        // removed from its exact source table (the phase-1 tag). Pre-images stay
-        // in one table.
-        let mut del_curs: Vec<Option<Cursor>> = tables.iter().map(|_| None).collect();
-        let pre_del = session.open_cursor(PREIMAGE_TABLE, None)?;
-        for (seq, tbl) in &doomed {
-            if del_curs[*tbl].is_none() {
-                del_curs[*tbl] = Some(session.open_cursor(&tables[*tbl], None)?);
-            }
-            let op_del = del_curs[*tbl].as_ref().unwrap();
-            op_del.reset()?;
-            op_del.set_key_q(*seq);
-            match op_del.remove() {
-                Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
-            pre_del.reset()?;
-            pre_del.set_key_q(*seq);
-            match pre_del.remove() {
-                Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        // Keep the live-count honest for the next sweep's sizing.
-        self.oplog.lock().unwrap().live_count -= doomed.len() as i64;
-        Ok(doomed.len())
     }
 
+    // Bounded KEY-ONLY walk of the oldest rows: a row is doomed if it's
+    // within the cap excess (position alone — no value read) OR past
+    // retention (its `ts` peeked only in the tail beyond the excess). Both
+    // doom a seq-ordered prefix, so the scan stops at the first row that is
+    // neither, bounded by max(excess, RETENTION_SCAN_BATCH); retention rows
+    // beyond that drain on later sweeps. The merge carries each row's
+    // source table so phase 2 deletes from exactly that table. At a
+    // sustained write load past the cap the old full-value merge
+    // (`read_oplog_shards_tagged`) copied ~8 MB of blobs per sweep just to
+    // learn the doomed seqs — ~36% of the whole sync insert path
+    // (Finding 12); keys are all the cap trim needs.
+    // Phase A': for a data-nonlogged store, entries at/above the stable
+    // checkpoint are the only path back to the acknowledged data after a
+    // hard crash — clamp the sweep below them. The periodic checkpoint
+    // thread advances the clamp on the mongod cadence, releasing backlog.
+    let ceiling = if ctx.data_nonlogged {
+        ctx.stable_seq.load(Ordering::Acquire).max(0) + 1
+    } else {
+        i64::MAX
+    };
+    let doomed = scan_doomed_oplog_keys(
+        &session,
+        existing,
+        excess,
+        cutoff,
+        RETENTION_SCAN_BATCH,
+        ceiling,
+    )?;
+    if ctx.data_nonlogged && excess > 0 && doomed.len() < excess {
+        // The clamp blocked part of a genuine cap excess: demand an anchor
+        // so the stable seq advances and the next sweep can trim. Without
+        // this, a sustained writer outruns the periodic cadence and the
+        // oplog grows without bound.
+        ctx.checkpoint_requested.store(true, Ordering::Release);
+    }
+    if doomed.is_empty() {
+        return Ok(0);
+    }
+    let doomed_seqs: Vec<i64> = doomed.iter().map(|(s, _)| *s).collect();
+
+    // PITR v2: archive the soon-to-be-dropped rows to a durable segment
+    // *before* deleting them, so recovery can still reach a time before the
+    // new oplog floor.
+    let archive_dir = ctx
+        .archive_dir
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(archive_dir) = archive_dir {
+        Storage::archive_doomed_oplog(&session, existing, &archive_dir, &doomed_seqs)?;
+    }
+
+    // Phase 2: the deletes. Sweep exclusivity is already held
+    // (`prune_lock`, taken at the top); no other lock is needed —
+    // concurrent writers only ever append higher seqs. Each doomed row is
+    // removed from its exact source table (the phase-1 tag). Pre-images stay
+    // in one table.
+    let mut del_curs: Vec<Option<Cursor>> = tables.iter().map(|_| None).collect();
+    let pre_del = session.open_cursor(PREIMAGE_TABLE, None)?;
+    for (seq, tbl) in &doomed {
+        if del_curs[*tbl].is_none() {
+            del_curs[*tbl] = Some(session.open_cursor(&tables[*tbl], None)?);
+        }
+        let op_del = del_curs[*tbl].as_ref().unwrap();
+        op_del.reset()?;
+        op_del.set_key_q(*seq);
+        match op_del.remove() {
+            Ok(()) => {}
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e.into()),
+        }
+        pre_del.reset()?;
+        pre_del.set_key_q(*seq);
+        match pre_del.remove() {
+            Ok(()) => {}
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    // Keep the live-count honest for the next sweep's sizing.
+    ctx.oplog
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .live_count -= doomed.len() as i64;
+    Ok(doomed.len())
+}
+
+impl Storage {
     /// Append one `{op: "n", ns: "", o: {msg: "periodic noop"}}` heartbeat and
     /// return its seq — keeps a quiet collection's resume token advancing with
     /// cluster time. Mirrors `storage.emit_noop_heartbeat`.
@@ -4399,10 +5627,22 @@ impl Storage {
         // resolve in microseconds; a long-open user transaction hits the
         // bounded deadline and falls back to the committed-view answer, which
         // is exactly today's best-effort behaviour.
+        //
+        // The visible tail is sampled BEFORE the scan, and the order is load
+        // bearing. Sampling it after left a window in which an in-flight mint
+        // committed between the two reads: the scan still returned the answer
+        // from before the commit (naming the seq *above* the in-flight one)
+        // while the tail read afterwards had already advanced to cover it, so
+        // the stale answer passed the check and the entry was skipped for
+        // good. Sampling first is conservative in the safe direction — the
+        // tail only ever grows, so an earlier reading is no larger than the
+        // true one at scan time, and everything at or below it is resolved
+        // (committed or a permanent hole) and so visible to the scan that
+        // follows. Twin of the Python fix in `Storage.find_seq_for_ts`.
         let deadline = std::time::Instant::now() + Duration::from_millis(500);
         loop {
-            let r = self.find_seq_for_ts_scan(ts)?;
             let vis = self.oplog_visible_tail_seq();
+            let r = self.find_seq_for_ts_scan(ts)?;
             if r - 1 <= vis || std::time::Instant::now() >= deadline {
                 return Ok(r);
             }
@@ -4417,7 +5657,12 @@ impl Storage {
     /// session (see `read_oplog`).
     fn find_seq_for_ts_scan(&self, ts: bson::Timestamp) -> Result<i64> {
         let session = self.conn.open_session()?;
-        for (seq, blob) in read_oplog_shards(&session, 0, usize::MAX)? {
+        for (seq, blob) in read_oplog_shards(
+            &session,
+            self.oplog_shards_created.load(Ordering::Relaxed),
+            0,
+            usize::MAX,
+        )? {
             if let Some(e) = peek_entry_ts(&blob) {
                 if e.time > ts.time || (e.time == ts.time && e.increment >= ts.increment) {
                     return Ok(seq);
@@ -4461,6 +5706,21 @@ impl Storage {
         }
     }
 
+    /// Take an admission ticket for the duration of one engine write.
+    ///
+    /// A no-op when admission control is disabled (the default) or when this
+    /// thread is already admitted, so nested writes inside a multi-document
+    /// transaction ride the outer ticket instead of deadlocking against it.
+    #[inline]
+    fn admit_write(&self) -> crate::admission::Ticket<'_> {
+        self.write_tickets.acquire()
+    }
+
+    /// Writes currently admitted, and the cap. Diagnostics / tests.
+    pub fn write_admission(&self) -> (usize, usize) {
+        (self.write_tickets.in_flight(), self.write_tickets.limit())
+    }
+
     /// Open a dedicated WT session for a new multi-document transaction. The WT
     /// `begin_transaction` is deferred to the first `with_user_transaction`.
     pub fn begin_user_transaction(&self) -> Result<UserTransactionHandle> {
@@ -4470,8 +5730,10 @@ impl Storage {
             session: Some(session),
             began: false,
             minted_ranges: Vec::new(),
+            pending_async: Vec::new(),
             oplog: Arc::clone(&self.oplog),
             oplog_cv: Arc::clone(&self.oplog_cv),
+            dirty_bytes: 0,
         })
     }
 
@@ -4513,9 +5775,61 @@ impl Storage {
             }
         }
         let _harvest = Harvest(&mut handle.minted_ranges);
+        // Async mode: hold `IN_ASYNC_STMT` across the statement so emits
+        // buffer in `PENDING_OPLOG` instead of self-draining mid-transaction
+        // (`with_statement_txn` early-returns for `OpSession::Txn`, so without
+        // this the flag is false and `emit_oplog_entries` would mint + enqueue
+        // BEFORE this transaction commits — a rollback would then leave a
+        // persisted ghost entry). The guard restores the flag and moves the
+        // buffered entries onto the handle on every exit, panic included; the
+        // transaction's resolution point (commit / rollback / Drop) owns them
+        // from there.
+        struct AsyncHarvest<'a> {
+            pending: &'a mut Vec<(OplogEntry, Option<Vec<u8>>)>,
+            prev: bool,
+            active: bool,
+        }
+        impl Drop for AsyncHarvest<'_> {
+            fn drop(&mut self) {
+                if self.active {
+                    IN_ASYNC_STMT.with(|f| f.set(self.prev));
+                    PENDING_OPLOG.with(|p| self.pending.extend(p.borrow_mut().drain(..)));
+                }
+            }
+        }
+        let async_scope = AsyncHarvest {
+            pending: &mut handle.pending_async,
+            prev: IN_ASYNC_STMT.with(|f| f.get()),
+            active: self.async_oplog.is_some(),
+        };
+        if async_scope.active {
+            IN_ASYNC_STMT.with(|f| f.set(true));
+        }
         let _restore = Restore(ACTIVE_TXN_SESSION.with(|c| c.get()));
         ACTIVE_TXN_SESSION.with(|c| c.set(session as *const Session));
-        Ok(f())
+        // Statement dirty accounting: zero the thread-local counter on entry
+        // (a panicked prior scope must not leak bytes into this one) and
+        // harvest it onto the handle on every exit, panic included.
+        struct DirtyHarvest<'a>(&'a mut u64);
+        impl Drop for DirtyHarvest<'_> {
+            fn drop(&mut self) {
+                *self.0 += PENDING_DIRTY_BYTES.with(|c| c.replace(0));
+            }
+        }
+        PENDING_DIRTY_BYTES.with(|c| c.set(0));
+        let dirty_scope = DirtyHarvest(&mut handle.dirty_bytes);
+        let out = f();
+        drop(dirty_scope);
+        // Transaction dirty budget — mongod's `TransactionTooLargeForCache`
+        // guard: a transaction's dirty content is unevictable, so letting it
+        // approach WT's dirty trigger livelocks the engine. Engine-side dirty
+        // is ~2x the emitted-entry bytes (doc rows + oplog rows). Checked
+        // after the statement; its writes roll back with the transaction when
+        // the command layer aborts it (any failed in-txn statement does).
+        if 2 * handle.dirty_bytes > self.txn_dirty_limit {
+            return Err(StorageError::TransactionTooLargeForCache);
+        }
+        Ok(out)
     }
 
     /// Commit the transaction's WT session, then **close** it (releasing the WT
@@ -4528,10 +5842,17 @@ impl Storage {
             handle.began = false;
             if began {
                 if let Err(e) = session.commit_transaction(None) {
+                    // Read WHY first: the reason belongs to the failing
+                    // transaction and the next call on this session clears it.
+                    let why = session.rollback_reason();
                     // The transaction is dead either way — its rows can never
                     // appear, so its minted ranges leave the in-flight window
-                    // (the visible tail must not stay pinned on the corpse).
+                    // (the visible tail must not stay pinned on the corpse)
+                    // and its buffered async entries are discarded (they were
+                    // never minted; enqueueing them would fabricate events
+                    // for data that never committed).
                     handle.deregister_minted();
+                    handle.pending_async.clear();
                     // A concurrent transaction can mark this one rollback-only
                     // after its last statement ran; WiredTiger then fails the
                     // commit call itself with bare EINVAL (its documented
@@ -4547,7 +5868,7 @@ impl Storage {
                     // isn't a conflict is a durability signal.
                     const EINVAL: i32 = 22;
                     if e.is_rollback() || e.code == EINVAL {
-                        return Err(StorageError::WriteConflict);
+                        return Err(classify_rollback(why));
                     }
                     return Err(e.into());
                 }
@@ -4555,6 +5876,13 @@ impl Storage {
                 // became visible at this commit, not at emit — advancing the
                 // visible tail and waking tailable change-stream waiters.
                 handle.deregister_minted();
+                // Async mode: the transaction's buffered entries mint + reach
+                // the drainer only NOW, after the data commit — the user-txn
+                // analogue of `with_statement_txn`'s post-commit drain. An
+                // acked commitTransaction therefore has its entries minted
+                // before the reply, which `oplog_open_seq` relies on.
+                let pending = std::mem::take(&mut handle.pending_async);
+                self.mint_and_enqueue(pending);
             }
             // `session` drops here → the dedicated WT session is closed.
         }
@@ -4571,8 +5899,11 @@ impl Storage {
                 let _ = session.rollback_transaction(None);
             }
             // The rolled-back rows can never appear: release the minted
-            // ranges so the visible tail moves past the permanent holes.
+            // ranges so the visible tail moves past the permanent holes, and
+            // discard any async-buffered entries (never minted, never
+            // enqueued — no ghost events).
             handle.deregister_minted();
+            handle.pending_async.clear();
             // `session` drops here → the dedicated WT session is closed.
         }
         Ok(())
@@ -4612,6 +5943,7 @@ impl Storage {
     }
 
     pub fn insert_one(&self, db: &str, coll: &str, doc_bytes: &[u8]) -> Result<Vec<u8>> {
+        let _admit = self.admit_write();
         self.retry_write_conflicts("insert_one", || {
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -4638,9 +5970,10 @@ impl Storage {
 
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                ensure_collection(&session, db, coll)?;
+                ensure_collection(&session, db, coll, self.data_nonlogged)?;
+                let meta = coll_meta(&session, db, coll)?;
                 // Timeseries: suffix the doc-table key so duplicate `_id`s coexist.
-                if self.is_timeseries(&session, db, coll)? {
+                if meta.timeseries {
                     key.extend_from_slice(&self.timeseries_doc_suffix());
                 }
                 // Reject unique-index violations before writing anything.
@@ -4663,7 +5996,7 @@ impl Storage {
                 self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
                 // Oplog: an insert is op "i". No pre-image (there's no prior document).
                 if self.enable_oplog {
-                    let ui = collection_uuid(&session, db, coll)?;
+                    let ui = meta_uuid(&session, db, coll, &meta)?;
                     let mut o2 = Document::new();
                     o2.insert("_id", id.clone());
                     let mut entry = Document::new();
@@ -4696,12 +6029,79 @@ impl Storage {
         docs: Vec<Vec<u8>>,
         ordered: bool,
     ) -> Result<(usize, Vec<Document>)> {
+        let _admit = self.admit_write();
+        // One wire message never runs as ONE statement transaction: its dirty
+        // content (doc rows + full-doc oplog entries + index entries, ~2-3x
+        // the message bytes) is unevictable until commit, and a 48MB-class
+        // batch can cross WiredTiger's dirty-stall fraction of the cache and
+        // livelock the engine — every thread drafted into eviction that can
+        // evict nothing (the Python server hit exactly this as the
+        // mongo-rust-driver `large_insert` weekly-CI wedge; the 4G embedded
+        // default cache masks it here, a `--cache-size 256M` daemon does
+        // not). Commit in bounded chunks instead, like mongod's internal
+        // insert batches — client batches are per-document atomic only, so
+        // the commit points are invisible on the wire.
+        const INSERT_CHUNK_MAX_DOCS: usize = 1000;
+        const INSERT_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
+        let mut inserted = 0usize;
+        let mut errors: Vec<Document> = Vec::new();
+        // Committed prior chunks' doc keys, so capped eviction never evicts
+        // documents of the batch being inserted. Extended only after a chunk
+        // commits — the conflict-retry re-runs a rolled-back chunk and must
+        // not see its phantom keys.
+        let mut fresh_id_keys: HashSet<Vec<u8>> = HashSet::new();
+        if docs.is_empty() {
+            // An empty batch still lazily creates the collection.
+            let (_, _, _, _) = self.insert_chunk(db, coll, &[], 0, ordered, &fresh_id_keys)?;
+            return Ok((0, errors));
+        }
+        let n = docs.len();
+        let mut start = 0usize;
+        while start < n {
+            let mut end = start + 1;
+            let mut chunk_bytes = docs[start].len();
+            while end < n
+                && end - start < INSERT_CHUNK_MAX_DOCS
+                && chunk_bytes + docs[end].len() <= INSERT_CHUNK_MAX_BYTES
+            {
+                chunk_bytes += docs[end].len();
+                end += 1;
+            }
+            let (chunk_inserted, chunk_errors, chunk_keys, stopped) =
+                self.insert_chunk(db, coll, &docs[start..end], start, ordered, &fresh_id_keys)?;
+            inserted += chunk_inserted;
+            errors.extend(chunk_errors);
+            fresh_id_keys.extend(chunk_keys);
+            if stopped {
+                break;
+            }
+            start = end;
+        }
+        Ok((inserted, errors))
+    }
+
+    /// One bounded statement transaction of [`Self::insert`] (see the chunk
+    /// note there). `base_index` offsets per-doc error indexes back into the
+    /// client's batch; `prior_fresh` carries the committed earlier chunks'
+    /// doc keys for capped-FIFO protection. Returns
+    /// `(inserted, errors, chunk_keys, stopped)` — `stopped` when an ordered
+    /// batch hit an error and the remaining chunks must not run.
+    #[allow(clippy::type_complexity)]
+    fn insert_chunk(
+        &self,
+        db: &str,
+        coll: &str,
+        docs: &[Vec<u8>],
+        base_index: usize,
+        ordered: bool,
+        prior_fresh: &HashSet<Vec<u8>>,
+    ) -> Result<(usize, Vec<Document>, HashSet<Vec<u8>>, bool)> {
         self.retry_write_conflicts("insert", || {
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                ensure_collection(&session, db, coll)?;
+                ensure_collection(&session, db, coll, self.data_nonlogged)?;
                 let descs = self.index_descs(&session, db, coll)?;
                 let ns = format!("{db}.{coll}");
                 let oplog_on = self.enable_oplog;
@@ -4715,9 +6115,11 @@ impl Storage {
                 let mut errors: Vec<Document> = Vec::new();
                 let mut oplog_entries: Vec<OplogEntry> = Vec::new();
                 let mut fresh_id_keys: HashSet<Vec<u8>> = HashSet::new();
+                let mut stopped = false;
                 let doc_cur =
                     session.open_cursor(&doc_table_for(db, coll), Some("overwrite=false"))?;
-                for (index, doc_bytes) in docs.iter().enumerate() {
+                for (offset, doc_bytes) in docs.iter().enumerate() {
+                    let index = base_index + offset;
                     let mut doc = decode_doc(doc_bytes)?;
                     let assigned_id = !doc.contains_key("_id");
                     if assigned_id {
@@ -4740,6 +6142,7 @@ impl Storage {
                         e.insert("keyValue", Bson::Document(c.key_value));
                         errors.push(e);
                         if ordered {
+                            stopped = true;
                             break;
                         }
                         continue;
@@ -4762,6 +6165,7 @@ impl Storage {
                     if blob.len() > MAX_BSON_OBJECT_SIZE {
                         errors.push(too_large_write_error(index, blob.len()));
                         if ordered {
+                            stopped = true;
                             break;
                         }
                         continue;
@@ -4789,6 +6193,7 @@ impl Storage {
                             ed.insert("keyValue", Bson::Document(key_value));
                             errors.push(ed);
                             if ordered {
+                                stopped = true;
                                 break;
                             }
                             continue;
@@ -4823,11 +6228,13 @@ impl Storage {
                 // the per-insert pre-image slots are all None; eviction appends its own.
                 let mut pre_images: Vec<Option<Vec<u8>>> = vec![None; oplog_entries.len()];
                 if inserted > 0 {
+                    let all_fresh: HashSet<Vec<u8>> =
+                        prior_fresh.union(&fresh_id_keys).cloned().collect();
                     self.enforce_capped_bounds(
                         &session,
                         db,
                         coll,
-                        &fresh_id_keys,
+                        &all_fresh,
                         &descs,
                         oplog_on,
                         &ns,
@@ -4839,7 +6246,7 @@ impl Storage {
                 if oplog_on && !oplog_entries.is_empty() {
                     self.emit_oplog_entries(&session, oplog_entries, pre_images)?;
                 }
-                Ok((inserted, errors))
+                Ok((inserted, errors, fresh_id_keys, stopped))
             })
         })
     }
@@ -4948,8 +6355,9 @@ impl Storage {
                 // doesn't expose). The pre-image (old doc) is stored when the collection
                 // has changeStreamPreAndPostImages enabled.
                 if self.enable_oplog {
-                    let ui = collection_uuid(&session, db, coll)?;
-                    let pre = if pre_post_images_enabled(&session, db, coll)? {
+                    let meta = coll_meta(&session, db, coll)?;
+                    let ui = meta_uuid(&session, db, coll, &meta)?;
+                    let pre = if meta.pre_post_images {
                         Some(encode_doc(&old_doc)?)
                     } else {
                         None
@@ -4972,6 +6380,7 @@ impl Storage {
 
     /// Delete the document with `_id == id`. Returns `false` if absent.
     pub fn delete_by_id(&self, db: &str, coll: &str, id: &Bson) -> Result<bool> {
+        let _admit = self.admit_write();
         self.retry_write_conflicts("delete_by_id", || {
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -5004,8 +6413,9 @@ impl Storage {
                 // Oplog: a delete is op "d" with `o` = `o2` = {_id}. The pre-image (the
                 // deleted doc) is stored when changeStreamPreAndPostImages is enabled.
                 if self.enable_oplog {
-                    let ui = collection_uuid(&session, db, coll)?;
-                    let pre = if pre_post_images_enabled(&session, db, coll)? {
+                    let meta = coll_meta(&session, db, coll)?;
+                    let ui = meta_uuid(&session, db, coll, &meta)?;
+                    let pre = if meta.pre_post_images {
                         Some(encode_doc(&old_doc)?)
                     } else {
                         None
@@ -5208,42 +6618,51 @@ impl Storage {
         // then the collection lock — see `lock`'s ordering rules).
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let session = self.op_session()?;
-        if collection_registered(&session, db, coll)? {
-            return Ok(false);
-        }
-        ensure_collection(&session, db, coll)?;
-        if !options.is_empty() {
-            // Persist before minting the UUID below — collection_uuid re-reads and
-            // merges, so the options survive.
-            let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
-            for (k, v) in options {
-                current.insert(k.clone(), v.clone());
-            }
-            write_coll_options(&session, db, coll, &current)?;
-        }
-        if self.enable_oplog {
-            let ui = collection_uuid(&session, db, coll)?;
-            let mut id_key_spec = Document::new();
-            id_key_spec.insert("_id", 1i32);
-            let mut id_index = Document::new();
-            id_index.insert("v", 2i32);
-            id_index.insert("key", Bson::Document(id_key_spec));
-            id_index.insert("name", ID_INDEX_NAME);
-            let mut o = Document::new();
-            o.insert("create", coll);
-            for (k, v) in options {
-                o.insert(k.clone(), v.clone());
-            }
-            o.insert("idIndex", Bson::Document(id_index));
-            let mut entry = Document::new();
-            entry.insert("op", "c");
-            entry.insert("ns", format!("{db}.$cmd"));
-            entry.insert("ui", uuid_binary(&ui));
-            entry.insert("o", Bson::Document(o));
-            self.emit_oplog(&session, vec![entry], vec![None])?;
-        }
-        Ok(true)
+        // One statement transaction around the row writes (registry + options +
+        // oplog), so a crash mid-create can't leave a half-registered
+        // collection. The lazy WT `create` inside `ensure_collection` is a
+        // schema op — WiredTiger runs it on an internal session outside this
+        // transaction (an empty orphan table is harmless and idempotent).
+        self.retry_write_conflicts("create_collection", || {
+            let session = self.op_session()?;
+            self.with_statement_txn(&session, || {
+                if collection_registered(&session, db, coll)? {
+                    return Ok(false);
+                }
+                ensure_collection(&session, db, coll, self.data_nonlogged)?;
+                if !options.is_empty() {
+                    // Persist before minting the UUID below — collection_uuid re-reads and
+                    // merges, so the options survive.
+                    let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
+                    for (k, v) in options {
+                        current.insert(k.clone(), v.clone());
+                    }
+                    write_coll_options(&session, db, coll, &current)?;
+                }
+                if self.enable_oplog {
+                    let ui = collection_uuid(&session, db, coll)?;
+                    let mut id_key_spec = Document::new();
+                    id_key_spec.insert("_id", 1i32);
+                    let mut id_index = Document::new();
+                    id_index.insert("v", 2i32);
+                    id_index.insert("key", Bson::Document(id_key_spec));
+                    id_index.insert("name", ID_INDEX_NAME);
+                    let mut o = Document::new();
+                    o.insert("create", coll);
+                    for (k, v) in options {
+                        o.insert(k.clone(), v.clone());
+                    }
+                    o.insert("idIndex", Bson::Document(id_index));
+                    let mut entry = Document::new();
+                    entry.insert("op", "c");
+                    entry.insert("ns", format!("{db}.$cmd"));
+                    entry.insert("ui", uuid_binary(&ui));
+                    entry.insert("o", Bson::Document(o));
+                    self.emit_oplog(&session, vec![entry], vec![None])?;
+                }
+                Ok(true)
+            })
+        })
     }
 
     /// Drop a collection: delete its documents, indexes, and index entries, then
@@ -5255,32 +6674,204 @@ impl Storage {
         // then the collection lock — see `lock`'s ordering rules).
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
-        let existed = coll_options(&session, db, coll)?.is_some();
-        let ui = if existed && self.enable_oplog {
-            Some(collection_uuid(&session, db, coll)?)
-        } else {
-            None
+        let _gen = self.ddl_generation_scope();
+        if self.in_user_txn() {
+            // Inside a user transaction the drop must join it atomically; the
+            // transaction's own dirty-budget guard (TransactionTooLargeForCache)
+            // bounds the size, so the single-transaction purge is safe here.
+            return self.retry_write_conflicts("drop_collection", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    let existed = coll_options(&session, db, coll)?.is_some();
+                    let ui = if existed && self.enable_oplog {
+                        Some(collection_uuid(&session, db, coll)?)
+                    } else {
+                        None
+                    };
+                    self.purge_collection_tables(&session, db, coll)?;
+                    let c = session.open_cursor(COLL_TABLE, None)?;
+                    c.set_key_ss(db, coll);
+                    match c.search() {
+                        Ok(()) => c.remove()?,
+                        Err(e) if e.is_not_found() => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                    if let Some(ui) = ui {
+                        self.emit_drop_oplog(&session, db, coll, &ui)?;
+                    }
+                    Ok(existed)
+                })
+            });
+        }
+        // Chunked two-phase drop. A whole-collection purge in ONE statement
+        // transaction is unbounded dirty content — the WT livelock class the
+        // chunked insert / updateMany / deleteMany work closed. A drop of a
+        // collection larger than the cache's dirty budget got a cache-pressure
+        // WT_ROLLBACK, which the WriteConflict retry loop re-ran forever while
+        // the eviction threads spun (the 2026-08-11 wedge; `tests/drop_chunk.rs`
+        // reproduces it deterministically at a small cache).
+        //
+        // Phase 1 (small transaction): unregister the collection, write a drop
+        // tombstone, emit the drop oplog entry. After this commit the namespace
+        // no longer exists for every reader/writer (all routing goes through
+        // the registry), so the batched purge is unobservable.
+        // Phase 2 (bounded transactions): delete the rows table-by-table in
+        // PURGE_CHUNK_MAX_ROWS batches, then clear the tombstone. A crash
+        // mid-purge leaves rows behind an unregistered name plus the
+        // tombstone; `recover_pending_drops` finishes the purge at next open,
+        // before any traffic can re-create the name.
+        let existed = self.retry_write_conflicts("drop_collection", || {
+            let session = self.op_session()?;
+            self.with_statement_txn(&session, || {
+                let existed = coll_options(&session, db, coll)?.is_some();
+                if !existed {
+                    return Ok(false);
+                }
+                let ui = if self.enable_oplog {
+                    Some(collection_uuid(&session, db, coll)?)
+                } else {
+                    None
+                };
+                let c = session.open_cursor(COLL_TABLE, None)?;
+                c.set_key_ss(db, coll);
+                match c.search() {
+                    Ok(()) => c.remove()?,
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+                let t = session.open_cursor(TOMB_TABLE, None)?;
+                t.set_key_ss(db, coll);
+                t.set_value_u(b"");
+                t.insert()?;
+                if let Some(ui) = ui {
+                    self.emit_drop_oplog(&session, db, coll, &ui)?;
+                }
+                Ok(true)
+            })
+        })?;
+        if !existed {
+            return Ok(false);
+        }
+        self.purge_dropped_collection(db, coll)?;
+        Ok(true)
+    }
+
+    /// The `op: "c"` `drop` oplog entry for `(db, coll)`.
+    fn emit_drop_oplog(&self, session: &Session, db: &str, coll: &str, ui: &[u8]) -> Result<()> {
+        let mut o = Document::new();
+        o.insert("drop", coll);
+        let mut entry = Document::new();
+        entry.insert("op", "c");
+        entry.insert("ns", format!("{db}.$cmd"));
+        entry.insert("ui", uuid_binary(ui));
+        entry.insert("o", Bson::Document(o));
+        self.emit_oplog(session, vec![entry], vec![None])?;
+        Ok(())
+    }
+
+    /// Phase 2 of a chunked drop: delete the unregistered collection's rows in
+    /// bounded batches (each its own statement transaction), then clear the
+    /// tombstone. Caller holds whatever exclusion it needs (the drop path holds
+    /// the global + namespace locks; open-time recovery runs single-threaded).
+    fn purge_dropped_collection(&self, db: &str, coll: &str) -> Result<()> {
+        loop {
+            let n = self.retry_write_conflicts("drop_collection purge(uniq)", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.purge_uniq_batch(&session, db, coll, PURGE_CHUNK_MAX_ROWS)
+                })
+            })?;
+            if n < PURGE_CHUNK_MAX_ROWS {
+                break;
+            }
+        }
+        loop {
+            let n = self.retry_write_conflicts("drop_collection purge(docs)", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.purge_docs_batch(&session, db, coll, PURGE_CHUNK_MAX_ROWS)
+                })
+            })?;
+            if n < PURGE_CHUNK_MAX_ROWS {
+                break;
+            }
+        }
+        loop {
+            let n = self.retry_write_conflicts("drop_collection purge(idx)", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.purge_idx_entries_batch(&session, db, coll, PURGE_CHUNK_MAX_ROWS)
+                })
+            })?;
+            if n < PURGE_CHUNK_MAX_ROWS {
+                break;
+            }
+        }
+        loop {
+            let n = self.retry_write_conflicts("drop_collection purge(nat)", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.purge_nat_batch(&session, db, coll, PURGE_CHUNK_MAX_ROWS)
+                })
+            })?;
+            if n < PURGE_CHUNK_MAX_ROWS {
+                break;
+            }
+        }
+        // Final small transaction: the index catalog rows (a handful) and the
+        // tombstone itself.
+        self.retry_write_conflicts("drop_collection purge(final)", || {
+            let session = self.op_session()?;
+            self.with_statement_txn(&session, || {
+                for (name, _key_spec, _opts) in self.iter_indexes(&session, db, coll)? {
+                    let ic = session.open_cursor(IDX_TABLE, None)?;
+                    ic.set_key_sss(db, coll, &name);
+                    match ic.remove() {
+                        Ok(()) => {}
+                        Err(e) if e.is_not_found() => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                let t = session.open_cursor(TOMB_TABLE, None)?;
+                t.set_key_ss(db, coll);
+                match t.search() {
+                    Ok(()) => t.remove()?,
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+                Ok(())
+            })
+        })
+    }
+
+    /// Finish any drop whose batched purge a crash interrupted: the registry
+    /// row is already gone (phase 1 committed), so the leftover rows belong to
+    /// an unregistered name and must be purged before traffic can re-create
+    /// it. Runs at open, single-threaded.
+    fn recover_pending_drops(&self) -> Result<()> {
+        let pending: Vec<(String, String)> = {
+            let session = self.conn.open_session()?;
+            let cur = match session.open_cursor(TOMB_TABLE, None) {
+                Ok(c) => c,
+                Err(e) if e.is_missing_table() => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            let mut out = Vec::new();
+            let mut more = cur.next()?;
+            while more {
+                let (d, c) = cur.get_key_ss()?;
+                out.push((d, c));
+                more = cur.next()?;
+            }
+            out
         };
-        self.purge_collection_tables(&session, db, coll)?;
-        let c = session.open_cursor(COLL_TABLE, None)?;
-        c.set_key_ss(db, coll);
-        match c.search() {
-            Ok(()) => c.remove()?,
-            Err(e) if e.is_not_found() => {}
-            Err(e) => return Err(e.into()),
+        for (db, coll) in pending {
+            eprintln!(
+                "secantus-storage: finishing interrupted drop of {db}.{coll} (crash-left tombstone)"
+            );
+            self.purge_dropped_collection(&db, &coll)?;
         }
-        if let Some(ui) = ui {
-            let mut o = Document::new();
-            o.insert("drop", coll);
-            let mut entry = Document::new();
-            entry.insert("op", "c");
-            entry.insert("ns", format!("{db}.$cmd"));
-            entry.insert("ui", uuid_binary(&ui));
-            entry.insert("o", Bson::Document(o));
-            self.emit_oplog(&session, vec![entry], vec![None])?;
-        }
-        Ok(existed)
+        Ok(())
     }
 
     /// Drop an entire database: delete every collection's data + registry rows.
@@ -5288,8 +6879,10 @@ impl Storage {
     /// command oplog entry (no `ui`). Mirrors `storage.drop_database`.
     pub fn drop_database(&self, db: &str) -> Result<()> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
-        let colls = self.colls_of(&session, db)?;
+        let colls = {
+            let session = self.conn.open_session()?;
+            self.colls_of(&session, db)?
+        };
         // Every existing collection's write lock (sorted registry order), so
         // in-flight CRUD on the db drains before the purge. A collection
         // created concurrently by a racing insert's lazy ensure_collection
@@ -5301,46 +6894,87 @@ impl Storage {
             .iter()
             .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()))
             .collect();
-        let mut ui_pairs: Vec<(String, Vec<u8>)> = Vec::new();
-        if self.enable_oplog {
-            for c in &colls {
-                ui_pairs.push((c.clone(), collection_uuid(&session, db, c)?));
-            }
-        }
+        let _gen = self.ddl_generation_scope();
+        // Per-collection statement transactions (not one db-wide transaction —
+        // a whole-db purge in a single WT transaction could exceed the cache's
+        // dirty limit on a large database, and mongod's dropDatabase is
+        // likewise per-collection): each collection's purge, registry removal
+        // and drop oplog entry commit or vanish together, so a crash
+        // mid-dropDatabase leaves whole collections, never orphan rows.
+        let in_user_txn = self.in_user_txn();
         for c in &colls {
-            self.purge_collection_tables(&session, db, c)?;
-        }
-        let rc = session.open_cursor(COLL_TABLE, None)?;
-        for c in &colls {
-            rc.reset()?;
-            rc.set_key_ss(db, c);
-            match rc.search() {
-                Ok(()) => rc.remove()?,
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
+            if in_user_txn {
+                // Joins the user transaction atomically; its dirty-budget
+                // guard bounds the size (same reasoning as drop_collection).
+                self.retry_write_conflicts("drop_database", || {
+                    let session = self.op_session()?;
+                    self.with_statement_txn(&session, || {
+                        let ui = if self.enable_oplog {
+                            Some(collection_uuid(&session, db, c)?)
+                        } else {
+                            None
+                        };
+                        self.purge_collection_tables(&session, db, c)?;
+                        let rc = session.open_cursor(COLL_TABLE, None)?;
+                        rc.set_key_ss(db, c);
+                        match rc.search() {
+                            Ok(()) => rc.remove()?,
+                            Err(e) if e.is_not_found() => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                        if let Some(ui) = &ui {
+                            self.emit_drop_oplog(&session, db, c, ui)?;
+                        }
+                        Ok(())
+                    })
+                })?;
+                continue;
             }
+            // Chunked two-phase drop, same as drop_collection: unregister +
+            // tombstone + drop entry in a small transaction, then the batched
+            // row purge (one unbounded purge transaction per collection was
+            // the same WT-livelock class — see the drop_collection comment).
+            self.retry_write_conflicts("drop_database", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    let ui = if self.enable_oplog {
+                        Some(collection_uuid(&session, db, c)?)
+                    } else {
+                        None
+                    };
+                    let rc = session.open_cursor(COLL_TABLE, None)?;
+                    rc.set_key_ss(db, c);
+                    match rc.search() {
+                        Ok(()) => rc.remove()?,
+                        Err(e) if e.is_not_found() => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                    let t = session.open_cursor(TOMB_TABLE, None)?;
+                    t.set_key_ss(db, c);
+                    t.set_value_u(b"");
+                    t.insert()?;
+                    if let Some(ui) = &ui {
+                        self.emit_drop_oplog(&session, db, c, ui)?;
+                    }
+                    Ok(())
+                })
+            })?;
+            self.purge_dropped_collection(db, c)?;
         }
         if self.enable_oplog {
-            let mut entries: Vec<Document> = Vec::new();
-            for (c, ui) in &ui_pairs {
-                let mut o = Document::new();
-                o.insert("drop", c.clone());
-                let mut entry = Document::new();
-                entry.insert("op", "c");
-                entry.insert("ns", format!("{db}.$cmd"));
-                entry.insert("ui", uuid_binary(ui));
-                entry.insert("o", Bson::Document(o));
-                entries.push(entry);
-            }
-            let mut dd_o = Document::new();
-            dd_o.insert("dropDatabase", 1i32);
-            let mut dd = Document::new();
-            dd.insert("op", "c");
-            dd.insert("ns", format!("{db}.$cmd"));
-            dd.insert("o", Bson::Document(dd_o));
-            entries.push(dd);
-            let n = entries.len();
-            self.emit_oplog(&session, entries, vec![None; n])?;
+            self.retry_write_conflicts("drop_database", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    let mut dd_o = Document::new();
+                    dd_o.insert("dropDatabase", 1i32);
+                    let mut dd = Document::new();
+                    dd.insert("op", "c");
+                    dd.insert("ns", format!("{db}.$cmd"));
+                    dd.insert("o", Bson::Document(dd_o));
+                    self.emit_oplog(&session, vec![dd], vec![None])?;
+                    Ok(())
+                })
+            })?;
         }
         Ok(())
     }
@@ -5372,8 +7006,250 @@ impl Storage {
             .iter()
             .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()))
             .collect();
-        let session = self.conn.open_session()?;
-        if coll_options(&session, src_db, src_coll)?.is_none() {
+        let _gen = self.ddl_generation_scope();
+        if self.in_user_txn() {
+            // Joins the user transaction atomically; its dirty-budget guard
+            // (TransactionTooLargeForCache) bounds the size — same reasoning
+            // as drop_collection's user-txn path.
+            return self.retry_write_conflicts("rename_collection", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.rename_collection_in_txn(
+                        &session,
+                        src_db,
+                        src_coll,
+                        dst_db,
+                        dst_coll,
+                        drop_target,
+                    )
+                })
+            });
+        }
+        // Chunked two-phase rename. The single-transaction move re-keyed every
+        // row at once — unbounded dirty content, the same WT-livelock class as
+        // the (fixed) one-transaction drop purge. The phases reuse the drop
+        // tombstones so BOTH crash windows recover through the existing
+        // `recover_pending_drops`, on both servers:
+        //
+        //   0. validation (+ chunked drop of the target under drop_target);
+        //   A. small txn: tombstone DST — a crash mid-copy leaves partial rows
+        //      behind an unregistered name with a plain drop tombstone, which
+        //      open-time recovery purges (the rename simply never happened);
+        //   B. batched txns: copy src rows to dst (fresh RecordIds, index
+        //      catalog + rebuilt entries + unique claims per batch);
+        //   C. small txn — THE SWITCH: register dst, unregister src, move the
+        //      tombstone dst -> src, emit the rename oplog entry. After this
+        //      commit the rename has happened; a crash leaves src's rows
+        //      behind an unregistered name with a plain tombstone (recovered
+        //      as a drop);
+        //   D. batched purge of src rows + tombstone clear
+        //      (`purge_dropped_collection`).
+        //
+        // The namespace locks are held throughout, so no reader or writer can
+        // observe the intermediate states on a live server.
+        {
+            let session = self.op_session()?;
+            if coll_options(&session, src_db, src_coll)?.is_none() {
+                return Ok((
+                    false,
+                    Some(format!(
+                        "source namespace does not exist: {src_db}.{src_coll}"
+                    )),
+                ));
+            }
+            if (src_db, src_coll) == (dst_db, dst_coll) {
+                return Ok((true, None));
+            }
+            if coll_options(&session, dst_db, dst_coll)?.is_some() && !drop_target {
+                return Ok((
+                    false,
+                    Some(format!("target namespace exists: {dst_db}.{dst_coll}")),
+                ));
+            }
+        }
+        let src_ui = if self.enable_oplog {
+            let session = self.op_session()?;
+            Some(collection_uuid(&session, src_db, src_coll)?)
+        } else {
+            None
+        };
+        // Phase 0: drop an existing target the chunked way (unregister +
+        // tombstone + drop oplog entry, then batched purge) — mongod's oplog
+        // order is drop-target then rename.
+        let mut dst_ui: Option<Vec<u8>> = None;
+        let dst_existed = {
+            let session = self.op_session()?;
+            coll_options(&session, dst_db, dst_coll)?.is_some()
+        };
+        if dst_existed {
+            dst_ui = if self.enable_oplog {
+                let session = self.op_session()?;
+                Some(collection_uuid(&session, dst_db, dst_coll)?)
+            } else {
+                None
+            };
+            self.retry_write_conflicts("rename_collection drop-target", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    let c = session.open_cursor(COLL_TABLE, None)?;
+                    c.set_key_ss(dst_db, dst_coll);
+                    match c.search() {
+                        Ok(()) => c.remove()?,
+                        Err(e) if e.is_not_found() => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                    let t = session.open_cursor(TOMB_TABLE, None)?;
+                    t.set_key_ss(dst_db, dst_coll);
+                    t.set_value_u(b"");
+                    t.insert()?;
+                    if let Some(du) = &dst_ui {
+                        self.emit_drop_oplog(&session, dst_db, dst_coll, du)?;
+                    }
+                    Ok(())
+                })
+            })?;
+            self.purge_dropped_collection(dst_db, dst_coll)?;
+        }
+        // Phase A: tombstone the destination before any row lands there.
+        self.retry_write_conflicts("rename_collection tombstone", || {
+            let session = self.op_session()?;
+            self.with_statement_txn(&session, || {
+                let t = session.open_cursor(TOMB_TABLE, None)?;
+                t.set_key_ss(dst_db, dst_coll);
+                t.set_value_u(b"");
+                t.insert()?;
+                // The index catalog rows ride in this small transaction so
+                // every copy batch sees the destination's indexes.
+                let idx_rows = self.collect_idx_rows(&session, src_db, src_coll)?;
+                let icur = session.open_cursor(IDX_TABLE, None)?;
+                for (name, payload) in &idx_rows {
+                    icur.reset()?;
+                    icur.set_key_sss(dst_db, dst_coll, name);
+                    icur.set_value_u(payload);
+                    icur.insert()?;
+                }
+                Ok(())
+            })
+        })?;
+        // Lazy shards: the destination's doc shard may not exist yet (schema
+        // op, runs on WiredTiger's internal session — idempotent).
+        {
+            let session = self.op_session()?;
+            session.create(
+                &doc_table_for(dst_db, dst_coll),
+                &data_table_cfg(DOC_TABLE_CFG, self.data_nonlogged),
+            )?;
+        }
+        // Phase B: copy in bounded batches, resuming by source RecordId.
+        // Fresh RecordIds preserve insertion order (the source walk is
+        // RecordId order and minting is monotonic); index entries + unique
+        // claims are rebuilt per doc.
+        let mut after: Option<i64> = None;
+        loop {
+            let copied = self.retry_write_conflicts("rename_collection copy", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    let batch = self.scan_docs_batch(
+                        &session,
+                        src_db,
+                        src_coll,
+                        after,
+                        PURGE_CHUNK_MAX_ROWS,
+                    )?;
+                    let dst_descs = self.index_descs(&session, dst_db, dst_coll)?;
+                    let dcur = session.open_cursor(&doc_table_for(dst_db, dst_coll), None)?;
+                    let mut last = after;
+                    for (src_rid, id_k, blob) in &batch {
+                        let recordid = self.write_nat_entry(&session, dst_db, dst_coll, id_k)?;
+                        dcur.reset()?;
+                        dcur.set_key_ssq(dst_db, dst_coll, recordid);
+                        dcur.set_value_u(&frame_doc_value(id_k, blob));
+                        dcur.insert()?;
+                        let doc = decode_doc(blob)?;
+                        self.write_index_entries(
+                            &session, dst_db, dst_coll, &doc, &dst_descs, recordid,
+                        )?;
+                        last = Some(*src_rid);
+                    }
+                    Ok((batch.len(), last))
+                })
+            });
+            let (n, last) = match copied {
+                Ok(v) => v,
+                Err(e) => {
+                    // A failed copy leaves partial rows behind the tombstoned,
+                    // unregistered destination. Purge them before surfacing
+                    // the error — the locks are still held, so nothing can
+                    // have observed the partial copy, and leaving it would
+                    // resurface the rows under a later CREATE of that name.
+                    let _ = self.purge_dropped_collection(dst_db, dst_coll);
+                    return Err(e);
+                }
+            };
+            after = last;
+            if n < PURGE_CHUNK_MAX_ROWS {
+                break;
+            }
+        }
+        // Phase C — the switch.
+        self.retry_write_conflicts("rename_collection switch", || {
+            let session = self.op_session()?;
+            self.with_statement_txn(&session, || {
+                ensure_collection(&session, dst_db, dst_coll, self.data_nonlogged)?;
+                let rc = session.open_cursor(COLL_TABLE, None)?;
+                rc.set_key_ss(src_db, src_coll);
+                match rc.search() {
+                    Ok(()) => rc.remove()?,
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+                let t = session.open_cursor(TOMB_TABLE, None)?;
+                t.set_key_ss(dst_db, dst_coll);
+                match t.search() {
+                    Ok(()) => t.remove()?,
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+                let ts = session.open_cursor(TOMB_TABLE, None)?;
+                ts.set_key_ss(src_db, src_coll);
+                ts.set_value_u(b"");
+                ts.insert()?;
+                if self.enable_oplog {
+                    let mut o = Document::new();
+                    o.insert("renameCollection", format!("{src_db}.{src_coll}"));
+                    o.insert("to", format!("{dst_db}.{dst_coll}"));
+                    if let Some(du) = &dst_ui {
+                        o.insert("dropTarget", uuid_binary(du));
+                    }
+                    let mut e = Document::new();
+                    e.insert("op", "c");
+                    e.insert("ns", format!("{src_db}.$cmd"));
+                    if let Some(u) = &src_ui {
+                        e.insert("ui", uuid_binary(u));
+                    }
+                    e.insert("o", Bson::Document(o));
+                    self.emit_oplog(&session, vec![e], vec![None])?;
+                }
+                Ok(())
+            })
+        })?;
+        // Phase D: purge the source's rows and clear its tombstone.
+        self.purge_dropped_collection(src_db, src_coll)?;
+        Ok((true, None))
+    }
+
+    /// The body of [`rename_collection`], run inside its statement transaction.
+    #[allow(clippy::too_many_arguments)]
+    fn rename_collection_in_txn(
+        &self,
+        session: &Session,
+        src_db: &str,
+        src_coll: &str,
+        dst_db: &str,
+        dst_coll: &str,
+        drop_target: bool,
+    ) -> Result<(bool, Option<String>)> {
+        if coll_options(session, src_db, src_coll)?.is_none() {
             return Ok((
                 false,
                 Some(format!(
@@ -5384,7 +7260,7 @@ impl Storage {
         if (src_db, src_coll) == (dst_db, dst_coll) {
             return Ok((true, None));
         }
-        let dst_existed = coll_options(&session, dst_db, dst_coll)?.is_some();
+        let dst_existed = coll_options(session, dst_db, dst_coll)?.is_some();
         if dst_existed && !drop_target {
             return Ok((
                 false,
@@ -5392,17 +7268,17 @@ impl Storage {
             ));
         }
         let ui = if self.enable_oplog {
-            Some(collection_uuid(&session, src_db, src_coll)?)
+            Some(collection_uuid(session, src_db, src_coll)?)
         } else {
             None
         };
         let dst_ui = if dst_existed && self.enable_oplog {
-            Some(collection_uuid(&session, dst_db, dst_coll)?)
+            Some(collection_uuid(session, dst_db, dst_coll)?)
         } else {
             None
         };
         if dst_existed {
-            self.purge_collection_tables(&session, dst_db, dst_coll)?;
+            self.purge_collection_tables(session, dst_db, dst_coll)?;
             let c = session.open_cursor(COLL_TABLE, None)?;
             c.set_key_ss(dst_db, dst_coll);
             match c.search() {
@@ -5412,9 +7288,9 @@ impl Storage {
             }
         }
         // Collect every src row, drop the src tables, then re-key into dst.
-        let docs = self.scan_docs(&session, src_db, src_coll)?;
-        let idx_rows = self.collect_idx_rows(&session, src_db, src_coll)?;
-        self.purge_collection_tables(&session, src_db, src_coll)?;
+        let docs = self.scan_docs(session, src_db, src_coll)?;
+        let idx_rows = self.collect_idx_rows(session, src_db, src_coll)?;
+        self.purge_collection_tables(session, src_db, src_coll)?;
         // Sharded: dst rows go to the dst collection's shard (may differ from the
         // src shard — the src rows were already read into `docs` and purged above).
         // Re-mint a fresh RecordId per doc in src natural order (preserving
@@ -5423,14 +7299,14 @@ impl Storage {
         // Lazy shards: the rename target's shard may not exist yet — make it.
         session.create(
             &doc_table_for(dst_db, dst_coll),
-            &data_table_cfg(DOC_TABLE_CFG),
+            &data_table_cfg(DOC_TABLE_CFG, self.data_nonlogged),
         )?;
         let dcur = session.open_cursor(&doc_table_for(dst_db, dst_coll), None)?;
         // Remember each doc against the RecordId it was RE-MINTED under in the
         // destination — the source RecordIds do not carry over.
         let mut moved: Vec<(i64, Document)> = Vec::with_capacity(docs.len());
         for (_src_rid, id_k, blob) in &docs {
-            let recordid = self.write_nat_entry(&session, dst_db, dst_coll, id_k)?;
+            let recordid = self.write_nat_entry(session, dst_db, dst_coll, id_k)?;
             dcur.reset()?;
             dcur.set_key_ssq(dst_db, dst_coll, recordid);
             dcur.set_value_u(&frame_doc_value(id_k, blob));
@@ -5451,11 +7327,11 @@ impl Storage {
         // entries carried the `id_key`, which survives a rename, so the copy was
         // safe then.) The index catalog rows are written above, so `index_descs`
         // sees the destination's indexes here.
-        let dst_descs = self.index_descs(&session, dst_db, dst_coll)?;
+        let dst_descs = self.index_descs(session, dst_db, dst_coll)?;
         for (recordid, doc) in &moved {
-            self.write_index_entries(&session, dst_db, dst_coll, doc, &dst_descs, *recordid)?;
+            self.write_index_entries(session, dst_db, dst_coll, doc, &dst_descs, *recordid)?;
         }
-        ensure_collection(&session, dst_db, dst_coll)?;
+        ensure_collection(session, dst_db, dst_coll, self.data_nonlogged)?;
         let rc = session.open_cursor(COLL_TABLE, None)?;
         rc.set_key_ss(src_db, src_coll);
         match rc.search() {
@@ -5493,7 +7369,7 @@ impl Storage {
             e.insert("o", Bson::Document(o));
             entries.push(e);
             let n = entries.len();
-            self.emit_oplog(&session, entries, vec![None; n])?;
+            self.emit_oplog(session, entries, vec![None; n])?;
         }
         Ok((true, None))
     }
@@ -5506,8 +7382,9 @@ impl Storage {
         if self.enable_oplog && db == "local" && coll == "oplog.rs" {
             let mut o = Document::new();
             o.insert("capped", true);
-            o.insert("size", (self.oplog_max_entries as i64) * 16 * 1024);
-            o.insert("max", self.oplog_max_entries as i64);
+            let max_entries = self.prune_ctx.max_entries.load(Ordering::Relaxed) as i64;
+            o.insert("size", max_entries * 16 * 1024);
+            o.insert("max", max_entries);
             return Ok(o);
         }
         // Lock-free read (see the `lock` field's invariants).
@@ -5936,8 +7813,32 @@ impl Storage {
         // multi-document transaction runs on the transaction's WT session — a
         // fresh session would deadlock against the same transaction's
         // uncommitted writes (e.g. a collection created earlier in the txn).
-        let session = self.op_session()?;
-        ensure_collection(&session, db, coll)?;
+        // One statement transaction around the backfill + registry insert +
+        // oplog entry, so a crash mid-build can't leave orphan entry rows
+        // behind a missing registry row (the entries-before-registry write
+        // order below still guards the lock-free-reader interleaving; the
+        // transaction adds crash atomicity).
+        self.retry_write_conflicts("create_index", || {
+            let session = self.op_session()?;
+            self.with_statement_txn(&session, || {
+                self.create_index_in_txn(&session, db, coll, name, key_spec, options)
+            })
+        })
+    }
+
+    /// The body of [`create_index`], run inside its statement transaction.
+    fn create_index_in_txn(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        key_spec: &Document,
+        options: &Document,
+    ) -> Result<bool> {
+        let geo = parse_geo_2d(key_spec, options);
+        let geo_sphere = parse_geo_sphere(key_spec);
+        ensure_collection(session, db, coll, self.data_nonlogged)?;
 
         let c = session.open_cursor(IDX_TABLE, None)?;
         c.set_key_sss(db, coll, name);
@@ -5988,7 +7889,7 @@ impl Storage {
             // multikey so the regular (numeric) pickers skip it.
             stored_options.insert("multikey", Bson::Boolean(true));
             let mut out: Vec<(Vec<u8>, i64)> = Vec::new();
-            for (rid, _id_k, blob) in self.scan_docs(&session, db, coll)? {
+            for (rid, _id_k, blob) in self.scan_docs(session, db, coll)? {
                 let d = decode_doc(&blob)?;
                 if let Some(kb) = get_path(&d, &geo.field).and_then(|v| geo.cell_kb(v)) {
                     out.push((kb, rid));
@@ -5999,8 +7900,16 @@ impl Storage {
             // 2dsphere S2 index: covering cells + ancestors per geometry-valued
             // doc. Flagged multikey (one doc → many cell entries).
             stored_options.insert("multikey", Bson::Boolean(true));
+            // mongod stamps every 2dsphere index with its format version (3
+            // since 3.2) and drivers surface it through listIndexes — the PHP
+            // library's `IndexInfo::is2dSphere` / `['2dsphereIndexVersion']`
+            // assertion reads it and got null. `2d` indexes carry no such
+            // field. Mirrors `storage.create_index`.
+            stored_options
+                .entry("2dsphereIndexVersion".to_string())
+                .or_insert(Bson::Int32(3));
             let mut out: Vec<(Vec<u8>, i64)> = Vec::new();
-            for (rid, _id_k, blob) in self.scan_docs(&session, db, coll)? {
+            for (rid, _id_k, blob) in self.scan_docs(session, db, coll)? {
                 let d = decode_doc(&blob)?;
                 if let Some(v) = get_path(&d, &gs.field) {
                     for kb in gs.cell_kbs(v) {
@@ -6025,7 +7934,7 @@ impl Storage {
             // already hands us — no `id_key -> RecordId` lookup needed here.
             let mut entries: Vec<(Vec<u8>, i64)> = Vec::new();
             let mut seen: HashSet<Vec<u8>> = HashSet::new();
-            for (rid, _id_k, blob) in self.scan_docs(&session, db, coll)? {
+            for (rid, _id_k, blob) in self.scan_docs(session, db, coll)? {
                 let d = decode_doc(&blob)?;
                 if let Some(pf) = &partial {
                     if !query_matches(&d, pf, &Document::new(), None)
@@ -6086,7 +7995,7 @@ impl Storage {
         // change stream surfaces a `createIndexes` event (the projector reads
         // `o.createIndexes` + `o.indexes[].{v,key,name}`).
         if self.enable_oplog {
-            let ui = collection_uuid(&session, db, coll)?;
+            let ui = collection_uuid(session, db, coll)?;
             let mut idx = Document::new();
             idx.insert("v", 2i32);
             idx.insert("key", Bson::Document(key_spec.clone()));
@@ -6099,7 +8008,7 @@ impl Storage {
             entry.insert("ns", format!("{db}.$cmd"));
             entry.insert("ui", uuid_binary(&ui));
             entry.insert("o", Bson::Document(o));
-            self.emit_oplog(&session, vec![entry], vec![None])?;
+            self.emit_oplog(session, vec![entry], vec![None])?;
         }
         Ok(true)
     }
@@ -6293,40 +8202,52 @@ impl Storage {
         if name == ID_INDEX_NAME {
             return Ok(false);
         }
-        let session = self.conn.open_session()?;
-        let c = session.open_cursor(IDX_TABLE, None)?;
-        c.set_key_sss(db, coll, name);
-        match c.search() {
-            Ok(()) => {}
-            Err(e) if e.is_not_found() => return Ok(false),
-            Err(e) => return Err(e.into()),
-        }
-        // Capture the spec before removal: mongod's showExpandedEvents
-        // `dropIndexes` event describes the dropped index in full
-        // (`{v, key, name}`, probed 7.0.12), not just its name.
-        let key_spec = decode_doc(&c.get_value_u()?)
-            .ok()
-            .and_then(|d| d.get_document("key").ok().cloned())
-            .unwrap_or_default();
-        c.remove()?;
-        self.delete_entries_prefix(&session, db, coll, name)?;
-        // Oplog: a DDL `op: "c"` `dropIndexes` entry so a `showExpandedEvents`
-        // change stream surfaces a `dropIndexes` event (the projector reads
-        // `o.dropIndexes` + `o.index` + `o.key`).
-        if self.enable_oplog {
-            let ui = collection_uuid(&session, db, coll)?;
-            let mut o = Document::new();
-            o.insert("dropIndexes", coll);
-            o.insert("index", name);
-            o.insert("key", Bson::Document(key_spec));
-            let mut entry = Document::new();
-            entry.insert("op", "c");
-            entry.insert("ns", format!("{db}.$cmd"));
-            entry.insert("ui", uuid_binary(&ui));
-            entry.insert("o", Bson::Document(o));
-            self.emit_oplog(&session, vec![entry], vec![None])?;
-        }
-        Ok(true)
+        let _gen = self.ddl_generation_scope();
+        // One statement transaction: registry row, entry rows and the oplog
+        // entry go together — a crash mid-drop can't strand entry rows for a
+        // vanished index.
+        self.retry_write_conflicts("drop_index", || {
+            let session = self.op_session()?;
+            self.with_statement_txn(&session, || {
+                let c = session.open_cursor(IDX_TABLE, None)?;
+                c.set_key_sss(db, coll, name);
+                match c.search() {
+                    Ok(()) => {}
+                    Err(e) if e.is_not_found() => return Ok(false),
+                    Err(e) => return Err(e.into()),
+                }
+                // Capture the spec before removal: mongod's showExpandedEvents
+                // `dropIndexes` event describes the dropped index in full
+                // (`{v, key, name}`, probed 7.0.12), not just its name.
+                let key_spec = decode_doc(&c.get_value_u()?)
+                    .ok()
+                    .and_then(|d| d.get_document("key").ok().cloned())
+                    .unwrap_or_default();
+                c.remove()?;
+                self.delete_entries_prefix(&session, db, coll, name)?;
+                // The index is gone, so its claims must go too — otherwise
+                // recreating it (or inserting the value again) is refused
+                // against an index that no longer exists.
+                self.purge_unique_claims(&session, db, coll, Some(name))?;
+                // Oplog: a DDL `op: "c"` `dropIndexes` entry so a `showExpandedEvents`
+                // change stream surfaces a `dropIndexes` event (the projector reads
+                // `o.dropIndexes` + `o.index` + `o.key`).
+                if self.enable_oplog {
+                    let ui = collection_uuid(&session, db, coll)?;
+                    let mut o = Document::new();
+                    o.insert("dropIndexes", coll);
+                    o.insert("index", name);
+                    o.insert("key", Bson::Document(key_spec));
+                    let mut entry = Document::new();
+                    entry.insert("op", "c");
+                    entry.insert("ns", format!("{db}.$cmd"));
+                    entry.insert("ui", uuid_binary(&ui));
+                    entry.insert("o", Bson::Document(o));
+                    self.emit_oplog(&session, vec![entry], vec![None])?;
+                }
+                Ok(true)
+            })
+        })
     }
 
     /// Drop every (non-`_id_`) index on `(db, coll)`. Returns how many were
@@ -6337,42 +8258,49 @@ impl Storage {
         // then the collection lock — see `lock`'s ordering rules).
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
-        let dropped: Vec<(String, Document)> = self
-            .iter_indexes(&session, db, coll)?
-            .into_iter()
-            .map(|(n, key_spec, _)| (n, key_spec))
-            .collect();
-        for (name, _) in &dropped {
-            let c = session.open_cursor(IDX_TABLE, None)?;
-            c.set_key_sss(db, coll, name);
-            if c.search().is_ok() {
-                c.remove()?;
-            }
-            self.delete_entries_prefix(&session, db, coll, name)?;
-        }
-        // Oplog: one `dropIndexes` "c" entry per dropped index (mongod emits
-        // per-index events for `dropIndexes: "*"` too), each carrying the key
-        // spec for the showExpandedEvents event's full index description.
-        if self.enable_oplog && !dropped.is_empty() {
-            let ui = collection_uuid(&session, db, coll)?;
-            let mut entries = Vec::with_capacity(dropped.len());
-            for (name, key_spec) in &dropped {
-                let mut o = Document::new();
-                o.insert("dropIndexes", coll);
-                o.insert("index", name.as_str());
-                o.insert("key", Bson::Document(key_spec.clone()));
-                let mut entry = Document::new();
-                entry.insert("op", "c");
-                entry.insert("ns", format!("{db}.$cmd"));
-                entry.insert("ui", uuid_binary(&ui));
-                entry.insert("o", Bson::Document(o));
-                entries.push(entry);
-            }
-            let n = entries.len();
-            self.emit_oplog(&session, entries, vec![None; n])?;
-        }
-        Ok(dropped.len())
+        let _gen = self.ddl_generation_scope();
+        // One statement transaction across all the drops (registry rows, entry
+        // rows, oplog entries) — same crash-atomicity as `drop_index`.
+        self.retry_write_conflicts("drop_all_indexes", || {
+            let session = self.op_session()?;
+            self.with_statement_txn(&session, || {
+                let dropped: Vec<(String, Document)> = self
+                    .iter_indexes(&session, db, coll)?
+                    .into_iter()
+                    .map(|(n, key_spec, _)| (n, key_spec))
+                    .collect();
+                for (name, _) in &dropped {
+                    let c = session.open_cursor(IDX_TABLE, None)?;
+                    c.set_key_sss(db, coll, name);
+                    if c.search().is_ok() {
+                        c.remove()?;
+                    }
+                    self.delete_entries_prefix(&session, db, coll, name)?;
+                }
+                // Oplog: one `dropIndexes` "c" entry per dropped index (mongod emits
+                // per-index events for `dropIndexes: "*"` too), each carrying the key
+                // spec for the showExpandedEvents event's full index description.
+                if self.enable_oplog && !dropped.is_empty() {
+                    let ui = collection_uuid(&session, db, coll)?;
+                    let mut entries = Vec::with_capacity(dropped.len());
+                    for (name, key_spec) in &dropped {
+                        let mut o = Document::new();
+                        o.insert("dropIndexes", coll);
+                        o.insert("index", name.as_str());
+                        o.insert("key", Bson::Document(key_spec.clone()));
+                        let mut entry = Document::new();
+                        entry.insert("op", "c");
+                        entry.insert("ns", format!("{db}.$cmd"));
+                        entry.insert("ui", uuid_binary(&ui));
+                        entry.insert("o", Bson::Document(o));
+                        entries.push(entry);
+                    }
+                    let n = entries.len();
+                    self.emit_oplog(&session, entries, vec![None; n])?;
+                }
+                Ok(dropped.len())
+            })
+        })
     }
 
     /// Walk the registry for `(db, coll)`: `(name, key_spec, options)` per index.
@@ -6436,6 +8364,49 @@ impl Storage {
             Err(e) => return Err(e.into()),
         };
         while more {
+            let (d, c, recordid) = cur.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            let value = cur.get_value_u()?;
+            let (idk, blob) = unframe_doc_value(&value)?;
+            out.push((recordid, idk.to_vec(), blob.to_vec()));
+            more = cur.next()?;
+        }
+        Ok(out)
+    }
+
+    /// Up to `limit` doc rows with the `(db, coll)` prefix whose RecordId is
+    /// strictly greater than `after` — the batched rename-copy's resumable
+    /// read (RecordId order IS insertion order).
+    fn scan_docs_batch(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        after: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<ScannedDoc>> {
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let start = after.map_or(i64::MIN, |a| a.saturating_add(1));
+        cur.set_key_ssq(db, coll, start);
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        while more && out.len() < limit {
             let (d, c, recordid) = cur.get_key_ssq()?;
             if d != db || c != coll {
                 break;
@@ -6815,6 +8786,45 @@ impl Storage {
         }
         // The entry's trailing half is the doc's RecordId (step 2), so the old
         // `id_key_override` plumbing that existed purely to compute it is gone.
+        // Claim each unique key BEFORE writing entries, so a rejected claim
+        // leaves nothing behind. `overwrite=false` makes WiredTiger itself
+        // refuse a key another row holds — including one an open transaction is
+        // holding uncommitted, which the snapshot-read probe cannot see. Two
+        // writers racing the same key collide here and one takes a write
+        // conflict, which the retry wrapper turns into a clean duplicate-key
+        // error. Mirrors `storage._claim_unique_key`.
+        let claims = session.open_cursor(UNIQ_TABLE, Some("overwrite=false"))?;
+        for desc in descs {
+            // `_id_` is deliberately excluded: `_id` uniqueness is already
+            // enforced by the `_id` index (`write_nat_entry`'s overwrite=false
+            // insert into NAT_SEQ_TABLE), which is the only path from an `_id`
+            // to its doc row. Claiming it here too would double-write every
+            // insert for no added guarantee — and the extra dirty content
+            // pushed a large transaction over WiredTiger's cache before the
+            // dirty-budget guard could report it (caught by txn_budget).
+            if desc.name == "_id_"
+                || (!desc.unique && !desc.prepare_unique)
+                || !self.doc_in_partial(doc, desc)?
+            {
+                continue;
+            }
+            for kb in index_key_variants(doc, &desc.key_spec, desc.sparse)? {
+                claims.reset()?;
+                claims.set_key_sssu(db, coll, &desc.name, &escape_kb(&kb));
+                claims.set_value_q(recordid);
+                match claims.insert() {
+                    Ok(()) => {}
+                    Err(e) if e.is_duplicate_key() => {
+                        return Err(StorageError::DuplicateKey(Box::new(UniqueConflict {
+                            index: desc.name.clone(),
+                            key_pattern: desc.key_spec.clone(),
+                            key_value: conflict_key_value(doc, &desc.key_spec, &kb),
+                        })));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         for desc in descs {
             for packed in self.packed_entry_keys(doc, desc, recordid)? {
@@ -6843,7 +8853,31 @@ impl Storage {
             return Ok(());
         }
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        // Release the unique claims this RecordId owns. Only its own: a claim
+        // the row never held belongs to somebody else, and dropping it would
+        // let a genuine duplicate through. The value is the owning RecordId
+        // precisely so this can be checked.
+        let claims = session.open_cursor(UNIQ_TABLE, None)?;
         for desc in descs {
+            if desc.name != "_id_" && (desc.unique || desc.prepare_unique) {
+                for kb in index_key_variants(doc, &desc.key_spec, desc.sparse)? {
+                    claims.reset()?;
+                    claims.set_key_sssu(db, coll, &desc.name, &escape_kb(&kb));
+                    match claims.search() {
+                        Ok(()) => {
+                            if claims.get_value_q().ok() == Some(recordid) {
+                                match claims.remove() {
+                                    Ok(()) => {}
+                                    Err(e) if e.is_not_found() => {}
+                                    Err(e) => return Err(e.into()),
+                                }
+                            }
+                        }
+                        Err(e) if e.is_not_found() => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
             for packed in self.packed_entry_keys(doc, desc, recordid)? {
                 cur.reset()?;
                 cur.set_key_sssu(db, coll, &desc.name, &packed);
@@ -6939,6 +8973,55 @@ impl Storage {
                 Err(e) if e.is_not_found() => {}
                 Err(e) => return Err(e.into()),
             }
+        }
+        Ok(())
+    }
+
+    /// Drop every unique-key claim under `(db, coll)`, or under one index when
+    /// `index` is given.
+    ///
+    /// Claims MUST die with the namespace that owns them. A claim outliving its
+    /// collection makes a later insert of the same value fail as a duplicate
+    /// against a row that no longer exists — the false-rejection class #808 hit
+    /// on the Python side, where nothing purged the table on drop and a
+    /// drop/recreate/re-insert cycle was refused.
+    fn purge_unique_claims(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        index: Option<&str>,
+    ) -> Result<()> {
+        let scan = session.open_cursor(UNIQ_TABLE, None)?;
+        let del = session.open_cursor(UNIQ_TABLE, None)?;
+        scan.reset()?;
+        scan.set_key_sssu(db, coll, index.unwrap_or(""), b"");
+        let mut more = match scan.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    scan.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, n, k) = scan.get_key_sssu()?;
+            if d != db || c != coll {
+                break;
+            }
+            if index.is_none_or(|want| want == n) {
+                del.reset()?;
+                del.set_key_sssu(&d, &c, &n, &k);
+                match del.remove() {
+                    Ok(()) => {}
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            more = scan.next()?;
         }
         Ok(())
     }
@@ -7125,7 +9208,223 @@ impl Storage {
     /// Delete a collection's document / index-registry / index-entry rows
     /// (everything except its `secantus_collections` registry row). Shared by
     /// `drop_collection` / `drop_database` / `rename_collection`.
+    /// Delete up to `limit` doc rows with the `(db, coll)` prefix; returns
+    /// how many were deleted. Collect-then-remove, same as the whole-purge
+    /// loops. The prefix keys are consecutive, so a batch dirties few pages.
+    fn purge_docs_batch(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        limit: usize,
+    ) -> Result<usize> {
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        cur.set_key_ssq(db, coll, i64::MIN);
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut ids: Vec<i64> = Vec::new();
+        while more && ids.len() < limit {
+            let (d, c, recordid) = cur.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            ids.push(recordid);
+            more = cur.next()?;
+        }
+        for recordid in &ids {
+            cur.reset()?;
+            cur.set_key_ssq(db, coll, *recordid);
+            match cur.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(ids.len())
+    }
+
+    /// Delete up to `limit` index-entry rows across ALL of the collection's
+    /// indexes; returns how many were deleted.
+    fn purge_idx_entries_batch(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        limit: usize,
+    ) -> Result<usize> {
+        let scan = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        scan.set_key_sssu(db, coll, "", b"");
+        let mut more = match scan.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    scan.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut keys: Vec<(String, Vec<u8>)> = Vec::new();
+        while more && keys.len() < limit {
+            let (d, c, n, packed) = scan.get_key_sssu()?;
+            if d != db || c != coll {
+                break;
+            }
+            keys.push((n, packed));
+            more = scan.next()?;
+        }
+        let del = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        for (n, p) in &keys {
+            del.reset()?;
+            del.set_key_sssu(db, coll, n, p);
+            match del.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(keys.len())
+    }
+
+    /// Delete up to `limit` natural-order rows (forward then reverse tables)
+    /// for the collection; returns how many were deleted.
+    fn purge_nat_batch(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        limit: usize,
+    ) -> Result<usize> {
+        let nat = session.open_cursor(NAT_TABLE, None)?;
+        nat.set_key_ssq(db, coll, i64::MIN);
+        let mut more = match nat.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    nat.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut seqs: Vec<i64> = Vec::new();
+        while more && seqs.len() < limit {
+            let (d, c, seq) = nat.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            seqs.push(seq);
+            more = nat.next()?;
+        }
+        for seq in &seqs {
+            nat.reset()?;
+            nat.set_key_ssq(db, coll, *seq);
+            if nat.search().is_ok() {
+                nat.remove()?;
+            }
+        }
+        let mut deleted = seqs.len();
+        if deleted >= limit {
+            return Ok(deleted);
+        }
+        let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
+        rev.set_key_ssu(db, coll, b"");
+        let mut more = match rev.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    rev.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        while more && deleted + keys.len() < limit {
+            let (d, c, k) = rev.get_key_ssu()?;
+            if d != db || c != coll {
+                break;
+            }
+            keys.push(k);
+            more = rev.next()?;
+        }
+        for k in &keys {
+            rev.reset()?;
+            rev.set_key_ssu(db, coll, k);
+            if rev.search().is_ok() {
+                rev.remove()?;
+            }
+        }
+        deleted += keys.len();
+        Ok(deleted)
+    }
+
+    /// Delete up to `limit` unique-key claims for the collection (all
+    /// indexes); returns how many were deleted.
+    fn purge_uniq_batch(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        limit: usize,
+    ) -> Result<usize> {
+        let scan = session.open_cursor(UNIQ_TABLE, None)?;
+        let del = session.open_cursor(UNIQ_TABLE, None)?;
+        scan.reset()?;
+        scan.set_key_sssu(db, coll, "", b"");
+        let mut more = match scan.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    scan.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let mut keys: Vec<(String, Vec<u8>)> = Vec::new();
+        while more && keys.len() < limit {
+            let (d, c, n, k) = scan.get_key_sssu()?;
+            if d != db || c != coll {
+                break;
+            }
+            keys.push((n, k));
+            more = scan.next()?;
+        }
+        for (n, k) in &keys {
+            del.reset()?;
+            del.set_key_sssu(db, coll, n, k);
+            match del.remove() {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(keys.len())
+    }
+
     fn purge_collection_tables(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
+        // Unique-key claims die with the namespace (see purge_unique_claims):
+        // a surviving claim would reject a later insert of the same value
+        // against a row that no longer exists.
+        self.purge_unique_claims(session, db, coll, None)?;
         // Lazy shards: a collection whose shard was never written (dropping an
         // empty / never-created collection — a no-op in MongoDB) has no doc rows
         // to purge, so an absent shard is simply skipped.
@@ -7294,6 +9593,24 @@ impl Storage {
         if self.is_oplog_rs(db, coll) {
             return self.find_oplog_rs(filter, sort, coll_opt, vars);
         }
+        self.with_ddl_generation_check(|| {
+            self.find_matching_with_inner(db, coll, filter, sort, hint, coll_opt, vars)
+        })
+    }
+
+    /// The body of [`find_matching_with`], one scan attempt (re-run by the
+    /// DDL-generation check when a namespace-level DDL raced it).
+    #[allow(clippy::too_many_arguments)]
+    fn find_matching_with_inner(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        sort: Option<&Document>,
+        hint: Option<&Hint>,
+        coll_opt: Option<&Collation>,
+        vars: &Document,
+    ) -> Result<Vec<Vec<u8>>> {
         // Lock-free read (see the `lock` field's invariants).
         let session = self.op_session()?;
         let (sort_field, sort_dir) = single_sort_spec(sort);
@@ -7342,6 +9659,7 @@ impl Storage {
                             coll,
                             &idx_name,
                             sort_dir != idx_dir,
+                            idx_dir,
                         )?
                     }
                     None => self.scan_blobs_natural(&session, db, coll)?,
@@ -7351,7 +9669,7 @@ impl Storage {
                 match self.compound_index_for_sort(&session, db, coll, &multi)? {
                     Some((idx_name, reverse)) => {
                         in_sort_order = true;
-                        self.walk_index_in_order(&session, db, coll, &idx_name, reverse)?
+                        self.walk_index_in_order(&session, db, coll, &idx_name, reverse, 1)?
                     }
                     None => self.scan_blobs_natural(&session, db, coll)?,
                 }
@@ -7468,28 +9786,30 @@ impl Storage {
                 .find_oplog_rs(filter, None, coll_opt, &Document::new())?
                 .len());
         }
-        // Lock-free read (see the `lock` field's invariants).
-        let session = self.op_session()?;
-        if filter.is_empty() {
-            return Ok(self.scan_docs(&session, db, coll)?.len());
-        }
-        let vars = Document::new();
-        let mut n = 0usize;
-        for (_rid, _id_k, blob) in
-            self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
-        {
-            // Match over raw BSON — count never returns the documents, so a
-            // selective filter over wide documents decodes only the filter's
-            // fields, nothing else (matches `find_matching_with`).
-            let raw =
-                bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
-            if secantus_core::query::matches_raw(raw, filter, &vars, coll_opt)
-                .map_err(|_| StorageError::QueryUnsupported)?
-            {
-                n += 1;
+        self.with_ddl_generation_check(|| {
+            // Lock-free read (see the `lock` field's invariants).
+            let session = self.op_session()?;
+            if filter.is_empty() {
+                return Ok(self.scan_docs(&session, db, coll)?.len());
             }
-        }
-        Ok(n)
+            let vars = Document::new();
+            let mut n = 0usize;
+            for (_rid, _id_k, blob) in
+                self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
+            {
+                // Match over raw BSON — count never returns the documents, so a
+                // selective filter over wide documents decodes only the filter's
+                // fields, nothing else (matches `find_matching_with`).
+                let raw = bson::RawDocument::from_bytes(&blob)
+                    .map_err(|_| StorageError::QueryUnsupported)?;
+                if secantus_core::query::matches_raw(raw, filter, &vars, coll_opt)
+                    .map_err(|_| StorageError::QueryUnsupported)?
+                {
+                    n += 1;
+                }
+            }
+            Ok(n)
+        })
     }
 
     /// Apply `update` to documents matching `filter`. `multi` updates every
@@ -7500,6 +9820,11 @@ impl Storage {
     /// `storage.update_matching` (base form — `array_filters` / positional
     /// operators / `let` / `collation` / `validator` / capped collections route
     /// to Python at the engine-selection layer).
+    #[allow(clippy::too_many_arguments)]
+    /// Update at the default `strict` validation level.
+    ///
+    /// Thin wrapper over [`Storage::update_matching_leveled`]; see it for the
+    /// `moderate` behaviour.
     #[allow(clippy::too_many_arguments)]
     pub fn update_matching(
         &self,
@@ -7513,7 +9838,50 @@ impl Storage {
         let_vars: &Document,
         coll_opt: Option<&Collation>,
         validator: Option<&Document>,
+        want_post_image: bool,
     ) -> Result<UpdateOutcome> {
+        let _admit = self.admit_write();
+        self.update_matching_leveled(
+            db,
+            coll,
+            filter,
+            update,
+            multi,
+            upsert,
+            array_filters,
+            let_vars,
+            coll_opt,
+            validator,
+            false,
+            want_post_image,
+        )
+    }
+
+    /// Update with the collection's `validationLevel` taken into account.
+    ///
+    /// `validator_moderate` is `validationLevel: "moderate"`: exempt documents
+    /// that ALREADY failed the validator from update-time validation (inserts
+    /// stay validated). [`Storage::update_matching`] is the strict-level
+    /// wrapper, kept so the many callers that have no validator at all — tests,
+    /// PITR replay, the adapter's plain path — need not thread a flag that
+    /// cannot affect them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_matching_leveled(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        update: &Document,
+        multi: bool,
+        upsert: bool,
+        array_filters: &[Document],
+        let_vars: &Document,
+        coll_opt: Option<&Collation>,
+        validator: Option<&Document>,
+        validator_moderate: bool,
+        want_post_image: bool,
+    ) -> Result<UpdateOutcome> {
+        let _admit = self.admit_write();
         // Operator-/replacement-form update. `is_replacement` (no `$`-prefixed
         // top-level key) drives the oplog shape: a replacement emits the whole
         // doc in `o`, an operator update a `{$v:2, diff}`. Positional operators
@@ -7537,6 +9905,8 @@ impl Storage {
             upsert,
             is_replacement,
             validator,
+            validator_moderate,
+            want_post_image,
             &|doc, up| {
                 // mongod rejects any update that would change the immutable `_id`
                 // with ImmutableField (66) — surface that specific code rather than
@@ -7548,7 +9918,24 @@ impl Storage {
                 }
                 let pos = secantus_core::update::find_positional_matches(doc, filter);
                 secantus_core::update::apply_update_with(doc, update, up, array_filters, &pos)
-                    .map_err(|_| StorageError::QueryUnsupported)
+                    .map_err(|_| {
+                        // Prefer the error mongod actually names. A bare defer
+                        // becomes a generic BadValue (2) on this server, which
+                        // has no Python to fall back to, where mongod answers
+                        // TypeMismatch (14).
+                        if let Some(m) = secantus_core::update::path_conflict_error(update) {
+                            // Overlapping operator paths -> mongod's code 40.
+                            return StorageError::UpdatePathConflict(m);
+                        }
+                        if let Some(m) = secantus_core::update::path_not_viable_error(doc, update) {
+                            // Creating through a non-document -> mongod's code 28.
+                            return StorageError::UpdatePathNotViable(m);
+                        }
+                        match secantus_core::update::arith_type_error(doc, update) {
+                            Some(m) => StorageError::UpdateTypeMismatch(m),
+                            None => StorageError::QueryUnsupported,
+                        }
+                    })
             },
         )
     }
@@ -7573,7 +9960,12 @@ impl Storage {
         let_vars: &Document,
         coll_opt: Option<&Collation>,
         validator: Option<&Document>,
+        // `validationLevel: "moderate"` — exempt documents that ALREADY failed
+        // the validator from update-time validation (inserts are still checked).
+        validator_moderate: bool,
+        want_post_image: bool,
     ) -> Result<UpdateOutcome> {
+        let _admit = self.admit_write();
         self.update_matching_core(
             db,
             coll,
@@ -7584,6 +9976,8 @@ impl Storage {
             upsert,
             false,
             validator,
+            validator_moderate,
+            want_post_image,
             &|doc, _up| {
                 let out = secantus_core::aggregate::apply_pipeline(
                     vec![doc.clone()],
@@ -7625,6 +10019,309 @@ impl Storage {
         upsert: bool,
         is_replacement: bool,
         validator: Option<&Document>,
+        // `validationLevel: "moderate"` — exempt documents that ALREADY failed
+        // the validator from update-time validation (inserts are still checked).
+        validator_moderate: bool,
+        want_post_image: bool,
+        transform: &dyn Fn(&Document, bool) -> Result<Document>,
+    ) -> Result<UpdateOutcome> {
+        // Route: a multi-update outside a user transaction rewrites an
+        // unbounded matched set, so it runs CHUNKED (bounded dirty per
+        // statement transaction — the same livelock class the chunked
+        // inserts closed; mongod's updateMany is per-document write units
+        // and non-atomic, so the commit points match its semantics). The
+        // single-doc, upsert-only and in-user-transaction paths are
+        // inherently bounded / not ours to commit and keep the one-txn body.
+        if multi && !self.in_user_txn() {
+            return self.update_matching_chunked(
+                db,
+                coll,
+                filter,
+                vars,
+                coll_opt,
+                upsert,
+                is_replacement,
+                validator,
+                validator_moderate,
+                transform,
+            );
+        }
+        self.update_matching_single_txn(
+            db,
+            coll,
+            filter,
+            vars,
+            coll_opt,
+            multi,
+            upsert,
+            is_replacement,
+            validator,
+            validator_moderate,
+            want_post_image,
+            transform,
+        )
+    }
+
+    /// The chunked multi-update driver: one candidate scan (RecordIds only,
+    /// pre-filtered on the scan's blobs), then bounded statement
+    /// transactions over the RecordId list. Each chunk RE-FETCHES every doc
+    /// row inside its own transaction and re-applies the filter — the scan's
+    /// blobs must never feed a later chunk's transform, or a user
+    /// transaction committing between chunks would be silently overwritten
+    /// with state computed from a stale read (no overlapping WT transactions
+    /// = no conflict to catch it). A conflict retries only its own
+    /// (rolled-back) chunk, and the RecordId list is partitioned across
+    /// chunks, so every document is transformed exactly once ($inc never
+    /// double-applies). The collection write lock is held across the whole
+    /// operation, exactly like the single-transaction path.
+    #[allow(clippy::too_many_arguments)]
+    fn update_matching_chunked(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        vars: &Document,
+        coll_opt: Option<&Collation>,
+        upsert: bool,
+        is_replacement: bool,
+        validator: Option<&Document>,
+        // `validationLevel: "moderate"` — see `update_matching_core`.
+        validator_moderate: bool,
+        transform: &dyn Fn(&Document, bool) -> Result<Document>,
+    ) -> Result<UpdateOutcome> {
+        let (matched, modified) = {
+            // The coll lock's guard lives only for this block: the zero-match
+            // delegation below re-enters `update_matching_single_txn`, which
+            // takes the SAME non-reentrant mutex — holding it across that
+            // call self-deadlocks (found by the first test run).
+            let lock = self.coll_lock(db, coll);
+            let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let rids: Vec<i64> = {
+                let session = self.op_session()?;
+                ensure_collection(&session, db, coll, self.data_nonlogged)?;
+                let mut rids = Vec::new();
+                for (recordid, _id_k, blob) in
+                    self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
+                {
+                    let raw = bson::RawDocument::from_bytes(&blob)
+                        .map_err(|_| StorageError::QueryUnsupported)?;
+                    if secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
+                        .map_err(|_| StorageError::QueryUnsupported)?
+                    {
+                        rids.push(recordid);
+                    }
+                }
+                rids
+            };
+            let mut matched = 0usize;
+            let mut modified = 0usize;
+            let mut idx = 0usize;
+            while idx < rids.len() {
+                let (consumed, m, w) =
+                    self.retry_write_conflicts("update_matching_chunk", || {
+                        let session = self.op_session()?;
+                        self.with_statement_txn(&session, || {
+                            self.update_chunk_txn(
+                                &session,
+                                db,
+                                coll,
+                                &rids[idx..],
+                                filter,
+                                vars,
+                                coll_opt,
+                                is_replacement,
+                                validator,
+                                validator_moderate,
+                                transform,
+                            )
+                        })
+                    })?;
+                debug_assert!(consumed > 0);
+                idx += consumed;
+                matched += m;
+                modified += w;
+            }
+            (matched, modified)
+        };
+        if matched == 0 {
+            // Zero matches (an empty scan, or every candidate stopped
+            // matching by its chunk's re-check): the single-transaction body
+            // — now that the lock is released — rescans and degenerates to
+            // its upsert branch or a clean zero outcome.
+            return self.update_matching_single_txn(
+                db,
+                coll,
+                filter,
+                vars,
+                coll_opt,
+                true,
+                upsert,
+                is_replacement,
+                validator,
+                validator_moderate,
+                false,
+                transform,
+            );
+        }
+        Ok(UpdateOutcome {
+            matched,
+            modified,
+            upserted_id: None,
+            post_image: None,
+        })
+    }
+
+    /// One bounded chunk of the multi-update: process RecordIds from the
+    /// front of `rids` until the doc/byte budget closes the transaction.
+    /// Returns `(consumed, matched, modified)` — `consumed` counts every
+    /// examined RecordId (matching or not) so the driver always advances.
+    #[allow(clippy::too_many_arguments)]
+    fn update_chunk_txn(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        rids: &[i64],
+        filter: &Document,
+        vars: &Document,
+        coll_opt: Option<&Collation>,
+        is_replacement: bool,
+        validator: Option<&Document>,
+        // `validationLevel: "moderate"` — see `update_matching_core`.
+        validator_moderate: bool,
+        transform: &dyn Fn(&Document, bool) -> Result<Document>,
+    ) -> Result<(usize, usize, usize)> {
+        let ns = format!("{db}.{coll}");
+        let descs = self.index_descs(session, db, coll)?;
+        let oplog_on = self.enable_oplog;
+        let preimages_on = oplog_on && pre_post_images_enabled(session, db, coll)?;
+        let ui = if oplog_on {
+            Some(collection_uuid(session, db, coll)?)
+        } else {
+            None
+        };
+        let mut consumed = 0usize;
+        let mut matched = 0usize;
+        let mut modified = 0usize;
+        let mut chunk_bytes = 0usize;
+        let mut oplog_entries: Vec<OplogEntry> = Vec::new();
+        let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
+        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+        for &recordid in rids {
+            if modified >= WRITE_CHUNK_MAX_DOCS || chunk_bytes >= WRITE_CHUNK_MAX_BYTES {
+                break;
+            }
+            consumed += 1;
+            // Fresh read inside THIS transaction (see the driver note).
+            cur.reset()?;
+            cur.set_key_ssq(db, coll, recordid);
+            let (id_k, blob) = match cur.search() {
+                Ok(()) => {
+                    let value = cur.get_value_u()?;
+                    let (idk, b) = unframe_doc_value(&value)?;
+                    (idk.to_vec(), b.to_vec())
+                }
+                Err(e) if e.is_not_found() => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let raw =
+                bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
+            if !secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
+                .map_err(|_| StorageError::QueryUnsupported)?
+            {
+                continue;
+            }
+            let doc = decode_doc(&blob)?;
+            matched += 1;
+            let new = transform(&doc, false)?;
+            if new == doc {
+                continue;
+            }
+            if let Some(v) = validator {
+                let new_ok = query_matches(&new, v, &Document::new(), None).unwrap_or(true);
+                // `moderate` exempts a doc that ALREADY failed the validator
+                // before this update; one that currently satisfies it is still
+                // held to it, so an update cannot break a valid doc.
+                let was_already_invalid = validator_moderate
+                    && !query_matches(&doc, v, &Document::new(), None).unwrap_or(true);
+                if !new_ok && !was_already_invalid {
+                    return Err(StorageError::DocumentValidationFailure);
+                }
+            }
+            if let Some(c) =
+                self.unique_conflict(session, db, coll, &new, &descs, Some(recordid))?
+            {
+                return Err(StorageError::DuplicateKey(Box::new(c)));
+            }
+            let new_blob = encode_doc(&new)?;
+            if new_blob.len() > MAX_BSON_OBJECT_SIZE {
+                return Err(StorageError::DocumentTooLarge(new_blob.len()));
+            }
+            modified += 1;
+            chunk_bytes += new_blob.len();
+            let (additions, removals) = self.index_entry_diff(&doc, &new, &descs, recordid)?;
+            self.insert_index_entries(session, db, coll, &additions)?;
+            cur.reset()?;
+            cur.set_key_ssq(db, coll, recordid);
+            cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
+            cur.update()?;
+            self.remove_index_entries(session, db, coll, &removals)?;
+            self.maybe_mark_multikey(session, db, coll, &new, &descs)?;
+            if oplog_on {
+                let o_owned: Vec<u8>;
+                let o_bytes: &[u8] = if is_replacement {
+                    &new_blob
+                } else {
+                    let mut o = Document::new();
+                    o.insert("$v", 2i32);
+                    o.insert(
+                        "diff",
+                        Bson::Document(
+                            compute_update_description(&doc, &new)
+                                .map_err(|_| StorageError::QueryUnsupported)?,
+                        ),
+                    );
+                    o_owned = encode_doc(&o)?;
+                    &o_owned
+                };
+                let o2 = encode_id_doc(&doc.get("_id").cloned().unwrap_or(Bson::Null))?;
+                oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
+                    "u",
+                    &ns,
+                    Some(ui.as_ref().unwrap()),
+                    o_bytes,
+                    &o2,
+                )?));
+                pre_images.push(if preimages_on {
+                    chunk_bytes += blob.len();
+                    Some(blob.clone())
+                } else {
+                    None
+                });
+            }
+        }
+        if oplog_on && !oplog_entries.is_empty() {
+            self.emit_oplog_entries(session, oplog_entries, pre_images)?;
+        }
+        Ok((consumed, matched, modified))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_matching_single_txn(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        vars: &Document,
+        coll_opt: Option<&Collation>,
+        multi: bool,
+        upsert: bool,
+        is_replacement: bool,
+        validator: Option<&Document>,
+        // `validationLevel: "moderate"` — exempt documents that ALREADY failed
+        // the validator from update-time validation (inserts are still checked).
+        validator_moderate: bool,
+        want_post_image: bool,
         transform: &dyn Fn(&Document, bool) -> Result<Document>,
     ) -> Result<UpdateOutcome> {
         self.retry_write_conflicts("update_matching_core", || {
@@ -7632,7 +10329,7 @@ impl Storage {
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                ensure_collection(&session, db, coll)?;
+                ensure_collection(&session, db, coll, self.data_nonlogged)?;
                 let ns = format!("{db}.{coll}");
                 let descs = self.index_descs(&session, db, coll)?;
                 let oplog_on = self.enable_oplog;
@@ -7665,10 +10362,12 @@ impl Storage {
                     let doc = decode_doc(&blob)?;
                     matched += 1;
                     let new = transform(&doc, false)?;
-                    if !multi {
+                    if !multi && want_post_image {
                         // Captured before the oplog branch below moves `new`; the
                         // post-image is the applied doc even when the update was a
-                        // no-op (`new == doc`), matching mongod's fam reply.
+                        // no-op (`new == doc`), matching mongod's fam reply. Gated
+                        // on `want_post_image` so a plain update (which never reads
+                        // it) skips the full-document clone.
                         post_image = Some(new.clone());
                     }
                     if new != doc {
@@ -7677,7 +10376,12 @@ impl Storage {
                         // validator the query engine can't evaluate is treated as
                         // passing (lenient), matching the insert path.
                         if let Some(v) = validator {
-                            if !query_matches(&new, v, &Document::new(), None).unwrap_or(true) {
+                            let new_ok =
+                                query_matches(&new, v, &Document::new(), None).unwrap_or(true);
+                            // `moderate`: see the sibling update site above.
+                            let was_already_invalid = validator_moderate
+                                && !query_matches(&doc, v, &Document::new(), None).unwrap_or(true);
+                            if !new_ok && !was_already_invalid {
                                 return Err(StorageError::DocumentValidationFailure);
                             }
                         }
@@ -7793,7 +10497,9 @@ impl Storage {
                     cur.insert()?;
                     self.write_index_entries(&session, db, coll, &new, &descs, recordid)?;
                     self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
-                    post_image = Some(new.clone());
+                    if want_post_image {
+                        post_image = Some(new.clone());
+                    }
                     if oplog_on {
                         // The upserted doc is recorded as an insert; splice the
                         // `new_blob` we already encoded for the doc-table write.
@@ -7829,6 +10535,170 @@ impl Storage {
     /// when enabled). Mirrors `storage.delete_matching` (base form — `let` /
     /// `collation` route to Python at the engine-selection layer).
     pub fn delete_matching(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        limit: usize,
+        let_vars: &Document,
+        coll_opt: Option<&Collation>,
+    ) -> Result<usize> {
+        let _admit = self.admit_write();
+        // Unbounded deletes (limit == 0, deleteMany) outside a user
+        // transaction run CHUNKED — the matched set's index-entry removals
+        // plus pre-images are unbounded dirty content in one transaction
+        // otherwise (same class and same driver shape as
+        // `update_matching_chunked`; mongod's deleteMany is per-document
+        // write units and non-atomic). Bounded deletes (limit >= 1) and
+        // in-transaction deletes keep the single-transaction body.
+        if limit == 0 && !self.in_user_txn() {
+            return self.delete_matching_chunked(db, coll, filter, let_vars, coll_opt);
+        }
+        self.delete_matching_single_txn(db, coll, filter, limit, let_vars, coll_opt)
+    }
+
+    /// Chunked deleteMany driver — see `update_matching_chunked` for the
+    /// re-fetch-inside-the-chunk-transaction rationale.
+    fn delete_matching_chunked(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        let_vars: &Document,
+        coll_opt: Option<&Collation>,
+    ) -> Result<usize> {
+        let lock = self.coll_lock(db, coll);
+        let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let rids: Vec<i64> = {
+            let session = self.op_session()?;
+            let mut rids = Vec::new();
+            for (recordid, _id_k, blob) in
+                self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
+            {
+                let raw = bson::RawDocument::from_bytes(&blob)
+                    .map_err(|_| StorageError::QueryUnsupported)?;
+                if secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt)
+                    .map_err(|_| StorageError::QueryUnsupported)?
+                {
+                    rids.push(recordid);
+                }
+            }
+            rids
+        };
+        let mut deleted = 0usize;
+        let mut idx = 0usize;
+        while idx < rids.len() {
+            let (consumed, d) = self.retry_write_conflicts("delete_matching_chunk", || {
+                let session = self.op_session()?;
+                self.with_statement_txn(&session, || {
+                    self.delete_chunk_txn(
+                        &session,
+                        db,
+                        coll,
+                        &rids[idx..],
+                        filter,
+                        let_vars,
+                        coll_opt,
+                    )
+                })
+            })?;
+            debug_assert!(consumed > 0);
+            idx += consumed;
+            deleted += d;
+        }
+        Ok(deleted)
+    }
+
+    /// One bounded chunk of the deleteMany. Returns `(consumed, deleted)`.
+    #[allow(clippy::too_many_arguments)]
+    fn delete_chunk_txn(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        rids: &[i64],
+        filter: &Document,
+        let_vars: &Document,
+        coll_opt: Option<&Collation>,
+    ) -> Result<(usize, usize)> {
+        let descs = self.index_descs(session, db, coll)?;
+        let oplog_on = self.enable_oplog;
+        let preimages_on = oplog_on && pre_post_images_enabled(session, db, coll)?;
+        let ui = if oplog_on && coll_options(session, db, coll)?.is_some() {
+            Some(collection_uuid(session, db, coll)?)
+        } else {
+            None
+        };
+        let ns = if oplog_on {
+            format!("{db}.{coll}")
+        } else {
+            String::new()
+        };
+        let mut consumed = 0usize;
+        let mut deleted = 0usize;
+        let mut chunk_bytes = 0usize;
+        let mut oplog_entries: Vec<OplogEntry> = Vec::new();
+        let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
+        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+        for &recordid in rids {
+            if deleted >= WRITE_CHUNK_MAX_DOCS || chunk_bytes >= WRITE_CHUNK_MAX_BYTES {
+                break;
+            }
+            consumed += 1;
+            cur.reset()?;
+            cur.set_key_ssq(db, coll, recordid);
+            let (id_k, blob) = match cur.search() {
+                Ok(()) => {
+                    let value = cur.get_value_u()?;
+                    let (idk, b) = unframe_doc_value(&value)?;
+                    (idk.to_vec(), b.to_vec())
+                }
+                Err(e) if e.is_not_found() => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let raw =
+                bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
+            if !secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt)
+                .map_err(|_| StorageError::QueryUnsupported)?
+            {
+                continue;
+            }
+            let doc = decode_doc(&blob)?;
+            // Doc row first, entries after — see prune_ttl for the lock-free
+            // reader ordering rationale.
+            cur.reset()?;
+            cur.set_key_ssq(db, coll, recordid);
+            cur.remove()?;
+            self.delete_index_entries(session, db, coll, &doc, &descs, recordid)?;
+            self.delete_nat_entry(session, db, coll, &id_k)?;
+            deleted += 1;
+            // Index-entry removals are the delete's dirty content; approximate
+            // with the doc size (each removal dirties an entry page).
+            chunk_bytes += blob.len();
+            if oplog_on {
+                let id_doc = encode_id_doc(&doc.get("_id").cloned().unwrap_or(Bson::Null))?;
+                oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
+                    "d",
+                    &ns,
+                    ui.as_deref(),
+                    &id_doc,
+                    &id_doc,
+                )?));
+                pre_images.push(if preimages_on {
+                    chunk_bytes += blob.len();
+                    Some(blob.clone())
+                } else {
+                    None
+                });
+            }
+        }
+        if oplog_on && !oplog_entries.is_empty() {
+            self.emit_oplog_entries(session, oplog_entries, pre_images)?;
+        }
+        Ok((consumed, deleted))
+    }
+
+    fn delete_matching_single_txn(
         &self,
         db: &str,
         coll: &str,
@@ -8078,7 +10948,7 @@ impl Storage {
                         break;
                     }
                 }
-                let mut docs = self.walk_index_in_order(session, db, coll, name, false)?;
+                let mut docs = self.walk_index_in_order(session, db, coll, name, false, 1)?;
                 let in_order = match (&leading, sort_field) {
                     (Some((f, _)), Some(sf)) => f == sf,
                     _ => false,
@@ -8100,6 +10970,7 @@ impl Storage {
         coll: &str,
         name: &str,
         reverse: bool,
+        idx_dir: i32,
     ) -> Result<Vec<Vec<u8>>> {
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         cur.set_key_sssu(db, coll, name, b"");
@@ -8120,9 +10991,20 @@ impl Storage {
             if d != db || c != coll || n != name {
                 break;
             }
-            let (_esc, row_id) = unpack_entry(&packed);
+            let (esc, row_id) = unpack_entry(&packed);
+            // Skip WHOLE-ARRAY entries. A multikey index writes one entry per
+            // element plus one for the whole array, and the whole-array key sorts
+            // in the Array slot — after every scalar. Walking backward hits those
+            // first, and the first-occurrence dedup in `docs_by_recordids` then
+            // picks documents by their whole-array key instead of by their maximum
+            // element, which is what mongod orders by. Ascending never showed it:
+            // element entries come first there. This walk is used only for
+            // ordering; whole-array equality lookups take a different path and
+            // still need those entries. Mirrors `storage.py::_is_whole_array_key`.
             if let Some(rid) = row_id {
-                recordids.push(rid);
+                if !is_whole_array_key(esc, idx_dir) {
+                    recordids.push(rid);
+                }
             }
             more = cur.next()?;
         }
@@ -9270,7 +12152,7 @@ fn collection_registered(session: &Session, db: &str, coll: &str) -> Result<bool
 }
 
 /// Register `(db, coll)` in the collections table if not already present.
-fn ensure_collection(session: &Session, db: &str, coll: &str) -> Result<()> {
+fn ensure_collection(session: &Session, db: &str, coll: &str, data_nonlogged: bool) -> Result<()> {
     let probe = session.open_cursor(COLL_TABLE, None)?;
     probe.set_key_ss(db, coll);
     match probe.search() {
@@ -9290,7 +12172,10 @@ fn ensure_collection(session: &Session, db: &str, coll: &str) -> Result<()> {
             // covers every write caller (create / auto-create-on-insert / rename).
             // Read / scan paths tolerate an absent shard, keeping a lazily-sharded
             // store byte-compatible with an eager one (missing shard reads empty).
-            session.create(&doc_table_for(db, coll), &data_table_cfg(DOC_TABLE_CFG))?;
+            session.create(
+                &doc_table_for(db, coll),
+                &data_table_cfg(DOC_TABLE_CFG, data_nonlogged),
+            )?;
             Ok(())
         }
         Err(e) => Err(e.into()),
@@ -9341,6 +12226,44 @@ fn collection_uuid(session: &Session, db: &str, coll: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// One-decode view of the per-op collection facts. The write paths used to
+/// hit `coll_options` (a WT search + BSON decode) two or three times per
+/// operation — timeseries check, UUID fetch, pre/post-image flag — for the
+/// same row. `uuid` stays lazy (`None` until someone actually needs it) so a
+/// server with the oplog disabled never starts minting UUIDs it previously
+/// didn't.
+struct CollMeta {
+    timeseries: bool,
+    pre_post_images: bool,
+    uuid: Option<Vec<u8>>,
+}
+
+fn coll_meta(session: &Session, db: &str, coll: &str) -> Result<CollMeta> {
+    let opts = coll_options(session, db, coll)?.unwrap_or_default();
+    let uuid = match opts.get("uuid") {
+        Some(Bson::Binary(b)) if b.bytes.len() == 16 => Some(b.bytes.clone()),
+        _ => None,
+    };
+    Ok(CollMeta {
+        timeseries: opts.contains_key("timeseries"),
+        pre_post_images: opts
+            .get_document("changeStreamPreAndPostImages")
+            .map(|s| s.get_bool("enabled").unwrap_or(false))
+            .unwrap_or(false),
+        uuid,
+    })
+}
+
+/// The collection UUID from an already-decoded [`CollMeta`], minting (and
+/// persisting) one only when the meta had none — the same first-use mint
+/// `collection_uuid` does, without re-decoding the options row.
+fn meta_uuid(session: &Session, db: &str, coll: &str, meta: &CollMeta) -> Result<Vec<u8>> {
+    match &meta.uuid {
+        Some(u) => Ok(u.clone()),
+        None => collection_uuid(session, db, coll),
+    }
+}
+
 /// Whether `changeStreamPreAndPostImages.enabled` is set on the collection.
 fn pre_post_images_enabled(session: &Session, db: &str, coll: &str) -> Result<bool> {
     if let Some(opts) = coll_options(session, db, coll)? {
@@ -9387,6 +12310,100 @@ mod tests {
     use super::*;
     use bson::doc;
 
+    /// The rollback-reason classifier that decides whether a `WT_ROLLBACK` was
+    /// cache pressure (not retryable — `TransactionTooLargeForCache`) or a
+    /// concurrency race (retryable — `WriteConflict`). The strings are the ones
+    /// WiredTiger actually emits across the versions we link.
+    #[test]
+    fn cache_pressure_rollback_reasons_are_recognised() {
+        for reason in [
+            "oldest pinned transaction ID rolled back for eviction",
+            "transaction rolled back because of cache overflow",
+            "Cache capacity has overflown",
+        ] {
+            assert!(
+                rollback_reason_is_cache_pressure(reason),
+                "should read as cache pressure: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrency_rollback_reasons_stay_write_conflicts() {
+        // These must NOT be re-mapped: they are genuine races between
+        // operations, and the caller's retry is what resolves them. Calling one
+        // of these TransactionTooLargeForCache would turn a retryable conflict
+        // into a hard, non-retryable error.
+        for reason in [
+            "conflict between concurrent operations",
+            "conflict with a prepared update",
+            "transaction requires rollback: WT_ROLLBACK",
+            "",
+        ] {
+            assert!(
+                !rollback_reason_is_cache_pressure(reason),
+                "should stay a write conflict: {reason}"
+            );
+        }
+    }
+
+    /// A tombstone left by a crash mid-purge (phase 1 committed: registry row
+    /// gone, rows orphaned) is finished at the next open — the orphan rows
+    /// must not resurface under a re-created name. WT-backed (the only test
+    /// in this module that is): forging the crash-left state needs direct
+    /// access to the private tables.
+    #[test]
+    fn interrupted_drop_recovers_at_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "secantus-droprecover-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t").len()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let home = dir.to_str().unwrap().to_string();
+        {
+            let st = Storage::open(&home).unwrap();
+            let docs: Vec<Vec<u8>> = (0..50i64)
+                .map(|i| bson::to_vec(&doc! {"_id": i, "x": i}).unwrap())
+                .collect();
+            st.insert("app", "c", docs, true).unwrap();
+            st.create_index("app", "c", "x_1", &doc! {"x": 1i32}, &Document::new())
+                .unwrap();
+            // Forge the crash-left state: phase 1's effects (registry row
+            // removed, tombstone written) without the phase-2 purge.
+            let session = st.conn.open_session().unwrap();
+            let rc = session.open_cursor(COLL_TABLE, None).unwrap();
+            rc.set_key_ss("app", "c");
+            rc.search().unwrap();
+            rc.remove().unwrap();
+            let t = session.open_cursor(TOMB_TABLE, None).unwrap();
+            t.set_key_ss("app", "c");
+            t.set_value_u(b"");
+            t.insert().unwrap();
+        }
+        let st = Storage::open(&home).unwrap();
+        // Recovery purged the orphans: a re-created collection sees only its
+        // own rows (orphaned doc rows would inflate the scan), and the
+        // tombstone is gone.
+        st.insert(
+            "app",
+            "c",
+            vec![bson::to_vec(&doc! {"_id": 100i64}).unwrap()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(st.count_matching("app", "c", &doc! {}, None).unwrap(), 1);
+        {
+            let session = st.conn.open_session().unwrap();
+            let t = session.open_cursor(TOMB_TABLE, None).unwrap();
+            t.set_key_ss("app", "c");
+            assert!(t.search().is_err(), "tombstone must be cleared");
+        }
+        drop(st);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `doc_shard_hash` must be byte-for-byte identical to the Python
     /// `storage._doc_shard_hash` so a collection routes to the same documents
     /// shard in both servers (cross-server backup / PITR portability). Values
@@ -9403,7 +12420,35 @@ mod tests {
     /// `DEFAULT_CONFIG` string so `Storage::open` behaviour is unchanged.
     #[test]
     fn wt_config_matches_default() {
-        assert_eq!(wt_config("256M", 1000, false, "128MB"), DEFAULT_CONFIG);
+        assert_eq!(wt_config("4G", 1000, false, "128MB"), DEFAULT_CONFIG);
+    }
+
+    /// New tables are created with lz4 — the compressor sweep measured it at
+    /// +86% throughput and -97% p99.9 against zlib (tasks/backlog.md).
+    #[test]
+    fn value_heavy_tables_default_to_lz4() {
+        for cfg in [DOC_TABLE_CFG, QU_COMPRESSED_CFG] {
+            #[cfg(not(target_os = "windows"))]
+            assert!(cfg.contains("block_compressor=lz4"), "{cfg}");
+            #[cfg(target_os = "windows")]
+            assert!(!cfg.contains("block_compressor"), "{cfg}");
+        }
+    }
+
+    /// `block_compressor` is recorded per table at CREATE time, so a store
+    /// written before the lz4 switch has zlib tables and can only be opened
+    /// while the zlib extension is still linked. Dropping zlib from the
+    /// WiredTiger build would make existing user data unreadable — this test
+    /// exists so that stays a deliberate decision rather than a cleanup.
+    #[test]
+    fn zlib_must_remain_available_for_legacy_tables() {
+        let cfg = wt_config("4G", 1000, false, "128MB");
+        // The connection config never names a compressor; availability comes
+        // from the WiredTiger build (HAVE_BUILTIN_EXTENSION_ZLIB in
+        // CMakeLists.txt) and the link libs in secantus-wt/build.rs. Assert the
+        // contract the storage layer depends on: nothing here pins the engine
+        // to a single compressor, so a mixed zlib/lz4 store stays openable.
+        assert!(!cfg.contains("block_compressor"), "{cfg}");
     }
 
     /// `extract_key_format` pulls the format token out of a WT metadata line,
@@ -9918,6 +12963,7 @@ mod tests {
                 &empty,
                 None,
                 None,
+                false,
             )
             .unwrap();
             s.delete_matching("app", "c", &doc! {"_id": 2i32}, 1, &empty, None)
@@ -10010,6 +13056,8 @@ mod tests {
                 true,
             )
             .unwrap();
+            // Async lane: read-after-write needs the drainer flushed.
+            s.flush_oplog();
             s.read_oplog(1, 100)
                 .unwrap()
                 .iter()
@@ -10116,9 +13164,23 @@ mod tests {
         for i in 0..total {
             s.insert("app", "c", vec![enc(i)], true).unwrap();
         }
-        // The opportunistic prune at the OPLOG_PRUNE_INTERVAL-th emit trimmed the
-        // oplog to the 10-entry cap; only the handful of writes after it remain.
-        let live = s.read_oplog(1, 1_000_000).unwrap().len();
+        // The opportunistic prune at the OPLOG_PRUNE_INTERVAL-th emit (sync:
+        // writer-side, synchronous; async: drainer-side as rows land) trims
+        // the oplog to the 10-entry cap; only the handful of writes after it
+        // remain. In async mode the cadence sweep runs CONCURRENTLY on the
+        // drainer thread — `flush_oplog` guarantees the rows landed, not that
+        // an in-flight sweep's deletes finished — so poll briefly: the
+        // invariant is "write volume alone eventually bounds the oplog".
+        // Sync mode passes on the first iteration.
+        s.flush_oplog();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let live = loop {
+            let live = s.read_oplog(1, 1_000_000).unwrap().len();
+            if live <= 50 || std::time::Instant::now() >= deadline {
+                break live;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         assert!(
             live <= 50,
             "oplog not opportunistically pruned: {live} live rows after {total} writes"

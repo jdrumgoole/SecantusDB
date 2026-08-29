@@ -147,9 +147,11 @@ server. The remaining *feature* differences (full three-way matrix in the
 
 - **SQL / PostgreSQL frontend** — the PG wire listener (`secantusd-py-pg`)
   is Python-server-only.
-- **`mapReduce` and `top`** — the Python server ships a minimal `mapReduce`
-  (`{out: {inline: 1}}` only) and a zero-counter `top`; the Rust server
-  answers `CommandNotFound` for both.
+- **`mapReduce`** — the Python server ships a minimal `mapReduce`
+  (`{out: {inline: 1}}` only); the Rust server answers `CommandNotFound`.
+  Both servers now answer `top` with the mongod-shaped reply (counters are
+  always zero — there is no per-namespace instrumentation), so `mongotop`
+  runs against either.
 - **Point-in-time restore over the wire** — `secantusAdmin.restoreToTimestamp`
   is Python-server-only; the Rust server does the same restore via the
   `secantusd-rs restore` CLI subcommand.

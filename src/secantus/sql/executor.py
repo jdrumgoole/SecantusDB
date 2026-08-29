@@ -8,8 +8,10 @@ the planner stays pure translation.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import operator
+import re
 import threading
 import weakref
 from typing import Any
@@ -17,7 +19,7 @@ from typing import Any
 import bson
 
 from secantus.paths import get_path, has_path
-from secantus.sql import errors, planner, typemap
+from secantus.sql import errors, planner, subms, typemap
 from secantus.sql.catalog import USER_TYPE_ARRAY_OID_OFFSET, Catalog
 from secantus.sql.result import ColumnDesc, SQLResult
 
@@ -108,7 +110,11 @@ def _order_key_fn(
     def key_of(doc: Any) -> tuple:
         out = []
         for field_path, _, _ in order:
-            value = get_path(doc, field_path)
+            # A timestamp's microseconds live in a hidden companion (see
+            # `secantus.sql.subms`); without them the sort key is only
+            # millisecond-granular and rows inside one millisecond come back in
+            # storage order.
+            value = _subms(doc, field_path)
             omap = ordinals.get(field_path)
             if omap is not None and value is not None:
                 value = omap.get(value, len(omap))  # unknown label sorts last
@@ -134,8 +140,19 @@ def _resolve_user_type_column(col: Any, catalog: Catalog, db: str) -> Any:
     if catalog.enum_exists(db, name):
         return col
     if typemap.is_array_tag(col.type_tag):
-        # Only enum arrays are supported as user-type array columns; a
-        # composite/domain rewrite would lose the array shape.
+        # An array of a declared composite (``custom[]`` — pgjdbc's
+        # DatabaseMetaDataTest customtable) stores a list of subdocuments and
+        # reports the composite's minted array-companion oid. Other user-type
+        # arrays (domains) stay unsupported.
+        composite = catalog.get_composite(db, name)
+        if composite is not None:
+            return dataclasses.replace(
+                col,
+                enum_type=None,
+                composite_type=name,
+                composite_fields=tuple(composite),
+                type_tag="composite[]",
+            )
         raise errors.SQLError("42704", f'type "{name}[]" does not exist')
     composite = catalog.get_composite(db, name)
     if composite is not None:
@@ -151,6 +168,19 @@ def _resolve_user_type_column(col: Any, catalog: Catalog, db: str) -> Any:
         )
     domain = catalog.get_domain(db, name)
     if domain is None:
+        # A TABLE's name is also its ROW TYPE (typtype 'c') in PG — a column
+        # declared ``col rsmd1`` where rsmd1 is a table stores that row shape
+        # (pgjdbc's ResultSetMetaDataTest builds its compositetest this way).
+        rel = catalog.get(db, name)
+        if rel is not None and getattr(rel, "columns", None):
+            fields = tuple((c.name, c.type_tag, None) for c in rel.columns)
+            return dataclasses.replace(
+                col,
+                enum_type=None,
+                composite_type=name,
+                composite_fields=fields,
+                type_tag="composite",
+            )
         raise errors.SQLError("42704", f'type "{name}" does not exist')
     inherit_default = not col.has_default and bool(domain.get("has_default"))
     return dataclasses.replace(
@@ -163,13 +193,63 @@ def _resolve_user_type_column(col: Any, catalog: Catalog, db: str) -> Any:
     )
 
 
+def unique_index_name(constraint_name: str) -> str:
+    """The storage index backing a UNIQUE constraint takes the constraint's own
+    name, which is also what Postgres calls the index it creates for one — so
+    catalog reflection reports a single index, not the constraint's plus a
+    differently-named implementation detail."""
+    return constraint_name
+
+
+def _create_unique_index(storage: Any, db: str, table: planner.TableDef, uq: Any) -> None:
+    """Back a SQL UNIQUE constraint with a storage unique index.
+
+    The constraint was upheld only by a probe read before writing, which cannot
+    see a value another transaction committed after the writer's snapshot, nor
+    one a second writer is inserting right now — so duplicates were stored. The
+    storage index makes WiredTiger the arbiter instead.
+
+    NULLs are distinct in SQL — any number of them satisfy a UNIQUE constraint,
+    and a multi-column constraint is unconstrained if ANY of its columns is NULL
+    — whereas a Mongo unique index would collide them. A partial filter
+    excluding NULL from every column reproduces the SQL rule. Sparse would not:
+    a SQL NULL is stored as an explicit null, not a missing field.
+    """
+    if getattr(uq, "deferrable", False):
+        # A DEFERRABLE constraint may be violated transiently inside a
+        # transaction and is only judged at COMMIT — swapping two values is the
+        # classic case. An index enforcing on every write would reject the
+        # intermediate state, so those keep the deferred check instead.
+        return
+    fields = [table.field_for(c) for c in uq.columns]
+    if not fields:
+        return
+    key_spec = dict.fromkeys(fields, 1)
+    clauses = [{f: {"$ne": None}} for f in fields]
+    partial = clauses[0] if len(clauses) == 1 else {"$and": clauses}
+    storage.create_index(
+        db,
+        table.collection,
+        unique_index_name(uq.name),
+        key_spec,
+        {"unique": True, "partialFilterExpression": partial},
+    )
+
+
 def execute_create_table(
     plan: planner.CreateTablePlan, catalog: Catalog, storage: Any, db: str
 ) -> SQLResult:
     if catalog.exists(db, plan.table.name):
         if plan.if_not_exists:
             return SQLResult(command_tag="CREATE TABLE")
-        raise errors.duplicate_table(plan.table.name)
+        # A temp table's catalog key carries its session namespace; the error
+        # names the bare relation like real PG ('relation "foo" already exists').
+        name = plan.table.name
+        raise errors.duplicate_table(name.split(".", 1)[1] if plan.table.temp else name)
+    if "." in plan.table.name and not plan.table.temp:
+        schema = plan.table.name.split(".", 1)[0]
+        if not catalog.schema_exists(db, schema):
+            raise errors.SQLError("3F000", f'schema "{schema}" does not exist')
     # A user-defined column type (the planner records it as ``enum_type``, since
     # it can't reach storage to tell enum from domain) must resolve to a declared
     # enum *or* domain — else 42704. A domain column adopts the domain's base tag
@@ -177,6 +257,8 @@ def execute_create_table(
     plan.table.columns = [_resolve_user_type_column(col, catalog, db) for col in plan.table.columns]
     catalog.put(db, plan.table)
     storage.create_collection(db, plan.table.collection)
+    for uq in plan.table.unique_constraints:
+        _create_unique_index(storage, db, plan.table, uq)
     # Auto-create the sequence behind each SERIAL column (owned by the table).
     for seq in plan.sequences:
         catalog.create_sequence(
@@ -197,6 +279,7 @@ def execute_drop_table(
         if plan.if_exists:
             return SQLResult(command_tag="DROP TABLE")
         raise errors.undefined_table(plan.name)
+    catalog.drop_triggers_for_table(db, plan.name)  # triggers die with the table
     catalog.drop(db, plan.name)
     storage.drop_collection(db, table.collection)
     # Drop any sequences the table owned (SERIAL columns).
@@ -226,6 +309,59 @@ def execute_alter_table(
     return SQLResult(command_tag="ALTER TABLE")
 
 
+def _add_primary_key(
+    table: Any, cols: list[str], con_name: str | None, storage: Any, db: str
+) -> None:
+    """Apply ``ADD PRIMARY KEY`` to an existing table: every row's ``_id`` is
+    rewritten to the key column value(s) (single column → scalar ``_id``,
+    composite → subdocument), after NOT NULL and uniqueness validation."""
+    import dataclasses
+
+    from secantus.sql import planner
+
+    if table.pk_columns:
+        raise errors.SQLError(
+            "42P16", f'multiple primary keys for table "{table.name}" are not allowed'
+        )
+    for c in cols:
+        if table.column(c) is None:
+            raise errors.undefined_column(c)
+    docs = storage.find_matching(db, table.collection, {})
+    seen: set[str] = set()
+    new_docs = []
+    for doc in docs:
+        vals = []
+        for c in cols:
+            v = doc.get(c)
+            if v is None:
+                raise errors.SQLError(
+                    "23502",
+                    f'column "{c}" of relation "{table.name}" contains null values',
+                )
+            vals.append(v)
+        new_id: Any = vals[0] if len(cols) == 1 else dict(zip(cols, vals, strict=True))
+        key = repr(new_id)
+        if key in seen:
+            raise errors.SQLError(
+                "23505",
+                f'could not create unique index "{con_name or table.name + "_pkey"}" '
+                "— duplicate key values",
+            )
+        seen.add(key)
+        nd = {k: v for k, v in doc.items() if k not in cols and k != "_id"}
+        nd["_id"] = new_id
+        new_docs.append(nd)
+    storage.delete_matching(db, table.collection, {})
+    if new_docs:
+        storage.insert(db, table.collection, new_docs)
+    table.columns = [
+        planner._with_pk(dataclasses.replace(c, nullable=False) if c.name in cols else c, cols)
+        for c in table.columns
+    ]
+    table.pk_name = con_name
+    table.pk_column_order = tuple(cols) if len(cols) > 1 else None
+
+
 def execute_comment(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLResult:
     """``COMMENT ON TABLE t IS '…'`` / ``COMMENT ON COLUMN t.c IS '…'`` — store the
     comment in the catalog so it reflects via ``pg_description`` (SQLAlchemy's
@@ -240,15 +376,23 @@ def execute_comment(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLRe
     if text == planner.UNCOMMENT_SENTINEL:
         text = None
     if kind == "TABLE":
-        table = catalog.get(db, stmt.this.name)
+        _tn = (
+            planner.qualified_table_name(stmt.this)
+            if hasattr(stmt.this, "args")
+            else stmt.this.name
+        )
+        table = catalog.get(db, _tn)
         if table is None:
-            raise errors.undefined_table(stmt.this.name)
+            raise errors.undefined_table(_tn)
         table.comment = text
         catalog.replace(db, table)
         return SQLResult(command_tag="COMMENT")
     if kind == "COLUMN":
-        col_node = stmt.this  # exp.Column: table.col
-        tname, cname = col_node.table, col_node.name
+        col_node = stmt.this  # exp.Column: [schema.]table.col
+        cname = col_node.name
+        _schema = col_node.args.get("db")
+        _sname = _schema.name if _schema is not None else None
+        tname = f"{_sname}.{col_node.table}" if _sname and _sname != "public" else col_node.table
         table = catalog.get(db, tname)
         if table is None:
             raise errors.undefined_table(tname)
@@ -259,28 +403,159 @@ def execute_comment(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLRe
         ]
         catalog.replace(db, table)
         return SQLResult(command_tag="COMMENT")
+    if kind == "FUNCTION":
+        # ``COMMENT ON FUNCTION f([argtypes]) IS '…'`` — store on the function
+        # doc for pg_description reflection. The arg list picks the overload
+        # by arity; the bare-name form comments the sole overload.
+        node = stmt.this
+        nargs: int | None = None
+        if isinstance(node, exp.UserDefinedFunction):
+            nargs = len(node.args.get("expressions") or [])
+            node = node.this
+        fname = node.name.lower()
+        target = None
+        if nargs is not None:
+            target = catalog.get_function(db, fname, nargs)
+        else:
+            matches = [f for f in catalog.list_functions(db) if f["name"].lower() == fname]
+            if len(matches) == 1:
+                target = matches[0]
+            elif len(matches) > 1:
+                raise errors.SQLError("42725", f'function name "{fname}" is not unique')
+        if target is None:
+            raise errors.SQLError("42883", f"function {fname} does not exist")
+        target = {k: v for k, v in target.items() if k != "_id"}
+        target["comment"] = text
+        catalog.put_function(db, target)
+        return SQLResult(command_tag="COMMENT")
+    if kind == "INDEX":
+        # ``COMMENT ON INDEX idx IS '…'`` — stored keyed by index name and
+        # surfaced through pg_description on the index relation's oid
+        # (pgjdbc's getIndexInfo REMARKS join; remarkIndexInfo).
+        iname = stmt.this.name
+        known = {
+            ix.get("name")
+            for tn in catalog.list_tables(db)
+            if (t := catalog.get(db, tn)) is not None
+            for ix in storage.list_indexes(db, t.collection)
+        }
+        if iname not in known:
+            raise errors.SQLError("42704", f'relation "{iname}" does not exist')
+        catalog.set_index_comment(db, iname, text)
+        return SQLResult(command_tag="COMMENT")
     raise errors.feature_not_supported(f"COMMENT ON {kind} is not supported")
+
+
+def _view_star_columns(select: Any, catalog: Catalog, storage: Any, db: str) -> list[Any]:
+    """``select``'s output expressions with any ``*`` expanded to real columns.
+
+    A declared column list has to be matched up positionally against the view's
+    output columns, so ``CREATE VIEW v (v1, v2) AS SELECT * FROM t`` has to know
+    what ``*`` stands for. Postgres resolves the star once, at creation — adding
+    a column to ``t`` afterwards does NOT add it to ``v`` (probed against 14) —
+    so freezing the expansion here matches it. Raises when a star's source isn't
+    a plain table (a subquery / VALUES / SRF), rather than guessing.
+    """
+    from sqlglot import exp as _exp
+
+    from secantus.sql import reflect
+
+    out: list[Any] = []
+    for e in select.expressions:
+        is_star = isinstance(e, _exp.Star) or (
+            isinstance(e, _exp.Column) and isinstance(e.this, _exp.Star)
+        )
+        if not is_star:
+            out.append(e)
+            continue
+        qualifier = e.table if isinstance(e, _exp.Column) else None
+        # This statement's OWN sources: ``find_all`` would also descend into a
+        # subquery in the WHERE and expand that table's columns into the view.
+        from_node = select.args.get("from_") or select.args.get("from")
+        holders = ([from_node] if from_node is not None else []) + list(
+            select.args.get("joins") or []
+        )
+        sources = [h.this for h in holders if isinstance(h.this, _exp.Table)]
+        if not sources or len(sources) != len(holders):
+            raise errors.feature_not_supported(
+                "CREATE VIEW with a column list over a non-table source is not supported"
+            )
+        for src in sources:
+            alias = src.alias or src.name
+            if qualifier and alias != qualifier:
+                continue
+            qn = planner.qualified_table_name(src)
+            tdef = catalog.get(db, qn) or reflect.reflect(storage, db, qn)
+            if tdef is None:
+                raise errors.SQLError("42P01", f'relation "{qn}" does not exist')
+            for c in tdef.columns:
+                out.append(_exp.column(c.name, table=alias))
+    return out
+
+
+def _apply_view_column_names(
+    select: Any, names: list[str], catalog: Catalog, storage: Any, db: str
+) -> Any:
+    """Rename ``select``'s outputs to the view's declared column names.
+
+    Postgres applies them positionally and stores the rewritten query — a view
+    declared ``v (x)`` over ``SELECT a, b`` renders as ``SELECT a AS x, b``, so
+    surplus outputs keep their own names while surplus *names* are an error
+    (both probed against 14).
+    """
+    from sqlglot import exp as _exp
+
+    exprs = _view_star_columns(select, catalog, storage, db)
+    if len(names) > len(exprs):
+        raise errors.SQLError("42601", "CREATE VIEW specifies more column names than columns")
+    aliased = list(exprs)
+    for i, nm in enumerate(names):
+        inner = aliased[i]
+        inner = inner.this if isinstance(inner, _exp.Alias) else inner
+        aliased[i] = _exp.alias_(inner.copy(), nm)
+    out = select.copy()
+    out.set("expressions", aliased)
+    return out
 
 
 def execute_create_view(
     stmt: Any, catalog: Catalog, storage: Any, db: str, check_option: str | None = None
 ) -> SQLResult:
-    """``CREATE [OR REPLACE] VIEW v AS SELECT … [WITH [LOCAL|CASCADED] CHECK
-    OPTION]`` — store the SELECT definition. Querying the view expands it as a
-    subquery (see ``engine._expand_views``); ``check_option`` (``"LOCAL"`` /
-    ``"CASCADED"``) is enforced on write-through against each written row."""
-    name = stmt.this.name
+    """``CREATE [OR REPLACE] VIEW v [(cols)] AS SELECT … [WITH [LOCAL|CASCADED]
+    CHECK OPTION]`` — store the SELECT definition. Querying the view expands it
+    as a subquery (see ``engine._expand_views``); ``check_option`` (``"LOCAL"`` /
+    ``"CASCADED"``) is enforced on write-through against each written row.
+
+    A declared column list parses as a ``Schema`` node wrapping the name, so the
+    name is unwrapped from it — reading it straight off produced an empty view
+    name, and the view was filed under "" while CREATE VIEW still reported
+    success (every later reference then failed as an undefined relation)."""
+    from sqlglot import exp as _exp
+
+    name_node = stmt.this
+    column_names: list[str] = []
+    if isinstance(name_node, _exp.Schema):
+        column_names = [c.name for c in name_node.expressions]
+        name_node = name_node.this
+    name = planner.qualified_table_name(name_node)
     replace = bool(stmt.args.get("replace"))
     if catalog.exists(db, name):
         raise errors.SQLError("42P07", f'relation "{name}" already exists')
     if not replace and catalog.get_view(db, name) is not None:
         raise errors.SQLError("42P07", f'relation "{name}" already exists')
-    catalog.put_view(db, name, stmt.expression.sql(dialect="postgres"), check_option=check_option)
+    body = stmt.expression
+    if column_names:
+        if not isinstance(body, _exp.Select):
+            raise errors.feature_not_supported(
+                "CREATE VIEW with a column list is supported for SELECT bodies only"
+            )
+        body = _apply_view_column_names(body, column_names, catalog, storage, db)
+    catalog.put_view(db, name, body.sql(dialect="postgres"), check_option=check_option)
     return SQLResult(command_tag="CREATE VIEW")
 
 
 def execute_drop_view(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLResult:
-    name = stmt.this.name
+    name = planner.qualified_table_name(stmt.this)
     if not catalog.drop_view(db, name) and not stmt.args.get("exists"):
         raise errors.SQLError("42P01", f'view "{name}" does not exist')
     return SQLResult(command_tag="DROP VIEW")
@@ -331,6 +606,9 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
             )
         table.foreign_keys = [c for c in table.foreign_keys if c.name != name]
         table.check_constraints = [c for c in table.check_constraints if c.name != name]
+        for _uq in [c for c in table.unique_constraints if c.name == name]:
+            with contextlib.suppress(Exception):
+                storage.drop_index(db, table.collection, unique_index_name(_uq.name))
         table.unique_constraints = [c for c in table.unique_constraints if c.name != name]
         return
     if isinstance(action, exp.Drop):  # DROP COLUMN [IF EXISTS] name
@@ -388,12 +666,18 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
         if col is None:
             raise errors.undefined_column(name)
         if action.args.get("dtype") is not None:  # TYPE t — retype in the catalog
-            tag = typemap.type_tag_for_sql(action.args["dtype"])
+            dtype = action.args["dtype"]
+            tag = typemap.type_tag_for_sql(dtype)
             if tag is None:
-                raise errors.feature_not_supported(
-                    f"unsupported column type: {action.args['dtype'].sql()}"
-                )
-            new_col = dataclasses.replace(col, type_tag=tag)
+                raise errors.feature_not_supported(f"unsupported column type: {dtype.sql()}")
+            # The declared identity has to be recomputed, not inherited: a column
+            # retyped from ``char(8)`` to ``text`` kept reporting bpchar/12 in
+            # RowDescription (pgtest row_description reads it after an ALTER).
+            identity = typemap.cast_type_identity(dtype)
+            decl_oid, typmod = identity if identity is not None else (None, -1)
+            new_col = dataclasses.replace(
+                col, type_tag=tag, decl_oid=decl_oid, typmod=typmod, json_plain=decl_oid == 114
+            )
         elif action.args.get("default") is not None:  # SET DEFAULT <literal | expr>
             node = action.args["default"]
             has_def, value = planner._literal_default(node, col.type_tag)
@@ -443,12 +727,43 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
                     planner.make_check_constraint(node, table.name, con_name)
                 )
             elif isinstance(node, exp.UniqueColumnConstraint):
-                table.unique_constraints.append(
-                    planner.make_unique_constraint(node, table.name, con_name)
-                )
+                added = planner.make_unique_constraint(node, table.name, con_name)
+                table.unique_constraints.append(added)
+                # Back it with a storage index like CREATE TABLE does, or a
+                # constraint added later would be the only one still relying on
+                # the probe alone.
+                _create_unique_index(storage, db, table, added)
+            elif isinstance(node, exp.PrimaryKey):
+                # ``ALTER TABLE t ADD [CONSTRAINT c] PRIMARY KEY (cols)`` —
+                # validates NOT NULL + uniqueness, re-keys every row from the
+                # auto-assigned ``_id`` onto the column value(s), and updates
+                # the catalog mapping (pgbench -i's post-load step).
+                pk_cols = [planner._column_name(c) for c in node.expressions]
+                _add_primary_key(table, pk_cols, con_name, storage, db)
             else:
                 raise errors.feature_not_supported(f"unsupported ADD CONSTRAINT: {action.sql()}")
         return
+    if type(action).__name__ == "Command":
+        # ``ALTER TABLE t DROP name`` (no COLUMN keyword — valid PG; pgjdbc's
+        # droppedColumns test) exceeds sqlglot's action parser and lands here
+        # as a raw Command. Re-parse with the keyword and apply that action.
+        import re as _re
+
+        from secantus.sql import planner as _planner
+
+        m = _re.match(
+            r"(?is)^\s*DROP\s+(?!COLUMN\b|CONSTRAINT\b)(?P<ie>IF\s+EXISTS\s+)?"
+            r'(?P<col>"[^"]+"|[A-Za-z_]\w*)\s*(?:CASCADE|RESTRICT)?\s*$',
+            action.sql(),
+        )
+        if m is not None:
+            ie = "IF EXISTS " if m.group("ie") else ""
+            reparsed = _planner.parse(
+                f'ALTER TABLE "{table.name}" DROP COLUMN {ie}{m.group("col")}'
+            )[0]
+            for sub in reparsed.args.get("actions") or []:
+                _apply_alter_action(sub, table, storage, db)
+            return
     raise errors.feature_not_supported(f"unsupported ALTER TABLE action: {action.sql()}")
 
 
@@ -470,6 +785,8 @@ def execute_create_index(
         options["unique"] = True
     if plan.partial_filter:
         options["partialFilterExpression"] = plan.partial_filter
+    if plan.include:
+        options["include"] = list(plan.include)
     storage.create_index(db, plan.collection, plan.name, plan.key_spec, options or None)
     return SQLResult(command_tag="CREATE INDEX")
 
@@ -541,8 +858,64 @@ def _drop_expr_index(table: Any, index_name: str, catalog: Catalog, storage: Any
             )
 
 
+def _source_column_identity(table: Any, storage: Any, db: str | None) -> tuple[int, dict[str, int]]:
+    """``(table_oid, {column_name: attnum})`` for a result's base table.
+
+    RowDescription reports these per column, and a JDBC updatable ResultSet
+    resolves each result column back to its base column through them. Sending
+    0/0 left it unable to, so ``updateRow()`` emitted ``SET "" = ?``. Returns
+    ``(0, {})`` when there is no single base table (a reflected collection has
+    no pg_class row, and a computed column has no source column anyway).
+    """
+    if table is None or storage is None or db is None or getattr(table, "reflected", False):
+        return 0, {}
+    from secantus.sql import virtual
+
+    try:
+        oid = virtual._table_oids(db, Catalog(storage)).get(table.name, 0)
+    except Exception:  # pragma: no cover - catalog unavailable
+        return 0, {}
+    return oid, {c.name: i + 1 for i, c in enumerate(table.columns)}
+
+
+def _view_oid(name: str, storage: Any, db: str | None) -> int:
+    """The minted pg_class oid for view ``name``, or 0 when it can't be resolved."""
+    if storage is None or db is None:
+        return 0
+    from secantus.sql import virtual
+
+    try:
+        return virtual._view_oids(db, Catalog(storage)).get(name, 0)
+    except Exception:  # pragma: no cover - catalog unavailable
+        return 0
+
+
+def _subms(doc: dict[str, Any], field: str) -> Any:
+    """``doc``'s value at ``field`` with its sub-millisecond remainder restored.
+
+    The companion only exists for timestamp columns with a non-zero remainder,
+    and `subms.merge` ignores anything that is not a datetime, so this is a
+    no-op everywhere else.
+    """
+    return subms.merge(get_path(doc, field), doc.get(subms.companion_field(field)))
+
+
+def _with_subms(doc: dict[str, Any], col: Any) -> Any:
+    """``col``'s stored value with its sub-millisecond remainder added back.
+
+    BSON dates hold whole milliseconds, so a ``timestamp`` column's microseconds
+    are carried in a hidden companion field (see `secantus.sql.subms`). Only the
+    paths that still have the whole document can restore them — a value already
+    projected through the aggregation pipeline has lost the companion.
+    """
+    value = get_path(doc, col.field)
+    if getattr(col, "type_tag", None) not in subms.SUBMS_TAGS:
+        return value
+    return subms.merge(value, doc.get(subms.companion_field(col.field)))
+
+
 def _out_column_descs(
-    cols: list[tuple[str, Any]], storage: Any, db: str | None
+    cols: list[tuple[str, Any]], storage: Any, db: str | None, table: Any = None
 ) -> list[ColumnDesc]:
     """Describe ``(out_name, Column)`` output pairs for a result.
 
@@ -552,9 +925,17 @@ def _out_column_descs(
     recognises result columns. The value bytes are the label text either way
     (an enum's binary wire form IS its text), so only the oid changes."""
     enum_oids: dict[str, int] | None = None
+    table_oid, attnums = _source_column_identity(table, storage, db)
     out: list[ColumnDesc] = []
     for name, col in cols:
         oid = typemap.PG_OID.get(col.type_tag, 25)
+        # A declared identity (varchar/bpchar fold to text for storage but
+        # reflect their real oid; numeric/timestamp precision rides the
+        # atttypmod) — JDBC derives display size and scale from these.
+        decl = getattr(col, "decl_oid", None)
+        if decl:
+            oid = decl
+        typmod = getattr(col, "typmod", -1)
         if getattr(col, "json_plain", False):
             oid = 114  # a ``json`` (not jsonb) column keeps the plain-json oid
         if (
@@ -568,8 +949,20 @@ def _out_column_descs(
             from secantus.sql import virtual
 
             minted = virtual._composite_oids(db, Catalog(storage)).get(col.composite_type)
+            if minted is None:
+                # A column typed by a TABLE's row type: report the table's
+                # rowtype oid — its pg_type row has typtype 'c', which is what
+                # pgjdbc's getSQLType maps to java.sql.Types.STRUCT (generic
+                # RECORD/2249 mapped to OTHER — ResultSetMetaDataTest's
+                # testComposite trio).
+                minted = virtual._table_rowtype_oids(db, Catalog(storage)).get(col.composite_type)
             if minted is not None:
-                oid = minted
+                # A composite-array column reports the minted array-companion
+                # oid, same scheme as enum arrays.
+                if typemap.is_array_tag(col.type_tag):
+                    oid = minted + USER_TYPE_ARRAY_OID_OFFSET
+                else:
+                    oid = minted
         if getattr(col, "enum_type", None) is not None and storage is not None and db is not None:
             if enum_oids is None:
                 enum_oids = Catalog(storage).enum_type_oids(db)
@@ -581,7 +974,17 @@ def _out_column_descs(
                     oid = enum_oid + USER_TYPE_ARRAY_OID_OFFSET
                 else:
                     oid = enum_oid
-        out.append(ColumnDesc(name, col.type_tag, oid))
+        attnum = attnums.get(getattr(col, "name", ""), 0)
+        out.append(
+            ColumnDesc(
+                name,
+                col.type_tag,
+                oid,
+                typmod,
+                table_oid=table_oid if attnum else 0,
+                attnum=attnum,
+            )
+        )
     return out
 
 
@@ -590,12 +993,44 @@ def _tagged_out_column_descs(
     enum_types: dict[int, str],
     storage: Any,
     db: str | None,
+    *,
+    out_exprs: list | None = None,
+    base_table: Any = None,
+    out_sources: list[tuple[Any, int] | None] | None = None,
 ) -> list[ColumnDesc]:
     """Describe ``(out_name, type_tag)`` output pairs (the pipeline/evaluated
     plans' string-tag form). ``enum_types`` maps output positions to enum type
     names — the tag alone can't carry the identity (labels are stored as text) —
-    so those positions resolve the minted enum oid like `_out_column_descs`."""
+    so those positions resolve the minted enum oid like `_out_column_descs`.
+
+    ``out_exprs`` + ``base_table`` (single-table evaluated plans) attribute
+    bare-column outputs to their source table/attnum — JDBC's
+    getBaseColumnName resolves aliases through these RowDescription fields,
+    and a computed projection in the list must not strip the identity from
+    its plain-column siblings (ResultSetMetaDataTest's base-column asserts).
+
+    ``out_sources`` carries the same identity per output position for plans with
+    no single base table (a JOIN): ``(TableDef, attnum)`` or None. It takes
+    precedence over the ``base_table`` derivation where both are present."""
+    from sqlglot import exp as _exp
+
     enum_oids: dict[str, int] | None = None
+    table_oid, attnums = _source_column_identity(base_table, storage, db)
+    identities: dict[int, tuple[int, dict[str, int]]] = {}
+
+    def _identity_of(tdef: Any) -> tuple[int, dict[str, int]]:
+        """``_source_column_identity`` memoised per joined table (the oid lookup
+        reflects the whole catalog, so a wide join would repeat it per column).
+        A ``ViewSource`` resolves through the view oid range instead — a view has
+        no ``TableDef``, but it is a relation and reports its own pg_class oid."""
+        key = id(tdef)
+        if key not in identities:
+            if isinstance(tdef, planner.ViewSource):
+                identities[key] = (_view_oid(tdef.name, storage, db), {})
+            else:
+                identities[key] = _source_column_identity(tdef, storage, db)
+        return identities[key]
+
     out: list[ColumnDesc] = []
     for i, (name, tag) in enumerate(cols):
         oid = typemap.PG_OID.get(tag, 25)
@@ -608,7 +1043,39 @@ def _tagged_out_column_descs(
                 oid = (
                     enum_oid + USER_TYPE_ARRAY_OID_OFFSET if typemap.is_array_tag(tag) else enum_oid
                 )
-        out.append(ColumnDesc(name, tag, oid))
+        attnum = 0
+        typmod = -1
+        src_table = base_table
+        col_table_oid = table_oid
+        if out_sources is not None and i < len(out_sources) and out_sources[i] is not None:
+            src_table, src_attnum = out_sources[i]  # type: ignore[misc]
+            col_table_oid, _ = _identity_of(src_table)
+            attnum = src_attnum if col_table_oid else 0
+        elif col_table_oid and out_exprs is not None and i < len(out_exprs):
+            expr = out_exprs[i]
+            if isinstance(expr, _exp.Column):
+                attnum = attnums.get(expr.name, 0)
+        src_columns = getattr(src_table, "columns", None)
+        if attnum and src_columns and attnum <= len(src_columns):
+            # The evaluated plans carry only string tags, so the declared
+            # identity (varchar's 1043, numeric's precision typmod) comes from
+            # the source table's column def. A view source has no column defs —
+            # its outputs keep the tag-derived identity.
+            src = src_columns[attnum - 1]
+            decl = getattr(src, "decl_oid", None)
+            if decl and enum_types.get(i) is None:
+                oid = decl
+            typmod = getattr(src, "typmod", -1)
+        out.append(
+            ColumnDesc(
+                name,
+                tag,
+                oid,
+                typmod,
+                table_oid=col_table_oid if attnum else 0,
+                attnum=attnum,
+            )
+        )
     return out
 
 
@@ -636,7 +1103,7 @@ def _returning_result(
 
     def cell(doc: dict[str, Any], col: Any, expr: Any) -> Any:
         if expr is None:
-            return typemap.to_py(get_path(doc, col.field), col.type_tag)
+            return typemap.to_py(_with_subms(doc, col), col.type_tag)
         from secantus.sql import scalar
 
         def scope(node: Any) -> Any:
@@ -646,6 +1113,52 @@ def _returning_result(
 
     rows = [tuple(cell(doc, col, expr) for _, col, expr in returning) for doc in docs]
     return SQLResult(command_tag=command_tag, columns=columns, rows=rows, rowcount=rowcount)
+
+
+def _fire_before_insert_triggers(
+    plan: Any, storage: Any, db: str, catalog: Any, session: Any
+) -> list[dict[str, Any]]:
+    """Run BEFORE INSERT FOR EACH ROW triggers over the planned rows.
+
+    Each row becomes a column-name-keyed NEW record for the plpgsql trigger
+    function, which may mutate fields (``new.ts := to_tsvector(new.t)``) or
+    return NULL to skip the row — PG's BEFORE-trigger semantics. The returned
+    record is written back through each column's storage field."""
+    if catalog is None or getattr(plan.table, "reflected", False):
+        return plan.docs
+    triggers = [
+        t
+        for t in catalog.triggers_for_table(db, plan.table.name)
+        if t.get("timing") == "BEFORE" and t.get("event") == "INSERT"
+    ]
+    if not triggers:
+        return plan.docs
+    from secantus.paths import set_path
+    from secantus.sql import plpgsql, scalar
+
+    ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+    out: list[dict[str, Any]] = []
+    for doc in plan.docs:
+        record: dict[str, Any] | None = {c.name: get_path(doc, c.field) for c in plan.table.columns}
+        for trg in triggers:
+            func = catalog.get_function(db, trg["function"], 0)
+            if func is None:
+                raise errors.SQLError("42883", f"function {trg['function']}() does not exist")
+            record = plpgsql.invoke_trigger(func, record, ctx)
+            if record is None:
+                break  # RETURN NULL: skip this row
+        if record is None:
+            continue
+        for c in plan.table.columns:
+            value = record.get(c.name)
+            # Structured values (tsvector / jsonb dicts) pass through as-is;
+            # scalars get best-effort coercion to the column type.
+            if value is not None and not isinstance(value, dict):
+                with contextlib.suppress(errors.SQLError, ValueError, TypeError):
+                    value = typemap.coerce(value, c.type_tag)
+            set_path(doc, c.field, value)
+        out.append(doc)
+    return out
 
 
 @_serialized_write
@@ -658,6 +1171,7 @@ def execute_insert(
 ) -> SQLResult:
     if plan.on_conflict is not None:
         return _execute_insert_on_conflict(plan, storage, db, catalog, session)
+    plan.docs = _fire_before_insert_triggers(plan, storage, db, catalog, session)
     _assign_sequences(plan.docs, plan.table, db, catalog, session)
     if plan.check_option is not None:
         from secantus.sql import scalar
@@ -693,10 +1207,34 @@ def execute_insert(
 
 def _raise_write_error(err: dict[str, Any], table: planner.TableDef) -> None:
     if err.get("code") == 11000:
-        raise errors.unique_violation(
-            f'duplicate key value violates unique constraint on "{table.name}"'
+        constraint = _dup_key_constraint_name(err, table)
+        uq = next((u for u in table.unique_constraints if u.name == constraint), None)
+        if uq is not None and uq.exclusion:
+            raise errors.SQLError(
+                "23P01",
+                f'conflicting key value violates exclusion constraint "{constraint}"',
+                diag=_error_diag(table, n=constraint),
+            )
+        raise errors.SQLError(
+            "23505",
+            f'duplicate key value violates unique constraint "{constraint}"',
+            diag=_error_diag(table, n=constraint),
         )
     raise errors.SQLError("XX000", err.get("errmsg", "insert failed"))
+
+
+def _dup_key_constraint_name(err: dict[str, Any], table: planner.TableDef) -> str:
+    """The violated constraint's PG name from a storage duplicate-key error:
+    the ``_id`` index is the primary key; any other index name maps back
+    through the ``unique_index_name`` scheme to the declared constraint."""
+    m = re.search(r"index: (\S+) dup key", err.get("errmsg", ""))
+    index_name = m.group(1) if m else ""
+    if index_name in ("", "_id_"):
+        return table.pk_constraint_name()
+    for uq in table.unique_constraints:
+        if unique_index_name(uq.name) == index_name or uq.name == index_name:
+            return uq.name
+    return index_name
 
 
 @functools.lru_cache(maxsize=256)
@@ -727,7 +1265,7 @@ def _validate_write_row(doc: dict[str, Any], table: Any, ctx: Any) -> None:
                 "23502",
                 f'null value in column "{col.name}" of relation "{table.name}" '
                 "violates not-null constraint",
-                diag={"s": _table_schema(table), "t": table.name, "c": col.name},
+                diag=_error_diag(table, c=col.name),
             )
     if not table.check_constraints:
         return
@@ -742,12 +1280,30 @@ def _validate_write_row(doc: dict[str, Any], table: Any, ctx: Any) -> None:
             raise errors.SQLError(
                 "23514",
                 f'new row for relation "{table.name}" violates check constraint "{ck.name}"',
-                diag={"s": _table_schema(table), "t": table.name, "n": ck.name},
+                diag=_error_diag(table, n=ck.name),
             )
 
 
 def _table_schema(table: Any) -> str:
-    return "pg_temp_1" if getattr(table, "temp", False) else "public"
+    name = getattr(table, "name", "")
+    if getattr(table, "temp", False):
+        return name.split(".", 1)[0] if name.startswith("pg_temp_") else "pg_temp_1"
+    return name.split(".", 1)[0] if "." in name else "public"
+
+
+def _bare_table_name(table: Any) -> str:
+    name = getattr(table, "name", "")
+    return name.split(".", 1)[1] if "." in name else name
+
+
+def _error_diag(table: Any, **extra: str) -> dict[str, str]:
+    """PG's ErrorResponse identity fields for a constraint violation on
+    ``table``: s=schema, t=bare table name, plus any of c(olumn)/
+    n(constraint)/d(atatype) the caller supplies. pgjdbc's
+    ``ServerErrorMessage`` surfaces these via getSchema()/getTable()/...."""
+    diag = {"s": _table_schema(table), "t": _bare_table_name(table)}
+    diag.update({k: v for k, v in extra.items() if v})
+    return diag
 
 
 def _validate_check_option(
@@ -898,6 +1454,11 @@ def _validate_domain_columns(
                         "23514",
                         f"value for domain {col.domain_type} violates check "
                         f'constraint "{check["name"]}"',
+                        diag={
+                            "s": "public",
+                            "d": str(col.domain_type),
+                            "n": str(check["name"]),
+                        },
                     )
 
 
@@ -1035,8 +1596,17 @@ def _hashable_id(value: Any) -> Any:
     return value
 
 
-def _uq_violation(uq: Any) -> errors.SQLError:
-    return errors.unique_violation(f'duplicate key value violates unique constraint "{uq.name}"')
+def _uq_violation(uq: Any, table: Any = None) -> errors.SQLError:
+    diag = _error_diag(table, n=uq.name) if table is not None else {"n": uq.name}
+    if getattr(uq, "exclusion", False):
+        return errors.SQLError(
+            "23P01",
+            f'conflicting key value violates exclusion constraint "{uq.name}"',
+            diag=diag,
+        )
+    return errors.SQLError(
+        "23505", f'duplicate key value violates unique constraint "{uq.name}"', diag=diag
+    )
 
 
 def _maybe_defer(session: Any, kind: str, table_name: str, constraint: Any) -> bool:
@@ -1083,14 +1653,23 @@ def _validate_unique_rows(
             violated = key in seen[uq.name]
             if not violated:
                 probe = dict(zip(fields, key, strict=True))
-                for existing in storage.find_matching(db, table.collection, probe):
+                # Two probes, because neither alone is sufficient inside a
+                # transaction: the plain one sees this transaction's own
+                # uncommitted rows, and the committed one sees rows other
+                # transactions committed after our snapshot was taken (which
+                # the snapshot hides, so the duplicate used to be stored).
+                candidates = list(storage.find_matching(db, table.collection, probe))
+                committed = getattr(storage, "find_matching_committed", None)
+                if committed is not None:
+                    candidates += committed(db, table.collection, probe)
+                for existing in candidates:
                     if _hashable_id(existing.get("_id")) not in exclude_ids:
                         violated = True
                         break
             if violated:
                 if _maybe_defer(session, "unique", table.name, uq):
                     continue
-                raise _uq_violation(uq)
+                raise _uq_violation(uq, table)
             seen[uq.name].add(key)
 
 
@@ -1242,15 +1821,13 @@ def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult
         docs = storage.find_matching(
             db, plan.table.collection, plan.filter, skip=plan.skip, limit=plan.limit
         )
-    columns = _out_column_descs(plan.out_columns, storage, db)
+    columns = _out_column_descs(plan.out_columns, storage, db, getattr(plan, "table", None))
     rows: list[tuple[Any, ...]] = []
     for doc in docs:
         # get_path walks dotted field paths (jsonb navigation); a plain field
         # name resolves to a top-level lookup.
         rows.append(
-            tuple(
-                typemap.to_py(get_path(doc, col.field), col.type_tag) for _, col in plan.out_columns
-            )
+            tuple(typemap.to_py(_with_subms(doc, col), col.type_tag) for _, col in plan.out_columns)
         )
     return SQLResult(
         command_tag=f"SELECT {len(rows)}", columns=columns, rows=rows, rowcount=len(rows)
@@ -1307,9 +1884,9 @@ def execute_correlated_select(
     if plan.limit:
         matched = matched[: plan.limit]
 
-    columns = _out_column_descs(plan.out_columns, storage, db)
+    columns = _out_column_descs(plan.out_columns, storage, db, getattr(plan, "table", None))
     rows = [
-        tuple(typemap.to_py(get_path(doc, col.field), col.type_tag) for _, col in plan.out_columns)
+        tuple(typemap.to_py(_with_subms(doc, col), col.type_tag) for _, col in plan.out_columns)
         for doc in matched
     ]
     return SQLResult(
@@ -1344,6 +1921,19 @@ def _run_subplan_to_docs(
 ) -> list[dict[str, Any]]:
     from secantus.aggregate import PipelineContext, apply_pipeline
 
+    if isinstance(plan, (planner.exp.Expression, planner.RawDerived)):
+        # A raw statement sub-plan (a set-operation or VALUES derived table) —
+        # run it through the engine and shape the result rows into docs,
+        # renaming positionally when the alias declared column names.
+        from secantus.sql import engine
+
+        stmt = plan.stmt if isinstance(plan, planner.RawDerived) else plan
+        rename = plan.names if isinstance(plan, planner.RawDerived) else None
+        res = engine._run_query(
+            stmt, storage, db, getattr(sctx, "catalog", None), getattr(sctx, "session", None)
+        )
+        names = rename or [c.name for c in res.columns]
+        return [dict(zip(names, row, strict=True)) for row in res.rows]
     _materialize_derived(plan, storage, db, sctx)
     if isinstance(plan, planner.PipelineSelectPlan):
         docs, remaining = _pipeline_input_docs(plan, storage, db, sctx)
@@ -1456,12 +2046,30 @@ def _evaluated_value_rows(
 
     def make_scope(doc: dict[str, Any]):
         def scope(node: Any) -> Any:
+            # `_subms` restores the microseconds a timestamp's hidden companion
+            # carries. This scope feeds ORDER BY keys, the DISTINCT ON key AND
+            # the projected values (`_expand_srf` evaluates through it), and
+            # unlike the plain-column path it never goes through `_with_subms`
+            # -- so without this, `select id, ts ... order by 2` both sorted at
+            # millisecond granularity and RETURNED truncated times.
             field = win_field.get(id(node))
             if field is not None:
-                return get_path(doc, field)
+                return _subms(doc, field)
             path, _ = plan.resolve(node)
-            return get_path(doc, path)
+            return _subms(doc, path)
 
+        # Optional protocol: lets ``scalar._eval_cast`` learn a column's type
+        # tag (a naive datetime from storage is a ``timestamp`` or a decoded
+        # ``timestamptz`` — only the tag can tell, and ``col::text`` must
+        # render a timestamptz with the session-zone offset like Postgres).
+        def column_tag(node: Any) -> str | None:
+            try:
+                _, tag = plan.resolve(node)
+            except Exception:  # noqa: BLE001 — unresolvable: no tag claim
+                return None
+            return tag
+
+        scope.column_tag = column_tag  # type: ignore[attr-defined]
         return scope
 
     # An enum ORDER BY term sorts by the label's declared ordinal, not lexically.
@@ -1475,17 +2083,34 @@ def _evaluated_value_rows(
         omap = enum_ordinals.get(i)
         return omap.get(v, len(omap)) if omap is not None and v is not None else v
 
+    # ORDER BY terms that name an SRF-produced output are resolved against the
+    # EXPANDED tuple, not the source row: one row fans out to many, so a
+    # source-row key is identical across every expanded row and a stable sort
+    # leaves them in array order. `ORDER BY 1` over `unnest` used to do exactly
+    # that, and `ORDER BY <alias>` raised 0A000 instead.
+    srf_out = getattr(plan, "order_srf_output", {}) or {}
     scored: list[tuple[tuple[Any, ...], tuple[Any, ...], tuple[Any, ...]]] = []
     for doc in docs:
         scope = make_scope(doc)
-        keys = tuple(_order_key(oe, i, scope) for i, (oe, _, _) in enumerate(plan.order))
-        # DISTINCT ON key (row-level, evaluated before any SRF expansion).
+        base_keys = tuple(
+            None if i in srf_out else _order_key(oe, i, scope)
+            for i, (oe, _, _) in enumerate(plan.order)
+        )
+        # DISTINCT ON key (row-level, evaluated before any SRF expansion —
+        # deliberately NOT resolved against the expanded tuple).
         don_key = (
             tuple(repr(scalar.evaluate(e, scope, sctx)) for e in plan.distinct_on)
             if plan.distinct_on
             else ()
         )
         for vt in _expand_srf(plan, scope, sctx):
+            if srf_out:
+                keys = tuple(
+                    vt[srf_out[i]] if i in srf_out and srf_out[i] < len(vt) else base_keys[i]
+                    for i in range(len(base_keys))
+                )
+            else:
+                keys = base_keys
             scored.append((keys, don_key, vt))
 
     _pg_sort(scored, lambda r: r[0], [(direction, nf) for _, direction, nf in plan.order])
@@ -1514,6 +2139,27 @@ def _evaluated_value_rows(
     if plan.limit:
         rows = rows[: plan.limit]
     return rows
+
+
+def _expandarray_cell(kind: str, arr: list[Any], k: int) -> Any:
+    """One output cell for ``information_schema._pg_expandarray(arr)``.
+
+    The function yields a ``(x, n)`` record per element — the value and its
+    1-based subscript. ``kind`` carries which field was selected
+    (``_pg_expandarray.n`` / ``.x``); the bare kind means the whole record was
+    selected, and it stays a subdocument rather than composite text so that
+    field access still works a level up. pgjdbc selects the record into a
+    subquery column and then reads ``(result.KEYS).x`` from the outer query,
+    which needs the composite intact.
+    """
+    if k >= len(arr):
+        return None
+    field = kind.partition(".")[2]
+    if field == "n":
+        return k + 1
+    if field == "x":
+        return arr[k]
+    return {"x": arr[k], "n": k + 1}
 
 
 def _expand_srf(plan: planner.EvaluatedSelectPlan, scope: Any, sctx: Any) -> list[tuple[Any, ...]]:
@@ -1555,6 +2201,8 @@ def _expand_srf(plan: planner.EvaluatedSelectPlan, scope: Any, sctx: Any) -> lis
                 kind, arr = srfs[idx]
                 if kind == "generate_subscripts":  # 1-based ordinal
                     row.append(k + 1 if k < len(arr) else None)
+                elif kind.startswith("_pg_expandarray"):
+                    row.append(_expandarray_cell(kind, arr, k))
                 else:  # unnest / jsonb_array_elements / jsonb_object_keys → element/key
                     row.append(arr[k] if k < len(arr) else None)
             else:
@@ -1655,6 +2303,22 @@ def _apply_post_aggregates(plan: Any, result: list[dict[str, Any]]) -> list[dict
     (Python-side, since the aggregation engine can't sort). Shared by the top-level
     pipeline executor and derived-table materialization so the ``{v, k}`` push
     pairs never leak past either path."""
+    # A timestamp min/max accumulates a `{__subms_d, __subms_u}` composite (a
+    # BSON date cannot carry the remainder), so merge it back before anything
+    # downstream sees it.
+    for doc in result:
+        for key, value in doc.items():
+            if not isinstance(value, dict):
+                continue
+            if subms.COMPOSITE_DATE in value:
+                doc[key] = subms.unwrap_composite(value)
+                continue
+            # `_id` is a dict of grouping column -> key, and a timestamp key is
+            # itself a composite (grouping on the truncated date merges rows
+            # that differ only in microseconds).
+            for inner_key, inner in value.items():
+                if isinstance(inner, dict) and subms.COMPOSITE_DATE in inner:
+                    value[inner_key] = subms.unwrap_composite(inner)
     for field_name, kind, payload in getattr(plan, "post_aggregates", ()) or ():
         for doc in result:
             if kind in ("sorted_array", "sorted_string"):
@@ -1695,6 +2359,14 @@ def _sorted_agg_value(kind: str, payload: Any, pairs: Any) -> Any:
     return the ``v`` values as a list (``sorted_array``) or joined with the
     separator, skipping NULLs (``sorted_string`` — NULL when all values are NULL)."""
     items = list(pairs or [])
+    # A timestamp sort key rides as the sub-millisecond composite; merge it back
+    # so the keys are comparable datetimes (and microsecond-exact) before sorting.
+    for p in items:
+        keys = p.get("k")
+        if isinstance(keys, list) and any(
+            isinstance(k, dict) and subms.COMPOSITE_DATE in k for k in keys
+        ):
+            p["k"] = [subms.unwrap_composite(k) for k in keys]
     if kind == "sorted_array":
         specs = payload
         _pg_sort(items, lambda p: tuple(p.get("k") or []), specs)
@@ -1768,7 +2440,13 @@ def execute_pipeline_select(
         synthesized = _empty_implicit_aggregate_row(remaining, ctx)
         if synthesized is not None:
             result = _apply_post_aggregates(plan, synthesized)
-    columns = _tagged_out_column_descs(plan.out_columns, plan.out_enum_types, storage, db)
+    columns = _tagged_out_column_descs(
+        plan.out_columns,
+        plan.out_enum_types,
+        storage,
+        db,
+        out_sources=getattr(plan, "out_sources", None) or None,
+    )
     rows = [
         tuple(typemap.to_py(doc.get(name), tag) for name, tag in plan.out_columns) for doc in result
     ]
@@ -1783,7 +2461,15 @@ def execute_evaluated_select(
     """Run a SELECT whose list / ORDER BY needs per-row evaluation (scalar /
     set-returning functions, CASE, correlated subqueries)."""
     rows = _evaluated_value_rows(plan, storage, db, sctx)
-    columns = _tagged_out_column_descs(plan.out_columns, plan.out_enum_types, storage, db)
+    columns = _tagged_out_column_descs(
+        plan.out_columns,
+        plan.out_enum_types,
+        storage,
+        db,
+        out_exprs=plan.out_exprs,
+        base_table=getattr(plan, "base_table", None),
+        out_sources=getattr(plan, "out_sources", None) or None,
+    )
     out_rows = [
         tuple(typemap.to_py(v, tag) for v, (_, tag) in zip(row, plan.out_columns, strict=True))
         for row in rows
@@ -1844,6 +2530,45 @@ def execute_update(
 
 
 def _execute_update_materialized(
+    plan: planner.UpdatePlan, storage: Any, db: str, catalog: Any, session: Any
+) -> SQLResult:
+    # Outside a transaction block, the whole read-compute-write must be ONE
+    # WT snapshot transaction. It used to be a bare read followed by
+    # autocommit writes, atomic only because nothing could COMMIT between
+    # them under the statement-write lock — but an extended-protocol implicit
+    # transaction commits at Sync, outside that lock, and its commit landing
+    # inside the window was silently overwritten by a value computed from the
+    # pre-commit row (the deterministic straddle in
+    # test_sync_commit_serializes_with_bare_statements). Inside a snapshot
+    # transaction the mid-window commit surfaces as a write conflict and the
+    # statement retries from a fresh read.
+    if session is not None and getattr(session, "txn_handle", None) is None:
+        from secantus.storage import WriteConflictError, _is_wt_rollback
+
+        while True:
+            handle = storage.begin_user_transaction()
+            try:
+                with storage.use_user_transaction(handle):
+                    result = _execute_update_materialized_body(plan, storage, db, catalog, session)
+                storage.commit_user_transaction(handle)
+                return result
+            except errors.SQLError as exc:
+                storage.abort_user_transaction(handle)
+                if exc.sqlstate == "40001":
+                    continue  # statement-level retry, like the autocommit path
+                raise
+            except WriteConflictError:
+                storage.abort_user_transaction(handle)
+                continue
+            except Exception as exc:
+                storage.abort_user_transaction(handle)
+                if _is_wt_rollback(exc):
+                    continue  # raw WT rollback from a storage op inside the txn
+                raise
+    return _execute_update_materialized_body(plan, storage, db, catalog, session)
+
+
+def _execute_update_materialized_body(
     plan: planner.UpdatePlan, storage: Any, db: str, catalog: Any, session: Any
 ) -> SQLResult:
     """An UPDATE that must be materialized per row rather than a bulk ``$set``:
@@ -1926,7 +2651,9 @@ def _execute_update_materialized(
             if collides:
                 raise errors.SQLError(
                     "23505",
-                    f'duplicate key value violates unique constraint "{table.name}_pkey"',
+                    "duplicate key value violates unique constraint "
+                    f'"{table.pk_constraint_name()}"',
+                    diag=_error_diag(table, n=table.pk_constraint_name()),
                 )
             seen.add(new_h)
         # Delete every matched row, then insert the re-keyed rows (a PK swap needs
@@ -2049,9 +2776,11 @@ def _validate_fk_child_rows(
             if not storage.find_matching(db, parent.collection, probe, limit=1):
                 if _maybe_defer(session, "fk", table.name, fk):
                     continue
-                raise errors.foreign_key_violation(
+                raise errors.SQLError(
+                    "23503",
                     f'insert or update on table "{table.name}" violates foreign key '
-                    f'constraint "{fk.name}"'
+                    f'constraint "{fk.name}"',
+                    diag=_error_diag(table, n=fk.name),
                 )
 
 
@@ -2090,7 +2819,7 @@ def _recheck_unique(table: Any, cname: str, storage: Any, db: str) -> None:
         if any(v is None for v in key):
             continue
         if key in seen:
-            raise _uq_violation(uq)
+            raise _uq_violation(uq, table)
         seen.add(key)
 
 
@@ -2108,9 +2837,11 @@ def _recheck_fk(table: Any, cname: str, storage: Any, db: str, catalog: Any) -> 
             continue
         probe = _parent_probe(fk, parent, values)
         if not storage.find_matching(db, parent.collection, probe, limit=1):
-            raise errors.foreign_key_violation(
+            raise errors.SQLError(
+                "23503",
                 f'insert or update on table "{table.name}" violates foreign key '
-                f'constraint "{fk.name}"'
+                f'constraint "{fk.name}"',
+                diag=_error_diag(table, n=fk.name),
             )
 
 
@@ -2159,9 +2890,11 @@ def _enforce_fk_on_parent_delete(
                 continue
             action = (fk.on_delete or "NO ACTION").upper()
             if action in ("NO ACTION", "RESTRICT"):
-                raise errors.foreign_key_violation(
+                raise errors.SQLError(
+                    "23503",
                     f'update or delete on table "{parent.name}" violates foreign key '
-                    f'constraint "{fk.name}" on table "{child.name}"'
+                    f'constraint "{fk.name}" on table "{child.name}"',
+                    diag=_error_diag(child, n=fk.name),
                 )
             if action == "CASCADE":
                 _enforce_fk_on_parent_delete(children, child, storage, db, catalog, _depth + 1)
@@ -2208,9 +2941,11 @@ def _enforce_fk_on_parent_update(
                 continue
             action = (fk.on_update or "NO ACTION").upper()
             if action in ("NO ACTION", "RESTRICT"):
-                raise errors.foreign_key_violation(
+                raise errors.SQLError(
+                    "23503",
                     f'update or delete on table "{parent.name}" violates foreign key '
-                    f'constraint "{fk.name}" on table "{child.name}"'
+                    f'constraint "{fk.name}" on table "{child.name}"',
+                    diag=_error_diag(child, n=fk.name),
                 )
             if action == "CASCADE":
                 new_set = {child.field_for(c): v for c, v in zip(fk.columns, new, strict=False)}

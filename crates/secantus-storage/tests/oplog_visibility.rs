@@ -9,7 +9,7 @@
 //! advanced its resume position lost the entry permanently once it committed.
 
 use bson::{doc, Document};
-use secantus_storage::Storage;
+use secantus_storage::{Storage, StorageOptions};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -25,7 +25,18 @@ fn temp_home() -> PathBuf {
 
 fn with_db(body: impl FnOnce(&Storage)) {
     let home = temp_home();
-    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    // These tests pin SYNC-mode semantics (the in-flight mint window); async
+    // mode mints post-commit, so there is no window to test. Pin the mode
+    // explicitly so the SECANTUS_OPLOG_ASYNC=1 CI lane still exercises the
+    // sync invariants (the option beats the env var).
+    let st = Storage::open_with_options(
+        home.to_str().unwrap(),
+        &StorageOptions {
+            oplog_async: Some(false),
+            ..StorageOptions::default()
+        },
+    )
+    .unwrap();
     body(&st);
     drop(st);
     let _ = std::fs::remove_dir_all(&home);

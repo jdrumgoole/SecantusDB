@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from sqlglot import exp
@@ -44,12 +45,145 @@ _NAMED_SRFS = frozenset(
         "json_each",
         "jsonb_each_text",
         "json_each_text",
+        "pg_get_keywords",
     }
 )
 
 # Record-returning SRFs: each row is a ``(key, value)`` pair, so the source has
 # two columns (default-named ``key`` / ``value``) rather than one.
-_RECORD_SRFS = frozenset({"jsonb_each", "json_each", "jsonb_each_text", "json_each_text"})
+_RECORD_SRFS = frozenset(
+    {
+        "jsonb_each",
+        "json_each",
+        "jsonb_each_text",
+        "json_each_text",
+        # information_schema._pg_expandarray(arr) -> (x anyelement, n int):
+        # each element with its 1-based subscript. pgjdbc's DatabaseMetaData
+        # index/PK queries use it. NOTE: the row shape below is right, but the
+        # CALL SITES pgjdbc emits are not recognised yet — a schema-qualified
+        # name in FROM position, and the composite-value form
+        # ``(_pg_expandarray(x)).n`` — so this is not reachable from those
+        # queries. See tasks/backlog.md.
+        "_pg_expandarray",
+        # pg_get_keywords() -> (word, catcode, barelabel, catdesc, baredesc):
+        # the server's keyword list; pgjdbc's getSQLKeywords string_aggs it.
+        "pg_get_keywords",
+    }
+)
+
+#: Per-record-SRF default column names (the jsonb_each family is key/value).
+_RECORD_SRF_COLUMNS = {
+    "_pg_expandarray": ["x", "n"],
+    "pg_get_keywords": ["word", "catcode", "barelabel", "catdesc", "baredesc"],
+}
+
+#: The PG-specific keyword list served by ``pg_get_keywords()`` — the words a
+#: JDBC client can't find in SQL:2003 (pgjdbc filters that standard set out and
+#: asserts ``reindex`` survives). catcode: R reserved, U unreserved.
+_PG_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("abort", "U"),
+    ("analyse", "R"),
+    ("analyze", "R"),
+    ("attach", "U"),
+    ("backward", "U"),
+    ("cluster", "U"),
+    ("comment", "U"),
+    ("concurrently", "R"),
+    ("conflict", "U"),
+    ("copy", "U"),
+    ("cost", "U"),
+    ("csv", "U"),
+    ("current_catalog", "R"),
+    ("current_schema", "R"),
+    ("delimiter", "U"),
+    ("detach", "U"),
+    ("discard", "U"),
+    ("do", "R"),
+    ("enum", "U"),
+    ("explain", "U"),
+    ("extension", "U"),
+    ("family", "U"),
+    ("forward", "U"),
+    ("freeze", "R"),
+    ("greatest", "U"),
+    ("handler", "U"),
+    ("header", "U"),
+    ("ilike", "R"),
+    ("immutable", "U"),
+    ("inherit", "U"),
+    ("inherits", "U"),
+    ("isnull", "R"),
+    ("lateral", "R"),
+    ("least", "U"),
+    ("limit", "R"),
+    ("listen", "U"),
+    ("load", "U"),
+    ("lock", "U"),
+    ("logged", "U"),
+    ("mode", "U"),
+    ("move", "U"),
+    ("notify", "U"),
+    ("notnull", "R"),
+    ("nowait", "U"),
+    ("off", "U"),
+    ("offset", "R"),
+    ("oids", "U"),
+    ("owned", "U"),
+    ("owner", "U"),
+    ("parallel", "U"),
+    ("passing", "U"),
+    ("password", "U"),
+    ("plans", "U"),
+    ("policy", "U"),
+    ("prepared", "U"),
+    ("procedural", "U"),
+    ("publication", "U"),
+    ("refresh", "U"),
+    ("reindex", "U"),
+    ("rename", "U"),
+    ("replica", "U"),
+    ("reset", "U"),
+    ("restart", "U"),
+    ("returning", "R"),
+    ("rule", "U"),
+    ("setof", "U"),
+    ("share", "U"),
+    ("show", "U"),
+    ("skip", "U"),
+    ("snapshot", "U"),
+    ("stable", "U"),
+    ("standalone", "U"),
+    ("storage", "U"),
+    ("stored", "U"),
+    ("strict", "U"),
+    ("subscription", "U"),
+    ("support", "U"),
+    ("sysid", "U"),
+    ("tables", "U"),
+    ("tablespace", "U"),
+    ("truncate", "U"),
+    ("trusted", "U"),
+    ("unlisten", "U"),
+    ("unlogged", "U"),
+    ("vacuum", "U"),
+    ("valid", "U"),
+    ("validate", "U"),
+    ("validator", "U"),
+    ("variadic", "R"),
+    ("verbose", "R"),
+    ("volatile", "U"),
+    ("whitespace", "U"),
+    ("xmlattributes", "U"),
+    ("xmlconcat", "U"),
+    ("xmlelement", "U"),
+    ("xmlexists", "U"),
+    ("xmlforest", "U"),
+    ("xmlparse", "U"),
+    ("xmlpi", "U"),
+    ("xmlroot", "U"),
+    ("xmlserialize", "U"),
+    ("yes", "U"),
+)
 
 
 def _is_record_srf(node: exp.Expression) -> bool:
@@ -84,6 +218,24 @@ def _is_srf_node(node: exp.Expression) -> bool:
     return False
 
 
+def _is_from_callable(node: exp.Expression) -> bool:
+    """Acceptance for FROM position ONLY — wider than ``_is_srf_node``.
+
+    Named SRFs, plus ANY function call in FROM position: pgjdbc's
+    CallableStatement rewrites ``{? = call f(?)}`` into
+    ``select * from f($1) as result``, so a user-defined function in
+    FROM must evaluate as a one-row source (``_values_and_tag`` falls
+    back to the scalar evaluator, which resolves catalog UDFs and
+    raises 42883 for genuinely unknown names — a FROM item that parses
+    as a call is never a real table). ``exp.Func`` rather than
+    ``exp.Anonymous`` because sqlglot parses some calls into dedicated
+    nodes — ``now()`` -> CurrentTimestamp — and pgjdbc's ``{call now()}``
+    must still work. A FROM-less ``SELECT f()`` projection must NOT take
+    this path (it would reroute every ordinary scalar call), which is why
+    ``fromless_projection`` keeps the strict predicate."""
+    return _is_srf_node(node) or isinstance(node, exp.Func)
+
+
 def _alias_parts(alias_node: exp.Expression | None) -> tuple[str | None, list[str]]:
     if alias_node is None:
         return None, []
@@ -104,7 +256,7 @@ def from_source(stmt: exp.Select) -> SrfSource | None:
     if isinstance(src, exp.Unnest):
         name, cols = _alias_parts(src.args.get("alias"))
         return SrfSource(src, bool(src.args.get("offset")), name, cols)
-    if isinstance(src, exp.Table) and _is_srf_node(src.this):
+    if isinstance(src, exp.Table) and _is_from_callable(src.this):
         name, cols = _alias_parts(src.args.get("alias"))
         return SrfSource(src.this, bool(src.args.get("ordinality")), name, cols)
     return None
@@ -146,16 +298,46 @@ def _default_name(node: exp.Expression) -> str:
     if isinstance(node, exp.Anonymous):
         base = str(node.this).rsplit(".", 1)[-1].lower()
         return "unnest" if base == "unnest" else base
+    if isinstance(node, exp.Func):
+        return node.sql_name().lower()
     return "?column?"
 
 
-def _values_and_tag(node: exp.Expression, ctx: Any) -> tuple[list[Any], str]:
-    """Generate the SRF's element values plus the value column's type tag."""
+def _tag_for_value(value: Any) -> str:
+    import datetime as _dt
+    from decimal import Decimal
+
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int4" if -(2**31) <= value < 2**31 else "int8"
+    if isinstance(value, float):
+        return "float8"
+    if isinstance(value, Decimal):
+        return "numeric"
+    if isinstance(value, _dt.datetime):
+        return "timestamptz" if value.tzinfo is not None else "timestamp"
+    if isinstance(value, _dt.date):
+        return "date"
+    if isinstance(value, str):
+        return "text"
+    return "any"
+
+
+def _values_and_tag(
+    node: exp.Expression, ctx: Any, describe_only: bool = False
+) -> tuple[list[Any], str]:
+    """Generate the SRF's element values plus the value column's type tag.
+
+    ``describe_only`` derives the column tag WITHOUT invoking catalog UDFs —
+    extended-protocol Describe must never run a side-effecting function body
+    (pgjdbc's batched ``{call f(?)}`` executed every insert twice: once at
+    Describe, once at Execute)."""
     from secantus.sql import scalar, typemap
 
     if isinstance(node, exp.Cast):
         # ``srf(...)::tag`` — generate, then coerce each element to the target.
-        values, _tag = _values_and_tag(node.this, ctx)
+        values, _tag = _values_and_tag(node.this, ctx, describe_only)
         cast_tag = typemap.type_tag_for_sql(node.to)
         if cast_tag is None:
             return values, "any"
@@ -210,6 +392,40 @@ def _values_and_tag(node: exp.Expression, ctx: Any) -> tuple[list[Any], str]:
                 if "g" not in flags:
                     break
             return rows, "text[]"
+    if isinstance(node, exp.Anonymous):
+        # Not a built-in SRF: evaluate as a scalar call (catalog UDFs included
+        # — pgjdbc's ``select * from f($1) as result`` callable shape) and
+        # yield its single row. The column's type tag comes from the
+        # function's declared return type — pgjdbc's CallableStatement
+        # cross-checks the result column's OID against the registered OUT
+        # type and refuses a mismatch. RETURNS SETOF stays unsupported.
+        tag = "any"
+        catalog = getattr(ctx, "catalog", None)
+        if catalog is not None:
+            fname = str(node.this).rsplit(".", 1)[-1].lower()
+            udf = catalog.get_function(ctx.db, fname, len(node.expressions or []))
+            if udf is not None and udf.get("return_tag"):
+                tag = udf["return_tag"]
+        if describe_only:
+            return [], tag
+        value = scalar.evaluate(node, _empty_scope, ctx)
+        return [value], tag
+    if isinstance(node, exp.Func):
+        # A call sqlglot parsed into a dedicated node (``now()`` ->
+        # CurrentTimestamp, ``version()`` -> CurrentVersion): session-info
+        # functions first, then the general scalar evaluator, tagging the
+        # column from the value.
+        session = getattr(ctx, "session", None)
+        if session is not None:
+            from secantus.sql import functions
+
+            try:
+                _name, value, tag = functions.evaluate_scalar(node, session)
+                return [value], tag
+            except errors.SQLError:
+                pass
+        value = scalar.evaluate(node, _empty_scope, ctx)
+        return [value], _tag_for_value(value)
     raise errors.feature_not_supported(f"unsupported set-returning function: {node.sql()}")
 
 
@@ -221,7 +437,19 @@ def _record_values(node: exp.Expression, ctx: Any) -> tuple[list[tuple[Any, Any]
 
     name = str(node.this).rsplit(".", 1)[-1].lower()
     arg = node.expressions[0] if node.expressions else None
-    doc = _as_json(scalar.evaluate(arg, _empty_scope, ctx) if arg is not None else None)
+    value = scalar.evaluate(arg, _empty_scope, ctx) if arg is not None else None
+    if name == "_pg_expandarray":
+        items_list = list(value) if isinstance(value, (list, tuple)) else []
+        return [(v, i) for i, v in enumerate(items_list, start=1)], ["any", "int4"]
+    if name == "pg_get_keywords":
+        return [(word, code, False, None, None) for word, code in _PG_KEYWORDS], [
+            "text",
+            "text",
+            "bool",
+            "text",
+            "text",
+        ]
+    doc = _as_json(value)
     items = list(doc.items()) if isinstance(doc, dict) else []
     if name in ("jsonb_each_text", "json_each_text"):
         return [(k, _jsonb_to_text(v)) for k, v in items], ["text", "text"]
@@ -262,15 +490,65 @@ def _as_json_list(val: Any) -> list[Any]:
     return list(doc) if isinstance(doc, (list, tuple)) else []
 
 
+def _coerce_series_bound(val: Any) -> Any:
+    """Parse a numeric-looking string bound into a number.
+
+    Only strings are touched, and only when they parse cleanly — anything else
+    is returned unchanged so the caller's type check still rejects genuinely
+    unsupported bounds with its own error. Integers are preferred over Decimal
+    so the common `generate_series(1, $1)` yields int8 rows rather than numeric.
+    """
+    if not isinstance(val, str):
+        return val
+    text = val.strip()
+    if not text:
+        return val
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return Decimal(text)
+    except (InvalidOperation, ValueError):
+        return val
+
+
 def _generate_series(start: Any, stop: Any, step: Any) -> tuple[list[Any], str]:
     """``generate_series(start, stop[, step])`` — inclusive of both ends. Numeric
     ranges (int / numeric step) and date / timestamp ranges (an ``interval``
     step) are both supported."""
     if start is None or stop is None:
+        # Describe-time: a parameter bound is still unbound (None). Type from
+        # the bounds we DO know, with the same int4/int8 rule as below, so the
+        # RowDescription a Describe reports matches the DataRow a later
+        # Execute sends. (A later $1 outside int32 range would make execute
+        # rows int8 under an int4 describe — real PG errors on that input
+        # outright, having typed the parameter int4 at parse.)
+        known = [
+            b for b in (_coerce_series_bound(start), _coerce_series_bound(stop)) if b is not None
+        ]
+        if all(isinstance(b, int) and -(2**31) <= b < 2**31 for b in known):
+            return [], "int4"
         return [], "int8"
+    # An untyped parameter (`generate_series(1, $1)` with `$1` sent as text)
+    # arrives as a string: the wire gave no type OID, so nothing upstream
+    # coerced it. Postgres infers the parameter's type from the argument
+    # position and parses it as an integer, so a numeric-looking string is a
+    # number here too. Without this, pgx's `ensureConnValid` helper — which
+    # runs exactly that query and is called at the end of 66 pgconn tests —
+    # failed, taking otherwise-passing tests down with it.
+    #
+    # Runs before the temporal branch so a coerced bound is what that branch
+    # sees. Note this does NOT rescue a quoted third argument
+    # (`generate_series(1, 10, '3')`): sqlglot parses that into an `Interval`
+    # node at parse time, so the step arrives already an interval and never
+    # reaches this coercion. That is a separate parser-level quirk.
+    start = _coerce_series_bound(start)
+    stop = _coerce_series_bound(stop)
+    step = _coerce_series_bound(step)
     if _is_temporal(start) or intervals.is_interval(step):
         return _generate_series_temporal(start, stop, step)
-    if not isinstance(start, (int, float)) or not isinstance(stop, (int, float)):
+    if not isinstance(start, (int, float, Decimal)) or not isinstance(stop, (int, float, Decimal)):
         raise errors.feature_not_supported(
             "generate_series is supported for integer / numeric or "
             "date / timestamp (with interval step) ranges only"
@@ -288,7 +566,17 @@ def _generate_series(start: Any, stop: Any, step: Any) -> tuple[list[Any], str]:
         while cur >= stop:
             out.append(cur)
             cur += step
-    tag = "int8" if all(isinstance(v, int) for v in out) else "numeric"
+    if all(isinstance(v, int) for v in out):
+        # PG picks the overload from the ARGUMENT types: int4 bounds yield
+        # int4 rows, an int8 bound yields int8. The wire gives us values, not
+        # declared types, so int32-range bounds mean int4 (an explicit
+        # small-valued ::int8 bound diverges — PG would say int8; accepted).
+        int4_bounds = all(
+            b is None or (isinstance(b, int) and -(2**31) <= b < 2**31) for b in (start, stop, step)
+        )
+        tag = "int4" if int4_bounds else "int8"
+    else:
+        tag = "numeric"
     return out, tag
 
 
@@ -344,24 +632,28 @@ def _build_record(source: SrfSource, ctx: Any) -> tuple[list[dict[str, Any]], Ta
     ``key`` / ``value``, optionally renamed by ``AS t(k, v)`` and extended by
     ``WITH ORDINALITY``."""
     pairs, tags = _record_values(source.node, ctx)
-    default_names = ["key", "value"]
+    srf_name = str(source.node.this).rsplit(".", 1)[-1].lower()
+    default_names = list(_RECORD_SRF_COLUMNS.get(srf_name, ["key", "value"]))
     # ``AS t(k, v)`` renames the columns; the bare table alias does not (unlike a
     # single-column SRF, where ``AS g`` names the lone column).
     names = list(source.column_aliases) if source.column_aliases else list(default_names)
     names += default_names[len(names) :]  # pad if fewer aliases than columns
+    width = len(default_names)
     columns = [
         Column(name=names[i], type_tag=tags[i], field=names[i], pk=False, nullable=True)
-        for i in range(2)
+        for i in range(width)
     ]
     ord_col = None
     if source.ordinality:
-        ord_col = source.column_aliases[2] if len(source.column_aliases) > 2 else "ordinality"
+        ord_col = (
+            source.column_aliases[width] if len(source.column_aliases) > width else "ordinality"
+        )
         columns.append(
             Column(name=ord_col, type_tag="int8", field=ord_col, pk=False, nullable=True)
         )
     rows: list[dict[str, Any]] = []
-    for i, (k, v) in enumerate(pairs, start=1):
-        row = {names[0]: k, names[1]: v}
+    for i, rec in enumerate(pairs, start=1):
+        row = {names[j]: rec[j] for j in range(width)}
         if ord_col is not None:
             row[ord_col] = i
         rows.append(row)
@@ -369,12 +661,17 @@ def _build_record(source: SrfSource, ctx: Any) -> tuple[list[dict[str, Any]], Ta
     return rows, TableDef(name=table_name, collection=table_name, columns=columns)
 
 
-def build(source: SrfSource, ctx: Any) -> tuple[list[dict[str, Any]], TableDef]:
+def build(
+    source: SrfSource, ctx: Any, describe_only: bool = False
+) -> tuple[list[dict[str, Any]], TableDef]:
     """Materialize the SRF's rows as documents and a synthetic single-source
-    ``TableDef`` describing the value (and optional ``WITH ORDINALITY``) columns."""
+    ``TableDef`` describing the value (and optional ``WITH ORDINALITY``) columns.
+
+    ``describe_only`` returns the shape without invoking catalog UDFs (empty
+    rows for those) — see ``_values_and_tag``."""
     if _is_record_srf(source.node):
         return _build_record(source, ctx)
-    values, tag = _values_and_tag(source.node, ctx)
+    values, tag = _values_and_tag(source.node, ctx, describe_only)
     default = _default_name(source.node)
     # A single-column SRF's column takes the explicit column alias, else the table
     # alias (Postgres: ``FROM generate_series(1,5) AS g`` names the column ``g``),

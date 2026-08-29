@@ -45,10 +45,15 @@ from secantus.geo_index import (
     s2_doc_covering,
     s2_query_covering,
 )
-from secantus.paths import get_path, get_path_values
-from secantus.projection import apply_projection
+from secantus.paths import get_path, get_path_values, set_path
+from secantus.projection import apply_projection_batch
 from secantus.query import matches
-from secantus.sortkey import COMPOUND_SEP, encode_value, encode_value_directed
+from secantus.sortkey import (
+    COMPOUND_SEP,
+    RANK_ARRAY,
+    encode_value,
+    encode_value_directed,
+)
 from secantus.update import apply_update, find_positional_matches
 
 _GEO_2DSPHERE = "2dsphere"
@@ -151,7 +156,10 @@ def _doc_shard_name(s: int) -> str:
     return f"table:secantus_documents_sh{s}"
 
 
+@functools.lru_cache(maxsize=4096)
 def _doc_table_for(db: str, coll: str) -> str:
+    # Memoised: the pure-Python FNV byte loop ran on every storage op for an
+    # immutable (db, coll) -> shard-name mapping.
     return _doc_shard_name(_doc_shard_hash(db, coll) % _DOC_SHARDS)
 
 
@@ -289,6 +297,23 @@ _NAT_SEQ_TABLE = "table:secantus_natural_seq"
 _INT64_MIN = -(2**63)  # lowest WT ``q`` key — scan a (db, coll) prefix from the start
 _IDX_TABLE = "table:secantus_indexes"
 _IDX_ENTRIES_TABLE = "table:secantus_index_entries"
+#: ``(db, coll, index) + escape(sortkey) -> RecordId``. Unique indexes ONLY.
+#: The index-entries table above keys by ``sortkey + RecordId``, so two docs
+#: sharing an indexed value produce DIFFERENT keys and never collide — which is
+#: why uniqueness had to be a snapshot-read probe, and why that probe could not
+#: see a value another transaction committed after your snapshot. Here the key
+#: IS the indexed value, so WiredTiger enforces it: a duplicate is WT's own
+#: WT_DUPLICATE_KEY, and two concurrent inserts of the same value are a
+#: write-write conflict rather than two silent successes.
+_UNIQ_TABLE = "table:secantus_unique_keys"
+#: Pending-drop tombstones written by the RUST server's chunked two-phase drop
+#: (phase 1 unregisters the collection and writes `(db, coll) -> b""` here;
+#: phase 2 purges the rows in bounded batches and clears the row). The Python
+#: server never writes tombstones — its drop is autocommit per-row, so it has
+#: no unbounded purge transaction — but it must FINISH one left by a Rust
+#: crash mid-purge (cross-server portability: the layouts are byte-identical),
+#: or the orphan rows resurface inside a re-created collection.
+_TOMB_TABLE = "table:secantus_drop_tombstones"
 _OPLOG_TABLE = "table:secantus_oplog"
 # The oplog is sharded across ``_OPLOG_SHARDS`` btrees in the Rust server so
 # concurrent writers don't all rendezvous on one table's rightmost append page
@@ -376,6 +401,20 @@ def _pack_entry(kb: bytes, recordid: int) -> bytes:
     ``pack_entry``.
     """
     return _escape_kb(kb) + _ENTRY_SEP + recordid.to_bytes(8, "big", signed=True)
+
+
+def _is_whole_array_key(escaped_key: bytes, idx_dir: int) -> bool:
+    """Whether an index entry's key is a whole-array key rather than an element.
+
+    The first byte of an encoded value is its type rank (see `sortkey`), and
+    escaping only rewrites `\x00`, which no rank byte is. A descending column is
+    encoded byte-inverted, so the rank arrives as `0xFF - rank` there.
+    """
+    if not escaped_key:
+        return False
+    first = escaped_key[0]
+    expected = RANK_ARRAY if idx_dir >= 0 else 0xFF - RANK_ARRAY
+    return first == expected
 
 
 def _unpack_entry(packed: bytes) -> tuple[bytes, int | None]:
@@ -532,6 +571,23 @@ def extract_backup_archive(
     }
 
 
+class UniqueKeyTaken(Exception):
+    """A unique-index key WiredTiger refused because another row holds it.
+
+    Raised while index entries are written, which is AFTER the snapshot-read
+    probe has passed — so this is precisely the case that probe cannot see: a
+    value another transaction committed after our snapshot, or a concurrent
+    insert of the same value. Callers turn it into the same duplicate-key write
+    error the probe produces, so clients see one behaviour either way.
+    """
+
+    def __init__(self, index: str, key_pattern: dict[str, Any], key_value: dict[str, Any]) -> None:
+        super().__init__(f"duplicate key on {index}: {key_value!r}")
+        self.index = index
+        self.key_pattern = key_pattern
+        self.key_value = key_value
+
+
 class DuplicateKeyError(Exception):
     def __init__(self, doc_id: Any) -> None:
         super().__init__(f"duplicate _id: {doc_id!r}")
@@ -544,6 +600,28 @@ def _is_operator_expr(v: Any) -> bool:
     a literal subdocument equality value (``{f: 1, f2: 2}``). Used by the
     upsert seed extraction to tell the two apart."""
     return isinstance(v, dict) and len(v) > 0 and all(k.startswith("$") for k in v)
+
+
+def _order_upserted_doc(new: dict[str, Any], seeded: list[str]) -> dict[str, Any]:
+    """mongod's field order for an upserted document (probed 6.0.16).
+
+    ``_id`` first, then the fields seeded from the query's equalities in
+    field-name order, then whatever the update added, also in field-name
+    order. ``seeded`` is the query-derived top-level key list.
+
+    Ours came out in "query order, then update-document order, then ``_id``
+    appended last", so a ``findAndModify`` upsert handed the client a document
+    whose bytes mongod would never emit -- ``_id`` at the END, most visibly.
+    """
+    rest = {k: v for k, v in new.items() if k != "_id"}
+    from_query = sorted(k for k in rest if k in seeded)
+    from_update = sorted(k for k in rest if k not in seeded)
+    ordered: dict[str, Any] = {}
+    if "_id" in new:
+        ordered["_id"] = new["_id"]
+    for k in from_query + from_update:
+        ordered[k] = rest[k]
+    return ordered
 
 
 def _id_key(doc_id: Any) -> bytes:
@@ -937,6 +1015,36 @@ class IndexConflict(Exception):
         self.key_value = key_value
 
 
+def _parse_cache_bytes(cache_size: str) -> int:
+    """Parse a WiredTiger cache-size string ("128M", "1G", "512K", plain
+    bytes) to bytes. Unknown forms fall back to the 1G default rather than
+    failing storage open over a tuning knob."""
+    s = cache_size.strip().upper()
+    mult = 1
+    for suffix, m in (("K", 1024), ("M", 1024**2), ("G", 1024**3), ("T", 1024**4)):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+            mult = m
+            break
+    try:
+        return int(float(s) * mult)
+    except ValueError:
+        return 1024**3
+
+
+class TransactionTooLargeError(Exception):
+    """A multi-document transaction's buffered write volume exceeded the
+    storage cache's dirty budget. Raised BEFORE the transaction can pin
+    enough unevictable dirty content to livelock WiredTiger (the same
+    engine-stall class the chunked-insert work closed for plain batch
+    writes — a user transaction's statements all join one WT transaction,
+    so chunking cannot apply and the guard must be explicit). Caught at
+    the command layer and surfaced as mongod's ``TransactionTooLargeForCache``
+    (313), which mongod introduced for exactly this condition; the failed
+    statement aborts the transaction and carries NO transient label —
+    retrying an oversized transaction would hit the same wall."""
+
+
 class WriteConflictError(Exception):
     """A WiredTiger WT_ROLLBACK: two transactions touched the same item.
 
@@ -1106,7 +1214,16 @@ class UserTransactionHandle:
     that ``commit_user_transaction`` flushes.
     """
 
-    __slots__ = ("session", "cursors", "began", "closed", "oplog_entries", "pre_images")
+    __slots__ = (
+        "session",
+        "cursors",
+        "began",
+        "closed",
+        "oplog_entries",
+        "pre_images",
+        "written",
+        "dirty_bytes",
+    )
 
     def __init__(self, session: Any) -> None:
         self.session = session
@@ -1115,6 +1232,18 @@ class UserTransactionHandle:
         self.closed = False
         self.oplog_entries: list[dict[str, Any]] = []
         self.pre_images: list[bytes | None] = []
+        # (db, coll) this transaction has written to. A committed-state read
+        # (``find_matching_committed``) is only authoritative for a collection
+        # the transaction has NOT touched: once it has deleted or rewritten a
+        # row, the committed view of that row is stale and would report a
+        # conflict against a value the transaction has already freed.
+        self.written: set[tuple[str, str]] = set()
+        # Approximate bytes this transaction has written, accumulated from
+        # its buffered oplog entries (which carry the full documents). The
+        # engine-side dirty footprint is roughly twice this (doc rows +
+        # oplog rows) plus index entries; ``_emit_oplog``'s buffering
+        # branch enforces the cache-derived budget against it.
+        self.dirty_bytes = 0
 
 
 class DocumentValidationError(Exception):
@@ -1284,6 +1413,19 @@ class Storage:
         self._in_memory = path == ":memory:"
         # Stashed for reuse in restore-archive / explain output.
         self.cache_size = cache_size
+        # Public, read-only view of the above for callers outside storage
+        # (``serverStatus.storageEngine.persistent``). Exposed as a property
+        # below rather than a second attribute so it cannot drift.
+        # Dirty budget for one multi-document transaction, derived from the
+        # cache: WT starts stalling application threads around its dirty
+        # trigger (~20% of cache), and dirty content belonging to an OPEN
+        # transaction is unevictable — a transaction allowed to fill that
+        # budget livelocks the engine (only its own commit could free the
+        # cache). mongod guards the same hazard with
+        # ``TransactionTooLargeForCache``; 0.75 of the dirty trigger mirrors
+        # its threshold default. The estimate compared against it is
+        # 2 x buffered-entry bytes (doc rows + oplog rows).
+        self._txn_dirty_limit = int(_parse_cache_bytes(cache_size) * 0.20 * 0.75)
         self.session_max = session_max
         self.sync_on_commit = sync_on_commit
         # ``durable`` (I2a test-mode fast storage). Resolution precedence:
@@ -1428,6 +1570,8 @@ class Storage:
             boot.create(_NAT_SEQ_TABLE, "key_format=SSu,value_format=q")
             boot.create(_IDX_TABLE, "key_format=SSS,value_format=u")
             boot.create(_IDX_ENTRIES_TABLE, "key_format=SSSu,value_format=u")
+            boot.create(_UNIQ_TABLE, "key_format=SSSu,value_format=q")
+            boot.create(_TOMB_TABLE, "key_format=SS,value_format=u")
             boot.create(_OPLOG_TABLE, "key_format=q,value_format=u")
             boot.create(_PREIMAGE_TABLE, "key_format=q,value_format=u")
             boot.create(_OPLOG_META_TABLE, "key_format=S,value_format=u")
@@ -1482,6 +1626,21 @@ class Storage:
         # of the WT concurrency plan) so concurrent writers can mint
         # without contending on the global storage lock.
         self._oplog_seq_lock = threading.Lock()
+        # In-flight mint window: ``start_seq -> end_seq`` (exclusive) for every
+        # minted batch whose transaction has not yet committed or rolled back.
+        # Guarded by ``_oplog_seq_lock``. The **visible tail** — the largest
+        # seq below which nothing can still appear — is ``min(window) - 1``
+        # when non-empty, else ``_next_seq - 1`` (the analogue of WiredTiger /
+        # mongod's ``all_durable`` timestamp, and the twin of the Rust
+        # server's ``OplogState.in_flight``). Since the Phase-2.4
+        # per-collection lock split, writers on different collections mint
+        # and commit independently — a reader that advanced past a
+        # minted-but-uncommitted seq would permanently lose the event when
+        # its transaction commits, so every tail readers consume is bounded
+        # by this window's floor. A rolled-back batch simply deregisters:
+        # the abandoned range vanishes and ``min`` moves on (a permanent seq
+        # hole, which the oplog merge already tolerates).
+        self._oplog_in_flight: dict[int, int] = {}
         # Tiny lock for the monotonic insertion-order counter (_NAT_TABLE seq).
         # Global (not per-collection): seqs are unique across the whole store
         # so an unsorted scan within any one collection still sees a strictly
@@ -1523,6 +1682,10 @@ class Storage:
             # is exceeded. Seeded here by a one-time key-only count (cheap, and
             # only on open); maintained incrementally on every emit / prune.
             self._oplog_live_count = self._count_oplog_rows()
+            # Finish any chunked drop the Rust server's crash interrupted
+            # (registry row already gone; the tombstoned rows must not
+            # resurface under a re-created name). See ``_TOMB_TABLE``.
+            self._recover_pending_drops_locked()
 
         # TTL sweeper. Real mongod runs ``ttlMonitor`` every 60s by
         # default; we mirror that. ``ttl_sweep_seconds <= 0`` disables
@@ -1891,8 +2054,62 @@ class Storage:
         with self._oplog_seq_lock:
             start = self._next_seq
             self._next_seq += n
+            # Register the range in the in-flight window (same lock
+            # acquisition — zero extra locking). The emitting scope parks it
+            # on ``_tls.pending_minted`` for its resolution point (batch-txn
+            # exit, user-txn commit/abort, or end-of-emit for bare
+            # autocommit writes) to deregister via ``_deregister_minted``.
+            self._oplog_in_flight[start] = start + n
             timestamps = [self._mint_ts() for _ in range(n)]
             return start, timestamps
+
+    def _deregister_minted(self, ranges: list[tuple[int, int]]) -> None:
+        """Remove minted seq ranges from the in-flight window and wake
+        tailable waiters — their transaction committed (rows visible) or
+        rolled back (rows can never appear); either way the visible tail
+        may have advanced."""
+        if not ranges:
+            return
+        with self._oplog_seq_lock:
+            for start, _end in ranges:
+                self._oplog_in_flight.pop(start, None)
+        with self._oplog_cv:
+            self._oplog_cv.notify_all()
+
+    def _drain_pending_minted(self) -> list[tuple[int, int]]:
+        """Take (and clear) the ranges the current thread's scope minted."""
+        pending = getattr(self._tls, "pending_minted", None)
+        if not pending:
+            return []
+        self._tls.pending_minted = []
+        return pending
+
+    def oplog_visible_tail_seq(self) -> int:
+        """The highest seq a reader may consume or name in a resume
+        position: everything at or below it is committed-and-visible or a
+        permanent hole. Tail readers, resume-token high-water marks, and
+        ``read_oplog``'s bound all use THIS, never the minted
+        ``oplog_tail_seq`` — a minted-but-uncommitted seq below the minted
+        tail is an event a reader would otherwise permanently skip."""
+        with self._oplog_seq_lock:
+            if self._oplog_in_flight:
+                return min(self._oplog_in_flight) - 1
+            return self._next_seq - 1
+
+    def oplog_visible_tail_seq_nolock(self) -> int:
+        """Lock-free ``oplog_visible_tail_seq`` for the tailable-getMore
+        wake predicate (same deadlock-avoidance contract as
+        ``oplog_tail_seq_nolock``: a waiter holding ``_oplog_cv`` must not
+        take other locks). Dict reads are atomic under the GIL; a
+        momentarily stale value self-corrects on the next predicate check
+        because every deregistration notifies the condvar."""
+        inflight = self._oplog_in_flight
+        if inflight:
+            try:
+                return min(inflight) - 1
+            except ValueError:  # raced to empty between check and min
+                pass
+        return self._next_seq - 1
 
     def _collection_uuid(self, db: str, coll: str) -> _uuid.UUID:
         """Return the collection's UUID, minting and persisting on first call.
@@ -2084,7 +2301,7 @@ class Storage:
         if limit > 0:
             rows = rows[:limit]
         if projection:
-            rows = [apply_projection(r, projection, filter) for r in rows]
+            rows = apply_projection_batch(rows, projection, filter)
         return rows
 
     def _is_system_users(self, db: str, coll: str) -> bool:
@@ -2171,7 +2388,7 @@ class Storage:
         if limit > 0:
             rows = rows[:limit]
         if projection:
-            rows = [apply_projection(r, projection, filter) for r in rows]
+            rows = apply_projection_batch(rows, projection, filter)
         return rows
 
     def _count_system_users(
@@ -2238,7 +2455,7 @@ class Storage:
         if limit > 0:
             rows = rows[:limit]
         if projection:
-            rows = [apply_projection(r, projection, filter) for r in rows]
+            rows = apply_projection_batch(rows, projection, filter)
         return rows
 
     def _count_system_version(
@@ -2326,6 +2543,14 @@ class Storage:
             return 0
         handle = getattr(self._tls, "user_txn", None)
         if handle is not None:
+            handle.dirty_bytes += sum(len(bson.encode(e)) for e in entries)
+            if 2 * handle.dirty_bytes > self._txn_dirty_limit:
+                # The statement's partial writes roll back with the
+                # transaction (any failed in-txn statement aborts it
+                # server-side, mongod parity).
+                raise TransactionTooLargeError(
+                    "Transaction is too large and will not fit in the storage engine cache"
+                )
             if self.enable_oplog and entries:
                 if pre_images is None:
                     pre_images = [None] * len(entries)
@@ -2346,38 +2571,65 @@ class Storage:
         # session without holding any cross-thread Python lock.
         n = len(entries)
         start_seq, ts_range = self._mint_oplog_seq_and_ts(n)
-        op_cur = self._cursor(_OPLOG_TABLE)
-        pre_cur = None
+        # Whose commit resolves this mint? Inside a batch transaction (or the
+        # user-txn commit flush, which sets the same flag) the rows commit
+        # later — park the range for the transaction's resolution point to
+        # deregister. Outside (a bare emit whose cursor writes autocommit)
+        # the range deregisters at the end of this method.
+        deferred = getattr(self._tls, "defer_minted", False)
+        if deferred:
+            pending = getattr(self._tls, "pending_minted", None)
+            if pending is None:
+                pending = self._tls.pending_minted = []
+            pending.append((start_seq, start_seq + n))
+        # Mint-to-deregister must be exception-safe on the bare autocommit
+        # path: if the cursor-write loop or the opportunistic prune raises (a
+        # WT write error / WT_ROLLBACK under contention — expected, not
+        # exotic), the minted range must still leave ``_oplog_in_flight``.
+        # Otherwise ``oplog_visible_tail_seq`` clamps at that seq for the life
+        # of the process and change streams server-wide silently freeze — a
+        # self-inflicted DoS (#714). A deferred emit's range is owned by its
+        # transaction's commit/rollback, so it is NOT deregistered here.
         last_seq = 0
-        for i, (entry, pre) in enumerate(zip(entries, pre_images, strict=True)):
-            seq = start_seq + i
-            entry_with_ts = dict(entry)
-            if "ts" not in entry_with_ts:
-                entry_with_ts["ts"] = ts_range[i]
-            if "wall" not in entry_with_ts:
-                entry_with_ts["wall"] = _dt.datetime.now(_dt.timezone.utc)
-            op_cur[seq] = bson.encode(entry_with_ts)
-            if pre is not None:
-                if pre_cur is None:
-                    pre_cur = self._cursor(_PREIMAGE_TABLE)
-                pre_cur[seq] = pre
-            last_seq = seq
-        # ``_persist_oplog_meta`` was called here on every emit, but
-        # under concurrent writers it WT-rollbacks half the time —
-        # every writer hits the same single ``"state"`` meta row.
-        # The meta row is purely a recovery optimisation; if it's
-        # stale, ``_load_oplog_meta``'s fallback scans the oplog
-        # table for the actual max seq. So we now persist only on
-        # close + on prune_oplog, both of which are rare. The seq
-        # mint itself is durable because the actual oplog rows are
-        # written on every emit.
-        self._oplog_live_count += len(entries)
-        self._oplog_emit_count += len(entries)
-        if self._oplog_emit_count >= _OPLOG_PRUNE_INTERVAL:
-            self._oplog_emit_count = 0
-            self._prune_oplog_locked(now=self._time())
-        with self._oplog_cv:
-            self._oplog_cv.notify_all()
+        try:
+            op_cur = self._cursor(_OPLOG_TABLE)
+            pre_cur = None
+            for i, (entry, pre) in enumerate(zip(entries, pre_images, strict=True)):
+                seq = start_seq + i
+                entry_with_ts = dict(entry)
+                if "ts" not in entry_with_ts:
+                    entry_with_ts["ts"] = ts_range[i]
+                if "wall" not in entry_with_ts:
+                    entry_with_ts["wall"] = _dt.datetime.now(_dt.timezone.utc)
+                op_cur[seq] = bson.encode(entry_with_ts)
+                if pre is not None:
+                    if pre_cur is None:
+                        pre_cur = self._cursor(_PREIMAGE_TABLE)
+                    pre_cur[seq] = pre
+                last_seq = seq
+            # ``_persist_oplog_meta`` was called here on every emit, but
+            # under concurrent writers it WT-rollbacks half the time —
+            # every writer hits the same single ``"state"`` meta row.
+            # The meta row is purely a recovery optimisation; if it's
+            # stale, ``_load_oplog_meta``'s fallback scans the oplog
+            # table for the actual max seq. So we now persist only on
+            # close + on prune_oplog, both of which are rare. The seq
+            # mint itself is durable because the actual oplog rows are
+            # written on every emit.
+            self._oplog_live_count += len(entries)
+            self._oplog_emit_count += len(entries)
+            if self._oplog_emit_count >= _OPLOG_PRUNE_INTERVAL:
+                self._oplog_emit_count = 0
+                self._prune_oplog_locked(now=self._time())
+        finally:
+            if not deferred:
+                # Bare autocommit emit: the cursor writes above committed on
+                # their own, so the minted range resolves here (deregister +
+                # notify) even if the body raised. A deferred emit's range
+                # resolves at its transaction's commit/rollback instead.
+                self._deregister_minted([(start_seq, start_seq + n)])
+            with self._oplog_cv:
+                self._oplog_cv.notify_all()
         return last_seq
 
     @staticmethod
@@ -2478,13 +2730,31 @@ class Storage:
         rejected. Bounding the skip by the oplog *tail* instead loses events —
         the tail counts minted seqs, and an entry minted but not yet committed is
         invisible to this scan, so skipping to the tail steps over it forever.
+
+        Both the rows and ``scan_high`` are additionally clamped at the
+        **visible tail** (the in-flight window's floor): a committed row past a
+        still-in-flight lower mint is real data, but serving it — or letting
+        ``scan_high`` pass it — would advance a change-stream position over the
+        hole, permanently losing the in-flight event when its transaction
+        commits (the same minted-vs-committed race the Rust server's
+        visibility point closed; per-collection-locked writers commit out of
+        mint order across collections).
         """
+        # Read the bound BEFORE opening the read session: commit →
+        # deregister → this read → session open, so the session's snapshot
+        # necessarily contains every seq <= the bound.
+        max_seq = self.oplog_visible_tail_seq()
+        if start_seq > max_seq:
+            return [], start_seq - 1
         with self._lock:
             if self._closed:
                 return [], start_seq - 1
             session = self._conn.open_session()
             try:
-                return self._merge_oplog_on_session(session, start_seq, limit, ns_filter)
+                rows, scan_high = self._merge_oplog_on_session(session, start_seq, limit, ns_filter)
+                if rows and rows[-1][0] > max_seq:
+                    rows = [r for r in rows if r[0] <= max_seq]
+                return rows, min(scan_high, max_seq)
             finally:
                 with contextlib.suppress(Exception):
                     session.close()
@@ -2626,13 +2896,48 @@ class Storage:
                 with contextlib.suppress(Exception):
                     session.close()
 
-    def find_seq_for_ts(self, ts: Timestamp) -> int:
+    def find_seq_for_ts(self, ts: Timestamp, *, max_wait_seconds: float = 0.5) -> int:
         """Smallest seq whose entry ``ts >= target``. Tail+1 if none qualify.
 
-        Uses a private session for cross-thread visibility. Sharded: ts is
-        monotone in the *global* seq order, so the shard merge yields entries in
-        ts order — the first one at/after ``target`` is the answer.
+        The committed-view scan can name a seq above a minted-but-uncommitted
+        entry whose ts also qualifies (ts is minted monotonically with seq) —
+        a ``startAtOperationTime`` position finalised there would permanently
+        skip that entry when its transaction commits. So the answer is
+        accepted only once the visible tail covers it (no in-flight seq can
+        then exist below it); otherwise wait briefly for the window to drain
+        and rescan. Batch transactions resolve in microseconds; a long-open
+        user transaction hits the bounded deadline and falls back to the
+        committed-view answer — the pre-fix behaviour. Twin of the Rust
+        server's bounded wait.
+
+        ``max_wait_seconds`` is that bound. It is a parameter only so tests can
+        widen it.
+
+        The visible tail is sampled BEFORE the scan, and the order is load
+        bearing. Sampling it after left a window in which an in-flight mint
+        committed between the two reads: the scan still returned the answer
+        from before the commit (naming the seq *above* the in-flight one),
+        while the tail read afterwards had already advanced to cover it, so
+        the stale answer passed the check and the entry was skipped for good.
+        Sampling first is conservative in the safe direction — the tail only
+        ever grows, so an earlier reading is no larger than the true one at
+        scan time, and everything at or below it is resolved (committed or a
+        permanent hole) and therefore visible to the scan that follows.
         """
+        deadline = _time.monotonic() + max_wait_seconds
+        while True:
+            vis = self.oplog_visible_tail_seq()
+            r = self._find_seq_for_ts_scan(ts)
+            if r - 1 <= vis or _time.monotonic() >= deadline:
+                return r
+            with self._oplog_cv:
+                self._oplog_cv.wait(0.05)
+
+    def _find_seq_for_ts_scan(self, ts: Timestamp) -> int:
+        """One committed-view scan for ``find_seq_for_ts``. Uses a private
+        session for cross-thread visibility. Sharded: ts is monotone in the
+        *global* seq order, so the shard merge yields entries in ts order —
+        the first one at/after ``target`` is the answer."""
         with self._lock:
             if self._closed:
                 return 0
@@ -2996,6 +3301,11 @@ class Storage:
     ) -> None:
         self.close()
 
+    @property
+    def in_memory(self) -> bool:
+        """True when this store is the ``:memory:`` (non-persistent) variant."""
+        return self._in_memory
+
     def close(self) -> None:
         # Stop background threads before tearing down WT — both the
         # TTL sweeper and the noop heartbeat acquire ``self._lock``,
@@ -3237,6 +3547,36 @@ class Storage:
             # Storage.close() to tear down cross-thread. See close()'s join note.
             self._reset_thread_session()
 
+    def release_thread_snapshot(self) -> None:
+        """Release the calling thread's WT read snapshot and cursor positions.
+
+        Call at the END of every request/statement (both wire servers do).
+        ``_refresh_read_snapshot`` releases a stale snapshot at the *start* of
+        the next read — but a connection that goes idle after its last
+        statement never reaches that point, and a cached session left with a
+        positioned cursor holds an implicit transaction that pins WiredTiger's
+        oldest-transaction horizon indefinitely. Every write after that pin
+        keeps its history unevictable, so per-operation cost grows linearly
+        with churn until page reads stall the whole server (the pgjdbc gauge's
+        CopyLargeFileTest wedge: one idle connection's pinned snapshot turned a
+        4-minute test into a 2-hour lane timeout). ``WT_SESSION.reset()``
+        releases the snapshot and resets every cursor position in one call;
+        cached cursor handles stay valid (``_cursor`` re-``reset()``s before
+        each reuse).
+
+        No-op inside a user transaction — its pinned snapshot is the
+        transaction's semantics, bounded by the servers' transaction-lifetime
+        / idle-in-transaction timeouts."""
+        if getattr(self._tls, "user_txn", None) is not None:
+            return
+        s = getattr(self._tls, "session", None)
+        if s is None:
+            return
+        with self._lock:
+            if not self._closed:
+                with contextlib.suppress(Exception):
+                    s.reset()
+
     def _reset_thread_session(self) -> None:
         """Close the calling thread's cached WT session + cursors so
         the next ``_session()`` call opens fresh ones. Needed when a
@@ -3359,7 +3699,7 @@ class Storage:
         from . import pitr_archive
 
         with self._lock:
-            head = self.oplog_tail_seq_nolock()
+            head = self.oplog_visible_tail_seq_nolock()
         out = os.path.join(archive_dir, pitr_archive.base_name(head))
         result = self.create_archive(out)
         result["headSeq"] = head
@@ -3373,7 +3713,7 @@ class Storage:
         directly; the manifest lets tooling report a backup's recoverable
         range without opening WiredTiger. Must be called under ``self._lock``."""
         floor = self.oplog_floor_seq()
-        head = self.oplog_tail_seq_nolock()
+        head = self.oplog_visible_tail_seq_nolock()
 
         def _row(seq: int) -> dict[str, Any] | None:
             if seq <= 0:
@@ -3451,6 +3791,14 @@ class Storage:
             with contextlib.suppress(Exception):
                 c.reset()
         session.begin_transaction()
+        # Emits inside this transaction park their minted seq ranges on
+        # ``_tls.pending_minted``; the ``finally`` deregisters them from the
+        # in-flight window on EVERY exit — after the commit (rows visible:
+        # the visible tail may advance and tailable waiters wake) and after
+        # a rollback (rows can never appear: the abandoned range must not
+        # pin the tail forever).
+        prev_defer = getattr(self._tls, "defer_minted", False)
+        self._tls.defer_minted = True
         try:
             yield session
         except Exception:
@@ -3459,6 +3807,9 @@ class Storage:
             raise
         else:
             _commit_batch_transaction(session, sync)
+        finally:
+            self._tls.defer_minted = prev_defer
+            self._deregister_minted(self._drain_pending_minted())
 
     def _session(self) -> Any:
         s = getattr(self._tls, "session", None)
@@ -3512,6 +3863,79 @@ class Storage:
             # path is defensive — log via ``suppress`` and move on.
             s.reset_snapshot()
 
+    @contextlib.contextmanager
+    def _committed_read_scope(self) -> Iterator[None]:
+        """Run reads on this thread against the latest COMMITTED state.
+
+        Swaps a fresh session (and its own cursor cache) into ``_tls`` for the
+        duration, with ``user_txn`` cleared, so every existing read path
+        transparently sees committed data instead of the transaction's pinned
+        snapshot. READ-ONLY: a write inside this scope would land outside the
+        caller's transaction and escape its rollback.
+        """
+        tls = self._tls
+        saved = (
+            getattr(tls, "session", None),
+            getattr(tls, "cursors", None),
+            getattr(tls, "user_txn", None),
+        )
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Storage is closed")
+            session = self._conn.open_session()
+        tls.session, tls.cursors, tls.user_txn = session, {}, None
+        try:
+            yield
+        finally:
+            for cur in list(tls.cursors.values()):
+                with contextlib.suppress(Exception):
+                    cur.close()
+            tls.session, tls.cursors, tls.user_txn = saved
+            with contextlib.suppress(Exception):
+                session.close()
+
+    def _note_write(self, db: str, coll: str) -> None:
+        """Record that the in-flight user transaction has written to this
+        collection, which disqualifies the committed-state probe for it (see
+        ``find_matching_committed``)."""
+        txn = getattr(self._tls, "user_txn", None)
+        if txn is not None:
+            txn.written.add((db, coll))
+
+    def find_matching_committed(
+        self, db: str, coll: str, filter: dict[str, Any] | None = None, *, limit: int = 0
+    ) -> list[dict[str, Any]]:
+        """``find_matching`` against the latest COMMITTED state, ignoring a user
+        transaction's pinned snapshot.
+
+        For CONSTRAINT ENFORCEMENT only, not for user-visible reads — those must
+        keep the transaction's view. A uniqueness probe is not an ordinary read:
+        Postgres pins your read snapshot too, yet still checks a unique index
+        against committed data, so a value another transaction committed after
+        your snapshot conflicts. Probing through the snapshot instead let the
+        duplicate through and stored it.
+
+        Outside a user transaction this is plain ``find_matching`` — the
+        session's snapshot is already refreshed per read — so the common path
+        costs nothing extra.
+
+        Returns nothing once the transaction has WRITTEN to the collection: the
+        committed view of a row this transaction has deleted or rewritten is
+        stale, and reporting it would reject a value the transaction has
+        legitimately freed (delete-then-reinsert inside one transaction is
+        valid, and Postgres allows it). The caller's own snapshot probe still
+        covers everything visible to the transaction; what is given up is
+        catching a *late* outside commit in a transaction that has already
+        written to the same table.
+        """
+        txn = getattr(self._tls, "user_txn", None)
+        if txn is None:
+            return self.find_matching(db, coll, filter, limit=limit)
+        if (db, coll) in txn.written:
+            return []
+        with self._committed_read_scope():
+            return self.find_matching(db, coll, filter, limit=limit)
+
     # -- user (multi-document) transactions --------------------------------
     #
     # A user transaction owns a dedicated WT session, NOT the connection
@@ -3549,11 +3973,18 @@ class Storage:
             handle.session.begin_transaction()
             handle.began = True
         with self._install_txn_session(handle):
+            # Save/restore rather than clear: a nested entry (a scalar function
+            # like ``lo_creat`` running storage ops inside a statement that is
+            # itself inside the transaction) must not strip the outer entry's
+            # marker — that made the enclosing INSERT run ``_batch_transaction``
+            # against the transaction's session and hit WT's "begin_transaction
+            # not permitted in a running transaction".
+            prev_user_txn = getattr(self._tls, "user_txn", None)
             self._tls.user_txn = handle
             try:
                 yield
             finally:
-                self._tls.user_txn = None
+                self._tls.user_txn = prev_user_txn
 
     def commit_user_transaction(
         self,
@@ -3596,10 +4027,22 @@ class Storage:
                 with self._install_txn_session(handle):
                     # ``_tls.user_txn`` is deliberately NOT set here, so
                     # ``_emit_oplog`` takes its real write path on the
-                    # transaction's session instead of re-buffering.
-                    if entries:
-                        last_seq = self._emit_oplog(entries, pre_images)
-                    handle.session.commit_transaction()
+                    # transaction's session instead of re-buffering. The
+                    # flush's minted range is deferred (rows are not visible
+                    # until ``commit_transaction`` below) and deregistered in
+                    # the ``finally`` — after the commit on success, and on
+                    # the exception path before ``abort_user_transaction``
+                    # rolls back, so a failed commit can't pin the visible
+                    # tail on a corpse.
+                    prev_defer = getattr(self._tls, "defer_minted", False)
+                    self._tls.defer_minted = True
+                    try:
+                        if entries:
+                            last_seq = self._emit_oplog(entries, pre_images)
+                        handle.session.commit_transaction()
+                    finally:
+                        self._tls.defer_minted = prev_defer
+                        self._deregister_minted(self._drain_pending_minted())
         except Exception:
             self.abort_user_transaction(handle)
             raise
@@ -3892,7 +4335,23 @@ class Storage:
             opts = self._coll_options(db, coll) or {}
             return bool(opts.get("capped"))
 
-    @_retry_write_conflicts
+    # Bounds for one insert chunk's statement transaction. A single wire
+    # message can carry up to 48MB of documents, and writing them all in ONE
+    # WT transaction pins ~2-3x that as UNEVICTABLE dirty cache (doc rows +
+    # full-doc oplog entries + index entries). Once that approaches WT's
+    # dirty-stall fraction of the cache, the engine livelocks: every thread
+    # is drafted into eviction, but uncommitted content cannot be evicted and
+    # only this transaction's own commit could free it. Reproduced with
+    # 35k x 1.2KB docs against the 1G default cache (the mongo-rust-driver
+    # ``large_insert`` weekly-CI wedge); the same insert against a 4G cache
+    # takes 1.6s, and an 11MB insert against a 128M cache wedges identically.
+    # mongod never writes a whole client batch in one storage transaction
+    # either — it chunks internal insert batches — and batch inserts are
+    # per-document atomic only, so the extra commit points are invisible to
+    # clients.
+    _INSERT_CHUNK_MAX_DOCS = 1000
+    _INSERT_CHUNK_MAX_BYTES = 4 * 1024 * 1024
+
     def insert(
         self,
         db: str,
@@ -3902,15 +4361,94 @@ class Storage:
         ordered: bool = True,
         journal: bool = False,
     ) -> tuple[int, list[dict[str, Any]]]:
-        # Materialized so the conflict-retry wrapper can safely re-run
-        # the whole method (a generator would arrive exhausted).
+        self._note_write(db, coll)
         docs = list(docs)
+        # Encode every doc once, up front: the blob feeds both the per-chunk
+        # byte budget and the doc-table write (the chunk body reuses it, so
+        # this is the same one-encode-per-doc as before). Server-side ``_id``
+        # minting moves here too; a doc past an ordered stop may therefore
+        # gain an ``_id`` it wouldn't have before, which is invisible on the
+        # wire — drivers mint ``_id`` client-side.
+        prepared: list[tuple[dict[str, Any], bytes]] = []
+        for doc in docs:
+            if "_id" not in doc:
+                doc["_id"] = bson.ObjectId()
+            prepared.append((doc, bson.encode(doc)))
+        inserted = 0
+        errors: list[dict[str, Any]] = []
+        fresh_id_keys: set[bytes] = set()
+        if not prepared:
+            # Preserve the pre-chunking behaviour for an empty batch: the
+            # collection is still created (lazy ensure) even with no docs.
+            _, _, _ = self._insert_chunk(
+                db,
+                coll,
+                [],
+                base_index=0,
+                ordered=ordered,
+                sync=journal,
+                fresh_id_keys=fresh_id_keys,
+            )
+            return 0, []
+        start = 0
+        n = len(prepared)
+        while start < n:
+            end = start + 1
+            chunk_bytes = len(prepared[start][1])
+            while (
+                end < n
+                and end - start < self._INSERT_CHUNK_MAX_DOCS
+                and chunk_bytes + len(prepared[end][1]) <= self._INSERT_CHUNK_MAX_BYTES
+            ):
+                chunk_bytes += len(prepared[end][1])
+                end += 1
+            chunk_inserted, chunk_errors, stop = self._insert_chunk(
+                db,
+                coll,
+                prepared[start:end],
+                base_index=start,
+                ordered=ordered,
+                sync=journal,
+                fresh_id_keys=fresh_id_keys,
+            )
+            inserted += chunk_inserted
+            errors.extend(chunk_errors)
+            if stop:
+                break
+            start = end
+        return inserted, errors
+
+    @_retry_write_conflicts
+    def _insert_chunk(
+        self,
+        db: str,
+        coll: str,
+        prepared: list[tuple[dict[str, Any], bytes]],
+        *,
+        base_index: int,
+        ordered: bool,
+        sync: bool,
+        fresh_id_keys: set[bytes],
+    ) -> tuple[int, list[dict[str, Any]], bool]:
+        """One bounded statement transaction of :meth:`insert`.
+
+        ``prepared`` is ``[(doc, blob)]`` with ``_id`` already assigned;
+        ``base_index`` offsets per-doc error indexes back into the client's
+        batch. ``fresh_id_keys`` carries the *committed* prior chunks' keys so
+        capped eviction never evicts documents of the same client batch; this
+        chunk's keys are merged in only AFTER its transaction commits, so the
+        conflict-retry wrapper (which rolls the chunk back and re-runs it)
+        starts each attempt from a clean set. Returns
+        ``(inserted, errors, stop)`` — ``stop`` when an ordered batch hit an
+        error and the remaining chunks must not run.
+        """
         inserted = 0
         errors: list[dict[str, Any]] = []
         oplog_entries: list[dict[str, Any]] = []
-        fresh_id_keys: set[bytes] = set()
+        chunk_keys: set[bytes] = set()
+        stop = False
         oplog_on = self.enable_oplog
-        with self._coll_lock(db, coll), self._batch_transaction(sync=journal):
+        with self._coll_lock(db, coll), self._batch_transaction(sync=sync):
             # Per-collection lock (Phase 2.4): writes to other
             # collections proceed in parallel; same-collection writes
             # still serialise to keep the unique-index pre-check
@@ -3925,9 +4463,8 @@ class Storage:
             partials = self._partial_filters(db, coll)
             multikey_names = self._multikey_index_names(db, coll)
             timeseries = self._is_timeseries(db, coll)
-            for index, doc in enumerate(docs):
-                if "_id" not in doc:
-                    doc["_id"] = bson.ObjectId()
+            for offset, (doc, blob) in enumerate(prepared):
+                index = base_index + offset
                 key = _id_key(doc["_id"])
                 if timeseries:
                     # Duplicate _ids are legal in timeseries collections —
@@ -3948,6 +4485,7 @@ class Storage:
                         }
                     )
                     if ordered:
+                        stop = True
                         break
                     continue
                 # Pre-flight every geo index: a bad geometry should reject
@@ -3959,9 +4497,9 @@ class Storage:
                 except GeoExtractError as exc:
                     errors.append({"index": index, "code": 16572, "errmsg": str(exc)})
                     if ordered:
+                        stop = True
                         break
                     continue
-                blob = bson.encode(doc)
                 if len(blob) > MAX_BSON_OBJECT_SIZE:
                     # mongod rejects per-document at insert time with
                     # BSONObjectTooLarge (10334) and this exact wording.
@@ -3976,6 +4514,7 @@ class Storage:
                         }
                     )
                     if ordered:
+                        stop = True
                         break
                     continue
                 # ``_id`` index first: it mints the RecordId the doc row is keyed
@@ -3996,6 +4535,7 @@ class Storage:
                         }
                     )
                     if ordered:
+                        stop = True
                         break
                     continue
                 doc_cur = self._cursor(_doc_table_for(db, coll), overwrite=False)
@@ -4007,7 +4547,28 @@ class Storage:
                     # The RecordId is freshly minted and unique, so the only
                     # failure left here is a concurrency conflict.
                     raise WriteConflictError(str(exc)) from exc
-                self._write_index_entries(db, coll, doc, indexes, partials, recordid=recordid)
+                try:
+                    self._write_index_entries(db, coll, doc, indexes, partials, recordid=recordid)
+                except UniqueKeyTaken as taken:
+                    # WiredTiger refused the key: a duplicate the snapshot-read
+                    # probe above could not see. Reported exactly as the probe
+                    # would have, so the client sees one behaviour either way.
+                    self._undo_partial_insert(db, coll, recordid, key)
+                    errors.append(
+                        {
+                            "index": index,
+                            "code": 11000,
+                            "errmsg": format_dup_key_errmsg(
+                                f"{db}.{coll}", taken.index, taken.key_value
+                            ),
+                            "keyPattern": taken.key_pattern,
+                            "keyValue": taken.key_value,
+                        }
+                    )
+                    if ordered:
+                        stop = True
+                        break
+                    continue
                 multikey_names = self._maybe_mark_multikey(db, coll, doc, indexes, multikey_names)
                 inserted += 1
                 if oplog_on:
@@ -4020,14 +4581,18 @@ class Storage:
                             "o2": {"_id": doc["_id"]},
                         }
                     )
-                fresh_id_keys.add(key)
+                chunk_keys.add(key)
             cap_entries, cap_pre_images = self._enforce_capped_bounds_locked(
-                db, coll, fresh_id_keys, indexes, partials, oplog_on, ns, ui
+                db, coll, fresh_id_keys | chunk_keys, indexes, partials, oplog_on, ns, ui
             )
             if oplog_entries or cap_entries:
                 pre_images = [None] * len(oplog_entries) + cap_pre_images
                 self._emit_oplog(oplog_entries + cap_entries, pre_images)
-        return inserted, errors
+        # Only after the chunk's transaction committed: a conflict-retry rolls
+        # the chunk back and re-runs it, and must not leave phantom keys that
+        # would shield evictable docs from capped enforcement.
+        fresh_id_keys |= chunk_keys
+        return inserted, errors, stop
 
     def _enforce_capped_bounds_locked(
         self,
@@ -4196,7 +4761,9 @@ class Storage:
                         # If the index direction matches the sort direction,
                         # walk forward; if it's opposite, walk backward.
                         reverse = sort_dir != idx_dir
-                        candidates = self._walk_index_in_order(db, coll, idx_name, reverse=reverse)
+                        candidates = self._walk_index_in_order(
+                            db, coll, idx_name, reverse=reverse, idx_dir=idx_dir
+                        )
                         in_sort_order = True
                 # Multi-field sort acceleration: when sort has 2+ fields and
                 # filter is empty, try to find a compound index whose key
@@ -4237,7 +4804,7 @@ class Storage:
         if limit > 0:
             out = out[:limit]
         if projection:
-            out = [apply_projection(d, projection, filter) for d in out]
+            out = apply_projection_batch(out, projection, filter)
         return out
 
     def _apply_minmax_bounds(
@@ -4496,8 +5063,24 @@ class Storage:
         return None
 
     def _walk_index_in_order(
-        self, db: str, coll: str, name: str, *, reverse: bool = False
+        self, db: str, coll: str, name: str, *, reverse: bool = False, idx_dir: int = 1
     ) -> list[dict[str, Any]]:
+        """Documents in index order, for sort acceleration.
+
+        **Whole-array entries are skipped.** A multikey index writes one entry per
+        array element *plus* one for the whole array, and the whole-array key sorts
+        in the Array type slot — after every scalar. Walking backward therefore hits
+        those first, and the first-occurrence dedup below then picked documents by
+        their whole-array key instead of by their maximum element, which is what
+        mongod orders by. (Ascending never showed it: the element entries come
+        first there, so dedup naturally picked the minimum.)
+
+        Concretely, with `[{x: [5,9]}, {x: [1,100]}, {x: [7]}, {x: 6}]` and an
+        ascending index, descending returned insertion order rather than
+        `[1,100] < [5,9] < [7] < 6` by maxima. The whole-array entries exist to
+        answer equality against a whole array (`{x: [5, 9]}`) and have no business
+        deciding sort position, so this walk — used only for ordering — drops them.
+        """
         c = self._cursor(_IDX_ENTRIES_TABLE)
         c.set_key(db, coll, name, b"")
         rc = c.search_near()
@@ -4511,8 +5094,8 @@ class Storage:
             if (k[0], k[1], k[2]) != (db, coll, name):
                 break
             packed = bytes(k[3])
-            _esc, row_id = _unpack_entry(packed)
-            if row_id is not None:
+            esc, row_id = _unpack_entry(packed)
+            if row_id is not None and not _is_whole_array_key(esc, idx_dir):
                 recordids.append(row_id)
             if c.next() != 0:
                 break
@@ -4821,7 +5404,16 @@ class Storage:
                 sizes[name] = sizes.get(name, 0) + len(packed)
             return sizes
 
-    @_retry_write_conflicts
+    # Per-statement-transaction bounds for the chunked multi-document write
+    # paths (multi-update / unbounded delete) — the same values and the same
+    # rationale as the chunked insert (see _INSERT_CHUNK_MAX_DOCS): one
+    # transaction's dirty content is unevictable, and a matched set's rewrite
+    # volume is unbounded. mongod's updateMany / deleteMany are per-document
+    # write units and documented non-atomic, so the commit points match its
+    # semantics. Twin of the Rust WRITE_CHUNK_* consts.
+    _WRITE_CHUNK_MAX_DOCS = 1000
+    _WRITE_CHUNK_MAX_BYTES = 4 * 1024 * 1024
+
     def update_matching(
         self,
         db: str,
@@ -4835,9 +5427,309 @@ class Storage:
         let: dict[str, Any] | None = None,
         collation: Any = None,
         validator: dict[str, Any] | None = None,
+        validator_moderate: bool = False,
         journal: bool = False,
         return_post_images: bool = False,
     ) -> dict[str, Any]:
+        # Route: a multi-update outside a user transaction rewrites an
+        # unbounded matched set, so it runs CHUNKED (bounded dirty per
+        # statement transaction — the livelock class the chunked inserts
+        # closed). Single-doc updates, upsert-only outcomes and
+        # in-transaction updates keep the single-transaction body.
+        if multi and getattr(self._tls, "user_txn", None) is None:
+            return self._update_matching_chunked(
+                db,
+                coll,
+                filter,
+                update,
+                upsert=upsert,
+                array_filters=array_filters,
+                let=let,
+                collation=collation,
+                validator=validator,
+                validator_moderate=validator_moderate,
+                journal=journal,
+                return_post_images=return_post_images,
+            )
+        return self._update_matching_single_txn(
+            db,
+            coll,
+            filter,
+            update,
+            multi=multi,
+            upsert=upsert,
+            array_filters=array_filters,
+            let=let,
+            collation=collation,
+            validator=validator,
+            validator_moderate=validator_moderate,
+            journal=journal,
+            return_post_images=return_post_images,
+        )
+
+    def _update_matching_chunked(
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        update: dict[str, Any],
+        *,
+        upsert: bool,
+        array_filters: list[dict[str, Any]] | None,
+        let: dict[str, Any] | None,
+        collation: Any,
+        validator: dict[str, Any] | None,
+        validator_moderate: bool = False,
+        journal: bool,
+        return_post_images: bool,
+    ) -> dict[str, Any]:
+        """Chunked updateMany driver — twin of the Rust
+        ``update_matching_chunked``. One candidate scan collects matching
+        RecordIds; bounded statement transactions then process the
+        partitioned list, each chunk RE-FETCHING its doc rows inside its own
+        transaction (the scan's blobs must never feed a later chunk's
+        transform — a user transaction committing between chunks would be
+        silently overwritten from the stale read, with no overlapping WT
+        transactions to raise a conflict). A conflict retries only its own
+        rolled-back chunk, and the RecordId list is partitioned, so ``$inc``
+        applies exactly once per document."""
+        self._note_write(db, coll)
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        self._refresh_read_snapshot()
+        matched = 0
+        modified = 0
+        post_images: list[dict[str, Any]] | None = [] if return_post_images else None
+        with self._coll_lock(db, coll):
+            self._ensure_collection(db, coll)
+            if collation_obj is not None:
+                candidates = self._scan_docs(db, coll)
+            else:
+                candidates = self._candidates_iter(db, coll, filter)
+            rids = [
+                recordid
+                for recordid, _id_k, blob in candidates
+                if matches(bson.decode(blob), filter, vars=let, collation=collation_obj)
+            ]
+            idx = 0
+            while idx < len(rids):
+                consumed, m, w, posts = self._update_chunk(
+                    db,
+                    coll,
+                    rids[idx:],
+                    filter,
+                    update,
+                    array_filters=array_filters,
+                    let=let,
+                    collation_obj=collation_obj,
+                    validator=validator,
+                    validator_moderate=validator_moderate,
+                    journal=journal,
+                    want_posts=post_images is not None,
+                )
+                assert consumed > 0
+                idx += consumed
+                matched += m
+                modified += w
+                if post_images is not None:
+                    post_images.extend(posts)
+        if matched == 0:
+            # Zero matches (or every candidate stopped matching by its
+            # chunk's re-check): the single-transaction body rescans and
+            # degenerates to its upsert branch or a clean zero outcome. The
+            # coll lock is an RLock, but the delegation runs outside our
+            # ``with`` anyway.
+            return self._update_matching_single_txn(
+                db,
+                coll,
+                filter,
+                update,
+                multi=True,
+                upsert=upsert,
+                array_filters=array_filters,
+                let=let,
+                collation=collation,
+                validator=validator,
+                validator_moderate=validator_moderate,
+                journal=journal,
+                return_post_images=return_post_images,
+            )
+        result: dict[str, Any] = {
+            "matched": matched,
+            "modified": modified,
+            "upserted_id": None,
+            "did_upsert": False,
+        }
+        if post_images is not None:
+            result["post_images"] = post_images
+        return result
+
+    @_retry_write_conflicts
+    def _update_chunk(
+        self,
+        db: str,
+        coll: str,
+        rids: list[int],
+        filter: dict[str, Any],
+        update: dict[str, Any],
+        *,
+        array_filters: list[dict[str, Any]] | None,
+        let: dict[str, Any] | None,
+        collation_obj: Any,
+        validator: dict[str, Any] | None,
+        validator_moderate: bool = False,
+        journal: bool,
+        want_posts: bool,
+    ) -> tuple[int, int, int, list[dict[str, Any]]]:
+        """One bounded chunk of the multi-update: process RecordIds from the
+        front of ``rids`` until the doc/byte budget closes the transaction.
+        ``consumed`` counts every examined RecordId so the driver always
+        advances. Caller holds the coll lock."""
+        consumed = 0
+        matched = 0
+        modified = 0
+        chunk_bytes = 0
+        posts: list[dict[str, Any]] = []
+        oplog_entries: list[dict[str, Any]] = []
+        pre_images: list[bytes | None] = []
+        oplog_on = self.enable_oplog
+        with self._batch_transaction(sync=journal):
+            ns = self._ns(db, coll)
+            ui = self._collection_uuid(db, coll) if oplog_on else None
+            preimages_on = oplog_on and self._pre_post_images_enabled(db, coll)
+            indexes = self._all_indexes(db, coll)
+            partials = self._partial_filters(db, coll)
+            multikey_names = self._multikey_index_names(db, coll)
+            is_replacement = not isinstance(update, list) and not any(
+                isinstance(k, str) and k.startswith("$") for k in update
+            )
+            doc_cur = self._cursor(_doc_table_for(db, coll))
+            for recordid in rids:
+                if (
+                    modified >= self._WRITE_CHUNK_MAX_DOCS
+                    or chunk_bytes >= self._WRITE_CHUNK_MAX_BYTES
+                ):
+                    break
+                consumed += 1
+                # Fresh read inside THIS transaction (see the driver note).
+                doc_cur.reset()
+                doc_cur.set_key(db, coll, recordid)
+                if doc_cur.search() != 0:
+                    continue
+                id_k, blob = _unframe_doc_value(bytes(doc_cur.get_value()))
+                doc = bson.decode(blob)
+                if not matches(doc, filter, vars=let, collation=collation_obj):
+                    continue
+                matched += 1
+                pos = find_positional_matches(doc, filter)
+                new = apply_update(
+                    doc,
+                    update,
+                    array_filters=array_filters,
+                    positional_matches=pos,
+                    let=let,
+                )
+                if new != doc:
+                    # ``validationLevel: "moderate"`` exempts a document that
+                    # ALREADY failed the validator before this update — the level
+                    # exists so a validator can be added to a collection with
+                    # legacy rows without freezing them. A doc that currently
+                    # SATISFIES the validator is still held to it, so an update
+                    # cannot break a valid doc.
+                    was_already_invalid = validator_moderate and not matches(doc, validator)
+                    if (
+                        validator is not None
+                        and not matches(new, validator)
+                        and not was_already_invalid
+                    ):
+                        raise DocumentValidationError(new.get("_id"))
+                    conflict = self._unique_conflict(
+                        db, coll, new, indexes, exclude_recordid=recordid, partials=partials
+                    )
+                    if conflict is not None:
+                        cname, kpat, kval = conflict
+                        raise IndexConflict(
+                            cname,
+                            new["_id"],
+                            key_pattern=kpat,
+                            key_value=kval,
+                            namespace=f"{db}.{coll}",
+                        )
+                    self._validate_geo_indexes(db, coll, new, indexes, partials)
+                    new_blob = bson.encode(new)
+                    if len(new_blob) > MAX_BSON_OBJECT_SIZE:
+                        raise DocumentTooLargeError(
+                            10334,
+                            "Plan executor error during update :: caused by :: "
+                            f"Resulting document after update is larger than "
+                            f"{MAX_BSON_OBJECT_SIZE}",
+                        )
+                    modified += 1
+                    chunk_bytes += len(new_blob)
+                    self._delete_index_entries(db, coll, doc, indexes, partials, recordid=recordid)
+                    doc_cur.reset()
+                    doc_cur[db, coll, recordid] = _frame_doc_value(id_k, new_blob)
+                    try:
+                        self._write_index_entries(
+                            db, coll, new, indexes, partials, recordid=recordid
+                        )
+                    except UniqueKeyTaken as taken:
+                        raise self._index_conflict_from(db, coll, new, taken) from taken
+                    multikey_names = self._maybe_mark_multikey(
+                        db, coll, new, indexes, multikey_names
+                    )
+                    if oplog_on:
+                        if is_replacement:
+                            o_field: dict[str, Any] = dict(new)
+                        else:
+                            o_field = {"$v": 2, "diff": compute_update_description(doc, new)}
+                        oplog_entries.append(
+                            {
+                                "op": "u",
+                                "ns": ns,
+                                "ui": bson.Binary(ui.bytes, subtype=4),
+                                "o": o_field,
+                                "o2": {"_id": doc["_id"]},
+                            }
+                        )
+                        if preimages_on:
+                            chunk_bytes += len(blob)
+                            pre_images.append(blob)
+                        else:
+                            pre_images.append(None)
+                if want_posts:
+                    posts.append(new)
+            cap_ns = ns if oplog_on else ""
+            cap_entries, cap_pre = self._enforce_capped_bounds_locked(
+                db, coll, set(), indexes, partials, oplog_on, cap_ns, ui
+            )
+            if cap_entries:
+                oplog_entries.extend(cap_entries)
+                pre_images.extend(cap_pre)
+            if oplog_entries:
+                self._emit_oplog(oplog_entries, pre_images)
+        return consumed, matched, modified, posts
+
+    @_retry_write_conflicts
+    def _update_matching_single_txn(
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        update: dict[str, Any],
+        *,
+        multi: bool = False,
+        upsert: bool = False,
+        array_filters: list[dict[str, Any]] | None = None,
+        let: dict[str, Any] | None = None,
+        collation: Any = None,
+        validator: dict[str, Any] | None = None,
+        validator_moderate: bool = False,
+        journal: bool = False,
+        return_post_images: bool = False,
+    ) -> dict[str, Any]:
+        self._note_write(db, coll)
         from secantus.collation import parse as _parse_collation
 
         collation_obj = _parse_collation(collation)
@@ -4907,7 +5799,15 @@ class Storage:
                     # rejects updates whose result fails the predicate.
                     # Caller passes ``None`` to skip
                     # (``bypassDocumentValidation: true``).
-                    if validator is not None and not matches(new, validator):
+                    # ``moderate``: see the chunked path above. BOTH update
+                    # paths enforce, and patching only one left single-document
+                    # updates — the common case — still rejecting.
+                    was_already_invalid = validator_moderate and not matches(doc, validator)
+                    if (
+                        validator is not None
+                        and not matches(new, validator)
+                        and not was_already_invalid
+                    ):
                         raise DocumentValidationError(new.get("_id"))
                     # _id is immutable, so the row's RecordId is the right write
                     # target and its id_key is unchanged. For timeseries the
@@ -4942,7 +5842,12 @@ class Storage:
                     self._delete_index_entries(db, coll, doc, indexes, partials, recordid=recordid)
                     doc_cur = self._cursor(_doc_table_for(db, coll))
                     doc_cur[db, coll, recordid] = _frame_doc_value(new_id_key, new_blob)
-                    self._write_index_entries(db, coll, new, indexes, partials, recordid=recordid)
+                    try:
+                        self._write_index_entries(
+                            db, coll, new, indexes, partials, recordid=recordid
+                        )
+                    except UniqueKeyTaken as taken:
+                        raise self._index_conflict_from(db, coll, new, taken) from taken
                     multikey_names = self._maybe_mark_multikey(
                         db, coll, new, indexes, multikey_names
                     )
@@ -4975,7 +5880,15 @@ class Storage:
                     break
             if matched == 0 and upsert:
                 seed: dict[str, Any] = {}
-                for k, v in filter.items():
+                # Sorted, because mongod's upserted document is ordered
+                # ``_id`` first, then the query-seeded fields in field-name
+                # order, then the update-applied ones in field-name order
+                # (probed 6.0.16: query ``{n: 1, m: 2}`` with ``$set:
+                # {z: 3, a: 4}`` upserts ``{_id, m, n, a, z}``). BSON field
+                # order is on the wire, so a client comparing raw bytes --
+                # mongo-php-library's codec tests do -- sees the difference.
+                for k in sorted(filter):
+                    v = filter[k]
                     # Seed bare-equality predicates into the upserted doc.
                     # A dict value is only skipped when it's an OPERATOR
                     # expression ({$gt: 5}); a literal subdocument value
@@ -4985,10 +5898,18 @@ class Storage:
                     # generating a fresh ObjectId instead.
                     if k.startswith("$") or _is_operator_expr(v):
                         continue
-                    seed[k] = v
+                    # A DOTTED equality names a nested path, and mongod
+                    # builds the nesting: ``{"a.b.c": 5}`` upserts
+                    # ``{a: {b: {c: 5}}}``. Assigning ``seed[k] = v`` stored a
+                    # literal key with dots in it — a document mongod cannot
+                    # produce and most drivers refuse to send, which then
+                    # never matched the very query that created it.
+                    set_path(seed, k, v)
+                seeded = list(seed)
                 new = apply_update(seed, update, is_upsert=True, array_filters=array_filters)
                 if "_id" not in new:
                     new["_id"] = bson.ObjectId()
+                new = _order_upserted_doc(new, seeded)
                 if validator is not None and not matches(new, validator):
                     raise DocumentValidationError(new.get("_id"))
                 upserted_id = new["_id"]
@@ -5028,9 +5949,12 @@ class Storage:
                     )
                 doc_cur = self._cursor(_doc_table_for(db, coll))
                 doc_cur[db, coll, upsert_recordid] = _frame_doc_value(upsert_id_key, upsert_blob)
-                self._write_index_entries(
-                    db, coll, new, indexes, partials, recordid=upsert_recordid
-                )
+                try:
+                    self._write_index_entries(
+                        db, coll, new, indexes, partials, recordid=upsert_recordid
+                    )
+                except UniqueKeyTaken as taken:
+                    raise self._index_conflict_from(db, coll, new, taken) from taken
                 self._maybe_mark_multikey(db, coll, new, indexes, multikey_names)
                 if oplog_on:
                     oplog_entries.append(
@@ -5064,7 +5988,6 @@ class Storage:
             result["post_images"] = post_images
         return result
 
-    @_retry_write_conflicts
     def delete_matching(
         self,
         db: str,
@@ -5076,6 +5999,145 @@ class Storage:
         collation: Any = None,
         journal: bool = False,
     ) -> int:
+        # Route: an unbounded delete (deleteMany) outside a user transaction
+        # runs CHUNKED — see ``update_matching``'s router note; same class,
+        # same driver shape. Bounded deletes and in-transaction deletes keep
+        # the single-transaction body.
+        if limit == 0 and getattr(self._tls, "user_txn", None) is None:
+            return self._delete_matching_chunked(
+                db, coll, filter, let=let, collation=collation, journal=journal
+            )
+        return self._delete_matching_single_txn(
+            db, coll, filter, limit=limit, let=let, collation=collation, journal=journal
+        )
+
+    def _delete_matching_chunked(
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        *,
+        let: dict[str, Any] | None,
+        collation: Any,
+        journal: bool,
+    ) -> int:
+        """Chunked deleteMany driver — see ``_update_matching_chunked`` for
+        the re-fetch-inside-the-chunk-transaction rationale."""
+        self._note_write(db, coll)
+        from secantus.collation import parse as _parse_collation
+
+        collation_obj = _parse_collation(collation)
+        self._refresh_read_snapshot()
+        deleted = 0
+        with self._coll_lock(db, coll):
+            if collation_obj is not None:
+                candidates = self._scan_docs(db, coll)
+            else:
+                candidates = self._candidates_iter(db, coll, filter)
+            rids = [
+                recordid
+                for recordid, _id_k, blob in candidates
+                if matches(bson.decode(blob), filter, vars=let, collation=collation_obj)
+            ]
+            idx = 0
+            while idx < len(rids):
+                consumed, d = self._delete_chunk(
+                    db,
+                    coll,
+                    rids[idx:],
+                    filter,
+                    let=let,
+                    collation_obj=collation_obj,
+                    journal=journal,
+                )
+                assert consumed > 0
+                idx += consumed
+                deleted += d
+        return deleted
+
+    @_retry_write_conflicts
+    def _delete_chunk(
+        self,
+        db: str,
+        coll: str,
+        rids: list[int],
+        filter: dict[str, Any],
+        *,
+        let: dict[str, Any] | None,
+        collation_obj: Any,
+        journal: bool,
+    ) -> tuple[int, int]:
+        """One bounded chunk of the deleteMany. Caller holds the coll lock.
+        Returns ``(consumed, deleted)``."""
+        consumed = 0
+        deleted = 0
+        chunk_bytes = 0
+        oplog_entries: list[dict[str, Any]] = []
+        pre_images: list[bytes | None] = []
+        oplog_on = self.enable_oplog
+        with self._batch_transaction(sync=journal):
+            ns = self._ns(db, coll) if oplog_on else ""
+            preimages_on = oplog_on and self._pre_post_images_enabled(db, coll)
+            ui = (
+                self._collection_uuid(db, coll)
+                if oplog_on and self._coll_options(db, coll) is not None
+                else None
+            )
+            indexes = self._all_indexes(db, coll)
+            partials = self._partial_filters(db, coll)
+            doc_cur = self._cursor(_doc_table_for(db, coll))
+            for recordid in rids:
+                if (
+                    deleted >= self._WRITE_CHUNK_MAX_DOCS
+                    or chunk_bytes >= self._WRITE_CHUNK_MAX_BYTES
+                ):
+                    break
+                consumed += 1
+                doc_cur.reset()
+                doc_cur.set_key(db, coll, recordid)
+                if doc_cur.search() != 0:
+                    continue
+                id_k, blob = _unframe_doc_value(bytes(doc_cur.get_value()))
+                doc = bson.decode(blob)
+                if not matches(doc, filter, vars=let, collation=collation_obj):
+                    continue
+                self._delete_index_entries(db, coll, doc, indexes, partials, recordid=recordid)
+                self._delete_doc_row(db, coll, recordid)
+                self._delete_nat_entry(db, coll, id_k)
+                deleted += 1
+                chunk_bytes += len(blob)
+                if oplog_on:
+                    entry: dict[str, Any] = {
+                        "op": "d",
+                        "ns": ns,
+                        "o": {"_id": doc["_id"]},
+                        "o2": {"_id": doc["_id"]},
+                    }
+                    if ui is not None:
+                        entry["ui"] = bson.Binary(ui.bytes, subtype=4)
+                    oplog_entries.append(entry)
+                    if preimages_on:
+                        chunk_bytes += len(blob)
+                        pre_images.append(blob)
+                    else:
+                        pre_images.append(None)
+            if oplog_entries:
+                self._emit_oplog(oplog_entries, pre_images)
+        return consumed, deleted
+
+    @_retry_write_conflicts
+    def _delete_matching_single_txn(
+        self,
+        db: str,
+        coll: str,
+        filter: dict[str, Any],
+        *,
+        limit: int = 0,
+        let: dict[str, Any] | None = None,
+        collation: Any = None,
+        journal: bool = False,
+    ) -> int:
+        self._note_write(db, coll)
         from secantus.collation import parse as _parse_collation
 
         collation_obj = _parse_collation(collation)
@@ -5227,6 +6289,8 @@ class Storage:
             _NAT_SEQ_TABLE: "SSu",
             _IDX_TABLE: "SSS",
             _IDX_ENTRIES_TABLE: "SSSu",
+            _UNIQ_TABLE: "SSSu",
+            _TOMB_TABLE: "SS",
         }[table]
 
     @staticmethod
@@ -5269,6 +6333,21 @@ class Storage:
             c.remove()
             c.reset()
 
+    def _recover_pending_drops_locked(self) -> None:
+        pending = [k for k, _ in self._collect_prefix(_TOMB_TABLE, ())]
+        for db, coll in pending:
+            for tbl in (
+                _doc_table_for(db, coll),
+                _NAT_TABLE,
+                _NAT_SEQ_TABLE,
+                _IDX_TABLE,
+                _IDX_ENTRIES_TABLE,
+                _UNIQ_TABLE,
+            ):
+                rows = self._collect_prefix(tbl, (db, coll))
+                self._delete_keys(tbl, [k for k, _ in rows])
+            self._delete_keys(_TOMB_TABLE, [(db, coll)])
+
     def drop_collection(self, db: str, coll: str) -> bool:
         with self._lock:
             # Mutating scanners read the current rows before deleting/rewriting
@@ -5285,6 +6364,11 @@ class Storage:
                 _NAT_SEQ_TABLE,
                 _IDX_TABLE,
                 _IDX_ENTRIES_TABLE,
+                # Unique-key claims die with the collection — a claim that
+                # survived DROP falsely rejected the value from a recreated
+                # table (found by slt index/delete, the first weekly sweep
+                # after #775).
+                _UNIQ_TABLE,
             ):
                 rows = self._collect_prefix(tbl, (db, coll))
                 self._delete_keys(tbl, [k for k, _ in rows])
@@ -5325,6 +6409,7 @@ class Storage:
                 _NAT_SEQ_TABLE,
                 _IDX_TABLE,
                 _IDX_ENTRIES_TABLE,
+                _UNIQ_TABLE,
                 _COLL_TABLE,
             ):
                 rows = self._collect_prefix(tbl, (db,))
@@ -5374,6 +6459,7 @@ class Storage:
                     _NAT_SEQ_TABLE,
                     _IDX_TABLE,
                     _IDX_ENTRIES_TABLE,
+                    _UNIQ_TABLE,
                 ):
                     rows = self._collect_prefix(tbl, (dst_db, dst_coll))
                     self._delete_keys(tbl, [k for k, _ in rows])
@@ -5394,7 +6480,7 @@ class Storage:
                 dst_doc.set_value(v)
                 dst_doc.insert()
                 dst_doc.reset()
-            for tbl in (_NAT_TABLE, _NAT_SEQ_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE):
+            for tbl in (_NAT_TABLE, _NAT_SEQ_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE, _UNIQ_TABLE):
                 rows = self._collect_prefix(tbl, (src_db, src_coll))
                 self._delete_keys(tbl, [k for k, _ in rows])
                 c = self._cursor(tbl)
@@ -5658,6 +6744,12 @@ class Storage:
                 for kb, entry_recordid in entries:
                     entry_cur.reset()
                     entry_cur[db, coll, name, _pack_entry(kb, entry_recordid)] = b""
+                    if unique:
+                        # Claim the existing rows' keys too, or the table would
+                        # only protect values written after the index was made.
+                        uq = self._cursor(_UNIQ_TABLE)
+                        uq.reset()
+                        uq[db, coll, name, _escape_kb(kb)] = entry_recordid
             else:
                 # Single doc-table walk: decode each blob once and fold all
                 # three checks (uniqueness, multikey detection, entry build)
@@ -5697,6 +6789,12 @@ class Storage:
                 for kb, entry_recordid in entries:
                     entry_cur.reset()
                     entry_cur[db, coll, name, _pack_entry(kb, entry_recordid)] = b""
+                    if unique:
+                        # Claim the existing rows' keys too, or the table would
+                        # only protect values written after the index was made.
+                        uq = self._cursor(_UNIQ_TABLE)
+                        uq.reset()
+                        uq[db, coll, name, _escape_kb(kb)] = entry_recordid
             ui = self._collection_uuid(db, coll)
             self._emit_oplog(
                 [
@@ -5749,7 +6847,12 @@ class Storage:
     def drop_index(self, db: str, coll: str, name: str) -> bool:
         if name == _ID_INDEX_NAME:
             return False
-        with self._lock:
+        # LOCK ORDER: `_coll_lock` BEFORE `_lock` (the canonical order, same as
+        # `create_index`). Without the per-collection lock a concurrent
+        # insert/update/delete landing between the entry-table snapshot and its
+        # deletion is invisible to both, the drop-direction twin of the
+        # create_index race #632 closed (#635).
+        with self._coll_lock(db, coll), self._lock:
             # Mutating scanners read the current rows before deleting/rewriting
             # them; a snapshot pinned by an earlier positioned cursor on
             # this connection thread would hide rows committed by other
@@ -5768,6 +6871,10 @@ class Storage:
             c.remove()
             entry_rows = self._collect_prefix(_IDX_ENTRIES_TABLE, (db, coll, name))
             self._delete_keys(_IDX_ENTRIES_TABLE, [k for k, _ in entry_rows])
+            # The dropped unique index's claims go with it — recreating the
+            # index (or just inserting the same values) must not hit them.
+            uq_rows = self._collect_prefix(_UNIQ_TABLE, (db, coll, name))
+            self._delete_keys(_UNIQ_TABLE, [k for k, _ in uq_rows])
             ui = self._collection_uuid(db, coll)
             self._emit_oplog(
                 [
@@ -5864,7 +6971,10 @@ class Storage:
         return out
 
     def drop_all_indexes(self, db: str, coll: str) -> int:
-        with self._lock:
+        # LOCK ORDER: `_coll_lock` BEFORE `_lock`, as `create_index` /
+        # `drop_index` — the per-collection lock keeps a concurrent CRUD writer
+        # from racing the index-entry snapshot-then-delete (#635).
+        with self._coll_lock(db, coll), self._lock:
             # Mutating scanners read the current rows before deleting/rewriting
             # them; a snapshot pinned by an earlier positioned cursor on
             # this connection thread would hide rows committed by other
@@ -5879,6 +6989,8 @@ class Storage:
             self._delete_keys(_IDX_TABLE, [k for k, _ in rows])
             entry_rows = self._collect_prefix(_IDX_ENTRIES_TABLE, (db, coll))
             self._delete_keys(_IDX_ENTRIES_TABLE, [k for k, _ in entry_rows])
+            uq_rows = self._collect_prefix(_UNIQ_TABLE, (db, coll))
+            self._delete_keys(_UNIQ_TABLE, [k for k, _ in uq_rows])
             if dropped:
                 ui = self._collection_uuid(db, coll)
                 self._emit_oplog(
@@ -6027,9 +7139,112 @@ class Storage:
                     c[db, coll, name, _pack_entry(cell_bytes, recordid)] = b""
                 continue
             coll_opt = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            enforce = _unique or bool(index_options.get(name, {}).get("prepareUnique"))
             for kb in _index_key_variants(doc, key_spec, sparse=sparse, collation=coll_opt):
                 c.reset()
                 c[db, coll, name, _pack_entry(kb, recordid)] = b""
+                if enforce:
+                    self._claim_unique_key(db, coll, name, kb, recordid, key_spec, doc, coll_opt)
+
+    def _index_conflict_from(
+        self, db: str, coll: str, doc: dict[str, Any], taken: UniqueKeyTaken
+    ) -> IndexConflict:
+        """The refusal WiredTiger raised, reported as the duplicate-key error
+        the snapshot probe would have produced for the same collision."""
+        return IndexConflict(
+            taken.index,
+            doc.get("_id"),
+            key_pattern=taken.key_pattern,
+            key_value=taken.key_value,
+            namespace=f"{db}.{coll}",
+        )
+
+    def _undo_partial_insert(self, db: str, coll: str, recordid: int, id_key: bytes) -> None:
+        """Remove the doc row and index entries written before a unique key was
+        refused, so a rejected insert leaves nothing behind. The whole statement
+        runs in one WT transaction, but an unordered batch continues past the
+        failure and must not carry a half-written row with it."""
+        with contextlib.suppress(Exception):
+            cur = self._cursor(_doc_table_for(db, coll))
+            cur.reset()
+            cur.set_key(db, coll, recordid)
+            cur.remove()
+        with contextlib.suppress(Exception):
+            seq = self._cursor(_NAT_SEQ_TABLE)
+            seq.reset()
+            seq.set_key(db, coll, id_key)
+            seq.remove()
+
+    def _claim_unique_key(
+        self,
+        db: str,
+        coll: str,
+        name: str,
+        kb: bytes,
+        recordid: int,
+        key_spec: dict[str, Any],
+        doc: dict[str, Any],
+        collation: Any,
+    ) -> None:
+        """Take ownership of one unique-index key, or fail.
+
+        The insert uses a NON-overwrite cursor, so WiredTiger itself rejects a
+        key another row already holds — including one committed after this
+        transaction's snapshot, which the snapshot-read probe could not see.
+        Two transactions racing for the same key collide on it and one takes a
+        write conflict, which the storage retry wrapper replays into a clean
+        duplicate-key error.
+        """
+        cur = self._cursor(_UNIQ_TABLE, overwrite=False)
+        cur.reset()
+        cur.set_key(db, coll, name, _escape_kb(kb))
+        cur.set_value(recordid)
+        try:
+            rc = cur.insert()
+        except Exception as exc:
+            if _is_wt_duplicate_key(exc):
+                raise self._dup_key_error(db, coll, name, kb, key_spec, doc, collation) from exc
+            raise
+        if rc != 0:
+            raise self._dup_key_error(db, coll, name, kb, key_spec, doc, collation)
+
+    def _dup_key_error(
+        self,
+        db: str,
+        coll: str,
+        name: str,
+        kb: bytes,
+        key_spec: dict[str, Any],
+        doc: dict[str, Any],
+        collation: Any,
+    ) -> UniqueKeyTaken:
+        return UniqueKeyTaken(
+            name, dict(key_spec), _conflict_key_value(doc, key_spec, kb, collation=collation)
+        )
+
+    def _release_unique_keys(
+        self,
+        db: str,
+        coll: str,
+        name: str,
+        keys: list[bytes],
+        recordid: int,
+    ) -> None:
+        """Drop this row's claims so the values become available again.
+
+        Only claims this RecordId actually owns are released: an update that
+        rewrites a row re-claims its keys before the old entries are swept, and
+        removing a claim another row now holds would silently unprotect it.
+        """
+        if not keys:
+            return
+        cur = self._cursor(_UNIQ_TABLE)
+        for kb in keys:
+            cur.reset()
+            cur.set_key(db, coll, name, _escape_kb(kb))
+            with contextlib.suppress(Exception):
+                if cur.search() == 0 and cur.get_value() == recordid:
+                    cur.remove()
 
     def _delete_index_entries(
         self,
@@ -6073,6 +7288,16 @@ class Storage:
                         c.remove()
                 continue
             coll_opt = _parse_index_collation(index_options.get(name, {}).get("collation"))
+            if _unique or index_options.get(name, {}).get("prepareUnique"):
+                # Give the values back, or the row that held them would keep
+                # them reserved forever and a delete-then-reinsert would fail.
+                self._release_unique_keys(
+                    db,
+                    coll,
+                    name,
+                    list(_index_key_variants(doc, key_spec, sparse=sparse, collation=coll_opt)),
+                    recordid,
+                )
             for kb in _index_key_variants(doc, key_spec, sparse=sparse, collation=coll_opt):
                 c.reset()
                 c.set_key(db, coll, name, _pack_entry(kb, recordid))

@@ -16,12 +16,12 @@ use bson::{Bson, Document};
 use crate::collation::{self, Collation};
 
 // Type ranks — must match secantus.sortkey.
-const RANK_MINKEY: u8 = 1;
+pub const RANK_MINKEY: u8 = 1;
 const RANK_NULL: u8 = 2;
 const RANK_NUMBER: u8 = 3;
 const RANK_STRING: u8 = 4;
 const RANK_DOCUMENT: u8 = 5;
-const RANK_ARRAY: u8 = 6;
+pub const RANK_ARRAY: u8 = 6;
 const RANK_BINDATA: u8 = 7;
 const RANK_OBJECTID: u8 = 8;
 const RANK_BOOL: u8 = 9;
@@ -143,8 +143,13 @@ fn encode_number_from_parts(p: &DecimalParts) -> Vec<u8> {
     if digits.len() % 2 == 1 {
         digits.push(0);
     }
+    // `digits` was padded to an even length just above, so the `as_chunks`
+    // remainder (`.1`) is always empty and the pairing is exhaustive — same
+    // semantics as the `chunks_exact(2)` this replaces.
     let mut pairs: Vec<u8> = digits
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| c[0] * 10 + c[1] + 1)
         .collect();
     if p.sign < 0 {

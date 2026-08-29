@@ -157,19 +157,48 @@ throughput — see the Measured section.
 
 ## Remaining work before this is more than a prototype
 
-- **Config surface.** Currently an env flag (`SECANTUS_OPLOG_ASYNC`) + an env cap
-  override (`SECANTUS_OPLOG_ASYNC_CAP_BYTES`). Promote to an
-  explicit `RustServer(oplog_async=…)` / `secantusd-rs --async-oplog` option with the
-  durability trade documented at the call site.
-- **Read-after-write oplog reads.** Direct `read_oplog` / `oplog_tail_seq` callers
-  that assume synchronous visibility (several unit tests, some admin paths) must call
-  `flush_oplog()` first in async mode; today they race the drainer (the async-mode
-  unit-test "failures" are exactly this — not bugs, but a semantic change to pin
-  down).
-- **DDL that manages its own transaction** (outside `with_statement_txn`) would drain
-  immediately, i.e. enqueue before its own commit — audit those paths (rare; not hit
-  by CRUD or the gauges) and route them through the buffered path or keep them sync.
-- **`prune_oplog` under async:** opportunistic prune no longer fires from the write
-  path (it lived in the synchronous emit); move it into the drainer or a timer.
-- **Gauge + parity** under the flag, and a `SECANTUS_OPLOG_ASYNC=1` CI lane, before
-  it could ever become a default.
+Productization landed (Phase C of the concurrency-parity plan):
+
+- ~~**Config surface.**~~ DONE — `StorageOptions` on the storage crate;
+  `RustServer(oplog_async=…, oplog_nonlogged=…, data_nonlogged=…,
+  checkpoint_seconds=…)` kwargs; `secantusd-rs --oplog-async /
+  --oplog-nonlogged / --data-nonlogged / --checkpoint-seconds` +
+  `[storage]` TOML keys. `None`/unset defers to the `SECANTUS_*` env vars.
+- ~~**`prune_oplog` under async:**~~ DONE — `drain_pending_oplog` mirrors the
+  sync emit path's every-`OPLOG_PRUNE_INTERVAL` opportunistic prune on the
+  committing writer's thread (best-effort, after the batch handoff).
+- ~~**Backup drain:**~~ DONE — `create_archive` calls `flush_oplog()` before
+  its checkpoint so an archive's manifest never misses acknowledged writes
+  still queued at the drainer.
+
+All three closed by the async-oplog hardening slice
+(`tasks/async-oplog-hardening-plan.md`):
+
+- ~~**Read-after-write oplog reads.**~~ DONE — the `local.oplog.rs` view read
+  path (`find_oplog_rs`, which find/count route through) now calls
+  `flush_oplog()` first in async mode (an acked write's entry is in the oplog
+  when a mongod client reads it — the read-your-own-write the view owes);
+  storage-crate tests that read the oplog after writes pin the documented
+  "flush first" contract explicitly (no-op in sync mode); sync-only
+  visibility tests (`oplog_visibility.rs`) pin `oplog_async: Some(false)` so
+  they still test the in-flight window under the async CI lane.
+- ~~**DDL / own-transaction emit audit.**~~ DONE — DDL paths were already
+  correct (autocommit ops, then a self-draining emit = mint after commit).
+  The audit instead caught **user transactions**: `with_statement_txn`
+  early-returns for `OpSession::Txn` without setting `IN_ASYNC_STMT`, so a
+  multi-document transaction's writes minted + enqueued MID-transaction — a
+  rollback left a persisted ghost oplog entry (phantom change event, wrong
+  PITR). Fixed: `with_user_transaction` holds `IN_ASYNC_STMT` and harvests
+  the buffered entries onto the handle; `commit_user_transaction` mints +
+  enqueues them only after the WT commit succeeds; rollback / commit-failure
+  / Drop discard them. Pinned by `tests/async_txn.rs` (rollback leaves no
+  trace; commit lands exactly once, nothing visible mid-transaction).
+  Bonus from the same slice: the opportunistic prune cadence moved to the
+  DRAINERS (`record_persisted` on the landing path) — the writer-side
+  trigger could only doom already-persisted rows, so drainer-queue lag
+  escaped every sweep and the oplog was unbounded when writes stopped.
+- ~~**Parity CI lane.**~~ DONE — `test.yml`'s `rust-storage` job re-runs the
+  whole storage suite under `SECANTUS_OPLOG_ASYNC=1` +
+  `SECANTUS_OPLOG_NONLOGGED=1` (the Finding-9 pairing), same build, env-only
+  re-run. (The pymongo gauge had already been run under `oplog_async=True` +
+  `oplog_nonlogged=True` — see the changelog entry for the Phase C slice.)

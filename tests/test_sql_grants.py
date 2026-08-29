@@ -202,3 +202,46 @@ def test_embedded_api_ignores_grants(storage):
     plain = Session(database=DB)  # authz_active False
     assert _rows(storage, plain, "SELECT n FROM t") == [(10,)]
     _run(storage, plain, "INSERT INTO t (id, n) VALUES (9, 90)")  # write allowed
+
+
+class TestRelaclReflection:
+    """pg_class.relacl / relowner as pgjdbc's getTablePrivileges reads them:
+    an untouched relation reports NULL (owner holds everything implicitly), and
+    the owner's role oid must match pg_roles so the metadata join resolves."""
+
+    def _priv_join(self, storage, session, relname):
+        return run_sql(
+            storage,
+            DB,
+            "SELECT r.rolname, c.relacl FROM pg_catalog.pg_namespace n,"
+            " pg_catalog.pg_class c, pg_catalog.pg_roles r"
+            " WHERE c.relnamespace = n.oid AND c.relowner = r.oid"
+            f" AND c.relkind IN ('r','p','v','m','f') AND c.relname LIKE '{relname}'",
+            session=session,
+        )[-1].rows
+
+    def test_untouched_relation_join_returns_owner_null_acl(self, storage):
+        s = Session(database=DB, user="alice")
+        run_sql(storage, DB, "CREATE TABLE owned (a int)", session=s)
+        assert self._priv_join(storage, s, "owned") == [("alice", None)]
+
+    def test_view_owner_join_resolves(self, storage):
+        s = Session(database=DB, user="alice")
+        run_sql(storage, DB, "CREATE VIEW ov AS SELECT id FROM t", session=s)
+        assert self._priv_join(storage, s, "ov") == [("alice", None)]
+
+    def test_revoke_all_from_owner_empties_acl(self, storage):
+        s = Session(database=DB, user="alice")
+        run_sql(storage, DB, "CREATE TABLE owned (a int)", session=s)
+        run_sql(storage, DB, "REVOKE ALL ON owned FROM PUBLIC", session=s)
+        run_sql(storage, DB, "REVOKE ALL ON owned FROM alice", session=s)
+        # materialized to an empty aclitem array — pgjdbc reads no owner SELECT
+        assert self._priv_join(storage, s, "owned") == [("alice", "{}")]
+
+    def test_grant_to_third_party_materializes_owner_and_grantee(self, storage):
+        s = Session(database=DB, user="alice")
+        run_sql(storage, DB, "CREATE TABLE owned (a int)", session=s)
+        run_sql(storage, DB, "GRANT SELECT ON owned TO bob", session=s)
+        (rolname, acl) = self._priv_join(storage, s, "owned")[0]
+        assert rolname == "alice"
+        assert acl == "{alice=arwdDxt/alice,bob=r/alice}"

@@ -158,6 +158,65 @@ def test_out_bypass_skips_target_validator(db) -> None:
     assert db.guarded.count_documents({}) == 1
 
 
+# --- validationAction warn/off accepts violating writes --------------------
+
+
+@pytest.mark.parametrize("action", ["warn", "off"])
+def test_validation_action_warn_and_off_accept_violating_writes(db, action) -> None:
+    """``warn`` / ``off`` mean "store it anyway" on every write path.
+
+    Only ``validationAction: "error"`` (the default) rejects. Enforcing
+    under ``warn`` would break the standard way of staging a validator
+    against live traffic — writes would hard-fail with 121 while the
+    operator believed they were merely being logged.
+    """
+    db.create_collection("staged", validator={"number": {"$gte": 5}}, validationAction=action)
+
+    db.staged.insert_one({"_id": 1, "number": 1})
+    assert db.staged.find_one({"_id": 1})["number"] == 1
+
+    db.staged.update_one({"_id": 1}, {"$set": {"number": 2}})
+    assert db.staged.find_one({"_id": 1})["number"] == 2
+
+    db.staged.find_one_and_update({"_id": 1}, {"$set": {"number": 3}})
+    assert db.staged.find_one({"_id": 1})["number"] == 3
+
+    db.staged.replace_one({"_id": 1}, {"number": 4})
+    assert db.staged.find_one({"_id": 1})["number"] == 4
+
+
+def test_validation_action_error_still_rejects(db) -> None:
+    """The default path must be untouched by the warn/off carve-out."""
+    db.create_collection("strict", validator={"number": {"$gte": 5}}, validationAction="error")
+    with pytest.raises(OperationFailure) as exc:
+        db.strict.insert_one({"number": 1})
+    assert exc.value.code == 121
+
+
+def test_collmod_persists_validation_action_and_level(db) -> None:
+    """``collMod`` must apply these, not accept-and-discard them.
+
+    Previously the command replied ``ok: 1`` and dropped both options, so a
+    caller relaxing enforcement got a success reply and unchanged behaviour.
+    """
+    db.create_collection("c", validator={"number": {"$gte": 5}})
+    db.command({"collMod": "c", "validationAction": "warn", "validationLevel": "moderate"})
+
+    opts = next(iter(db.list_collections(filter={"name": "c"})))["options"]
+    assert opts["validationAction"] == "warn"
+    assert opts["validationLevel"] == "moderate"
+
+    # And the change is live, not merely recorded.
+    db.c.insert_one({"_id": 1, "number": 1})
+    assert db.c.find_one({"_id": 1}) is not None
+
+    # Flipping back to error re-arms enforcement.
+    db.command({"collMod": "c", "validationAction": "error"})
+    with pytest.raises(OperationFailure) as exc:
+        db.c.insert_one({"_id": 2, "number": 1})
+    assert exc.value.code == 121
+
+
 # --- collMod prepareUnique -> unique violations (mongo-c-driver) -----------
 
 
@@ -220,3 +279,81 @@ def test_unknown_index_plugin_rejected(db) -> None:
     # The valid geo plugins and numeric directions are still accepted.
     db.command("createIndexes", "c", indexes=[{"key": {"loc": "2dsphere"}, "name": "loc_2d"}])
     db.command("createIndexes", "c", indexes=[{"key": {"n": -1}, "name": "n_-1"}])
+
+
+# --- validationLevel: off / moderate / strict ------------------------------
+
+
+def test_validation_level_off_disables_validation(db) -> None:
+    """``validationLevel: "off"`` means no validation, whatever the action says.
+
+    The level was stored by ``create`` / ``collMod`` and then never consulted,
+    so a collection explicitly opted OUT still had its validator enforced.
+    """
+    db.create_collection("lvl_off", validator={"n": {"$gte": 0}}, validationLevel="off")
+    db.lvl_off.insert_one({"n": -5})
+    assert db.lvl_off.count_documents({}) == 1
+
+
+def test_validation_level_moderate_exempts_already_invalid_docs(db) -> None:
+    """``moderate`` lets a pre-existing invalid document keep being updated.
+
+    That is the level's whole purpose: add a validator to a collection holding
+    legacy rows without freezing them. Under ``strict`` those rows become
+    un-updatable, which is what we did before.
+    """
+    db.create_collection("lvl_mod", validationLevel="moderate")
+    db.lvl_mod.insert_one({"_id": 1, "n": -5})  # legacy row, no validator yet
+    db.command({"collMod": "lvl_mod", "validator": {"n": {"$gte": 0}}})
+
+    db.lvl_mod.update_one({"_id": 1}, {"$set": {"tag": "x"}})
+    assert db.lvl_mod.find_one({"_id": 1})["tag"] == "x"
+
+
+def test_validation_level_moderate_still_protects_valid_docs(db) -> None:
+    """A doc that currently SATISFIES the validator is still held to it.
+
+    Without this, ``moderate`` would read as "validation off for updates" and
+    an update could silently turn a valid document invalid.
+    """
+    db.create_collection("lvl_mod2", validator={"n": {"$gte": 0}}, validationLevel="moderate")
+    db.lvl_mod2.insert_one({"_id": 1, "n": 5})
+    with pytest.raises(OperationFailure) as exc:
+        db.lvl_mod2.update_one({"_id": 1}, {"$set": {"n": -1}})
+    assert exc.value.code == 121
+
+
+def test_validation_level_moderate_still_validates_inserts(db) -> None:
+    """``moderate`` exempts UPDATES of invalid docs, never inserts.
+
+    mongod validates every insert at ``moderate``; only the update path
+    consults the pre-image. An upsert-inserted document counts as an insert.
+    """
+    db.create_collection("lvl_mod3", validator={"n": {"$gte": 0}}, validationLevel="moderate")
+    with pytest.raises(OperationFailure) as exc:
+        db.lvl_mod3.insert_one({"n": -1})
+    assert exc.value.code == 121
+
+
+def test_validation_level_strict_is_the_default(db) -> None:
+    """Omitting the level keeps the pre-existing strict behaviour."""
+    db.create_collection("lvl_strict", validator={"n": {"$gte": 0}})
+    db.lvl_strict.insert_one({"_id": 1, "n": 5})
+    with pytest.raises(OperationFailure) as exc:
+        db.lvl_strict.update_one({"_id": 1}, {"$set": {"n": -1}})
+    assert exc.value.code == 121
+
+
+def test_validation_level_moderate_on_multi_update(db) -> None:
+    """The multi-document path enforces separately from the single-doc one.
+
+    Storage routes ``multi: true`` through a chunked writer with its OWN
+    validator check; patching only one path left single-document updates (the
+    common case) still rejecting while the multi path looked correct.
+    """
+    db.create_collection("lvl_multi", validationLevel="moderate")
+    db.lvl_multi.insert_many([{"_id": 1, "n": -5}, {"_id": 2, "n": -7}])
+    db.command({"collMod": "lvl_multi", "validator": {"n": {"$gte": 0}}})
+
+    db.lvl_multi.update_many({}, {"$set": {"tag": "x"}})
+    assert db.lvl_multi.count_documents({"tag": "x"}) == 2

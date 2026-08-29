@@ -43,6 +43,7 @@ from validation_summary.generate import (
     _collect_dotnet,
     _collect_go,
     _collect_java,
+    _collect_kotlin,
     _collect_node,
     _collect_php_ext,
     _collect_php_lib,
@@ -101,6 +102,19 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "silently."
         ),
         "report_url": ("https://secantusdb.com/docs/validation-report-java.html"),
+    },
+    "mongo-kotlin-driver": {
+        "title": "mongo-kotlin-driver",
+        "lang": "Kotlin",
+        "note": (
+            "The official Kotlin driver, which ships inside the "
+            "mongo-java-driver monorepo and is the coroutine-friendly entry "
+            "point for JVM services written in Kotlin. We run its "
+            "<code>:driver-kotlin-sync:integrationTest</code> suite unmodified "
+            "against a standalone SecantusDB daemon, through the same "
+            "two-phase auth setup the Java gauge uses."
+        ),
+        "report_url": ("https://secantusdb.com/docs/validation-report-kotlin.html"),
     },
     "mongo-node-driver": {
         "title": "mongo-node-driver",
@@ -243,6 +257,7 @@ _COLLECTORS = {
     "pymongo": _collect_pymongo,
     "pymongo (async)": _collect_pymongo_async,
     "mongo-java-driver": _collect_java,
+    "mongo-kotlin-driver": _collect_kotlin,
     "mongo-node-driver": _collect_node,
     "mongo-go-driver": _collect_go,
     "mongo-ruby-driver": _collect_ruby,

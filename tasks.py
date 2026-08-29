@@ -294,6 +294,51 @@ def concurrency(
 
 
 @task(
+    name="concurrency-refresh",
+    help={
+        "duration": "Wall-clock seconds per writer count (default: 30).",
+        "writers": 'Comma-separated writer counts (default: "1,2,4,8").',
+        "runs": "Interleaved sweeps to median over (default: 3).",
+        "skip-bench": "Re-render the graphs from the committed results JSON without re-measuring.",
+    },
+)
+def concurrency_refresh(
+    c: Context,
+    duration: float = 30.0,
+    writers: str = "1,2,4,8",
+    runs: int = 3,
+    skip_bench: bool = False,
+) -> None:
+    """Re-measure N-writer scaling and refresh the concurrency graphs.
+
+    Runs ``bench.concurrency --server all`` (python, rust, rust-async,
+    mongod — needs ``mongod`` on PATH and a built ``secantusd-rs``) with
+    interleaved runs, writes the medians to
+    ``bench/results/concurrency.json``, then regenerates the
+    marker-delimited chart + table blocks in
+    ``website/themes/secantus/templates/performance.html`` and
+    ``docs/concurrency.md`` via ``bench.concurrency_chart``. The prose
+    around both charts is hand-maintained — review it against the
+    printed headlines. Part of the per-release website refresh (see the
+    secantusdb-website skill); default settings take ~25 min.
+    """
+    results = "bench/results/concurrency.json"
+    if not skip_bench:
+        c.run(
+            "uv run --no-sync python -m bench.concurrency --server all"
+            f" --duration {float(duration)}"
+            f" --writers {shlex.quote(writers)}"
+            f" --runs {int(runs)}"
+            f" --json {results}",
+            pty=True,
+        )
+    c.run(
+        f"uv run --no-sync python -m bench.concurrency_chart --results {results}",
+        pty=True,
+    )
+
+
+@task(
     name="rw-harness",
     help={
         "workers": "Number of independent reader/writer processes (default: 4).",
@@ -340,6 +385,342 @@ def rw_harness(
     if sync_on_commit:
         cmd += " --sync-on-commit"
     c.run(cmd, pty=True)
+
+
+# The harness is Rust (crates/secantus-bench): a `do-cluster` orchestrator and a
+# `do-client` load agent. `cargo run` keeps it building from source so a local
+# edit is picked up, and --release matters — a debug-build load agent would
+# measure the agent, not the server.
+_DO_CLUSTER = (
+    "cargo run --quiet --release --manifest-path crates/Cargo.toml "
+    "-p secantus-bench --bin do-cluster --"
+)
+
+
+@task(
+    name="do-bench",
+    help={
+        "duration": "Timed seconds of load (default: 120).",
+        "workers": "Load processes per client droplet (default: 16).",
+        "op-mix": "Weighted op mix, e.g. 'insert=100' or 'insert=70,find=20,update=10'.",
+        "repeat": "Measurement passes (default 1); >1 interleaves engines and reports medians.",
+        "payload": "Document payload: repeat (default, compressible) | random (incompressible).",
+        "doc-bytes": "Payload bytes per document (default: 8192).",
+        "batch-size": "Documents per insert call (default: 1).",
+        "region": "DigitalOcean region (default: lon1).",
+        "server-size": "Server droplet size (default: c-4, dedicated CPU).",
+        "client-size": "Client droplet size (default: c-2).",
+        "build": "Server binary: 'release' (published tarball) or 'source' (build on the droplet).",
+        "engine": "Which databases to measure: both (default) | secantus | mongod.",
+        "mongod-version": "MongoDB major version to install for the comparison (default: 8.0).",
+        "suspend-mode": "After the run: destroy (default) | snapshot | power-off.",
+        "no-suspend": "Leave the droplets running afterwards.",
+    },
+)
+def do_bench(
+    c: Context,
+    duration: float = 120.0,
+    workers: int = 16,
+    op_mix: str = "insert=70,find=20,update=10",
+    repeat: int = 1,
+    payload: str = "repeat",
+    doc_bytes: int = 8192,
+    batch_size: int = 1,
+    region: str = "lon1",
+    server_size: str = "c-4",
+    client_size: str = "c-2",
+    build: str = "release",
+    engine: str = "both",
+    mongod_version: str = "8.0",
+    suspend_mode: str = "destroy",
+    no_suspend: bool = False,
+) -> None:
+    """Full three-droplet DigitalOcean benchmark: up -> deploy -> run -> suspend.
+
+    Provisions one server droplet and two client droplets driving load at it
+    across a private VPC, so the load generator is not competing with the
+    database for the same cores and the network is a real NIC rather than
+    loopback. By default it measures **SecantusDB and a real MongoDB
+    back-to-back on the same droplets** and prints a side-by-side comparison;
+    ``--engine secantus`` or ``--engine mongod`` runs just one. Requires
+    ``DIGITALOCEAN_TOKEN``.
+
+    Costs real money for as long as the droplets exist, so the run destroys
+    them afterwards by default — a *powered-off* DigitalOcean droplet still
+    bills at full price. Use ``--suspend-mode snapshot`` to keep the
+    installed software as a cheap image and skip the next redeploy, or
+    ``--no-suspend`` to leave the cluster up. ``invoke do-status`` prints the
+    live rate for whatever is currently allocated.
+    """
+    cmd = (
+        f"{_DO_CLUSTER} all"
+        f" --duration {float(duration)}"
+        f" --workers {int(workers)}"
+        f" --op-mix {shlex.quote(op_mix)}"
+        f" --repeat {int(repeat)}"
+        f" --payload {shlex.quote(payload)}"
+        f" --doc-bytes {int(doc_bytes)}"
+        f" --batch-size {int(batch_size)}"
+        f" --region {shlex.quote(region)}"
+        f" --server-size {shlex.quote(server_size)}"
+        f" --client-size {shlex.quote(client_size)}"
+        f" --server-build {shlex.quote(build)}"
+        f" --engine {shlex.quote(engine)}"
+        f" --mongod-version {shlex.quote(mongod_version)}"
+        f" --mode {shlex.quote(suspend_mode)}"
+    )
+    if no_suspend:
+        cmd += " --no-suspend"
+    c.run(cmd, pty=True)
+
+
+@task(
+    name="release-benchmark",
+    help={
+        "duration": "Seconds per engine per pass (default: 90).",
+        "workers": "Load processes per client droplet (default: 16).",
+        "repeat": "Interleaved measurement passes (default: 3).",
+        "keep": "Leave the droplets running afterwards (default: destroy them).",
+    },
+)
+def release_benchmark(
+    c: Context,
+    duration: float = 90.0,
+    workers: int = 16,
+    repeat: int = 3,
+    keep: bool = False,
+) -> None:
+    """Re-measure SecantusDB against MongoDB for a release, on real hardware.
+
+    `docs/benchmark.md` publishes a head-to-head throughput and latency
+    comparison against a real ``mongod``. It is prose with numbers in it, so it
+    goes stale silently: nothing in the test suite fails when the engine gets
+    faster, and a release that improves performance ships a page that
+    understates it. (Exactly that happened when lz4 replaced zlib as the block
+    compressor — the published figures were measured the day before, with the
+    old compressor.)
+
+    This task provisions the three droplets, deploys both engines, runs the
+    comparison with **release settings** — incompressible payloads and three
+    interleaved passes, so the medians are defensible — prints the numbers, and
+    destroys the cluster. Requires ``DIGITALOCEAN_TOKEN``; costs roughly $0.25
+    and takes about 45 minutes, most of it deployment.
+
+    ``--payload random`` is not optional here. Both engines compress, so the
+    default repeated-character payload measures the compressor rather than the
+    engine, and it flatters whichever side compresses harder.
+
+    **Cut the Rust binary release first.** This deploys the newest published
+    ``secantusdb-v*`` release, so running it before that tag exists measures the
+    *previous* build — which is exactly the staleness the task is meant to
+    prevent. Pass ``--server-build source`` via ``do-cluster`` instead if you
+    need to measure an unreleased ref.
+    """
+    cmd = (
+        f"{_DO_CLUSTER} all"
+        f" --duration {float(duration)}"
+        f" --workers {int(workers)}"
+        f" --repeat {int(repeat)}"
+        " --payload random"
+        " --engine both"
+        " --deploy auto"
+    )
+    cmd += " --no-suspend" if keep else " --mode destroy"
+    print(
+        "Release benchmark: 3 interleaved passes per engine on incompressible\n"
+        "documents. Copy the comparison table into docs/benchmark.md's\n"
+        '"Over a real network, against a real MongoDB" section when it finishes.\n'
+    )
+    c.run(cmd, pty=True)
+
+
+@task(
+    name="do-perf",
+    help={
+        "count": "Documents per latency workload (default: 10000).",
+        "reps": "Reps to median over per latency workload (default: 5).",
+        "duration": "Seconds per writer count in the scaling sweep (default: 30).",
+        "writers": 'Writer counts for the scaling sweep (default: "1,2,4,8").',
+        "runs": "Interleaved sweeps to median over (default: 3).",
+        "keep": "Leave the droplet running instead of destroying it.",
+        "git-ref": "Pushed git ref to build and measure (default: HEAD).",
+        "size": "Server droplet plan (default: s-8vcpu-16gb — see the docstring).",
+    },
+)
+def do_perf(
+    c: Context,
+    count: int = 10000,
+    reps: int = 5,
+    duration: float = 30.0,
+    writers: str = "1,2,4,8",
+    runs: int = 3,
+    keep: bool = False,
+    git_ref: str = "",
+    size: str = "s-8vcpu-16gb",
+) -> None:
+    """Measure per-operation latency and writer scaling on a DigitalOcean droplet.
+
+    The droplet counterpart of ``compare-servers`` + ``concurrency-refresh``.
+    Those run on whatever machine you happen to be sitting at, and that is
+    where the published numbers have gone wrong: a background build or an OS
+    indexer moves every column at once and nothing in the output says so. One
+    such run made *mongod itself* 2.5x slower than its own baseline, which
+    would have published a fabricated regression.
+
+    A droplet is dedicated and idle, and because ``mongod`` is measured in the
+    same run it is the control that proves it: if mongod's numbers drift from
+    the previous ``bench/results/latency.json``, the machine moved, not the
+    engine.
+
+    Only the server droplet is used -- both harnesses spawn all three engines
+    and talk to them over loopback, so a client droplet would add nothing but
+    a NIC.
+
+    **The default plan is s-8vcpu-16gb, not the cluster default c-4, because
+    the scaling sweep needs more cores than it has writers.** At eight writers
+    the harness runs eight writer processes *plus* the server; on four vCPUs
+    that measures core starvation rather than write scaling. Measured directly:
+    mongod -- unchanged code, the control -- scaled 4.19x at eight writers on a
+    12-core machine and only 1.78x on a c-4 droplet. Every engine was
+    compressed the same way, so the whole sweep was a CPU-count artefact.
+
+    **Keep vCPUs >= the largest writer count.** An earlier note here demanded
+    2x; measurement showed that is too conservative. mongod -- the control --
+    scales 4.96x at eight writers on this 8-vCPU plan, against 4.65x on a
+    12-core workstation and only 1.78x on a 4-vCPU c-4. So 1:1 is fine and 2:1
+    oversubscription is what breaks; `s-8vcpu-16gb` measures an eight-writer
+    sweep honestly.
+
+    Absolute throughput is much lower than on a fast workstation (the cores
+    are slower), but the *scaling ratio* -- what the page reports -- holds.
+    Always check mongod against its own previous run before believing a sweep.
+
+    Costs roughly $0.60 and takes about an hour, most of it building WiredTiger
+    and the Rust server from source.
+
+    Writes ``bench/results/latency.json`` and ``bench/results/concurrency.json``,
+    then regenerate the published charts with ``bench.latency_chart`` and
+    ``bench.concurrency_chart``.
+    """
+    cmd = (
+        f"{_DO_CLUSTER} perf"
+        f" --server-size {shlex.quote(size)}"
+        f" --perf-n {int(count)}"
+        f" --perf-reps {int(reps)}"
+        f" --duration {float(duration)}"
+        f" --perf-writers {shlex.quote(writers)}"
+        f" --repeat {int(runs)}"
+    )
+    if git_ref:
+        cmd += f" --server-ref {shlex.quote(git_ref)}"
+    cmd += " --no-suspend" if keep else " --mode destroy"
+    print(
+        "Droplet perf run: per-operation latency + concurrent-writer scaling on\n"
+        "dedicated hardware. mongod is measured alongside as the control.\n"
+    )
+    c.run(cmd, pty=True)
+
+
+@task(
+    name="do-up",
+    help={"region": "DigitalOcean region (default: lon1).", "fresh": "Ignore existing snapshots."},
+)
+def do_up(c: Context, region: str = "lon1", fresh: bool = False) -> None:
+    """Create (or wake) the three benchmark droplets and leave them running."""
+    cmd = f"{_DO_CLUSTER} up --region {shlex.quote(region)}"
+    if fresh:
+        cmd += " --fresh"
+    c.run(cmd, pty=True)
+
+
+@task(
+    name="do-deploy",
+    help={
+        "build": "'release' (published tarball, default) or 'source' (build on the droplet).",
+        "version": "Release tag for --build release (default: latest secantusdb-v*).",
+        "ref": "Git ref for --build source (default: HEAD, which must already be pushed).",
+    },
+)
+def do_deploy(
+    c: Context,
+    build: str = "release",
+    version: str = "latest",
+    ref: str = "",
+    engine: str = "both",
+) -> None:
+    """Install the database(s) and the client load agents on the droplets.
+
+    ``--engine both`` (the default) also installs MongoDB Community on the
+    server droplet so the comparison run has something to compare against.
+    """
+    cmd = (
+        f"{_DO_CLUSTER} deploy"
+        f" --server-build {shlex.quote(build)} --server-version {shlex.quote(version)}"
+        f" --engine {shlex.quote(engine)}"
+    )
+    if ref:
+        cmd += f" --server-ref {shlex.quote(ref)}"
+    c.run(cmd, pty=True)
+
+
+@task(
+    name="do-run",
+    help={
+        "duration": "Timed seconds of load (default: 120).",
+        "workers": "Load processes per client droplet (default: 16).",
+        "op-mix": "Weighted op mix (default: insert=70,find=20,update=10).",
+        "engine": "Which databases to measure: both (default) | secantus | mongod.",
+        "repeat": "Measurement passes (default 1); >1 interleaves engines and reports medians.",
+        "sync-on-commit": "Start the server with --sync-on-commit (fsync every commit).",
+    },
+)
+def do_run(
+    c: Context,
+    duration: float = 120.0,
+    workers: int = 16,
+    op_mix: str = "insert=70,find=20,update=10",
+    engine: str = "both",
+    repeat: int = 1,
+    sync_on_commit: bool = False,
+) -> None:
+    """Run the timed benchmark against already-deployed droplets.
+
+    With the default ``--engine both`` this measures SecantusDB and MongoDB
+    back-to-back on the same droplets and prints the comparison.
+    """
+    cmd = (
+        f"{_DO_CLUSTER} run"
+        f" --duration {float(duration)} --workers {int(workers)}"
+        f" --op-mix {shlex.quote(op_mix)}"
+        f" --engine {shlex.quote(engine)}"
+        f" --repeat {int(repeat)}"
+    )
+    if sync_on_commit:
+        cmd += " --sync-on-commit"
+    c.run(cmd, pty=True)
+
+
+@task(
+    name="do-suspend",
+    help={"mode": "destroy (default) | snapshot | power-off — see the module docstring."},
+)
+def do_suspend(c: Context, mode: str = "destroy") -> None:
+    """Park the benchmark droplets until the next test.
+
+    ``destroy`` (default) keeps nothing and bills nothing; ``snapshot``
+    destroys the droplets while keeping the installed software as a cheap
+    image; ``power-off`` resumes in seconds but keeps billing at full price.
+    """
+    c.run(
+        f"{_DO_CLUSTER} suspend --mode {shlex.quote(mode)}",
+        pty=True,
+    )
+
+
+@task(name="do-status")
+def do_status(c: Context) -> None:
+    """Show which benchmark droplets exist, their state, and the live hourly cost."""
+    c.run(f"{_DO_CLUSTER} status", pty=True)
 
 
 @task(
@@ -893,6 +1274,195 @@ def validate_psycopg(c: Context) -> None:
     print("\nWrote docs/validation-report-psycopg.md")
 
 
+@task(name="validate-sqlalchemy")
+def validate_sqlalchemy(c: Context) -> None:
+    """Run SQLAlchemy's dialect-compliance suite against a SecantusPGServer daemon.
+
+    The SQL-server ORM gauge (tasks/sql-gauges-plan.md G6): SQLAlchemy's own
+    third-party-dialect compliance suite (sqlalchemy.testing.suite — nothing
+    vendored, it ships in the sqlalchemy package) over the stock
+    postgresql+psycopg dialect, with SecantusDB's capability declarations in
+    sqlalchemy_validation/requirements.py. Generates
+    docs/validation-report-sqlalchemy.md. Python server only — the Rust
+    server has no SQL front end.
+    """
+    _run_gauge(
+        c,
+        module="sqlalchemy_validation.runner",
+        raw=".validation/sqlalchemy-raw.json",
+        report="docs/validation-report-sqlalchemy.md",
+        hint="A PG-server startup failure is the usual cause (nothing is vendored).",
+    )
+    c.run(
+        "uv run --no-sync python -m sqlalchemy_validation.generate_report "
+        ".validation/sqlalchemy-raw.json docs/validation-report-sqlalchemy.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-sqlalchemy.md")
+
+
+@task(name="sql-stress")
+def sql_stress(c: Context) -> None:
+    """Run the pgbench + psql stress/smoke against a SecantusPGServer daemon.
+
+    The SQL-server always-on smoke (tasks/sql-gauges-plan.md G7): unmodified
+    pgbench init (DDL + COPY + ALTER ADD PRIMARY KEY) and TPC-B in all three
+    protocol modes plus a concurrent select-only lane, then a psql catalog
+    smoke. Any error or dropped connection is a bug. Requires pgbench + psql
+    on PATH. Generates docs/validation-report-sqlstress.md.
+    """
+    _run_gauge(
+        c,
+        module="sqlstress_validation.runner",
+        raw=".validation/sqlstress-raw.json",
+        report="docs/validation-report-sqlstress.md",
+        hint="pgbench/psql missing from PATH or a PG-server startup failure is the usual cause.",
+    )
+    c.run(
+        "uv run --no-sync python -m sqlstress_validation.generate_report "
+        ".validation/sqlstress-raw.json docs/validation-report-sqlstress.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-sqlstress.md")
+
+
+@task(name="validate-pgjdbc")
+def validate_pgjdbc(c: Context, shard: str = "") -> None:
+    """Run pgjdbc's own test suite against a SecantusPGServer daemon.
+
+    The SQL-server JDBC gauge (tasks/sql-gauges-plan.md G5): the official
+    PostgreSQL JDBC driver's suite, unmodified, targeted via pgjdbc's stock
+    build.local.properties (gitignored upstream, so the submodule stays
+    pristine). Requires a JDK 21 (pgjdbc's Gradle toolchain). Generates
+    docs/validation-report-pgjdbc.md. Python server only.
+
+    ``--shard K/N`` runs only the k-th round-robin slice of the class list and
+    writes ``.validation/pgjdbc-raw-shard-K.json`` WITHOUT generating a report
+    — the CI lane fans the suite across N parallel jobs this way, and
+    ``validate-pgjdbc-report`` merges the complete shard set afterwards.
+    """
+    import pathlib
+
+    if not pathlib.Path("vendor/pgjdbc/gradlew").exists():
+        c.run("git submodule update --init vendor/pgjdbc", pty=True)
+    if shard:
+        k = shard.split("/", 1)[0]
+        raw = pathlib.Path(f".validation/pgjdbc-raw-shard-{k}.json")
+        raw.unlink(missing_ok=True)  # same freshness discipline as _run_gauge
+        c.run(
+            f"SECANTUS_PGJDBC_SHARD={shard} uv run --no-sync python -m pgjdbc_validation.runner",
+            pty=True,
+            warn=True,  # failing tests still produce the raw artifact — the deliverable
+        )
+        from invoke.exceptions import Exit
+
+        if not raw.exists():
+            raise Exit(f"pgjdbc shard {shard} produced no {raw} — the runner never ran")
+        print(f"\nWrote {raw} (shard {shard}; merge with validate-pgjdbc-report)")
+        # Gradle's exit is deliberately NOT propagated — same semantics as the
+        # unsharded task (_run_gauge's warn=True): standing test failures are
+        # the report's content, not a job failure, and a red step would skip
+        # the artifact-upload steps that ship the raw to the merge job (the
+        # first sharded run failed exactly that way: four red shards, zero
+        # artifacts, and a merge with nothing to merge). A shard is red only
+        # when it produced no raw at all (the Exit above).
+        return
+    _run_gauge(
+        c,
+        module="pgjdbc_validation.runner",
+        raw=".validation/pgjdbc-raw.json",
+        report="docs/validation-report-pgjdbc.md",
+        hint="A missing `vendor/pgjdbc` submodule, no JDK 21, or a PG-server startup failure is the usual cause.",
+    )
+    c.run(
+        "uv run --no-sync python -m pgjdbc_validation.generate_report "
+        ".validation/pgjdbc-raw.json docs/validation-report-pgjdbc.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-pgjdbc.md")
+
+
+@task(name="validate-pgjdbc-report")
+def validate_pgjdbc_report(c: Context) -> None:
+    """Merge a COMPLETE set of pgjdbc shard raws into the conformance report.
+
+    Counterpart of ``validate-pgjdbc --shard K/N``: expects every
+    ``.validation/pgjdbc-raw-shard-*.json`` of one run to be present (the CI
+    merge job downloads them from the shard jobs' artifacts); the generator
+    refuses a missing / duplicate / truncated shard rather than publishing a
+    pass rate over part of the suite.
+
+    The shard raws are CONSUMED on a successful merge — this task's
+    equivalent of ``_run_gauge``'s freshness guard: a re-run without fresh
+    shard artifacts fails on the missing files instead of re-rendering the
+    previous run's results under today's date."""
+    import glob
+    import pathlib
+
+    c.run(
+        "uv run --no-sync python -m pgjdbc_validation.generate_report "
+        ".validation/pgjdbc-raw-shard-*.json docs/validation-report-pgjdbc.md",
+        pty=True,
+    )
+    for consumed in glob.glob(".validation/pgjdbc-raw-shard-*.json"):
+        pathlib.Path(consumed).unlink()
+    print("\nWrote docs/validation-report-pgjdbc.md (shard raws consumed)")
+
+
+@task(name="validate-pgtest")
+def validate_pgtest(c: Context) -> None:
+    """Run CockroachDB's pgtest wire corpus against a SecantusPGServer daemon.
+
+    The SQL-server wire-protocol gauge (tasks/sql-gauges-plan.md G3): ~54
+    datadriven files of raw pgwire exchanges, driven by cockroach's own
+    pkg/testutils/pgtest runner verbatim. Corpus + runner are fetched at a
+    pinned commit via a sparse blob-filtered clone (cached under
+    .validation/) — never vendored. Requires go + network on first run.
+    Generates docs/validation-report-pgtest.md. Python server only.
+    """
+    _run_gauge(
+        c,
+        module="pgtest_validation.runner",
+        raw=".validation/pgtest-raw.json",
+        report="docs/validation-report-pgtest.md",
+        hint="Missing `go`, no network for the pinned cockroach fetch, or a PG-server startup failure is the usual cause.",
+    )
+    c.run(
+        "uv run --no-sync python -m pgtest_validation.generate_report "
+        ".validation/pgtest-raw.json docs/validation-report-pgtest.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-pgtest.md")
+
+
+@task(name="validate-pgx")
+def validate_pgx(c: Context) -> None:
+    """Run jackc/pgx's pgconn + pgproto3 tests against a SecantusPGServer daemon.
+
+    The SQL-server low-level Go gauge (tasks/sql-gauges-plan.md G4): the
+    strictest hand-rolled pgwire client, run unmodified from vendor/pgx via
+    PGX_TEST_DATABASE. Requires the Go toolchain. Generates
+    docs/validation-report-pgx.md. Python server only.
+    """
+    import pathlib
+
+    if not pathlib.Path("vendor/pgx/pgconn").exists():
+        c.run("git submodule update --init vendor/pgx", pty=True)
+    _run_gauge(
+        c,
+        module="pgx_validation.runner",
+        raw=".validation/pgx-raw.json",
+        report="docs/validation-report-pgx.md",
+        hint="A missing `vendor/pgx` submodule, missing `go`, or PG-server startup failure is the usual cause.",
+    )
+    c.run(
+        "uv run --no-sync python -m pgx_validation.generate_report "
+        ".validation/pgx-raw.json docs/validation-report-pgx.md",
+        pty=True,
+    )
+    print("\nWrote docs/validation-report-pgx.md")
+
+
 @task(name="validate-slt")
 def validate_slt(c: Context) -> None:
     """Run the sqllogictest corpus against a SecantusPGServer daemon.
@@ -1330,6 +1900,7 @@ def validate_all(c: Context, server: str = "python", jobs: int = 4) -> None:
     import concurrent.futures
     import subprocess
     import sys
+    import threading
 
     if server not in ("python", "rust"):
         raise SystemExit(f"--server must be 'python' or 'rust', got {server!r}")
@@ -1350,15 +1921,28 @@ def validate_all(c: Context, server: str = "python", jobs: int = 4) -> None:
         ("dotnet", "validate-dotnet"),
     ]
 
+    # `java` and `kotlin` both drive `./gradlew` inside the SAME vendored
+    # monorepo (`vendor/mongo-java-driver` — the Kotlin driver ships in it), so
+    # running them concurrently contends on Gradle's project lock and one dies
+    # with "Gradle Test Executor … failed to execute tests" +
+    # "SmokeTests#initializationError". That is a HARNESS failure that reports
+    # as 0 passed / 2 failed — a plausible-looking 0.0% pass rate that would go
+    # straight onto the website's driver panel. Observed 2026-08-19 at
+    # `--jobs 4`; the same commit measured 294 / 0 / 100.0% when kotlin ran
+    # alone. Serialise the pair against each other (they still overlap freely
+    # with the other eleven).
+    gradle_lock = threading.Lock()
+    GRADLE_GAUGES = {"java", "kotlin"}
+
     def _run(name_task: tuple[str, str]) -> tuple[str, int]:
         name, task_name = name_task
         # Stream stdout/stderr directly so the user gets live progress.
         # We don't capture — interleaving is the price of parallelism.
-        result = subprocess.run(
-            ["uv", "run", "--no-sync", "python", "-m", "invoke", task_name, "--server", server],
-            check=False,
-        )
-        return name, result.returncode
+        cmd = ["uv", "run", "--no-sync", "python", "-m", "invoke", task_name, "--server", server]
+        if name in GRADLE_GAUGES:
+            with gradle_lock:
+                return name, subprocess.run(cmd, check=False).returncode
+        return name, subprocess.run(cmd, check=False).returncode
 
     # Parallel by default. Earlier parallel attempts flaked, but the cause
     # was an ephemeral-port TOCTOU race in the runners — each picked a free

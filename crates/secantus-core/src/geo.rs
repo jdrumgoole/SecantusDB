@@ -294,10 +294,32 @@ fn parse_near_spec(
     sibling_min: Option<&Bson>,
     default_spherical: bool,
 ) -> Result<((f64, f64), Option<f64>, Option<f64>, bool, bool), Fallback> {
+    // An ABSENT key means "unbounded"; an explicit `null` is INVALID and must
+    // not be conflated with it. Probed on mongod 8.3.4: `{$near: {$geometry: ...,
+    // $minDistance: null}}` is rejected with "$minDistance must be a number"
+    // (code 2). Negative bounds are rejected too ("must be non-negative").
+    //
+    // This block previously accepted `Bson::Null` as absent, justified by a
+    // comment claiming the Java driver "sends `$minDistance: null` when the
+    // caller passes no minimum". That claim is FALSE -- the driver omits the
+    // field entirely, in both serialisation paths:
+    //
+    //     Filters.java createNearFilterDocument:  if (minDistance != null) { ... }
+    //     Filters.java GeometryOperatorFilter:    if (minDistance != null) { ... }
+    //
+    // So null-tolerance was never needed for the Java gauge, and it made both
+    // servers silently run an unbounded query where mongod errors. Mirrors
+    // `query._opt_number`.
     let opt_number = |b: Option<&Bson>| -> Result<Option<f64>, Fallback> {
         match b {
             None => Ok(None),
-            Some(v) => num(v).map(Some).ok_or(Fallback),
+            // Null / non-number / negative are all errors mongod names
+            // precisely; defer so the Python engine raises the exact message.
+            Some(Bson::Null) => Err(Fallback),
+            Some(v) => match num(v) {
+                Some(n) if n >= 0.0 => Ok(Some(n)),
+                _ => Err(Fallback),
+            },
         }
     };
     match arg {
@@ -498,6 +520,81 @@ mod tests {
     }
     fn xy(x: f64, y: f64) -> Bson {
         Bson::Array(vec![Bson::Double(x), Bson::Double(y)])
+    }
+
+    /// The Java driver sends `$minDistance: null` when `Filters.nearSphere` is
+    /// An explicit null is INVALID, not absent. mongod rejects it ("$minDistance
+    /// must be a number"), so the engine defers and the Python side names the
+    /// error. These tests previously asserted the opposite, justified by a claim
+    /// that the Java driver sends `$minDistance: null` when called with no
+    /// minimum -- the driver source disproves it, omitting the field entirely
+    /// (`Filters.java`: `if (minDistance != null) { ... }`, both paths).
+    #[test]
+    fn a_null_distance_bound_is_deferred() {
+        let point = Bson::Document(doc! {"type": "Point", "coordinates": [1.0, 1.0]});
+        let near = doc! {
+            "$geometry": {"type": "Point", "coordinates": [1.01, 1.01]},
+            "$maxDistance": 10000.0,
+            "$minDistance": Bson::Null,
+        };
+        assert!(
+            op_geo_near(&[Some(&point)], &Bson::Document(near), None, None, true).is_err(),
+            "a null $minDistance is invalid and must defer, not run unbounded"
+        );
+    }
+
+    #[test]
+    fn a_null_max_distance_is_deferred() {
+        // A null bound must NOT be read as "unbounded" -- that silently ran the
+        // query where mongod errors.
+        let point = Bson::Document(doc! {"type": "Point", "coordinates": [40.0, 40.0]});
+        let near = doc! {
+            "$geometry": {"type": "Point", "coordinates": [1.0, 1.0]},
+            "$maxDistance": Bson::Null,
+        };
+        assert!(op_geo_near(&[Some(&point)], &Bson::Document(near), None, None, true).is_err());
+    }
+
+    #[test]
+    fn an_absent_bound_still_means_unbounded() {
+        // The fix distinguishes absent from null; it must not reject both.
+        let point = Bson::Document(doc! {"type": "Point", "coordinates": [40.0, 40.0]});
+        let near = doc! {"$geometry": {"type": "Point", "coordinates": [1.0, 1.0]}};
+        assert!(op_geo_near(&[Some(&point)], &Bson::Document(near), None, None, true).unwrap());
+    }
+
+    #[test]
+    fn a_negative_distance_bound_is_deferred() {
+        // mongod: "$maxDistance must be non-negative".
+        let point = Bson::Document(doc! {"type": "Point", "coordinates": [1.0, 1.0]});
+        let near = doc! {
+            "$geometry": {"type": "Point", "coordinates": [1.01, 1.01]},
+            "$maxDistance": -1.0,
+        };
+        assert!(op_geo_near(&[Some(&point)], &Bson::Document(near), None, None, true).is_err());
+    }
+
+    #[test]
+    fn a_non_numeric_distance_bound_still_falls_back() {
+        // A string is invalid too (nothing is "forgiven" here any more).
+        let point = Bson::Document(doc! {"type": "Point", "coordinates": [1.0, 1.0]});
+        let near = doc! {
+            "$geometry": {"type": "Point", "coordinates": [1.01, 1.01]},
+            "$maxDistance": "far",
+        };
+        assert!(op_geo_near(&[Some(&point)], &Bson::Document(near), None, None, true).is_err());
+    }
+
+    #[test]
+    fn a_null_sibling_bound_is_deferred_too() {
+        // The legacy pair form lifts the bounds to sibling keys. A null there is
+        // invalid on mongod too -- with its OWN codes, 16895 ($maxDistance) and
+        // 16893 ($minDistance), rather than the nested form's BadValue (2) --
+        // so defer and let the Python engine name it.
+        let point = xy(1.0, 1.0);
+        let near = Bson::Array(vec![Bson::Double(1.01), Bson::Double(1.01)]);
+        let null = Bson::Null;
+        assert!(op_geo_near(&[Some(&point)], &near, Some(&null), Some(&null), false).is_err());
     }
 
     #[test]

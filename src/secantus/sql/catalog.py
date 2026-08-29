@@ -16,17 +16,72 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+from weakref import WeakKeyDictionary
 
 from secantus.sql import errors
 
 CATALOG_COLLECTION = "__sql_catalog__"
 VIEW_COLLECTION = "__sql_views__"
 MATVIEW_COLLECTION = "__sql_matviews__"
+TRIGGER_COLLECTION = "__sql_triggers__"
 SEQUENCE_COLLECTION = "__sql_sequences__"
+
+#: How many sequence values one persisted write pre-allocates (see the
+#: sequences section of ``Catalog``). 128 cuts the per-``nextval`` storage
+#: writes by ~99% on bulk SERIAL ingest while keeping the worst-case
+#: restart gap small.
+SEQUENCE_ALLOC_BATCH = 128
+
+#: Pre-allocated sequence values, server-wide per storage object:
+#: ``storage -> {(db, name): [pending (reversed for pop), last_handed]}``.
+#: ``last_handed`` lets invalidation write the true position back to the
+#: stored doc, so ``setval`` / ``ALTER`` / reflection-after-mutation see
+#: CACHE-1-observable state, not the batch high-water mark. Weakly keyed so a
+#: closed storage's cache dies with it; guarded by the executor's
+#: statement-write lock (every reader/writer of an entry holds it).
+_SEQ_ALLOC_CACHE: WeakKeyDictionary[Any, dict[tuple[str, str], list[Any]]] = WeakKeyDictionary()
+
+
+def _precompute_sequence_values(doc: dict[str, Any], count: int) -> list[int]:
+    """The next up-to-``count`` values ``doc``'s sequence will yield, applying
+    the same first-draw / increment / bound / cycle rules one step at a time.
+    Stops early at an uncycled bound (returning what fits); raises 2200H only
+    when not even one value is available."""
+    inc = int(doc.get("increment", 1))
+    values: list[int] = []
+    last = int(doc["last_value"])
+    called = bool(doc.get("is_called", False))
+    for _ in range(count):
+        if not called:
+            # First draw returns the current value as-is — ``start`` for a
+            # fresh sequence, or the value a ``setval(…, false)`` planted.
+            value = last
+            called = True
+        else:
+            value = last + inc
+            bound = doc.get("max_value") if inc > 0 else doc.get("min_value")
+            if bound is not None and (value > bound if inc > 0 else value < bound):
+                if not doc.get("cycle", False):
+                    if values:
+                        break
+                    raise errors.SQLError(
+                        "2200H",
+                        f'nextval: reached maximum value of sequence "{doc["_id"]}"',
+                    )
+                other = doc.get("min_value") if inc > 0 else doc.get("max_value")
+                value = other if other is not None else int(doc.get("start", 1))
+        values.append(value)
+        last = value
+    return values
+
+
 ROLE_COLLECTION = "__sql_roles__"
 ROLE_MEMBER_COLLECTION = "__sql_role_members__"
 GRANT_COLLECTION = "__sql_grants__"
 SCHEMA_COLLECTION = "__sql_schemas__"
+# Per-database GUC defaults set by ``ALTER DATABASE … SET <guc>`` — applied to
+# every NEW session at connect (PG semantics), never to already-open ones.
+DB_SETTINGS_COLLECTION = "__sql_db_settings__"
 ENUM_COLLECTION = "__sql_enums__"
 # The enum oid counter lives outside ENUM_COLLECTION so list_enums stays a plain scan.
 ENUM_META_COLLECTION = "__sql_enum_meta__"
@@ -48,6 +103,22 @@ DOMAIN_COLLECTION = "__sql_domains__"
 COMPOSITE_COLLECTION = "__sql_composites__"
 FUNCTION_COLLECTION = "__sql_functions__"
 POLICY_COLLECTION = "__sql_policies__"
+# Direct DML against the pg_description virtual relation (suppressed derived
+# rows + extra rows) — see ``virtual._pg_description``.
+DESCRIPTION_DELTA_COLLECTION = "__sql_description_delta__"
+# User-defined operators (CREATE OPERATOR) — registered so the DDL round-trips;
+# expression evaluation does not consult them.
+OPERATOR_COLLECTION = "__sql_operators__"
+# COMMENT ON INDEX comments, keyed by index name (resolved to the index
+# relation's oid at pg_description read time — minted oids can reshuffle).
+INDEX_COMMENT_COLLECTION = "__sql_index_comments__"
+# Per-relation ACL materialization state. A relation the user never GRANTed /
+# REVOKEd on has NO row here and reports ``relacl`` NULL — real PG's "default"
+# ACL, which a driver reads as the owner holding every privilege implicitly.
+# The first grant/revoke *materializes* the ACL: a row appears whose
+# ``owner_privs`` is the owner's retained privilege set (``REVOKE ALL FROM
+# <owner>`` empties it), and per-grantee privileges come from GRANT_COLLECTION.
+RELATION_ACL_COLLECTION = "__sql_relation_acl__"
 RLS_COLLECTION = "__sql_rls__"
 COLUMN_GRANT_COLLECTION = "__sql_column_grants__"
 
@@ -63,15 +134,21 @@ ALL_CATALOG_COLLECTIONS = (
     ROLE_MEMBER_COLLECTION,
     GRANT_COLLECTION,
     SCHEMA_COLLECTION,
+    DB_SETTINGS_COLLECTION,
     ENUM_COLLECTION,
     ENUM_META_COLLECTION,
     RANGE_TYPE_COLLECTION,
     DOMAIN_COLLECTION,
     COMPOSITE_COLLECTION,
     FUNCTION_COLLECTION,
+    TRIGGER_COLLECTION,
     POLICY_COLLECTION,
     RLS_COLLECTION,
     COLUMN_GRANT_COLLECTION,
+    DESCRIPTION_DELTA_COLLECTION,
+    OPERATOR_COLLECTION,
+    INDEX_COMMENT_COLLECTION,
+    RELATION_ACL_COLLECTION,
 )
 
 
@@ -174,6 +251,11 @@ class Column:
     # onto the named fields and ``(col).field`` access can type its result.
     composite_type: str | None = None
     composite_fields: tuple[tuple[str, str], ...] | None = None
+    # Declared PG type identity for reflection: the oid when it differs from
+    # the storage tag's (``varchar``/``bpchar`` fold to the ``text`` tag) and
+    # the ``atttypmod`` (``varchar(52)`` → 56, ``numeric(18,5)`` → ((18<<16)|5)+4).
+    decl_oid: int | None = None
+    typmod: int = -1
     # True for a column declared ``json`` (not ``jsonb``): the value behaviour
     # is identical (both store parsed JSON under type_tag "json") but the wire
     # identity differs — RowDescription/COPY report oid 114, whose binary form
@@ -197,6 +279,7 @@ class ForeignKey:
     on_update: str | None = None
     deferrable: bool = False  # DEFERRABLE — the check can be postponed to COMMIT
     initially_deferred: bool = False  # INITIALLY DEFERRED — deferred by default
+    comment: str | None = None  # COMMENT ON CONSTRAINT
 
 
 @dataclass(frozen=True)
@@ -206,6 +289,7 @@ class CheckConstraint:
 
     name: str
     expression: str
+    comment: str | None = None  # COMMENT ON CONSTRAINT
 
 
 @dataclass(frozen=True)
@@ -216,6 +300,11 @@ class UniqueConstraint:
     columns: tuple[str, ...]
     deferrable: bool = False
     initially_deferred: bool = False
+    comment: str | None = None  # COMMENT ON CONSTRAINT
+    # An ``EXCLUDE (col WITH =, ...)`` constraint: equality-only exclusion is
+    # unique enforcement with a different violation (23P01, PG's
+    # exclusion_violation) and reflected contype 'x'.
+    exclusion: bool = False
 
 
 @dataclass(frozen=True)
@@ -250,10 +339,33 @@ class TableDef:
     check_constraints: list[CheckConstraint] = field(default_factory=list)
     unique_constraints: list[UniqueConstraint] = field(default_factory=list)
     comment: str | None = None  # COMMENT ON TABLE (reflected via pg_description)
+    # Declared PK constraint name (``CONSTRAINT <name> PRIMARY KEY (…)``);
+    # reflection surfaces it instead of the synthesized ``<table>_pkey``.
+    pk_name: str | None = None
+    pk_comment: str | None = None  # COMMENT ON CONSTRAINT for the PK
+    # The PK constraint's declared column order (``PRIMARY KEY (name, id)``),
+    # when it differs from table-column order — reflection surfaces it; the
+    # storage ``_id`` mapping is untouched.
+    pk_column_order: tuple[str, ...] | None = None
     # Expression (functional) indexes. Their hidden ``field`` keys resolve like
     # columns (so a query rewritten onto one plans through the normal index path)
     # but are NOT in ``columns`` (so ``SELECT *`` / reflection never surface them).
     expr_indexes: list[ExprIndex] = field(default_factory=list)
+
+    def ordered_pk_columns(self) -> list[Column]:
+        """PK columns in the constraint's declared order (reflection order);
+        falls back to table-column order when no explicit order was declared."""
+        cols = self.pk_columns
+        if not self.pk_column_order:
+            return cols
+        by_name = {c.name: c for c in cols}
+        ordered = [by_name[n] for n in self.pk_column_order if n in by_name]
+        return ordered if len(ordered) == len(cols) else cols
+
+    def pk_constraint_name(self) -> str:
+        """The PK constraint's reflected name: the declared one, else the
+        Postgres default ``<table>_pkey``."""
+        return self.pk_name or f"{self.name}_pkey"
 
     def column(self, name: str) -> Column | None:
         for c in self.columns:
@@ -331,10 +443,15 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "composite_type": c.composite_type,
                 "composite_fields": _ser_composite_fields(c.composite_fields),
                 "json_plain": c.json_plain,
+                "decl_oid": c.decl_oid,
+                "typmod": c.typmod,
             }
             for c in table.columns
         ],
         "comment": table.comment,
+        "pk_name": table.pk_name,
+        "pk_comment": table.pk_comment,
+        "pk_column_order": list(table.pk_column_order) if table.pk_column_order else None,
         "temp": table.temp,
         "foreign_keys": [
             {
@@ -346,11 +463,13 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "on_update": fk.on_update,
                 "deferrable": fk.deferrable,
                 "initially_deferred": fk.initially_deferred,
+                "comment": fk.comment,
             }
             for fk in table.foreign_keys
         ],
         "check_constraints": [
-            {"name": ck.name, "expression": ck.expression} for ck in table.check_constraints
+            {"name": ck.name, "expression": ck.expression, "comment": ck.comment}
+            for ck in table.check_constraints
         ],
         "unique_constraints": [
             {
@@ -358,6 +477,8 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
                 "columns": list(uq.columns),
                 "deferrable": uq.deferrable,
                 "initially_deferred": uq.initially_deferred,
+                "comment": uq.comment,
+                "exclusion": uq.exclusion,
             }
             for uq in table.unique_constraints
         ],
@@ -397,10 +518,15 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 composite_type=c.get("composite_type"),
                 composite_fields=_deser_composite_fields(c.get("composite_fields")),
                 json_plain=bool(c.get("json_plain", False)),
+                decl_oid=c.get("decl_oid"),
+                typmod=int(c.get("typmod", -1)),
             )
             for c in doc["columns"]
         ],
         comment=doc.get("comment"),
+        pk_name=doc.get("pk_name"),
+        pk_comment=doc.get("pk_comment"),
+        pk_column_order=(tuple(doc["pk_column_order"]) if doc.get("pk_column_order") else None),
         temp=bool(doc.get("temp", False)),
         foreign_keys=[
             ForeignKey(
@@ -412,11 +538,12 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 on_update=fk.get("on_update"),
                 deferrable=bool(fk.get("deferrable", False)),
                 initially_deferred=bool(fk.get("initially_deferred", False)),
+                comment=fk.get("comment"),
             )
             for fk in doc.get("foreign_keys", [])
         ],
         check_constraints=[
-            CheckConstraint(name=ck["name"], expression=ck["expression"])
+            CheckConstraint(name=ck["name"], expression=ck["expression"], comment=ck.get("comment"))
             for ck in doc.get("check_constraints", [])
         ],
         unique_constraints=[
@@ -425,6 +552,8 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 columns=tuple(uq["columns"]),
                 deferrable=bool(uq.get("deferrable", False)),
                 initially_deferred=bool(uq.get("initially_deferred", False)),
+                comment=uq.get("comment"),
+                exclusion=bool(uq.get("exclusion", False)),
             )
             for uq in doc.get("unique_constraints", [])
         ],
@@ -504,6 +633,35 @@ class Catalog:
     def drop_view(self, db: str, name: str) -> bool:
         return self._storage.delete_matching(db, VIEW_COLLECTION, {"_id": name}) > 0
 
+    # -- triggers ----------------------------------------------------------- #
+    # BEFORE INSERT FOR EACH ROW triggers (the supported shape). Keyed by
+    # (table, name) — PG trigger names are per-table.
+
+    def put_trigger(self, db: str, doc: dict[str, Any]) -> None:
+        key = f"{doc['table']}::{doc['name']}"
+        self._storage.delete_matching(db, TRIGGER_COLLECTION, {"_id": key})
+        self._storage.insert(db, TRIGGER_COLLECTION, [{**doc, "_id": key}])
+
+    def trigger_exists(self, db: str, table: str, name: str) -> bool:
+        key = f"{table}::{name}"
+        return bool(self._storage.find_matching(db, TRIGGER_COLLECTION, {"_id": key}))
+
+    def triggers_for_table(self, db: str, table: str) -> list[dict[str, Any]]:
+        return sorted(
+            self._storage.find_matching(db, TRIGGER_COLLECTION, {"table": table}),
+            key=lambda t: t.get("name", ""),
+        )
+
+    def drop_triggers_for_table(self, db: str, table: str) -> None:
+        self._storage.delete_matching(db, TRIGGER_COLLECTION, {"table": table})
+
+    def drop_trigger(self, db: str, table: str, name: str) -> bool:
+        key = f"{table}::{name}"
+        if not self._storage.find_matching(db, TRIGGER_COLLECTION, {"_id": key}):
+            return False
+        self._storage.delete_matching(db, TRIGGER_COLLECTION, {"_id": key})
+        return True
+
     def list_views(self, db: str) -> list[str]:
         docs = self._storage.find_matching(db, VIEW_COLLECTION, {})
         return sorted(d["view"] for d in docs)
@@ -547,6 +705,20 @@ class Catalog:
     # A sequence is a persisted monotonic counter (``CREATE SEQUENCE`` and the
     # implicit sequence behind a SERIAL column). State lives in a per-db
     # ``__sql_sequences__`` collection, one doc per sequence.
+    #
+    # ``nextval`` allocates in BATCHES: one storage write persists the batch's
+    # high-water mark, then values are handed out from memory (guarded by the
+    # same statement-write lock that already serializes ``nextval``). This is
+    # PG's own ``CACHE`` mechanism applied server-side — without it every
+    # SERIAL insert paid a full read + durable-update transaction, which
+    # dominated bulk-ingest profiles (a 100k-row ``COPY`` into a SERIAL table
+    # spent ~75% of its samples inside ``nextval``'s update). Consequences,
+    # both PG-faithful for a cached sequence: values are gapless while the
+    # server runs (the cache is server-wide, not per-backend), and a restart
+    # resumes from the persisted high-water mark, skipping unhanded values —
+    # exactly the gap PG's ``CACHE``/crash semantics produce. Every other
+    # sequence write path (create / drop / setval / ALTER) invalidates the
+    # cached run so its effect is immediate.
 
     def create_sequence(
         self,
@@ -562,6 +734,7 @@ class Catalog:
     ) -> None:
         """Create (or overwrite) a sequence's persisted state. ``owned_by`` is the
         ``table.column`` a SERIAL/identity sequence belongs to (dropped with it)."""
+        self._invalidate_sequence_cache(db, name)
         self._storage.delete_matching(db, SEQUENCE_COLLECTION, {"_id": name})
         self._storage.insert(
             db,
@@ -590,6 +763,7 @@ class Catalog:
         return self.get_sequence(db, name) is not None
 
     def drop_sequence(self, db: str, name: str) -> bool:
+        self._invalidate_sequence_cache(db, name)
         return self._storage.delete_matching(db, SEQUENCE_COLLECTION, {"_id": name}) > 0
 
     def list_sequences(self, db: str) -> list[str]:
@@ -611,31 +785,45 @@ class Catalog:
             return self._sequence_nextval_locked(db, name)
 
     def _sequence_nextval_locked(self, db: str, name: str) -> int:
+        cache = _SEQ_ALLOC_CACHE.setdefault(self._storage, {})
+        entry = cache.get((db, name))
+        if entry is not None and entry[0]:
+            value = entry[0].pop()
+            entry[1] = value
+            return value
         doc = self.get_sequence(db, name)
         if doc is None:
             raise errors.SQLError("42P01", f'relation "{name}" does not exist')
-        inc = int(doc.get("increment", 1))
-        if not doc.get("is_called", False):
-            # First draw returns the current value as-is — ``start`` for a fresh
-            # sequence, or the value a ``setval(…, false)`` planted.
-            value = int(doc["last_value"])
-        else:
-            value = int(doc["last_value"]) + inc
-            bound = doc.get("max_value") if inc > 0 else doc.get("min_value")
-            if bound is not None and (value > bound if inc > 0 else value < bound):
-                if not doc.get("cycle", False):
-                    raise errors.SQLError(
-                        "2200H", f'nextval: reached maximum value of sequence "{name}"'
-                    )
-                other = doc.get("min_value") if inc > 0 else doc.get("max_value")
-                value = other if other is not None else int(doc.get("start", 1))
+        values = _precompute_sequence_values(doc, SEQUENCE_ALLOC_BATCH)
+        # One write persists the whole batch's high-water mark BEFORE any
+        # value is handed out, so a crash can only skip values, never repeat.
         self._storage.update_matching(
             db,
             SEQUENCE_COLLECTION,
             {"_id": name},
-            {"$set": {"last_value": value, "is_called": True}},
+            {"$set": {"last_value": values[-1], "is_called": True}},
         )
-        return value
+        first = values[0]
+        rest = values[1:]
+        rest.reverse()
+        cache[(db, name)] = [rest, first]
+        return first
+
+    def _invalidate_sequence_cache(self, db: str, name: str) -> None:
+        """Retire ``name``'s pre-allocated run, writing the last value actually
+        handed out back to the stored doc first — so ``setval`` / ``ALTER`` /
+        drop-and-recreate proceed from the sequence's true position, exactly as
+        an uncached (CACHE 1) sequence would. Every sequence write path other
+        than ``nextval`` itself must call this before its own write."""
+        cache = _SEQ_ALLOC_CACHE.get(self._storage)
+        entry = cache.pop((db, name), None) if cache is not None else None
+        if entry is not None:
+            self._storage.update_matching(
+                db,
+                SEQUENCE_COLLECTION,
+                {"_id": name},
+                {"$set": {"last_value": entry[1], "is_called": True}},
+            )
 
     # -- roles -------------------------------------------------------------- #
     # SQL-level roles (``CREATE ROLE`` / ``CREATE USER``). Recorded for reflection
@@ -812,6 +1000,64 @@ class Catalog:
         """Every table grant in ``db`` (for ``information_schema`` reflection)."""
         return self._storage.find_matching(db, GRANT_COLLECTION, {})
 
+    #: PG aclitem privilege letters (pg_class.relacl text form) — the subset a
+    #: table can carry, in the order real PG emits them.
+    _ACL_LETTERS = (
+        ("INSERT", "a"),
+        ("SELECT", "r"),
+        ("UPDATE", "w"),
+        ("DELETE", "d"),
+        ("TRUNCATE", "D"),
+        ("REFERENCES", "x"),
+        ("TRIGGER", "t"),
+    )
+
+    def materialize_relation_owner_privileges(
+        self, db: str, table: str, owner: str, privileges: list[str] | None
+    ) -> None:
+        """Record the owner's retained privileges on ``table`` — the act of
+        touching the ACL. ``privileges=None`` seeds the owner's full implicit
+        set (first GRANT to a third party); a list (possibly empty) is the set
+        left after a REVOKE / GRANT that targeted the owner. Presence of the
+        row is what flips ``relacl`` from NULL to a materialized array."""
+        privs = list(self.TABLE_PRIVILEGES) if privileges is None else list(privileges)
+        ordered = [p for p in self.TABLE_PRIVILEGES if p in {x.upper() for x in privs}]
+        self._storage.delete_matching(db, RELATION_ACL_COLLECTION, {"_id": table})
+        self._storage.insert(
+            db, RELATION_ACL_COLLECTION, [{"_id": table, "owner": owner, "owner_privs": ordered}]
+        )
+
+    def _relation_acl_state(self, db: str, table: str) -> dict[str, Any] | None:
+        docs = self._storage.find_matching(db, RELATION_ACL_COLLECTION, {"_id": table}, limit=1)
+        return docs[0] if docs else None
+
+    def relation_acl_text(self, db: str, table: str, owner: str) -> str | None:
+        """The ``pg_class.relacl`` text (aclitem[] literal) for ``table``, or
+        None when the ACL was never touched (real PG's default → a driver reads
+        the owner as implicitly holding everything). Once materialized, emit the
+        owner's retained privileges plus every recorded per-grantee grant."""
+        grants = self.get_table_grants(db, table)
+        state = self._relation_acl_state(db, table)
+        if not grants and state is None:
+            return None  # untouched — implicit owner privileges
+        owner_privs = state["owner_privs"] if state is not None else list(self.TABLE_PRIVILEGES)
+
+        def item(grantee: str, privs: list[str]) -> str:
+            held = {p.upper() for p in privs}
+            letters = "".join(ch for name, ch in self._ACL_LETTERS if name in held)
+            # An empty grantee name is PUBLIC in the aclitem form (``=r/owner``).
+            who = "" if grantee.upper() == "PUBLIC" else grantee
+            return f"{who}={letters}/{owner}"
+
+        entries: list[str] = []
+        if owner_privs:
+            entries.append(item(owner, owner_privs))
+        for doc in grants:
+            if doc["grantee"] == owner:
+                continue  # the owner's row is driven by owner_privs above
+            entries.append(item(doc["grantee"], doc.get("privileges", [])))
+        return "{" + ",".join(entries) + "}"
+
     def has_table_privilege(self, db: str, table: str, grantees: set[str], privilege: str) -> bool:
         """Whether any identity in ``grantees`` (a user + its role names, plus
         ``PUBLIC``) holds ``privilege`` on ``table`` via a recorded grant."""
@@ -956,6 +1202,24 @@ class Catalog:
         self._storage.delete_matching(db, FUNCTION_COLLECTION, {"_id": key})
         self._storage.insert(db, FUNCTION_COLLECTION, [{"_id": key, **doc}])
 
+    @staticmethod
+    def _operator_key(name: str, left: str, right: str) -> str:
+        return f"{name}/{left.lower()}/{right.lower()}"
+
+    def put_operator(self, db: str, doc: dict[str, Any]) -> None:
+        key = self._operator_key(doc["name"], doc["leftarg"], doc["rightarg"])
+        self._storage.delete_matching(db, OPERATOR_COLLECTION, {"_id": key})
+        self._storage.insert(db, OPERATOR_COLLECTION, [{"_id": key, **doc}])
+
+    def get_operator(self, db: str, name: str, left: str, right: str) -> dict[str, Any] | None:
+        key = self._operator_key(name, left, right)
+        docs = self._storage.find_matching(db, OPERATOR_COLLECTION, {"_id": key}, limit=1)
+        return docs[0] if docs else None
+
+    def drop_operator(self, db: str, name: str, left: str, right: str) -> bool:
+        key = self._operator_key(name, left, right)
+        return self._storage.delete_matching(db, OPERATOR_COLLECTION, {"_id": key}) > 0
+
     def get_function(self, db: str, name: str, nargs: int) -> dict[str, Any] | None:
         key = self._function_key(name, nargs)
         docs = self._storage.find_matching(db, FUNCTION_COLLECTION, {"_id": key}, limit=1)
@@ -977,6 +1241,7 @@ class Catalog:
         ``value`` itself (Postgres ``setval(seq, v, false)`` semantics)."""
         if not self.sequence_exists(db, name):
             raise errors.SQLError("42P01", f'relation "{name}" does not exist')
+        self._invalidate_sequence_cache(db, name)
         self._storage.update_matching(
             db,
             SEQUENCE_COLLECTION,
@@ -1089,6 +1354,20 @@ class Catalog:
     # tables). Types created in a schema are stored under their dotted
     # qualified name ("testschema.testcomp"); pg_namespace / pg_type surface
     # the schema with a minted namespace oid.
+
+    # -- per-database GUC defaults (ALTER DATABASE … SET) -------------------- #
+
+    def set_db_setting(self, db: str, name: str, value: str | None) -> None:
+        """Set (or, with ``value=None``, reset) a database-level GUC default."""
+        self._storage.delete_matching(db, DB_SETTINGS_COLLECTION, {"_id": name})
+        if value is not None:
+            self._storage.insert(db, DB_SETTINGS_COLLECTION, [{"_id": name, "value": value}])
+
+    def db_settings(self, db: str) -> dict[str, str]:
+        return {
+            d["_id"]: d["value"]
+            for d in self._storage.find_matching(db, DB_SETTINGS_COLLECTION, {})
+        }
 
     def create_schema(self, db: str, name: str) -> None:
         if not self.schema_exists(db, name):
@@ -1218,6 +1497,8 @@ class Catalog:
         checks: list[dict[str, Any]] | None = None,
         has_default: bool = False,
         default: Any = None,
+        typmod: int = -1,
+        base_oid: int | None = None,
     ) -> None:
         self._storage.delete_matching(db, DOMAIN_COLLECTION, {"_id": name})
         self._storage.insert(
@@ -1232,6 +1513,11 @@ class Catalog:
                     "checks": list(checks or []),
                     "has_default": bool(has_default),
                     "default": default,
+                    # The base type's declared typmod / oid (``varbit(3)`` →
+                    # typmod 3), surfaced as the domain's pg_type.typtypmod /
+                    # typbasetype so getColumns reports COLUMN_SIZE.
+                    "typmod": int(typmod),
+                    "base_oid": base_oid,
                     "oid": self._mint_user_type_oid(
                         db, "domain_oid_counter", DOMAIN_TYPE_OID_BASE, DOMAIN_COLLECTION
                     ),
@@ -1247,6 +1533,27 @@ class Catalog:
         for i, doc in enumerate(sorted(docs, key=lambda d: d["domain"])):
             out[doc["domain"]] = doc.get("oid", DOMAIN_TYPE_OID_BASE + i)
         return out
+
+    def set_domain_comment(self, db: str, name: str, comment: str | None) -> bool:
+        doc = self.get_domain(db, name)
+        if doc is None:
+            return False
+        doc = {k: v for k, v in doc.items() if k != "_id"}
+        doc["comment"] = comment
+        self._storage.delete_matching(db, DOMAIN_COLLECTION, {"_id": name})
+        self._storage.insert(db, DOMAIN_COLLECTION, [{"_id": name, **doc}])
+        return True
+
+    def set_index_comment(self, db: str, name: str, comment: str | None) -> None:
+        self._storage.delete_matching(db, INDEX_COMMENT_COLLECTION, {"_id": name})
+        if comment is not None:
+            self._storage.insert(db, INDEX_COMMENT_COLLECTION, [{"_id": name, "comment": comment}])
+
+    def index_comments(self, db: str) -> dict[str, str]:
+        return {
+            d["_id"]: d["comment"]
+            for d in self._storage.find_matching(db, INDEX_COMMENT_COLLECTION, {})
+        }
 
     def get_domain(self, db: str, name: str) -> dict[str, Any] | None:
         docs = self._storage.find_matching(db, DOMAIN_COLLECTION, {"_id": name}, limit=1)
@@ -1277,6 +1584,7 @@ class Catalog:
         doc = self.get_sequence(db, name)
         if doc is None:
             raise errors.SQLError("42P01", f'relation "{name}" does not exist')
+        self._invalidate_sequence_cache(db, name)
         update: dict[str, Any] = {}
         for key in ("increment", "min_value", "max_value", "cycle", "start"):
             if key in changes:

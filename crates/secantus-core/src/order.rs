@@ -19,23 +19,77 @@ use crate::numeric;
 /// MongoDB's cross-type sort rank (lower sorts first), matching
 /// `_bson_type_rank`. Only the types we can faithfully compare get a rank;
 /// `is_sortable` gates everything else out before `cmp` runs.
+/// `Bson::Undefined` stands in for an empty array in a sort key — see
+/// [`array_sort_value`]. pymongo never encodes `undefined`, so it cannot collide
+/// with a stored value.
+pub const EMPTY_ARRAY_SORT_MARKER: Bson = Bson::Undefined;
+
+/// Ranks are spaced by 10 so the empty-array marker can sit *between* MinKey and
+/// Null, which is where mongod puts it. Relative order is otherwise unchanged.
 fn type_rank(v: &Bson) -> u8 {
     match v {
-        Bson::MinKey => 1,
-        Bson::Null => 2,
-        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => 3,
-        Bson::String(_) => 4,
-        Bson::Document(_) => 5,
-        Bson::Array(_) => 6,
-        Bson::Binary(_) => 7,
-        Bson::ObjectId(_) => 8,
-        Bson::Boolean(_) => 9,
-        Bson::DateTime(_) => 10,
-        Bson::Timestamp(_) => 11,
-        Bson::RegularExpression(_) => 12,
-        Bson::MaxKey => 13,
-        _ => 5, // matches Python's `return 5` fallback (never reached: is_sortable bars these)
+        Bson::MinKey => 10,
+        Bson::Undefined => 15, // empty-array sort marker: above MinKey, below Null
+        Bson::Null => 20,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => 30,
+        Bson::String(_) => 40,
+        Bson::Document(_) => 50,
+        Bson::Array(_) => 60,
+        Bson::Binary(_) => 70,
+        Bson::ObjectId(_) => 80,
+        Bson::Boolean(_) => 90,
+        Bson::DateTime(_) => 100,
+        Bson::Timestamp(_) => 110,
+        Bson::RegularExpression(_) => 120,
+        Bson::MaxKey => 130,
+        _ => 50, // matches Python's `return 5` fallback (never reached: is_sortable bars these)
     }
+}
+
+/// The value mongod actually sorts an ARRAY-valued field by: its minimum element
+/// ascending, its maximum descending.
+///
+/// Verified against mongod 6.0.16 — `[[1,100], [5,9], 6, [7]]` sorts ascending as
+/// `[1,100] < [5,9] < 6 < [7]` (minima 1 < 5 < 6 < 7) and descending by maxima
+/// 100 > 9 > 7 > 6. An empty array has no representative and sorts between MinKey
+/// and Null.
+///
+/// Comparing whole arrays put every array after every scalar, and worse, it
+/// disagreed with our own index path: a multikey index writes one entry per
+/// element, so an index scan already produced mongod's ordering and the same query
+/// returned a different order depending on whether an index existed.
+///
+/// Returns `None` when an element is not faithfully sortable, so the caller can
+/// raise its own module's `Fallback`. Mirrors `ordering.py::_array_sort_value`.
+pub fn array_sort_value(v: Bson, reverse: bool) -> Option<Bson> {
+    let Bson::Array(items) = v else {
+        return Some(v);
+    };
+    if items.is_empty() {
+        return Some(EMPTY_ARRAY_SORT_MARKER);
+    }
+    let mut best: Option<Bson> = None;
+    for item in items {
+        if !is_sortable(&item) {
+            return None;
+        }
+        best = Some(match best {
+            None => item,
+            Some(cur) => {
+                let take = if reverse {
+                    cmp(&item, &cur) == std::cmp::Ordering::Greater
+                } else {
+                    cmp(&item, &cur) == std::cmp::Ordering::Less
+                };
+                if take {
+                    item
+                } else {
+                    cur
+                }
+            }
+        });
+    }
+    Some(best.unwrap_or(Bson::Null))
 }
 
 /// True if every value in `v` is one we can sort *faithfully* — meaning Python
@@ -93,10 +147,15 @@ pub fn cmp(a: &Bson, b: &Bson) -> Ordering {
         (Bson::Array(x), Bson::Array(y)) => array_cmp(x, y),
         // Rank 3: the unified numeric type. NaN is unordered -> Python's `<` is
         // False both ways -> Equal (stable).
-        _ => match (numeric::classify(a), numeric::classify(b)) {
-            (Some(na), Some(nb)) => numeric::cmp(&na, &nb).unwrap_or(Ordering::Equal),
-            _ => Ordering::Equal,
-        },
+        _ => {
+            if let Some(r) = numeric::fast_cmp(a, b) {
+                return r.unwrap_or(Ordering::Equal);
+            }
+            match (numeric::classify(a), numeric::classify(b)) {
+                (Some(na), Some(nb)) => numeric::cmp(&na, &nb).unwrap_or(Ordering::Equal),
+                _ => Ordering::Equal,
+            }
+        }
     }
 }
 
@@ -216,6 +275,9 @@ pub fn bson_lt(a: &Bson, b: &Bson) -> Option<bool> {
             }
             // Rank 3: the unified numeric type (int / long / double /
             // Decimal128). NaN is unordered → Python `<` is False.
+            if let Some(r) = numeric::fast_cmp(a, b) {
+                return Some(r == Some(Ordering::Less));
+            }
             match (numeric::classify(a), numeric::classify(b)) {
                 (Some(na), Some(nb)) => Some(numeric::cmp(&na, &nb) == Some(Ordering::Less)),
                 _ => None,

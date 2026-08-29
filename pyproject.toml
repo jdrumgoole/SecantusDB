@@ -4,7 +4,7 @@
 # Python (Pillow → PIL, scikit-learn → sklearn). PyPI normalizes
 # `SecantusDB` → `secantusdb` for URLs and lookup; pip is case-insensitive.
 name = "SecantusDB"
-version = "0.6.0b4"
+version = "0.6.0b16"
 description = "An embeddable, MongoDB compatible, document database, built on WiredTiger"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -43,6 +43,13 @@ dev = [
     # ``--splits N --group K`` against the per-platform files in ci/durations/;
     # see .github/workflows/record-durations.yml for how those are produced.
     "pytest-split>=0.10",
+    # starlette's TestClient prefers httpx2 and emits a
+    # StarletteDeprecationWarning on every construction when only httpx is
+    # importable ("Using `httpx` with `starlette.testclient` is deprecated").
+    # That was the last warning left in the default suite — six of them, from
+    # the admin websocket tests. Test-only: nothing under src/secantus imports
+    # httpx at runtime, so this does not belong in the admin/opsboard extras.
+    "httpx2>=2.12",
     "trustme>=1.2",  # ephemeral CA + self-signed certs for tests/test_tls.py
     "sqlglot>=25",  # SQL parser for the secantus.sql tests (mirrors the [sql] extra)
     "pg8000>=1.31",  # pure-Python Postgres driver: real-driver gauge for the SQL server
@@ -193,6 +200,9 @@ wheel.packages = ["src/secantus"]
 # vendor/wiredtiger contains GPL'd C source; cibuildwheel needs it.
 sdist.include = ["vendor/wiredtiger/**"]
 sdist.exclude = [
+    # Differential probes are a development tool (they need a live mongod
+    # alongside SecantusDB), same rationale as the gauge dirs below.
+    "tools/**",
     "vendor/wiredtiger/test/**",
     "vendor/wiredtiger/bench/**",
     "vendor/wiredtiger/examples/**",
@@ -234,6 +244,13 @@ sdist.exclude = [
     "psycopg_validation/**",
     "vendor/sqllogictest/**",
     "slt_validation/**",
+    "sqlalchemy_validation/**",
+    "vendor/pgx/**",
+    "pgx_validation/**",
+    "pgtest_validation/**",
+    "vendor/pgjdbc/**",
+    "pgjdbc_validation/**",
+    "sqlstress_validation/**",
     ".validation/**",
     # brandkit/ is marketing content (logos, brand-guide HTML); not
     # needed at install or run time. The docs that need it pull from
@@ -279,7 +296,9 @@ test-command = "pytest -v {project}/tests/test_smoke.py {project}/tests/test_pym
 # manylinux_2_28 (AlmaLinux 8, dnf) + musllinux_1_2 (Alpine, apk). The
 # storage-engine build (SECANTUS_BUILD_STORAGE_ENGINE=ON) compiles the Rust
 # extensions, which need (a) swig for WiredTiger's Python module, (b) a Rust
-# toolchain, and (c) libclang for `secantus-wt`'s bindgen. We pin manylinux to
+# toolchain, (c) libclang for `secantus-wt`'s bindgen, and (d) **lz4**, the
+# default block compressor since 2026-08-22 — WiredTiger's builtin lz4
+# extension links against it (zlib is already present on every image). We pin manylinux to
 # 2_28 (glibc 2.28+) because its `dnf install clang clang-libs` gives a modern
 # libclang (the CentOS-7 manylinux2014 SCL clang is far more painful). The
 # install path of libclang.so differs by distro (manylinux /usr/lib64, musllinux
@@ -290,7 +309,7 @@ manylinux-x86_64-image = "manylinux_2_28"
 manylinux-aarch64-image = "manylinux_2_28"
 archs = ["x86_64", "aarch64"]
 before-build = """
-(dnf install -y swig clang clang-libs clang-devel llvm-libs || apk add --no-cache swig clang clang-dev llvm-dev)
+(dnf install -y swig clang clang-libs clang-devel llvm-libs lz4-devel || apk add --no-cache swig clang clang-dev llvm-dev lz4-dev)
 mkdir -p /opt/libclang
 lc=$(find /usr -name 'libclang.so*' 2>/dev/null | head -1); [ -n "$lc" ] && ln -sf "$lc" /opt/libclang/libclang.so
 command -v cargo >/dev/null 2>&1 || (curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable)
@@ -303,8 +322,15 @@ command -v cargo >/dev/null 2>&1 || (curl --proto '=https' --tlsv1.2 -sSf https:
 # parses WiredTiger's headers into broken bindings (missing WT_CURSOR fields);
 # bindgen auto-discovers Xcode's libclang, which is what the storage-engine CI
 # job uses successfully. `brew install` is idempotent.
+#
+# lz4 is built from source rather than `brew install lz4` (tools/build_lz4_macos.sh).
+# Homebrew builds for the runner's own OS, so its liblz4 carries a minimum
+# target of macOS 14 and `delocate` refuses to bundle it into a wheel targeting
+# macOS 11 — accepting it would mean raising the wheel's floor to 14 and
+# dropping every Apple Silicon user on macOS 11-13. The script builds a STATIC
+# liblz4 at the wheel's own deployment target, so there is no dylib to bundle.
 archs = ["arm64"]
-before-build = "brew install swig && (command -v cargo >/dev/null 2>&1 || brew install rust)"
+before-build = "brew install swig && (command -v cargo >/dev/null 2>&1 || brew install rust) && bash tools/build_lz4_macos.sh"
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]
@@ -352,6 +378,7 @@ markers = [
     "perf: performance regression tests (run via `invoke perf`, not in default suite)",
     "online: tests that hit the public internet (run via `invoke validate-readme` or `pytest -m online`, not in default suite)",
     "slow: long-running benchmarks / scaling regressions (run via `pytest -m slow`, not in default suite)",
+    "differential: same operation against SecantusDB and a real mongod (skipped when no mongod is on PATH; run via `pytest -m differential`)",
 ]
 
 [tool.ruff]

@@ -53,6 +53,7 @@
 
 use bson::{doc, Bson, Document};
 
+use crate::argtypes;
 use crate::find::split_docs_into_cursor;
 use crate::util::{
     as_i64, bool_field, collation_of, command_error, decode_docs, decode_docs_minimal, encode_docs,
@@ -63,6 +64,14 @@ use secantus_core::collation::Collation;
 
 /// `aggregate` — run a pipeline and return a cursor over the results.
 pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    // `cursor` means "missing or an object" literally: an explicit `cursor: null`
+    // is rejected where an absent one is fine. `let` is the BSON-field family.
+    argtypes::require_cursor_object(doc)?;
+    argtypes::require_object(doc, "let", "aggregate.let")?;
+    if let Some(bson::Bson::Document(c)) = doc.get("cursor") {
+        argtypes::require_number(c, "batchSize", "cursor.batchSize")?;
+    }
+    argtypes::require_max_time_ms(doc)?;
     // `aggregate: <coll>` (string) or `aggregate: 1` (collectionless).
     let coll = match doc.get("aggregate") {
         Some(Bson::String(s)) => Some(s.clone()),
@@ -84,6 +93,18 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // engine fallback produces. Parse-time, like the stage-name check.
     if let Err(e) = validate_project_exprs(&pipeline) {
         return Ok(e.into_reply());
+    }
+    // A wrong-TYPED stage spec: name it with mongod's own code rather than
+    // letting the engine's generic `Fallback` surface as BadValue (2). Seven
+    // stages, seven codes -- see `crate::argtypes::stage_spec_error`.
+    if let Some((code, errmsg)) = argtypes::stage_spec_error(&pipeline) {
+        // 9 is FailedToParse; the rest are mongod's anonymous `Location<n>` codes.
+        let code_name = if code == 9 {
+            "FailedToParse".to_string()
+        } else {
+            format!("Location{code}")
+        };
+        return Ok(CommandError::new(code, code_name, errmsg).into_reply());
     }
 
     // Inline `explain: true` on the aggregate command (the legacy flag, distinct
@@ -241,6 +262,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         ),
     };
 
+    // The connection's handshake `client` doc, for `$currentOp`'s appName /
+    // clientMetadata (read before the borrow of `ctx` below).
+    let client_metadata: Option<Document> = ctx
+        .conn_auth
+        .as_ref()
+        .and_then(|a| a.lock().ok())
+        .and_then(|g| g.client_metadata.clone());
     let result = run_segmented(
         input,
         &working_pipeline,
@@ -250,12 +278,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         storage,
         collation.as_ref(),
         doc,
+        client_metadata.as_ref(),
     )?;
 
     // The pipeline result is already decoded `Document`s. Send the `firstBatch`
     // straight to the wire as `Bson` and encode only the cursor remainder for the
     // registry — no encode→decode round-trip on the docs the client gets now.
-    let (first_batch, cursor_id) = split_docs_into_cursor(result, batch_size, &ns, cursors)?;
+    let (first_batch, cursor_id) = split_docs_into_cursor(result, batch_size, &ns, cursors, false)?;
     Ok(doc! {
         "cursor": {
             "firstBatch": first_batch,
@@ -305,6 +334,7 @@ fn apply_source_stage(
     db: &str,
     coll: Option<&str>,
     cmd_doc: &Document,
+    client_metadata: Option<&Document>,
 ) -> Vec<Document> {
     let command_doc = if cmd_doc.contains_key("aggregate") {
         let mut c = cmd_doc.clone();
@@ -319,7 +349,7 @@ fn apply_source_stage(
         doc! { "aggregate": 1 }
     };
     let ns = format!("{}.{}", db, coll.unwrap_or("$cmd.aggregate"));
-    vec![doc! {
+    let mut row = doc! {
         "type": "op",
         "host": "secantus",
         "desc": "$currentOp",
@@ -328,7 +358,27 @@ fn apply_source_stage(
         "command": command_doc,
         "ns": ns,
         "op": "command",
-    }]
+    };
+    // Surface the connection's driver handshake metadata the way mongod's
+    // `$currentOp` does: the whole `clientMetadata` document plus a top-level
+    // `appName` lifted out of `application.name`. mongocxx's "client metadata
+    // handshake feature" test connects with `?appName=…`, scans
+    // `db.aggregate([{$currentOp: {}}])` for a row whose `appName` matches, and
+    // only then checks `clientMetadata.{application,driver,os}` — with neither
+    // field present its scan matched nothing and the test failed on a missing
+    // op rather than on any of the metadata it meant to verify. Mirrors
+    // `aggregate._stage_current_op`.
+    if let Some(meta) = client_metadata {
+        if let Some(name) = meta
+            .get_document("application")
+            .ok()
+            .and_then(|a| a.get_str("name").ok())
+        {
+            row.insert("appName", name.to_string());
+        }
+        row.insert("clientMetadata", meta.clone());
+    }
+    vec![row]
 }
 
 /// Atlas-only aggregation stages SecantusDB can't provide — rejected with the
@@ -341,7 +391,18 @@ const ATLAS_STAGES: &[&str] = &[
     "$vectorSearch",
 ];
 
-const SEARCH_INDEX_ATLAS_MSG: &str = "Using Atlas Search Database Commands and the \
+/// mongod's error when a `pipeline` element is not a BSON document. Code 14
+/// (TypeMismatch); libmongoc's `/change_stream/accepts_array` asserts on the
+/// wording verbatim. Probed identical on mongod 6.0.16 and 8.3.4.
+pub const PIPELINE_ELEMENT_MSG: &str = "Each element of the 'pipeline' array must be an object";
+
+/// mongod's error when a stage *is* a document but isn't a single
+/// `{operator: spec}` pair -- both an empty `{}` and a multi-key stage. Note
+/// the trailing period, and that it is Location40323, not the generic 14.
+pub const STAGE_ARITY_MSG: &str =
+    "A pipeline stage specification object must contain exactly one field.";
+
+pub const SEARCH_INDEX_ATLAS_MSG: &str = "Using Atlas Search Database Commands and the \
 $listSearchIndexes aggregation stage requires additional configuration. Please connect to Atlas \
 or an Atlas-compatible deployment to use this feature.";
 
@@ -439,11 +500,14 @@ fn validate_project_exprs(pipeline: &[Bson]) -> Result<(), CommandError> {
 
 fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError> {
     for stage in pipeline {
+        // Both of these used to `continue`, so a malformed element sailed past
+        // validation: `pipeline: [42]` reached execution and surfaced as a bare
+        // internal error, and a two-key stage was silently accepted.
         let Some(d) = stage.as_document() else {
-            continue;
+            return Err(CommandError::new(14, "TypeMismatch", PIPELINE_ELEMENT_MSG));
         };
         if d.len() != 1 {
-            continue;
+            return Err(CommandError::new(40323, "Location40323", STAGE_ARITY_MSG));
         }
         let name = stage_name(stage);
         if ATLAS_STAGES.contains(&name) {
@@ -489,6 +553,7 @@ fn run_segmented(
     storage: &dyn crate::storage::Storage,
     collation: Option<&Collation>,
     cmd_doc: &Document,
+    client_metadata: Option<&Document>,
 ) -> Result<Vec<Document>, CommandError> {
     let mut docs = input;
     let mut buffer: Vec<Bson> = Vec::new();
@@ -514,7 +579,7 @@ fn run_segmented(
                 let _ = core_run(docs, &buffer, vars, collation)?;
                 buffer.clear();
             }
-            docs = apply_source_stage(name, db, coll, cmd_doc);
+            docs = apply_source_stage(name, db, coll, cmd_doc, client_metadata);
         } else if is_storage_backed(name) {
             if !buffer.is_empty() {
                 docs = core_run(docs, &buffer, vars, collation)?;
@@ -716,6 +781,7 @@ fn apply_lookup(
                 storage,
                 collation,
                 &Document::new(),
+                None,
             )?
         } else {
             // Simple form: localField == foreignField (array-aware).
@@ -929,6 +995,7 @@ fn apply_facet(
             storage,
             collation,
             &Document::new(),
+            None,
         )?;
         out.insert(
             name.clone(),
@@ -986,6 +1053,7 @@ fn apply_union_with(
             storage,
             collation,
             &Document::new(),
+            None,
         )?;
     }
     docs.append(&mut foreign);
@@ -1429,7 +1497,23 @@ fn apply_coll_stats(
             "nindexes": indexes.len() as i32,
         };
         if storage.collection_is_capped(db, coll).unwrap_or(false) {
+            // mongod renames the user-set `size` to `maxSize` here, so a caller
+            // can tell the cap from the current data size. mongo-ruby-driver's
+            // `Collection#create ... applies the options` capped spec reads
+            // `storageStats.{capped, max, maxSize}` directly, so all three have
+            // to be present. Mirrors `aggregate._coll_stats`.
             storage_stats.insert("capped", true);
+            // `as_i64` (the crate helper), not `Bson::as_i64` — the latter
+            // matches Int64 only, and drivers send these as Int32
+            // (mongo-ruby-driver sends `size: 4096, max: 512`), so both fields
+            // silently vanished from the reply.
+            let opts = storage.get_collection_options(db, coll).unwrap_or_default();
+            if let Some(size) = opts.get("size").and_then(as_i64) {
+                storage_stats.insert("maxSize", size);
+            }
+            if let Some(max) = opts.get("max").and_then(as_i64) {
+                storage_stats.insert("max", max);
+            }
         }
         out.insert("storageStats", storage_stats);
     }
@@ -1898,4 +1982,109 @@ fn reduce_raw_prefix(
         consumed += 1;
     }
     (bytes, pipeline[consumed..].to_vec())
+}
+
+#[cfg(test)]
+mod current_op_metadata_tests {
+    use super::*;
+
+    fn meta() -> Document {
+        doc! {
+            "application": {"name": "my-app"},
+            "driver": {"name": "mongoc / mongocxx", "version": "1.2.3"},
+            "os": {"type": "Darwin"},
+        }
+    }
+
+    /// mongocxx's client-metadata handshake test scans `$currentOp` for a row
+    /// whose top-level `appName` matches the one it connected with, and only
+    /// then inspects `clientMetadata`. With neither field the scan matched
+    /// nothing, so the test failed on a missing op rather than on the metadata
+    /// it meant to check.
+    #[test]
+    fn current_op_surfaces_app_name_and_client_metadata() {
+        let rows = apply_source_stage("$currentOp", "db", None, &doc! {}, Some(&meta()));
+        let row = &rows[0];
+        assert_eq!(row.get_str("appName").unwrap(), "my-app");
+        let cm = row.get_document("clientMetadata").unwrap();
+        assert_eq!(
+            cm.get_document("driver").unwrap().get_str("name").unwrap(),
+            "mongoc / mongocxx"
+        );
+        assert!(
+            cm.get_document("os").is_ok(),
+            "os is asserted by the test too"
+        );
+    }
+
+    /// No handshake metadata (an internal caller) ⇒ neither field, rather than
+    /// an empty `appName` that a scan could match by accident.
+    #[test]
+    fn current_op_omits_the_fields_without_metadata() {
+        let rows = apply_source_stage("$currentOp", "db", None, &doc! {}, None);
+        assert!(rows[0].get("appName").is_none());
+        assert!(rows[0].get("clientMetadata").is_none());
+    }
+
+    /// Metadata without `application` (a driver that sent no appName) still
+    /// surfaces `clientMetadata`, just no `appName` to match on.
+    #[test]
+    fn metadata_without_an_application_yields_no_app_name() {
+        let m = doc! {"driver": {"name": "d", "version": "1"}, "os": {"type": "Linux"}};
+        let rows = apply_source_stage("$currentOp", "db", None, &doc! {}, Some(&m));
+        assert!(rows[0].get("appName").is_none());
+        assert!(rows[0].get_document("clientMetadata").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod malformed_pipeline_tests {
+    use super::*;
+    use bson::doc;
+
+    /// Values probed against real mongod (6.0.16 and 8.3.4 agree): every
+    /// non-document element of `pipeline` is 14 TypeMismatch with one wording.
+    #[test]
+    fn non_document_element_is_type_mismatch() {
+        for bad in [
+            Bson::Int32(42),
+            Bson::String("stage".into()),
+            Bson::Array(vec![Bson::String("nested".into())]),
+            Bson::Null,
+            Bson::Double(3.5),
+            Bson::Boolean(true),
+        ] {
+            let err = validate_stage_names(std::slice::from_ref(&bad))
+                .expect_err(&format!("{bad:?} should be rejected"));
+            assert_eq!(err.code, 14, "{bad:?}");
+            assert_eq!(err.code_name, "TypeMismatch", "{bad:?}");
+            assert_eq!(err.errmsg, PIPELINE_ELEMENT_MSG, "{bad:?}");
+        }
+    }
+
+    /// A document of the wrong arity is a *different* error from the wrong
+    /// type: Location40323, with a trailing period.
+    #[test]
+    fn wrong_arity_stage_is_location_40323() {
+        for bad in [
+            doc! {},
+            doc! {"$match": {}, "$count": "n"},
+            doc! {"$limit": 1, "$count": "n"},
+        ] {
+            let err = validate_stage_names(&[Bson::Document(bad.clone())])
+                .expect_err(&format!("{bad:?} should be rejected"));
+            assert_eq!(err.code, 40323, "{bad:?}");
+            assert_eq!(err.code_name, "Location40323", "{bad:?}");
+            assert_eq!(err.errmsg, STAGE_ARITY_MSG, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn well_formed_pipeline_still_validates() {
+        validate_stage_names(&[
+            Bson::Document(doc! {"$match": {"x": 1}}),
+            Bson::Document(doc! {"$count": "n"}),
+        ])
+        .expect("a valid pipeline must not be rejected");
+    }
 }

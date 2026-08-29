@@ -26,6 +26,7 @@ use std::collections::HashMap;
 
 use bson::{Bson, Document};
 
+use crate::decimal;
 use crate::expressions;
 use crate::numeric::{self, as_int_like, int_promoted_to_bson, int_to_bson, is_int64, NumVal};
 
@@ -105,19 +106,36 @@ pub fn gkey(v: &Bson) -> R<GKey> {
 /// Running numeric value preserving Python's int-vs-float distinction. The
 /// integral variant also tracks whether any operand was int64, so the result
 /// promotes to int64 (MongoDB's numeric widening — `numerics.bson_add`).
-#[derive(Clone, Copy)]
+// Not `Copy`: the decimal arm owns its coefficient digits.
+#[derive(Clone)]
 // `pub(crate)` only because it is reachable through the `pub(crate) Acc` the
 // `windowfields` module reuses; not part of any real cross-module API.
 pub(crate) enum Num {
-    Int { v: i128, wide: bool },
+    Int {
+        v: i128,
+        wide: bool,
+    },
     Float(f64),
+    /// Decimal dominates the widening order, so a running total switches here
+    /// the moment any decimal value arrives and never switches back.
+    Dec(decimal::Dec),
 }
 
 impl Num {
+    /// Move the running total out, leaving a zero behind. `Num` stopped being
+    /// `Copy` when the decimal arm arrived; the accumulator loop still only
+    /// needs a move, so this keeps the hot `$sum` path allocation-free.
+    fn take(&mut self) -> Num {
+        std::mem::replace(self, Num::Int { v: 0, wide: false })
+    }
+
     /// Python `self + v`. `Err(())` if `v` isn't numeric (Python `int + str`
     /// etc. raises -> defer). `pub(crate)` so the expression-form `$sum`/`$avg`
     /// accumulators (`expressions.rs`) reuse the exact width logic for parity.
     pub(crate) fn add(self, v: &Bson) -> R<Num> {
+        if matches!(self, Num::Dec(_)) || matches!(v, Bson::Decimal128(_)) {
+            return self.add_decimal(v);
+        }
         match v {
             Bson::Int32(_) | Bson::Int64(_) | Bson::Boolean(_) => {
                 let n = as_int_like(v).unwrap();
@@ -127,20 +145,47 @@ impl Num {
                         wide: wide || is_int64(v),
                     },
                     Num::Float(f) => Num::Float(f + n as f64),
+                    // Unreachable — a decimal running total took the branch
+                    // above. Deferring (rather than panicking) keeps a wrong
+                    // assumption here a slowdown, not a crash.
+                    Num::Dec(_) => return Err(()),
                 })
             }
             Bson::Double(d) => Ok(match self {
                 Num::Int { v: a, .. } => Num::Float(a as f64 + d),
                 Num::Float(f) => Num::Float(f + d),
+                Num::Dec(_) => return Err(()), // as above
             }),
             _ => Err(()), // string / array / doc / Decimal128 / null -> TypeError
         }
     }
 
-    pub(crate) fn to_bson(self) -> R<Bson> {
+    /// The decimal-domain arm of [`Num::add`]. Bools stay int-like here exactly
+    /// as they are on the integer path, so widening to decimal can't silently
+    /// change which values a `$sum` counts.
+    fn add_decimal(self, v: &Bson) -> R<Num> {
+        let a = match self {
+            Num::Dec(d) => d,
+            Num::Int { v: a, .. } => decimal::parse(&a.to_string()).ok_or(())?,
+            Num::Float(f) => decimal::from_bson_accumulator(&Bson::Double(f)).ok_or(())?,
+        };
+        let b = match v {
+            Bson::Boolean(_) => {
+                decimal::from_bson(&Bson::Int32(as_int_like(v).ok_or(())? as i32)).ok_or(())?
+            }
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
+                decimal::from_bson_accumulator(v).ok_or(())?
+            }
+            _ => return Err(()), // string / array / doc / null -> TypeError
+        };
+        Ok(Num::Dec(decimal::add(&a, &b).ok_or(())?))
+    }
+
+    pub(crate) fn into_bson(self) -> R<Bson> {
         match self {
             Num::Int { v, wide } => int_promoted_to_bson(v, wide).ok_or(()),
             Num::Float(f) => Ok(Bson::Double(f)),
+            Num::Dec(d) => decimal::to_bson(&d).ok_or(()),
         }
     }
 }
@@ -358,32 +403,29 @@ fn arg_is_one(arg: &Bson) -> bool {
 pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Document) -> R<()> {
     match acc {
         Acc::Sum(running) => {
-            // mongod sums only numeric operands (int / long / double); string /
-            // bool / null / missing / array / doc are ignored. Decimal128 -> Python.
+            // mongod sums only numeric operands (int / long / double / decimal);
+            // string / bool / null / missing / array / doc are ignored.
             if arg_is_one(arg) {
-                *running = running.add(&Bson::Int32(1))?;
+                *running = running.take().add(&Bson::Int32(1))?;
             } else {
-                match eval(arg, doc, vars)? {
-                    v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)) => {
-                        *running = running.add(&v)?;
-                    }
-                    Bson::Decimal128(_) => return Err(()),
-                    _ => {}
+                if let v @ (Bson::Int32(_)
+                | Bson::Int64(_)
+                | Bson::Double(_)
+                | Bson::Decimal128(_)) = eval(arg, doc, vars)?
+                {
+                    *running = running.take().add(&v)?;
                 }
             }
         }
         Acc::Count(n) => *n += 1,
         Acc::Avg(state) => {
-            // Averages only numeric values (Decimal128 -> Python); an all-non-
-            // numeric group finalises to null.
-            match eval(arg, doc, vars)? {
-                v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)) => {
-                    let (total, count) =
-                        state.take().unwrap_or((Num::Int { v: 0, wide: false }, 0));
-                    *state = Some((total.add(&v)?, count + 1));
-                }
-                Bson::Decimal128(_) => return Err(()),
-                _ => {}
+            // Averages only numeric values; an all-non-numeric group finalises
+            // to null.
+            if let v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)) =
+                eval(arg, doc, vars)?
+            {
+                let (total, count) = state.take().unwrap_or((Num::Int { v: 0, wide: false }, 0));
+                *state = Some((total.add(&v)?, count + 1));
             }
         }
         Acc::Min(cur) => update_extreme(cur, eval(arg, doc, vars)?, Ordering::Less)?,
@@ -433,13 +475,23 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
             }
         }
         Acc::StdDev { values, .. } => {
-            // Python appends every non-null value; a non-numeric would then blow
-            // up `sum(values)` at finalize, so we defer such a group to Python
-            // (which raises). `null` is skipped. Bool counts as 0/1 (Python sums
-            // bools as ints) — matches the pure evaluator.
+            // mongod counts only int / long / double / decimal. bool, null,
+            // string, array and document values are silently *skipped*, not
+            // errors (probed 6.0.16: `$stdDevPop` over [5, "x", 7] is 1.0, and
+            // over bools alone is null).
+            //
+            // This used to defer the whole group on any non-numeric, with a
+            // comment saying Python would raise — which it did, with a bare
+            // TypeError that escaped as "internal server error". It also folded
+            // bool to 0/1 "matching the pure evaluator", which mongod does not.
+            // Both sides are fixed together.
             let v = eval(arg, doc, vars)?;
-            if !is_null(&v) {
-                values.push(numeric_f64(&v).ok_or(())?);
+            // `percentile_f64` is the same domain (int/long/double/decimal,
+            // bool and NaN excluded) and handles Decimal128, which
+            // `numeric_f64` does not — mongod answers a double even for decimal
+            // input (probed: $stdDevPop over Decimal128 5 and 7 is 1.0).
+            if let Some(f) = percentile_f64(&v) {
+                values.push(f);
             }
         }
         Acc::Percentile {
@@ -632,19 +684,6 @@ fn nelem_result(kind: NElemKind, n: usize, vals: Vec<Bson>) -> R<Vec<Bson>> {
     }
 }
 
-/// A numeric value as `f64` for `$stdDev*`: int / long / double, plus bool as
-/// `0.0`/`1.0` (Python folds bools into the numeric sum). Anything else → `None`,
-/// so the caller defers the group to Python (whose `sum()` would raise).
-fn numeric_f64(b: &Bson) -> Option<f64> {
-    match b {
-        Bson::Int32(n) => Some(*n as f64),
-        Bson::Int64(n) => Some(*n as f64),
-        Bson::Double(d) => Some(*d),
-        Bson::Boolean(x) => Some(if *x { 1.0 } else { 0.0 }),
-        _ => None,
-    }
-}
-
 /// Population / sample standard deviation, mirroring the pure `_std_dev`: `None`
 /// for an empty set, and additionally for a sample (`pop == false`) with < 2
 /// values (population of a single value is `0.0`). Squares with plain
@@ -702,7 +741,7 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
     for (field, acc) in accs {
         match acc {
             Acc::Sum(n) => {
-                out.insert(field.to_string(), n.to_bson()?);
+                out.insert(field.to_string(), n.into_bson()?);
             }
             Acc::Count(n) => {
                 out.insert(field.to_string(), int_to_bson(n as i128).ok_or(())?);
@@ -712,16 +751,22 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
                 // always-created avg state finalising to null.
                 match state {
                     Some((total, count)) => {
-                        let tf = match total {
+                        let val = match total {
                             Num::Int { v: a, .. } => {
                                 if a.unsigned_abs() > (1u128 << 53) {
                                     return Err(()); // precision: defer to Python int/int divide
                                 }
-                                a as f64
+                                Bson::Double(a as f64 / count as f64)
                             }
-                            Num::Float(f) => f,
+                            Num::Float(f) => Bson::Double(f / count as f64),
+                            // Stay in the decimal domain — an f64 divide would
+                            // narrow the type and drop digits.
+                            Num::Dec(d) => {
+                                decimal::to_bson(&decimal::div_int(&d, count).ok_or(())?)
+                                    .ok_or(())?
+                            }
                         };
-                        out.insert(field.to_string(), Bson::Double(tf / count as f64));
+                        out.insert(field.to_string(), val);
                     }
                     None => {
                         out.insert(field.to_string(), Bson::Null);
@@ -744,13 +789,11 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
                 out.insert(field.to_string(), Bson::Document(merged));
             }
             Acc::StdDev { values, pop } => {
-                // No numeric value seen -> the pure code never creates the bucket
-                // key, so the field is absent. Otherwise `_std_dev` may still be
-                // null (sample of a single value), which the pure code writes.
-                if !values.is_empty() {
-                    let v = std_dev(&values, pop).map_or(Bson::Null, Bson::Double);
-                    out.insert(field.to_string(), v);
-                }
+                // mongod always emits the field, answering `null` when the group
+                // held no numeric value. Omitting it (which the pure code also
+                // did) dropped a key mongod always sends.
+                let v = std_dev(&values, pop).map_or(Bson::Null, Bson::Double);
+                out.insert(field.to_string(), v);
             }
             Acc::Percentile {
                 is_median,
@@ -794,7 +837,7 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
 /// -> Null), the empty-window case needs no special path.
 pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
     Ok(match acc {
-        Acc::Sum(n) => n.to_bson()?,
+        Acc::Sum(n) => n.into_bson()?,
         Acc::Count(n) => int_to_bson(n as i128).ok_or(())?,
         Acc::Avg(state) => match state {
             Some((total, count)) => {
@@ -806,6 +849,11 @@ pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
                         a as f64
                     }
                     Num::Float(f) => f,
+                    // A decimal total stays in the decimal domain — dividing
+                    // through f64 would both narrow the type and lose digits.
+                    Num::Dec(d) => {
+                        return decimal::to_bson(&decimal::div_int(&d, count).ok_or(())?).ok_or(());
+                    }
                 };
                 Bson::Double(tf / count as f64)
             }
@@ -1046,9 +1094,8 @@ pub fn sort_by_count_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R
 
 /// Accumulate `output_spec` over `docs` into a single bucket with a fixed
 /// `_id` (shared by `$bucket`). Mirrors the per-bucket `_accumulate` /
-/// `_finalize` loop in `_stage_bucket`. Caller guarantees `docs` is non-empty
-/// (an empty `$bucket` bucket emits only `{_id}` — the accumulator fields are
-/// never created, matching the pure code).
+/// `_finalize` loop in `_stage_bucket`. Caller guarantees `docs` is non-empty —
+/// an empty bucket is not emitted at all.
 fn accumulate_into(
     id: Bson,
     output_spec: &Document,
@@ -1201,14 +1248,17 @@ pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Do
 
     let mut out = Vec::with_capacity(keys.len());
     for (key, bucket_docs) in keys.into_iter().zip(placed) {
+        // mongod emits a bucket only when something landed in it — boundary
+        // buckets and `default` alike (probed 6.0.16: boundaries [0,2,4,8] over
+        // values 1 and 7 answer `_id: 0` and `_id: 4`, omitting the empty
+        // `_id: 2`). Buckets are pre-created to keep boundary order, so the
+        // empty ones are dropped here. This previously emitted a bare `{_id}`
+        // with no accumulator fields, faithfully reproducing the pure-Python
+        // bug; both are fixed together.
         if bucket_docs.is_empty() {
-            // Empty bucket: only `_id` (accumulator fields are never created).
-            let mut doc = Document::new();
-            doc.insert("_id".to_string(), key);
-            out.push(doc);
-        } else {
-            out.push(accumulate_into(key, output_spec, &bucket_docs, vars)?);
+            continue;
         }
+        out.push(accumulate_into(key, output_spec, &bucket_docs, vars)?);
     }
     Ok(out)
 }
@@ -1731,7 +1781,10 @@ mod tests {
         );
         assert_eq!(out[0].get("p"), Some(&Bson::Double((8.0f64 / 3.0).sqrt())));
         assert_eq!(out[0].get("s"), Some(&Bson::Double(2.0)));
-        // Single value: pop -> 0.0, samp -> null. All-missing -> field absent.
+        // Single value: pop -> 0.0, samp -> null. All-missing -> field present
+        // and null: mongod always emits the key (probed 6.0.16). This assertion
+        // used to require the field be *absent*, pinning the bug it was meant to
+        // guard.
         let out2 = g(
             bson::bson!({
                 "_id": Bson::Null,
@@ -1742,7 +1795,7 @@ mod tests {
         );
         assert_eq!(out2[0].get("p"), Some(&Bson::Double(0.0)));
         assert_eq!(out2[0].get("s"), Some(&Bson::Null));
-        assert!(out2[0].get("m").is_none());
+        assert_eq!(out2[0].get("m"), Some(&Bson::Null));
     }
 
     #[test]

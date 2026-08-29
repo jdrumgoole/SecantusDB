@@ -1,8 +1,9 @@
 name: Validate (driver conformance)
 
 # Runs the vendored driver test suites (pymongo, pymongo-async, go, node,
-# java, kotlin, ruby, rust, php-lib, php-ext, c, cxx, dotnet, psycopg, plus
-# the pymongo- and java-vs-Rust-server gates) against SecantusDB and
+# java, kotlin, ruby, rust, php-lib, php-ext, c, cxx, dotnet, psycopg, slt,
+# plus a `*-rust-server` lane per MongoDB-wire gauge pointing the SAME
+# unmodified suite at the Rust server) against SecantusDB and
 # regenerates the per-driver
 # `docs/validation-report*.md` files. Slow (~10–15 min per driver on
 # a fresh WT build) so this is NOT on every push — it runs weekly on
@@ -20,60 +21,103 @@ on:
   schedule:
     - cron: "0 6 * * 1"   # Monday 06:00 UTC
   workflow_dispatch:
+    inputs:
+      only:
+        description: >-
+          Comma-separated lane names to run (e.g. "rust" or
+          "slt,pgjdbc"). Empty = every lane. Single-lane dispatches are
+          how a wedged or flaky gauge gets diagnosed without burning the
+          whole 33-lane matrix; the aggregate/report PR step is skipped
+          for filtered runs (a partial artifact set must never overwrite
+          the full weekly reports).
+        required: false
+        default: ""
 
 jobs:
+  # Resolves the lane matrix from .github/validate-lanes.json, filtered by the
+  # `only` dispatch input (exact-name match within the comma list, so "rust"
+  # can't accidentally select "rust-rust-server"). A plan job is the only way
+  # to filter a matrix by an input: `matrix` is not a named value job-level
+  # `if` may reference (merging such an `if` broke every trigger of this
+  # workflow at parse time — found the hard way).
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          sparse-checkout: .github/validate-lanes.json
+          sparse-checkout-cone-mode: false
+      - name: Pick lanes
+        id: pick
+        env:
+          ONLY: ${{ inputs.only || '' }}
+        run: |
+          if [ -z "$ONLY" ]; then
+            m=$(jq -c . .github/validate-lanes.json)
+          else
+            m=$(jq -c --arg only ",$ONLY," '[.[] | select((("," + .name + ",") as $n | $only | contains($n)) or ((.group // "") != "" and (("," + .group + ",") as $g | $only | contains($g))))]' .github/validate-lanes.json)
+          fi
+          n=$(jq length <<<"$m")
+          echo "running $n lane(s)"
+          if [ "$n" -eq 0 ]; then
+            echo "::error::only='$ONLY' matched no lanes in .github/validate-lanes.json"
+            exit 1
+          fi
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+
   validate:
     name: ${{ matrix.driver.name }}
+    needs: plan
     runs-on: ubuntu-latest
+    # Least privilege: this job checks out the repo and then runs a dozen
+    # third-party driver toolchains (Go modules, npm, Maven/Gradle, gems,
+    # crates, PHP builds, the .NET SDK) whose transitive dependencies don't
+    # carry this repo's SHA-pinning discipline. An explicit grant keeps the
+    # job's token read-only regardless of the org/repo default. Artifact
+    # upload needs no contents write.
+    permissions:
+      contents: read
+    # A wedged gauge must fail fast, not burn the 6-hour default: the rust
+    # gauge spent two consecutive weekly runs crawling to the 6h kill (cold
+    # cargo cache + per-filter timeouts compounding — see rust_validation/
+    # runner.py's pre-build note). The slowest healthy lane (cxx cold build)
+    # is ~30-40 min; 2h is generous headroom for any cold cache. Exception:
+    # the slt lane legitimately runs long on the 2-core runner (60 files,
+    # some at several minutes each under the widened per-file timeout below).
+    timeout-minutes: ${{ matrix.driver.name == 'slt' && 300 || 120 }}
     strategy:
       fail-fast: false
       matrix:
-        driver:
-          - { name: pymongo, task: validate,      report: docs/validation-report.md }
-          - { name: pymongo-async, task: validate-pymongo-async, report: docs/validation-report-pymongo-async.md }
-          - { name: go,      task: validate-go,   report: docs/validation-report-go.md }
-          - { name: node,    task: validate-node, report: docs/validation-report-node.md }
-          - { name: java,    task: validate-java, report: docs/validation-report-java.md }
-          - { name: kotlin,  task: validate-kotlin, report: docs/validation-report-kotlin.md }
-          - { name: ruby,    task: validate-ruby, report: docs/validation-report-ruby.md }
-          - { name: rust,    task: validate-rust, report: docs/validation-report-rust.md }
-          - { name: php-lib, task: validate-php-lib, report: docs/validation-report-php-lib.md }
-          - { name: php-ext, task: validate-php-ext, report: docs/validation-report-php-ext.md }
-          - { name: c,       task: validate-c,    report: docs/validation-report-c.md }
-          - { name: cxx,     task: validate-cxx,  report: docs/validation-report-cxx.md }
-          - { name: dotnet,  task: validate-dotnet, report: docs/validation-report-dotnet.md }
-          # The SQL-server gauge (tasks/sql-gauges-plan.md G2): psycopg 3's own
-          # unmodified test suite over PSYCOPG_TEST_DSN against a daemon
-          # SecantusPGServer. Python-only toolchain — psycopg[binary] ships libpq.
-          - { name: psycopg, task: validate-psycopg, report: docs/validation-report-psycopg.md }
-          # The R8 gate (tasks/rust-server-plan.md): the SAME unmodified pymongo
-          # suite as the headline gauge, pointed at the Rust server via
-          # SECANTUS_GAUGE_SERVER=rust. Needs the _secantus_server extension, so
-          # its sync step builds the wheel with SECANTUS_BUILD_STORAGE_ENGINE=ON
-          # (extra toolchain steps below).
-          - { name: pymongo-rust-server, task: "validate --server rust", report: docs/validation-report-rust-server.md }
-          # The Java analogue of the R8 gate: the SAME unmodified
-          # mongo-java-driver suite as the java gauge, pointed at the
-          # standalone Rust server. Needs the JVM toolchain of the java gauge
-          # PLUS the storage-engine sync, which stages the secantusd-rs
-          # daemon into .venv/bin (SECANTUSDB_BIN on the run step points
-          # gauge_common.rust_binary at it — the default search only covers
-          # the cargo target dir).
-          - { name: java-rust-server, task: "validate-java --server rust", report: docs/validation-report-java-rust-server.md }
+        # The lane list lives in .github/validate-lanes.json (name / task /
+        # report per lane) so the plan job can filter it by the `only`
+        # dispatch input. Per-lane requirements are encoded in the step
+        # conditions below (toolchain setup per language, the
+        # storage-engine sync for *-rust-server lanes, port/serial rules);
+        # add a new lane by appending to the JSON and extending whichever
+        # setup-step conditions its toolchain needs.
+        driver: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           submodules: recursive   # vendor/wiredtiger + the per-driver vendored submodule
 
       - name: Install swig
-        run: sudo apt-get update && sudo apt-get install -y swig
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig liblz4-dev
 
       # The Rust-server gauge builds the _secantus_storage / _secantus_server
       # extensions inside the wheel build: bindgen needs libclang, the WT
       # ExternalProject forces Ninja, and the cargo build needs a Rust toolchain.
       - name: Install storage-engine toolchain
         if: contains(matrix.driver.name, 'rust-server')
-        run: sudo apt-get install -y clang libclang-dev llvm-dev ninja-build
+        uses: ./.github/actions/apt-install
+        with:
+          packages: clang libclang-dev llvm-dev ninja-build
 
       - name: Install Rust toolchain
         if: contains(matrix.driver.name, 'rust-server')
@@ -103,12 +147,21 @@ jobs:
       # The C gauge builds the vendored mongo-c-driver's test-libmongoc
       # binary from source (CMake): needs cmake + OpenSSL headers. A C
       # compiler is preinstalled on ubuntu-latest.
+      # The sql-stress smoke drives unmodified pgbench + psql.
+      - name: Install pgbench + psql
+        if: matrix.driver.name == 'sql-stress'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: postgresql-contrib postgresql-client
+
       - name: Install C-driver build toolchain
-        if: matrix.driver.name == 'c'
-        run: sudo apt-get install -y cmake libssl-dev
+        if: matrix.driver.name == 'c' || matrix.driver.name == 'c-rust-server'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: cmake libssl-dev
 
       - name: Cache test-libmongoc build
-        if: matrix.driver.name == 'c'
+        if: matrix.driver.name == 'c' || matrix.driver.name == 'c-rust-server'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           # The from-source build (~several min cold) is the dominant cost.
@@ -123,11 +176,13 @@ jobs:
       # the mongocxx test_driver Catch2 binary from source — needs cmake, a
       # C++17 compiler (preinstalled), and OpenSSL headers.
       - name: Install C++-driver build toolchain
-        if: matrix.driver.name == 'cxx'
-        run: sudo apt-get install -y cmake libssl-dev
+        if: matrix.driver.name == 'cxx' || matrix.driver.name == 'cxx-rust-server'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: cmake libssl-dev
 
       - name: Cache libmongoc install + mongocxx build
-        if: matrix.driver.name == 'cxx'
+        if: matrix.driver.name == 'cxx' || matrix.driver.name == 'cxx-rust-server'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           # The libmongoc install + mongocxx build (~10-15 min cold) dominate.
@@ -145,13 +200,13 @@ jobs:
       # gpg (preinstalled on ubuntu-latest) during build. The test project
       # targets net10.0.
       - name: Set up .NET SDK
-        if: matrix.driver.name == 'dotnet'
+        if: startsWith(matrix.driver.name, 'dotnet')
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68  # v6.0.0
         with:
           dotnet-version: "10.0.x"
 
       - name: Cache NuGet packages
-        if: matrix.driver.name == 'dotnet'
+        if: startsWith(matrix.driver.name, 'dotnet')
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/.nuget/packages
@@ -160,13 +215,13 @@ jobs:
             ${{ runner.os }}-nuget-
 
       - name: Set up Go
-        if: matrix.driver.name == 'go'
+        if: matrix.driver.name == 'go' || matrix.driver.name == 'go-rust-server' || matrix.driver.name == 'pgx' || matrix.driver.name == 'pgtest'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version: "1.25"
 
       - name: Cache Go modules + build
-        if: matrix.driver.name == 'go'
+        if: matrix.driver.name == 'go' || matrix.driver.name == 'go-rust-server'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
@@ -183,13 +238,13 @@ jobs:
             ${{ runner.os }}-go-
 
       - name: Set up Node.js
-        if: matrix.driver.name == 'node'
+        if: startsWith(matrix.driver.name, 'node')
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: "22"
 
       - name: Cache node_modules
-        if: matrix.driver.name == 'node'
+        if: startsWith(matrix.driver.name, 'node')
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: vendor/node-mongodb-native/node_modules
@@ -198,14 +253,14 @@ jobs:
             ${{ runner.os }}-node-modules-
 
       - name: Set up JDK
-        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server'
+        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'kotlin-rust-server' || startsWith(matrix.driver.name, 'pgjdbc')
         uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95  # v5
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Cache Gradle caches + wrapper
-        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server'
+        if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'kotlin-rust-server' || startsWith(matrix.driver.name, 'pgjdbc')
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
@@ -221,14 +276,14 @@ jobs:
             ${{ runner.os }}-gradle-
 
       - name: Set up Ruby
-        if: matrix.driver.name == 'ruby'
+        if: startsWith(matrix.driver.name, 'ruby')
         uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b  # v1
         with:
           ruby-version: "3.3"
           bundler-cache: false  # gems installed via runner's bundle install
 
       - name: Cache Ruby bundle
-        if: matrix.driver.name == 'ruby'
+        if: startsWith(matrix.driver.name, 'ruby')
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: vendor/mongo-ruby-driver/.bundle
@@ -237,16 +292,43 @@ jobs:
             ${{ runner.os }}-ruby-bundle-
 
       - name: Set up Rust
-        if: matrix.driver.name == 'rust'
+        if: matrix.driver.name == 'rust' || matrix.driver.name == 'rust-rust-server' || matrix.driver.name == 'slt'
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
         with:
           # mongo-rust-driver's MSRV is 1.88; stable on Actions is
           # ahead of that as of writing.
           toolchain: stable
 
-      - name: Cache cargo registry + target
-        if: matrix.driver.name == 'rust'
+      # The slt gauge's runner binary. Cached by pinned version so the
+      # ~3-min cargo build only happens when the pin moves; the version pin
+      # mirrors the psycopg==3.3.4 discipline (the gauge measures SecantusDB,
+      # not runner drift). slt_validation/runner.py falls back to
+      # ~/.cargo/bin/sqllogictest, which is where cargo install puts it.
+      - name: Cache sqllogictest binary
+        if: matrix.driver.name == 'slt'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cargo/bin/sqllogictest
+          key: ${{ runner.os }}-sqllogictest-bin-0.29.1
+
+      - name: Install sqllogictest-rs
+        if: matrix.driver.name == 'slt'
+        run: |
+          if [ ! -x ~/.cargo/bin/sqllogictest ]; then
+            cargo install sqllogictest-bin --version 0.29.1 --locked
+          fi
+          ~/.cargo/bin/sqllogictest --version
+
+      # Split restore/save (not plain actions/cache) so a failed or killed
+      # job STILL saves the compiled target. The plain form only saves on
+      # job success, which is how the rust gauge wedged itself for two
+      # weeks: the cache evicted (7-day TTL), the cold run overran the job
+      # limit and was killed, the kill skipped the save, and every later
+      # weekly run started cold again.
+      - name: Restore cargo registry + target
+        id: cargo-cache
+        if: matrix.driver.name == 'rust' || matrix.driver.name == 'rust-rust-server'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -273,13 +355,34 @@ jobs:
         env:
           # gauge_common.rust_binary()'s default search only covers the cargo
           # target dir; the storage-engine sync stages the daemon in .venv/bin.
-          SECANTUSDB_BIN: ${{ matrix.driver.name == 'java-rust-server' && '.venv/bin/secantusd-rs' || '' }}
+          SECANTUSDB_BIN: ${{ contains(matrix.driver.name, 'rust-server') && '.venv/bin/secantusd-rs' || '' }}
+          # The 2-core runner executes slt files 5-10x slower than a dev
+          # machine; 300s (the local calibration) timed out ~15 files that
+          # pass locally in ~25s each on the first weekly slt run.
+          SECANTUS_SLT_FILE_TIMEOUT: ${{ matrix.driver.name == 'slt' && '900' || '' }}
         run: uv run python -m invoke ${{ matrix.driver.task }}
+
+      # Companion of the split restore above: persist the compiled driver
+      # target even when the gauge failed or timed out, so the next run never
+      # starts from a cold compile. Saving over an existing identical key is
+      # a no-op warning, not an error.
+      - name: Save cargo registry + target
+        if: always() && (matrix.driver.name == 'rust' || matrix.driver.name == 'rust-rust-server')
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            vendor/mongo-rust-driver/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Show report summary
         run: head -50 ${{ matrix.driver.report }}
 
       - name: Upload report artifact
+        # Shard lanes (a `group` without a `report`) produce only a raw
+        # artifact; their group's merge job renders the report.
+        if: matrix.driver.report != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: report-${{ matrix.driver.name }}
@@ -302,14 +405,74 @@ jobs:
           # regenerated from an empty .validation/ — "the 0 gauges").
           include-hidden-files: true
 
+  pgjdbc-report:
+    name: Merge pgjdbc shards into the report
+    needs: [plan, validate]
+    runs-on: ubuntu-latest
+    # `always()` so one red shard still yields a merged report of whatever
+    # completed — the generator itself refuses an INCOMPLETE shard set, so a
+    # missing shard fails here loudly instead of shipping a short denominator.
+    if: >-
+      always() && !cancelled() &&
+      contains(needs.plan.outputs.matrix, 'pgjdbc-1')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Download pgjdbc shard raws
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: raw-pgjdbc-*
+          path: artifacts
+
+      - name: Reassemble .validation
+        run: |
+          shopt -s nullglob
+          mkdir -p .validation
+          staged=0
+          for d in artifacts/raw-pgjdbc-*/; do
+            cp -R "$d". .validation/
+            staged=$((staged + 1))
+          done
+          if [ "$staged" -eq 0 ]; then
+            echo "::error::no pgjdbc shard raw artifacts found — the shard jobs uploaded nothing"
+            exit 1
+          fi
+          ls .validation/
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Merge shards into the report
+        # --no-project: the generator is stdlib-only (reads the version from
+        # src/), so no WT build is needed here.
+        run: |
+          PYTHONPATH=. uv run --no-project python -m pgjdbc_validation.generate_report \
+            .validation/pgjdbc-raw-shard-*.json docs/validation-report-pgjdbc.md
+
+      - name: Upload merged report artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: report-pgjdbc
+          path: docs/validation-report-pgjdbc.md
+          if-no-files-found: error
+
   aggregate:
     name: Aggregate reports and open PR
-    needs: validate
+    needs: [validate, pgjdbc-report]
     runs-on: ubuntu-latest
     # `always()` so the aggregate step runs even if one driver gauge fails —
     # we still want to ship the reports for the gauges that did succeed so a
     # regression in one driver doesn't hide partial progress in the others.
-    if: always() && !cancelled()
+    # Skipped for lane-filtered dispatches: a partial artifact set must never
+    # regenerate the cross-driver summary or open a reports PR.
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name != 'workflow_dispatch' || inputs.only == '')
     permissions:
       contents: write
       pull-requests: write
@@ -395,8 +558,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add docs/validation-report*.md docs/validation-summary.md
-          git commit -m "Refresh validation reports + cross-driver summary (pymongo + go + node + java + ruby + rust + php-lib + php-ext + pymongo-vs-Rust-server + java-vs-Rust-server)"
+          git commit -m "Refresh validation reports + cross-driver summary (all driver + SQL gauges, Python and Rust servers)"
           git push -u origin "$branch"
           gh pr create \
             --title "Refresh validation reports" \
-            --body "Automated weekly refresh of pymongo / go-driver / node-driver / java-driver / ruby-driver / rust-driver / php-library / php-extension validation reports, plus the pymongo-vs-Rust-server R8 gate and its java-vs-Rust-server analogue. The cross-driver summary (docs/validation-summary.md) is regenerated from the same run's raw artifacts. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test / cargo-test / phpunit / run-tests.php output."
+            --body "Automated weekly refresh of every driver-conformance and SQL-gauge validation report — each MongoDB-wire gauge against the Python server AND its \`*-rust-server\` lane against the Rust server. The cross-driver summary (docs/validation-summary.md) is regenerated from the same run's raw artifacts. Inspect the per-category numbers for regressions or new pass-rate wins. Per-driver gauges ran in parallel; check each gauge's job log for the underlying pytest / mocha / rspec / gradle / go-test / cargo-test / phpunit / run-tests.php / dotnet-test output."

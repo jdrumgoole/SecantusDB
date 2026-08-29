@@ -194,14 +194,27 @@ pub fn densify_stage(spec: &Bson, docs: &[Document]) -> R<Vec<Document>> {
     let mut out: Vec<Document> = Vec::new();
     for key in &order {
         let part = &groups[index[key]];
-        // sorted(partition, key=get_path(field)) — numeric, stable. Any
-        // missing / non-numeric / NaN field value defers (Python sort raises).
+        // A doc whose densify field is missing or null does NOT participate:
+        // mongod emits it unchanged and it contributes neither a bound nor a
+        // step. Null sorts before every number, so those lead the output.
+        //
+        // This used to defer the whole stage on any such doc, with a comment
+        // saying "Python sort raises" — which it did, with a bare TypeError
+        // that escaped as "internal server error". Both sides are fixed
+        // together; a non-numeric, non-date value still defers so the Python
+        // engine can raise mongod's typed 5733201.
         let mut keyed: Vec<(Num, &Document)> = Vec::with_capacity(part.len());
         for d in part {
-            let Some(num) = paths::get_path(d, field).and_then(num_of) else {
-                return Err(());
-            };
-            keyed.push((num, d));
+            match paths::get_path(d, field) {
+                None | Some(Bson::Null) => out.push((*d).clone()),
+                Some(v) => match num_of(v) {
+                    Some(num) => keyed.push((num, d)),
+                    None => return Err(()), // non-numeric/date -> Python raises 5733201
+                },
+            }
+        }
+        if keyed.is_empty() {
+            continue;
         }
         keyed.sort_by(|(a, _), (b, _)| cmp(*a, *b).unwrap_or(Ordering::Equal));
 

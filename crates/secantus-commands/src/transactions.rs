@@ -39,7 +39,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use bson::{doc, Document};
+use bson::{doc, Bson, Document};
 
 /// mongod default `transactionLifetimeLimitSeconds`.
 pub const DEFAULT_LIFETIME_SECONDS: f64 = 60.0;
@@ -148,6 +148,47 @@ struct Inner {
     /// Newest `txnNumber` ever seen per session (transactions and retryable
     /// writes share the per-session sequence).
     last_number: HashMap<Vec<u8>, i64>,
+    /// Retryable-write records: `(lsid, txnNumber)` -> [`RetryableRecord`]. mongod keeps the equivalent in `config.transactions` so a
+    /// driver's automatic retry gets the ORIGINAL reply instead of re-applying
+    /// the write; without it a retried `{$inc: {n: 1}}` increments twice while
+    /// both replies claim `nModified: 1`. Mirrors the Python registry's
+    /// `_retryable`.
+    retryable: HashMap<RetryableKey, RetryableRecord>,
+}
+
+/// `(lsid, txnNumber)` — the pair mongod keys a retryable write on.
+type RetryableKey = (Vec<u8>, i64);
+
+/// A completed retryable write: its reply, when it was stored, and a digest of
+/// the command that produced it (so a replay only fires for the same write).
+type RetryableRecord = (Document, f64, [u8; 20]);
+
+/// How long a retryable-write record is kept, matching mongod's 30-minute
+/// sweep. A driver retrying later than this re-executes — as it would against
+/// mongod.
+const RETRYABLE_RECORD_LIFETIME_SECONDS: f64 = 30.0 * 60.0;
+
+/// Backstop on record count so a client minting unbounded sessions cannot grow
+/// the map without limit. Oldest-first eviction.
+const RETRYABLE_RECORD_MAX: usize = 10_000;
+
+/// Whether `reply` represents a write that fully took effect, and is therefore
+/// replayable. A failed or partially-failed write must re-execute on retry:
+/// caching an error would make a transient failure permanent, and caching a
+/// partial batch would report missing documents as written. A
+/// `writeConcernError` is deliberately NOT disqualifying — the write applied,
+/// only its replication did not confirm, so a retry must not apply it twice.
+fn is_recordable_reply(reply: &Document) -> bool {
+    let ok = match reply.get("ok") {
+        Some(Bson::Double(d)) => *d,
+        Some(Bson::Int32(i)) => *i as f64,
+        Some(Bson::Int64(i)) => *i as f64,
+        _ => 0.0,
+    };
+    if ok != 1.0 {
+        return false;
+    }
+    !matches!(reply.get("writeErrors"), Some(Bson::Array(a)) if !a.is_empty())
 }
 
 /// Thread-safe map of `lsid_bytes` → most-recent [`Transaction`].
@@ -164,12 +205,38 @@ pub struct TransactionRegistry {
     clock: Clock,
 }
 
+/// Copy `reply` without the fields that describe THIS attempt only.
+///
+/// A `writeConcernError` is a property of the attempt, not of the stored
+/// statement outcome: the write succeeded and only its durability
+/// acknowledgement failed. Replaying it makes the driver's retry see the very
+/// error it retried because of, so the retry "fails" too and the operation
+/// surfaces as an error even though the write is safely applied.
+///
+/// Probed on mongod 8.3.4 (single-node replica set, `failCommand` with
+/// `errorLabels: ["RetryableWriteError"]` + `writeConcernError: {code: 91}`,
+/// `mode: {times: 1}`): attempt 1 carries both fields, the retry carries
+/// neither. This is what kept libmongoc's
+/// `/command_monitoring/unified/writeConcernError` red -- the driver DID
+/// classify the write as retryable and DID retry (both attempts carried
+/// `txnNumber: 1`, confirmed by tracing), but got the replayed error back.
+///
+/// `errorLabels` goes with it: on a successful reply the only labels present
+/// are the ones the write-concern error carried.
+fn strip_per_attempt_fields(reply: &Document) -> Document {
+    let mut out = reply.clone();
+    out.remove("writeConcernError");
+    out.remove("errorLabels");
+    out
+}
+
 impl TransactionRegistry {
     /// `commit` / `rollback` perform the storage-side WT work for a transaction;
     /// `clock` returns monotonic seconds (injectable for deterministic tests).
     pub fn new(commit: TxnFn, rollback: TxnFn, lifetime_seconds: f64, clock: Clock) -> Self {
         TransactionRegistry {
             inner: Mutex::new(Inner {
+                retryable: HashMap::new(),
                 txns: HashMap::new(),
                 last_number: HashMap::new(),
             }),
@@ -322,6 +389,73 @@ impl TransactionRegistry {
         }
     }
 
+    /// The stored reply for an already-executed retryable write, if any.
+    ///
+    /// A driver retries with the SAME `lsid` + `txnNumber` after a network
+    /// blip, a `writeConcernError`, or a stepdown. mongod recognises the repeat
+    /// and replays its stored reply rather than executing the write a second
+    /// time; `None` means "not seen before, run it".
+    ///
+    /// `identity` must match the recorded command too. A retry re-sends a
+    /// byte-identical command, so a mismatch means the key was reused for a
+    /// DIFFERENT write — replaying one command's reply for another would be
+    /// worse than the double-apply this exists to prevent, so we execute.
+    pub fn retryable_reply(
+        &self,
+        lsid_bytes: &[u8],
+        txn_number: i64,
+        identity: &[u8; 20],
+    ) -> Option<Document> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = (self.clock)();
+        Self::prune_retryable(&mut inner, now);
+        match inner.retryable.get(&(lsid_bytes.to_vec(), txn_number)) {
+            Some((reply, _at, ident)) if ident == identity => Some(reply.clone()),
+            _ => None,
+        }
+    }
+
+    /// Store `reply` as the outcome of this retryable write. Only successful
+    /// writes are recorded (see [`is_recordable_reply`]).
+    pub fn record_retryable(
+        &self,
+        lsid_bytes: &[u8],
+        txn_number: i64,
+        identity: [u8; 20],
+        reply: &Document,
+    ) {
+        if !is_recordable_reply(reply) {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = (self.clock)();
+        inner.retryable.insert(
+            (lsid_bytes.to_vec(), txn_number),
+            (strip_per_attempt_fields(reply), now, identity),
+        );
+        Self::prune_retryable(&mut inner, now);
+    }
+
+    /// Drop records past their lifetime and cap total size. Called on every
+    /// lookup / record, so an idle server sheds them without a background
+    /// sweeper — the opportunistic pattern the oplog and TTL pruning use.
+    fn prune_retryable(inner: &mut Inner, now: f64) {
+        let cutoff = now - RETRYABLE_RECORD_LIFETIME_SECONDS;
+        inner.retryable.retain(|_k, (_r, at, _i)| *at >= cutoff);
+        if inner.retryable.len() > RETRYABLE_RECORD_MAX {
+            let excess = inner.retryable.len() - RETRYABLE_RECORD_MAX;
+            let mut by_age: Vec<(RetryableKey, f64)> = inner
+                .retryable
+                .iter()
+                .map(|(k, (_r, at, _i))| (k.clone(), *at))
+                .collect();
+            by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (k, _at) in by_age.into_iter().take(excess) {
+                inner.retryable.remove(&k);
+            }
+        }
+    }
+
     /// `endSessions` / `killSessions`: abort the session's in-progress txn.
     pub fn abort_for_session(&self, lsid_bytes: &[u8]) {
         let cur = self
@@ -407,6 +541,80 @@ mod tests {
     }
 
     const LS: &[u8] = b"session-1";
+
+    /// Retryable-write records: keyed on (lsid, txnNumber) AND the command
+    /// identity. Mirrors the Python server's
+    /// `test_registry_isolates_sessions_and_verifies_identity`.
+    #[test]
+    fn retryable_records_are_keyed_by_session_number_and_identity() {
+        let (r, _c, _rb) = reg();
+        let ident = [1u8; 20];
+        let other = [2u8; 20];
+        let reply = doc! {"ok": 1.0, "n": 1};
+
+        r.record_retryable(b"session-a", 1, ident, &reply);
+
+        // Same session, same number, same command -> replay.
+        assert_eq!(r.retryable_reply(b"session-a", 1, &ident), Some(reply));
+        // Different session -> not a retry.
+        assert!(r.retryable_reply(b"session-b", 1, &ident).is_none());
+        // Different txnNumber -> a new write.
+        assert!(r.retryable_reply(b"session-a", 2, &ident).is_none());
+        // Same key, DIFFERENT command: replaying here would serve one write's
+        // answer for another, which is worse than the double-apply this
+        // prevents.
+        assert!(r.retryable_reply(b"session-a", 1, &other).is_none());
+    }
+
+    /// Only writes that took effect are replayable. Caching a failure would
+    /// turn a transient error into a permanent one.
+    #[test]
+    fn retryable_records_skip_failed_writes() {
+        let (r, _c, _rb) = reg();
+        let ident = [3u8; 20];
+
+        r.record_retryable(b"s", 1, ident, &doc! {"ok": 0.0, "errmsg": "boom"});
+        assert!(r.retryable_reply(b"s", 1, &ident).is_none());
+
+        r.record_retryable(
+            b"s",
+            2,
+            ident,
+            &doc! {"ok": 1.0, "writeErrors": [{"index": 0}]},
+        );
+        assert!(r.retryable_reply(b"s", 2, &ident).is_none());
+
+        // A writeConcernError means the write DID apply — only replication of
+        // it did not confirm — so mongod records it and a retry must not apply
+        // it twice.
+        r.record_retryable(
+            b"s",
+            3,
+            ident,
+            &doc! {"ok": 1.0, "n": 1, "writeConcernError": {"code": 64}},
+        );
+        assert!(r.retryable_reply(b"s", 3, &ident).is_some());
+    }
+
+    /// Records age out, so a much later retry re-executes — as against mongod.
+    #[test]
+    fn retryable_records_expire() {
+        use std::sync::atomic::AtomicU64;
+        let now = Arc::new(AtomicU64::new(1000));
+        let n2 = now.clone();
+        let r = TransactionRegistry::new(
+            Box::new(|_t| {}),
+            Box::new(|_t| {}),
+            60.0,
+            Box::new(move || n2.load(Ordering::SeqCst) as f64),
+        );
+        let ident = [4u8; 20];
+        r.record_retryable(b"s", 1, ident, &doc! {"ok": 1.0, "n": 1});
+        assert!(r.retryable_reply(b"s", 1, &ident).is_some());
+
+        now.fetch_add(31 * 60, Ordering::SeqCst); // past the 30-minute lifetime
+        assert!(r.retryable_reply(b"s", 1, &ident).is_none());
+    }
 
     #[test]
     fn start_then_continue_then_commit() {

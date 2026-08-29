@@ -4,7 +4,17 @@
    attribute opened a second change-stream websocket, so every event showed
    up twice. See tests/test_admin_asset_order.py. #}
 <div
-  x-data='changestreamPage({{ {"scope": scope, "db": db_name, "coll": coll_name} | tojson }})'
+  x-data='changestreamPage({{ {
+    "scope": scope,
+    "db": db_name,
+    "coll": coll_name,
+    "fullDocument": full_document,
+    "fullDocumentBeforeChange": full_document_before_change,
+    "resumeAfter": resume_after,
+    "startAfter": start_after,
+    "startAtOperationTime": start_at_operation_time,
+    "pipeline": pipeline,
+  } | tojson }})'
 >
   {# Not a ``<form>`` on purpose — the Watch button doesn't submit, it
      calls Alpine's ``reconnect()`` which rebuilds the WebSocket. A
@@ -32,12 +42,65 @@
         <input type="checkbox" x-model="ddlOn" /> Show DDL events
       </label>
       <button type="button" @click="reconnect()">Watch</button>
+      <button type="button" class="btn-secondary" @click="optionsOpen = !optionsOpen">
+        <span x-text="optionsOpen ? 'Hide options' : 'Options'"></span><span
+          x-show="optionCount > 0" x-text="` (${optionCount})`"></span>
+      </button>
     </div>
+
+    {# Advanced watch options. Collapsed by default so the common
+       "just tail this namespace" path stays a two-click flow. #}
+    <div class="filter-controls" x-show="optionsOpen" x-cloak>
+      <label>
+        fullDocument
+        <select name="fullDocument" x-model="fullDocument">
+          <option value="default">default</option>
+          <option value="updateLookup">updateLookup</option>
+          <option value="whenAvailable">whenAvailable</option>
+          <option value="required">required</option>
+        </select>
+      </label>
+      <label>
+        fullDocumentBeforeChange
+        <select name="fullDocumentBeforeChange" x-model="fullDocumentBeforeChange">
+          <option value="off">off</option>
+          <option value="whenAvailable">whenAvailable</option>
+          <option value="required">required</option>
+        </select>
+      </label>
+      <label>
+        resumeAfter
+        <input type="text" name="resumeAfter" x-model="resumeAfter"
+               placeholder='{"_data": "…"}' autocomplete="off" />
+      </label>
+      <label>
+        startAfter
+        <input type="text" name="startAfter" x-model="startAfter"
+               placeholder='{"_data": "…"}' autocomplete="off" />
+      </label>
+      <label>
+        startAtOperationTime
+        <input type="text" name="startAtOperationTime" x-model="startAtOperationTime"
+               placeholder="secs or secs,ord" autocomplete="off" />
+      </label>
+      <label class="filter-wide">
+        pipeline
+        <input type="text" name="pipeline" x-model="pipeline"
+               placeholder='[{"$match": {"operationType": "insert"}}]' autocomplete="off" />
+      </label>
+    </div>
+    <p x-show="optionsOpen" x-cloak class="modal-meta">
+      Pre-images require <code>changeStreamPreAndPostImages</code> on the collection.
+      Only one start point may be set — the server rejects more than one of
+      <code>resumeAfter</code> / <code>startAfter</code> / <code>startAtOperationTime</code>.
+    </p>
   </div>
 
   <p class="modal-meta">
     Status: <code x-text="status"></code>
     <span x-show="namespace">· Namespace: <code x-text="namespace"></code></span>
+    <span x-show="appliedOptions.length">· Options:
+      <code x-text="appliedOptions.join(', ')"></code></span>
   </p>
 
   <div class="changestream-log">
@@ -51,6 +114,11 @@
             class="btn-secondary"
             @click="copyResume(entry.event._id)"
           >Copy resume token</button>
+          <button
+            type="button"
+            class="btn-secondary"
+            @click="resumeFrom(entry.event._id)"
+          >Resume from here</button>
         </div>
         <pre class="doc-body" x-html="formatJson(entry.event)"></pre>
       </div>
@@ -70,12 +138,39 @@ function changestreamPage(initial) {
     scope: initial.scope || "cluster",
     db: initial.db || "",
     coll: initial.coll || "",
+    fullDocument: initial.fullDocument || "default",
+    fullDocumentBeforeChange: initial.fullDocumentBeforeChange || "off",
+    resumeAfter: initial.resumeAfter || "",
+    startAfter: initial.startAfter || "",
+    startAtOperationTime: initial.startAtOperationTime || "",
+    pipeline: initial.pipeline || "",
+    optionsOpen: false,
     ddlOn: true,
     status: "idle",
+    fatal: false,
+    appliedOptions: [],
     namespace: "",
     events: [],
     nextId: 1,
     ws: null,
+
+    // Non-default watch options, as [name, value] pairs. Single source of
+    // truth for the URL, the WebSocket query string, and the badge count —
+    // so the link you share reproduces exactly the stream you are watching.
+    activeOptions() {
+      const pairs = [];
+      if (this.fullDocument && this.fullDocument !== "default")
+        pairs.push(["fullDocument", this.fullDocument]);
+      if (this.fullDocumentBeforeChange && this.fullDocumentBeforeChange !== "off")
+        pairs.push(["fullDocumentBeforeChange", this.fullDocumentBeforeChange]);
+      for (const name of ["resumeAfter", "startAfter", "startAtOperationTime", "pipeline"]) {
+        const value = (this[name] || "").trim();
+        if (value) pairs.push([name, value]);
+      }
+      return pairs;
+    },
+
+    get optionCount() { return this.activeOptions().length; },
 
     init() {
       // Auto-connect if URL has scope= already (the page link from nav
@@ -86,17 +181,30 @@ function changestreamPage(initial) {
     },
 
     reconnect() {
-      // Update the URL so a refresh keeps the same scope.
+      // Update the URL so a refresh keeps the same scope and options.
       const params = new URLSearchParams();
       params.set("scope", this.scope);
       if (this.scope !== "cluster") params.set("db", this.db);
       if (this.scope === "coll") params.set("coll", this.coll);
+      for (const [name, value] of this.activeOptions()) params.set(name, value);
       window.history.replaceState(null, "", `/changestream?${params.toString()}`);
       this.events = [];
       this._connect();
     },
 
+    // Restart the stream just after this event. The token is sent as
+    // Extended JSON, which is what the server parses it back out of.
+    resumeFrom(token) {
+      this.resumeAfter = JSON.stringify(token);
+      this.startAfter = "";
+      this.startAtOperationTime = "";
+      this.optionsOpen = true;
+      this.reconnect();
+    },
+
     _connect() {
+      this.fatal = false;
+      this.appliedOptions = [];
       if (this.ws) {
         try { this.ws.close(); } catch (_) {}
         this.ws = null;
@@ -105,6 +213,7 @@ function changestreamPage(initial) {
       const params = new URLSearchParams();
       if (this.scope !== "cluster") params.set("db", this.db);
       if (this.scope === "coll") params.set("coll", this.coll);
+      for (const [name, value] of this.activeOptions()) params.set(name, value);
       const qs = params.toString();
       const url = `${proto}//${window.location.host}/ws/changes/${this.scope}${qs ? "?" + qs : ""}`;
       this.status = "connecting…";
@@ -114,16 +223,21 @@ function changestreamPage(initial) {
         const msg = JSON.parse(evt.data);
         if (msg.type === "open") {
           this.namespace = msg.namespace;
+          this.appliedOptions = msg.options || [];
           this.status = "tailing";
         } else if (msg.type === "event") {
           if (!this.ddlOn && this._isDDL(msg.event)) return;
           this.events.unshift({id: this.nextId++, event: msg.event});
           if (this.events.length > 200) this.events.pop();
         } else if (msg.type === "error") {
+          // A rejected option closes the socket right after this frame.
+          // Latch it so ``onclose`` doesn't overwrite the only text that
+          // says *why* the stream stopped.
+          this.fatal = true;
           this.status = `error: ${msg.message}`;
         }
       };
-      this.ws.onclose = () => { this.status = "disconnected"; };
+      this.ws.onclose = () => { if (!this.fatal) this.status = "disconnected"; };
       this.ws.onerror = () => { this.status = "websocket error"; };
     },
 

@@ -76,3 +76,72 @@ def test_parse_handles_adjacent_parameters():
 def test_parse_leaves_dollar_in_string_literal_untouched():
     (stmt,) = planner.parse("SELECT * FROM t WHERE name = '$1,$2'")
     assert stmt.args["where"].this.expression.this == "$1,$2"
+
+
+# --------------------------------------------------------------------------- #
+# Parameter substitution
+# --------------------------------------------------------------------------- #
+
+
+def _params_sql(n: int) -> str:
+    return "SELECT coalesce(" + ",".join(f"${i + 1}" for i in range(n)) + ")"
+
+
+def test_substitute_parameters_binds_every_placeholder():
+    stmt = planner.parse(_params_sql(4))[0]
+    out = planner.substitute_parameters(stmt, [1, None, "x", 2.5])
+    assert out.sql(dialect="postgres") == "SELECT COALESCE(1, NULL, 'x', 2.5)"
+
+
+def test_substitute_parameters_binds_a_bare_placeholder():
+    stmt = planner.parse("SELECT $1")[0]
+    assert planner.substitute_parameters(stmt, ["x"]).sql(dialect="postgres") == "SELECT 'x'"
+
+
+def test_substitute_parameters_leaves_the_source_statement_alone():
+    stmt = planner.parse("SELECT $1, $2")[0]
+    planner.substitute_parameters(stmt, [1, 2])
+    assert stmt.sql(dialect="postgres") == "SELECT $1, $2"
+
+
+def test_substitute_parameters_scales_linearly():
+    """Binding N placeholders under one node must not be O(N**2).
+
+    Replacing them one at a time makes sqlglot re-parent every sibling per call.
+    pgjdbc's rewritten batch INSERT binds tens of thousands of parameters in a
+    single statement, which took minutes and timed the connection out.
+
+    Counted rather than timed: a ratio of two wall-clock measurements is
+    dominated by fixed overhead at the small end and by scheduler noise on a
+    shared runner, which made it flaky in both directions. The defect is
+    structural, so measure the structure — every re-parented child is one unit
+    of the work that went quadratic.
+    """
+    from sqlglot import exp
+
+    assert hasattr(exp.Expression, "_set_parent"), "sqlglot changed: re-point this probe"
+    original = exp.Expression._set_parent
+    reparented = 0
+
+    def counting(self, arg_key, value, index=None):
+        nonlocal reparented
+        reparented += len(value) if isinstance(value, list) else 1
+        return original(self, arg_key, value, index)
+
+    def work(n: int) -> int:
+        nonlocal reparented
+        stmt = planner.parse(_params_sql(n))[0]
+        reparented = 0
+        exp.Expression._set_parent = counting
+        try:
+            planner.substitute_parameters(stmt, [None] * n)
+        finally:
+            exp.Expression._set_parent = original
+        return reparented
+
+    n = 2000
+    units = work(n)
+    # Linear does one pass over the argument list (~n). Quadratic re-parents all
+    # n siblings once per placeholder (~n**2 = 4,000,000 here). 10n is far above
+    # the former and far below the latter, and the count is deterministic.
+    assert units < 10 * n, f"{units:,} re-parented children for {n:,} parameters (expected ~{n:,})"

@@ -254,6 +254,52 @@ def _compare(got: Any, op: str, target: Any) -> bool:
     return False
 
 
+def canonicalize(text: str) -> str:
+    """PG's canonical jsonpath text (jsonPathToCstring): member accessors are
+    always quoted (``$.abc`` -> ``$."abc"``), subscripts verbatim, filters as
+    ``?(@."k" == v)``. An empty path is a syntax error, like real PG."""
+    s = text.strip()
+    if not s:
+        raise JsonPathError("syntax error at end of jsonpath input")
+    return "$" + _render_steps(_parse(s))
+
+
+def _render_steps(steps: list[dict]) -> str:
+    out: list[str] = []
+    for st in steps:
+        op = st["op"]
+        if op == "key":
+            out.append('."' + str(st["key"]).replace('"', '\\"') + '"')
+        elif op == "wild_member":
+            out.append(".*")
+        elif op == "index":
+            out.append(f"[{st['index']}]")
+        elif op == "wild_array":
+            out.append("[*]")
+        elif op == "filter":
+            out.append(f"?({_render_pred(st['pred'])})")
+    return "".join(out)
+
+
+def _render_pred(p: dict) -> str:
+    kind = p["kind"]
+    if kind in ("and", "or"):
+        op = "&&" if kind == "and" else "||"
+        return f"{_render_pred(p['left'])} {op} {_render_pred(p['right'])}"
+    val = p["value"]
+    if val is None:
+        lit = "null"
+    elif isinstance(val, bool):
+        lit = "true" if val else "false"
+    elif isinstance(val, str):
+        lit = '"' + val.replace('"', '\\"') + '"'
+    elif isinstance(val, float) and val.is_integer():
+        lit = str(int(val))
+    else:
+        lit = str(val)
+    return f"@{_render_steps(p['path'])} {p['op']} {lit}"
+
+
 def query(doc: Any, path: str) -> list[Any]:
     """All values in ``doc`` matched by ``path`` (the SQL ``jsonb_path_query`` set)."""
     return _apply_steps([doc], _parse(path))

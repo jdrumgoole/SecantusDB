@@ -251,6 +251,39 @@ def test_untyped_empty_multirange_binary_param():
     assert typemap.coerce("{}", "nummultirange") == {"multirange": []}
 
 
+def test_untyped_binary_param_non_text_is_22P03():
+    # A binary payload for an untyped (oid 0) parameter that isn't valid text —
+    # e.g. an EWKB GEOMETRY value for a type we don't model — surfaces a
+    # faithful 22P03, not a leaked UnicodeDecodeError (generic XX000).
+    from secantus.sql import errors
+
+    ewkb = bytes.fromhex("0101000020E6100000000000000000F03F000000000000F03F")
+    with pytest.raises(errors.SQLError) as e:
+        pgextended._decode_param(ewkb, 1, 0)
+    assert e.value.sqlstate == "22P03"
+
+
+def test_length_qualified_char_casts_truncate_and_pad():
+    st = Storage(":memory:")
+    try:
+        sess = Session(database="d")
+
+        def one(sql):
+            r = run_sql(st, "d", sql, session=sess)[-1]
+            return r.rows[0][0], r.columns[0].pg_oid, r.columns[0].typmod
+
+        # varchar(n) truncates the value; identity is varchar (1043), typmod n+4.
+        assert one("SELECT 'bar'::VARCHAR(2)") == ("ba", 1043, 6)
+        # char(n) truncates AND blank-pads to n.
+        assert one("SELECT 'bar'::CHAR(2)") == ("ba", 1042, 6)
+        assert one("SELECT 'a'::CHAR(4)") == ("a   ", 1042, 8)
+        # Bare text/varchar impose no limit.
+        assert one("SELECT 'foobar'::TEXT") == ("foobar", 25, -1)
+        assert one("SELECT 'foobar'::VARCHAR") == ("foobar", 1043, -1)
+    finally:
+        st.close()
+
+
 def test_three_valued_logic_in_per_row_where():
     st = Storage(":memory:")
     try:
@@ -363,7 +396,17 @@ def test_fromless_aggregates_fold_over_one_row():
         assert rows("select count(22), count(null)") == [(1, 0)]
         assert rows("select sum(distinct 73), min(all -32), avg(5)") == [(73, -32, 5)]
         assert rows("select nullif( - count( * ), 67 ) + 54") == [(53,)]
-        assert rows("select max(3) where 1 = 2") == []
+        # An UNGROUPED aggregate yields exactly one row even when the WHERE
+        # excludes the implicit input row — COUNT is 0, the rest NULL. (This
+        # line previously asserted zero rows; verified against real PostgreSQL
+        # 14.13: ``select max(3) where 1=2`` returns one NULL row, and
+        # ``select 0/count(*) where 1=2`` therefore raises division_by_zero,
+        # which is how pgjdbc's batch tests inject a runtime failure.)
+        assert rows("select max(3) where 1 = 2") == [(None,)]
+        assert rows("select count(*) where 1 = 2") == [(0,)]
+        assert rows("select sum(1) where 1 = 2") == [(None,)]
+        # A non-aggregate projection still yields zero rows.
+        assert rows("select 1 where 1 = 2") == []
     finally:
         st.close()
 

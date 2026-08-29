@@ -35,17 +35,31 @@ class NotifyHub:
 
     def listen(self, channel: str, session: Any) -> None:
         with self._lock:
-            self._channels[channel][id(session)] = session
+            if id(session) not in self._channels[channel]:
+                self._channels[channel][id(session)] = session
+                session.listen_count = getattr(session, "listen_count", 0) + 1
 
     def unlisten(self, channel: str, session: Any) -> None:
         with self._lock:
-            self._channels.get(channel, {}).pop(id(session), None)
+            if self._channels.get(channel, {}).pop(id(session), None) is not None:
+                session.listen_count = max(0, getattr(session, "listen_count", 1) - 1)
 
     def unlisten_all(self, session: Any) -> None:
         """Drop ``session`` from every channel (``UNLISTEN *`` / disconnect)."""
         with self._lock:
             for listeners in self._channels.values():
                 listeners.pop(id(session), None)
+            session.listen_count = 0
+
+    def is_listening(self, session: Any) -> bool:
+        """Whether ``session`` listens on any channel — the wire server's idle
+        loop polls (and pushes queued notifications) only for listeners, so a
+        connection that never LISTENed keeps its pure blocking read. Reads the
+        per-session counter maintained under the hub lock by listen /
+        unlisten / unlisten_all: this runs before EVERY message read on EVERY
+        connection, and taking the hub lock there put a shared lock on the
+        whole server's hot path."""
+        return getattr(session, "listen_count", 0) > 0
 
     def notify(self, channel: str, payload: str, pid: int) -> None:
         """Deliver a notification to every session listening on ``channel`` by

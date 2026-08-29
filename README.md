@@ -67,7 +67,7 @@ mongod uses.
 That doesn't make SecantusDB *as fast* as mongod — the layers above
 storage (command dispatch, query planner, aggregation pipeline) are
 Python, and a like-for-like benchmark currently has SecantusDB
-~4×–17× slower per operation than mongod. CRUD reads sit near the
+~1.2×–24× slower per operation than mongod. CRUD reads sit near the
 lower end of that; bulk update / delete and aggregation sit at the
 upper end where Python loop overhead dominates. See
 [`docs/benchmark.md`](https://secantusdb.com/docs/benchmark.html) for current numbers and

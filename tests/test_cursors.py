@@ -28,6 +28,28 @@ def test_next_batch_returns_chunks_then_exhausts() -> None:
     assert exhausted
 
 
+def test_next_batch_byte_budget_caps_and_makes_progress() -> None:
+    import bson
+
+    reg = CursorRegistry()
+    docs = [{"i": i, "pad": "x" * 100} for i in range(4)]
+    per_doc = len(bson.encode(docs[0]))
+    cid = reg.register("db.c", docs)
+
+    # Budget for two docs: the drain stops before the third.
+    batch, exhausted = reg.next_batch(cid, 0, max_bytes=per_doc * 2)
+    assert [d["i"] for d in batch] == [0, 1]
+    assert not exhausted
+    # A budget smaller than one document still yields one doc (progress).
+    batch, exhausted = reg.next_batch(cid, 0, max_bytes=1)
+    assert [d["i"] for d in batch] == [2]
+    assert not exhausted
+    # An explicit count limit is still byte-capped.
+    batch, exhausted = reg.next_batch(cid, 5, max_bytes=per_doc)
+    assert [d["i"] for d in batch] == [3]
+    assert exhausted
+
+
 def test_cursor_removed_after_exhaustion() -> None:
     reg = CursorRegistry()
     cid = reg.register("db.c", [{"x": 1}])

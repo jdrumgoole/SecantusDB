@@ -25,7 +25,7 @@ use pyo3::prelude::*;
 
 use secantus_commands::{CursorRegistry, Storage as CmdStorage};
 use secantus_server::{bind, RunningServer, ServerConfig};
-use secantus_storage::{wt_config, Storage};
+use secantus_storage::{wt_config, Storage, StorageOptions};
 use secantus_storage_adapter::StorageAdapter;
 
 /// An in-process handle to a running Rust SecantusDB server. Constructing it
@@ -59,6 +59,15 @@ impl RustServer {
     ///   `--sync-on-commit`), threaded into `wt_config`. Defaults match
     ///   `python -m secantus` and the standalone `secantusd-rs` binary
     ///   (4G cache cap — WiredTiger fills it lazily, so idle test servers stay small — 1000 sessions, no per-commit fsync).
+    /// * `oplog_async` / `oplog_nonlogged` / `data_nonlogged` /
+    ///   `checkpoint_seconds` — the storage write-path modes, per store:
+    ///   background oplog drainer, non-logged oplog tables, and the
+    ///   log-only-the-oplog data mode with its stable-checkpoint cadence.
+    ///   `None` (the default) defers to the matching `SECANTUS_*` env var, so
+    ///   env-driven workflows are unchanged; an explicit value wins over the
+    ///   environment for THIS server only. An existing store's recorded
+    ///   data-logging mode always wins over `data_nonlogged` (the table
+    ///   config is create-time-sticky).
     #[new]
     #[pyo3(signature = (
         storage_path,
@@ -74,6 +83,10 @@ impl RustServer {
         cache_size = "4G".to_string(),
         session_max = 1000,
         sync_on_commit = false,
+        oplog_async = None,
+        oplog_nonlogged = None,
+        data_nonlogged = None,
+        checkpoint_seconds = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -90,6 +103,10 @@ impl RustServer {
         cache_size: String,
         session_max: u32,
         sync_on_commit: bool,
+        oplog_async: Option<bool>,
+        oplog_nonlogged: Option<bool>,
+        data_nonlogged: Option<bool>,
+        checkpoint_seconds: Option<u64>,
     ) -> PyResult<Self> {
         // WiredTiger requires the home directory to exist; create it so any
         // path "just works" (matching the one-or-two-line ergonomic).
@@ -97,15 +114,23 @@ impl RustServer {
             PyRuntimeError::new_err(format!("failed to create storage dir {storage_path}: {e}"))
         })?;
         // Defaults match `python -m secantus`, the Python `SecantusDBServer`,
-        // and the standalone `secantusdb` binary (4G cache cap; the engine's own
-        // `Storage::open` default stays 256M). Each knob is overridable per
-        // handle so tests can exercise non-default WiredTiger configs.
-        let mut storage = Storage::open_with_config(
+        // the standalone `secantusdb` binary, AND the engine's own
+        // `Storage::open` (all 4G cache cap — WiredTiger fills lazily). Each
+        // knob is overridable per handle so tests can exercise non-default
+        // WiredTiger configs.
+        let mut storage = Storage::open_with_options(
             storage_path,
-            // Embedded handle keeps the 128MB log default (many ephemeral in-process
-            // instances in a test suite must not each carry a big sparse log); the
-            // standalone daemon opts into 2GB for write throughput.
-            &wt_config(&cache_size, session_max, sync_on_commit, "128MB"),
+            &StorageOptions {
+                // Embedded handle keeps the 128MB log default (many ephemeral in-process
+                // instances in a test suite must not each carry a big sparse log); the
+                // standalone daemon opts into 2GB for write throughput.
+                wt_config: Some(wt_config(&cache_size, session_max, sync_on_commit, "128MB")),
+                oplog_async,
+                oplog_nonlogged,
+                data_nonlogged,
+                checkpoint_seconds,
+                ..StorageOptions::default()
+            },
         )
         .map_err(|e| PyRuntimeError::new_err(format!("failed to open storage: {e:?}")))?;
         storage.set_enable_oplog(enable_oplog);
@@ -169,7 +194,7 @@ impl RustServer {
     /// is joined.
     fn stop(&mut self, py: Python<'_>) {
         if let Some(mut running) = self.running.take() {
-            py.allow_threads(|| running.stop());
+            py.detach(|| running.stop());
         }
     }
 

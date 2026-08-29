@@ -223,3 +223,24 @@ def test_domain_checks_in_pg_constraint(t, session):
         "SELECT conname, contype FROM pg_constraint WHERE contypid <> 0 ORDER BY conname",
     ).rows
     assert rows == [("email_chk", "c"), ("nonblank_check", "c"), ("posint_check", "c")]
+
+
+def test_domain_base_typmod_surfaces_in_pg_type(storage, session):
+    # pgjdbc's getColumns reads a domain column's COLUMN_SIZE from the domain's
+    # pg_type.typbasetype + typtypmod (domainColumnSize): varbit(3) -> 3,
+    # numeric(8,3) -> packed precision/scale, an int domain -> no typmod.
+    run(storage, session, "CREATE DOMAIN nndom AS int not null")
+    run(storage, session, "CREATE DOMAIN varbit2 AS varbit(3)")
+    run(storage, session, "CREATE DOMAIN float83 AS numeric(8,3)")
+    run(storage, session, "CREATE TABLE domaintable (id nndom, v varbit2, f float83)")
+    rows = run(
+        storage,
+        session,
+        "SELECT typname, typbasetype, typtypmod FROM pg_type"
+        " WHERE typname IN ('nndom','varbit2','float83') ORDER BY typname",
+    ).rows
+    assert rows == [
+        ("float83", 1700, ((8 << 16) | 3) + 4),
+        ("nndom", 23, -1),
+        ("varbit2", 1562, 3),
+    ]

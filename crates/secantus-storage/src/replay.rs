@@ -173,7 +173,10 @@ pub fn apply_entry(storage: &Storage, entry: &Document) -> Result<bool> {
                 &[],
                 &empty_doc(),
                 None,
+                // Replay re-applies a write that already passed validation when
+                // it was first accepted, so no validator is enforced here.
                 None,
+                false,
             )?;
             Ok(true)
         }

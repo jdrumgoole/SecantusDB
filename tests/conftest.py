@@ -97,6 +97,46 @@ if "wiredtiger" not in sys.modules and importlib.util.find_spec("wiredtiger") is
 _SAFE_TMP_RETENTION = frozenset({"all"})
 
 
+def _install_sigtrace() -> None:
+    """SECANTUS_SIGTRACE=1: log receipt of catchable terminating signals to a
+    per-pid file, then die with the default action — evidence for the xdist
+    worker-death hunt (backlog: 'group-kill' theory). A worker that dies
+    WITHOUT a log line was SIGKILLed (uncatchable) or crashed in C; one that
+    logs SIGTERM names the signal, and phase B (SA_SIGINFO) can then chase
+    the sender pid. Python-level handlers run even when the main thread is
+    blocked in a syscall (PEP 475 runs handlers before retrying on EINTR).
+    """
+    import contextlib as _contextlib
+    import signal as _signal
+    import tempfile as _tempfile
+    import time as _time
+
+    trace_dir = os.environ.get("SECANTUS_SIGTRACE_DIR") or _tempfile.gettempdir()
+
+    def _log_and_die(signo: int, frame: object) -> None:
+        try:
+            with open(os.path.join(trace_dir, f"sigtrace-{os.getpid()}.log"), "a") as fh:
+                fh.write(
+                    f"{_time.strftime('%H:%M:%S')} pid={os.getpid()} got signal "
+                    f"{signo} ({_signal.Signals(signo).name}) "
+                    f"test={os.environ.get('PYTEST_CURRENT_TEST', '?')}\n"
+                )
+        finally:
+            _signal.signal(signo, _signal.SIG_DFL)
+            os.kill(os.getpid(), signo)
+
+    for signo in (
+        _signal.SIGTERM,
+        _signal.SIGINT,
+        _signal.SIGHUP,
+        _signal.SIGQUIT,
+        _signal.SIGUSR1,
+        _signal.SIGUSR2,
+    ):
+        with _contextlib.suppress(OSError, ValueError):
+            _signal.signal(signo, _log_and_die)
+
+
 @pytest.fixture(scope="session")
 def _wt_template(tmp_path_factory: pytest.TempPathFactory) -> str:
     """One pristine WiredTiger home per xdist worker, built once.
@@ -158,6 +198,8 @@ def pytest_configure(config: pytest.Config) -> None:
     aggressive cleanup, run it in its own pytest invocation instead of
     flipping this policy globally.
     """
+    if os.environ.get("SECANTUS_SIGTRACE") == "1":
+        _install_sigtrace()
     # Start the session stall watcher (see the block below). Done here rather
     # than in a fixture because fixtures run only in xdist WORKERS, and the
     # controller is exactly the process that wedges.
@@ -242,7 +284,15 @@ def _hang_watchdog():
     with zero diagnostics. This watchdog fires first (25 min < the 30-min job cap)
     and prints every thread's stack to stderr. Each xdist worker arms its own.
     """
-    _hang_seconds = float(os.environ.get("SECANTUS_HANG_SECONDS", "1500"))
+    # Default 90 min, NOT the CI-tuned 25: CI pins SECANTUS_HANG_SECONDS=1500
+    # explicitly (25 min < its 30-min job cap). A LOCAL run on a shared box can
+    # legitimately exceed 25 min — a 0.6.0b8 release-gate run took 25:11 under a
+    # parallel session's gauge load and the watchdog hard-exited five healthy
+    # workers mid-suite (node down: Not properly terminated + controller
+    # INTERNALERROR), with the stderr dumps lost. The watchdog exists to name a
+    # WEDGED worker, not to kill a slow-but-progressing one; locally the only
+    # hard deadline worth enforcing is "something is truly stuck".
+    _hang_seconds = float(os.environ.get("SECANTUS_HANG_SECONDS", "5400"))
     # Route the wedge traceback to the per-worker crash FILE when one is armed
     # (SECANTUS_FAULTHANDLER_DIR): a worker that wedges in shutdown dies with its
     # stderr unflushed and unforwarded (xdist reports only "node down"), so a
@@ -312,6 +362,7 @@ _last_progress_at = time.monotonic()
 _stall_watch_armed = False
 _node_down: list[str] = []
 _first_node_down_at: float | None = None
+_seen_nodeids: set[str] = set()
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
@@ -323,6 +374,34 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     """
     global _last_progress_at
     _last_progress_at = time.monotonic()
+    # Which tests actually got as far as running. A test assigned to a worker
+    # that died is never dispatched anywhere else, so it never lands here --
+    # that gap is how ``_lost_test_report`` counts what a crash swallowed.
+    _seen_nodeids.add(report.nodeid)
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_handlecrashitem(crashitem: str, report: object, sched: object) -> None:
+    """Name the test a crashed worker was running, the moment it crashes.
+
+    The stall watchdog can kill a post-crash run before pytest's summary
+    prints, and the summary is the only place xdist's "worker crashed while
+    running X" failure reports would otherwise appear — three worker-death
+    occurrences (2026-08-14/15) left no record of WHICH tests the dead
+    workers were on. This dumps the crashed item immediately, plus a memory
+    snapshot for the SIGKILL-no-.ips hypothesis (fd/RSS exhaustion).
+    """
+    sys.stderr.write(f"\n=== crashed worker was running: {crashitem} ===\n")
+    try:
+        import resource
+        import subprocess
+
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+        free = next((ln for ln in vm.splitlines() if "free" in ln), "")
+        sys.stderr.write(f"controller maxrss={rss_mb:.0f}MB; {free.strip()}\n")
+    except Exception:
+        pass
 
 
 @pytest.hookimpl(optionalhook=True)
@@ -359,6 +438,71 @@ def pytest_testnodedown(node: object, error: object) -> None:
     )
     faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
     sys.stderr.flush()
+
+
+def _lost_test_report(
+    collected: int,
+    executed: int,
+    node_down: list[str],
+) -> str | None:
+    """The banner for a run that lost a worker, or ``None`` if it was clean.
+
+    Kept pure so it can be unit-tested without staging a real worker death.
+    """
+    if not node_down:
+        return None
+    missing = max(0, collected - executed)
+    lines = [
+        "",
+        "=" * 72,
+        "RUN INVALID -- an xdist worker died; this result proves nothing.",
+        "=" * 72,
+        f"workers lost: {len(node_down)}",
+    ]
+    lines += [f"  - {r}" for r in node_down]
+    lines.append(f"collected: {collected}   actually ran: {executed}   never ran: {missing}")
+    if missing:
+        lines.append(
+            f"{missing} test(s) were assigned to a dead worker and were never "
+            "re-dispatched, so nothing here says whether they pass."
+        )
+    lines += [
+        "",
+        "pytest's own summary above counts only the tests that DID run, and the",
+        "session would otherwise exit 0 -- a green-looking result hiding the gap.",
+        "Common cause on a dev box: a second `-n auto` suite (or another heavy",
+        "job) oversubscribing the machine, so the OS kills a worker. Re-run on a",
+        "quiet machine before trusting any result.",
+        "=" * 72,
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Fail a run that lost a worker, instead of exiting 0 on partial results.
+
+    Observed 2026-08-26: a contended box got a worker SIGKILLed ~2/3 of the way
+    through. xdist logged ``node down: Not properly terminated`` and an
+    ``INTERNALERROR``, then pytest printed ``4093 passed`` and exited **0** --
+    but 6257 tests had been collected, so ~2100 never ran at all. That is a
+    green light over an unmeasured suite, which is exactly the kind of signal
+    this repo must never hand back (CLAUDE.md: never discount an error).
+
+    The worker-death diagnostics already existed (see ``pytest_testnodedown``
+    and ``pytest_handlecrashitem``); what was missing was making the *exit
+    status* reflect them.
+    """
+    # Controller only -- workers have ``workerinput`` and their own exit path.
+    if hasattr(session.config, "workerinput"):
+        return
+    banner = _lost_test_report(session.testscollected, len(_seen_nodeids), _node_down)
+    if banner is None:
+        return
+    sys.stderr.write(banner)
+    sys.stderr.flush()
+    if exitstatus == 0:
+        session.exitstatus = 1
 
 
 def _stall_trigger(

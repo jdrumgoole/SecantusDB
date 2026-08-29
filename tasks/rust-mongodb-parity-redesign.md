@@ -1,5 +1,22 @@
 # Plan: redesign the Rust server to approach mongod performance
 
+> **STILL ACTIVE — confirmed by Joe, 2026-08-20.** These two plans stay live
+> **until Rust-server / mongod performance parity is achieved.** Recorded here
+> because a status line reading "active (2026-07-2x)" invites each later audit to
+> ask whether it still is; it does, and the exit criterion is parity, not a date.
+>
+> **Joe's position, stated 2026-08-20: parity IS achievable, and the investigation
+> continues.** That is the standing direction — not an aspiration attached to a
+> closed question.
+>
+> Relevant history: the **VERDICT (2026-07-22)** in
+> `tasks/rust-parity-forward-plan.md` concluded that write-parity is not reachable
+> for this architecture. It was **retracted on 2026-08-20** — it compared a Rust
+> server writing an oplog against a mongod keeping none, and neither of its decisive
+> observations reproduces. The honest gap is 2.4x at one writer rising to 3.7x at
+> eight, a scaling shape rather than a flat per-op wall. Don't let a stale quotation
+> of that verdict stop work planned here.
+
 Status: **active** (2026-07-20). Goal set by Joe: "redesign the rust server so it
 approaches MongoDB performance, ignore previous simplicity goals." The global-lock
 / "don't think about WT's MVCC" simplicity constraint is **lifted**.

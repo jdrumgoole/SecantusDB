@@ -180,11 +180,74 @@ def test_idle_in_transaction_session_timeout(server):
     finally:
         with contextlib.suppress(psycopg.Error):
             conn.close()
-    # A zero (default) timeout leaves an idle transaction alone.
+    # An idle transaction well inside the server default (120s) is left alone.
     with connect(server) as conn:
         conn.execute("SELECT 1")
         time.sleep(0.3)
         assert conn.execute("SELECT 2").fetchone() == (2,)
+
+
+def test_idle_in_txn_server_default_applies(tmp_path):
+    """The server-level idle_in_transaction_timeout_s applies to sessions that
+    never SET the GUC: an abandoned open transaction is aborted and the
+    connection terminated (25P03), and its writes roll back. This is the
+    guard against a leaked in-transaction connection pinning WT's oldest
+    snapshot and degrading every later write (the pgjdbc-gauge lane hang)."""
+    import time
+
+    st = Storage(str(tmp_path))
+    srv = SecantusPGServer(port=0, storage=st, idle_in_transaction_timeout_s=0.1)
+    srv.start()
+    try:
+        conn = connect(srv)  # autocommit off; dies mid-test
+        try:
+            conn.execute("CREATE TABLE leak_t (v int)")
+            conn.commit()
+            conn.execute("INSERT INTO leak_t VALUES (1)")  # open txn with a write
+            time.sleep(0.6)
+            with pytest.raises(
+                (psycopg.errors.IdleInTransactionSessionTimeout, psycopg.OperationalError)
+            ):
+                conn.execute("SELECT 1")
+        finally:
+            with contextlib.suppress(psycopg.Error):
+                conn.close()
+        with connect(srv) as conn2:
+            assert conn2.execute("SELECT count(*) FROM leak_t").fetchone() == (0,)
+    finally:
+        srv.stop()
+        st.close()
+
+
+def test_idle_in_txn_server_default_overridable(tmp_path):
+    """SET idle_in_transaction_session_timeout = 0 opts a session out of the
+    server default (PG GUC precedence: session SET beats server config)."""
+    import time
+
+    st = Storage(str(tmp_path))
+    srv = SecantusPGServer(port=0, storage=st, idle_in_transaction_timeout_s=0.1)
+    srv.start()
+    try:
+        with connect(srv) as conn:
+            conn.execute("SET idle_in_transaction_session_timeout = 0")
+            conn.execute("SELECT 1")  # opens the transaction block
+            time.sleep(0.6)
+            assert conn.execute("SELECT 2").fetchone() == (2,)
+    finally:
+        srv.stop()
+        st.close()
+
+
+def test_idle_in_txn_show_and_reset_reflect_server_default(server):
+    """SHOW reports the server-config value when the session never SET it, and
+    RESET falls back to the server config, not the built-in 0."""
+    with connect(server, autocommit=True) as conn:
+        default = conn.execute("SHOW idle_in_transaction_session_timeout").fetchone()[0]
+        assert default == "120000"
+        conn.execute("SET idle_in_transaction_session_timeout = 5000")
+        assert conn.execute("SHOW idle_in_transaction_session_timeout").fetchone()[0] == "5000"
+        conn.execute("RESET idle_in_transaction_session_timeout")
+        assert conn.execute("SHOW idle_in_transaction_session_timeout").fetchone()[0] == "120000"
 
 
 def test_transaction_commit_and_rollback(server):
@@ -237,6 +300,24 @@ def test_write_to_reflected_table(server):
 def test_undefined_table_sqlstate(server):
     with connect(server, autocommit=True) as conn, pytest.raises(psycopg.errors.UndefinedTable):
         conn.execute("SELECT * FROM nonexistent")
+
+
+def test_cross_type_comparison_sqlstate(server):
+    """Comparing a text column against an integer is a parse-analysis failure in
+    Postgres, so psycopg must see ``42883 undefined_function`` — not an empty
+    result set. ``= '42'`` (an untyped literal) must keep working."""
+    with connect(server, autocommit=True) as conn:
+        conn.execute("CREATE TABLE ct (id bigint primary key, name text, age int)")
+        conn.execute("INSERT INTO ct (id, name, age) VALUES (1, '42', 42)")
+        with pytest.raises(psycopg.errors.UndefinedFunction) as ei:
+            conn.execute("SELECT id FROM ct WHERE name = 42")
+        assert ei.value.sqlstate == "42883"
+        assert "operator does not exist: text = integer" in str(ei.value)
+    with connect(server, autocommit=True) as conn:
+        assert conn.execute("SELECT id FROM ct WHERE name = '42'").fetchall() == [(1,)]
+        assert conn.execute("SELECT id FROM ct WHERE age = 42").fetchall() == [(1,)]
+        # A bound parameter is typed from the column, so this resolves too.
+        assert conn.execute("SELECT id FROM ct WHERE name = %s", ("42",)).fetchall() == [(1,)]
 
 
 # -- SQLAlchemy via the psycopg dialect -------------------------------------- #

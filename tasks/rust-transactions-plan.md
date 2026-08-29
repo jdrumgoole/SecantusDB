@@ -1,5 +1,15 @@
 # Rust server: multi-document transactions (real WT-backed)
 
+> **DELIVERED (audited 2026-08-20).** Its "Current Rust state" paragraph — no-op
+> `commitTransaction`/`abortTransaction` stubs, no `startTransaction`, no
+> session/txn registry, no WT user transactions — is now false in every clause.
+> `crates/secantus-commands/src/transactions.rs` exists, `startTransaction` is
+> dispatched (`commands/src/lib.rs`, `admin.rs`), and `secantus-storage` tracks
+> user transactions (`in_user_txn`, lib.rs:3765). The Rust server has since had
+> transaction *bug fixes* on top, e.g. #809's cross-transaction unique-index
+> enforcement — see the `[x]` entries under "Multi-document transaction
+> limitations" in `tasks/backlog.md`, which are the current record.
+
 **Decision (2026-06-15, Joe):** implement real WiredTiger-backed transactions on
 the Rust server, mirroring the Python server's design — NOT a buffer-and-apply
 shim. Transactions are **in scope** (single-node, WT-native; SecantusDB

@@ -35,6 +35,13 @@ fn evaluate(expr: &Bson, doc: &Document, vars: &Document) -> R<Bson> {
     expressions::evaluate(doc, expr, vars).map_err(|_| Fallback)
 }
 
+/// [`evaluate`] in *field-value* position: an absent field path yields the
+/// missing marker so `$project` / `$addFields` omit the key instead of writing
+/// null.
+fn evaluate_or_missing(expr: &Bson, doc: &Document, vars: &Document) -> R<Bson> {
+    expressions::evaluate_or_missing(doc, expr, vars).map_err(|_| Fallback)
+}
+
 pub fn apply_pipeline(
     mut docs: Vec<Document>,
     pipeline: &[Bson],
@@ -293,12 +300,14 @@ fn sort_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
     let mut keyed: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
     for d in docs {
         let mut keys = Vec::with_capacity(fields.len());
-        for (path, _) in &fields {
+        for (path, rev) in &fields {
             let v = paths::get_path(&d, path).cloned().unwrap_or(Bson::Null);
             if !order::is_sortable(&v) {
                 return Err(Fallback);
             }
-            keys.push(v);
+            // mongod sorts an array-valued field by one representative element:
+            // its minimum ascending, its maximum descending.
+            keys.push(order::array_sort_value(v, *rev).ok_or(Fallback)?);
         }
         keyed.push((keys, d));
     }
@@ -456,7 +465,9 @@ fn add_fields_one(mut doc: Document, spec: &Document, vars: &Document) -> R<Docu
     // expressions first, then mutate `doc` in place rather than cloning it.
     let mut computed = Vec::with_capacity(spec.len());
     for (path, expr) in spec {
-        computed.push((path, evaluate(expr, &doc, vars)?));
+        // `evaluate_or_missing`: a direct field path that doesn't exist is
+        // MISSING, not null, and mongod omits the key rather than adding it.
+        computed.push((path, evaluate_or_missing(expr, &doc, vars)?));
     }
     for (path, v) in computed {
         // A computed value of `Bson::Undefined` is the "missing" marker (e.g. a
@@ -555,7 +566,7 @@ fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> 
             }
         }
         for (key, expr) in computed {
-            let v = evaluate(expr, doc, vars)?;
+            let v = evaluate_or_missing(expr, doc, vars)?;
             // `Bson::Undefined` is the "missing" marker (e.g. `$getField` on an
             // absent field): mongod omits the field rather than emitting null.
             if matches!(v, Bson::Undefined) {

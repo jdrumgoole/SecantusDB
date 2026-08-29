@@ -387,6 +387,216 @@ async def test_collections_page_for_empty_db_renders_empty_message(
     assert "No collections" in r.text
 
 
+# ---- custom roles ----------------------------------------------------------
+
+
+async def test_create_custom_role_then_drop_it(server, http: AsyncClient) -> None:
+    """createRole / dropRole are reachable from the roles page."""
+    r = await http.post(
+        "/roles?db=admin",
+        data={
+            "name": "appReader",
+            "privileges": '[{"resource": {"db": "app", "collection": ""}, "actions": ["find"]}]',
+            "roles": "",
+        },
+        headers={HEADER_NAME: "testtoken"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+
+    listing = await http.get("/roles?db=admin", headers={HEADER_NAME: "testtoken"})
+    assert "appReader" in listing.text
+    # A role the package has no action table for is flagged, not invented.
+    assert "custom" in listing.text
+
+    dropped = await http.post(
+        "/roles/admin/appReader/drop",
+        headers={HEADER_NAME: "testtoken"},
+        follow_redirects=False,
+    )
+    assert dropped.status_code == 303
+    after = await http.get("/roles?db=admin", headers={HEADER_NAME: "testtoken"})
+    assert "appReader" not in after.text
+
+
+async def test_create_role_rejects_empty_grant(http: AsyncClient) -> None:
+    """No privileges and no inherited roles grants nothing — say so."""
+    r = await http.post(
+        "/roles?db=admin",
+        data={"name": "empty", "privileges": "", "roles": ""},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    assert "at least one privilege" in r.text
+
+
+async def test_create_role_rejects_malformed_privileges(http: AsyncClient) -> None:
+    r = await http.post(
+        "/roles?db=admin",
+        data={"name": "bad", "privileges": "{}", "roles": ""},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    assert "must be a JSON array" in r.text
+
+
+# ---- collection lifecycle (create / collMod / rename) ----------------------
+
+
+async def test_create_collection_with_validator(server, http: AsyncClient) -> None:
+    """The create form reaches ``create`` with its options intact."""
+    from pymongo import MongoClient
+
+    r = await http.post(
+        "/db/ddl_db/collections",
+        data={
+            "name": "people",
+            "options": '{"validator": {"age": {"$gte": 0}}, "validationAction": "error"}',
+        },
+        headers={HEADER_NAME: "testtoken"},
+        follow_redirects=False,
+    )
+    # 303, not 307: a refresh must not replay the POST and re-run the DDL.
+    assert r.status_code == 303
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        opts = next(iter(mc["ddl_db"].list_collections(filter={"name": "people"})))["options"]
+        assert opts["validator"] == {"age": {"$gte": 0}}
+        # The validator is live, not merely recorded.
+        from pymongo.errors import WriteError
+
+        with pytest.raises(WriteError) as exc:
+            mc["ddl_db"]["people"].insert_one({"age": -1})
+        assert exc.value.code == 121
+    finally:
+        mc.close()
+
+
+async def test_create_collection_rejects_bad_options_without_creating(
+    server, http: AsyncClient
+) -> None:
+    from pymongo import MongoClient
+
+    r = await http.post(
+        "/db/ddl_bad/collections",
+        data={"name": "c", "options": "not json"},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    assert "not valid Extended JSON" in r.text
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        assert "c" not in mc["ddl_bad"].list_collection_names()
+    finally:
+        mc.close()
+
+
+async def test_collmod_applies_changes(server, http: AsyncClient) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["mod_db"].create_collection("c", validator={"n": {"$gte": 0}})
+        r = await http.post(
+            "/db/mod_db/c/collmod",
+            data={"changes": '{"validationAction": "warn"}'},
+            headers={HEADER_NAME: "testtoken"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        opts = next(iter(mc["mod_db"].list_collections(filter={"name": "c"})))["options"]
+        assert opts["validationAction"] == "warn"
+    finally:
+        mc.close()
+
+
+async def test_collmod_rejects_empty_changes(http: AsyncClient) -> None:
+    """An empty document is a no-op, so say that rather than reporting success."""
+    r = await http.post(
+        "/db/mod_db/c/collmod",
+        data={"changes": "{}"},
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 400
+    assert "no-op" in r.text
+
+
+async def test_rename_collection_within_and_across_databases(server, http: AsyncClient) -> None:
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["ren_db"]["before"].insert_one({"_id": 1})
+        r = await http.post(
+            "/db/ren_db/before/rename",
+            data={"target": "after"},
+            headers={HEADER_NAME: "testtoken"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        names = mc["ren_db"].list_collection_names()
+        assert "after" in names and "before" not in names
+        assert mc["ren_db"]["after"].find_one({"_id": 1}) is not None
+
+        # A dotted target is a full namespace, so it can cross databases.
+        r2 = await http.post(
+            "/db/ren_db/after/rename",
+            data={"target": "other_db.moved"},
+            headers={HEADER_NAME: "testtoken"},
+            follow_redirects=False,
+        )
+        assert r2.status_code == 303
+        assert "moved" in mc["other_db"].list_collection_names()
+    finally:
+        mc.close()
+
+
+async def test_rename_onto_existing_target_needs_drop_target(server, http: AsyncClient) -> None:
+    """Without the checkbox the server refuses; with it, the target is replaced."""
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["clash_db"]["src"].insert_one({"_id": "from-src"})
+        mc["clash_db"]["dst"].insert_one({"_id": "from-dst"})
+
+        r = await http.post(
+            "/db/clash_db/src/rename",
+            data={"target": "dst"},
+            headers={HEADER_NAME: "testtoken"},
+        )
+        assert r.status_code == 400
+        assert mc["clash_db"]["dst"].find_one({"_id": "from-dst"}) is not None
+
+        r2 = await http.post(
+            "/db/clash_db/src/rename",
+            data={"target": "dst", "drop_target": "1"},
+            headers={HEADER_NAME: "testtoken"},
+            follow_redirects=False,
+        )
+        assert r2.status_code == 303
+        assert mc["clash_db"]["dst"].find_one({"_id": "from-src"}) is not None
+    finally:
+        mc.close()
+
+
+async def test_collections_page_exposes_lifecycle_controls(server, http: AsyncClient) -> None:
+    """The actions are reachable from the page, not just via curl."""
+    from pymongo import MongoClient
+
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["ui_db"]["c"].insert_one({"_id": 1})
+    finally:
+        mc.close()
+    r = await http.get("/db/ui_db", headers={HEADER_NAME: "testtoken"})
+    assert r.status_code == 200
+    assert "/db/ui_db/collections" in r.text
+    assert "/db/ui_db/c/collmod" in r.text
+    assert "/db/ui_db/c/rename" in r.text
+
+
 # ---- collection viewer (Slice 2.2) -----------------------------------------
 
 
@@ -961,6 +1171,28 @@ async def test_changestream_page_renders(http: AsyncClient) -> None:
     assert "Change stream" in r.text
     # Scope picker is wired up.
     assert 'name="scope"' in r.text
+    # Watch options are reachable from the page, not just the query string.
+    for control in (
+        "fullDocument",
+        "fullDocumentBeforeChange",
+        "resumeAfter",
+        "startAfter",
+        "startAtOperationTime",
+        "pipeline",
+    ):
+        assert f'name="{control}"' in r.text, control
+
+
+async def test_changestream_page_round_trips_options(http: AsyncClient) -> None:
+    """Options in the URL come back as form state, so a reload keeps them."""
+    r = await http.get(
+        "/changestream?scope=coll&db=d&coll=c"
+        "&fullDocument=updateLookup&startAtOperationTime=17%2C3",
+        headers={HEADER_NAME: "testtoken"},
+    )
+    assert r.status_code == 200
+    assert "updateLookup" in r.text
+    assert "17,3" in r.text
 
 
 def test_ws_changes_streams_collection_event(server, tmp_path) -> None:
@@ -987,6 +1219,153 @@ def test_ws_changes_streams_collection_event(server, tmp_path) -> None:
         assert evt["event"]["operationType"] == "insert"
         assert evt["event"]["ns"]["db"] == "cs_db"
         assert evt["event"]["ns"]["coll"] == "c"
+
+
+def test_watch_kwargs_only_includes_supplied_options() -> None:
+    """An untouched control must not override a driver default.
+
+    The sentinel values ("default" / "off") are what the UI submits when the
+    user never opens the options panel; forwarding them as real kwargs would
+    silently change stream behaviour for everyone.
+    """
+    from secantus.admin.routers.changestream import watch_kwargs
+
+    assert watch_kwargs({}) == {}
+    assert watch_kwargs({"fullDocument": "default", "fullDocumentBeforeChange": "off"}) == {}
+    # Blank / whitespace-only text inputs are "unset", not an empty token.
+    assert watch_kwargs({"resumeAfter": "  ", "pipeline": ""}) == {}
+
+    assert watch_kwargs({"fullDocument": "updateLookup"}) == {"full_document": "updateLookup"}
+    assert watch_kwargs({"fullDocumentBeforeChange": "required"}) == {
+        "full_document_before_change": "required"
+    }
+    assert watch_kwargs({"resumeAfter": '{"_data": "ab"}'}) == {"resume_after": {"_data": "ab"}}
+    assert watch_kwargs({"pipeline": '[{"$match": {"operationType": "insert"}}]'}) == {
+        "pipeline": [{"$match": {"operationType": "insert"}}]
+    }
+
+
+def test_watch_kwargs_parses_operation_time() -> None:
+    from bson import Timestamp
+
+    from secantus.admin.routers.changestream import watch_kwargs
+
+    assert watch_kwargs({"startAtOperationTime": "17"}) == {
+        "start_at_operation_time": Timestamp(17, 0)
+    }
+    assert watch_kwargs({"startAtOperationTime": "17,3"}) == {
+        "start_at_operation_time": Timestamp(17, 3)
+    }
+    # Extended JSON is what a token copied out of an oplog row looks like.
+    assert watch_kwargs({"startAtOperationTime": '{"$timestamp": {"t": 17, "i": 3}}'}) == {
+        "start_at_operation_time": Timestamp(17, 3)
+    }
+
+
+@pytest.mark.parametrize(
+    "params, expected",
+    [
+        ({"fullDocument": "bogus"}, "fullDocument must be one of"),
+        ({"fullDocumentBeforeChange": "bogus"}, "fullDocumentBeforeChange must be one of"),
+        ({"resumeAfter": "not json"}, "resumeAfter is not valid JSON"),
+        ({"resumeAfter": "[1, 2]"}, "resumeAfter must be a document"),
+        ({"pipeline": "{}"}, "pipeline must be a JSON array"),
+        ({"pipeline": "[1]"}, "every pipeline stage must be a document"),
+        ({"startAtOperationTime": "nope"}, "startAtOperationTime must be"),
+        ({"startAtOperationTime": "1,2,3"}, "at most"),
+    ],
+)
+def test_watch_kwargs_rejects_malformed_options(params, expected) -> None:
+    from secantus.admin.routers.changestream import WatchOptionError, watch_kwargs
+
+    with pytest.raises(WatchOptionError, match=expected):
+        watch_kwargs(params)
+
+
+def test_ws_changes_rejects_bad_option_with_an_error_frame(server, tmp_path) -> None:
+    """A malformed option must explain itself, not close silently.
+
+    A bare 1008 close reads to the user as "it didn't work" with no cause,
+    so the tail accepts first and sends a message it can render.
+    """
+    from fastapi.testclient import TestClient
+
+    app = create_app(mongo_uri=server.uri, token="cs-token", history_path=tmp_path / "h.db")
+    with (
+        TestClient(app) as client,
+        client.websocket_connect(
+            "/ws/changes/coll?t=cs-token&db=cs_db&coll=c&fullDocument=bogus"
+        ) as ws,
+    ):
+        frame = _recv_json(ws)
+        assert frame["type"] == "error"
+        assert "fullDocument must be one of" in frame["message"]
+
+
+def test_ws_changes_resume_after_replays_from_the_token(server, tmp_path) -> None:
+    """``resumeAfter`` starts the tail *after* the given event.
+
+    Writes two docs on one stream, takes the first event's token, then opens
+    a second stream resuming from it and asserts the first doc is not
+    replayed — the property that makes the "Resume from here" button useful.
+    """
+    import json
+    from urllib.parse import quote
+
+    from fastapi.testclient import TestClient
+    from pymongo import MongoClient
+
+    app = create_app(mongo_uri=server.uri, token="cs-token", history_path=tmp_path / "h.db")
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/changes/coll?t=cs-token&db=rs_db&coll=c") as ws:
+            assert _recv_json(ws)["type"] == "open"
+            mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+            try:
+                mc["rs_db"]["c"].insert_one({"_id": 1})
+                mc["rs_db"]["c"].insert_one({"_id": 2})
+            finally:
+                mc.close()
+            first = _recv_json(ws)
+            second = _recv_json(ws)
+            assert first["event"]["documentKey"]["_id"] == 1
+            assert second["event"]["documentKey"]["_id"] == 2
+            token = quote(json.dumps(first["event"]["_id"]))
+
+        url = f"/ws/changes/coll?t=cs-token&db=rs_db&coll=c&resumeAfter={token}"
+        with client.websocket_connect(url) as ws2:
+            opened = _recv_json(ws2)
+            assert opened["type"] == "open"
+            # The open frame echoes what took effect, so the UI can show that
+            # the option was honoured rather than merely requested.
+            assert opened["options"] == ["resume_after"]
+            replayed = _recv_json(ws2)
+            assert replayed["type"] == "event"
+            assert replayed["event"]["documentKey"]["_id"] == 2
+
+
+def test_ws_changes_full_document_update_lookup(server, tmp_path) -> None:
+    """``fullDocument=updateLookup`` attaches the post-image to an update."""
+    from fastapi.testclient import TestClient
+    from pymongo import MongoClient
+
+    app = create_app(mongo_uri=server.uri, token="cs-token", history_path=tmp_path / "h.db")
+    mc = MongoClient(server.uri, serverSelectionTimeoutMS=2000)
+    try:
+        mc["fd_db"]["c"].insert_one({"_id": 1, "x": 1})
+        with (
+            TestClient(app) as client,
+            client.websocket_connect(
+                "/ws/changes/coll?t=cs-token&db=fd_db&coll=c&fullDocument=updateLookup"
+            ) as ws,
+        ):
+            assert _recv_json(ws)["type"] == "open"
+            mc["fd_db"]["c"].update_one({"_id": 1}, {"$set": {"x": 2}})
+            evt = _recv_json(ws)
+            assert evt["event"]["operationType"] == "update"
+            # Without the option this key is absent entirely.
+            assert evt["event"]["fullDocument"]["x"] == 2
+    finally:
+        mc.close()
 
 
 def test_ws_changes_quiet_stream_closes_cleanly_and_app_stays_healthy(server, tmp_path) -> None:

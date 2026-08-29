@@ -40,7 +40,9 @@ pub struct UpdateOutcome {
     /// The post-image of a single-doc (`multi == false`) update / upsert,
     /// captured inside the storage write. `findAndModify {new: true}` must
     /// return this rather than re-`find`ing — the re-read races concurrent
-    /// writers and can hand two clients the same "new" document.
+    /// writers and can hand two clients the same "new" document. Captured
+    /// only when the caller passes `want_post_image` — a plain `update`
+    /// never reads it, so it skips the per-doc clone.
     pub post_image: Option<Document>,
 }
 
@@ -122,6 +124,16 @@ pub struct ChangeStreamBatch {
 /// The storage operations the command handlers depend on. Bytes at the seam:
 /// documents go in/out as `bson::encode` bytes, as they come off the WT cursor.
 pub trait Storage: Send + Sync {
+    /// True when the store is non-persistent (WiredTiger `in_memory=true`).
+    ///
+    /// Read by `serverStatus.storageEngine.persistent`. Defaults to `false`
+    /// (i.e. persistent) so test fakes, which are not the thing whose
+    /// durability anyone is asking about, need not implement it; the
+    /// WiredTiger-backed adapter forwards to the real flag.
+    fn in_memory(&self) -> bool {
+        false
+    }
+
     /// The current cluster time WITHOUT advancing it — for reply gossip
     /// (`$clusterTime` / `operationTime` attached to every reply). The default
     /// returns a zero timestamp (test fakes don't track cluster time); the
@@ -264,6 +276,10 @@ pub trait Storage: Send + Sync {
         _let_vars: &Document,
         _collation: Option<&Collation>,
         _validator: Option<&Document>,
+        // `validationLevel: "moderate"` — exempt docs that ALREADY failed the
+        // validator from update-time validation (inserts stay validated).
+        _validator_moderate: bool,
+        _want_post_image: bool,
     ) -> Result<UpdateOutcome, StorageError> {
         self.update_matching(db, coll, filter, update, multi, upsert)
     }
@@ -286,6 +302,10 @@ pub trait Storage: Send + Sync {
         _let_vars: &Document,
         _collation: Option<&Collation>,
         _validator: Option<&Document>,
+        // `validationLevel: "moderate"` — exempt docs that ALREADY failed the
+        // validator from update-time validation (inserts stay validated).
+        _validator_moderate: bool,
+        _want_post_image: bool,
     ) -> Result<UpdateOutcome, StorageError> {
         Err(StorageError::WriteError {
             code: 2,

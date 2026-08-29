@@ -167,10 +167,41 @@ endif()
 # (macOS SDK + manylinux/musllinux). Windows has no default libz, so WT builds
 # there without the compressor (the storage layer omits the block_compressor
 # clause on Windows too — see secantus-storage BOOTSTRAP).
+# OFF by default: enabling the extra compressors makes WiredTiger's builtin
+# extensions reference libsnappy / liblz4 / libzstd, which then have to be
+# present at link time and on every build platform. That is a dependency
+# decision, not an experiment knob, so the default build is unchanged.
+#
+# Turn it ON (with `SECANTUS_WT_EXTRA_COMPRESSORS=1` in the environment for the
+# Rust link step) to reproduce the compressor sweep in tasks/backlog.md.
+# Profiling the daemon under sustained write load put **65% of server CPU
+# inside zlib's `deflate`** on WiredTiger's page-reconciliation path, and
+# swapping zlib for lz4 measured +86% throughput and -97% p99.9 on
+# incompressible data, +15% / -88% on compressible. mongod defaults to snappy
+# for exactly this reason.
+# lz4 is the DEFAULT block compressor (see secantus-storage's table configs);
+# zlib is built alongside it and is NOT optional, because `block_compressor` is
+# recorded per table at create time — a store created before the switch has
+# zlib tables that can only be opened while the zlib extension is linked.
+#
+# snappy and zstd stay opt-in: they measured close to lz4 and adding two more
+# link dependencies to every wheel target for no further gain is not worth it.
+# Turn them on to reproduce the sweep in tasks/backlog.md.
+option(SECANTUS_WT_EXTRA_COMPRESSORS
+       "Also build the snappy and zstd block compressors (lz4 + zlib always build)"
+       OFF)
 if(WIN32)
     set(WT_ZLIB_ARG "")
+elseif(SECANTUS_WT_EXTRA_COMPRESSORS)
+    set(WT_ZLIB_ARG
+        -DENABLE_ZLIB=OFF -DHAVE_BUILTIN_EXTENSION_ZLIB=ON
+        -DENABLE_LZ4=OFF -DHAVE_BUILTIN_EXTENSION_LZ4=ON
+        -DENABLE_SNAPPY=OFF -DHAVE_BUILTIN_EXTENSION_SNAPPY=ON
+        -DENABLE_ZSTD=OFF -DHAVE_BUILTIN_EXTENSION_ZSTD=ON)
 else()
-    set(WT_ZLIB_ARG -DHAVE_BUILTIN_EXTENSION_ZLIB=ON)
+    set(WT_ZLIB_ARG
+        -DENABLE_ZLIB=OFF -DHAVE_BUILTIN_EXTENSION_ZLIB=ON
+        -DENABLE_LZ4=OFF -DHAVE_BUILTIN_EXTENSION_LZ4=ON)
 endif()
 
 ExternalProject_Add(wiredtiger_ext
@@ -222,8 +253,15 @@ ExternalProject_Add(wiredtiger_ext
         # images (self-contained), but not by default on Windows. Cuts the
         # per-doc disk-write volume that bounds steady-state write throughput;
         # mongod defaults to snappy, a follow-up can bundle that for the CPU win.
-        # (builtin-only — WT rejects ENABLE_ZLIB + HAVE_BUILTIN_EXTENSION_ZLIB
-        # together; the builtin flag both finds libz and statically links it.)
+        # (builtin-only — WT rejects ENABLE_<lib> + HAVE_BUILTIN_EXTENSION_<lib>
+        # together; the builtin flag both finds the library and statically links
+        # it. The paired `-DENABLE_<lib>=OFF` is deliberate belt-and-braces:
+        # WT only defaults ENABLE_LZ4 off when the builtin flag is already set,
+        # so a build directory configured BEFORE the builtin flag was added —
+        # where liblz4 was present and auto-detected — carries ENABLE_LZ4=ON in
+        # its CMake cache and the next configure dies on the conflict. Passing
+        # it explicitly makes a stale cache harmless; fresh CI containers never
+        # saw it, a developer's incremental tree does.)
         ${WT_ZLIB_ARG}
         # Belt-and-braces with BUILD_COMMAND below; ENABLE_CPPSUITE=OFF
         # also short-circuits the configure-time SWIG/Catch2 lookups.

@@ -22,8 +22,10 @@ use std::time::{Duration, Instant};
 
 use bson::{doc, Bson, Document};
 
-use crate::util::{as_i64, docs_to_bson};
-use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
+use crate::util::as_i64;
+use crate::{
+    CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE, MAX_GETMORE_BATCH_BYTES,
+};
 
 /// Idle TTL for ordinary cursors — MongoDB's 10-minute default.
 pub const DEFAULT_IDLE_TTL_SECONDS: f64 = 600.0;
@@ -83,6 +85,12 @@ pub struct TailableOptions {
     /// Docs matched at creation time that didn't fit the first batch; drained
     /// before the producer is consulted.
     pub initial_remaining: Vec<Vec<u8>>,
+    /// Whether this is a change stream rather than a plain capped-collection
+    /// tail. A dropped collection is signalled differently for the two: a
+    /// change stream drives its own invalidation through the producer's final
+    /// `invalidate` event, while a plain tail gets a `QueryPlanKilled`
+    /// "collection dropped" error. Mirrors `cursors._Entry.change_stream`.
+    pub change_stream: bool,
 }
 
 struct Entry {
@@ -92,6 +100,15 @@ struct Entry {
     tailable: bool,
     await_data: bool,
     no_cursor_timeout: bool,
+    change_stream: bool,
+    /// True when the result's size is KNOWN up front -- an explicit `limit` /
+    /// `singleBatch`, or a catalog enumeration like `listIndexes`. mongod closes
+    /// such a cursor the moment the bound is reached; without one it cannot know
+    /// and keeps the cursor open past an exact-fill batch.
+    bounded: bool,
+    /// Tombstoned by `kill_namespace`: the collection was dropped out from
+    /// under a plain tailable cursor, and the next getMore must say so.
+    dropped: bool,
     // The tailable fields below are written by `register_tailable` but only read
     // by the change-stream getMore slice (deferred), so they're allow(dead_code)
     // until that lands.
@@ -104,7 +121,6 @@ struct Entry {
     invalidated: bool,
     #[allow(dead_code)]
     final_event_pending: bool,
-    #[allow(dead_code)]
     last_token: Option<Document>,
     /// A fatal projection error (code 280) the producer hit; once set, the next
     /// getMore returns it as an `ok: 0` reply and the cursor is dropped.
@@ -188,6 +204,16 @@ impl CursorRegistry {
     /// Register an ordinary cursor over already-fetched documents; returns its
     /// id. The remaining docs drain via `getMore`.
     pub fn register(&self, namespace: &str, remaining: Vec<Vec<u8>>) -> Result<i64, CursorError> {
+        self.register_bounded(namespace, remaining, false)
+    }
+
+    /// `register` with an explicit `bounded` flag (see [`Entry::bounded`]).
+    pub fn register_bounded(
+        &self,
+        namespace: &str,
+        remaining: Vec<Vec<u8>>,
+        bounded: bool,
+    ) -> Result<i64, CursorError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.prune_locked(&mut inner);
         if inner.cursors.len() >= self.max_cursors {
@@ -202,6 +228,9 @@ impl CursorRegistry {
                 remaining: remaining.into_iter().collect(),
                 last_access: now,
                 tailable: false,
+                bounded,
+                change_stream: false,
+                dropped: false,
                 await_data: false,
                 no_cursor_timeout: false,
                 producer: None,
@@ -238,6 +267,9 @@ impl CursorRegistry {
                 remaining: opts.initial_remaining.into_iter().collect(),
                 last_access: now,
                 tailable: true,
+                bounded: false,
+                change_stream: opts.change_stream,
+                dropped: false,
                 await_data: opts.await_data,
                 no_cursor_timeout: opts.no_cursor_timeout,
                 producer: Some(producer),
@@ -272,14 +304,17 @@ impl CursorRegistry {
         })
     }
 
-    /// Drain up to `batch_size` documents (`<= 0` ⇒ all remaining). Returns the
-    /// batch and whether the cursor is now exhausted. An exhausted *non-tailable*
-    /// cursor is removed; a tailable cursor persists across empty batches and
-    /// always reports `exhausted == false` (`cursors.py::next_batch`).
+    /// Drain up to `batch_size` documents (`<= 0` ⇒ all remaining), never more
+    /// than `max_bytes` of encoded BSON (but always at least one document, so a
+    /// drain makes progress). Returns the batch and whether the cursor is now
+    /// exhausted. An exhausted *non-tailable* cursor is removed; a tailable
+    /// cursor persists across empty batches and always reports
+    /// `exhausted == false` (`cursors.py::next_batch`).
     pub fn next_batch(
         &self,
         cursor_id: i64,
         batch_size: i64,
+        max_bytes: usize,
     ) -> Result<(Vec<Vec<u8>>, bool), CursorError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.prune_locked(&mut inner);
@@ -289,14 +324,35 @@ impl CursorRegistry {
                 .cursors
                 .get_mut(&cursor_id)
                 .ok_or(CursorError::NotFound(cursor_id))?;
+            // A non-positive `batchSize` means "server default", i.e. the
+            // client named no size. Probed on mongod 8.3.4: it then drains the
+            // cursor AND closes it, because "the batch exactly filled the
+            // request" is meaningless when nothing was requested.
+            let explicit_request = batch_size > 0;
             let want = if batch_size <= 0 {
                 e.remaining.len()
             } else {
                 batch_size as usize
             };
-            let take = want.min(e.remaining.len());
+            let mut take = 0usize;
+            let mut bytes = 0usize;
+            for blob in e.remaining.iter().take(want.min(e.remaining.len())) {
+                if take > 0 && bytes + blob.len() > max_bytes {
+                    break;
+                }
+                bytes += blob.len();
+                take += 1;
+            }
             let batch: Vec<Vec<u8>> = e.remaining.drain(..take).collect();
-            let exhausted = e.remaining.is_empty();
+            // mongod closes a cursor only when it KNOWS the result is finished:
+            // the batch came up short, a `limit`/`singleBatch` bounded it, or no
+            // size was requested. A batch that exactly fills `want` proves
+            // nothing, so the cursor stays open and costs one more empty
+            // getMore. We buffer the whole result and could close early -- doing
+            // so made our round-trip count differ from mongod's, which drivers
+            // observe directly (mongo-go-driver asserts on exactly that).
+            let exhausted = e.remaining.is_empty()
+                && (e.bounded || !explicit_request || batch.is_empty() || batch.len() < want);
             if e.tailable || !exhausted {
                 e.last_access = now;
             }
@@ -384,24 +440,71 @@ impl CursorRegistry {
         (killed, not_found)
     }
 
-    /// Drop every cursor open on `namespace` (a `db.coll` string), returning the
-    /// count. mongod kills a collection's cursors when it's dropped or renamed,
-    /// so a later `getMore` fails with `CursorNotFound`; SecantusDB's cursors
-    /// hold detached snapshots, so without this they'd keep serving rows after
-    /// the collection is gone (mongo-c-driver's `error_document/getmore` test).
-    /// Mirrors `cursors.kill_namespace`.
+    /// Kill every cursor open on `namespace` (a `db.coll` string), returning the
+    /// count. mongod kills a collection's cursors when it's dropped or renamed;
+    /// SecantusDB's cursors hold detached snapshots, so without this they'd keep
+    /// serving rows after the collection is gone.
+    ///
+    /// The three kinds are treated differently, mirroring
+    /// `cursors.kill_namespace`:
+    ///
+    /// * **Non-tailable** — removed outright, so the next `getMore` is
+    ///   `CursorNotFound` (mongo-c-driver's `error_document/getmore`).
+    /// * **Plain tailable** — *tombstoned* (`dropped = true`, entry kept) so the
+    ///   next `getMore` can return `QueryPlanKilled` "collection dropped", which
+    ///   is what mongod tells a tailing client and what mongo-php-driver's
+    ///   `cursor-tailable_error-001` asserts on. A bare `CursorNotFound` doesn't
+    ///   say why the tail ended.
+    /// * **Change streams** — left alone: they drive their own drop/rename
+    ///   invalidation through the producer's final `invalidate` event, and
+    ///   tombstoning would replace that event with an error.
     pub fn kill_namespace(&self, namespace: &str) -> usize {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let doomed: Vec<i64> = inner
+        let affected: Vec<i64> = inner
             .cursors
             .iter()
-            .filter(|(_, e)| e.namespace == namespace)
+            .filter(|(_, e)| e.namespace == namespace && !e.change_stream)
             .map(|(&cid, _)| cid)
             .collect();
-        for cid in &doomed {
-            inner.cursors.remove(cid);
+        for cid in &affected {
+            let tailable = inner.cursors.get(cid).is_some_and(|e| e.tailable);
+            if tailable {
+                if let Some(e) = inner.cursors.get_mut(cid) {
+                    e.dropped = true;
+                }
+            } else {
+                inner.cursors.remove(cid);
+            }
         }
-        doomed.len()
+        affected.len()
+    }
+
+    /// Remember the token of the last event handed to the client, so a later
+    /// empty batch can re-emit it instead of rewinding to a positional
+    /// high-water mark.
+    pub fn remember_last_token(&self, cursor_id: i64, tok: &Bson) {
+        if let Some(d) = tok.as_document() {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(e) = inner.cursors.get_mut(&cursor_id) {
+                e.last_token = Some(d.clone());
+            }
+        }
+    }
+
+    /// The last event token handed to this cursor's client, if any.
+    pub fn last_token(&self, cursor_id: i64) -> Option<Bson> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .cursors
+            .get(&cursor_id)
+            .and_then(|e| e.last_token.clone())
+            .map(Bson::Document)
+    }
+
+    /// Whether this cursor was tombstoned by a drop/rename of its collection.
+    pub fn was_dropped(&self, cursor_id: i64) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.cursors.get(&cursor_id).is_some_and(|e| e.dropped)
     }
 
     /// Mark a cursor invalidated (a blocked tailable getMore wakes and ends).
@@ -503,11 +606,11 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .and_then(as_i64)
         .ok_or_else(|| CommandError::new(2, "BadValue", "getMore requires a cursor id"))?;
     let coll = doc.get("collection").and_then(Bson::as_str).unwrap_or("");
-    let batch_size = doc
-        .get("batchSize")
-        .and_then(as_i64)
-        .filter(|&b| b > 0)
-        .unwrap_or(DEFAULT_BATCH_SIZE as i64);
+    // Tri-state like `find`'s, but the absent-default differs: mongod's 101
+    // applies only to the FIRST batch — an unspecified getMore batchSize means
+    // "fill up to 16MB". Only the tailable path keeps the small default (its
+    // events arrive incrementally off the oplog).
+    let batch_size = doc.get("batchSize").and_then(as_i64).filter(|&b| b > 0);
     let ns = format!("{}.{}", ctx.db_name, coll);
     let cursors = ctx.cursors()?;
 
@@ -519,6 +622,21 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // else we answer CursorNotFound (don't confirm cursor ids across conns).
     if !info.namespace.is_empty() && ns != info.namespace {
         return Ok(cursor_not_found(cursor_id));
+    }
+    // The collection was dropped out from under a plain tailable cursor: say so
+    // before anything else, since any buffered rows are stale. mongod kills the
+    // plan executor with QueryPlanKilled (175) and names the namespace;
+    // mongo-php-driver's `cursor-tailable_error-001` asserts the message
+    // mentions "collection dropped" rather than a bare CursorNotFound, which
+    // wouldn't tell a tailing client why its tail ended.
+    if cursors.was_dropped(cursor_id) {
+        cursors.kill(&[cursor_id]);
+        return Ok(CommandError::new(
+            175,
+            "QueryPlanKilled",
+            format!("collection dropped: {}", info.namespace),
+        )
+        .into_reply());
     }
     if info.tailable {
         let storage = ctx.storage()?;
@@ -534,7 +652,9 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let mut closed;
         let mut fatal;
         loop {
-            match cursors.tailable_next_batch(cursor_id, batch_size) {
+            match cursors
+                .tailable_next_batch(cursor_id, batch_size.unwrap_or(DEFAULT_BATCH_SIZE as i64))
+            {
                 Ok((b, p, c, f)) => {
                     batch = b;
                     position = p;
@@ -567,39 +687,68 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             return Ok(err.into_reply());
         }
 
-        // postBatchResumeToken: the last event's token, or — on an empty batch —
-        // a high-water-mark token at the current position so the client can
-        // resume past this quiet getMore.
-        let pbrt = post_batch_resume_token(&batch).or_else(|| {
-            let bytes = storage.high_water_mark_token(position);
-            if bytes.is_empty() {
-                None
-            } else {
-                Document::from_reader(&mut bytes.as_slice())
-                    .ok()
-                    .map(Bson::Document)
+        // postBatchResumeToken: the last event's token when this batch carried
+        // events. On an EMPTY batch a high-water-mark token lets a client resume
+        // past a quiet getMore — but only if it is actually newer than the last
+        // event we delivered. mongod does not rewind: when nothing has happened
+        // since the last event, the token stays that event's, and mongocxx's
+        // "must continuously track the last seen resumeToken" asserts exactly
+        // that (its final read is empty and must still equal the previous
+        // token). Emitting a fresh high-water token there replaced a real token
+        // — carrying its `ns` and `documentKey` — with a positional one whose
+        // both fields are empty.
+        let pbrt = match post_batch_resume_token(&batch) {
+            Some(tok) => {
+                cursors.remember_last_token(cursor_id, &tok);
+                Some(tok)
             }
-        });
+            None => {
+                let bytes = storage.high_water_mark_token(position);
+                let hwm = if bytes.is_empty() {
+                    None
+                } else {
+                    Document::from_reader(&mut bytes.as_slice())
+                        .ok()
+                        .map(Bson::Document)
+                };
+                match (hwm, cursors.last_token(cursor_id)) {
+                    // Only move forward: a high-water mark at or behind the
+                    // last delivered event would rewind the client's token.
+                    (Some(h), Some(l)) if token_seq(&h) > token_seq(&l) => Some(h),
+                    (_, Some(l)) => Some(l),
+                    (h, None) => h,
+                }
+            }
+        };
         let mut cursor_doc = doc! {
-            "nextBatch": docs_to_bson(batch)?,
             "id": Bson::Int64(if closed { 0 } else { cursor_id }),
             "ns": ns,
         };
         if let Some(tok) = pbrt {
             cursor_doc.insert("postBatchResumeToken", tok);
         }
+        // Raw splice, same as the plain getMore below: the event blobs go to
+        // the wire encoder undecoded. The postBatchResumeToken only ever
+        // needed the LAST blob (`post_batch_resume_token`), so nothing here
+        // requires materialising the whole batch any more; the splice keeps
+        // the exact old field order (nextBatch, id, ns, postBatchResumeToken).
+        ctx.pending_batch = Some(crate::PendingBatch {
+            batch_field: "nextBatch",
+            batch,
+        });
         return Ok(doc! { "cursor": cursor_doc, "ok": 1.0 });
     }
 
-    let (batch, exhausted) = match cursors.next_batch(cursor_id, batch_size) {
-        Ok(x) => x,
-        Err(_) => return Ok(cursor_not_found(cursor_id)),
-    };
+    let (batch, exhausted) =
+        match cursors.next_batch(cursor_id, batch_size.unwrap_or(0), MAX_GETMORE_BATCH_BYTES) {
+            Ok(x) => x,
+            Err(_) => return Ok(cursor_not_found(cursor_id)),
+        };
     // The registry already holds the batch as pre-encoded blobs; hand them to
     // the server (`ctx.pending_batch`) to splice onto the wire without the
     // decode→re-encode round-trip `docs_to_bson` would cost. The reply carries
-    // only the cursor envelope. (The tailable branch above keeps materialising
-    // because it computes a `postBatchResumeToken` from the decoded batch.)
+    // only the cursor envelope. (The tailable branch above splices the same
+    // way; its postBatchResumeToken decodes only the last blob.)
     ctx.pending_batch = Some(crate::PendingBatch {
         batch_field: "nextBatch",
         batch,
@@ -661,6 +810,24 @@ fn int64_array(ids: Vec<i64>) -> Vec<Bson> {
 /// PBRT then; pymongo falls back to the last seen event's `_id`, which is
 /// correct when no new events were delivered. Empty-batch high-water-mark
 /// advancement (and noop-heartbeat tracking) is R3b-b.
+/// The `s` (oplog seq) inside a `{"_data": "<hex>"}` resume token, or -1 when it
+/// can't be read — an unreadable token must never look newer than a real one.
+fn token_seq(tok: &Bson) -> i64 {
+    let Some(d) = tok.as_document() else {
+        return -1;
+    };
+    let Ok(hex) = d.get_str("_data") else {
+        return -1;
+    };
+    let bytes: Vec<u8> = (0..hex.len() / 2)
+        .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+        .collect();
+    Document::from_reader(&mut bytes.as_slice())
+        .ok()
+        .and_then(|d| d.get_i64("s").ok())
+        .unwrap_or(-1)
+}
+
 fn post_batch_resume_token(batch: &[Vec<u8>]) -> Option<Bson> {
     let last = batch.last()?;
     let doc = Document::from_reader(&mut last.as_slice()).ok()?;
@@ -694,18 +861,21 @@ mod tests {
         let docs: Vec<Vec<u8>> = (0..5).map(|i| enc(&doc! {"_id": i})).collect();
         let id = reg.register("t.c", docs).unwrap();
         assert_eq!(reg.len(), 1);
-        let (b1, ex1) = reg.next_batch(id, 2).unwrap();
+        let (b1, ex1) = reg.next_batch(id, 2, usize::MAX).unwrap();
         assert_eq!(b1.len(), 2);
         assert!(!ex1);
-        let (b2, ex2) = reg.next_batch(id, 2).unwrap();
+        let (b2, ex2) = reg.next_batch(id, 2, usize::MAX).unwrap();
         assert_eq!(b2.len(), 2);
         assert!(!ex2);
-        let (b3, ex3) = reg.next_batch(id, 2).unwrap();
+        let (b3, ex3) = reg.next_batch(id, 2, usize::MAX).unwrap();
         assert_eq!(b3.len(), 1);
         assert!(ex3, "exhausted on the final partial batch");
         // Exhausted non-tailable cursor is gone.
         assert_eq!(reg.len(), 0);
-        assert_eq!(reg.next_batch(id, 2), Err(CursorError::NotFound(id)));
+        assert_eq!(
+            reg.next_batch(id, 2, usize::MAX),
+            Err(CursorError::NotFound(id))
+        );
     }
 
     #[test]
@@ -713,9 +883,31 @@ mod tests {
         let reg = CursorRegistry::new();
         let docs: Vec<Vec<u8>> = (0..3).map(|i| enc(&doc! {"_id": i})).collect();
         let id = reg.register("t.c", docs).unwrap();
-        let (b, ex) = reg.next_batch(id, 0).unwrap();
+        let (b, ex) = reg.next_batch(id, 0, usize::MAX).unwrap();
         assert_eq!(b.len(), 3);
         assert!(ex);
+    }
+
+    #[test]
+    fn byte_budget_caps_a_batch_but_always_makes_progress() {
+        let reg = CursorRegistry::new();
+        let docs: Vec<Vec<u8>> = (0..4)
+            .map(|i| enc(&doc! {"_id": i, "pad": "x".repeat(100)}))
+            .collect();
+        let per_doc = docs[0].len();
+        let id = reg.register("t.c", docs).unwrap();
+        // Budget for two docs: the drain stops before the third.
+        let (b1, ex1) = reg.next_batch(id, 0, per_doc * 2).unwrap();
+        assert_eq!(b1.len(), 2);
+        assert!(!ex1);
+        // A budget smaller than one document still yields one doc (progress).
+        let (b2, ex2) = reg.next_batch(id, 0, 1).unwrap();
+        assert_eq!(b2.len(), 1);
+        assert!(!ex2);
+        // Explicit count limit still byte-capped.
+        let (b3, ex3) = reg.next_batch(id, 5, per_doc).unwrap();
+        assert_eq!(b3.len(), 1);
+        assert!(ex3);
     }
 
     #[test]
@@ -757,7 +949,7 @@ mod tests {
             .unwrap();
         assert!(id > (1i64 << 32));
         // Draining a tailable cursor never exhausts/removes it.
-        let (b, ex) = reg.next_batch(id, 10).unwrap();
+        let (b, ex) = reg.next_batch(id, 10, usize::MAX).unwrap();
         assert!(b.is_empty());
         assert!(!ex);
         assert_eq!(reg.len(), 1);
@@ -845,7 +1037,10 @@ mod tests {
         // Advance past the TTL; the next operation prunes it.
         *clock.lock().unwrap_or_else(|e| e.into_inner()) = 1000.0;
         assert_eq!(reg.len(), 0);
-        assert_eq!(reg.next_batch(id, 1), Err(CursorError::NotFound(id)));
+        assert_eq!(
+            reg.next_batch(id, 1, usize::MAX),
+            Err(CursorError::NotFound(id))
+        );
     }
 
     #[test]
@@ -964,5 +1159,144 @@ mod tests {
             &vec![Bson::Int64(42)]
         );
         assert_eq!(reg.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod drop_tombstone_tests {
+    use super::*;
+
+    struct Noop;
+    impl CursorProducer for Noop {
+        fn produce(&mut self) -> Vec<Vec<u8>> {
+            vec![]
+        }
+        fn position(&self) -> i64 {
+            0
+        }
+        fn invalidated(&self) -> bool {
+            false
+        }
+    }
+
+    fn tailable(reg: &CursorRegistry, ns: &str, change_stream: bool) -> i64 {
+        reg.register_tailable(
+            ns,
+            Box::new(Noop),
+            TailableOptions {
+                change_stream,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// A plain tail is tombstoned, not removed: the next getMore has to be able
+    /// to say *why* the tail ended. mongo-php-driver's
+    /// `cursor-tailable_error-001` asserts on "collection dropped", which a
+    /// bare CursorNotFound cannot convey.
+    #[test]
+    fn a_dropped_collection_tombstones_a_plain_tailable_cursor() {
+        let reg = CursorRegistry::new();
+        let cid = tailable(&reg, "t.c", false);
+        assert_eq!(reg.kill_namespace("t.c"), 1);
+        assert!(
+            reg.was_dropped(cid),
+            "the entry must survive, flagged dropped"
+        );
+        assert!(reg.info(cid).is_ok(), "tombstoned, not removed");
+    }
+
+    /// A non-tailable cursor is removed outright — a later getMore is
+    /// CursorNotFound (mongo-c-driver's `error_document/getmore`).
+    #[test]
+    fn a_dropped_collection_removes_a_non_tailable_cursor() {
+        let reg = CursorRegistry::new();
+        let cid = reg.register("t.c", vec![vec![1, 2, 3]]).unwrap();
+        assert_eq!(reg.kill_namespace("t.c"), 1);
+        assert!(reg.info(cid).is_err(), "removed, not tombstoned");
+        assert!(!reg.was_dropped(cid));
+    }
+
+    /// Change streams are left alone: they signal a drop through their own
+    /// final `invalidate` event, and a tombstone would replace that event with
+    /// an error.
+    #[test]
+    fn a_dropped_collection_leaves_change_streams_alone() {
+        let reg = CursorRegistry::new();
+        let cid = tailable(&reg, "t.c", true);
+        assert_eq!(
+            reg.kill_namespace("t.c"),
+            0,
+            "change streams are not counted"
+        );
+        assert!(!reg.was_dropped(cid), "no tombstone on a change stream");
+        assert!(reg.info(cid).is_ok(), "and it stays alive");
+    }
+
+    /// Only the dropped namespace is affected.
+    #[test]
+    fn other_namespaces_are_untouched() {
+        let reg = CursorRegistry::new();
+        let other = tailable(&reg, "t.other", false);
+        assert_eq!(reg.kill_namespace("t.c"), 0);
+        assert!(!reg.was_dropped(other));
+    }
+}
+
+#[cfg(test)]
+mod exhaustion_parity_tests {
+    use super::*;
+
+    fn blobs(n: usize) -> Vec<Vec<u8>> {
+        (0..n).map(|i| vec![i as u8; 4]).collect()
+    }
+
+    fn reg() -> CursorRegistry {
+        CursorRegistry::new()
+    }
+
+    /// A batch that exactly fills the request proves nothing about what follows,
+    /// so mongod keeps the cursor open for one more empty getMore.
+    #[test]
+    fn exact_fill_keeps_an_unbounded_cursor_open() {
+        let r = reg();
+        let id = r.register("db.c", blobs(4)).unwrap();
+        let (b1, done1) = r.next_batch(id, 2, usize::MAX).unwrap();
+        assert_eq!((b1.len(), done1), (2, false));
+        let (b2, done2) = r.next_batch(id, 2, usize::MAX).unwrap();
+        assert_eq!((b2.len(), done2), (2, false), "exact fill must not close");
+        let (b3, done3) = r.next_batch(id, 2, usize::MAX).unwrap();
+        assert_eq!((b3.len(), done3), (0, true), "trailing empty batch closes");
+    }
+
+    /// A short batch tells the client it is finished, so no extra round trip.
+    #[test]
+    fn short_batch_closes_immediately() {
+        let r = reg();
+        let id = r.register("db.c", blobs(3)).unwrap();
+        assert!(!r.next_batch(id, 2, usize::MAX).unwrap().1);
+        let (b2, done2) = r.next_batch(id, 2, usize::MAX).unwrap();
+        assert_eq!((b2.len(), done2), (1, true));
+    }
+
+    /// `limit` / `singleBatch` / catalog enumerations make the size knowable.
+    #[test]
+    fn bounded_cursor_closes_on_exact_fill() {
+        let r = reg();
+        let id = r.register_bounded("db.c", blobs(4), true).unwrap();
+        assert!(!r.next_batch(id, 2, usize::MAX).unwrap().1);
+        let (b2, done2) = r.next_batch(id, 2, usize::MAX).unwrap();
+        assert_eq!((b2.len(), done2), (2, true), "bounded must close on drain");
+    }
+
+    /// A non-positive batchSize means "server default" -- no size was asked
+    /// for, so mongod drains AND closes.
+    #[test]
+    fn unspecified_batch_size_drains_and_closes() {
+        let r = reg();
+        let id = r.register("db.c", blobs(3)).unwrap();
+        let (batch, done) = r.next_batch(id, 0, usize::MAX).unwrap();
+        assert_eq!((batch.len(), done), (3, true));
     }
 }

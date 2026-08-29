@@ -20,7 +20,7 @@
 //!
 //! **GIL discipline:** each `#[pyfunction]` decodes its BSON arguments while
 //! holding the GIL (the byte slices borrow Python buffers), then runs the pure
-//! Rust compute inside `Python::allow_threads` so concurrent callers don't
+//! Rust compute inside `Python::detach` (0.29 renamed `allow_threads`) so concurrent callers don't
 //! serialise on it. See `benchmarks/` for the throughput characterisation (the
 //! win is large single-threaded; multi-core scaling needs the per-doc seams
 //! batched — coarse calls like `apply_pipeline` already benefit).
@@ -47,7 +47,7 @@ fn unwrap_value(doc_bytes: &[u8]) -> PyResult<bson::Bson> {
 }
 
 fn to_pybytes(py: Python<'_>, bytes: Vec<u8>) -> Py<PyBytes> {
-    PyBytes::new_bound(py, &bytes).unbind()
+    PyBytes::new(py, &bytes).unbind()
 }
 
 /// Encode a document to BSON bytes inside a GIL-released closure (returns a
@@ -72,7 +72,7 @@ fn sortkey_encode_value(
 ) -> PyResult<Option<Py<PyBytes>>> {
     let value = unwrap_value(doc_bytes)?;
     let coll = parse_collation(collation_bytes)?;
-    let out = py.allow_threads(|| sortkey::encode_value(&value, coll.as_ref()).ok());
+    let out = py.detach(|| sortkey::encode_value(&value, coll.as_ref()).ok());
     Ok(out.map(|b| to_pybytes(py, b)))
 }
 
@@ -86,8 +86,7 @@ fn sortkey_encode_value_directed(
 ) -> PyResult<Option<Py<PyBytes>>> {
     let value = unwrap_value(doc_bytes)?;
     let coll = parse_collation(collation_bytes)?;
-    let out =
-        py.allow_threads(|| sortkey::encode_value_directed(&value, direction, coll.as_ref()).ok());
+    let out = py.detach(|| sortkey::encode_value_directed(&value, direction, coll.as_ref()).ok());
     Ok(out.map(|b| to_pybytes(py, b)))
 }
 
@@ -117,7 +116,7 @@ fn query_matches(
     let coll = parse_collation(collation_bytes)?;
     // Ok(b) -> Some(b) (a real result); Err(Fallback) -> None (defer to Python).
     // The match runs with the GIL released so concurrent callers parallelise.
-    Ok(py.allow_threads(|| query::matches(&doc, &query, &vars, coll.as_ref()).ok()))
+    Ok(py.detach(|| query::matches(&doc, &query, &vars, coll.as_ref()).ok()))
 }
 
 /// `query.matches_raw` — the raw-BSON matcher, over the same BSON bytes. The
@@ -141,7 +140,7 @@ fn query_matches_raw(
     let coll = parse_collation(collation_bytes)?;
     let raw = bson::RawDocument::from_bytes(doc_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
-    Ok(py.allow_threads(|| query::matches_raw(raw, &query, &vars, coll.as_ref()).ok()))
+    Ok(py.detach(|| query::matches_raw(raw, &query, &vars, coll.as_ref()).ok()))
 }
 
 /// Batched `query.matches`: one call filters a whole candidate list under a
@@ -178,7 +177,7 @@ fn query_matches_batch(
         }
     }
     let out = py
-        .allow_threads(move || {
+        .detach(move || {
             let mut flags: Vec<Bson> = Vec::with_capacity(docs.len());
             for doc in &docs {
                 match query::matches(doc, &query, &vars, coll.as_ref()) {
@@ -215,7 +214,7 @@ fn evaluate(
         .get("e")
         .ok_or_else(|| PyValueError::new_err("expr wrapper missing key 'e'"))?;
     let out = py
-        .allow_threads(|| match expressions::evaluate(&doc, expr, &vars) {
+        .detach(|| match expressions::evaluate(&doc, expr, &vars) {
             Ok(value) => {
                 let mut wrap = Document::new();
                 wrap.insert("r".to_string(), value);
@@ -245,7 +244,7 @@ fn apply_update(
     let update: Document = bson::from_slice(update_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid update BSON: {e}")))?;
     let out = py
-        .allow_threads(|| match update::apply_update(&doc, &update, is_upsert) {
+        .detach(|| match update::apply_update(&doc, &update, is_upsert) {
             Ok(new) => encode_doc(&new).map(Some),
             Err(update::Fallback) => Ok(None),
         })
@@ -280,7 +279,7 @@ fn apply_update_with(
     let pos: Document = bson::from_slice(positional_matches_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid positionalMatches BSON: {e}")))?;
     let out = py
-        .allow_threads(|| {
+        .detach(|| {
             match update::apply_update_with(&doc, &update, is_upsert, &array_filters, &pos) {
                 Ok(new) => encode_doc(&new).map(Some),
                 Err(update::Fallback) => Ok(None),
@@ -316,7 +315,7 @@ fn apply_update_batch(
         }
     }
     let out = py
-        .allow_threads(move || {
+        .detach(move || {
             let mut results: Vec<Bson> = Vec::with_capacity(docs.len());
             for doc in &docs {
                 match update::apply_update(doc, &update, is_upsert) {
@@ -348,7 +347,7 @@ fn apply_projection(
         .map_err(|e| PyValueError::new_err(format!("invalid spec BSON: {e}")))?;
     let query = decode_optional_query(query_bytes)?;
     let out = py
-        .allow_threads(
+        .detach(
             || match projection::apply_projection(&doc, &spec, query.as_ref()) {
                 Ok(out) => encode_doc(&out).map(Some),
                 Err(projection::Fallback) => Ok(None),
@@ -438,7 +437,7 @@ fn apply_projection_batch(
         }
     }
     let out = py
-        .allow_threads(move || {
+        .detach(move || {
             let mut results: Vec<Bson> = Vec::with_capacity(docs.len());
             for doc in &docs {
                 match projection::apply_projection(doc, &spec, query.as_ref()) {
@@ -468,7 +467,7 @@ fn compute_update_description(
     let post: Document = bson::from_slice(post_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid post BSON: {e}")))?;
     let out = py
-        .allow_threads(|| match diff::compute_update_description(&pre, &post) {
+        .detach(|| match diff::compute_update_description(&pre, &post) {
             Ok(out) => encode_doc(&out).map(Some),
             Err(diff::Fallback) => Ok(None),
         })
@@ -491,7 +490,7 @@ fn apply_update_description(
     let diff: Document = bson::from_slice(diff_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid diff BSON: {e}")))?;
     let out = py
-        .allow_threads(|| match diff::apply_update_description(doc, &diff) {
+        .detach(|| match diff::apply_update_description(doc, &diff) {
             Ok(out) => encode_doc(&out).map(Some),
             Err(diff::Fallback) => Ok(None),
         })
@@ -537,8 +536,8 @@ fn apply_pipeline(
     // The whole pipeline runs with the GIL released; only the BSON decode above
     // and the PyBytes build below need it.
     let out = py
-        .allow_threads(move || {
-            match aggregate::apply_pipeline(docs, pipeline, &vars, coll.as_ref()) {
+        .detach(
+            move || match aggregate::apply_pipeline(docs, pipeline, &vars, coll.as_ref()) {
                 Ok(out) => {
                     let mut wrap = Document::new();
                     wrap.insert(
@@ -548,8 +547,8 @@ fn apply_pipeline(
                     encode_doc(&wrap).map(Some)
                 }
                 Err(aggregate::Fallback) => Ok(None),
-            }
-        })
+            },
+        )
         .map_err(PyValueError::new_err)?;
     Ok(out.map(|b| to_pybytes(py, b)))
 }

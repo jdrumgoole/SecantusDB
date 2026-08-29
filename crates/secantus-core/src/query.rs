@@ -653,6 +653,19 @@ fn eq_scalar(v: &Bson, expected: &Bson, coll: Option<&Collation>) -> R {
     if let (Bson::Boolean(a), Bson::Boolean(b)) = (v, expected) {
         return Ok(a == b);
     }
+    // NaN equals NaN for query purposes. IEEE says otherwise, and both
+    // `fast_eq` and `numeric::eq` follow IEEE — correctly, because they also
+    // drive ordering, where NaN must stay incomparable. Equality is the one
+    // place mongod differs: it matches `{x: NaN}` against a stored NaN (probed
+    // against 6.0.16). Without this a document written with `_id: NaN` is
+    // accepted and then unreachable by its own key. Mirrors
+    // `query.py::_eq_numeric_aware`.
+    if is_nan_bson(v) && is_nan_bson(expected) {
+        return Ok(true);
+    }
+    if let Some(r) = numeric::fast_eq(v, expected) {
+        return Ok(r);
+    }
     if let (Some(na), Some(nb)) = (numeric::classify(v), numeric::classify(expected)) {
         return Ok(numeric::eq(&na, &nb));
     }
@@ -734,6 +747,9 @@ fn compare_values(
             (Bson::Boolean(x), Bson::Boolean(y)) => Some(x.cmp(y)),
             _ => None,
         });
+    }
+    if let Some(r) = numeric::fast_cmp(a, b) {
+        return Ok(r);
     }
     if let (Some(na), Some(nb)) = (numeric::classify(a), numeric::classify(b)) {
         return Ok(numeric::cmp(&na, &nb));
@@ -1824,6 +1840,21 @@ fn op_bits(values: &[Option<&Bson>], arg: &Bson, pred: fn(u64, u64) -> bool) -> 
     Ok(false)
 }
 
+/// A float or Decimal128 NaN. Used only by equality — ordering keeps IEEE
+/// semantics, where NaN is incomparable with everything including itself.
+fn is_nan_bson(b: &Bson) -> bool {
+    match b {
+        Bson::Double(d) => d.is_nan(),
+        // Decimal128's NaN is a bit pattern, not a value we can compare; parse
+        // its string form, which is what the bson crate exposes portably.
+        Bson::Decimal128(d) => {
+            let s = d.to_string();
+            s.eq_ignore_ascii_case("nan") || s.eq_ignore_ascii_case("-nan")
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1843,6 +1874,29 @@ mod tests {
             "matches_raw disagreed with matches for doc={doc:?} query={query:?}"
         );
         owned
+    }
+
+    #[test]
+    fn nan_equals_nan_for_equality_but_not_ordering() {
+        // mongod matches `{x: NaN}` against a stored NaN (probed against
+        // 6.0.16). Without this, a document written with `_id: NaN` is accepted
+        // and then unreachable by its own key.
+        assert!(m(doc! {"x": f64::NAN}, doc! {"x": f64::NAN}));
+        assert!(m(doc! {"_id": f64::NAN}, doc! {"_id": f64::NAN}));
+
+        // No false positives in either direction.
+        assert!(!m(doc! {"x": f64::NAN}, doc! {"x": 1}));
+        assert!(!m(doc! {"x": 5}, doc! {"x": f64::NAN}));
+        assert!(!m(doc! {"x": f64::NAN}, doc! {"x": f64::INFINITY}));
+
+        // Infinity compares fine under IEEE and must be untouched.
+        assert!(m(doc! {"x": f64::INFINITY}, doc! {"x": f64::INFINITY}));
+        assert!(!m(doc! {"x": f64::INFINITY}, doc! {"x": f64::NEG_INFINITY}));
+
+        // The rule is confined to equality: NaN stays incomparable for ranges,
+        // which is what keeps sort order IEEE-correct.
+        assert!(!m(doc! {"x": f64::NAN}, doc! {"x": {"$gt": f64::NAN}}));
+        assert!(!m(doc! {"x": f64::NAN}, doc! {"x": {"$lt": 0}}));
     }
 
     #[test]

@@ -164,6 +164,8 @@ struct Shared {
     transactions: Arc<secantus_commands::transactions::TransactionRegistry>,
     /// Server-wide `configureFailPoint` registry, shared across connections.
     failpoints: Arc<secantus_commands::failpoints::FailPointRegistry>,
+    /// Server-wide per-namespace operation accounting, reported by `top`.
+    top_stats: Arc<secantus_commands::topstats::TopStats>,
     address: SocketAddr,
     next_conn_id: AtomicI64,
     next_reply_id: AtomicI64,
@@ -377,6 +379,7 @@ pub fn bind(
         cursors,
         transactions,
         failpoints: Arc::new(secantus_commands::failpoints::FailPointRegistry::new()),
+        top_stats: Arc::new(secantus_commands::topstats::TopStats::new()),
         address,
         next_conn_id: AtomicI64::new(1),
         next_reply_id: AtomicI64::new(1),
@@ -402,6 +405,15 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     while !shared.stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _peer)) => {
+                // Disable Nagle: reply paths write small frames back-to-back
+                // and with Nagle on the second write waits for the peer's
+                // delayed ACK — ~40ms per round trip on Linux CI, invisible
+                // on macOS loopback. The Python servers' identical fix took
+                // pgjdbc's generated-keys batch tests from 41.5s to 0.2s
+                // each; mongod and PostgreSQL both set TCP_NODELAY
+                // unconditionally. Best-effort: a failed setsockopt on an
+                // already-dying socket must not kill the accept loop.
+                let _ = stream.set_nodelay(true);
                 let conn_shared = shared.clone();
                 // Counter Arc is independent of `Shared`, so the guard can outlive
                 // `conn_shared`'s drop (which releases this thread's storage ref).
@@ -565,7 +577,7 @@ fn serve<S: Read + Write>(
                         continue;
                     }
                 };
-                let (mut reply, close_conn, pending) = run_dispatch(
+                let (reply, close_conn, pending) = run_dispatch(
                     &request,
                     raw_insert_docs,
                     conn_id,
@@ -590,12 +602,8 @@ fn serve<S: Read + Write>(
                     && request.contains_key("getMore")
                     && matches!(reply.get("cursor"), Some(Bson::Document(_)))
                 {
-                    // The exhaust streamer reframes the batch array in the reply
-                    // document, so materialise the pending blobs back into it
-                    // (the normal path below splices them straight onto the wire).
-                    if let Some(pb) = pending {
-                        materialize_batch(&mut reply, pb);
-                    }
+                    // The streamer splices pending blobs straight onto the
+                    // wire per frame — no decode→re-encode of the batch.
                     if !stream_exhaust_getmore(
                         stream,
                         &header,
@@ -605,6 +613,7 @@ fn serve<S: Read + Write>(
                         conn_auth,
                         &peer_cert_dn,
                         reply,
+                        pending,
                     )? {
                         return Ok(());
                     }
@@ -844,6 +853,7 @@ fn run_dispatch(
     // and reply with a wire-level `InternalError` instead of letting the panic
     // unwind the connection thread and drop the socket with no reply — matching
     // the Python server's dispatch-level catch-all.
+    let started = std::time::Instant::now();
     let reply =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(request, &mut ctx)))
             .unwrap_or_else(|_| {
@@ -854,38 +864,26 @@ fn run_dispatch(
                 d.insert("codeName", "InternalError");
                 d
             });
+    // `top` accounting. Only commands that name a collection are attributed to
+    // a namespace -- `ping` / `hello` / `serverStatus` / `listCollections`
+    // never appear in mongod's `top` output either.
+    if let Some(name) = request.keys().next() {
+        if let Some(coll) = secantus_commands::topstats::namespace_target(name, request) {
+            let ns = format!("{}.{}", ctx.db_name, coll);
+            let micros = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
+            shared.top_stats.record(&ns, name, micros);
+            // A successful drop resets the namespace's counters -- probed on
+            // mongod 8.3.4, where a dropped-and-recreated collection restarts
+            // from zero rather than carrying its history forward.
+            if name == "drop" && reply.get_f64("ok").unwrap_or(0.0) == 1.0 {
+                shared.top_stats.forget(&ns);
+            }
+        }
+    }
     // `pending_batch` is set by `find` / `getMore` to hand the reply's document
     // batch to the wire as pre-encoded blobs (spliced by `write_op_msg` /
     // `materialize_batch`) instead of an owned `Bson::Array` in the reply.
     (reply, ctx.close_connection, ctx.pending_batch.take())
-}
-
-/// Decode a `pending_batch`'s blobs into `reply.cursor.<field>` as an owned
-/// `Bson::Array` — the old `docs_to_bson` behaviour, relocated. Used by the
-/// exhaust-getMore streamer, whose framing logic inspects the batch array in the
-/// reply document (the normal reply path splices the blobs straight onto the
-/// wire and never materialises them). A blob that fails to decode is corruption
-/// (`this is a database`); log it loudly and drop that element rather than
-/// panicking mid-stream.
-fn materialize_batch(reply: &mut Document, pending: PendingBatch) {
-    let mut arr: Vec<Bson> = Vec::with_capacity(pending.batch.len());
-    for blob in &pending.batch {
-        match Document::from_reader(&mut &blob[..]) {
-            Ok(d) => arr.push(Bson::Document(d)),
-            Err(e) => {
-                eprintln!("secantus-server: cursor batch blob failed to decode (corruption?): {e}")
-            }
-        }
-    }
-    if let Ok(cursor) = reply.get_document_mut("cursor") {
-        // Batch field first, matching the handler's original layout.
-        let mut rebuilt = Document::new();
-        rebuilt.insert(pending.batch_field, arr);
-        for (k, v) in cursor.iter() {
-            rebuilt.insert(k, v.clone());
-        }
-        *cursor = rebuilt;
-    }
 }
 
 fn make_context(
@@ -901,7 +899,14 @@ fn make_context(
         .with_failpoints(shared.failpoints.clone())
         .with_conn_auth(conn_auth.clone())
         .with_conn_killer(shared.conn_killer.clone())
-        .with_logs(shared.logs.clone());
+        .with_logs(shared.logs.clone())
+        .with_top_stats(shared.top_stats.clone())
+        // `next_conn_id` starts at 1 and is bumped per accepted connection, so
+        // it is the lifetime total plus one; `conns` holds the live sockets.
+        .with_conn_stats(secantus_commands::ConnStats {
+            current: shared.conns.lock().map(|c| c.len() as i64).unwrap_or(0),
+            total_created: shared.next_conn_id.load(Ordering::SeqCst) - 1,
+        });
     ctx.server_address = Some((shared.address.ip().to_string(), shared.address.port()));
     ctx.replica_set_name = shared.config.replica_set_name.clone();
     ctx.require_auth = shared.config.require_auth;
@@ -989,6 +994,7 @@ fn stream_exhaust_getmore<S: Write>(
     conn_auth: &Arc<Mutex<ConnectionAuth>>,
     peer_cert_dn: &Option<String>,
     first_reply: Document,
+    first_pending: Option<PendingBatch>,
 ) -> io::Result<bool> {
     let target_id = match request.get("getMore") {
         Some(b) => b.clone(),
@@ -1003,51 +1009,90 @@ fn stream_exhaust_getmore<S: Write>(
         .map(str::to_string)
         .unwrap_or_else(|| format!("{db}.{coll}"));
 
-    let send = |stream: &mut S, doc: &Document, more: bool| -> io::Result<bool> {
+    // `pending` batches splice onto the wire undecoded (`cursor_or_plain_body`),
+    // exactly like the non-exhaust reply path.
+    let send = |stream: &mut S,
+                doc: &Document,
+                pending: Option<&PendingBatch>,
+                more: bool|
+     -> io::Result<bool> {
         let flags = if more { OP_MSG_FLAG_MORE_TO_COME } else { 0 };
-        match write_op_msg_flags(stream, header, shared, doc, flags) {
+        let body = cursor_or_plain_body(doc, pending)?;
+        let frame = build_op_msg_reply(header.request_id, next_reply_id(shared), &body, flags);
+        match stream.write_all(&frame) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false),
         }
     };
 
     let mut doc = first_reply;
+    let mut pending = first_pending;
     loop {
-        let cursor = match doc.get("cursor") {
-            Some(Bson::Document(c)) => c.clone(),
+        let (drained, batch_empty) = match doc.get("cursor") {
+            Some(Bson::Document(c)) => {
+                let empty = match &pending {
+                    Some(p) => p.batch.is_empty(),
+                    // Materialized fallback (a handler that didn't splice).
+                    None => c
+                        .get_array("nextBatch")
+                        .or_else(|_| c.get_array("firstBatch"))
+                        .map(|a| a.is_empty())
+                        .unwrap_or(true),
+                };
+                (c.get_i64("id").unwrap_or(0) == 0, empty)
+            }
             // An error reply (ok: 0) mid-stream — deliver it without moreToCome.
-            _ => return send(stream, &doc, false),
+            _ => return send(stream, &doc, None, false),
         };
-        let batch: Vec<Bson> = cursor
-            .get_array("nextBatch")
-            .or_else(|_| cursor.get_array("firstBatch"))
-            .cloned()
-            .unwrap_or_default();
-        let drained = cursor.get_i64("id").unwrap_or(0) == 0;
         if drained {
-            if !batch.is_empty()
-                && !send(
-                    stream,
-                    &doc! {"cursor": {"nextBatch": batch, "id": target_id.clone(), "ns": &ns}, "ok": 1.0},
-                    true,
-                )?
-            {
-                return Ok(false);
+            if !batch_empty {
+                // Re-advertise the ORIGINAL cursor id with this final batch
+                // (the exhaust protocol closes with a separate empty frame).
+                let sent = match pending.take() {
+                    Some(p) => send(
+                        stream,
+                        &doc! {"cursor": {"id": target_id.clone(), "ns": &ns}, "ok": 1.0},
+                        Some(&p),
+                        true,
+                    )?,
+                    None => {
+                        let batch: Vec<Bson> = doc
+                            .get_document("cursor")
+                            .ok()
+                            .and_then(|c| {
+                                c.get_array("nextBatch")
+                                    .or_else(|_| c.get_array("firstBatch"))
+                                    .ok()
+                            })
+                            .cloned()
+                            .unwrap_or_default();
+                        send(
+                            stream,
+                            &doc! {"cursor": {"nextBatch": batch, "id": target_id.clone(), "ns": &ns}, "ok": 1.0},
+                            None,
+                            true,
+                        )?
+                    }
+                };
+                if !sent {
+                    return Ok(false);
+                }
             }
             let empty: Vec<Bson> = Vec::new();
             return send(
                 stream,
                 &doc! {"cursor": {"nextBatch": empty, "id": 0i64, "ns": &ns}, "ok": 1.0},
+                None,
                 false,
             );
         }
-        if batch.is_empty() {
+        if batch_empty {
             // A live cursor that yielded nothing (tailable/awaitData wait expired):
             // deliver this empty batch without moreToCome and stop streaming so we
             // don't spin. Normal cursors never reach here (empty drains id to 0).
-            return send(stream, &doc, false);
+            return send(stream, &doc, pending.as_ref(), false);
         }
-        if !send(stream, &doc, true)? {
+        if !send(stream, &doc, pending.as_ref(), true)? {
             return Ok(false);
         }
         let mut getmore = doc! {"getMore": target_id.clone(), "collection": &coll, "$db": &db};
@@ -1057,13 +1102,10 @@ fn stream_exhaust_getmore<S: Write>(
         if let Some(mt) = request.get("maxTimeMS") {
             getmore.insert("maxTimeMS", mt.clone());
         }
-        let (mut reply, _close, pending) =
+        let (reply, _close, p) =
             run_dispatch(&getmore, None, conn_id, shared, conn_auth, peer_cert_dn);
-        // Reframe the next batch into the reply document for the exhaust streamer.
-        if let Some(pb) = pending {
-            materialize_batch(&mut reply, pb);
-        }
         doc = reply;
+        pending = p;
     }
 }
 

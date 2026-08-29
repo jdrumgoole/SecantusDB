@@ -438,6 +438,12 @@ def _resolve_path(doc: Any, path: str) -> list[Any]:
     return current
 
 
+# Operator-clause keys that ride alongside another operator rather than
+# being operators themselves (hoisted: this used to be rebuilt per doc
+# per clause inside _field_matches).
+_SIBLING_MODIFIERS = frozenset(("$options", "$maxDistance", "$minDistance"))
+
+
 def _field_matches(values: list[Any], condition: Any, collation: Collation | None = None) -> bool:
     if isinstance(condition, Regex):
         return _op_regex(values, condition.pattern, condition.flags)
@@ -449,7 +455,6 @@ def _field_matches(values: list[Any], condition: Any, collation: Collation | Non
         # bound lives at the sibling level (mongod's
         # ``{geo: {$near: [x, y], $maxDistance: r}}``). Skip them when
         # iterating; pull them in below when their parent op runs.
-        _SIBLING_MODIFIERS = frozenset(("$options", "$maxDistance", "$minDistance"))
         has_near = "$near" in condition or "$nearSphere" in condition
         # mongod validates the $regex / $options pair at parse time (BadValue /
         # 51108), before matching. $options is a sibling modifier of $regex.
@@ -578,10 +583,32 @@ def _eq_numeric_aware(a: Any, b: Any, collation: Collation | None = None) -> boo
     if isinstance(a, _dt.datetime) and isinstance(b, _dt.datetime):
         a2, b2 = _coerce_datetime(a, b)
         return a2 == b2
+    # NaN equals NaN for query purposes. IEEE says otherwise and Python follows
+    # IEEE, but mongod matches `{x: NaN}` against a stored NaN — probed against
+    # 6.0.16. Without this a document inserted with `_id: NaN` can never be found
+    # by its own `_id` again, which is the worst form of the bug: the write is
+    # accepted and the row is then unreachable by key. Checked BEFORE the
+    # `_coerce_numeric` early return below, which bails for two same-type floats
+    # and so never reached this.
+    if _is_nan(a) and _is_nan(b):
+        return True
     a2, b2 = _coerce_numeric(a, b)
     if a2 is a:
         return False
     return a2 == b2
+
+
+def _is_nan(v: Any) -> bool:
+    """True for a float or Decimal128 NaN, False for anything else."""
+    if isinstance(v, float):
+        return math.isnan(v)
+    to_dec = getattr(v, "to_decimal", None)
+    if to_dec is not None:
+        try:
+            return to_dec().is_nan()
+        except (ValueError, ArithmeticError):
+            return False
+    return False
 
 
 def _op_matches(values: list[Any], op: str, arg: Any, collation: Collation | None = None) -> bool:
@@ -783,8 +810,8 @@ def _parse_near_spec(
             cx, cy = geom["coordinates"]
             return (
                 (float(cx), float(cy)),
-                _opt_number(arg.get("$maxDistance"), "$maxDistance"),
-                _opt_number(arg.get("$minDistance"), "$minDistance"),
+                _opt_number(arg.get("$maxDistance", MISSING), "$maxDistance"),
+                _opt_number(arg.get("$minDistance", MISSING), "$minDistance"),
                 True,
                 False,  # GeoJSON form — distances are already in meters
             )
@@ -802,11 +829,11 @@ def _parse_near_spec(
         # from the siblings dict.
         if siblings is not None:
             if "$maxDistance" in siblings:
-                sibling_max = _opt_number(siblings["$maxDistance"], "$maxDistance")
+                sibling_max = _opt_number(siblings["$maxDistance"], "$maxDistance", code=16895)
                 if sibling_max is not None:
                     max_d = sibling_max
             if "$minDistance" in siblings:
-                min_d = _opt_number(siblings["$minDistance"], "$minDistance")
+                min_d = _opt_number(siblings["$minDistance"], "$minDistance", code=16893)
         # Legacy spec keeps the bound in its raw unit (input units for
         # ``$near``, radians-on-unit-sphere for ``$nearSphere``).
         # Conversion to the comparison currency (meters for spherical,
@@ -817,11 +844,30 @@ def _parse_near_spec(
     raise QueryError("$near must be a GeoJSON-shaped doc or a coordinate pair")
 
 
-def _opt_number(value: Any, label: str) -> float | None:
-    if value is None:
+def _opt_number(value: Any, label: str, code: int = 2) -> float | None:
+    """A ``$near`` distance bound, or ``None`` when the key is absent.
+
+    ``MISSING`` means the key was not supplied. An explicit ``null`` is NOT the
+    same thing -- probed on mongod 8.3.4, ``{$near: {..., $minDistance: null}}``
+    is rejected with ``$minDistance must be a number`` (code 2), where we used to
+    treat it as absent and run the query unbounded. Callers therefore pass
+    ``arg.get(key, MISSING)`` rather than ``arg.get(key)``.
+
+    Negative bounds are rejected too: mongod answers ``$minDistance must be
+    non-negative``. Strings and bools were already refused.
+
+    ``code`` differs by form, probed on mongod 8.3.4: the nested GeoJSON form
+    (``{$near: {$geometry: ..., $minDistance: x}}``) uses the generic BadValue
+    (2), while the legacy sibling form (``{geo: {$near: [x, y],
+    $maxDistance: x}}``) has dedicated codes -- 16895 for ``$maxDistance`` and
+    16893 for ``$minDistance``.
+    """
+    if value is MISSING:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise QueryError(f"{label} must be a number")
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise QueryError(f"{label} must be a number", code=code)
+    if value < 0:
+        raise QueryError(f"{label} must be non-negative", code=code)
     return float(value)
 
 

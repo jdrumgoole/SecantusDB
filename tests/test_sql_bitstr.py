@@ -199,3 +199,40 @@ def test_where_bitwise_mask(flags, session):
 
 def test_column_bitwise_in_select(flags, session):
     assert val(flags, session, "SELECT flags & b'00001111' FROM t WHERE id = 1") == "00001010"
+
+
+# --------------------------------------------------------------------------- #
+# Binary wire decode (pgextended._decode_varbit)
+# --------------------------------------------------------------------------- #
+
+
+def test_binary_varbit_decodes_to_bit_string():
+    import struct
+
+    from secantus.sql.pgextended import _decode_varbit
+
+    # 4-byte bit length + ceil(bits/8) data bytes → the '0'/'1' string.
+    assert _decode_varbit(struct.pack("!i", 4) + b"\xa0") == "1010"
+    assert _decode_varbit(struct.pack("!i", 0)) == ""
+
+
+def test_binary_varbit_empty_is_08P01():
+    from secantus.sql import errors
+    from secantus.sql.pgextended import _decode_varbit
+
+    # An empty binary param can't hold the 4-byte length header.
+    with pytest.raises(errors.SQLError) as e:
+        _decode_varbit(b"")
+    assert e.value.sqlstate == "08P01"
+
+
+def test_binary_varbit_trailing_bytes_is_22P03():
+    import struct
+
+    from secantus.sql import errors
+    from secantus.sql.pgextended import _decode_varbit
+
+    # bitlen=82 needs 11 bytes; 17 trailing bytes leave the buffer unconsumed.
+    with pytest.raises(errors.SQLError) as e:
+        _decode_varbit(struct.pack("!i", 82) + b"\x00" * 17)
+    assert e.value.sqlstate == "22P03"

@@ -74,7 +74,7 @@ fn unwrap_id(id_bytes: &[u8]) -> PyResult<Bson> {
 }
 
 fn bytes(py: Python<'_>, b: Vec<u8>) -> Py<PyBytes> {
-    PyBytes::new_bound(py, &b).unbind()
+    PyBytes::new(py, &b).unbind()
 }
 
 fn doc_list(py: Python<'_>, docs: Vec<Vec<u8>>) -> Vec<Py<PyBytes>> {
@@ -177,7 +177,7 @@ impl RustStorage {
             .map_err(to_pyerr)?;
         let err_bytes = errors
             .iter()
-            .map(|e| encode_doc(e))
+            .map(encode_doc)
             .collect::<PyResult<Vec<_>>>()?;
         Ok((
             inserted,
@@ -251,6 +251,7 @@ impl RustStorage {
     /// or a BSON key-spec). Results come back ordered / index-routed per
     /// `find_matching_with`.
     #[pyo3(signature = (db, coll, filter_bytes, sort_bytes=None, hint_name=None, hint_key_spec=None))]
+    #[allow(clippy::too_many_arguments)]
     fn find_matching_with(
         &self,
         py: Python<'_>,
@@ -315,6 +316,7 @@ impl RustStorage {
     /// Apply `update` (BSON) to documents matching `filter`. Returns a
     /// `{matched, modified, upserted_id?}` BSON document (`upserted_id` present
     /// only when an `upsert` inserted a doc).
+    #[allow(clippy::too_many_arguments)]
     fn update_matching(
         &self,
         py: Python<'_>,
@@ -340,6 +342,7 @@ impl RustStorage {
                 &Document::new(),
                 None,
                 None,
+                false,
             )
             .map_err(to_pyerr)?;
         let mut d = Document::new();
@@ -574,7 +577,7 @@ impl RustStorage {
     /// tail seq. The change-stream tailable `getMore` waits here instead of on a
     /// Python `threading.Condition`.
     fn wait_for_oplog(&self, py: Python<'_>, after_seq: i64, timeout_ms: u64) -> i64 {
-        py.allow_threads(|| self.inner.wait_for_oplog(after_seq, timeout_ms))
+        py.detach(|| self.inner.wait_for_oplog(after_seq, timeout_ms))
     }
 
     /// Wake every `wait_for_oplog` waiter without advancing the oplog (e.g. on
@@ -713,6 +716,6 @@ fn _secantus_storage(m: &Bound<'_, PyModule>) -> PyResult<()> {
          collections / documents / indexes / oplog, behind the BSON byte seam.",
     )?;
     m.add_class::<RustStorage>()?;
-    m.add("EngineFallback", m.py().get_type_bound::<EngineFallback>())?;
+    m.add("EngineFallback", m.py().get_type::<EngineFallback>())?;
     Ok(())
 }

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from secantus.sql import run_sql
+from secantus.sql import errors, run_sql
 from secantus.sql.session import Session
 from secantus.storage import Storage
 
@@ -462,3 +462,321 @@ def test_create_schema_and_qualified_types(storage, session):
     assert getattr(exc.value, "sqlstate", None) == "3F000"
     # DROP TYPE IF EXISTS tolerates the missing schema.
     run_sql(storage, "db", "drop type if exists testschema.testcomp cascade", session=session)
+
+
+# -- catalog builders are consistent under concurrent DDL --------------------- #
+
+
+class _RacingCatalog:
+    """A real ``Catalog`` that hides one existing table on its first listing.
+
+    That is what a builder sees when another session commits a ``CREATE TABLE``
+    mid-scan: the first enumeration (which assigns the OIDs) misses the table
+    and the second one returns it. The wrapper defers every lookup to the
+    genuine catalog, so each table still resolves against real storage.
+    """
+
+    def __init__(self, inner, hidden: str) -> None:
+        self._inner = inner
+        self._hidden = hidden
+        self.calls = 0
+
+    def list_tables(self, db: str):
+        self.calls += 1
+        names = list(self._inner.list_tables(db))
+        if self.calls == 1:
+            names = [n for n in names if n != self._hidden]
+        return names
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+@pytest.mark.parametrize(
+    "builder",
+    ["_pg_class", "_pg_attribute", "_pg_attrdef", "_pg_description", "_pg_index"],
+)
+def test_catalog_builders_survive_a_table_appearing_mid_scan(storage, session, builder):
+    """A builder that enumerates the tables twice — once for the OID map, once
+    for the rows — dies with a ``KeyError`` on a table the first pass never saw.
+    Each must take a single snapshot instead.
+    """
+    from secantus.sql import virtual
+    from secantus.sql.catalog import Catalog
+
+    q(storage, session, "CREATE TABLE seen (id int PRIMARY KEY, v text)")
+    q(storage, session, "CREATE TABLE create_and_drop_table (id int PRIMARY KEY, v text)")
+    racing = _RacingCatalog(Catalog(storage), "create_and_drop_table")
+    assert isinstance(getattr(virtual, builder)(DB, session, storage, racing), list)
+
+
+def test_max_index_keys_setting(storage, session):
+    # pgjdbc's getMaxIndexKeys reads this once per connection; every FK /
+    # primary-key metadata call errors if the row is absent.
+    res = q(
+        storage, session, "SELECT setting FROM pg_catalog.pg_settings WHERE name='max_index_keys'"
+    )
+    assert res.rows == [("32",)]
+
+
+def test_pg_proc_arg_mode_columns(storage, session):
+    # pgjdbc's getFunctionColumns selects proargmodes / proallargtypes; NULL is
+    # a valid value (no OUT params) but the columns must exist.
+    q(storage, session, "CREATE FUNCTION f1(int) RETURNS int AS 'SELECT 1' LANGUAGE sql")
+    res = q(
+        storage,
+        session,
+        "SELECT proargmodes, proallargtypes FROM pg_proc WHERE proname='f1'",
+    )
+    assert res.rows == [(None, None)]
+
+
+def test_pg_class_reltuples(storage, session):
+    # pgjdbc's getIndexInfo reads ci.reltuples as CARDINALITY; -1 is PG's
+    # "no estimate yet" initial value.
+    q(storage, session, "CREATE TABLE rt (a int PRIMARY KEY)")
+    res = q(storage, session, "SELECT reltuples FROM pg_class WHERE relname='rt'")
+    assert res.rows == [(-1.0,)]
+
+
+def test_join_order_by_computed_output_alias(storage, session):
+    # pgjdbc's getTables ORDER BY "TABLE_TYPE" names a computed (CASE) output
+    # alias; the evaluated-join planner must substitute the select expression
+    # (input-column resolution alone raises 42703).
+    q(storage, session, "CREATE TABLE ta (x int)")
+    q(storage, session, "CREATE TABLE tb (y int)")
+    q(storage, session, "INSERT INTO ta VALUES (1)")
+    q(storage, session, "INSERT INTO ta VALUES (2)")
+    q(storage, session, "INSERT INTO tb VALUES (1)")
+    q(storage, session, "INSERT INTO tb VALUES (2)")
+    res = q(
+        storage,
+        session,
+        "SELECT CASE a.x WHEN 1 THEN 'one' ELSE 'two' END AS \"AA\""
+        ' FROM ta a, tb b WHERE a.x = b.y ORDER BY "AA" DESC',
+    )
+    assert res.rows == [("two",), ("one",)]
+    # ordinals resolve the same way
+    res = q(
+        storage,
+        session,
+        "SELECT CASE a.x WHEN 1 THEN 'one' ELSE 'two' END"
+        " FROM ta a, tb b WHERE a.x = b.y ORDER BY 1",
+    )
+    assert res.rows == [("one",), ("two",)]
+
+
+def test_pgjdbc_get_tables_query_shape(storage, session):
+    # The structural skeleton of pgjdbc's getTables: comma-join + LEFT JOIN
+    # pg_description + CASE-computed "TABLE_TYPE" + quoted-alias ORDER BY.
+    q(storage, session, "CREATE TABLE mdt (id int4)")
+    q(storage, session, "COMMENT ON TABLE mdt IS 'a comment'")
+    res = q(
+        storage,
+        session,
+        'SELECT n.nspname AS "TABLE_SCHEM", c.relname AS "TABLE_NAME",'
+        " CASE c.relkind WHEN 'r' THEN 'TABLE' ELSE NULL END AS \"TABLE_TYPE\","
+        ' d.description AS "REMARKS"'
+        " FROM pg_catalog.pg_namespace n, pg_catalog.pg_class c"
+        " LEFT JOIN pg_catalog.pg_description d ON (c.oid = d.objoid"
+        " AND d.objsubid = 0 and d.classoid = 'pg_class'::regclass)"
+        " WHERE c.relnamespace = n.oid AND n.nspname LIKE 'public'"
+        " AND c.relkind = 'r'"
+        ' ORDER BY "TABLE_TYPE","TABLE_SCHEM","TABLE_NAME"',
+    )
+    assert res.rows == [("public", "mdt", "TABLE", "a comment")]
+
+
+def test_pg_constraint_fk_conindid_and_action_codes(storage, session):
+    # A foreign key's conindid points at the referenced table's PK index and
+    # carries the one-letter referential-action codes — pgjdbc's
+    # getImportedKeys joins pkic.oid = con.conindid and decodes
+    # confupdtype/confdeltype; conindid 0 silently empties the result.
+    q(storage, session, "CREATE TABLE pkt (a int, b int, PRIMARY KEY (a, b))")
+    q(
+        storage,
+        session,
+        "CREATE TABLE fkt (x int, y int, FOREIGN KEY (x, y) REFERENCES pkt (a, b)"
+        " ON DELETE CASCADE ON UPDATE SET NULL)",
+    )
+    res = q(
+        storage,
+        session,
+        "SELECT con.conindid, con.confupdtype, con.confdeltype, pkic.relname"
+        " FROM pg_constraint con, pg_class pkic"
+        " WHERE con.contype = 'f' AND pkic.oid = con.conindid",
+    )
+    assert res.rows == [(res.rows[0][0], "n", "c", "pkt_pkey")]
+
+
+def test_pgjdbc_get_imported_keys_shape(storage, session):
+    # The core of pgjdbc's getImportedKeys: position-joined conkey/confkey
+    # via generate_series, PK index join through conindid. Two rows for a
+    # two-column FK, KEY_SEQ 1 and 2.
+    q(storage, session, "CREATE TABLE pkt (a int, b int, PRIMARY KEY (a, b))")
+    q(storage, session, "CREATE TABLE fkt (x int, y int, FOREIGN KEY (x, y) REFERENCES pkt (a, b))")
+    res = q(
+        storage,
+        session,
+        "SELECT pka.attname, fka.attname, pos.n, con.conname, pkic.relname"
+        " FROM pg_catalog.pg_class pkc, pg_catalog.pg_attribute pka,"
+        " pg_catalog.pg_class fkc, pg_catalog.pg_attribute fka,"
+        " pg_catalog.pg_constraint con, pg_catalog.generate_series(1, 4) pos(n),"
+        " pg_catalog.pg_class pkic"
+        " WHERE pkc.oid = pka.attrelid AND pka.attnum = con.confkey[pos.n]"
+        " AND con.confrelid = pkc.oid"
+        " AND fkc.oid = fka.attrelid AND fka.attnum = con.conkey[pos.n]"
+        " AND con.conrelid = fkc.oid AND con.contype = 'f'"
+        " AND (pkic.relkind = 'i' OR pkic.relkind = 'I') AND pkic.oid = con.conindid"
+        " AND fkc.relname = 'fkt'"
+        " ORDER BY pos.n",
+    )
+    assert res.rows == [
+        ("a", "x", 1, "fkt_x_fkey", "pkt_pkey"),
+        ("b", "y", 2, "fkt_x_fkey", "pkt_pkey"),
+    ]
+
+
+def test_comment_on_domain_and_obj_description(storage, session):
+    # pgjdbc's getUDTs reads a domain's REMARKS via obj_description(oid,
+    # 'pg_type'); COMMENT ON DOMAIN arrives as a sqlglot Command fallback,
+    # including the IS NULL removal (rewritten to the uncomment sentinel).
+    q(storage, session, "CREATE DOMAIN testint8 AS int8")
+    assert q(storage, session, "comment on domain testint8 is 'jdbc123'").command_tag == "COMMENT"
+    res = q(
+        storage,
+        session,
+        "SELECT obj_description(t.oid, 'pg_type') FROM pg_type t WHERE t.typname = 'testint8'",
+    )
+    assert res.rows == [("jdbc123",)]
+    q(storage, session, "comment on domain testint8 is NULL")
+    res = q(
+        storage,
+        session,
+        "SELECT obj_description(t.oid, 'pg_type') FROM pg_type t WHERE t.typname = 'testint8'",
+    )
+    assert res.rows == [(None,)]
+
+
+def test_comment_on_index_reflects_in_pg_description(storage, session):
+    # remarkIndexInfo: getIndexInfo LEFT JOINs pg_description on the index
+    # relation's oid to read REMARKS.
+    q(storage, session, "CREATE TABLE ct (a int primary key)")
+    q(storage, session, "CREATE INDEX idx_name ON ct (a)")
+    assert (
+        q(storage, session, "comment on index idx_name is 'index_comment'").command_tag == "COMMENT"
+    )
+    res = q(
+        storage,
+        session,
+        "SELECT d.description FROM pg_class ci"
+        " LEFT JOIN pg_description d ON (ci.oid = d.objoid)"
+        " WHERE ci.relname = 'idx_name'",
+    )
+    assert res.rows == [("index_comment",)]
+
+    with pytest.raises(errors.SQLError) as e:
+        q(storage, session, "comment on index no_such_index is 'x'")
+    assert e.value.sqlstate == "42704"
+
+
+def test_pg_get_keywords_and_sql_keywords_query(storage, session):
+    # pgjdbc's getSQLKeywords: string_agg over the keywords SRF with a
+    # <> ALL array filter. reindex must be present (the test asserts it).
+    res = q(
+        storage,
+        session,
+        "SELECT string_agg(word, ',') FROM pg_catalog.pg_get_keywords()"
+        " WHERE word <> ALL ('{abort,do}'::text[])",
+    )
+    words = res.rows[0][0].split(",")
+    assert "reindex" in words
+    assert "abort" not in words and "do" not in words
+    assert len(words) == len(set(words))
+
+
+def test_aggregates_over_srf_from(storage, session):
+    assert q(storage, session, "SELECT sum(g) FROM generate_series(1, 3) g").rows == [(6,)]
+    assert q(storage, session, "SELECT string_agg('ab', '') FROM generate_series(1, 3)").rows == [
+        ("ababab",)
+    ]
+    assert q(storage, session, "SELECT array_agg(g) FROM generate_series(1,3) g").rows == [
+        ([1, 2, 3],)
+    ]
+
+
+def test_scalar_subquery_over_srf(storage, session):
+    res = q(storage, session, "SELECT (SELECT string_agg('ab', '') FROM generate_series(1, 3))")
+    assert res.rows == [("ababab",)]
+
+
+def test_function_wrapped_string_agg(storage, session):
+    q(storage, session, "CREATE TABLE wsa (b text)")
+    q(storage, session, "INSERT INTO wsa VALUES ('61'), ('62')")
+    assert q(storage, session, "SELECT decode(string_agg(b, ''), 'hex') FROM wsa").rows == [
+        (b"ab",)
+    ]
+    assert q(storage, session, "SELECT upper(string_agg(b, '-')) FROM wsa").rows == [("61-62",)]
+
+
+def test_pg_database_includes_postgres_maintenance_db(storage, session):
+    # pgjdbc's getCatalogs asserts both the connected db and "postgres" are
+    # present and the list is sorted; a PG client must never see MongoDB-side
+    # names like "local" as a connectable catalog.
+    rows = q(
+        storage,
+        session,
+        'SELECT datname AS "TABLE_CAT" FROM pg_catalog.pg_database'
+        " WHERE datallowconn = true ORDER BY datname",
+    ).rows
+    names = [r[0] for r in rows]
+    assert "postgres" in names
+    assert DB in names
+    assert "local" not in names
+    assert names == sorted(names)
+
+
+def test_comma_join_is_keyed_not_cartesian(storage, session):
+    # A multi-table comma-join with join predicates in WHERE must key each
+    # $lookup instead of cross-producting — pgjdbc's getImportedKeys over the
+    # catalogs otherwise materializes billions of rows (183GB OOM). It now
+    # completes and returns the FK's key columns with their positions.
+    q(storage, session, "CREATE TABLE pk (a int, b int, PRIMARY KEY (a, b))")
+    q(
+        storage,
+        session,
+        "CREATE TABLE fk (x int, y int, FOREIGN KEY (x, y) REFERENCES pk(a, b))",
+    )
+    res = q(
+        storage,
+        session,
+        "SELECT pka.attname, fka.attname, pos.n"
+        " FROM pg_catalog.pg_namespace pkn, pg_catalog.pg_class pkc,"
+        " pg_catalog.pg_attribute pka, pg_catalog.pg_namespace fkn,"
+        " pg_catalog.pg_class fkc, pg_catalog.pg_attribute fka,"
+        " pg_catalog.pg_constraint con, pg_catalog.generate_series(1, 32) pos(n),"
+        " pg_catalog.pg_class pkic"
+        " WHERE pkn.oid = pkc.relnamespace AND pkc.oid = pka.attrelid"
+        " AND pka.attnum = con.confkey[pos.n] AND con.confrelid = pkc.oid"
+        " AND fkn.oid = fkc.relnamespace AND fkc.oid = fka.attrelid"
+        " AND fka.attnum = con.conkey[pos.n] AND con.conrelid = fkc.oid"
+        " AND con.contype = 'f' AND pkic.oid = con.conindid"
+        " ORDER BY pos.n",
+    )
+    assert res.rows == [("a", "x", 1), ("b", "y", 2)]
+
+
+def test_comma_join_semantics_preserved(storage, session):
+    q(storage, session, "CREATE TABLE ca (id int, x int)")
+    q(storage, session, "CREATE TABLE cb (id int, aid int)")
+    q(storage, session, "CREATE TABLE cc (id int, bid int)")
+    q(storage, session, "INSERT INTO ca VALUES (1, 10), (2, 20)")
+    q(storage, session, "INSERT INTO cb VALUES (100, 1), (200, 2)")
+    q(storage, session, "INSERT INTO cc VALUES (1000, 100), (2000, 200)")
+    res = q(
+        storage,
+        session,
+        "SELECT ca.x, cc.id FROM ca, cb, cc"
+        " WHERE ca.id = cb.aid AND cb.id = cc.bid AND ca.x = 10 ORDER BY cc.id",
+    )
+    assert res.rows == [(10, 1000)]

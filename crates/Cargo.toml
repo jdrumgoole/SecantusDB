@@ -16,6 +16,11 @@
 #                        same `rust` CI job; the WT adapter lands separately.
 #   * secantus-auth    — pure-Rust SCRAM-SHA-256 mechanism (R5). No PyO3 / native
 #                        deps; same `rust` CI job.
+#   * secantus-bench   — the three-droplet DigitalOcean benchmark harness
+#                        (`do-cluster` orchestrator + `do-client` load agent).
+#                        No PyO3 / native deps: the client speaks the wire
+#                        protocol through secantus-wire rather than linking the
+#                        official driver, so it builds in the same `rust` CI job.
 [workspace]
 resolver = "2"
 members = [
@@ -25,6 +30,7 @@ members = [
     "secantus-commands",
     "secantus-server",
     "secantus-auth",
+    "secantus-bench",
 ]
 # secantus-wt (the WiredTiger FFI / storage foundation, Phase 4) is intentionally
 # NOT a workspace member yet: it links the vendored WiredTiger C library, which

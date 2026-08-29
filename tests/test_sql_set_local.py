@@ -27,6 +27,14 @@ def _run(storage, session, sql):
     return run_sql(storage, DB, sql, session=session)[-1]
 
 
+def test_custom_namespaced_guc_roundtrips(storage):
+    # A custom (extension) GUC ``namespace.name`` parses with the namespace as the
+    # LHS column's table part; SET must keep the full dotted name so SHOW finds it.
+    sess = Session(database=DB)
+    _run(storage, sess, "SET custom_option.session_setting = 'abc'")
+    assert _run(storage, sess, "SHOW custom_option.session_setting").rows == [("abc",)]
+
+
 def test_set_local_reverts_at_commit(storage):
     sess = Session(database=DB)
     _run(storage, sess, "BEGIN")
@@ -111,3 +119,81 @@ def test_pg_settings_boot_and_reset_val(storage):
     )
     # setting reflects the override; boot_val/reset_val stay at the default.
     assert res.rows == [("LATIN1", "UTF8", "UTF8")]
+
+
+class TestTxnScopedSetAndReporting:
+    """PG unwinds a plain in-block ``SET`` on ROLLBACK (keeps it on COMMIT),
+    and re-reports GUC_REPORT parameters when a SET LOCAL or rolled-back SET
+    unwinds — pgjdbc's ParameterStatusTest transactionalParameters* trio."""
+
+    def test_plain_set_unwinds_on_rollback(self, storage):
+        sess = Session(database=DB)
+        _run(storage, sess, "SET application_name = 'base'")
+        _run(storage, sess, "BEGIN")
+        _run(storage, sess, "SET application_name = 'txn'")
+        assert _run(storage, sess, "SHOW application_name").rows == [("txn",)]
+        _run(storage, sess, "ROLLBACK")
+        assert _run(storage, sess, "SHOW application_name").rows == [("base",)]
+
+    def test_plain_set_survives_commit(self, storage):
+        sess = Session(database=DB)
+        _run(storage, sess, "BEGIN")
+        _run(storage, sess, "SET application_name = 'kept'")
+        _run(storage, sess, "COMMIT")
+        assert _run(storage, sess, "SHOW application_name").rows == [("kept",)]
+
+    def test_commit_of_failed_block_unwinds_set(self, storage):
+        sess = Session(database=DB)
+        _run(storage, sess, "SET application_name = 'base'")
+        _run(storage, sess, "BEGIN")
+        _run(storage, sess, "SET application_name = 'doomed'")
+        from secantus.sql import errors as sql_errors
+
+        with pytest.raises(sql_errors.SQLError):
+            _run(storage, sess, "SELECT * FROM missing_relation_xyz")
+        _run(storage, sess, "COMMIT")  # acts as ROLLBACK on a failed block
+        assert _run(storage, sess, "SHOW application_name").rows == [("base",)]
+
+    def test_unwind_reports_parameter_status(self, storage):
+        sess = Session(database=DB)
+        _run(storage, sess, "SET application_name = 'base'")
+        sess.pending_parameter_status = []
+        _run(storage, sess, "BEGIN")
+        _run(storage, sess, "SET LOCAL application_name = 'local'")
+        _run(storage, sess, "COMMIT")
+        assert ("application_name", "base") in sess.pending_parameter_status
+
+    def test_rollback_reports_reverted_plain_set(self, storage):
+        sess = Session(database=DB)
+        _run(storage, sess, "SET application_name = 'base'")
+        sess.pending_parameter_status = []
+        _run(storage, sess, "BEGIN")
+        _run(storage, sess, "SET application_name = 'txn'")
+        _run(storage, sess, "ROLLBACK")
+        assert sess.pending_parameter_status[-1] == ("application_name", "base")
+
+    def test_savepoint_alias_shapes_accepted_by_extended_parse(self, storage):
+        # SAVEPOINT / RELEASE parse as a bare Alias in sqlglot; the extended
+        # protocol's garbage guard (#876) must not reject them.
+        import struct
+
+        from secantus.sql.pgextended import ExtendedSession
+
+        ext = ExtendedSession(storage, Session(database=DB))
+
+        def run(q):
+            payload = b"\x00" + q.encode() + b"\x00" + struct.pack(">h", 0)
+            out = ext.process("P", payload)
+            assert b"syntax error" not in bytes(out), q
+
+        run("BEGIN")
+        run("SAVEPOINT sp1")
+        run("RELEASE SAVEPOINT sp1")
+        run("START TRANSACTION")
+
+    def test_bare_start_transaction_opens_a_block(self, storage):
+        sess = Session(database=DB)
+        res = _run(storage, sess, "START TRANSACTION")
+        assert res.command_tag == "BEGIN"
+        assert sess.txn_handle is not None
+        _run(storage, sess, "COMMIT")

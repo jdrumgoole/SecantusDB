@@ -143,7 +143,9 @@ def test_deallocate_all(fresh):
     _run(st, sess, "PREPARE a AS SELECT 1")
     _run(st, sess, "PREPARE b AS SELECT 2")
     r = _run(st, sess, "DEALLOCATE ALL")
-    assert r.command_tag == "DEALLOCATE"
+    # Postgres tags the ALL form "DEALLOCATE ALL" (checked against 14.13), and
+    # drivers key off that exact string to know their statement cache is gone.
+    assert r.command_tag == "DEALLOCATE ALL"
     assert sess.prepared == {}
 
 
@@ -179,3 +181,13 @@ def test_prepared_statements_are_per_session(tmp_path):
         assert exc.value.sqlstate == "26000"
     finally:
         st.close()
+
+
+def test_discard_tag_echoes_target(fresh):
+    # PG echoes the DISCARD target in the CommandComplete tag.
+    st, sess = fresh
+    assert _run(st, sess, "DISCARD ALL").command_tag == "DISCARD ALL"
+    assert _run(st, sess, "DISCARD PLANS").command_tag == "DISCARD PLANS"
+    assert _run(st, sess, "DISCARD SEQUENCES").command_tag == "DISCARD SEQUENCES"
+    assert _run(st, sess, "DISCARD TEMP").command_tag == "DISCARD TEMP"
+    assert _run(st, sess, "DISCARD TEMPORARY").command_tag == "DISCARD TEMP"

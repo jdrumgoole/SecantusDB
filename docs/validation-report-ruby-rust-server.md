@@ -1,6 +1,6 @@
 # mongo-ruby-driver Validation Report
 
-Generated 2026-07-17 — SecantusDB 0.5.4b237 vs mongo-ruby-driver f68d676643c1 (`vendor/mongo-ruby-driver/`).
+Generated 2026-08-24 — SecantusDB 0.6.0b15 vs mongo-ruby-driver f68d676643c1 (`vendor/mongo-ruby-driver/`).
 
 Run `uv run python -m invoke validate-ruby` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver / mongo-java-driver gauges for the official Ruby driver — the same gem Rails + Sinatra applications and the Ruby ecosystem build on.
 
@@ -8,22 +8,18 @@ Run `uv run python -m invoke validate-ruby` to refresh. The pass rate is the ana
 
 | Category | Passed | Failed | Pending | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `spec/mongo` | 203 | 2 | 16 | 221 | 99.0% |
-| `spec/support` | 86 | 3 | 8 | 97 | 96.6% |
-| **Overall** | **289** | **5** | **24** | **318** | **98.3%** |
+| `spec/mongo` | 206 | 1 | 16 | 223 | 99.5% |
+| `spec/support` | 89 | 0 | 8 | 97 | 100.0% |
+| **Overall** | **295** | **1** | **24** | **320** | **99.7%** |
 
-Run time: 11.46s.
+Run time: 11.66s.
 
-## Failures (5)
+## Failures (1)
 
 First 30 failed examples for triage:
 
 ```
-spec/mongo :: Mongo::Collection#create when the collection has options when the collection is capped when instantiating a collection using create applies the options
 spec/mongo :: Mongo::Collection#create when the collection has options when the collection has a write concern when write concern passed in as an option applies the write concern passed in as an option
-spec/support :: Mongo::Collection#create when the collection has options when a session is provided behaves like a failed operation using a session raises an error
-spec/support :: Mongo::Collection#indexes when a session is provided behaves like a failed operation using a session raises an error
-spec/support :: Mongo::Index::View#create_one when the index is created when provided a session behaves like a failed operation using a session raises an error
 ```
 
 ## How this is generated

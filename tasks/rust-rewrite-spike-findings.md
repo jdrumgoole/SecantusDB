@@ -1,5 +1,12 @@
 # Phase 0 spike findings — Python → Rust rewrite
 
+> **HISTORICAL — superseded (audited 2026-08-20).** This plan is built on the
+> *in-process selectable-engine* model (`SECANTUS_ENGINE=python|rust|auto`, the
+> `secantus.engine` shims, the `EngineFallback` adapter). That model was retired
+> in favour of **two separate servers**, and CLAUDE.md names
+> `tasks/rust-server-plan.md` as the authoritative plan. Kept for the design
+> reasoning and the measurements; do not take its next-steps as current work.
+
 Companion to `tasks/rust-rewrite-plan.md`. These are the results of the three
 de-risking spikes that §6 Phase 0 calls go/no-go gates. **All three passed.**
 Spike code lives in `rust/` (a throwaway cargo workspace) with driver harnesses

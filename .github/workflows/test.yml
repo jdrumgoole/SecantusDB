@@ -85,6 +85,9 @@ jobs:
       # instead of dying with its stderr — the ws-changes crash has been
       # anonymous ≥4× for want of this (tasks/backlog.md).
       SECANTUS_FAULTHANDLER_DIR: ${{ github.workspace }}/faulthandler-dumps
+      # CI keeps the 25-min hang deadline (job cap is 30 min); the local
+      # conftest default is 90 min so shared-box runs don't self-destruct.
+      SECANTUS_HANG_SECONDS: "1500"
     # 30 min suffices for Linux, but a macOS cell builds vendored WiredTiger
     # from source on a contended pool (10-40+ min per 9e16e49) BEFORE it runs a
     # test, so the cron cells need a much larger cap.
@@ -206,6 +209,17 @@ jobs:
           ' > /tmp/disk-reclaim.log 2>&1 &
           echo "reclaim detached as pid $!"
 
+      - name: Register the MongoDB apt repository (Linux)
+        # Registering the repo BEFORE the install step means one ``apt-get
+        # update`` covers both it and the Ubuntu indexes — the second update we
+        # used to run re-fetched every index for no new information.
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
+            https://www.mongodb.org/static/pgp/server-8.0.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
+
       - name: Install toolchain and MongoDB CLI tools (Linux)
         # swig (for the vendored WT build) plus mongosh + Database Tools so the
         # CLI-tool conformance tests (tests/test_mongosh.py,
@@ -215,16 +229,10 @@ jobs:
         # intentionally omitted: the mongosh tests skip on win32 by design
         # (PowerShell --eval quoting), leaving only marginal coverage for a
         # slow, flake-prone choco install.
-        #
-        # Registering the MongoDB repo BEFORE the single ``apt-get update``
-        # merges what used to be two separate update+install steps — the second
-        # ``apt-get update`` was re-fetching every index for no new information.
         if: runner.os == 'Linux'
-        run: |
-          curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
-          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
-          sudo apt-get update
-          sudo apt-get install -y swig mongodb-mongosh mongodb-database-tools
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig liblz4-dev mongodb-mongosh mongodb-database-tools
 
       - name: Install toolchain and MongoDB CLI tools (macOS)
         # The macOS half of the step above. Installing mongosh + Database Tools
@@ -236,7 +244,7 @@ jobs:
         # swig is what the vendored WT build needs on top.
         if: runner.os == 'macOS'
         run: |
-          brew install swig
+          brew install swig lz4
           brew tap mongodb/brew
           # Homebrew now refuses to load formulae from an untrusted third-party
           # tap ("Refusing to load formula mongodb/brew/mongodb-database-tools
@@ -432,15 +440,34 @@ jobs:
         # written and then fails the job.
         if: runner.os == 'Linux'
         run: |
-          for _ in $(seq 1 180); do
-            [ -f /tmp/disk-reclaim.done ] && break
-            sleep 1
+          # Wait on the RECLAIM ITSELF, not on a fixed deadline. The old
+          # version polled 180s and failed the whole workflow when the runner
+          # was merely slow -- which happened on 2026-08-26, taking out two
+          # shards of an otherwise green run. The rm walks hundreds of
+          # thousands of files; how long that takes is the runner's I/O, not
+          # anything this repo controls.
+          #
+          # Keep waiting while the reclaim is alive, fail FAST if it died
+          # without arming the sentinel (a real failure worth surfacing), and
+          # keep a generous absolute ceiling as a backstop.
+          deadline=$(( SECONDS + 600 ))
+          while [ ! -f /tmp/disk-reclaim.done ]; do
+            if ! pgrep -f 'rm -rf /usr/local/lib/android' >/dev/null 2>&1; then
+              sleep 2   # let a just-finished rm write the sentinel
+              [ -f /tmp/disk-reclaim.done ] && break
+              cat /tmp/disk-reclaim.log || true
+              echo "::error::disk reclaim exited without completing"
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              cat /tmp/disk-reclaim.log || true
+              echo "::error::disk reclaim still running after 600s"
+              exit 1
+            fi
+            sleep 2
           done
           cat /tmp/disk-reclaim.log || true
-          if [ ! -f /tmp/disk-reclaim.done ]; then
-            echo "::error::disk reclaim did not finish within 180s"
-            exit 1
-          fi
+          df -h /
 
       - name: Tests (group ${{ matrix.group }}/4)
         # ``--timeout=120 --timeout-method=thread`` catches deadline-
@@ -769,6 +796,9 @@ jobs:
       # helper). The durable lane re-runs the whole suite under real checkpoint
       # durability, so it exercises the same ws-changes / WT crash surface.
       SECANTUS_FAULTHANDLER_DIR: ${{ github.workspace }}/faulthandler-dumps
+      # CI keeps the 25-min hang deadline (job cap is 30 min); the local
+      # conftest default is 90 min so shared-box runs don't self-destruct.
+      SECANTUS_HANG_SECONDS: "1500"
     # See the ``test`` job: the cron's macOS cells pay a 10-40 min source build
     # of vendored WiredTiger before the first test runs.
     timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 90 || 30 }}
@@ -849,23 +879,30 @@ jobs:
           ' > /tmp/disk-reclaim.log 2>&1 &
           echo "reclaim detached as pid $!"
 
+      - name: Register the MongoDB apt repository (Linux)
+        # Registered before the install so one ``apt-get update`` covers it and
+        # the Ubuntu indexes — see the ``test`` job's twin.
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
+            https://www.mongodb.org/static/pgp/server-8.0.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
+
       - name: Install toolchain and MongoDB CLI tools (Linux)
         # Same rationale as the ``test`` job: without mongosh + Database Tools
         # the CLI-tool conformance tests skip, and the durable pass must cover
-        # exactly what the fast pass covers. Single ``apt-get update`` for the
-        # same reason too.
+        # exactly what the fast pass covers.
         if: runner.os == 'Linux'
-        run: |
-          curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
-          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
-          sudo apt-get update
-          sudo apt-get install -y swig mongodb-mongosh mongodb-database-tools
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig liblz4-dev mongodb-mongosh mongodb-database-tools
 
       - name: Install toolchain and MongoDB CLI tools (macOS)
         # macOS half — see the ``test`` job's twin.
         if: runner.os == 'macOS'
         run: |
-          brew install swig
+          brew install swig lz4
           brew tap mongodb/brew
           # Homebrew now refuses to load formulae from an untrusted third-party
           # tap ("Refusing to load formula mongodb/brew/mongodb-database-tools
@@ -1050,15 +1087,34 @@ jobs:
         # including why this carries the same Linux gate as the arming step.
         if: runner.os == 'Linux'
         run: |
-          for _ in $(seq 1 180); do
-            [ -f /tmp/disk-reclaim.done ] && break
-            sleep 1
+          # Wait on the RECLAIM ITSELF, not on a fixed deadline. The old
+          # version polled 180s and failed the whole workflow when the runner
+          # was merely slow -- which happened on 2026-08-26, taking out two
+          # shards of an otherwise green run. The rm walks hundreds of
+          # thousands of files; how long that takes is the runner's I/O, not
+          # anything this repo controls.
+          #
+          # Keep waiting while the reclaim is alive, fail FAST if it died
+          # without arming the sentinel (a real failure worth surfacing), and
+          # keep a generous absolute ceiling as a backstop.
+          deadline=$(( SECONDS + 600 ))
+          while [ ! -f /tmp/disk-reclaim.done ]; do
+            if ! pgrep -f 'rm -rf /usr/local/lib/android' >/dev/null 2>&1; then
+              sleep 2   # let a just-finished rm write the sentinel
+              [ -f /tmp/disk-reclaim.done ] && break
+              cat /tmp/disk-reclaim.log || true
+              echo "::error::disk reclaim exited without completing"
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              cat /tmp/disk-reclaim.log || true
+              echo "::error::disk reclaim still running after 600s"
+              exit 1
+            fi
+            sleep 2
           done
           cat /tmp/disk-reclaim.log || true
-          if [ ! -f /tmp/disk-reclaim.done ]; then
-            echo "::error::disk reclaim did not finish within 180s"
-            exit 1
-          fi
+          df -h /
 
       - name: Durable-storage tests (group ${{ matrix.group }}/4)
         # The default suite above runs FAST (the test conftest sets
@@ -1126,7 +1182,9 @@ jobs:
           git submodule update --init vendor/wiredtiger
 
       - name: Install swig
-        run: sudo apt-get update && sudo apt-get install -y swig
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig liblz4-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
@@ -1339,7 +1397,9 @@ jobs:
       # swig builds WT's Python module; clang/libclang for secantus-wt's bindgen;
       # ninja is the generator the WT ExternalProject forces.
       - name: Install toolchain
-        run: sudo apt-get update && sudo apt-get install -y swig clang libclang-dev llvm-dev ninja-build
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig clang libclang-dev llvm-dev ninja-build liblz4-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
@@ -1523,6 +1583,22 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test
 
+      # The async/decoupled-oplog parity lane: the whole storage suite again
+      # with the drainer pool live (SECANTUS_OPLOG_ASYNC=1, stacked with the
+      # non-logged oplog tables the mode ships with — the Finding-9 pairing).
+      # tasks/rust-async-oplog-prototype.md names this lane as the
+      # precondition for the mode ever becoming a default. Mode-specific
+      # tests pin their own mode via StorageOptions (the option beats the env
+      # var), so sync-only invariants stay covered by the run above while
+      # everything else exercises the async path. Same build — only the env
+      # differs, so this re-runs tests without recompiling.
+      - name: Cargo test (secantus-storage, async-oplog lane)
+        working-directory: crates/secantus-storage
+        env:
+          SECANTUS_OPLOG_ASYNC: "1"
+          SECANTUS_OPLOG_NONLOGGED: "1"
+        run: cargo test
+
       - name: Cargo fmt / clippy / test (secantus-storage-adapter, R4b)
         # The WiredTiger → command-`Storage` adapter (R4b). Like secantus-storage
         # it links WiredTiger and is excluded from the workspace, so it's built
@@ -1588,7 +1664,9 @@ jobs:
 
       - name: Install toolchain (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y swig clang libclang-dev llvm-dev ninja-build
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig clang libclang-dev llvm-dev ninja-build liblz4-dev
 
       - name: Install toolchain (macOS)
         if: runner.os == 'macOS'

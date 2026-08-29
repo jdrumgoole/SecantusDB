@@ -126,6 +126,13 @@ binary-format parameters, server-side prepared statements, and the psycopg SQLAl
 dialect's catalog reflection), each paired with a **SQLAlchemy** Core round-trip. `psql`
 and a JVM/JDBC client speak the same protocol but need a system libpq / a JVM, so they
 aren't run in CI.
+
+Beyond the bundled tests, three **external, unmodified** suites run weekly as
+conformance gauges: psycopg 3's own test suite (`invoke validate-psycopg`),
+the SQLite-originated sqllogictest corpus over pgwire (`invoke validate-slt`),
+and SQLAlchemy's dialect-compliance suite (`invoke validate-sqlalchemy`).
+Their pass-rate reports live alongside this page in the repository
+(`docs/validation-report-{psycopg,slt,sqlalchemy}.md`).
 :::
 
 ## Declared tables
@@ -249,6 +256,85 @@ INSERT INTO m (id, price, at) VALUES (1, 19.99, '2020-01-02T03:04:05Z');
 SELECT price, at FROM m;
 -- price -> Decimal('19.99'),  at -> datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC)
 ```
+
+One **precision ceiling** follows from the BSON storage forms and is a
+permanent divergence from real Postgres:
+
+- **`numeric` holds at most 34 significant digits.** Values are stored
+  as IEEE 754-2008 Decimal128, so a wider `numeric` rounds to 34
+  significant digits where real Postgres keeps arbitrary precision.
+  (pgjdbc's `NumericTransfer2Test` asserts wider round-trips.)
+
+#### Sub-millisecond timestamps
+
+A BSON date (`0x09`) is a signed 64-bit count of **milliseconds** — there is no
+sub-millisecond date type in MongoDB at all (`Timestamp`, `0x11`, is coarser
+still: seconds plus an ordinal, reserved for replication). A Postgres
+`timestamp` carries microseconds, so it does not fit.
+
+SecantusDB keeps the BSON date and stores the leftover microseconds beside it,
+in a hidden companion field named `__us_<field>`:
+
+```sql
+CREATE TABLE ts (id bigint PRIMARY KEY, t timestamp);
+INSERT INTO ts VALUES (1, '2026-08-18 12:00:00.123456');
+SELECT t FROM ts;   -- 2026-08-18 12:00:00.123456
+```
+
+The document a **Mongo client** sees is:
+
+```javascript
+{ _id: 1, t: ISODate("2026-08-18T12:00:00.123Z"), __us_t: 456 }
+```
+
+`t` is an ordinary BSON date holding whole milliseconds — exactly what was
+stored before this existed — and `__us_t` holds the remaining 0–999
+microseconds. Points worth knowing:
+
+- **The companion is only written when it is non-zero.** A timestamp that lands
+  on a whole millisecond (the common case) adds no extra field.
+- **It is not a column.** `__`-prefixed keys are SecantusDB's convention for
+  hidden storage fields, so the companion never appears in `SELECT *`, in
+  `information_schema`, or in the columns reflected from a schema-on-read
+  collection.
+- **Every write resolves it.** An `UPDATE` to a whole-millisecond value
+  *removes* the companion rather than leaving the old one behind — a stale
+  remainder would report a time that was never stored.
+- **It is data, not metadata.** A Mongo client writing to the same collection
+  directly can set or omit `__us_t` freely; a value outside 0–999 is ignored on
+  read rather than trusted.
+
+**The remaining limitation: predicates are still millisecond-blind.** The stored
+date is truncated, so `WHERE` and `ORDER BY` on a timestamp column compare only
+whole milliseconds. A sub-millisecond literal matches nothing
+(`WHERE t = '…12:00:00.123456'` returns no rows even for the row above, whereas
+`'…12:00:00.123'` matches it), and two rows within the same millisecond sort in
+an unspecified order. Closing that means lowering comparisons against both
+fields and adding the companion as a sort tiebreaker; until then reads are
+precise and predicates are not.
+
+#### Comparing incompatible types is an error, not an empty result
+
+Postgres resolves a comparison operator while it *analyses* a statement, so
+comparing a `text` column against an integer fails before any row is read:
+
+```sql
+SELECT * FROM users WHERE name = 42;
+-- ERROR:  operator does not exist: text = integer   (SQLSTATE 42883)
+```
+
+An untyped literal is not a type — Postgres resolves it to the other operand —
+so `name = '42'` and `age = '42'` both keep working, as does any numeric-vs-numeric
+or date-vs-timestamp pair. The check covers the six binary comparison operators
+on **declared** tables, across four type categories (numeric / string / boolean /
+date-time). It is deliberately conservative: bound parameters, subqueries,
+arithmetic, most function results, CTEs, derived tables and views are left to
+run, because a wrong `42883` would break a working query.
+
+Reflected tables (see "Reflected tables and jsonb", below) are
+exempt. Their column types come from sampling documents, so a field may be typed
+`text` while holding integers — comparing across BSON types is the point of the
+dual-protocol path, and stays permissive there.
 
 ### Evolving a table (`ALTER TABLE`)
 
@@ -983,6 +1069,66 @@ Postgres, which folds them. The dominant citext uses (case-insensitive lookups,
 uniqueness, and sorted listings) are faithful; case-folding aggregation grouping
 is a known limitation. citext indexing is also out of scope.
 
+### Label paths (`ltree`)
+
+`ltree` columns store a dotted label path (alphanumeric / underscore labels) and
+are reported on the wire at oid 90010 — the placeholder CockroachDB uses for the
+extension type, since `ltree` has no fixed catalog oid:
+
+```sql
+CREATE TABLE t (id int4 PRIMARY KEY, path ltree NOT NULL);
+INSERT INTO t VALUES (1, 'A.B');
+SELECT id FROM t WHERE path = 'A.B';   -- 1
+```
+
+Values are validated on write (a malformed path is rejected), and a parameter
+compared against an `ltree` column is typed as `ltree` by parse analysis, so
+binary-format parameters (a version byte followed by the text, as the extension
+sends) decode correctly. The path *operators* (`@>`, `<@`, `~`, `lquery`) are out
+of scope — storage, comparison, and the wire representation are what SecantusDB
+models.
+
+### SQL/JSON paths (`jsonpath`)
+
+A `jsonpath` value stores PostgreSQL's canonical text form of a path expression
+(oid 4072). Member accessors are always quoted on output, as PG renders them:
+
+```sql
+SELECT '$.abc'::jsonpath;                        -- $."abc"
+SELECT jsonb_path_query('{"a": true}', '$.a');   -- true
+SELECT ''::jsonpath;                             -- ERROR 42601 (syntax error)
+```
+
+The binary format is a version byte followed by the canonical text. The path
+language itself is the subset `jsonb_path_query` / `jsonb_path_exists` / `@?` /
+`@@` accept — see *jsonb containment, existence, and functions* below.
+
+### The internal one-byte type (`"char"`)
+
+The **quoted** `"char"` spelling is PostgreSQL's internal one-byte type (oid 18,
+typlen 1) — distinct from `char(n)` / `bpchar`, and used by catalog columns:
+
+```sql
+CREATE TABLE a (i int4 PRIMARY KEY, b "char");
+INSERT INTO a VALUES (1, 'eee');   -- stored as 'e' (truncated to one character)
+INSERT INTO a VALUES (2, '');      -- stored as NULL
+SELECT 'a'::"char";                -- column named char, oid 18, size 1
+SELECT 0::"char";                  -- the zero byte
+```
+
+Input truncates to a single character, an empty string or zero byte stores NULL,
+and an integer cast yields that code point (out of range raises `22003`). The
+unquoted `char` keyword still means `char(n)` / `bpchar`.
+
+### Blank padding (`char(n)`)
+
+`char(n)` is a blank-padded type: a shorter value is sent to the client padded
+out to the declared width, so `'hello'` in a `char(8)` column arrives as
+`'hello   '`. The padding is presentation only — `length()` ignores trailing
+blanks (it reports 5, not 8), comparison ignores them, and casting to `text`
+strips them, matching Postgres. The declared length is **not** enforced on
+write: an overlong value is stored as given, where Postgres raises `22001`.
+
 ### XML (`xml`)
 
 `xml` columns store XML text (validated well-formed on write) and support the
@@ -1111,7 +1257,11 @@ SELECT id, unnest(tags) FROM post;    -- one row per element
 index — Postgres arrays don't wrap), and `arr[lo:hi]` returns the 1-based
 inclusive slice (clamped to the array bounds). Both work in the SELECT list and in
 `WHERE` (`WHERE tags[1] = 'py'`). `unnest(array_col)` in the SELECT list expands
-the array; the FROM-clause table form (`FROM unnest(col)`) is not yet supported.
+the array, and the FROM-clause table form works too — both standalone
+(`FROM unnest(ARRAY[10, 20]) AS x`) and the lateral comma-join form that
+expands per row (`SELECT id, tag FROM t, unnest(t.tags) AS tag`). Set-returning
+functions (`generate_series`, `unnest`, …) can also appear as join and
+derived-table sources, not just as the sole `FROM` item.
 
 The array manipulation functions are available too:
 
@@ -1357,6 +1507,14 @@ COMMENT ON COLUMN users.email IS 'primary contact address';
 COMMENT ON COLUMN users.email IS NULL;   -- remove the comment
 ```
 
+### `CREATE TABLE AS` (CTAS)
+
+`CREATE [TEMP] TABLE name AS SELECT ...` runs the query once, creates the
+table with the result's inferred column names and types, and inserts the
+rows, reporting PG's `SELECT <n>` command tag (which drivers surface as the
+update count). `IF NOT EXISTS` skips both the create and the query's
+side effects when the table already exists.
+
 ## Views (`CREATE VIEW`)
 
 A view is a stored `SELECT` that reads like the table it stands for. `CREATE
@@ -1374,6 +1532,23 @@ SELECT a.name FROM active_users a JOIN orders o ON o.user_id = a.id;
 DROP VIEW active_users;
 DROP VIEW IF EXISTS active_users;                  -- no error if absent
 ```
+
+A view may name its own columns, which override the query's output names
+positionally:
+
+```sql
+CREATE VIEW v (v1, v2) AS SELECT a, tab1_a FROM tab1 JOIN tab2 ON tab1.a = tab2.tab1_a;
+CREATE VIEW vfew (x) AS SELECT a, b FROM t;        -- `b` keeps its own name
+```
+
+Supplying more names than the query has columns raises `42601`. A `SELECT *`
+body has its columns resolved once, when the view is created, so a column added
+to the underlying table afterwards does not appear in the view — the same as
+Postgres.
+
+A view's result columns identify themselves as belonging to the *view*: they
+carry the view's `pg_class` oid and their position within the view, not the
+positions they occupy in the underlying tables.
 
 Views reflect through `pg_class` (`relkind = 'v'`), `pg_get_viewdef()`, and
 `information_schema.views`, so SQLAlchemy's `get_view_names()` and
@@ -1504,10 +1679,14 @@ $$ LANGUAGE plpgsql;
 
 A bare identifier that matches a declared variable or a parameter resolves to that
 value; everything else (table columns, functions, subqueries) is left to the
-ordinary SQL machinery. `IF` treats a `NULL` condition as false. **Out of scope**
-(rejected with `0A000`, at `CREATE` time): loops (`LOOP` / `WHILE` / `FOR`),
-`RAISE`, `RETURN QUERY` / `RETURN NEXT` (set-returning), `CASE` statements,
-cursors, `EXCEPTION` handlers, and dynamic `EXECUTE`.
+ordinary SQL machinery. `IF` treats a `NULL` condition as false. `RAISE` is
+supported with PostgreSQL's semantics: `RAISE NOTICE` / `WARNING` / `INFO` /
+`DEBUG` / `LOG` format a message (`%` placeholders, comma-separated arguments)
+and deliver it to the client as a wire notice; `RAISE EXCEPTION` aborts the
+function with `P0001`. **Out of scope** (rejected with `0A000`, at `CREATE`
+time): loops (`LOOP` / `WHILE` / `FOR`), `RETURN QUERY` / `RETURN NEXT`
+(set-returning), `CASE` statements, cursors, `EXCEPTION` handlers, and dynamic
+`EXECUTE`.
 
 User functions are reflected like Postgres', so `psql`'s `\df` and SQLAlchemy see
 them: they appear in `pg_catalog.pg_proc` (with `proname` / `pronargs` /
@@ -1525,8 +1704,8 @@ FROM pg_catalog.pg_proc WHERE proname = 'add';   -- add | a integer, b integer |
 
 **Simplifications:** `LANGUAGE sql` bodies must be a single statement (a
 multi-statement `sql` body is not yet supported); `LANGUAGE plpgsql` covers the
-scalar subset above (no loops / `RAISE` / set-returning / `CASE` / cursors /
-exceptions); a set-returning (`RETURNS SETOF` / `TABLE`) function returns only its
+scalar subset above (no loops / set-returning / `CASE` / cursors / exception
+handlers); a set-returning (`RETURNS SETOF` / `TABLE`) function returns only its
 first row in a scalar context (use it as a scalar); and `pg_proc` lists only
 user-defined functions (built-ins aren't enumerated there).
 
@@ -2488,6 +2667,31 @@ WHEN NOT MATCHED THEN INSERT (sku, qty) VALUES (s.sku, s.qty)
 RETURNING merge_action(), i.sku, s.qty AS shipped;
 ```
 
+## Large objects
+
+The PostgreSQL Large Object API is supported the way drivers actually drive
+it: over the **Fastpath sub-protocol** (wire `FunctionCall` messages
+dispatching the `lo_*` built-ins by their real `pg_proc` OIDs, which are
+reflected into `pg_catalog.pg_proc` so a driver can resolve them by name).
+This is what pgjdbc's `LargeObjectManager` — and therefore JDBC `Blob` /
+`Clob` — uses.
+
+Supported functions: `lo_creat`, `lo_create`, `lo_open`, `lo_close`,
+`loread`, `lowrite`, `lo_lseek`, `lo_tell`, `lo_truncate`, `lo_unlink`, and
+the 64-bit variants `lo_lseek64` / `lo_tell64` / `lo_truncate64`.
+`lo_creat`, `lo_create`, and `lo_unlink` are also callable from SQL
+(`INSERT INTO t VALUES (1, lo_creat(-1))`, `SELECT lo_unlink(lob) FROM t`).
+
+Object bytes are stored chunked and **sparse** — `lo_truncate` extending an
+object to multiple gigabytes stores nothing for the holes, which read back
+as zero bytes, matching PostgreSQL's representation. Reads and writes join
+the session's open transaction, so a `ROLLBACK` discards `lowrite` data.
+Descriptors are per-session; PostgreSQL closes them at transaction end,
+SecantusDB at session end (no driver-visible difference in practice).
+contrib/lo's `lo_manage` trigger DDL is accepted as a recognized no-op
+(replaced objects are never auto-unlinked — nothing vacuums orphans);
+`lo_import` / `lo_export` (server-side file I/O) are not supported.
+
 ## Bulk load / dump (`COPY`)
 
 `COPY … FROM STDIN` bulk-loads rows and `COPY … TO STDOUT` streams them out — the
@@ -2831,20 +3035,27 @@ SELECT pg_advisory_unlock_all();          -- release all session locks
 ```
 
 All eleven functions are supported — `pg_advisory_lock` / `pg_advisory_unlock` /
-`pg_advisory_unlock_all` and the `_shared`, `_xact_`, and `pg_try_*` variants.
-SecantusDB is single-node, so a lock is **always granted immediately** — the
-functions never block. What SecantusDB does track is *which* locks the
-connection holds, so:
+`pg_advisory_unlock_all` and the `_shared`, `_xact_`, and `pg_try_*` variants —
+and they provide **real mutual exclusion**: the server runs one advisory-lock
+table shared by every connection, so leader-election and migration-fencing
+patterns (alembic's lock, cron fencing) genuinely exclude. Semantics follow
+PostgreSQL:
 
-- `pg_try_advisory_lock*` always return `true` (nothing to contend with);
+- exclusive and shared modes with PostgreSQL's grant rules — two sessions can
+  share a `_shared` hold, an exclusive hold blocks everyone else;
+- `pg_advisory_lock*` **block** until the lock is granted, with deadlock
+  detection (a cycle raises `40P01 deadlock detected` in one of the waiters);
+- `pg_try_advisory_lock*` return `true` / `false` truthfully;
 - `pg_advisory_unlock*` return `true` only if a matching session-level lock was
   held (and `false` otherwise, as Postgres does);
 - advisory locks are **re-entrant** — locking the same key twice needs two
   unlocks;
 - `pg_advisory_xact_lock*` locks are released automatically at `COMMIT` /
   `ROLLBACK` (and can't be released manually);
-- the held locks are reflected through **`pg_catalog.pg_locks`** (`locktype =
-  'advisory'`, one row per key+mode, always `granted`).
+- every held lock is released when its connection ends;
+- held locks are reflected through **`pg_catalog.pg_locks`** (`locktype =
+  'advisory'`, one row per key+mode, always `granted`), across all
+  connections.
 
 ```sql
 SELECT locktype, classid, objid, objsubid, mode, granted
@@ -2853,9 +3064,8 @@ FROM pg_locks WHERE locktype = 'advisory';
 
 A single `bigint` key splits into `(classid, objid)` signed 32-bit halves with
 `objsubid = 1`; a two-`int4` key maps straight through with `objsubid = 2` —
-matching Postgres. `pg_locks` reflects **this connection's** locks (single-node
-dev surface); cross-backend visibility and non-advisory lock types aren't
-modelled.
+matching Postgres. Non-advisory lock types (relation / tuple rows) aren't
+modelled in `pg_locks`.
 
 ### Two-phase commit (`PREPARE TRANSACTION`)
 
@@ -2932,10 +3142,25 @@ promptly; a listener that goes completely silent won't observe them until its
 next round-trip.
 
 **Simplifications:** duplicate `(channel, payload)` notifications within one
-transaction are not collapsed (Postgres collapses them); `LISTEN` / `UNLISTEN`
-take effect immediately rather than at commit; and there is no out-of-band push
-to a fully-idle connection (notifications are attached to the next query
-response, not delivered asynchronously mid-idle).
+transaction are not collapsed (Postgres collapses them), and `LISTEN` /
+`UNLISTEN` take effect immediately rather than at commit. Idle connections
+receive notifications asynchronously, like real PG: a listener blocked in
+`psycopg`'s `connection.notifies()` (or any driver waiting on the socket)
+wakes when another connection commits a `NOTIFY`, with no query needed.
+
+## Query cancellation
+
+The wire cancel sub-protocol is honoured. A client opens a fresh connection
+and sends a CancelRequest carrying the `(pid, secret)` pair from its main
+connection's BackendKeyData; the server verifies the secret and interrupts
+that session's running statement with PostgreSQL's `57014 canceling
+statement due to user request`. The cancelled connection stays fully usable
+— cancel is not terminate. This is the machinery JDBC's
+`Statement.setQueryTimeout`, psycopg's `Connection.cancel()`, and pgx's
+context cancellation drive. `pg_cancel_backend(pid)` cancels the target's
+running query the same way (`pg_terminate_backend` still closes the
+connection), and a cancel that arrives while the session is idle is
+discarded, as in real PG.
 
 ## Prepared statements (`PREPARE` / `EXECUTE` / `DEALLOCATE`)
 
@@ -3291,7 +3516,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Aggregates | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT`/`SUM`/`AVG`(`DISTINCT`) (select list *and* `HAVING`, single-table + JOIN), an **expression over an aggregate** (`sum(x)+1`, `round(avg(x),2)`), a **computed GROUP BY key** (`GROUP BY lower(name)`, `GROUP BY a+b`, incl. over a JOIN and under GROUPING SETS), `GROUP BY`, `HAVING`, `GROUP BY ROLLUP`/`CUBE`/`GROUPING SETS` (single-table **and over a JOIN**, incl. `HAVING`, `COUNT`/`SUM`/`AVG`(`DISTINCT`) per set, the statistical / bitwise aggregates (`variance`/`var_pop`/`stddev*`/`bit_and`/`bit_or`/`bit_xor`) per set, computed keys, **and a window over it — single-table or over a JOIN**) + the `GROUPING()` super-aggregate helper, **`ORDER BY <position>`** (`ORDER BY 1`) and **`ORDER BY <aggregate>`** (`ORDER BY count(*) DESC`, when selected) | a correlated WHERE over a JOIN, or a subquery in HAVING alongside a window over GROUPING SETS |
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` frames (`UNBOUNDED`/`CURRENT ROW`, numeric `n PRECEDING`/`n FOLLOWING` offsets, **and** `INTERVAL` offsets over a date/timestamp key) | a `RANGE` interval offset on a non-temporal key |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, a **pure-`RIGHT` adjacent chain of 3+ tables**, a **leading `RIGHT`/`FULL` join + `INNER`/`LEFT` tail**, a **trailing `RIGHT`/`FULL` join over an `N`-table `INNER`/`LEFT` composite** (`A [INNER|LEFT] JOIN B [… JOIN …] RIGHT|FULL JOIN C`, outer `ON` over any subset of composite tables), `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (simple single-table subquery, or a **rich** subquery — join / `GROUP BY` / `DISTINCT` / aggregate — evaluated per outer row; correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | a `RIGHT`/`FULL` join that isn't first in a 3+ chain (other than the trailing-outer-over-a-composite case), a non-adjacent `RIGHT` `ON`, a second `FULL` in the tail, a composite whose own joins aren't adjacent |
-| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`, multi-action lists `ADD …, DROP …`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`, partial `… WHERE …`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `CREATE [OR REPLACE]`/`DROP FUNCTION` (`LANGUAGE sql` single-statement body, or `LANGUAGE plpgsql` scalar body — `DECLARE` / `:=` / `IF` / `RETURN` / `SELECT … INTO`), `COMMENT ON TABLE`/`COLUMN`, **expression column `DEFAULT`** (`now()` / `gen_random_uuid()` / arithmetic, evaluated per row) | a column `DEFAULT` that references another column, multi-statement `LANGUAGE sql` bodies, `plpgsql` loops / `RAISE` / set-returning / `CASE` / cursors / exceptions |
+| DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`, multi-action lists `ADD …, DROP …`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`, partial `… WHERE …`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `CREATE [OR REPLACE]`/`DROP FUNCTION` (`LANGUAGE sql` single-statement body, or `LANGUAGE plpgsql` scalar body — `DECLARE` / `:=` / `IF` / `RAISE` / `RETURN` / `SELECT … INTO`), `COMMENT ON TABLE`/`COLUMN`, **expression column `DEFAULT`** (`now()` / `gen_random_uuid()` / arithmetic, evaluated per row) | a column `DEFAULT` that references another column, multi-statement `LANGUAGE sql` bodies, `plpgsql` loops / set-returning / `CASE` / cursors / exception handlers |
 | Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (real nested rollback), two-phase commit `PREPARE TRANSACTION` / `COMMIT`/`ROLLBACK PREPARED` (cross-connection, `pg_prepared_xacts`) | prepared xacts surviving a restart, two-phase over the extended protocol |
 | Sessions | `LISTEN`/`NOTIFY`/`UNLISTEN` + `pg_notify()` (cross-connection pub/sub), `PREPARE`/`EXECUTE`/`DEALLOCATE` (SQL-level prepared statements), `DECLARE`/`FETCH`/`MOVE`/`CLOSE` (server-side cursors), `EXPLAIN [ANALYZE]` (`FORMAT TEXT`/`JSON`, faithful Index/Seq Scan) | async push to a fully-idle connection, cursor `SCROLL` past materialized rows, per-node `EXPLAIN` costs / timing |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format, `COPY … FROM/TO STDIN/STDOUT` (text + CSV) | binary-format `COPY`, `COPY` from/to a server-side file |

@@ -1,0 +1,182 @@
+[
+  {
+    "name": "pymongo",
+    "task": "validate",
+    "report": "docs/validation-report.md"
+  },
+  {
+    "name": "pymongo-async",
+    "task": "validate-pymongo-async",
+    "report": "docs/validation-report-pymongo-async.md"
+  },
+  {
+    "name": "go",
+    "task": "validate-go",
+    "report": "docs/validation-report-go.md"
+  },
+  {
+    "name": "node",
+    "task": "validate-node",
+    "report": "docs/validation-report-node.md"
+  },
+  {
+    "name": "java",
+    "task": "validate-java",
+    "report": "docs/validation-report-java.md"
+  },
+  {
+    "name": "kotlin",
+    "task": "validate-kotlin",
+    "report": "docs/validation-report-kotlin.md"
+  },
+  {
+    "name": "ruby",
+    "task": "validate-ruby",
+    "report": "docs/validation-report-ruby.md"
+  },
+  {
+    "name": "rust",
+    "task": "validate-rust",
+    "report": "docs/validation-report-rust.md"
+  },
+  {
+    "name": "php-lib",
+    "task": "validate-php-lib",
+    "report": "docs/validation-report-php-lib.md"
+  },
+  {
+    "name": "php-ext",
+    "task": "validate-php-ext",
+    "report": "docs/validation-report-php-ext.md"
+  },
+  {
+    "name": "c",
+    "task": "validate-c",
+    "report": "docs/validation-report-c.md"
+  },
+  {
+    "name": "cxx",
+    "task": "validate-cxx",
+    "report": "docs/validation-report-cxx.md"
+  },
+  {
+    "name": "dotnet",
+    "task": "validate-dotnet",
+    "report": "docs/validation-report-dotnet.md"
+  },
+  {
+    "name": "psycopg",
+    "task": "validate-psycopg",
+    "report": "docs/validation-report-psycopg.md"
+  },
+  {
+    "name": "sqlalchemy",
+    "task": "validate-sqlalchemy",
+    "report": "docs/validation-report-sqlalchemy.md"
+  },
+  {
+    "name": "sql-stress",
+    "task": "sql-stress",
+    "report": "docs/validation-report-sqlstress.md"
+  },
+  {
+    "name": "pgjdbc-1",
+    "group": "pgjdbc",
+    "task": "validate-pgjdbc --shard 1/4"
+  },
+  {
+    "name": "pgjdbc-2",
+    "group": "pgjdbc",
+    "task": "validate-pgjdbc --shard 2/4"
+  },
+  {
+    "name": "pgjdbc-3",
+    "group": "pgjdbc",
+    "task": "validate-pgjdbc --shard 3/4"
+  },
+  {
+    "name": "pgjdbc-4",
+    "group": "pgjdbc",
+    "task": "validate-pgjdbc --shard 4/4"
+  },
+  {
+    "name": "pgtest",
+    "task": "validate-pgtest",
+    "report": "docs/validation-report-pgtest.md"
+  },
+  {
+    "name": "pgx",
+    "task": "validate-pgx",
+    "report": "docs/validation-report-pgx.md"
+  },
+  {
+    "name": "slt",
+    "task": "validate-slt",
+    "report": "docs/validation-report-slt.md"
+  },
+  {
+    "name": "pymongo-rust-server",
+    "task": "validate --server rust",
+    "report": "docs/validation-report-rust-server.md"
+  },
+  {
+    "name": "pymongo-async-rust-server",
+    "task": "validate-pymongo-async --server rust",
+    "report": "docs/validation-report-pymongo-async-rust-server.md"
+  },
+  {
+    "name": "go-rust-server",
+    "task": "validate-go --server rust",
+    "report": "docs/validation-report-go-rust-server.md"
+  },
+  {
+    "name": "node-rust-server",
+    "task": "validate-node --server rust",
+    "report": "docs/validation-report-node-rust-server.md"
+  },
+  {
+    "name": "java-rust-server",
+    "task": "validate-java --server rust",
+    "report": "docs/validation-report-java-rust-server.md"
+  },
+  {
+    "name": "kotlin-rust-server",
+    "task": "validate-kotlin --server rust",
+    "report": "docs/validation-report-kotlin-rust-server.md"
+  },
+  {
+    "name": "ruby-rust-server",
+    "task": "validate-ruby --server rust",
+    "report": "docs/validation-report-ruby-rust-server.md"
+  },
+  {
+    "name": "rust-rust-server",
+    "task": "validate-rust --server rust",
+    "report": "docs/validation-report-rust-rust-server.md"
+  },
+  {
+    "name": "php-lib-rust-server",
+    "task": "validate-php-lib --server rust",
+    "report": "docs/validation-report-php-lib-rust-server.md"
+  },
+  {
+    "name": "php-ext-rust-server",
+    "task": "validate-php-ext --server rust",
+    "report": "docs/validation-report-php-ext-rust-server.md"
+  },
+  {
+    "name": "c-rust-server",
+    "task": "validate-c --server rust",
+    "report": "docs/validation-report-c-rust-server.md"
+  },
+  {
+    "name": "cxx-rust-server",
+    "task": "validate-cxx --server rust",
+    "report": "docs/validation-report-cxx-rust-server.md"
+  },
+  {
+    "name": "dotnet-rust-server",
+    "task": "validate-dotnet --server rust",
+    "report": "docs/validation-report-dotnet-rust-server.md"
+  }
+]

@@ -22,6 +22,7 @@ import types
 
 import bson
 import pytest
+from bson.decimal128 import Decimal128
 
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
@@ -1278,3 +1279,30 @@ def test_pipeline_fuzz(seed):
         handled += 1
         assert rust == py, f"rust={rust} pure={py} pipeline={pipeline} docs={docs}"
     assert handled > 1000, f"expected many handled pipelines, only {handled}"
+
+
+# `$sum` / `$avg` over Decimal128 compute natively in Rust now (they used to
+# defer). Note these accumulators convert a double by its **exact** binary
+# value, unlike `$inc`/`$mul`, which use 15 significant digits — mongod really
+# does differ between the two, so the split is pinned on both sides.
+DECIMAL_ACC_DOCS = [
+    [{"_id": 1, "x": Decimal128("1.000000000000000000000000000000001")}, {"_id": 2, "x": 1}],
+    [{"_id": 1, "x": Decimal128("2.50")}, {"_id": 2, "x": Decimal128("0.10")}],
+    [{"_id": 1, "x": Decimal128("0")}, {"_id": 2, "x": 0.1}],
+    [{"_id": 1, "x": Decimal128("0")}, {"_id": 2, "x": 1e10}],
+    [{"_id": 1, "x": Decimal128("1.5")}, {"_id": 2, "x": 3.0}],
+    [{"_id": 1, "x": Decimal128("-2.5")}, {"_id": 2, "x": Decimal128("2.5")}],
+    [{"_id": 1, "x": Decimal128("1")}, {"_id": 2, "x": Decimal128("2")}, {"_id": 3, "x": 3}],
+    [{"_id": 1, "x": Decimal128("1")}, {"_id": 2, "x": "skip"}, {"_id": 3, "x": None}],
+]
+
+
+@pytest.mark.parametrize("acc", ["$sum", "$avg"])
+@pytest.mark.parametrize("docs", DECIMAL_ACC_DOCS, ids=range(len(DECIMAL_ACC_DOCS)))
+def test_decimal_accumulators_match_pure_python(docs, acc):
+    docs = [bson.decode(bson.encode(d)) for d in docs]
+    pipeline = [{"$group": {"_id": None, "r": {acc: "$x"}}}]
+    got = _rust_pipeline(docs, pipeline)
+    assert got is not None, "Rust deferred; decimal accumulation should be native"
+    want = _pure.apply_pipeline([dict(d) for d in docs], pipeline, _PipelineContext())
+    assert got == want

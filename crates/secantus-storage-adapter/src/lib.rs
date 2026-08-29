@@ -42,6 +42,10 @@ impl StorageAdapter {
 }
 
 impl CmdStorage for StorageAdapter {
+    fn in_memory(&self) -> bool {
+        self.inner.in_memory()
+    }
+
     fn peek_cluster_time(&self) -> bson::Timestamp {
         // Gossip must never fail a command — fall back to a zero timestamp
         // if the (read-only, mints-once-on-virgin) peek somehow errors.
@@ -172,13 +176,14 @@ impl CmdStorage for StorageAdapter {
     }
 
     fn oplog_tail_seq(&self) -> i64 {
-        // The VISIBLE tail, not the minted tail: a fresh change stream seeds
-        // its position here, and the minted tail can sit past an entry whose
-        // transaction has not committed yet — a watch opened at that position
-        // would permanently miss the entry when it commits. The visible tail
-        // is the highest seq a reader may safely name (sync: the
-        // in-flight-window floor; async: the drainer's durable watermark).
-        self.inner.oplog_visible_tail_seq()
+        // The change-stream OPEN position (this trait method's only caller
+        // is the open-seeding path): sync mode, the visible tail — the
+        // minted tail can sit past an entry whose transaction has not
+        // committed yet, and a watch opened there would permanently miss the
+        // entry when it commits. Async mode, `oplog_open_seq` additionally
+        // waits for the drainer to reach the minted tail so writes acked
+        // before the open can't surface as post-open events.
+        self.inner.oplog_open_seq()
     }
 
     fn oplog_floor_seq(&self) -> i64 {
@@ -257,6 +262,7 @@ impl CmdStorage for StorageAdapter {
                 &Document::new(),
                 None,
                 None,
+                false,
             )
             .map_err(map_err)?;
         Ok(UpdateOutcome {
@@ -280,10 +286,12 @@ impl CmdStorage for StorageAdapter {
         let_vars: &Document,
         collation: Option<&Collation>,
         validator: Option<&Document>,
+        validator_moderate: bool,
+        want_post_image: bool,
     ) -> Result<UpdateOutcome, StorageError> {
         let o = self
             .inner
-            .update_matching(
+            .update_matching_leveled(
                 db,
                 coll,
                 filter,
@@ -294,6 +302,8 @@ impl CmdStorage for StorageAdapter {
                 let_vars,
                 collation,
                 validator,
+                validator_moderate,
+                want_post_image,
             )
             .map_err(map_err)?;
         Ok(UpdateOutcome {
@@ -316,11 +326,23 @@ impl CmdStorage for StorageAdapter {
         let_vars: &Document,
         collation: Option<&Collation>,
         validator: Option<&Document>,
+        validator_moderate: bool,
+        want_post_image: bool,
     ) -> Result<UpdateOutcome, StorageError> {
         let o = self
             .inner
             .update_matching_pipeline(
-                db, coll, filter, pipeline, multi, upsert, let_vars, collation, validator,
+                db,
+                coll,
+                filter,
+                pipeline,
+                multi,
+                upsert,
+                let_vars,
+                collation,
+                validator,
+                validator_moderate,
+                want_post_image,
             )
             .map_err(map_err)?;
         Ok(UpdateOutcome {
@@ -812,6 +834,15 @@ fn map_err(e: WtError) -> StorageError {
         // A lost WT_ROLLBACK race → mongod's WriteConflict (112). Routed
         // command-level by the write handlers so the txn envelope labels it.
         WtError::WriteConflict => StorageError::WriteConflict,
+        // An oversized multi-document transaction → mongod's
+        // TransactionTooLargeForCache (313). Deliberately NOT in the
+        // transient-label set: retrying the same transaction hits the same
+        // wall.
+        WtError::TransactionTooLargeForCache => StorageError::WriteError {
+            code: 313,
+            errmsg: "Transaction is too large and will not fit in the storage engine cache"
+                .to_string(),
+        },
         // An over-limit document → mongod's BSONObjectTooLarge (10334).
         WtError::DocumentTooLarge(size) => StorageError::WriteError {
             code: 10334,
@@ -833,6 +864,22 @@ fn map_err(e: WtError) -> StorageError {
         // Bad hint / unsupported query construct → BadValue (2), the same code
         // the Python server surfaces for these at the command layer.
         WtError::BadHint(m) => StorageError::WriteError { code: 2, errmsg: m },
+        // A named refusal (non-numeric $inc/$mul) → mongod's TypeMismatch (14),
+        // not the generic BadValue the plain defer would produce.
+        WtError::UpdateTypeMismatch(m) => StorageError::WriteError {
+            code: 14,
+            errmsg: m,
+        },
+        // Overlapping operator paths → mongod's ConflictingUpdateOperators (40).
+        WtError::UpdatePathConflict(m) => StorageError::WriteError {
+            code: 40,
+            errmsg: m,
+        },
+        // Creating a field under a non-document → mongod's PathNotViable (28).
+        WtError::UpdatePathNotViable(m) => StorageError::WriteError {
+            code: 28,
+            errmsg: m,
+        },
         WtError::QueryUnsupported => StorageError::WriteError {
             code: 2,
             errmsg: "query uses a construct the Rust server does not support".to_string(),

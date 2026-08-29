@@ -11,6 +11,8 @@ function the aggregation engine can't lower (e.g. ``substr``) is still ``0A000``
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import bson
 import pytest
 import sqlglot
@@ -183,9 +185,14 @@ def test_function_in_colref_predicate_through_join(storage, session):
 def test_function_in_colref_predicate_evaluates_per_row(storage, session):
     # A predicate the pushdown can't lower (a scalar function against a column)
     # now routes to per-row evaluation instead of 0A000. qty is an int and
-    # substr() yields text, and the evaluator's cross-type ``=`` is False —
-    # real Postgres would error 42883 (no int = text operator); the silent
-    # no-match is a documented divergence (tasks/backlog.md).
+    # substr() yields text, so real Postgres would error 42883 (no int = text
+    # operator) — but ``orders`` here is a REFLECTED table (seeded through
+    # storage.insert, no CREATE TABLE), and the plan-time 42883 analysis
+    # (secantus.sql.typecheck) deliberately exempts reflected tables: their
+    # column types come from sampling 50 documents, so a heterogeneous BSON
+    # field can be declared text while holding ints. The silent no-match is
+    # the right answer here; a declared table gets the 42883
+    # (tests/test_sql_typecheck.py).
     assert q(storage, session, "SELECT _id FROM orders WHERE qty = substr(shipped, 1, 1)") == []
 
 
@@ -236,7 +243,10 @@ def test_colref_lowers_to_expr():
 
 
 def test_arithmetic_lowers_to_expr():
-    product = {"$multiply": ["$cost", 1.5]}
+    # 1.5 lowers as Decimal128, not a float: a decimal literal is ``numeric``
+    # in Postgres, and carrying it exactly is what makes ``0.1 + 0.2 = 0.3``
+    # true. This pins the lowered shape, so the type is part of the contract.
+    product = {"$multiply": ["$cost", bson.Decimal128(Decimal("1.5"))]}
     assert _filter_for("price < cost * 1.5") == {
         "$expr": {
             "$and": [

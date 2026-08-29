@@ -27,10 +27,14 @@ def _to_decimal(value: Any) -> Decimal:
     return Decimal(value)
 
 
-def _bson_type_rank(value: Any) -> int:
+def _bson_type_rank(value: Any) -> float:
     """Rank for MongoDB's cross-type sort order. Lower rank sorts first."""
     if isinstance(value, MinKey):
         return 1
+    # `[]` has no element to represent it in a sort. mongod places it between
+    # MinKey and null — verified: the corpus sorted `minkey < [] < null < ...`.
+    if isinstance(value, _EmptyArraySortsAs):
+        return 1.5  # type: ignore[return-value]
     if value is None:
         return 2
     if isinstance(value, bool):
@@ -135,6 +139,18 @@ def _bson_lt(a: Any, b: Any) -> bool:
         return type(a).__name__ < type(b).__name__
 
 
+class _EmptyArraySortsAs:
+    """Stand-in for `[]` in a sort key: below null, above MinKey (mongod)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<empty-array-sort-key>"
+
+
+_EMPTY_ARRAY_SORTS_AS = _EmptyArraySortsAs()
+
+
 def sort_docs(
     docs: list[dict[str, Any]], sort_spec: Mapping[str, Any] | None
 ) -> list[dict[str, Any]]:
@@ -145,5 +161,34 @@ def sort_docs(
     # one pass through Timsort, get_path called once per field per doc.
     return sorted(
         docs,
-        key=lambda d: tuple(_SortKey(get_path(d, f), reverse=rev) for f, rev in fields),
+        key=lambda d: tuple(
+            _SortKey(_array_sort_value(get_path(d, f), rev), reverse=rev) for f, rev in fields
+        ),
     )
+
+
+def _array_sort_value(v: Any, reverse: bool) -> Any:
+    """mongod sorts an ARRAY-valued field by one representative element.
+
+    Ascending takes the array's minimum element, descending its maximum —
+    verified against mongod 6.0.16, where `[[1,100], [5,9], 6, [7]]` sorts
+    ascending as `[1,100] < [5,9] < 6 < [7]` (by minima 1 < 5 < 6 < 7) and
+    descending by maxima 100 > 9 > 7 > 6.
+
+    Comparing whole arrays instead put every array after every scalar, which had
+    a worse consequence than being merely wrong: **it disagreed with our own index
+    path.** A multikey index writes one entry per element, so an IXSCAN already
+    yielded mongod's element ordering, and the same query returned a different
+    order depending on whether an index happened to exist. An index must change
+    speed, never results.
+
+    An empty array has no element to represent it; mongod sorts it below null
+    (just above MinKey), which `_EMPTY_ARRAY_SORTS_AS` stands in for. A non-array
+    value is returned unchanged.
+    """
+    if not isinstance(v, list):
+        return v
+    if not v:
+        return _EMPTY_ARRAY_SORTS_AS
+    keyed = [_SortKey(e) for e in v]
+    return (max(keyed) if reverse else min(keyed)).val

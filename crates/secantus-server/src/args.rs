@@ -57,6 +57,15 @@ pub struct CliArgs {
     pub oplog_retention_seconds: f64,
     pub oplog_max_entries: usize,
     pub ttl_sweep_seconds: f64,
+    /// Storage write-path modes (`--oplog-async` / `--oplog-nonlogged` /
+    /// `--data-nonlogged` / `--checkpoint-seconds`). `None` defers to the
+    /// matching `SECANTUS_*` env var via `StorageOptions`.
+    pub oplog_async: Option<bool>,
+    pub oplog_nonlogged: Option<bool>,
+    pub data_nonlogged: Option<bool>,
+    pub checkpoint_seconds: Option<u64>,
+    /// Admission control: cap on concurrent engine writes (0 / None = off).
+    pub write_tickets: Option<usize>,
 }
 
 /// TLS options in plain-data form (the lib's [`TlsOptions`] is not `PartialEq`,
@@ -102,6 +111,11 @@ impl CliArgs {
             oplog_retention_seconds: cfg.oplog_retention_seconds,
             oplog_max_entries: cfg.oplog_max_entries,
             ttl_sweep_seconds: cfg.ttl_sweep_seconds,
+            oplog_async: cfg.oplog_async,
+            oplog_nonlogged: cfg.oplog_nonlogged,
+            data_nonlogged: cfg.data_nonlogged,
+            checkpoint_seconds: cfg.checkpoint_seconds,
+            write_tickets: cfg.write_tickets,
         })
     }
 
@@ -238,6 +252,13 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             }
             "--cache-size" => o.cache_size = Some(take_value("--cache-size")?),
             "--log-file-max" => o.log_file_max = Some(take_value("--log-file-max")?),
+            "--write-tickets" => {
+                let raw = take_value("--write-tickets")?;
+                o.write_tickets = Some(
+                    raw.parse::<usize>()
+                        .map_err(|_| format!("--write-tickets: {raw:?} is not a number"))?,
+                );
+            }
             "--session-max" => {
                 let raw = take_value("--session-max")?;
                 o.session_max = Some(raw.parse::<u32>().map_err(|_| {
@@ -245,6 +266,15 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 })?);
             }
             "--sync-on-commit" => o.sync_on_commit = Some(true),
+            "--oplog-async" => o.oplog_async = Some(true),
+            "--oplog-nonlogged" => o.oplog_nonlogged = Some(true),
+            "--data-nonlogged" => o.data_nonlogged = Some(true),
+            "--checkpoint-seconds" => {
+                let raw = take_value("--checkpoint-seconds")?;
+                o.checkpoint_seconds = Some(raw.parse::<u64>().map_err(|_| {
+                    format!("--checkpoint-seconds expects a non-negative integer, got {raw:?}")
+                })?);
+            }
             "--noop-heartbeat-seconds" => {
                 let raw = take_value("--noop-heartbeat-seconds")?;
                 o.noop_heartbeat_seconds = Some(raw.parse::<f64>().map_err(|_| {
@@ -279,6 +309,9 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 "--auth"
                     | "--standalone"
                     | "--sync-on-commit"
+                    | "--oplog-async"
+                    | "--oplog-nonlogged"
+                    | "--data-nonlogged"
                     | "--tls-require-client-cert"
                     | "--help"
                     | "--version"
@@ -351,9 +384,31 @@ OPTIONS:
                                  load = higher throughput; files are sparse.)
     --session-max N              WiredTiger session_max — concurrent WT session
                                  cap (default: 1000)
+    --write-tickets N            Admission control: cap on writes concurrently
+                                 inside the storage engine; further writers
+                                 queue OUTSIDE it. 0 = unlimited (default).
+                                 Bounds the p99.9 tail under write saturation,
+                                 which unbounded concurrency does not — see
+                                 tasks/backlog.md. Start near the core count.
     --sync-on-commit             Fsync the WT log on every transaction commit
                                  (closes the writeConcern j:true durability gap
                                  at a throughput cost; off by default)
+    --oplog-async                Persist oplog entries via a background drainer
+                                 pool instead of inside each write's commit
+                                 (higher write throughput; change-stream events
+                                 become visible when drained. Default: off, or
+                                 SECANTUS_OPLOG_ASYNC)
+    --oplog-nonlogged            Create oplog tables log=(enabled=false) —
+                                 checkpoint-durable only. Measurement/ephemeral
+                                 use; a crash can lose the oplog tail (default:
+                                 off, or SECANTUS_OPLOG_NONLOGGED)
+    --data-nonlogged             mongod's split: WAL-log only the oplog; data
+                                 tables recover by oplog replay from the last
+                                 stable checkpoint. Create-time for fresh
+                                 stores; an existing store keeps its recorded
+                                 mode (default: off, or SECANTUS_DATA_NONLOGGED)
+    --checkpoint-seconds S       Stable-checkpoint cadence for --data-nonlogged
+                                 (default: 60, or SECANTUS_CHECKPOINT_SECONDS)
     --noop-heartbeat-seconds S   Emit a periodic {{op:'n'}} oplog heartbeat every
                                  S seconds so quiet change-stream cursors keep
                                  their resume token inside the retention window.
@@ -461,6 +516,41 @@ mod tests {
         assert!(parse(&["--auth=yes"]).is_err());
         assert!(parse(&["--standalone=1"]).is_err());
         assert!(parse(&["--sync-on-commit=1"]).is_err());
+        assert!(parse(&["--oplog-async=1"]).is_err());
+        assert!(parse(&["--oplog-nonlogged=1"]).is_err());
+        assert!(parse(&["--data-nonlogged=1"]).is_err());
+    }
+
+    #[test]
+    fn storage_mode_flags_default_to_env_deferral() {
+        // No flag passed → None → StorageOptions defers to the SECANTUS_* env.
+        let a = run(&[]);
+        assert_eq!(a.oplog_async, None);
+        assert_eq!(a.oplog_nonlogged, None);
+        assert_eq!(a.data_nonlogged, None);
+        assert_eq!(a.checkpoint_seconds, None);
+    }
+
+    #[test]
+    fn storage_mode_flags_resolve() {
+        let a = run(&[
+            "--oplog-async",
+            "--oplog-nonlogged",
+            "--data-nonlogged",
+            "--checkpoint-seconds",
+            "15",
+        ]);
+        assert_eq!(a.oplog_async, Some(true));
+        assert_eq!(a.oplog_nonlogged, Some(true));
+        assert_eq!(a.data_nonlogged, Some(true));
+        assert_eq!(a.checkpoint_seconds, Some(15));
+    }
+
+    #[test]
+    fn bad_checkpoint_seconds_rejected() {
+        assert!(parse(&["--checkpoint-seconds", "-5"]).is_err());
+        assert!(parse(&["--checkpoint-seconds", "abc"]).is_err());
+        assert!(parse(&["--checkpoint-seconds"]).is_err());
     }
 
     #[test]

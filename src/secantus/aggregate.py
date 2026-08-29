@@ -4,6 +4,7 @@ import copy
 import datetime as _dt
 import decimal as _decimal
 import math
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
@@ -20,12 +21,20 @@ from secantus.expressions import (
     evaluate,
     evaluate_or_missing,
 )
-from secantus.numerics import bson_add
+from secantus.numerics import bson_sum
 from secantus.paths import get_path, set_path, unset_path
 from secantus.query import QueryError, matches
 
 if TYPE_CHECKING:
     from secantus.storage import Storage
+
+
+# mongod's exact arity error for a stage document that isn't a single
+# ``{operator: spec}`` pair -- both an empty ``{}`` and a multi-key stage.
+# Probed identical on mongod 6.0.16 and 8.3.4. Note the trailing period and
+# the dedicated code: it is Location40323, NOT the generic 14 TypeMismatch
+# that a wrong *element type* gets.
+STAGE_ARITY_MSG = "A pipeline stage specification object must contain exactly one field."
 
 
 class AggregateError(Exception):
@@ -47,6 +56,26 @@ class AggregateError(Exception):
 # message naming Atlas; the driver index-management spec tests assert only that
 # the error mentions "Atlas". Shared with ``commands.py`` so the stage and the
 # commands stay in lockstep.
+#: Hard ceiling on documents materialized by a single pipeline stage. A join
+#: whose predicates can't be pushed into the ``$lookup`` degenerates into a
+#: cartesian product (an unkeyed comma-join over system catalogs — pgjdbc's
+#: getImportedKeys for multi-column FKs ballooned to 183GB and OS-killed the
+#: server). This bounds the blast radius: the pipeline fails with a clear error
+#: instead of exhausting memory. Generous enough that real aggregations never
+#: hit it; override with ``SECANTUS_MAX_PIPELINE_DOCS`` for a stress harness.
+MAX_PIPELINE_DOCS = int(os.environ.get("SECANTUS_MAX_PIPELINE_DOCS", 5_000_000))
+
+
+def _pipeline_overflow(stage: str) -> AggregateError:
+    return AggregateError(
+        f"{stage} would materialize more than {MAX_PIPELINE_DOCS} documents in one "
+        "stage — the query degenerated into an unbounded cross product; add a join "
+        "predicate the planner can push down, or raise SECANTUS_MAX_PIPELINE_DOCS",
+        code=292,
+        code_name="QueryExceededMemoryLimitNoDiskUseAllowed",
+    )
+
+
 SEARCH_INDEX_ATLAS_MSG = (
     "Using Atlas Search Database Commands and the $listSearchIndexes aggregation "
     "stage requires additional configuration. Please connect to Atlas or an "
@@ -71,6 +100,14 @@ class PipelineContext:
     # request's ``collation`` argument; ``None`` keeps default
     # codepoint comparison.
     collation: Any = None
+    # Cleared (sticky) by ``apply_pipeline`` when any stage — including nested
+    # $lookup/$facet/$unionWith sub-pipelines — mutates docs in place ($fill's
+    # locf/linear and $densify write through set_path without copying). While
+    # True, ``$unwind`` may produce shallow top-level copies that share
+    # unmutated subtrees instead of deepcopying every fanned-out doc — the
+    # dominant cost of high-fanout join pipelines (pgjdbc's getImportedKeys
+    # 9-way join). Never flips back to True on a ctx once cleared.
+    shared_unwind_ok: bool = True
     # The aggregate command's request body (minus the ``$db`` /
     # ``lsid`` envelope fields). Surfaced by ``$currentOp`` as the
     # ``command`` sub-doc on the self-row mongo-node-driver's
@@ -135,9 +172,37 @@ def apply_pipeline(
                         code=40601,
                         code_name="Location40601",
                     )
+    if ctx.shared_unwind_ok and _pipeline_mutates_in_place(pipeline):
+        ctx.shared_unwind_ok = False
     for stage in pipeline:
         docs = _apply_stage(stage, docs, ctx)
+        if len(docs) > MAX_PIPELINE_DOCS:
+            name = next(iter(stage)) if isinstance(stage, Mapping) and stage else "stage"
+            raise _pipeline_overflow(name)
     return docs
+
+
+def _pipeline_mutates_in_place(pipeline: Any) -> bool:
+    """Whether any stage (recursing into $lookup / $facet / $unionWith
+    sub-pipelines) writes through docs without copying — the gate for
+    ``$unwind``'s shared shallow-copy fast path."""
+    if not isinstance(pipeline, list):
+        return False
+    for stage in pipeline:
+        if not isinstance(stage, Mapping):
+            continue
+        if "$fill" in stage or "$densify" in stage:
+            return True
+        for key in ("$lookup", "$unionWith"):
+            spec = stage.get(key)
+            if isinstance(spec, Mapping) and _pipeline_mutates_in_place(spec.get("pipeline")):
+                return True
+        facet = stage.get("$facet")
+        if isinstance(facet, Mapping):
+            for sub in facet.values():
+                if _pipeline_mutates_in_place(sub):
+                    return True
+    return False
 
 
 def _apply_stage(
@@ -145,8 +210,14 @@ def _apply_stage(
     docs: list[dict[str, Any]],
     ctx: PipelineContext,
 ) -> list[dict[str, Any]]:
+    if not isinstance(stage, Mapping):
+        # mongod's exact wording and code (14 TypeMismatch); libmongoc's
+        # /change_stream/accepts_array asserts on this string. Without the
+        # type check ``len(stage)`` raised TypeError on e.g. ``pipeline: [42]``
+        # and the client saw a bare "internal server error".
+        raise AggregateError("Each element of the 'pipeline' array must be an object")
     if len(stage) != 1:
-        raise AggregateError("each pipeline stage must have exactly one key")
+        raise AggregateError(STAGE_ARITY_MSG, code=40323, code_name="Location40323")
     name, spec = next(iter(stage.items()))
     if name in _ATLAS_ONLY_STAGES:
         # Atlas-only stage on a non-Atlas deployment — mongod fails it with a
@@ -171,6 +242,14 @@ def _stage_match(
 ) -> list[dict[str, Any]]:
     from secantus.collation import parse as _parse_collation
 
+    if not isinstance(spec, Mapping):
+        # A non-document $match spec reached the matcher and crashed as
+        # "internal server error"; mongod names it with its own code.
+        raise AggregateError(
+            "the match filter must be an expression in an object",
+            code=15959,
+            code_name="Location15959",
+        )
     coll_obj = _parse_collation(ctx.collation)
     return [d for d in docs if matches(d, spec, vars=ctx.vars, collation=coll_obj)]
 
@@ -269,7 +348,15 @@ def _validate_sort_spec(spec: Any) -> None:
     """mongod's `$sort` stage validation: at least one key (15976); each direction
     is 1 / -1 as an int or whole double, else a non-numeric value is "Illegal key"
     (15974) and a numeric non-±1 is "must be 1 … or -1" (15975)."""
-    if not isinstance(spec, Mapping) or not spec:
+    if not isinstance(spec, Mapping):
+        # A wrong-TYPED spec and an EMPTY one are different errors on mongod
+        # (15973 vs 15976); we answered 15976 for both.
+        raise AggregateError(
+            "the $sort key specification must be an object",
+            code=15973,
+            code_name="Location15973",
+        )
+    if not spec:
         raise AggregateError(
             "$sort stage must have at least one sort key",
             code=15976,
@@ -368,9 +455,14 @@ def _project_one(
             if value is not None or _path_present(doc, path):
                 set_path(result, path, copy.deepcopy(value))
         for key, expr in computed.items():
-            value = evaluate(expr, doc, vars)
+            # `evaluate_or_missing`, not `evaluate`: a *direct field path* that
+            # doesn't exist (`{z: "$nope"}`) evaluates to MISSING in mongod and
+            # the key is omitted. Plain `evaluate` answers None, which emitted
+            # `z: null` on every document — an extra key mongod never sends, so
+            # a client testing `"z" in doc` saw the opposite of the truth.
+            value = evaluate_or_missing(expr, doc, vars)
             # A computed field that resolves to the "missing" marker (an
-            # absent field via ``$getField`` / an explicit ``$$REMOVE``) is
+            # absent field path, ``$getField``, or an explicit ``$$REMOVE``) is
             # omitted from the output, matching mongod — never emitted as null.
             if value is MISSING:
                 continue
@@ -409,8 +501,10 @@ def _add_fields_one(
 ) -> dict[str, Any]:
     result = copy.deepcopy(doc)
     for path, expr in spec.items():
-        value = evaluate(expr, doc, vars)
-        # A field that resolves to the "missing" marker (absent field via
+        # See `_project_one`: a direct field path that doesn't exist is MISSING,
+        # not null, and mongod omits the key rather than adding it.
+        value = evaluate_or_missing(expr, doc, vars)
+        # A field that resolves to the "missing" marker (absent field path,
         # ``$getField`` / ``$$REMOVE``) is dropped rather than written —
         # matching mongod's ``$addFields``, which removes an existing field
         # when its new value is the missing/``$$REMOVE`` value.
@@ -613,7 +707,29 @@ def _stage_densify(
 
     out: list[dict[str, Any]] = []
     for key in insertion_order:
-        partition_docs = sorted(grouped[key], key=lambda d: get_path(d, field))
+        # A doc whose densify field is null or absent does NOT participate:
+        # mongod passes it through at its BSON sort position (null sorts before
+        # numbers) and densifies only the rest. Sorting the raw list crashed
+        # here with a bare `TypeError: '<' not supported between instances of
+        # 'NoneType' and 'int'`, which escaped as "internal server error"
+        # (code 1) — a crash where mongod answers.
+        passthrough = [d for d in grouped[key] if not _densify_participates(d, field)]
+        participants = [d for d in grouped[key] if _densify_participates(d, field)]
+        for d in participants:
+            value = get_path(d, field)
+            if not _densify_value_ok(value):
+                # mongod-probed 6.0.16: a non-numeric, non-date value is
+                # rejected outright rather than skipped.
+                raise AggregateError(
+                    "Densify field type must be numeric or a date",
+                    code=5733201,
+                    code_name="Location5733201",
+                )
+        # Null / missing sort before every number and date, so they lead.
+        out.extend(passthrough)
+        if not participants:
+            continue
+        partition_docs = sorted(participants, key=lambda d: get_path(d, field))
         partition_carry = {f: get_path(partition_docs[0], f) for f in partition_fields}
         if isinstance(bounds, list) and len(bounds) == 2:
             lo, hi = bounds[0], bounds[1]
@@ -622,6 +738,22 @@ def _stage_densify(
             hi = get_path(partition_docs[-1], field)
         out.extend(_densify_partition(field, partition_docs, lo, hi, step, partition_carry))
     return out
+
+
+def _densify_participates(doc: Mapping[str, Any], field: str) -> bool:
+    """Whether a doc takes part in densification at all.
+
+    mongod ignores a doc whose densify field is missing or null — it is emitted
+    unchanged and contributes neither a bound nor a step.
+    """
+    return get_path(doc, field, default=None) is not None
+
+
+def _densify_value_ok(value: Any) -> bool:
+    """mongod's densify domain: numeric or date. `bool` is not numeric here."""
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (int, float, _dt.datetime, Decimal128))
 
 
 def _densify_fill_range(
@@ -675,6 +807,12 @@ def _densify_canon(value: Any) -> Any:
     return value
 
 
+_UNWIND_NO_PATH = object()
+"""Absent `path` -- distinct from `path: null`, which is 28808 not 28812."""
+
+_UNWIND_OPTIONS = frozenset({"path", "preserveNullAndEmptyArrays", "includeArrayIndex"})
+
+
 def _stage_unwind(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -683,7 +821,16 @@ def _stage_unwind(
         raw_path: Any = spec
         preserve_null = False
     elif isinstance(spec, Mapping):
-        raw_path = spec.get("path")
+        unknown = next((k for k in spec if k not in _UNWIND_OPTIONS), None)
+        if unknown is not None:
+            # Ahead of the no-path check: mongod answers 28811 for
+            # `{$unwind: {other: 1}}`, not 28812 (probed).
+            raise AggregateError(
+                f"unrecognized option to $unwind stage: {unknown}",
+                code=28811,
+                code_name="Location28811",
+            )
+        raw_path = spec.get("path", _UNWIND_NO_PATH)
         preserve_raw = spec.get("preserveNullAndEmptyArrays", False)
         if not isinstance(preserve_raw, bool):
             raise AggregateError(
@@ -710,7 +857,21 @@ def _stage_unwind(
                     code_name="Location28822",
                 )
     else:
-        raise AggregateError("$unwind requires a path string or document spec")
+        raise AggregateError(
+            "expected either a string or an object as specification for "
+            f"$unwind stage, got {_bson_type_name(spec)}",
+            code=15981,
+            code_name="Location15981",
+        )
+    if raw_path is _UNWIND_NO_PATH or raw_path == "":
+        # Both an ABSENT `path` and an empty one are "no path specified" on
+        # mongod; only a path of the wrong TYPE is 28808. An empty string used
+        # to fall through to the missing-`$` check and answer 28818.
+        raise AggregateError(
+            "no path specified to $unwind stage",
+            code=28812,
+            code_name="Location28812",
+        )
     if not isinstance(raw_path, str):
         raise AggregateError(
             f"expected a string as the path for $unwind stage, got {_bson_type_name(raw_path)}",
@@ -725,32 +886,46 @@ def _stage_unwind(
         )
     path = raw_path.lstrip("$")
 
+    # Fast path: a top-level unwind field in a pipeline with no in-place
+    # mutating stage (see PipelineContext.shared_unwind_ok) fans out with a
+    # shallow dict copy — every stage that writes docs deepcopies its input
+    # first, so shared subtrees are never corrupted. High-fanout join
+    # pipelines spend nearly all their time in this deepcopy otherwise.
+    shallow = _ctx.shared_unwind_ok and "." not in path
+    _copy = (lambda d: dict(d)) if shallow else copy.deepcopy
+
     result: list[dict[str, Any]] = []
     for doc in docs:
+        # Fail fast mid-fanout: an unkeyed join's $unwind multiplies row counts
+        # per stage, so the balloon must be caught while materializing, not only
+        # after (a single stage can otherwise reach tens of GB before the loop's
+        # post-stage check runs).
+        if len(result) > MAX_PIPELINE_DOCS:
+            raise _pipeline_overflow("$unwind")
         value = get_path(doc, path)
         if isinstance(value, list):
             if not value:
                 if preserve_null:
-                    new = copy.deepcopy(doc)
+                    new = _copy(doc)
                     unset_path(new, path)
                     if include_index:
                         new[include_index] = None
                     result.append(new)
                 continue
             for i, elem in enumerate(value):
-                new = copy.deepcopy(doc)
+                new = _copy(doc)
                 set_path(new, path, elem)
                 if include_index:
                     new[include_index] = i
                 result.append(new)
         elif value is None:
             if preserve_null:
-                new = copy.deepcopy(doc)
+                new = _copy(doc)
                 if include_index:
                     new[include_index] = None
                 result.append(new)
         else:
-            new = copy.deepcopy(doc)
+            new = _copy(doc)
             if include_index:
                 new[include_index] = None
             result.append(new)
@@ -946,8 +1121,18 @@ def _replace_root_one(
 def _stage_group(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    if not isinstance(spec, Mapping) or "_id" not in spec:
-        raise AggregateError("$group requires an _id expression")
+    if not isinstance(spec, Mapping):
+        raise AggregateError(
+            "a group's fields must be specified in an object",
+            code=15947,
+            code_name="Location15947",
+        )
+    if "_id" not in spec:
+        raise AggregateError(
+            "a group specification must include an _id",
+            code=15955,
+            code_name="Location15955",
+        )
     id_expr = spec["_id"]
     accumulators = {k: v for k, v in spec.items() if k != "_id"}
     # Pre-compile accumulators once: each entry is (field, handler, arg) where
@@ -1000,7 +1185,7 @@ def _hashable_with_collation(value: Any, collation: Any) -> Any:
 def _finalize(bucket: dict[str, Any]) -> dict[str, Any]:
     for k, v in list(bucket.items()):
         if isinstance(v, dict) and "_avg_total" in v and "_avg_n" in v:
-            bucket[k] = v["_avg_total"] / v["_avg_n"] if v["_avg_n"] else None
+            bucket[k] = _avg_divide(v["_avg_total"], v["_avg_n"])
         elif isinstance(v, dict) and "_std_vals" in v:
             bucket[k] = _std_dev(v["_std_vals"], pop=v["_std_pop"])
         elif isinstance(v, dict) and "_nelem_vals" in v:
@@ -1032,7 +1217,7 @@ def _std_dev(values: list[Any], *, pop: bool) -> float | None:
         return None
     total = 0.0
     for x in values:
-        total += x  # bool folds to 0.0/1.0, matching the Rust engine
+        total += x  # values are pre-filtered to floats by the accumulator
     mean = total / n
     denom = n if pop else n - 1
     acc = 0.0
@@ -1045,6 +1230,20 @@ def _std_dev(values: list[Any], *, pop: bool) -> float | None:
 _AccHandler = Callable[[dict[str, Any], str, Any, Mapping[str, Any], dict[str, Any]], None]
 
 
+def _std_dev_operand(v: Any) -> float:
+    """A `$stdDev*` input as the float the fold works on.
+
+    mongod answers a double even for decimal input (probed 6.0.16: `$stdDevPop`
+    over Decimal128 5 and 7 is `1.0`), so decimals convert here rather than
+    widening the accumulator.
+    """
+    if isinstance(v, Decimal128):
+        return float(v.to_decimal())
+    if isinstance(v, _decimal.Decimal):
+        return float(v)
+    return float(v)
+
+
 def _is_acc_number(v: Any) -> bool:
     """A numeric value that ``$sum`` / ``$avg`` accumulate. mongod ignores
     everything else (string / bool / null / missing / array / …); a bool is *not*
@@ -1052,6 +1251,25 @@ def _is_acc_number(v: Any) -> bool:
     included for the SQL engine, whose ``numeric`` columns compile SUM/AVG through
     ``$sum`` / ``$avg`` with Python decimals (not ``bson.Decimal128``)."""
     return isinstance(v, (int, float, Decimal128, _decimal.Decimal)) and not isinstance(v, bool)
+
+
+def _avg_divide(total: Any, n: int) -> Any:
+    """Finalise a running $avg, keeping Decimal128 in the decimal domain.
+
+    mongod's $avg over Decimal128 values answers a Decimal128; dividing through
+    Python float would both narrow the type and lose precision.
+    """
+    if not n:
+        return None
+    if isinstance(total, Decimal128):
+        # Decimal128 carries 34 significant digits; Python's default decimal
+        # context is 28, which silently truncated the quotient to 27 and left us
+        # short of mongod (…333333333333333 vs our …333333333). Widen the context
+        # for the division only.
+        with _decimal.localcontext() as ctx:
+            ctx.prec = 34
+            return Decimal128(total.to_decimal() / _decimal.Decimal(n))
+    return total / n
 
 
 def _acc_sum(
@@ -1065,7 +1283,7 @@ def _acc_sum(
     # bson_add preserves the BSON numeric type (int32 < int64 < double <
     # decimal128) so a $sum over Int64 values stays Int64 rather than
     # narrowing to int32 on the wire.
-    bucket[field] = bson_add(bucket[field], increment)
+    bucket[field] = bson_sum(bucket[field], increment)
 
 
 def _acc_count(
@@ -1086,7 +1304,12 @@ def _acc_avg(
     v = evaluate(arg, doc, vars)
     if not _is_acc_number(v):
         return  # mongod averages only numeric values
-    state["_avg_total"] += v
+    # `bson_add`, not `+=`: a raw Python add throws
+    # `TypeError: unsupported operand type(s) for +=: 'float' and 'Decimal128'`
+    # the moment a group mixes Decimal128 with any other numeric type, and that
+    # escaped as a bare "internal server error" to the client. $sum already used
+    # bson_add; $avg was simply missed.
+    state["_avg_total"] = bson_sum(state["_avg_total"], v)
     state["_avg_n"] += 1
 
 
@@ -1184,13 +1407,20 @@ def _acc_std(
     pop: bool,
 ) -> None:
     v = evaluate(arg, doc, vars)
-    if v is None:
-        return
+    # Create the state even when this doc contributes nothing: mongod always
+    # emits the field, answering `null` when the group held no numeric value.
+    # Creating it lazily meant an all-non-numeric group *omitted* the field.
     state = bucket.get(field)
     if not isinstance(state, dict) or "_std_vals" not in state:
         state = {"_std_vals": [], "_std_pop": pop}
         bucket[field] = state
-    state["_std_vals"].append(v)
+    # mongod counts only int / long / double / decimal; bool, null, string,
+    # array and document values are silently skipped, not errors. Appending
+    # them raised a bare `TypeError: unsupported operand type(s) for +=:
+    # 'float' and 'str'` in `_std_dev`, which escaped as "internal server
+    # error" (code 1) — a crash where mongod answers.
+    if _is_acc_number(v):
+        state["_std_vals"].append(_std_dev_operand(v))
 
 
 def _percentile_spec(arg: Any, op: str) -> tuple[Any, list[float] | None]:
@@ -1548,7 +1778,11 @@ def _stage_lookup(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
-        raise AggregateError("$lookup requires a document spec")
+        raise AggregateError(
+            f"the $lookup stage specification must be an object, but found {_bson_type_name(spec)}",
+            code=9,
+            code_name="FailedToParse",
+        )
     from_coll = spec.get("from")
     as_field = spec.get("as")
     if not (isinstance(from_coll, str) and isinstance(as_field, str)):
@@ -2019,6 +2253,15 @@ def _stage_bucket(
 
     result: list[dict[str, Any]] = []
     for key, bucket_docs in buckets.items():
+        # mongod emits a bucket only when something landed in it — boundary
+        # buckets and the `default` bucket alike (probed 6.0.16: boundaries
+        # [0,2,4,8] over values 1 and 7 answer `_id: 0` and `_id: 4`, with the
+        # empty `_id: 2` omitted). We pre-create every bucket to keep them in
+        # boundary order, so the empty ones have to be dropped here; otherwise
+        # an unused `default` surfaced as a bare `{_id: "other"}` with no
+        # `count` at all, since the accumulator never ran to seed it.
+        if not bucket_docs:
+            continue
         bucket: dict[str, Any] = {"_id": key}
         for field_name, accumulator in output_spec.items():
             for d in bucket_docs:
@@ -4235,8 +4478,10 @@ def validate_stage_names(pipeline: list[Any]) -> None:
     before any document flows — change streams need the 40324 at
     ``aggregate`` time, not lazily at the first ``getMore``)."""
     for stage in pipeline:
-        if not isinstance(stage, Mapping) or len(stage) != 1:
-            raise AggregateError("each pipeline stage must have exactly one key")
+        if not isinstance(stage, Mapping):
+            raise AggregateError("Each element of the 'pipeline' array must be an object")
+        if len(stage) != 1:
+            raise AggregateError(STAGE_ARITY_MSG, code=40323, code_name="Location40323")
         name = next(iter(stage))
         if name in _ATLAS_ONLY_STAGES:
             # Atlas-only stage — reject with the Atlas message at parse time

@@ -297,7 +297,45 @@ def apply_projection_batch(
     """
     if not spec:
         return [copy.deepcopy(d) for d in docs]
-    return [apply_projection(d, spec, query) for d in docs]
+    plan = compile_projection(spec, query)
+    return [apply_projection_plan(d, plan) for d in docs]
+
+
+class _ProjectionPlan:
+    """A projection spec compiled once per cursor: meta validation done, spec
+    partitioned (main / $slice / positional), inclusion mode detected, path
+    tries built, positional predicate resolved. ``apply_projection_plan`` then
+    does only the per-doc work — previously ALL of this re-ran per document
+    (the projected-find hot spot from the 2026-08 micro-opt review)."""
+
+    __slots__ = (
+        "kind",
+        "spec_main",
+        "slice_specs",
+        "include_id",
+        "id_excluded",
+        "elem_match_paths",
+        "plain_tree",
+        "exclude_tree",
+        "array_path",
+        "doc_pred",
+        "value_pred",
+        "non_id",
+    )
+
+    def __init__(self) -> None:
+        self.kind = ""
+        self.spec_main: dict[str, Any] = {}
+        self.slice_specs: dict[str, Any] = {}
+        self.include_id = True
+        self.id_excluded = False
+        self.elem_match_paths: set[str] = set()
+        self.plain_tree: dict[str, Any] | None = None
+        self.exclude_tree: dict[str, Any] | None = None
+        self.array_path = ""
+        self.doc_pred: Mapping[str, Any] | None = None
+        self.value_pred: Any = None
+        self.non_id: dict[str, Any] = {}
 
 
 def apply_projection(
@@ -307,33 +345,43 @@ def apply_projection(
 ) -> dict[str, Any]:
     if not spec:
         return copy.deepcopy(doc)
+    return apply_projection_plan(doc, compile_projection(spec, query))
+
+
+def compile_projection(
+    spec: Mapping[str, Any],
+    query: Mapping[str, Any] | None = None,
+) -> _ProjectionPlan:
+    plan = _ProjectionPlan()
 
     # ``$meta`` projections validate at parse time (Location17308 for an unknown
-    # argument, Location40218 for ``textScore`` without a ``$text`` query). A
-    # ``$meta`` field is inclusion-mode in mongod, but SecantusDB doesn't compute
-    # the metadata — so the field is *omitted* (partial, graceful degradation).
-    # We drop the meta keys from the spec while remembering one was present: a
-    # spec that was *only* ``$meta`` fields becomes an inclusion projection of no
-    # fields (mongod result: just ``_id``, unless ``_id`` was excluded).
-    meta_present = any(_is_meta_spec(v) for v in spec.values())
-    if meta_present:
+    # argument, Location40218 for ``textScore`` without a ``$text`` query).
+    # SecantusDB doesn't compute the metadata, so the projected field is
+    # *omitted* — but the rest of the document is untouched.
+    #
+    # `$meta` does NOT participate in inclusion / exclusion mode detection, the
+    # same rule `$slice` and positional follow below (mongod treats all three as
+    # value re-shapers). Oracle-pinned against mongod 6.0.16:
+    #
+    #   {m: {$meta: X}}            -> the WHOLE document
+    #   {_id: 0, m: {$meta: X}}    -> whole document minus _id
+    #   {a: 1,   m: {$meta: X}}    -> {_id, a}   (the `a: 1` drives inclusion)
+    #   {b: 0,   m: {$meta: X}}    -> exclusion, driven by `b: 0`
+    #
+    # This used to force a `$meta`-only spec into an inclusion projection of no
+    # fields, on a comment asserting "mongod result: just `_id`" — which is
+    # simply not what mongod does. Asking for a metadata field silently threw
+    # away the caller's entire document.
+    if any(_is_meta_spec(v) for v in spec.values()):
         validate_meta_projection(spec, query)
         spec = {k: v for k, v in spec.items() if not _is_meta_spec(v)}
-        non_meta_non_id = any(k != "_id" for k in spec)
-        if not non_meta_non_id:
-            # Inclusion projection with no surviving field: keep only ``_id``
-            # (dropped when the spec excludes it via ``_id: 0``).
-            result: dict[str, Any] = {}
-            if spec.get("_id", 1) and "_id" in doc:
-                result["_id"] = copy.deepcopy(doc["_id"])
-            return result
 
     # Separate ``$slice`` and positional (``arr.$``) projections — they don't
     # participate in inclusion / exclusion mode detection (mongod treats them as
     # value re-shapers). Apply them after the inclusion/exclusion pass.
-    slice_specs: dict[str, Any] = {}
+    slice_specs: dict[str, Any] = plan.slice_specs
     positional_specs: dict[str, Any] = {}
-    spec_main: dict[str, Any] = {}
+    spec_main: dict[str, Any] = plan.spec_main
     for k, v in spec.items():
         if _is_slice_spec(v):
             _validate_slice_arg(v["$slice"])
@@ -374,9 +422,14 @@ def apply_projection(
                 code=51246,
                 code_name="Location51246",
             )
-        return _apply_positional(doc, spec_main, slice_specs, array_path, doc_pred, value_pred)
+        plan.kind = "positional"
+        plan.array_path = array_path
+        plan.doc_pred = doc_pred
+        plan.value_pred = value_pred
+        return plan
 
     non_id = {k: v for k, v in spec_main.items() if k != "_id"}
+    plan.non_id = non_id
     if not non_id:
         # The spec is at most an ``_id`` entry plus ``$slice`` modifiers.
         # mongod's rules (oracle-pinned against a real mongod):
@@ -385,37 +438,63 @@ def apply_projection(
         #   * numeric zero / False => whole doc minus ``_id``;
         #   * no ``_id`` key => whole doc ($slice applied in place).
         if "_id" in spec_main and spec_main["_id"] != 0:
-            result = {}
-            if "_id" in doc:
-                result["_id"] = copy.deepcopy(doc["_id"])
-            for path, slice_arg in slice_specs.items():
-                current = get_path(doc, path, default=_MISSING)
-                if current is not _MISSING:
-                    set_path(result, path, _apply_slice(copy.deepcopy(current), slice_arg))
-            return result
+            plan.kind = "id_only_inclusion"
+        else:
+            plan.kind = "whole_doc"
+            plan.id_excluded = "_id" in spec_main
+        return plan
+
+    if _detect_inclusion(non_id):
+        plan.kind = "inclusion"
+        plan.include_id = bool(spec_main.get("_id", 1))
+        plan.elem_match_paths = {p for p, v in non_id.items() if _is_elem_match_spec(v)}
+        plain_paths = [p for p in non_id if p not in plan.elem_match_paths]
+        plan.plain_tree = _spec_tree(plain_paths) if plain_paths else None
+        return plan
+
+    plan.kind = "exclusion"
+    plan.id_excluded = spec_main.get("_id") == 0
+    plan.exclude_tree = _spec_tree(list(non_id))
+    return plan
+
+
+def apply_projection_plan(doc: dict[str, Any], plan: _ProjectionPlan) -> dict[str, Any]:
+    """The per-document half of a compiled projection — branch bodies verbatim
+    from the pre-split ``apply_projection``."""
+    slice_specs = plan.slice_specs
+    if plan.kind == "positional":
+        assert plan.doc_pred is not None
+        return _apply_positional(
+            doc, plan.spec_main, slice_specs, plan.array_path, plan.doc_pred, plan.value_pred
+        )
+    if plan.kind == "id_only_inclusion":
+        result = {}
+        if "_id" in doc:
+            result["_id"] = copy.deepcopy(doc["_id"])
+        for path, slice_arg in slice_specs.items():
+            current = get_path(doc, path, default=_MISSING)
+            if current is not _MISSING:
+                set_path(result, path, _apply_slice(copy.deepcopy(current), slice_arg))
+        return result
+    if plan.kind == "whole_doc":
         result = copy.deepcopy(doc)
-        if "_id" in spec_main:
+        if plan.id_excluded:
             result.pop("_id", None)
         for path, slice_arg in slice_specs.items():
             current = get_path(result, path, default=_MISSING)
             if current is not _MISSING:
                 set_path(result, path, _apply_slice(current, slice_arg))
         return result
-
-    inclusion_mode = _detect_inclusion(non_id)
-
-    if inclusion_mode:
-        result: dict[str, Any] = {}
-        if spec_main.get("_id", 1) and "_id" in doc:
+    if plan.kind == "inclusion":
+        result = {}
+        if plan.include_id and "_id" in doc:
             result["_id"] = copy.deepcopy(doc["_id"])
-        elem_match_paths = {p for p, v in non_id.items() if _is_elem_match_spec(v)}
-        plain_paths = [p for p in non_id if p not in elem_match_paths]
-        if plain_paths:
-            projected = _include_doc(doc, _spec_tree(plain_paths))
+        if plan.plain_tree is not None:
+            projected = _include_doc(doc, plan.plain_tree)
             for k, v in projected.items():
                 result[k] = v
-        for path in elem_match_paths:
-            first = _first_match(doc, path, non_id[path]["$elemMatch"])
+        for path in plan.elem_match_paths:
+            first = _first_match(doc, path, plan.non_id[path]["$elemMatch"])
             if first is not _MISSING:
                 set_path(result, path, [copy.deepcopy(first)])
         # $slice on a path also implicitly INCLUDES the path in
@@ -430,10 +509,11 @@ def apply_projection(
             if current is not _MISSING:
                 set_path(result, path, _apply_slice(current, slice_arg))
         return result
-
+    # exclusion
     result = copy.deepcopy(doc)
-    _exclude_doc(result, _spec_tree(list(non_id)))
-    if spec_main.get("_id") == 0:
+    assert plan.exclude_tree is not None
+    _exclude_doc(result, plan.exclude_tree)
+    if plan.id_excluded:
         result.pop("_id", None)
     for path, slice_arg in slice_specs.items():
         current = get_path(result, path, default=_MISSING)

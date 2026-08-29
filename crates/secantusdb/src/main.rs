@@ -33,7 +33,7 @@ use secantus_commands::{CursorRegistry, Storage as CmdStorage};
 use secantus_server::args::{parse_args, CliArgs, Parsed};
 use secantus_server::bind;
 use secantus_server::config::resolve;
-use secantus_storage::{wt_config, Storage};
+use secantus_storage::{wt_config, Storage, StorageOptions};
 use secantus_storage_adapter::StorageAdapter;
 
 const RESTORE_HELP: &str = "\
@@ -149,7 +149,19 @@ fn run(cli: CliArgs) -> Result<(), String> {
         cli.sync_on_commit,
         &cli.log_file_max,
     );
-    let mut storage = Storage::open_with_config(&cli.storage_path, &wt)
+    // Storage write-path modes (--oplog-async / --oplog-nonlogged /
+    // --data-nonlogged / --checkpoint-seconds): `None` defers to the matching
+    // SECANTUS_* env var, so env-driven runs are unchanged.
+    let opts = StorageOptions {
+        wt_config: Some(wt),
+        oplog_async: cli.oplog_async,
+        oplog_nonlogged: cli.oplog_nonlogged,
+        data_nonlogged: cli.data_nonlogged,
+        checkpoint_seconds: cli.checkpoint_seconds,
+        write_tickets: cli.write_tickets,
+        ..StorageOptions::default()
+    };
+    let mut storage = Storage::open_with_options(&cli.storage_path, &opts)
         .map_err(|e| format!("failed to open storage at {}: {e:?}", cli.storage_path))?;
     // SECANTUS_DISABLE_OPLOG=1 turns oplog emission off entirely (no change
     // streams / PITR — the "drop the oplog for ~2× multi-writer throughput"

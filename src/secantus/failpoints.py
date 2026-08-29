@@ -71,6 +71,16 @@ class _FailCommand:
     skip_remaining: int = 0
     """Number of matching commands to skip before triggering."""
 
+    server_injected: bool = False
+    """Configured as ``failGetMoreAfterCursorCheckout``, not ``failCommand``.
+
+    mongod injects that one *inside* the change-stream getMore path, where it
+    stamps ``ResumableChangeStreamError`` on a resumable code. ``failCommand``
+    short-circuits earlier and carries only the labels the failpoint itself
+    specified. The change-streams spec pins the difference:
+    ``failGetMoreAfterCursorCheckout`` + code 6 resumes, ``failCommand`` +
+    code 6 does not."""
+
 
 @dataclass
 class FailPointMatch:
@@ -82,6 +92,8 @@ class FailPointMatch:
     close_connection: bool = False
     block_connection: bool = False
     block_time_ms: int = 0
+    server_injected: bool = False
+    """See ``_FailCommand.server_injected``."""
 
 
 class CloseConnectionRequested(Exception):
@@ -107,10 +119,19 @@ class FailPointRegistry:
         ``mode`` is what mongod accepts — ``"alwaysOn"``, ``"off"``,
         ``{"times": N}``, or ``{"skip": N, "times": M}``.
         """
-        if name != "failCommand":
+        # ``failGetMoreAfterCursorCheckout`` is ``failCommand`` scoped to
+        # ``getMore``: mongod fails the getMore once the cursor has been
+        # checked out, with the supplied errorCode. Drivers use it to provoke
+        # a *resumable* error mid-stream and assert the change stream resumes
+        # — libmongoc's ``_setup_for_resume`` reaches for it on wire >= 4.4.
+        # Ignoring it meant the getMore succeeded, no error was raised, and no
+        # resume ever happened, so the driver sent 2 commands where the spec
+        # expects 3 (aggregate / getMore / resume aggregate).
+        getmore_only = name == "failGetMoreAfterCursorCheckout"
+        if name != "failCommand" and not getmore_only:
             # Accept-but-ignore: lets test setup that configures
-            # SecantusDB-irrelevant failpoints (failGetMoreAfterCursorCheckout
-            # etc.) keep going without a CommandNotFound.
+            # SecantusDB-irrelevant failpoints keep going without a
+            # CommandNotFound. Real mongod exposes dozens.
             return
 
         with self._lock:
@@ -137,7 +158,9 @@ class FailPointRegistry:
                 return
 
             fc = _FailCommand(
-                fail_commands=tuple(data.get("failCommands") or ()),
+                fail_commands=(
+                    ("getMore",) if getmore_only else tuple(data.get("failCommands") or ())
+                ),
                 error_code=int(data["errorCode"]) if "errorCode" in data else None,
                 write_concern_error=(
                     dict(data["writeConcernError"])
@@ -150,6 +173,7 @@ class FailPointRegistry:
                 block_time_ms=int(data.get("blockTimeMS", 0) or 0),
                 times_remaining=times,
                 skip_remaining=skip,
+                server_injected=getmore_only,
             )
             self._fail_commands.append(fc)
 
@@ -177,5 +201,41 @@ class FailPointRegistry:
                     close_connection=fc.close_connection,
                     block_connection=fc.block_connection,
                     block_time_ms=fc.block_time_ms,
+                    server_injected=fc.server_injected,
                 )
             return None
+
+
+# Error codes mongod treats as resumable for a change stream. Kept in lockstep
+# with the Rust server's ``RESUMABLE_CHANGE_STREAM_CODES``
+# (crates/secantus-commands/src/failpoints.rs) — the two servers must label
+# identically or a driver resumes against one and gives up against the other.
+#
+# Note 50 (MaxTimeMSExpired) is deliberately ABSENT: the change-streams spec
+# removed it from the resumable set, and including it would make a driver
+# retry a stream the user asked to time out.
+RESUMABLE_CHANGE_STREAM_CODES: frozenset[int] = frozenset(
+    {
+        6,  # HostUnreachable
+        7,  # HostNotFound
+        63,  # StaleShardVersion
+        89,  # NetworkTimeout
+        91,  # ShutdownInProgress
+        133,  # FailedToSatisfyReadPreference
+        150,  # StaleEpoch
+        189,  # PrimarySteppedDown
+        234,  # RetryChangeStream
+        262,  # ExceededTimeLimit
+        9001,  # SocketException
+        10107,  # NotWritablePrimary
+        11600,  # InterruptedAtShutdown
+        11602,  # InterruptedDueToReplStateChange
+        13435,  # NotPrimaryNoSecondaryOk
+        13436,  # NotPrimaryOrSecondary
+    }
+)
+
+
+def is_resumable_change_stream_code(code: int | None) -> bool:
+    """Whether ``code`` is resumable for a change stream."""
+    return code is not None and code in RESUMABLE_CHANGE_STREAM_CODES

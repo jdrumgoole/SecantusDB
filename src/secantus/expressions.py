@@ -66,7 +66,11 @@ def _eval(expr: Any, ctx: _Ctx) -> Any:
         if expr.startswith("$$"):
             return _resolve_var(expr[2:], ctx)
         if expr.startswith("$"):
-            return get_path(dict(ctx.doc), expr[1:], default=None)
+            # No defensive copy: get_path/walk_to_parent(create=False) is
+            # read-only, and copying the whole doc per $field reference was
+            # a per-doc-per-field allocation on every $project/$group.
+            d = ctx.doc if isinstance(ctx.doc, dict) else dict(ctx.doc)
+            return get_path(d, expr[1:], default=None)
         return expr
     if isinstance(expr, list):
         return [_eval(e, ctx) for e in expr]
@@ -75,8 +79,31 @@ def _eval(expr: Any, ctx: _Ctx) -> Any:
             (key,) = expr.keys()
             if key.startswith("$"):
                 return _apply_op(key, expr[key], ctx)
-        return {k: _eval(v, ctx) for k, v in expr.items()}
+        # A document *literal*. Each member sits in field-value position, so a
+        # member whose value is an absent field path is dropped rather than
+        # written as null — mongod answers `{z: {}}` for
+        # `{$project: {z: {w: "$nope"}}}`, not `{z: {w: null}}`.
+        out: dict[str, Any] = {}
+        for k, v in expr.items():
+            value = _eval_field_value(v, ctx)
+            if value is not MISSING:
+                out[k] = value
+        return out
     return expr
+
+
+def _eval_field_value(expr: Any, ctx: _Ctx) -> Any:
+    """Evaluate in *field-value* position, where an absent path is MISSING.
+
+    Differs from :func:`_eval` only for a bare field-path string: as an
+    operator argument a missing path is `null` (`{$add: ["$nope", 1]}` is 1),
+    but as the value of a projected/added field it is *missing* and the key is
+    omitted. Keeping the two distinct is why this isn't folded into `_eval`.
+    """
+    if isinstance(expr, str) and expr.startswith("$") and not expr.startswith("$$"):
+        d = ctx.doc if isinstance(ctx.doc, dict) else dict(ctx.doc)
+        return get_path(d, expr[1:], default=MISSING)
+    return _eval(expr, ctx)
 
 
 _REMOVE_SENTINEL: Any = object()
@@ -94,7 +121,8 @@ def evaluate_or_missing(
     value the way mongod does — ``$push`` / ``$addToSet`` accumulate an explicit
     ``null`` but not a missing field."""
     if isinstance(expr, str) and expr.startswith("$") and not expr.startswith("$$"):
-        return get_path(dict(doc), expr[1:], default=MISSING)
+        d = doc if isinstance(doc, dict) else dict(doc)
+        return get_path(d, expr[1:], default=MISSING)
     return evaluate(expr, doc, vars)
 
 
@@ -129,7 +157,7 @@ def _resolve_var(name: str, ctx: _Ctx) -> Any:
         return value
     if not isinstance(value, Mapping):
         return None
-    return get_path(dict(value), rest, default=None)
+    return get_path(value if isinstance(value, dict) else dict(value), rest, default=None)
 
 
 def _apply_op(op: str, arg: Any, ctx: _Ctx) -> Any:
@@ -347,9 +375,22 @@ def _op_not(arg: Any, ctx: _Ctx) -> bool:
     return not _bool(_eval(inner, ctx))
 
 
+def _unwrap_d128(v: Any) -> Any:
+    """A ``Decimal128`` as a plain ``Decimal`` for comparison.
+
+    Decimal128 has no Python comparison operators, so ``12 < Decimal128("15")``
+    raised TypeError, which the range operators below swallow into False, and
+    ``==`` simply answered False. Every comparison against a decimal was
+    therefore wrong. mongod compares the numeric types by value, and a
+    ``Decimal`` compares correctly against int and float, so unwrapping is all
+    that is needed.
+    """
+    return v.to_decimal() if isinstance(v, Decimal128) else v
+
+
 def _cmp_pair(arg: Any, ctx: _Ctx) -> tuple[Any, Any]:
     a, b = _eval_args(arg, ctx)
-    return a, b
+    return _unwrap_d128(a), _unwrap_d128(b)
 
 
 def _op_eq(arg: Any, ctx: _Ctx) -> bool:
@@ -2295,10 +2336,17 @@ def _op_array_elem_at(arg: Any, ctx: _Ctx) -> Any:
         arr, f"$arrayElemAt's first argument must be an array, but is {_bson_type_name(arr)}", 28689
     )
     if not isinstance(arr, list) or not isinstance(idx, int):
+        # A missing / null input array really is null — probed against mongod
+        # 6.0.16: `{$arrayElemAt: ["$nope", 0]}` projects `r: null`.
         return None
     if -len(arr) <= idx < len(arr):
         return arr[idx]
-    return None
+    # An in-bounds array with an out-of-range index evaluates to MISSING, not
+    # null, so `$project` omits the field entirely. mongod on `[1, 2]`:
+    # index 9 and index -9 both yield `{_id: 1}` with no `r` at all, while
+    # index 0 yields `r: 1`. We returned null, which added a field mongod does
+    # not send.
+    return MISSING
 
 
 def _reject_non_array(v: Any, message: str, code: int) -> None:
@@ -2737,7 +2785,10 @@ def _convert_value(value: Any, target: Any) -> Any:
         if isinstance(value, int):
             return Decimal128(Decimal(value))
         if isinstance(value, float):
-            return Decimal128(Decimal(repr(value)))
+            # 15 significant digits, as `$toDecimal` — mongod-probed 6.0.16.
+            from secantus.numerics import decimal_from_double
+
+            return Decimal128(decimal_from_double(value))
         if isinstance(value, str):
             if len(value) > _MAX_INT_STR_DIGITS:
                 raise ExpressionError(
@@ -2783,7 +2834,12 @@ def _op_to_decimal(arg: Any, ctx: _Ctx) -> Any:
     if isinstance(value, Decimal128):
         return value
     if isinstance(value, (int, float)):
-        return Decimal128(Decimal(repr(value) if isinstance(value, float) else value))
+        from secantus.numerics import decimal_from_double
+
+        # mongod converts a double at 15 significant digits; ints stay exact.
+        return Decimal128(
+            decimal_from_double(value) if isinstance(value, float) else Decimal(value)
+        )
     if isinstance(value, str):
         try:
             return Decimal128(value)
@@ -3124,12 +3180,12 @@ def _expr_is_number(v: Any) -> bool:
 
 
 def _op_expr_sum(arg: Any, ctx: _Ctx) -> Any:
-    from secantus.numerics import bson_add
+    from secantus.numerics import bson_sum
 
     total: Any = 0
     for x in _expr_acc_values(arg, ctx):
         if _expr_is_number(x):
-            total = bson_add(total, x)
+            total = bson_sum(total, x)
     return total
 
 

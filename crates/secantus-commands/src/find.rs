@@ -26,13 +26,16 @@ use std::sync::Arc;
 
 use bson::{doc, Bson, Document};
 
+use crate::argtypes;
 use crate::cursors::{CursorProducer, CursorRegistry, TailableOptions};
 use crate::storage::Storage;
 use crate::util::{
     as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, docs_to_bson,
     encode_docs, resolve_let_vars,
 };
-use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
+use crate::{
+    CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE, MAX_GETMORE_BATCH_BYTES,
+};
 
 /// Producer for a tailable cursor on a capped collection (`find` with
 /// `tailable: true`). Each `produce` scans the collection for documents whose
@@ -232,6 +235,22 @@ fn build_view_find_aggregate(doc: &Document, coll: &str) -> Document {
 
 pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "find")?;
+    // Argument types, before anything reads them. A wrong-typed slot used to be
+    // silently ignored here (`and_then(as_i64)` yields None -> the default), so
+    // `find.limit: "x"` returned every document and reported success. mongod
+    // reports find's numeric slots under its IDL name, `FindCommandRequest.limit`,
+    // NOT `find.limit` -- probed, not guessed. See `crate::argtypes`.
+    for field in ["filter", "sort", "projection", "collation"] {
+        argtypes::require_object_expected(doc, field)?;
+    }
+    for field in ["limit", "skip", "batchSize"] {
+        argtypes::require_number(doc, field, &format!("FindCommandRequest.{field}"))?;
+    }
+    argtypes::require_object(doc, "let", "FindCommandRequest.let")?;
+    argtypes::require_object(doc, "min", "FindCommandRequest.min")?;
+    argtypes::require_object(doc, "max", "FindCommandRequest.max")?;
+    argtypes::require_bool_value(doc, "singleBatch")?;
+    argtypes::require_max_time_ms(doc)?;
     // A view: translate the find into the equivalent aggregate over the base
     // collection (the find options become pipeline stages after the view's own
     // pipeline) and delegate — the aggregate handler resolves the view. `find` and
@@ -518,7 +537,7 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             let (first_batch, cursor_id): (Vec<Bson>, i64) = if single_batch {
                 (projected.into_iter().map(Bson::Document).collect(), 0)
             } else {
-                split_docs_into_cursor(projected, batch_size, &ns, cursors)?
+                split_docs_into_cursor(projected, batch_size, &ns, cursors, limit > 0)?
             };
             Ok(doc! {
                 "cursor": {
@@ -534,7 +553,10 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             let (first, cursor_id) = if single_batch {
                 (docs, 0)
             } else {
-                split_into_cursor(docs, batch_size, &ns, cursors)?
+                // A positive `limit` bounds the result, so mongod closes the
+                // cursor the moment it is reached rather than spending a
+                // trailing empty getMore.
+                split_into_cursor(docs, batch_size, &ns, cursors, limit > 0)?
             };
             ctx.pending_batch = Some(crate::PendingBatch {
                 batch_field: "firstBatch",
@@ -561,19 +583,44 @@ pub(crate) fn split_into_cursor(
     batch_size: i64,
     ns: &str,
     cursors: &CursorRegistry,
+    bounded: bool,
 ) -> Result<(Vec<Vec<u8>>, i64), CommandError> {
-    let take = if batch_size < 0 {
+    let mut take = if batch_size < 0 {
         DEFAULT_BATCH_SIZE as usize
     } else {
         batch_size as usize
     }
     .min(docs.len());
+    // Byte-budget the FIRST batch as well as getMore. mongod caps every reply at
+    // 16MB and keeps the cursor open for the rest; capping on document count
+    // alone made `find` with `batchSize: 25` over 1MB documents return a 25MB
+    // reply with an exhausted cursor, where mongod returns 15MB and a live
+    // cursor id (measured against 6.0.16). Blob lengths are already known here,
+    // so this costs nothing. Always take at least one document, matching
+    // `CursorRegistry::next_batch`, so an oversized document still makes
+    // progress instead of returning an empty batch forever.
+    let mut bytes = 0usize;
+    let mut fitted = 0usize;
+    for blob in docs.iter().take(take) {
+        if fitted > 0 && bytes + blob.len() > MAX_GETMORE_BATCH_BYTES {
+            break;
+        }
+        bytes += blob.len();
+        fitted += 1;
+    }
+    take = fitted;
     let remaining = docs.split_off(take);
-    if remaining.is_empty() {
+    // A batch that exactly fills the requested size proves nothing about what
+    // follows, so an unbounded cursor stays open even with nothing left -- the
+    // client spends one more getMore to see the empty batch, exactly as against
+    // mongod. Closing early made our round-trip count differ, which drivers
+    // observe directly.
+    let filled_exactly = batch_size > 0 && docs.len() == batch_size as usize;
+    if remaining.is_empty() && (bounded || !filled_exactly) {
         return Ok((docs, 0));
     }
     let cursor_id = cursors
-        .register(ns, remaining)
+        .register_bounded(ns, remaining, bounded)
         .map_err(|e| CommandError::new(1, "InternalError", format!("cursor registry: {e:?}")))?;
     Ok((docs, cursor_id))
 }
@@ -588,6 +635,7 @@ pub(crate) fn split_docs_into_cursor(
     batch_size: i64,
     ns: &str,
     cursors: &CursorRegistry,
+    bounded: bool,
 ) -> Result<(Vec<Bson>, i64), CommandError> {
     let take = if batch_size < 0 {
         DEFAULT_BATCH_SIZE as usize
@@ -596,12 +644,13 @@ pub(crate) fn split_docs_into_cursor(
     }
     .min(docs.len());
     let remaining = docs.split_off(take);
+    let filled_exactly = batch_size > 0 && docs.len() == batch_size as usize;
     let first: Vec<Bson> = docs.into_iter().map(Bson::Document).collect();
-    if remaining.is_empty() {
+    if remaining.is_empty() && (bounded || !filled_exactly) {
         return Ok((first, 0));
     }
     let cursor_id = cursors
-        .register(ns, encode_docs(remaining)?)
+        .register_bounded(ns, encode_docs(remaining)?, bounded)
         .map_err(|e| CommandError::new(1, "InternalError", format!("cursor registry: {e:?}")))?;
     Ok((first, cursor_id))
 }
@@ -872,4 +921,66 @@ fn project_to_docs(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod first_batch_byte_cap_tests {
+    use super::split_into_cursor;
+    use crate::cursors::CursorRegistry;
+    use crate::MAX_GETMORE_BATCH_BYTES;
+
+    /// A blob of `n` bytes standing in for an encoded document.
+    fn blob(n: usize) -> Vec<u8> {
+        vec![0u8; n]
+    }
+
+    #[test]
+    fn first_batch_stops_under_the_reply_cap() {
+        // 25 x 1MiB with batchSize 25: the count cap alone would return all 25
+        // and exhaust the cursor. mongod 6.0.16, measured, returns 15 documents
+        // (15.0 MiB) and a live cursor id.
+        let reg = CursorRegistry::new();
+        let docs: Vec<Vec<u8>> = (0..25).map(|_| blob(1024 * 1024)).collect();
+        let (first, cursor_id) = split_into_cursor(docs, 25, "t.big", &reg, false).unwrap();
+
+        let bytes: usize = first.iter().map(|b| b.len()).sum();
+        assert!(
+            bytes <= MAX_GETMORE_BATCH_BYTES,
+            "reply exceeded the 16MB cap"
+        );
+        assert!(
+            first.len() < 25,
+            "the count cap alone would have taken all 25"
+        );
+        assert_ne!(cursor_id, 0, "the remainder must stay behind a live cursor");
+    }
+
+    #[test]
+    fn a_single_oversized_document_still_makes_progress() {
+        // Never hand back an empty batch with documents pending — that hangs a
+        // client. Matches CursorRegistry::next_batch's "at least one" rule.
+        let reg = CursorRegistry::new();
+        let docs: Vec<Vec<u8>> = (0..2).map(|_| blob(12 * 1024 * 1024)).collect();
+        let (first, cursor_id) = split_into_cursor(docs, 2, "t.huge", &reg, false).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_ne!(cursor_id, 0);
+    }
+
+    #[test]
+    fn small_documents_are_governed_by_the_count_cap() {
+        let reg = CursorRegistry::new();
+        let docs: Vec<Vec<u8>> = (0..500).map(|_| blob(64)).collect();
+        let (first, cursor_id) = split_into_cursor(docs, 101, "t.small", &reg, false).unwrap();
+        assert_eq!(first.len(), 101, "the common path must not change");
+        assert_ne!(cursor_id, 0);
+    }
+
+    #[test]
+    fn everything_fitting_exhausts_the_cursor() {
+        let reg = CursorRegistry::new();
+        let docs: Vec<Vec<u8>> = (0..5).map(|_| blob(64)).collect();
+        let (first, cursor_id) = split_into_cursor(docs, 101, "t.small", &reg, false).unwrap();
+        assert_eq!(first.len(), 5);
+        assert_eq!(cursor_id, 0);
+    }
 }

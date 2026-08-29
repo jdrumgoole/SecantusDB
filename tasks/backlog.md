@@ -1,8 +1,215 @@
 # Backlog: stubs, stopgaps, and deferred work
 
-A living list of things SecantusDB does not yet implement faithfully. Update when you stub something, when you defer a slice, or when you discover a limitation in production code. Don't add items here that already have a fix in flight — those belong in tasks/todo.md.
+A living list of things SecantusDB does not yet implement faithfully. Update when you stub something, when you defer a slice, or when you discover a limitation in production code. Don't add items here that already have a fix in flight — those live on the branch and PR doing the fixing. (This line used to point at `tasks/todo.md`; that file is the *delivered* Admin UI plan, not a general in-flight list.)
 
 Each item should have enough context for a future session to pick it up cold: what's there now, what's missing, why it was deferred.
+
+**Markers are load-bearing — `- [ ]` means open work, `- [x]` means a finished
+record kept for its detail.** When a slice lands, flip its box in the same commit.
+An audit on 2026-08-20 found 107 of 178 open-marked items were finished work whose
+box was never flipped, which made the board unreadable: a session scanning for
+`- [ ]` could not tell the real tasks from the archive.
+
+**Correct a superseded entry rather than adding a newer one beside it.** The same
+audit found entries asserting limitations the engine had not had for months —
+"Foreign keys … NOT enforced" sat a few hundred lines above "FOREIGN KEY
+enforcement on write landed". **Reproduce an item before working it** (a probe, the
+failing test, the query); several "open" items were already fixed, and the wrong
+ones were wrong in the direction that costs most — they described work as missing
+when it existed.
+
+## Triage: what is actually broken (2026-08-26)
+
+> **Sequenced in `tasks/remaining-work-plan.md` (2026-08-27)** — which phase to
+> do in what order, what is confirmed by measurement versus merely classified,
+> and the four probe techniques that found every bug in the August sweep. That
+> file points here; **this file wins** if the two disagree.
+
+The `- [ ]` count is not a work estimate. A pass over every open item found it
+mixes real defects with scope decisions, upstream bugs, performance work, and
+finished work whose box was never flipped. **Of 78 open items, 26 are real,
+fixable defects.** The rest will not be "fixed" in the sense the checkbox
+implies.
+
+| category | n | meaning |
+|---|---|---|
+| **DEFECT** | 26 | Real divergence from mongod / PostgreSQL. Ours to fix. |
+| **STATUS** | 13 | Finished work or a description of shipped behaviour; nothing pending. Kept for the detail. |
+| **WONTFIX** | 12 | Deliberate scope decision — multi-node, alternative auth, a BSON representation limit. Will not change. |
+| **PERF** | 11 | Throughput / latency / measurement. Real, but a different class from correctness. |
+| **CHORE** | 9 | Infra, CI, release, one-time configuration. |
+| **UPSTREAM** | 5 | Driver or test-harness artifacts, not server bugs. |
+| **FEATURE** | 2 | Planned capability never built (not a divergence). |
+
+### The 26 defects, grouped by root cause
+
+**SQL / PostgreSQL wire (10)** — the largest concentration by far:
+cross-type lenient pairs; query pipelining; CancelRequest; streaming COPY OUT
+abort; `test_return_untyped` DatatypeMismatch; write-conflict retry (40001 vs
+PG's real semantics); pgjdbc remaining clusters; pgx gauge tail; sub-millisecond
+timestamp *predicates*; jsonb operator gap. Plus the catalog's missing
+column-level reflection, `SET search_path` not affecting name resolution,
+deferred constraints unmodelled, and partial-index `pg_get_expr` rendering.
+
+**`top` timings were zero on Windows before 3.11 — FIXED 2026-08-28.** Not from
+a probe: CI's `windows/3.10` lane failed
+`test_top_counters.py::test_time_is_recorded_in_microseconds` with `assert 0 > 0`
+while the same commit was green locally and on `main`. Root cause is real, not a
+flake — `dispatch` measured with `time.monotonic_ns()`, which on Windows before
+3.11 is `GetTickCount64` at ~15.6 ms granularity, so any command faster than a
+tick measured ZERO elapsed and `// 1_000` reported 0 microseconds. `top`'s times
+were therefore useless on that platform, and the test caught it intermittently
+(it needs the insert to straddle a tick boundary to pass). Switched to
+`time.perf_counter_ns()`, the highest-resolution monotonic clock on every
+platform and the right one for measuring an interval. Introduced by #1064; found
+because a red CI lane was investigated rather than re-run.
+
+**Phase 0 SQL probe, 2026-08-28 — 3 more claims STALE, 3 NEW bugs found.**
+Ran every remaining SQL claim against the live PostgreSQL 14.
+
+*Stale, now corrected:* **deferred constraints** (a `DEFERRABLE INITIALLY
+DEFERRED` FK is accepted inside the transaction and raises `23503` at COMMIT,
+exactly as PG); the **catalog remainder** (`pg_constraint` / `pg_index` /
+`pg_am` / `pg_opclass` and bool-expression typing all match); and half the
+**partial-index** entry (a function-call predicate is accepted, not rejected).
+
+*Confirmed open:* cross-type lenient pairs (6 of 7 skipped shapes diverge, as
+the entry says); `pg_index.indpred` reflecting NULL.
+
+*NEW, none of them recorded anywhere:*
+- **`jsonb || jsonb` over two objects was SILENTLY WRONG — FIXED 2026-08-28.**
+  It fell through to the text fallback, so `str(dict)` produced a *Python
+  repr*: `'{"x":1}'::jsonb || '{"y":2}'::jsonb` answered `{'x': 1}{'y': 2}` —
+  single-quoted, not valid JSON. Now merges with the right operand winning,
+  matching PG.
+- **`jsonb || jsonb` mixed shapes are typed as a PG ARRAY (open).**
+  `array||array`, `object||array`, `array||scalar` have the right *values* but
+  render `{1,2,3}` where PG renders the jsonb `[1, 2, 3]`. Fixing it means the
+  concat result carrying the jsonb tag — a typing change, not a value one.
+- **`jsonb - 'key'` raised `XX000` — FIXED 2026-08-28.** The operator reached
+  Python's `-` (`dict - str`) and the bare TypeError escaped as an internal
+  server error. `scalar._jsonb_delete` now implements PG's full rule set
+  (PG-probed 14): object − text deletes a key (missing = no-op), array − text
+  drops matching string elements, array − int deletes by index (negative counts
+  from the end, out-of-range = no-op), either − text[] deletes each, object −
+  int is `22023 cannot delete from object using integer index`, and a scalar is
+  `22023 cannot delete from scalar`.
+- **An unsupported operand pair raised `XX000` — FIXED 2026-08-28.** The tail of
+  `_eval_arith` did a raw Python operation, so `'\x01'::bytea + 1` died with
+  `TypeError: can't concat int to bytes`. It now answers PG's
+  `42883 operator does not exist: bytea + integer`.
+  **Partial, and worth stating exactly:** for the `test_return_untyped[b]` case
+  (`select %s::int + 1` with a `bytes` argument) we answer **42883** where PG
+  answers **42846** (`cannot cast type`). Both are typed 42xxx errors rather
+  than a crash, but they are not the same code — PG's is about the failed
+  *cast*, ours about the missing *operator*. Closing that gap means the cast
+  failing at bind time, before arithmetic is reached.
+- **`'a'::text - 1` answers `22P02`, not PG's `42883` (open).** The untyped-text
+  → number coercion (deliberate, for pgbench's typeless params) fires first and
+  reports an invalid numeric literal. Distinguishing a *typed* `::text` operand
+  from an unknown literal is exactly the "cross-type lenient pairs" entry, whose
+  skipped-shape list already names arithmetic operands. Not new.
+- **jsonb results that are ARRAYS are typed as a PG array (open).** Affects both
+  `||`'s mixed shapes and `-` on an array: `'[1,2,3]'::jsonb - 1` has the right
+  *value* but renders `{1,3}` where PG renders `[1, 3]`. One root cause — a
+  jsonb operation returning a Python list loses the jsonb tag — so both are one
+  fix: carry the tag through the operator result.
+
+**Probed 2026-08-27 — 2 of 8 sampled were already done.** Reproduced each
+rather than reading it. **Stale:** `CancelRequest` is fully implemented (`57014`
+plus a still-usable connection, 29 tests) and catalog column-level reflection is
+present (`information_schema.columns` *and* `pg_attribute`). **Confirmed still
+open:** COPY OUT abort (transaction stays `INTRANS` where PG gives `INERROR`),
+write-conflict `40001` (the second writer serialization-fails instead of
+blocking), `SET search_path` (ignored in name resolution), sub-millisecond
+predicates, and partial-index reflection (`pg_indexes.indexdef` drops the
+`WHERE`). jsonb's core operators (`@>` `?` `->>` `#>` `<@`) all answered — the
+named gap needs its specific case to reproduce. Same lesson as the Rust class:
+**the count overstates the work; reproduce before planning.**
+
+**Rust server errors where Python defers — MEASURED 2026-08-26, and the five
+entries describing it are largely stale.** A three-way probe of 45
+query / update / aggregate constructs against the standalone `secantusd-rs`
+binary answered **42 correctly**. Everything the five entries name as missing is
+in fact working on the Rust server: `$lookup`, `$graphLookup`, `$out`, `$merge`,
+`$unionWith`, `$setWindowFields`, `$fill`, `$redact`, `$sample`, `$indexStats`,
+`$collStats`, `$dateToString`, `$dateFromString`, `$dateTrunc`, `$regexFind`,
+`$toDate`, `$bit`, `$currentDate`, `$pull` with a condition, `$pullAll`,
+`$addToSet` `$each`, `$push` `$slice`/`$sort`, positional `$[]` updates,
+pipeline-form updates, `$expr`, `$jsonSchema`, `$bitsAllSet`, `$mod`,
+`$elemMatch`, regex with options, `$geoWithin`.
+
+Of the 3 failures, **none was Rust-specific** — the Python server failed all
+three too:
+  - `$where` and `$function` need a JavaScript engine. Neither server has one;
+    this is a scope decision, not a porting gap. **Reclassify as WONTFIX.**
+  - `$densify` over a null / missing / non-numeric field: the *Python* server
+    **crashed** (`TypeError: '<' not supported between 'NoneType' and 'int'`
+    escaping as "internal server error", code 1) and Rust deferred to it with a
+    comment saying "Python sort raises". FIXED on both 2026-08-26.
+
+What genuinely remains of this class is the **error-code half only**: a
+construct the Rust engine can't do surfaces as generic `BadValue` (2) rather
+than mongod's typed code — e.g. `$densify` on a string field answers 2 where
+mongod answers 5733201. `update::arith_type_error` (2026-08-25) is the worked
+template. The porting half is done; do not plan a campaign around it without
+re-measuring first.
+
+**Mongo-side correctness (6 as classified; 2 remain after the 2026-08-28
+sweep)**. Five of the seven listed here and under Transactions were already
+fixed when re-probed — the classification was written from the boxes, and the
+boxes lagged:
+
+    top counters always zero            FIXED 2026-08-27 (#1064)
+    C-driver writeConcernError          FIXED 2026-08-28 (#1071)
+    change-stream awaitData, no maxTimeMS   never a server bug (2026-08-27)
+    multi-document update/delete chunking   FIXED 2026-08-09 (#795 / #798)
+    user-transaction dirty-budget guard     FIXED 2026-08-09 (#791 / #792)
+
+Genuinely open: **`$meta` projection values** (narrowed 2026-08-28 — the
+inclusion-mode bug under it is fixed; what is left is the uncomputed metadata
+value plus `{$meta: "sortKey"}` in a *find* projection answering rows where
+mongod errors code 2), and the **aggregation error-wrapper prefix**
+(characterised 2026-08-25, needs constant-fold modelling; deliberately
+deferred).
+
+Add to this class the item measured 2026-08-28 and filed in §3:
+**wrong-typed command arguments** — 0 crashes after #1080, but **42 divergences**
+remain (24 slots silently accepted where mongod errors, 18 answered with the
+wrong code).
+
+### Reading this list
+
+Line numbers drift, so items are identified by headline above rather than by
+number. Two standing rules, both learned the hard way:
+
+- **Reproduce an item before working it.** This pass found five entries
+  describing slices that had already shipped (`#140`–`#144`), now flipped to
+  `[x]`. Earlier passes found entries asserting limitations the engine had not
+  had for months.
+- **"The engines agree" is not "the engines are correct."** The `$bucket`
+  empty-bucket bug (fixed 2026-08-25) had the Rust engine *deliberately*
+  reproducing the Python bug, comment and all, with parity green throughout.
+  Only a live mongod settles correctness.
+
+  **This is a searchable pattern, and sweeping it was 4-for-4 (2026-08-26).**
+  Where a Rust comment justifies behaviour by what the *Python* engine does —
+  rather than by what mongod does — the Python behaviour is often itself the
+  bug, and the Rust deferral exists only to preserve it. Four found this way:
+  `$bucket` empty buckets ("matching the pure code"), Decimal128 arithmetic
+  ("no Python arithmetic support (raises)" — false), `$densify` on a null field
+  ("Python sort raises" — a crash), and `$stdDev*` on non-numeric input
+  ("would then blow up `sum(values)` … defer to Python (which raises)" — also a
+  crash, plus bool folded to 0/1 "matching the pure evaluator", which mongod
+  does not do). Two were crash-class.
+
+  Greps that found them:
+  `"which the pure code"`, `"matching the pure evaluator"`, `"Python .* raises"`
+  near an `Err(Fallback)`. The *benign* form cites mongod in the same breath
+  ("mongod-faithful", "mongod ignores null elements") — those checked out.
+  **`$stdDevPop`'s Rust unit test asserted the buggy behaviour**
+  (`get("m").is_none()`), so the test pinned the bug it was meant to guard;
+  expect that when fixing this class.
 
 ---
 
@@ -16,9 +223,125 @@ These commands accept the request and return a wire-valid response, but the resp
 
 These work end-to-end but cut corners.
 
-- [ ] **`$bucketAuto` `granularity` rounding — SHIPPED, hex-exact on both servers (2026-07-19).** The prior "1-ULP blocker" was a wrong-constants artifact: mongod stores each preferred-number series as **integer-valued doubles** (R5 = `{10,16,25,40,63}`, not normalised `0.63`-style literals) and computes `series_element * multiplier` (multiplier a power of 10), which reproduces its non-standard ULPs (`63 * 0.1 = 6.300000000000001`) bit-for-bit in Python and Rust f64. Ported `roundUp` / `roundDown` (double path) verbatim from `granularity_rounder_preferred_numbers.cpp` + the `populateNextBucket` boundary walk (first min = `roundDown(dataMin)`, every other boundary = `roundUp(chunkMax)` with the absorb-below-boundary loop; `std::round(nDocs/nBuckets)` bucket size), plus the POWERSOF2 rounder. Both engines: `secantus.aggregate._bucket_auto_granular` (`_BUCKET_AUTO_SERIES` + `_round_up/down_series` + `_round_up/down_pow2`) and `secantus-core` `group::bucket_auto_granular`. **Verified hex-exact vs a live mongod 7.0.12 oracle** (1200+ cases across all 13 granularities × scales × bucket counts, incl. edges: zeros, exact-boundary values, +inf, single bucket); Rust pinned to Python by a 400-case parity fuzz. Value validation reproduces mongod's codes on the Python server — non-numeric 40258, NaN 40259, negative 40260 (name errors 40261/40257 already shipped) — and defers on the Rust server (BadValue, the standing error-code gap). **Remaining sub-limitation:** a **Decimal128**-valued groupBy defers/rejects (code 2) rather than running mongod's separate Decimal128 rounder — the standing Decimal128 precision deferral; the double/int path (the common case) is complete.
-- [ ] **`_id` numeric type bridge** — works for finite int/float/Decimal128. `bool` is deliberately not numeric. NaN and infinity `_id` values fall through to the BSON-blob path; behavior is unspecified.
-- [ ] **`top` counters are always zero** — the command returns the mongod shape (one `totals` entry per namespace, `total`/`readLock`/`writeLock`/per-op sections) and mongotop renders it like an idle server, but SecantusDB doesn't instrument per-namespace operation timing, so every `{time, count}` is `0`. Real counters would need per-ns accounting in `Metrics` threaded through dispatch.
+- [x] **`$bucketAuto` `granularity` rounding — SHIPPED, hex-exact on both servers (2026-07-19).** The prior "1-ULP blocker" was a wrong-constants artifact: mongod stores each preferred-number series as **integer-valued doubles** (R5 = `{10,16,25,40,63}`, not normalised `0.63`-style literals) and computes `series_element * multiplier` (multiplier a power of 10), which reproduces its non-standard ULPs (`63 * 0.1 = 6.300000000000001`) bit-for-bit in Python and Rust f64. Ported `roundUp` / `roundDown` (double path) verbatim from `granularity_rounder_preferred_numbers.cpp` + the `populateNextBucket` boundary walk (first min = `roundDown(dataMin)`, every other boundary = `roundUp(chunkMax)` with the absorb-below-boundary loop; `std::round(nDocs/nBuckets)` bucket size), plus the POWERSOF2 rounder. Both engines: `secantus.aggregate._bucket_auto_granular` (`_BUCKET_AUTO_SERIES` + `_round_up/down_series` + `_round_up/down_pow2`) and `secantus-core` `group::bucket_auto_granular`. **Verified hex-exact vs a live mongod 7.0.12 oracle** (1200+ cases across all 13 granularities × scales × bucket counts, incl. edges: zeros, exact-boundary values, +inf, single bucket); Rust pinned to Python by a 400-case parity fuzz. Value validation reproduces mongod's codes on the Python server — non-numeric 40258, NaN 40259, negative 40260 (name errors 40261/40257 already shipped) — and defers on the Rust server (BadValue, the standing error-code gap). **Remaining sub-limitation:** a **Decimal128**-valued groupBy defers/rejects (code 2) rather than running mongod's separate Decimal128 rounder — the standing Decimal128 precision deferral; the double/int path (the common case) is complete.
+- [x] **`_id` numeric type bridge — NaN was a real bug and is FIXED (2026-08-22).**
+  Works for finite int/float/Decimal128; `bool` is deliberately not numeric. The old
+  "NaN and infinity fall through to the BSON-blob path; behavior is unspecified" was
+  understated: probed three ways against mongod 6.0.16, a document written with
+  `_id: NaN` was **accepted and then unreachable by its own key** on BOTH servers —
+  `count_documents({_id: NaN})` returned 0 while `count_documents({})` returned 1.
+  mongod matches it. The storage layer was never at fault (`sortkey.encode_value`
+  already gives NaN a stable encoding, so the index entry was correct); the equality
+  matcher followed IEEE, where NaN != NaN. Fixed in `query.py::_eq_numeric_aware` and
+  `query.rs` — equality only, so ranges and sort keep IEEE semantics and NaN still
+  sorts below every number with `$gt: NaN` matching nothing. Infinity was always
+  fine. Covered by `tests/test_nan_equality.py` and a `secantus-core` unit test.
+- [x] **RESOLVED 2026-08-27 (#1067) — `listIndexes` pagination was broken: a second
+  batch was unreachable (BOTH servers, not just Python as first filed).** `listIndexes` with a `batchSize` smaller than the index
+  count returns a live cursor id, but the follow-up `getMore` fails with
+  `CursorNotFound` (code 43), so the remaining index specs cannot be retrieved at
+  all. mongod returns `[2, 1]` for three indexes at `batchSize: 2`; we return the
+  first batch and then error.
+
+  Reproduce (three indexes, `batchSize: 2`):
+
+      db.command({"listIndexes": "c", "cursor": {"batchSize": 2}})   # -> id != 0
+      db.command({"getMore": id, "collection": "c", "batchSize": 2}) # -> CursorNotFound
+
+  **Was pre-existing, NOT a regression** — reproduced on `main` unchanged while
+  working the cursor-exhaustion slice. Most collections have few enough indexes
+  that the default batch covers them, which is presumably why it went unnoticed.
+
+  **Root cause:** the cursor was registered under `db.$cmd.listIndexes.<coll>`,
+  while drivers put the plain collection name in the getMore's `collection`
+  field. The getMore ownership check — which exists so a guessed cursor id cannot
+  pull pages from a namespace the caller has no privilege on — compared the two
+  and rejected the continuation. The check was correct; the registered namespace
+  was not. mongod uses plain `db.coll`.
+
+  **NOT a blanket "drop the `$cmd` prefix"** — probed on mongod 8.3.4, the answer
+  differs per command and two of the three were already right:
+
+      listIndexes             ns = db.coll                   <- was wrong
+      listCollections         ns = db.$cmd.listCollections   <- already correct
+      aggregate: 1 (no coll)  ns = db.$cmd.aggregate         <- already correct
+
+  Fixed on both servers. Pinned by `tests/test_list_indexes_pagination.py`
+  (7 tests, 4 of which fail with the fix reverted), including one asserting the
+  cross-namespace ownership check still rejects a foreign `collection` — the fix
+  must not weaken the security property whose enforcement produced the symptom.
+
+- [x] **RESOLVED 2026-08-27 — a cursor whose result count is an exact multiple of
+  `batchSize` closed one `getMore` early (both servers).** Probed against mongod 8.3.4
+  (2026-08-27): with `batchSize: 2`, mongod keeps the cursor OPEN after draining
+  it and requires one further `getMore` that returns an empty `nextBatch` with
+  `id: 0`; SecantusDB sets `id: 0` on the batch that drains it.
+
+      4 docs   mongod    batches=[2, 2, 0]    getMores=2
+      4 docs   secantus  batches=[2, 2]       getMores=1
+      6 docs   mongod    batches=[2, 2, 2, 0] getMores=3
+      6 docs   secantus  batches=[2, 2, 2]    getMores=2
+
+  Only diverges when the count divides evenly — with a partial final batch both
+  servers agree (`5 docs -> [2, 2, 1]`). Found incidentally while differential-
+  testing `top`'s `getmore` counter, which is how it surfaced at all: the counter
+  was right and the round-trip count was not.
+
+  Matters because drivers observe round-trip counts directly — mongo-go-driver's
+  `verifyOneGetmoreSent` asserts on exactly that.
+
+  **Fixed 2026-08-27.** The rule mongod actually follows: close only when the
+  result is KNOWN finished — the batch came up short, a `limit`/`singleBatch`
+  bounded it, or no `batchSize` was requested (which means "server default", and
+  mongod then drains and closes). A batch that exactly fills the request proves
+  nothing, so the cursor stays open.
+
+  **The rule is NOT uniform across commands, and assuming it was would have
+  broken two of them.** Probed on mongod 8.3.4: `find` and `aggregate` keep the
+  cursor open on an exact-fill batch, but `listIndexes` and `listCollections`
+  CLOSE — they enumerate a catalog whose size is known up front. Implemented as a
+  `bounded` flag on the cursor entry, set by the catalog commands and by
+  `find` under a positive `limit`.
+
+  Also wider than first filed here: it is not only "exact multiple across
+  getMores" but any batch that exactly drains, including the *first* (`2 docs,
+  batchSize 2` → mongod `[2, 0]`, we returned `[2]`).
+
+  Verified across 12 shapes on both servers (`tests/test_cursor_exhaustion_parity.py`,
+  19 tests, 6 of which fail with the fix reverted; 4 Rust unit tests).
+
+- [x] **RESOLVED 2026-08-27 — `top` reports real per-namespace counters on both servers.** `top` now answers on
+  **both** servers with the mongod shape — one `totals` entry per namespace, a
+  `note` key mongo-tools skips, and `total`/`readLock`/`writeLock` plus the per-op
+  sections each `{time, count}` — and both refuse a non-admin database with code 13.
+  The Rust half landed 2026-08-21 (`diagnostics::top`); until then it answered code
+  59 CommandNotFound, so `mongotop` failed outright against the Rust server rather
+  than rendering an idle one, a gap this entry's old "counters are always zero"
+  wording hid by reading as if it described both servers.
+  **The counters now exist on both servers.** Python: `Metrics.record_namespace_op`
+  / `top_snapshot` (`metrics.py`), called from `dispatch` reusing the profiler's
+  existing clock read. Rust: a new `topstats::TopStats` on `Shared`, threaded into
+  every `CommandContext` and recorded around `dispatch`
+  (`secantus-server/src/lib.rs`).
+
+  **The section mapping was probed against real mongod 8.3.4, not assumed — and
+  the obvious assumptions were wrong in four places.** `aggregate`, `count`,
+  `distinct` and `findAndModify` all land in `commands`, NOT in `queries`/`update`;
+  mongod's `queries` section is essentially just `find`. Counts are per COMMAND,
+  not per document (a 50-document `insert` bumps the count by 1). `createIndexes` /
+  `dropIndexes` / `findAndModify` take `writeLock`; `aggregate` / `count` /
+  `distinct` / `listIndexes` / `explain` take `readLock`. A successful `drop`
+  RESETS the namespace's counters — mongod does not carry history across a drop,
+  which the first implementation here got backwards. Commands naming no collection
+  (`ping` / `hello` / `serverStatus` / `listCollections`) are not attributed.
+
+  One mongod oddity deliberately not reproduced: `collMod` bumps `total` but
+  neither `readLock` nor `writeLock`. We classify it as a write — noted rather than
+  special-cased, since the shape matters to mongotop and this asymmetry does not.
+
+  Differential against mongod 8.3.4 over a mixed workload matches on 8 of 9
+  sections; the 9th (`getmore`) differs only because of the separate
+  cursor-exhaustion divergence filed above, not because of the counter.
 - ~~**`renameCollection` cross-process safety**~~ structurally guaranteed by WiredTiger (b34). Within-process atomicity is the storage `RLock`. Cross-process exclusion is `WiredTiger.lock` — a second `wiredtiger_open` on the same path fails with ``WT_ERROR Resource busy`` before any state is touched, so concurrent writers across processes / worktrees can't exist in the first place. See `tests/test_storage_exclusion.py`.
 - ~~**`createIndexes` collation**~~ shipped (single-field b25 + compound b27). `sortkey.encode_value_directed` takes a `collation` kwarg; index entries are written under the index's stored collation; single-field equality / range / `$in` (`_find_leading_field_index`), compound bare-equality (`_pick_compound_eq_index`), and compound prefix + trailing-operator (`_pick_compound_range_index`) all thread collation through and gate by exact match. Unique-probe path reads each index's stored collation too. Strength 1/2/3 + `caseLevel` work uniformly across single- and compound-field indexes; `numericOrdering` still falls back to COLLSCAN at every level (would need a length-prefixed digit-run encoding to stay byte-sortable). See `docs/indexes.md` "Per-index collation".
 
@@ -26,7 +349,168 @@ These work end-to-end but cut corners.
 
 Specific items that were left out of the slice that introduced their feature area.
 
-- [ ] **Admin UI saved-connections / settings page**: Slice 11 of the admin UI shipped schema sampler / logs viewer / geo viewer but skipped the planned `/settings` page with saved Mongo URIs and a manual dark/light toggle. The CLI today takes a single `--uri` per launch, so saved connections are bookmark-only (you can't switch targets after start). When the launcher gains hot-swap support, revisit this page — it's likely a small SQLite-backed list reusing the existing `~/.secantus/admin.db` store.
+- [x] **find/aggregate firstBatch is byte-capped — FIXED 2026-08-22 (both servers).**
+  `getMore` had mongod's 16MB reply budget; a FIRST batch was capped on document
+  count alone, so `find` with `batchSize: 25` over 1MB documents assembled a 25MB
+  reply and exhausted the cursor. Measured against a live mongod 6.0.16 on the same
+  data: mongod returns 15 documents (15.0 MiB) and a live cursor id; we returned 25
+  documents (25.0 MiB) and `id: 0`. Both servers now apply the same budget
+  `CursorRegistry.next_batch` already used — stop before the document that would
+  overflow, always take at least one so an oversized document still makes progress —
+  in `commands.py::_split_into_cursor` (encode-to-measure) and
+  `find.rs::split_into_cursor` (blob lengths already known, so free). Both now
+  answer 15 / 15.0 MiB / cursor open, matching mongod exactly.
+  **Not covered:** `find.rs::split_docs_into_cursor`, the projected/aggregate path
+  that carries decoded `Document`s rather than blobs. Measuring there means encoding
+  each document purely to size it — real overhead on the Rust server's hot path for
+  a case (megabyte documents *and* a projection) that no driver has hit. Left
+  deliberately, recorded rather than silently skipped.
+- ~~**Three-droplet DigitalOcean benchmark: no repeat-and-median mode**~~ — shipped. `--repeat N` interleaves the engines within each pass (so drift lands on both equally) and reports medians plus a `(max - min) / median` spread column and a per-pass table. Measured 3.4% spread for secantusdb and 1.1% for mongod over three 60s passes. The whole harness is now live-verified: provisioning, VPC + firewall, SSH, cloud-init, both deploy routes, both engines, repeat/median, and all three teardown modes. See `bench/DO_CLUSTER.md`.
+- [ ] **SecantusDB is 0.27x mongod on incompressible data; p99.9 is 72x worse (2026-08-21)**: the three-droplet comparison on identical `c-4` hardware, **8 KiB incompressible documents**, 70/20/10 mix, 16 workers x 2 client droplets, 4G WT cache both, three interleaved 90s passes (spreads 3.6% / 3.9%): secantusd-rs 0.5.3-beta.160 at **3,993 ops/s against mongod 8.0.29's 14,937**, p50 2.41ms vs 1.73ms, p99 64ms vs 10ms, **p99.9 1,303ms vs 18ms**. Both server-CPU-bound at 80-83% with clients idle, so the comparison is fair. **Supersedes the earlier 0.46x / 9.8-11.3x figure**, which was measured with the default `repeat` payload — a single repeated character that both engines compress away, and that flattered SecantusDB because mongod's snappy-compressed journal benefits far more than SecantusDB's uncompressed one. Published in `docs/benchmark.md`. Reproduce with `invoke do-bench --repeat 3 --payload random`. The tail is the weak point: p50 is within 1.4x, so typical operations are competitive; it is the worst 0.1% that collapses. Relates to the uncompressed-WAL and cache-pressure entries above and to the write-path gap in §7.
+- [x] **RESOLVED 2026-08-28 — update error messages: mongod wraps EXECUTION-time
+  errors, we didn't (BOTH servers).** Probed on mongod 8.3.4 while differential-testing the update
+  operator family. mongod prefixes errors that depend on the STORED DOCUMENT with
+  `Plan executor error during update :: caused by :: `, and leaves errors
+  determinable from the update spec alone plain:
+
+      PREFIXED   $inc/$mul on a non-numeric FIELD          code 14
+      PREFIXED   $push/$pop/$addToSet/$pull on a non-array  code 2 / 14
+      plain      path conflict                              code 40
+      plain      self-rename                                code 2
+      plain      unknown operator                           code 9
+      plain      $inc with a non-numeric ARGUMENT           code 14
+
+  Our `$inc` non-numeric message is byte-identical to mongod's apart from the
+  missing prefix. `$push` on a non-array is worse: we answer code **9** with
+  `$push on non-array at 'a'` where mongod answers code **2** with
+  `The field 'a' must be an array but is of type int in document {_id: 1}`.
+
+  **Fixed.** All six execution-time cases now match mongod byte-for-byte (they
+  were 0/6). `$inc` / `$mul` / `$pull` needed only the wrapper; `$push` and
+  `$addToSet` needed mongod's code (2, not 9) and message bodies as well.
+
+  **The probe also turned up a correctness bug the entry had not noticed:**
+  `$pop` on a non-array was a SILENT NO-OP on both servers -- `n: 1`, no write
+  error, document untouched -- where mongod answers code 14. The Rust engine had
+  the same gap (a non-array fell through its `if let Some(Bson::Array(..))`) and
+  now defers. A missing field and an empty array stay no-ops on both, as on
+  mongod.
+
+  Pinned by `tests/test_update_execution_errors.py` (15 tests, 7 of which fail
+  with the fix reverted), including one asserting parse-time errors stay
+  UNwrapped -- the wrapper must not spread to errors that do not depend on the
+  stored document.
+
+- [x] **RESOLVED 2026-08-28/29 — wrong-typed command arguments (Python server).
+  The sweep is 87/87 clean**, from 24 crashes + 44 divergences when it started.
+  Reproduce with `tools/probes/arg_types_extended.py` against the mongod on PATH
+  (6.0.16 — see `tools/probes/README.md` on probing the version we advertise).
+
+  Landed in four PRs, one per failure mode:
+
+      #1078  document-valued arguments        45 crashes -> 0   (56/56 clean)
+      #1080  numeric / cursor arguments       24 crashes -> 0
+      #1084  silently accepted (24 slots)     accepted   -> mongod's error
+      ....   wrong code (18 slots)            our code   -> mongod's code
+
+  **The lesson, which is the reason this took four PRs and not one: mongod's
+  strictness is per-slot, not per-class.** Nine slots in the third tranche alone
+  needed six different message families. Cases that a blanket rule gets wrong,
+  all measured rather than reasoned:
+
+      delete.deletes.limit    NOT type-checked at all -- {} / "x" / [1] / 0 all
+                              accepted, meaning "no limit", while the analogous
+                              find.limit IS a type error
+      findAndModify.upsert    bool OR any number (upsert: 1.5 is valid), while
+                              the adjacent update.updates.multi is a strict bool
+                              that rejects multi: 1
+      find.let                reported as `FindCommandRequest.let`, mongod's
+                              internal IDL name, while update / delete /
+                              findAndModify / aggregate use their command name
+      find.maxTimeMS          code 2, not 14, with three distinct messages
+      find.min / .max         type-checked at PARSE time, before hint validation
+      explicit null           accepted by six slots, rejected by three
+
+  Two conflated conditions were each doing two jobs and are now split (with the
+  correct half pinned so it cannot regress): `$sort` answered "must have at
+  least one sort key" for a spec that was not an object, and `$unwind` answered
+  "expected a string as the path" for a spec with no `path` at all.
+
+  Pinned by `tests/test_command_arg_types.py`, `tests/test_arg_types_numeric.py`,
+  `tests/test_arg_types_accepted_slots.py` and
+  `tests/test_arg_types_wrong_codes.py`.
+
+  **NOT done: the Rust server has never been swept for this class.** Every
+  number above is the Python server. The probe drives whatever is on the wire,
+  so pointing it at `secantusd-rs` is the whole of the measurement — do that
+  before assuming either result.
+- [ ] **OPEN — `test_tls_against_rust_server` flakes on the Windows runner
+  (first seen 2026-08-29, PR #1089).** `storage-engine (windows-latest)` failed
+  ONE of 86 tests with `ServerSelectionTimeoutError: No servers found yet,
+  Timeout: 5.0s` while pinging a TLS-enabled `RustServer`; a rerun of the same
+  job on the same commit passed. The PR that surfaced it changed only
+  `sql/planner.py` and its tests, so there is no causal path to the Rust
+  server's TLS listener.
+
+  **Not the known Windows `storage-engine` pattern** — that one is disk
+  exhaustion and shows `WT_PANIC` + `No space left on device` across a burst of
+  tests. This is a single test, no panic, no ENOSPC.
+
+  Most likely a genuinely tight budget: the test allows **5s** for a TLS
+  handshake against a freshly-spawned server on the slowest runner in the
+  matrix, and `tests/test_rust_server_smoke.py` uses the same 5000ms in seven
+  places. Per this repo's rule a flake is a bug, not noise — the fix is to give
+  the TLS case a budget matched to Windows (or wait for the listener rather than
+  race it), not to rerun it away. Recorded here because reruns hide it.
+
+- [x] **RESOLVED 2026-08-29 — wrong-typed command arguments on the RUST SERVER:
+  78 of 87 divergences -> 87/87 clean.** First swept the same day (the Python
+  server had reached 87/87 across #1078 / #1080 / #1084 / #1085; this server had
+  never been measured). Reproduce with `PROBE_SERVER` — see
+  `tools/probes/README.md`.
+
+  Fixed in two halves, matching the two failure modes:
+
+  **54 silently accepted** — new `secantus-commands::argtypes`, one validator per
+  message family, wired into `find` / `aggregate` / `createIndexes` / `create` /
+  `collMod` / `listIndexes` / `findAndModify` / `update`. Messages mirror the
+  Python server's, which are pinned byte-for-byte against a live mongod, so they
+  did not have to be re-derived. Every per-slot asymmetry carries across:
+  `findAndModify.upsert` takes a bool OR any number while `update.multi` rejects
+  `multi: 1`; `find.let` reports as `FindCommandRequest.let`; `maxTimeMS` is
+  code 2 with three messages; six slots accept an explicit null and three reject
+  it; `delete.deletes.limit` stays UNvalidated.
+
+  **24 generic `BadValue` (2)** — the "Rust error-code class"
+  (`tasks/remaining-work-plan.md` §1b), and the cause is structural:
+  `secantus-core` returns `Fallback` meaning "let the Python engine run this",
+  but this server has no Python, so it surfaced as BadValue. Closed with the
+  plan's named template (`update::arith_type_error`) rather than by widening
+  `Fallback`: a standalone `argtypes::stage_spec_error` naming the seven stages
+  it can name — `$lookup` 9, `$group` 15947, `$match` 15959, `$sort` 15973,
+  `$limit` 5107201, `$skip` 5107200, `$count` 40156, `$unwind` 15981 / 28812 —
+  and leaving everything else alone.
+
+  19 Rust unit tests. **Both servers are now 87/87 on this sweep.**
+
+- [ ] **OPEN — `$limit` / `$skip` stage-error messages render the offending value
+  as a PYTHON repr (Python server).** Found 2026-08-29 while porting the above.
+  mongod echoes the value shell-style — probed on 6.0.16:
+
+      $skip: "x"    ->  ... Expected a number in: $skip: "x"     (quoted)
+      $skip: true   ->  ... Expected a number in: $skip: true
+      $skip: [1]    ->  ... Expected a number in: $skip: [ 1 ]   (spaced)
+      $skip: {}     ->  ... Expected a number in: $skip: {}
+
+  `aggregate._fmt_stage_val` uses `str()` / `repr()`, so a string renders bare
+  (`x`) and an array unspaced (`[1]`). The CODE is right, which is why the sweep
+  never caught it — `arg_types_extended.py` compares codes only. The Rust server
+  now renders these mongod-style (`argtypes::render_stage_value`), so the two
+  servers currently DISAGREE on this message. Low severity (message text on an
+  already-correct error) but it is a real divergence and the two engines should
+  not differ; port the Rust renderer back to Python.
+
+- [ ] **OPEN — Admin UI saved-connections / settings page**: Slice 11 of the admin UI shipped schema sampler / logs viewer / geo viewer but skipped the planned `/settings` page with saved Mongo URIs and a manual dark/light toggle. The CLI today takes a single `--uri` per launch, so saved connections are bookmark-only (you can't switch targets after start). When the launcher gains hot-swap support, revisit this page — it's likely a small SQLite-backed list reusing the existing `~/.secantus/admin.db` store.
 
 ### 3.1 Authentication
 
@@ -52,8 +536,109 @@ Single-node change streams are implemented and conformant for typical pymongo `w
   `showExpandedEvents`; added the `modify` branch. A `showExpandedEvents` watch
   now sees `createIndexes` / `dropIndexes` / `modify`, and a default watch
   suppresses them.
-- [ ] **Read concern / write concern semantics** — accepted on the wire for compatibility, otherwise ignored.
-- [ ] **C-driver (`libmongoc`) change-stream gauge tests excluded** — the C gauge's `include_paths.py` deliberately omits the `/change_stream` and `/change_streams` suites. libmongoc's test fixture bootstraps every change-stream test through `test_framework_replset_member_count()`, which now sees `replSetGetStatus` → `NoReplicationEnabled` (member count 0) and therefore *skips* those tests as "standalone". They no longer abort the run (that was the pre-`replSetGetStatus` behaviour), but they wouldn't actually exercise the change-stream path either, so they're left out. To gauge change streams through the C driver, `replSetGetStatus` would need to report ≥1 live member (a fuller fake-replset reply) — a larger emulation change than the standalone error we ship.
+- [ ] **Read concern / write concern semantics** — read concern is accepted and ignored. **Write concern is NOT merely ignored** (re-probed 2026-08-20): an unsatisfiable `w` is rejected exactly as mongod rejects it, `{code: 100, codeName: "CannotSatisfyWriteConcern", errmsg: "Not enough data-bearing nodes"}`, on **both** servers — `w: 2` against a one-member set raises rather than silently succeeding. That is the faithful behaviour, and the ruby-gauge `w:2` expected-fail below is a consequence of it. What remains genuinely accept-and-ignore is `j` / `wtimeout` / `w: "majority"` durability semantics, which a single node satisfies trivially.
+- [x] **C-driver (`libmongoc`) change-stream gauge tests — NOW RUNNING.** The
+  `/change_stream` + `/change_streams` suites were excluded because the C
+  fixture bootstraps them through `test_framework_replset_member_count()`,
+  which counts `replSetGetStatus.members`; SecantusDB answered the standalone
+  `NoReplicationEnabled` error, so the helper saw 0 members and skipped every
+  one. `replSetGetStatus` now reports the same one-member PRIMARY roster its
+  own `hello` already advertised (gated on a set name being configured — a
+  genuine standalone still gets the honest error), which resolves an
+  inconsistency as well as enabling the suites: `hello` claimed replica-set
+  primary while `replSetGetStatus` claimed standalone, and real mongod is
+  never both. **32 change-stream tests now execute; 28 pass.** Four defects
+  surfaced and were fixed: the resume-token error message and the
+  pipeline-stage error code/message did not match mongod's, and the
+  resume-token validity check caught only a *removed* `_id`, not a *modified*
+  one (mongod allows "only transformations that retain the unmodified `_id`").
+  Net C gauge 802 tests/10 fails -> 815/10 — same failures, 13 more tests.
+  **All three follow-up gaps are now CLOSED** (`failGetMoreAfterCursorCheckout`
+  + the `ResumableChangeStreamError` label): change-stream failures 3 -> 0, C
+  gauge 10 -> 7 fails / 99.1%, 31 change-stream tests passing. **2026-08-27: `/change_stream/accepts_array` now passes too (PR #1058, malformed pipeline elements), taking the whole `/change_stream` suite to 0 failures; C gauge 761/7/70 = 99.1%, the 7 being the 4 `select_server` + 2 `ipv6` inherents and `writeConcernError`.** The remaining 7
+  failures are the long-standing ones the **Python** server shares, so the C
+  gauge is back to zero rust-only failures WITH change streams covered. **Skipped as inherent:**
+  `/change_stream/live/read_prefs`, `/Client/command_secondary` and
+  `/Collection/aggregate/secondary` need a real SECONDARY, which a single-node
+  surrogate has not got (multi-node is out of scope) — rationale recorded in
+  `c_validation/include_paths.py::SKIP_TESTS`.
+  **Follow-up 2026-08-21: the `replSetGetStatus` half of this was Rust-only until
+  now.** The entry above reads as a server-wide fix, but only
+  `handshake.rs::repl_set_get_status` reported the roster; `commands.py` kept
+  answering the standalone error, so the Python server went on claiming
+  `setName: secantus` in `hello` while telling `replSetGetStatus` it was "not
+  running with --replSet". libmongoc counts `members` to classify the topology, so
+  it treated the Python server as standalone and ran standalone-only tests against
+  it — `/Client/last_write_date_absent{,/pooled}` asserted no `lastWriteDate` and
+  found the replica-set-shaped one our `hello` supplies. Porting the roster to
+  Python drops those two (now correctly `skip`), which is why the Python list was
+  10 and the Rust list 7. **Triage of the remainder, reproduced 2026-08-21:**
+  `/Client/select_server` ×4 is *inherent* — it asserts the server selected for
+  reads is `standalone_or_rs_secondary_or_mongos` and we can only offer the
+  primary, the same class as the pymongo/ruby secondary-readPreference
+  expected-reds. **`/Client/ipv6` ×2 is also inherent — corrected again 2026-08-21.**
+  This audit first called it fixable ("we bind `127.0.0.1` only"). Reading the test
+  says otherwise: it hardcodes `mongodb://[::1]/` — no port, so the *default*
+  27017 — and never consults `MONGOC_TEST_URI`, so it can only pass against a
+  server the harness happens to have placed on `[::1]:27017`. No server-side change
+  reaches it. (The IPv4-only limitation it led to *was* real and is now fixed —
+  `server.py` derives the address family via `getaddrinfo`, so `host="::1"` serves
+  properly; `tests/test_server_bind_family.py`. That is a genuine capability gain
+  and not a gauge fix.) The one genuinely open C failure is
+  `/command_monitoring/unified/writeConcernError`, which unlike the "flaky, not
+  deterministic" note above **reproduces every time when run alone**. Re-triaged
+  2026-08-21 and **four plausible causes were ruled out by probing** — record these
+  so the next attempt does not re-walk them:
+  1. *`failCommand` ignores `writeConcernError`* — false. `failpoints.py` supports
+     it and `commands.py:7205` attaches it to the successful reply.
+  2. *The failpoint's `errorLabels` are dropped on the WCE path* — false, they are
+     attached at `commands.py:7207`.
+  3. *Our reply shape is wrong* — false. Probed against the spec's exact failpoint,
+     we return `{ok: 1.0, n: 1, errorLabels: ["RetryableWriteError"],
+     writeConcernError: {code: 91}}`, which matches the `commandSucceededEvent`
+     the spec expects field for field.
+  4. *Retryable-write idempotency is missing, so the driver's retry hits
+     DuplicateKey* — false. Two inserts of the same document with the same
+     `lsid` + `txnNumber` both return `n: 1` and leave one document.
+  The spec expects **two** `commandStartedEvent`s, i.e. the driver retries after
+  the retryable WCE and the retry succeeds. pymongo does not retry here at all (it
+  raises `WriteConcernError`), so the divergence is most likely in *when libmongoc
+  decides a write is retryable* — topology classification from a `Single`-topology
+  URI is the obvious next thing to check, not the reply contents. One residual
+  fidelity nit found on the way: we answer `codeName: "Location91"` where 91 is
+  `ShutdownInProgress`; harmless for retry decisions (they key on the code) but
+  wrong.
+
+  **Re-probed 2026-08-27 (C gauge at HEAD 6ab4d115).** Two things confirmed, plus
+  one dead end recorded so it is not re-walked:
+  - The failure is at the *operation* level, verbatim: `error: expected success,
+    but got error: failCommand failpoint`. libmongoc surfaces our
+    `writeConcernError` as an `insertOne` error rather than retrying. This does
+    **not** contradict ruled-out cause 3 above — a correct reply shape and an
+    operation error are both true if the driver never retries, which is what the
+    evidence says. Our side re-read and still looks right: the failpoint carries
+    only `errorLabels` + `writeConcernError` (no `errorCode`), so the error branch
+    is skipped and the WCE + labels ride a successful reply
+    (`commands.py:7247-7250`); `mode.times` does decrement (`failpoints.py:193`);
+    and `hello` advertises `logicalSessionTimeoutMinutes` + a wire version that
+    permit retryable writes.
+  - **Dead end — do not repeat:** tracing the server by monkeypatching
+    `secantus.commands.dispatch` (or `secantus.server.dispatch`) logs NOTHING.
+    `server.py` does `from secantus.commands import dispatch` at import
+    (`server.py:22`) and calls the module global at 502/623/745/835, so a late
+    patch never reaches the running accept loop. A future attempt needs a
+    wire-level proxy or an in-tree hook, not a monkeypatch.
+  The open question is unchanged and still the right one: does libmongoc assign a
+  `txnNumber` for this write at all (i.e. does it classify a `Single`-topology URI
+  as retryable-write capable)? Answer that first — if no `txnNumber` arrives,
+  nothing about our reply can make it retry.
+  **`/BulkOperation/OP_MSG/max_msg_size` is NOT in that list, and this audit
+  briefly claimed it was.** Run by its exact name it PASSES, both forked and
+  `--no-fork`, exactly as the 2026-08-11 re-diagnosis above says. It appeared to
+  fail here only because the reproducer appended a `*` to the pattern, pulling in
+  its `/BulkOperation/OP_MSG/*` siblings and reproducing the accumulated-state
+  interference that entry already documents. The lesson is the entry's own: the
+  framing "the server doesn't split" is wrong and chasing it wastes time.
 - [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
 
 ### 3.3 MongoDB CLI / tool conformance tests
@@ -96,23 +681,46 @@ into the thread-local, oplog entries buffered until commit). Conformance:
 `tests/test_transactions.py` (pymongo-driven), `tests/test_transaction_registry.py`,
 `tests/test_storage_user_txn.py`. Known divergences, all deliberate:
 
-- [ ] **Non-transactional writers don't block until the transaction ends** —
-  mongod parks a plain writer that hits a transaction's uncommitted write until
-  commit/abort. SecantusDB retries in a bounded backoff loop
-  (`storage._retry_write_conflicts`, ~5s deadline) and then surfaces 112
-  `WriteConflict`. A plain writer can therefore fail against a long-lived open
-  transaction where mongod would have waited the full
-  `transactionLifetimeLimitSeconds`.
-- [ ] **Cross-transaction unique-index enforcement can leak** — index-entry
-  keys embed the doc's id_key, so two different docs violating the same unique
-  constraint from a transaction + a concurrent writer don't collide on a WT key
-  and both commits can succeed. mongod prevents this with prepared conflicts.
-  Same-key (`_id`) conflicts ARE caught (WT write-write conflict → 112).
-- [ ] **Failpoint-injected errors on in-transaction statements don't abort the
-  transaction** — the `failCommand` short-circuit runs before transaction
-  resolution so retryable-commit tests (inject once, retry succeeds) work. If a
-  unified test asserts transient labels on injected in-txn statement errors,
-  the label must come from the failpoint's own `errorLabels` data.
+- [x] **Non-transactional writers DO block until the transaction ends — entry
+  was wrong; re-measured 2026-08-11.** The claim below (bounded ~5s backoff,
+  then 112 `WriteConflict`) does not reproduce on either server. Measured over
+  the wire: a holder thread opens a transaction, updates `{_id: 1}`, sleeps,
+  commits, while an outside client updates the same doc. The outside writer
+  parks for the full life of the transaction and then **succeeds** —
+  Rust `hold=2s → waited 1.73s`, `hold=8s → waited 7.72s`,
+  `hold=20s → waited 19.72s`; Python `hold=8s → waited 7.71s`. All four end
+  `{'txn': 'committed', 'outside': 'ok'}` with the final value reflecting both
+  writes. 20s is well past the claimed ~5s deadline, so there is no deadline to
+  hit. This matches mongod. Nothing to fix.
+- [x] **Cross-transaction unique-index enforcement can leak — FIXED (#809).**
+  Index-entry keys embed the RecordId, so two different docs violating the same
+  unique constraint never collided on a WT key, and the check was a probe read
+  through the caller's own snapshot — blind to a value an open transaction held
+  uncommitted. A transaction plus a concurrent writer could both commit;
+  reproduced 10/10 over the wire, silently, with both writers told they had
+  succeeded. Fixed by porting the Python server's #775 design: a
+  `secantus_unique_keys` table keyed on the VALUE alone (not value+RecordId),
+  claimed with `overwrite=false` so WiredTiger refuses the second claim itself.
+  Claims release only to their owning RecordId and are purged on collection /
+  database / index drop (#808's false-rejection lesson). `_id_` is excluded —
+  its uniqueness is already enforced by the `_id` index, and claiming it too
+  double-wrote every insert. Verified both directions: commit ⇒ the outside
+  writer gets DuplicateKey, abort ⇒ it succeeds; 0/25 plain-concurrency leaks
+  and 0/10 drop/recreate false rejections.
+- [x] **Failpoint-injected errors on in-transaction statements DO abort the
+  transaction — entry was wrong; re-measured 2026-08-11.** Measured on both
+  servers: `failCommand` injects `errorCode: 2` on an in-transaction `insert`,
+  then a second statement and a commit are attempted. Both servers give
+  identical, mongod-shaped results — injected statement `code=2`; the *next*
+  statement is refused with `code=251` `NoSuchTransaction` +
+  `errorLabels: ['TransientTransactionError']`; the commit likewise 251 +
+  `TransientTransactionError`; and the collection ends holding only the seed
+  doc, so no transaction write leaked. The label drivers key whole-transaction
+  retry off is therefore already present and does **not** need to come from the
+  failpoint's own `errorLabels` data. Note when probing this: use a non-SDAM
+  `errorCode`. `11600` (`InterruptedAtShutdown`) makes the driver mark the
+  topology unknown, so the follow-up fails on server selection and hides the
+  transaction state you're trying to observe.
 - [ ] **No `recoveryToken` / mongos pinning, no prepared transactions, no
   `maxCommitTimeMS`, no `serverStatus.transactions` metrics, no
   `afterClusterTime` enforcement** — multi-node machinery; out of scope.
@@ -138,7 +746,7 @@ The 2026-06-13 gauge-gaps slice fixed projection `_id`/array semantics,
 `maxBsonObjectSize` enforcement, snapshot readConcern + `$$NOW`, and most of
 the change-stream batch. Still open, precisely characterized:
 
-- [ ] **Cursor/collection misc from the 64-list** (task #14 of the slice).
+- [ ] **OPEN — Cursor/collection misc from the 64-list** (task #14 of the slice).
   Fixed in the gauge-misc slice (2026-06-13): embedded-document equality is
   now order-sensitive + exact (real matcher correctness bug — `query_embedded`
   / `query_array` examples), the `validate` command is implemented
@@ -290,6 +898,300 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [x] **Cursor / `getMore` / `killCursors` argument sweep — 22 of 51 shapes
+  diverged, four of them CRASHES, all fixed (2026-08-29).** Phase 2's second
+  surface. The crashes: `getMore` with a string cursor id or a string
+  `batchSize`, and `killCursors` with a non-array `cursors` or a wrong-typed
+  element, each reached a bare `int()` and the `ValueError` / `TypeError`
+  escaped as `internal server error` (code 1).
+  Two patterns worth carrying forward:
+  - **`getMore` answered `CursorNotFound` (43) for four different PARSE
+    errors** — about a cursor that existed. A wrong error that names a
+    plausible cause is worse than a crash for debugging: it sends the caller
+    looking at cursor lifetime when the actual fault is a missing
+    `collection` (mongod: 40414), a non-string one (14), an unknown field
+    (40415) or an int32 cursor id (14 — mongod requires a *long*). mongod
+    parses before it looks a cursor up.
+  - **Every numeric cursor slot accepted negatives.** `batchSize` fell through
+    `or DEFAULT` and silently became the default; `limit: -3` returned the
+    whole collection. mongod answers `Location51024` and, unlike the type error
+    on the same slot, names the field *bare* rather than by its IDL path.
+  **The Rust server does not share the crashes** (`as_i64` returns `None` where
+  Python's `int()` raises) but does share the accepted-and-ignored family —
+  covered by the standing "point the wrong-typed-argument probe at
+  `secantusd-rs`" item, still open.
+- [ ] **`getMore` on a namespace that isn't the cursor's answers 43, not
+  mongod's 13.** mongod says `Requested getMore on namespace 'db.other', but
+  cursor belongs to a different namespace db.c`. Ours answers `CursorNotFound`
+  **deliberately** — the handler's comment explains it: `getMore` is in
+  `_NO_PRIVILEGE_COMMANDS`, so answering a distinguishable error would
+  confirm-or-deny which cursor ids exist on other connections. Recorded as a
+  divergence, not scheduled as a fix: reverting it would trade a real hardening
+  property for message fidelity nobody's driver reads.
+- [ ] **A `find` on a MISSING collection orders the cursor reply's keys
+  differently.** mongod answers `{id, ns, firstBatch}` there and
+  `{firstBatch, id, ns}` for every other find — a different code path in the
+  server. Ours is consistent, so it matches on the common path and differs on
+  the missing-collection one. Left alone deliberately: after two version splits
+  found by CI on this same gate (see below), a one-version observation about
+  BSON key order is not enough to act on.
+
+- [x] **`findAndModify` differential sweep — 14 of 49 combinations diverged,
+  all fixed (2026-08-29).** Phase 2 of `tasks/remaining-work-plan.md`. Probed
+  against mongod 6.0.16, comparing the **raw command reply** rather than
+  pymongo's `find_one_and_*` wrappers — half the divergences were in the reply
+  *shape* (`lastErrorObject`'s keys, an upserted document's field order), which
+  the wrappers hide. Three findings are worth carrying forward:
+  - **Two of the bugs were in the shared update path, not in `findAndModify`**,
+    so probing one command found bugs in two. `update: {}` is a *replacement*
+    (mongod reduces the document to its `_id`, `nModified: 1`); both write
+    commands short-circuited on a falsy update and kept every field the caller
+    asked to drop. And an upsert from a dotted query (`{"sub.k": 77}`) stored a
+    literal key with a dot in it — a document mongod cannot produce, which then
+    never matched the query that created it. When a command-level probe finds
+    something, re-run the shapes through the sibling commands.
+  - **`$set: {"n.x": 1}` against `{n: 5}` silently did nothing** where mongod
+    answers `PathNotViable` (28). The Rust port justified it with the comment
+    `non-container intermediate -> Python walk returns None -> no-op`, making
+    this the **fifth** hit for the cross-referencing-comments pattern (5-for-5;
+    see the triage block's greps).
+  - **`findAndModify` had no `UpdateError` mapping at all**, so every update
+    failure escaped to dispatch's generic handler as `14 TypeMismatch` — codes
+    9 / 40 / 66 / 28 all arrived wrong. The `update` command has had the mapping
+    for a while; the two had simply drifted. `codeName` was independently
+    broken: it was pinned to `TypeMismatch` even when the exception named its
+    own code, a pair mongod never sends.
+  Also fixed: `new` never type-checked (a string went through Python
+  truthiness, so `new: "no"` returned the post-image), unknown top-level fields
+  accepted, `hint` accepted and ignored, `arrayFilters` type errors naming a
+  field path this command does not have, and mongod's single "Unknown modifier"
+  wording.
+  **One more instance of "a test pinning the bug" (now 4-for-4):**
+  `test_arg_types_accepted_slots.py` asserted
+  `expected types '[bool, long, int, decimal, double]'` — the sensible quoting.
+  mongod emits `…double']`, with the closing quote **inside** the bracket;
+  re-probed at byte level to be sure, because a quote-position claim is easy to
+  get backwards. The test and the server had agreed on a string mongod does not
+  send, so the full suite was green over it. `tests/test_mongod_differential.py` 57 → 93 cases;
+  `tests/test_findandmodify_fidelity.py` and
+  `tests/test_update_replacement_and_paths.py` pin the semantics.
+- [x] **The differential gate runs against DIFFERENT mongod versions per CI
+  lane, and two assertions were version-dependent (found by CI, 2026-08-29).**
+  The dev box has 6.0.16; the `windows-latest` runner image ships a newer
+  server, and `test-windows` failed twice on assertions that passed on macOS
+  and Linux. Neither was a flake. Both splits are worth knowing before adding
+  a differential case:
+  - **`codeName` for the high numeric codes is not stable.** 40415 is
+    `Location40415` on 6.0.16 (mongod's fallback rendering for a code with no
+    symbolic name) and `IDLUnknownField` on the newer server — same code, same
+    message. The *named* codes (2 / 9 / 14 / 28 / 40 / 66) are stable.
+    `_stable_code_name` now asserts the name only below code 10000.
+  - **An upserted document's query-seeded fields are ordered differently.**
+    6.0.16 sorts them (`{b: 1, a: 2}` upserts `{_id, a, b, …}`); the newer
+    server keeps the query's order (`{_id, b, a, …}`). `_id` leading, and
+    field-name order for the fields the *update* added, hold on both. We ship
+    6.0's form per this project's standing convention; the gate asserts only
+    the version-stable parts (`_upsert_key_shape`).
+- [ ] **A hint that names no index answers a shorter message than mongod's.**
+  Code (2) and `codeName` (`BadValue`) match, and the causal sentence is the
+  same — `hint provided does not correspond to an existing index` — but mongod
+  prefixes a dump of the parsed plan: `error processing query:
+  ns=<db>.<coll>Tree: _id $eq 1\nSort: {}\nProj: {}\nCollation: { locale:
+  "simple" }\n planner returned error :: caused by :: …`. Reproducing it needs a
+  renderer for the parsed query tree, the sort, the projection and the
+  collation, which would diverge for anything but trivial filters. **Shared with
+  `find` and `count`**, which have always answered the short form; noticed on
+  `findAndModify` only because that command previously ignored `hint` entirely.
+  Message-only — no code, `codeName`, or behaviour differs.
+- [ ] **A `$`-prefixed unknown command field is accepted where mongod rejects
+  it.** mongod answers `Location40415` for `findAndModify.$zz` as it does for
+  any other unknown field; we accept every `$`-prefixed key unconditionally.
+  Deliberate, and the same carve-out `create` makes: `$`-keys are the wire
+  envelope (`$db`, `$clusterTime`, `$readPreference`, `$audit`, …) and an
+  allowlist that missed one would break a driver over a message nobody reads.
+  Revisit only with a driver-verified envelope list.
+- [x] **Decimal128 arithmetic — SHIPPED on BOTH servers, all four operators
+  (2026-08-24).** `$inc` / `$mul` / `$sum` / `$avg` now compute natively in Rust
+  instead of erroring, and the **Python server's silent 28-digit truncation is
+  fixed**: `_combine` ran in Python's default decimal context, so every stored
+  decimal lost six of decimal128's 34 digits
+  (`Decimal128("1.000000000000000000000000000000001") + 1` answered
+  `2.000000000000000000000000000`). New `crates/secantus-core/src/decimal.rs`
+  implements exact sign/coefficient/exponent arithmetic — add (preferred exponent
+  `min(e1,e2)`), multiply (`e1+e2`), and divide-by-count for `$avg` — with a
+  single round-half-even to 34 digits, preserving **quantum** (`2.50 + 0.10` is
+  `2.60`, `2.50 * 2` is `5.00`). Three-way verified against mongod 6.0.16
+  (`tests/test_mongod_differential.py`, 30 cases) and pinned to the Python engine
+  by `tests/test_rust_decimal_parity.py` — a **seeded generative fuzz** that is
+  now a standing gate, not a scratchpad script. It asserts both agreement *and*
+  zero deferrals (a deferral is fatal on the standalone Rust server), and it
+  earned its keep immediately: it caught a denormal-vs-large pairing that the
+  ad-hoc fuzz had missed, where the exact-alignment width was one digit short.
+  `SECANTUS_DECIMAL_FUZZ_SCALE=N` cranks it for hunting.
+- [x] **`$inc`/`$mul` type errors — FIXED on BOTH servers (2026-08-25).** The
+  Rust server answered code 2 (BadValue) where mongod answers 14 (TypeMismatch),
+  because the engine's `Fallback` is opaque — it means "run Python", which the
+  standalone Rust server cannot do. Fixed with a standalone validator,
+  `update::arith_type_error`, mirroring the existing
+  `query::json_schema_keyword_error` pattern: it names the errors we *can* name
+  and leaves `Fallback` for the ones we can't. New `StorageError::
+  UpdateTypeMismatch` carries it; the adapter maps it to code 14.
+  **The same investigation found a second, unrecorded bug**: the *Python*
+  server's message was wrong. mongod puts the **document's `_id`** in the braces
+  (`{_id: 1} has the field 'n' …`); we rendered the field path (`{n} has …`) —
+  the right code attached to a message no real server emits. Both servers now
+  match mongod byte-for-byte on code *and* message, verified three-way against
+  the real `secantusd-rs` binary (6 shapes: non-numeric field / operand, `$inc`
+  and `$mul`, ObjectId `_id`, dotted paths). Pinned by 6 cases in
+  `tests/test_mongod_differential.py` and 4 unit tests in `secantus-core`.
+
+- [x] **Rust `$sum`/`$avg` over Decimal128 — SHIPPED (2026-08-24).** Folded into
+  the Decimal128 arithmetic item above; a `$group` over a collection containing a
+  Decimal128 now answers on the Rust server instead of failing the pipeline.
+  Uncovered while fixing it: mongod uses **two different** double→decimal
+  conversions — accumulators take the double's exact binary value
+  (`$sum` of `0.1` contributes `0.1000000000000000055511151231257827`) while
+  `$inc`/`$mul`/`$toDecimal` take 15 significant digits (`0.100000000000000`).
+  Both servers now reproduce the split. `$toDecimal` and `$convert: {to:
+  "decimal"}` were *separately* wrong in all four implementations (both
+  operators × both servers) — each used shortest-round-trip text, so
+  `$toDecimal: 4.125` answered `4.125` where mongod answers `4.12500000000000`.
+  Caught by the engine-parity suite, not by review.
+- [x] **Array sort order — FIXED on BOTH servers, all four paths (2026-08-23).**
+  mongod sorts an ARRAY-valued field by one representative element: its minimum
+  ascending, its maximum descending. Verified on mongod 6.0.16 with
+  `[[1,100], [5,9], 6, [7]]` — ascending `[1,100] < [5,9] < 6 < [7]` (minima
+  1 < 5 < 6 < 7), descending by maxima 100 > 9 > 7 > 6. An empty array has no
+  representative and sorts between MinKey and Null. We compared whole arrays, which
+  put every array after every scalar.
+  **The sharper bug was internal:** a multikey index writes one entry per element,
+  so an IXSCAN already produced mongod's ordering while the in-memory sort did not —
+  *the same query returned a different order depending on whether an index existed*.
+  An index must change speed, never results.
+  **A second, distinct defect showed up in the descending index walk.** Multikey
+  indexes also write a WHOLE-ARRAY entry, and that key sorts in the Array slot,
+  after every scalar. A backward walk hit those first, so the first-occurrence dedup
+  picked documents by their whole-array key rather than their maximum element —
+  which happened to reproduce insertion order and made it look inexplicable.
+  Ascending never showed it because element entries come first there.
+  **Fixed in four places:** `ordering.py::_array_sort_value` (Python in-memory),
+  `storage.py::_walk_index_in_order` + `_is_whole_array_key` (Python index walk),
+  `order.rs::array_sort_value` with `aggregate.rs`'s `$sort` stage and
+  `storage/lib.rs::sort_key` (Rust in-memory), and `walk_index_in_order` +
+  `is_whole_array_key` (Rust index walk). Whole-array entries are dropped only from
+  the ORDERING walk — they exist to answer `{x: [5, 9]}` equality, which takes a
+  different path and is covered by its own test on both servers.
+  The Rust empty-array marker is `Bson::Undefined` (pymongo never encodes it, so it
+  cannot collide) with a rank between MinKey and Null; the persisted index rank
+  bytes were deliberately NOT renumbered, and the storage `sort_key` special case
+  is safe because its only two callers are in-memory sorts.
+- [x] **DATA CORRUPTION: retryable writes were not idempotent — FIXED on BOTH
+  servers (#844 Python, #850 Rust).** Found 2026-08-13 while
+  triaging the C gauge's `/command_monitoring/unified/writeConcernError`.
+
+  mongod persists the outcome of every retryable write keyed by
+  `(lsid, txnNumber)` (its `config.transactions` collection). When the same
+  `lsid` + `txnNumber` arrives again — which every official driver sends
+  automatically after a network blip, a `writeConcernError`, or a stepdown —
+  mongod recognises the repeat and returns the **stored** result without
+  re-applying the write. SecantusDB does neither: `_txn_envelope` parses the
+  envelope and `TransactionRegistry.on_retryable_write` merely consumes the
+  txnNumber sequence. Nothing caches the result; nothing detects a repeat. The
+  write simply runs again.
+
+  Reproduced over the wire, same command sent twice with one `lsid` /
+  `txnNumber` (`{"$inc": {"n": 1}}` against `{_id: 1, n: 0}`):
+
+  ```
+  first  reply nModified: 1
+  retry  reply nModified: 1
+  final stored value: 2        <-- mongod stores 1
+  ```
+
+  **Identical on the Python and Rust servers.** The insert case is loud (the
+  retry hits `E11000`, which is what the C test sees). The update case is
+  SILENT: the value is doubled and both replies claim `nModified: 1`, so the
+  client is told exactly one update happened. Any non-idempotent operator —
+  `$inc`, `$push`, `$addToSet`-on-array-growth, `$mul` — corrupts data with no
+  error surfaced to anyone. This is the "never ignore an error — this is a
+  database" category: a user loses data integrity and gets a success reply.
+
+  **Fixing it properly** means implementing mongod's retryable-write record:
+  persist `(lsid, txnNumber) -> {reply, opTime}` per statement (mongod keys
+  per statement id within a batch, so a partially-applied `insert` batch
+  retries only its missing documents), return the cached reply verbatim on a
+  repeat, and expire records the way mongod's 30-minute
+  `transactionLifetimeLimitSeconds` sweep does. It must land on **both**
+  engines together plus storage, so it is a slice of its own, not a
+  conformance-gauge cleanup. Deliberately deferred here rather than
+  half-implemented — a partial version that caches some operations and not
+  others would be worse than the current honest-but-wrong behaviour, because
+  it would look fixed.
+
+  **Status (2026-08-13).** The Python server now keeps the record: dispatch
+  looks up `(lsid, txnNumber)` plus a digest of the command body before
+  executing a retryable write, replays the stored reply on a match, and
+  records the outcome on the way out (`TransactionRegistry.retryable_reply` /
+  `record_retryable`). Verified over the wire: a retried `$inc` now leaves 1,
+  a retried insert no longer self-collides with `E11000`, and a retried
+  `$push` appends once.
+
+  Three deliberate limits, none of which make it *look* fixed while being
+  broken:
+
+  * **Only fully-successful writes are recorded.** A failed or partially-failed
+    write (`writeErrors` present) is not, so its retry genuinely re-executes —
+    caching a failure would make a transient error permanent. A
+    `writeConcernError` IS recorded: the write applied, only its replication
+    did not confirm, so a retry must not apply it twice.
+  * **No per-statement-id granularity.** mongod records each statement in a
+    batch, so a partially-applied `insert` batch retries only the missing
+    documents. We record whole-command outcomes, so a partially-failed batch
+    re-runs entirely — exactly as it does today, not worse.
+  * **The command identity is part of the key.** If the same
+    `(lsid, txnNumber)` is presented with a *different* command we execute
+    rather than replay, because serving one write's reply for another would be
+    worse than the double-apply this prevents. (Found the hard way: pymongo
+    OVERRIDES an explicit `lsid` on `db.command()` with its own implicit
+    session, so hand-built probes collide on one session.)
+
+  **The Rust server is fixed too** (#850, 2026-08-14): the same record, keyed
+  on `(lsid, txnNumber, identity)`, lives in `TransactionRegistry`
+  (`crates/secantus-commands/src/transactions.rs`) and is consulted from
+  `run_with_txn_envelope`. Verified at the WIRE level against a release
+  `secantusd-rs` — a retried `$inc` leaves 1 (was 2) and a retried insert no
+  longer self-collides with `E11000`. The digest algorithm deliberately
+  differs from Python's (SHA-256-truncated vs SHA-1): records are per-process
+  and never shared, so only "same command => same identity" matters.
+
+  The two servers agree again and the three limits above apply to both. The C
+  gauge's `writeConcernError` test should now pass on both — worth confirming
+  on the next gauge refresh rather than assuming.
+
+- [ ] **`invoke concurrency-refresh` needs a genuinely quiet box AND a spread
+  audit before its output is trusted.** Two consecutive refresh runs
+  (2026-08-02) were silently poisoned by a parallel session's gauge load —
+  medians-of-3 didn't protect (whole interleaved passes degraded 10-30x,
+  mongod itself read 10.5k vs its healthy 104k). A load<3 gate at START is
+  insufficient; contention arriving mid-run wrecks all arms. Before accepting
+  a refresh: check every `runs_docs_per_sec` cell for >2.5x intra-cell spread
+  and re-run (or keep the previously committed clean numbers) when flagged.
+  Worth upstreaming the audit into the task itself.
+
+- [x] **RESOLVED (fired for real in the 0.6.0b8 release gate, 2026-08-02): the 25-min watchdog hard-exited five healthy workers when a shared-box suite run took 25:11 — local default now 90 min, CI pins 1500 explicitly (test.yml).** Original entry: the 25-min hang watchdog's own dump can wedge a
+  worker (observed live 2026-07-31).** On a box loaded enough that a session
+  crosses `SECANTUS_HANG_SECONDS` (1500s), `faulthandler.dump_traceback_later`
+  fires while the worker is still healthy; the dump thread walks live threads'
+  frames without the GIL and was sampled hot-spinning in
+  `_Py_DumpTracebackThreads → _PyCode_CheckLineNumber` (CPython race, not ours).
+  It then never releases faulthandler's `running` lock, so the session-fixture
+  teardown's `cancel_dump_traceback_later()` blocks forever — the worker looks
+  "wedged after its last test". Mitigations landed: the nested-run wedge
+  tolerance in `test_crash_stall_watchdog.py` now actually matches `-q` output,
+  and the hard-kill harness kill is ack-driven. The dump-spin itself is
+  upstream; if it recurs, consider raising `SECANTUS_HANG_SECONDS` locally or
+  `exit=True`-only dumps to a file (never a pipe).
+
 - [ ] **Intermittent failure of the two `crash_watchdog_nested` tests under the
   full parallel suite (2026-08-29, `5372fdfa`) — IDENTIFIED.**
   The culprits are `tests/test_crash_stall_watchdog.py::
@@ -339,19 +1241,6 @@ These are explicit non-goals. Don't add them without a reason.
   of calling it a regression. Optional future nicety (small): pre-create
   the two route-default oplog shards on a background thread at open to
   hide ~10ms of first-write latency — cosmetic, not queued.
-
-- [ ] **Python server: oplog minted-vs-committed race via user transactions
-  (twin of the Rust bug fixed by the oplog-visibility-point PR, 2026-07-30).**
-  `Storage.oplog_tail_seq` / `oplog_tail_seq_nolock` return `_next_seq - 1` —
-  the highest *minted* seq. Plain statements are safe (the global `RLock` holds
-  mint and WT commit atomic per write, so mint order == commit order), but a
-  **multi-document transaction** emits its oplog entries (minting seqs) inside
-  the still-open snapshot with the lock released between statements: another
-  writer can commit a later seq while the txn's earlier seq is uncommitted, and
-  a change stream advancing past the hole loses the event when the txn commits.
-  Fix is the Rust design transplanted: an in-flight window pinning the visible
-  tail (registered at mint under `_oplog_seq_lock`, released on
-  commit/abort/reap), with `read_oplog` clamped at the floor.
 
 - [x] **ws-changes flake — THREE causes, all now fixed (2026-07-22 / 2026-07-26).
   Two lived in the test and the admin router; the third was silent event loss in
@@ -748,25 +1637,60 @@ These are explicit non-goals. Don't add them without a reason.
 
 Subtler than the above; these may bite specific test suites.
 
-- [ ] **`test_crash_stall_watchdog.py::test_faulthandler_dir_captures_a_worker_crash`
-  flakes in the FULL parallel suite only (seen 2026-07-22).** It spawns a nested
-  pytest that `faulthandler._sigsegv()`s a worker and asserts the per-worker fault
-  file captured the stack. **Passes cleanly in isolation, repeatedly, even under 8
-  CPU burners** — so it needs the full `-n auto` suite's scheduling contention, and
-  reproducing it standalone is a dead end (don't try). Plausible mechanism: the
-  nested pytest's own startup/crash timing loses to the outer suite's pressure, or
-  a race on the shared fault-dir glob. Notable irony worth a proper fix rather than
-  a rerun: this is the test that *guards the crash-capture diagnostic*, so a real
-  regression here would blind exactly the tooling the anonymous-worker-death class
-  (§ CI catalog) depends on. If diagnosing, run the whole suite `-n auto` with the
-  fault dir preserved; do not deselect.
+- [x] **RESOLVED 2026-08-17 — `test_crash_stall_watchdog.py`'s two nested-run
+  tests (`test_faulthandler_dir_arms_a_file_per_worker` /
+  `…_captures_a_worker_crash`) wedged in pytest's SHARED-temp-root `atexit`
+  cleanup, not in execnet/fd inheritance.** A pytest process that is not given
+  `--basetemp` picks its base dir through `make_numbered_dir_with_cleanup`, which
+  **registers an `atexit` hook** that `rmtree`s every stale
+  `$TMPDIR/pytest-of-<user>/pytest-NNNN` except the newest three
+  (`_pytest/pathlib.py`). This dev box had **240** such leftovers, each a full
+  suite's worth of WiredTiger databases, so the nested session's *exit* ground
+  through millions of `unlink()`s long after its last test. Measured on the exact
+  nested command: nested tests **0.55s**, process wall clock **252.96s**
+  (`user 1.08s / sys 18.11s` — I/O, not CPU), and `sample` of the wedged pid put
+  **1479 of 1559** samples in `Py_FinalizeEx → atexit_callfuncs → os.unlink`.
+  Intermittent because the first run to pay the cost drains the backlog: the same
+  command three times in a row took 252.96s, 11.95s, 0.60s. Controlled proof: with
+  a synthetic 30-dir stale root the nested run took 1.6s and deleted 26 of the
+  dirs, and with `--basetemp` it took 0.6s and deleted none (150-dir / 240k-file
+  variant: SIGKILLed at a 3s budget with all tests passed, vs 0.6s clean). Fix:
+  both nested helpers now pass `--basetemp <tmp_path>/basetemp`, which skips that
+  registration entirely (`TempPathFactory.getbasetemp`), plus the timeout path
+  `killpg`s the nested tree (a Popen `start_new_session=True`) so an orphaned
+  nested worker can't hold the inherited pipes open and starve the recovery read
+  of EOF. Pinned by
+  `test_nested_sessions_stay_out_of_the_shared_pytest_temp_root` (sentinel stale
+  dirs in a private `TMPDIR`: it fails, deleting `pytest-1..3`, if the
+  `--basetemp` isolation is removed). Note the earlier CPU-starvation theory is
+  refuted by the `user 1.08s` figure, and the fd/execnet-inheritance hypothesis
+  was not needed. **Residual, unexplained:** one captured occurrence showed
+  stdout ending at `[100%]` with no summary line, i.e. a wedge *before* the
+  summary; the flush timeline of a healthy nested run shows `.`, `[100%]` and
+  `\n1 passed in Xs\n` as three separate flushes ~20-40ms apart with the summary
+  gated on xdist's `teardown_nodes`, so that one capture points at a second
+  (much rarer) pre-summary teardown wedge. `_run_tolerating_teardown_wedge`
+  already tolerates that shape.
 
 - [x] **macOS CI test job hangs to the 6-hour kill — RESOLVED + CONFIRMED 2026-07-19: an fd/memory leak from unclosed `Storage` test fixtures (fixed #563); macOS re-enabled on continuous CI and confirmed green (#567). Investigation detail below.** The `test (macos-latest, 3.10)` job hit GitHub's 6-hour job timeout repeatedly (≥3× across unrelated PRs, including a *tooling-only* one), while passing in ~4 min on Linux/Windows and locally on macOS. Mitigated, not fixed: `9e16e49` dropped macOS from the continuous (push/PR) matrix, so it now runs **only at release time** (`publish.yml` / scheduled sweep) — where the hang can still bite. The per-test `timeout` (pytest-timeout, 600s) does **not** cover the wedge because it only guards a test's own body, not collection / session-scoped fixtures / xdist worker *shutdown*. **Prime suspect:** a daemon/thread not reaped on macOS keeping the worker process alive after its tests "finish" — most likely the Rust server's `stop()` / accept-thread join or a parked change-stream tailable `getMore` (the same shape as the *Python* `SecantusDBServer.stop()` use-after-free fixed in 0.5.3b5, below; `test_rust_server_stress.py` / `test_rust_pitr_cross_server.py` exercise the Rust lifecycle). **Diagnostics added** (`ci-macos-hang-guard`): a `timeout-minutes: 30` cap on the test job + a `faulthandler` session watchdog in `tests/conftest.py` that dumps every thread's stack and exits at 25 min — so the next occurrence names the wedged thread/test instead of dying silent. Close once a stack identifies the culprit and the lifecycle leak is fixed. **Reframed 2026-07-19 (investigation):** it is NOT a thread leak — it is an early *worker-process crash*. The 2026-07-18 full-matrix dispatch run reproduced it: `test (3.12, macos-14, core)` ran 90 min (its dispatch-event `timeout-minutes` cap is 90, not 30) while every other macOS job finished in 4–6 min, and its worker `gw0` went **"node down: Not properly terminated" at ~3.5 min** — a subprocess crash (WT_PANIC / segfault / abort), not a lingering thread at shutdown. The prime suspect (Rust `stop()`) is **ruled out**: it has been bounded (10s drain, `RunningServer::Drop`→`stop()`) since beta.48 (2026-06-21), which *predates* the macOS-drop (9e16e49, 2026-06-29) by 8 days; all Python server threads are daemon. Local audits (single-process AND 3-worker xdist, thread + native `faulthandler` dumps) of every suspect file leave zero leaked threads / no crash — the crash is macOS-timing-specific and does not reproduce on a newer local macOS. The 25-min watchdog did not fire in that run because after the crash the surviving workers kept reporting, so the idle-based check never tripped and the shard crawled to the cap. **Fixed the diagnostic gap so the next occurrence self-diagnoses:** `pytest_testnodedown` now dumps the crash reason (`error`, carrying the dead worker's last frames) the moment a worker goes down, and the controller watchdog gained a *post-crash overrun* trigger (`_stall_trigger`) that fails fast with a stack dump if the run is still going `_POST_CRASH_DEADLINE_SECONDS` (20 min, `SECANTUS_POST_CRASH_SECONDS`-overridable) after the first crash — the idle check alone can't see a crawl. **ROOT CAUSE FOUND + FIXED 2026-07-19:** it is a **file-descriptor / memory leak from test fixtures that create a `Storage` but never `close()` it.** A returned-but-never-closed `Storage` abandons its WiredTiger connection — measured at **~2.5 MB and ~17 fds each** (150 leaks → 419 MB, 2571 fds, both linear/unbounded). Three offenders: `tests/test_indexes.py`'s `storage` fixture (`return Storage(...)`, backing **161 tests**), `tests/test_storage.py`'s `storage` fixture, and `tests/test_aggregate.py`'s `_setup_lookup_storage` helper (6 tests). A worker running many of these exhausts its fd limit (`ulimit -n`, ~1024 on CI) or RSS late in the run → the process dies hard with no clean error → xdist reports "node down: Not properly terminated" (the crashed worker's stderr, incl. any WT_PANIC, is lost). Intermittent because it depends on how many leaky tests a worker draws under the random split; late (~92%) because the leak accumulates. Fixed all three to `try: yield s finally: s.close()` / `request.addfinalizer(s.close)` — verified fds stay flat (12→12 over 221 tests, was ~17/test) and a broad sweep (471 tests) shows zero remaining fd growth. **Confirmed closed (#567):** macOS was re-enabled on the push/PR matrix for the `test` and `test-durable` lanes via a matrix `include` of `macos-14` + the dev interpreter (3.12) for each shard group (the include merges with the existing cron cross-product, so no extra weekly-cron cells). On that PR's own CI run **all 8 macOS shards** (`test` ×4 + `test-durable` ×4 — the exact lanes that used to hang) passed green, proving the fix holds on macOS. Any future regression is bounded to a fast, self-diagnosing failure by the #555 crash-capture + 30-min job cap. (`storage-engine` stays cron-only — heaviest source build, and it covers the Rust engine, not the fd-leak surface.)
 - ~~**Intermittent pytest-xdist worker crash at ~97% of full suite (post-b18).**~~ Fixed (0.5.3b5). Root cause: `SecantusDBServer.stop()` joined only the accept thread, then closed WiredTiger while per-connection daemon threads could still be mid-WT-operation (e.g. a change-stream tailable `getMore` reading the oplog) — a use-after-free that surfaced as the native worker crash ("node down: Not properly terminated"). `stop()` now closes connection sockets, wakes parked tailable getMores (`Storage.signal_shutdown`), and waits for the active-connection count to drain to zero before `storage.close()`. Reproduced deterministically (a connection thread in a tight WT-read loop vs `storage.close()` raised `Cursor_reset ... is None`, the Python-surfaced form of the same use-after-close); a 200-iteration stress now runs clean. Regression guard: `tests/test_server_shutdown.py`.
 - ~~**Rust server `WT_PANIC` under concurrent start/stop (cross-server PITR flake).**~~ Fixed (Rust 0.5.3-beta.48). Root cause was the Rust analogue of the Python shutdown bug above: `RunningServer::stop()` signalled the flag and joined only the accept loop — the detached per-connection threads (each holding an `Arc<Storage>`) weren't waited for, so the WiredTiger connection didn't close until one of them later exited, and that connection's final close-checkpoint then raced the caller removing / reopening the data dir (`WiredTigerHS.wt: stat: No such file` → "the checkpoint failed, the system must restart: WT_PANIC"). `stop()` now drains a live-connection counter (`Shared.active`, an independent `Arc<AtomicUsize>` so a thread releases its storage ref *before* decrementing) to zero — bounded by a 10s deadline — before returning, making teardown synchronous and the data dir quiescent. Reproduced deterministically with the new `bench/wt_stress.py` (`invoke rust-stress` — 24 of 64 concurrent cycles panicked before, 0 after). Regression guard: `tests/test_rust_server_stress.py`; the previously-deselected `tests/test_rust_pitr_cross_server.py` cross-server tests now pass under `-n auto`.
 - ~~**`$type: "int"` / `"long"`**~~ fixed (b29). `_TYPE_PREDS` keys on `isinstance(v, bson.Int64)` rather than Python value range — pymongo's BSON decoder preserves the int32/int64 distinction by class (int32 → plain `int`, int64 → `Int64`), so a doc inserted as `Int64(5)` now matches `$type: "long"` (not `"int"`). `$convert: {to: "long"}` returns `Int64` so its output round-trips correctly through the type predicate.
-- [ ] **`$lookup` simple-form-plus-pipeline** — when both `localField`/`foreignField` and `pipeline` are present, we pre-filter by the simple form and then run the pipeline. Real MongoDB does this too in modern versions, but the documentation isn't crystal clear on the order. If a test breaks here, this is the place to look.
-- [ ] **Aggregation `$group` stable order** — group buckets are emitted in first-seen order, not sorted. Matches MongoDB for unsharded but might differ from sharded behavior (which we don't model).
+- [x] **`$lookup` simple-form-plus-pipeline — matches mongod (verified 2026-08-22).**
+  When both `localField`/`foreignField` and `pipeline` are present we pre-filter by the
+  simple form and then run the pipeline; the entry worried the ordering might differ
+  from mongod. Probed three ways on the same data (orders joined to stock, pipeline
+  filtering `qty > 0`): mongod 6.0.16, the Python server and the Rust server all return
+  `[(1, 1), (2, 1)]`. No divergence to chase.
+- [x] **Aggregation `$group` bucket order — the old claim about mongod was wrong
+  (corrected 2026-08-22).** It said buckets are emitted in first-seen order and that
+  this "matches MongoDB for unsharded". It does not: on the same input
+  (`z, a, m, a, z`) mongod 6.0.16 returned `['m', 'z', 'a']` — neither first-seen nor
+  sorted — while both our servers returned first-seen `['z', 'a', 'm']`. **This is not
+  a bug to fix.** `$group` output order is unspecified in MongoDB; mongod's is an
+  artifact of its internal hash table, not a contract. Ours being deterministic is a
+  superset of the guarantee. Recorded so nobody "fixes" our order to chase a mongod
+  behaviour that is itself arbitrary.
 - ~~**`apiStrict: true` enforcement Java pool-clear cascade**~~ resolved (0.5.2b3) by narrowing the gate instead of the broad-whitelist invert. A focused `_API_V1_REJECTED_BY_NAME = {"distinct"}` rejects only the canary command the spec's unified runners actively probe (mongo-java-driver `crud-api-version-1-strict.yml` `distinct appends declared API version`). Empirical Java-gauge run: +1 pass for the canary, **zero** new failures and zero pool-clear symptoms across the 900-test suite. The previous cascade theory (broad whitelist would invalidate the pool through SDAM) is correct for the broad path but doesn't trigger from a single command rejection — the broad invert also rejected `count` (used internally by `estimatedDocumentCount`) and other handshake-adjacent admin commands, which is the actual mechanism for the 6 cascade failures, not pool-clear semantics. The narrow gate sidesteps that entirely.
 - [ ] **Java gauge: 5 remaining failures are all driver-internal / out-of-scope (triaged 2026-06-30, Python server, HEAD d8e75ff).** A broad multi-gauge survey left java the only gauge with fresh failures (5; node/ruby's single fails are the known text-index + single-node-`w:2` artifacts; rust/kotlin/dotnet/cxx are 100%). All 5 were triaged and proven **not** to be server divergences — driving the same operations via pymongo against an on-disk daemon produced exactly the spec-expected wire replies, and the pymongo gauge passes the *identical* upstream command-monitoring / versioned-api spec files (which assert the same event counts → the server induces no extra round-trips). Recorded in `validation_summary/expected_failures.py` (`JAVA` list):
   - `ClientMetadataTest … metadata append does not create new connections …` — client-side `appendMetadata` crosses no wire; driver connection/handshake logic. Not server-fixable.
@@ -780,11 +1704,11 @@ Subtler than the above; these may bite specific test suites.
   **Repro session 2026-06-15 — verdict: test-harness artifact, not a SecantusDB scope-filter bug; accepted.** Two things were established. (1) **The change-stream scope filter does not leak.** A direct stress — a collection-scoped `watch()` open on `db.A` while a writer hammered `db.B` on the same shared `:memory:` daemon — polled 1650 times and saw **0** cross-collection events. The projection layer (`changestreams.project`) and `_ns_filter` correctly confine a collection-scoped stream to its own namespace. So the `TryNext returned true on iteration 1` is *not* SecantusDB surfacing a foreign write through a mis-scoped filter. (2) **The Go mtest harness shares one namespace across tests and truncates collection names to a colliding suffix.** `dbName` defaults to a single shared constant `TestDB` for every test (`mongotest.go:117-118`), and `collName = t.Name()` is then truncated to its *trailing* bytes to fit the 120-byte namespace cap (`sanitizeCollectionName`, `mongotest.go:591-602`: `coll = coll[len(coll)-remaining:]`). Two different long subtest names can therefore collide on the same `TestDB.<suffix>` collection. Combined with the parallel top-level `Test*` functions that call `t.Parallel()` (encryption-prose, `TestClient_BSONOptions`) writing during the change-stream's await window, a genuinely same-namespace write from a *concurrent test* can legitimately wake the stream early — which is correct server behaviour, not a leak. This reproduces only under the one-shared-daemon gauge (each test gets its own server in normal CI), and is invisible running `TestChangeStream_ReplicaSet` alone (30/30 pass). Not patchable on the SecantusDB side without breaking conformance; the honest fix is harness-side namespace isolation, which would mean editing the vendored submodule (forbidden — defeats the gauge). Left documented and accepted.
 - [ ] **Ruby gauge: `Index::View#create_one with session` test client-side-stripped** — mongo-ruby-driver's `Mongo::Index::View#create_one when provided a session behaves like a failed operation using a session raises an error` test passes `view.create_one(spec, invalid: true)` and expects an `OperationFailure` to come back from the server. But the Ruby driver's `Options::Mapper.transform` filters the model hash against its `OPTIONS` whitelist (`lib/mongo/index/view.rb:61`) **before** the command is built, so `invalid: true` never reaches the wire. We added unknown-spec-option rejection on `createIndexes` (`commands.py:_INDEX_SPEC_KNOWN_OPTIONS` + the `Location40415` gate in `_create_indexes`) which DOES fire when the option arrives, so this is a working server-side guard — the test is just structurally broken against modern Ruby drivers. Real mongod has the same problem; the test would need the driver to keep `invalid: true` in the spec for the server-side rejection path to be reachable. Documented and accepted.
 - [ ] **Ruby gauge: `applies the write concern passed in as an option` expected-fail under single-node topology** — mongo-ruby-driver's `Mongo::Collection#create ... when write concern passed in as an option` test (`spec/mongo/collection_ddl_spec.rb:211`) explicitly passes `w: 2` to `collection.create` and expects success — it assumes the canonical multi-node replica-set test cluster the Ruby driver's CI runs against. SecantusDB advertises as a single-node `secantus` replica set, so `w: 2` produces a `writeConcernError` (code 100, `CannotSatisfyWriteConcern`) — added in `commands.py:_unsatisfiable_wc_error` + dispatch wire-up. This is the correct mongod emulation; the test is structurally incompatible with our topology. **Net trade-off was +7 Ruby gauge passes**: seven `applies the write concern` tests that pass `INVALID_WRITE_CONCERN = {w: 4000}` and expect `OperationFailure` now pass because of the wce, this one test now fails. If the test cluster ever grows past 1 advertised member, this test will start passing organically.
-- [ ] **PHP gauges landed (2026-06-15) — conformance gaps surfaced, not yet fixed.** Two new gauges: `php_ext_validation` (mongo-php-driver `.phpt`, the low-level C extension that wraps libmongoc — strictest wire-protocol gauge alongside Go) at **99.9%** (670/671 ran, 41 skipped — climbing: dup-key `errmsg` fix 0.5.3b9, cursor open-count 0.5.3b11, insertion-order `find` 0.5.3b13) and `php_lib_validation` (mongo-php-library PHPUnit, the high-level `mongodb/mongodb` package) at **98.8%** (3051/3091 ran, 39 skipped — climbing: `explain` 0.5.3b8, `collMod` TTL 0.5.3b10, `count` hint + 2dsphere 0.5.3b12, insertion-order `find` 0.5.3b13). Submodules pinned to the installed extension version (driver `2.3.1`, library `2.3.0`); the ext gauge runs against the already-installed extension via `run-tests.php` (no rebuild). Real divergences to chase (none block the gauge feature):
+- [x] **PHP gauges landed (2026-06-15) — every surfaced gap is now CLOSED (headline corrected 2026-08-21).** Both gauges sit at **zero failures** in the current `docs/validation-summary.md`: `mongo-php-driver` 100.0%, `mongo-php-library` 98.2% with 0 failed (the remainder are skips). The "not yet fixed" wording outlived the fixes listed in this entry's own body. Two new gauges: `php_ext_validation` (mongo-php-driver `.phpt`, the low-level C extension that wraps libmongoc — strictest wire-protocol gauge alongside Go) at **99.9%** (670/671 ran, 41 skipped — climbing: dup-key `errmsg` fix 0.5.3b9, cursor open-count 0.5.3b11, insertion-order `find` 0.5.3b13) and `php_lib_validation` (mongo-php-library PHPUnit, the high-level `mongodb/mongodb` package) at **98.8%** (3051/3091 ran, 39 skipped — climbing: `explain` 0.5.3b8, `collMod` TTL 0.5.3b10, `count` hint + 2dsphere 0.5.3b12, insertion-order `find` 0.5.3b13). Submodules pinned to the installed extension version (driver `2.3.1`, library `2.3.0`); the ext gauge runs against the already-installed extension via `run-tests.php` (no rebuild). Real divergences to chase (none block the gauge feature):
   - ~~**capped-collection tailable cursors** — php-ext `cursor-tailable_error-001`~~ **FIXED (0.5.4b17)** — the test opens a `tailable` query on a capped collection, iterates with awaitData polling, and expects a "collection dropped" error when the coll is dropped mid-iteration. Capped tailables ship (`e187fb7` + the 0.5.4b16 filter fix); dropping the collection now **tombstones** open tailable cursors (`CursorRegistry.kill_namespace` sets a `dropped` flag instead of removing them) so the next `getMore` returns `QueryPlanKilled` (175) "collection dropped: <ns>" — the message the php-ext test asserts. Non-tailable cursors are still removed (→ `CursorNotFound` 43, per mongo-c-driver's `error_document/getmore`). Regression: `tests/test_crud.py::test_tailable_drop_returns_collection_dropped`. (The sibling `cursor-destruct-001` — killCursors-on-destruct via the live `serverStatus.metrics.cursor.open.total` count — shipped in 0.5.3b11.)
   - Transaction-gated cases skip/fail under single-node topology (expected, same class as the Ruby `w:2` note above).
-- [ ] **mongo-c-driver (`libmongoc`) gauge landed (2026-06-19) — conformance gaps surfaced, not yet fixed.** New `c_validation` gauge builds the vendored driver's `test-libmongoc` from source (CMake) and runs a curated set of wire-protocol suites against an embedded daemon over `MONGOC_TEST_URI`. Driver pinned to `1.30.8`. Current (after the 0.5.4b9 fixes below, gauge-verified): **712 pass / 21 fail / 69 skip**; was **707 / 26 / 69** at landing — +5 from the five fixes below, zero regressions. The failure set is byte-identical across repeated full runs (deterministic, not flaky). 8 of the 26 are documented in `validation_summary/expected_failures.py` (`C` list — the RS-primary `hello` advertisement makes libmongoc's standalone/secondary server-type and `lastWriteDate`-absent assertions fail; IPv6 needs a v6 listener). The remaining ~18 are real divergences to chase (none block the gauge):
-  - **`maxMessageSizeBytes` split boundary** (`/BulkOperation/OP_MSG/max_msg_size`, "2 == 1") — a bulk write the C driver expects to split into 2 OP_MSGs goes out as 1; SecantusDB's advertised max-message-size / write-batch limits don't force the split. (Driver-side split decision; not addressed.)
+- [x] **RESOLVED 2026-08-28 — mongo-c-driver (`libmongoc`) gauge: the last genuine failure (`/command_monitoring/unified/writeConcernError`) now PASSES; the rest are inherent.**
+  - **`maxMessageSizeBytes` split boundary** (`/BulkOperation/OP_MSG/max_msg_size`, "2 == 1") — **NOT a splitting bug; re-diagnosed 2026-08-11.** The framing below ("the server doesn't split") is wrong, and chasing it wastes time. Measured: all three advertised limits are byte-identical to mongod on BOTH servers (`maxBsonObjectSize` 16777216, `maxMessageSizeBytes` 48000000, `maxWriteBatchSize` 100000), and the driver — which decides splitting itself, before sending — therefore has correct inputs. The test **PASSES standalone** (0.72s) and **passes alongside its `/BulkOperation/OP_MSG/*` sibling**; it fails only inside the full ~800-test run, and it fails on the **Python server too**, so it is not Rust-specific. That profile (isolation-clean, full-run-only, both servers) is test interference or accumulated state, the same class as the accepted go-gauge `TestChangeStream_ReplicaSet` harness race below — not a wire-limit divergence. Pinning it down means bisecting a ~10-minute full-gauge run; worth doing only if it ever blocks something. Original note:
   - ~~**`bypassDocumentValidation` on aggregate `$out`**~~ **FIXED (0.5.4b9)** — `$out` / `$merge` now enforce the destination collection's `validator` (when `validationAction: "error"`) unless the command set `bypassDocumentValidation`, raising `DocumentValidationFailure` (121). See `aggregate._enforce_target_validator` (`bypass_validation` threaded through `PipelineContext`).
   - ~~**getMore error-document shape**~~ **FIXED (0.5.4b9)** — dropping (or renaming) a collection now kills its open cursors (`CursorRegistry.kill_namespace`, called from `_drop` / `_rename_collection`), so a later `getMore` fails with `CursorNotFound` (43) instead of serving stale snapshot rows.
   - ~~**Decimal128 `batchSize`**~~ **FIXED (0.5.4b9)** — `find` / `aggregate` coerce a numeric `batchSize` of any BSON type via `_coerce_command_int` (Decimal128 → underlying Decimal → int).
@@ -796,16 +1720,16 @@ Subtler than the above; these may bite specific test suites.
   - **`/command_monitoring/unified/writeConcernError`** — **flaky, not deterministic** (0.5.4b15 triage): a fresh full-run repro of the curated C include set has it **passing** (only `/Client/ipv6/single` + `/Collection/tailable/timeout` fail there now), so the earlier gauge report that listed it was a flaky red, not a reproducible state leak. The failpoint registry (`secantus.failpoints`) *is* per-server with no `appName` scoping, so a leaked `failCommand` from a prior test is a plausible mechanism, but it couldn't be reproduced in any isolable subset. Left as a watch item; if it recurs, add per-`appName` failCommand scoping (the mongod-faithful isolation) + audit failpoint teardown. **A real, separate bug found during this triage was fixed in 0.5.4b15**: a malformed `$and`/`$or`/`$nor` (non-array / empty / non-doc element) crashed the query engine into a generic `InternalError` instead of `BadValue` — see `query._match_clause` + the changelog.
   - ~~**State-ordering-dependent drop/rename/create** (`/Collection/drop`, `/Collection/rename`, `/Collection/index`, `/Database/drop`)~~ **FIXED (0.5.4b13)** — not state-ordering at all (misdiagnosis): each test ends with a DDL op carrying `writeConcern: {w: 99}` and asserts `assert_wc_oob_error` — for a server >= 4.3.3 (we advertise 7.0) that's `FailedToParse` (9) "w has to be a non-negative number and not greater than 50", because mongod caps numeric `w` at 50. SecantusDB was returning a `CannotSatisfyWriteConcern` (100) writeConcernError on a success instead. `commands._validate_write_concern` now rejects `w` outside `[0, 50]` with code 9 before the command runs (and `_drop_database` / `_rename_collection` now call it). Regression: `tests/test_crud.py::test_write_concern_w_above_50_is_parse_error`.
   - ~~**Atlas Search index management** (`/index-management/{list,drop,update,create}SearchIndex`)~~ **FIXED (0.5.4b18)** — `createSearchIndexes` / `updateSearchIndex` / `dropSearchIndex` commands and the `$listSearchIndexes` aggregation stage (+ `$search` / `$searchMeta` / `$vectorSearch`) are Atlas-only; a non-Atlas mongod fails them with a message naming Atlas. Now rejected with `CommandNotSupported` (115) + the shared `aggregate.SEARCH_INDEX_ATLAS_MSG` (the tests assert `errorContains: "Atlas"`). Regression: `tests/test_crud.py::test_atlas_search_index_commands_rejected` + `tests/test_aggregate.py::test_atlas_only_stage_rejected_with_atlas_message`.
-  - **Change streams excluded** — see §3.2 (the C-driver fixture would need a fuller fake-replset `replSetGetStatus` reporting ≥1 member; the standalone error we ship makes those tests skip).
+  - ~~**Change streams excluded**~~ **NOW RUNNING (#802, #804)** — `replSetGetStatus` reports the one-member roster `hello` already advertised, so the C fixture no longer skips the suites as standalone. 31 change-stream tests pass; the four defects that surfaced (resume-token error message, pipeline-stage code/message, resume-token *modification* not just removal, and `failGetMoreAfterCursorCheckout` + the `ResumableChangeStreamError` label) are all fixed.
   - **Fresh gauge number (0.5.4b18):** 720 pass / 13 fail / 69 skip. The 13 remaining are all documented-expected (ipv6 ×2, `last_write_date_absent` ×2, `select_server` ×4 — all RS-primary `hello` artifacts in `expected_failures.py`) or known/deferred (`BulkOperation/max_msg_size` driver-side split; `command_monitoring/writeConcernError` flaky). No clean actionable server divergences remain in this gauge.
-- [ ] **mongo-cxx-driver (`mongocxx`) gauge landed (2026-06-19) — conformance gaps surfaced, not yet fixed.** New `cxx_validation` gauge builds the vendored libmongoc (installed to a prefix) + the mongocxx `test_driver` Catch2 binary from source and runs it against an embedded daemon. Drivers pinned: mongocxx `r3.11.0` on libmongoc `1.30.8`. mongocxx's core tests hard-wire `mongodb://localhost:27017` (no `MONGOC_TEST_URI`-style override), so the gauge binds the daemon on **27017** (refuses to run if occupied). At landing: **880 pass / 9 fail / 9 skip (99.0%)** (Catch2 expands SECTIONs, so the testcase total > TEST_CASE count). After the 0.5.4b8 dup-index fix + the 0.5.4b9 fixes below + the 0.5.4b11 resume-token fix + the 0.5.4b12 `$currentOp` clientMetadata fix, the cxx gauge's real failures are **closed** (the prior `client metadata handshake` ×2 are fixed below). The remaining divergences to chase (none block the gauge):
+- [x] **mongo-cxx-driver (`mongocxx`) gauge — ALL GAPS CLOSED (#815); 890 pass / 0 fail / 9 skip = 100.0%, identical to the Python server.** First run ever made against the RUST server (2026-08-11): its tests bind port 27017 with no env override, so it needed the local mongod stopped, and the report on disk until then was a Python-server artifact. Three rust-only failures surfaced and were fixed — the change-stream resume token rewound to a positional high-water mark on an empty batch (losing the `ns` / `documentKey` a real token carries), and `$currentOp` reported neither `appName` nor `clientMetadata`, so the handshake test's scan matched nothing. Original landing note follows. New `cxx_validation` gauge builds the vendored libmongoc (installed to a prefix) + the mongocxx `test_driver` Catch2 binary from source and runs it against an embedded daemon. Drivers pinned: mongocxx `r3.11.0` on libmongoc `1.30.8`. mongocxx's core tests hard-wire `mongodb://localhost:27017` (no `MONGOC_TEST_URI`-style override), so the gauge binds the daemon on **27017** (refuses to run if occupied). At landing: **880 pass / 9 fail / 9 skip (99.0%)** (Catch2 expands SECTIONs, so the testcase total > TEST_CASE count). After the 0.5.4b8 dup-index fix + the 0.5.4b9 fixes below + the 0.5.4b11 resume-token fix + the 0.5.4b12 `$currentOp` clientMetadata fix, the cxx gauge's real failures are **closed** (the prior `client metadata handshake` ×2 are fixed below). The remaining divergences to chase (none block the gauge):
   - ~~**Duplicate-index conflict not rejected** (3 tests)~~ **FIXED (0.5.4b8)** — `createIndexes` now rejects same-name-different-key with `IndexKeySpecsConflict` (86) and same-name-different-options with `IndexOptionsConflict` (85), and returns `note: "all indexes already exist"` on an identical re-create so drivers see the no-op (`storage.create_index` + `commands._create_indexes`).
   - ~~**`$out` not last in pipeline not rejected**~~ **FIXED (0.5.4b9)** — `apply_pipeline` rejects a non-terminal `$out` / `$merge` with `Location40601` (40601) before executing any stage.
   - ~~**Change-stream invalid-pipeline error timing**~~ **FIXED (0.5.4b9)** — `validate_stage_names` now also validates `$match` filter syntax (unknown query operators → `QueryError`) up-front, so a change stream opened with `{$match: {$foo: -1}}` errors at aggregate (`.begin()`) time rather than at the first `getMore`.
   - ~~**Change-stream resume-token continuity** (`Spec Prose Tests/1. ChangeStream must continuously track the last seen resumeToken`)~~ **FIXED (0.5.4b11)** — `postBatchResumeToken` now reflects the resume token of the last event *actually returned* in each batch (not the producer's prefetch tail), so per-batch tokens advance under any `batchSize`; and an empty `getMore` only re-mints the token when the oplog tail genuinely moved, so an exhausted quiet stream reports the same token as its last event. `commands._change_stream_cursor_doc` (PBRT = `batch[-1]["_id"]`) + the producer's guarded empty-batch advance; regression `tests/test_change_streams.py::test_resume_token_tracks_per_event_with_batch_size_one`. (Distinct from the Rust-server change-stream resume fixes in 0.5.3-beta.53/54: the open now polls once so already-available events ride the **firstBatch** — pymongo's `_has_next()` only inspects the client buffer, so a resumed stream with an empty firstBatch read as "no changes" — and `resumeAfter` on an **invalidate** token is rejected with `InvalidResumeToken` (260) via a `from_invalidate` marker in the token, while `startAfter` is allowed. Closes pymongo `test_start_after` ×2 + `test_resumetoken_uniterated_nonempty_batch_*` ×2.)
   - ~~**Client-metadata handshake** (`integration tests for client metadata handshake feature/with client`, `/with pool`)~~ **FIXED (0.5.4b12)** — the test connects with `?appName=xyz` and scans `db.aggregate([{$currentOp: {}}])` for an op whose `appName` matches, then reads its `clientMetadata.{application,driver,os}`. The `$currentOp` *aggregation stage* (`aggregate._stage_current_op`) was a bare stub; it now surfaces the connection's `clientMetadata` + a top-level `appName` (threaded via `PipelineContext.client_metadata` from the connection registry), like the `currentOp` command already did. Regression: `tests/test_hello_client_metadata.py::test_aggregation_currentop_surfaces_appname_and_metadata`.
   - Out-of-scope tags excluded in `cxx_validation/include_paths.py` (CSFLE, Atlas, search indexes, transactions, sessions, SDAM monitoring, and `[uri_options]` which needs the `URI_OPTIONS_TESTS_PATH` spec-data dir).
-- [ ] **mongo-csharp-driver (C# / .NET) gauge landed (2026-06-19) — one conformance gap surfaced.** New `dotnet_validation` gauge runs the vendored driver's xUnit `MongoDB.Driver.Tests` via `dotnet test` against an embedded daemon over `MONGODB_URI`. Driver pinned `v3.9.0`; scoped to the **CRUD specification suite** (`MongoDB.Driver.Tests.Specifications.crud`) via `--filter` — `MongoDB.Driver.Tests` as a whole is enormous and dominated by non-server unit tests (LINQ/serialization) plus external-service suites (CSFLE/KMS, auth, Atlas Search, load balancing) and multi-node features (transactions, sessions, SDAM, retryable). At landing: **201 pass / 1 fail / 26 skip (99.5%)** (the 26 are `[RequireServer]`/CSFLE-gated skips). After the 0.5.4b9 validation-detail fix below, gauge-verified at **202 pass / 0 fail / 26 skip**. The one (now-fixed) divergence:
+- [x] **mongo-csharp-driver (C# / .NET) gauge landed (2026-06-19) — the one gap surfaced is FIXED (headline corrected 2026-08-21).** `mongo-csharp-driver` is at **0 failures / 100.0%** in the current `docs/validation-summary.md`, and this entry's own body already records the fix ("gauge-verified at 202 pass / 0 fail / 26 skip"). New `dotnet_validation` gauge runs the vendored driver's xUnit `MongoDB.Driver.Tests` via `dotnet test` against an embedded daemon over `MONGODB_URI`. Driver pinned `v3.9.0`; scoped to the **CRUD specification suite** (`MongoDB.Driver.Tests.Specifications.crud`) via `--filter` — `MongoDB.Driver.Tests` as a whole is enormous and dominated by non-server unit tests (LINQ/serialization) plus external-service suites (CSFLE/KMS, auth, Atlas Search, load balancing) and multi-node features (transactions, sessions, SDAM, retryable). At landing: **201 pass / 1 fail / 26 skip (99.5%)** (the 26 are `[RequireServer]`/CSFLE-gated skips). After the 0.5.4b9 validation-detail fix below, gauge-verified at **202 pass / 0 fail / 26 skip**. The one (now-fixed) divergence:
   - ~~**Document-validation error detail** (`CrudProseTests.WriteError_details_should_expose_writeErrors_errInfo`)~~ **FIXED (0.5.4b9)** — a failed query-expression validator now synthesises mongod's per-operator `errInfo.details` (`operatorName` / `specifiedAs` / `reason` / `consideredValue` / `consideredType`) via `commands._validation_failure_details` + `query.bson_type_name`, used by both the insert path and `_validate_doc_against_collection`. ($jsonSchema validators still report a minimal `{operatorName: "$jsonSchema"}` — their schema-rules detail is unsynthesised.)
   - The CRUD-only scope is deliberate and expandable — broaden the `--filter` in `dotnet_validation/include_paths.py` to add more spec families (e.g. `read_write_concern`, `change-streams`) as they're validated. Build note: the driver's `MongoDB.Driver.Encryption` project verifies a downloaded libmongocrypt with **gpg** at build time, so `gpg` (and network for the libmongocrypt download) are build prerequisites even though CSFLE itself is out of scope.
 
@@ -839,16 +1763,55 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 ### P2 — polish
 
 - [ ] **Admin UI polish bundle** — small fixes that don't deserve individual entries; address opportunistically when touching nearby code. (Currently no entries — the bundle was cleared in `admin-ui-rest`, May 2026. Drop new ones here as they show up.)
-- [ ] **No admin surface for `collMod` / `createCollection` / validators / `renameCollection` / custom-role creation.** All ship server-side; the only way to reach them is hand-typing into `/query`'s `runCommand` box, so they're undiscoverable. Not wrong, just missing — add panels as the need shows up.
-- [ ] **Change-stream page has no resume-token / `fullDocument` controls.** `/changestream` tails by scope only; `resumeAfter` / `startAfter` / `fullDocument` / `fullDocumentBeforeChange` and pipeline filters all ship on both servers but aren't reachable from the UI.
+- [x] **Admin surface for `collMod` / `createCollection` / validators / `renameCollection` / custom-role creation — SHIPPED.** `/db/{db}` grew a create-collection form plus per-row Modify (`collMod`) and Rename (`renameCollection`, including a cross-database `otherdb.name` target and `dropTarget`); `/roles` grew a create form (`createRole`) and a Drop button on custom roles only. Options are one Extended-JSON document rather than a field per option, so a server-version-dependent option set (validators, capped sizing, pre/post images) can't be capped by a stale form. All are PRG with 303 so a refresh can't replay the DDL.
+- [x] **Change-stream page resume-token / `fullDocument` controls — SHIPPED.** `/changestream` now carries `fullDocument`, `fullDocumentBeforeChange`, `resumeAfter`, `startAfter`, `startAtOperationTime` and a pipeline filter, in a collapsed options panel; the `open` frame echoes which options took effect, and each event grew a **Resume from here** button that closes the copy-token loop (the page previously offered "Copy resume token" with nowhere to paste it). Options round-trip through the URL so a shared link reproduces the same stream.
+- [x] **`validationLevel` is honoured on BOTH servers — the 2026-08-11 entry was
+  wrong; re-probed 2026-08-20.** The claim was that the level is stored but never
+  consulted. It is consulted, and correctly. Probed over the wire on both servers:
+  create with `validator: {n: {$gte: 0}}`, `validationAction: "error"`,
+  `validationLevel: "moderate"`; insert a valid doc; sneak an invalid one in under
+  `validationLevel: "off"`; switch back to `moderate`. Updating the **already-valid**
+  doc to an invalid value is rejected with 121, and updating the **already-invalid**
+  doc is accepted — which is exactly mongod's `moderate` rule and is
+  indistinguishable from `strict` only if the level were being ignored. Identical
+  results from the Python server and the Rust binary. `"off"` demonstrably disables
+  validation too (that is how the invalid doc got in). Nothing to fix.
 - [ ] **The SQL / PostgreSQL-wire server has no admin UI at all**, and this is now an explicit scoping decision rather than an accident: `client.check_supported_uri` rejects a `postgresql://` target with a message saying so. If a SQL admin surface is ever wanted it needs its own console — every page here is pymongo-driven.
-- [ ] **`StarletteDeprecationWarning` from fastapi's testclient import** — the six
-  admin websocket tests each emit "Using `httpx` with `starlette.testclient` is
-  deprecated; install `httpx2`" from fastapi's own import shim. The last warnings
-  in the default suite. Fix is a dev-dependency bump (fastapi/starlette/httpx2)
-  in its own PR — no runtime code involved.
+- [x] **`StarletteDeprecationWarning` — FIXED 2026-08-23; the suite is warning-free.**
+  starlette's `TestClient` prefers `httpx2` and emits
+  "Using `httpx` with `starlette.testclient` is deprecated" on every construction
+  when only `httpx` is importable (`starlette/testclient.py:47`). Six of them, from
+  the admin websocket tests — the last warnings in the default suite. Adding
+  `httpx2>=2.12` to the **dev** extra silences them: verified by re-running
+  `tests/test_admin_skeleton.py`, 137 passed with no warnings section at all.
+  Test-only on purpose — nothing under `src/secantus` imports `httpx` at runtime,
+  so it does not belong in the `admin` / `opsboard` extras (which declare `httpx`
+  for the same TestClient reason).
 
 ## 7. Python → Rust rewrite (in progress)
+
+### 7.0 Cache-pressure rollback — CI exercises it now
+
+`WT_ROLLBACK` is two conditions wearing one code: a write-write conflict
+(retryable → `WriteConflict`) and WiredTiger abandoning a transaction whose own
+dirty content it cannot evict (NOT retryable → `TransactionTooLargeForCache`).
+`Session::rollback_reason()` separates them at all three sites that mint the
+error (#981).
+
+This entry recorded that the cache-pressure branch had no end-to-end coverage,
+because it could not be reproduced on a fast machine (80 runs under 8-way
+concurrency plus 10 CPU burners did not trigger it). **It has since fired for
+real on a loaded CI runner**, which both confirmed the classification works and
+exposed the last piece: the condition can surface at EITHER level — our own
+post-statement guard returns it as the outer `Err`, while an engine-side
+rollback during the statement returns it as the INNER one. `txn_budget.rs`
+accepted only the outer, so it panicked on the inner. It now accepts both.
+
+So the branch is exercised, just not deterministically: CI is where it happens.
+A `StorageOptions` override for the dirty budget would still let a test force
+the engine to lose the race on demand, which is worth having if this area
+changes again.
+
 
 ### 7.1 Rust server performance and security review (2026-06-16) — CLOSED
 
@@ -1026,14 +1989,30 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   | c | 718 / 15 / 69 | 98.0% | documented C set (ipv6/lastWriteDate/select_server/search) |
   | cxx | 885 / 3 / 9 | 99.7% | change-stream resume-token tracking, client-metadata handshake ×2 |
 
+  **The php-lib row's "~37 txn/session (out of scope)" reading was WRONG —
+  corrected 2026-08-12.** Those transaction failures were not an out-of-scope
+  gap at all: `serverStatus` omitted the `storageEngine` sub-document, so the
+  suite's `skipIfTransactionsNotSupported` helper threw "Could not determine
+  server storage engine" and errored ~27 tests before any transaction ran.
+  Fixed in #829; php-lib then went 42 failures -> 4, and #830 took it to 1
+  (a text-index test, genuinely out of scope). The lesson worth keeping: a
+  cluster of failures sharing one *symptom* is not evidence of a shared
+  *cause*, and "out of scope" is the most expensive label to get wrong —
+  it stops anyone looking again.
+
   Follow-up triage (not blockers, no data risk): the php-lib "4 real" assertion
   failures (change-stream resume-token type, session-freed, findOneAndReplace
   BSON-type-map field order, 2dsphere index-version) and the pymongo-async
   6× `test_read_concern` (shared `CollectionInvalid: collection already exists`
   — likely async-harness test-isolation) should be diffed against the Python-server
-  runs of the same gauges to confirm none is Rust-specific. The remaining CI
-  wiring — adding the other-language `--server rust` gauge lanes to
-  `validate.yml` (only pymongo-rust-server runs weekly today) — is the last piece.
+  runs of the same gauges to confirm none is Rust-specific. ~~The remaining CI
+  wiring~~ — DONE (rust-gauge-lanes slice): `validate.yml` now carries a
+  `*-rust-server` lane for every MongoDB-wire gauge (pymongo-async / go / node
+  / java / kotlin / ruby / rust / php-lib / php-ext / c / cxx / dotnet, joining
+  the existing pymongo-rust-server + java-rust-server), each reusing its
+  language-toolchain steps plus the storage-engine sync, with `SECANTUSDB_BIN`
+  pointing the daemon gauges at the staged `secantusd-rs`. All thirteen gauges
+  now run weekly against BOTH servers.
   Original: only the pymongo gauge runs against the Rust server
   (`invoke validate --server rust` / the `pymongo-rust-server` entry in
   `validate.yml`). The Go/Node/Java/Ruby/Rust-driver gauges still gauge the
@@ -1228,7 +2207,7 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   fixed `aggregate`, which had passed the *raw* (un-evaluated) `let` doc as vars.
   findAndModify threads `let`+`collation` into its match (upsert-no-match `let`
   still deferred). **+7 gauge (`test_crud_unified` 275→282).**
-- [ ] **`find` edges** — empty-collection/empty-result filter validation DONE:
+- [x] **`find` edges** — empty-collection/empty-result filter validation DONE:
   when nothing matched, the filter is re-run once against an empty document so an
   invalid / unsupported filter surfaces `BadValue` (consistent with the
   non-empty storage-scan path) instead of an empty cursor. The `tailable: true`
@@ -1507,7 +2486,7 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   once engine-selection makes the Rust storage engine selectable, flip the flag on
   in the shipping `wheels.yml` / cibuildwheel matrix (and add the abi3 storage
   extension to the wheel's repair/tag handling there).
-- [ ] **Toward a standalone Rust package — (b) DONE, (a) needs a crates.io
+- [ ] **OPEN — Toward a standalone Rust package — (b) DONE, (a) needs a crates.io
   decision** (2026-07-17 audit). (b) the `secantusdb` binary crate exists and
   ships (`secantusd-rs`, the `secantusdb-v*` release-binaries track). (a)
   flipping `publish = false` and publishing `secantus-core` to crates.io needs
@@ -1553,7 +2532,7 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   **any regex**, `$all`, structural/compound equality (array/doc operands),
   bool-as-int comparison, exotic BSON types. Parity pinned by
   `tests/test_rust_query_parity.py` (curated + 6000-case fuzz).
-- [ ] **Widen the Rust query matcher (Rust server)** — the matcher backs the
+- [ ] **OPEN — Widen the Rust query matcher (Rust server)** — the matcher backs the
   Rust server directly; there is no Python fallback in that path, so an unported
   construct surfaces as `BadValue`. **Done:** `$all` (element equality via
   `expressions::py_eq`, **regex elements via `op_regex`**, and — fixed 2026-07-17
@@ -2057,11 +3036,14 @@ session tests + the go harness race below.
   mtest harness under full-gauge load, not suppressible at the runner and not a server bug.
   **Accepted**, same as the Python-server verdict in §5. See the top-section entry for the
   full 2026-06-26 evidence.
-  - [ ] *Minor, separate:* the `secantusdb` binary doesn't accept `--noop-heartbeat-seconds`
-    (stripped by `gauge_common._PYTHON_ONLY_FLAGS` for the Rust server), so the go gauge
-    runs Rust without periodic noop heartbeats. Not the cause here (the `resume_token_
-    updated_on_empty_batch` test that needs it is in the skip list), but worth adding the
-    flag to the binary for gauge parity.
+  - [ ] *Minor, separate — the CAUSE has changed; re-probed 2026-08-20.* The go gauge
+    still runs the Rust server without periodic noop heartbeats, but no longer because
+    the binary lacks the flag: `secantusd-rs --help` lists `--noop-heartbeat-seconds S`,
+    `crates/secantus-server/src/args.rs:268` parses it, and the daemon starts cleanly
+    with it. What still drops it is `gauge_common._PYTHON_ONLY_FLAGS` (line 45), which
+    strips the flag for the Rust server. **The fix is now deleting one line from that
+    set**, not adding a flag to the binary — and then confirming the go gauge still
+    passes with heartbeats on.
 
 ### 7.5 Remaining Rust-server feature gaps (defer audit, 2026-06-26)
 
@@ -2135,7 +3117,7 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   mongod) instead of null; null/missing still yield null. Parity-corpus
   comments updated; pinned by `test_expressions.py::
   test_log_family_domain_errors`.
-- [ ] **`$group` accumulator gaps — `$median`/`$percentile` SHIPPED on both
+- [ ] **OPEN — `$group` accumulator gaps — `$median`/`$percentile` SHIPPED on both
   servers (2026-07-17).** Both the group-accumulator and expression forms now
   run on Python and Rust, pinned by a live mongod **7.0.12** probe: the
   "approximate" method on bounded data is mongod's discrete percentile
@@ -2219,12 +3201,22 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   raises a generic `BadValue` (2) on these error paths because the Rust core signals
   `Fallback` rather than a coded error — same class as the unrecognized-operator
   nit. A faithful fix needs the `Fallback` type to carry an optional mongod code (or
-  per-operator error emission in the command layer). **Now native on the Rust
+  per-operator error emission in the command layer).
+  **There is now a worked template for closing these one family at a time**
+  (2026-08-25): rather than widening `Fallback` (which touches every `Err`
+  site in the engine), add a *standalone validator* alongside the operator —
+  `update::arith_type_error` for `$inc`/`$mul`, mirroring the older
+  `query::json_schema_keyword_error` — that names the errors it can name and
+  leaves `Fallback` for genuinely unimplemented constructs. Plumbing is a
+  `StorageError` variant carrying the message plus one arm in the adapter's
+  code table. `$inc`/`$mul` are closed this way; the remaining families
+  (`$stdDev*` / `$median` / `$percentile` argument validation, the log-family
+  domain errors, unrecognized operators) can follow the same shape. **Now native on the Rust
   server:** `$stdDevPop` /
   `$stdDevSamp` accumulators (0.5.3-beta.135 / 0.5.4b163 — Python already had them;
   both engines aligned to a naive-fold + multiply + `sqrt` computation so they agree
   bit-for-bit despite CPython 3.12's compensated `sum()`).
-- [ ] **Cross-type range comparison — FIXED 2026-07-13 on both servers; only a
+- [ ] **OPEN — Cross-type range comparison — FIXED 2026-07-13 on both servers; only a
   DBPointer operand nested in an array/document still defers (`$gt`/`$gte`/`$lt`/
   `$lte`). All four sub-items below are done (verified 2026-07-19).** mongod's range operators are
   **type-bracketed** (verified with a three-way probe against real `mongod` 6.0):
@@ -2270,11 +3262,66 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   update-parity cases.)
 - [ ] **Aggregate gaps found by the three-way differential (2026-07-10, both
   servers).**
+  **2026-08-25 re-run (44 stages/operators, both servers vs mongod 6.0.16):
+  two real bugs found and FIXED, one new gap characterised.**
+  - *FIXED — a missing field path emitted `null` instead of being omitted.*
+    `{$project: {z: "$nope"}}`, `{$project: {z: "$n.k"}}` with `n.k` absent, and
+    `{$addFields: {z: "$nope"}}` all wrote `z: null`; mongod omits the key. So
+    did a document literal — `{$project: {z: {w: "$nope"}}}` gave `{z: {w: null}}`
+    where mongod gives `{z: {}}`. Silent wrong data: every document carried a key
+    mongod never sends, inverting a client's `"z" in doc` test. Both engines
+    already had the MISSING marker and both stages already skipped it — they
+    never *received* it, because plain `evaluate` answers null for an absent
+    path. Fixed with a separate field-value evaluator
+    (`expressions.evaluate_or_missing` / `expressions::eval_field_value`),
+    deliberately NOT by changing `evaluate`: a missing path is still `null` as an
+    *operator argument* (`{$add: ["$nope", 1]}` is 1), and only *missing* in
+    field-value position. Both rules are pinned in
+    `tests/test_mongod_differential.py`.
+  - *FIXED — `$bucket` emitted empty buckets.* mongod emits a bucket only when
+    something landed in it, boundary buckets and `default` alike (probed:
+    boundaries `[0,2,4,8]` over values 1 and 7 answer `_id: 0` and `_id: 4`,
+    omitting `_id: 2`). An unused `default` surfaced as a bare `{_id: "other"}`
+    with no `count` at all. The Rust side had *deliberately* reproduced the bug
+    to match the buggy Python, comment and all; both moved together.
+  - *OPEN (new, characterised) — aggregation runtime errors lack mongod's
+    wrapper prefix.* Codes match; the message doesn't. mongod picks one of three
+    wrappers by **when** the error fires, which is decided by constant folding:
+    an all-literal expression folds at optimize time and gets
+    `Failed to optimize pipeline :: caused by :: <msg>`, while any field
+    reference defers to runtime and gets
+    `PlanExecutor error during aggregation :: caused by :: <msg>`. Probed both
+    ways on the same operators (`{$divide: [1, 0]}` vs `{$divide: ["$a", 0]}`;
+    `{$ln: -1}` vs `{$ln: "$neg"}`). Parse-time errors have their own wrappers
+    (`Invalid $project :: caused by ::`, which we already emit). Closing it means
+    modelling "does this expression subtree reference a field path or variable",
+    which is tractable but is message text only — deliberately not attempted in
+    the 2026-08-25 pass rather than half-implemented.
+  - *NOT a bug:* `$group` output order differs from mongod. Confirmed identical
+    as sets, and mongod's own order **changed between two runs of the same
+    pipeline** — it is genuinely unspecified. Any test comparing `$group` output
+    must sort first.
+
   **`$stdDevPop` last-ULP vs mongod** — both servers agree with each other but
   differ from mongod in the final ULP (e.g. `2.357022603955158` vs mongod's
   `2.3570226039551585`); mongod uses a different summation order. Precision-only,
   hard to match exactly — likely a permanent minor divergence.
-- [ ] **`$meta` projection values** (`{score: {$meta: "recordId"}}` / `"indexKey"` /
+- [ ] **OPEN (narrowed) — `$meta` projection values.** **A worse bug underneath
+  this one was FIXED 2026-08-28:** a `$meta` projection was treated as
+  *inclusion-mode*, so `find({}, {m: {$meta: "recordId"}})` answered `{_id: 1}`
+  — the caller's entire document silently discarded. mongod treats `$meta` as a
+  value re-shaper that does **not** participate in inclusion/exclusion
+  detection, exactly as `$slice` and positional already did here. Oracle-pinned
+  (6.0.16): meta-only → whole document; `_id: 0` + meta → whole document minus
+  `_id`; `a: 1` + meta → `{_id, a}`; `b: 0` + meta → exclusion. Both engines
+  fixed together — the Rust side carried the same wrong comment, which asserted
+  "result: just `_id`" as though it were mongod's behaviour. **What remains is
+  the original, narrower item:** the metadata value itself is not computed, so
+  the field is omitted where mongod returns a real `recordId` / `indexKey`
+  (`recordId` is now reachable — storage has one). Also `{$meta: "sortKey"}` in
+  a *find* projection answers rows where mongod errors code 2.
+
+  Original entry: (`{score: {$meta: "recordId"}}` / `"indexKey"` /
   `"sortKey"`) — the recognized-but-unsupported `$meta` args now validate clean on
   both servers and the field is **omitted** (partial, graceful degradation) rather
   than faithfully computed — mongod returns the actual index / record-id / sort-key
@@ -2378,13 +3425,464 @@ threading into `wt_config`.)
 
 ## SQL / PostgreSQL interface — P0 spike limitations
 
-- [ ] **Cross-type comparisons evaluate to false instead of erroring.** A per-row
-  predicate comparing incompatible types (`int_col = substr(text_col, 1, 1)`)
-  quietly matches nothing; real Postgres raises `42883 operator does not exist:
-  bigint = text` at plan time. The scalar evaluator's Python `==` absorbs the
-  mismatch. Faithful behaviour needs type-aware comparison in the evaluator —
-  weigh against the dual-protocol reflected-table case where cross-BSON-type
-  comparison is deliberate.
+### pgx gauge — `pgconn` findings and next steps (2026-08-14)
+
+**Where it stands: `pgconn` is at 0 stable failures — MEASURED, package
+CLOSED** (full run at `03d5c63b`, 2026-08-15, after the triggers +
+tsvector build #901: the only failure was the documented load-sensitive
+`TestDeadlineContextWatcherHandler`; the official full-gauge run reads
+**376 P / 2 F / 22 S = 99.5%**, from 77.0% at the 2026-08-14 baseline —
+`pgconn` 99.0%, `pgproto3`/`bgreader`/`ctxwatch` 100%) (of 216 tests;
+full-package re-run measured 2026-08-15 at `f2891c28`, three runs). The
+chain: 86 → 29 (#862) → 23 (#866) → 20 (#868) → 18 (#869) → 17 (#870) →
+12 (#871, measured) → 8 (#873) → 5 (#876) → 4 (#877). Two additional tests are
+LOAD-SENSITIVE, not broken — the ctxwatch timing-budget pair,
+`TestDeadlineContextWatcherHandler` and (less often)
+`TestCancelRequestContextWatcherHandler`: both give short pg_sleep queries
+sub-second cancel/deadline budgets, pass repeatedly in isolation against
+the same daemon (3/3 and 5/5 across measurement rounds, including at
+moderate load), and miss their margins only under the full package's
+16-way parallel load against the GIL-bound Python server on this shared
+desktop (2026-08-15: flickered in 2 of 5 full runs; one earlier round was
+also polluted by a leaked debug process, since killed). The Python server
+is not a perf target (throughput/latency work goes to the Rust server) —
+re-measure on a quiet machine before treating either as a server defect. The stable four: 86 → 29 after the `generate_series`
+untyped-bound fix (#862), 29 → 23 after per-session temp-table namespacing
+(#866), 23 → 20 after the stray-CopyData drain fix (#868), 20 → 18 after
+plain-json compact rendering (#869), 18 → 17 after the legacy bare
+`COPY … BINARY` keyword fix (#870), 17 → 13 after wire CancelRequest support
+(#871), and the full re-run measured 12 — `TestConnExecBatchImplicitTransaction`
+also passes now (pipeline implicit-transaction work, #856 line). The other
+three pgx packages were already clean (`bgreader` 6/6, `ctxwatch` 6/6,
+`pgproto3` 171/172), so `pgconn` is the whole gauge gap.
+
+**What the 86 → 29 fix was, and why it was worth so much.** pgx's
+`ensureConnValid` helper (`pgconn/helper_test.go:28`) runs
+`select generate_series(1,$1)` with `$1` sent as untyped text, and is called
+at the END of 66 `pgconn` tests to prove the connection still works. We
+rejected that query, so every one of those tests failed at its final step
+regardless of what it was testing — one missing coercion presenting as 66
+unrelated bugs, including things like `TestConnEscapeString`. **The lesson is
+the reusable part: in this gauge, a shared test helper can make one gap look
+like a whole subsystem. Read the actual failure text before believing the
+test names.**
+
+**The four stable failures** (fixed clusters deleted per the
+delete-when-fixed rule — the narratives live in `docs/changelog.md` and the
+PR trail #866/#868/#869/#870/#871/#873/#876/#877):
+
+* (none — the trigger/tsvector build landed BEFORE INSERT FOR EACH ROW
+  triggers with plpgsql NEW records. Scope limits, deliberate: AFTER /
+  UPDATE / DELETE / statement-level triggers stay rejected 0A000; a
+  `pg_temp.`-homed trigger FUNCTION lingers in the catalog after its
+  session ends (its trigger and temp table are torn down; the orphaned
+  function entry is invisible to other sessions' bare-name lookups).
+
+Known divergence recorded while fixing the batch shape (#876): a real PG
+multi-statement simple query is ONE implicit transaction (an error rolls
+back earlier statements' writes); ours runs per-statement autocommit, so
+earlier writes survive. No gauge test observes it yet.
+
+#### Temp tables: concurrent namespacing FIXED and CONFIRMED as the cluster's cause
+
+The confirmed gap — two simultaneously-open connections each doing
+`create temporary table bar(a int4)` had the second fail `42P07` because we
+shared one temp namespace — is **fixed** (#866): every session now gets its
+own lazily-allocated `pg_temp_<n>` namespace (catalog keys carry the prefix),
+unqualified names resolve temp-first ahead of `public` (so a session's temp
+table shadows a permanent one, like real PG), explicit `pg_temp.<name>`
+resolves to the session's own namespace, and COPY / extended-protocol
+Describe resolve through the same path. `tests/test_sql_temp_namespacing.py`
+pins all of it, including the two-concurrent-psycopg-connections repro.
+
+**Causality is now measured, not assumed.** The 2026-08-14 re-run at
+`7cab7a3a` has **zero** `already exists` occurrences in the whole package log
+(the 42P07 signature is gone), and the COPY cluster dropped 13 → 8 —
+`TestConnCopyFrom`, `TestConnCopyFromConnectionTerminated` (the
+abnormal-disconnect suspect), `TestConnCopyFromCanceled`,
+`TestConnCopyFromPrecanceled`, `TestConnCopyFromGzipReader`,
+`TestConnCopyToPrecanceled`, and `TestConnCopyToQueryError` all pass, as do
+the baseline's `TestConnExecBatchDeferredError` and `TestConnDeallocate*`.
+The earlier alternative hypothesis (abnormal-disconnect leak) is dead: the
+shared namespace was the cause. The mechanism the original diagnosis missed
+is `t.Parallel()` — 116 calls in `pgconn_test.go` — so tests' connections
+are simultaneously open, and same-named temp tables collided across live
+sessions even though every test closed its own connection cleanly.
+
+Residual namespacing caveats (deliberate): stale `pg_temp_<n>.*` catalog
+entries from a crashed process are not purged at startup (the namespace
+counter is pid-seeded, so re-mint collisions are vanishingly unlikely, but
+the dead entries linger invisibly until a same-named session drops them);
+RBAC grants and `pg_namespace` don't know per-session namespaces
+(`pg_namespace` still lists a single `pg_temp_1` row).
+
+#### Reproductions
+
+```
+# gauge, one test
+python -m secantus.sql.pgserver --host 127.0.0.1 --port 15435 --storage-path $(mktemp -d)
+cd vendor/pgx && PGX_TEST_DATABASE="host=127.0.0.1 port=15435 dbname=postgres user=postgres" \
+  go test -count=1 -run 'TestConnCopyFrom$' ./pgconn/
+
+# whole package (~130s)
+... go test -count=1 -timeout=600s ./pgconn/
+```
+
+
+### SQL-gauge re-baseline sweep (2026-08-15, at `36937245`)
+
+Run after the pgx campaign to harvest gains and regression-check the
+shared-surface changes (parse errors, startup GUCs, reply shapes,
+`generate_series` int4, notifications, triggers):
+
+- **sqlalchemy**: 978 P / 0 F / 447 S — clean, no regression.
+- **sqllogictest**: 52/60 files, 8 expected divergences, 0 unexpected —
+  identical to the committed report.
+- **pgtest**: 10/58 files — identical to the committed report (an older
+  backlog entry said 8/58; that was stale). Campaign started 2026-08-16:
+  the `aborted_txn` file's two protocol gaps (25P02 for extended steps in
+  aborted transactions with the COMMIT/ROLLBACK carve-out;
+  `ignore_till_sync` covering interleaved simple Query) took the corpus
+  43 → 40 failing files; slice 2 fixed the XX000-leak class (malformed
+  binary array params → 08P01, malformed array-literal casts → 22P02 —
+  files advance internally, count still 40). Known next divergences:
+  slices 3–4 greened `array`, `json`, `json_array` (nested-constructor
+  typing; JSON[] 199/114 identities; VERBATIM plain-json echo narrowing
+  that divergence to table-stored columns; jsonb binary validation;
+  42804/08P01 element-oid split). Slice 5 greened `batch_stmt` and
+  CLOSED the recorded batch-transaction divergence: a multi-statement
+  simple query is now ONE implicit transaction (mid-batch errors roll
+  back earlier writes; BEGIN takes over with its characteristics —
+  READ ONLY gates + poisons; COMMIT splits), with a top-level-semicolon
+  segment-parse fallback for batches sqlglot rejects whole. Slice 6
+  greened `bind_and_resolve`: reg-pseudotype parameter oids
+  (`$1::REGCLASS` → 2205 in ParameterDescription) and bind-time portal
+  snapshots — a portal bound inside an explicit txn runs eagerly at Bind
+  (read-only SELECTs only; errors stay at Execute after BindComplete;
+  cached-plan revalidation still trips 0A000 at Execute), so later
+  same-txn DDL can't change what the held portal returns. Slice 7
+  greened `char` (one documented divergence: char:250 pins crdb's
+  TableOID=105 with no ignore_table_oids — impossible for any non-crdb
+  server; recorded in EXPECTED_DIVERGENCES): the QUOTED `"char"`
+  spelling now maps to PG's internal one-byte type — oid 18, typlen 1,
+  column name `char` — via a token-context pre-parse rewrite to the
+  `pg_char_1` sentinel (sqlglot collapses the quoted spelling into
+  plain CHAR in both cast and column-def positions; the rewrite fires
+  after `::`, after AS only inside CAST(...), and in CREATE/ALTER
+  column-type position, never on aliases/column names/string
+  literals). Input truncates to ONE character; empty/zero-byte input
+  stores NULL; `0::"char"` is the zero byte (binary render 0x00);
+  binary param/result codecs added. Slice 8 greened `citext`: citext
+  now rides crdb's stable placeholder oid 90008 (like hstore's 16935 —
+  the extension has no fixed catalog oid; the old citext-as-25 entry
+  was omitted only because 25 collided with text in OID_TO_TAG),
+  binary param/result codecs are the text bytes, and an unknown param
+  compared against a citext COLUMN infers 90008 (citext-only on
+  purpose — its own operator family; the char corpus pins a "char"
+  comparison param at 25). Slice 9 greened `copy` (1187 lines, the
+  biggest file): CSV parsing rewritten as PG's CopyReadAttributesCSV
+  state machine (quoting decides NULL-ness — quoted "N" with NULL 'N'
+  is the string N; quoted empty is ''; custom ESCAPE chars; a \\.
+  line ends CSV data; unterminated quote → 22P04); COPY TO CSV
+  force-quotes empty strings; _copy_options re-scans sqlglot's
+  mangled legacy option syntax as a token stream (CSV NULL 'NS'
+  DELIMITER '|'); ESCAPE/HEADER are CSV-only (0A000); text-mode
+  \\xHH/\\OOO byte escapes decode; COPY (query) TO STDOUT works via
+  the extended protocol (NoData + CopyOutResponse/CopyData/CopyDone
+  in Execute; COPY takes 0 params — binding any is 08P01 with the
+  statement-summary detail; an unbound $1 at Execute is 42P02);
+  crdb's inline INDEX(...) table element is accepted-and-skipped and
+  ADD COLUMN ... NOT VISIBLE parses as a normal column. Slice 10
+  greened `copy_file_upload`: unknown COPY option keywords (crdb's
+  ``WITH destination = 'nodelocal://…'``) now raise PG's 42601 at
+  parse, before the target table resolves (was 42P01), via a
+  known-keyword allowlist in the option scanner; the legit ``QUOTE``
+  option is wired for real while at it (custom CSV quote char in
+  parse + render, CSV-only 0A000 gate, 22023 for multi-char).
+  Slice 11 greened `decimal`: the binary-numeric decoder always
+  quantizes to dscale (a zero built from 8192 zero digit-groups kept
+  exponent -32768 and rendered 0.000…0 — the #38139 regression
+  payload), and a dscale outside PG's NUMERIC_DSCALE_MASK (0x3FFF)
+  raises 22P03 at Bind like numeric_recv (the corpus sends 0xFFF0).
+  Slice 12 greened `enum`: an unaliased cast to a user-defined type
+  names its output column after the TYPE (SELECT 'hi'::te → column
+  te), and RowDescription reports typlen 4 for minted enum oids
+  (PG stores enum values as 4-byte oids; the [65000, 66000) range
+  check in pgwire is pinned to catalog's bases by a test). Slice 13
+  greened `errors`: multi-name DROP TABLE is ONE statement — one
+  CommandComplete tag, and without IF EXISTS every name must resolve
+  before anything drops (a MULTIDROP_TABLE command wrapping the
+  per-name Drop nodes); Bind rejects format codes other than 0/1
+  with 08P01 before BindComplete; the FK ConstraintName error field
+  already passed unchanged. Corpus: 28 unexpected failures; green:
+  aborted_txn, array, batch_stmt, bind_and_resolve, json,
+  json_array, char, citext, copy, copy_file_upload, decimal, enum,
+  errors (+2). Slice 14 greened `execute`: Describe(P) of a
+  wire-parsed ``EXECUTE name(args)`` resolves the UNDERLYING
+  SQL-level prepared statement and reports ITS shape (a SELECT's
+  RowDescription, not NoData). Slice 15 greened `float`: float4
+  casts narrow to single precision and float4out renders the
+  shortest float32 round-trip (0.33333334, arrays included via the
+  element tag); extra_float_digits < 1 reduces %g precision for both
+  float widths; SET with a NEGATIVE value no longer drops the sign
+  (Neg's .name is the bare inner literal); bare ARRAY[…]/ROW(…)
+  constructors name their columns array/row. Slice 16 greened
+  `implicit_txn`: a nested BEGIN inside an explicit block completes
+  with the BEGIN tag but emits PG's WARNING notice — 25001 with the
+  File/Routine identity fields (xact.c / BeginTransactionBlock),
+  which the notice plumbing now carries (SQLResult.notices accepts
+  (severity, message[, sqlstate[, file[, routine]]])). Slice 17
+  greened `inet`: malformed binary inet payloads get PG's error
+  classes — a truncated header is 08P01, a bad family or address
+  length is 22P03 (inet_recv; XX000 leaked before). Slice 18 greened
+  `int2vector` (one documented divergence: the corpus expects crdb's
+  indoption=2 NULLS-FIRST pkey value; PG and we report 0 — matching
+  2 would corrupt SQLAlchemy reflection; in EXPECTED_DIVERGENCES):
+  the BINARY wire form of int2vector is now a real int2 ARRAY —
+  elemoid 21, 2-byte elements, lower bound 1 (crdb #111907's
+  regression class; the text "0" leaked through binary result
+  format before). Slice 19 took `jsonpath` to its documented
+  divergence only: the jsonpath TYPE landed (oid 4072, canonical
+  member quoting via jsonpath.canonicalize — $.abc → $."abc" — 42601
+  on an empty path, binary = version byte + PG's UNQUOTED canonical
+  text; the corpus's quoted binary form is crdb's, recorded in
+  EXPECTED_DIVERGENCES); jsonb_path_query coerces a string first arg
+  to jsonb like PG's implicit cast; unaliased function-call columns
+  are named after the function (PG rule — was ?column?). Corpus: 22
+  unexpected failures. Slice 20 greened `ltree`: the ltree type
+  landed on crdb's stable placeholder oid 90010 (like citext's
+  90008), stored as validated dotted-label text, binary = version
+  byte + text, INSERT-target and comparison inference (the
+  citext-only comparison branch is now the {citext, ltree} operator-
+  family set). Slice 21 advanced `multiple_active_portals`
+  :137 → :681 (9 of 18 subtests): PG portal semantics landed —
+  re-binding a NAMED portal live in the same explicit txn is 42P03
+  (with crdb's detail shape), portals DIE at transaction end
+  (cleared in _end_txn_state and at Sync when no block remains; a
+  post-Sync Execute is 34000 "unknown portal"), and DROP TABLE
+  refuses 55006 while an undrained portal in the session reads the
+  table. **Remaining blocker (architectural): the query_timeout
+  subtest needs row-LAZY portal execution** — pg_sleep evaluated per
+  fetched row with a cumulative statement_timeout across
+  Execute-resumes; our portals materialize fully at first Execute,
+  so the timeout can't fire mid-drain. Slice 22 greened `oid`: the
+  reg* pseudo-types (regproc 24, regprocedure 2202, regclass 2205,
+  regtype 2206, regnamespace 4089, regrole 4096) ride the oid wire
+  form — typlen 4 in RowDescription and a 4-byte unsigned binary
+  decode (raw bytes echoed through before), with a wrong-length
+  payload rejected 08P01 like PG's oidrecv. Slice 23 greened
+  `param_status` (350 lines, :7 → green): ParameterStatus now follows
+  the command's CommandComplete in BOTH protocol paths; a numeric SET
+  TIME ZONE reports PG's POSIX spec (`+6` → `<+06>-06`, sign inverted
+  after the label); IntervalStyle and is_superuser joined
+  REPORTABLE_GUCS (IntervalStyle lowercased); DateStyle reports
+  canonically as `<style>, <order>` regardless of written order;
+  `SET LOCAL TIME ZONE` honours LOCAL scope and canonicalizes;
+  SET ROLE / `SET [LOCAL] role =` report is_superuser, but only on a
+  real change; savepoints snapshot the GUCs so ROLLBACK TO SAVEPOINT
+  reverts and re-reports them; the transaction-end and ERROR-time
+  unwinds report case-insensitively ordered, including is_superuser
+  when the role reverts. Slice 24 greened `parameter_description`:
+  PG's FigureColname precedence (a cast's OPERAND names the column, so
+  `n::int4` is `n` while `2::int8` stays `int8`); `SET col = $N` and
+  `col = $N` type the parameter from the COLUMN (uuid 2950,
+  timestamptz 1184 — the old branch was citext/ltree-only; `"char"`
+  stays text, which the char corpus pins); one-type-per-parameter
+  conflicts raise 42883 (`lower($1)` with `$1::int`); a gap in
+  parameter numbering (`SELECT $2 > 0`) and a bare parameter as the
+  only CASE result raise 42P18. Slice 25 advanced `portals`
+  :147 → :1182 of 1550 (now a documented divergence): an Execute
+  delivering EXACTLY MaxRows always sends PortalSuspended — PG can't
+  know the portal is exhausted until an Execute fetches past the last
+  row — and each Execute's CommandComplete counts the rows THAT
+  Execute delivered (the drained one reports `SELECT 0`; a slice-21
+  test of mine had asserted the portal total). **:1182 is a
+  fidelity-conflict divergence**: the stanza compares the
+  CHECK-violation MESSAGE and pins crdb's wording; ours is real
+  PostgreSQL's, so matching would be a regression.
+  **Consequence to remember: the stanzas AFTER :1182 are not
+  exercised** — they cover 34000 'unknown portal' (already
+  implemented) and 42P03 'cursor "p" already exists as portal'
+  (NOT implemented — a DECLARE colliding with an open portal name).
+  Corpus: 17 unexpected failures. Slice 26 greened `prepare`: Bind now
+  requires exactly as many parameters as the prepared statement has,
+  and DECLARED oids count even when the query uses fewer placeholders
+  (three declared / one used → a one-parameter Bind is 08P01). The
+  check sits AFTER the COPY-specific 08P01, whose error carries PG's
+  statement-summary Detail — putting it first regressed the `copy`
+  file, which the full-corpus re-run caught.
+  **Gauge-harness limitation FIXED (runner isolation):** the runner
+  now spawns a FRESH daemon per corpus file (anchored
+  `-run TestPGTest/^<file>$`, `-json` streams concatenated), because the
+  corpus assumes a clean database per file — `execute` leaves table
+  `t0` behind, so `prepare` and `copy` failed in a shared-daemon run
+  while passing alone. Upstream crdb uses a per-file server for the
+  same reason. **The report is now the honest measurement: 37/64 pass,
+  4 expected divergences, 18 unexpected failures, 5 skipped** (campaign
+  start: 10/58 pass, 43 unexpected). The 58→64 denominator shift is
+  real: files that used to fail on line 1 now get far enough to emit
+  their subtest events. Slice 27 greened
+  `prepared_stmt_invalidation`: PG revalidates a named statement's
+  cached plan during BIND, so a shape changed by DDL raises 0A000
+  INSTEAD of BindComplete and no portal is created (we raised it at
+  Execute, after BindComplete). `aborted_txn` ignores BindComplete, so
+  Bind-time satisfies both files, and it keeps the check ahead of any
+  side effect (the data-modifying-CTE case). Report: 38/64 pass, 17
+  unexpected. Slice 28 took `row_description` to its last stanza
+  (recorded as the 5th expected divergence — its final directive sends
+  crdb-only `::STRING` / `::STRING(2)` with no `crdb_only` marker, and
+  real PG 14 rejects both with `42704 type "string" does not exist`,
+  probed). Four fixes: JOIN and view result columns now carry base-column
+  identity (`out_sources` per output position, replacing the single
+  `base_table`), `CREATE VIEW v (cols…)` no longer registers the view
+  under an EMPTY name while reporting success (the column list parses as
+  a `Schema` node wrapping the name — every reference to such a view
+  failed 42P01), `char(n)` blank-pads on the wire, and `ALTER COLUMN …
+  TYPE` recomputes the declared oid/typmod instead of inheriting the old
+  one. Slice 29 took `typing` to its ceiling (recorded as an expected
+  divergence — both its non-crdb stanzas use `keepErrMessage` to pin
+  crdb's `22023 unsupported comparison operator: <varchar> = <uuid>`,
+  where real PG 14 raises `42883 operator does not exist: character
+  varying = uuid`, probed). The behaviour those stanzas regression-test
+  IS now implemented: a comparison against a parameter whose DECLARED
+  type has no operator against the other operand raises 42883 **at
+  Parse** (the only place the declared OIDs are known), instead of
+  silently matching no rows; the message names the declared type, not
+  the folded storage tag. Known gap left behind: the same comparison
+  written as a *cast* (`v = $1::uuid`) is still unjudged — `_CATEGORY`
+  covers the cast path and doesn't model uuid/bytea/json/inet, which
+  only `_PARAM_CATEGORY` does. Remaining files: `tuple`, `procedure`,
+  `timezone` (`set`, `unknown`, `varbit`, `void` greened by #971; the
+  geo trio `box2d` / `pgvector` / `spatial` reclassified by #973).
+- **psycopg**: per-file failure signature matches the committed 99.0%
+  baseline everywhere EXCEPT two REAL regressions the sweep caught from
+  the temp-namespacing work — diag TABLE NAME leaking the ``pg_temp_<n>.``
+  prefix, and self-referencing FKs in CREATE TEMP TABLE pointing at a
+  nonexistent bare name (deferred checks silently never fired). Both
+  fixed in this slice; ``tests/test_errors.py`` back to its baseline
+  signature. (A 125-failure ``test_typing.py`` cluster in the sweep run
+  was venv-artifact — mypy example files — not server behaviour;
+  ``test_generators.py::test_cancel`` now times out instead of failing
+  fast, consistent with cancel support landing — worth a look in the
+  next official run.)
+
+### SQL / PostgreSQL section — survey (2026-08-14)
+
+**The headline count is wrong by 4x.** The section carries 126 unchecked
+`- [ ]` items, which reads as 126 open problems. It is not: **95 of them are
+completed work whose headline literally says "landed" / "shipped" / "FIXED"**
+and whose box was never ticked. CLAUDE.md says to delete an item's line when
+it is fixed; that has not been happening here, and the section has become a
+changelog wearing a to-do list's clothes.
+
+**Two entries were actively misleading, not merely stale.** `CHECK / UNIQUE
+constraints — declared, reflected, NOT enforced` (b91) and `Foreign keys —
+declared, reflected, NOT enforced` (b81) are contradicted by a LATER entry,
+`Enforcement made uniform across all write paths` (b98). Measured against the
+real engine rather than trusting either:
+
+```
+CHECK    violate -> SQLError: new row for relation "c1" violates check constraint "c1_n_check"
+UNIQUE   dup     -> SQLError: duplicate key value violates unique constraint "u1_n_key"
+NOT NULL null    -> SQLError: null value in column "n" violates not-null constraint
+FK       orphan  -> SQLError: insert or update on table "ch1" violates foreign key constraint
+```
+
+All four are enforced, with Postgres-shaped messages. A reader skimming for
+data-integrity risk would have found two entries announcing that constraints
+are not enforced — the single most alarming thing a database backlog can say —
+and both are false. That is worse than a stale checkbox: it misdirects
+attention away from real problems.
+
+**After removing landed work and status notes, ~17 items are genuinely open.**
+They cluster into four groups, in the order I would tackle them:
+
+1. **Shared-storage constraints (won't fix at this layer)** — sub-millisecond
+   timestamp fidelity (~11 gauge tests) and `numeric` beyond 34 significant
+   digits. Both are consequences of storing SQL values as BSON, the same
+   representation the Mongo side reads. Fixing either means diverging SQL
+   storage from the dual-protocol reflected-table path. These should be moved
+   OUT of the open list into "out of scope with reasoning" — they are
+   decisions, not tasks.
+
+2. **Driver-gauge clusters** — pgjdbc, pgtest, and pgx each have a bucket of
+   remaining failures. This is the same shape as the Mongo-side gauge work
+   that took driver conformance from 53 real failures to ~2, and the same
+   method applies: read the actual failure output, cluster by root cause, and
+   expect one cause to explain many failures.
+
+3. **Protocol/semantic gaps with real users** — query pipelining, streaming
+   COPY OUT abort, cross-connection async NOTIFY delivery, and write-conflict
+   retry (40001) semantics.
+
+   **Correction (2026-08-14): this cluster originally named `SAVEPOINT` as a
+   no-op and recommended it first. That was wrong, and wrong in exactly the
+   way this survey warns about** — it came from the entry's stale HEADLINE
+   ("SAVEPOINT is a no-op") while the entry's own BODY said "Real nested
+   savepoints landed (b71)". Measured against the engine: `SAVEPOINT` /
+   `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` all work, including nesting
+   and RELEASE merging snapshots into the parent, with Postgres' SQLSTATEs
+   (`3B001` unknown savepoint, `25P01` outside a transaction block). The
+   headline is now fixed. The lesson stands and cost me directly: reading a
+   headline is not reading the entry.
+
+4. **Correctness edges** — cross-type comparisons returning false where
+   Postgres raises `42883`, the `HAVING` general-shape residual, and
+   `DatatypeMismatch` on untyped parameters.
+
+**Recommended first action is not a code change.** Reconcile the section:
+delete or tick the 95 landed items, move the two shared-storage constraints
+to the out-of-scope section, and correct the two false "NOT enforced"
+headlines. That takes the section from 126 apparent problems to ~17 real
+ones, and removes two entries that actively point away from where the risk
+is. Only then is a prioritised implementation plan worth writing, because
+only then does the list describe reality.
+
+**Method note.** Every claim above was checked against the engine or the
+file, not inferred from the entry text. The two "NOT enforced" entries are
+the fourth, fifth and sixth stale-or-wrong backlog claims found this session
+(after the two transaction divergences, the php-lib "out of scope" reading,
+and the `maxMessageSizeBytes` framing). The pattern is consistent enough to
+be worth naming: **this backlog's prose is a hypothesis, not evidence.**
+
+
+- [ ] **Cross-type comparisons: the remaining lenient pairs.** The plan-time
+  42883 analysis shipped in `src/secantus/sql/typecheck.py` — a comparison
+  between two *confidently-typed* operands drawn from two different categories
+  (numeric / string / boolean / date-time) now raises `42883 operator does not
+  exist: text = integer` before any row is read, on declared tables. What is
+  still deliberately lenient, and why:
+  - **Reflected (schema-on-read) tables are exempt wholesale.** A reflected
+    column's type comes from sampling 50 documents, so a heterogeneous BSON
+    field can be declared `text` while holding integers; the dual-protocol
+    path *wants* the cross-BSON-type comparison. This is not a gap to close —
+    it is the correct answer for that table kind.
+  - **Categories not modelled**: `bytea`, `uuid`, `json`, `money`, `oid`,
+    `interval`, `time`/`timetz`, `"char"`, arrays, ranges, geo, network, bit.
+    Several of those pairs genuinely error in Postgres (`bytea = text`,
+    `uuid = text`, `interval = integer`), but the implicit-cast graph is
+    subtler and a false 42883 is worse than the lenient FALSE.
+  - **Same-category pairs Postgres still rejects**: `enum = text` (an enum
+    column carries the `text` tag here), `citext = name`. Lenient by design.
+  - **Operand shapes not typed**: bound parameters, subqueries, arithmetic,
+    `||`, `CASE`, and every function outside the small text-preserving /
+    int-returning allowlist. Also `IN`-lists and `BETWEEN` (only the six binary
+    comparison operators are analysed).
+  - **Statement shapes skipped**: CTEs, derived tables, set operations, table
+    functions in FROM, views, and any comparison nested inside a subquery
+    scope. Also **FROM-less selects** (`SELECT 'a'::text = 1`) — the analysis
+    is driven by declared column types, and constant-only expressions are most
+    of what the psycopg / SQLAlchemy gauges evaluate, so widening to them wants
+    its own gauge run.
+  - **`UPDATE … SET col = expr`** is an assignment, not a comparison: Postgres
+    reports an unassignable value as `42804 datatype_mismatch` under
+    assignment-cast rules. Still unimplemented — a `SET text_col = 42` is
+    silently coerced.
+  - **Not yet verified against the psycopg / sqllogictest / SQLAlchemy
+    gauges** (`invoke validate-psycopg` / `validate-slt` /
+    `validate-sqlalchemy`). The 2812-test `tests/test_sql*.py` suite and the
+    418-test `tests/test_pgserver*.py` suite are green, but the vendored
+    gauges are the only population large enough to expose a false 42883.
 
 The embedded SQL engine (`src/secantus/sql/`, `run_sql`) shipped as the P0 spike of
 `tasks/sql-postgres-plan.md`. Known gaps, to close in later phases:
@@ -2417,12 +3915,18 @@ shared storage engine or building large new protocol subsystems:
   psycopg's pipeline mode batches many extended-protocol messages before a
   Sync; the server processes each `Sync` synchronously rather than tracking a
   pipeline-abort boundary. A real feature (its own subsystem), not a bug.
-- [ ] **CancelRequest handling (`test_generators::test_cancel`, and the
-  environmental `test_cancel_safe_*` "proxy didn't start listening: Errno 22"
-  harness failures).** The v3 CancelRequest startup packet is parsed but not
-  acted on (statements run synchronously, so there is no mid-query cancel
-  point to interrupt). The `test_cancel_safe_*` failures are a psycopg
-  test-harness socket-proxy issue on this machine, not a server behaviour.
+- [x] **CancelRequest handling — SHIPPED (verified 2026-08-27).**
+  (`test_generators::test_cancel`, and the environmental `test_cancel_safe_*`
+  "proxy didn't start listening: Errno 22" harness failures.)
+  ~~The v3 CancelRequest startup packet is parsed but not acted on (statements
+  run synchronously, so there is no mid-query cancel point to interrupt).~~
+  **That was stale.** Reproduced 2026-08-27: `cancel_safe()` against a running
+  `pg_sleep` raises `57014 QueryCanceled`, and the connection stays usable
+  afterwards (cancel is not terminate). `tests/test_pgserver_cancel.py` covers
+  the wire sub-protocol, `pg_cancel_backend`, and the `pg_sleep` / per-row /
+  FROM-less cancellation points; pgx's cancel cluster rides it. The
+  `test_cancel_safe_*` failures remain a psycopg test-harness socket-proxy
+  issue on this machine, not a server behaviour.
 - [ ] **Reject connections to non-existent databases (`test_pgconn_error`,
   `test_connect_bad`).** SecantusDB creates a database on demand (the
   ephemeral-db model shared with the Mongo server), so connecting to
@@ -2435,19 +3939,486 @@ shared storage engine or building large new protocol subsystems:
   client-abort detection during a streamed COPY OUT.
 - [ ] **`test_return_untyped[b]` / DatatypeMismatch.** A binary untyped
   parameter used in a context that PG rejects with 42804 — niche.
-- [ ] **Schema-qualified tables** (`CREATE TABLE testschema.t (…)`) — CREATE
-  SCHEMA and schema-qualified user *types* landed; tables in a user schema
-  still raise. Needs the (db, coll) storage key to carry the schema (or a
-  dotted-collection mapping like the types take).
-- [ ] **HAVING general-shape residual**: the HAVING lowerers now cover
-  comparisons, `IS [NOT] NULL` (incl. computed group-key operands),
-  `[NOT] IN` over group keys, and always-unknown NULL-operand folds — but any
-  shape outside those still raises `0A000`. The systemic fix is a
-  HAVING-residual route mirroring the WHERE probes (the group-window paths
-  already carry `residual_having` for subqueries).
-- [ ] **Multi-way comma-join performance**: sqllogictest `select4.test`/`select5.test`
-  4-way joins with equi-WHEREs exceed 300s — the pipeline nests `$lookup`s without
-  pushing the WHERE's equi-conditions into the lookup stages.
+- [ ] **Write-conflict retry semantics (40001 under contention)**: concurrent
+  writers to the same row surface WiredTiger's optimistic write conflict as a
+  PG-SERIALIZABLE-style `40001 could not serialize access` instead of real
+  PG's READ COMMITTED block-and-proceed. Clients that retry (pgbench 15+
+  `--max-tries`, retry-loop applications) behave correctly; ones that treat
+  40001 as fatal abort. A server-side fix means statement-level replay after
+  waiting out the competing transaction (WT invalidates the whole txn on
+  conflict, so the user transaction's prior statements must replay too).
+  Until then the sql-stress smoke keeps its write lanes single-client.
+- [ ] **pgjdbc gauge — remaining clusters** (`invoke validate-pgjdbc`, 93.7%
+  over the `jdbc2` package — 5183 P / 347 F / 28 S,
+  `docs/validation-report-pgjdbc.md`; was 89.7%). Read the per-message counts
+  off the JUnit XML in `vendor/pgjdbc/pgjdbc/build/test-results/test/*.xml`
+  rather than eyeballing class totals — the report lists test ids only, and
+  attributing a class's failures to the wrong cause once already cost a
+  feature that fixed nothing here. Remaining, largest first:
+  - **No implicit transaction around a pipelined batch** (64,
+    `BatchFailureTest`) — **root cause found, fix written and proven, but it
+    cannot ship yet.** Postgres treats every message between two Syncs as one
+    transaction when no explicit block is open, so a batch is all-or-nothing.
+    We commit each Execute independently, so a batch that fails partway leaves
+    its earlier rows behind while pgjdbc — correctly — reports every statement
+    as `EXECUTE_FAILED` (the update-count array is all `-3`). The client's view
+    and the table's contents then disagree, which is what the test asserts on.
+    Reproduce in ten lines with psycopg's `pipeline()`: insert two good rows, a
+    duplicate key, then another good row, and compare. Real PostgreSQL 14.13
+    keeps only the pre-existing row; we keep the two good ones as well.
+
+    The fix is an implicit transaction in `pgextended.ExtendedSession`: open it
+    on the first Execute when `session.txn_handle is None`, commit it at Sync,
+    roll it back if anything since the last Sync errored, and hand ownership
+    over if an explicit BEGIN arrives (psycopg depends on a BEGIN surviving
+    Sync). A working implementation — pipelined rollback, successful-batch
+    commit and explicit transactions all verified against real PG — is kept at
+    `scratchpad/implicit-txn-attempt.py`.
+
+    **It is blocked on the write-conflict item above.** The implicit
+    transaction spans a network round trip, so two connections doing ordinary
+    concurrent autocommit writes now overlap inside WiredTiger, which aborts
+    where Postgres blocks. That turns five `tests/test_pgserver_concurrency.py`
+    tests (`test_concurrent_nextval_never_repeats`,
+    `test_autocommit_computed_updates_lose_no_increments`, the two
+    single-winner race tests, and the dual-protocol stall test) into `40001`
+    failures. Trading a batch-semantics divergence for broken concurrent
+    autocommit writes is the worse deal, so this waits for block-and-retry
+    write-conflict handling and should land immediately after it.
+  - ~~**`_pg_expandarray`** (28, `UpdateableResultTest`)~~ — RESOLVED
+    (2026-08-15, #904): select-list record SRFs (bare composite + immediate
+    `(SRF(x)).n` field access, lockstep multi-reference expansion),
+    `(col).field` in JOIN ON, and search_path-aware `pg_table_is_visible`
+    (the WHERE lowering hardcoded the default namespaces, hiding every
+    user-schema relation after `SET search_path`). Both pgjdbc metadata
+    queries (getPrimaryKeys / getPrimaryUniqueKeys) run verbatim.
+    UpdateableResultTest's four residuals are separate features: datetime
+    micros-vs-millis (BSON millisecond ceiling — now documented in
+    `docs/sql.md` "Precision ceilings" alongside the Decimal128 34-digit
+    numeric ceiling; both are permanent divergences, not fixable bugs),
+    serial RETURN_GENERATED_KEYS, oid-column updatability, and the two
+    metadata classes' setup blockers (`COMMENT ON FUNCTION`, composite
+    `CREATE TYPE`) — the setup blockers themselves are now fixed.
+    BatchDeadlockTest is green (8 pass, 8 upstream-`@Disabled` skips) —
+    the old 6F cleared with the pipeline implicit-transaction work.
+  - ~~**`relation "" does not exist`** (73)~~ — FIXED. It was pgjdbc's
+    `TypeInfoCache` type-lookup query, and reduced to two independent bugs,
+    both now closed (`JOIN … USING` cross-joining, and an SRF usable only as
+    the sole FROM item). Clearing it took `PGObjectGetTest`,
+    `PGObjectSetTest`, `GeometricTest` and `SearchPathLookupTest` with it and
+    moved the gauge 92.5% → 93.7%. One divergence from that work remains:
+    - ~~**`SELECT *` over a `USING` join does not merge the joined column.**~~
+      RESOLVED (2026-08-14): `planner.expand_using_star` rewrites the lone
+      star into the merged column list BEFORE `desugar_join_using` erases the
+      USING marker — one site, not a dozen. `tbl.*` over joins (which
+      crashed) expands via `expand_table_stars`. Pinned by
+      `tests/test_sql_join_using.py::TestStarMerge`.
+    Multi-entry `search_path` resolution landed separately and moved none of
+    these.
+  - ~~**`pg_type` has no array-type rows.**~~ RESOLVED (2026-08-14): every
+    type with a `typarray` gets the paired array row (`_<name>`, `typelem`
+    back-pointer, `typinput = array_in`); `typelem` column added; `::regproc`
+    strips the schema like PG (planner + scalar cast paths). EnumTest's
+    enum-array resolution works; cross-checked green on the psycopg/pg8000
+    local suites. Named residuals, all separate features: pgjdbc
+    `enumArrayArray` (nested enum-array resolution returns no rows — needs
+    the exact TypeInfoCache query captured), `testNonStandardBounds`
+    (negative array subscripts `intarr[-1]` unsupported in the planner),
+    `testUnknownArrayType` (fails beyond the now-present `relacl` — next
+    probe is the exact metadata query). Original entry:
+  - **`pg_type` has no array-type rows.** `typarray` on a scalar type points
+    at an oid (int4 → 1007) that has no row of its own, so a driver resolving
+    an array type by oid finds nothing. `typinput` now exists and reports
+    `array_in` for any `_`-prefixed typname, so the standard
+    `typinput = 'pg_catalog.array_in'::regproc` array test will work the day
+    those rows appear — but nothing currently matches it. Note that
+    `::regproc` does not strip the schema the way real Postgres does; that
+    only becomes observable once array rows exist, and both should be fixed
+    together. Widening `pg_type` touches every gauge that reads the catalog
+    (psycopg especially), so measure across gauges, not just pgjdbc.
+  - **Metadata classes, revealed by the setup unlock (2026-08-16)** —
+    ResultSetMetaDataTest is now a clean 60/60 (STRUCT oids + base-column
+    identity + declared typmods, PR #920). DatabaseMetaDataTest's setup
+    is fully unblocked (pg_description DML + operator DDL + PK USING
+    INDEX + composite arrays + OUT-param arity): 74 pass, 82F across 18
+    clusters (2026-08-16 run), biggest first: MaxIndexKeys via missing
+    `pg_am`/`pg_settings` catalog data (18F, kills all FK metadata);
+    assorted boolean asserts needing per-test triage (16F);
+    **FK metadata queries** — getImportedKeys' 9-way comma-join FIXED:
+    comma-joins are now keyed from WHERE equalities (was a 13-min hang /
+    zero rows, then ~16s, then a 183GB OOM once the class ran past the
+    #944 setup regression — now completes in ms), plus a hard per-stage
+    materialization cap that surfaces 54000 instead of OOMing on any
+    residual cross product;
+    `pg_proc.proargmodes` column (6F); quoted-uppercase output aliases
+    like `"TABLE_TYPE"` erroring instead of resolving (6F + 4F
+    "DATA_TYPE" — likely one alias-resolution bug); COMMENT ON TYPE (6F)
+    and COMMENT ON INDEX (2F) unsupported; `pg_class.reltuples` column
+    (4F); ACL reflection: getTablePrivileges for tables/views/matviews
+    FIXED (relowner→role oid + relacl materialization); the remaining ACL
+    piece is **columnPrivileges** (2F) — getColumnPrivileges over the
+    system catalog `pg_statistic`, which needs pg_statistic modeled as a
+    queryable relation with columns in pg_class/pg_attribute;
+    domainColumnSize FIXED (domain pg_type carries the base type's
+    typtypmod/typbasetype; int-domain's 10 is int4's fixed precision,
+    already right); customArrayTypeInfo FIXED (composite column oids +
+    collision-avoiding array type names); indexInfo
+    mixed expression+column multi-key index (2F); catalogs list missing
+    "postgres" (2F); pg_get_keywords() in-context (2F);
+    getColumnsCharOctetLength (2F); ALTER TABLE DROP of a quoted
+    ``"name"`` column mis-parsed as `DROP name` (2F).
+    RefCursorTest is 8/8 after the plpgsql OPEN/refcursor slice;
+    RefCursorFetchTest: aggregates over SRF row sources now work
+    (sum/string_agg/array_agg over generate_series, incl. in scalar
+    subqueries), but the class's seeding INSERT still fails one layer
+    deeper — its string_agg ARGUMENT is
+    `lpad(to_hex(width_bucket(random(),0,1,256)-1),2,'0')` and
+    `_agg_arg_to_expr` can't compile lpad/to_hex/width_bucket/random
+    into pipeline expressions ("unsupported array_agg argument").
+    Either extend the pipeline expression vocabulary or evaluate
+    aggregate args per row in Python on the derived path.
+  - **AutoRollbackTest savepoint/autosave semantics** (~24): `autosave`
+    modes and `flushCacheOnDeallocate` / `DEALLOCATE ALL` behaviour around
+    failed statements in a transaction.
+  - **StatementTest / PreparedStatementTest residuals (2026-08-15)** — the
+    grabbag slice fixed dollar quotes, nested comments, non-standard
+    strings, the `{fn}` scalar surface, stable `now()`, CTAS, and
+    TRUNCATE qualification. Still failing, each a separate feature:
+    `parsingSemiColons` (CREATE RULE — rewrite rules unimplemented);
+    `warningsAreAvailableAsap` / `closeInProgressStatement(Protocol32)` /
+    `concurrentWarningReadAndClear` (mid-statement NOTICE streaming +
+    blocking LOCK TABLE + plpgsql FOR; the Protocol32 variant additionally
+    needs NegotiateProtocolVersion for a 3.2 StartupMessage);
+    `setQueryTimeout{,WithSleep,OnPrepared}` (query cancel — a parallel
+    session's cancel-request worktree owns this; this slice deliberately
+    backed out its own overlapping implementation);
+    `testDoubleQuestionMark` (`?-` prefix / `?#` infix geometric operators
+    — sqlglot can't tokenize either, needs a parser extension, and the
+    `lseg '...'` / `box '...'` typed-literal prefix syntax doesn't parse
+    outside `point`);
+    `testNumeric` (1000-digit numerics exceed Decimal128's 34 significant
+    digits — a storage-representation ceiling, cast/round-trip truncates);
+    `testUnknownSetObject` (extended-protocol strictness: a varchar-typed
+    param inserting into an interval column must raise 42804; our insert
+    coercion doesn't see the param's declared OID);
+    `testSetObjectBigDecimalWithScale` (was the TRUNCATE qualifier bug —
+    expected fixed by this slice, verify on the next gauge run).
+  - ~~**Large objects** (11, `BlobTest`)~~ — FIXED (the `pg-large-objects`
+    slice): the Fastpath sub-protocol + `lo_*` built-ins landed
+    (`secantus/sql/largeobjects.py`), plus the surrounding pieces pgjdbc's
+    callable shape needs (UDF-in-FROM typed by declared return type,
+    describe-without-executing, void-arg drop, plpgsql `RAISE`, `lo_manage`
+    accepts). `BlobTest` 28/28, `BlobTransactionTest` 1/1, `CallableStmtTest`
+    14/14, `CleanupSavepointsWithFastpathTest` 10/10 — all four were zeroed
+    before. Known divergences, deliberately accepted:
+    - **LO descriptors close at session end, not transaction end** (PG closes
+      them at commit/rollback). No gauge test distinguishes the two.
+    - **`lo_manage` trigger DDL is an inert no-op** — replaced large objects
+      are never unlinked by the trigger (nothing vacuums orphans here anyway).
+      Every other `CREATE TRIGGER` stays rejected.
+    - **`lo_import` / `lo_export` are absent** (server-side file I/O; nothing
+      drives them over the wire in the gauges).
+  - ~~**DateTest date offsets** (21)~~ — FIXED across several slices; now
+    **192/192** (re-measured 2026-08-12) — see the dedicated section below; the
+    shape is now measured rather than guessed at.
+  - **`bind parameter $N has no value`** (8, BatchedInsertReWrite): pgjdbc's
+    insert-rewrite batches leave a parameter unbound on a re-written statement.
+  - ~~**`internal error`** (13)~~ — FIXED (gauge 5311 P / 219 F / 28 S =
+    **96.04%**, measured after the fix; `BatchedInsertReWriteEnabledTest`
+    16 → 4 failures, `BatchFailureTest` 64 → 48). Every one was a crash that
+    dropped
+    the connection rather than returning a usable message, and each collapsed
+    to a small independent cause once the failing *statement* was paired with
+    the traceback (see "Capture the statement behind the error" below — the
+    same technique that cracked the earlier clusters):
+    - 16-bit protocol **count** fields (parameter / column counts) were read
+      *and written* as signed. Postgres allows 65535 parameters per Bind and
+      pgjdbc's rewritten batches really do send tens of thousands; above 32767
+      the count came back negative and walked the parse offset backwards
+      (`not enough data to unpack 4 bytes at offset -2`). Genuinely-signed
+      fields — attnum, type size, format codes — stay `_INT16`.
+    - Geometric types had **no binary parameter decoder**, so a `point` / `box`
+      / `polygon` sent in the binary format reached the *text* parser as raw
+      bytes. Decoders for all seven now exist.
+    - `line` could not be parsed even as text: its canonical form is three
+      coefficients `{A,B,C}`, and the branch handling it sat *after* the
+      coordinate-pair parse it could never survive — dead code.
+    - `time ± interval` had no overload at all (`str + dict`).
+    - Interval arithmetic in a WHERE was lowered into a Mongo `$expr`, which
+      has no interval type; the cast was silently dropped and `$multiply` got
+      the raw literal text. Interval casts now refuse to lower, so the
+      predicate falls back to per-row scalar evaluation.
+    Two further defects surfaced in the same blast radius and are also fixed:
+    - **Binding N parameters was `O(N**2)`** — sqlglot re-parents every sibling
+      on each `Expression.replace`. A 40000-parameter statement took over two
+      minutes, so the batch tests unblocked above would have *timed out*
+      instead of crashing. Now linear (0.38s). Pinned by
+      `test_sql_planner.py::test_substitute_parameters_scales_linearly`.
+    - The `pg_class` / `pg_attribute` / `pg_attrdef` / `pg_description` /
+      `pg_index` builders **enumerated the table list twice** — once to assign
+      OIDs, once to emit rows — so a table created by another session in
+      between raised `KeyError` mid-scan. `virtual._tables_with_oids` is the
+      single-snapshot accessor they all use now.
+    A second measured pass caught two the first had *moved* rather than fixed:
+    `timetz ± interval` had no overload either (only bare `time` did), and once
+    the interval predicate correctly stopped being pushed down, comparing the
+    `date` column against the computed timestamp raised `TypeError` one step
+    further in — a stored `date` is ISO text, and Postgres promotes it to
+    midnight. Both fixed (verified directly; gauge re-measure below). The lesson is the
+    obvious one: re-measure after the fix, because "the crash moved" looks
+    exactly like "the crash is gone" from the code side.
+    Separately, `'23:59:60'::time` stored the literal second 60, which nothing
+    downstream could parse — so `time - time` *already* crashed the same way.
+    It now carries forward to `24:00:00` as Postgres does, and time arithmetic
+    goes through `datetimes.time_micros` because that boundary value does not
+    fit in a Python `datetime.time`.
+- [ ] **OPEN — Cross-connection async NOTIFY — WORKS; only the pgjdbc re-run is
+  outstanding.** Measured 2026-08-18: with one psycopg connection blocked in
+  `notifies()` (both the timeout form and the endless form, which is what
+  pgjdbc's `NotifyTest` uses), a `NOTIFY` on a second connection IS delivered.
+  `NotifyHub.notify` fans out to every listening session's queue and
+  `pgserver._read_next_message` polls listeners on a 0.25s `select` slice and
+  flushes them — the "needs to fan out and wake a blocked reader" work this
+  entry described is done (the `select`-based poll from #882 is what closed
+  it). `NotifyTest` stays excluded from the pgjdbc gauge only because it has
+  never been re-run since: if it did still hang, a JUnit timeout cannot
+  interrupt that socket read and it would wedge the weekly gauge. Closing this
+  is one gauge run — drop the `EXCLUDE_CLASSES` entry and run
+  `pgjdbc_validation.runner`.
+- [x] **pgtest gauge — CAMPAIGN COMPLETE.** `docs/validation-report-pgtest.md`:
+  **49/66 files pass, 12 expected divergences, ZERO unexpected failures**
+  (5 skipped), from 43 unexpected failures when the campaign started
+  2026-08-16. Every file that does not pass is a documented crdb-vs-PG conflict,
+  each with its reason inline in `pgtest_validation/include_paths.py`.
+
+  The divergences fall into two kinds, and neither is fixable without making
+  SecantusDB *less* faithful to PostgreSQL:
+
+  * **crdb internals pinned by the corpus** — `char` (crdb's deterministic
+    TableOID), `int2vector` (crdb's NULLS-FIRST pkey indoption), `procedure`
+    (crdb's NoticeResponse `File`/`Routine` = `builtins.go`/`func401`; real PG
+    emits `exec_stmt_raise`/`pl_exec.c`, probed), `portals` and `typing`
+    (`keepErrMessage` pinning crdb's error wording where PG's differs).
+  * **crdb-only surface** — `row_description`'s `::STRING` casts (PG: `42704`),
+    `jsonpath`'s binary form, and the extension types `spatial` / `box2d` /
+    `pgvector`.
+
+  Fixes that landed along the way, in order: 25P02 aborted-transaction rules,
+  binary-param error classes, batch/segment parse, portal lifetime + snapshots,
+  citext, COPY, decimal, enum, execute, float4, error fields, inet, cached-plan
+  revalidation at Bind, base-column identity across joins/views/retypes,
+  parameter-type resolution at Parse, timetz sub-minute offsets, `void`, `set`,
+  `varbit`, `unknown`, row constructors, and CREATE PROCEDURE / CALL.
+
+  **Note for re-runs:** drive the runner directly —
+  `PYTHONPATH=. .venv/bin/python -m pgtest_validation.runner` then
+  `... -m pgtest_validation.generate_report .validation/pgtest-raw.json
+  docs/validation-report-pgtest.md`. `invoke validate-pgtest` spawns the daemon
+  without `PYTHONPATH` and dies with "pg daemon did not become ready within
+  15s" (the same wrapper issue the psycopg gauge has).
+
+
+- [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
+  **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,
+  from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn campaign
+  (#866 #868–#871 #873 #876 #877 #885 #891 #901). Every package is at its
+  ceiling: `pgconn` 99.0% (0 stable failures — the 2 failure entries are
+  the single load-sensitive `TestDeadlineContextWatcherHandler` family,
+  documented in the pgconn findings section), `pgproto3` / `bgreader` /
+  `ctxwatch` 100%. Remaining work is only the load-sensitivity
+  re-measurement on a quiet machine.
+- [ ] **Sub-millisecond timestamps — READS are precise; PREDICATES are not.**
+  BSON has no sub-ms date (a date is int64 milliseconds; `Timestamp` is
+  seconds+ordinal, an internal replication type), so the remainder is stored
+  beside the date in a hidden `__us_<field>` companion — see
+  `src/secantus/sql/subms.py` and the "Sub-millisecond timestamps" section of
+  `docs/sql.md`. INSERT / UPDATE / SELECT / RETURNING round-trip microseconds,
+  `SELECT *` and reflection hide the companion, and every write resolves it (a
+  whole-millisecond UPDATE *removes* it — a stale remainder would report a time
+  that was never stored).
+
+  **Still open, in rough order of value:**
+  1. **Predicates — FIXED 2026-08-27.** Comparisons now lower against both the
+     truncated field and the `__us_` companion (`subms.cmp_filter`, wired into
+     the planner's EQ / NEQ / range sites), so `=`, `<>`, `<`, `<=`, `>`, `>=`
+     are microsecond-exact. Verified against a **live PostgreSQL 14** across 42
+     predicate/literal combinations over 8 rows — zero divergence — and pinned by
+     `test_subms_predicates_match_real_postgres`, which skips when no server is
+     reachable. Note `tests/test_sql_subms_timestamps.py` previously carried
+     `test_comparisons_remain_millisecond_blind`, which pinned the limitation
+     "so it stays visible" and thereby pinned two *wrong answers*; it is now
+     `test_comparisons_are_microsecond_exact`. **ORDER BY — FIXED 2026-08-29**,
+     and it was two code paths, not one: the plain-column sort key
+     (`_order_key_fn`) and the projected-expression scope (`ORDER BY 2`,
+     DISTINCT ON, and anything evaluated through `_expand_srf`). The second
+     never went through the read-side merge at all, so `SELECT id, t … ORDER BY
+     2` also *returned* truncated times — an ordering bug hiding a value bug.
+     Both now read through one `_subms(doc, field)` helper. Six shapes verified
+     against the live PostgreSQL 14 (plain / DESC / alias / ordinal /
+     DISTINCT ON / LIMIT); 7 tests, all of which fail with the fix reverted.
+     Note LIMIT and DISTINCT ON returned wrong *rows*, not merely wrong order.
+     Original note follows.
+     ~~Predicates are millisecond-blind — and wrong in BOTH directions.~~
+     Measured 2026-08-27 against a stored `…00.123456`: `WHERE t = '…123456'`
+     matches nothing (false negative — a row fails an equality on its *own
+     stored value*), **and `WHERE t = '…123'` matches it** (false positive — it
+     matches a value it is not equal to), and `WHERE t > '…123'` misses it.
+     `>= '…123'`, `> '…122'` and `< '…124'` are correct. This is silent wrong
+     *results*, not only lost precision, which is a higher severity than the
+     original wording implied. Original note: `WHERE t = '…123456'` matches nothing
+     and rows inside one millisecond sort arbitrarily — unchanged from before
+     the companion existed (verified against `main`), but now the fix is
+     possible: lower a comparison against BOTH fields
+     (`{t: <trunc>, __us_t: <rem>}` for equality; an `$or` of "later
+     millisecond" OR "same millisecond and larger remainder" for ranges) and add
+     the companion as a sort tiebreaker (missing sorts lowest, which is 0 — the
+     right answer).
+  2. **Pipeline-shaped reads truncate.** GROUP BY / JOIN / DISTINCT read a
+     *projected* document, and the companion was never projected. Each `$project`
+     the planner builds would need to carry it, and a GROUP BY on a timestamp
+     would need it in the group key to avoid merging rows that differ only in
+     microseconds.
+
+     **min / max / ordered aggregates — FIXED 2026-08-29.** These are pipeline
+     accumulators, so no Python-side change reached them: `min(t)` answered
+     `.123000` for a stored `.123456` — a timestamp that was never stored, not
+     merely a lost ordering. They now accumulate a sortable composite
+     `{__subms_d, __subms_u}` (`subms.composite_expr`, defaulted with `$ifNull`
+     so a whole-millisecond row is still comparable) which the executor merges
+     back. Covers `min` / `max` including `FILTER`, and the `{v, k}` ordered
+     push behind `array_agg(x ORDER BY t)` / `string_agg`, on both the
+     single-table and join paths.
+
+     **HAVING had to move with it, and this is the part worth remembering.**
+     `HAVING min(t) > '…'` compares against the accumulator's output, so a
+     composite there needs the LITERAL lowered to the same shape
+     (`subms.composite_cmp_filter`). Without that the composite *regressed* the
+     one HAVING shape that used to work — `min(t) = '…122000'` was right only
+     because its literal happened to land on a whole millisecond. Measured
+     before and after across five operators: 3 were already wrong, 1 was right
+     by luck, and all 5 are right now. A fix in this area must re-measure
+     HAVING, not assume it.
+
+     **GROUP BY — FIXED 2026-08-29.** The group key was the truncated date, so
+     rows differing only in microseconds merged: three distinct times became two
+     groups, `count(*)` answered 3 where PG answers 2 and 1, `sum(id)` answered
+     6 where PG answers 4 and 2, and the emitted key was `.123000` — a time no
+     row held. So the aggregate VALUES were wrong, not just the key. The
+     `$group` `_id` now carries the composite (`_group_key_expr`, applied at the
+     four table-resolved and two join-resolved sites) and the executor unwraps
+     it one level into `_id`. **HAVING over a group key needed the same literal
+     lowering** as the min/max case — the gate is now "min/max accumulator OR
+     group-key column". Eight grouped shapes measured against PG: all eight were
+     wrong before, all eight right now.
+
+     **DISTINCT — FIXED 2026-08-29, and it was two routes.** `SELECT DISTINCT`
+     dedups on the PROJECTED value and the projection dropped the companion, so
+     two rows at `.123100` / `.123500` came back as ONE reading `.123000` — both
+     halves of the bug at once. The projection now emits the composite
+     (`_plan_distinct_select`, both the star and named-column branches) so the
+     dedup `$group` and the following `$sort` both see microseconds.
+     Separately, **`count(DISTINCT t)` was a FIFTH path**: an `$addToSet` whose
+     set held truncated dates, so it answered 2 for three distinct values;
+     `_register_distinct_agg` now collects the composite.
+
+     **This class is now closed across all five routes.** 39 shapes measured
+     against the live PostgreSQL 14 across four probes (read/ORDER BY,
+     accumulators, group key, DISTINCT) with zero divergences. The recurring
+     lesson: each route was invisible from the others, and each fix reached
+     exactly one of them — `scope` did not reach the accumulators, the
+     accumulators did not reach the group key, the group key did not reach
+     DISTINCT, and DISTINCT did not reach `count(DISTINCT …)`. A sixth is
+     possible; probe before claiming otherwise.
+
+  3. **COPY and the Rust server** don't write the companion — they truncate, as
+     before. Not wrong, just not precise.
+
+
+- [x] **HAVING general-shape residual — DONE.** Any shape the `$match` lowerer
+  can't express now falls back to the per-grouped-row residual route the
+  HAVING-subquery case already used, instead of raising `0A000`: the plain
+  group planner re-plans through `_plan_group_window_select` on a 0A000 (on a
+  pristine copy — planning mutates the tree), and the group-window planner
+  catches it inline. Only 0A000 falls back; a real user error (42803 "must
+  appear in the GROUP BY clause") still surfaces. Nine of ten surveyed shapes
+  used to fail — `NOT (...)`, `BETWEEN`, `count(*) * 2`, `sum(n) + count(*)`,
+  `abs(sum(n))`, `CASE`, `coalesce`, `max - min`, `count(*)::text` — and all
+  ten now match PostgreSQL 14 row for row.
+- [x] **`char(n)` / `varchar(n)` declared length — ENFORCED.** An over-length
+  value now raises `22001 value too long for type character varying(3)` /
+  `character(3)` on INSERT and UPDATE, instead of being stored intact (a column
+  holding data that violates its own declared schema). Trailing-blank overflow
+  is trimmed rather than refused, matching PostgreSQL 14 (`'abc  '` into
+  `varchar(3)` stores `'abc'`; `'abcd'` is refused) — `typemap.enforce_declared_length`.
+  The `octet_length()` note that sat here turned out to understate the problem:
+  `octet_length` and `bit_length` were dispatched to the BIT-STRING
+  implementations for EVERY input, so `octet_length('abc')` answered
+  `(3+7)//8 = 1` and `bit_length('abc')` answered 3 (PG: 3 and 24). Both now
+  measure encoded bytes for text and keep the bit semantics for bit values.
+  Still open, and genuinely narrow: `octet_length()` on a `char(n)` returns the
+  unpadded count (4 in PG for `'xy'::char(4)`) because padding is applied at
+  render, not in storage — the scalar evaluator has no access to the declared
+  width; and `char(n)[]` elements are not padded.
+
+
+- [x] **`::STRING` — WON'T FIX, and here is why.** The crdb type alias parses
+  and behaves as `text`, where PG raises `42704 type "string" does not exist`.
+  Rejecting it is not worth doing: sqlglot normalises `STRING` to `TEXT` at
+  parse time, so by the time the planner sees the cast it is indistinguishable
+  from a real `::text` — detecting it would mean sniffing the raw SQL string,
+  which is fragile (a column named `string`, a literal containing `::STRING`)
+  for a spelling no PostgreSQL client emits. The only thing that asks for it is
+  crdb's own corpus, which is already a recorded divergence
+  (`row_description`). Accepting a non-PG alias is a permissiveness, not a
+  wrong answer.
+
+
+- [x] **Casts to text — the predicate path is closed too.** `_eval_cast`
+  converts int / float / Decimal / **Decimal128** / bool to Postgres' text
+  spellings, and a WHERE comparing a cast-to-text now routes to per-row
+  evaluation (`_where_has_text_cast_comparison`) instead of pushing a filter
+  that compared the raw stored value — `WHERE n::text = '2'` matched NOTHING
+  before. Decimal128 mattered specifically because `numeric` is stored as one,
+  so `WHERE d::text = '2.50'` was comparing a Decimal128 against a string.
+  `interval::text` is fixed too — it used to hand the client our INTERNAL
+  subdocument (`{"interval": {"months": 0, "days": 1, ...}}`) instead of
+  Postgres' `1 day`; it now renders through `intervals.render`, the same path
+  the wire layer uses for an interval column. `bit::text` was already correct.
+  Still unconverted: geo and other composite targets.
+
+
+- [ ] **OPEN — Multi-way comma-join performance — much improved, `select4`/`select5`
+  still over the 300s cap.** Two pushdowns landed (see
+  `_push_single_table_predicates` / `_key_comma_joins_from_where`):
+
+  1. **Single-table WHERE conjuncts move to the stage that produces their rows**
+     — a bare key into a `$match` ahead of the first `$lookup`, an
+     `<alias>.<path>` key into that `$lookup`'s sub-pipeline, and an operator
+     subtree (`$or`) when every field it touches is one table's. A top-level
+     `$and` is flattened first: any WHERE containing an OR arrives as ONE
+     `{"$and": [...]}` key, which read as table-spanning and blocked every
+     conjunct beside it. Measured on 3 tables with one constant each: was cubic
+     in table size (27k-row product 0.09s, 216k 0.56s, 1M 2.53s), now flat —
+     a 343M-row product answers in 0.01s.
+  2. **Unqualified cross-table equalities now key the comma joins.**
+     `_key_comma_joins_from_where` only matched `c.this.table`, and the corpus
+     writes `WHERE a3=b9`, not `t3.a3=t9.b9` — so every comma join stayed
+     unkeyed and became a cartesian product. It now resolves an unqualified
+     column to its owning alias through the catalog (unambiguous names only) and
+     qualifies the relocated ON.
+
+  **Not sound to push into a LEFT join's lookup** — WHERE runs after the join, so
+  a predicate on the right table must delete the outer row; only an alias whose
+  `$unwind` is non-preserving is eligible. Verified against PostgreSQL 14 across
+  11 shapes incl. the LEFT-join traps and a cross-table OR.
+
+  **Remaining:** both files now run instead of failing fast, but still exceed the
+  runner's 300s cap (`select4` reached the 5M-doc guard on a 6-way join before
+  the OR push; both now time out). The queries are well-constrained — the 6-way
+  one expects 30 values — so what is left is the join *strategy*: unkeyed
+  lookups materialise their whole foreign side per outer row. Index-backed or
+  streaming lookups are the next step, not more predicate motion. They stay out
+  of `slt_validation` INCLUDE until then.
 
 - [ ] **Wire server: simple + extended protocol, trust + SCRAM auth, optional TLS.**
   `pgserver.py` speaks v3 startup, simple `Query` (P1), extended `Parse`/`Bind`/
@@ -2482,7 +4453,7 @@ shared storage engine or building large new protocol subsystems:
   resolver matches on sampled columns — qualify it as `alias.field`, or it must appear in the
   50-doc sample); type inference samples 50 docs and picks the first non-null type per field (no
   widening across conflicting types — first-seen wins).
-- [ ] **jsonb operator surface landed (one gap + one parser quirk).** Containment/existence
+- [ ] **OPEN — jsonb operator surface landed (one gap + one parser quirk).** Containment/existence
   operators in WHERE compile to Mongo filters: `@>` (object → dotted-path equalities, array →
   `$all`, scalar → equality), `?` / `?|` / `?&` (key-or-element existence via `$exists` + array-aware
   equality). `jsonb_build_object` / `jsonb_build_array` / `jsonb_array_length` / `jsonb_typeof`
@@ -2509,7 +4480,7 @@ shared storage engine or building large new protocol subsystems:
   pipeline) and the base-less `SELECT jsonb_each(x)` composite form. **Parser quirk:** sqlglot reads
   a bare `f(a->'k')` arrow as a lambda, so a navigated *function argument* must be parenthesised
   (`f((a->'k'))`) or use `#>` (`f(a #> '{k}')`) — bare navigation in WHERE / projection is unaffected.
-- [ ] **Aggregate/JOIN path has gaps (P5 + later slices landed the core).** `GROUP BY` +
+- [ ] **OPEN — Aggregate/JOIN path has gaps (P5 + later slices landed the core).** `GROUP BY` +
   `HAVING` + `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, **multi-table** `INNER`/`LEFT JOIN` (equality
   `ON`, each join relating to the base or an already-joined table), **`SELECT DISTINCT`**
   (single-table and over a join), **and JOIN *combined* with GROUP BY / aggregates / HAVING /
@@ -2642,7 +4613,7 @@ shared storage engine or building large new protocol subsystems:
   `$reduce` in the group `$project` (`_string_agg_project`) that joins the pushed array skipping NULL
   elements (NULL when all-NULL) — wired into the single-table, join, and grouping-set planners with the
   routing predicates updated. Tests: `tests/test_sql_string_agg.py`.
-- [ ] **Regex / string scalar functions landed** (b129): `regexp_replace(src, pat, repl [,flags])`
+- [x] **Regex / string scalar functions landed** (b129): `regexp_replace(src, pat, repl [,flags])`
   (Python `re.sub`; `g` flag → global, `i`/`m`/`s`/`x` supported; PG `\&` whole-match → Python `\g<0>`,
   `\1`–`\9` pass through), `split_part(str, delim, n)` (1-based; negative counts from the end (PG14+);
   out-of-range → `''`), `translate(str, from, to)` (per-char map; extra `from` chars deleted),
@@ -2655,7 +4626,7 @@ shared storage engine or building large new protocol subsystems:
   yields every match, without it at most the first, and no match / NULL input yields no rows. The scalar
   path (`scalar.py`) is retained for a `regexp_matches` nested inside a larger expression or appearing
   alongside other projections (multi-target-list), where it still returns the first match's `text[]`.
-- [ ] **Math / numeric scalar functions landed** (b130): `trunc(x [,n])` (truncate toward zero;
+- [x] **Math / numeric scalar functions landed** (b130): `trunc(x [,n])` (truncate toward zero;
   numeric), `sqrt` / `cbrt` (real cube root via `copysign` so negatives work), `sign` (−1/0/1,
   operand kind preserved), `ln`, `log(x)` (base-10 in PG) / `log(b, x)` / `log10` (base-10/2 use the
   exact `math.log10`/`log2` so `log10(1000) == 3.0`), `exp`, `pi()`, `degrees`, `radians`,
@@ -2664,7 +4635,7 @@ shared storage engine or building large new protocol subsystems:
   Output types wired in `planner._infer_scalar_tag` (float8 for the transcendental/root funcs,
   numeric for trunc/sign/factorial, int8 for gcd/lcm). `mod` / `power` / `abs` / `ceil` / `floor` /
   `round` were already present.
-- [ ] **Composite types landed** (b131): `CREATE TYPE name AS (field type, …)` stores an ordered
+- [x] **Composite types landed** (b131): `CREATE TYPE name AS (field type, …)` stores an ordered
   `(field, type_tag)` list in the `__sql_composites__` catalog collection (`Catalog.create_composite`
   / `get_composite` / `composite_exists` / `drop_composite` / `list_composites`). A composite-typed
   column carries `composite_type` + `composite_fields` on its `Column` (resolved from the type at
@@ -2676,7 +4647,7 @@ shared storage engine or building large new protocol subsystems:
   record text literal `(f1,f2)` (`typemap._render_pg_composite`, RECORD oid 2249). Reflected via
   `pg_type` (`typtype = 'c'`, oid base 67000 in `virtual._composite_oids`). WHERE/UPDATE access and
   `pg_attribute` reflection landed in b134 (below). **Remaining limitation:** no nested composites.
-- [ ] **Composite type follow-ups landed** (b134): closed the b131 gaps. (1) `(col).field` in a WHERE
+- [x] **Composite type follow-ups landed** (b134): closed the b131 gaps. (1) `(col).field` in a WHERE
   predicate — `planner._composite_access_parts` (Paren-gated `Dot(Paren(Column), Identifier)` so a
   schema-qualified `pg_catalog.x` Dot is never misread) feeds `_field`/`_is_field_node`, lowering to a
   dotted Mongo path `col.field`. (2) UPDATE targets — `SET col.field = v` (`_composite_subfield_target`
@@ -2687,7 +4658,7 @@ shared storage engine or building large new protocol subsystems:
   row per field, so `pg_type.typrelid → pg_class.oid → pg_attribute.attrelid` resolves field names /
   oids (`psql \dT+`, SQLAlchemy). Added the `typrelid` column to the pg_type schema and `reltype` to
   pg_class.
-- [ ] **Nested composite types landed** (b139): a composite type whose own field is another composite,
+- [x] **Nested composite types landed** (b139): a composite type whose own field is another composite,
   closing the b134 gap. Composite field entries became recursive 3-tuples `(name, tag, subfields)` —
   `subfields` is None for a scalar field or the referenced type's fields for a composite field (embedded
   at `CREATE TYPE` time by `engine._composite_fields_from_schema`, which now takes `catalog`/`db` and
@@ -2705,7 +4676,7 @@ shared storage engine or building large new protocol subsystems:
   plus a pg8000 wire test. **Limitation:** pg8000's own record parser mis-splits a *doubly*-nested
   anonymous record on the wire (a client-side limitation — the emitted text is byte-exact Postgres);
   single-level composite fields decode cleanly.
-- [ ] **Statistical + bitwise aggregates landed** (b136): `stddev`/`stddev_samp`/`stddev_pop`,
+- [x] **Statistical + bitwise aggregates landed** (b136): `stddev`/`stddev_samp`/`stddev_pop`,
   `variance`/`var_samp`(=variance)/`var_pop`, and `bit_and`/`bit_or`/`bit_xor` (`every` already aliased
   `bool_and`). Added the dedicated sqlglot nodes to `planner._AGG_CLASSES` (via a version-tolerant
   getattr loop). stddev lowers to Mongo's native `$stdDevSamp`/`$stdDevPop` accumulators (newly
@@ -2720,7 +4691,7 @@ shared storage engine or building large new protocol subsystems:
   resolver), and `every()` is recognised as `bool_and` in `_join_aggregate_of`. **Limitations:**
   `every()`/`bool_and` still require a boolean **column** argument, not a boolean expression; a
   whole-table aggregate over an **empty** table returns no row (pre-existing, except `count`).
-- [ ] **Range types landed** (b137): `int4range`/`int8range`/`numrange`/`tsrange`/`daterange`. A new
+- [x] **Range types landed** (b137): `int4range`/`int8range`/`numrange`/`tsrange`/`daterange`. A new
   self-contained `secantus/sql/ranges.py` (build/parse/render/compare) stores a range as a subdocument
   `{"lower","upper","lower_inc","upper_inc"}` (or `{"empty": true}`); discrete types canonicalise to the
   half-open `[)` form (`(1,10]` → `[2,11)`). Wired through every layer: `typemap` (PG OIDs 3904/3906/3908/
@@ -2738,7 +4709,7 @@ shared storage engine or building large new protocol subsystems:
   SQL surface) and a pg8000 wire test. **Limitations:** the `@>`/`<@`/`&&` operators run a COLLSCAN
   per-row (no lowered Mongo filter / index); multirange types, range GiST indexes, and the extra range
   functions are unimplemented (**range algebra + multirange landed b140, below**).
-- [ ] **Range algebra + multirange landed** (b140): the range set operators and the `range_agg` aggregate
+- [x] **Range algebra + multirange landed** (b140): the range set operators and the `range_agg` aggregate
   + multirange types (`int4multirange`/`int8multirange`/`nummultirange`/`tsmultirange`/`datemultirange`).
   `ranges.py` gained `merge` (range_merge, spans gaps), `intersect` (`*`), `union` (`+`, raises if
   non-contiguous), `difference` (`-`, raises if it splits), `adjacent` (`-|-`), and a multirange layer
@@ -2763,7 +4734,7 @@ shared storage engine or building large new protocol subsystems:
   now unions `_RANGE_TAGS | _MULTIRANGE_TAGS`). Tests: `tests/test_sql_multirange_ops.py`. **Not yet:**
   `range_intersect_agg`, multirange extraction functions, range_agg over a JOIN or GROUPING SETS, and
   range GiST indexes.
-- [ ] **Full-text search landed** (b141): `tsvector` / `tsquery` types + `to_tsvector` / `to_tsquery` /
+- [x] **Full-text search landed** (b141): `tsvector` / `tsquery` types + `to_tsvector` / `to_tsquery` /
   `plainto_tsquery`, the `@@` match operator, and `ts_rank`. New self-contained `secantus/sql/fts.py`:
   `to_tsvector` → `{"tsvector": {lexeme: [pos, …]}}` (lower-cased tokens, English stop-words dropped, 1-based
   positions); `to_tsquery` (a recursive-descent parser over `& | !` + parens) / `plainto_tsquery` →
@@ -2782,7 +4753,7 @@ shared storage engine or building large new protocol subsystems:
   fixed english config, **no stemming** (`cats` ≠ `cat`), `ts_rank` is a match-count not cover-density;
   weights (`:A` / `setweight`), prefix (`cat:*`), phrase (`<->`), `ts_headline`, and GIN/GiST FTS indexes
   are out of scope.
-- [ ] **Network address types landed** (b142): `inet` / `cidr` / `macaddr` types, the `<<` / `>>` / `&&`
+- [x] **Network address types landed** (b142): `inet` / `cidr` / `macaddr` types, the `<<` / `>>` / `&&`
   subnet-containment/overlap operators, and the `host` / `masklen` / `network` / `netmask` / `broadcast` /
   `abbrev` / `family` / `hostmask` accessor functions. New self-contained `secantus/sql/net.py` stores values
   as canonical text (`inet`/`cidr` as `addr/masklen`, `macaddr` as `xx:xx:xx:xx:xx:xx`) and parses with
@@ -2798,7 +4769,7 @@ shared storage engine or building large new protocol subsystems:
   `tests/test_sql_net.py` (29: pure net + SQL surface) plus a pg8000 wire test. **Simplifications:** the `<<=`
   / `>>=` (contain-or-equal) operators aren't parsed by sqlglot, and `inet ± int` arithmetic, `macaddr8`, and
   GiST network indexes are out of scope.
-- [ ] **Bit-string types landed** (b143): `bit(n)` / `varbit` types, `B'…'` literals, the bitwise operators
+- [x] **Bit-string types landed** (b143): `bit(n)` / `varbit` types, `B'…'` literals, the bitwise operators
   `&` / `|` / `#` / `~` / `<<` / `>>`, `||` concat, and `length` / `bit_length` / `octet_length` / `get_bit` /
   `set_bit` plus `int`↔`bit` casts. New self-contained `secantus/sql/bitstr.py` stores values as a canonical
   '0'/'1' string; `normalize` pads/truncates, `from_int`/`to_int`, `band`/`bor`/`bxor`/`bnot`,
@@ -2815,7 +4786,7 @@ shared storage engine or building large new protocol subsystems:
   (declared length not tracked at storage — only explicit `::bit(n)` casts pad); a stored bit column can't be
   re-read via `::int` (only a `B'…'` literal or `::bit` cast is treated as a bit source); bit indexes are out
   of scope.
-- [ ] **Interval type landed** (b144): the `interval` type (stored as `{"interval": {"months", "days",
+- [x] **Interval type landed** (b144): the `interval` type (stored as `{"interval": {"months", "days",
   "micros"}}`), interval literals (`interval '1 day'` / `'1 year 2 mons 3 days 04:05:06'` / `interval '1'
   day`), interval/date arithmetic (`interval ± interval`, `interval * n`, `date ± interval`, `timestamp -
   timestamp -> interval`, unary `-`), and the functions `make_interval` / `justify_days` / `justify_hours` /
@@ -2831,7 +4802,7 @@ shared storage engine or building large new protocol subsystems:
   FROM-less interval funcs. Tests: `tests/test_sql_interval.py` (22: pure intervals + SQL surface) plus a
   pg8000 wire test. **Simplifications:** days are treated as 24h (no DST-aware arithmetic), the verbose `@`
   input grammar (beyond a trailing `ago`) isn't parsed, and interval indexes are out of scope.
-- [ ] **Full-text search follow-ups landed** (b145): prefix (`cat:*`), phrase (`foo <-> bar` / `foo <N> bar`),
+- [x] **Full-text search follow-ups landed** (b145): prefix (`cat:*`), phrase (`foo <-> bar` / `foo <N> bar`),
   `phraseto_tsquery`, and `ts_headline` added to `secantus/sql/fts.py`. The `_TSQueryParser` gained a
   `_parse_phrase` level (phrase binds between `&` and factor) and a `:*` prefix suffix; `matches` / `ts_rank`
   now walk token positions (`_end_positions` / `_phrase_positions` / `_count_hits`) so adjacency queries work
@@ -2843,7 +4814,7 @@ shared storage engine or building large new protocol subsystems:
   queries. Tests: `tests/test_sql_fts.py` (+14, now 33) plus a pg8000 wire test. **Simplifications:**
   `ts_headline` returns the whole document (no fragment windowing), and lexeme weights (`:A` / `setweight` /
   weighted `ts_rank`) remain out of scope (the tsvector stores no per-lexeme weight).
-- [ ] **UUID type landed** (b146): the `uuid` type + `gen_random_uuid()` / `uuid_generate_v4()` /
+- [x] **UUID type landed** (b146): the `uuid` type + `gen_random_uuid()` / `uuid_generate_v4()` /
   `uuid_generate_v1()` generators, uuid literals / casts (hyphenated, bare-hex, and `{braced}` forms all
   canonicalise to the lower-case hyphenated string), and equality / ordering that lower to a Mongo filter (no
   per-row eval — the value stores as its canonical string). New self-contained `secantus/sql/uuidtype.py`
@@ -2857,7 +4828,7 @@ shared storage engine or building large new protocol subsystems:
   SQL surface) plus a pg8000 wire test. **Simplifications:** only v4 (random) UUIDs are generated
   (`uuid_generate_v1` returns a v4, not a real time-based v1); no `uuid-ossp` namespace functions
   (`uuid_generate_v3` / `v5`).
-- [ ] **date / time / timetz distinct types landed** (b147): `date` / `time` / `timetz` are now distinct
+- [x] **date / time / timetz distinct types landed** (b147): `date` / `time` / `timetz` are now distinct
   types (previously `date` collapsed to `timestamptz`), reporting the correct wire OIDs (1082 / 1083 / 1266)
   for driver/ORM reflection. New self-contained `secantus/sql/datetimes.py` stores them as canonical text
   (`date` `YYYY-MM-DD`, `time` `HH:MM:SS[.ffffff]`, `timetz` with an offset) — BSON has no date-only /
@@ -2874,7 +4845,7 @@ shared storage engine or building large new protocol subsystems:
   plus a pg8000 wire test. **Simplifications:** `time(p)` precision isn't rounded, `timetz` preserves the
   literal's offset without converting, and mixing a bare `timestamp` with a `date` in one arithmetic
   expression isn't supported (cast one side).
-- [ ] **money type + to_char numeric formatting landed** (b148): the `money` type (OID 790, stored as a
+- [x] **money type + to_char numeric formatting landed** (b148): the `money` type (OID 790, stored as a
   2-decimal `Decimal128`, rendered `$1,234.56`) with literals / casts (`'$1,234.56'::money`, `(1234.56)` →
   negative) and arithmetic (`money ± money` / `money * n` → money, `money / money` → float8); plus numeric
   `to_char(numeric, fmt)` supporting `9` / `0` / `.` / `,` / `$` / `L` / `S` / `MI` / `PR` / `FM`. New
@@ -2889,7 +4860,7 @@ shared storage engine or building large new protocol subsystems:
   `$`-only currency (no locale), `to_char` omits `EEEE` / `RN` / `V` / `TH` / non-ASCII locale patterns, and
   `ORDER BY` on a money/decimal *column* relies on the storage engine's sort (the in-memory `FakeStorage`
   can't compare raw `Decimal128`).
-- [ ] **Geometric types landed** (b149): the core Postgres geometric types `point` / `box` / `circle` /
+- [x] **Geometric types landed** (b149): the core Postgres geometric types `point` / `box` / `circle` /
   `polygon` / `lseg` (and the `line` / `path` spellings — stored/canonicalised but not operated on), stored as
   their canonical Postgres text (`(1,2)`, `(2,2),(0,0)`, `<(0,0),5>`, `((0,0),(1,0),(1,1))`, `[(0,0),(1,1)]`),
   with the operators `<->` (distance → float8), `@>` (contains) / `<@` (contained by) / `&&` (overlaps) → bool.
@@ -2904,7 +4875,7 @@ shared storage engine or building large new protocol subsystems:
   `tests/test_sql_geo.py` (19: pure pggeo + SQL surface) plus a pg8000 wire test. **Out of scope:** the infinite
   `line` type and open/closed `path` distinction for operators, the `#` / `##` / `?-` / `?|` positional operators,
   and geometric indexes.
-- [ ] **bytea functions + literal forms landed** (b150): the `bytea` binary type already round-tripped (OID 17,
+- [x] **bytea functions + literal forms landed** (b150): the `bytea` binary type already round-tripped (OID 17,
   `coerce` → `bson.Binary`, `to_py` → `bytes`, `to_pg_text` → the `\x…` hex form); this slice adds the literal
   parsing and function surface. New self-contained `secantus/sql/bytea.py` (`parse` — hex `\x…` **and** escape form;
   `encode` / `decode` for `hex` / `base64` / `escape`; `get_byte` / `set_byte`; `concat`). Wired through `typemap`
@@ -2917,7 +4888,7 @@ shared storage engine or building large new protocol subsystems:
   Tests: `tests/test_sql_bytea.py` (27: pure bytea + SQL surface) plus a pg8000 wire test. **Out of scope:** the
   `bytea_output = escape` server setting (output is always hex) and the digest functions (`md5`/`sha256`, crypto
   extensions).
-- [ ] **hstore key/value type landed** (b153): the `hstore` contrib type — a flat string→string map (NULL values
+- [x] **hstore key/value type landed** (b153): the `hstore` contrib type — a flat string→string map (NULL values
   allowed), stored as a **tagged** subdocument `{"hstore": {…}}` so it stays distinct from a plain `jsonb` object
   (the `->` / `@>` / `<@` / `?` / `?&` / `?|` / `||` operators are all spelled the same as jsonb's). New
   self-contained `secantus/sql/hstore.py` (`parse` / `render` / `is_hstore` / `as_map`; the operators
@@ -2934,7 +4905,7 @@ shared storage engine or building large new protocol subsystems:
   filter). Tests: `tests/test_sql_hstore.py` (25: pure hstore + SQL surface) plus a pg8000 wire test. **Out of
   scope:** the set-returning `each`/`skeys`/`svals` forms (the `akeys`/`avals` arrays cover the need), GiST/GIN
   indexing, and the `#=`/`%%`/`%#` record operators.
-- [ ] **citext case-insensitive text landed** (b154): the `citext` contrib type — text stored verbatim (case
+- [x] **citext case-insensitive text landed** (b154): the `citext` contrib type — text stored verbatim (case
   preserved for display) but compared / sorted case-insensitively. The case-folding is a **query-planner behaviour**,
   not a value shape (a citext value is an ordinary string, so it can't be tagged like hstore without breaking text
   rendering) — so it's driven off the column's `type_tag == "citext"`. Wired through `typemap` (OID 25 / the text OID
@@ -2947,7 +4918,7 @@ shared storage engine or building large new protocol subsystems:
   `SELECT DISTINCT` on a citext column group case-**sensitively** (`Alice` ≠ `alice`), unlike real Postgres — the
   dominant citext uses (case-insensitive equality / uniqueness / range / sort) are faithful, but case-folding
   aggregation grouping isn't wired yet. citext indexing is out of scope.
-- [ ] **xml type + basic functions landed** (b155): the `xml` type (real builtin, OID 142) stored as its text and
+- [x] **xml type + basic functions landed** (b155): the `xml` type (real builtin, OID 142) stored as its text and
   validated well-formed on cast / coerce, plus the constructor / extraction functions. New self-contained
   `secantus/sql/xmltype.py` (`is_well_formed` / `parse` / `element` / `forest` / `concat` / `xpath`); XML parsing +
   serialization go through the stdlib `xml.etree.ElementTree` (no external dep; external entities disabled → no XXE).
@@ -2961,7 +4932,7 @@ shared storage engine or building large new protocol subsystems:
   `text()` / `@attr` step, a leading `//tag` descendant search) — not full XPath 1.0 (no namespaces / predicates /
   functions); the `xmltable` table function, the `xmlagg` aggregate, and the document/content-node distinction are
   out of scope.
-- [ ] **Full-text search ranking landed** (b166): two parts. (1) **`websearch_to_tsquery`** (`secantus/sql/fts.py`)
+- [x] **Full-text search ranking landed** (b166): two parts. (1) **`websearch_to_tsquery`** (`secantus/sql/fts.py`)
   — parses a web-search-style query (bare words AND'd, `"quoted phrases"` → adjacency via `phraseto_tsquery`, the
   bare word `or` → OR, leading `-` → NOT); registered in the four FTS dispatch sites (scalar `_call_func`, planner
   value-expr + `_infer_scalar_tag` → tsquery, `functions._SCALAR_EVAL_ANON`). (2) **ORDER BY output-alias
@@ -2972,7 +4943,7 @@ shared storage engine or building large new protocol subsystems:
   The rest of the FTS ranking surface already existed: `ts_rank` / `ts_rank_cd`, `ts_headline`, `phraseto_tsquery`,
   and `ORDER BY ts_rank(…)` (repeated expression). **Simplifications (unchanged):** `ts_rank_cd` == `ts_rank` (a
   monotonic match-count, not cover-density); fixed config; no stemming; no lexeme weights.
-- [ ] **generate_series + base-less FROM-clause SRFs landed** (b163): a set-returning function as the *whole* row
+- [x] **generate_series + base-less FROM-clause SRFs landed** (b163): a set-returning function as the *whole* row
   source. New `secantus/sql/srf.py`: `from_source` (a base-less `FROM generate_series(…)` / `FROM unnest(…)` /
   `jsonb_array_elements` / `jsonb_object_keys` / `regexp_split_to_table`, incl. `WITH ORDINALITY` and `AS t(cols)`)
   and `fromless_projection` (a bare `SELECT generate_series(…)`). `engine._run_srf_select` materializes the generated
@@ -2989,7 +4960,7 @@ shared storage engine or building large new protocol subsystems:
   a base-less SRF isn't supported yet (the SRF path uses `plan_select`, not the pipeline planner) — wrap in a
   subquery/CTE or generate into a table first. The `FROM t, <srf>(…)` *join* form is unchanged (pipeline planner's
   `_unnest_join_stage`).
-- [ ] **SQL functions (CREATE FUNCTION) landed** (b162): `CREATE [OR REPLACE] FUNCTION name(params) RETURNS t AS $$
+- [x] **SQL functions (CREATE FUNCTION) landed** (b162): `CREATE [OR REPLACE] FUNCTION name(params) RETURNS t AS $$
   body $$ LANGUAGE sql` + `DROP FUNCTION`. sqlglot parses these as `exp.Create`/`exp.Drop` with `kind=FUNCTION`
   (body = a `Heredoc` for `$$…$$` or a string `Literal`). `catalog.put_function`/`get_function`/`drop_function`
   persist to a new `__sql_functions__` collection keyed `name/nargs` (overload by arity). `engine._create_function`
@@ -3016,7 +4987,7 @@ shared storage engine or building large new protocol subsystems:
   limitation). **Still simplifications:** a *multi-statement* `LANGUAGE sql` body is still rejected (deferred — the
   other flagged site at `engine._create_function`); a set-returning (`SETOF`/`TABLE`) function yields only its first
   row in a scalar context.
-- [ ] **Arrays of the new types + array ops landed** (b161): two parts. (1) **Array type OIDs** — `typemap._ARRAY_PG_OID`
+- [x] **Arrays of the new types + array ops landed** (b161): two parts. (1) **Array type OIDs** — `typemap._ARRAY_PG_OID`
   gains the real Postgres array-type OIDs for the newer element types (`uuid[]` 2951, `inet[]`/`cidr[]`/`macaddr[]`,
   `date[]`/`time[]`/`timetz[]`, `interval[]`, `bit[]`/`varbit[]`, `money[]`, `xml[]`, `json[]`→jsonb 3807, the
   geometric arrays, and the range arrays), so a driver decodes the elements natively (pg8000 gives a `uuid[]` back as
@@ -3029,7 +5000,7 @@ shared storage engine or building large new protocol subsystems:
   an array-typed operand. Tests: `tests/test_sql_array_ops.py` (10) + a pg8000 wire test. **Simplifications:** array
   element equality is Python `==` (no cross-type array coercion beyond the element coerce); `citext[]` / `hstore[]`
   fall back to the text array OID (those element types have no fixed catalog OID); arrays stay one level deep.
-- [ ] **EXPLAIN for the SQL layer landed** (b158): `EXPLAIN [ANALYZE] [(options)] <statement>` returns a `QUERY
+- [x] **EXPLAIN for the SQL layer landed** (b158): `EXPLAIN [ANALYZE] [(options)] <statement>` returns a `QUERY
   PLAN` text column. New `secantus/sql/explain.py`: `parse_options` splits the tail (both the bare `EXPLAIN ANALYZE
   VERBOSE <stmt>` word form and the parenthesised `(ANALYZE, FORMAT JSON)` form); `_build_node` walks the parsed
   statement into a plan-node dict; `_text_lines` / `_json_node` render the indented tree or Postgres' single-row
@@ -3045,7 +5016,7 @@ shared storage engine or building large new protocol subsystems:
   actual rows but no per-node timing; `BUFFERS`/`SETTINGS`/`COSTS`/`TIMING` accepted-and-ignored; only `FORMAT
   TEXT`/`JSON` (others → `0A000`); pipeline-query plans name the top operation coarsely rather than reproducing
   Postgres' full plan-node tree.
-- [ ] **PREPARE / EXECUTE / DEALLOCATE landed** (b157): SQL-level prepared statements on the session. `PREPARE name
+- [x] **PREPARE / EXECUTE / DEALLOCATE landed** (b157): SQL-level prepared statements on the session. `PREPARE name
   [(argtypes)] AS <query>` parses the query (with its `$N` placeholders) and stashes `(query_ast, param_count)` on
   the new `Session.prepared` dict; `EXECUTE name [(args)]` parses the args (`SELECT <args>` wrapper → expression
   nodes), substitutes them for the `$N` `exp.Parameter` nodes (`_bind_parameter_nodes`, node-for-node so casts /
@@ -3059,7 +5030,7 @@ shared storage engine or building large new protocol subsystems:
   Distinct from the extended wire protocol's Parse/Bind portals (`pgextended.py`) — a driver's own `%s` binding
   never touches these. Tests: `tests/test_sql_prepare.py` (14) + a pg8000 wire test. **Simplification:** unquoted
   statement names aren't folded to lower case (matches the existing DECLARE CURSOR name handling).
-- [ ] **LISTEN / NOTIFY / UNLISTEN landed** (b156): cross-connection async pub/sub on the PG wire server. New
+- [x] **LISTEN / NOTIFY / UNLISTEN landed** (b156): cross-connection async pub/sub on the PG wire server. New
   `secantus/sql/pgnotify.py` (`NotifyHub` — a server-wide channel → listening-session registry, keyed by
   `id(session)` since `Session` is an unhashable dataclass). New `pgwire.notification_response` ('A'). `Session`
   gains `notify_hub`, a thread-safe inbound `_notify_deliveries` deque (drained by the owning connection thread —
@@ -3077,7 +5048,7 @@ shared storage engine or building large new protocol subsystems:
   a two-connection pg8000 wire test. **Simplifications:** duplicate `(channel, payload)` notifications in one txn
   aren't collapsed (Postgres collapses them); LISTEN/UNLISTEN take effect immediately, not at commit; and there is
   no out-of-band async push to a fully-idle connection (notifications ride the next query response).
-- [ ] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
+- [x] **jsonb aggregates + builders landed** (b138): the aggregates `jsonb_agg` / `json_agg` and
   `jsonb_object_agg` / `json_object_agg`, plus the scalar builders `to_jsonb` / `to_json` /
   `row_to_json`. `jsonb_agg` / `json_agg` fold into `planner._array_agg_arg` (they build the same
   `$push` array and are already typed `json` here) so every group-plan + detection site lights up
@@ -3095,7 +5066,7 @@ shared storage engine or building large new protocol subsystems:
   record SRF — the current SRF executor emits a single value per row, so a multi-column record SRF
   needs an executor change); `FILTER (WHERE …)` on the jsonb aggregates; the default output label for
   an un-aliased `jsonb_agg` is `array_agg` (cosmetic).
-- [ ] **SQL/JSON path queries landed** (b135): a compact `jsonpath` evaluator in `secantus/sql/jsonpath.py`
+- [x] **SQL/JSON path queries landed** (b135): a compact `jsonpath` evaluator in `secantus/sql/jsonpath.py`
   (tokenizer + recursive-descent parser + evaluator) powering `jsonb_path_query` / `jsonb_path_query_array`
   / `jsonb_path_exists` / `jsonb_path_match` (via `scalar._call_func`) and the `@?` (`exp.JSONBPathExists`)
   / `@@` (`exp.MatchAgainst` — sqlglot puts the path in `this`, the doc in `expressions[0]`) operators
@@ -3109,7 +5080,7 @@ shared storage engine or building large new protocol subsystems:
   genuinely set-returning in PG but returns only the **first** match in a scalar SELECT (use
   `jsonb_path_query_array` for the set); `@?`/`@@` in a WHERE predicate go through the scalar path
   (COLLSCAN), not a lowered Mongo filter.
-- [ ] **Date/time scalar functions landed** (b132): `extract(field FROM ts)` / `date_part('field', ts)`
+- [x] **Date/time scalar functions landed** (b132): `extract(field FROM ts)` / `date_part('field', ts)`
   (year/month/day/hour/minute/second/quarter/dow[Sun=0]/isodow[Mon=1]/doy/week/epoch → numeric),
   `date_trunc('unit', ts)` (year/quarter/month/week[→Monday]/day/hour/minute/second → timestamptz),
   `to_char(ts, fmt)` (text), interval arithmetic `ts ± interval '…'`, and `now()` / `current_timestamp`
@@ -3124,7 +5095,7 @@ shared storage engine or building large new protocol subsystems:
   `to_char` full weekday names (`Day`/`Dy`) mis-render because sqlglot greedily eats the leading `D`
   during normalisation; date/time functions in a `WHERE` predicate go through COLLSCAN + the scalar
   path (not lowered to a Mongo filter), same as other computed predicates.
-- [ ] **String round-out scalar functions landed** (b133): `lpad`/`rpad` (pad or truncate to a length,
+- [x] **String round-out scalar functions landed** (b133): `lpad`/`rpad` (pad or truncate to a length,
   default fill space), `left`/`right` (prefix/suffix; a negative count drops from the far end — `left`
   via `s[:n]`, `right` via `s[-i:]` with an `i==0 → ''` guard), `repeat`, `reverse`, `initcap`
   (`str.title()`), `ascii`/`chr`, `position(sub IN str)` / `strpos(str, sub)` (1-based, 0 if absent),
@@ -3133,7 +5104,7 @@ shared storage engine or building large new protocol subsystems:
   reverse/initcap/chr/overlay → text; ascii/strpos/position → int4). **Limitation:** `initcap` uses
   Python `str.title()`, which matches Postgres for ASCII words but can differ on apostrophes
   (`"o'brien"` → `"O'Brien"` vs PG `"O'Brien"` — same here, but exotic Unicode word boundaries may drift).
-- [ ] **Aggregate in-call `ORDER BY` landed** (b128): `array_agg(x ORDER BY y [DESC])` /
+- [x] **Aggregate in-call `ORDER BY` landed** (b128): `array_agg(x ORDER BY y [DESC])` /
   `string_agg(x, sep ORDER BY y)` order the aggregated values. sqlglot keeps the ORDER BY as an
   `exp.Order` wrapping the value (the old "sqlglot drops it" note was wrong). `planner._agg_order_spec`
   unwraps it into `(value, [(key, direction, nulls_first), …])`; `_sorted_agg_push` emits a `$push` of
@@ -3151,7 +5122,7 @@ shared storage engine or building large new protocol subsystems:
   materialization (`_run_subplan_to_docs`) so the `{v, k}` push pairs never leak — this also closed a
   latent b127 gap where an ordered-set agg inside a derived table (e.g. SQLAlchemy's index reflection,
   which does `array_agg(attname ORDER BY …)` over a derived table) leaked its raw pushed array.
-- [ ] **Ordered-set aggregates landed** (b127): `percentile_cont(f)` / `percentile_disc(f)` / `mode()`
+- [x] **Ordered-set aggregates landed** (b127): `percentile_cont(f)` / `percentile_disc(f)` / `mode()`
   via `WITHIN GROUP (ORDER BY expr)` (sqlglot `exp.WithinGroup`). `planner._ordered_set_agg` detects them
   (wired into `select_needs_pipeline` + the two `has_aggregate` routing predicates); `_plan_group_select`
   collects the ORDER BY values into a `$push` accumulator and records a `PipelineSelectPlan.post_aggregates`
@@ -3163,7 +5134,7 @@ shared storage engine or building large new protocol subsystems:
   engine has no `$sortArray`.) **Not supported:** ordered-set aggs over a JOIN (single-table + whole-table
   only), and — like all pipeline aggregates — a whole-table aggregate over zero input rows returns no row
   rather than one NULL row.
-- [ ] **WHERE: column-to-column + arithmetic + non-correlated subqueries landed.** `column OP
+- [x] **WHERE: column-to-column + arithmetic + non-correlated subqueries landed.** `column OP
   literal` keeps the indexable `{field: {op: val}}` fast path. A comparison where neither side is
   a constant — `qty > shipped`, `price < cost * 1.5` — lowers to a Mongo `{$expr: {$op: [...]}}`
   (`planner._to_agg_expr`), with `+`/`-`/`*`/`/` arithmetic over columns and literals nesting
@@ -3202,7 +5173,7 @@ shared storage engine or building large new protocol subsystems:
   used as a *pushdown* filter (`WHERE amt = abs(target)`) works in GROUP BY / JOIN pipelines too (it
   rides the shared `_expr_to_filter` / `_to_agg_expr` lowering, same as the single-table path; an
   unlowerable function like `substr` stays `0A000`). Still `0A000`: `<@`-style structural predicates.
-- [ ] **`RETURNING` landed** (b46). `INSERT` / `UPDATE` / `DELETE … RETURNING <proj>` projects the
+- [x] **`RETURNING` landed** (b46). `INSERT` / `UPDATE` / `DELETE … RETURNING <proj>` projects the
   affected rows back as a result set (`planner._returning_columns` reuses the SELECT projection
   vocabulary `_out_columns`: `*`, columns, aliases, jsonb nav). `execute_insert` pins an `_id` on
   each doc before insert so the in-hand list is the authoritative inserted set; `execute_update`
@@ -3214,7 +5185,7 @@ shared storage engine or building large new protocol subsystems:
   against a scope over that row (arithmetic, `||`, function calls, `CASE`, …). Works for INSERT /
   UPDATE (post-image) / DELETE and `INSERT … ON CONFLICT`. A subquery inside `RETURNING` isn't
   supported (the eval ctx has no catalog/session).
-- [ ] **Set operations landed** (b47). `UNION` / `INTERSECT` / `EXCEPT` (+ `ALL` variants, chained)
+- [x] **Set operations landed** (b47). `UNION` / `INTERSECT` / `EXCEPT` (+ `ALL` variants, chained)
   in `engine._run_set_operation`: each arm runs through the full SELECT path, rows are combined
   with multiset semantics (`_combine_setop_rows` / `_multiset_filter` — DISTINCT collapses to set
   semantics, `ALL` keeps min-count for INTERSECT / left-minus-right for EXCEPT), output columns
@@ -3231,7 +5202,7 @@ shared storage engine or building large new protocol subsystems:
   (columns/types taken verbatim from the first arm); a set-op / `VALUES` `ORDER BY` accepts only an
   output-column name or ordinal, not an arbitrary expression (`42703`) — Postgres rejects the latter too.
   (`VALUES` as a FROM-clause derived table is a separate, still-open path.)
-- [ ] **Non-recursive CTEs landed** (b49). `WITH name AS (...) [, ...] <query>` in
+- [x] **Non-recursive CTEs landed** (b49). `WITH name AS (...) [, ...] <query>` in
   `engine._run_with`: each CTE is materialized to rows (run through `_run_query`) and registered as
   an ephemeral collection on a `CatalogBackend`, with a `_CTECatalog` overlay mapping CTE names to
   TableDefs built from each inner query's result shape; the `WITH` is stripped (`node.pop()`) and the
@@ -3261,7 +5232,7 @@ shared storage engine or building large new protocol subsystems:
   before an `INSERT`/`UPDATE`/`DELETE` also works (the recursive CTE materializes first, then the write
   body dispatches). Not modeled: statement-level snapshot semantics (each data-modifying CTE sees the
   effects of earlier ones rather than a single pre-statement snapshot) and `WITH CHECK OPTION`.
-- [ ] **`INSERT … SELECT` landed** (b50). `INSERT INTO t [(cols)] SELECT …` routes through
+- [x] **`INSERT … SELECT` landed** (b50). `INSERT INTO t [(cols)] SELECT …` routes through
   `engine._run_insert`: the source query (a SELECT / set operation; may join / aggregate / CTE) runs
   via `_run_query`, and its result rows map positionally onto the target columns through the shared
   `planner._insert_doc` (same coercion / NOT NULL / PK→`_id` path as VALUES, factored out alongside
@@ -3269,7 +5240,7 @@ shared storage engine or building large new protocol subsystems:
   `RETURNING` works (the source is materialized first, so a self-insert reads a stable snapshot).
   A leading `WITH` before an `INSERT` / `UPDATE` / `DELETE` / **`MERGE`** (b204, #169 added MERGE) all
   work — the CTEs materialise, then the write runs against the CTE-aware backend + catalog overlay.
-- [ ] **Window functions landed** (b51). `func(...) OVER (PARTITION BY … ORDER BY …)` routes through
+- [x] **Window functions landed** (b51). `func(...) OVER (PARTITION BY … ORDER BY …)` routes through
   the evaluated-select path (a window expr already trips `_stmt_needs_evaluation`). `secantus.sql.window`
   computes each window over the fetched rows — partition (repr-keyed groups), order within partition
   (stable multi-key sort), then apply the function — and stores the value on each doc under a synthetic
@@ -3304,7 +5275,7 @@ shared storage engine or building large new protocol subsystems:
   landed everywhere** (b208): the simple pushdown path resolves a standalone output alias to its input
   column (`_rewrite_order_by_aliases`, a real column of the same name wins per Postgres precedence);
   the evaluated / group-window paths already resolved aliases.
-- [ ] **`INSERT … ON CONFLICT` landed** (b52). `INSERT … ON CONFLICT (cols) DO NOTHING | DO UPDATE SET …
+- [x] **`INSERT … ON CONFLICT` landed** (b52). `INSERT … ON CONFLICT (cols) DO NOTHING | DO UPDATE SET …
   [WHERE …]` via `planner._plan_on_conflict` (an `OnConflict` on `InsertPlan`) + `executor.
   _execute_insert_on_conflict`: each proposed row probes the conflict target with `find_matching`; a
   clean row inserts, a conflicting row is skipped (`DO NOTHING`) or updated in place (`DO UPDATE`). SET
@@ -3316,7 +5287,7 @@ shared storage engine or building large new protocol subsystems:
   `_fields_for_constraint` resolves the name against the table's `unique_constraints` (by name) or the
   primary key (by its Postgres default name `<table>_pkey`) to the arbiter's storage fields; an unknown
   name raises `42704`. **Still unsupported:** `DO UPDATE` with no conflict target (→ `42601`).
-- [ ] **`MERGE` landed** (b74). `MERGE INTO target [alias] USING source [alias] ON <cond> WHEN [NOT]
+- [x] **`MERGE` landed** (b74). `MERGE INTO target [alias] USING source [alias] ON <cond> WHEN [NOT]
   MATCHED [AND <cond>] THEN UPDATE SET … | DELETE | INSERT [(cols)] VALUES (…) | DO NOTHING` via
   `engine._run_merge`. Per source row it scans the target snapshot (loaded once at MERGE start) for rows
   the `ON` condition matches, then applies the first `WHEN` of the right kind whose optional `AND`
@@ -3344,7 +5315,7 @@ shared storage engine or building large new protocol subsystems:
   (RESTRICT / CASCADE / SET NULL) fire via `executor._enforce_fk_on_parent_update` when the referenced
   column changes — mirroring the plain UPDATE re-key path (#157). **Limitations:** an unqualified column
   ambiguous between target and source resolves to the target.
-- [ ] **Join DML landed (#162/#163, b199).** `DELETE FROM t USING src[, …] WHERE <join>` and
+- [x] **Join DML landed (#162/#163, b199).** `DELETE FROM t USING src[, …] WHERE <join>` and
   `UPDATE t SET … FROM src[, …] WHERE <join>` bring in other tables. `engine._run_statement` routes an
   UPDATE with `args["from_"]` → `_run_update_from` and a DELETE with `args["using"]` → `_run_delete_using`.
   Both collect source rows via `_collect_dml_sources` (reusing `_merge_source`, so a source may be a table
@@ -3358,7 +5329,7 @@ shared storage engine or building large new protocol subsystems:
   silently ignored — `DELETE … USING` deleted every target row (data-loss bug).** Limitations: a target
   row matched by multiple sources still updates from the *first* combination (Postgres leaves this
   unspecified); no self-join of the target back into the source list.
-- [ ] **Small cleanups landed** (b58). (1) A FROM-less `SELECT` now evaluates constant *expressions*
+- [x] **Small cleanups landed** (b58). (1) A FROM-less `SELECT` now evaluates constant *expressions*
   (arithmetic, `||`, function calls, `CASE` …) via `scalar.evaluate` against an empty scope
   (`_const_scope`), not just bare literals + info functions; (2) a FROM-less `SELECT … WHERE <const>`
   is honoured — a false predicate yields zero rows (`ConstantSelectPlan.emit`), so a recursive-CTE
@@ -3366,7 +5337,7 @@ shared storage engine or building large new protocol subsystems:
   (contained-by) operator lands in its pushable `const <@ field` form (== `field @> const`,
   `_jsonb_contains_filter`); the reverse `field <@ const` (subset-of-a-constant) form now runs as a
   COLLSCAN + residual — **landed in #149, b191 (see the jsonb-functions entry above).**
-- [ ] **WHERE subqueries in the pipeline paths landed** (b59). The single-table pushdown always threaded
+- [x] **WHERE subqueries in the pipeline paths landed** (b59). The single-table pushdown always threaded
   a `SubqueryCtx`, but the pipeline planners (JOIN / GROUP BY / evaluated / DISTINCT) called
   `_where_filter` from many places without one, so a WHERE scalar/`IN` subquery there was `0A000`.
   `plan_pipeline_select` now publishes the context via a planning-scoped `contextvars.ContextVar`
@@ -3384,7 +5355,7 @@ shared storage engine or building large new protocol subsystems:
   (`_select_projects_subquery`) routes to the evaluated group path. The one remaining gap is a correlated
   subquery in **HAVING** (`HAVING agg > (SELECT … WHERE t.k = outer.k)`) → `0A000`, since HAVING lowers to
   a post-`$group` `$match` with no per-group subquery evaluation.
-- [ ] **`ORDER BY` NULL placement landed** (b54). Postgres orders NULL as the largest value (ASC →
+- [x] **`ORDER BY` NULL placement landed** (b54). Postgres orders NULL as the largest value (ASC →
   NULLs last, DESC → NULLs first) with `NULLS FIRST`/`NULLS LAST` overriding; Mongo sort treats
   NULL/missing as the *smallest*, so the SQL layer no longer delegates NULL placement to storage.
   `planner._nulls_first` reads sqlglot's per-term flag (already PG-defaulted); the single-table,
@@ -3395,7 +5366,7 @@ shared storage engine or building large new protocol subsystems:
   (`planner._emit_pipeline_sort`), then `$unset`. **Note:** index-accelerated ORDER BY+LIMIT pushdown
   no longer applies to a single-table ordered SELECT (correctness over the storage-side sort
   optimisation — the SQL layer is a dev/test surface).
-- [ ] **Array columns landed** (b111). A `<type>[]` column stores a native BSON array; `ARRAY[…]` and
+- [x] **Array columns landed** (b111). A `<type>[]` column stores a native BSON array; `ARRAY[…]` and
   `'{…}'` literals coerce in (`typemap._parse_pg_array_literal` / `coerce`), results render as Postgres
   array text (`_render_pg_array`) with the array type OID in `PG_OID` so a driver decodes back to a list.
   `<value> = ANY(col)` → array membership, `col @> ARRAY[…]` → containment (reuses the jsonb `$all` path),
@@ -3435,9 +5406,14 @@ shared storage engine or building large new protocol subsystems:
   **Remaining unnest limitations:** the base-less form (`FROM unnest(ARRAY[…])` with no other table) →
   `42703` (use the SELECT-list `SELECT unnest(…)` form); `WITH ORDINALITY` and multi-array `unnest(a, b)`
   unsupported.
-- [ ] **No transactions, no parameters, no prepared statements.** `BEGIN`/`COMMIT`,
-  `$1` placeholders, and the extended query protocol come with the wire phases (P3/P5).
-- [ ] **Composite primary keys landed** (b117): a `PRIMARY KEY (a, b)` maps to a subdocument `_id: {a, b}`
+- [x] ~~**No transactions, no parameters, no prepared statements.**~~ All three shipped;
+  this was a P0-spike survey line that outlived its subject (verified 2026-08-20).
+  `BEGIN`/`INSERT`/`ROLLBACK` really rolls back on a real WT user-transaction (probe:
+  0 rows after), `PREPARE p (int) AS SELECT … WHERE id = $1` + `EXECUTE p (1)` returns
+  the row, and the extended query protocol is the pgserver's normal path. Live detail
+  is in "Transactions: single-connection atomicity; savepoints are real" and
+  "PREPARE / EXECUTE / DEALLOCATE landed (b157)" further down this section.
+- [x] **Composite primary keys landed** (b117): a `PRIMARY KEY (a, b)` maps to a subdocument `_id: {a, b}`
   (each PK column's `Column.field` is `_id.<name>`), so uniqueness rides the storage `_id` index exactly
   like a single-column PK. `planner._with_pk` maps the fields; `_insert_doc` builds the `_id` subdoc via
   `set_path` and `_canonicalize_composite_id` fixes its key order to the PK declaration order (Mongo treats
@@ -3456,7 +5432,7 @@ shared storage engine or building large new protocol subsystems:
   renaming a composite-PK column via `ALTER TABLE` doesn't rewrite the `_id.<name>` subdoc key (edge case);
   a SERIAL/identity column inside a composite PK is untested. (A computed PK — `SET id = <expr>` — now works,
   including a PK swap; see the UPDATE-SET-expression entry below.)
-- [ ] **`UPDATE ... SET col = <expr>` — per-row computed assignment landed (#159, b198).** A SET RHS that isn't
+- [x] **`UPDATE ... SET col = <expr>` — per-row computed assignment landed (#159, b198).** A SET RHS that isn't
   a literal (arithmetic, a column reference, `||`, a function call — `SET n = n + 1`, `SET a = b`, `SET s =
   upper(s)`) is collected into `UpdatePlan.computed` (`(field, type_tag, expr)`) by `plan_update` (via
   `_try_literal`), and `executor._execute_update_materialized` evaluates each against the **old** row (a
@@ -3466,10 +5442,18 @@ shared storage engine or building large new protocol subsystems:
   fast bulk `$set` path. Tests: `tests/test_sql_update_expr.py`. **Limitations:** a computed *composite-type*
   subfield is coerced as a scalar (nested composite value not rebuilt); a SET RHS that is a correlated
   subquery over another table isn't modelled.
-- [ ] **`numeric`/`json`/`bytea` partial.** `numeric` round-trips via Decimal128; `json`
-  passes dicts/lists through without a real `jsonb` operator surface; `bytea` is hex-string
-  in / `bytes` out. Full `jsonb` navigation (`->`/`->>`/`#>`) is P6.
-- [ ] **Catalog surface: joins landed, column-level reflection still missing.**
+- [x] ~~**`numeric`/`json`/`bytea` partial.**~~ Superseded (verified 2026-08-20). The
+  `jsonb` half is simply wrong now: `->`, `->>`, `#>` and `@>` all evaluate — probed
+  against `'{"a": {"b": 42}, "tags": ["x"]}'`, they return `{'b': 42}`, `42`, `42` and
+  the containing row respectively. See "jsonb operator surface landed" and "SQL/JSON
+  path queries landed (b135)". `numeric` still round-trips via Decimal128 and its real
+  residual limit — 34 significant digits — has its own entry above.
+- [x] **Catalog surface — re-probed 2026-08-28, nothing divergent found.**
+  `pg_constraint`, `pg_index`, `pg_am`, `pg_opclass` and boolean-expression
+  typing (`conrelid IS NOT NULL` → `bool`) all match PostgreSQL 14 on a table
+  with a primary key and a unique constraint, as does column-level reflection
+  (re-measured 2026-08-27, below). Reopen with a specific failing query rather
+  than from the prose. The "column-level reflection still missing" wording below is stale: for a freshly created table `information_schema.columns` answers `[('a','integer'),('b','text')]` and `pg_attribute` the matching type OIDs (23/25). Whatever remains is narrower than the headline claimed — re-probe before working it.
   `information_schema.tables`/`.columns`/`.schemata` and `pg_catalog.pg_class`/
   `pg_namespace`/`pg_type`/`pg_database` are served as virtual tables, and JOINs / GROUP BY
   across them now execute (`virtual.CatalogBackend` + `planner._lookup_table_def`), so
@@ -3504,9 +5488,13 @@ shared storage engine or building large new protocol subsystems:
   `enforce_update_images` (UNIQUE excludes the rewritten rows), `enforce_parent_delete` (FK referential
   actions) — are reused by `execute_insert`, `_execute_insert_on_conflict`, `_apply_conflict_update`,
   and the MERGE handlers, so every path enforces identically. Closes the MERGE-bypass and ON-CONFLICT
-  secondary-constraint gaps noted in the b94/b95/b96 entries. **Still open:** deferred constraints
-  aren't modeled (all checks are immediate — a future slice).
-- [ ] **Aggregate `FILTER (WHERE cond)` landed** (b126): `agg(...) FILTER (WHERE cond)` scopes an
+  secondary-constraint gaps noted in the b94/b95/b96 entries.
+  ~~**Still open:** deferred constraints aren't modeled (all checks are
+  immediate — a future slice).~~ **STALE — re-probed 2026-08-28 against
+  PostgreSQL 14.** A `DEFERRABLE INITIALLY DEFERRED` FK behaves exactly as PG:
+  the violating INSERT is accepted inside the transaction and `COMMIT` raises
+  `23503`. Both servers answered `accepted/commit-23503`, identically.
+- [x] **Aggregate `FILTER (WHERE cond)` landed** (b126): `agg(...) FILTER (WHERE cond)` scopes an
   aggregate to matching rows. sqlglot parses it as `exp.Filter(this=<agg>, expression=Where(cond))`;
   the aggregate detectors (`_aggregate_of` / `_array_agg_arg` / `_string_agg_arg` / `_join_aggregate_of`)
   peel the Filter, and `_agg_filter_where` + `_filter_cond_to_agg` lower the predicate to a Mongo
@@ -3530,7 +5518,7 @@ shared storage engine or building large new protocol subsystems:
   `DISTINCT` count/sum/avg `FILTER` under GROUPING SETS also works (b211). **Not supported (→ `0A000`):**
   `FILTER` with an in-aggregate `ORDER BY` (the sorted-push path would need the sentinel threaded through
   the executor finish).
-- [ ] **`ALTER DOMAIN` landed** (b125): `ADD [CONSTRAINT c] CHECK (…) [NOT VALID]`, `DROP CONSTRAINT
+- [x] **`ALTER DOMAIN` landed** (b125): `ADD [CONSTRAINT c] CHECK (…) [NOT VALID]`, `DROP CONSTRAINT
   [IF EXISTS] c`, `SET DEFAULT expr` / `DROP DEFAULT`, `SET NOT NULL` / `DROP NOT NULL`, and `RENAME TO
   new`. Handled in `engine._alter_domain_command` (Command-parsed; catalog `update_domain`). `ADD …
   CHECK` and `SET NOT NULL` **re-validate every existing row** of every column typed with the domain
@@ -3540,7 +5528,7 @@ shared storage engine or building large new protocol subsystems:
   auto-names `<domain>_check[N]`; a duplicate explicit name → `42710`. `RENAME TO` re-keys the domain
   and repoints every referencing column's `domain_type` (columns track domains by name). **Not modeled:**
   `VALIDATE CONSTRAINT` (no-op accept — we validate eagerly), `RENAME CONSTRAINT`, dependency tracking.
-- [ ] **POSIX regex-match operators landed** (b124): `~` / `~*` / `!~` / `!~*` in WHERE lower to a Mongo
+- [x] **POSIX regex-match operators landed** (b124): `~` / `~*` / `!~` / `!~*` in WHERE lower to a Mongo
   `$regex` filter (`planner._expr_to_filter`, next to the LIKE handler; the pattern is a raw regex,
   *not* LIKE-translated, and matches unanchored — `re.search` semantics — like Postgres). `~*` adds
   `$options: "i"`; `!~` / `!~*` parse as `Not(RegexpLike/RegexpILike)` and negate through the existing
@@ -3550,7 +5538,7 @@ shared storage engine or building large new protocol subsystems:
   **Limitation:** `!~` / `!~*` inherit the layer's existing NULL-in-negation divergence (a NULL row
   leaks into the negated result, shared with `!=` / `NOT LIKE`; the positive `~` correctly excludes
   NULL) — a broader NULL-semantics fix, not regex-specific.
-- [ ] **`CREATE DOMAIN` landed** (b122): a named base type with its own `NOT NULL` / `CHECK` (and
+- [x] **`CREATE DOMAIN` landed** (b122): a named base type with its own `NOT NULL` / `CHECK` (and
   optional `DEFAULT`). `CREATE DOMAIN name AS base [DEFAULT expr] [ [CONSTRAINT c] { NOT NULL | CHECK
   (…) } … ]` and `DROP DOMAIN [IF EXISTS] name` arrive as `exp.Command` (sqlglot doesn't model the
   grammar) and are handled in `engine._create_domain_command` / `_drop_domain_command`; the base type +
@@ -3569,7 +5557,7 @@ shared storage engine or building large new protocol subsystems:
   supported (→ `0A000`, same gap as table CHECKs); `ALTER DOMAIN` (add/drop constraint, set default) and
   domain-on-domain aren't modeled; `DROP DOMAIN` doesn't check for dependent columns (no RESTRICT/CASCADE
   dependency tracking).
-- [ ] **FOREIGN KEY enforcement on write landed** (b96): referential integrity is now enforced both
+- [x] **FOREIGN KEY enforcement on write landed** (b96): referential integrity is now enforced both
   ways (`23503`, `errors.foreign_key_violation`). **Child side** (`executor._validate_fk_child_rows`,
   wired into `execute_insert` + the UPDATE post-image path): an INSERT/UPDATE row whose FK columns are
   all non-NULL must have a matching parent row — MATCH SIMPLE, so a NULL in any FK column exempts the
@@ -3586,7 +5574,7 @@ shared storage engine or building large new protocol subsystems:
   via `enforce_insert_rows` / `enforce_update_images`, parent-side FK on a MERGE UPDATE via
   `_enforce_fk_on_parent_update`, and parent-side on a MERGE DELETE via `enforce_parent_delete` — see the
   MERGE bullet.)
-- [ ] **UNIQUE enforcement on write landed** (b95): `INSERT` / `UPDATE` on a **declared** table now
+- [x] **UNIQUE enforcement on write landed** (b95): `INSERT` / `UPDATE` on a **declared** table now
   reject a write that would create two rows sharing a value for a declared UNIQUE constraint (`23505`,
   `executor._validate_unique_rows`). NULLs are distinct — a row with any NULL in a constraint's columns
   is exempt (matches Postgres default, no `NULLS NOT DISTINCT`). Duplicates *within* an INSERT/UPDATE
@@ -3598,7 +5586,7 @@ shared storage engine or building large new protocol subsystems:
   DISTINCT`. (Historical note, now closed by #67: `INSERT … ON CONFLICT` catches a secondary UNIQUE — the
   clean-insert branch runs `enforce_insert_rows` over every UNIQUE constraint, not just the arbiter — and
   `MERGE` writes enforce through the same shared helpers.)
-- [ ] **CHECK + NOT NULL enforcement on write landed** (b94): `INSERT` / `UPDATE` on a **declared**
+- [x] **CHECK + NOT NULL enforcement on write landed** (b94): `INSERT` / `UPDATE` on a **declared**
   table now enforce NOT NULL (`23502`) and CHECK (`23514`) against the post-image — a violating write is
   rejected and the table left unchanged (`executor._validate_write_row` / `_validate_rows` /
   `_validate_update_post_images`). NOT NULL skips the PK column (storage auto-assigns `_id`). CHECK
@@ -3612,7 +5600,13 @@ shared storage engine or building large new protocol subsystems:
   rolled back unless inside an explicit transaction block (per-statement atomicity only for the failing
   statement). (Historical note, now closed: UNIQUE (#64) / FOREIGN KEY (#65) are enforced, and `MERGE`
   writes go through the shared enforcement helpers (#67), not a bypass.)
-- [ ] **CHECK / UNIQUE constraints — declared, reflected, NOT enforced** (b91): column-level (`col int
+- [x] **CHECK / UNIQUE constraints — declared, reflected, and ENFORCED** (b91 declared them;
+  b98 made enforcement uniform across every write path — headline corrected 2026-08-20, the
+  "NOT enforced" wording had survived the slice that fixed it). Probed live: `INSERT` of `-5`
+  into `n int CHECK (n > 0)` raises `23514 new row for relation "t" violates check constraint
+  "t_n_check"`, and a duplicate into `e text UNIQUE` raises `23505 duplicate key value violates
+  unique constraint "t_e_key"` — Postgres' SQLSTATEs and message wording. The declaration /
+  reflection detail below is still accurate: column-level (`col int
   CHECK (col > 0)` / `col text UNIQUE`), table-level named (`CONSTRAINT c CHECK (...)` / `... UNIQUE (a,
   b)`), and table-level unnamed CHECK/UNIQUE are parsed by `planner._extract_constraints`, stored on
   `TableDef.check_constraints` (`catalog.CheckConstraint`) / `TableDef.unique_constraints`
@@ -3628,7 +5622,7 @@ shared storage engine or building large new protocol subsystems:
   enforced:** no CHECK-predicate validation, no UNIQUE-duplicate rejection on write — schema-shape
   record only. **Limitations:** CHECK columns aren't listed in `constraint_column_usage` (the
   predicate isn't parsed for referenced columns).
-- [ ] **`ALTER TABLE … ADD CONSTRAINT CHECK/UNIQUE` + `DROP CONSTRAINT` landed** (b93): `ADD
+- [x] **`ALTER TABLE … ADD CONSTRAINT CHECK/UNIQUE` + `DROP CONSTRAINT` landed** (b93): `ADD
   [CONSTRAINT name] CHECK (…)` / `UNIQUE (…)` and unnamed `ADD UNIQUE (…)` append to
   `TableDef.check_constraints` / `unique_constraints` via `executor._apply_alter_action` (reusing
   `planner.make_check_constraint` / `make_unique_constraint`, factored out of `_extract_constraints`);
@@ -3637,7 +5631,7 @@ shared storage engine or building large new protocol subsystems:
   name → `42704` unless IF EXISTS). Still not enforced. **Limitations:** unnamed `ADD CHECK (…)` isn't
   accepted (sqlglot can't parse it — a CHECK needs an explicit `CONSTRAINT name`); no `ALTER CONSTRAINT`
   / `VALIDATE CONSTRAINT`.
-- [ ] **Materialized-view polish landed** (b99): `WITH NO DATA` registers a matview unpopulated (a
+- [x] **Materialized-view polish landed** (b99): `WITH NO DATA` registers a matview unpopulated (a
   `populated` flag in the `__sql_matviews__` registry doc — `catalog.matview_populated` /
   `set_matview_populated`); querying an unpopulated matview errors `55000`
   (`object_not_in_prerequisite_state`, checked in `engine._run_select`), and its first `REFRESH` marks
@@ -3655,7 +5649,7 @@ shared storage engine or building large new protocol subsystems:
   inside a WITH. **Limitations:** the unpopulated check only fires for a matview in the query's primary
   FROM (not a secondary JOIN position); no real `CONCURRENTLY` snapshot isolation; still no indexes on
   the snapshot.
-- [ ] **Materialized views landed** (b97): `CREATE MATERIALIZED VIEW name AS SELECT …` runs the SELECT
+- [x] **Materialized views landed** (b97): `CREATE MATERIALIZED VIEW name AS SELECT …` runs the SELECT
   and stores a **snapshot** of its rows in a backing collection (named after the matview) plus the
   definition text in a per-db `__sql_matviews__` registry (`catalog.put_matview` / `get_matview` /
   `drop_matview` / `list_matviews`). The snapshot's shape is registered as a catalog `TableDef` (columns
@@ -3672,7 +5666,7 @@ shared storage engine or building large new protocol subsystems:
   `WITH NO DATA` / `WITH DATA` *are* modeled — an unpopulated matview raises `55000` on scan until its
   first `REFRESH` — and `REFRESH … CONCURRENTLY` + a unique index on the snapshot + `ALTER MATERIALIZED
   VIEW … RENAME TO` are supported; other `ALTER MATERIALIZED VIEW` subcommands remain `0A000`.)
-- [ ] **`CREATE VIEW` / `DROP VIEW` landed** (b87): a view is a stored `SELECT` persisted as its query
+- [x] **`CREATE VIEW` / `DROP VIEW` landed** (b87): a view is a stored `SELECT` persisted as its query
   text in a per-db `__sql_views__` collection (`catalog.put_view` / `get_view` / `drop_view` /
   `list_views`). `CREATE [OR REPLACE] VIEW` and `DROP VIEW [IF EXISTS]` dispatch on `exp.Create` /
   `exp.Drop` kind `'VIEW'` (`executor.execute_create_view` / `execute_drop_view`). Querying a view
@@ -3704,7 +5698,7 @@ shared storage engine or building large new protocol subsystems:
   query re-reads the base tables); no `CASCADE`/`RESTRICT` on `DROP`; no column-list aliasing (`CREATE VIEW
   v (a, b) AS …`); CHECK OPTION cascades only one level (a CASCADED view over another CHECK OPTION view
   doesn't re-check the inner condition); aliased / expression projections aren't updatable.
-- [ ] **`COMMENT ON TABLE` / `COLUMN` landed** (b86): the comment is stored on `TableDef.comment` /
+- [x] **`COMMENT ON TABLE` / `COLUMN` landed** (b86): the comment is stored on `TableDef.comment` /
   `Column.comment` (persisted in the catalog doc) by `executor.execute_comment` (dispatched on
   `exp.Comment`), surfaced through `virtual._pg_description` (table comment → `objsubid 0`, column
   comment → the column's attnum, `classoid` = pg_class 1259). SQLAlchemy's `get_table_comment()` and
@@ -3713,7 +5707,11 @@ shared storage engine or building large new protocol subsystems:
   NULL` statement — anchored so a query's `WHERE x IS NULL` is untouched — to an `UNCOMMENT_SENTINEL`
   the executor reads as removal). `get_table_comment`'s join needs `'pg_catalog.pg_class'::regclass`, so
   `_coerce_cast` now maps a `regclass` cast of a catalog relation name to its OID (`_REGCLASS_OIDS`).
-- [ ] **Foreign keys — declared, reflected, NOT enforced** (b81): column-level `col type REFERENCES
+- [x] **Foreign keys — declared, reflected, and ENFORCED** (b81 declared them; b98 made
+  enforcement uniform — headline corrected 2026-08-20, same stale-wording problem as the
+  CHECK/UNIQUE entry). Probed live: inserting a child row whose `pid` has no parent raises
+  `23503 insert or update on table "child" violates foreign key constraint "child_pid_fkey"`.
+  The declaration / reflection detail below is still accurate: column-level `col type REFERENCES
   t(c)` and table-level `FOREIGN KEY (c) REFERENCES t(c)` (incl. `ON DELETE` / `ON UPDATE` actions and
   the columnless `REFERENCES t` → target-PK form) are parsed by `planner._extract_foreign_keys`, stored
   on `TableDef.foreign_keys` (`catalog.ForeignKey`), and persisted in the catalog doc. Reflection:
@@ -3727,14 +5725,14 @@ shared storage engine or building large new protocol subsystems:
   name] FOREIGN KEY` landed in b85 (see below). **Limitations:** `MATCH` renders as the default.
   (FK enforcement + referential actions landed in later slices; `DEFERRABLE` is captured and
   honoured — see "Constraint enforcement" and "Deferred constraints" below.)
-- [ ] **`ALTER TABLE … ADD [CONSTRAINT name] FOREIGN KEY` landed** (b85): parsed as `exp.AddConstraint`
+- [x] **`ALTER TABLE … ADD [CONSTRAINT name] FOREIGN KEY` landed** (b85): parsed as `exp.AddConstraint`
   (a bare `ForeignKey` or a named `Constraint` wrapping one) in `executor._apply_alter_action`, which
   appends a `catalog.ForeignKey` (via `planner._make_fk`, now taking an optional constraint name) to
   the table and persists it through `Catalog.replace`. Reflects exactly like a CREATE TABLE FK
   (`information_schema.referential_constraints`, `pg_constraint` contype='f', SQLAlchemy
   `get_foreign_keys()`). Non-FK `ADD CONSTRAINT` (CHECK / UNIQUE) → `feature_not_supported`. Still not
   enforced.
-- [ ] **Deferred constraints landed** (b100): `UNIQUE` / `FOREIGN KEY` declared `DEFERRABLE` /
+- [x] **Deferred constraints landed** (b100): `UNIQUE` / `FOREIGN KEY` declared `DEFERRABLE` /
   `INITIALLY DEFERRED` are parsed (`planner._deferrable_flags`), stored on `catalog.UniqueConstraint` /
   `ForeignKey` (`deferrable` / `initially_deferred`), and reflected via `pg_constraint.condeferrable` /
   `condeferred` and `information_schema.table_constraints.is_deferrable` / `initially_deferred`. When a
@@ -3746,7 +5744,7 @@ shared storage engine or building large new protocol subsystems:
   deferral state (`deferred_all` / `deferred_names` / `pending_deferred`) resets at end of transaction.
   **Limitations:** re-check is a whole-constraint rescan (not per-row). (The named-FK parsing gap this
   note used to describe was fixed in b101 — see "Named FK constraint parsing" below.)
-- [ ] **Named FK constraint parsing landed** (b101): `planner._extract_foreign_keys` now handles a
+- [x] **Named FK constraint parsing landed** (b101): `planner._extract_foreign_keys` now handles a
   table-level `CONSTRAINT n FOREIGN KEY (cols) REFERENCES …` (sqlglot wraps it in an `exp.Constraint`
   whose `expressions` hold the `exp.ForeignKey`) — previously not parsed into a FK **at all** — and a
   column-level `col … CONSTRAINT n REFERENCES …` now keeps the explicit name (read from the
@@ -3755,7 +5753,7 @@ shared storage engine or building large new protocol subsystems:
   the name through `_make_fk`; composite columns, `ON DELETE`/`ON UPDATE`, and `DEFERRABLE` all carry
   through. Enforcement + reflection + named `SET CONSTRAINTS` all light up under the real name. Tests:
   `tests/test_sql_foreign_keys.py`.
-- [ ] **SERIAL columns + sequences landed** (b102): `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` columns
+- [x] **SERIAL columns + sequences landed** (b102): `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` columns
   (int + implicit NOT NULL + owned sequence `<table>_<col>_seq`), `CREATE SEQUENCE` / `DROP SEQUENCE`
   (`START WITH` / `INCREMENT BY` / `MINVALUE` / `MAXVALUE` / `CYCLE`), `DEFAULT nextval('seq')`, and the
   `nextval` / `currval` / `setval` / `lastval` functions. Sequence state persists in a per-db
@@ -3771,7 +5769,7 @@ shared storage engine or building large new protocol subsystems:
   different connections (acceptable for the dev/test surface; the storage RLock keeps each write
   atomic); no `ALTER SEQUENCE`, no `CACHE`, no `OWNED BY`, and an explicit value into a SERIAL column
   doesn't bump the sequence (matches Postgres).
-- [ ] **SQL-level roles landed** (b103): `CREATE ROLE` / `CREATE USER` / `ALTER ROLE` / `DROP ROLE`
+- [x] **SQL-level roles landed** (b103): `CREATE ROLE` / `CREATE USER` / `ALTER ROLE` / `DROP ROLE`
   (all arrive as `exp.Command`; parsed by `engine._run_role_command` / `_parse_role_attrs` — `LOGIN` /
   `SUPERUSER` / `CREATEDB` / `CREATEROLE` / `INHERIT` / `REPLICATION` + `NO…` negations, `PASSWORD`,
   `CONNECTION LIMIT`; `USER` implies LOGIN). Stored in a per-db `__sql_roles__` collection
@@ -3784,7 +5782,7 @@ shared storage engine or building large new protocol subsystems:
   users** (constructor `users={}`), no `pg_authid` / `pg_auth_members` / role-membership graph, password
   not stored (only a `password_set` flag), and roles live in the connection's db rather than being
   cluster-wide.
-- [ ] **Enforced table-level GRANT/REVOKE landed** (#127, b167): `GRANT`/`REVOKE` of
+- [x] **Enforced table-level GRANT/REVOKE landed** (#127, b167): `GRANT`/`REVOKE` of
   `SELECT`/`INSERT`/`UPDATE`/`DELETE` (or `ALL`) `ON <table> TO/FROM <role>` (`exp.Grant`/`exp.Revoke`
   with a `Table` securable) persist per-`(table, grantee)` in `__sql_grants__`
   (`Catalog.grant_table_privileges` / `revoke_table_privileges` / `get_table_grants` /
@@ -3802,7 +5800,7 @@ shared storage engine or building large new protocol subsystems:
   enforced (no such ops); no table-owner tracking (owners aren't auto-granted — the seeding/trust-mode
   session is unrestricted anyway); grant target must be a single identifiable table (multi-table /
   subquery statements get no table-grant fallback). Not ported to the Rust server.
-- [ ] **SET ROLE / SET SESSION AUTHORIZATION landed** (#128, b168): `SET [SESSION|LOCAL] ROLE { name |
+- [x] **SET ROLE / SET SESSION AUTHORIZATION landed** (#128, b168): `SET [SESSION|LOCAL] ROLE { name |
   NONE | DEFAULT }`, `SET [SESSION|LOCAL] SESSION AUTHORIZATION { name | DEFAULT }`, and their `RESET`
   forms (all arrive as `exp.Command`; handled by `engine._run_authorization_command`). `Session.role` is
   the current-role override (SET ROLE), `Session.user` the session user (SET SESSION AUTHORIZATION),
@@ -3819,7 +5817,7 @@ shared storage engine or building large new protocol subsystems:
   transaction (behaves like `SET`); the Mongo RBAC db-level gate still uses the login's `session.roles`
   (SET ROLE changes the table-grant identity + `current_user`, not the underlying db-wide Mongo role
   bindings). Not ported to the Rust server.
-- [ ] **Row-level security (RLS) landed** (#129, b169): `ALTER TABLE t {ENABLE|DISABLE|FORCE|NO FORCE}
+- [x] **Row-level security (RLS) landed** (#129, b169): `ALTER TABLE t {ENABLE|DISABLE|FORCE|NO FORCE}
   ROW LEVEL SECURITY` + `CREATE POLICY name ON t [AS PERMISSIVE|RESTRICTIVE] [FOR cmd] [TO roles]
   [USING (expr)] [WITH CHECK (expr)]` + `DROP POLICY [IF EXISTS] name ON t` (all `exp.Command`;
   regex-parsed in `engine._alter_rls_command` / `_create_policy_command` / `_drop_policy_command`,
@@ -3840,7 +5838,7 @@ shared storage engine or building large new protocol subsystems:
   recorded but behaves like `ENABLE` (no owner to force against); RLS DDL itself needs no privilege (any authenticated
   user can add/alter policies — no ownership check); policies over the pipeline/set-operation/CTE paths aren't injected
   (only the direct single-table SELECT/UPDATE/DELETE dispatch). Not ported to the Rust server.
-- [ ] **UDF reflection landed** (#130, b170): `CREATE FUNCTION` (#124) definitions now surface through
+- [x] **UDF reflection landed** (#130, b170): `CREATE FUNCTION` (#124) definitions now surface through
   `pg_catalog.pg_proc` (`virtual._pg_proc`: oid / proname / pronamespace / prolang=14 / prorettype /
   pronargs / proargtypes / proargnames / prosrc / prokind='f' / proretset), `information_schema.routines`
   + `.parameters` (`_info_routines` / `_info_parameters`), and `pg_get_functiondef` /
@@ -3854,7 +5852,7 @@ shared storage engine or building large new protocol subsystems:
   `proargmodes` / `proargdefaults` (all params reflect as `IN`, no defaults); `is_deterministic` is a
   fixed `NO`; overloads share a `proname` but get distinct oids/`specific_name`. Not ported to the Rust
   server.
-- [ ] **Column-level privileges landed** (#131, b171): `GRANT`/`REVOKE` `SELECT`/`INSERT`/`UPDATE (col,
+- [x] **Column-level privileges landed** (#131, b171): `GRANT`/`REVOKE` `SELECT`/`INSERT`/`UPDATE (col,
   …)` `ON t` (the `GrantPrivilege.expressions` column list) persist per-`(table, grantee, column)` in
   `__sql_column_grants__` (`Catalog.grant_column_privileges` / `revoke_column_privileges` /
   `get_column_grants` / `list_column_grants` / `has_column_privilege`; `engine._grant_privileges` now
@@ -3870,7 +5868,7 @@ shared storage engine or building large new protocol subsystems:
   role or table grant); `count(*)`/no-column-ref SELECTs fall back to table-level (can't be authorized by
   a column grant alone); `REFERENCES`/`TRIGGER` column privileges aren't enforced; `is_grantable` always
   `NO`. Not ported to the Rust server.
-- [ ] **IDENTITY columns + ALTER SEQUENCE landed** (b104): `GENERATED { ALWAYS | BY DEFAULT } AS
+- [x] **IDENTITY columns + ALTER SEQUENCE landed** (b104): `GENERATED { ALWAYS | BY DEFAULT } AS
   IDENTITY [(START WITH n INCREMENT BY n)]` columns (`planner._identity_spec`) reuse the SERIAL sequence
   machinery — an owned `<table>_<col>_seq`, NOT NULL, auto-filled on omit. `Column.identity` is
   `"always"` / `"by_default"`; ALWAYS rejects a user-supplied value with `428C9` but accepts the
@@ -3882,7 +5880,7 @@ shared storage engine or building large new protocol subsystems:
   columns. Tests: `tests/test_sql_identity.py`. **Limitations:** no `OVERRIDING SYSTEM VALUE` (so an
   ALWAYS column can't be force-overridden), no `ALTER TABLE … ADD/DROP/SET GENERATED`, no
   `ALTER SEQUENCE … OWNED BY` / `RESTART` distinction from `is_called` edge cases beyond the basic reset.
-- [ ] **Enum types landed** (b107): `CREATE TYPE name AS ENUM ('a', …)` / `DROP TYPE [IF EXISTS]` store
+- [x] **Enum types landed** (b107): `CREATE TYPE name AS ENUM ('a', …)` / `DROP TYPE [IF EXISTS]` store
   the label list in a per-db `__sql_enums__` collection (`Catalog.create_enum` / `get_enum` / `drop_enum`
   / `list_enums`); dispatched from `engine._create_type` / `_drop_type`. An enum-typed column
   (`Column.enum_type`, stored as `text`) is detected in `plan_create_table` via `_enum_type_name` (a
@@ -3909,7 +5907,7 @@ shared storage engine or building large new protocol subsystems:
   result columns still describe as `text` 25; enum-cast oids ride constant selects only (a cast inside a
   table SELECT's projection types by the column machinery); no `pg_type` row for the paired `_name`
   array type itself (only `typarray` on the base row); `mood[]` table columns aren't supported.
-- [ ] **`ALTER TYPE … ADD VALUE` + enum-aware ORDER BY landed** (b112): `ALTER TYPE name ADD VALUE
+- [x] **`ALTER TYPE … ADD VALUE` + enum-aware ORDER BY landed** (b112): `ALTER TYPE name ADD VALUE
   [IF NOT EXISTS] 'label' [BEFORE|AFTER 'other']` (arrives as a `Command`, parsed by
   `engine._ALTER_TYPE_ADD_RE` → `Catalog.alter_enum_add_value`) inserts a new label into the enum's
   ordered label list at the end or relative to a neighbour; duplicate → `42710` (unless `IF NOT EXISTS`),
@@ -3927,7 +5925,7 @@ shared storage engine or building large new protocol subsystems:
   by `_order_key_fn` in `executor.execute_correlated_select`). Tests: `tests/test_sql_enum_order.py`,
   `tests/test_sql_correlated_extras.py`. **Limitations:** `ALTER TYPE RENAME VALUE` / composite-type
   alters → `0A000`.
-- [ ] **Generated columns landed** (b108): `GENERATED ALWAYS AS (expr) STORED` columns
+- [x] **Generated columns landed** (b108): `GENERATED ALWAYS AS (expr) STORED` columns
   (`planner._generated_expr` stores the rendered SQL on `Column.generated`). Computed from the row's
   other columns on every write by `executor._apply_generated_columns` (evaluates the expr via
   `scalar.evaluate` with a column→field scope, reusing the CHECK-constraint machinery) — runs before
@@ -3939,7 +5937,7 @@ shared storage engine or building large new protocol subsystems:
   same row (no subqueries / volatile functions guard); no `ALTER TABLE … ADD COLUMN … GENERATED` (the
   ALTER ADD path doesn't parse the constraint yet); a generated column isn't re-derived if the underlying
   data was written directly via the Mongo API (SQL writes only).
-- [ ] **COPY FROM/TO STDIN/STDOUT landed** (b109): the `COPY` bulk-load / dump sub-protocol over the
+- [x] **COPY FROM/TO STDIN/STDOUT landed** (b109): the `COPY` bulk-load / dump sub-protocol over the
   wire (`psql \copy`, `pg_dump`). `pgwire` gained `copy_in_response` ('G') / `copy_out_response` ('H') /
   `copy_data` ('d') / `copy_done` ('c') / `copy_fail` ('f'); `pgserver._handle_copy` / `_copy_in` /
   `_copy_out` drive the streaming (detected in `_handle_query` when the single parsed statement is
@@ -3956,7 +5954,7 @@ shared storage engine or building large new protocol subsystems:
   `COPY (query) FROM` → `42601`. **Limitations:** text + CSV only (no binary `COPY`); `STDIN` / `STDOUT`
   only (no server-side file paths — the client streams, like `\copy`); the embedded `run_sql` API can't
   drive the streaming COPY sub-protocol (no stream) — it's wire-only.
-- [ ] **Partial indexes landed** (b110): `CREATE INDEX … WHERE <predicate>` lowers the predicate to a
+- [ ] **OPEN — Partial indexes landed** (b110): `CREATE INDEX … WHERE <predicate>` lowers the predicate to a
   Mongo filter (`planner.plan_create_index` calls `_expr_to_filter` on the index's `params.where`) and
   passes it to storage as `partialFilterExpression` (`executor.execute_create_index`), so the query
   planner accelerates matching queries and `explain` reports `IXSCAN` `isPartial: true` (the storage
@@ -3966,10 +5964,14 @@ shared storage engine or building large new protocol subsystems:
   computed values (add a `GENERATED … STORED` column and index that). Tests:
   `tests/test_sql_partial_index.py`. **Limitations:** `pg_index.indpred` still reflects as NULL (the
   index works + accelerates, but SQLAlchemy's `get_indexes` won't report it as partial — rendering the
-  Mongo filter back to a SQL predicate for `pg_get_expr` isn't done); a partial predicate that doesn't
-  lower to a field filter (e.g. a function call) would raise at CREATE rather than degrade to a full
-  index.
-- [ ] **`DISTINCT ON` + `LATERAL` joins landed** (b82). **`DISTINCT ON (exprs)`** keeps the first row
+  Mongo filter back to a SQL predicate for `pg_get_expr` isn't done);
+  ~~a partial predicate that doesn't lower to a field filter (e.g. a function
+  call) would raise at CREATE rather than degrade to a full index.~~
+  **Re-probed 2026-08-28 against PostgreSQL 14: the second half is STALE** —
+  `CREATE INDEX … WHERE length(t) > 2` is accepted, same as PG. The `indpred`
+  half is **CONFIRMED still open**: `pg_index.indpred IS NOT NULL` answers
+  `false` where PG answers `true`.
+- [x] **`DISTINCT ON` + `LATERAL` joins landed** (b82). **`DISTINCT ON (exprs)`** keeps the first row
   per distinct value of `exprs` in ORDER BY order (single-table + join) — routed through the evaluated
   path (`planner._distinct_on`, `EvaluatedSelectPlan.distinct_on`, dedup in `executor._evaluated_value_rows`);
   before this it was silently mistreated as plain full-row DISTINCT. **`LATERAL`** (comma / `CROSS JOIN
@@ -3993,7 +5995,7 @@ shared storage engine or building large new protocol subsystems:
   (see §aggregate note above); `count`-style aggregates and `LEFT JOIN LATERAL` are unaffected.
   `DISTINCT ON` doesn't enforce Postgres' "ORDER BY must start with the DISTINCT ON exprs" rule
   (lenient — keeps whatever the sort order gives).
-- [ ] **`GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` landed** (b83, single-table). Enumerated grouping
+- [x] **`GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` landed** (b83, single-table). Enumerated grouping
   sets (`planner._grouping_sets`: ROLLUP → prefixes, CUBE → all subsets, explicit GROUPING SETS as
   written, a leading plain `GROUP BY a, …` as a prefix in every set) are each compiled to a
   `$group`+`$project` branch (`_grouping_set_branch`; group columns absent from a set project as
@@ -4045,7 +6047,7 @@ shared storage engine or building large new protocol subsystems:
   **Limitations:** a subquery in `HAVING` alongside a window over GROUPING SETS → `0A000`; a correlated /
   per-row WHERE with GROUPING SETS over a JOIN → `feature_not_supported`. (An in-aggregate `ORDER BY` under
   GROUPING SETS, single-table or over a JOIN, now works — b224.)
-- [ ] **Expression over an aggregate landed (#167, b202):** a SELECT item that *wraps* an aggregate
+- [x] **Expression over an aggregate landed (#167, b202):** a SELECT item that *wraps* an aggregate
   (`sum(x) + 1`, `round(avg(x), 2)`, `sum(x) - min(x)`) is now supported — `_select_has_computed_aggregate`
   routes it to the window-aware `_plan_group_window_select`, which rewrites each aggregate to its `$group`
   output field and evaluates the wrapping expression per grouped row via the evaluated executor (the same
@@ -4053,7 +6055,7 @@ shared storage engine or building large new protocol subsystems:
   keys (`GROUP BY lower(name)`, `GROUP BY a + b`) work (single-table + JOIN) via
   `_computed_group_keys` / `_lower_computed_group_keys`; a key using an unlowerable function (`substr`)
   stays `0A000`.
-- [ ] **ORDER BY completeness in GROUP BY / pipeline queries landed** (b210): a pipeline `ORDER BY` now
+- [x] **ORDER BY completeness in GROUP BY / pipeline queries landed** (b210): a pipeline `ORDER BY` now
   accepts a **positional reference** (`ORDER BY 1`, `ORDER BY 2 DESC` → the Nth select item; out-of-range
   → `42P10`) and an **aggregate / computed expression that matches a select-list item** (`ORDER BY
   count(*) DESC`, `ORDER BY sum(x)` when that aggregate is selected). `_append_sort_limit` now takes the
@@ -4068,7 +6070,7 @@ shared storage engine or building large new protocol subsystems:
   `out_columns` so the executor drops it from the output; `_resolve_order_output` maps the term's SQL to
   the hidden field. Still `0A000`: a non-aggregate computed ORDER BY expression not in the select list,
   and ORDER BY an unselected aggregate under GROUPING SETS (the union branches don't share hidden fields).
-- [ ] **`ALTER TABLE` landed** (b80): `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`
+- [x] **`ALTER TABLE` landed** (b80): `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`
   (`$unset`s the field on every doc), `RENAME COLUMN` (`$rename`s a non-PK field; a PK rename keeps
   the `_id` field and only changes the SQL name), `RENAME TO` (renames the table *and* moves the
   backing collection via `Storage.rename_collection`, so the old name stops resolving — otherwise the
@@ -4084,7 +6086,7 @@ shared storage engine or building large new protocol subsystems:
   single-ALTER path. Homogeneous lists (all-ADD / all-DROP) already parsed natively and were unaffected.
   Handles `IF EXISTS` and preserves data through a mid-list `RENAME COLUMN`. Tests: `test_sql_alter.py`
   (`test_multi_action_*`).
-- [ ] **Literal column DEFAULTs + `ALTER COLUMN TYPE` / `SET`/`DROP DEFAULT` landed** (b84). `Column`
+- [x] **Literal column DEFAULTs + `ALTER COLUMN TYPE` / `SET`/`DROP DEFAULT` landed** (b84). `Column`
   gained `has_default` / `default`; a literal DEFAULT (number / string / bool / NULL) from `CREATE
   TABLE` (`planner._column_default`) or `ALTER COLUMN SET DEFAULT` is filled in for an omitted column
   in `_insert_doc`. `ALTER COLUMN … TYPE t` updates the catalog `type_tag` (new inserts/reads use it;
@@ -4103,7 +6105,7 @@ shared storage engine or building large new protocol subsystems:
 - [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
   echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
   name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)
-- [ ] **Transactions: single-connection atomicity; SAVEPOINT is a no-op.**
+- [ ] **Transactions: single-connection atomicity; savepoints are real (DDL excepted).**
   `BEGIN`/`COMMIT`/`ROLLBACK` open/commit/abort a real `Storage` user-transaction
   (statements in the block run on its WT session; ROLLBACK undoes them; an error poisons
   the block with `25P02` until it ends). `SET TRANSACTION ISOLATION LEVEL` / `READ ONLY` /
@@ -4122,6 +6124,9 @@ shared storage engine or building large new protocol subsystems:
   txn block → `25P01`; unknown savepoint → `3B001`. **Limitations:** it's a collection-granularity
   snapshot (fine for the ephemeral test data SecantusDB targets, `O(rows-in-touched-collection)` per
   first-write-per-savepoint, not a WT-native savepoint); **DDL inside a savepoint is not undone**
+  (verified 2026-08-14: `SAVEPOINT sp; CREATE TABLE x; ROLLBACK TO sp` leaves `x` present, where
+  Postgres drops it — the savepoint snapshots row data, not catalog state. This is the ONLY savepoint
+  gap left; everything else in this entry was confirmed working against the engine.)
   (`CREATE`/`DROP`/`CREATE INDEX` — only DML restores); and recovery after a storage-engine
   `WT_ROLLBACK`-class error (vs an ordinary constraint violation) may leave the WT txn unusable for
   the restore writes. `DISCARD` remains a no-op (`DEALLOCATE` is now a real prepared-statement command — see the
@@ -4138,7 +6143,7 @@ shared storage engine or building large new protocol subsystems:
   and it isn't wired into the extended protocol's Portal machinery (it's a SQL-level cursor, like
   psycopg's named server-side cursors). DDL is transactional via BEGIN/COMMIT/ROLLBACK. Cross-connection
   isolation is the WT engine's job (the test double only models atomicity).
-- [ ] **Row-locking clauses landed** (#132, b172): `SELECT … FOR UPDATE | FOR SHARE | FOR NO KEY UPDATE
+- [x] **Row-locking clauses landed** (#132, b172): `SELECT … FOR UPDATE | FOR SHARE | FOR NO KEY UPDATE
   | FOR KEY SHARE` with `NOWAIT` / `SKIP LOCKED` / `OF <table>` (sqlglot `stmt.args["locks"]` =
   `[exp.Lock]`) are **accepted as single-node no-ops** that return the rows — so SQLAlchemy's
   `with_for_update()` works. Honored across every SELECT shape (plain / join / group / distinct / CTE /
@@ -4151,7 +6156,7 @@ shared storage engine or building large new protocol subsystems:
   aggregate / `DISTINCT` / set-op / group is accepted rather than rejected as Postgres would; OF-target
   validation is only applied on the direct single-table/JOIN `_run_select` path (set-op/pipeline locks
   aren't re-validated). Not ported to the Rust server.
-- [ ] **TRUNCATE TABLE landed** (#133, b173): `TRUNCATE [TABLE] t [, …] [RESTART | CONTINUE IDENTITY]
+- [x] **TRUNCATE TABLE landed** (#133, b173): `TRUNCATE [TABLE] t [, …] [RESTART | CONTINUE IDENTITY]
   [CASCADE | RESTRICT] [IF EXISTS]` (sqlglot `exp.TruncateTable`: `expressions` = tables, `identity` =
   RESTART/CONTINUE, `option` = CASCADE/RESTRICT) → `engine._run_truncate`. Empties each table via
   `storage.delete_matching(db, coll, {})` (index entries maintained). `RESTART IDENTITY` resets each
@@ -4166,7 +6171,7 @@ shared storage engine or building large new protocol subsystems:
   identities unless they're also named; runs within the session transaction (rolls back with it) but
   isn't the O(1) file-truncate a real engine does — it's a bulk `delete_matching`. Not ported to the
   Rust server.
-- [ ] **Index / constraint reflection for `\d` landed** (#134, b174): `pg_catalog.pg_indexes`
+- [x] **Index / constraint reflection for `\d` landed** (#134, b174): `pg_catalog.pg_indexes`
   (`virtual._pg_indexes`) lists one row per index (`schemaname`/`tablename`/`indexname`/`tablespace`=NULL/
   `indexdef`) and `pg_get_indexdef(oid)` (`virtual.indexdef_for_oid`, wired in `scalar._call_func` +
   registered in `functions._SCALAR_EVAL_ANON`) both render `CREATE [UNIQUE] INDEX <name> ON public.<table>
@@ -4182,7 +6187,7 @@ shared storage engine or building large new protocol subsystems:
   but the expression text isn't rendered); expression/functional index columns reflect only when every
   key field maps to a declared column (index over a raw field is skipped); no `INCLUDE`/opclass/collation
   detail in `indexdef`. Not ported to the Rust server.
-- [ ] **Advisory locks landed** (#135, b175): the `pg_advisory_lock` family — `pg_advisory_lock` /
+- [x] **Advisory locks landed** (#135, b175): the `pg_advisory_lock` family — `pg_advisory_lock` /
   `pg_advisory_unlock` / `pg_advisory_unlock_all` plus the `_shared`, `_xact_`, and `pg_try_*` variants
   (eleven functions total) — as **session-tracked single-node no-op locking**. All parse as `exp.Anonymous`;
   registered in `functions._SCALAR_EVAL_ANON` so FROM-less `SELECT pg_advisory_*(…)` routes to
@@ -4202,7 +6207,7 @@ shared storage engine or building large new protocol subsystems:
   *this* connection's advisory locks (no cross-backend visibility) and no non-advisory lock types
   (relation/tuple/transactionid rows); `objsubid`/`tuple` reflect as `int4` (no `int2` type tag). Not ported
   to the Rust server.
-- [ ] **SET LOCAL + SHOW ALL / pg_settings landed** (#136, b176): `SET LOCAL name = value`
+- [x] **SET LOCAL + SHOW ALL / pg_settings landed** (#136, b176): `SET LOCAL name = value`
   (sqlglot `exp.SetItem(kind=LOCAL)`) applies a GUC only for the rest of the current transaction and
   reverts at COMMIT/ROLLBACK (`Session.set_local` / `restore_local_gucs`, hooked in
   `engine._end_txn_state`); outside a transaction it has no lasting effect (Postgres warns and drops it).
@@ -4217,7 +6222,7 @@ shared storage engine or building large new protocol subsystems:
   ROLLBACK (real Postgres reverts transactional GUCs); the txn-end revert of a *reportable* GUC (search_path
   etc.) doesn't emit a compensating `ParameterStatus`; `pg_settings` metadata is coarse (generic category,
   empty short_desc, NULL unit/min/max/enumvals, no per-GUC context). Not ported to the Rust server.
-- [ ] **Monitoring views (pg_stat_activity) landed** (#137, b177): `pg_catalog.pg_stat_activity` (one row
+- [x] **Monitoring views (pg_stat_activity) landed** (#137, b177): `pg_catalog.pg_stat_activity` (one row
   per live backend) + `pg_catalog.pg_stat_database` (per-db backend count) reflect a new server-level
   `session.ActivityRegistry` — `SecantusPGServer` registers each connection's `Session` on connect and
   unregisters on disconnect (parallel to the `_notify`/`_conns` pattern), assigns a unique per-connection
@@ -4233,7 +6238,7 @@ shared storage engine or building large new protocol subsystems:
   `pg_stat_activity` omits live `xact_start` / `state_change` / `wait_event*` / `leader_pid` /
   `backend_xid` (NULL); `client_port` is NULL and `client_addr` is text (not `inet`); COPY sub-protocol and
   the initial handshake don't update `state`. Not ported to the Rust server.
-- [ ] **Role membership (GRANT role TO role) landed** (#138, b178): `GRANT <roles> TO <members> [WITH
+- [x] **Role membership (GRANT role TO role) landed** (#138, b178): `GRANT <roles> TO <members> [WITH
   ADMIN OPTION]` / `REVOKE [ADMIN OPTION FOR] <roles> FROM <members> [CASCADE|RESTRICT]` — role-membership
   grants parse as `exp.Command` (no `ON` target, unlike privilege grants which are `exp.Grant`), routed by
   `engine._run_role_membership` (regex-split the tail; a Command carrying `ON` is a privilege grant → no-op
@@ -4250,7 +6255,7 @@ shared storage engine or building large new protocol subsystems:
   REVOKE are accepted but ignored (no dependency tracking); a membership referencing a name that isn't a
   declared role or the connecting user reflects with `oid 0` (won't join to `pg_roles`); no cycle detection.
   Not ported to the Rust server.
-- [ ] **FakeStorage removed — all SQL/PG tests on real Storage** (#140, b179): the legacy `tests/sqlfake.py`
+- [x] **FakeStorage removed — all SQL/PG tests on real Storage** (#140, b179): the legacy `tests/sqlfake.py`
   mock is deleted; every SQL / pg-server test now drives the real WiredTiger `Storage(str(tmp_path))` with a
   `try: yield finally: s.close()` fixture. The migration surfaced (and this slice fixed) four real bugs the
   mock had masked: (1) `query._coerce_datetime` — a tz-aware SQL literal vs a tz-naive-UTC stored datetime
@@ -4265,7 +6270,7 @@ shared storage engine or building large new protocol subsystems:
   (BSON decodes naive); the wire path is now tz-aware. `tests/test_sql_datetime_funcs.py` +
   `test_sql_spike.py` carry a small UTC-normalising shim (commented, referencing #141) so they assert the
   PG-correct tz-aware instant; remove the shim when #141 lands. **(Resolved in b181 — see below.)**
-- [ ] **Two-phase commit (PREPARE TRANSACTION) landed** (#139, b180): `PREPARE TRANSACTION 'gid'` /
+- [x] **Two-phase commit (PREPARE TRANSACTION) landed** (#139, b180): `PREPARE TRANSACTION 'gid'` /
   `COMMIT PREPARED 'gid'` / `ROLLBACK PREPARED 'gid'`. Handled *before* sqlglot in `run_sql`
   (`engine._maybe_two_phase` / `_TWO_PHASE_RE`) because sqlglot can't parse `COMMIT`/`ROLLBACK PREPARED` at
   all and `PREPARE TRANSACTION` collides with the SQL-level `PREPARE name AS` (#121). `PREPARE` detaches the
@@ -4285,7 +6290,7 @@ shared storage engine or building large new protocol subsystems:
   persists to `pg_twophase`); the statements work only over the **simple query protocol** (the extended
   Parse/Bind path routes a bound AST through `run_statement`, bypassing the pre-parse interceptor — same
   constraint as LISTEN/NOTIFY). Not ported to the Rust server.
-- [ ] **Embedded run_sql returns tz-aware `timestamptz` (#141, b181):** a stored `timestamptz` decodes
+- [x] **Embedded run_sql returns tz-aware `timestamptz` (#141, b181):** a stored `timestamptz` decodes
   tz-naive UTC from BSON, so the embedded `run_sql` result used to hand back a naive datetime while the wire
   path already rendered it tz-aware — an embedded/wire inconsistency, and the naive value silently
   mis-compared against a tz-aware literal. `engine._normalize_result` now tags naive `timestamptz` /
@@ -4301,7 +6306,7 @@ shared storage engine or building large new protocol subsystems:
   the divergence. A real naive-`timestamp` type (tag + OID 1114 + render/coerce/round-trip) is a larger
   slice — **now landed in #143, b183 (see below).** (The related WHERE `timestamptz_col = '…+00:00'` /
   `::timestamptz` filter-coercion quirk is **fixed in #142, b182** — see below.)
-- [ ] **timestamptz WHERE-equality bridges naive/aware (#142, b182):** `WHERE ts = '…+00:00'` /
+- [x] **timestamptz WHERE-equality bridges naive/aware (#142, b182):** `WHERE ts = '…+00:00'` /
   `= '…'::timestamptz` used to match **nothing** — the equality path (`query._eq_numeric_aware`, shared by
   bare equality / `$eq` / `$in` / `$ne`) did numeric coercion but not the tz-aware/naive datetime alignment
   the range operators already had (`_try_cmp` → `_coerce_datetime`), so a tz-aware SQL literal never equalled
@@ -4314,7 +6319,7 @@ shared storage engine or building large new protocol subsystems:
   from the Rust `eq_scalar` (which compares `Bson::DateTime` millis). Tests: `test_query.py`
   ::test_datetime_naive_aware_equality_same_instant + `test_sql_datetime_types.py`
   ::test_timestamptz_where_equality_matches_offset_literal / _uses_index.
-- [ ] **Distinct naive `timestamp` type (#143, b183):** `TIMESTAMP` / `DATETIME` (and `::timestamp` casts,
+- [x] **Distinct naive `timestamp` type (#143, b183):** `TIMESTAMP` / `DATETIME` (and `::timestamp` casts,
   `timestamp '…'` literals, `date + interval` / `timestamp + interval` arithmetic) now type as a distinct
   **`timestamp`** tag (OID 1114, `timestamp without time zone`) instead of collapsing to `timestamptz`
   (1184) — matching Postgres, which types those naive. Only explicit `TIMESTAMPTZ` /
@@ -4331,7 +6336,7 @@ shared storage engine or building large new protocol subsystems:
   test_cast_timestamptz_to_timestamp_strips_tz / test_timestamp_array_naive`. SQL-layer change only — no Rust
   parity impact (the Rust engines cover query/update/expr/aggregate, not the SQL type mapping). **Follow-up
   (`date_trunc` argument typing) landed in #144, b184 — see below.**
-- [ ] **date_trunc preserves argument tz-ness (#144, b184):** `date_trunc(unit, src)` now types as the
+- [x] **date_trunc preserves argument tz-ness (#144, b184):** `date_trunc(unit, src)` now types as the
   tz-ness of `src` — `date_trunc(text, timestamptz) -> timestamptz`, `date_trunc(text, timestamp) -> timestamp`
   (a `date` argument casts to naive timestamp) — instead of always `timestamptz`. `planner._infer_scalar_tag`
   threads the argument tag through the `TimestampTrunc` node (`CurrentTimestamp` / `now()` stay `timestamptz`);
@@ -4344,7 +6349,7 @@ shared storage engine or building large new protocol subsystems:
   argument and truncates the interval, zeroing every component finer than `unit` (years > months > days > time;
   `_date_trunc_interval` in `scalar.py`). Result types as `interval` (`_infer_scalar_tag`). `week` is not a valid
   unit for an interval (→ `0A000`, matching Postgres). SQL-layer only — no Rust parity impact.
-- [ ] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
+- [x] **CREATE/DROP INDEX landed; ALTER not.** `CREATE [UNIQUE] INDEX [name] ON t (col [DESC], …)`
   maps to `Storage.create_index` (PK column → `_id`; auto-generated `field_dir` name when
   unnamed; duplicate → `42P07`); `DROP INDEX [IF EXISTS] name` finds the owning collection by
   scanning the catalog and calls `drop_index` (`42704` when absent). Indexes now reflect back
@@ -4368,6 +6373,544 @@ shared storage engine or building large new protocol subsystems:
 ---
 
 When you fix one of these, delete the line. When you discover a new one, add it under the right section with enough context to come back to it cold.
+
+## The tail is CPU-bound, and 65% of the CPU is zlib (2026-08-22)
+
+Profiled on the DigitalOcean droplets — deliberately Linux, not macOS, and
+with `--payload random`, because two earlier wrong calls this session came from
+generalising a compressible-payload macOS reading to a Linux droplet.
+
+### The stalls are on-CPU, not blocked
+
+Sampling every server thread's scheduler state and wait-channel every 20ms
+(`/proc/<pid>/task/*/stat` + `wchan`) and intersecting with the client's
+`--slow-ms 50` stall windows — 4,729 samples, 1,886 stalls:
+
+| | outside stalls | inside stalls |
+| --- | ---: | ---: |
+| **R** (running) | 2.1% | **75.8%** |
+| S (sleeping) | 97.8% | 23.2% |
+| **D** (uninterruptible / disk I/O) | 0.1% | **0.9%** |
+| futex (lock wait) | 26.7% | 17.0% |
+
+**During a stall the threads are on the CPU**, disk I/O is negligible, and lock
+waiting *falls*. That retires the "threads blocking on disk reads because the
+cache cannot hold the working set" reading recorded earlier in this file — the
+stalls are compute, not I/O and not contention.
+
+### The compute is zlib
+
+`perf record` on the server during the same workload, by shared object:
+
+| shared object | CPU |
+| --- | ---: |
+| **libz.so (zlib deflate)** | **65.5%** |
+| libc | 7.0% |
+| kernel | 10.7% |
+| secantusd-rs itself | 16.6% |
+
+**Two thirds of the server's CPU is block compression.** Every symbol at the
+top of the profile is `deflate` under WiredTiger's page reconciliation.
+
+### This ties every earlier observation together
+
+Application threads conscripted into eviction spend that time in `deflate`, so:
+more cache helps (fewer evictions to compress), smaller documents help more
+(less to compress), eviction *thread count* does not help (the box has 4 vCPU
+and the work is CPU-bound), admission control does not help (it does not reduce
+total compression work), and the tail is worst exactly when the cache is
+smallest.
+
+### The lever nobody has pulled: a cheaper compressor
+
+Finding 13 concluded "never turn oplog compression off — 8w throughput craters
+to 19%", and that is correct: uncompressed pages mean more eviction IO. But
+that tested **zlib versus none**. The real choice is **zlib versus a cheaper
+compressor**, and it has never been measured.
+
+mongod defaults to **snappy** for collections precisely because it sits at a
+different point on the CPU/IO curve — roughly an order of magnitude cheaper to
+compress than zlib, at a worse ratio. SecantusDB pays zlib CPU on every page
+reconciliation, on a 4-vCPU box, while mongod pays snappy CPU. That is a strong
+candidate for the bulk of the 3.7x throughput gap *and* the tail.
+
+### DONE — and it is the largest lever measured in this project
+
+Built WiredTiger with the snappy / lz4 / zstd builtin extensions
+(`-DSECANTUS_WT_EXTRA_COMPRESSORS=ON`, plus
+`SECANTUS_WT_EXTRA_COMPRESSORS=1` / `SECANTUS_WT_EXTRA_LIBDIR` for the Rust
+link step — both opt-in, the default build is untouched) and swept
+`block_compressor` on the document *and* oplog tables via the existing
+`SECANTUS_OPLOG_TABLE_EXTRA` hook plus a new `SECANTUS_DATA_TABLE_EXTRA` one.
+8 writers, 1G cache, 8 KiB documents, 45s:
+
+**Incompressible payload** (`--payload random`):
+
+| compressor | ops/s | vs zlib | p50 ms | p99.9 ms | vs zlib | disk |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| zlib (today) | 19,752 | — | 0.16 | 105.98 | — | 19.7 GB |
+| snappy | 36,087 | **+83%** | 0.20 | 3.60 | **-97%** | 46.7 GB |
+| **lz4** | **36,709** | **+86%** | 0.20 | **3.47** | **-97%** | 37.8 GB |
+| zstd | 34,169 | +73% | 0.20 | 7.90 | -93% | 32.9 GB |
+
+**Compressible payload** (`--payload repeat`, zlib's best case):
+
+| compressor | ops/s | vs zlib | p99.9 ms | vs zlib | disk |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| zlib (today) | 36,830 | — | 8.38 | — | 28.6 GB |
+| snappy | 42,064 | +14% | 1.11 | -87% | 33.1 GB |
+| **lz4** | **42,255** | **+15%** | **1.05** | **-88%** | 32.7 GB |
+| zstd | 41,146 | +12% | 2.19 | -74% | 31.8 GB |
+
+**lz4 wins on both axes in both regimes.** Nearly double the throughput and a
+30x better tail on incompressible data; +15% and -88% even where zlib's ratio
+should shine. The cost is disk: 1.9x on incompressible content, but only 1.14x
+on compressible — and zstd is the middle option (+73%/+12% throughput, 1.67x /
+1.11x disk) if disk matters more than the last of the tail.
+
+This closes the loop on the whole investigation. It is why 65% of server CPU
+was `deflate`, why the tail was CPU-bound, why more cache helped (fewer
+evictions to compress), why eviction tuning did not (the work is CPU), and it
+is a large part of why mongod — which defaults to snappy — was 3.7x faster with
+a 72x better tail.
+
+It also revises Finding 13. "Never turn oplog compression off — throughput
+craters to 19%" is correct and still stands: uncompressed pages mean more
+eviction IO. But that measured **zlib versus none**, and concluded compression
+was load-bearing. The real axis is **which** compressor: zlib is the wrong
+point on the CPU/IO curve for this engine on small-core machines.
+
+- [x] ~~**Decide and ship a compressor change**~~ — **SHIPPED: lz4 is the
+  default** (2026-08-22). The document and oplog table configs now name
+  `block_compressor=lz4`; WiredTiger builds lz4 alongside zlib by default
+  (snappy/zstd stay behind `SECANTUS_WT_EXTRA_COMPRESSORS`), `liblz4-dev` /
+  `brew lz4` / `lz4-devel` / `lz4-dev` were added to every wheel and CI build
+  step that compiles WiredTiger, and `secantus-wt/build.rs` links lz4 and
+  auto-detects Homebrew's lib directory on macOS (Apple ships no liblz4, and
+  it is not on the default linker path).
+  **zlib remains linked deliberately** and must stay so: `block_compressor` is
+  recorded per table at create time, so a store written before this switch has
+  zlib tables. Verified end to end — a store created by the old binary was
+  opened by the new one, 201,982 documents read back with zero errors, and new
+  writes added an lz4 table alongside the 11 zlib ones. A unit test
+  (`zlib_must_remain_available_for_legacy_tables`) records why the extension
+  cannot be dropped as a cleanup.
+- [ ] **Consider exposing `--block-compressor`** so a disk-constrained
+  deployment can opt back to zlib (1.9x less disk on incompressible content),
+  and consider a per-table default — documents and oplog have different
+  read/write mixes and the sweep measured them together.
+- [ ] Re-run the three-droplet MongoDB comparison after the change. The
+  published 0.27x throughput / 72x p99.9 figures were measured with zlib; if
+  the sweep holds on Linux they should move substantially, and
+  `docs/benchmark.md` needs updating with them.
+
+## RETRACTED: the "42x dirty cache bytes" comparison was a counter artifact (2026-08-21)
+
+The cache sweep proved the tail is governed by cache pressure, but not why
+mongod holds p99.9 at 10.75ms where SecantusDB reaches 121ms **at the same 4G
+cache**. WiredTiger's own statistics answer it. Both engines are WiredTiger, so
+the same counters are directly comparable — enable with
+`statistics=(fast),statistics_log=(wait=1,json=true)` (via
+`SECANTUS_WT_CONFIG_EXTRA` here, `--wiredTigerEngineConfigString` on mongod),
+which needs no code and writes per-second JSON into the data directory.
+
+45s of insert-only load, 8 writers, 1G cache, 8 KiB documents. **Normalised per
+GB of logical data written** — the two engines did different amounts of work in
+the window (SecantusDB 11.95 GB, mongod 27.70 GB), so raw counters mislead:
+
+| counter, per GB of data written | SecantusDB | mongod | ratio |
+| --- | ---: | ---: | ---: |
+| **dirty cache bytes** | **1.12 GB** | **0.03 GB** | **42x** |
+| WAL bytes | 2.09 GB | 0.06 GB | 34x |
+| application-thread disk reads | 1,772 | 72 | 25x |
+| pages selected for eviction, unevictable | 132 | 9.4 | 14x |
+| eviction-worker pages | 9,214 | 5,205 | 2x |
+
+> **RETRACTED.** The `bytes dirty in the cache cumulative` counter does not
+> account for every table's writes, so this comparison measured counter
+> coverage rather than work. See "Why the dirty-bytes comparison is void"
+> below. The cache *sweep* (cache size versus tail) is a black-box measurement
+> and stands; this counter-based comparison does not.
+
+The original claim, kept for the record: SecantusDB dirties 42x more cache per
+byte of data written, which would explain every earlier result:
+more cache helps (more headroom before the trigger), smaller documents help
+more (less dirty per op), no eviction knob helps (the problem is upstream of
+eviction), and bounding concurrency does not help (it does not reduce dirty
+bytes per operation).
+
+Two supporting details worth noting:
+
+- The WAL row independently reproduces the uncompressed-log finding above:
+  2.09 GB per GB logical here versus 2.04x measured directly. A useful
+  cross-check that the instrument agrees with the file sizes.
+- Application threads do **more disk reads** (25x), not more eviction writes —
+  SecantusDB's app-thread page *writes* were actually lower than mongod's. So
+  the stall is threads blocking on reads because the cache cannot hold the
+  working set, rather than threads conscripted into writing pages out.
+
+### Split by table (also void — same artifact)
+
+Per-table dirty bytes, same workload (`statistics_log=(...,sources=("file:"))`
+— note `sources` accepts `file:`, not `table:`). Insert-only, 8 writers, 40s,
+10.77 GB logical written:
+
+| table family | dirty GB | share | x logical |
+| --- | ---: | ---: | ---: |
+| **oplog** | **11.39** | **95.0%** | 1.06x |
+| index_entries | 0.23 | 1.9% | 0.02x |
+| natural_seq (`_id` index) | 0.19 | 1.6% | 0.02x |
+| documents (the actual data) | 0.18 | 1.5% | 0.02x |
+
+Total 11.99 GB = 1.11x logical, against the connection-level counter's 1.12x —
+the two instruments agree, which is the cross-check that makes the split
+trustworthy.
+
+That split is **not** evidence the oplog does 63x more work — see below. It is
+the same counter-coverage artifact. It is also why `--oplog-async` was the single
+biggest lever found (-24%): it is the only change so far that touches the table
+responsible for 95% of the pressure.
+
+**Page size is NOT the explanation.** The oplog is created with
+`leaf_page_max=128KB, split_pct=100` (Finding-13 append tuning, +19% at 8
+writers), so "large pages re-dirtied on every append" was the obvious theory.
+Tested with `SECANTUS_OPLOG_TABLE_EXTRA`:
+
+| oplog `leaf_page_max` | ops/s | p99.9 ms | oplog dirty | x logical |
+| --- | ---: | ---: | ---: | ---: |
+| 128KB (today) | 32,348 | 8.26 | 11.24 GB | 1.06x |
+| 32KB | 32,180 | 8.26 | 10.99 GB | 1.04x |
+| 16KB | 31,640 | **10.69** | 0.05 GB | 0.00x |
+
+128KB and 32KB are indistinguishable — same tail, same dirty bytes. The 16KB
+row is an artifact, not a fix: 8 KiB values stop fitting the leaf and spill to
+overflow items, which the dirty-bytes counter does not see, and the tail gets
+*worse*. So the theory is disproven and the +19% tuning is not to blame.
+
+### Why the dirty-bytes comparison is void
+
+Chasing the oplog/documents asymmetry answered it. Adding `cache: bytes written
+from cache` alongside the dirty counter, same workload:
+
+| writers | table | dirty GB | **written GB** | written/dirty |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | oplog | 3.97 | **4.46** | 1.1x |
+| 1 | documents | 0.00 | **4.31** | **1,289x** |
+| 8 | oplog | 12.91 | **12.76** | 1.0x |
+| 8 | documents | 0.24 | **12.39** | **51x** |
+
+**The documents table writes essentially the same bytes as the oplog** — which
+is exactly right, since both hold a full copy of every document — while its
+cumulative-dirty counter reads ~zero. The write volumes are symmetric and
+credible; the dirty accounting is not. `bytes dirty in the cache cumulative`
+simply does not cover that table's writes.
+
+Consequences, stated plainly:
+
+- The **"oplog is 95% of dirty bytes"** split is an artifact of counter
+  coverage, not evidence that the oplog does 63x the work. Retracted.
+- The **"42x more dirty bytes than mongod"** comparison is worse: if mongod's
+  collection writes are similarly uncounted, that number compared how well each
+  engine's tables are instrumented, not how much cache they dirty. **Retracted.**
+- What survives: `bytes written from cache` shows the oplog and the documents
+  table each writing ~1x logical, so **~2x total** — which independently agrees
+  with the WAL measurement (2.04x from file sizes) and with the doc +
+  full-document-oplog-entry reasoning. That much is consistent across three
+  instruments.
+
+The mechanism behind mongod's better tail at the same cache size is therefore
+**still unexplained**. The cache sweep stands (tail is governed by cache
+headroom); what does not stand is any counter-based claim about *why*
+SecantusDB reaches the eviction trigger sooner.
+
+- [ ] **Re-do the comparison with a counter that covers both engines.**
+  `cache: bytes written from cache` per table is symmetric and trustworthy on
+  the SecantusDB side; the same counter on mongod's collection and oplog tables
+  would give a like-for-like write-volume comparison. That is the measurement
+  the 42x claim should have been built on.
+
+**Methodology note**: the run above used the default `repeat` payload, which
+mongod's snappy WAL compression crushes — that inflates the WAL row
+specifically. The dirty-cache row is not affected by WAL compression, and it is
+the row that matters.
+
+## The WAL is uncompressed: 2x logical data, and 22% of the tail (2026-08-21)
+
+Measured with `do-client --payload random` (per-document entropy — see the
+correction below). 20,000 x 8 KiB documents = 160 MB logical, WAL bytes
+sampled while the server was still running:
+
+| config | WAL | x logical |
+| --- | ---: | ---: |
+| SecantusDB, random payload | 327,072 KB | **2.04x** |
+| SecantusDB, repeated payload | 327,072 KB | **2.04x** |
+| mongod, random payload | 141,864 KB | 0.89x |
+| mongod, repeated payload | 8,244 KB | **0.05x** |
+| SecantusDB, random + `compressor=zlib` | 125,040 KB | **0.78x** |
+
+**SecantusDB writes byte-identical WAL volume for random and repeated
+payloads.** That is proof the WAL is uncompressed: `wt_config` sets
+`log=(enabled=true,file_max=...,prealloc=false)` and never names a compressor,
+while mongod defaults to `--wiredTigerJournalCompressor snappy`.
+
+The 2.04x itself is expected and matches mongod — every insert logs the
+document row *and* a full-document oplog entry, which is what mongod's oplog
+does too. The difference is purely that mongod compresses the result and
+SecantusDB does not. On the compressible payload the benchmarks elsewhere in
+this file used, that is **2.04x against 0.05x — roughly 40x the write I/O for
+the same workload.**
+
+### It is worth a fifth of the tail
+
+Turning on WAL compression (8 writers, 1G cache, 8 KiB docs, medians of two
+passes):
+
+| WAL | ops/s | p50 ms | p99.9 ms |
+| --- | ---: | ---: | ---: |
+| uncompressed (today) | 36,285 | 0.19 | 8.45 |
+| `compressor=zlib` | 34,365 | 0.20 | **6.62** |
+
+**-22% p99.9 for -5% throughput** — a far better trade than the admission
+control prototype (-12% tail for -22% throughput), and it composes with
+`--oplog-async` (-24%) since they attack different parts of the write path.
+It does not *fix* the tail (33x p50→p99.9 remains), but it is the second real
+lever found.
+
+- [ ] **Configure a WAL compressor.** `zlib` is already linked into the
+  vendored WiredTiger (`HAVE_BUILTIN_EXTENSION_ZLIB`) and is what the data
+  tables use, so this is a connection-string change, not a build change.
+  mongod uses snappy; zlib measured well here. Worth pairing with the
+  `log_file_max` rotation fix above — together they are ~19x the disk and ~22%
+  of the tail for ~5% of throughput.
+
+### Correction: `--payload random` was not measuring what it claimed
+
+First implementation generated **one** random payload per worker and reused it
+for every document. Each document was incompressible internally and every
+document was identical, so WiredTiger's block compression — which spans many
+records — crushed the lot: 20,000 x 8 KiB "random" documents produced an 8.8 MB
+table and preloaded in 1.2s. The first amplification numbers taken with it
+(a 96x WAL reduction from zlib) were an artifact and are void. Fixed to derive
+the payload per document; the numbers above are the corrected ones.
+
+## The 2GB WAL default costs 19x the disk — for up to 19% of throughput (2026-08-21, corrected 08-22)
+
+Measured while chasing write amplification: **SecantusDB leaves 674 MB on disk
+where mongod leaves 41 MB for the same 320 MB of documents** (40,000 x 8 KiB,
+clean shutdown, `du` of the data directory).
+
+The data files are not the problem — they are *smaller* than mongod's, because
+zlib beats snappy on this content:
+
+| engine | payload | total | WAL | data files |
+| --- | --- | ---: | ---: | ---: |
+| secantusdb | repeated char | 674 MB | 639 MB | 19 MB |
+| mongod | repeated char | 41 MB | 16 MB | 24 MB |
+| secantusdb | random | 691 MB | 639 MB | 37 MB |
+| mongod | random | 82 MB | 11 MB | 70 MB |
+
+It is entirely the write-ahead log: **639 MB against mongod's 11-16 MB**.
+
+**Cause.** The daemon defaults `--log-file-max` to 2GB (chosen so a sustained
+writer rotates rarely). WiredTiger can only reclaim *completed* log files, so a
+workload that writes 639 MB of WAL has produced exactly **one, still-active**
+file — nothing is reclaimable until 2 GB has been written. mongod's 100 MB
+files rotate several times over the same workload and are removed after each
+checkpoint. Confirmed by varying only that flag:
+
+| `--log-file-max` | WAL retained | total on disk |
+| --- | ---: | ---: |
+| 2GB (default) | 639 MB | **674 MB** |
+| 128MB | 32 KB | **35 MB** |
+| 64MB | 32 KB | **35 MB** |
+
+At 128 MB the total is 19x smaller *and beats mongod* (35 MB vs 82 MB).
+
+**The 2GB default buys nothing measurable.** A separate experiment varying only
+the log file size (128MB vs 1GB, 8 writers, 45s) moved throughput 35,984 →
+36,264 ops/s, under 1% and inside run-to-run noise, and left p99.9 unchanged.
+
+Also note the WAL is ~2x the logical data (639 MB for 320 MB of documents),
+consistent with every insert logging both the document row and a
+full-document oplog entry — the write-amplification hypothesis for the tail,
+now with a number attached.
+
+- [ ] **`log_file_max`: a disk-versus-throughput trade, NOT a free win**
+  (corrected 2026-08-22). The measurement above stands — 2GB retains 19x the
+  disk because WiredTiger reclaims only *completed* log files. But the claim
+  that it costs "under 1% of throughput" was wrong: `tasks/rust-perf-findings.md`
+  records a prior sweep of `file_max` 128MB→2GB measuring **+13-19% at 4-8
+  writers**, which is why the 2GB default was chosen. That sweep ran on Linux
+  under IO-bound conditions; the "<1%" reading here was macOS with a
+  compressible payload, where the log volume — and therefore the rotation cost
+  — was a fraction of the real thing.
+  So the real question is what a deployment should prefer: ~19x the journal
+  footprint, or up to ~19% of write throughput. Probably a **documented flag
+  with a smaller default** rather than a silent 2GB, since a user who does not
+  know the trade exists currently gets the disk-hungry end of it by default.
+  Re-measure on Linux with `--payload random` before deciding.
+- [ ] Re-check whether the full-document oplog entry can be trimmed, now that
+  the WAL cost of it is visible (2x logical data).
+
+**Methodology note**: this measurement is only meaningful with `--payload
+random`. `do-client`'s default payload is a repeated character, which both
+engines compress to nearly nothing — a bytes-on-disk comparison on it measures
+the compressor, not the engine. The throughput numbers elsewhere in this file
+used the repeated payload; both engines saw the same easy data, so the
+comparison is fair, but it is not representative of incompressible workloads.
+
+## p99.9 write-tail: WiredTiger cache pressure, unthrottled (2026-08-21)
+
+The three-droplet comparison put SecantusDB at **0.46-0.49x mongod's throughput
+but 9.8-11.3x its p99.9 latency** — far worse in the tail than at the median
+(1.5x p50, 3.7x p99). Investigated with `do-client --slow-ms`, which records
+every operation over a threshold **with its timestamp** (a histogram throws
+time away, which is exactly what a tail diagnosis needs back).
+
+**Reproduces locally**, so it is an engine property, not a network or cloud
+artifact: macOS over loopback shows the same shape (47x p50→p99.9 against the
+droplets' 48x). Every experiment below is therefore a free local run.
+
+### Where it lives
+
+- **Not the read path.** 8 concurrent readers: p50 0.14ms, p99.9 0.31ms — a 2x
+  spread. There is no read tail.
+- **The write path, and it is concurrency rather than per-write cost.**
+  Insert-only, 8 KiB docs, local:
+
+  | writers | ops/s | per-writer | p50 ms | p99.9 ms | ratio |
+  | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | 12,853 | 12,853 | 0.07 | 0.36 | 5x |
+  | 2 | 22,535 | 11,268 | 0.08 | 0.68 | 9x |
+  | 4 | 32,513 | 8,128 | 0.11 | **4.83** | **45x** |
+  | 8 | 36,583 | 4,573 | 0.19 | 8.26 | 44x |
+  | 16 | 42,144 | 2,634 | 0.29 | 9.92 | 34x |
+
+  The tail jumps 7x between 2 and 4 writers while the median barely moves.
+  Slow-op traces show **every large stall hitting all workers within the same
+  few milliseconds**, at irregular gaps (2.8s, 5.2s, 25.0s, 1.8s, ...) — a
+  convoy behind a shared resource, and not a fixed-period background task.
+
+### Root cause: cache pressure
+
+Cache sweep, 8 writers, insert-only, 8 KiB docs — throughput and p50 are flat;
+**only the tail moves**:
+
+| cache | ops/s | p50 ms | p99.9 ms | ratio |
+| ---: | ---: | ---: | ---: | ---: |
+| 512M | 35,391 | 0.18 | 9.28 | 52x |
+| 1G | 37,648 | 0.18 | 8.26 | 46x |
+| 2G | 39,324 | 0.18 | 2.96 | 16x |
+| 4G | 39,022 | 0.18 | 1.66 | 9x |
+| 8G | 38,910 | 0.18 | 1.29 | 7x |
+
+Shrinking the data instead of growing the cache does the same thing (256B docs
+instead of 8 KiB: p99.9 8.26 → 0.37ms, -96%), confirming it is the *rate dirty
+data fills the cache* that governs the tail, not the absolute data size — every
+run above writes ~14 GB regardless.
+
+### Ruled out by experiment
+
+Each a 45-60s local run against an 8.26ms baseline:
+
+| suspect | test | p99.9 |
+| --- | --- | --- |
+| Checkpoints | `--checkpoint-seconds 3600` | no change |
+| WT log preallocation | `log=(...,prealloc=true)` | no change |
+| WT log file size | `file_max=1GB` vs 128MB | no change |
+| **WT logging entirely** | `--data-nonlogged --oplog-nonlogged` | **no change** |
+| Eviction thread count | 4 → 8 threads | +2% (none) |
+| Eviction dirty thresholds | `dirty_target=5,trigger=10` | **+19% (worse)** |
+| Eviction dirty thresholds | `dirty_target=1,trigger=5` | **+16% (worse)**, -19% throughput |
+| Eviction updates thresholds | `updates_target=2,trigger=5` | **+16% (worse)** |
+| Oplog pruning | effectively disabled | unchanged, but worst stall 126ms → 26ms |
+
+There is **no WiredTiger config-only fix**: every eviction knob either did
+nothing or made it worse while costing throughput.
+
+### Admission control: prototyped, measured, and NOT the answer
+
+`--write-tickets N` (default 0 = off) bounds how many writes are inside the
+storage engine at once; the rest queue outside it. Implemented in
+`secantus-storage/src/admission.rs` — a Mutex+Condvar permit pool with a
+thread-local re-entrancy guard so a multi-document transaction rides one ticket
+instead of deadlocking against itself, and RAII release so a panicking write
+cannot leak a permit and wedge the pool.
+
+It works, and it does **not** fix the tail. Three interleaved passes, 512M
+cache (maximum pressure), 16 client writers, insert-only, medians:
+
+| tickets | ops/s | p50 ms | p99.9 ms | worst stall ms |
+| ---: | ---: | ---: | ---: | ---: |
+| off | 40,097 | 0.28 | 11.58 | 150.8 |
+| 4 | 31,319 | 0.44 | **10.18** | **102.1** |
+
+**-22% throughput to buy -12% p99.9 and -32% on the worst stall.** A poor
+trade. At a 1G cache with 16 writers it was worse still: 8 tickets gave -8%,
+4 tickets -1%, and 2 tickets made the tail *35% worse* while halving
+throughput.
+
+One genuine benefit: with tickets the tail becomes **perfectly repeatable**
+(10.18ms on all three passes, against 11.33-12.99ms unbounded). Bounding
+concurrency buys predictability, not speed.
+
+**Why the hypothesis failed.** Capping engine concurrency relocates the queue
+rather than removing it. A client holding 16 requests in flight still waits for
+all 16; moving 12 of them from a WiredTiger eviction stall into a condvar queue
+barely changes what the client's stopwatch sees. Compare: reducing the *client*
+to 4 writers gave p99.9 4.83ms, while 16 clients throttled to 4 tickets gave
+~10ms at similar throughput. Same engine concurrency, very different
+client-observed tail — the difference is offered load, not admission.
+
+So the flag stays **off by default** and is kept as a diagnostic and a
+predictability knob, not as a fix. It should not be enabled hoping for a faster
+tail.
+
+### Why mongod does better on identical hardware
+
+On the droplets both engines ran with the **same 4G cache** and the same
+workload, yet mongod held p99.9 at 10.75ms where SecantusDB reached 121ms. So
+this is not "SecantusDB needs a bigger cache" — it is that mongod degrades
+gracefully under the same pressure and SecantusDB does not.
+
+Admission control was the obvious explanation and it has now been **tested and
+rejected** (above): bounding engine concurrency buys almost nothing.
+
+The leading remaining hypothesis is **write amplification**. Every SecantusDB
+insert writes the document row, a **full-document oplog entry**, and the index
+entries — the `insert()` comment in `secantus-storage` puts it at 2-3x the
+message bytes. mongod's oplog entry for an insert is the document too, but the
+totals differ, and dirty bytes per operation is precisely the quantity the
+cache sweep shows the tail is governed by. If SecantusDB dirties materially
+more cache per insert than mongod does, it reaches the eviction trigger sooner
+at any given cache size — which is exactly the observed behaviour, and would
+explain why more cache helps, why smaller documents help even more, and why no
+eviction knob or concurrency bound does.
+
+That `--oplog-async` independently recovers 24% of the tail is consistent with
+it: the oplog is a large share of the write volume.
+
+**Next measurement**: bytes written to disk per insert, SecantusDB versus
+mongod, at a fixed document size. That is a direct test and it has not been
+run.
+
+### Where to go next
+
+- [x] ~~**Admission control**~~ — prototyped as `--write-tickets` and measured;
+  it is not the fix (see above). Kept, off by default, as a diagnostic and a
+  tail-predictability knob.
+- [ ] **Measure write amplification** — bytes on disk per insert, SecantusDB
+  versus mongod at a fixed document size. The leading hypothesis, and untested.
+- [ ] **`--oplog-async` as a default** — worth 24% of the tail and 42% of the
+  stalls on its own, independently of the cache story. Every write currently
+  passes through one process-wide `Arc<Mutex<OplogState>>`.
+- [ ] **Cache defaulting** — the daemon caps at 4G; the sweep shows the tail is
+  governed by cache headroom versus write rate, so the default deserves
+  revisiting (and documenting) rather than being a fixed number.
+
+Reproduce any of this with `do-client --slow-ms 5` (see `bench/DO_CLUSTER.md`
+"Diagnosing a tail"). Relates to the residual item in the section below and to
+`tasks/wt-concurrency-plan.md`.
 
 ## Concurrent-writer contention (found by bench.concurrency, 2026-07-16)
 
@@ -4393,12 +6936,21 @@ When you fix one of these, delete the line. When you discover a new one, add it 
   machinery, the rust-coll-locks slice. Re-measure with
   `bench.concurrency --server rust` and refresh docs/concurrency.md.)
 
-- Rust DDL paths (create/drop index, create/drop/rename collection) run
-  autocommit-per-operation under the global+collection locks — a crash
-  mid-DDL can leave orphan index-entry rows (invisible to readers, since
-  the registry row is the commit point, but a space leak). CRUD statements
-  are transactional since the rust-coll-locks slice; wrapping DDL the same
-  way is the remaining piece.
+- ~~Rust DDL paths run autocommit-per-operation~~ — **fixed (rust-backlog-clear
+  slice)**: create/drop index, drop-all-indexes, create/drop/rename collection
+  and dropDatabase now run their row writes (registry, index entries, options,
+  oplog) inside `with_statement_txn` + `retry_write_conflicts`, so a crash
+  mid-DDL can no longer strand orphan index-entry rows. dropDatabase is
+  per-collection transactions (mongod's unit; one db-wide WT transaction could
+  blow the cache dirty limit). WT schema `create` calls inside a wrapped DDL
+  are safe — WiredTiger runs them on an internal session
+  (`__wt_schema_internal_session`), so only an idempotent empty table can leak
+  on a crash. Pinned by `tests/ddl_txn.rs` (DDL joins + rolls back with a user
+  transaction). One residual: a DDL issued *inside* a user (multi-document)
+  transaction bumps the DDL generation (below) at statement end, not at the
+  user-txn commit where its rows become visible — irrelevant today because the
+  command layer never routes drop/rename through a user transaction (mongod
+  prohibits them in transactions too).
 
 ## Concurrency races (found by the concurrent stress suites, 2026-07-16)
 
@@ -4407,41 +6959,58 @@ Found by the two concurrency harnesses — `tests/test_mongo_server_concurrency.
 `tests/test_pgserver_concurrency.py` (psycopg vs the PG server); fixed items are
 recorded in that slice's changelog fragment. Still open:
 
-- [ ] **SQL UNIQUE constraints race across open transactions.** Statement-time
-  constraint probes read the session's snapshot, so two *open transactions* that
-  each insert the same UNIQUE value both pass the probe and both commit (the docs
-  have different `_id`s, so WiredTiger sees no write-write conflict). Real
-  Postgres blocks the second inserter on the index entry until the first commits.
-  The autocommit-vs-autocommit race is closed (the per-storage statement-write
-  lock in `sql/executor.py`); the cross-transaction case needs either commit-time
-  re-validation against committed state or storage-level unique indexes backing
-  SQL UNIQUE constraints.
-- [ ] **SQL advisory locks provide no cross-connection exclusion** (§ "Advisory
-  locks landed", #135): `pg_advisory_lock` is per-`Session` bookkeeping that always
-  grants, so two connections can hold the same exclusive lock concurrently — apps
-  using advisory locks for leader election / migration fencing (alembic, cron
-  fencing) get no mutual exclusion. A truthful implementation needs a server-wide
-  lock table (like `NotifyHub` / `PreparedXactRegistry`) with blocking waits and
-  deadlock detection.
+- ~~**SQL UNIQUE constraints race across open transactions.**~~ — **FIXED
+  (#775 + #778)**: exactly the fix this entry called for landed — storage-level
+  unique indexes (`table:secantus_unique_keys`, WiredTiger-enforced) back both
+  the Mongo persona's unique indexes and SQL `UNIQUE` / `PRIMARY KEY`
+  constraints, so cross-transaction and simultaneous-uncommitted duplicates
+  collide on the key itself. See "UNIQUE constraints across transactions —
+  FIXED (storage + SQL)" below for the full record. Sole surviving sliver:
+  **DEFERRABLE constraints** keep the commit-time check (an every-write index
+  would reject legitimately-transient violations, e.g. the value-swap case) and
+  therefore keep the old race — a narrow, documented trade.
+- ~~**SQL advisory locks provide no cross-connection exclusion**~~ — **FIXED
+  (advisory-lock-hub slice)**: exactly the implementation this entry called
+  for — a server-wide `AdvisoryLockHub` (`sql/pgadvisory.py`, the `NotifyHub`
+  pattern) is now the authority: exclusive/shared grant rules, re-entrant
+  per-owner holds with session- and transaction-level lifetimes, BLOCKING
+  `pg_advisory_lock*` waits with a wait-for-graph deadlock check every ~1s
+  (PostgreSQL's `deadlock_timeout` shape) surfacing `40P01 deadlock
+  detected`, `pg_try_*` returning real grant results, and release at
+  unlock / unlock_all / COMMIT (xact locks) / connection teardown. The
+  per-`Session` bookkeeping stays as the `pg_locks` reflection layer and is
+  hub-synced; embedded `run_sql` sessions (no hub) keep the old single-
+  connection behaviour. Pinned by the cross-connection suite in
+  `tests/test_sql_advisory_locks.py` (exclusion, blocking, shared-vs-
+  exclusive, deadlock, xact-release, teardown-release, plus a wire-level
+  two-psycopg-connection test).
 
-## Rust lock-free reads: DDL-vs-scan wobble (2026-07-17)
+## Rust lock-free reads: DDL-vs-scan wobble (2026-07-17) — FIXED
 
-- A `renameCollection` / `dropCollection` / `dropDatabase` racing a
-  lock-free read can yield a partial result set (the reader walks shared
-  tables while the DDL is mid-copy/mid-delete). Real mongod kills open
-  cursors on drop and errors them; we return the partial page instead. No
-  wrong documents are ever served (every candidate is re-verified) — the
-  divergence is result-set completeness during a concurrent namespace-level
-  DDL. Fix would be a namespace-generation check (bump a counter on DDL,
-  re-check before returning) or reader-visible kill markers.
+- ~~Partial result sets when a rename/drop/dropDatabase races a lock-free
+  read~~ — **fixed (rust-backlog-clear slice)** by the namespace-generation
+  check this entry proposed, made sound by the DDL statement transactions
+  above (a DDL's row writes now commit atomically, so a re-run whose
+  generation held still is a point-in-time answer). `Storage.ddl_generation`
+  is a seqlock-style counter: every namespace DDL holds it odd for its
+  duration (`ddl_generation_scope`, drop-guarded so an error can't stick it
+  odd; sound because DDL serialises on the global lock), and
+  `find_matching_with` / `count_matching` re-run a scan whose generation was
+  odd or moved (`with_ddl_generation_check`, bounded at 5 re-runs so a DDL
+  storm can't livelock a reader). The pre-bump matters: a post-commit-only
+  bump left a window where a reader finished a partial scan and checked the
+  generation before the DDL thread bumped it. Pinned by
+  `tests/concurrent_reads.rs::scans_racing_namespace_ddl_are_never_partial`.
 
 ## Follow-ups from the #451 (concurrency stress suites) review, 2026-07-17
 
-- [ ] **Rust `UpdateOutcome::post_image` is cloned unconditionally** — every
-  single-doc update pays a full `Document` clone even when the caller is a
-  plain `update` that never reads it (the Python side gates on
-  `return_post_images`). Plumb a `want_post_image` flag, or let the raw-BSON
-  serving-path refactor (tasks/rust-perf-findings.md) subsume it.
+- [x] ~~**Rust `UpdateOutcome::post_image` is cloned unconditionally**~~ —
+  fixed (rust-backlog-clear slice): `update_matching` /
+  `update_matching_pipeline` / the command-seam
+  `update_matching_array_filters` / `update_matching_pipeline` take a
+  `want_post_image` flag; only `findAndModify` passes `return_new`, so a
+  plain update no longer pays the per-doc post-image clone (mirrors the
+  Python side's `return_post_images` gating).
 
 ## CI build cost
 
@@ -4451,11 +7020,14 @@ recorded in that slice's changelog fragment. Still open:
   both named `${Python3_EXECUTABLE}`, which under a PEP 517 build is the
   isolated build env's interpreter — a fresh temp path on every build — so the
   patch and configure stamps were invalidated every time. Local half is fixed
-  (interpreter passed by file + `REALPATH`; rebuild 37 s -> 1.3 s). CI still
-  pays it in full because every job starts from a fresh checkout with no build
-  dir; that needs a build-dir cache, whose design and the source-patching
-  hazard it must avoid are in `tasks/wt-build-cache-plan.md`. Windows is still
-  unstabilised there (venv pythons are copies, so `REALPATH` is a no-op).
+  (interpreter passed by file + `REALPATH`; rebuild 37 s -> 1.3 s). **The CI half is
+  fixed too — corrected 2026-08-20.** The build-dir cache this entry called for was
+  built and is live: `test.yml` carries a "Restore the WiredTiger build"
+  `actions/cache` step on `path: build`, keyed on runner OS + image version + WT rev
+  + config + interpreter, deliberately with no `restore-keys` so a near-miss cold-builds
+  rather than reusing objects from a different compiler. The immediately following item
+  (#562) records the follow-up fix. **What actually remains:** Windows is still
+  unstabilised (venv pythons are copies, so `REALPATH` is a no-op).
 - [x] ~~**The WiredTiger build cache restores but the test lanes rebuild anyway.**~~
   ANSWERED and fixed (#562). scikit-build-core writes `Python3_EXECUTABLE` into
   the TOP-LEVEL CMakeCache, and under PEP 517 that is the isolated build env — a
@@ -4568,9 +7140,9 @@ touched:
 
 - **RUSTSEC-2025-0134** — `rustls-pemfile` 2.2.0 unmaintained. Transitive; its
   API folded into `rustls-pki-types`. Clears when the TLS dep chain updates.
-- **RUSTSEC-2026-0190** — `anyhow` 1.0.102 unsound (`Error::downcast_mut()`).
-  Fixed in a later 1.0.x; a plain `cargo update -p anyhow` should clear it — do
-  it next time the relevant lockfiles are regenerated.
+- ~~**RUSTSEC-2026-0190** — `anyhow` unsound~~ — cleared (rust-backlog-clear
+  slice): `cargo update -p anyhow` → 1.0.104 in all four lockfiles
+  (`crates/`, `secantusdb`, `secantus-storage`, `secantus-storage-py`).
 - **RUSTSEC-2026-0196 / -0197** — `cgmath` 0.18.0 unmaintained + `swap_columns`
   UB. Pulled in transitively via the geo/spatial stack (`s2`). No fixed release;
   revisit if the geo dependency is ever swapped.
@@ -4578,3 +7150,840 @@ touched:
 The two *vulnerability*-class pyo3 advisories (RUSTSEC-2025-0020 / -2026-0177) are
 tracked separately in #584 (the 0.22 -> 0.29 migration) and are the two IDs on
 the gate's `--ignore` baseline. When #584 lands, drop those ignores.
+
+## Oplog in-flight window races on Windows CI (2026-08-01) — RESOLVED by #743
+
+`tests/test_oplog_visibility.py::test_find_seq_for_ts_waits_for_in_flight_mint`
+fails intermittently on the Windows CI lanes (seen on PRs #739 and #741, both
+of which touch only the SQL front end and cannot reach this code). It has not
+been reproduced on macOS.
+
+**This is a real product race, not a slow runner.** It was first mis-diagnosed
+as `find_seq_for_ts`'s bounded 0.5s wait expiring under load, and the bound was
+made injectable so the test could widen it to 30s. **It still failed after
+that**, which rules the deadline out.
+
+What the failure means, from the code: `find_seq_for_ts` returns the
+committed-view answer once `r - 1 <= oplog_visible_tail_seq()`. With seq 2
+minted inside an open batch transaction, `oplog_visible_tail_seq()` must report
+`min(_oplog_in_flight) - 1 == 1`, so the wait continues until seq 2 commits and
+the answer is 2. Getting 3 means `_oplog_in_flight` did **not** contain seq 2 at
+that moment, so the in-flight registration was either not yet visible to the
+reading thread or was dropped.
+
+Why this matters beyond a red lane: `oplog_visible_tail_seq` is what stops a
+change-stream reader advancing past a hole. If the in-flight window can be
+observed empty while a mint is genuinely in flight, a `startAtOperationTime`
+position can be finalised above an uncommitted entry and that event is
+**permanently skipped** when its transaction commits. That is silent event loss,
+which is exactly what the visibility work in #706 existed to prevent.
+
+Where to look: `Storage._mint_oplog_seqs` registers the range under
+`_oplog_seq_lock`, and `_deregister_minted` removes it at the emitting scope's
+resolution point, with the pending ranges parked on **thread-local**
+`_tls.pending_minted`. Suspect the interaction between that thread-local
+bookkeeping and a batch transaction whose emit and commit happen on different
+threads from the reader, plus `oplog_visible_tail_seq_nolock`'s deliberately
+lock-free dict read. Windows' coarser scheduling quantum likely just widens a
+window that exists everywhere.
+
+Do not "fix" this by deselecting the test or by widening a timeout again.
+
+**RESOLVED (verified 2026-08-09): this was the sample-after-scan bug #743
+fixed the same evening; the entry was written mid-investigation and never
+closed.** The timeline is decisive: every observed failure — including the
+still-failed-with-a-30s-bound runs — rode PRs #739 (16:02) and #741 (18:05)
+on 2026-08-01, and #743 ("sample the visible tail before the scan, not
+after — silent event loss") merged at 19:22 that day, touching exactly this
+test with the load-bearing sample-order comment now in
+``find_seq_for_ts``. Since #743: zero failures of this test across every
+lane (8 days of CI, Windows lanes on every push — the two later red runs
+that existed were the since-fixed ``test_math_funcs_via_driver`` numeric
+failures, no ``find_seq_for_ts`` involvement). Freshly re-verified against
+current main: a 500-iteration jittered stress of the exact choreography in
+fast-storage mode plus 500 more under ``SECANTUS_FORCE_DURABLE=1`` — zero
+failures — and a code audit of the invariants (range registration is atomic
+with minting under ``_oplog_seq_lock``; ``_mint_ts`` stays strictly
+monotonic even under a backwards wall clock; with the visible tail sampled
+before the scan, no event-loss interleaving is constructible).
+
+## UNIQUE constraints across transactions (2026-08-01) — FIXED (storage + SQL)
+
+**Was: a data-integrity bug on the SQL front end; duplicates were silently stored.**
+The common case is fixed (see "What is fixed" / "What remains" at the end of
+this entry); the original diagnosis is kept because the residual holes share it.
+
+Reproduce in one script: connection A opens a transaction and reads (taking its
+snapshot), connection B inserts and commits a row, then A inserts a row with the
+same `UNIQUE` value and commits. Both rows land. Real PostgreSQL 14.13 rejects
+A's insert with `23505 duplicate key value violates unique constraint` — checked
+side by side.
+
+```sql
+CREATE TABLE uq (id bigint primary key, val int unique);
+-- A: BEGIN; SELECT count(*) FROM uq;      -- snapshot taken
+-- B: INSERT INTO uq VALUES (1, 42);       -- commits
+-- A: INSERT INTO uq VALUES (2, 42); COMMIT;   -- should fail, currently succeeds
+-- => 2 rows, 1 distinct val
+```
+
+Mechanism: uniqueness is enforced by `Storage._unique_conflict`, a prefix probe
+over `table:secantus_index_entries` **read through the caller's transaction
+snapshot**. A row committed after that snapshot is invisible, so no conflict is
+detected. WiredTiger cannot catch it either: an index entry's key is
+`escape(sortkey) + \x00\x00 + RecordId`, so two docs sharing an indexed value
+produce *different* keys and never collide.
+
+Today's autocommit path survives only because each statement is its own short
+transaction (fresh snapshot) *and* `_coll_lock(db, coll)` serialises the
+probe-and-insert within a process. Neither protects a multi-statement
+transaction, which is why the explicit-transaction case above is broken now.
+
+Fixing it is the prerequisite for the implicit-transaction work below — that
+change gives every batch a snapshot older than its statements, which widened
+this from a narrow window to routine (a probe test stored 150 rows across 20
+distinct values). Options, in rough order of fidelity:
+
+- Give unique indexes a key with **no RecordId suffix**, so WiredTiger's own key
+  uniqueness and conflict detection enforce them, as a real unique index does.
+  This is the principled fix and the one that also handles two *simultaneous*
+  uncommitted inserts. It changes the on-disk entry layout, so it needs an
+  `entryFormat` bump and the Rust twin.
+- Or probe on a **fresh session** (latest committed) in addition to the
+  transaction's own view, so own-transaction writes are still seen. Cheaper, but
+  it leaves the simultaneous-uncommitted case to the collection lock and costs an
+  extra probe on every insert into a table with a unique index — measure against
+  the perf gates.
+
+Do not paper over this by re-scoping the tests. `tests/test_pgserver_concurrency.py`
+already asserts the invariant for the autocommit path; the explicit-transaction
+case needs a test of its own once fixed.
+
+## `numeric` exactness (2026-08-01) — FIXED, with one divergence left
+
+`planner._literal` turns any decimal literal into a Python `float`, so Postgres'
+arbitrary-precision exact `numeric` behaves like a double. Verified against real
+PostgreSQL 14.13:
+
+| expression | ours | real PG |
+| --- | --- | --- |
+| `SELECT 0.1 + 0.2` | `0.30000000000000004` | `0.3` |
+| `SELECT 0.1 + 0.2 = 0.3` | **false** | true |
+| `SELECT 0.000000` | `0` | `0.000000` |
+| `SELECT 12345678901234567890.12345 + 1` | `1.2345678901234567E+19` | `12345678901234567891.12345` |
+
+The last row is the serious one: a value wider than a double silently drops
+digits, which for money-shaped data is corruption rather than rounding. The
+scale loss is what pgjdbc's `NumericTransfer2Test` fails on (26 of the gauge's
+remaining failures, all `getBigDecimal for SELECT 0.x00000`).
+
+Parsing the literal as `Decimal` fixes the scale half and is a two-line change,
+**but it is not sufficient on its own** — it was tried and reverted. Arithmetic
+is evaluated elsewhere and still coerces to float, so the exactness rows above
+stay wrong, and `secantus.expressions` raises `ExpressionError` when a `Decimal`
+reaches it (`tests/test_sql_colref.py::test_col_lt_arithmetic` and
+`tests/test_sql_types.py::test_integer_division_truncates_in_aggregate_args`
+both fail). Land it as one piece: literal parsing, the expression engine's
+numeric tower, and the float8-vs-numeric distinction (`1e3` is float8 in
+Postgres, a plain `1.5` is numeric) together.
+
+### UNIQUE across transactions — what is fixed, and what remains
+
+**RECONCILED 2026-08-10: everything below is superseded — both residual holes
+are CLOSED (#775 storage, #778 SQL wiring); the section is kept as a stub so
+in-flight references resolve.** The interim `find_matching_committed` probe
+described here (and its two residual holes: a transaction that had already
+written to the table, and two simultaneous uncommitted inserts) was replaced
+by the storage-level fix the old text proposed "for when someone takes it on"
+— implemented additively as `table:secantus_unique_keys` rather than the
+entry-table re-key, so no format bump was needed. The Mongo persona's
+multi-document-transaction gap closed with it (the unique-keys table is
+engine-enforced, snapshot-independent). Pinned by
+`tests/test_storage_unique_keys.py` and the wire-level
+`tests/test_sql_unique_across_transactions.py` concurrency tests (eight
+concurrent writers, exactly one winner). See "The storage-level fix landed"
+and "SQL UNIQUE is now storage-backed too" further down for the design record.
+The one deliberate residue: **DEFERRABLE constraints** keep the commit-time
+check and with it the old cross-transaction race (narrow, documented there).
+
+**Post-reconcile regression, found and fixed the same week (unique-keys-drop-
+purge slice, 2026-08-10):** the claims table survived namespace teardown — no
+drop path purged `table:secantus_unique_keys`, so DROP TABLE → recreate →
+re-insert falsely rejected the value with 23505 (the FALSE-rejection class
+#775's additive design was supposed to make impossible). Caught by the first
+full weekly sweep after #775: slt's `index/delete` lane failed in both
+engines (its corpus cycles drop/create with unique indexes), reproduced in
+eight lines. (It was NOT the pgjdbc 2h blowout's cause — that turned out to
+be a leaked idle-in-transaction connection pinning WT's oldest snapshot; see
+the pgjdbc-lane entry below.)
+All five teardown paths now purge claims (drop_collection / drop_database /
+drop_index / drop_all_indexes / rename src+dst), pinned by
+`TestClaimsDieWithTheirNamespace` in `tests/test_storage_unique_keys.py`.
+
+### `numeric` — what landed, and the division-scale divergence
+
+**Fixed.** A decimal literal is now `Decimal128`, the same exact type a
+`numeric` column already stored (`typemap.number_literal`, shared by the
+planner and the scalar evaluator — they previously carried separate copies,
+which is why fixing only one left arithmetic on floats). Exponent notation is
+numeric too: `pg_typeof(1e3)` is `numeric`, checked against 14.13, which is not
+what the notation suggests. Comparison operators unwrap Decimal128 rather than
+swallowing the TypeError and answering false.
+`tests/test_sql_numeric_exact.py` covers it.
+
+~~**Divergence: Postgres derives a scale for numeric division; we do not.**~~
+— **FIXED (numeric-div-scale slice)**: `select_div_scale` is ported verbatim
+into `typemap.numeric_div` (base-10000 operand weight + leading digit →
+16-significant-digit result scale, floored by the operands' display scales,
+clamped to 0..1000; ROUND_HALF_UP, PG's half-away-from-zero), wired through
+`scalar._pg_div` for numeric/numeric (int/int keeps truncation; any float8
+operand keeps float coercion). Probed against a LIVE local PostgreSQL 14.13:
+20 division cases, byte-identical text renders end-to-end. Pinned by
+`tests/test_sql_numeric_div_scale.py` (the probed battery) and the upgraded
+`test_float_by_numeric_typmod`, which now asserts the scale it previously
+deliberately ignored.
+
+**Anything that consumes a numeric value must unwrap it first**
+(`typemap.unwrap_numeric`): `Decimal128` implements no Python numeric
+protocol, so `int()`, `float()`, arithmetic, comparison and unary minus all
+reject it outright. Landing this change flushed out call sites in `coerce`,
+the percentile/sequence planners, `log()`, unary minus, and the binary wire
+encoders — each of which had been fed a float before and raised a bare
+TypeError on the first decimal.
+
+**Residual: values beyond Decimal128's 34 significant digits.** The pgjdbc
+numeric cluster went 26 -> 4 with this change; the remaining 4 are
+`SELECT 0.1000000000000000000000000000000...` and its integer counterpart,
+which carry more than 34 significant digits and so round when stored as
+Decimal128. Postgres' numeric is arbitrary precision. Fixing it means not
+using Decimal128 as the carrier — a bigger change than this one, since
+Decimal128 is what the storage layer stores for a `numeric` column — and it is
+the same limit already noted against `typemap.coerce`.
+
+## ORDER BY does not sort rows expanded by a set-returning function (2026-08-02)
+
+Silent wrong ordering, pre-existing and affecting every SRF in the select
+list, not just the one added most recently:
+
+```sql
+CREATE TABLE src (id int primary key); INSERT INTO src VALUES (1);
+SELECT unnest(ARRAY[9,8,7]) FROM src ORDER BY 1;   -- we give 9, 8, 7
+                                                   -- Postgres gives 7, 8, 9
+```
+
+Cause: in `executor._evaluated_value_rows` the ORDER BY keys are computed once
+per SOURCE document (`_order_key` over `make_scope(doc)`) and only then is the
+row expanded by `_expand_srf`. Every expanded row therefore inherits one
+identical sort key and they keep the array's own order. With a single source
+row nothing sorts at all.
+
+Fixing it means deriving the sort key from the EXPANDED row when an ORDER BY
+term refers to an output column that an SRF produced — positional terms
+(`ORDER BY 1`) map straight onto the output tuple, and an expression term has
+to be matched against the projection. Watch DISTINCT ON while doing it: that
+key is deliberately row-level and computed before expansion, and the two must
+not be conflated.
+
+Pinned by `tests/test_sql_pg_expandarray.py::TestFieldSelection::
+test_order_by_does_not_sort_expanded_rows` so the current shape is visible
+rather than assumed correct.
+
+**Re-measured 2026-08-27 against a LIVE PostgreSQL 14** (one is running on this
+machine — `host=127.0.0.1 port=5432`, and `SECANTUS_PG_ORACLE_DSN` points the
+sub-ms oracle test at it; the same trick works for any SQL probe). The entry
+above is confirmed, and the probe found **two further divergences it does not
+mention**:
+
+- **`ORDER BY` over `unnest` — FIXED 2026-08-28.** Both halves: `ORDER BY 1`
+  silently returned array order, and `ORDER BY <alias>` / `<alias> DESC` — the
+  shape a real query uses — answered `0A000 feature not supported`. One cause:
+  sort keys were computed per SOURCE row, *before* expansion, so every expanded
+  row shared a single key and a stable sort left array order untouched. Keys for
+  an SRF-produced output now come off the **expanded tuple**
+  (`EvaluatedSelectPlan.order_srf_output`, resolved in the executor's expansion
+  loop). `DISTINCT ON` deliberately stays row-level — the entry's own warning,
+  and its tests still pass. Verified against PostgreSQL 14 for ordinal, alias,
+  `DESC`, and text elements; pinned by `TestSrfOrdering`.
+  **Still open, narrower:** the *record*-SRF field form
+  `(information_schema._pg_expandarray(arr)).x` plans by a different route the
+  fix does not reach, so it keeps array order; and `(...).n AS n ... ORDER BY n`
+  answers `42703` (verified pre-existing, not introduced by the fix).
+- **`unnest` declared `int4` for EVERY array — FIXED 2026-08-27.** Chasing the
+  `.x` type led to a far worse bug one level up: `_infer_scalar_tag`'s SRF branch
+  returned a hardcoded `int4`, so `SELECT unnest(ARRAY['a','b'])` put `int4` in
+  the RowDescription and then sent `a`. psycopg did `int('a')` and raised
+  `ValueError: invalid literal for int() with base 10: 'a'` **client-side** —
+  the query failed outright for text, numeric and boolean arrays. Only integer
+  arrays worked, and only by luck. The branch now infers the array's element
+  type (and keeps `int4` for the subscript-yielding `generate_subscripts` /
+  `.n`). Verified against a live PostgreSQL 14 for text / numeric / bool / int;
+  pinned by `TestSrfElementTypes`.
+- **`_pg_expandarray(...).x` still comes back as TEXT (open).**
+  `SELECT (information_schema._pg_expandarray(ARRAY[9,8,7])).x` gives
+  `'9','8','7'` where PG gives ints; `.n` is correct. The element-type inference
+  above does NOT reach it — the record-SRF field projection is typed by a
+  different path that assigns `any` (`pg_oid` 0) before
+  `_infer_scalar_tag` is consulted, so finding that path is the work. Narrow: it
+  affects only the `.x` field of one `information_schema` helper, which is
+  pgjdbc's `DatabaseMetaData` route.
+
+`unnest` ordering (above) and `.x` typing remain; `unnest` element types, `.n`,
+and `generate_subscripts` match PG exactly.
+
+## Unquoted identifiers are not case-folded (2026-08-02) — FIXED
+
+Postgres folds an unquoted identifier to lower case, so `AS TABLE_NAME` and a
+later `r.table_name` are the same column. We preserve the case as written and
+compare exactly, so they are two different names:
+
+```sql
+CREATE TABLE src (id int primary key); INSERT INTO src VALUES (1);
+SELECT r.table_name FROM (SELECT id AS TABLE_NAME FROM src) r;
+-- ERROR: column "table_name" does not exist   (Postgres: 1)
+SELECT r.TABLE_NAME FROM (SELECT id AS table_name FROM src) r;
+-- ERROR: column "TABLE_NAME" does not exist   (Postgres: 1)
+```
+
+Matching case works, which is why this went unnoticed — code that writes an
+alias one way and reads it back the same way never trips it. Anything
+generated, or written in the SQL-standard uppercase style, does.
+
+**This is now what blocks the pgjdbc `UpdateableResultTest` cluster (26).**
+Its `DatabaseMetaData.getPrimaryKeys` aliases columns as `AS TABLE_NAME` /
+`AS KEY_SEQ` in a subquery and reads them back lower-cased from the outer
+query. The `_pg_expandarray` support those queries also needed has landed, and
+the failure message moved from `function _pg_expandarray() is not supported`
+to `field access on a non-composite value` to `column "table_name" does not
+exist` — each fix exposing the next layer.
+
+Fixing it means folding unquoted identifiers at parse/resolve time — aliases,
+column references, and table names alike — while leaving quoted ones exact.
+Note sqlglot records whether an identifier was quoted (`Identifier.quoted`),
+which is the signal to key off. Check the catalog paths too: table and column
+names created unquoted should also fold, and `pg_catalog` lookups already
+assume lower case.
+
+### Case folding landed; the empty column name that followed is also fixed
+
+Folding happens once in `planner._fold_unquoted_identifiers`, right after the
+parse: every unquoted `Identifier` is lower-cased and quoted ones are left
+exactly as written, so no downstream consumer needs case logic of its own.
+`PUBLIC` is restored in `_grant_principals` because Postgres treats it as a
+keyword and `information_schema.role_table_grants` reports it upper-case.
+
+The pgjdbc `UpdateableResultTest` cluster went **33 -> 24** and the gauge
+94.2% -> 94.4%. The remaining 21 now fail with:
+
+```
+ERROR: column "" does not exist
+```
+
+— an EMPTY column name, the same smell as the `relation ""` bug that turned
+out to be `TypeInfoCache`. It comes from `DatabaseMetaData.getPrimaryKeys`,
+whose outer query wraps the `_pg_expandarray` subquery. The obvious candidates
+were each reproduced in isolation and are all fine: a `NULL AS ALIAS` column in
+a derived table, a quoted upper-case outer alias over a folded inner one, and
+the missing space in the driver's own `AS "IS_NOT_NULL"FROM` concatenation.
+
+**Do not reconstruct the query by hand to find it** — that is what cost the
+time here. Log the statement server-side (the `pgserver` query path) during a
+`validate-pgjdbc` run and read back exactly what the driver sent, including
+the parameter placeholders and the `pg_table_is_visible` / `ct.relname = ?`
+clauses that only appear for some call shapes.
+
+### `column "" does not exist` — FIXED (RowDescription source identity)
+
+Found by doing what the note above said: instrumenting the server to log the
+statement behind each SQLError during a `validate-pgjdbc` run, rather than
+reconstructing the query. What the driver actually sent was
+
+```sql
+UPDATE primaryunique SET  "" = $1 WHERE "id" = $2
+```
+
+— pgjdbc had generated the empty column name itself. Its
+`PgResultSetMetaData.getBaseColumnName` returns `""` the moment a field's
+table oid is 0, and we sent 0 for the table oid and 0 for the attnum on every
+RowDescription field. `ColumnDesc` now carries both and the wire encoder emits
+them.
+
+Note the Describe path needed fixing separately from the executed path: the
+extended protocol describes without executing (`engine._describe_statement`),
+and that is the one a JDBC client reads. Fixing only the executed path moved
+nothing, which is why `tests/test_sql_row_description_source.py` covers both.
+
+`UpdateableResultTest` went 24 failures -> 8. The remaining 8 are a mix rather
+than a cluster: two more `column ""` (a select shape that still describes
+without a base table — likely the pipeline/evaluated path, which builds its
+columns from `(name, tag)` pairs with no Column object to carry the identity),
+a timestamp-precision mismatch, an `INSERT has 2 values but 3 columns`, and a
+"resultset tuples, but no field structure" protocol complaint.
+
+## Cached-plan invalidation on DDL (2026-08-03)
+
+Postgres caches a prepared statement's plan. When DDL changes a table so the
+statement's result type would differ, re-executing it fails with
+
+```
+0A000  cached plan must not change result type
+```
+
+which aborts the transaction. We re-plan on every execute, so the statement
+just succeeds with the new shape and the transaction lives on.
+
+This is the last cluster in pgjdbc's `AutoRollbackTest` (8 of its original 24 —
+the other 16 were the transaction-abort and `DEALLOCATE ALL` command-tag pair,
+both now fixed). Its assertion reads "autosave=NEVER + flushCacheOnDdl=false,
+thus the transaction should be killed".
+
+Sketch: record each prepared statement's described column shape at Parse, and a
+catalog generation counter bumped by any DDL. On Execute, only when the
+generation has moved since the statement was prepared, re-derive the shape and
+compare — so the common path costs one integer comparison and DDL, which is
+rare, pays for the re-describe. Raise `feature_not_supported` with Postgres'
+exact wording, since drivers match on the message as well as the SQLSTATE.
+
+## Weekly validate.yml failures (2026-08-03 triage)
+
+The 2026-07-27 and 2026-08-03 scheduled runs did not finish green. Three
+distinct problems, triaged from the run logs:
+
+- ~~**`rust` gauge (mongo-rust-driver vs the Python server) crawls to the
+  6-hour job kill** — both weeks; 7 minutes on 2026-07-20.~~ **FIXED
+  (rust-gauge-wedge slice).** Root cause was a compounding loop: the cargo
+  cache (populated 2026-07-20) hit the 7-day eviction TTL; the cold run's
+  FIRST per-filter `cargo test` invocation had to compile the whole driver
+  test binary inside the 600s per-invocation timeout, which killed cargo
+  mid-compile, so each of the 88 invocations resumed a partial build inside
+  its own 600s window (log signature: hours-long silent gaps between filter
+  outputs); the job overran the 6h default and was cancelled; and the
+  cancelled job skipped `actions/cache`'s success-only save, so every later
+  weekly run started cold again — a permanent wedge. Fix: (1)
+  `rust_validation/runner.py` pre-builds with `cargo test --no-run` under its
+  own 3600s wall so the 600s limit bounds only test runtime; (2) the cargo
+  cache is split into `actions/cache/restore` + an `if: always()`
+  `actions/cache/save`, so even a failed/killed run persists the compiled
+  target; (3) the `validate` job carries `timeout-minutes: 120` so any future
+  wedge fails fast instead of burning six runner-hours per lane.
+- ~~**REFINED (2026-08-04): rust-driver tests genuinely hang against the
+  Python server**~~ — **ROOT-CAUSED AND FIXED (2026-08-09, insert-chunked-txn
+  slice): a WiredTiger dirty-cache livelock from writing one whole insert
+  message in a single statement transaction.** The per-filter streaming logs
+  (a lane-filtered `only=rust` dispatch, run 30889017762) named the wedge
+  precisely: filters 1–32 fast, then `test::coll::large_insert` (35k ×
+  1.18KB docs ≈ 39.5MB in ONE insert command) hung — and EVERY later filter
+  timed out behind the wedged server. The test skips on non-Linux
+  (`std::env::consts::OS != "linux"`), which is the entire "CI-only,
+  passes-locally" mystery: it had simply never run on the dev Mac. Once
+  replicated via pymongo it wedged on macOS too. A stack probe caught the
+  connection thread drafted into the oplog-prune scan, and a cache-size
+  experiment nailed the mechanism: 39.5MB @ 4G cache → 1.6s; 11MB @ 128M
+  cache → wedged. `insert()` wrote the whole wire batch (docs + full-doc
+  oplog entries + index entries ≈ 2–3× message bytes) as UNEVICTABLE dirty
+  content in one WT transaction; near the cache's ~20% dirty-stall fraction
+  WT drafts every thread into eviction that cannot evict anything — only the
+  writer's own commit could free the cache. The Jul 20 → Jul 27 flip was the
+  RecordId/`_id`-index rewrites adding bytes-per-doc to that same
+  transaction, pushing the same test across the 1G default cache's line.
+  **Fix:** `storage.insert` now chunks the batch into ≤1000-doc / ≤4MB
+  statement transactions (mongod chunks internal insert batches too; batch
+  inserts are per-document atomic only, so the commit points are invisible
+  to clients), with the conflict-retry moved to chunk scope and capped-FIFO
+  fresh-keys threaded across chunks. Guards:
+  `test_storage.py::test_large_batch_insert_survives_a_small_cache`
+  (35k × 1.1KB @ 128M cache) + ordered/unordered cross-chunk semantics
+  tests.
+- ~~**Rust server: same transaction-size class, currently saved by cache
+  headroom.**~~ — **mirrored (rust-insert-chunked-txn slice)**:
+  `crates/secantus-storage`'s `insert` now commits in the same bounded
+  chunks as the Python fix (≤1000 docs / ≤4MB per statement transaction;
+  conflict-retry per chunk, capped-FIFO fresh keys threaded across chunks
+  and merged post-commit, empty batch still lazily creates the collection).
+  Previously only the 4G embedded default cache stood between a
+  `--cache-size 256M` daemon and the same WT dirty-cache livelock. Pinned by
+  `tests/batch_insert.rs::large_batch_insert_survives_a_small_cache`
+  (35k × 1.1KB @ 128M cache) + ordered/unordered cross-chunk semantics
+  tests.
+- [x] **RESOLVED 2026-08-09 (both servers) — User (multi-document) transactions
+  dirty-budget guard** — the remaining member of the livelock class. *Box flipped
+  2026-08-28: the work landed in #791 / #792 three weeks before, and the entry
+  below already said DONE on both servers.* **Python server: DONE
+  (txn-too-large-guard slice)** — `_emit_oplog`'s buffering branch tracks
+  the transaction's approximate write volume (`handle.dirty_bytes`, from
+  the full-doc oplog entries; engine dirty ≈ 2×) and raises past ~15% of
+  the cache (0.75 × WT's ~20% dirty trigger, mirroring mongod's
+  threshold), surfaced as mongod's `TransactionTooLargeForCache` (313, no
+  transient label — a retry would hit the same wall; the failed statement
+  aborts the transaction server-side). Pinned by
+  `test_storage_user_txn.py::test_transaction_dirty_budget_guard` and
+  `test_transactions.py::test_transaction_too_large_for_cache` (128M
+  cache). **Rust server: DONE (rust-txn-too-large slice)** — the same
+  guard, harvested through the `PENDING_DIRTY_BYTES` thread-local into
+  `UserTransactionHandle.dirty_bytes` per statement (the `PENDING_MINTED`
+  pattern), budget parsed from the connection config's `cache_size`
+  (default 4G → trips past ~300MB emitted), surfaced as 313 via the
+  adapter (`code_name_for` knows `TransactionTooLargeForCache`; not in
+  the transient set). Pinned by
+  `tests/txn_budget.rs::transaction_dirty_budget_guard` (128M cache).
+  **The dirty-cache livelock class is now closed on both servers**:
+  chunked batch inserts (#787 / #789) + the transaction dirty budget
+  (Python #791 / #792+#793).
+- [x] **RESOLVED 2026-08-09 (both servers) — Multi-document update/delete chunking**
+  — the class's final member (Rust #795, Python #798). *Box flipped 2026-08-28;
+  the entry below already said DONE on both servers.*
+  updateMany / deleteMany rewrite an unbounded matched set. **Rust server:
+  DONE (rust-multiwrite-chunked slice)** — `update_matching_core` routes
+  multi=true (outside user transactions) through a chunked driver: one
+  RecordId scan under the coll lock, then ≤1000-doc / ≤4MB statement
+  transactions that RE-FETCH each doc row inside their own transaction
+  (reusing the scan's blobs across chunk commits would let a user-txn
+  commit landing between chunks be silently overwritten — no overlapping
+  WT transactions, no conflict detection; found during design). RecordIds
+  are partitioned across chunks and a conflict retries only its own
+  rolled-back chunk, so `$inc` applies exactly once. `delete_matching`
+  (limit=0) mirrors it. Zero-match runs delegate to the single-txn body
+  (which degenerates to the upsert branch) AFTER releasing the coll lock —
+  holding it across the delegation self-deadlocks on the non-reentrant
+  mutex (found by the first test run). Chunk-boundary states are
+  reader-visible, which is mongod-faithful: updateMany/deleteMany are
+  per-document write units, documented non-atomic. Pinned by
+  `tests/multiwrite_chunk.rs` (35k-doc rewrite + deleteMany @ 128M cache;
+  exactly-once `$inc` across chunks; bounded paths unchanged).
+  **Python server: DONE (py-multiwrite-chunked slice)** — the twin driver:
+  `update_matching` (multi, outside user txns) and `delete_matching`
+  (limit=0) route through chunked drivers with the same re-fetch +
+  partition rules (the coll RLock makes the zero-match delegation
+  reentrancy-safe); single-doc / upsert / in-transaction paths keep the
+  single-`_batch_transaction` body. Pinned by the same three guards in
+  `tests/test_storage.py` (35k rewrite + deleteMany @ 128M cache;
+  exactly-once `$inc`; bounded paths). **With this, the WT dirty-cache
+  livelock class is fully closed on both servers across all three
+  surfaces: batch inserts, multi-document updates/deletes, and
+  multi-document transactions.**
+- ~~**`slt` gauge "regression"**~~ — NOT a regression; **timeout calibration,
+  fixed (rust-gauge-wedge slice).** 2026-08-03 was the slt lane's FIRST
+  weekly run (the SQL gauge lanes postdate the 2026-07-27 schedule), and the
+  ~15 `postgres-extended` `index/*` / `random/*` files it timed out at 300s
+  pass locally in ~25s each — verified by running
+  `index/orderby/10/slt_good_0.test` against BOTH current main and the
+  2026-07-27 head (`c4873cb0`) on this machine: 24.5s vs 24.4s, byte-same
+  timing, so no server slowdown exists. The 2-core CI runner is simply
+  5-10x slower than the dev machine the 300s cap was calibrated on (its
+  passing `select3.test` extended lane took 277s — right at the wall).
+  `FILE_TIMEOUT_SECONDS` is now `SECANTUS_SLT_FILE_TIMEOUT`-overridable and
+  `validate.yml` sets 900 for the slt lane (with a 300-minute lane timeout,
+  since the honest runtime is long on that hardware).
+- [ ] **Don't run the pgjdbc gauge alongside the test suite.** It is
+  timing-sensitive, and its wall clock under contention says nothing about the
+  server: a run competing with a full pytest suite blew the (then 1h) budget
+  while the same code re-run alone finished in **8m16s**. Note also that a
+  healthy full run is legitimately long — `CopyLargeFileTest` alone is ~282s,
+  inherently, since it streams a large file through COPY (`CopyTest` beside it
+  is 1.8s). Check `uptime` before drawing any conclusion from gauge timings;
+  this machine has repeatedly carried runaway processes from parallel sessions.
+- **pgjdbc 2h lane hang — fully closed (wt-snapshot-release slice,
+  2026-08-10).** The idle-in-transaction default (#810, below) fixed one
+  vulnerability but not the observed wedge: with the fix in place the CI
+  sweep and a local full-gauge run still wedged in `CopyLargeFileTest`, and a
+  live `pg_stat_activity` check showed **no open transactions** (note:
+  `xact_start` is a hardcoded stub and `state` never reports
+  "idle in transaction" — do not use them to rule out open txns). The real
+  pinner: an idle connection's cached per-thread WT session left with a
+  positioned cursor after its last statement — an *implicit* WT transaction,
+  invisible to all PG-level accounting, pinning the oldest-txn horizon
+  (`transaction range of IDs currently pinned` grew to ~100k; resetting every
+  cached session mid-wedge collapsed it instantly and unwedged the run).
+  Arming needed a specific mix of prior traffic (the batch classes + the
+  error-path classes + ConnectionTest — every subset was clean; the union
+  wedged deterministically). Fix: `Storage.release_thread_snapshot()` called
+  by both wire servers before each idle wait; regression tests in
+  `tests/test_storage_snapshot_release.py` read the WT pinned-range statistic
+  directly. **Rust server audited — immune by construction** (2026-08-10):
+  each autocommit operation runs on a fresh WT session (`OpSession::Fresh`
+  in `crates/secantus-storage/src/lib.rs`) closed when the operation drops,
+  and transaction sessions live only for the transaction (bounded by the
+  lifetime limit) — no cached per-connection session survives into an idle
+  wait, so an idle Rust connection cannot pin the oldest-txn horizon.
+- **pgjdbc 2h lane hang — first fix (pg-idle-txn-default slice,
+  2026-08-10).** The wedge was a leaked idle-in-transaction connection: a
+  failed autocommit-off test (the CleanupSavepoints / AutoSave cluster) left
+  its connection open mid-transaction for the rest of the run, and with
+  `idle_in_transaction_session_timeout` defaulting to 0 the server never
+  aborted it. The open WT transaction pins the oldest snapshot, so every
+  later write's history is unevictable — per-operation cost grows linearly
+  with churn (probe: flat 3.7s/100k-cycle control vs +2s/cycle unbounded
+  with one abandoned txn) — until `CopyLargeFileTest`'s 1M-row COPY/TRUNCATE
+  churn stalls in `__wt_page_in_func` sleep-retry and the whole suite hangs
+  (JUnit's same-thread 60s timeout cannot interrupt a blocked socket read).
+  Fix: `SecantusPGServer` now applies a 120s server-config default for the
+  GUC (session `SET` overrides, 0 opts out, `RESET` returns to the server
+  value) — verified by re-running the leak + churn scenario end-to-end
+  (flat timings, leak reaped with 25P03).
+- **Read-only transactions are enforced (pg-readonly-isolation slice,
+  2026-08-11)** — writes under `BEGIN READ ONLY` / `SET TRANSACTION READ
+  ONLY` / `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` fail with
+  PG's 25006, and `SHOW TRANSACTION ISOLATION LEVEL` (pgjdbc's spelling)
+  resolves to `transaction_isolation`. Known divergences from PG, none
+  exercised by any gauge: temp-table writes are also blocked (PG allows
+  them in read-only txns), and `SELECT … FOR UPDATE` / `nextval()` are NOT
+  blocked (PG blocks both).
+- [x] **RESOLVED: Rust server: `drop` of a heavily-churned collection wedges
+  behind a WT eviction storm.** Root cause found by code reading, then
+  reproduced deterministically in seconds (`crates/secantus-storage/tests/
+  drop_chunk.rs`): collections share the sharded doc tables, so `drop` is a
+  row purge — and it ran as ONE statement transaction. A collection whose
+  delete markers exceed the cache's dirty budget gets a cache-pressure
+  `WT_ROLLBACK` (unevictable dirty content — the same class the chunked
+  insert / updateMany / deleteMany work closed), which the blanket
+  `WT_ROLLBACK -> WriteConflict` mapping fed into `retry_write_conflicts`'s
+  UNBOUNDED retry loop: re-run purge, re-storm, roll back, forever. That is
+  the whole incident signature — eviction threads spinning with zero
+  connections (the drop thread kept retrying server-side), no self-recovery,
+  SIGTERM dead behind the in-flight dispatch. The three negative repro
+  attempts failed because the missing ingredient was the COLLECTION-SIZE-TO-
+  CACHE ratio, not churn history: at the 4G default cache 1M small docs fit;
+  a 165MB collection under a 128M cache wedges every time. Fixed with a
+  chunked two-phase drop: phase 1 (small txn) unregisters the collection +
+  writes a `secantus_drop_tombstones` row + emits the drop oplog entry;
+  phase 2 purges rows in 4000-row statement transactions, then clears the
+  tombstone. A crash mid-purge is finished at the next open
+  (`recover_pending_drops`) before traffic can re-create the name, so orphan
+  rows can't resurface. `dropDatabase` converted the same way; inside a user
+  transaction both keep the old single-transaction path (the user-txn dirty
+  budget guard bounds it). The tombstone table is additive to the shared
+  layout (unique-keys precedent). Original entry follows for the incident
+  record.
+  Original: **Rust server: `drop` of a heavily-churned collection wedges behind a
+  WT eviction storm.** Found by the 2026-08-11 concurrency-report refresh:
+  after rounds of multi-writer churn (~1M+ docs inserted per row), a
+  subsequent `drop` sat in dispatch 40+ minutes while every WT eviction
+  thread spun in `__evict_lru_pages` / `__evict_page` / `__tree_walk` —
+  and the storm did NOT self-recover after the client disconnected (the
+  daemon burned ~112% CPU for 1.5h with zero connections) nor respond to
+  SIGTERM (needed SIGKILL). Native stacks captured in the session
+  scratchpad (`server.sample`). Standalone `drop` of a fresh 1M-doc
+  collection is 1.46s — the wedge needs the accumulated-churn cache
+  state. Same WT-livelock family as the chunked-write / pinned-snapshot
+  fixes; likely WT wants the whole dirty tree evicted before the drop's
+  exclusive dhandle access, and eviction thrashes. Repro attempts (2026-08-11, all NEGATIVE — drops sub-second): 3-4
+  rounds x 1M-doc 4-writer churn then drop-oldest; 1KB payloads (4GB
+  written) then drop-freshest-still-dirty; 5x drop-recreate cycles on the
+  same names. So the wedge needs more than churn volume, dirty-cache
+  drops, or name reuse alone — the incident server had hours of mixed
+  sweep history (SIGTERM'd writers mid-batch, dozens of collections,
+  the venv-staged binary). Note the Rust server DOES run a checkpoint
+  thread (`checkpoint_seconds`), unlike the Python server. Next attempt
+  should replay the original pre-drop harness verbatim for multiple full
+  sweep runs on one daemon. Original repro shape:
+  `bench.concurrency` rows without the fresh-collection-names harness fix
+  (drop a prior row's collection mid-churn). Also note: a drop queued
+  behind live writers starves indefinitely (lock fairness) — the bench
+  harness now avoids drops entirely (fresh per-row collection names).
+- [x] **RESOLVED: Rust server: `rename_collection` re-keys every row in one
+  statement transaction** — now a chunked two-phase move reusing the drop
+  tombstones (tombstone dst -> batched copy -> small switch txn -> batched
+  src purge); both crash windows recover through the existing
+  `recover_pending_drops` as plain drops, on both servers. Pinned by
+  `crates/secantus-storage/tests/rename_chunk.rs` (150k docs under a 128M
+  cache — the shape that wedged — plus index/claim/order/drop_target
+  semantics). User-transaction renames keep the atomic path (dirty-budget
+  guarded). Original entry: A rename of a collection whose re-key volume exceeds the cache's
+  dirty budget would hit the same cache-pressure `WT_ROLLBACK` + unbounded
+  `retry_write_conflicts` loop. Unlike drop, rename NEEDS single-transaction
+  atomicity (a crash mid-rename must not leave the namespace half-moved), so
+  the chunked-drop pattern doesn't transplant directly — it wants a
+  tombstone-style two-phase move (register dst + tombstone src, batched
+  re-key, finalize) with open-time recovery. Not observed in the wild
+  (renames of huge collections are rare); bounded today only by luck of
+  cache headroom. The `drop_target=true` purge inside rename shares the
+  shape.
+- [x] **RESOLVED 2026-08-27 — and it was never a server bug. Change streams, an awaitData `getMore`
+  with NO `maxTimeMS` waits 1s; the Go gauge's own package concurrency dropped the
+  shared database inside that window.** Surfaced as
+  mongo-go-driver's `TestChangeStream_ReplicaSet/try_next/one_getMore_sent`
+  failing intermittently: `TryNext returned true on iteration 1` with no events
+  generated at all.
+
+  **Root-caused by reading the kept oplog** (`SECANTUS_GAUGE_KEEP_STORAGE=1`).
+  The subtest occupies exactly two oplog entries — `seq=32 create` of the
+  watched collection, `seq=33 drop` of it by mtest teardown. The drop is the one
+  entry that passes `_scope_matches` and is not gated behind
+  `show_expanded_events`, and it lands *inside* our wait window, so the getMore
+  returns `drop` + `invalidate` for an event that had not happened when the
+  client asked.
+
+  **Fixed (this entry's first half):** an explicit `maxTimeMS: 0` no longer
+  blocks. `max_time_ms = int(doc.get("maxTimeMS", 0) or 0)` made an explicit
+  zero indistinguishable from an absent field, and both fell to the 1s default;
+  mongod returns immediately on an explicit zero. The Rust server was already
+  correct (`unwrap_or(1000)` — "a zero deadline polls exactly once"), so this
+  also closed a two-server parity gap. Pinned by
+  `tests/test_getmore_maxtimems_zero.py` (3 tests, each verified to fail with
+  the fix reverted). Go-gauge failure rate went **2-in-3 → 1-in-3**.
+
+  **Still open, but NOT for the reason first filed here.** The Go driver's
+  `TryNext` sends **no `maxTimeMS` at all` (confirmed by instrumenting the
+  server: `has_maxTimeMS=False`), so it gets the 1s default wait. This entry
+  originally claimed that was the remaining bug and that fixing it meant
+  choosing between pymongo (wants the wait) and Go (wants a prompt return).
+
+  **A probe of real mongod 6.0.16 falsifies that.** Same three scenarios,
+  single-node replica set, drop injected 150 ms into the wait:
+
+  | scenario | mongod | SecantusDB (post-fix) |
+  |---|---|---|
+  | no `maxTimeMS`, nothing happens | 1003 ms, 0 docs | 1s default — matches |
+  | no `maxTimeMS`, drop at 150 ms | 166 ms, `drop`+`invalidate` | matches |
+  | `maxTimeMS: 0`, drop at 150 ms | 0 ms, 0 docs | matches |
+
+  So the 1s default is **correct** — mongod does the same — and mongod also
+  returns a drop that happens during the wait. There is no semantic conflict
+  between the drivers, and **the default must not be changed.**
+
+  **Timing matches too**, so it is not a "we are slower" artefact either. Same
+  sequence against both, single-node RS mongod vs SecantusDB:
+
+      mongod       aggregate=  1.6ms firstBatch=0  getMore=1002.9ms docs=0
+      secantusdb   aggregate=  0.6ms firstBatch=0  getMore=1002.5ms docs=0
+
+  So on every dimension probed — the wait length, whether a mid-wait drop is
+  returned, explicit-zero handling, `firstBatch` emptiness, and the wall-clock
+  of both calls — SecantusDB is now indistinguishable from mongod, yet the Go
+  gauge still fails ~1 run in 3 and mongod never does.
+
+  **ROOT-CAUSED 2026-08-27 by tracing every dispatched command through a
+  reproduced failure (reproduced on the 2nd full-gauge attempt).** All three
+  hypotheses this entry previously listed — a leftover cursor from
+  `existing_non-empty_batch`, an extra `getMore`, and reply framing on a killed
+  cursor — are **wrong**. The trace shows exactly ONE `getMore` on the
+  change-stream cursor, no overlapping change-stream cursors, and clean framing.
+
+  The real cause is the gauge's own invocation. `./internal/integration/...`
+  expands to THREE packages (`integration`, `integration/mtest`,
+  `integration/unified`) and `go test` runs packages **concurrently** by default.
+  All three share `mtest.TestDB == "test"`, and `mtest.Teardown()` **drops that
+  database** (`mtest/setup.go:239`). Because `TestUnifiedSpec` is in our
+  `SKIP_PATTERNS`, the `unified` package has no work to do: its `TestMain` runs
+  `Setup()` then `Teardown()` back-to-back and drops `test` within a second of
+  starting — concurrently with `integration`. In the failing run the trace shows
+  a second connection issuing `getParameter '*'` (the `mtest` setup fingerprint)
+  then `dropDatabase`, landing 263 ms into the change-stream `getMore`; the
+  getMore correctly returned `drop` + `invalidate`, so `TryNext` returned true
+  and the test's `Should be false` assertion fired. In a passing run that same
+  pair lands *before* the `try_next` subtests start. A timing shift, nothing else.
+
+  So the server was right all along — as the mongod probe above already implied:
+  mongod returns a mid-wait drop the same way. **Fixed gauge-side** by adding
+  `-p 1` to the `go test` invocation (`go_validation/runner.py`), serialising
+  packages so one package's teardown can no longer drop the database another
+  package is mid-stream on. No assertion weakened, no test skipped, and the
+  `unified` package's two genuine unit tests (`TestEntityMap`, `TestMatches`)
+  still run.
+
+  Lesson worth keeping: a driver-gauge flake that survives a faithful
+  per-dimension comparison against mongod is a reason to instrument the
+  *harness*, not to keep hunting the server. Three plausible server-side
+  hypotheses sat in this entry for two days and all three were wrong.
+
+- [x] **RESOLVED 2026-08-23: PITR restore wrote 2 GB regardless of database
+  size — backup extraction now punches holes instead of writing runs of
+  zeros.** WiredTiger preallocates `WiredTigerLog.0000000001` to
+  `log_file_max` (2 GiB). It is almost entirely zeros, so it compressed to
+  nothing and expanded to full size: a 100-document store archived to 2.0 MB
+  and restored to 2.0 GB.
+
+  Symptom was `test_rust_binary_pitr.py::test_rust_binary_v2_archive_base_snapshot_and_restore`
+  intermittently hitting its 900s `subprocess.TimeoutExpired`. Diagnosed by
+  sampling the live process rather than inferring: both stacks 60s apart were
+  identical, **99.8% of samples blocked in `write(2)`** under
+  `extract_backup_archive` → `tar::entry::unpack`, at 2.7% CPU (2.10s → 3.71s
+  across 60 wall-seconds). Not a deadlock and not a retry loop — plain I/O.
+  Those 2 GB took 0.84s on an idle disk and 858s with 12 xdist workers sharing
+  the volume, which is why it straddled the timeout instead of failing
+  consistently.
+
+  Fix (`unpack_sparse` / `unpack_entry_sparse` in `secantus-storage`): read
+  each entry in 256 KiB chunks and `seek` past all-zero chunks (coalescing
+  consecutive runs) instead of writing them, then `set_len` to the header size
+  — seeking past EOF does not itself extend a file, so a zero-tailed file would
+  otherwise end short. **Extraction-side only**: holes read back as zeros, so
+  the restored bytes are identical and WiredTiger cannot tell the difference.
+  Both extraction paths (`extract_backup_archive`,
+  `extract_backup_archive_ex`) share it, and it reimplements tar's absolute /
+  `..` path guard, which replacing `Archive::unpack` would otherwise have
+  dropped.
+
+  Measured after: restored directory **2.0 GB → 276 KB** on disk, restore
+  2.59s, PITR suites 10 passed in 14.6s, and restores under the full parallel
+  suite now finish in **5-6s** rather than 858s.
+
+  Pinned by `crates/secantus-storage/tests/sparse_extract.rs`: an all-zero log
+  restores byte-identical *and* verifiably sparse (asserted via
+  `MetadataExt::blocks()` — without that the test would pass even if the fix
+  did nothing), mixed content with interior holes and a zero tail round-trips
+  exactly, and traversal paths stay refused.
+
+  Note the trade-off that created it: `log_file_max` was raised to 2 GB for a
+  measured +13-19% write-throughput win (`tasks/rust-perf-findings.md`). That
+  gain is real and is kept; only the backup's handling of the mostly-empty log
+  changed.
+
+  **The second-extraction follow-on is closed as not-worth-fixing, by
+  measurement (2026-08-23).** `restore_from_archive_dir` does extract a second
+  copy into a tempdir when a newer base snapshot exists, but with sparse
+  extraction it costs nothing measurable: an interleaved A/B over 7 pairs put a
+  restore that takes the branch at median **2.87s** against **2.86s** for one
+  that does not — inside run-to-run noise.
+
+  Two traps worth recording, because both produced confident wrong answers on
+  the way there:
+
+  - A decomposition putting `Storage::open` at 1.6-2.3s was **measured on a
+    store whose 2 GB log had been extracted by system `tar`**, i.e. fully
+    written, where a real restore's is now sparse. The component measurement
+    did not reflect the composed path.
+  - Sequential before/after readings showed a 4.1-5.1s "regression" that was
+    entirely the release rebuild run immediately beforehand. Interleaving the
+    two binaries so load drift hits both equally showed +0.3%.
+
+  A `durable: Some(false)` open for that throwaway store was written, measured
+  at +0.3%, and reverted: it changes durability semantics on a restore path for
+  no measurable gain.
+
+
+- [x] **RESOLVED (for real this time): the xdist "worker death" cluster
+  (2026-08-13 → 08-16) — workers starved on the machine-wide rust-binary
+  test flock until the GLOBAL 600s thread-method pytest-timeout os._exit'd
+  them.** The definitive evidence (instrumented run, 2026-08-16): four
+  workers entered `test_rust_binary_pitr` tests at 13:37:50-54, queued on
+  the blocking `fcntl.flock` in the file's autouse serialization fixture
+  (one holder + three waiters; a SECOND suite in a parallel worktree
+  shared the same /tmp lock, stretching the queue), and died at
+  13:47:48-52 — exactly 600s later. Signal tracing (SECANTUS_SIGTRACE=1
+  handlers on TERM/INT/HUP/QUIT/USR1/2) captured NOTHING on the victims:
+  not a signal at all, but pytest-timeout's thread-method `os._exit` —
+  which the file's `timeout(1200, method="signal")` marker does NOT
+  override for FIXTURE waits — with the dump swallowed by xdist capture.
+  Every historical signature matches: victims always in (or queued behind)
+  this file, multiple simultaneous deaths (xdist hands out a file's tests
+  together, so several workers hit 600s within seconds), the "fast" test
+  victim (blocked, not slow), never reproducible in isolation (no second
+  suite → short queue), rerun-clean, no .ips, no dump. The earlier
+  pytest-timeout finding (#878) was the same killer at a different depth —
+  the "signal method" change (#886) missed because the flock wait lives in
+  a fixture. FIX: the serialization fixture acquires the lock NON-BLOCKING
+  in a 480s bounded poll and raises a NAMED AssertionError on expiry — a
+  visible failure inside every timeout budget; the worker survives.
+  Diagnostics kept: `pytest_handlecrashitem` (names crashed tests) and the
+  env-gated `SECANTUS_SIGTRACE=1` signal-receipt tracer in conftest.
+  **Coda (2026-08-17, the ACTUAL last piece): the file's
+  `timeout(1200, method="signal")` marker never applied at all** — a
+  second bare `pytestmark =` assignment (the binary-availability skipif,
+  lower in the module) silently OVERWROTE the first, so the PITR test
+  BODIES still ran under the global 600s thread-method timeout and a
+  slow-disk run os._exit'd the worker mid-test (two more deaths,
+  2026-08-16/17, same test, quiet machine, sigtrace silent, faulthandler
+  empty — the os._exit signature). Both marks now ride one combined
+  `pytestmark` list, and `tests/test_meta_pytestmark.py` walks every test
+  module's AST rejecting double assignment so the overwrite pattern can't
+  recur anywhere.

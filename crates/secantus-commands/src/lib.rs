@@ -33,6 +33,7 @@
 
 pub mod admin;
 pub mod aggregate;
+pub mod argtypes;
 pub mod auth;
 pub mod changestream;
 pub mod crud;
@@ -44,9 +45,11 @@ pub mod find;
 pub mod findandmodify;
 pub mod handshake;
 pub mod logbuf;
+pub mod mapreduce;
 pub mod rbac;
 pub mod roles;
 pub mod storage;
+pub mod topstats;
 pub mod transactions;
 mod util;
 
@@ -66,7 +69,14 @@ pub const SERVER_VERSION: &str = "7.0.0";
 /// `versionArray` companion to [`SERVER_VERSION`].
 pub const SERVER_VERSION_ARRAY: [i32; 4] = [7, 0, 0, 0];
 /// Default cursor batch size when the client doesn't specify one.
+///
+/// This is the FIRST-batch default only. mongod's 101-document default applies
+/// to `find` / `aggregate` first batches; an unspecified `batchSize` on a
+/// `getMore` means "as many documents as fit in [`MAX_GETMORE_BATCH_BYTES`]",
+/// so a full scan drains in ~2 round trips, not `count / 101`.
 pub const DEFAULT_BATCH_SIZE: i32 = 101;
+/// Byte budget for a single cursor batch (mongod's 16MB reply-document cap).
+pub const MAX_GETMORE_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
 /// Valid `readConcern.level` values (`commands.py::_VALID_READ_CONCERN_LEVELS`).
 const VALID_READ_CONCERN_LEVELS: [&str; 5] =
@@ -136,6 +146,12 @@ pub struct CommandContext {
     /// server wires one in (and in unit-test contexts) — `getLog` then reports an
     /// empty log.
     pub logs: Option<Arc<logbuf::LogBuffer>>,
+    /// Live connection counts for `serverStatus.connections`, snapshotted by the
+    /// server when it builds the context. `None` off-server (unit tests) ⇒ zeros.
+    pub conn_stats: Option<ConnStats>,
+    /// Server-wide per-namespace operation accounting, read by `top`. `None`
+    /// off-server (unit tests) ⇒ `top` reports zeros, as it always used to.
+    pub top_stats: Option<Arc<topstats::TopStats>>,
     /// Set by a cursor-producing handler (`find` / `getMore`) to hand the
     /// server the reply's document batch as **pre-encoded blobs** instead of an
     /// owned `Bson::Array` inside the reply document. The reply the handler
@@ -188,6 +204,8 @@ impl CommandContext {
             close_connection: false,
             conn_killer: None,
             logs: None,
+            conn_stats: None,
+            top_stats: None,
             pending_batch: None,
             raw_insert_documents: None,
         }
@@ -233,6 +251,17 @@ impl CommandContext {
     /// reads it.
     pub fn with_logs(mut self, logs: Arc<logbuf::LogBuffer>) -> Self {
         self.logs = Some(logs);
+        self
+    }
+
+    /// Attach this instant's connection counts (builder-style).
+    pub fn with_top_stats(mut self, stats: Arc<topstats::TopStats>) -> Self {
+        self.top_stats = Some(stats);
+        self
+    }
+
+    pub fn with_conn_stats(mut self, stats: ConnStats) -> Self {
+        self.conn_stats = Some(stats);
         self
     }
 
@@ -335,6 +364,28 @@ pub fn command_name(doc: &Document) -> &str {
     doc.keys().next().map(String::as_str).unwrap_or("")
 }
 
+/// A snapshot of the server's connection counters for `serverStatus`.
+///
+/// mongo-c-driver's `/Client/exhaust_cursor/{single,pool}` assert that opening
+/// an exhaust cursor *creates a connection* — they read `connections.
+/// totalCreated` before and after and require it to rise. Reporting a constant
+/// zero fails that just as surely as omitting the field.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConnStats {
+    /// Connections currently open.
+    pub current: i64,
+    /// Connections created over the server's lifetime.
+    pub total_created: i64,
+}
+
+/// Test hook: whether a command name resolves to a handler at all. A name that
+/// doesn't is answered with `CommandNotFound`, which some driver suites treat
+/// as a different outcome from a registered-but-unsupported command.
+#[cfg(test)]
+pub(crate) fn lookup_for_test(name: &str) -> Option<Handler> {
+    lookup(name)
+}
+
 /// Resolve a command name (incl. case aliases) to its handler. `None` ⇒
 /// `CommandNotFound`. Families are added here as they are ported.
 fn lookup(name: &str) -> Option<Handler> {
@@ -348,6 +399,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "delete" => crud::delete,
         "count" => crud::count,
         "distinct" => distinct::distinct,
+        "mapReduce" | "mapreduce" => mapreduce::map_reduce,
         "findAndModify" | "findandmodify" => findandmodify::find_and_modify,
         "find" => find::find,
         "aggregate" => aggregate::aggregate,
@@ -367,6 +419,9 @@ fn lookup(name: &str) -> Option<Handler> {
         "listDatabases" => admin::list_databases,
         "listIndexes" => admin::list_indexes,
         "createIndexes" => admin::create_indexes,
+        "createSearchIndexes" | "updateSearchIndex" | "dropSearchIndex" => {
+            admin::search_index_not_supported
+        }
         "dropIndexes" => admin::drop_indexes,
         "dropDatabase" => admin::drop_database,
         "renameCollection" => admin::rename_collection,
@@ -412,6 +467,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "whatsmyuri" => diagnostics::whatsmyuri,
         "fsync" => diagnostics::fsync,
         "hostInfo" => diagnostics::host_info,
+        "top" => diagnostics::top,
         "getLog" => diagnostics::get_log,
         "configureFailPoint" => configure_fail_point,
         _ => return None,
@@ -707,13 +763,25 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                         "Failing command due to 'failCommand' failpoint",
                     )
                     .into_reply();
-                    if !m.error_labels.is_empty() {
+                    // `failGetMoreAfterCursorCheckout` is injected inside the
+                    // change-stream getMore path, where mongod stamps a
+                    // resumable code with `ResumableChangeStreamError`; drivers
+                    // on wire >= 9 resume on that label and never on the bare
+                    // code. `failCommand` short-circuits earlier and carries
+                    // only the labels it was given — which is why the spec has
+                    // `failGetMoreAfterCursorCheckout` + code 6 resume while
+                    // `failCommand` + code 6 does not.
+                    let mut labels = m.error_labels.clone();
+                    if m.server_injected
+                        && failpoints::is_resumable_change_stream_code(code)
+                        && !labels.iter().any(|l| l == "ResumableChangeStreamError")
+                    {
+                        labels.push("ResumableChangeStreamError".to_string());
+                    }
+                    if !labels.is_empty() {
                         reply.insert(
                             "errorLabels",
-                            m.error_labels
-                                .iter()
-                                .map(|s| Bson::String(s.clone()))
-                                .collect::<Vec<_>>(),
+                            labels.into_iter().map(Bson::String).collect::<Vec<_>>(),
                         );
                     }
                     return reply;
@@ -736,13 +804,31 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             // `system.profile` entry when the per-database level requires it.
             let start = profile_eligible(name, doc).then(std::time::Instant::now);
             let mut reply = run_with_txn_envelope(name, handler, doc, ctx);
-            // A failpoint-configured writeConcernError attaches to a successful reply.
+            // A failpoint-configured writeConcernError attaches to a successful reply,
+            // AND so do the failpoint's errorLabels. The labels are what make the
+            // write retryable in the driver's eyes: without `RetryableWriteError`
+            // libmongoc never retries, so the two commandStartedEvents that
+            // /command_monitoring/unified/writeConcernError expects never happen.
+            // Attaching the wce alone left that test red on this server even after
+            // the replay fix (#1069) cleared it on the Python server -- caught by
+            // running BOTH C lanes rather than assuming they moved together.
             if let Some(m) = &fp {
                 if let Some(wce) = &m.write_concern_error {
                     if reply.get_f64("ok").unwrap_or(0.0) == 1.0
                         && !reply.contains_key("writeConcernError")
                     {
                         reply.insert("writeConcernError", Bson::Document(wce.clone()));
+                        if !m.error_labels.is_empty() && !reply.contains_key("errorLabels") {
+                            reply.insert(
+                                "errorLabels",
+                                Bson::Array(
+                                    m.error_labels
+                                        .iter()
+                                        .map(|l| Bson::String(l.clone()))
+                                        .collect(),
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -994,6 +1080,61 @@ fn txn_envelope(doc: &Document) -> (Option<Vec<u8>>, Option<i64>) {
 /// `autocommit: false` + `lsid` + `txnNumber` envelope it resolves / runs inside
 /// the transaction; a bare `txnNumber` (retryable write) just advances the
 /// session sequence; everything else runs the handler directly.
+/// Commands mongod records a retryable-write result for. Drivers only attach a
+/// `txnNumber` to genuinely retryable operations (single-document writes) —
+/// `updateMany` / `deleteMany` are excluded by the spec and arrive without one
+/// — so the envelope alone is nearly sufficient. Naming the commands anyway
+/// keeps a stray `txnNumber` on a read from being cached and replayed.
+const RETRYABLE_WRITE_COMMANDS: &[&str] = &["insert", "update", "delete", "findAndModify"];
+
+/// Envelope fields a driver legitimately varies between the original attempt
+/// and its retry (gossip, routing, the session envelope itself). Excluded from
+/// the identity digest so a genuine retry still matches.
+const RETRY_IDENTITY_IGNORED: &[&str] = &[
+    "lsid",
+    "txnNumber",
+    "$clusterTime",
+    "$db",
+    "$readPreference",
+    "readConcern",
+    "writeConcern",
+    "apiVersion",
+    "apiStrict",
+    "apiDeprecationErrors",
+    "comment",
+];
+
+/// A stable digest of the write this command represents.
+///
+/// Two attempts of the same retryable write are byte-identical apart from the
+/// envelope fields above, so this matches on a genuine retry and differs when
+/// the `(lsid, txnNumber)` key has been reused for another write. Mirrors the
+/// Python server's `_retry_identity`.
+fn retry_identity(doc: &Document) -> [u8; 20] {
+    use sha2::{Digest, Sha256};
+
+    let mut body = Document::new();
+    for (k, v) in doc.iter() {
+        if !RETRY_IDENTITY_IGNORED.contains(&k.as_str()) {
+            body.insert(k.clone(), v.clone());
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    let payload = match body.to_writer(&mut buf) {
+        Ok(()) => buf.as_slice(),
+        // Unencodable body: fall back to a debug rendering. It only has to be
+        // consistent for a given command, not canonical.
+        Err(_) => {
+            buf = format!("{body:?}").into_bytes();
+            buf.as_slice()
+        }
+    };
+    let full = Sha256::digest(payload);
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&full[..20]);
+    out
+}
+
 fn run_with_txn_envelope(
     name: &str,
     handler: Handler,
@@ -1012,11 +1153,53 @@ fn run_with_txn_envelope(
         // Retryable write: consumes the session's txnNumber sequence (and aborts
         // an older in-progress transaction), then runs normally.
         registry.on_retryable_write(&lsid, txn_number);
-        return run_handler(handler, doc, ctx);
+        if !RETRYABLE_WRITE_COMMANDS.contains(&name) {
+            return run_handler(handler, doc, ctx);
+        }
+        // If this exact (lsid, txnNumber) already ran THIS command, replay the
+        // stored reply instead of executing the write again. Without it a
+        // retried `{$inc: {n: 1}}` applies twice while both replies claim
+        // `nModified: 1` — silent corruption on a path every driver exercises
+        // automatically after a network blip.
+        let identity = retry_identity(doc);
+        if let Some(cached) = registry.retryable_reply(&lsid, txn_number, &identity) {
+            return cached;
+        }
+        let result = run_handler(handler, doc, ctx);
+        registry.record_retryable(&lsid, txn_number, identity, &result);
+        return result;
     }
     // commit/abort carry the same envelope but are controls (own handlers).
     if name == "commitTransaction" || name == "abortTransaction" {
         return run_handler(handler, doc, ctx);
+    }
+    // A transaction's concerns are fixed when it starts: `readConcern` may ride
+    // only the FIRST statement, and `writeConcern` belongs on commit/abort,
+    // never on a statement. mongod rejects both with InvalidOptions (72); we
+    // accepted and silently ignored them, so a caller could believe a statement
+    // ran at a concern it did not. Drivers guard this client-side (the
+    // transactions spec marks these `isClientError: true`), so no gauge covers
+    // it — it matters for raw-command callers. Messages are mongod's verbatim,
+    // from the spec corpus the drivers vendor.
+    if doc.get("writeConcern").is_some() {
+        return CommandError::new(
+            72,
+            "InvalidOptions",
+            "Cannot set write concern after starting a transaction",
+        )
+        .into_reply();
+    }
+    let starting = matches!(
+        doc.get("startTransaction"),
+        Some(Bson::Boolean(true)) | Some(Bson::Int32(1)) | Some(Bson::Int64(1))
+    );
+    if !starting && doc.get("readConcern").is_some() {
+        return CommandError::new(
+            72,
+            "InvalidOptions",
+            "Cannot set read concern after starting a transaction",
+        )
+        .into_reply();
     }
     let start = matches!(
         doc.get("startTransaction"),
@@ -1225,6 +1408,31 @@ fn authorize(name: &str, doc: &Document, ctx: &CommandContext) -> Result<(), Com
                     ),
                 ));
             }
+            // A pipeline's secondary namespaces carry their own privilege
+            // requirements ($out/$merge write, $lookup-family read) — the
+            // primary (find, primary-collection) grant alone must not
+            // authorize writes to or reads from other namespaces. Mirrors
+            // commands.py's _pipeline_secondary_requirements check.
+            if name == "aggregate" {
+                for (extra_action, extra_db) in pipeline_secondary_requirements(doc, &ctx.db_name) {
+                    if !rbac::check_privilege_resolved(
+                        &roles,
+                        extra_action,
+                        Some(&extra_db),
+                        false,
+                        Some(&resolver),
+                    ) {
+                        return Err(CommandError::new(
+                            13,
+                            "Unauthorized",
+                            format!(
+                                "not authorized on {extra_db} to execute \
+                                 aggregation stage (action: {extra_action})"
+                            ),
+                        ));
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -1283,7 +1491,9 @@ fn is_no_privilege_command(name: &str) -> bool {
 fn command_action(name: &str) -> Option<(&'static str, &'static str)> {
     use rbac::*;
     Some(match name {
-        "find" | "count" | "distinct" | "aggregate" => (A_FIND, SCOPE_COLLECTION),
+        "find" | "count" | "distinct" | "aggregate" | "mapReduce" | "mapreduce" => {
+            (A_FIND, SCOPE_COLLECTION)
+        }
         "insert" => (A_INSERT, SCOPE_COLLECTION),
         "update" => (A_UPDATE, SCOPE_COLLECTION),
         "delete" => (A_REMOVE, SCOPE_COLLECTION),
@@ -1320,11 +1530,90 @@ fn command_action(name: &str) -> Option<(&'static str, &'static str)> {
         "currentOp" => (A_INPROG, SCOPE_CLUSTER),
         "killOp" => (A_KILLOP, SCOPE_CLUSTER),
         "hostInfo" => (A_HOST_INFO, SCOPE_CLUSTER),
+        "top" => (A_TOP, SCOPE_CLUSTER),
         "getCmdLineOpts" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
         "getParameter" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
         "getLog" => (A_GET_LOG, SCOPE_CLUSTER),
+        // Fault injection is a server-wide DoS lever (e.g. closeConnection on
+        // every find); require an explicit cluster-admin grant under --auth.
+        "configureFailPoint" => (A_CONFIGURE_FAIL_POINT, SCOPE_CLUSTER),
         _ => return None,
     })
+}
+
+/// The `(action, db)` grants a pipeline needs beyond the primary `find`:
+/// `$out` insert+remove on its target, `$merge` insert+update, and the
+/// read-side stages (`$lookup` / `$graphLookup` / `$unionWith`) find on the
+/// foreign namespace. Sub-pipelines (`$lookup.pipeline`,
+/// `$unionWith.pipeline`, `$facet` branches) are walked recursively. RBAC is
+/// db-granular, so requirements resolve to `(action, db)` pairs. Mirrors
+/// `commands.py::_pipeline_secondary_requirements`.
+fn pipeline_secondary_requirements(
+    doc: &Document,
+    default_db: &str,
+) -> Vec<(&'static str, String)> {
+    let mut reqs: Vec<(&'static str, String)> = Vec::new();
+
+    fn walk(pipeline: &Bson, default_db: &str, reqs: &mut Vec<(&'static str, String)>) {
+        use rbac::{A_FIND, A_INSERT, A_REMOVE, A_UPDATE};
+        let Bson::Array(stages) = pipeline else {
+            return;
+        };
+        for stage in stages {
+            let Bson::Document(stage) = stage else {
+                continue;
+            };
+            for (op, spec) in stage.iter() {
+                match op.as_str() {
+                    "$out" => {
+                        let db = match spec {
+                            Bson::Document(d) => d.get_str("db").unwrap_or(default_db).to_string(),
+                            _ => default_db.to_string(),
+                        };
+                        reqs.push((A_INSERT, db.clone()));
+                        reqs.push((A_REMOVE, db));
+                    }
+                    "$merge" => {
+                        let into = match spec {
+                            Bson::Document(d) => d.get("into"),
+                            _ => None,
+                        };
+                        let db = match into {
+                            Some(Bson::Document(d)) => {
+                                d.get_str("db").unwrap_or(default_db).to_string()
+                            }
+                            _ => default_db.to_string(),
+                        };
+                        reqs.push((A_INSERT, db.clone()));
+                        reqs.push((A_UPDATE, db));
+                    }
+                    "$lookup" | "$graphLookup" | "$unionWith" => {
+                        reqs.push((A_FIND, default_db.to_string()));
+                        if let Bson::Document(d) = spec {
+                            if let Some(sub) = d.get("pipeline") {
+                                walk(sub, default_db, reqs);
+                            }
+                        }
+                    }
+                    "$facet" => {
+                        if let Bson::Document(d) = spec {
+                            for (_, sub) in d.iter() {
+                                walk(sub, default_db, reqs);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if let Some(pipeline) = doc.get("pipeline") {
+        walk(pipeline, default_db, &mut reqs);
+    }
+    reqs.sort();
+    reqs.dedup();
+    reqs
 }
 
 /// Resolve the `(target_db, cluster_flag)` an action operates on. Cluster-scoped
@@ -1514,6 +1803,42 @@ mod tests {
     fn command_name_is_first_key() {
         assert_eq!(command_name(&doc! {"ping": 1, "$db": "admin"}), "ping");
         assert_eq!(command_name(&Document::new()), "");
+    }
+
+    #[test]
+    fn pipeline_secondary_requirements_walks_all_stage_shapes() {
+        let doc = doc! {"aggregate": "orders", "pipeline": [
+            {"$match": {"v": 1}},
+            {"$out": {"db": "warehouse", "coll": "t"}},
+            {"$merge": {"into": "t2"}},
+            {"$unionWith": {"coll": "c2", "pipeline": [
+                {"$merge": {"into": {"db": "x", "coll": "y"}}},
+            ]}},
+            {"$facet": {"branch": [
+                {"$lookup": {"from": "f", "localField": "a", "foreignField": "b", "as": "z"}},
+            ]}},
+        ]};
+        let reqs = pipeline_secondary_requirements(&doc, "shop");
+        for want in [
+            (rbac::A_INSERT, "warehouse"),
+            (rbac::A_REMOVE, "warehouse"),
+            (rbac::A_INSERT, "shop"),
+            (rbac::A_UPDATE, "shop"),
+            (rbac::A_INSERT, "x"),
+            (rbac::A_UPDATE, "x"),
+            (rbac::A_FIND, "shop"),
+        ] {
+            assert!(
+                reqs.contains(&(want.0, want.1.to_string())),
+                "missing {want:?} in {reqs:?}"
+            );
+        }
+        // A plain read pipeline demands nothing extra.
+        assert!(pipeline_secondary_requirements(
+            &doc! {"aggregate": "orders", "pipeline": [{"$match": {}}]},
+            "shop"
+        )
+        .is_empty());
     }
 
     #[test]

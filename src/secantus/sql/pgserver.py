@@ -22,6 +22,7 @@ import itertools
 import logging
 import os
 import secrets
+import select
 import signal
 import socket
 import ssl
@@ -59,6 +60,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_CLIENT_IDLE_TIMEOUT_S = 300.0
+#: Server-config default for ``idle_in_transaction_session_timeout``. Real PG
+#: ships 0 (disabled), but SecantusDB cannot afford an abandoned open
+#: transaction: the WT storage engine keeps every later write's history
+#: reachable from the pinned snapshot, so per-operation cost grows linearly
+#: with churn until page reads stall the whole server (the pgjdbc gauge's
+#: 2-hour lane hang — one leaked in-transaction connection from a failed
+#: autocommit-off test wedged a later 100k-row TRUNCATE indefinitely).
+#: Sessions can still ``SET idle_in_transaction_session_timeout = 0`` to
+#: opt out — this is the postgresql.conf tier, not a hard cap.
+DEFAULT_IDLE_IN_TXN_TIMEOUT_S = 120.0
 #: Cap on concurrently-served connections — an over-cap accept is closed
 #: immediately rather than spawning a thread (mirrors the Mongo server's
 #: ``DEFAULT_MAX_CONNECTIONS``). Bounds the fan-out of the per-connection cursor
@@ -146,6 +157,18 @@ def _parse_binary_copy(
         raise errors.SQLError("22P04", "incomplete binary COPY data") from None
 
 
+def _tune_client_socket(conn: socket.socket) -> None:
+    """Disable Nagle on an accepted client socket. Reply paths write small
+    frames back-to-back (a reply then ReadyForQuery, one batch item's result
+    then the next); with Nagle on, the second write waits for the peer's
+    delayed ACK — ~40ms per round trip on Linux, invisible on macOS loopback.
+    pgjdbc's generated-keys batches (1000 single-row round trips per test)
+    measured 41.5s per test in CI against 0.2s locally from exactly this.
+    Real servers (mongod, PostgreSQL) set TCP_NODELAY unconditionally."""
+    with contextlib.suppress(OSError):
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+
 class SecantusPGServer:
     def __init__(
         self,
@@ -156,6 +179,7 @@ class SecantusPGServer:
         storage: Any = None,
         default_database: str = "postgres",
         client_idle_timeout_s: float = DEFAULT_CLIENT_IDLE_TIMEOUT_S,
+        idle_in_transaction_timeout_s: float = DEFAULT_IDLE_IN_TXN_TIMEOUT_S,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
         require_auth: bool = False,
         users: dict[str, str] | None = None,
@@ -167,6 +191,7 @@ class SecantusPGServer:
         self.port = port
         self.default_database = default_database
         self.client_idle_timeout_s = client_idle_timeout_s
+        self.idle_in_transaction_timeout_s = idle_in_transaction_timeout_s
         self.max_connections = max_connections
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -178,6 +203,11 @@ class SecantusPGServer:
         self._handler_threads: set[threading.Thread] = set()
         # Server-wide LISTEN / NOTIFY channel registry.
         self._notify = NotifyHub()
+        # Server-wide advisory-lock table (#135 follow-up): real
+        # cross-connection exclusion for the pg_advisory_lock family.
+        from secantus.sql.pgadvisory import AdvisoryLockHub
+
+        self._advisory = AdvisoryLockHub()
         # Server-wide live-session registry for pg_stat_activity (#137), plus a
         # monotonic per-connection backend pid (real Postgres gives each backend a
         # distinct pid; in-process we'd otherwise share os.getpid()).
@@ -188,6 +218,12 @@ class SecantusPGServer:
         self._prepared_xacts = PreparedXactRegistry()
         # itertools.count.__next__ is atomic under the GIL, so no extra lock.
         self._backend_pid_seq = itertools.count((os.getpid() & 0x7FFFFF) << 8 | 1)
+        # CancelRequest routing: backend_pid -> live session. A cancel arrives
+        # on its own fresh connection carrying (pid, secret); the secret is
+        # checked against the session's BackendKeyData before its cancel_event
+        # is set. Entries live exactly as long as the connection's handler.
+        self._cancel_targets: dict[int, Session] = {}
+        self._cancel_lock = threading.Lock()
         # SCRAM-SHA-256 auth: when require_auth is on, clients must authenticate
         # against a user from ``users`` (username -> plaintext, hashed into a
         # SCRAM verifier at startup; the plaintext is not retained).
@@ -292,6 +328,7 @@ class SecantusPGServer:
                 conn, addr = self._socket.accept()
             except OSError:
                 return
+            _tune_client_socket(conn)
             # Enforce the connection cap before spawning a handler, and register
             # the socket under the lock so the count is accurate (the handler
             # removes it on exit). An over-cap accept is closed immediately — the
@@ -346,7 +383,15 @@ class SecantusPGServer:
                     self.storage.abort_user_transaction(session.txn_handle)
             if session is not None:
                 self._notify.unlisten_all(session)  # drop this conn's LISTENs
+                # PG releases every advisory lock at session end.
+                with contextlib.suppress(Exception):
+                    self._advisory.release_all(session)
                 self._activity.unregister(session)  # drop from pg_stat_activity (#137)
+                with self._cancel_lock:  # dead pid must not receive cancels
+                    self._cancel_targets.pop(session.backend_pid, None)
+                # PG drops a session's temp tables when the session ends.
+                with contextlib.suppress(Exception):
+                    sql_engine.drop_session_temp_tables(self.storage, session)
             # Release this thread's cached WT session + cursors back to the
             # engine, exactly like the Mongo server's teardown (server.py).
             # Without this every pg connection leaked its WT session: the
@@ -381,9 +426,26 @@ class SecantusPGServer:
                 io.sendall(b"N")
                 continue
             if isinstance(packet, pgwire.CancelRequest):
+                # The cancel sub-protocol: a fresh connection carrying the
+                # (pid, secret) from BackendKeyData. Fire the target session's
+                # cancel_event (checked at cancellation points — pg_sleep, the
+                # COPY TO stream) and drop the connection without replying,
+                # exactly like real PG. A bad pid/secret is silently ignored.
+                with self._cancel_lock:
+                    target = self._cancel_targets.get(packet.pid)
+                if target is not None and target.cancel_key == packet.secret:
+                    target.cancel_event.set()
                 return None
             startup = packet
             break
+
+        # A newer minor protocol (pgx's MaxProtocolVersion "3.2" sends
+        # 196610) or unrecognized ``_pq_.*`` startup options get real PG's
+        # answer: NegotiateProtocolVersion FIRST — newest minor we speak plus
+        # the unknown option names — then the handshake continues at 3.0.
+        pq_options = [k for k in startup.params if k.startswith("_pq_.")]
+        if startup.protocol != pgwire.PROTOCOL_VERSION_3 or pq_options:
+            io.sendall(pgwire.negotiate_protocol_version(pgwire.PROTOCOL_VERSION_3, pq_options))
 
         db = startup.params.get("database") or startup.params.get("user") or self.default_database
         user = startup.params.get("user", "secantus")
@@ -394,10 +456,23 @@ class SecantusPGServer:
             return None
 
         session = Session(database=db, user=user, backend_pid=backend_pid)
+        # Server-config GUC tier (postgresql.conf equivalent): SET overrides
+        # it, RESET falls back to it, SHOW reports it.
+        if self.idle_in_transaction_timeout_s > 0:
+            session.server_gucs["idle_in_transaction_session_timeout"] = str(
+                int(self.idle_in_transaction_timeout_s * 1000)
+            )
+        # Database-level GUC defaults (ALTER DATABASE … SET) apply to new
+        # sessions only — merge them before the client sends anything.
+        with contextlib.suppress(Exception):
+            from secantus.sql.catalog import Catalog
+
+            session.apply_database_defaults(Catalog(self.storage).db_settings(db))
         # Bind the session to this connection thread's render context so
         # to_pg_text can honour per-session GUCs (TimeZone) at output time.
         typemap.set_render_session(session)
         session.notify_hub = self._notify
+        session.advisory_hub = self._advisory
         session.activity_registry = self._activity
         session.prepared_xacts = self._prepared_xacts
         session.backend_start = _dt.datetime.now(_dt.timezone.utc)
@@ -429,13 +504,36 @@ class SecantusPGServer:
             if canonical is not None:
                 session.settings["client_encoding"] = canonical
 
+        # Startup-packet GUC parameters: Postgres accepts any run-time GUC as
+        # a startup parameter and applies it as the session default. pgjdbc
+        # sends ``TimeZone`` this way (the JVM zone in the POSIX-inverted
+        # spelling PG expects) — dropping it left every pgjdbc session on UTC,
+        # which shifted date reads a day for clients west of Greenwich
+        # (DateTest's timestamptz x GMT-N failures). ALL parameters are
+        # applied, like real PG — pgx's target_session_attrs=read-write probe
+        # ships ``default_transaction_read_only=on`` at startup and expects
+        # ``SHOW transaction_read_only`` to reflect it. ``_pq_.*`` protocol
+        # options are handled by the NegotiateProtocolVersion path, not GUCs.
+        for raw_name, raw_value in startup.params.items():
+            if raw_name in ("user", "database", "options", "replication"):
+                continue
+            if raw_name.startswith("_pq_."):
+                continue
+            guc = sql_session.canonical_guc_name(raw_name)
+            value = raw_value
+            if guc == "TimeZone":
+                value = sql_session.canonical_timezone_setting(value)
+            elif guc == "client_encoding":
+                value = sql_session.canonical_client_encoding(value) or value
+            session.settings[guc] = value
+
         out = bytearray()
         out += pgwire.authentication_ok()
         for name, value in (
             ("server_version", SERVER_VERSION),
             ("server_encoding", "UTF8"),
             ("client_encoding", session.get_setting("client_encoding")),
-            ("DateStyle", "ISO, MDY"),
+            ("DateStyle", session.get_setting("DateStyle") or "ISO, MDY"),
             # Real postgres reports IntervalStyle in the startup set, and
             # psycopg selects its interval parser from it: without the
             # ParameterStatus the client sees IntervalStyle "unknown" and
@@ -443,15 +541,18 @@ class SecantusPGServer:
             ("IntervalStyle", session.get_setting("IntervalStyle")),
             ("integer_datetimes", "on"),
             ("standard_conforming_strings", "on"),
-            ("TimeZone", "UTC"),
+            ("TimeZone", session.get_setting("TimeZone") or "UTC"),
             ("application_name", application_name),
             ("is_superuser", "off"),
             ("session_authorization", user),
         ):
             out += pgwire.parameter_status(name, value)
-        # A nominal pid/secret so CancelRequest has something to echo (cancel
-        # isn't honoured in P1, but clients store these).
-        out += pgwire.backend_key_data(backend_pid, secrets.randbits(31))
+        # BackendKeyData: the (pid, secret) a CancelRequest must echo to
+        # cancel this session's running query.
+        session.cancel_key = secrets.randbits(31)
+        with self._cancel_lock:
+            self._cancel_targets[backend_pid] = session
+        out += pgwire.backend_key_data(backend_pid, session.cancel_key)
         out += pgwire.ready_for_query(b"I")
         io.sendall(bytes(out))
         return io, session
@@ -485,6 +586,48 @@ class SecantusPGServer:
             )
             return False
 
+    def _read_next_message(
+        self, conn: socket.socket, session: Session, txn_deadline: float | None
+    ) -> pgwire.Message:
+        """Block for the next frontend message, pushing async notifications.
+
+        Real PG delivers LISTEN/NOTIFY to an IDLE connection without waiting
+        for its next query (pgx's ``WaitForNotification`` just blocks reading
+        the socket). A session listening on any channel therefore waits in
+        short slices, flushing queued notifications between them — its own
+        thread does the socket write, so writes stay serialized. Sessions with
+        no LISTENs (the overwhelming default) keep the pure blocking read: no
+        busy-wake. ``txn_deadline`` carries idle_in_transaction_session_timeout
+        across the poll slices; reaching it raises TimeoutError to the caller
+        (which aborts the transaction exactly as before)."""
+        while True:
+            timeout: float | None = None
+            if txn_deadline is not None:
+                timeout = max(0.001, txn_deadline - time.monotonic())
+            if self._notify.is_listening(session):
+                timeout = 0.25 if timeout is None else min(timeout, 0.25)
+            # Wait for readability with `select`, NOT a socket read timeout.
+            # A read timeout can fire mid-frame — after `read_message` has
+            # consumed the type byte or part of the length/payload — and the
+            # bytes already read are then silently discarded, desyncing the
+            # wire stream so every subsequent byte is misread (#882). `select`
+            # only decides WHEN to look; once the socket is readable we read a
+            # COMPLETE frame with a blocking recv, so a poll wakeup can never
+            # truncate a frame. Ordinary network jitter that delays a frame's
+            # tail just blocks the recv until it arrives, exactly as the
+            # non-listening default path already does.
+            ready, _, _ = select.select([conn], [], [], timeout)
+            if ready:
+                conn.settimeout(None)
+                return pgwire.read_message(conn)
+            # Woke with no data: honour the idle-in-transaction deadline, then
+            # flush any queued LISTEN/NOTIFY deliveries and poll again.
+            if txn_deadline is not None and time.monotonic() >= txn_deadline:
+                raise TimeoutError
+            pending = self._pending_notification_bytes(session)
+            if pending:
+                conn.sendall(pending)
+
     def _query_loop(self, conn: socket.socket, session: Session) -> None:
         # Per-connection extended-protocol state (prepared statements + portals).
         ext = ExtendedSession(self.storage, session)
@@ -493,12 +636,18 @@ class SecantusPGServer:
             # bound the wait for the next command; exceeding it aborts the
             # transaction and terminates the connection (25P03), like PG.
             idle_ms = _idle_in_txn_timeout_ms(session)
-            if idle_ms and session.txn_handle is not None:
-                conn.settimeout(idle_ms / 1000.0)
-            else:
-                conn.settimeout(None)
+            txn_deadline = (
+                time.monotonic() + idle_ms / 1000.0
+                if idle_ms and session.txn_handle is not None
+                else None
+            )
+            # Never go idle holding a read snapshot: an idle connection whose
+            # last statement left its thread session with a positioned cursor
+            # pins WT's oldest-transaction horizon for every other connection
+            # (the pgjdbc CopyLargeFileTest wedge). Release before blocking.
+            self.storage.release_thread_snapshot()
             try:
-                msg = pgwire.read_message(conn)
+                msg = self._read_next_message(conn, session, txn_deadline)
             except TimeoutError:
                 if session.txn_handle is not None:
                     with contextlib.suppress(Exception):
@@ -526,7 +675,41 @@ class SecantusPGServer:
                 return
             if msg.type == "X":  # Terminate
                 return
+            if msg.type in ("d", "c", "f"):
+                # CopyData / CopyDone / CopyFail outside a COPY operation: a
+                # client that streams ahead of the CopyInResponse (pgx's
+                # CopyFrom pumps data concurrently with sending the command)
+                # keeps sending after the COPY command itself failed. Real PG
+                # accepts and discards these per the protocol spec
+                # (PostgresMain); routing them to the extended-protocol
+                # dispatch instead raised 08P01 and poisoned the connection.
+                continue
+            if ext.skip_until_sync and msg.type in ("Q", "F"):
+                # An errored extended-protocol pipeline discards EVERYTHING
+                # until Sync — including interleaved simple Query messages
+                # (PG's ignore_till_sync; the pgtest corpus pins the shape:
+                # "the SELECT 1 queries should be ignored and should not
+                # return ReadyForQuery").
+                continue
+            if msg.type == "F":  # Fastpath FunctionCall (pgjdbc large objects)
+                conn.sendall(self._handle_fastpath(session, msg.payload))
+                continue
             if msg.type == "Q":  # simple Query
+                # A simple Query mid-pipeline commits any pending extended-protocol
+                # IMPLICIT transaction, then runs in its own (pgjdbc's autosave
+                # interleave: the earlier Execute's work commits, so re-executing
+                # a unique insert now conflicts). An explicit BEGIN block stays
+                # open — `_settle_implicit_txn` only touches implicit ones.
+                try:
+                    ext._settle_implicit_txn()
+                except errors.SQLError as exc:
+                    conn.sendall(
+                        pgwire.error_response(
+                            exc.sqlstate, exc.message, encoding=session.wire_encoding
+                        )
+                        + pgwire.ready_for_query(session.txn_status())
+                    )
+                    continue
                 try:
                     sql = pgwire.parse_query(msg.payload, session.wire_encoding)
                 except UnicodeDecodeError:
@@ -552,6 +735,64 @@ class SecantusPGServer:
             if notifications or reply:
                 conn.sendall(notifications + (reply or b""))
 
+    def _authorize_lo_write(self, session: Session) -> None:
+        """Gate a mutating Fastpath large-object call with the same RBAC +
+        read-only-transaction checks engine dispatch applies to a table write.
+        Large objects are database-scoped (no per-object owner), so RBAC is at
+        db granularity: a write needs a role granting a write action (``insert``
+        — ``readWrite`` covers it) on the connection's database. No-op unless
+        authorization is active, matching the statement path."""
+        from secantus import rbac
+
+        if session.get_setting("transaction_read_only") == "on":
+            raise errors.SQLError(
+                "25006", "cannot execute lo_* write function in a read-only transaction"
+            )
+        if not session.authz_active:
+            return
+        resolver = getattr(self.storage, "get_role", None)
+        if not rbac.check_privilege(
+            session.roles,
+            rbac.A_INSERT,
+            target_db=session.database,
+            role_resolver=resolver,
+        ):
+            raise errors.insufficient_privilege(session.database, rbac.A_INSERT)
+
+    def _handle_fastpath(self, session: Session, payload: bytes) -> bytes:
+        """One Fastpath FunctionCall ('F') cycle: FunctionCallResponse ('V') +
+        ReadyForQuery, or ErrorResponse + ReadyForQuery. pgjdbc's LargeObject
+        API is the (only known) client of this sub-protocol — it resolves the
+        ``lo_*`` OIDs from pg_proc, then calls by OID with binary args."""
+        from secantus.sql import largeobjects
+
+        try:
+            fn_oid, args = pgwire.parse_function_call(payload)
+            # The Fastpath sub-protocol bypasses the statement pipeline, so the
+            # RBAC gate and read-only-transaction check that engine dispatch
+            # applies to ordinary writes must be applied here too — otherwise a
+            # write-privilege-less session (or one inside BEGIN READ ONLY) could
+            # create/write/truncate/unlink large objects via Fastpath (#836).
+            if largeobjects.is_write_call(fn_oid):
+                self._authorize_lo_write(session)
+            result = largeobjects.call(
+                fn_oid, args, storage=self.storage, db=session.database, session=session
+            )
+            return pgwire.function_call_response(result) + pgwire.ready_for_query(
+                session.txn_status()
+            )
+        except errors.SQLError as exc:
+            if session.txn_handle is not None:
+                session.txn_failed = True
+            return pgwire.error_response(exc.sqlstate, exc.message) + pgwire.ready_for_query(
+                session.txn_status()
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("error executing fastpath call")
+            return pgwire.error_response("XX000", _INTERNAL_ERROR_MSG) + pgwire.ready_for_query(
+                session.txn_status()
+            )
+
     def _pending_notification_bytes(self, session: Session) -> bytes:
         """Serialize this connection's queued async LISTEN/NOTIFY deliveries into
         ``NotificationResponse`` bytes to write on the owning thread (so socket
@@ -568,6 +809,12 @@ class SecantusPGServer:
         # (CopyIn/CopyOut) mid-query, so it can't go through run_sql.
         from sqlglot import exp
 
+        # A cancel that landed while idle is discarded — PG only cancels the
+        # query that is running when the cancel is processed.
+        session.cancel_event.clear()
+        # Arm statement_timeout for this query (kept if a batch already armed it,
+        # e.g. an extended portal whose Executes bracket this simple query).
+        session.arm_statement_deadline()
         # pg_stat_activity (#137): this backend is 'active' with ``sql`` while the
         # query runs; it stays as the last query (state 'idle') afterwards.
         session.state = "active"
@@ -596,6 +843,10 @@ class SecantusPGServer:
                 for res in results:
                     out += _render_result(res, session.wire_encoding, session)
         except errors.SQLError as exc:
+            # A mid-batch error in a multi-statement query still delivers the
+            # completed statements' results first, like real PG's streaming.
+            for res in getattr(exc, "partial_results", None) or []:
+                out += _render_result(res, session.wire_encoding, session)
             out += pgwire.error_response(
                 exc.sqlstate,
                 exc.message,
@@ -603,6 +854,15 @@ class SecantusPGServer:
                 diag=getattr(exc, "diag", None),
                 position=getattr(exc, "position", None) or _error_position(exc, sql),
             )
+            if session.txn_handle is not None and session.local_gucs:
+                # An error aborts the transaction, so its SET LOCALs revert
+                # NOW and PG reports them right after the ErrorResponse
+                # (pgtest param_status). The later ROLLBACK then has nothing
+                # left to unwind, matching PG's silent rollback there.
+                session.restore_local_gucs()
+                for pname, pvalue in session.pending_parameter_status:
+                    out += pgwire.parameter_status(pname, pvalue)
+                session.pending_parameter_status = []
         except Exception:  # pragma: no cover - defensive
             logger.exception("error executing SQL")
             # Don't leak the raw Python exception text to the wire client — the
@@ -613,6 +873,8 @@ class SecantusPGServer:
         # NOTIFY, or one from another connection) before ReadyForQuery, matching
         # Postgres, so the client picks them up in this same query exchange.
         out += self._pending_notification_bytes(session)
+        # A simple query completes its own batch — the statement_timeout resets.
+        session.clear_statement_deadline()
         # The ReadyForQuery status reflects the transaction block (I/T/E).
         out += pgwire.ready_for_query(session.txn_status())
         session.state = "idle"  # query done; pg_stat_activity shows it idle (#137)
@@ -689,7 +951,12 @@ class SecantusPGServer:
                 ) from None
             if plan.fmt == "csv":
                 rows = copyfmt.parse_csv(
-                    data, delimiter=plan.delimiter, null=plan.null, header=plan.header
+                    data,
+                    delimiter=plan.delimiter,
+                    null=plan.null,
+                    header=plan.header,
+                    quote=plan.quote or '"',
+                    escape=plan.escape,
                 )
             else:
                 rows = copyfmt.parse_text(data, delimiter=plan.delimiter, null=plan.null)
@@ -725,11 +992,18 @@ class SecantusPGServer:
             if plan.header:
                 chunks.append(
                     copyfmt.format_csv(
-                        [], delimiter=plan.delimiter, null=plan.null, header=plan.columns
+                        [],
+                        delimiter=plan.delimiter,
+                        null=plan.null,
+                        header=plan.columns,
+                        quote=plan.quote or '"',
                     )
                 )
             chunks += [
-                copyfmt.format_csv([row], delimiter=plan.delimiter, null=plan.null) for row in rows
+                copyfmt.format_csv(
+                    [row], delimiter=plan.delimiter, null=plan.null, quote=plan.quote or '"'
+                )
+                for row in rows
             ]
         else:
             chunks += [
@@ -796,33 +1070,51 @@ class SecantusPGServer:
 def _render_result(res: Any, encoding: str | None = "utf-8", session: Any = None) -> bytes:
     """Serialise one ``SQLResult`` to its backend messages."""
     out = bytearray()
-    for severity, message in getattr(res, "notices", ()) or ():
+    for notice in getattr(res, "notices", ()) or ():
+        severity, message = notice[0], notice[1]
         out += pgwire.notice_response(
             message,
             severity=severity,
-            sqlstate="01000" if severity == "WARNING" else "00000",
+            sqlstate=(
+                notice[2] if len(notice) > 2 else ("01000" if severity == "WARNING" else "00000")
+            ),
             encoding=encoding,
+            file=notice[3] if len(notice) > 3 else None,
+            routine=notice[4] if len(notice) > 4 else None,
         )
     status = list(res.parameter_status)
     if session is not None and session.pending_parameter_status:
         # Reportable GUCs changed mid-statement by set_config().
         status += session.pending_parameter_status
         session.pending_parameter_status = []
-    for name, value in status:
-        out += pgwire.parameter_status(name, value)
     if res.columns or res.command_tag.startswith("SELECT"):
         out += pgwire.row_description(
-            [(c.name, c.pg_oid, c.typmod) for c in res.columns], encoding=encoding
+            [(c.name, c.pg_oid, c.typmod, c.table_oid, c.attnum) for c in res.columns],
+            encoding=encoding,
         )
-        tags = [c.type_tag for c in res.columns]
+        # A plain ``json`` column (oid 114) renders compact; jsonb (3802)
+        # keeps PG's canonical spacing. The oid is the only place the result
+        # shape distinguishes them ("json_plain" is a render-only tag).
+        tags = [
+            "json_plain" if c.pg_oid == 114 and c.type_tag == "json" else c.type_tag
+            for c in res.columns
+        ]
+        # (oid, typmod) per column so a ``char(n)`` value goes out blank-padded.
+        widths = [(c.pg_oid, c.typmod) for c in res.columns]
         for row in res.rows:
             out += pgwire.data_row(
                 [
-                    pgwire.transcode_out(typemap.to_pg_text(v, t), encoding)
-                    for v, t in zip(row, tags, strict=False)
+                    pgwire.transcode_out(
+                        typemap.to_pg_text(typemap.blank_pad(v, w[0], w[1]), t), encoding
+                    )
+                    for v, t, w in zip(row, tags, widths, strict=False)
                 ]
             )
     out += pgwire.command_complete(res.command_tag)
+    # PG reports GUC changes AFTER the command's CommandComplete, just before
+    # ReadyForQuery (pgtest param_status reads the order byte-for-byte).
+    for name, value in status:
+        out += pgwire.parameter_status(name, value)
     return bytes(out)
 
 
@@ -851,6 +1143,19 @@ def build_parser() -> argparse.ArgumentParser:
         default="postgres",
         metavar="NAME",
         help="Database reported to clients that don't request one (default: postgres).",
+    )
+    parser.add_argument(
+        "--idle-in-transaction-timeout",
+        type=float,
+        default=DEFAULT_IDLE_IN_TXN_TIMEOUT_S,
+        metavar="SECONDS",
+        help=(
+            "Server default for idle_in_transaction_session_timeout, in "
+            f"seconds (default: {DEFAULT_IDLE_IN_TXN_TIMEOUT_S:.0f}; 0 "
+            "disables). A session left idle inside an open transaction "
+            "longer than this is terminated (FATAL 25P03), like PG's GUC — "
+            "sessions can SET their own value to override."
+        ),
     )
     parser.add_argument(
         "--log-level",
@@ -890,6 +1195,7 @@ def main(argv: list[str] | None = None) -> int:
         port=args.port,
         storage_path=args.storage_path,
         default_database=args.default_database,
+        idle_in_transaction_timeout_s=args.idle_in_transaction_timeout,
         tls_cert_file=args.tls_cert_file,
         tls_key_file=args.tls_key_file,
     )

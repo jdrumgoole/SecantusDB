@@ -71,8 +71,20 @@ def undefined_column(name: str) -> SQLError:
     return SQLError("42703", f'column "{name}" does not exist')
 
 
-def not_null_violation(column: str) -> SQLError:
-    return SQLError("23502", f'null value in column "{column}" violates not-null constraint')
+def not_null_violation(column: str, table_name: str | None = None) -> SQLError:
+    """23502 with PG's identity fields when the table is known: s=schema,
+    t=bare table name, c=column (pgjdbc's ServerErrorMessage asserts them)."""
+    if table_name is None:
+        return SQLError("23502", f'null value in column "{column}" violates not-null constraint')
+    if table_name.startswith("pg_temp_") or "." in table_name:
+        schema, bare = table_name.split(".", 1)
+    else:
+        schema, bare = "public", table_name
+    return SQLError(
+        "23502",
+        f'null value in column "{column}" of relation "{bare}" violates not-null constraint',
+        diag={"s": schema, "t": bare, "c": column},
+    )
 
 
 def unique_violation(message: str) -> SQLError:

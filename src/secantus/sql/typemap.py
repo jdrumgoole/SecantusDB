@@ -26,6 +26,7 @@ import decimal as _decimal
 import json as _json
 import math as _math
 import re as _re
+import struct as _struct
 from decimal import Decimal
 from typing import Any
 
@@ -37,6 +38,10 @@ from sqlglot import exp
 PG_OID: dict[str, int] = {
     "bool": 16,
     "bytea": 17,
+    # PG's internal one-byte "char" (quoted; pg_type.typname = char, oid 18).
+    # Distinct from char(n)/bpchar: size 1, truncates to one character on
+    # input, and an empty/zero-byte input stores NULL (pgtest char corpus).
+    "char1": 18,
     "int8": 20,
     "int2": 21,
     "int4": 23,
@@ -85,6 +90,9 @@ PG_OID: dict[str, int] = {
     "interval": 1186,
     # UUID type (rendered as the canonical lower-case hyphenated string).
     "uuid": 2950,
+    # Refcursor: a server-side cursor's name (plpgsql OPEN … FOR). The value is
+    # the name text; the oid is what tells a driver to FETCH from it.
+    "refcursor": 1790,
     # Money type (a Decimal rendered as ``$1,234.56``).
     "money": 790,
     # Geometric types (stored as canonical Postgres text).
@@ -101,12 +109,22 @@ PG_OID: dict[str, int] = {
     # PG_TYPENAME, so ``to_regtype('hstore')`` stays NULL and SQLAlchemy's psycopg
     # connect-time hstore probe is a no-op (it must not register a fictional type).
     "hstore": 16935,
-    # citext (contrib): case-insensitive text. Stored (and sent on the wire) as
-    # plain text — the case-folding is a query-planner behaviour, not a value shape.
-    # It intentionally has NO PG_OID entry: the wire layer's ``PG_OID.get(tag, 25)``
-    # already reports the text OID (25) for it, and adding an explicit ``citext: 25``
-    # would collide with ``text: 25`` in the inverted OID→typename map (making
-    # ``format_type(25)`` resolve to "citext" instead of "text").
+    # citext (contrib): case-insensitive text, stored as plain text — the
+    # case-folding is a query-planner behaviour, not a value shape. Like
+    # hstore, the extension has no fixed catalog OID, so we use crdb's stable
+    # placeholder 90008 (the pgtest citext corpus reads it byte-for-byte in
+    # ParameterDescription and RowDescription; drivers treat the unknown OID
+    # as text). A distinct OID also keeps the inverted OID→typename map
+    # collision-free — ``format_type(25)`` still resolves to "text" (an
+    # explicit ``citext: 25`` was the old reason this entry didn't exist).
+    "citext": 90008,
+    # SQL/JSON path expressions, stored as PG's canonical text form
+    # (jsonpath.canonicalize). Real catalog oid.
+    "jsonpath": 4072,
+    # ltree (contrib): a dotted label path, stored as text. Like citext and
+    # hstore, no fixed catalog oid — crdb's stable placeholder (pgtest ltree
+    # corpus reads it in ParameterDescription and RowDescription).
+    "ltree": 90010,
     # xml (a real built-in type, OID 142). Stored as its text; validated
     # well-formed on cast / coerce.
     "xml": 142,
@@ -120,6 +138,9 @@ PG_OID: dict[str, int] = {
     "aclitem": 1033,
     # name — the 63-byte identifier type (values travel as text).
     "name": 19,
+    # void — the result type of a function called for its side effect only
+    # (pg_sleep). typlen 4, value NULL on the wire (pgtest void corpus).
+    "void": 2278,
 }
 
 # Full-text search type tags — stored as subdocuments, rendered as their PG text.
@@ -246,6 +267,8 @@ _REGTYPE_SPELLINGS: dict[str, str] = {
     # ``"oid"[]`` DDL can't survive sqlglot's OID keyword; ``planner.parse``
     # rewrites it to this quoted spelling, which resolves back here.
     "secantus_oid": "oid",
+    "jsonpath": "jsonpath",
+    "ltree": "ltree",
 }
 
 
@@ -256,7 +279,12 @@ def builtin_tag_for_name(name: str) -> str | None:
     type; psycopg's own test fixtures build DDL exactly this way
     (``sql.Identifier(info.name)``), so quoted built-in names must resolve
     before the enum/domain fallback."""
-    key = " ".join(str(name).strip().strip('"').lower().split())
+    raw = str(name).strip()
+    if raw == '"char"' or raw == "'char'":
+        # The QUOTED spelling names PG's internal one-byte type (oid 18);
+        # the unquoted keyword spelling stays bpchar/text below.
+        return "char1"
+    key = " ".join(raw.strip('"').lower().split())
     if key.endswith("[]"):
         elem = builtin_tag_for_name(key[:-2])
         return f"{elem}[]" if elem is not None and f"{elem}[]" in PG_OID else None
@@ -532,6 +560,33 @@ class TypedList(list):
         self.elem_tag = elem_tag
 
 
+class RegClassValue(int):
+    """A resolved ``regclass`` value: numerically the relation's pg_class oid
+    (so ``c.oid = 'name'::regclass`` joins work), rendered as the relation
+    name like real PG (``SELECT 'pub'::regclass`` prints ``pub``)."""
+
+    relname: str
+
+    def __new__(cls, oid: int, relname: str) -> RegClassValue:
+        self = super().__new__(cls, oid)
+        self.relname = relname
+        return self
+
+    def __str__(self) -> str:  # text render shows the name, not the oid
+        return self.relname
+
+    def __eq__(self, other: Any) -> bool:
+        # ``pg_typeof(x) = 'name'::regtype``: pg_typeof rewrites to the pretty
+        # type-name STRING at plan time, so a reg-value must compare equal to
+        # its own name as well as to its oid (PG compares oids; the string leg
+        # is our plan-time representation meeting the resolved cast).
+        if isinstance(other, str):
+            return other == self.relname
+        return int(self) == other if isinstance(other, int) else NotImplemented
+
+    __hash__ = int.__hash__
+
+
 class RecordValue(dict):
     """An anonymous ``row(…)`` record value: an f1..fN dict that ALSO carries
     each field's SQL type oid (0 = derive from the Python value). The binary
@@ -553,6 +608,119 @@ class TimeText(str):
 
 class TimeTzText(str):
     """Canonical timetz text from a ``timetz`` (1266) parameter — ``::timetz``."""
+
+
+def to_decimal128(d: Decimal) -> bson.Decimal128:
+    """A ``Decimal`` as BSON ``Decimal128``, rounding into range when it is
+    wider than the 34 significant digits Decimal128 holds (the same fallback
+    :func:`coerce` applies to a stored ``numeric``)."""
+    try:
+        return bson.Decimal128(d)
+    except _decimal.DecimalException:
+        from bson.decimal128 import create_decimal128_context
+
+        with _decimal.localcontext(create_decimal128_context()) as ctx:
+            return bson.Decimal128(ctx.create_decimal(d))
+
+
+def number_literal(text: str) -> Any:
+    """The value of a non-string numeric literal, as Postgres types it.
+
+    A decimal literal (``1.5``, ``0.000000``) is ``numeric``: exact, and it
+    keeps the scale it was written with. Reading those as a float lost both —
+    ``0.1 + 0.2 = 0.3`` answered false, ``SELECT 0.000000`` came back as ``0``,
+    and a value wider than a double silently dropped digits. Decimal128 is what
+    a ``numeric`` COLUMN already stores (see :func:`coerce`), so literals and
+    stored values share one representation.
+
+    Exponent notation (``1e3``) is numeric too — ``pg_typeof(1e3)`` is
+    ``numeric``, checked against PostgreSQL 14.13, not float8 as one might
+    expect. An integer literal stays an ``int``.
+
+    Lives here rather than in the planner because the scalar evaluator needs
+    exactly the same mapping, and the two carried separate copies of it — which
+    is why fixing only the planner's left arithmetic on floats.
+    """
+    if "." in text or "e" in text.lower():
+        d = Decimal(text)
+        exponent = d.as_tuple().exponent
+        if isinstance(exponent, int) and exponent > 0 and d.adjusted() < 34:
+            # ``1.5e2`` parses to Decimal('1.5E+2'); Postgres shows 150, so
+            # expand the exponent to match. Guarded by ``adjusted()`` so a
+            # literal like ``1e400`` — whose integer form is 401 digits, past
+            # what Decimal128 can hold — keeps its compact form instead of
+            # raising. The wire renderer expands either shape identically; this
+            # only makes the embedded value match what Postgres reports.
+            with _decimal.localcontext() as ctx:
+                ctx.prec = 40
+                d = d.quantize(Decimal(1))
+        return to_decimal128(d)
+    return int(text)
+
+
+# PG numeric.c constants for select_div_scale (ported below).
+_NUMERIC_MIN_SIG_DIGITS = 16
+_NUMERIC_MAX_DISPLAY_SCALE = 1000
+
+
+def _div_operand_stats(d: Decimal) -> tuple[int, int, int]:
+    """The ``(base-10000 weight, first base-10000 digit, display scale)`` of a
+    numeric operand — what PG's ``select_div_scale`` reads off its NumericVar
+    (digits are stored base-10000 there, DEC_DIGITS=4)."""
+    t = d.as_tuple()
+    exponent = t.exponent if isinstance(t.exponent, int) else 0
+    dscale = max(0, -exponent)
+    if d.is_zero():
+        return 0, 0, dscale
+    msd_exp = d.adjusted()  # base-10 exponent of the most significant digit
+    weight = msd_exp // 4  # floor → the base-10000 group index, incl. negatives
+    first = int(abs(d).scaleb(-4 * weight))
+    return weight, first, dscale
+
+
+def numeric_div(left: Decimal, right: Decimal) -> Decimal:
+    """PG ``numeric / numeric``: the quotient at the result scale real Postgres
+    derives (``select_div_scale``, numeric.c — ported and probed against a live
+    14.13: 20 cases, byte-identical renders).
+
+    The scale rule: estimate the quotient's weight from the operands' leading
+    base-10000 digits (assuming var1 < var2 when their first digits tie), give
+    the result ``16`` significant digits past that weight, and floor/ceiling by
+    the operands' display scales and Postgres' 0..1000 display-scale range.
+    Rounding is half-away-from-zero, as numeric's round always is."""
+    w1, f1, s1 = _div_operand_stats(left)
+    w2, f2, s2 = _div_operand_stats(right)
+    qweight = w1 - w2
+    if f1 <= f2:
+        qweight -= 1
+    rscale = _NUMERIC_MIN_SIG_DIGITS - qweight * 4
+    rscale = max(rscale, s1, s2, 0)
+    rscale = min(rscale, _NUMERIC_MAX_DISPLAY_SCALE)
+    with _decimal.localcontext() as ctx:
+        # Enough working digits that the quantize below only ever rounds the
+        # true quotient: the integer part is ~4*qweight digits, plus rscale
+        # fractional digits, plus guard.
+        ctx.prec = max(40, 4 * abs(qweight) + rscale + 12)
+        q = left / right
+        return q.quantize(Decimal(1).scaleb(-rscale), rounding=_decimal.ROUND_HALF_UP)
+
+
+def unwrap_numeric(value: Any) -> Any:
+    """A ``Decimal128`` as a plain ``Decimal``; anything else unchanged.
+
+    Decimal128 implements no Python numeric protocol, so ``int()`` / ``float()``
+    / arithmetic / comparison all reject it. Any code that takes a value which
+    might be a ``numeric`` and does arithmetic on it needs this first.
+    """
+    return value.to_decimal() if isinstance(value, bson.Decimal128) else value
+
+
+def negate(value: Any) -> Any:
+    """Arithmetic negation that also handles BSON ``Decimal128`` (which has no
+    Python operators of its own)."""
+    if isinstance(value, bson.Decimal128):
+        return bson.Decimal128(-value.to_decimal())
+    return -value
 
 
 def type_tag_for_sql(datatype: exp.DataType) -> str | None:
@@ -583,6 +751,8 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
     base = name.split("(", 1)[0].strip()
     if base == "bit varying":
         return "varbit"
+    if base == "refcursor":
+        return "refcursor"
     if base in _BIT_TAGS:
         return base
     if base == "interval" or base.startswith("interval "):
@@ -597,8 +767,16 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
         return "date"
     if base in _GEO_TAGS:
         return base
+    if base == "pg_char_1":
+        # planner.parse rewrites a ::"char" cast to this sentinel (sqlglot
+        # collapses the quoted spelling into plain CHAR, losing the identity).
+        return "char1"
     if base == "citext":
         return "citext"
+    if base == "jsonpath":
+        return "jsonpath"
+    if base == "ltree":
+        return "ltree"
     if base == "aclitem":
         return "aclitem"
     if base == "name":
@@ -652,6 +830,12 @@ def cast_type_identity(datatype: exp.DataType) -> tuple[int, int] | None:
     the target isn't a modifier-bearing type."""
     if datatype.this == exp.DataType.Type.ARRAY:
         inner = datatype.args.get("expressions") or []
+        if inner and isinstance(inner[0], exp.DataType) and inner[0].this == exp.DataType.Type.JSON:
+            # ``::JSON[]`` keeps the plain-json ARRAY identity (199), like the
+            # scalar ``::json`` → 114 below — the tag collapses json into
+            # jsonb, but the wire oids (and the binary array's element oid)
+            # differ, and the pgtest corpus reads them byte-for-byte.
+            return (199, -1)
         if inner and isinstance(inner[0], exp.DataType):
             elem = cast_type_identity(inner[0])
             if elem is not None:
@@ -837,6 +1021,83 @@ def _int_or_22p02(value: Any, tag: str) -> int:
         raise _coercion_error(tag, value) from e
 
 
+def _render_timestamp_iso(value: _dt.datetime) -> str:
+    """ISO text with Postgres' offset spelling.
+
+    Python renders a zero-minute offset as ``+00:00``; Postgres writes ``+00``,
+    widening to ``-05:30`` or ``+05:45:12`` only when it must. Clients compare
+    the rendered text — pgjdbc's TimezoneTest asserts ``12:00:00+00`` — so the
+    trailing ``:00`` is not cosmetic.
+    """
+    text = value.isoformat(sep=" ")
+    if value.tzinfo is None:
+        return text
+    head, sign, offset = text.rpartition("+") if "+" in text[10:] else text.rpartition("-")
+    if not sign or ":" not in offset:
+        return text
+    parts = offset.split(":")
+    while len(parts) > 1 and parts[-1] == "00":
+        parts.pop()
+    return f"{head}{sign}{':'.join(parts)}"
+
+
+def _to_session_wall_clock(value: _dt.datetime) -> _dt.datetime:
+    """A tz-aware instant as naive local wall clock in the session zone —
+    Postgres' ``timestamptz`` -> ``timestamp`` conversion."""
+    session = _render_session.get()
+    if session is None:
+        return value.replace(tzinfo=None)
+    from secantus.sql.datetimes import session_tzinfo
+
+    with contextlib.suppress(OverflowError, ValueError):
+        return value.astimezone(session_tzinfo(session)).replace(tzinfo=None)
+    return value.replace(tzinfo=None)
+
+
+def _representable_instant(value: _dt.datetime) -> _dt.datetime:
+    """An aware datetime that BSON can store, else the same value tz-naive.
+
+    BSON normalises an aware datetime to UTC on the way out, and near
+    ``datetime.min`` that crosses out of Python's range — ``0001-01-01
+    00:00+05:00`` is year zero in UTC. Those extremes keep their wall clock
+    instead, which is what they did before offsets were parsed at all.
+    """
+    if value.tzinfo is None:
+        return value
+    try:
+        value.astimezone(_dt.timezone.utc)
+    except (OverflowError, ValueError):
+        return value.replace(tzinfo=None)
+    return value
+
+
+def _as_session_instant(value: _dt.datetime) -> _dt.datetime:
+    """Resolve a ``timestamptz`` input to an absolute instant.
+
+    A literal carrying no offset is LOCAL TIME IN THE SESSION ZONE, not UTC —
+    ``'1950-02-07'`` under ``America/New_York`` is midnight in New York, which
+    Postgres reports back as ``1950-02-07 00:00:00-05``. Reading it as UTC
+    shifted the value by the zone's offset, so the same date came back a day
+    early or late depending on which side of Greenwich the client sat.
+
+    A value that already carries an offset is absolute and passes through.
+    """
+    if value.tzinfo is not None:
+        return value
+    session = _render_session.get()
+    if session is None:
+        return value  # no connection bound (embedded API): unchanged, i.e. UTC
+    from secantus.sql.datetimes import session_tzinfo
+
+    with contextlib.suppress(OverflowError, ValueError):
+        return value.replace(tzinfo=session_tzinfo(session)).astimezone(_dt.timezone.utc)
+    return value
+
+
+#: An ltree label path: alphanumeric/underscore labels joined by dots.
+_LTREE_RE = _re.compile(r"[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*")
+
+
 def coerce(value: Any, tag: str) -> Any:
     """Coerce a Python literal to the BSON value stored for column ``tag``.
 
@@ -845,6 +1106,14 @@ def coerce(value: Any, tag: str) -> Any:
     """
     if value is None:
         return None
+    if isinstance(value, bson.Decimal128) and tag != "numeric":
+        # A decimal literal now arrives as Decimal128 (see number_literal), and
+        # Decimal128 supports no Python conversions — ``float(Decimal128)``
+        # raises. Unwrap once here so every tag below converts from a plain
+        # Decimal, which int() / float() / str() all accept. ``numeric`` is
+        # excluded because its own branch already handles both forms and would
+        # otherwise lose the fast path.
+        value = value.to_decimal()
     if is_array_tag(tag):
         elem = array_element_tag(tag)
         if elem == "box" and not isinstance(value, (list, tuple)):
@@ -957,6 +1226,29 @@ def coerce(value: Any, tag: str) -> Any:
         # citext stores the original text verbatim (case preserved for display);
         # the case-insensitivity is applied by the query planner, not on write.
         return str(value)
+    if tag == "jsonpath":
+        from secantus.sql import jsonpath as _jsonpath
+
+        try:
+            return _jsonpath.canonicalize(str(value))
+        except _jsonpath.JsonPathError as exc:
+            raise ValueError(str(exc)) from exc
+    if tag == "ltree":
+        s_ = str(value)
+        if not _LTREE_RE.fullmatch(s_):
+            raise ValueError(f"ltree syntax error at character 1: {s_!r}")
+        return s_
+    if tag == "char1":
+        # PG's internal one-byte "char": input truncates to ONE character
+        # (crdb's UTF-8-character rule, pinned by the pgtest char corpus),
+        # and an empty string / zero byte stores NULL (the corpus reads
+        # both back as SQL NULL).
+        if isinstance(value, int) and not isinstance(value, bool):
+            value = chr(value) if 0 <= value < 0x110000 else str(value)
+        s = str(value)
+        if s in ("", "\x00"):
+            return None
+        return s[0]
     if tag == "bool":
         if isinstance(value, str):
             # A text-format bound parameter / literal arrives as Postgres' bool
@@ -970,7 +1262,7 @@ def coerce(value: Any, tag: str) -> Any:
         return bool(value)
     if tag == "timestamptz":
         if isinstance(value, _dt.datetime):
-            return value
+            return _as_session_instant(value)
         # ISO-8601 string literal -> datetime (with the 3.10 short-offset net).
         from secantus.sql.datetimes import (
             datetime_sentinel,
@@ -981,14 +1273,30 @@ def coerce(value: Any, tag: str) -> Any:
         sentinel = datetime_sentinel(value)
         if sentinel is not None:
             return sentinel
-        wide = wide_timestamp_text(value)
+        session = _render_session.get()
+        default_off = None
+        if session is not None:
+            from secantus.sql.datetimes import session_offset_text
+
+            default_off = session_offset_text(session)
+        wide = wide_timestamp_text(value, default_offset=default_off)
         if wide is not None:
             return wide  # PG-valid but beyond Python's datetime range: text
-        return parse_iso_datetime(value)
+        return _representable_instant(_as_session_instant(parse_iso_datetime(value)))
     if tag == "timestamp":
-        # Naive "without time zone": an offset in the input is dropped and the
-        # wall-clock fields kept (Postgres timestamp semantics), so the stored /
-        # compared value is always tz-naive.
+        # Naive "without time zone". A TEXT literal carrying an offset has it
+        # dropped and its wall-clock fields kept, which is Postgres' timestamp
+        # INPUT rule: '1950-02-07 00:00:00+02'::timestamp is 1950-02-07
+        # 00:00:00. A tz-aware datetime VALUE is different — that is a
+        # timestamptz being converted, and Postgres converts it through the
+        # session zone, so the same instant under America/New_York becomes
+        # 1950-02-06 17:00:00. Both checked against PostgreSQL 14.13.
+        #
+        # Treating a bound aware parameter like a literal left it on UTC wall
+        # clock, which shifted every timestamp a JDBC client wrote by the
+        # session zone's offset.
+        if isinstance(value, _dt.datetime) and value.tzinfo is not None:
+            return _to_session_wall_clock(value)
         from secantus.sql.datetimes import (
             datetime_sentinel,
             parse_iso_datetime,
@@ -999,10 +1307,25 @@ def coerce(value: Any, tag: str) -> Any:
             sentinel = datetime_sentinel(value)
             if sentinel is not None:
                 return sentinel
-            wide = wide_timestamp_text(value)
+            # A "without time zone" column forgets any offset the input
+            # carried, the same as the in-range path below does.
+            wide = wide_timestamp_text(value, drop_offset=True)
             if wide is not None:
                 return wide
-        dt = value if isinstance(value, _dt.datetime) else parse_iso_datetime(value)
+        if isinstance(value, _dt.datetime):
+            dt = value
+        else:
+            from secantus.sql import errors as _sql_errors
+
+            try:
+                dt = parse_iso_datetime(value)
+            except _sql_errors.SQLError:
+                raise  # already a typed error; do not re-wrap
+            except ValueError as exc:
+                # An unparseable timestamp reached the wire as "internal
+                # error" — Python's ValueError escaped uncaught. Postgres
+                # reports invalid input syntax, and so does this now.
+                raise _coercion_error(tag, value) from exc
         return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
     if tag in ("date", "time", "timetz"):
         from secantus.sql import datetimes as _datetimes
@@ -1048,24 +1371,92 @@ def _bson_safe_json(value: Any) -> Any:
     return value
 
 
-def _render_json(value: Any) -> str:
+def _render_json(value: Any, compact: bool = False) -> str:
     """Render a stored JSON value as text. Identical to ``json.dumps`` except
     that a ``Decimal128`` (an int that overflowed BSON's int64 — see
-    ``_bson_safe_json``) renders as a bare number, not a quoted string."""
+    ``_bson_safe_json``) renders as a bare number, not a quoted string.
+
+    Default spacing is jsonb's canonical form (``{"a": 1, "b": 2}`` — space
+    after colon and comma, like real PG). ``compact`` drops the spaces for
+    plain ``json`` columns: PG preserves a json value's input text verbatim,
+    and machine-written JSON is compact, so compact re-rendering reproduces
+    the typical input byte-for-byte (a hand-spaced literal still normalises —
+    the parsed storage shape can't be fully verbatim; tasks/backlog.md)."""
+    isep, ksep = (",", ":") if compact else (", ", ": ")
     if isinstance(value, bson.Decimal128):
         return str(value.to_decimal())
     if isinstance(value, Decimal):
         # ``to_py`` unwraps a top-level Decimal128 column value to Decimal.
         return str(value)
     if isinstance(value, list):
-        return "[" + ", ".join(_render_json(v) for v in value) + "]"
+        return "[" + isep.join(_render_json(v, compact) for v in value) + "]"
     if isinstance(value, dict):
         return (
             "{"
-            + ", ".join(f"{_json.dumps(str(k))}: {_render_json(v)}" for k, v in value.items())
+            + isep.join(
+                f"{_json.dumps(str(k))}{ksep}{_render_json(v, compact)}" for k, v in value.items()
+            )
             + "}"
         )
     return _json.dumps(value, default=str)
+
+
+#: pg_type oid of ``character(n)`` / ``bpchar``.
+BPCHAR_OID = 1042
+
+
+#: pg_type oid of ``character varying``.
+VARCHAR_OID = 1043
+
+
+def enforce_declared_length(value: Any, pg_oid: int | None, typmod: int, column: str = "") -> Any:
+    """Apply a ``char(n)`` / ``varchar(n)`` declared length, Postgres-style.
+
+    Over-length input is an ERROR — `22001 value too long for type character
+    varying(3)` — not a silent truncation. The one exception is an overflow made
+    only of TRAILING BLANKS, which Postgres trims to fit: `'abc  '` into a
+    `varchar(3)` stores `'abc'`, while `'abcd'` is refused (both probed against
+    14). A database that quietly stored a value violating its own declared
+    schema would be lying about the column.
+
+    Returns the value to store (possibly blank-trimmed); raises on overflow.
+    ``atttypmod`` is the declared width + 4; anything without one is unbounded.
+    """
+    if pg_oid not in (BPCHAR_OID, VARCHAR_OID) or typmod <= 4 or not isinstance(value, str):
+        return value
+    width = typmod - 4
+    if len(value) <= width:
+        return value
+    trimmed = value.rstrip(" ")
+    if len(trimmed) <= width:
+        # Only trailing blanks overflowed — Postgres trims rather than refuses.
+        return value[:width] if len(trimmed) < width else trimmed
+    from secantus.sql import errors
+
+    name = "character varying" if pg_oid == VARCHAR_OID else "character"
+    raise errors.SQLError(
+        "22001",
+        f"value too long for type {name}({width})",
+        diag={"c": column} if column else None,
+    )
+
+
+def blank_pad(value: Any, pg_oid: int, typmod: int) -> Any:
+    """Blank-pad a ``character(n)`` value to its declared width for output.
+
+    ``char(n)`` is a *blank-padded* type: Postgres stores and sends ``'hello'``
+    in a ``char(8)`` column as ``'hello   '`` (pgtest's row_description reads the
+    padded DataRow). The padding is applied on the way out rather than on the way
+    in, because the semantics that matter internally are the unpadded ones —
+    ``length()`` ignores trailing blanks, comparison ignores them, and casting to
+    ``text`` strips them, all of which fall out for free when the stored value
+    stays unpadded. ``atttypmod`` is the declared width + 4; a bare ``char``
+    (typmod -1) has no width to pad to.
+    """
+    if pg_oid != BPCHAR_OID or typmod <= 4 or not isinstance(value, str):
+        return value
+    width = typmod - 4
+    return value.ljust(width) if len(value) < width else value
 
 
 def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
@@ -1077,6 +1468,17 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
     """
     if value is None:
         return None
+    if isinstance(value, RegClassValue):
+        return value.relname.encode("utf-8")
+    if tag == "float4" and isinstance(value, float):
+        # float4out renders at SINGLE precision — shortest round-trip by
+        # default, %.{6+efd}g when extra_float_digits is negative (pgtest
+        # float corpus; array elements come through _render_pg_array).
+        return _render_pg_float4(value).encode("ascii")
+    if tag == "timetz" or isinstance(value, TimeTzText):
+        from secantus.sql import datetimes as _datetimes
+
+        return _datetimes.render_timetz(value).encode("ascii")
     if tag in _VECTOR_TAGS and isinstance(value, (list, tuple)):
         # int2vector / oidvector render as space-separated ints ("1 2"), the
         # form libpq clients parse for pg_index.indkey/indoption/indclass.
@@ -1084,10 +1486,17 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
     if is_array_tag(tag) and isinstance(value, (list, tuple)):
         elem = array_element_tag(tag)
         return _render_pg_array(value, elem).encode("utf-8")
-    if tag == "json":
+    if tag in ("json", "json_plain"):
         # A JSON value renders as JSON text whatever its top-level type — a bare
         # ``true`` / ``"str"`` must not fall through to the bool/str renderers.
-        return _render_json(value).encode("utf-8")
+        # "json_plain" is an internal render-only tag: a plain ``json`` (oid
+        # 114) column renders compact, jsonb keeps its canonical spacing. A
+        # JsonText value is the client's own text, echoed VERBATIM — PG's
+        # plain json preserves input bytes (``SELECT $1::JSON`` round-trips
+        # exactly; the pgtest corpus compares them byte-for-byte).
+        if isinstance(value, JsonText):
+            return str(value).encode("utf-8")
+        return _render_json(value, compact=(tag == "json_plain")).encode("utf-8")
     if isinstance(value, bool):
         return b"t" if value else b"f"
     if isinstance(value, (bytes, bytearray)):
@@ -1112,7 +1521,7 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
             style, order = render_datestyle()
             if style != "ISO":
                 return _render_timestamp_style(value, style, order).encode("utf-8")
-        return value.isoformat(sep=" ").encode("utf-8")
+        return _render_timestamp_iso(value).encode("utf-8")
     if tag == "date":
         # Dates are stored as canonical ``YYYY-MM-DD`` text; a non-ISO DateStyle
         # reorders the fields the way psycopg's DateLoader slices them.
@@ -1195,16 +1604,51 @@ def _render_pg_numeric(value: Decimal) -> str:
     return format(value, "f")
 
 
+def _extra_float_digits() -> int:
+    """The active session's extra_float_digits GUC (PG 12+ default 1 =
+    shortest round-trip; negative values reduce %g precision)."""
+    session = _render_session.get()
+    if session is None:
+        return 1
+    try:
+        return int(session.get_setting("extra_float_digits") or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
 def _render_pg_float(value: float) -> str:
-    """Postgres ``float8out`` text: shortest round-trip form, no ``.0`` on an
-    integral value (``12`` not ``12.0``), and PG's ``NaN`` / ``Infinity`` /
-    ``-Infinity`` spellings (Python's are ``nan`` / ``inf``)."""
+    """Postgres ``float8out`` text: shortest round-trip form (no ``.0`` on an
+    integral value), PG's ``NaN`` / ``Infinity`` / ``-Infinity`` spellings,
+    and ``%.{15+efd}g`` when extra_float_digits is negative (pgtest float
+    corpus pins efd -1 / -15)."""
     if _math.isnan(value):
         return "NaN"
     if _math.isinf(value):
         return "Infinity" if value > 0 else "-Infinity"
+    efd = _extra_float_digits()
+    if efd < 1:
+        return f"{value:.{max(1, 15 + efd)}g}"
     s = repr(value)
     return s[:-2] if s.endswith(".0") else s
+
+
+def _render_pg_float4(value: float) -> str:
+    """Postgres ``float4out``: the shortest decimal that round-trips to the
+    same single-precision value, or ``%.{6+efd}g`` when extra_float_digits
+    is negative."""
+    if _math.isnan(value):
+        return "NaN"
+    if _math.isinf(value):
+        return "Infinity" if value > 0 else "-Infinity"
+    efd = _extra_float_digits()
+    if efd < 1:
+        return f"{value:.{max(1, 6 + efd)}g}"
+    packed = _struct.pack("!f", value)
+    for p in range(1, 10):
+        s = f"{value:.{p}g}"
+        if _struct.pack("!f", float(s)) == packed:
+            return s
+    return f"{value:.9g}"
 
 
 def parse_pg_record_literal(text: str) -> list[str | None]:
@@ -1305,8 +1749,16 @@ def to_py(value: Any, tag: str) -> Any:
 
 def infer_elem_tag(items: Any) -> str:
     """Best-effort element tag for rendering an untyped Python list as a PG
-    array literal — keyed off the first non-None element."""
+    array literal — keyed off the first non-None LEAF element. A
+    multi-dimensional array (``flag[][]`` → nested lists) shares one element
+    type across every level, so descend before deciding; keying off the outer
+    list would type it ``json`` and render nested braces as quoted JSON."""
     elem = next((v for v in items if v is not None), None)
+    while isinstance(elem, (list, tuple)):
+        nxt = next((v for v in elem if v is not None), None)
+        if nxt is None:
+            break
+        elem = nxt
     if isinstance(elem, bool):
         return "bool"
     if isinstance(elem, int):

@@ -68,6 +68,18 @@ DEFAULT_CLIENT_IDLE_TIMEOUT_S = 300.0
 DEFAULT_MAX_CONNECTIONS = 1000
 
 
+def _tune_client_socket(conn: socket.socket) -> None:
+    """Disable Nagle on an accepted client socket. Reply paths write small
+    frames back-to-back (a reply then ReadyForQuery, one batch item's result
+    then the next); with Nagle on, the second write waits for the peer's
+    delayed ACK — ~40ms per round trip on Linux, invisible on macOS loopback.
+    pgjdbc's generated-keys batches (1000 single-row round trips per test)
+    measured 41.5s per test in CI against 0.2s locally from exactly this.
+    Real servers (mongod, PostgreSQL) set TCP_NODELAY unconditionally."""
+    with contextlib.suppress(OSError):
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+
 class SecantusDBServer:
     def __init__(
         self,
@@ -234,9 +246,20 @@ class SecantusDBServer:
     def start(self) -> None:
         if self._socket is not None:
             raise RuntimeError("server is already started")
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Resolve the family from the host rather than hardcoding AF_INET, which
+        # made the server IPv4-only: `host="::1"` failed at bind with a bare
+        # `gaierror`, and there was no way to serve an IPv6 client at all.
+        # getaddrinfo also handles hostnames, and AI_PASSIVE gives the right
+        # wildcard address when the caller passes "" (INADDR_ANY / in6addr_any).
+        family, socktype, proto, _canon, sockaddr = socket.getaddrinfo(
+            self.host or None,
+            self.port,
+            type=socket.SOCK_STREAM,
+            flags=socket.AI_PASSIVE,
+        )[0]
+        sock = socket.socket(family, socktype, proto)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.host, self.port))
+        sock.bind(sockaddr)
         sock.listen()
         self._socket = sock
         self.host, self.port = sock.getsockname()[:2]
@@ -337,6 +360,7 @@ class SecantusDBServer:
                 conn, addr = self._socket.accept()
             except OSError:
                 return
+            _tune_client_socket(conn)
             # Refuse new connections beyond the cap. A flood-DoS attacker
             # would otherwise spawn a thread per accepted socket. We close
             # the socket immediately rather than queuing — clients should
@@ -631,6 +655,11 @@ class SecantusDBServer:
         try:
             with conn:
                 while not self._stop_event.is_set():
+                    # Never go idle holding a read snapshot: an idle
+                    # connection whose last op left its thread session with a
+                    # positioned cursor pins WT's oldest-transaction horizon
+                    # for every other connection. Release before blocking.
+                    self.storage.release_thread_snapshot()
                     try:
                         message = read_message(conn)
                     except ConnectionClosed:

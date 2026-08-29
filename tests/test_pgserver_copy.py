@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import socket
+import struct as _struct
 
 import pytest
 
@@ -240,3 +241,187 @@ def test_copy_query_from_stdin_rejected(client):
     assert m.type == "E"
     assert pgwire.parse_error_response(m.payload)["C"] == "42601"
     client.read_until_ready()
+
+
+# --------------------------------------------------------------------------- #
+# Copy frames arriving outside a COPY operation are discarded (pgx streams
+# CopyData concurrently with the COPY command, so the frames land after the
+# command already failed). Real PG accepts and ignores stray CopyData /
+# CopyDone / CopyFail per the protocol spec; routing them into the extended
+# protocol raised 08P01 and poisoned the connection.
+
+
+def test_copy_data_after_failed_copy_is_discarded(client):
+    # pgx's CopyFrom shape: the command and the data are pumped without
+    # waiting for CopyInResponse. The COPY fails (42P01), then the stray
+    # frames must be dropped and the connection stay usable.
+    client.send(pgwire.build_query("COPY nosuchtable FROM STDIN"))
+    client.send(pgwire.copy_data(b"id\t0\n"))
+    client.send(pgwire.copy_done())
+    msgs = client.read_until_ready()
+    errs = [m for m in msgs if m.type == "E"]
+    assert len(errs) == 1
+    assert pgwire.parse_error_response(errs[0].payload)["C"] == "42P01"
+    tags = [m.type for m in client.query("SELECT 1")]
+    assert "D" in tags and tags[-1] == "Z"
+
+
+def test_copy_data_after_syntax_error_is_discarded(client):
+    # The pgx TestConnCopyFromQuerySyntaxError shape: the "COPY" command is
+    # not even SQL, and 1000 rows are streamed regardless.
+    client.send(pgwire.build_query("cropy t FROM STDIN WITH (FORMAT csv)"))
+    for i in range(1000):
+        client.send(pgwire.copy_data(f'{i},"foo {i} bar"\n'.encode()))
+    client.send(pgwire.copy_done())
+    msgs = client.read_until_ready()
+    errs = [m for m in msgs if m.type == "E"]
+    assert len(errs) == 1
+    assert pgwire.parse_error_response(errs[0].payload)["C"] == "42601"
+    tags = [m.type for m in client.query("SELECT 1")]
+    assert "D" in tags and tags[-1] == "Z"
+
+
+def test_stray_copy_fail_is_discarded(client):
+    client.send(pgwire.build_query("COPY nosuchtable FROM STDIN"))
+    client.send(pgwire.copy_fail("client gave up"))
+    msgs = client.read_until_ready()
+    assert [m.type for m in msgs if m.type == "E"] == ["E"]
+    tags = [m.type for m in client.query("SELECT 1")]
+    assert "D" in tags and tags[-1] == "Z"
+
+
+def test_failed_copy_then_valid_copy_succeeds(client):
+    # The pgx TestConnCopyFromDataWriteAfterErrorAndReturn shape: a failed
+    # COPY (with data still streaming in) followed by a valid COPY on the
+    # same connection.
+    client.send(pgwire.build_query("COPY nosuchtable FROM STDIN"))
+    client.send(pgwire.copy_data(b"id\t0\n"))
+    client.send(pgwire.copy_done())
+    client.read_until_ready()
+    msgs = _copy_in(client, "COPY t FROM STDIN", b"7\tcarol\tt\n")
+    assert _tag(msgs) == "COPY 1"
+    rows = [m for m in client.query("SELECT id, name FROM t WHERE id = 7") if m.type == "D"]
+    assert len(rows) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Plain ``json`` (oid 114) renders compact — machine-written JSON is compact,
+# so compact re-rendering reproduces the typical input byte-for-byte (real PG
+# keeps a json value's text verbatim; our parsed storage can't, see
+# tasks/backlog.md). jsonb keeps PG's canonical spacing ({"a": 1, "b": 2}).
+
+
+def _one_cell(client: PGClient, sql: str) -> bytes:
+    client.send(pgwire.build_query(sql))
+    for m in client.read_until_ready():
+        if m.type == "D":
+            return pgwire.parse_data_row(m.payload)[0]
+    raise AssertionError("no DataRow")
+
+
+def test_copy_to_stdout_json_is_compact(client):
+    # The pgx TestConnCopyToSmall shape: compact json in, identical bytes out.
+    client.query("CREATE TABLE j (id int4, g json)")
+    client.query("""INSERT INTO j VALUES (1, '{"abc":"def","foo":"bar"}')""")
+    data = _copy_out(client, "COPY j TO STDOUT")
+    assert data == b'1\t{"abc":"def","foo":"bar"}\n'
+
+
+def test_copy_query_to_stdout_json_is_compact(client):
+    client.query("CREATE TABLE jq (id int4, g json)")
+    client.query("""INSERT INTO jq VALUES (1, '{"a":[1,2],"b":null}')""")
+    data = _copy_out(client, "COPY (SELECT g FROM jq) TO STDOUT")
+    assert data == b'{"a":[1,2],"b":null}\n'
+
+
+def test_select_json_is_compact_but_jsonb_keeps_canonical_spacing(client):
+    client.query("CREATE TABLE j2 (g json, h jsonb)")
+    client.query("""INSERT INTO j2 VALUES ('{"a":1,"b":[1,2]}', '{"a":1,"b":[1,2]}')""")
+    assert _one_cell(client, "SELECT g FROM j2") == b'{"a":1,"b":[1,2]}'
+    assert _one_cell(client, "SELECT h FROM j2") == b'{"a": 1, "b": [1, 2]}'
+
+
+# --------------------------------------------------------------------------- #
+# The legacy bare-keyword form ``COPY t FROM STDIN BINARY`` (pre-9.0 syntax,
+# still emitted by pgx) parses as a value-less COPY parameter; it must select
+# the binary format, not fall through to the text parser (which rejected the
+# PGCOPY stream with 22021 invalid-byte-sequence).
+
+_PGCOPY_SIG = b"PGCOPY\n\xff\r\n\x00"
+
+
+def _pgcopy_stream(rows: list[tuple[int, str]]) -> bytes:
+    buf = bytearray(_PGCOPY_SIG + _struct.pack("!ii", 0, 0))
+    for a, b in rows:
+        raw = b.encode()
+        buf += _struct.pack("!h", 2)
+        buf += _struct.pack("!i", 4) + _struct.pack("!i", a)
+        buf += _struct.pack("!i", len(raw)) + raw
+    buf += _struct.pack("!h", -1)
+    return bytes(buf)
+
+
+def test_copy_from_stdin_bare_binary_keyword(client):
+    # The pgx TestConnCopyFromBinary shape, scaled down.
+    client.query("CREATE TABLE bb (a int4, b varchar)")
+    rows = [(i, f"foo {i} bar") for i in range(50)]
+    client.send(pgwire.build_query("COPY bb (a, b) FROM STDIN BINARY;"))
+    g = client.read_message()
+    assert g.type == "G", f"expected CopyInResponse, got {g.type}"
+    # A binary CopyInResponse advertises format 1 for every column.
+    overall = g.payload[0]
+    assert overall == 1
+    client.send(pgwire.copy_data(_pgcopy_stream(rows)))
+    client.send(pgwire.copy_done())
+    msgs = client.read_until_ready()
+    assert _tag(msgs) == "COPY 50"
+    out = [m for m in client.query("SELECT a, b FROM bb ORDER BY a") if m.type == "D"]
+    assert len(out) == 50
+    first = pgwire.parse_data_row(out[0].payload)
+    assert first == [b"0", b"foo 0 bar"]
+
+
+def test_copy_to_stdout_bare_binary_keyword(client):
+    client.query("CREATE TABLE bo (a int4)")
+    client.query("INSERT INTO bo VALUES (7)")
+    client.send(pgwire.build_query("COPY bo TO STDOUT BINARY"))
+    h = client.read_message()
+    assert h.type == "H"  # CopyOutResponse
+    assert h.payload[0] == 1  # binary overall format
+    data = bytearray()
+    while True:
+        m = client.read_message()
+        if m.type == "d":
+            data += m.payload
+        elif m.type == "c":
+            break
+    client.read_until_ready()
+    assert bytes(data).startswith(_PGCOPY_SIG)
+    # One row: int16 nfields=1, int32 len=4, int4 value 7, int16 -1 trailer.
+    body = bytes(data)[len(_PGCOPY_SIG) + 8 :]
+    one_row = _struct.pack("!h", 1) + _struct.pack("!i", 4) + _struct.pack("!i", 7)
+    assert body == one_row + _struct.pack("!h", -1)
+
+
+def test_unknown_copy_option_is_syntax_error(client):
+    # crdb's ``WITH destination = 'nodelocal://…'`` (pgtest copy_file_upload):
+    # PG's COPY grammar rejects unknown option keywords at parse — 42601,
+    # raised BEFORE the target table resolves (not 42P01).
+    msgs = client.query("COPY nowhere FROM STDIN WITH destination = 'nodelocal://self/f.csv'")
+    err = next(m for m in msgs if m.type == "E")
+    assert pgwire.parse_error_response(err.payload).get("C") == "42601"
+
+
+def test_copy_csv_custom_quote_roundtrip(client):
+    client.send(pgwire.build_query("COPY t (id, name) FROM STDIN CSV QUOTE '|'"))
+    assert client.read_message().type == "G"
+    client.send(pgwire.copy_data(b"1,|a,b|\n"))
+    client.send(pgwire.copy_done())
+    msgs = client.read_until_ready()
+    assert _tag(msgs) == "COPY 1"
+    rows = [
+        pgwire.parse_data_row(m.payload)
+        for m in client.query("SELECT name FROM t WHERE id = 1")
+        if m.type == "D"
+    ]
+    assert rows == [[b"a,b"]]

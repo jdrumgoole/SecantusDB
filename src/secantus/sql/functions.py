@@ -36,17 +36,25 @@ def _num(text: str) -> Any:
     return float(text) if ("." in text or "e" in text.lower()) else int(text)
 
 
-def terminate_backend(args: list, session: Session) -> bool:
-    """``pg_terminate_backend`` / ``pg_cancel_backend``: find the target
-    backend in the server's live-session registry and close its connection
-    (cancel ≈ terminate here — statements run to completion synchronously, so
-    there is no mid-query cancel point). False when the pid isn't live."""
+def terminate_backend(args: list, session: Session, *, cancel: bool = False) -> bool:
+    """``pg_terminate_backend`` (close the target's connection) and
+    ``pg_cancel_backend`` (fire the target's cancel_event, observed at
+    cancellation points like pg_sleep — the connection stays up, like real
+    PG). False when the pid isn't live."""
     pid = int(args[0]) if args and args[0] is not None else -1
     registry = getattr(session, "activity_registry", None)
     target = None
     if registry is not None:
         target = next((s for s in registry.snapshot() if s.backend_pid == pid), None)
-    terminate = getattr(target, "terminate_cb", None) if target is not None else None
+    if target is None:
+        return False
+    if cancel:
+        event = getattr(target, "cancel_event", None)
+        if event is None:
+            return False
+        event.set()
+        return True
+    terminate = getattr(target, "terminate_cb", None)
     if terminate is not None:
         terminate()
         return True
@@ -57,9 +65,13 @@ def evaluate_scalar_by_name(name: str, args: list, session: Session) -> Any:
     """Session-function dispatch by bare name + evaluated args — the scalar
     evaluator's escape hatch for calls that appear in non-constant contexts."""
     if name in ("pg_terminate_backend", "pg_cancel_backend"):
-        return terminate_backend(args, session)
+        return terminate_backend(args, session, cancel=(name == "pg_cancel_backend"))
     if name == "pg_backend_pid":
         return session.backend_pid
+    if name == "pg_sleep":
+        # Per-row pg_sleep (``select pg_sleep(0.01) from generate_series(…)``)
+        # — same cancellation-point semantics as the FROM-less form.
+        return _evaluate_named("pg_sleep", args, session)[1]
     raise errors.feature_not_supported(f"function {name}() is not supported in this context")
 
 
@@ -136,17 +148,38 @@ def _evaluate_named(name: str, args: list[Any], session: Session) -> tuple[str, 
     if name == "pg_backend_pid":
         return ("pg_backend_pid", session.backend_pid, "int4")
     if name == "pg_sleep":
-        import time as _time
+        # PG returns void after sleeping. The sleep is a cancellation point:
+        # it waits on the session's cancel_event (set by a wire CancelRequest
+        # or pg_cancel_backend) and raises PG's 57014 when cancelled. Still
+        # capped so an embedded session with no cancel path can't pin a
+        # thread forever.
+        # str() first: the per-row scalar path hands numerics over as
+        # Decimal128, which float() rejects directly.
+        seconds = float(str(args[0])) if args and args[0] is not None else 0.0
+        sleep_for = max(0.0, min(seconds, 30.0))
+        deadline = session.statement_deadline
+        if deadline is not None:
+            import time as _time
 
-        # PG returns void after sleeping. Capped: our per-connection threads
-        # have no cancel path, so an unbounded sleep would pin one forever.
-        seconds = float(args[0]) if args and args[0] is not None else 0.0
-        _time.sleep(max(0.0, min(seconds, 30.0)))
-        return ("pg_sleep", "", "text")
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                raise errors.SQLError("57014", "canceling statement due to statement timeout")
+            if sleep_for > remaining:
+                # statement_timeout fires partway through this sleep.
+                if session.cancel_event.wait(remaining):
+                    session.cancel_event.clear()
+                    raise errors.SQLError("57014", "canceling statement due to user request")
+                raise errors.SQLError("57014", "canceling statement due to statement timeout")
+        if session.cancel_event.wait(sleep_for):
+            session.cancel_event.clear()
+            raise errors.SQLError("57014", "canceling statement due to user request")
+        # PG types pg_sleep as void (oid 2278, typlen 4), value NULL on the wire.
+        return ("pg_sleep", None, "void")
     if name in ("pg_is_in_recovery",):
         return (name, False, "bool")
     if name in ("pg_terminate_backend", "pg_cancel_backend"):
-        return (name, terminate_backend(args, session), "bool")
+        killed = terminate_backend(args, session, cancel=(name == "pg_cancel_backend"))
+        return (name, killed, "bool")
     if name in ("jsonb_build_object", "json_build_object"):
         out: dict[str, Any] = {}
         for i in range(0, len(args) - 1, 2):

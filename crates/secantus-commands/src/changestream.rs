@@ -87,8 +87,10 @@ impl CursorProducer for ChangeStreamProducer {
                             CommandError::new(
                                 280,
                                 "ChangeStreamFatalError",
-                                "the change stream pipeline may not remove the _id \
-                                 (resume token) field",
+                                // mongod's exact wording — libmongoc's
+                                // `_test_resume_token_error` asserts on it.
+                                "Only transformations that retain the unmodified \
+                                 _id field are allowed.",
                             )
                             .with_extra(doc! {
                                 "errorLabels": ["NonResumableChangeStreamError"],
@@ -298,6 +300,7 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
             &ns,
             producer,
             TailableOptions {
+                change_stream: true,
                 await_data: true,
                 no_cursor_timeout: false,
                 position_seq: open_position,
@@ -344,14 +347,23 @@ fn apply_event_pipeline(events: Vec<Vec<u8>>, pipeline: &[Bson]) -> (Vec<Vec<u8>
     let Ok(decoded) = decode_docs(events) else {
         return (raw, false);
     };
+    // The resume tokens going in, to compare against what comes out.
+    let tokens_in: Vec<Option<Bson>> = decoded.iter().map(|d| d.get("_id").cloned()).collect();
     match secantus_core::aggregate::apply_pipeline(decoded, pipeline, &Document::new(), None) {
         Ok(out) => {
-            // mongod treats a pipeline that drops a delivered event's `_id`
-            // (the resume token) as a fatal change-stream error. An event
-            // filtered out entirely (e.g. by `$match`) is fine — only a
-            // surviving event missing `_id` trips it.
-            let stripped_id = out.iter().any(|d| !d.contains_key("_id"));
-            (encode_docs(out).unwrap_or(raw), stripped_id)
+            // mongod allows "only transformations that retain the unmodified
+            // `_id`" — so a pipeline that *changes* the resume token is as
+            // fatal as one that drops it (libmongoc drives both:
+            // `{$project: {_id: 0}}` removes, `{_id: {$literal: 1}}` rewrites).
+            // An event filtered out entirely (e.g. by `$match`) is fine; only a
+            // surviving event with a missing or altered `_id` trips it. The
+            // pipeline may reorder or drop events, so match each output against
+            // the input carrying the same token rather than by position.
+            let invalid_id = out.iter().any(|d| match d.get("_id") {
+                None => true,
+                Some(tok) => !tokens_in.iter().any(|t| t.as_ref() == Some(tok)),
+            });
+            (encode_docs(out).unwrap_or(raw), invalid_id)
         }
         Err(_) => (raw, false),
     }
@@ -372,12 +384,27 @@ fn extract_change_stream_pipeline(doc: &Document) -> Result<Vec<Bson>, CommandEr
     let mut out: Vec<Bson> = Vec::new();
     for stage in stages.iter().skip(1) {
         let Some(s) = stage.as_document() else {
+            // TypeMismatch (14), not BadValue: the stage is the wrong BSON
+            // *type*, which is what mongod reports and what libmongoc's
+            // `test_change_stream_accepts_array` asserts on.
             return Err(CommandError::new(
-                2,
-                "BadValue",
-                "each aggregation stage must be a document",
+                14,
+                "TypeMismatch",
+                // mongod's exact wording, which libmongoc asserts on.
+                crate::aggregate::PIPELINE_ELEMENT_MSG,
             ));
         };
+        if s.len() != 1 {
+            // A document of the wrong arity is Location40323, distinct from the
+            // TypeMismatch above. Without this, `{}` fell through to the
+            // unrecognised-stage branch below as the empty name `''`, and a
+            // multi-key stage was accepted outright.
+            return Err(CommandError::new(
+                40323,
+                "Location40323",
+                crate::aggregate::STAGE_ARITY_MSG,
+            ));
+        }
         let name = s.keys().next().map(String::as_str).unwrap_or("");
         if name == "$changeStream" {
             return Err(CommandError::new(
@@ -482,4 +509,54 @@ fn cursor_batch_size(doc: &Document) -> i64 {
         .and_then(|c| c.get("batchSize"))
         .and_then(as_i64)
         .unwrap_or(DEFAULT_BATCH_SIZE as i64)
+}
+
+#[cfg(test)]
+mod malformed_cs_pipeline_tests {
+    use super::*;
+    use bson::doc;
+
+    fn err_for(stage: Bson) -> CommandError {
+        let d = doc! {"pipeline": [Bson::Document(doc! {"$changeStream": {}}), stage]};
+        extract_change_stream_pipeline(&d).expect_err("malformed stage should be rejected")
+    }
+
+    #[test]
+    fn non_document_stage_is_type_mismatch() {
+        for bad in [
+            Bson::Int32(42),
+            Bson::String("stage".into()),
+            Bson::Array(vec![Bson::Int32(1)]),
+            Bson::Null,
+        ] {
+            let err = err_for(bad.clone());
+            assert_eq!(err.code, 14, "{bad:?}");
+            assert_eq!(
+                err.errmsg,
+                crate::aggregate::PIPELINE_ELEMENT_MSG,
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// `{}` previously fell through to the unrecognised-stage branch as the
+    /// empty name `''` (40324); a multi-key stage was accepted outright.
+    #[test]
+    fn wrong_arity_stage_is_location_40323() {
+        for bad in [doc! {}, doc! {"$match": {}, "$project": {"x": 1}}] {
+            let err = err_for(Bson::Document(bad.clone()));
+            assert_eq!(err.code, 40323, "{bad:?}");
+            assert_eq!(err.errmsg, crate::aggregate::STAGE_ARITY_MSG, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn well_formed_stage_still_accepted() {
+        let d = doc! {"pipeline": [
+            Bson::Document(doc! {"$changeStream": {}}),
+            Bson::Document(doc! {"$match": {"operationType": "insert"}}),
+        ]};
+        let out = extract_change_stream_pipeline(&d).expect("valid stage must pass");
+        assert_eq!(out.len(), 1);
+    }
 }

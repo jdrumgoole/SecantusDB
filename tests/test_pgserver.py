@@ -305,3 +305,159 @@ def test_stop_drains_handler_threads_before_storage_close(tmp_path, caplog):
         st.close()
     assert not [r for r in caplog.records if "close failed" in r.message]
     c.sock.close()
+
+
+# --------------------------------------------------------------------------- #
+# Statement-shaped garbage is a syntax error, and a mid-batch error still
+# streams the earlier statements' results — both PG parse/exec error shapes
+# pinned by pgx (PrepareSyntaxError / PipelinePrepareError /
+# ExecMultipleQueriesError).
+
+
+def test_bare_expression_is_a_syntax_error(client):
+    # sqlglot parses "SYNTAX ERROR" as an aliased column expression; a bare
+    # expression is not a statement and real PG rejects it with 42601.
+    msgs = client.query("SYNTAX ERROR")
+    errs = [m for m in msgs if m.type == "E"]
+    assert len(errs) == 1
+    assert pgwire.parse_error_response(errs[0].payload)["C"] == "42601"
+    res = parse_results(client.query("SELECT 1"))
+    assert res["results"][0]["rows"] == [[b"1"]]
+
+
+def test_multi_statement_error_streams_completed_results(client):
+    # select 1 runs and its rows arrive; select 1/0 errors 22012; the third
+    # statement never executes — exactly real PG's simple-protocol shape.
+    msgs = client.query("select 1; select 1/0; select 2")
+    types = [m.type for m in msgs]
+    data = [m for m in msgs if m.type == "D"]
+    errs = [m for m in msgs if m.type == "E"]
+    assert len(data) == 1 and pgwire.parse_data_row(data[0].payload) == [b"1"]
+    assert len(errs) == 1
+    assert pgwire.parse_error_response(errs[0].payload)["C"] == "22012"
+    # The first statement completed (its CommandComplete precedes the error);
+    # nothing from the third statement follows the ErrorResponse.
+    assert types.index("C") < types.index("E")
+    assert types[-1] == "Z"
+
+
+# --------------------------------------------------------------------------- #
+# Protocol negotiation: a client asking for a newer minor protocol (pgx's
+# MaxProtocolVersion "3.2" sends 196610) gets NegotiateProtocolVersion FIRST
+# — the newest minor we speak plus any unrecognized _pq_.* options — and the
+# handshake continues at 3.0, exactly like real PG.
+
+
+def _startup_with_protocol(server, protocol, extra=None):
+    import struct as _struct
+
+    host, port = server.address
+    c = PGClient(host, port)
+    params = {"user": "secantus", "database": "testdb", **(extra or {})}
+    c.sock.sendall(pgwire.build_startup_message(params, protocol=protocol))
+    first = pgwire.read_message(c.sock)
+    assert first.type == "v", f"expected NegotiateProtocolVersion, got {first.type}"
+    (newest,) = _struct.unpack_from("!i", first.payload, 0)
+    (count,) = _struct.unpack_from("!i", first.payload, 4)
+    names = first.payload[8:].split(b"\x00")[:-1] if count else []
+    c._read_until_ready()
+    return c, newest, count, [n.decode() for n in names]
+
+
+def test_protocol_32_negotiates_down_to_30(server):
+    c, newest, count, names = _startup_with_protocol(server, (3 << 16) | 2)
+    try:
+        assert newest == 196608 and count == 0 and names == []
+        res = parse_results(c.query("SELECT 1"))
+        assert res["results"][0]["rows"] == [[b"1"]]
+    finally:
+        c.close()
+
+
+def test_unknown_pq_option_is_reported(server):
+    c, newest, count, names = _startup_with_protocol(
+        server, (3 << 16) | 2, extra={"_pq_.fancy_feature": "on"}
+    )
+    try:
+        assert newest == 196608
+        assert names == ["_pq_.fancy_feature"]
+    finally:
+        c.close()
+
+
+def test_protocol_30_gets_no_negotiation(client):
+    # The plain-3.0 handshake shape is pinned by every other test in this
+    # file; just confirm a fresh query round-trip stays clean.
+    res = parse_results(client.query("SELECT 1"))
+    assert res["results"][0]["rows"] == [[b"1"]]
+
+
+def test_show_server_version_num(client):
+    res = parse_results(client.query("SHOW server_version_num"))
+    assert res["results"][0]["rows"] == [[b"150000"]]
+
+
+def test_startup_parameter_applies_any_guc(server):
+    # Real PG accepts any run-time GUC as a startup parameter. pgx's
+    # target_session_attrs=read-write probe ships
+    # default_transaction_read_only=on at startup and expects SHOW
+    # transaction_read_only to reflect it (and writes to fail 25006).
+    host, port = server.address
+    c = PGClient(host, port)
+    c.sock.sendall(
+        pgwire.build_startup_message(
+            {
+                "user": "secantus",
+                "database": "testdb",
+                "default_transaction_read_only": "on",
+            }
+        )
+    )
+    c._read_until_ready()
+    try:
+        res = parse_results(c.query("SHOW transaction_read_only"))
+        assert res["results"][0]["rows"] == [[b"on"]]
+        msgs = c.query("CREATE TABLE ro_probe (a int4)")
+        errs = [m for m in msgs if m.type == "E"]
+        assert errs and pgwire.parse_error_response(errs[0].payload)["C"] == "25006"
+    finally:
+        c.close()
+
+
+# --------------------------------------------------------------------------- #
+# A multi-statement simple query is ONE implicit transaction (real PG; the
+# pgtest batch_stmt corpus pins every shape below): a mid-batch error rolls
+# back the earlier statements' writes; BEGIN inside the batch takes the
+# transaction over (its characteristics included); COMMIT ends it and the
+# remainder starts a fresh implicit transaction.
+
+
+def test_batch_error_rolls_back_earlier_writes(client):
+    client.query("CREATE TABLE batch_a (n int4)")
+    msgs = client.query("INSERT INTO batch_a VALUES(1); SELECT 1/0; INSERT INTO batch_a VALUES(2);")
+    tags = [pgwire.parse_command_complete(m.payload) for m in msgs if m.type == "C"]
+    assert tags == ["INSERT 0 1"]  # first statement's result streamed
+    errs = [m for m in msgs if m.type == "E"]
+    assert pgwire.parse_error_response(errs[0].payload)["C"] == "22012"
+    res = parse_results(client.query("SELECT count(*) FROM batch_a"))
+    assert res["results"][0]["rows"] == [[b"0"]]  # rolled back
+
+
+def test_commit_in_batch_splits_transactions(client):
+    client.query("CREATE TABLE batch_b (n int4)")
+    client.query("INSERT INTO batch_b VALUES(1); COMMIT; SELECT 1/0;")
+    res = parse_results(client.query("SELECT count(*) FROM batch_b"))
+    assert res["results"][0]["rows"] == [[b"1"]]  # committed before the error
+
+
+def test_begin_read_only_takeover_in_batch(client):
+    client.query("CREATE TABLE batch_c (n int4)")
+    msgs = client.query(
+        "INSERT INTO batch_c VALUES(6); BEGIN READ ONLY; INSERT INTO batch_c VALUES(7); COMMIT;"
+    )
+    errs = [m for m in msgs if m.type == "E"]
+    assert pgwire.parse_error_response(errs[0].payload)["C"] == "25006"
+    assert msgs[-1].payload == b"E"  # ReadyForQuery: failed transaction block
+    client.query("COMMIT")  # ends the failed block (rolls back)
+    res = parse_results(client.query("SELECT count(*) FROM batch_c"))
+    assert res["results"][0]["rows"] == [[b"0"]]  # INSERT 6 rolled back too

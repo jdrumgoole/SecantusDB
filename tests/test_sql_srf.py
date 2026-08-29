@@ -342,3 +342,247 @@ def test_computed_projection_over_catalog_table():
         assert res.rows == [(1,)]
     finally:
         st.close()
+
+
+def test_generate_series_accepts_untyped_text_bounds():
+    """A bound arriving as text is parsed as a number, as Postgres does.
+
+    An untyped parameter (`generate_series(1, $1)` with `$1` sent without a
+    type OID) reaches the SRF as a string — nothing upstream coerced it,
+    because the wire gave no type. Postgres infers the parameter's type from
+    the argument position and parses it as an integer.
+
+    This is not academic: pgx's `ensureConnValid` helper runs exactly that
+    query and is called at the end of 66 `pgconn` tests, so rejecting it took
+    otherwise-passing tests down with it. Fixing it moved that package from 86
+    failures to 29.
+    """
+    assert _rows("select generate_series(1, '3')") == [(1,), (2,), (3,)]
+    assert _rows("select generate_series('1', '3')") == [(1,), (2,), (3,)]
+    # A numeric step still works alongside coerced bounds.
+    assert _rows("select generate_series('1', '10', 3)") == [(1,), (4,), (7,), (10,)]
+
+    # NOT covered, deliberately: a QUOTED third argument
+    # (`generate_series(1, 10, '3')`). sqlglot parses that into an `Interval`
+    # node at parse time, so it arrives as an interval and never reaches this
+    # coercion — a separate parser-level quirk, not this fix's job. Recorded
+    # here rather than silently omitted.
+
+
+def test_generate_series_still_rejects_non_numeric_bounds():
+    """Coercion is narrow: only strings that parse cleanly become numbers.
+
+    Guards the over-permissive direction — a bound that is genuinely not a
+    number must still raise, not silently yield an empty or nonsense series.
+    """
+    import pytest as _pytest
+
+    from secantus.sql import errors
+
+    with _pytest.raises(errors.SQLError) as exc:
+        _rows("select generate_series('a', 'b')")
+    assert "integer / numeric" in str(exc.value)
+
+
+class TestSeriesResultTyping:
+    # pgx's NetworkUsage test byte-counts the reply: PG's generate_series
+    # picks its overload from the argument types, so int4-range bounds yield
+    # int4 rows (oid 23, 4-byte binary cells), not int8.
+    def test_int4_bounds_type_int4(self):
+        res = _run("select n from generate_series(1, 3) n")
+        assert res.columns[0].type_tag == "int4"
+        assert res.columns[0].pg_oid == 23
+
+    def test_int8_bounds_type_int8(self):
+        res = _run("select n from generate_series(2147483648, 2147483650) n")
+        assert res.columns[0].type_tag == "int8"
+        assert res.columns[0].pg_oid == 20
+
+    def test_describe_matches_execute_for_param_bound(self):
+        # Describe-time ($1 unbound) and execute-time typing must agree — a
+        # RowDescription claiming int8 over 4-byte int4 cells breaks binary
+        # clients. Known int4-range bounds decide int4 both times.
+        from secantus.sql import srf as _srf
+
+        assert _srf._generate_series(1, None, None) == ([], "int4")
+        assert _srf._generate_series(2147483648, None, None) == ([], "int8")
+
+
+class TestOutputNameFidelity:
+    def test_duplicate_unaliased_names_repeat_verbatim(self):
+        # Real PG repeats ?column? for every unaliased expression — never
+        # ?column?_2 (pgx's NetworkUsage test byte-counts the names).
+        assert _cols("select 'a', 'b', 1, 2 from generate_series(1, 1) n") == [
+            "?column?",
+            "?column?",
+            "?column?",
+            "?column?",
+        ]
+
+    def test_array_cast_named_after_element_type(self):
+        assert _cols("select '{foo}'::text[] from generate_series(1, 1) n") == ["text"]
+
+
+class TestSelectListRecordSrf:
+    """``_pg_expandarray`` in the SELECT list — the call sites pgjdbc's
+    DatabaseMetaData PK/index queries emit: bare composite column, immediate
+    ``(SRF(x)).n`` field access, and both in one projection expanding in
+    lockstep. Rows multiply per element; empty arrays eliminate the row."""
+
+    @pytest.fixture
+    def st(self, tmp_path):
+        s = Storage(str(tmp_path))
+        try:
+            sess = Session(database=DB)
+            run_sql(s, DB, "CREATE TABLE t (id int, arr int[])", session=sess)
+            run_sql(
+                s,
+                DB,
+                "INSERT INTO t VALUES (1, ARRAY[10,20]), (2, ARRAY[30]), (3, ARRAY[]::int[])",
+                session=sess,
+            )
+            yield s
+        finally:
+            s.close()
+
+    def test_bare_composite_column(self, st):
+        res = _run(
+            "SELECT id, information_schema._pg_expandarray(arr) AS keys FROM t ORDER BY id",
+            st=st,
+        )
+        assert res.rows == [
+            (1, {"x": 10, "n": 1}),
+            (1, {"x": 20, "n": 2}),
+            (2, {"x": 30, "n": 1}),
+        ]
+        assert [c.name for c in res.columns] == ["id", "keys"]
+
+    def test_field_access_form(self, st):
+        res = _run(
+            "SELECT id, (information_schema._pg_expandarray(arr)).n AS seq FROM t ORDER BY id",
+            st=st,
+        )
+        assert res.rows == [(1, 1), (1, 2), (2, 1)]
+
+    def test_lockstep_expansion(self, st):
+        res = _run(
+            "SELECT (information_schema._pg_expandarray(arr)).n AS seq, "
+            "information_schema._pg_expandarray(arr) AS keys FROM t WHERE id = 1",
+            st=st,
+        )
+        assert res.rows == [(1, {"x": 10, "n": 1}), (2, {"x": 20, "n": 2})]
+
+    def test_fromless(self, st):
+        res = _run("SELECT information_schema._pg_expandarray(ARRAY[7,8]) AS k", st=st)
+        assert res.rows == [({"x": 7, "n": 1},), ({"x": 8, "n": 2},)]
+
+    def test_composite_access_through_derived_table(self, st):
+        res = _run(
+            "SELECT (sub.keys).x, (sub.keys).n FROM "
+            "(SELECT information_schema._pg_expandarray(ARRAY[10,20]) AS keys) sub",
+            st=st,
+        )
+        assert res.rows == [(10, 1), (20, 2)]
+
+    def test_pgjdbc_get_primary_keys_shape(self, st):
+        sess = Session(database=DB)
+        run_sql(st, DB, "CREATE TABLE pkt2 (p int, q int, PRIMARY KEY (p, q))", session=sess)
+        res = _run(
+            "SELECT result.COLUMN_NAME, result.KEY_SEQ, result.PK_NAME FROM "
+            "(SELECT a.attname AS COLUMN_NAME, "
+            " (information_schema._pg_expandarray(con.conkey)).n AS KEY_SEQ, "
+            " con.conname AS PK_NAME, "
+            " information_schema._pg_expandarray(con.conkey) AS KEYS, "
+            " a.attnum AS A_ATTNUM "
+            "FROM pg_catalog.pg_constraint con "
+            " JOIN pg_catalog.pg_class ct ON (con.conrelid = ct.oid) "
+            " JOIN pg_catalog.pg_attribute a ON (a.attrelid = ct.oid) "
+            "WHERE con.contype = 'p' AND ct.relname = 'pkt2') result "
+            "where result.A_ATTNUM = (result.KEYS).x "
+            "ORDER BY result.key_seq",
+            st=st,
+        )
+        assert res.rows == [("p", 1, "pkt2_pkey"), ("q", 2, "pkt2_pkey")]
+
+    def test_pgjdbc_index_keys_join_shape(self, st):
+        sess = Session(database=DB)
+        run_sql(st, DB, "CREATE TABLE pkt (a int, b text, PRIMARY KEY (a))", session=sess)
+        res = _run(
+            "SELECT a.attname FROM pg_catalog.pg_class ct "
+            " JOIN pg_catalog.pg_attribute a ON (ct.oid = a.attrelid) "
+            " JOIN (SELECT i.indexrelid, i.indrelid, i.indisprimary, "
+            "        information_schema._pg_expandarray(i.indkey) AS keys "
+            "       FROM pg_catalog.pg_index i) i "
+            "   ON (a.attnum = (i.keys).x AND a.attrelid = i.indrelid) "
+            "WHERE ct.relname = 'pkt' AND i.indisprimary ORDER BY a.attnum",
+            st=st,
+        )
+        assert res.rows == [("a",)]
+
+
+class TestSearchPathVisibility:
+    """``pg_table_is_visible`` honours the session's search_path — both in
+    WHERE position (lowered to a namespace filter) and as a projected value —
+    so pgjdbc's getPrimaryUniqueKeys disambiguates same-named tables across
+    schemas (UpdateableResultTest.testUpdateableWithSameTableNameInMultipleSchemas)."""
+
+    @pytest.fixture
+    def st(self, tmp_path):
+        s = Storage(str(tmp_path))
+        try:
+            sess = Session(database=DB)
+            for ddl in (
+                "CREATE SCHEMA schema1",
+                "CREATE SCHEMA schema2",
+                "CREATE TABLE schema1.same_name (id int PRIMARY KEY, val text)",
+                "CREATE TABLE schema2.same_name (id2 int PRIMARY KEY, val text)",
+            ):
+                run_sql(s, DB, ddl, session=sess)
+            yield s
+        finally:
+            s.close()
+
+    def _pk_columns(self, st, sess):
+        q = (
+            "SELECT a.attname FROM pg_catalog.pg_class ct "
+            " JOIN pg_catalog.pg_attribute a ON (ct.oid = a.attrelid) "
+            " JOIN pg_catalog.pg_index i ON (a.attrelid = i.indrelid) "
+            " JOIN (SELECT i2.indrelid AS rid, "
+            "        information_schema._pg_expandarray(i2.indkey) AS keys "
+            "       FROM pg_catalog.pg_index i2) k "
+            "   ON (a.attnum = (k.keys).x AND a.attrelid = k.rid) "
+            "WHERE i.indisprimary AND pg_catalog.pg_table_is_visible(ct.oid) "
+            "  AND ct.relname = 'same_name'"
+        )
+        return run_sql(st, DB, q, session=sess)[-1].rows
+
+    def test_where_position_follows_search_path(self, st):
+        sess = Session(database=DB)
+        run_sql(st, DB, "SET search_path TO schema1", session=sess)
+        assert self._pk_columns(st, sess) == [("id",)]
+        run_sql(st, DB, "SET search_path TO schema2", session=sess)
+        assert self._pk_columns(st, sess) == [("id2",)]
+
+    def test_projection_position_follows_search_path(self, st):
+        sess = Session(database=DB)
+        run_sql(st, DB, "SET search_path TO schema1", session=sess)
+        rows = run_sql(
+            st,
+            DB,
+            "SELECT pg_catalog.pg_table_is_visible(oid) FROM pg_catalog.pg_class "
+            "WHERE relname = 'same_name' ORDER BY relnamespace",
+            session=sess,
+        )[-1].rows
+        assert rows == [(True,), (False,)]
+
+    def test_default_path_still_sees_public(self, st):
+        sess = Session(database=DB)
+        run_sql(st, DB, "CREATE TABLE pub_t (a int PRIMARY KEY)", session=sess)
+        rows = run_sql(
+            st,
+            DB,
+            "SELECT relname FROM pg_catalog.pg_class "
+            "WHERE pg_catalog.pg_table_is_visible(oid) AND relname = 'pub_t'",
+            session=sess,
+        )[-1].rows
+        assert rows == [("pub_t",)]

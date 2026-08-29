@@ -1,0 +1,39 @@
+[package]
+name = "secantus-bench"
+version = "0.5.3-beta.163"
+edition = "2021"
+description = "Three-droplet DigitalOcean benchmark harness for the SecantusDB Rust server: provisioning, deployment, coordinated load generation and reporting."
+license = "GPL-2.0-only"
+repository = "https://github.com/jdrumgoole/SecantusDB"
+publish = false
+
+# Deliberately dep-light, like the rest of the clean workspace:
+#
+#   * The load client speaks the MongoDB wire protocol directly through
+#     `secantus-wire` instead of pulling in the official `mongodb` driver and a
+#     tokio runtime. Two reasons: the workspace stays free of a ~200-crate
+#     async tree that CI would rebuild on every push, and a benchmark client
+#     wants the LOWEST possible client-side overhead — driver abstraction is
+#     exactly what caps how much load one client machine can offer.
+#   * The orchestrator drives `curl` / `ssh` / `scp` as subprocesses rather than
+#     linking an HTTP client and a TLS stack. It is a process driver already
+#     (ssh, scp, ping); adding curl to that list costs nothing and keeps a TLS
+#     implementation out of the dependency graph.
+[lib]
+name = "secantus_bench"
+crate-type = ["rlib"]
+
+[dependencies]
+bson = { workspace = true }
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+secantus-wire = { path = "../secantus-wire" }
+
+[[bin]]
+name = "do-client"
+path = "src/bin/do-client.rs"
+
+[[bin]]
+name = "do-cluster"
+path = "src/bin/do-cluster.rs"

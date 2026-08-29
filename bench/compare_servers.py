@@ -32,6 +32,9 @@ Ctrl-C aborts cleanly between reps.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
+import platform
 import shutil
 import signal
 import socket
@@ -42,6 +45,7 @@ import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -53,10 +57,12 @@ WORKLOADS = (
     "insert",
     "find_indexed_range",
     "find_all",
+    "find_filtered_scan",
     "update_many_half",
     "aggregate_group",
     "aggregate_multistage",
     "delete_many_half",
+    "change_stream_drain",
 )
 
 
@@ -86,7 +92,9 @@ def _wait_for_listener(host: str, port: int, timeout: float = 30.0) -> None:
 def _rust_client() -> Iterator[pymongo.MongoClient]:
     import _secantus_server
 
-    srv = _secantus_server.RustServer(tempfile.mkdtemp(prefix="cmp-rust-"), 0)
+    srv = _secantus_server.RustServer(
+        tempfile.mkdtemp(prefix="cmp-rust-"), 0, replica_set_name="secantus"
+    )
     try:
         host, port = srv.address
         yield pymongo.MongoClient(host, port, directConnection=True, serverSelectionTimeoutMS=5000)
@@ -104,6 +112,58 @@ def _python_client() -> Iterator[pymongo.MongoClient]:
         yield pymongo.MongoClient(srv.uri, directConnection=True, serverSelectionTimeoutMS=5000)
     finally:
         srv.stop()
+
+
+@contextmanager
+def _mongod_replset_client() -> Iterator[pymongo.MongoClient]:
+    """Spawn a throwaway SINGLE-NODE REPLICA SET mongod (change streams need
+    one) — used only for the ``change_stream_drain`` reference number; every
+    other row keeps the standalone reference so the table stays comparable
+    with earlier publications."""
+    data_dir = Path(tempfile.mkdtemp(prefix="cmp-mongod-rs-"))
+    port = _free_port()
+    proc = subprocess.Popen(
+        [
+            "mongod",
+            "--bind_ip",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--dbpath",
+            str(data_dir),
+            "--logpath",
+            str(data_dir / "mongod.log"),
+            "--replSet",
+            "cmp0",
+            "--noauth",
+            "--quiet",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_for_listener("127.0.0.1", port)
+        client = pymongo.MongoClient(
+            f"mongodb://127.0.0.1:{port}", directConnection=True, serverSelectionTimeoutMS=10000
+        )
+        client.admin.command("replSetInitiate")
+        deadline = time.perf_counter() + 30
+        while time.perf_counter() < deadline:
+            try:
+                if client.admin.command("hello").get("isWritablePrimary"):
+                    break
+            except pymongo.errors.PyMongoError:
+                pass
+            time.sleep(0.2)
+        yield client
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        shutil.rmtree(data_dir, ignore_errors=True)
 
 
 @contextmanager
@@ -165,6 +225,13 @@ def _run_workloads(client: pymongo.MongoClient, n: int) -> dict[str, float]:
     start = time.perf_counter()
     _ = list(coll.find({}))
     t["find_all"] = time.perf_counter() - start
+
+    # COLLSCAN with a numeric range filter on an UNINDEXED field (`g` — only
+    # `v` is indexed): the per-document compare path, which `find_all` (no
+    # filter) and the indexed range (B-tree byte compare) never touch.
+    start = time.perf_counter()
+    _ = list(coll.find({"g": {"$gte": 25}}))
+    t["find_filtered_scan"] = time.perf_counter() - start
 
     start = time.perf_counter()
     coll.update_many({"active": True}, {"$inc": {"v": 1}})
@@ -230,16 +297,112 @@ def _run_workloads(client: pymongo.MongoClient, n: int) -> dict[str, float]:
     t["delete_many_half"] = time.perf_counter() - start
 
     coll.drop()
+    t["change_stream_drain"] = _change_stream_drain(client, n)
     return t
 
 
-def _median_run(make_client: Any, n: int, reps: int) -> dict[str, float]:
+def _change_stream_drain(client: pymongo.MongoClient, n: int) -> float:
+    """Seconds to drain ``n // 2`` change-stream events (inserted while the
+    watch is open; only the drain is timed). ``NaN`` when the server rejects
+    ``$changeStream`` — a STANDALONE mongod does (its change streams need a
+    replica set), so the throwaway standalone reference gets its number from
+    a separate single-node-replica-set spawn in ``main``."""
+    events = n // 2
+    cs = client["perf"]["cs"]
+    cs.drop()
+    try:
+        with cs.watch(batch_size=2000) as stream:
+            for lo in range(0, events, 1000):
+                cs.insert_many([{"_id": lo + k, "pad": "y" * 64} for k in range(1000)])
+            start = time.perf_counter()
+            for _ in range(events):
+                stream.next()
+            elapsed = time.perf_counter() - start
+    except pymongo.errors.PyMongoError:
+        return float("nan")
+    finally:
+        cs.drop()
+    return elapsed
+
+
+# The mongod build every ratio on this page is expressed against. Captured at
+# run time rather than assumed: mongod is the denominator of every published
+# "xmongod" figure, so a change of reference moves every ratio for reasons that
+# have nothing to do with SecantusDB. Measuring on droplets (mongod 8.0) rather
+# than a laptop (6.0) did exactly that -- 8.0 inserts materially faster, so the
+# ratios worsened while our own absolute numbers held steady.
+_MONGOD_VERSION = {"version": "unknown"}
+
+
+def _capture_mongod_version(client: pymongo.MongoClient) -> None:
+    # A version probe must never fail a benchmark run.
+    with contextlib.suppress(Exception):
+        _MONGOD_VERSION["version"] = str(client.server_info().get("version", "unknown"))
+
+
+def _median_run(
+    make_client: Any, n: int, reps: int, *, capture_version: bool = False
+) -> dict[str, float]:
     samples: dict[str, list[float]] = {}
     for _ in range(reps):
         with make_client() as client:
+            if capture_version:
+                _capture_mongod_version(client)
             for k, v in _run_workloads(client, n).items():
                 samples.setdefault(k, []).append(v)
     return {k: statistics.median(v) for k, v in samples.items()}
+
+
+# Display labels for each workload key, matching what the chart generator and
+# the published tables expect. Kept next to WORKLOADS so the two can't drift.
+JSON_LABELS = {
+    "insert": "insert (10k docs)",
+    "find_indexed_range": "find indexed range",
+    "find_all": "find full scan",
+    "find_filtered_scan": "find filtered scan",
+    "update_many_half": "update_many (half)",
+    "aggregate_group": "aggregate $group",
+    "aggregate_multistage": "aggregate multi-stage",
+    "delete_many_half": "delete_many (half)",
+    "change_stream_drain": "change-stream drain",
+}
+
+
+def _write_json(
+    path: Path,
+    mongod: dict[str, float],
+    rust: dict[str, float],
+    py: dict[str, float],
+    args: argparse.Namespace,
+) -> None:
+    """Write results in the ``bench/results/latency.json`` schema.
+
+    That file feeds ``bench.latency_chart``, which rewrites the published
+    table and SVG in ``docs/benchmark.md`` and the website's
+    ``performance.html``. Emitting it directly removes a hand-transcription
+    step that was previously the only way to get from this harness to the
+    published numbers -- and hand-copying 27 figures is exactly the kind of
+    step that silently publishes a typo.
+    """
+    payload = {
+        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "host": f"{platform.system()} {platform.machine()}",
+        "source": f"bench.compare_servers --n {args.n} --reps {args.reps}",
+        "mongod_version": _MONGOD_VERSION["version"],
+        "workloads": [
+            {
+                "key": k,
+                "label": JSON_LABELS[k],
+                "md_label": JSON_LABELS[k],
+                "mongod_ms": round(mongod[k] * 1000, 2),
+                "rust_ms": round(rust[k] * 1000, 2),
+                "py_ms": round(py[k] * 1000, 2),
+            }
+            for k in WORKLOADS
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -257,6 +420,11 @@ def main(argv: list[str] | None = None) -> int:
         "--mongo-uri", default="", help="existing mongod URI (default: spawn a throwaway mongod)"
     )
     parser.add_argument("--no-mongod", action="store_true", help="skip the mongod comparison")
+    parser.add_argument(
+        "--json",
+        default="",
+        help="also write results to this path in bench/results/latency.json schema",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -275,10 +443,30 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"workload n={args.n}, median of {args.reps} reps, on-disk WiredTiger, via pymongo\n")
     mongod = (
-        _median_run(lambda: _mongod_client(args.mongo_uri or None), args.n, args.reps)
+        _median_run(
+            lambda: _mongod_client(args.mongo_uri or None),
+            args.n,
+            args.reps,
+            capture_version=True,
+        )
         if use_mongod
         else None
     )
+    import math
+
+    if (
+        mongod is not None
+        and math.isnan(mongod.get("change_stream_drain", float("nan")))
+        and not args.mongo_uri
+        and shutil.which("mongod") is not None
+    ):
+        # Standalone mongod rejects $changeStream — measure that one row
+        # against a throwaway single-node replica set.
+        samples = []
+        for _ in range(args.reps):
+            with _mongod_replset_client() as rc:
+                samples.append(_change_stream_drain(rc, args.n))
+        mongod["change_stream_drain"] = statistics.median(samples)
     rust = _median_run(_rust_client, args.n, args.reps)
     py = _median_run(_python_client, args.n, args.reps)
 
@@ -298,7 +486,8 @@ def main(argv: list[str] | None = None) -> int:
             m, r, p = mongod[k] * 1000, rust[k] * 1000, py[k] * 1000
             rx = r / m if m else float("nan")
             px = p / m if m else float("nan")
-            print(f"{k:<22}{m:>12.2f}{r:>19.2f}{rx:>8.1f}x{p:>16.2f}{px:>8.1f}x")
+            row = f"{k:<22}{m:>12.2f}{r:>19.2f}{rx:>8.1f}x{p:>16.2f}{px:>8.1f}x"
+            print(row.replace("nan", "  —"))
     else:
         header = f"{'workload':<22}{'SecantusDB-rs(ms)':>19}{'SecantusDB(ms)':>16}{'speedup':>10}"
         sub = f"{'':<22}{'(Rust)':>19}{'(Python)':>16}{'':>10}"
@@ -308,6 +497,13 @@ def main(argv: list[str] | None = None) -> int:
         for k in WORKLOADS:
             r, p = rust[k] * 1000, py[k] * 1000
             print(f"{k:<22}{r:>19.2f}{p:>16.2f}{(p / r if r else float('nan')):>9.1f}x")
+
+    if args.json:
+        if mongod is None:
+            print("--json needs the mongod column; nothing written.", file=sys.stderr)
+            return 2
+        _write_json(Path(args.json), mongod, rust, py, args)
+        print(f"\nwrote {args.json}")
     return 0
 
 

@@ -17,10 +17,9 @@ These pinned three concurrency fixes:
   constraint and concurrent ``SET n = n + 1`` updates lose increments;
 * the loser of a conflict keeps a usable connection and a clean session.
 
-Known remaining divergence (tasks/backlog.md): two *open transactions* that
-each insert the same UNIQUE value can both commit — statement-time constraint
-probes can't see the other transaction's uncommitted writes, and the docs
-don't collide in WiredTiger. Real Postgres blocks on the index entry.
+(The divergence formerly noted here — two open transactions both committing
+the same UNIQUE value — was closed by #775/#778: SQL UNIQUE constraints are
+backed by a storage unique index WiredTiger itself enforces.)
 """
 
 from __future__ import annotations
@@ -172,14 +171,26 @@ def test_autocommit_computed_updates_lose_no_increments(server):
         c.execute("INSERT INTO ctr VALUES (1, 0)")
     per_worker = 50
 
+    from secantus.sql import pgextended
+
+    counters_at_start = dict(pgextended.COUNTERS)
+    outcomes: dict[int, list[str]] = {}
+
     def worker(i: int) -> None:
+        log = outcomes.setdefault(i, [])
         with connect(server) as c:
             for _ in range(per_worker):
-                c.execute("UPDATE ctr SET n = n + 1 WHERE id = 1")
+                cur = c.execute("UPDATE ctr SET n = n + 1 WHERE id = 1")
+                log.append(str(cur.rowcount))
 
     run_workers(WORKERS, worker)
     with connect(server) as c:
-        assert c.execute("SELECT n FROM ctr").fetchone() == (WORKERS * per_worker,)
+        n = c.execute("SELECT n FROM ctr").fetchone()[0]
+        delta = {k: pgextended.COUNTERS[k] - counters_at_start[k] for k in counters_at_start}
+        assert n == WORKERS * per_worker, (
+            f"lost increments: n={n}, implicit-txn deltas THIS TEST={delta}, "
+            f"per-worker rowcounts={outcomes}"
+        )
 
 
 def test_transactional_increments_retry_to_exact_total(server):
@@ -402,16 +413,107 @@ def test_dual_protocol_txn_vs_autocommit_stall_is_bounded(server):
         c.execute("CREATE TABLE t (id bigint primary key, n int)")
         c.execute("INSERT INTO t VALUES (1, 0)")
         c.execute("INSERT INTO t VALUES (2, 0)")
+    from secantus.sql import pgextended
+
+    counters_at_start = dict(pgextended.COUNTERS)
+    outcomes: dict[int, list[str]] = {}
     with connect(server, autocommit=False) as txn:
         txn.execute("UPDATE t SET n = 1 WHERE id = 1")
 
         def other_row_writer(i: int) -> None:
+            log = outcomes.setdefault(i, [])
             with connect(server) as c:
                 for _ in range(10):
-                    c.execute("UPDATE t SET n = n + 1 WHERE id = 2")
+                    cur = c.execute("UPDATE t SET n = n + 1 WHERE id = 2")
+                    # A lost increment on the CI lanes needs to name itself:
+                    # record the reported rowcount per iteration so the assert
+                    # below shows exactly which statements claimed success.
+                    log.append(str(cur.rowcount))
 
         run_workers(4, other_row_writer)
         txn.commit()
     with connect(server) as c:
         assert c.execute("SELECT n FROM t WHERE id = 1").fetchone() == (1,)
-        assert c.execute("SELECT n FROM t WHERE id = 2").fetchone() == (40,)
+        n = c.execute("SELECT n FROM t WHERE id = 2").fetchone()[0]
+        delta = {k: pgextended.COUNTERS[k] - counters_at_start[k] for k in counters_at_start}
+        assert n == 40, (
+            f"lost increments: n={n}, implicit-txn deltas THIS TEST={delta}, "
+            f"per-worker rowcounts={outcomes}"
+        )
+
+
+def test_sync_commit_serializes_with_bare_statements(tmp_path):
+    # The proven lost-update mechanism, pinned deterministically: a pipelined
+    # implicit transaction's Sync-commit lands *inside* a bare autocommit
+    # computed-update's read-compute-write window. Pre-fix, the bare write's
+    # fresh WT transaction included that commit in its snapshot, saw no
+    # conflict, and overwrote it — a silent lost update. The fix wraps the
+    # whole materialized update in one WT snapshot transaction
+    # (executor._execute_update_materialized), so the mid-window commit
+    # surfaces as a write conflict and the statement retries from a fresh
+    # read. Final value must be 2: both increments survive.
+    import struct
+
+    from secantus.sql import run_sql
+    from secantus.sql.pgextended import ExtendedSession
+    from secantus.sql.session import Session
+
+    st = Storage(str(tmp_path))
+    try:
+        boot = Session(database="d")
+        run_sql(st, "d", "CREATE TABLE t (id int primary key, n int)", session=boot)
+        run_sql(st, "d", "INSERT INTO t VALUES (2, 0)", session=boot)
+
+        ext = ExtendedSession(st, Session(database="d"))
+        parse = b"\x00UPDATE t SET n = n + 1 WHERE id = 2\x00" + struct.pack(">h", 0)
+        ext.process("P", parse)
+        ext.process("B", b"\x00\x00" + struct.pack(">h", 0) * 3)
+        ext.process("E", b"\x00" + struct.pack(">i", 0))  # uncommitted until Sync
+
+        read_done = threading.Event()
+        commit_done = threading.Event()
+        orig_find = Storage.find_matching
+        first_bare_read = threading.Event()
+
+        def gated_find(self, *args, **kwargs):
+            out = orig_find(self, *args, **kwargs)
+            if (
+                args[1] == "t"
+                and threading.current_thread().name == "BARE"
+                and not first_bare_read.is_set()
+            ):
+                first_bare_read.set()
+                read_done.set()
+                commit_done.wait(10)
+            return out
+
+        bare_errors: list[BaseException] = []
+
+        def bare() -> None:
+            try:
+                run_sql(
+                    st,
+                    "d",
+                    "UPDATE t SET n = n + 1 WHERE id = 2",
+                    session=Session(database="d"),
+                )
+            except BaseException as exc:  # noqa: BLE001 — surface into pytest
+                bare_errors.append(exc)
+
+        Storage.find_matching = gated_find
+        try:
+            t = threading.Thread(target=bare, name="BARE")
+            t.start()
+            assert read_done.wait(10), "bare statement never reached its read"
+            ext.process("S", b"")  # implicit-txn commit lands mid-window
+            commit_done.set()
+            t.join(30)
+            assert not t.is_alive(), "bare statement wedged"
+        finally:
+            Storage.find_matching = orig_find
+
+        assert not bare_errors, f"bare statement errored: {bare_errors!r}"
+        rows = run_sql(st, "d", "SELECT n FROM t WHERE id = 2", session=boot)[-1].rows
+        assert rows == [(2,)], f"lost update: expected n=2, got rows={rows!r}"
+    finally:
+        st.close()

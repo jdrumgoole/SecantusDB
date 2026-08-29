@@ -70,10 +70,21 @@ def _user_tables(db: str, catalog: Catalog) -> list[TableDef]:
     return [t for name in catalog.list_tables(db) if (t := catalog.get(db, name)) is not None]
 
 
+def _tables_with_oids(db: str, catalog: Catalog) -> tuple[list[TableDef], dict[str, int]]:
+    """The user tables and their OIDs from a *single* enumeration.
+
+    A builder that needs both must not call ``_user_tables`` and ``_table_oids``
+    separately: another session's DDL landing between the two calls leaves the
+    second list holding a table the OID map never saw, and the builder dies with
+    a ``KeyError`` part-way through a catalog scan."""
+    tables = _user_tables(db, catalog)
+    return tables, {t.name: 16384 + i for i, t in enumerate(tables)}
+
+
 def _table_oids(db: str, catalog: Catalog) -> dict[str, int]:
     """Stable, fictional pg_class OIDs per table — shared by every catalog that
     keys off ``relid`` (pg_class.oid, pg_attribute.attrelid) so joins line up."""
-    return {t.name: 16384 + i for i, t in enumerate(_user_tables(db, catalog))}
+    return _tables_with_oids(db, catalog)[1]
 
 
 # Table row types (typtype 'c'): pg_type oids derived from the table's
@@ -144,10 +155,10 @@ def _indexes(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
     for ``pg_get_indexdef`` / ``pg_indexes`` — the owning ``table`` name and the
     rendered ``columns`` (with ``DESC``). ``partial`` flags a partial index (its
     predicate isn't reversed back to SQL)."""
-    table_oids = _table_oids(db, catalog)
+    tables, table_oids = _tables_with_oids(db, catalog)
     out: list[dict[str, Any]] = []
     oid = _INDEX_OID_BASE
-    for t in _user_tables(db, catalog):
+    for t in tables:
         relid = table_oids[t.name]
         field_to_attnum = {col.field: i for i, col in enumerate(t.columns, start=1)}
         field_to_name = {col.field: col.name for col in t.columns}
@@ -155,26 +166,33 @@ def _indexes(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
         # that field back to its source SQL so the index reflects like Postgres'
         # (indkey attnum 0 marks an expression column).
         field_to_expr = {ei.field: ei for ei in getattr(t, "expr_indexes", [])}
-        pk_cols = t.pk_columns
+        pk_cols = t.ordered_pk_columns()
         if pk_cols:
             out.append(
                 {
                     "indexrelid": oid,
                     "indrelid": relid,
-                    "relname": f"{t.name}_pkey",
+                    "relname": t.pk_constraint_name(),
                     "indkey": [field_to_attnum.get(c.field, 1) for c in pk_cols],
                     "unique": True,
                     "primary": True,
-                    "conname": f"{t.name}_pkey",
+                    "conname": t.pk_constraint_name(),
                     "table": t.name,
                     "columns": [c.name for c in pk_cols],
                     "partial": False,
                 }
             )
             oid += 1
+        constraint_backed = {uq.name for uq in getattr(t, "unique_constraints", [])}
         for ix in storage.list_indexes(db, t.collection):
             if ix.get("name") == "_id_":
                 continue  # WiredTiger's physical _id index — the PK is shown as <t>_pkey
+            if ix.get("name") in constraint_backed:
+                # The storage index enforcing a declared UNIQUE constraint. It
+                # is reported below from the constraint itself, which carries
+                # the conname / conkey a client expects, so listing it here as
+                # well would show the same index twice.
+                continue
             key = ix.get("key") or {}
             expr_fields = [f for f in key if f in field_to_expr]
             if expr_fields:
@@ -199,12 +217,21 @@ def _indexes(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
             indkey = [field_to_attnum.get(f) for f in key]
             if not indkey or any(a is None for a in indkey):
                 continue  # index over a non-column field — not reflectable as SQL
+            nkeyatts = len(indkey)
+            # ``INCLUDE (cols)`` covering columns ride indkey beyond
+            # indnkeyatts, exactly how real pg_index encodes them.
+            for inc in ix.get("include") or []:
+                col = t.column(inc)
+                attnum = field_to_attnum.get(col.field) if col is not None else None
+                if attnum is not None:
+                    indkey.append(attnum)
             out.append(
                 {
                     "indexrelid": oid,
                     "indrelid": relid,
                     "relname": ix["name"],
                     "indkey": indkey,
+                    "nkeyatts": nkeyatts,
                     "unique": bool(ix.get("unique")),
                     "primary": False,
                     "conname": None,
@@ -244,11 +271,17 @@ _INDEX_RELATION_KEYS = (
 )
 
 
+def _relation_row(ix: dict[str, Any]) -> dict[str, Any]:
+    row = {k: ix[k] for k in _INDEX_RELATION_KEYS}
+    row["nkeyatts"] = ix.get("nkeyatts", len(ix["indkey"]))
+    return row
+
+
 def _index_relations(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
     """The pg_index / pg_class / pg_constraint projection of :func:`_indexes` — a
     stable ``indexrelid``, its table ``indrelid``, the ``indkey`` attnum array, and
     unique/primary flags. (Kept as the historical shape those builders consume.)"""
-    return [{k: ix[k] for k in _INDEX_RELATION_KEYS} for ix in _indexes(db, storage, catalog)]
+    return [_relation_row(ix) for ix in _indexes(db, storage, catalog)]
 
 
 def indexdef_for_oid(db: str, storage: Any, catalog: Catalog, oid: int) -> str | None:
@@ -271,9 +304,15 @@ def _info_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> l
     rows = [
         {
             "table_catalog": db,
-            "table_schema": "public",
-            "table_name": t.name,
-            "table_type": "BASE TABLE",
+            # Real PG homes a temp table in its session's pg_temp_N schema
+            # with type LOCAL TEMPORARY, so schema-filtered reflection
+            # (table_schema = 'public') never lists it. The schema is the
+            # name's own per-session pg_temp_<n> prefix.
+            "table_schema": (_table_schema_name(t.name) if "." in t.name else "pg_temp_1")
+            if t.temp
+            else _table_schema_name(t.name),
+            "table_name": _bare_table_name(t.name),
+            "table_type": "LOCAL TEMPORARY" if t.temp else "BASE TABLE",
         }
         for t in _user_tables(db, catalog)
         if t.name not in matviews
@@ -282,8 +321,8 @@ def _info_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> l
     rows.extend(
         {
             "table_catalog": db,
-            "table_schema": "public",
-            "table_name": name,
+            "table_schema": _table_schema_name(name),
+            "table_name": _bare_table_name(name),
             "table_type": "VIEW",
         }
         for name in _view_names(db, catalog)
@@ -416,9 +455,9 @@ def _pk_constraints(db: str, catalog: Catalog) -> list[tuple[TableDef, str, list
     an index, not a constraint), so these builders surface PK rows only."""
     out: list[tuple[TableDef, str, list[str]]] = []
     for t in _user_tables(db, catalog):
-        pk_cols = t.pk_columns
+        pk_cols = t.ordered_pk_columns()
         if pk_cols:
-            out.append((t, f"{t.name}_pkey", [c.name for c in pk_cols]))
+            out.append((t, t.pk_constraint_name(), [c.name for c in pk_cols]))
     return out
 
 
@@ -426,12 +465,32 @@ _PK_CON_OID_BASE = 30000
 _FK_OID_BASE = 40000
 
 
+_SAFE_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_$]*$")
+
+
+def _quote_ident(name: str) -> str:
+    """``quote_ident`` semantics: bare when already lowercase-safe, else
+    double-quoted with embedded quotes doubled — matching how real
+    ``pg_get_constraintdef`` renders identifiers (SQLAlchemy regex-parses
+    that text, and an unquoted ``i need quotes`` breaks its parser)."""
+    if _SAFE_IDENT_RE.match(name):
+        return name
+    return '"' + name.replace('"', '""') + '"'
+
+
 def _fk_condef(fk: ForeignKey, ref_cols: list[str]) -> str:
     """Render a foreign key the way ``pg_get_constraintdef`` does — SQLAlchemy's
     inspector regex-parses exactly this string to reflect the constraint."""
-    cols = ", ".join(fk.columns)
-    rcols = ", ".join(ref_cols)
-    text = f"FOREIGN KEY ({cols}) REFERENCES {fk.ref_table}({rcols})"
+    cols = ", ".join(_quote_ident(c) for c in fk.columns)
+    rcols = ", ".join(_quote_ident(c) for c in ref_cols)
+    # A cross-schema target is stored dotted; render schema and relation as
+    # separately-quoted identifiers so the inspector's regex parses them.
+    if "." in fk.ref_table:
+        rschema, rname = fk.ref_table.split(".", 1)
+        ref_sql = f"{_quote_ident(rschema)}.{_quote_ident(rname)}"
+    else:
+        ref_sql = _quote_ident(fk.ref_table)
+    text = f"FOREIGN KEY ({cols}) REFERENCES {ref_sql}({rcols})"
     if fk.on_update:
         text += f" ON UPDATE {fk.on_update}"
     if fk.on_delete:
@@ -444,11 +503,11 @@ def _foreign_keys(db: str, catalog: Catalog) -> list[dict[str, Any]]:
     ``information_schema`` / ``pg_get_constraintdef`` reflection paths need: a
     stable ``oid``, owner/referenced table OIDs, ``conkey``/``confkey`` attnum
     arrays, the resolved referenced columns, and the rendered ``condef``."""
-    table_oids = _table_oids(db, catalog)
-    tables = {t.name: t for t in _user_tables(db, catalog)}
+    table_list, table_oids = _tables_with_oids(db, catalog)
+    tables = {t.name: t for t in table_list}
     out: list[dict[str, Any]] = []
     oid = _FK_OID_BASE
-    for t in _user_tables(db, catalog):
+    for t in table_list:
         owner_attnum = {c.name: i for i, c in enumerate(t.columns, start=1)}
         for fk in t.foreign_keys:
             ref = tables.get(fk.ref_table)
@@ -467,7 +526,7 @@ def _foreign_keys(db: str, catalog: Catalog) -> list[dict[str, Any]]:
                     "conkey": [owner_attnum.get(c, 0) for c in fk.columns],
                     "confkey": [ref_attnum.get(c, 0) for c in ref_cols],
                     "ref_cols": ref_cols,
-                    "ref_pk_name": f"{fk.ref_table}_pkey" if ref is not None else None,
+                    "ref_pk_name": ref.pk_constraint_name() if ref is not None else None,
                     "condef": _fk_condef(fk, ref_cols),
                 }
             )
@@ -486,11 +545,11 @@ def _unique_constraints(db: str, catalog: Catalog) -> list[dict[str, Any]]:
     owner table OID, ``conkey`` attnums, columns, the rendered ``condef``, and the
     OID of its backing unique index (``conindid``) — SQLAlchemy reflects a UNIQUE
     constraint by joining ``pg_constraint.conindid = pg_index.indexrelid``."""
-    table_oids = _table_oids(db, catalog)
+    tables, table_oids = _tables_with_oids(db, catalog)
     out: list[dict[str, Any]] = []
     oid = _UNIQUE_CON_OID_BASE
     idx_oid = _UNIQUE_IDX_OID_BASE
-    for t in _user_tables(db, catalog):
+    for t in tables:
         attnum = {c.name: i for i, c in enumerate(t.columns, start=1)}
         for uq in t.unique_constraints:
             out.append(
@@ -533,10 +592,10 @@ def _check_constraints(db: str, catalog: Catalog) -> list[dict[str, Any]]:
     """Declared CHECK constraints with the fields reflection needs. ``condef`` is
     rendered the way Postgres does — ``CHECK ((<expr>))`` — so SQLAlchemy's
     ``get_check_constraints`` regex can peel it back to the predicate text."""
-    table_oids = _table_oids(db, catalog)
+    tables, table_oids = _tables_with_oids(db, catalog)
     out: list[dict[str, Any]] = []
     oid = _CHECK_CON_OID_BASE
-    for t in _user_tables(db, catalog):
+    for t in tables:
         for ck in t.check_constraints:
             out.append(
                 {
@@ -772,8 +831,8 @@ def _info_sequences(db: str, session: Session, storage: Any, catalog: Catalog) -
         rows.append(
             {
                 "sequence_catalog": db,
-                "sequence_schema": "public",
-                "sequence_name": name,
+                "sequence_schema": _table_schema_name(name),
+                "sequence_name": _bare_table_name(name),
                 "data_type": "bigint",
                 "numeric_precision": 64,
                 "numeric_scale": 0,
@@ -797,9 +856,34 @@ def _schema_oids(db: str, catalog: Catalog) -> dict[str, int]:
 
 
 def _pg_namespace(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    rows = [{"oid": oid, "nspname": name} for name, oid in _NS_OIDS.items()]
-    rows.extend({"oid": oid, "nspname": name} for name, oid in _schema_oids(db, catalog).items())
+    rows = [{"oid": oid, "nspname": name, "nspowner": 10} for name, oid in _NS_OIDS.items()]
+    rows.append({"oid": _PG_TEMP_NS_OID, "nspname": "pg_temp_1", "nspowner": 10})
+    rows.extend(
+        {"oid": oid, "nspname": name, "nspowner": 10}
+        for name, oid in _schema_oids(db, catalog).items()
+    )
     return rows
+
+
+_PG_TEMP_NS_OID = 99  # pg_temp_1's namespace oid (real PG mints one per backend)
+
+
+def _bare_table_name(name: str) -> str:
+    """The relation name without its schema prefix — tables in a user schema
+    are stored dotted (``testschema.users``), like user types."""
+    return name.split(".", 1)[1] if "." in name else name
+
+
+def _table_schema_name(name: str) -> str:
+    return name.split(".", 1)[0] if "." in name else "public"
+
+
+def _table_ns_oid(t: Any, schema_oids: dict[str, int]) -> int:
+    if getattr(t, "temp", False):
+        return _PG_TEMP_NS_OID
+    if "." in t.name:
+        return schema_oids.get(t.name.split(".", 1)[0], _NS_OIDS["public"])
+    return _NS_OIDS["public"]
 
 
 def _split_user_type_name(name: str, schema_oids: dict[str, int]) -> tuple[str, int]:
@@ -814,21 +898,51 @@ def _split_user_type_name(name: str, schema_oids: dict[str, int]) -> tuple[str, 
 
 
 def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    oids = _table_oids(db, catalog)
+    tables, oids = _tables_with_oids(db, catalog)
     matviews = _matview_names(db, catalog)
+    schema_oids = _schema_oids(db, catalog)
+    # Every relation is owned by the connecting user (they created it). Report
+    # that role's oid as relowner — hardcoding PG's bootstrap-superuser oid 10
+    # broke pgjdbc's getTablePrivileges join (``c.relowner = r.oid`` against the
+    # minted role oid). relacl is the materialized ACL, or NULL when untouched.
+    owner_name = getattr(session, "user", None)
+    owner_oid = _role_oid_map(db, session, catalog).get(owner_name, 10) if owner_name else 10
+
+    def _relacl(name: str) -> str | None:
+        if owner_name is None:
+            return None
+        return catalog.relation_acl_text(db, _bare_table_name(name), owner_name)
+
     rows = [
         {
             "oid": oids[t.name],
-            "relname": t.name,
-            "relnamespace": _NS_OIDS["public"],
+            "relname": _bare_table_name(t.name),
+            "relnamespace": _table_ns_oid(t, schema_oids),
             # A materialized view is a real relation with columns, tracked in the
             # catalog like a table — but it reports relkind 'm', not 'r'.
             "relkind": "m" if t.name in matviews else "r",
-            "relpersistence": "p",  # permanent (never temp/unlogged)
+            # Temp tables report 't' so SQLAlchemy's get_table_names filter
+            # (relpersistence != 't') hides them, exactly as real PG does.
+            "relpersistence": "t" if t.temp else "p",
             "relam": _HEAP_AM_OID,
+            "relowner": owner_oid,
+            "relacl": _relacl(t.name),
+            "reltoastrelid": 0,
+            "relchecks": len(t.check_constraints),
+            "relhasindex": True,
+            "relhasrules": False,
+            "relhastriggers": False,
+            "relrowsecurity": False,
+            "relforcerowsecurity": False,
+            "relispartition": False,
+            "reltablespace": 0,
+            "relreplident": "d",
+            "reloftype": 0,
             "reloptions": None,
+            # -1 = "no estimate yet" (PG's initial value; we never analyze).
+            "reltuples": -1.0,
         }
-        for t in _user_tables(db, catalog)
+        for t in tables
     ]
     # Index relations are also pg_class rows (relkind 'i') — reflection joins
     # pg_index.indexrelid = pg_class.oid to read an index's name + access method.
@@ -842,6 +956,7 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
                 "relpersistence": "p",
                 "relam": _BTREE_AM_OID,
                 "reloptions": None,
+                "reltuples": -1.0,
             }
         )
     # Views are pg_class rows too (relkind 'v') — SQLAlchemy's get_view_names
@@ -850,11 +965,15 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
         rows.append(
             {
                 "oid": oid,
-                "relname": name,
-                "relnamespace": _NS_OIDS["public"],
+                "relname": _bare_table_name(name),
+                "relnamespace": schema_oids.get(_table_schema_name(name), _NS_OIDS["public"])
+                if "." in name
+                else _NS_OIDS["public"],
                 "relkind": "v",
                 "relpersistence": "p",
                 "relam": 0,
+                "relowner": owner_oid,
+                "relacl": _relacl(name),
                 "reloptions": None,
             }
         )
@@ -863,8 +982,10 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
         rows.append(
             {
                 "oid": oid,
-                "relname": name,
-                "relnamespace": _NS_OIDS["public"],
+                "relname": _bare_table_name(name),
+                "relnamespace": schema_oids.get(_table_schema_name(name), _NS_OIDS["public"])
+                if "." in name
+                else _NS_OIDS["public"],
                 "relkind": "S",
                 "relpersistence": "p",
                 "relam": 0,
@@ -951,24 +1072,41 @@ def functiondef_for_oid(db: str, catalog: Catalog, oid: int) -> str | None:
 def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     """One row per column of every declared table — the pg_catalog column surface
     tools (and ``\\d``-style queries) read. attrelid lines up with pg_class.oid."""
-    oids = _table_oids(db, catalog)
+    tables, oids = _tables_with_oids(db, catalog)
     enum_oids = _enum_oids(db, catalog)
     domain_oids = _domain_oids(db, catalog)
     rows: list[dict] = []
-    for t in _user_tables(db, catalog):
+    for t in tables:
         for i, col in enumerate(t.columns, start=1):
             if col.domain_type is not None:
                 typoid = domain_oids.get(col.domain_type, 25)
             elif col.enum_type is not None:
                 typoid = enum_oids.get(col.enum_type, 25)
+            elif getattr(col, "composite_type", None) is not None:
+                # A composite (or composite-array) column reports its type's
+                # minted oid, not generic RECORD/2249 — so getColumns' typname
+                # join resolves ``custom`` / ``_custom`` (pgjdbc's
+                # customArrayTypeInfo; psycopg composite reflection).
+                ct = col.composite_type
+                minted = _composite_oids(db, catalog).get(ct) or _table_rowtype_oids(
+                    db, catalog
+                ).get(ct)
+                if minted is not None:
+                    typoid = (
+                        minted + USER_TYPE_ARRAY_OID_OFFSET
+                        if typemap.is_array_tag(col.type_tag)
+                        else minted
+                    )
+                else:
+                    typoid = col.decl_oid or typemap.PG_OID.get(col.type_tag, 25)
             else:
-                typoid = typemap.PG_OID.get(col.type_tag, 25)
+                typoid = col.decl_oid or typemap.PG_OID.get(col.type_tag, 25)
             rows.append(
                 {
                     "attrelid": oids[t.name],
                     "attname": col.name,
                     "atttypid": typoid,
-                    "atttypmod": -1,
+                    "atttypmod": col.typmod,
                     "attnum": i,
                     "attnotnull": not col.nullable,
                     "atthasdef": col.has_default or col.sequence is not None,
@@ -979,6 +1117,44 @@ def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> 
                     "attlen": -1,
                 }
             )
+    # Plain views expose their output columns as pg_attribute rows keyed on the
+    # view's pg_class oid (real PG does the same) — this is what SQLAlchemy's
+    # get_columns reads for a view. The column shape comes from describing the
+    # view's stored SELECT (planning only, never executed); a view whose
+    # definition can't be described (e.g. its base table was dropped) simply
+    # contributes no rows. Lazy import: engine imports virtual at module level.
+    getter = getattr(catalog, "get_view", None)
+    if getter is not None:
+        import sqlglot as _sqlglot
+
+        from secantus.sql import engine as _engine
+
+        for vname, void in _view_oids(db, catalog).items():
+            definition = getter(db, vname)
+            if definition is None:
+                continue
+            try:
+                inner = _sqlglot.parse_one(definition, read="postgres")
+                descs = _engine.describe_statement(storage, db, inner, session, catalog)
+            except Exception:
+                continue
+            for i, desc in enumerate(descs or [], start=1):
+                rows.append(
+                    {
+                        "attrelid": void,
+                        "attname": desc.name,
+                        "atttypid": desc.pg_oid,
+                        "atttypmod": desc.typmod,
+                        "attnum": i,
+                        "attnotnull": False,
+                        "atthasdef": False,
+                        "attisdropped": False,
+                        "attidentity": "",
+                        "attgenerated": "",
+                        "attcollation": 0,
+                        "attlen": -1,
+                    }
+                )
     # Composite-type fields are pg_attribute rows keyed on the type's relkind='c'
     # relation oid, so pg_type.typrelid -> pg_class.oid -> pg_attribute resolves.
     rel_oids = _composite_rel_oids(db, catalog)
@@ -1019,9 +1195,9 @@ def _pg_attrdef(db: str, session: Session, storage: Any, catalog: Catalog) -> li
     # text (Postgres stores a nodeToString there and tools call pg_get_expr; we
     # store the rendered text directly, which is what our pg_get_expr passes
     # through). ``adnum`` is the column's attnum; ``oid`` is synthesised per row.
-    oids = _table_oids(db, catalog)
+    tables, oids = _tables_with_oids(db, catalog)
     rows: list[dict] = []
-    for t in _user_tables(db, catalog):
+    for t in tables:
         relid = oids[t.name]
         for attnum, col in enumerate(t.columns, start=1):
             adbin = _column_default_text(col)
@@ -1039,15 +1215,18 @@ def _pg_attrdef(db: str, session: Session, storage: Any, catalog: Catalog) -> li
 
 
 _PG_CLASS_OID = 1259  # the OID of the pg_class catalog itself (classoid for relations)
+_PG_CONSTRAINT_CLASSOID = 2606  # pg_constraint catalog OID (classoid for constraint comments)
+_PG_PROC_CLASSOID = 1255  # pg_proc catalog OID (classoid for function comments)
+_PG_TYPE_CLASSOID = 1247  # pg_type catalog OID (classoid for type/domain comments)
 
 
 def _pg_description(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     # Object comments from COMMENT ON TABLE / COLUMN. A table comment has
     # objsubid 0; a column comment's objsubid is the column's attnum. classoid is
     # pg_class so SQLAlchemy's get_columns / get_table_comment joins line up.
-    oids = _table_oids(db, catalog)
+    tables, oids = _tables_with_oids(db, catalog)
     rows: list[dict] = []
-    for t in _user_tables(db, catalog):
+    for t in tables:
         relid = oids[t.name]
         if t.comment is not None:
             rows.append(
@@ -1066,6 +1245,99 @@ def _pg_description(db: str, session: Session, storage: Any, catalog: Catalog) -
                         "classoid": _PG_CLASS_OID,
                         "objsubid": attnum,
                         "description": col.comment,
+                    }
+                )
+    # COMMENT ON CONSTRAINT rows, keyed by the pg_constraint oid so
+    # SQLAlchemy's constraint-comment outer join (objoid = pg_constraint.oid)
+    # resolves. The comments live on the catalog's constraint records.
+    relid_to_table = {oids[t.name]: t for t in tables}
+    for con in _pg_constraint(db, session, storage, catalog):
+        t = relid_to_table.get(con["conrelid"])
+        if t is None:
+            continue
+        comment = None
+        if con["contype"] == "p" and con["conname"] == t.pk_constraint_name():
+            comment = t.pk_comment
+        else:
+            for group in (t.check_constraints, t.unique_constraints, t.foreign_keys):
+                for c in group:
+                    if c.name == con["conname"]:
+                        comment = c.comment
+                        break
+        if comment is not None:
+            rows.append(
+                {
+                    "objoid": con["oid"],
+                    "classoid": _PG_CONSTRAINT_CLASSOID,
+                    "objsubid": 0,
+                    "description": comment,
+                }
+            )
+    # COMMENT ON FUNCTION rows (classoid pg_proc), keyed by the minted pg_proc
+    # oid so ``objoid = 'name'::regproc`` predicates resolve.
+    fn_oids = _function_oids(db, catalog)
+    for f in _functions(db, catalog):
+        comment = f.get("comment")
+        if comment is not None:
+            rows.append(
+                {
+                    "objoid": fn_oids[f"{f['name']}/{f['nargs']}"],
+                    "classoid": _PG_PROC_CLASSOID,
+                    "objsubid": 0,
+                    "description": comment,
+                }
+            )
+    # COMMENT ON DOMAIN rows (classoid pg_type) — obj_description(oid,
+    # 'pg_type') is how pgjdbc's getUDTs reads a domain's REMARKS.
+    lister = getattr(catalog, "get_domain", None)
+    if lister is not None:
+        for dom_name, dom_oid in catalog.domain_type_oids(db).items():
+            dom = catalog.get_domain(db, dom_name)
+            comment = dom.get("comment") if dom else None
+            if comment is not None:
+                rows.append(
+                    {
+                        "objoid": dom_oid,
+                        "classoid": _PG_TYPE_CLASSOID,
+                        "objsubid": 0,
+                        "description": comment,
+                    }
+                )
+    # COMMENT ON INDEX rows — stored by name, resolved to the index relation's
+    # oid here (minted oids can reshuffle as indexes come and go).
+    index_comments = getattr(catalog, "index_comments", lambda _db: {})(db)
+    if index_comments:
+        for ix in _index_relations(db, storage, catalog):
+            comment = index_comments.get(ix["relname"])
+            if comment is not None:
+                rows.append(
+                    {
+                        "objoid": ix["indexrelid"],
+                        "classoid": _PG_CLASS_OID,
+                        "objsubid": 0,
+                        "description": comment,
+                    }
+                )
+    # Direct DML against pg_description (DatabaseMetaDataTest's setup moves a
+    # function comment onto a table's oid to manufacture a duplicate row) is
+    # persisted as a delta over the derived rows: suppressed original keys
+    # plus replacement/inserted rows.
+    from secantus.sql.catalog import DESCRIPTION_DELTA_COLLECTION
+
+    delta = storage.find_matching(db, DESCRIPTION_DELTA_COLLECTION, {})
+    if delta:
+        suppressed = {d["key"] for d in delta if d.get("kind") == "suppress"}
+        rows = [
+            r for r in rows if f"{r['objoid']}/{r['classoid']}/{r['objsubid']}" not in suppressed
+        ]
+        for d in delta:
+            if d.get("kind") == "extra":
+                rows.append(
+                    {
+                        "objoid": d["objoid"],
+                        "classoid": d["classoid"],
+                        "objsubid": d["objsubid"],
+                        "description": d["description"],
                     }
                 )
     return rows
@@ -1188,10 +1460,52 @@ def _function_signature(fn: dict) -> str:
     return ", ".join(parts)
 
 
+#: Built-in large-object functions, reflected so pgjdbc's LargeObjectManager
+#: can resolve their OIDs (it queries pg_proc joined to the pg_catalog
+#: namespace by name, then calls via the Fastpath sub-protocol — see
+#: ``secantus.sql.largeobjects``). ``(name, oid, rettype_oid, argtype_oids)``.
+_LO_PROCS = [
+    ("lo_open", 952, 23, "26 23"),
+    ("lo_close", 953, 23, "23"),
+    ("loread", 954, 17, "23 23"),
+    ("lowrite", 955, 23, "23 17"),
+    ("lo_lseek", 956, 23, "23 23 23"),
+    ("lo_creat", 957, 26, "23"),
+    ("lo_create", 715, 26, "26"),
+    ("lo_tell", 958, 23, "23"),
+    ("lo_unlink", 964, 23, "26"),
+    ("lo_truncate", 1004, 23, "23 23"),
+    ("lo_lseek64", 3170, 20, "23 20 23"),
+    ("lo_tell64", 3171, 20, "23"),
+    ("lo_truncate64", 3172, 23, "23 20"),
+]
+
+
 def _pg_proc(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    """``pg_catalog.pg_proc`` — one row per user-defined ``CREATE FUNCTION`` (#130)."""
+    """``pg_catalog.pg_proc`` — one row per user-defined ``CREATE FUNCTION``
+    (#130), plus the built-in large-object functions in ``pg_catalog``."""
     oids = _function_oids(db, catalog)
-    rows = []
+    rows = [
+        {
+            "oid": oid,
+            "proname": name,
+            "pronamespace": _NS_OIDS["pg_catalog"],
+            "proowner": 10,
+            "prolang": _SQL_LANG_OID,
+            "prorettype": rettype,
+            "pronargs": len(argtypes.split()),
+            "pronargdefaults": 0,
+            "proargtypes": argtypes,
+            "proargnames": None,
+            "proargmodes": None,
+            "proallargtypes": None,
+            "prosrc": name,
+            "prokind": "f",
+            "proretset": False,
+            "provariadic": 0,
+        }
+        for name, oid, rettype, argtypes in _LO_PROCS
+    ]
     for fn in _functions(db, catalog):
         key = f"{fn['name']}/{fn['nargs']}"
         argtypes = " ".join(str(_type_oid(t)) for t in (fn.get("param_types") or []))
@@ -1208,6 +1522,8 @@ def _pg_proc(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 "pronargdefaults": 0,
                 "proargtypes": argtypes,
                 "proargnames": names or None,
+                "proargmodes": None,
+                "proallargtypes": None,
                 "prosrc": fn.get("body"),
                 "prokind": "f",
                 "proretset": bool(fn.get("is_table")),
@@ -1604,13 +1920,19 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
     # psycopg's ``TypeInfo.fetch(conn, "<table>")`` resolves it (and its
     # ``typarray``) to register the table-row array loader.
     table_oids = _table_oids(db, catalog)
+    schema_oids = _schema_oids(db, catalog)
     for tname, rowtype_oid in _table_rowtype_oids(db, catalog).items():
+        # A schema-qualified table's row type: bare typname + its schema's
+        # namespace oid — pgjdbc's TypeInfoCache resolves ``typname = 'x'``
+        # against the search_path's nspnames (SearchPathLookupTest).
         rows.append(
             {
                 "oid": rowtype_oid,
-                "typname": tname,
+                "typname": _bare_table_name(tname),
                 "typcollation": 0,
-                "typnamespace": _NS_OIDS["public"],
+                "typnamespace": schema_oids.get(_table_schema_name(tname), _NS_OIDS["public"])
+                if "." in tname
+                else _NS_OIDS["public"],
                 "typbasetype": 0,
                 "typtypmod": -1,
                 "typnotnull": False,
@@ -1676,14 +1998,19 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
         base_tag = domain.get("base_tag") if domain else None
         default = domain.get("default") if domain else None
         typname, nsoid = _split_user_type_name(name, schema_oids)
+        base_oid = (domain.get("base_oid") if domain else None) or typemap.PG_OID.get(
+            base_tag or "", 25
+        )
         rows.append(
             {
                 "oid": oid,
                 "typname": typname,
                 "typcollation": 0,
                 "typnamespace": nsoid,
-                "typbasetype": typemap.PG_OID.get(base_tag or "", 25),
-                "typtypmod": -1,
+                "typbasetype": base_oid,
+                # The base type's declared typmod (``varbit(3)`` → 3), which
+                # getColumns reads as a domain column's COLUMN_SIZE.
+                "typtypmod": int(domain.get("typmod", -1)) if domain else -1,
                 "typnotnull": bool(domain.get("not_null")) if domain else False,
                 "typdefault": None if default is None else str(default),
                 "typtype": "d",
@@ -1717,6 +2044,63 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
         row.setdefault("typrelid", 0)
         row.setdefault("typarray", 0)
         row.setdefault("typdelim", ",")
+        # Scalar / composite / enum rows are not arrays: no element type.
+        row.setdefault("typelem", 0)
+        # typinput is the type's input function. Drivers do not call it; they
+        # compare it to array_in to decide whether a type is an array —
+        # pgjdbc's TypeInfoCache asks for ``typinput = 'pg_catalog.array_in'
+        # ::regproc as is_array``. Array types therefore must report exactly
+        # ``array_in``; for the rest the conventional ``<typname>in`` name is
+        # both harmless and what real Postgres shows for the common types.
+        row.setdefault(
+            "typinput",
+            "array_in" if str(row.get("typname", "")).startswith("_") else f"{row['typname']}in",
+        )
+    # Every type that advertises a ``typarray`` gets the paired array-type ROW
+    # — real pg_type has one per scalar (``_int4`` etc.), and a driver
+    # resolving an array type by the oid it read from ``typarray`` (pgjdbc's
+    # TypeInfoCache, psycopg's TypeInfo.fetch) found nothing here before.
+    # ``typelem`` points back at the element; arrays of arrays don't exist in
+    # PG, so the array row's own typarray is 0.
+    #
+    # Array type names are ``_<element>`` — but when that collides with an
+    # EXISTING type name (a user composite literally named ``_custom`` shadows
+    # the array type of ``custom``), real PG prepends more underscores until
+    # unique (``__custom``). pgjdbc's customArrayTypeInfo reads exactly this.
+    # Assign array names in oid order — PG names an array type when its element
+    # type is created, so an earlier-created (lower-oid) element claims the
+    # shorter name (``custom`` created before ``_custom`` → ``custom``'s array
+    # is ``__custom``, ``_custom``'s array is ``___custom``).
+    taken = {r["typname"] for r in rows}
+    array_name_by_oid: dict[int, str] = {}
+    for row in sorted(rows, key=lambda r: r["oid"]):
+        name = f"_{row['typname']}"
+        while name in taken:
+            name = f"_{name}"
+        taken.add(name)
+        array_name_by_oid[row["typarray"]] = name
+
+    array_rows = [
+        {
+            "oid": row["typarray"],
+            "typname": array_name_by_oid[row["typarray"]],
+            "typcollation": 0,
+            "typnamespace": row.get("typnamespace", _NS_OIDS["pg_catalog"]),
+            "typbasetype": 0,
+            "typtypmod": -1,
+            "typnotnull": False,
+            "typdefault": None,
+            "typtype": "b",
+            "typrelid": 0,
+            "typarray": 0,
+            "typelem": row["oid"],
+            "typdelim": ",",
+            "typinput": "array_in",
+        }
+        for row in rows
+        if row.get("typarray")
+    ]
+    rows.extend(array_rows)
     return rows
 
 
@@ -1913,6 +2297,16 @@ def _pg_range(db: str, session: Session, storage: Any, catalog: Catalog) -> list
     return rows
 
 
+def _fk_action_code(action: str | None) -> str:
+    """pg_constraint's one-letter referential-action code."""
+    return {
+        "CASCADE": "c",
+        "SET NULL": "n",
+        "SET DEFAULT": "d",
+        "RESTRICT": "r",
+    }.get((action or "").upper(), "a")
+
+
 def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     # Primary-key constraints (contype 'p'), one per table with a PK, keyed to
     # the implicit PK index via conindid, plus declared foreign keys (contype
@@ -1920,6 +2314,14 @@ def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) ->
     # is an index, not a constraint), so contype 'u'/'c' rows are absent.
     rows: list[dict] = []
     oid = _PK_CON_OID_BASE
+    # A foreign key's conindid points at the referenced table's PK index —
+    # pgjdbc's getImportedKeys joins ``pkic.oid = con.conindid`` to read the
+    # PK_NAME, so a 0 here silently empties every FK metadata result.
+    pk_index_by_rel = {
+        ix["indrelid"]: ix["indexrelid"]
+        for ix in _index_relations(db, storage, catalog)
+        if ix["primary"]
+    }
     for ix in _index_relations(db, storage, catalog):
         if not ix["primary"]:
             continue
@@ -1946,13 +2348,15 @@ def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) ->
                 "conname": fk["conname"],
                 "conrelid": fk["conrelid"],
                 "confrelid": fk["confrelid"],
-                "conindid": 0,
+                "conindid": pk_index_by_rel.get(fk["confrelid"], 0),
                 "contype": "f",
                 "contypid": 0,
                 "condeferrable": fk["fk"].deferrable,
                 "condeferred": fk["fk"].initially_deferred,
                 "conkey": fk["conkey"],
                 "confkey": fk["confkey"],
+                "confupdtype": _fk_action_code(fk["fk"].on_update),
+                "confdeltype": _fk_action_code(fk["fk"].on_delete),
             }
         )
     for uq in _unique_constraints(db, catalog):
@@ -2024,9 +2428,12 @@ def _pg_index(db: str, session: Session, storage: Any, catalog: Catalog) -> list
                 "indclass": [_DEFAULT_OPCLASS_OID] * n,
                 "indoption": [0] * n,
                 "indnatts": n,
-                "indnkeyatts": n,
+                "indnkeyatts": ix.get("nkeyatts", n),
                 "indisunique": ix["unique"],
                 "indisprimary": ix["primary"],
+                "indisclustered": False,
+                "indisvalid": True,
+                "indisreplident": False,
                 "indnullsnotdistinct": False,
                 "indpred": None,
                 "indexprs": None,
@@ -2066,7 +2473,26 @@ def _pg_enum(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
 
 
 def _pg_database(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    return [{"oid": 1, "datname": db, "datallowconn": True}]
+    # The connected database plus ``postgres`` — the maintenance database every
+    # real PG cluster carries and the one JDBC clients enumerate through
+    # (pgjdbc's getCatalogs asserts both are present). We deliberately do NOT
+    # enumerate ``storage.list_databases()`` here: that set is the MongoDB-wire
+    # namespace and includes cross-protocol names like ``local`` that a PG
+    # client must never see as a connectable catalog.
+    names = [db] if db == "postgres" else [db, "postgres"]
+    return [
+        {
+            "oid": 1 + i,
+            "datname": name,
+            "datallowconn": True,
+            "datdba": 10,
+            "encoding": 6,
+            "datcollate": "C",
+            "datctype": "C",
+            "datacl": None,
+        }
+        for i, name in enumerate(names)
+    ]
 
 
 def _pg_tables(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
@@ -2265,7 +2691,7 @@ _register(
 _register(
     "pg_catalog",
     "pg_namespace",
-    [("oid", "int4"), ("nspname", "text")],
+    [("oid", "int4"), ("nspname", "text"), ("nspowner", "int4")],
     _pg_namespace,
 )
 _register(
@@ -2290,11 +2716,25 @@ _register(
         ("oid", "int4"),
         ("relname", "text"),
         ("relnamespace", "int4"),
+        ("relowner", "int4"),
+        ("reltoastrelid", "int4"),
+        ("relchecks", "int2"),
+        ("relhasindex", "bool"),
+        ("relhasrules", "bool"),
+        ("relhastriggers", "bool"),
+        ("relrowsecurity", "bool"),
+        ("relforcerowsecurity", "bool"),
+        ("relispartition", "bool"),
+        ("reltablespace", "int4"),
+        ("relreplident", "text"),
+        ("reloftype", "int4"),
         ("relkind", "text"),
+        ("relacl", "text"),
         ("relpersistence", "text"),
         ("relam", "int4"),
         ("reloptions", "text"),
         ("reltype", "int4"),
+        ("reltuples", "float4"),
     ],
     _pg_class,
 )
@@ -2541,6 +2981,8 @@ _register(
         ("pronargdefaults", "int4"),
         ("proargtypes", "text"),
         ("proargnames", "text[]"),
+        ("proargmodes", "text[]"),
+        ("proallargtypes", "text[]"),
         ("prosrc", "text"),
         ("prokind", "text"),
         ("proretset", "bool"),
@@ -2596,7 +3038,9 @@ _register(
         ("typtype", "text"),
         ("typrelid", "int4"),
         ("typarray", "int4"),
+        ("typelem", "int4"),
         ("typdelim", "text"),
+        ("typinput", "text"),
     ],
     _pg_type,
 )
@@ -2626,8 +3070,131 @@ _register(
         ("condeferred", "bool"),
         ("conkey", "json"),
         ("confkey", "json"),
+        ("confupdtype", "text"),
+        ("confdeltype", "text"),
     ],
     _pg_constraint,
+)
+
+
+def _pg_policy(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    # Row-level-security policies: psql's ``\d`` joins this; one row per
+    # declared policy, keyed to the owning table's pg_class oid.
+    oids = _table_oids(db, catalog)
+    rows: list[dict] = []
+    lister = getattr(catalog, "list_policies", None)
+    if lister is None:
+        return rows
+    for i, pol in enumerate(lister(db)):
+        relid = oids.get(pol.get("table"))
+        if relid is None:
+            continue
+        rows.append(
+            {
+                "oid": 75000 + i,
+                "polname": pol.get("name"),
+                "polrelid": relid,
+                "polcmd": (pol.get("cmd") or "*")[:1].lower(),
+                "polpermissive": bool(pol.get("permissive", True)),
+                "polroles": [0],
+                "polqual": pol.get("using"),
+                "polwithcheck": pol.get("check"),
+            }
+        )
+    return rows
+
+
+def _empty_rows(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    return []
+
+
+# Present-but-empty catalogs psql's ``\d`` family joins: no extended
+# statistics, triggers, rules, inheritance, or publications in our model —
+# but the relations must exist so the queries run.
+_register(
+    "pg_catalog",
+    "pg_statistic_ext",
+    [
+        ("oid", "int4"),
+        ("stxrelid", "int4"),
+        ("stxname", "text"),
+        ("stxnamespace", "int4"),
+        ("stxkeys", "int2vector"),
+        ("stxkind", "text[]"),
+        ("stxstattarget", "int4"),
+    ],
+    _empty_rows,
+)
+_register(
+    "pg_catalog",
+    "pg_trigger",
+    [
+        ("oid", "int4"),
+        ("tgrelid", "int4"),
+        ("tgname", "text"),
+        ("tgfoid", "int4"),
+        ("tgtype", "int4"),
+        ("tgenabled", "text"),
+        ("tgisinternal", "bool"),
+        ("tgconstraint", "int4"),
+        ("tgdeferrable", "bool"),
+        ("tginitdeferred", "bool"),
+    ],
+    _empty_rows,
+)
+_register(
+    "pg_catalog",
+    "pg_rewrite",
+    [("oid", "int4"), ("rulename", "text"), ("ev_class", "int4"), ("ev_type", "text")],
+    _empty_rows,
+)
+_register(
+    "pg_catalog",
+    "pg_inherits",
+    [("inhrelid", "int4"), ("inhparent", "int4"), ("inhseqno", "int4")],
+    _empty_rows,
+)
+_register(
+    "pg_catalog",
+    "pg_publication",
+    [
+        ("oid", "int4"),
+        ("pubname", "text"),
+        ("puballtables", "bool"),
+        ("pubinsert", "bool"),
+        ("pubupdate", "bool"),
+        ("pubdelete", "bool"),
+        ("pubtruncate", "bool"),
+        ("pubviaroot", "bool"),
+    ],
+    _empty_rows,
+)
+_register(
+    "pg_catalog",
+    "pg_publication_rel",
+    [("oid", "int4"), ("prpubid", "int4"), ("prrelid", "int4")],
+    _empty_rows,
+)
+_register(
+    "pg_catalog",
+    "pg_publication_namespace",
+    [("oid", "int4"), ("pnpubid", "int4"), ("pnnspid", "int4")],
+    _empty_rows,
+)
+_register(
+    "pg_catalog",
+    "pg_policy",
+    [
+        ("oid", "int4"),
+        ("polname", "text"),
+        ("polrelid", "int4"),
+        ("polcmd", "text"),
+        ("polpermissive", "bool"),
+        ("polroles", "int4[]"),
+        ("polqual", "text"),
+        ("polwithcheck", "text"),
+    ],
+    _pg_policy,
 )
 _register(
     "pg_catalog",
@@ -2640,6 +3207,9 @@ _register(
         ("indoption", "int2vector"),
         ("indnatts", "int4"),
         ("indnkeyatts", "int4"),
+        ("indisclustered", "bool"),
+        ("indisvalid", "bool"),
+        ("indisreplident", "bool"),
         ("indisunique", "bool"),
         ("indisprimary", "bool"),
         ("indnullsnotdistinct", "bool"),
@@ -2674,7 +3244,16 @@ _register(
 _register(
     "pg_catalog",
     "pg_database",
-    [("oid", "int4"), ("datname", "text"), ("datallowconn", "bool")],
+    [
+        ("oid", "int4"),
+        ("datname", "text"),
+        ("datallowconn", "bool"),
+        ("datdba", "int4"),
+        ("encoding", "int4"),
+        ("datcollate", "text"),
+        ("datctype", "text"),
+        ("datacl", "text[]"),
+    ],
     _pg_database,
 )
 

@@ -136,3 +136,95 @@ def test_composite_result_oid_is_record():
 
 def test_bad_field_type_errors(storage, session):
     assert sqlstate(storage, session, "CREATE TYPE bad AS (x notatype)") == "0A000"
+
+
+def test_composite_column_atttypid_and_array_typename_collision(storage, session):
+    # pgjdbc's customArrayTypeInfo: composite columns report their minted oid
+    # (not RECORD), and a composite array type name avoids collision with an
+    # existing type of that name — custom[]'s type is __custom because the
+    # composite _custom already claims _custom.
+    run(storage, session, "CREATE TYPE custom AS (i int)")
+    run(storage, session, "CREATE TYPE _custom AS (f float)")
+    run(
+        storage,
+        session,
+        "CREATE TABLE customtable (c1 custom, c2 _custom, c3 custom[], c4 _custom[])",
+    )
+    rows = run(
+        storage,
+        session,
+        "SELECT a.attname, t.typname FROM pg_attribute a"
+        " JOIN pg_class c ON a.attrelid = c.oid"
+        " JOIN pg_type t ON a.atttypid = t.oid"
+        " WHERE c.relname = 'customtable' AND a.attnum > 0 ORDER BY a.attnum",
+    ).rows
+    assert rows == [
+        ("c1", "custom"),
+        ("c2", "_custom"),
+        ("c3", "__custom"),
+        ("c4", "___custom"),
+    ]
+
+
+def test_scalar_array_type_names_unaffected(storage, session):
+    run(storage, session, "CREATE TABLE it (a int[], t text[])")
+    rows = run(
+        storage,
+        session,
+        "SELECT a.attname, ty.typname FROM pg_attribute a"
+        " JOIN pg_class c ON a.attrelid = c.oid"
+        " JOIN pg_type ty ON a.atttypid = ty.oid"
+        " WHERE c.relname = 'it' AND a.attnum > 0 ORDER BY a.attnum",
+    ).rows
+    assert rows == [("a", "_int4"), ("t", "_text")]
+
+
+# --------------------------------------------------------------------------- #
+# Anonymous record constructor: ``(a, b, …)`` (pgtest tuple)
+# --------------------------------------------------------------------------- #
+
+
+def test_parenthesized_tuple_is_a_record(storage, session):
+    # ``(a, b, …)`` is the anonymous record constructor, like ``ROW(a, b, …)``.
+    res = run(storage, session, "SELECT (1::int2, 2::int4, 3::int8, null) AS row")
+    assert res.columns[0].pg_oid == 2249  # RECORD
+    assert res.columns[0].name == "row"
+    assert res.rows[0][0] == {"f1": 1, "f2": 2, "f3": 3, "f4": None}
+
+
+def test_record_text_render_quotes_and_pads(storage, session):
+    val = run(
+        storage,
+        session,
+        "SELECT ('a'::text, 'd'::char(2), 'f'::char(3)) AS row",
+    ).rows[0][0]
+    # A char(n) field blank-pads; the record text quotes fields with spaces.
+    from secantus.sql import typemap as _tm
+
+    assert _tm.to_pg_text(val, "composite").decode() == '(a,"d ","f  ")'
+
+
+def test_binary_composite_param_errors():
+    # The validating binary-composite decoder raises PG's exact wire errors
+    # (pgtest tuple corpus pins them via keepErrMessage).
+    from secantus.sql import errors
+    from secantus.sql.pgextended import _decode_binary_composite
+
+    fields = [("a", "bool", None)]  # CREATE TYPE r AS (a bool)
+
+    def code(raw):
+        try:
+            _decode_binary_composite(bytes.fromhex(raw), fields)
+            return None
+        except errors.SQLError as e:
+            return e.sqlstate
+
+    assert _decode_binary_composite(bytes.fromhex("00000001000000100000000101"), fields) == "(t)"
+    assert _decode_binary_composite(bytes.fromhex("0000000100000010FFFFFFFF"), fields) == "()"
+    assert code("") == "08P01"  # no header
+    assert code("FFFFFFFF") == "42804"  # wrong column count
+    assert code("00000001") == "08P01"  # no element oid
+    assert code("0000000100000000") == "42804"  # oid mismatch
+    assert code("0000000100000010") == "08P01"  # no element size
+    assert code("000000010000001000000000") == "08P01"  # 0-length bool
+    assert code("000000010000001000000001") == "22P03"  # length exceeds buffer

@@ -309,12 +309,13 @@ aren't filtered against the local table: the server is the authority, so
 an unknown role comes back as an honest `RoleNotFound` rather than being
 silently dropped from the request.
 
-`/roles` is read-only. Each row shows the role's action set as inline
-pills plus flag badges (`any_db`, `cluster`, `admin_only`); a role the
-target reports but this package has no action table for is listed with a
-`custom` badge and no pills, rather than inventing privileges that
-haven't been read. Creating and editing custom roles is deferred — see
-[Compatibility](compatibility.md).
+`/roles` shows every role's action set as inline pills plus flag badges
+(`any_db`, `cluster`, `admin_only`); a role the target reports but this
+package has no action table for is listed with a `custom` badge and no
+pills, rather than inventing privileges that haven't been read. Custom
+roles can be **created** (name, privileges, inherited roles as one
+Extended-JSON document) and **dropped** from the page; editing an
+existing role in place is still deferred — drop and re-create it.
 
 ![The Users page: accounts on a database with their granted roles.](screenshots/admin-users.png)
 
@@ -324,11 +325,17 @@ haven't been read. Creating and editing custom roles is deferred — see
 
 Pick a scope (cluster, db, coll), hit Watch, and a WebSocket-driven
 event log fills the page. Each event renders as a card with the
-`operationType` badge, the namespace, an Extended-JSON pre block, and
-a "Copy resume token" button that pushes the resume token to the
-clipboard. A DDL filter toggle drops `create` / `drop` /
-`createIndexes` / `dropIndexes` / `rename` / `modify` / `invalidate`
-events when off.
+`operationType` badge, the namespace, an Extended-JSON pre block, a
+"Copy resume token" button, and a **Resume from here** action that
+restarts the stream after that event. The watch options cover the real
+debugging surface: `fullDocument` and `fullDocumentBeforeChange`
+modes, all three start points (`resumeAfter`, `startAfter`,
+`startAtOperationTime`), and a pipeline filter — all round-tripped
+through the URL so a shared link reproduces the same stream. A DDL
+filter toggle drops `create` / `drop` / `createIndexes` /
+`dropIndexes` / `rename` / `modify` / `invalidate` events when off. A
+rejected option is reported as a readable error frame rather than a
+bare disconnect.
 
 The bridge from pymongo's sync `ChangeStream` to async runs the cursor
 in a thread (`asyncio.to_thread(stream.try_next)`); the cursor is

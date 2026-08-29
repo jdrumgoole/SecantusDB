@@ -64,6 +64,13 @@ pub fn evaluate(doc: &Document, expr: &Bson, vars: &Document) -> R {
     eval(expr, &Ctx { doc, vars })
 }
 
+/// [`evaluate`] in *field-value* position — an absent field path yields the
+/// missing marker (`Bson::Undefined`) so `$project` / `$addFields` omit the key
+/// instead of writing null. Mirrors `expressions.py::evaluate_or_missing`.
+pub fn evaluate_or_missing(doc: &Document, expr: &Bson, vars: &Document) -> R {
+    eval_field_value(expr, &Ctx { doc, vars })
+}
+
 /// MongoDB truthiness (`secantus.expressions._bool` / `query._truthy`): null is
 /// false, numbers are nonzero, everything else (incl. strings/arrays/docs/
 /// Decimal128) is true.
@@ -105,14 +112,42 @@ fn eval(expr: &Bson, ctx: &Ctx) -> R {
                     return apply_op(key, val, ctx);
                 }
             }
+            // A document *literal*. Each member is in field-value position, so
+            // a member whose value is an absent field path is dropped rather
+            // than written as null: mongod answers `{z: {}}` for
+            // `{$project: {z: {w: "$nope"}}}`, not `{z: {w: null}}`.
             let mut out = Document::new();
             for (k, v) in d {
-                out.insert(k.clone(), eval(v, ctx)?);
+                let value = eval_field_value(v, ctx)?;
+                if !matches!(value, Bson::Undefined) {
+                    out.insert(k.clone(), value);
+                }
             }
             Ok(Bson::Document(out))
         }
         other => Ok(other.clone()),
     }
+}
+
+/// Evaluate in *field-value* position, where an absent path is the missing
+/// marker (`Bson::Undefined`) rather than null.
+///
+/// Differs from [`eval`] only for a bare field-path string: as an operator
+/// argument a missing path is null (`{$add: ["$nope", 1]}` is 1), but as the
+/// value of a projected/added field it is *missing* and the key is omitted.
+/// Keeping the two distinct is why this isn't folded into `eval`.
+/// Mirrors `expressions.py::_eval_field_value`.
+fn eval_field_value(expr: &Bson, ctx: &Ctx) -> R {
+    if let Bson::String(s) = expr {
+        if !s.starts_with("$$") {
+            if let Some(path) = s.strip_prefix('$') {
+                return Ok(paths::get_path(ctx.doc, path)
+                    .cloned()
+                    .unwrap_or(Bson::Undefined));
+            }
+        }
+    }
+    eval(expr, ctx)
 }
 
 fn resolve_var(name: &str, ctx: &Ctx) -> R {
@@ -639,11 +674,10 @@ pub fn py_order(a: &Bson, b: &Bson) -> Result<Option<Ordering>, Fallback> {
     {
         return Err(Fallback);
     }
-    let (numa, numb) = (as_num(a), as_num(b));
-    if let (Some(na), Some(nb)) = (&numa, &numb) {
-        return Ok(numeric::cmp(na, nb));
+    if let Some(r) = numeric::fast_cmp_numberish(a, b) {
+        return Ok(r);
     }
-    if numa.is_some() != numb.is_some() {
+    if numeric::is_numberish(a) != numeric::is_numberish(b) {
         return Ok(None); // numberish vs non-numberish -> TypeError -> False
     }
     Ok(match (a, b) {
@@ -660,16 +694,6 @@ pub fn py_order(a: &Bson, b: &Bson) -> Result<Option<Ordering>, Fallback> {
         // null-vs-null, regex, and different types are not orderable in Python.
         _ => None,
     })
-}
-
-/// numberish view (bool as 0/1) for comparison; `None` if not int/int64/
-/// double/bool.
-fn as_num(b: &Bson) -> Option<numeric::NumVal> {
-    match b {
-        Bson::Boolean(v) => Some(numeric::classify(&Bson::Int32(i32::from(*v))).unwrap()),
-        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => numeric::classify(b),
-        _ => None,
-    }
 }
 
 fn is_exotic(b: &Bson) -> bool {
@@ -924,7 +948,13 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
     if (0..len).contains(&resolved) {
         Ok(a[resolved as usize].clone())
     } else {
-        Ok(Bson::Null)
+        // Out of range evaluates to MISSING, not null, so `$project` omits the
+        // field. `Bson::Undefined` is this engine's missing marker and the
+        // project stage already skips it. Probed against mongod 6.0.16 on
+        // `[1, 2]`: index 9 and index -9 both give `{_id: 1}` with no field,
+        // while a missing/null input array really is null. Mirrors
+        // `expressions.py::_array_elem_at`.
+        Ok(Bson::Undefined)
     }
 }
 
@@ -1173,19 +1203,18 @@ fn expr_acc_values(arg: &Bson, ctx: &Ctx) -> Result<Vec<Bson>, Fallback> {
 }
 
 fn op_expr_sum(arg: &Bson, ctx: &Ctx) -> R {
-    // Reuses the group-accumulator `Num` width logic (int32 < int64 < double);
-    // a Decimal128 element defers to Python; non-numeric elements are ignored.
+    // Reuses the group-accumulator `Num` width logic (int32 < int64 < double <
+    // decimal); non-numeric elements are ignored.
     let mut running = crate::group::Num::Int { v: 0, wide: false };
     for v in expr_acc_values(arg, ctx)? {
         match v {
-            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => {
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
                 running = running.add(&v).map_err(|_| Fallback)?;
             }
-            Bson::Decimal128(_) => return Err(Fallback),
             _ => {} // bool / string / null / doc / array -> ignored
         }
     }
-    running.to_bson().map_err(|_| Fallback)
+    running.into_bson().map_err(|_| Fallback)
 }
 
 fn op_expr_avg(arg: &Bson, ctx: &Ctx) -> R {
@@ -1193,11 +1222,10 @@ fn op_expr_avg(arg: &Bson, ctx: &Ctx) -> R {
     let mut count: i64 = 0;
     for v in expr_acc_values(arg, ctx)? {
         match v {
-            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => {
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
                 total = total.add(&v).map_err(|_| Fallback)?;
                 count += 1;
             }
-            Bson::Decimal128(_) => return Err(Fallback),
             _ => {}
         }
     }
@@ -1212,6 +1240,12 @@ fn op_expr_avg(arg: &Bson, ctx: &Ctx) -> R {
             v as f64
         }
         crate::group::Num::Float(f) => f,
+        // Stay in the decimal domain — an f64 divide would narrow the type and
+        // drop digits.
+        crate::group::Num::Dec(d) => {
+            return crate::decimal::to_bson(&crate::decimal::div_int(&d, count).ok_or(Fallback)?)
+                .ok_or(Fallback);
+        }
     };
     Ok(Bson::Double(tf / count as f64))
 }
@@ -2861,9 +2895,13 @@ fn op_to_decimal(arg: &Bson, ctx: &Ctx) -> R {
         Bson::Int32(n) => decimal_from_str(&n.to_string()),
         Bson::Int64(n) => decimal_from_str(&n.to_string()),
         Bson::Boolean(b) => decimal_from_str(if b { "1" } else { "0" }),
-        // Shortest round-trip text matches Python's `repr(float)` so the
-        // Decimal128 payload agrees bit-for-bit.
-        Bson::Double(d) if d.is_finite() => decimal_from_str(&format!("{d:?}")),
+        // mongod converts a double at a fixed 15 significant digits, so
+        // `$toDecimal: 4.125` is `4.12500000000000` — the shortest round-trip
+        // text would answer `4.125`, a different quantum. (The `$sum`/`$avg`
+        // accumulators use a *different* rule; see `crate::decimal`.)
+        Bson::Double(d) if d.is_finite() => crate::decimal::from_bson(&Bson::Double(d))
+            .and_then(|v| crate::decimal::to_bson(&v))
+            .ok_or(Fallback),
         Bson::String(ref s) => decimal_from_str(s),
         _ => Err(Fallback),
     }
@@ -2990,7 +3028,15 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
             Bson::Boolean(b) => decimal_conv(if *b { "1" } else { "0" }),
             Bson::Int32(n) => decimal_conv(&n.to_string()),
             Bson::Int64(n) => decimal_conv(&n.to_string()),
-            Bson::Double(d) if d.is_finite() => decimal_conv(&format!("{d:?}")),
+            // 15 significant digits, as `$toDecimal` — mongod-probed 6.0.16.
+            Bson::Double(d) if d.is_finite() => {
+                match crate::decimal::from_bson(&Bson::Double(*d))
+                    .and_then(|v| crate::decimal::to_bson(&v))
+                {
+                    Some(b) => Conv::Ok(b),
+                    None => Conv::Unsupported,
+                }
+            }
             Bson::String(s) => decimal_conv(s),
             _ => Conv::Unsupported,
         },
@@ -4027,10 +4073,10 @@ pub fn py_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
     {
         return Err(Fallback);
     }
-    if let (Some(na), Some(nb)) = (as_num(a), as_num(b)) {
-        return Ok(numeric::eq(&na, &nb));
+    if let Some(r) = numeric::fast_cmp_numberish(a, b) {
+        return Ok(r == Some(std::cmp::Ordering::Equal));
     }
-    if as_num(a).is_some() != as_num(b).is_some() {
+    if numeric::is_numberish(a) != numeric::is_numberish(b) {
         return Ok(false);
     }
     Ok(match (a, b) {

@@ -118,6 +118,7 @@ pub(crate) fn validation_error_info(validator: &Document, doc: &Document) -> Doc
     info
 }
 
+use crate::argtypes;
 use crate::util::{
     as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, resolve_let_vars,
     write_error,
@@ -273,7 +274,12 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .get_collection_options(&db, &coll)
             .map_err(command_error)?;
         let action = opts.get_str("validationAction").unwrap_or("error");
-        if action == "warn" || action == "off" {
+        // `validationLevel: "off"` disables validation entirely, whatever the
+        // action says — mongod checks the level first. The level was stored by
+        // `create` / `collMod` and then never consulted, so a collection
+        // explicitly opted OUT of validation still had it enforced.
+        let level_off = opts.get_str("validationLevel").unwrap_or("strict") == "off";
+        if level_off || action == "warn" || action == "off" {
             None
         } else {
             opts.get("validator").and_then(Bson::as_document).cloned()
@@ -535,14 +541,16 @@ fn unsupported_update_modifier(u: &Document) -> Option<String> {
     if !u.keys().any(|k| k.starts_with('$')) {
         return None; // replacement-style update
     }
-    if !u.keys().all(|k| k.starts_with('$')) {
-        return Some("update document cannot mix operators with replacement fields".to_string());
-    }
+    // mongod has ONE complaint for both shapes -- an unrecognised `$`-operator
+    // and a document mixing operators with replacement fields -- and for the
+    // mixed one it names the bare field, no `$`: `Unknown modifier: z`.
+    // Probed 6.0.16.
     u.keys()
-        .find(|k| !KNOWN_UPDATE_OPS.contains(&k.as_str()))
+        .find(|k| !k.starts_with('$') || !KNOWN_UPDATE_OPS.contains(&k.as_str()))
         .map(|k| {
             format!(
-                "Unknown modifier: {k}. Expected a valid update modifier (e.g. $set, $unset, $inc, ...)"
+                "Unknown modifier: {k}. Expected a valid update modifier or \
+                 pipeline-style update specified as an array"
             )
         })
 }
@@ -592,6 +600,7 @@ fn ts_update_is_meta_only(u: Option<&Bson>, meta: &str) -> bool {
 }
 
 pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    argtypes::require_object(doc, "let", "update.let")?;
     let coll = coll_arg(doc, "update")?;
     let storage = ctx.storage()?;
     let updates = array_field(doc, "updates");
@@ -617,12 +626,24 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         None
     } else {
         let action = opts.get_str("validationAction").unwrap_or("error");
-        if action == "warn" || action == "off" {
+        // `validationLevel: "off"` disables validation entirely, whatever the
+        // action says — mongod checks the level first. The level was stored by
+        // `create` / `collMod` and then never consulted, so a collection
+        // explicitly opted OUT of validation still had it enforced.
+        let level_off = opts.get_str("validationLevel").unwrap_or("strict") == "off";
+        if level_off || action == "warn" || action == "off" {
             None
         } else {
             opts.get("validator").and_then(Bson::as_document).cloned()
         }
     };
+    // `validationLevel: "moderate"` applies the validator to inserts and to
+    // updates of documents that ALREADY satisfy it, but exempts documents that
+    // were already invalid when the validator was introduced — the level exists
+    // so a validator can be added to a collection with legacy rows without
+    // freezing them.
+    let validator_moderate = opts.get_str("validationLevel").unwrap_or("strict") == "moderate";
+
     // mongod 7.0 restricts updates on a timeseries collection to the metaField
     // only. `ts_meta` is `Some(metaField)` for a timeseries collection (an empty
     // string when no metaField is declared — then nothing is updatable).
@@ -633,6 +654,10 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
     for (index, spec) in updates.iter().enumerate() {
         let Bson::Document(spec) = spec else { continue };
+
+        // Strict bool, unlike findAndModify's `upsert`, which takes a bool OR any
+        // number. Adjacent slots, different rules -- probed, not inferred.
+        argtypes::require_bool_field(spec, "multi", "update.updates.multi")?;
 
         // MongoDB 8.0 added a per-spec `sort`; pre-8.0 (we advertise 7.0) it's a
         // command-level FailedToParse. Drivers' `*-sort` tests with
@@ -723,6 +748,8 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 &let_vars,
                 collation.as_ref(),
                 validator.as_ref(),
+                validator_moderate,
+                false,
             )
         } else {
             let u = doc_field(spec, "u");
@@ -745,6 +772,8 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 &let_vars,
                 collation.as_ref(),
                 validator.as_ref(),
+                validator_moderate,
+                false,
             )
         };
 

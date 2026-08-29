@@ -46,6 +46,9 @@ fn project_op(
     before: &str,
     scope: &Scope,
 ) -> (Option<Document>, bool) {
+    // Async lane: wait out the drainer so the emitted entry is readable
+    // (no-op in sync mode).
+    st.flush_oplog();
     let (seq, blob) = st
         .read_oplog(1, 100)
         .unwrap()
@@ -336,6 +339,7 @@ fn rename_event_carries_operation_description_with_drop_target() {
 fn noop_heartbeat_projects_nothing() {
     with_db(|st| {
         let seq = st.emit_noop_heartbeat().unwrap();
+        st.flush_oplog();
         let rows = st.read_oplog(1, 10).unwrap();
         let entry = decode(&rows[0].1);
         let (ev, inv) = changestreams::project(

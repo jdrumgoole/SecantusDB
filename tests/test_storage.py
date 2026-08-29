@@ -215,14 +215,23 @@ def test_sort_cross_type_order(storage: Storage) -> None:
     )
     out = storage.find_matching("db", "c", {}, sort={"v": 1})
     ids = [d["_id"] for d in out]
-    # MongoDB order: null < numbers < string < object < array < ObjectId < bool
+    # MongoDB cross-type order for SCALARS:
+    #   null < numbers < string < object < ObjectId < bool
+    #
+    # An ARRAY does not take a type slot of its own. mongod sorts an array-valued
+    # field by its minimum element (ascending), so `[1, 2]` sorts as the number 1
+    # and lands among the numbers — before string and object, not after them.
+    # This previously asserted `object < array`, the whole-array model we used to
+    # implement; mongod 6.0.16 on these exact seven documents returns
+    # [4, 5, 2, 1, 6, 7, 3].
     pos = {i: ids.index(i) for i in range(1, 8)}
     assert pos[4] < pos[2]  # null < num
     assert pos[2] < pos[1]  # num < string
     assert pos[1] < pos[6]  # string < object
-    assert pos[6] < pos[5]  # object < array
-    assert pos[5] < pos[7]  # array < ObjectId
+    assert pos[6] < pos[7]  # object < ObjectId
     assert pos[7] < pos[3]  # ObjectId < bool
+    assert pos[5] < pos[2]  # array [1,2] -> min 1 -> before the scalar 5
+    assert ids == [4, 5, 2, 1, 6, 7, 3], "must match mongod exactly"
 
 
 def test_reopen_clamps_seq_counters_past_stale_meta(tmp_path) -> None:
@@ -945,6 +954,109 @@ def test_ddl_and_crud_never_deadlock_and_index_stays_complete(storage: Storage) 
         _ddl_crud_round(storage, "app", f"c{r}", writers=4, per_writer=25)
 
 
+def _drop_ddl_crud_round(
+    storage: Storage, db: str, coll: str, writers: int, per_writer: int
+) -> None:
+    """One race round: N fresh writer threads vs a concurrent dropIndex on the
+    same collection — the drop-direction twin of `_ddl_crud_round` (#635)."""
+    storage.insert(db, coll, [{"_id": k, "x": k % 5} for k in range(20)])
+    storage.create_index(db, coll, "x_1", {"x": 1})
+    barrier = threading.Barrier(writers + 1)
+    errors: list[BaseException] = []
+
+    def writer(i: int) -> None:
+        try:
+            barrier.wait()
+            base = 1000 + i * per_writer
+            for k in range(per_writer):
+                storage.insert(db, coll, [{"_id": base + k, "x": (base + k) % 5}])
+        except BaseException as exc:  # noqa: BLE001 - surfaced after join
+            errors.append(exc)
+
+    def dropper() -> None:
+        try:
+            barrier.wait()
+            storage.drop_index(db, coll, "x_1")
+        except BaseException as exc:  # noqa: BLE001 - surfaced after join
+            errors.append(exc)
+
+    threads = [threading.Thread(target=dropper)]
+    threads += [threading.Thread(target=writer, args=(i,)) for i in range(writers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+        assert not t.is_alive(), (
+            "thread did not finish within 60s — deadlock between dropIndex and a "
+            "concurrent write (check the _coll_lock/_lock ordering)"
+        )
+    assert not errors, f"worker failures: {errors!r}"
+
+    # Every doc is still reachable by a plain scan (the drop removed the index,
+    # not data), and no index-entry rows survive for the dropped index.
+    total = 20 + writers * per_writer
+    assert storage.count_matching(db, coll, {}) == total
+    from secantus.storage import _IDX_ENTRIES_TABLE
+
+    survivors = storage._collect_prefix(_IDX_ENTRIES_TABLE, (db, coll, "x_1"))
+    assert survivors == [], f"dropIndex left {len(survivors)} orphaned entry rows"
+
+
+def test_drop_index_and_crud_never_deadlock_or_orphan_entries(storage: Storage) -> None:
+    """Concurrent dropIndex + writes must neither deadlock nor leave the dropped
+    index's entry rows behind. Guards the #635 drop-direction race: before
+    `drop_index`/`drop_all_indexes` took `_coll_lock`, a write interleaving the
+    entry-table snapshot-then-delete could survive as an orphaned entry."""
+    for r in range(4):
+        _drop_ddl_crud_round(storage, "app", f"d{r}", writers=4, per_writer=25)
+
+
+def test_bare_emit_failure_does_not_freeze_the_visible_tail(storage: Storage) -> None:
+    """#714: if a bare (autocommit) oplog emit's write loop raises, the minted
+    seq range must still leave `_oplog_in_flight` — otherwise
+    `oplog_visible_tail_seq` clamps at that seq forever and change streams
+    server-wide freeze. A DDL write is the bare path; we force its emit to throw
+    and assert the tail recovers."""
+    storage.insert("app", "c", [{"_id": 1}])
+    tail_before = storage.oplog_visible_tail_seq()
+    assert not storage._oplog_in_flight
+
+    # Force the next oplog cursor write to raise, mid bare-path emit.
+    real_cursor = storage._cursor
+    from secantus.storage import _OPLOG_TABLE
+
+    class _Boom(Exception):
+        pass
+
+    def _boom_cursor(table, *a, **k):
+        cur = real_cursor(table, *a, **k)
+        if table == _OPLOG_TABLE:
+
+            class _Wrap:
+                def __setitem__(self, *_):
+                    raise _Boom("injected oplog write failure")
+
+                def __getattr__(self, n):
+                    return getattr(cur, n)
+
+            return _Wrap()
+        return cur
+
+    storage._cursor = _boom_cursor
+    try:
+        with pytest.raises(_Boom):
+            # create_collection goes through the bare `_emit_oplog` path.
+            storage.create_collection("app", "fresh")
+    finally:
+        storage._cursor = real_cursor
+
+    # The minted range was released despite the failure — nothing pinned.
+    assert not storage._oplog_in_flight, "a failed bare emit leaked an in-flight range"
+    # A subsequent successful write advances the tail past where it froze.
+    storage.insert("app", "c", [{"_id": 2}])
+    assert storage.oplog_visible_tail_seq() > tail_before
+
+
 def test_frame_doc_value_layout_and_roundtrip() -> None:
     """The doc-table value frame is ``[u32-LE id_key_len][id_key][blob]`` — byte
     for byte what the Rust server writes (RecordId step 4a), so a store written by
@@ -1061,3 +1173,157 @@ def test_open_refuses_a_pre_recordid_doc_format(tmp_path) -> None:
     # The refusal must not leave the WT home locked by a half-open connection.
     with pytest.raises(IncompatibleStorageFormatError):
         Storage(home)
+
+
+def test_large_batch_insert_survives_a_small_cache(tmp_path) -> None:
+    # One wire message can carry ~48MB of documents. Pre-chunking, insert()
+    # wrote the whole batch in ONE statement transaction whose unevictable
+    # dirty content (doc rows + full-doc oplog entries + index entries)
+    # livelocked WiredTiger once it neared the cache's dirty-stall fraction —
+    # the mongo-rust-driver ``large_insert`` weekly-CI wedge, reproduced
+    # locally at 35k x 1.2KB docs vs the 1G default cache. Chunked (<=1000
+    # docs / <=4MB per transaction), the same batch's dirty footprint stays
+    # bounded and this passes quickly even against a deliberately tiny cache.
+    # A regression wedges (pytest-timeout is the alarm).
+    filler = "x" * 1100
+    docs = [{"_id": i, "pad": filler} for i in range(35000)]
+    s = Storage(str(tmp_path), cache_size="128M")
+    try:
+        inserted, errors = s.insert("app", "c", docs)
+        assert inserted == 35000
+        assert errors == []
+        assert len(s.find_matching("app", "c", {"_id": 17321})) == 1
+    finally:
+        s.close()
+
+
+def test_ordered_insert_stops_across_chunk_boundaries(tmp_path) -> None:
+    # The ordered contract must hold across the chunked transactions: an
+    # error in chunk N stops the batch — later chunks never run — and the
+    # error's ``index`` is the position in the CLIENT batch, not the chunk.
+    docs = [{"_id": i} for i in range(1500)]
+    docs[1200]["_id"] = 3  # duplicate of an earlier doc, lands in chunk 2
+    s = Storage(str(tmp_path))
+    try:
+        inserted, errors = s.insert("app", "c", docs, ordered=True)
+        assert inserted == 1200
+        assert len(errors) == 1
+        assert errors[0]["index"] == 1200
+        assert errors[0]["code"] == 11000
+        # Nothing after the ordered stop landed.
+        assert s.find_matching("app", "c", {"_id": 1499}) == []
+        assert len(s.find_matching("app", "c", {"_id": 1199})) == 1
+    finally:
+        s.close()
+
+
+def test_unordered_insert_reports_errors_across_chunks(tmp_path) -> None:
+    docs = [{"_id": i} for i in range(1500)]
+    docs[1200]["_id"] = 3
+    s = Storage(str(tmp_path))
+    try:
+        inserted, errors = s.insert("app", "c", docs, ordered=False)
+        assert inserted == 1499
+        assert [e["index"] for e in errors] == [1200]
+        assert len(s.find_matching("app", "c", {"_id": 1499})) == 1
+    finally:
+        s.close()
+
+
+def test_update_and_delete_many_survive_a_small_cache(tmp_path) -> None:
+    # updateMany / deleteMany over a large matched set used to run as ONE
+    # statement transaction — unbounded unevictable dirty content, the same
+    # livelock class the chunked inserts closed. Chunked (twin of the Rust
+    # driver), a whole-collection rewrite and delete stay bounded against a
+    # deliberately small cache. A regression wedges (pytest-timeout alarms).
+    filler = "x" * 1100
+    s = Storage(str(tmp_path), cache_size="128M")
+    try:
+        docs = [{"_id": i, "pad": filler, "x": 1} for i in range(35000)]
+        inserted, errors = s.insert("app", "c", docs)
+        assert inserted == 35000 and errors == []
+        out = s.update_matching("app", "c", {"x": 1}, {"$set": {"x": 2}}, multi=True)
+        assert out["matched"] == 35000
+        assert out["modified"] == 35000
+        assert len(s.find_matching("app", "c", {"x": 2})) == 35000
+        deleted = s.delete_matching("app", "c", {"x": 2})
+        assert deleted == 35000
+        assert s.find_matching("app", "c", {}) == []
+    finally:
+        s.close()
+
+
+def test_multi_update_inc_applies_exactly_once_across_chunks(tmp_path) -> None:
+    # The RecordId list is partitioned across chunk transactions and a
+    # conflict retries only its own rolled-back chunk — $inc must apply
+    # exactly once per doc even when the update spans multiple chunks.
+    s = Storage(str(tmp_path))
+    try:
+        s.insert("app", "c", [{"_id": i, "n": 0} for i in range(2500)])
+        out = s.update_matching("app", "c", {}, {"$inc": {"n": 1}}, multi=True)
+        assert out["matched"] == 2500
+        assert out["modified"] == 2500
+        assert len(s.find_matching("app", "c", {"n": 1})) == 2500
+        out = s.update_matching("app", "c", {"n": 1}, {"$inc": {"n": 1}}, multi=True)
+        assert out["modified"] == 2500
+        assert len(s.find_matching("app", "c", {"n": 2})) == 2500
+    finally:
+        s.close()
+
+
+def test_bounded_write_paths_unchanged_by_chunking(tmp_path) -> None:
+    s = Storage(str(tmp_path))
+    try:
+        s.insert("app", "c", [{"_id": i, "x": 1} for i in range(10)])
+        # Single-doc update keeps post-image capture.
+        out = s.update_matching(
+            "app", "c", {"x": 1}, {"$set": {"x": 9}}, multi=False, return_post_images=True
+        )
+        assert (out["matched"], out["modified"]) == (1, 1)
+        assert out["post_images"][0]["x"] == 9
+        # deleteOne stays bounded-path.
+        assert s.delete_matching("app", "c", {"x": 1}, limit=1) == 1
+        assert len(s.find_matching("app", "c", {})) == 9
+        # Upsert through the chunked route's zero-match delegation.
+        out = s.update_matching("app", "c", {"x": 777}, {"$set": {"y": 1}}, multi=True, upsert=True)
+        assert out["matched"] == 0
+        assert out["did_upsert"] is True
+        assert out["upserted_id"] is not None
+    finally:
+        s.close()
+
+
+def test_pending_drop_tombstone_recovered_at_open(tmp_path) -> None:
+    """A drop tombstone left by the Rust server's chunked drop crashing
+    mid-purge (registry row gone, doc/index rows orphaned) is finished at the
+    next open — the orphans must not resurface inside a re-created collection.
+    The layouts are byte-identical cross-server, so the Python server must
+    honour a Rust-written tombstone."""
+    from secantus.storage import _COLL_TABLE, _TOMB_TABLE, _doc_table_for
+
+    s1 = Storage(str(tmp_path))
+    try:
+        s1.insert("app", "c", [{"_id": i, "x": i} for i in range(50)])
+        s1.create_index("app", "c", "x_1", {"x": 1}, {})
+        with s1._lock:
+            # Forge the crash-left state: phase 1's effects (registry row
+            # removed, tombstone written) without the phase-2 purge.
+            s1._delete_keys(_COLL_TABLE, [("app", "c")])
+            c = s1._cursor(_TOMB_TABLE)
+            c.set_key("app", "c")
+            c.set_value(b"")
+            c.insert()
+            c.reset()
+    finally:
+        s1.close()
+
+    s2 = Storage(str(tmp_path))
+    try:
+        # Recovery purged the orphans and cleared the tombstone; a re-created
+        # collection sees only its own rows.
+        assert s2._collect_prefix(_TOMB_TABLE, ()) == []
+        assert s2._collect_prefix(_doc_table_for("app", "c"), ("app", "c")) == []
+        s2.insert("app", "c", [{"_id": 100}])
+        assert s2.count_matching("app", "c", {}) == 1
+    finally:
+        s2.close()

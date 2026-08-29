@@ -14,12 +14,15 @@ Only the P0 subset is handled; anything outside it raises a
 from __future__ import annotations
 
 import contextvars
+import dataclasses
 import datetime as _dt
 import functools
 import json
 import logging
 import math as _math
 import re
+import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from decimal import Decimal as _Decimal
@@ -29,7 +32,7 @@ import sqlglot
 from sqlglot import exp
 
 from secantus.paths import set_path
-from secantus.sql import errors, ranges, typemap
+from secantus.sql import errors, ranges, subms, typemap
 from secantus.sql.catalog import (
     CheckConstraint,
     Column,
@@ -85,6 +88,10 @@ class CreateIndexPlan:
     # ``ExprIndex`` metadata to register on the table (its hidden ``field`` is the
     # key indexed by ``key_spec``) and the raw expression SQL to backfill/maintain.
     expr_index: Any = None  # catalog.ExprIndex | None
+    # ``CREATE INDEX … INCLUDE (cols)`` — covering columns, stored as metadata
+    # only (a surrogate needs no physical INCLUDE payload) and reflected via
+    # pg_index's indnkeyatts/indkey split.
+    include: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -236,7 +243,7 @@ def _literal(node: exp.Expression) -> Any:
             from secantus.sql import intervals as _intervals
 
             return _intervals.neg(inner)
-        return -inner
+        return typemap.negate(inner)
     if isinstance(node, exp.Null):
         return None
     if isinstance(node, exp.Boolean):
@@ -246,8 +253,7 @@ def _literal(node: exp.Expression) -> Any:
     if isinstance(node, exp.Literal):
         if node.is_string:
             return node.this
-        text = node.this
-        return float(text) if ("." in text or "e" in text.lower()) else int(text)
+        return typemap.number_literal(node.this)
     if isinstance(node, exp.BitString):  # ``B'1010'`` -> the canonical '0'/'1' string
         return str(node.this)
     if isinstance(node, exp.ByteString):
@@ -390,6 +396,13 @@ def _coerce_cast(value: Any, datatype: exp.Expression | None) -> Any:
         return value
     if isinstance(datatype, exp.ObjectIdentifier) and str(datatype.this).upper() == "REGCLASS":
         return _regclass_oid(value)
+    if isinstance(datatype, exp.ObjectIdentifier) and str(datatype.this).upper() == "REGPROC":
+        # ``'pg_catalog.array_in'::regproc`` in a pushdown constant — PG
+        # renders search-path-visible functions UNQUALIFIED, which is what
+        # pg_type.typinput stores (pgjdbc's is_array probe compares them).
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return str(value).rsplit(".", 1)[-1]
     if isinstance(datatype, exp.ObjectIdentifier) and str(datatype.this).upper() == "REGTYPE":
         # ``'name'::regtype`` in a pushdown constant — resolve to the type oid
         # (built-ins and, via the planning subctx, user-declared types).
@@ -408,6 +421,15 @@ def _coerce_cast(value: Any, datatype: exp.Expression | None) -> Any:
             from decimal import Decimal
 
             return value if isinstance(value, Decimal) else Decimal(str(value))
+        if tag == "timestamptz" and not isinstance(value, _dt.datetime):
+            # Resolve to an INSTANT here. A timestamptz-declared bound
+            # parameter is substituted as ``CAST('…' AS timestamptz)``, and
+            # leaving that as text lost the declared type: storing it into a
+            # ``timestamp`` column then applied Postgres' literal rule (drop
+            # the offset, keep the wall clock) where Postgres converts the
+            # value through the session zone. A JDBC client's timestamps were
+            # shifted by the session offset as a result.
+            return typemap.coerce(value, "timestamptz")
     except (TypeError, ValueError):
         return value
     return value
@@ -491,8 +513,10 @@ def _identity_spec(coldef: exp.ColumnDef) -> dict[str, Any] | None:
         increment = kind.args.get("increment")
         return {
             "mode": "always" if always else "by_default",
-            "start": int(_literal(start)) if start is not None else 1,
-            "increment": int(_literal(increment)) if increment is not None else 1,
+            "start": int(typemap.unwrap_numeric(_literal(start))) if start is not None else 1,
+            "increment": (
+                int(typemap.unwrap_numeric(_literal(increment))) if increment is not None else 1
+            ),
         }
     return None
 
@@ -562,6 +586,21 @@ def _default_col_scope(node: Any) -> Any:
 # WHERE -> Mongo filter
 # ---------------------------------------------------------------------------
 
+
+def _subms_cmp(field: str, op: str, value: Any, tag: str | None) -> dict[str, Any] | None:
+    """Sub-millisecond-aware comparison filter, or None to use the plain one.
+
+    A `timestamp` / `timestamptz` is stored truncated to whole milliseconds with
+    the remainder in a hidden companion (see `secantus.sql.subms`), so a
+    comparison that looks only at the stored field is blind to the last three
+    digits. Dotted paths are excluded for the same reason writes are: the
+    companion is only maintained for top-level fields.
+    """
+    if tag not in subms.SUBMS_TAGS or "." in field:
+        return None
+    return subms.cmp_filter(field, op, value)
+
+
 _CMP_OPS: dict[type, tuple[str, str]] = {
     # exp class -> (operator, operator-when-column-is-on-the-right)
     exp.GT: ("$gt", "$lt"),
@@ -571,20 +610,54 @@ _CMP_OPS: dict[type, tuple[str, str]] = {
 }
 
 
-def _like_to_regex(pattern: str) -> str:
+_EXPLICIT_OPERATORS = {
+    "~": exp.RegexpLike,
+    "~*": exp.RegexpILike,
+}
+
+
+def _rewrite_explicit_operator(node: exp.Operator) -> exp.Expression | None:
+    """``a OPERATOR(pg_catalog.~) b`` (psql's ``\\d`` family emits it) → the
+    equivalent regex node; a COLLATE wrapper on the pattern is dropped (the
+    default collation changes nothing here). Unknown operators return None."""
+    op = str(node.args.get("operator") or "").rsplit(".", 1)[-1]
+    negated = op.startswith("!")
+    cls = _EXPLICIT_OPERATORS.get(op.lstrip("!"))
+    if cls is None:
+        return None
+    rhs = node.expression
+    if isinstance(rhs, exp.Collate):
+        rhs = rhs.this
+    out: exp.Expression = cls(this=node.this, expression=rhs)
+    return exp.Not(this=out) if negated else out
+
+
+def _like_to_regex(pattern: str, escape: str | None = None) -> str:
     """Translate a SQL LIKE pattern to an anchored regex.
 
     ``%`` -> ``.*`` and ``_`` -> ``.``; every other character is escaped so it
-    matches literally.
+    matches literally. With an ``ESCAPE`` character, ``<esc>X`` matches ``X``
+    literally (PG semantics — the escape applies to the next character).
     """
+    if escape is not None and len(escape) > 1:
+        raise errors.SQLError("22025", "invalid escape string")
+    if not escape:
+        escape = None  # ``ESCAPE ''`` disables escaping, like PG
     out = ["^"]
-    for ch in pattern:
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if escape and ch == escape and i + 1 < len(pattern):
+            out.append(re.escape(pattern[i + 1]))
+            i += 2
+            continue
         if ch == "%":
             out.append(".*")
         elif ch == "_":
             out.append(".")
         else:
             out.append(re.escape(ch))
+        i += 1
     out.append("$")
     return "".join(out)
 
@@ -848,6 +921,14 @@ def _to_agg_expr(node: exp.Expression, resolve: Resolve) -> Any:
     if _is_field_node(node):
         return "$" + _field(node, resolve)[0]
     if isinstance(node, exp.Cast):
+        # The cast itself is dropped — the operand's own value is what the
+        # aggregation engine compares. That only holds for types the engine
+        # models; an ``interval`` has no BSON counterpart at all, so dropping
+        # the cast would hand ``$multiply`` / ``$add`` the raw literal text and
+        # produce a wrong answer (or a crash). Refuse it, and the WHERE falls
+        # back to the scalar evaluator, which does understand intervals.
+        if node.to is not None and node.to.sql(dialect="postgres").lower().strip() == "interval":
+            raise errors.feature_not_supported("interval arithmetic in a pushed-down predicate")
         return _to_agg_expr(node.this, resolve)
     if isinstance(node, exp.Neg) and not isinstance(node.this, (exp.Literal, exp.Null)):
         # Unary minus over a non-literal (``- col2``) — a negative literal
@@ -925,7 +1006,10 @@ def _func_to_agg_expr(node: exp.Expression, resolve: Resolve) -> Any | None:
 # Catalog predicates that are functions of visibility/scope which, on a
 # single-node SecantusDB where every relation lives in the default search path,
 # are always true. SQLAlchemy's reflection emits these in its catalog WHEREs.
-_ALWAYS_TRUE_PREDICATES = {"pg_table_is_visible", "pg_type_is_visible"}
+# ``pg_table_is_visible`` is NOT here: a temp relation is invisible to every
+# session but its creator (and the reflecting connection is never the creator),
+# so it translates to ``relpersistence != 't'`` on the pg_class row instead.
+_ALWAYS_TRUE_PREDICATES = {"pg_type_is_visible"}
 
 
 @dataclass
@@ -1131,6 +1215,61 @@ def _expr_to_filter(
         node = node.expression
     if isinstance(node, exp.Anonymous) and node.name.lower() in _ALWAYS_TRUE_PREDICATES:
         return {}
+    if isinstance(node, exp.Anonymous) and node.name.lower() == "pg_table_is_visible":
+        # Real PG: a temp relation is visible only to its creating session.
+        # Sessions track the temp tables they created (``Session.temp_tables``),
+        # so the predicate lowers to ``relpersistence != 't' OR relname IN
+        # (<this session's temp tables>)`` on the same pg_class row the oid
+        # argument points at (same alias, so joins resolve).
+        arg = (node.expressions or [None])[0]
+        alias = arg.table if isinstance(arg, exp.Column) else None
+        vis: exp.Expression = exp.NEQ(
+            this=exp.column("relpersistence", table=alias or None),
+            expression=exp.Literal.string("t"),
+        )
+        session = getattr(subctx, "session", None)
+        # temp_tables carries the pg_temp_<n>. prefix; pg_class relname is bare.
+        own = sorted(
+            name.split(".", 1)[1] if "." in name else name
+            for (tdb, name) in (getattr(session, "temp_tables", None) or ())
+            if subctx is None or tdb == subctx.db
+        )
+        if own:
+            vis = exp.Or(
+                this=vis,
+                expression=exp.In(
+                    this=exp.column("relname", table=alias or None),
+                    expressions=[exp.Literal.string(n) for n in own],
+                ),
+            )
+        # Search-path visibility: the relation's namespace must be on the
+        # session's search_path (plus the implicit pg_catalog /
+        # information_schema / session pg_temp). The path is resolved to
+        # namespace oids per-session — a hardcoded default-path list hid every
+        # user-schema relation the moment ``SET search_path TO schema1`` ran
+        # (pgjdbc's same-table-name-in-two-schemas updatable-resultset probe).
+        # Default namespace oids mirror virtual._NS_OIDS / _PG_TEMP_NS_OID.
+        visible_ns = [11, 13000, 99]
+        path = list(getattr(session, "search_path", None) or ["public"])
+        if subctx is not None and getattr(subctx, "catalog", None) is not None:
+            from secantus.sql import virtual as _virtual
+
+            schema_oid_map = _virtual._schema_oids(subctx.db, subctx.catalog)
+        else:
+            schema_oid_map = {}
+        for schema in path:
+            if schema == "public":
+                visible_ns.append(2200)
+            elif schema in schema_oid_map:
+                visible_ns.append(schema_oid_map[schema])
+        vis = exp.And(
+            this=vis,
+            expression=exp.In(
+                this=exp.column("relnamespace", table=alias or None),
+                expressions=[exp.Literal.number(o) for o in visible_ns],
+            ),
+        )
+        return _expr_to_filter(vis, resolve, subctx)
 
     if isinstance(node, exp.And):
         parts = [
@@ -1185,14 +1324,37 @@ def _expr_to_filter(
             # ``col = ANY(ARRAY[...])`` is Postgres' IN — SQLAlchemy's reflection
             # emits ``relkind = ANY(ARRAY['r','p',...])``.
             field, tag = _field(other, resolve)
-            values = [typemap.coerce(_literal(e), tag) for e in _array_elements(inner)]
+            try:
+                elements = _array_elements(inner)
+            except errors.SQLError:
+                elements = None
+            if elements is None:
+                # ``col = ANY(<expr>)`` where the operand is a function or other
+                # expression yielding an array (``ANY(current_schemas(true))`` —
+                # pgjdbc's DatabaseMetaData namespace filter): evaluate it.
+                from secantus.sql import scalar as _scalar
+
+                sub = subctx or _pipeline_subctx.get()
+                ctx = _scalar.ScalarContext(
+                    storage=getattr(sub, "storage", None),
+                    catalog=getattr(sub, "catalog", None),
+                    db=getattr(sub, "db", None) or "",
+                    session=getattr(sub, "session", None),
+                )
+                value = _scalar.evaluate(inner, _const_scope, ctx)
+                if not isinstance(value, (list, tuple)):
+                    raise errors.feature_not_supported(f"unsupported ANY operand: {inner.sql()}")
+                return {field: {"$in": [typemap.coerce(v, tag) for v in value]}}
+            values = [typemap.coerce(_literal(e), tag) for e in elements]
             return {field: {"$in": values}}
         pair = _field_literal_pair(left, right)
         if pair is not None:
             field, tag = _field(pair[0], resolve)
             if tag == "citext":
                 return _citext_cmp_filter(field, "$eq", _literal(pair[1]))
-            return {field: typemap.coerce(_literal(pair[1]), tag)}
+            value = typemap.coerce(_literal(pair[1]), tag)
+            sub = _subms_cmp(field, "$eq", value, tag)
+            return sub if sub is not None else {field: value}
         return _null_guarded_expr_cmp("$eq", left, right, resolve)
 
     if isinstance(node, exp.NEQ):
@@ -1205,7 +1367,9 @@ def _expr_to_filter(
             # SQL ``<>`` is unknown (not true) for a NULL operand; Mongo's bare
             # ``$ne`` would match NULL/missing rows, so guard the field non-null.
             value = typemap.coerce(_literal(pair[1]), tag)
-            return {"$and": [{field: {"$ne": value}}, {field: {"$ne": None}}]}
+            sub = _subms_cmp(field, "$ne", value, tag)
+            negated = sub if sub is not None else {field: {"$ne": value}}
+            return {"$and": [negated, {field: {"$ne": None}}]}
         return _null_guarded_expr_cmp("$ne", left, right, resolve)
 
     for cls, (op, flipped) in _CMP_OPS.items():
@@ -1215,12 +1379,16 @@ def _expr_to_filter(
                 field, tag = _field(left, resolve)
                 if tag == "citext":
                     return _citext_cmp_filter(field, op, _literal(right))
-                return {field: {op: typemap.coerce(_literal(right), tag)}}
+                value = typemap.coerce(_literal(right), tag)
+                sub = _subms_cmp(field, op, value, tag)
+                return sub if sub is not None else {field: {op: value}}
             if _is_field_node(right) and _is_literalish(left):
                 field, tag = _field(right, resolve)
                 if tag == "citext":
                     return _citext_cmp_filter(field, flipped, _literal(left))
-                return {field: {flipped: typemap.coerce(_literal(left), tag)}}
+                value = typemap.coerce(_literal(left), tag)
+                sub = _subms_cmp(field, flipped, value, tag)
+                return sub if sub is not None else {field: {flipped: value}}
             return _null_guarded_expr_cmp(_EXPR_CMP[cls], left, right, resolve)
 
     if isinstance(node, exp.In):
@@ -1255,6 +1423,24 @@ def _expr_to_filter(
         high = typemap.coerce(_literal(node.args["high"]), tag)
         return {field: {"$gte": low, "$lte": high}}
 
+    if isinstance(node, exp.Operator):
+        rewritten = _rewrite_explicit_operator(node)
+        if rewritten is not None:
+            return _expr_to_filter(rewritten, resolve, subctx)
+    if isinstance(node, exp.Escape) and isinstance(node.this, (exp.Like, exp.ILike)):
+        # ``LIKE <pattern> ESCAPE <char>`` — same lowering with the escape
+        # character honored in the regex translation.
+        like = node.this
+        esc = _literal(node.expression)
+        field, tag = _field(like.this, resolve)
+        pattern = _literal(like.expression)
+        spec_e: dict[str, Any] = {"$regex": _like_to_regex(str(pattern), escape=str(esc))}
+        if isinstance(like, exp.ILike) or tag == "citext":
+            spec_e["$options"] = "i"
+        if like.args.get("negate"):
+            return {field: {"$not": spec_e}}
+        return {field: spec_e}
+
     if isinstance(node, (exp.Like, exp.ILike)):
         field, tag = _field(node.this, resolve)
         pattern = _literal(node.expression)
@@ -1262,6 +1448,9 @@ def _expr_to_filter(
         # ``citext LIKE`` is case-insensitive (equivalent to ILIKE).
         if isinstance(node, exp.ILike) or tag == "citext":
             spec["$options"] = "i"
+        # sqlglot parses ``NOT LIKE`` as ``Like(negate=True)``, not Not(Like).
+        if node.args.get("negate"):
+            return {field: {"$not": spec}}
         return {field: spec}
 
     if isinstance(node, (exp.RegexpLike, exp.RegexpILike)):
@@ -1505,30 +1694,73 @@ def _where_filter(
 # ---------------------------------------------------------------------------
 
 
+def _decl_identity(datatype: exp.DataType) -> dict[str, Any]:
+    """The declared reflection identity of a column type — ``decl_oid`` when the
+    declared oid differs from the storage tag's (``varchar``/``bpchar`` fold to
+    ``text``) and the ``atttypmod`` (``varchar(52)``, ``numeric(18,5)``, …), via
+    the same ``cast_type_identity`` the cast descriptor uses. JSON's special
+    (114, -1) identity is already carried by ``json_plain``."""
+    ident = typemap.cast_type_identity(datatype)
+    if ident is None or ident == (114, -1):
+        return {}
+    oid, typmod = ident
+    return {"decl_oid": oid, "typmod": typmod}
+
+
 def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
     schema = stmt.this
     if not isinstance(schema, exp.Schema):
         raise errors.feature_not_supported("CREATE TABLE requires a column list")
-    table_name = schema.this.name
+    table_name = qualified_table_name(schema.this)
     columns: list[Column] = []
     seq_plans: list[dict[str, Any]] = []
     pk_seen = False
+    pk_table_names: list[str] = []
+    pk_name: str | None = None
     for coldef in schema.expressions:
         if isinstance(coldef, exp.PrimaryKey):
             # Table-level PRIMARY KEY (col, ...) — mark the named column(s). A
             # composite PK maps to a subdocument ``_id`` (field ``_id.<name>`` per
-            # column); a single PK maps directly to ``_id``.
-            names = [_column_name(c) for c in coldef.expressions]
-            columns = [_with_pk(c, names) for c in columns]
+            # column); a single PK maps directly to ``_id``. Applied post-loop so
+            # a PK clause written before its columns still marks them.
+            pk_table_names = [_column_name(c) for c in coldef.expressions]
             pk_seen = True
             continue
         if isinstance(coldef, exp.ForeignKey):
             # Table-level FOREIGN KEY — collected by _extract_foreign_keys below.
             continue
-        if isinstance(
-            coldef, (exp.Constraint, exp.CheckColumnConstraint, exp.UniqueColumnConstraint)
-        ):
+        if isinstance(coldef, exp.Constraint):
+            # ``CONSTRAINT <name> PRIMARY KEY (col, ...)`` — same as the bare
+            # table-level PK, plus the declared constraint name (which reflection
+            # and COMMENT ON CONSTRAINT surface instead of ``<table>_pkey``).
+            # CHECK / UNIQUE inners are collected by _extract_constraints below.
+            inner_pk = next(
+                (
+                    i
+                    for i in (coldef.args.get("expressions") or [])
+                    if isinstance(i, exp.PrimaryKey)
+                ),
+                None,
+            )
+            if inner_pk is not None:
+                pk_table_names = [_column_name(c) for c in inner_pk.expressions]
+                pk_name = coldef.this.name if coldef.this else None
+                pk_seen = True
+            continue
+        if isinstance(coldef, (exp.CheckColumnConstraint, exp.UniqueColumnConstraint)):
             # Table-level CHECK / UNIQUE — collected by _extract_constraints below.
+            continue
+        if isinstance(coldef, exp.ExcludeColumnConstraint):
+            # ``EXCLUDE (col WITH =, ...)`` — equality-only exclusion is
+            # collected by _extract_constraints; any other operator rejects
+            # there (a GiST range exclusion has no unique-index equivalent).
+            continue
+        if isinstance(coldef, exp.Anonymous) and str(coldef.this).upper() == "INDEX":
+            # crdb-style inline ``INDEX (...)`` table element (also MySQL DDL;
+            # the pgtest copy corpus creates one on an expression). The table
+            # is created without the secondary index — inline index elements
+            # are an optimization hint here, not a constraint (see
+            # tasks/backlog.md).
             continue
         if not isinstance(coldef, exp.ColumnDef):
             raise errors.feature_not_supported(f"unsupported table element: {coldef.sql()}")
@@ -1595,16 +1827,36 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
                 generated=_generated_expr(coldef),
                 # ``json`` (not ``jsonb``): same stored shape, oid 114 on the wire.
                 json_plain=(tag == "json" and coldef.args["kind"].this == exp.DataType.Type.JSON),
+                **_decl_identity(coldef.args["kind"]),
             )
         )
+    if pk_table_names:
+        columns = [_with_pk(c, pk_table_names) for c in columns]
     if not pk_seen:
         # No PK: the _id is auto-assigned by storage and not surfaced as a
         # column. Fine for the spike.
         pass
     fks = _extract_foreign_keys(schema, table_name)
+    # A SELF-referencing FK captured the target by its spelled name, which for
+    # a temp table is the bare pre-rewrite name (``references test_deferred``
+    # inside ``CREATE TEMP TABLE test_deferred`` — the target's pg_temp_<n>.
+    # rewrite happens on the create target, and the reference can't resolve
+    # through the catalog because the table doesn't exist yet). Point it at
+    # the table's own final name so enforcement finds the right relation.
+    if "." in table_name:
+        bare = table_name.split(".", 1)[1]
+        fks = [
+            dataclasses.replace(fk, ref_table=table_name) if fk.ref_table == bare else fk
+            for fk in fks
+        ]
     checks, uniques = _extract_constraints(schema, table_name)
     props = stmt.args.get("properties")
-    is_temp = bool(props) and any(isinstance(p, exp.TemporaryProperty) for p in props.expressions)
+    # A pg_temp_<n>-homed name is temp even without the TEMP keyword — CREATE
+    # TABLE pg_temp.t is a temp table in real PG (the qualifier was rewritten
+    # to the session's namespace by qualify_from_search_path).
+    is_temp = (
+        bool(props) and any(isinstance(p, exp.TemporaryProperty) for p in props.expressions)
+    ) or table_name.startswith("pg_temp_")
     table = TableDef(
         name=table_name,
         collection=table_name,
@@ -1613,6 +1865,8 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
         check_constraints=checks,
         unique_constraints=uniques,
         temp=is_temp,
+        pk_name=pk_name,
+        pk_column_order=tuple(pk_table_names) if pk_table_names else None,
     )
     return CreateTablePlan(
         table=table, if_not_exists=bool(stmt.args.get("exists")), sequences=seq_plans
@@ -1625,9 +1879,9 @@ def _ref_target(ref: exp.Reference) -> tuple[str, tuple[str, ...]]:
     and resolved to ``_id`` by reflection."""
     schema = ref.this  # exp.Schema or exp.Table
     if isinstance(schema, exp.Schema):
-        return schema.this.name, tuple(_column_name(c) for c in schema.expressions)
+        return qualified_table_name(schema.this), tuple(_column_name(c) for c in schema.expressions)
     if isinstance(schema, exp.Table):
-        return schema.name, ()
+        return qualified_table_name(schema), ()
     raise errors.feature_not_supported(f"unsupported REFERENCES target: {ref.sql()}")
 
 
@@ -1662,7 +1916,8 @@ def _make_fk(
     deferrable, initially_deferred = _deferrable_flags(ref.args.get("options"))
     # Postgres' default constraint name: <table>_<firstcol>_fkey (an explicit
     # ``CONSTRAINT <name>`` wins when supplied, e.g. from ALTER TABLE ADD).
-    con_name = name or (f"{table_name}_{cols[0]}_fkey" if cols else f"{table_name}_fkey")
+    bare = table_name.split(".", 1)[1] if "." in table_name else table_name
+    con_name = name or (f"{bare}_{cols[0]}_fkey" if cols else f"{bare}_fkey")
     return ForeignKey(
         name=con_name,
         columns=cols,
@@ -1779,7 +2034,34 @@ def _extract_constraints(
             checks.append(make_check_constraint(coldef, table_name, None))
         elif isinstance(coldef, exp.UniqueColumnConstraint):  # table-level unnamed UNIQUE (...)
             uniques.append(make_unique_constraint(coldef, table_name, None))
+        elif isinstance(coldef, exp.ExcludeColumnConstraint):
+            uniques.append(_make_exclusion_constraint(coldef, table_name))
     return checks, uniques
+
+
+def _make_exclusion_constraint(
+    coldef: exp.ExcludeColumnConstraint, table_name: str
+) -> UniqueConstraint:
+    """``EXCLUDE (col WITH =, ...)`` — the equality-only form is unique
+    enforcement with PG's exclusion identity: violation 23P01, default name
+    ``<table>_<col>_excl``. Any non-``=`` operator (a real GiST range
+    exclusion) stays unsupported."""
+    params = coldef.this
+    cols: list[str] = []
+    for item in params.args.get("columns") or []:
+        target = item.this if isinstance(item, exp.WithOperator) else item
+        op = item.args.get("op") if isinstance(item, exp.WithOperator) else None
+        op_text = (op.name if op is not None else "=").strip()
+        if op_text != "=":
+            raise errors.feature_not_supported(
+                f"EXCLUDE with operator {op_text} is not supported (equality only)"
+            )
+        if isinstance(target, exp.Ordered):
+            target = target.this
+        cols.append(_column_name(target))
+    bare = table_name.split(".", 1)[1] if "." in table_name else table_name
+    name = f"{bare}_{'_'.join(cols)}_excl"
+    return UniqueConstraint(name=name, columns=tuple(cols), exclusion=True)
 
 
 def _with_pk(col: Column, pk_names: list[str]) -> Column:
@@ -1793,7 +2075,9 @@ def _with_pk(col: Column, pk_names: list[str]) -> Column:
 
 
 def plan_drop_table(stmt: exp.Drop) -> DropTablePlan:
-    return DropTablePlan(name=stmt.this.name, if_exists=bool(stmt.args.get("exists")))
+    return DropTablePlan(
+        name=qualified_table_name(stmt.this), if_exists=bool(stmt.args.get("exists"))
+    )
 
 
 def plan_alter_table(stmt: exp.Alter) -> AlterTablePlan:
@@ -1872,6 +2156,7 @@ def plan_create_index(stmt: exp.Create, table: TableDef) -> CreateIndexPlan:
     partial_filter = (
         _expr_to_filter(where.this, table_resolver(table), None) if where is not None else None
     )
+    include = [_column_name(c) for c in (params.args.get("include") or [])]
     return CreateIndexPlan(
         collection=table.collection,
         name=index_name,
@@ -1879,6 +2164,7 @@ def plan_create_index(stmt: exp.Create, table: TableDef) -> CreateIndexPlan:
         unique=bool(stmt.args.get("unique")),
         if_not_exists=bool(stmt.args.get("exists")),
         partial_filter=partial_filter,
+        include=include,
     )
 
 
@@ -1904,6 +2190,24 @@ def _is_default_cell(cell: exp.Expression) -> bool:
     """A ``DEFAULT`` keyword in a VALUES tuple (sqlglot parses it as
     ``Var('DEFAULT')``)."""
     return isinstance(cell, exp.Var) and cell.name.upper() == "DEFAULT"
+
+
+def _insert_cell_value(cell: exp.Expression, subctx: Any = None) -> Any:
+    """A VALUES cell: a plain literal, else any constant expression PG allows
+    there (``nextval('seq')``, arithmetic, casts …) evaluated by the scalar
+    engine — with the real storage in scope when the dispatcher provides it."""
+    try:
+        return _literal(cell)
+    except errors.SQLError:
+        from secantus.sql import scalar
+
+        ctx = scalar.ScalarContext(
+            storage=getattr(subctx, "storage", None),
+            catalog=getattr(subctx, "catalog", None),
+            db=getattr(subctx, "db", None) or "",
+            session=getattr(subctx, "session", None),
+        )
+        return scalar.evaluate(cell, _const_scope, ctx)
 
 
 def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) -> dict[str, Any]:
@@ -1935,12 +2239,18 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
                 f"generated column",
             )
         if raw is None and not col.nullable:
-            raise errors.not_null_violation(name)
+            raise errors.not_null_violation(name, table.name)
         if col.composite_type is not None and raw is not None:
             value = _composite_value(raw, col)
         else:
             value = typemap.coerce(raw, col.type_tag)
-        _set_doc_field(doc, col.field, value)
+            # A declared char(n) / varchar(n) width is enforced, not ignored —
+            # storing an over-length value would violate the column's own
+            # schema. Trailing-blank overflow trims, like Postgres.
+            value = typemap.enforce_declared_length(
+                value, getattr(col, "decl_oid", None), getattr(col, "typmod", -1), col.name
+            )
+        _set_doc_field(doc, col.field, value, col.type_tag)
         provided.add(name)
     # An omitted column takes its DEFAULT if it has one; otherwise a NOT NULL
     # omission is a violation. A sequence-backed column (SERIAL / DEFAULT
@@ -1951,15 +2261,15 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
         if col.sequence is not None or col.generated is not None:
             continue  # filled by the executor (sequence draw / computed expr)
         if col.has_default:
-            _set_doc_field(doc, col.field, typemap.coerce(col.default, col.type_tag))
+            _set_doc_field(doc, col.field, typemap.coerce(col.default, col.type_tag), col.type_tag)
         elif col.default_expr is not None:
             from secantus.sql import scalar
 
             ctx = scalar.ScalarContext(storage=None, catalog=None, db="", session=None)
             val = scalar.evaluate(_parse_default_expr(col.default_expr), _default_col_scope, ctx)
-            _set_doc_field(doc, col.field, typemap.coerce(val, col.type_tag))
+            _set_doc_field(doc, col.field, typemap.coerce(val, col.type_tag), col.type_tag)
         elif not col.nullable:
-            raise errors.not_null_violation(col.name)
+            raise errors.not_null_violation(col.name, table.name)
     _canonicalize_composite_id(doc, table)
     return doc
 
@@ -2009,10 +2319,17 @@ def _build_composite(raw: Any, fields: Any, type_name: str) -> dict[str, Any]:
     return out
 
 
-def _set_doc_field(doc: dict[str, Any], field: str, value: Any) -> None:
+def _set_doc_field(doc: dict[str, Any], field: str, value: Any, tag: str | None = None) -> None:
     """Assign a column's value to its storage field. A composite-PK column has a
     dotted field (``_id.<name>``) that builds a subdocument ``_id``; a plain field
-    is a direct key."""
+    is a direct key.
+
+    A ``timestamp`` value carries microseconds a BSON date cannot hold, so its
+    sub-millisecond remainder is split off into a hidden companion field — see
+    `secantus.sql.subms`, and note the invariant there: the companion is
+    resolved on EVERY write, never left stale."""
+    if tag in subms.SUBMS_TAGS and "." not in field:
+        value = subms.carry_subms(doc, field, value)
     if "." in field:
         set_path(doc, field, value)
     else:
@@ -2037,27 +2354,37 @@ def copy_row_doc(col_names: list[str], values: list[Any], table: TableDef) -> di
     return _insert_doc(col_names, values, table)
 
 
-def plan_insert(stmt: exp.Insert, table: TableDef) -> InsertPlan:
+def plan_insert(stmt: exp.Insert, table: TableDef, subctx: Any = None) -> InsertPlan:
     col_names = insert_target_columns(stmt, table)
     values = stmt.expression
+    if values is None and stmt.args.get("default"):
+        # ``INSERT INTO t DEFAULT VALUES`` — one row, every column defaulted:
+        # equivalent to an empty column list with one empty tuple.
+        values = exp.Values(expressions=[exp.Tuple(expressions=[])])
+        col_names = []
     if not isinstance(values, exp.Values):
         raise errors.feature_not_supported("INSERT requires a VALUES clause")
+    explicit_cols = isinstance(stmt.this, exp.Schema)
     docs: list[dict[str, Any]] = []
     for tup in values.expressions:
         cells = tup.expressions
-        if len(cells) != len(col_names):
-            raise errors.syntax_error(
-                f"INSERT has {len(cells)} values but {len(col_names)} columns"
-            )
+        if len(cells) > len(col_names):
+            raise errors.syntax_error("INSERT has more expressions than target columns")
+        if len(cells) < len(col_names) and explicit_cols:
+            raise errors.syntax_error("INSERT has more target columns than expressions")
+        # Without an explicit column list, Postgres lets a shorter row fill a
+        # PREFIX of the table's columns — the rest take their DEFAULT / NULL
+        # (pgjdbc's rewritten batch inserts and TimeTest lean on this).
+        row_col_names = col_names[: len(cells)]
         # A ``DEFAULT`` keyword cell is treated as an omitted column, so the
         # column's DEFAULT / sequence applies (and an identity ALWAYS column
         # accepts DEFAULT while rejecting a real value).
         row_cols, row_vals = [], []
-        for name, cell in zip(col_names, cells, strict=True):
+        for name, cell in zip(row_col_names, cells, strict=True):
             if _is_default_cell(cell):
                 continue
             row_cols.append(name)
-            row_vals.append(_literal(cell))
+            row_vals.append(_insert_cell_value(cell, subctx))
         docs.append(_insert_doc(row_cols, row_vals, table))
     return InsertPlan(
         table=table,
@@ -2094,7 +2421,7 @@ def _fields_for_constraint(name: str, table: TableDef) -> list[str]:
     for uq in table.unique_constraints:
         if uq.name == name:
             return [table.field_for(col) for col in uq.columns]
-    if table.pk_columns and name == f"{table.name}_pkey":
+    if table.pk_columns and name in (table.pk_constraint_name(), f"{table.name}_pkey"):
         return [c.field for c in table.pk_columns]
     raise errors.SQLError("42704", f'constraint "{name}" for table "{table.name}" does not exist')
 
@@ -2266,6 +2593,30 @@ def _column_for_order_node(
     return None
 
 
+def _source_table_attnum(
+    node: exp.Expression, amap: dict[str, tuple[str, TableDef]]
+) -> tuple[TableDef, int] | None:
+    """Resolve a bare column to its ``(TableDef, 1-based attnum)`` across a join's
+    alias map, mirroring `_column_for_order_node`'s qualified-then-unqualified
+    lookup so provenance names the same table the value came from. None when the
+    term isn't a bare column of one of the joined tables."""
+    if not isinstance(node, exp.Column):
+        return None
+    name = node.name
+    if node.table:
+        entry = amap.get(node.table)
+        if entry is None:
+            return None
+        tdefs = [entry[1]]
+    else:
+        tdefs = [tdef for _alias, (_role, tdef) in amap.items()]
+    for tdef in tdefs:
+        for i, c in enumerate(tdef.columns, start=1):
+            if c.name == name:
+                return tdef, i
+    return None
+
+
 def _emit_pipeline_sort(
     pipeline: list[dict[str, Any]],
     terms: list[tuple[str, int, bool]],
@@ -2309,9 +2660,32 @@ def _emit_pipeline_sort(
 def _limit_skip(stmt: exp.Expression) -> tuple[int, int]:
     limit_node = stmt.args.get("limit")
     offset_node = stmt.args.get("offset")
-    limit = int(_literal(limit_node.expression)) if limit_node is not None else 0
-    skip = int(_literal(offset_node.expression)) if offset_node is not None else 0
+    limit = _const_int(limit_node.expression) if limit_node is not None else 0
+    skip = _const_int(offset_node.expression) if offset_node is not None else 0
     return limit, skip
+
+
+def _const_int(node: exp.Expression) -> int:
+    """An integer LIMIT / OFFSET operand. PG accepts any constant expression
+    there (``OFFSET 1 + 1``, ``LIMIT $1::INTEGER``); fall back to the scalar
+    evaluator for anything ``_literal`` can't fold."""
+    try:
+        value = _literal(node)
+    except errors.SQLError:
+        from secantus.sql import scalar
+
+        value = scalar.evaluate(
+            node,
+            _const_scope,
+            scalar.ScalarContext(storage=None, catalog=None, db="", session=None),
+        )
+    if value is None:
+        raise errors.feature_not_supported(f"non-constant LIMIT/OFFSET: {node.sql()}")
+    return int(_unwrap_num(value))
+
+
+def _unwrap_num(value: Any) -> Any:
+    return int(value) if isinstance(value, _Decimal) else value
 
 
 def _infer_value_tag(value: Any) -> str:
@@ -2355,16 +2729,33 @@ def _const_scope(node: exp.Expression) -> Any:
 _SINGLE_ROW_AGGS = (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)
 
 
-def _fold_single_row_aggregates(node: exp.Expression, ctx: Any) -> exp.Expression:
+def _fold_single_row_aggregates(node: exp.Expression, ctx: Any, rows: int = 1) -> exp.Expression:
     """Fold aggregates in a FROM-less SELECT to constants.
 
     Postgres feeds a FROM-less aggregation exactly one implicit row, so
     ``COUNT(*)`` is 1, ``COUNT(e)`` is 0/1 by ``e``'s NULL-ness, and
-    ``SUM`` / ``AVG`` / ``MIN`` / ``MAX`` of ``e`` are ``e`` itself."""
+    ``SUM`` / ``AVG`` / ``MIN`` / ``MAX`` of ``e`` are ``e`` itself.
+
+    ``rows=0`` folds over an EMPTY input — the case where a WHERE excludes the
+    implicit row (``SELECT count(*) WHERE 1=2``). An ungrouped aggregate still
+    produces exactly one output row, with ``COUNT`` 0 and the others NULL.
+
+    Aggregates inside a nested SELECT are left alone: that subquery has its own
+    row source, so folding it against the outer implicit row is simply wrong —
+    ``SELECT (SELECT count(*) FROM t)`` answered 1 for any ``t``, and
+    ``SELECT (SELECT max(a) FROM t)`` raised ``column "a" does not exist``."""
     from secantus.sql import scalar
 
+    node = node.copy()
+    nested_aggs = {
+        id(agg)
+        for sub in node.find_all(exp.Select, exp.Subquery)
+        if sub is not node
+        for agg in sub.find_all(_SINGLE_ROW_AGGS)
+    }
+
     def fold(n: exp.Expression) -> exp.Expression:
-        if not isinstance(n, _SINGLE_ROW_AGGS):
+        if not isinstance(n, _SINGLE_ROW_AGGS) or id(n) in nested_aggs:
             return n
         arg = n.this
         if isinstance(arg, exp.Distinct):
@@ -2372,12 +2763,26 @@ def _fold_single_row_aggregates(node: exp.Expression, ctx: Any) -> exp.Expressio
                 raise errors.feature_not_supported(f"unsupported aggregate: {n.sql()}")
             arg = arg.expressions[0]
         if isinstance(n, exp.Count):
+            if rows == 0:
+                return exp.Literal.number(0)
             if arg is None or isinstance(arg, exp.Star):
                 return exp.Literal.number(1)
             return exp.Literal.number(0 if scalar.evaluate(arg, _const_scope, ctx) is None else 1)
+        if rows == 0:
+            return exp.Null()
         return _value_to_node(scalar.evaluate(arg, _const_scope, ctx))
 
-    return node.transform(fold)
+    return node.transform(fold, copy=False)
+
+
+def _select_has_aggregate(stmt: exp.Select) -> bool:
+    """Whether a FROM-less SELECT's projections contain an aggregate — such a
+    statement yields exactly one row even when its WHERE is false."""
+    for e in stmt.expressions:
+        target = e.this if isinstance(e, exp.Alias) else e
+        if target.find(exp.AggFunc) is not None:
+            return True
+    return False
 
 
 _SEQUENCE_FUNCS = frozenset({"nextval", "currval", "setval", "lastval"})
@@ -2388,6 +2793,75 @@ def _is_sequence_func(node: exp.Expression) -> bool:
         isinstance(node, (exp.Anonymous, exp.Func))
         and str(getattr(node, "this", node.sql_name())).lower() in _SEQUENCE_FUNCS
     )
+
+
+_CAST_TYPNAME_BY_OID = {
+    1042: "bpchar",
+    1043: "varchar",
+    1560: "bit",
+    1562: "varbit",
+    1700: "numeric",
+    1083: "time",
+    1114: "timestamp",
+    1184: "timestamptz",
+    1186: "interval",
+    1266: "timetz",
+    114: "json",
+}
+
+
+def _cast_output_name(target: exp.Expression) -> str | None:
+    """PG names an unaliased top-level cast's output column after the target
+    type's ``typname`` — ``SELECT 2::int8`` yields a column named ``int8``,
+    ``'x'::varchar`` yields ``varchar`` — and constructor keywords after
+    themselves (``ARRAY[…]`` → ``array``, ``ROW(…)`` → ``row``; pgtest float
+    corpus). None when the ``?column?`` fallback stands."""
+    if isinstance(target, exp.Array):
+        return "array"
+    if isinstance(target, exp.Anonymous):
+        if str(target.this).upper() == "ROW":
+            return "row"
+        # PG names an unaliased function-call column after the function
+        # (``SELECT jsonb_path_query(…)`` → column ``jsonb_path_query``).
+        return str(target.this).rsplit(".", 1)[-1].lower() or None
+    if not isinstance(target, exp.Cast) or target.to is None:
+        return None
+    # PG's FigureColname recurses into the cast's OPERAND first: a name the
+    # operand supplies wins over the type name, so ``n::int4`` is ``n`` and
+    # ``f()::int`` is ``f`` — only a nameless operand (a literal, an
+    # expression) falls back to the typname (pgtest parameter_description).
+    inner = target.this
+    while isinstance(inner, exp.Paren):
+        inner = inner.this
+    if isinstance(inner, exp.Column):
+        return inner.name or None
+    if isinstance(inner, (exp.Cast, exp.Array, exp.Anonymous)):
+        nested = _cast_output_name(inner)
+        if nested is not None:
+            return nested
+    ident = typemap.cast_type_identity(target.to)
+    if ident is not None and ident[0] in _CAST_TYPNAME_BY_OID:
+        return _CAST_TYPNAME_BY_OID[ident[0]]
+    if target.to.this == exp.DataType.Type.USERDEFINED:
+        # PG names an unaliased cast to a user-defined type (enum, composite,
+        # domain) after the TYPE name — ``SELECT 'hi'::te`` yields a column
+        # named ``te`` (pgtest enum corpus).
+        kind = target.to.args.get("kind")
+        if kind is not None:
+            name = str(getattr(kind, "this", kind)).strip('"').lower()
+            # The quoted-"char" cast rewrites to the pg_char_1 sentinel
+            # pre-parse; its typname is the bare word (oid 18).
+            return "char" if name == "pg_char_1" else name
+    tag = typemap.type_tag_for_sql(target.to)
+    if tag is None:
+        return None
+    if tag == "char1":
+        return "char"  # pg_type.typname for oid 18 is the bare word
+    if tag.endswith("[]"):
+        # PG names an array-cast column after the ELEMENT typname:
+        # ``'{a}'::text[]`` yields a column named ``text``.
+        return tag[:-2]
+    return tag
 
 
 def plan_constant_select(
@@ -2411,7 +2885,14 @@ def plan_constant_select(
         raise errors.feature_not_supported("FROM-less SELECT supports only constant projections")
     ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
     where = stmt.args.get("where")
-    emit = where is None or scalar._truthy(scalar.evaluate(where.this, _const_scope, ctx))
+    passes = where is None or scalar._truthy(scalar.evaluate(where.this, _const_scope, ctx))
+    # An ungrouped aggregate always produces exactly one row, even when the
+    # WHERE excludes the implicit input row — ``SELECT count(*) WHERE 1=2`` is
+    # 0, not "no rows" (and ``SELECT 0/count(*) WHERE 1=2`` therefore divides
+    # by zero, which is how pgjdbc's batch tests inject a runtime failure).
+    aggregated = _select_has_aggregate(stmt)
+    emit = passes or aggregated
+    agg_rows = 1 if passes else 0
     columns: list[tuple[str, str, Any]] = []
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
@@ -2419,12 +2900,18 @@ def plan_constant_select(
         if target.find(exp.AggFunc) is not None:
             if alias is None and isinstance(target, _SINGLE_ROW_AGGS):
                 alias = target.key  # Postgres names a bare aggregate output "count" etc.
-            target = _fold_single_row_aggregates(target.copy(), ctx)
+            target = _fold_single_row_aggregates(target.copy(), ctx, rows=agg_rows)
         if isinstance(target, _LITERAL_NODES) and _is_pure_literal(target):
             value = _literal(target)
             # Tag from the AST, not the Python value — a decimal constant
             # (``SELECT 1.5``) is numeric in Postgres, which the float can't show.
-            columns.append((alias or "?column?", _infer_scalar_tag(target, _const_scope), value))
+            columns.append(
+                (
+                    alias or _cast_output_name(target) or "?column?",
+                    _infer_scalar_tag(target, _const_scope),
+                    value,
+                )
+            )
         elif _is_sequence_func(target):
             # nextval / currval / setval / lastval need storage + session state,
             # so they go through the scalar evaluator (not the storage-free
@@ -2449,11 +2936,21 @@ def plan_constant_select(
                 # range type's constructor) — the full scalar evaluator decides.
                 value = scalar.evaluate(target, _const_scope, ctx)
                 columns.append(
-                    (alias or "?column?", _infer_scalar_tag(target, _const_scope), value)
+                    (
+                        alias or _cast_output_name(target) or "?column?",
+                        _infer_scalar_tag(target, _const_scope),
+                        value,
+                    )
                 )
         else:
             value = scalar.evaluate(target, _const_scope, ctx)
-            columns.append((alias or "?column?", _infer_scalar_tag(target, _const_scope), value))
+            columns.append(
+                (
+                    alias or _cast_output_name(target) or "?column?",
+                    _infer_scalar_tag(target, _const_scope),
+                    value,
+                )
+            )
     pg_oids: list[int | None] = [None] * len(columns)
     typmods: list[int] = [-1] * len(columns)
     for i, e in enumerate(stmt.expressions):
@@ -2761,12 +3258,55 @@ def _returning_columns(
             )
         else:
             # A computed expression — evaluated per returned row (field unused).
-            out_name = alias or "?column?"
+            out_name = alias or _cast_output_name(target) or "?column?"
             tag = _infer_scalar_tag(target, resolve)
             items.append(
                 (out_name, Column(out_name, tag, out_name, pk=False, nullable=True), target)
             )
     return items
+
+
+def _where_has_text_cast_comparison(node: exp.Expression, table: TableDef | None = None) -> bool:
+    """Whether the WHERE compares a COLUMN cast to text against something.
+
+    The pushdown compares the stored value and does not apply the cast, so
+    `WHERE n::text = '2'` lowered to a filter on the raw int and matched
+    NOTHING (Postgres returns the row). The scalar evaluator does apply it
+    (`scalar._eval_cast` renders numbers, decimals, Decimal128 and booleans with
+    Postgres' spellings), so routing these to per-row evaluation is correct; the
+    cost is losing index pushdown for a predicate that could not have used it
+    correctly anyway.
+
+    Deliberately narrow, because per-row evaluation is a whole different
+    execution path:
+
+    * the cast operand must be a COLUMN. A cast on a LITERAL needs nothing — the
+      value is already text — and claiming those broke SQLAlchemy's reflection,
+      which filters with `relkind = ANY(ARRAY[CAST('v' AS VARCHAR)])`;
+    * a column that is ALREADY text is skipped too: casting text to text cannot
+      change the comparison, so there is nothing to fix and no reason to pay for
+      the slower path.
+    """
+    for cmp_node in node.find_all(exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE):
+        for side in (cmp_node.this, cmp_node.expression):
+            inner = side
+            while isinstance(inner, exp.Paren):
+                inner = inner.this
+            if not isinstance(inner, exp.Cast):
+                continue
+            if typemap.type_tag_for_sql(inner.to) != "text":
+                continue
+            operand = inner.this
+            while isinstance(operand, exp.Paren):
+                operand = operand.this
+            if not isinstance(operand, exp.Column):
+                continue
+            if table is not None:
+                col = table.column(_column_name(operand))
+                if col is not None and col.type_tag == "text":
+                    continue
+            return True
+    return False
 
 
 def where_needs_per_row(
@@ -2790,6 +3330,8 @@ def where_needs_per_row(
     if catalog is not None and _where_has_udf(node, catalog, db):
         return True
     if table is not None and _where_has_range_predicate(node, table):
+        return True
+    if _where_has_text_cast_comparison(node, table):
         return True
     if table is not None and _where_has_net_predicate(node, table):
         return True
@@ -3100,6 +3642,8 @@ def _composite_subfield_target(target: exp.Expression, table: TableDef):
 
 def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
     set_doc: dict[str, Any] = {}
+    # Companion fields to remove — see the invariant in `secantus.sql.subms`.
+    unset_fields: list[str] = []
     rekey = False
     computed: list[tuple[str, str, Any]] = []
     for assign in stmt.expressions:
@@ -3150,15 +3694,34 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
             computed.append((col.field, col.type_tag, assign.expression))
             continue
         if raw is None and not col.nullable:
-            raise errors.not_null_violation(col_name)
+            raise errors.not_null_violation(col_name, table.name)
         if col.composite_type is not None and raw is not None:
             set_doc[col.field] = _composite_value(raw, col)
+        elif col.decl_oid in (typemap.BPCHAR_OID, typemap.VARCHAR_OID):
+            set_doc[col.field] = typemap.enforce_declared_length(
+                typemap.coerce(raw, col.type_tag), col.decl_oid, col.typmod, col.name
+            )
+        elif col.type_tag in subms.SUBMS_TAGS:
+            stored, companion, remainder = subms.subms_update_ops(
+                col.field, typemap.coerce(raw, col.type_tag)
+            )
+            set_doc[col.field] = stored
+            if remainder is not None:
+                set_doc[companion] = remainder
+            else:
+                # No remainder: the companion must GO, or the row keeps the
+                # microseconds of whatever it held before this update.
+                unset_fields.append(companion)
         else:
             set_doc[col.field] = typemap.coerce(raw, col.type_tag)
     return UpdatePlan(
         table=table,
         filter=_where_filter(stmt, table),
-        update={"$set": set_doc},
+        update=(
+            {"$set": set_doc, "$unset": {f: "" for f in unset_fields}}
+            if unset_fields
+            else {"$set": set_doc}
+        ),
         returning=_returning_columns(stmt, table),
         rekey=rekey,
         computed=computed,
@@ -3297,6 +3860,15 @@ def _value_to_node(value: Any) -> exp.Expression:
     return exp.Literal.string(str(value))
 
 
+#: Sentinel for a NULL bound with declared type VOID (oid 2278). pgjdbc's
+#: CallableStatement passes a function's OUT placeholder as a real argument
+#: bound as ``NULL::void`` (``select * from f($1,$2)`` for ``{?= call f(?)}``)
+#: — PostgreSQL's function resolution drops void arguments for exactly this
+#: convention, and so do we: the placeholder is removed from the call's
+#: argument list at substitution time.
+VOID_BIND = object()
+
+
 def substitute_parameters(stmt: exp.Expression, values: list[Any]) -> exp.Expression:
     """Replace ``$1`` / ``$2`` ... placeholders with bound literal nodes.
 
@@ -3305,14 +3877,49 @@ def substitute_parameters(stmt: exp.Expression, values: list[Any]) -> exp.Expres
     type, so a text ``"5"`` bound into an ``int8`` column lands as ``Int64(5)``.
     """
     stmt = stmt.copy()
-    for param in list(stmt.find_all(exp.Parameter)):
+    bound: list[tuple[exp.Parameter, exp.Expression]] = []
+    for param in stmt.find_all(exp.Parameter):
         try:
             idx = int(param.name) - 1
         except (TypeError, ValueError) as exc:
             raise errors.syntax_error(f"invalid bind parameter ${param.name}") from exc
         if idx < 0 or idx >= len(values):
             raise errors.syntax_error(f"bind parameter ${param.name} has no value")
-        param.replace(_value_to_node(values[idx]))
+        if values[idx] is VOID_BIND:
+            parent = param.parent
+            if isinstance(parent, (exp.Anonymous, exp.Func)) and param in (
+                parent.expressions or []
+            ):
+                param.pop()  # PG drops void args from the call (JDBC OUT slot)
+                continue
+            bound.append((param, exp.Null()))
+            continue
+        bound.append((param, _value_to_node(values[idx])))
+    # Swap each placeholder for its bound literal. Replacing them one at a time
+    # through ``Expression.replace`` is quadratic — sqlglot re-parents *every*
+    # sibling in the argument list on each call — so a statement binding many
+    # parameters under one node (pgjdbc's rewritten batch INSERT binds tens of
+    # thousands) spends O(N**2) here. Collect the swaps per argument list and
+    # apply each list once instead.
+    edits: dict[tuple[int, str], tuple[exp.Expression, str, list]] = {}
+    for param, node in bound:
+        parent = param.parent
+        container = parent.args.get(param.arg_key) if parent is not None else None
+        if parent is None:
+            stmt = node  # the whole statement was a bare ``$1``
+            continue
+        if not isinstance(container, list) or param.index is None:
+            param.replace(node)  # a scalar argument slot — already O(1)
+            continue
+        key = (id(parent), param.arg_key)
+        entry = edits.get(key)
+        if entry is None:
+            # Not ``setdefault``: it would evaluate the list copy on every
+            # parameter, reintroducing the quadratic cost this avoids.
+            entry = edits[key] = (parent, param.arg_key, container[:])
+        entry[2][param.index] = node
+    for parent, arg_key, new_list in edits.values():
+        parent.set(arg_key, new_list)
     # A statement sqlglot keeps as a raw Command (``DECLARE c CURSOR FOR
     # SELECT $1::text``) carries its ``$N`` placeholders inside the tail
     # *text*, invisible to find_all — substitute them textually with rendered
@@ -3341,6 +3948,15 @@ def parameter_count(stmt: exp.Expression) -> int:
             indices.append(int(param.name))
         except (TypeError, ValueError):
             continue
+    # ``CALL proc($1)`` is kept as a raw Command; its ``$N`` placeholders live in
+    # the tail text, invisible to ``find_all`` — scan them so the extended
+    # protocol binds the parameter. Restricted to CALL: other Command tails
+    # (``PREPARE … AS SELECT $1``) carry ``$N`` that belong to an EMBEDDED query,
+    # not to the command's own bind parameters.
+    if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "CALL":
+        tail = stmt.args.get("expression")
+        if isinstance(tail, exp.Literal):
+            indices += [int(n) for n in re.findall(r"\$(\d+)", str(tail.this))]
     return max(indices, default=0)
 
 
@@ -3351,12 +3967,57 @@ _COMPARISON_NODES = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)
 _VARIADIC_ANY_FUNCS = frozenset({"concat", "concat_ws", "format"})
 
 
-def indeterminate_parameter(stmt: exp.Expression | None, oids: list[int]) -> int | None:
-    """The 1-based index of an untyped parameter passed directly to a VARIADIC
-    "any" function (``concat($1, $2)`` with no declared type), or None. Real
-    Postgres rejects the Parse with 42P18."""
+def parameter_numbering_gap(stmt: exp.Expression | None) -> int | None:
+    """The lowest parameter number a statement SKIPS (``SELECT $2 > 0`` never
+    mentions ``$1``), or None. Nothing can type the missing one, so PG rejects
+    the Parse with 42P18 (pgtest parameter_description).
+
+    Must run on the RAW parsed statement: later rewrites (``pg_typeof($1)``
+    folds its argument to a type name) remove parameters from the AST and
+    would look like a gap.
+    """
     if stmt is None:
         return None
+    used: set[int] = set()
+    for param in stmt.find_all(exp.Parameter):
+        try:
+            used.add(int(param.name))
+        except (TypeError, ValueError):
+            continue
+    if not used:
+        return None
+    missing = [n for n in range(1, max(used)) if n not in used]
+    return missing[0] if missing else None
+
+
+def indeterminate_parameter(stmt: exp.Expression | None, oids: list[int]) -> int | None:
+    """The 1-based index of a parameter PG cannot type at Parse, or None.
+
+    Two cases, both 42P18 in real Postgres: an untyped parameter passed
+    directly to a VARIADIC "any" function (``concat($1, $2)``), and a GAP in
+    the parameter numbering — ``SELECT $2 > 0`` never mentions ``$1``, so
+    nothing can type it (pgtest parameter_description)."""
+    if stmt is None:
+        return None
+    # A bare parameter as a CASE result with NO typed sibling branch has no
+    # type context at all — PG can't resolve the CASE's type (pgtest
+    # parameter_description). A CASE with another concrete branch resolves
+    # from that branch, so those are left alone.
+    for case in stmt.find_all(exp.Case):
+        results = [i.args.get("true") for i in case.args.get("ifs") or []]
+        if case.args.get("default") is not None:
+            results.append(case.args["default"])
+        results = [r for r in results if r is not None]
+        params = [r for r in results if isinstance(r, exp.Parameter)]
+        if not params or len(params) != len(results):
+            continue  # no bare-parameter result, or a typed sibling resolves it
+        for r in params:
+            try:
+                idx = int(r.name)
+            except (TypeError, ValueError):
+                continue
+            if idx >= 1 and (idx > len(oids) or not oids[idx - 1]):
+                return idx
     calls: list[exp.Expression] = [
         c for c in stmt.find_all(exp.Anonymous) if str(c.this).lower() in _VARIADIC_ANY_FUNCS
     ]
@@ -3370,6 +4031,78 @@ def indeterminate_parameter(stmt: exp.Expression | None, oids: list[int]) -> int
                     continue
                 if idx >= 1 and (idx > len(oids) or not oids[idx - 1]):
                     return idx
+    return None
+
+
+#: Text-only functions: PG has no numeric/date overload, so a parameter whose
+#: type another use already pinned to a non-text type makes the call resolve to
+#: nothing — 42883 undefined_function.
+_TEXT_ONLY_FUNC_NODES = (exp.Lower, exp.Upper, exp.Trim, exp.Length, exp.Initcap)
+#: Non-text parameter oids that cannot feed a text-only function.
+_NON_TEXT_PARAM_OIDS = frozenset({16, 17, 20, 21, 23, 26, 700, 701, 1082, 1083, 1114, 1184, 1700})
+_OID_PG_NAME = {
+    16: "boolean",
+    17: "bytea",
+    20: "bigint",
+    21: "smallint",
+    23: "integer",
+    26: "oid",
+    700: "real",
+    701: "double precision",
+    1082: "date",
+    1083: "time",
+    1114: "timestamp",
+    1184: "timestamp with time zone",
+    1700: "numeric",
+}
+
+
+def _column_param_oid(cname: str, stmt: exp.Expression, catalog: Any, db: str) -> int | None:
+    """The parameter oid PG assigns from a comparison/assignment against column
+    ``cname`` in ``stmt``'s tables, or None. ``"char"`` (oid 18) deliberately
+    yields None: the pgtest char corpus pins such a parameter at text."""
+    for tbl in stmt.find_all(exp.Table):
+        t = catalog.get(db, tbl.name)
+        col = t.column(cname) if t is not None else None
+        if col is None:
+            continue
+        tag = col.type_tag
+        if tag == "char1":
+            return None
+        if getattr(col, "json_plain", False):
+            return 114
+        oid = typemap.PG_OID.get(tag)
+        if oid is None and typemap.is_array_tag(tag):
+            oid = typemap._ARRAY_PG_OID.get(typemap.array_element_tag(tag))
+        return oid
+    return None
+
+
+def conflicting_parameter_use(
+    stmt: exp.Expression | None, oids: list[int]
+) -> tuple[str, str] | None:
+    """``(function, type_name)`` when a parameter whose type is already pinned
+    to a non-text type is passed to a text-only function, else None.
+
+    PG gives each parameter ONE type, so ``select lower($1) … $1::int`` can't
+    resolve ``lower(integer)`` and fails 42883 (pgtest
+    parameter_description). We only flag types something else PINNED — an
+    untyped parameter still defaults to text and resolves fine."""
+    if stmt is None:
+        return None
+    for call in stmt.find_all(*_TEXT_ONLY_FUNC_NODES):
+        arg = call.this
+        while isinstance(arg, exp.Paren):
+            arg = arg.this
+        if not isinstance(arg, exp.Parameter):
+            continue
+        try:
+            idx = int(arg.name) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < len(oids) and oids[idx] in _NON_TEXT_PARAM_OIDS:
+            fname = type(call).__name__.lower()
+            return (fname, _OID_PG_NAME.get(oids[idx], str(oids[idx])))
     return None
 
 
@@ -3390,7 +4123,11 @@ def infer_parameter_types(
     if stmt is None:
         return declared
     count = parameter_count(stmt)
-    oids = list(declared) + [0] * (count - len(declared))
+    # An explicitly-declared ``unknown`` (oid 705) is treated like an undeclared
+    # parameter: PG's parse analysis resolves it from context (a target column,
+    # a cast, a compared operand) rather than echoing 705 back in
+    # ParameterDescription (pgtest ``unknown`` corpus).
+    oids = [0 if o == 705 else o for o in declared] + [0] * (count - len(declared))
     # INSERT: an untyped parameter in a VALUES cell takes the target column's
     # type, like PG's parse analysis (``insert into t (j) values ($1)`` with a
     # jsonb column types $1 jsonb).
@@ -3428,6 +4165,24 @@ def infer_parameter_types(
                             if getattr(col, "json_plain", False)
                             else typemap.PG_OID.get(col.type_tag, 0)
                         )
+    # UPDATE ... SET col = $N — the assignment target's column type, like PG.
+    if isinstance(stmt, exp.Update) and catalog is not None and db is not None:
+        for assign in stmt.args.get("expressions") or []:
+            if not isinstance(assign, exp.EQ):
+                continue
+            target, value = assign.this, assign.expression
+            while isinstance(value, exp.Paren):
+                value = value.this
+            if not (isinstance(target, exp.Column) and isinstance(value, exp.Parameter)):
+                continue
+            try:
+                idx = int(value.name) - 1
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < count and not oids[idx]:
+                oid = _column_param_oid(target.name, stmt, catalog, db)
+                if oid:
+                    oids[idx] = oid
     for param in stmt.find_all(exp.Parameter):
         try:
             idx = int(param.name) - 1
@@ -3456,12 +4211,60 @@ def infer_parameter_types(
                 if fname in typemap._RANGE_TAGS or fname in typemap._MULTIRANGE_TAGS:
                     oids[idx] = typemap.PG_OID[fname]
                     continue
+            elif isinstance(other, exp.Column) and catalog is not None and db is not None:
+                # ``col = $N`` types the parameter as the COLUMN's type, like
+                # PG's parse analysis (pgtest parameter_description reads uuid
+                # 2950 and timestamptz 1184 this way; citext/ltree corpora read
+                # their extension oids). ``"char"`` is the one exception the
+                # corpus pins at text — PG resolves that comparison through
+                # text rather than the one-byte type.
+                oid = _column_param_oid(other.name, stmt, catalog, db)
+                if oid:
+                    oids[idx] = oid
         if target is None:
+            continue
+        # ``$1::REGCLASS`` and friends parse as ObjectIdentifier, not
+        # DataType — map the reg-pseudotype oids directly (the pgtest
+        # bind_and_resolve corpus reads ParameterDescription byte-for-byte).
+        if isinstance(target, exp.ObjectIdentifier):
+            reg_oid = {
+                "REGCLASS": 2205,
+                "REGTYPE": 2206,
+                "REGPROC": 24,
+                "REGPROCEDURE": 2202,
+                "REGNAMESPACE": 4089,
+                "REGROLE": 4096,
+                "OID": 26,
+            }.get(str(target.this).upper())
+            if reg_oid:
+                oids[idx] = reg_oid
+            continue
+        # ``$1::JSON`` / ``$1::JSON[]`` keep the plain-json identities
+        # (114 / 199) — the collapsed tag would report jsonb's 3802/3807.
+        ident = typemap.cast_type_identity(target)
+        if ident is not None and ident[0] in (114, 199):
+            oids[idx] = ident[0]
             continue
         tag = typemap.type_tag_for_sql(target)
         oid = typemap.PG_OID.get(tag) if tag is not None else None
         if oid is None and typemap.is_array_tag(tag):
             oid = typemap._ARRAY_PG_OID.get(typemap.array_element_tag(tag))
+        if (
+            oid is None
+            and catalog is not None
+            and db is not None
+            and isinstance(target, exp.DataType)
+            and target.this == exp.DataType.Type.USERDEFINED
+        ):
+            # ``$1::r`` where ``r`` is a user-declared type (composite / enum /
+            # domain / range) — resolve to its minted oid so a BINARY param
+            # decodes through the type's record layout, not as raw text.
+            from secantus.sql import virtual
+
+            kind = target.args.get("kind")
+            uname = str(getattr(kind, "this", kind)).strip('"') if kind is not None else None
+            if uname:
+                oid = virtual.user_type_oid(db, catalog, uname)
         if oid:
             oids[idx] = oid
     return oids
@@ -3470,6 +4273,16 @@ def infer_parameter_types(
 # ---------------------------------------------------------------------------
 # Pipeline path: JOIN / GROUP BY / aggregates -> an aggregation pipeline
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class RawDerived:
+    """A derived-table sub-plan carried as a raw statement (a set operation or
+    a ``VALUES`` list in FROM) — the executor runs it through the engine and
+    optionally renames the output columns positionally (``AS alias(c1, c2)``)."""
+
+    stmt: Any
+    names: list[str] | None = None
 
 
 @dataclass
@@ -3534,6 +4347,11 @@ class PipelineSelectPlan:
     # the scalar in Python (the aggregation engine has no ``$sortArray``). Each
     # entry is ``(output_field, kind, fraction)`` — ``fraction`` None for mode.
     post_aggregates: list[tuple[str, str, float | None]] = field(default_factory=list)
+    # Per output position, the ``(TableDef, 1-based attnum)`` the column came
+    # from, or None for a computed / unattributable output. A join has no single
+    # base table, so this is how RowDescription still carries each output's base
+    # column identity (pgtest's row_description asserts it across a JOIN).
+    out_sources: list[tuple[Any, int] | None] = field(default_factory=list)
 
 
 @dataclass
@@ -3576,9 +4394,26 @@ class EvaluatedSelectPlan:
     # ORDER BY index -> the enum's declared labels, when that ORDER BY term is an
     # enum column, so the executor sorts by declared order not lexically.
     enum_orders: dict[int, list[str]] = field(default_factory=dict)
+    # ORDER BY index -> the OUTPUT column index it refers to, when that output is
+    # produced by a set-returning function. Such a key cannot be computed from
+    # the source row: one row fans out to many, and every expanded row would
+    # share a single key (which is why `ORDER BY 1` over `unnest` used to return
+    # array order, and `ORDER BY <alias>` raised 0A000). The executor reads the
+    # key off the EXPANDED tuple instead. DISTINCT ON is deliberately NOT in
+    # here — that key is row-level and computed before expansion.
+    order_srf_output: dict[int, int] = field(default_factory=dict)
     # Rich ``JOIN LATERAL`` sources (subquery with its own join/group/aggregate),
     # expanded nested-loop per outer row by the executor after the pipeline runs.
     lateral_joins: list[LateralJoin] = field(default_factory=list)
+    # The single base TableDef when the plan came from a one-table SELECT —
+    # lets the descriptor builder attribute bare-column outputs to their
+    # source table/attnum (RowDescription base-column identity, which JDBC's
+    # getBaseColumnName resolves through). None for joins, which carry the
+    # same identity per output position in ``out_sources`` instead.
+    base_table: Any = None
+    # Per output position, the ``(TableDef | ViewSource, 1-based attnum)`` the
+    # column came from, or None for a computed / unattributable output.
+    out_sources: list[tuple[Any, int] | None] = field(default_factory=list)
 
 
 def _evaluated_enum_orders(
@@ -3809,6 +4644,25 @@ def _agg_order_spec(
     return value_node.this, terms
 
 
+def _sorted_agg_key(key: exp.Expression, table: TableDef) -> Any:
+    """One ``k`` element of an ordered aggregate's pushed pair.
+
+    A key naming a timestamp column pushes the sub-millisecond composite rather
+    than the stored date, so `array_agg(x ORDER BY t)` orders by microseconds
+    like Postgres instead of leaving rows inside one millisecond in storage
+    order. `_sorted_agg_value` merges the composite before it sorts.
+    """
+    if isinstance(key, exp.Column):
+        name = _column_name(key)
+        try:
+            tag = table.type_for(name)
+        except Exception:  # noqa: BLE001 -- not a resolvable column: lower as-is
+            tag = None
+        if tag in subms.SUBMS_TAGS:
+            return subms.composite_expr(table.field_for(name))
+    return _agg_arg_to_expr(key, table)
+
+
 def _sorted_agg_push(
     value_node: exp.Expression,
     terms: list[tuple[exp.Expression, int, bool]],
@@ -3819,9 +4673,23 @@ def _sorted_agg_push(
     return {
         "$push": {
             "v": _agg_arg_to_expr(value_node, table),
-            "k": [_agg_arg_to_expr(key, table) for key, _dir, _nf in terms],
+            "k": [_sorted_agg_key(key, table) for key, _dir, _nf in terms],
         }
     }
+
+
+def _sorted_agg_key_resolve(key: exp.Expression, resolve: Resolve) -> Any:
+    """`_sorted_agg_key` for the join path -- same rule, resolved through the
+    join's `Resolve` (which yields the dotted pipeline path and its tag, so the
+    companion lands at `b.__us_t` rather than `__us_b.t`)."""
+    if isinstance(key, exp.Column):
+        try:
+            path, tag = resolve(key)
+        except Exception:  # noqa: BLE001 -- unresolvable: lower as-is
+            path, tag = None, None
+        if path is not None and tag in subms.SUBMS_TAGS:
+            return subms.composite_expr(path)
+    return _to_agg_expr(key, resolve)
 
 
 def _sorted_agg_push_resolve(
@@ -3834,7 +4702,7 @@ def _sorted_agg_push_resolve(
     return {
         "$push": {
             "v": _to_agg_expr(value_node, resolve),
-            "k": [_to_agg_expr(key, resolve) for key, _dir, _nf in terms],
+            "k": [_sorted_agg_key_resolve(key, resolve) for key, _dir, _nf in terms],
         }
     }
 
@@ -4037,10 +4905,37 @@ def _ordered_set_agg(node: exp.Expression) -> tuple[str, float | None, exp.Expre
     order_val = ordered[0].this
     fraction: float | None = None
     if kind != "mode":
-        fraction = float(_literal(inner.this.this))
+        fraction = float(typemap.unwrap_numeric(_literal(inner.this.this)))
         if not 0.0 <= fraction <= 1.0:
             raise errors.SQLError("2202E", f"percentile value {fraction} is not between 0 and 1")
     return kind, fraction, order_val
+
+
+#: SRF kinds that yield a composite record, so ``(srf(...)).field`` is valid on
+#: them. ``_srf_of`` tags those as ``"<kind>.<field>"``.
+_RECORD_SRF_KINDS = frozenset({"_pg_expandarray"})
+
+
+def _srf_output_index(
+    term: exp.Expression, out_exprs: list[exp.Expression], out_names: list[str]
+) -> int | None:
+    """The OUTPUT index an ORDER BY term names, when that output is an SRF.
+
+    `ORDER BY 1` (ordinal) and `ORDER BY u` (output alias / name) both resolve
+    onto the projection; when the target is a set-returning function the key has
+    to come from the *expanded* row, so the caller records the index rather than
+    substituting the expression. Returns None for every ordinary term.
+    """
+    if isinstance(term, exp.Literal) and not term.is_string and str(term.this).isdigit():
+        idx = int(term.this) - 1
+        if 0 <= idx < len(out_exprs) and _srf_of(out_exprs[idx]) is not None:
+            return idx
+        return None
+    if isinstance(term, exp.Column) and not term.table:
+        for idx, name in enumerate(out_names):
+            if name == term.name and idx < len(out_exprs) and _srf_of(out_exprs[idx]) is not None:
+                return idx
+    return None
 
 
 def _srf_of(node: exp.Expression) -> tuple[str, exp.Expression] | None:
@@ -4052,6 +4947,18 @@ def _srf_of(node: exp.Expression) -> tuple[str, exp.Expression] | None:
     inner = node.this if isinstance(node, exp.Alias) else node
     if isinstance(inner, exp.Explode):
         return ("unnest", inner.this)
+    # ``(schema.srf(arr)).field`` — a composite field selected off a
+    # record-returning SRF, which is how pgjdbc's DatabaseMetaData asks for
+    # ``(information_schema._pg_expandarray(i.indkey)).n``. Recurse on the
+    # parenthesised call and tag the kind with the field being taken.
+    if isinstance(inner, exp.Dot) and isinstance(inner.this, exp.Paren):
+        field = inner.expression
+        field_name = field.name if isinstance(field, (exp.Identifier, exp.Column)) else None
+        if field_name:
+            base = _srf_of(inner.this.this)
+            if base is not None and base[0] in _RECORD_SRF_KINDS:
+                return (f"{base[0]}.{field_name.lower()}", base[1])
+        return None
     if isinstance(inner, exp.Dot) and isinstance(inner.expression, exp.Anonymous):
         inner = inner.expression
     if isinstance(inner, exp.Anonymous):
@@ -4067,6 +4974,10 @@ def _srf_of(node: exp.Expression) -> tuple[str, exp.Expression] | None:
             return ("jsonb_array_elements", inner.expressions[0])
         if name in ("jsonb_object_keys", "json_object_keys") and inner.expressions:
             return ("jsonb_object_keys", inner.expressions[0])
+        # information_schema._pg_expandarray(arr) -> one (x, n) record per
+        # element: the value and its 1-based subscript.
+        if name == "_pg_expandarray" and inner.expressions:
+            return ("_pg_expandarray", inner.expressions[0])
     return None
 
 
@@ -4132,7 +5043,7 @@ def select_needs_pipeline(stmt: exp.Select) -> bool:
     # A ``(SELECT ...) AS alias`` derived table in FROM — e.g. an expanded view —
     # is materialized by the pipeline path's ``_resolve_source``.
     from_node = next((v for v in stmt.args.values() if isinstance(v, exp.From)), None)
-    if from_node is not None and isinstance(from_node.this, exp.Subquery):
+    if from_node is not None and isinstance(from_node.this, (exp.Subquery, exp.Values)):
         return True
     # A SELECT list / ORDER BY with set-returning or scalar functions, CASE, or
     # subqueries needs per-row evaluation (the pipeline path), not a plain find.
@@ -4168,6 +5079,164 @@ def select_needs_pipeline(stmt: exp.Select) -> bool:
     return True
 
 
+def qualified_table_name(table_node: exp.Table) -> str:
+    """The catalog key for a (possibly schema-qualified) table reference: the
+    bare name for ``public`` and unqualified references, else
+    ``"<schema>.<name>"`` — the same dotted-key mapping user types take. The
+    backing Mongo collection uses the same composed string, so the
+    dual-protocol view addresses it as ``db["schema.table"]``."""
+    schema = table_node.args.get("db")
+    sname = schema.name if schema is not None else None
+    if not sname or sname == "public":
+        return table_node.name
+    return f"{sname}.{table_node.name}"
+
+
+def _join_source_alias(node: exp.Expression | None) -> str | None:
+    """The name a join source is referenced by: its alias if it has one, else
+    the table name. Returns None for a source we cannot name (and therefore
+    cannot build a qualified ON against)."""
+    if node is None:
+        return None
+    if isinstance(node, exp.From):
+        node = node.this
+    alias = node.args.get("alias") if isinstance(node.args.get("alias"), exp.TableAlias) else None
+    if alias is not None and alias.name:
+        return alias.name
+    if isinstance(node, exp.Table):
+        return node.alias_or_name or None
+    return None
+
+
+def desugar_join_using(stmt: exp.Expression) -> None:
+    """Rewrite ``JOIN b USING (c, …)`` into the equivalent qualified ON.
+
+    Nothing in join planning read ``args["using"]``, so a USING join lost its
+    condition entirely and degraded to a CROSS JOIN — ``SELECT v, w FROM a
+    JOIN b USING (k)`` returned every pair instead of the matching ones. That
+    is a silent wrong answer, so USING is normalised to ON here and the
+    existing ON machinery does the rest.
+
+    The left side of each equality is the nearest preceding source. In a chain
+    (``a JOIN b USING (k) JOIN c USING (k)``) Postgres joins against the merged
+    column, which equals the nearest preceding one by construction, so the
+    result set is the same.
+    """
+    for select in stmt.find_all(exp.Select):
+        joins = select.args.get("joins") or []
+        if not joins:
+            continue
+        # sqlglot spells the FROM arg "from_", not "from".
+        prev = _join_source_alias(select.args.get("from_"))
+        for jn in joins:
+            right = _join_source_alias(jn.this)
+            columns = jn.args.get("using") or []
+            if columns and prev and right:
+                conds = [
+                    exp.EQ(
+                        this=exp.column(col.name, table=prev),
+                        expression=exp.column(col.name, table=right),
+                    )
+                    for col in columns
+                ]
+                condition = conds[0]
+                for extra in conds[1:]:
+                    condition = exp.And(this=condition, expression=extra)
+                jn.set("on", condition)
+                jn.set("using", None)
+            prev = right or prev
+
+
+def _create_target(stmt: exp.Expression) -> exp.Table | None:
+    """The relation a CREATE statement *defines*, which search_path resolution
+    must leave alone: Postgres creates into the path's first schema and never
+    binds a create target to an existing relation elsewhere on the path. The
+    body of a CREATE TABLE AS / CREATE VIEW still resolves normally, as does a
+    CREATE INDEX's target table (that one names an existing relation)."""
+    if not isinstance(stmt, exp.Create):
+        return None
+    if (stmt.args.get("kind") or "TABLE").upper() not in ("TABLE", "VIEW"):
+        return None
+    target = stmt.this
+    if isinstance(target, exp.Schema):
+        target = target.this
+    return target if isinstance(target, exp.Table) else None
+
+
+def qualify_from_search_path(stmt: exp.Expression, catalog: Any, db: str, session: Any) -> None:
+    """Qualify bare table references against the session's ``search_path``.
+
+    Postgres resolves an unqualified relation by walking ``search_path`` in
+    order and taking the first schema that holds it. We only consult the path
+    when the bare name is *not* itself a catalog entry, so this can turn a
+    "relation does not exist" into a hit but can never redirect a name that
+    already resolves. The node is rewritten in place, which keeps the write
+    path honest: ``qualified_table_name`` composes the storage key from the
+    same node the resolver matched, so a read and a write of one unqualified
+    name cannot land in different schemas.
+
+    Names bound by a CTE in scope are left alone — they shadow real relations.
+
+    The session's private temp namespace (``pg_temp_<n>``) participates the way
+    real PG's does: an explicit ``pg_temp.<name>`` qualifier is rewritten to the
+    session's own namespace, and — unless the user placed ``pg_temp`` explicitly
+    on the path — an unqualified name is tried against the temp namespace FIRST,
+    so a session's temp table shadows a permanent one of the same name.
+    """
+    path = [s for s in session.search_path if s != "public"]
+    temp_ns = getattr(session, "temp_schema", None)
+    cte_names = {cte.alias_or_name.lower() for cte in stmt.find_all(exp.CTE) if cte.alias_or_name}
+    skip = _create_target(stmt)
+    temp_first = temp_ns is not None and "pg_temp" not in path
+    for table in stmt.find_all(exp.Table):
+        if not table.name:
+            continue
+        schema_arg = table.args.get("db")
+        if schema_arg is not None:
+            # ``pg_temp.<name>`` means *this session's* temp namespace. A create
+            # target resolves here too — CREATE TABLE pg_temp.t IS a temp table
+            # (the engine's qualify_temp_create_target handles the temp flag).
+            if schema_arg.name == "pg_temp":
+                table.set("db", exp.to_identifier(session.ensure_temp_schema()))
+            continue
+        if table.name.lower() in cte_names or table is skip:
+            continue
+        if temp_first and catalog.get(db, f"{temp_ns}.{table.name}") is not None:
+            table.set("db", exp.to_identifier(temp_ns))
+            continue
+        if catalog.get(db, table.name) is not None:
+            continue
+        for schema in path:
+            resolved = temp_ns if schema == "pg_temp" and temp_ns is not None else schema
+            if catalog.get(db, f"{resolved}.{table.name}") is not None:
+                table.set("db", exp.to_identifier(resolved))
+                break
+
+
+def qualify_temp_create_target(stmt: exp.Create, session: Any) -> None:
+    """Home a ``CREATE TEMP TABLE`` target in the session's private temp
+    namespace (``pg_temp_<n>``) by qualifying the target node in place, so
+    concurrent sessions' same-named temp tables land on distinct catalog keys
+    — real PG gives every backend its own temp schema. An explicit ``pg_temp``
+    qualifier was already rewritten by ``qualify_from_search_path``; a TEMP
+    keyword aimed at any other schema is rejected like real PG."""
+    target = _create_target(stmt)
+    if target is None:
+        return
+    props = stmt.args.get("properties")
+    is_temp_kw = bool(props) and any(
+        isinstance(p, exp.TemporaryProperty) for p in props.expressions
+    )
+    if not is_temp_kw:
+        return
+    schema = target.args.get("db")
+    sname = schema.name if schema is not None else None
+    if sname is None:
+        target.set("db", exp.to_identifier(session.ensure_temp_schema()))
+    elif sname != getattr(session, "temp_schema", None):
+        raise errors.SQLError("42P16", "cannot create temporary relation in non-temporary schema")
+
+
 def _lookup_table_def(
     catalog: Any, db: str, table_node: exp.Table, storage: Any = None
 ) -> TableDef | None:
@@ -4181,7 +5250,7 @@ def _lookup_table_def(
     """
     from secantus.sql import reflect, virtual
 
-    table = catalog.get(db, table_node.name)
+    table = catalog.get(db, qualified_table_name(table_node))
     if table is not None:
         return table
     schema = table_node.args.get("db")
@@ -4194,6 +5263,121 @@ def _lookup_table_def(
     if storage is not None and schema_name is None:
         return reflect.reflect(storage, db, table_node.name)
     return None
+
+
+def expand_using_star(stmt: exp.Select, catalog: Any, db: str) -> None:
+    """Expand a lone ``SELECT *`` over USING joins into Postgres' merged list.
+
+    ``SELECT * FROM a JOIN b USING (k)`` returns the join column ONCE (from
+    the left side; the right side for RIGHT joins; ``COALESCE`` for FULL),
+    then each source's remaining columns in FROM order. Our star expansion
+    emitted ``k`` once per side. Rewriting the AST here — one site, before
+    planning — beats teaching every star-expansion path about join shapes.
+
+    Sound-not-complete: anything unusual (mixed ON/USING chains, non-table
+    sources, unknown tables, ``tbl.*``, extra select items, outer sides in a
+    multi-join chain) bails and keeps the old expansion.
+    """
+    if len(stmt.expressions) != 1 or not isinstance(stmt.expressions[0], exp.Star):
+        return
+    from_node = stmt.args.get("from_")
+    joins = stmt.args.get("joins") or []
+    if from_node is None or not joins or not all(j.args.get("using") for j in joins):
+        return
+    if len(joins) > 1 and any(j.side for j in joins):
+        return  # outer sides in a chain: merge-source rules get positional; bail
+
+    def resolve(node: exp.Expression) -> tuple[str, Any] | None:
+        if not isinstance(node, exp.Table) or not isinstance(node.this, exp.Identifier):
+            return None
+        td = catalog.get(db, node.name) if catalog is not None else None
+        if td is None:
+            return None
+        return (node.alias or node.name, td)
+
+    base = resolve(from_node.this)
+    if base is None:
+        return
+    sources = [base]
+    for j in joins:
+        r = resolve(j.this)
+        if r is None:
+            return
+        sources.append(r)
+    cols_of = {alias: [c.name for c in td.columns] for alias, td in sources}
+
+    # Merged USING columns, in first-use order; each must exist in the left
+    # accumulation and the join's right side, or we bail.
+    merged: list[str] = []
+    for i, j in enumerate(joins):
+        right_alias = sources[i + 1][0]
+        left_aliases = [a for a, _ in sources[: i + 1]]
+        for u in j.args["using"]:
+            name = u.name
+            if name not in cols_of[right_alias] or not any(
+                name in cols_of[a] for a in left_aliases
+            ):
+                return
+            if name not in merged:
+                merged.append(name)
+
+    def qcol(alias: str, name: str) -> exp.Column:
+        return exp.column(name, table=alias)
+
+    out: list[exp.Expression] = []
+    for name in merged:
+        holders = [a for a, _ in sources if name in cols_of[a]]
+        side = joins[0].side if len(joins) == 1 else None
+        if side == "FULL":
+            out.append(
+                exp.alias_(
+                    exp.Coalesce(
+                        this=qcol(holders[0], name),
+                        expressions=[qcol(h, name) for h in holders[1:]],
+                    ),
+                    name,
+                )
+            )
+        elif side == "RIGHT":
+            out.append(exp.alias_(qcol(holders[-1], name), name))
+        else:
+            out.append(exp.alias_(qcol(holders[0], name), name))
+    for alias, _td in sources:
+        for name in cols_of[alias]:
+            if name not in merged:
+                out.append(qcol(alias, name))
+    stmt.set("expressions", out)
+
+
+def expand_table_stars(stmt: exp.Select, catalog: Any, db: str) -> None:
+    """Expand ``tbl.*`` select items over a JOIN into explicit columns.
+
+    The join planner resolves select items column-by-column and crashed on a
+    table-qualified star (``column "*" does not exist``). Postgres expands it
+    to the table's columns in order — and does NOT merge USING columns for
+    ``tbl.*`` (only the bare ``*`` merges). Bails per-item when the source
+    isn't a resolvable plain table."""
+    joins = stmt.args.get("joins") or []
+    from_node = stmt.args.get("from_")
+    if from_node is None or not joins:
+        return
+    if not any(
+        isinstance(e, exp.Column) and isinstance(e.this, exp.Star) for e in stmt.expressions
+    ):
+        return
+    defs: dict[str, Any] = {}
+    for node in [from_node.this] + [j.this for j in joins]:
+        if isinstance(node, exp.Table) and isinstance(node.this, exp.Identifier):
+            td = catalog.get(db, node.name) if catalog is not None else None
+            if td is not None:
+                defs[node.alias or node.name] = td
+    out: list[exp.Expression] = []
+    for e in stmt.expressions:
+        if isinstance(e, exp.Column) and isinstance(e.this, exp.Star) and e.table in defs:
+            out.extend(exp.column(c.name, table=e.table) for c in defs[e.table].columns)
+        else:
+            out.append(e)
+    stmt.set("expressions", out)
 
 
 def unwrap_paren_join_from(stmt: exp.Select) -> None:
@@ -4212,25 +5396,102 @@ def unwrap_paren_join_from(stmt: exp.Select) -> None:
         isinstance(node, exp.Subquery)
         and not node.alias
         and isinstance(node.this, (exp.Table, exp.Subquery))
-        and node.this.args.get("joins")
     ):
         inner = node.this
-        joins = inner.args.pop("joins", None) or []
-        stmt.set("joins", joins + (stmt.args.get("joins") or []))
+        # Joins can sit on the INNER node (``FROM (a JOIN b)``) or on the
+        # grouping Subquery ITSELF (``FROM ((a JOIN b) JOIN c)`` attaches the
+        # c-join to the outer parens; extra grouping layers — CrystalReports'
+        # {oj (((…))) } shape — nest join-less wrappers that still must peel).
+        # Hoist both, inner-first (their join order in the original text).
+        # A wrapper whose inner is a SELECT is a derived table missing its
+        # alias and is left for the error path (the isinstance gate above).
+        joins = (inner.args.pop("joins", None) or []) + (node.args.pop("joins", None) or [])
+        if joins:
+            stmt.set("joins", joins + (stmt.args.get("joins") or []))
         frm.set("this", inner)
         node = inner
 
 
 def plan_pipeline_select(
-    stmt: exp.Select, db: str, catalog: Any, storage: Any = None
+    stmt: exp.Select, db: str, catalog: Any, storage: Any = None, session: Any = None
 ) -> PipelineSelectPlan | EvaluatedSelectPlan:
     # Publish the subquery context so any WHERE `$match` in the pipeline planners
     # can evaluate a scalar / IN subquery (the same as the single-table pushdown).
-    token = _pipeline_subctx.set(SubqueryCtx(storage=storage, db=db, catalog=catalog, session=None))
+    # The session rides along for session-aware predicates (pg_table_is_visible's
+    # own-temp-table branch); a nested planning call inherits the outer one's.
+    if session is None:
+        session = getattr(_pipeline_subctx.get(), "session", None)
+    token = _pipeline_subctx.set(
+        SubqueryCtx(storage=storage, db=db, catalog=catalog, session=session)
+    )
+    # Resolved BEFORE planning: planning flattens ``FROM (subquery) AS v`` into
+    # the subquery itself, so the view reference is gone by the time the plan
+    # comes back.
+    view_positions = _view_source_positions(stmt, db, catalog)
     try:
-        return _plan_pipeline_select(stmt, db, catalog, storage)
+        plan = _plan_pipeline_select(stmt, db, catalog, storage)
     finally:
         _pipeline_subctx.reset(token)
+    if view_positions is not None:
+        _attribute_view_source(plan, *view_positions)
+    return plan
+
+
+@dataclass(frozen=True)
+class ViewSource:
+    """A view relation standing as an output column's provenance. Carries only
+    the name — the pg_class oid is minted in ``virtual``, which the descriptor
+    builder resolves (a view has no ``TableDef``)."""
+
+    name: str
+
+
+def _view_source_positions(
+    stmt: exp.Select, db: str, catalog: Any
+) -> tuple[str, dict[str, int]] | None:
+    """``(view_name, {column_name: 1-based position})`` when ``stmt`` selects from
+    exactly one expanded view, else None.
+
+    A view is expanded into an inline subquery before planning, which loses the
+    relation identity Postgres reports in RowDescription — a view's columns carry
+    the view's own oid and its own 1-based positions, not the underlying tables'.
+    The expansion keeps the view's name as the subquery alias, and the stored
+    definition round-trips to exactly the subquery body, so an exact-SQL match
+    identifies the source without mistaking a user subquery that happens to be
+    aliased like a view.
+    """
+    # sqlglot spells the arg ``from_``; older versions used ``from``.
+    from_node = stmt.args.get("from_") or stmt.args.get("from")
+    if from_node is None or stmt.args.get("joins"):
+        return None
+    src = from_node.this
+    if not isinstance(src, exp.Subquery) or not src.alias:
+        return None
+    getter = getattr(catalog, "get_view", None)
+    vdef = getter(db, src.alias) if getter is not None else None
+    if vdef is None or src.this.sql(dialect="postgres") != vdef:
+        return None
+    try:
+        view_select = sqlglot.parse_one(vdef, read="postgres")
+        names = view_select.named_selects
+    except Exception:  # pragma: no cover - a stored definition that won't reparse
+        return None
+    return src.alias, {n: i + 1 for i, n in enumerate(names)}
+
+
+def _attribute_view_source(plan: Any, view_name: str, positions: dict[str, int]) -> None:
+    """Point ``plan``'s outputs at the view relation they were selected from.
+
+    This OVERRIDES any table-level attribution already on the plan: planning a
+    view over a join can flatten down to the view body's own plan, whose columns
+    were attributed to the underlying tables. Postgres reports the view.
+    """
+    if not hasattr(plan, "out_sources"):
+        return
+    plan.out_sources = [
+        (ViewSource(view_name), positions[name]) if name in positions else None
+        for name, _tag in plan.out_columns
+    ]
 
 
 def _plan_pipeline_select(
@@ -4324,7 +5585,19 @@ def _plan_pipeline_select(
         # evaluated executor.
         plan = _plan_group_window_select(stmt, table)
     elif grouped:
-        plan = _plan_group_select(stmt, table)
+        # A HAVING shape the `$match` lowerer can't express is not a hard
+        # 0A000: re-plan through the evaluated path, which carries HAVING as a
+        # per-grouped-row residual (the route the HAVING-subquery case already
+        # takes). The copy is taken first because planning mutates the tree
+        # (aggregates are replaced by their computed-field references), so the
+        # re-plan needs a pristine statement.
+        having_backup = stmt.copy() if stmt.args.get("having") is not None else None
+        try:
+            plan = _plan_group_select(stmt, table)
+        except errors.SQLError as exc:
+            if exc.sqlstate != "0A000" or having_backup is None:
+                raise
+            plan = _plan_group_window_select(having_backup, table)
     elif _stmt_needs_evaluation(stmt) or _distinct_on(stmt) or where_needs_per_row(stmt, table):
         # DISTINCT ON needs the evaluated path's sort-then-keep-first-per-key;
         # a WHERE the pushdown can't lower (column arithmetic in a comparison,
@@ -4397,7 +5670,11 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
     out_enum_types: dict[int, str] = {}
     out_exprs: list[exp.Expression] = []
     alias_exprs: dict[str, exp.Expression] = {}
-    names = _NameAllocator()
+    # No name uniquifying here: the evaluated executor extracts row values
+    # POSITIONALLY (zip with out_exprs), so duplicate output names are pure
+    # display — and real PG repeats them verbatim (``select 'a', 'b'`` is
+    # ``?column?, ?column?``, never ``?column?_2``; pgx's NetworkUsage test
+    # byte-counts the RowDescription).
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
         inner = e.this if isinstance(e, exp.Alias) else e
@@ -4405,18 +5682,23 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
             for col in table.columns:
                 if col.enum_type is not None:
                     out_enum_types[len(out_columns)] = col.enum_type
-                out_columns.append((names.fresh(col.name), col.type_tag))
+                out_columns.append((col.name, col.type_tag))
                 out_exprs.append(exp.column(col.name))
             continue
-        name = alias or (_column_name(inner) if isinstance(inner, exp.Column) else "?column?")
+        name = alias or (
+            _column_name(inner)
+            if isinstance(inner, exp.Column)
+            else _cast_output_name(inner) or "?column?"
+        )
         enum_name = _projected_enum_type(inner, table)
         if enum_name is not None:
             out_enum_types[len(out_columns)] = enum_name
-        out_columns.append((names.fresh(name), _infer_scalar_tag(inner, resolve)))
+        out_columns.append((name, _infer_scalar_tag(inner, resolve)))
         out_exprs.append(inner)
         if alias is not None:
             alias_exprs[alias] = inner
     order: list[tuple[exp.Expression, int, bool]] = []
+    order_srf_output: dict[int, int] = {}
     order_node = stmt.args.get("order")
     if order_node is not None:
         for o in order_node.expressions:
@@ -4424,16 +5706,20 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
             # 1-based output ordinal (``ORDER BY 1``) — Postgres resolves both
             # to that output expression, so sorting a computed column works.
             term = o.this
-            if isinstance(term, exp.Column) and not term.table and term.name in alias_exprs:
+            # An ORDER BY term that names an SRF-produced output is recorded by
+            # OUTPUT INDEX and resolved by the executor against the expanded
+            # tuple — it cannot be evaluated against the source row, where every
+            # expanded row would share one key.
+            srf_out = _srf_output_index(term, out_exprs, [n for n, _ in out_columns])
+            if srf_out is not None:
+                order_srf_output[len(order)] = srf_out
+            elif isinstance(term, exp.Column) and not term.table and term.name in alias_exprs:
                 term = alias_exprs[term.name]
             elif (
                 isinstance(term, exp.Literal)
                 and not term.is_string
                 and str(term.this).isdigit()
                 and 1 <= int(term.this) <= len(out_exprs)
-                # An SRF output can't be the sort key pre-expansion (one source
-                # row fans out to many); leave the ordinal to the executor.
-                and _srf_of(out_exprs[int(term.this) - 1]) is None
             ):
                 term = out_exprs[int(term.this) - 1]
             order.append((term, -1 if o.args.get("desc") else 1, _nulls_first(o)))
@@ -4444,7 +5730,9 @@ def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelec
         lambda node: table.column(_column_name(node)) if isinstance(node, exp.Column) else None,
     )
     return EvaluatedSelectPlan(
+        order_srf_output=order_srf_output,
         base_collection=table.collection,
+        base_table=table,
         base_filter=base_filter,
         pipeline=[],
         out_columns=out_columns,
@@ -4499,14 +5787,18 @@ def _plan_distinct_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPl
         if isinstance(inner, exp.Star):
             for col in table.columns:
                 nm = names.fresh(col.name)
-                project[nm] = f"${col.field}"
+                # DISTINCT dedups on the PROJECTED value, so a timestamp has to
+                # be projected as the sub-millisecond composite -- projecting the
+                # truncated date merges rows that differ only in microseconds AND
+                # returns a time none of them held.
+                project[nm] = _group_key_expr(col.field, col.type_tag)
                 if col.enum_type is not None:
                     out_enum_types[len(out_columns)] = col.enum_type
                 out_columns.append((nm, col.type_tag))
             continue
         path, tag = _field(inner, resolve)
         nm = names.fresh(alias or _column_name(inner))
-        project[nm] = f"${path}"
+        project[nm] = _group_key_expr(path, tag)
         enum_name = _projected_enum_type(inner, table)
         if enum_name is not None:
             out_enum_types[len(out_columns)] = enum_name
@@ -4517,6 +5809,34 @@ def _plan_distinct_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPl
     return PipelineSelectPlan(
         table.collection, base_filter, pipeline, out_columns, out_enum_types=out_enum_types
     )
+
+
+def _group_key_expr(field: str, tag: str | None) -> Any:
+    """The ``$group`` ``_id`` expression for one grouping column.
+
+    A timestamp groups on the sub-millisecond composite, not the stored date:
+    grouping on the truncated value MERGES rows that differ only in
+    microseconds, so the counts and sums over those groups are wrong and the
+    emitted key is a time that was never stored. The executor unwraps the key
+    on the way out.
+    """
+    if tag in subms.SUBMS_TAGS:
+        return subms.composite_expr(field)
+    return f"${field}"
+
+
+def _minmax_body(val: Any, field: str | None, tag: str | None, filter_cond: Any) -> Any:
+    """The value a ``$min`` / ``$max`` accumulates.
+
+    For a timestamp column that is the sortable composite (`subms.composite_expr`)
+    rather than the stored date: a BSON date holds whole milliseconds, so
+    accumulating it directly answers a time that was never stored -- `min(t)`
+    returned `.123000` for a stored `.123456`. The executor merges the composite
+    back on the way out.
+    """
+    if field is not None and tag in subms.SUBMS_TAGS:
+        val = subms.composite_expr(field)
+    return {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
 
 
 def _accumulator_for(
@@ -4548,10 +5868,10 @@ def _accumulator_for(
         body = {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
         return {"$avg": body}, _avg_tag(tag)
     if func in ("min", "bool_and"):
-        body = {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
+        body = _minmax_body(val, field, tag, filter_cond)
         return {"$min": body}, ("bool" if func == "bool_and" else (tag or "text"))
     if func in ("max", "bool_or"):
-        body = {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
+        body = _minmax_body(val, field, tag, filter_cond)
         return {"$max": body}, ("bool" if func == "bool_or" else (tag or "text"))
     if func in ("stddev", "stddev_samp"):
         # Native Mongo accumulators; a lone value yields NULL (Mongo returns null
@@ -4682,9 +6002,11 @@ def _register_distinct_agg(
     reduction's NULL filter drops — so only matching rows' distinct values count
     (SQL ``agg(DISTINCT x) FILTER (WHERE cond)`` semantics)."""
     set_name = names.fresh(f"{alias or func}__distinct")
-    accumulators[set_name] = {
-        "$addToSet": _push_filtered(value if field is None else f"${field}", fcond)
-    }
+    # `count(DISTINCT t)` dedups whatever the set collects, so a timestamp has to
+    # go in as the sub-millisecond composite -- collecting the truncated date
+    # counted two rows a millisecond apart as one value.
+    distinct_value = value if field is None else _group_key_expr(field, tag)
+    accumulators[set_name] = {"$addToSet": _push_filtered(distinct_value, fcond)}
     fname = names.fresh(alias or func)
     reductions[fname] = _distinct_reduction(func, f"${set_name}")
     return fname, _agg_out_tag(func, tag)
@@ -4972,7 +6294,7 @@ def _grouping_set_branch(
     ``post_aggregates`` finishes statistical / bitwise aggregates in Python after the
     union (identical across branches, so the planner keeps one copy)."""
     in_set = set(gset)
-    group_id = {c: f"${table.field_for(c)}" for c in gset} or None
+    group_id = {c: _group_key_expr(table.field_for(c), table.type_for(c)) for c in gset} or None
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
     project: dict[str, Any] = {"_id": 0}
@@ -5203,6 +6525,19 @@ def _plan_grouping_sets_window_select(
             field_tags[fname] = "json"
             agg_field_names.append(fname)
             return fname
+        sa = _string_agg_arg(node)
+        if sa is not None:
+            # A function-wrapped ``string_agg`` (``decode(string_agg(…),
+            # 'hex')`` — RefCursorFetchTest's seeding INSERT) reaches the
+            # computed-projection registrar; push the values and join with the
+            # separator in the reduction, like the plain string_agg path does.
+            sa_expr, sep = sa
+            fname = names.fresh("string_agg")
+            accumulators[fname] = {"$push": _agg_arg_to_expr(sa_expr, table)}
+            reductions[fname] = _string_agg_project(fname, sep)
+            field_tags[fname] = "text"
+            agg_field_names.append(fname)
+            return fname
         agg = _aggregate_of(node)
         if agg is None:
             raise errors.feature_not_supported(f"unsupported aggregate: {node.sql()}")
@@ -5284,7 +6619,7 @@ def _plan_grouping_sets_window_select(
 
     def branch(gset: list[str]) -> list[dict[str, Any]]:
         in_set = set(gset)
-        group_id = {c: f"${table.field_for(c)}" for c in gset} or None
+        group_id = {c: _group_key_expr(table.field_for(c), table.type_for(c)) for c in gset} or None
         project: dict[str, Any] = {"_id": 0}
         for c in group_cols:
             project[c] = f"$_id.{c}" if c in in_set else {"$literal": None}
@@ -5323,7 +6658,9 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     group_cols = [_column_name(c) for c in group_node.expressions] if group_node else []
     for c in group_cols:
         table.field_for(c)  # validate
-    group_id = {c: f"${table.field_for(c)}" for c in group_cols} or None
+    group_id = {
+        c: _group_key_expr(table.field_for(c), table.type_for(c)) for c in group_cols
+    } or None
 
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
@@ -5775,7 +7112,9 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
     group_cols = [_column_name(c) for c in group_node.expressions] if group_node else []
     for c in group_cols:
         table.field_for(c)  # validate
-    group_id = {c: f"${table.field_for(c)}" for c in group_cols} or None
+    group_id = {
+        c: _group_key_expr(table.field_for(c), table.type_for(c)) for c in group_cols
+    } or None
 
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
@@ -5792,6 +7131,19 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
             fname = names.fresh("array_agg")
             accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
             field_tags[fname] = "json"
+            agg_field_names.append(fname)
+            return fname
+        sa = _string_agg_arg(node)
+        if sa is not None:
+            # A function-wrapped ``string_agg`` (``decode(string_agg(…),
+            # 'hex')`` — RefCursorFetchTest's seeding INSERT) reaches the
+            # computed-projection registrar; push the values and join with the
+            # separator in the reduction, like the plain string_agg path does.
+            sa_expr, sep = sa
+            fname = names.fresh("string_agg")
+            accumulators[fname] = {"$push": _agg_arg_to_expr(sa_expr, table)}
+            reductions[fname] = _string_agg_project(fname, sep)
+            field_tags[fname] = "text"
             agg_field_names.append(fname)
             return fname
         agg = _aggregate_of(node)
@@ -5866,9 +7218,25 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
                 node.replace(exp.column(register_agg(node)))
             residual_having = having.this
         else:
-            having_match = _having_to_match(
-                having.this, table, accumulators, agg_fields, group_cols, names, reductions
-            )
+            try:
+                having_match = _having_to_match(
+                    having.this, table, accumulators, agg_fields, group_cols, names, reductions
+                )
+            except errors.SQLError as exc:
+                # Only "we can't lower this shape" (0A000) falls back — a real
+                # user error (42803 "must appear in the GROUP BY clause", say)
+                # has to surface, not be silently deferred to a residual that
+                # would then evaluate it as a plain expression.
+                if exc.sqlstate != "0A000":
+                    raise
+                # The same route the HAVING-subquery case takes: rewrite the
+                # aggregates to their computed fields and evaluate the predicate
+                # per grouped row. This is what keeps a HAVING shape the $match
+                # lowerer doesn't cover from being a hard 0A000.
+                for node in _outer_agg_nodes(having.this):
+                    node.replace(exp.column(register_agg(node)))
+                residual_having = having.this
+                having_match = None
 
     pipeline: list[dict[str, Any]] = [{"$group": {"_id": group_id, **accumulators}}]
     if reductions:
@@ -5918,7 +7286,11 @@ def _finish_group_window(
         inner = e.this if isinstance(e, exp.Alias) else e
         if isinstance(inner, exp.Star):
             raise errors.feature_not_supported("SELECT * with GROUP BY is not supported")
-        name = alias or (_column_name(inner) if isinstance(inner, exp.Column) else "?column?")
+        name = alias or (
+            _column_name(inner)
+            if isinstance(inner, exp.Column)
+            else _cast_output_name(inner) or "?column?"
+        )
         out_columns.append((onames.fresh(name), _infer_scalar_tag(inner, resolve)))
         out_exprs.append(inner)
         if alias is not None:
@@ -6055,6 +7427,27 @@ def _having_to_match(
             term, lit, on_left = right, left, False
         field, tag = field_tag(term)
         value = typemap.coerce(_literal(lit), tag)
+        # A min/max over a timestamp accumulates the sub-millisecond composite,
+        # so the literal has to be compared in the same shape. Only min/max --
+        # a GROUP BY key (`_id.<col>`) is still the stored date, and lowering
+        # that here would compare a composite against a plain field.
+        # Both a min/max accumulator AND a GROUP BY key hold the composite now,
+        # so both need the literal lowered. A HAVING term is one or the other.
+        _agg = _aggregate_of(term)
+        _is_composite = (_agg is not None and _agg[0] in ("min", "max")) or (
+            _agg is None and isinstance(term, exp.Column)
+        )
+        if tag in subms.SUBMS_TAGS and _is_composite:
+            if isinstance(node, exp.EQ):
+                _op = "$eq"
+            elif isinstance(node, exp.NEQ):
+                _op = "$ne"
+            else:
+                _cmp, _flip = _HAVING_CMP[type(node)]
+                _op = _cmp if on_left else _flip
+            _composite = subms.composite_cmp_filter(field, _op, value)
+            if _composite is not None:
+                return _composite
         if isinstance(node, exp.EQ):
             return {field: value}
         if isinstance(node, exp.NEQ):
@@ -6316,6 +7709,24 @@ class _OnTranslator:
         if isinstance(node, exp.EQ) and isinstance(node.expression, exp.Any):
             elems = [self.expr(e) for e in _array_elements(node.expression.this)]
             return {"$in": [self.expr(node.this), elems]}
+        # ``col IN ('p', 'u', 'x')`` — same $in lowering (psql's ``\\d`` index
+        # listing joins pg_constraint with a literal IN list).
+        if isinstance(node, exp.In) and node.args.get("expressions"):
+            elems = [self.expr(e) for e in node.args["expressions"]]
+            return {"$in": [self.expr(node.this), elems]}
+        # ``(col).field`` — composite-value access on a record column (the
+        # ``(i.keys).x`` term in pgjdbc's index-metadata join). A record cell
+        # is a subdocument, so the access is just the dotted field path; only
+        # the NEW (being-joined) side lowers this way — an outer composite
+        # would need its full path let-bound.
+        if (
+            isinstance(node, exp.Dot)
+            and isinstance(node.this, exp.Paren)
+            and isinstance(node.this.this, exp.Column)
+        ):
+            base = self.expr(node.this.this)
+            if isinstance(base, str) and base.startswith("$") and not base.startswith("$$"):
+                return f"{base}.{node.expression.name}"
         for cls, op in self._OPS.items():
             if isinstance(node, cls):
                 return {op: [self.expr(node.this), self.expr(node.expression)]}
@@ -6610,6 +8021,94 @@ def _lateral_stage(
     return alias, tdef, stages
 
 
+def _srf_body(stmt: exp.Expression) -> Any:
+    """The ``SrfSource`` when ``stmt`` is a SELECT whose FROM is a base-less
+    set-returning function, else None."""
+    from secantus.sql import srf
+
+    if not isinstance(stmt, exp.Select):
+        return None
+    return srf.from_source(stmt)
+
+
+def _is_srf_table_source(node: exp.Expression) -> bool:
+    """True for a table function sitting directly in FROM / JOIN position.
+
+    sqlglot models it as a ``Table`` whose ``this`` is the function node rather
+    than an identifier, which is why such a source used to fall through to the
+    catalog lookup and report ``relation "" does not exist``."""
+    from secantus.sql import srf
+
+    if isinstance(node, exp.Unnest):
+        return True
+    return isinstance(node, exp.Table) and srf._is_srf_node(node.this)
+
+
+def _srf_out_columns(
+    stmt: exp.Select, db: str, catalog: Any, storage: Any
+) -> list[tuple[str, str]]:
+    """Output (name, tag) shape of a base-less SRF SELECT.
+
+    Built by asking ``srf`` to materialize the source, which is how the engine
+    derives the same shape at run time — so the planner's column types agree
+    with the rows the executor will produce. The evaluation is best-effort:
+    an SRF whose arguments need session state (``generate_series(1,
+    array_upper(current_schemas(false), 1))``) cannot be resolved from here,
+    and those columns fall back to the untyped tag rather than a guess.
+    """
+    from secantus.sql import scalar, srf
+
+    source = srf.from_source(stmt)
+    names: list[str] = []
+    if source is not None:
+        try:
+            _rows, tdef = srf.build(source, scalar.ScalarContext(storage, catalog, db, None))
+            by_name = {c.name: c.type_tag for c in tdef.columns}
+            names = list(by_name)
+        except Exception:
+            by_name = {}
+            names = list(source.column_aliases) or [source.table_alias or "?column?"]
+    else:  # pragma: no cover - guarded by the caller
+        by_name = {}
+
+    projected = _srf_projected_names(stmt, names)
+    return [(n, by_name.get(n, "any")) for n in projected]
+
+
+def _srf_projected_names(stmt: exp.Select, source_names: list[str]) -> list[str]:
+    """The SELECT's output names over an SRF source: the source's own columns
+    for ``SELECT *``, else the projection's aliases / column names."""
+    out: list[str] = []
+    for e in stmt.expressions:
+        target = e.this if isinstance(e, exp.Alias) else e
+        if isinstance(target, exp.Star):
+            out.extend(source_names)
+            continue
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        out.append(alias or (target.name if isinstance(target, exp.Column) else "?column?"))
+    return out or source_names
+
+
+def _fromless_out_columns(stmt: exp.Select) -> list[tuple[str, str]]:
+    """Output (name, tag) shape of a FROM-less SELECT — used for derived tables
+    whose inner query has no row source (``FROM (SELECT 1 AS x) AS a``)."""
+    cols: list[tuple[str, str]] = []
+    for e in stmt.expressions:
+        alias = e.alias if isinstance(e, exp.Alias) else None
+        target = e.this if isinstance(e, exp.Alias) else e
+        name = alias or (
+            target.name
+            if isinstance(target, exp.Column)
+            else _cast_output_name(target) or "?column?"
+        )
+        try:
+            tag = _infer_scalar_tag(target, _const_scope)
+        except errors.SQLError:
+            tag = "text"
+        cols.append((name, tag))
+    return cols
+
+
 def _resolve_source(
     node: exp.Expression, db: str, catalog: Any, storage: Any, derived: list[DerivedTable]
 ) -> tuple[str, TableDef]:
@@ -6621,13 +8120,93 @@ def _resolve_source(
     named by the alias before running the main pipeline)."""
     if isinstance(node, exp.Lateral):
         raise errors.feature_not_supported("LATERAL cannot be the first FROM item")
+    if isinstance(node, exp.Table) and isinstance(node.this, exp.Values):
+        # Extra grouping parens make sqlglot parse ``((VALUES …) AS t (…))``
+        # as a Table WRAPPING the Values (CrystalReports' {oj (((…)))} shape)
+        # — move the alias onto the Values node and take the normal branch.
+        inner = node.this
+        inner.set("alias", node.args.get("alias"))
+        node = inner
+    if isinstance(node, exp.Values):
+        # ``FROM (VALUES (…), …) AS alias(c1, c2)`` — a constant derived table.
+        # Column names from the alias list, tags inferred from the first row.
+        alias_node = node.args.get("alias")
+        alias = alias_node.name if alias_node is not None else ""
+        if not alias:
+            raise errors.feature_not_supported("VALUES in FROM requires an alias")
+        first = node.expressions[0].expressions if node.expressions else []
+        acols = [c.name for c in (alias_node.args.get("columns") or [])]
+        if len(acols) < len(first):
+            # PG allows an alias with fewer columns — the rest keep the
+            # default column1..columnN names.
+            acols = acols + [f"column{i + 1}" for i in range(len(acols), len(first))]
+        tags = []
+        for cell in first:
+            try:
+                tags.append(_infer_value_tag(_literal(cell)))
+            except errors.SQLError:
+                tags.append("text")
+        cols = list(zip(acols, tags, strict=False))
+        tdef = TableDef(
+            name=alias,
+            collection=alias,
+            columns=[Column(n, t, n, pk=False, nullable=True) for n, t in cols],
+        )
+        derived.append(DerivedTable(name=alias, plan=RawDerived(node, acols), columns=cols))
+        return alias, tdef
     if isinstance(node, exp.Subquery):
         alias = node.alias
         if not alias:
             raise errors.feature_not_supported("a derived table requires an alias")
         sub = node.this
+        if isinstance(sub, exp.SetOperation):
+            # ``FROM (SELECT … UNION SELECT …) AS alias`` — column shape from
+            # planning the first arm; the executor materializes the whole set
+            # operation through the engine (dedup / ALL semantics included).
+            arm: exp.Expression = sub
+            while isinstance(arm, exp.SetOperation):
+                arm = arm.left
+            if isinstance(arm, exp.Subquery):
+                arm = arm.this
+            if not isinstance(arm, exp.Select):
+                raise errors.feature_not_supported(f"unsupported derived table: {node.sql()}")
+            if arm.args.get("from_") is None:
+                cols = _fromless_out_columns(arm)
+            else:
+                cols = plan_pipeline_select(arm, db, catalog, storage).out_columns
+            tdef = TableDef(
+                name=alias,
+                collection=alias,
+                columns=[Column(n, t, n, pk=False, nullable=True) for n, t in cols],
+            )
+            derived.append(DerivedTable(name=alias, plan=sub, columns=cols))
+            return alias, tdef
         if not isinstance(sub, exp.Select):
             raise errors.feature_not_supported(f"unsupported derived table: {node.sql()}")
+        if _srf_body(sub) is not None:
+            # ``FROM (SELECT … FROM generate_series(…) AS s(r)) AS d`` — the
+            # engine's base-less SRF path already materializes this shape, so
+            # hand it over as a raw sub-plan rather than pipelining it (there
+            # is no collection to pipeline over).
+            cols = _srf_out_columns(sub, db, catalog, storage)
+            tdef = TableDef(
+                name=alias,
+                collection=alias,
+                columns=[Column(n, t, n, pk=False, nullable=True) for n, t in cols],
+            )
+            derived.append(DerivedTable(name=alias, plan=RawDerived(sub), columns=cols))
+            return alias, tdef
+        if sub.args.get("from_") is None:
+            # ``FROM (SELECT 1 AS x) AS a`` — no row source to pipeline; the
+            # executor runs the constant SELECT through the engine.
+            cols = _fromless_out_columns(sub)
+            tdef = TableDef(
+                name=alias,
+                collection=alias,
+                columns=[Column(n, t, n, pk=False, nullable=True) for n, t in cols],
+            )
+            derived.append(DerivedTable(name=alias, plan=RawDerived(sub), columns=cols))
+            return alias, tdef
         sub_plan = plan_pipeline_select(sub, db, catalog, storage)
         cols = sub_plan.out_columns
         tdef = TableDef(
@@ -6637,6 +8216,26 @@ def _resolve_source(
         )
         derived.append(DerivedTable(name=alias, plan=sub_plan, columns=cols))
         return alias, tdef
+    if _is_srf_table_source(node):
+        # A table function in JOIN position (``JOIN generate_series(…) AS s(r)``).
+        # Wrapping it in a SELECT reduces it to the base-less SRF shape the
+        # engine already materializes, so it goes through the same raw sub-plan
+        # path as a derived table over one.
+        alias_node = node.args.get("alias")
+        alias = alias_node.name if alias_node is not None else ""
+        if not alias:
+            raise errors.feature_not_supported("a set-returning function in FROM requires an alias")
+        sub = exp.Select(expressions=[exp.Star()], from_=exp.From(this=node.copy()))
+        cols = _srf_out_columns(sub, db, catalog, storage)
+        tdef = TableDef(
+            name=alias,
+            collection=alias,
+            columns=[Column(n, t, n, pk=False, nullable=True) for n, t in cols],
+        )
+        derived.append(DerivedTable(name=alias, plan=RawDerived(sub), columns=cols))
+        return alias, tdef
+    if isinstance(node, exp.Table) and not isinstance(node.this, exp.Identifier):
+        raise errors.feature_not_supported(f"unsupported FROM item: {node.sql()}")
     tdef = _lookup_table_def(catalog, db, node, storage)
     if tdef is None:
         raise errors.undefined_table(node.name)
@@ -6834,6 +8433,110 @@ def _append_forward_join(
     amap[join_alias] = ("join", join_table)
 
 
+def _key_comma_joins_from_where(
+    stmt: exp.Select,
+    base_alias: str,
+    base: TableDef | None = None,
+    db: str | None = None,
+    catalog: Any = None,
+    storage: Any = None,
+) -> None:
+    """Push simple cross-table equalities from WHERE onto comma-join ON clauses.
+
+    A pure comma-join (``FROM a, b, …`` — no ON, no outer side) compiles to an
+    UNKEYED ``$lookup`` that returns the entire foreign collection per outer row
+    (a cartesian product), with the join predicates applied only by the terminal
+    WHERE ``$match``. Over several catalog tables that intermediate is
+    astronomical (pgjdbc's getImportedKeys for multi-column FKs reached 183GB).
+
+    For each comma-join, move the WHERE equalities of the form ``joined.col =
+    available.col`` (both plain columns, the other side an ALREADY-available
+    alias) onto that join's ON, so the ``$lookup`` is keyed. Comma-joins are
+    INNER, so relocating an equality from the terminal ``$match`` onto the
+    inner-join ON is result-preserving. Residual predicates (single-table
+    filters, array-subscript / expression joins) stay in WHERE. Idempotent — a
+    re-plan finds the joins already carry an ON and does nothing."""
+    joins = stmt.args.get("joins") or []
+    where = stmt.args.get("where")
+    if where is None or not any(j.args.get("on") is None and not j.args.get("side") for j in joins):
+        return
+    conjuncts = _and_conjuncts(where.this)
+    available = {base_alias}
+    consumed: set[int] = set()
+    # Which alias owns each column NAME. The sqllogictest corpus writes its join
+    # equalities unqualified (``WHERE a3=b9``, not ``t3.a3=t9.b9``), so without
+    # this every comma join stayed unkeyed and the plan degenerated into the
+    # cartesian product this function exists to prevent. Only UNAMBIGUOUS names
+    # are usable: a name declared by two joined tables can't be attributed, and
+    # guessing would key the join on the wrong table.
+    owner_of: dict[str, str | None] = {}
+    if catalog is not None and db is not None:
+        defs: list[tuple[str, TableDef]] = []
+        if base is not None:
+            defs.append((base_alias, base))
+        for jn in joins:
+            src = jn.this
+            a = _join_source_alias(src)
+            if a is None or not isinstance(src, exp.Table):
+                continue
+            tdef = _lookup_table_def(catalog, db, src, storage)
+            if tdef is not None:
+                defs.append((a, tdef))
+        for alias, tdef in defs:
+            for col in tdef.columns:
+                # None marks "ambiguous" — seen under more than one alias.
+                owner_of[col.name] = None if col.name in owner_of else alias
+
+    def alias_of(node: exp.Column) -> str | None:
+        return node.table or owner_of.get(node.name)
+
+    for jn in joins:
+        alias = _join_source_alias(jn.this)
+        if jn.args.get("on") is not None or jn.args.get("side") or alias is None:
+            if alias is not None:
+                available.add(alias)
+            continue
+        keys: list[exp.Expression] = []
+        for i, c in enumerate(conjuncts):
+            if (
+                i in consumed
+                or not isinstance(c, exp.EQ)
+                or not isinstance(c.this, exp.Column)
+                or not isinstance(c.expression, exp.Column)
+            ):
+                continue
+            la, ra = alias_of(c.this), alias_of(c.expression)
+            if (la == alias and ra in available and ra != alias) or (
+                ra == alias and la in available and la != alias
+            ):
+                keys.append(c)
+                consumed.add(i)
+        if keys:
+            # QUALIFY the relocated columns. The equality may have arrived
+            # unqualified (`a3=b9`), and an ON clause has to say which side is
+            # local and which is foreign for the `$lookup` to be keyed at all.
+            def qualified(node: exp.Column) -> exp.Column:
+                owner = alias_of(node)
+                return exp.column(node.name, table=owner) if owner else node.copy()
+
+            on: exp.Expression | None = None
+            for k in keys:
+                eq = exp.EQ(this=qualified(k.this), expression=qualified(k.expression))
+                on = eq if on is None else exp.And(this=on, expression=eq)
+            jn.set("on", on)
+        available.add(alias)
+    if not consumed:
+        return
+    remaining = [c for i, c in enumerate(conjuncts) if i not in consumed]
+    if remaining:
+        new_where = remaining[0].copy()
+        for c in remaining[1:]:
+            new_where = exp.And(this=new_where, expression=c.copy())
+        stmt.set("where", exp.Where(this=new_where))
+    else:
+        stmt.set("where", None)
+
+
 def _build_join_pipeline(
     stmt: exp.Select, db: str, catalog: Any, storage: Any
 ) -> tuple[
@@ -6894,6 +8597,11 @@ def _build_join_pipeline(
     amap: dict[str, tuple[str, TableDef]] = {base_alias: ("base", base)}
     pipeline: list[dict[str, Any]] = []
 
+    # Key comma-joins from WHERE before building stages: an unkeyed comma-join
+    # $lookup returns the WHOLE foreign collection (a cartesian product), so a
+    # multi-table comma-join over the catalogs explodes (getImportedKeys 183GB).
+    _key_comma_joins_from_where(stmt, base_alias, base, db, catalog, storage)
+
     # Each JOIN compiles to a $lookup + $unwind. The lookup's localField may point
     # into an already-joined alias (a chain like a⋈b⋈c where c joins on b), which
     # Mongo's dotted localField handles since b was unwound into the doc.
@@ -6905,8 +8613,201 @@ def _build_join_pipeline(
     # A correlated / EXISTS WHERE is left for per-row evaluation (see
     # ``_build_evaluated_join``); only a pushdown-able WHERE becomes a ``$match``.
     if where is not None and not where_needs_per_row(stmt) and _join_where_lowerable(stmt, resolve):
-        pipeline.append({"$match": _expr_to_filter(where.this, resolve, _pipeline_subctx.get())})
+        filt = _expr_to_filter(where.this, resolve, _pipeline_subctx.get())
+        residual = _push_single_table_predicates(filt, pipeline, amap, base_alias)
+        if residual:
+            pipeline.append({"$match": residual})
     return base, amap, resolve, pipeline, derived
+
+
+def _filter_field_keys(value: Any) -> list[str]:
+    """Every field key a (possibly nested) filter fragment touches.
+
+    Operator keys are structural, not fields, so they are walked through rather
+    than collected — what comes back is the set of document paths the fragment
+    constrains.
+    """
+    out: list[str] = []
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k.startswith("$"):
+                out.extend(_filter_field_keys(v))
+            else:
+                out.append(k)
+    elif isinstance(value, list):
+        for item in value:
+            out.extend(_filter_field_keys(item))
+    return out
+
+
+def _sole_filter_owner(
+    value: Any, amap: dict[str, tuple[str, TableDef]], base_alias: str | None
+) -> str | None:
+    """The one alias every field in ``value`` belongs to, or None if it spans
+    tables (or touches nothing attributable)."""
+    owners: set[str] = set()
+    keys = _filter_field_keys(value)
+    if not keys:
+        return None
+    for key in keys:
+        prefix, _, rest = key.partition(".")
+        if rest and prefix in amap:
+            owners.add(prefix)
+        elif not rest and prefix not in amap:
+            owners.add(base_alias or "")
+        else:
+            return None
+        if len(owners) > 1:
+            return None
+    return next(iter(owners)) if owners else None
+
+
+def _strip_alias_prefix(value: Any, alias: str) -> Any:
+    """``value`` with a leading ``alias.`` removed from every field key — the
+    lookup sub-pipeline runs against that collection, so its own paths apply."""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if k.startswith("$"):
+                out[k] = _strip_alias_prefix(v, alias)
+            else:
+                out[k[len(alias) + 1 :] if k.startswith(f"{alias}.") else k] = v
+        return out
+    if isinstance(value, list):
+        return [_strip_alias_prefix(item, alias) for item in value]
+    return value
+
+
+def _flatten_and(filt: dict[str, Any]) -> list[dict[str, Any]]:
+    """``filt`` as a list of single-key conjuncts, flattening nested ``$and``.
+
+    A filter carrying an OR arrives as one ``{"$and": [...]}`` key, which would
+    otherwise be judged as a single (table-spanning) conjunct.
+    """
+    out: list[dict[str, Any]] = []
+    for key, value in filt.items():
+        if key == "$and" and isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    out.extend(_flatten_and(item))
+        else:
+            out.append({key: value})
+    return out
+
+
+def _merge_frags(frags: list[dict[str, Any]]) -> dict[str, Any]:
+    """Recombine conjunct fragments, using ``$and`` only when a key repeats (two
+    predicates on one field can't share a dict key)."""
+    out: dict[str, Any] = {}
+    extra: list[dict[str, Any]] = []
+    for frag in frags:
+        for key, value in frag.items():
+            if key in out:
+                extra.append({key: value})
+            else:
+                out[key] = value
+    if extra:
+        first = dict(out)
+        out = (
+            {"$and": [first, *extra]}
+            if first
+            else ({"$and": extra} if len(extra) > 1 else extra[0])
+        )
+    return out
+
+
+def _push_single_table_predicates(
+    filt: dict[str, Any],
+    pipeline: list[dict[str, Any]],
+    amap: dict[str, tuple[str, TableDef]],
+    base_alias: str | None,
+) -> dict[str, Any]:
+    """Move each single-table WHERE conjunct to the stage that produces its rows,
+    returning whatever must still be matched after the join.
+
+    A comma join whose WHERE conjuncts each constrain ONE table is a cross
+    product in disguise — sqllogictest's ``select4`` is full of them::
+
+        SELECT b7, d5+18+d5, c2 FROM t7, t2, t5
+         WHERE c5=733 AND a2 IN (...) AND 460=e7
+
+    There is no join condition at all. Matching after the ``$lookup``s means
+    materialising |t7| x |t2| x |t5| rows to return a handful: growth measured
+    cubic in table size (27k rows 0.09s, 216k 0.56s, 1M 2.53s), so the corpus's
+    ~700-row tables are ~343M rows — the >300s in the backlog. Filtering each
+    table as it enters collapses that to the product of the SURVIVING rows.
+
+    Only a conjunct attributable to exactly one table moves:
+
+    * a bare (unprefixed) key belongs to the base table and becomes a ``$match``
+      ahead of the first ``$lookup``;
+    * an ``<alias>.<path>`` key moves into that alias's ``$lookup``
+      sub-pipeline, prefix stripped (the sub-pipeline runs against the foreign
+      collection, so the remainder is that collection's own path);
+    * an operator subtree (``$or`` / ``$nor`` / ``$expr``) moves when EVERY field
+      it touches belongs to one table — sqllogictest constrains a table with
+      nothing but ``(e9=245 OR 35=e9 OR 799=e9)``, and leaving that behind left
+      the table both unfiltered and unjoined;
+    * anything else stays behind — a subtree spanning tables cannot be decided by
+      either table alone, and a prefix that is not a joined alias is just a
+      dotted field of the base table.
+
+    A top-level ``$and`` is FLATTENED first. Whenever the WHERE contains an OR,
+    the whole filter arrives as a single ``{"$and": [...]}`` key; treating that as
+    one conjunct made it span tables, so nothing moved — not even the plain
+    single-table equalities beside it.
+
+    **A left join's lookup is never pushed into.** WHERE runs after the join, so
+    a predicate on the right table of a LEFT JOIN must delete the outer row;
+    filtering inside the lookup would leave that row with nulls and KEEP it.
+    Only an alias whose ``$unwind`` is non-preserving (an inner join) qualifies.
+    """
+    inner_aliases = {
+        str(st["$unwind"]["path"]).lstrip("$")
+        for st in pipeline
+        if isinstance(st.get("$unwind"), dict)
+        and not st["$unwind"].get("preserveNullAndEmptyArrays", False)
+    }
+
+    per_frags: dict[str, list[dict[str, Any]]] = {}
+    base_frags: list[dict[str, Any]] = []
+    residual_frags: list[dict[str, Any]] = []
+
+    for frag in _flatten_and(filt):
+        ((key, value),) = frag.items()
+        if key.startswith("$"):
+            owner = _sole_filter_owner(value, amap, base_alias)
+            if owner is not None and owner != base_alias and owner in inner_aliases:
+                per_frags.setdefault(owner, []).append({key: _strip_alias_prefix(value, owner)})
+            elif owner is not None and owner == base_alias:
+                base_frags.append(frag)
+            else:
+                residual_frags.append(frag)
+            continue
+        prefix, _, rest = key.partition(".")
+        if rest and prefix in amap and prefix != base_alias and prefix in inner_aliases:
+            per_frags.setdefault(prefix, []).append({rest: value})
+        elif not rest and prefix not in amap:
+            base_frags.append(frag)
+        else:
+            residual_frags.append(frag)
+
+    for stage in pipeline:
+        lookup = stage.get("$lookup")
+        if not isinstance(lookup, dict):
+            continue
+        pushed = per_frags.pop(str(lookup.get("as")), None)
+        if pushed:
+            lookup.setdefault("pipeline", []).insert(0, {"$match": _merge_frags(pushed)})
+    # An alias whose $lookup wasn't found keeps its predicate rather than losing it.
+    for alias, frags in per_frags.items():
+        for frag in frags:
+            for path, value in frag.items():
+                residual_frags.append({f"{alias}.{path}": value})
+
+    if base_frags:
+        pipeline.insert(0, {"$match": _merge_frags(base_frags)})
+    return _merge_frags(residual_frags)
 
 
 def _build_outer_join_pipeline(
@@ -7282,18 +9183,20 @@ def _plan_join_select(
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
     out_enum_types: dict[int, str] = {}
+    out_sources: list[tuple[Any, int] | None] = []
     names = _NameAllocator()
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
         inner = e.this if isinstance(e, exp.Alias) else e
         if isinstance(inner, exp.Star):
             for a, (role, tdef) in amap.items():
-                for c in tdef.columns:
+                for i, c in enumerate(tdef.columns, start=1):
                     name = names.fresh(c.name)
                     project[name] = f"${c.field if role == 'base' else f'{a}.{c.field}'}"
                     if c.enum_type is not None:
                         out_enum_types[len(out_columns)] = c.enum_type
                     out_columns.append((name, c.type_tag))
+                    out_sources.append((tdef, i))
             continue
         path, tag = resolve(inner)
         name = names.fresh(alias or _column_name(inner))
@@ -7302,9 +9205,16 @@ def _plan_join_select(
         if src_col is not None and src_col.enum_type is not None:
             out_enum_types[len(out_columns)] = src_col.enum_type
         out_columns.append((name, tag))
+        out_sources.append(_source_table_attnum(inner, amap))
     _append_join_tail(pipeline, stmt, resolve, project, out_columns, amap)
     return PipelineSelectPlan(
-        base.collection, {}, pipeline, out_columns, out_enum_types=out_enum_types, derived=derived
+        base.collection,
+        {},
+        pipeline,
+        out_columns,
+        out_enum_types=out_enum_types,
+        derived=derived,
+        out_sources=out_sources,
     )
 
 
@@ -7624,7 +9534,7 @@ def _join_grouping_set_branch(
     ``(stages, out_columns, post_aggregates)`` — statistical / bitwise finishes run
     in Python over the union (identical across branches)."""
     in_set = set(gset)
-    group_id = {c: f"${key_path[c]}" for c in gset} or None
+    group_id = {c: _group_key_expr(key_path[c], key_tag.get(c)) for c in gset} or None
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
     project: dict[str, Any] = {"_id": 0}
@@ -7973,7 +9883,7 @@ def _plan_join_grouping_sets_window_select(
 
     def branch(gset: list[str]) -> list[dict[str, Any]]:
         in_set = set(gset)
-        group_id = {c: f"${key_path[c]}" for c in gset} or None
+        group_id = {c: _group_key_expr(key_path[c], key_tag.get(c)) for c in gset} or None
         project: dict[str, Any] = {"_id": 0}
         for c in group_cols:
             project[c] = f"$_id.{c}" if c in in_set else {"$literal": None}
@@ -8235,6 +10145,27 @@ def _join_having_to_match(
             term, lit, on_left = right, left, False
         field, tag = field_tag(term)
         value = typemap.coerce(_literal(lit), tag)
+        # A min/max over a timestamp accumulates the sub-millisecond composite,
+        # so the literal has to be compared in the same shape. Only min/max --
+        # a GROUP BY key (`_id.<col>`) is still the stored date, and lowering
+        # that here would compare a composite against a plain field.
+        # Both a min/max accumulator AND a GROUP BY key hold the composite now,
+        # so both need the literal lowered. A HAVING term is one or the other.
+        _agg = _aggregate_of(term)
+        _is_composite = (_agg is not None and _agg[0] in ("min", "max")) or (
+            _agg is None and isinstance(term, exp.Column)
+        )
+        if tag in subms.SUBMS_TAGS and _is_composite:
+            if isinstance(node, exp.EQ):
+                _op = "$eq"
+            elif isinstance(node, exp.NEQ):
+                _op = "$ne"
+            else:
+                _cmp, _flip = _HAVING_CMP[type(node)]
+                _op = _cmp if on_left else _flip
+            _composite = subms.composite_cmp_filter(field, _op, value)
+            if _composite is not None:
+                return _composite
         if isinstance(node, exp.EQ):
             return {field: value}
         if isinstance(node, exp.NEQ):
@@ -8740,6 +10671,14 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     # ``array[x::inet, …]`` — a bare array constructor types as its elements'
     # array type when an element's tag is knowable (a cast or nested literal).
     if isinstance(node, exp.Array) and node.expressions:
+        nested = next((e for e in node.expressions if isinstance(e, exp.Array)), None)
+        if nested is not None:
+            # ``ARRAY[ARRAY[1], …]`` — a multidimensional array keeps its BASE
+            # array type: PG has ONE array oid per element type regardless of
+            # dimensionality (the pgtest corpus reads the binary element oid).
+            inner = _infer_scalar_tag(nested, resolve)
+            if typemap.is_array_tag(inner):
+                return inner
         first = next((e for e in node.expressions if isinstance(e, exp.Cast)), None)
         elem_tag = typemap.type_tag_for_sql(first.to) if first is not None else None
         if elem_tag and not typemap.is_array_tag(elem_tag) and f"{elem_tag}[]" in typemap.PG_OID:
@@ -8752,6 +10691,26 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
             _udf = _udf_lookup(node, _sub.catalog, _sub.db)
             if _udf is not None and _udf.get("return_tag"):
                 return _udf["return_tag"]
+    # A scalar subquery types as its single projected column — a plain inner
+    # column reference adopts the inner table's declared tag (PG types scalar
+    # subqueries statically; without this a datetime subquery wires as text).
+    if isinstance(node, exp.Subquery) and isinstance(node.this, exp.Select):
+        inner = node.this
+        exprs = inner.expressions
+        _sub = _pipeline_subctx.get()
+        if len(exprs) == 1 and _sub is not None and getattr(_sub, "catalog", None) is not None:
+            target = exprs[0].this if isinstance(exprs[0], exp.Alias) else exprs[0]
+            tbl_node = inner.find(exp.Table)
+            if isinstance(target, exp.Column) and tbl_node is not None:
+                try:
+                    tdef = _lookup_table_def(
+                        _sub.catalog, _sub.db, tbl_node, getattr(_sub, "storage", None)
+                    )
+                except errors.SQLError:
+                    tdef = None
+                col = tdef.column(target.name) if tdef is not None else None
+                if col is not None:
+                    return col.type_tag
     # Range operators (@> / <@ / &&) over a range operand are boolean; a range
     # constructor / cast is the range type. (Non-range @> / <@ fall through to the
     # jsonb typing below.)
@@ -8766,6 +10725,9 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         return str(node.this).lower()
     # ``row(...)`` -> an anonymous record.
     if isinstance(node, exp.Anonymous) and str(node.this).lower() == "row":
+        return "composite"
+    # ``(a, b, …)`` parenthesized tuple — an anonymous record constructor.
+    if isinstance(node, exp.Tuple):
         return "composite"
     # ``range_merge(a, b)`` -> the operands' range type.
     if isinstance(node, exp.Anonymous) and str(node.this).lower() == "range_merge":
@@ -8951,6 +10913,8 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
                 "json",
                 "aclitem",
                 "name",
+                "char1",
+                "jsonpath",
             )
             or _mapped in typemap._GEO_TAGS
         ):
@@ -9017,9 +10981,25 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         return "numeric"
     srf = _srf_of(node)
     if srf is not None:
-        # jsonb_array_elements → json elements; jsonb_object_keys → text keys;
-        # unnest(indkey/indclass) → attnum/opclass oid; generate_subscripts → ord.
-        return {"jsonb_array_elements": "json", "jsonb_object_keys": "text"}.get(srf[0], "int4")
+        kind, array_expr = srf
+        # jsonb_array_elements → json elements; jsonb_object_keys → text keys.
+        fixed = {"jsonb_array_elements": "json", "jsonb_object_keys": "text"}.get(kind)
+        if fixed is not None:
+            return fixed
+        # A subscript is an int whatever the array holds.
+        if kind == "generate_subscripts" or kind.endswith("._n") or kind.endswith(".n"):
+            return "int4"
+        # `unnest(arr)` and `(_pg_expandarray(arr)).x` yield the array's ELEMENT
+        # type. This used to default to int4 for every array, which is a wire
+        # lie for anything else: the server declared int4 in the RowDescription
+        # and then sent `a` / `1.5` / `t`, so a strict client did `int('a')` and
+        # died. Only integer arrays worked, and only by luck.
+        elem = _infer_scalar_tag(array_expr, resolve)
+        if elem and elem.endswith("[]"):
+            return elem[:-2]
+        # Unknown element type: `any` lets the wire pick text rather than
+        # asserting a type the values may not honour.
+        return elem or "any"
     # A boolean-producing expression (IS NOT NULL, comparisons, AND/OR) must type
     # as bool, not text — else its value rides the wire as the string 'f'/'t' and
     # a driver reads ``if row["x"]`` as truthy (SQLAlchemy's duplicates_constraint).
@@ -9284,6 +11264,7 @@ def _build_evaluated_join(
     out_columns: list[tuple[str, str]] = []
     out_enum_types: dict[int, str] = {}
     out_exprs: list[exp.Expression] = []
+    alias_exprs: dict[str, exp.Expression] = {}
     names = _NameAllocator()
     for e in stmt.expressions:
         alias = e.alias if isinstance(e, exp.Alias) else None
@@ -9299,18 +11280,34 @@ def _build_evaluated_join(
         if isinstance(inner, exp.Column):
             name = alias or _column_name(inner)
         else:
-            name = alias or "?column?"
+            name = alias or _cast_output_name(inner) or "?column?"
         src_col = _column_for_order_node(inner, amap)
         if src_col is not None and src_col.enum_type is not None:
             out_enum_types[len(out_columns)] = src_col.enum_type
         out_columns.append((names.fresh(name), _infer_scalar_tag(inner, resolve)))
         out_exprs.append(inner)
+        if alias is not None:
+            alias_exprs[alias] = inner
 
+    # ORDER BY may name a SELECT output alias (``ORDER BY "TABLE_TYPE"`` in
+    # pgjdbc's getTables) or an ordinal — Postgres resolves both to the output
+    # expression, and ``resolve`` only knows input columns, so a computed
+    # output alias must be substituted here or sorting raises 42703.
     order: list[tuple[exp.Expression, int, bool]] = []
     order_node = stmt.args.get("order")
     if order_node is not None:
         for o in order_node.expressions:
-            order.append((o.this, -1 if o.args.get("desc") else 1, _nulls_first(o)))
+            term = o.this
+            if isinstance(term, exp.Column) and not term.table and term.name in alias_exprs:
+                term = alias_exprs[term.name]
+            elif (
+                isinstance(term, exp.Literal)
+                and not term.is_string
+                and str(term.name).isdigit()
+                and 1 <= int(term.name) <= len(out_exprs)
+            ):
+                term = out_exprs[int(term.name) - 1]
+            order.append((term, -1 if o.args.get("desc") else 1, _nulls_first(o)))
     limit, skip = _limit_skip(stmt)
     # A correlated / EXISTS WHERE wasn't pushed into the pipeline (see
     # ``_build_join_pipeline``); carry it for per-joined-row evaluation.
@@ -9339,6 +11336,10 @@ def _build_evaluated_join(
         where=residual,
         distinct_on=don,
         enum_orders=enum_orders,
+        # A computed output in the list (which is what routed this join to the
+        # evaluator) must not strip the base-column identity from its plain
+        # siblings — they still name a real column of a real table.
+        out_sources=[_source_table_attnum(e, amap) for e in out_exprs],
     )
 
 
@@ -9635,6 +11636,13 @@ UNCOMMENT_SENTINEL = "\x00__secantus_uncomment__"
 # Only a whole ``COMMENT ON … IS NULL`` statement — anchored so a query's
 # ``WHERE x IS NULL`` is never touched.
 _COMMENT_NULL_RE = re.compile(r"(?is)^(\s*COMMENT\s+ON\b.*\bIS\s+)NULL(\s*;?\s*)$")
+_CREATE_FUNCTION_RE = re.compile(r"\bcreate\s+(?:or\s+replace\s+)?function\b", re.I)
+#: CREATE [OR REPLACE] PROCEDURE — routed to a Command so the engine's regex
+#: parser handles it (sqlglot rejects the ``a INOUT int`` argmode syntax).
+_CREATE_PROCEDURE_RE = re.compile(r"(?is)^\s*create\s+(?:or\s+replace\s+)?procedure\b")
+_DROP_PROCEDURE_RE = re.compile(r"(?is)^\s*drop\s+procedure\b")
+_RETURNS_TRIGGER_RE = re.compile(r"(\breturns\s+)trigger\b", re.I)
+
 # sqlglot parses COPY's options only in the ``WITH (…)`` spelling; the bare
 # ``COPY … TO STDOUT (FORMAT csv)`` form (what psycopg emits) needs the WITH
 # inserted. Anchored on the STDIN/STDOUT target and a known option keyword so a
@@ -9648,6 +11656,58 @@ _COPY_BARE_OPTIONS_RE = re.compile(
 # A ``::numeric(p,-s)`` cast — the only spot Postgres syntax allows a negative
 # scale. Anchored on the ``::`` cast so a matching text inside a string literal
 # isn't touched.
+def _rewrite_quoted_char_types(sql: str) -> str:
+    """Replace the QUOTED ``"char"`` type spelling (PG's internal one-byte
+    type, oid 18) with the ``pg_char_1`` sentinel before parse — sqlglot
+    collapses the quoted spelling into plain CHAR in both cast and column-def
+    positions, losing the identity. Token-context aware so a ``"char"``
+    column NAME, alias, or string literal is never touched: rewrites after
+    ``::``, after ``AS`` only inside a CAST(...), and after an identifier in a
+    CREATE/ALTER statement (a column def's type position)."""
+    from sqlglot.tokens import TokenType
+
+    try:
+        tokens = sqlglot.tokenize(sql, read="postgres")
+    except Exception:
+        return sql
+    is_ddl = bool(tokens) and tokens[0].token_type in (TokenType.CREATE, TokenType.ALTER)
+    spans: list[tuple[int, int]] = []
+    for i, tok in enumerate(tokens):
+        if tok.text != "char" or sql[tok.start : tok.end + 1] != '"char"':
+            continue
+        if i == 0:
+            continue
+        ptt = tokens[i - 1].token_type
+        if ptt == TokenType.DCOLON:
+            spans.append((tok.start, tok.end + 1))
+        elif ptt == TokenType.ALIAS:
+            # ``CAST(expr AS "char")`` vs an ``AS "char"`` output alias: walk
+            # back to the paren opening this depth and require CAST before it.
+            depth = 0
+            for j in range(i - 2, -1, -1):
+                jtt = tokens[j].token_type
+                if jtt == TokenType.R_PAREN:
+                    depth += 1
+                elif jtt == TokenType.L_PAREN:
+                    if depth == 0:
+                        if j > 0 and tokens[j - 1].text.upper() in ("CAST", "TRY_CAST"):
+                            spans.append((tok.start, tok.end + 1))
+                        break
+                    depth -= 1
+        elif is_ddl and ptt in (TokenType.VAR, TokenType.IDENTIFIER):
+            # ``CREATE TABLE t (c "char" ...)`` — the type follows the column
+            # name. A quoted "char" COLUMN name follows ``(`` or ``,`` instead.
+            spans.append((tok.start, tok.end + 1))
+    for start, end in reversed(spans):
+        sql = sql[:start] + "pg_char_1" + sql[end:]
+    return sql
+
+
+#: crdb's ``ADD COLUMN ... NOT VISIBLE`` modifier (the pgtest copy corpus
+#: uses it in an unmarked stanza) — sqlglot can't parse it; the column is
+#: added as a normal visible column.
+_NOT_VISIBLE_RE = re.compile(r"(\bADD\s+COLUMN\s+[^,']*?)\s+NOT\s+VISIBLE\b", re.I)
+
 _NEGSCALE_RE = re.compile(r"(::\s*(?:numeric|decimal)\s*\(\s*\d+\s*,\s*)-\s*(\d+)(\s*\))", re.I)
 
 # ``BEGIN`` / ``START TRANSACTION`` with transaction characteristics — sqlglot
@@ -9656,10 +11716,75 @@ _NEGSCALE_RE = re.compile(r"(::\s*(?:numeric|decimal)\s*\(\s*\d+\s*,\s*)-\s*(\d+
 # pure keywords (letters/commas/whitespace), so a compound statement never
 # matches and falls through to sqlglot.
 _BEGIN_CHARACTERISTICS_RE = re.compile(
-    r"^\s*(?:BEGIN|START\s+TRANSACTION)(?:\s+(?:WORK|TRANSACTION))?\s+"
-    r"(?P<tail>(?:ISOLATION|READ|NOT|DEFERRABLE)[A-Za-z,\s]*?)\s*;?\s*$",
+    r"^\s*(?:BEGIN|START\s+TRANSACTION)(?:\s+(?:WORK|TRANSACTION))?"
+    r"(?:\s+(?P<tail>(?:ISOLATION|READ|NOT|DEFERRABLE)[A-Za-z,\s]*?))?\s*;?\s*$",
     re.IGNORECASE,
 )
+
+
+def _split_top_level_semicolons(sql: str) -> list[str]:
+    """Split a multi-statement string on semicolons OUTSIDE quotes, dollar
+    quotes and comments — the batch fallback when sqlglot rejects the string
+    as a whole but the individual statements parse (``BEGIN READ ONLY``
+    mid-batch takes the regex path only per-statement)."""
+    parts: list[str] = []
+    buf: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    break
+                j += 1
+            buf.append(sql[i : j + 1])
+            i = j + 1
+            continue
+        if c == '"':
+            j = sql.find('"', i + 1)
+            j = n - 1 if j < 0 else j
+            buf.append(sql[i : j + 1])
+            i = j + 1
+            continue
+        if c == "$":
+            m = re.match(r"\$[A-Za-z_0-9]*\$", sql[i:])
+            if m is not None:
+                tag = m.group(0)
+                end = sql.find(tag, i + len(tag))
+                end = n if end < 0 else end + len(tag)
+                buf.append(sql[i:end])
+                i = end
+                continue
+        if c == "-" and sql[i : i + 2] == "--":
+            j = sql.find("\n", i)
+            j = n if j < 0 else j + 1
+            buf.append(sql[i:j])
+            i = j
+            continue
+        if c == "/" and sql[i : i + 2] == "/*":
+            j = sql.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            buf.append(sql[i:j])
+            i = j
+            continue
+        if c == ";":
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    part = "".join(buf).strip()
+    if part:
+        parts.append(part)
+    return parts
+
 
 # ``SET TRANSACTION <characteristics>`` — the keyword tail, like BEGIN's.
 _SET_TRANSACTION_RE = re.compile(
@@ -9668,7 +11793,20 @@ _SET_TRANSACTION_RE = re.compile(
 )
 
 # A LISTEN / NOTIFY / UNLISTEN statement head (single statement only).
+_MULTI_DROP_TABLE_RE = re.compile(
+    r"(?is)^\s*DROP\s+TABLE\s+(?P<if_exists>IF\s+EXISTS\s+)?"
+    r"(?P<names>[^;]+?)\s*;?\s*$"
+)
 _PUBSUB_HEAD_RE = re.compile(r"^\s*(?:LISTEN|UNLISTEN|NOTIFY)\b[^;]*;?\s*$", re.IGNORECASE)
+
+# ``COMMENT ON CONSTRAINT c ON t IS '…'`` — sqlglot's Comment node can't
+# express the two-name form; carry the raw text as a Command the engine's
+# constraint-comment handler parses with this same regex.
+COMMENT_CONSTRAINT_RE = re.compile(
+    r"(?is)^\s*COMMENT\s+ON\s+CONSTRAINT\s+(?P<name>\"[^\"]+\"|[\w$]+)\s+ON\s+"
+    r"(?P<table>(?:\"[^\"]+\"|[\w$]+)(?:\.(?:\"[^\"]+\"|[\w$]+))?)\s+IS\s+"
+    r"(?P<value>'(?:[^']|'')*'|NULL)\s*;?\s*$"
+)
 
 # ``DO $tag$ body $tag$ [LANGUAGE plpgsql]`` — the dollar-quoted body.
 _DO_BLOCK_RE = re.compile(
@@ -9680,7 +11818,7 @@ _DO_BLOCK_RE = re.compile(
 #: Reject a statement string longer than this before handing it to sqlglot. 1 MB
 #: is far larger than any real query yet small enough that a flood of oversized
 #: statements can't pin the parser.
-MAX_SQL_LENGTH = 1_000_000
+MAX_SQL_LENGTH = 16_000_000
 
 
 def _resolve_group_by_ordinals(root: exp.Expression) -> None:
@@ -9709,7 +11847,82 @@ def _resolve_group_by_ordinals(root: exp.Expression) -> None:
 _ESTRING_SIMPLE = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
 
 
-def _decode_estrings(sql: str) -> str:
+#: A dollar-quote tag: ``$$`` or ``$tag$`` where the tag starts with a letter /
+#: underscore and may continue with digits (``$A0$``, ``$_0$``) — PG's rule.
+_DOLLAR_TAG_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+
+
+def _strip_nested_block_comments(sql: str) -> str:
+    """Strip block comments when (and only when) any of them NEST.
+
+    PostgreSQL nests ``/* /* */ */``; sqlglot's tokenizer does not, so a nested
+    comment mis-tokenizes into stray operators (``/*/*/*/**/*/*/*/`` became
+    ``* *``). Non-nested comments are left for sqlglot (it keeps them as
+    trivia). Strings, quoted identifiers, dollar-quoted bodies, and line
+    comments are skipped, mirroring ``_decode_estrings``'s scanner."""
+    out: list[str] = []
+    i, n = 0, len(sql)
+    nested = False
+    while i < n:
+        c = sql[i]
+        if c == "-" and sql[i : i + 2] == "--":  # line comment
+            j = sql.find("\n", i)
+            j = n if j == -1 else j + 1
+            out.append(sql[i:j])
+            i = j
+        elif c == "/" and sql[i : i + 2] == "/*":  # block comment — count depth
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if sql[j : j + 2] == "/*":
+                    depth += 1
+                    nested = True
+                    j += 2
+                elif sql[j : j + 2] == "*/":
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            out.append(" ")
+            i = j
+        elif c == '"' or c == "'":  # quoted identifier / plain literal
+            q = c
+            j = i + 1
+            while j < n:
+                if sql[j] == q:
+                    if sql[j + 1 : j + 2] == q:
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            out.append(sql[i:j])
+            i = j
+        elif (
+            c == "$"
+            and (m := _DOLLAR_TAG_RE.match(sql, i))
+            and not (i and (sql[i - 1].isalnum() or sql[i - 1] in "_$"))
+        ):  # dollar-quoted body
+            tag = m.group(0)
+            j = sql.find(tag, i + len(tag))
+            j = n if j == -1 else j + len(tag)
+            out.append(sql[i:j])
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out) if nested else sql
+
+
+def decode_nonstandard_strings(sql: str) -> str:
+    """``standard_conforming_strings = off``: every plain ``'…'`` literal
+    treats backslash as an escape character, exactly like ``E'…'``. Rewrite
+    them all (and E-strings) to standard literals before parsing. Called by the
+    engine/wire layers when the session GUC is off — ``parse`` itself is
+    session-independent (and cached), so the transform happens on the text."""
+    return _decode_estrings(sql, nonstandard=True)
+
+
+def _decode_estrings(sql: str, *, nonstandard: bool = False) -> str:
     """Rewrite every ``E'…'`` escape-string literal into an equivalent standard
     literal BEFORE sqlglot parses.
 
@@ -9746,13 +11959,23 @@ def _decode_estrings(sql: str) -> str:
                 j += 1
             out.append(sql[i:j])
             i = j
-        elif c == "$" and (m := re.match(r"\$[A-Za-z_]*\$", sql[i:])):  # dollar quote
+        elif (
+            c == "$"
+            and (m := _DOLLAR_TAG_RE.match(sql, i))
+            and not (i and (sql[i - 1].isalnum() or sql[i - 1] in "_$"))
+        ):  # dollar quote (tag may carry digits after the first char: $A0$, $_0$)
             tag = m.group(0)
             j = sql.find(tag, i + len(tag))
             j = n if j == -1 else j + len(tag)
             out.append(sql[i:j])
             i = j
         elif c == "'":  # plain literal — skip over '' doubling
+            if nonstandard:
+                # standard_conforming_strings=off: backslash escapes apply in
+                # plain literals too — decode with the E-string grammar.
+                value, i = _consume_estring(sql, i + 1)
+                out.append("'" + value.replace("'", "''") + "'")
+                continue
             j = i + 1
             while j < n:
                 if sql[j] == "'":
@@ -9828,11 +12051,77 @@ def _consume_estring(sql: str, i: int) -> tuple[str, int]:
     return "".join(buf), i  # unterminated — sqlglot will raise the syntax error
 
 
+def _fold_unquoted_identifiers(stmt: exp.Expression) -> None:
+    """Lower-case every UNQUOTED identifier, in place.
+
+    Postgres folds an unquoted identifier to lower case and keeps a quoted one
+    exactly as written, so ``AS TABLE_NAME`` and a later ``r.table_name`` name
+    the same column while ``"TABLE_NAME"`` is a different one. We compared them
+    exactly, so the two spellings were two different names — every generated or
+    SQL-standard-uppercase statement broke on it, while code that wrote and
+    read one spelling never noticed.
+
+    Doing it here, once, right after the parse means every downstream
+    consumer — alias resolution, catalog lookups, the column resolver — sees
+    one canonical spelling and needs no case logic of its own. String literals
+    are ``Literal`` nodes, not ``Identifier``, so their contents are untouched.
+    """
+    for ident in stmt.find_all(exp.Identifier):
+        if not ident.args.get("quoted") and isinstance(ident.this, str):
+            ident.set("this", ident.this.lower())
+
+
+#: Parse cache: SQL text -> pristine AST statements, handed out as copies
+#: (``exp.Expression.copy()`` measures 3-4x cheaper than a parse). Entries are
+#: cached on SECOND sight — the first occurrence only leaves a marker — so
+#: workloads of mostly-unique statements (sqllogictest's corpus, inline-literal
+#: DML) pay nothing beyond a dict probe, while repeated text (per-connection
+#: re-Parse of the same prepared statements, fixture DDL repeated across
+#: thousands of tests) hits from the second occurrence on. The cached trees
+#: never leave the cache uncopied, so downstream mutation cannot poison them.
+_PARSE_CACHE_MAX = 4096
+_PARSE_CACHE: OrderedDict[str, list[exp.Expression] | None] = OrderedDict()
+_PARSE_CACHE_LOCK = threading.Lock()
+
+
 def parse(sql: str) -> list[exp.Expression]:
-    """Parse a (possibly multi-statement) SQL string into AST statements."""
+    """Parse a (possibly multi-statement) SQL string into AST statements.
+
+    Cached: repeated text returns copies of the cached trees (see
+    ``_PARSE_CACHE``); semantics are identical to an uncached parse because
+    ``_parse_uncached`` is a pure function of the text."""
+    with _PARSE_CACHE_LOCK:
+        entry = _PARSE_CACHE.get(sql)
+        if entry is not None:
+            _PARSE_CACHE.move_to_end(sql)
+    if entry is not None:
+        return [s.copy() for s in entry]
+    stmts = _parse_uncached(sql)
+    seen_before = False
+    with _PARSE_CACHE_LOCK:
+        seen_before = sql in _PARSE_CACHE
+        if not seen_before:
+            _PARSE_CACHE[sql] = None  # first sight: mark, don't pay the copy
+            _PARSE_CACHE.move_to_end(sql)
+            while len(_PARSE_CACHE) > _PARSE_CACHE_MAX:
+                _PARSE_CACHE.popitem(last=False)
+    if seen_before:
+        pristine = [s.copy() for s in stmts]  # copy OUTSIDE the lock
+        with _PARSE_CACHE_LOCK:
+            _PARSE_CACHE[sql] = pristine
+            _PARSE_CACHE.move_to_end(sql)
+            while len(_PARSE_CACHE) > _PARSE_CACHE_MAX:
+                _PARSE_CACHE.popitem(last=False)
+    return stmts
+
+
+def _parse_uncached(sql: str) -> list[exp.Expression]:
     # Cap the statement length before parsing — a cheap upper bound on parse cost
     # so a flood of oversized statements can't pin CPU (the Mongo wire has
-    # analogous 16/48 MB size ceilings). 1 MB is far above any real query. (#194)
+    # analogous 16/48 MB size ceilings). 16 MB matches the Mongo document
+    # ceiling; the earlier 1 MB cap was falsified by a REAL query shape —
+    # pgx's 65535-parameter statements are ~1.04 MB and real PG accepts up
+    # to its 1 GB message limit. (#194)
     if len(sql) > MAX_SQL_LENGTH:
         raise errors.program_limit_exceeded(
             f"statement too long: {len(sql)} bytes exceeds the {MAX_SQL_LENGTH}-byte limit"
@@ -9842,17 +12131,45 @@ def parse(sql: str) -> list[exp.Expression]:
         return [exp.Command(this="MOVE", expression=exp.Literal.string(move.group("tail")))]
     begin = _BEGIN_CHARACTERISTICS_RE.match(sql)
     if begin is not None:
-        return [exp.Transaction(modes=[begin.group("tail")])]
+        tail = begin.group("tail")
+        return [exp.Transaction(modes=[tail] if tail else [])]
     # LISTEN / NOTIFY / UNLISTEN — sqlglot mis-parses these; carry the raw text
     # as a Command the engine's pubsub handler executes. (run_sql intercepts
     # them pre-parse; this covers the extended-protocol Parse path.)
     if _PUBSUB_HEAD_RE.match(sql):
         return [exp.Command(this="PUBSUB", expression=exp.Literal.string(sql))]
+    multi_drop = _MULTI_DROP_TABLE_RE.match(sql)
+    if multi_drop is not None and "," in multi_drop.group("names"):
+        # ``DROP TABLE [IF EXISTS] a, b, c`` — sqlglot can't parse the
+        # multi-name form (pgbench -i emits it). ONE statement in PG: one
+        # CommandComplete tag (pgtest errors:9), and without IF EXISTS the
+        # whole drop fails before any table goes. The engine executes each
+        # parsed Drop inside a single MULTIDROP_TABLE command.
+        head = "DROP TABLE " + ("IF EXISTS " if multi_drop.group("if_exists") else "")
+        cmd = exp.Command(this="MULTIDROP_TABLE", expression=exp.Literal.string(sql))
+        cmd.set(
+            "drops",
+            [
+                sqlglot.parse_one(head + name.strip(), read="postgres")
+                for name in multi_drop.group("names").split(",")
+                if name.strip()
+            ],
+        )
+        return [cmd]
+    if COMMENT_CONSTRAINT_RE.match(sql):
+        return [exp.Command(this="COMMENT_CONSTRAINT", expression=exp.Literal.string(sql))]
     # ``DO $$ … $$ [language plpgsql]`` — the body is handled by the engine's
     # minimal plpgsql interpreter (RAISE notices/exceptions).
     do_m = _DO_BLOCK_RE.match(sql)
     if do_m is not None:
         return [exp.Command(this="DO", expression=exp.Literal.string(do_m.group("body")))]
+    # CREATE [OR REPLACE] PROCEDURE / DROP PROCEDURE — sqlglot rejects the
+    # ``a INOUT int`` argmode syntax, so carry the raw text to the engine's
+    # regex-driven handlers.
+    if _CREATE_PROCEDURE_RE.match(sql):
+        return [exp.Command(this="CREATE_PROCEDURE", expression=exp.Literal.string(sql))]
+    if _DROP_PROCEDURE_RE.match(sql):
+        return [exp.Command(this="DROP_PROCEDURE", expression=exp.Literal.string(sql))]
     # ``SET TRANSACTION <characteristics>`` — sqlglot rejects some spellings
     # (``SET TRANSACTION DEFERRABLE``); route every form to the Command SET
     # handler, which applies the characteristics to the open transaction.
@@ -9877,19 +12194,53 @@ def parse(sql: str) -> list[exp.Expression]:
     sql = _COMMENT_NULL_RE.sub(lambda m: f"{m.group(1)}'{UNCOMMENT_SENTINEL}'{m.group(2)}", sql)
     # ``COPY … TO STDOUT (FORMAT csv)`` — insert the WITH sqlglot requires.
     sql = _COPY_BARE_OPTIONS_RE.sub(r"\1 WITH (", sql)
+    # ``CREATE FUNCTION … RETURNS trigger`` — sqlglot rejects the bare
+    # pseudo-type; quoting it parses as a user-defined type whose identity
+    # ``_create_function`` recognizes.
+    if _CREATE_FUNCTION_RE.search(sql):
+        sql = _RETURNS_TRIGGER_RE.sub(r'\1"trigger"', sql)
     # sqlglot can't parse a negative numeric scale (``::numeric(2,-3)``) —
     # rewrite it to a sentinel value the typmod encoder undoes (the cast
     # evaluator ignores precision/scale, so only the descriptor sees it).
     sql = _NEGSCALE_RE.sub(
         lambda m: f"{m.group(1)}{typemap.NEGSCALE_SENTINEL + int(m.group(2))}{m.group(3)}", sql
     )
+    if '"char"' in sql:
+        sql = _rewrite_quoted_char_types(sql)
+    if "visible" in sql.lower():
+        sql = _NOT_VISIBLE_RE.sub(r"\1", sql)
     # Decode E'…' escape strings ourselves — sqlglot's half-decoding is lossy.
     if "e'" in sql or "E'" in sql:
         sql = _decode_estrings(sql)
+    # PG nests block comments; sqlglot doesn't — strip them when they nest.
+    if "/*" in sql:
+        sql = _strip_nested_block_comments(sql)
     try:
-        stmts = [s for s in sqlglot.parse(_normalize_params(sql), read="postgres") if s is not None]
+        try:
+            stmts = [
+                s for s in sqlglot.parse(_normalize_params(sql), read="postgres") if s is not None
+            ]
+        except sqlglot.errors.ParseError:
+            # A batch whose INDIVIDUAL statements we can parse (some only via
+            # the regex fallbacks above — ``BEGIN READ ONLY`` mid-batch is the
+            # pgtest shape) still fails as one string. Split on top-level
+            # semicolons and parse each segment through the full entry point.
+            segments = _split_top_level_semicolons(sql)
+            if len(segments) <= 1:
+                raise
+            out: list[exp.Expression] = []
+            for seg in segments:
+                out.extend(_parse_uncached(seg))
+            return out
         for s in stmts:
+            _fold_unquoted_identifiers(s)
             _resolve_group_by_ordinals(s)
+            # Dollar-quoted strings tokenize as RawString — downstream code
+            # (scalar, typemap, every literal path) only knows Literal, so
+            # normalize in place: the value is identical, only the quoting
+            # style differed.
+            for raw in list(s.find_all(exp.RawString)):
+                raw.replace(exp.Literal.string(raw.this))
         return stmts
     except (sqlglot.errors.ParseError, sqlglot.errors.TokenError) as exc:
         raise errors.syntax_error(str(exc).splitlines()[0]) from exc

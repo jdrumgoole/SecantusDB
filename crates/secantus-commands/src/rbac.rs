@@ -53,12 +53,17 @@ pub const A_DROP_ROLE: &str = "dropRole";
 
 pub const A_SERVER_STATUS: &str = "serverStatus";
 pub const A_HOST_INFO: &str = "hostInfo";
+pub const A_TOP: &str = "top";
 pub const A_GET_CMD_LINE_OPTS: &str = "getCmdLineOpts";
 pub const A_GET_LOG: &str = "getLog";
 pub const A_INPROG: &str = "inprog";
 pub const A_KILLOP: &str = "killop";
 pub const A_FSYNC: &str = "fsync";
 pub const A_ENABLE_PROFILER: &str = "enableProfiler";
+// configureFailPoint arms server-wide fault injection (a DoS lever), so it
+// needs an explicit cluster-admin grant — mongod gates the same command
+// behind enableTestCommands AND a privileged role.
+pub const A_CONFIGURE_FAIL_POINT: &str = "configureFailPoint";
 
 // --- Resource scopes -----------------------------------------------------
 
@@ -124,12 +129,13 @@ const CLUSTER_MONITOR_ACTIONS: &[&str] = &[
     A_LIST_DATABASES,
     A_SERVER_STATUS,
     A_HOST_INFO,
+    A_TOP,
     A_GET_CMD_LINE_OPTS,
     A_GET_LOG,
     A_INPROG,
 ];
 
-const CLUSTER_ADMIN_EXTRA: &[&str] = &[A_FSYNC, A_DROP_DATABASE, A_KILLOP];
+const CLUSTER_ADMIN_EXTRA: &[&str] = &[A_FSYNC, A_DROP_DATABASE, A_KILLOP, A_CONFIGURE_FAIL_POINT];
 
 /// Actions + scope flags for a built-in role. Mirrors `rbac.py::_RoleSpec`.
 struct RoleSpec {

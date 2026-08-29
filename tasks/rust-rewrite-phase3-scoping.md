@@ -1,5 +1,12 @@
 # Phase 3+4 scoping — cursors / change streams, then the storage keystone
 
+> **HISTORICAL — superseded (audited 2026-08-20).** This plan is built on the
+> *in-process selectable-engine* model (`SECANTUS_ENGINE=python|rust|auto`, the
+> `secantus.engine` shims, the `EngineFallback` adapter). That model was retired
+> in favour of **two separate servers**, and CLAUDE.md names
+> `tasks/rust-server-plan.md` as the authoritative plan. Kept for the design
+> reasoning and the measurements; do not take its next-steps as current work.
+
 > ⚠️ **Integration model changed — see `tasks/rust-server-plan.md` (authoritative).**
 > The "dual-engine at `Storage` granularity, selected process-wide by
 > `secantus.engine`" decision in §3 below is **superseded**: there are now **two

@@ -86,14 +86,56 @@ fn main() {
     // libwiredtiger_static — references libz's inflate/deflate. libz is a system
     // library on macOS (SDK) and Linux (manylinux/musl ship zlib).
     let sys_libs: &[&str] = match target_os.as_str() {
-        "linux" => &["pthread", "rt", "dl", "z"],
-        "macos" => &["pthread", "dl", "z"],
+        "linux" => &["pthread", "rt", "dl", "z", "lz4"],
+        "macos" => &["pthread", "dl", "z", "lz4"],
         "windows" => &[],
         // Other POSIX targets (the BSDs etc.): pthread is the safe baseline.
         _ => &["pthread"],
     };
     for l in sys_libs {
         println!("cargo:rustc-link-lib=dylib={l}");
+    }
+
+    // lz4 is in `sys_libs` above because it is the default block compressor and
+    // WiredTiger's builtin extension references it. zlib stays linked too: a
+    // store created before the lz4 switch has zlib tables, and
+    // `block_compressor` is recorded at create time, so dropping zlib would
+    // make existing data unreadable.
+    //
+    // `SECANTUS_WT_EXTRA_COMPRESSORS=1` matches the CMake option of the same
+    // name and adds snappy + zstd, which are opt-in only.
+    // `SECANTUS_WT_EXTRA_LIBDIR` adds a search path (e.g. Homebrew's
+    // /opt/homebrew/lib) for any of them.
+    println!("cargo:rerun-if-env-changed=SECANTUS_WT_EXTRA_COMPRESSORS");
+    println!("cargo:rerun-if-env-changed=SECANTUS_WT_EXTRA_LIBDIR");
+    if let Ok(dir) = env::var("SECANTUS_WT_EXTRA_LIBDIR") {
+        println!("cargo:rustc-link-search=native={dir}");
+    } else if target_os == "macos" {
+        // liblz4 is a default link library now, and Apple ships none in the
+        // SDK, so the search path has to be found rather than assumed.
+        //
+        // The wheel build supplies its own static liblz4 via
+        // SECANTUS_WT_EXTRA_LIBDIR: `brew install lz4` produces a dylib
+        // targeting the runner's OS (macOS 14), which `delocate` refuses to
+        // bundle into a wheel targeting macOS 11 — see
+        // tools/build_lz4_macos.sh. Homebrew's prefixes are the fallback for a
+        // plain developer `cargo build`, where no wheel is produced and the
+        // deployment target does not matter.
+        // The wheel build points SECANTUS_WT_EXTRA_LIBDIR at its own static
+        // build (handled above); these are the developer fallbacks.
+        for prefix in ["/opt/homebrew/lib", "/usr/local/lib"] {
+            let has_static = std::path::Path::new(&format!("{prefix}/liblz4.a")).exists();
+            let has_dylib = std::path::Path::new(&format!("{prefix}/liblz4.dylib")).exists();
+            if has_static || has_dylib {
+                println!("cargo:rustc-link-search=native={prefix}");
+                break;
+            }
+        }
+    }
+    if env::var_os("SECANTUS_WT_EXTRA_COMPRESSORS").is_some() && target_os != "windows" {
+        for l in ["snappy", "zstd"] {
+            println!("cargo:rustc-link-lib=dylib={l}");
+        }
     }
 
     let header = format!("{inc}/wiredtiger.h");

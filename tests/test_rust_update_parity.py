@@ -4,7 +4,7 @@ Phase 1 net for the third ported leaf engine. For each (doc, update) the Rust
 path is run over BSON bytes; when it returns concrete bytes (didn't defer), the
 decoded result must equal the authoritative pure-Python `apply_update`. When it
 returns None (fallback — pipeline updates, positional ops, `$currentDate`,
-`$min`/`$max`/`$pull`/`$addToSet`/`$bit`, Decimal128 arithmetic, error cases)
+`$min`/`$max`/`$pull`/`$addToSet`/`$bit`, error cases)
 there's nothing to assert: the shim runs pure Python anyway.
 
 Import-light: prefers the real `secantus.update`, else loads `update.py` +
@@ -24,6 +24,7 @@ import types
 import bson
 import pytest
 from bson import Int64, ObjectId
+from bson.decimal128 import Decimal128
 
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
@@ -485,3 +486,43 @@ def test_array_filters_invalid_defers_and_raises(af, code):
     with pytest.raises(_pure.UpdateError) as exc:
         _pure.apply_update(doc, update, array_filters=af)
     assert exc.value.code == code
+
+
+# Decimal128 arithmetic: the Rust engine computes these natively now (it used
+# to defer wholesale). Both halves matter — the digits *and* the quantum, since
+# decimal128 is a non-normalized format where 5.00 and 5 are distinguishable.
+DECIMAL_CASES = [
+    # 34 significant digits survive (a 28-digit context used to eat six).
+    ({"v": Decimal128("1.000000000000000000000000000000001")}, {"$inc": {"v": Decimal128("1")}}),
+    # Quantum is preserved: min(e1,e2) for add, e1+e2 for multiply.
+    ({"v": Decimal128("2.50")}, {"$inc": {"v": Decimal128("0.10")}}),
+    ({"v": Decimal128("2.50")}, {"$mul": {"v": Decimal128("2")}}),
+    ({"v": Decimal128("0.1")}, {"$mul": {"v": Decimal128("0.1")}}),
+    # Rounds half-even past 34 digits.
+    (
+        {"v": Decimal128("1.234567890123456789012345678901234")},
+        {"$mul": {"v": Decimal128("9.999")}},
+    ),
+    # Mixed widening — a double joins the decimal domain at 15 significant
+    # digits for the *update* operators (the accumulators differ; see
+    # tests/test_rust_aggregate_parity.py).
+    ({"v": Decimal128("1.5")}, {"$inc": {"v": 3.0}}),
+    ({"v": Decimal128("1.5")}, {"$inc": {"v": 0.1}}),
+    ({"v": 3.0}, {"$inc": {"v": Decimal128("1.5")}}),
+    ({"v": Decimal128("1")}, {"$inc": {"v": Int64(5)}}),
+    ({"v": 7}, {"$mul": {"v": Decimal128("0.5")}}),
+    # Signs, zeros, and wide exponents.
+    ({"v": Decimal128("-2.5")}, {"$inc": {"v": Decimal128("2.5")}}),
+    ({"v": Decimal128("0E+10")}, {"$inc": {"v": Decimal128("-7.56E-26")}}),
+    ({"v": Decimal128("1.128797342904130E-13")}, {"$inc": {"v": Decimal128("0E+10")}}),
+    ({"v": Decimal128("-0")}, {"$mul": {"v": Decimal128("3")}}),
+]
+
+
+@pytest.mark.parametrize("doc,update", DECIMAL_CASES, ids=[str(u) for _, u in DECIMAL_CASES])
+def test_decimal_arithmetic_matches_pure_python(doc, update):
+    doc = bson.decode(bson.encode(doc))
+    update = bson.decode(bson.encode(update))
+    raw = _rust_apply(doc, update)
+    assert raw is not None, "Rust deferred; decimal arithmetic should be native"
+    assert bson.decode(raw) == _pure.apply_update(dict(doc), update)

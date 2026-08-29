@@ -221,3 +221,28 @@ def test_cursor_row_count_is_capped(storage, session, monkeypatch):
     with pytest.raises(SQLError) as ei:
         q(storage, session, "DECLARE big CURSOR FOR SELECT id FROM t")
     assert ei.value.sqlstate == "54000"
+
+
+def test_parse_accepts_megabyte_scale_statement():
+    # The old 1 MB cap was falsified by a REAL query shape: pgx's
+    # 65535-parameter statements are ~1.04 MB (real PG accepts up to its
+    # 1 GB message limit). A statement over the old cap must parse.
+    from secantus.sql import planner
+
+    literal = "x" * 1_100_000
+    stmts = planner.parse(f"SELECT length('{literal}')")
+    assert len(stmts) == 1
+
+
+def test_bare_expressions_are_syntax_errors(storage, session):
+    # sqlglot parses bare words as column/aliased expressions; a
+    # non-statement must be PG's 42601, not silently accepted (pgx
+    # Prepare("SYNTAX ERROR")). The expression-shaped COMMANDS sqlglot
+    # mis-parses the same way (CLOSE / DISCARD / DEALLOCATE) stay working.
+    from secantus.sql import engine
+
+    for sql in ("bad", "SYNTAX ERROR", "asdf"):
+        with pytest.raises(SQLError) as ei:
+            engine.run_sql(storage, session.database, sql, session=session)
+        assert ei.value.sqlstate == "42601"
+    assert engine.run_sql(storage, session.database, "DISCARD ALL", session=session)

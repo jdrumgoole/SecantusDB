@@ -1,5 +1,10 @@
 # Resume here — Rust-server build-out
 
+> **STALE SNAPSHOT (audited 2026-08-20).** A "where am I" handover note whose
+> Current-state table stops at R5 (Rust auth + TLS). The Rust server has since
+> passed its R8 conformance gate across all 13 driver gauges. This file ages by
+> design; `tasks/rust-server-plan.md` is the authoritative roadmap and is current.
+
 Working handoff note for picking the Rust-server work back up on another machine.
 Authoritative roadmap stays in `tasks/rust-server-plan.md`; this is the
 "where am I, what's next" cheat-sheet.

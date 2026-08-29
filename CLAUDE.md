@@ -230,6 +230,13 @@ engines.
 
 Both procedures are managed by skills — they auto-fire on the relevant trigger phrases. To inspect or invoke manually: `/secantusdb-release` and `/secantusdb-website`. The skill files are under `~/.claude/skills/`; treat them as the source of truth and edit them there, not here.
 
+- **Release-time benchmark refresh** — `invoke release-benchmark` re-measures
+  SecantusDB against a real `mongod` on three DigitalOcean droplets (three
+  interleaved passes, incompressible payloads) and prints the table for
+  `docs/benchmark.md`. **Run it after the version bump lands on `main`**, so the
+  measured build is the released one. `docs/benchmark.md` is prose with numbers
+  in it and goes stale silently — nothing fails when the engine gets faster.
+  Details in `bench/DO_CLUSTER.md` "At release time".
 - **`secantusdb-release`** — the two-phase pipeline (`release-prepare` once in foreground, `release-finalize` in a foreground retry loop), the sub-agent contract, foreground-only constraints, the 8-step pipeline (pre-flight → pytest → perf gates → changelog collation → bump → tag/push → GitHub Release → PyPI workflow + listing), and the hard prohibitions against manual `git tag`/`uv publish`. Docs are **self-hosted at secantusdb.com/docs/** (main tree) and **/docs/rust/** (Rust server) — they deploy with the post-release website publish, not the release pipeline; the readthedocs.io copies are legacy, kept alive with a moved banner.
 - **`secantusdb-website`** — **website content lives on `main`** (the retired `SecantusDB-website` / `website-dev` worktree pattern is gone; Pelican builds the live site from `main`). Edit `website/` on a short feature branch and land via PR (website-only commits skip the full pytest run — only `website/`, this `CLAUDE.md`, and `.gitignore` qualify), then `invoke deploy` from `main` to build + `aws s3 sync` + invalidate CloudFront. Also covers the driver-panel regeneration and the per-release blog-post template (descriptive title + prose body + link bar — never a stub linking out to GitHub).
 
@@ -243,6 +250,46 @@ After every push (to a feature branch via PR — the default — or to `main`), 
 
 ## Conventions for changes here
 
+- **Claim a backlog item before working it — the claim is a PUSHED branch.**
+  This repo runs several parallel sessions against one `tasks/backlog.md`, and
+  the same item repeatedly got picked up twice: `set` and `timetz` in the pgtest
+  campaign, plus `tuple` and `procedure`, were each built independently by two
+  sessions and one copy thrown away. Before starting an item:
+  1. `git fetch origin --prune`, then `git ls-remote --heads origin` and
+     `gh pr list --state open`. A branch or open PR matching the item means
+     another session holds it — pick something else.
+  2. **Re-verify the item is still open by reproducing it** — run the corpus
+     file, the failing test, the query. The backlog lags reality: several
+     "open" items here had already been fixed by a parallel session, and two
+     others *understated* the bug (`octet_length` was filed as a `char(n)`
+     padding nit when it was wrong for every string input). Never implement
+     from the backlog text alone.
+  3. Claim it by creating the branch and **pushing it immediately, before the
+     first real commit** — `git push -u origin <branch>` on an empty branch, or
+     open a draft PR. An unpushed local branch is invisible to every other
+     session and claims nothing. The repo already uses one branch per slice;
+     the only change is that the push moves to the start.
+  4. Release by merging and deleting the branch (see the teardown bullet
+     below), or by deleting your own branch if you abandon the item.
+  5. **Never delete or force-push another session's claim branch**, however
+     stale it looks. Report it and let Joe decide.
+- **Batch several slices into ONE branch and PR — do not run the full suite per
+  small feature.** The suite is ~6,000 tests and 12–13 minutes; running it after
+  every one-file change makes the ceremony cost dwarf the work. Nine
+  single-slice PRs in one stretch (each with its own worktree, full suite, lint,
+  changelog fragment, backlog edit, PR, CI watch, merge, teardown) burned a
+  session's budget while the task board barely moved. Instead:
+  - while iterating, run only the **targeted** tests (`uv run python -m pytest
+    -n0 tests/test_x.py`) plus whatever gauge / corpus command proves the slice;
+  - accumulate related slices on one branch;
+  - run the **full suite once** at the end, before the batch's commit — this
+    still satisfies "run the full test suite before committing", because the
+    batch is what gets committed;
+  - one PR, one CI watch, one merge, one teardown per batch.
+
+  An incidental discovery (a flaky test, a CI annoyance, a stray temp dir) gets
+  folded into the current batch or written down — it does not get its own full
+  cycle.
 - **Major features and non-trivial updates go in a git worktree on a feature branch — never directly on `main`.** New CRUD operators, aggregation stages, storage-layer changes, wire-protocol additions, indexing work, and similar multi-file changes all qualify. Trivial one-file tweaks (typo fixes, single-line config edits) can stay on `main`. Create a worktree alongside the repo: `git worktree add ../SecantusDB-<branch> -b <branch>`. Develop and run the full test suite (and `./inv rust-gate` for Rust-server work) there.
 - **Pin a worktree to a commit for any timing / performance measurement.** Because multiple sessions run parallel worktrees, `main` (and your own checkout) can advance *mid-run* — a baseline, scaling curve, or floor measurement taken across a moving `main` compares different code against a different test population and is worthless. (Observed: a scaling curve was invalidated when `main` moved `3a86d9e5`→`b6b20df7` between runs, the suite growing ~1400 tests underneath it, with a transient breakage flickering through one run.) For any measurement, create a **detached worktree frozen at a SHA** — `git worktree add --detach ../SecantusDB-measure "$(git rev-parse origin/main)"` — run every comparison run there, and confirm `git rev-parse HEAD` is unchanged before *and* after. Caveat: a fresh worktree has no `vendor/wiredtiger`, and the copied-`.so` venv trick (memory `worktree-test-venv`) is fine for *collection* but can throw WT `Session__freecb` errors on `close()` that inflate *runtime* timings — for close-to-metal timing, measure in the main repo's built venv (e.g. a self-contained raw-WT script like `scratchpad/wt_floor.py`) or build WT in the worktree. See `tasks/test-performance-plan.md`.
 - **Land via branch push + PR, not `git push HEAD:main`.** Push the feature branch (`git push -u origin <branch>`) and open a PR (`gh pr create --base main`); let CI run on the PR, then merge when green. **Do not push straight to `main` from a session** — every session pushing the same ref (`refs/heads/main`) lands them in the same CI concurrency group, so a newer push cancels the older session's in-flight run (and forces constant rebases). One feature branch per session = one CI lane per session; distinct refs never cancel each other. After merge, tear the branch down — see the next bullet. (`test.yml` / `wheels.yml` / `rust-wheels.yml` are keyed `concurrency: ${{ github.workflow }}-${{ github.ref }}`, `cancel-in-progress: true` — per-ref, so the cancel only bites within a single branch, which is what you want.)

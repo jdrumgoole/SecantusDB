@@ -951,3 +951,193 @@ Conclusions:
 Net journey this session (sync durable, 8 writers): 41.5k (pre-#700) → 74.8k
 (#700) → 102.8k (config winners, fully durable) — 2.5× — with the ceiling at
 190k and mongod's replset-w:1 at ~301k on the same box.
+
+## Finding 14 — Phase A′ landed: replay-on-open is correct, but durability ANCHORING is the real cost of the mongod split (2026-07-31)
+
+Phase A′ (log-only-the-oplog + replay-on-open recovery) shipped as opt-in:
+stable-checkpoint marker in the always-logged oplog-meta table, a periodic
+checkpoint thread (60s default, `SECANTUS_CHECKPOINT_SECONDS`), an
+on-demand anchor when the prune clamp blocks a genuine cap excess, and
+idempotent oplog replay at open — proven by a hard-kill harness (SIGKILL
+mid-load; every `sync_on_commit` acknowledged write recovered, including
+full replay from genesis with no checkpoint ever taken).
+
+The measured surprise: **Finding 13's arm-D numbers (+11% @8w) were the
+UNANCHORED mode.** With anchoring live at any practical cadence, a
+sustained 8-writer cap-pressure load pays the periodic checkpoint of a
+hot, fully-dirty unlogged working set:
+
+| anchored cadence (8w, 15s, cap-pressure) | docs/s |
+|---|---:|
+| never (probe shape; unbounded oplog) | 122.4k |
+| 2s | 57.1k |
+| 10s | 45.7k |
+| 60s + demand-anchor (shipped default) | ~38–46k |
+| logged default (no A′), same build | ~92k |
+
+Single-writer: ~+5% (36.8k vs 34.9k). Decomposition: between anchors the
+unlogged tables accumulate the ENTIRE working set as dirty pages (nothing
+was WAL-reconciled), so each checkpoint writes it wholesale while writers
+stall; the prune clamp additionally holds every post-stable oplog entry,
+so cap-pressure loads bloat until an anchor lands (the demand-anchor
+bounds this but forces the expensive checkpoint sooner). mongod amortises
+the same cost with incremental checkpointing + eviction tuned for exactly
+this shape. **Decision: the default flip (A′-2) is parked** — the mode is
+correct, recoverable, and opt-in for read-heavy / single-writer / bounded
+workloads; taming the anchored-checkpoint cost (incremental checkpoints,
+eviction_dirty_target tuning for unlogged tables) is the priced next
+investigation if the flip is ever to happen.
+
+## Finding 15 — the anchored A′ equilibrium is CAP-DRIVEN, and dirty-eviction tuning makes it worse (2026-07-31)
+
+Swept the named levers against the anchored-checkpoint cost (Finding 14) via
+the existing hooks (`SECANTUS_DATA_NONLOGGED=1`, live anchoring, 8 writers,
+30 s, 2 reps):
+
+| arm | 8w docs/s |
+|---|---:|
+| control (10s cadence) | ~49.9k |
+| `eviction_dirty_target=2,trigger=5` | ~30.2k (−40%) |
+| `eviction_dirty_target=1,trigger=3` | ~5.9k (−88%) |
+| dirty 2/5 + 8 eviction threads | ~32.9k |
+| dirty 2/5, 30s cadence | ~32.0k |
+| cadence 3600 (demand-anchor only) | ~50.7k |
+
+Two conclusions:
+
+1. **Aggressive dirty writeback is a dead end** — an append-hot unlogged
+   working set gets written repeatedly as pages refill: pure write
+   amplification, catastrophically so at target 1%.
+2. **Every sustained arm converges at ~50k because the demand-anchor makes
+   the equilibrium OPLOG-CAP-DRIVEN, not cadence-driven**: at cap pressure
+   (100k entries ÷ ~50k docs/s) the cap-blocked prune demands an anchor
+   every ~2 s regardless of the configured cadence. (Finding 14's 122k
+   "unanchored" figure predates the demand-anchor; with it, the unbounded
+   arm no longer exists — correctly.) The one cheap untested lever, for
+   whenever the flip is revisited: a larger `oplog_max_entries` in this
+   mode proportionally reduces anchor frequency (cap 1M ≈ one anchor per
+   ~20 s at this rate). The default flip stays parked.
+
+## Finding 16 — Phase B experiment 1: the per-collection-recno layout hypothesis is FALSIFIED (2026-07-31)
+
+`bench/wt_poc/wt_layout_bench.c` A/Bs the engine's table layout against
+mongod's at the raw-WT level (pure C + pthreads, ~1 KiB rows, ascending
+keys, compression off in all arms to isolate layout; 60k rows/thread,
+2 reps, means):
+
+| layout | 1t | 4t | 8t |
+|---|---:|---:|---:|
+| `q` — per-thread table, bare int64 key (mongod shape) | 532k | 879k | 824k |
+| `ssq` — per-thread table, (db, coll, id) composite key | 494k | 858k | 834k |
+| `ssq-shared` — 2 threads/table, composite key (shard collision) | 503k | 897k | **1017k** |
+
+The (S,S,q) key shape costs **~7% at one thread and ~nothing at 4–8**, and
+btree sharing is not a penalty at this scale — the shared arm WINS at 8
+threads (fewer trees → better cache/eviction locality). Against the
+plan's ≥1.5× decision gate this is a falsification by an order of margin:
+**the per-collection-recno storage-format epoch is not justified and is
+closed.** The residual ~1.9× single-writer gap to mongod lives above raw
+WiredTiger — per-operation work in dispatch/BSON/session-txn handling and
+mongod's ingest pipeline — exactly the "Lever B: do NOT pursue for the
+reward / Lever C: research-scale" territory the forward plan already
+priced. With Phase 0/A/A′ shipped and B's gate concluded NO-GO, the
+concurrency-parity plan's experimental program is **complete**: every
+phase has either shipped or been closed with data.
+
+## Finding 17 — post-Phase-C confirmation matrix; the async prune's measured cost (2026-07-31)
+
+A full pinned 3-rep interleaved 4-arm matrix on `01d45bea` (post-#716/#717,
+PGO-staged daemon, standard 30s / batch-100 / per-writer-collections
+methodology) re-confirms the durable-path improvement, with mongod as the
+session normalizer landing within 3% of the published table:
+
+| arm (medians, docs/s) | 1w | 2w | 4w | 8w | vs published |
+|---|---:|---:|---:|---:|---|
+| Python | 11.7k | 8.6k | 9.9k | 7.6k | ±3% |
+| Rust sync (default) | 34.0k | 47.3k | 77.5k | 89.4k | −3..−12% (2w rep-1 outlier; scaling 2.63×, monotonic) |
+| Rust async+nonlogged | 45.2k | 57.3k | 88.1k | 104.7k | −10..−12% |
+| mongod (standalone) | 105.3k | 202.2k | 358.2k | 468.2k | −3% |
+
+The async column's larger deviation decomposes cleanly. A cargo-vs-cargo A/B
+(neither binary PGO'd; 3 interleaved reps, async 8w) of pre-#716 (`75d122a2`)
+vs current: **121.3k vs 113.0k median — the #716 opportunistic prune costs
+~6% at 8 writers**; the remainder matches the session's ~3–5% box headwind
+seen equally on the mongod and sync arms. This cost is deliberate: before
+#716 an async store never pruned from write volume at all, so every published
+async number was measured on a store whose oplog grew without bound for the
+duration of the run — an unshippable configuration. The sync path has always
+paid the (post-#700 key-only) prune; #716 makes async pay the same, honest
+price. The published async column (50.4k/66k/100.3k/119.2k, 0.6.0b5) should
+be read as ~5% optimistic until the next release re-baseline.
+
+## Finding 18 — Tier-1 micro-opt measurements: the compare fast path is large, the catalog cache is a measured zero (2026-08-01)
+
+From the codebase micro-optimisation review (gate: ship at >=1% on the
+target bench, drop below it):
+
+- **`numeric::classify` fast path (#730, SHIPPED)**: allocation-free
+  int/double comparisons. COLLSCAN int-range filter drain **+10.8%**
+  (1.98M → 2.19M docs/s), int-bound-vs-double-field drain **+48.7%**
+  (2.03M → 3.03M), in-engine sort neutral. Interleaved A/B, release
+  builds, non-overlapping distributions. The historic "BSON alloc churn"
+  hot spot had a second layer below mimalloc: the digit-form NumVal built
+  a String + Vec per operand per comparison.
+- **`CollMeta` one-decode options view (SHIPPED)**: insert/replace/delete
+  decoded the same collection-options row 2-3× per op. Paired A/B on
+  two-index batch inserts: **+2.3%, 5/5 positive pairs** (plain-insert arm
+  within noise). Strictly-less-work change, no added machinery.
+- **Per-(db,coll) index-catalog snapshot cache (DROPPED — measured ~0)**:
+  a seqlock-generation cache of decoded `IndexDesc`s, correct under
+  concurrent DDL (fresh-session fills, user-txn bypass, commit bumps) and
+  fully green on the storage suites — but two quiet-box 5-rep A/Bs put the
+  two-index insert delta at **+0.4% / +2.3%-with-outlier ≈ noise**, and
+  the run-to-run drift (~3%) exceeded the effect. Mechanism: the per-thread
+  WT cursor cache already makes the K≤2 catalog walk cheap (~a search +
+  two tiny decodes), and the cache's own per-op cost (two String key
+  allocs + mutex + Arc clones) cancels most of the saving. Might pay at
+  K≥5 indexes, but that isn't the representative workload; complexity not
+  shipped for noise. (Branch existed as `microopt-catalog`, deleted; the
+  diff is reconstructible from this finding + #730-era review notes.)
+
+Measurement note for future micro-opts on this box: with a parallel
+session active the practical noise floor is ±2-3% even at load<4 —
+sub-2% effects need paired designs (per-pair deltas, sign tests), not
+mean comparison.
+
+## Finding 19 — the 11 Aug → 23 Aug benchmark deltas: one real speedup, one phantom regression (2026-08-23)
+
+Refreshing the published benchmarks showed the Rust server's per-operation
+numbers moving in both directions against the 2026-08-11 table. Both were run
+down by interleaved A/B against a rebuilt binary from `5f00e01c` (the commit
+whose results that table records), with **both binaries linked against the same
+WiredTiger build** so the storage engine is held constant.
+
+| workload | 11 Aug published | measured now | verdict |
+|---|---|---|---|
+| `find_all` (10k) | 17.38 ms | 13.39 → **6.57 ms** | **real, 2.04x** |
+| `insert` (10k) | 76.81 ms | 73.45 → **74.32 ms** | **not real, +1.2%** |
+
+**The read speedup is `51ac8f30` (#875, 2026-08-15), and it was already
+claimed.** `getMore` reused mongod's 101-document *first-batch* default on
+every batch, so a 10k-document scan paid ~100 round trips where mongod pays 2.
+Bisect over 191 commits was unambiguous: two tight clusters (~12.1 ms and
+~6.6 ms) with nothing between, so a single commit. The commit message's own
+figure ("7.1 ms vs mongod 6.9 ms, 2 batches") matches what reproduces today.
+The published table was simply measured four days before the fix landed and
+stayed stale for over a week — the staleness `invoke do-perf` now guards.
+
+**The write "regression" was an artefact of comparing across sessions.**
+`76.81 ms` and `83.95 ms` came from two benchmark runs days apart, not an
+interleaved comparison. Alternating the two binaries in one session puts them
+at 73.45 vs 74.32 ms with fully overlapping spreads. This is the third time in
+one day that sequential before/after readings manufactured a difference that
+interleaving erased (see also the restore "regression" of 4.1-5.1 s that was a
+release rebuild, and the fabricated 0.3x ratio from benchmarking after a
+parallel build).
+
+**Method note.** Both endpoints were driven through the *standalone binary*
+with a purpose-built scan/insert harness rather than `bench.compare_servers`,
+so a bisect step costs one `cargo build -p secantusdb` (~30 s) instead of a
+full extension rebuild. Old commits need `RUSTFLAGS="-L native=/opt/homebrew/lib
+-l lz4"` because their `build.rs` predates lz4 linking while the shared WT
+build has the compressor built in.
