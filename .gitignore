@@ -38,10 +38,16 @@ docs/_build/
 
 # Claude Code's per-worktree harness config (hooks, plugins, settings).
 # settings.local.json (and everything else under .claude/) stays per-developer
-# and uncommitted; settings.json is the shared, committed team config —
-# e.g. the test-run permission allowlist every contributor benefits from.
+# and uncommitted. Two things ARE shared and committed, on the same reasoning —
+# they encode team knowledge, not personal setup:
+#   * settings.json — e.g. the test-run permission allowlist every contributor
+#     benefits from;
+#   * skills/ — project procedure worth carrying between sessions and people
+#     (how to probe against the mongod oracle, how to set up and land a batch).
 .claude/*
 !.claude/settings.json
+!.claude/skills/
+!.claude/skills/**
 
 # Cross-driver smoke test scaffolding. The Go module's downloaded
 # deps live in $GOPATH (already outside the repo); the Node smoke's
