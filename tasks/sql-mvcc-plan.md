@@ -143,13 +143,46 @@ be *replaced* by the undo log, not extended.
 Each phase ends in something committable and independently valuable. No phase
 begins before the previous one's exit criterion is met.
 
-**Phase 0 — decide whether the partial mode is enough (days, not weeks).**
-Build §2c's lock manager with the second-write case explicitly raising `40001`.
-Measure how many real-world shapes it fixes: does the conflicting write tend to
-be the transaction's *first*? Instrument the psycopg / SQLAlchemy / pgjdbc
-gauges. **If it covers the shapes that matter, stop here** — the remaining
-phases may never be worth their risk. This phase is cheap and it is the honest
-test of whether the project is needed at all.
+**Phase 0 — RUN 2026-08-29. Result: the partial mode is NOT clearly enough.**
+The measurement was done first (cheaper than building), by instrumenting
+`insert` / `update_matching` / `delete_matching` and counting writes per
+explicit transaction.
+
+    sample                                  txns   read-only  1 write  2+ writes
+    our SQL suite (3074 tests)              4928      2.0%     97.2%      0.8%
+    psycopg's OWN transaction tests (168)    847     50.6%     22.8%     26.6%
+
+    of WRITING transactions, single-write:  ours 99.2%   upstream 46.2%
+
+**The hypothesis was that conflicting writes are usually a transaction's first.
+Upstream code says otherwise: 53.8% of writing transactions write more than
+once**, so a first-write-only lock mode covers under half of them, not ~99%.
+
+**Both samples are biased, in opposite directions, and neither is an
+application workload.** Ours skews to trivial single-write transactions written
+to exercise one behaviour each. psycopg's transaction tests deliberately
+exercise multi-statement transaction shapes — that is their subject. The truth
+for real applications is somewhere between, and nothing measured so far pins it.
+
+What this does establish, and it is the point of the phase:
+
+* the "stop here, ship the partial mode" exit is **not** justified by evidence;
+* **50.6% of upstream explicit transactions never write at all** and are
+  unaffected by any of this;
+* autocommit remains the overwhelming majority of writes and is already correct.
+
+**Recommendation unchanged in direction, sharpened in reason:** do not start
+Phases 1–4. But do not build the partial mode either on the strength of the
+"99%" figure — that number came from our own tests and does not survive contact
+with upstream code. If the partial mode is built, justify it as "fixes 46% of
+writing transactions and leaves the rest at today's honest 40001", which is a
+much weaker case than it first appeared.
+
+Instrumentation used: three wrapped `Storage` methods plus a per-transaction
+counter; two failed attempts first (the gauge's daemon is stopped with SIGTERM,
+which bypasses `atexit`, and the injected `sitecustomize` never reached that
+subprocess at all). Running upstream tests against an in-process server was the
+approach that worked.
 
 **Phase 1 — the facade, no behaviour change.** Introduce `VersionedStorage` as a
 pass-through installed for SQL sessions. Exit: the full suite and all SQL gauges

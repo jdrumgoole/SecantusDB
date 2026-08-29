@@ -543,9 +543,15 @@ Specific items that were left out of the slice that introduced their feature are
   durable undo, crash recovery, GC, row locks), fixes the seam (four storage
   methods carry ~95% of SQL traffic, and the seam must sit ABOVE `Storage` so
   the Mongo side keeps mongod's snapshot isolation), and states kill criteria.
-  **Its recommendation is to do Phase 0 only** — a partial row-lock mode that
-  raises 40001 on a second write rather than answering wrongly — and re-decide
-  with that measurement. Do not start Phases 3–4 without reading §8.
+  **Phase 0 RAN 2026-08-29 and refuted the premise.** The partial row-lock mode
+  helps only transactions whose conflicting write is their FIRST. Measured:
+  our own SQL suite says 99.2% of writing transactions are single-write —
+  but psycopg's own transaction tests say **46.2%**, i.e. more than half of
+  upstream writing transactions write repeatedly. Both samples are biased in
+  opposite directions and neither is an application workload. So the
+  "ship the partial mode and stop" exit is **not** evidence-backed, and the
+  99% figure must not be quoted — it came from our tests. Do not start
+  Phases 3–4 without reading §8.
 
   All four rows are pinned by `tests/test_sql_isolation_level.py`, with the two
   divergent ones named `test_known_divergence_*` so they cannot be misread as
