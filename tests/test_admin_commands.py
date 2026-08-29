@@ -16,8 +16,8 @@ from secantus import SecantusDBServer
 
 
 @pytest.fixture
-def server(tmp_path):
-    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as srv:
+def server(wt_home):
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         yield srv
 
 

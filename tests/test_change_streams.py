@@ -23,8 +23,8 @@ from secantus import SecantusDBServer
 
 
 @pytest.fixture
-def server(tmp_path) -> Iterator[SecantusDBServer]:
-    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as srv:
+def server(wt_home) -> Iterator[SecantusDBServer]:
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         yield srv
 
 

@@ -21,8 +21,8 @@ from secantus import SecantusDBServer
 
 
 @pytest.fixture
-def server(tmp_path):
-    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as srv:
+def server(wt_home):
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         yield srv
 
 
@@ -278,12 +278,10 @@ def test_non_txn_writer_retries_until_commit(client, coll):
     assert doc["w"] == "plain"
 
 
-def test_expired_transaction_is_reaped(tmp_path):
+def test_expired_transaction_is_reaped(wt_home):
     import time
 
-    with SecantusDBServer(
-        port=0, storage_path=str(tmp_path), transaction_lifetime_seconds=0.5
-    ) as srv:
+    with SecantusDBServer(port=0, storage_path=wt_home, transaction_lifetime_seconds=0.5) as srv:
         mc = MongoClient(srv.uri, serverSelectionTimeoutMS=2000)
         try:
             c = mc["txndb"]["things"]
@@ -317,8 +315,8 @@ def test_end_sessions_aborts_open_transaction(client, coll):
     assert coll.count_documents({"_id": "doomed"}) == 0
 
 
-def test_server_stop_with_open_transaction(tmp_path):
-    srv = SecantusDBServer(port=0, storage_path=str(tmp_path))
+def test_server_stop_with_open_transaction(wt_home):
+    srv = SecantusDBServer(port=0, storage_path=wt_home)
     srv.start()
     mc = MongoClient(srv.uri, serverSelectionTimeoutMS=2000)
     try:
@@ -331,7 +329,7 @@ def test_server_stop_with_open_transaction(tmp_path):
         mc.close()
     srv.stop()  # must not hang or leak; rolls the txn back
     # Reopen: the uncommitted write is gone.
-    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as srv2:
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv2:
         mc2 = MongoClient(srv2.uri, serverSelectionTimeoutMS=2000)
         try:
             ids = {d["_id"] for d in mc2["txndb"]["things"].find()}

@@ -13,10 +13,11 @@ from secantus import SecantusDBServer
 
 
 @pytest.fixture
-def server(tmp_path):
-    # Real on-disk WiredTiger storage. `tmp_path` is unique per test +
-    # parallel worker (xdist), and pytest cleans it up after teardown.
-    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as srv:
+def server(wt_home):
+    # Real on-disk WiredTiger storage, cloned from this worker's prebuilt
+    # template rather than created from scratch (see the `wt_home` fixture in
+    # conftest.py). Unique per test + parallel worker, cleaned up by pytest.
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         yield srv
 
 

@@ -329,7 +329,7 @@ def test_storage_persists_across_reopen(tmp_path) -> None:
         s2.close()
 
 
-def test_secantusdb_server_persists_across_restart(tmp_path) -> None:
+def test_secantusdb_server_persists_across_restart(wt_home) -> None:
     """End-to-end: server restart on the same on-disk path keeps data.
 
     Mirrors the test_storage_persists_across_reopen check but goes
@@ -345,7 +345,7 @@ def test_secantusdb_server_persists_across_restart(tmp_path) -> None:
         {"_id": 2, "x": "second"},
     ]
 
-    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as srv:
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         mc = MongoClient(srv.uri, serverSelectionTimeoutMS=2000)
         try:
             mc["persist_db"]["c"].insert_many(docs)
@@ -354,7 +354,7 @@ def test_secantusdb_server_persists_across_restart(tmp_path) -> None:
             mc.close()
 
     # Reopen the server on the same path (different bound port).
-    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as srv:
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         mc = MongoClient(srv.uri, serverSelectionTimeoutMS=2000)
         try:
             stored = sorted(

@@ -921,6 +921,38 @@ pain point again:
 - **V2 — toolchain-daemon reuse in `validate-all`** (shared Gradle daemon across
   Java+Kotlin; dotnet incremental build; skip the gpg libmongocrypt re-verify
   when unchanged). Modest, and only affects the weekly CI wall.
+- **Rewrite the test harness in Rust — INVESTIGATED, REJECTED (2026-08-29).**
+  Asked whether reimplementing the Python harness in Rust would speed the test
+  cycle up. Measured: it would not. A clean full suite is **712 s wall but only
+  436 s CPU on 8 cores** (0.61 cores busy — 7.7 % of capacity), so the suite is
+  idle-bound, not CPU-bound. Decomposing the 281 ms per-test floor: **234 ms
+  (83 %) is inside WiredTiger's C library** (97.7 ms connection open + 136.7 ms
+  of eager table creates, independently confirmed at **9.7 ms per table**),
+  ~37 ms is pymongo (unreplaceable — it *is* the conformance target), and only
+  **~10 ms (3.4 %) is Python the harness owns**. Optimistic ceiling for a total
+  rewrite: **~13 s of 712 s (~2 %)**, against 80 k LOC of tests. The pure-operator
+  tests Rust would actually speed up are already free (82 tests in 0.16 s) and
+  already ported (610 `#[test]` fns under `cargo test`).
+  **The live lever this surfaced is language-agnostic and worth picking up:**
+  cloning a prebuilt WiredTiger home per test instead of creating one —
+  **measured 239.8 ms → 126.7 ms (1.9×)**, and verified that WiredTiger opens the
+  clone cleanly. Plain `cp -R` was within 7 ms of APFS clonefile, so it is not
+  macOS-specific. Compounds with making more of the 12 eager tables lazy (9.7 ms
+  each, and it speeds both shipped servers' startup) and with I2b above.
+  Full analysis, phased plan, and the reproducer scripts:
+  `tasks/rust-test-harness-investigation.md`.
+- [x] **L1 (WiredTiger-home clone) — SHIPPED (2026-08-29).** `tests/wt_template.py`
+  + a session-scoped `_wt_template` (one pristine home per xdist worker, built by
+  running the real `Storage` constructor so it cannot drift from the schema) and a
+  per-test `wt_home` fixture that clones it. 22 test files converted.
+  **Measured 259.9 s → 194.9 s (1.33x) over those files' 789 tests** (~82 ms/test,
+  matching the ~87 ms predicted); `test_crud.py` alone 86.1 s → 58.4 s (1.48x).
+  Equivalence with a freshly-created home is pinned by `tests/test_wt_template.py`
+  (whole-result-dict comparison + isolation + durable reopen), not assumed.
+  **Remaining L1 headroom:** ~48 more files build a server by shapes other than
+  `storage_path=str(tmp_path)` and still create a home per test.
+  **Trap:** the `wt_template` import in `conftest.py` must stay *lazy* — see
+  §11 of the investigation doc.
 
 ## 4. Out of scope (intentional, with reasoning)
 
@@ -1286,6 +1318,36 @@ These are explicit non-goals. Don't add them without a reason.
   and the hard-kill harness kill is ack-driven. The dump-spin itself is
   upstream; if it recurs, consider raising `SECANTUS_HANG_SECONDS` locally or
   `exit=True`-only dumps to a file (never a pipe).
+
+- [ ] **Intermittent failure of the two `crash_watchdog_nested` tests under the
+  full parallel suite (2026-08-29, `5372fdfa`) — IDENTIFIED.**
+  The culprits are `tests/test_crash_stall_watchdog.py::
+  test_faulthandler_dir_captures_a_worker_crash@crash_watchdog_nested` and
+  `::test_faulthandler_dir_arms_a_file_per_worker@crash_watchdog_nested`. They
+  fail only in the full parallel suite (~1 run in 3) and pass 5/5 standalone.
+  **Pre-existing, not caused by the L1 clone work**: the file is untouched by it,
+  uses no WiredTiger storage at all, and the original 2-failure run was on a
+  completely unmodified tree. **Correction to the note below:** the `lastfailed`
+  cache was dismissed as entirely stale — wrong. Its two `test_driver_panels`
+  entries were stale, but its two `crash_watchdog_nested` entries were the live
+  answer all along, and were written by exactly that 2-failure run. Isolation
+  passing does not exonerate a parallel-only flake. Original context follows.
+
+  **Original note (2026-08-29).** Three full-suite runs at the same commit:
+  5032 passed / **2 failed, 5030 passed** / 5032 passed — i.e. a parallel-only,
+  roughly 1-in-3 failure. **The two test names were lost**: that run's output was
+  piped through a `grep` keeping only timing lines, and pytest's `lastfailed`
+  cache held only stale entries from earlier sessions (its two
+  `test_driver_panels.py::test_format_rate_*` entries name tests that no longer
+  exist — consistent with the deliberate removal of expected-failure exclusion
+  from the panels, so they are a red herring, not the culprit). Candidate files
+  ruled out by re-running them in isolation and under xdist: `test_crash_stall_
+  watchdog.py`, `test_opsboard.py`, `test_driver_panels.py` (39 passed, 1
+  skipped). Not caused by the harness investigation — no source was modified,
+  only `scratchpad/` scripts added. Per CLAUDE.md this is a failing test, not a
+  flake to wave through. **To chase:** loop `uv run python -m pytest -q -rf`
+  with full output retained (no filtering `grep`) until it reproduces, then
+  diagnose the shared state / timing issue.
 
 - [x] **RESOLVED (bisected 2026-07-30): the small-doc one-shot insert
   "regression" (0.8× → 1.2× mongod between #666 and #703) is a COST SHIFT

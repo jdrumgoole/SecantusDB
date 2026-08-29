@@ -221,10 +221,10 @@ def test_make_next_cursor_emits_token_when_overfetched() -> None:
 
 
 @pytest.fixture
-def server(tmp_path):
+def server(wt_home):
     from secantus import SecantusDBServer
 
-    with SecantusDBServer(port=0, storage_path=str(tmp_path)) as srv:
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         yield srv
 
 
