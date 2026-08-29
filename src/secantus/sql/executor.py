@@ -2308,8 +2308,17 @@ def _apply_post_aggregates(plan: Any, result: list[dict[str, Any]]) -> list[dict
     # downstream sees it.
     for doc in result:
         for key, value in doc.items():
-            if isinstance(value, dict) and subms.COMPOSITE_DATE in value:
+            if not isinstance(value, dict):
+                continue
+            if subms.COMPOSITE_DATE in value:
                 doc[key] = subms.unwrap_composite(value)
+                continue
+            # `_id` is a dict of grouping column -> key, and a timestamp key is
+            # itself a composite (grouping on the truncated date merges rows
+            # that differ only in microseconds).
+            for inner_key, inner in value.items():
+                if isinstance(inner, dict) and subms.COMPOSITE_DATE in inner:
+                    value[inner_key] = subms.unwrap_composite(inner)
     for field_name, kind, payload in getattr(plan, "post_aggregates", ()) or ():
         for doc in result:
             if kind in ("sorted_array", "sorted_string"):

@@ -5807,6 +5807,20 @@ def _plan_distinct_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPl
     )
 
 
+def _group_key_expr(field: str, tag: str | None) -> Any:
+    """The ``$group`` ``_id`` expression for one grouping column.
+
+    A timestamp groups on the sub-millisecond composite, not the stored date:
+    grouping on the truncated value MERGES rows that differ only in
+    microseconds, so the counts and sums over those groups are wrong and the
+    emitted key is a time that was never stored. The executor unwraps the key
+    on the way out.
+    """
+    if tag in subms.SUBMS_TAGS:
+        return subms.composite_expr(field)
+    return f"${field}"
+
+
 def _minmax_body(val: Any, field: str | None, tag: str | None, filter_cond: Any) -> Any:
     """The value a ``$min`` / ``$max`` accumulates.
 
@@ -6274,7 +6288,7 @@ def _grouping_set_branch(
     ``post_aggregates`` finishes statistical / bitwise aggregates in Python after the
     union (identical across branches, so the planner keeps one copy)."""
     in_set = set(gset)
-    group_id = {c: f"${table.field_for(c)}" for c in gset} or None
+    group_id = {c: _group_key_expr(table.field_for(c), table.type_for(c)) for c in gset} or None
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
     project: dict[str, Any] = {"_id": 0}
@@ -6599,7 +6613,7 @@ def _plan_grouping_sets_window_select(
 
     def branch(gset: list[str]) -> list[dict[str, Any]]:
         in_set = set(gset)
-        group_id = {c: f"${table.field_for(c)}" for c in gset} or None
+        group_id = {c: _group_key_expr(table.field_for(c), table.type_for(c)) for c in gset} or None
         project: dict[str, Any] = {"_id": 0}
         for c in group_cols:
             project[c] = f"$_id.{c}" if c in in_set else {"$literal": None}
@@ -6638,7 +6652,9 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     group_cols = [_column_name(c) for c in group_node.expressions] if group_node else []
     for c in group_cols:
         table.field_for(c)  # validate
-    group_id = {c: f"${table.field_for(c)}" for c in group_cols} or None
+    group_id = {
+        c: _group_key_expr(table.field_for(c), table.type_for(c)) for c in group_cols
+    } or None
 
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
@@ -7090,7 +7106,9 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
     group_cols = [_column_name(c) for c in group_node.expressions] if group_node else []
     for c in group_cols:
         table.field_for(c)  # validate
-    group_id = {c: f"${table.field_for(c)}" for c in group_cols} or None
+    group_id = {
+        c: _group_key_expr(table.field_for(c), table.type_for(c)) for c in group_cols
+    } or None
 
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
@@ -7407,8 +7425,13 @@ def _having_to_match(
         # so the literal has to be compared in the same shape. Only min/max --
         # a GROUP BY key (`_id.<col>`) is still the stored date, and lowering
         # that here would compare a composite against a plain field.
+        # Both a min/max accumulator AND a GROUP BY key hold the composite now,
+        # so both need the literal lowered. A HAVING term is one or the other.
         _agg = _aggregate_of(term)
-        if tag in subms.SUBMS_TAGS and _agg is not None and _agg[0] in ("min", "max"):
+        _is_composite = (_agg is not None and _agg[0] in ("min", "max")) or (
+            _agg is None and isinstance(term, exp.Column)
+        )
+        if tag in subms.SUBMS_TAGS and _is_composite:
             if isinstance(node, exp.EQ):
                 _op = "$eq"
             elif isinstance(node, exp.NEQ):
@@ -9505,7 +9528,7 @@ def _join_grouping_set_branch(
     ``(stages, out_columns, post_aggregates)`` — statistical / bitwise finishes run
     in Python over the union (identical across branches)."""
     in_set = set(gset)
-    group_id = {c: f"${key_path[c]}" for c in gset} or None
+    group_id = {c: _group_key_expr(key_path[c], key_tag.get(c)) for c in gset} or None
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
     project: dict[str, Any] = {"_id": 0}
@@ -9854,7 +9877,7 @@ def _plan_join_grouping_sets_window_select(
 
     def branch(gset: list[str]) -> list[dict[str, Any]]:
         in_set = set(gset)
-        group_id = {c: f"${key_path[c]}" for c in gset} or None
+        group_id = {c: _group_key_expr(key_path[c], key_tag.get(c)) for c in gset} or None
         project: dict[str, Any] = {"_id": 0}
         for c in group_cols:
             project[c] = f"$_id.{c}" if c in in_set else {"$literal": None}
@@ -10120,8 +10143,13 @@ def _join_having_to_match(
         # so the literal has to be compared in the same shape. Only min/max --
         # a GROUP BY key (`_id.<col>`) is still the stored date, and lowering
         # that here would compare a composite against a plain field.
+        # Both a min/max accumulator AND a GROUP BY key hold the composite now,
+        # so both need the literal lowered. A HAVING term is one or the other.
         _agg = _aggregate_of(term)
-        if tag in subms.SUBMS_TAGS and _agg is not None and _agg[0] in ("min", "max"):
+        _is_composite = (_agg is not None and _agg[0] in ("min", "max")) or (
+            _agg is None and isinstance(term, exp.Column)
+        )
+        if tag in subms.SUBMS_TAGS and _is_composite:
             if isinstance(node, exp.EQ):
                 _op = "$eq"
             elif isinstance(node, exp.NEQ):
