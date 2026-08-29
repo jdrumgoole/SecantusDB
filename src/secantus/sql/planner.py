@@ -5166,14 +5166,22 @@ def _create_target(stmt: exp.Expression) -> exp.Table | None:
 def qualify_from_search_path(stmt: exp.Expression, catalog: Any, db: str, session: Any) -> None:
     """Qualify bare table references against the session's ``search_path``.
 
-    Postgres resolves an unqualified relation by walking ``search_path`` in
-    order and taking the first schema that holds it. We only consult the path
-    when the bare name is *not* itself a catalog entry, so this can turn a
-    "relation does not exist" into a hit but can never redirect a name that
-    already resolves. The node is rewritten in place, which keeps the write
-    path honest: ``qualified_table_name`` composes the storage key from the
-    same node the resolver matched, so a read and a write of one unqualified
-    name cannot land in different schemas.
+    Postgres resolves an unqualified relation by walking ``search_path`` IN
+    ORDER and taking the first schema that holds it — and a relation in no
+    schema on the path is invisible, not merely lower priority. The node is
+    rewritten in place, which keeps the write path honest:
+    ``qualified_table_name`` composes the storage key from the same node the
+    resolver matched, so a read and a write of one unqualified name cannot land
+    in different schemas. Qualifying with ``public`` is storage-neutral (that
+    function maps a bare name and ``public.<name>`` to the same key).
+
+    This used to consult the path only when the bare name was *not* already a
+    catalog entry, and stripped ``public`` from the path outright. Both are
+    wrong once two schemas hold the same name (probed against PostgreSQL 14):
+    ``SET search_path TO sa`` could not redirect ``t`` away from ``public.t``,
+    and ``sa, public`` versus ``public, sa`` gave the same answer, so the order
+    the user asked for was ignored. Nothing caught it because a probe with only
+    ONE table named ``t`` resolves to it either way.
 
     Names bound by a CTE in scope are left alone — they shadow real relations.
 
@@ -5183,7 +5191,9 @@ def qualify_from_search_path(stmt: exp.Expression, catalog: Any, db: str, sessio
     on the path — an unqualified name is tried against the temp namespace FIRST,
     so a session's temp table shadows a permanent one of the same name.
     """
-    path = [s for s in session.search_path if s != "public"]
+    # `public` is an ordinary path entry, not an implicit fallback: `sa, public`
+    # and `public, sa` must resolve differently.
+    path = list(session.search_path or ["public"])
     temp_ns = getattr(session, "temp_schema", None)
     cte_names = {cte.alias_or_name.lower() for cte in stmt.find_all(exp.CTE) if cte.alias_or_name}
     skip = _create_target(stmt)
@@ -5199,18 +5209,42 @@ def qualify_from_search_path(stmt: exp.Expression, catalog: Any, db: str, sessio
             if schema_arg.name == "pg_temp":
                 table.set("db", exp.to_identifier(session.ensure_temp_schema()))
             continue
-        if table.name.lower() in cte_names or table is skip:
+        if table.name.lower() in cte_names:
+            continue
+        if table is skip:
+            # A CREATE target does not RESOLVE onto an existing relation, but it
+            # is still created INTO the path's first schema -- probed: with
+            # `search_path TO s1, public` and `s1.t` present, PG answers
+            # `relation "t" already exists` rather than creating `public.t`.
+            # Leaving it unqualified put the write in `public` while every read
+            # of the same name went to `s1`.
+            first = next((sc for sc in path if sc not in ("public", "pg_temp")), None)
+            if first is not None:
+                table.set("db", exp.to_identifier(first))
             continue
         if temp_first and catalog.get(db, f"{temp_ns}.{table.name}") is not None:
             table.set("db", exp.to_identifier(temp_ns))
             continue
-        if catalog.get(db, table.name) is not None:
-            continue
         for schema in path:
             resolved = temp_ns if schema == "pg_temp" and temp_ns is not None else schema
+            # `public` keys as the bare name (see `qualified_table_name`), so it
+            # is looked up — and left — unqualified.
+            if resolved == "public":
+                if catalog.get(db, table.name) is not None:
+                    break
+                continue
             if catalog.get(db, f"{resolved}.{table.name}") is not None:
                 table.set("db", exp.to_identifier(resolved))
                 break
+        else:
+            # Nothing on the path holds it. In PG the relation is INVISIBLE, not
+            # merely lower priority -- `SET search_path TO sa` then selecting a
+            # public-only table errors. Qualify with the first path schema so the
+            # lookup fails rather than silently falling back to the bare name.
+            first = next((sc for sc in path if sc != "public"), None)
+            if first is not None and "public" not in path:
+                resolved_first = temp_ns if first == "pg_temp" and temp_ns is not None else first
+                table.set("db", exp.to_identifier(resolved_first))
 
 
 def qualify_temp_create_target(stmt: exp.Create, session: Any) -> None:
