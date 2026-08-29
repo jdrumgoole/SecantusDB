@@ -507,7 +507,10 @@ Specific items that were left out of the slice that introduced their feature are
   proceeds". Measured three-way against PostgreSQL 14:
 
       autocommit write-write        pg blocks -> 111   us blocks -> 111   MATCH
-      explicit txn READ COMMITTED   pg blocks -> 111   us 40001  -> 101   DIVERGE
+      explicit txn READ COMMITTED   pg blocks -> 111   us blocks -> 111   MATCH*
+        (* FIXED 2026-08-29 for a transaction's FIRST write, which is the only
+           one WiredTiger lets us refresh a snapshot before; a later write still
+           answers 40001 rather than computing against a stale view)
       explicit txn REPEATABLE READ  pg 40001  -> 101   us 40001  -> 101   MATCH
       explicit txn SERIALIZABLE     pg 40001 (skew)    us BOTH COMMIT      DIVERGE
 
@@ -543,13 +546,43 @@ Specific items that were left out of the slice that introduced their feature are
   durable undo, crash recovery, GC, row locks), fixes the seam (four storage
   methods carry ~95% of SQL traffic, and the seam must sit ABOVE `Storage` so
   the Mongo side keeps mongod's snapshot isolation), and states kill criteria.
-  **Its recommendation is to do Phase 0 only** — a partial row-lock mode that
-  raises 40001 on a second write rather than answering wrongly — and re-decide
-  with that measurement. Do not start Phases 3–4 without reading §8.
+  **Phase 0 RAN 2026-08-29 and refuted the premise.** The partial row-lock mode
+  helps only transactions whose conflicting write is their FIRST. Measured:
+  our own SQL suite says 99.2% of writing transactions are single-write —
+  but psycopg's own transaction tests say **46.2%**, i.e. more than half of
+  upstream writing transactions write repeatedly. Both samples are biased in
+  opposite directions and neither is an application workload. So the
+  "ship the partial mode and stop" exit is **not** evidence-backed, and the
+  99% figure must not be quoted — it came from our tests. Do not start
+  Phases 3–4 without reading §8.
 
   All four rows are pinned by `tests/test_sql_isolation_level.py`, with the two
   divergent ones named `test_known_divergence_*` so they cannot be misread as
   conformance, plus an oracle test for the two that match.
+
+- [ ] **OPEN — `CREATE INDEX` is not undone by `ROLLBACK TO SAVEPOINT`.** Found
+  2026-08-29 while checking whether DDL is transactional at all. Measured
+  against PostgreSQL 14:
+
+      after a savepoint, then ROLLBACK TO SAVEPOINT
+        CREATE TABLE   undone      MATCH
+        DROP TABLE     undone      MATCH
+        ALTER TABLE    undone      MATCH
+        CREATE VIEW    undone      MATCH
+        CREATE INDEX   SURVIVES    pg removes it            <-- diverges
+
+      full ROLLBACK
+        CREATE INDEX / DROP INDEX  undone     MATCH
+
+  So index DDL IS transactional; it is not savepoint-aware. Cause is likely that
+  savepoints capture per-collection document pre-images (`sql/session.py`
+  `_Savepoint.snapshots`) and the index catalog is not part of that capture.
+
+  **`docs/sql.md` claimed the opposite and has been corrected**: it said DDL
+  "is **not** rolled back by `ROLLBACK TO SAVEPOINT` — only DML is", giving
+  `CREATE TABLE` as the example — which is precisely the case that DOES roll
+  back. The doc understated the engine everywhere except the one place it was
+  right.
 
 - [ ] **OPEN — an unresolvable bare relation is named with the schema we tried,
   not the name the user wrote.** Fallout from the search_path work above, and
@@ -1090,6 +1123,85 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [x] **Missing-vs-null sweep — the confusion was real but NARROW (2026-08-29).**
+  Motivated by the Phase 2 campaign, where conflating an absent field with an
+  explicit null produced both `$graphLookup` bugs and the `$lookup` `let` gap.
+  25 shapes probed; **22 were already correct**, because the *query* language
+  genuinely does treat them alike (`{a: null}` matches a missing field — that
+  is mongod's rule, not our bug). The divergence was confined to the
+  **comparison operators**: `$eq: ["$absent", null]` answered true where mongod
+  answers false, a missing field did not rank below other values, and `$let` /
+  `$lookup`'s `let` bound it as null. All fixed, in both engines.
+  **The useful part is the scoping.** This was recorded during the `$lookup`
+  batch as needing "a missing sentinel in `expressions.py`, which touches every
+  operator" — it did not. The sentinel already existed (`evaluate_or_missing`,
+  used by accumulators and `$project`); only the comparisons failed to use it.
+  An estimate made from reading was wrong in the expensive direction, and one
+  probe corrected it. Same lesson as the `$graphLookup` "does not recurse"
+  misread earlier the same day.
+
+- [x] **Change-stream spec sweep — 13 of 13 shapes diverged, all fixed
+  (2026-08-29).** Phase 2's fifth and last surface. One crash (a resume token
+  that is valid hex but not valid BSON raised `InvalidBSON` as
+  `internal server error`), and the rest overwhelmingly **accepted and
+  ignored** — `parse_spec` guarded each field with `isinstance` and silently
+  skipped a wrong-typed value.
+  **Why this class is worse here than elsewhere:** the caller believes they
+  asked for something. A misspelled `fullDocument: "updateLookup"` produced a
+  stream without lookups; a wrong-typed `resumeAfter` produced a stream that
+  started from the beginning instead of the requested position. Both reported
+  success. A silently-ignored option on a *read* is a wrong answer you can see;
+  on a *stream* it is a wrong answer that keeps arriving.
+  Also fixed: `$changeStream` accepted anywhere in the pipeline (mongod:
+  `Location40602`) where we built an ordinary aggregation and answered an
+  exhausted cursor — a stream that never yields and never explains; two wrong
+  codes; and the event field order (`fullDocument` belongs immediately after
+  `operationType`, not appended at the end — contents already matched).
+- [ ] **Change-stream `updateDescription` reports array edits in a shape mongod
+  never produces — we emit `truncatedArrays`, mongod (6.0.16) emits none, ever
+  (2026-08-29).** Measured with `tools/probes/change_streams.py` across eight
+  array mutations and four array sizes (5 / 20 / 100 / 1000); nine cases
+  diverge and only `$set` of one element agrees. mongod's rule is: any shrink
+  or reorder reports the **whole new array** under `updatedFields`, and an
+  append reports the **positional path** of the added element.
+
+  | mutation | us | mongod |
+  |---|---|---|
+  | `$push` one | `updatedFields: {arr: [1,2,3,4,5,9]}` | `updatedFields: {arr.5: 9}` |
+  | `$pop` last | `truncatedArrays: [{field: arr, newSize: 4}]` | `updatedFields: {arr: [1,2,3,4]}` |
+  | `$pop` first | `{arr.0..arr.3}` + `truncatedArrays` | `updatedFields: {arr: [2,3,4,5]}` |
+  | `$pull` middle | `{arr.2, arr.3}` + `truncatedArrays` | `updatedFields: {arr: [1,2,4,5]}` |
+  | `$slice` keep 2 | `truncatedArrays: [{field: arr, newSize: 2}]` | `updatedFields: {arr: [1,2]}` |
+  | replace array | `{arr.0, arr.1}` + `truncatedArrays` | `updatedFields: {arr: [7,8]}` |
+
+  Array size does not change mongod's answer (checked at 20/100/1000 — it does
+  NOT switch to a truncation form for large arrays, which was the reason to
+  suspect a size threshold). Deliberately **not** fixed in the sweep that found
+  it: the diff walk is parity-mirrored (`src/secantus/diff.py` +
+  `crates/secantus-core/src/diff.rs`) and ~19 assertions across
+  `tests/test_diff.py` and `tests/test_change_streams.py` pin the current
+  behaviour, so it is its own slice. Note `truncatedArrays` is a real mongod
+  field — this is about when it is emitted, and 6.0.16 never emits it for any
+  mutation probed.
+
+- [ ] **Expanded change events omit `collectionUUID`, and `collMod` omits
+  `stateBeforeChange` (2026-08-29).** With `showExpandedEvents: true`, mongod
+  puts `collectionUUID` on `create` / `createIndexes` / `dropIndexes` /
+  `collMod` events (immediately after `clusterTime`); we emit it only on CRUD
+  events. mongod's `collMod` event also carries `stateBeforeChange:
+  {collectionOptions: {uuid: …}}`, which we do not emit at all. Four content
+  divergences plus the four matching field-order ones, identical on both
+  servers. Measured with `tools/probes/change_streams.py`.
+
+- [ ] **mongod 6.0.16 emits `to` as the FIRST field of a `rename` change event,
+  before `_id` — not replicated, deliberately (2026-08-29).** Measured
+  repeatedly and directly: `['to', '_id', 'operationType', 'clusterTime',
+  'wallTime', 'ns']`. Every other event type puts `_id` first, so this looks
+  like an assembly artifact rather than a contract, and it may well differ on
+  the 7.0 we advertise. Recorded rather than copied; re-measure on a newer
+  mongod before deciding. Ours is `['_id', 'operationType', 'clusterTime',
+  'wallTime', 'ns', 'to']`.
+
 - [x] **`$lookup` / `$graphLookup` sweep — 20 of 27 shapes diverged, headline
   was a TRUNCATED traversal (2026-08-29).** `$graphLookup` stopped following
   the chain at the first null `connectFromField`, so a four-document chain
@@ -1111,13 +1223,18 @@ These are explicit non-goals. Don't add them without a reason.
   of that class this campaign); two crashes (`let: 5`, `pipeline: 5`); unknown
   arguments accepted on both stages; and a negative `maxDepth` that matched
   nothing instead of erroring.
-- [ ] **A `$lookup` `let` binding cannot express MISSING.** For a document
-  without the local field, mongod binds `$$var` as *missing*, and
-  `$eq: ["$field", "$$var"]` against an explicitly-null foreign value is then
-  FALSE. Our evaluator resolves a missing path to `None`, so the two compare
-  equal and the join returns rows mongod excludes. Fixing it means a missing
-  sentinel in `expressions.py`, which touches every operator — deliberately not
-  attempted inside a join-semantics batch.
+- [x] **A `$lookup` `let` binding could not express MISSING — FIXED 2026-08-29
+  (#1107).** For a document without the local field, mongod binds `$$var` as
+  *missing*, so `$eq: ["$field", "$$var"]` against an explicitly-null foreign
+  value is FALSE; our evaluator resolved a missing path to `None`, the two
+  compared equal, and the join returned rows mongod excludes.
+  **The estimate recorded here was wrong, and kept because the error is the
+  lesson**: this said fixing it "means a missing sentinel in `expressions.py`,
+  which touches every operator". It did not. The sentinel already existed
+  (`evaluate_or_missing`, used by accumulators and `$project`) and only the
+  comparison operators failed to use it. An estimate made from READING was
+  wrong in the expensive direction and one probe corrected it — the second such
+  case that day, alongside the `$graphLookup` "does not recurse" misread.
 - [ ] **`$lookup`'s `as` field ORDER when it overwrites an existing field.**
   mongod moves the overwritten field to the END of the document; we keep its
   original position. Left alone rather than guessed at: this campaign has

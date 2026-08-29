@@ -96,7 +96,8 @@ def _eval_field_value(expr: Any, ctx: _Ctx) -> Any:
     """Evaluate in *field-value* position, where an absent path is MISSING.
 
     Differs from :func:`_eval` only for a bare field-path string: as an
-    operator argument a missing path is `null` (`{$add: ["$nope", 1]}` is 1),
+    operator argument a missing path is `null` (and arithmetic over null is
+    null -- `{$add: ["$nope", 1]}` is `null`, probed 6.0.16),
     but as the value of a projected/added field it is *missing* and the key is
     omitted. Keeping the two distinct is why this isn't folded into `_eval`.
     """
@@ -388,23 +389,60 @@ def _unwrap_d128(v: Any) -> Any:
     return v.to_decimal() if isinstance(v, Decimal128) else v
 
 
+#: A missing field ranks immediately BELOW null in the comparison operators --
+#: probed on mongod 6.0.16, where `$cmp: ["$absent", null]` is -1 and
+#: `$cmp: ["$absent", "$alsoAbsent"]` is 0. Anything else compares as a value.
+_MISSING_RANK = object()
+
+
+def _cmp_operand(expr: Any, ctx: _Ctx) -> Any:
+    """One comparison operand, with a missing field path kept DISTINCT from null.
+
+    The comparison operators are the one place in the expression language where
+    the difference is observable: `$eq: ["$absent", null]` is **false** on
+    mongod, while `$eq: ["$explicitNull", null]` is true. Everywhere else an
+    operator argument resolving to a missing path is simply null
+    (`{$add: ["$nope", 1]}` is 1), which is why this is not `_eval_field_value`
+    for every operator.
+
+    We evaluated both through `_eval`, which resolves a missing path to None, so
+    every comparison against null answered true for documents that did not have
+    the field at all -- and `$cond` built on `$eq` inherited it.
+    """
+    value = _eval_field_value(expr, ctx)
+    return _MISSING_RANK if value is MISSING else _unwrap_d128(value)
+
+
 def _cmp_pair(arg: Any, ctx: _Ctx) -> tuple[Any, Any]:
+    if isinstance(arg, list) and len(arg) == 2:
+        return _cmp_operand(arg[0], ctx), _cmp_operand(arg[1], ctx)
     a, b = _eval_args(arg, ctx)
     return _unwrap_d128(a), _unwrap_d128(b)
 
 
 def _op_eq(arg: Any, ctx: _Ctx) -> bool:
     a, b = _cmp_pair(arg, ctx)
+    # MISSING equals only MISSING -- `is` rather than `==` because the sentinel
+    # must not compare equal to None.
+    if a is _MISSING_RANK or b is _MISSING_RANK:
+        return a is b
     return a == b
 
 
 def _op_ne(arg: Any, ctx: _Ctx) -> bool:
     a, b = _cmp_pair(arg, ctx)
+    if a is _MISSING_RANK or b is _MISSING_RANK:
+        return a is not b
     return a != b
 
 
 def _op_gt(arg: Any, ctx: _Ctx) -> bool:
     a, b = _cmp_pair(arg, ctx)
+    if a is _MISSING_RANK or b is _MISSING_RANK:
+        if a is b:
+            return False
+        # MISSING ranks below every real value.
+        return b is _MISSING_RANK
     try:
         return bool(a > b)
     except TypeError:
@@ -413,6 +451,11 @@ def _op_gt(arg: Any, ctx: _Ctx) -> bool:
 
 def _op_gte(arg: Any, ctx: _Ctx) -> bool:
     a, b = _cmp_pair(arg, ctx)
+    if a is _MISSING_RANK or b is _MISSING_RANK:
+        if a is b:
+            return True
+        # MISSING ranks below every real value.
+        return b is _MISSING_RANK
     try:
         return bool(a >= b)
     except TypeError:
@@ -421,6 +464,11 @@ def _op_gte(arg: Any, ctx: _Ctx) -> bool:
 
 def _op_lt(arg: Any, ctx: _Ctx) -> bool:
     a, b = _cmp_pair(arg, ctx)
+    if a is _MISSING_RANK or b is _MISSING_RANK:
+        if a is b:
+            return False
+        # MISSING ranks below every real value.
+        return a is _MISSING_RANK
     try:
         return bool(a < b)
     except TypeError:
@@ -429,6 +477,11 @@ def _op_lt(arg: Any, ctx: _Ctx) -> bool:
 
 def _op_lte(arg: Any, ctx: _Ctx) -> bool:
     a, b = _cmp_pair(arg, ctx)
+    if a is _MISSING_RANK or b is _MISSING_RANK:
+        if a is b:
+            return True
+        # MISSING ranks below every real value.
+        return a is _MISSING_RANK
     try:
         return bool(a <= b)
     except TypeError:
@@ -1922,7 +1975,12 @@ def _op_let(arg: Any, ctx: _Ctx) -> Any:
         raise ExpressionError("$let.vars must be a document")
     inner = ctx
     for name, value_expr in bindings.items():
-        inner = inner.with_var(name, _eval(value_expr, ctx))
+        # Bind in FIELD-VALUE position so a missing path stays MISSING rather
+        # than collapsing to null. mongod binds `$$v` from an absent field as
+        # missing, so `$eq: ["$$v", null]` is false -- we bound null and it was
+        # true. The same rule governs `$lookup`'s `let`, where it meant a
+        # document without the local field joined rows mongod excludes.
+        inner = inner.with_var(name, _eval_field_value(value_expr, ctx))
     return _eval(arg["in"], inner)
 
 
@@ -3038,7 +3096,11 @@ def _op_cmp(arg: Any, ctx: _Ctx) -> int:
     """``$cmp``: three-way comparison of two values by BSON order → -1 / 0 / 1."""
     from secantus.ordering import _bson_lt
 
-    a, b = _eval_args(arg, ctx)
+    a, b = _cmp_pair(arg, ctx)
+    if a is _MISSING_RANK or b is _MISSING_RANK:
+        if a is b:
+            return 0
+        return -1 if a is _MISSING_RANK else 1
     if _bson_lt(a, b):
         return -1
     return 1 if _bson_lt(b, a) else 0

@@ -1434,7 +1434,7 @@ pub enum StorageError {
     /// a mongod `BadValue`).
     BadHint(String),
     /// A `fullDocument` / `fullDocumentBeforeChange: "required"` change-stream
-    /// lookup missed (mongod code 280, `ChangeStreamFatalError`).
+    /// lookup missed (mongod code 47, `NoMatchingDocument`).
     ChangeStreamFatal(String),
     /// An internal invariant failure (e.g. a transaction operation on an
     /// already-closed handle). Surfaces as a command-level `InternalError`.

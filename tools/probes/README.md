@@ -48,12 +48,21 @@ broke five live differential cases, because 8.3 wraps update errors in
 PATH version first, then cross-check a newer one to learn which differences are
 version-dependent.
 
+**Change streams need a REPLICA SET.** mongod refuses `$changeStream` on a
+standalone, and `tests/test_mongod_differential.py`'s harness spawns a
+standalone — which is why that whole area had never been differentially probed
+until `change_streams.py`. Start one explicitly:
+
+    mongod --replSet rs0 --port 27045 --dbpath /tmp/csrs --fork --logpath /tmp/csrs/log
+    mongosh --port 27045 --eval 'rs.initiate()'
+
 ## The probes
 
 | script | area | last result |
 |---|---|---|
 | `arg_types_documents.py` | document-valued command arguments | 56/56 clean (was 45 crashes) |
 | `arg_types_extended.py` | more commands + numeric/string/bool argument classes | Python **87/87 clean**; **Rust server 78 divergences — open** (see `PROBE_SERVER` above) |
+| `change_streams.py` | change events, event field order, fatal errors | 14 of 41 diverge — all `truncatedArrays` + expanded-event gaps, both servers (**needs a replica set**, see the script) |
 | `findandmodify_shapes.py` | findAndModify replies and argument validation | 18/18 clean (was 6 divergences) |
 | `update_operators.py` | update operator semantics and errors | clean except the filed items |
 | `update_path_conflicts.py` | overlapping update operator paths | 12/12 clean (was 8 wrong results) |

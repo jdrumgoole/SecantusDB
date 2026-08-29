@@ -712,11 +712,18 @@ def _rollback_to_savepoint(name: str, storage: Any, db: str, session: Session) -
     for fr in session.savepoints[idx:]:
         for coll, snap in fr.snapshots.items():
             restore.setdefault(coll, snap)
+    restore_ix: dict[str, list] = {}
+    for fr in session.savepoints[idx:]:
+        for coll, ix in fr.indexes.items():
+            restore_ix.setdefault(coll, ix)
     with storage.use_user_transaction(session.txn_handle):
         for coll, snap in restore.items():
             storage.delete_matching(db, coll, {})
             if snap:
                 storage.insert(db, coll, [copy.deepcopy(d) for d in snap])
+        # Indexes AFTER the documents: `create_index` builds its entries from the
+        # rows present, so a recreated index must see the restored ones.
+        _restore_savepoint_indexes(storage, db, restore_ix)
     # Drop the nested savepoints; keep ``name`` (a repeat ROLLBACK TO must work,
     # and its snapshots still hold the pre-``name`` state).
     del session.savepoints[idx + 1 :]
@@ -725,6 +732,36 @@ def _rollback_to_savepoint(name: str, storage: Any, db: str, session: Session) -
     # re-reported (pgtest param_status reads them after ROLLBACK TO SAVEPOINT).
     session.restore_savepoint_gucs(session.savepoints[idx].gucs)
     return SQLResult(command_tag="ROLLBACK")
+
+
+def _restore_savepoint_indexes(storage: Any, db: str, wanted: dict[str, list]) -> None:
+    """Put each collection's indexes back to its savepoint-time set.
+
+    Drops what was created since, recreates what was dropped. ``_id_`` is
+    implicit and never dropped or recreated.
+    """
+    for coll, snap in wanted.items():
+        try:
+            current = {e["name"]: e for e in storage.list_indexes(db, coll)}
+        except Exception:  # noqa: BLE001
+            continue
+        target = {e["name"]: e for e in snap}
+        for name in current.keys() - target.keys():
+            if name == "_id_":
+                continue
+            with contextlib.suppress(Exception):
+                storage.drop_index(db, coll, name)
+        for name in target.keys() - current.keys():
+            if name == "_id_":
+                continue
+            entry = dict(target[name])
+            key_spec = entry.pop("key", None)
+            if not key_spec:
+                continue
+            for drop in ("v", "name", "multikey", "entryFormat"):
+                entry.pop(drop, None)
+            with contextlib.suppress(Exception):
+                storage.create_index(db, coll, name, key_spec, entry or None)
 
 
 def _capture_savepoint_snapshots(
@@ -753,6 +790,40 @@ def _capture_savepoint_snapshots(
             if snap is None:
                 snap = [copy.deepcopy(d) for d in storage.find_matching(db, coll, {})]
             fr.snapshots[coll] = snap
+    if _is_index_ddl(stmt):
+        _capture_savepoint_indexes(storage, db, catalog, session)
+
+
+def _is_index_ddl(stmt: exp.Expression) -> bool:
+    """CREATE INDEX / DROP INDEX, which the catalog-collection capture misses."""
+    if isinstance(stmt, exp.Create) and (stmt.args.get("kind") or "").upper() == "INDEX":
+        return True
+    return isinstance(stmt, exp.Drop) and (stmt.args.get("kind") or "").upper() == "INDEX"
+
+
+def _capture_savepoint_indexes(storage: Any, db: str, catalog: Catalog, session: Session) -> None:
+    """Snapshot every user table's index list into each open savepoint.
+
+    Every table, not just the statement's target: ``DROP INDEX name`` does not
+    name its table, so resolving ownership from the AST is not possible in
+    general. Index DDL is rare and this mirrors the cost the catalog capture
+    above already accepts for any DDL statement.
+    """
+    try:
+        tables = [t for t in catalog.list_tables(db)]
+    except Exception:  # noqa: BLE001 -- a catalog we cannot read has nothing to restore
+        return
+    for coll in tables:
+        snap: list | None = None
+        for fr in session.savepoints:
+            if coll in fr.indexes:
+                continue
+            if snap is None:
+                try:
+                    snap = copy.deepcopy(storage.list_indexes(db, coll))
+                except Exception:  # noqa: BLE001
+                    snap = []
+            fr.indexes[coll] = snap
 
 
 def _is_ddl(stmt: exp.Expression) -> bool:
@@ -3002,6 +3073,56 @@ def _projection_record_srf_spec(stmt: exp.Select) -> dict | None:
     return {"stmt": stmt, "plan": plan, "keys": keys}
 
 
+def _sort_selectlist_srf_rows(
+    stmt: exp.Select, columns: list[ColumnDesc], rows: list[tuple]
+) -> None:
+    """Apply ORDER BY to a record-SRF projection's EXPANDED rows, in place.
+
+    This path dropped ORDER BY entirely, in two different ways: an alias or a
+    field reference errored 42703 (the name is not a source column -- it only
+    exists in the expanded output), and an ORDINAL was accepted and then
+    silently ignored, so `ORDER BY 1` returned the array's own order while
+    reporting success. The silent one is the worse half.
+
+    The keys have to come from the expanded rows, not the source row: one input
+    row fans out to many, so a source-row key is identical across all of them
+    and any stable sort leaves the array order untouched. Same reason the
+    `unnest` form needed its own fix.
+    """
+    order = stmt.args.get("order")
+    if order is None or not rows:
+        return
+    names = [c.name for c in columns]
+    specs: list[tuple[int, bool]] = []
+    idxs: list[int] = []
+    for term in order.expressions:
+        node = term.this
+        idx: int | None = None
+        if isinstance(node, exp.Literal) and not node.is_string and str(node.this).isdigit():
+            pos = int(node.this) - 1
+            if 0 <= pos < len(names):
+                idx = pos
+        else:
+            # An alias, a bare name, or the field expression itself -- match on
+            # the projection's own text so `(srf(a)).n` resolves like `n` does.
+            want = node.name if isinstance(node, (exp.Column, exp.Identifier)) else None
+            if want is None:
+                want = node.sql(dialect="postgres")
+            for i, nm in enumerate(names):
+                if nm == want:
+                    idx = i
+                    break
+        if idx is None:
+            return  # a term we cannot resolve onto the output: leave order alone
+        idxs.append(idx)
+        desc = bool(term.args.get("desc"))
+        nulls_first = term.args.get("nulls_first")
+        if nulls_first is None:
+            nulls_first = desc  # PG default: NULLS LAST asc, NULLS FIRST desc
+        specs.append((-1 if desc else 1, bool(nulls_first)))
+    executor._pg_sort(rows, lambda r: tuple(r[i] for i in idxs), specs)
+
+
 def _run_selectlist_srf(
     spec: dict, storage: Any, db: str, catalog: Catalog, session: Session
 ) -> SQLResult:
@@ -3024,6 +3145,13 @@ def _run_selectlist_srf(
             exp.Alias(this=arg.copy(), alias=exp.to_identifier(f"__srf_arg{len(key_idx)}"))
         )
     inner.set("expressions", projections)
+    # Drop ORDER BY from the INNER query. Its terms name the OUTPUT of the
+    # expansion -- an alias, or `(srf(a)).n` -- which is not a column of the
+    # source, so resolving it here raised 42703. The ordering is applied to the
+    # expanded rows instead (`_sort_selectlist_srf_rows`), which is also the
+    # only place it can be correct: one source row fans out to many, so a
+    # source-row sort key is identical across all of them.
+    inner.set("order", None)
     res = _run_select(inner, storage, db, catalog, session)
 
     out_rows: list[tuple] = []
@@ -3065,7 +3193,24 @@ def _run_selectlist_srf(
             if op[3] == "n":
                 columns.append(ColumnDesc(name, "int4", typemap.PG_OID["int4"]))
             else:
-                columns.append(ColumnDesc(name, "any", 0))
+                # `.x` is the ELEMENT of the array argument, so it types as that
+                # element -- int4 for int[], text for text[], numeric for
+                # numeric[]. It used to report `any` / oid 0, which is not a type
+                # a client can do anything with: psycopg surfaced it as oid 0
+                # where PostgreSQL gives the real element type.
+                #
+                # The argument's own column is right there: the query was run
+                # with each SRF call REPLACED BY its array argument, so
+                # `res.columns[key_idx[...]]` already carries the array's tag and
+                # the element tag follows from it.
+                tag = "any"
+                src = res.columns[key_idx[op[1]]].type_tag if op[1] in key_idx else None
+                if src and typemap.is_array_tag(src):
+                    tag = typemap.array_element_tag(src)
+                columns.append(
+                    ColumnDesc(name, tag, typemap.PG_OID.get(tag, 0) if tag != "any" else 0)
+                )
+    _sort_selectlist_srf_rows(spec["stmt"], columns, out_rows)
     return SQLResult(
         command_tag=f"SELECT {len(out_rows)}",
         columns=columns,

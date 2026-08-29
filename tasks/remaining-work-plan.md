@@ -169,12 +169,12 @@ Every item here was reproduced against an oracle in August 2026.
 
 | item | measured behaviour | note |
 |---|---|---|
-| ~~`ORDER BY` over a set-returning function~~ **FIXED for `unnest`** (2026-08-28); the record-SRF field form still keeps array order | array order, not sorted; **`ORDER BY <alias> DESC` errors `0A000`** where PG answers | the erroring shape is the one real queries use |
-| `_pg_expandarray(...).x` type — **still open**; the attempt surfaced a *wider* bug (`unnest` declared `int4` for every array, failing outright on non-int ones) which **is** fixed | returns **text**, PG returns the element type | record-SRF field projection is typed by a path that assigns `any` *before* `_infer_scalar_tag`; finding that path is the work |
+| ~~`ORDER BY` over a set-returning function~~ **FULLY FIXED** — `unnest` 2026-08-28, the record-SRF field form 2026-08-29 | array order, not sorted; the alias form errored `0A000`/`42703` | the ordinal form was ACCEPTED and silently unsorted — the worse half |
+| ~~`_pg_expandarray(...).x` type~~ **FIXED 2026-08-29** — `.x` types as the array's ELEMENT (int4 / text / numeric), was `any` / oid 0 for every array | returns **text**, PG returns the element type | the argument's own result column already carried the array tag |
 | Write-conflict semantics — **RE-MEASURED 2026-08-29, entry was wrong both ways**: autocommit already MATCHES PG (blocks, both writes land); only explicit txns diverge, because they run snapshot isolation (= PG's REPEATABLE READ). An unretried client LOSES a write, and SERIALIZABLE permits write skew | second writer gets `40001`; PG blocks and proceeds | true READ COMMITTED needs per-statement snapshots — a redesign, not a slice. SERIALIZABLE policy is a product decision. Pinned by `tests/test_sql_isolation_level.py` |
-| COPY OUT abort | transaction stays `INTRANS`; PG gives `INERROR` | needs interleaved client-abort detection |
+| COPY OUT abort — **DOES NOT REPRODUCE (2026-08-29)**: probed twice, both PG and we leave the transaction `INTRANS`. Re-probe with the exact client-abort shape before working it, or close it | transaction stays `INTRANS`; PG gives `INERROR` | needs interleaved client-abort detection |
 | ~~`SET search_path`~~ **FIXED 2026-08-29** — order decides, off-path relations are invisible, and CREATE targets the path's first schema | recorded but ignored in name resolution | two tests pinned the old behaviour and were rewritten |
-| Partial-index reflection | `pg_indexes.indexdef` drops the `WHERE` clause | needs a Mongo-filter → SQL-predicate render |
+| ~~Partial-index reflection~~ **FIXED 2026-08-29** — the stored filter is reversed back to SQL; 10 predicate shapes render byte-identically to PG (incl. `b <> 5` through its `$and` desugaring, and the `::text` cast) | `pg_indexes.indexdef` drops the `WHERE` clause | unrecognised shapes still omit the WHERE rather than approximate it |
 | `ORDER BY` within one millisecond — **still open**; sub-ms *predicates* are fixed (2026-08-27), the sort tiebreaker is not. Plan's cheapest next item | millisecond-granular | the *other half* of the sub-ms entry; predicates are fixed, sorting needs the companion as a tiebreaker |
 
 **Sequencing note.** The two SRF items are adjacent (same subsystem, and the
@@ -208,13 +208,47 @@ Sub-ms `ORDER BY` is adjacent to work already landed and should be cheap.
 
 ---
 
-## Phase 2 — Keep the differential moving — **1 of 5 surfaces done**
+## Phase 2 — Keep the differential moving — **COMPLETE (5 of 5, 2026-08-29)**
 
 The differential's hit rate has been better than working the known list: eleven
 bugs from a handful of probes, and the `findAndModify` sweep below kept the rate
-up. These surfaces are still **untouched**:
+up. **All five surfaces are now done** (2026-08-29):
 
-- [ ] Change streams (resume tokens, `fullDocument` modes, invalidation)
+- [x] **Change streams (resume tokens, `fullDocument` modes, invalidation) —
+      DONE 2026-08-29 — swept TWICE, for different things (#1104 and this
+      slice).** mongod refuses change streams on a standalone and the
+      differential harness spawns one, so this surface had never been compared
+      against a real server at all; both sweeps had to stand up a single-node
+      replica set first.
+
+      **Arguments (#1104):** 13 shapes, **all 13 diverged.** One crash (a resume
+      token that is valid hex but not valid BSON), and the rest overwhelmingly
+      arguments ACCEPTED AND IGNORED — the worst shape for a stream
+      specifically, because the caller believes they asked for something: a
+      misspelled `fullDocument: "updateLookup"` produced a stream without
+      lookups, a wrong-typed `resumeAfter` one that restarted from the
+      beginning. Both reported success.
+      Method note: the validation belongs in `changestreams.parse_spec`, NOT in
+      the `$changeStream` pipeline stage — the `aggregate` command routes change
+      streams through its own path and never runs that stage, so a first attempt
+      in the stage handler had no effect at all.
+
+      **Events and errors (this slice):** 41 cases, 14 diverged. The `required`
+      pre-/post-image error answered 280 where mongod answers **47
+      `NoMatchingDocument`** with no error labels — two distinct conditions had
+      been sharing one exception class, so one wrong code covered both; the
+      stripped-resume-token error was missing mongod's `Executor error during
+      getMore` wrapper and its `Expected: … but found: …` tail; and events were
+      emitted with `wallTime` and `fullDocument` in the wrong positions, with
+      `_id` not first. **Field order is invisible to a document comparison**,
+      which is how nine construction sites drifted unnoticed and why the probe
+      now compares key lists as its own pass — that alone found 28 of 34 CRUD
+      events out of order. Fixed on both servers, which now diverge from mongod
+      on exactly the same remaining cases.
+      Recorded, not fixed: `truncatedArrays` (mongod never emits it, measured
+      across eight mutations and four array sizes — its own slice, ~19
+      assertions across two mirrored engines) and the expanded-event
+      `collectionUUID` / `stateBeforeChange` gaps.
 - [x] **Index and query planning (`explain` shapes, hint honouring, multikey)
       — behavioural half DONE 2026-08-29; `explain`'s stage vocabulary
       deliberately left whole (one scoped item in `backlog.md`).**
@@ -269,7 +303,17 @@ up. These surfaces are still **untouched**:
       rejects on the getMore. pymongo sends it anyway — its guard is a bitmask
       test (`flags & CursorType.TAILABLE_AWAIT` is `2 & 6 == 2`, truthy) — so
       the option it documents as ignored reaches the wire.
-- [ ] `$lookup` / `$graphLookup` forms (`let`/`pipeline`, nested)
+- [x] **`$lookup` / `$graphLookup` forms (`let`/`pipeline`, nested) — DONE
+      2026-08-29 (#1102).** 27 shapes, 20 diverged. The worst was a SHORT ANSWER
+      WITH NO ERROR: `$graphLookup` stopped following the chain at the first
+      null `connectFromField`, so a four-document chain returned one document.
+      Also: an empty-array `localField` matched nothing where mongod joins it
+      against null-valued rows (BOTH join paths, and the index path's comment
+      claimed `$in: []` semantics the oracle contradicts); `as` treated as a key
+      rather than a path; two crashes; unknown arguments accepted.
+      **Correction kept deliberately**: first written up as "does not recurse at
+      all" and scoped as a possible feature build. It recurses — the fixture put
+      a null on the first hop. The fix was a guard.
 
 Caveat worth stating plainly: this **adds** to the board rather than shrinking
 it. That is a feature — undiscovered wrong answers are worse than known ones —

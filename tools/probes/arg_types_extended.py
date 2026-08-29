@@ -8,10 +8,9 @@ crashes. This widens it two ways:
     string (names), and boolean args, each fed a value of the wrong kind.
 """
 
+import datetime
 import os
 import tempfile
-
-import datetime
 
 import pymongo
 from bson import Decimal128, ObjectId
