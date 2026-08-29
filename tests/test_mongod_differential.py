@@ -562,7 +562,7 @@ def _fam(db: Database, **body: object) -> str:
         reply = dict(db.command(cmd))
     except OperationFailure as exc:
         d = exc.details or {}
-        return f"{d.get('code')}/{d.get('codeName')}: {d.get('errmsg')!r}"
+        return f"{d.get('code')}/{_stable_code_name(d)}: {d.get('errmsg')!r}"
     out = {k: reply[k] for k in ("lastErrorObject", "value") if k in reply}
     leo = out.get("lastErrorObject")
     if isinstance(leo, dict) and isinstance(leo.get("upserted"), ObjectId):
@@ -573,6 +573,30 @@ def _fam(db: Database, **body: object) -> str:
         # mongod leads an upserted document with ``_id`` and we did not.
         out["value"] = {"_id": "<oid>", **{k: v for k, v in val.items() if k != "_id"}}
     return repr(out)
+
+
+def _stable_code_name(details: Mapping) -> str:
+    """``codeName``, or a marker when mongod's name for the code is not stable.
+
+    This gate runs against *whatever* ``mongod`` is on PATH, and the lanes do
+    not agree: the dev box has 6.0.16, the Windows runner image ships a newer
+    server. mongod's NAMED codes (2 BadValue, 9 FailedToParse, 14 TypeMismatch,
+    28, 40, 66 …) are stable across those versions, but the high numeric ones
+    are exactly the codes that had no symbolic name in 6.0 -- which renders
+    them as the fallback ``Location<N>`` -- and acquired one later. 40415 is
+    ``Location40415`` on 6.0.16 and ``IDLUnknownField`` on the newer server,
+    with the same code and the same message.
+
+    So the *code* and the *message* are asserted, and the name is asserted only
+    where it means something. Found by CI: the case passed on macOS and Linux
+    and failed on `test-windows`, which was a real version difference and not a
+    flake.
+    """
+    code = details.get("code")
+    name = details.get("codeName")
+    if isinstance(code, int) and code >= 10000:
+        return "<version-dependent>"
+    return str(name)
 
 
 def _reply_keys(reply: Mapping) -> list[str]:
