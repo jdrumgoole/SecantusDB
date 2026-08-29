@@ -1090,6 +1090,28 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [x] **Change-stream spec sweep — 13 of 13 shapes diverged, all fixed
+  (2026-08-29).** Phase 2's fifth and last surface. One crash (a resume token
+  that is valid hex but not valid BSON raised `InvalidBSON` as
+  `internal server error`), and the rest overwhelmingly **accepted and
+  ignored** — `parse_spec` guarded each field with `isinstance` and silently
+  skipped a wrong-typed value.
+  **Why this class is worse here than elsewhere:** the caller believes they
+  asked for something. A misspelled `fullDocument: "updateLookup"` produced a
+  stream without lookups; a wrong-typed `resumeAfter` produced a stream that
+  started from the beginning instead of the requested position. Both reported
+  success. A silently-ignored option on a *read* is a wrong answer you can see;
+  on a *stream* it is a wrong answer that keeps arriving.
+  Also fixed: `$changeStream` accepted anywhere in the pipeline (mongod:
+  `Location40602`) where we built an ordinary aggregation and answered an
+  exhausted cursor — a stream that never yields and never explains; two wrong
+  codes; and the event field order (`fullDocument` belongs immediately after
+  `operationType`, not appended at the end — contents already matched).
+- [ ] **The change-stream `_id`-modified fatal error lacks mongod's wrapper
+  prefix.** Code (280) and message body match; mongod prefixes
+  `Executor error during getMore :: caused by ::`. Same wrapper-prefix class as
+  the aggregation-error entry already tracked above, and no code differs.
+
 - [x] **`$lookup` / `$graphLookup` sweep — 20 of 27 shapes diverged, headline
   was a TRUNCATED traversal (2026-08-29).** `$graphLookup` stopped following
   the chain at the first null `connectFromField`, so a four-document chain

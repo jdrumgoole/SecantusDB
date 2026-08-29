@@ -85,7 +85,19 @@ def parse_resume_token(token: Mapping[str, Any]) -> ResumeTokenData:
     raw = token["_data"]
     if not isinstance(raw, str):
         raise ValueError("resume token _data must be a hex string")
-    inner = bson.decode(bytes.fromhex(raw))
+    try:
+        decoded = bytes.fromhex(raw)
+    except ValueError:
+        # mongod's wording, which names the problem rather than quoting
+        # Python's ``fromhex()`` complaint back at the client.
+        raise ValueError("resume token string was not a valid hex string") from None
+    try:
+        inner = bson.decode(decoded)
+    except Exception:
+        # Valid hex that is not valid BSON -- e.g. ``{"_data": "aa"}``, two hex
+        # digits that decode to one byte. This raised ``InvalidBSON`` straight
+        # out of the handler and escaped as "internal server error" (code 1).
+        raise ValueError("resume token is not a valid resume token") from None
     ts = inner.get("t")
     if not isinstance(ts, Timestamp):
         raise ValueError("resume token has invalid timestamp")
@@ -135,6 +147,24 @@ def _do_lookup(storage: Storage, db: str, coll: str, doc_id: Any) -> dict[str, A
     return docs[0] if docs else None
 
 
+def _set_full_document(event: dict[str, Any], value: Any) -> None:
+    """Place ``fullDocument`` immediately after ``operationType``.
+
+    mongod's change event orders it there; assigning ``event["fullDocument"]``
+    appends it at the END instead. The event's field order is part of the
+    change-stream contract drivers read off the wire, and it is the only thing
+    that differed between our events and mongod's -- the contents already
+    matched.
+    """
+    rest = {k: v for k, v in event.items() if k not in ("operationType", "fullDocument")}
+    op_type = event.get("operationType")
+    event.clear()
+    if op_type is not None:
+        event["operationType"] = op_type
+    event["fullDocument"] = value
+    event.update(rest)
+
+
 def _attach_full_document(
     event: dict[str, Any],
     op: str,
@@ -146,13 +176,13 @@ def _attach_full_document(
     if op == "i":
         # Inserts already carry the full doc.
         if full_document_mode != FULL_DOC_OFF:
-            event["fullDocument"] = dict(oplog_entry["o"])
+            _set_full_document(event, dict(oplog_entry["o"]))
         return
     if event.get("operationType") == "replace":
         # Replacement-style updates emit the full new doc as `o` (mirroring
         # mongod). The change-stream contract says replace events always
         # carry fullDocument; no separate updateLookup is required.
-        event["fullDocument"] = dict(oplog_entry["o"])
+        _set_full_document(event, dict(oplog_entry["o"]))
         return
     if op == "u" and full_document_mode in (
         FULL_DOC_UPDATE_LOOKUP,
@@ -180,17 +210,17 @@ def _attach_full_document(
                     "changeStreamPreAndPostImages to be enabled on the "
                     f"collection {ns}"
                 )
-            event["fullDocument"] = None
+            _set_full_document(event, None)
             return
         looked_up = _do_lookup(storage, db, coll, doc_id) if doc_id is not None else None
         if looked_up is not None:
-            event["fullDocument"] = looked_up
+            _set_full_document(event, looked_up)
         elif full_document_mode == FULL_DOC_REQUIRED:
             raise ChangeStreamFatalError(
                 f"fullDocument required but document with _id={doc_id!r} not found"
             )
         else:
-            event["fullDocument"] = None
+            _set_full_document(event, None)
 
 
 def _attach_full_document_before_change(
@@ -522,7 +552,120 @@ class ChangeStreamSpec:
     show_expanded_events: bool = False
 
 
+_KNOWN_SPEC_FIELDS = frozenset(
+    {
+        "fullDocument",
+        "fullDocumentBeforeChange",
+        "resumeAfter",
+        "startAfter",
+        "startAtOperationTime",
+        "allChangesForCluster",
+        "showExpandedEvents",
+        "showRawUpdateDescription",
+        "splitLargeChangeStreamEvents",
+        "allowToRunOnSystemNS",
+    }
+)
+_FULL_DOCUMENT_MODES = frozenset({"default", "updateLookup", "whenAvailable", "required"})
+_FULL_DOCUMENT_BEFORE_MODES = frozenset({"off", "whenAvailable", "required"})
+
+
+def _spec_error(message: str, code: int, code_name: str):
+    """An ``AggregateError`` carrying mongod's code for a bad $changeStream spec.
+
+    Imported lazily: ``aggregate`` imports this module, so a module-level
+    import the other way round would be circular.
+    """
+    from secantus.aggregate import AggregateError
+
+    return AggregateError(message, code=code, code_name=code_name)
+
+
+def validate_spec(spec: Mapping[str, Any]) -> None:
+    """Reject a ``$changeStream`` spec mongod would reject.
+
+    Every check here covers something previously accepted and IGNORED, which is
+    the worst shape for a change stream: the caller believes they asked for
+    ``updateLookup``, or to resume from a token, and gets a stream that quietly
+    does neither. ``parse_spec``'s ``isinstance`` guards silently skipped a
+    wrong-typed value and carried on with the default.
+
+    Note this lives in ``parse_spec``'s module rather than in the ``$changeStream``
+    pipeline STAGE, because the ``aggregate`` command routes change streams
+    through its own path and never runs that stage.
+    """
+    unknown = next((k for k in spec if k not in _KNOWN_SPEC_FIELDS), None)
+    if unknown is not None:
+        raise _spec_error(
+            f"BSON field '$changeStream.{unknown}' is an unknown field.",
+            40415,
+            "Location40415",
+        )
+    for field, allowed in (
+        ("fullDocument", _FULL_DOCUMENT_MODES),
+        ("fullDocumentBeforeChange", _FULL_DOCUMENT_BEFORE_MODES),
+    ):
+        value = spec.get(field)
+        if value is not None and value not in allowed:
+            raise _spec_error(
+                f"Enumeration value '{value}' for field '$changeStream.{field}' "
+                "is not a valid value.",
+                2,
+                "BadValue",
+            )
+    for field in ("resumeAfter", "startAfter"):
+        value = spec.get(field)
+        if value is not None and not isinstance(value, Mapping):
+            raise _spec_error(
+                f"BSON field '$changeStream.{field}' is the wrong type "
+                f"'{_bson_type_name(value)}', expected type 'object'",
+                14,
+                "TypeMismatch",
+            )
+    sat = spec.get("startAtOperationTime")
+    if sat is not None and not isinstance(sat, Timestamp):
+        raise _spec_error(
+            f"BSON field '$changeStream.startAtOperationTime' is the wrong type "
+            f"'{_bson_type_name(sat)}', expected type 'timestamp'",
+            14,
+            "TypeMismatch",
+        )
+
+
+def _bson_type_name(v: Any) -> str:
+    from bson import Decimal128, Int64
+
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, Int64):
+        return "long"
+    if isinstance(v, int):
+        return "int"
+    if isinstance(v, float):
+        return "double"
+    if isinstance(v, Decimal128):
+        return "decimal"
+    if isinstance(v, str):
+        return "string"
+    if v is None:
+        return "null"
+    if isinstance(v, Timestamp):
+        return "timestamp"
+    if isinstance(v, Mapping):
+        return "object"
+    if isinstance(v, (list, tuple)):
+        return "array"
+    return type(v).__name__
+
+
 def parse_spec(spec: Mapping[str, Any]) -> ChangeStreamSpec:
+    if not isinstance(spec, Mapping):
+        raise _spec_error(
+            f"$changeStream must take a nested object but found: $changeStream: {spec}",
+            6188500,
+            "Location6188500",
+        )
+    validate_spec(spec)
     out = ChangeStreamSpec()
     fd = spec.get("fullDocument")
     if isinstance(fd, str):

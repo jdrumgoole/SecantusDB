@@ -5382,6 +5382,21 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
     first_stage = pipeline[0] if pipeline else {}
     is_change_stream = isinstance(first_stage, Mapping) and "$changeStream" in first_stage
+    # ``$changeStream`` is only valid as the FIRST stage. Anywhere else we
+    # silently built an ordinary aggregation and answered an exhausted cursor,
+    # so a client asking to watch got a stream that never yielded an event and
+    # never said why.
+    if not is_change_stream and any(
+        isinstance(_s, Mapping) and "$changeStream" in _s for _s in pipeline[1:]
+    ):
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                "$_internalChangeStreamOplogMatch is only valid as the first stage in a pipeline"
+            ),
+            "code": 40602,
+            "codeName": "Location40602",
+        }
 
     if is_change_stream:
         # Change streams require a replica-set deployment (real mongod
@@ -5559,9 +5574,9 @@ def _aggregate_change_stream(
     if not isinstance(spec, Mapping):
         return {
             "ok": 0.0,
-            "errmsg": "$changeStream spec must be a document",
-            "code": 2,
-            "codeName": "BadValue",
+            "errmsg": (f"$changeStream must take a nested object but found: $changeStream: {spec}"),
+            "code": 6188500,
+            "codeName": "Location6188500",
         }
     cs_spec = changestreams.parse_spec(spec)
 
@@ -5593,7 +5608,7 @@ def _aggregate_change_stream(
         except (ValueError, KeyError) as exc:
             return {
                 "ok": 0.0,
-                "errmsg": f"invalid resume token: {exc}",
+                "errmsg": str(exc),
                 "code": 9,
                 "codeName": "FailedToParse",
             }
