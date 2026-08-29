@@ -110,7 +110,11 @@ def _order_key_fn(
     def key_of(doc: Any) -> tuple:
         out = []
         for field_path, _, _ in order:
-            value = get_path(doc, field_path)
+            # A timestamp's microseconds live in a hidden companion (see
+            # `secantus.sql.subms`); without them the sort key is only
+            # millisecond-granular and rows inside one millisecond come back in
+            # storage order.
+            value = _subms(doc, field_path)
             omap = ordinals.get(field_path)
             if omap is not None and value is not None:
                 value = omap.get(value, len(omap))  # unknown label sorts last
@@ -884,6 +888,16 @@ def _view_oid(name: str, storage: Any, db: str | None) -> int:
         return virtual._view_oids(db, Catalog(storage)).get(name, 0)
     except Exception:  # pragma: no cover - catalog unavailable
         return 0
+
+
+def _subms(doc: dict[str, Any], field: str) -> Any:
+    """``doc``'s value at ``field`` with its sub-millisecond remainder restored.
+
+    The companion only exists for timestamp columns with a non-zero remainder,
+    and `subms.merge` ignores anything that is not a datetime, so this is a
+    no-op everywhere else.
+    """
+    return subms.merge(get_path(doc, field), doc.get(subms.companion_field(field)))
 
 
 def _with_subms(doc: dict[str, Any], col: Any) -> Any:
@@ -2032,11 +2046,17 @@ def _evaluated_value_rows(
 
     def make_scope(doc: dict[str, Any]):
         def scope(node: Any) -> Any:
+            # `_subms` restores the microseconds a timestamp's hidden companion
+            # carries. This scope feeds ORDER BY keys, the DISTINCT ON key AND
+            # the projected values (`_expand_srf` evaluates through it), and
+            # unlike the plain-column path it never goes through `_with_subms`
+            # -- so without this, `select id, ts ... order by 2` both sorted at
+            # millisecond granularity and RETURNED truncated times.
             field = win_field.get(id(node))
             if field is not None:
-                return get_path(doc, field)
+                return _subms(doc, field)
             path, _ = plan.resolve(node)
-            return get_path(doc, path)
+            return _subms(doc, path)
 
         # Optional protocol: lets ``scalar._eval_cast`` learn a column's type
         # tag (a naive datetime from storage is a ``timestamp`` or a decoded
