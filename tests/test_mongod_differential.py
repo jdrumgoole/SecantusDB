@@ -20,6 +20,7 @@ Run explicitly with `pytest -m differential`.
 
 from __future__ import annotations
 
+import re
 import shutil
 import socket
 import subprocess
@@ -876,11 +877,203 @@ UPDATE_CMD_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ),
 ]
 
+
+def _cursor_cmd(db: Database, cmd: dict) -> str:
+    """A cursor-command reply, with the parts that cannot be compared removed.
+
+    Cursor ids differ per server by construction, so an id is rendered as its
+    BSON type plus whether it is zero (open vs exhausted) -- which is what
+    drivers actually assert -- and an id echoed back inside an error message or
+    a ``killCursors`` list is replaced with a marker.
+    """
+    from pymongo.errors import OperationFailure
+
+    try:
+        reply = dict(db.command(cmd))
+    except OperationFailure as exc:
+        d = exc.details or {}
+        msg = str(d.get("errmsg", ""))
+        # "cursor id 12345 not found" -- the number is per-server.
+        msg = re.sub(r"cursor id \d+", "cursor id <id>", msg)
+        return f"{d.get('code')}/{_stable_code_name(d)}: {msg!r}"
+    out = {}
+    for k, v in reply.items():
+        if k in ("$clusterTime", "operationTime"):
+            continue
+        if k == "cursor" and isinstance(v, dict):
+            v = {
+                ck: (f"{type(cv).__name__}/{'zero' if cv == 0 else 'open'}" if ck == "id" else cv)
+                for ck, cv in v.items()
+            }
+        elif k.startswith("cursors") and isinstance(v, list):
+            v = ["<id>" for _ in v]
+        out[k] = v
+    return repr(out)
+
+
+CURSOR_SEED = [{"_id": i} for i in range(1, 11)]
+
+
+def _with_cursor(cmd_fn):
+    """Open a cursor with batchSize 2, then run ``cmd_fn(cursor_id)``."""
+
+    def op(db: Database) -> str:
+        cid = db.command({"find": "c", "batchSize": 2})["cursor"]["id"]
+        return _cursor_cmd(db, cmd_fn(cid))
+
+    return op
+
+
+# Cursor / getMore / killCursors. 51 shapes probed, 22 diverged -- FOUR of them
+# crash-class, where a malformed argument reached a bare ``int()`` and the
+# exception escaped as "internal server error" (code 1). Most of the rest were
+# arguments accepted and ignored, or ``CursorNotFound`` (43) answered for what
+# mongod reports as a parse error before it looks a cursor up.
+CURSOR_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    # The crashes.
+    (
+        "getmore-id-string",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"getMore": "x", "collection": "c"}),
+    ),
+    (
+        "getmore-batchsize-string",
+        CURSOR_SEED,
+        _with_cursor(lambda cid: {"getMore": cid, "collection": "c", "batchSize": "x"}),
+    ),
+    (
+        "killcursors-not-an-array",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"killCursors": "c", "cursors": 5}),
+    ),
+    (
+        "killcursors-element-not-a-long",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"killCursors": "c", "cursors": ["x"]}),
+    ),
+    # Negative sizing values.
+    (
+        "find-batchsize-negative",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"find": "c", "batchSize": -3}),
+    ),
+    ("find-limit-negative", CURSOR_SEED, lambda db: _cursor_cmd(db, {"find": "c", "limit": -3})),
+    ("find-skip-negative", CURSOR_SEED, lambda db: _cursor_cmd(db, {"find": "c", "skip": -3})),
+    (
+        "getmore-batchsize-negative",
+        CURSOR_SEED,
+        _with_cursor(lambda cid: {"getMore": cid, "collection": "c", "batchSize": -1}),
+    ),
+    (
+        "agg-cursor-batchsize-negative",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"aggregate": "c", "pipeline": [], "cursor": {"batchSize": -1}}),
+    ),
+    # Accepted numeric shapes -- the range check must not narrow the types.
+    (
+        "find-batchsize-fractional",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"find": "c", "batchSize": 2.5}),
+    ),
+    (
+        "find-batchsize-decimal",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"find": "c", "batchSize": Decimal128("3")}),
+    ),
+    (
+        "find-batchsize-null",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"find": "c", "batchSize": None}),
+    ),
+    ("find-batchsize-zero", CURSOR_SEED, lambda db: _cursor_cmd(db, {"find": "c", "batchSize": 0})),
+    # getMore's required / typed fields.
+    (
+        "getmore-id-int32",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"getMore": 5, "collection": "c"}),
+    ),
+    ("getmore-no-collection", CURSOR_SEED, _with_cursor(lambda cid: {"getMore": cid})),
+    (
+        "getmore-collection-not-a-string",
+        CURSOR_SEED,
+        _with_cursor(lambda cid: {"getMore": cid, "collection": 5}),
+    ),
+    (
+        "getmore-unknown-field",
+        CURSOR_SEED,
+        _with_cursor(lambda cid: {"getMore": cid, "collection": "c", "zz": 1}),
+    ),
+    (
+        "getmore-maxtimems-non-awaitdata",
+        CURSOR_SEED,
+        _with_cursor(lambda cid: {"getMore": cid, "collection": "c", "maxTimeMS": 10}),
+    ),
+    (
+        "getmore-normal",
+        CURSOR_SEED,
+        _with_cursor(lambda cid: {"getMore": cid, "collection": "c", "batchSize": 3}),
+    ),
+    # killCursors.
+    (
+        "killcursors-missing-cursors",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"killCursors": "c"}),
+    ),
+    (
+        "killcursors-null-cursors",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"killCursors": "c", "cursors": None}),
+    ),
+    (
+        "killcursors-null-element",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"killCursors": "c", "cursors": [None]}),
+    ),
+    (
+        "killcursors-unknown-field",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"killCursors": "c", "cursors": [], "zz": 1}),
+    ),
+    (
+        "killcursors-empty",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"killCursors": "c", "cursors": []}),
+    ),
+    (
+        "killcursors-shape",
+        CURSOR_SEED,
+        _with_cursor(lambda cid: {"killCursors": "c", "cursors": [cid]}),
+    ),
+    # aggregate's cursor spec.
+    (
+        "agg-cursor-missing",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"aggregate": "c", "pipeline": []}),
+    ),
+    (
+        "agg-cursor-unknown-key",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"aggregate": "c", "pipeline": [], "cursor": {"zz": 1}}),
+    ),
+    (
+        "agg-cursor-batchsize-zero",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"aggregate": "c", "pipeline": [], "cursor": {"batchSize": 0}}),
+    ),
+    # awaitData without tailable.
+    (
+        "awaitdata-without-tailable",
+        CURSOR_SEED,
+        lambda db: _cursor_cmd(db, {"find": "c", "awaitData": True}),
+    ),
+]
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
     + [("fam", c) for c in FAM_CASES]
     + [("updatecmd", c) for c in UPDATE_CMD_CASES]
+    + [("cursor", c) for c in CURSOR_CASES]
 )
 
 
