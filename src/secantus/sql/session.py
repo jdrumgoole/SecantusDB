@@ -245,6 +245,13 @@ class _Savepoint:
 
     name: str
     snapshots: dict[str, list] = field(default_factory=dict)
+    #: Collection -> `list_indexes()` output at this savepoint's establishment,
+    #: captured lazily on the first INDEX DDL while it is open. Indexes are not
+    #: a catalog COLLECTION -- they live in the storage engine's own index
+    #: catalog -- so the `snapshots` capture above does not see them, and a
+    #: CREATE INDEX after a savepoint used to survive ROLLBACK TO SAVEPOINT
+    #: where PostgreSQL removes it.
+    indexes: dict[str, list] = field(default_factory=dict)
     #: Every GUC's value when this savepoint was established. ROLLBACK TO
     #: SAVEPOINT reverts GUCs set after it and re-reports the GUC_REPORT ones
     #: (pgtest param_status), exactly like PG's per-subtransaction GUC stack.

@@ -712,11 +712,18 @@ def _rollback_to_savepoint(name: str, storage: Any, db: str, session: Session) -
     for fr in session.savepoints[idx:]:
         for coll, snap in fr.snapshots.items():
             restore.setdefault(coll, snap)
+    restore_ix: dict[str, list] = {}
+    for fr in session.savepoints[idx:]:
+        for coll, ix in fr.indexes.items():
+            restore_ix.setdefault(coll, ix)
     with storage.use_user_transaction(session.txn_handle):
         for coll, snap in restore.items():
             storage.delete_matching(db, coll, {})
             if snap:
                 storage.insert(db, coll, [copy.deepcopy(d) for d in snap])
+        # Indexes AFTER the documents: `create_index` builds its entries from the
+        # rows present, so a recreated index must see the restored ones.
+        _restore_savepoint_indexes(storage, db, restore_ix)
     # Drop the nested savepoints; keep ``name`` (a repeat ROLLBACK TO must work,
     # and its snapshots still hold the pre-``name`` state).
     del session.savepoints[idx + 1 :]
@@ -725,6 +732,36 @@ def _rollback_to_savepoint(name: str, storage: Any, db: str, session: Session) -
     # re-reported (pgtest param_status reads them after ROLLBACK TO SAVEPOINT).
     session.restore_savepoint_gucs(session.savepoints[idx].gucs)
     return SQLResult(command_tag="ROLLBACK")
+
+
+def _restore_savepoint_indexes(storage: Any, db: str, wanted: dict[str, list]) -> None:
+    """Put each collection's indexes back to its savepoint-time set.
+
+    Drops what was created since, recreates what was dropped. ``_id_`` is
+    implicit and never dropped or recreated.
+    """
+    for coll, snap in wanted.items():
+        try:
+            current = {e["name"]: e for e in storage.list_indexes(db, coll)}
+        except Exception:  # noqa: BLE001
+            continue
+        target = {e["name"]: e for e in snap}
+        for name in current.keys() - target.keys():
+            if name == "_id_":
+                continue
+            with contextlib.suppress(Exception):
+                storage.drop_index(db, coll, name)
+        for name in target.keys() - current.keys():
+            if name == "_id_":
+                continue
+            entry = dict(target[name])
+            key_spec = entry.pop("key", None)
+            if not key_spec:
+                continue
+            for drop in ("v", "name", "multikey", "entryFormat"):
+                entry.pop(drop, None)
+            with contextlib.suppress(Exception):
+                storage.create_index(db, coll, name, key_spec, entry or None)
 
 
 def _capture_savepoint_snapshots(
@@ -753,6 +790,40 @@ def _capture_savepoint_snapshots(
             if snap is None:
                 snap = [copy.deepcopy(d) for d in storage.find_matching(db, coll, {})]
             fr.snapshots[coll] = snap
+    if _is_index_ddl(stmt):
+        _capture_savepoint_indexes(storage, db, catalog, session)
+
+
+def _is_index_ddl(stmt: exp.Expression) -> bool:
+    """CREATE INDEX / DROP INDEX, which the catalog-collection capture misses."""
+    if isinstance(stmt, exp.Create) and (stmt.args.get("kind") or "").upper() == "INDEX":
+        return True
+    return isinstance(stmt, exp.Drop) and (stmt.args.get("kind") or "").upper() == "INDEX"
+
+
+def _capture_savepoint_indexes(storage: Any, db: str, catalog: Catalog, session: Session) -> None:
+    """Snapshot every user table's index list into each open savepoint.
+
+    Every table, not just the statement's target: ``DROP INDEX name`` does not
+    name its table, so resolving ownership from the AST is not possible in
+    general. Index DDL is rare and this mirrors the cost the catalog capture
+    above already accepts for any DDL statement.
+    """
+    try:
+        tables = [t for t in catalog.list_tables(db)]
+    except Exception:  # noqa: BLE001 -- a catalog we cannot read has nothing to restore
+        return
+    for coll in tables:
+        snap: list | None = None
+        for fr in session.savepoints:
+            if coll in fr.indexes:
+                continue
+            if snap is None:
+                try:
+                    snap = copy.deepcopy(storage.list_indexes(db, coll))
+                except Exception:  # noqa: BLE001
+                    snap = []
+            fr.indexes[coll] = snap
 
 
 def _is_ddl(stmt: exp.Expression) -> bool:

@@ -178,6 +178,43 @@ with upstream code. If the partial mode is built, justify it as "fixes 46% of
 writing transactions and leaves the rest at today's honest 40001", which is a
 much weaker case than it first appeared.
 
+**BUILT AND REVERTED 2026-08-29.** The semantics were reached — READ COMMITTED
+matched PostgreSQL exactly for a transaction's first write (B blocks, both
+writes land, 111) — and it was still reverted, because **lock lifetime could not
+be made safe**. Four distinct failure modes, each surfacing only after the
+previous fix:
+
+1. **Released too early.** Freeing it in `_end_txn_state`, which runs BEFORE the
+   storage commit, woke the waiter while the committing data was still
+   uncommitted: it took a stale snapshot and hit the exact conflict the lock
+   exists to prevent. *The lock blocked correctly and bought nothing.*
+2. **Broke REPEATABLE READ.** Applied at every isolation level, the snapshot
+   refresh turned RR's *correct* `40001` into a wrong success. Caught only
+   because the test covered the level that already worked.
+3. **Leaked on abandoned transactions.** Releasing only at explicit end points
+   meant any transaction never committed or rolled back held its lock forever;
+   because the manager is process-wide, the next writer to that table waited the
+   full 30s timeout and failed, landing on unrelated later work. **13 suite
+   failures, all timeouts.**
+4. **Weak references do not fix (3).** `UserTransactionHandle` has `__slots__`
+   without `__weakref__`, so `weakref.ref()` raised TypeError on every first
+   write — **38 failures**. Adding the slot took it to 1 remaining failure, and
+   that last one is the real blocker: **pytest retains tracebacks referencing
+   the session, which pins the handle and defeats the weak reference** — and
+   ordinary error paths that store an exception do the same.
+
+**The lesson for any future attempt:** a process-wide lock whose release depends
+on an object being collected is not safe when any stored exception can keep that
+object alive. Tie the lock to an explicit, exhaustively-covered lifecycle, or do
+not build it. And weigh that against what it buys — 46% of writing transactions
+(Phase 0), against a failure mode of wedging unrelated queries for the timeout.
+
+The deadlock-freedom argument DID hold and is worth reusing: one lock per
+transaction, ever, so no cycle can form.
+
+The code is not in the tree. Recover it from this session's history if
+attempting again; do not restart from the summary above alone.
+
 Instrumentation used: three wrapped `Storage` methods plus a per-transaction
 counter; two failed attempts first (the gauge's daemon is stopped with SIGTERM,
 which bypasses `atexit`, and the injected `sitecustomize` never reached that

@@ -2926,8 +2926,18 @@ Each savepoint captures a touched table's pre-image the first time it's written
 after the savepoint is established, and `ROLLBACK TO` restores those pre-images —
 so it undoes `INSERT` / `UPDATE` / `DELETE` (and upserts). A `SAVEPOINT` /
 `RELEASE` / `ROLLBACK TO` outside a transaction block errors with `25P01`; an
-unknown savepoint name errors with `3B001`. DDL issued inside a savepoint (e.g.
-`CREATE TABLE`) is **not** rolled back by `ROLLBACK TO SAVEPOINT` — only DML is.
+unknown savepoint name errors with `3B001`.
+
+**DDL is transactional, and savepoint-aware, with one exception.** Verified
+against PostgreSQL 14: `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE` and
+`CREATE VIEW` issued after a savepoint are all undone by `ROLLBACK TO SAVEPOINT`,
+and objects created *before* the savepoint survive it — the same as PostgreSQL.
+A full `ROLLBACK` undoes every kind of DDL, index DDL included.
+
+The exception is **index DDL under `ROLLBACK TO SAVEPOINT`**: a `CREATE INDEX`
+issued after a savepoint is *not* removed by rolling back to it, where
+PostgreSQL removes it. A full `ROLLBACK` does undo it. If you rely on partial
+rollback to discard an index, drop it explicitly instead.
 
 ### Server-side cursors
 

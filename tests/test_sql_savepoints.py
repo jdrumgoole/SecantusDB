@@ -205,3 +205,71 @@ def test_rollback_to_savepoint_restores_dropped_type(storage, session):
     # The dropped type is back.
     assert q(storage, session, "SELECT count(*) FROM pg_type WHERE typname = 'hue'").rows == [(1,)]
     q(storage, session, "COMMIT")
+
+
+# ---------------------------------------------------------------------------
+# Index DDL and savepoints. Indexes are not a catalog COLLECTION — they live in
+# the storage engine's own index catalog — so the document-snapshot capture that
+# makes CREATE/DROP/ALTER TABLE savepoint-aware could not see them, and a
+# CREATE INDEX after a savepoint survived ROLLBACK TO SAVEPOINT.
+#
+# Found 2026-08-29 by measuring the docs' claim that DDL is not rolled back by
+# ROLLBACK TO SAVEPOINT: that claim was wrong for every DDL it named, and right
+# only for the one it didn't (indexes).
+# ---------------------------------------------------------------------------
+
+
+def test_create_index_after_savepoint_is_undone(storage, session):
+    q(storage, session, "CREATE TABLE ix (a int, b int)")
+    q(storage, session, "BEGIN")
+    q(storage, session, "SAVEPOINT sp")
+    q(storage, session, "CREATE INDEX ix_a ON ix (a)")
+    q(storage, session, "ROLLBACK TO SAVEPOINT sp")
+    q(storage, session, "COMMIT")
+    assert [i["name"] for i in storage.list_indexes(DB, "ix")] == ["_id_"]
+
+
+def test_index_created_before_the_savepoint_survives(storage, session):
+    q(storage, session, "CREATE TABLE ix2 (a int, b int)")
+    q(storage, session, "CREATE INDEX ix2_a ON ix2 (a)")
+    q(storage, session, "BEGIN")
+    q(storage, session, "SAVEPOINT sp")
+    q(storage, session, "INSERT INTO ix2 (a, b) VALUES (1, 1)")
+    q(storage, session, "ROLLBACK TO SAVEPOINT sp")
+    q(storage, session, "COMMIT")
+    assert "ix2_a" in [i["name"] for i in storage.list_indexes(DB, "ix2")]
+
+
+def test_drop_index_after_savepoint_is_undone(storage, session):
+    q(storage, session, "CREATE TABLE ix3 (a int, b int)")
+    q(storage, session, "CREATE INDEX ix3_a ON ix3 (a)")
+    q(storage, session, "BEGIN")
+    q(storage, session, "SAVEPOINT sp")
+    q(storage, session, "DROP INDEX ix3_a")
+    q(storage, session, "ROLLBACK TO SAVEPOINT sp")
+    q(storage, session, "COMMIT")
+    assert "ix3_a" in [i["name"] for i in storage.list_indexes(DB, "ix3")]
+
+
+def test_a_restored_index_keeps_its_options(storage, session):
+    """The failure mode a careless fix has: the index comes back by NAME while
+    its uniqueness or partial filter is silently dropped, so it looks restored
+    and stops enforcing anything.
+
+    Both are compared as stored, not as rendered — `pg_indexes.indexdef` drops a
+    partial index's WHERE clause for unrelated reasons (a separate open bug), so
+    rendering would hide a real loss here."""
+    q(storage, session, "CREATE TABLE ix4 (a int, b int)")
+    q(storage, session, "CREATE UNIQUE INDEX ix4_u ON ix4 (a)")
+    q(storage, session, "CREATE INDEX ix4_p ON ix4 (b) WHERE a > 5")
+    before = {i["name"]: i for i in storage.list_indexes(DB, "ix4")}
+    q(storage, session, "BEGIN")
+    q(storage, session, "SAVEPOINT sp")
+    q(storage, session, "DROP INDEX ix4_u")
+    q(storage, session, "DROP INDEX ix4_p")
+    q(storage, session, "ROLLBACK TO SAVEPOINT sp")
+    q(storage, session, "COMMIT")
+    after = {i["name"]: i for i in storage.list_indexes(DB, "ix4")}
+    assert after == before, "an index came back without its options"
+    assert after["ix4_u"].get("unique") is True
+    assert after["ix4_p"].get("partialFilterExpression") == {"a": {"$gt": 5}}
