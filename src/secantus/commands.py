@@ -2257,6 +2257,10 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         _err = _require_number_bson_field(doc.get(_fld), f"FindCommandRequest.{_fld}")
         if _err is not None:
             return _err
+        # ... and then the RANGE, which is a different code and the bare name.
+        _err = _require_non_negative_number(doc.get(_fld), _fld)
+        if _err is not None:
+            return _err
     # `min` / `max` are the same family: mongod type-checks them at parse time
     # and answers 14 BEFORE any hint validation, where we reached the index
     # bound-checker and answered 51174.
@@ -2423,6 +2427,17 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # is separate — it goes through the ``aggregate``/``$changeStream``
     # pipeline, not ``find``.
     tailable = bool(doc.get("tailable", False))
+    # ``awaitData`` only means anything on a tailable cursor, and mongod
+    # refuses the pair rather than ignoring the orphan. We accepted it and ran
+    # an ordinary find, so a client that asked to block got a plain batch back
+    # and no indication its option had been dropped.
+    if doc.get("awaitData") and not tailable:
+        return {
+            "ok": 0.0,
+            "errmsg": "Cannot set 'awaitData' without also setting 'tailable'",
+            "code": 9,
+            "codeName": "FailedToParse",
+        }
     if tailable:
         if not ctx.storage.collection_is_capped(ctx.db_name, coll):
             return {
@@ -3083,6 +3098,38 @@ def _require_number_bson_field(value: Any, field_path: str) -> dict[str, Any] | 
         ),
         "code": 14,
         "codeName": "TypeMismatch",
+    }
+
+
+def _require_non_negative_number(value: Any, bare_name: str) -> dict[str, Any] | None:
+    """mongod's ``Location51024`` for a negative cursor-sizing value, else None.
+
+    ``batchSize`` / ``limit`` / ``skip`` are all "must be >= 0" on ``find``,
+    ``getMore`` and ``aggregate``'s cursor spec (probed 6.0.16). Every one of
+    them was accepted here: a negative ``batchSize`` fell through Python's
+    ``or DEFAULT`` and silently became the default, and a negative ``limit``
+    returned the whole collection.
+
+    Unlike the type error above, the message uses the BARE field name --
+    ``BSON field 'batchSize'``, not the IDL path -- on all three commands.
+    Call AFTER the type check: a string is a TypeMismatch, not this.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float, bson.Decimal128)):
+        return None
+    number = _coerce_command_int(value) if not isinstance(value, float) else value
+    if number >= 0:
+        return None
+    # mongod prints the value as given (``-1``), not the coerced form.
+    rendered = int(value.to_decimal()) if isinstance(value, bson.Decimal128) else value
+    if isinstance(rendered, float) and rendered == int(rendered):
+        rendered = int(rendered)
+    return {
+        "ok": 0.0,
+        "errmsg": f"BSON field '{bare_name}' value must be >= 0, actual value '{rendered}'",
+        "code": 51024,
+        "codeName": "Location51024",
     }
 
 
@@ -4561,8 +4608,84 @@ def _search_index_not_supported(_doc: dict[str, Any], _ctx: CommandContext) -> d
     }
 
 
+_KILL_CURSORS_KNOWN_FIELDS = frozenset(
+    {
+        "killCursors",
+        "cursors",
+        "comment",
+        "maxTimeMS",
+        "lsid",
+        "txnNumber",
+        "autocommit",
+        "readConcern",
+        "apiVersion",
+        "apiStrict",
+        "apiDeprecationErrors",
+    }
+)
+
+
 def _kill_cursors(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
-    cursor_ids = [int(c) for c in doc.get("cursors", [])]
+    # Two of the shapes below were CRASHES: ``cursors: 5`` raised TypeError
+    # ('int' object is not iterable) and ``cursors: ["x"]`` raised ValueError,
+    # both escaping as "internal server error" (code 1). A MISSING ``cursors``
+    # answered a cheerful all-empty success reply where mongod requires the
+    # field. Probed 6.0.16.
+    unknown = next(
+        (k for k in doc if k not in _KILL_CURSORS_KNOWN_FIELDS and not k.startswith("$")),
+        None,
+    )
+    if unknown is not None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"BSON field 'killCursors.{unknown}' is an unknown field.",
+            "code": 40415,
+            "codeName": "Location40415",
+        }
+    if "cursors" not in doc:
+        return {
+            "ok": 0.0,
+            "errmsg": "BSON field 'killCursors.cursors' is missing but a required field",
+            "code": 40414,
+            "codeName": "Location40414",
+        }
+    raw_cursors = doc["cursors"]
+    if raw_cursors is None:
+        # An explicit null takes mongod's older code path, as it does for
+        # ``findAndModify.arrayFilters``.
+        return {
+            "ok": 0.0,
+            "errmsg": "invalid parameter: expected an object (cursors)",
+            "code": 10065,
+            "codeName": "Location10065",
+        }
+    if not isinstance(raw_cursors, list):
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"BSON field 'killCursors.cursors' is the wrong type "
+                f"'{_bson_type_of(raw_cursors)}', expected type 'array'"
+            ),
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    cursor_ids = []
+    for i, c in enumerate(raw_cursors):
+        # A null ELEMENT is silently skipped -- mongod answers an all-empty
+        # success reply for ``cursors: [null]`` rather than rejecting it.
+        if c is None:
+            continue
+        if not isinstance(c, bson.Int64):
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    f"BSON field 'killCursors.cursors.{i}' is the wrong type "
+                    f"'{_bson_type_of(c)}', expected type 'long'"
+                ),
+                "code": 14,
+                "codeName": "TypeMismatch",
+            }
+        cursor_ids.append(int(c))
     # Wake any in-flight `_get_more` on these cursors BEFORE removing them
     # from the registry. The tailable getMore handler holds an `entry`
     # reference fetched at command start and sleeps in
@@ -4710,9 +4833,88 @@ def _change_stream_cursor_doc(
     return cursor_doc
 
 
+# Top-level fields ``getMore`` accepts (probed 6.0.16, which answers
+# ``Location40415`` for anything else). ``term`` and
+# ``lastKnownCommittedOpTime`` are the replication-internal pair a secondary
+# sends; they are accepted and ignored.
+_GET_MORE_KNOWN_FIELDS = frozenset(
+    {
+        "getMore",
+        "collection",
+        "batchSize",
+        "maxTimeMS",
+        "comment",
+        "term",
+        "lastKnownCommittedOpTime",
+        "lsid",
+        "txnNumber",
+        "autocommit",
+        "startTransaction",
+        "stmtId",
+        "readConcern",
+        "apiVersion",
+        "apiStrict",
+        "apiDeprecationErrors",
+    }
+)
+
+
 def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
-    cursor_id = int(doc["getMore"])
-    coll = doc.get("collection", "")
+    # Everything in this prologue used to be absent, and three of the shapes it
+    # rejects were CRASHES: ``int(doc["getMore"])`` on a string and
+    # ``int(doc.get("batchSize"))`` on a string both raised a bare ValueError
+    # that escaped as "internal server error" (code 1). The rest answered
+    # ``CursorNotFound`` (43) -- a plausible-looking lie -- for what mongod
+    # reports as a parse error before it ever looks a cursor up.
+    unknown = next(
+        (k for k in doc if k not in _GET_MORE_KNOWN_FIELDS and not k.startswith("$")),
+        None,
+    )
+    if unknown is not None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"BSON field 'getMore.{unknown}' is an unknown field.",
+            "code": 40415,
+            "codeName": "Location40415",
+        }
+    # The cursor id must be a LONG -- an int32 is refused, which is the same
+    # int64-strictness the Go and C drivers enforce on the reply side.
+    raw_id = doc.get("getMore")
+    if not isinstance(raw_id, bson.Int64):
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"BSON field 'getMore.getMore' is the wrong type "
+                f"'{_bson_type_of(raw_id)}', expected type 'long'"
+            ),
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    if "collection" not in doc:
+        return {
+            "ok": 0.0,
+            "errmsg": "BSON field 'getMore.collection' is missing but a required field",
+            "code": 40414,
+            "codeName": "Location40414",
+        }
+    if not isinstance(doc["collection"], str):
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"BSON field 'getMore.collection' is the wrong type "
+                f"'{_bson_type_of(doc['collection'])}', expected type 'string'"
+            ),
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    _err = _require_number_bson_field(doc.get("batchSize"), "getMore.batchSize")
+    if _err is not None:
+        return _err
+    _err = _require_non_negative_number(doc.get("batchSize"), "batchSize")
+    if _err is not None:
+        return _err
+    cursor_id = int(raw_id)
+    coll = doc["collection"]
     # mongod's 101-document default applies only to a find/aggregate FIRST
     # batch: an unspecified getMore batchSize means "as many documents as fit
     # in 16MB", so a full scan drains in ~2 round trips, not count/101. Only
@@ -4757,6 +4959,12 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 43,
             "codeName": "CursorNotFound",
         }
+    # ``maxTimeMS`` on a getMore is the awaitData wait budget, so mongod
+    # refuses it outright on a cursor that cannot wait. We accepted and
+    # ignored it, which is the shape that hides a client bug: a caller who
+    # thinks it has bounded a blocking read has in fact bounded nothing.
+    if "maxTimeMS" in doc and not entry.await_data:
+        return _bad_value("cannot set maxTimeMS on getMore command for a non-awaitData cursor")
     if not entry.tailable:
         try:
             batch, exhausted = ctx.cursors.next_batch(
@@ -4965,6 +5173,31 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         _err = _require_number_bson_field(_cursor_opt.get("batchSize"), "cursor.batchSize")
         if _err is not None:
             return _err
+        _err = _require_non_negative_number(_cursor_opt.get("batchSize"), "batchSize")
+        if _err is not None:
+            return _err
+        # ``batchSize`` is the only key the cursor spec takes.
+        _unknown_cursor_key = next((k for k in _cursor_opt if k != "batchSize"), None)
+        if _unknown_cursor_key is not None:
+            return {
+                "ok": 0.0,
+                "errmsg": f"BSON field 'cursor.{_unknown_cursor_key}' is an unknown field.",
+                "code": 40415,
+                "codeName": "Location40415",
+            }
+    elif "explain" not in doc:
+        # ``cursor`` is REQUIRED, and its absence is a parse error rather than
+        # "use the default" -- the one exception is an explain, which returns a
+        # plan instead of a cursor. We ran the pipeline and answered a cursor
+        # anyway, so a client that forgot the option never learned it had.
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                "The 'cursor' option is required, except for aggregate with the explain argument"
+            ),
+            "code": 9,
+            "codeName": "FailedToParse",
+        }
     pipeline = doc.get("pipeline", [])
     if not isinstance(pipeline, list):
         # A non-array pipeline reached the stage walker and crashed as

@@ -235,7 +235,25 @@ up. These surfaces are still **untouched**:
       top-level fields, `hint`) or error codes flattened to `14 TypeMismatch`
       on the way out of the command. `tests/test_mongod_differential.py`
       57 → 93 cases.
-- [ ] Cursor / `getMore` semantics (batch sizing, `maxTimeMS`, tailable)
+- [x] **Cursor / `getMore` semantics (batch sizing, `maxTimeMS`, tailable) —
+      DONE 2026-08-29.** 51 shapes probed, **22 diverged, four crash-class**: a
+      malformed argument reached a bare `int()` and the exception escaped as
+      `internal server error` (code 1). The pattern across the rest: `getMore`
+      answered `CursorNotFound` (43) for four different *parse* errors — about
+      a cursor that existed — where mongod reports the parse error before it
+      looks a cursor up, and negative `batchSize` / `limit` / `skip` were
+      accepted everywhere (a negative `batchSize` fell through `or DEFAULT` and
+      became the default; a negative `limit` returned the whole collection).
+      **The Rust server does NOT share the crashes** — its `as_i64` returns
+      `None` where Python's `int()` raises — but it does share the
+      accepted-and-ignored family; that belongs to the standing "point the same
+      probe at `secantusd-rs`" item in 1b and is not closed here.
+      One test was pinning the permissive behaviour, the third instance this
+      week: `test_tailable_drop_closes_pymongo_cursor_cleanly` set
+      `max_await_time_ms` on a plain `TAILABLE` cursor, which real mongod
+      rejects on the getMore. pymongo sends it anyway — its guard is a bitmask
+      test (`flags & CursorType.TAILABLE_AWAIT` is `2 & 6 == 2`, truthy) — so
+      the option it documents as ignored reaches the wire.
 - [ ] `$lookup` / `$graphLookup` forms (`let`/`pipeline`, nested)
 
 Caveat worth stating plainly: this **adds** to the board rather than shrinking

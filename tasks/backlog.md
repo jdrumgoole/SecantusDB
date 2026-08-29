@@ -866,6 +866,44 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [x] **Cursor / `getMore` / `killCursors` argument sweep — 22 of 51 shapes
+  diverged, four of them CRASHES, all fixed (2026-08-29).** Phase 2's second
+  surface. The crashes: `getMore` with a string cursor id or a string
+  `batchSize`, and `killCursors` with a non-array `cursors` or a wrong-typed
+  element, each reached a bare `int()` and the `ValueError` / `TypeError`
+  escaped as `internal server error` (code 1).
+  Two patterns worth carrying forward:
+  - **`getMore` answered `CursorNotFound` (43) for four different PARSE
+    errors** — about a cursor that existed. A wrong error that names a
+    plausible cause is worse than a crash for debugging: it sends the caller
+    looking at cursor lifetime when the actual fault is a missing
+    `collection` (mongod: 40414), a non-string one (14), an unknown field
+    (40415) or an int32 cursor id (14 — mongod requires a *long*). mongod
+    parses before it looks a cursor up.
+  - **Every numeric cursor slot accepted negatives.** `batchSize` fell through
+    `or DEFAULT` and silently became the default; `limit: -3` returned the
+    whole collection. mongod answers `Location51024` and, unlike the type error
+    on the same slot, names the field *bare* rather than by its IDL path.
+  **The Rust server does not share the crashes** (`as_i64` returns `None` where
+  Python's `int()` raises) but does share the accepted-and-ignored family —
+  covered by the standing "point the wrong-typed-argument probe at
+  `secantusd-rs`" item, still open.
+- [ ] **`getMore` on a namespace that isn't the cursor's answers 43, not
+  mongod's 13.** mongod says `Requested getMore on namespace 'db.other', but
+  cursor belongs to a different namespace db.c`. Ours answers `CursorNotFound`
+  **deliberately** — the handler's comment explains it: `getMore` is in
+  `_NO_PRIVILEGE_COMMANDS`, so answering a distinguishable error would
+  confirm-or-deny which cursor ids exist on other connections. Recorded as a
+  divergence, not scheduled as a fix: reverting it would trade a real hardening
+  property for message fidelity nobody's driver reads.
+- [ ] **A `find` on a MISSING collection orders the cursor reply's keys
+  differently.** mongod answers `{id, ns, firstBatch}` there and
+  `{firstBatch, id, ns}` for every other find — a different code path in the
+  server. Ours is consistent, so it matches on the common path and differs on
+  the missing-collection one. Left alone deliberately: after two version splits
+  found by CI on this same gate (see below), a one-version observation about
+  BSON key order is not enough to act on.
+
 - [x] **`findAndModify` differential sweep — 14 of 49 combinations diverged,
   all fixed (2026-08-29).** Phase 2 of `tasks/remaining-work-plan.md`. Probed
   against mongod 6.0.16, comparing the **raw command reply** rather than

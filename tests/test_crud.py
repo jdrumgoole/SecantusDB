@@ -4164,7 +4164,17 @@ def test_tailable_drop_closes_pymongo_cursor_cleanly(client: MongoClient) -> Non
     db.create_collection("cap", capped=True, size=1024 * 1024)
     db.cap.insert_many([{"_id": i} for i in (1, 2, 3)])
 
-    cursor = db.cap.find(cursor_type=pymongo.CursorType.TAILABLE).max_await_time_ms(50)
+    # No ``max_await_time_ms`` here, and it is not an omission. mongod refuses
+    # ``maxTimeMS`` on a getMore for any cursor that is not **awaitData** --
+    # a plain TAILABLE one included (probed 6.0.16, both a tailable and a
+    # non-tailable cursor answer ``2 BadValue: cannot set maxTimeMS on getMore
+    # command for a non-awaitData cursor``). pymongo sends it anyway, because
+    # its guard is a BITMASK test -- ``_query_flags & CursorType.TAILABLE_AWAIT``
+    # is 2 & 6 == 2, truthy, for a plain TAILABLE cursor -- so the option it
+    # documents as "ignored ... for other types of cursor" reaches the wire.
+    # This test used to set it and pass only because we accepted it; the same
+    # code against a real mongod raises instead of draining.
+    cursor = db.cap.find(cursor_type=pymongo.CursorType.TAILABLE)
     drained = [cursor.next()["_id"] for _ in range(3)]
     assert drained == [1, 2, 3]
 
