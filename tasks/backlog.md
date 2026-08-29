@@ -1128,6 +1128,46 @@ These are explicit non-goals. Don't add them without a reason.
   array differs, and mongod's order reflects its internal traversal rather than
   a documented contract. Not chased for the same reason as above.
 
+- [ ] **The error surface is conformant to mongod 6.0, and diverges from 8.x in
+  23 known places (2026-08-29).** `src/secantus/commands.py` alone cites 6.0.16
+  in 45 places, including error strings reproduced *verbatim, unbalanced quotes
+  and all* (`expected types '[bool, long, int, decimal, double']` — mongod 6.0
+  really does put the closing quote inside the bracket). Against mongod **8.2.1**
+  those same surfaces have moved, in four families:
+  - **negative cursor sizing** (`limit` / `skip` / `batchSize` / `getMore
+    .batchSize` / agg `cursor.batchSize`): 6.0 `51024 Location51024` → 8.x
+    `2 BadValue`.
+  - **expected-type lists** (`findAndModify.remove` / `.new`,
+    `getMore.batchSize`): reordered, and the misplaced closing quote fixed.
+  - **executor-error prefixes**: 8.x wraps update failures in `Plan executor
+    error during update :: caused by :: ` and aggregate failures in `Executor
+    error during aggregate command on namespace: <ns> :: caused by :: `.
+  - **null-valued arguments** (`findAndModify.arrayFilters`,
+    `killCursors.cursors`): rejected `10065` on 6.0, treated as *absent* on 8.x.
+  - plus **unknown-field errors** naming the IDL struct:
+    `BSON field 'distinct.zz'` → `'distinctCommandRequest.zz'`.
+
+  - plus **IDL-parsed stages**: `$lookup` gained IDL parsing, so a missing `as`
+    is `40414 "BSON field '$lookup.as' is missing but a required field"` on 8.x
+    where 6.0 hand-writes `9 "must specify 'as' field for a $lookup"`; unknown
+    `$lookup` arguments likewise `9` → `40415`.
+
+  `tests/test_mongod_differential.py` spawns whatever `mongod` is on PATH and
+  asserts EXACT equality, so on an 8.x box these read as SecantusDB failures
+  when they are version differences. The whole file is now gated on
+  `PROBED_MONGOD_SERIES` and skips with an explicit reason off 6.0; on a 6.0 box
+  every case runs and asserts. **A per-case allow-list was tried first and
+  rejected:** it must be maintained by whoever adds a case, and they cannot see
+  the problem — dev boxes that run this are on 6.0, and CI installs mongosh and
+  database-tools but *not* `mongod`, so `@requires_mongod` skips the file there
+  entirely. In one afternoon three PRs added cases failing only on 8.2.1 (17,
+  then 1, then 5). **The cost of the file-level gate is real:** on a non-6.0 box
+  this file gives no coverage at all.
+  **Decide before it drifts further:** either stay on 6.0 deliberately (and say
+  so in the docs), or retarget to a supported server and update all 45 probe
+  sites. Do not "fix" individual cases to match whatever mongod is local — that
+  silently swaps which server we conform to.
+
 - [x] **Index / query-planning sweep — the worst find of the Phase 2 campaign
   was a WRITE that should not have happened (2026-08-29).** `delete` and
   `update` take a per-statement `hint`; mongod refuses the statement when it

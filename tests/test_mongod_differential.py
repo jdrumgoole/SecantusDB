@@ -42,6 +42,46 @@ MONGOD = shutil.which("mongod")
 requires_mongod = pytest.mark.skipif(MONGOD is None, reason="no mongod on PATH")
 
 
+# Whether this gate can say anything at all on the server it found.
+#
+# Every expectation here is an EXACT match against mongod, and mongod's error
+# surface moves between majors. Observed 6.0.16 -> 8.2.1, all at once:
+#
+#   * negative cursor sizing   51024 Location51024 -> 2 BadValue
+#   * expected-type lists      '[bool, long, int, decimal, double']  (closing
+#                              quote INSIDE the bracket, a real 6.0 quirk)
+#                              -> '[int, decimal, long, bool, double]'
+#   * update / aggregate       bare message -> wrapped in "Plan executor error
+#     failures                 during update :: caused by :: " / "Executor error
+#                              during aggregate command on namespace: ... "
+#   * null-valued arguments    rejected (10065) -> treated as absent
+#   * IDL-parsed stages        $lookup gained IDL parsing: hand-written
+#                              9 "must specify 'as' field for a $lookup" ->
+#                              40414 "BSON field '$lookup.as' is missing but a
+#                              required field"; unknown fields likewise 9 -> 40415
+#   * unknown-field errors     name the IDL struct: 'distinct.zz' ->
+#                              'distinctCommandRequest.zz'
+#
+# SecantusDB deliberately reproduces the 6.0 forms (commands.py alone cites
+# 6.0.16 in 45 places), so "fixing" a case to match a newer server would break
+# the target the code is written against.
+#
+# WHY THE WHOLE FILE, NOT A LIST OF KNOWN-VARIANT CASES. That was tried first.
+# It needs updating by whoever adds a case -- and they cannot see the problem:
+# the dev boxes that run this are on 6.0, and CI installs mongosh and
+# database-tools but NOT mongod, so @requires_mongod skips this file there
+# entirely. In one afternoon three separate PRs added cases that failed only on
+# 8.2.1 (17, then 1, then 5). A list that only a minority of boxes can maintain
+# rots into recurring false failures. Gating the file is self-maintaining: a new
+# case needs no thought, and the gate can never claim a divergence it cannot
+# actually judge.
+#
+# The cost is real: on a non-6.0 box this file provides no coverage. That is the
+# honest answer -- on an unprobed server an exact-match gate has no expectation
+# to assert. Run it on 6.0 (or retarget deliberately; see backlog.md 5).
+PROBED_MONGOD_SERIES = (6, 0)
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -76,6 +116,21 @@ def mongod_uri() -> Iterator[str]:
         proc.terminate()
         proc.wait(timeout=30)
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+@pytest.fixture(scope="module")
+def mongod_version(mongod_uri: str) -> tuple[int, int]:
+    """``(major, minor)`` of the mongod this gate actually spawned.
+
+    Read from the running server rather than ``mongod --version`` so it
+    describes the process under test, not whatever else is on PATH.
+    """
+    client = MongoClient(mongod_uri, serverSelectionTimeoutMS=10000)
+    try:
+        version_array = client.admin.command("buildInfo")["versionArray"]
+    finally:
+        client.close()
+    return int(version_array[0]), int(version_array[1])
 
 
 @pytest.fixture(scope="module")
@@ -1428,9 +1483,19 @@ ALL_CASES = (
 
 @requires_mongod
 @pytest.mark.parametrize("kind,case", ALL_CASES, ids=[f"{k}-{c[0]}" for k, c in ALL_CASES])
-def test_matches_mongod(kind, case, secantus_uri: str, mongod_uri: str) -> None:
+def test_matches_mongod(
+    kind, case, secantus_uri: str, mongod_uri: str, mongod_version: tuple[int, int]
+) -> None:
     """SecantusDB must answer exactly what mongod answers."""
     name, seed, op = case
+    if mongod_version != PROBED_MONGOD_SERIES:
+        probed = ".".join(str(p) for p in PROBED_MONGOD_SERIES)
+        found = ".".join(str(p) for p in mongod_version)
+        pytest.skip(
+            f"this gate asserts an exact match against mongod {probed}, and this "
+            f"box has mongod {found}; its error surface differs in ways that are "
+            f"not SecantusDB divergences. See PROBED_MONGOD_SERIES."
+        )
     db_name = f"diff_{kind}_{name.replace('-', '_')}"
     ours = _run(secantus_uri, db_name, seed, op)
     theirs = _run(mongod_uri, db_name, seed, op)
