@@ -118,6 +118,7 @@ pub(crate) fn validation_error_info(validator: &Document, doc: &Document) -> Doc
     info
 }
 
+use crate::argtypes;
 use crate::util::{
     as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, resolve_let_vars,
     write_error,
@@ -597,6 +598,7 @@ fn ts_update_is_meta_only(u: Option<&Bson>, meta: &str) -> bool {
 }
 
 pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    argtypes::require_object(doc, "let", "update.let")?;
     let coll = coll_arg(doc, "update")?;
     let storage = ctx.storage()?;
     let updates = array_field(doc, "updates");
@@ -650,6 +652,10 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
     for (index, spec) in updates.iter().enumerate() {
         let Bson::Document(spec) = spec else { continue };
+
+        // Strict bool, unlike findAndModify's `upsert`, which takes a bool OR any
+        // number. Adjacent slots, different rules -- probed, not inferred.
+        argtypes::require_bool_field(spec, "multi", "update.updates.multi")?;
 
         // MongoDB 8.0 added a per-spec `sort`; pre-8.0 (we advertise 7.0) it's a
         // command-level FailedToParse. Drivers' `*-sort` tests with

@@ -33,6 +33,7 @@
 
 pub mod admin;
 pub mod aggregate;
+pub mod argtypes;
 pub mod auth;
 pub mod changestream;
 pub mod crud;

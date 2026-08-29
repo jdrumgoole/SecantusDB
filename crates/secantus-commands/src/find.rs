@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use bson::{doc, Bson, Document};
 
+use crate::argtypes;
 use crate::cursors::{CursorProducer, CursorRegistry, TailableOptions};
 use crate::storage::Storage;
 use crate::util::{
@@ -234,6 +235,22 @@ fn build_view_find_aggregate(doc: &Document, coll: &str) -> Document {
 
 pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "find")?;
+    // Argument types, before anything reads them. A wrong-typed slot used to be
+    // silently ignored here (`and_then(as_i64)` yields None -> the default), so
+    // `find.limit: "x"` returned every document and reported success. mongod
+    // reports find's numeric slots under its IDL name, `FindCommandRequest.limit`,
+    // NOT `find.limit` -- probed, not guessed. See `crate::argtypes`.
+    for field in ["filter", "sort", "projection", "collation"] {
+        argtypes::require_object_expected(doc, field)?;
+    }
+    for field in ["limit", "skip", "batchSize"] {
+        argtypes::require_number(doc, field, &format!("FindCommandRequest.{field}"))?;
+    }
+    argtypes::require_object(doc, "let", "FindCommandRequest.let")?;
+    argtypes::require_object(doc, "min", "FindCommandRequest.min")?;
+    argtypes::require_object(doc, "max", "FindCommandRequest.max")?;
+    argtypes::require_bool_value(doc, "singleBatch")?;
+    argtypes::require_max_time_ms(doc)?;
     // A view: translate the find into the equivalent aggregate over the base
     // collection (the find options become pipeline stages after the view's own
     // pipeline) and delegate — the aggregate handler resolves the view. `find` and

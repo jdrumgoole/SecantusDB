@@ -463,45 +463,52 @@ Specific items that were left out of the slice that introduced their feature are
   the TLS case a budget matched to Windows (or wait for the listener rather than
   race it), not to rerun it away. Recorded here because reruns hide it.
 
-- [ ] **OPEN — wrong-typed command arguments on the RUST SERVER: 78 of 87
-  divergences (measured 2026-08-29, first sweep ever).** The Python server's
-  four-PR sweep (#1078 / #1080 / #1084 / #1085) got that server to 87/87 clean.
-  The Rust server had never been measured. It is not close:
+- [x] **RESOLVED 2026-08-29 — wrong-typed command arguments on the RUST SERVER:
+  78 of 87 divergences -> 87/87 clean.** First swept the same day (the Python
+  server had reached 87/87 across #1078 / #1080 / #1084 / #1085; this server had
+  never been measured). Reproduce with `PROBE_SERVER` — see
+  `tools/probes/README.md`.
 
-      cases: 87   CRASHES (code 1): 0   divergences: 78
-      rust == python on only 9/87
+  Fixed in two halves, matching the two failure modes:
 
-          54  accepted where mongod errors
-          24  generic BadValue (2) where mongod has a typed code
+  **54 silently accepted** — new `secantus-commands::argtypes`, one validator per
+  message family, wired into `find` / `aggregate` / `createIndexes` / `create` /
+  `collMod` / `listIndexes` / `findAndModify` / `update`. Messages mirror the
+  Python server's, which are pinned byte-for-byte against a live mongod, so they
+  did not have to be re-derived. Every per-slot asymmetry carries across:
+  `findAndModify.upsert` takes a bool OR any number while `update.multi` rejects
+  `multi: 1`; `find.let` reports as `FindCommandRequest.let`; `maxTimeMS` is
+  code 2 with three messages; six slots accept an explicit null and three reject
+  it; `delete.deletes.limit` stays UNvalidated.
 
-  Reproduce: build the binary (`./inv rust-binary-build`), run it
-  (`secantusd-rs --port 27055 --storage-path DIR`), then
-  `PROBE_SERVER=mongodb://127.0.0.1:27055 PROBE_MONGOD=... uv run --no-sync
-  python tools/probes/arg_types_extended.py`. The probe now takes any server URI.
+  **24 generic `BadValue` (2)** — the "Rust error-code class"
+  (`tasks/remaining-work-plan.md` §1b), and the cause is structural:
+  `secantus-core` returns `Fallback` meaning "let the Python engine run this",
+  but this server has no Python, so it surfaced as BadValue. Closed with the
+  plan's named template (`update::arith_type_error`) rather than by widening
+  `Fallback`: a standalone `argtypes::stage_spec_error` naming the seven stages
+  it can name — `$lookup` 9, `$group` 15947, `$match` 15959, `$sort` 15973,
+  `$limit` 5107201, `$skip` 5107200, `$count` 40156, `$unwind` 15981 / 28812 —
+  and leaving everything else alone.
 
-  **"Accepted" understates it — the server reports success AND does the wrong
-  thing.** Probed against mongod on the same data:
+  19 Rust unit tests. **Both servers are now 87/87 on this sweep.**
 
-      createIndexes.indexes=5   mongod 14   rust: OK, and creates NO index
-      update.multi={}           mongod 14   rust: OK, updates 1 of 2 (multi=false)
-      findAndModify.upsert=[1]  mongod 14   rust: OK, no document created
-      find.limit='x'            mongod 14   rust: OK, limit ignored
+- [ ] **OPEN — `$limit` / `$skip` stage-error messages render the offending value
+  as a PYTHON repr (Python server).** Found 2026-08-29 while porting the above.
+  mongod echoes the value shell-style — probed on 6.0.16:
 
-  The `createIndexes` case is the worst of them: a driver is told the index was
-  created when it was not, so anything relying on it — query plans, or an
-  application's uniqueness assumption — is silently wrong from then on.
+      $skip: "x"    ->  ... Expected a number in: $skip: "x"     (quoted)
+      $skip: true   ->  ... Expected a number in: $skip: true
+      $skip: [1]    ->  ... Expected a number in: $skip: [ 1 ]   (spaced)
+      $skip: {}     ->  ... Expected a number in: $skip: {}
 
-  **Two things NOT to conclude from this.** (1) The Rust server never crashes —
-  zero code-1 replies, where the Python server started at 45 then 24. Its wire
-  layer is *sturdier*; what it lacks is argument validation. (2) The 24 generic
-  `BadValue` answers are the already-filed "Rust error-code class" (see
-  `tasks/remaining-work-plan.md` §1b), now with a count rather than a single
-  `$densify` example — do not plan them as separate campaigns.
-
-  Sequencing note: the Python fixes are the worked template, and the per-slot
-  message families are already probed and written down in the entry above. The
-  hard-won rule applies unchanged — mongod's strictness is per-slot, so probe
-  each one; `delete.deletes.limit` must stay UNvalidated.
+  `aggregate._fmt_stage_val` uses `str()` / `repr()`, so a string renders bare
+  (`x`) and an array unspaced (`[1]`). The CODE is right, which is why the sweep
+  never caught it — `arg_types_extended.py` compares codes only. The Rust server
+  now renders these mongod-style (`argtypes::render_stage_value`), so the two
+  servers currently DISAGREE on this message. Low severity (message text on an
+  already-correct error) but it is a real divergence and the two engines should
+  not differ; port the Rust renderer back to Python.
 
 - [ ] **OPEN — Admin UI saved-connections / settings page**: Slice 11 of the admin UI shipped schema sampler / logs viewer / geo viewer but skipped the planned `/settings` page with saved Mongo URIs and a manual dark/light toggle. The CLI today takes a single `--uri` per launch, so saved connections are bookmark-only (you can't switch targets after start). When the launcher gains hot-swap support, revisit this page — it's likely a small SQLite-backed list reusing the existing `~/.secantus/admin.db` store.
 

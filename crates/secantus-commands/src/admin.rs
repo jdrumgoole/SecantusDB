@@ -30,6 +30,7 @@
 
 use bson::{doc, Bson, Document};
 
+use crate::argtypes;
 use crate::find::split_into_cursor;
 use crate::util::{
     as_i64, bool_field, coll_arg, collation_of, command_error, docs_to_bson, encode_docs,
@@ -73,6 +74,9 @@ fn collection_option_subset(doc: &Document) -> Document {
 
 /// `create` — create a collection, persisting recognised options.
 pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    // Before the namespace checks: mongod parses the command before executing it,
+    // so a wrong-typed option on a MISSING collection is still the type error.
+    argtypes::require_object(doc, "storageEngine", "create.storageEngine")?;
     let coll = coll_arg(doc, "create")?;
     if let Some(unknown) = first_unknown_field(doc, CREATE_KNOWN_OPTIONS) {
         return Ok(CommandError::new(
@@ -154,6 +158,7 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// options into the collection's stored blob. Errors `NamespaceNotFound` (26)
 /// when the collection doesn't exist. (TTL-index `index` modification deferred.)
 pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    argtypes::require_object(doc, "index", "collMod.index")?;
     let coll = match doc.get("collMod").or_else(|| doc.get("collmod")) {
         Some(Bson::String(s)) => s.clone(),
         _ => {
@@ -782,6 +787,7 @@ pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
 
 /// `listIndexes` — a cursor over the indexes of a collection.
 pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    argtypes::require_cursor_object(doc)?;
     let coll = coll_arg(doc, "listIndexes")?;
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
@@ -966,6 +972,17 @@ fn is_falsy(v: &Bson) -> bool {
 }
 
 pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    // `indexes` is an array of specs; a scalar there used to report ok:1 and
+    // create NOTHING, so a driver believed an index existed that did not.
+    argtypes::require_array(doc, "indexes", "createIndexes.indexes")?;
+    if let Some(bson::Bson::Array(specs)) = doc.get("indexes") {
+        for spec in specs {
+            if let bson::Bson::Document(spec) = spec {
+                argtypes::require_object(spec, "key", "createIndexes.key")?;
+                argtypes::require_string(spec, "name", "createIndexes.name")?;
+            }
+        }
+    }
     let coll = coll_arg(doc, "createIndexes")?;
     let storage = ctx.storage()?;
     let specs: Vec<Bson> = match doc.get("indexes") {
