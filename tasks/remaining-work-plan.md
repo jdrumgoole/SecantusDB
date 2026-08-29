@@ -215,17 +215,40 @@ bugs from a handful of probes, and the `findAndModify` sweep below kept the rate
 up. **All five surfaces are now done** (2026-08-29):
 
 - [x] **Change streams (resume tokens, `fullDocument` modes, invalidation) —
-      DONE 2026-08-29 (#1104).** 13 shapes against a real replica-set mongod;
-      **all 13 diverged.** One crash (a resume token that is valid hex but not
-      valid BSON), and the rest overwhelmingly arguments ACCEPTED AND IGNORED —
-      the worst shape for a stream specifically, because the caller believes
-      they asked for something: a misspelled `fullDocument: "updateLookup"`
-      produced a stream without lookups, a wrong-typed `resumeAfter` one that
-      restarted from the beginning. Both reported success.
+      DONE 2026-08-29 — swept TWICE, for different things (#1104 and this
+      slice).** mongod refuses change streams on a standalone and the
+      differential harness spawns one, so this surface had never been compared
+      against a real server at all; both sweeps had to stand up a single-node
+      replica set first.
+
+      **Arguments (#1104):** 13 shapes, **all 13 diverged.** One crash (a resume
+      token that is valid hex but not valid BSON), and the rest overwhelmingly
+      arguments ACCEPTED AND IGNORED — the worst shape for a stream
+      specifically, because the caller believes they asked for something: a
+      misspelled `fullDocument: "updateLookup"` produced a stream without
+      lookups, a wrong-typed `resumeAfter` one that restarted from the
+      beginning. Both reported success.
       Method note: the validation belongs in `changestreams.parse_spec`, NOT in
       the `$changeStream` pipeline stage — the `aggregate` command routes change
       streams through its own path and never runs that stage, so a first attempt
       in the stage handler had no effect at all.
+
+      **Events and errors (this slice):** 41 cases, 14 diverged. The `required`
+      pre-/post-image error answered 280 where mongod answers **47
+      `NoMatchingDocument`** with no error labels — two distinct conditions had
+      been sharing one exception class, so one wrong code covered both; the
+      stripped-resume-token error was missing mongod's `Executor error during
+      getMore` wrapper and its `Expected: … but found: …` tail; and events were
+      emitted with `wallTime` and `fullDocument` in the wrong positions, with
+      `_id` not first. **Field order is invisible to a document comparison**,
+      which is how nine construction sites drifted unnoticed and why the probe
+      now compares key lists as its own pass — that alone found 28 of 34 CRUD
+      events out of order. Fixed on both servers, which now diverge from mongod
+      on exactly the same remaining cases.
+      Recorded, not fixed: `truncatedArrays` (mongod never emits it, measured
+      across eight mutations and four array sizes — its own slice, ~19
+      assertions across two mirrored engines) and the expanded-event
+      `collectionUUID` / `stateBeforeChange` gaps.
 - [x] **Index and query planning (`explain` shapes, hint honouring, multikey)
       — behavioural half DONE 2026-08-29; `explain`'s stage vocabulary
       deliberately left whole (one scoped item in `backlog.md`).**

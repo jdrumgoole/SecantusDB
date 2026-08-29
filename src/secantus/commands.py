@@ -17,6 +17,7 @@ from secantus.aggregate import (
     SEARCH_INDEX_ATLAS_MSG,
     AggregateError,
     PipelineContext,
+    _fmt_stage_val,
     _geo_near_index_filter,
     apply_pipeline,
     validate_stage_names,
@@ -4879,17 +4880,21 @@ def _kill_cursors(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _change_stream_fatal_reply(exc: changestreams.ChangeStreamFatalError) -> dict[str, Any]:
-    """mongod's reply shape for fatal change-stream conditions: the
-    error code plus the ``NonResumableChangeStreamError`` label so
-    drivers know not to auto-resume (asserted by the unified
-    change-streams-errors specs)."""
-    return {
+    """mongod's reply shape for fatal change-stream conditions.
+
+    The labels come from the exception rather than being hard-coded:
+    projecting out ``_id`` carries ``NonResumableChangeStreamError`` (the
+    unified change-streams specs assert it), while a missing required
+    pre-/post-image carries none — measured against mongod 6.0.16."""
+    reply: dict[str, Any] = {
         "ok": 0.0,
         "errmsg": str(exc),
         "code": exc.code,
         "codeName": exc.codeName,
-        "errorLabels": ["NonResumableChangeStreamError"],
     }
+    if exc.error_labels:
+        reply["errorLabels"] = list(exc.error_labels)
+    return reply
 
 
 class _CappedPositionLost(Exception):
@@ -5797,7 +5802,7 @@ def _aggregate_change_stream(
             # The resume tokens going in, to compare against what comes out.
             tokens_in = [ev.get("_id") for ev in events if isinstance(ev, Mapping)]
             events = apply_pipeline(events, pipeline_after_cs, pipeline_ctx)
-            for ev in events:
+            for idx, ev in enumerate(events):
                 if not isinstance(ev, Mapping):
                     continue
                 # mongod 4.1.8+ allows "only transformations that retain the
@@ -5815,6 +5820,13 @@ def _aggregate_change_stream(
                 # position, since the pipeline may reorder or drop events.
                 token = ev.get("_id")
                 if token is None or not any(token == t for t in tokens_in):
+                    # mongod ends the message with the token it expected and
+                    # what the pipeline left behind — `but found: {}` when the
+                    # token was dropped, `{ _id: <value> }` when it was
+                    # rewritten (both measured against 6.0.16).
+                    expected = tokens_in[idx] if idx < len(tokens_in) else None
+                    found = "{}" if token is None else _fmt_stage_val({"_id": token})
+                    detail = f" Expected: {_fmt_stage_val({'_id': expected})} but found: {found}"
                     raise changestreams.ChangeStreamFatalError(
                         # mongod's exact wording. libmongoc's
                         # `_test_resume_token_error` asserts on the final
@@ -5822,11 +5834,15 @@ def _aggregate_change_stream(
                         # this message was the Python server's own paraphrase,
                         # which ended "unusable for resuming" and so failed the
                         # C gauge's /change_stream/live/{missing,invalid}_resume_token.
+                        # The wrapper prefix is mongod's too: the condition is
+                        # detected while draining a getMore, so it surfaces
+                        # wrapped (measured against 6.0.16).
+                        "Executor error during getMore :: caused by :: "
                         "Encountered an event whose _id field, which contains the "
                         "resume token, was modified by the pipeline. Modifying the "
                         "_id field of an event makes it impossible to resume the "
                         "stream from that point. Only transformations that retain "
-                        "the unmodified _id field are allowed."
+                        "the unmodified _id field are allowed." + detail
                     )
         return events
 

@@ -354,7 +354,7 @@ mod tests {
 /// mongod's rendering of a stage argument inside an error message: strings are
 /// quoted, bools lowercase, arrays spaced (`[ 1 ]`), an empty document `{}`.
 /// Probed on 6.0.16 via `$skip`'s message, which echoes the offending value.
-fn render_stage_value(v: &Bson) -> String {
+pub(crate) fn render_stage_value(v: &Bson) -> String {
     match v {
         Bson::String(s) => format!("\"{s}\""),
         Bson::Boolean(b) => b.to_string(),

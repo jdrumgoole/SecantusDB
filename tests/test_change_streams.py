@@ -915,3 +915,77 @@ def test_empty_poll_cannot_skip_a_write_that_lands_mid_scan(
     )
     assert event["operationType"] == "insert"
     assert event["documentKey"]["_id"] == "written-mid-scan"
+
+
+# --- Fatal change-stream errors: two conditions, two different codes ---------
+#
+# These used to share code 280. Measured against mongod 6.0.16 (a single-node
+# replica set, since change streams need one) on 2026-08-29 they differ:
+#
+#   pipeline strips/rewrites the resume token -> 280 ChangeStreamFatalError,
+#                                                with NonResumableChangeStreamError
+#   required pre-/post-image not available     -> 47  NoMatchingDocument, no labels
+#
+# The 280 case is also asserted by the driver spec suite
+# (change-streams.json, "Test server error on projecting out _id"), so the two
+# must not be collapsed back together.
+
+
+def _fatal(cs_kwargs, pipeline, client: MongoClient, dbname: str):
+    """Drive a stream to its fatal error and return the server's error doc."""
+    coll = client[dbname]["c"]
+    coll.insert_one({"_id": 1, "a": 1})
+    with pytest.raises(OperationFailure) as ei, coll.watch(pipeline, **cs_kwargs) as cs:
+        coll.update_one({"_id": 1}, {"$set": {"a": 2}})
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            cs.try_next()
+    return ei.value.details or {}
+
+
+def test_full_document_required_without_images_is_47_not_280(client: MongoClient) -> None:
+    """mongod answers a missing required POST-image with 47 NoMatchingDocument
+    and no error labels — not the 280 it uses for a stripped resume token."""
+    d = _fatal({"full_document": "required"}, [], client, "fdreq")
+    assert d.get("code") == 47
+    assert d.get("codeName") == "NoMatchingDocument"
+    assert d.get("errorLabels") is None
+    assert d["errmsg"].startswith("Executor error during getMore :: caused by :: ")
+    assert "require a post-image for all update events" in d["errmsg"]
+    # The event that could not be satisfied is named, shell-rendered.
+    assert 'ns: {db: "fdreq", coll: "c"}' in d["errmsg"]
+
+
+def test_before_change_required_without_preimage_is_47(client: MongoClient) -> None:
+    """Same code, different wording: the PRE-image message names all three
+    operations mongod lists for it."""
+    d = _fatal({"full_document_before_change": "required"}, [], client, "bcreq")
+    assert d.get("code") == 47
+    assert d.get("codeName") == "NoMatchingDocument"
+    assert d.get("errorLabels") is None
+    assert "require a pre-image for all update, delete and replace events" in d["errmsg"]
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "found"),
+    [
+        ([{"$project": {"_id": 0}}], "{}"),
+        ([{"$project": {"_id": {"$literal": "foo"}}}], '{ _id: "foo" }'),
+        ([{"$addFields": {"_id": 7}}], "{ _id: 7 }"),
+    ],
+    ids=["dropped", "rewritten-literal", "rewritten-addfields"],
+)
+def test_modified_resume_token_is_280_with_expected_and_found(
+    client: MongoClient, pipeline: list[dict[str, Any]], found: str
+) -> None:
+    """Dropping OR rewriting the token is fatal, and mongod's message ends by
+    naming the token it expected and what the pipeline left behind."""
+    d = _fatal({}, pipeline, client, "tok")
+    assert d.get("code") == 280
+    assert d.get("codeName") == "ChangeStreamFatalError"
+    assert d.get("errorLabels") == ["NonResumableChangeStreamError"]
+    assert d["errmsg"].startswith("Executor error during getMore :: caused by :: ")
+    # libmongoc's _test_resume_token_error asserts on this sentence.
+    assert "Only transformations that retain the unmodified _id field are allowed." in d["errmsg"]
+    assert d["errmsg"].endswith(f" but found: {found}")
+    assert '{ _id: { _data: "' in d["errmsg"]

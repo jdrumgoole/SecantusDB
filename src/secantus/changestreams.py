@@ -46,10 +46,29 @@ class ChangeStreamHistoryLost(Exception):
 
 
 class ChangeStreamFatalError(Exception):
-    """``fullDocument: "required"`` lookup missed (code 280)."""
+    """A change stream cannot continue — e.g. the pipeline projected out
+    ``_id``, so no resume token can be built (measured against mongod
+    6.0.16: code 280, with the non-resumable label)."""
 
     code = 280
     codeName = "ChangeStreamFatalError"
+    error_labels: tuple[str, ...] = ("NonResumableChangeStreamError",)
+
+
+class ChangeStreamRequiredImageError(ChangeStreamFatalError):
+    """``fullDocument`` / ``fullDocumentBeforeChange`` was ``"required"``
+    and the image was not available.
+
+    A *different* condition from the one above and mongod answers it
+    differently: measured against 6.0.16 on 2026-08-29 it is code 47
+    ``NoMatchingDocument`` with **no** error labels, not 280. Both cases
+    used to share 280 here, which is why this is a subclass — the
+    getMore path catches the base class and the reply is shaped from
+    whichever code/labels the instance carries."""
+
+    code = 47
+    codeName = "NoMatchingDocument"
+    error_labels: tuple[str, ...] = ()
 
 
 @dataclass
@@ -142,27 +161,82 @@ def _ns_doc(ns: str) -> dict[str, str]:
     return out
 
 
+# mongod's field order for a change event, measured against 6.0.16 on
+# 2026-08-29 with tools/probes/change_streams.py. Order is invisible to a dict
+# comparison, so it survived every equality-based check we had: the probe
+# compares key LISTS, and found 28 of 34 CRUD cases out of order. Any key not
+# listed here keeps its relative position after these.
+_EVENT_FIELD_ORDER = (
+    "_id",
+    "operationType",
+    "clusterTime",
+    "collectionUUID",
+    "wallTime",
+    "fullDocument",
+    "ns",
+    "to",
+    "documentKey",
+    "operationDescription",
+    "updateDescription",
+    "stateBeforeChange",
+    "fullDocumentBeforeChange",
+)
+
+
+def _order_event_fields(event: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild an event with mongod's field order.
+
+    Applied once, at the end of projection, rather than by constructing every
+    event type in the right order — there are nine construction sites and they
+    drifted apart precisely because nothing checked them."""
+    known = [k for k in _EVENT_FIELD_ORDER if k in event]
+    rest = [k for k in event if k not in _EVENT_FIELD_ORDER]
+    return {k: event[k] for k in known + rest}
+
+
 def _do_lookup(storage: Storage, db: str, coll: str, doc_id: Any) -> dict[str, Any] | None:
     docs = storage.find_matching(db, coll, {"_id": doc_id}, limit=1)
     return docs[0] if docs else None
 
 
 def _set_full_document(event: dict[str, Any], value: Any) -> None:
-    """Place ``fullDocument`` immediately after ``operationType``.
+    """Set ``fullDocument``; placement is handled by [`_order_event_fields`].
 
-    mongod's change event orders it there; assigning ``event["fullDocument"]``
-    appends it at the END instead. The event's field order is part of the
-    change-stream contract drivers read off the wire, and it is the only thing
-    that differed between our events and mongod's -- the contents already
-    matched.
-    """
-    rest = {k: v for k, v in event.items() if k not in ("operationType", "fullDocument")}
-    op_type = event.get("operationType")
-    event.clear()
-    if op_type is not None:
-        event["operationType"] = op_type
+    This used to hand-place the key immediately after ``operationType``, which
+    was measured wrong twice over against mongod 6.0.16: mongod puts
+    ``fullDocument`` after ``wallTime``, and the hoisting also pushed ``_id``
+    out of first position."""
     event["fullDocument"] = value
-    event.update(rest)
+
+
+def _required_image_message(event: Mapping[str, Any], *, pre: bool) -> str:
+    """mongod's wording for a missing required pre-/post-image.
+
+    Verbatim from 6.0.16, including the ``Executor error during getMore``
+    wrapper it adds when the condition is hit while draining a cursor and
+    the shell-style rendering of the offending event."""
+    ts = event.get("clusterTime")
+    ns = event.get("ns") or {}
+    summary = (
+        '{{operationType: "{op}", ns: {{db: "{db}", coll: "{coll}"}}, '
+        "clusterTime: Timestamp({secs}, {inc})}}"
+    ).format(
+        op=event.get("operationType", ""),
+        db=ns.get("db", ""),
+        coll=ns.get("coll", ""),
+        secs=getattr(ts, "time", 0),
+        inc=getattr(ts, "inc", 0),
+    )
+    if pre:
+        what = (
+            "a pre-image for all update, delete and replace events, but the pre-image was not found"
+        )
+    else:
+        what = "a post-image for all update events, but the post-image was not found"
+    return (
+        "Executor error during getMore :: caused by :: "
+        f"Change stream was configured to require {what} for event: {summary}"
+    )
 
 
 def _attach_full_document(
@@ -205,20 +279,14 @@ def _attach_full_document(
             FULL_DOC_WHEN_AVAILABLE,
         ) and not storage._pre_post_images_enabled(db, coll):
             if full_document_mode == FULL_DOC_REQUIRED:
-                raise ChangeStreamFatalError(
-                    "the 'fullDocument: required' option requires "
-                    "changeStreamPreAndPostImages to be enabled on the "
-                    f"collection {ns}"
-                )
+                raise ChangeStreamRequiredImageError(_required_image_message(event, pre=False))
             _set_full_document(event, None)
             return
         looked_up = _do_lookup(storage, db, coll, doc_id) if doc_id is not None else None
         if looked_up is not None:
             _set_full_document(event, looked_up)
         elif full_document_mode == FULL_DOC_REQUIRED:
-            raise ChangeStreamFatalError(
-                f"fullDocument required but document with _id={doc_id!r} not found"
-            )
+            raise ChangeStreamRequiredImageError(_required_image_message(event, pre=False))
         else:
             _set_full_document(event, None)
 
@@ -236,12 +304,35 @@ def _attach_full_document_before_change(
     if pre is not None:
         event["fullDocumentBeforeChange"] = pre
     elif mode == FULL_DOC_REQUIRED:
-        raise ChangeStreamFatalError("fullDocumentBeforeChange required but pre-image not stored")
+        raise ChangeStreamRequiredImageError(_required_image_message(event, pre=True))
     elif mode == FULL_DOC_WHEN_AVAILABLE:
         event["fullDocumentBeforeChange"] = None
 
 
 def project(
+    seq: int,
+    oplog_entry: Mapping[str, Any],
+    *,
+    storage: Storage,
+    full_document_mode: str = FULL_DOC_DEFAULT,
+    full_document_before_change_mode: str = FULL_DOC_DEFAULT,
+    scope: Mapping[str, Any],
+    show_expanded_events: bool = False,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Project an oplog entry into a change event, in mongod's field order."""
+    event, invalidates = _project(
+        seq,
+        oplog_entry,
+        storage=storage,
+        full_document_mode=full_document_mode,
+        full_document_before_change_mode=full_document_before_change_mode,
+        scope=scope,
+        show_expanded_events=show_expanded_events,
+    )
+    return (_order_event_fields(event) if event is not None else None), invalidates
+
+
+def _project(
     seq: int,
     oplog_entry: Mapping[str, Any],
     *,
@@ -298,16 +389,21 @@ def project(
             "_id": token,
             "operationType": op_type,
             "clusterTime": ts,
-            "ns": _ns_doc(ns),
-            "documentKey": document_key,
         }
+        # mongod puts wallTime immediately after clusterTime and before ns
+        # (measured against 6.0.16, 2026-08-29; we emitted it after
+        # documentKey). Field order is invisible to a dict comparison, so it
+        # survived every equality-based check until the probe compared key
+        # lists — see tools/probes/change_streams.py.
+        if wall is not None:
+            event["wallTime"] = wall
+        event["ns"] = _ns_doc(ns)
+        event["documentKey"] = document_key
         # mongod 6.0+ attaches the collection's UUID to CRUD events when the
         # stream was opened with ``showExpandedEvents``. The oplog row carries
         # it as ``ui`` (Binary subtype 4).
         if show_expanded_events and oplog_entry.get("ui") is not None:
             event["collectionUUID"] = oplog_entry["ui"]
-        if isinstance(wall, object) and wall is not None:
-            event["wallTime"] = wall
         # Writes that happened inside a multi-document transaction carry
         # the session/transaction identity on their oplog entries; mongod
         # surfaces both on the change event.
@@ -759,6 +855,7 @@ def stamp_split_event(event: dict[str, Any]) -> list[dict[str, Any]]:
 
 __all__ = [
     "ChangeStreamFatalError",
+    "ChangeStreamRequiredImageError",
     "ChangeStreamHistoryLost",
     "ChangeStreamSpec",
     "FULL_DOC_DEFAULT",

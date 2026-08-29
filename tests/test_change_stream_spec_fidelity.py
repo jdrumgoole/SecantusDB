@@ -163,22 +163,49 @@ def _events(db, **kw):
     return out
 
 
-def test_full_document_follows_operation_type(db) -> None:
-    """mongod orders ``fullDocument`` immediately after ``operationType``; we
-    appended it at the END. The contents already matched exactly -- only the
-    order differed, and the event's field order is the contract drivers read
-    off the wire."""
+# These two used to assert that ``fullDocument`` sits immediately after
+# ``operationType``. That was never measured -- this file drives our own
+# server, and mongod refuses change streams on a standalone, so nothing here
+# could check it. Measured against a real single-node replica set (mongod
+# 6.0.16, 2026-08-29, tools/probes/change_streams.py), the event is:
+#
+#   ['_id', 'operationType', 'clusterTime', 'wallTime', 'fullDocument',
+#    'ns', 'documentKey', 'updateDescription']
+#
+# so ``fullDocument`` follows ``wallTime`` at index 4, and hoisting it to
+# index 2 also pushed ``_id`` out of first position. They now pin the measured
+# order, which is why they are written as an exact key sequence rather than as
+# a relative index: a relative assertion is what let the wrong claim survive.
+
+
+def test_insert_event_field_order_matches_mongod(db) -> None:
+    """The event's field order is part of what a driver reads off the wire."""
     events = _events(db)
     assert events, "expected at least the insert event"
-    keys = list(events[0])
-    assert keys.index("fullDocument") == keys.index("operationType") + 1
+    assert list(events[0]) == [
+        "_id",
+        "operationType",
+        "clusterTime",
+        "wallTime",
+        "fullDocument",
+        "ns",
+        "documentKey",
+    ]
 
 
-def test_update_lookup_places_full_document_the_same_way(db) -> None:
+def test_update_lookup_event_field_order_matches_mongod(db) -> None:
     events = _events(db, full_document="updateLookup")
     update = next(e for e in events if e["operationType"] == "update")
-    keys = list(update)
-    assert keys.index("fullDocument") == keys.index("operationType") + 1
+    assert list(update) == [
+        "_id",
+        "operationType",
+        "clusterTime",
+        "wallTime",
+        "fullDocument",
+        "ns",
+        "documentKey",
+        "updateDescription",
+    ]
 
 
 def test_the_events_themselves_are_unchanged(db) -> None:

@@ -136,11 +136,14 @@ impl CmdStorage for StorageAdapter {
             // A fatal projection error (e.g. fullDocument: required with
             // changeStreamPreAndPostImages disabled) ends the stream with an
             // ok: 0 reply rather than tearing down the poll — surface it via the
-            // batch so the producer/getMore can report it (code 280).
+            // batch so the producer/getMore can report it. mongod 6.0.16 answers
+            // a missing required pre-/post-image with 47 `NoMatchingDocument`
+            // (measured 2026-08-29), NOT the 280 it uses when a pipeline strips
+            // the resume token — every storage-side fatal here is the former.
             let (event, invalidates) = match projected {
                 Ok(v) => v,
                 Err(WtError::ChangeStreamFatal(m)) => {
-                    fatal = Some((280, m));
+                    fatal = Some((47, m));
                     break;
                 }
                 Err(e) => return Err(map_err(e)),

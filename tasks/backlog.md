@@ -1157,10 +1157,50 @@ These are explicit non-goals. Don't add them without a reason.
   exhausted cursor — a stream that never yields and never explains; two wrong
   codes; and the event field order (`fullDocument` belongs immediately after
   `operationType`, not appended at the end — contents already matched).
-- [ ] **The change-stream `_id`-modified fatal error lacks mongod's wrapper
-  prefix.** Code (280) and message body match; mongod prefixes
-  `Executor error during getMore :: caused by ::`. Same wrapper-prefix class as
-  the aggregation-error entry already tracked above, and no code differs.
+- [ ] **Change-stream `updateDescription` reports array edits in a shape mongod
+  never produces — we emit `truncatedArrays`, mongod (6.0.16) emits none, ever
+  (2026-08-29).** Measured with `tools/probes/change_streams.py` across eight
+  array mutations and four array sizes (5 / 20 / 100 / 1000); nine cases
+  diverge and only `$set` of one element agrees. mongod's rule is: any shrink
+  or reorder reports the **whole new array** under `updatedFields`, and an
+  append reports the **positional path** of the added element.
+
+  | mutation | us | mongod |
+  |---|---|---|
+  | `$push` one | `updatedFields: {arr: [1,2,3,4,5,9]}` | `updatedFields: {arr.5: 9}` |
+  | `$pop` last | `truncatedArrays: [{field: arr, newSize: 4}]` | `updatedFields: {arr: [1,2,3,4]}` |
+  | `$pop` first | `{arr.0..arr.3}` + `truncatedArrays` | `updatedFields: {arr: [2,3,4,5]}` |
+  | `$pull` middle | `{arr.2, arr.3}` + `truncatedArrays` | `updatedFields: {arr: [1,2,4,5]}` |
+  | `$slice` keep 2 | `truncatedArrays: [{field: arr, newSize: 2}]` | `updatedFields: {arr: [1,2]}` |
+  | replace array | `{arr.0, arr.1}` + `truncatedArrays` | `updatedFields: {arr: [7,8]}` |
+
+  Array size does not change mongod's answer (checked at 20/100/1000 — it does
+  NOT switch to a truncation form for large arrays, which was the reason to
+  suspect a size threshold). Deliberately **not** fixed in the sweep that found
+  it: the diff walk is parity-mirrored (`src/secantus/diff.py` +
+  `crates/secantus-core/src/diff.rs`) and ~19 assertions across
+  `tests/test_diff.py` and `tests/test_change_streams.py` pin the current
+  behaviour, so it is its own slice. Note `truncatedArrays` is a real mongod
+  field — this is about when it is emitted, and 6.0.16 never emits it for any
+  mutation probed.
+
+- [ ] **Expanded change events omit `collectionUUID`, and `collMod` omits
+  `stateBeforeChange` (2026-08-29).** With `showExpandedEvents: true`, mongod
+  puts `collectionUUID` on `create` / `createIndexes` / `dropIndexes` /
+  `collMod` events (immediately after `clusterTime`); we emit it only on CRUD
+  events. mongod's `collMod` event also carries `stateBeforeChange:
+  {collectionOptions: {uuid: …}}`, which we do not emit at all. Four content
+  divergences plus the four matching field-order ones, identical on both
+  servers. Measured with `tools/probes/change_streams.py`.
+
+- [ ] **mongod 6.0.16 emits `to` as the FIRST field of a `rename` change event,
+  before `_id` — not replicated, deliberately (2026-08-29).** Measured
+  repeatedly and directly: `['to', '_id', 'operationType', 'clusterTime',
+  'wallTime', 'ns']`. Every other event type puts `_id` first, so this looks
+  like an assembly artifact rather than a contract, and it may well differ on
+  the 7.0 we advertise. Recorded rather than copied; re-measure on a newer
+  mongod before deciding. Ours is `['_id', 'operationType', 'clusterTime',
+  'wallTime', 'ns', 'to']`.
 
 - [x] **`$lookup` / `$graphLookup` sweep — 20 of 27 shapes diverged, headline
   was a TRUNCATED traversal (2026-08-29).** `$graphLookup` stopped following
