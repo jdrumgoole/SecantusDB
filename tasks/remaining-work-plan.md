@@ -225,8 +225,28 @@ Sub-ms `ORDER BY` is adjacent to work already landed and should be cheap.
       | `$bucket` with no `default` and an out-of-range value | 2 | 7158303 |
       | `$replaceRoot` whose `newRoot` resolves to a scalar | 2 | 40228 |
 
-      The last one is wrong on the PYTHON server too (14, not 40228). For these
-      the template still applies: **`update::arith_type_error`** — a standalone
+      **The PYTHON server was measured on the same three cases 2026-08-30
+      (mongod 8.2.11 on `:27019`, Python server on `:27018`) and is NOT uniformly
+      wrong — only one of the three needs a code at all:**
+
+      | case | python code | python message | verdict |
+      |---|---|---|---|
+      | `$densify` on a string field | 5733201 | wrapped, text matches | **already correct** |
+      | `$bucket` with no `default` | 7158303 | correct text, **wrapper prefix missing** | message half only |
+      | `$replaceRoot` scalar `newRoot` | **14** (want 40228) | `$replaceRoot newRoot must evaluate to a document`, **unwrapped**; mongod says `'newRoot' expression  must evaluate to an object, but resulting value was: 1. Type of resulting value: 'int'. Input document: {n: 1}` (mongod's own double space after `expression`) | code + message |
+
+      **The Python half needs no new machinery — it is two raise sites.**
+      `AggregateError` already takes `code=` and `exec_error=True`, and
+      `commands.py` (the `apply_pipeline` except arm) already applies mongod's
+      `Executor error during aggregate command on namespace: <ns> :: caused by ::`
+      prefix to any `exec_error` raise — which is exactly why `$densify` is
+      already right. So: `aggregate.py`'s `$replaceRoot newRoot must evaluate to
+      a document` raise needs `code=40228, exec_error=True` and mongod's text,
+      and the `$switch` no-matching-branch raise needs `exec_error=True`. This
+      entry's cost estimate was written from the Rust side and over-reads the
+      Python side.
+
+      For the Rust side the template still applies: **`update::arith_type_error`** — a standalone
       validator naming the errors it can name, leaving `Fallback` for genuinely
       unimplemented constructs, plus a `StorageError` variant and one arm in the
       adapter's code table. Do *not* widen `Fallback` itself — that touches 37
