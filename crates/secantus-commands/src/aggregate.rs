@@ -524,6 +524,65 @@ fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError> {
                 format!("Unrecognized pipeline stage name: '{name}'"),
             ));
         }
+        if name == "$setWindowFields" {
+            validate_set_window_fields(d.get(name))?;
+        }
+    }
+    Ok(())
+}
+
+/// `$setWindowFields`'s own fields. Anything else is REJECTED rather than
+/// ignored: an unknown top-level key used to be accepted silently, so a caller
+/// who misspelled `partitionBy` -- or put `range` at the top level, where it
+/// looks plausible but belongs inside a window -- got a wrong answer instead of
+/// an error. Codes and messages probed against mongod 8.2.11. Mirrors the
+/// Python server's `_SET_WINDOW_FIELDS_KNOWN`.
+const SET_WINDOW_FIELDS_KNOWN: &[&str] = &["partitionBy", "sortBy", "output"];
+
+fn validate_set_window_fields(spec: Option<&Bson>) -> Result<(), CommandError> {
+    let Some(spec) = spec.and_then(Bson::as_document) else {
+        return Ok(()); // shape errors are the engine's to report
+    };
+    if let Some(unknown) = spec
+        .keys()
+        .find(|k| !k.starts_with('$') && !SET_WINDOW_FIELDS_KNOWN.contains(&k.as_str()))
+    {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field '$setWindowFields.{unknown}' is an unknown field."),
+        ));
+    }
+    if !spec.contains_key("output") {
+        return Err(CommandError::new(
+            40414,
+            "IDLFailedToParse",
+            "BSON field '$setWindowFields.output' is missing but a required field",
+        ));
+    }
+    // The same silent acceptance one level down: an unknown key inside `window`
+    // was ignored, so a misspelled `documents` widened the window to the whole
+    // partition without saying so.
+    if let Some(output) = spec.get("output").and_then(Bson::as_document) {
+        for (_field, field_spec) in output.iter() {
+            let Some(fs) = field_spec.as_document() else {
+                continue;
+            };
+            let Some(window) = fs.get("window").and_then(Bson::as_document) else {
+                continue;
+            };
+            if window
+                .keys()
+                .any(|k| !matches!(k.as_str(), "documents" | "range" | "unit"))
+            {
+                return Err(CommandError::new(
+                    9,
+                    "FailedToParse",
+                    "'window' field can only contain 'documents' as the only argument \
+                     or 'range' with an optional 'unit' field",
+                ));
+            }
+        }
     }
     Ok(())
 }
