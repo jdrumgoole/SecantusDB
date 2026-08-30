@@ -91,6 +91,13 @@ PROBED_MONGOD_MAJOR = 8
 #: The exact server the expectations were taken from. Informational -- the gate
 #: compares the major above -- but it is the version to reproduce against.
 PROBED_MONGOD_VERSION = "8.2.1"
+#: Also verified green, 2026-08-30: 8.2.11, which is what
+#: ``brew install mongodb/brew/mongodb-community@8.2`` installs and what is now
+#: linked as this box's default ``mongod``. It needed `_sort_type_lists` below --
+#: three cases differed only in the ORDER of an expected-type list. Anything in
+#: the 8.2 range should pass; if a new patch release fails, re-probe the case
+#: rather than widening the skip.
+VERIFIED_ALSO = ("8.2.11",)
 
 
 def _free_port() -> int:
@@ -151,6 +158,25 @@ def secantus_uri(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
         yield srv.uri
 
 
+# mongod renders a wrong-type error's expected-type list in an arbitrary order:
+# `[long, int, double, bool, decimal]` on 8.2.11 versus
+# `[int, decimal, long, bool, double]` on 8.2.1, for the same field. The order is
+# stable per build (checked across separate processes) but changes between patch
+# releases, so pinning it pins a build rather than a behaviour -- 8.2.11, the
+# version `brew install mongodb-community@8.2` gives, failed three cases against
+# expectations probed from 8.2.1. It is a SET; compare it as one. Everything
+# else about the message, including the type NAMES, is still asserted exactly.
+_TYPE_LIST = re.compile(r"(expected types \\?')\[([^\]]*)\]")
+
+
+def _sort_type_lists(rendered: str) -> str:
+    def repl(m: re.Match) -> str:
+        items = sorted(part.strip() for part in m.group(2).split(",") if part.strip())
+        return f"{m.group(1)}[{', '.join(items)}]"
+
+    return _TYPE_LIST.sub(repl, rendered)
+
+
 def _run(uri: str, db_name: str, seed: list[dict], op: Callable[[Database], object]) -> str:
     """Apply one case and return a comparable rendering of its outcome.
 
@@ -165,7 +191,7 @@ def _run(uri: str, db_name: str, seed: list[dict], op: Callable[[Database], obje
         if seed:
             db.c.insert_many([dict(d) for d in seed])
         try:
-            return repr(op(db))
+            return _sort_type_lists(repr(op(db)))
         except Exception as exc:  # noqa: BLE001 - the error IS the result
             return f"ERROR code={getattr(exc, 'code', None)}"
     finally:

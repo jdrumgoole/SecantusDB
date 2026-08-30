@@ -39,6 +39,20 @@ divergent** while the Python server was 87/87 clean — the two servers are NOT
 interchangeable for conformance, and a probe that has only ever run against one
 of them says nothing about the other.
 
+**Three mongod versions are installed here.** `mongod` on `PATH` is **8.2.11**
+(`mongodb-community@8.2`, linked as default so the differential gate runs rather
+than skipping); 6.0.16 is at `/opt/homebrew/opt/mongodb-community@6.0/bin/mongod`
+and 8.3.4 at `.../mongodb-community@8.3/bin/mongod`. Probe more than one whenever
+a result could be version-shaped.
+
+The change-stream sweep is the cautionary case. Probed on 8.3.4 it looked like
+`fullDocument` had moved position in "8.x", and a backlog entry was written
+claiming a retarget gap. On 8.2.1 — the version actually targeted — it had not
+moved at all: 6.0.16 and 8.2.1 agree and only 8.3 differs. A major series is not
+one behaviour, and neither is a minor one: 8.2.1 and 8.2.11 disagree on the order
+of a wrong-type error's type list. (8.x dropped `--fork` on macOS; background it
+with `nohup … &`.)
+
 **Probe the mongod version SecantusDB targets.** We advertise 7.0
 (`buildInfo.version`, maxWireVersion 17) and `tests/test_mongod_differential.py`
 spawns whatever `mongod` is on PATH. Probing a newer server than that and
@@ -62,7 +76,7 @@ until `change_streams.py`. Start one explicitly:
 |---|---|---|
 | `arg_types_documents.py` | document-valued command arguments | 56/56 clean (was 45 crashes) |
 | `arg_types_extended.py` | more commands + numeric/string/bool argument classes | Python **87/87 clean**; **Rust server 78 divergences — open** (see `PROBE_SERVER` above) |
-| `change_streams.py` | change events, event field order, fatal errors | 14 of 41 diverge — all `truncatedArrays` + expanded-event gaps, both servers (**needs a replica set**, see the script) |
+| `change_streams.py` | change events, event field order, fatal errors | 14 of 41 on 6.0.16, **8.2.1** (the probed target) and 8.3.4 alike — `truncatedArrays` + expanded-event gaps, identical on both our servers. Error codes/messages are stable across all three; `fullDocument`'s POSITION changes at 8.3 (backlog WATCH). **Needs a replica set**, see the script |
 | `findandmodify_shapes.py` | findAndModify replies and argument validation | 18/18 clean (was 6 divergences) |
 | `update_operators.py` | update operator semantics and errors | clean except the filed items |
 | `update_path_conflicts.py` | overlapping update operator paths | 12/12 clean (was 8 wrong results) |
