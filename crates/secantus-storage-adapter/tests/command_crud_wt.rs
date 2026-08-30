@@ -513,15 +513,52 @@ fn update_upsert_reports_upserted_id() {
     });
 }
 
+/// MongoDB 8.0's `sort` on an update statement: match in sort order, update the
+/// FIRST one. This test used to assert the option was REJECTED, which was right
+/// while the server advertised 7.0 and wrong the moment it advertised 8.2.11 --
+/// the driver `*-sort` specs assert both directions, gated on the version.
 #[test]
-fn update_sort_option_rejected_pre_8() {
+fn update_sort_updates_the_first_in_sort_order() {
+    with_wt(|c| {
+        for (id, v) in [(1, 3), (2, 1), (3, 2)] {
+            dispatch(&doc! {"insert": "c", "documents": [{"_id": id, "v": v}]}, c);
+        }
+        let reply = dispatch(
+            &doc! {"update": "c", "updates": [
+                {"q": {}, "u": {"$set": {"hit": 1}}, "sort": {"v": 1}}
+            ]},
+            c,
+        );
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(reply.get_i32("n").unwrap(), 1);
+        // `v: 1` sorts _id 2 first, so that is the document that was updated.
+        let found = dispatch(&doc! {"find": "c", "filter": {"hit": 1}}, c);
+        let batch = fb(&found, c);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            batch[0].as_document().unwrap().get_i32("_id").unwrap(),
+            2,
+            "sort asc should pick the lowest v"
+        );
+    });
+}
+
+/// mongod refuses the combination -- probed 8.2.11.
+#[test]
+fn update_sort_with_multi_is_rejected() {
     with_wt(|c| {
         let reply = dispatch(
-            &doc! {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}, "sort": {"a": 1}}]},
+            &doc! {"update": "c", "updates": [
+                {"q": {}, "u": {"$set": {"a": 1}}, "multi": true, "sort": {"a": 1}}
+            ]},
             c,
         );
         assert_eq!(reply.get_i32("code").unwrap(), 9);
         assert_eq!(reply.get_str("codeName").unwrap(), "FailedToParse");
+        assert_eq!(
+            reply.get_str("errmsg").unwrap(),
+            "Cannot specify sort with multi=true"
+        );
     });
 }
 

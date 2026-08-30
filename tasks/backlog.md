@@ -435,31 +435,25 @@ Specific items that were left out of the slice that introduced their feature are
   a case (megabyte documents *and* a projection) that no driver has hit. Left
   deliberately, recorded rather than silently skipped.
 - ~~**Three-droplet DigitalOcean benchmark: no repeat-and-median mode**~~ — shipped. `--repeat N` interleaves the engines within each pass (so drift lands on both equally) and reports medians plus a `(max - min) / median` spread column and a per-pass table. Measured 3.4% spread for secantusdb and 1.1% for mongod over three 60s passes. The whole harness is now live-verified: provisioning, VPC + firewall, SSH, cloud-init, both deploy routes, both engines, repeat/median, and all three teardown modes. See `bench/DO_CLUSTER.md`.
-- [ ] **The Rust server has none of the MongoDB 8.0 features the Python server
-  now advertises, and still advertises 7.0 (2026-08-30).** The Python server
-  gained `bulkWrite`, `sort` on update statements, and change-event `nsType`,
-  and moved its advertised version to 8.2.11 / wire 27 to match. The Rust server
-  keeps `WIRE_VERSION = 17` / `SERVER_VERSION = "7.0.0"` in
-  `crates/secantus-commands/src/lib.rs`, has no `bulkWrite` handler, still
-  rejects `sort` (`crates/secantus-commands/src/crud.rs`), and emits no
-  `nsType`.
+- [x] **RESOLVED (2026-08-30): the Rust server has the MongoDB 8.0 features and
+  advertises 8.2.11, matching the Python server.** `bulkWrite`, `sort` on update
+  statements and change-event `nsType` are all implemented in
+  `crates/secantus-commands` / `crates/secantus-storage`, and
+  `WIRE_VERSION` / `SERVER_VERSION` moved to 27 / "8.2.11" only once they
+  existed -- the sequencing the Python side established.
 
-  **That is deliberate and is the correct state today**: the advertised version
-  is a capability contract, so a server should advertise what it can do. Raising
-  the Rust constants without the features would make drivers send `bulkWrite`
-  and get `CommandNotFound` -- the exact failure the Python bump was sequenced to
-  avoid. The two servers version independently by design (CLAUDE.md
-  "Versioning").
+  Verified the same way: the 12-case `bulkWrite` differential against a live
+  8.2.11 is **0 diverge** (identical to Python), and the pymongo gauge against
+  the Rust server is **99.4%** with the same five out-of-scope failures the
+  Python server has (hashed / text indexes, `$where`, two CSOT).
 
-  It does mean a user switching servers sees different feature availability, so
-  it should not sit here indefinitely. Closing it is three pieces plus the bump,
-  and the Python side is the reference implementation for each: `bulkWrite`
-  (admin-only, `ops`/`nsInfo`, cursor-shaped reply, and per-op errors that must
-  NOT fail the batch), `sort` (resolve the first match in sort order, then pin
-  the update to its `_id`; reject with `multi: true`), and `nsType` on `create`
-  events. Verify against 8.2.11 and the pymongo gauge --
-  `TestUnifiedClientBulkWriteErrors` and `TestUnifiedChangeStreamsNsType` are the
-  tests that catch each.
+  The gauge earned its place again. Porting from a working reference is not the
+  same as porting it correctly: the Rust `bulkWrite` known-field list omitted
+  the Stable API envelope (`apiVersion` / `apiStrict` /
+  `apiDeprecationErrors`) that the Python list carries, so `client.bulk_write()`
+  failed outright for any client declaring an API version. The 12-case probe
+  passed anyway -- it never sends those fields. Only
+  `test_client_bulkWrite_appends_declared_API_version` caught it.
 
 - [ ] **SecantusDB is 0.27x mongod on incompressible data; p99.9 is 72x worse (2026-08-21)**: the three-droplet comparison on identical `c-4` hardware, **8 KiB incompressible documents**, 70/20/10 mix, 16 workers x 2 client droplets, 4G WT cache both, three interleaved 90s passes (spreads 3.6% / 3.9%): secantusd-rs 0.5.3-beta.160 at **3,993 ops/s against mongod 8.0.29's 14,937**, p50 2.41ms vs 1.73ms, p99 64ms vs 10ms, **p99.9 1,303ms vs 18ms**. Both server-CPU-bound at 80-83% with clients idle, so the comparison is fair. **Supersedes the earlier 0.46x / 9.8-11.3x figure**, which was measured with the default `repeat` payload — a single repeated character that both engines compress away, and that flattered SecantusDB because mongod's snappy-compressed journal benefits far more than SecantusDB's uncompressed one. Published in `docs/benchmark.md`. Reproduce with `invoke do-bench --repeat 3 --payload random`. The tail is the weak point: p50 is within 1.4x, so typical operations are competitive; it is the worst 0.1% that collapses. Relates to the uncompressed-WAL and cache-pressure entries above and to the write-path gap in §7.
 - [x] **RESOLVED 2026-08-28 — update error messages: mongod wraps EXECUTION-time

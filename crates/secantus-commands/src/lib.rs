@@ -35,6 +35,7 @@ pub mod admin;
 pub mod aggregate;
 pub mod argtypes;
 pub mod auth;
+mod bulkwrite;
 pub mod changestream;
 pub mod crud;
 pub mod cursors;
@@ -61,13 +62,20 @@ pub use cursors::{CursorError, CursorRegistry};
 pub use secantus_wire::{MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE};
 pub use storage::{Storage, StorageError, UpdateOutcome};
 
-/// Max wire protocol version advertised in `hello` (mongod 7.0).
-pub const WIRE_VERSION: i32 = 17;
+/// Max wire protocol version advertised in `hello` (mongod 8.2).
+///
+/// The advertised version is a CAPABILITY CONTRACT, not a label: drivers gate
+/// features on it, and the spec suites gate tests on it in both directions
+/// (`maxServerVersion: "7.99"` asserts a feature is REJECTED, `minServerVersion:
+/// "8.0"` that it works). So it moves only when the 8.0 features it promises
+/// exist -- `bulkWrite`, `sort` on updateOne/replaceOne, and change-event
+/// `nsType`, all landed alongside this bump. Matches the probed server (8.2.11).
+pub const WIRE_VERSION: i32 = 27;
 /// `version` reported by `buildInfo` — the MongoDB-compatibility value drivers
 /// gate feature flags on (change streams, pre-images, …).
-pub const SERVER_VERSION: &str = "7.0.0";
+pub const SERVER_VERSION: &str = "8.2.11";
 /// `versionArray` companion to [`SERVER_VERSION`].
-pub const SERVER_VERSION_ARRAY: [i32; 4] = [7, 0, 0, 0];
+pub const SERVER_VERSION_ARRAY: [i32; 4] = [8, 2, 11, 0];
 /// Default cursor batch size when the client doesn't specify one.
 ///
 /// This is the FIRST-batch default only. mongod's 101-document default applies
@@ -394,6 +402,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "ping" => handshake::ping,
         "replSetGetStatus" => handshake::repl_set_get_status,
         "buildInfo" | "buildinfo" => handshake::build_info,
+        "bulkWrite" => bulkwrite::bulk_write,
         "insert" => crud::insert,
         "update" => crud::update,
         "delete" => crud::delete,
