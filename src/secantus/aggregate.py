@@ -3798,6 +3798,11 @@ def _stage_documents(
 
 
 _RANK_FUNCS = frozenset({"$rank", "$denseRank", "$documentNumber"})
+#: `$setWindowFields`'s own fields. Anything else is rejected rather than
+#: ignored -- mongod answers 40415 (probed 8.2.11), and silently accepting a
+#: misspelled option is the shape where a caller believes they asked for
+#: something and got a wrong answer instead of an error.
+_SET_WINDOW_FIELDS_KNOWN = frozenset({"partitionBy", "sortBy", "output"})
 
 
 def _stage_set_window_fields(
@@ -3847,9 +3852,29 @@ def _stage_set_window_fields(
 
     if not isinstance(spec, Mapping):
         raise AggregateError("$setWindowFields requires a doc spec")
+    # An unknown top-level field was ACCEPTED AND IGNORED, so a caller who
+    # misspelled `partitionBy` -- or put `range` at the top level, where it
+    # looks plausible but belongs inside a window -- got a silent, wrong answer
+    # rather than an error. mongod rejects it (probed 8.2.11).
+    unknown = next(
+        (k for k in spec if k not in _SET_WINDOW_FIELDS_KNOWN and not k.startswith("$")),
+        None,
+    )
+    if unknown is not None:
+        raise AggregateError(
+            f"BSON field '$setWindowFields.{unknown}' is an unknown field.",
+            code=40415,
+            code_name="IDLUnknownField",
+        )
     partition_by = spec.get("partitionBy")
     sort_by = spec.get("sortBy")
     output = spec.get("output")
+    if "output" not in spec:
+        raise AggregateError(
+            "BSON field '$setWindowFields.output' is missing but a required field",
+            code=40414,
+            code_name="IDLFailedToParse",
+        )
     if not isinstance(output, Mapping) or not output:
         raise AggregateError("$setWindowFields requires a non-empty output doc")
 
@@ -3867,6 +3892,18 @@ def _stage_set_window_fields(
         window = field_spec.get("window")
         if window is not None and not isinstance(window, Mapping):
             raise AggregateError(f"$setWindowFields output[{field!r}].window must be a doc")
+        # Same silent-acceptance problem one level down: an unknown key inside
+        # `window` was ignored, so a misspelled `documents` widened the window
+        # to the whole partition without saying so.
+        if isinstance(window, Mapping):
+            bad = next((k for k in window if k not in ("documents", "range", "unit")), None)
+            if bad is not None:
+                raise AggregateError(
+                    "'window' field can only contain 'documents' as the only argument "
+                    "or 'range' with an optional 'unit' field",
+                    code=9,
+                    code_name="FailedToParse",
+                )
         if op in _RANK_FUNCS:
             # Rank functions take no arg and don't accept a window. Mongod
             # surfaces both violations as parse errors; mirror.

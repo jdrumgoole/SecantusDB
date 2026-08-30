@@ -767,3 +767,76 @@ def test_preserves_original_input_order(client) -> None:
     # In ts-asc order: ts=10 (_id=2, running=1), ts=20 (_id=3, running=2),
     # ts=30 (_id=1, running=3). So _id=1 → 3, _id=2 → 1, _id=3 → 2.
     assert [d["running"] for d in docs] == [3, 1, 2]
+
+
+# --- Argument validation ----------------------------------------------------
+#
+# These were ACCEPTED AND IGNORED, which is the worst shape for an option: the
+# caller believes they asked for something and gets a wrong answer instead of an
+# error. A misspelled `partitionBy` computed over the whole collection as one
+# partition; `range` written at the top level -- where it looks plausible, but
+# belongs inside a window -- silently widened every window to the partition.
+#
+# Codes and messages probed against mongod 8.2.11 (2026-08-30).
+
+
+@pytest.mark.parametrize(
+    ("stage", "code", "fragment"),
+    [
+        (
+            {"sortBy": {"n": 1}, "output": {"o": {"$sum": "$n"}}, "bogus": 1},
+            40415,
+            "BSON field '$setWindowFields.bogus' is an unknown field.",
+        ),
+        (
+            {"sortBy": {"n": 1}, "output": {"o": {"$sum": "$n"}}, "range": [1]},
+            40415,
+            "BSON field '$setWindowFields.range' is an unknown field.",
+        ),
+        (
+            {"sortBy": {"n": 1}},
+            40414,
+            "BSON field '$setWindowFields.output' is missing but a required field",
+        ),
+        (
+            {"sortBy": {"n": 1}, "output": {"o": {"$sum": "$n", "window": {"bogus": [1, 2]}}}},
+            9,
+            "'window' field can only contain 'documents'",
+        ),
+    ],
+    ids=["unknown-top-field", "range-at-top-level", "missing-output", "unknown-window-field"],
+)
+def test_rejects_what_it_used_to_ignore(
+    client: MongoClient, stage: dict, code: int, fragment: str
+) -> None:
+    db = client["swf_validation"]
+    db.c.drop()
+    db.c.insert_many([{"_id": 1, "n": 1}, {"_id": 2, "n": 5}])
+    with pytest.raises(OperationFailure) as ei:
+        list(db.c.aggregate([{"$setWindowFields": stage}]))
+    details = ei.value.details or {}
+    assert details.get("code") == code
+    assert fragment in details.get("errmsg", "")
+
+
+def test_valid_window_spec_still_runs(client: MongoClient) -> None:
+    """The validation must not reject the real thing."""
+    db = client["swf_validation_ok"]
+    db.c.drop()
+    db.c.insert_many([{"_id": 1, "n": 1}, {"_id": 2, "n": 5}])
+    out = list(
+        db.c.aggregate(
+            [
+                {
+                    "$setWindowFields": {
+                        "partitionBy": None,
+                        "sortBy": {"n": 1},
+                        "output": {
+                            "o": {"$sum": "$n", "window": {"documents": ["unbounded", "current"]}}
+                        },
+                    }
+                }
+            ]
+        )
+    )
+    assert [d["o"] for d in out] == [1, 6]
