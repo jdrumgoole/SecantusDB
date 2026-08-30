@@ -310,7 +310,19 @@ const EVENT_FIELD_ORDER: &[&str] = &[
 /// rather than by constructing each event type in order.
 fn order_event_fields(event: Document) -> Document {
     let mut out = Document::new();
+    // `rename` is the one event where mongod does NOT lead with `_id`: `to`
+    // comes first, before the resume token. Measured on 6.0.16 and 8.2.11, with
+    // and without showExpandedEvents. Mirrors `src/secantus/changestreams.py`.
+    let to_leads = event.get_str("operationType") == Ok("rename") && event.contains_key("to");
+    if to_leads {
+        if let Some(v) = event.get("to") {
+            out.insert("to", v.clone());
+        }
+    }
     for key in EVENT_FIELD_ORDER {
+        if to_leads && *key == "to" {
+            continue;
+        }
         if let Some(v) = event.get(*key) {
             out.insert(*key, v.clone());
         }

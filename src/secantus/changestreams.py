@@ -199,7 +199,15 @@ def _order_event_fields(event: dict[str, Any]) -> dict[str, Any]:
     drifted apart precisely because nothing checked them."""
     known = [k for k in _EVENT_FIELD_ORDER if k in event]
     rest = [k for k in event if k not in _EVENT_FIELD_ORDER]
-    return {k: event[k] for k in known + rest}
+    order = known + rest
+    # `rename` is the one event where mongod does NOT lead with `_id`: `to`
+    # comes first, before the resume token. Measured on 6.0.16 and 8.2.11, with
+    # and without showExpandedEvents -- it was first written off as a probable
+    # 6.0 assembly artifact, and re-measuring on the target version showed it is
+    # simply what a rename event looks like.
+    if event.get("operationType") == "rename" and "to" in event:
+        order = ["to"] + [k for k in order if k != "to"]
+    return {k: event[k] for k in order}
 
 
 def _do_lookup(storage: Storage, db: str, coll: str, doc_id: Any) -> dict[str, Any] | None:

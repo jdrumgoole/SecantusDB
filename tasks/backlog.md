@@ -1314,7 +1314,7 @@ These are explicit non-goals. Don't add them without a reason.
   | server | `fullDocument` position |
   |---|---|
   | 6.0.16 | index 4, after `wallTime` |
-  | **8.2.1** (the probed target) | **index 4, after `wallTime` — same as 6.0** |
+  | **8.2.1 and 8.2.11** (the probed target) | **index 4, after `wallTime` — same as 6.0** |
   | 8.3.4 | **last**, after `updateDescription` |
 
   So there is nothing to change: `changestreams._EVENT_FIELD_ORDER` (mirrored in
@@ -1322,7 +1322,10 @@ These are explicit non-goals. Don't add them without a reason.
   `tests/test_change_stream_spec_fidelity.py`) already matches
   `PROBED_MONGOD_VERSION`. Filed as a WATCH because whoever next moves the
   probed version forward to 8.3+ must move that field and those pinned key
-  sequences together.
+  sequences together. Re-confirmed on 8.2.11 (2026-08-30): still index 4, so
+  there is still nothing to do — a tripwire for a future version bump, not
+  outstanding work. (Two branches had landed this entry twice; the copy is
+  removed.)
 
   Two things this cost, worth keeping. First, a **patch-level** difference:
   6.0.16 and 8.2.1 agree while 8.3.4 differs, so "the 8.x series" is not a
@@ -1350,32 +1353,6 @@ These are explicit non-goals. Don't add them without a reason.
   The one thing still differing is the `rename` field-order WATCH below, kept
   deliberately.
 
-- [ ] **WATCH (not a defect today): `fullDocument`'s position in a change event
-  moved in mongod 8.3, and we match the 8.2.1 target (2026-08-30).** Measured
-  on all three servers:
-
-  | server | `fullDocument` position |
-  |---|---|
-  | 6.0.16 | index 4, after `wallTime` |
-  | **8.2.1** (the probed target) | **index 4, after `wallTime` — same as 6.0** |
-  | 8.3.4 | **last**, after `updateDescription` |
-
-  So there is nothing to change: `changestreams._EVENT_FIELD_ORDER` (mirrored in
-  `crates/secantus-storage/src/changestreams.rs`, pinned by
-  `tests/test_change_stream_spec_fidelity.py`) already matches
-  `PROBED_MONGOD_VERSION`. Filed as a WATCH because whoever next moves the
-  probed version forward to 8.3+ must move that field and those pinned key
-  sequences together.
-
-  Two things this cost, worth keeping. First, a **patch-level** difference:
-  6.0.16 and 8.2.1 agree while 8.3.4 differs, so "the 8.x series" is not a
-  single behaviour and probing 8.3 to learn about 8.2 gives the wrong answer —
-  which is exactly what happened here before 8.2.1 was measured. Second, this
-  one field has now been in three positions: the original code appended it last
-  (8.3's form, by accident), a later change "fixed" it to sit immediately after
-  `operationType` (matching no released server), and a probe moved it to the
-  form 6.0.16 and 8.2.1 share. Only the last was measured.
-
 - [ ] **Expanded change events omit `collectionUUID`, and `collMod` omits
   `stateBeforeChange` (2026-08-29).** With `showExpandedEvents: true`, mongod
   puts `collectionUUID` on `create` / `createIndexes` / `dropIndexes` /
@@ -1385,15 +1362,18 @@ These are explicit non-goals. Don't add them without a reason.
   divergences plus the four matching field-order ones, identical on both
   servers. Measured with `tools/probes/change_streams.py`.
 
-- [ ] **mongod 6.0.16 emits `to` as the FIRST field of a `rename` change event,
-  before `_id` — not replicated, deliberately (2026-08-29).** Measured
-  repeatedly and directly: `['to', '_id', 'operationType', 'clusterTime',
-  'wallTime', 'ns']`. Every other event type puts `_id` first, so this looks
-  like an assembly artifact rather than a contract, and it may well differ on
-  the 7.0 we advertise. Recorded rather than copied; re-measure on a newer
-  mongod before deciding. Ours is `['_id', 'operationType', 'clusterTime',
-  'wallTime', 'ns', 'to']`.
+- [x] **RESOLVED (2026-08-30): `rename` leads with `to`, and we now match it.**
+  Recorded first as "not replicated, deliberately" on the reasoning that leading
+  with `to` instead of `_id` looked like a mongod assembly artifact and might be
+  version-specific. Re-measured on **8.2.11**, the version we target: it is
+  identical there, with and without `showExpandedEvents`. Stable across 6.0.16
+  and 8.2.11 is not an artifact -- it is the contract, and the 8.x policy makes
+  the target's behaviour right by definition. Replicated on both servers and
+  pinned by a test.
 
+  The lesson is the reason to re-read "deliberately not fixed" entries when the
+  reference server moves: the DECISION was sound on the evidence available
+  (6.0.16 only), and wrong once the evidence widened.
 - [x] **`$lookup` / `$graphLookup` sweep — 20 of 27 shapes diverged, headline
   was a TRUNCATED traversal (2026-08-29).** `$graphLookup` stopped following
   the chain at the first null `connectFromField`, so a four-document chain

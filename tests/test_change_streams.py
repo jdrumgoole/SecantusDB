@@ -1068,3 +1068,27 @@ def test_collmod_reports_the_options_it_replaced(client: MongoClient) -> None:
     assert "uuid" in before
     # The change itself is still reported separately.
     assert event["operationDescription"] == {"changeStreamPreAndPostImages": {"enabled": True}}
+
+
+def test_rename_event_leads_with_to_not_id(client: MongoClient) -> None:
+    """`rename` is the ONE event where mongod does not lead with `_id`.
+
+    `to` comes first, before the resume token. This was first written off as a
+    probable mongod-6.0 assembly artifact and left unreplicated; re-measuring on
+    8.2.11 -- the version we target -- showed it is stable across both, with and
+    without showExpandedEvents, so it is simply what a rename event looks like.
+    """
+    db = client["renameorder"]
+    db.c.insert_one({"_id": 1})
+    with db.watch() as cs:
+        assert cs.try_next() is None
+        db.c.rename("c2")
+        event = None
+        deadline = time.time() + 10
+        while event is None and time.time() < deadline:
+            nxt = cs.try_next()
+            if nxt is not None and nxt.get("operationType") == "rename":
+                event = nxt
+    assert event is not None
+    assert list(event)[0] == "to", f"rename must lead with `to`, got {list(event)}"
+    assert list(event)[1] == "_id"
