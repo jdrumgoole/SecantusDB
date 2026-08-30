@@ -303,6 +303,7 @@ const EVENT_FIELD_ORDER: &[&str] = &[
     "updateDescription",
     "stateBeforeChange",
     "fullDocumentBeforeChange",
+    "nsType",
 ];
 
 /// Rebuild an event in mongod's field order. Applied once at projection's exit
@@ -566,12 +567,24 @@ fn project_command(
                 op_desc.insert(k.clone(), v.clone());
             }
         }
+        // mongod 8.1+ tags a `create` event with WHAT was created. Probed on
+        // 8.2.11: "collection", "timeseries" or "view", as a TOP-LEVEL field
+        // (not inside `ns`), emitted last. The unified `change-streams-nsType`
+        // spec asserts all three. Mirrors `src/secantus/changestreams.py`.
+        let ns_type = if cmd.contains_key("viewOn") {
+            "view"
+        } else if cmd.contains_key("timeseries") {
+            "timeseries"
+        } else {
+            "collection"
+        };
         let event = base(
             "create",
             &affected_ns,
             &[
                 ("ns", Bson::Document(ns_doc(&affected_ns))),
                 ("operationDescription", Bson::Document(op_desc)),
+                ("nsType", Bson::String(ns_type.to_string())),
             ],
         )?;
         return Ok((Some(event), false));

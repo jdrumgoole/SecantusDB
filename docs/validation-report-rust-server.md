@@ -1,6 +1,6 @@
 # pymongo Validation Report (Rust server)
 
-Generated 2026-08-24 — SecantusDB 0.6.0b15 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-08-30 — SecantusDB 0.6.0b16 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 conformance gate from `tasks/rust-server-plan.md`: the same unmodified pymongo suite the headline gauge runs, pointed at the **Rust server** instead of the pure-Python one. The gap between this pass rate and `docs/validation-report.md` is the Rust server's remaining to-do list.
 
@@ -10,15 +10,15 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 |---|---:|---:|---:|---:|---:|---:|
 | `test_binary.py` | 29 | 0 | 0 | 0 | 29 | 100.0% |
 | `test_bulk.py` | 34 | 0 | 0 | 4 | 38 | 100.0% |
-| `test_change_stream.py` | 106 | 0 | 0 | 49 | 155 | 100.0% |
+| `test_change_stream.py` | 109 | 0 | 0 | 46 | 155 | 100.0% |
 | `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
 | `test_collection.py` | 85 | 2 | 0 | 4 | 91 | 97.7% |
 | `test_collection_management.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
 | `test_command_logging.py` | 22 | 0 | 0 | 14 | 36 | 100.0% |
-| `test_command_monitoring.py` | 31 | 0 | 0 | 7 | 38 | 100.0% |
+| `test_command_monitoring.py` | 32 | 0 | 0 | 6 | 38 | 100.0% |
 | `test_comment.py` | 3 | 0 | 0 | 0 | 3 | 100.0% |
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_crud_unified.py` | 301 | 0 | 0 | 185 | 486 | 100.0% |
+| `test_crud_unified.py` | 344 | 0 | 0 | 142 | 486 | 100.0% |
 | `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
 | `test_cursor.py` | 64 | 3 | 0 | 5 | 72 | 95.5% |
 | `test_custom_types.py` | 51 | 0 | 0 | 0 | 51 | 100.0% |
@@ -32,13 +32,13 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_read_preferences.py` | 9 | 0 | 0 | 20 | 29 | 100.0% |
 | `test_results.py` | 5 | 0 | 0 | 0 | 5 | 100.0% |
 | `test_run_command.py` | 16 | 0 | 0 | 5 | 21 | 100.0% |
-| `test_transactions_unified.py` | 92 | 0 | 0 | 172 | 264 | 100.0% |
+| `test_transactions_unified.py` | 95 | 0 | 0 | 169 | 264 | 100.0% |
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
+| `test_versioned_api_integration.py` | 38 | 1 | 0 | 4 | 43 | 97.4% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **1020** | **5** | **0** | **475** | **1500** | **99.5%** |
+| **Overall** | **1070** | **6** | **0** | **424** | **1500** | **99.4%** |
 
-## Failures (5)
+## Failures (6)
 
 First 30 failure node-ids for manual triage:
 
@@ -48,6 +48,7 @@ vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_text
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_maxtime_ms_message
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_to_list_csot_applied
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_where
+vendor/pymongo-tests/test/test_versioned_api_integration.py::TestVersionedApiCrudApiVersion_1::test_client_bulkWrite_appends_declared_API_version
 ```
 
 ## How this is generated

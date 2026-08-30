@@ -659,14 +659,31 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // number. Adjacent slots, different rules -- probed, not inferred.
         argtypes::require_bool_field(spec, "multi", "update.updates.multi")?;
 
-        // MongoDB 8.0 added a per-spec `sort`; pre-8.0 (we advertise 7.0) it's a
-        // command-level FailedToParse. Drivers' `*-sort` tests with
-        // `maxServerVersion: "7.99"` assert this.
-        if spec.contains_key("sort") {
+        // MongoDB 8.0's per-spec `sort`: match in sort order and update the
+        // FIRST one. Probed on 8.2.11 -- `multi: true` is rejected, and an
+        // upsert whose filter matches nothing still upserts. This used to
+        // reject `sort` outright because we advertised 7.0; the driver `*-sort`
+        // tests assert BOTH directions (`maxServerVersion: "7.99"` for the
+        // rejection, `minServerVersion: "8.0"` for the support), so it moved
+        // with the advertised version. Mirrors `_update` in
+        // `src/secantus/commands.py`.
+        let sort_spec = match spec.get("sort") {
+            Some(Bson::Document(d)) => Some(d.clone()),
+            None => None,
+            Some(_) => {
+                return Ok(CommandError::new(
+                    2,
+                    "BadValue",
+                    "BSON field 'update.updates.sort' is the wrong type",
+                )
+                .into_reply());
+            }
+        };
+        if sort_spec.is_some() && bool_field(spec, "multi", false) {
             return Ok(CommandError::new(
                 9,
                 "FailedToParse",
-                "The 'sort' option is not supported on update commands before MongoDB 8.0",
+                "Cannot specify sort with multi=true",
             )
             .into_reply());
         }
@@ -674,7 +691,33 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // `collation` is per-update-statement (inside each `updates[]` entry),
         // not a command-level field — collation-aware filter matching (COLLSCAN).
         let collation = collation_of(spec);
-        let q = doc_field(spec, "q");
+        let mut q = doc_field(spec, "q");
+        if let Some(sort) = &sort_spec {
+            // Resolve WHICH document sorts first, then pin the update to it.
+            // Nothing matched -> leave the filter alone, so an upsert still
+            // upserts.
+            let sorted = ctx.storage().and_then(|st| {
+                st.find_collated(
+                    &ctx.db_name,
+                    &coll,
+                    &q,
+                    Some(sort),
+                    None,
+                    collation.as_ref(),
+                    &Document::new(),
+                )
+                .map_err(|_| CommandError::new(2, "BadValue", "sort resolution failed"))
+            });
+            if let Ok(rows) = sorted {
+                if let Some(first) = rows.first() {
+                    if let Ok(d) = Document::from_reader(&mut first.as_slice()) {
+                        if let Some(id) = d.get("_id") {
+                            q = doc! { "_id": id.clone() };
+                        }
+                    }
+                }
+            }
+        }
         let multi = bool_field(spec, "multi", false);
         let upsert = bool_field(spec, "upsert", false);
 
