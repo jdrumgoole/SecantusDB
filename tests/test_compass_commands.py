@@ -19,8 +19,8 @@ from secantus import SecantusDBServer
 
 
 @pytest.fixture
-def server(tmp_path):
-    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as srv:
+def server(wt_home):
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         yield srv
 
 
@@ -88,16 +88,14 @@ def test_repl_set_get_status_agrees_with_hello(client: MongoClient) -> None:
     assert member["name"] == hello["me"]
 
 
-def test_repl_set_get_status_standalone_error(tmp_path) -> None:
+def test_repl_set_get_status_standalone_error(wt_home) -> None:
     """With no set name this really is a standalone, and the honest answer stands.
 
     ``NoReplicationEnabled`` (76) with mongod's canonical wording — not
     CommandNotFound. Harnesses special-case that exact message to mean
     "standalone, skip the replica-set-only paths"; a bare code-59 aborts them.
     """
-    with SecantusDBServer(
-        port=0, storage_path=str(tmp_path / "standalone"), replica_set_name=None
-    ) as srv:
+    with SecantusDBServer(port=0, storage_path=wt_home, replica_set_name=None) as srv:
         mc = MongoClient(srv.uri, serverSelectionTimeoutMS=2000, directConnection=True)
         try:
             assert "setName" not in mc.admin.command("hello")

@@ -33,8 +33,8 @@ PREFIX = "Plan executor error during update :: caused by :: "
 
 
 @pytest.fixture
-def db(tmp_path):
-    srv = SecantusDBServer(port=0, storage_path=str(tmp_path / "data"))
+def db(wt_home):
+    srv = SecantusDBServer(port=0, storage_path=wt_home)
     srv.start()
     cli = pymongo.MongoClient(f"mongodb://{srv.address[0]}:{srv.address[1]}", directConnection=True)
     try:

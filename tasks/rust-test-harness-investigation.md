@@ -294,5 +294,57 @@ close-and-reopen.
 - `wt_home` returns a `tmp_path/wt` **subdirectory**, so tests can still use
   `tmp_path` for archives / exports without colliding with WiredTiger's files.
 - Only the 22 files matching the exact `storage_path=str(tmp_path)` shape were
-  converted. ~48 more files build a server by other shapes and are still on the
-  fresh-home path — the remaining L1 headroom.
+  converted in the first pass. **A second pass (2026-08-30) took the remaining
+  headroom — see §12.**
+
+
+---
+
+## 12. L1 second pass — the remaining files (2026-08-30)
+
+The first pass converted only the exact `storage_path=str(tmp_path)` shape. The
+dominant remaining form was `storage_path=str(tmp_path / "<sub>")`, which is the
+same thing with a subdirectory. **54 more files / 83 call sites converted.**
+
+### Measured, same files, same 950 tests, serial, quiet machine
+
+| | wall |
+|---|---:|
+| before | **349.5 s** |
+| after | **252.6 s** |
+| **saving** | **96.8 s — 1.38x, ~102 ms/test** |
+
+Slightly better per test than the first pass's ~82 ms, because these files skew
+towards one server per test rather than a shared module fixture.
+
+Deliberately **not** converted: the 11 files whose servers do not all come from
+`tmp_path` — backup / restore / PITR / mongodump / perf-regression. Those stand
+up several stores with distinct roles (source, target, restored, archive output)
+and a restore target in particular must often start *empty*, so a pre-populated
+clone would change what the test proves.
+
+### Two traps the mechanical conversion hit, both caught by tests
+
+1. **Same literal path across several servers means one shared store.** The
+   first rule was "more than one `storage_path` in a function → give each its
+   own home", which broke the bootstrap-then-restart pattern: `test_x509_auth`
+   starts a server, creates a user, stops it, then brings the real server up
+   **on the same path**. Handing those two calls separate homes silently loses
+   the user. The rule is now keyed on the number of *distinct* literals, not the
+   count — and with that fix, no function needs more than one home, so no
+   factory fixture was added.
+2. **Only convert what pytest injects into.** `test_getmore_batching` has a
+   plain `@contextlib.contextmanager` helper taking `tmp_path`; its callers pass
+   it positionally, so renaming the parameter to `wt_home` handed it a `Path`
+   where a `str` was expected and surfaced as
+   `TypeError: in method 'wiredtiger_open'`. The converter now skips anything
+   that is not a `test_*` function or a `@pytest.fixture`.
+
+### Disk
+
+Worth recording alongside the wall-clock: one full-suite run was measured
+leaving **47 GB** in `$TMPDIR/pytest-of-<user>`. Every converted test now takes a
+copy-on-write clone where the filesystem supports it instead of building a fresh
+~10 MB store, so the converted share of that footprint drops too. That matters
+beyond disk: a `pytest-of` backlog makes every *later* run pay an unbounded
+`rmtree` at exit (`tasks/backlog.md` §3.6).

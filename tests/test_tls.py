@@ -75,14 +75,14 @@ def foreign_client_cert(tmp_path: Path) -> Path:
     return combined
 
 
-def test_tls_round_trip_insert_find(tmp_path, tls_files) -> None:
+def test_tls_round_trip_insert_find(wt_home, tls_files) -> None:
     """End-to-end: pymongo connects with TLS, inserts a doc, reads it
     back. The default suite never hits this path because no fixture
     has been passing tls_* kwargs before now."""
     cert_path, key_path, ca_path = tls_files
     srv = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "data"),
+        storage_path=wt_home,
         tls_cert_file=str(cert_path),
         tls_key_file=str(key_path),
     )
@@ -102,7 +102,7 @@ def test_tls_round_trip_insert_find(tmp_path, tls_files) -> None:
         srv.stop()
 
 
-def test_tls_server_rejects_plaintext_client(tmp_path, tls_files) -> None:
+def test_tls_server_rejects_plaintext_client(wt_home, tls_files) -> None:
     """A client that opens a raw TCP socket and sends MongoDB wire
     bytes (no TLS handshake) gets dropped — the handshake fails on
     the server side and the connection is closed. The server keeps
@@ -110,7 +110,7 @@ def test_tls_server_rejects_plaintext_client(tmp_path, tls_files) -> None:
     cert_path, key_path, ca_path = tls_files
     srv = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "data"),
+        storage_path=wt_home,
         tls_cert_file=str(cert_path),
         tls_key_file=str(key_path),
     )
@@ -138,10 +138,10 @@ def test_tls_server_rejects_plaintext_client(tmp_path, tls_files) -> None:
         srv.stop()
 
 
-def test_no_tls_args_keeps_plaintext_behavior(tmp_path) -> None:
+def test_no_tls_args_keeps_plaintext_behavior(wt_home) -> None:
     """The pre-TLS no-regression guarantee: a server constructed with
     no tls_* kwargs serves plaintext exactly as before."""
-    srv = SecantusDBServer(port=0, storage_path=str(tmp_path / "data"))
+    srv = SecantusDBServer(port=0, storage_path=wt_home)
     assert srv._ssl_context is None  # noqa: SLF001
     srv.start()
     try:
@@ -155,7 +155,7 @@ def test_no_tls_args_keeps_plaintext_behavior(tmp_path) -> None:
         srv.stop()
 
 
-def test_partial_tls_args_raises(tmp_path, tls_files) -> None:
+def test_partial_tls_args_raises(wt_home, tls_files) -> None:
     """Either both cert+key or neither — half-configured TLS is
     almost certainly a deployment mistake and should fail at startup,
     not silently fall back to plaintext."""
@@ -163,32 +163,32 @@ def test_partial_tls_args_raises(tmp_path, tls_files) -> None:
     with pytest.raises(ValueError, match="both be set or both be None"):
         SecantusDBServer(
             port=0,
-            storage_path=str(tmp_path / "data"),
+            storage_path=wt_home,
             tls_cert_file=str(cert_path),
             # no tls_key_file
         )
 
 
-def test_missing_cert_file_fails_at_startup(tmp_path) -> None:
+def test_missing_cert_file_fails_at_startup(tmp_path, wt_home) -> None:
     """A path that doesn't exist surfaces a clean exception during
     __init__ (not a runtime accept-loop crash)."""
     with pytest.raises((FileNotFoundError, ssl.SSLError, OSError)):
         SecantusDBServer(
             port=0,
-            storage_path=str(tmp_path / "data"),
+            storage_path=wt_home,
             tls_cert_file=str(tmp_path / "missing.crt"),
             tls_key_file=str(tmp_path / "missing.key"),
         )
 
 
-def test_tls_handshake_failure_doesnt_consume_connection_slot(tmp_path, tls_files) -> None:
+def test_tls_handshake_failure_doesnt_consume_connection_slot(wt_home, tls_files) -> None:
     """If a bad TLS handshake leaked the active-connections counter,
     enough failed handshakes would lock everyone out. Verify the
     counter is correctly decremented on handshake error."""
     cert_path, key_path, ca_path = tls_files
     srv = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "data"),
+        storage_path=wt_home,
         tls_cert_file=str(cert_path),
         tls_key_file=str(key_path),
     )
@@ -230,14 +230,14 @@ def test_tls_handshake_failure_doesnt_consume_connection_slot(tmp_path, tls_file
 
 
 def test_mtls_required_accepts_client_with_valid_cert(
-    tmp_path, tls_files, client_cert_combined
+    tmp_path, wt_home, tls_files, client_cert_combined
 ) -> None:
     """Server with require_client_cert=True + CA configured accepts a
     client presenting a cert signed by that CA, end-to-end."""
     cert_path, key_path, ca_path = tls_files
     srv = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "data"),
+        storage_path=wt_home,
         tls_cert_file=str(cert_path),
         tls_key_file=str(key_path),
         tls_ca_file=str(ca_path),
@@ -259,7 +259,7 @@ def test_mtls_required_accepts_client_with_valid_cert(
         srv.stop()
 
 
-def test_mtls_required_rejects_client_without_cert(tmp_path, tls_files) -> None:
+def test_mtls_required_rejects_client_without_cert(wt_home, tls_files) -> None:
     """Same server, no client cert — TLS handshake fails, client gets
     an error, daemon keeps serving."""
     from pymongo.errors import ServerSelectionTimeoutError
@@ -267,7 +267,7 @@ def test_mtls_required_rejects_client_without_cert(tmp_path, tls_files) -> None:
     cert_path, key_path, ca_path = tls_files
     srv = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "data"),
+        storage_path=wt_home,
         tls_cert_file=str(cert_path),
         tls_key_file=str(key_path),
         tls_ca_file=str(ca_path),
@@ -285,7 +285,7 @@ def test_mtls_required_rejects_client_without_cert(tmp_path, tls_files) -> None:
         srv.stop()
 
 
-def test_mtls_required_rejects_foreign_ca_client(tmp_path, tls_files, foreign_client_cert) -> None:
+def test_mtls_required_rejects_foreign_ca_client(wt_home, tls_files, foreign_client_cert) -> None:
     """A client cert signed by a *different* CA must not authenticate
     — that's the entire point of pinning the CA bundle."""
     from pymongo.errors import ServerSelectionTimeoutError
@@ -293,7 +293,7 @@ def test_mtls_required_rejects_foreign_ca_client(tmp_path, tls_files, foreign_cl
     cert_path, key_path, ca_path = tls_files
     srv = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "data"),
+        storage_path=wt_home,
         tls_cert_file=str(cert_path),
         tls_key_file=str(key_path),
         tls_ca_file=str(ca_path),
@@ -314,7 +314,7 @@ def test_mtls_required_rejects_foreign_ca_client(tmp_path, tls_files, foreign_cl
 
 
 def test_mtls_optional_accepts_with_or_without_cert(
-    tmp_path, tls_files, client_cert_combined
+    tmp_path, wt_home, tls_files, client_cert_combined
 ) -> None:
     """``require_client_cert=False`` is the staged-rollout mode: a
     cert is verified if presented, but clients without a cert still
@@ -322,7 +322,7 @@ def test_mtls_optional_accepts_with_or_without_cert(
     cert_path, key_path, ca_path = tls_files
     srv = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "data"),
+        storage_path=wt_home,
         tls_cert_file=str(cert_path),
         tls_key_file=str(key_path),
         tls_ca_file=str(ca_path),
@@ -351,7 +351,7 @@ def test_mtls_optional_accepts_with_or_without_cert(
         srv.stop()
 
 
-def test_mtls_without_server_tls_raises(tmp_path) -> None:
+def test_mtls_without_server_tls_raises(tmp_path, wt_home) -> None:
     """``tls_ca_file`` / ``tls_require_client_cert`` only make sense
     when server-side TLS (cert + key) is also configured. Without it,
     raise loudly at startup — the daemon would otherwise stay
@@ -359,18 +359,18 @@ def test_mtls_without_server_tls_raises(tmp_path) -> None:
     with pytest.raises(ValueError, match="require tls_cert_file"):
         SecantusDBServer(
             port=0,
-            storage_path=str(tmp_path / "data"),
+            storage_path=wt_home,
             tls_ca_file=str(tmp_path / "ca.crt"),  # no cert/key
         )
     with pytest.raises(ValueError, match="require tls_cert_file"):
         SecantusDBServer(
             port=0,
-            storage_path=str(tmp_path / "data"),
+            storage_path=wt_home,
             tls_require_client_cert=True,  # no cert/key
         )
 
 
-def test_mtls_require_without_ca_raises(tmp_path, tls_files) -> None:
+def test_mtls_require_without_ca_raises(wt_home, tls_files) -> None:
     """``require_client_cert=True`` without a CA is a deployment
     mistake — the server would have nothing to verify the cert
     against. Raise at startup rather than letting the SSL handshake
@@ -379,7 +379,7 @@ def test_mtls_require_without_ca_raises(tmp_path, tls_files) -> None:
     with pytest.raises(ValueError, match="requires tls_ca_file"):
         SecantusDBServer(
             port=0,
-            storage_path=str(tmp_path / "data"),
+            storage_path=wt_home,
             tls_cert_file=str(cert_path),
             tls_key_file=str(key_path),
             tls_require_client_cert=True,

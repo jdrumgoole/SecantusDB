@@ -29,8 +29,8 @@ DOCS = [{"_id": 1, "a": None}, {"_id": 2}, {"_id": 3, "a": 5}]
 
 
 @pytest.fixture
-def db(tmp_path):
-    srv = SecantusDBServer(port=0, storage_path=str(tmp_path / "data"))
+def db(wt_home):
+    srv = SecantusDBServer(port=0, storage_path=wt_home)
     srv.start()
     cli = pymongo.MongoClient(f"mongodb://{srv.address[0]}:{srv.address[1]}", directConnection=True)
     try:

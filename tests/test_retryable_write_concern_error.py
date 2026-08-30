@@ -28,8 +28,8 @@ from secantus import SecantusDBServer
 
 
 @pytest.fixture
-def client(tmp_path):
-    srv = SecantusDBServer(port=0, storage_path=str(tmp_path / "data"), replica_set_name="secantus")
+def client(wt_home):
+    srv = SecantusDBServer(port=0, storage_path=wt_home, replica_set_name="secantus")
     srv.start()
     cli = pymongo.MongoClient(f"mongodb://{srv.address[0]}:{srv.address[1]}", directConnection=True)
     try:

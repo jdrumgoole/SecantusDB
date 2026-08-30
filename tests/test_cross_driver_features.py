@@ -391,14 +391,14 @@ def _run_java_smoke(
 
 
 @pytest.fixture
-def server(tmp_path):
+def server(wt_home):
     """Plain (no-auth) server — used by DDL smoke."""
-    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as srv:
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         yield srv
 
 
 @pytest.fixture
-def server_with_noop(tmp_path):
+def server_with_noop(wt_home):
     """Server with periodic noop oplog heartbeats enabled, mirroring mongod.
 
     Real mongod advances a change stream's ``postBatchResumeToken`` on a quiet
@@ -410,9 +410,7 @@ def server_with_noop(tmp_path):
     advances across empty getMores on an otherwise-quiet collection — need that
     background activity. A fast 0.2s interval so the ~600 ms smoke window sees
     several heartbeats."""
-    with SecantusDBServer(
-        port=0, storage_path=str(tmp_path / "wt"), noop_heartbeat_seconds=0.2
-    ) as srv:
+    with SecantusDBServer(port=0, storage_path=wt_home, noop_heartbeat_seconds=0.2) as srv:
         yield srv
 
 
@@ -421,9 +419,9 @@ _ADMIN_PWD = "rootpw"
 
 
 @pytest.fixture
-def server_with_auth(tmp_path):
+def server_with_auth(wt_home):
     """Auth-enabled server with a bootstrap root/`rootpw` admin user."""
-    srv = SecantusDBServer(port=0, storage_path=str(tmp_path / "wt"), require_auth=True)
+    srv = SecantusDBServer(port=0, storage_path=wt_home, require_auth=True)
     srv.start()
     creds = derive_credentials(_ADMIN_PWD)
     record = {

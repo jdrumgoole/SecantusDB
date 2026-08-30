@@ -57,7 +57,7 @@ def kind(request):
 
 
 @pytest.fixture
-def server(kind, tmp_path):
+def server(kind, tmp_path, wt_home):
     if kind == "rust":
         import _secantus_server
 
@@ -71,7 +71,7 @@ def server(kind, tmp_path):
         finally:
             srv.stop()
     else:
-        srv = SecantusDBServer(host="127.0.0.1", port=0, storage_path=str(tmp_path / "wt"))
+        srv = SecantusDBServer(host="127.0.0.1", port=0, storage_path=wt_home)
         srv.start()
         try:
             yield srv

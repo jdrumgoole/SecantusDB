@@ -37,12 +37,12 @@ def _has_ipv6_loopback() -> bool:
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "::1"])
-def test_server_serves_over_both_address_families(host: str, tmp_path) -> None:
+def test_server_serves_over_both_address_families(host: str, wt_home) -> None:
     """A client must complete a real round-trip over IPv4 and over IPv6."""
     if host == "::1" and not _has_ipv6_loopback():
         pytest.skip("no IPv6 loopback on this host")
 
-    with SecantusDBServer(host=host, port=0, storage_path=str(tmp_path / "wt")) as srv:
+    with SecantusDBServer(host=host, port=0, storage_path=wt_home) as srv:
         client = MongoClient(
             _uri(srv.host, srv.port), serverSelectionTimeoutMS=5000, directConnection=True
         )
@@ -56,8 +56,8 @@ def test_server_serves_over_both_address_families(host: str, tmp_path) -> None:
             client.close()
 
 
-def test_bound_host_is_reported_back(tmp_path) -> None:
+def test_bound_host_is_reported_back(wt_home) -> None:
     """`srv.host` reflects what was actually bound, so callers can build a URI."""
-    with SecantusDBServer(host="127.0.0.1", port=0, storage_path=str(tmp_path / "wt")) as srv:
+    with SecantusDBServer(host="127.0.0.1", port=0, storage_path=wt_home) as srv:
         assert srv.host == "127.0.0.1"
         assert srv.port > 0

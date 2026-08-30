@@ -19,8 +19,8 @@ GEOM = {"type": "Point", "coordinates": [1.01, 1.01]}
 
 
 @pytest.fixture
-def coll(tmp_path):
-    srv = SecantusDBServer(port=0, storage_path=str(tmp_path / "data"))
+def coll(wt_home):
+    srv = SecantusDBServer(port=0, storage_path=wt_home)
     srv.start()
     cli = pymongo.MongoClient(f"mongodb://{srv.address[0]}:{srv.address[1]}", directConnection=True)
     db = cli["neard"]
@@ -76,9 +76,9 @@ def test_bound_still_filters(coll) -> None:
 
 
 @pytest.fixture
-def legacy_coll(tmp_path):
+def legacy_coll(wt_home):
     """The legacy pair form needs a 2d index and `[x, y]` document geometry."""
-    srv = SecantusDBServer(port=0, storage_path=str(tmp_path / "legacy"))
+    srv = SecantusDBServer(port=0, storage_path=wt_home)
     srv.start()
     cli = pymongo.MongoClient(f"mongodb://{srv.address[0]}:{srv.address[1]}", directConnection=True)
     db = cli["nearlegacy"]

@@ -33,8 +33,8 @@ DESC = ["b[1,100]", "a[5,9]", "c[7]", "d-scalar-6"]
 
 
 @pytest.fixture
-def db(tmp_path):
-    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as srv:
+def db(wt_home):
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         client = MongoClient(srv.uri, serverSelectionTimeoutMS=5000)
         try:
             yield client.t

@@ -90,8 +90,8 @@ def test_storage_default_journal_is_false(tmp_path) -> None:
 
 
 @pytest.fixture
-def server_and_client(tmp_path):
-    srv = SecantusDBServer(port=0, storage_path=str(tmp_path / "data"))
+def server_and_client(wt_home):
+    srv = SecantusDBServer(port=0, storage_path=wt_home)
     srv.start()
     client = MongoClient(srv.uri, serverSelectionTimeoutMS=2000)
     try:

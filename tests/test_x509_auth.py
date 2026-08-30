@@ -137,7 +137,7 @@ def alice_cert(tmp_path: Path, ca: trustme.CA) -> tuple[Path, str]:
 
 
 @pytest.fixture
-def auth_server(tmp_path, tls_files, alice_cert):
+def auth_server(wt_home, tls_files, alice_cert):
     """SecantusDB with TLS + mTLS + --auth on. Provision alice user
     (X509 mechanism, username = alice's real cert DN) before flipping
     --auth; yield (server, ca_path, cert_path, alice_dn)."""
@@ -148,7 +148,7 @@ def auth_server(tmp_path, tls_files, alice_cert):
     # the user. mTLS verification still happens.
     bootstrap = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "data"),
+        storage_path=wt_home,
         tls_cert_file=str(cert_path),
         tls_key_file=str(key_path),
         tls_ca_file=str(ca_path),
@@ -176,7 +176,7 @@ def auth_server(tmp_path, tls_files, alice_cert):
     # Stage 2: bring the real server up with auth + require-client-cert.
     server = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "data"),
+        storage_path=wt_home,
         tls_cert_file=str(cert_path),
         tls_key_file=str(key_path),
         tls_ca_file=str(ca_path),
@@ -208,7 +208,7 @@ def test_x509_authenticates_with_matching_cert(auth_server, alice_cert) -> None:
         client.close()
 
 
-def test_x509_refused_when_no_matching_user(tmp_path, tls_files, ca) -> None:
+def test_x509_refused_when_no_matching_user(tmp_path, wt_home, tls_files, ca) -> None:
     """A cert signed by the configured CA but with no matching user
     record on the server gets refused."""
     cert_path, key_path, ca_path = tls_files
@@ -221,7 +221,7 @@ def test_x509_refused_when_no_matching_user(tmp_path, tls_files, ca) -> None:
 
     server = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "data"),
+        storage_path=wt_home,
         tls_cert_file=str(cert_path),
         tls_key_file=str(key_path),
         tls_ca_file=str(ca_path),
@@ -243,7 +243,7 @@ def test_x509_refused_when_no_matching_user(tmp_path, tls_files, ca) -> None:
         server.stop()
 
 
-def test_x509_refused_for_scram_only_user(tmp_path, tls_files, ca) -> None:
+def test_x509_refused_for_scram_only_user(tmp_path, wt_home, tls_files, ca) -> None:
     """A user record exists for the cert DN but doesn't have an X509
     entry in credentials — X509 attempt refused."""
     cert_path, key_path, ca_path = tls_files
@@ -261,7 +261,7 @@ def test_x509_refused_for_scram_only_user(tmp_path, tls_files, ca) -> None:
     # Create alice as SCRAM-only.
     bootstrap = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "data"),
+        storage_path=wt_home,
         tls_cert_file=str(cert_path),
         tls_key_file=str(key_path),
         tls_ca_file=str(ca_path),
@@ -289,7 +289,7 @@ def test_x509_refused_for_scram_only_user(tmp_path, tls_files, ca) -> None:
 
     server = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "data"),
+        storage_path=wt_home,
         tls_cert_file=str(cert_path),
         tls_key_file=str(key_path),
         tls_ca_file=str(ca_path),
@@ -311,14 +311,14 @@ def test_x509_refused_for_scram_only_user(tmp_path, tls_files, ca) -> None:
         server.stop()
 
 
-def test_scram_still_works_on_mtls_server(tmp_path, tls_files, ca) -> None:
+def test_scram_still_works_on_mtls_server(tmp_path, wt_home, tls_files, ca) -> None:
     """A SCRAM user authenticates normally even on an mTLS-required
     server — the cert proves "approved client", SCRAM proves "this
     specific user"."""
     cert_path, key_path, ca_path = tls_files
     bootstrap = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "data"),
+        storage_path=wt_home,
         tls_cert_file=str(cert_path),
         tls_key_file=str(key_path),
         tls_ca_file=str(ca_path),
@@ -354,7 +354,7 @@ def test_scram_still_works_on_mtls_server(tmp_path, tls_files, ca) -> None:
 
     server = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "data"),
+        storage_path=wt_home,
         tls_cert_file=str(cert_path),
         tls_key_file=str(key_path),
         tls_ca_file=str(ca_path),
@@ -378,12 +378,12 @@ def test_scram_still_works_on_mtls_server(tmp_path, tls_files, ca) -> None:
         server.stop()
 
 
-def test_x509_refused_without_tls(tmp_path) -> None:
+def test_x509_refused_without_tls(wt_home) -> None:
     """X509 auth on a plaintext daemon — no cert was ever presented,
     no DN to authenticate against. Surfaces as AuthenticationFailed."""
     bootstrap = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "data"),
+        storage_path=wt_home,
         require_auth=False,
     )
     bootstrap.start()
@@ -403,7 +403,7 @@ def test_x509_refused_without_tls(tmp_path) -> None:
 
     server = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "data"),
+        storage_path=wt_home,
         require_auth=True,
     )
     server.start()
