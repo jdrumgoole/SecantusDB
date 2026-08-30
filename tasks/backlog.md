@@ -282,6 +282,41 @@ mongod answers 5733201. `update::arith_type_error` (2026-08-25) is the worked
 template. The porting half is done; do not plan a campaign around it without
 re-measuring first.
 
+- [ ] **`$replaceRoot` with a scalar `newRoot` answers code 14 on the PYTHON
+      server; mongod answers 40228 — and the message is unwrapped.** Measured
+      2026-08-30 against mongod 8.2.11 (`:27019`) with the Python server on
+      `:27018`, pipeline `[{"$replaceRoot": {"newRoot": "$n"}}]` over
+      `{n: 1}`:
+
+          python  code=14
+                  $replaceRoot newRoot must evaluate to a document
+          mongod  code=40228
+                  Executor error during aggregate command on namespace: <ns>
+                  :: caused by :: 'newRoot' expression  must evaluate to an
+                  object, but resulting value was: 1. Type of resulting value:
+                  'int'. Input document: {n: 1}
+
+      (The double space after `expression` is mongod's own.) Separate from the
+      Rust entry above — this is the Python server. The fix is one raise site:
+      `aggregate.py`'s `AggregateError("$replaceRoot newRoot must evaluate to a
+      document")` needs `code=40228, exec_error=True` and mongod's wording; the
+      `exec_error` flag is what makes `commands.py` add the `Executor error
+      during aggregate command on namespace:` prefix.
+
+- [ ] **`$bucket` with no `default` and an out-of-range value has mongod's CODE
+      but not its wrapper prefix (Python server).** Measured in the same
+      2026-08-30 run: both servers answer 7158303 with the text `$switch could
+      not find a matching branch for an input, and no default was specified.`,
+      but mongod prefixes it with `Executor error during aggregate command on
+      namespace: <ns> :: caused by ::` and we do not. One raise site: the
+      `$switch` no-matching-branch raise needs `exec_error=True`. A codes-only
+      comparison reports this case as passing — see the "compare MESSAGES, not
+      just codes" note in `tasks/remaining-work-plan.md` §1b.
+
+      **`$densify` on a string field was measured in the same run and is
+      already fully correct on the Python server** (5733201, wrapped, text
+      matches) — it is the working example the two fixes above should copy.
+
 **Mongo-side correctness (6 as classified; 2 remain after the 2026-08-28
 sweep)**. Five of the seven listed here and under Transactions were already
 fixed when re-probed — the classification was written from the boxes, and the
