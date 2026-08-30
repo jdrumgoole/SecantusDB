@@ -1176,13 +1176,44 @@ These are explicit non-goals. Don't add them without a reason.
 
   Array size does not change mongod's answer (checked at 20/100/1000 — it does
   NOT switch to a truncation form for large arrays, which was the reason to
-  suspect a size threshold). Deliberately **not** fixed in the sweep that found
+  suspect a size threshold). **Re-probed against mongod 8.3.4 (2026-08-30):
+  the class survives the version change — still 14 of 41 cases, still no
+  `truncatedArrays` ever — but the shape is itself version-dependent.
+  `$addToSet` reports the whole array on 6.0.16 and the positional `arr.5: 42`
+  on 8.3.4, so 8.x is more aggressively positional than 6.0. Fixing this must
+  therefore target ONE version deliberately, not "mongod".** Deliberately **not** fixed in the sweep that found
   it: the diff walk is parity-mirrored (`src/secantus/diff.py` +
   `crates/secantus-core/src/diff.rs`) and ~19 assertions across
   `tests/test_diff.py` and `tests/test_change_streams.py` pin the current
   behaviour, so it is its own slice. Note `truncatedArrays` is a real mongod
   field — this is about when it is emitted, and 6.0.16 never emits it for any
   mutation probed.
+
+- [ ] **WATCH (not a defect today): `fullDocument`'s position in a change event
+  moved in mongod 8.3, and we match the 8.2.1 target (2026-08-30).** Measured
+  on all three servers:
+
+  | server | `fullDocument` position |
+  |---|---|
+  | 6.0.16 | index 4, after `wallTime` |
+  | **8.2.1** (the probed target) | **index 4, after `wallTime` — same as 6.0** |
+  | 8.3.4 | **last**, after `updateDescription` |
+
+  So there is nothing to change: `changestreams._EVENT_FIELD_ORDER` (mirrored in
+  `crates/secantus-storage/src/changestreams.rs`, pinned by
+  `tests/test_change_stream_spec_fidelity.py`) already matches
+  `PROBED_MONGOD_VERSION`. Filed as a WATCH because whoever next moves the
+  probed version forward to 8.3+ must move that field and those pinned key
+  sequences together.
+
+  Two things this cost, worth keeping. First, a **patch-level** difference:
+  6.0.16 and 8.2.1 agree while 8.3.4 differs, so "the 8.x series" is not a
+  single behaviour and probing 8.3 to learn about 8.2 gives the wrong answer —
+  which is exactly what happened here before 8.2.1 was measured. Second, this
+  one field has now been in three positions: the original code appended it last
+  (8.3's form, by accident), a later change "fixed" it to sit immediately after
+  `operationType` (matching no released server), and a probe moved it to the
+  form 6.0.16 and 8.2.1 share. Only the last was measured.
 
 - [ ] **Expanded change events omit `collectionUUID`, and `collMod` omits
   `stateBeforeChange` (2026-08-29).** With `showExpandedEvents: true`, mongod

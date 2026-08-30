@@ -176,6 +176,13 @@ def _events(db, **kw):
 # index 2 also pushed ``_id`` out of first position. They now pin the measured
 # order, which is why they are written as an exact key sequence rather than as
 # a relative index: a relative assertion is what let the wrong claim survive.
+#
+# Re-measured on 2026-08-30 against mongod 8.2.1, the version
+# ``PROBED_MONGOD_VERSION`` targets: the order below is identical there, so
+# these pin the PROBED server, not a superseded one. mongod 8.3.4 moves
+# ``fullDocument`` to the end of the event -- a patch-level change within 8.x,
+# filed as a WATCH in the backlog. If the probed version moves to 8.3+, these
+# sequences and ``changestreams._EVENT_FIELD_ORDER`` move together.
 
 
 def test_insert_event_field_order_matches_mongod(db) -> None:

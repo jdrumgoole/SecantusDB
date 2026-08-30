@@ -162,7 +162,14 @@ def _ns_doc(ns: str) -> dict[str, str]:
 
 
 # mongod's field order for a change event, measured against 6.0.16 on
-# 2026-08-29 with tools/probes/change_streams.py. Order is invisible to a dict
+# 2026-08-29 with tools/probes/change_streams.py.
+#
+# Re-measured against mongod 8.2.1 -- the version `PROBED_MONGOD_VERSION`
+# targets -- on 2026-08-30: identical to 6.0.16, so this order matches the
+# probed server. `fullDocument`'s slot is the one that is NOT stable forever:
+# 8.3.4 moves it to the END, after updateDescription. Nothing to do today;
+# whoever moves the probed version to 8.3+ moves this and the key sequences in
+# tests/test_change_stream_spec_fidelity.py together. Order is invisible to a dict
 # comparison, so it survived every equality-based check we had: the probe
 # compares key LISTS, and found 28 of 34 CRUD cases out of order. Any key not
 # listed here keeps its relative position after these.

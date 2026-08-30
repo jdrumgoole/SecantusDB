@@ -42,8 +42,14 @@ def normalise(value):
 
 
 def norm_msg(msg):
-    """Strip the resume-token hex and cluster time out of an error message."""
-    msg = re.sub(r'"[0-9A-Fa-f]{30,}"', '"<TOKEN>"', str(msg))
+    """Strip the resume-token hex and cluster time out of an error message.
+
+    The optional trailing ellipsis in the pattern matters: mongod 8.x builds a
+    much longer resume token (it encodes operationType and documentKey), long
+    enough that the message is truncated with an ellipsis INSIDE the quotes. A
+    pattern requiring quote-hex-quote silently stopped matching there and
+    manufactured three divergences that were really one normalisation gap."""
+    msg = re.sub(r'"[0-9A-Fa-f]{30,}\.{0,3}"', '"<TOKEN>"', str(msg))
     return re.sub(r"Timestamp\(\d+, \d+\)", "Timestamp(<T>)", msg)
 
 

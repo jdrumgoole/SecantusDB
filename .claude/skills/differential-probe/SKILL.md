@@ -99,11 +99,59 @@ reproducible locally, neither a flake:
   code 10000.
 - **An upserted document's query-seeded field order changed.** 6.0.16 sorts
   them; newer keeps the query's own order. `_id` leading is stable on both.
+- **A change event's `fullDocument` moved at a PATCH level.** 6.0.16 and 8.2.1
+  put it after `wallTime`; **8.3.4 puts it last**. A major series is not one
+  behaviour: probing 8.3 to learn about 8.2 gave the wrong answer and produced a
+  backlog entry claiming a retarget gap that did not exist. One field, three
+  positions over time — the original code appended it last (8.3's form, by
+  accident), a later change "fixed" it to sit after `operationType` (matching no
+  released server), and a probe moved it to the 6.0/8.2 form.
+
+**Installing an 8.x that the gate accepts.** `PROBED_MONGOD_MAJOR` is 8, so on
+a box whose `mongod` is 6.0 the whole of `tests/test_mongod_differential.py`
+**silently skips** — a green local run of that file means it did not run. The
+tap has the right formula:
+
+    brew install mongodb/brew/mongodb-community@8.2   # 8.2.11
+    brew unlink mongodb-community@6.0 && brew link --force mongodb-community@8.2
+
+That is done on this box: `mongod` is **8.2.11** and the gate runs (150 passed).
+6.0.16 is still installed and reachable at
+`/opt/homebrew/opt/mongodb-community@6.0/bin/mongod` for cross-version probing,
+as is 8.3.4 under `mongodb-community@8.3`. The exact probed 8.2.1 is not in brew
+at all; fetch it only if you need that precise build:
+
+    curl -sSL -o m.tgz https://fastdl.mongodb.org/osx/mongodb-macos-arm64-8.2.1.tgz
+
+**Patch releases differ, so do not pin a rendering that is really a set.**
+8.2.1 and 8.2.11 disagree on the ORDER of a wrong-type error's expected-type
+list (`[long, int, double, bool, decimal]` versus
+`[int, decimal, long, bool, double]`) — stable per build, checked across
+processes, but different between patches. Three gate cases failed on that alone.
+The fix was to compare the list as the set it is (`_sort_type_lists`), not to
+pin a build: an assertion that breaks on a patch bump is asserting mongod's
+implementation detail, not its contract. Type NAMES are still compared exactly.
+
+8.x also **dropped `--fork` on macOS** — background it with `nohup … &`.
 
 Before asserting anything version-shaped — a `codeName` above 10000, BSON field
 order, whether an option exists at all (`distinct.hint` was added after 6.0) —
-either probe an always-stable variant instead, or don't assert that part. The
-project convention is to **ship 6.0's form** and gate the assertion.
+either probe an always-stable variant instead, or don't assert that part.
+
+**Ship the probed version's form — which is now 8.2.1, not 6.0.** #1106
+retargeted the error surface and `PROBED_MONGOD_VERSION` with it. Source
+comments across ~11 files still cite 6.0.16 and were explicitly not
+re-verified, so a citation is evidence of when it was measured, not of what the
+server does now. If you introduce a version-dependent difference, record every
+version you measured in `tasks/backlog.md` rather than silently picking one.
+
+**A finding that appears only on the newer server is a normalisation bug until
+proven otherwise.** Probing change streams against 8.3.4 produced three extra
+divergences that were one stale regex: 8.x's resume token is long enough that
+mongod truncates the message with an ellipsis *inside* the quotes, so a
+`"[0-9A-Fa-f]{30,}"` pattern stopped matching and the raw token leaked into the
+comparison. Re-run the same probe against the old server; a difference in the
+*count* between versions is worth suspecting before it is worth reporting.
 
 ## Size the work from a probe, never from the source
 
