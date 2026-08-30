@@ -1635,8 +1635,31 @@ def _render_pg_float(value: float) -> str:
     efd = _extra_float_digits()
     if efd < 1:
         return f"{value:.{max(1, 15 + efd)}g}"
-    s = repr(value)
-    return s[:-2] if s.endswith(".0") else s
+    return _shortest_round_trip(value, float, 18, 15)
+
+
+def _shortest_round_trip(value: float, back: Any, max_digits: int, sci_at: int) -> str:
+    """Postgres' shortest-round-trip float text: the fewest significant digits
+    that reproduce ``value`` through ``back``, rendered fixed or scientific by
+    the EXPONENT alone.
+
+    Keeping the digit count and the notation separate is the point. ``%g``
+    picks scientific whenever ``exp >= precision``, so a value needing few
+    digits flipped to exponent form far too early — float4 80 printed as
+    ``8e+01``. And Python's ``repr`` (which float8 used) has its own threshold
+    of 16 where Postgres switches at 15, so 1e15 printed as ``1000000000000000``
+    where PG prints ``1e+15``. Postgres keys off the exponent only: scientific
+    iff ``exp < -4 or exp >= sci_at`` — 6 for float4, 15 for float8. Both
+    thresholds probed against PG 14 over the type's whole range."""
+    digits = max_digits - 1
+    for p in range(1, max_digits):
+        if back(float(f"{value:.{p - 1}e}")) == back(value):
+            digits = p
+            break
+    exponent = int(f"{value:.{digits - 1}e}".split("e")[1])
+    if -4 <= exponent < sci_at:
+        return f"{value:.{max(0, digits - 1 - exponent)}f}"
+    return f"{value:.{digits - 1}e}"
 
 
 def _render_pg_float4(value: float) -> str:
@@ -1650,12 +1673,10 @@ def _render_pg_float4(value: float) -> str:
     efd = _extra_float_digits()
     if efd < 1:
         return f"{value:.{max(1, 6 + efd)}g}"
-    packed = _struct.pack("!f", value)
-    for p in range(1, 10):
-        s = f"{value:.{p}g}"
-        if _struct.pack("!f", float(s)) == packed:
-            return s
-    return f"{value:.9g}"
+    # Round-trip through single precision, and switch to scientific at exp 6 —
+    # which is why 16777216 (8 digits, exp 7) is ``1.6777216e+07`` while 100000
+    # (1 digit, exp 5) is ``100000``.
+    return _shortest_round_trip(value, lambda v: _struct.pack("!f", v), 10, 6)
 
 
 def parse_pg_record_literal(text: str) -> list[str | None]:
