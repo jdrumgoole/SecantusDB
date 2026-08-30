@@ -1244,6 +1244,53 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **`maxTimeMS` diverges from mongod 8.2.1 in all four of its behaviours
+  (found 2026-08-30 by re-probing a "probed 6.0.16" comment).**
+  `commands._require_max_time_ms` still implements the 6.0 contract, which its
+  own docstring describes as "code 2 rather than 14 -- the only slot in this
+  sweep that is not a TypeMismatch". On 8.2.1 that is no longer true:
+
+  | case | mongod 8.2.1 | ours |
+  |---|---|---|
+  | wrong type | `14` `BSON field '<struct>.maxTimeMS' is the wrong type '<t>', expected types '<list>'` | `2 maxTimeMS must be a number` |
+  | `1.5` | `9 Expected an integer: maxTimeMS: 1.5` | `2 maxTimeMS has non-integral value` |
+  | `-1` | `2 BSON field 'maxTimeMS' value must be >= 0, actual value '-1'` | `2 -1 value for maxTimeMS is out of range` |
+  | `null` | **accepted** | rejected |
+
+  **The wrong-type case is the awkward one and is why this is filed rather than
+  fixed:** the IDL struct name is per-command AND the type list differs between
+  commands. Probed: `find` -> `'FindCommandRequest.maxTimeMS'` with
+  `'[int, double, decimal, long]'`; `aggregate` -> `'aggregate.maxTimeMS'` and
+  `count` -> `'count.maxTimeMS'`, both with a *different* ordering starting
+  `[decimal, long, ...]`. So a correct fix must probe **every** command that
+  accepts `maxTimeMS`, not the three sampled here. Do not derive the struct name
+  from the command name -- `find` already breaks that rule.
+
+- [ ] **`createIndexes` with `indexes: null` answers the wrong code (found
+  2026-08-30, same sweep).** mongod 8.2.1 treats an explicit null as the field
+  being ABSENT: `40414 IDLFailedToParse: BSON field 'createIndexes.indexes' is
+  missing but a required field` (identical to omitting it). We answer
+  `10065 invalid parameter: expected an object (indexes)`, the 6.0 form. This is
+  the same null-means-absent family already fixed for
+  `findAndModify.arrayFilters` and `killCursors.cursors` in the 8.x retarget;
+  `createIndexes` was missed because the crash there was fixed separately
+  (#1098) without revisiting the code. Small, self-contained fix.
+
+- [x] **18 other "probed 6.0.16" claims re-verified against 8.2.1 (2026-08-30)** —
+  `tools/probes/reprobe_60.py` runs each against a live mongod AND SecantusDB and
+  compares, so a claim only passes when the two agree. Confirmed still true:
+  missing-path arithmetic is null; `$cmp` ranks missing below null;
+  `$arrayElemAt` over a missing array is null; `$stdDevPop` over Decimal128
+  answers a double; `$densify` rejects a non-numeric field; `$toDecimal` pads to
+  15 significant digits; `{x: NaN}` matches a stored NaN;
+  `findAndModify.upsert`/`.new` accept numbers while `update.updates.multi` is a
+  strict bool; unknown top-level fields on `findAndModify` / `getMore` answer
+  40415; `find` rejects `filter: null`; `killCursors` requires `cursors`; `$inc`
+  on a non-numeric names the document `_id`; an unknown modifier's message;
+  array sort takes the min ascending and the max descending. **25 of the 58
+  citations remain unprobed** -- mostly reply field ORDER and change-stream event
+  shape, which need a different harness than this one.
+
 - [x] **Missing-vs-null sweep — the confusion was real but NARROW (2026-08-29).**
   Motivated by the Phase 2 campaign, where conflating an absent field with an
   explicit null produced both `$graphLookup` bugs and the `$lookup` `let` gap.
