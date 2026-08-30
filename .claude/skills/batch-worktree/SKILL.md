@@ -108,6 +108,11 @@ Three traps, all hit for real:
   then use `-D`.
 - **Never remove a worktree or branch you did not create in this conversation.**
 
+The branch and worktree are only half of it. Servers still bound to ports,
+WiredTiger temp stores, the `pytest-of-<user>` backlog, and background waiters
+still armed all outlive the session too — see the **`session-cleanup`** skill
+for those and for the closing verification pass.
+
 ## If work lands on a branch whose PR is already open
 
 Do not commit it there — that changes a PR mid-review. Save and restore:
