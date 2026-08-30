@@ -78,9 +78,19 @@ requires_mongod = pytest.mark.skipif(MONGOD is None, reason="no mongod on PATH")
 # the gate can never claim a divergence it cannot actually judge.
 #
 # The cost is real: on another series this file provides no coverage. That is
-# the honest answer -- on an unprobed server an exact-match gate has no
-# expectation to assert.
-PROBED_MONGOD_SERIES = (8, 2)
+# the honest answer -- across majors an exact-match gate has no expectation to
+# assert. Within the major it runs, so drift shows up as a failure.
+# Gate on the MAJOR only. mongod's error surface is stable within a major, so a
+# mismatch on 8.0 or 8.4 is far more likely to be a real SecantusDB divergence
+# than version drift -- and a loud failure is more useful there than a silent
+# skip, which is what a (major, minor) gate gave. The exact server every value
+# here was probed against is recorded below; if a future 8.x does move one of
+# these surfaces, this gate is what will tell you, and the fix is to re-probe
+# rather than to widen the skip.
+PROBED_MONGOD_MAJOR = 8
+#: The exact server the expectations were taken from. Informational -- the gate
+#: compares the major above -- but it is the version to reproduce against.
+PROBED_MONGOD_VERSION = "8.2.1"
 
 
 def _free_port() -> int:
@@ -1489,13 +1499,13 @@ def test_matches_mongod(
 ) -> None:
     """SecantusDB must answer exactly what mongod answers."""
     name, seed, op = case
-    if mongod_version != PROBED_MONGOD_SERIES:
-        probed = ".".join(str(p) for p in PROBED_MONGOD_SERIES)
+    if mongod_version[0] != PROBED_MONGOD_MAJOR:
         found = ".".join(str(p) for p in mongod_version)
         pytest.skip(
-            f"this gate asserts an exact match against mongod {probed}, and this "
-            f"box has mongod {found}; its error surface differs in ways that are "
-            f"not SecantusDB divergences. See PROBED_MONGOD_SERIES."
+            f"this gate asserts an exact match against mongod "
+            f"{PROBED_MONGOD_MAJOR}.x (probed {PROBED_MONGOD_VERSION}), and this "
+            f"box has mongod {found}; across majors its error surface differs in "
+            f"ways that are not SecantusDB divergences. See PROBED_MONGOD_MAJOR."
         )
     db_name = f"diff_{kind}_{name.replace('-', '_')}"
     ours = _run(secantus_uri, db_name, seed, op)
