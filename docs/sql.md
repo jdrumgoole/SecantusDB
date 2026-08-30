@@ -313,10 +313,10 @@ an unspecified order. Closing that means lowering comparisons against both
 fields and adding the companion as a sort tiebreaker; until then reads are
 precise and predicates are not.
 
-#### Comparing incompatible types is an error, not an empty result
+#### Using incompatible types is an error, not an empty result
 
-Postgres resolves a comparison operator while it *analyses* a statement, so
-comparing a `text` column against an integer fails before any row is read:
+Postgres resolves an operator while it *analyses* a statement, so comparing a
+`text` column against an integer fails before any row is read:
 
 ```sql
 SELECT * FROM users WHERE name = 42;
@@ -327,9 +327,27 @@ An untyped literal is not a type — Postgres resolves it to the other operand �
 so `name = '42'` and `age = '42'` both keep working, as does any numeric-vs-numeric
 or date-vs-timestamp pair. The check covers the six binary comparison operators
 on **declared** tables, across four type categories (numeric / string / boolean /
-date-time). It is deliberately conservative: bound parameters, subqueries,
-arithmetic, most function results, CTEs, derived tables and views are left to
-run, because a wrong `42883` would break a working query.
+date-time).
+
+**Arithmetic is checked too**, on a simpler rule: Postgres defines no arithmetic
+operator on text at all, so the column's *contents* are irrelevant — `name + 1`
+fails on a column holding `'42'` exactly as on one holding `'abc'`:
+
+```sql
+SELECT name + 1 FROM users;
+-- ERROR:  operator does not exist: text + integer   (SQLSTATE 42883)
+SELECT '1'::text + 1;
+-- ERROR:  operator does not exist: text + integer
+SELECT '1' + 1;      -- 2 — an untyped literal still resolves to integer
+```
+
+Postgres names the *declared* type, so a `varchar` column reports "character
+varying". Casting out of text is the supported form (`name::int + 1`), and
+`||` is concatenation, not arithmetic, so it is untouched.
+
+The analysis stays deliberately conservative: bound parameters, subqueries,
+most function results, CTEs, derived tables and views are left to run, because a
+wrong `42883` would break a working query.
 
 Reflected tables (see "Reflected tables and jsonb", below) are
 exempt. Their column types come from sampling documents, so a field may be typed
