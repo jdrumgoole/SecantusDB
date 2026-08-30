@@ -252,7 +252,6 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_object_expected(doc, "min")?;
     argtypes::require_object_expected(doc, "max")?;
     argtypes::require_bool_value(doc, "singleBatch")?;
-    argtypes::require_max_time_ms(doc)?;
     // A view: translate the find into the equivalent aggregate over the base
     // collection (the find options become pipeline stages after the view's own
     // pipeline) and delegate — the aggregate handler resolves the view. `find` and

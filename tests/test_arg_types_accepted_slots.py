@@ -17,10 +17,15 @@ reasoning:
 * ``find.let`` is reported as ``FindCommandRequest.let``, mongod's internal IDL
   name, while ``update.let`` / ``delete.let`` / ``findAndModify.let`` /
   ``aggregate.let`` use their command name.
-* ``find.maxTimeMS`` is the only slot in the sweep that is not a TypeMismatch:
-  code 2, with three distinct messages depending on how the value is wrong.
+* ``find.maxTimeMS`` was described here as "the only slot in the sweep that is
+  not a TypeMismatch: code 2, with three distinct messages". That was the 6.0
+  contract and 8.x honours none of it -- see ``test_max_time_ms_fidelity.py``,
+  which owns the slot now. The lesson stands even though the fact did not: the
+  slot really is unlike its neighbours, just not in the way recorded.
 
-An explicit ``null`` is its own axis: six slots accept it, three reject it.
+An explicit ``null`` is its own axis: on 6.0 six slots accepted it and three
+rejected it; 8.x accepts it in more of them, ``maxTimeMS`` and
+``createIndexes.indexes`` included, where an explicit null means ABSENT.
 """
 
 from __future__ import annotations
@@ -203,30 +208,43 @@ def test_update_multi_accepts_an_explicit_null(db) -> None:
 
 
 # --------------------------------------------------------------------------
-# ``find.maxTimeMS``: code 2, three messages.
+# ``find.maxTimeMS``. This block used to assert the 6.0 contract -- "code 2
+# rather than 14, the only slot in this sweep that is not a TypeMismatch" --
+# which 8.x honours in none of its four behaviours. The full cross-command
+# contract lives in ``test_max_time_ms_fidelity.py``; what stays here is the
+# ``find`` row, because this file is where the slot was first swept.
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bad", [{}, "x", [1], True, None])
-def test_max_time_ms_must_be_a_number(db, bad) -> None:
+@pytest.mark.parametrize("bad", [{}, "x", [1], True])
+def test_max_time_ms_wrong_type_is_a_type_mismatch(db, bad) -> None:
+    """14, not the 6.0-era 2 -- and reported against mongod's IDL struct name,
+    which for ``find`` alone is not the command name."""
     err = _err(db, {"find": "c", "maxTimeMS": bad})
-    assert err.code == 2
-    assert err.details["errmsg"] == "maxTimeMS must be a number"
+    assert err.code == 14
+    assert err.details["errmsg"].startswith(
+        "BSON field 'FindCommandRequest.maxTimeMS' is the wrong type"
+    )
+
+
+def test_max_time_ms_accepts_an_explicit_null(db) -> None:
+    """8.x treats it as absent. 6.0 rejected it, and so did we."""
+    db.command({"find": "c", "maxTimeMS": None})
 
 
 def test_max_time_ms_must_be_integral(db) -> None:
     err = _err(db, {"find": "c", "maxTimeMS": 1.5})
-    assert err.code == 2
-    assert err.details["errmsg"] == "maxTimeMS has non-integral value"
+    assert err.code == 9
+    assert err.details["errmsg"] == "Expected an integer: maxTimeMS: 1.5"
 
 
 def test_max_time_ms_must_not_be_negative(db) -> None:
     err = _err(db, {"find": "c", "maxTimeMS": -1})
     assert err.code == 2
-    assert err.details["errmsg"] == "-1 value for maxTimeMS is out of range"
+    assert err.details["errmsg"] == ("BSON field 'maxTimeMS' value must be >= 0, actual value '-1'")
 
 
-@pytest.mark.parametrize("ok", [0, 5, 5.0, Decimal128("5")])
+@pytest.mark.parametrize("ok", [0, 5000, 5000.0, Decimal128("5000")])
 def test_max_time_ms_accepts_integral_numbers(db, ok) -> None:
     db.command({"find": "c", "maxTimeMS": ok})
 
@@ -268,15 +286,28 @@ def test_delete_limit_is_still_not_type_checked(db, value) -> None:
 
 def test_create_indexes_rejects_a_null_indexes_list(db) -> None:
     """This CRASHED as "internal server error" -- `for idx_spec in indexes`
-    over a None. mongod has its own code for the slot, and it is not 14."""
+    over a None. The crash fix answered 10065, the 6.0 code; 8.x treats an
+    explicit null as the required field being ABSENT."""
     err = _err(db, {"createIndexes": "c", "indexes": None})
-    assert err.code == 10065
-    assert err.details["errmsg"] == "invalid parameter: expected an object (indexes)"
+    assert err.code == 40414
+    assert err.details["errmsg"] == (
+        "BSON field 'createIndexes.indexes' is missing but a required field"
+    )
+
+
+def test_create_indexes_null_answers_exactly_what_omitting_it_answers(db) -> None:
+    """The point of the null-means-absent family: the two are indistinguishable."""
+    null_err = _err(db, {"createIndexes": "c", "indexes": None})
+    missing_err = _err(db, {"createIndexes": "c"})
+    assert (null_err.code, null_err.details["errmsg"]) == (
+        missing_err.code,
+        missing_err.details["errmsg"],
+    )
 
 
 @pytest.mark.parametrize("bad", [5, "x", True, [1]])
 def test_create_indexes_wrong_typed_list_is_not_the_null_code(db, bad) -> None:
-    """Two codes for one slot, split by null-ness: an explicit null is 10065,
+    """Two codes for one slot, split by null-ness: an explicit null is 40414,
     a wrong-typed non-null is the ordinary 14."""
     err = _err(db, {"createIndexes": "c", "indexes": bad})
     assert err.code == 14

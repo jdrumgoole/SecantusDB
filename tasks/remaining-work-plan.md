@@ -190,9 +190,14 @@ Sub-ms `ORDER BY` is adjacent to work already landed and should be cheap.
 - [x] **Wrong-typed command arguments — DONE, sweep is 87/87 clean.** Was 24
       crashes + 44 divergences; closed across four PRs (#1078 document-valued,
       #1080 numeric/cursor, #1084 the 24 silently-accepted, plus the wrong-code
-      slice). Detail and the per-slot lessons are in `backlog.md` §3. **The Rust
-      server has not been swept for this class** — point the same probe at
-      `secantusd-rs` to find out; that measurement has never been taken.
+      slice). Detail and the per-slot lessons are in `backlog.md` §3.
+      **The Rust server has not been swept for this class as a whole** — point
+      the same probe at `secantusd-rs`; that measurement has still never been
+      taken. One data point exists as of 2026-08-30: the `maxTimeMS` slot was
+      checked, and the Rust server had the identical defect (the 6.0 contract,
+      applied to 3 commands instead of 1), fixed on both servers in the same PR.
+      That is one slot out of the sweep's 87, so it hints the class ports across
+      wholesale rather than settling it.
 - [ ] **Aggregation runtime errors lack mongod's wrapper prefix.** Codes match;
       the message doesn't. mongod picks between
       `Failed to optimize pipeline :: caused by ::` and

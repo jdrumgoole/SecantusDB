@@ -31,7 +31,6 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     // `upsert` takes a bool OR any number here, unlike `update.updates.multi`.
     argtypes::require_bool_or_number(doc, "upsert", "findAndModify.upsert")?;
     argtypes::require_object(doc, "let", "findAndModify.let")?;
-    argtypes::require_max_time_ms(doc)?;
     let coll = match doc
         .get("findAndModify")
         .or_else(|| doc.get("findandmodify"))

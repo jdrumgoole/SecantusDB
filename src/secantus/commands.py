@@ -2336,9 +2336,6 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     _err = _require_bool_value_field(doc, "singleBatch")
     if _err is not None:
         return _err
-    _err = _require_max_time_ms(doc)
-    if _err is not None:
-        return _err
     filter_ = doc.get("filter") or {}
     skip = int(doc.get("skip", 0) or 0)
     limit = int(doc.get("limit", 0) or 0)
@@ -3802,30 +3799,121 @@ def _validate_array_filters_field(
     }
 
 
-def _require_max_time_ms(doc: Mapping[str, Any]) -> dict[str, Any] | None:
-    """``maxTimeMS``: three distinct messages, and code 2 rather than 14.
+# mongod names the IDL *struct* in a maxTimeMS type error. Probed across 24
+# commands on 8.2.1: for every one of them that struct is simply the command
+# name -- with exactly one exception, which is why this is a lookup table and
+# not an f-string.
+_MAX_TIME_MS_STRUCTS = {"find": "FindCommandRequest"}
 
-    Probed on 6.0.16 -- the only slot in this sweep that is not a
-    ``TypeMismatch``:
+# mongod's own ceiling for the slot, reported verbatim in the range message.
+_MAX_TIME_MS_LIMIT = 2**31 - 1
 
-        {} / "x" / [1] / true / null   2  maxTimeMS must be a number
-        1.5                            2  maxTimeMS has non-integral value
-        -1                             2  -1 value for maxTimeMS is out of range
+# Beyond this a double cannot round-trip through a 64-bit integer, which mongod
+# reports differently from a merely fractional value.
+_INT64_MAX = 2**63 - 1
+_INT64_MIN = -(2**63)
 
-    ``Decimal128`` is accepted. An explicit ``null`` is rejected, absent is fine.
-    The upper bound was not probed, so it is not enforced here.
+
+def _max_time_ms_not_integral(value: Any) -> dict[str, Any] | None:
+    """The ``9 FailedToParse`` half of the maxTimeMS contract, or None if OK.
+
+    Four distinct messages, and which one you get depends on the BSON type as
+    well as the value -- a fractional ``double`` and a fractional ``Decimal128``
+    do NOT share wording::
+
+        double 1.5      Expected an integer: maxTimeMS: 1.5
+        double nan      Expected an integer, but found NaN in: maxTimeMS: nan
+        double 1e100    Cannot represent as a 64-bit integer: maxTimeMS: 1e+100
+        double -inf     Cannot represent as a 64-bit integer: maxTimeMS: -inf
+        decimal 1.5     Cannot represent as a 64-bit integer: maxTimeMS: 1.5
+        decimal NaN     Cannot represent as a 64-bit integer: maxTimeMS: NaN
+
+    Python's ``repr`` of a float already matches mongod's rendering for every
+    case probed (``1.5``, ``-0.5``, ``3.25``, ``1e+100``, ``inf``, ``nan``), and
+    ``str`` of a ``Decimal128`` preserves the literal the client sent
+    (``1E+40``, ``Infinity``), which is what mongod echoes.
+    """
+    if isinstance(value, bson.Decimal128):
+        dec = value.to_decimal()
+        if dec.is_nan() or dec.is_infinite() or dec != dec.to_integral_value():
+            return _failed_to_parse(f"Cannot represent as a 64-bit integer: maxTimeMS: {value}")
+        if not _INT64_MIN <= int(dec) <= _INT64_MAX:
+            return _failed_to_parse(f"Cannot represent as a 64-bit integer: maxTimeMS: {value}")
+        return None
+    if isinstance(value, float):
+        if value != value:
+            return _failed_to_parse(f"Expected an integer, but found NaN in: maxTimeMS: {value!r}")
+        if value in (float("inf"), float("-inf")) or not _INT64_MIN <= value <= _INT64_MAX:
+            return _failed_to_parse(f"Cannot represent as a 64-bit integer: maxTimeMS: {value!r}")
+        if value != int(value):
+            return _failed_to_parse(f"Expected an integer: maxTimeMS: {value!r}")
+    return None
+
+
+def _require_max_time_ms(doc: Mapping[str, Any], command: str) -> dict[str, Any] | None:
+    """``maxTimeMS`` on any command, as mongod 8.2.1 validates it.
+
+    Three checks in a fixed order, each with its own code. **The order is
+    load-bearing**: ``-1.5`` is both non-integral and negative, and mongod
+    answers the integral error (9), not the range one (2)::
+
+        "x" / {} / [1] / true   14  BSON field '<struct>.maxTimeMS' is the wrong
+                                    type '<t>', expected types '[decimal, int, double, long]'
+        1.5 / -1.5 / -0.5       9   (see _max_time_ms_not_integral)
+        -1                      2   BSON field 'maxTimeMS' value must be >= 0, actual value '-1'
+        2**31                   2   BSON field 'maxTimeMS' value must be
+                                    <= 2147483647, actual value '2147483648'
+        null / 0 / 2147483647   accepted
+
+    Note the range message carries NO struct prefix where the type message does.
+    That asymmetry is mongod's, not an oversight here.
+
+    This replaces a 6.0-era version whose own docstring called the slot "code 2
+    rather than 14 -- the only slot in this sweep that is not a TypeMismatch".
+    8.x honours none of that: all four of its behaviours changed, an explicit
+    ``null`` is now ACCEPTED (it means absent), and the old version was called
+    from ``find`` alone -- so ``aggregate``, ``count`` and 21 other commands
+    took a wrong-typed value **silently**, which is why this now runs in
+    ``dispatch`` for every command.
+
+    The expected-type list is the same SET on all 24 commands probed, but
+    mongod renders it in 12 different orders across them -- and reorders it
+    between patch builds (see CLAUDE.md). Only the set is meaningful; we emit
+    one fixed order via ``_NUMERIC_TYPES_MSG``.
     """
     if "maxTimeMS" not in doc:
         return None
     value = doc["maxTimeMS"]
+    if value is None:
+        # 8.x treats an explicit null as the field being absent. 6.0 rejected
+        # it, which is what we used to do.
+        return None
     if isinstance(value, bool) or not isinstance(value, (int, float, bson.Decimal128)):
-        return _bad_value("maxTimeMS must be a number")
-    number = value.to_decimal() if isinstance(value, bson.Decimal128) else value
-    if number != int(number):
-        return _bad_value("maxTimeMS has non-integral value")
+        struct = _MAX_TIME_MS_STRUCTS.get(command, command)
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"BSON field '{struct}.maxTimeMS' is the wrong type "
+                f"'{_bson_type_of(value)}', expected types {_NUMERIC_TYPES_MSG}"
+            ),
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    _err = _max_time_ms_not_integral(value)
+    if _err is not None:
+        return _err
+    number = int(value.to_decimal()) if isinstance(value, bson.Decimal128) else int(value)
     if number < 0:
-        return _bad_value(f"{int(number)} value for maxTimeMS is out of range")
+        return _bad_value(f"BSON field 'maxTimeMS' value must be >= 0, actual value '{number}'")
+    if number > _MAX_TIME_MS_LIMIT:
+        return _bad_value(
+            f"BSON field 'maxTimeMS' value must be <= {_MAX_TIME_MS_LIMIT}, actual value '{number}'"
+        )
     return None
+
+
+def _failed_to_parse(errmsg: str) -> dict[str, Any]:
+    return {"ok": 0.0, "errmsg": errmsg, "code": 9, "codeName": "FailedToParse"}
 
 
 def _bad_value(errmsg: str) -> dict[str, Any]:
@@ -4797,10 +4885,20 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if oplog_err is not None:
         return oplog_err
     indexes = doc.get("indexes", [])
-    if indexes is None or not isinstance(indexes, (list, tuple)):
-        # mongod's own wording for this slot, and its own code -- an explicit
-        # null used to reach the `for idx_spec in indexes` loop and crash as
-        # "internal server error". Probed 6.0.16.
+    if indexes is None or "indexes" not in doc:
+        # 8.x treats an explicit null as the required field being ABSENT, and
+        # answers exactly what omitting it answers -- the same null-means-absent
+        # family as findAndModify.arrayFilters and killCursors.cursors. We
+        # answered 10065, the 6.0 form; this slot was missed when the crash here
+        # (it used to reach the `for idx_spec in indexes` loop) was fixed
+        # separately. Re-probed 8.2.1.
+        return {
+            "ok": 0.0,
+            "errmsg": "BSON field 'createIndexes.indexes' is missing but a required field",
+            "code": 40414,
+            "codeName": "IDLFailedToParse",
+        }
+    if not isinstance(indexes, (list, tuple)):
         return {
             "ok": 0.0,
             "errmsg": "invalid parameter: expected an object (indexes)",
@@ -8391,6 +8489,22 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 59,
             "codeName": "CommandNotFound",
         }
+    # ``maxTimeMS`` is a generic command field -- mongod's IDL validates it on
+    # every command, not just the ones that honour the timeout, so it belongs
+    # here beside readConcern / apiVersion rather than in 24 handlers. It used
+    # to be checked in ``find`` alone, and every other command took a
+    # wrong-typed value silently.
+    #
+    # The two neighbours it sits between were both settled by probing an
+    # auth-enabled mongod 8.2.1, because guessing either way was plausible:
+    #
+    #   * CommandNotFound WINS over it -- an unknown command with a bad
+    #     maxTimeMS answers 59, so this must stay below the handler lookup.
+    #   * It WINS over authorization -- an unauthorized `find` with a bad
+    #     maxTimeMS answers 14, not 13, so it must stay above the auth checks.
+    _err = _require_max_time_ms(doc, name)
+    if _err is not None:
+        return _err
     if (
         ctx.require_auth
         and name not in _PRE_AUTH_COMMANDS

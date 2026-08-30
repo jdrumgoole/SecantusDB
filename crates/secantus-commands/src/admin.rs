@@ -977,9 +977,9 @@ fn is_falsy(v: &Bson) -> bool {
 pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `indexes` is an array of specs; a scalar there used to report ok:1 and
     // create NOTHING, so a driver believed an index existed that did not.
-    // `indexes` has its own code (10065) and rejects an explicit null; the
-    // fields INSIDE a spec quote the whole spec back. Neither follows the
-    // generic families -- probed per slot.
+    // An explicit `indexes: null` means ABSENT on 8.x (40414), identical to
+    // omitting it; the fields INSIDE a spec quote the whole spec back. Neither
+    // follows the generic families -- probed per slot.
     argtypes::require_index_specs(doc)?;
     if let Some(bson::Bson::Array(specs)) = doc.get("indexes") {
         for spec in specs {
