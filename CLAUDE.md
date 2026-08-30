@@ -16,11 +16,14 @@ The audience is developers who want fast, ephemeral, in-process MongoDB behaviou
 
 ## Design constraints
 
-- **The error surface targets mongod 8.2.1.** Retargeted from 6.0.16 on
-  2026-08-29. `tests/test_mongod_differential.py` is the gate: it runs every
-  supported operation against a real `mongod` and asserts an *exact* match, and
-  it **skips off the probed series** (`PROBED_MONGOD_SERIES`) rather than
-  reporting version differences as divergences. Note CI installs `mongosh` and
+- **The error surface targets mongod 8.x** (probed against 8.2.1; retargeted
+  from 6.0.16 on 2026-08-29). `tests/test_mongod_differential.py` is the gate: it
+  runs every supported operation against a real `mongod` and asserts an *exact*
+  match. It gates on the **major** (`PROBED_MONGOD_MAJOR`), so any 8.x runs it
+  and only a different major skips — mongod's error surface is stable within a
+  major, so a mismatch on 8.0 or 8.4 is far more likely to be a real divergence
+  than version drift, and a loud failure beats a silent skip. If a future 8.x
+  does move a surface, re-probe rather than widening the skip. Note CI installs `mongosh` and
   `mongodb-database-tools` but **not `mongod`**, so that gate only ever runs on a
   dev box — run it locally before changing an error message. Comments saying
   "probed 6.0.16" without naming 8.x predate the retarget and were not
