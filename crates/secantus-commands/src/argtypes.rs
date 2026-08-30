@@ -49,6 +49,10 @@ fn bad_value(errmsg: impl Into<String>) -> CommandError {
     CommandError::new(2, "BadValue", errmsg.into())
 }
 
+fn failed_to_parse(errmsg: impl Into<String>) -> CommandError {
+    CommandError::new(9, "FailedToParse", errmsg.into())
+}
+
 /// `BSON field '<path>' is the wrong type '<t>', expected type 'object'`.
 ///
 /// An absent field and an explicit `null` are both accepted here — that is
@@ -162,19 +166,20 @@ pub fn require_bool_or_number(doc: &Document, field: &str, path: &str) -> Result
     }
 }
 
-/// `createIndexes.indexes`: mongod's own code and wording, and it rejects an
-/// explicit `null` (10065) rather than treating it as absent — unlike `let`.
-/// The Python server used to CRASH here (`'NoneType' object is not iterable`).
+/// `createIndexes.indexes`: on 8.x an explicit `null` means the required field
+/// is ABSENT, and answers exactly what omitting it answers — the same
+/// null-means-absent rule as `findAndModify.arrayFilters` and
+/// `killCursors.cursors`. Both servers used to answer the 6.0 form
+/// (`10065 invalid parameter: expected an object (indexes)`); re-probed 8.2.1.
+/// A wrong-TYPED non-null is still the ordinary array type error (14), so this
+/// slot has two codes split by null-ness — just not the two it used to have.
 pub fn require_index_specs(doc: &Document) -> Result<(), CommandError> {
     match doc.get("indexes") {
         Some(Bson::Array(_)) => Ok(()),
-        // Explicit null ONLY: mongod answers 10065 here, but a wrong-TYPED
-        // non-null is the ordinary array type error (14). Two codes for one
-        // slot, split by whether the value is null.
         None | Some(Bson::Null) => Err(CommandError::new(
-            10065,
-            "Location10065",
-            "invalid parameter: expected an object (indexes)",
+            40414,
+            "IDLFailedToParse",
+            "BSON field 'createIndexes.indexes' is missing but a required field",
         )),
         Some(v) => Err(type_mismatch(format!(
             "BSON field 'createIndexes.indexes' is the wrong type '{}', expected type 'array'",
@@ -211,37 +216,142 @@ pub fn require_index_spec_field(
     )))
 }
 
-/// `maxTimeMS` — the only slot in the sweep that is not a `TypeMismatch`:
-/// code 2, with three distinct messages. `Decimal128` is accepted; an explicit
-/// null is rejected while absent is fine. No upper bound is enforced (unprobed).
-pub fn require_max_time_ms(doc: &Document) -> Result<(), CommandError> {
+/// mongod names the IDL *struct* in a `maxTimeMS` type error. Probed across 24
+/// commands on 8.2.1: for every one of them that struct is simply the command
+/// name — with exactly one exception, which is why this is a lookup and not a
+/// format string. Mirrors `commands._MAX_TIME_MS_STRUCTS`.
+fn max_time_ms_struct(command: &str) -> &str {
+    if command == "find" {
+        "FindCommandRequest"
+    } else {
+        command
+    }
+}
+
+/// mongod's own ceiling for the slot, reported verbatim in the range message.
+const MAX_TIME_MS_LIMIT: i64 = i32::MAX as i64;
+
+/// `maxTimeMS` on any command, as mongod 8.2.1 validates it.
+///
+/// Three checks in a fixed order, each with its own code. **The order is
+/// load-bearing**: `-1.5` is both non-integral and negative, and mongod answers
+/// the integral error (9), not the range one (2).
+///
+/// ```text
+/// "x" / {} / [1] / true   14  BSON field '<struct>.maxTimeMS' is the wrong type
+///                             '<t>', expected types '[decimal, int, double, long]'
+/// 1.5 / -1.5 / -0.5       9   Expected an integer: maxTimeMS: 1.5
+/// double NaN              9   Expected an integer, but found NaN in: maxTimeMS: nan
+/// double 1e100 / inf      9   Cannot represent as a 64-bit integer: maxTimeMS: 1e+100
+/// Decimal128 non-integral 9   Cannot represent as a 64-bit integer: maxTimeMS: 1.5
+/// -1                      2   BSON field 'maxTimeMS' value must be >= 0, actual value '-1'
+/// 2**31                   2   BSON field 'maxTimeMS' value must be <= 2147483647, ...
+/// null / 0 / 2147483647   accepted
+/// ```
+///
+/// The range message carries NO struct prefix where the type message does; that
+/// asymmetry is mongod's. A fractional `double` and a fractional `Decimal128`
+/// also get different wording for the same numeric value.
+///
+/// This replaces a port of the 6.0 contract whose doc comment called the slot
+/// "the only one in the sweep that is not a TypeMismatch" — 8.x honours none of
+/// its four behaviours, and an explicit null is now ACCEPTED (it means absent).
+/// It was also called from `find` / `aggregate` / `findAndModify` only, so the
+/// other 21 commands took a wrong-typed value silently; it now runs in
+/// `dispatch`. Mirrors `commands._require_max_time_ms`.
+pub fn require_max_time_ms(doc: &Document, command: &str) -> Result<(), CommandError> {
     let value = match doc.get("maxTimeMS") {
-        None => return Ok(()),
+        // 8.x treats an explicit null as the field being absent.
+        None | Some(Bson::Null) => return Ok(()),
         Some(v) => v,
     };
-    let number = match value {
-        Bson::Int32(n) => f64::from(*n),
-        Bson::Int64(n) => *n as f64,
-        Bson::Double(d) => *d,
-        // Decimal128 has no lossless f64 view here; mongod accepts it, and the
-        // integral / range checks below are what a bad one would trip. Parsing
-        // its string form keeps this faithful without a decimal dependency.
-        Bson::Decimal128(d) => match d.to_string().parse::<f64>() {
-            Ok(n) => n,
-            Err(_) => return Ok(()),
-        },
-        _ => return Err(bad_value("maxTimeMS must be a number")),
+    let number: i64 = match value {
+        Bson::Int32(n) => i64::from(*n),
+        Bson::Int64(n) => *n,
+        Bson::Double(d) => {
+            if d.is_nan() {
+                return Err(failed_to_parse(format!(
+                    "Expected an integer, but found NaN in: maxTimeMS: {}",
+                    render_double(*d)
+                )));
+            }
+            if d.is_infinite() || *d < i64::MIN as f64 || *d > i64::MAX as f64 {
+                return Err(failed_to_parse(format!(
+                    "Cannot represent as a 64-bit integer: maxTimeMS: {}",
+                    render_double(*d)
+                )));
+            }
+            if d.fract() != 0.0 {
+                return Err(failed_to_parse(format!(
+                    "Expected an integer: maxTimeMS: {}",
+                    render_double(*d)
+                )));
+            }
+            *d as i64
+        }
+        // The literal the client sent is echoed back verbatim (`1E+40`, not
+        // `1e+40`), so the string form is what goes in the message.
+        Bson::Decimal128(dec) => {
+            let text = dec.to_string();
+            match text.parse::<f64>() {
+                Ok(n)
+                    if n.is_finite()
+                        && n.fract() == 0.0
+                        && (i64::MIN as f64..=i64::MAX as f64).contains(&n) =>
+                {
+                    n as i64
+                }
+                _ => {
+                    return Err(failed_to_parse(format!(
+                        "Cannot represent as a 64-bit integer: maxTimeMS: {text}"
+                    )))
+                }
+            }
+        }
+        _ => {
+            return Err(type_mismatch(format!(
+                "BSON field '{}.maxTimeMS' is the wrong type '{}', expected types {NUMERIC_TYPES}",
+                max_time_ms_struct(command),
+                bson_type_name(value)
+            )))
+        }
     };
-    if number.fract() != 0.0 {
-        return Err(bad_value("maxTimeMS has non-integral value"));
-    }
-    if number < 0.0 {
+    if number < 0 {
         return Err(bad_value(format!(
-            "{} value for maxTimeMS is out of range",
-            number as i64
+            "BSON field 'maxTimeMS' value must be >= 0, actual value '{number}'"
+        )));
+    }
+    if number > MAX_TIME_MS_LIMIT {
+        return Err(bad_value(format!(
+            "BSON field 'maxTimeMS' value must be <= {MAX_TIME_MS_LIMIT}, actual value '{number}'"
         )));
     }
     Ok(())
+}
+
+/// mongod renders these the way C++ does, which for every case probed matches
+/// Rust's own `{}` for a float except that Rust prints `inf` / `NaN` and an
+/// integral-valued double without an exponent. Only the non-integral and
+/// non-finite paths reach this, so `1.5`, `-0.5`, `1e100`, `inf` and `nan` are
+/// what matter.
+fn render_double(d: f64) -> String {
+    if d.is_nan() {
+        return "nan".to_string();
+    }
+    if d.is_infinite() {
+        return if d > 0.0 { "inf".into() } else { "-inf".into() };
+    }
+    // C++ iostreams switch to scientific past 6 significant digits; the values
+    // that get here are either small fractions or astronomically large.
+    if d != 0.0 && (d.abs() >= 1e16 || d.abs() < 1e-4) {
+        let s = format!("{d:e}");
+        // Rust writes `1e100`; C++ writes `1e+100`.
+        return match s.split_once('e') {
+            Some((mantissa, exp)) if !exp.starts_with('-') => format!("{mantissa}e+{exp}"),
+            _ => s,
+        };
+    }
+    format!("{d}")
 }
 
 /// `aggregate`'s cursor slot: mongod's own wording, and it means "missing"
@@ -325,25 +435,104 @@ mod tests {
     }
 
     #[test]
-    fn max_time_ms_has_three_messages_and_is_code_2() {
-        let cases = [
-            (doc! {"maxTimeMS": "x"}, "maxTimeMS must be a number"),
-            (doc! {"maxTimeMS": true}, "maxTimeMS must be a number"),
-            (doc! {"maxTimeMS": Bson::Null}, "maxTimeMS must be a number"),
-            (doc! {"maxTimeMS": 1.5}, "maxTimeMS has non-integral value"),
+    fn max_time_ms_wrong_type_is_14_and_names_the_idl_struct() {
+        // The struct is the command name for every command but `find`.
+        for (command, struct_name) in [
+            ("find", "FindCommandRequest"),
+            ("aggregate", "aggregate"),
+            ("count", "count"),
+            ("ping", "ping"),
+        ] {
+            for bad in [
+                Bson::String("x".into()),
+                Bson::Boolean(true),
+                Bson::Document(doc! {}),
+                Bson::Array(vec![Bson::Int32(1)]),
+            ] {
+                let err =
+                    require_max_time_ms(&doc! {"maxTimeMS": bad.clone()}, command).unwrap_err();
+                assert_eq!(err.code, 14, "{command} {bad:?}");
+                assert!(
+                    err.errmsg
+                        .starts_with(&format!("BSON field '{struct_name}.maxTimeMS'")),
+                    "{}",
+                    err.errmsg
+                );
+                assert!(err
+                    .errmsg
+                    .ends_with(&format!("expected types {NUMERIC_TYPES}")));
+            }
+        }
+    }
+
+    #[test]
+    fn max_time_ms_non_integral_is_9_and_splits_by_bson_type() {
+        // A fractional double and a fractional Decimal128 do NOT share wording.
+        let cases: [(Bson, &str); 7] = [
+            (Bson::Double(1.5), "Expected an integer: maxTimeMS: 1.5"),
+            (Bson::Double(-1.5), "Expected an integer: maxTimeMS: -1.5"),
+            (Bson::Double(-0.5), "Expected an integer: maxTimeMS: -0.5"),
             (
-                doc! {"maxTimeMS": -1},
-                "-1 value for maxTimeMS is out of range",
+                Bson::Double(f64::NAN),
+                "Expected an integer, but found NaN in: maxTimeMS: nan",
+            ),
+            (
+                Bson::Double(f64::INFINITY),
+                "Cannot represent as a 64-bit integer: maxTimeMS: inf",
+            ),
+            (
+                Bson::Double(1e100),
+                "Cannot represent as a 64-bit integer: maxTimeMS: 1e+100",
+            ),
+            (
+                Bson::Decimal128("1.5".parse().unwrap()),
+                "Cannot represent as a 64-bit integer: maxTimeMS: 1.5",
             ),
         ];
-        for (d, expected) in cases {
-            let err = require_max_time_ms(&d).unwrap_err();
-            assert_eq!(err.code, 2, "{expected}");
+        for (value, expected) in cases {
+            let err = require_max_time_ms(&doc! {"maxTimeMS": value}, "find").unwrap_err();
+            assert_eq!(err.code, 9, "{expected}");
             assert_eq!(err.errmsg, expected);
         }
-        assert!(require_max_time_ms(&doc! {}).is_ok());
-        assert!(require_max_time_ms(&doc! {"maxTimeMS": 0}).is_ok());
-        assert!(require_max_time_ms(&doc! {"maxTimeMS": 5.0}).is_ok());
+    }
+
+    #[test]
+    fn max_time_ms_out_of_range_is_2_without_the_struct_prefix() {
+        let err = require_max_time_ms(&doc! {"maxTimeMS": -1}, "find").unwrap_err();
+        assert_eq!(err.code, 2);
+        assert_eq!(
+            err.errmsg,
+            "BSON field 'maxTimeMS' value must be >= 0, actual value '-1'"
+        );
+        let err = require_max_time_ms(&doc! {"maxTimeMS": 2147483648i64}, "find").unwrap_err();
+        assert_eq!(err.code, 2);
+        assert_eq!(
+            err.errmsg,
+            "BSON field 'maxTimeMS' value must be <= 2147483647, actual value '2147483648'"
+        );
+    }
+
+    #[test]
+    fn max_time_ms_negative_and_non_integral_answers_the_integral_error() {
+        // The check ORDER: -1.5 is both, and mongod answers 9, not 2.
+        let err = require_max_time_ms(&doc! {"maxTimeMS": -1.5}, "find").unwrap_err();
+        assert_eq!(err.code, 9);
+    }
+
+    #[test]
+    fn max_time_ms_accepts_absent_null_and_valid_numbers() {
+        for d in [
+            doc! {},
+            // 8.x: an explicit null means the field was not sent. 6.0 rejected it.
+            doc! {"maxTimeMS": Bson::Null},
+            doc! {"maxTimeMS": 0},
+            doc! {"maxTimeMS": 5000},
+            doc! {"maxTimeMS": 5000.0},
+            doc! {"maxTimeMS": 2147483647i64},
+            doc! {"maxTimeMS": Bson::Decimal128("5000".parse().unwrap())},
+        ] {
+            assert!(require_max_time_ms(&d, "find").is_ok(), "{d:?}");
+        }
     }
 
     #[test]

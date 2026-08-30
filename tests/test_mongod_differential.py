@@ -1507,6 +1507,91 @@ LOOKUP_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ),
 ]
 
+
+def _plain_cmd(db: Database, cmd: dict) -> str:
+    """A command reply reduced to what is comparable across the two servers."""
+    from pymongo.errors import OperationFailure
+
+    try:
+        db.command(cmd)
+    except OperationFailure as exc:
+        d = exc.details or {}
+        return f"{d.get('code')}/{_stable_code_name(d)}: {str(d.get('errmsg', ''))!r}"
+    return "ok"
+
+
+# ``maxTimeMS``, which is a GENERIC command field -- mongod validates it on
+# every command, and we used to check it on ``find`` alone, so 23 commands took
+# a wrong-typed value silently. The values here are deliberately either invalid
+# or large: a small VALID value (2, 5) makes mongod actually time the operation
+# out and answer 50 MaxTimeMSExpired, which we do not enforce -- a real but
+# separate gap (backlog §5), and a race against elapsed time that would make
+# this gate flaky.
+MAXTIME_SEED = [{"_id": 1, "a": 1}]
+
+_MAXTIME_BODIES: dict[str, dict] = {
+    "find": {"find": "c", "filter": {}},
+    "aggregate": {"aggregate": "c", "pipeline": [], "cursor": {}},
+    "count": {"count": "c"},
+    "distinct": {"distinct": "c", "key": "a"},
+    "insert": {"insert": "c", "documents": [{"z": 1}]},
+    "listCollections": {"listCollections": 1},
+    "ping": {"ping": 1},
+}
+
+_MAXTIME_VALUES: list[tuple[str, object]] = [
+    ("string", "x"),
+    ("object", {}),
+    ("array", [1]),
+    ("bool", True),
+    ("frac", 1.5),
+    ("frac-negative", -1.5),
+    ("nan", float("nan")),
+    ("inf", float("inf")),
+    ("huge-double", 1e100),
+    ("dec-frac", Decimal128("1.5")),
+    ("dec-nan", Decimal128("NaN")),
+    ("negative", -1),
+    ("over-int32", 2**31),
+    ("null", None),
+    ("valid", 1000),
+]
+
+
+def _maxtime_op(body: dict, value: object) -> Callable[[Database], object]:
+    """Bind the loop variables -- a lambda in the comprehension would capture
+    the last iteration's values for all 105 cases."""
+
+    def op(db: Database) -> str:
+        return _plain_cmd(db, {**body, "maxTimeMS": value})
+
+    return op
+
+
+MAXTIME_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    (f"maxtimems-{cname}-{vname}", MAXTIME_SEED, _maxtime_op(body, value))
+    for cname, body in _MAXTIME_BODIES.items()
+    for vname, value in _MAXTIME_VALUES
+] + [
+    # The null-means-absent rule next door, and its wrong-typed neighbour.
+    (
+        "createindexes-indexes-null",
+        MAXTIME_SEED,
+        lambda db: _plain_cmd(db, {"createIndexes": "c", "indexes": None}),
+    ),
+    (
+        "createindexes-indexes-missing",
+        MAXTIME_SEED,
+        lambda db: _plain_cmd(db, {"createIndexes": "c"}),
+    ),
+    (
+        "createindexes-indexes-int",
+        MAXTIME_SEED,
+        lambda db: _plain_cmd(db, {"createIndexes": "c", "indexes": 5}),
+    ),
+]
+
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
@@ -1515,6 +1600,7 @@ ALL_CASES = (
     + [("cursor", c) for c in CURSOR_CASES]
     + [("hint", c) for c in HINT_CASES]
     + [("lookup", c) for c in LOOKUP_CASES]
+    + [("maxtime", c) for c in MAXTIME_CASES]
 )
 
 

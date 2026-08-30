@@ -71,7 +71,6 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Some(bson::Bson::Document(c)) = doc.get("cursor") {
         argtypes::require_number(c, "batchSize", "cursor.batchSize")?;
     }
-    argtypes::require_max_time_ms(doc)?;
     // `aggregate: <coll>` (string) or `aggregate: 1` (collectionless).
     let coll = match doc.get("aggregate") {
         Some(Bson::String(s)) => Some(s.clone()),

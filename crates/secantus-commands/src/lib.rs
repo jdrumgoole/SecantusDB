@@ -740,6 +740,16 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
 
     match lookup(name) {
         Some(handler) => {
+            // `maxTimeMS` is a generic command field — mongod's IDL validates
+            // it on every command, so it belongs here rather than in the three
+            // handlers that used to call it (the other 21 took a wrong-typed
+            // value silently). Both neighbours were measured against an
+            // auth-enabled mongod 8.2.1: CommandNotFound (59) WINS over this
+            // check, so it sits inside the `Some(handler)` arm; this check WINS
+            // over authorization (13), so it sits above `authorize`.
+            if let Err(e) = argtypes::require_max_time_ms(doc, name) {
+                return e.into_reply();
+            }
             // Auth gating + RBAC run after CommandNotFound but before the
             // handler (mirrors `commands.py::dispatch`), so an unknown command
             // is still `59` rather than `13` even under `--auth`.
