@@ -202,7 +202,7 @@ fn insert_raw_path(
         return Ok(doc! {
             "ok": 0.0,
             "errmsg": "Write batch sizes must be between 1 and 100000. Got 0 operations.",
-            "code": 4,
+            "code": 16,
             "codeName": "InvalidLength",
         });
     }
@@ -253,8 +253,32 @@ fn insert_raw_path(
 }
 
 /// `insert` — batch document insert.
+/// mongod's empty-batch rule, which `insert` already applied and `update` /
+/// `delete` did not: an absent, non-array or empty write array is
+/// InvalidLength (16), not a no-op success. Both used to answer ok:1 with
+/// `n: 0`, telling the caller a batch it never sent had been applied.
+fn empty_batch(doc: &Document, field: &str) -> Result<(), CommandError> {
+    match doc.get(field) {
+        Some(Bson::Array(a)) if !a.is_empty() => Ok(()),
+        _ => Err(CommandError::new(
+            16,
+            "InvalidLength",
+            "Write batch sizes must be between 1 and 100000. Got 0 operations.",
+        )),
+    }
+}
+
 pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "insert")?;
+    argtypes::require_bool_field(doc, "ordered", "insert.ordered")?;
+    argtypes::require_object(doc, "writeConcern", "insert.writeConcern")?;
+    // `bypassDocumentValidation` is the bool-OR-number family (`1.5` is valid),
+    // not the strict bool of `ordered` on the same command.
+    argtypes::require_bool_or_number(
+        doc,
+        "bypassDocumentValidation",
+        "insert.bypassDocumentValidation",
+    )?;
     // Take the raw-BSON write side-channel first, releasing the `&mut` borrow
     // before the immutable `storage()` / `db_name` borrows below.
     let raw_docs = ctx.raw_insert_documents.take();
@@ -294,13 +318,16 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Decoded path: documents inline in the command body.
     let documents = match doc.get("documents") {
         Some(Bson::Array(a)) if !a.is_empty() => a,
-        // mongod rejects an empty/absent `documents` array with InvalidLength
-        // (4) — drivers gate command-error tests on this exact code/codeName.
+        // mongod rejects an empty/absent `documents` array with InvalidLength,
+        // which is code **16** — this said 4 (NoSuchKey) under a comment
+        // asserting drivers gate on "this exact code/codeName combo". They
+        // gate on the codeName; the code was simply wrong, and `bulkWrite` in
+        // this same crate already answered 16. Probed on mongod 8.2.11.
         _ => {
             return Ok(doc! {
                 "ok": 0.0,
                 "errmsg": "Write batch sizes must be between 1 and 100000. Got 0 operations.",
-                "code": 4,
+                "code": 16,
                 "codeName": "InvalidLength",
             })
         }
@@ -381,8 +408,21 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// `delete` — batch delete, one entry per `{q, limit}` spec.
 pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "delete")?;
+    argtypes::require_bool_field(doc, "ordered", "delete.ordered")?;
+    empty_batch(doc, "deletes")?;
+    for spec in array_field(doc, "deletes").iter() {
+        if let Bson::Document(spec) = spec {
+            argtypes::require_object(spec, "collation", "delete.deletes.collation")?;
+            argtypes::require_hint(spec, "hint")?;
+        }
+    }
     let storage = ctx.storage()?;
     let deletes = array_field(doc, "deletes");
+    for spec in deletes.iter() {
+        if let Bson::Document(spec) = spec {
+            crate::util::validate_write_hint(storage, &ctx.db_name, &coll, spec.get("hint"))?;
+        }
+    }
     let ordered = bool_field(doc, "ordered", true);
 
     let mut n = 0_i32;
@@ -433,6 +473,13 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// way mongod's `count` command (and the legacy `cursor.count()`) does.
 pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "count")?;
+    argtypes::require_object(doc, "query", "count.query")?;
+    // Two adjacent numeric slots, two families: `limit` answers BadValue with
+    // its own wording and rejects null, `skip` answers the ordinary numeric
+    // type error and accepts one. Probed on 8.2.11.
+    argtypes::require_count_limit(doc, "limit")?;
+    argtypes::require_number(doc, "skip", "count.skip")?;
+    argtypes::require_hint(doc, "hint")?;
     let storage = ctx.storage()?;
     let filter = doc_field(doc, "query");
     let collation = collation_of(doc);
@@ -601,9 +648,16 @@ fn ts_update_is_meta_only(u: Option<&Bson>, meta: &str) -> bool {
 
 pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_object(doc, "let", "update.let")?;
+    argtypes::require_bool_field(doc, "ordered", "update.ordered")?;
+    empty_batch(doc, "updates")?;
     let coll = coll_arg(doc, "update")?;
     let storage = ctx.storage()?;
     let updates = array_field(doc, "updates");
+    for spec in updates.iter() {
+        if let Bson::Document(spec) = spec {
+            crate::util::validate_write_hint(storage, &ctx.db_name, &coll, spec.get("hint"))?;
+        }
+    }
     let ordered = bool_field(doc, "ordered", true);
 
     let mut n = 0_i32;
@@ -658,6 +712,9 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // Strict bool, unlike findAndModify's `upsert`, which takes a bool OR any
         // number. Adjacent slots, different rules -- probed, not inferred.
         argtypes::require_bool_field(spec, "multi", "update.updates.multi")?;
+        argtypes::require_object(spec, "collation", "update.updates.collation")?;
+        argtypes::require_array(spec, "arrayFilters", "update.updates.arrayFilters")?;
+        argtypes::require_hint(spec, "hint")?;
 
         // MongoDB 8.0's per-spec `sort`: match in sort order and update the
         // FIRST one. Probed on 8.2.11 -- `multi: true` is rejected, and an
@@ -804,6 +861,9 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 .and_then(Bson::as_array)
                 .map(|a| a.iter().filter_map(|b| b.as_document().cloned()).collect())
                 .unwrap_or_default();
+            if let Some(e) = argtypes::array_filter_identifier_error(&u, &array_filters) {
+                return Ok(e.into_reply());
+            }
             storage.update_matching_array_filters(
                 &ctx.db_name,
                 &coll,

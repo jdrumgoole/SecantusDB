@@ -47,6 +47,53 @@ pub(crate) fn coll_arg(doc: &Document, cmd: &str) -> Result<String, CommandError
 
 /// A document-valued field, or an empty document when absent / wrong type
 /// (mirrors Python's `spec.get("q", {})` / `doc.get("query") or {}`).
+/// A `hint` on a WRITE command must name an index that exists.
+///
+/// `find` / `count` / `aggregate` route their hint through the storage layer,
+/// which rejects an unknown one; `update` / `delete` / `findAndModify` never
+/// passed theirs anywhere, so `hint: "nosuch"` was accepted and the write ran
+/// unhinted while mongod fails the command. Validating without planning off it
+/// is result-equivalent: a VALID hint selects an index, never a different set
+/// of documents.
+pub(crate) fn validate_write_hint(
+    storage: &dyn crate::Storage,
+    db: &str,
+    coll: &str,
+    hint: Option<&Bson>,
+) -> Result<(), CommandError> {
+    let hint = match hint {
+        None | Some(Bson::Null) => return Ok(()),
+        Some(h) => h,
+    };
+    let indexes = storage.list_indexes(db, coll).unwrap_or_default();
+    let known = match hint {
+        Bson::String(s) => {
+            s == "$natural"
+                || s == "_id_"
+                || indexes
+                    .iter()
+                    .any(|i| i.get_str("name").map(|n| n == s).unwrap_or(false))
+        }
+        Bson::Document(spec) => {
+            (spec.len() == 1 && (spec.contains_key("$natural") || spec.contains_key("_id")))
+                || indexes
+                    .iter()
+                    .any(|i| i.get_document("key").map(|k| k == spec).unwrap_or(false))
+        }
+        _ => return Ok(()), // the type error is raised by `argtypes::require_hint`
+    };
+    if known {
+        return Ok(());
+    }
+    // mongod renders its whole query plan here; we name the hint. The CODE
+    // matches, the text does not — see `tasks/backlog.md`.
+    Err(CommandError::new(
+        2,
+        "BadValue",
+        format!("hint {hint:?} does not correspond to an existing index"),
+    ))
+}
+
 pub(crate) fn doc_field(doc: &Document, key: &str) -> Document {
     doc.get(key)
         .and_then(Bson::as_document)

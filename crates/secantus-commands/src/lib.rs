@@ -579,16 +579,24 @@ fn is_write_concern_command(name: &str) -> bool {
 /// `"majority"` → `UnknownReplWriteConcern` (79); an integer `w` outside `[0, 50]`
 /// → `FailedToParse` (9). `None` when absent or well-formed. (`w > 1` still
 /// succeeds with a `writeConcernError` attached — see `attach_write_concern_error`.)
-fn validate_write_concern(doc: &Document) -> Option<CommandError> {
+fn validate_write_concern(doc: &Document, command: &str) -> Option<CommandError> {
     let wc = match doc.get("writeConcern") {
-        None => return None,
+        // An explicit `writeConcern: null` is ACCEPTED — the BSON-field family's
+        // null-means-absent rule. This used to reject it.
+        None | Some(Bson::Null) => return None,
         Some(Bson::Document(d)) => d,
-        Some(_) => {
+        Some(v) => {
+            // Was a bespoke "writeConcern must be a document"; mongod uses the
+            // ordinary BSON-field wording, naming the command and the type.
             return Some(CommandError::new(
                 14,
                 "TypeMismatch",
-                "writeConcern must be a document",
-            ))
+                format!(
+                    "BSON field '{command}.writeConcern' is the wrong type '{}', \
+                     expected type 'object'",
+                    secantus_core::query::bson_type_name(v)
+                ),
+            ));
         }
     };
     if let Some(w) = wc.get("w") {
@@ -810,7 +818,7 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             // (mirrors commands.py, which prepends _validate_write_concern to each
             // write handler). Reads don't carry a writeConcern.
             if is_write_concern_command(name) {
-                if let Some(e) = validate_write_concern(doc) {
+                if let Some(e) = validate_write_concern(doc, name) {
                     return e.into_reply();
                 }
             }
