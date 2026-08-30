@@ -1904,3 +1904,143 @@ def test_a_fractional_decimal_has_its_own_message() -> None:
     with pytest.raises(AggregateError) as exc:
         apply_pipeline([{"_id": 1}], [{"$skip": 1.5}])
     assert str(exc.value) == ("invalid argument to $skip stage: Expected an integer: $skip: 1.5")
+
+
+# --- runtime error fidelity: $replaceRoot / $replaceWith / $switch / $bucket ---
+#
+# All strings below are mongod 8.2.11's, probed verbatim. The differential gate
+# (tests/test_mongod_differential.py, AGGERR_CASES) re-derives them from a live
+# server, but only on a box that has one — CI has no mongod, so these pin the
+# same contract where the gate can only skip.
+
+
+def _agg_raises(pipeline: list, docs: list | None = None) -> AggregateError:
+    with pytest.raises(AggregateError) as exc:
+        apply_pipeline(list(docs if docs is not None else [{"_id": 1, "n": 1}]), pipeline)
+    return exc.value
+
+
+def test_replace_root_scalar_reports_mongod_code_and_message() -> None:
+    err = _agg_raises([{"$replaceRoot": {"newRoot": "$n"}}])
+    assert err.code == 40228
+    assert err.exec_error is True
+    # The double space after `expression` is mongod's own.
+    assert str(err) == (
+        "'newRoot' expression  must evaluate to an object, but resulting value was: 1. "
+        "Type of resulting value: 'int'. Input document: {n: 1}"
+    )
+
+
+def test_replace_with_names_its_own_subject() -> None:
+    """`$replaceWith` shares the code and shape but not the subject."""
+    err = _agg_raises([{"$replaceWith": "$n"}])
+    assert err.code == 40228
+    assert str(err).startswith("'replacement document'  must evaluate to an object")
+
+
+@pytest.mark.parametrize(
+    "value,rendered,type_name",
+    [
+        (1, "1", "int"),
+        (1.5, "1.5", "double"),
+        (Int64(2**40), "1099511627776", "long"),
+        (Decimal128("1.25"), "1.25", "decimal"),
+        ("abc", '"abc"', "string"),
+        (True, "true", "bool"),
+        ([1, {"a": 2}], "[1, {a: 2}]", "array"),
+    ],
+)
+def test_replace_root_renders_values_as_mongod_does(value, rendered, type_name) -> None:
+    err = _agg_raises([{"$replaceRoot": {"newRoot": "$n"}}], [{"_id": 1, "n": value}])
+    assert f"resulting value was: {rendered}. " in str(err)
+    assert f"Type of resulting value: '{type_name}'." in str(err)
+
+
+@pytest.mark.parametrize(
+    "doc,new_root,expected",
+    [
+        # Only what the expression reads survives, and `_id` is not automatic.
+        ({"_id": 1, "n": 1, "s": "hi"}, "$n", "{n: 1}"),
+        ({"_id": 7, "n": 1}, {"$add": ["$_id", "$n"]}, "{_id: 7, n: 1}"),
+        ({"_id": 1}, {"$literal": 5}, "{}"),
+        # An absent path is omitted, not rendered null.
+        ({"_id": 1, "n": 1}, {"$ifNull": ["$missing", 5]}, "{}"),
+        ({"_id": 1, "n": 1}, {"$ifNull": ["$a.b", 5]}, "{}"),
+        # A dotted path prunes into the sub-document; a referenced parent wins.
+        ({"_id": 1, "a": {"b": 5, "c": 6}}, "$a.b", "{a: {b: 5}}"),
+        # Order follows the DOCUMENT, not the order the expression mentions.
+        (
+            {"_id": 1, "a": 1, "b": 2},
+            {"$concat": [{"$toString": "$b"}, {"$toString": "$a"}]},
+            "{a: 1, b: 2}",
+        ),
+        (
+            {"_id": 1, "a": {"b": 1, "c": 2, "d": 3}},
+            {"$concat": [{"$toString": "$a.c"}, {"$toString": "$a.b"}]},
+            "{a: {b: 1, c: 2}}",
+        ),
+        # `$$ROOT.a` is a path read like `$a`.
+        ({"_id": 1, "a": 1, "b": 2}, {"$toString": "$$ROOT.a"}, "{a: 1}"),
+    ],
+)
+def test_replace_root_input_document_is_dependency_pruned(doc, new_root, expected) -> None:
+    """mongod names the PRUNED input document, not the stored one."""
+    err = _agg_raises([{"$replaceRoot": {"newRoot": new_root}}], [doc])
+    assert str(err).endswith(f"Input document: {expected}")
+
+
+def test_switch_no_matching_branch_at_runtime() -> None:
+    """A field-referencing case cannot be folded, so it fails per document."""
+    from secantus.expressions import ExpressionError
+
+    with pytest.raises(ExpressionError) as exc:
+        apply_pipeline(
+            [{"_id": 1, "n": 1}],
+            [
+                {
+                    "$addFields": {
+                        "x": {"$switch": {"branches": [{"case": {"$gt": ["$n", 99]}, "then": 1}]}}
+                    }
+                }
+            ],
+        )
+    assert exc.value.code == 40066
+    assert str(exc.value) == (
+        "$switch could not find a matching branch for an input, and no default was specified."
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [False, 0, None, {"$gt": [1, 99]}, {"$and": [True, False]}, {"$literal": False}],
+)
+def test_switch_with_only_constant_cases_is_folded(case) -> None:
+    """mongod rejects these during optimization, so they fire over NO documents
+    at all — where we used to return an empty cursor and `ok: 1`."""
+    err = _agg_raises(
+        [{"$addFields": {"x": {"$switch": {"branches": [{"case": case, "then": 1}]}}}}], []
+    )
+    assert err.code == 40069
+    assert str(err) == (
+        "Failed to optimize pipeline :: caused by :: Cannot execute a switch statement "
+        "where all the cases evaluate to false without a default"
+    )
+
+
+def test_switch_folding_is_blocked_by_a_field_reference_or_a_default() -> None:
+    """One field-referencing case defers the whole thing to execution, and a
+    `default` makes it legal outright — neither may fold."""
+    mixed = {"$switch": {"branches": [{"case": False, "then": 1}, {"case": "$n", "then": 2}]}}
+    assert apply_pipeline([], [{"$addFields": {"x": mixed}}]) == []
+    with_default = {"$switch": {"branches": [{"case": False, "then": 1}], "default": 9}}
+    assert apply_pipeline([{"_id": 1}], [{"$addFields": {"x": with_default}}])[0]["x"] == 9
+
+
+def test_bucket_out_of_range_value_is_an_execution_error() -> None:
+    """It carries mongod's code AND its executor wrapper — the wrapper is what
+    the command layer keys on, and it was missing."""
+    err = _agg_raises(
+        [{"$bucket": {"groupBy": "$n", "boundaries": [0, 2, 4]}}], [{"_id": 1, "n": 99}]
+    )
+    assert err.code == 7158303
+    assert err.exec_error is True

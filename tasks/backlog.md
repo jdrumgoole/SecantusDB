@@ -282,8 +282,16 @@ mongod answers 5733201. `update::arith_type_error` (2026-08-25) is the worked
 template. The porting half is done; do not plan a campaign around it without
 re-measuring first.
 
-- [ ] **`$replaceRoot` with a scalar `newRoot` answers code 14 on the PYTHON
-      server; mongod answers 40228 — and the message is unwrapped.** Measured
+- [x] **`$replaceRoot` with a scalar `newRoot` answers code 14 on the PYTHON
+      server; mongod answers 40228 — and the message is unwrapped. FIXED
+      2026-08-31.** Code, wrapper and message all match 8.2.11 now, and
+      `$replaceWith` with them (it shares the shape but names a different
+      subject, `'replacement document'`). The one part not visible from the
+      measurement below: the `Input document:` half is mongod's
+      **dependency-pruned** document, not the stored one — pruned to the fields
+      the expression reads, in DOCUMENT order, with an absent path omitted and a
+      referenced parent subsuming a referenced child. See
+      `aggregate._input_document`. *Original measurement:*
       2026-08-30 against mongod 8.2.11 (`:27019`) with the Python server on
       `:27018`, pipeline `[{"$replaceRoot": {"newRoot": "$n"}}]` over
       `{n: 1}`:
@@ -303,8 +311,13 @@ re-measuring first.
       `exec_error` flag is what makes `commands.py` add the `Executor error
       during aggregate command on namespace:` prefix.
 
-- [ ] **`$bucket` with no `default` and an out-of-range value has mongod's CODE
-      but not its wrapper prefix (Python server).** Measured in the same
+- [x] **`$bucket` with no `default` and an out-of-range value has mongod's CODE
+      but not its wrapper prefix (Python server). FIXED 2026-08-31** — the
+      `$bucket` raise took `exec_error=True`. The related `$switch` raise named
+      below needed more than that flag: it already had the wrapper (an
+      `ExpressionError` always qualifies) and instead lacked mongod's code
+      (40066) and wording, plus a parse-time rejection it never did at all —
+      see the `$switch` folding entry below. *Original measurement:*
       2026-08-30 run: both servers answer 7158303 with the text `$switch could
       not find a matching branch for an input, and no default was specified.`,
       but mongod prefixes it with `Executor error during aggregate command on
@@ -331,9 +344,27 @@ boxes lagged:
 Genuinely open: **`$meta` projection values** (narrowed 2026-08-28 — the
 inclusion-mode bug under it is fixed; what is left is the uncomputed metadata
 value plus `{$meta: "sortKey"}` in a *find* projection answering rows where
-mongod errors code 2), and the **aggregation error-wrapper prefix**
-(characterised 2026-08-25, needs constant-fold modelling; deliberately
-deferred).
+mongod errors code 2), and the **aggregation error-wrapper prefix** for
+operators whose *arguments* constant-fold (`$divide`, `$ln`) — still deferred,
+but see the correction below before deferring another one.
+
+- [x] **A constant-foldable `$switch` was not rejected at all — FIXED
+      2026-08-31.** Filed under the wrapper-prefix entry as message text; it was
+      a wrong ANSWER. mongod folds a `$switch` whose every case is constant and
+      that has no `default`, so it answers 40069 **while optimizing** — over an
+      EMPTY collection, with no document read. We returned an empty cursor and
+      `ok: 1`, and only errored once a document happened to exist, making the
+      behaviour depend on the data rather than the query. Probed against 8.2.11:
+      a document field reference in any case blocks folding, a variable
+      (`$$NOW`) does not, `$literal` does not, and a `default` makes it legal.
+      `aggregate._fold_constant_switches` models it for `$switch` only.
+
+      **Lesson for the remaining wrapper-prefix work: probe against an empty
+      collection.** It is the cheapest way to tell a parse/optimize-time error
+      from an execution-time one; comparing populated collections alone reports
+      the two as merely differing in wording, which is exactly how this sat
+      misfiled. If the construct being folded can itself raise, the divergence
+      reaches the answer and is not cosmetic.
 
 Add to this class the item measured 2026-08-28 and filed in §3:
 **wrong-typed command arguments** — 0 crashes after #1080, but **42 divergences**

@@ -198,14 +198,34 @@ Sub-ms `ORDER BY` is adjacent to work already landed and should be cheap.
       applied to 3 commands instead of 1), fixed on both servers in the same PR.
       That is one slot out of the sweep's 87, so it hints the class ports across
       wholesale rather than settling it.
-- [ ] **Aggregation runtime errors lack mongod's wrapper prefix.** Codes match;
-      the message doesn't. mongod picks between
-      `Failed to optimize pipeline :: caused by ::` and
+- [ ] **Aggregation runtime errors lack mongod's wrapper prefix — STILL OPEN in
+      general, but the framing "message text only" was WRONG and cost a real
+      bug three weeks (measured 2026-08-31 against 8.2.11).** mongod picks
+      between `Failed to optimize pipeline :: caused by ::` and
       `PlanExecutor error during aggregation :: caused by ::` by whether it could
       **constant-fold** the expression — all-literal args fold, any field
-      reference doesn't (probed both ways on `$divide` and `$ln`). Closing it
-      means modelling constant folding, for message text only.
-      **Deliberately deferred**; listed so the analysis isn't redone.
+      reference doesn't (probed both ways on `$divide` and `$ln`).
+
+      **Folding is not cosmetic where the folded expression is itself the
+      error.** A `$switch` with only constant cases and no `default` is rejected
+      during optimization, so mongod answers 40069 **over an empty collection**,
+      with no document ever read. We returned an empty cursor and `ok: 1` — the
+      "argument accepted and ignored" shape — and only failed once a document
+      happened to exist. That is a wrong ANSWER, not wrong wording, and it hid
+      here because the entry said the gap was message text. **Fixed 2026-08-31**
+      (`aggregate._fold_constant_switches`), along with the execution-time arm
+      (40066, was a generic `14 TypeMismatch`).
+
+      What remains deferred is genuinely message-only: modelling folding for
+      operators whose *arguments* fold (`$divide`, `$ln`) so the right one of
+      the two prefixes is chosen. Before deferring the next one, check whether
+      the construct being folded can itself raise — if it can, the divergence
+      reaches the answer.
+
+      Method note: probe against an **empty collection**. That is the single
+      cheapest way to separate a parse/optimize-time error from an
+      execution-time one, and comparing populated collections alone reports the
+      two as merely differing in wording.
 - [ ] **The Rust error-code class — SPEC-LEVEL HALF DONE (2026-08-30), runtime
       half open.** A construct the Rust engine can't do surfaces as generic
       `BadValue` (2) rather than mongod's typed code.
@@ -240,7 +260,24 @@ Sub-ms `ORDER BY` is adjacent to work already landed and should be cheap.
       | `$bucket` with no `default` | 7158303 | correct text, **wrapper prefix missing** | message half only |
       | `$replaceRoot` scalar `newRoot` | **14** (want 40228) | `$replaceRoot newRoot must evaluate to a document`, **unwrapped**; mongod says `'newRoot' expression  must evaluate to an object, but resulting value was: 1. Type of resulting value: 'int'. Input document: {n: 1}` (mongod's own double space after `expression`) | code + message |
 
-      **The Python half needs no new machinery — it is two raise sites.**
+      **The Python half is DONE (2026-08-31).** All three cases above now match
+      8.2.11 exactly, plus `$replaceWith`, and 30 cases pin it in the
+      differential gate (`AGGERR_CASES`). Two corrections to the analysis below,
+      both found by running it:
+
+      * The `$switch` case was recorded as needing only `exec_error=True`. It
+        already had the wrapper (an `ExpressionError` always qualifies); what it
+        lacked was mongod's code (40066) and wording — and, in the foldable
+        form, a parse-time rejection it never performed at all (see the entry
+        above).
+      * `$replaceRoot`'s message embeds the **dependency-pruned** input
+        document, not the stored one: `{_id: 1, n: 1, s: "hi"}` with
+        `newRoot: "$n"` reports `{n: 1}`. Field order follows the DOCUMENT, a
+        referenced parent subsumes a referenced child, an absent path is
+        omitted, and `$$ROOT.a` counts as a path read. None of that is derivable
+        from the code; all of it came from the oracle.
+
+      *Original analysis, kept because its shape was right:*
       `AggregateError` already takes `code=` and `exec_error=True`, and
       `commands.py` (the `apply_pipeline` except arm) already applies mongod's
       `Executor error during aggregate command on namespace: <ns> :: caused by ::`

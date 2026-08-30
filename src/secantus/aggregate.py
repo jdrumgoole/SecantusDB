@@ -16,6 +16,7 @@ from secantus.expressions import (
     MISSING,
     ExpressionError,
     UnknownExpressionOperatorError,
+    _bool,
     _bson_type_name,
     _fmt_double,
     evaluate,
@@ -160,7 +161,16 @@ def apply_pipeline(
     docs: list[dict[str, Any]],
     pipeline: list[dict[str, Any]],
     ctx: PipelineContext | None = None,
+    *,
+    fold_candidates: list[list[Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    """Run ``pipeline`` over ``docs``.
+
+    ``fold_candidates`` is the result of ``_switch_fold_candidates(pipeline)``,
+    for a caller that runs the same pipeline repeatedly and has hoisted that
+    structural scan out of its loop (``$lookup``'s pipeline form). Omit it and
+    the scan runs here.
+    """
     ctx = ctx or _NULL_CTX
     # ``$$NOW``: a Date constant for the whole pipeline execution
     # (mongod semantics). Seeded into vars so it resolves through the
@@ -172,6 +182,11 @@ def apply_pipeline(
             ctx = PipelineContext(vars={"NOW": now})
         else:
             ctx.vars["NOW"] = now
+    # Optimization-time rejections, before any document is touched -- mongod
+    # answers these over an empty collection too.
+    if fold_candidates is None:
+        fold_candidates = _switch_fold_candidates(pipeline, [])
+    _apply_switch_folds(fold_candidates, ctx.vars)
     # ``$out`` / ``$merge`` may only appear as the final stage. mongod
     # rejects a non-terminal write stage with Location40601 before
     # executing anything (mongo-cxx-driver's "out fails when not last").
@@ -1164,26 +1179,236 @@ def _stage_fill(
     return out
 
 
+def _render_compact(v: Any) -> str:
+    """A value as mongod prints it in a ``$replaceRoot`` 40228 message.
+
+    Distinct from ``update.py``'s ``_render_bson_value``, which pads its
+    brackets (``{ a: 1 }``) because the ``PathNotViable`` message it feeds
+    does. This one does not (``{a: 1}``), and prints an ObjectId as bare hex
+    rather than in constructor form -- both probed against mongod 8.2.11.
+    """
+    import bson
+
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if v is None:
+        return "null"
+    if isinstance(v, str):
+        return f'"{v}"'
+    if isinstance(v, float):
+        return _fmt_double(v)
+    if isinstance(v, _dt.datetime):
+        # mongod's ISO-8601 with milliseconds and a literal Z.
+        return v.strftime("%Y-%m-%dT%H:%M:%S.") + f"{v.microsecond // 1000:03d}Z"
+    if isinstance(v, bson.ObjectId):
+        return str(v)
+    if isinstance(v, Mapping):
+        return "{" + ", ".join(f"{k}: {_render_compact(x)}" for k, x in v.items()) + "}"
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(_render_compact(x) for x in v) + "]"
+    return str(v)
+
+
+# Sentinel: the expression depends on the whole document (a bare ``$$ROOT``),
+# so no pruning is possible.
+_ALL_FIELDS = object()
+
+
+def _expression_field_paths(expr: Any, out: set[str]) -> Any:
+    """Collect the document field paths ``expr`` reads, for ``_input_document``.
+
+    Returns ``_ALL_FIELDS`` if the expression reads the whole document.
+    """
+    if isinstance(expr, str):
+        if expr.startswith("$$"):
+            # ``$$ROOT.a`` / ``$$CURRENT.a`` are path reads like ``$a``; a bare
+            # ``$$ROOT`` (or any other system/user variable) is not prunable.
+            head, _, rest = expr[2:].partition(".")
+            if head in ("ROOT", "CURRENT") and rest:
+                out.add(rest)
+                return None
+            return _ALL_FIELDS if head in ("ROOT", "CURRENT") else None
+        if expr.startswith("$"):
+            out.add(expr[1:])
+        return None
+    if isinstance(expr, Mapping):
+        if len(expr) == 1 and "$literal" in expr:
+            return None
+        for value in expr.values():
+            if _expression_field_paths(value, out) is _ALL_FIELDS:
+                return _ALL_FIELDS
+        return None
+    if isinstance(expr, (list, tuple)):
+        for item in expr:
+            if _expression_field_paths(item, out) is _ALL_FIELDS:
+                return _ALL_FIELDS
+    return None
+
+
+def _input_document(doc: Mapping[str, Any], expr: Any) -> dict[str, Any]:
+    """The document mongod names in ``Input document:`` -- the input pruned to
+    the fields the expression actually reads.
+
+    mongod runs its dependency analysis before the stage, so the message names
+    the *pruned* document, not the stored one: ``{_id: 1, n: 1, s: "hi"}`` with
+    ``newRoot: "$n"`` reports ``{n: 1}``, and ``_id`` appears only when the
+    expression reads it. Probed against mongod 8.2.11 -- field order follows
+    the DOCUMENT, not the order the expression mentions them, an absent path
+    is omitted rather than rendered null, and a referenced parent subsumes a
+    referenced child (``$a.b`` plus ``$a`` reports all of ``a``).
+    """
+    from secantus.projection import apply_projection
+
+    paths: set[str] = set()
+    if _expression_field_paths(expr, paths) is _ALL_FIELDS:
+        return dict(doc)
+    # A path whose ancestor is also read adds nothing -- projecting both would
+    # narrow `a` to `a.b`, where mongod keeps the whole of `a`.
+    pruned = {
+        p for p in paths if not any(other != p and p.startswith(other + ".") for other in paths)
+    }
+    if not pruned:
+        return {}
+    spec: dict[str, Any] = {p: 1 for p in pruned}
+    if "_id" not in pruned:
+        spec["_id"] = 0
+    # ``apply_projection`` emits in SPEC order; mongod's message follows the
+    # DOCUMENT, at every level (`$a.c` before `$a.b` over `{a: {b, c, d}}`
+    # still reports `{a: {b, c}}`). ``pruned`` is a set, so spec order is not
+    # even stable between runs.
+    return _reorder_like(apply_projection(dict(doc), spec), doc)
+
+
+def _reorder_like(projected: Any, source: Any) -> Any:
+    """``projected`` with every object's keys back in ``source``'s order."""
+    if isinstance(projected, Mapping) and isinstance(source, Mapping):
+        position = {key: i for i, key in enumerate(source)}
+        return {
+            key: _reorder_like(projected[key], source.get(key))
+            for key in sorted(projected, key=lambda k: position.get(k, len(position)))
+        }
+    if isinstance(projected, list) and isinstance(source, list):
+        return [
+            _reorder_like(item, source[i] if i < len(source) else None)
+            for i, item in enumerate(projected)
+        ]
+    return projected
+
+
+def _switch_fold_candidates(node: Any, out: list[list[Any]]) -> list[list[Any]]:
+    """Every ``$switch`` in ``node`` that mongod could fold away at parse time,
+    as its list of ``case`` expressions.
+
+    mongod optimizes the pipeline before executing it, so a ``$switch`` whose
+    every ``case`` is constant, that has no ``default``, and whose cases are all
+    falsy is rejected during optimization -- **even over an empty collection**,
+    where no document is ever processed. We used to return an empty cursor and
+    ``ok: 1`` there, swallowing an error the user had earned.
+
+    Probed against mongod 8.2.11: a **document field reference** in any case is
+    what blocks folding. Variables do not -- both ``$$NOW`` and a ``$lookup``
+    ``let`` binding still fold -- and nor does wrapping in ``$literal``. A
+    ``default`` makes it legal outright, and a single field-referencing case
+    defers the whole thing to execution (40066, raised by
+    ``expressions._op_switch``).
+
+    Split from the evaluation half deliberately: this walk is structural and
+    depends only on the pipeline, while the verdict depends on the variables in
+    scope. ``$lookup``'s pipeline form runs its sub-pipeline once per OUTER
+    document, so a combined pass cost ~16us per document there -- several times
+    the deepcopy already on that path -- for a construct almost no pipeline
+    contains. The scan is hoisted out of that loop; only the (usually empty)
+    candidate list is re-evaluated.
+
+    Only ``$switch`` is modelled. mongod folds constants generally, and doing
+    that in full is the deferred item in ``tasks/remaining-work-plan.md`` 1b;
+    this covers the one construct where folding changes the ANSWER rather than
+    just the message.
+    """
+    if isinstance(node, Mapping):
+        if len(node) == 1 and "$literal" in node:
+            return out
+        switch = node.get("$switch")
+        if isinstance(switch, Mapping) and "default" not in switch:
+            branches = switch.get("branches")
+            if isinstance(branches, list) and branches:
+                cases = [b["case"] for b in branches if isinstance(b, Mapping) and "case" in b]
+                if len(cases) == len(branches) and all(_is_constant_expression(c) for c in cases):
+                    out.append(cases)
+        for value in node.values():
+            _switch_fold_candidates(value, out)
+    elif isinstance(node, (list, tuple)):
+        for value in node:
+            _switch_fold_candidates(value, out)
+    return out
+
+
+def _apply_switch_folds(candidates: list[list[Any]], vars: dict[str, Any]) -> None:
+    """Raise mongod's 40069 for any candidate whose cases are all falsy."""
+    for cases in candidates:
+        try:
+            fires = any(_bool(evaluate(c, {}, vars)) for c in cases)
+        except (
+            ExpressionError,
+            QueryError,
+            ValueError,
+            TypeError,
+            ArithmeticError,
+            LookupError,
+        ):
+            # Not foldable after all (an unbound variable, say) -- leave it to
+            # execution rather than reporting an optimization error we invented.
+            fires = True
+        if not fires:
+            raise AggregateError(
+                "Failed to optimize pipeline :: caused by :: Cannot execute a "
+                "switch statement where all the cases evaluate to false "
+                "without a default",
+                code=40069,
+            )
+
+
+def _is_constant_expression(expr: Any) -> bool:
+    """True when ``expr`` reads no document field, so mongod can fold it."""
+    paths: set[str] = set()
+    return _expression_field_paths(expr, paths) is not _ALL_FIELDS and not paths
+
+
 def _stage_replace_root(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping) or "newRoot" not in spec:
         raise AggregateError("$replaceRoot requires {newRoot: <expression>}")
-    return [_replace_root_one(d, spec["newRoot"], ctx.vars) for d in docs]
+    return [_replace_root_one(d, spec["newRoot"], ctx.vars, "'newRoot' expression") for d in docs]
 
 
 def _stage_replace_with(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    return [_replace_root_one(d, spec, ctx.vars) for d in docs]
+    return [_replace_root_one(d, spec, ctx.vars, "'replacement document'") for d in docs]
 
 
 def _replace_root_one(
-    doc: dict[str, Any], new_root_expr: Any, vars: dict[str, Any]
+    doc: dict[str, Any],
+    new_root_expr: Any,
+    vars: dict[str, Any],
+    subject: str,
 ) -> dict[str, Any]:
     new_root = evaluate(new_root_expr, doc, vars)
     if not isinstance(new_root, Mapping):
-        raise AggregateError("$replaceRoot newRoot must evaluate to a document")
+        # mongod names the stage's own subject -- `'newRoot' expression` for
+        # `$replaceRoot`, `'replacement document'` for `$replaceWith` -- and
+        # the double space after it is mongod's, not a typo here (8.2.11).
+        raise AggregateError(
+            f"{subject}  must evaluate to an object, but resulting value was: "
+            f"{_render_compact(new_root)}. "
+            f"Type of resulting value: '{_bson_type_name(new_root)}'. "
+            f"Input document: {_render_compact(_input_document(doc, new_root_expr))}",
+            code=40228,
+            exec_error=True,
+        )
     return dict(new_root)
 
 
@@ -2049,6 +2274,11 @@ def _stage_lookup_pipeline(
             else None
         )
 
+    # The sub-pipeline runs once per OUTER document, so its structural
+    # constant-fold scan is hoisted here; only the verdict depends on the
+    # per-document `let` bindings.
+    sub_folds = _switch_fold_candidates(sub_pipeline, [])
+
     out: list[dict[str, Any]] = []
     for doc in docs:
         # FIELD-VALUE position: a `let` var bound from an absent field stays
@@ -2074,7 +2304,7 @@ def _stage_lookup_pipeline(
                 foreign_docs = ctx.storage.find_matching(ctx.db_name, from_coll, {})
             candidates = list(foreign_docs)
         sub_ctx = ctx.with_vars(bound)
-        joined = apply_pipeline(candidates, sub_pipeline, sub_ctx)
+        joined = apply_pipeline(candidates, sub_pipeline, sub_ctx, fold_candidates=sub_folds)
         new = copy.deepcopy(doc)
         _set_as_field(new, as_field, joined)
         out.append(new)
@@ -2454,6 +2684,7 @@ def _stage_bucket(
                     "$switch could not find a matching branch for an input, and no "
                     "default was specified.",
                     code=7158303,
+                    exec_error=True,
                 )
             buckets[default].append(d)
 

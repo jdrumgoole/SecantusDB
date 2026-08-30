@@ -963,7 +963,17 @@ def _op_switch(arg: Any, ctx: _Ctx) -> Any:
             return _eval(branch["then"], ctx)
     if "default" in arg:
         return _eval(arg["default"], ctx)
-    raise ExpressionError("$switch found no matching branch and no default")
+    # mongod 8.2.11 answers 40066 here, wrapped in its executor prefix. It
+    # answers a DIFFERENT error -- 40069, "Cannot execute a switch statement
+    # where all the cases evaluate to false without a default", under
+    # `Failed to optimize pipeline` -- when every case is a constant it can
+    # fold at parse time. Reproducing that split means modelling constant
+    # folding for message text alone; see `tasks/remaining-work-plan.md` 1b.
+    raise ExpressionError(
+        "$switch could not find a matching branch for an input, and no default was specified.",
+        code=40066,
+        code_name="Location40066",
+    )
 
 
 # Mirror of query.py's pattern-length cap. Python `re` has no match

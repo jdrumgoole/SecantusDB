@@ -27,6 +27,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -247,10 +248,14 @@ def _agg_err(db: Database, pipeline: list) -> str:
     mongod wraps a *runtime* aggregation error in
     ``PlanExecutor error during aggregation :: caused by :: <msg>`` (and a
     constant-folded one in ``Failed to optimize pipeline :: caused by ::``).
-    We emit the bare message — a separately tracked gap, since reproducing the
-    choice means modelling mongod's constant folding for message text alone.
-    Strip the wrapper on both sides so these cases assert the code and the
-    message that matter, not the known-missing prefix.
+    These cases strip the wrapper on both sides so they assert the code and the
+    message rather than the prefix.
+
+    Do not read that as "the prefix is unreachable" — ``AGGERR_CASES`` below
+    asserts the FULL message, wrapper included, for the stages that carry it.
+    What is still deferred is modelling mongod's constant folding in general;
+    ``$switch``, where folding changes the answer and not just the text, is
+    handled (see ``aggregate._fold_constant_switches``).
     """
     from pymongo.errors import OperationFailure
 
@@ -1592,6 +1597,106 @@ MAXTIME_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
 ]
 
 
+def _agg_err_full(db: Database, pipeline: list) -> str:
+    """Like ``_agg_err``, but keeps mongod's wrapper prefix.
+
+    The namespace inside the executor prefix names the case's own database, so
+    both servers render the same string only after it is normalised away.
+    """
+    from pymongo.errors import OperationFailure
+
+    try:
+        return f"ok:{len(list(db.c.aggregate(pipeline)))}"
+    except OperationFailure as exc:
+        msg = str(exc.details.get("errmsg", ""))
+        msg = re.sub(r"namespace: [^ ]+", "namespace: <ns>", msg)
+        return f"{exc.code}/{_stable_code_name(exc.details)}: {msg}"
+
+
+def _rr(new_root: object) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(db, [{"$replaceRoot": {"newRoot": new_root}}])
+
+
+def _rw(expr: object) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(db, [{"$replaceWith": expr}])
+
+
+def _switch(case: object, **extra: object) -> Callable[[Database], object]:
+    body: dict = {"branches": [{"case": case, "then": 1}], **extra}
+    return lambda db: _agg_err_full(db, [{"$addFields": {"x": {"$switch": body}}}])
+
+
+ONE = [{"_id": 1, "n": 1}]
+
+# `$replaceRoot`/`$replaceWith` runtime failure (40228), `$switch` with no
+# matching branch (40066 at execution, 40069 when mongod folds it away), and
+# `$bucket`'s out-of-range value (7158303). All probed against mongod 8.2.11.
+#
+# The `Input document:` half of the 40228 message is mongod's DEPENDENCY-PRUNED
+# document, not the stored one, so several cases exist only to pin that: which
+# fields survive, in which order, and how a dotted or absent path behaves.
+AGGERR_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    ("rr-int", ONE, _rr("$n")),
+    ("rr-string", [{"_id": 1, "n": "abc"}], _rr("$n")),
+    ("rr-double", [{"_id": 1, "n": 1.5}], _rr("$n")),
+    ("rr-long", [{"_id": 1, "n": Int64(2**40)}], _rr("$n")),
+    ("rr-decimal", [{"_id": 1, "n": Decimal128("1.25")}], _rr("$n")),
+    ("rr-bool", [{"_id": 1, "n": True}], _rr("$n")),
+    ("rr-array", [{"_id": 1, "n": [1, {"a": 2}]}], _rr("$n")),
+    ("rr-objectid", [{"_id": ObjectId("0123456789ab0123456789ab"), "n": 1}], _rr("$_id")),
+    ("rr-date", [{"_id": 1, "n": datetime(2026, 8, 31, 12, 0, 0)}], _rr("$n")),
+    ("rr-null-literal", ONE, _rr({"$literal": None})),
+    # Pruning: unreferenced fields are dropped, and `_id` is not automatic.
+    ("rr-prunes-unreferenced", [{"_id": 1, "n": 1, "s": "hi", "arr": [1, 2]}], _rr("$n")),
+    ("rr-keeps-referenced-id", [{"_id": 7, "n": 1}], _rr({"$add": ["$_id", "$n"]})),
+    ("rr-no-field-refs", [{"_id": 1}], _rr({"$literal": 5})),
+    ("rr-absent-field", ONE, _rr({"$ifNull": ["$missing", 5]})),
+    ("rr-absent-parent", ONE, _rr({"$ifNull": ["$a.b", 5]})),
+    ("rr-dotted-path", [{"_id": 1, "a": {"b": 5, "c": 6}}], _rr("$a.b")),
+    (
+        "rr-parent-subsumes-child",
+        [{"_id": 1, "a": {"b": 1, "c": 2}}],
+        _rr({"$concat": [{"$toString": "$a.b"}, {"$toString": {"$type": "$a"}}]}),
+    ),
+    ("rr-root-dot-field", [{"_id": 1, "a": 1, "b": 2}], _rr({"$toString": "$$ROOT.a"})),
+    # Order follows the DOCUMENT, not the order the expression mentions fields.
+    (
+        "rr-doc-order",
+        [{"_id": 1, "a": 1, "b": 2}],
+        _rr({"$concat": [{"$toString": "$b"}, {"$toString": "$a"}]}),
+    ),
+    (
+        "rr-doc-order-nested",
+        [{"_id": 1, "a": {"b": 1, "c": 2, "d": 3}}],
+        _rr({"$concat": [{"$toString": "$a.c"}, {"$toString": "$a.b"}]}),
+    ),
+    # `$replaceWith` names a different subject in the same message.
+    ("rw-scalar", ONE, _rw("$n")),
+    ("rw-literal", ONE, _rw({"$literal": 5})),
+    # `$switch`: folded at parse time (40069) vs discovered per document (40066).
+    ("switch-field-ref", ONE, _switch({"$gt": ["$n", 99]})),
+    ("switch-literal-false", ONE, _switch(False)),
+    ("switch-literal-all-const", ONE, _switch({"$gt": [1, 99]})),
+    ("switch-with-default", ONE, _switch(False, default=9)),
+    # The fold fires with nothing to execute over -- an empty seed is the point.
+    ("switch-folds-on-empty", [], _switch(False)),
+    ("switch-field-ref-on-empty", [], _switch({"$gt": ["$n", 99]})),
+    # `$bucket` reuses mongod's `$switch` text and takes the executor wrapper.
+    (
+        "bucket-out-of-range",
+        [{"_id": 1, "n": 99}],
+        lambda db: _agg_err_full(db, [{"$bucket": {"groupBy": "$n", "boundaries": [0, 2, 4]}}]),
+    ),
+    (
+        "bucket-with-default",
+        [{"_id": 1, "n": 99}],
+        lambda db: _agg_err_full(
+            db, [{"$bucket": {"groupBy": "$n", "boundaries": [0, 2, 4], "default": "other"}}]
+        ),
+    ),
+]
+
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
@@ -1601,6 +1706,7 @@ ALL_CASES = (
     + [("hint", c) for c in HINT_CASES]
     + [("lookup", c) for c in LOOKUP_CASES]
     + [("maxtime", c) for c in MAXTIME_CASES]
+    + [("aggerr", c) for c in AGGERR_CASES]
 )
 
 
