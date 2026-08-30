@@ -20,9 +20,12 @@ These are the things that cost time to rediscover.
 
 **Oracles — both are the point of this plan.**
 
-* `mongod` is on `PATH` (Homebrew `@6.0` symlink, reports 6.0.16). Start one on
-  `127.0.0.1:27019` and diff against it. `tests/test_mongod_differential.py`
-  (57 cases) is the standing harness; run it with `-m differential`.
+* `mongod` is on `PATH` — **it reports 8.2.11 as of 2026-08-30**, not the 6.0.16
+  this file was written against; the error surface was retargeted to 8.x on
+  2026-08-29 (see `CLAUDE.md`). Measurements below dated against 6.0.16 stay
+  true about *that* version — re-probe before relying on one. Start a server on
+  `127.0.0.1:27019` and diff against it. `tests/test_mongod_differential.py` is
+  the standing harness; run it with `-m differential`.
 * **A live PostgreSQL 14 runs on this box** at `host=127.0.0.1 port=5432
   dbname=postgres user=jdrumgoole`. `SECANTUS_PG_ORACLE_DSN` points
   `test_subms_predicates_match_real_postgres` at it. It settled six SQL claims
@@ -175,7 +178,8 @@ Every item here was reproduced against an oracle in August 2026.
 | COPY OUT abort — **DOES NOT REPRODUCE (2026-08-29)**: probed twice, both PG and we leave the transaction `INTRANS`. Re-probe with the exact client-abort shape before working it, or close it | transaction stays `INTRANS`; PG gives `INERROR` | needs interleaved client-abort detection |
 | ~~`SET search_path`~~ **FIXED 2026-08-29** — order decides, off-path relations are invisible, and CREATE targets the path's first schema | recorded but ignored in name resolution | two tests pinned the old behaviour and were rewritten |
 | ~~Partial-index reflection~~ **FIXED 2026-08-29** — the stored filter is reversed back to SQL; 10 predicate shapes render byte-identically to PG (incl. `b <> 5` through its `$and` desugaring, and the `::text` cast) | `pg_indexes.indexdef` drops the `WHERE` clause | unrecognised shapes still omit the WHERE rather than approximate it |
-| `ORDER BY` within one millisecond — **still open**; sub-ms *predicates* are fixed (2026-08-27), the sort tiebreaker is not. Plan's cheapest next item | millisecond-granular | the *other half* of the sub-ms entry; predicates are fixed, sorting needs the companion as a tiebreaker |
+| ~~`ORDER BY` within one millisecond~~ **FIXED 2026-08-29** — two code paths (the plain-column sort key and the projected-expression scope); LIMIT and DISTINCT ON had been returning wrong *rows*, not merely wrong order | millisecond-granular | what remains of sub-ms is pipeline-shaped reads (GROUP BY / JOIN / DISTINCT); `min`/`max` fixed 2026-08-29 |
+| ~~Result types that disagree with their values~~ **FIXED 2026-08-30** — jsonb `\|\|` / `-` lost the jsonb tag, and unknown-literal arithmetic widened instead of resolving to the other operand's type | right value, wrong declared OID → the CLIENT raised decoding it | found by comparing the **result OID** over the wire against live PG; an in-process probe of the same statements showed nothing |
 
 **Sequencing note.** The two SRF items are adjacent (same subsystem, and the
 `.x` path hunt likely surfaces the ORDER BY expansion point). Do them together.

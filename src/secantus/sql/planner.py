@@ -10849,6 +10849,19 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         return "text"
     if isinstance(node, exp.JSONExtract):
         return "json"
+    # ``jsonb || jsonb`` and ``jsonb - key`` answer jsonb. Postgres has no
+    # jsonb-to-text concat and no ``x - jsonb``, so ``||`` is jsonb when EITHER
+    # operand is, and ``-`` when the LEFT one is. Without these the result typed
+    # from the other operand and the tag was lost: ``||`` wired as text (oid 25)
+    # and ``- 1`` as int4, so the wire sent a jsonb payload under a numeric oid
+    # and the CLIENT raised decoding it (``invalid literal for int(): '{1,3}'``).
+    # ``#-`` (JSONBDeleteAtPath) is a dedicated node and already types as json.
+    if isinstance(node, exp.DPipe) and any(
+        _infer_scalar_tag(side, resolve) == "json" for side in (node.this, node.expression)
+    ):
+        return "json"
+    if isinstance(node, exp.Sub) and _infer_scalar_tag(node.this, resolve) == "json":
+        return "json"
     if isinstance(node, exp.DPipe) and _has_hstore_operand(node, resolve):
         return "hstore"
     # Postgres array operators: ``@>`` / ``<@`` / ``&&`` over an array operand -> bool.
