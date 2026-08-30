@@ -179,7 +179,12 @@ def _migrate_legacy_docs(session: Any) -> None:
     ``secantus_documents`` table to its per-collection shard (a store written
     before doc-sharding). A born-sharded store's legacy table is empty, so this is
     a quick no-op scan. Mirrors the Rust ``migrate_legacy_docs``."""
-    src = session.open_cursor(_DOC_TABLE, None)
+    try:
+        src = session.open_cursor(_DOC_TABLE, None)
+    except Exception as exc:  # noqa: BLE001 - re-raised unless it is "no such table"
+        if _is_missing_table(exc):
+            return  # never created: a born-sharded store has nothing to fold in
+        raise
     rows: list[tuple[str, str, bytes, bytes]] = []
     try:
         rc = src.next()
@@ -1558,7 +1563,15 @@ class Storage:
         boot = self._conn.open_session()
         try:
             boot.create(_COLL_TABLE, "key_format=SS,value_format=u")
-            boot.create(_DOC_TABLE, "key_format=SSu,value_format=u")
+            # ``_DOC_TABLE`` and ``_NAT_TABLE`` are LEGACY formats that current
+            # code never writes: the pre-shard single documents table (folded
+            # into the shards by ``_migrate_legacy_docs``) and the old forward
+            # seq -> id_key index (the doc table's own key order replaced it).
+            # They used to be created on every open purely so the migration and
+            # the drop paths could find them empty -- ~9.7 ms per table, on
+            # every open, forever, for two tables nothing writes. A store that
+            # HAS them still migrates and drops from them correctly, because
+            # every reader treats an absent table as empty.
             # Per-collection documents shards (see ``_DOC_SHARDS``, keyed ``SSq``)
             # and the oplog shards below are NO LONGER created eagerly here. Each
             # doc shard is made on first write to a collection that hashes to it
@@ -1571,7 +1584,6 @@ class Storage:
             # (``_is_missing_table`` / ``_cursor_optional``), so a store written
             # with a subset of shards stays byte-compatible with the Rust server
             # (cross-server backup / PITR): a missing shard reads as empty.
-            boot.create(_NAT_TABLE, "key_format=SSq,value_format=u")
             boot.create(_NAT_SEQ_TABLE, "key_format=SSu,value_format=q")
             boot.create(_IDX_TABLE, "key_format=SSS,value_format=u")
             boot.create(_IDX_ENTRIES_TABLE, "key_format=SSSu,value_format=u")
@@ -6511,6 +6523,11 @@ class Storage:
                 dst_doc.reset()
             for tbl in (_NAT_TABLE, _NAT_SEQ_TABLE, _IDX_TABLE, _IDX_ENTRIES_TABLE, _UNIQ_TABLE):
                 rows = self._collect_prefix(tbl, (src_db, src_coll))
+                if not rows:
+                    # Nothing to move. Skip BEFORE opening a cursor: the list
+                    # includes the legacy ``_NAT_TABLE``, which a current store
+                    # never creates, and ``_cursor`` on an absent table raises.
+                    continue
                 self._delete_keys(tbl, [k for k, _ in rows])
                 c = self._cursor(tbl)
                 for k, v in rows:
