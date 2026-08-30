@@ -3410,9 +3410,9 @@ _NUMERIC_TYPES_MSG = "'[decimal, int, double, long]'"
 def _delete_stmt_limit(value: Any) -> int:
     """A ``delete`` statement's ``limit``, mongod-style: 1 or unlimited.
 
-    mongod does NOT type-check this slot -- probed on 6.0.16, ``limit: {}`` /
-    ``"x"`` / ``[1]`` / ``0`` all succeed and delete every match, and only a
-    numeric ``1`` limits to one document. ``true`` counts as "not 1" even though
+    mongod does NOT type-check this slot -- re-probed on 8.2.11, ``limit: {}`` /
+    ``"x"`` / ``[1]`` / ``0`` / ``true`` all succeed and delete every match, and
+    only a numeric ``1`` limits to one document. ``true`` counts as "not 1" even though
     Python makes bool an int.
 
     This is why the surrounding argument validation is per-slot rather than
@@ -3456,12 +3456,12 @@ def _require_number_bson_field(value: Any, field_path: str) -> dict[str, Any] | 
 # Fields the ``distinct`` command accepts. It used to accept ANY field and
 # ignore it, so a misspelled option was silently dropped.
 #
-# ``hint`` is deliberately in the set even though mongod **6.0.16 rejects it**
-# (`BSON field 'distinctCommandRequest.hint' is an unknown field.`): MongoDB added a hint
-# option to `distinct` in a later release, so a current driver may legitimately
-# send it. Accepting is the safe direction for a field whose status changed --
-# unlike the rest of this set, where rejecting matches every version. The
-# differential gate therefore probes an always-unknown field, not this one.
+# ``hint`` is in the set because **mongod 8.2.11 accepts it** (re-probed
+# 2026-08-30 -- `distinct` with `hint: "a_1"` returns the values). 6.0.16
+# rejected it as an unknown field, which is what this comment used to hedge
+# around; 8.x is the target, so there is nothing to hedge. The differential gate
+# still probes an always-unknown field rather than this one, since this slot's
+# status is the thing that changed between versions.
 _DISTINCT_KNOWN_FIELDS = frozenset(
     {
         "distinct",
@@ -3883,9 +3883,10 @@ def _find_and_modify_impl(doc: dict[str, Any], ctx: CommandContext) -> dict[str,
     # ``hint`` was accepted and then dropped on the floor, so a caller who
     # hinted an index that does not exist got a silent collection scan and an
     # ``ok: 1`` reply. mongod rejects it (BadValue), and honours it when it
-    # resolves. ``$natural`` is NOT a valid findAndModify hint -- probed
-    # 6.0.16, where it draws the same "does not correspond to an existing
-    # index" rejection as any other unknown name, unlike ``find``.
+    # resolves. ``$natural`` is NOT a valid findAndModify hint -- re-probed
+    # 8.2.11, where it is still rejected (unlike ``find``). Note the WORDING
+    # moved: 6.0.16 said "does not correspond to an existing index", 8.2.11
+    # returns a planner error, so assert the rejection rather than the text.
     hint = doc.get("hint")
     if hint is not None and not isinstance(hint, (str, Mapping)):
         return {

@@ -1283,6 +1283,36 @@ These are explicit non-goals. Don't add them without a reason.
   signatures on the Rust side. Omitting it means the value diff, which is what
   pipelines want.
 
+- [ ] **168 source comments still cite mongod 6.0.16 as their only evidence
+  (inventory taken 2026-08-30).** CLAUDE.md now says 8.x is the only version we
+  target, so a comment citing 6.0 records *when* something was measured, not
+  what the server does. Spread: 60 in `src/`, 61 in `tests/`, 46 in `crates/`,
+  1 in `tools/` — densest in `commands.py` (19), `changestreams.py` (11),
+  `aggregate.py` (10), `update.py` (9), `expressions.py` (8).
+
+  **The load-bearing ones — comments that JUSTIFIED a behaviour on 6.0 grounds —
+  have been swept and re-probed on 8.2.11.** They were the dangerous class,
+  because each told a future session to keep a 6.0-shaped choice:
+  - the update-error wrapper, which said it was "deliberately NOT emitted"
+    because 6.0 does not wrap. 8.x wraps, and the retarget had already changed
+    the code — only the comment lagged, so it read as an instruction to undo a
+    correct fix;
+  - `distinct.hint`, hedged as "6.0.16 rejects it but a later release added it".
+    8.2.11 accepts it, so the hedge collapses to a fact;
+  - `delete`'s `limit` slot being untype-checked (still true on 8.2.11:
+    `{}` / `"x"` / `[1]` / `0` / `true` all delete every match);
+  - `$natural` as a `findAndModify` hint (still rejected on 8.2.11, but the
+    WORDING moved — 6.0 said "does not correspond to an existing index", 8.2.11
+    returns a planner error, so assert the rejection and not the text).
+
+  What remains is the bulk: comments that merely record a probe against 6.0
+  without justifying a divergence. They are not known-wrong, and the 150-case
+  differential gate is green on 8.2.11, which covers the error surface many of
+  them describe. Re-verify opportunistically — when you touch the code a comment
+  sits on, re-probe it and re-date the citation — rather than in one sweep. Do
+  not bulk-rewrite the citations to say 8.x without probing: that would destroy
+  the only signal distinguishing verified claims from assumed ones.
+
 - [ ] **WATCH (not a defect today): `fullDocument`'s position in a change event
   moved in mongod 8.3, and we match the 8.2.1 target (2026-08-30).** Measured
   on all three servers:
