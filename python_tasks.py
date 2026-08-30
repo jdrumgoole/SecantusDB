@@ -54,7 +54,31 @@ _LOCAL_DESELECT = "tests/test_rust_pitr_cross_server.py::test_python_restores_ru
 
 @task
 def sync(c: Context) -> None:
-    c.run("uv sync --extra dev", pty=True)
+    """Sync the venv so the FULL suite can actually collect and run.
+
+    Two traps this exists to avoid, both of which produce a green run that
+    proved less than it looked:
+
+    1. ``--extra dev`` alone omits the ``rust`` extra, so ``_secantus_core`` is
+       not installed -- and the ~1700 engine-parity tests then do not collect
+       at all (they ``pytest.importorskip`` it, deliberately, so pure-Python
+       environments still work). The suite still exits 0, roughly 1700 tests
+       short, and only comparing the collected count catches it. Worse, a
+       partial sync PRUNES: syncing a subset once removed the whole Pelican
+       toolchain the website tasks need. ``--all-extras`` is the dev default.
+
+    2. ``uv sync`` does NOT rebuild ``secantus-core`` when its Rust source
+       changes -- it is a path dependency, and uv reuses the cached build. Pull
+       a commit that touches ``crates/secantus-core*`` and the venv keeps the
+       OLD compiled extension, so the parity suites compare current Python
+       against stale Rust. Observed as 31 phantom failures in
+       ``test_rust_diff_parity.py`` on a perfectly green ``main``, which reads
+       exactly like a regression. ``--reinstall-package`` busts that cache.
+    """
+    c.run(
+        "uv sync --all-extras --reinstall-package secantus-core",
+        pty=True,
+    )
 
 
 @task
