@@ -47,6 +47,50 @@ from secantus.sql.catalog import (
 # the server log isn't spammed for statements we handle on purpose.
 logging.getLogger("sqlglot").setLevel(logging.ERROR)
 
+
+def _patch_sqlglot_interval_continuation() -> None:
+    """``interval '1 day' + 1`` is arithmetic in Postgres, not a continuation.
+
+    sqlglot supports the multi-part interval form (``INTERVAL '1' DAY '2' HOUR``)
+    by absorbing a following STRING **or NUMBER** into a sum of intervals, even
+    across an explicit ``+``. Postgres has no such form, so the number is really
+    an addend — and PG answers ``42883 operator does not exist: interval +
+    integer``. We answered ``1 day 00:00:01``, reading the ``1`` as one *second*:
+    silent wrong data.
+
+    The distinction cannot be recovered after parsing — sqlglot rewrites the
+    numeric token into a **string** literal inside the synthesised ``Interval``,
+    so ``+ 1`` and ``+ '1'`` end up byte-identical in the AST. So it has to be
+    caught here, at the one point where the token is still visible. Patched on
+    the dialect rather than at ~20 ``read="postgres"`` call sites.
+
+    ``+ 'string'`` is deliberately left alone: PG resolves the unknown literal to
+    an interval there, which is what the continuation already computes.
+    """
+    from sqlglot.dialects.postgres import Postgres
+    from sqlglot.tokens import TokenType
+
+    parser_cls = Postgres.Parser
+    original = parser_cls._parse_interval
+
+    def _parse_interval(self, require_interval: bool = True):  # type: ignore[no-untyped-def]
+        node = original(self, require_interval)
+        if (
+            isinstance(node, exp.Add)
+            and isinstance(node.expression, exp.Interval)
+            and node.expression.args.get("unit") is None
+            and self._index > 0
+            and self._tokens[self._index - 1].token_type is TokenType.NUMBER
+        ):
+            number = exp.Literal.number(self._tokens[self._index - 1].text)
+            return self.expression(exp.Add(this=node.this, expression=number))
+        return node
+
+    parser_cls._parse_interval = _parse_interval
+
+
+_patch_sqlglot_interval_continuation()
+
 # ---------------------------------------------------------------------------
 # Plan objects — ready-to-execute structures over Storage.
 # ---------------------------------------------------------------------------
@@ -10601,6 +10645,13 @@ def _pg_typeof_name(
     return _tag_to_regtype(_infer_scalar_tag(arg, resolve))
 
 
+#: Arg key marking a literal that `rewrite_pg_typeof` minted, so it types as
+#: ``regtype`` (oid 2206) rather than as the plain ``text`` a string literal
+#: would. Rides in the node's args, which survive the tree copies the parse
+#: cache and planner make.
+_REGTYPE_MARKER = "secantus_regtype"
+
+
 def rewrite_pg_typeof(
     stmt: exp.Expression,
     table: TableDef | None,
@@ -10639,7 +10690,17 @@ def rewrite_pg_typeof(
                 if isinstance(parent.parent, exp.Select):
                     parent.replace(exp.alias_(parent.copy(), "pg_typeof"))
                 continue
+        # ``pg_typeof`` returns **regtype**, not text. The value is the type's
+        # name either way, so the bare string literal got the answer right and
+        # the declared oid wrong — every ``pg_typeof`` wired as text (25) where
+        # PG says 2206.
+        #
+        # The literal is TAGGED rather than wrapped in a ``::regtype`` cast: the
+        # cast is evaluated, and ``'int4'::regtype`` evaluates to the type's OID
+        # *number* (23), so wrapping changed the answer from 'integer' to 23.
+        # The marker only steers `_infer_scalar_tag`; the value stays the name.
         replacement: exp.Expression = exp.Literal.string(name)
+        replacement.set(_REGTYPE_MARKER, True)
         if isinstance(parent, exp.Select):
             replacement = exp.alias_(replacement, "pg_typeof")
         node.replace(replacement)
@@ -10702,6 +10763,9 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
 
 def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     """The uncached body of ``_infer_scalar_tag``."""
+    # A literal minted by `rewrite_pg_typeof` is a regtype, not text.
+    if node.args.get(_REGTYPE_MARKER):
+        return "regtype"
     # Composite field access ``(col).field`` types as the field's declared type.
     composite_tag = _composite_field_tag(node, resolve)
     if composite_tag is not None:
@@ -10966,6 +11030,7 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
                 "name",
                 "char1",
                 "jsonpath",
+                "regtype",
             )
             or _mapped in typemap._GEO_TAGS
         ):

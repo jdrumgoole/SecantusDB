@@ -1,7 +1,7 @@
-"""Plan-time comparison-operator resolution (Postgres' 42883).
+"""Plan-time operator resolution (Postgres' 42883) — comparisons and arithmetic.
 
-In Postgres a comparison is resolved to a concrete operator during *parse
-analysis*, before any row is read, so comparing two incompatible types is an
+In Postgres an operator is resolved to a concrete implementation during *parse
+analysis*, before any row is read, so combining two incompatible types is an
 ERROR rather than a predicate that matches nothing::
 
     -- real postgres
@@ -18,10 +18,16 @@ that works today, which is far worse than the lenient FALSE. So the analysis
 is deliberately **sound but very incomplete** — every uncertainty resolves to
 "say nothing":
 
-* Only a comparison whose BOTH operands have a confidently-known static type
+* Only an expression whose BOTH operands have a confidently-known static type
   is judged. An untyped string literal (Postgres' ``unknown``), a bound
   parameter, a subquery, an unrecognised function, an unresolvable column —
-  any of these makes the comparison unjudged.
+  any of these leaves it unjudged.
+* **Arithmetic** (``+ - * / %``) is judged as well as comparison, on one rule:
+  Postgres defines no arithmetic operator on a text-category operand, so
+  ``text_col + 1`` is 42883 whatever the column contains. That is invisible to
+  the evaluator, where a typed text column and an unknown literal are both a
+  Python ``str`` — it coerced both, so ``text_col + 1`` silently answered a
+  number.
 * Only four type *categories* participate (numeric / text / boolean /
   date-time). Within a category Postgres has implicit casts both ways, so a
   same-category pair is always fine; across these four there is no implicit
@@ -38,9 +44,12 @@ is deliberately **sound but very incomplete** — every uncertainty resolves to
   tables (CTEs, derived tables, set operations, subqueries, functions in FROM)
   is skipped wholesale rather than analysed with partial information. A
   statement with **no** FROM at all (``SELECT 'a'::text = 1``) is likewise not
-  judged: this analysis is driven by declared column types, and constant-only
-  expressions are the bulk of what the psycopg / SQLAlchemy gauges evaluate,
-  so widening to them is a separate, separately-measured change.
+  judged here: this analysis is driven by declared column types, and
+  constant-only expressions are the bulk of what the psycopg / SQLAlchemy
+  gauges evaluate. The constant *arithmetic* case is covered instead by
+  ``scalar._text_cast_type``, which decides an explicit cast from the AST alone
+  — a cast is unambiguously typed, so it needs no catalog and carries none of
+  the risk that made widening this module's scope a separate question.
 """
 
 from __future__ import annotations
@@ -134,6 +143,19 @@ _OP_TEXT = {
     exp.GTE: ">=",
     exp.LT: "<",
     exp.LTE: "<=",
+}
+
+#: Arithmetic operators. Postgres defines none of them on a text-category
+#: operand, so a text column in arithmetic is 42883 whatever the other side is
+#: — ``t + 1`` errors on a column holding '1' exactly as on one holding 'a'.
+_ARITHMETIC = (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod)
+
+_ARITH_OP_TEXT = {
+    exp.Add: "+",
+    exp.Sub: "-",
+    exp.Mul: "*",
+    exp.Div: "/",
+    exp.Mod: "%",
 }
 
 #: Functions that return ``text`` when handed a text argument. Postgres has no
@@ -365,6 +387,30 @@ def _check_comparison(node: exp.Expression, resolver: _Resolver) -> None:
     raise errors.SQLError("42883", f"operator does not exist: {left[1]} {op} {right[1]}")
 
 
+def _check_arithmetic(node: exp.Expression, resolver: _Resolver) -> None:
+    """Raise 42883 for arithmetic over a text-category operand.
+
+    Postgres has no arithmetic operator on text at all, so the *content* is
+    irrelevant — a text column holding '1' is as much an error as one holding
+    'a'. The scalar evaluator cannot see this: by the time it runs, a typed text
+    column and an unknown literal are both a Python ``str``, and it coerced
+    both, so ``t + 1`` silently answered 2.
+
+    Same soundness bar as the comparison check — BOTH operands must be
+    statically certain, so an unknown literal, a parameter or a subquery leaves
+    the expression unjudged rather than guessed at. The explicit-cast form
+    (``'1'::text + 1``) is decided in `sql/scalar.py` instead, because a
+    constant-only statement never reaches this analysis at all."""
+    left = _static_type(node.this, resolver)
+    right = _static_type(node.expression, resolver)
+    if left is None or right is None:
+        return
+    if left[0] != "string" and right[0] != "string":
+        return
+    op = _ARITH_OP_TEXT[type(node)]
+    raise errors.SQLError("42883", f"operator does not exist: {left[1]} {op} {right[1]}")
+
+
 def _has_nested_query(node: exp.Expression, root: exp.Expression) -> bool:
     """Whether ``node`` sits inside a nested query relative to ``root`` — its
     columns may resolve against a scope the resolver knows nothing about."""
@@ -411,6 +457,10 @@ def _analyse(
         if id(node) in assignments or _has_nested_query(node, stmt):
             continue
         _check_comparison(node, resolver)
+    for node in stmt.find_all(*_ARITHMETIC):
+        if _has_nested_query(node, stmt):
+            continue
+        _check_arithmetic(node, resolver)
 
 
 def _set_assignments(stmt: exp.Expression) -> set[int]:

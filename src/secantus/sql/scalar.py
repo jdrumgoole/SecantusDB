@@ -575,6 +575,22 @@ def _eval_arith(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         right = float(right)
     elif isinstance(right, float) and isinstance(left, Decimal):
         left = float(left)
+    # A *typed* text operand has no arithmetic operator at all in Postgres, so
+    # it is 42883 whatever it contains — ``'1'::text + 1`` errors just as
+    # ``'a'::text + 1`` does. Only an UNKNOWN literal coerces (below). We ran the
+    # coercion for both, so a typed operand either computed silently (`'1'::text
+    # + 1` answered 2) or reported the coercion's 22P02 instead of PG's 42883.
+    # Decided from the cast alone — no resolver needed, and a cast is
+    # unambiguously typed. The column form is judged in `sql/typecheck.py`, which
+    # owns the exemptions a declared type needs (reflected tables especially).
+    _lt, _rt = _text_cast_type(node.this), _text_cast_type(node.expression)
+    if _lt is not None or _rt is not None:
+        op = _ARITH_SYMBOL.get(type(node), "?")
+        raise errors.SQLError(
+            "42883",
+            f"operator does not exist: {_lt or _pg_operand_type(left)} {op} "
+            f"{_rt or _pg_operand_type(right)}",
+        )
     # An unknown-type text operand against a number resolves numerically, like
     # PG's unknown-literal coercion (``abalance + $1`` with an untyped text
     # param — pgbench's extended mode binds every param typeless).
@@ -586,7 +602,17 @@ def _eval_arith(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     # `_ARITH` because a Mapping/list left operand has no meaningful Python
     # subtraction — `dict - str` raised a bare TypeError that escaped as an
     # "internal server error" (XX000).
-    if isinstance(node, exp.Sub) and isinstance(left, (Mapping, list)):
+    #
+    # An interval / range is ALSO a Mapping (they ride as tagged subdocuments),
+    # so this branch used to claim them: ``interval '1 day' - 1`` answered
+    # ``22023 cannot delete from scalar`` — a *jsonb* error for an interval —
+    # where PG answers 42883. They fall through to the operator check below.
+    if (
+        isinstance(node, exp.Sub)
+        and isinstance(left, (Mapping, list))
+        and not _is_interval(left)
+        and not _is_range_value(left)
+    ):
         return _jsonb_delete(left, right)
     # Postgres has NO arithmetic operators on boolean, so any bool operand is
     # 42883. Python would not raise here — `bool` IS an `int`, so `true + 1`
@@ -626,6 +652,12 @@ def _pg_operand_type(v: Any) -> str:
         return "unknown"
     if isinstance(v, bool):
         return "boolean"
+    # Intervals and ranges ride as tagged subdocuments, so the Mapping arm below
+    # would call them "jsonb". Named before it.
+    if _is_interval(v):
+        return "interval"
+    if _is_range_value(v):
+        return "range"
     if isinstance(v, int):
         return "integer"
     if isinstance(v, float):
@@ -703,6 +735,34 @@ def _interval_from_text(text: str) -> Any:
         raise errors.SQLError(
             "22007", f'invalid input syntax for type interval: "{text}"'
         ) from None
+
+
+#: Cast spellings with no arithmetic operator in Postgres -> the type name the
+#: 42883 message uses. Postgres names the *declared* type, so ``varchar`` reports
+#: "character varying", not "text".
+_TEXT_CAST_NAMES: dict[str, str] = {
+    "text": "text",
+    "varchar": "character varying",
+    "character varying": "character varying",
+    "char": "character",
+    "character": "character",
+    "bpchar": "character",
+    "citext": "citext",
+    "name": "name",
+}
+
+
+def _text_cast_type(node: exp.Expression | None) -> str | None:
+    """The PG type name of an explicit cast to a text type, else None.
+
+    Only an explicit cast is judged — that is what makes the operand *typed*
+    rather than Postgres' ``unknown``."""
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if not isinstance(node, exp.Cast) or node.to is None:
+        return None
+    spelling = node.to.sql(dialect="postgres").lower().strip().split("(", 1)[0].strip()
+    return _TEXT_CAST_NAMES.get(spelling)
 
 
 def _is_unknown_literal(node: exp.Expression | None) -> bool:
