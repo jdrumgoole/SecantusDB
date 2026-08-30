@@ -76,7 +76,7 @@ until `change_streams.py`. Start one explicitly:
 |---|---|---|
 | `arg_types_documents.py` | document-valued command arguments | 56/56 clean (was 45 crashes) |
 | `arg_types_extended.py` | more commands + numeric/string/bool argument classes | Python **87/87 clean**; **Rust server 78 divergences — open** (see `PROBE_SERVER` above) |
-| `change_streams.py` | change events, event field order, fatal errors | 14 of 41 on 6.0.16, **8.2.1** (the probed target) and 8.3.4 alike — `truncatedArrays` + expanded-event gaps, identical on both our servers. Error codes/messages are stable across all three; `fullDocument`'s POSITION changes at 8.3 (backlog WATCH). **Needs a replica set**, see the script |
+| `change_streams.py` | change events, event field order, fatal errors | **0 of 41, and 0 field-order differences**, on both servers against mongod 8.2.11 (2026-08-30) — the sweep is closed. Was 14/41 when first run. **Needs a replica set**, see the script |
 | `findandmodify_shapes.py` | findAndModify replies and argument validation | 18/18 clean (was 6 divergences) |
 | `update_operators.py` | update operator semantics and errors | clean except the filed items |
 | `update_path_conflicts.py` | overlapping update operator paths | 12/12 clean (was 8 wrong results) |
