@@ -901,35 +901,100 @@ Specific items that were left out of the slice that introduced their feature are
   the TLS case a budget matched to Windows (or wait for the listener rather than
   race it), not to rerun it away. Recorded here because reruns hide it.
 
-- [x] **RESOLVED 2026-08-29 — wrong-typed command arguments on the RUST SERVER:
-  78 of 87 divergences -> 87/87 clean.** First swept the same day (the Python
-  server had reached 87/87 across #1078 / #1080 / #1084 / #1085; this server had
-  never been measured). Reproduce with `PROBE_SERVER` — see
-  `tools/probes/README.md`.
 
-  Fixed in two halves, matching the two failure modes:
+- [x] **RESOLVED 2026-08-31 — the wrong-typed-argument sweep, widened from CODES
+  to MESSAGES: 76 more slots on the RUST SERVER, all closed.** The two entries
+  above closed 87 shapes and then 244; both servers read **244/244 clean**, and
+  that number was true and incomplete for the third time. `arg_types_extended.py`
+  compares `(ok, code)` and nothing else. Comparing `(code, errmsg)` over 685
+  shapes against **mongod 8.2.11** — `tools/probes/arg_types_messages.py`,
+  `PROBE_SERVER` as before — found **550 code + 50 message divergences across 76
+  argument slots**. Now 0; what remains is listed at the bottom of this entry and
+  is not this class.
 
-  **54 silently accepted** — new `secantus-commands::argtypes`, one validator per
-  message family, wired into `find` / `aggregate` / `createIndexes` / `create` /
-  `collMod` / `listIndexes` / `findAndModify` / `update`. Messages mirror the
-  Python server's, which are pinned byte-for-byte against a live mongod, so they
-  did not have to be re-derived. Every per-slot asymmetry carries across:
-  `findAndModify.upsert` takes a bool OR any number while `update.multi` rejects
-  `multi: 1`; `find.let` reports as `FindCommandRequest.let`; `maxTimeMS` is
-  code 2 with three messages; six slots accept an explicit null and three reject
-  it; `delete.deletes.limit` stays UNvalidated.
+  Re-running the OLD 244-shape sweep against 8.2.11 first showed it still clean,
+  so this is not a consequence of the 6.0→8.x retarget: those shapes survived it.
+  It is coverage. The 76 slots were simply never probed.
 
-  **24 generic `BadValue` (2)** — the "Rust error-code class"
-  (`tasks/remaining-work-plan.md` §1b), and the cause is structural:
-  `secantus-core` returns `Fallback` meaning "let the Python engine run this",
-  but this server has no Python, so it surfaced as BadValue. Closed with the
-  plan's named template (`update::arith_type_error`) rather than by widening
-  `Fallback`: a standalone `argtypes::stage_spec_error` naming the seven stages
-  it can name — `$lookup` 9, `$group` 15947, `$match` 15959, `$sort` 15973,
-  `$limit` 5107201, `$skip` 5107200, `$count` 40156, `$unwind` 15981 / 28812 —
-  and leaving everything else alone.
+  **The dominant failure was silent acceptance — 54 of the first tranche and the
+  large majority overall.** Not "returns the wrong status": the server did
+  something other than what the caller asked and reported success. `update` with
+  an empty `updates` array answered `ok:1, n:0` for a batch it never received;
+  `killCursors` with `cursors: 5` reported the named cursors killed while killing
+  none; a `hint` naming no index was dropped on the floor by `update` / `delete`
+  / `findAndModify` so the write ran unhinted; a non-array `pipeline` ran the
+  whole collection through no stages at all.
 
-  19 Rust unit tests. **Both servers are now 87/87 on this sweep.**
+  **Two defects were worse than the class they were found in.**
+  - `dropIndexes` by KEY PATTERN answered **code 1, `InternalError`** — the
+    crash code — for a shape mongod handles routinely, so a supported operation
+    read as a server fault. Now implemented (catalog scan for a matching `key`),
+    or IndexNotFound (27).
+  - `$[identifier]` with no matching `arrayFilters` entry was ACCEPTED when the
+    target field was not an array: the engine's `walk_positional` returns early
+    for a non-array value *before* it looks the identifier up, so
+    `{$set: {"a.$[e]": 1}}` against `{a: 1}` wrote nothing and answered ok. The
+    Python server has had the check since it was written, with a comment saying
+    mongod decides this from the update document ALONE, which is exactly why the
+    early return could not reach it. Fixed at the command layer
+    (`argtypes::array_filter_identifier_error`), not in the engine, because the
+    engine's only failure signal is `Fallback` — which on a server with no
+    Python becomes a generic BadValue with the wrong text.
+
+  **`InvalidLength` is 16, not 4 — fixed on BOTH servers.** `insert` answered 4
+  (`NoSuchKey`) under a comment asserting that mongo-go-driver and
+  mongo-java-driver "have command-error tests that check for this specific code
+  / codeName combo, so it's load-bearing for the gauge". They gate on the
+  codeName; the code was simply wrong, and `bulkWrite` in the same codebase
+  already answered 16. This is the "comment justifying behaviour by something
+  other than the reference server" pattern again — it now stands at 6-for-6, and
+  this instance had the additional tell of contradicting the same repo's other
+  implementation of the same rule.
+
+  **Method notes worth keeping.**
+  - **Compare messages, not codes.** 50 slots carried the right code and the
+    wrong words. Codes alone had reported all 50 correct.
+  - **Normalise the expected-type LIST as a set.** mongod renders
+    `'[decimal, int, double, long]'` in a different ORDER on 8.2.1 and 8.2.11 —
+    a *patch* bump — so a literal comparison pins a build. The probe sorts it,
+    as `tests/test_mongod_differential.py` already does.
+  - **pymongo cannot send 21 of the shapes.** `insert` / `update` / `delete`
+    promote their array argument to an OP_MSG document sequence, so a
+    non-iterable value fails in the driver before the wire. Bucketed separately
+    rather than counted: they are unreachable through the conformance target.
+  - **A probe that reuses a collection name reports its own leftover state.**
+    Already recorded for `create.storageEngine`; it bit again here until each
+    `create` case got a unique name.
+
+  Pinned by `tests/test_rust_arg_types_sweep.py` (42 tests, driving the embedded
+  Rust server) and nine Rust unit tests in `argtypes.rs`.
+
+  **What is left, and is NOT this class:**
+  - [ ] **`$redact` is not implemented on the Rust server** (9 of the 685 cases).
+        It answers `BadValue` (2) `aggregation pipeline uses a stage or operator
+        not supported by the Rust server` where mongod evaluates the expression
+        and answers 17053. A missing STAGE, not an argument defect — the Python
+        server implements it.
+  - [ ] **An unknown-index `hint` reports our message, not mongod's plan dump**
+        (6 cases, on `find` / `count` / `aggregate` / `update` / `delete` /
+        `findAndModify`). The CODE matches (2) on all six; mongod's text is a
+        rendering of the whole canonical query
+        (`error processing query: ns=<db>.<coll>Tree: $and\nSort: {}\nProj: {}\n
+        planner returned error :: caused by :: hint provided does not correspond
+        to an existing index`). Reproducing it means rendering the query plan,
+        which is a subsystem, for message text on an already-correct code —
+        deliberately deferred, same call as the aggregation wrapper prefix in
+        `tasks/remaining-work-plan.md` §1b.
+  - [ ] **The PYTHON server has the same class open on ~61 of these slots, with
+        18 CRASHES.** Measured on the same 685 shapes, same day: 409 code + 123
+        message divergences, and 18 cases answering `internal server error`
+        (code 1) — every one an `int()` over a wrong-typed value
+        (`count.limit` / `count.skip` / `listCollections.cursor.batchSize` /
+        `listIndexes.cursor.batchSize` / `getMore.batchSize` and neighbours).
+        That is the crash class #1080 closed, surviving on the slots its corpus
+        never reached. **The two servers now disagree on these slots**, which is
+        its own reason to close it. Reproduce with the same probe and no
+        `PROBE_SERVER`.
 
 - [ ] **OPEN — `$limit` / `$skip` stage-error messages render the offending value
   as a PYTHON repr (Python server).** Found 2026-08-29 while porting the above.

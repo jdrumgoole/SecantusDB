@@ -228,10 +228,13 @@ pub fn array_filter_identifier_error(
     update: &Document,
     filters: &[Document],
 ) -> Option<CommandError> {
+    // Reuse the engine's extractor rather than reading the filter's top-level
+    // keys: an identifier may be nested inside `$and` / `$or` / `$nor`
+    // (`[{$and: [{"x.g": {$gt: 8}}]}]` names `x`), and a naive read reported
+    // that valid filter as missing.
     let named: Vec<String> = filters
         .iter()
-        .flat_map(|f| f.keys())
-        .map(|k| k.split('.').next().unwrap_or(k).to_string())
+        .flat_map(secantus_core::update::extract_af_identifiers)
         .collect();
     for value in update.values() {
         let Bson::Document(payload) = value else {
@@ -1204,7 +1207,9 @@ mod stage_tests {
         );
         // Capital "The" here, lowercase on $setWindowFields — mongod's own
         // inconsistency, not a typo in the port.
-        assert!(err_for("$densify", Bson::Int32(5)).1.starts_with("The $densify"));
+        assert!(err_for("$densify", Bson::Int32(5))
+            .1
+            .starts_with("The $densify"));
         assert!(err_for("$setWindowFields", Bson::Int32(5))
             .1
             .starts_with("the $setWindowFields"));
@@ -1216,8 +1221,14 @@ mod stage_tests {
         assert!(stage_spec_error(&[Bson::Document(doc! {"$unionWith": "other"})]).is_none());
         // $sortByCount: three codes, split by what the spec IS.
         assert_eq!(err_for("$sortByCount", Bson::Int32(5)).0, 40149);
-        assert_eq!(err_for("$sortByCount", Bson::String("nodollar".into())).0, 40148);
-        assert_eq!(err_for("$sortByCount", Bson::Document(Document::new())).0, 40147);
+        assert_eq!(
+            err_for("$sortByCount", Bson::String("nodollar".into())).0,
+            40148
+        );
+        assert_eq!(
+            err_for("$sortByCount", Bson::Document(Document::new())).0,
+            40147
+        );
         assert!(stage_spec_error(&[Bson::Document(doc! {"$sortByCount": "$a"})]).is_none());
     }
 }
@@ -1250,8 +1261,9 @@ mod swept_slot_tests {
                 "BSON field 'getMore.collection' is missing but a required field"
             );
         }
-        let err = require_required_string(&doc! {"collection": 5}, "collection", "getMore.collection")
-            .unwrap_err();
+        let err =
+            require_required_string(&doc! {"collection": 5}, "collection", "getMore.collection")
+                .unwrap_err();
         assert_eq!(err.code, 14);
     }
 
@@ -1269,10 +1281,18 @@ mod swept_slot_tests {
     fn drop_indexes_names_a_different_type_list_for_an_array() {
         let err = require_index_name_or_key(&doc! {"index": [1]}, "index", "dropIndexes.index")
             .unwrap_err();
-        assert!(err.errmsg.ends_with("expected types '[string]'"), "{}", err.errmsg);
+        assert!(
+            err.errmsg.ends_with("expected types '[string]'"),
+            "{}",
+            err.errmsg
+        );
         let err = require_index_name_or_key(&doc! {"index": 5}, "index", "dropIndexes.index")
             .unwrap_err();
-        assert!(err.errmsg.ends_with("expected types '[string, object]'"), "{}", err.errmsg);
+        assert!(
+            err.errmsg.ends_with("expected types '[string, object]'"),
+            "{}",
+            err.errmsg
+        );
     }
 
     #[test]
@@ -1282,7 +1302,9 @@ mod swept_slot_tests {
         let spec = doc! {"key": {"a": 1}, "name": "i", "unique": "x"};
         let err = require_index_spec_bool(&spec, "unique").unwrap_err();
         assert!(
-            err.errmsg.contains("The field 'unique has value unique: \"x\", which is not convertible to bool"),
+            err.errmsg.contains(
+                "The field 'unique has value unique: \"x\", which is not convertible to bool"
+            ),
             "{}",
             err.errmsg
         );
@@ -1309,5 +1331,9 @@ mod swept_slot_tests {
         let f = vec![doc! {"e.x": 1}];
         assert!(array_filter_identifier_error(&update, &f).is_none());
         assert!(array_filter_identifier_error(&doc! {"$set": {"a.$[]": 1}}, &[]).is_none());
+        // An identifier nested inside `$and` is named by that filter too — a
+        // top-level-keys-only read called this valid filter missing.
+        let nested = vec![doc! {"$and": [{"e.g": {"$gt": 8}}]}];
+        assert!(array_filter_identifier_error(&update, &nested).is_none());
     }
 }

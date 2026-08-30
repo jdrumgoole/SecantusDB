@@ -60,41 +60,114 @@ def cases():
         yield (f"distinct.query={b!r}", {"distinct": "c", "key": "a", "query": b})
         yield (f"distinct.collation={b!r}", {"distinct": "c", "key": "a", "collation": b})
         yield (f"insert.writeConcern={b!r}", {"insert": "c", "documents": [{}], "writeConcern": b})
-        yield (f"update.let={b!r}", {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}}], "let": b})
-        yield (f"update.collation={b!r}", {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}, "collation": b}]})
-        yield (f"update.hint={b!r}", {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}, "hint": b}]})
-        yield (f"delete.collation={b!r}", {"delete": "c", "deletes": [{"q": {}, "limit": 0, "collation": b}]})
+        yield (
+            f"update.let={b!r}",
+            {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}}], "let": b},
+        )
+        yield (
+            f"update.collation={b!r}",
+            {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}, "collation": b}]},
+        )
+        yield (
+            f"update.hint={b!r}",
+            {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}, "hint": b}]},
+        )
+        yield (
+            f"delete.collation={b!r}",
+            {"delete": "c", "deletes": [{"q": {}, "limit": 0, "collation": b}]},
+        )
         yield (f"delete.hint={b!r}", {"delete": "c", "deletes": [{"q": {}, "limit": 0, "hint": b}]})
-        yield (f"fam.fields={b!r}", {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "fields": b})
-        yield (f"fam.sort={b!r}", {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "sort": b})
-        yield (f"fam.collation={b!r}", {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "collation": b})
-        yield (f"fam.let={b!r}", {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "let": b})
-        yield (f"fam.hint={b!r}", {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "hint": b})
-        yield (f"agg.collation={b!r}", {"aggregate": "c", "pipeline": [], "cursor": {}, "collation": b})
+        yield (
+            f"fam.fields={b!r}",
+            {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "fields": b},
+        )
+        yield (
+            f"fam.sort={b!r}",
+            {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "sort": b},
+        )
+        yield (
+            f"fam.collation={b!r}",
+            {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "collation": b},
+        )
+        yield (
+            f"fam.let={b!r}",
+            {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "let": b},
+        )
+        yield (
+            f"fam.hint={b!r}",
+            {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "hint": b},
+        )
+        yield (
+            f"agg.collation={b!r}",
+            {"aggregate": "c", "pipeline": [], "cursor": {}, "collation": b},
+        )
         yield (f"agg.hint={b!r}", {"aggregate": "c", "pipeline": [], "cursor": {}, "hint": b})
-        yield (f"agg.readConcern={b!r}", {"aggregate": "c", "pipeline": [], "cursor": {}, "readConcern": b})
+        yield (
+            f"agg.readConcern={b!r}",
+            {"aggregate": "c", "pipeline": [], "cursor": {}, "readConcern": b},
+        )
         yield (f"listCollections.filter={b!r}", {"listCollections": 1, "filter": b})
         yield (f"listCollections.cursor={b!r}", {"listCollections": 1, "cursor": b})
-        yield (f"createIndexes.partialFilter={b!r}",
-               {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "i", "partialFilterExpression": b}]})
-        yield (f"createIndexes.collation={b!r}",
-               {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "i", "collation": b}]})
-        yield (f"create.validator={b!r}", {"create": f"v_{abs(hash(repr(b))) % 10000}", "validator": b})
-        yield (f"create.timeseries={b!r}", {"create": f"ts_{abs(hash(repr(b))) % 10000}", "timeseries": b})
+        yield (
+            f"createIndexes.partialFilter={b!r}",
+            {
+                "createIndexes": "c",
+                "indexes": [{"key": {"a": 1}, "name": "i", "partialFilterExpression": b}],
+            },
+        )
+        yield (
+            f"createIndexes.collation={b!r}",
+            {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "i", "collation": b}]},
+        )
+        yield (
+            f"create.validator={b!r}",
+            {"create": f"v_{abs(hash(repr(b))) % 10000}", "validator": b},
+        )
+        yield (
+            f"create.timeseries={b!r}",
+            {"create": f"ts_{abs(hash(repr(b))) % 10000}", "timeseries": b},
+        )
         yield (f"collMod.validator={b!r}", {"collMod": "c", "validator": b})
         yield (f"collMod.preImages={b!r}", {"collMod": "c", "changeStreamPreAndPostImages": b})
         # aggregation stage specs the extended sweep did not reach
-        yield (f"project.spec={b!r}", {"aggregate": "c", "pipeline": [{"$project": b}], "cursor": {}})
-        yield (f"addFields.spec={b!r}", {"aggregate": "c", "pipeline": [{"$addFields": b}], "cursor": {}})
-        yield (f"replaceRoot.spec={b!r}", {"aggregate": "c", "pipeline": [{"$replaceRoot": b}], "cursor": {}})
+        yield (
+            f"project.spec={b!r}",
+            {"aggregate": "c", "pipeline": [{"$project": b}], "cursor": {}},
+        )
+        yield (
+            f"addFields.spec={b!r}",
+            {"aggregate": "c", "pipeline": [{"$addFields": b}], "cursor": {}},
+        )
+        yield (
+            f"replaceRoot.spec={b!r}",
+            {"aggregate": "c", "pipeline": [{"$replaceRoot": b}], "cursor": {}},
+        )
         yield (f"facet.spec={b!r}", {"aggregate": "c", "pipeline": [{"$facet": b}], "cursor": {}})
         yield (f"bucket.spec={b!r}", {"aggregate": "c", "pipeline": [{"$bucket": b}], "cursor": {}})
-        yield (f"sortByCount.spec={b!r}", {"aggregate": "c", "pipeline": [{"$sortByCount": b}], "cursor": {}})
-        yield (f"geoNear.spec={b!r}", {"aggregate": "c", "pipeline": [{"$geoNear": b}], "cursor": {}})
-        yield (f"graphLookup.spec={b!r}", {"aggregate": "c", "pipeline": [{"$graphLookup": b}], "cursor": {}})
-        yield (f"unionWith.spec={b!r}", {"aggregate": "c", "pipeline": [{"$unionWith": b}], "cursor": {}})
-        yield (f"setWindowFields.spec={b!r}", {"aggregate": "c", "pipeline": [{"$setWindowFields": b}], "cursor": {}})
-        yield (f"densify.spec={b!r}", {"aggregate": "c", "pipeline": [{"$densify": b}], "cursor": {}})
+        yield (
+            f"sortByCount.spec={b!r}",
+            {"aggregate": "c", "pipeline": [{"$sortByCount": b}], "cursor": {}},
+        )
+        yield (
+            f"geoNear.spec={b!r}",
+            {"aggregate": "c", "pipeline": [{"$geoNear": b}], "cursor": {}},
+        )
+        yield (
+            f"graphLookup.spec={b!r}",
+            {"aggregate": "c", "pipeline": [{"$graphLookup": b}], "cursor": {}},
+        )
+        yield (
+            f"unionWith.spec={b!r}",
+            {"aggregate": "c", "pipeline": [{"$unionWith": b}], "cursor": {}},
+        )
+        yield (
+            f"setWindowFields.spec={b!r}",
+            {"aggregate": "c", "pipeline": [{"$setWindowFields": b}], "cursor": {}},
+        )
+        yield (
+            f"densify.spec={b!r}",
+            {"aggregate": "c", "pipeline": [{"$densify": b}], "cursor": {}},
+        )
         yield (f"fill.spec={b!r}", {"aggregate": "c", "pipeline": [{"$fill": b}], "cursor": {}})
         yield (f"sample.spec={b!r}", {"aggregate": "c", "pipeline": [{"$sample": b}], "cursor": {}})
         yield (f"redact.spec={b!r}", {"aggregate": "c", "pipeline": [{"$redact": b}], "cursor": {}})
@@ -105,10 +178,22 @@ def cases():
         yield (f"update.updates={b!r}", {"update": "c", "updates": b})
         yield (f"delete.deletes={b!r}", {"delete": "c", "deletes": b})
         yield (f"aggregate.pipeline={b!r}", {"aggregate": "c", "pipeline": b, "cursor": {}})
-        yield (f"fam.arrayFilters={b!r}",
-               {"findAndModify": "c", "query": {}, "update": {"$set": {"a.$[e]": 1}}, "arrayFilters": b})
-        yield (f"update.arrayFilters={b!r}",
-               {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a.$[e]": 1}}, "arrayFilters": b}]})
+        yield (
+            f"fam.arrayFilters={b!r}",
+            {
+                "findAndModify": "c",
+                "query": {},
+                "update": {"$set": {"a.$[e]": 1}},
+                "arrayFilters": b,
+            },
+        )
+        yield (
+            f"update.arrayFilters={b!r}",
+            {
+                "update": "c",
+                "updates": [{"q": {}, "u": {"$set": {"a.$[e]": 1}}, "arrayFilters": b}],
+            },
+        )
         yield (f"killCursors.cursors={b!r}", {"killCursors": "c", "cursors": b})
 
     # ---- numeric slots ----
@@ -116,17 +201,36 @@ def cases():
         yield (f"count.limit={b!r}", {"count": "c", "limit": b})
         yield (f"count.skip={b!r}", {"count": "c", "skip": b})
         yield (f"count.maxTimeMS={b!r}", {"count": "c", "maxTimeMS": b})
-        yield (f"agg.maxTimeMS={b!r}", {"aggregate": "c", "pipeline": [], "cursor": {}, "maxTimeMS": b})
+        yield (
+            f"agg.maxTimeMS={b!r}",
+            {"aggregate": "c", "pipeline": [], "cursor": {}, "maxTimeMS": b},
+        )
         yield (f"distinct.maxTimeMS={b!r}", {"distinct": "c", "key": "a", "maxTimeMS": b})
-        yield (f"fam.maxTimeMS={b!r}",
-               {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "maxTimeMS": b})
+        yield (
+            f"fam.maxTimeMS={b!r}",
+            {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "maxTimeMS": b},
+        )
         yield (f"getMore.batchSize={b!r}", {"getMore": Int64(1), "collection": "c", "batchSize": b})
         yield (f"getMore.maxTimeMS={b!r}", {"getMore": Int64(1), "collection": "c", "maxTimeMS": b})
-        yield (f"createIndexes.expireAfter={b!r}",
-               {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "i", "expireAfterSeconds": b}]})
-        yield (f"create.size={b!r}", {"create": f"sz_{abs(hash(repr(b))) % 10000}", "capped": True, "size": b})
-        yield (f"create.max={b!r}", {"create": f"mx_{abs(hash(repr(b))) % 10000}", "capped": True, "size": 4096, "max": b})
-        yield (f"listCollections.batchSize={b!r}", {"listCollections": 1, "cursor": {"batchSize": b}})
+        yield (
+            f"createIndexes.expireAfter={b!r}",
+            {
+                "createIndexes": "c",
+                "indexes": [{"key": {"a": 1}, "name": "i", "expireAfterSeconds": b}],
+            },
+        )
+        yield (
+            f"create.size={b!r}",
+            {"create": f"sz_{abs(hash(repr(b))) % 10000}", "capped": True, "size": b},
+        )
+        yield (
+            f"create.max={b!r}",
+            {"create": f"mx_{abs(hash(repr(b))) % 10000}", "capped": True, "size": 4096, "max": b},
+        )
+        yield (
+            f"listCollections.batchSize={b!r}",
+            {"listCollections": 1, "cursor": {"batchSize": b}},
+        )
         yield (f"listIndexes.batchSize={b!r}", {"listIndexes": "c", "cursor": {"batchSize": b}})
 
     # ---- string slots ----
@@ -135,30 +239,57 @@ def cases():
         yield (f"dropIndexes.index={b!r}", {"dropIndexes": "c", "index": b})
         yield (f"renameCollection.to={b!r}", {"renameCollection": "argtypes.c", "to": b})
         yield (f"find.comment={b!r}", {"find": "c", "comment": b})
-        yield (f"sortByCount.str={b!r}", {"aggregate": "c", "pipeline": [{"$sortByCount": b}], "cursor": {}})
+        yield (
+            f"sortByCount.str={b!r}",
+            {"aggregate": "c", "pipeline": [{"$sortByCount": b}], "cursor": {}},
+        )
         yield (f"collMod.viewOn={b!r}", {"collMod": "c", "viewOn": b})
 
     # ---- boolean slots ----
     for b in BOOLISH:
         yield (f"insert.ordered={b!r}", {"insert": "c", "documents": [{}], "ordered": b})
-        yield (f"update.ordered={b!r}", {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}}], "ordered": b})
-        yield (f"delete.ordered={b!r}", {"delete": "c", "deletes": [{"q": {}, "limit": 0}], "ordered": b})
-        yield (f"insert.bypass={b!r}", {"insert": "c", "documents": [{}], "bypassDocumentValidation": b})
+        yield (
+            f"update.ordered={b!r}",
+            {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}}], "ordered": b},
+        )
+        yield (
+            f"delete.ordered={b!r}",
+            {"delete": "c", "deletes": [{"q": {}, "limit": 0}], "ordered": b},
+        )
+        yield (
+            f"insert.bypass={b!r}",
+            {"insert": "c", "documents": [{}], "bypassDocumentValidation": b},
+        )
         yield (f"fam.remove={b!r}", {"findAndModify": "c", "query": {}, "remove": b})
-        yield (f"fam.new={b!r}", {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "new": b})
+        yield (
+            f"fam.new={b!r}",
+            {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "new": b},
+        )
         yield (f"find.tailable={b!r}", {"find": "c", "tailable": b})
         yield (f"find.awaitData={b!r}", {"find": "c", "tailable": True, "awaitData": b})
         yield (f"find.showRecordId={b!r}", {"find": "c", "showRecordId": b})
         yield (f"find.returnKey={b!r}", {"find": "c", "returnKey": b})
         yield (f"find.allowDiskUse={b!r}", {"find": "c", "allowDiskUse": b})
-        yield (f"agg.allowDiskUse={b!r}", {"aggregate": "c", "pipeline": [], "cursor": {}, "allowDiskUse": b})
-        yield (f"createIndexes.unique={b!r}",
-               {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "i", "unique": b}]})
-        yield (f"createIndexes.sparse={b!r}",
-               {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "i", "sparse": b}]})
-        yield (f"create.capped={b!r}", {"create": f"cp_{abs(hash(repr(b))) % 10000}", "capped": b, "size": 4096})
-        yield (f"renameCollection.dropTarget={b!r}",
-               {"renameCollection": "argtypes.c", "to": "argtypes.c2", "dropTarget": b})
+        yield (
+            f"agg.allowDiskUse={b!r}",
+            {"aggregate": "c", "pipeline": [], "cursor": {}, "allowDiskUse": b},
+        )
+        yield (
+            f"createIndexes.unique={b!r}",
+            {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "i", "unique": b}]},
+        )
+        yield (
+            f"createIndexes.sparse={b!r}",
+            {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "i", "sparse": b}]},
+        )
+        yield (
+            f"create.capped={b!r}",
+            {"create": f"cp_{abs(hash(repr(b))) % 10000}", "capped": b, "size": 4096},
+        )
+        yield (
+            f"renameCollection.dropTarget={b!r}",
+            {"renameCollection": "argtypes.c", "to": "argtypes.c2", "dropTarget": b},
+        )
 
 
 #: Sentinel for a shape pymongo refuses to ENCODE, so it never reaches the wire.

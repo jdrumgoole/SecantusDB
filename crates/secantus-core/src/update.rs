@@ -125,7 +125,7 @@ fn referenced_af_identifiers(update: &Document) -> std::collections::HashSet<Str
 /// through `$and`/`$or`/`$nor` sub-clauses. Mirrors `_extract_af_identifiers`
 /// (the `$expr`/no-identifier distinction only matters for Python's exact error
 /// code, so the bool isn't tracked here — an empty result defers regardless).
-fn extract_af_identifiers(f: &Document) -> Vec<String> {
+pub fn extract_af_identifiers(f: &Document) -> Vec<String> {
     fn walk(m: &Document, idents: &mut Vec<String>, seen: &mut std::collections::HashSet<String>) {
         for (key, value) in m {
             if key == "$and" || key == "$or" || key == "$nor" {
