@@ -9,13 +9,17 @@ A session ends well when someone arriving cold can tell what happened, what is
 true now, and what is left — from the repo alone, without this conversation.
 That takes four passes, in this order, because each depends on the one before.
 
-Two sibling skills own parts of it and are not repeated here:
+Its mirror is **`start-session`**: what this skill records at the end, that one
+reads at the beginning. Three sibling skills own parts of the work and are not
+repeated here:
 
 - **`batch-worktree`** — landing one branch: claim, commit, PR, watch CI, merge,
   tear down. The traps that make teardown fail live there.
 - **`session-cleanup`** — machine residue: daemons, WiredTiger temp stores, the
   `pytest-of-<user>` backlog, wedged background waiters, and whose debris is
   whose.
+- **`start-session`** — the opening checks, including the leftovers this skill
+  is responsible for not creating.
 
 This skill is the order to run them in, plus the documentation pass.
 
