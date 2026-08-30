@@ -200,8 +200,16 @@ the entry says); `pg_index.indpred` reflecting NULL.
 - **Float text rendering picked the wrong NOTATION — FIXED 2026-08-30, on both
   float types.** `SELECT CAST(80 AS REAL)` sent `8e+01` where PG sends `80`.
   Found by the sqllogictest gauge (`random/select/slt_good_1.test:26359`), which
-  compares raw text; that file now passes, taking the lane back to the committed
-  52/60.
+  compares raw text; that file now passes, taking the lane back to 52/60.
+
+  **The committed report had been asserting that file passed while it did not.**
+  `docs/validation-report-slt.md` was regenerated 2026-08-30 and had been stamped
+  **2026-08-11, version 0.6.0b9 — 19 days and 7 betas stale.** Its 52/60 headline
+  happened to be right again after this fix, which is the trap: a stale report
+  can agree with reality by coincidence and still be worthless as a baseline.
+  Nothing detects a stale generated report, so treat the stamp line as part of
+  the reading — if it names an older version than the tree, the numbers below it
+  are not evidence about the tree.
 
   **A driver-decoded comparison could not see this, and my first probe said the
   10 float4 shapes all matched** — psycopg decodes both sides to the same Python
