@@ -34,8 +34,12 @@ _pure = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_pure)
 
 
-def _rust_diff(pre, post):
-    res = _rust.compute_update_description(bson.encode(pre), bson.encode(post))
+def _rust_diff(pre, post, update=None):
+    res = _rust.compute_update_description(
+        bson.encode(pre),
+        bson.encode(post),
+        None if update is None else bson.encode(update),
+    )
     return None if res is None else bson.decode(res)
 
 
@@ -151,3 +155,40 @@ def test_apply_parity_fuzz():
         py = _pure.apply_update_description(bson.decode(bson.encode(pre)), diff)
         assert rust == py, f"apply divergence: rust={rust} pure={py} pre={pre} diff={diff}"
     assert handled > 1000, f"expected many handled cases, only {handled}"
+
+
+# --- Operator-aware array reporting -----------------------------------------
+#
+# mongod reports an array by the OPERATION that changed it, so the update spec
+# is part of the diff's input and both engines must read it identically. These
+# pin the shapes the change-stream probe measured against mongod 8.2.11; a
+# divergence here means one engine's classifier drifted from the other's.
+
+ARRAY_CASES = [
+    # (pre, post, update)
+    ({"a": [1, 2]}, {"a": [1, 2, 9]}, {"$push": {"a": 9}}),
+    ({"a": [1, 2]}, {"a": [1, 2, 8, 9]}, {"$push": {"a": {"$each": [8, 9]}}}),
+    ({"a": [1, 2]}, {"a": [1, 2, 7]}, {"$addToSet": {"a": 7}}),
+    ({"a": [1, 2, 3]}, {"a": [1, 9, 3]}, {"$set": {"a.1": 9}}),
+    ({"a": [1, 2, 3]}, {"a": [1, 2, 3, None, 8]}, {"$set": {"a.4": 8}}),
+    ({"a": [1, 2, 3]}, {"a": [1, 2]}, {"$pop": {"a": 1}}),
+    ({"a": [1, 2, 3]}, {"a": [2, 3]}, {"$pop": {"a": -1}}),
+    ({"a": [1, 2, 3]}, {"a": [1, 3]}, {"$pull": {"a": 2}}),
+    ({"a": [1, 2, 3]}, {"a": [1, 2]}, {"$push": {"a": {"$each": [], "$slice": 2}}}),
+    ({"a": [1, 2]}, {"a": [1, 2, 3]}, {"$set": {"a": [1, 2, 3]}}),
+    ({"a": [1, 2, 3]}, {"a": [1, 5, 3]}, {"$inc": {"a.1": 3}}),
+    ({"a": [{"x": 1}]}, {"a": [{"x": 2}]}, {"$set": {"a.0.x": 2}}),
+    # No spec at all, and a pipeline update: both diff the values.
+    ({"a": [1, 2, 3]}, {"a": [1, 2]}, None),
+]
+
+
+@pytest.mark.parametrize("pre,post,update", ARRAY_CASES)
+def test_array_operator_parity(pre, post, update):
+    pre = bson.decode(bson.encode(pre))
+    post = bson.decode(bson.encode(post))
+    rust = _rust_diff(pre, post, update)
+    if rust is None:
+        return
+    py = _pure.compute_update_description(pre, post, update)
+    assert rust == py, f"rust={rust} pure={py} pre={pre} post={post} update={update}"

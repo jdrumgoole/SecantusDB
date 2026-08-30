@@ -1157,37 +1157,36 @@ These are explicit non-goals. Don't add them without a reason.
   exhausted cursor — a stream that never yields and never explains; two wrong
   codes; and the event field order (`fullDocument` belongs immediately after
   `operationType`, not appended at the end — contents already matched).
-- [ ] **Change-stream `updateDescription` reports array edits in a shape mongod
-  never produces — we emit `truncatedArrays`, mongod (6.0.16) emits none, ever
-  (2026-08-29).** Measured with `tools/probes/change_streams.py` across eight
-  array mutations and four array sizes (5 / 20 / 100 / 1000); nine cases
-  diverge and only `$set` of one element agrees. mongod's rule is: any shrink
-  or reorder reports the **whole new array** under `updatedFields`, and an
-  append reports the **positional path** of the added element.
+- [x] **RESOLVED (2026-08-30): change-stream `updateDescription` now reports
+  array edits the way mongod does, on both servers.** The probe's array cases
+  went from 9 divergences to 0 (41-case sweep: 14 -> 4, the rest being the
+  expanded-event entry below).
 
-  | mutation | us | mongod |
-  |---|---|---|
-  | `$push` one | `updatedFields: {arr: [1,2,3,4,5,9]}` | `updatedFields: {arr.5: 9}` |
-  | `$pop` last | `truncatedArrays: [{field: arr, newSize: 4}]` | `updatedFields: {arr: [1,2,3,4]}` |
-  | `$pop` first | `{arr.0..arr.3}` + `truncatedArrays` | `updatedFields: {arr: [2,3,4,5]}` |
-  | `$pull` middle | `{arr.2, arr.3}` + `truncatedArrays` | `updatedFields: {arr: [1,2,4,5]}` |
-  | `$slice` keep 2 | `truncatedArrays: [{field: arr, newSize: 2}]` | `updatedFields: {arr: [1,2]}` |
-  | replace array | `{arr.0, arr.1}` + `truncatedArrays` | `updatedFields: {arr: [7,8]}` |
+  **The claim this entry was filed with was wrong in an instructive way.** It
+  said mongod "never emits `truncatedArrays`", measured across eight mutations
+  and four array sizes. mongod does emit it — for **aggregation-pipeline**
+  updates. `[{$set: {a: [...shorter...]}}]` reports a truncation where the same
+  `$set` as an *operator* resends the whole array. The original sweep only
+  probed operator updates, so it generalised from half the surface; pymongo's
+  unified "Test array truncation" spec had been asserting the pipeline
+  behaviour correctly all along.
 
-  Array size does not change mongod's answer (checked at 20/100/1000 — it does
-  NOT switch to a truncation form for large arrays, which was the reason to
-  suspect a size threshold). **Re-probed against mongod 8.3.4 (2026-08-30):
-  the class survives the version change — still 14 of 41 cases, still no
-  `truncatedArrays` ever — but the shape is itself version-dependent.
-  `$addToSet` reports the whole array on 6.0.16 and the positional `arr.5: 42`
-  on 8.3.4, so 8.x is more aggressively positional than 6.0. Fixing this must
-  therefore target ONE version deliberately, not "mongod".** Deliberately **not** fixed in the sweep that found
-  it: the diff walk is parity-mirrored (`src/secantus/diff.py` +
-  `crates/secantus-core/src/diff.rs`) and ~19 assertions across
-  `tests/test_diff.py` and `tests/test_change_streams.py` pin the current
-  behaviour, so it is its own slice. Note `truncatedArrays` is a real mongod
-  field — this is about when it is emitted, and 6.0.16 never emits it for any
-  mutation probed.
+  The rule, measured on 8.2.11 and now implemented in both engines, is
+  **operation-shaped**:
+
+  | update | mongod |
+  |---|---|
+  | `$push` / `$addToSet` (no `$slice`/`$sort`/`$position`) | `arr.<i>` per appended index |
+  | `$set`/`$unset`/`$inc`/`$mul`/`$min`/`$max` of an indexed path | that path only — `$set: {"arr.7": 77}` on a 5-array reports `arr.7` and NOT the nulls it creates at 5 and 6 |
+  | `$pop` / `$pull` / `$pullAll` / sliced or sorted `$push` / whole-field `$set` | the whole array |
+  | any **pipeline** update | value diff, including `truncatedArrays` on a shrink |
+
+  Because `$set: {arr: [1,2,3,4,5,6,7]}` and `$push: {arr: {$each: [6,7]}}`
+  produce an identical document and are reported differently, no value-only
+  diff can be exact: `compute_update_description` now takes the update spec
+  (`compute_update_description_for` in Rust), threaded through four storage
+  signatures on the Rust side. Omitting it means the value diff, which is what
+  pipelines want.
 
 - [ ] **WATCH (not a defect today): `fullDocument`'s position in a change event
   moved in mongod 8.3, and we match the 8.2.1 target (2026-08-30).** Measured

@@ -5724,7 +5724,10 @@ class Storage:
                         if is_replacement:
                             o_field: dict[str, Any] = dict(new)
                         else:
-                            o_field = {"$v": 2, "diff": compute_update_description(doc, new)}
+                            o_field = {
+                                "$v": 2,
+                                "diff": compute_update_description(doc, new, update),
+                            }
                         oplog_entries.append(
                             {
                                 "op": "u",
@@ -5904,7 +5907,10 @@ class Storage:
                         if is_replacement:
                             o_field: dict[str, Any] = dict(new)
                         else:
-                            o_field = {"$v": 2, "diff": compute_update_description(doc, new)}
+                            o_field = {
+                                "$v": 2,
+                                "diff": compute_update_description(doc, new, update),
+                            }
                         oplog_entries.append(
                             {
                                 "op": "u",
