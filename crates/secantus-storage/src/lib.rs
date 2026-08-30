@@ -367,7 +367,12 @@ fn unframe_doc_value(value: &[u8]) -> Result<(&[u8], &[u8])> {
 /// born-sharded store's legacy table is empty, so this is a quick no-op scan on
 /// open. Runs on the bootstrap session before the connection serves requests.
 fn migrate_legacy_docs(session: &Session, data_nonlogged: bool) -> Result<()> {
-    let src = session.open_cursor(DOC_TABLE, None)?;
+    // Never created on a born-sharded store: nothing to fold in.
+    let src = match session.open_cursor(DOC_TABLE, None) {
+        Ok(c) => c,
+        Err(e) if e.is_missing_table() => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
     let mut rows: Vec<(String, String, Vec<u8>, Vec<u8>)> = Vec::new();
     let mut more = src.next()?;
     while more {
@@ -1357,15 +1362,20 @@ const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u";
 // collections + documents tables, but creating the rest keeps the on-disk schema
 // identical so later sub-phases don't need a migration.
 const BOOTSTRAP: &[(&str, &str)] = &[
+    // NOTE: DOC_TABLE (the pre-shard single documents table) and
+    // table:secantus_natural (the old forward seq -> id_key index) are LEGACY
+    // formats nothing writes any more, so they are NOT created here. Creating
+    // them cost ~9.7 ms each on every open just so the migration and the drop
+    // paths could find them empty. A store that HAS them still migrates and
+    // drops correctly -- every reader treats an absent table as empty.
+    // Mirrors the Python `Storage` bootstrap.
     (COLL_TABLE, "key_format=SS,value_format=u"),
     (TOMB_TABLE, "key_format=SS,value_format=u"),
-    (DOC_TABLE, DOC_TABLE_CFG),
     ("table:secantus_indexes", "key_format=SSS,value_format=u"),
     (
         "table:secantus_index_entries",
         "key_format=SSSu,value_format=u",
     ),
-    ("table:secantus_natural", "key_format=SSq,value_format=u"),
     (
         "table:secantus_unique_keys",
         "key_format=SSSu,value_format=q",
@@ -1640,10 +1650,10 @@ fn update_would_change_id(update: &Document, old_id: &Bson) -> bool {
                 }
             }
             "$unset" | "$inc" | "$mul" | "$min" | "$max" | "$pop" | "$push" | "$pull"
-            | "$pullAll" | "$addToSet" | "$bit" | "$currentDate" => {
-                if touches_id(fields) {
-                    return true;
-                }
+            | "$pullAll" | "$addToSet" | "$bit" | "$currentDate"
+                if touches_id(fields) =>
+            {
+                return true;
             }
             "$rename" => {
                 for (from, to) in fields {
@@ -8501,36 +8511,47 @@ impl Storage {
     /// Drop every natural-order entry for `(db, coll)` (both directions) — called
     /// on drop / rename so a later re-create can't resurrect stale positions.
     fn drop_nat_collection(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
-        // Forward (db, coll, seq): collect this collection's seqs, then remove.
-        let nat = session.open_cursor(NAT_TABLE, None)?;
-        nat.set_key_ssq(db, coll, i64::MIN);
-        let mut more = match nat.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    nat.next()?
-                } else {
-                    true
+        // Forward (db, coll, seq) in the LEGACY table: collect this
+        // collection's seqs, then remove. The table is not created on a new
+        // store, and an absent one simply has no rows -- but this must NOT
+        // return early, because the reverse half below cleans NAT_SEQ_TABLE,
+        // the live `_id` index. Skipping that leaves stale index entries that
+        // reject a re-insert into the recreated namespace with a duplicate
+        // key (caught by drop_chunk::drop_collection_survives_a_small_cache).
+        if let Some(nat) = match session.open_cursor(NAT_TABLE, None) {
+            Ok(c) => Some(c),
+            Err(e) if e.is_missing_table() => None,
+            Err(e) => return Err(e.into()),
+        } {
+            nat.set_key_ssq(db, coll, i64::MIN);
+            let mut more = match nat.search_near() {
+                Ok(cmp) => {
+                    if cmp < 0 {
+                        nat.next()?
+                    } else {
+                        true
+                    }
+                }
+                Err(e) if e.is_not_found() => false,
+                Err(e) => return Err(e.into()),
+            };
+            let mut seqs: Vec<i64> = Vec::new();
+            while more {
+                let (d, c, seq) = nat.get_key_ssq()?;
+                if d != db || c != coll {
+                    break;
+                }
+                seqs.push(seq);
+                more = nat.next()?;
+            }
+            for seq in seqs {
+                nat.set_key_ssq(db, coll, seq);
+                if nat.search().is_ok() {
+                    nat.remove()?;
                 }
             }
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
-        };
-        let mut seqs: Vec<i64> = Vec::new();
-        while more {
-            let (d, c, seq) = nat.get_key_ssq()?;
-            if d != db || c != coll {
-                break;
-            }
-            seqs.push(seq);
-            more = nat.next()?;
         }
-        for seq in seqs {
-            nat.set_key_ssq(db, coll, seq);
-            if nat.search().is_ok() {
-                nat.remove()?;
-            }
-        }
-        // Reverse (db, coll, id_key).
+        // Reverse (db, coll, id_key) in the LIVE `_id` index -- always run.
         let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
         rev.set_key_ssu(db, coll, b"");
         let mut more = match rev.search_near() {
@@ -9309,33 +9330,44 @@ impl Storage {
         coll: &str,
         limit: usize,
     ) -> Result<usize> {
-        let nat = session.open_cursor(NAT_TABLE, None)?;
-        nat.set_key_ssq(db, coll, i64::MIN);
-        let mut more = match nat.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    nat.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
-        };
+        // Forward half, in the LEGACY table. It is not created on a new store,
+        // and an absent one has no rows -- but this must NOT return early: the
+        // reverse half below purges NAT_SEQ_TABLE, the live `_id` index, and
+        // skipping it leaves entries that reject a re-insert into the
+        // recreated namespace (caught by
+        // drop_chunk::drop_collection_survives_a_small_cache).
         let mut seqs: Vec<i64> = Vec::new();
-        while more && seqs.len() < limit {
-            let (d, c, seq) = nat.get_key_ssq()?;
-            if d != db || c != coll {
-                break;
+        if let Some(nat) = match session.open_cursor(NAT_TABLE, None) {
+            Ok(c) => Some(c),
+            Err(e) if e.is_missing_table() => None,
+            Err(e) => return Err(e.into()),
+        } {
+            nat.set_key_ssq(db, coll, i64::MIN);
+            let mut more = match nat.search_near() {
+                Ok(cmp) => {
+                    if cmp < 0 {
+                        nat.next()?
+                    } else {
+                        true
+                    }
+                }
+                Err(e) if e.is_not_found() => false,
+                Err(e) => return Err(e.into()),
+            };
+            while more && seqs.len() < limit {
+                let (d, c, seq) = nat.get_key_ssq()?;
+                if d != db || c != coll {
+                    break;
+                }
+                seqs.push(seq);
+                more = nat.next()?;
             }
-            seqs.push(seq);
-            more = nat.next()?;
-        }
-        for seq in &seqs {
-            nat.reset()?;
-            nat.set_key_ssq(db, coll, *seq);
-            if nat.search().is_ok() {
-                nat.remove()?;
+            for seq in &seqs {
+                nat.reset()?;
+                nat.set_key_ssq(db, coll, *seq);
+                if nat.search().is_ok() {
+                    nat.remove()?;
+                }
             }
         }
         let mut deleted = seqs.len();
