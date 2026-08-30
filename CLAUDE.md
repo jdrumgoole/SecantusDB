@@ -16,18 +16,32 @@ The audience is developers who want fast, ephemeral, in-process MongoDB behaviou
 
 ## Design constraints
 
-- **The error surface targets mongod 8.x** (probed against 8.2.1; retargeted
-  from 6.0.16 on 2026-08-29). `tests/test_mongod_differential.py` is the gate: it
-  runs every supported operation against a real `mongod` and asserts an *exact*
-  match. It gates on the **major** (`PROBED_MONGOD_MAJOR`), so any 8.x runs it
-  and only a different major skips — mongod's error surface is stable within a
-  major, so a mismatch on 8.0 or 8.4 is far more likely to be a real divergence
-  than version drift, and a loud failure beats a silent skip. If a future 8.x
-  does move a surface, re-probe rather than widening the skip. Note CI installs `mongosh` and
-  `mongodb-database-tools` but **not `mongod`**, so that gate only ever runs on a
-  dev box — run it locally before changing an error message. Comments saying
-  "probed 6.0.16" without naming 8.x predate the retarget and were not
-  re-verified; re-probe before relying on one.
+- **mongod 8.x is the only version we target.** Not just the error surface —
+  every behaviour. 6.0 was the reference until 2026-08-29 and is now history:
+  when 8.x and 6.0 disagree, **8.x is right by definition** and matching 6.0 is
+  a bug, however long-standing. Probed against 8.2.1 and 8.2.11. Do not add
+  6.0-compatibility branches, and do not "fix" a difference that only appears
+  on 6.0.
+
+  `tests/test_mongod_differential.py` is the gate: it runs every supported
+  operation against a real `mongod` and asserts an *exact* match. It gates on
+  the **major** (`PROBED_MONGOD_MAJOR`), so any 8.x runs it and only a different
+  major skips — a loud failure beats a silent skip. **CI installs `mongosh` and
+  `mongodb-database-tools` but NOT `mongod`**, so the gate only ever runs on a
+  dev box; run it locally before changing an error message.
+
+  **"Stable within a major" is a good default and not a guarantee** — two
+  measured counterexamples, so probe rather than assume when a difference looks
+  version-shaped:
+  - `fullDocument`'s position in a change event is the same on 6.0.16 and
+    8.2.1, and **moves to the end in 8.3.4** (a minor bump).
+  - A wrong-type error's expected-type list is rendered in a different ORDER by
+    8.2.1 and 8.2.11 (a *patch* bump). Stable per build, so it pinned a build
+    rather than a behaviour; the gate now compares that list as the set it is.
+
+  Comments saying "probed 6.0.16" without naming 8.x predate the retarget and
+  were not re-verified — they record when something was measured, not what the
+  server does now. Re-probe before relying on one.
 - **`pymongo` is the conformance target.** Behaviour is "correct" when a `pymongo` client cannot tell SecantusDB apart from a real `mongod` for the operations it supports. When in doubt, write a test that runs the same code against `pymongo` → SecantusDB and `pymongo` → real MongoDB and assert the responses match.
 - **Wire-protocol fidelity over feature completeness.** Prefer returning a faithful "command not supported" error over a half-implemented feature that silently diverges from real server behaviour.
 - **Ease of use for the beginning programmer:** starting a server in a test should be one or two lines, with no external processes to manage.
@@ -82,7 +96,7 @@ Unique enforcement is a prefix probe on the entries table, not a full scan.
 
 `aggregate` also lifts a leading `$match` stage into the initial fetch's filter so a pipeline starting with `[{$match: {...}}]` benefits from the same index acceleration as `find`. The `$match` stage is then skipped in the pipeline so the filter isn't re-applied.
 
-`explain` reports `IXSCAN` when an index would be used and `COLLSCAN` otherwise. `Storage.explain_plan(...)` mirrors `find_matching`'s routing decisions without executing them and returns `{"kind": "IXSCAN", "index_name", "key_pattern", "direction", "multikey"}` or `{"kind": "COLLSCAN"}`; the `_explain` command shapes that into MongoDB's `winningPlan` (`FETCH` wrapping an `IXSCAN` inputStage, with `indexName` / `keyPattern` / `direction` / `isMultiKey`). The internal `multikey` catalog flag is stripped from `listIndexes` on the way out — mongod doesn't carry it there (probed 6.0.16); `Storage.index_is_multikey` is the accessor for it. Picker helpers (`_pick_compound_eq_index`, `_pick_compound_range_index`, `_find_leading_field_index`) are shared between the lookup and planning paths.
+`explain` reports `IXSCAN` when an index would be used and `COLLSCAN` otherwise. `Storage.explain_plan(...)` mirrors `find_matching`'s routing decisions without executing them and returns `{"kind": "IXSCAN", "index_name", "key_pattern", "direction", "multikey"}` or `{"kind": "COLLSCAN"}`; the `_explain` command shapes that into MongoDB's `winningPlan` (`FETCH` wrapping an `IXSCAN` inputStage, with `indexName` / `keyPattern` / `direction` / `isMultiKey`). The internal `multikey` catalog flag is stripped from `listIndexes` on the way out — mongod doesn't carry it there (re-probed 8.2.11, 2026-08-30); `Storage.index_is_multikey` is the accessor for it. Picker helpers (`_pick_compound_eq_index`, `_pick_compound_range_index`, `_find_leading_field_index`) are shared between the lookup and planning paths.
 
 **Direction support**: single-field and compound indexes accept any per-field direction. The encoder bitwise-inverts the bytes for DESC fields so the WT B-tree gives us the index's natural order with a forward walk. Equality, `$in`, range (`$gt`/`$gte`/`$lt`/`$lte`) — operator semantics flip automatically when targeting a DESC field — and direction-aware sort acceleration all work end-to-end on single-field indexes, and the equality/prefix/trailing-operator paths all work on mixed-direction compound indexes.
 
@@ -260,8 +274,12 @@ Both procedures are managed by skills — they auto-fire on the relevant trigger
 
 Every bug found in the 2026-08 sweeps came from **executing behaviour and
 comparing against a real server**, not from reading code or the backlog. Two
-oracles are on this box and both are cheap: `mongod` on `PATH` (Homebrew
-`@6.0`), and a live PostgreSQL 14 for the SQL side. The standing gate is
+reference servers are on this box and both are cheap: `mongod` on `PATH`
+(Homebrew `mongodb-community@8.2`, currently **8.2.11**, linked as the default
+so the differential gate runs instead of skipping), and a live PostgreSQL 14 for
+the SQL side. 6.0.16 and 8.3.4 are still installed at their keg paths
+(`/opt/homebrew/opt/mongodb-community@{6.0,8.3}/bin/mongod`) — for probing a
+version difference, never as a target. The standing gate is
 `tests/test_mongod_differential.py` (`pytest -m differential`) — a probe that
 finds something belongs there, or the next session re-finds it.
 
