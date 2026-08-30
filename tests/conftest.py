@@ -176,6 +176,26 @@ def wt_home(_wt_template: str, tmp_path) -> str:
     return str(dest)
 
 
+@pytest.fixture(scope="module")
+def wt_home_module(_wt_template: str, tmp_path_factory: pytest.TempPathFactory) -> str:
+    """One cloned WiredTiger home shared by a whole test MODULE.
+
+    ``wt_home`` gives every test its own store, which is the safe default. A
+    module that stands its server up once amortises the ~236 ms open across all
+    its tests instead of paying it each time — but only where the tests do not
+    collide, since they then share one server's databases.
+
+    Use it ONLY in modules where every test already writes to its own namespace
+    and nothing depends on a private server (no change streams, oplog, reopen,
+    capped collections, TTL clocks, cluster time or auth state).
+    """
+    from wt_template import clone_template  # lazy -- see _wt_template above
+
+    dest = tmp_path_factory.mktemp("wt-module") / "wt"
+    clone_template(_wt_template, str(dest))
+    return str(dest)
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Refuse to run under a ``tmp_path_retention_policy`` that deletes tmp
     dirs mid-session.

@@ -35,9 +35,13 @@ from pymongo.errors import OperationFailure
 from secantus import SecantusDBServer
 
 
-@pytest.fixture
-def server(wt_home):
-    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
+# Module-scoped: this file's tests each use their own collection, so one
+# server serves them all and the ~236 ms store open is paid once, not per
+# test. Do NOT widen this to a module whose tests share a namespace, or
+# that needs a private oplog / cluster time / reopen.
+@pytest.fixture(scope="module")
+def server(wt_home_module):
+    with SecantusDBServer(port=0, storage_path=wt_home_module) as srv:
         yield srv
 
 
