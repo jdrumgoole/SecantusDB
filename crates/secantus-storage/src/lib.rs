@@ -5294,6 +5294,10 @@ impl Storage {
         let session = self.conn.open_session()?;
         ensure_collection(&session, db, coll, self.data_nonlogged)?;
         let mut current = coll_options(&session, db, coll)?.unwrap_or_default();
+        // The options BEFORE the merge below: mongod puts these on the `modify`
+        // change event as `stateBeforeChange`, and stores them in the oplog
+        // entry's `o2.collectionOptions_old` (probed 8.2.11).
+        let state_before = current.clone();
         for (k, v) in opts {
             current.insert(k.clone(), v.clone());
         }
@@ -5305,11 +5309,24 @@ impl Storage {
             for (k, v) in opts {
                 o.insert(k.clone(), v.clone());
             }
+            // `uuid` is set explicitly and any inbound one dropped, so the
+            // stored value is the BSON binary form and leads the document --
+            // mongod's key order.
+            let mut old_opts = Document::new();
+            old_opts.insert("uuid", uuid_binary(&ui));
+            for (k, v) in &state_before {
+                if k != "uuid" {
+                    old_opts.insert(k.clone(), v.clone());
+                }
+            }
+            let mut o2 = Document::new();
+            o2.insert("collectionOptions_old", Bson::Document(old_opts));
             let mut entry = Document::new();
             entry.insert("op", "c");
             entry.insert("ns", format!("{db}.$cmd"));
             entry.insert("ui", uuid_binary(&ui));
             entry.insert("o", Bson::Document(o));
+            entry.insert("o2", Bson::Document(o2));
             self.emit_oplog(&session, vec![entry], vec![None])?;
         }
         Ok(())
