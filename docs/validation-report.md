@@ -1,6 +1,6 @@
 # pymongo Validation Report
 
-Generated 2026-08-24 — SecantusDB 0.6.0b15 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-08-30 — SecantusDB 0.6.0b16 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate` to refresh. The pass rate is the best honest measure of how close SecantusDB is to a complete MongoDB surrogate for the in-scope wire-protocol surface; gaps are the to-do list.
 
@@ -10,15 +10,15 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 |---|---:|---:|---:|---:|---:|---:|
 | `test_binary.py` | 29 | 0 | 0 | 0 | 29 | 100.0% |
 | `test_bulk.py` | 34 | 0 | 0 | 4 | 38 | 100.0% |
-| `test_change_stream.py` | 106 | 0 | 0 | 49 | 155 | 100.0% |
+| `test_change_stream.py` | 109 | 0 | 0 | 46 | 155 | 100.0% |
 | `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
 | `test_collection.py` | 85 | 2 | 0 | 4 | 91 | 97.7% |
 | `test_collection_management.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
 | `test_command_logging.py` | 22 | 0 | 0 | 14 | 36 | 100.0% |
-| `test_command_monitoring.py` | 31 | 0 | 0 | 7 | 38 | 100.0% |
+| `test_command_monitoring.py` | 32 | 0 | 0 | 6 | 38 | 100.0% |
 | `test_comment.py` | 3 | 0 | 0 | 0 | 3 | 100.0% |
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_crud_unified.py` | 301 | 0 | 0 | 185 | 486 | 100.0% |
+| `test_crud_unified.py` | 344 | 0 | 0 | 142 | 486 | 100.0% |
 | `test_crud_v1.py` | 14 | 0 | 0 | 0 | 14 | 100.0% |
 | `test_cursor.py` | 64 | 3 | 0 | 5 | 72 | 95.5% |
 | `test_custom_types.py` | 51 | 0 | 0 | 0 | 51 | 100.0% |
@@ -32,11 +32,11 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_read_preferences.py` | 9 | 0 | 0 | 20 | 29 | 100.0% |
 | `test_results.py` | 5 | 0 | 0 | 0 | 5 | 100.0% |
 | `test_run_command.py` | 16 | 0 | 0 | 5 | 21 | 100.0% |
-| `test_transactions_unified.py` | 92 | 0 | 0 | 172 | 264 | 100.0% |
+| `test_transactions_unified.py` | 95 | 0 | 0 | 169 | 264 | 100.0% |
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
+| `test_versioned_api_integration.py` | 39 | 0 | 0 | 4 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **1020** | **5** | **0** | **475** | **1500** | **99.5%** |
+| **Overall** | **1071** | **5** | **0** | **424** | **1500** | **99.5%** |
 
 ## Failures (5)
 
