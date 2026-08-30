@@ -24,19 +24,30 @@ import pytest
 from secantus import SecantusDBServer
 
 
+# The server is module-scoped, but `db` stays per-test: this file's fixture
+# SEEDS data, and seeding once while a shared server kept the rows would let
+# one test's writes reach the next. Each test gets a fresh client, a fresh
+# seed, and drops its database on the way out -- so only the ~236 ms store
+# open is shared, not any state.
+@pytest.fixture(scope="module")
+def _server(wt_home_module):
+    with SecantusDBServer(port=0, storage_path=wt_home_module) as srv:
+        yield srv
+
+
 @pytest.fixture
-def db(wt_home):
-    srv = SecantusDBServer(port=0, storage_path=wt_home)
-    srv.start()
-    cli = pymongo.MongoClient(f"mongodb://{srv.address[0]}:{srv.address[1]}", directConnection=True)
+def db(_server):
+    cli = pymongo.MongoClient(
+        f"mongodb://{_server.address[0]}:{_server.address[1]}", directConnection=True
+    )
     try:
         d = cli["hint"]
         d.c.insert_many([{"_id": i, "a": i} for i in range(1, 6)])
         d.c.create_index([("a", 1)], name="a_1")
         yield d
     finally:
+        cli.drop_database(d.name)
         cli.close()
-        srv.stop()
 
 
 def _err(db, cmd):
