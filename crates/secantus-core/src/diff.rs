@@ -7,7 +7,7 @@
 //! (`expressions::py_eq`); a Decimal128 / exotic value anywhere defers the whole
 //! diff to pure Python.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bson::{Bson, Document};
 
@@ -22,6 +22,12 @@ struct Acc {
     updated: Document,
     removed: Vec<Bson>,
     truncated: Vec<Bson>,
+    /// Array paths the UPDATE touched element-wise, mapped to the indices past
+    /// the old end that may be reported (`None` = any, an append knows every
+    /// index it wrote). `None` for the whole field means "no operator update":
+    /// pipeline updates and callers with no spec diff the values instead.
+    /// See this module's docs.
+    elementwise: Option<BTreeMap<String, Option<BTreeSet<i64>>>>,
     disambiguated: Document,
 }
 
@@ -86,24 +92,56 @@ fn walk(pre: &Bson, post: &Bson, path: &str, segments: &[Bson], acc: &mut Acc) -
             if eq(pre, post)? {
                 return Ok(());
             }
-            // Post longer than pre -> wholesale replace (can't encode appends).
-            if b.len() > a.len() {
+            // mongod reports an array by the OPERATION that changed it, not by
+            // diffing the values. Mirrors `_walk` in src/secantus/diff.py.
+            let Some(ew) = acc.elementwise.as_ref() else {
+                // Pipeline update (or no spec): diff the values. This is the one
+                // shape where mongod really does emit `truncatedArrays`.
+                for i in 0..b.len() {
+                    let cp = child_path(path, &i.to_string());
+                    let mut cs = segments.to_vec();
+                    cs.push(Bson::Int32(i as i32));
+                    if i >= a.len() {
+                        acc.updated.insert(cp.clone(), b[i].clone());
+                        record_ambiguous(&cp, &cs, acc);
+                        continue;
+                    }
+                    walk(&a[i], &b[i], &cp, &cs, acc)?;
+                }
+                if b.len() < a.len() {
+                    let mut entry = Document::new();
+                    entry.insert("field".to_string(), Bson::String(path.to_string()));
+                    entry.insert("newSize".to_string(), Bson::Int32(b.len() as i32));
+                    acc.truncated.push(Bson::Document(entry));
+                    record_ambiguous(path, segments, acc);
+                }
+                return Ok(());
+            };
+            let beyond = ew.get(path);
+            if beyond.is_none() || b.len() < a.len() {
+                // Not element-wise, or it shrank: mongod resends the array.
                 acc.updated.insert(path.to_string(), post.clone());
                 record_ambiguous(path, segments, acc);
                 return Ok(());
             }
+            let allowed = beyond.and_then(|v| v.clone());
             for i in 0..b.len() {
                 let cp = child_path(path, &i.to_string());
                 let mut cs = segments.to_vec();
                 cs.push(Bson::Int32(i as i32));
+                if i >= a.len() {
+                    // An append reports every index it wrote; an indexed `$set`
+                    // reports only the one it named.
+                    if let Some(named) = allowed.as_ref() {
+                        if !named.contains(&(i as i64)) {
+                            continue;
+                        }
+                    }
+                    acc.updated.insert(cp.clone(), b[i].clone());
+                    record_ambiguous(&cp, &cs, acc);
+                    continue;
+                }
                 walk(&a[i], &b[i], &cp, &cs, acc)?;
-            }
-            if b.len() < a.len() {
-                let mut entry = Document::new();
-                entry.insert("field".to_string(), Bson::String(path.to_string()));
-                entry.insert("newSize".to_string(), Bson::Int32(b.len() as i32));
-                acc.truncated.push(Bson::Document(entry));
-                record_ambiguous(path, segments, acc);
             }
             Ok(())
         }
@@ -117,14 +155,88 @@ fn walk(pre: &Bson, post: &Bson, path: &str, segments: &[Bson], acc: &mut Acc) -
     }
 }
 
+/// Operators whose effect on an array mongod reports element-wise, provided
+/// they are a plain append (`$slice` / `$sort` / `$position` reorder or shrink
+/// the array, and mongod then sends the whole thing).
+const APPEND_OPS: &[&str] = &["$push", "$addToSet"];
+const NON_APPEND_MODIFIERS: &[&str] = &["$slice", "$sort", "$position"];
+/// Operators that write ONE named path. An indexed path under any of them makes
+/// that array element-wise -- checked against mongod 8.2.11.
+const PATH_WRITE_OPS: &[&str] = &[
+    "$set",
+    "$unset",
+    "$inc",
+    "$mul",
+    "$min",
+    "$max",
+    "$currentDate",
+    "$bit",
+];
+
+/// Array paths this update touches in a way mongod reports element-wise.
+/// Mirrors `_elementwise_array_paths` in `src/secantus/diff.py`.
+fn elementwise_array_paths(update: &Document) -> BTreeMap<String, Option<BTreeSet<i64>>> {
+    let mut paths: BTreeMap<String, Option<BTreeSet<i64>>> = BTreeMap::new();
+    for (op, spec) in update.iter() {
+        let Some(spec) = spec.as_document() else {
+            continue;
+        };
+        if APPEND_OPS.contains(&op.as_str()) {
+            for (field, value) in spec.iter() {
+                if let Some(d) = value.as_document() {
+                    if NON_APPEND_MODIFIERS.iter().any(|m| d.contains_key(*m)) {
+                        continue; // reorders or truncates -> whole array
+                    }
+                }
+                paths.insert(field.clone(), None);
+            }
+        } else if PATH_WRITE_OPS.contains(&op.as_str()) {
+            for field in spec.keys() {
+                let parts: Vec<&str> = field.split('.').collect();
+                for (i, part) in parts.iter().enumerate() {
+                    if i == 0 || !part.chars().all(|c| c.is_ascii_digit()) {
+                        continue;
+                    }
+                    let prefix = parts[..i].join(".");
+                    match paths.get(&prefix) {
+                        Some(None) => continue, // an append already allowed any index
+                        _ => {
+                            let entry =
+                                paths.entry(prefix).or_insert_with(|| Some(BTreeSet::new()));
+                            if let Some(set) = entry.as_mut() {
+                                if let Ok(n) = part.parse::<i64>() {
+                                    set.insert(n);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    paths
+}
+
 /// `{updatedFields, removedFields, truncatedArrays}` for `pre` -> `post`.
 /// `Err(Fallback)` => defer to the pure-Python implementation.
 pub fn compute_update_description(pre: &Document, post: &Document) -> R<Document> {
+    compute_update_description_for(pre, post, None)
+}
+
+/// As above, told which update produced `post`. `update` is the operator
+/// document; pass `None` for a pipeline update or when the spec is unknown, and
+/// arrays are diffed by value (which is what mongod does for pipelines).
+pub fn compute_update_description_for(
+    pre: &Document,
+    post: &Document,
+    update: Option<&Document>,
+) -> R<Document> {
     let mut acc = Acc {
         updated: Document::new(),
         removed: Vec::new(),
         truncated: Vec::new(),
         disambiguated: Document::new(),
+        elementwise: update.map(elementwise_array_paths),
     };
     walk_docs(pre, post, "", &[], &mut acc)?;
     let mut out = Document::new();
@@ -240,13 +352,55 @@ mod tests {
         );
     }
 
+    /// Growth used to wholesale-replace here. Measured against mongod 8.2.11 it
+    /// is reported positionally -- for a pipeline update (no spec) and for a
+    /// `$push` alike. Only a whole-field operator `$set` resends the array.
     #[test]
-    fn array_growth_wholesale() {
+    fn array_growth_reports_appended_indices() {
         let out = d(doc! {"a": [1, 2]}, doc! {"a": [1, 2, 3]});
+        assert_eq!(out.get_document("updatedFields").unwrap(), &doc! {"a.2": 3});
+
+        let pushed = compute_update_description_for(
+            &doc! {"a": [1, 2]},
+            &doc! {"a": [1, 2, 3]},
+            Some(&doc! {"$push": {"a": 3}}),
+        )
+        .unwrap();
         assert_eq!(
-            out.get_document("updatedFields").unwrap(),
+            pushed.get_document("updatedFields").unwrap(),
+            &doc! {"a.2": 3}
+        );
+
+        let whole = compute_update_description_for(
+            &doc! {"a": [1, 2]},
+            &doc! {"a": [1, 2, 3]},
+            Some(&doc! {"$set": {"a": [1, 2, 3]}}),
+        )
+        .unwrap();
+        assert_eq!(
+            whole.get_document("updatedFields").unwrap(),
             &doc! {"a": [1, 2, 3]}
         );
+    }
+
+    /// A shrink by an OPERATOR resends the array; the same shrink with no spec
+    /// (pipeline form) reports a truncation. Both measured on 8.2.11.
+    #[test]
+    fn array_shrink_depends_on_the_operation() {
+        let popped = compute_update_description_for(
+            &doc! {"a": [1, 2, 3]},
+            &doc! {"a": [1, 2]},
+            Some(&doc! {"$pop": {"a": 1}}),
+        )
+        .unwrap();
+        assert_eq!(
+            popped.get_document("updatedFields").unwrap(),
+            &doc! {"a": [1, 2]}
+        );
+        assert!(popped.get_array("truncatedArrays").unwrap().is_empty());
+
+        let pipeline = d(doc! {"a": [1, 2, 3]}, doc! {"a": [1, 2]});
+        assert_eq!(pipeline.get_array("truncatedArrays").unwrap().len(), 1);
     }
 
     /// `apply_update_description` is the exact inverse of `compute`: rolling the

@@ -457,20 +457,34 @@ fn apply_projection_batch(
 /// `{updatedFields, removedFields, truncatedArrays}` document's bytes, or `None`
 /// to fall back to pure Python (Decimal128 / exotic values).
 #[pyfunction]
+#[pyo3(signature = (pre_bytes, post_bytes, update_bytes=None))]
 fn compute_update_description(
     py: Python<'_>,
     pre_bytes: &[u8],
     post_bytes: &[u8],
+    // The operator update that produced `post`, so arrays are reported the way
+    // mongod does. `None` means a pipeline update (or no spec), which mongod
+    // diffs by value -- see `secantus_core::diff`.
+    update_bytes: Option<&[u8]>,
 ) -> PyResult<Option<Py<PyBytes>>> {
     let pre: Document = bson::from_slice(pre_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid pre BSON: {e}")))?;
     let post: Document = bson::from_slice(post_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid post BSON: {e}")))?;
+    let update: Option<Document> = match update_bytes {
+        Some(b) => Some(
+            bson::from_slice(b)
+                .map_err(|e| PyValueError::new_err(format!("invalid update BSON: {e}")))?,
+        ),
+        None => None,
+    };
     let out = py
-        .detach(|| match diff::compute_update_description(&pre, &post) {
-            Ok(out) => encode_doc(&out).map(Some),
-            Err(diff::Fallback) => Ok(None),
-        })
+        .detach(
+            || match diff::compute_update_description_for(&pre, &post, update.as_ref()) {
+                Ok(out) => encode_doc(&out).map(Some),
+                Err(diff::Fallback) => Ok(None),
+            },
+        )
         .map_err(PyValueError::new_err)?;
     Ok(out.map(|b| to_pybytes(py, b)))
 }

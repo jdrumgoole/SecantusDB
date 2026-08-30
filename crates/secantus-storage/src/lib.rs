@@ -37,7 +37,7 @@ use s2::latlng::LatLng;
 use s2::rect::Rect;
 use s2::region::RegionCoverer;
 use secantus_core::collation::Collation;
-use secantus_core::diff::compute_update_description;
+use secantus_core::diff::compute_update_description_for;
 use secantus_core::order;
 use secantus_core::query::matches as query_matches;
 use secantus_core::sortkey::{self, COMPOUND_SEP, RANK_MINKEY};
@@ -9936,6 +9936,7 @@ impl Storage {
             multi,
             upsert,
             is_replacement,
+            Some(update),
             validator,
             validator_moderate,
             want_post_image,
@@ -10007,6 +10008,7 @@ impl Storage {
             multi,
             upsert,
             false,
+            None, // pipeline update: mongod diffs these by value
             validator,
             validator_moderate,
             want_post_image,
@@ -10050,6 +10052,10 @@ impl Storage {
         multi: bool,
         upsert: bool,
         is_replacement: bool,
+        // The operator update that produced the post-image, so the change-stream
+        // diff can report arrays the way mongod does (see secantus_core::diff).
+        // `None` for a pipeline update: mongod diffs those by value.
+        update_spec: Option<&Document>,
         validator: Option<&Document>,
         // `validationLevel: "moderate"` — exempt documents that ALREADY failed
         // the validator from update-time validation (inserts are still checked).
@@ -10073,6 +10079,7 @@ impl Storage {
                 coll_opt,
                 upsert,
                 is_replacement,
+                update_spec,
                 validator,
                 validator_moderate,
                 transform,
@@ -10087,6 +10094,7 @@ impl Storage {
             multi,
             upsert,
             is_replacement,
+            update_spec,
             validator,
             validator_moderate,
             want_post_image,
@@ -10116,6 +10124,10 @@ impl Storage {
         coll_opt: Option<&Collation>,
         upsert: bool,
         is_replacement: bool,
+        // The operator update that produced the post-image, so the change-stream
+        // diff can report arrays the way mongod does (see secantus_core::diff).
+        // `None` for a pipeline update: mongod diffs those by value.
+        update_spec: Option<&Document>,
         validator: Option<&Document>,
         // `validationLevel: "moderate"` — see `update_matching_core`.
         validator_moderate: bool,
@@ -10162,6 +10174,7 @@ impl Storage {
                                 vars,
                                 coll_opt,
                                 is_replacement,
+                                update_spec,
                                 validator,
                                 validator_moderate,
                                 transform,
@@ -10189,6 +10202,7 @@ impl Storage {
                 true,
                 upsert,
                 is_replacement,
+                update_spec,
                 validator,
                 validator_moderate,
                 false,
@@ -10218,6 +10232,10 @@ impl Storage {
         vars: &Document,
         coll_opt: Option<&Collation>,
         is_replacement: bool,
+        // The operator update that produced the post-image, so the change-stream
+        // diff can report arrays the way mongod does (see secantus_core::diff).
+        // `None` for a pipeline update: mongod diffs those by value.
+        update_spec: Option<&Document>,
         validator: Option<&Document>,
         // `validationLevel: "moderate"` — see `update_matching_core`.
         validator_moderate: bool,
@@ -10309,7 +10327,7 @@ impl Storage {
                     o.insert(
                         "diff",
                         Bson::Document(
-                            compute_update_description(&doc, &new)
+                            compute_update_description_for(&doc, &new, update_spec)
                                 .map_err(|_| StorageError::QueryUnsupported)?,
                         ),
                     );
@@ -10349,6 +10367,10 @@ impl Storage {
         multi: bool,
         upsert: bool,
         is_replacement: bool,
+        // The operator update that produced the post-image, so the change-stream
+        // diff can report arrays the way mongod does (see secantus_core::diff).
+        // `None` for a pipeline update: mongod diffs those by value.
+        update_spec: Option<&Document>,
         validator: Option<&Document>,
         // `validationLevel: "moderate"` — exempt documents that ALREADY failed
         // the validator from update-time validation (inserts are still checked).
@@ -10457,7 +10479,7 @@ impl Storage {
                                 o.insert(
                                     "diff",
                                     Bson::Document(
-                                        compute_update_description(&doc, &new)
+                                        compute_update_description_for(&doc, &new, update_spec)
                                             .map_err(|_| StorageError::QueryUnsupported)?,
                                     ),
                                 );
