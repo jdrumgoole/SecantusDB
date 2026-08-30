@@ -103,14 +103,13 @@ the entry says); `pg_index.indpred` reflecting NULL.
   than a crash, but they are not the same code — PG's is about the failed
   *cast*, ours about the missing *operator*. Closing that gap means the cast
   failing at bind time, before arithmetic is reached.
-- **`'a'::text - 1` answers `22P02`, not PG's `42883` (open).** The untyped-text
-  → number coercion (deliberate, for pgbench's typeless params) fires first and
-  reports an invalid numeric literal. Distinguishing a *typed* `::text` operand
-  from an unknown literal is exactly the "cross-type lenient pairs" entry, whose
-  skipped-shape list already names arithmetic operands. Not new.
-  **Superseded 2026-08-30** by the "typed `text` / `varchar` operands" entry
-  below, which carries the full PG-measured rule and the reason it needs static
-  types. Do not work these two separately — they are one fix.
+- **`'a'::text - 1` answered `22P02`, not PG's `42883` — FIXED 2026-08-30
+  (#1133).** The untyped-text → number coercion (deliberate, for pgbench's
+  typeless params) fired first and reported an invalid numeric literal.
+  Distinguishing a *typed* `::text` operand from an unknown literal was the
+  "cross-type lenient pairs" entry; both are closed by the "typed `text` /
+  `varchar` operands" entry below. Re-probed on `main` after the merge:
+  `'a'::text - 1` and `'1'::text + 1` both answer `42883`.
 - **jsonb results lost the jsonb tag — FIXED 2026-08-30, and it was WORSE than
   filed.** Recorded as a render nit (`{1,3}` where PG renders `[1, 3]`). Probed
   over the **wire** against a live PostgreSQL 14 comparing the result OID as

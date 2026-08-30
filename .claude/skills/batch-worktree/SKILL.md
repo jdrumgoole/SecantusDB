@@ -1,6 +1,6 @@
 ---
 name: batch-worktree
-description: Set up an isolated worktree for a SecantusDB change batch and land it cleanly. Fires when starting a feature/fix batch, creating a worktree, provisioning a worktree venv, or preparing to commit/PR/merge. Holds the venv recipe that avoids silently skipping 1700 tests, the claim protocol for parallel sessions, and the landing sequence including the traps that make teardown fail.
+description: Set up an isolated worktree for a SecantusDB change batch and land it cleanly. Fires when starting a feature/fix batch, creating a worktree, provisioning a worktree venv, running a gauge from a worktree, or preparing to commit/PR/merge. Holds the venv recipe that avoids silently skipping 1700 tests, how to run and baseline a gauge from a worktree, the claim protocol for parallel sessions, and the landing sequence including the traps that make teardown fail — notably that a worktree which ran a gauge cannot be removed by `git worktree remove` at all.
 ---
 
 # Set up a batch worktree, and land it without leaving debris
@@ -61,6 +61,35 @@ lock, and an unpinned `sqlglot` fails ~5 SQL tests as a pure venv artifact.
 
 Run with `PYTHONPATH=src .venv-test/bin/python -m pytest ...`.
 
+**Gauges need the same venv, and `./inv validate-*` will not use it.** The
+invoke tasks run under the worktree's own `uv` environment, which has no
+WiredTiger — so the gauge's daemon cannot start and you get
+`pg daemon at 127.0.0.1:<port> did not become ready within 15.0s`, not an
+import error naming the real cause. Drive the runner directly instead; it
+spawns its daemon with `sys.executable`, so the interpreter you choose is the
+one the daemon gets:
+
+```bash
+PYTHONPATH=src .venv-test/bin/python -m psycopg_validation.runner
+PYTHONPATH=src .venv-test/bin/python -m sqlalchemy_validation.runner
+PYTHONPATH=src .venv-test/bin/python -m slt_validation.runner
+```
+
+**A gauge number means nothing against the committed report.** The reports in
+`docs/validation-report-*.md` were generated in a fully-provisioned environment;
+a worktree venv is missing extras those suites need, which shows up as failures
+that have nothing to do with your change (psycopg's `test_typing.py` alone is
+125 failures without a mypy toolchain). To judge a regression, **run the gauge
+twice — once with `git stash push src/` and once without** — and diff the
+`FAILED` lists. Do that before concluding anything from a delta; two apparent
+regressions in one 2026-08-30 batch both dissolved this way, one of them a leak
+test giving 3/3/2 failures at baseline versus 1/2/3 with changes on identical
+code.
+
+**Do not stash while a suite or gauge is running.** The files change underneath
+it and the run is silently invalid — kill it and restart rather than report its
+number.
+
 ## Batch several slices per branch
 
 The suite is ~8,700 tests and 13–20 minutes. Running it per one-file change
@@ -97,7 +126,7 @@ git branch -D <branch>                         # -d refuses squash-merged work
 git push origin --delete <branch>
 ```
 
-Three traps, all hit for real:
+Four traps, all hit for real:
 
 - **Remove the worktree before deleting the branch.** `gh pr merge
   --delete-branch` aborts with "cannot delete branch ... used by worktree" —
@@ -106,7 +135,29 @@ Three traps, all hit for real:
 - **`git branch -d` refuses branches that did land.** Squash-merged commits are
   never ancestors of `main`. Confirm `gh pr view <N> --json state` is `MERGED`,
   then use `-D`.
+- **A worktree that ran a gauge cannot be removed by `git worktree remove` at
+  all.** Any gauge (`validate-psycopg`, `validate-slt`, …) runs
+  `git submodule update --init vendor/<x>` in *your* worktree, and from then on
+  git refuses: `fatal: working trees containing submodules cannot be moved or
+  removed`. `git submodule deinit -f <paths>` does **not** lift it — the refusal
+  is unconditional once the worktree has submodule entries, and `--force` does
+  not bypass it either. The fallback is a manual remove plus a prune:
+
+  ```bash
+  gh pr view <N> --json state -q .state          # must be MERGED
+  git -C ../SecantusDB-<slug> status --short     # must be empty
+  git -C ../SecantusDB-<slug> rev-parse HEAD     # must equal the pushed ref
+  rm -rf ../SecantusDB-<slug>
+  git worktree prune
+  ```
+
+  Run those three checks *first* — `rm -rf` cannot be undone, and a gauge
+  worktree can be carrying a gigabyte of vendored corpus you do not want to
+  re-clone by accident. (`vendor/sqllogictest` alone is ~1.1 GB.)
 - **Never remove a worktree or branch you did not create in this conversation.**
+  This includes **stashes**, which are repo-global and therefore visible from
+  every worktree: `git stash list` in your worktree will show other sessions'
+  entries. Leave them. Only pop what you pushed in this conversation.
 
 The branch and worktree are only half of it. Servers still bound to ports,
 WiredTiger temp stores, the `pytest-of-<user>` backlog, and background waiters
