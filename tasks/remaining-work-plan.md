@@ -20,12 +20,20 @@ These are the things that cost time to rediscover.
 
 **Oracles — both are the point of this plan.**
 
-* `mongod` is on `PATH` — **it reports 8.2.11 as of 2026-08-30**, not the 6.0.16
-  this file was written against; the error surface was retargeted to 8.x on
-  2026-08-29 (see `CLAUDE.md`). Measurements below dated against 6.0.16 stay
-  true about *that* version — re-probe before relying on one. Start a server on
+* `mongod` is on `PATH` — **it reports 8.2.1 as of 2026-08-31**, not the 6.0.16
+  this file was written against, and not the 8.2.11 this line claimed until
+  2026-08-31; the error surface was retargeted to 8.x on 2026-08-29 (see
+  `CLAUDE.md`). **8.2.11 is installed separately** at
+  `/opt/homebrew/opt/mongodb-community@8.2.11/bin/mongod`; put it first on
+  `PATH` to probe against it. Measurements below dated against 6.0.16 stay true
+  about *that* version — re-probe before relying on one, and note that 6.0.16
+  and 8.3.4 are no longer installed at all. Start a server on
   `127.0.0.1:27019` and diff against it. `tests/test_mongod_differential.py` is
   the standing harness; run it with `-m differential`.
+
+  **Run `mongod --version` and record it with the measurement.** This line was
+  wrong for a day because nobody did, and a *patch* bump has changed an error
+  message here before — "8.x" is not specific enough to cite.
 * **A live PostgreSQL 14 runs on this box** at `host=127.0.0.1 port=5432
   dbname=postgres user=jdrumgoole`. `SECANTUS_PG_ORACLE_DSN` points
   `test_subms_predicates_match_real_postgres` at it. It settled six SQL claims

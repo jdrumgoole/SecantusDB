@@ -13,8 +13,12 @@ for *finding* and not for *sizing*.
 
 Two oracles live on this box and both are cheap to start:
 
-- `mongod` on `PATH` (Homebrew `@6.0`, reports 6.0.16). Change streams need a
-  replica set — spawn with `--replSet rs0` and `replSetInitiate`.
+- `mongod` on `PATH` (Homebrew `mongodb-community`, reported **8.2.1** on
+  2026-08-31 — this line said 6.0.16 until then, so check rather than trust it).
+  **8.2.11 is installed separately** at
+  `/opt/homebrew/opt/mongodb-community@8.2.11/bin/mongod`; put it first on
+  `PATH` to probe against it. Change streams need a replica set — spawn with
+  `--replSet rs0` and `replSetInitiate`.
 - PostgreSQL 14 at `host=127.0.0.1 port=5432 dbname=postgres user=jdrumgoole`
   for anything SQL-side.
 
@@ -107,21 +111,31 @@ reproducible locally, neither a flake:
   accident), a later change "fixed" it to sit after `operationType` (matching no
   released server), and a probe moved it to the 6.0/8.2 form.
 
-**Installing an 8.x that the gate accepts.** `PROBED_MONGOD_MAJOR` is 8, so on
-a box whose `mongod` is 6.0 the whole of `tests/test_mongod_differential.py`
-**silently skips** — a green local run of that file means it did not run. The
-tap has the right formula:
+**Installing a specific build. Do not use Homebrew for this.** The
+`mongodb/brew` tap was 3 months stale as of 2026-08-31: its `@8.2` formula pins
+**8.2.10**, its unversioned `mongodb-community` points at **8.3.3** (which
+diverges — see the `fullDocument` note above), and the tap is marked untrusted,
+so nothing loads from it without `brew trust`. Its version-suffixed kegs are
+also not what they look like: `mongodb-community@8.0` and `@8.2` were both
+symlinks to the *same* 8.2.1 keg.
 
-    brew install mongodb/brew/mongodb-community@8.2   # 8.2.11
-    brew unlink mongodb-community@6.0 && brew link --force mongodb-community@8.2
+Fetch the exact build from the official download host instead — the same place
+Homebrew gets it — and give it its own prefix:
 
-That is done on this box: `mongod` is **8.2.11** and the gate runs (150 passed).
-6.0.16 is still installed and reachable at
-`/opt/homebrew/opt/mongodb-community@6.0/bin/mongod` for cross-version probing,
-as is 8.3.4 under `mongodb-community@8.3`. The exact probed 8.2.1 is not in brew
-at all; fetch it only if you need that precise build:
+    V=8.2.11
+    curl -fL -o m.tgz https://fastdl.mongodb.org/osx/mongodb-macos-arm64-$V.tgz
+    sudo mkdir -p /opt/homebrew/opt/mongodb-community@$V
+    sudo tar xzf m.tgz -C /opt/homebrew/opt/mongodb-community@$V --strip-components=1
+    /opt/homebrew/opt/mongodb-community@$V/bin/mongod --version
 
-    curl -sSL -o m.tgz https://fastdl.mongodb.org/osx/mongodb-macos-arm64-8.2.1.tgz
+That leaves Homebrew's symlinks and any running brew service untouched; put the
+prefix first on `PATH` for the probe. `PROBED_MONGOD_MAJOR` is 8, so on a box
+whose `mongod` is 6.0 the whole of `tests/test_mongod_differential.py`
+**silently skips** — a green local run of that file means it did not run.
+
+**As of 2026-08-31 no 6.0 or 8.3 build is installed**, so the cross-version
+probing older entries here describe cannot be reproduced without fetching one
+by the recipe above.
 
 **Patch releases differ, so do not pin a rendering that is really a set.**
 8.2.1 and 8.2.11 disagree on the ORDER of a wrong-type error's expected-type

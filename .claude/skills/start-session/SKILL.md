@@ -83,10 +83,18 @@ before you draw conclusions:
 which mongod && mongod --version | head -1
 ```
 
-**mongod 8.x is the only version SecantusDB targets** (CLAUDE.md). `PATH` here
-should be 8.2.11; 6.0.16 and 8.3.4 sit at their keg paths for probing version
-differences. If `PATH` gives 6.0, `tests/test_mongod_differential.py` **silently
-skips** — a green local run of that file then means it did not run. The probe
+**mongod 8.x is the only version SecantusDB targets** (CLAUDE.md). `PATH` gave
+**8.2.1** on 2026-08-31, with **8.2.11 installed separately** at
+`/opt/homebrew/opt/mongodb-community@8.2.11/bin/mongod` — put that first on
+`PATH` to probe against it. If `PATH` gives 6.0,
+`tests/test_mongod_differential.py` **silently skips**, so a green local run of
+that file means it did not run.
+
+**Check the version rather than trusting any line that names one — this one
+included.** CLAUDE.md and the plan both asserted 8.2.11 on `PATH` with 6.0.16
+and 8.3.4 at keg paths; the box actually had one mongod, and the two keg paths
+were aliases for the same build. A *patch* bump has changed an error message
+here before, so record `mongod --version` alongside any measurement. The probe
 recipe, normalisation rules and version hazards are in **`differential-probe`**.
 
 ## Before the first substantive change
