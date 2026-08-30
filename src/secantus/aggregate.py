@@ -1083,7 +1083,14 @@ def _stage_fill(
         elif "method" in action:
             method = action["method"]
             if method not in ("locf", "linear"):
-                raise AggregateError(f"$fill output.{field}.method must be 'locf' or 'linear'")
+                # mongod's own wording and code (probed 8.2.11) -- this used to
+                # be our own phrasing under the generic 14 TypeMismatch, so a
+                # driver could not match on it.
+                raise AggregateError(
+                    "Method must be either locf or linear",
+                    code=6050202,
+                    code_name="Location6050202",
+                )
             fillers.append((method, field, None))
         else:
             raise AggregateError(f"$fill output.{field} requires value or method")
@@ -2263,7 +2270,9 @@ def _stage_sample(
     if isinstance(size_raw, bool) or not isinstance(size_raw, (int, float)):
         raise AggregateError("size argument to $sample must be a number", code=28746)
     if size_raw < 0:
-        raise AggregateError("size argument to $sample must not be negative", code=28747)
+        # mongod's wording (probed 8.2.11); ours said "must not be negative",
+        # which matched the code but not the text a driver may assert on.
+        raise AggregateError("size argument to $sample must be a positive integer", code=28747)
     size = int(size_raw)
     if size >= len(docs):
         return list(docs)
@@ -2384,8 +2393,9 @@ def _stage_bucket(
         )
     if len(boundaries) < 2:
         raise AggregateError(
+            # mongod says "N value(s)." -- ours dropped the unit (probed 8.2.11).
             "The $bucket 'boundaries' field must have at least 2 values, but found "
-            f"{len(boundaries)}.",
+            f"{len(boundaries)} value(s).",
             code=40192,
         )
     ctype0 = _bucket_ctype(boundaries[0])

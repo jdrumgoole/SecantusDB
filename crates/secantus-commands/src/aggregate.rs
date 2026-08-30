@@ -524,8 +524,148 @@ fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError> {
                 format!("Unrecognized pipeline stage name: '{name}'"),
             ));
         }
-        if name == "$setWindowFields" {
-            validate_set_window_fields(d.get(name))?;
+        // Spec-level validation with mongod's own codes. The core engine
+        // signals "cannot do this" with a bare `Err(())`, which the adapter
+        // reports as a generic `BadValue` (2) -- so a MALFORMED spec was
+        // indistinguishable from an unimplemented one, and every case below
+        // answered 2 where mongod has a specific code. Validating the spec here,
+        // before the engine runs, is the same place `$facet` already does it and
+        // avoids widening the engine's error type. All probed against 8.2.11.
+        match name {
+            "$setWindowFields" => validate_set_window_fields(d.get(name))?,
+            "$sample" => validate_sample(d.get(name))?,
+            "$unwind" => validate_unwind(d.get(name))?,
+            "$bucket" => validate_bucket(d.get(name))?,
+            "$densify" => validate_densify(d.get(name))?,
+            "$fill" => validate_fill(d.get(name))?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// `$sample`'s `size`: a number, and a positive one.
+fn validate_sample(spec: Option<&Bson>) -> Result<(), CommandError> {
+    let Some(spec) = spec.and_then(Bson::as_document) else {
+        return Ok(());
+    };
+    let Some(size) = spec.get("size") else {
+        return Ok(());
+    };
+    let n = match size {
+        Bson::Int32(v) => f64::from(*v),
+        Bson::Int64(v) => *v as f64,
+        Bson::Double(v) => *v,
+        _ => {
+            return Err(CommandError::new(
+                28746,
+                "Location28746",
+                "size argument to $sample must be a number",
+            ));
+        }
+    };
+    if n < 0.0 {
+        return Err(CommandError::new(
+            28747,
+            "Location28747",
+            "size argument to $sample must be a positive integer",
+        ));
+    }
+    Ok(())
+}
+
+/// `$unwind`'s string form must be a field PATH, i.e. `$`-prefixed.
+fn validate_unwind(spec: Option<&Bson>) -> Result<(), CommandError> {
+    let path = match spec {
+        Some(Bson::String(p)) => p.clone(),
+        Some(Bson::Document(d)) => match d.get_str("path") {
+            Ok(p) => p.to_string(),
+            Err(_) => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    if !path.starts_with('$') {
+        return Err(CommandError::new(
+            28818,
+            "Location28818",
+            format!("path option to $unwind stage should be prefixed with a '$': {path}"),
+        ));
+    }
+    Ok(())
+}
+
+/// `$bucket` needs at least two boundaries to define one bucket.
+fn validate_bucket(spec: Option<&Bson>) -> Result<(), CommandError> {
+    let Some(spec) = spec.and_then(Bson::as_document) else {
+        return Ok(());
+    };
+    if let Some(Bson::Array(b)) = spec.get("boundaries") {
+        if b.len() < 2 {
+            return Err(CommandError::new(
+                40192,
+                "Location40192",
+                format!(
+                    "The $bucket 'boundaries' field must have at least 2 values, \
+                     but found {} value(s).",
+                    b.len()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `$densify`'s `range.step` must be strictly positive.
+fn validate_densify(spec: Option<&Bson>) -> Result<(), CommandError> {
+    let Some(range) = spec
+        .and_then(Bson::as_document)
+        .and_then(|d| d.get("range"))
+        .and_then(Bson::as_document)
+    else {
+        return Ok(());
+    };
+    let step = match range.get("step") {
+        Some(Bson::Int32(v)) => f64::from(*v),
+        Some(Bson::Int64(v)) => *v as f64,
+        Some(Bson::Double(v)) => *v,
+        Some(_) => f64::NAN,
+        None => return Ok(()),
+    };
+    // NaN spelled out rather than written as `!(step > 0.0)`: that form relies
+    // on NaN comparing false, which clippy rejects as a negated comparison on a
+    // partially-ordered type. A non-numeric `step` lands here as NaN above.
+    if step.is_nan() || step <= 0.0 {
+        return Err(CommandError::new(
+            5733401,
+            "Location5733401",
+            "The step parameter in a range statement must be a strictly positive numeric value",
+        ));
+    }
+    Ok(())
+}
+
+/// `$fill`'s per-field `method`, when given, is `locf` or `linear`.
+fn validate_fill(spec: Option<&Bson>) -> Result<(), CommandError> {
+    let Some(output) = spec
+        .and_then(Bson::as_document)
+        .and_then(|d| d.get("output"))
+        .and_then(Bson::as_document)
+    else {
+        return Ok(());
+    };
+    for (_field, field_spec) in output.iter() {
+        let Some(fs) = field_spec.as_document() else {
+            continue;
+        };
+        if let Some(m) = fs.get("method") {
+            let ok = matches!(m.as_str(), Some("locf") | Some("linear"));
+            if !ok {
+                return Err(CommandError::new(
+                    6050202,
+                    "Location6050202",
+                    "Method must be either locf or linear",
+                ));
+            }
         }
     }
     Ok(())
