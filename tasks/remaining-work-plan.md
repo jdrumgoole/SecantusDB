@@ -201,15 +201,41 @@ Sub-ms `ORDER BY` is adjacent to work already landed and should be cheap.
       reference doesn't (probed both ways on `$divide` and `$ln`). Closing it
       means modelling constant folding, for message text only.
       **Deliberately deferred**; listed so the analysis isn't redone.
-- [ ] **The Rust error-code class — PARTLY ADVANCED.** `update::arith_type_error` shipped as the worked template (2026-08-25); the class is not closed (e.g. `$densify` on a string still answers `BadValue` where mongod says `5733201`). A construct the Rust engine can't do
-      surfaces as generic `BadValue` (2) rather than mongod's typed code — e.g.
-      `$densify` on a string answers 2 where mongod answers 5733201.
-      **`update::arith_type_error` is the worked template**: a standalone
-      validator that names the errors it can name, leaving `Fallback` for
-      genuinely unimplemented constructs, plus a `StorageError` variant and one
-      arm in the adapter's code table. Do *not* widen `Fallback` itself — that
-      touches 37 sites and the PyO3 boundary.
+- [ ] **The Rust error-code class — SPEC-LEVEL HALF DONE (2026-08-30), runtime
+      half open.** A construct the Rust engine can't do surfaces as generic
+      `BadValue` (2) rather than mongod's typed code.
 
+      **What closed, and how, because it was cheaper than this entry assumed.**
+      Validating the stage SPEC at the command layer — where `$facet` already
+      validates its own — gives mongod's code without touching the engine's
+      error type at all. That closed seven cases: `$setWindowFields` unknown
+      field / missing output / unknown window key (40415 / 40414 / 9), `$sample`
+      negative and non-numeric size (28747 / 28746), `$unwind` unprefixed path
+      (28818), `$bucket` one-element boundaries (40192), `$densify` non-positive
+      step (5733401) and `$fill` unknown method (6050202). None of it needed the
+      `Fallback` widening this entry warned about.
+
+      **What remains is the RUNTIME half** — errors discoverable only while
+      processing documents, which no spec check can reach. Measured on the Rust
+      server against mongod 8.2.11 on 2026-08-30:
+
+      | case | rust | mongod |
+      |---|---|---|
+      | `$densify` on a string field | 2 | 5733201 |
+      | `$bucket` with no `default` and an out-of-range value | 2 | 7158303 |
+      | `$replaceRoot` whose `newRoot` resolves to a scalar | 2 | 40228 |
+
+      The last one is wrong on the PYTHON server too (14, not 40228). For these
+      the template still applies: **`update::arith_type_error`** — a standalone
+      validator naming the errors it can name, leaving `Fallback` for genuinely
+      unimplemented constructs, plus a `StorageError` variant and one arm in the
+      adapter's code table. Do *not* widen `Fallback` itself — that touches 37
+      sites and the PyO3 boundary.
+
+      Method note: compare error MESSAGES, not just codes. Comparing codes alone
+      reported the Python server correct on five cases that had mongod's code
+      with different wording (`$sample` said "must not be negative" for "must be
+      a positive integer"; `$bucket` dropped "value(s)").
 ---
 
 ## Phase 2 — Keep the differential moving — **COMPLETE (5 of 5, 2026-08-29)**

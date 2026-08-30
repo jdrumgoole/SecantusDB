@@ -3928,9 +3928,12 @@ def _find_and_modify_impl(doc: dict[str, Any], ctx: CommandContext) -> dict[str,
     if is_remove and update is not None:
         return {
             "ok": 0.0,
-            # mongod 6.0.16's wording; 8.3.4 quotes the field names
-            # ("both an 'update' and 'remove'=true"). We advertise 7.0 and the
-            # live differential gate runs PATH mongod, so 6.0's form ships.
+            # Re-probed on 8.2.11 (2026-08-30), the version we now advertise
+            # and target: it uses this exact wording, same as 6.0.16. Only
+            # 8.3.4 differs, quoting the field names ("both an 'update' and
+            # 'remove'=true"). The comment here used to justify the choice by
+            # "we advertise 7.0" and "the gate runs PATH mongod" -- both
+            # premises are now false, though the shipped string is still right.
             "errmsg": "Cannot specify both an update and remove=true",
             "code": 9,
             "codeName": "FailedToParse",
