@@ -114,7 +114,22 @@ def _rust_env() -> dict[str, str]:
 
 @task(name="rust-test")
 def rust_test(c: Context) -> None:
-    """cargo fmt --check, clippy (warnings-as-errors), unit tests (whole workspace)."""
+    """fmt/clippy/test the CLEAN workspace only — NOT the WiredTiger crates.
+
+    "Whole workspace" is exactly what this is not, and reading it that way
+    costs real time. ``crates/Cargo.toml`` **excludes** six crates because they
+    link WiredTiger: ``secantus-wt``, ``secantus-storage``,
+    ``secantus-storage-py``, ``secantus-storage-adapter``,
+    ``secantus-server-py`` and ``secantusdb``. That is the entire storage layer
+    and the shipped binary. Cargo does not warn about an excluded crate, so this
+    task reports success having never compiled them — a storage change can fail
+    to build while this is green.
+
+    For Rust-server work run ``./inv rust-gate`` (CLAUDE.md says so), which adds
+    the WiredTiger-linked crates. To gate one of them by hand, run cargo from
+    its own directory with ``SECANTUS_WT_INCLUDE`` / ``SECANTUS_WT_LIB`` set —
+    see ``_rust_env``.
+    """
     c.run(f"cd {_RUST_WORKSPACE_DIR} && cargo fmt --check", pty=True)
     c.run(f"cd {_RUST_WORKSPACE_DIR} && cargo clippy --all-targets -- -D warnings", pty=True)
     c.run(f"cd {_RUST_WORKSPACE_DIR} && cargo test", pty=True)
@@ -502,6 +517,11 @@ def rust_gate(c: Context, pytest: bool = True, deselect: str = "") -> None:
     leaf-engine parity suites (``rust-parity``); and — unless ``--no-pytest`` —
     the full Python suite. This is the sequence that must be green before
     committing Rust work; previously assembled by hand every time.
+
+    **Still not covered here**, because each needs its own build: the two PyO3
+    WiredTiger crates (``rust-storage-py``, and the embedded handle built by
+    ``rust-server-build``) and the standalone binary (``rust-binary-test``). If
+    you touched those, run their tasks too — nothing else will.
     """
     steps = 8 if pytest else 7
     # ``==> [k/N] label`` phase markers: drive the Ops Board progress stepper
