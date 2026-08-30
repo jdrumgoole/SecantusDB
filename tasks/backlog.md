@@ -197,16 +197,34 @@ the entry says); `pg_index.indpred` reflecting NULL.
   (`planner._REGTYPE_MARKER`, read by `_infer_scalar_tag`), which steers typing
   without touching the value.
 
-- **`float4` renders in exponent form where PG prints the plain integer (open).**
-  `SELECT DISTINCT - CAST ( - col0 AS REAL )` answers `8e+01` where the corpus
-  expects `80`. Found by the sqllogictest gauge at
-  `random/select/slt_good_1.test:26359` — and **the committed
-  `docs/validation-report-slt.md` records that file as `pass`**, so either the
-  report is stale or it was generated on a different environment. Measured on
-  this box 2026-08-30: it fails **at baseline** (source stashed) as
-  deterministically as it does with changes applied, twice each way, so it is
-  pre-existing and not a regression. Worth a re-baseline of that report as much
-  as a fix.
+- **Float text rendering picked the wrong NOTATION — FIXED 2026-08-30, on both
+  float types.** `SELECT CAST(80 AS REAL)` sent `8e+01` where PG sends `80`.
+  Found by the sqllogictest gauge (`random/select/slt_good_1.test:26359`), which
+  compares raw text; that file now passes, taking the lane back to the committed
+  52/60.
+
+  **A driver-decoded comparison could not see this, and my first probe said the
+  10 float4 shapes all matched** — psycopg decodes both sides to the same Python
+  float. It only surfaced by registering a raw text loader for oid 700/701 and
+  comparing the bytes on the wire. Same lesson as the jsonb-tag bug: when the
+  suspicion is *rendering*, compare the wire, not the value.
+
+  Root cause was one confusion, in two places. The digit count and the notation
+  are separate decisions, and both renderers derived the notation from the digit
+  count:
+  - **float4** searched for the shortest round-trip with `f"{v:.{p}g}"` and
+    returned that string. `%g` goes scientific whenever `exp >= precision`, so
+    80 — which round-trips on one digit — printed as `8e+01`.
+  - **float8** used Python's `repr`, whose fixed/scientific threshold is 16
+    where **Postgres switches at 15**: `1e15` printed as `1000000000000000`
+    where PG prints `1e+15`. Found by sweeping float8 after fixing float4, on
+    the suspicion that the same conflation lived there too — it did.
+
+  Postgres keys the choice off the **exponent alone**: scientific iff
+  `exp < -4 or exp >= sci_at`, with `sci_at` 6 for float4 and 15 for float8.
+  Both now share `typemap._shortest_round_trip` so they cannot drift again.
+  Verified against PG 14 over 637 float4 and 620 float8 values, 400 of each
+  being random bit patterns across the whole range: zero mismatches.
 
 - **A reflected column in arithmetic raises from the Mongo side (open, minor).**
   `SELECT _id FROM coll WHERE v + 0 = 7` over a schema-on-read collection pushes
@@ -8116,17 +8134,23 @@ mention**:
   type (and keeps `int4` for the subscript-yielding `generate_subscripts` /
   `.n`). Verified against a live PostgreSQL 14 for text / numeric / bool / int;
   pinned by `TestSrfElementTypes`.
-- **`_pg_expandarray(...).x` still comes back as TEXT (open).**
-  `SELECT (information_schema._pg_expandarray(ARRAY[9,8,7])).x` gives
-  `'9','8','7'` where PG gives ints; `.n` is correct. The element-type inference
-  above does NOT reach it — the record-SRF field projection is typed by a
-  different path that assigns `any` (`pg_oid` 0) before
-  `_infer_scalar_tag` is consulted, so finding that path is the work. Narrow: it
-  affects only the `.x` field of one `information_schema` helper, which is
-  pgjdbc's `DatabaseMetaData` route.
+- ~~**`_pg_expandarray(...).x` still comes back as TEXT**~~ — **STALE, closed
+  2026-08-30.** It was fixed on 2026-08-29 (`remaining-work-plan.md` records
+  that; this entry was never flipped, so the two files disagreed for a day).
+  Re-probed against PG 14 with this entry's own example: `.x` over
+  `ARRAY[9,8,7]`, `ARRAY['a','b']` and `ARRAY[1.5,2.5]` all match PG on **value
+  and OID**, as does `.n`.
 
-`unnest` ordering (above) and `.x` typing remain; `unnest` element types, `.n`,
-and `generate_subscripts` match PG exactly.
+- **`pg_typeof(<set-returning function>)` returns ONE row where PG returns N
+  (open, obscure).** `SELECT pg_typeof(generate_series(1,3))` answers one row;
+  PG answers three. `planner.rewrite_pg_typeof` folds the call to a literal at
+  plan time — right for the *type*, but it discards the argument, and with it
+  the SRF's row multiplication. Measured 2026-08-30 as identical with and
+  without that day's changes, so it is pre-existing. Fixing it means keeping
+  the SRF in the projection and emitting a constant per row.
+
+`unnest` ordering (above) remains; `unnest` element types, `.x`, `.n`, and
+`generate_subscripts` match PG exactly.
 
 ## Unquoted identifiers are not case-folded (2026-08-02) — FIXED
 
