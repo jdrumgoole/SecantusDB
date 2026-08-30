@@ -1568,12 +1568,31 @@ jobs:
       # from the clean workspace (they link WiredTiger), so each has its own
       # `target` dir — both are listed, or the second would still cold-compile.
       # Placed after the WT probe above so `SECANTUS_WT_*` is already resolved.
+      # ONE target directory for every WiredTiger-linked crate. They are
+      # excluded from the clean workspace, so by default each gets its own
+      # target and recompiles the same WT-linked dependencies from scratch.
+      # Measured locally: six crates with separate targets came to 1.9 GB;
+      # sharing one target covers all six in 1.1 GB. Sharing is what makes
+      # gating the extra four AFFORDABLE rather than a disk problem -- it
+      # cuts the cache 42% while adding coverage.
+      - name: Point every WT-linked crate at one target directory
+        run: echo "CARGO_TARGET_DIR=${{ github.workspace }}/crates/wt-target" >> "$GITHUB_ENV"
+
+      - name: Disk before the Rust build
+        run: df -h / | tail -1
+
       - name: Cache cargo registry + target (WT-linked crates)
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
+          # All six roots share the one target above, so this is a single
+          # cache, not six. Keep this list in step with the gate steps below.
           workspaces: |
-            crates/secantus-storage
-            crates/secantus-storage-adapter
+            crates/secantus-storage -> ../wt-target
+            crates/secantus-storage-adapter -> ../wt-target
+            crates/secantus-wt -> ../wt-target
+            crates/secantus-storage-py -> ../wt-target
+            crates/secantus-server-py -> ../wt-target
+            crates/secantusdb -> ../wt-target
           cache-on-failure: true
 
       - name: Cargo fmt / clippy / test (secantus-storage)
@@ -1612,6 +1631,30 @@ jobs:
           cargo fmt --check
           cargo clippy --all-targets -- -D warnings
           cargo test
+
+      # The four WT-linked crates nothing gated until now -- not here, not in
+      # the clean workspace (`cargo` does not warn about an excluded crate, so
+      # `./inv rust-test` reports success having never compiled them). Two of
+      # these are shipped artifacts: `secantusdb` is the standalone binary and
+      # `secantus-server-py` is the embedded handle the Rust gauge drives.
+      # clippy (not test) on purpose: it type-checks everything for the cost of
+      # a check, and these crates' behaviour is covered by the Python suites.
+      - name: Cargo fmt / clippy (the remaining WT-linked crates)
+        run: |
+          set -e
+          for crate in secantus-wt secantus-storage-py secantus-server-py secantusdb; do
+            echo "::group::$crate"
+            (cd "crates/$crate" \
+              && cargo fmt --check \
+              && cargo clippy --all-targets -- -D warnings)
+            echo "::endgroup::"
+          done
+
+      - name: Disk after the Rust build
+        if: always()
+        run: |
+          df -h / | tail -1
+          du -sh "${CARGO_TARGET_DIR:-crates/wt-target}" 2>/dev/null || true
 
   # Builds the main `secantus` wheel with the off-by-default storage-engine flag
   # flipped ON (SECANTUS_BUILD_STORAGE_ENGINE=ON): the Rust `_secantus_storage`
