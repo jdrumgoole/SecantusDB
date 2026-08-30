@@ -139,9 +139,15 @@ _USER_FACING_EXCEPTIONS: tuple[type[BaseException], ...] = (
     UpdateError,
 )
 
-WIRE_VERSION = 17
-SERVER_VERSION = "7.0.0"
-SERVER_VERSION_ARRAY = [7, 0, 0, 0]
+# The version we ADVERTISE is a capability contract, not a label: drivers gate
+# features on it, and the spec suites gate tests on it in both directions
+# (`maxServerVersion: "7.99"` asserts a feature is REJECTED, `minServerVersion:
+# "8.0"` that it works). So this moves only when the 8.0 features it promises
+# actually exist -- `bulkWrite` and `sort` on updateOne/replaceOne, both added
+# alongside this bump. Wire 27 and 8.2.x match the probed server (8.2.11).
+WIRE_VERSION = 27
+SERVER_VERSION = "8.2.11"
+SERVER_VERSION_ARRAY = [8, 2, 11, 0]
 DEFAULT_BATCH_SIZE = 101
 
 # ``topologyVersion.processId`` identifies the *server process* and is fixed for
@@ -2752,23 +2758,27 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "code": 9,
                 "codeName": "FailedToParse",
             }
-        # MongoDB 8.0 added a ``sort`` option to update spec entries
-        # (matches in sort order then updates the first). Pre-8.0 the
-        # server rejects it as a parse error. We advertise wire
-        # version 17 (7.0), so mirror mongod's pre-8.0 behaviour: a
-        # command-level FailedToParse. Drivers' ``updateOne-sort`` /
-        # ``replaceOne-sort`` / ``BulkWrite updateOne-sort`` /
-        # ``BulkWrite replaceOne-sort`` tests with
-        # ``maxServerVersion: "7.99"`` assert this.
-        if "sort" in spec:
-            return {
-                "ok": 0.0,
-                "errmsg": (
-                    "The 'sort' option is not supported on update commands before MongoDB 8.0"
-                ),
-                "code": 9,
-                "codeName": "FailedToParse",
-            }
+        # MongoDB 8.0's ``sort`` on an update spec entry: match in sort order
+        # and update the FIRST one. Probed on 8.2.11 -- `multi: true` is
+        # rejected (code 9), and an upsert whose filter matches nothing still
+        # upserts normally, sort or no sort.
+        #
+        # This used to reject `sort` outright, mirroring pre-8.0 mongod because
+        # we advertised wire 17. Both halves are asserted by driver tests --
+        # `updateOne-sort` / `replaceOne-sort` gate on `maxServerVersion:
+        # "7.99"` for the rejection and `minServerVersion: "8.0"` for the
+        # support -- so this moved together with the advertised version.
+        sort_spec = spec.get("sort")
+        if sort_spec is not None:
+            if bool(spec.get("multi", False)):
+                return {
+                    "ok": 0.0,
+                    "errmsg": "Cannot specify sort with multi=true",
+                    "code": 9,
+                    "codeName": "FailedToParse",
+                }
+            if not isinstance(sort_spec, Mapping):
+                return _bad_value("BSON field 'update.updates.sort' is the wrong type")
         # Pre-validate the pipeline-update shape upfront so a no-match
         # filter still surfaces parse errors to the client. Real
         # mongod parses the pipeline before scanning the collection
@@ -2804,10 +2814,26 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             # errors even against an empty collection (apply_update only
             # runs per matched doc, which would miss this).
             validate_update_doc(spec.get("u", {}))
+            stmt_filter = spec.get("q", {})
+            if sort_spec:
+                # Resolve WHICH document sorts first, then pin the update to
+                # it. mongod matches in sort order and updates the first; an
+                # upsert with no match still upserts, so leave the filter alone
+                # when nothing matched.
+                first = ctx.storage.find_matching(
+                    ctx.db_name,
+                    coll,
+                    stmt_filter,
+                    sort=sort_spec,
+                    limit=1,
+                    collation=spec.get("collation"),
+                )
+                if first:
+                    stmt_filter = {"_id": first[0]["_id"]}
             result = ctx.storage.update_matching(
                 ctx.db_name,
                 coll,
-                spec.get("q", {}),
+                stmt_filter,
                 spec.get("u", {}),
                 multi=bool(spec.get("multi", False)),
                 upsert=bool(spec.get("upsert", False)),
@@ -2910,6 +2936,237 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     reply["nModified"] = n_modified
     reply["ok"] = 1.0
     return reply
+
+
+# --- bulkWrite (MongoDB 8.0's client-level bulk command) ---------------------
+#
+# Every shape below was probed against a live mongod 8.2.11 (2026-08-30). The
+# command runs ONLY against `admin`, takes a flat `ops` list whose entries name
+# a namespace by index into `nsInfo`, and answers with a CURSOR of per-op
+# results plus summary counters -- not the `{n, writeErrors}` shape the
+# single-collection write commands use.
+#
+# Each op is executed through the ordinary `_insert` / `_update` / `_delete`
+# handler with a context rebound to that op's database, so bulk semantics can
+# never drift from single-write semantics: validation, upsert, oplog and
+# collection options are whatever those handlers already do.
+_BULK_WRITE_KNOWN_FIELDS = frozenset(
+    {
+        "bulkWrite",
+        "ops",
+        "nsInfo",
+        "ordered",
+        "bypassDocumentValidation",
+        "let",
+        "errorsOnly",
+        "comment",
+        "cursor",
+        "maxTimeMS",
+        "writeConcern",
+        "lsid",
+        "txnNumber",
+        "autocommit",
+        "startTransaction",
+        "$db",
+        "$clusterTime",
+        "$readPreference",
+        "apiVersion",
+        "apiStrict",
+        "apiDeprecationErrors",
+    }
+)
+#: mongod's batch bounds, quoted in its own InvalidLength message.
+_BULK_WRITE_MAX_OPS = 100000
+
+
+def _bulk_write_missing(field: str) -> dict[str, Any]:
+    """mongod's ``IDLFailedToParse`` for a required op field that is absent."""
+    return {
+        "ok": 0.0,
+        "errmsg": f"BSON field '{field}' is missing but a required field",
+        "code": 40414,
+        "codeName": "IDLFailedToParse",
+    }
+
+
+def _bulk_write_op_error(idx: int, code: int, errmsg: str, extra: Mapping | None = None) -> dict:
+    """A failed op's cursor entry. mongod leads with ``ok``/``idx``/``code``."""
+    out: dict[str, Any] = {"ok": 0.0, "idx": idx, "code": code, "errmsg": errmsg}
+    for key in ("keyPattern", "keyValue"):
+        if extra and key in extra:
+            out[key] = extra[key]
+    out["n"] = 0
+    return out
+
+
+def _bulk_write(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """MongoDB 8.0's ``bulkWrite``: writes across namespaces in one command."""
+    if ctx.db_name != "admin":
+        return {
+            "ok": 0.0,
+            "errmsg": "bulkWrite may only be run against the admin database.",
+            "code": 13,
+            "codeName": "Unauthorized",
+        }
+    unknown = _unknown_command_field(doc, "bulkWrite", _BULK_WRITE_KNOWN_FIELDS)
+    if unknown is not None:
+        return unknown
+
+    ops = doc.get("ops")
+    if not isinstance(ops, list) or not ops or len(ops) > _BULK_WRITE_MAX_OPS:
+        n = len(ops) if isinstance(ops, list) else 0
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"Write batch sizes must be between 1 and {_BULK_WRITE_MAX_OPS}. "
+                f"Got {n} operations."
+            ),
+            "code": 16,
+            "codeName": "InvalidLength",
+        }
+    ns_info = doc.get("nsInfo")
+    if not isinstance(ns_info, list):
+        return _bad_value("BSON field 'bulkWrite.nsInfo' is the wrong type")
+
+    ordered = doc.get("ordered", True)
+    errors_only = bool(doc.get("errorsOnly", False))
+    results: list[dict[str, Any]] = []
+    counts = dict.fromkeys(("nInserted", "nMatched", "nModified", "nUpserted", "nDeleted"), 0)
+    n_errors = 0
+
+    for idx, op in enumerate(ops):
+        if not isinstance(op, Mapping):
+            return _bad_value(f"BulkWrite ops entry {op!r} is not an object")
+        kind = next((k for k in ("insert", "update", "delete") if k in op), None)
+        if kind is None:
+            return _bad_value(
+                f"BulkWrite ops entry {_fmt_stage_val(dict(op))} does not contain a "
+                "supported operation type"
+            )
+        ns_index = op.get(kind)
+        if (
+            not isinstance(ns_index, int)
+            or isinstance(ns_index, bool)
+            or not (0 <= ns_index < len(ns_info))
+        ):
+            return _bad_value(
+                f"BulkWrite ops entry {_fmt_stage_val(dict(op))} has an invalid nsInfo index."
+            )
+        entry = ns_info[ns_index]
+        ns = entry.get("ns") if isinstance(entry, Mapping) else None
+        if not isinstance(ns, str) or "." not in ns:
+            return _bad_value(
+                f"BulkWrite ops entry {_fmt_stage_val(dict(op))} has an invalid nsInfo index."
+            )
+        db_name, _, coll = ns.partition(".")
+        sub_ctx = replace(ctx, db_name=db_name)
+
+        if kind == "insert":
+            if "document" not in op:
+                return _bulk_write_missing("bulkWrite.ops.document")
+            cmd: dict[str, Any] = {"insert": coll, "documents": [op["document"]]}
+        elif kind == "update":
+            if "updateMods" not in op:
+                return _bulk_write_missing("bulkWrite.ops.updateMods")
+            stmt: dict[str, Any] = {
+                "q": op.get("filter", {}),
+                "u": op["updateMods"],
+                "multi": bool(op.get("multi", False)),
+            }
+            for src, dst in (
+                ("upsert", "upsert"),
+                ("arrayFilters", "arrayFilters"),
+                ("hint", "hint"),
+                ("collation", "collation"),
+                ("sort", "sort"),
+            ):
+                if src in op:
+                    stmt[dst] = op[src]
+            cmd = {"update": coll, "updates": [stmt]}
+        else:
+            if "filter" not in op:
+                return _bulk_write_missing("bulkWrite.ops.filter")
+            stmt = {"q": op["filter"], "limit": 0 if op.get("multi") else 1}
+            for src in ("hint", "collation"):
+                if src in op:
+                    stmt[src] = op[src]
+            cmd = {"delete": coll, "deletes": [stmt]}
+        if doc.get("let") is not None:
+            cmd["let"] = doc["let"]
+        if doc.get("bypassDocumentValidation") is not None:
+            cmd["bypassDocumentValidation"] = doc["bypassDocumentValidation"]
+
+        handler = {"insert": _insert, "update": _update, "delete": _delete}[kind]
+        try:
+            reply = handler(cmd, sub_ctx)
+        except _USER_FACING_EXCEPTIONS as exc:
+            # A per-op failure, NOT a command failure. Letting this escape to
+            # `dispatch` failed the whole batch with `ok: 0`, so a driver saw no
+            # partial result at all -- the unified client-bulkWrite error specs
+            # (`an individual operation fails during an {,un}ordered bulkWrite`)
+            # drive exactly this with an undefined `$$var` in one op's filter
+            # and expect the OTHER ops to have run. Shaped the way `dispatch`
+            # shapes the same exception, then reported against the op.
+            exc_code = getattr(exc, "code", None) or 14
+            results.append(_bulk_write_op_error(idx, int(exc_code), str(exc)))
+            n_errors += 1
+            if ordered:
+                break
+            continue
+        if not reply.get("ok"):
+            # A whole-statement failure (a bad spec rather than a bad document)
+            # is reported against the op, like a write error.
+            results.append(
+                _bulk_write_op_error(
+                    idx, int(reply.get("code", 8)), str(reply.get("errmsg", "")), reply
+                )
+            )
+            n_errors += 1
+            if ordered:
+                break
+            continue
+        write_errors = reply.get("writeErrors") or []
+        if write_errors:
+            werr = write_errors[0]
+            results.append(
+                _bulk_write_op_error(
+                    idx, int(werr.get("code", 8)), str(werr.get("errmsg", "")), werr
+                )
+            )
+            n_errors += 1
+            if ordered:
+                break
+            continue
+
+        n = int(reply.get("n", 0))
+        entry_out: dict[str, Any] = {"ok": 1.0, "idx": idx, "n": n}
+        if kind == "insert":
+            counts["nInserted"] += n
+        elif kind == "update":
+            upserted = reply.get("upserted") or []
+            entry_out["nModified"] = int(reply.get("nModified", 0))
+            if upserted:
+                counts["nUpserted"] += len(upserted)
+                entry_out["upserted"] = {"_id": upserted[0]["_id"]}
+            else:
+                counts["nMatched"] += n
+            counts["nModified"] += int(reply.get("nModified", 0))
+        else:
+            counts["nDeleted"] += n
+        if not errors_only:
+            results.append(entry_out)
+
+    # Field order is mongod's: the cursor first, then the counters, then ``ok``.
+    return {
+        "cursor": {"id": 0, "firstBatch": results, "ns": "admin.$cmd.bulkWrite"},
+        "nErrors": n_errors,
+        "nInserted": counts["nInserted"],
+        "nMatched": counts["nMatched"],
+        "nModified": counts["nModified"],
+        "nUpserted": counts["nUpserted"],
+        "nDeleted": counts["nDeleted"],
+        "ok": 1.0,
+    }
 
 
 def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -7159,6 +7416,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "dbstats": _db_stats,
     "collStats": _coll_stats,
     "validate": _validate,
+    "bulkWrite": _bulk_write,
     "insert": _insert,
     "find": _find,
     "update": _update,

@@ -187,6 +187,7 @@ _EVENT_FIELD_ORDER = (
     "updateDescription",
     "stateBeforeChange",
     "fullDocumentBeforeChange",
+    "nsType",
 )
 
 
@@ -532,6 +533,16 @@ def _project(
             }
             if wall is not None:
                 event["wallTime"] = wall
+            # mongod 8.1+ tags a `create` event with what was created. Probed on
+            # 8.2.11: "collection", "timeseries" or "view", as a TOP-LEVEL field
+            # (not inside `ns`), emitted last. The unified
+            # `change-streams-nsType` spec asserts all three.
+            if "viewOn" in cmd:
+                event["nsType"] = "view"
+            elif "timeseries" in cmd:
+                event["nsType"] = "timeseries"
+            else:
+                event["nsType"] = "collection"
             return event, False
         if "collMod" in cmd:
             if not show_expanded_events:
