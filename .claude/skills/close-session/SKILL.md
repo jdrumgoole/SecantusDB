@@ -122,8 +122,11 @@ Close with what the repo now says, each line backed by a command you just ran:
 - anything you deliberately did **not** do, and why — a leftover reported is
   finished work, a leftover unmentioned is a trap;
 - anything that outlives the session and would surprise someone: a changed
-  default (`mongod` is now 8.2.11 here), a machine-wide install, a still-running
-  process that belongs to someone else.
+  default, a machine-wide install (an 8.2.11 `mongod` was added under its own
+  prefix on 2026-08-31), a still-running process that belongs to someone else.
+  **Write the version you measured, not the one you expected** — the `mongod`
+  line in `CLAUDE.md` was wrong for a day because a session recorded the
+  intended version rather than `mongod --version`'s answer.
 
 And state corrections plainly. If a number you reported earlier was measured
 against your own bug rather than a baseline, say so — a pass rate that "improved
