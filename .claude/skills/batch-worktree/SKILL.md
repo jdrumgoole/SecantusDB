@@ -162,7 +162,9 @@ Four traps, all hit for real:
 The branch and worktree are only half of it. Servers still bound to ports,
 WiredTiger temp stores, the `pytest-of-<user>` backlog, and background waiters
 still armed all outlive the session too — see the **`session-cleanup`** skill
-for those and for the closing verification pass.
+for those and for the closing verification pass. To close out a whole session
+rather than one branch — landing every outstanding change, recording what is
+left, and reconciling the docs with what changed — see **`close-session`**.
 
 ## If work lands on a branch whose PR is already open
 
