@@ -16,6 +16,10 @@ Git-side teardown — worktree before branch, `-D` not `-d`, the
 `--delete-branch` trap — lives in the **`batch-worktree`** skill. This one is
 everything *else* a session leaves behind.
 
+Closing a whole session is a bigger job than either: land every outstanding
+change, record what is left, and reconcile the docs with what changed. That
+sequence is the **`close-session`** skill, which ends by running this one.
+
 ## Verify every claim with a command
 
 "Clean" is a measurement, not a feeling. Each line of the final report should
