@@ -269,3 +269,83 @@ def test_cte_is_not_judged(storage, session):
         "WITH c AS (SELECT n AS v FROM t) SELECT v FROM c WHERE v = 42",
     )
     assert rows == [(42,)]
+
+
+# --- arithmetic ------------------------------------------------------------ #
+#
+# Postgres defines NO arithmetic operator on a text-category operand, so the
+# column's *content* is irrelevant: `txt + 1` errors on a column holding '42'
+# exactly as on one holding 'abc'. The scalar evaluator cannot see this — by the
+# time it runs, a typed text column and an unknown literal are both a Python
+# `str`, and it coerced both, so `txt + 1` silently answered 43.
+
+
+@pytest.mark.parametrize(
+    "sql,message",
+    [
+        ("SELECT txt + 1 FROM t", "operator does not exist: text + integer"),
+        ("SELECT txt - 1 FROM t", "operator does not exist: text - integer"),
+        ("SELECT txt * 2 FROM t", "operator does not exist: text * integer"),
+        ("SELECT txt / 2 FROM t", "operator does not exist: text / integer"),
+        ("SELECT 1 + txt FROM t", "operator does not exist: integer + text"),
+        # Postgres names the DECLARED type, so varchar reports as such.
+        ("SELECT vc + 1 FROM t", "operator does not exist: character varying + integer"),
+        ("SELECT txt + num FROM t", "operator does not exist: text + numeric"),
+        ("SELECT txt + txt FROM t", "operator does not exist: text + text"),
+        ("SELECT id FROM t WHERE txt + 1 = 2", "operator does not exist: text + integer"),
+    ],
+)
+def test_arithmetic_over_text_is_undefined(rule, sql, message):
+    assert rule(sql) == message
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # Numeric columns are the ordinary case and must keep working.
+        "SELECT n + 1 FROM t",
+        "SELECT num * n FROM t",
+        "SELECT big - 1 FROM t",
+        # A text-returning FUNCTION of a text column is text, but length() is
+        # integer — the operand that reaches the operator is numeric.
+        "SELECT length(txt) + 1 FROM t",
+        # Date arithmetic is a real Postgres operator.
+        "SELECT d + 1 FROM t",
+        # Casting OUT of text is exactly how a user is meant to do this.
+        "SELECT txt::int + 1 FROM t",
+        # An unknown literal is not typed — it coerces, and must not be judged.
+        "SELECT '1' + 1",
+        # A parameter's type is unknown here; guessing would be unsound.
+        "SELECT txt + $1 FROM t",
+        # Concatenation is not arithmetic.
+        "SELECT txt || '1' FROM t",
+    ],
+)
+def test_arithmetic_that_must_stay_lenient(rule, sql):
+    assert rule(sql) is None
+
+
+def test_reflected_table_arithmetic_is_not_judged(storage):
+    """The dual-protocol exemption applies to arithmetic too. A schema-on-read
+    column declared ``text`` from a 50-document sample may hold numbers, so a
+    42883 there would break working queries over pymongo-written data.
+
+    Asserted on the ANALYSIS rather than end-to-end: the reflected read path
+    pushes ``v + 0`` down to Mongo's ``$add``, which rejects a string operand
+    for its own reasons. That is pre-existing and separate — what must hold
+    here is that this analysis stays silent."""
+    storage.insert(
+        DB, "mixednum", [{"_id": bson.Int64(1), "v": "7"}, {"_id": bson.Int64(2), "v": 7}]
+    )
+    catalog = Catalog(storage)
+    stmt = planner.parse("SELECT _id FROM mixednum WHERE v + 0 = 7")[0]
+    typecheck.check_statement(stmt, catalog, DB)  # must not raise
+
+
+def test_arithmetic_in_a_subquery_scope_is_not_judged(storage, session):
+    rows = run(
+        storage,
+        session,
+        "SELECT id FROM t WHERE n = (SELECT max(n) FROM t WHERE txt = '42')",
+    )
+    assert rows == [(1,)]

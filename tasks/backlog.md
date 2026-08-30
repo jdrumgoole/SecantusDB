@@ -148,41 +148,74 @@ the entry says); `pg_index.indpred` reflecting NULL.
     arithmetic on boolean and answers `42883`. Python never raised here because
     `bool` IS an `int` — the lenient path had nothing to catch.
 
-- **Typed `text` / `varchar` operands in arithmetic still answer the wrong code
-  (open, and this is the residue of "cross-type lenient pairs").** Measured
-  against PG 14 on 2026-08-30, the rule is exact and worth writing down:
-  **unknown coerces; a typed operand is `42883`.** `'1'::text + 1`,
-  `'a'::text - 1`, `1 + '1'::text`, and a text **column** (`t + 1`, even from
-  `values('1')`) are all `42883 operator does not exist: text + integer`; only
-  a bare literal coerces. We answer `22P02` for the cast forms and silently
-  *compute* for the column form. Closing it needs the operand's **static** type,
-  which `scalar._eval_arith` does not have — it sees runtime values, where a
-  typed `text` and an unknown literal are both `str`. The natural home is
-  `sql/typecheck.py` (plan-time 42883 resolution), but that module today judges
-  **comparisons only** and deliberately skips FROM-less statements; its own
-  docstring calls widening to constant expressions "a separate, separately-
-  measured change". Note its soundness constraint: a spurious `42883` breaks a
-  working query, which is worse than the lenient answer — so this wants the
-  SQL gauges run, not just pytest.
+- **Typed `text` / `varchar` operands in arithmetic — FIXED 2026-08-30.** The
+  residue of "cross-type lenient pairs". The rule, measured against PG 14:
+  **unknown coerces; a typed operand is `42883`** — Postgres defines no
+  arithmetic operator on text at all, so the *content* is irrelevant and
+  `'1'::text + 1` errors exactly as `'a'::text + 1` does. We coerced both, so a
+  cast form reported the coercion's `22P02` and a text **column** silently
+  *computed* (`t + 1` answered 2).
 
-- **`interval '1 day' + 1` answers an interval where PG answers `42883`
-  (open).** Not an evaluator bug: **sqlglot parses the bare `1` as an
-  `exp.Interval` node**, so both operands arrive as intervals and `1` is read as
-  one second (`interval '1 day' + 1` → `1 day 00:00:01`). The unknown-literal
-  rules above do not reach it because the operand is not a `Literal` by the time
-  we see it. Fixing it means rejecting a unit-less numeric `exp.Interval` that
-  did not come from an `interval` keyword — an AST-shape fix, and worth checking
-  what else relies on that parse before touching it.
+  Split by what each half can know, which is the part worth remembering:
+  an explicit **cast** is decided in `scalar._eval_arith` from the AST alone
+  (a cast is unambiguously typed, and a constant-only statement never reaches
+  the plan-time analysis at all); a **column** is decided in `sql/typecheck.py`,
+  which owns the exemptions a declared type needs — reflected schema-on-read
+  tables above all, where a column typed `text` from a 50-document sample may
+  hold numbers. Postgres names the *declared* type, so `varchar` reports
+  "character varying". `typecheck` now judges arithmetic as well as comparisons,
+  to the same soundness bar (both operands statically certain, or say nothing).
 
-- **`pg_typeof(...)` wires as `text` (25), not `regtype` (2206) (open).**
-  Universal, not jsonb-specific — measured 2026-08-30 across `pg_typeof` of an
-  int / text / numeric / timestamptz / bool: the *value* is right every time
-  (`'integer'`, `'jsonb'`, …) and only the declared OID is wrong. The explicit
-  `pg_typeof(x)::text` and `::oid` forms are already correct. `planner.
-  rewrite_pg_typeof` replaces the call with a string literal, which then types
-  as text. Blocked on there being no `regtype` tag at all (`typemap.PG_OID` has
-  no entry for 2206), and adding one ripples into coercion, rendering and casts
-  — so it is a typing slice, not a one-liner.
+- **`interval '1 day' + 1` answered `1 day 00:00:01` — FIXED 2026-08-30, and
+  the cause was one level deeper than filed.** Filed as "sqlglot parses the bare
+  `1` as an `exp.Interval`", which is true but not actionable as written: the
+  entry assumed the node could be told apart after parsing. It cannot —
+  **sqlglot rewrites the numeric token into a *string* literal** inside the
+  synthesised `Interval`, so `+ 1` and `+ '1'` are byte-identical in the AST.
+  The real mechanism is sqlglot's multi-part interval form
+  (`INTERVAL '1' DAY '2' HOUR`), which absorbs a following STRING **or NUMBER**
+  across an explicit `+`; Postgres has no such syntax. Corrected at the parser
+  (`planner._patch_sqlglot_interval_continuation`), the one place the token is
+  still visible, rather than at ~20 `read="postgres"` call sites. `+ 'string'`
+  is left alone — PG resolves the unknown to an interval there, which is what
+  the continuation already computed.
+
+- **`interval '1 day' - 1` answered `22023 cannot delete from scalar` — FIXED
+  2026-08-30.** A *jsonb* error for an interval, found while probing the entry
+  above. Intervals and ranges ride as tagged subdocuments, so the
+  `jsonb - key` branch in `_eval_arith` claimed them; they are excluded now, and
+  `_pg_operand_type` names them rather than calling them "jsonb".
+
+- **`pg_typeof(...)` wired as `text` (25), not `regtype` (2206) — FIXED
+  2026-08-30.** Universal, not jsonb-specific: the *value* was right every time
+  and only the declared OID was wrong. `regtype` is a real tag now, and an
+  explicit `'int4'::regtype` types correctly too.
+
+  **The obvious implementation is wrong and cost a cycle:** wrapping the minted
+  literal in a `::regtype` cast changes the ANSWER, because the cast is
+  evaluated and `'int4'::regtype` evaluates to the type's OID *number* — the
+  column went from `'integer'` to `23`. The literal is **tagged** instead
+  (`planner._REGTYPE_MARKER`, read by `_infer_scalar_tag`), which steers typing
+  without touching the value.
+
+- **`float4` renders in exponent form where PG prints the plain integer (open).**
+  `SELECT DISTINCT - CAST ( - col0 AS REAL )` answers `8e+01` where the corpus
+  expects `80`. Found by the sqllogictest gauge at
+  `random/select/slt_good_1.test:26359` — and **the committed
+  `docs/validation-report-slt.md` records that file as `pass`**, so either the
+  report is stale or it was generated on a different environment. Measured on
+  this box 2026-08-30: it fails **at baseline** (source stashed) as
+  deterministically as it does with changes applied, twice each way, so it is
+  pre-existing and not a regression. Worth a re-baseline of that report as much
+  as a fix.
+
+- **A reflected column in arithmetic raises from the Mongo side (open, minor).**
+  `SELECT _id FROM coll WHERE v + 0 = 7` over a schema-on-read collection pushes
+  `v + 0` down to `$add`, which rejects a string operand
+  (`ExpressionError: $add only supports numeric or date types, not string`).
+  Pre-existing and separate from the typing work — noted while writing the
+  reflected-table exemption test, which pins the *analysis* rather than the
+  end-to-end read for exactly this reason.
 
 **Probed 2026-08-27 — 2 of 8 sampled were already done.** Reproduced each
 rather than reading it. **Stale:** `CancelRequest` is fully implemented (`57014`

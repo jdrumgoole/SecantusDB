@@ -47,6 +47,10 @@ PG_OID: dict[str, int] = {
     "int4": 23,
     # oid: an unsigned int4-like object identifier (psycopg's Oid wrapper).
     "oid": 26,
+    # regtype: a type's OID that INPUTS and PRINTS as the type's name. The value
+    # is the name text, so it renders exactly like ``text`` — only the declared
+    # oid differs, which is the whole point (``pg_typeof`` returns one).
+    "regtype": 2206,
     "text": 25,
     "float4": 700,
     "float8": 701,
@@ -782,9 +786,12 @@ def type_tag_for_sql(datatype: exp.DataType) -> str | None:
     if base == "name":
         return "name"
     # ``oid`` parses as an ``exp.ObjectIdentifier`` (whose ``.sql()`` is "OID"),
-    # not a DataType enum member — match on the rendered name.
+    # not a DataType enum member — match on the rendered name. ``regtype`` parses
+    # the same way.
     if base == "oid":
         return "oid"
+    if base == "regtype":
+        return "regtype"
     return None
 
 
