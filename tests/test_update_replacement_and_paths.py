@@ -29,9 +29,25 @@ from secantus.paths import path_block
 from secantus.update import UpdateError, apply_update
 
 
-@pytest.fixture
-def db(wt_home):
-    srv = SecantusDBServer(port=0, storage_path=wt_home)
+@pytest.fixture(autouse=True)
+def _fresh_databases(db):
+    """Drop everything this test made, so the shared server looks new to the next.
+
+    The isolation a per-test server gave for free, without paying for a server.
+    Runs AFTER the test so a failure leaves its data in place for inspection.
+    """
+    yield
+    _client = db.client
+    for _name in _client.list_database_names():
+        if _name not in ("admin", "local", "config"):
+            _client.drop_database(_name)
+
+
+# Module-scoped: one server for the file, with `_fresh_databases`
+# below giving each test the clean slate a per-test server used to.
+@pytest.fixture(scope="module")
+def db(wt_home_module):
+    srv = SecantusDBServer(port=0, storage_path=wt_home_module)
     srv.start()
     cli = pymongo.MongoClient(f"mongodb://{srv.address[0]}:{srv.address[1]}", directConnection=True)
     try:
