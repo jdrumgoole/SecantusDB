@@ -22,10 +22,25 @@ from pymongo.errors import OperationFailure
 from secantus import SecantusDBServer
 
 
-@pytest.fixture
-def server(wt_home):
-    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
+# Module-scoped: one server for the file, with `_fresh_databases` below
+# giving each test the clean slate a per-test server used to.
+@pytest.fixture(scope="module")
+def server(wt_home_module):
+    with SecantusDBServer(port=0, storage_path=wt_home_module) as srv:
         yield srv
+
+
+@pytest.fixture(autouse=True)
+def _fresh_databases(client):
+    """Drop everything this test made, so the shared server looks new to the next.
+
+    The isolation a per-test server gave for free, without paying for a server.
+    Runs AFTER the test so a failure leaves its data in place for inspection.
+    """
+    yield
+    for _name in client.list_database_names():
+        if _name not in ("admin", "local", "config"):
+            client.drop_database(_name)
 
 
 @pytest.fixture
