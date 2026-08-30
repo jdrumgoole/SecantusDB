@@ -60,21 +60,19 @@ class UpdateError(Exception):
 # applying the update to a particular doc, as opposed to parse errors readable
 # from the update spec alone.
 #
-# mongod 8.3.4 wraps these in "Plan executor error during update :: caused by ::".
-# mongod 6.0.16 does NOT -- the message bodies and codes are identical, only the
-# wrapper differs. We advertise 7.0 (`buildInfo.version`, maxWireVersion 17) and
-# have no 7.0 to probe, and `tests/test_mongod_differential.py` runs whatever
-# mongod is on PATH -- 6.0.16 here. So the wrapper is deliberately NOT emitted
-# for the ``update`` command: adding it on the evidence of a version NEWER than
-# the one we advertise broke five live differential cases.
+# mongod 8.x wraps these in "Plan executor error during <command> :: caused by
+# ::" -- re-probed on 8.2.11, for BOTH ``update`` and ``findAndModify``, and we
+# emit it for both.
 #
-# ``findAndModify`` is the other half of that finding and goes the OTHER way:
-# 6.0.16 DOES wrap there, with its own command-named prefix
-# ("Plan executor error during findAndModify :: caused by ::"), and only for
-# this execution class -- parse errors (unknown modifier, path conflict,
-# $rename onto itself, array-filter problems) come back bare. Probed 6.0.16
-# across nine shapes. So the classification is load-bearing now rather than
-# aspirational, and ``exec_error`` carries it to the command layer.
+# This comment used to say the wrapper was "deliberately NOT emitted" for
+# ``update``, because 6.0.16 did not wrap there and adopting 8.3's form broke
+# five live differential cases. That reasoning died with the retarget to 8.x
+# (CLAUDE.md: when 8.x and 6.0 disagree, 8.x is right by definition), and the
+# code moved with it -- only the comment lagged. Parse errors are still the
+# other half of the finding: unknown modifier, path conflict, $rename onto
+# itself and array-filter problems come back BARE, so the execution-vs-parse
+# classification stays load-bearing and ``exec_error`` carries it to the
+# command layer.
 def _exec_error(message: str, code: int) -> UpdateError:
     """An execution-time update error (see the note above on the wrappers)."""
     return UpdateError(message, code=code, exec_error=True)

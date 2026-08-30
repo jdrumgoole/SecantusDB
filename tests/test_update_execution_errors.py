@@ -4,9 +4,11 @@ mongod distinguishes two kinds of update error and wraps only one of them:
 
 * **execution-time** — discoverable only while applying the update to a
   particular document (``$inc`` on a non-numeric *field*, an array operator on a
-  non-array *field*). mongod 8.3.4 wraps these in ``Plan executor error during
-  update :: caused by :: ``; 6.0.16 does not, and the codes and bodies are the
-  same either way. We advertise 7.0 and emit the bare body.
+  non-array *field*). mongod 8.x wraps these in ``Plan executor error during
+  update :: caused by :: `` -- re-probed on 8.2.11, the version
+  ``PROBED_MONGOD_VERSION`` names, and we emit the wrapper. (6.0.16 did not
+  wrap, which is why this file once said we emit the bare body; 8.x is the
+  target now.)
 * **parse-time** — determinable from the update spec alone (a path conflict, a
   self-rename, an unknown operator, ``$inc`` with a non-numeric *argument*).
   These stay plain.
