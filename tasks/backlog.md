@@ -1359,6 +1359,19 @@ These are explicit non-goals. Don't add them without a reason.
   (#1098) without revisiting the code. A wrong-typed non-null `indexes` still
   answers the ordinary 14.
 
+- [ ] **`_create_indexes` keeps an UNREACHABLE `10065` branch (found 2026-08-30
+  while closing the maxTimeMS batch).** After the null-means-absent fix, the
+  `if not isinstance(indexes, (list, tuple))` arm in `commands._create_indexes`
+  cannot be reached: `_require_typed_bson_field` at the top of the handler
+  already answers 14 for any non-null non-list, and the 40414 arm above it
+  catches null/missing — so only a list arrives, and a list passes the
+  isinstance. Confirmed empirically: the differential cases for `indexes` as
+  null / omitted / `5` / `"x"` all match mongod and none produces 10065.
+  Harmless today, but it is dead code holding a 6.0-era answer, so if the
+  type-check above it is ever refactored away the stale code silently comes
+  back. Delete the arm. Cosmetic; not worth its own full-suite cycle, so it is
+  filed for the next batch that touches this handler.
+
 - [ ] **`maxTimeMS` is validated but still not ENFORCED (measured 2026-08-30).**
   Now that the validation matches, this is the whole of the remaining gap and it
   is the one the differential probe trips over: mongod times the operation out
