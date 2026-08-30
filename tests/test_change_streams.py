@@ -989,3 +989,82 @@ def test_modified_resume_token_is_280_with_expected_and_found(
     assert "Only transformations that retain the unmodified _id field are allowed." in d["errmsg"]
     assert d["errmsg"].endswith(f" but found: {found}")
     assert '{ _id: { _data: "' in d["errmsg"]
+
+
+# --- Expanded events: collectionUUID and collMod's stateBeforeChange ---------
+#
+# Probed against mongod 8.2.11 (2026-08-30). With `showExpandedEvents`, every
+# event that HAS a collection carries `collectionUUID` -- the command events
+# (create / createIndexes / dropIndexes / collMod / drop / rename) as well as
+# CRUD. `invalidate` does NOT, even though it derives from an entry that does.
+# `collMod` additionally carries `stateBeforeChange`, the collection's options
+# as they stood BEFORE the change.
+
+
+def _expanded_events(client: MongoClient, dbname: str, action, count: int = 1):
+    db = client[dbname]
+    db.c.insert_one({"_id": 1})
+    with db.watch(show_expanded_events=True) as cs:
+        assert cs.try_next() is None
+        action(db)
+        events = []
+        deadline = time.time() + 10
+        while time.time() < deadline and len(events) < count:
+            ev = cs.try_next()
+            if ev is not None:
+                events.append(ev)
+    return events
+
+
+@pytest.mark.parametrize(
+    ("name", "action"),
+    [
+        ("createIndexes", lambda db: db.c.create_index([("a", 1)], name="ix")),
+        ("create", lambda db: db.create_collection("other")),
+        ("drop", lambda db: db.c.drop()),
+        ("collMod", lambda db: db.command({"collMod": "c", "validator": {}})),
+    ],
+)
+def test_command_events_carry_collection_uuid(client: MongoClient, name: str, action) -> None:
+    """These carried it only on CRUD events before -- the four command events
+    were the last content divergence in the change-stream sweep."""
+    events = _expanded_events(client, f"uuid_{name}", action)
+    assert events, f"expected a {name} event"
+    assert "collectionUUID" in events[0], f"{name} event lost collectionUUID"
+    keys = list(events[0])
+    # mongod puts it immediately after clusterTime.
+    assert keys.index("collectionUUID") == keys.index("clusterTime") + 1
+
+
+def test_invalidate_does_not_carry_collection_uuid(client: MongoClient) -> None:
+    """The exclusion is deliberate: `invalidate` derives from an entry that HAS
+    a uuid, and mongod still omits it."""
+    events = _expanded_events(client, "uuid_inval", lambda db: db.c.drop(), count=2)
+    by_type = {e["operationType"]: e for e in events}
+    assert "drop" in by_type
+    assert "collectionUUID" in by_type["drop"]
+    if "invalidate" in by_type:
+        assert "collectionUUID" not in by_type["invalidate"]
+
+
+def test_collmod_reports_the_options_it_replaced(client: MongoClient) -> None:
+    """`stateBeforeChange` is the collection's options BEFORE the collMod, so it
+    has to be captured before the mutation, not read back after it."""
+    db = client["sbc"]
+    db.create_collection("c", validator={"x": {"$exists": True}})
+    with db.watch(show_expanded_events=True) as cs:
+        assert cs.try_next() is None
+        db.command({"collMod": "c", "changeStreamPreAndPostImages": {"enabled": True}})
+        event = None
+        deadline = time.time() + 10
+        while event is None and time.time() < deadline:
+            event = cs.try_next()
+    assert event is not None
+    assert event["operationType"] == "modify"
+    before = event["stateBeforeChange"]["collectionOptions"]
+    # The PRIOR validator, not the newly-set option.
+    assert before["validator"] == {"x": {"$exists": True}}
+    assert "changeStreamPreAndPostImages" not in before
+    assert "uuid" in before
+    # The change itself is still reported separately.
+    assert event["operationDescription"] == {"changeStreamPreAndPostImages": {"enabled": True}}

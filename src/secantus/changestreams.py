@@ -337,7 +337,22 @@ def project(
         scope=scope,
         show_expanded_events=show_expanded_events,
     )
-    return (_order_event_fields(event) if event is not None else None), invalidates
+    if event is not None:
+        # `showExpandedEvents` puts the collection's UUID on every event that
+        # HAS a collection -- CRUD and the command events alike (probed on
+        # 8.2.11: create / createIndexes / dropIndexes / collMod / drop /
+        # rename all carry it). `invalidate` does NOT, even though it is derived
+        # from an entry that does, so it is excluded explicitly rather than by
+        # accident. The CRUD path sets it earlier; this fills in the rest.
+        if (
+            show_expanded_events
+            and event.get("operationType") != "invalidate"
+            and "collectionUUID" not in event
+            and oplog_entry.get("ui") is not None
+        ):
+            event["collectionUUID"] = oplog_entry["ui"]
+        event = _order_event_fields(event)
+    return event, invalidates
 
 
 def _project(
@@ -560,6 +575,13 @@ def _project(
             }
             if wall is not None:
                 event["wallTime"] = wall
+            # The collection's options as they were BEFORE this collMod. mongod
+            # keeps them in the oplog entry's `o2.collectionOptions_old` and
+            # renames the key on the event to `collectionOptions` (probed
+            # 8.2.11).
+            old_opts = (oplog_entry.get("o2") or {}).get("collectionOptions_old")
+            if old_opts is not None:
+                event["stateBeforeChange"] = {"collectionOptions": old_opts}
             return event, False
         if "createIndexes" in cmd:
             if not show_expanded_events:

@@ -4436,6 +4436,12 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 26,
             "codeName": "NamespaceNotFound",
         }
+    # The options as they stand BEFORE anything is mutated below. mongod puts
+    # these on the `modify` change event as `stateBeforeChange`, and stores them
+    # in the oplog entry's `o2.collectionOptions_old` (probed 8.2.11), so they
+    # have to be captured here -- by the time the event is emitted the mutation
+    # has already happened.
+    state_before = ctx.storage.get_collection_options(ctx.db_name, coll)
     # Collect the options this collMod actually changed; the same map
     # becomes the ``modify`` change event's ``operationDescription`` (a bare
     # collMod with no options is a valid no-op that still emits an event).
@@ -4526,7 +4532,7 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             description["index"] = {"name": target["name"], "unique": True}
     # Emit the collMod command oplog entry so a change stream with
     # ``showExpandedEvents`` surfaces a ``modify`` event.
-    ctx.storage.record_collmod(ctx.db_name, coll, description)
+    ctx.storage.record_collmod(ctx.db_name, coll, description, state_before=state_before)
     return reply
 
 

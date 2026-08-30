@@ -30,7 +30,20 @@ MONGOD = os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27045")
 SERVER = os.environ.get("PROBE_SERVER")
 
 # Per-run values: normalised, not compared.
-VOLATILE = ("_id", "clusterTime", "wallTime", "collectionUUID", "txnNumber", "lsid")
+# Per-run values: normalised, not compared. `uuid` is here as well as
+# `collectionUUID` because a collection's UUID also appears NESTED, inside
+# `stateBeforeChange.collectionOptions` -- normalising only the top-level name
+# left that one comparing raw bytes and reported a divergence where the two
+# structures were identical.
+VOLATILE = (
+    "_id",
+    "clusterTime",
+    "wallTime",
+    "collectionUUID",
+    "uuid",
+    "txnNumber",
+    "lsid",
+)
 
 
 def normalise(value):

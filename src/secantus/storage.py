@@ -6582,7 +6582,14 @@ class Storage:
             self._emit_oplog(entries)
             return True, None
 
-    def record_collmod(self, db: str, coll: str, description: dict[str, Any]) -> None:
+    def record_collmod(
+        self,
+        db: str,
+        coll: str,
+        description: dict[str, Any],
+        *,
+        state_before: dict[str, Any] | None = None,
+    ) -> None:
         """Emit a ``collMod`` command oplog entry so change streams watching
         ``db`` / ``db.coll`` (with ``showExpandedEvents``) can surface a
         ``modify`` event. ``description`` carries the changed options (empty
@@ -6601,6 +6608,21 @@ class Storage:
                         "ns": f"{db}.$cmd",
                         "ui": bson.Binary(ui.bytes, subtype=4),
                         "o": {"collMod": coll, **description},
+                        # mongod carries the pre-change options here, as
+                        # `collectionOptions_old` including the uuid (probed
+                        # 8.2.11); the change stream surfaces them as
+                        # `stateBeforeChange.collectionOptions`.
+                        # `uuid` is set explicitly and any inbound one dropped:
+                        # `get_collection_options` hands back a native
+                        # `uuid.UUID`, which BSON refuses to encode under
+                        # UuidRepresentation.UNSPECIFIED. Leading with it also
+                        # matches mongod's key order (uuid, then the options).
+                        "o2": {
+                            "collectionOptions_old": {
+                                "uuid": bson.Binary(ui.bytes, subtype=4),
+                                **{k: v for k, v in (state_before or {}).items() if k != "uuid"},
+                            }
+                        },
                     }
                 ]
             )

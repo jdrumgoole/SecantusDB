@@ -341,7 +341,25 @@ pub fn project(
         scope,
         show_expanded_events,
     )?;
-    Ok((event.map(order_event_fields), invalidates))
+    let event = event.map(|mut ev| {
+        // `showExpandedEvents` puts the collection's UUID on every event that
+        // HAS a collection -- CRUD and the command events alike (probed on
+        // 8.2.11: create / createIndexes / dropIndexes / collMod / drop /
+        // rename all carry it). `invalidate` does NOT, even though it derives
+        // from an entry that does, so it is excluded explicitly. The CRUD path
+        // sets it earlier; this fills in the rest. Mirrors
+        // `src/secantus/changestreams.py`.
+        if show_expanded_events
+            && ev.get_str("operationType") != Ok("invalidate")
+            && !ev.contains_key("collectionUUID")
+        {
+            if let Some(ui) = oplog_entry.get("ui") {
+                ev.insert("collectionUUID", ui.clone());
+            }
+        }
+        order_event_fields(ev)
+    });
+    Ok((event, invalidates))
 }
 
 fn project_unordered(
@@ -684,6 +702,24 @@ fn project_command(
                 ("operationDescription", Bson::Document(op_desc)),
             ],
         )?;
+        // The collection's options as they were BEFORE this collMod. mongod
+        // keeps them in the oplog entry's `o2.collectionOptions_old` and renames
+        // the key on the event to `collectionOptions` (probed 8.2.11).
+        let mut event = event;
+        if let Some(old_opts) = oplog_entry
+            .get_document("o2")
+            .ok()
+            .and_then(|o2| o2.get("collectionOptions_old"))
+        {
+            event.insert(
+                "stateBeforeChange",
+                Bson::Document({
+                    let mut d = Document::new();
+                    d.insert("collectionOptions", old_opts.clone());
+                    d
+                }),
+            );
+        }
         return Ok((Some(event), false));
     }
     Ok((None, false))

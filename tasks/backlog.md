@@ -1333,6 +1333,49 @@ These are explicit non-goals. Don't add them without a reason.
   `operationType` (matching no released server), and a probe moved it to the
   form 6.0.16 and 8.2.1 share. Only the last was measured.
 
+- [x] **RESOLVED (2026-08-30): expanded change events carry `collectionUUID`,
+  and `collMod` carries `stateBeforeChange` — the change-stream sweep is now
+  0 of 41 diverging on BOTH servers.** `collectionUUID` was set only on CRUD
+  events; mongod puts it on every event that HAS a collection, command events
+  included (`create` / `createIndexes` / `dropIndexes` / `collMod` / `drop` /
+  `rename`). `invalidate` does NOT carry it even though it derives from an entry
+  that does, so the exclusion is explicit and pinned by a test.
+
+  `stateBeforeChange` is the collection's options as they stood BEFORE the
+  collMod, so it has to be captured before the mutation rather than read back
+  after. mongod stores it in the oplog entry's `o2.collectionOptions_old` and
+  renames the key on the event to `collectionOptions` — read off a real 8.2.11
+  oplog rather than guessed.
+
+  The one thing still differing is the `rename` field-order WATCH below, kept
+  deliberately.
+
+- [ ] **WATCH (not a defect today): `fullDocument`'s position in a change event
+  moved in mongod 8.3, and we match the 8.2.1 target (2026-08-30).** Measured
+  on all three servers:
+
+  | server | `fullDocument` position |
+  |---|---|
+  | 6.0.16 | index 4, after `wallTime` |
+  | **8.2.1** (the probed target) | **index 4, after `wallTime` — same as 6.0** |
+  | 8.3.4 | **last**, after `updateDescription` |
+
+  So there is nothing to change: `changestreams._EVENT_FIELD_ORDER` (mirrored in
+  `crates/secantus-storage/src/changestreams.rs`, pinned by
+  `tests/test_change_stream_spec_fidelity.py`) already matches
+  `PROBED_MONGOD_VERSION`. Filed as a WATCH because whoever next moves the
+  probed version forward to 8.3+ must move that field and those pinned key
+  sequences together.
+
+  Two things this cost, worth keeping. First, a **patch-level** difference:
+  6.0.16 and 8.2.1 agree while 8.3.4 differs, so "the 8.x series" is not a
+  single behaviour and probing 8.3 to learn about 8.2 gives the wrong answer —
+  which is exactly what happened here before 8.2.1 was measured. Second, this
+  one field has now been in three positions: the original code appended it last
+  (8.3's form, by accident), a later change "fixed" it to sit immediately after
+  `operationType` (matching no released server), and a probe moved it to the
+  form 6.0.16 and 8.2.1 share. Only the last was measured.
+
 - [ ] **Expanded change events omit `collectionUUID`, and `collMod` omits
   `stateBeforeChange` (2026-08-29).** With `showExpandedEvents: true`, mongod
   puts `collectionUUID` on `create` / `createIndexes` / `dropIndexes` /
