@@ -271,11 +271,11 @@ def test_storage_list_roles_filters_by_db(tmp_path) -> None:
 
 
 @pytest.fixture
-def server_with_auth(tmp_path):
+def server_with_auth(wt_home):
     """Auth-enabled server with a bootstrap root user on admin."""
     srv = SecantusDBServer(
         port=0,
-        storage_path=str(tmp_path / "wt"),
+        storage_path=wt_home,
         require_auth=True,
         ttl_sweep_seconds=0,
     )

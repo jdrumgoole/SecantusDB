@@ -109,11 +109,11 @@ def test_project_returns_none_for_noop(tmp_path) -> None:
         storage.close()
 
 
-def test_change_stream_resume_token_advances_via_heartbeat(tmp_path) -> None:
+def test_change_stream_resume_token_advances_via_heartbeat(wt_home) -> None:
     """End-to-end: open a change stream on a quiet collection, drive
     one explicit heartbeat, and verify the cursor's
     ``postBatchResumeToken`` advances even though no user op landed."""
-    srv = SecantusDBServer(port=0, storage_path=str(tmp_path / "srv"))
+    srv = SecantusDBServer(port=0, storage_path=wt_home)
     srv.start()
     try:
         client = MongoClient(srv.uri, serverSelectionTimeoutMS=2000)

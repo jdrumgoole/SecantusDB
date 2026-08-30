@@ -83,8 +83,8 @@ class TestSessionRegistryUnit:
 
 class TestSessionCommandsViaWire:
     @pytest.fixture
-    def server(self, tmp_path):
-        with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as srv:
+    def server(self, wt_home):
+        with SecantusDBServer(port=0, storage_path=wt_home) as srv:
             yield srv
 
     @pytest.fixture

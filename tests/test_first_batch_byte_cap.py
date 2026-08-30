@@ -22,8 +22,8 @@ MONGOD_REPLY_CAP = 16 * ONE_MIB
 
 
 @pytest.fixture
-def client(tmp_path):
-    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as srv:
+def client(wt_home):
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         mc = MongoClient(srv.uri, serverSelectionTimeoutMS=5000)
         try:
             yield mc

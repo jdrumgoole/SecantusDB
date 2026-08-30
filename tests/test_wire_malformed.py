@@ -77,13 +77,13 @@ def _read_op_msg_reply(sock: socket.socket) -> bytes:
     return body
 
 
-def test_malformed_body_returns_bad_value_keeps_connection_open(tmp_path) -> None:
+def test_malformed_body_returns_bad_value_keeps_connection_open(wt_home) -> None:
     """A handcrafted OP_MSG with invalid BSON in the body now elicits a
     targeted ``BadValue`` reply, not a dropped connection. Verified by
     sending a valid follow-up ``ping`` on the same socket."""
     import bson
 
-    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as srv:
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         host, port = srv.address
         with socket.create_connection((host, port), timeout=5) as sock:
             # 1. Send malformed OP_MSG. Server should reply with BadValue.
@@ -127,7 +127,7 @@ def _read_reply_flags_and_doc(sock: socket.socket) -> tuple[int, bytes]:
     return flags, body[5:]
 
 
-def test_awaitable_exhaust_hello_streams_more_to_come(tmp_path) -> None:
+def test_awaitable_exhaust_hello_streams_more_to_come(wt_home) -> None:
     """Streaming-SDAM monitor: an awaitable ``hello`` (carries ``maxAwaitTimeMS``)
     sent with the OP_MSG ``exhaustAllowed`` flag must get a *stream* of
     ``moreToCome`` replies, and on server shutdown a final ``moreToCome``-clear
@@ -136,7 +136,7 @@ def test_awaitable_exhaust_hello_streams_more_to_come(tmp_path) -> None:
     the intermittent ``mongosh`` smoke failure this guards against."""
     import bson
 
-    srv = SecantusDBServer(port=0, storage_path=str(tmp_path / "wt"))
+    srv = SecantusDBServer(port=0, storage_path=wt_home)
     srv.start()
     try:
         host, port = srv.address
@@ -173,7 +173,7 @@ def test_awaitable_exhaust_hello_streams_more_to_come(tmp_path) -> None:
         srv.stop()
 
 
-def test_awaitable_exhaust_hello_streams_when_fd_above_1024(tmp_path) -> None:
+def test_awaitable_exhaust_hello_streams_when_fd_above_1024(wt_home) -> None:
     """Regression: the awaitable-hello stream must survive a connection whose
     socket fd is >= 1024. ``select.select()`` raises ``ValueError:
     filedescriptor out of range`` past ``FD_SETSIZE`` (1024), which — under
@@ -193,7 +193,7 @@ def test_awaitable_exhaust_hello_streams_when_fd_above_1024(tmp_path) -> None:
         resource.setrlimit(resource.RLIMIT_NOFILE, (min(want, hard), hard))
 
     hogs: list[int] = []
-    srv = SecantusDBServer(port=0, storage_path=str(tmp_path / "wt"))
+    srv = SecantusDBServer(port=0, storage_path=wt_home)
     srv.start()
     try:
         # Burn low fds so the client socket below lands above FD_SETSIZE.
@@ -228,14 +228,14 @@ def test_awaitable_exhaust_hello_streams_when_fd_above_1024(tmp_path) -> None:
             resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
 
-def test_malformed_body_logs_warning_does_not_unhandled_traceback(tmp_path, caplog) -> None:
+def test_malformed_body_logs_warning_does_not_unhandled_traceback(wt_home, caplog) -> None:
     """Pre-fix the wire path leaked a Python traceback through the
     server's catch-all handler. After the fix the bad body is logged
     at WARNING level and produces no ``unhandled error`` ERROR log."""
     import logging
 
     with (
-        SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as srv,
+        SecantusDBServer(port=0, storage_path=wt_home) as srv,
         caplog.at_level(logging.WARNING, logger="secantus.server"),
     ):
         host, port = srv.address
@@ -280,21 +280,21 @@ def _assert_bad_value_then_ping_survives(sock: socket.socket, request_id: int) -
     assert ping_doc["ok"] == 1.0, "connection did not survive the malformed OP_QUERY"
 
 
-def test_op_query_unterminated_collname_returns_bad_value(tmp_path) -> None:
+def test_op_query_unterminated_collname_returns_bad_value(wt_home) -> None:
     """A malformed OP_QUERY whose fullCollectionName has no NUL terminator
     (the issue-#116 bug) used to raise an uncaught ``ValueError`` from
     ``bytes.index`` and drop the connection without a reply. It now routes
     through the BadValue path and the connection survives."""
     # flags(4) + a collection name with NO NUL byte anywhere after it.
     body = struct.pack("<I", 0) + b"admin.$cmd-but-this-name-is-never-nul-terminated"
-    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as srv:
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         host, port = srv.address
         with socket.create_connection((host, port), timeout=5) as sock:
             sock.sendall(_build_op_query_raw(request_id=99, op_query_body=body))
             _assert_bad_value_then_ping_survives(sock, request_id=100)
 
 
-def test_op_query_invalid_utf8_collname_returns_bad_value(tmp_path) -> None:
+def test_op_query_invalid_utf8_collname_returns_bad_value(wt_home) -> None:
     """A NUL-terminated but non-UTF-8 collection name must not raise an
     uncaught ``UnicodeDecodeError`` (a ``ValueError`` subclass) either."""
     body = (
@@ -304,25 +304,25 @@ def test_op_query_invalid_utf8_collname_returns_bad_value(tmp_path) -> None:
         + struct.pack("<iii", 0, 0, 5)  # skip, return, empty-doc length
         + b"\x00"  # empty BSON doc terminator
     )
-    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as srv:
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         host, port = srv.address
         with socket.create_connection((host, port), timeout=5) as sock:
             sock.sendall(_build_op_query_raw(request_id=7, op_query_body=body))
             _assert_bad_value_then_ping_survives(sock, request_id=8)
 
 
-def test_op_query_truncated_after_collname_returns_bad_value(tmp_path) -> None:
+def test_op_query_truncated_after_collname_returns_bad_value(wt_home) -> None:
     """An OP_QUERY truncated before the skip/return/query fields must surface
     BadValue (a ``struct.error`` from ``unpack_from``), not drop the socket."""
     body = struct.pack("<I", 0) + b"db.coll" + b"\x00" + b"\x01\x02"  # truncated
-    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as srv:
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         host, port = srv.address
         with socket.create_connection((host, port), timeout=5) as sock:
             sock.sendall(_build_op_query_raw(request_id=11, op_query_body=body))
             _assert_bad_value_then_ping_survives(sock, request_id=12)
 
 
-def test_op_query_negative_doc_len_returns_bad_value(tmp_path) -> None:
+def test_op_query_negative_doc_len_returns_bad_value(wt_home) -> None:
     """A negative declared query-doc length must be caught by ``_check_doc_len``
     (the OP_MSG hardening, now applied to OP_QUERY too), not produce a garbage
     slice that ``bson.decode`` crashes the connection thread on."""
@@ -333,21 +333,21 @@ def test_op_query_negative_doc_len_returns_bad_value(tmp_path) -> None:
         + struct.pack("<iii", 0, 0, -1)  # skip, return, doc_len = -1
         + b"\x00\x00\x00\x00"
     )
-    with SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as srv:
+    with SecantusDBServer(port=0, storage_path=wt_home) as srv:
         host, port = srv.address
         with socket.create_connection((host, port), timeout=5) as sock:
             sock.sendall(_build_op_query_raw(request_id=13, op_query_body=body))
             _assert_bad_value_then_ping_survives(sock, request_id=14)
 
 
-def test_op_query_malformed_logs_warning_not_traceback(tmp_path, caplog) -> None:
+def test_op_query_malformed_logs_warning_not_traceback(wt_home, caplog) -> None:
     """The malformed OP_QUERY must be a WARNING, never an ``unhandled error``
     ERROR-level traceback through the catch-all handler."""
     import logging
 
     body = struct.pack("<I", 0) + b"no-nul-here-at-all-not-even-once"
     with (
-        SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as srv,
+        SecantusDBServer(port=0, storage_path=wt_home) as srv,
         caplog.at_level(logging.WARNING, logger="secantus.server"),
     ):
         host, port = srv.address
@@ -362,7 +362,7 @@ def test_op_query_malformed_logs_warning_not_traceback(tmp_path, caplog) -> None
     )
 
 
-def test_abrupt_reset_close_is_quiet(tmp_path, caplog) -> None:
+def test_abrupt_reset_close_is_quiet(wt_home, caplog) -> None:
     """An RST-style hang-up (SO_LINGER 0 close — how Go-driver tools like
     mongodump drop pooled connections) is a normal disconnect: DEBUG log,
     no ``unhandled error`` traceback through the catch-all handler."""
@@ -372,7 +372,7 @@ def test_abrupt_reset_close_is_quiet(tmp_path, caplog) -> None:
     import bson
 
     with (
-        SecantusDBServer(port=0, storage_path=str(tmp_path / "wt")) as srv,
+        SecantusDBServer(port=0, storage_path=wt_home) as srv,
         caplog.at_level(logging.DEBUG, logger="secantus.server"),
     ):
         host, port = srv.address
