@@ -82,10 +82,9 @@ the entry says); `pg_index.indpred` reflecting NULL.
   repr*: `'{"x":1}'::jsonb || '{"y":2}'::jsonb` answered `{'x': 1}{'y': 2}` —
   single-quoted, not valid JSON. Now merges with the right operand winning,
   matching PG.
-- **`jsonb || jsonb` mixed shapes are typed as a PG ARRAY (open).**
-  `array||array`, `object||array`, `array||scalar` have the right *values* but
-  render `{1,2,3}` where PG renders the jsonb `[1, 2, 3]`. Fixing it means the
-  concat result carrying the jsonb tag — a typing change, not a value one.
+- **`jsonb || jsonb` mixed shapes are typed as a PG ARRAY — FIXED 2026-08-30.**
+  See the combined jsonb-tag entry below; `||` and `-` were one root cause and
+  were fixed together.
 - **`jsonb - 'key'` raised `XX000` — FIXED 2026-08-28.** The operator reached
   Python's `-` (`dict - str`) and the bare TypeError escaped as an internal
   server error. `scalar._jsonb_delete` now implements PG's full rule set
@@ -109,11 +108,81 @@ the entry says); `pg_index.indpred` reflecting NULL.
   reports an invalid numeric literal. Distinguishing a *typed* `::text` operand
   from an unknown literal is exactly the "cross-type lenient pairs" entry, whose
   skipped-shape list already names arithmetic operands. Not new.
-- **jsonb results that are ARRAYS are typed as a PG array (open).** Affects both
-  `||`'s mixed shapes and `-` on an array: `'[1,2,3]'::jsonb - 1` has the right
-  *value* but renders `{1,3}` where PG renders `[1, 3]`. One root cause — a
-  jsonb operation returning a Python list loses the jsonb tag — so both are one
-  fix: carry the tag through the operator result.
+  **Superseded 2026-08-30** by the "typed `text` / `varchar` operands" entry
+  below, which carries the full PG-measured rule and the reason it needs static
+  types. Do not work these two separately — they are one fix.
+- **jsonb results lost the jsonb tag — FIXED 2026-08-30, and it was WORSE than
+  filed.** Recorded as a render nit (`{1,3}` where PG renders `[1, 3]`). Probed
+  over the **wire** against a live PostgreSQL 14 comparing the result OID as
+  well as the value, every `jsonb - anything` turned out to be a hard
+  **client-side crash**: the result typed from the RIGHT operand (`int4` /
+  `numeric`), so a jsonb payload went out under a numeric OID and psycopg raised
+  `invalid literal for int() with base 10: '{1,3}'`. `||` typed as `text`. Both
+  fixed in `planner._infer_scalar_tag` — `||` is jsonb when EITHER operand is,
+  `-` when the LEFT one is; `#-` was already correct. 13 shapes now match PG
+  exactly.
+
+  **Method note worth reusing: an in-process probe of these same statements
+  showed NOTHING.** `run_sql` returns the Python value, which was right all
+  along — the bug lived entirely in the declared type, so it was visible only
+  over a real driver connection. A value-only comparison cannot see this class
+  at all. `tests/test_sql_result_type_tags.py` asserts the OID alongside the
+  value for exactly that reason.
+
+- **Arithmetic result types disagreed with their values — FIXED 2026-08-30.**
+  Same shape as the jsonb entry, found by the same probe. Postgres resolves an
+  `unknown` literal to the OTHER operand's type *before* choosing an operator,
+  so that type decides both the parse and the error. We widened instead:
+  - `'1.5' + 1` answered `2.5` under the `int4` OID the literal `1` had fixed
+    (client crash); PG answers `22P02` naming **integer**. Our `22P02` message
+    said "numeric" for every target and now names the real one.
+  - `'2020-01-01' + 1` did *date* arithmetic and answered a date under an
+    `int4` OID (client crash); PG answers `22P02`. Only a bare **literal** is
+    judged — a `::date` cast or a date column keeps date arithmetic.
+  - `'2020-01-01' + interval '1 day'` answered a timestamp under the *interval*
+    OID (client crash: `can't parse interval '2020-01-02 00:00:00'`); PG
+    answers `22007`, because beside an interval the unknown coerces to an
+    interval. `+` / `-` only — for `*` / `/` PG picks a number, so
+    `interval '1 day' * '2'` is two days.
+  - `true + 1` answered `2` and `true - false` answered `1`; PG has NO
+    arithmetic on boolean and answers `42883`. Python never raised here because
+    `bool` IS an `int` — the lenient path had nothing to catch.
+
+- **Typed `text` / `varchar` operands in arithmetic still answer the wrong code
+  (open, and this is the residue of "cross-type lenient pairs").** Measured
+  against PG 14 on 2026-08-30, the rule is exact and worth writing down:
+  **unknown coerces; a typed operand is `42883`.** `'1'::text + 1`,
+  `'a'::text - 1`, `1 + '1'::text`, and a text **column** (`t + 1`, even from
+  `values('1')`) are all `42883 operator does not exist: text + integer`; only
+  a bare literal coerces. We answer `22P02` for the cast forms and silently
+  *compute* for the column form. Closing it needs the operand's **static** type,
+  which `scalar._eval_arith` does not have — it sees runtime values, where a
+  typed `text` and an unknown literal are both `str`. The natural home is
+  `sql/typecheck.py` (plan-time 42883 resolution), but that module today judges
+  **comparisons only** and deliberately skips FROM-less statements; its own
+  docstring calls widening to constant expressions "a separate, separately-
+  measured change". Note its soundness constraint: a spurious `42883` breaks a
+  working query, which is worse than the lenient answer — so this wants the
+  SQL gauges run, not just pytest.
+
+- **`interval '1 day' + 1` answers an interval where PG answers `42883`
+  (open).** Not an evaluator bug: **sqlglot parses the bare `1` as an
+  `exp.Interval` node**, so both operands arrive as intervals and `1` is read as
+  one second (`interval '1 day' + 1` → `1 day 00:00:01`). The unknown-literal
+  rules above do not reach it because the operand is not a `Literal` by the time
+  we see it. Fixing it means rejecting a unit-less numeric `exp.Interval` that
+  did not come from an `interval` keyword — an AST-shape fix, and worth checking
+  what else relies on that parse before touching it.
+
+- **`pg_typeof(...)` wires as `text` (25), not `regtype` (2206) (open).**
+  Universal, not jsonb-specific — measured 2026-08-30 across `pg_typeof` of an
+  int / text / numeric / timestamptz / bool: the *value* is right every time
+  (`'integer'`, `'jsonb'`, …) and only the declared OID is wrong. The explicit
+  `pg_typeof(x)::text` and `::oid` forms are already correct. `planner.
+  rewrite_pg_typeof` replaces the call with a string literal, which then types
+  as text. Blocked on there being no `regtype` tag at all (`typemap.PG_OID` has
+  no entry for 2206), and adding one ripples into coercion, rendering and casts
+  — so it is a typing slice, not a one-liner.
 
 **Probed 2026-08-27 — 2 of 8 sampled were already done.** Reproduced each
 rather than reading it. **Stale:** `CancelRequest` is fully implemented (`57014`

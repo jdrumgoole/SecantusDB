@@ -541,6 +541,28 @@ def _eval_arith(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
             return _ranges.union(left, right)
         if isinstance(node, exp.Sub):
             return _ranges.difference(left, right)
+    # A bare string literal is Postgres' ``unknown``, and unknown resolves to the
+    # OTHER operand's type before an operator is chosen — so it must not be read
+    # as a date here. ``'2020-01-01' + 1`` is *integer* input in PG (22P02); we
+    # did date arithmetic and answered '2020-01-02' under the int4 oid the
+    # literal ``1`` had already fixed, so the CLIENT raised decoding it. Only a
+    # literal node is judged: a date column or a ``::date`` cast is genuinely
+    # typed and keeps its date arithmetic.
+    if isinstance(left, str) and _is_number(right) and _is_unknown_literal(node.this):
+        left = _num_from_text(left, right)
+    elif isinstance(right, str) and _is_number(left) and _is_unknown_literal(node.expression):
+        right = _num_from_text(right, left)
+    # Beside an interval the same rule makes the unknown an *interval*, so
+    # ``'2020-01-01' + interval '1 day'`` is 22007 in PG, not a timestamp. We
+    # read the literal as a date and answered one — under the oid the INTERVAL
+    # operand had fixed, so psycopg raised ``can't parse interval '2020-01-02
+    # 00:00:00'``. Only ``+`` / ``-``: for ``*`` / ``/`` PG resolves the unknown
+    # to a number instead (``interval '1 day' * '2'`` is two days).
+    elif isinstance(node, (exp.Add, exp.Sub)):
+        if isinstance(left, str) and _is_interval(right) and _is_unknown_literal(node.this):
+            left = _interval_from_text(left)
+        elif isinstance(right, str) and _is_interval(left) and _is_unknown_literal(node.expression):
+            right = _interval_from_text(right)
     date_result = _eval_date_arith(node, left, right)
     if date_result is not _NOT_DATE:
         return date_result
@@ -566,6 +588,15 @@ def _eval_arith(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     # "internal server error" (XX000).
     if isinstance(node, exp.Sub) and isinstance(left, (Mapping, list)):
         return _jsonb_delete(left, right)
+    # Postgres has NO arithmetic operators on boolean, so any bool operand is
+    # 42883. Python would not raise here — `bool` IS an `int`, so `true + 1`
+    # quietly answered 2 and `true - false` answered 1 where PG errors.
+    if isinstance(left, bool) or isinstance(right, bool):
+        op = _ARITH_SYMBOL.get(type(node), "?")
+        raise errors.SQLError(
+            "42883",
+            f"operator does not exist: {_pg_operand_type(left)} {op} {_pg_operand_type(right)}",
+        )
     try:
         return _ARITH[type(node)](left, right)
     except TypeError:
@@ -656,16 +687,56 @@ def _is_number(v: Any) -> bool:
     return isinstance(v, (int, float, Decimal)) and not isinstance(v, bool)
 
 
-def _num_from_text(text: str, like: Any) -> Any:
-    t = text.strip()
+def _is_interval(v: Any) -> bool:
+    from secantus.sql import intervals as _intervals
+
+    return _intervals.is_interval(v)
+
+
+def _interval_from_text(text: str) -> Any:
+    """Coerce an ``unknown`` literal to an interval, PG's ``22007`` on failure."""
+    from secantus.sql import intervals as _intervals
+
     try:
-        if isinstance(like, float):
-            return float(t)
-        if isinstance(like, Decimal):
-            return Decimal(t)
-        return int(t) if "." not in t and "e" not in t.lower() else Decimal(t)
+        return _intervals.parse(text)
+    except _intervals.IntervalError:
+        raise errors.SQLError(
+            "22007", f'invalid input syntax for type interval: "{text}"'
+        ) from None
+
+
+def _is_unknown_literal(node: exp.Expression | None) -> bool:
+    """Is this operand a bare string literal — Postgres' ``unknown`` type?
+
+    A cast, a column or a parameter is typed and must NOT be judged here; only
+    the literal form is unambiguously unknown."""
+    while isinstance(node, exp.Paren):
+        node = node.this
+    return isinstance(node, exp.Literal) and bool(node.is_string)
+
+
+def _num_from_text(text: str, like: Any) -> Any:
+    """Coerce an ``unknown`` literal to the OTHER operand's type, PG's rule.
+
+    The target type decides both the parse and the error text, so ``'1.5' + 1``
+    is *integer* input and fails ``22P02`` — it does not silently widen to
+    numeric. Widening was wrong twice over: it answered ``2.5`` for a column the
+    planner had already typed ``int4`` from the literal ``1``, so the wire sent
+    a decimal under an int4 oid and the CLIENT raised decoding it
+    (``invalid literal for int(): '2.5'``). PG-probed 14."""
+    t = text.strip()
+    if isinstance(like, float):
+        target, parse = "double precision", float
+    elif isinstance(like, Decimal):
+        target, parse = "numeric", Decimal
+    else:
+        target, parse = "integer", int
+    try:
+        return parse(t)  # type: ignore[operator]
     except (ValueError, ArithmeticError):
-        raise errors.SQLError("22P02", f'invalid input syntax for type numeric: "{text}"') from None
+        raise errors.SQLError(
+            "22P02", f'invalid input syntax for type {target}: "{text}"'
+        ) from None
 
 
 _NOT_DATE = object()
