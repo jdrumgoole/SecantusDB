@@ -129,3 +129,12 @@ And state corrections plainly. If a number you reported earlier was measured
 against your own bug rather than a baseline, say so — a pass rate that "improved
 from 99.0% to 99.5%" when the real baseline was always 99.5% is a flattering
 description of fixing your own regression.
+
+**End by saying the session is closed, in those words.** Not "that should be
+everything" or "let me know if you want anything else" — a definite statement
+that the session is closed, placed after the handover so it is the last thing
+read. Trailing off leaves the reader unsure whether the four passes finished or
+merely stopped, and an ambiguous ending has had someone re-run cleanup that was
+already done. If something is genuinely unfinished, close on that instead and
+name it — "closed, with X left open and filed at Y" is an ending; silence is
+not.
