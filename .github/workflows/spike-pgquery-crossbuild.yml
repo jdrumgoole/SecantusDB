@@ -63,7 +63,15 @@ jobs:
         # transitive dep needs -- that is the distro's age, not libpg_query.
         # Install current stable via rustup so the probe measures what it claims.
         run: |
-          apk add --no-cache musl-dev clang-dev clang-static build-base curl bash
+          # Mirror pyproject.toml's musllinux `before-build` recipe verbatim:
+          # bindgen needs libclang, and the repo already solves this for
+          # secantus-wt by symlinking whichever libclang.so exists into a fixed
+          # /opt/libclang and pointing LIBCLANG_PATH at it.
+          apk add --no-cache musl-dev build-base curl bash clang clang-dev llvm-dev
+          mkdir -p /opt/libclang
+          lc=$(find /usr -name 'libclang.so*' 2>/dev/null | head -1)
+          [ -n "$lc" ] && ln -sf "$lc" /opt/libclang/libclang.so
+          echo "LIBCLANG_PATH=/opt/libclang" >> "$GITHUB_ENV"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
