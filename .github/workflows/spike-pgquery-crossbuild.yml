@@ -98,3 +98,9 @@ jobs:
       - name: Build and run
         working-directory: probe
         run: cargo run --release
+        env:
+          # Rust's musl host defaults to crt-static, so the BUILD SCRIPT is
+          # statically linked and cannot dlopen libclang. Turning it off for
+          # the build is the standard musl+bindgen fix; it does not affect
+          # what libpg_query itself can do.
+          RUSTFLAGS: "-C target-feature=-crt-static"
