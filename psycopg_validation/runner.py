@@ -2,7 +2,9 @@
 
 The SQL analogue of the thirteen MongoDB driver gauges: psycopg's own tests
 run **unmodified** (vendored at the exact version pinned in the ``dev`` extra)
-against a real ``SecantusPGServer`` over TCP. The runner:
+against a real ``SecantusPGServer`` over TCP. ``SECANTUS_GAUGE_SERVER=rust``
+drives the Rust ``secantusd-pg`` binary instead, so the same unmodified suite
+scores both servers. The runner:
 
 1. Spawns ``python -m secantus.sql.pgserver --host 127.0.0.1 --port <picked>
    --storage-path <tempdir>`` as a subprocess on a kernel-assigned ephemeral
@@ -33,7 +35,18 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "psycopg"
+
+
+#: Raw pytest JSON. Server-specific: a Rust run must not overwrite the Python
+#: server's recorded baseline, since the two are compared against each other.
+def _raw_out(which: str) -> Path:
+    name = "psycopg-raw.json" if which == "python" else f"psycopg-raw-{which}.json"
+    return REPO_ROOT / ".validation" / name
+
+
 RAW_OUT = REPO_ROOT / ".validation" / "psycopg-raw.json"
+#: The Rust PostgreSQL server, driven when SECANTUS_GAUGE_SERVER=rust.
+RUST_BINARY = REPO_ROOT / "crates" / "secantus-pgserver" / "target" / "debug" / "secantusd-pg"
 
 #: Wall-clock cap on the pytest invocation. The full sync half is ~28s against
 #: a healthy server; a broken change leaves hung awaits, and per-test
@@ -86,13 +99,30 @@ def main() -> int:
         )
         return 2
 
-    RAW_OUT.parent.mkdir(exist_ok=True)
+    (REPO_ROOT / ".validation").mkdir(exist_ok=True)
     host = "127.0.0.1"
     port = _pick_ephemeral_port()
     storage_dir = tempfile.mkdtemp(prefix="secantus-psycopg-gauge-")
 
-    daemon = subprocess.Popen(
-        [
+    # Which server to measure. Mirrors the MongoDB gauges' SECANTUS_GAUGE_SERVER
+    # so one variable selects the persona everywhere.
+    which = os.environ.get("SECANTUS_GAUGE_SERVER", "python").lower()
+    if which not in ("python", "rust"):
+        print(f"SECANTUS_GAUGE_SERVER must be 'python' or 'rust', got {which!r}", file=sys.stderr)
+        return 2
+    raw_out = _raw_out(which)
+
+    if which == "rust":
+        if not RUST_BINARY.exists():
+            print(
+                f"{RUST_BINARY.relative_to(REPO_ROOT)} not built — run "
+                "`uv run python -m invoke rust-pgserver-build`",
+                file=sys.stderr,
+            )
+            return 2
+        argv = [str(RUST_BINARY), storage_dir, f"{host}:{port}"]
+    else:
+        argv = [
             sys.executable,
             "-m",
             "secantus.sql.pgserver",
@@ -102,10 +132,9 @@ def main() -> int:
             str(port),
             "--storage-path",
             storage_dir,
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+        ]
+
+    daemon = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         _wait_for_listener(host, port)
         _verify_secantus_identity(host, port)
@@ -137,7 +166,7 @@ def main() -> int:
             "no:benchmark",
             "--continue-on-collection-errors",
             "--json-report",
-            f"--json-report-file={RAW_OUT}",
+            f"--json-report-file={raw_out}",
             "--no-header",
             "--tb=no",
             "-q",

@@ -296,3 +296,38 @@ def test_order_limit_offset_and_dml(home: Path) -> None:
         assert cur.rowcount == 1
         cur.execute("SELECT id FROM t")
         assert sorted(r[0] for r in cur.fetchall()) == [1, 3, 4]
+
+
+def test_parameterised_queries_go_over_the_extended_protocol(home: Path) -> None:
+    """psycopg switches to Parse/Bind/Execute the moment a query has parameters.
+
+    Before the extended handler existed, that path answered `OK` with ZERO ROWS
+    for a query that should return rows -- a wrong answer rather than a missing
+    feature, and invisible to every literal-SQL test.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t (id int PRIMARY KEY, n int, s text)")
+        cur.execute("INSERT INTO t VALUES (1,10,'a'),(2,20,'b'),(3,NULL,'c')")
+
+        cur.execute("SELECT id FROM t WHERE n > %s", (5,))
+        assert sorted(r[0] for r in cur.fetchall()) == [1, 2]
+        cur.execute("SELECT id FROM t WHERE s = %s", ("b",))
+        assert cur.fetchall() == [(2,)]
+        cur.execute("SELECT id FROM t WHERE n IN (%s, %s)", (10, 20))
+        assert sorted(r[0] for r in cur.fetchall()) == [1, 2]
+        cur.execute("SELECT count(*) FROM t WHERE n > %s", (5,))
+        assert cur.fetchall() == [(2,)]
+
+        # A bound NULL behaves like a literal one: `= NULL` is never true.
+        cur.execute("SELECT id FROM t WHERE n = %s", (None,))
+        assert cur.fetchall() == []
+
+        cur.execute("UPDATE t SET n = %s WHERE id = %s", (99, 1))
+        assert cur.rowcount == 1
+        cur.execute("DELETE FROM t WHERE id = %s", (3,))
+        assert cur.rowcount == 1
+        cur.execute("INSERT INTO t VALUES (%s, %s, %s)", (4, 40, "d"))
+        assert cur.rowcount == 1
+        cur.execute("SELECT id, n FROM t ORDER BY id")
+        assert cur.fetchall() == [(1, 99), (2, 20), (4, 40)]

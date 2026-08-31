@@ -134,6 +134,12 @@ QUERIES = [
     "SELECT id FROM d WHERE n BETWEEN 1 AND 2",
     "SELECT id FROM d WHERE n NOT BETWEEN 1 AND 2",
     "SELECT id FROM d WHERE n = 1",
+    # `= NULL` is never true in SQL -- only `IS NULL` matches. MQL's `{n: null}`
+    # would match, so these pin the short-circuit for LITERAL nulls too.
+    "SELECT id FROM d WHERE n = NULL",
+    "SELECT id FROM d WHERE n <> NULL",
+    "SELECT id FROM d WHERE n > NULL",
+    "SELECT id FROM d WHERE s = NULL",
     "SELECT id FROM d WHERE n <> 1",
     "SELECT id FROM d WHERE n > 1 AND s IS NOT NULL",
     "SELECT id FROM d WHERE n IS NULL OR n > 2",
@@ -296,6 +302,77 @@ def test_query_matches_postgres(
     theirs = _rows(oracle.cursor(), sql)
     mine = _rows(ours.cursor(), sql)
     assert mine == theirs, f"{sql}\n  postgres={theirs}\n  ours    ={mine}"
+
+
+# (sql, params). These go over the EXTENDED protocol -- Parse/Bind/Execute --
+# because psycopg switches to it as soon as a query has parameters. Until the
+# server implemented that path it answered "OK" with zero rows, which is a wrong
+# answer rather than a missing feature, and no literal-SQL case could catch it.
+PARAMETERISED = [
+    ("SELECT id FROM d WHERE n > %s", (1,)),
+    ("SELECT id FROM d WHERE n = %s", (3,)),
+    ("SELECT id FROM d WHERE n <> %s", (1,)),
+    ("SELECT id FROM d WHERE s = %s", ("a",)),
+    ("SELECT id FROM d WHERE s <> %s", ("a",)),
+    ("SELECT id FROM d WHERE n >= %s AND n <= %s", (1, 2)),
+    ("SELECT id FROM d WHERE n IN (%s, %s)", (1, 3)),
+    ("SELECT id FROM d WHERE n NOT IN (%s)", (1,)),
+    ("SELECT id FROM d WHERE n BETWEEN %s AND %s", (1, 2)),
+    ("SELECT id FROM d WHERE NOT (n = %s)", (1,)),
+    ("SELECT id FROM d WHERE s = %s OR n > %s", ("a", 2)),
+    ("SELECT id FROM d ORDER BY id LIMIT %s", (2,)),
+    ("SELECT id FROM d ORDER BY id LIMIT %s OFFSET %s", (2, 1)),
+    ("SELECT id, n FROM d WHERE n IS NOT NULL ORDER BY id", ()),
+    ("SELECT count(*) FROM d WHERE n > %s", (1,)),
+    ("SELECT sum(n) FROM d WHERE n > %s", (1,)),
+    ("SELECT count(*) FROM d WHERE n > %s", (99,)),
+    ("SELECT sum(n) FROM d WHERE n > %s", (99,)),
+    ("SELECT s, count(*) FROM d GROUP BY s ORDER BY s", ()),
+    # A bound NULL must behave exactly like a literal one.
+    ("SELECT id FROM d WHERE n = %s", (None,)),
+    ("SELECT id FROM d WHERE n <> %s", (None,)),
+    ("SELECT id FROM d WHERE n IN (%s, %s)", (1, None)),
+]
+
+PARAM_MUTATIONS = [
+    ("UPDATE d SET n = %s WHERE id = %s", (99, 1), "SELECT id, n FROM d ORDER BY id"),
+    ("UPDATE d SET s = %s WHERE n > %s", ("z", 1), "SELECT id, s FROM d ORDER BY id"),
+    ("UPDATE d SET n = %s WHERE n IS NULL", (7,), "SELECT id, n FROM d ORDER BY id"),
+    ("DELETE FROM d WHERE id = %s", (2,), "SELECT id FROM d ORDER BY id"),
+    ("DELETE FROM d WHERE n > %s", (1,), "SELECT id FROM d ORDER BY id"),
+    ("INSERT INTO d VALUES (%s, %s, %s)", (9, 9, "i"), "SELECT id, n, s FROM d ORDER BY id"),
+]
+
+
+@pytest.mark.parametrize("sql,params", PARAMETERISED, ids=lambda v: str(v)[:52])
+def test_parameterised_query_matches_postgres(
+    sql: str, params: tuple, ours: psycopg.Connection, oracle: psycopg.Connection
+) -> None:
+    _reset_oracle(oracle)
+    ocur, mcur = oracle.cursor(), ours.cursor()
+    ocur.execute(sql, params or None)
+    theirs = ocur.fetchall()
+    mcur.execute(sql, params or None)
+    mine = mcur.fetchall()
+    assert mine == theirs, f"{sql} {params}\n  postgres={theirs}\n  ours    ={mine}"
+
+
+@pytest.mark.parametrize("stmt,params,verify", PARAM_MUTATIONS, ids=lambda v: str(v)[:52])
+def test_parameterised_mutation_matches_postgres(
+    stmt: str,
+    params: tuple,
+    verify: str,
+    ours: psycopg.Connection,
+    oracle: psycopg.Connection,
+) -> None:
+    _reset_oracle(oracle)
+    ocur, mcur = oracle.cursor(), ours.cursor()
+    ocur.execute(stmt, params or None)
+    mcur.execute(stmt, params or None)
+    assert mcur.rowcount == ocur.rowcount, (
+        f"{stmt} {params}\n  postgres rowcount={ocur.rowcount}\n  ours     rowcount={mcur.rowcount}"
+    )
+    assert _rows(mcur, verify) == _rows(ocur, verify), f"after {stmt} {params}"
 
 
 @pytest.mark.parametrize("stmt,verify", MUTATIONS, ids=lambda s: str(s)[:58])
