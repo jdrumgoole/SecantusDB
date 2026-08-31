@@ -1499,6 +1499,45 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **OPEN — six `_secantus_server`-gated test files never run in CI**
+  (found 2026-08-31 while adding a seventh). Every Rust-server test file starts
+  with `importorskip("_secantus_server")`, so it skips in all the ordinary
+  `test` jobs, which do not build that extension. The one job that DOES build
+  it — `storage-engine` in `.github/workflows/test.yml` — runs a hand-written
+  list of **named files**, not the suite. Anything not on that list therefore
+  runs nowhere:
+
+  | file | in CI? |
+  |---|---|
+  | `test_rust_server_smoke.py` | yes |
+  | `test_mongo_server_concurrency.py` | yes |
+  | `test_rust_agg_runtime_errors.py` | yes (added with the list, #1166) |
+  | `test_crash_recovery.py` | **no** |
+  | `test_rust_pitr_cross_server.py` | **no** |
+  | `test_rust_arg_types_sweep.py` | **no** |
+  | `test_rbac_pipeline.py` | **no** |
+  | `test_getmore_batching.py` | **no** |
+  | `test_rust_server_stress.py` | **no** |
+
+  Two of those are **data-integrity** suites — crash recovery and cross-server
+  PITR — which is the category `CLAUDE.md` says never to let slide. A third,
+  `test_rust_arg_types_sweep.py`, pins the 76 argument slots fixed on
+  2026-08-31; nothing would catch their regression.
+
+  They are not dead everywhere: they run on a dev box whose venv has the
+  extension built. But no push is gated on them.
+
+  Deliberately NOT fixed wholesale in #1166, which only added its own file to
+  the list: `test_rust_server_stress.py` is a stress suite whose runtime and
+  flakiness in CI need judging before it is wired in, and that is a decision
+  about CI budget rather than a bug fix. The narrow fix is to add the
+  integrity-critical files (`test_crash_recovery.py`,
+  `test_rust_pitr_cross_server.py`, `test_rust_arg_types_sweep.py`) to the same
+  step; the better fix is for that step to select by marker rather than by a
+  hand-maintained list, so the next file added is covered by default.
+
+
+
 - [x] **RESOLVED 2026-08-31 — `$$REMOVE` IS the missing value, and treating it
   as a marker of its own leaked it into results (one CRASH).** Probed 9-for-9
   against mongod 8.2.11: in every position — projected field, array element,

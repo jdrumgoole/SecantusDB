@@ -377,6 +377,198 @@ pub fn redact_runtime_error(
     None
 }
 
+/// Whether `runtime_error` could possibly name a failure in this pipeline.
+///
+/// The caller must CLONE the input documents to keep them for the naming
+/// re-check, and that clone happens on the SUCCESS path too — so the gate has
+/// to stay narrow. `$redact` and `$densify` are rare enough to gate on the
+/// stage alone, but `$project` / `$addFields` / `$set` are ubiquitous, and
+/// gating on those would copy every input document for the majority of
+/// aggregations. So the scan looks for the specific shape that can fail: a
+/// `$switch` with no `default`, and a `$bucket` with no `default`.
+///
+/// This walks the pipeline SPEC, never the documents, so it is proportional to
+/// the query rather than to the data.
+pub fn may_name_runtime_error(stages: &[Bson]) -> bool {
+    fn has_defaultless_switch(expr: &Bson) -> bool {
+        match expr {
+            Bson::Document(d) => {
+                if let Some(Bson::Document(sw)) = d.get("$switch") {
+                    if sw.get("default").is_none() {
+                        return true;
+                    }
+                }
+                d.values().any(has_defaultless_switch)
+            }
+            Bson::Array(a) => a.iter().any(has_defaultless_switch),
+            _ => false,
+        }
+    }
+    stages.iter().any(|stage| {
+        let Bson::Document(d) = stage else {
+            return false;
+        };
+        if d.contains_key("$redact") || d.contains_key("$densify") {
+            return true;
+        }
+        if let Some(Bson::Document(b)) = d.get("$bucket") {
+            if matches!(b.get("default"), None | Some(Bson::Null)) {
+                return true;
+            }
+        }
+        ["$project", "$addFields", "$set"]
+            .iter()
+            .filter_map(|k| d.get(*k))
+            .any(has_defaultless_switch)
+    })
+}
+
+/// Name a RUNTIME aggregation failure that the engine can only signal as
+/// `Fallback`, so the Rust server can answer mongod's code instead of a
+/// generic `2 BadValue`.
+///
+/// Runtime = discoverable only while processing documents, so no spec-level
+/// check at the command layer can reach it. `redact_runtime_error` was the
+/// first of these; the pattern is deliberately a STANDALONE re-check rather
+/// than a payload on `Fallback`, which is a unit struct returned from ~37
+/// sites and carries the "defer to Python" contract the parity suites pin.
+///
+/// Each namer must be certain of its own cause: it re-runs the prefix pipeline
+/// and reproduces only the specific condition it names, so a pipeline that
+/// defers for some OTHER reason still falls through to the generic message.
+/// Caveat: when one pipeline contains two runtime faults, the code named here
+/// is the first this function finds, which need not be the one mongod would
+/// report first. Every message below was probed against mongod 8.2.11
+/// (2026-08-31).
+pub fn runtime_error(
+    docs: &[Document],
+    stages: &[Bson],
+    vars: &Document,
+    collation: Option<&Collation>,
+) -> Option<(i32, String)> {
+    if let Some(found) = redact_runtime_error(docs, stages, vars, collation) {
+        return Some(found);
+    }
+    // mongod's wording for a `$switch` with no matching branch and no default.
+    // `$bucket` is implemented over `$switch` inside mongod, so it reports the
+    // SAME sentence under a different code.
+    const NO_BRANCH: &str = concat!(
+        "$switch could not find a matching branch for an input, ",
+        "and no default was specified."
+    );
+    for (i, stage) in stages.iter().enumerate() {
+        let Bson::Document(d) = stage else { continue };
+        if let Some(spec) = d.get("$densify") {
+            let input = apply_pipeline(docs.to_vec(), &stages[..i], vars, collation).ok()?;
+            if densify_field_type_fault(spec, &input) {
+                return Some((
+                    5733201,
+                    "Densify field type must be numeric or a date".to_string(),
+                ));
+            }
+        }
+        if let Some(spec) = d.get("$bucket") {
+            let input = apply_pipeline(docs.to_vec(), &stages[..i], vars, collation).ok()?;
+            if bucket_unmatched_fault(spec, &input, vars) {
+                return Some((7158303, NO_BRANCH.to_string()));
+            }
+        }
+        for key in ["$project", "$addFields", "$set"] {
+            let Some(spec) = d.get(key) else { continue };
+            let input = apply_pipeline(docs.to_vec(), &stages[..i], vars, collation).ok()?;
+            if switch_unmatched_fault(spec, &input, vars) {
+                return Some((40066, NO_BRANCH.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// True when some document's densify field holds a value that is neither
+/// numeric nor a date. Only that cause -- a malformed `range` defers instead,
+/// and is reported by the command layer's spec validation.
+fn densify_field_type_fault(spec: &Bson, docs: &[Document]) -> bool {
+    let Bson::Document(s) = spec else {
+        return false;
+    };
+    let Some(Bson::String(field)) = s.get("field") else {
+        return false;
+    };
+    docs.iter().any(|d| match paths::get_path(d, field) {
+        Some(v) => {
+            !matches!(
+                v,
+                Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+            ) && !matches!(v, Bson::DateTime(_))
+        }
+        None => false,
+    })
+}
+
+/// True when `$bucket` has no usable `default` and some document's `groupBy`
+/// value falls outside every bucket -- the arm `bucket_stage` gives up on.
+fn bucket_unmatched_fault(spec: &Bson, docs: &[Document], vars: &Document) -> bool {
+    let Bson::Document(s) = spec else {
+        return false;
+    };
+    // An explicit null `default` counts as absent, as it does in `bucket_stage`.
+    if !matches!(s.get("default"), None | Some(Bson::Null)) {
+        return false;
+    }
+    let (Some(group_by), Some(Bson::Array(boundaries))) = (s.get("groupBy"), s.get("boundaries"))
+    else {
+        return false;
+    };
+    if boundaries.len() < 2 {
+        return false;
+    }
+    docs.iter().any(|d| {
+        let Ok(v) = expressions::evaluate(d, group_by, vars) else {
+            return false;
+        };
+        !(0..boundaries.len() - 1).any(|i| {
+            matches!(
+                expressions::py_order(&boundaries[i], &v),
+                Ok(Some(Ordering::Less | Ordering::Equal))
+            ) && matches!(
+                expressions::py_order(&v, &boundaries[i + 1]),
+                Ok(Some(Ordering::Less))
+            )
+        })
+    })
+}
+
+/// True when a `$switch` anywhere in a projection-style spec matches no branch
+/// for some document and declares no `default`.
+fn switch_unmatched_fault(spec: &Bson, docs: &[Document], vars: &Document) -> bool {
+    fn walk(expr: &Bson, doc: &Document, vars: &Document) -> bool {
+        match expr {
+            Bson::Document(d) => {
+                if let Some(Bson::Document(sw)) = d.get("$switch") {
+                    if sw.get("default").is_none() {
+                        if let Some(Bson::Array(branches)) = sw.get("branches") {
+                            let matched = branches.iter().any(|b| match b {
+                                Bson::Document(bd) => bd
+                                    .get("case")
+                                    .and_then(|c| expressions::evaluate(doc, c, vars).ok())
+                                    .is_some_and(|v| expressions::truthy(&v)),
+                                _ => false,
+                            });
+                            if !matched {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                d.values().any(|v| walk(v, doc, vars))
+            }
+            Bson::Array(a) => a.iter().any(|v| walk(v, doc, vars)),
+            _ => false,
+        }
+    }
+    docs.iter().any(|d| walk(spec, d, vars))
+}
+
 fn facet_stage(
     spec: &Bson,
     mut docs: Vec<Document>,
@@ -964,5 +1156,103 @@ mod redact_tests {
         // A well-formed $redact names nothing.
         let ok = vec![Bson::Document(doc! {"$redact": "$$KEEP"})];
         assert!(redact_runtime_error(&[doc! {"_id": 1}], &ok, &Document::new(), None).is_none());
+    }
+
+    /// Each message here was copied from mongod 8.2.11 (2026-08-31), not
+    /// written from the docs. The Rust server answered a generic `2 BadValue`
+    /// for all three before this.
+    /// The gate decides whether the caller clones every input document, on the
+    /// SUCCESS path as well as the failure one -- so a `$project` that cannot
+    /// fail this way must NOT open it.
+    #[test]
+    fn may_name_runtime_error_stays_off_the_common_path() {
+        let plain_project = vec![Bson::Document(doc! {"$project": {"a": 1}})];
+        assert!(!may_name_runtime_error(&plain_project));
+
+        let switch_with_default = vec![Bson::Document(doc! {"$project": {
+            "v": {"$switch": {"branches": [{"case": true, "then": 1}], "default": 0}}
+        }})];
+        assert!(!may_name_runtime_error(&switch_with_default));
+
+        let bucket_with_default = vec![Bson::Document(
+            doc! {"$bucket": {"groupBy": "$n", "boundaries": [0, 10], "default": "x"}},
+        )];
+        assert!(!may_name_runtime_error(&bucket_with_default));
+
+        // ... and it must open for the shapes that can.
+        let switch_no_default = vec![Bson::Document(doc! {"$project": {
+            "v": {"$switch": {"branches": [{"case": true, "then": 1}]}}
+        }})];
+        assert!(may_name_runtime_error(&switch_no_default));
+
+        // Nested inside another expression, not just at the top level.
+        let nested = vec![Bson::Document(doc! {"$addFields": {
+            "v": {"$add": [1, {"$switch": {"branches": [{"case": true, "then": 1}]}}]}
+        }})];
+        assert!(may_name_runtime_error(&nested));
+
+        let bucket_no_default = vec![Bson::Document(
+            doc! {"$bucket": {"groupBy": "$n", "boundaries": [0, 10]}},
+        )];
+        assert!(may_name_runtime_error(&bucket_no_default));
+
+        for stage in ["$redact", "$densify"] {
+            let s = vec![Bson::Document(doc! {stage: {}})];
+            assert!(may_name_runtime_error(&s), "{stage} should open the gate");
+        }
+    }
+
+    /// mongod's exact sentence, kept on one line so it reads as what it is.
+    const NO_MATCHING_BRANCH_MESSAGE: &str =
+        "$switch could not find a matching branch for an input, and no default was specified.";
+
+    #[test]
+    fn runtime_error_names_densify_bucket_and_switch() {
+        let vars = Document::new();
+
+        // $densify over a string field.
+        let stages = vec![Bson::Document(
+            doc! {"$densify": {"field": "s", "range": {"step": 1, "bounds": "full"}}},
+        )];
+        let (code, msg) = runtime_error(&[doc! {"_id": 1, "s": "x"}], &stages, &vars, None)
+            .expect("densify should be named");
+        assert_eq!(code, 5733201);
+        assert_eq!(msg, "Densify field type must be numeric or a date");
+        // A numeric field is fine, and names nothing.
+        assert!(runtime_error(&[doc! {"_id": 1, "s": 1}], &stages, &vars, None).is_none());
+
+        // $bucket with a value outside every boundary and no default. mongod
+        // implements $bucket over $switch, so it reports the $switch sentence
+        // under its own code.
+        let stages = vec![Bson::Document(
+            doc! {"$bucket": {"groupBy": "$n", "boundaries": [0, 10]}},
+        )];
+        let (code, msg) = runtime_error(&[doc! {"_id": 1, "n": 99}], &stages, &vars, None)
+            .expect("bucket should be named");
+        assert_eq!(code, 7158303);
+        assert_eq!(msg, NO_MATCHING_BRANCH_MESSAGE);
+        // In range, so nothing to name.
+        assert!(runtime_error(&[doc! {"_id": 1, "n": 5}], &stages, &vars, None).is_none());
+        // An explicit default absorbs it.
+        let with_default = vec![Bson::Document(
+            doc! {"$bucket": {"groupBy": "$n", "boundaries": [0, 10], "default": "other"}},
+        )];
+        assert!(runtime_error(&[doc! {"_id": 1, "n": 99}], &with_default, &vars, None).is_none());
+
+        // $switch inside a projection, no branch matching and no default.
+        let stages = vec![Bson::Document(doc! {"$project": {
+            "v": {"$switch": {"branches": [{"case": {"$eq": ["$n", 99]}, "then": 1}]}}
+        }})];
+        let (code, msg) = runtime_error(&[doc! {"_id": 1, "n": 1}], &stages, &vars, None)
+            .expect("switch should be named");
+        assert_eq!(code, 40066);
+        assert_eq!(msg, NO_MATCHING_BRANCH_MESSAGE);
+        // A default means there is nothing to name.
+        let defaulted = vec![Bson::Document(doc! {"$project": {
+            "v": {"$switch": {
+                "branches": [{"case": {"$eq": ["$n", 99]}, "then": 1}], "default": 0
+            }}
+        }})];
+        assert!(runtime_error(&[doc! {"_id": 1, "n": 1}], &defaulted, &vars, None).is_none());
     }
 }

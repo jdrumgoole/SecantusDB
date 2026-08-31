@@ -878,17 +878,22 @@ fn core_run(
     collation: Option<&Collation>,
     ns: Option<&str>,
 ) -> Result<Vec<Document>, CommandError> {
-    // A `$redact` in the pipeline can fail at RUNTIME with an error mongod
-    // names (17053) that the engine can only signal as `Fallback` — kept for
-    // the retry below, which needs the input documents the engine consumes.
-    let nameable = stages
-        .iter()
-        .any(|s| matches!(s, Bson::Document(d) if d.contains_key("$redact")));
+    // Several stages can fail at RUNTIME with an error mongod names but the
+    // engine can only signal as `Fallback` — the input documents are kept for
+    // the naming re-check below, which consumes them. `$redact` was the first;
+    // `$densify` / `$bucket` / `$switch` were measured divergent on 2026-08-31
+    // (the Rust server answered a generic `2 BadValue` for all of them).
+    // The gate is deliberately narrow: `saved` is cloned on the SUCCESS path
+    // too, and `$project` / `$addFields` / `$set` are ubiquitous, so gating on
+    // the stage name alone would copy every input document for most
+    // aggregations. `may_name_runtime_error` scans the pipeline SPEC for the
+    // shapes that can actually fail this way.
+    let nameable = secantus_core::aggregate::may_name_runtime_error(stages);
     let saved = nameable.then(|| docs.clone());
     secantus_core::aggregate::apply_pipeline(docs, stages, vars, collation).map_err(|_| {
         if let Some(docs) = saved {
             if let Some((code, errmsg)) =
-                secantus_core::aggregate::redact_runtime_error(&docs, stages, vars, collation)
+                secantus_core::aggregate::runtime_error(&docs, stages, vars, collation)
             {
                 // An EXECUTION-time failure, so mongod wraps it. This server
                 // had no executor wrapper at all; the Python one applies it to

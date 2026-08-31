@@ -273,15 +273,41 @@ Sub-ms `ORDER BY` is adjacent to work already landed and should be cheap.
       step (5733401) and `$fill` unknown method (6050202). None of it needed the
       `Fallback` widening this entry warned about.
 
-      **What remains is the RUNTIME half** — errors discoverable only while
-      processing documents, which no spec check can reach. Measured on the Rust
-      server against mongod 8.2.11 on 2026-08-30:
+      **The RUNTIME half was measured and mostly closed on 2026-08-31.** Errors
+      discoverable only while processing documents, which no spec check can
+      reach. Re-measuring found the gap **wider than the three cases below** —
+      6 of 7 probed cases, all answering the same generic
+      `2 aggregation pipeline uses a stage or operator not supported by the
+      Rust server`.
 
-      | case | rust | mongod |
-      |---|---|---|
-      | `$densify` on a string field | 2 | 5733201 |
-      | `$bucket` with no `default` and an out-of-range value | 2 | 7158303 |
-      | `$replaceRoot` whose `newRoot` resolves to a scalar | 2 | 40228 |
+      | case | rust before | rust now | mongod |
+      |---|---|---|---|
+      | `$densify` on a string field | 2 | **5733201** | 5733201 |
+      | `$bucket` with no `default`, value out of range | 2 | **7158303** | 7158303 |
+      | `$switch` with no matching branch, no default | 2 | **40066** | 40066 |
+      | `$unwind` on a scalar | (already matched) | — | — |
+      | `$replaceRoot` whose `newRoot` is a scalar | 2 | 2 | 40228 |
+      | `$arrayToObject` on a scalar | 2 | 2 | 40386 |
+      | `$concatArrays` with a scalar | 2 | 2 | 28664 |
+
+      Closed via `secantus_core::aggregate::runtime_error`, extending the
+      standalone-validator pattern `redact_runtime_error` established — NOT by
+      widening `Fallback`, which is a unit struct returned from ~37 sites and
+      carries the defer-to-Python contract the parity suites pin. Pinned by
+      `tests/test_rust_agg_runtime_errors.py`.
+
+      **The three still open each need machinery this pattern does not give.**
+      `$replaceRoot`'s message quotes the input document *pruned to the fields
+      the expression reads* — mongod runs dependency analysis first, and the
+      Python server ports that as `_input_document` / `_expression_field_paths`;
+      naming it in Rust means porting that too. `$arrayToObject` and
+      `$concatArrays` are expression type errors, the head of a per-operator
+      long tail rather than a fixed set.
+
+      **The PYTHON server needs nothing here — re-measured 2026-08-31 and it
+      matches mongod on all seven cases**, including the four the table below
+      predicted were open. The paragraph that follows is kept for its method
+      note, not its verdicts.
 
       **The PYTHON server was measured on the same three cases 2026-08-30
       (mongod 8.2.11 on `:27019`, Python server on `:27018`) and is NOT uniformly

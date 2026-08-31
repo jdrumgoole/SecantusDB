@@ -1890,11 +1890,17 @@ jobs:
         # test_rust_storage_smoke.py drives the storage engine; test_rust_server
         # _smoke.py drives the embedded Rust server (R6) end-to-end via pymongo —
         # the first pymongo → Rust → WiredTiger conformance check.
+        #
+        # This job runs NAMED files, so an `importorskip("_secantus_server")`
+        # file that is not listed here does not run anywhere: it skips in every
+        # other job (no extension) and is never invoked in this one. Add new
+        # Rust-server files to this list, or they are dead weight.
         shell: bash
         run: >-
           uv run --no-project --with pymongo --with pytest
           --with "$(ls dist-storage/*.whl)"
           python -m pytest tests/test_rust_storage_smoke.py tests/test_rust_server_smoke.py
+          tests/test_rust_agg_runtime_errors.py
           -o addopts= -p no:cacheprovider -q
 
       - name: Rust-server concurrency invariants (#451 stress suite)
