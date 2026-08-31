@@ -1583,12 +1583,29 @@ These are explicit non-goals. Don't add them without a reason.
   differential cases.
 
   **What is left of the sweep, all measured 2026-08-31:**
-  - [ ] **~1556 Rust code differences: the per-operator OPERAND-TYPE errors.**
-        `{$abs: "x"}` is `28765 $abs only supports numeric types, not string` on
-        mongod and a generic BadValue on the Rust server. ~200 distinct message
-        families remain, roughly one per operator, so this is several slices
-        rather than one; the object-argument family above was the largest
-        uniform block and is done.
+  - [ ] **~1336 Rust code differences left: the per-operator OPERAND-TYPE
+        errors.** `{$abs: "x"}` is `28765 $abs only supports numeric types, not
+        string`. **The largest family -- the 24 unary numeric guards, 220
+        shapes -- was closed 2026-08-31** by re-evaluating just the ARGUMENT
+        against the stage's documents (the `arith_type_error` template; no
+        `Fallback` widening). What is left is the long tail: ~169 date
+        conversions (16006), 130 `$OP accepts exactly one argument if given an
+        <T>` (40536), 97 more ranged arities (28667), 60 `requires a single
+        argument` (50723), and roughly 190 smaller families.
+
+  - [ ] **The constant-folding WRAPPER, now measured and decidable.** For a
+        CONSTANT operand mongod folds at optimization time and says
+        `Failed to optimize pipeline :: caused by ::`; for a field reference it
+        says `Executor error during aggregate command on namespace: … :: caused
+        by ::`. Both servers always use the executor form, which is 148 of the
+        Rust server's message-only diffs and a similar count on Python.
+
+        The plan calls this "modelling constant folding" and defers it. Probed
+        2026-08-31, **the rule is static**: mongod folds exactly when the
+        argument contains no field-path reference -- a nested constant folds, a
+        nested `$field` does not, and `$$NOW` folds. That is a much cheaper
+        proposition than the entry implies and is worth re-costing before
+        deferring it again.
   - [ ] **~669 Python message-only differences**, right code and wrong wording.
   - [ ] **42 wrong VALUES on Python / 33 on Rust**, mostly the circular trig
         functions narrowing Decimal128 (see the Decimal128 entry) plus

@@ -2332,6 +2332,41 @@ OBJECT_ARG_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ("sinh-ok", OBJ_SEED, _o({"$sinh": 1})),
 ]
 
+# mongod's numeric type guard, `$OP only supports numeric types, not <type>` --
+# 24 unary operators, 220 shapes, the largest family left in the sweep. The Rust
+# engine deferred every one to a generic BadValue, because the operators know
+# the operand's type when they evaluate it but `Fallback` carries no code.
+#
+# The Python server already answered these correctly, so these cases pin BOTH
+# servers against a family only one of them had.
+NG_SEED = [{"_id": 1, "s": "x", "n": 2}]
+
+
+def _n(expr: object) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(db, [{"$addFields": {"z": expr}}])
+
+
+NUMERIC_GUARD_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    # a FIELD reference — evaluated per document, so this is the runtime path
+    ("abs-field-string", NG_SEED, _n({"$abs": "$s"})),
+    ("sqrt-field-string", NG_SEED, _n({"$sqrt": "$s"})),
+    ("ln-field-string", NG_SEED, _n({"$ln": "$s"})),
+    ("ceil-field-string", NG_SEED, _n({"$ceil": "$s"})),
+    ("floor-field-string", NG_SEED, _n({"$floor": "$s"})),
+    ("sin-field-string", NG_SEED, _n({"$sin": "$s"})),
+    ("exp-field-string", NG_SEED, _n({"$exp": "$s"})),
+    # `$round` / `$trunc` answer 51081 where the rest answer 28765
+    ("round-field-string", NG_SEED, _n({"$round": "$s"})),
+    ("trunc-field-string", NG_SEED, _n({"$trunc": "$s"})),
+    # nested inside another expression
+    ("nested-in-add", NG_SEED, _n({"$add": [1, {"$abs": "$s"}]})),
+    # a null operand is NOT an error, and a numeric one computes
+    ("abs-null-ok", NG_SEED, _n({"$abs": None})),
+    ("abs-number-ok", NG_SEED, _n({"$abs": -3})),
+    ("abs-field-number-ok", NG_SEED, _n({"$abs": "$n"})),
+    ("sqrt-field-number-ok", NG_SEED, _n({"$sqrt": "$n"})),
+]
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
@@ -2351,6 +2386,7 @@ ALL_CASES = (
     + [("arity", c) for c in ARITY_CASES]
     + [("decimal", c) for c in DECIMAL_CASES]
     + [("objarg", c) for c in OBJECT_ARG_CASES]
+    + [("numguard", c) for c in NUMERIC_GUARD_CASES]
 )
 
 
