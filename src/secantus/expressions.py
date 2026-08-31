@@ -194,9 +194,121 @@ def _resolve_var(name: str, ctx: _Ctx) -> Any:
     return get_path(value if isinstance(value, dict) else dict(value), rest, default=None)
 
 
+#: Operators mongod rejects with 16020 when the argument count is wrong, and
+#: the count it wants. DERIVED by asking mongod 8.2.11 each operator with 0-4
+#: arguments and reading the arity out of its own message, not from docs.
+#:
+#: The count is `len(arg)` for a list and 1 for anything else -- a bare
+#: `{$abs: 5}` is one argument, and so is a nested expression document.
+#: `$cond`'s OBJECT form (`{if, then, else}`) is exempt: it is a document, so
+#: it would count as 1 against an arity of 3.
+_FIXED_ARITY: dict[str, int] = {
+    # arity 1
+    "$abs": 1,
+    "$acos": 1,
+    "$acosh": 1,
+    "$allElementsTrue": 1,
+    "$anyElementTrue": 1,
+    "$arrayToObject": 1,
+    "$asin": 1,
+    "$asinh": 1,
+    "$atan": 1,
+    "$atanh": 1,
+    "$binarySize": 1,
+    "$bitNot": 1,
+    "$bsonSize": 1,
+    "$ceil": 1,
+    "$cos": 1,
+    "$cosh": 1,
+    "$degreesToRadians": 1,
+    "$exp": 1,
+    "$first": 1,
+    "$floor": 1,
+    "$isArray": 1,
+    "$isNumber": 1,
+    "$last": 1,
+    "$ln": 1,
+    "$log10": 1,
+    "$not": 1,
+    "$objectToArray": 1,
+    "$radiansToDegrees": 1,
+    "$reverseArray": 1,
+    "$sin": 1,
+    "$sinh": 1,
+    "$size": 1,
+    "$sqrt": 1,
+    "$strLenBytes": 1,
+    "$strLenCP": 1,
+    "$tan": 1,
+    "$tanh": 1,
+    "$toLower": 1,
+    "$toUpper": 1,
+    "$tsIncrement": 1,
+    "$tsSecond": 1,
+    "$type": 1,
+    # arity 2
+    "$arrayElemAt": 2,
+    "$atan2": 2,
+    "$cmp": 2,
+    "$divide": 2,
+    "$eq": 2,
+    "$gt": 2,
+    "$gte": 2,
+    "$in": 2,
+    "$log": 2,
+    "$lt": 2,
+    "$lte": 2,
+    "$mod": 2,
+    "$ne": 2,
+    "$pow": 2,
+    "$setDifference": 2,
+    "$setIsSubset": 2,
+    "$split": 2,
+    "$strcasecmp": 2,
+    "$subtract": 2,
+    # arity 3
+    "$cond": 3,
+    "$substr": 3,
+    "$substrBytes": 3,
+    "$substrCP": 3,
+}
+
+
+#: Operators mongod reports under a different name, because they are aliases.
+_ARITY_ALIASES = {"$substr": "$substrBytes"}
+
+
+def _arity_problem(op: str, arg: Any) -> tuple[int, str] | None:
+    """mongod's 16020 when a fixed-arity operator gets the wrong count."""
+    want = _FIXED_ARITY.get(op)
+    if want is None:
+        return None
+    # `$cond`'s object form is the one document argument that is not "one
+    # argument" -- it carries all three.
+    if op == "$cond" and isinstance(arg, Mapping):
+        return None
+    got = len(arg) if isinstance(arg, list) else 1
+    if got == want:
+        return None
+    # `$substr` is an ALIAS: mongod names the canonical operator in the message.
+    name = _ARITY_ALIASES.get(op, op)
+    # "1 arguments" is mongod's own plural, and it is reproduced.
+    return (
+        16020,
+        f"Expression {name} takes exactly {want} arguments. {got} were passed in.",
+    )
+
+
 def _apply_op(op: str, arg: Any, ctx: _Ctx) -> Any:
     if op == "$literal":
         return arg
+    # mongod's expression parser treats `{$op: [x]}` as ONE argument for the
+    # single-argument operators, unwrapping the list. We passed the list
+    # through, which produced silent WRONG VALUES rather than errors:
+    # `{$size: [[1, 2]]}` counted the outer array (1, not 2), `{$toUpper: ["a"]}`
+    # returned `["a"]`, and `{$first: ["$arr"]}` returned the whole array.
+    if isinstance(arg, list) and len(arg) == 1 and _FIXED_ARITY.get(op) == 1:
+        arg = arg[0]
     handler = _OPS.get(op)
     if handler is None:
         raise UnknownExpressionOperatorError(op)
@@ -3139,7 +3251,10 @@ def _op_set_is_subset(arg: Any, ctx: _Ctx) -> bool:
 
 
 def _op_all_elements_true(arg: Any, ctx: _Ctx) -> bool:
-    arr = _eval_args(arg, ctx)[0]
+    # `_eval` on the single operand, not `_eval_args(..)[0]`: `_apply_op`
+    # already unwraps the one-element list form, so the array arrives
+    # directly and `_eval_args` would iterate ITS elements instead.
+    arr = _eval(arg, ctx)
     if not isinstance(arr, list):
         raise ExpressionError(
             f"$allElementsTrue's argument must be an array, but is {_bson_type_name(arr)}",
@@ -3150,7 +3265,10 @@ def _op_all_elements_true(arg: Any, ctx: _Ctx) -> bool:
 
 
 def _op_any_element_true(arg: Any, ctx: _Ctx) -> bool:
-    arr = _eval_args(arg, ctx)[0]
+    # `_eval` on the single operand, not `_eval_args(..)[0]`: `_apply_op`
+    # already unwraps the one-element list form, so the array arrives
+    # directly and `_eval_args` would iterate ITS elements instead.
+    arr = _eval(arg, ctx)
     if not isinstance(arr, list):
         raise ExpressionError(
             f"$anyElementTrue's argument must be an array, but is {_bson_type_name(arr)}",

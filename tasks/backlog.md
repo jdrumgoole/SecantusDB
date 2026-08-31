@@ -1557,13 +1557,35 @@ These are explicit non-goals. Don't add them without a reason.
   definition of BSON equality, used by the expression language and the diff.
 
   **Still open, and each is its own slice. Measured, not estimated:**
-  - [ ] **The ARITY family: ~907 cases where mongod answers 16020**
-        (`Expression $x takes exactly N arguments. M were passed in.`), of which
-        **233 CRASH** (`internal server error`) and the rest answer 14 / 28765 /
-        51044 / 51276. The crash is `ValueError: not enough values to unpack` —
-        an operator indexing `arg[0], arg[1]` on a scalar. A table of operator ->
-        arity, checked before dispatch, closes the whole family at once; that is
-        the same shape as the command-argument sweep's fix.
+  - [x] **RESOLVED 2026-08-31 — the ARITY family (~907 cases, 233 of them
+        crashes) is closed on both servers, and closing it found a WRONG-VALUE
+        bug the sweep had missed.** 65 fixed-arity operators now answer mongod's
+        `16020 Expression $x takes exactly N arguments. M were passed in.`
+
+        The table was DERIVED by asking mongod each of the 143 operators with
+        0-4 arguments and reading the arity out of its own message. That is what
+        surfaced the three rules a hand-written table would have got wrong:
+        `$cond`'s object form is exempt, `$substr` reports as `$substrBytes`,
+        and the count is `len` for a list but 1 for anything else.
+
+        **A one-element list is ONE argument, and we were not unwrapping it** --
+        found by a test written for this fix, not by the sweep, whose corpus
+        never paired an operator with a single-element list:
+
+            {$size: [[1, 2]]}    mongod 2      ours 1  (counted the outer list)
+            {$size: ["$arr"]}    mongod 2      ours 1
+            {$toUpper: ["a"]}    mongod "A"    ours ["a"]
+            {$type: [5]}         mongod "int"  ours "array"
+            {$first: ["$arr"]}   mongod 1      ours the whole array
+
+        Silent wrong ANSWERS, in operators as ordinary as `$size`. The unwrap
+        lives in the engine dispatch, which is why the table moved there too;
+        `$allElementsTrue` / `$anyElementTrue` then had to stop reading their
+        operand as `eval_args(..)[0]`, which the parity suite caught on both
+        engines.
+
+        Result: python crashes 274 -> 21, rust 274 -> 1; the 16020 family 907 ->
+        0 on both; rust message-only 689 -> 0.
   - [ ] **Decimal128: 29 CRASHES plus precision loss.** `{$abs: Decimal128}`
         raises `TypeError: bad operand type for abs()` on the Python server and
         defers on the Rust one; the trig and log operators convert to `float`

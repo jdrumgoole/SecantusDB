@@ -2172,6 +2172,57 @@ UNDEFVAR_CMD_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] =
     ),
 ]
 
+# Fixed-arity operators: mongod answers 16020 `Expression $x takes exactly N
+# arguments. M were passed in.` for 65 of them. We answered a mix of 14 / 28765 /
+# 51044 / 51276 and, for 233 of the ~907 shapes, CRASHED with `internal server
+# error` — an operator indexing `arg[0], arg[1]` on a scalar. It is a PARSE
+# error: an empty or missing collection still reports it.
+#
+# The arity table was DERIVED by asking mongod each operator with 0-4 arguments
+# and reading the count out of its own message, not taken from documentation.
+# The count is `len(arg)` for an array and 1 for anything else; `$cond`'s object
+# form is exempt; `$substr` is reported under its canonical name `$substrBytes`.
+ARITY_SEED = [{"_id": 1, "a": 1}]
+
+
+def _e(expr: object) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(db, [{"$addFields": {"z": expr}}])
+
+
+ARITY_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    # arity 1 — these CRASHED
+    ("abs-two-args", ARITY_SEED, _e({"$abs": [1, 2]})),
+    ("abs-zero-args", ARITY_SEED, _e({"$abs": []})),
+    ("abs-bare-ok", ARITY_SEED, _e({"$abs": 5})),
+    ("abs-one-array-ok", ARITY_SEED, _e({"$abs": [5]})),
+    ("abs-nested-expr-ok", ARITY_SEED, _e({"$abs": {"$add": [1, 2]}})),
+    ("not-two-args", ARITY_SEED, _e({"$not": [True, True]})),
+    ("type-doc-arg-ok", ARITY_SEED, _e({"$type": {"$literal": {"k": 1}}})),
+    ("size-bare-ok", ARITY_SEED, _e({"$size": {"$literal": [1, 2]}})),
+    # arity 2
+    ("eq-one-arg", ARITY_SEED, _e({"$eq": [1]})),
+    ("eq-three-args", ARITY_SEED, _e({"$eq": [1, 2, 3]})),
+    ("eq-bare", ARITY_SEED, _e({"$eq": 1})),
+    ("divide-one-arg", ARITY_SEED, _e({"$divide": [1]})),
+    ("split-one-arg", ARITY_SEED, _e({"$split": ["a"]})),
+    ("arrayelemat-one-arg", ARITY_SEED, _e({"$arrayElemAt": [1]})),
+    # arity 3, and $cond's object form which must stay exempt
+    ("cond-two-args", ARITY_SEED, _e({"$cond": [True, 1]})),
+    ("cond-three-args-ok", ARITY_SEED, _e({"$cond": [True, 1, 2]})),
+    ("cond-object-form-ok", ARITY_SEED, _e({"$cond": {"if": True, "then": 1, "else": 2}})),
+    # `$substr` reports as `$substrBytes`
+    ("substr-alias-name", ARITY_SEED, _e({"$substr": 1})),
+    ("substrbytes-two-args", ARITY_SEED, _e({"$substrBytes": ["ab", 0]})),
+    # PARSE time: an empty (here, missing) collection still reports it.
+    ("empty-collection", [], _e({"$abs": [1, 2]})),
+    # The wrapper follows the stage, as for undefined variables.
+    (
+        "bare-in-group",
+        ARITY_SEED,
+        lambda db: _agg_err_full(db, [{"$group": {"_id": {"$abs": [1, 2]}}}]),
+    ),
+]
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
@@ -2188,6 +2239,7 @@ ALL_CASES = (
     + [("propagate", c) for c in PROPAGATE_CASES]
     + [("exprcmp", c) for c in EXPRCMP_CASES]
     + [("undefvarcmd", c) for c in UNDEFVAR_CMD_CASES]
+    + [("arity", c) for c in ARITY_CASES]
 )
 
 

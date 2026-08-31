@@ -1743,7 +1743,11 @@ def test_array_set_typeguard_validation(tmp_path) -> None:
                     {
                         "$project": {
                             "_id": 0,
-                            "s": {"$size": [1, 2, 3]},
+                            # `[[1, 2, 3]]`, not `[1, 2, 3]`: `$size` takes
+                            # exactly ONE argument, so the bare list is three
+                            # arguments and mongod answers 16020. This asserted
+                            # our own wrong reading of it.
+                            "s": {"$size": [[1, 2, 3]]},
                             "i": {"$in": [2, [1, 2]]},
                             "r": {"$regexMatch": {"input": "abc", "regex": "b"}},
                         }

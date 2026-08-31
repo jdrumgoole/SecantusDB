@@ -16,6 +16,7 @@ from secantus.expressions import (
     MISSING,
     ExpressionError,
     UnknownExpressionOperatorError,
+    _arity_problem,
     _bool,
     _bson_type_name,
     _fmt_double,
@@ -301,24 +302,29 @@ _EXPR_SPEC_STAGES = frozenset({"$redact", "$replaceWith", "$sortByCount"})
 _EXPR_MAP_STAGES = frozenset({"$project", "$addFields", "$set", "$group"})
 
 
-def _undefined_variable(expr: Any, bound: frozenset[str]) -> str | None:
-    """The first `$$name` in ``expr`` that names nothing, or ``None``.
+def _expression_problem(expr: Any, bound: frozenset[str]) -> tuple[int, str] | None:
+    """The first problem in ``expr`` that mongod reports at PARSE time.
+
+    Returns ``(code, message)`` -- an undefined `$$variable` (17276) or a
+    fixed-arity operator given the wrong argument count (16020). One traversal
+    reports both: a second walker over the same expression positions is exactly
+    the duplication that let the field-value rule drift.
 
     Deliberately CONSERVATIVE: it reports only from positions known to be
-    expressions, and returns ``None`` for anything it does not recognise. A
-    false negative leaves the old behaviour; a false positive would break a
-    VALID pipeline, which is far worse than the wrong error code this exists to
-    fix. Every rule below was probed against mongod 8.2.11.
+    expressions and returns ``None`` for anything it does not recognise. A false
+    negative leaves the old behaviour; a false positive would reject a VALID
+    pipeline, far worse than the wrong error being fixed. Every rule was probed
+    against mongod 8.2.11.
     """
     if isinstance(expr, str):
         if expr.startswith("$$"):
             base = expr[2:].split(".", 1)[0]
             if base and base not in bound and base not in _SYSTEM_VARS:
-                return base
+                return (17276, f"Use of undefined variable: {base}")
         return None
     if isinstance(expr, list):
         for item in expr:
-            found = _undefined_variable(item, bound)
+            found = _expression_problem(item, bound)
             if found:
                 return found
         return None
@@ -326,36 +332,27 @@ def _undefined_variable(expr: Any, bound: frozenset[str]) -> str | None:
         return None
     for op, arg in expr.items():
         # `$literal`'s argument is data, not an expression: `{$literal: "$$x"}`
-        # is the STRING, and mongod does not resolve it.
+        # is the STRING, and mongod does not resolve it. Its ARITY is still
+        # checked, since that is structural.
+        found = _arity_problem(op, arg)
+        if found:
+            return found
         if op == "$literal":
             continue
         if op == "$let":
-            found = _undefined_let(arg, bound)
-            if found:
-                return found
-            continue
-        if op in ("$map", "$filter"):
-            found = _undefined_binding(arg, bound, op)
-            if found:
-                return found
-            continue
-        if op == "$reduce":
-            if isinstance(arg, Mapping):
-                for key in ("input", "initialValue"):
-                    found = _undefined_variable(arg.get(key), bound)
-                    if found:
-                        return found
-                found = _undefined_variable(arg.get("in"), bound | {"this", "value"})
-                if found:
-                    return found
-            continue
-        found = _undefined_variable(arg, bound)
+            found = _problem_in_let(arg, bound)
+        elif op in ("$map", "$filter"):
+            found = _problem_in_binding(arg, bound, op)
+        elif op == "$reduce":
+            found = _problem_in_reduce(arg, bound)
+        else:
+            found = _expression_problem(arg, bound)
         if found:
             return found
     return None
 
 
-def _undefined_let(arg: Any, bound: frozenset[str]) -> str | None:
+def _problem_in_let(arg: Any, bound: frozenset[str]) -> tuple[int, str] | None:
     """`$let`: the bindings are evaluated in the OUTER scope (they cannot see
     each other -- probed), and only ``in`` sees the new names."""
     if not isinstance(arg, Mapping):
@@ -363,68 +360,75 @@ def _undefined_let(arg: Any, bound: frozenset[str]) -> str | None:
     names = arg.get("vars")
     if isinstance(names, Mapping):
         for value in names.values():
-            found = _undefined_variable(value, bound)
+            found = _expression_problem(value, bound)
             if found:
                 return found
         bound = bound | set(names)
-    return _undefined_variable(arg.get("in"), bound)
+    return _expression_problem(arg.get("in"), bound)
 
 
-def _undefined_binding(arg: Any, bound: frozenset[str], op: str) -> str | None:
+def _problem_in_binding(arg: Any, bound: frozenset[str], op: str) -> tuple[int, str] | None:
     """`$map` / `$filter`: ``input`` is outer-scope; the body sees ``as``
     (default ``this``)."""
     if not isinstance(arg, Mapping):
         return None
-    found = _undefined_variable(arg.get("input"), bound)
+    found = _expression_problem(arg.get("input"), bound)
     if found:
         return found
     as_name = arg.get("as")
     inner = bound | {as_name if isinstance(as_name, str) and as_name else "this"}
-    return _undefined_variable(arg.get("cond" if op == "$filter" else "in"), inner)
+    return _expression_problem(arg.get("cond" if op == "$filter" else "in"), inner)
 
 
-def undefined_variable_in_filter(filter_doc: Any, bound: frozenset[str]) -> str | None:
-    """The first `$$name` in a QUERY FILTER that names nothing.
+def _problem_in_reduce(arg: Any, bound: frozenset[str]) -> tuple[int, str] | None:
+    """`$reduce` binds ``this`` and ``value`` for its ``in``."""
+    if not isinstance(arg, Mapping):
+        return None
+    for key in ("input", "initialValue"):
+        found = _expression_problem(arg.get(key), bound)
+        if found:
+            return found
+    return _expression_problem(arg.get("in"), bound | {"this", "value"})
+
+
+def expression_problem_in_filter(filter_doc: Any, bound: frozenset[str]) -> tuple[int, str] | None:
+    """The first parse-time expression problem in a QUERY FILTER.
 
     A filter is query language, not an expression: ``{s: "$$NOPE"}`` matches the
     literal string. Only ``$expr`` holds an expression, and only ``$and`` /
-    ``$or`` / ``$nor`` nest further filters. Conservative for the same reason
-    :func:`undefined_variable_in_pipeline` is -- a false positive would reject a
-    VALID query.
-
-    This is the surface the pipeline walker did not cover: ``find`` / ``count``
-    / ``distinct`` / ``findAndModify`` and the ``q`` of an ``update`` /
-    ``delete`` all take a filter.
+    ``$or`` / ``$nor`` nest further filters.
     """
     if not isinstance(filter_doc, Mapping):
         return None
     for key, value in filter_doc.items():
         if key == "$expr":
-            found = _undefined_variable(value, bound)
+            found = _expression_problem(value, bound)
             if found:
                 return found
         elif key in ("$and", "$or", "$nor") and isinstance(value, list):
             for sub in value:
-                found = undefined_variable_in_filter(sub, bound)
+                found = expression_problem_in_filter(sub, bound)
                 if found:
                     return found
     return None
 
 
-def undefined_variable_message(var: str, stage: str) -> str:
-    """mongod's message, with the stage wrapper it uses inside `$project` /
-    `$addFields` / `$set` and no wrapper anywhere else."""
-    msg = f"Use of undefined variable: {var}"
-    return f"Invalid {stage} :: caused by :: {msg}" if stage else msg
+def wrap_expression_problem(message: str, stage: str) -> str:
+    """mongod's wrapper: `Invalid $<stage> :: caused by ::` inside `$project` /
+    `$addFields` / `$set`, and nothing anywhere else."""
+    return f"Invalid {stage} :: caused by :: {message}" if stage else message
 
 
-def undefined_variable_in_pipeline(pipeline: Any, bound: frozenset[str]) -> tuple[str, str] | None:
-    """``(variable, stage)`` for the first undefined `$$name`, or ``None``.
+def expression_problem_in_pipeline(
+    pipeline: Any, bound: frozenset[str]
+) -> tuple[int, str, str] | None:
+    """``(code, message, stage)`` for the first parse-time expression problem.
 
-    mongod reports this at PARSE time -- an empty collection still errors, which
-    is why this runs before the pipeline rather than during it. ``stage`` is the
-    name for the `Invalid $<stage> :: caused by ::` wrapper, or ``""`` where
-    mongod leaves the message bare.
+    mongod reports these BEFORE reading a document -- an empty, or missing,
+    collection still errors -- which is why this runs ahead of the pipeline
+    rather than during it. ``stage`` is the name for the
+    `Invalid $<stage> :: caused by ::` wrapper, or ``""`` where mongod leaves
+    the message bare.
     """
     if not isinstance(pipeline, list):
         return None
@@ -433,36 +437,31 @@ def undefined_variable_in_pipeline(pipeline: Any, bound: frozenset[str]) -> tupl
             continue
         name, spec = next(iter(stage.items()))
         wrapper = name if name in _EXPR_WRAPPING_STAGES else ""
+        found: tuple[int, str] | None = None
         if name in _EXPR_SPEC_STAGES:
-            # `$redact` binds its three decision names for its own expression.
             inner = bound | {"KEEP", "PRUNE", "DESCEND"} if name == "$redact" else bound
-            found = _undefined_variable(spec, inner)
-            if found:
-                return (found, wrapper)
+            found = _expression_problem(spec, inner)
         elif name in _EXPR_MAP_STAGES:
             if isinstance(spec, Mapping):
                 for value in spec.values():
-                    found = _undefined_variable(value, bound)
+                    found = _expression_problem(value, bound)
                     if found:
-                        return (found, wrapper)
+                        break
         elif name == "$replaceRoot":
             if isinstance(spec, Mapping):
-                found = _undefined_variable(spec.get("newRoot"), bound)
-                if found:
-                    return (found, wrapper)
+                found = _expression_problem(spec.get("newRoot"), bound)
         elif name == "$match":
-            # The filter is QUERY language, where `"$$x"` is a literal value to
-            # match. Only `$expr` holds an expression.
+            # The filter is QUERY language; only `$expr` holds an expression.
             if isinstance(spec, Mapping) and "$expr" in spec:
-                found = _undefined_variable(spec["$expr"], bound)
+                found = _expression_problem(spec["$expr"], bound)
                 if found:
-                    return (found, "")
+                    return (found[0], found[1], "")
         elif name == "$facet":
             if isinstance(spec, Mapping):
                 for sub in spec.values():
-                    found = undefined_variable_in_pipeline(sub, bound)
-                    if found:
-                        return found
+                    nested = expression_problem_in_pipeline(sub, bound)
+                    if nested:
+                        return nested
         elif name == "$lookup":
             # `let` binds only inside this stage's own sub-pipeline -- probed:
             # referencing it in a LATER stage is undefined.
@@ -471,14 +470,17 @@ def undefined_variable_in_pipeline(pipeline: Any, bound: frozenset[str]) -> tupl
                 inner = bound
                 if isinstance(let_vars, Mapping):
                     for value in let_vars.values():
-                        found = _undefined_variable(value, bound)
+                        found = _expression_problem(value, bound)
                         if found:
-                            return (found, wrapper)
+                            break
                     inner = bound | set(let_vars)
-                found = undefined_variable_in_pipeline(spec.get("pipeline"), inner)
-                if found:
-                    return found
+                if not found:
+                    nested = expression_problem_in_pipeline(spec.get("pipeline"), inner)
+                    if nested:
+                        return nested
         # Every other stage is left alone on purpose: see the docstring above.
+        if found:
+            return (found[0], found[1], wrapper)
     return None
 
 

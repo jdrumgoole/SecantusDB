@@ -99,6 +99,86 @@ pub fn truthy(v: &Bson) -> bool {
     }
 }
 
+/// Operators mongod rejects with 16020 when the argument count is wrong, and
+/// the count it wants. DERIVED by asking mongod 8.2.11 each operator with 0-4
+/// arguments and reading the arity out of its own message, not from docs.
+/// Mirrors `expressions._FIXED_ARITY`.
+const FIXED_ARITY: &[(&str, usize)] = &[
+    ("$abs", 1),
+    ("$acos", 1),
+    ("$acosh", 1),
+    ("$allElementsTrue", 1),
+    ("$anyElementTrue", 1),
+    ("$arrayElemAt", 2),
+    ("$arrayToObject", 1),
+    ("$asin", 1),
+    ("$asinh", 1),
+    ("$atan", 1),
+    ("$atan2", 2),
+    ("$atanh", 1),
+    ("$binarySize", 1),
+    ("$bitNot", 1),
+    ("$bsonSize", 1),
+    ("$ceil", 1),
+    ("$cmp", 2),
+    ("$cond", 3),
+    ("$cos", 1),
+    ("$cosh", 1),
+    ("$degreesToRadians", 1),
+    ("$divide", 2),
+    ("$eq", 2),
+    ("$exp", 1),
+    ("$first", 1),
+    ("$floor", 1),
+    ("$gt", 2),
+    ("$gte", 2),
+    ("$in", 2),
+    ("$isArray", 1),
+    ("$isNumber", 1),
+    ("$last", 1),
+    ("$ln", 1),
+    ("$log", 2),
+    ("$log10", 1),
+    ("$lt", 2),
+    ("$lte", 2),
+    ("$mod", 2),
+    ("$ne", 2),
+    ("$not", 1),
+    ("$objectToArray", 1),
+    ("$pow", 2),
+    ("$radiansToDegrees", 1),
+    ("$reverseArray", 1),
+    ("$setDifference", 2),
+    ("$setIsSubset", 2),
+    ("$sin", 1),
+    ("$sinh", 1),
+    ("$size", 1),
+    ("$split", 2),
+    ("$sqrt", 1),
+    ("$strLenBytes", 1),
+    ("$strLenCP", 1),
+    ("$strcasecmp", 2),
+    ("$substr", 3),
+    ("$substrBytes", 3),
+    ("$substrCP", 3),
+    ("$subtract", 2),
+    ("$tan", 1),
+    ("$tanh", 1),
+    ("$toLower", 1),
+    ("$toUpper", 1),
+    ("$tsIncrement", 1),
+    ("$tsSecond", 1),
+    ("$type", 1),
+];
+
+/// The fixed argument count mongod requires for `op`, if it has one.
+pub fn fixed_arity(op: &str) -> Option<usize> {
+    FIXED_ARITY
+        .iter()
+        .find(|(name, _)| *name == op)
+        .map(|(_, n)| *n)
+}
+
 fn eval(expr: &Bson, ctx: &Ctx) -> R {
     match expr {
         Bson::String(s) => {
@@ -242,6 +322,19 @@ fn is_null(b: &Bson) -> bool {
 }
 
 fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
+    // mongod's expression parser treats `{$op: [x]}` as ONE argument for the
+    // single-argument operators, unwrapping the list. Passing the list through
+    // produced silent WRONG VALUES rather than errors: `{$size: [[1, 2]]}`
+    // counted the outer array (1, not 2), `{$toUpper: ["a"]}` returned
+    // `["a"]`, and `{$first: ["$arr"]}` returned the whole array.
+    let unwrapped;
+    let arg = match arg {
+        Bson::Array(a) if a.len() == 1 && fixed_arity(op) == Some(1) => {
+            unwrapped = a[0].clone();
+            &unwrapped
+        }
+        other => other,
+    };
     match op {
         "$literal" => Ok(arg.clone()),
         // $eq/$ne use Python `==` (total: null==null is true, different types
@@ -2008,8 +2101,10 @@ fn op_set_is_subset(arg: &Bson, ctx: &Ctx) -> R {
 }
 
 fn op_elements_true(arg: &Bson, ctx: &Ctx, all: bool) -> R {
-    let arr = eval_args(arg, ctx)?;
-    let Some(Bson::Array(a)) = arr.into_iter().next() else {
+    // `eval` on the single operand, not `eval_args(..)[0]`: `apply_op` already
+    // unwraps the one-element list form, so the operand arrives directly and
+    // `eval_args` would iterate the ARRAY's own elements instead.
+    let Bson::Array(a) = eval(arg, ctx)? else {
         return Err(Fallback);
     };
     Ok(Bson::Boolean(if all {

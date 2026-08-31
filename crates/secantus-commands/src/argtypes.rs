@@ -814,7 +814,35 @@ const EXPR_MAP_STAGES: &[&str] = &["$project", "$addFields", "$set", "$group"];
 /// stage reports it bare. Probed on 8.2.11.
 const EXPR_WRAPPING_STAGES: &[&str] = &["$project", "$addFields", "$set"];
 
-fn undefined_in_expr(expr: &Bson, bound: &[String]) -> Option<String> {
+/// mongod's 16020 when a fixed-arity operator gets the wrong argument count.
+/// The table lives in the ENGINE (`secantus_core::expressions`), because the
+/// evaluator needs it too: mongod unwraps a one-element array for the
+/// single-argument operators, and getting that wrong produced silent wrong
+/// values, not just wrong errors.
+fn arity_problem(op: &str, arg: &Bson) -> Option<(i32, String)> {
+    let want = secantus_core::expressions::fixed_arity(op)?;
+    // `$cond`'s OBJECT form (`{if, then, else}`) is exempt: it is a document,
+    // so it would otherwise count as 1 against an arity of 3.
+    if op == "$cond" && matches!(arg, Bson::Document(_)) {
+        return None;
+    }
+    let got = match arg {
+        Bson::Array(a) => a.len(),
+        _ => 1,
+    };
+    if got == want {
+        return None;
+    }
+    // `$substr` is an ALIAS: mongod names the canonical operator.
+    let name = if op == "$substr" { "$substrBytes" } else { op };
+    // "1 arguments" is mongod's own plural, reproduced.
+    Some((
+        16020,
+        format!("Expression {name} takes exactly {want} arguments. {got} were passed in."),
+    ))
+}
+
+fn expression_problem(expr: &Bson, bound: &[String]) -> Option<(i32, String)> {
     match expr {
         Bson::String(s) => {
             let name = s.strip_prefix("$$")?;
@@ -822,21 +850,25 @@ fn undefined_in_expr(expr: &Bson, bound: &[String]) -> Option<String> {
             if base.is_empty() || bound.iter().any(|b| b == base) || SYSTEM_VARS.contains(&base) {
                 return None;
             }
-            Some(base.to_string())
+            Some((17276, format!("Use of undefined variable: {base}")))
         }
-        Bson::Array(items) => items.iter().find_map(|i| undefined_in_expr(i, bound)),
+        Bson::Array(items) => items.iter().find_map(|i| expression_problem(i, bound)),
         Bson::Document(d) => {
             for (op, arg) in d {
+                // Arity is STRUCTURAL, so it is checked even for `$literal`.
+                if let Some(found) = arity_problem(op, arg) {
+                    return Some(found);
+                }
                 // `$literal`'s argument is DATA: `{$literal: "$$x"}` is the
                 // string, and mongod does not resolve it.
                 if op == "$literal" {
                     continue;
                 }
                 let found = match op.as_str() {
-                    "$let" => undefined_in_let(arg, bound),
-                    "$map" | "$filter" => undefined_in_binding(arg, bound, op),
-                    "$reduce" => undefined_in_reduce(arg, bound),
-                    _ => undefined_in_expr(arg, bound),
+                    "$let" => problem_in_let(arg, bound),
+                    "$map" | "$filter" => problem_in_binding(arg, bound, op),
+                    "$reduce" => problem_in_reduce(arg, bound),
+                    _ => expression_problem(arg, bound),
                 };
                 if found.is_some() {
                     return found;
@@ -850,25 +882,25 @@ fn undefined_in_expr(expr: &Bson, bound: &[String]) -> Option<String> {
 
 /// `$let`: the bindings are evaluated in the OUTER scope — they cannot see each
 /// other (probed) — and only `in` sees the new names.
-fn undefined_in_let(arg: &Bson, bound: &[String]) -> Option<String> {
+fn problem_in_let(arg: &Bson, bound: &[String]) -> Option<(i32, String)> {
     let Bson::Document(d) = arg else { return None };
     let mut inner = bound.to_vec();
     if let Some(Bson::Document(vars)) = d.get("vars") {
         for (_, value) in vars {
-            if let Some(found) = undefined_in_expr(value, bound) {
+            if let Some(found) = expression_problem(value, bound) {
                 return Some(found);
             }
         }
         inner.extend(vars.keys().cloned());
     }
-    d.get("in").and_then(|e| undefined_in_expr(e, &inner))
+    d.get("in").and_then(|e| expression_problem(e, &inner))
 }
 
 /// `$map` / `$filter`: `input` is outer-scope; the body sees `as` (default
 /// `this`).
-fn undefined_in_binding(arg: &Bson, bound: &[String], op: &str) -> Option<String> {
+fn problem_in_binding(arg: &Bson, bound: &[String], op: &str) -> Option<(i32, String)> {
     let Bson::Document(d) = arg else { return None };
-    if let Some(found) = d.get("input").and_then(|e| undefined_in_expr(e, bound)) {
+    if let Some(found) = d.get("input").and_then(|e| expression_problem(e, bound)) {
         return Some(found);
     }
     let as_name = match d.get("as") {
@@ -878,20 +910,20 @@ fn undefined_in_binding(arg: &Bson, bound: &[String], op: &str) -> Option<String
     let mut inner = bound.to_vec();
     inner.push(as_name);
     let body = if op == "$filter" { "cond" } else { "in" };
-    d.get(body).and_then(|e| undefined_in_expr(e, &inner))
+    d.get(body).and_then(|e| expression_problem(e, &inner))
 }
 
-fn undefined_in_reduce(arg: &Bson, bound: &[String]) -> Option<String> {
+fn problem_in_reduce(arg: &Bson, bound: &[String]) -> Option<(i32, String)> {
     let Bson::Document(d) = arg else { return None };
     for key in ["input", "initialValue"] {
-        if let Some(found) = d.get(key).and_then(|e| undefined_in_expr(e, bound)) {
+        if let Some(found) = d.get(key).and_then(|e| expression_problem(e, bound)) {
             return Some(found);
         }
     }
     let mut inner = bound.to_vec();
     inner.push("this".to_string());
     inner.push("value".to_string());
-    d.get("in").and_then(|e| undefined_in_expr(e, &inner))
+    d.get("in").and_then(|e| expression_problem(e, &inner))
 }
 
 /// The first `$$name` in a QUERY FILTER that names nothing.
@@ -907,11 +939,11 @@ fn undefined_in_reduce(arg: &Bson, bound: &[String]) -> Option<String> {
 /// filter, and an undefined variable in one answered the storage layer's
 /// generic `BadValue` (2) `query uses a construct the Rust server does not
 /// support` instead of mongod's 17276.
-pub fn undefined_variable_in_filter(filter: &Document, bound: &[String]) -> Option<String> {
+pub fn expression_problem_in_filter(filter: &Document, bound: &[String]) -> Option<(i32, String)> {
     for (key, value) in filter {
         match key.as_str() {
             "$expr" => {
-                if let Some(found) = undefined_in_expr(value, bound) {
+                if let Some(found) = expression_problem(value, bound) {
                     return Some(found);
                 }
             }
@@ -919,7 +951,7 @@ pub fn undefined_variable_in_filter(filter: &Document, bound: &[String]) -> Opti
                 if let Bson::Array(subs) = value {
                     for sub in subs {
                         if let Bson::Document(d) = sub {
-                            if let Some(found) = undefined_variable_in_filter(d, bound) {
+                            if let Some(found) = expression_problem_in_filter(d, bound) {
                                 return Some(found);
                             }
                         }
@@ -935,21 +967,23 @@ pub fn undefined_variable_in_filter(filter: &Document, bound: &[String]) -> Opti
 /// The first `$$name` that names nothing in an UPDATE, whether it is an
 /// operator document (no expressions, so nothing to find) or a PIPELINE.
 /// Returns `(variable, stage)` like [`undefined_variable_error`].
-pub fn undefined_variable_in_update(update: &Bson, bound: &[String]) -> Option<(String, String)> {
+pub fn expression_problem_in_update(
+    update: &Bson,
+    bound: &[String],
+) -> Option<(i32, String, String)> {
     match update {
-        Bson::Array(stages) => undefined_variable_error(stages, bound),
+        Bson::Array(stages) => expression_problem_in_pipeline(stages, bound),
         _ => None,
     }
 }
 
 /// mongod's message for an undefined variable, with the stage wrapper it uses
 /// inside `$project` / `$addFields` / `$set` and no wrapper anywhere else.
-pub fn undefined_variable_message(var: &str, stage: &str) -> String {
-    let msg = format!("Use of undefined variable: {var}");
+pub fn wrap_expression_problem(message: &str, stage: &str) -> String {
     if stage.is_empty() {
-        msg
+        message.to_string()
     } else {
-        format!("Invalid {stage} :: caused by :: {msg}")
+        format!("Invalid {stage} :: caused by :: {message}")
     }
 }
 
@@ -966,7 +1000,10 @@ pub fn undefined_variable_message(var: &str, stage: &str) -> String {
 /// leaves the previous behaviour, while a false positive would reject a VALID
 /// pipeline — much worse than the generic `BadValue` this replaces. Mirrors
 /// `aggregate.undefined_variable_in_pipeline`.
-pub fn undefined_variable_error(pipeline: &[Bson], bound: &[String]) -> Option<(String, String)> {
+pub fn expression_problem_in_pipeline(
+    pipeline: &[Bson],
+    bound: &[String],
+) -> Option<(i32, String, String)> {
     for stage in pipeline {
         let Bson::Document(stage) = stage else {
             continue;
@@ -982,7 +1019,10 @@ pub fn undefined_variable_error(pipeline: &[Bson], bound: &[String]) -> Option<(
         } else {
             String::new()
         };
-        let found = if EXPR_SPEC_STAGES.contains(&name.as_str()) {
+        // `found` is a problem in THIS stage, which takes this stage's wrapper.
+        // The nesting stages return their own fully-formed answer instead, since
+        // the wrapper belongs to the INNER stage that failed.
+        let found: Option<(i32, String)> = if EXPR_SPEC_STAGES.contains(&name.as_str()) {
             // `$redact` binds its three decision names for its own expression.
             let mut inner = bound.to_vec();
             if name == "$redact" {
@@ -992,41 +1032,40 @@ pub fn undefined_variable_error(pipeline: &[Bson], bound: &[String]) -> Option<(
                     "DESCEND".to_string(),
                 ]);
             }
-            undefined_in_expr(spec, &inner).map(|v| (v, wrapper))
+            expression_problem(spec, &inner)
         } else if EXPR_MAP_STAGES.contains(&name.as_str()) {
             match spec {
-                Bson::Document(d) => d
-                    .iter()
-                    .find_map(|(_, v)| undefined_in_expr(v, bound))
-                    .map(|v| (v, wrapper)),
+                Bson::Document(d) => d.iter().find_map(|(_, v)| expression_problem(v, bound)),
                 _ => None,
             }
         } else if name == "$replaceRoot" {
             match spec {
-                Bson::Document(d) => d
-                    .get("newRoot")
-                    .and_then(|e| undefined_in_expr(e, bound))
-                    .map(|v| (v, wrapper)),
+                Bson::Document(d) => d.get("newRoot").and_then(|e| expression_problem(e, bound)),
                 _ => None,
             }
         } else if name == "$match" {
             // The filter is QUERY language, where `"$$x"` is a literal value to
-            // match. Only `$expr` holds an expression.
+            // match. Only `$expr` holds an expression, and it takes no wrapper.
             match spec {
-                Bson::Document(d) => d
-                    .get("$expr")
-                    .and_then(|e| undefined_in_expr(e, bound))
-                    .map(|v| (v, String::new())),
+                Bson::Document(d) => {
+                    if let Some(p) = d.get("$expr").and_then(|e| expression_problem(e, bound)) {
+                        return Some((p.0, p.1, String::new()));
+                    }
+                    None
+                }
                 _ => None,
             }
         } else if name == "$facet" {
-            match spec {
-                Bson::Document(d) => d.iter().find_map(|(_, sub)| match sub {
-                    Bson::Array(p) => undefined_variable_error(p, bound),
-                    _ => None,
-                }),
-                _ => None,
+            if let Bson::Document(d) = spec {
+                for (_, sub) in d {
+                    if let Bson::Array(p) = sub {
+                        if let Some(found) = expression_problem_in_pipeline(p, bound) {
+                            return Some(found);
+                        }
+                    }
+                }
             }
+            None
         } else if name == "$lookup" {
             match spec {
                 Bson::Document(d) => {
@@ -1036,25 +1075,29 @@ pub fn undefined_variable_error(pipeline: &[Bson], bound: &[String]) -> Option<(
                     let mut bad = None;
                     if let Some(Bson::Document(lv)) = d.get("let") {
                         for (_, value) in lv {
-                            if let Some(found) = undefined_in_expr(value, bound) {
-                                bad = Some((found, wrapper.clone()));
+                            if let Some(found) = expression_problem(value, bound) {
+                                bad = Some(found);
                                 break;
                             }
                         }
                         inner.extend(lv.keys().cloned());
                     }
-                    bad.or_else(|| match d.get("pipeline") {
-                        Some(Bson::Array(p)) => undefined_variable_error(p, &inner),
-                        _ => None,
-                    })
+                    if bad.is_none() {
+                        if let Some(Bson::Array(p)) = d.get("pipeline") {
+                            if let Some(found) = expression_problem_in_pipeline(p, &inner) {
+                                return Some(found);
+                            }
+                        }
+                    }
+                    bad
                 }
                 _ => None,
             }
         } else {
             None // every other stage is left alone on purpose
         };
-        if found.is_some() {
-            return found;
+        if let Some((code, msg)) = found {
+            return Some((code, msg, wrapper));
         }
     }
     None
@@ -1615,8 +1658,11 @@ mod undefined_var_tests {
     use super::*;
     use bson::doc;
 
+    /// `(variable-or-message, stage)` for the first problem, so the existing
+    /// assertions read unchanged.
     fn find(pipeline: Vec<Bson>) -> Option<(String, String)> {
-        undefined_variable_error(&pipeline, &[])
+        expression_problem_in_pipeline(&pipeline, &[])
+            .map(|(_, msg, stage)| (msg.rsplit(": ").next().unwrap_or(&msg).to_string(), stage))
     }
 
     fn stage(name: &str, spec: Bson) -> Bson {
@@ -1743,7 +1789,48 @@ mod undefined_var_tests {
     #[test]
     fn command_level_let_names_are_bound() {
         let pipeline = vec![stage("$project", Bson::Document(doc! {"x": "$$cv"}))];
-        assert!(undefined_variable_error(&pipeline, &["cv".to_string()]).is_none());
-        assert!(undefined_variable_error(&pipeline, &[]).is_some());
+        assert!(expression_problem_in_pipeline(&pipeline, &["cv".to_string()]).is_none());
+        assert!(expression_problem_in_pipeline(&pipeline, &[]).is_some());
+    }
+
+    /// The arity table is derived from mongod; these pin the rules that are not
+    /// "count the list": the object form, the alias, and the parse-time code.
+    #[test]
+    fn fixed_arity_is_checked_with_mongods_own_wording() {
+        let p = |e: Bson| {
+            expression_problem_in_pipeline(
+                &[stage("$addFields", Bson::Document(doc! {"z": e}))],
+                &[],
+            )
+        };
+        let (code, msg, stage_name) = p(bson::bson!({"$abs": [1, 2]})).unwrap();
+        assert_eq!(code, 16020);
+        assert_eq!(
+            msg,
+            "Expression $abs takes exactly 1 arguments. 2 were passed in."
+        );
+        assert_eq!(stage_name, "$addFields");
+        // A bare argument, a one-element list and a nested expression are all
+        // ONE argument.
+        assert!(p(bson::bson!({"$abs": 5})).is_none());
+        assert!(p(bson::bson!({"$abs": [5]})).is_none());
+        assert!(p(bson::bson!({"$abs": {"$add": [1, 2]}})).is_none());
+        // `$cond`'s object form carries all three arguments and is exempt.
+        assert!(p(bson::bson!({"$cond": {"if": true, "then": 1, "else": 2}})).is_none());
+        assert_eq!(p(bson::bson!({"$cond": [true, 1]})).unwrap().0, 16020);
+        // `$substr` is reported under its canonical name.
+        assert!(p(bson::bson!({"$substr": 1}))
+            .unwrap()
+            .1
+            .starts_with("Expression $substrBytes"));
+    }
+
+    #[test]
+    fn a_one_element_list_is_one_argument_for_the_engine_too() {
+        // The unwrap lives in the engine, so the two agree on what `[x]` means.
+        assert_eq!(secantus_core::expressions::fixed_arity("$abs"), Some(1));
+        assert_eq!(secantus_core::expressions::fixed_arity("$eq"), Some(2));
+        assert_eq!(secantus_core::expressions::fixed_arity("$cond"), Some(3));
+        assert_eq!(secantus_core::expressions::fixed_arity("$add"), None);
     }
 }

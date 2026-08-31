@@ -49,20 +49,16 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             _ => Vec::new(),
         };
         if let Some(Bson::Document(q)) = doc.get("query") {
-            if let Some(var) = argtypes::undefined_variable_in_filter(q, &bound) {
-                return Err(CommandError::new(
-                    17276,
-                    "Location17276",
-                    argtypes::undefined_variable_message(&var, ""),
-                ));
+            if let Some((code, msg)) = argtypes::expression_problem_in_filter(q, &bound) {
+                return Err(CommandError::new(code, format!("Location{code}"), msg));
             }
         }
         if let Some(u) = doc.get("update") {
-            if let Some((var, stage)) = argtypes::undefined_variable_in_update(u, &bound) {
+            if let Some((code, msg, stage)) = argtypes::expression_problem_in_update(u, &bound) {
                 return Err(CommandError::new(
-                    17276,
-                    "Location17276",
-                    argtypes::undefined_variable_message(&var, &stage),
+                    code,
+                    format!("Location{code}"),
+                    argtypes::wrap_expression_problem(&msg, &stage),
                 ));
             }
         }
