@@ -383,6 +383,41 @@ def _undefined_binding(arg: Any, bound: frozenset[str], op: str) -> str | None:
     return _undefined_variable(arg.get("cond" if op == "$filter" else "in"), inner)
 
 
+def undefined_variable_in_filter(filter_doc: Any, bound: frozenset[str]) -> str | None:
+    """The first `$$name` in a QUERY FILTER that names nothing.
+
+    A filter is query language, not an expression: ``{s: "$$NOPE"}`` matches the
+    literal string. Only ``$expr`` holds an expression, and only ``$and`` /
+    ``$or`` / ``$nor`` nest further filters. Conservative for the same reason
+    :func:`undefined_variable_in_pipeline` is -- a false positive would reject a
+    VALID query.
+
+    This is the surface the pipeline walker did not cover: ``find`` / ``count``
+    / ``distinct`` / ``findAndModify`` and the ``q`` of an ``update`` /
+    ``delete`` all take a filter.
+    """
+    if not isinstance(filter_doc, Mapping):
+        return None
+    for key, value in filter_doc.items():
+        if key == "$expr":
+            found = _undefined_variable(value, bound)
+            if found:
+                return found
+        elif key in ("$and", "$or", "$nor") and isinstance(value, list):
+            for sub in value:
+                found = undefined_variable_in_filter(sub, bound)
+                if found:
+                    return found
+    return None
+
+
+def undefined_variable_message(var: str, stage: str) -> str:
+    """mongod's message, with the stage wrapper it uses inside `$project` /
+    `$addFields` / `$set` and no wrapper anywhere else."""
+    msg = f"Use of undefined variable: {var}"
+    return f"Invalid {stage} :: caused by :: {msg}" if stage else msg
+
+
 def undefined_variable_in_pipeline(pipeline: Any, bound: frozenset[str]) -> tuple[str, str] | None:
     """``(variable, stage)`` for the first undefined `$$name`, or ``None``.
 

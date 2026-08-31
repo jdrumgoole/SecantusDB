@@ -1499,6 +1499,29 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [x] **RESOLVED 2026-08-31 — the undefined-`$$variable` check reached only the
+  aggregation pipeline; every other surface still answered a generic error.**
+  The walker landed for `aggregate`; `find` / `count` / `distinct` /
+  `findAndModify` / `update.q` / `delete.q` and pipeline-form updates did not
+  have one, so on the **Rust server all 8 surfaces** answered the storage
+  layer's `BadValue` (2) `query uses a construct the Rust server does not
+  support`, and the **Python server was wrong on 4**.
+
+  **The write path was wrong in SHAPE, not just in code.** mongod reports this
+  per STATEMENT in `writeErrors` and still applies the rest of the batch —
+  `n: 1` with the error at `index: 1`. The Python server raised a command error
+  and failed the whole batch; the Rust server reported code 2 in the
+  writeError. A caller batching updates lost writes mongod would have applied.
+
+  A pipeline-form `u` carries mongod's `Invalid $<stage> :: caused by ::`
+  wrapper; a filter never does.
+
+  The new filter walker descends only into `$expr` and `$and`/`$or`/`$nor` —
+  a filter is query language, so `{s: "$$NOPE"}` matches the literal string and
+  must not be flagged. Pinned by 14 differential cases, four of them
+  false-positive guards.
+
+
 - [x] **RESOLVED 2026-08-31 (partly) — the FIRST operator-by-operator sweep of
   the aggregation EXPRESSION language, and it is not finished.**
   `tools/probes/agg_expressions.py`, 143 operators fed a shared value corpus in

@@ -2088,6 +2088,90 @@ EXPRCMP_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ),
 ]
 
+# The undefined-`$$variable` walker reached the aggregation pipeline; every
+# OTHER surface that takes a filter or an update still answered the storage
+# layer's generic BadValue (2) on the Rust server. `find` / `count` / `distinct`
+# / `findAndModify` error at the command level, while `update` / `delete` report
+# it PER STATEMENT in `writeErrors` -- so an earlier statement in the batch still
+# applies. A pipeline-form update carries the `Invalid $<stage>` wrapper; a
+# filter never does. Probed on mongod 8.2.11.
+UV_SEED = [{"_id": 1, "a": 1, "s": "$$NOPE"}]
+UV_EXPR = {"$expr": {"$eq": ["$$NOPE", 1]}}
+
+
+def _c(cmd: dict) -> Callable[[Database], object]:
+    """Run a raw command, keeping any per-statement writeError."""
+
+    def run(db: Database) -> object:
+        from pymongo.errors import OperationFailure
+
+        try:
+            r = db.command(dict(cmd))
+        except OperationFailure as exc:
+            return f"{exc.code}: {str(exc.details.get('errmsg', ''))}"
+        we = (r.get("writeErrors") or [{}])[0]
+        if we:
+            return f"we{we.get('index')}/{we.get('code')}: {we.get('errmsg')} n={r.get('n')}"
+        return f"ok n={r.get('n')}"
+
+    return run
+
+
+UNDEFVAR_CMD_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    ("find", UV_SEED, _c({"find": "c", "filter": UV_EXPR})),
+    ("find-nested-and", UV_SEED, _c({"find": "c", "filter": {"$and": [UV_EXPR]}})),
+    ("count", UV_SEED, _c({"count": "c", "query": UV_EXPR})),
+    ("distinct", UV_SEED, _c({"distinct": "c", "key": "a", "query": UV_EXPR})),
+    (
+        "fam-query",
+        UV_SEED,
+        _c({"findAndModify": "c", "query": UV_EXPR, "update": {"$set": {"b": 1}}}),
+    ),
+    (
+        "fam-pipeline",
+        UV_SEED,
+        _c({"findAndModify": "c", "query": {}, "update": [{"$set": {"b": "$$NOPE"}}]}),
+    ),
+    (
+        "update-q",
+        UV_SEED,
+        _c({"update": "c", "updates": [{"q": UV_EXPR, "u": {"$set": {"b": 1}}}]}),
+    ),
+    (
+        "update-pipeline",
+        UV_SEED,
+        _c({"update": "c", "updates": [{"q": {}, "u": [{"$set": {"b": "$$NOPE"}}]}]}),
+    ),
+    # The error is per STATEMENT: the first update still applies (`n: 1`).
+    (
+        "update-second-statement",
+        UV_SEED,
+        _c(
+            {
+                "update": "c",
+                "updates": [
+                    {"q": {}, "u": {"$set": {"ok": 1}}},
+                    {"q": UV_EXPR, "u": {"$set": {"b": 1}}},
+                ],
+            }
+        ),
+    ),
+    ("delete-q", UV_SEED, _c({"delete": "c", "deletes": [{"q": UV_EXPR, "limit": 0}]})),
+    # False-positive guards: a filter is query language, and `let` binds.
+    ("ok-literal-in-filter", UV_SEED, _c({"find": "c", "filter": {"s": "$$NOPE"}})),
+    (
+        "ok-command-let",
+        UV_SEED,
+        _c({"find": "c", "filter": {"$expr": {"$eq": ["$$cv", 1]}}, "let": {"cv": 1}}),
+    ),
+    ("ok-plain-find", UV_SEED, _c({"find": "c", "filter": {"a": 1}})),
+    (
+        "ok-plain-update",
+        UV_SEED,
+        _c({"update": "c", "updates": [{"q": {"a": 1}, "u": {"$set": {"b": 2}}}]}),
+    ),
+]
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
@@ -2103,6 +2187,7 @@ ALL_CASES = (
     + [("remove", c) for c in REMOVE_CASES]
     + [("propagate", c) for c in PROPAGATE_CASES]
     + [("exprcmp", c) for c in EXPRCMP_CASES]
+    + [("undefvarcmd", c) for c in UNDEFVAR_CMD_CASES]
 )
 
 
