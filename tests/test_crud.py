@@ -2998,7 +2998,7 @@ def test_find_by_id_returns_correct_doc(coll) -> None:
 def test_explain_find_with_hint_uses_hinted_index(coll) -> None:
     coll.create_index("n")
     coll.insert_many([{"_id": i, "n": i} for i in range(5)])
-    plan = coll.find({"n": 2}).hint("$natural").explain()["queryPlanner"]["winningPlan"]
+    plan = coll.find({"n": 2}).hint([("$natural", 1)]).explain()["queryPlanner"]["winningPlan"]
     assert plan["stage"] == "COLLSCAN"
 
 
@@ -3616,10 +3616,52 @@ def test_find_with_unknown_hint_returns_bad_value(coll) -> None:
 
 
 def test_find_with_natural_hint_is_collection_scan(coll) -> None:
+    """The DOCUMENT form is what mongod takes -- see the string case below."""
     coll.create_index("x")
     coll.insert_many([{"_id": i, "x": i} for i in range(3)])
-    docs = list(coll.find({"x": 1}, hint="$natural"))
+    docs = list(coll.find({"x": 1}, hint={"$natural": 1}))
     assert [d["_id"] for d in docs] == [1]
+
+
+def test_natural_hint_reversed_walks_backwards(coll) -> None:
+    """`{$natural: -1}` is reverse insertion order, not forward.
+
+    The direction is part of the hint. Both servers collapsed the two onto one
+    token at some point, which returned forward order for a caller who asked
+    for reverse -- silently wrong data rather than an error. Probed 8.2.11.
+    """
+    coll.insert_many([{"_id": i} for i in range(5)])
+    assert [d["_id"] for d in coll.find({}, hint={"$natural": -1})] == [4, 3, 2, 1, 0]
+    assert [d["_id"] for d in coll.find({}, hint={"$natural": 1})] == [0, 1, 2, 3, 4]
+
+
+def test_natural_hint_as_a_string_is_rejected(coll) -> None:
+    """mongod takes only the document form; the string is a BadValue.
+
+    `pymongo`'s `.hint("$natural")` produces exactly this string, so accepting
+    it meant the natural call scanned here and errored against a real server.
+    Re-probed 8.2.11 (2026-08-31) across every command that takes a hint.
+    """
+    coll.insert_many([{"_id": i, "x": i} for i in range(3)])
+    with pytest.raises(pymongo.errors.OperationFailure) as exc:
+        list(coll.find({"x": 1}, hint="$natural"))
+    assert exc.value.code == 2
+
+
+def test_distinct_rejects_a_hint_naming_no_index(coll) -> None:
+    """`distinct` resolves its hint like every other read.
+
+    It was the one hint-bearing command that never did, so a bogus hint
+    silently returned full results where mongod refuses the command. A VALID
+    hint is still accepted -- that half was already right. Probed 8.2.11.
+    """
+    coll.create_index("x")
+    coll.insert_many([{"_id": i, "x": i % 2} for i in range(4)])
+    assert sorted(coll.distinct("x", hint="x_1")) == [0, 1]
+    assert sorted(coll.distinct("x", hint={"x": 1})) == [0, 1]
+    with pytest.raises(pymongo.errors.OperationFailure) as exc:
+        coll.distinct("x", hint="nonexistent_1")
+    assert exc.value.code == 2
 
 
 def test_aggregate_with_hint(coll) -> None:

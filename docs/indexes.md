@@ -186,10 +186,17 @@ ASC or DESC. Multi-field sort still falls back to in-memory `sort_docs`
 | --- | --- |
 | Index name string | Walk that index |
 | Key-spec dict matching an index | Walk that index |
-| `"$natural"` | Force collection scan |
+| `{$natural: 1}` | Force collection scan (insertion order) |
+| `{$natural: -1}` | Force collection scan, reverse insertion order |
 | `"_id_"` / `{_id: 1}` | Walk doc table order |
 
-An unknown hint surfaces as a `BadValue` (code 2) error to the client.
+An unknown hint surfaces as a `BadValue` (code 2) error to the client. So does
+the **string** `"$natural"`: MongoDB accepts `$natural` only in the document
+form above, and SecantusDB matches it. Note that `pymongo`'s
+`.hint("$natural")` produces the string — use `.hint([("$natural", 1)])` or
+`hint={"$natural": 1}` instead, which is what a real server requires too.
+
+Every command that takes a `hint` resolves it, `distinct` included.
 The hint can also align with the sort spec to skip the post-sort step.
 
 `aggregate` lifts a leading `$match` stage into the initial fetch's filter
@@ -283,7 +290,7 @@ without `sort` walk in this order, matching `mongod`.
 | `{"arr.field": v}` into an array of subdocuments | Per-element entry |
 | `{partial_filter_keys, ...index_keys}` | Partial-index path |
 | Sort `{f: ±1}` aligned with an index leading field | B-tree walk in (reversed) order, no post-sort |
-| `hint` | Forces a specific index / `$natural` |
+| `hint` | Forces a specific index / `{$natural: ±1}` |
 
 ## Acceleration summary across index types
 

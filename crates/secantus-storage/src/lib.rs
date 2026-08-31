@@ -1253,6 +1253,13 @@ pub enum Hint {
 enum ResolvedHint {
     /// `$natural` — force a collection scan.
     Natural,
+    /// `{$natural: -1}` — a collection scan walked BACKWARDS. The direction is
+    /// part of the hint: mongod returns [5,4,3,2,1] where `{$natural: 1}`
+    /// returns [1,2,3,4,5]. Collapsing both onto `Natural` dropped it, so a
+    /// caller asking for reverse insertion order silently got forward order.
+    /// The Python server fixed this in the 2026-08-29 index sweep; this port
+    /// did not, so the two servers disagreed until 2026-08-31.
+    NaturalReverse,
     /// The virtual `_id_` index (doc-table order).
     IdIndex,
     /// A stored index by name.
@@ -10879,7 +10886,7 @@ impl Storage {
                 Err(e) => return Err(e),
             };
             return match resolved {
-                ResolvedHint::Natural => Ok(ExplainPlan::CollScan),
+                ResolvedHint::Natural | ResolvedHint::NaturalReverse => Ok(ExplainPlan::CollScan),
                 ResolvedHint::IdIndex => {
                     let direction = if sort_field == Some("_id") && sort_dir == -1 {
                         "backward"
@@ -10952,9 +10959,14 @@ impl Storage {
     ) -> Result<ResolvedHint> {
         match hint {
             Hint::Name(s) => {
-                if s == "$natural" {
-                    return Ok(ResolvedHint::Natural);
-                }
+                // NOT `"$natural"`. mongod takes only the DOCUMENT form
+                // (`{$natural: 1}` / `{$natural: -1}`) and answers BadValue for
+                // the string -- re-probed 8.2.11 (2026-08-31). We accepted it
+                // as a documented convenience, so `pymongo`'s natural
+                // `.hint("$natural")` scanned here and errored against a real
+                // server. `ResolvedHint::Natural` is still the resolved value
+                // of the document form; only user input of the string is
+                // refused. Mirrors `storage._resolve_hint`.
                 if s == ID_INDEX_NAME {
                     return Ok(ResolvedHint::IdIndex);
                 }
@@ -10969,6 +10981,12 @@ impl Storage {
             }
             Hint::KeySpec(spec) => {
                 if spec.len() == 1 && spec.contains_key("$natural") {
+                    // The DIRECTION is part of the hint -- see `NaturalReverse`.
+                    // A non-numeric value is not a direction; mongod treats the
+                    // hint as forward, which is what `direction_of`'s None does.
+                    if spec.get("$natural").and_then(direction_of) == Some(-1) {
+                        return Ok(ResolvedHint::NaturalReverse);
+                    }
                     return Ok(ResolvedHint::Natural);
                 }
                 if spec.len() == 1 && spec.get("_id").and_then(direction_of) == Some(1) {
@@ -11000,6 +11018,11 @@ impl Storage {
         match resolved {
             // `$natural` is insertion order — walk the natural-order index.
             ResolvedHint::Natural => Ok((self.scan_blobs_natural(session, db, coll)?, false)),
+            ResolvedHint::NaturalReverse => {
+                let mut blobs = self.scan_blobs_natural(session, db, coll)?;
+                blobs.reverse();
+                Ok((blobs, false))
+            }
             ResolvedHint::IdIndex => {
                 // The doc table is keyed by id_key, so this scan IS _id order.
                 let mut docs = self.scan_blobs(session, db, coll)?;

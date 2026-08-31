@@ -418,11 +418,13 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     let storage = ctx.storage()?;
     let deletes = array_field(doc, "deletes");
-    for spec in deletes.iter() {
-        if let Bson::Document(spec) = spec {
-            crate::util::validate_write_hint(storage, &ctx.db_name, &coll, spec.get("hint"))?;
-        }
-    }
+    // NOTE: an unresolvable `hint` is a PER-STATEMENT writeError, not a
+    // command-level failure. mongod answers `ok: 1` with
+    // `writeErrors: [{index, code: 2}]` and applies the other statements in the
+    // batch; returning `Err` here failed the whole command and reported no
+    // `n`. Probed 8.2.11 (2026-08-31) against a bogus index name on both
+    // `delete` and `update`. Validation therefore lives in the loop below,
+    // beside the other per-statement checks, and not in a pre-pass.
     let ordered = bool_field(doc, "ordered", true);
 
     let mut n = 0_i32;
@@ -451,6 +453,21 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     continue;
                 }
             }
+        }
+        // An unresolvable `hint` fails THIS statement, not the batch (see the
+        // note above the loop).
+        if let Err(e) =
+            crate::util::validate_write_hint(storage, &ctx.db_name, &coll, spec.get("hint"))
+        {
+            write_errors.push(Bson::Document(doc! {
+                "index": index as i32,
+                "code": e.code,
+                "errmsg": e.errmsg.clone(),
+            }));
+            if ordered {
+                break;
+            }
+            continue;
         }
         let filter = doc_field(spec, "q");
         // `collation` is per-delete-statement (inside each `deletes[]` entry).
@@ -691,11 +708,13 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "update")?;
     let storage = ctx.storage()?;
     let updates = array_field(doc, "updates");
-    for spec in updates.iter() {
-        if let Bson::Document(spec) = spec {
-            crate::util::validate_write_hint(storage, &ctx.db_name, &coll, spec.get("hint"))?;
-        }
-    }
+    // NOTE: an unresolvable `hint` is a PER-STATEMENT writeError, not a
+    // command-level failure. mongod answers `ok: 1` with
+    // `writeErrors: [{index, code: 2}]` and applies the other statements in the
+    // batch; returning `Err` here failed the whole command and reported no
+    // `n`. Probed 8.2.11 (2026-08-31) against a bogus index name on both
+    // `delete` and `update`. Validation therefore lives in the loop below,
+    // beside the other per-statement checks, and not in a pre-pass.
     let ordered = bool_field(doc, "ordered", true);
 
     let mut n = 0_i32;
@@ -753,6 +772,22 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         argtypes::require_object(spec, "collation", "update.updates.collation")?;
         argtypes::require_array(spec, "arrayFilters", "update.updates.arrayFilters")?;
         argtypes::require_hint(spec, "hint")?;
+
+        // An unresolvable `hint` fails THIS statement, not the batch (see the
+        // note above the loop).
+        if let Err(e) =
+            crate::util::validate_write_hint(storage, &ctx.db_name, &coll, spec.get("hint"))
+        {
+            write_errors.push(Bson::Document(doc! {
+                "index": index as i32,
+                "code": e.code,
+                "errmsg": e.errmsg.clone(),
+            }));
+            if ordered {
+                break;
+            }
+            continue;
+        }
 
         // MongoDB 8.0's per-spec `sort`: match in sort order and update the
         // FIRST one. Probed on 8.2.11 -- `multi: true` is rejected, and an

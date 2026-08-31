@@ -3590,7 +3590,23 @@ def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         }
     collation = doc.get("collation")
     collation_obj = _parse_collation(collation)
-    matched = ctx.storage.find_matching(ctx.db_name, coll, filter_, collation=collation)
+    # `distinct` takes a hint like every other read, and mongod REFUSES the
+    # command when it names no index rather than falling back to a scan
+    # (probed 8.2.11, 2026-08-31: code 2, where a valid index name or key spec
+    # is accepted). This was the only hint-bearing command that never resolved
+    # the field -- find / count / aggregate / findAndModify / delete / update
+    # all did -- so a bogus hint silently returned full results. Routing
+    # through `find_matching` validates AND honours the hint, which matters for
+    # a sparse index: hinting one distinct-s only the docs present in it, the
+    # same way `count` does.
+    from secantus.storage import BadHint
+
+    try:
+        matched = ctx.storage.find_matching(
+            ctx.db_name, coll, filter_, hint=doc.get("hint"), collation=collation
+        )
+    except BadHint as exc:
+        return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
     seen: list[Any] = []
     seen_keys: set[Any] = set()
 
@@ -3718,6 +3734,11 @@ def _require_number_bson_field(value: Any, field_path: str) -> dict[str, Any] | 
 # around; 8.x is the target, so there is nothing to hedge. The differential gate
 # still probes an always-unknown field rather than this one, since this slot's
 # status is the thing that changed between versions.
+#
+# Accepting the FIELD is only half of it, and the half this comment used to
+# stop at: mongod also RESOLVES the value, and refuses the command when it
+# names no index (probed 8.2.11, 2026-08-31). Being in this set stops the
+# unknown-field check firing; `_distinct` is what validates the value.
 _DISTINCT_KNOWN_FIELDS = frozenset(
     {
         "distinct",

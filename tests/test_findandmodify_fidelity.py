@@ -308,7 +308,13 @@ def test_unknown_hint_is_rejected(db) -> None:
 
 
 def test_natural_hint_is_not_valid_here(db) -> None:
-    """Unlike `find`, findAndModify rejects `$natural` (probed 6.0.16)."""
+    """findAndModify rejects the `$natural` STRING (re-probed 8.2.11).
+
+    This used to say "unlike `find`" -- `find` accepted the string as a
+    documented convenience while this command rejected it, which is how the
+    inconsistency was discovered. Both reject it now; mongod takes only the
+    document form.
+    """
     db.c.insert_one({"_id": 1, "n": 5})
     with pytest.raises(pymongo.errors.OperationFailure) as exc:
         _fam(db, query={"_id": 1}, update={"$set": {"n": 1}}, hint="$natural")

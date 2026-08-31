@@ -754,7 +754,7 @@ def test_hint_natural_uses_collection_scan(storage: Storage, monkeypatch) -> Non
     storage.create_index("db", "c", "x_1", {"x": 1}, {})
     storage.insert("db", "c", [{"_id": i, "x": i} for i in range(3)])
     calls = _spy_scans(storage, monkeypatch)
-    docs = storage.find_matching("db", "c", {"x": 1}, hint="$natural")
+    docs = storage.find_matching("db", "c", {"x": 1}, hint={"$natural": 1})
     assert [d["_id"] for d in docs] == [1]
     assert calls != []
 
@@ -1366,7 +1366,7 @@ def test_explain_plan_hint_by_keyspec(storage: Storage) -> None:
 
 def test_explain_plan_hint_natural_is_collscan(storage: Storage) -> None:
     storage.create_index("db", "c", "x_1", {"x": 1}, {})
-    plan = storage.explain_plan("db", "c", {"x": 5}, hint="$natural")
+    plan = storage.explain_plan("db", "c", {"x": 5}, hint={"$natural": 1})
     assert plan == {"kind": "COLLSCAN"}
 
 
@@ -1938,7 +1938,7 @@ def test_multi_field_sort_uses_compound_index(storage: Storage) -> None:
     assert plan["direction"] == "forward"
 
     indexed = storage.find_matching("db", "c", {}, sort={"a": 1, "b": 1})
-    scanned = storage.find_matching("db", "c", {}, sort={"a": 1, "b": 1}, hint="$natural")
+    scanned = storage.find_matching("db", "c", {}, sort={"a": 1, "b": 1}, hint={"$natural": 1})
     assert [(d["a"], d["b"]) for d in indexed] == [(d["a"], d["b"]) for d in scanned]
 
 
@@ -1955,7 +1955,7 @@ def test_multi_field_sort_walks_backward_for_inverted_directions(
     assert plan["direction"] == "backward"
 
     indexed = storage.find_matching("db", "c", {}, sort={"a": -1, "b": -1})
-    scanned = storage.find_matching("db", "c", {}, sort={"a": -1, "b": -1}, hint="$natural")
+    scanned = storage.find_matching("db", "c", {}, sort={"a": -1, "b": -1}, hint={"$natural": 1})
     assert [(d["a"], d["b"]) for d in indexed] == [(d["a"], d["b"]) for d in scanned]
 
 
@@ -1985,7 +1985,7 @@ def test_multi_field_sort_mixed_direction_index_matches(storage: Storage) -> Non
     assert plan["direction"] == "forward"
 
     indexed = storage.find_matching("db", "c", {}, sort={"a": 1, "b": -1})
-    scanned = storage.find_matching("db", "c", {}, sort={"a": 1, "b": -1}, hint="$natural")
+    scanned = storage.find_matching("db", "c", {}, sort={"a": 1, "b": -1}, hint={"$natural": 1})
     assert [(d["a"], d["b"]) for d in indexed] == [(d["a"], d["b"]) for d in scanned]
 
 
@@ -2206,7 +2206,9 @@ def test_rename_keeps_secondary_index_reachable(storage: Storage) -> None:
     assert ok, err
 
     via_index = storage.find_matching("db", "dst", {"x": 1}, hint="x_1")
-    via_scan = [d for d in storage.find_matching("db", "dst", {}, hint="$natural") if d["x"] == 1]
+    via_scan = [
+        d for d in storage.find_matching("db", "dst", {}, hint={"$natural": 1}) if d["x"] == 1
+    ]
     assert sorted(d["_id"] for d in via_index) == sorted(d["_id"] for d in via_scan) == [1, 4, 7]
     # And the destination is still writable through the index.
     storage.insert("db", "dst", [{"_id": 99, "x": 1}])
