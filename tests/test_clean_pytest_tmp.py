@@ -1,4 +1,10 @@
-"""``invoke clean``'s sweep of abandoned pytest temp trees.
+"""The sweep of abandoned pytest temp trees.
+
+Two callers: ``invoke clean`` (explicit, reports the bytes it freed) and
+``tests/conftest.py``'s ``pytest_sessionstart`` (automatic, skips the sizing
+walk). The automatic one is what stops the backlog returning -- ``invoke
+clean`` could always fix this, but only when somebody remembered to run it.
+
 
 This suite pins ``tmp_path_retention_policy = "all"`` (deleting a passed
 test's ``tmp_path`` mid-session races WiredTiger into ``WT_PANIC`` — see
@@ -104,3 +110,80 @@ def test_symlinks_and_foreign_names_are_left_alone(tmp_path: Path) -> None:
 
 def test_missing_root_is_a_noop(tmp_path: Path) -> None:
     assert python_tasks._sweep_stale_pytest_tmp(str(tmp_path / "nope")) == (0, 0)
+
+
+def test_measure_false_skips_sizing_but_still_reaps(tmp_path: Path) -> None:
+    """The session-start caller wants the deletion, not the byte count.
+
+    Sizing walks every file to produce ``invoke clean``'s summary line, which
+    doubles the I/O on a big backlog -- and the backlog is exactly when the
+    automatic sweep fires.
+    """
+    root = tmp_path / f"pytest-of-{__import__('getpass').getuser()}"
+    root.mkdir()
+    runs = [_make_run(root, n, lock_pid=None) for n in range(1, 7)]
+    for i, d in enumerate(runs):
+        os.utime(d, (1_000_000 + i, 1_000_000 + i))
+
+    reaped, freed = python_tasks._sweep_stale_pytest_tmp(str(tmp_path), measure=False)
+
+    assert reaped == 3, reaped
+    assert freed == 0, "measure=False must not walk the trees"
+    survivors = sorted(p.name for p in root.iterdir())
+    assert survivors == ["pytest-4", "pytest-5", "pytest-6"], survivors
+
+
+def test_session_start_reaper_is_controller_only(monkeypatch) -> None:
+    """xdist workers must not each redo the sweep and race one another.
+
+    Twelve workers all reaping the same tree would have them deleting each
+    other's candidates mid-``rmtree``.
+    """
+    import conftest
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        python_tasks, "_sweep_stale_pytest_tmp", lambda *a, **k: calls.append("swept") or (0, 0)
+    )
+    monkeypatch.delenv("SECANTUS_NO_TMP_REAP", raising=False)
+
+    class _Worker:
+        workerinput = {"workerid": "gw3"}
+
+    class _Controller:
+        pass
+
+    conftest._reap_abandoned_pytest_tmp(_Worker())
+    assert calls == [], "an xdist worker ran the sweep"
+
+    conftest._reap_abandoned_pytest_tmp(_Controller())
+    assert calls == ["swept"], "the controller did not run the sweep"
+
+
+def test_session_start_reaper_never_raises(monkeypatch, tmp_path: Path) -> None:
+    """Housekeeping must never fail a test run, whatever goes wrong."""
+    import conftest
+
+    class _Cfg:
+        pass  # no workerinput -> the controller path
+
+    def _boom(*a, **k):
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(python_tasks, "_sweep_stale_pytest_tmp", _boom)
+    conftest._reap_abandoned_pytest_tmp(_Cfg())  # must not raise
+
+
+def test_session_start_reaper_respects_the_opt_out(monkeypatch) -> None:
+    import conftest
+
+    class _Cfg:
+        pass
+
+    calls: list[int] = []
+    monkeypatch.setenv("SECANTUS_NO_TMP_REAP", "1")
+    monkeypatch.setattr(
+        python_tasks, "_sweep_stale_pytest_tmp", lambda *a, **k: calls.append(1) or (0, 0)
+    )
+    conftest._reap_abandoned_pytest_tmp(_Cfg())
+    assert calls == [], "opt-out did not prevent the sweep"
