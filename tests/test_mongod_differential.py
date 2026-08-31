@@ -1883,6 +1883,80 @@ UNDEFVAR_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ),
 ]
 
+# `$$REMOVE` IS the missing value — probed 9-for-9 against the equivalent absent
+# field path, in every position. It used to be a marker of its own, which leaked:
+# `{arr: [1, "$$REMOVE", 2]}` reached `bson.encode` and CRASHED the command,
+# `$type` answered "object", `$concat` raised 16702, and the Rust engine deferred
+# the variable entirely (a generic BadValue on a server with no Python). The
+# `twin-` cases pair each shape with its absent-path equivalent: the two must
+# stay identical, which is the whole claim being pinned.
+TWO_FIELDS = [{"_id": 1, "a": 1, "b": 2}]
+
+
+def _af(spec: dict) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(db, [{"$addFields": spec}])
+
+
+REMOVE_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    ("project", TWO_FIELDS, lambda db: _agg_err_full(db, [{"$project": {"x": "$$REMOVE"}}])),
+    (
+        "project-keeps-others",
+        TWO_FIELDS,
+        lambda db: _agg_err_full(db, [{"$project": {"a": 1, "x": "$$REMOVE"}}]),
+    ),
+    ("addfields", TWO_FIELDS, _af({"x": "$$REMOVE"})),
+    ("set-existing", TWO_FIELDS, _af({"a": "$$REMOVE"})),
+    (
+        "replacewith",
+        TWO_FIELDS,
+        lambda db: _agg_err_full(db, [{"$replaceWith": {"k": "$$REMOVE", "j": 1}}]),
+    ),
+    ("group-id", TWO_FIELDS, lambda db: _agg_err_full(db, [{"$group": {"_id": "$$REMOVE"}}])),
+    (
+        "group-acc",
+        TWO_FIELDS,
+        lambda db: _agg_err_full(db, [{"$group": {"_id": None, "s": {"$sum": "$$REMOVE"}}}]),
+    ),
+    ("nested-doc", TWO_FIELDS, _af({"o": {"p": "$$REMOVE", "q": 1}})),
+    # Crashed the Python server: the marker reached bson.encode.
+    ("in-array", TWO_FIELDS, _af({"arr": [1, "$$REMOVE", 2]})),
+    (
+        "let-binding",
+        TWO_FIELDS,
+        lambda db: _agg_err_full(
+            db, [{"$project": {"x": {"$let": {"vars": {"v": "$$REMOVE"}, "in": "$$v"}}}}]
+        ),
+    ),
+    ("ifnull", TWO_FIELDS, _af({"x": {"$ifNull": ["$$REMOVE", 9]}})),
+    ("eq-null", TWO_FIELDS, _af({"x": {"$eq": ["$$REMOVE", None]}})),
+    ("type", TWO_FIELDS, _af({"x": {"$type": "$$REMOVE"}})),
+    ("concat", TWO_FIELDS, _af({"x": {"$concat": ["s", "$$REMOVE"]}})),
+    ("sum-pair", TWO_FIELDS, _af({"x": {"$sum": ["$$REMOVE", 1]}})),
+    # `$setField` removes for `$$REMOVE` AND for an absent path; only an
+    # explicit null writes a null. The null form was rejected outright.
+    (
+        "setfield-remove",
+        TWO_FIELDS,
+        _af({"d": {"$setField": {"field": "a", "input": "$$ROOT", "value": "$$REMOVE"}}}),
+    ),
+    (
+        "setfield-absent",
+        TWO_FIELDS,
+        _af({"d": {"$setField": {"field": "a", "input": "$$ROOT", "value": "$nosuch"}}}),
+    ),
+    (
+        "setfield-null",
+        TWO_FIELDS,
+        _af({"d": {"$setField": {"field": "a", "input": "$$ROOT", "value": None}}}),
+    ),
+    # The absent-path twins: each must answer exactly what its `$$REMOVE` pair does.
+    ("twin-array", TWO_FIELDS, _af({"arr": [1, "$nosuch", 2]})),
+    ("twin-type", TWO_FIELDS, _af({"x": {"$type": "$nosuch"}})),
+    ("twin-ifnull", TWO_FIELDS, _af({"x": {"$ifNull": ["$nosuch", 9]}})),
+    ("twin-concat", TWO_FIELDS, _af({"x": {"$concat": ["s", "$nosuch"]}})),
+    ("twin-nested-doc", TWO_FIELDS, _af({"o": {"p": "$nosuch", "q": 1}})),
+]
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
@@ -1895,6 +1969,7 @@ ALL_CASES = (
     + [("aggerr", c) for c in AGGERR_CASES]
     + [("redact", c) for c in REDACT_CASES]
     + [("undefvar", c) for c in UNDEFVAR_CASES]
+    + [("remove", c) for c in REMOVE_CASES]
 )
 
 

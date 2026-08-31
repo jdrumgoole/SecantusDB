@@ -147,6 +147,14 @@ fn eval_field_value(expr: &Bson, ctx: &Ctx) -> R {
                     .unwrap_or(Bson::Undefined));
             }
         }
+        // `$$REMOVE` IS the missing value -- probed 9-for-9 against mongod
+        // 8.2.11, in every position, against the equivalent absent field path.
+        // So it follows the same two-position rule as one: the missing marker
+        // here, `null` in `eval`. This whole variable used to defer to Python,
+        // which on a server with no Python is a generic BadValue.
+        if s == "$$REMOVE" {
+            return Ok(Bson::Undefined);
+        }
     }
     eval(expr, ctx)
 }
@@ -160,6 +168,12 @@ fn resolve_var(name: &str, ctx: &Ctx) -> R {
         v.clone()
     } else if base == "ROOT" || base == "CURRENT" {
         Bson::Document(ctx.doc.clone())
+    } else if base == "REMOVE" {
+        // Value position: an absent field path is `null` here, and `$$REMOVE`
+        // is exactly an absent field path. `eval_field_value` returns the
+        // missing marker for the field-value position, which is what makes
+        // `$project` / `$addFields` omit the key.
+        Bson::Null
     } else {
         // `$$KEEP` / `$$PRUNE` / `$$DESCEND` deliberately fall through here.
         // They are NOT globally-defined variables: mongod binds them only while
@@ -170,8 +184,7 @@ fn resolve_var(name: &str, ctx: &Ctx) -> R {
         // `"$$KEEP"` indistinguishable from the sentinel, so `$redact: "$field"`
         // over caller-controlled content kept a document mongod refuses to.
         // `aggregate::redact_stage` binds them for its own evaluation.
-        // $$REMOVE (tied to unported $setField/$project-remove) and undefined
-        // vars (Python raises) -> Python.
+        // Undefined vars (Python raises) -> Python.
         return Err(Fallback);
     };
     match rest {
@@ -1650,10 +1663,16 @@ fn op_set_field(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Document(mut doc) = input else {
         return Err(Fallback); // non-document input -> Python raises
     };
-    // value $$REMOVE makes eval defer (resolve_var returns Fallback), so the
-    // field-drop case is handled by the pure-Python path.
-    let value = eval(ve, ctx)?;
-    doc.insert(field, value);
+    // FIELD-VALUE position: mongod REMOVES the field for `$$REMOVE` and for an
+    // absent path (`value: "$nosuch"` -- probed 8.2.11), while an explicit null
+    // writes a null. This used to use `eval`, where `$$REMOVE` deferred to
+    // Python and an absent path wrote a null.
+    let value = eval_field_value(ve, ctx)?;
+    if matches!(value, Bson::Undefined) {
+        doc.remove(&field);
+    } else {
+        doc.insert(field, value);
+    }
     Ok(Bson::Document(doc))
 }
 
@@ -3775,6 +3794,10 @@ fn type_name(v: &Bson) -> &'static str {
 /// `"missing"` (mongod distinguishes an absent field from an explicit null).
 fn op_type(arg: &Bson, ctx: &Ctx) -> R {
     if let Bson::String(s) = arg {
+        // `$$REMOVE` IS the missing value -- probed.
+        if s == "$$REMOVE" {
+            return Ok(Bson::String("missing".into()));
+        }
         if let Some(path) = s.strip_prefix('$') {
             if !path.starts_with('$') && crate::paths::get_path(ctx.doc, path).is_none() {
                 return Ok(Bson::String("missing".into()));
