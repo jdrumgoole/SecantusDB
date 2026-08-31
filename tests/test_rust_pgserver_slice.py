@@ -210,9 +210,15 @@ def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
         ("CREATE TABLE t (id int PRIMARY KEY)", "42P07"),
         # Unsupported must be an honest 0A000 -- never a wrong row. There is no
         # fallback into Python by design.
-        ("SELECT count(*) FROM t GROUP BY n", "0A000"),
         ("SELECT * FROM t JOIN t AS u ON t.id = u.id", "0A000"),
-        ("SELECT * FROM t WHERE NOT (n = 1)", "0A000"),
+        ("SELECT avg(n) FROM t", "0A000"),
+        ("SELECT n, count(*) FROM t", "42803"),
+        ("SELECT * FROM t WHERE n LIKE 'x'", "0A000"),
+        ("SELECT * FROM t ORDER BY n + 1", "0A000"),
+        # The PK is the document's `_id`, which storage treats as immutable.
+        ("UPDATE t SET id = 2 WHERE id = 1", "0A000"),
+        ("UPDATE t SET nope = 1", "42703"),
+        ("DELETE FROM missing", "42P01"),
     ],
 )
 def test_refusals_carry_the_right_sqlstate(home: Path, sql: str, sqlstate: str) -> None:
@@ -245,3 +251,48 @@ def test_acknowledged_writes_survive_sigterm(home: Path) -> None:
     # Nothing above ran a checkpoint explicitly; only the signal handler can
     # have flushed this.
     assert _python_sql(home, "SELECT id, n FROM durable ORDER BY id") == [(1, 10), (2, 20)]
+
+
+def test_order_limit_offset_and_dml(home: Path) -> None:
+    """The P5 slice end to end over the wire.
+
+    Every expectation here was checked against a live PostgreSQL 14; the
+    exhaustive comparison lives in `test_rust_pgserver_differential.py`.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t (id int PRIMARY KEY, n int, s text)")
+        cur.execute("INSERT INTO t VALUES (1,3,'c'),(2,NULL,'a'),(3,1,NULL),(4,2,'b')")
+
+        # PostgreSQL puts NULLs LAST on ASC and FIRST on DESC. MongoDB sorts
+        # null LOW, so getting this wrong reorders every nullable column.
+        cur.execute("SELECT id FROM t ORDER BY n")
+        assert [r[0] for r in cur.fetchall()] == [3, 4, 1, 2]
+        cur.execute("SELECT id FROM t ORDER BY n DESC")
+        assert [r[0] for r in cur.fetchall()] == [2, 1, 4, 3]
+        cur.execute("SELECT id FROM t ORDER BY n ASC NULLS FIRST")
+        assert [r[0] for r in cur.fetchall()] == [2, 3, 4, 1]
+
+        cur.execute("SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1")
+        assert [r[0] for r in cur.fetchall()] == [2, 3]
+
+        # Three-valued logic: the NULL row is excluded by <> and by NOT IN.
+        cur.execute("SELECT id FROM t WHERE n <> 1")
+        assert sorted(r[0] for r in cur.fetchall()) == [1, 4]
+        cur.execute("SELECT id FROM t WHERE n NOT IN (1)")
+        assert sorted(r[0] for r in cur.fetchall()) == [1, 4]
+        cur.execute("SELECT id FROM t WHERE n NOT IN (1, NULL)")
+        assert cur.fetchall() == []
+        cur.execute("SELECT id FROM t WHERE NOT (n = 1)")
+        assert sorted(r[0] for r in cur.fetchall()) == [1, 4]
+
+        # UPDATE's row count is rows MATCHED, as PostgreSQL reports.
+        cur.execute("UPDATE t SET s = 'z' WHERE n > 1")
+        assert cur.rowcount == 2
+        cur.execute("SELECT id FROM t WHERE s = 'z'")
+        assert sorted(r[0] for r in cur.fetchall()) == [1, 4]
+
+        cur.execute("DELETE FROM t WHERE n IS NULL")
+        assert cur.rowcount == 1
+        cur.execute("SELECT id FROM t")
+        assert sorted(r[0] for r in cur.fetchall()) == [1, 3, 4]

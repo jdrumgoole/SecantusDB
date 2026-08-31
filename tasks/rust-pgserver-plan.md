@@ -1,6 +1,11 @@
 # Plan: a Rust PostgreSQL server
 
-> **Status: P0 PASSED and P1 VERTICAL SLICE LANDED, 2026-08-31. P2+ not started.**
+> **Status: P0 PASSED, P1 LANDED, P5 STARTED, 2026-08-31.**
+> P5's first batch added ORDER BY / LIMIT / OFFSET, UPDATE, DELETE, the
+> three-valued predicates and the count/sum/min/max aggregates with GROUP BY,
+> pinned by a 109-case differential against a live PostgreSQL (§0.7). P2
+> (session/auth) is still not started.
+>
 > P1 shipped `secantus-pgcatalog` / `secantus-pgplan` / `secantus-pgserver` and
 > the `secantusd-pg` binary: CREATE TABLE, INSERT and single-table SELECT over
 > **real `secantus-storage`**, with the cross-server catalog contract proven in
@@ -113,6 +118,72 @@ result matters as much as the first: an unsupported construct returns an honest
 Note for P1: `pgwire`'s **default features pull `aws-lc-rs`**, a second C crypto
 build. `default-features = false, features = ["server-api"]` avoids it; match
 whatever rustls backend the Mongo server already uses rather than adding one.
+
+### 0.7 P5, first batch (2026-08-31): three-valued logic is where the bugs are
+
+Added: `ORDER BY` (direction + `NULLS FIRST/LAST`), `LIMIT`, `OFFSET`,
+`UPDATE`, `DELETE`, `IS [NOT] NULL`, `IN`, `NOT IN`, `BETWEEN`, `NOT BETWEEN`,
+`NOT`. Pinned by `tests/test_rust_pgserver_differential.py` — **83 statements
+run against a live PostgreSQL 14 and ours, compared verbatim**.
+
+**Every bug in this batch was a NULL bug, and every one returned wrong ROWS
+rather than an error:**
+
+| construct | MQL's answer | PostgreSQL's | fix |
+|---|---|---|---|
+| `ORDER BY n` (ASC) | null sorts LOW → first | NULLs **LAST** | sort in Rust, do not push down |
+| `ORDER BY n DESC` | null sorts LOW → last | NULLs **FIRST** | same |
+| `n <> 1` | `$ne` matches null → row returned | NULL excluded | explicit `$ne: null` guard |
+| `n NOT IN (1)` | `$nin` matches null | NULL excluded | same guard |
+| `n NOT IN (1, NULL)` | matches rows | **nothing** matches | short-circuit to match-nothing |
+
+`NOT` is lowered by **pushing the negation into the leaves**, not by wrapping:
+MQL has no operator meaning SQL's `NOT` (`$nor` matches missing-or-null). De
+Morgan is valid in Kleene logic, so the descent is exact, and every leaf it
+reaches is already NULL-correct.
+
+**The magic-number lesson repeated itself and cost real time.** P1 recorded
+"match named enums, never protobuf integers" after the `BoolExpr` bug — and this
+batch then wrote `AExprKind` as integers anyway, with **two** consequences:
+`AEXPR_OP` is 1 not 0, so every plain `=` was refused; and `BETWEEN` is 11 not
+10, so `BETWEEN` silently ran the `NOT BETWEEN` arm and returned the complement.
+All enum handling is now `try_from` on the named type. If a third instance
+appears, make it a lint rather than a comment.
+
+**Aggregates landed in the same batch**, with PostgreSQL's rules probed rather
+than assumed: `count(*)` counts ROWS while every other aggregate skips NULLs;
+over an empty input `count` is 0 but `sum`/`min`/`max` are **NULL**; NULL forms
+its own GROUP BY group; and the result types are `int8` for count/sum but the
+INPUT type for min/max. `avg` is refused — PostgreSQL returns `numeric` with its
+own scale (`avg(int4)` over {1,3} is `2.0000000000000000`), and approximating it
+would be a wrong answer.
+
+Two aggregate bugs, both from keying output rows by NAME:
+
+* `SELECT count(*), count(n)` produces two columns both called `count`; the
+  name-keyed row let the second overwrite the first, so `count(*)` reported
+  `count(n)`'s answer.
+* `GROUP BY s ORDER BY s` with `s` unprojected lost the sort key entirely.
+
+Both are fixed by making the output POSITIONAL — `OutputCol::Group(i)` /
+`OutputCol::Agg(i)` — and resolving ORDER BY to a group INDEX rather than an
+output name. Worth remembering as its own shape: **SQL output columns are
+positional and their names are not unique**, so any structure keyed by name will
+eventually drop one.
+
+**Method note:** the differential harness was written before most of these
+fixes, and it found all of them. Write the oracle comparison first; it is
+cheaper than reasoning about three-valued logic and it does not talk itself into
+a wrong answer.
+
+**The harness had a bug of its own, and only the FULL suite found it.** It
+created a fixed-name table `d` in the shared `public` schema of the single local
+PostgreSQL, so xdist workers raced on `CREATE TABLE d` — 35 failures under
+`-n auto`, every one of which passed serially. Each worker now gets its own
+schema. A second run then surfaced a connection leak in the same file: the
+`skipif` probe opened a connection at import and never closed it, one per worker
+for the whole session. **Running only the new test file proves nothing about
+either.**
 
 ### 0.6 P1 vertical slice (2026-08-31): the seam holds on real storage
 

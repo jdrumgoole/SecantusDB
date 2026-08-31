@@ -2,6 +2,7 @@
 //! PostgreSQL 14 on 2026-08-31 -- PG is the oracle, not the Python server.
 
 use super::*;
+use bson::Bson;
 
 fn t() -> TableDef {
     TableDef::new(
@@ -86,13 +87,22 @@ fn select_lowers_predicates_over_stored_fields() {
     let cases: Vec<(&str, Document)> = vec![
         ("SELECT * FROM t WHERE id = 1", doc! {"_id": 1i32}),
         ("SELECT * FROM t WHERE n > 15", doc! {"n": {"$gt": 15i32}}),
+        // `<>` carries an explicit not-null guard: MQL's `$ne` matches a
+        // missing-or-null field, but SQL's `<>` over NULL yields NULL and the
+        // row is excluded (probed PG 14).
         (
             "SELECT * FROM t WHERE name <> 'bob'",
-            doc! {"name": {"$ne": "bob"}},
+            doc! {"$and": [
+                {"name": {"$ne": "bob"}},
+                {"name": {"$ne": Bson::Null}},
+            ]},
         ),
         (
             "SELECT * FROM t WHERE n >= 20 AND id <> 3",
-            doc! {"$and": [{"n": {"$gte": 20i32}}, {"_id": {"$ne": 3i32}}]},
+            doc! {"$and": [
+                {"n": {"$gte": 20i32}},
+                {"$and": [{"_id": {"$ne": 3i32}}, {"_id": {"$ne": Bson::Null}}]},
+            ]},
         ),
         (
             "SELECT * FROM t WHERE name = 'carol' OR n < 15",
@@ -127,9 +137,7 @@ fn select_renames_through_an_alias() {
 #[test]
 fn unsupported_and_undefined_carry_postgres_sqlstates() {
     let cases: Vec<(&str, &str)> = vec![
-        ("SELECT count(*) FROM t GROUP BY n", "0A000"),
         ("SELECT * FROM t JOIN u ON t.id = u.id", "0A000"),
-        ("SELECT * FROM t WHERE NOT (n = 1)", "0A000"),
         ("SELECT * FROM t WHERE n LIKE 'x'", "0A000"),
         ("SELECT nope FROM t", "42703"),
         ("SELECT * FROM t WHERE nope = 1", "42703"),
@@ -150,6 +158,148 @@ fn unsupported_and_undefined_carry_postgres_sqlstates() {
 /// The shapes the backlog records sqlglot mangling. Each needs a regex
 /// pre-pass in the Python planner; libpg_query parses them natively, so they
 /// must reach an honest 0A000 rather than a syntax error.
+/// NOT is pushed into the leaves rather than wrapped.
+///
+/// MQL has no operator matching SQL's NOT: `$nor` matches a missing-or-null
+/// field where SQL yields NULL and excludes the row. De Morgan is valid in
+/// three-valued logic, so the negation can descend to leaves that are already
+/// NULL-correct. Every expectation below was checked against live PostgreSQL 14.
+#[test]
+fn not_is_pushed_down_to_null_correct_leaves() {
+    let cases: Vec<(&str, Document)> = vec![
+        (
+            "SELECT * FROM t WHERE NOT (n IS NULL)",
+            doc! {"n": {"$ne": Bson::Null}},
+        ),
+        (
+            "SELECT * FROM t WHERE NOT (n IS NOT NULL)",
+            doc! {"n": Bson::Null},
+        ),
+        (
+            "SELECT * FROM t WHERE NOT (n > 1)",
+            doc! {"n": {"$lte": 1i32}},
+        ),
+        // NOT NOT collapses rather than nesting.
+        ("SELECT * FROM t WHERE NOT (NOT (n = 1))", doc! {"n": 1i32}),
+        // De Morgan: NOT (a AND b) -> NOT a OR NOT b.
+        (
+            "SELECT * FROM t WHERE NOT (n = 1 AND name = 'bob')",
+            doc! {"$or": [
+                {"$and": [{"n": {"$ne": 1i32}}, {"n": {"$ne": Bson::Null}}]},
+                {"$and": [{"name": {"$ne": "bob"}}, {"name": {"$ne": Bson::Null}}]},
+            ]},
+        ),
+    ];
+    for (sql, want) in cases {
+        match plan_ok(sql) {
+            Statement::Select(s) => assert_eq!(s.filter, want, "for {sql}"),
+            other => panic!("wrong statement for {sql}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn order_limit_and_offset_are_planned() {
+    match plan_ok("SELECT id FROM t ORDER BY n DESC, name LIMIT 5 OFFSET 2") {
+        Statement::Select(s) => {
+            assert_eq!(s.limit, Some(5));
+            assert_eq!(s.offset, 2);
+            assert_eq!(s.order.len(), 2);
+            assert_eq!(s.order[0].field, "n");
+            assert!(!s.order[0].ascending);
+            // PostgreSQL's DESC default is NULLS FIRST; ASC is NULLS LAST.
+            assert_eq!(s.order[0].nulls, Nulls::First);
+            assert_eq!(s.order[1].field, "name");
+            assert!(s.order[1].ascending);
+            assert_eq!(s.order[1].nulls, Nulls::Last);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+#[test]
+fn explicit_nulls_placement_overrides_the_direction_default() {
+    match plan_ok("SELECT id FROM t ORDER BY n ASC NULLS FIRST") {
+        Statement::Select(s) => assert_eq!(s.order[0].nulls, Nulls::First),
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("SELECT id FROM t ORDER BY n DESC NULLS LAST") {
+        Statement::Select(s) => assert_eq!(s.order[0].nulls, Nulls::Last),
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+/// `LIMIT NULL` means "no limit" in PostgreSQL, NOT "limit zero" -- while
+/// `LIMIT 0` is a real limit that returns nothing.
+#[test]
+fn limit_null_is_not_limit_zero() {
+    match plan_ok("SELECT id FROM t LIMIT NULL") {
+        Statement::Select(s) => assert_eq!(s.limit, None),
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("SELECT id FROM t LIMIT 0") {
+        Statement::Select(s) => assert_eq!(s.limit, Some(0)),
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+#[test]
+fn in_and_between_respect_three_valued_logic() {
+    let cases: Vec<(&str, Document)> = vec![
+        (
+            "SELECT * FROM t WHERE n IN (1, 3)",
+            doc! {"n": {"$in": [1i32, 3i32]}},
+        ),
+        // A NULL in a positive IN list simply never matches, so it is dropped.
+        (
+            "SELECT * FROM t WHERE n IN (1, NULL)",
+            doc! {"n": {"$in": [1i32]}},
+        ),
+        // NOT IN must exclude NULL rows: `NULL <> 1` is NULL, not true.
+        (
+            "SELECT * FROM t WHERE n NOT IN (1)",
+            doc! {"$and": [{"n": {"$nin": [1i32]}}, {"n": {"$ne": Bson::Null}}]},
+        ),
+        (
+            "SELECT * FROM t WHERE n BETWEEN 1 AND 3",
+            doc! {"n": {"$gte": 1i32, "$lte": 3i32}},
+        ),
+    ];
+    for (sql, want) in cases {
+        match plan_ok(sql) {
+            Statement::Select(s) => assert_eq!(s.filter, want, "for {sql}"),
+            other => panic!("wrong statement for {sql}: {other:?}"),
+        }
+    }
+    // `NOT IN` over a list containing NULL is never true for any row.
+    match plan_ok("SELECT * FROM t WHERE n NOT IN (1, NULL)") {
+        Statement::Select(s) => assert_eq!(s.filter, doc! {"$nor": [Document::new()]}),
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+#[test]
+fn update_and_delete_are_planned() {
+    match plan_ok("UPDATE t SET n = 5 WHERE id = 1") {
+        Statement::Update(u) => {
+            assert_eq!(u.table, "t");
+            assert_eq!(u.set, doc! {"n": 5i32});
+            assert_eq!(u.filter, doc! {"_id": 1i32});
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("DELETE FROM t WHERE n > 2") {
+        Statement::Delete(d) => {
+            assert_eq!(d.table, "t");
+            assert_eq!(d.filter, doc! {"n": {"$gt": 2i32}});
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    // The PK is the document's `_id`, which storage treats as immutable.
+    let err = plan("UPDATE t SET id = 2 WHERE id = 1", &lookup).expect_err("PK update");
+    assert_eq!(err.sqlstate(), "0A000");
+}
+
 #[test]
 fn shapes_sqlglot_mis_parses_reach_us_as_real_statements() {
     for sql in [
@@ -162,5 +312,86 @@ fn shapes_sqlglot_mis_parses_reach_us_as_real_statements() {
     ] {
         let err = plan(sql, &lookup).expect_err(sql);
         assert_eq!(err.sqlstate(), "0A000", "for {sql} (got {err})");
+    }
+}
+
+/// Aggregates plan to POSITIONAL output columns.
+///
+/// `SELECT count(*), count(n)` yields two columns both called `count`. An
+/// earlier cut keyed the result row by name, so the second silently overwrote
+/// the first and `count(*)` reported `count(n)`'s answer.
+#[test]
+fn duplicate_aggregate_names_stay_distinct_columns() {
+    match plan_ok("SELECT count(*), count(n) FROM t") {
+        Statement::Aggregate(a) => {
+            assert_eq!(a.items.len(), 2);
+            assert_eq!(a.items[0].func, AggFunc::CountStar);
+            assert_eq!(a.items[0].field, None);
+            assert_eq!(a.items[1].func, AggFunc::Count);
+            assert_eq!(a.items[1].field.as_deref(), Some("n"));
+            assert_eq!(
+                a.select,
+                vec![
+                    ("count".to_string(), OutputCol::Agg(0)),
+                    ("count".to_string(), OutputCol::Agg(1)),
+                ]
+            );
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+/// ORDER BY over a column that is neither grouped nor aggregated is refused
+/// rather than silently ignored.
+#[test]
+fn order_by_a_non_grouped_column_is_refused() {
+    let err = plan("SELECT count(*) FROM t ORDER BY name", &lookup).expect_err("must refuse");
+    assert_eq!(err.sqlstate(), "0A000");
+}
+
+#[test]
+fn group_by_resolves_order_by_index() {
+    match plan_ok("SELECT count(*) FROM t GROUP BY name ORDER BY name DESC") {
+        Statement::Aggregate(a) => {
+            assert_eq!(a.group_by, vec![("name".to_string(), "name".to_string())]);
+            // `name` is grouped but NOT projected; only the aggregate is.
+            assert_eq!(a.select, vec![("count".to_string(), OutputCol::Agg(0))]);
+            assert_eq!(a.order.len(), 1);
+            assert_eq!(a.order[0].group_index, 0);
+            assert!(!a.order[0].ascending);
+            // DESC defaults to NULLS FIRST.
+            assert_eq!(a.order[0].nulls, Nulls::First);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+#[test]
+fn min_and_max_carry_their_source_type() {
+    match plan_ok("SELECT min(n), max(name) FROM t") {
+        Statement::Aggregate(a) => {
+            assert_eq!(a.items[0].source_type.as_deref(), Some("int4"));
+            assert_eq!(a.items[1].source_type.as_deref(), Some("text"));
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+#[test]
+fn aggregate_refusals_carry_the_right_sqlstate() {
+    let cases: Vec<(&str, &str)> = vec![
+        // A bare column beside an aggregate must be grouped.
+        ("SELECT name, count(*) FROM t", "42803"),
+        // Deliberately deferred rather than approximated.
+        ("SELECT avg(n) FROM t", "0A000"),
+        ("SELECT count(DISTINCT n) FROM t", "0A000"),
+        ("SELECT count(*) FROM t HAVING count(*) > 1", "0A000"),
+        ("SELECT sum(n + 1) FROM t", "0A000"),
+        ("SELECT count(nope) FROM t", "42703"),
+        ("SELECT count(*) FROM t GROUP BY nope", "42703"),
+    ];
+    for (sql, want) in cases {
+        let err = plan(sql, &lookup).expect_err(sql);
+        assert_eq!(err.sqlstate(), want, "for {sql} (got {err})");
     }
 }

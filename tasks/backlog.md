@@ -18,6 +18,61 @@ failing test, the query); several "open" items were already fixed, and the wrong
 ones were wrong in the direction that costs most — they described work as missing
 when it existed.
 
+- [ ] **The PostgreSQL-oracle differential tests do not run in the full suite —
+      ALL of them, and it predates the Rust PG server. Diagnosed 2026-08-31.**
+      `test_sql_search_path.py`, `test_sql_subms_timestamps.py`,
+      `test_sql_operator_types.py`, `test_sql_isolation_level.py`,
+      `test_sql_result_type_tags.py` and the new
+      `test_rust_pgserver_differential.py` all pass standalone (serially AND
+      under xdist) and all SKIP inside `pytest -q`. That is ~109 + ~10 tests
+      reporting green while never executing.
+
+      **Cause is the environment, not the tests.** Postgres.app gates
+      connections per-application behind a macOS permission dialog. The
+      interactive shell is approved; pytest-xdist worker processes are not, so
+      the server waits on a dialog nothing answers and psycopg reports a bare
+      `ConnectionTimeout`:
+
+          FATAL:  Postgres.app failed to verify "trust" authentication
+          DETAIL:  You did not confirm the permission dialog.
+          HINT:  Configure app permissions in Postgres.app settings
+
+      Two hypotheses were killed by measurement first: connection exhaustion
+      (peak was **6 of max_connections=100**) and collection-time interference
+      (collecting the whole suite while running only these tests gives 141
+      passed, zero oracle skips). The bare skip reason **"no local PostgreSQL
+      oracle"** is what hid it — indistinguishable from "PostgreSQL is not
+      installed", so it read as intentional configuration for as long as these
+      suites have existed. `test_rust_pgserver_differential.py` now puts the
+      underlying exception in its skip reason; **the five older files still do
+      not, and should**.
+
+      Fix: approve the permission in Postgres.app's settings, or point
+      `SECANTUS_PG_ORACLE_DSN` at a non-Postgres.app PostgreSQL. Worth a CI
+      thought too — CI has no oracle at all, so this class only ever runs on a
+      dev box, and only when that box is configured for it.
+
+- [ ] **`ORDER BY` on a text column sorts by BYTES, not by the database's
+      collation — BOTH servers, found 2026-08-31.** PostgreSQL sorts text using
+      the database collation (this box: `en_US.UTF-8`), which ignores case and
+      punctuation at the primary level. Both SecantusDB servers sort by raw
+      bytes, so the ORDER matters as soon as the data mixes case or punctuation.
+      Measured on the same nine values:
+
+          postgres (en_US) : a b, a-b, ab, abc, aBc, Abc, ABC, zzz, ZZZ
+          python server    : ABC, Abc, ZZZ, a b, a-b, aBc, ab, abc, zzz
+          rust pg server   : (identical to the python server)
+
+      Found while building the Rust server's ORDER BY; it is **not** a Rust
+      regression — the Python server has always done this, and the two agree
+      with each other, which is exactly why parity testing never caught it
+      (`CLAUDE.md`: "parity is not correctness"). Easy to miss because the usual
+      fixture data (`'a'`, `'b'`, `'c'`) sorts identically under both rules.
+
+      Closing it means a real collation implementation, since PostgreSQL
+      delegates to the OS locale; ICU or a `C`-collation-only restriction are
+      the two honest options. Numeric and boolean ORDER BY are unaffected.
+
 ## Triage: what is actually broken (2026-08-26)
 
 > **Sequenced in `tasks/remaining-work-plan.md` (2026-08-27)** — which phase to

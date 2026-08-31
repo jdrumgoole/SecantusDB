@@ -9,6 +9,7 @@
 //! because the point of P1 is to prove the SEAM end to end on real storage,
 //! including the shared on-disk catalog format. Breadth is P5's problem.
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -21,7 +22,9 @@ use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use secantus_pgcatalog::{TableDef, CATALOG_COLLECTION};
-use secantus_pgplan::{plan, Error as PlanError, Statement};
+use secantus_pgplan::{
+    plan, AggFunc, AggItem, Error as PlanError, Nulls, OrderKey, OutputCol, Statement,
+};
 use secantus_storage::Storage;
 
 /// One database's worth of SQL over a shared `Storage`.
@@ -213,6 +216,29 @@ impl SimpleQueryHandler for PgHandler {
                     .lookup(&sel.table)
                     .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?;
 
+                // Decode once: ORDER BY, OFFSET and LIMIT all need the values,
+                // and re-decoding per comparison would be quadratic.
+                let mut docs: Vec<Document> = raw
+                    .iter()
+                    .map(|b| bson::from_slice(b))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| Self::storage_err("could not decode a row", e))?;
+
+                if !sel.order.is_empty() {
+                    sort_rows(&mut docs, &sel.order);
+                }
+                // OFFSET is applied before LIMIT, as PostgreSQL does.
+                if sel.offset > 0 {
+                    let skip = usize::try_from(sel.offset).unwrap_or(usize::MAX);
+                    docs = docs.into_iter().skip(skip).collect();
+                }
+                if let Some(limit) = sel.limit {
+                    // A negative LIMIT is a PostgreSQL error, but the parser
+                    // hands it through; clamp rather than panic on the cast.
+                    let take = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+                    docs.truncate(take);
+                }
+
                 let schema = Arc::new(
                     sel.columns
                         .iter()
@@ -228,27 +254,349 @@ impl SimpleQueryHandler for PgHandler {
 
                 let fields: Vec<String> = sel.columns.iter().map(|(_, f)| f.clone()).collect();
                 let schema_ref = schema.clone();
-                let rows = stream::iter(raw).map(move |bytes| {
-                    let d: Document = bson::from_slice(&bytes).map_err(|e| {
-                        PgWireError::ApiError(Box::new(std::io::Error::other(e.to_string())))
-                    })?;
+                let rows = stream::iter(docs).map(move |d| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
                     for f in &fields {
-                        match d.get(f) {
-                            Some(Bson::Int32(v)) => enc.encode_field(&Some(*v))?,
-                            Some(Bson::Int64(v)) => enc.encode_field(&Some(*v))?,
-                            Some(Bson::Double(v)) => enc.encode_field(&Some(*v))?,
-                            Some(Bson::Boolean(v)) => enc.encode_field(&Some(*v))?,
-                            Some(Bson::String(v)) => enc.encode_field(&Some(v.as_str()))?,
-                            // Absent and explicit null are both SQL NULL here.
-                            _ => enc.encode_field(&None::<i32>)?,
-                        }
+                        encode_value(&mut enc, d.get(f))?;
                     }
                     enc.finish()
                 });
                 Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
             }
+
+            Statement::Aggregate(agg) => {
+                let raw = self
+                    .storage
+                    .find_matching(&self.db, &agg.table, &agg.filter)
+                    .map_err(|e| Self::storage_err("could not read", e))?;
+                let docs: Vec<Document> = raw
+                    .iter()
+                    .map(|b| bson::from_slice(b))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| Self::storage_err("could not decode a row", e))?;
+
+                // Group, preserving first-seen order so output is deterministic
+                // even with no ORDER BY.
+                let mut keys: Vec<Vec<Option<Bson>>> = Vec::new();
+                let mut buckets: Vec<Vec<Document>> = Vec::new();
+                if agg.group_by.is_empty() {
+                    keys.push(Vec::new());
+                    buckets.push(docs);
+                } else {
+                    for d in docs {
+                        // NULL forms its OWN group in PostgreSQL, so a missing
+                        // or null key is a real key rather than a skip.
+                        let key: Vec<Option<Bson>> = agg
+                            .group_by
+                            .iter()
+                            .map(|(_, f)| match d.get(f) {
+                                None | Some(Bson::Null) => None,
+                                Some(v) => Some(v.clone()),
+                            })
+                            .collect();
+                        match keys.iter().position(|k| *k == key) {
+                            Some(i) => buckets[i].push(d),
+                            None => {
+                                keys.push(key);
+                                buckets.push(vec![d]);
+                            }
+                        }
+                    }
+                }
+
+                // (group key, computed aggregates) per group. Kept POSITIONAL:
+                // `SELECT count(*), count(n)` yields two columns both named
+                // `count`, so a name-keyed row silently drops one.
+                let mut groups: Vec<(Vec<Option<Bson>>, Vec<Bson>)> = keys
+                    .iter()
+                    .zip(buckets.iter())
+                    .map(|(k, bucket)| {
+                        let vals = agg
+                            .items
+                            .iter()
+                            .map(|item| compute_aggregate(item, bucket))
+                            .collect();
+                        (k.clone(), vals)
+                    })
+                    .collect();
+
+                // Sort on the GROUP KEY, by index -- so `GROUP BY s ORDER BY s`
+                // works even when `s` is not projected.
+                if !agg.order.is_empty() {
+                    groups.sort_by(|a, b| {
+                        for key in &agg.order {
+                            let (l, r) = (&a.0[key.group_index], &b.0[key.group_index]);
+                            let ord = match (l, r) {
+                                (None, None) => Ordering::Equal,
+                                (None, Some(_)) => match key.nulls {
+                                    Nulls::First => Ordering::Less,
+                                    Nulls::Last => Ordering::Greater,
+                                },
+                                (Some(_), None) => match key.nulls {
+                                    Nulls::First => Ordering::Greater,
+                                    Nulls::Last => Ordering::Less,
+                                },
+                                (Some(x), Some(y)) => {
+                                    let c = compare_values(x, y);
+                                    if key.ascending {
+                                        c
+                                    } else {
+                                        c.reverse()
+                                    }
+                                }
+                            };
+                            if ord != Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        Ordering::Equal
+                    });
+                }
+                if agg.offset > 0 {
+                    let skip = usize::try_from(agg.offset).unwrap_or(usize::MAX);
+                    groups = groups.into_iter().skip(skip).collect();
+                }
+                if let Some(limit) = agg.limit {
+                    groups.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
+                }
+
+                let def = self
+                    .lookup(&agg.table)
+                    .ok_or_else(|| Self::err(&PlanError::UndefinedTable(agg.table.clone())))?;
+                let schema = Arc::new(
+                    agg.select
+                        .iter()
+                        .map(|(name, col)| {
+                            let ty = match col {
+                                OutputCol::Group(i) => def
+                                    .column(&agg.group_by[*i].0)
+                                    .map(|c| wire_type(&c.pg_type))
+                                    .unwrap_or(Type::VARCHAR),
+                                OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
+                            };
+                            FieldInfo::new(name.clone(), None, None, ty, FieldFormat::Text)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+
+                let select = agg.select.clone();
+                let schema_ref = schema.clone();
+                let rows = stream::iter(groups).map(move |(key, vals)| {
+                    let mut enc = DataRowEncoder::new(schema_ref.clone());
+                    for (_, col) in &select {
+                        let v = match col {
+                            OutputCol::Group(i) => key[*i].clone().unwrap_or(Bson::Null),
+                            OutputCol::Agg(i) => vals[*i].clone(),
+                        };
+                        encode_value(&mut enc, Some(&v))?;
+                    }
+                    enc.finish()
+                });
+                Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
+            }
+
+            Statement::Update(upd) => {
+                let outcome = self
+                    .storage
+                    .update_matching(
+                        &self.db,
+                        &upd.table,
+                        &upd.filter,
+                        &bson::doc! { "$set": upd.set },
+                        true,  // multi: SQL UPDATE has no single-row default
+                        false, // upsert: never; PostgreSQL UPDATE does not insert
+                        &[],
+                        &Document::new(),
+                        None,
+                        None,
+                        false,
+                    )
+                    .map_err(|e| Self::storage_err("could not update", e))?;
+                // PostgreSQL's UPDATE tag counts rows MATCHED, not rows whose
+                // value actually changed: `UPDATE t SET n = n` reports every
+                // row. `modified` would under-report a no-op assignment.
+                Ok(vec![Response::Execution(
+                    Tag::new("UPDATE").with_rows(outcome.matched),
+                )])
+            }
+
+            Statement::Delete(del) => {
+                let deleted = self
+                    .storage
+                    .delete_matching(&self.db, &del.table, &del.filter, 0, &Document::new(), None)
+                    .map_err(|e| Self::storage_err("could not delete", e))?;
+                Ok(vec![Response::Execution(
+                    Tag::new("DELETE").with_rows(deleted),
+                )])
+            }
         }
+    }
+}
+
+/// Encode one stored value as a SQL datum. Absent and explicit null are both
+/// SQL NULL.
+fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> {
+    match v {
+        Some(Bson::Int32(x)) => enc.encode_field(&Some(*x)),
+        Some(Bson::Int64(x)) => enc.encode_field(&Some(*x)),
+        Some(Bson::Double(x)) => enc.encode_field(&Some(*x)),
+        Some(Bson::Boolean(x)) => enc.encode_field(&Some(*x)),
+        Some(Bson::String(x)) => enc.encode_field(&Some(x.as_str())),
+        _ => enc.encode_field(&None::<i32>),
+    }
+}
+
+/// The wire type an aggregate's result carries.
+///
+/// Probed against PostgreSQL 14: `count(*)` and `count(col)` are int8 (oid 20),
+/// `sum(int4)` is **int8**, not int4, and `min`/`max` return the INPUT type.
+fn aggregate_wire_type(item: &AggItem) -> Type {
+    match item.func {
+        AggFunc::CountStar | AggFunc::Count | AggFunc::Sum => Type::INT8,
+        AggFunc::Min | AggFunc::Max => item
+            .source_type
+            .as_deref()
+            .map(wire_type)
+            .unwrap_or(Type::VARCHAR),
+    }
+}
+
+/// One aggregate over one group.
+///
+/// PostgreSQL's NULL rules, probed on 14: `count(*)` counts ROWS; every other
+/// aggregate SKIPS NULLs; and over an empty input `count` is 0 while `sum`,
+/// `min` and `max` are **NULL, not zero**.
+fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
+    let Some(field) = item.field.as_deref() else {
+        // count(*)
+        return Bson::Int64(rows.len() as i64);
+    };
+    let values: Vec<&Bson> = rows
+        .iter()
+        .filter_map(|d| match d.get(field) {
+            None | Some(Bson::Null) => None,
+            Some(v) => Some(v),
+        })
+        .collect();
+
+    match item.func {
+        AggFunc::CountStar => Bson::Int64(rows.len() as i64),
+        AggFunc::Count => Bson::Int64(values.len() as i64),
+        AggFunc::Sum => {
+            if values.is_empty() {
+                return Bson::Null;
+            }
+            // Integer inputs sum as int8; a float anywhere makes it a double.
+            if values
+                .iter()
+                .all(|v| matches!(v, Bson::Int32(_) | Bson::Int64(_)))
+            {
+                let total: i64 = values
+                    .iter()
+                    .map(|v| match v {
+                        Bson::Int32(x) => i64::from(*x),
+                        Bson::Int64(x) => *x,
+                        _ => 0,
+                    })
+                    .sum();
+                Bson::Int64(total)
+            } else {
+                let total: f64 = values
+                    .iter()
+                    .map(|v| match v {
+                        Bson::Int32(x) => f64::from(*x),
+                        Bson::Int64(x) => *x as f64,
+                        Bson::Double(x) => *x,
+                        _ => 0.0,
+                    })
+                    .sum();
+                Bson::Double(total)
+            }
+        }
+        AggFunc::Min | AggFunc::Max => {
+            let mut best: Option<&Bson> = None;
+            for v in values {
+                best = Some(match best {
+                    None => v,
+                    Some(cur) => {
+                        let cmp = compare_values(v, cur);
+                        let take = if item.func == AggFunc::Min {
+                            cmp == Ordering::Less
+                        } else {
+                            cmp == Ordering::Greater
+                        };
+                        if take {
+                            v
+                        } else {
+                            cur
+                        }
+                    }
+                });
+            }
+            best.cloned().unwrap_or(Bson::Null)
+        }
+    }
+}
+
+/// Sort decoded rows in PostgreSQL's order.
+///
+/// Deliberately NOT pushed into the storage layer's sort: MongoDB orders null
+/// LOW, while PostgreSQL puts NULLs LAST on ASC and FIRST on DESC (probed 14).
+/// Pushing an ASC sort down would silently reorder every nullable column.
+fn sort_rows(docs: &mut [Document], order: &[OrderKey]) {
+    docs.sort_by(|a, b| {
+        for key in order {
+            let (l, r) = (a.get(&key.field), b.get(&key.field));
+            let l_null = matches!(l, None | Some(Bson::Null));
+            let r_null = matches!(r, None | Some(Bson::Null));
+            let ord = match (l_null, r_null) {
+                (true, true) => Ordering::Equal,
+                (true, false) => match key.nulls {
+                    Nulls::First => Ordering::Less,
+                    Nulls::Last => Ordering::Greater,
+                },
+                (false, true) => match key.nulls {
+                    Nulls::First => Ordering::Greater,
+                    Nulls::Last => Ordering::Less,
+                },
+                (false, false) => {
+                    let cmp = compare_values(l.unwrap(), r.unwrap());
+                    if key.ascending {
+                        cmp
+                    } else {
+                        cmp.reverse()
+                    }
+                }
+            };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    });
+}
+
+/// Compare two non-null stored values the way PostgreSQL compares the SQL types
+/// this slice supports. Numbers compare numerically across int/long/double,
+/// strings byte-wise, booleans false < true.
+fn compare_values(a: &Bson, b: &Bson) -> Ordering {
+    fn as_f64(v: &Bson) -> Option<f64> {
+        match v {
+            Bson::Int32(i) => Some(f64::from(*i)),
+            Bson::Int64(i) => Some(*i as f64),
+            Bson::Double(d) => Some(*d),
+            _ => None,
+        }
+    }
+    match (a, b) {
+        (Bson::String(x), Bson::String(y)) => x.cmp(y),
+        (Bson::Boolean(x), Bson::Boolean(y)) => x.cmp(y),
+        _ => match (as_f64(a), as_f64(b)) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+            // Mixed or unsupported types cannot arise from one SQL column
+            // today; keeping them equal is stable rather than arbitrary.
+            _ => Ordering::Equal,
+        },
     }
 }
 
