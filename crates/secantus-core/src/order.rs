@@ -113,11 +113,16 @@ pub fn is_sortable(v: &Bson) -> bool {
         | Bson::Int64(_)
         | Bson::String(_)
         | Bson::ObjectId(_)
-        | Bson::DateTime(_) => true,
+        | Bson::DateTime(_)
+        // Booleans ARE ordered (`type_rank` has always placed them at 90, and
+        // `cmp` has always had the same-type arm) -- excluding them here made
+        // every comparison involving one defer, which on a server with no
+        // Python is a generic BadValue. `{$gt: [true, 1]}` is true on mongod.
+        | Bson::Boolean(_) => true,
         Bson::Double(d) => !d.is_nan(),
         Bson::Document(d) => d.values().all(is_sortable),
         Bson::Array(a) => a.iter().all(is_sortable),
-        // bool, NaN, Binary, Timestamp, Regex, Min/MaxKey, Decimal128, exotic.
+        // NaN, Binary, Timestamp, Regex, Min/MaxKey, Decimal128, exotic.
         _ => false,
     }
 }
@@ -322,9 +327,14 @@ mod tests {
     fn sortable_gating() {
         assert!(is_sortable(&b(bson!({"a": [1, "x", {"n": 2}]}))));
         // bool / NaN / Decimal128 defer (their Python `==` diverges from cmp).
-        assert!(!is_sortable(&b(bson!(true))));
+        // Bools ARE sortable: mongod ranks them above ObjectId and below Date,
+        // and `{$gt: [true, 1]}` is true. This asserted the opposite, pinning a
+        // gating decision rather than a behaviour.
+        assert!(is_sortable(&b(bson!(true))));
         assert!(!is_sortable(&b(bson!(f64::NAN))));
-        assert!(!is_sortable(&b(bson!([1, "x", true]))));
+        // An array of sortable elements is sortable, and a bool is now one of
+        // them; this case existed only because bools were excluded.
+        assert!(is_sortable(&b(bson!([1, "x", true]))));
         assert!(!is_sortable(&Bson::Decimal128("1.5".parse().unwrap())));
         assert!(!is_sortable(&b(
             bson!({"a": Bson::Decimal128("1".parse().unwrap())})

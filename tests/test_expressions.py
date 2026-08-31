@@ -582,7 +582,9 @@ def test_to_double_conversions() -> None:
 def test_to_bool_conversions() -> None:
     assert evaluate({"$toBool": 0}, {}) is False
     assert evaluate({"$toBool": "x"}, {}) is True
-    assert evaluate({"$toBool": ""}, {}) is False
+    # EVERY string is true to mongod, the empty one included (probed 8.2.11).
+    # This asserted Python's own truthiness.
+    assert evaluate({"$toBool": ""}, {}) is True
 
 
 def test_filter_basic() -> None:

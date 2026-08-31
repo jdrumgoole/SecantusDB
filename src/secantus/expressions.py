@@ -11,6 +11,7 @@ from typing import Any
 import bson
 from bson import Decimal128, Int64
 
+from secantus.ordering import bson_equal as _bson_equal
 from secantus.paths import get_path
 
 
@@ -209,10 +210,22 @@ def _eval_args(arg: Any, ctx: _Ctx) -> list[Any]:
 
 
 def _bool(value: Any) -> bool:
-    if value is None:
+    """mongod's truthiness: only null, missing, `false` and zero are false.
+
+    Every other value is true -- including the EMPTY STRING, an empty array and
+    an empty document, none of which follow Python's own truthiness. `$or: ""`
+    is true on mongod and was false here, and the same rule governs `$and`,
+    `$cond`, `$switch` cases and `$filter`. `Decimal128` is a number and has to
+    be tested as one rather than falling through to the catch-all.
+    """
+    if value is None or value is MISSING:
         return False
-    if isinstance(value, (bool, int, float)):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
         return bool(value)
+    if isinstance(value, Decimal128):
+        return bool(value.to_decimal())
     return True
 
 
@@ -379,12 +392,27 @@ def _op_mod(arg: Any, ctx: _Ctx) -> Any:
     return a % b
 
 
+def _operands(arg: Any) -> list[Any]:
+    """The operand EXPRESSIONS of a logical operator, unevaluated.
+
+    A single non-array operand is a one-element list to mongod
+    (`{$and: "$s"}`); iterating the argument directly walked the string
+    CHARACTER BY CHARACTER, so `"$s"` became `'$'` and `'s'` and the first
+    parsed as an empty field path. Returning expressions rather than values
+    keeps `$and` / `$or` lazy -- mongod short-circuits at runtime, so
+    `{$and: [false, {$divide: ["$n", 0]}]}` is false and must not evaluate the
+    divide (probed 8.2.11; an all-constant version folds at optimization time
+    and DOES raise, which is why the field reference matters here).
+    """
+    return arg if isinstance(arg, list) else [arg]
+
+
 def _op_and(arg: Any, ctx: _Ctx) -> bool:
-    return all(_bool(_eval(a, ctx)) for a in arg)
+    return all(_bool(_eval(a, ctx)) for a in _operands(arg))
 
 
 def _op_or(arg: Any, ctx: _Ctx) -> bool:
-    return any(_bool(_eval(a, ctx)) for a in arg)
+    return any(_bool(_eval(a, ctx)) for a in _operands(arg))
 
 
 def _op_not(arg: Any, ctx: _Ctx) -> bool:
@@ -442,66 +470,59 @@ def _op_eq(arg: Any, ctx: _Ctx) -> bool:
     # must not compare equal to None.
     if a is _MISSING_RANK or b is _MISSING_RANK:
         return a is b
-    return a == b
+    return _bson_equal(a, b)
 
 
 def _op_ne(arg: Any, ctx: _Ctx) -> bool:
     a, b = _cmp_pair(arg, ctx)
     if a is _MISSING_RANK or b is _MISSING_RANK:
         return a is not b
-    return a != b
+    return not _bson_equal(a, b)
+
+
+def _relational(arg: Any, ctx: _Ctx, want: tuple[int, ...]) -> bool:
+    """`$gt` / `$gte` / `$lt` / `$lte`, over mongod's BSON order.
+
+    These used to compare with Python's own operators and swallow the
+    `TypeError` a cross-type pair raises:
+
+        try:
+            return bool(a > b)
+        except TypeError:
+            return False
+
+    So EVERY comparison between different BSON types answered false, silently.
+    `{$gt: ["abc", 1]}` is true on mongod -- a string sorts after a number in
+    the canonical order -- and `{$lt: [null, 1]}` is true likewise. `$cmp` two
+    thousand lines below had it right all along, via `ordering._bson_lt`; these
+    four never used it. The expression language drives `$expr`, `$cond`,
+    `$filter`, `$switch` and `$bucket`, so the wrong answer reached rows.
+    """
+    a, b = _cmp_pair(arg, ctx)
+    if a is _MISSING_RANK or b is _MISSING_RANK:
+        # MISSING ranks below every real value.
+        order = 0 if a is b else (-1 if a is _MISSING_RANK else 1)
+    else:
+        from secantus.ordering import _bson_lt
+
+        order = -1 if _bson_lt(a, b) else (1 if _bson_lt(b, a) else 0)
+    return order in want
 
 
 def _op_gt(arg: Any, ctx: _Ctx) -> bool:
-    a, b = _cmp_pair(arg, ctx)
-    if a is _MISSING_RANK or b is _MISSING_RANK:
-        if a is b:
-            return False
-        # MISSING ranks below every real value.
-        return b is _MISSING_RANK
-    try:
-        return bool(a > b)
-    except TypeError:
-        return False
+    return _relational(arg, ctx, (1,))
 
 
 def _op_gte(arg: Any, ctx: _Ctx) -> bool:
-    a, b = _cmp_pair(arg, ctx)
-    if a is _MISSING_RANK or b is _MISSING_RANK:
-        if a is b:
-            return True
-        # MISSING ranks below every real value.
-        return b is _MISSING_RANK
-    try:
-        return bool(a >= b)
-    except TypeError:
-        return False
+    return _relational(arg, ctx, (0, 1))
 
 
 def _op_lt(arg: Any, ctx: _Ctx) -> bool:
-    a, b = _cmp_pair(arg, ctx)
-    if a is _MISSING_RANK or b is _MISSING_RANK:
-        if a is b:
-            return False
-        # MISSING ranks below every real value.
-        return a is _MISSING_RANK
-    try:
-        return bool(a < b)
-    except TypeError:
-        return False
+    return _relational(arg, ctx, (-1,))
 
 
 def _op_lte(arg: Any, ctx: _Ctx) -> bool:
-    a, b = _cmp_pair(arg, ctx)
-    if a is _MISSING_RANK or b is _MISSING_RANK:
-        if a is b:
-            return True
-        # MISSING ranks below every real value.
-        return a is _MISSING_RANK
-    try:
-        return bool(a <= b)
-    except TypeError:
-        return False
+    return _relational(arg, ctx, (-1, 0))
 
 
 def _op_cond(arg: Any, ctx: _Ctx, ret: _Eval = None) -> Any:
@@ -2661,7 +2682,10 @@ def _op_in(arg: Any, ctx: _Ctx) -> bool:
             code=40081,
             code_name="Location40081",
         )
-    return needle in haystack
+    # `in` uses Python equality, where `False == 0`, so `{$in: [false, [0]]}`
+    # answered true; mongod says false, bool and number being different BSON
+    # types. `_set_eq` is the same rule the set operators already use.
+    return any(_set_eq(needle, x) for x in haystack)
 
 
 # `int(very_long_string)` is O(n^2) in CPython. Python 3.11+ enforces a
@@ -2779,7 +2803,9 @@ def _op_to_bool(arg: Any, ctx: _Ctx) -> Any:
     if isinstance(value, Decimal128):
         return value.to_decimal() != Decimal(0)
     if isinstance(value, str):
-        return len(value) > 0
+        # Every string is true, the empty one included -- `{$toBool: ""}` is
+        # true on mongod (probed 8.2.11). This used Python's own truthiness.
+        return True
     return True
 
 
