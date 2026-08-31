@@ -22,6 +22,24 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `distinct.key` above uses. Two naming conventions on one command; probed.
     argtypes::require_object(doc, "query", "distinctCommandRequest.query")?;
     argtypes::require_object(doc, "collation", "distinctCommandRequest.collation")?;
+    // An undefined `$$variable` is a PARSE error (17276), not the storage
+    // layer's generic "unsupported construct" BadValue.
+    {
+        let bound: Vec<String> = match doc.get("let") {
+            Some(Bson::Document(d)) => d.keys().cloned().collect(),
+            _ => Vec::new(),
+        };
+        if let Some(Bson::Document(f)) = doc.get("query") {
+            if let Some(var) = argtypes::undefined_variable_in_filter(f, &bound) {
+                return Err(CommandError::new(
+                    17276,
+                    "Location17276",
+                    argtypes::undefined_variable_message(&var, ""),
+                ));
+            }
+        }
+    }
+
     let key = match doc.get("key") {
         Some(Bson::String(s)) => s.clone(),
         // An explicit null is MISSING to mongod, not wrong-typed: a required

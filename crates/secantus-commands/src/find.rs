@@ -267,6 +267,24 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     argtypes::require_object(doc, "readConcern", "FindCommandRequest.readConcern")?;
     argtypes::require_hint(doc, "hint")?;
+    // An undefined `$$variable` is a PARSE error (17276), not the storage
+    // layer's generic "unsupported construct" BadValue.
+    {
+        let bound: Vec<String> = match doc.get("let") {
+            Some(Bson::Document(d)) => d.keys().cloned().collect(),
+            _ => Vec::new(),
+        };
+        if let Some(Bson::Document(f)) = doc.get("filter") {
+            if let Some(var) = argtypes::undefined_variable_in_filter(f, &bound) {
+                return Err(CommandError::new(
+                    17276,
+                    "Location17276",
+                    argtypes::undefined_variable_message(&var, ""),
+                ));
+            }
+        }
+    }
+
     // A view: translate the find into the equivalent aggregate over the base
     // collection (the find options become pipeline stages after the view's own
     // pipeline) and delegate — the aggregate handler resolves the view. `find` and

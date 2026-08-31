@@ -40,6 +40,33 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     }
     argtypes::require_array(doc, "arrayFilters", "findAndModify.arrayFilters")?;
     argtypes::require_hint(doc, "hint")?;
+    // An undefined `$$variable` is a PARSE error (17276). The `update` may be a
+    // PIPELINE, whose stages carry mongod's `Invalid $<stage> :: caused by ::`
+    // wrapper; the query filter never does.
+    {
+        let bound: Vec<String> = match doc.get("let") {
+            Some(Bson::Document(d)) => d.keys().cloned().collect(),
+            _ => Vec::new(),
+        };
+        if let Some(Bson::Document(q)) = doc.get("query") {
+            if let Some(var) = argtypes::undefined_variable_in_filter(q, &bound) {
+                return Err(CommandError::new(
+                    17276,
+                    "Location17276",
+                    argtypes::undefined_variable_message(&var, ""),
+                ));
+            }
+        }
+        if let Some(u) = doc.get("update") {
+            if let Some((var, stage)) = argtypes::undefined_variable_in_update(u, &bound) {
+                return Err(CommandError::new(
+                    17276,
+                    "Location17276",
+                    argtypes::undefined_variable_message(&var, &stage),
+                ));
+            }
+        }
+    }
     // `new` and `remove` follow `upsert` above into the bool-OR-number family,
     // not the strict bool that `update.updates.multi` uses.
     argtypes::require_bool_or_number(doc, "new", "findAndModify.new")?;

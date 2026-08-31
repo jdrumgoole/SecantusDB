@@ -431,6 +431,27 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let let_vars = resolve_let_vars(doc.get("let"));
     for (index, spec) in deletes.iter().enumerate() {
         let Bson::Document(spec) = spec else { continue };
+        // As in `update`: an undefined `$$variable` in the filter is a
+        // per-statement writeError carrying mongod's 17276.
+        {
+            let bound: Vec<String> = match doc.get("let") {
+                Some(Bson::Document(d)) => d.keys().cloned().collect(),
+                _ => Vec::new(),
+            };
+            if let Some(Bson::Document(q)) = spec.get("q") {
+                if let Some(var) = argtypes::undefined_variable_in_filter(q, &bound) {
+                    write_errors.push(Bson::Document(doc! {
+                        "index": index as i32,
+                        "code": 17276,
+                        "errmsg": argtypes::undefined_variable_message(&var, ""),
+                    }));
+                    if ordered {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
         let filter = doc_field(spec, "q");
         // `collation` is per-delete-statement (inside each `deletes[]` entry).
         let collation = collation_of(spec);
@@ -480,6 +501,23 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_count_limit(doc, "limit")?;
     argtypes::require_number(doc, "skip", "count.skip")?;
     argtypes::require_hint(doc, "hint")?;
+    // An undefined `$$variable` is a PARSE error (17276), not the storage
+    // layer's generic "unsupported construct" BadValue.
+    {
+        let bound: Vec<String> = match doc.get("let") {
+            Some(Bson::Document(d)) => d.keys().cloned().collect(),
+            _ => Vec::new(),
+        };
+        if let Some(Bson::Document(f)) = doc.get("query") {
+            if let Some(var) = argtypes::undefined_variable_in_filter(f, &bound) {
+                return Err(CommandError::new(
+                    17276,
+                    "Location17276",
+                    argtypes::undefined_variable_message(&var, ""),
+                ));
+            }
+        }
+    }
     let storage = ctx.storage()?;
     let filter = doc_field(doc, "query");
     let collation = collation_of(doc);
@@ -777,6 +815,38 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
         let multi = bool_field(spec, "multi", false);
         let upsert = bool_field(spec, "upsert", false);
+
+        // An undefined `$$variable` in the filter or in a PIPELINE-form `u` is a
+        // per-statement writeError with mongod's 17276, not the storage layer's
+        // generic BadValue — and it is per statement, so an earlier one in the
+        // batch still applies (probed: `n: 1` with the error at `index: 1`).
+        {
+            let bound: Vec<String> = match doc.get("let") {
+                Some(Bson::Document(d)) => d.keys().cloned().collect(),
+                _ => Vec::new(),
+            };
+            let found = match spec.get("q") {
+                Some(Bson::Document(q)) => {
+                    argtypes::undefined_variable_in_filter(q, &bound).map(|v| (v, String::new()))
+                }
+                _ => None,
+            }
+            .or_else(|| {
+                spec.get("u")
+                    .and_then(|u| argtypes::undefined_variable_in_update(u, &bound))
+            });
+            if let Some((var, stage)) = found {
+                write_errors.push(Bson::Document(doc! {
+                    "index": index as i32,
+                    "code": 17276,
+                    "errmsg": argtypes::undefined_variable_message(&var, &stage),
+                }));
+                if ordered {
+                    break;
+                }
+                continue;
+            }
+        }
 
         // Timeseries (mongod 7.0): an update may only modify the metaField, via
         // operator-form modifiers — no replacement / pipeline / non-meta paths.

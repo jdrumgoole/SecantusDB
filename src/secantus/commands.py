@@ -20,7 +20,9 @@ from secantus.aggregate import (
     _fmt_stage_val,
     _geo_near_index_filter,
     apply_pipeline,
+    undefined_variable_in_filter,
     undefined_variable_in_pipeline,
+    undefined_variable_message,
     validate_stage_names,
 )
 from secantus.auth import (
@@ -2792,6 +2794,28 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             if ordered:
                 break
             continue
+        # An undefined `$$variable` in the filter or in a PIPELINE-form `u` is a
+        # per-statement writeError with mongod's 17276 (probed: an earlier
+        # statement in the batch still applies, `n: 1` with the error at
+        # `index: 1`). We raised it as a COMMAND error, failing the whole batch.
+        _uv_bound = frozenset(_let) if isinstance(_let := doc.get("let"), Mapping) else frozenset()
+        _uv = undefined_variable_in_filter(spec.get("q"), _uv_bound)
+        _uv_stage = ""
+        if _uv is None and isinstance(spec.get("u"), list):
+            _found = undefined_variable_in_pipeline(spec.get("u"), _uv_bound)
+            if _found is not None:
+                _uv, _uv_stage = _found
+        if _uv is not None:
+            write_errors.append(
+                {
+                    "index": index,
+                    "code": 17276,
+                    "errmsg": undefined_variable_message(_uv, _uv_stage),
+                }
+            )
+            if ordered:
+                break
+            continue
         _u = spec.get("u")
         if isinstance(_u, list):
             # An array `u` IS a pipeline, so its elements obey the pipeline rule
@@ -3291,6 +3315,18 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             # typo'd index name had their delete applied where MongoDB would
             # have declined to run it.
             write_errors.append({"index": index, "code": 2, "errmsg": hint_err})
+            if ordered:
+                break
+            continue
+        # As on `update`: an undefined `$$variable` in the filter is a
+        # per-statement writeError carrying mongod's 17276, not a command error
+        # that fails the whole batch.
+        _uv_bound = frozenset(_l) if isinstance(_l := doc.get("let"), Mapping) else frozenset()
+        _uv = undefined_variable_in_filter(spec.get("q"), _uv_bound)
+        if _uv is not None:
+            write_errors.append(
+                {"index": index, "code": 17276, "errmsg": undefined_variable_message(_uv, "")}
+            )
             if ordered:
                 break
             continue
@@ -4227,6 +4263,22 @@ def _find_and_modify_impl(doc: dict[str, Any], ctx: CommandContext) -> dict[str,
     wc_err = _validate_write_concern(doc)
     if wc_err is not None:
         return wc_err
+    # An undefined `$$variable` is a PARSE error (17276). A PIPELINE-form
+    # `update` carries mongod's `Invalid $<stage> :: caused by ::` wrapper; the
+    # query filter never does. We reported the bare message for both.
+    _uv_bound = frozenset(_l) if isinstance(_l := doc.get("let"), Mapping) else frozenset()
+    _uv, _uv_stage = undefined_variable_in_filter(doc.get("query"), _uv_bound), ""
+    if _uv is None and isinstance(doc.get("update"), list):
+        _found = undefined_variable_in_pipeline(doc.get("update"), _uv_bound)
+        if _found is not None:
+            _uv, _uv_stage = _found
+    if _uv is not None:
+        return {
+            "ok": 0.0,
+            "errmsg": undefined_variable_message(_uv, _uv_stage),
+            "code": 17276,
+            "codeName": "Location17276",
+        }
     _err = _unknown_find_and_modify_field(doc)
     if _err is not None:
         return _err

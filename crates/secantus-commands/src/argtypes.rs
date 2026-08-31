@@ -894,6 +894,65 @@ fn undefined_in_reduce(arg: &Bson, bound: &[String]) -> Option<String> {
     d.get("in").and_then(|e| undefined_in_expr(e, &inner))
 }
 
+/// The first `$$name` in a QUERY FILTER that names nothing.
+///
+/// A filter is query language, not an expression: `{s: "$$NOPE"}` matches the
+/// literal string. Only `$expr` holds an expression, and only `$and` / `$or` /
+/// `$nor` nest further filters. Everything else is left alone, the same
+/// conservative rule [`undefined_variable_error`] follows — a false positive
+/// would reject a VALID query.
+///
+/// This is the surface the pipeline walker did not cover: `find`, `count`,
+/// `distinct`, `findAndModify` and the `q` of an `update` / `delete` all take a
+/// filter, and an undefined variable in one answered the storage layer's
+/// generic `BadValue` (2) `query uses a construct the Rust server does not
+/// support` instead of mongod's 17276.
+pub fn undefined_variable_in_filter(filter: &Document, bound: &[String]) -> Option<String> {
+    for (key, value) in filter {
+        match key.as_str() {
+            "$expr" => {
+                if let Some(found) = undefined_in_expr(value, bound) {
+                    return Some(found);
+                }
+            }
+            "$and" | "$or" | "$nor" => {
+                if let Bson::Array(subs) = value {
+                    for sub in subs {
+                        if let Bson::Document(d) = sub {
+                            if let Some(found) = undefined_variable_in_filter(d, bound) {
+                                return Some(found);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The first `$$name` that names nothing in an UPDATE, whether it is an
+/// operator document (no expressions, so nothing to find) or a PIPELINE.
+/// Returns `(variable, stage)` like [`undefined_variable_error`].
+pub fn undefined_variable_in_update(update: &Bson, bound: &[String]) -> Option<(String, String)> {
+    match update {
+        Bson::Array(stages) => undefined_variable_error(stages, bound),
+        _ => None,
+    }
+}
+
+/// mongod's message for an undefined variable, with the stage wrapper it uses
+/// inside `$project` / `$addFields` / `$set` and no wrapper anywhere else.
+pub fn undefined_variable_message(var: &str, stage: &str) -> String {
+    let msg = format!("Use of undefined variable: {var}");
+    if stage.is_empty() {
+        msg
+    } else {
+        format!("Invalid {stage} :: caused by :: {msg}")
+    }
+}
+
 /// The first `$$name` in `pipeline` that names nothing, with the stage name for
 /// mongod's wrapper (empty where mongod leaves the message bare).
 ///
