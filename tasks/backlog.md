@@ -18,39 +18,64 @@ failing test, the query); several "open" items were already fixed, and the wrong
 ones were wrong in the direction that costs most — they described work as missing
 when it existed.
 
-- [ ] **The PostgreSQL-oracle differential tests do not run in the full suite —
-      ALL of them, and it predates the Rust PG server. Diagnosed 2026-08-31.**
-      `test_sql_search_path.py`, `test_sql_subms_timestamps.py`,
-      `test_sql_operator_types.py`, `test_sql_isolation_level.py`,
-      `test_sql_result_type_tags.py` and the new
-      `test_rust_pgserver_differential.py` all pass standalone (serially AND
-      under xdist) and all SKIP inside `pytest -q`. That is ~109 + ~10 tests
-      reporting green while never executing.
+- [x] **RESOLVED (2026-08-31): the PostgreSQL-oracle suites DO run in the full
+      suite, and the skip reason that hid the question now names its cause.**
+      The entry this replaces said `test_sql_search_path.py`,
+      `test_sql_subms_timestamps.py`, `test_sql_operator_types.py`,
+      `test_sql_isolation_level.py`, `test_sql_result_type_tags.py` and
+      `test_rust_pgserver_differential.py` "all SKIP inside `pytest -q`",
+      disabling ~109 tests. **Re-measured before working it, and it does not
+      reproduce**: a full `pytest tests/ -n auto` gives **9583 passed, 181
+      skipped, and zero oracle skips** — all 195 tests across those six files
+      execute. (`test_sql_float_rendering.py` uses the oracle too and was never
+      in the list.)
 
-      **Cause is the environment, not the tests.** Postgres.app gates
-      connections per-application behind a macOS permission dialog. The
-      interactive shell is approved; pytest-xdist worker processes are not, so
-      the server waits on a dialog nothing answers and psycopg reports a bare
-      `ConnectionTimeout`:
+      **Why the old diagnosis no longer applies: this box does not run
+      Postgres.app.** The server on `127.0.0.1:5432` is **PostgreSQL 14.13
+      (Homebrew)**, data directory `/opt/homebrew/var/postgresql@14`. The
+      permission-dialog gate the entry describes is a Postgres.app feature, so
+      there is nothing here to approve. Keep the description for the day
+      someone points `SECANTUS_PG_ORACLE_DSN` back at a Postgres.app instance:
+      it gates connections per application, an unapproved process (every xdist
+      worker) waits on a dialog nothing can answer, and psycopg reports a bare
+      `ConnectionTimeout`.
 
-          FATAL:  Postgres.app failed to verify "trust" authentication
-          DETAIL:  You did not confirm the permission dialog.
-          HINT:  Configure app permissions in Postgres.app settings
+      **What WAS a real defect, and is fixed:** the skip reason. `"no local
+      PostgreSQL oracle"` is indistinguishable from "PostgreSQL is not
+      installed", which is exactly why a suite could be disabled without anyone
+      noticing — and why the question "is it still disabled?" needed a full
+      suite run to answer. All six files now share `tests/pg_oracle.py`, whose
+      skips name the DSN **and** the underlying exception:
 
-      Two hypotheses were killed by measurement first: connection exhaustion
-      (peak was **6 of max_connections=100**) and collection-time interference
-      (collecting the whole suite while running only these tests gives 141
-      passed, zero oracle skips). The bare skip reason **"no local PostgreSQL
-      oracle"** is what hid it — indistinguishable from "PostgreSQL is not
-      installed", so it read as intentional configuration for as long as these
-      suites have existed. `test_rust_pgserver_differential.py` now puts the
-      underlying exception in its skip reason; **the five older files still do
-      not, and should**.
+          SKIPPED [1] tests/test_sql_search_path.py:257: no local PostgreSQL
+          reference server (host=127.0.0.1 port=5999 ...): OperationalError:
+          connection failed: ... Connection refused
 
-      Fix: approve the permission in Postgres.app's settings, or point
-      `SECANTUS_PG_ORACLE_DSN` at a non-Postgres.app PostgreSQL. Worth a CI
-      thought too — CI has no oracle at all, so this class only ever runs on a
-      dev box, and only when that box is configured for it.
+      The shared module also removes three drifted default DSNs (one omitted
+      the user) and caches its probe, so a worker makes one connection instead
+      of nine — which matters when a connect *hangs* rather than refuses, the
+      shape the Postgres.app gate above produces: nine probes at the old 3s
+      timeout is 27s of dead collection time per worker, against one 5s probe
+      now.
+
+      **A leak theory, measured and DISPROVED** — recorded so it is not
+      re-derived. `@pytest.mark.skipif(_pg_oracle() is None, ...)` looks like it
+      must leak a connection per decorator per worker (nine across the six
+      files, against `max_connections=100`). It does not: CPython refcounting
+      collects the unreferenced connection the moment the comparison is
+      computed. Probed on this box — nine old-shape probes leave **zero** extra
+      rows in `pg_stat_activity`, where nine *held* references leave nine. The
+      original entry's measurement ruling out connection exhaustion (peak 6 of
+      100) was right, and this is the mechanism.
+      `tests/test_rust_pgserver_differential.py` asserted the leak in a
+      docstring; that claim is corrected in place.
+
+- [ ] **CI has no PostgreSQL reference server at all**, so the six oracle
+      suites above only ever execute on a dev box that happens to have one.
+      They skip silently in CI — now with a reason that says why, but still
+      skipping. Split out of the resolved entry above (2026-08-31), which
+      raised it as "worth a CI thought" and never separated it. Deciding
+      whether CI should stand one up is the open question; nothing is broken.
 
 - [ ] **`ORDER BY` on a text column sorts by BYTES, not by the database's
       collation — BOTH servers, found 2026-08-31.** PostgreSQL sorts text using

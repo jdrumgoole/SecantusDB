@@ -13,10 +13,10 @@ set or clear it.
 from __future__ import annotations
 
 import datetime as dt
-import os
 
 import pytest
 
+import pg_oracle
 from secantus.sql import run_sql, subms
 from secantus.sql.session import Session
 from secantus.storage import Storage
@@ -177,20 +177,20 @@ def test_comparisons_are_microsecond_exact(table):
 
 # --- differential against a real PostgreSQL, when one is reachable -----------
 
-_PG_DSN = os.environ.get("SECANTUS_PG_ORACLE_DSN", "host=127.0.0.1 port=5432 dbname=postgres")
-
 
 def _pg_oracle():
-    """A live PostgreSQL connection, or None. Never fails the suite."""
-    try:
-        import psycopg
+    """A live PostgreSQL to check against, or None. Point elsewhere with
+    SECANTUS_PG_ORACLE_DSN.
 
-        return psycopg.connect(_PG_DSN, autocommit=True, connect_timeout=3)
-    except Exception:  # noqa: BLE001 — absence is the normal case in CI
-        return None
+    Delegates to `pg_oracle` so all six oracle suites share one probe, and one
+    skip reason that says why. The inline copies this replaced had drifted to
+    three different default DSNs and skipped with a message indistinguishable
+    from "PostgreSQL is not installed".
+    """
+    return pg_oracle.connect()
 
 
-@pytest.mark.skipif(_pg_oracle() is None, reason="no local PostgreSQL oracle")
+@pytest.mark.skipif(not pg_oracle.available(), reason=pg_oracle.skip_reason())
 def test_subms_predicates_match_real_postgres(table):
     """Every comparison shape answered exactly as PostgreSQL answers it.
 
@@ -309,7 +309,7 @@ def test_order_by_limit_takes_the_microsecond_smallest(ordered_table):
     assert got == [4, 2]
 
 
-@pytest.mark.skipif(_pg_oracle() is None, reason="no local PostgreSQL oracle")
+@pytest.mark.skipif(not pg_oracle.available(), reason=pg_oracle.skip_reason())
 def test_subms_order_by_matches_real_postgres(ordered_table):
     """The same shapes against the live server rather than a hand-derived
     expectation. `min`/`max` and in-call `array_agg(... ORDER BY t)` are
@@ -436,7 +436,7 @@ def test_order_by_an_aggregate_still_works(grouped_table):
     assert [r[0] for r in rows] == ["b", "a", "c"]
 
 
-@pytest.mark.skipif(_pg_oracle() is None, reason="no local PostgreSQL oracle")
+@pytest.mark.skipif(not pg_oracle.available(), reason=pg_oracle.skip_reason())
 def test_subms_aggregates_match_real_postgres(grouped_table):
     storage, session = grouped_table
     pg = _pg_oracle()
@@ -532,7 +532,7 @@ def test_group_by_with_a_where_clause(keyed_table):
     assert [(r[0].microsecond, r[1]) for r in rows] == [(123100, 2), (123500, 1)]
 
 
-@pytest.mark.skipif(_pg_oracle() is None, reason="no local PostgreSQL oracle")
+@pytest.mark.skipif(not pg_oracle.available(), reason=pg_oracle.skip_reason())
 def test_subms_group_by_matches_real_postgres(keyed_table):
     storage, session = keyed_table
     pg = _pg_oracle()
@@ -627,7 +627,7 @@ def test_distinct_with_where_and_limit(distinct_table):
     assert [r[0].microsecond for r in rows] == [123100, 123500]
 
 
-@pytest.mark.skipif(_pg_oracle() is None, reason="no local PostgreSQL oracle")
+@pytest.mark.skipif(not pg_oracle.available(), reason=pg_oracle.skip_reason())
 def test_subms_distinct_matches_real_postgres(distinct_table):
     storage, session = distinct_table
     pg = _pg_oracle()

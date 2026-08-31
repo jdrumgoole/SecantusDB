@@ -9,10 +9,9 @@ first in the path to prove resolution walks past it).
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
+import pg_oracle
 from secantus.sql.engine import run_sql
 from secantus.sql.session import Session
 from secantus.storage import Storage
@@ -246,19 +245,17 @@ class TestNestedAggregatesAreNotFolded:
 
 def _pg_oracle():
     """A live PostgreSQL to check against, or None. Point elsewhere with
-    SECANTUS_PG_ORACLE_DSN."""
-    dsn = os.environ.get(
-        "SECANTUS_PG_ORACLE_DSN", "host=127.0.0.1 port=5432 dbname=postgres user=jdrumgoole"
-    )
-    try:
-        import psycopg
+    SECANTUS_PG_ORACLE_DSN.
 
-        return psycopg.connect(dsn, autocommit=True, connect_timeout=3)
-    except Exception:
-        return None
+    Delegates to `pg_oracle` so all six oracle suites share one probe, and one
+    skip reason that says why. The inline copies this replaced had drifted to
+    three different default DSNs and skipped with a message indistinguishable
+    from "PostgreSQL is not installed".
+    """
+    return pg_oracle.connect()
 
 
-@pytest.mark.skipif(_pg_oracle() is None, reason="no local PostgreSQL oracle")
+@pytest.mark.skipif(not pg_oracle.available(), reason=pg_oracle.skip_reason())
 def test_search_path_resolution_matches_real_postgres(db):
     """The hand-derived expectations above say what we believe; this says what
     PostgreSQL actually does. Every shape here diverged before 2026-08-29 —

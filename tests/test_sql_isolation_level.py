@@ -22,12 +22,13 @@ overstated it (autocommit, the common path, is already correct).
 
 from __future__ import annotations
 
-import os
 import tempfile
 import threading
 import time
 
 import pytest
+
+import pg_oracle
 
 psycopg = pytest.importorskip("psycopg")
 
@@ -173,20 +174,11 @@ def test_begin_isolation_level_is_reported_back(dsn, level):
 
 
 def _pg_oracle_dsn():
-    return os.environ.get(
-        "SECANTUS_PG_ORACLE_DSN", "host=127.0.0.1 port=5432 dbname=postgres user=jdrumgoole"
-    )
+    """Delegates to `pg_oracle`, the one probe the six oracle suites share."""
+    return pg_oracle.dsn()
 
 
-def _oracle_reachable():
-    try:
-        psycopg.connect(_pg_oracle_dsn(), connect_timeout=3).close()
-        return True
-    except Exception:  # noqa: BLE001
-        return False
-
-
-@pytest.mark.skipif(not _oracle_reachable(), reason="no local PostgreSQL oracle")
+@pytest.mark.skipif(not pg_oracle.available(), reason=pg_oracle.skip_reason())
 def test_autocommit_and_repeatable_read_match_real_postgres(dsn):
     """The two cases we claim to match, checked against the real server rather
     than against a hand-derived number."""

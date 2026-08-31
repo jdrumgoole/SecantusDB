@@ -276,25 +276,39 @@ Both procedures are managed by skills — they auto-fire on the relevant trigger
 Every bug found in the 2026-08 sweeps came from **executing behaviour and
 comparing against a real server**, not from reading code or the backlog. Two
 reference servers are on this box and both are cheap: `mongod` on `PATH`
-(Homebrew `mongodb-community`, **8.2.1** as of 2026-08-31, linked as the default
-so the differential gate runs instead of skipping), and a live PostgreSQL 14 for
-the SQL side.
+(Homebrew `mongodb-community@8.2`, **8.2.11** as of 2026-08-31, linked as the
+default so the differential gate runs instead of skipping), and a live
+PostgreSQL 14 for the SQL side.
 
-**8.2.11 is installed separately** at
-`/opt/homebrew/opt/mongodb-community@8.2.11/bin/mongod`, from the official
-tarball rather than Homebrew — put it first on `PATH` to probe against it.
 **Check `mongod --version` before recording a measurement**: a *patch* bump has
 changed an error message here before (the expected-type list ordering above), so
-"8.x" is not specific enough to cite.
+"8.x" is not specific enough to cite. Cite the version you measured, and prefer
+a `Cellar` path over an `opt` symlink when you want a *specific* build — the
+symlinks move under you, which is how the paragraph this replaced went stale.
 
-**No other version is currently installed.** 6.0.16 and 8.3.4 are gone, so the
-version-difference probing that older entries describe cannot be reproduced
-as-is; `/opt/homebrew/opt/mongodb-community@{8.0,8.2}` both symlink the *same*
-8.2.1 keg and are not the distinct versions their names suggest. Homebrew cannot
-supply 8.2.11 either — the `mongodb/brew` tap is stale (its `@8.2` pins 8.2.10,
-and the unversioned formula points at 8.3.3, which diverges per the note above)
-and is marked untrusted. Fetch a specific build from
-`https://fastdl.mongodb.org/osx/mongodb-macos-arm64-<version>.tgz`.
+**Three builds are installed, all via Homebrew** (measured 2026-08-31 by running
+each binary's `--version`, not by reading the formula names):
+
+| Build | Path |
+| --- | --- |
+| 6.0.16 | `/opt/homebrew/Cellar/mongodb-community@6.0/6.0.16/bin/mongod` |
+| **8.2.11** (on `PATH`) | `/opt/homebrew/Cellar/mongodb-community@8.2/8.2.11/bin/mongod` |
+| 8.3.4 | `/opt/homebrew/Cellar/mongodb-community/8.3.4/bin/mongod` |
+
+Put a `Cellar` `bin` first on `PATH` to probe against a non-default build. So
+the version-difference probing older entries describe **is** reproducible: both
+the 6.0-versus-8.2 comparisons and the 8.3.4 `fullDocument`-position watch item
+can be re-run here today.
+
+Two naming traps in the `opt` symlinks, which is what an earlier version of this
+paragraph got wrong: there is **no `@8.0`** at all, and both
+`/opt/homebrew/opt/mongodb-community` (unversioned) and `@8.3` point at the same
+**8.3.4** keg — which diverges from 8.2 per the note above, so neither is a safe
+default to probe through. **8.2.1 is not installed**; entries citing it record a
+build that is no longer on this box. The `mongodb/brew` tap is current and
+supplies 8.2.11 as `@8.2`'s stable — earlier advice to fetch a tarball from
+`https://fastdl.mongodb.org/osx/mongodb-macos-arm64-<version>.tgz` is only
+needed for a build the tap does not carry.
 
 The standing gate is
 `tests/test_mongod_differential.py` (`pytest -m differential`) — a probe that
