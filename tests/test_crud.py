@@ -3812,21 +3812,31 @@ def test_create_capped_without_size_rejected(client: MongoClient) -> None:
 
 
 def test_create_capped_negative_size_rejected(client: MongoClient) -> None:
+    """A negative ``size`` is BadValue (2) with a floor of ONE, not 72.
+
+    Re-probed 8.2.11 (2026-08-31). This asserted 72 with our own semantic
+    wording; mongod answers ``2 BSON field 'size' value must be >= 1, actual
+    value '-1'`` -- a bare field name, and a minimum of 1 rather than 0.
+    """
     from pymongo.errors import OperationFailure
 
     db = client["capped_negsize_db"]
     with pytest.raises(OperationFailure) as exc:
         db.create_collection("logs", capped=True, size=-1)
-    assert exc.value.code == 72
+    assert exc.value.code == 2
+    assert "BSON field 'size' value must be >= 1, actual value '-1'" in str(exc.value)
 
 
-def test_create_capped_zero_max_rejected(client: MongoClient) -> None:
-    from pymongo.errors import OperationFailure
+def test_create_capped_zero_max_is_accepted(client: MongoClient) -> None:
+    """``max`` has NO lower bound -- 0, -1 and a non-integral double all pass.
 
+    This test used to assert a 72 rejection, which was our behaviour and not
+    mongod's (re-probed 8.2.11, 2026-08-31: all three are accepted).
+    """
     db = client["capped_zeromax_db"]
-    with pytest.raises(OperationFailure) as exc:
-        db.create_collection("logs", capped=True, size=4096, max=0)
-    assert exc.value.code == 72
+    db.create_collection("logs", capped=True, size=4096, max=0)
+    info = next(c for c in db.list_collections() if c["name"] == "logs")
+    assert info["options"]["capped"] is True
 
 
 def test_create_uncapped_options_absent(client: MongoClient) -> None:
