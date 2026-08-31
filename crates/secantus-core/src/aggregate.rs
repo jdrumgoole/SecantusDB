@@ -409,8 +409,15 @@ pub fn may_name_runtime_error(stages: &[Bson]) -> bool {
     fn has_numeric_guard(expr: &Bson) -> bool {
         match expr {
             Bson::Document(d) => d.iter().any(|(k, v)| {
-                (k != "$literal" && NUMERIC_GUARD.iter().any(|(n, _)| n == k))
-                    || (k != "$literal" && has_numeric_guard(v))
+                // `(A && B) || (A && C)` factored to `A && (B || C)`: identical,
+                // and it keeps the cheap table lookup ahead of the recursive
+                // call, which clippy's own suggested rewrite would have
+                // reversed. Unfactored this trips `clippy::nonminimal_bool`,
+                // which CI runs as `-D warnings` -- green today only because
+                // the workflows take an unpinned `stable` toolchain whose
+                // clippy is older than 0.1.96.
+                k != "$literal"
+                    && (NUMERIC_GUARD.iter().any(|(n, _)| n == k) || has_numeric_guard(v))
             }),
             Bson::Array(a) => a.iter().any(has_numeric_guard),
             _ => false,
