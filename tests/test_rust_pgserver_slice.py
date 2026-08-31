@@ -331,3 +331,61 @@ def test_parameterised_queries_go_over_the_extended_protocol(home: Path) -> None
         assert cur.rowcount == 1
         cur.execute("SELECT id, n FROM t ORDER BY id")
         assert cur.fetchall() == [(1, 99), (2, 20), (4, 40)]
+
+
+def test_drop_table_removes_the_catalog_entry(home: Path) -> None:
+    """A dropped table must leave nothing behind.
+
+    The collection AND its `__sql_catalog__` document both go; a surviving
+    catalog row pointing at a vanished collection is the unrecoverable half,
+    which is why the drop does the collection first.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t (id int PRIMARY KEY, n int)")
+        cur.execute("INSERT INTO t VALUES (1, 10)")
+        cur.execute("DROP TABLE t")
+
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("SELECT id FROM t")
+        assert exc.value.diag.sqlstate == "42P01"
+
+        # Recreating with a DIFFERENT shape proves the old catalog row is gone
+        # rather than merely orphaned.
+        cur.execute("CREATE TABLE t (id int PRIMARY KEY, s text)")
+        cur.execute("INSERT INTO t VALUES (1, 'fresh')")
+        cur.execute("SELECT id, s FROM t")
+        assert cur.fetchall() == [(1, "fresh")]
+
+
+def test_drop_table_if_exists_and_missing(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t (id int PRIMARY KEY)")
+        cur.execute("DROP TABLE t")
+        # Bare DROP of a missing table is 42P01; IF EXISTS is a no-op that
+        # still reports the DROP TABLE tag (probed PG 14).
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("DROP TABLE t")
+        assert exc.value.diag.sqlstate == "42P01"
+        cur.execute("DROP TABLE IF EXISTS t")
+        cur.execute("DROP TABLE IF EXISTS nope1, nope2")
+
+
+def test_casts_carry_postgres_types_not_value_types(home: Path) -> None:
+    """`Describe` precedes `Bind`, so a column's type cannot be read off the
+    value — it comes from the cast."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT %s::int", ("42",))
+        assert cur.fetchall() == [(42,)]
+        assert cur.description[0].type_code == 23  # int4, not varchar
+        cur.execute("SELECT 1::text")
+        assert cur.fetchall() == [("1",)]
+        assert cur.description[0].type_code == 25  # text, NOT varchar (1043)
+        cur.execute("SELECT NULL::int")
+        assert cur.fetchall() == [(None,)]
+        assert cur.description[0].type_code == 23
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("SELECT 'x'::int")
+        assert exc.value.diag.sqlstate == "22P02"

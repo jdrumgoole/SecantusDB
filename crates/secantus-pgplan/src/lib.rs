@@ -14,8 +14,8 @@
 use bson::{doc, Bson, Document};
 use pg_query::protobuf::node::Node as N;
 use pg_query::protobuf::{
-    a_const, AExpr, AExprKind, BoolExprType, NullTestType, SortByDir, SortByNulls,
-    TransactionStmtKind,
+    a_const, AExpr, AExprKind, BoolExprType, DropBehavior, NullTestType, ObjectType, SortByDir,
+    SortByNulls, TransactionStmtKind,
 };
 use secantus_pgcatalog::{Column, TableDef};
 
@@ -34,6 +34,8 @@ pub enum Error {
     Grouping(String),
     /// A `$N` with no bound value -> 42P02.
     Parameter(String),
+    /// A value that cannot be read as its target type -> 22P02.
+    InvalidText(String),
 }
 
 impl std::fmt::Display for Error {
@@ -45,6 +47,7 @@ impl std::fmt::Display for Error {
             Error::UndefinedTable(t) => write!(f, "relation \"{t}\" does not exist"),
             Error::Grouping(m) => write!(f, "{m}"),
             Error::Parameter(m) => write!(f, "{m}"),
+            Error::InvalidText(m) => write!(f, "{m}"),
         }
     }
 }
@@ -57,8 +60,9 @@ impl Error {
             Error::Unsupported(_) => "0A000", // feature_not_supported
             Error::UndefinedColumn(_) => "42703",
             Error::UndefinedTable(_) => "42P01",
-            Error::Grouping(_) => "42803",  // grouping_error
-            Error::Parameter(_) => "42P02", // undefined_parameter
+            Error::Grouping(_) => "42803",    // grouping_error
+            Error::Parameter(_) => "42P02",   // undefined_parameter
+            Error::InvalidText(_) => "22P02", // invalid_text_representation
         }
     }
 }
@@ -73,6 +77,7 @@ pub enum Statement {
     Select(Select),
     SelectConstant(SelectConstant),
     Transaction(TransactionControl),
+    DropTable(DropTable),
     Aggregate(Aggregate),
     Update(Update),
     Delete(Delete),
@@ -199,8 +204,22 @@ pub enum TransactionControl {
 /// answer it is unusable by real drivers even if every table query works.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectConstant {
-    /// (output name, value).
-    pub columns: Vec<(String, Bson)>,
+    /// (output name, value, declared PostgreSQL type).
+    ///
+    /// The type is carried EXPLICITLY rather than inferred from the value.
+    /// `Describe` arrives before `Bind` and is planned against NULL
+    /// placeholders, so inferring from the value typed `$1::int` as `varchar`
+    /// and the client then decoded a perfectly good integer as a string.
+    pub columns: Vec<(String, Bson, String)>,
+}
+
+/// `DROP TABLE a, b` / `DROP TABLE IF EXISTS a`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropTable {
+    pub tables: Vec<String>,
+    /// `IF EXISTS`: a missing table is not an error (probed PG 14, which still
+    /// answers the `DROP TABLE` tag).
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -259,6 +278,7 @@ pub fn plan_with_params(
         N::CreateStmt(c) => plan_create(&c),
         N::InsertStmt(i) => plan_insert(&i, lookup, params),
         N::SelectStmt(s) => plan_select(&s, lookup, params),
+        N::DropStmt(d) => plan_drop(&d),
         N::TransactionStmt(t) => {
             // Named enum, not the wire integer -- twice bitten already.
             match TransactionStmtKind::try_from(t.kind) {
@@ -784,13 +804,24 @@ fn session_function(name: &str) -> Option<Bson> {
     })
 }
 
+/// The PostgreSQL type a constant value carries when nothing declares one.
+fn inferred_type(v: &Bson) -> &'static str {
+    match v {
+        Bson::Int32(_) => "int4",
+        Bson::Int64(_) => "int8",
+        Bson::Double(_) => "float8",
+        Bson::Boolean(_) => "bool",
+        _ => "text",
+    }
+}
+
 fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> Result<Statement> {
-    let mut columns: Vec<(String, Bson)> = Vec::new();
+    let mut columns: Vec<(String, Bson, String)> = Vec::new();
     for t in &s.target_list {
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
             return Err(Error::Unsupported("this target".into()));
         };
-        let (default_name, value) = match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
+        let (default_name, value, pg_type) = match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
             Some(N::FuncCall(f)) => {
                 let name = f
                     .funcname
@@ -803,7 +834,8 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     .unwrap_or_default();
                 let v = session_function(&name)
                     .ok_or_else(|| Error::Unsupported(format!("function {name}()")))?;
-                (name, v)
+                let t = inferred_type(&v).to_string();
+                (name, v, t)
             }
             // `current_user` and friends parse as bare column refs, not calls.
             Some(N::ColumnRef(c)) => {
@@ -818,11 +850,23 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     .ok_or_else(|| Error::Unsupported("this target".into()))?;
                 let v =
                     session_function(&name).ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
-                (name, v)
+                let t = inferred_type(&v).to_string();
+                (name, v, t)
             }
-            Some(N::AConst(_)) | Some(N::ParamRef(_)) => {
+            Some(node @ (N::AConst(_) | N::ParamRef(_) | N::TypeCast(_))) => {
                 let v = const_value(rt.val.as_ref().expect("checked"), params)?;
-                ("?column?".to_string(), v)
+                // A cast DECLARES the type; anything else takes the value's.
+                // This must not depend on the value, because Describe plans
+                // with NULL placeholders.
+                let t = match node {
+                    N::TypeCast(tc) => tc
+                        .type_name
+                        .as_ref()
+                        .map(|n| type_name(&n.names))
+                        .unwrap_or_else(|| inferred_type(&v).to_string()),
+                    _ => inferred_type(&v).to_string(),
+                };
+                ("?column?".to_string(), v, t)
             }
             Some(other) => return Err(Error::Unsupported(disc(other))),
             None => return Err(Error::Unsupported("an empty target".into())),
@@ -832,9 +876,135 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         } else {
             rt.name.clone()
         };
-        columns.push((out, value));
+        columns.push((out, value, pg_type));
     }
     Ok(Statement::SelectConstant(SelectConstant { columns }))
+}
+
+/// `DROP TABLE`. Other DROP targets (index, view, schema) stay unsupported --
+/// each needs its own catalog work, and dropping the wrong thing silently
+/// would be unrecoverable.
+/// Coerce a value to a PostgreSQL type, as `::` does.
+///
+/// Probed PG 14: `'1'::int` is 1, `1::text` is `"1"`, `'1.5'::float8` is 1.5,
+/// `'true'::bool` is true, and **`null::int` stays NULL** rather than becoming
+/// a zero. A value that cannot be read as the target type is `22P02
+/// invalid_text_representation`, quoting the offending input the way
+/// PostgreSQL does.
+fn cast_value(value: Bson, target: &str) -> Result<Bson> {
+    // A NULL survives every cast; only its declared type changes.
+    if value == Bson::Null {
+        return Ok(Bson::Null);
+    }
+    let as_text = |v: &Bson| match v {
+        Bson::String(s) => s.clone(),
+        Bson::Int32(i) => i.to_string(),
+        Bson::Int64(i) => i.to_string(),
+        Bson::Double(d) => {
+            // PostgreSQL renders a whole float8 without a trailing `.0`.
+            if d.fract() == 0.0 && d.is_finite() {
+                format!("{}", *d as i64)
+            } else {
+                d.to_string()
+            }
+        }
+        Bson::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
+        other => format!("{other:?}"),
+    };
+    let bad = |want: &str, v: &Bson| {
+        Error::InvalidText(format!(
+            "invalid input syntax for type {want}: \"{}\"",
+            as_text(v)
+        ))
+    };
+
+    match target {
+        "int4" | "int2" | "integer" | "int" | "smallint" => match &value {
+            Bson::Int32(_) => Ok(value),
+            Bson::Int64(i) => i32::try_from(*i)
+                .map(Bson::Int32)
+                .map_err(|_| Error::InvalidText(format!("integer out of range: \"{i}\""))),
+            Bson::Double(d) => Ok(Bson::Int32(d.round() as i32)),
+            Bson::String(s) => s
+                .trim()
+                .parse::<i32>()
+                .map(Bson::Int32)
+                .map_err(|_| bad("integer", &value)),
+            _ => Err(bad("integer", &value)),
+        },
+        "int8" | "bigint" => match &value {
+            Bson::Int32(i) => Ok(Bson::Int64(i64::from(*i))),
+            Bson::Int64(_) => Ok(value),
+            Bson::Double(d) => Ok(Bson::Int64(d.round() as i64)),
+            Bson::String(s) => s
+                .trim()
+                .parse::<i64>()
+                .map(Bson::Int64)
+                .map_err(|_| bad("bigint", &value)),
+            _ => Err(bad("bigint", &value)),
+        },
+        "float4" | "float8" | "numeric" | "real" | "double" => match &value {
+            Bson::Int32(i) => Ok(Bson::Double(f64::from(*i))),
+            Bson::Int64(i) => Ok(Bson::Double(*i as f64)),
+            Bson::Double(_) => Ok(value),
+            Bson::String(s) => s
+                .trim()
+                .parse::<f64>()
+                .map(Bson::Double)
+                .map_err(|_| bad("double precision", &value)),
+            _ => Err(bad("double precision", &value)),
+        },
+        "bool" | "boolean" => match &value {
+            Bson::Boolean(_) => Ok(value),
+            Bson::Int32(i) => Ok(Bson::Boolean(*i != 0)),
+            Bson::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "t" | "true" | "y" | "yes" | "on" | "1" => Ok(Bson::Boolean(true)),
+                "f" | "false" | "n" | "no" | "off" | "0" => Ok(Bson::Boolean(false)),
+                _ => Err(bad("boolean", &value)),
+            },
+            _ => Err(bad("boolean", &value)),
+        },
+        "text" | "varchar" | "bpchar" | "char" | "name" => Ok(Bson::String(as_text(&value))),
+        other => Err(Error::Unsupported(format!("a cast to {other}"))),
+    }
+}
+
+fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
+    if ObjectType::try_from(d.remove_type) != Ok(ObjectType::ObjectTable) {
+        return Err(Error::Unsupported(format!(
+            "DROP of {:?}",
+            ObjectType::try_from(d.remove_type)
+        )));
+    }
+    // CASCADE would have to chase dependants; refuse rather than silently
+    // behave as RESTRICT. DropBehavior: Restrict = 1, Cascade = 2.
+    if DropBehavior::try_from(d.behavior) == Ok(DropBehavior::DropCascade) {
+        return Err(Error::Unsupported("DROP TABLE ... CASCADE".into()));
+    }
+    let mut tables = Vec::new();
+    for obj in &d.objects {
+        // Each object is a List of name parts (schema, table).
+        let parts = match obj.node.as_ref() {
+            Some(N::List(l)) => &l.items,
+            _ => return Err(Error::Unsupported("this DROP target".into())),
+        };
+        let name = parts
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                N::String(s) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .next_back()
+            .ok_or_else(|| Error::Unsupported("this DROP target".into()))?;
+        tables.push(name);
+    }
+    if tables.is_empty() {
+        return Err(Error::Parse("DROP TABLE with no table".into()));
+    }
+    Ok(Statement::DropTable(DropTable {
+        tables,
+        if_exists: d.missing_ok,
+    }))
 }
 
 fn plan_update(
@@ -951,6 +1121,21 @@ pub fn lower_where(
 /// `params[0]`. A statement planned without parameters passes an empty slice,
 /// and a `$N` beyond its end is a client error rather than a panic.
 fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
+    // `'1'::int`, `$1::text`, `null::int`. The cast is applied to whatever the
+    // operand evaluates to, so a bound parameter casts exactly like a literal.
+    if let Some(N::TypeCast(tc)) = node.node.as_ref() {
+        let arg = tc
+            .arg
+            .as_ref()
+            .ok_or_else(|| Error::Parse("cast with no operand".into()))?;
+        let value = const_value(arg, params)?;
+        let target = tc
+            .type_name
+            .as_ref()
+            .map(|t| type_name(&t.names))
+            .unwrap_or_default();
+        return cast_value(value, &target);
+    }
     if let Some(N::ParamRef(p)) = node.node.as_ref() {
         let idx = usize::try_from(p.number).unwrap_or(0);
         if idx == 0 {

@@ -183,9 +183,36 @@ setup in `BEGIN`/`COMMIT` (transaction statements did not exist). Both are now
 implemented — transactions with real `UserTransactionHandle`s, so `ROLLBACK`
 actually discards rather than reporting success.
 
-**Sequencing note for the next batch:** `DROP TABLE` is 316 failures for a
-trivial amount of work, and `TypeCast` plus target-list `AExpr` are together
-1,252. Those three are the cheapest route to a materially different number.
+### 0.10 DROP TABLE + TypeCast (2026-08-31): 694 -> 746
+
+Both blockers closed; **neither appears in the ranking any more**. The gauge
+moved **694 -> 746 passed, errors 417 -> 333**.
+
+**+52, not +836, and that is the lesson.** The blocker counts are per-test
+occurrences of the FIRST error each test hits. A test blocked by `DROP TABLE`
+usually needs several other things as well, so removing one obstacle mostly
+reveals the next. Read the ranking as "what to build", never as "how many tests
+this will win".
+
+Updated ranking:
+
+| n | blocker |
+|---:|---|
+| **737** | `AExpr` — expressions in a target list. Now the clear #1. |
+| 503 | `VariableSetStmt` — `SET`/`RESET` |
+| 274 | `CopyStmt` |
+| 83 | `AArrayExpr` — array literals |
+| 72 | `DeclareCursorStmt` |
+| 66 | casts to `interval` |
+| 59 | `set_config()` |
+
+**A type-system trap worth remembering.** `Describe` runs BEFORE `Bind`, so a
+column's type cannot be inferred from its value — at that point `$1::int` has
+no value. Inferring typed it `varchar`, and the client then decoded a correct
+integer as a string. Types must come from the expression that declares them.
+The same fix caught `text` being reported as `varchar` (oid 25 vs 1043):
+psycopg decodes both to `str` so no value comparison notices, but pgjdbc and
+pgx read the oid.
 
 ### 0.7 P5, first batch (2026-08-31): three-valued logic is where the bugs are
 

@@ -152,6 +152,18 @@ QUERIES = [
     # --- projection ----------------------------------------------------------
     "SELECT id, n, s FROM d ORDER BY id",
     "SELECT s AS label FROM d ORDER BY id",
+    # --- casts. The declared type matters as much as the value: `Describe`
+    # runs before `Bind`, so a type inferred from the (NULL) value typed
+    # `$1::int` as varchar and the client decoded an integer as a string.
+    "SELECT '1'::int",
+    "SELECT 1::text",
+    "SELECT '1.5'::float8",
+    "SELECT 'true'::bool",
+    "SELECT NULL::int",
+    "SELECT '42'::int8",
+    "SELECT 1::float8",
+    "SELECT id FROM d WHERE n = '3'::int",
+    "SELECT id FROM d WHERE n > '1'::int",
     "SELECT * FROM d ORDER BY id",
     "SELECT n, id FROM d ORDER BY id",
     "SELECT id, id FROM d ORDER BY id",
