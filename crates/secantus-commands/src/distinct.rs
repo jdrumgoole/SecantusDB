@@ -66,6 +66,15 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     };
     let filter = doc_field(doc, "query");
     let collation = collation_of(doc);
+    // `distinct` takes a hint like every other read, and mongod REFUSES the
+    // command when it names no index rather than scanning (probed 8.2.11,
+    // 2026-08-31: code 2; a valid index name or key spec is accepted). This
+    // handler passed `None` here, so a bogus hint silently returned full
+    // results -- the only hint-bearing command that did not resolve the field.
+    // Passing it validates AND honours the hint, including a sparse index's
+    // reduced document set, the way `find` does.
+    argtypes::require_hint(doc, "hint")?;
+    let hint = doc.get("hint");
     let storage = ctx.storage()?;
     let bytes = storage
         .find_collated(
@@ -73,7 +82,7 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             &coll,
             &filter,
             None,
-            None,
+            hint,
             collation.as_ref(),
             &Document::new(),
         )

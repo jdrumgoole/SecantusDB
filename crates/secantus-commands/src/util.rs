@@ -68,8 +68,11 @@ pub(crate) fn validate_write_hint(
     let indexes = storage.list_indexes(db, coll).unwrap_or_default();
     let known = match hint {
         Bson::String(s) => {
-            s == "$natural"
-                || s == "_id_"
+            // `"$natural"` is deliberately absent: mongod takes only the
+            // document form and rejects the string (probed 8.2.11,
+            // 2026-08-31). The `Bson::Document` arm below still accepts
+            // `{$natural: ...}`.
+            s == "_id_"
                 || indexes
                     .iter()
                     .any(|i| i.get_str("name").map(|n| n == s).unwrap_or(false))

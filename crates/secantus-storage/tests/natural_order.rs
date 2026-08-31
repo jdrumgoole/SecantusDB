@@ -152,7 +152,9 @@ fn natural_hint_walks_insertion_order() {
         true,
     )
     .unwrap();
-    let hint = secantus_storage::Hint::Name("$natural".to_string());
+    // The DOCUMENT form: mongod takes only `{$natural: ±1}` and rejects the
+    // string, so `Hint::Name("$natural")` is no longer a valid hint here.
+    let hint = secantus_storage::Hint::KeySpec(doc! {"$natural": 1});
     let got: Vec<Bson> = st
         .find_matching_with(
             "app",
@@ -168,6 +170,43 @@ fn natural_hint_walks_insertion_order() {
         .map(|b| dec(b).get("_id").cloned().unwrap())
         .collect();
     assert_eq!(got, vec![Bson::Int32(5), Bson::Int32(1), Bson::Int32(3)]);
+
+    // `{$natural: -1}` is REVERSE insertion order. Both directions used to
+    // resolve to the same token here, so a caller asking for reverse silently
+    // got forward -- wrong data, not an error. The Python server fixed this in
+    // the 2026-08-29 index sweep; this port did not until 2026-08-31.
+    let rev = secantus_storage::Hint::KeySpec(doc! {"$natural": -1});
+    let got_rev: Vec<Bson> = st
+        .find_matching_with(
+            "app",
+            "c",
+            &Document::new(),
+            None,
+            Some(&rev),
+            None,
+            &Document::new(),
+        )
+        .unwrap()
+        .iter()
+        .map(|b| dec(b).get("_id").cloned().unwrap())
+        .collect();
+    assert_eq!(
+        got_rev,
+        vec![Bson::Int32(3), Bson::Int32(1), Bson::Int32(5)]
+    );
+
+    // The string form is refused on both servers.
+    assert!(st
+        .find_matching_with(
+            "app",
+            "c",
+            &Document::new(),
+            None,
+            Some(&secantus_storage::Hint::Name("$natural".to_string())),
+            None,
+            &Document::new(),
+        )
+        .is_err());
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }

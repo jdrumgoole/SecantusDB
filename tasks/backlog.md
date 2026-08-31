@@ -2387,22 +2387,48 @@ These are explicit non-goals. Don't add them without a reason.
   Deliberately left whole rather than half-built — a partial stage tree
   misleads more than a flat one. The IXSCAN node also omits `isPartial` /
   `isSparse` / `isUnique`, which are cheap and could land first.
-- [ ] **`hint: "$natural"` as a STRING is accepted; mongod takes only the
-  document form** (`{$natural: 1}` / `{$natural: -1}`) and rejects the string
-  with `hint provided does not correspond to an existing index`. Ours is a
-  documented convenience (`docs/feature-comparison.md`) with several tests, and
-  pymongo's `.hint("$natural")` produces exactly that string — so a user doing
-  the natural thing gets an error from real MongoDB and a scan from us.
-  Recorded rather than changed: removing it is a user-visible break of a
-  documented feature, which is Joe's call, not a silent fix.
-- [ ] **`distinct.hint` is accepted although mongod 6.0.16 rejects it**
-  (`BSON field 'distinct.hint' is an unknown field.`). A later MongoDB release
-  added a `hint` option to `distinct`, so a current driver may legitimately
-  send it, and accepting is the safe direction for a field whose status changed
-  between versions. The unknown-field rejection added alongside this is probed
-  with an always-unknown field instead, so the differential gate does not
-  depend on which mongod a lane happens to have — see the two version splits
-  recorded below.
+- [x] **RESOLVED (2026-08-31): the hint surface matches mongod on BOTH servers
+  — four defects, two of them found while fixing the other two.** A hint probe
+  across every hint-bearing command (`find` / `count` / `aggregate` /
+  `distinct` / `findAndModify` / `delete` / `update`) against mongod 8.2.11,
+  then against both servers, closed these and ended at **0 divergences on 11
+  shapes, three-way**:
+
+  1. **`hint: "$natural"` as a STRING was accepted; mongod takes only the
+     document form** (`{$natural: 1}` / `{$natural: -1}`). It was recorded as a
+     documented convenience and parked as Joe's call — but `findAndModify`
+     already rejected it here, citing a probe, so the "convenience" was drift
+     that got documented after the fact, not a designed feature. pymongo's
+     `.hint("$natural")` produces exactly that string, so the natural call
+     scanned here and errored against a real server. Now rejected on both
+     servers, with `docs/indexes.md` naming `.hint([("$natural", 1)])` as the
+     form that works everywhere.
+  2. **`distinct` never resolved its hint at all** — the only hint-bearing
+     command that did not. A hint naming no index silently returned full
+     results where mongod refuses the command (code 2). The entry this replaces
+     framed `distinct.hint` as "accepting is the safe direction for a field
+     whose status changed between versions", which is right for a *valid* hint
+     (8.2.11 accepts both `"a_1"` and `{a: 1}`) and silently wrong for a bogus
+     one. Accepting the FIELD and resolving the VALUE are separate things.
+  3. **The Rust server ignored `{$natural: -1}`'s direction**, returning
+     forward insertion order for a caller who asked for reverse — wrong data,
+     not an error. The Python server fixed this in the 2026-08-29 index sweep
+     and the port never followed: dual-server drift that only a three-way probe
+     shows, since the two servers agree with each other on nothing here.
+  4. **The Rust server failed the whole `delete` / `update` command** on an
+     unresolvable hint, where mongod answers `ok: 1` with a per-statement
+     `writeErrors: [{index, code: 2}]` and applies the rest of the batch. The
+     validation sat in a pre-pass loop using `?`. Python was already correct.
+
+  Pinned by 7 new cases in `tests/test_mongod_differential.py` (531 green
+  against 8.2.11) plus wire-level tests in `tests/test_crud.py` and storage
+  tests in `crates/secantus-storage/tests/`. The unknown-field rejection is
+  still probed with an always-unknown field rather than `distinct.hint`, since
+  that slot's status is what changed between versions.
+
+  Still open and unchanged: the *message* for an unresolvable hint is shorter
+  than mongod's planner dump — see the entry on that below; only the code is
+  compared by the gate.
 
 - [x] **Cursor / `getMore` / `killCursors` argument sweep — 22 of 51 shapes
   diverged, four of them CRASHES, all fixed (2026-08-29).** Phase 2's second

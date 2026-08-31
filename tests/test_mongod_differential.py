@@ -1184,6 +1184,25 @@ def _write_hint(db: Database, cmd: dict) -> str:
     return repr(out)
 
 
+def _read_hint(db: Database, cmd: dict) -> str:
+    """A read command's outcome under a hint: the VALUES, or the error code.
+
+    Companion to `_write_hint`. mongod renders its whole query plan in the
+    errmsg for an unresolvable hint and we name the hint instead (see
+    tasks/backlog.md), so the code is compared and the prose is not.
+    """
+    from pymongo.errors import OperationFailure
+
+    try:
+        reply = dict(db.command(cmd))
+    except OperationFailure as exc:
+        d = exc.details or {}
+        return f"error {d.get('code')}/{_stable_code_name(d)}"
+    if "values" in reply:
+        return repr(sorted(reply["values"], key=repr))
+    return repr([d.get("_id") for d in reply.get("cursor", {}).get("firstBatch", [])])
+
+
 HINT_SEED = [{"_id": i, "a": i} for i in range(1, 6)]
 
 
@@ -1247,6 +1266,52 @@ HINT_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
                 },
             )
         ),
+    ),
+    # `$natural` is a DOCUMENT-only hint; the string is a BadValue on every
+    # command that takes one. We accepted the string as a documented
+    # convenience, so `pymongo`'s `.hint("$natural")` scanned here and errored
+    # against a real server -- probed 8.2.11, 2026-08-31.
+    (
+        "find-natural-hint-as-string",
+        HINT_SEED,
+        _with_index(lambda db: _read_hint(db, {"find": "c", "filter": {}, "hint": "$natural"})),
+    ),
+    (
+        "count-natural-hint-as-string",
+        HINT_SEED,
+        _with_index(lambda db: _read_hint(db, {"count": "c", "hint": "$natural"})),
+    ),
+    (
+        "distinct-natural-hint-as-string",
+        HINT_SEED,
+        _with_index(lambda db: _read_hint(db, {"distinct": "c", "key": "a", "hint": "$natural"})),
+    ),
+    (
+        "delete-natural-hint-as-string",
+        HINT_SEED,
+        _with_index(
+            lambda db: _write_hint(
+                db, {"delete": "c", "deletes": [{"q": {}, "limit": 1, "hint": "$natural"}]}
+            )
+        ),
+    ),
+    # `distinct` takes a hint and RESOLVES it: a valid one is honoured, one
+    # naming no index refuses the command. It was the only hint-bearing command
+    # that ignored the field, so a bogus hint returned full results.
+    (
+        "distinct-hint-valid-name",
+        HINT_SEED,
+        _with_index(lambda db: _read_hint(db, {"distinct": "c", "key": "a", "hint": "a_1"})),
+    ),
+    (
+        "distinct-hint-valid-key-spec",
+        HINT_SEED,
+        _with_index(lambda db: _read_hint(db, {"distinct": "c", "key": "a", "hint": {"a": 1}})),
+    ),
+    (
+        "distinct-hint-unresolvable",
+        HINT_SEED,
+        _with_index(lambda db: _read_hint(db, {"distinct": "c", "key": "a", "hint": "nope"})),
     ),
     # $natural direction.
     (

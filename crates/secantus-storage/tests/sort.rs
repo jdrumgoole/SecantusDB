@@ -244,12 +244,13 @@ fn hint_forces_index_and_natural() {
             Some(("a_1".into(), "forward".into()))
         );
         // $natural forces a COLLSCAN even though a_1 would serve {a:30}.
+        // The DOCUMENT form: mongod rejects the bare string (probed 8.2.11).
         assert_eq!(
             plan(
                 st,
                 doc! {"a": 30},
                 None,
-                Some(Hint::Name("$natural".into()))
+                Some(Hint::KeySpec(doc! {"$natural": 1}))
             ),
             ExplainPlan::CollScan
         );
@@ -258,7 +259,7 @@ fn hint_forces_index_and_natural() {
                 st,
                 doc! {"a": 30},
                 None,
-                Some(Hint::Name("$natural".into()))
+                Some(Hint::KeySpec(doc! {"$natural": 1}))
             ),
             vec![1]
         );

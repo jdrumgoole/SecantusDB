@@ -101,7 +101,7 @@ def test_2dsphere_geo_within_index_matches_scan(client: MongoClient) -> None:
     coll.create_index([("loc", "2dsphere")])
     q = {"loc": {"$geoWithin": {"$centerSphere": [[0.0, 0.0], 0.001]}}}
     indexed = sorted(d["_id"] for d in coll.find(q))
-    scanned = sorted(d["_id"] for d in coll.find(q, hint="$natural"))
+    scanned = sorted(d["_id"] for d in coll.find(q, hint={"$natural": 1}))
     assert indexed == scanned
     # Sanity — should pull in the close points but not the far ones.
     assert 4 not in indexed
@@ -121,7 +121,7 @@ def test_2dsphere_near_index_matches_scan(client: MongoClient) -> None:
         }
     }
     indexed = sorted(d["_id"] for d in coll.find(q))
-    scanned = sorted(d["_id"] for d in coll.find(q, hint="$natural"))
+    scanned = sorted(d["_id"] for d in coll.find(q, hint={"$natural": 1}))
     assert indexed == scanned
 
 
@@ -168,7 +168,7 @@ def test_2d_geo_within_box_index(client: MongoClient) -> None:
     coll.create_index([("loc", "2d")])
     q = {"loc": {"$geoWithin": {"$box": [[0.0, 0.0], [10.0, 10.0]]}}}
     indexed = sorted(d["_id"] for d in coll.find(q))
-    scanned = sorted(d["_id"] for d in coll.find(q, hint="$natural"))
+    scanned = sorted(d["_id"] for d in coll.find(q, hint={"$natural": 1}))
     assert indexed == scanned
     assert indexed == [1, 2]
 
@@ -434,7 +434,7 @@ def test_compound_geo_scalar_filters_by_trailing_field(client: MongoClient) -> N
         "loc": {"$geoWithin": {"$centerSphere": [[0, 0], 0.001]}},
     }
     indexed = sorted(d["_id"] for d in coll.find(q))
-    scanned = sorted(d["_id"] for d in coll.find(q, hint="$natural"))
+    scanned = sorted(d["_id"] for d in coll.find(q, hint={"$natural": 1}))
     assert indexed == scanned == [1, 3]
 
 

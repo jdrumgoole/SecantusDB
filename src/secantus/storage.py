@@ -4913,8 +4913,15 @@ class Storage:
         ``BadValue`` error.
         """
         if isinstance(hint, str):
-            if hint == "$natural":
-                return "$natural"
+            # NOT `"$natural"`. mongod takes only the DOCUMENT form
+            # (`{$natural: 1}` / `{$natural: -1}`) and answers BadValue for the
+            # string -- re-probed 8.2.11 (2026-08-31), which is also what
+            # `findAndModify` has always enforced here. We accepted the string
+            # as a documented convenience, which meant `pymongo`'s natural
+            # `.hint("$natural")` scanned for us and errored against a real
+            # server: the exact divergence a conformance target exists to
+            # prevent. The RESOLVED token below is still the string; only user
+            # input is refused.
             if hint == _ID_INDEX_NAME:
                 return _ID_INDEX_NAME
             for name, _key_spec, _sparse, _unique in self._all_indexes(db, coll):

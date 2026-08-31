@@ -185,7 +185,7 @@ still returns a generic `BadValue` for the `$project` case).
 | Text | ✅ | ❌ rejected | ❌ rejected |
 | Hashed | ✅ | ❌ rejected | ❌ rejected |
 | Wildcard (`$**`) | ✅ | ❌ | ❌ |
-| `hint` (name, key spec, `$natural`) | ✅ | ✅ | ✅ |
+| `hint` (name, key spec, `{$natural: ±1}`) | ✅ | ✅ | ✅ |
 | `explain` (IXSCAN/COLLSCAN + `winningPlan` shape) | ✅ | ✅ | ✅ |
 
 ## Collections
