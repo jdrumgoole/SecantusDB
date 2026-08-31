@@ -615,8 +615,8 @@ Specific items that were left out of the slice that introduced their feature are
   stored document.
 
 - [ ] **OPEN — wrong-typed command arguments on the PYTHON server, measured by
-  MESSAGE rather than by code; 311 of 409 closed 2026-08-31, `createIndexes.*`
-  and `collMod.*` remain.** The 87/87 sweep
+  MESSAGE rather than by code; 372 of 409 closed 2026-08-31, `create.*` and
+  `insert.bypassDocumentValidation` remain.** The 87/87 sweep
   below compares `(ok, code)`; comparing `(code, errmsg)` over 685 shapes
   (`tools/probes/arg_types_messages.py`, against mongod 8.2.11) found the
   Python server divergent on **409 CODE + 88 MSG**, including **18 shapes
@@ -639,13 +639,28 @@ Specific items that were left out of the slice that introduced their feature are
   `allowDiskUse`, `aggregate.allowDiskUse`, `ordered` on the three write
   commands, `renameCollection.dropTarget`).
 
-  **The measured remainder is `createIndexes.*` and `collMod.*`** — about 50
-  cases: `createIndexes.collation` / `.partialFilterExpression` /
-  `.expireAfterSeconds` / `.sparse` / `.unique` (mongod wraps these in
-  `Error in specification { ... } :: caused by ::`, code 67 for the TTL one,
-  which is why they were not folded into the object-slot family) and
-  `collMod.validator` / `.preImages` / `.viewOn`. Re-measure with the probe
-  before working them; do not work from this paragraph's counts alone.
+  **`createIndexes.*` and `collMod.*` closed 2026-08-31 (second slice), taking
+  CODE 97 → 37.** `collMod`'s three slots took the plain IDL helpers. The
+  `createIndexes` ones needed `bsontypes.render_bson`, which reproduces
+  mongod's shell rendering of the echoed index spec (`{ key: { a: 1 }, name:
+  "i", collation: 5 }` — inner spaces on non-empty documents and arrays but
+  not empty ones, strings NOT escaped, `new Date(<ms>)`, `BinData(0, ABCD)`
+  with uppercase hex, subtype 4 as `UUID("...")`). Three wrappers, each
+  reproduced verbatim including **two unbalanced quotes that are mongod's
+  own**: `The field 'unique has value ...` and `...a type of 'object`.
+  `unique` / `sparse` accept a DOUBLE (1.5 converts to bool), so they are not
+  the strict-bool rule `insert.ordered` uses.
+
+  Found while there: **`wildcardProjection`'s three arms all answered 67**
+  where mongod answers 14 (wrong type), 9 (empty object, its own wording
+  "can't be an empty object") and 2 (non-wildcard base index), and rendered
+  the spec with Python's `repr`. Fixed; `tests/test_crud.py` had pinned our
+  message rather than mongod's and was rewritten.
+
+  **The measured remainder is `create.capped` / `.size` / `.max` (18 cases)
+  and `insert.bypassDocumentValidation` (5), plus ~10 singletons** — CODE 37 /
+  MSG 57 as of 2026-08-31. Re-measure with the probe before working them; do
+  not work from this paragraph's counts alone.
 
   Two mongod asymmetries worth not re-deriving: `count`'s `limit` and `skip`
   take different parse paths (`limit` → `2 limit value is not a valid number`,

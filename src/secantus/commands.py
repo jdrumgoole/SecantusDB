@@ -3561,6 +3561,87 @@ def _unknown_command_field(
     }
 
 
+def _index_spec_option_error(idx_spec: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Wrong-typed per-index options on ``createIndexes``, or None if OK.
+
+    These do not use the plain ``BSON field '<path>' is the wrong type`` form
+    the other commands share: mongod echoes the OFFENDING SPEC and appends the
+    reason after ``:: caused by ::``. Three distinct shapes, all probed against
+    8.2.11 (2026-08-31), all reproduced verbatim including mongod's own
+    unbalanced quotes:
+
+        collation / partialFilterExpression
+            14  Error in specification <spec> :: caused by ::
+                The field '<name>' must be an object, but got <type>
+            (an explicit null is REJECTED here, unlike most object slots)
+
+        expireAfterSeconds
+            67  . Index spec: <spec> :: caused by :: TTL index
+                'expireAfterSeconds' option must be numeric, but received a
+                type of '<type>
+            (note the leading ". " and the quote that mongod never closes)
+
+        unique / sparse
+            14  Error in specification <spec> :: caused by :: The field
+                '<name> has value <name>: <value>, which is not convertible
+                to bool
+            (again an unclosed quote after ``The field '``. A DOUBLE is
+            ACCEPTED here -- 1.5 converts to bool -- so this is not the same
+            "strictly bool" rule as ``insert.ordered``.)
+
+    The spec is rendered by `bsontypes.render_bson`, which reproduces mongod's
+    shell syntax (``{ key: { a: 1 }, name: "i", collation: 5 }``) rather than
+    Python's repr.
+    """
+    from secantus.bsontypes import render_bson
+
+    rendered = render_bson(idx_spec)
+    for field in ("collation", "partialFilterExpression"):
+        if field in idx_spec and not isinstance(idx_spec[field], Mapping):
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    f"Error in specification {rendered} :: caused by :: "
+                    f"The field '{field}' must be an object, but got "
+                    f"{_bson_type_of(idx_spec[field])}"
+                ),
+                "code": 14,
+                "codeName": "TypeMismatch",
+            }
+    if "expireAfterSeconds" in idx_spec:
+        value = idx_spec["expireAfterSeconds"]
+        if isinstance(value, bool) or not isinstance(value, (int, float, bson.Decimal128)):
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    f". Index spec: {rendered} :: caused by :: TTL index "
+                    f"'expireAfterSeconds' option must be numeric, but received a type of "
+                    f"'{_bson_type_of(value)}"
+                ),
+                "code": 67,
+                "codeName": "CannotCreateIndex",
+            }
+    for field in ("unique", "sparse"):
+        if field in idx_spec:
+            value = idx_spec[field]
+            if not isinstance(value, bool) and not (
+                isinstance(value, (int, float, bson.Decimal128))
+            ):
+                from secantus.bsontypes import render_bson as _r
+
+                return {
+                    "ok": 0.0,
+                    "errmsg": (
+                        f"Error in specification {rendered} :: caused by :: "
+                        f"The field '{field} has value {field}: {_r(value)}, "
+                        f"which is not convertible to bool"
+                    ),
+                    "code": 14,
+                    "codeName": "TypeMismatch",
+                }
+    return None
+
+
 def _require_hint_type(hint: Any) -> dict[str, Any] | None:
     """mongod's wrong-typed-``hint`` reply, or None if OK / absent.
 
@@ -4696,6 +4777,18 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     _err = _require_object_bson_field(doc.get("index"), "collMod.index")
     if _err is not None:
         return _err
+    # Same "parse before executing" rule as `index` above: these were silently
+    # accepted, so a `viewOn: 5` reached the catalog. All three take the plain
+    # IDL form and all three accept an explicit null (probed 8.2.11).
+    for _fld in ("validator", "changeStreamPreAndPostImages"):
+        _err = _require_object_bson_field(doc.get(_fld), f"collMod.{_fld}")
+        if _err is not None:
+            return _err
+    _err = _require_typed_bson_field(
+        doc.get("viewOn"), "collMod.viewOn", expected="string", ok=lambda v: isinstance(v, str)
+    )
+    if _err is not None:
+        return _err
     coll = doc["collMod"]
     if not ctx.storage.collection_exists(ctx.db_name, coll):
         return {
@@ -5139,6 +5232,9 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "codeName": "TypeMismatch",
             }
         options = {k: v for k, v in idx_spec.items() if k not in ("key", "name")}
+        _err = _index_spec_option_error(idx_spec)
+        if _err is not None:
+            return _err
         # Reject unknown options on the index spec itself. Real mongod
         # rejects with ``Location40415`` (40415, IDLUnknownField).
         # mongo-ruby-driver's ``Index::View#create_one when provided a
@@ -5210,16 +5306,30 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # base index`` tests pin both messages via regex.
         wcp = options.get("wildcardProjection")
         if wcp is not None:
-            if not isinstance(wcp, Mapping) or not wcp:
+            # Re-probed 8.2.11 (2026-08-31). All three arms were wrong: the
+            # spec was rendered with Python's repr ({'a': 1}) and without
+            # `name`, and every arm answered 67 where mongod answers three
+            # DIFFERENT codes. A wrong type and an empty object are also
+            # separate errors, not one.
+            from secantus.bsontypes import render_bson as _render
+
+            _spec = f"Error in specification {_render(idx_spec)} :: caused by :: "
+            if not isinstance(wcp, Mapping):
                 return {
                     "ok": 0.0,
                     "errmsg": (
-                        f"Error in specification {{ key: {dict(key_spec)!r}, "
-                        f"wildcardProjection: {wcp!r} }} :: caused by :: "
-                        "wildcardProjection must be a non-empty object"
+                        f"{_spec}The field 'wildcardProjection' must be a non-empty "
+                        f"object, but got {_bson_type_of(wcp)}"
                     ),
-                    "code": 67,
-                    "codeName": "CannotCreateIndex",
+                    "code": 14,
+                    "codeName": "TypeMismatch",
+                }
+            if not wcp:
+                return {
+                    "ok": 0.0,
+                    "errmsg": (f"{_spec}The 'wildcardProjection' field can't be an empty object"),
+                    "code": 9,
+                    "codeName": "FailedToParse",
                 }
             is_wildcard_key = any(
                 isinstance(k, str) and (k == "$**" or k.endswith(".$**")) for k in key_spec
@@ -5228,12 +5338,11 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 return {
                     "ok": 0.0,
                     "errmsg": (
-                        f"Error in specification {{ key: {dict(key_spec)!r}, "
-                        f"wildcardProjection: {dict(wcp)!r} }} :: caused by :: "
-                        "wildcardProjection is only allowed on wildcard indexes"
+                        f"{_spec}The field 'wildcardProjection' is only allowed in "
+                        f"'wildcard' indexes"
                     ),
-                    "code": 67,
-                    "codeName": "CannotCreateIndex",
+                    "code": 2,
+                    "codeName": "BadValue",
                 }
         try:
             new = ctx.storage.create_index(ctx.db_name, coll, name, key_spec, options)
