@@ -91,6 +91,19 @@ pub fn int_promoted_to_bson(r: i128, operand_wide: bool) -> Option<Bson> {
     }
 }
 
+/// The BSON width of an integral *aggregation* result, with mongod's
+/// saturation: `long` is contagious, an int32 result that outgrows its width
+/// becomes a long, and one past int64 becomes a **double** rather than an
+/// error (`$pow: [2, 64]` answers 1.8446744073709552e+19). The *update*
+/// operators fail instead -- see `expressions._int_result` /
+/// `numerics.IntegerOverflowError` on the Python side. Probed 8.2.11.
+pub fn int_result(r: i128, operand_wide: bool) -> Bson {
+    match int_promoted_to_bson(r, operand_wide) {
+        Some(b) => b,
+        None => Bson::Double(r as f64),
+    }
+}
+
 fn normalize(digits: &mut Vec<u8>, exp: &mut i64) {
     while digits.first() == Some(&0) {
         digits.remove(0);

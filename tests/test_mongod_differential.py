@@ -2414,6 +2414,153 @@ FOLD_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ("field-ok", FOLD_SEED, _f({"$abs": "$n"})),
 ]
 
+# The BSON *type* an expression answers, alongside its value. These bugs were
+# invisible to a value-only comparison -- `$trunc` of a long answered the right
+# number as the wrong type -- so every case here pins `$type` too.
+#
+# Three rules, all probed on 8.2.11:
+#   * the rounding operators are type-preserving (a double in is a double out,
+#     `$ceil` of 1.5 is 2.0);
+#   * `long` is contagious through arithmetic, and an int32 result that
+#     outgrows its width widens to long;
+#   * an integral result past int64 saturates to a **double** in an
+#     aggregation (`$pow: [2, 64]`), where the *update* operators fail --
+#     see `UPDATE_OVERFLOW_CASES`.
+NUMTYPE_SEED = [{"_id": 1, "n": 2, "big": Int64(9223372036854775807), "small": Int64(5)}]
+
+
+def _tv(expr: object) -> Callable[[Database], object]:
+    from pymongo.errors import OperationFailure
+
+    def run(db: Database) -> object:
+        try:
+            doc = list(db.c.aggregate([{"$addFields": {"z": expr, "zt": {"$type": expr}}}]))[0]
+            return f"{doc['zt']}={doc['z']!r}"
+        except OperationFailure as exc:
+            msg = re.sub(r"namespace: [^ ]+", "namespace: <ns>", str(exc.details.get("errmsg", "")))
+            return f"{exc.code}/{_stable_code_name(exc.details)}: {msg}"
+
+    return run
+
+
+NUMTYPE_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    # type-preserving rounding
+    ("ceil-double", NUMTYPE_SEED, _tv({"$ceil": 1.5})),
+    ("floor-double", NUMTYPE_SEED, _tv({"$floor": 1.5})),
+    ("trunc-double", NUMTYPE_SEED, _tv({"$trunc": 1.5})),
+    ("round-double", NUMTYPE_SEED, _tv({"$round": 1.5})),
+    ("trunc-int", NUMTYPE_SEED, _tv({"$trunc": 1})),
+    ("trunc-long", NUMTYPE_SEED, _tv({"$trunc": "$small"})),
+    ("floor-long", NUMTYPE_SEED, _tv({"$floor": "$small"})),
+    ("ceil-long", NUMTYPE_SEED, _tv({"$ceil": "$small"})),
+    ("round-long", NUMTYPE_SEED, _tv({"$round": "$small"})),
+    ("abs-long", NUMTYPE_SEED, _tv({"$abs": "$small"})),
+    # long is contagious
+    ("add-long-int", NUMTYPE_SEED, _tv({"$add": ["$small", 1]})),
+    ("subtract-long-int", NUMTYPE_SEED, _tv({"$subtract": ["$small", 1]})),
+    ("multiply-long-int", NUMTYPE_SEED, _tv({"$multiply": ["$small", 2]})),
+    ("mod-long-int", NUMTYPE_SEED, _tv({"$mod": ["$small", 2]})),
+    ("pow-long-int", NUMTYPE_SEED, _tv({"$pow": ["$small", 2]})),
+    ("add-int-int", NUMTYPE_SEED, _tv({"$add": [1, 2]})),
+    # int32 overflow widens to long
+    ("add-int32-overflow", NUMTYPE_SEED, _tv({"$add": [2147483647, 1]})),
+    ("multiply-int32-overflow", NUMTYPE_SEED, _tv({"$multiply": [2147483647, 2]})),
+    ("abs-int32-min", NUMTYPE_SEED, _tv({"$abs": -2147483648})),
+    # int64 overflow saturates to a double
+    ("add-int64-overflow", NUMTYPE_SEED, _tv({"$add": ["$big", 1]})),
+    ("multiply-int64-overflow", NUMTYPE_SEED, _tv({"$multiply": ["$big", 2]})),
+    ("pow-int64-overflow", NUMTYPE_SEED, _tv({"$pow": [2, 64]})),
+    ("pow-huge-is-inf", NUMTYPE_SEED, _tv({"$pow": [10, 400]})),
+    # `$mod` truncates toward zero, so the sign follows the DIVIDEND
+    ("mod-neg-dividend", NUMTYPE_SEED, _tv({"$mod": [-5, 2]})),
+    ("mod-neg-divisor", NUMTYPE_SEED, _tv({"$mod": [5, -2]})),
+    ("mod-both-neg", NUMTYPE_SEED, _tv({"$mod": [-5, -2]})),
+    ("mod-double", NUMTYPE_SEED, _tv({"$mod": [-5.5, 2]})),
+    # the degree/radian factor is precomputed, which shows in the last bit
+    ("degrees-to-radians", NUMTYPE_SEED, _tv({"$degreesToRadians": 1.5})),
+    ("radians-to-degrees", NUMTYPE_SEED, _tv({"$radiansToDegrees": 1.5})),
+    ("degrees-to-radians-int", NUMTYPE_SEED, _tv({"$degreesToRadians": 7})),
+]
+
+# `$toLower` / `$toUpper` coerce their operand to a string first, and that
+# conversion is NOT `$toString`'s: it takes a javascript value but rejects a
+# bool and an ObjectId, renders a double through `%g` (six significant digits)
+# where `$toString` round-trips it, and turns null and missing into `""` where
+# `$toString` gives null. Both probed against 8.2.11.
+STR_SEED = [{"_id": 1, "n": 2, "s": "aB", "d": 1099511627776.0, "arr": [1], "o": {"k": 1}}]
+
+STRCONV_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    ("lower-int", STR_SEED, _tv({"$toLower": 1})),
+    ("lower-negative", STR_SEED, _tv({"$toLower": -1})),
+    ("lower-double-fraction", STR_SEED, _tv({"$toLower": 1.5})),
+    ("lower-double-whole", STR_SEED, _tv({"$toLower": 4.0})),
+    ("lower-double-wide", STR_SEED, _tv({"$toLower": "$d"})),
+    ("lower-decimal", STR_SEED, _tv({"$toLower": Decimal128("2.5")})),
+    ("lower-null", STR_SEED, _tv({"$toLower": None})),
+    ("lower-missing", STR_SEED, _tv({"$toLower": "$nosuch"})),
+    ("lower-date", STR_SEED, _tv({"$toLower": datetime(2026, 1, 2, 3, 4, 5)})),
+    ("lower-field", STR_SEED, _tv({"$toLower": "$s"})),
+    ("lower-bool-rejected", STR_SEED, _tv({"$toLower": True})),
+    ("lower-oid-rejected", STR_SEED, _tv({"$toLower": ObjectId("64b7f9a2c1d2e3f4a5b6c7d8")})),
+    ("lower-array-rejected", STR_SEED, _tv({"$toLower": "$arr"})),
+    ("lower-object-rejected", STR_SEED, _tv({"$toLower": "$o"})),
+    ("upper-double-wide", STR_SEED, _tv({"$toUpper": "$d"})),
+    ("upper-field", STR_SEED, _tv({"$toUpper": "$s"})),
+    ("upper-date", STR_SEED, _tv({"$toUpper": datetime(2026, 1, 2, 3, 4, 5)})),
+    ("upper-missing", STR_SEED, _tv({"$toUpper": "$nosuch"})),
+    # `$toString` is the other conversion
+    ("tostring-true", STR_SEED, _tv({"$toString": True})),
+    ("tostring-false", STR_SEED, _tv({"$toString": False})),
+    ("tostring-date", STR_SEED, _tv({"$toString": datetime(2026, 1, 2, 3, 4, 5)})),
+    ("tostring-double-wide", STR_SEED, _tv({"$toString": "$d"})),
+    ("tostring-double-whole", STR_SEED, _tv({"$toString": 4.0})),
+    ("tostring-oid", STR_SEED, _tv({"$toString": ObjectId("64b7f9a2c1d2e3f4a5b6c7d8")})),
+    ("tostring-null", STR_SEED, _tv({"$toString": None})),
+    ("tostring-missing", STR_SEED, _tv({"$toString": "$nosuch"})),
+    ("tostring-array-rejected", STR_SEED, _tv({"$toString": "$arr"})),
+    ("tostring-object-rejected", STR_SEED, _tv({"$toString": "$o"})),
+    # the same `%g` rendering inside an error message
+    ("acos-message-renders-wide-double", STR_SEED, _tv({"$acos": "$d"})),
+]
+
+# `$inc` / `$mul` past int64 FAIL the write -- they do not saturate to a double
+# the way the aggregation operators do. Probed 8.2.11. Both servers used to let
+# the unbounded Python int reach `bson.encode`, whose `OverflowError` escaped
+# from inside the storage layer's update transaction as an internal error.
+OVF_SEED = [
+    {"_id": 1, "n": Int64(9223372036854775807)},
+    {"_id": 2, "n": Int64(-9223372036854775808)},
+    {"_id": 3, "n": Int64(5)},
+]
+
+
+def _u(query: dict, update: dict) -> Callable[[Database], object]:
+    from pymongo.errors import OperationFailure
+
+    def run(db: Database) -> object:
+        try:
+            db.c.update_one(query, update)
+            doc = db.c.find_one(query)
+            return f"ok:{doc['n']!r}" if doc else "ok:none"
+        except OperationFailure as exc:
+            return f"{exc.code}/{_stable_code_name(exc.details)}: {exc.details.get('errmsg', '')}"
+
+    return run
+
+
+UPDATE_OVERFLOW_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    ("inc-past-max", OVF_SEED, _u({"_id": 1}, {"$inc": {"n": 1}})),
+    ("inc-past-max-by-long", OVF_SEED, _u({"_id": 1}, {"$inc": {"n": Int64(5)}})),
+    ("mul-past-max", OVF_SEED, _u({"_id": 1}, {"$mul": {"n": 2}})),
+    ("inc-past-min", OVF_SEED, _u({"_id": 2}, {"$inc": {"n": -1}})),
+    # a double operand moves the whole thing into the double domain -- no overflow
+    ("inc-by-double-widens", OVF_SEED, _u({"_id": 1}, {"$inc": {"n": 1.0}})),
+    # and the ordinary case still works, keeping its width
+    ("inc-in-range", OVF_SEED, _u({"_id": 3}, {"$inc": {"n": 1}})),
+    ("mul-in-range", OVF_SEED, _u({"_id": 3}, {"$mul": {"n": 2}})),
+]
+
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
@@ -2435,6 +2582,9 @@ ALL_CASES = (
     + [("objarg", c) for c in OBJECT_ARG_CASES]
     + [("numguard", c) for c in NUMERIC_GUARD_CASES]
     + [("fold", c) for c in FOLD_CASES]
+    + [("numtype", c) for c in NUMTYPE_CASES]
+    + [("strconv", c) for c in STRCONV_CASES]
+    + [("updovf", c) for c in UPDATE_OVERFLOW_CASES]
 )
 
 

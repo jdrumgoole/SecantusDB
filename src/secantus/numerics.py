@@ -23,6 +23,38 @@ from typing import Any
 from bson import Int64
 from bson.decimal128 import Decimal128
 
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
+
+class IntegerOverflowError(ArithmeticError):
+    """An exact integer result too large for BSON's 64-bit int.
+
+    Raised rather than resolved here because the two callers want opposite
+    things, both probed on 8.2.11: an *aggregation expression* saturates to a
+    double (`$pow: [2, 64]` answers 1.8446744073709552e+19), while an *update
+    operator* fails the write (`$inc` past the max is code 2, "Failed to apply
+    $inc operations to current value ..."). Before this existed both paths let
+    an unbounded Python int reach `bson.encode`, which raised `OverflowError`
+    -- inside the storage layer's update transaction, in the `$inc` case --
+    and surfaced to the client as an internal server error.
+    """
+
+
+def bson_int_width(value: int, *, wide: bool) -> Any:
+    """Give an exact integer arithmetic result its BSON width.
+
+    `long` is contagious (`wide`): a long operand makes the answer a long even
+    when it would fit in 32 bits. A result that outgrows int32 widens to long
+    on its own; one that outgrows int64 raises `IntegerOverflowError`.
+    """
+    if not (_INT64_MIN <= value <= _INT64_MAX):
+        raise IntegerOverflowError(value)
+    if wide or not (_INT32_MIN <= value <= _INT32_MAX):
+        return Int64(value)
+    return int(value)
+
+
 _INT32_MIN = -(2**31)
 _INT32_MAX = 2**31 - 1
 
@@ -115,9 +147,7 @@ def _combine(a: Any, b: Any, op: Callable[[Any, Any], Any], *, exact_double: boo
     # Integral domain: the result is int64 if either operand is already a
     # 64-bit int, or if a 32-bit result would overflow — otherwise int32.
     res = op(int(a), int(b))
-    if isinstance(a, Int64) or isinstance(b, Int64) or not (_INT32_MIN <= res <= _INT32_MAX):
-        return Int64(res)
-    return int(res)
+    return bson_int_width(res, wide=isinstance(a, Int64) or isinstance(b, Int64))
 
 
 def bson_add(a: Any, b: Any) -> Any:
