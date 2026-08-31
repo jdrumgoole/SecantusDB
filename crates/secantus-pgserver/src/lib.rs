@@ -10,27 +10,39 @@
 //! including the shared on-disk catalog format. Breadth is P5's problem.
 
 use std::cmp::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bson::{Bson, Document};
+use bytes::Bytes;
 use futures::{stream, Sink, StreamExt};
 use pgwire::api::auth::noop::NoopStartupHandler;
-use pgwire::api::query::SimpleQueryHandler;
+use pgwire::api::portal::{Format, Portal};
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
-use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
+use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse};
+use pgwire::api::stmt::{QueryParser, StoredStatement};
+use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use secantus_pgcatalog::{TableDef, CATALOG_COLLECTION};
 use secantus_pgplan::{
-    plan, AggFunc, AggItem, Error as PlanError, Nulls, OrderKey, OutputCol, Statement,
+    plan_with_params, AggFunc, AggItem, Error as PlanError, Nulls, OrderKey, OutputCol, Statement,
+    TransactionControl,
 };
-use secantus_storage::Storage;
+use secantus_storage::{Storage, UserTransactionHandle};
 
 /// One database's worth of SQL over a shared `Storage`.
 pub struct PgHandler {
     storage: Arc<Storage>,
     db: String,
+    /// The open explicit transaction, if any.
+    ///
+    /// One handler per connection, so this is per-session state exactly as
+    /// PostgreSQL's is. Held as a real `UserTransactionHandle` rather than a
+    /// flag: a `ROLLBACK` that did not actually roll back would be a silent
+    /// wrong answer, which is worse than refusing `BEGIN` outright.
+    txn: Mutex<Option<UserTransactionHandle>>,
 }
 
 impl PgHandler {
@@ -38,6 +50,7 @@ impl PgHandler {
         Self {
             storage,
             db: db.to_string(),
+            txn: Mutex::new(None),
         }
     }
 
@@ -157,13 +170,88 @@ impl SimpleQueryHandler for PgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
+        // The simple protocol has no parameters and no row limit.
+        self.run(query, &[], 0).await
+    }
+}
+
+impl PgHandler {
+    /// Execute one statement. Shared by BOTH protocols so they cannot drift:
+    /// the simple path passes no parameters, the extended path passes the
+    /// portal's bound values and `Execute`'s row limit.
+    async fn run<'a>(
+        &self,
+        query: &str,
+        params: &[Bson],
+        max_rows: usize,
+    ) -> PgWireResult<Vec<Response<'a>>> {
         let sql = query.trim().trim_end_matches(';').trim();
         if sql.is_empty() {
             return Ok(vec![Response::EmptyQuery]);
         }
 
-        let stmt = plan(sql, &|n| self.lookup(n)).map_err(|e| Self::err(&e))?;
+        let stmt = plan_with_params(sql, &|n| self.lookup(n), params).map_err(|e| Self::err(&e))?;
+
+        // Transaction control is session state, not a storage operation.
+        if let Statement::Transaction(control) = stmt {
+            return self.transaction_control(control);
+        }
+
+        // Everything else runs INSIDE the open transaction when there is one,
+        // so a later ROLLBACK really discards it.
+        let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_mut() {
+            Some(handle) => self
+                .storage
+                .with_user_transaction(handle, || self.execute(stmt, max_rows))
+                .map_err(|e| Self::storage_err("transaction failed", e))?,
+            None => self.execute(stmt, max_rows),
+        }
+    }
+
+    /// BEGIN / COMMIT / ROLLBACK.
+    fn transaction_control<'a>(
+        &self,
+        control: TransactionControl,
+    ) -> PgWireResult<Vec<Response<'a>>> {
+        let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = match control {
+            TransactionControl::Begin => {
+                if guard.is_none() {
+                    let handle = self
+                        .storage
+                        .begin_user_transaction()
+                        .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
+                    *guard = Some(handle);
+                }
+                // A BEGIN inside a transaction is a WARNING in PostgreSQL, not
+                // an error, and the existing transaction continues.
+                "BEGIN"
+            }
+            TransactionControl::Commit => {
+                if let Some(mut handle) = guard.take() {
+                    self.storage
+                        .commit_user_transaction(&mut handle)
+                        .map_err(|e| Self::storage_err("could not commit", e))?;
+                }
+                "COMMIT"
+            }
+            TransactionControl::Rollback => {
+                if let Some(mut handle) = guard.take() {
+                    self.storage
+                        .rollback_user_transaction(&mut handle)
+                        .map_err(|e| Self::storage_err("could not roll back", e))?;
+                }
+                "ROLLBACK"
+            }
+        };
+        Ok(vec![Response::Execution(Tag::new(tag))])
+    }
+
+    /// Execute one planned statement against storage.
+    fn execute<'a>(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response<'a>>> {
         match stmt {
+            Statement::Transaction(_) => unreachable!("handled before execute"),
             Statement::CreateTable(def) => {
                 if self.lookup(&def.name).is_some() {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -238,6 +326,11 @@ impl SimpleQueryHandler for PgHandler {
                     let take = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
                     docs.truncate(take);
                 }
+                // `Execute` may cap rows independently of any SQL LIMIT; 0 means
+                // "no cap" in the protocol, not "no rows".
+                if max_rows > 0 {
+                    docs.truncate(max_rows);
+                }
 
                 let schema = Arc::new(
                     sel.columns
@@ -258,6 +351,35 @@ impl SimpleQueryHandler for PgHandler {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
                     for f in &fields {
                         encode_value(&mut enc, d.get(f))?;
+                    }
+                    enc.finish()
+                });
+                Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
+            }
+
+            Statement::SelectConstant(sc) => {
+                // One row, no storage touched.
+                let schema = Arc::new(
+                    sc.columns
+                        .iter()
+                        .map(|(name, v)| {
+                            let ty = match v {
+                                Bson::Int32(_) => Type::INT4,
+                                Bson::Int64(_) => Type::INT8,
+                                Bson::Double(_) => Type::FLOAT8,
+                                Bson::Boolean(_) => Type::BOOL,
+                                _ => Type::VARCHAR,
+                            };
+                            FieldInfo::new(name.clone(), None, None, ty, FieldFormat::Text)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let values: Vec<Bson> = sc.columns.iter().map(|(_, v)| v.clone()).collect();
+                let schema_ref = schema.clone();
+                let rows = stream::iter(std::iter::once(values)).map(move |vals| {
+                    let mut enc = DataRowEncoder::new(schema_ref.clone());
+                    for v in &vals {
+                        encode_value(&mut enc, Some(v))?;
                     }
                     enc.finish()
                 });
@@ -358,6 +480,9 @@ impl SimpleQueryHandler for PgHandler {
                 }
                 if let Some(limit) = agg.limit {
                     groups.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
+                }
+                if max_rows > 0 {
+                    groups.truncate(max_rows);
                 }
 
                 let def = self
@@ -600,10 +725,280 @@ fn compare_values(a: &Bson, b: &Bson) -> Ordering {
     }
 }
 
+/// A parsed statement: the SQL text plus whatever parameter types the client
+/// declared in `Parse`.
+///
+/// The text is kept rather than a plan, because the extended protocol binds
+/// values AFTER parsing and the plan depends on them (`WHERE n = $1` lowers to
+/// a different filter for a NULL than for a 5). Re-planning per Bind keeps one
+/// set of NULL rules instead of two.
+#[derive(Debug, Clone)]
+pub struct ParsedStatement {
+    pub sql: String,
+    pub declared_types: Vec<Type>,
+}
+
+pub struct SqlParser;
+
+#[async_trait]
+impl QueryParser for SqlParser {
+    type Statement = ParsedStatement;
+
+    async fn parse_sql<C>(&self, _c: &C, sql: &str, types: &[Type]) -> PgWireResult<Self::Statement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        Ok(ParsedStatement {
+            sql: sql.to_string(),
+            declared_types: types.to_vec(),
+        })
+    }
+}
+
+/// Decode one bound parameter into the value the planner will substitute.
+///
+/// `None` is SQL NULL. A client may declare a parameter's type as oid 0
+/// ("unspecified") and leave the server to infer it, which is why the text path
+/// falls back to sniffing the literal rather than assuming `text`.
+fn decode_parameter(raw: Option<&Bytes>, ty: Option<&Type>, binary: bool) -> PgWireResult<Bson> {
+    let Some(bytes) = raw else {
+        return Ok(Bson::Null);
+    };
+    if binary {
+        // Binary format is width- and type-exact, so an unknown type here is a
+        // genuine "cannot decode" rather than something to guess at.
+        return match ty.map(|t| t.oid()) {
+            Some(23) if bytes.len() == 4 => Ok(Bson::Int32(i32::from_be_bytes(
+                bytes[..4].try_into().expect("checked"),
+            ))),
+            Some(20) if bytes.len() == 8 => Ok(Bson::Int64(i64::from_be_bytes(
+                bytes[..8].try_into().expect("checked"),
+            ))),
+            Some(21) if bytes.len() == 2 => Ok(Bson::Int32(i32::from(i16::from_be_bytes(
+                bytes[..2].try_into().expect("checked"),
+            )))),
+            Some(701) if bytes.len() == 8 => Ok(Bson::Double(f64::from_be_bytes(
+                bytes[..8].try_into().expect("checked"),
+            ))),
+            Some(700) if bytes.len() == 4 => Ok(Bson::Double(f64::from(f32::from_be_bytes(
+                bytes[..4].try_into().expect("checked"),
+            )))),
+            Some(16) if bytes.len() == 1 => Ok(Bson::Boolean(bytes[0] != 0)),
+            Some(25) | Some(1043) | Some(19) => {
+                Ok(Bson::String(String::from_utf8_lossy(bytes).into_owned()))
+            }
+            _ => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "0A000".into(),
+                format!(
+                    "binary parameters of type oid {:?} are not supported yet",
+                    ty.map(|t| t.oid())
+                ),
+            )))),
+        };
+    }
+
+    let text = String::from_utf8_lossy(bytes);
+    match ty.map(|t| t.oid()) {
+        Some(23) | Some(21) => text
+            .parse::<i32>()
+            .map(Bson::Int32)
+            .map_err(|_| invalid_text(&text, "integer")),
+        Some(20) => text
+            .parse::<i64>()
+            .map(Bson::Int64)
+            .map_err(|_| invalid_text(&text, "bigint")),
+        Some(700) | Some(701) | Some(1700) => text
+            .parse::<f64>()
+            .map(Bson::Double)
+            .map_err(|_| invalid_text(&text, "double precision")),
+        Some(16) => Ok(Bson::Boolean(matches!(
+            text.as_ref(),
+            "t" | "true" | "TRUE" | "1" | "y" | "yes" | "on"
+        ))),
+        Some(25) | Some(1043) | Some(19) => Ok(Bson::String(text.into_owned())),
+        // oid 0 = the client left the type to us. PostgreSQL infers from
+        // context; sniffing the literal covers the shapes this server plans.
+        _ => Ok(sniff_text(&text)),
+    }
+}
+
+fn invalid_text(text: &str, want: &str) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".into(),
+        "22P02".into(), // invalid_text_representation
+        format!("invalid input syntax for type {want}: \"{text}\""),
+    )))
+}
+
+fn sniff_text(text: &str) -> Bson {
+    if let Ok(i) = text.parse::<i32>() {
+        return Bson::Int32(i);
+    }
+    if let Ok(i) = text.parse::<i64>() {
+        return Bson::Int64(i);
+    }
+    if let Ok(f) = text.parse::<f64>() {
+        return Bson::Double(f);
+    }
+    Bson::String(text.to_string())
+}
+
+impl PgHandler {
+    /// Every bound parameter of a portal, decoded in order.
+    fn portal_params<S>(&self, portal: &Portal<S>) -> PgWireResult<Vec<Bson>>
+    where
+        S: Clone + Send + Sync,
+    {
+        let declared = &portal.statement.parameter_types;
+        portal
+            .parameters
+            .iter()
+            .enumerate()
+            .map(|(i, raw)| {
+                let binary = match &portal.parameter_format {
+                    Format::UnifiedText => false,
+                    Format::UnifiedBinary => true,
+                    Format::Individual(codes) => codes.get(i).copied().unwrap_or(0) == 1,
+                };
+                decode_parameter(raw.as_ref(), declared.get(i), binary)
+            })
+            .collect()
+    }
+
+    /// The output columns a statement would produce, without running it.
+    ///
+    /// Planned against NULL placeholders: `Describe` arrives before `Bind`, so
+    /// no values exist yet, and the result SHAPE does not depend on them.
+    fn describe_fields(&self, sql: &str, n_params: usize) -> PgWireResult<Vec<FieldInfo>> {
+        let params = vec![Bson::Null; n_params];
+        let stmt =
+            plan_with_params(sql, &|n| self.lookup(n), &params).map_err(|e| Self::err(&e))?;
+        Ok(match stmt {
+            Statement::Select(sel) => {
+                let def = self
+                    .lookup(&sel.table)
+                    .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?;
+                sel.columns
+                    .iter()
+                    .map(|(out, _)| {
+                        let ty = def
+                            .column(out)
+                            .map(|c| wire_type(&c.pg_type))
+                            .unwrap_or(Type::VARCHAR);
+                        FieldInfo::new(out.clone(), None, None, ty, FieldFormat::Text)
+                    })
+                    .collect()
+            }
+            Statement::Aggregate(agg) => {
+                let def = self
+                    .lookup(&agg.table)
+                    .ok_or_else(|| Self::err(&PlanError::UndefinedTable(agg.table.clone())))?;
+                agg.select
+                    .iter()
+                    .map(|(name, col)| {
+                        let ty = match col {
+                            OutputCol::Group(i) => def
+                                .column(&agg.group_by[*i].0)
+                                .map(|c| wire_type(&c.pg_type))
+                                .unwrap_or(Type::VARCHAR),
+                            OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
+                        };
+                        FieldInfo::new(name.clone(), None, None, ty, FieldFormat::Text)
+                    })
+                    .collect()
+            }
+            Statement::SelectConstant(sc) => sc
+                .columns
+                .iter()
+                .map(|(name, v)| {
+                    let ty = match v {
+                        Bson::Int32(_) => Type::INT4,
+                        Bson::Int64(_) => Type::INT8,
+                        Bson::Double(_) => Type::FLOAT8,
+                        Bson::Boolean(_) => Type::BOOL,
+                        _ => Type::VARCHAR,
+                    };
+                    FieldInfo::new(name.clone(), None, None, ty, FieldFormat::Text)
+                })
+                .collect(),
+            // CREATE / INSERT / UPDATE / DELETE return no rows.
+            _ => Vec::new(),
+        })
+    }
+}
+
+#[async_trait]
+impl ExtendedQueryHandler for PgHandler {
+    type Statement = ParsedStatement;
+    type QueryParser = SqlParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        Arc::new(SqlParser)
+    }
+
+    async fn do_describe_statement<C>(
+        &self,
+        _c: &mut C,
+        target: &StoredStatement<Self::Statement>,
+    ) -> PgWireResult<DescribeStatementResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let types = target.parameter_types.clone();
+        let fields = self.describe_fields(&target.statement.sql, types.len())?;
+        Ok(DescribeStatementResponse::new(types, fields))
+    }
+
+    async fn do_describe_portal<C>(
+        &self,
+        _c: &mut C,
+        target: &Portal<Self::Statement>,
+    ) -> PgWireResult<DescribePortalResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let fields = self.describe_fields(
+            &target.statement.statement.sql,
+            target.statement.parameter_types.len(),
+        )?;
+        Ok(DescribePortalResponse::new(fields))
+    }
+
+    async fn do_query<'a, C>(
+        &self,
+        _c: &mut C,
+        portal: &Portal<Self::Statement>,
+        max_rows: usize,
+    ) -> PgWireResult<Response<'a>>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let params = self.portal_params(portal)?;
+        let mut responses = self
+            .run(&portal.statement.statement.sql, &params, max_rows)
+            .await?;
+        // One portal is one statement, so exactly one response.
+        Ok(responses.remove(0))
+    }
+}
+
 pub struct HandlerFactory(pub Arc<PgHandler>);
 
 impl PgWireServerHandlers for HandlerFactory {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
+        self.0.clone()
+    }
+    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
         self.0.clone()
     }
     fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {

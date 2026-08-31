@@ -307,7 +307,6 @@ fn shapes_sqlglot_mis_parses_reach_us_as_real_statements() {
         "LISTEN chan",
         "NOTIFY chan, 'payload'",
         "DROP TABLE a, b, c",
-        "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
         "COPY t FROM stdin WITH (freeze on)",
     ] {
         let err = plan(sql, &lookup).expect_err(sql);
@@ -394,4 +393,129 @@ fn aggregate_refusals_carry_the_right_sqlstate() {
         let err = plan(sql, &lookup).expect_err(sql);
         assert_eq!(err.sqlstate(), want, "for {sql} (got {err})");
     }
+}
+
+/// `$N` placeholders resolve from the extended protocol's bound values.
+#[test]
+fn bound_parameters_substitute_into_the_plan() {
+    let params = vec![Bson::Int32(5), Bson::String("bob".into())];
+    match plan_with_params("SELECT id FROM t WHERE n > $1", &lookup, &params).unwrap() {
+        Statement::Select(s) => assert_eq!(s.filter, doc! {"n": {"$gt": 5i32}}),
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_with_params("SELECT id FROM t WHERE name = $2", &lookup, &params).unwrap() {
+        Statement::Select(s) => assert_eq!(s.filter, doc! {"name": "bob"}),
+        other => panic!("wrong statement: {other:?}"),
+    }
+    // A bound value works anywhere a literal does.
+    match plan_with_params("SELECT id FROM t LIMIT $1", &lookup, &params).unwrap() {
+        Statement::Select(s) => assert_eq!(s.limit, Some(5)),
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_with_params("UPDATE t SET n = $1 WHERE name = $2", &lookup, &params).unwrap() {
+        Statement::Update(u) => {
+            assert_eq!(u.set, doc! {"n": 5i32});
+            assert_eq!(u.filter, doc! {"name": "bob"});
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+/// A comparison against NULL is never TRUE -- bound or literal.
+///
+/// `n = NULL` yields NULL, not true, so no row qualifies; only `IS NULL`
+/// matches. MQL's `{n: null}` WOULD match, so the lowering short-circuits.
+/// Probed PG 14. Found by the parameterised differential, but the literal form
+/// was equally wrong and equally untested.
+#[test]
+fn comparing_against_null_matches_nothing() {
+    let never = doc! {"$nor": [Document::new()]};
+    for sql in [
+        "SELECT id FROM t WHERE n = NULL",
+        "SELECT id FROM t WHERE n <> NULL",
+        "SELECT id FROM t WHERE n > NULL",
+        "SELECT id FROM t WHERE n <= NULL",
+    ] {
+        match plan_ok(sql) {
+            Statement::Select(s) => assert_eq!(s.filter, never, "for {sql}"),
+            other => panic!("wrong statement for {sql}: {other:?}"),
+        }
+    }
+    // The same, arriving as a bound parameter.
+    let params = vec![Bson::Null];
+    match plan_with_params("SELECT id FROM t WHERE n = $1", &lookup, &params).unwrap() {
+        Statement::Select(s) => assert_eq!(s.filter, never),
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+/// A `$N` with nothing bound is a client error, not a panic.
+#[test]
+fn an_unbound_parameter_is_42p02() {
+    let err = plan_with_params("SELECT id FROM t WHERE n = $2", &lookup, &[Bson::Int32(1)])
+        .expect_err("must refuse");
+    assert_eq!(err.sqlstate(), "42P02");
+}
+
+/// Transaction control is planned, not refused.
+///
+/// psycopg wraps even its connection setup in BEGIN/COMMIT, so a server that
+/// refuses these is unusable by real clients no matter how good its queries
+/// are -- the psycopg gauge failed on the very first statement until this
+/// existed.
+#[test]
+fn transaction_statements_are_planned() {
+    for (sql, want) in [
+        ("BEGIN", TransactionControl::Begin),
+        ("START TRANSACTION", TransactionControl::Begin),
+        (
+            "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+            TransactionControl::Begin,
+        ),
+        ("COMMIT", TransactionControl::Commit),
+        ("ROLLBACK", TransactionControl::Rollback),
+    ] {
+        match plan_ok(sql) {
+            Statement::Transaction(c) => assert_eq!(c, want, "for {sql}"),
+            other => panic!("wrong statement for {sql}: {other:?}"),
+        }
+    }
+    // Savepoints would need machinery this server does not have; refusing is
+    // honest, silently accepting would lose the semantics a client relies on.
+    let err = plan("SAVEPOINT s1", &lookup).expect_err("savepoint");
+    assert_eq!(err.sqlstate(), "0A000");
+}
+
+/// `SELECT` with no FROM, including the session functions a connecting client
+/// probes before it does anything else.
+#[test]
+fn select_without_from_answers_session_functions() {
+    match plan_ok("SELECT version()") {
+        Statement::SelectConstant(sc) => {
+            assert_eq!(sc.columns.len(), 1);
+            assert_eq!(sc.columns[0].0, "version");
+            let Bson::String(v) = &sc.columns[0].1 else {
+                panic!("version() must be text");
+            };
+            // The gauges refuse to score a daemon whose version() does not
+            // name SecantusDB, so a real PostgreSQL cannot inflate the number.
+            assert!(v.contains("SecantusDB"), "{v}");
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("SELECT 1 AS one, current_database()") {
+        Statement::SelectConstant(sc) => {
+            assert_eq!(sc.columns[0], ("one".to_string(), Bson::Int32(1)));
+            assert_eq!(
+                sc.columns[1],
+                (
+                    "current_database".to_string(),
+                    Bson::String("postgres".into())
+                )
+            );
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    let err = plan("SELECT nosuchfunc()", &lookup).expect_err("unknown function");
+    assert_eq!(err.sqlstate(), "0A000");
 }

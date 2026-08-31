@@ -26,6 +26,7 @@ secantus-storage = { path = "../secantus-storage" }
 # test harness stops the daemon with SIGTERM, and an uncaught one skips the
 # WiredTiger close entirely -- which loses acknowledged writes.
 ctrlc = { version = "3", features = ["termination"] }
+bytes = "1.12.1"
 
 [[bin]]
 name = "secantusd-pg"

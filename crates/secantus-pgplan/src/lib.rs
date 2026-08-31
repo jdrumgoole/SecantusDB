@@ -15,6 +15,7 @@ use bson::{doc, Bson, Document};
 use pg_query::protobuf::node::Node as N;
 use pg_query::protobuf::{
     a_const, AExpr, AExprKind, BoolExprType, NullTestType, SortByDir, SortByNulls,
+    TransactionStmtKind,
 };
 use secantus_pgcatalog::{Column, TableDef};
 
@@ -31,6 +32,8 @@ pub enum Error {
     UndefinedTable(String),
     /// A bare column beside an aggregate, not in GROUP BY -> 42803.
     Grouping(String),
+    /// A `$N` with no bound value -> 42P02.
+    Parameter(String),
 }
 
 impl std::fmt::Display for Error {
@@ -41,6 +44,7 @@ impl std::fmt::Display for Error {
             Error::UndefinedColumn(c) => write!(f, "column \"{c}\" does not exist"),
             Error::UndefinedTable(t) => write!(f, "relation \"{t}\" does not exist"),
             Error::Grouping(m) => write!(f, "{m}"),
+            Error::Parameter(m) => write!(f, "{m}"),
         }
     }
 }
@@ -53,7 +57,8 @@ impl Error {
             Error::Unsupported(_) => "0A000", // feature_not_supported
             Error::UndefinedColumn(_) => "42703",
             Error::UndefinedTable(_) => "42P01",
-            Error::Grouping(_) => "42803", // grouping_error
+            Error::Grouping(_) => "42803",  // grouping_error
+            Error::Parameter(_) => "42P02", // undefined_parameter
         }
     }
 }
@@ -66,6 +71,8 @@ pub enum Statement {
     CreateTable(TableDef),
     Insert(Insert),
     Select(Select),
+    SelectConstant(SelectConstant),
+    Transaction(TransactionControl),
     Aggregate(Aggregate),
     Update(Update),
     Delete(Delete),
@@ -175,6 +182,27 @@ pub struct Aggregate {
     pub offset: i64,
 }
 
+/// Transaction control. Savepoints and prepared transactions are deliberately
+/// absent -- they need machinery this server does not have, and pretending
+/// would silently lose the semantics a client is relying on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionControl {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+/// `SELECT <items>` with no FROM: one row, computed without touching storage.
+///
+/// Clients lean on this constantly -- psycopg, pgjdbc and pgx all probe
+/// `version()` and friends during connection setup -- so a server that cannot
+/// answer it is unusable by real drivers even if every table query works.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectConstant {
+    /// (output name, value).
+    pub columns: Vec<(String, Bson)>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Update {
     pub table: String,
@@ -213,12 +241,42 @@ fn parse_one(sql: &str) -> Result<N> {
 /// Lower one statement. `lookup` resolves a table name to its catalog entry;
 /// `CREATE TABLE` does not consult it.
 pub fn plan(sql: &str, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Result<Statement> {
+    plan_with_params(sql, lookup, &[])
+}
+
+/// Plan a statement whose `$N` placeholders are filled from `params`.
+///
+/// The extended protocol binds values AFTER parsing, so the same SQL is planned
+/// once per Bind. Substituting at plan time keeps every NULL rule in one place:
+/// a bound NULL then flows through the same `IS NULL` / `<>` / `NOT IN` paths as
+/// a literal one, rather than needing its own parallel set.
+pub fn plan_with_params(
+    sql: &str,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Statement> {
     match parse_one(sql)? {
         N::CreateStmt(c) => plan_create(&c),
-        N::InsertStmt(i) => plan_insert(&i, lookup),
-        N::SelectStmt(s) => plan_select(&s, lookup),
-        N::UpdateStmt(u) => plan_update(&u, lookup),
-        N::DeleteStmt(d) => plan_delete(&d, lookup),
+        N::InsertStmt(i) => plan_insert(&i, lookup, params),
+        N::SelectStmt(s) => plan_select(&s, lookup, params),
+        N::TransactionStmt(t) => {
+            // Named enum, not the wire integer -- twice bitten already.
+            match TransactionStmtKind::try_from(t.kind) {
+                Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart) => {
+                    Ok(Statement::Transaction(TransactionControl::Begin))
+                }
+                Ok(TransactionStmtKind::TransStmtCommit) => {
+                    Ok(Statement::Transaction(TransactionControl::Commit))
+                }
+                Ok(TransactionStmtKind::TransStmtRollback) => {
+                    Ok(Statement::Transaction(TransactionControl::Rollback))
+                }
+                Ok(other) => Err(Error::Unsupported(format!("{other:?}"))),
+                Err(_) => Err(Error::Unsupported("this transaction statement".into())),
+            }
+        }
+        N::UpdateStmt(u) => plan_update(&u, lookup, params),
+        N::DeleteStmt(d) => plan_delete(&d, lookup, params),
         other => Err(Error::Unsupported(disc(&other))),
     }
 }
@@ -274,6 +332,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
 fn plan_insert(
     i: &pg_query::protobuf::InsertStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
 ) -> Result<Statement> {
     let table = i
         .relation
@@ -318,7 +377,7 @@ fn plan_insert(
         let mut d = Document::new();
         for (col, item) in targets.iter().zip(items) {
             let field = def.field_of(col).expect("checked above");
-            d.insert(field, const_value(item)?);
+            d.insert(field, const_value(item, params)?);
         }
         rows.push(d);
     }
@@ -339,9 +398,13 @@ fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
 fn plan_select(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
 ) -> Result<Statement> {
+    if s.from_clause.is_empty() {
+        return plan_select_constant(s, params);
+    }
     if !s.group_clause.is_empty() || has_aggregate(s) {
-        return plan_aggregate(s, lookup);
+        return plan_aggregate(s, lookup, params);
     }
     if s.from_clause.len() != 1 {
         return Err(Error::Unsupported(
@@ -392,7 +455,7 @@ fn plan_select(
 
     let filter = match s.where_clause.as_ref() {
         None => Document::new(),
-        Some(w) => lower_where(w, &def)?,
+        Some(w) => lower_where(w, &def, params)?,
     };
 
     let mut order = Vec::new();
@@ -439,7 +502,7 @@ fn plan_select(
 
     let limit = match s.limit_count.as_ref() {
         None => None,
-        Some(n) => match const_value(n)? {
+        Some(n) => match const_value(n, params)? {
             Bson::Int32(v) => Some(i64::from(v)),
             Bson::Int64(v) => Some(v),
             // `LIMIT NULL` means "no limit" in PostgreSQL, not "limit zero".
@@ -449,7 +512,7 @@ fn plan_select(
     };
     let offset = match s.limit_offset.as_ref() {
         None => 0,
-        Some(n) => match const_value(n)? {
+        Some(n) => match const_value(n, params)? {
             Bson::Int32(v) => i64::from(v),
             Bson::Int64(v) => v,
             Bson::Null => 0,
@@ -477,6 +540,7 @@ fn plan_select(
 fn plan_aggregate(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
 ) -> Result<Statement> {
     if s.from_clause.len() != 1 {
         return Err(Error::Unsupported(
@@ -626,7 +690,7 @@ fn plan_aggregate(
 
     let filter = match s.where_clause.as_ref() {
         None => Document::new(),
-        Some(w) => lower_where(w, &def)?,
+        Some(w) => lower_where(w, &def, params)?,
     };
 
     // ORDER BY is allowed only over GROUP BY columns in this slice; ordering by
@@ -672,7 +736,7 @@ fn plan_aggregate(
 
     let limit = match s.limit_count.as_ref() {
         None => None,
-        Some(n) => match const_value(n)? {
+        Some(n) => match const_value(n, params)? {
             Bson::Int32(v) => Some(i64::from(v)),
             Bson::Int64(v) => Some(v),
             Bson::Null => None,
@@ -681,7 +745,7 @@ fn plan_aggregate(
     };
     let offset = match s.limit_offset.as_ref() {
         None => 0,
-        Some(n) => match const_value(n)? {
+        Some(n) => match const_value(n, params)? {
             Bson::Int32(v) => i64::from(v),
             Bson::Int64(v) => v,
             Bson::Null => 0,
@@ -701,9 +765,82 @@ fn plan_aggregate(
     }))
 }
 
+/// The session functions a connecting client asks for.
+///
+/// The version string mirrors the Python server's shape so both identify as
+/// SecantusDB -- the conformance gauges refuse to run against a daemon whose
+/// `version()` does not name it, precisely so a stray real PostgreSQL cannot
+/// inflate the numbers.
+fn session_function(name: &str) -> Option<Bson> {
+    Some(match name {
+        "version" => Bson::String(format!(
+            "PostgreSQL 15.0 (SecantusDB) on {}, compiled by rust",
+            std::env::consts::ARCH
+        )),
+        "current_database" | "current_catalog" => Bson::String("postgres".into()),
+        "current_schema" => Bson::String("public".into()),
+        "current_user" | "session_user" | "user" => Bson::String("postgres".into()),
+        _ => return None,
+    })
+}
+
+fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> Result<Statement> {
+    let mut columns: Vec<(String, Bson)> = Vec::new();
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return Err(Error::Unsupported("this target".into()));
+        };
+        let (default_name, value) = match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
+            Some(N::FuncCall(f)) => {
+                let name = f
+                    .funcname
+                    .iter()
+                    .filter_map(|n| match n.node.as_ref()? {
+                        N::String(st) => Some(st.sval.clone()),
+                        _ => None,
+                    })
+                    .next_back()
+                    .unwrap_or_default();
+                let v = session_function(&name)
+                    .ok_or_else(|| Error::Unsupported(format!("function {name}()")))?;
+                (name, v)
+            }
+            // `current_user` and friends parse as bare column refs, not calls.
+            Some(N::ColumnRef(c)) => {
+                let name = c
+                    .fields
+                    .first()
+                    .and_then(|f| f.node.as_ref())
+                    .and_then(|n| match n {
+                        N::String(st) => Some(st.sval.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| Error::Unsupported("this target".into()))?;
+                let v =
+                    session_function(&name).ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
+                (name, v)
+            }
+            Some(N::AConst(_)) | Some(N::ParamRef(_)) => {
+                let v = const_value(rt.val.as_ref().expect("checked"), params)?;
+                ("?column?".to_string(), v)
+            }
+            Some(other) => return Err(Error::Unsupported(disc(other))),
+            None => return Err(Error::Unsupported("an empty target".into())),
+        };
+        let out = if rt.name.is_empty() {
+            default_name
+        } else {
+            rt.name.clone()
+        };
+        columns.push((out, value));
+    }
+    Ok(Statement::SelectConstant(SelectConstant { columns }))
+}
+
 fn plan_update(
     u: &pg_query::protobuf::UpdateStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
 ) -> Result<Statement> {
     let table = u
         .relation
@@ -730,6 +867,7 @@ fn plan_update(
             rt.val
                 .as_ref()
                 .ok_or_else(|| Error::Parse("SET without a value".into()))?,
+            params,
         )?;
         set.insert(field, value);
     }
@@ -738,7 +876,7 @@ fn plan_update(
     }
     let filter = match u.where_clause.as_ref() {
         None => Document::new(),
-        Some(w) => lower_where(w, &def)?,
+        Some(w) => lower_where(w, &def, params)?,
     };
     Ok(Statement::Update(Update { table, set, filter }))
 }
@@ -746,6 +884,7 @@ fn plan_update(
 fn plan_delete(
     d: &pg_query::protobuf::DeleteStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
 ) -> Result<Statement> {
     let table = d
         .relation
@@ -755,15 +894,19 @@ fn plan_delete(
     let def = lookup(&table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
     let filter = match d.where_clause.as_ref() {
         None => Document::new(),
-        Some(w) => lower_where(w, &def)?,
+        Some(w) => lower_where(w, &def, params)?,
     };
     Ok(Statement::Delete(Delete { table, filter }))
 }
 
 /// A WHERE predicate as a Mongo filter over STORED FIELDS.
-pub fn lower_where(node: &pg_query::protobuf::Node, def: &TableDef) -> Result<Document> {
+pub fn lower_where(
+    node: &pg_query::protobuf::Node,
+    def: &TableDef,
+    params: &[Bson],
+) -> Result<Document> {
     match node.node.as_ref() {
-        Some(N::AExpr(e)) => lower_aexpr(e, def),
+        Some(N::AExpr(e)) => lower_aexpr(e, def, params),
         Some(N::NullTest(t)) => {
             let field = column_field(t.arg.as_deref(), def)?;
             // A SQL NULL is either an explicit null or an absent field here,
@@ -786,14 +929,14 @@ pub fn lower_where(node: &pg_query::protobuf::Node, def: &TableDef) -> Result<Do
                         .args
                         .first()
                         .ok_or_else(|| Error::Parse("NOT with no operand".into()))?;
-                    return lower_negated(arg, def);
+                    return lower_negated(arg, def, params);
                 }
                 _ => return Err(Error::Unsupported("this boolean operator".into())),
             };
             let arms = b
                 .args
                 .iter()
-                .map(|a| lower_where(a, def))
+                .map(|a| lower_where(a, def, params))
                 .collect::<Result<Vec<_>>>()?;
             Ok(doc! { key: arms })
         }
@@ -802,7 +945,22 @@ pub fn lower_where(node: &pg_query::protobuf::Node, def: &TableDef) -> Result<Do
     }
 }
 
-fn const_value(node: &pg_query::protobuf::Node) -> Result<Bson> {
+/// A literal, or a bound `$N` parameter.
+///
+/// `params` is the extended protocol's Bind values, in order; `$1` is
+/// `params[0]`. A statement planned without parameters passes an empty slice,
+/// and a `$N` beyond its end is a client error rather than a panic.
+fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
+    if let Some(N::ParamRef(p)) = node.node.as_ref() {
+        let idx = usize::try_from(p.number).unwrap_or(0);
+        if idx == 0 {
+            return Err(Error::Parse("parameter $0 is not valid".into()));
+        }
+        return params
+            .get(idx - 1)
+            .cloned()
+            .ok_or_else(|| Error::Parameter(format!("there is no parameter ${idx}")));
+    }
     match node.node.as_ref() {
         Some(N::AConst(c)) => {
             if c.isnull {
@@ -835,14 +993,18 @@ fn const_value(node: &pg_query::protobuf::Node) -> Result<Bson> {
 /// De Morgan is valid in SQL's three-valued (Kleene) logic, so `NOT (a AND b)`
 /// -> `NOT a OR NOT b` is sound, as is the double-negation collapse. Anything
 /// not handled here stays an honest 0A000 rather than an approximation.
-fn lower_negated(node: &pg_query::protobuf::Node, def: &TableDef) -> Result<Document> {
+fn lower_negated(
+    node: &pg_query::protobuf::Node,
+    def: &TableDef,
+    params: &[Bson],
+) -> Result<Document> {
     match node.node.as_ref() {
         Some(N::BoolExpr(b)) => match BoolExprType::try_from(b.boolop) {
             Ok(BoolExprType::AndExpr) => {
                 let arms = b
                     .args
                     .iter()
-                    .map(|a| lower_negated(a, def))
+                    .map(|a| lower_negated(a, def, params))
                     .collect::<Result<Vec<_>>>()?;
                 Ok(doc! { "$or": arms })
             }
@@ -850,7 +1012,7 @@ fn lower_negated(node: &pg_query::protobuf::Node, def: &TableDef) -> Result<Docu
                 let arms = b
                     .args
                     .iter()
-                    .map(|a| lower_negated(a, def))
+                    .map(|a| lower_negated(a, def, params))
                     .collect::<Result<Vec<_>>>()?;
                 Ok(doc! { "$and": arms })
             }
@@ -860,7 +1022,7 @@ fn lower_negated(node: &pg_query::protobuf::Node, def: &TableDef) -> Result<Docu
                     .args
                     .first()
                     .ok_or_else(|| Error::Parse("NOT with no operand".into()))?;
-                lower_where(arg, def)
+                lower_where(arg, def, params)
             }
             _ => Err(Error::Unsupported("this boolean operator".into())),
         },
@@ -877,17 +1039,17 @@ fn lower_negated(node: &pg_query::protobuf::Node, def: &TableDef) -> Result<Docu
             match AExprKind::try_from(e.kind) {
                 Ok(AExprKind::AexprBetween) => {
                     flipped.kind = AExprKind::AexprNotBetween as i32;
-                    return lower_between(&flipped, def);
+                    return lower_between(&flipped, def, params);
                 }
                 Ok(AExprKind::AexprNotBetween) => {
                     flipped.kind = AExprKind::AexprBetween as i32;
-                    return lower_between(&flipped, def);
+                    return lower_between(&flipped, def, params);
                 }
                 Ok(AExprKind::AexprIn) => {
                     // `IN` and `NOT IN` are distinguished by the operator name
                     // the parser attaches, so flip that.
                     flipped.name = vec![string_node(if in_is_negated(e) { "=" } else { "<>" })];
-                    return lower_in(&flipped, def);
+                    return lower_in(&flipped, def, params);
                 }
                 Ok(AExprKind::AexprOp) => {}
                 _ => return Err(Error::Unsupported("this operator form".into())),
@@ -903,7 +1065,7 @@ fn lower_negated(node: &pg_query::protobuf::Node, def: &TableDef) -> Result<Docu
                 other => return Err(Error::Unsupported(format!("NOT over operator {other}"))),
             };
             flipped.name = vec![string_node(negated)];
-            lower_aexpr(&flipped, def)
+            lower_aexpr(&flipped, def, params)
         }
         Some(other) => Err(Error::Unsupported(disc(other))),
         None => Err(Error::Parse("NOT with an empty operand".into())),
@@ -959,14 +1121,16 @@ fn match_nothing() -> Document {
     doc! { "$nor": [Document::new()] }
 }
 
-fn lower_aexpr(e: &AExpr, def: &TableDef) -> Result<Document> {
+fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     // Named enum, never the wire integer. Written against the integers first,
     // this had `Op = 0` (it is 1, so every plain `=` was refused) and
     // `Between = 10` (it is 11, so BETWEEN silently ran the NOT BETWEEN arm and
     // returned the complement). Same mistake as the BoolExpr one below.
     match AExprKind::try_from(e.kind) {
-        Ok(AExprKind::AexprIn) => return lower_in(e, def),
-        Ok(AExprKind::AexprBetween | AExprKind::AexprNotBetween) => return lower_between(e, def),
+        Ok(AExprKind::AexprIn) => return lower_in(e, def, params),
+        Ok(AExprKind::AexprBetween | AExprKind::AexprNotBetween) => {
+            return lower_between(e, def, params)
+        }
         Ok(AExprKind::AexprOp) => {}
         _ => return Err(Error::Unsupported("this operator form".into())),
     }
@@ -993,7 +1157,18 @@ fn lower_aexpr(e: &AExpr, def: &TableDef) -> Result<Document> {
         e.rexpr
             .as_ref()
             .ok_or_else(|| Error::Parse("no right operand".into()))?,
+        params,
     )?;
+
+    // A comparison against NULL is never TRUE in SQL -- `n = NULL`, `n <> NULL`
+    // and every range operator yield NULL, so no row qualifies. Only `IS NULL`
+    // matches. MQL's `{n: null}` would match, so this must short-circuit.
+    // Probed PG 14: `select id from t where n = null` returns nothing, even for
+    // the row whose `n` IS null. Applies equally to a literal NULL and a bound
+    // `$1` -- the parameterised tests found it, but the literal was wrong too.
+    if value == Bson::Null {
+        return Ok(match_nothing());
+    }
 
     let mongo_op = match op {
         // `=` and the range operators are already NULL-correct: MQL brackets by
@@ -1027,7 +1202,7 @@ fn lower_aexpr(e: &AExpr, def: &TableDef) -> Result<Document> {
 /// `n NOT IN (1)` does NOT return a row whose `n` is NULL (because `NULL <> 1`
 /// is NULL, not true), and `n NOT IN (1, NULL)` returns nothing at all. MQL's
 /// `$nin` would match a null on both counts, so the guard is explicit.
-fn lower_in(e: &AExpr, def: &TableDef) -> Result<Document> {
+fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     let negated = in_is_negated(e);
     let field = column_field(e.lexpr.as_deref(), def)?;
     let items = match e.rexpr.as_ref().and_then(|r| r.node.as_ref()) {
@@ -1037,7 +1212,7 @@ fn lower_in(e: &AExpr, def: &TableDef) -> Result<Document> {
     let mut values = Vec::new();
     let mut saw_null = false;
     for item in items {
-        let v = const_value(item)?;
+        let v = const_value(item, params)?;
         if v == Bson::Null {
             saw_null = true;
         } else {
@@ -1062,14 +1237,14 @@ fn lower_in(e: &AExpr, def: &TableDef) -> Result<Document> {
 }
 
 /// `x BETWEEN a AND b` / `x NOT BETWEEN a AND b`.
-fn lower_between(e: &AExpr, def: &TableDef) -> Result<Document> {
+fn lower_between(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     let field = column_field(e.lexpr.as_deref(), def)?;
     let bounds = match e.rexpr.as_ref().and_then(|r| r.node.as_ref()) {
         Some(N::List(l)) if l.items.len() == 2 => &l.items,
         _ => return Err(Error::Unsupported("this BETWEEN form".into())),
     };
-    let lo = const_value(&bounds[0])?;
-    let hi = const_value(&bounds[1])?;
+    let lo = const_value(&bounds[0], params)?;
+    let hi = const_value(&bounds[1], params)?;
     if lo == Bson::Null || hi == Bson::Null {
         return Ok(match_nothing());
     }

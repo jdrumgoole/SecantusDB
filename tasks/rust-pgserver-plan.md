@@ -1,6 +1,10 @@
 # Plan: a Rust PostgreSQL server
 
-> **Status: P0 PASSED, P1 LANDED, P5 STARTED, 2026-08-31.**
+> **Status: P0 PASSED, P1 LANDED, P5 STARTED, P7 LANDED, 2026-08-31.**
+> P7 (extended protocol) is done — see §0.8. It was pulled forward ahead of the
+> rest of P5 because it was not a missing feature but a WRONG ANSWER, and
+> because no SQL gauge can run without it.
+>
 > P5's first batch added ORDER BY / LIMIT / OFFSET, UPDATE, DELETE, the
 > three-valued predicates and the count/sum/min/max aggregates with GROUP BY,
 > pinned by a 109-case differential against a live PostgreSQL (§0.7). P2
@@ -118,6 +122,70 @@ result matters as much as the first: an unsupported construct returns an honest
 Note for P1: `pgwire`'s **default features pull `aws-lc-rs`**, a second C crypto
 build. `default-features = false, features = ["server-api"]` avoids it; match
 whatever rustls backend the Mongo server already uses rather than adding one.
+
+### 0.8 P7 (2026-08-31): the extended protocol, pulled forward
+
+**Found by asking "what would a gauge need?", not by reading the plan.** A
+parameterised query — the moment psycopg, pgjdbc or pgx binds a value — went
+down pgwire's default extended path and returned **command status OK with zero
+rows**. Not an error, not a `0A000`: a silent empty result for a query that
+should return data. Every differential case up to then used literal SQL, so
+none of them could see it.
+
+Implemented: `Parse` / `Bind` / `Describe` / `Execute` / `Close`, text AND
+binary parameter decoding, `Describe`-before-`Bind` (planned against NULL
+placeholders, since the result SHAPE does not depend on the values), and
+`Execute`'s `max_rows`. `$N` resolves in the planner via `plan_with_params`, so
+a bound value flows through exactly the same NULL rules as a literal instead of
+needing a parallel set. **Both protocols share one `run()`** so they cannot
+drift.
+
+**It immediately exposed a wrong answer unrelated to parameters.** `WHERE n =
+NULL` is never true in SQL — only `IS NULL` matches — but MQL's `{n: null}`
+matches, so the server returned the NULL row. The same was true of `<>`, `>`,
+`<=` and the rest. **The literal form was equally broken and equally untested**;
+binding a NULL parameter is simply what made it obvious enough to write down.
+Lowering now short-circuits any comparison against NULL to match-nothing.
+
+Differential: **141 cases**, 28 of them over the extended protocol, including
+bound NULLs and the literal `= NULL` forms.
+
+### 0.9 The first gauge number (2026-08-31)
+
+`SECANTUS_GAUGE_SERVER=rust` now drives `secantusd-pg` in
+`psycopg_validation/runner.py`, mirroring the MongoDB gauges' variable. The raw
+JSON is written per-server so a Rust run cannot overwrite the Python baseline.
+
+**psycopg 3's unmodified suite against the Rust server: 694 passed, 3026
+failed, 417 errors, 76 skipped of 4,238 (~16%).** Low, and that is the point —
+everything before this was measured against a differential written by the same
+person who wrote the server. This is the first number produced by someone
+else's tests, and the ranked failure list is worth more than the percentage:
+
+| n | blocker |
+|---:|---|
+| 732 | `AExpr` — expressions in a target list (`SELECT 1+1`, `a \|\| b`) |
+| 520 | `TypeCast` — `'1'::int`, `$1::text` |
+| 502 | `VariableSetStmt` — `SET`/`RESET` |
+| 331 | statement input (multi-statement / empty) |
+| 316 | **`DropStmt` — `DROP TABLE`**, which is cheap |
+| 223 | `CopyStmt` |
+| 71 | `DeclareCursorStmt` |
+| 59 | `set_config()` |
+| 56 | `AArrayExpr` — array literals |
+| 40 | `RangeFunction` — `FROM generate_series(...)` |
+
+Two connection-level requirements were found only by attempting this, and no
+amount of self-written differential testing would have surfaced either: the
+runner refuses any daemon whose `select version()` does not name SecantusDB
+(the server could not do `SELECT` without `FROM` at all), and psycopg wraps
+setup in `BEGIN`/`COMMIT` (transaction statements did not exist). Both are now
+implemented — transactions with real `UserTransactionHandle`s, so `ROLLBACK`
+actually discards rather than reporting success.
+
+**Sequencing note for the next batch:** `DROP TABLE` is 316 failures for a
+trivial amount of work, and `TypeCast` plus target-list `AExpr` are together
+1,252. Those three are the cheapest route to a materially different number.
 
 ### 0.7 P5, first batch (2026-08-31): three-valued logic is where the bugs are
 
