@@ -4,7 +4,8 @@ Under ``SECANTUS_DATA_NONLOGGED=1`` the Rust server's data tables are
 checkpoint-durable only; acknowledged writes survive a hard crash via
 replay of the (WAL-logged) oplog from the stable-checkpoint marker at the
 next open. These tests prove that contract end to end: a subprocess drives
-acknowledged inserts through pymongo and is ``SIGKILL``ed mid-load; the
+acknowledged inserts through pymongo and is HARD-KILLED mid-load (SIGKILL
+on POSIX, TerminateProcess on Windows -- both uncatchable, no cleanup); the
 store is then reopened in-process and every acknowledged ``_id`` must be
 present, exactly once. Env is subprocess-scoped, so the default suite's
 stores are untouched.
@@ -13,7 +14,6 @@ stores are untouched.
 from __future__ import annotations
 
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -56,7 +56,7 @@ with open(ack_file, "a", buffering=1) as acks:
 
 
 def _run_killed_load(tmp_path: Path, *, run_seconds: float, checkpoint_seconds: str) -> list[range]:
-    """Drive the writer subprocess, SIGKILL it mid-load, return acked ranges."""
+    """Drive the writer subprocess, hard-kill it mid-load, return acked ranges."""
     store = tmp_path / "wt"
     ack_file = tmp_path / "acks.txt"
     port_file = tmp_path / "port.txt"
@@ -96,7 +96,13 @@ def _run_killed_load(tmp_path: Path, *, run_seconds: float, checkpoint_seconds: 
                 raise AssertionError(f"writer died mid-load: {proc.stderr.read().decode()[-2000:]}")
             time.sleep(0.1)
     finally:
-        proc.send_signal(signal.SIGKILL)
+        # `Popen.kill()` rather than `send_signal(signal.SIGKILL)`: the constant
+        # does not exist on Windows, where this file had never run (it was not
+        # named in the one CI job that builds `_secantus_server`, so it skipped
+        # everywhere). `kill()` is SIGKILL on POSIX and TerminateProcess on
+        # Windows -- both are the uncatchable, no-cleanup kill this test needs,
+        # so the crash being simulated is the same one on every platform.
+        proc.kill()
         proc.wait(timeout=10)
 
     ranges = []
@@ -111,6 +117,38 @@ def _run_killed_load(tmp_path: Path, *, run_seconds: float, checkpoint_seconds: 
     return ranges
 
 
+def _open_after_crash(_secantus_server, tmp_path: Path, *, timeout: float = 30.0):
+    """Reopen the crashed store, tolerating a briefly-held lock.
+
+    On POSIX the kill releases the store's file handles immediately and the
+    first attempt succeeds. On Windows the first attempt after
+    `TerminateProcess` can answer ``WtError code 16`` (EBUSY) while the OS is
+    still releasing the dead process's handles -- Windows had never run this
+    file, so that difference had never surfaced.
+
+    The wait is bounded and NARROW on purpose: only a busy-lock is retried, and
+    only for `timeout` seconds. A store that is genuinely unopenable -- the
+    thing this harness exists to catch -- still fails, with WiredTiger's own
+    error. A real restart after a crash faces exactly the same wait, so this is
+    the behaviour under test, not a workaround for it.
+    """
+    deadline = time.monotonic() + timeout
+    last: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            return _secantus_server.RustServer(
+                str(tmp_path / "wt"), 0, host="127.0.0.1", replica_set_name="secantus"
+            )
+        except RuntimeError as exc:  # noqa: PERF203 — the retry IS the point
+            if "code: 16" not in str(exc):
+                raise
+            last = exc
+            time.sleep(0.5)
+    raise AssertionError(
+        f"the crashed store stayed locked for {timeout:.0f}s after a hard kill; last error: {last}"
+    )
+
+
 def _verify_all_present(tmp_path: Path, ranges: list[range]) -> None:
     """Reopen the killed store (replay-on-open) and check every acked _id."""
     import _secantus_server
@@ -118,9 +156,7 @@ def _verify_all_present(tmp_path: Path, ranges: list[range]) -> None:
     env_backup = os.environ.get("SECANTUS_DATA_NONLOGGED")
     os.environ["SECANTUS_DATA_NONLOGGED"] = "1"
     try:
-        srv = _secantus_server.RustServer(
-            str(tmp_path / "wt"), 0, host="127.0.0.1", replica_set_name="secantus"
-        )
+        srv = _open_after_crash(_secantus_server, tmp_path)
         try:
             host, port = srv.address
             client = pymongo.MongoClient(host, port, directConnection=True)
@@ -172,14 +208,14 @@ def _verify_all_present(tmp_path: Path, ranges: list[range]) -> None:
 
 
 def test_hard_kill_mid_load_recovers_every_acked_write(tmp_path):
-    """SIGKILL mid-load with frequent checkpoints: the replay gap is small and
+    """Hard-kill mid-load with frequent checkpoints: the replay gap is small and
     every acknowledged write survives."""
     ranges = _run_killed_load(tmp_path, run_seconds=4.0, checkpoint_seconds="1")
     _verify_all_present(tmp_path, ranges)
 
 
 def test_hard_kill_before_any_checkpoint_recovers_from_genesis(tmp_path):
-    """SIGKILL before the first periodic checkpoint ever fires: the stable
+    """Hard-kill before the first periodic checkpoint ever fires: the stable
     marker is absent/zero, the data tables recover empty, and the ENTIRE load
     must come back from oplog replay alone."""
     ranges = _run_killed_load(tmp_path, run_seconds=3.0, checkpoint_seconds="3600")
