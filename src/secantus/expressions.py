@@ -61,6 +61,12 @@ def evaluate(expr: Any, doc: Mapping[str, Any], vars: dict[str, Any] | None = No
     return _eval(expr, _Ctx(doc=doc, vars=dict(vars) if vars else {}))
 
 
+#: An evaluator for a sub-expression whose value is RETURNED unchanged. The
+#: four operators below take one so the caller can choose the position: `_eval`
+#: (an absent path is null) or `_eval_field_value` (it stays MISSING).
+_Eval = Any
+
+
 def _eval(expr: Any, ctx: _Ctx) -> Any:
     if isinstance(expr, str):
         if expr.startswith("$$"):
@@ -113,6 +119,17 @@ def _eval_field_value(expr: Any, ctx: _Ctx) -> Any:
     # "object" instead of "missing", and ``$concat`` raised 16702.
     if expr == "$$REMOVE":
         return MISSING
+    # The operators that RETURN one of their sub-expressions propagate its
+    # missing-ness; the ones that COMPUTE a value collapse it to null.
+    # `{$addFields: {z: {$cond: [true, "$nosuch", 1]}}}` omits `z` on mongod --
+    # probed 8.2.11, where we wrote a null. `$getField` already had its own
+    # handling. The position is lost once evaluation drops into the generic
+    # operator path, which is why this dispatches here rather than inside `_eval`.
+    if isinstance(expr, Mapping) and len(expr) == 1:
+        op, arg = next(iter(expr.items()))
+        propagating = _MISSING_PROPAGATING.get(op)
+        if propagating is not None:
+            return propagating(arg, ctx, _eval_field_value)
     return _eval(expr, ctx)
 
 
@@ -130,14 +147,11 @@ def evaluate_or_missing(
     :data:`MISSING` (distinct from ``None``) so accumulators can skip a missing
     value the way mongod does — ``$push`` / ``$addToSet`` accumulate an explicit
     ``null`` but not a missing field."""
-    if isinstance(expr, str) and expr.startswith("$") and not expr.startswith("$$"):
-        d = doc if isinstance(doc, dict) else dict(doc)
-        return get_path(d, expr[1:], default=MISSING)
-    # `$$REMOVE` IS the missing value, so it belongs on this branch with the
-    # absent paths -- see `_eval_field_value`, which this function mirrors.
-    if expr == "$$REMOVE":
-        return MISSING
-    return evaluate(expr, doc, vars)
+    # ONE implementation of the field-value rule. This used to be a second copy
+    # of `_eval_field_value`'s logic, and the copies drifted: the `$$REMOVE`
+    # fix had to be made twice, and the missing-propagating operators below
+    # would have had to be as well.
+    return _eval_field_value(expr, _Ctx(doc=doc, vars=dict(vars) if vars else {}))
 
 
 def _resolve_var(name: str, ctx: _Ctx) -> Any:
@@ -490,16 +504,17 @@ def _op_lte(arg: Any, ctx: _Ctx) -> bool:
         return False
 
 
-def _op_cond(arg: Any, ctx: _Ctx) -> Any:
+def _op_cond(arg: Any, ctx: _Ctx, ret: _Eval = None) -> Any:
+    ret = ret or _eval
     if isinstance(arg, Mapping):
         condition = _eval(arg["if"], ctx)
-        return _eval(arg["then"] if _bool(condition) else arg["else"], ctx)
+        return ret(arg["then"] if _bool(condition) else arg["else"], ctx)
     if isinstance(arg, list) and len(arg) == 3:
-        return _eval(arg[1] if _bool(_eval(arg[0], ctx)) else arg[2], ctx)
+        return ret(arg[1] if _bool(_eval(arg[0], ctx)) else arg[2], ctx)
     raise ExpressionError("$cond requires {if, then, else} or [cond, then, else]")
 
 
-def _op_if_null(arg: Any, ctx: _Ctx) -> Any:
+def _op_if_null(arg: Any, ctx: _Ctx, ret: _Eval = None) -> Any:
     if not isinstance(arg, list) or len(arg) < 2:
         n = len(arg) if isinstance(arg, list) else 1
         raise ExpressionError(
@@ -508,11 +523,20 @@ def _op_if_null(arg: Any, ctx: _Ctx) -> Any:
             code_name="Location1257300",
         )
     *checks, fallback = arg
+    ret = ret or _eval
     for check in checks:
-        v = _eval(check, ctx)
-        if v is not None:
+        v = ret(check, ctx)
+        # A MISSING check is skipped exactly like a null one: `$ifNull` is
+        # looking for the first argument that HAS a value.
+        if v is not None and v is not MISSING:
             return v
-    return _eval(fallback, ctx)
+    return ret(fallback, ctx)
+
+
+#: The operators whose result IS one of their sub-expressions, so a missing
+#: sub-expression makes the whole thing missing. Populated after the functions
+#: are defined; `_eval_field_value` looks each one up by name.
+_MISSING_PROPAGATING: dict[str, Any] = {}
 
 
 def _op_size(arg: Any, ctx: _Ctx) -> int:
@@ -952,7 +976,7 @@ def _op_get_field(arg: Any, ctx: _Ctx) -> Any:
     return input_doc[field]
 
 
-def _op_switch(arg: Any, ctx: _Ctx) -> Any:
+def _op_switch(arg: Any, ctx: _Ctx, ret: _Eval = None) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$switch requires {branches, default?}")
     branches = arg.get("branches")
@@ -966,9 +990,9 @@ def _op_switch(arg: Any, ctx: _Ctx) -> Any:
         if not isinstance(branch, Mapping) or "case" not in branch or "then" not in branch:
             raise ExpressionError("each $switch branch needs case and then")
         if _bool(_eval(branch["case"], ctx)):
-            return _eval(branch["then"], ctx)
+            return (ret or _eval)(branch["then"], ctx)
     if "default" in arg:
-        return _eval(arg["default"], ctx)
+        return (ret or _eval)(arg["default"], ctx)
     # mongod 8.2.11 answers 40066 here, wrapped in its executor prefix. It
     # answers a DIFFERENT error -- 40069, "Cannot execute a switch statement
     # where all the cases evaluate to false without a default", under
@@ -1985,7 +2009,7 @@ def _op_index_of_array(arg: Any, ctx: _Ctx) -> Any:
     return -1
 
 
-def _op_let(arg: Any, ctx: _Ctx) -> Any:
+def _op_let(arg: Any, ctx: _Ctx, ret: _Eval = None) -> Any:
     if not isinstance(arg, Mapping) or "vars" not in arg or "in" not in arg:
         raise ExpressionError("$let requires {vars, in}")
     bindings = arg["vars"]
@@ -1999,7 +2023,7 @@ def _op_let(arg: Any, ctx: _Ctx) -> Any:
         # true. The same rule governs `$lookup`'s `let`, where it meant a
         # document without the local field joined rows mongod excludes.
         inner = inner.with_var(name, _eval_field_value(value_expr, ctx))
-    return _eval(arg["in"], inner)
+    return (ret or _eval)(arg["in"], inner)
 
 
 # Hard cap on the size of a `$range` result. Without this, a single
@@ -3477,3 +3501,13 @@ def _percentile_expr(arg: Any, ctx: _Ctx, *, op: str) -> Any:
 
 _OPS["$median"] = _op_median_expr
 _OPS["$percentile"] = _op_percentile_expr
+
+
+_MISSING_PROPAGATING.update(
+    {
+        "$cond": _op_cond,
+        "$switch": _op_switch,
+        "$let": _op_let,
+        "$ifNull": _op_if_null,
+    }
+)

@@ -54,6 +54,12 @@ pub struct Fallback;
 
 type R = Result<Bson, Fallback>;
 
+/// The evaluator to use for a sub-expression whose value is RETURNED unchanged.
+/// The four operators below take one so the caller chooses the position:
+/// [`eval`] (an absent path is null) or [`eval_field_value`] (it stays missing).
+/// Mirrors `expressions.py::_Eval`.
+type Ret = fn(&Bson, &Ctx) -> R;
+
 struct Ctx<'a> {
     doc: &'a Document,
     vars: &'a Document,
@@ -156,6 +162,25 @@ fn eval_field_value(expr: &Bson, ctx: &Ctx) -> R {
             return Ok(Bson::Undefined);
         }
     }
+    // The operators that RETURN one of their sub-expressions propagate its
+    // missing-ness; the ones that COMPUTE a value collapse it to null.
+    // `{$addFields: {z: {$cond: [true, "$nosuch", 1]}}}` omits `z` on mongod --
+    // probed 8.2.11, where both engines wrote a null. `$getField` already had
+    // its own handling. The position is lost once evaluation drops into the
+    // generic operator path, which is why this dispatches here.
+    if let Bson::Document(d) = expr {
+        if d.len() == 1 {
+            if let Some((op, arg)) = d.iter().next() {
+                match op.as_str() {
+                    "$cond" => return op_cond(arg, ctx, eval_field_value),
+                    "$switch" => return op_switch(arg, ctx, eval_field_value),
+                    "$let" => return op_let(arg, ctx, eval_field_value),
+                    "$ifNull" => return op_if_null(arg, ctx, eval_field_value),
+                    _ => {}
+                }
+            }
+        }
+    }
     eval(expr, ctx)
 }
 
@@ -229,9 +254,9 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
             };
             Ok(Bson::Boolean(!truthy(&eval(inner, ctx)?)))
         }
-        "$cond" => op_cond(arg, ctx),
-        "$ifNull" => op_if_null(arg, ctx),
-        "$switch" => op_switch(arg, ctx),
+        "$cond" => op_cond(arg, ctx, eval),
+        "$ifNull" => op_if_null(arg, ctx, eval),
+        "$switch" => op_switch(arg, ctx, eval),
         "$add" => arith_nary(arg, ctx, false),
         "$multiply" => arith_nary(arg, ctx, true),
         "$subtract" => op_subtract(arg, ctx),
@@ -279,7 +304,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$setField" => op_set_field(arg, ctx),
         "$zip" => op_zip(arg, ctx),
         // scope-introducing
-        "$let" => op_let(arg, ctx),
+        "$let" => op_let(arg, ctx, eval),
         "$map" => op_map(arg, ctx),
         "$filter" => op_filter(arg, ctx),
         "$reduce" => op_reduce(arg, ctx),
@@ -786,7 +811,7 @@ fn logic(arg: &Bson, ctx: &Ctx, all: bool) -> R {
     Ok(Bson::Boolean(all))
 }
 
-fn op_cond(arg: &Bson, ctx: &Ctx) -> R {
+fn op_cond(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
     match arg {
         Bson::Document(d) => {
             let (cond, then, els) = (d.get("if"), d.get("then"), d.get("else"));
@@ -794,23 +819,23 @@ fn op_cond(arg: &Bson, ctx: &Ctx) -> R {
                 return Err(Fallback);
             };
             if truthy(&eval(cond, ctx)?) {
-                eval(then, ctx)
+                ret(then, ctx)
             } else {
-                eval(els, ctx)
+                ret(els, ctx)
             }
         }
         Bson::Array(a) if a.len() == 3 => {
             if truthy(&eval(&a[0], ctx)?) {
-                eval(&a[1], ctx)
+                ret(&a[1], ctx)
             } else {
-                eval(&a[2], ctx)
+                ret(&a[2], ctx)
             }
         }
         _ => Err(Fallback),
     }
 }
 
-fn op_if_null(arg: &Bson, ctx: &Ctx) -> R {
+fn op_if_null(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
     let Bson::Array(items) = arg else {
         return Err(Fallback);
     };
@@ -819,15 +844,17 @@ fn op_if_null(arg: &Bson, ctx: &Ctx) -> R {
     }
     let (fallback, checks) = items.split_last().unwrap();
     for check in checks {
-        let v = eval(check, ctx)?;
-        if !is_null(&v) {
+        let v = ret(check, ctx)?;
+        // A MISSING check is skipped exactly like a null one: `$ifNull` looks
+        // for the first argument that HAS a value.
+        if !is_null(&v) && !matches!(v, Bson::Undefined) {
             return Ok(v);
         }
     }
-    eval(fallback, ctx)
+    ret(fallback, ctx)
 }
 
-fn op_switch(arg: &Bson, ctx: &Ctx) -> R {
+fn op_switch(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback);
     };
@@ -842,11 +869,11 @@ fn op_switch(arg: &Bson, ctx: &Ctx) -> R {
             return Err(Fallback);
         };
         if truthy(&eval(case, ctx)?) {
-            return eval(then, ctx);
+            return ret(then, ctx);
         }
     }
     match d.get("default") {
-        Some(def) => eval(def, ctx),
+        Some(def) => ret(def, ctx),
         None => Err(Fallback), // Python raises when no branch matches and no default
     }
 }
@@ -1779,7 +1806,7 @@ fn as_var_name(spec: Option<&Bson>) -> Result<String, Fallback> {
     }
 }
 
-fn op_let(arg: &Bson, ctx: &Ctx) -> R {
+fn op_let(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
     let Bson::Document(d) = arg else {
         return Err(Fallback);
     };
@@ -1796,7 +1823,7 @@ fn op_let(arg: &Bson, ctx: &Ctx) -> R {
         let v = eval_field_value(vexpr, ctx)?;
         vars.insert(name.clone(), v);
     }
-    eval(
+    ret(
         in_expr,
         &Ctx {
             doc: ctx.doc,

@@ -1957,6 +1957,62 @@ REMOVE_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ("twin-nested-doc", TWO_FIELDS, _af({"o": {"p": "$nosuch", "q": 1}})),
 ]
 
+# "Missing" propagates through the operators whose result IS one of their
+# sub-expressions -- `$cond`, `$switch`, `$let`, `$ifNull` -- and does NOT
+# through the ones that compute a value (`$add`, `$concat`), which is why both
+# families are here. mongod omits the field when a field-value position selects
+# a missing sub-expression; both servers wrote a null. It matters in operator
+# position too: `{$eq: [{$cond: [true, "$nosuch", 1]}, null]}` is FALSE on
+# mongod, because the result is missing rather than null. Probed on 8.2.11.
+ONE_A = [{"_id": 1, "a": 1}]
+
+
+def _z(spec: object) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(db, [{"$addFields": {"z": spec}}])
+
+
+PROPAGATE_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    ("cond-then", ONE_A, _z({"$cond": [True, "$nosuch", 1]})),
+    ("cond-else", ONE_A, _z({"$cond": [False, 1, "$nosuch"]})),
+    ("cond-taken-present", ONE_A, _z({"$cond": [True, 1, "$nosuch"]})),
+    ("cond-nested", ONE_A, _z({"$cond": [True, {"$cond": [True, "$nosuch", 1]}, 2]})),
+    ("cond-object-form", ONE_A, _z({"$cond": {"if": True, "then": "$nosuch", "else": 1}})),
+    ("cond-remove", ONE_A, _z({"$cond": [True, "$$REMOVE", 1]})),
+    ("switch-branch", ONE_A, _z({"$switch": {"branches": [{"case": True, "then": "$nosuch"}]}})),
+    (
+        "switch-default",
+        ONE_A,
+        _z({"$switch": {"branches": [{"case": False, "then": 1}], "default": "$nosuch"}}),
+    ),
+    (
+        "switch-taken-present",
+        ONE_A,
+        _z({"$switch": {"branches": [{"case": True, "then": 5}], "default": "$nosuch"}}),
+    ),
+    ("let-in", ONE_A, _z({"$let": {"vars": {"v": 1}, "in": "$nosuch"}})),
+    ("let-var-used", ONE_A, _z({"$let": {"vars": {"v": "$nosuch"}, "in": "$$v"}})),
+    ("let-var-unused", ONE_A, _z({"$let": {"vars": {"v": "$nosuch"}, "in": 7}})),
+    ("ifnull-all-missing", ONE_A, _z({"$ifNull": ["$n1", "$n2"]})),
+    ("ifnull-second-present", ONE_A, _z({"$ifNull": ["$n1", 9]})),
+    ("ifnull-last-null", ONE_A, _z({"$ifNull": ["$n1", None]})),
+    ("ifnull-three-missing", ONE_A, _z({"$ifNull": ["$n1", "$n2", "$n3"]})),
+    ("ifnull-null-then-missing", ONE_A, _z({"$ifNull": [None, "$nosuch"]})),
+    ("nested-doc", ONE_A, _z({"k": {"$cond": [True, "$nosuch", 1]}})),
+    ("in-array", ONE_A, _z([{"$cond": [True, "$nosuch", 1]}])),
+    # The computing operators must keep collapsing missing to null.
+    ("add-collapses", ONE_A, _z({"$add": ["$nosuch", 1]})),
+    ("concat-collapses", ONE_A, _z({"$concat": ["x", "$nosuch"]})),
+    # Operator position: the propagated value is MISSING, not null.
+    ("eq-cond-null", ONE_A, _z({"$eq": [{"$cond": [True, "$nosuch", 1]}, None]})),
+    ("eq-path-null", ONE_A, _z({"$eq": ["$nosuch", None]})),
+    ("lte-cond-literal", ONE_A, _z({"$lte": [{"$cond": [True, "$nosuch", 1]}, "lit"]})),
+    (
+        "eq-switch-null",
+        ONE_A,
+        _z({"$eq": [{"$switch": {"branches": [{"case": True, "then": "$nosuch"}]}}, None]}),
+    ),
+]
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
@@ -1970,6 +2026,7 @@ ALL_CASES = (
     + [("redact", c) for c in REDACT_CASES]
     + [("undefvar", c) for c in UNDEFVAR_CASES]
     + [("remove", c) for c in REMOVE_CASES]
+    + [("propagate", c) for c in PROPAGATE_CASES]
 )
 
 
