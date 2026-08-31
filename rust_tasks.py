@@ -32,6 +32,7 @@ _RUST_BINDINGS_DIR = "crates/secantus-core-py"
 _RUST_WT_DIR = "crates/secantus-wt"
 _RUST_STORAGE_DIR = "crates/secantus-storage"
 _RUST_ADAPTER_DIR = "crates/secantus-storage-adapter"
+_RUST_PGSERVER_DIR = "crates/secantus-pgserver"
 _RUST_STORAGE_PY_DIR = "crates/secantus-storage-py"
 _RUST_BINARY_DIR = "crates/secantusdb"
 
@@ -224,6 +225,42 @@ def rust_adapter_test(c: Context) -> None:
     c.run(f"cd {_RUST_ADAPTER_DIR} && cargo test", pty=True, env=env)
 
 
+@task(name="rust-pgserver-test")
+def rust_pgserver_test(c: Context) -> None:
+    """fmt/clippy/test the secantus-pgserver crate (the PostgreSQL server).
+
+    Excluded from the clean workspace (links WiredTiger through
+    secantus-storage), so the clean-workspace ``rust-test`` NEVER covers it and
+    Cargo does not warn about that. Run this after any change under
+    ``crates/secantus-pgserver``. Same WiredTiger / libclang prerequisites as
+    ``rust-wt-test``.
+
+    The pure-Rust halves (``secantus-pgcatalog`` / ``secantus-pgplan``) ARE in
+    the clean workspace and are covered by ``rust-test``.
+    """
+    env = _rust_env()
+    c.run(f"cd {_RUST_PGSERVER_DIR} && cargo fmt --check", pty=True, env=env)
+    c.run(
+        f"cd {_RUST_PGSERVER_DIR} && cargo clippy --all-targets -- -D warnings",
+        pty=True,
+        env=env,
+    )
+    c.run(f"cd {_RUST_PGSERVER_DIR} && cargo test", pty=True, env=env)
+
+
+@task(name="rust-pgserver-build")
+def rust_pgserver_build(c: Context, release: bool = False) -> None:
+    """Build the standalone ``secantusd-pg`` binary.
+
+    ``tests/test_rust_pgserver_slice.py`` SKIPS unless this has been run — a
+    green pytest run proves nothing about the PostgreSQL server until the binary
+    exists, so check the skip count, not just the exit code.
+    """
+    env = _rust_env()
+    flag = " --release" if release else ""
+    c.run(f"cd {_RUST_PGSERVER_DIR} && cargo build{flag}", pty=True, env=env)
+
+
 @task(name="rust-test-one")
 def rust_test_one(
     c: Context,
@@ -366,9 +403,7 @@ def _llvm_profdata() -> str:
     found = which("llvm-profdata")
     if found:
         return found
-    raise SystemExit(
-        "llvm-profdata not found — run: rustup component add llvm-tools-preview"
-    )
+    raise SystemExit("llvm-profdata not found — run: rustup component add llvm-tools-preview")
 
 
 @task(name="rust-pgo-refresh")
@@ -420,15 +455,12 @@ def rust_pgo_refresh(c: Context) -> None:
 
         raws = glob.glob(str(prof_dir / "*.profraw"))
         if not raws:
-            raise SystemExit(
-                "PGO: no .profraw produced — the instrumented build may not have run."
-            )
+            raise SystemExit("PGO: no .profraw produced — the instrumented build may not have run.")
         merged = prof_dir / "merged.profdata"
         print(f"=== PGO: merging {len(raws)} profraw → sparse profdata ===")
         c.run(
             f"{shlex.quote(profdata_tool)} merge --sparse "
-            f"-o {shlex.quote(str(merged))} "
-            + " ".join(shlex.quote(r) for r in raws)
+            f"-o {shlex.quote(str(merged))} " + " ".join(shlex.quote(r) for r in raws)
         )
         with tarfile.open(committed, "w:gz") as tf:
             tf.add(merged, arcname="_secantus_server.profdata")
@@ -534,6 +566,8 @@ def rust_gate(c: Context, pytest: bool = True, deselect: str = "") -> None:
     rust_storage_test(c)
     print(f"==> [4/{steps}] adapter crate", flush=True)
     rust_adapter_test(c)
+    print(f"==> [4b/{steps}] pgserver crate", flush=True)
+    rust_pgserver_test(c)
     print(f"==> [5/{steps}] parity", flush=True)
     rust_parity(c)
     # Python lint + format — the parity suites are Python, but the cargo
