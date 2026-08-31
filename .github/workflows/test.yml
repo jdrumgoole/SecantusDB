@@ -1342,7 +1342,7 @@ jobs:
       # `cache-on-failure` still populates it when clippy/test go red, so a
       # red-then-fix cycle doesn't pay the full compile twice.
       - name: Cache cargo registry + target (clean workspace)
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           workspaces: crates
           cache-on-failure: true
@@ -1582,7 +1582,7 @@ jobs:
         run: df -h / | tail -1
 
       - name: Cache cargo registry + target (WT-linked crates)
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           # All six roots share the one target above, so this is a single
           # cache, not six. Keep this list in step with the gate steps below.
