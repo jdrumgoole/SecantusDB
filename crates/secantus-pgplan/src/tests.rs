@@ -582,3 +582,54 @@ fn drop_table_is_planned() {
     let err = plan("DROP INDEX i", &lookup).expect_err("drop index");
     assert_eq!(err.sqlstate(), "0A000");
 }
+
+/// Constant expressions, with the corners PostgreSQL gets surprising.
+#[test]
+fn constant_expressions_follow_postgres() {
+    let cases: Vec<(&str, Bson)> = vec![
+        ("SELECT 1+1", Bson::Int32(2)),
+        ("SELECT 1-2", Bson::Int32(-1)),
+        ("SELECT 2*3", Bson::Int32(6)),
+        // Integer division TRUNCATES: 7/2 is 3, not 3.5.
+        ("SELECT 7/2", Bson::Int32(3)),
+        ("SELECT 7%2", Bson::Int32(1)),
+        ("SELECT (1+2)*3", Bson::Int32(9)),
+        ("SELECT -3", Bson::Int32(-3)),
+        ("SELECT 'a'||'b'", Bson::String("ab".into())),
+        // `||` coerces the non-text side.
+        ("SELECT 'n='||1", Bson::String("n=1".into())),
+        // NULL propagates through every operator.
+        ("SELECT 1+NULL", Bson::Null),
+        ("SELECT 1=1", Bson::Boolean(true)),
+        ("SELECT 2<>2", Bson::Boolean(false)),
+    ];
+    for (sql, want) in cases {
+        match plan_ok(sql) {
+            Statement::SelectConstant(sc) => assert_eq!(sc.columns[0].1, want, "for {sql}"),
+            other => panic!("wrong statement for {sql}: {other:?}"),
+        }
+    }
+    let err = plan("SELECT 5/0", &lookup).expect_err("division by zero");
+    assert_eq!(err.sqlstate(), "22012");
+}
+
+/// An expression's column type comes from the OPERATOR, not from the value.
+///
+/// `Describe` precedes `Bind`, so `SELECT $1 + 1` evaluates to NULL when the
+/// type is decided. Reading the type off that NULL would call it `text`.
+#[test]
+fn an_expression_is_typed_by_its_operator() {
+    match plan_with_params("SELECT $1 + 1", &lookup, &[Bson::Null]).unwrap() {
+        Statement::SelectConstant(sc) => {
+            assert_eq!(sc.columns[0].1, Bson::Null);
+            assert_eq!(sc.columns[0].2, "int4");
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    for (sql, want) in [("SELECT 'a'||'b'", "text"), ("SELECT 1<2", "bool")] {
+        match plan_ok(sql) {
+            Statement::SelectConstant(sc) => assert_eq!(sc.columns[0].2, want, "for {sql}"),
+            other => panic!("wrong statement for {sql}: {other:?}"),
+        }
+    }
+}

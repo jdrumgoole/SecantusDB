@@ -389,3 +389,38 @@ def test_casts_carry_postgres_types_not_value_types(home: Path) -> None:
         with pytest.raises(psycopg.Error) as exc:
             cur.execute("SELECT 'x'::int")
         assert exc.value.diag.sqlstate == "22P02"
+
+
+def test_constant_expressions_match_postgres(home: Path) -> None:
+    """Arithmetic, concatenation and comparison in a SELECT list.
+
+    Two corners were probed rather than assumed: integer division TRUNCATES
+    (`7/2` is 3, not 3.5) and `5/0` is `22012`, not a NULL or an infinity.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for sql, want, oid in [
+            ("SELECT 1+1", 2, 23),
+            ("SELECT 7/2", 3, 23),
+            ("SELECT 7%2", 1, 23),
+            ("SELECT (1+2)*3", 9, 23),
+            ("SELECT -3", -3, 23),
+            ("SELECT 'a'||'b'", "ab", 25),
+            ("SELECT 'n='||1", "n=1", 25),
+            ("SELECT 1+NULL", None, 23),
+            ("SELECT 1=1", True, 16),
+            ("SELECT 1<2", True, 16),
+        ]:
+            cur.execute(sql)
+            assert cur.fetchone()[0] == want, sql
+            assert cur.description[0].type_code == oid, sql
+
+        # The type comes from the OPERATOR, not the value: Describe plans this
+        # against a NULL placeholder and must still say int4.
+        cur.execute("SELECT %s + 1", (41,))
+        assert cur.fetchone()[0] == 42
+        assert cur.description[0].type_code == 23
+
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("SELECT 5/0")
+        assert exc.value.diag.sqlstate == "22012"

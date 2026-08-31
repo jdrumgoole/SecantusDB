@@ -155,6 +155,21 @@ QUERIES = [
     # --- casts. The declared type matters as much as the value: `Describe`
     # runs before `Bind`, so a type inferred from the (NULL) value typed
     # `$1::int` as varchar and the client decoded an integer as a string.
+    # --- constant expressions. `7/2` is 3 (integer division truncates) and
+    # `5/0` is 22012 -- both probed, neither guessed.
+    "SELECT 1+1",
+    "SELECT 1-2",
+    "SELECT 2*3",
+    "SELECT 7/2",
+    "SELECT 7%2",
+    "SELECT (1+2)*3",
+    "SELECT -3",
+    "SELECT 'a'||'b'",
+    "SELECT 'n='||1",
+    "SELECT 1+NULL",
+    "SELECT 1=1",
+    "SELECT 1<2",
+    "SELECT 2<>2",
     "SELECT '1'::int",
     "SELECT 1::text",
     "SELECT '1.5'::float8",

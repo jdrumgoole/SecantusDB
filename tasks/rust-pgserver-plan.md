@@ -206,6 +206,36 @@ Updated ranking:
 | 66 | casts to `interval` |
 | 59 | `set_config()` |
 
+### 0.11 Expressions (2026-08-31): 746 -> 853
+
+`AExpr` closed; **gone from the ranking**. The largest jump yet, **+107**.
+
+Arithmetic (`+ - * / %`), `||`, comparisons and unary minus, over literals and
+bound parameters. 14 of 14 shapes match PG 14 on value AND type oid, including
+`7/2 = 3` (integer division truncates) and `5/0` -> `22012`.
+
+**Decimal arithmetic is deliberately refused.** PostgreSQL types `1 + 1.5` as
+`numeric` (oid 1700) with its own scale rules, not `float8`. Returning a double
+would be the right value under the wrong declared type -- the same class as the
+`$1::int`-decoded-as-string bug. Explicit `::float8` casts work, because then
+the type genuinely is float8.
+
+The static-typing rule earned its keep again: `SELECT $1 + 1` is planned
+against a NULL placeholder at Describe time, so the column type comes from the
+OPERATOR (int4), never from the value (which would say text).
+
+Ranking now:
+
+| n | blocker |
+|---:|---|
+| 503 | `VariableSetStmt` — `SET`/`RESET` |
+| 325 | `FuncCall` — functions in a target list |
+| 274 | `CopyStmt` |
+| 179 | `AArrayExpr` — array literals |
+| 80 | casts to `interval` |
+
+**Trajectory: 694 -> 746 -> 853.**
+
 **A type-system trap worth remembering.** `Describe` runs BEFORE `Bind`, so a
 column's type cannot be inferred from its value — at that point `$1::int` has
 no value. Inferring typed it `varchar`, and the client then decoded a correct

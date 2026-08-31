@@ -36,6 +36,10 @@ pub enum Error {
     Parameter(String),
     /// A value that cannot be read as its target type -> 22P02.
     InvalidText(String),
+    /// `x / 0` -> 22012.
+    DivisionByZero,
+    /// Integer overflow -> 22003.
+    NumericOutOfRange(String),
 }
 
 impl std::fmt::Display for Error {
@@ -48,6 +52,8 @@ impl std::fmt::Display for Error {
             Error::Grouping(m) => write!(f, "{m}"),
             Error::Parameter(m) => write!(f, "{m}"),
             Error::InvalidText(m) => write!(f, "{m}"),
+            Error::DivisionByZero => write!(f, "division by zero"),
+            Error::NumericOutOfRange(m) => write!(f, "{m}"),
         }
     }
 }
@@ -63,6 +69,8 @@ impl Error {
             Error::Grouping(_) => "42803",    // grouping_error
             Error::Parameter(_) => "42P02",   // undefined_parameter
             Error::InvalidText(_) => "22P02", // invalid_text_representation
+            Error::DivisionByZero => "22012",
+            Error::NumericOutOfRange(_) => "22003", // numeric_value_out_of_range
         }
     }
 }
@@ -804,6 +812,41 @@ fn session_function(name: &str) -> Option<Bson> {
     })
 }
 
+/// The PostgreSQL type an EXPRESSION declares, read from its shape rather than
+/// from the value it happens to produce.
+///
+/// `Describe` runs before `Bind` and plans against NULL placeholders, so
+/// `SELECT $1 + 1` evaluates to NULL at describe time. Typing that column from
+/// the value would call it `text`; the operator says `int4`. This is the same
+/// trap that made `$1::int` decode as a string.
+fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
+    match node.node.as_ref() {
+        Some(N::TypeCast(tc)) => tc
+            .type_name
+            .as_ref()
+            .map(|n| type_name(&n.names))
+            .unwrap_or_else(|| inferred_type(value).to_string()),
+        Some(N::AExpr(e)) => {
+            let op = operator_name(e).unwrap_or("");
+            match op {
+                "||" => "text".to_string(),
+                "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" => "bool".to_string(),
+                // Arithmetic keeps the value's type when it computed one, and
+                // falls back to int4 for the NULL-placeholder case, which is
+                // what PostgreSQL reports for `1 + NULL`.
+                _ => {
+                    if *value == Bson::Null {
+                        "int4".to_string()
+                    } else {
+                        inferred_type(value).to_string()
+                    }
+                }
+            }
+        }
+        _ => inferred_type(value).to_string(),
+    }
+}
+
 /// The PostgreSQL type a constant value carries when nothing declares one.
 fn inferred_type(v: &Bson) -> &'static str {
     match v {
@@ -853,19 +896,10 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 let t = inferred_type(&v).to_string();
                 (name, v, t)
             }
-            Some(node @ (N::AConst(_) | N::ParamRef(_) | N::TypeCast(_))) => {
+            Some(node @ (N::AConst(_) | N::ParamRef(_) | N::TypeCast(_) | N::AExpr(_))) => {
                 let v = const_value(rt.val.as_ref().expect("checked"), params)?;
-                // A cast DECLARES the type; anything else takes the value's.
-                // This must not depend on the value, because Describe plans
-                // with NULL placeholders.
-                let t = match node {
-                    N::TypeCast(tc) => tc
-                        .type_name
-                        .as_ref()
-                        .map(|n| type_name(&n.names))
-                        .unwrap_or_else(|| inferred_type(&v).to_string()),
-                    _ => inferred_type(&v).to_string(),
-                };
+                let t = static_type(rt.val.as_ref().expect("checked"), &v);
+                let _ = node;
                 ("?column?".to_string(), v, t)
             }
             Some(other) => return Err(Error::Unsupported(disc(other))),
@@ -966,6 +1000,137 @@ fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         },
         "text" | "varchar" | "bpchar" | "char" | "name" => Ok(Bson::String(as_text(&value))),
         other => Err(Error::Unsupported(format!("a cast to {other}"))),
+    }
+}
+
+/// Evaluate a constant expression: arithmetic, concatenation, comparison.
+///
+/// Probed PG 14, and the surprises are all in the corners:
+/// `7/2` is **3** (integer division truncates), `5/0` is `22012`, `1+NULL` is
+/// NULL, and `'n='||1` coerces the integer to text.
+///
+/// **Non-integer numeric operands are refused.** PostgreSQL types `1 + 1.5` as
+/// `numeric` (oid 1700) with its own scale rules, not `float8`; producing a
+/// double would give the right value with the wrong declared type, which is the
+/// bug class that made `$1::int` decode as a string. Explicit `::float8` casts
+/// work, because then the type IS float8.
+fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
+    // NULL propagates through every operator here (PG: `1 + NULL` is NULL).
+    if lhs == Bson::Null || rhs == Bson::Null {
+        return Ok(Bson::Null);
+    }
+
+    if op == "||" {
+        let text = |v: &Bson| match v {
+            Bson::String(s) => s.clone(),
+            Bson::Int32(i) => i.to_string(),
+            Bson::Int64(i) => i.to_string(),
+            Bson::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
+            Bson::Double(d) => d.to_string(),
+            other => format!("{other:?}"),
+        };
+        return Ok(Bson::String(format!("{}{}", text(&lhs), text(&rhs))));
+    }
+
+    if matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+        let ord = compare_constants(&lhs, &rhs)
+            .ok_or_else(|| Error::Unsupported(format!("comparing these operands with {op}")))?;
+        return Ok(Bson::Boolean(match op {
+            "=" => ord == std::cmp::Ordering::Equal,
+            "<>" | "!=" => ord != std::cmp::Ordering::Equal,
+            "<" => ord == std::cmp::Ordering::Less,
+            "<=" => ord != std::cmp::Ordering::Greater,
+            ">" => ord == std::cmp::Ordering::Greater,
+            _ => ord != std::cmp::Ordering::Less,
+        }));
+    }
+
+    let ints = |v: &Bson| match v {
+        Bson::Int32(i) => Some(i64::from(*i)),
+        Bson::Int64(i) => Some(*i),
+        _ => None,
+    };
+    let (a, b) = match (ints(&lhs), ints(&rhs)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            // Doubles reach here only from an explicit ::float8 cast, where the
+            // declared type really is float8.
+            let floats = |v: &Bson| match v {
+                Bson::Double(d) => Some(*d),
+                Bson::Int32(i) => Some(f64::from(*i)),
+                Bson::Int64(i) => Some(*i as f64),
+                _ => None,
+            };
+            let (x, y) = match (floats(&lhs), floats(&rhs)) {
+                (Some(x), Some(y)) => (x, y),
+                _ => {
+                    return Err(Error::Unsupported(format!(
+                        "operator {op} on these operands"
+                    )))
+                }
+            };
+            return Ok(Bson::Double(match op {
+                "+" => x + y,
+                "-" => x - y,
+                "*" => x * y,
+                "/" => {
+                    if y == 0.0 {
+                        return Err(Error::DivisionByZero);
+                    }
+                    x / y
+                }
+                _ => return Err(Error::Unsupported(format!("operator {op}"))),
+            }));
+        }
+    };
+
+    let out = match op {
+        "+" => a.checked_add(b),
+        "-" => a.checked_sub(b),
+        "*" => a.checked_mul(b),
+        // Integer division TRUNCATES in PostgreSQL: 7/2 is 3, not 3.5.
+        "/" => {
+            if b == 0 {
+                return Err(Error::DivisionByZero);
+            }
+            a.checked_div(b)
+        }
+        "%" => {
+            if b == 0 {
+                return Err(Error::DivisionByZero);
+            }
+            a.checked_rem(b)
+        }
+        other => return Err(Error::Unsupported(format!("operator {other}"))),
+    }
+    .ok_or_else(|| Error::NumericOutOfRange("integer out of range".into()))?;
+
+    // int4 stays int4 unless it genuinely overflowed into int8 territory.
+    Ok(
+        if matches!(lhs, Bson::Int64(_))
+            || matches!(rhs, Bson::Int64(_))
+            || i32::try_from(out).is_err()
+        {
+            Bson::Int64(out)
+        } else {
+            Bson::Int32(out as i32)
+        },
+    )
+}
+
+fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Bson::String(x), Bson::String(y)) => Some(x.cmp(y)),
+        (Bson::Boolean(x), Bson::Boolean(y)) => Some(x.cmp(y)),
+        _ => {
+            let f = |v: &Bson| match v {
+                Bson::Int32(i) => Some(f64::from(*i)),
+                Bson::Int64(i) => Some(*i as f64),
+                Bson::Double(d) => Some(*d),
+                _ => None,
+            };
+            f(a)?.partial_cmp(&f(b)?)
+        }
     }
 }
 
@@ -1135,6 +1300,28 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             .map(|t| type_name(&t.names))
             .unwrap_or_default();
         return cast_value(value, &target);
+    }
+    if let Some(N::AExpr(e)) = node.node.as_ref() {
+        if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp) {
+            return Err(Error::Unsupported("this operator form".into()));
+        }
+        let op = operator_name(e)?.to_string();
+        let rhs = const_value(
+            e.rexpr
+                .as_ref()
+                .ok_or_else(|| Error::Parse("operator with no right operand".into()))?,
+            params,
+        )?;
+        // A missing left operand is unary: `-3`, `+3`.
+        let lhs = match e.lexpr.as_ref() {
+            Some(l) => const_value(l, params)?,
+            None => match op.as_str() {
+                "-" => Bson::Int32(0),
+                "+" => return Ok(rhs),
+                _ => return Err(Error::Unsupported(format!("unary {op}"))),
+            },
+        };
+        return eval_binary(&op, lhs, rhs);
     }
     if let Some(N::ParamRef(p)) = node.node.as_ref() {
         let idx = usize::try_from(p.number).unwrap_or(0);
