@@ -2223,6 +2223,56 @@ ARITY_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ),
 ]
 
+# Decimal128 through the math operators. Thirteen of them CRASHED the Python
+# server (`internal server error`) because `math` rejects a `Decimal128`
+# outright, and the rest narrowed it to a `float`, dropping half the digits
+# mongod keeps. decimal128 carries 34 significant digits and mongod computes in
+# them; `float` carries 17.
+#
+# The hyperbolics are exact identities over exp/ln/sqrt, which `decimal`
+# provides. The CIRCULAR functions have no such identity and still narrow —
+# recorded in `tasks/backlog.md`, not fixed here.
+DEC = Decimal128("2.5")
+DEC_SEED = [{"_id": 1}]
+
+
+def _d(expr: object) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(db, [{"$addFields": {"z": expr}}])
+
+
+DECIMAL_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    # these thirteen crashed
+    ("abs", DEC_SEED, _d({"$abs": DEC})),
+    ("ceil", DEC_SEED, _d({"$ceil": DEC})),
+    ("floor", DEC_SEED, _d({"$floor": DEC})),
+    ("trunc", DEC_SEED, _d({"$trunc": DEC})),
+    ("round", DEC_SEED, _d({"$round": DEC})),
+    ("exp", DEC_SEED, _d({"$exp": DEC})),
+    ("ln", DEC_SEED, _d({"$ln": DEC})),
+    ("log10", DEC_SEED, _d({"$log10": DEC})),
+    ("sqrt", DEC_SEED, _d({"$sqrt": DEC})),
+    ("mod", DEC_SEED, _d({"$mod": [DEC, 2]})),
+    ("pow", DEC_SEED, _d({"$pow": [DEC, 2]})),
+    ("log", DEC_SEED, _d({"$log": [DEC, 2]})),
+    ("avg", DEC_SEED, _d({"$avg": [DEC, DEC]})),
+    # precision, not crashes
+    ("sinh", DEC_SEED, _d({"$sinh": DEC})),
+    ("cosh", DEC_SEED, _d({"$cosh": DEC})),
+    ("tanh", DEC_SEED, _d({"$tanh": DEC})),
+    ("asinh", DEC_SEED, _d({"$asinh": DEC})),
+    ("degrees-to-radians", DEC_SEED, _d({"$degreesToRadians": DEC})),
+    ("radians-to-degrees", DEC_SEED, _d({"$radiansToDegrees": DEC})),
+    # the conversions and predicates, which were already right
+    ("to-decimal", DEC_SEED, _d({"$toDecimal": DEC})),
+    ("to-string", DEC_SEED, _d({"$toString": DEC})),
+    ("type", DEC_SEED, _d({"$type": DEC})),
+    ("is-number", DEC_SEED, _d({"$isNumber": DEC})),
+    ("add", DEC_SEED, _d({"$add": [DEC, 2]})),
+    ("multiply", DEC_SEED, _d({"$multiply": [DEC, 2]})),
+    ("divide", DEC_SEED, _d({"$divide": [DEC, 2]})),
+    ("eq-decimal-int", DEC_SEED, _d({"$eq": [Decimal128("2"), 2]})),
+]
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
@@ -2240,6 +2290,7 @@ ALL_CASES = (
     + [("exprcmp", c) for c in EXPRCMP_CASES]
     + [("undefvarcmd", c) for c in UNDEFVAR_CMD_CASES]
     + [("arity", c) for c in ARITY_CASES]
+    + [("decimal", c) for c in DECIMAL_CASES]
 )
 
 

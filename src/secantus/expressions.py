@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import decimal as _decimal
 import math
 import zoneinfo
 from collections.abc import Mapping
@@ -501,6 +502,11 @@ def _op_mod(arg: Any, ctx: _Ctx) -> Any:
         )
     if b == 0:
         raise ExpressionError("can't $mod by zero", code=16610)
+    if _has_decimal(a, b):
+        # `Decimal.__mod__` truncates toward zero, which is C's `fmod` and
+        # mongod's rule -- Python's `%` on ints/floats floors instead, which is
+        # why this cannot just widen the existing expression.
+        return _decimal_result(lambda x, y: x % y, a, b)
     return a % b
 
 
@@ -700,6 +706,43 @@ def _op_to_upper(arg: Any, ctx: _Ctx) -> Any:
     return value.upper() if isinstance(value, str) else value
 
 
+#: IEEE 754 decimal128 carries 34 significant digits, and that is the precision
+#: mongod computes these operators in. Converting through `float` -- which is
+#: what every one of them used to do -- narrows the result to 17 digits, and for
+#: nine of them raised a `TypeError` outright because `math` rejects a
+#: `Decimal128`. Both were visible to a caller: `{$sqrt: Decimal128("2.5")}`
+#: answered `internal server error`.
+_DEC128_CTX = _decimal.Context(prec=34)
+
+
+#: pi to more digits than decimal128 carries, so the conversion below rounds
+#: rather than truncates.
+_PI = _decimal.Decimal("3.14159265358979323846264338327950288419716939937510")
+
+
+def _to_decimal(v: Any) -> _decimal.Decimal:
+    """A numeric operand as a `Decimal`, exactly."""
+    if isinstance(v, Decimal128):
+        return v.to_decimal()
+    if isinstance(v, _decimal.Decimal):
+        return v
+    if isinstance(v, float):
+        # Through `str`, not `Decimal(float)`: the latter carries the binary
+        # value's full expansion (0.1 -> 0.1000000000000000055511151231257827).
+        return _decimal.Decimal(str(v))
+    return _decimal.Decimal(v)
+
+
+def _has_decimal(*vals: Any) -> bool:
+    return any(isinstance(v, Decimal128) for v in vals)
+
+
+def _decimal_result(fn: Any, *vals: Any) -> Decimal128:
+    """Run `fn` over the operands as `Decimal`s, at decimal128 precision."""
+    with _decimal.localcontext(_DEC128_CTX):
+        return Decimal128(fn(*(_to_decimal(v) for v in vals)))
+
+
 def _require_math_numeric(v: Any, op: str, code: int = 28765) -> None:
     """mongod's type guard for the unary math operators: a non-numeric operand is
     rejected (Location28765 for most, 51081 for $round / $trunc), rather than
@@ -718,6 +761,8 @@ def _op_abs(arg: Any, ctx: _Ctx) -> Any:
     if v is None:
         return None
     _require_math_numeric(v, "$abs")
+    if _has_decimal(v):
+        return _decimal_result(abs, v)
     return abs(v)
 
 
@@ -743,6 +788,15 @@ def _op_round(arg: Any, ctx: _Ctx) -> Any:
         place = int(place)
     if not isinstance(place, int):
         place = 0
+    if _has_decimal(n):
+        # Half-to-even, which is what `round` does for floats and what mongod
+        # documents for `$round`.
+        return _decimal_result(
+            lambda d: d.quantize(
+                _decimal.Decimal(1).scaleb(-place), rounding=_decimal.ROUND_HALF_EVEN
+            ),
+            n,
+        )
     return round(n, place)
 
 
@@ -753,6 +807,8 @@ def _op_floor(arg: Any, ctx: _Ctx) -> Any:
     if v is None:
         return None
     _require_math_numeric(v, "$floor")
+    if _has_decimal(v):
+        return _decimal_result(lambda d: d.to_integral_value(rounding=_decimal.ROUND_FLOOR), v)
     return math.floor(v)
 
 
@@ -763,6 +819,8 @@ def _op_ceil(arg: Any, ctx: _Ctx) -> Any:
     if v is None:
         return None
     _require_math_numeric(v, "$ceil")
+    if _has_decimal(v):
+        return _decimal_result(lambda d: d.to_integral_value(rounding=_decimal.ROUND_CEILING), v)
     return math.ceil(v)
 
 
@@ -780,6 +838,8 @@ def _op_sqrt(arg: Any, ctx: _Ctx) -> Any:
             code=28714,
             code_name="Location28714",
         )
+    if _has_decimal(v):
+        return _decimal_result(lambda d: d.sqrt(), v)
     return math.sqrt(v)
 
 
@@ -799,6 +859,12 @@ def _op_pow(arg: Any, ctx: _Ctx) -> Any:
         )
     if base == 0 and exponent < 0:
         raise ExpressionError("$pow cannot take a base of 0 and a negative exponent", code=28764)
+    if _has_decimal(base, exponent):
+        # `exp(e * ln(b))`, not `b ** e`. mongod computes it that way and the
+        # rounding shows: `2.5 ** 2` is exactly 6.25, but mongod answers
+        # 6.249999999999999999999999999999999, and matching the reference
+        # server is the point. A zero base has no `ln`, so it is handled first.
+        return _decimal_result(lambda b, e: b**e if b == 0 else (e * b.ln()).exp(), base, exponent)
     result = base**exponent
     # A negative base with a fractional exponent yields a Python complex, which
     # is unencodable (crashes BSON) — mongod returns NaN instead.
@@ -814,6 +880,8 @@ def _op_exp(arg: Any, ctx: _Ctx) -> Any:
     if v is None:
         return None
     _require_math_numeric(v, "$exp")
+    if _has_decimal(v):
+        return _decimal_result(lambda d: d.exp(), v)
     return math.exp(v)
 
 
@@ -831,6 +899,8 @@ def _op_ln(arg: Any, ctx: _Ctx) -> Any:
             code=28766,
             code_name="Location28766",
         )
+    if _has_decimal(v):
+        return _decimal_result(lambda d: d.ln(), v)
     return math.log(v)
 
 
@@ -869,6 +939,8 @@ def _op_log(arg: Any, ctx: _Ctx) -> Any:
             code=28759,
             code_name="Location28759",
         )
+    if _has_decimal(n, base):
+        return _decimal_result(lambda x, b: x.ln() / b.ln(), n, base)
     return math.log(n, base)
 
 
@@ -886,6 +958,8 @@ def _op_log10(arg: Any, ctx: _Ctx) -> Any:
             code=28761,
             code_name="Location28761",
         )
+    if _has_decimal(v):
+        return _decimal_result(lambda d: d.log10(), v)
     return math.log10(v)
 
 
@@ -897,6 +971,21 @@ def _trig_coerce(name: str, v: Any, code: int = 28765) -> float:
     if isinstance(v, bool) or not isinstance(v, (int, float, Decimal128)):
         raise ExpressionError(f"{name} only supports numeric types, not {_type_name(v)}", code=code)
     return float(v.to_decimal()) if isinstance(v, Decimal128) else float(v)
+
+
+#: Decimal128 implementations of the HYPERBOLIC functions, as exact identities
+#: over `exp` / `ln` / `sqrt` -- all of which `decimal` provides, so these carry
+#: the full 34 digits mongod does. The CIRCULAR functions (sin / cos / tan and
+#: their inverses) have no such identity and would need series expansions; they
+#: still narrow to `float`. See `tasks/backlog.md`.
+_DEC_TRIG: dict[str, Any] = {
+    "$sinh": lambda d: (d.exp() - (-d).exp()) / 2,
+    "$cosh": lambda d: (d.exp() + (-d).exp()) / 2,
+    "$tanh": lambda d: (d.exp() - (-d).exp()) / (d.exp() + (-d).exp()),
+    "$asinh": lambda d: (d + (d * d + 1).sqrt()).ln(),
+    "$acosh": lambda d: (d + (d * d - 1).sqrt()).ln(),
+    "$atanh": lambda d: ((1 + d) / (1 - d)).ln() / 2,
+}
 
 
 def _make_trig(name: str, fn: Any, domain: str) -> Any:
@@ -925,6 +1014,15 @@ def _make_trig(name: str, fn: Any, domain: str) -> Any:
             )
         if domain == "atanh" and abs(x) == 1.0:
             return math.inf if x > 0 else -math.inf
+        dec_fn = _DEC_TRIG.get(name)
+        if dec_fn is not None and _has_decimal(v):
+            # At decimal128 precision THROUGHOUT, deliberately. Computing wide
+            # and rounding back is more accurate and matches mongod LESS: it
+            # accumulates its own rounding at 34 digits, so `$cosh` moved from
+            # agreeing to differing in the last digit when guard digits were
+            # tried. Fidelity here means reproducing the arithmetic, not
+            # improving on it.
+            return _decimal_result(dec_fn, v)
         return fn(x)
 
     return op
@@ -975,6 +1073,12 @@ def _op_trunc(arg: Any, ctx: _Ctx) -> Any:
         place = int(place)
     if not isinstance(place, int):
         place = 0
+    if _has_decimal(n):
+        # `quantize` at the requested place, truncating toward zero.
+        return _decimal_result(
+            lambda d: d.quantize(_decimal.Decimal(1).scaleb(-place), rounding=_decimal.ROUND_DOWN),
+            n,
+        )
     factor = 10**place
     return math.trunc(n * factor) / factor
 
@@ -3331,7 +3435,9 @@ def _op_degrees_to_radians(arg: Any, ctx: _Ctx) -> Any:
         return None
     if isinstance(v, bool) or not isinstance(v, (int, float, Decimal128)):
         raise ExpressionError("$degreesToRadians requires a number")
-    x = float(v.to_decimal()) if isinstance(v, Decimal128) else float(v)
+    if _has_decimal(v):
+        return _decimal_result(lambda d: d * _PI / _decimal.Decimal(180), v)
+    x = float(v)
     return x * math.pi / 180.0
 
 
@@ -3343,7 +3449,9 @@ def _op_radians_to_degrees(arg: Any, ctx: _Ctx) -> Any:
         return None
     if isinstance(v, bool) or not isinstance(v, (int, float, Decimal128)):
         raise ExpressionError("$radiansToDegrees requires a number")
-    x = float(v.to_decimal()) if isinstance(v, Decimal128) else float(v)
+    if _has_decimal(v):
+        return _decimal_result(lambda d: d * _decimal.Decimal(180) / _PI, v)
+    x = float(v)
     return x * 180.0 / math.pi
 
 
@@ -3438,13 +3546,20 @@ def _op_expr_sum(arg: Any, ctx: _Ctx) -> Any:
 
 
 def _op_expr_avg(arg: Any, ctx: _Ctx) -> Any:
+    values = [x for x in _expr_acc_values(arg, ctx) if _expr_is_number(x)]
+    if not values:
+        return None
+    # A Decimal128 anywhere makes the whole average decimal128: `total += x`
+    # raised a TypeError against a `Decimal128`, which surfaced as an
+    # `internal server error`.
+    if _has_decimal(*values):
+        return _decimal_result(
+            lambda *ds: sum(ds[1:], ds[0]) / _decimal.Decimal(len(values)), *values
+        )
     total: Any = 0
-    n = 0
-    for x in _expr_acc_values(arg, ctx):
-        if _expr_is_number(x):
-            total += x
-            n += 1
-    return (total / n) if n else None
+    for x in values:
+        total += x
+    return total / len(values)
 
 
 def _op_expr_max(arg: Any, ctx: _Ctx) -> Any:
