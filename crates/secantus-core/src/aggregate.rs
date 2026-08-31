@@ -404,11 +404,26 @@ pub fn may_name_runtime_error(stages: &[Bson]) -> bool {
             _ => false,
         }
     }
+    /// A numeric-guard operator anywhere in the stage: its operand type is only
+    /// known at evaluation, so naming its 28765 needs the input documents.
+    fn has_numeric_guard(expr: &Bson) -> bool {
+        match expr {
+            Bson::Document(d) => d.iter().any(|(k, v)| {
+                (k != "$literal" && NUMERIC_GUARD.iter().any(|(n, _)| n == k))
+                    || (k != "$literal" && has_numeric_guard(v))
+            }),
+            Bson::Array(a) => a.iter().any(has_numeric_guard),
+            _ => false,
+        }
+    }
     stages.iter().any(|stage| {
         let Bson::Document(d) = stage else {
             return false;
         };
         if d.contains_key("$redact") || d.contains_key("$densify") {
+            return true;
+        }
+        if d.values().any(has_numeric_guard) {
             return true;
         }
         if let Some(Bson::Document(b)) = d.get("$bucket") {
@@ -440,6 +455,120 @@ pub fn may_name_runtime_error(stages: &[Bson]) -> bool {
 /// is the first this function finds, which need not be the one mongod would
 /// report first. Every message below was probed against mongod 8.2.11
 /// (2026-08-31).
+/// The unary operators mongod guards with `$OP only supports numeric types,
+/// not <type>`, and the code each uses. Derived from mongod 8.2.11 -- `$round`
+/// and `$trunc` answer 51081 where the rest answer 28765.
+const NUMERIC_GUARD: &[(&str, i32)] = &[
+    ("$abs", 28765),
+    ("$acos", 28765),
+    ("$acosh", 28765),
+    ("$asin", 28765),
+    ("$asinh", 28765),
+    ("$atan", 28765),
+    ("$atanh", 28765),
+    ("$bitNot", 28765),
+    ("$ceil", 28765),
+    ("$cos", 28765),
+    ("$cosh", 28765),
+    ("$degreesToRadians", 28765),
+    ("$exp", 28765),
+    ("$floor", 28765),
+    ("$ln", 28765),
+    ("$log10", 28765),
+    ("$radiansToDegrees", 28765),
+    ("$round", 51081),
+    ("$sin", 28765),
+    ("$sinh", 28765),
+    ("$sqrt", 28765),
+    ("$tan", 28765),
+    ("$tanh", 28765),
+    ("$trunc", 51081),
+];
+
+/// Report mongod's numeric type guard for an operand the engine deferred.
+///
+/// The operators know the operand's type when they evaluate it, but their only
+/// failure signal is `Fallback`, which carries no code -- so on a server with no
+/// Python every one of these answered a generic `BadValue`. This re-evaluates
+/// just the ARGUMENT (not the operator) against the documents the stage sees,
+/// which is enough to name the error. The `update::arith_type_error` template,
+/// like the rest of this module's validators.
+///
+/// A null operand is not an error (mongod returns null), and `Decimal128` IS
+/// numeric -- it is deferred for a different reason, so reporting a type guard
+/// for it would be wrong.
+fn numeric_guard_error(
+    docs: &[Document],
+    stages: &[Bson],
+    vars: &Document,
+    collation: Option<&Collation>,
+) -> Option<(i32, String)> {
+    for (i, stage) in stages.iter().enumerate() {
+        let Bson::Document(d) = stage else { continue };
+        let mut found: Option<(String, i32, Bson)> = None;
+        for (_, spec) in d {
+            collect_numeric_guard(spec, &mut found);
+        }
+        let Some((op, code, arg)) = found else {
+            continue;
+        };
+        let input = apply_pipeline(docs.to_vec(), &stages[..i], vars, collation).ok()?;
+        for doc in &input {
+            let Ok(v) = expressions::evaluate(doc, &arg, vars) else {
+                continue;
+            };
+            if matches!(
+                v,
+                Bson::Null
+                    | Bson::Undefined
+                    | Bson::Int32(_)
+                    | Bson::Int64(_)
+                    | Bson::Double(_)
+                    | Bson::Decimal128(_)
+            ) {
+                continue;
+            }
+            return Some((
+                code,
+                format!(
+                    "{op} only supports numeric types, not {}",
+                    crate::query::bson_type_name(&v)
+                ),
+            ));
+        }
+    }
+    None
+}
+
+/// Find the first numeric-guard operator inside a stage spec, with its argument.
+fn collect_numeric_guard(expr: &Bson, found: &mut Option<(String, i32, Bson)>) {
+    if found.is_some() {
+        return;
+    }
+    match expr {
+        Bson::Array(items) => items.iter().for_each(|i| collect_numeric_guard(i, found)),
+        Bson::Document(d) => {
+            for (k, v) in d {
+                if k == "$literal" {
+                    continue;
+                }
+                if let Some((_, code)) = NUMERIC_GUARD.iter().find(|(n, _)| n == k) {
+                    // A one-element list is the single argument (`apply_op`
+                    // unwraps it); anything else is the argument itself.
+                    let arg = match v {
+                        Bson::Array(a) if a.len() == 1 => a[0].clone(),
+                        other => other.clone(),
+                    };
+                    *found = Some((k.clone(), *code, arg));
+                    return;
+                }
+                collect_numeric_guard(v, found);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn runtime_error(
     docs: &[Document],
     stages: &[Bson],
@@ -447,6 +576,9 @@ pub fn runtime_error(
     collation: Option<&Collation>,
 ) -> Option<(i32, String)> {
     if let Some(found) = redact_runtime_error(docs, stages, vars, collation) {
+        return Some(found);
+    }
+    if let Some(found) = numeric_guard_error(docs, stages, vars, collation) {
         return Some(found);
     }
     // mongod's wording for a `$switch` with no matching branch and no default.
