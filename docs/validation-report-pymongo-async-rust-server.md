@@ -1,6 +1,6 @@
 # pymongo async Validation Report (Rust server)
 
-Generated 2026-08-24 — SecantusDB 0.6.0b15 vs pymongo f2103a95870a (`vendor/pymongo-tests/test/asynchronous/`).
+Generated 2026-08-31 — SecantusDB 0.6.0b16 vs pymongo f2103a95870a (`vendor/pymongo-tests/test/asynchronous/`).
 
 Run `uv run python -m invoke validate-pymongo-async --server rust` to refresh. This is the async-driver analogue of the R8 conformance gate: pymongo's native `AsyncMongoClient` suite pointed at the **Rust server**.
 
@@ -9,15 +9,15 @@ Run `uv run python -m invoke validate-pymongo-async --server rust` to refresh. T
 | Test file | Passed | Failed | Errored | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|---:|
 | `test_bulk.py` | 34 | 0 | 0 | 4 | 38 | 100.0% |
-| `test_change_stream.py` | 97 | 0 | 0 | 58 | 155 | 100.0% |
+| `test_change_stream.py` | 100 | 0 | 0 | 55 | 155 | 100.0% |
 | `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
 | `test_collection.py` | 85 | 2 | 0 | 4 | 91 | 97.7% |
 | `test_collection_management.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
 | `test_command_logging.py` | 22 | 0 | 0 | 14 | 36 | 100.0% |
-| `test_command_monitoring.py` | 31 | 0 | 0 | 7 | 38 | 100.0% |
+| `test_command_monitoring.py` | 32 | 0 | 0 | 6 | 38 | 100.0% |
 | `test_comment.py` | 3 | 0 | 0 | 0 | 3 | 100.0% |
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_crud_unified.py` | 301 | 0 | 0 | 185 | 486 | 100.0% |
+| `test_crud_unified.py` | 344 | 0 | 0 | 142 | 486 | 100.0% |
 | `test_cursor.py` | 57 | 3 | 0 | 12 | 72 | 95.0% |
 | `test_custom_types.py` | 51 | 0 | 0 | 0 | 51 | 100.0% |
 | `test_database.py` | 35 | 0 | 0 | 1 | 36 | 100.0% |
@@ -26,9 +26,9 @@ Run `uv run python -m invoke validate-pymongo-async --server rust` to refresh. T
 | `test_read_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
 | `test_read_preferences.py` | 9 | 1 | 0 | 20 | 30 | 90.0% |
 | `test_run_command.py` | 16 | 0 | 0 | 5 | 21 | 100.0% |
-| `test_transactions_unified.py` | 92 | 0 | 0 | 172 | 264 | 100.0% |
-| `test_versioned_api_integration.py` | 38 | 0 | 0 | 5 | 43 | 100.0% |
-| **Overall** | **926** | **6** | **0** | **491** | **1423** | **99.4%** |
+| `test_transactions_unified.py` | 95 | 0 | 0 | 169 | 264 | 100.0% |
+| `test_versioned_api_integration.py` | 39 | 0 | 0 | 4 | 43 | 100.0% |
+| **Overall** | **977** | **6** | **0** | **440** | **1423** | **99.4%** |
 
 ## Failures (6)
 

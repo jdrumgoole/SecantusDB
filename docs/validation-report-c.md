@@ -1,6 +1,6 @@
 # mongo-c-driver Validation Report
 
-Generated 2026-08-28 — SecantusDB 0.6.0b16 vs mongo-c-driver 57dba9c (`vendor/mongo-c-driver/`).
+Generated 2026-08-31 — SecantusDB 0.6.0b16 vs mongo-c-driver 57dba9c (`vendor/mongo-c-driver/`).
 
 Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** driver (`libmongoc`) is the lowest-level official client — and (with the Go and PHP-extension gauges) one of the strictest wire-protocol checks.
 
@@ -10,27 +10,27 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 |---|---:|---:|---:|---:|---:|
 | `/BulkOperation` | 93 | 0 | 10 | 103 | 100.0% |
 | `/Client` | 96 | 6 | 19 | 121 | 94.1% |
-| `/Collection` | 146 | 0 | 11 | 157 | 100.0% |
+| `/Collection` | 145 | 0 | 12 | 157 | 100.0% |
 | `/Cursor` | 70 | 0 | 0 | 70 | 100.0% |
 | `/Database` | 19 | 0 | 0 | 19 | 100.0% |
 | `/ReadConcern` | 6 | 0 | 0 | 6 | 100.0% |
 | `/ReadPrefs` | 16 | 0 | 0 | 16 | 100.0% |
 | `/WriteCommand` | 6 | 0 | 0 | 6 | 100.0% |
 | `/WriteConcern` | 13 | 0 | 0 | 13 | 100.0% |
-| `/bulkwrite` | 0 | 0 | 13 | 13 | 100.0% |
+| `/bulkwrite` | 12 | 0 | 1 | 13 | 100.0% |
 | `/change_stream` | 23 | 0 | 2 | 25 | 100.0% |
 | `/change_streams` | 11 | 0 | 0 | 11 | 100.0% |
 | `/collection-management` | 5 | 0 | 0 | 5 | 100.0% |
 | `/command_monitoring` | 34 | 0 | 1 | 35 | 100.0% |
-| `/crud` | 160 | 0 | 12 | 172 | 100.0% |
-| `/find_and_modify` | 9 | 0 | 0 | 9 | 100.0% |
+| `/crud` | 167 | 4 | 1 | 172 | 97.7% |
+| `/find_and_modify` | 8 | 1 | 0 | 9 | 88.9% |
 | `/gridfs` | 10 | 0 | 1 | 11 | 100.0% |
 | `/gridfs_old` | 32 | 0 | 2 | 34 | 100.0% |
 | `/index-management` | 6 | 0 | 0 | 6 | 100.0% |
 | `/long_namespace` | 8 | 0 | 1 | 9 | 100.0% |
-| **Overall** | **763** | **6** | **72** | **841** | **99.2%** |
+| **Overall** | **780** | **11** | **50** | **841** | **98.6%** |
 
-## Failures (6)
+## Failures (11)
 
 First 30 failed tests for triage:
 
@@ -41,6 +41,11 @@ First 30 failed tests for triage:
 /Client/select_server/pooled
 /Client/select_server/err/single
 /Client/select_server/err/pooled
+/find_and_modify/hint
+/crud/prose_test_7
+/crud/prose_test_8
+/crud/prose_test_9
+/crud/unified/find-comment
 ```
 
 ## How this is generated

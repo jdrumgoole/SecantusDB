@@ -1,6 +1,6 @@
 # mongo-kotlin-driver Validation Report
 
-Generated 2026-08-24 — SecantusDB 0.6.0b15 vs mongo-kotlin-driver cb45be6bb147 (`vendor/mongo-java-driver/driver-kotlin-sync/`).
+Generated 2026-08-31 — SecantusDB 0.6.0b16 vs mongo-kotlin-driver cb45be6bb147 (`vendor/mongo-java-driver/driver-kotlin-sync/`).
 
 Run `uv run python -m invoke validate-kotlin` to refresh. This is the official MongoDB **Kotlin** driver gauge — the Kotlin sync client (which ships in the mongo-java-driver monorepo) exercised end-to-end against a standalone SecantusDB daemon.
 
@@ -12,8 +12,19 @@ Run `uv run python -m invoke validate-kotlin` to refresh. This is the official M
 
 | Module | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `driver-kotlin-sync` | 294 | 0 | 244 | 538 | 100.0% |
-| **Overall** | **294** | **0** | **244** | **538** | **100.0%** |
+| `driver-kotlin-sync` | 336 | 4 | 198 | 538 | 98.8% |
+| **Overall** | **336** | **4** | **198** | **538** | **98.8%** |
+
+## Failures (4)
+
+First 30 failed tests for triage:
+
+```
+driver-kotlin-sync :: com.mongodb.kotlin.client.UnifiedCrudTest#client bulkWrite errors: an individual operation fails during an ordered bulkWrite
+driver-kotlin-sync :: com.mongodb.kotlin.client.UnifiedCrudTest#client bulkWrite errors: an individual operation fails during an unordered bulkWrite
+driver-kotlin-sync :: com.mongodb.kotlin.client.UnifiedCrudTest#client bulkWrite errors: detailed results are omitted from error when verboseResults is false
+driver-kotlin-sync :: com.mongodb.kotlin.client.UnifiedCrudTest#client bulkWrite errors: a bulk write with only errors does not report a partial result
+```
 
 ## How this is generated
 
