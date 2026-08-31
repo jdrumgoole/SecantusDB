@@ -144,13 +144,18 @@ def _resolve_var(name: str, ctx: _Ctx) -> Any:
         # the field instead of writing it. ``_op_set_field`` checks for
         # this identity to drop the key.
         return _REMOVE_SENTINEL
-    elif base in ("KEEP", "PRUNE", "DESCEND"):
-        # ``$redact`` sentinels. The expression evaluator returns the
-        # ``"$$NAME"`` string literal so the stage handler can dispatch
-        # on equality. Real mongod's ``$redact`` docs show these as the
-        # only legal return values from the stage's expression.
-        value = f"$${base}"
     else:
+        # ``$$KEEP`` / ``$$PRUNE`` / ``$$DESCEND`` deliberately fall through to
+        # here. They are NOT globally-defined variables: mongod binds them only
+        # while evaluating a ``$redact`` expression and answers
+        # ``Use of undefined variable: KEEP`` (17276) anywhere else -- probed on
+        # 8.2.11. This used to return the string ``"$$KEEP"`` for any of them,
+        # which leaked an internal marker into user output
+        # (``$project: {x: "$$KEEP"}`` returned it as data) and, worse, made a
+        # stored string equal to ``"$$KEEP"`` indistinguishable from the
+        # sentinel -- so ``$redact: "$field"`` over attacker-controlled content
+        # kept a document mongod refuses to keep. ``aggregate._stage_redact``
+        # now binds them in ``vars`` for the duration of its own evaluation.
         raise ExpressionError(
             f"Use of undefined variable: {base}", code=17276, code_name="Location17276"
         )

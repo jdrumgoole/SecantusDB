@@ -1621,6 +1621,15 @@ def _rw(expr: object) -> Callable[[Database], object]:
     return lambda db: _agg_err_full(db, [{"$replaceWith": expr}])
 
 
+def _redact(spec: object) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(db, [{"$redact": spec}])
+
+
+def _redact_ok(spec: object) -> Callable[[Database], object]:
+    """A `$redact` that SUCCEEDS — the result documents are the assertion."""
+    return lambda db: list(db.c.aggregate([{"$redact": spec}]))
+
+
 def _switch(case: object, **extra: object) -> Callable[[Database], object]:
     body: dict = {"branches": [{"case": case, "then": 1}], **extra}
     return lambda db: _agg_err_full(db, [{"$addFields": {"x": {"$switch": body}}}])
@@ -1697,6 +1706,47 @@ AGGERR_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
 ]
 
 
+# `$redact` — three defects found on 2026-08-31, all of which made the stage
+# return data it exists to withhold, and all of which were present on BOTH
+# servers. The decision names are VARIABLES bound only inside `$redact`, not the
+# strings that spell them: a stored `"$$KEEP"` used to be accepted as a decision
+# (disclosure driven by document content), the descent skipped NESTED arrays
+# (a tagged sub-doc one array deeper was returned), and the names resolved to
+# marker strings anywhere in a pipeline. The 17053 rendering is mongod's compact
+# `Value::toString` — a different renderer from the shell form other messages
+# use, which is why the container cases are here. Probed on mongod 8.2.11.
+LEVELLED = [{"_id": 1, "lvl": 1, "n": [[{"lvl": 9, "x": 1}], {"lvl": 1, "y": 2}], "s": "t"}]
+DESCEND_EXPR = {"$cond": [{"$lte": [{"$ifNull": ["$lvl", 0]}, 3]}, "$$DESCEND", "$$PRUNE"]}
+
+REDACT_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    # A stored string must not impersonate a decision.
+    ("stored-keep-string", [{"_id": 1, "tag": "$$KEEP", "s": "x"}], _redact("$tag")),
+    ("stored-prune-string", [{"_id": 1, "tag": "$$PRUNE"}], _redact("$tag")),
+    ("literal-keep-string", ONE, _redact({"$literal": "$$KEEP"})),
+    # The decision names are undefined OUTSIDE $redact.
+    ("keep-in-project", ONE, lambda db: _agg_err_full(db, [{"$project": {"x": "$$KEEP"}}])),
+    # Descent reaches nested arrays.
+    ("nested-arrays", LEVELLED, _redact_ok(DESCEND_EXPR)),
+    ("deep-nested-arrays", [{"_id": 1, "lvl": 1, "n": [[[{"lvl": 9}]]]}], _redact_ok(DESCEND_EXPR)),
+    # A non-decision result: mongod's code, wrapper, and compact rendering.
+    ("non-decision-int", ONE, _redact(5)),
+    ("non-decision-string", ONE, _redact({"$literal": "x"})),
+    ("non-decision-bool", ONE, _redact({"$literal": True})),
+    ("non-decision-null", ONE, _redact(None)),
+    ("non-decision-empty-doc", ONE, _redact({})),
+    ("non-decision-doc", ONE, _redact({"$literal": {"k": 1, "j": "s"}})),
+    ("non-decision-array", ONE, _redact({"$literal": [1, "a"]})),
+    ("non-decision-nested", ONE, _redact({"$literal": [[1]]})),
+    ("non-decision-double", ONE, _redact({"$literal": 1.5})),
+    ("non-decision-decimal", ONE, _redact({"$literal": Decimal128("2")})),
+    ("non-decision-oid", ONE, _redact({"$literal": ObjectId("0123456789ab0123456789ab")})),
+    ("non-decision-date", ONE, _redact({"$literal": datetime(2026, 1, 2, 3, 4, 5)})),
+    ("non-decision-field", ONE, _redact("$n")),
+    # Happy paths, so a future fix cannot trade the errors for wrong data.
+    ("keep-top", ONE, _redact_ok("$$KEEP")),
+    ("descend-classic", LEVELLED, _redact_ok(DESCEND_EXPR)),
+]
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
@@ -1707,6 +1757,7 @@ ALL_CASES = (
     + [("lookup", c) for c in LOOKUP_CASES]
     + [("maxtime", c) for c in MAXTIME_CASES]
     + [("aggerr", c) for c in AGGERR_CASES]
+    + [("redact", c) for c in REDACT_CASES]
 )
 
 

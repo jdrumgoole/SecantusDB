@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from dataclasses import field as _dc_field
 from typing import TYPE_CHECKING, Any
 
-from bson import Decimal128
+from bson import Binary, Decimal128, ObjectId
 
 from secantus.expressions import (
     MISSING,
@@ -61,6 +61,57 @@ class AggregateError(Exception):
         # unrecognized stage, a bad $sort spec and an unknown group operator
         # are not. The command layer applies the prefix; it owns the namespace.
         self.exec_error = exec_error
+
+
+#: ``$redact``'s three decision variables, bound ONLY while its expression is
+#: being evaluated -- which is what mongod does. Outside ``$redact`` they are
+#: undefined variables (17276), so they cannot leak into user output, and
+#: because the stage dispatches on the bound marker rather than on the string
+#: ``"$$KEEP"``, a stored string can no longer impersonate a decision.
+#:
+#: The Python stage compares by IDENTITY (``is``), which nothing in a document
+#: can forge. The Rust port compares by value, since its vars live in a BSON
+#: document; the payload is deliberately distinctive so a stored Binary is the
+#: only collision, the same assumption mongod makes about its internal
+#: constants. Keep the two payloads identical.
+_KEEP = Binary(b"$redact.KEEP", 0x80)
+_PRUNE = Binary(b"$redact.PRUNE", 0x80)
+_DESCEND = Binary(b"$redact.DESCEND", 0x80)
+REDACT_SENTINELS: dict[str, Any] = {"KEEP": _KEEP, "PRUNE": _PRUNE, "DESCEND": _DESCEND}
+
+
+def format_value_compact(value: Any) -> str:
+    """mongod's ``Value::toString`` -- the rendering ``$redact``'s 17053 uses.
+
+    NOT the shell form ``aggregate._fmt_stage_val`` / the Rust
+    ``argtypes::render_stage_value`` produce: this one has no inner spaces in
+    containers (``{k: 1}`` / ``[1, "a"]``, not ``{ k: 1 }`` / ``[ 1, "a" ]``),
+    renders an ObjectId bare rather than as ``ObjectId('...')``, and a date as
+    ISO-8601 rather than ``new Date(<ms>)``. Two renderers, both mongod's,
+    used by different messages -- probed on 8.2.11.
+    """
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, str):
+        return f'"{value}"'
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, _dt.datetime):
+        return value.strftime("%Y-%m-%dT%H:%M:%S.") + f"{value.microsecond // 1000:03d}Z"
+    if isinstance(value, Decimal128):
+        return str(value)
+    if isinstance(value, float):
+        return repr(int(value)) if value.is_integer() else repr(value)
+    if isinstance(value, Mapping):
+        inner = ", ".join(f"{k}: {format_value_compact(v)}" for k, v in value.items())
+        return "{" + inner + "}"
+    if isinstance(value, list):
+        return "[" + ", ".join(format_value_compact(v) for v in value) + "]"
+    return str(value)
 
 
 # Atlas Search is an Atlas-only feature. A real non-Atlas mongod rejects the
@@ -261,7 +312,24 @@ def _apply_stage(
             code=40324,
             code_name="Location40324",
         )
-    return handler(spec, docs, ctx)
+    try:
+        return handler(spec, docs, ctx)
+    except ExpressionError as exc:
+        # Tag the stage so the command layer can pick mongod's wrapper. Only the
+        # field-assignment stages get one: probed on 8.2.11, `$project` /
+        # `$addFields` / `$set` answer `Invalid $<stage> :: caused by :: <msg>`
+        # while `$group` / `$replaceRoot` / `$redact` / `$bucket` /
+        # `$sortByCount` / `$match` leave the message BARE. None of them take
+        # the executor wrapper, which is what we used to apply to all of them.
+        if getattr(exc, "stage_name", None) is None:
+            exc.stage_name = name if name in _EXPR_WRAPPING_STAGES else ""
+        raise
+
+
+#: The stages that wrap an expression error in `Invalid $<stage> :: caused by ::`.
+#: Every other stage reports the bare message. `$facet` reports the wrapper of
+#: the INNER stage that failed, which the tag above gives for free.
+_EXPR_WRAPPING_STAGES = frozenset({"$project", "$addFields", "$set"})
 
 
 def _stage_match(
@@ -4745,55 +4813,79 @@ def _stage_redact(
     * Empty list spec, missing expression, or a non-sentinel result
       raises ``AggregateError``.
     """
-    if spec is None or (isinstance(spec, Mapping) and not spec):
-        raise AggregateError("$redact requires an expression")
+    # No "$redact requires an expression" special case: mongod evaluates
+    # `null` / `{}` like any other expression and reports the RESULT as a
+    # non-sentinel (17053), not the spec as missing. Probed on 8.2.11.
+    redact_vars = dict(ctx.vars or {})
+    redact_vars.update(REDACT_SENTINELS)
     out: list[dict[str, Any]] = []
     for doc in docs:
-        result = _redact_subdoc(doc, spec, ctx)
+        result = _redact_subdoc(doc, spec, ctx, redact_vars)
         if result is not None:
             out.append(result)
     return out
 
 
 def _redact_subdoc(
-    doc: Mapping[str, Any], spec: Any, ctx: PipelineContext
+    doc: Mapping[str, Any], spec: Any, ctx: PipelineContext, redact_vars: dict[str, Any]
 ) -> dict[str, Any] | None:
-    decision = evaluate(spec, dict(doc), ctx.vars)
-    if decision == "$$KEEP":
+    decision = evaluate(spec, dict(doc), redact_vars)
+    # Identity against the bound marker, NOT equality against the string
+    # ``"$$KEEP"``. A document field holding that string used to satisfy this
+    # test, so `$redact: "$tag"` over content the caller controls kept a
+    # document mongod rejects -- data disclosure from the stage whose whole
+    # job is to withhold data.
+    if decision == _KEEP:
         return dict(doc)
-    if decision == "$$PRUNE":
+    if decision == _PRUNE:
         return None
-    if decision == "$$DESCEND":
-        return _redact_descend(doc, spec, ctx)
-    from secantus.update import _render_bson_scalar
-
+    if decision == _DESCEND:
+        return _redact_descend(doc, spec, ctx, redact_vars)
     raise AggregateError(
-        f"$redact's expression should not return anything aside from the variables "
-        f"$$KEEP, $$DESCEND, and $$PRUNE, but returned {_render_bson_scalar(decision)}",
+        "$redact's expression should not return anything aside from the variables "
+        f"$$KEEP, $$DESCEND, and $$PRUNE, but returned {format_value_compact(decision)}",
         code=17053,
+        code_name="Location17053",
         exec_error=True,
     )
 
 
-def _redact_descend(doc: Mapping[str, Any], spec: Any, ctx: PipelineContext) -> dict[str, Any]:
+def _redact_descend(
+    doc: Mapping[str, Any], spec: Any, ctx: PipelineContext, redact_vars: dict[str, Any]
+) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for k, v in doc.items():
         if isinstance(v, Mapping):
-            sub = _redact_subdoc(v, spec, ctx)
+            sub = _redact_subdoc(v, spec, ctx, redact_vars)
             if sub is not None:
                 out[k] = sub
         elif isinstance(v, list):
-            new_list: list[Any] = []
-            for elem in v:
-                if isinstance(elem, Mapping):
-                    redacted = _redact_subdoc(elem, spec, ctx)
-                    if redacted is not None:
-                        new_list.append(redacted)
-                else:
-                    new_list.append(elem)
-            out[k] = new_list
+            out[k] = _redact_list(v, spec, ctx, redact_vars)
         else:
             out[k] = v
+    return out
+
+
+def _redact_list(
+    values: list[Any], spec: Any, ctx: PipelineContext, redact_vars: dict[str, Any]
+) -> list[Any]:
+    """Redact one array, recursing into NESTED arrays as mongod does.
+
+    The list branch used to walk only the top level, so a sub-document one
+    array deeper -- ``[[{lvl: 9}]]`` -- was passed through untouched and
+    returned to the caller. mongod prunes it and leaves the inner array in
+    place (``[[]]``). Probed on 8.2.11.
+    """
+    out: list[Any] = []
+    for elem in values:
+        if isinstance(elem, Mapping):
+            redacted = _redact_subdoc(elem, spec, ctx, redact_vars)
+            if redacted is not None:
+                out.append(redacted)
+        elif isinstance(elem, list):
+            out.append(_redact_list(elem, spec, ctx, redact_vars))
+        else:
+            out.append(elem)
     return out
 
 

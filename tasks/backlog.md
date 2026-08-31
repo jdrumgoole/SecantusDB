@@ -1012,11 +1012,17 @@ Specific items that were left out of the slice that introduced their feature are
   Rust server) and nine Rust unit tests in `argtypes.rs`.
 
   **What is left, and is NOT this class:**
-  - [ ] **`$redact` is not implemented on the Rust server** (9 of the 685 cases).
-        It answers `BadValue` (2) `aggregation pipeline uses a stage or operator
-        not supported by the Rust server` where mongod evaluates the expression
-        and answers 17053. A missing STAGE, not an argument defect — the Python
-        server implements it.
+  - [x] **RESOLVED 2026-08-31 — and the diagnosis above was WRONG.** `$redact` is
+        not "not implemented on the Rust server": it was implemented on both
+        servers and correct for every valid pipeline. Only its ERROR path
+        surfaced as "not supported", which is what the sweep saw. Sized from
+        reading the sweep output instead of running the stage — the fourth
+        instance of the estimate-from-reading failure this repo records.
+
+        Running it found **three defects that made `$redact` return data it
+        exists to withhold**, all on BOTH servers (see the entry in §5):
+        a stored string could impersonate a `$$KEEP` decision, the descent
+        skipped nested arrays, and the decision names leaked outside the stage.
   - [ ] **An unknown-index `hint` reports our message, not mongod's plan dump**
         (6 cases, on `find` / `count` / `aggregate` / `update` / `delete` /
         `findAndModify`). The CODE matches (2) on all six; mongod's text is a
@@ -1442,6 +1448,62 @@ These are explicit non-goals. Don't add them without a reason.
 - ~~Tailable / awaitData cursors~~ — implemented for change streams (see "In scope" in `CLAUDE.md`) **and** for plain capped collections + `local.oplog.rs` (`commands._find_tailable` / `_find_tailable_oplog`, blocking `getMore` on the oplog condition variable). The producer re-applies the find filter (with `let` vars + collation) to follow-up inserts, advances its watermark by **RecordId** (insertion order — the same order capped eviction uses; an `id_key` watermark dropped and redelivered docs when `_id`s weren't monotonic), and raises `CappedPositionLost` (136) on rollover.
 
 ## 5. Known bugs and edge cases to watch
+
+- [x] **RESOLVED 2026-08-31 — `$redact` returned data it exists to withhold:
+  three defects, both servers.** `$redact` is the content-based access-control
+  stage, so each of these is a disclosure, not a cosmetic divergence. Found by
+  running the stage against mongod 8.2.11, not by reading it — the code
+  described the decisions as "sentinel strings", which is the assumption the
+  first two bugs rest on.
+
+  1. **A stored string could impersonate a decision.** The stage compared the
+     evaluated result against the STRING `"$$KEEP"`. A document whose own field
+     held that string therefore satisfied the test, so
+     `{"$redact": "$tag"}` over caller-supplied content kept a document — with
+     its secrets — that mongod refuses to keep (17053). The decision names are
+     now variables bound only for the duration of `$redact`'s own evaluation,
+     and the stage dispatches on the bound marker.
+  2. **The descent skipped NESTED arrays.** It walked documents and
+     arrays-of-documents, but a nested array was passed through untouched, so a
+     sub-document one array deeper (`[[{level: 9}]]`) was returned in full.
+     mongod prunes it and leaves the emptied inner array (`[[]]`).
+  3. **The decision names leaked outside the stage.**
+     `{"$project": {"x": "$$KEEP"}}` returned the marker string as ordinary
+     data; mongod answers `Use of undefined variable: KEEP` (17276).
+
+  Plus the error surface both servers got wrong: a non-decision result is 17053
+  with mongod's wording and executor wrapper (Python answered a generic 14, Rust
+  "stage not supported"), and an undefined variable takes `Invalid $<stage> ::
+  caused by ::` inside `$project` / `$addFields` / `$set` and a BARE message
+  everywhere else (Python applied the executor prefix to both).
+
+  **Three lessons, each already on this file's list and each paid for again.**
+  - *Sized from reading, not running.* The sweep that found this filed it as
+    "`$redact` is not implemented on the Rust server". It was implemented, on
+    both servers, and correct for every valid pipeline. One probe would have
+    said so; the entry has been corrected in place.
+  - *A comment justifying behaviour by something other than the reference
+    server.* `commands.py` asserted "ExpressionError is evaluation by
+    definition, so it always qualifies" for the executor wrapper. mongod
+    disagrees for the whole undefined-variable family. Now **7-for-7**.
+  - *Two renderers, both mongod's.* 17053 uses the compact `Value::toString`
+    (`{k: 1}`, `[1, "a"]`, bare ObjectId, ISO date); other messages use the
+    shell form (`{ k: 1 }`, `ObjectId('…')`, `new Date(<ms>)`). Reusing the
+    wrong one is a silent message divergence.
+
+  Pinned by 21 cases in `tests/test_mongod_differential.py`, 9 in
+  `tests/test_redact.py`, and 5 Rust unit tests.
+
+  **Still open, and deliberately NOT this slice:**
+  - [ ] **The Rust server answers `BadValue` (2) for an undefined variable
+        where mongod answers 17276**, in all 7 stages probed. The Python server
+        has the code right and now the wrapper too. Naming it on the Rust side
+        needs a standalone validator that tracks `$let` / `$map` / `$filter` /
+        `$reduce` scopes — without that it would mislabel unrelated `Fallback`
+        results as undefined variables. Measured 2026-08-31: python 0/7 wrong
+        after this slice, rust 7/7 wrong.
+
+
 
 - [x] **`maxTimeMS` diverged from mongod 8.2.1 in all four of its behaviours,
   and was only checked on ONE command — FIXED 2026-08-30.** Filed by the

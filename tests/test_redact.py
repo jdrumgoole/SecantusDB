@@ -1,13 +1,17 @@
 """``$redact`` — content-based document / sub-document pruning.
 
 The stage's expression is evaluated against each (sub-)document and
-must return one of three sentinel strings:
+must return one of three decision VARIABLES -- not the strings that
+name them, which is the distinction three of the tests below exist for:
 
-* ``"$$KEEP"`` — include the sub-doc as-is, no recursion.
-* ``"$$PRUNE"`` — drop the sub-doc (top-level drops the doc from
+* ``$$KEEP`` -- include the sub-doc as-is, no recursion.
+* ``$$PRUNE`` -- drop the sub-doc (top-level drops the doc from
   the pipeline; nested drops it from the parent's field / array).
-* ``"$$DESCEND"`` — recurse into every dict-valued field and every
-  dict-valued list element.
+* ``$$DESCEND`` -- recurse into every dict-valued field, every
+  dict-valued list element, and every NESTED list.
+
+mongod binds these three names only while evaluating a ``$redact``
+expression; anywhere else they are undefined variables (17276).
 
 Mongod uses ``$redact`` to implement document-level access control
 ("docs tagged confidential land in the pipeline filtered out"),
@@ -330,3 +334,75 @@ def test_redact_keep_inside_array_keeps_subdoc_unchanged(client) -> None:
     # "b" descended → its inner has secret=True → pruned.
     b = next(i for i in items if i.get("name") == "b")
     assert "inner" not in b
+
+
+# --- the three bugs found by probing 8.2.11 on 2026-08-31 ------------------
+#
+# All three were present on BOTH servers, and all three made `$redact` return
+# data it exists to withhold. They are pinned separately because they fail
+# independently.
+
+
+def test_a_stored_string_cannot_impersonate_a_decision(client) -> None:
+    """A field whose VALUE is ``"$$KEEP"`` is not the ``$$KEEP`` variable.
+
+    The stage used to compare the evaluated result against the string
+    ``"$$KEEP"``, so ``$redact: "$tag"`` over caller-controlled content kept a
+    document mongod refuses to keep -- disclosure driven by document content,
+    from the stage whose whole job is to withhold it.
+    """
+    coll = client["redact_db"]["impersonate"]
+    coll.insert_one({"_id": 1, "tag": "$$KEEP", "secret": "should-not-survive"})
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$redact": "$tag"}]))
+    assert exc.value.code == 17053
+    assert "should not return anything aside from the variables" in str(exc.value)
+
+
+def test_redact_descends_into_nested_arrays(client) -> None:
+    """A sub-doc one array deeper used to be passed through untouched.
+
+    mongod prunes it and leaves the (now empty) inner array in place.
+    """
+    coll = client["redact_db"]["nested_arrays"]
+    coll.insert_one({"_id": 1, "lvl": 1, "n": [[{"lvl": 9, "x": 1}], {"lvl": 1, "y": 2}]})
+    pipeline = [
+        {"$redact": {"$cond": [{"$lte": [{"$ifNull": ["$lvl", 0]}, 3]}, "$$DESCEND", "$$PRUNE"]}}
+    ]
+    assert list(coll.aggregate(pipeline)) == [{"_id": 1, "lvl": 1, "n": [[], {"lvl": 1, "y": 2}]}]
+
+
+def test_the_decision_variables_are_undefined_outside_redact(client) -> None:
+    """``$project: {x: "$$KEEP"}`` used to return the marker string as data."""
+    coll = client["redact_db"]["outside"]
+    coll.insert_one({"_id": 1, "a": 1})
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$project": {"x": "$$KEEP"}}]))
+    assert exc.value.code == 17276
+    assert "Use of undefined variable: KEEP" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("spec", "rendered"),
+    [
+        (5, "5"),
+        ("x", '"x"'),
+        (True, "true"),
+        (None, "null"),
+        ({}, "{}"),
+        ({"$literal": {"k": 1, "j": "s"}}, '{k: 1, j: "s"}'),
+        ({"$literal": [1, "a"]}, '[1, "a"]'),
+    ],
+)
+def test_a_non_decision_result_is_17053_rendered_mongods_way(client, spec, rendered) -> None:
+    """mongod's compact ``Value::toString``: no inner spaces in containers.
+
+    That is a DIFFERENT renderer from the shell form other messages use
+    (``{ k: 1 }`` with spaces, ``ObjectId('...')``); both are mongod's.
+    """
+    coll = client["redact_db"]["render"]
+    coll.insert_one({"_id": 1, "a": 1})
+    with pytest.raises(OperationFailure) as exc:
+        list(coll.aggregate([{"$redact": spec}]))
+    assert exc.value.code == 17053
+    assert str(exc.value).split("but returned ")[1].startswith(rendered)
