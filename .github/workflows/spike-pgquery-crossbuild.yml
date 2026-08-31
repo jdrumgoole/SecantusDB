@@ -1,0 +1,85 @@
+# TEMPORARY — P0 spike probe for tasks/rust-pgserver-plan.md.
+#
+# The single question: does libpg_query (vendored PostgreSQL C, built by the
+# `cc` crate) compile on every platform SecantusDB ships wheels for? Windows is
+# the real unknown; musl is the second. Delete this workflow once the answer is
+# recorded in the plan — it is a probe, not a gate.
+name: spike-pgquery-crossbuild
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [rust-pgserver-p0-spike]
+    paths:
+      - .github/workflows/spike-pgquery-crossbuild.yml
+
+jobs:
+  build:
+    name: pg_query on ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  label: linux-gnu-x86_64 }
+          - { os: windows-latest, label: windows-msvc-x86_64 }
+          - { os: macos-14,       label: macos-arm64 }
+    steps:
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Create a minimal pg_query consumer
+        shell: bash
+        run: |
+          mkdir -p probe/src
+          cat > probe/Cargo.toml <<'TOML'
+          [package]
+          name = "probe"
+          version = "0.1.0"
+          edition = "2021"
+          [dependencies]
+          pg_query = "6"
+          TOML
+          cat > probe/src/main.rs <<'RS'
+          fn main() {
+              // Parse the exact statement that makes `invoke sql-stress` fail
+              // 0/6 today, where sqlglot mis-parses `(freeze on)` into two
+              // bogus parameters.
+              let sql = "copy pgbench_accounts from stdin with (freeze on)";
+              let r = pg_query::parse(sql).expect("parse failed");
+              assert_eq!(r.protobuf.stmts.len(), 1);
+              println!("OK: libpg_query parsed {sql}");
+          }
+          RS
+      - name: Build and run
+        working-directory: probe
+        run: cargo run --release
+
+  musl:
+    name: pg_query on linux-musl-x86_64
+    runs-on: ubuntu-latest
+    container: alpine:3.20
+    steps:
+      - name: Toolchain
+        run: apk add --no-cache rust cargo musl-dev clang-dev clang-static build-base
+      - name: Create a minimal pg_query consumer
+        shell: sh
+        run: |
+          mkdir -p probe/src
+          cat > probe/Cargo.toml <<'TOML'
+          [package]
+          name = "probe"
+          version = "0.1.0"
+          edition = "2021"
+          [dependencies]
+          pg_query = "6"
+          TOML
+          cat > probe/src/main.rs <<'RS'
+          fn main() {
+              let sql = "copy pgbench_accounts from stdin with (freeze on)";
+              let r = pg_query::parse(sql).expect("parse failed");
+              assert_eq!(r.protobuf.stmts.len(), 1);
+              println!("OK: libpg_query parsed {sql}");
+          }
+          RS
+      - name: Build and run
+        working-directory: probe
+        run: cargo run --release
