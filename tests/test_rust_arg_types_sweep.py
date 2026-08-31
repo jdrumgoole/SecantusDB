@@ -121,14 +121,38 @@ def test_a_wrong_typed_hint_is_failed_to_parse(db, cmd) -> None:
 @pytest.mark.parametrize(
     "cmd",
     [
-        {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}, "hint": "nosuch"}]},
+        {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 9}}, "hint": "nosuch"}]},
         {"delete": "c", "deletes": [{"q": {}, "limit": 0, "hint": "nosuch"}]},
-        {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "hint": "nosuch"},
     ],
 )
-def test_a_hint_naming_no_index_fails_the_write(db, cmd) -> None:
-    """These three ignored `hint` entirely: the write ran unhinted, reporting ok."""
-    assert _err(db, cmd).code == 2
+def test_a_hint_naming_no_index_is_a_per_statement_write_error(db, cmd) -> None:
+    """A batch write reports the bad hint PER STATEMENT, and does not write.
+
+    These commands once ignored `hint` entirely and ran the write unhinted.
+    They then failed the whole command -- which stopped the write, but is not
+    what mongod does: `ok: 1` with `writeErrors: [{index, code: 2}]`, so the
+    other statements in the batch still apply. Probed 8.2.11 (2026-08-31); this
+    test asserted the command-level shape and so pinned the wrong half of the
+    fix. `findAndModify` is NOT a batch command and does fail outright -- see
+    the test below.
+    """
+    reply = db.command(dict(cmd))
+    assert reply["ok"] == 1
+    assert [w["code"] for w in reply["writeErrors"]] == [2]
+    assert reply.get("n", 0) == 0
+    # The point of the whole case: the write must not have happened.
+    assert db.c.find_one({"_id": 1}) == {"_id": 1, "a": 1}
+
+
+def test_a_hint_naming_no_index_fails_findandmodify(db) -> None:
+    """`findAndModify` takes one statement, so the bad hint fails the command."""
+    assert (
+        _err(
+            db, {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 9}}, "hint": "nosuch"}
+        ).code
+        == 2
+    )
+    assert db.c.find_one({"_id": 1}) == {"_id": 1, "a": 1}
 
 
 # --- the per-slot asymmetries ---------------------------------------------
