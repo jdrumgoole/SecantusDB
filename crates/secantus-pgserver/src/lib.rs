@@ -147,6 +147,13 @@ fn wire_type(pg_type: &str) -> Type {
         "float4" => Type::FLOAT4,
         "float8" => Type::FLOAT8,
         "bool" | "boolean" => Type::BOOL,
+        // `text` is oid 25, NOT varchar (1043). PostgreSQL distinguishes them
+        // and clients read the oid: psycopg decodes both to `str` so a value
+        // comparison never notices, but pgjdbc and pgx do.
+        "text" => Type::TEXT,
+        "varchar" | "character varying" => Type::VARCHAR,
+        "bpchar" | "char" | "character" => Type::BPCHAR,
+        "name" => Type::NAME,
         // Everything else renders as text for now; P4 owns the real type map.
         _ => Type::VARCHAR,
     }
@@ -357,24 +364,56 @@ impl PgHandler {
                 Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
             }
 
+            Statement::DropTable(drop) => {
+                for table in &drop.tables {
+                    if self.lookup(table).is_none() {
+                        if drop.if_exists {
+                            continue;
+                        }
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "42P01".into(), // undefined_table
+                            format!("table \"{table}\" does not exist"),
+                        ))));
+                    }
+                    // Both halves, and the CATALOG entry last: if the drop
+                    // fails midway, a table whose catalog row survived is
+                    // recoverable, whereas a catalog row pointing at a
+                    // collection that no longer exists is not.
+                    self.storage
+                        .drop_collection(&self.db, table)
+                        .map_err(|e| Self::storage_err("could not drop the table", e))?;
+                    self.storage
+                        .delete_matching(
+                            &self.db,
+                            CATALOG_COLLECTION,
+                            &bson::doc! { "_id": table },
+                            0,
+                            &Document::new(),
+                            None,
+                        )
+                        .map_err(|e| Self::storage_err("could not drop the catalog entry", e))?;
+                }
+                Ok(vec![Response::Execution(Tag::new("DROP TABLE"))])
+            }
+
             Statement::SelectConstant(sc) => {
                 // One row, no storage touched.
                 let schema = Arc::new(
                     sc.columns
                         .iter()
-                        .map(|(name, v)| {
-                            let ty = match v {
-                                Bson::Int32(_) => Type::INT4,
-                                Bson::Int64(_) => Type::INT8,
-                                Bson::Double(_) => Type::FLOAT8,
-                                Bson::Boolean(_) => Type::BOOL,
-                                _ => Type::VARCHAR,
-                            };
-                            FieldInfo::new(name.clone(), None, None, ty, FieldFormat::Text)
+                        .map(|(name, _, ty)| {
+                            FieldInfo::new(
+                                name.clone(),
+                                None,
+                                None,
+                                wire_type(ty),
+                                FieldFormat::Text,
+                            )
                         })
                         .collect::<Vec<_>>(),
                 );
-                let values: Vec<Bson> = sc.columns.iter().map(|(_, v)| v.clone()).collect();
+                let values: Vec<Bson> = sc.columns.iter().map(|(_, v, _)| v.clone()).collect();
                 let schema_ref = schema.clone();
                 let rows = stream::iter(std::iter::once(values)).map(move |vals| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
@@ -911,15 +950,8 @@ impl PgHandler {
             Statement::SelectConstant(sc) => sc
                 .columns
                 .iter()
-                .map(|(name, v)| {
-                    let ty = match v {
-                        Bson::Int32(_) => Type::INT4,
-                        Bson::Int64(_) => Type::INT8,
-                        Bson::Double(_) => Type::FLOAT8,
-                        Bson::Boolean(_) => Type::BOOL,
-                        _ => Type::VARCHAR,
-                    };
-                    FieldInfo::new(name.clone(), None, None, ty, FieldFormat::Text)
+                .map(|(name, _, ty)| {
+                    FieldInfo::new(name.clone(), None, None, wire_type(ty), FieldFormat::Text)
                 })
                 .collect(),
             // CREATE / INSERT / UPDATE / DELETE return no rows.

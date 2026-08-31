@@ -302,11 +302,12 @@ fn update_and_delete_are_planned() {
 
 #[test]
 fn shapes_sqlglot_mis_parses_reach_us_as_real_statements() {
+    // `DROP TABLE a, b, c` and `BEGIN ...` used to live here too; both now
+    // EXECUTE rather than merely parsing, which is the stronger result.
     for sql in [
         "MOVE FORWARD 2 IN c",
         "LISTEN chan",
         "NOTIFY chan, 'payload'",
-        "DROP TABLE a, b, c",
         "COPY t FROM stdin WITH (freeze on)",
     ] {
         let err = plan(sql, &lookup).expect_err(sql);
@@ -505,17 +506,79 @@ fn select_without_from_answers_session_functions() {
     }
     match plan_ok("SELECT 1 AS one, current_database()") {
         Statement::SelectConstant(sc) => {
-            assert_eq!(sc.columns[0], ("one".to_string(), Bson::Int32(1)));
+            assert_eq!(
+                sc.columns[0],
+                ("one".to_string(), Bson::Int32(1), "int4".to_string())
+            );
             assert_eq!(
                 sc.columns[1],
                 (
                     "current_database".to_string(),
-                    Bson::String("postgres".into())
+                    Bson::String("postgres".into()),
+                    "text".to_string()
                 )
             );
         }
         other => panic!("wrong statement: {other:?}"),
     }
     let err = plan("SELECT nosuchfunc()", &lookup).expect_err("unknown function");
+    assert_eq!(err.sqlstate(), "0A000");
+}
+
+/// A cast DECLARES its column's type, which is not the same as the type of the
+/// value that turns up.
+///
+/// `Describe` runs before `Bind`, so it plans against NULL placeholders. Typing
+/// the column from the value made `$1::int` a `varchar`, and the client then
+/// decoded a correct integer as a string.
+#[test]
+fn a_cast_declares_the_column_type() {
+    match plan_ok("SELECT '1'::int") {
+        Statement::SelectConstant(sc) => {
+            assert_eq!(sc.columns[0].1, Bson::Int32(1));
+            assert_eq!(sc.columns[0].2, "int4");
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    // The value is NULL, but the declared type is still int4.
+    match plan_with_params("SELECT $1::int", &lookup, &[Bson::Null]).unwrap() {
+        Statement::SelectConstant(sc) => {
+            assert_eq!(sc.columns[0].1, Bson::Null);
+            assert_eq!(sc.columns[0].2, "int4");
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    // A value that cannot convert is 22P02, quoting the input as PostgreSQL does.
+    let err = plan("SELECT 'x'::int", &lookup).expect_err("bad cast");
+    assert_eq!(err.sqlstate(), "22P02");
+    assert!(
+        err.to_string()
+            .contains("invalid input syntax for type integer"),
+        "{err}"
+    );
+}
+
+#[test]
+fn drop_table_is_planned() {
+    match plan_ok("DROP TABLE t") {
+        Statement::DropTable(d) => {
+            assert_eq!(d.tables, vec!["t".to_string()]);
+            assert!(!d.if_exists);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("DROP TABLE IF EXISTS a, b") {
+        Statement::DropTable(d) => {
+            assert_eq!(d.tables, vec!["a".to_string(), "b".to_string()]);
+            assert!(d.if_exists);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    // CASCADE would have to chase dependants; behaving as RESTRICT silently
+    // would be the wrong kind of helpful.
+    let err = plan("DROP TABLE t CASCADE", &lookup).expect_err("cascade");
+    assert_eq!(err.sqlstate(), "0A000");
+    // Other DROP targets stay refused rather than dropping the wrong thing.
+    let err = plan("DROP INDEX i", &lookup).expect_err("drop index");
     assert_eq!(err.sqlstate(), "0A000");
 }
