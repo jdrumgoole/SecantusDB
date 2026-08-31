@@ -788,6 +788,219 @@ pub(crate) fn render_stage_value(v: &Bson) -> String {
     }
 }
 
+/// Variables mongod defines for every pipeline. Listed rather than inferred, so
+/// an unknown name is reported instead of silently accepted. `CLUSTER_TIME` /
+/// `SEARCH_META` / `JS_SCOPE` are DEFINED but answer their own errors
+/// (10071200 / 6347902 / 51144); they belong here so this check leaves them to
+/// those paths. Mirrors `aggregate._SYSTEM_VARS`.
+const SYSTEM_VARS: &[&str] = &[
+    "ROOT",
+    "CURRENT",
+    "NOW",
+    "REMOVE",
+    "USER_ROLES",
+    "CLUSTER_TIME",
+    "SEARCH_META",
+    "JS_SCOPE",
+];
+
+/// Stages whose whole spec is one expression.
+const EXPR_SPEC_STAGES: &[&str] = &["$redact", "$replaceWith", "$sortByCount"];
+
+/// Stages whose spec is `field: <expression>` pairs. The KEYS are field names.
+const EXPR_MAP_STAGES: &[&str] = &["$project", "$addFields", "$set", "$group"];
+
+/// Stages that wrap the error in `Invalid $<stage> :: caused by ::`; every other
+/// stage reports it bare. Probed on 8.2.11.
+const EXPR_WRAPPING_STAGES: &[&str] = &["$project", "$addFields", "$set"];
+
+fn undefined_in_expr(expr: &Bson, bound: &[String]) -> Option<String> {
+    match expr {
+        Bson::String(s) => {
+            let name = s.strip_prefix("$$")?;
+            let base = name.split('.').next().unwrap_or(name);
+            if base.is_empty() || bound.iter().any(|b| b == base) || SYSTEM_VARS.contains(&base) {
+                return None;
+            }
+            Some(base.to_string())
+        }
+        Bson::Array(items) => items.iter().find_map(|i| undefined_in_expr(i, bound)),
+        Bson::Document(d) => {
+            for (op, arg) in d {
+                // `$literal`'s argument is DATA: `{$literal: "$$x"}` is the
+                // string, and mongod does not resolve it.
+                if op == "$literal" {
+                    continue;
+                }
+                let found = match op.as_str() {
+                    "$let" => undefined_in_let(arg, bound),
+                    "$map" | "$filter" => undefined_in_binding(arg, bound, op),
+                    "$reduce" => undefined_in_reduce(arg, bound),
+                    _ => undefined_in_expr(arg, bound),
+                };
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// `$let`: the bindings are evaluated in the OUTER scope — they cannot see each
+/// other (probed) — and only `in` sees the new names.
+fn undefined_in_let(arg: &Bson, bound: &[String]) -> Option<String> {
+    let Bson::Document(d) = arg else { return None };
+    let mut inner = bound.to_vec();
+    if let Some(Bson::Document(vars)) = d.get("vars") {
+        for (_, value) in vars {
+            if let Some(found) = undefined_in_expr(value, bound) {
+                return Some(found);
+            }
+        }
+        inner.extend(vars.keys().cloned());
+    }
+    d.get("in").and_then(|e| undefined_in_expr(e, &inner))
+}
+
+/// `$map` / `$filter`: `input` is outer-scope; the body sees `as` (default
+/// `this`).
+fn undefined_in_binding(arg: &Bson, bound: &[String], op: &str) -> Option<String> {
+    let Bson::Document(d) = arg else { return None };
+    if let Some(found) = d.get("input").and_then(|e| undefined_in_expr(e, bound)) {
+        return Some(found);
+    }
+    let as_name = match d.get("as") {
+        Some(Bson::String(s)) if !s.is_empty() => s.clone(),
+        _ => "this".to_string(),
+    };
+    let mut inner = bound.to_vec();
+    inner.push(as_name);
+    let body = if op == "$filter" { "cond" } else { "in" };
+    d.get(body).and_then(|e| undefined_in_expr(e, &inner))
+}
+
+fn undefined_in_reduce(arg: &Bson, bound: &[String]) -> Option<String> {
+    let Bson::Document(d) = arg else { return None };
+    for key in ["input", "initialValue"] {
+        if let Some(found) = d.get(key).and_then(|e| undefined_in_expr(e, bound)) {
+            return Some(found);
+        }
+    }
+    let mut inner = bound.to_vec();
+    inner.push("this".to_string());
+    inner.push("value".to_string());
+    d.get("in").and_then(|e| undefined_in_expr(e, &inner))
+}
+
+/// The first `$$name` in `pipeline` that names nothing, with the stage name for
+/// mongod's wrapper (empty where mongod leaves the message bare).
+///
+/// mongod reports this at PARSE time — it fires on an EMPTY collection, where
+/// nothing is ever evaluated — so this runs before the pipeline rather than
+/// during it. That is also why the engine could not produce it: with no
+/// documents there is no evaluation to fail.
+///
+/// Deliberately CONSERVATIVE. It descends only into positions known to be
+/// expressions and ignores every stage it does not recognise: a false negative
+/// leaves the previous behaviour, while a false positive would reject a VALID
+/// pipeline — much worse than the generic `BadValue` this replaces. Mirrors
+/// `aggregate.undefined_variable_in_pipeline`.
+pub fn undefined_variable_error(pipeline: &[Bson], bound: &[String]) -> Option<(String, String)> {
+    for stage in pipeline {
+        let Bson::Document(stage) = stage else {
+            continue;
+        };
+        if stage.len() != 1 {
+            continue;
+        }
+        let Some((name, spec)) = stage.iter().next() else {
+            continue;
+        };
+        let wrapper = if EXPR_WRAPPING_STAGES.contains(&name.as_str()) {
+            name.clone()
+        } else {
+            String::new()
+        };
+        let found = if EXPR_SPEC_STAGES.contains(&name.as_str()) {
+            // `$redact` binds its three decision names for its own expression.
+            let mut inner = bound.to_vec();
+            if name == "$redact" {
+                inner.extend([
+                    "KEEP".to_string(),
+                    "PRUNE".to_string(),
+                    "DESCEND".to_string(),
+                ]);
+            }
+            undefined_in_expr(spec, &inner).map(|v| (v, wrapper))
+        } else if EXPR_MAP_STAGES.contains(&name.as_str()) {
+            match spec {
+                Bson::Document(d) => d
+                    .iter()
+                    .find_map(|(_, v)| undefined_in_expr(v, bound))
+                    .map(|v| (v, wrapper)),
+                _ => None,
+            }
+        } else if name == "$replaceRoot" {
+            match spec {
+                Bson::Document(d) => d
+                    .get("newRoot")
+                    .and_then(|e| undefined_in_expr(e, bound))
+                    .map(|v| (v, wrapper)),
+                _ => None,
+            }
+        } else if name == "$match" {
+            // The filter is QUERY language, where `"$$x"` is a literal value to
+            // match. Only `$expr` holds an expression.
+            match spec {
+                Bson::Document(d) => d
+                    .get("$expr")
+                    .and_then(|e| undefined_in_expr(e, bound))
+                    .map(|v| (v, String::new())),
+                _ => None,
+            }
+        } else if name == "$facet" {
+            match spec {
+                Bson::Document(d) => d.iter().find_map(|(_, sub)| match sub {
+                    Bson::Array(p) => undefined_variable_error(p, bound),
+                    _ => None,
+                }),
+                _ => None,
+            }
+        } else if name == "$lookup" {
+            match spec {
+                Bson::Document(d) => {
+                    // `let` binds only inside this stage's own sub-pipeline:
+                    // referencing it in a LATER stage is undefined (probed).
+                    let mut inner = bound.to_vec();
+                    let mut bad = None;
+                    if let Some(Bson::Document(lv)) = d.get("let") {
+                        for (_, value) in lv {
+                            if let Some(found) = undefined_in_expr(value, bound) {
+                                bad = Some((found, wrapper.clone()));
+                                break;
+                            }
+                        }
+                        inner.extend(lv.keys().cloned());
+                    }
+                    bad.or_else(|| match d.get("pipeline") {
+                        Some(Bson::Array(p)) => undefined_variable_error(p, &inner),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None // every other stage is left alone on purpose
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
 /// A malformed aggregation STAGE spec, named with mongod's own code.
 ///
 /// This is the `update::arith_type_error` pattern applied to the pipeline: a
@@ -1335,5 +1548,143 @@ mod swept_slot_tests {
         // top-level-keys-only read called this valid filter missing.
         let nested = vec![doc! {"$and": [{"e.g": {"$gt": 8}}]}];
         assert!(array_filter_identifier_error(&update, &nested).is_none());
+    }
+}
+
+#[cfg(test)]
+mod undefined_var_tests {
+    use super::*;
+    use bson::doc;
+
+    fn find(pipeline: Vec<Bson>) -> Option<(String, String)> {
+        undefined_variable_error(&pipeline, &[])
+    }
+
+    fn stage(name: &str, spec: Bson) -> Bson {
+        let mut d = Document::new();
+        d.insert(name, spec);
+        Bson::Document(d)
+    }
+
+    #[test]
+    fn an_undefined_variable_is_found_with_its_stage_wrapper() {
+        // Only the field-assignment stages carry a wrapper; the rest are bare.
+        assert_eq!(
+            find(vec![stage(
+                "$project",
+                Bson::Document(doc! {"x": "$$NOPE"})
+            )]),
+            Some(("NOPE".into(), "$project".into()))
+        );
+        assert_eq!(
+            find(vec![stage(
+                "$group",
+                Bson::Document(doc! {"_id": "$$NOPE"})
+            )]),
+            Some(("NOPE".into(), String::new()))
+        );
+        assert_eq!(
+            find(vec![stage("$redact", Bson::String("$$NOPE".into()))]),
+            Some(("NOPE".into(), String::new()))
+        );
+    }
+
+    #[test]
+    fn it_descends_into_nested_documents_and_arrays() {
+        assert!(find(vec![stage(
+            "$addFields",
+            Bson::Document(doc! {"x": {"y": "$$NOPE"}})
+        )])
+        .is_some());
+        assert!(find(vec![stage(
+            "$addFields",
+            Bson::Document(doc! {"x": [1, "$$NOPE"]})
+        )])
+        .is_some());
+        assert!(find(vec![stage(
+            "$facet",
+            Bson::Document(doc! {"f": [{"$project": {"x": "$$NOPE"}}]})
+        )])
+        .is_some());
+    }
+
+    /// The false-positive guards. A checker that flags any of these rejects a
+    /// VALID pipeline, which is worse than the generic error it replaces.
+    #[test]
+    fn valid_pipelines_are_left_alone() {
+        // `$match`'s filter is query language: `"$$NOPE"` is a value to match.
+        assert!(find(vec![stage("$match", Bson::Document(doc! {"s": "$$NOPE"}))]).is_none());
+        // `$literal`'s argument is data.
+        assert!(find(vec![stage(
+            "$project",
+            Bson::Document(doc! {"x": {"$literal": "$$NOPE"}})
+        )])
+        .is_none());
+        // Every binding form defines its name.
+        for spec in [
+            doc! {"x": {"$let": {"vars": {"v": 1}, "in": "$$v"}}},
+            doc! {"x": {"$map": {"input": [1], "as": "m", "in": "$$m"}}},
+            doc! {"x": {"$map": {"input": [1], "in": "$$this"}}},
+            doc! {"x": {"$filter": {"input": [1], "cond": {"$gt": ["$$this", 1]}}}},
+            doc! {"x": {"$reduce": {"input": [1], "initialValue": 0,
+            "in": {"$add": ["$$value", "$$this"]}}}},
+            doc! {"x": "$$ROOT"},
+            doc! {"x": "$$NOW"},
+            doc! {"x": "$$REMOVE"},
+        ] {
+            assert!(
+                find(vec![stage("$project", Bson::Document(spec.clone()))]).is_none(),
+                "{spec:?}"
+            );
+        }
+        // `$redact` binds its three decision names for its own expression.
+        assert!(find(vec![stage(
+            "$redact",
+            Bson::Document(doc! {"$cond": [true, "$$KEEP", "$$PRUNE"]})
+        )])
+        .is_none());
+    }
+
+    #[test]
+    fn a_binding_does_not_escape_its_scope() {
+        // `$let`'s name is gone after `in` ...
+        assert_eq!(
+            find(vec![stage(
+                "$project",
+                Bson::Document(doc! {"y": {"$let": {"vars": {"v": 1}, "in": "$$v"}}, "z": "$$v"})
+            )]),
+            Some(("v".into(), "$project".into()))
+        );
+        // ... and its bindings cannot see each other.
+        assert_eq!(
+            find(vec![stage(
+                "$project",
+                Bson::Document(doc! {"x": {"$let": {"vars": {"a1": 1, "b1": "$$a1"},
+                "in": "$$b1"}}})
+            )]),
+            Some(("a1".into(), "$project".into()))
+        );
+    }
+
+    #[test]
+    fn lookup_let_binds_only_inside_its_own_pipeline() {
+        let lookup = doc! {"from": "other", "let": {"lv": "$a"},
+        "pipeline": [{"$match": {"$expr": {"$eq": ["$$lv", 1]}}}], "as": "r"};
+        assert!(find(vec![stage("$lookup", Bson::Document(lookup.clone()))]).is_none());
+        // Referenced after the stage, it is undefined.
+        assert_eq!(
+            find(vec![
+                stage("$lookup", Bson::Document(lookup)),
+                stage("$project", Bson::Document(doc! {"x": "$$lv"})),
+            ]),
+            Some(("lv".into(), "$project".into()))
+        );
+    }
+
+    #[test]
+    fn command_level_let_names_are_bound() {
+        let pipeline = vec![stage("$project", Bson::Document(doc! {"x": "$$cv"}))];
+        assert!(undefined_variable_error(&pipeline, &["cv".to_string()]).is_none());
+        assert!(undefined_variable_error(&pipeline, &[]).is_some());
     }
 }

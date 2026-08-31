@@ -1464,6 +1464,56 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [x] **RESOLVED 2026-08-31 — an undefined `$$variable` is a PARSE error, and
+  both servers only noticed it at evaluation time.** Filed as "the Rust server
+  answers BadValue (2) where mongod answers 17276". True, and not the whole
+  defect: because mongod decides this before reading a document, it errors on an
+  **empty or non-existent collection**, where both servers returned `ok: 1` and
+  an empty cursor. Found by asking the reference server the same question over an
+  empty collection — a dimension the earlier probe had not varied.
+
+  **Fixed on both servers** by a static walk of the pipeline, run once before it
+  executes. That is the only design that can report a parse-time error at all:
+  with no documents there is nothing for the engine to evaluate, so no amount of
+  work inside the evaluator could produce it. It also sidesteps the `Fallback`
+  problem the earlier entry worried about — `Fallback` is never consulted.
+
+  **The walker is deliberately conservative** and this is the load-bearing
+  design decision: it reports only from positions known to hold expressions and
+  ignores any stage it does not recognise. A false negative leaves the old
+  behaviour; a **false positive rejects a VALID pipeline**, which is far worse
+  than the wrong error code being fixed. Rules probed, not assumed:
+
+      $match filter     query language -- {"$match": {"s": "$$NOPE"}} matches the
+                        literal string; only its $expr is an expression
+      $literal          its argument is DATA, never resolved
+      $let              bindings evaluate in the OUTER scope (they cannot see each
+                        other) and do not escape the `in`
+      $map / $filter    bind `as`, default `this`
+      $reduce           binds `this` and `value`
+      $lookup let       binds ONLY inside that stage's own sub-pipeline
+      $redact           binds $$KEEP / $$PRUNE / $$DESCEND for its expression
+      CLUSTER_TIME /    DEFINED variables with their own errors (10071200 /
+      SEARCH_META /     6347902 / 51144) -- left to those paths rather than
+      JS_SCOPE          reported as undefined
+
+  The wrapper is per stage: `Invalid $<stage> :: caused by ::` for `$project` /
+  `$addFields` / `$set`, bare everywhere else.
+
+  Pinned by 29 differential cases (15 that must error, **14 false-positive guards
+  that must not**) and 6 Rust unit tests. The full 9405-test suite is the
+  broadest false-positive check and stayed green.
+
+  **Still open, unrelated to this and pre-existing:**
+  - [ ] **`$$REMOVE` is not implemented on the Rust server.** `{"$project":
+        {"x": "$$REMOVE"}}` answers `BadValue` (2) where mongod omits the field.
+        `resolve_var` has always deferred it ("tied to unported $setField /
+        $project-remove"), and on a server with no Python that deferral is a
+        generic error. The walker correctly does NOT flag it — it is a defined
+        variable — so this is a missing feature, not a naming gap. Measured
+        2026-08-31 as the single remaining difference in a 66-case sweep.
+
+
 - [x] **RESOLVED 2026-08-31 — `$redact` returned data it exists to withhold:
   three defects, both servers.** `$redact` is the content-based access-control
   stage, so each of these is a disclosure, not a cosmetic divergence. Found by
@@ -1510,13 +1560,14 @@ These are explicit non-goals. Don't add them without a reason.
   `tests/test_redact.py`, and 5 Rust unit tests.
 
   **Still open, and deliberately NOT this slice:**
-  - [ ] **The Rust server answers `BadValue` (2) for an undefined variable
-        where mongod answers 17276**, in all 7 stages probed. The Python server
-        has the code right and now the wrapper too. Naming it on the Rust side
-        needs a standalone validator that tracks `$let` / `$map` / `$filter` /
-        `$reduce` scopes — without that it would mislabel unrelated `Fallback`
-        results as undefined variables. Measured 2026-08-31: python 0/7 wrong
-        after this slice, rust 7/7 wrong.
+  - [x] **RESOLVED 2026-08-31 — and it was BIGGER than "the Rust server has the
+        wrong code".** The scope tracking this entry called for was built (a
+        conservative static walk; see the entry below), and building it surfaced
+        a defect on BOTH servers that no amount of Rust work would have fixed:
+        mongod reports an undefined variable at **PARSE** time, so it errors on
+        an EMPTY or non-existent collection where nothing is ever evaluated —
+        and both servers answered `ok: 1` with an empty cursor, because both
+        only found the problem while evaluating against a document.
 
 
 
