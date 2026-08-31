@@ -59,7 +59,14 @@ jobs:
     container: alpine:3.20
     steps:
       - name: Toolchain
-        run: apk add --no-cache rust cargo musl-dev clang-dev clang-static build-base
+        # Alpine's own cargo is 1.78 and cannot parse `edition2024`, which a
+        # transitive dep needs -- that is the distro's age, not libpg_query.
+        # Install current stable via rustup so the probe measures what it claims.
+        run: |
+          apk add --no-cache musl-dev clang-dev clang-static build-base curl bash
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Create a minimal pg_query consumer
         shell: sh
         run: |
