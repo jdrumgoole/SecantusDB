@@ -814,6 +814,150 @@ const EXPR_MAP_STAGES: &[&str] = &["$project", "$addFields", "$set", "$group"];
 /// stage reports it bare. Probed on 8.2.11.
 const EXPR_WRAPPING_STAGES: &[&str] = &["$project", "$addFields", "$set"];
 
+/// Operators whose argument must be a DOCUMENT, with mongod's code and wording.
+/// Taken from mongod 8.2.11 one operator at a time -- the five phrasings are its
+/// own and are not interchangeable ("found: {}" vs "found {}" vs no type at
+/// all), which is why this is a table rather than one message with the operator
+/// name substituted in. Mirrors `expressions._OBJECT_ARG`.
+///
+/// Like the arity check, this is a PARSE error: an empty collection reports it.
+const OBJECT_ARG: &[(&str, i32, &str)] = &[
+    (
+        "$convert",
+        9,
+        "$convert expects an object of named arguments but found: {}",
+    ),
+    (
+        "$dateAdd",
+        5166400,
+        "$dateAdd expects an object as its argument",
+    ),
+    (
+        "$dateDiff",
+        5166301,
+        "$dateDiff only supports an object as its argument",
+    ),
+    (
+        "$dateFromParts",
+        40519,
+        "$dateFromParts only supports an object as its argument",
+    ),
+    (
+        "$dateFromString",
+        40540,
+        "$dateFromString only supports an object as an argument, found: {}",
+    ),
+    (
+        "$dateSubtract",
+        5166400,
+        "$dateSubtract expects an object as its argument",
+    ),
+    (
+        "$dateToParts",
+        40524,
+        "$dateToParts only supports an object as its argument",
+    ),
+    (
+        "$dateToString",
+        18629,
+        "$dateToString only supports an object as its argument",
+    ),
+    (
+        "$dateTrunc",
+        5439007,
+        "$dateTrunc only supports an object as its argument",
+    ),
+    (
+        "$filter",
+        28646,
+        "$filter only supports an object as its argument",
+    ),
+    (
+        "$let",
+        16874,
+        "$let only supports an object as its argument",
+    ),
+    (
+        "$ltrim",
+        50696,
+        "$ltrim only supports an object as an argument, found {}",
+    ),
+    (
+        "$map",
+        16878,
+        "$map only supports an object as its argument",
+    ),
+    (
+        "$reduce",
+        40075,
+        "$reduce requires an object as an argument, found: {}",
+    ),
+    (
+        "$regexFind",
+        51103,
+        "$regexFind expects an object of named arguments but found: {}",
+    ),
+    (
+        "$regexFindAll",
+        51103,
+        "$regexFindAll expects an object of named arguments but found: {}",
+    ),
+    (
+        "$regexMatch",
+        51103,
+        "$regexMatch expects an object of named arguments but found: {}",
+    ),
+    (
+        "$replaceAll",
+        51751,
+        "$replaceAll requires an object as an argument, found: {}",
+    ),
+    (
+        "$replaceOne",
+        51751,
+        "$replaceOne requires an object as an argument, found: {}",
+    ),
+    (
+        "$rtrim",
+        50696,
+        "$rtrim only supports an object as an argument, found {}",
+    ),
+    (
+        "$setField",
+        4161100,
+        "$setField only supports an object as its argument",
+    ),
+    (
+        "$sortArray",
+        2942500,
+        "$sortArray requires an object as an argument, found: {}",
+    ),
+    (
+        "$switch",
+        40060,
+        "$switch requires an object as an argument, found: {}",
+    ),
+    (
+        "$trim",
+        50696,
+        "$trim only supports an object as an argument, found {}",
+    ),
+    (
+        "$zip",
+        34460,
+        "$zip only supports an object as an argument, found {}",
+    ),
+];
+
+/// mongod's error when a document-argument operator gets something else.
+fn object_arg_problem(op: &str, arg: &Bson) -> Option<(i32, String)> {
+    if matches!(arg, Bson::Document(_)) {
+        return None;
+    }
+    let (_, code, template) = OBJECT_ARG.iter().find(|(name, _, _)| *name == op)?;
+    Some((*code, template.replace("{}", bson_type_name(arg))))
+}
+
 /// mongod's 16020 when a fixed-arity operator gets the wrong argument count.
 /// The table lives in the ENGINE (`secantus_core::expressions`), because the
 /// evaluator needs it too: mongod unwraps a one-element array for the
@@ -856,7 +1000,8 @@ fn expression_problem(expr: &Bson, bound: &[String]) -> Option<(i32, String)> {
         Bson::Document(d) => {
             for (op, arg) in d {
                 // Arity is STRUCTURAL, so it is checked even for `$literal`.
-                if let Some(found) = arity_problem(op, arg) {
+                if let Some(found) = arity_problem(op, arg).or_else(|| object_arg_problem(op, arg))
+                {
                     return Some(found);
                 }
                 // `$literal`'s argument is DATA: `{$literal: "$$x"}` is the

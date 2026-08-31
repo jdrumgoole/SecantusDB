@@ -266,6 +266,17 @@ pub(crate) fn command_error(err: StorageError) -> CommandError {
     }
 }
 
+/// mongod's name for an error code: the real one where it has a name, and
+/// `Location<n>` otherwise. The parse-time expression checks answer a mix of
+/// both -- 16020 and 17276 are `Location`s, but 9 is `FailedToParse`, and
+/// naming it `Location9` is a divergence the differential gate catches.
+pub(crate) fn error_code_name(code: i32) -> String {
+    match code_name_for(code) {
+        "Location" => format!("Location{code}"),
+        name => name.to_string(),
+    }
+}
+
 fn code_name_for(code: i32) -> &'static str {
     match code {
         2 => "BadValue",

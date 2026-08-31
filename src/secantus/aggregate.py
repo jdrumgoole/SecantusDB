@@ -20,6 +20,9 @@ from secantus.expressions import (
     _bool,
     _bson_type_name,
     _fmt_double,
+    _object_arg_problem,
+    _object_keys_problem,
+    _ranged_arity_problem,
     _set_eq,
     evaluate,
     evaluate_or_missing,
@@ -334,7 +337,12 @@ def _expression_problem(expr: Any, bound: frozenset[str]) -> tuple[int, str] | N
         # `$literal`'s argument is data, not an expression: `{$literal: "$$x"}`
         # is the STRING, and mongod does not resolve it. Its ARITY is still
         # checked, since that is structural.
-        found = _arity_problem(op, arg)
+        found = (
+            _arity_problem(op, arg)
+            or _ranged_arity_problem(op, arg)
+            or _object_arg_problem(op, arg)
+            or _object_keys_problem(op, arg)
+        )
         if found:
             return found
         if op == "$literal":

@@ -1554,6 +1554,47 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [x] **RESOLVED 2026-08-31 — the document-argument operator family (25
+  operators, 675 shapes), and the LAST of the expression sweep's crashes.**
+  The largest uniform block left: mongod requires a document argument for
+  `$convert` / `$dateAdd` / `$dateDiff` / `$dateFromParts` / `$dateFromString` /
+  `$dateSubtract` / `$dateToParts` / `$dateToString` / `$dateTrunc` / `$filter` /
+  `$let` / `$ltrim` / `$map` / `$reduce` / `$regexFind` / `$regexFindAll` /
+  `$regexMatch` / `$replaceAll` / `$replaceOne` / `$rtrim` / `$setField` /
+  `$sortArray` / `$switch` / `$trim` / `$zip`, and the Rust server answered its
+  generic BadValue for every one.
+
+  **A table, not one message with the name substituted in.** mongod uses FIVE
+  phrasings that are not interchangeable -- `found: <T>` vs `found <T>` vs no
+  type at all -- and codes from 9 to 5439007. Derived by asking mongod one
+  operator at a time.
+
+  **The last crashes are gone: `{$trunc: []}` reached `arg[0]` (IndexError), an
+  unrecognised key in `$cond` / `$dateToString` was a bare KeyError, and
+  `$exp` / `$sinh` / `$cosh` of a large value raised OverflowError where mongod
+  saturates to INFINITY.** The Python server is now at **0 crashes**, from 274
+  when the sweep started.
+
+  Also: code **9 is `FailedToParse`, not `Location9`** -- the parse-time checks
+  were naming every code `Location<n>` and the differential gate caught it.
+
+  Sweep status: python crashes 274 -> 0, python code diffs 2288 -> 682, rust
+  code diffs 2288 -> 1556, rust message-only 689 -> 0. Pinned by 32 more
+  differential cases.
+
+  **What is left of the sweep, all measured 2026-08-31:**
+  - [ ] **~1556 Rust code differences: the per-operator OPERAND-TYPE errors.**
+        `{$abs: "x"}` is `28765 $abs only supports numeric types, not string` on
+        mongod and a generic BadValue on the Rust server. ~200 distinct message
+        families remain, roughly one per operator, so this is several slices
+        rather than one; the object-argument family above was the largest
+        uniform block and is done.
+  - [ ] **~669 Python message-only differences**, right code and wrong wording.
+  - [ ] **42 wrong VALUES on Python / 33 on Rust**, mostly the circular trig
+        functions narrowing Decimal128 (see the Decimal128 entry) plus
+        `$toLower`/`$toUpper` not coercing and `$ceil`/`$floor` narrowing a
+        double.
+
 - [ ] **OPEN — collation ORDERING is not ICU; matching is correct.** Measured
   2026-08-31 against mongod 8.2.11 with a 39-case differential (39 cases, 29
   divergent; the 7 spec-validation ones are fixed, leaving 22). The split is
