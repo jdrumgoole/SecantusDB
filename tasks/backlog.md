@@ -1499,6 +1499,47 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **OPEN — collation ORDERING is not ICU; matching is correct.** Measured
+  2026-08-31 against mongod 8.2.11 with a 39-case differential (39 cases, 29
+  divergent; the 7 spec-validation ones are fixed, leaving 22). The split is
+  the useful part: **every equality/matching case passed at every strength** —
+  `find` with a filter, `$match`, `count`, `$in` — and it is only ORDER that
+  diverges. Our collator casefolds and strips accents for the comparison key,
+  then falls back to CODEPOINT order:
+
+  | probe | mongod | ours |
+  |---|---|---|
+  | `["a","á","ä","az","b"]`, `en` | `a á ä az b` | `a az b á ä` |
+  | `["a","A","b","B"]`, strength 3 | `a A b B` | `A B a b` |
+  | `caseFirst: "upper"` | `A a B b` | `A B a b` (ignored) |
+  | `numericOrdering: true` on `["10","9","2","100"]` | `2 9 10 100` | `10 100 2 9` (ignored) |
+  | `backwards: true`, `fr` | `cote côte coté` | `cote coté côte` (ignored) |
+  | `locale: "de"` on `["ä","az","b"]` | `ä az b` | `az b ä` (locale ignored) |
+
+  So accents sort after `z` instead of beside their base letter, tertiary case
+  order is absent, and `caseFirst` / `numericOrdering` / `backwards` / the
+  locale itself are accepted and ignored. `alternate: "shifted"` happened to
+  agree on the probed strings; that is not evidence it is implemented.
+
+  **This is a dependency decision, not a slice.** Faithful ordering means ICU
+  (PyICU, or a vendored DUCET table) — accent placement and locale rules are
+  data, not logic. Two intermediate options exist and are cheaper:
+  `numericOrdering` needs only digit-run splitting, and tertiary case order +
+  `caseFirst` sit on top of the existing casefold key. Neither needs a new
+  dependency; both would close 4 of the 20 ordering cases without pretending
+  the rest work.
+
+- [ ] **OPEN — an invalid collation `locale` is accepted where mongod rejects
+  it.** `{locale: "xx_YY"}` answers `2 Field 'locale' is invalid in: { locale:
+  "xx_YY" }`, and a malformed keyword form gets a "Did you mean 'en_US'?"
+  suffix. Deliberately NOT implemented alongside the rest of the spec
+  validation (2026-08-31): enumerating ICU's locale list without ICU means
+  guessing, and wrongly rejecting a locale mongod ACCEPTS is worse than
+  accepting one it rejects. Comes free with any ICU dependency taken for the
+  ordering item above.
+
+
+
 - [x] **RESOLVED 2026-08-31 — the undefined-`$$variable` check reached only the
   aggregation pipeline; every other surface still answered a generic error.**
   The walker landed for `aggregate`; `find` / `count` / `distinct` /
