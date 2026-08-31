@@ -3080,6 +3080,12 @@ _BULK_WRITE_KNOWN_FIELDS = frozenset(
 _BULK_WRITE_MAX_OPS = 100000
 
 
+# `nsInfo` entries accept only these. An unknown one is 40415, named WITHOUT
+# an index (`bulkWrite.nsInfo.x`) even though a wrong-typed ENTRY is named with
+# one (`bulkWrite.nsInfo.0`) -- probed 8.2.11.
+_NS_INFO_KNOWN_FIELDS = frozenset({"ns", "collectionUUID", "encryptionInformation"})
+
+
 def _bulk_write_missing(field: str) -> dict[str, Any]:
     """mongod's ``IDLFailedToParse`` for a required op field that is absent."""
     return {
@@ -3113,6 +3119,67 @@ def _bulk_write(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if unknown is not None:
         return unknown
 
+    # `nsInfo` is validated BEFORE the batch-size check: mongod answers the
+    # nsInfo type error for `{ops: [], nsInfo: 5}`, not "Got 0 operations"
+    # (probed 8.2.11, 2026-08-31). Our order had the batch check first, so a
+    # wrong-typed nsInfo reported a batch-size problem.
+    if "nsInfo" not in doc or doc["nsInfo"] is None:
+        return _bulk_write_missing("bulkWrite.nsInfo")
+    ns_info = doc.get("nsInfo")
+    if not isinstance(ns_info, list):
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"BSON field 'bulkWrite.nsInfo' is the wrong type "
+                f"'{_bson_type_of(ns_info)}', expected type 'array'"
+            ),
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    for _i, _entry in enumerate(ns_info):
+        if not isinstance(_entry, Mapping):
+            # The ENTRY error carries its index; the field errors below do not.
+            # mongod's own inconsistency, reproduced.
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    f"BSON field 'bulkWrite.nsInfo.{_i}' is the wrong type "
+                    f"'{_bson_type_of(_entry)}', expected type 'object'"
+                ),
+                "code": 14,
+                "codeName": "TypeMismatch",
+            }
+        _unknown_ns = next((k for k in _entry if k not in _NS_INFO_KNOWN_FIELDS), None)
+        if _unknown_ns is not None:
+            return {
+                "ok": 0.0,
+                "errmsg": f"BSON field 'bulkWrite.nsInfo.{_unknown_ns}' is an unknown field.",
+                "code": 40415,
+                "codeName": "IDLUnknownField",
+            }
+        if "ns" not in _entry:
+            return _bulk_write_missing("bulkWrite.nsInfo.ns")
+        if not isinstance(_entry["ns"], str):
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    f"BSON field 'bulkWrite.nsInfo.ns' is the wrong type "
+                    f"'{_bson_type_of(_entry['ns'])}', expected type 'string'"
+                ),
+                "code": 14,
+                "codeName": "TypeMismatch",
+            }
+        _ns = _entry["ns"]
+        if "." not in _ns or not _ns.split(".", 1)[1]:
+            # mongod names the DATABASE half: 'nodot' has no dot so the whole
+            # string is the db, and '.' / '' both report ''.
+            return {
+                "ok": 0.0,
+                "errmsg": (f"Invalid namespace specified for bulkWrite: '{_ns.split('.', 1)[0]}'"),
+                "code": 73,
+                "codeName": "InvalidNamespace",
+            }
+
     ops = doc.get("ops")
     if not isinstance(ops, list) or not ops or len(ops) > _BULK_WRITE_MAX_OPS:
         n = len(ops) if isinstance(ops, list) else 0
@@ -3125,9 +3192,6 @@ def _bulk_write(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 16,
             "codeName": "InvalidLength",
         }
-    ns_info = doc.get("nsInfo")
-    if not isinstance(ns_info, list):
-        return _bad_value("BSON field 'bulkWrite.nsInfo' is the wrong type")
 
     ordered = doc.get("ordered", True)
     errors_only = bool(doc.get("errorsOnly", False))
@@ -3140,35 +3204,58 @@ def _bulk_write(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             return _bad_value(f"BulkWrite ops entry {op!r} is not an object")
         kind = next((k for k in ("insert", "update", "delete") if k in op), None)
         if kind is None:
-            return _bad_value(
-                f"BulkWrite ops entry {_fmt_stage_val(dict(op))} does not contain a "
-                "supported operation type"
-            )
+            # mongod names the offending KEY, not the whole entry.
+            unknown_op = next(iter(op), "op")
+            return {
+                "ok": 0.0,
+                "errmsg": f"BSON field 'bulkWrite.{unknown_op}' is an unknown field.",
+                "code": 40415,
+                "codeName": "IDLUnknownField",
+            }
         ns_index = op.get(kind)
-        if (
-            not isinstance(ns_index, int)
-            or isinstance(ns_index, bool)
-            or not (0 <= ns_index < len(ns_info))
-        ):
+        if isinstance(ns_index, bool) or not isinstance(ns_index, (int, float, bson.Decimal128)):
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    f"BSON field 'bulkWrite.ops.{kind}' is the wrong type "
+                    f"'{_bson_type_of(ns_index)}', expected types "
+                    f"'[long, int, decimal, double]'"
+                ),
+                "code": 14,
+                "codeName": "TypeMismatch",
+            }
+        ns_index = _coerce_command_int(ns_index)
+        if ns_index < 0:
+            # The field name here is the op KIND, bare -- not the IDL path.
+            return {
+                "ok": 0.0,
+                "errmsg": f"BSON field '{kind}' value must be >= 0, actual value '{ns_index}'",
+                "code": 2,
+                "codeName": "BadValue",
+            }
+        if ns_index >= len(ns_info):
             return _bad_value(
                 f"BulkWrite ops entry {_fmt_stage_val(dict(op))} has an invalid nsInfo index."
             )
         entry = ns_info[ns_index]
-        ns = entry.get("ns") if isinstance(entry, Mapping) else None
-        if not isinstance(ns, str) or "." not in ns:
-            return _bad_value(
-                f"BulkWrite ops entry {_fmt_stage_val(dict(op))} has an invalid nsInfo index."
-            )
+        ns = entry["ns"]
         db_name, _, coll = ns.partition(".")
         sub_ctx = replace(ctx, db_name=db_name)
 
         if kind == "insert":
             if "document" not in op:
                 return _bulk_write_missing("bulkWrite.ops.document")
+            _err = _require_object_bson_field(op["document"], "bulkWrite.ops.document")
+            if _err is not None:
+                return _err
             cmd: dict[str, Any] = {"insert": coll, "documents": [op["document"]]}
         elif kind == "update":
             if "updateMods" not in op:
                 return _bulk_write_missing("bulkWrite.ops.updateMods")
+            # `filter` is REQUIRED on update and delete -- we defaulted it to
+            # `{}`, which silently turned a malformed op into a match-all.
+            if "filter" not in op:
+                return _bulk_write_missing("bulkWrite.ops.filter")
             stmt: dict[str, Any] = {
                 "q": op.get("filter", {}),
                 "u": op["updateMods"],
