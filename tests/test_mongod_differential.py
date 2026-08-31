@@ -1747,6 +1747,142 @@ REDACT_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ("descend-classic", LEVELLED, _redact_ok(DESCEND_EXPR)),
 ]
 
+# Undefined `$$variable` — mongod reports it at PARSE time, so it fires on an
+# EMPTY collection where nothing is ever evaluated. Both servers used to answer
+# ok:1 there, and the Rust server answered a generic BadValue (2) even with
+# documents present. The wrapper is per stage: `Invalid $<stage> :: caused by ::`
+# for `$project` / `$addFields` / `$set`, bare everywhere else. The `ok-` cases
+# are the false-positive guards: a conservative checker must leave a literal
+# `"$$NOPE"` in a `$match` filter, a `$literal`, and every binding form alone.
+# Probed on mongod 8.2.11.
+#: An empty seed leaves the collection NON-EXISTENT, which is the strongest form
+#: of the parse-time check: mongod still reports the undefined variable there.
+NONE_AT_ALL: list[dict] = []
+
+
+def _agg(pipeline: list[dict]) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(db, pipeline)
+
+
+UNDEFVAR_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    ("project", ONE, _agg([{"$project": {"x": "$$NOPE"}}])),
+    ("addfields", ONE, _agg([{"$addFields": {"x": "$$NOPE"}}])),
+    ("set", ONE, _agg([{"$set": {"x": "$$NOPE"}}])),
+    ("group", ONE, _agg([{"$group": {"_id": "$$NOPE"}}])),
+    ("redact", ONE, _agg([{"$redact": "$$NOPE"}])),
+    ("replacewith", ONE, _agg([{"$replaceWith": {"k": "$$NOPE"}}])),
+    ("replaceroot", ONE, _agg([{"$replaceRoot": {"newRoot": {"x": "$$NOPE"}}}])),
+    ("match-expr", ONE, _agg([{"$match": {"$expr": {"$eq": ["$$NOPE", 1]}}}])),
+    ("facet-inner", ONE, _agg([{"$facet": {"f": [{"$project": {"x": "$$NOPE"}}]}}])),
+    ("nested-doc", ONE, _agg([{"$addFields": {"x": {"y": "$$NOPE"}}}])),
+    ("nested-array", ONE, _agg([{"$addFields": {"x": [1, "$$NOPE"]}}])),
+    ("deep-expr", ONE, _agg([{"$set": {"x": {"$concatArrays": [["$$NOPE"]]}}}])),
+    # `$let` bindings cannot see each other, and do not escape the `in`.
+    (
+        "let-escapes",
+        ONE,
+        _agg([{"$project": {"y": {"$let": {"vars": {"v": 1}, "in": "$$v"}}, "z": "$$v"}}]),
+    ),
+    (
+        "let-siblings",
+        ONE,
+        _agg([{"$project": {"x": {"$let": {"vars": {"a1": 1, "b1": "$$a1"}, "in": "$$b1"}}}}]),
+    ),
+    # PARSE time: an empty collection still errors.
+    ("empty-collection", NONE_AT_ALL, _agg([{"$project": {"x": "$$NOPE"}}])),
+    ("empty-collection-bare", NONE_AT_ALL, _agg([{"$group": {"_id": "$$NOPE"}}])),
+    # --- false-positive guards: all of these are VALID -----------------------
+    ("ok-match-literal", [{"_id": 1, "s": "$$NOPE"}], _agg([{"$match": {"s": "$$NOPE"}}])),
+    ("ok-literal", ONE, _agg([{"$project": {"x": {"$literal": "$$NOPE"}}}])),
+    ("ok-let", ONE, _agg([{"$project": {"x": {"$let": {"vars": {"v": 1}, "in": "$$v"}}}}])),
+    (
+        "ok-let-nested",
+        ONE,
+        _agg(
+            [
+                {
+                    "$project": {
+                        "x": {
+                            "$let": {
+                                "vars": {"v": 1},
+                                "in": {
+                                    "$let": {"vars": {"w": "$$v"}, "in": {"$add": ["$$v", "$$w"]}}
+                                },
+                            }
+                        }
+                    }
+                }
+            ]
+        ),
+    ),
+    (
+        "ok-map-as",
+        ONE,
+        _agg([{"$project": {"x": {"$map": {"input": [1, 2], "as": "m", "in": "$$m"}}}}]),
+    ),
+    (
+        "ok-map-default",
+        ONE,
+        _agg([{"$project": {"x": {"$map": {"input": [1, 2], "in": "$$this"}}}}]),
+    ),
+    (
+        "ok-filter-default",
+        ONE,
+        _agg([{"$project": {"x": {"$filter": {"input": [1, 2], "cond": {"$gt": ["$$this", 1]}}}}}]),
+    ),
+    (
+        "ok-reduce",
+        ONE,
+        _agg(
+            [
+                {
+                    "$project": {
+                        "x": {
+                            "$reduce": {
+                                "input": [1, 2],
+                                "initialValue": 0,
+                                "in": {"$add": ["$$value", "$$this"]},
+                            }
+                        }
+                    }
+                }
+            ]
+        ),
+    ),
+    ("ok-root", ONE, _agg([{"$project": {"x": "$$ROOT"}}])),
+    ("ok-now-type", ONE, _agg([{"$project": {"x": {"$type": "$$NOW"}}}])),
+    ("ok-redact-decisions", ONE, _agg([{"$redact": {"$cond": [True, "$$KEEP", "$$PRUNE"]}}])),
+    (
+        "ok-map-over-let",
+        ONE,
+        _agg(
+            [
+                {
+                    "$project": {
+                        "x": {
+                            "$let": {
+                                "vars": {"v": 1},
+                                "in": {
+                                    "$map": {
+                                        "input": [1],
+                                        "as": "m",
+                                        "in": {"$add": ["$$v", "$$m"]},
+                                    }
+                                },
+                            }
+                        }
+                    }
+                }
+            ]
+        ),
+    ),
+    (
+        "ok-dotted-var",
+        ONE,
+        _agg([{"$project": {"x": {"$let": {"vars": {"v": {"k": 1}}, "in": "$$v.k"}}}}]),
+    ),
+]
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
@@ -1758,6 +1894,7 @@ ALL_CASES = (
     + [("maxtime", c) for c in MAXTIME_CASES]
     + [("aggerr", c) for c in AGGERR_CASES]
     + [("redact", c) for c in REDACT_CASES]
+    + [("undefvar", c) for c in UNDEFVAR_CASES]
 )
 
 

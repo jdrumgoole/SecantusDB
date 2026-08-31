@@ -283,6 +283,169 @@ def _pipeline_mutates_in_place(pipeline: Any) -> bool:
     return False
 
 
+#: Variables mongod defines for every pipeline. Listed rather than inferred so
+#: an unknown name is reported instead of silently accepted. `CLUSTER_TIME`,
+#: `SEARCH_META` and `JS_SCOPE` are DEFINED but answer their own errors
+#: (10071200 / 6347902 / 51144) -- they belong here so the undefined-variable
+#: check leaves them for those paths.
+_SYSTEM_VARS = frozenset(
+    {"ROOT", "CURRENT", "NOW", "REMOVE", "USER_ROLES", "CLUSTER_TIME", "SEARCH_META", "JS_SCOPE"}
+)
+
+#: Stages whose spec is, as a whole, an expression evaluated per document.
+_EXPR_SPEC_STAGES = frozenset({"$redact", "$replaceWith", "$sortByCount"})
+
+#: Stages whose spec is a document of `field: <expression>` pairs. The KEYS are
+#: field names, never expressions.
+_EXPR_MAP_STAGES = frozenset({"$project", "$addFields", "$set", "$group"})
+
+
+def _undefined_variable(expr: Any, bound: frozenset[str]) -> str | None:
+    """The first `$$name` in ``expr`` that names nothing, or ``None``.
+
+    Deliberately CONSERVATIVE: it reports only from positions known to be
+    expressions, and returns ``None`` for anything it does not recognise. A
+    false negative leaves the old behaviour; a false positive would break a
+    VALID pipeline, which is far worse than the wrong error code this exists to
+    fix. Every rule below was probed against mongod 8.2.11.
+    """
+    if isinstance(expr, str):
+        if expr.startswith("$$"):
+            base = expr[2:].split(".", 1)[0]
+            if base and base not in bound and base not in _SYSTEM_VARS:
+                return base
+        return None
+    if isinstance(expr, list):
+        for item in expr:
+            found = _undefined_variable(item, bound)
+            if found:
+                return found
+        return None
+    if not isinstance(expr, Mapping):
+        return None
+    for op, arg in expr.items():
+        # `$literal`'s argument is data, not an expression: `{$literal: "$$x"}`
+        # is the STRING, and mongod does not resolve it.
+        if op == "$literal":
+            continue
+        if op == "$let":
+            found = _undefined_let(arg, bound)
+            if found:
+                return found
+            continue
+        if op in ("$map", "$filter"):
+            found = _undefined_binding(arg, bound, op)
+            if found:
+                return found
+            continue
+        if op == "$reduce":
+            if isinstance(arg, Mapping):
+                for key in ("input", "initialValue"):
+                    found = _undefined_variable(arg.get(key), bound)
+                    if found:
+                        return found
+                found = _undefined_variable(arg.get("in"), bound | {"this", "value"})
+                if found:
+                    return found
+            continue
+        found = _undefined_variable(arg, bound)
+        if found:
+            return found
+    return None
+
+
+def _undefined_let(arg: Any, bound: frozenset[str]) -> str | None:
+    """`$let`: the bindings are evaluated in the OUTER scope (they cannot see
+    each other -- probed), and only ``in`` sees the new names."""
+    if not isinstance(arg, Mapping):
+        return None
+    names = arg.get("vars")
+    if isinstance(names, Mapping):
+        for value in names.values():
+            found = _undefined_variable(value, bound)
+            if found:
+                return found
+        bound = bound | set(names)
+    return _undefined_variable(arg.get("in"), bound)
+
+
+def _undefined_binding(arg: Any, bound: frozenset[str], op: str) -> str | None:
+    """`$map` / `$filter`: ``input`` is outer-scope; the body sees ``as``
+    (default ``this``)."""
+    if not isinstance(arg, Mapping):
+        return None
+    found = _undefined_variable(arg.get("input"), bound)
+    if found:
+        return found
+    as_name = arg.get("as")
+    inner = bound | {as_name if isinstance(as_name, str) and as_name else "this"}
+    return _undefined_variable(arg.get("cond" if op == "$filter" else "in"), inner)
+
+
+def undefined_variable_in_pipeline(pipeline: Any, bound: frozenset[str]) -> tuple[str, str] | None:
+    """``(variable, stage)`` for the first undefined `$$name`, or ``None``.
+
+    mongod reports this at PARSE time -- an empty collection still errors, which
+    is why this runs before the pipeline rather than during it. ``stage`` is the
+    name for the `Invalid $<stage> :: caused by ::` wrapper, or ``""`` where
+    mongod leaves the message bare.
+    """
+    if not isinstance(pipeline, list):
+        return None
+    for stage in pipeline:
+        if not isinstance(stage, Mapping) or len(stage) != 1:
+            continue
+        name, spec = next(iter(stage.items()))
+        wrapper = name if name in _EXPR_WRAPPING_STAGES else ""
+        if name in _EXPR_SPEC_STAGES:
+            # `$redact` binds its three decision names for its own expression.
+            inner = bound | {"KEEP", "PRUNE", "DESCEND"} if name == "$redact" else bound
+            found = _undefined_variable(spec, inner)
+            if found:
+                return (found, wrapper)
+        elif name in _EXPR_MAP_STAGES:
+            if isinstance(spec, Mapping):
+                for value in spec.values():
+                    found = _undefined_variable(value, bound)
+                    if found:
+                        return (found, wrapper)
+        elif name == "$replaceRoot":
+            if isinstance(spec, Mapping):
+                found = _undefined_variable(spec.get("newRoot"), bound)
+                if found:
+                    return (found, wrapper)
+        elif name == "$match":
+            # The filter is QUERY language, where `"$$x"` is a literal value to
+            # match. Only `$expr` holds an expression.
+            if isinstance(spec, Mapping) and "$expr" in spec:
+                found = _undefined_variable(spec["$expr"], bound)
+                if found:
+                    return (found, "")
+        elif name == "$facet":
+            if isinstance(spec, Mapping):
+                for sub in spec.values():
+                    found = undefined_variable_in_pipeline(sub, bound)
+                    if found:
+                        return found
+        elif name == "$lookup":
+            # `let` binds only inside this stage's own sub-pipeline -- probed:
+            # referencing it in a LATER stage is undefined.
+            if isinstance(spec, Mapping):
+                let_vars = spec.get("let")
+                inner = bound
+                if isinstance(let_vars, Mapping):
+                    for value in let_vars.values():
+                        found = _undefined_variable(value, bound)
+                        if found:
+                            return (found, wrapper)
+                    inner = bound | set(let_vars)
+                found = undefined_variable_in_pipeline(spec.get("pipeline"), inner)
+                if found:
+                    return found
+        # Every other stage is left alone on purpose: see the docstring above.
+    return None
+
+
 def _apply_stage(
     stage: dict[str, Any],
     docs: list[dict[str, Any]],

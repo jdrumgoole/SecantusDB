@@ -20,6 +20,7 @@ from secantus.aggregate import (
     _fmt_stage_val,
     _geo_near_index_filter,
     apply_pipeline,
+    undefined_variable_in_pipeline,
     validate_stage_names,
 )
 from secantus.auth import (
@@ -6078,6 +6079,22 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "errmsg": "'pipeline' option must be specified as an array",
             "code": 14,
             "codeName": "TypeMismatch",
+        }
+    # An undefined `$$variable` is a PARSE error for mongod -- it fires on an
+    # EMPTY collection, where nothing is ever evaluated, so the evaluator alone
+    # could not produce it. Checked here, once, before the pipeline runs.
+    _cmd_let = doc.get("let")
+    _found = undefined_variable_in_pipeline(
+        pipeline, frozenset(_cmd_let) if isinstance(_cmd_let, Mapping) else frozenset()
+    )
+    if _found is not None:
+        _var, _stage = _found
+        _msg = f"Use of undefined variable: {_var}"
+        return {
+            "ok": 0.0,
+            "errmsg": f"Invalid {_stage} :: caused by :: {_msg}" if _stage else _msg,
+            "code": 17276,
+            "codeName": "Location17276",
         }
     hint = doc.get("hint")
     # ``let`` user-vars threaded into the pipeline context so

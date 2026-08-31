@@ -113,6 +113,24 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Err(e) = validate_project_exprs(&pipeline) {
         return Ok(e.into_reply());
     }
+    // An undefined `$$variable` is a PARSE error for mongod: it fires on an
+    // EMPTY collection, where nothing is ever evaluated, so no amount of engine
+    // work could produce it. Checked here, once, before the pipeline runs.
+    {
+        let bound: Vec<String> = match doc.get("let") {
+            Some(Bson::Document(d)) => d.keys().cloned().collect(),
+            _ => Vec::new(),
+        };
+        if let Some((var, stage)) = argtypes::undefined_variable_error(&pipeline, &bound) {
+            let msg = format!("Use of undefined variable: {var}");
+            let errmsg = if stage.is_empty() {
+                msg
+            } else {
+                format!("Invalid {stage} :: caused by :: {msg}")
+            };
+            return Ok(CommandError::new(17276, "Location17276", errmsg).into_reply());
+        }
+    }
     // A wrong-TYPED stage spec: name it with mongod's own code rather than
     // letting the engine's generic `Fallback` surface as BadValue (2). Seven
     // stages, seven codes -- see `crate::argtypes::stage_spec_error`.
