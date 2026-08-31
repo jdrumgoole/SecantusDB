@@ -236,3 +236,147 @@ def test_update_sort_still_upserts_when_nothing_matches(client: MongoClient) -> 
     coll.insert_one({"_id": 1, "v": 1})
     res = coll.update_one({"v": 99}, {"$set": {"z": 1}}, upsert=True, sort={"v": 1})
     assert res.upserted_id is not None
+
+
+# --- argument validation, probed against mongod 8.2.11 on 2026-08-31 --------
+#
+# A differential sweep of 47 shapes found five divergences, all of them error
+# SHAPE: a missing `nsInfo` reported as a wrong type, a negative namespace
+# index and an unknown op kind reported with our own wording, a non-array
+# `nsInfo` reported as a batch-size problem, and an invalid namespace reported
+# as a bad index. Each expectation below is mongod's, verbatim.
+
+
+def _bw_error(client: MongoClient, cmd: dict):
+    from pymongo.errors import OperationFailure
+
+    with pytest.raises(OperationFailure) as exc:
+        client["admin"].command(cmd)
+    return exc.value
+
+
+def _ops(op: dict) -> dict:
+    return {"bulkWrite": 1, "ops": [op], "nsInfo": [{"ns": "bwdb.c"}]}
+
+
+def test_missing_nsinfo_is_a_missing_field_not_a_type_error(client: MongoClient) -> None:
+    err = _bw_error(client, {"bulkWrite": 1, "ops": [{"insert": 0, "document": {"_id": 1}}]})
+    assert err.code == 40414
+    assert err.details["errmsg"] == "BSON field 'bulkWrite.nsInfo' is missing but a required field"
+
+
+def test_null_nsinfo_reads_as_missing(client: MongoClient) -> None:
+    err = _bw_error(
+        client, {"bulkWrite": 1, "ops": [{"insert": 0, "document": {"_id": 1}}], "nsInfo": None}
+    )
+    assert err.code == 40414
+
+
+def test_nsinfo_wrong_type_is_reported_before_the_batch_size(client: MongoClient) -> None:
+    """`{ops: [], nsInfo: 5}` is an nsInfo type error, NOT "Got 0 operations".
+
+    Our order had the batch-size check first, so a wrong-typed nsInfo reported
+    a batch-size problem. mongod validates nsInfo first.
+    """
+    err = _bw_error(client, {"bulkWrite": 1, "ops": [], "nsInfo": 5})
+    assert err.code == 14
+    assert (
+        err.details["errmsg"]
+        == "BSON field 'bulkWrite.nsInfo' is the wrong type 'int', expected type 'array'"
+    )
+
+
+def test_nsinfo_entry_wrong_type_names_its_index(client: MongoClient) -> None:
+    err = _bw_error(
+        client, {"bulkWrite": 1, "ops": [{"insert": 0, "document": {"_id": 1}}], "nsInfo": [5]}
+    )
+    assert err.code == 14
+    assert (
+        err.details["errmsg"]
+        == "BSON field 'bulkWrite.nsInfo.0' is the wrong type 'int', expected type 'object'"
+    )
+
+
+def test_nsinfo_unknown_field_does_not_carry_an_index(client: MongoClient) -> None:
+    """The ENTRY error is indexed (`nsInfo.0`); the FIELD error is not
+    (`nsInfo.x`). mongod's own inconsistency, reproduced rather than tidied."""
+    err = _bw_error(
+        client,
+        {"bulkWrite": 1, "ops": [{"insert": 0, "document": {"_id": 1}}], "nsInfo": [{"x": 1}]},
+    )
+    assert err.code == 40415
+    assert err.details["errmsg"] == "BSON field 'bulkWrite.nsInfo.x' is an unknown field."
+
+
+@pytest.mark.parametrize(("ns", "named"), [("nodot", "nodot"), ("", ""), (".", "")])
+def test_invalid_namespace_is_its_own_error(client: MongoClient, ns: str, named: str) -> None:
+    """mongod names the DATABASE half: 'nodot' has no dot so the whole string
+    is the db, while '.' and '' both report ''."""
+    err = _bw_error(
+        client,
+        {"bulkWrite": 1, "ops": [{"insert": 0, "document": {"_id": 1}}], "nsInfo": [{"ns": ns}]},
+    )
+    assert err.code == 73
+    assert err.details["errmsg"] == f"Invalid namespace specified for bulkWrite: '{named}'"
+
+
+def test_negative_namespace_index_names_the_op_kind(client: MongoClient) -> None:
+    """The field name is the bare op kind (`insert`), not the IDL path."""
+    err = _bw_error(client, _ops({"insert": -1, "document": {"_id": 1}}))
+    assert err.code == 2
+    assert err.details["errmsg"] == "BSON field 'insert' value must be >= 0, actual value '-1'"
+
+
+def test_out_of_range_namespace_index_is_the_index_error(client: MongoClient) -> None:
+    err = _bw_error(client, _ops({"insert": 5, "document": {"_id": 1}}))
+    assert err.code == 2
+    assert "has an invalid nsInfo index." in err.details["errmsg"]
+
+
+def test_wrong_typed_namespace_index(client: MongoClient) -> None:
+    err = _bw_error(client, _ops({"insert": "0", "document": {"_id": 1}}))
+    assert err.code == 14
+    assert err.details["errmsg"] == (
+        "BSON field 'bulkWrite.ops.insert' is the wrong type 'string', "
+        "expected types '[long, int, decimal, double]'"
+    )
+
+
+def test_a_double_namespace_index_is_accepted(client: MongoClient) -> None:
+    """0.0 is a valid index -- the type list admits doubles."""
+    client["admin"].command(_ops({"insert": 0.0, "document": {"_id": 1}}))
+    assert client["bwdb"].c.find_one({"_id": 1}) is not None
+
+
+def test_unknown_op_kind_names_the_key(client: MongoClient) -> None:
+    err = _bw_error(client, _ops({"frobnicate": 0, "document": {"_id": 1}}))
+    assert err.code == 40415
+    assert err.details["errmsg"] == "BSON field 'bulkWrite.frobnicate' is an unknown field."
+
+
+@pytest.mark.parametrize(
+    ("op", "missing"),
+    [
+        ({"insert": 0}, "document"),
+        ({"update": 0, "filter": {}}, "updateMods"),
+        # `filter` is required on both: we defaulted it to {}, silently turning
+        # a malformed op into a match-all.
+        ({"update": 0, "updateMods": {"$set": {"a": 1}}}, "filter"),
+        ({"delete": 0}, "filter"),
+    ],
+)
+def test_missing_op_fields(client: MongoClient, op: dict, missing: str) -> None:
+    err = _bw_error(client, _ops(op))
+    assert err.code == 40414
+    assert err.details["errmsg"] == (
+        f"BSON field 'bulkWrite.ops.{missing}' is missing but a required field"
+    )
+
+
+def test_insert_document_must_be_an_object(client: MongoClient) -> None:
+    err = _bw_error(client, _ops({"insert": 0, "document": 5}))
+    assert err.code == 14
+    assert (
+        err.details["errmsg"]
+        == "BSON field 'bulkWrite.ops.document' is the wrong type 'int', expected type 'object'"
+    )
