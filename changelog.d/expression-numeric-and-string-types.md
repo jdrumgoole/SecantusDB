@@ -49,6 +49,6 @@ Nearly all of them were one of three rules the engines did not implement.
   fell through to the double path and narrowed a 34-digit operand to 17 digits.
 
 After the change the Rust server has **no** value differences left across the
-3,884-case sweep (was 33) and the Python server has six, all of them a
-last-digit disagreement on a Decimal128 transcendental where mongod's own
+3,884-case sweep (was 33) and the Python server has five (was 42), all of them
+a last-digit disagreement on a Decimal128 transcendental where mongod's own
 answer is 1-2 ulp below the correctly-rounded value.

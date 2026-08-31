@@ -1808,7 +1808,7 @@ These are explicit non-goals. Don't add them without a reason.
 
         Related and still open: `cmp(string, Decimal128)` is inverted in the
         cross-type order (4 of 121 pairs).
-  - [ ] **~143 message-only differences** remain on the Python server across
+  - [ ] **135 message-only differences** remain on the Python server across
         the expression family (Rust: 4), down from 689. The largest remaining
         group is wording rather than rendering — the number rendering itself is
         fixed (`expressions._fmt_double` is mongod's `%g`).
