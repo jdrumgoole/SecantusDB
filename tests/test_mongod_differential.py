@@ -2367,6 +2367,53 @@ NUMERIC_GUARD_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] 
     ("sqrt-field-number-ok", NG_SEED, _n({"$sqrt": "$n"})),
 ]
 
+# Which of mongod's two prefixes an expression error carries. A CONSTANT
+# expression is folded at optimization time -- `Failed to optimize pipeline ::
+# caused by ::` -- and a document-dependent one fails per document under
+# `Executor error during aggregate command on namespace: … :: caused by ::`.
+# Both servers always used the executor form: 618 of the Python server's
+# message-only differences and 148 of the Rust server's.
+#
+# The predicate is "does it read the document": a field path, `$$ROOT` /
+# `$$CURRENT`, a variable bound from the input and `$rand` are execution-time;
+# literals, `$$NOW` and the command's own `let` values fold. Each pair below is
+# the same error reached both ways, so the two prefixes are pinned against each
+# other rather than in isolation.
+FOLD_SEED = [{"_id": 1, "s": "x", "n": 2}]
+
+
+def _f(expr: object) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(db, [{"$addFields": {"z": expr}}])
+
+
+FOLD_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    # constant -> folded
+    ("const-abs", FOLD_SEED, _f({"$abs": "x"})),
+    ("const-divide-by-zero", FOLD_SEED, _f({"$divide": [1, 0]})),
+    ("const-nested", FOLD_SEED, _f({"$abs": {"$concat": ["a", "b"]}})),
+    ("const-literal", FOLD_SEED, _f({"$abs": {"$literal": "x"}})),
+    ("const-now", FOLD_SEED, _f({"$abs": "$$NOW"})),
+    ("const-sqrt", FOLD_SEED, _f({"$sqrt": "x"})),
+    # document-dependent -> executor
+    ("field-abs", FOLD_SEED, _f({"$abs": "$s"})),
+    ("field-divide-by-zero", FOLD_SEED, _f({"$divide": ["$n", 0]})),
+    ("field-nested", FOLD_SEED, _f({"$abs": {"$concat": ["a", "$s"]}})),
+    ("root-var", FOLD_SEED, _f({"$abs": "$$ROOT"})),
+    ("current-var", FOLD_SEED, _f({"$abs": "$$CURRENT"})),
+    ("rand-is-not-constant", FOLD_SEED, _f({"$abs": {"$toString": {"$rand": {}}}})),
+    (
+        "map-binding-is-not-constant",
+        FOLD_SEED,
+        _f({"$map": {"input": [["x"]], "in": {"$abs": "$$this"}}}),
+    ),
+    # `$let` folds only when its bindings do
+    ("let-constant-binding", FOLD_SEED, _f({"$let": {"vars": {"v": "x"}, "in": {"$abs": "$$v"}}})),
+    ("let-field-binding", FOLD_SEED, _f({"$let": {"vars": {"v": "$s"}, "in": {"$abs": "$$v"}}})),
+    # a successful constant is still just computed
+    ("const-ok", FOLD_SEED, _f({"$abs": -3})),
+    ("field-ok", FOLD_SEED, _f({"$abs": "$n"})),
+]
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
@@ -2387,6 +2434,7 @@ ALL_CASES = (
     + [("decimal", c) for c in DECIMAL_CASES]
     + [("objarg", c) for c in OBJECT_ARG_CASES]
     + [("numguard", c) for c in NUMERIC_GUARD_CASES]
+    + [("fold", c) for c in FOLD_CASES]
 )
 
 

@@ -1618,24 +1618,31 @@ These are explicit non-goals. Don't add them without a reason.
         <T>` (40536), 97 more ranged arities (28667), 60 `requires a single
         argument` (50723), and roughly 190 smaller families.
 
-  - [ ] **The constant-folding WRAPPER, now measured and decidable.** For a
-        CONSTANT operand mongod folds at optimization time and says
-        `Failed to optimize pipeline :: caused by ::`; for a field reference it
-        says `Executor error during aggregate command on namespace: … :: caused
-        by ::`. Both servers always use the executor form, which is 148 of the
-        Rust server's message-only diffs and a similar count on Python.
+  - [x] **RESOLVED 2026-08-31 — the constant-folding WRAPPER, and it was cheap
+        once measured.** mongod picks between `Failed to optimize pipeline ::
+        caused by ::` and `Executor error during aggregate command on namespace:
+        … :: caused by ::` by whether the expression reads the DOCUMENT. Both
+        servers always used the executor form: **618 of the Python server's
+        message-only differences and 148 of the Rust server's**, the single
+        largest item left in the sweep.
 
-        The plan calls this "modelling constant folding" and defers it. Probed
-        2026-08-31, **the rule is static**: mongod folds exactly when the
-        argument contains no field-path reference -- a nested constant folds, a
-        nested `$field` does not, and `$$NOW` folds. That is a much cheaper
-        proposition than the entry implies and is worth re-costing before
-        deferring it again.
-  - [ ] **~669 Python message-only differences**, right code and wrong wording.
-  - [ ] **42 wrong VALUES on Python / 33 on Rust**, mostly the circular trig
-        functions narrowing Decimal128 (see the Decimal128 entry) plus
-        `$toLower`/`$toUpper` not coercing and `$ceil`/`$floor` narrowing a
-        double.
+        The plan deferred this three times as "modelling constant folding". The
+        predicate is static: literals / `$literal` / `$$NOW` / the command's own
+        `let` values / a constant `$let` fold; a field path / `$$ROOT` /
+        `$$CURRENT` / a variable bound from the input / `$rand` do not. Both
+        servers now fold constant sub-expressions before running, which is what
+        the optimizer does. Python message-only 669 -> 143, Rust 148 -> 4.
+
+        **Two stages must NOT be folded, both caught by the differential gate:**
+        `$switch` folds to a different ERROR than it raises (40069 with its own
+        wording, not 40066) and has a dedicated path already; `$redact` binds
+        its decision variables itself, so folding reported `$$KEEP` as
+        undefined.
+
+  - [ ] **~143 Python message-only differences left: NUMBER RENDERING inside the
+        message.** mongod prints `1.09951e+12` where we print `1099511627776`,
+        and `0` where we print `0.0`. Same family as the `$limit` / `$skip`
+        value-rendering entry above. Measured 2026-08-31.
 
 - [ ] **OPEN — collation ORDERING is not ICU; matching is correct.** Measured
   2026-08-31 against mongod 8.2.11 with a 39-case differential (39 cases, 29

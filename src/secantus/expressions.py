@@ -352,6 +352,63 @@ _OBJECT_KEYS: dict[str, tuple[int, str, tuple[str, ...]]] = {
 }
 
 
+#: Operators that introduce their own variables, and so cannot be folded: the
+#: bound value comes from the input. `$map` over a literal array still does not
+#: fold on mongod -- probed.
+_BINDING_OPS = frozenset({"$map", "$filter", "$reduce"})
+
+#: Non-deterministic, so never folded.
+_NON_DETERMINISTIC = frozenset({"$rand"})
+
+#: Variables that are constant for the whole pipeline. `$$ROOT` / `$$CURRENT`
+#: are the document, so they are not.
+_CONSTANT_VARS = frozenset({"NOW", "CLUSTER_TIME"})
+
+
+def is_constant_expression(expr: Any, bound: frozenset[str]) -> bool:
+    """Whether mongod can fold ``expr`` at optimization time.
+
+    Decides which of two prefixes an error carries: a folded expression fails
+    under ``Failed to optimize pipeline :: caused by ::``, and a
+    document-dependent one under ``Executor error during aggregate command on
+    namespace: … :: caused by ::``. Probed on mongod 8.2.11: a field path,
+    ``$$ROOT`` / ``$$CURRENT``, a variable bound from the input and ``$rand``
+    are all execution-time; literals, ``$$NOW`` and the command's own ``let``
+    values fold.
+
+    CONSERVATIVE: anything unrecognised is treated as non-constant, which keeps
+    the executor prefix -- the behaviour before this existed.
+    """
+    if isinstance(expr, str):
+        if expr.startswith("$$"):
+            base = expr[2:].split(".", 1)[0]
+            return base in _CONSTANT_VARS or base in bound
+        return not expr.startswith("$")  # a bare `$path` reads the document
+    if isinstance(expr, list):
+        return all(is_constant_expression(e, bound) for e in expr)
+    if not isinstance(expr, Mapping):
+        return True
+    for op, arg in expr.items():
+        if op == "$literal":
+            continue
+        if op in _NON_DETERMINISTIC or op in _BINDING_OPS:
+            return False
+        if op == "$let":
+            if not isinstance(arg, Mapping):
+                return False
+            names = arg.get("vars")
+            if not isinstance(names, Mapping):
+                return False
+            if not all(is_constant_expression(v, bound) for v in names.values()):
+                return False
+            if not is_constant_expression(arg.get("in"), bound | set(names)):
+                return False
+            continue
+        if not is_constant_expression(arg, bound):
+            return False
+    return True
+
+
 def _object_keys_problem(op: str, arg: Any) -> tuple[int, str] | None:
     """An unrecognised key in a document-argument operator.
 
