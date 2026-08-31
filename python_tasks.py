@@ -238,9 +238,15 @@ def clean(c: Context) -> None:
 _PYTEST_TMP_KEEP = 3
 
 
-def _sweep_stale_pytest_tmp(base: str) -> tuple[int, int]:
+def _sweep_stale_pytest_tmp(base: str, *, measure: bool = True) -> tuple[int, int]:
     """Delete abandoned ``pytest-of-<user>/pytest-NNNN`` trees; return
     ``(count, bytes_freed)``.
+
+    ``measure=False`` skips sizing the trees and reports ``0`` bytes. Sizing
+    walks every file to produce a number for ``invoke clean``'s summary line,
+    which doubles the I/O on a large backlog -- 37 GiB in one run directory has
+    been seen. The automatic sweep in ``tests/conftest.py`` runs on every
+    pytest start and wants none of that, so it opts out.
 
     This suite pins ``tmp_path_retention_policy = "all"`` on purpose — deleting
     a passed test's ``tmp_path`` mid-session races WiredTiger's background
@@ -280,7 +286,8 @@ def _sweep_stale_pytest_tmp(base: str) -> tuple[int, int]:
         if _pytest_tmp_owner_alive(path):
             continue
         try:
-            freed += _dir_size(path)
+            if measure:
+                freed += _dir_size(path)
             shutil.rmtree(path, ignore_errors=True)
             reaped += 1
         except OSError:

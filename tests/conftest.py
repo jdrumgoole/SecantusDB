@@ -243,6 +243,7 @@ _crash_dump_file = None
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
+    _reap_abandoned_pytest_tmp(session.config)
     # Arm the crash faulthandler HERE, not in pytest_configure: pytest's own
     # faulthandler plugin calls ``faulthandler.enable(file=<stderr>)`` in its
     # pytest_configure (_pytest/faulthandler.py), and hook ordering let it clobber
@@ -250,6 +251,48 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     # runs strictly after every pytest_configure, so our file wins and stays the
     # fatal-signal target for the whole run.
     _arm_crash_faulthandler(session.config)
+
+
+def _reap_abandoned_pytest_tmp(config: pytest.Config) -> None:
+    """Reclaim earlier runs' abandoned temp trees, once per session.
+
+    This suite pins ``tmp_path_retention_policy = "all"`` deliberately --
+    deleting a passed test's ``tmp_path`` mid-session races WiredTiger's
+    background threads into ``WT_PANIC`` (see ``pytest_configure`` above) -- so
+    every run leaves its per-test WiredTiger databases behind and depends on
+    pytest's own numbered-dir janitor to reclaim them. That janitor stalls for
+    a 3-day ``LOCK_TIMEOUT`` whenever a run dies without its atexit hooks, and
+    the backlog then compounds: one box reached 241 dirs / 391 GiB, another
+    48 GiB in a day.
+
+    ``invoke clean`` has been able to fix this for a while, but only when
+    somebody remembered to run it, which is why the backlog kept coming back.
+    Doing it at session start makes the suite self-maintaining, and it is the
+    safe half of "each test cleans up after itself": we delete only trees whose
+    owning pytest process is **gone**, never a live one and never the newest
+    few. The current run is protected twice over -- its dir is the newest, and
+    its ``.lock`` names this live PID.
+
+    Best-effort by construction. It runs on the xdist CONTROLLER only (workers
+    would each redo it and race one another), skips silently where
+    ``python_tasks`` will not import -- CI's slim `storage-engine` env has no
+    ``invoke`` -- and swallows every error: reclaiming disk must never fail a
+    test run.
+    """
+    if hasattr(config, "workerinput"):  # an xdist worker, not the controller
+        return
+    if os.environ.get("SECANTUS_NO_TMP_REAP") == "1":
+        return
+    try:
+        import tempfile
+
+        import python_tasks
+
+        reaped, _ = python_tasks._sweep_stale_pytest_tmp(tempfile.gettempdir(), measure=False)
+    except Exception:  # noqa: BLE001 - never fail a run over housekeeping
+        return
+    if reaped:
+        print(f"\nreaped {reaped} abandoned pytest temp tree(s) from earlier runs")
 
 
 def _arm_crash_faulthandler(config: pytest.Config) -> None:

@@ -3143,6 +3143,21 @@ These are explicit non-goals. Don't add them without a reason.
 
 Subtler than the above; these may bite specific test suites.
 
+- [x] **RESOLVED 2026-08-31 — the `pytest-of-<user>` backlog is swept
+  automatically now, not just by `invoke clean`.** Same root cause as the
+  entry below (a run that dies without its atexit hooks leaves a `.lock` that
+  makes pytest treat the dir as live for a 3-day `LOCK_TIMEOUT`, and the
+  backlog compounds because a bigger backlog means a longer exit-time cleanup
+  means more runs killed mid-cleanup). `_sweep_stale_pytest_tmp` had existed
+  for a while and decides liveness from the lock's PID, but its only caller
+  was `invoke clean` — so it only ran when somebody remembered, and the
+  backlog kept returning: **48 GiB in 37 dirs on this box in a day**, one
+  directory of which was 37 GiB. `tests/conftest.py`'s `pytest_sessionstart`
+  now calls it (controller only, `measure=False`, errors swallowed;
+  `SECANTUS_NO_TMP_REAP=1` opts out). Deleting a *passed test's own* `tmp_path`
+  mid-session is still forbidden and still tripwired — that races WiredTiger
+  into `WT_PANIC`.
+
 - [x] **RESOLVED 2026-08-17 — `test_crash_stall_watchdog.py`'s two nested-run
   tests (`test_faulthandler_dir_arms_a_file_per_worker` /
   `…_captures_a_worker_crash`) wedged in pytest's SHARED-temp-root `atexit`
