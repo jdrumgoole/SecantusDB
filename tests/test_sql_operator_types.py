@@ -10,10 +10,9 @@ deliberately do not have.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
+import pg_oracle
 from secantus.sql import run_sql
 from secantus.sql.pgserver import SecantusPGServer
 from secantus.sql.session import Session
@@ -186,14 +185,14 @@ class TestTypedTextHasNoArithmetic:
 
 def _pg_reference():
     """A live PostgreSQL to check against, or None. Point elsewhere with
-    SECANTUS_PG_ORACLE_DSN."""
-    dsn = os.environ.get(
-        "SECANTUS_PG_ORACLE_DSN", "host=127.0.0.1 port=5432 dbname=postgres user=jdrumgoole"
-    )
-    try:
-        return psycopg.connect(dsn, autocommit=True, connect_timeout=3)
-    except Exception:
-        return None
+    SECANTUS_PG_ORACLE_DSN.
+
+    Delegates to `pg_oracle` so all six oracle suites share one probe, and one
+    skip reason that says why. The inline copies this replaced had drifted to
+    three different default DSNs and skipped with a message indistinguishable
+    from "PostgreSQL is not installed".
+    """
+    return pg_oracle.connect()
 
 
 #: Every shape here diverged before 2026-08-30.
@@ -223,7 +222,7 @@ _SHAPES = [
 ]
 
 
-@pytest.mark.skipif(_pg_reference() is None, reason="no local PostgreSQL reference server")
+@pytest.mark.skipif(not pg_oracle.available(), reason=pg_oracle.skip_reason())
 def test_operator_types_match_real_postgres(wire):
     """The assertions above say what we believe; this says what PostgreSQL does.
 

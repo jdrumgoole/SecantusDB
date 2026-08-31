@@ -74,11 +74,17 @@ def _oracle() -> psycopg.Connection | None:
 
 
 def _oracle_available() -> bool:
-    """Probe for the oracle WITHOUT leaking the probe's connection.
+    """Probe for the oracle, closing the probe's connection.
 
-    The first cut called `_oracle()` straight into a `skipif` and dropped the
-    connection on the floor. Every xdist worker importing the module then held
-    one open for the whole session, against a server with max_connections=100.
+    The docstring here used to say the first cut "leaked" a connection per
+    worker by calling `_oracle()` straight into a `skipif`. **Measured
+    2026-08-31: it did not.** CPython refcounting collects the unreferenced
+    connection the moment the comparison is computed, and psycopg closes it on
+    `__del__`; nine such probes leave zero rows in `pg_stat_activity`, where
+    nine held references leave nine. Closing explicitly is still right -- it
+    does not depend on refcounting -- but connection exhaustion was never the
+    reason these suites skip. See `tests/pg_oracle.py`, the shared probe the
+    six older oracle suites now use, for what the reason actually is.
     """
     conn = _oracle()
     if conn is None:

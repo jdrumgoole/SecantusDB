@@ -20,22 +20,30 @@ These are the things that cost time to rediscover.
 
 **Oracles — both are the point of this plan.**
 
-* `mongod` is on `PATH` — **it reports 8.2.1 as of 2026-08-31**, not the 6.0.16
-  this file was written against, and not the 8.2.11 this line claimed until
-  2026-08-31; the error surface was retargeted to 8.x on 2026-08-29 (see
-  `CLAUDE.md`). **8.2.11 is installed separately** at
-  `/opt/homebrew/opt/mongodb-community@8.2.11/bin/mongod`; put it first on
+* `mongod` is on `PATH` — **it reports 8.2.11**, measured 2026-08-31 by running
+  the binary, not the 6.0.16 this file was written against; the error surface
+  was retargeted to 8.x on 2026-08-29 (see `CLAUDE.md`). **Two other builds are
+  installed**, so a version comparison is reproducible here today:
+  `/opt/homebrew/Cellar/mongodb-community@6.0/6.0.16/bin/mongod` and
+  `/opt/homebrew/Cellar/mongodb-community/8.3.4/bin/mongod` — put one first on
   `PATH` to probe against it. Measurements below dated against 6.0.16 stay true
-  about *that* version — re-probe before relying on one, and note that 6.0.16
-  and 8.3.4 are no longer installed at all. Start a server on
-  `127.0.0.1:27019` and diff against it. `tests/test_mongod_differential.py` is
-  the standing harness; run it with `-m differential`.
+  about *that* version, and can now be re-checked rather than taken on trust.
+  Start a server on `127.0.0.1:27019` and diff against it.
+  `tests/test_mongod_differential.py` is the standing harness; run it with
+  `-m differential`.
 
-  **Run `mongod --version` and record it with the measurement.** This line was
-  wrong for a day because nobody did, and a *patch* bump has changed an error
-  message here before — "8.x" is not specific enough to cite.
+  **Run `mongod --version` and record it with the measurement.** This line has
+  now carried two different wrong versions, and a *patch* bump has changed an
+  error message here before, so "8.x" is not specific enough to cite. Cite a
+  `Cellar` path, not an `opt` symlink — `/opt/homebrew/bin/mongod` was
+  repointed at a new keg on 2026-08-30, which is the kind of move that
+  invalidates a line like this one without touching the repo.
 * **A live PostgreSQL 14 runs on this box** at `host=127.0.0.1 port=5432
-  dbname=postgres user=jdrumgoole`. `SECANTUS_PG_ORACLE_DSN` points
+  dbname=postgres user=jdrumgoole` — **PostgreSQL 14.13 (Homebrew)**, data
+  directory `/opt/homebrew/var/postgresql@14`, measured 2026-08-31. Worth
+  naming because it is *not* Postgres.app, whose per-application permission
+  gate a backlog entry blamed for silently skipping the six oracle suites; they
+  do not skip. `SECANTUS_PG_ORACLE_DSN` points
   `test_subms_predicates_match_real_postgres` at it. It settled six SQL claims
   in an afternoon; use it for every SQL question.
 
