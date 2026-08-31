@@ -26,6 +26,7 @@ from secantus.expressions import (
     _set_eq,
     evaluate,
     evaluate_or_missing,
+    is_constant_expression,
 )
 from secantus.numerics import bson_sum
 from secantus.paths import get_path, has_path, set_path, unset_path
@@ -421,14 +422,75 @@ def expression_problem_in_filter(filter_doc: Any, bound: frozenset[str]) -> tupl
     return None
 
 
+#: Returned as the wrapper when the failing expression was CONSTANT: mongod
+#: folded it at optimization time and says so instead of naming the stage.
+FOLD_WRAPPER = "\0fold"
+
+
 def wrap_expression_problem(message: str, stage: str) -> str:
     """mongod's wrapper: `Invalid $<stage> :: caused by ::` inside `$project` /
     `$addFields` / `$set`, and nothing anywhere else."""
+    if stage == FOLD_WRAPPER:
+        return f"Failed to optimize pipeline :: caused by :: {message}"
     return f"Invalid {stage} :: caused by :: {message}" if stage else message
 
 
+def _contains_switch(expr: Any) -> bool:
+    if isinstance(expr, Mapping):
+        return "$switch" in expr or any(_contains_switch(v) for v in expr.values())
+    if isinstance(expr, list):
+        return any(_contains_switch(v) for v in expr)
+    return False
+
+
+def _fold_problem(
+    expr: Any, bound: frozenset[str], fold_vars: Mapping[str, Any] | None = None
+) -> tuple[int, str] | None:
+    """Evaluate a CONSTANT expression the way mongod's optimizer does.
+
+    mongod folds an expression that does not read the document, so an error in
+    one is reported at optimization time -- `Failed to optimize pipeline ::
+    caused by ::` -- rather than per document. Both servers always used the
+    executor prefix, which was 618 of the Python server's message-only
+    differences and 148 of the Rust server's.
+
+    Only the ERROR is taken from this; a constant that evaluates cleanly is
+    discarded, since the engine will compute it again. Anything unexpected is
+    swallowed: a false "not constant" merely keeps the previous wrapper.
+    """
+    if not is_constant_expression(expr, bound):
+        return None
+    # `$switch` folds to a DIFFERENT error than it raises at execution -- 40069
+    # "Cannot execute a switch statement where all the cases evaluate to false
+    # without a default" rather than 40066 -- and `_apply_switch_folds` already
+    # models that. Folding it here would report the execution-time error under
+    # the optimization-time prefix, which is neither answer.
+    if _contains_switch(expr):
+        return None
+    # The REAL `let` values, not placeholders: mongod folds `$$cv` to what the
+    # command bound, so `{$abs: "$$cv"}` with `cv: "x"` fails at optimization
+    # time. `$$NOW` is a pipeline constant and has to be seeded, or folding
+    # reports it as an undefined variable.
+    fold_ctx: dict[str, Any] = dict(fold_vars or {})
+    fold_ctx.setdefault("NOW", _dt.datetime.now(_dt.timezone.utc))
+    try:
+        evaluate(expr, {}, fold_ctx)
+    except ExpressionError as exc:
+        code = getattr(exc, "code", None)
+        if code is None:
+            return None
+        return (code, str(exc))
+    except AggregateError as exc:
+        code = getattr(exc, "code", None)
+        return (code, str(exc)) if code is not None else None
+    except Exception:
+        # Not a mongod-shaped failure: leave it to the engine.
+        return None
+    return None
+
+
 def expression_problem_in_pipeline(
-    pipeline: Any, bound: frozenset[str]
+    pipeline: Any, bound: frozenset[str], fold_vars: Mapping[str, Any] | None = None
 ) -> tuple[int, str, str] | None:
     """``(code, message, stage)`` for the first parse-time expression problem.
 
@@ -467,7 +529,7 @@ def expression_problem_in_pipeline(
         elif name == "$facet":
             if isinstance(spec, Mapping):
                 for sub in spec.values():
-                    nested = expression_problem_in_pipeline(sub, bound)
+                    nested = expression_problem_in_pipeline(sub, bound, fold_vars)
                     if nested:
                         return nested
         elif name == "$lookup":
@@ -483,12 +545,44 @@ def expression_problem_in_pipeline(
                             break
                     inner = bound | set(let_vars)
                 if not found:
-                    nested = expression_problem_in_pipeline(spec.get("pipeline"), inner)
+                    nested = expression_problem_in_pipeline(spec.get("pipeline"), inner, fold_vars)
                     if nested:
                         return nested
         # Every other stage is left alone on purpose: see the docstring above.
         if found:
             return (found[0], found[1], wrapper)
+        # No structural problem: mongod would now FOLD the constant
+        # sub-expressions, and an error in one is reported at optimization time
+        # under its own prefix rather than the stage's.
+        folded = _fold_in_stage(name, spec, bound, fold_vars)
+        if folded:
+            return (folded[0], folded[1], FOLD_WRAPPER)
+    return None
+
+
+def _fold_in_stage(
+    name: str, spec: Any, bound: frozenset[str], fold_vars: Mapping[str, Any] | None
+) -> tuple[int, str] | None:
+    """Fold the expressions of one stage, in the same positions the structural
+    walk uses -- a filter is query language, so only its `$expr` is folded."""
+    if name == "$redact":
+        # `$redact`'s decision variables are bound by the stage itself, with
+        # marker VALUES the folding evaluator does not have -- folding it
+        # reported `$$KEEP` as an undefined variable. It reads the document
+        # anyway, so there is nothing to fold.
+        return None
+    if name in _EXPR_SPEC_STAGES:
+        return _fold_problem(spec, bound, fold_vars)
+    if name in _EXPR_MAP_STAGES and isinstance(spec, Mapping):
+        for value in spec.values():
+            found = _fold_problem(value, bound, fold_vars)
+            if found:
+                return found
+        return None
+    if name == "$replaceRoot" and isinstance(spec, Mapping):
+        return _fold_problem(spec.get("newRoot"), bound, fold_vars)
+    if name == "$match" and isinstance(spec, Mapping) and "$expr" in spec:
+        return _fold_problem(spec["$expr"], bound, fold_vars)
     return None
 
 

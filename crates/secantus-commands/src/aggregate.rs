@@ -888,18 +888,23 @@ fn core_run(
     let saved = nameable.then(|| docs.clone());
     secantus_core::aggregate::apply_pipeline(docs, stages, vars, collation).map_err(|_| {
         if let Some(docs) = saved {
-            if let Some((code, errmsg)) =
+            if let Some((code, errmsg, folded)) =
                 secantus_core::aggregate::runtime_error(&docs, stages, vars, collation)
             {
-                // An EXECUTION-time failure, so mongod wraps it. This server
-                // had no executor wrapper at all; the Python one applies it to
-                // any `exec_error` raise.
-                let errmsg = match ns {
-                    Some(ns) => format!(
-                        "Executor error during aggregate command on namespace: \
-                         {ns} :: caused by :: {errmsg}"
-                    ),
-                    None => errmsg,
+                // Which of mongod's two prefixes depends on WHEN it failed. A
+                // constant expression is folded at optimization time and says
+                // so; a document-dependent one fails per document under the
+                // executor prefix. This server had no wrapper at all.
+                let errmsg = if folded {
+                    format!("Failed to optimize pipeline :: caused by :: {errmsg}")
+                } else {
+                    match ns {
+                        Some(ns) => format!(
+                            "Executor error during aggregate command on namespace: \
+                             {ns} :: caused by :: {errmsg}"
+                        ),
+                        None => errmsg,
+                    }
                 };
                 return CommandError::new(code, crate::util::error_code_name(code), errmsg);
             }

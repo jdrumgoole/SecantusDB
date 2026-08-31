@@ -6546,7 +6546,11 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # could not produce it. Checked here, once, before the pipeline runs.
     _cmd_let = doc.get("let")
     _found = expression_problem_in_pipeline(
-        pipeline, frozenset(_cmd_let) if isinstance(_cmd_let, Mapping) else frozenset()
+        pipeline,
+        frozenset(_cmd_let) if isinstance(_cmd_let, Mapping) else frozenset(),
+        # The real `let` VALUES, so a constant sub-expression folds the way
+        # mongod's optimizer folds it.
+        _cmd_let if isinstance(_cmd_let, Mapping) else None,
     )
     if _found is not None:
         _code, _msg, _stage = _found

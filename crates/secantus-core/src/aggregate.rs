@@ -485,6 +485,58 @@ const NUMERIC_GUARD: &[(&str, i32)] = &[
     ("$trunc", 51081),
 ];
 
+/// Whether mongod can FOLD this expression at optimization time.
+///
+/// Decides which prefix an error carries: a folded expression fails under
+/// `Failed to optimize pipeline :: caused by ::`, a document-dependent one
+/// under `Executor error during aggregate command on namespace: …`. Probed on
+/// 8.2.11 -- a field path, `$$ROOT` / `$$CURRENT`, a variable bound from the
+/// input and `$rand` are execution-time; literals, `$$NOW` and the command's
+/// own `let` values fold. Mirrors `expressions.is_constant_expression`.
+///
+/// CONSERVATIVE: anything unrecognised is treated as non-constant, which keeps
+/// the executor prefix that was there before.
+pub fn is_constant_expression(expr: &Bson, bound: &[String]) -> bool {
+    match expr {
+        Bson::String(s) => {
+            if let Some(var) = s.strip_prefix("$$") {
+                let base = var.split('.').next().unwrap_or(var);
+                return base == "NOW" || base == "CLUSTER_TIME" || bound.iter().any(|b| b == base);
+            }
+            !s.starts_with('$') // a bare `$path` reads the document
+        }
+        Bson::Array(a) => a.iter().all(|e| is_constant_expression(e, bound)),
+        Bson::Document(d) => d.iter().all(|(op, arg)| {
+            if op == "$literal" {
+                return true;
+            }
+            // `$rand` is non-deterministic; the binding operators take their
+            // variable from the input, so `$map` over a literal still does not
+            // fold (probed).
+            if matches!(op.as_str(), "$rand" | "$map" | "$filter" | "$reduce") {
+                return false;
+            }
+            if op == "$let" {
+                let Bson::Document(l) = arg else { return false };
+                let Some(Bson::Document(vars)) = l.get("vars") else {
+                    return false;
+                };
+                if !vars.iter().all(|(_, v)| is_constant_expression(v, bound)) {
+                    return false;
+                }
+                let mut inner = bound.to_vec();
+                inner.extend(vars.keys().cloned());
+                return l
+                    .get("in")
+                    .map(|e| is_constant_expression(e, &inner))
+                    .unwrap_or(false);
+            }
+            is_constant_expression(arg, bound)
+        }),
+        _ => true,
+    }
+}
+
 /// Report mongod's numeric type guard for an operand the engine deferred.
 ///
 /// The operators know the operand's type when they evaluate it, but their only
@@ -502,7 +554,7 @@ fn numeric_guard_error(
     stages: &[Bson],
     vars: &Document,
     collation: Option<&Collation>,
-) -> Option<(i32, String)> {
+) -> Option<(i32, String, bool)> {
     for (i, stage) in stages.iter().enumerate() {
         let Bson::Document(d) = stage else { continue };
         let mut found: Option<(String, i32, Bson)> = None;
@@ -528,12 +580,15 @@ fn numeric_guard_error(
             ) {
                 continue;
             }
+            // The wrapper follows the ARGUMENT: a constant one folds.
+            let constant = is_constant_expression(&arg, &vars.keys().cloned().collect::<Vec<_>>());
             return Some((
                 code,
                 format!(
                     "{op} only supports numeric types, not {}",
                     crate::query::bson_type_name(&v)
                 ),
+                constant,
             ));
         }
     }
@@ -574,9 +629,10 @@ pub fn runtime_error(
     stages: &[Bson],
     vars: &Document,
     collation: Option<&Collation>,
-) -> Option<(i32, String)> {
-    if let Some(found) = redact_runtime_error(docs, stages, vars, collation) {
-        return Some(found);
+) -> Option<(i32, String, bool)> {
+    if let Some((code, msg)) = redact_runtime_error(docs, stages, vars, collation) {
+        // Not folded: `$redact` reads the document by definition.
+        return Some((code, msg, false));
     }
     if let Some(found) = numeric_guard_error(docs, stages, vars, collation) {
         return Some(found);
@@ -596,20 +652,21 @@ pub fn runtime_error(
                 return Some((
                     5733201,
                     "Densify field type must be numeric or a date".to_string(),
+                    false,
                 ));
             }
         }
         if let Some(spec) = d.get("$bucket") {
             let input = apply_pipeline(docs.to_vec(), &stages[..i], vars, collation).ok()?;
             if bucket_unmatched_fault(spec, &input, vars) {
-                return Some((7158303, NO_BRANCH.to_string()));
+                return Some((7158303, NO_BRANCH.to_string(), false));
             }
         }
         for key in ["$project", "$addFields", "$set"] {
             let Some(spec) = d.get(key) else { continue };
             let input = apply_pipeline(docs.to_vec(), &stages[..i], vars, collation).ok()?;
             if switch_unmatched_fault(spec, &input, vars) {
-                return Some((40066, NO_BRANCH.to_string()));
+                return Some((40066, NO_BRANCH.to_string(), false));
             }
         }
     }
@@ -1346,8 +1403,9 @@ mod redact_tests {
         let stages = vec![Bson::Document(
             doc! {"$densify": {"field": "s", "range": {"step": 1, "bounds": "full"}}},
         )];
-        let (code, msg) = runtime_error(&[doc! {"_id": 1, "s": "x"}], &stages, &vars, None)
-            .expect("densify should be named");
+        let (code, msg, _folded) =
+            runtime_error(&[doc! {"_id": 1, "s": "x"}], &stages, &vars, None)
+                .expect("densify should be named");
         assert_eq!(code, 5733201);
         assert_eq!(msg, "Densify field type must be numeric or a date");
         // A numeric field is fine, and names nothing.
@@ -1359,7 +1417,7 @@ mod redact_tests {
         let stages = vec![Bson::Document(
             doc! {"$bucket": {"groupBy": "$n", "boundaries": [0, 10]}},
         )];
-        let (code, msg) = runtime_error(&[doc! {"_id": 1, "n": 99}], &stages, &vars, None)
+        let (code, msg, _folded) = runtime_error(&[doc! {"_id": 1, "n": 99}], &stages, &vars, None)
             .expect("bucket should be named");
         assert_eq!(code, 7158303);
         assert_eq!(msg, NO_MATCHING_BRANCH_MESSAGE);
@@ -1375,7 +1433,7 @@ mod redact_tests {
         let stages = vec![Bson::Document(doc! {"$project": {
             "v": {"$switch": {"branches": [{"case": {"$eq": ["$n", 99]}, "then": 1}]}}
         }})];
-        let (code, msg) = runtime_error(&[doc! {"_id": 1, "n": 1}], &stages, &vars, None)
+        let (code, msg, _folded) = runtime_error(&[doc! {"_id": 1, "n": 1}], &stages, &vars, None)
             .expect("switch should be named");
         assert_eq!(code, 40066);
         assert_eq!(msg, NO_MATCHING_BRANCH_MESSAGE);
