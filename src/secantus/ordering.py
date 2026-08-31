@@ -39,7 +39,12 @@ def _bson_type_rank(value: Any) -> float:
         return 2
     if isinstance(value, bool):
         return 9
-    if isinstance(value, (int, float, Decimal128)):
+    # `decimal.Decimal` is here for the SQL layer, whose numerics are native
+    # Decimals rather than Decimal128. Without it they fell to the catch-all
+    # rank and compared by TYPE against an int -- `price < cost * 1.5` returned
+    # rows where the comparison is false. It only began to matter when the
+    # expression relational operators started routing through this order.
+    if isinstance(value, (int, float, Decimal128, Decimal)):
         return 3
     if isinstance(value, str):
         return 4
@@ -84,6 +89,24 @@ class _SortKey:
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, _SortKey) and self.val == other.val
+
+
+def bson_equal(a: Any, b: Any) -> bool:
+    """Equality by BSON semantics, where a bool is NOT a number.
+
+    Python's ``True == 1`` is true, so ``{$eq: [true, 1]}`` answered true where
+    mongod says false, and the oplog update-diff called ``{a: true}`` -> ``{a: 1}``
+    no change at all. Bool and the numeric types are different BSON types; the
+    numeric types do compare across themselves (``1 == 1.0`` is true on mongod),
+    so only bool has to be separated out.
+
+    Lives here rather than in either caller because both the expression language
+    and the diff need exactly this rule -- the field-value rule that was copied
+    into two modules and drifted is the cautionary tale.
+    """
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    return bool(a == b)
 
 
 def _bson_lt(a: Any, b: Any) -> bool:

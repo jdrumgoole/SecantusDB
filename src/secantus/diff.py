@@ -42,6 +42,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from secantus.ordering import bson_equal
 from secantus.paths import get_path, set_path, unset_path
 
 #: Operators whose effect on an array mongod reports element-wise, provided
@@ -213,7 +214,10 @@ def _walk(
                 elementwise,
             )
         return
-    if pre != post:
+    # BSON equality, not Python's: `True == 1` is true in Python, so a field
+    # changing from `true` to `1` produced NO oplog entry at all -- a change a
+    # change-stream consumer never saw. The two are different BSON types.
+    if not bson_equal(pre, post):
         updated[path] = post
         _record_ambiguous(path, segments, disambiguated)
 

@@ -87,6 +87,14 @@ pub fn truthy(v: &Bson) -> bool {
         Bson::Int32(n) => *n != 0,
         Bson::Int64(n) => *n != 0,
         Bson::Double(d) => *d != 0.0, // NaN -> true (Python bool(nan))
+        // The MISSING marker is falsy, like null: `{$or: "$nosuch"}` is false
+        // on mongod, and this fell through to the catch-all and answered true.
+        Bson::Undefined => false,
+        Bson::Decimal128(d) => d
+            .to_string()
+            .parse::<f64>()
+            .map(|f| f != 0.0)
+            .unwrap_or(true),
         _ => true,
     }
 }
@@ -743,10 +751,16 @@ fn ord_op(arg: &Bson, ctx: &Ctx, pred: fn(Ordering) -> bool) -> R {
         };
         return Ok(Bson::Boolean(pred(ord)));
     }
-    Ok(Bson::Boolean(match py_order(&a, &b)? {
-        Some(o) => pred(o),
-        None => false, // Python `<`/`>` on incomparable operands raises -> False
-    }))
+    // mongod's BSON order, the same `op_cmp` uses -- NOT Python's operators.
+    // This used to read `None => false` under the comment "Python `<`/`>` on
+    // incomparable operands raises -> False", so every CROSS-TYPE comparison
+    // answered false: `{$gt: ["abc", 1]}` is true on mongod, a string sorting
+    // after a number, and `{$lt: [null, 1]}` likewise. Justifying behaviour by
+    // the other engine rather than by the reference server, again.
+    if !crate::order::is_sortable(&a) || !crate::order::is_sortable(&b) {
+        return Err(Fallback);
+    }
+    Ok(Bson::Boolean(pred(crate::order::cmp(&a, &b))))
 }
 
 /// Python ordering (`<`/`>`): `None` when the operands aren't orderable
@@ -796,8 +810,16 @@ fn is_exotic(b: &Bson) -> bool {
 // --- logic / control flow ----------------------------------------------
 
 fn logic(arg: &Bson, ctx: &Ctx, all: bool) -> R {
-    let Bson::Array(items) = arg else {
-        return Err(Fallback);
+    // A single non-array operand is a one-element list to mongod:
+    // `{$and: "$s"}` and `{$or: ""}` are both valid and both true. This
+    // deferred them.
+    let single;
+    let items: &Vec<Bson> = match arg {
+        Bson::Array(items) => items,
+        other => {
+            single = vec![other.clone()];
+            &single
+        }
     };
     for item in items {
         let t = truthy(&eval(item, ctx)?);
@@ -3205,9 +3227,11 @@ fn op_to_bool(arg: &Bson, ctx: &Ctx) -> R {
         Bson::Int32(n) => Bson::Boolean(n != 0),
         Bson::Int64(n) => Bson::Boolean(n != 0),
         Bson::Double(d) => Bson::Boolean(d != 0.0), // NaN -> true
-        Bson::String(s) => Bson::Boolean(!s.is_empty()),
+        // Every string is true, the EMPTY one included -- `{$toBool: ""}` is
+        // true on mongod (probed 8.2.11); this used Python's own truthiness.
+        Bson::String(_) => Bson::Boolean(true),
         Bson::Decimal128(_) => return Err(Fallback),
-        // Python: every other type is truthy.
+        // every other type is truthy.
         _ => Bson::Boolean(true),
     })
 }
@@ -4188,6 +4212,13 @@ pub fn py_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
     {
         return Err(Fallback);
     }
+    // A bool is NOT a number to mongod, so `{$eq: [true, 1]}` is false. The
+    // numberish fast path below treats them together (Python's `True == 1`),
+    // which answered true. Guarded here rather than in `numeric::is_numberish`,
+    // which the arithmetic paths also use.
+    if matches!(a, Bson::Boolean(_)) != matches!(b, Bson::Boolean(_)) {
+        return Ok(false);
+    }
     if let Some(r) = numeric::fast_cmp_numberish(a, b) {
         return Ok(r == Some(std::cmp::Ordering::Equal));
     }
@@ -4783,13 +4814,20 @@ mod tests {
             &Document::new()
         )
         .is_err());
+        // Booleans are ordered (rank 90, above the numerics at 30), so this
+        // returns the bool rather than deferring. It used to assert `is_err()`
+        // — a test pinning a LIMITATION, which went stale the moment
+        // `order::is_sortable` learned about bools. mongod: `[true]`, probed.
         let db = doc! {"a": [Bson::Boolean(true), Bson::Int32(1)]};
-        assert!(evaluate(
-            &db,
-            &bson::bson!({"$maxN": {"n": 1, "input": "$a"}}),
-            &Document::new()
-        )
-        .is_err());
+        assert_eq!(
+            evaluate(
+                &db,
+                &bson::bson!({"$maxN": {"n": 1, "input": "$a"}}),
+                &Document::new()
+            )
+            .unwrap(),
+            Bson::Array(vec![Bson::Boolean(true)])
+        );
     }
 
     #[test]

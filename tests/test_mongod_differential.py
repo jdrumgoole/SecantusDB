@@ -2013,6 +2013,81 @@ PROPAGATE_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ),
 ]
 
+# The expression language's comparison and truthiness rules, found by the first
+# operator-by-operator sweep of it (`tools/probes/agg_expressions.py`). Four
+# separate defects, all silent wrong ANSWERS rather than wrong errors:
+#
+#   * `$gt`/`$gte`/`$lt`/`$lte` compared with Python's own operators and
+#     swallowed the TypeError a cross-type pair raises, so EVERY comparison
+#     between different BSON types answered false. `$cmp` had it right.
+#   * `$and`/`$or` iterated a non-array argument, walking a STRING CHARACTER BY
+#     CHARACTER, and mongod's truthiness makes every string true -- empty too.
+#   * A bool is not a number: `{$eq: [true, 1]}` is false on mongod, and Python's
+#     `True == 1` made it true (and collapsed `$addToSet`'s `0` and `false`).
+#   * Missing is falsy; it was reaching the catch-all and reading as true.
+#
+# `sc-` are the short-circuit cases: mongod DOES short-circuit at runtime, so a
+# false `$and` operand hides a later error -- but an all-constant version folds
+# at optimization time and raises, which is why these use a field reference.
+CMP_SEED = [{"_id": 1, "n": 1, "s": "abc", "z0": 0}]
+
+
+def _r(expr: object) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(db, [{"$addFields": {"r": expr}}])
+
+
+EXPRCMP_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    ("gt-str-int", CMP_SEED, _r({"$gt": ["abc", 1]})),
+    ("gte-str-int", CMP_SEED, _r({"$gte": ["abc", 1]})),
+    ("lt-null-int", CMP_SEED, _r({"$lt": [None, 1]})),
+    ("lte-null-int", CMP_SEED, _r({"$lte": [None, 1]})),
+    ("gt-bool-int", CMP_SEED, _r({"$gt": [True, 1]})),
+    ("lt-bool-date", CMP_SEED, _r({"$lt": [True, datetime(2026, 1, 2)]})),
+    (
+        "gt-date-oid",
+        CMP_SEED,
+        _r({"$gt": [datetime(2026, 1, 2), ObjectId("0123456789ab0123456789ab")]}),
+    ),
+    ("lt-obj-arr", CMP_SEED, _r({"$lt": [{"$literal": {"k": 1}}, {"$literal": [1]}]})),
+    ("gt-emptystr-int", CMP_SEED, _r({"$gt": ["", 1]})),
+    ("gt-missing-int", CMP_SEED, _r({"$gt": ["$nosuch", 1]})),
+    ("lt-missing-int", CMP_SEED, _r({"$lt": ["$nosuch", 1]})),
+    ("cmp-agrees-with-lt", CMP_SEED, _r({"$cmp": ["abc", 1]})),
+    # bool is not a number
+    ("eq-bool-int", CMP_SEED, _r({"$eq": [True, 1]})),
+    ("ne-bool-int", CMP_SEED, _r({"$ne": [True, 1]})),
+    ("eq-int-double", CMP_SEED, _r({"$eq": [1, 1.0]})),
+    ("in-bool-numbers", CMP_SEED, _r({"$in": [False, {"$literal": [0, 44]}]})),
+    (
+        "setunion-bool-zero",
+        CMP_SEED,
+        _r({"$setUnion": [{"$literal": [0, False]}, {"$literal": [44]}]}),
+    ),
+    # truthiness
+    ("or-empty-string", CMP_SEED, _r({"$or": ""})),
+    ("and-string-field", CMP_SEED, _r({"$and": "$s"})),
+    ("or-missing", CMP_SEED, _r({"$or": "$nosuch"})),
+    ("and-missing", CMP_SEED, _r({"$and": "$nosuch"})),
+    ("and-empty-array", CMP_SEED, _r({"$and": []})),
+    ("or-empty-array", CMP_SEED, _r({"$or": []})),
+    ("and-zero", CMP_SEED, _r({"$and": 0})),
+    ("cond-empty-string", CMP_SEED, _r({"$cond": ["", "T", "F"]})),
+    ("not-empty-string", CMP_SEED, _r({"$not": ""})),
+    ("tobool-empty-string", CMP_SEED, _r({"$toBool": ""})),
+    # short-circuiting, which the fix must not lose
+    ("sc-and-false-hides-error", CMP_SEED, _r({"$and": [False, {"$divide": ["$n", "$z0"]}]})),
+    (
+        "sc-or-true-hides-error",
+        CMP_SEED,
+        _r({"$or": [{"$lt": ["$n", 5]}, {"$divide": ["$n", "$z0"]}]}),
+    ),
+    (
+        "sc-and-true-raises",
+        CMP_SEED,
+        _r({"$and": [{"$lt": ["$n", 5]}, {"$divide": ["$n", "$z0"]}]}),
+    ),
+]
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
@@ -2027,6 +2102,7 @@ ALL_CASES = (
     + [("undefvar", c) for c in UNDEFVAR_CASES]
     + [("remove", c) for c in REMOVE_CASES]
     + [("propagate", c) for c in PROPAGATE_CASES]
+    + [("exprcmp", c) for c in EXPRCMP_CASES]
 )
 
 

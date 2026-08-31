@@ -19,6 +19,7 @@ from secantus.expressions import (
     _bool,
     _bson_type_name,
     _fmt_double,
+    _set_eq,
     evaluate,
     evaluate_or_missing,
 )
@@ -1912,7 +1913,11 @@ def _acc_add_to_set(
 ) -> None:
     seen = bucket.setdefault(field, [])
     v = evaluate_or_missing(arg, doc, vars)
-    if v is not MISSING and v not in seen:
+    # `not in` uses Python equality, where `False == 0`, so a set containing
+    # both `0` and `false` collapsed to one element. mongod keeps them apart --
+    # they are different BSON types. `_set_eq` is the rule the `$set*` operators
+    # already used; the accumulator did not.
+    if v is not MISSING and not any(_set_eq(v, x) for x in seen):
         seen.append(v)
 
 
