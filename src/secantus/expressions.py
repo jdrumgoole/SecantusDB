@@ -1289,9 +1289,8 @@ def _trig_coerce(name: str, v: Any, code: int = 28765) -> float:
 
 #: Decimal128 implementations of the HYPERBOLIC functions, as exact identities
 #: over `exp` / `ln` / `sqrt` -- all of which `decimal` provides, so these carry
-#: the full 34 digits mongod does. The CIRCULAR functions (sin / cos / tan and
-#: their inverses) have no such identity and would need series expansions; they
-#: still narrow to `float`. See `tasks/backlog.md`.
+#: the full 34 digits mongod does. The CIRCULAR functions have no such identity
+#: and are summed as series below.
 #: Working precision for the circular functions below. `decimal` supplies
 #: `exp` / `ln` / `sqrt` -- which is all the hyperbolics need -- but nothing
 #: for sin / cos / tan / atan, so those are summed here. The series are
