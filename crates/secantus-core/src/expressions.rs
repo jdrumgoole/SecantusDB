@@ -160,11 +160,16 @@ fn resolve_var(name: &str, ctx: &Ctx) -> R {
         v.clone()
     } else if base == "ROOT" || base == "CURRENT" {
         Bson::Document(ctx.doc.clone())
-    } else if matches!(base, "KEEP" | "PRUNE" | "DESCEND") {
-        // $redact sentinels: the evaluator returns the `"$$NAME"` string so the
-        // `$redact` stage can dispatch on equality (mirrors `expressions`).
-        Bson::String(format!("$${base}"))
     } else {
+        // `$$KEEP` / `$$PRUNE` / `$$DESCEND` deliberately fall through here.
+        // They are NOT globally-defined variables: mongod binds them only while
+        // evaluating a `$redact` expression and answers `Use of undefined
+        // variable: KEEP` (17276) anywhere else -- probed on 8.2.11. This used
+        // to hand back the string `"$$KEEP"` for any of them, which leaked an
+        // internal marker into user output and made a STORED string equal to
+        // `"$$KEEP"` indistinguishable from the sentinel, so `$redact: "$field"`
+        // over caller-controlled content kept a document mongod refuses to.
+        // `aggregate::redact_stage` binds them for its own evaluation.
         // $$REMOVE (tied to unported $setField/$project-remove) and undefined
         // vars (Python raises) -> Python.
         return Err(Fallback);

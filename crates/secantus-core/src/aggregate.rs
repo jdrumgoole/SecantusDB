@@ -166,24 +166,73 @@ fn apply_stage(
 /// `aggregate._stage_redact`; a missing/empty expression or a non-sentinel result
 /// defers (Python raises).
 fn redact_stage(spec: &Bson, docs: Vec<Document>, vars: &Document) -> R<Vec<Document>> {
-    if matches!(spec, Bson::Document(d) if d.is_empty()) {
-        return Err(Fallback);
-    }
+    // No empty-spec special case: mongod evaluates `{}` (and `null`) like any
+    // other expression and reports the RESULT as a non-sentinel, not the spec
+    // as missing. Probed on 8.2.11.
+    let vars = redact_vars(vars);
     let mut out = Vec::with_capacity(docs.len());
     for doc in docs {
-        if let Some(r) = redact_subdoc(&doc, spec, vars)? {
+        if let Some(r) = redact_subdoc(&doc, spec, &vars)? {
             out.push(r);
         }
     }
     Ok(out)
 }
 
+/// `$redact`'s decision markers, bound only for the duration of its own
+/// evaluation — which is what mongod does. Outside `$redact` these names are
+/// undefined variables (17276), so they cannot leak into user output, and the
+/// stage dispatches on the marker rather than on the string `"$$KEEP"`, so a
+/// stored string can no longer impersonate a decision.
+///
+/// Comparison is by VALUE here (vars live in a BSON document), where the Python
+/// port compares by identity. The payloads are deliberately distinctive, so a
+/// stored Binary is the only collision — the same assumption mongod makes about
+/// its internal constants. Keep the payloads identical across the two ports.
+fn redact_marker(name: &str) -> Bson {
+    Bson::Binary(bson::Binary {
+        subtype: bson::spec::BinarySubtype::UserDefined(0x80),
+        bytes: format!("$redact.{name}").into_bytes(),
+    })
+}
+
+fn redact_vars(vars: &Document) -> Document {
+    let mut v = vars.clone();
+    for name in ["KEEP", "PRUNE", "DESCEND"] {
+        v.insert(name, redact_marker(name));
+    }
+    v
+}
+
+/// The decision a `$redact` expression produced, or the offending value.
+enum Decision {
+    Keep,
+    Prune,
+    Descend,
+    Other(Bson),
+}
+
+fn redact_decide(doc: &Document, spec: &Bson, vars: &Document) -> R<Decision> {
+    let v = evaluate(spec, doc, vars)?;
+    Ok(if v == redact_marker("KEEP") {
+        Decision::Keep
+    } else if v == redact_marker("PRUNE") {
+        Decision::Prune
+    } else if v == redact_marker("DESCEND") {
+        Decision::Descend
+    } else {
+        Decision::Other(v)
+    })
+}
+
 fn redact_subdoc(doc: &Document, spec: &Bson, vars: &Document) -> R<Option<Document>> {
-    match evaluate(spec, doc, vars)?.as_str() {
-        Some("$$KEEP") => Ok(Some(doc.clone())),
-        Some("$$PRUNE") => Ok(None),
-        Some("$$DESCEND") => Ok(Some(redact_descend(doc, spec, vars)?)),
-        _ => Err(Fallback), // non-sentinel result -> Python raises
+    match redact_decide(doc, spec, vars)? {
+        Decision::Keep => Ok(Some(doc.clone())),
+        Decision::Prune => Ok(None),
+        Decision::Descend => Ok(Some(redact_descend(doc, spec, vars)?)),
+        // Nameable at the command layer as mongod's 17053 — see
+        // [`redact_runtime_error`], which recovers the offending value.
+        Decision::Other(_) => Err(Fallback),
     }
 }
 
@@ -197,18 +246,7 @@ fn redact_descend(doc: &Document, spec: &Bson, vars: &Document) -> R<Document> {
                 }
             }
             Bson::Array(arr) => {
-                let mut new_list = Vec::with_capacity(arr.len());
-                for elem in arr {
-                    match elem {
-                        Bson::Document(sub) => {
-                            if let Some(r) = redact_subdoc(sub, spec, vars)? {
-                                new_list.push(Bson::Document(r));
-                            }
-                        }
-                        other => new_list.push(other.clone()),
-                    }
-                }
-                out.insert(k, Bson::Array(new_list));
+                out.insert(k, Bson::Array(redact_list(arr, spec, vars)?));
             }
             other => {
                 out.insert(k, other.clone());
@@ -216,6 +254,127 @@ fn redact_descend(doc: &Document, spec: &Bson, vars: &Document) -> R<Document> {
         }
     }
     Ok(out)
+}
+
+/// Redact one array, recursing into NESTED arrays as mongod does.
+///
+/// This walked only the top level, so a sub-document one array deeper —
+/// `[[{lvl: 9}]]` — was passed through untouched and returned to the caller.
+/// mongod prunes it and leaves the inner array in place (`[[]]`).
+fn redact_list(values: &[Bson], spec: &Bson, vars: &Document) -> R<Vec<Bson>> {
+    let mut out = Vec::with_capacity(values.len());
+    for elem in values {
+        match elem {
+            Bson::Document(sub) => {
+                if let Some(r) = redact_subdoc(sub, spec, vars)? {
+                    out.push(Bson::Document(r));
+                }
+            }
+            Bson::Array(inner) => out.push(Bson::Array(redact_list(inner, spec, vars)?)),
+            other => out.push(other.clone()),
+        }
+    }
+    Ok(out)
+}
+
+/// mongod's `Value::toString` — the rendering `$redact`'s 17053 uses.
+///
+/// NOT the shell form `argtypes::render_stage_value` produces: no inner spaces
+/// in containers (`{k: 1}` / `[1, "a"]`), an ObjectId bare rather than
+/// `ObjectId('…')`, and a date as ISO-8601 rather than `new Date(<ms>)`. Two
+/// renderers, both mongod's, used by different messages — probed on 8.2.11.
+pub fn render_value_compact(v: &Bson) -> String {
+    match v {
+        Bson::Null => "null".to_string(),
+        Bson::Boolean(b) => b.to_string(),
+        Bson::String(s) => format!("\"{s}\""),
+        Bson::Int32(n) => n.to_string(),
+        Bson::Int64(n) => n.to_string(),
+        Bson::Double(d) => {
+            if d.fract() == 0.0 && d.is_finite() {
+                format!("{}", *d as i64)
+            } else {
+                d.to_string()
+            }
+        }
+        Bson::Decimal128(d) => d.to_string(),
+        Bson::ObjectId(oid) => oid.to_hex(),
+        // mongod always renders exactly three fractional digits and a `Z`.
+        // RFC-3339 formatting omits the fraction when it is zero, which showed
+        // up as `2026-01-02T03:04:05Z` against mongod's `...05.000Z`.
+        Bson::DateTime(d) => {
+            let ms = d.timestamp_millis();
+            let secs = ms.div_euclid(1000);
+            let frac = ms.rem_euclid(1000);
+            match bson::DateTime::from_millis(secs * 1000).try_to_rfc3339_string() {
+                Ok(base) => {
+                    let stem = base
+                        .split_once('.')
+                        .map(|(head, _)| head.to_string())
+                        .unwrap_or_else(|| base.trim_end_matches('Z').replace("+00:00", ""));
+                    format!("{stem}.{frac:03}Z")
+                }
+                Err(_) => format!("{d:?}"),
+            }
+        }
+        Bson::Array(a) => format!(
+            "[{}]",
+            a.iter()
+                .map(render_value_compact)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Bson::Document(d) => format!(
+            "{{{}}}",
+            d.iter()
+                .map(|(k, v)| format!("{k}: {}", render_value_compact(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Name a `$redact` failure that the engine could only signal as `Fallback`.
+///
+/// The `update::arith_type_error` template: a standalone validator that names
+/// the errors it *can* name, leaving `Fallback` for genuinely unimplemented
+/// constructs. It exists because `Fallback` is a unit struct carrying no code —
+/// widening it would touch 34 construction sites in this file plus the PyO3
+/// boundary, and on the Python server `Fallback` legitimately means "the pure
+/// engine runs instead". On a server with no Python it became a generic
+/// `BadValue`, which is what `$redact`'s 17053 surfaced as.
+///
+/// Re-runs the stages preceding each `$redact` so the decision is evaluated
+/// against the documents that stage would actually have seen, then returns
+/// mongod's `(code, errmsg)` for the first non-sentinel result.
+pub fn redact_runtime_error(
+    docs: &[Document],
+    stages: &[Bson],
+    vars: &Document,
+    collation: Option<&Collation>,
+) -> Option<(i32, String)> {
+    for (i, stage) in stages.iter().enumerate() {
+        let Bson::Document(d) = stage else { continue };
+        let Some(spec) = d.get("$redact") else {
+            continue;
+        };
+        let input = apply_pipeline(docs.to_vec(), &stages[..i], vars, collation).ok()?;
+        let rvars = redact_vars(vars);
+        for doc in &input {
+            if let Ok(Decision::Other(v)) = redact_decide(doc, spec, &rvars) {
+                return Some((
+                    17053,
+                    format!(
+                        "$redact's expression should not return anything aside from the \
+                         variables $$KEEP, $$DESCEND, and $$PRUNE, but returned {}",
+                        render_value_compact(&v)
+                    ),
+                ));
+            }
+        }
+    }
+    None
 }
 
 fn facet_stage(
@@ -719,5 +878,91 @@ mod tests {
             ),
             vec![doc! {"_id": 1, "t": 9, "i": 0i32}]
         );
+    }
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::*;
+    use bson::doc;
+
+    fn run(spec: Bson, doc_in: Document) -> R<Vec<Document>> {
+        redact_stage(&spec, vec![doc_in], &Document::new())
+    }
+
+    /// The bug this whole slice exists for: a STORED string must not be
+    /// mistaken for the `$$KEEP` decision.
+    #[test]
+    fn a_stored_string_cannot_impersonate_a_decision() {
+        let d = doc! {"_id": 1, "tag": "$$KEEP", "secret": "s"};
+        assert!(run(Bson::String("$tag".into()), d).is_err());
+        // The real variable still works.
+        let d = doc! {"_id": 1};
+        assert_eq!(
+            run(Bson::String("$$KEEP".into()), d.clone()).unwrap(),
+            vec![d]
+        );
+    }
+
+    #[test]
+    fn descend_recurses_into_nested_arrays() {
+        let spec: Bson = bson::from_document(doc! {
+            "$cond": [{"$lte": [{"$ifNull": ["$lvl", 0]}, 3]}, "$$DESCEND", "$$PRUNE"]
+        })
+        .unwrap();
+        let d = doc! {"_id": 1, "lvl": 1, "n": [[{"lvl": 9, "x": 1}], {"lvl": 1, "y": 2}]};
+        // The level-9 sub-doc is pruned; its (now empty) inner array remains.
+        assert_eq!(
+            run(spec, d).unwrap(),
+            vec![doc! {"_id": 1, "lvl": 1, "n": [[], {"lvl": 1, "y": 2}]}]
+        );
+    }
+
+    #[test]
+    fn the_decision_names_are_undefined_outside_redact() {
+        // Not bound globally: evaluating them without the redact bindings defers.
+        let r = expressions::evaluate(&doc! {}, &Bson::String("$$KEEP".into()), &Document::new());
+        assert!(r.is_err());
+    }
+
+    /// mongod's compact `Value::toString`, which is NOT the shell rendering.
+    #[test]
+    fn the_17053_value_rendering_is_mongods_compact_form() {
+        assert_eq!(render_value_compact(&Bson::Int32(5)), "5");
+        assert_eq!(render_value_compact(&Bson::String("x".into())), "\"x\"");
+        assert_eq!(render_value_compact(&Bson::Boolean(true)), "true");
+        assert_eq!(render_value_compact(&Bson::Null), "null");
+        // No inner spaces, unlike `argtypes::render_stage_value`.
+        assert_eq!(
+            render_value_compact(&Bson::Document(doc! {"k": 1, "j": "s"})),
+            "{k: 1, j: \"s\"}"
+        );
+        assert_eq!(
+            render_value_compact(&Bson::Array(vec![Bson::Int32(1), Bson::String("a".into())])),
+            "[1, \"a\"]"
+        );
+        // A bare ObjectId, and a date with exactly three fractional digits.
+        let oid = bson::oid::ObjectId::parse_str("64b7f9a2c1d2e3f4a5b6c7d8").unwrap();
+        assert_eq!(
+            render_value_compact(&Bson::ObjectId(oid)),
+            "64b7f9a2c1d2e3f4a5b6c7d8"
+        );
+        let dt = bson::DateTime::from_millis(1_767_323_045_000);
+        assert_eq!(
+            render_value_compact(&Bson::DateTime(dt)),
+            "2026-01-02T03:04:05.000Z"
+        );
+    }
+
+    #[test]
+    fn the_runtime_error_names_mongods_code_and_value() {
+        let stages = vec![Bson::Document(doc! {"$redact": 5})];
+        let (code, msg) = redact_runtime_error(&[doc! {"_id": 1}], &stages, &Document::new(), None)
+            .expect("expected a named error");
+        assert_eq!(code, 17053);
+        assert!(msg.ends_with("but returned 5"), "{msg}");
+        // A well-formed $redact names nothing.
+        let ok = vec![Bson::Document(doc! {"$redact": "$$KEEP"})];
+        assert!(redact_runtime_error(&[doc! {"_id": 1}], &ok, &Document::new(), None).is_none());
     }
 }

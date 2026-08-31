@@ -773,6 +773,8 @@ fn run_segmented(
     cmd_doc: &Document,
     client_metadata: Option<&Document>,
 ) -> Result<Vec<Document>, CommandError> {
+    // mongod names the namespace in an execution-time aggregate error.
+    let ns = format!("{db}.{}", coll.unwrap_or(""));
     let mut docs = input;
     let mut buffer: Vec<Bson> = Vec::new();
     for stage in pipeline {
@@ -783,7 +785,7 @@ fn run_segmented(
             // only allows it first in a collectionless aggregate; run any buffered
             // stages first so ordering errors still surface in order.
             if !buffer.is_empty() {
-                let _ = core_run(docs, &buffer, vars, collation)?;
+                let _ = core_run(docs, &buffer, vars, collation, Some(&ns))?;
                 buffer.clear();
             }
             let spec = stage.as_document().and_then(|d| d.get(name));
@@ -794,13 +796,13 @@ fn run_segmented(
             // stages first so a malformed earlier stage still errors in order,
             // matching Python; the source stage replaces the docs regardless.
             if !buffer.is_empty() {
-                let _ = core_run(docs, &buffer, vars, collation)?;
+                let _ = core_run(docs, &buffer, vars, collation, Some(&ns))?;
                 buffer.clear();
             }
             docs = apply_source_stage(name, db, coll, cmd_doc, client_metadata);
         } else if is_storage_backed(name) {
             if !buffer.is_empty() {
-                docs = core_run(docs, &buffer, vars, collation)?;
+                docs = core_run(docs, &buffer, vars, collation, Some(&ns))?;
                 buffer.clear();
             }
             let spec = stage.as_document().and_then(|d| d.get(name)).cloned();
@@ -821,7 +823,7 @@ fn run_segmented(
         }
     }
     if !buffer.is_empty() {
-        docs = core_run(docs, &buffer, vars, collation)?;
+        docs = core_run(docs, &buffer, vars, collation, Some(&ns))?;
     }
     Ok(docs)
 }
@@ -856,8 +858,33 @@ fn core_run(
     stages: &[Bson],
     vars: &Document,
     collation: Option<&Collation>,
+    ns: Option<&str>,
 ) -> Result<Vec<Document>, CommandError> {
+    // A `$redact` in the pipeline can fail at RUNTIME with an error mongod
+    // names (17053) that the engine can only signal as `Fallback` — kept for
+    // the retry below, which needs the input documents the engine consumes.
+    let nameable = stages
+        .iter()
+        .any(|s| matches!(s, Bson::Document(d) if d.contains_key("$redact")));
+    let saved = nameable.then(|| docs.clone());
     secantus_core::aggregate::apply_pipeline(docs, stages, vars, collation).map_err(|_| {
+        if let Some(docs) = saved {
+            if let Some((code, errmsg)) =
+                secantus_core::aggregate::redact_runtime_error(&docs, stages, vars, collation)
+            {
+                // An EXECUTION-time failure, so mongod wraps it. This server
+                // had no executor wrapper at all; the Python one applies it to
+                // any `exec_error` raise.
+                let errmsg = match ns {
+                    Some(ns) => format!(
+                        "Executor error during aggregate command on namespace: \
+                         {ns} :: caused by :: {errmsg}"
+                    ),
+                    None => errmsg,
+                };
+                return CommandError::new(code, format!("Location{code}"), errmsg);
+            }
+        }
         CommandError::new(
             2,
             "BadValue",
@@ -1899,7 +1926,8 @@ fn apply_merge(
                         // incoming doc bound to `$$new`; the result replaces it
                         // (existing `_id` preserved).
                         let pvars = doc! { "new": Bson::Document(d.clone()) };
-                        let result = core_run(vec![existing.clone()], pipeline, &pvars, None)?;
+                        let result =
+                            core_run(vec![existing.clone()], pipeline, &pvars, None, None)?;
                         let mut newdoc = result.into_iter().next().unwrap_or(existing);
                         newdoc.insert("_id", existing_id);
                         storage

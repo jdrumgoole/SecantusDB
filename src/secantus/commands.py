@@ -6137,11 +6137,43 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     try:
         docs = apply_pipeline(docs, pipeline, pipeline_ctx)
     except (AggregateError, ExpressionError) as exc:
-        # Only EXECUTION-time failures take the prefix; parse errors stay bare
-        # (probed 8.2.1 -- see AggregateError.exec_error). ExpressionError is
-        # evaluation by definition, so it always qualifies. Deliberately applied
-        # HERE and not in ``dispatch``: the prefix names the namespace, and
-        # ``$expr`` in a plain ``find`` must not pick it up.
+        # Only EXECUTION-time failures take the executor prefix; parse errors
+        # stay bare (probed 8.2.1 -- see AggregateError.exec_error).
+        #
+        # An ExpressionError does NOT qualify, though this used to assert it did
+        # ("evaluation by definition, so it always qualifies"). Probed on
+        # 8.2.11: mongod gives an undefined-variable error inside `$project` /
+        # `$addFields` / `$set` the wrapper `Invalid $<stage> :: caused by ::`,
+        # and inside `$group` / `$replaceRoot` / `$redact` / `$bucket` /
+        # `$sortByCount` / `$match` no wrapper at all. We applied the executor
+        # prefix to all of them. `aggregate._apply_stage` tags the stage.
+        #
+        # Deliberately applied HERE and not in ``dispatch``: the prefix names
+        # the namespace, and ``$expr`` in a plain ``find`` must not pick it up.
+        if isinstance(exc, ExpressionError) and getattr(exc, "code", None) == 17276:
+            # An UNDEFINED VARIABLE is decidable without a document, so mongod
+            # reports it at parse time and never gives it the executor prefix:
+            # `Invalid $<stage> :: caused by ::` inside `$project` / `$addFields`
+            # / `$set`, and a bare message everywhere else. Probed on 8.2.11.
+            #
+            # Narrow to 17276 on purpose. The other expression failures are
+            # decided by WHEN mongod could evaluate them -- an all-constant
+            # `$switch` folds at optimization time (`Failed to optimize pipeline
+            # :: caused by ::`) while one reading a field fails at execution
+            # (the executor prefix). Modelling that split is the constant-folding
+            # item deferred in `tasks/remaining-work-plan.md` §1b; a first cut of
+            # this branch covered every ExpressionError and broke the `$switch`
+            # differential case doing it.
+            stage_name = getattr(exc, "stage_name", "") or ""
+            _code = 17276
+            errmsg = f"Invalid {stage_name} :: caused by :: {exc}" if stage_name else str(exc)
+            return {
+                "ok": 0.0,
+                "errmsg": errmsg,
+                "code": _code,
+                "codeName": getattr(exc, "code_name", None) or _code_name_for(_code),
+            }
+        # Every other ExpressionError keeps the executor prefix it had.
         if not (isinstance(exc, ExpressionError) or getattr(exc, "exec_error", False)):
             raise
         _code = getattr(exc, "code", None) or 14
