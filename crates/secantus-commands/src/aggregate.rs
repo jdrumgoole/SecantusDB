@@ -121,14 +121,11 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             Some(Bson::Document(d)) => d.keys().cloned().collect(),
             _ => Vec::new(),
         };
-        if let Some((var, stage)) = argtypes::undefined_variable_error(&pipeline, &bound) {
-            let msg = format!("Use of undefined variable: {var}");
-            let errmsg = if stage.is_empty() {
-                msg
-            } else {
-                format!("Invalid {stage} :: caused by :: {msg}")
-            };
-            return Ok(CommandError::new(17276, "Location17276", errmsg).into_reply());
+        if let Some((code, msg, stage)) =
+            argtypes::expression_problem_in_pipeline(&pipeline, &bound)
+        {
+            let errmsg = argtypes::wrap_expression_problem(&msg, &stage);
+            return Ok(CommandError::new(code, format!("Location{code}"), errmsg).into_reply());
         }
     }
     // A wrong-TYPED stage spec: name it with mongod's own code rather than

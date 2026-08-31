@@ -30,12 +30,8 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             _ => Vec::new(),
         };
         if let Some(Bson::Document(f)) = doc.get("query") {
-            if let Some(var) = argtypes::undefined_variable_in_filter(f, &bound) {
-                return Err(CommandError::new(
-                    17276,
-                    "Location17276",
-                    argtypes::undefined_variable_message(&var, ""),
-                ));
+            if let Some((code, msg)) = argtypes::expression_problem_in_filter(f, &bound) {
+                return Err(CommandError::new(code, format!("Location{code}"), msg));
             }
         }
     }

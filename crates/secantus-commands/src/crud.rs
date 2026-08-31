@@ -439,11 +439,11 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 _ => Vec::new(),
             };
             if let Some(Bson::Document(q)) = spec.get("q") {
-                if let Some(var) = argtypes::undefined_variable_in_filter(q, &bound) {
+                if let Some((code, msg)) = argtypes::expression_problem_in_filter(q, &bound) {
                     write_errors.push(Bson::Document(doc! {
                         "index": index as i32,
-                        "code": 17276,
-                        "errmsg": argtypes::undefined_variable_message(&var, ""),
+                        "code": code,
+                        "errmsg": msg,
                     }));
                     if ordered {
                         break;
@@ -509,12 +509,8 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             _ => Vec::new(),
         };
         if let Some(Bson::Document(f)) = doc.get("query") {
-            if let Some(var) = argtypes::undefined_variable_in_filter(f, &bound) {
-                return Err(CommandError::new(
-                    17276,
-                    "Location17276",
-                    argtypes::undefined_variable_message(&var, ""),
-                ));
+            if let Some((code, msg)) = argtypes::expression_problem_in_filter(f, &bound) {
+                return Err(CommandError::new(code, format!("Location{code}"), msg));
             }
         }
     }
@@ -826,20 +822,19 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 _ => Vec::new(),
             };
             let found = match spec.get("q") {
-                Some(Bson::Document(q)) => {
-                    argtypes::undefined_variable_in_filter(q, &bound).map(|v| (v, String::new()))
-                }
+                Some(Bson::Document(q)) => argtypes::expression_problem_in_filter(q, &bound)
+                    .map(|(c, m)| (c, m, String::new())),
                 _ => None,
             }
             .or_else(|| {
                 spec.get("u")
-                    .and_then(|u| argtypes::undefined_variable_in_update(u, &bound))
+                    .and_then(|u| argtypes::expression_problem_in_update(u, &bound))
             });
-            if let Some((var, stage)) = found {
+            if let Some((code, msg, stage)) = found {
                 write_errors.push(Bson::Document(doc! {
                     "index": index as i32,
-                    "code": 17276,
-                    "errmsg": argtypes::undefined_variable_message(&var, &stage),
+                    "code": code,
+                    "errmsg": argtypes::wrap_expression_problem(&msg, &stage),
                 }));
                 if ordered {
                     break;

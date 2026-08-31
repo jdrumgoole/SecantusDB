@@ -20,10 +20,10 @@ from secantus.aggregate import (
     _fmt_stage_val,
     _geo_near_index_filter,
     apply_pipeline,
-    undefined_variable_in_filter,
-    undefined_variable_in_pipeline,
-    undefined_variable_message,
+    expression_problem_in_filter,
+    expression_problem_in_pipeline,
     validate_stage_names,
+    wrap_expression_problem,
 )
 from secantus.auth import (
     MONGODB_X509,
@@ -2330,6 +2330,18 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.query import QueryError
     from secantus.storage import BadHint, MinMaxKeyError
 
+    # An undefined `$$variable` or a wrong argument count is a PARSE error to
+    # mongod -- it fires on an EMPTY collection, where nothing is evaluated, so
+    # relying on the evaluator to raise was never enough.
+    _uv_bound = frozenset(_l) if isinstance(_l := doc.get("let"), Mapping) else frozenset()
+    _uv = expression_problem_in_filter(doc.get("filter"), _uv_bound)
+    if _uv is not None:
+        return {
+            "ok": 0.0,
+            "errmsg": _uv[1],
+            "code": _uv[0],
+            "codeName": f"Location{_uv[0]}",
+        }
     coll = doc["find"]
     _err = _require_hint_type(doc)
     if _err is not None:
@@ -2799,18 +2811,16 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # statement in the batch still applies, `n: 1` with the error at
         # `index: 1`). We raised it as a COMMAND error, failing the whole batch.
         _uv_bound = frozenset(_let) if isinstance(_let := doc.get("let"), Mapping) else frozenset()
-        _uv = undefined_variable_in_filter(spec.get("q"), _uv_bound)
-        _uv_stage = ""
+        _uv = expression_problem_in_filter(spec.get("q"), _uv_bound)
+        _uv = (_uv[0], _uv[1], "") if _uv else None
         if _uv is None and isinstance(spec.get("u"), list):
-            _found = undefined_variable_in_pipeline(spec.get("u"), _uv_bound)
-            if _found is not None:
-                _uv, _uv_stage = _found
+            _uv = expression_problem_in_pipeline(spec.get("u"), _uv_bound)
         if _uv is not None:
             write_errors.append(
                 {
                     "index": index,
-                    "code": 17276,
-                    "errmsg": undefined_variable_message(_uv, _uv_stage),
+                    "code": _uv[0],
+                    "errmsg": wrap_expression_problem(_uv[1], _uv[2]),
                 }
             )
             if ordered:
@@ -3322,11 +3332,9 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # per-statement writeError carrying mongod's 17276, not a command error
         # that fails the whole batch.
         _uv_bound = frozenset(_l) if isinstance(_l := doc.get("let"), Mapping) else frozenset()
-        _uv = undefined_variable_in_filter(spec.get("q"), _uv_bound)
+        _uv = expression_problem_in_filter(spec.get("q"), _uv_bound)
         if _uv is not None:
-            write_errors.append(
-                {"index": index, "code": 17276, "errmsg": undefined_variable_message(_uv, "")}
-            )
+            write_errors.append({"index": index, "code": _uv[0], "errmsg": _uv[1]})
             if ordered:
                 break
             continue
@@ -3356,6 +3364,18 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
 
 def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    # An undefined `$$variable` or a wrong argument count is a PARSE error to
+    # mongod -- it fires on an EMPTY collection, where nothing is evaluated, so
+    # relying on the evaluator to raise was never enough.
+    _uv_bound = frozenset(_l) if isinstance(_l := doc.get("let"), Mapping) else frozenset()
+    _uv = expression_problem_in_filter(doc.get("query"), _uv_bound)
+    if _uv is not None:
+        return {
+            "ok": 0.0,
+            "errmsg": _uv[1],
+            "code": _uv[0],
+            "codeName": f"Location{_uv[0]}",
+        }
     coll = doc["count"]
     _err = _require_object_bson_field(doc.get("query"), "count.query")
     if _err is not None:
@@ -3427,6 +3447,18 @@ def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.collation import parse as _parse_collation
     from secantus.paths import get_path
 
+    # An undefined `$$variable` or a wrong argument count is a PARSE error to
+    # mongod -- it fires on an EMPTY collection, where nothing is evaluated, so
+    # relying on the evaluator to raise was never enough.
+    _uv_bound = frozenset(_l) if isinstance(_l := doc.get("let"), Mapping) else frozenset()
+    _uv = expression_problem_in_filter(doc.get("query"), _uv_bound)
+    if _uv is not None:
+        return {
+            "ok": 0.0,
+            "errmsg": _uv[1],
+            "code": _uv[0],
+            "codeName": f"Location{_uv[0]}",
+        }
     coll = doc["distinct"]
     _err = _require_object_bson_field(doc.get("collation"), "distinctCommandRequest.collation")
     if _err is not None:
@@ -4267,17 +4299,16 @@ def _find_and_modify_impl(doc: dict[str, Any], ctx: CommandContext) -> dict[str,
     # `update` carries mongod's `Invalid $<stage> :: caused by ::` wrapper; the
     # query filter never does. We reported the bare message for both.
     _uv_bound = frozenset(_l) if isinstance(_l := doc.get("let"), Mapping) else frozenset()
-    _uv, _uv_stage = undefined_variable_in_filter(doc.get("query"), _uv_bound), ""
+    _uv = expression_problem_in_filter(doc.get("query"), _uv_bound)
+    _uv = (_uv[0], _uv[1], "") if _uv else None
     if _uv is None and isinstance(doc.get("update"), list):
-        _found = undefined_variable_in_pipeline(doc.get("update"), _uv_bound)
-        if _found is not None:
-            _uv, _uv_stage = _found
+        _uv = expression_problem_in_pipeline(doc.get("update"), _uv_bound)
     if _uv is not None:
         return {
             "ok": 0.0,
-            "errmsg": undefined_variable_message(_uv, _uv_stage),
-            "code": 17276,
-            "codeName": "Location17276",
+            "errmsg": wrap_expression_problem(_uv[1], _uv[2]),
+            "code": _uv[0],
+            "codeName": f"Location{_uv[0]}",
         }
     _err = _unknown_find_and_modify_field(doc)
     if _err is not None:
@@ -6257,17 +6288,16 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # EMPTY collection, where nothing is ever evaluated, so the evaluator alone
     # could not produce it. Checked here, once, before the pipeline runs.
     _cmd_let = doc.get("let")
-    _found = undefined_variable_in_pipeline(
+    _found = expression_problem_in_pipeline(
         pipeline, frozenset(_cmd_let) if isinstance(_cmd_let, Mapping) else frozenset()
     )
     if _found is not None:
-        _var, _stage = _found
-        _msg = f"Use of undefined variable: {_var}"
+        _code, _msg, _stage = _found
         return {
             "ok": 0.0,
-            "errmsg": f"Invalid {_stage} :: caused by :: {_msg}" if _stage else _msg,
-            "code": 17276,
-            "codeName": "Location17276",
+            "errmsg": wrap_expression_problem(_msg, _stage),
+            "code": _code,
+            "codeName": f"Location{_code}",
         }
     hint = doc.get("hint")
     # ``let`` user-vars threaded into the pipeline context so
