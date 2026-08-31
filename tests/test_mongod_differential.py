@@ -2273,6 +2273,65 @@ DECIMAL_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ("eq-decimal-int", DEC_SEED, _d({"$eq": [Decimal128("2"), 2]})),
 ]
 
+# Operators whose argument must be a DOCUMENT. 25 of them, 675 shapes, each with
+# mongod's own code and one of FIVE phrasings that are not interchangeable
+# ("found: <T>" / "found <T>" / no type at all). The Rust server answered a
+# generic BadValue (2) for every one; a table is the only thing that reproduces
+# them. Parse-time, like the arity check.
+#
+# The last of the sweep's CRASHES are here too: an unrecognised key in `$cond` /
+# `$dateToString` was a bare KeyError, `{$trunc: []}` an IndexError, and
+# `$exp`/`$sinh`/`$cosh` of a large value an OverflowError — mongod saturates to
+# infinity. That takes the Python server from 274 crashes to zero.
+OBJ_SEED = [{"_id": 1}]
+
+
+def _o(expr: object) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(db, [{"$addFields": {"z": expr}}])
+
+
+OBJECT_ARG_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    # the five phrasings, one operator each
+    ("let-int", OBJ_SEED, _o({"$let": 5})),
+    ("reduce-int", OBJ_SEED, _o({"$reduce": 5})),
+    ("trim-int", OBJ_SEED, _o({"$trim": 5})),
+    ("convert-int", OBJ_SEED, _o({"$convert": 5})),
+    ("dateadd-int", OBJ_SEED, _o({"$dateAdd": 5})),
+    # the type name is rendered per value kind
+    ("reduce-string", OBJ_SEED, _o({"$reduce": "x"})),
+    ("reduce-bool", OBJ_SEED, _o({"$reduce": True})),
+    ("reduce-null", OBJ_SEED, _o({"$reduce": None})),
+    ("reduce-array", OBJ_SEED, _o({"$reduce": [1]})),
+    # a spread of the remaining operators
+    ("filter-int", OBJ_SEED, _o({"$filter": 5})),
+    ("map-int", OBJ_SEED, _o({"$map": 5})),
+    ("switch-int", OBJ_SEED, _o({"$switch": 5})),
+    ("zip-int", OBJ_SEED, _o({"$zip": 5})),
+    ("regexmatch-int", OBJ_SEED, _o({"$regexMatch": 5})),
+    ("replaceall-int", OBJ_SEED, _o({"$replaceAll": 5})),
+    ("sortarray-int", OBJ_SEED, _o({"$sortArray": 5})),
+    ("setfield-int", OBJ_SEED, _o({"$setField": 5})),
+    ("datetostring-int", OBJ_SEED, _o({"$dateToString": 5})),
+    ("datetrunc-int", OBJ_SEED, _o({"$dateTrunc": 5})),
+    ("datefromstring-int", OBJ_SEED, _o({"$dateFromString": 5})),
+    # parse-time: a missing collection still reports it
+    ("let-int-empty-collection", [], _o({"$let": 5})),
+    # ranged arity
+    ("trunc-zero-args", OBJ_SEED, _o({"$trunc": []})),
+    ("trunc-three-args", OBJ_SEED, _o({"$trunc": [1, 2, 3]})),
+    ("round-zero-args", OBJ_SEED, _o({"$round": []})),
+    ("trunc-two-args-ok", OBJ_SEED, _o({"$trunc": [1.55, 1]})),
+    # unrecognised keys — were bare KeyErrors
+    ("cond-unknown-key", OBJ_SEED, _o({"$cond": {"k": 1}})),
+    ("datetostring-unknown-key", OBJ_SEED, _o({"$dateToString": {"k": 1}})),
+    ("cond-object-ok", OBJ_SEED, _o({"$cond": {"if": True, "then": 1, "else": 2}})),
+    # overflow saturates to infinity
+    ("exp-overflow", OBJ_SEED, _o({"$exp": 1099511627776})),
+    ("sinh-overflow", OBJ_SEED, _o({"$sinh": 1099511627776})),
+    ("cosh-overflow", OBJ_SEED, _o({"$cosh": 1099511627776})),
+    ("sinh-ok", OBJ_SEED, _o({"$sinh": 1})),
+]
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("update", c) for c in UPDATE_CASES]
@@ -2291,6 +2350,7 @@ ALL_CASES = (
     + [("undefvarcmd", c) for c in UNDEFVAR_CMD_CASES]
     + [("arity", c) for c in ARITY_CASES]
     + [("decimal", c) for c in DECIMAL_CASES]
+    + [("objarg", c) for c in OBJECT_ARG_CASES]
 )
 
 

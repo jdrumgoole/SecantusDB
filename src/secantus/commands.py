@@ -2340,7 +2340,7 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "ok": 0.0,
             "errmsg": _uv[1],
             "code": _uv[0],
-            "codeName": f"Location{_uv[0]}",
+            "codeName": _code_name_for(_uv[0]),
         }
     coll = doc["find"]
     _err = _require_hint_type(doc)
@@ -3464,7 +3464,7 @@ def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "ok": 0.0,
             "errmsg": _uv[1],
             "code": _uv[0],
-            "codeName": f"Location{_uv[0]}",
+            "codeName": _code_name_for(_uv[0]),
         }
     coll = doc["count"]
     _err = _require_object_bson_field(doc.get("query"), "count.query")
@@ -3550,7 +3550,7 @@ def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "ok": 0.0,
             "errmsg": _uv[1],
             "code": _uv[0],
-            "codeName": f"Location{_uv[0]}",
+            "codeName": _code_name_for(_uv[0]),
         }
     coll = doc["distinct"]
     _err = _require_object_bson_field(doc.get("collation"), "distinctCommandRequest.collation")
@@ -4559,7 +4559,7 @@ def _find_and_modify_impl(doc: dict[str, Any], ctx: CommandContext) -> dict[str,
             "ok": 0.0,
             "errmsg": wrap_expression_problem(_uv[1], _uv[2]),
             "code": _uv[0],
-            "codeName": f"Location{_uv[0]}",
+            "codeName": _code_name_for(_uv[0]),
         }
     _err = _unknown_find_and_modify_field(doc)
     if _err is not None:
@@ -6554,7 +6554,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "ok": 0.0,
             "errmsg": wrap_expression_problem(_msg, _stage),
             "code": _code,
-            "codeName": f"Location{_code}",
+            "codeName": _code_name_for(_code),
         }
     hint = doc.get("hint")
     # ``let`` user-vars threaded into the pipeline context so

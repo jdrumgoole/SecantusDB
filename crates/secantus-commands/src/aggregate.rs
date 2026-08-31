@@ -125,19 +125,18 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             argtypes::expression_problem_in_pipeline(&pipeline, &bound)
         {
             let errmsg = argtypes::wrap_expression_problem(&msg, &stage);
-            return Ok(CommandError::new(code, format!("Location{code}"), errmsg).into_reply());
+            return Ok(
+                CommandError::new(code, crate::util::error_code_name(code), errmsg).into_reply(),
+            );
         }
     }
     // A wrong-TYPED stage spec: name it with mongod's own code rather than
     // letting the engine's generic `Fallback` surface as BadValue (2). Seven
     // stages, seven codes -- see `crate::argtypes::stage_spec_error`.
     if let Some((code, errmsg)) = argtypes::stage_spec_error(&pipeline) {
-        // 9 is FailedToParse; the rest are mongod's anonymous `Location<n>` codes.
-        let code_name = if code == 9 {
-            "FailedToParse".to_string()
-        } else {
-            format!("Location{code}")
-        };
+        // `error_code_name` knows 9 is FailedToParse; the rest are mongod's
+        // anonymous `Location<n>` codes.
+        let code_name = crate::util::error_code_name(code);
         return Ok(CommandError::new(code, code_name, errmsg).into_reply());
     }
 
@@ -902,7 +901,7 @@ fn core_run(
                     ),
                     None => errmsg,
                 };
-                return CommandError::new(code, format!("Location{code}"), errmsg);
+                return CommandError::new(code, crate::util::error_code_name(code), errmsg);
             }
         }
         CommandError::new(

@@ -510,7 +510,11 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         };
         if let Some(Bson::Document(f)) = doc.get("query") {
             if let Some((code, msg)) = argtypes::expression_problem_in_filter(f, &bound) {
-                return Err(CommandError::new(code, format!("Location{code}"), msg));
+                return Err(CommandError::new(
+                    code,
+                    crate::util::error_code_name(code),
+                    msg,
+                ));
             }
         }
     }

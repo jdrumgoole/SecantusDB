@@ -279,6 +279,106 @@ _FIXED_ARITY: dict[str, int] = {
 _ARITY_ALIASES = {"$substr": "$substrBytes"}
 
 
+#: Operators whose argument must be a DOCUMENT, with mongod's code and wording.
+#: Taken from mongod 8.2.11 one operator at a time -- the five phrasings are its
+#: own and are not interchangeable ("found: {t}" vs "found {t}" vs no type at
+#: all), which is why this is a table rather than one message with the operator
+#: name substituted in.
+#:
+#: Like the arity check, this is a PARSE error: an empty collection reports it.
+_OBJECT_ARG: dict[str, tuple[int, str]] = {
+    "$convert": (9, "$convert expects an object of named arguments but found: {t}"),
+    "$dateAdd": (5166400, "$dateAdd expects an object as its argument"),
+    "$dateDiff": (5166301, "$dateDiff only supports an object as its argument"),
+    "$dateFromParts": (40519, "$dateFromParts only supports an object as its argument"),
+    "$dateFromString": (
+        40540,
+        "$dateFromString only supports an object as an argument, found: {t}",
+    ),
+    "$dateSubtract": (5166400, "$dateSubtract expects an object as its argument"),
+    "$dateToParts": (40524, "$dateToParts only supports an object as its argument"),
+    "$dateToString": (18629, "$dateToString only supports an object as its argument"),
+    "$dateTrunc": (5439007, "$dateTrunc only supports an object as its argument"),
+    "$filter": (28646, "$filter only supports an object as its argument"),
+    "$let": (16874, "$let only supports an object as its argument"),
+    "$ltrim": (50696, "$ltrim only supports an object as an argument, found {t}"),
+    "$map": (16878, "$map only supports an object as its argument"),
+    "$reduce": (40075, "$reduce requires an object as an argument, found: {t}"),
+    "$regexFind": (51103, "$regexFind expects an object of named arguments but found: {t}"),
+    "$regexFindAll": (51103, "$regexFindAll expects an object of named arguments but found: {t}"),
+    "$regexMatch": (51103, "$regexMatch expects an object of named arguments but found: {t}"),
+    "$replaceAll": (51751, "$replaceAll requires an object as an argument, found: {t}"),
+    "$replaceOne": (51751, "$replaceOne requires an object as an argument, found: {t}"),
+    "$rtrim": (50696, "$rtrim only supports an object as an argument, found {t}"),
+    "$setField": (4161100, "$setField only supports an object as its argument"),
+    "$sortArray": (2942500, "$sortArray requires an object as an argument, found: {t}"),
+    "$switch": (40060, "$switch requires an object as an argument, found: {t}"),
+    "$trim": (50696, "$trim only supports an object as an argument, found {t}"),
+    "$zip": (34460, "$zip only supports an object as an argument, found {t}"),
+}
+
+
+#: Operators taking a RANGE of argument counts, with mongod's own 28667.
+_RANGED_ARITY: dict[str, tuple[int, int]] = {"$trunc": (1, 2), "$round": (1, 2)}
+
+
+def _ranged_arity_problem(op: str, arg: Any) -> tuple[int, str] | None:
+    bounds = _RANGED_ARITY.get(op)
+    if bounds is None:
+        return None
+    lo, hi = bounds
+    got = len(arg) if isinstance(arg, list) else 1
+    if lo <= got <= hi:
+        return None
+    # `{$trunc: []}` reached `arg[0]` and raised IndexError -> internal error.
+    return (
+        28667,
+        f"Expression {op} takes at least {lo} arguments, and at most {hi}, "
+        f"but {got} were passed in.",
+    )
+
+
+#: The keys a document-argument operator accepts, with mongod's code and wording
+#: for an unrecognised one. Only the operators whose key set has been probed are
+#: here -- an operator absent from this table is not checked, which is the
+#: conservative direction.
+_OBJECT_KEYS: dict[str, tuple[int, str, tuple[str, ...]]] = {
+    "$cond": (17083, "Unrecognized parameter to $cond: {k}", ("if", "then", "else")),
+    "$dateToString": (
+        18534,
+        "Unrecognized argument to $dateToString: {k}",
+        ("date", "format", "timezone", "onNull"),
+    ),
+}
+
+
+def _object_keys_problem(op: str, arg: Any) -> tuple[int, str] | None:
+    """An unrecognised key in a document-argument operator.
+
+    A PARSE error to mongod, which is why it lives in the walker rather than at
+    the raise site: reported from the operator itself it took the executor
+    wrapper, where mongod uses `Invalid $<stage> :: caused by ::`. It also used
+    to be a bare `KeyError` escaping as `internal server error`.
+    """
+    entry = _OBJECT_KEYS.get(op)
+    if entry is None or not isinstance(arg, Mapping):
+        return None
+    code, template, allowed = entry
+    for key in arg:
+        if key not in allowed:
+            return (code, template.format(k=key))
+    return None
+
+
+def _object_arg_problem(op: str, arg: Any) -> tuple[int, str] | None:
+    """mongod's error when a document-argument operator gets something else."""
+    entry = _OBJECT_ARG.get(op)
+    if entry is None or isinstance(arg, Mapping):
+        return None
+    code, template = entry
+    return (code, template.format(t=_bson_type_name(arg)))
+
+
 def _arity_problem(op: str, arg: Any) -> tuple[int, str] | None:
     """mongod's 16020 when a fixed-arity operator gets the wrong count."""
     want = _FIXED_ARITY.get(op)
@@ -646,8 +746,17 @@ def _op_lte(arg: Any, ctx: _Ctx) -> bool:
 def _op_cond(arg: Any, ctx: _Ctx, ret: _Eval = None) -> Any:
     ret = ret or _eval
     if isinstance(arg, Mapping):
-        condition = _eval(arg["if"], ctx)
-        return ret(arg["then"] if _bool(condition) else arg["else"], ctx)
+        # An unrecognised key is mongod's 17083; a MISSING one is `null` rather
+        # than a `KeyError` escaping as `internal server error`.
+        for key in arg:
+            if key not in ("if", "then", "else"):
+                raise ExpressionError(
+                    f"Unrecognized parameter to $cond: {key}",
+                    code=17083,
+                    code_name="Location17083",
+                )
+        condition = _eval(arg.get("if"), ctx)
+        return ret(arg.get("then") if _bool(condition) else arg.get("else"), ctx)
     if isinstance(arg, list) and len(arg) == 3:
         return ret(arg[1] if _bool(_eval(arg[0], ctx)) else arg[2], ctx)
     raise ExpressionError("$cond requires {if, then, else} or [cond, then, else]")
@@ -882,7 +991,12 @@ def _op_exp(arg: Any, ctx: _Ctx) -> Any:
     _require_math_numeric(v, "$exp")
     if _has_decimal(v):
         return _decimal_result(lambda d: d.exp(), v)
-    return math.exp(v)
+    try:
+        return math.exp(v)
+    except OverflowError:
+        # mongod saturates to infinity; the OverflowError escaped as an
+        # `internal server error`.
+        return math.inf
 
 
 def _op_ln(arg: Any, ctx: _Ctx) -> Any:
@@ -1015,6 +1129,13 @@ def _make_trig(name: str, fn: Any, domain: str) -> Any:
         if domain == "atanh" and abs(x) == 1.0:
             return math.inf if x > 0 else -math.inf
         dec_fn = _DEC_TRIG.get(name)
+        if dec_fn is None or not _has_decimal(v):
+            try:
+                return fn(x)
+            except OverflowError:
+                # `$sinh` / `$cosh` of a large value: mongod saturates to
+                # infinity rather than failing the command.
+                return math.copysign(math.inf, x) if name == "$sinh" else math.inf
         if dec_fn is not None and _has_decimal(v):
             # At decimal128 precision THROUGHOUT, deliberately. Computing wide
             # and rounding back is more accurate and matches mongod LESS: it
@@ -2620,7 +2741,14 @@ def _op_date_to_string(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$dateToString requires {date, format}")
     # A non-date, non-null 'date' is mongod Location16006 (was silently null).
-    d = _coerce_extractor_date(_eval(arg["date"], ctx))
+    for _k in arg:
+        if _k not in ("date", "format", "timezone", "onNull"):
+            raise ExpressionError(
+                f"Unrecognized argument to $dateToString: {_k}",
+                code=18534,
+                code_name="Location18534",
+            )
+    d = _coerce_extractor_date(_eval(arg.get("date"), ctx))
     if d is None:
         return None
     fmt = arg.get("format", "%Y-%m-%dT%H:%M:%S.%LZ")

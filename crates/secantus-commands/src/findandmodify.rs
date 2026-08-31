@@ -50,14 +50,18 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         };
         if let Some(Bson::Document(q)) = doc.get("query") {
             if let Some((code, msg)) = argtypes::expression_problem_in_filter(q, &bound) {
-                return Err(CommandError::new(code, format!("Location{code}"), msg));
+                return Err(CommandError::new(
+                    code,
+                    crate::util::error_code_name(code),
+                    msg,
+                ));
             }
         }
         if let Some(u) = doc.get("update") {
             if let Some((code, msg, stage)) = argtypes::expression_problem_in_update(u, &bound) {
                 return Err(CommandError::new(
                     code,
-                    format!("Location{code}"),
+                    crate::util::error_code_name(code),
                     argtypes::wrap_expression_problem(&msg, &stage),
                 ));
             }
