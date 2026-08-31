@@ -105,28 +105,15 @@ def _addtoset_equal(a: Any, b: Any) -> bool:
 
 
 def _bson_type_name(v: Any) -> str:
-    """mongod's type vocabulary for update parse-error messages."""
-    from bson import Decimal128, Int64
+    """mongod's type vocabulary for update parse-error messages.
 
-    if isinstance(v, bool):
-        return "bool"
-    if isinstance(v, Int64):
-        return "long"
-    if isinstance(v, int):
-        return "int" if -(2**31) <= v < 2**31 else "long"
-    if isinstance(v, float):
-        return "double"
-    if isinstance(v, Decimal128):
-        return "decimal"
-    if isinstance(v, str):
-        return "string"
-    if v is None:
-        return "null"
-    if isinstance(v, Mapping):
-        return "object"
-    if isinstance(v, (list, tuple)):
-        return "array"
-    return type(v).__name__
+    Delegates to `secantus.bsontypes`, which is the single probed copy. This
+    one used to stop at Mapping / list and fall through to the Python class
+    name, so an ObjectId reached the wire as ``'ObjectId'`` for ``objectId``.
+    """
+    from secantus.bsontypes import bson_type_name
+
+    return bson_type_name(v)
 
 
 def _render_bson_scalar(v: Any) -> str:

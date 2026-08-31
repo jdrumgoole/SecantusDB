@@ -470,7 +470,7 @@ def _stage_project(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
-        raise AggregateError("$project requires a document spec")
+        raise AggregateError("$project specification must be an object", code=15969)
     if not spec:
         raise AggregateError(
             "projection specification must have at least one field",
@@ -567,7 +567,10 @@ def _stage_add_fields(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
-        raise AggregateError("$addFields requires a document spec")
+        raise AggregateError(
+            f"$addFields specification stage must be an object, got {_bson_type_name(spec)}",
+            code=40272,
+        )
     return [_add_fields_one(d, spec, ctx.vars) for d in docs]
 
 
@@ -656,7 +659,10 @@ def _stage_densify(
     enumerating millennia.
     """
     if not isinstance(spec, Mapping):
-        raise AggregateError("$densify requires a document spec")
+        raise AggregateError(
+            f"The $densify stage specification must be an object, found {_bson_type_name(spec)}",
+            code=9,
+        )
     field = spec.get("field")
     if not isinstance(field, str):
         raise AggregateError("$densify requires a field name")
@@ -1084,7 +1090,10 @@ def _stage_fill(
     from secantus.storage import sort_docs
 
     if not isinstance(spec, Mapping):
-        raise AggregateError("$fill requires a document spec")
+        raise AggregateError(
+            f"The $fill stage specification must be an object, found {_bson_type_name(spec)}",
+            code=9,
+        )
     output = spec.get("output")
     if not isinstance(output, Mapping) or not output:
         raise AggregateError("$fill requires a non-empty output object")
@@ -1379,7 +1388,13 @@ def _is_constant_expression(expr: Any) -> bool:
 def _stage_replace_root(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    if not isinstance(spec, Mapping) or "newRoot" not in spec:
+    if not isinstance(spec, Mapping):
+        raise AggregateError(
+            f"expected an object as specification for $replaceRoot stage, got "
+            f"{_bson_type_name(spec)}",
+            code=40229,
+        )
+    if "newRoot" not in spec:
         raise AggregateError("$replaceRoot requires {newRoot: <expression>}")
     return [_replace_root_one(d, spec["newRoot"], ctx.vars, "'newRoot' expression") for d in docs]
 
@@ -2492,7 +2507,9 @@ def _stage_sample(
 ) -> list[dict[str, Any]]:
     import random
 
-    if not isinstance(spec, Mapping) or "size" not in spec:
+    if not isinstance(spec, Mapping):
+        raise AggregateError("the $sample stage specification must be an object", code=28745)
+    if "size" not in spec:
         raise AggregateError("$sample requires {size: N}")
     size_raw = spec["size"]
     # mongod: size must be a number (bool rejected) and non-negative; a
@@ -2605,7 +2622,11 @@ def _stage_bucket(
     from secantus.ordering import _SortKey
 
     if not isinstance(spec, Mapping):
-        raise AggregateError("$bucket requires a document spec")
+        raise AggregateError(
+            f"Argument to $bucket stage must be an object, but found type: "
+            f"{_bson_type_name(spec)}.",
+            code=40201,
+        )
     group_by = spec.get("groupBy")
     boundaries = spec.get("boundaries")
     # mongod validates the whole spec before bucketing — several of these were
@@ -3759,7 +3780,11 @@ def _stage_bucket_auto(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
-        raise AggregateError("$bucketAuto requires a document spec")
+        raise AggregateError(
+            f"The argument to $bucketAuto must be an object, but found type: "
+            f"{_bson_type_name(spec)}",
+            code=40240,
+        )
     # mongod: both groupBy and buckets must be present (40246); buckets must be
     # a non-bool numeric value (40241), representable as a 32-bit integer —
     # a whole double is accepted, a fractional double is not (40242) — and
@@ -4092,7 +4117,11 @@ def _stage_set_window_fields(
     from secantus.storage import sort_docs as _sort_docs
 
     if not isinstance(spec, Mapping):
-        raise AggregateError("$setWindowFields requires a doc spec")
+        raise AggregateError(
+            f"the $setWindowFields stage specification must be an object, found "
+            f"{_bson_type_name(spec)}",
+            code=9,
+        )
     # An unknown top-level field was ACCEPTED AND IGNORED, so a caller who
     # misspelled `partitionBy` -- or put `range` at the top level, where it
     # looks plausible but belongs inside a window -- got a silent, wrong answer
@@ -4736,8 +4765,13 @@ def _redact_subdoc(
         return None
     if decision == "$$DESCEND":
         return _redact_descend(doc, spec, ctx)
+    from secantus.update import _render_bson_scalar
+
     raise AggregateError(
-        f"$redact expression must return $$KEEP, $$PRUNE, or $$DESCEND, got {decision!r}"
+        f"$redact's expression should not return anything aside from the variables "
+        f"$$KEEP, $$DESCEND, and $$PRUNE, but returned {_render_bson_scalar(decision)}",
+        code=17053,
+        exec_error=True,
     )
 
 
@@ -4795,7 +4829,11 @@ def _stage_union_with(
         if sub_pipeline is not None and not isinstance(sub_pipeline, list):
             raise AggregateError("$unionWith 'pipeline' must be an array")
     else:
-        raise AggregateError("$unionWith requires a collection name or {coll, pipeline} doc")
+        raise AggregateError(
+            f"the $unionWith stage specification must be an object or string, but found "
+            f"{_bson_type_name(spec)}",
+            code=9,
+        )
     if ctx.storage is None:
         raise AggregateError("$unionWith requires storage context")
 
@@ -4832,7 +4870,7 @@ def _stage_geo_near(
     from secantus.geo import distance, parse_doc_geometry
 
     if not isinstance(spec, Mapping):
-        raise AggregateError("$geoNear requires an object")
+        raise AggregateError("invalid parameter: expected an object ($geoNear)", code=10065)
     near = spec.get("near")
     if near is None:
         raise AggregateError("$geoNear requires `near`")

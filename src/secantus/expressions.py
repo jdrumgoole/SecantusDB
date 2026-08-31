@@ -203,30 +203,14 @@ def _op_concat(arg: Any, ctx: _Ctx) -> Any:
 
 
 def _bson_type_name(v: Any) -> str:
-    """mongod's type vocabulary for arithmetic error messages."""
-    if isinstance(v, bool):
-        return "bool"
-    if isinstance(v, Int64):
-        return "long"
-    if isinstance(v, int):
-        return "int" if -(2**31) <= v < 2**31 else "long"
-    if isinstance(v, float):
-        return "double"
-    if isinstance(v, Decimal128):
-        return "decimal"
-    if isinstance(v, str):
-        return "string"
-    if isinstance(v, _dt.datetime):
-        return "date"
-    if isinstance(v, Mapping):
-        return "object"
-    if isinstance(v, list):
-        return "array"
-    if isinstance(v, bson.ObjectId):
-        return "objectId"
-    if v is None:
-        return "null"
-    return type(v).__name__
+    """mongod's type vocabulary for arithmetic error messages.
+
+    Delegates to `secantus.bsontypes` — see there for why three copies of this
+    existed and what each one got wrong.
+    """
+    from secantus.bsontypes import bson_type_name
+
+    return bson_type_name(v)
 
 
 def _is_numeric(v: Any) -> bool:

@@ -2209,6 +2209,11 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     wc_err = _validate_write_concern(doc)
     if wc_err is not None:
         return wc_err
+    _err = _require_typed_bson_field(
+        doc.get("ordered"), "insert.ordered", expected="bool", ok=lambda v: isinstance(v, bool)
+    )
+    if _err is not None:
+        return _err
     coll = doc["insert"]
     oplog_err = _reject_oplog_rs_write(ctx, coll, "insert")
     if oplog_err is not None:
@@ -2311,6 +2316,12 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.storage import BadHint, MinMaxKeyError
 
     coll = doc["find"]
+    _err = _require_hint_type(doc.get("hint"))
+    if _err is not None:
+        return _err
+    _err = _require_object_bson_field(doc.get("readConcern"), "FindCommandRequest.readConcern")
+    if _err is not None:
+        return _err
     for _fld in ("limit", "skip", "batchSize"):
         # mongod reports these under its IDL name, `FindCommandRequest.limit`,
         # not `find.limit` -- probed, not guessed.
@@ -2337,6 +2348,10 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     _err = _require_bool_value_field(doc, "singleBatch")
     if _err is not None:
         return _err
+    for _bfld in ("tailable", "awaitData", "returnKey", "showRecordId", "allowDiskUse"):
+        _err = _require_bool_value_field(doc, _bfld)
+        if _err is not None:
+            return _err
     filter_ = doc.get("filter") or {}
     skip = int(doc.get("skip", 0) or 0)
     limit = int(doc.get("limit", 0) or 0)
@@ -2688,6 +2703,23 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     _err = _require_object_bson_field(doc.get("let"), "update.let")
     if _err is not None:
         return _err
+    _err = _require_typed_bson_field(
+        doc.get("ordered"), "update.ordered", expected="bool", ok=lambda v: isinstance(v, bool)
+    )
+    if _err is not None:
+        return _err
+    # Parsed up front, like ``delete``: mongod validates every statement before
+    # applying any, so a wrong-typed hint / collation anywhere in the batch is
+    # a command-level error and NOTHING is written.
+    for _stmt in doc.get("updates") or []:
+        if not isinstance(_stmt, Mapping):
+            continue
+        _err = _require_hint_type(_stmt.get("hint"))
+        if _err is not None:
+            return _err
+        _err = _require_object_bson_field(_stmt.get("collation"), "update.updates.collation")
+        if _err is not None:
+            return _err
     coll = doc["update"]
     oplog_err = _reject_oplog_rs_write(ctx, coll, "update")
     if oplog_err is not None:
@@ -2777,6 +2809,12 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 }
             if not isinstance(sort_spec, Mapping):
                 return _bad_value("BSON field 'update.updates.sort' is the wrong type")
+        # A wrong-typed ``arrayFilters`` reached the update engine, which
+        # iterated it and answered ``internal server error``. findAndModify
+        # already routed through this validator; ``update`` never did.
+        _err = _validate_array_filters_field(spec, "arrayFilters", "update.updates.arrayFilters")
+        if _err is not None:
+            return _err
         # Pre-validate the pipeline-update shape upfront so a no-match
         # filter still surfaces parse errors to the client. Real
         # mongod parses the pipeline before scanning the collection
@@ -3174,6 +3212,23 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     _err = _require_object_bson_field(doc.get("let"), "delete.let")
     if _err is not None:
         return _err
+    _err = _require_typed_bson_field(
+        doc.get("ordered"), "delete.ordered", expected="bool", ok=lambda v: isinstance(v, bool)
+    )
+    if _err is not None:
+        return _err
+    # mongod parses every statement before running any, so a wrong-typed hint
+    # or collation in ANY entry is a command-level error, not a writeError on
+    # that entry -- and nothing is deleted. Probed 8.2.11.
+    for _stmt in doc.get("deletes") or []:
+        if not isinstance(_stmt, Mapping):
+            continue
+        _err = _require_hint_type(_stmt.get("hint"))
+        if _err is not None:
+            return _err
+        _err = _require_object_bson_field(_stmt.get("collation"), "delete.deletes.collation")
+        if _err is not None:
+            return _err
     coll = doc["delete"]
     oplog_err = _reject_oplog_rs_write(ctx, coll, "delete")
     if oplog_err is not None:
@@ -3233,6 +3288,18 @@ def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     _err = _require_object_bson_field(doc.get("query"), "count.query")
     if _err is not None:
         return _err
+    _err = _require_count_limit(doc)
+    if _err is not None:
+        return _err
+    _err = _require_number_bson_field(doc.get("skip"), "count.skip")
+    if _err is not None:
+        return _err
+    _err = _require_non_negative_number(doc.get("skip"), "skip")
+    if _err is not None:
+        return _err
+    _err = _require_hint_type(doc.get("hint"))
+    if _err is not None:
+        return _err
     filter_ = doc.get("query") or {}
     # View support: if the collection is a view (``viewOn`` set),
     # run the view's pipeline + the count's query filter via the
@@ -3253,13 +3320,7 @@ def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         )
         result_docs = apply_pipeline(docs, pipeline, pipeline_ctx)
         n = len(result_docs)
-        skip = int(doc.get("skip") or 0)
-        if skip > 0:
-            n = max(n - skip, 0)
-        limit = int(doc.get("limit") or 0)
-        if limit > 0:
-            n = min(n, limit)
-        return {"n": n, "ok": 1.0}
+        return {"n": _count_window(n, doc), "ok": 1.0}
     hint = doc.get("hint")
     if hint is not None:
         # A ``hint`` forces a specific index. For an empty filter this still
@@ -3286,13 +3347,7 @@ def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # ``min(max(matches - skip, 0), limit)``. mongo-node-driver's
     # ``crud_api`` integration test asserts this directly: a 4-doc
     # collection, ``.limit(2)``, then ``cursor.count()`` should yield 2.
-    skip = int(doc.get("skip") or 0)
-    if skip > 0:
-        n = max(n - skip, 0)
-    limit = int(doc.get("limit") or 0)
-    if limit > 0:
-        n = min(n, limit)
-    return {"n": n, "ok": 1.0}
+    return {"n": _count_window(n, doc), "ok": 1.0}
 
 
 def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -3301,6 +3356,9 @@ def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.paths import get_path
 
     coll = doc["distinct"]
+    _err = _require_object_bson_field(doc.get("collation"), "distinctCommandRequest.collation")
+    if _err is not None:
+        return _err
     # 8.x names the IDL STRUCT, not the command: 'distinctCommandRequest.zz',
     # where 6.0 said 'distinct.zz'.
     _err = _unknown_command_field(doc, "distinctCommandRequest", _DISTINCT_KNOWN_FIELDS)
@@ -3503,6 +3561,33 @@ def _unknown_command_field(
     }
 
 
+def _require_hint_type(hint: Any) -> dict[str, Any] | None:
+    """mongod's wrong-typed-``hint`` reply, or None if OK / absent.
+
+    Probed 8.2.11 on find / count / aggregate / update / delete: every
+    non-string, non-object hint answers ``9 FailedToParse`` with this text, and
+    it is a COMMAND-level error (an ``OperationFailure`` with no
+    ``writeErrors``) even on the batch commands, because mongod parses the
+    statements before running any of them.
+
+    ``findAndModify`` already had this check inline. The others reached
+    `Storage.validate_hint`, whose ``BadHint`` surfaced as ``2 invalid hint
+    type: int`` -- our own wording under mongod's generic BadValue code.
+
+    Distinct from `_unresolvable_hint_error`, which is about a hint of the
+    RIGHT type naming an index that does not exist; that stays a per-statement
+    writeError with code 2.
+    """
+    if hint is None or isinstance(hint, (str, Mapping)):
+        return None
+    return {
+        "ok": 0.0,
+        "errmsg": "Hint must be a string or an object",
+        "code": 9,
+        "codeName": "FailedToParse",
+    }
+
+
 def _unresolvable_hint_error(ctx: CommandContext, coll: str, hint: Any) -> str | None:
     """The error message for a ``hint`` that names no index, else None.
 
@@ -3561,6 +3646,75 @@ def _require_non_negative_number(value: Any, bare_name: str) -> dict[str, Any] |
         "code": 2,
         "codeName": "BadValue",
     }
+
+
+def _require_count_limit(doc: Mapping[str, Any]) -> dict[str, Any] | None:
+    """``count.limit``'s own parse errors, or None if OK / absent.
+
+    ``limit`` does **not** take the IDL path ``skip`` does, so the two slots
+    cannot share a validator. Probed 8.2.11, all five wordings are mongod's:
+
+        {}, "x", [1], null, true   2  limit value is not a valid number
+        2.7                        9  Expected an integer: limit: 2.7
+        Decimal128("2.5")          9  Cannot represent as a 64-bit integer: limit: 2.5
+        -3                         accepted -- a negative limit means its
+                                   ABSOLUTE value (-3 over five docs counts 3)
+        Decimal128("2"), 2.0       accepted
+
+    ``skip`` answers ``14`` with the IDL expected-types list for those same
+    wrong types and REJECTS a negative (``2 BSON field 'skip' value must be
+    >= 0``). The asymmetry is mongod's; do not "tidy" it into one call.
+    """
+    if "limit" not in doc:
+        return None
+    value = doc["limit"]
+    if isinstance(value, bool) or not isinstance(value, (int, float, bson.Decimal128)):
+        return {
+            "ok": 0.0,
+            "errmsg": "limit value is not a valid number",
+            "code": 2,
+            "codeName": "BadValue",
+        }
+    if isinstance(value, float) and value != int(value):
+        return {
+            "ok": 0.0,
+            "errmsg": f"Expected an integer: limit: {value}",
+            "code": 9,
+            "codeName": "FailedToParse",
+        }
+    if isinstance(value, bson.Decimal128):
+        as_decimal = value.to_decimal()
+        if as_decimal != int(as_decimal):
+            return {
+                "ok": 0.0,
+                "errmsg": f"Cannot represent as a 64-bit integer: limit: {value}",
+                "code": 9,
+                "codeName": "FailedToParse",
+            }
+    return None
+
+
+def _count_window(n: int, doc: Mapping[str, Any]) -> int:
+    """Apply ``count``'s ``skip`` / ``limit`` to a match count.
+
+    Call only after `_require_count_limit` and the ``skip`` type check: this
+    coerces without guarding, and a wrong-typed value would raise here (which
+    is exactly how this slot used to answer ``internal server error``).
+
+    ``abs`` is mongod's: a negative limit means "at most this many", so
+    ``limit: -3`` counts 3. We used to ignore a negative limit entirely.
+    """
+    skip_value = doc.get("skip")
+    if skip_value is not None:
+        skip = _coerce_command_int(skip_value)
+        if skip > 0:
+            n = max(n - skip, 0)
+    limit_value = doc.get("limit")
+    if limit_value is not None:
+        limit = abs(_coerce_command_int(limit_value))
+        if limit > 0:
+            n = min(n, limit)
+    return n
 
 
 def _require_typed_bson_field(
@@ -4013,6 +4167,9 @@ def _find_and_modify_impl(doc: dict[str, Any], ctx: CommandContext) -> dict[str,
     # before reaching the actual array element.
     array_filters = doc.get("arrayFilters")
     collation = doc.get("collation")
+    _err = _require_object_bson_field(collation, "findAndModify.collation")
+    if _err is not None:
+        return _err
 
     if is_remove and update is not None:
         return {
@@ -4341,6 +4498,19 @@ def _rename_collection(doc: dict[str, Any], ctx: CommandContext) -> dict[str, An
         return wc_err
     src_ns = doc.get("renameCollection")
     dst_ns = doc.get("to")
+    # ``'[binData, bool]'`` is mongod's list verbatim (8.2.11) -- binData is
+    # there because the IDL type is `safeBool`. Reproduced, not tidied.
+    _drop_target = doc.get("dropTarget")
+    if _drop_target is not None and not isinstance(_drop_target, (bool, bson.Binary, bytes)):
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"BSON field 'renameCollection.dropTarget' is the wrong type "
+                f"'{_bson_type_of(_drop_target)}', expected types '[binData, bool]'"
+            ),
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
     drop_target = bool(doc.get("dropTarget", False))
     if not isinstance(src_ns, str) or not isinstance(dst_ns, str):
         return {
@@ -4377,6 +4547,12 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if wc_err is not None:
         return wc_err
     _err = _require_object_bson_field(doc.get("storageEngine"), "create.storageEngine")
+    if _err is not None:
+        return _err
+    _err = _require_object_bson_field(doc.get("validator"), "create.validator")
+    if _err is not None:
+        return _err
+    _err = _require_object_bson_field(doc.get("timeseries"), "create.timeseries")
     if _err is not None:
         return _err
     # Reject unknown top-level options on ``create``. Real mongod
@@ -4643,6 +4819,12 @@ def _list_collections(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any
     names = ctx.storage.list_collections(ctx.db_name)
     name_only = bool(doc.get("nameOnly", False))
     filter_doc = doc.get("filter")
+    _err = _require_object_bson_field(filter_doc, "listCollections.filter")
+    if _err is not None:
+        return _err
+    _err = _require_object_bson_field(doc.get("cursor"), "listCollections.cursor")
+    if _err is not None:
+        return _err
 
     # Storage keys that are server-side bookkeeping, not user-facing
     # options. Anything else in the stored map round-trips into the
@@ -4708,7 +4890,19 @@ def _list_collections(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any
         raw_batch_size: Any = cursor_spec.get("batchSize")
     else:
         raw_batch_size = doc.get("batchSize")
-    batch_size = DEFAULT_BATCH_SIZE if raw_batch_size is None else int(raw_batch_size)
+    # Probed 8.2.11: the TYPE error names the IDL path
+    # (``listCollections.cursor.batchSize``) but the negative-value error uses
+    # the BARE name (``batchSize``) -- mongod's own inconsistency, reproduced.
+    # An explicit ``null`` batchSize, and ``cursor: null``, are both accepted.
+    _err = _require_number_bson_field(raw_batch_size, "listCollections.cursor.batchSize")
+    if _err is not None:
+        return _err
+    _err = _require_non_negative_number(raw_batch_size, "batchSize")
+    if _err is not None:
+        return _err
+    batch_size = (
+        DEFAULT_BATCH_SIZE if raw_batch_size is None else _coerce_command_int(raw_batch_size)
+    )
     ns = f"{ctx.db_name}.$cmd.listCollections"
     first_batch, cursor_id = _split_into_cursor(batch, batch_size, ns, ctx.cursors, bounded=True)
 
@@ -5711,6 +5905,18 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
     coll = doc["aggregate"]
     _err = _require_object_bson_field(doc.get("let"), "aggregate.let")
+    if _err is not None:
+        return _err
+    _err = _require_object_bson_field(doc.get("collation"), "aggregate.collation")
+    if _err is not None:
+        return _err
+    _err = _require_object_bson_field(doc.get("readConcern"), "aggregate.readConcern")
+    if _err is not None:
+        return _err
+    _err = _require_hint_type(doc.get("hint"))
+    if _err is not None:
+        return _err
+    _err = _require_bool_value_field(doc, "allowDiskUse")
     if _err is not None:
         return _err
     _cursor_opt = doc.get("cursor")
