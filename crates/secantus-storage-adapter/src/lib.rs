@@ -808,7 +808,8 @@ fn to_wt_scope(scope: &ChangeStreamScope) -> WtScope {
 }
 
 /// Convert a raw `hint` value into the storage `Hint`. A string is an index
-/// name (or `"$natural"` / `"_id_"`); a document is a key spec. Anything else
+/// name (or `"_id_"`) -- NOT `"$natural"`, which mongod takes only as
+/// `{$natural: ±1}`; a document is a key spec. Anything else
 /// falls through to an empty name, which `resolve_hint` rejects as `BadHint`
 /// (→ `BadValue` at the command layer), matching mongod.
 fn to_hint(b: RawHint<'_>) -> Hint {
