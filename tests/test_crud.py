@@ -2378,9 +2378,14 @@ def test_sparse_unique_index_via_pymongo(coll) -> None:
 def test_create_indexes_rejects_invalid_wildcard_projection(client: MongoClient) -> None:
     # mongo-ruby-driver's `create_one ... invalid wildcardProjection`
     # / `wildcard projection to an invalid base index` specs match
-    # the error messages by regex. Real mongod rejects with
-    # CannotCreateIndex (67) when the option is malformed or applied
-    # to a non-wildcard base index.
+    # the error messages by regex.
+    #
+    # Re-probed against mongod 8.2.11 (2026-08-31): the three shapes are three
+    # DIFFERENT errors, not one CannotCreateIndex (67). A wrong type is 14, an
+    # empty object is 9 with its own wording ("can't be an empty object", NOT
+    # "non-empty object" -- this assertion pinned our old message, not
+    # mongod's), and a non-wildcard base index is 2. All three now quote the
+    # spec in mongod's shell syntax rather than Python's repr.
     from pymongo.errors import OperationFailure
 
     db = client["wcp_validation_db"]
@@ -2393,8 +2398,10 @@ def test_create_indexes_rejects_invalid_wildcard_projection(client: MongoClient)
                 "indexes": [{"key": {"$**": 1}, "name": "wild_int", "wildcardProjection": 5}],
             }
         )
-    assert "wildcardProjection" in str(exc.value)
-    assert "non-empty object" in str(exc.value)
+    assert exc.value.code == 14
+    assert "The field 'wildcardProjection' must be a non-empty object, but got int" in str(
+        exc.value
+    )
 
     # Empty doc wildcardProjection.
     with pytest.raises(OperationFailure) as exc:
@@ -2404,7 +2411,8 @@ def test_create_indexes_rejects_invalid_wildcard_projection(client: MongoClient)
                 "indexes": [{"key": {"$**": 1}, "name": "wild_empty", "wildcardProjection": {}}],
             }
         )
-    assert "non-empty object" in str(exc.value)
+    assert exc.value.code == 9
+    assert "The 'wildcardProjection' field can't be an empty object" in str(exc.value)
 
     # wildcardProjection on a non-wildcard base index.
     with pytest.raises(OperationFailure) as exc:
@@ -2420,7 +2428,8 @@ def test_create_indexes_rejects_invalid_wildcard_projection(client: MongoClient)
                 ],
             }
         )
-    assert "only allowed" in str(exc.value)
+    assert exc.value.code == 2
+    assert "The field 'wildcardProjection' is only allowed in 'wildcard' indexes" in str(exc.value)
 
     # Valid wildcardProjection on a wildcard key — accepted.
     db.command(
