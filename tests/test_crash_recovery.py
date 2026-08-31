@@ -117,6 +117,38 @@ def _run_killed_load(tmp_path: Path, *, run_seconds: float, checkpoint_seconds: 
     return ranges
 
 
+def _open_after_crash(_secantus_server, tmp_path: Path, *, timeout: float = 30.0):
+    """Reopen the crashed store, tolerating a briefly-held lock.
+
+    On POSIX the kill releases the store's file handles immediately and the
+    first attempt succeeds. On Windows the first attempt after
+    `TerminateProcess` can answer ``WtError code 16`` (EBUSY) while the OS is
+    still releasing the dead process's handles -- Windows had never run this
+    file, so that difference had never surfaced.
+
+    The wait is bounded and NARROW on purpose: only a busy-lock is retried, and
+    only for `timeout` seconds. A store that is genuinely unopenable -- the
+    thing this harness exists to catch -- still fails, with WiredTiger's own
+    error. A real restart after a crash faces exactly the same wait, so this is
+    the behaviour under test, not a workaround for it.
+    """
+    deadline = time.monotonic() + timeout
+    last: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            return _secantus_server.RustServer(
+                str(tmp_path / "wt"), 0, host="127.0.0.1", replica_set_name="secantus"
+            )
+        except RuntimeError as exc:  # noqa: PERF203 — the retry IS the point
+            if "code: 16" not in str(exc):
+                raise
+            last = exc
+            time.sleep(0.5)
+    raise AssertionError(
+        f"the crashed store stayed locked for {timeout:.0f}s after a hard kill; last error: {last}"
+    )
+
+
 def _verify_all_present(tmp_path: Path, ranges: list[range]) -> None:
     """Reopen the killed store (replay-on-open) and check every acked _id."""
     import _secantus_server
@@ -124,9 +156,7 @@ def _verify_all_present(tmp_path: Path, ranges: list[range]) -> None:
     env_backup = os.environ.get("SECANTUS_DATA_NONLOGGED")
     os.environ["SECANTUS_DATA_NONLOGGED"] = "1"
     try:
-        srv = _secantus_server.RustServer(
-            str(tmp_path / "wt"), 0, host="127.0.0.1", replica_set_name="secantus"
-        )
+        srv = _open_after_crash(_secantus_server, tmp_path)
         try:
             host, port = srv.address
             client = pymongo.MongoClient(host, port, directConnection=True)
