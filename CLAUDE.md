@@ -106,7 +106,7 @@ Unique enforcement is a prefix probe on the entries table, not a full scan.
 
 Multi-field sort acceleration: a sort spec whose `(field, direction)` tuple list exactly matches — or fully inverts — a compound index's key spec walks the index in forward / backward order and skips the Python post-sort entirely. Picker is strict-shape only (partial-prefix sorts, mixed-direction mismatches, and multikey indexes fall back to COLLSCAN + Python sort). `_compound_index_for_sort` lives in `storage.py` next to `_single_field_index_for`; the planner mirrors the same rules in `explain_plan`.
 
-Per-index collation shipped (strength 1/2/3 + `caseLevel` across single-field and compound indexes; `numericOrdering` still falls back to COLLSCAN — see `tasks/backlog.md` §2 and `docs/indexes.md` "Per-index collation").
+Per-index collation shipped (strength 1/2/3 + `caseLevel` across single-field and compound indexes; `numericOrdering` still falls back to COLLSCAN — see `tasks/backlog.md` §2 and `docs/indexes.md` "Per-index collation"). **That is MATCHING only — collation ordering is not ICU** (measured 8.2.11, 2026-08-31: a collated `sort` falls back to codepoint order, so accents sort after `z` and `caseFirst` / `backwards` / the locale are ignored; `tasks/backlog.md` §5). The collation SPEC is validated on `find` / `aggregate` / `count` / `distinct` / `findAndModify` and deliberately not on `update` / `delete`, because mongod does not validate it there either.
 
 Out of scope regardless: text / hashed / wildcard indexes.
 

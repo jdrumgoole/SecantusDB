@@ -308,6 +308,14 @@ and `caseLevel` are supported; `numericOrdering` is not (would
 need a length-prefixed digit-run encoding to stay byte-sortable —
 queries combining it with an index fall back to COLLSCAN).
 
+That support is for **matching**. Collation *ordering* is not ICU:
+measured against mongod 8.2.11 on 2026-08-31, every equality case
+agreed at every strength, but a collated `sort` falls back to
+codepoint order — accents sort after `z` rather than beside their
+base letter, and `caseFirst`, `backwards` and the locale itself are
+accepted and ignored. See `tasks/backlog.md` §5 for the measurements
+and what closing it would take.
+
 ```python
 coll.create_index("name", collation={"locale": "en", "strength": 2})
 
