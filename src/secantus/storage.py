@@ -4905,12 +4905,17 @@ class Storage:
             self._resolve_hint(db, coll, hint)
 
     def _resolve_hint(self, db: str, coll: str, hint: str | Mapping[str, Any]) -> str:
-        """Resolve ``hint`` to an index name (or ``$natural``).
+        """Resolve ``hint`` to an index name (or the ``$natural`` sentinel).
 
-        ``hint`` may be an index name string, a key-spec dict matching an
-        existing index, ``"$natural"``, or ``{"$natural": +/-1}``. Anything
-        else raises ``BadHint`` so the command layer can return a Mongo
+        ``hint`` may be an index name string, ``"_id_"``, a key-spec dict
+        matching an existing index, or ``{"$natural": +/-1}``. Anything else
+        raises ``BadHint`` so the command layer can return a Mongo
         ``BadValue`` error.
+
+        **Not the bare string ``"$natural"``** -- mongod takes only the
+        document form and rejects the string (probed 8.2.11). The value this
+        RETURNS for the document form is still the string, which is why the
+        two are easy to conflate.
         """
         if isinstance(hint, str):
             # NOT `"$natural"`. mongod takes only the DOCUMENT form

@@ -18,7 +18,8 @@ use bson::{Bson, Document};
 pub use secantus_core::collation::Collation;
 
 /// A query hint at the command seam: the raw `hint` value (a string index name,
-/// a key-spec document, or a sentinel like `"$natural"` / `"_id_"`). The adapter
+/// a key-spec document, or the `"_id_"` sentinel; `$natural` only as
+/// `{$natural: ±1}`, never the bare string). The adapter
 /// converts it to `secantus_storage::Hint`; keeping it as `Bson` lets
 /// `secantus-commands` stay decoupled from the storage crate's `Hint` type.
 pub type RawHint<'a> = &'a Bson;

@@ -1241,7 +1241,10 @@ pub struct UniqueConflict {
     pub key_value: Document,
 }
 
-/// A query hint: either an index name (or `"$natural"` / `"_id_"`) or a key-spec
+/// A query hint: either an index name (or the `"_id_"` sentinel) or a key-spec
+/// document. `$natural` is accepted ONLY as `{$natural: ±1}`; the bare string
+/// is rejected, matching mongod (probed 8.2.11). Note `ResolvedHint::Natural`
+/// is what the document form resolves TO -- input and resolved form differ.
 /// document (`{a: 1, b: -1}` / `{$natural: 1}` / `{_id: 1}`).
 #[derive(Debug, Clone)]
 pub enum Hint {
