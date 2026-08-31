@@ -3482,10 +3482,14 @@ pin the Rust engines against the pure-Python ones.
   with mongod's promotion (int64 if any operand is int64 or a 32-bit result
   overflows), matching `secantus.numerics`. The `_norm_int_width` normaliser is
   dropped from `tests/test_rust_update_parity.py` (it now compares BSON subtypes
-  directly). The expression-language `$add`/`$subtract`/`$multiply` deliberately
-  still narrow to match the pure-Python `expressions` fold (which doesn't promote
-  either) — making *both* engines promote there is a Python-server behaviour
-  change, out of scope for this parity fix.
+  directly).
+
+  **Superseded 2026-09-01 (#1185).** This entry used to close by recording that
+  the expression-language `$add`/`$subtract`/`$multiply` *deliberately* still
+  narrowed, to match a pure-Python fold that did not promote either. That is no
+  longer true: both engines now promote there, because mongod does and the old
+  behaviour was a silent wrong BSON type. Left in place only so the reasoning is
+  not mistaken for a standing decision.
 
 **Rust server build-out (`tasks/rust-server-plan.md` §4).** Done: R1
 (`secantus-wire`), R2a (dispatch framework + handshake family), R2b (`insert` /

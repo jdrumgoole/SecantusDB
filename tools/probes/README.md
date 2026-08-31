@@ -81,7 +81,7 @@ until `change_streams.py`. Start one explicitly:
 | `findandmodify_shapes.py` | findAndModify replies and argument validation | 18/18 clean (was 6 divergences) |
 | `update_operators.py` | update operator semantics and errors | clean except the filed items |
 | `update_path_conflicts.py` | overlapping update operator paths | 12/12 clean (was 8 wrong results) |
-| `agg_expressions.py` | every aggregation EXPRESSION operator (143), 1- and 2-argument forms | first run 2026-08-31: 3884 cases, 57 wrong values, 2288 different codes, 689 message-only, **274 crashes**. After five slices: python **0 crashes**, 682 code / 669 message diffs; rust 1556 code / **0** message. What is left is the per-operator operand-type family — see `tasks/backlog.md` §5 |
+| `agg_expressions.py` | every aggregation EXPRESSION operator (143), 1- and 2-argument forms | first run 2026-08-31: 3884 cases, 57 wrong values, 2288 different codes, 689 message-only, **274 crashes**. After six slices (2026-09-01): python **0 crashes**, **5** wrong values, 651 code / 135 message diffs; rust **0** wrong values, 1331 code / 4 message. The five are a last-digit Decimal128 rounding where mongod is the less accurate side. What is left is the per-operator operand-type family — see `tasks/backlog.md` §5 |
 
 ## Writing a new one
 
