@@ -1,0 +1,9 @@
+[package]
+name = "secantus-pgcatalog"
+version = "0.1.0-beta.0"
+edition = "2021"
+description = "SQL catalog documents for the SecantusDB PostgreSQL server"
+license = "Apache-2.0"
+
+[dependencies]
+bson = "2"

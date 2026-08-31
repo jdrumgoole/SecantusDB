@@ -1,6 +1,11 @@
 # Plan: a Rust PostgreSQL server
 
-> **Status: P0 SPIKE RUN AND PASSED, 2026-08-31. Phases P1+ not started.**
+> **Status: P0 PASSED and P1 VERTICAL SLICE LANDED, 2026-08-31. P2+ not started.**
+> P1 shipped `secantus-pgcatalog` / `secantus-pgplan` / `secantus-pgserver` and
+> the `secantusd-pg` binary: CREATE TABLE, INSERT and single-table SELECT over
+> **real `secantus-storage`**, with the cross-server catalog contract proven in
+> both directions (§0.6). That closes the first two gaps §0.5 listed.
+>
 > The premise held on every question the spike could reach — see
 > §0 immediately below, which is measurement, not proposal. The phasing from §9
 > onward remains a proposal.
@@ -109,12 +114,49 @@ Note for P1: `pgwire`'s **default features pull `aws-lc-rs`**, a second C crypto
 build. `default-features = false, features = ["server-api"]` avoids it; match
 whatever rustls backend the Mongo server already uses rather than adding one.
 
+### 0.6 P1 vertical slice (2026-08-31): the seam holds on real storage
+
+`secantusd-pg` serves CREATE TABLE / INSERT / single-table SELECT from a real
+`secantus-storage` home. 17 tests in `tests/test_rust_pgserver_slice.py`.
+
+**The cross-server contract works in both directions** — this is the headline,
+because §5 called it the one constraint that is silent data loss if wrong:
+
+- Rust creates a table and inserts → the **Python** server reads it, and writes
+  a further row → the Rust server reads Python's row.
+- Python creates a table and inserts → the **Rust** server reads it.
+
+**Two real bugs the slice surfaced, both worth recording:**
+
+1. **Acknowledged writes did not survive SIGTERM.** The first cut had no signal
+   handler, so the process died with no WiredTiger checkpoint: after
+   CREATE TABLE + INSERT the client had been told both succeeded, and reopening
+   the store found the catalog document *and* the rows gone. `secantusd-rs`
+   already installs a SIGINT/SIGTERM handler for exactly this reason; `-pg` now
+   does too, with a named regression test.
+2. **A duplicate key leaked the MongoDB persona.** Storage answers
+   `E11000 duplicate key error collection: postgres.t index: _id_ ...`. Real
+   PostgreSQL 14 answers `duplicate key value violates unique constraint
+   "t_pkey"` with `DETAIL: Key (id)=(1) already exists.`; ours now matches it
+   byte for byte.
+
+**A `pgwire` 0.31 limitation to carry forward:** its `ErrorInfo` exposes
+severity / code / message / detail / hint / position / where / file / line /
+routine, but **not** the protocol's schema / table / column / constraint fields.
+Real PostgreSQL sends `constraint_name` and `table_name` on a 23505, and pgjdbc
+surfaces them via `getServerErrorMessage().getConstraint()`. If a gauge starts
+asserting them, either upstream the fields or hand-roll the codec — this is the
+first concrete cost of the crate-over-hand-roll decision.
+
+Also worth knowing: an early `BoolExpr` lowering matched the wire integer
+(`0 => $and`) instead of the named enum (`AND = 1`), silently turning every
+`AND` into an `OR`. A unit test caught it. Match named enums, never protobuf
+integers.
+
 ### 0.5 What the spike did NOT prove
 
-- **Rows came from memory, not `secantus-storage`.** Deliberate: storage is the
-  already-proven half (the Mongo Rust server runs on it) and linking WT would
-  have added build noise to a probe about the front half. Low risk, but it is
-  untested here.
+- ~~**Rows came from memory, not `secantus-storage`.**~~ **CLOSED by P1** — the
+  slice runs on real WiredTiger; see §0.6.
 - **Nothing beyond single-table SELECT with comparison/boolean predicates.**
   Joins, aggregates, subqueries, DML and DDL — the actual bulk of P5 — are
   untouched. The spike shows the seam is real; it says nothing about how long

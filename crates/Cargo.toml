@@ -16,6 +16,12 @@
 #                        same `rust` CI job; the WT adapter lands separately.
 #   * secantus-auth    — pure-Rust SCRAM-SHA-256 mechanism (R5). No PyO3 / native
 #                        deps; same `rust` CI job.
+#   * secantus-pgcatalog — the SQL catalog documents for the PostgreSQL server
+#                        (P1 of tasks/rust-pgserver-plan.md). Pure Rust, no WT:
+#                        the on-disk catalog format is a compatibility contract
+#                        shared with the Python server, pinned by golden vectors.
+#   * secantus-pgplan  — PostgreSQL parse tree (libpg_query) lowered to the MQL
+#                        filters secantus-core already evaluates. Pure Rust.
 #   * secantus-bench   — the three-droplet DigitalOcean benchmark harness
 #                        (`do-cluster` orchestrator + `do-client` load agent).
 #                        No PyO3 / native deps: the client speaks the wire
@@ -28,6 +34,8 @@ members = [
     "secantus-core-py",
     "secantus-wire",
     "secantus-commands",
+    "secantus-pgcatalog",
+    "secantus-pgplan",
     "secantus-server",
     "secantus-auth",
     "secantus-bench",

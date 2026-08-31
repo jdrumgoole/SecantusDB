@@ -1,0 +1,32 @@
+[package]
+name = "secantus-pgserver"
+version = "0.1.0-beta.0"
+edition = "2021"
+description = "The SecantusDB PostgreSQL wire server (P1 vertical slice)"
+license = "Apache-2.0"
+
+# EXCLUDED from the clean workspace: links WiredTiger through
+# secantus-storage, which is not present in the maturin manylinux build
+# containers or the default cargo test/clippy CI job. Gate it from this
+# directory with SECANTUS_WT_INCLUDE / SECANTUS_WT_LIB set, exactly as the
+# other WT-linked crates are -- `cargo clippy -p ...` in the clean workspace
+# will NEVER compile this crate, and Cargo does not warn about that.
+[workspace]
+
+[dependencies]
+bson = "2"
+async-trait = "0.1"
+futures = "0.3"
+pgwire = { version = "0.31", default-features = false, features = ["server-api"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+secantus-pgcatalog = { path = "../secantus-pgcatalog" }
+secantus-pgplan = { path = "../secantus-pgplan" }
+secantus-storage = { path = "../secantus-storage" }
+# "termination" so SIGTERM is caught too, not just SIGINT: a supervisor or a
+# test harness stops the daemon with SIGTERM, and an uncaught one skips the
+# WiredTiger close entirely -- which loses acknowledged writes.
+ctrlc = { version = "3", features = ["termination"] }
+
+[[bin]]
+name = "secantusd-pg"
+path = "src/main.rs"

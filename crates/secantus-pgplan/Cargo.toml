@@ -1,0 +1,11 @@
+[package]
+name = "secantus-pgplan"
+version = "0.1.0-beta.0"
+edition = "2021"
+description = "PostgreSQL parse trees lowered to MQL for the SecantusDB PostgreSQL server"
+license = "Apache-2.0"
+
+[dependencies]
+bson = "2"
+pg_query = "6"
+secantus-pgcatalog = { path = "../secantus-pgcatalog" }
