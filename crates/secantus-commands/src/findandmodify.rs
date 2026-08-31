@@ -31,6 +31,19 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     // `upsert` takes a bool OR any number here, unlike `update.updates.multi`.
     argtypes::require_bool_or_number(doc, "upsert", "findAndModify.upsert")?;
     argtypes::require_object(doc, "let", "findAndModify.let")?;
+    for (field, path) in [
+        ("fields", "findAndModify.fields"),
+        ("sort", "findAndModify.sort"),
+        ("collation", "findAndModify.collation"),
+    ] {
+        argtypes::require_object(doc, field, path)?;
+    }
+    argtypes::require_array(doc, "arrayFilters", "findAndModify.arrayFilters")?;
+    argtypes::require_hint(doc, "hint")?;
+    // `new` and `remove` follow `upsert` above into the bool-OR-number family,
+    // not the strict bool that `update.updates.multi` uses.
+    argtypes::require_bool_or_number(doc, "new", "findAndModify.new")?;
+    argtypes::require_bool_or_number(doc, "remove", "findAndModify.remove")?;
     let coll = match doc
         .get("findAndModify")
         .or_else(|| doc.get("findandmodify"))
@@ -67,7 +80,18 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     let fields = doc.get("fields").and_then(Bson::as_document);
     let return_new = doc.get("new").and_then(Bson::as_bool).unwrap_or(false);
     let upsert = doc.get("upsert").and_then(Bson::as_bool).unwrap_or(false);
-    let is_remove = doc.get("remove").and_then(Bson::as_bool).unwrap_or(false);
+    // `as_bool` is None for a NUMBER, so `remove: 1` / `remove: 1.5` read as
+    // "no remove" and then failed the update-or-remove check. mongod takes the
+    // same bool-OR-number values the validator above accepts and reads a
+    // nonzero one as true.
+    let is_remove = match doc.get("remove") {
+        Some(Bson::Boolean(b)) => *b,
+        Some(Bson::Int32(n)) => *n != 0,
+        Some(Bson::Int64(n)) => *n != 0,
+        Some(Bson::Double(d)) => *d != 0.0,
+        Some(Bson::Decimal128(d)) => d.to_string().parse::<f64>().unwrap_or(0.0) != 0.0,
+        _ => false,
+    };
     let update = doc.get("update");
 
     // Mutually-exclusive arg validation (FailedToParse, code 9).
@@ -89,6 +113,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     }
 
     let storage = ctx.storage()?;
+    crate::util::validate_write_hint(storage, &ctx.db_name, &coll, doc.get("hint"))?;
     // Command `let` (visible to `$expr` in `query`) + `collation` apply to the
     // match. The subsequent update/delete is keyed by the matched doc's `_id`.
     let let_vars = resolve_let_vars(doc.get("let"));
@@ -99,6 +124,11 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         .and_then(Bson::as_array)
         .map(|a| a.iter().filter_map(|b| b.as_document().cloned()).collect())
         .unwrap_or_default();
+    if let Some(Bson::Document(u)) = doc.get("update") {
+        if let Some(e) = argtypes::array_filter_identifier_error(u, &array_filters) {
+            return Ok(e.into_reply());
+        }
+    }
     // Pipeline-form update (`update: [ {$set: …}, … ]`) vs operator/replacement.
     let pipeline = update.and_then(Bson::as_array);
 

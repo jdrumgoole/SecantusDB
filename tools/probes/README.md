@@ -75,7 +75,8 @@ until `change_streams.py`. Start one explicitly:
 | script | area | last result |
 |---|---|---|
 | `arg_types_documents.py` | document-valued command arguments | 56/56 clean (was 45 crashes) |
-| `arg_types_extended.py` | more commands + numeric/string/bool argument classes | Python **87/87 clean**; **Rust server 78 divergences — open** (see `PROBE_SERVER` above) |
+| `arg_types_extended.py` | more commands + numeric/string/bool argument classes | **244/244 clean on both servers** against mongod 8.2.11 (2026-08-31). Compares CODES only — see `arg_types_messages.py` below |
+| `arg_types_messages.py` | the same class, comparing MESSAGES, over 685 shapes and ~80 more slots | Rust **0 of 685** (was 550 code + 50 message divergences over 76 slots, 2026-08-31). **Python server: 61 slots and 18 CRASHES — open** |
 | `change_streams.py` | change events, event field order, fatal errors | **0 of 41, and 0 field-order differences**, on both servers against mongod 8.2.11 (2026-08-30) — the sweep is closed. Was 14/41 when first run. **Needs a replica set**, see the script |
 | `findandmodify_shapes.py` | findAndModify replies and argument validation | 18/18 clean (was 6 divergences) |
 | `update_operators.py` | update operator semantics and errors | clean except the filed items |

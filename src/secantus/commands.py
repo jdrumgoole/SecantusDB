@@ -2215,14 +2215,15 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         return oplog_err
     documents = doc.get("documents", [])
     if not isinstance(documents, list) or len(documents) == 0:
-        # mongod rejects an empty `documents` array with code 4
-        # (InvalidLength). Drivers (mongo-go-driver, mongo-java-driver)
-        # have command-error tests that check for this specific code
-        # / codeName combo, so it's load-bearing for the gauge.
+        # mongod rejects an empty ``documents`` array with InvalidLength, which
+        # is code **16** -- this said 4 (NoSuchKey) under a comment asserting
+        # the drivers gate on "this specific code / codeName combo". They gate
+        # on the codeName; the code was wrong, and ``bulkWrite`` below already
+        # answered 16. Probed on mongod 8.2.11.
         return {
             "ok": 0.0,
             "errmsg": "Write batch sizes must be between 1 and 100000. Got 0 operations.",
-            "code": 4,
+            "code": 16,
             "codeName": "InvalidLength",
         }
     ordered = doc.get("ordered", True)

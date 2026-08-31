@@ -68,6 +68,26 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // is rejected where an absent one is fine. `let` is the BSON-field family.
     argtypes::require_cursor_object(doc)?;
     argtypes::require_object(doc, "let", "aggregate.let")?;
+    argtypes::require_object(doc, "collation", "aggregate.collation")?;
+    argtypes::require_object(doc, "readConcern", "aggregate.readConcern")?;
+    argtypes::require_hint(doc, "hint")?;
+    // The `Field '<name>' should be a boolean value` family, which rejects an
+    // explicit null — not the BSON-field family used two lines up.
+    argtypes::require_bool_value(doc, "allowDiskUse")?;
+    // `pipeline` is checked before it is READ: the read below falls back to an
+    // empty pipeline for a non-array, which silently ran the whole collection
+    // through no stages and answered ok.
+    match doc.get("pipeline") {
+        None | Some(Bson::Array(_)) => {}
+        Some(_) => {
+            return Ok(CommandError::new(
+                14,
+                "TypeMismatch",
+                "A pipeline must be an array of objects",
+            )
+            .into_reply())
+        }
+    }
     if let Some(bson::Bson::Document(c)) = doc.get("cursor") {
         argtypes::require_number(c, "batchSize", "cursor.batchSize")?;
     }

@@ -200,9 +200,18 @@ fn insert_bypass_document_validation_skips_validator() {
 #[test]
 fn insert_empty_documents_is_invalid_length() {
     with_wt(|c| {
-        let reply = dispatch(&doc! {"insert": "c", "documents": []}, c);
-        assert_eq!(reply.get_i32("code").unwrap(), 4);
-        assert_eq!(reply.get_str("codeName").unwrap(), "InvalidLength");
+        // `InvalidLength` is code **16**; this asserted 4, which is `NoSuchKey`.
+        // Probed on mongod 8.2.11 — and `bulkWrite` in this same codebase
+        // already answered 16. `update` / `delete` share the rule now too.
+        for cmd in [
+            doc! {"insert": "c", "documents": []},
+            doc! {"update": "c", "updates": []},
+            doc! {"delete": "c", "deletes": []},
+        ] {
+            let reply = dispatch(&cmd, c);
+            assert_eq!(reply.get_i32("code").unwrap(), 16, "{cmd:?}");
+            assert_eq!(reply.get_str("codeName").unwrap(), "InvalidLength");
+        }
     });
 }
 

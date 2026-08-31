@@ -252,6 +252,21 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_object_expected(doc, "min")?;
     argtypes::require_object_expected(doc, "max")?;
     argtypes::require_bool_value(doc, "singleBatch")?;
+    // The `Field '<name>' should be a boolean value` family, which — unlike the
+    // BSON-field family two lines up — REJECTS an explicit null. Five more slots
+    // share `singleBatch`'s rule; before this they were accepted and ignored, so
+    // `tailable: "x"` silently returned a non-tailable cursor.
+    for field in [
+        "tailable",
+        "awaitData",
+        "returnKey",
+        "showRecordId",
+        "allowDiskUse",
+    ] {
+        argtypes::require_bool_value(doc, field)?;
+    }
+    argtypes::require_object(doc, "readConcern", "FindCommandRequest.readConcern")?;
+    argtypes::require_hint(doc, "hint")?;
     // A view: translate the find into the equivalent aggregate over the base
     // collection (the find options become pipeline stages after the view's own
     // pipeline) and delegate — the aggregate handler resolves the view. `find` and

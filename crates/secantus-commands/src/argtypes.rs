@@ -166,6 +166,207 @@ pub fn require_bool_or_number(doc: &Document, field: &str, path: &str) -> Result
     }
 }
 
+/// An index-spec BOOLEAN option (`unique` / `sparse`), whose message is not the
+/// one [`require_index_spec_field`] produces beside it.
+///
+/// mongod's own quoting is broken here and is reproduced verbatim: the opening
+/// quote before the field name is never closed — `The field 'unique has value
+/// unique: {}, which is not convertible to bool`. A number IS convertible, so
+/// `unique: 1.5` is accepted where `unique: "x"` is not.
+pub fn require_index_spec_bool(spec: &Document, field: &str) -> Result<(), CommandError> {
+    match spec.get(field) {
+        None
+        | Some(Bson::Boolean(_))
+        | Some(Bson::Int32(_))
+        | Some(Bson::Int64(_))
+        | Some(Bson::Double(_))
+        | Some(Bson::Decimal128(_)) => Ok(()),
+        Some(v) => Err(type_mismatch(format!(
+            "Error in specification {} :: caused by :: The field '{field} has value {field}: {}, \
+             which is not convertible to bool",
+            render_stage_value(&Bson::Document(spec.clone())),
+            render_stage_value(v)
+        ))),
+    }
+}
+
+/// `createIndexes`'s `expireAfterSeconds`: code 67 (CannotCreateIndex), a
+/// leading `". Index spec: "` (mongod's own dangling full stop, from an empty
+/// namespace prefix) and, again, an unclosed quote around the type name.
+pub fn require_index_spec_ttl(spec: &Document, field: &str) -> Result<(), CommandError> {
+    match spec.get(field) {
+        None
+        | Some(Bson::Int32(_))
+        | Some(Bson::Int64(_))
+        | Some(Bson::Double(_))
+        | Some(Bson::Decimal128(_)) => Ok(()),
+        Some(v) => Err(CommandError::new(
+            67,
+            "CannotCreateIndex",
+            format!(
+                ". Index spec: {} :: caused by :: TTL index '{field}' option must be numeric, \
+                 but received a type of '{}",
+                render_stage_value(&Bson::Document(spec.clone())),
+                bson_type_name(v)
+            ),
+        )),
+    }
+}
+
+/// A `$[<identifier>]` in an update path with no matching `arrayFilters` entry:
+/// `No array filter found for identifier 'e' in path 'a.$[e]'` (BadValue, 2).
+///
+/// mongod decides this from the update document ALONE, before touching a
+/// document — so it fires even when the field is not an array. That is exactly
+/// the case this server got wrong: the engine's walk returns early for a
+/// non-array value, so `{$set: {"a.$[e]": 1}}` with no filters reported ok:1
+/// against `{a: 1}` and wrote nothing. Checked here, at the command layer,
+/// rather than in the engine, because the engine's only failure signal is
+/// `Fallback` — which on a server with no Python becomes a generic BadValue
+/// with the wrong text. Same template as [`stage_spec_error`].
+pub fn array_filter_identifier_error(
+    update: &Document,
+    filters: &[Document],
+) -> Option<CommandError> {
+    // Reuse the engine's extractor rather than reading the filter's top-level
+    // keys: an identifier may be nested inside `$and` / `$or` / `$nor`
+    // (`[{$and: [{"x.g": {$gt: 8}}]}]` names `x`), and a naive read reported
+    // that valid filter as missing.
+    let named: Vec<String> = filters
+        .iter()
+        .flat_map(secantus_core::update::extract_af_identifiers)
+        .collect();
+    for value in update.values() {
+        let Bson::Document(payload) = value else {
+            continue;
+        };
+        for path in payload.keys() {
+            for part in path.split('.') {
+                if let Some(name) = part.strip_prefix("$[").and_then(|p| p.strip_suffix(']')) {
+                    if !name.is_empty() && !named.iter().any(|n| n == name) {
+                        return Some(bad_value(format!(
+                            "No array filter found for identifier '{name}' in path '{path}'"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `Hint must be a string or an object` (FailedToParse, 9).
+///
+/// Not the BSON-field family: no field name, no type name, and an explicit
+/// `null` is rejected like any other wrong type. The same message serves
+/// `find` / `count` / `aggregate` / `update` / `delete` / `findAndModify`, so
+/// one validator covers six commands. A *string* hint naming no index is a
+/// different, later error (the planner's), not this one.
+pub fn require_hint(doc: &Document, field: &str) -> Result<(), CommandError> {
+    match doc.get(field) {
+        None | Some(Bson::String(_)) | Some(Bson::Document(_)) => Ok(()),
+        Some(_) => Err(failed_to_parse("Hint must be a string or an object")),
+    }
+}
+
+/// `renameCollection.dropTarget`: a bool OR binData. The binData half looks
+/// like a mistake and is mongod's, measured on 8.2.11 — it is the type list
+/// the IDL emits, so fidelity means carrying it.
+pub fn require_bool_or_bindata(
+    doc: &Document,
+    field: &str,
+    path: &str,
+) -> Result<(), CommandError> {
+    match doc.get(field) {
+        None | Some(Bson::Boolean(_)) | Some(Bson::Binary(_)) => Ok(()),
+        Some(v) => Err(type_mismatch(format!(
+            "BSON field '{path}' is the wrong type '{}', expected types '[bool, binData]'",
+            bson_type_name(v)
+        ))),
+    }
+}
+
+/// A required string slot, where an explicit `null` means ABSENT rather than
+/// wrong-typed and answers 40414 instead of 14 — the same null-means-absent
+/// rule `createIndexes.indexes` follows. `getMore.collection` and
+/// `renameCollection.to` share it.
+pub fn require_required_string(
+    doc: &Document,
+    field: &str,
+    path: &str,
+) -> Result<(), CommandError> {
+    match doc.get(field) {
+        Some(Bson::String(_)) => Ok(()),
+        None | Some(Bson::Null) => Err(CommandError::new(
+            40414,
+            "Location40414",
+            format!("BSON field '{path}' is missing but a required field"),
+        )),
+        Some(v) => Err(type_mismatch(format!(
+            "BSON field '{path}' is the wrong type '{}', expected type 'string'",
+            bson_type_name(v)
+        ))),
+    }
+}
+
+/// The array counterpart of [`require_required_string`] (`killCursors.cursors`).
+pub fn require_required_array(doc: &Document, field: &str, path: &str) -> Result<(), CommandError> {
+    match doc.get(field) {
+        Some(Bson::Array(_)) => Ok(()),
+        None | Some(Bson::Null) => Err(CommandError::new(
+            40414,
+            "Location40414",
+            format!("BSON field '{path}' is missing but a required field"),
+        )),
+        Some(v) => Err(type_mismatch(format!(
+            "BSON field '{path}' is the wrong type '{}', expected type 'array'",
+            bson_type_name(v)
+        ))),
+    }
+}
+
+/// `dropIndexes.index`: a string (a name) or an object (a key pattern).
+///
+/// The type list in the message is not constant — an ARRAY is told the expected
+/// type is `'[string]'` while every other wrong type is told `'[string, object]'`.
+/// Measured on 8.2.11, not derived; an array is presumably reaching a different
+/// IDL overload. A document falls through to the index lookup, which answers 27.
+pub fn require_index_name_or_key(
+    doc: &Document,
+    field: &str,
+    path: &str,
+) -> Result<(), CommandError> {
+    match doc.get(field) {
+        None | Some(Bson::String(_)) | Some(Bson::Document(_)) => Ok(()),
+        Some(v @ Bson::Array(_)) => Err(type_mismatch(format!(
+            "BSON field '{path}' is the wrong type '{}', expected types '[string]'",
+            bson_type_name(v)
+        ))),
+        Some(v) => Err(type_mismatch(format!(
+            "BSON field '{path}' is the wrong type '{}', expected types '[string, object]'",
+            bson_type_name(v)
+        ))),
+    }
+}
+
+/// `count.limit`'s value check: `limit value is not a valid number`
+/// (BadValue, 2).
+///
+/// `count.limit` does NOT use the BSON-field family its neighbours use, and it
+/// rejects an explicit `null` where that family accepts one. Probed on 8.2.11 —
+/// `count.skip` right beside it answers the ordinary numeric type error, so two
+/// adjacent slots on one command take two different families.
+pub fn require_count_limit(doc: &Document, field: &str) -> Result<(), CommandError> {
+    match doc.get(field) {
+        None
+        | Some(Bson::Int32(_))
+        | Some(Bson::Int64(_))
+        | Some(Bson::Double(_))
+        | Some(Bson::Decimal128(_)) => Ok(()),
+        Some(_) => Err(bad_value(format!("{field} value is not a valid number"))),
+    }
+}
+
 /// `createIndexes.indexes`: on 8.x an explicit `null` means the required field
 /// is ABSENT, and answers exactly what omitting it answers — the same
 /// null-means-absent rule as `findAndModify.arrayFilters` and
@@ -707,6 +908,118 @@ pub fn stage_spec_error(pipeline: &[Bson]) -> Option<(i32, String)> {
                     ),
                 )),
             },
+            // --- stages added by the 2026-08-31 wide sweep --------------------
+            // Each carries mongod's own code AND its own wording; the family
+            // looks uniform and is not. Four different verbs ("must be an
+            // object" / "expected an object as" / "Argument to … must be"),
+            // two different capitalisations of "The", and `$project` names no
+            // type at all while its neighbours all do. Probed on 8.2.11.
+            "$addFields" | "$set" if !matches!(spec, Bson::Document(_)) => Some((
+                40272,
+                format!(
+                    "$addFields specification stage must be an object, got {}",
+                    bson_type_name(spec)
+                ),
+            )),
+            "$project" if !matches!(spec, Bson::Document(_)) => Some((
+                15969,
+                "$project specification must be an object".to_string(),
+            )),
+            "$replaceRoot" | "$replaceWith" if !matches!(spec, Bson::Document(_)) => Some((
+                40229,
+                format!(
+                    "expected an object as specification for $replaceRoot stage, got {}",
+                    bson_type_name(spec)
+                ),
+            )),
+            // The only stage that echoes the offending VALUE rather than its
+            // type, and it prefixes it with the stage name again.
+            "$facet" if !matches!(spec, Bson::Document(_)) => Some((
+                40169,
+                format!(
+                    "the $facet specification must be a non-empty object, but found: $facet: {}",
+                    render_stage_value(spec)
+                ),
+            )),
+            "$bucket" if !matches!(spec, Bson::Document(_)) => Some((
+                40201,
+                format!(
+                    "Argument to $bucket stage must be an object, but found type: {}.",
+                    bson_type_name(spec)
+                ),
+            )),
+            // Three codes for one stage, split by what the spec IS rather than
+            // by whether it is valid: a non-string non-object is 40149, a
+            // string that is not $-prefixed is 40148, and an empty object is
+            // 40147 — the same message text under two different codes.
+            "$sortByCount" => match spec {
+                Bson::String(s) if s.starts_with('$') => None,
+                Bson::String(_) => Some((
+                    40148,
+                    "the sortByCount field must be defined as a $-prefixed path or an \
+                     expression inside an object"
+                        .to_string(),
+                )),
+                Bson::Document(d) if d.is_empty() => Some((
+                    40147,
+                    "the sortByCount field must be defined as a $-prefixed path or an \
+                     expression inside an object"
+                        .to_string(),
+                )),
+                Bson::Document(_) => None,
+                _ => Some((
+                    40149,
+                    "the sortByCount field must be specified as a string or as an object"
+                        .to_string(),
+                )),
+            },
+            "$geoNear" if !matches!(spec, Bson::Document(_)) => Some((
+                10065,
+                "invalid parameter: expected an object ($geoNear)".to_string(),
+            )),
+            "$graphLookup" if !matches!(spec, Bson::Document(_)) => Some((
+                9,
+                format!(
+                    "the $graphLookup stage specification must be an object, but found {}",
+                    bson_type_name(spec)
+                ),
+            )),
+            // Takes a string as well — the collection to union with.
+            "$unionWith" if !matches!(spec, Bson::Document(_) | Bson::String(_)) => Some((
+                9,
+                format!(
+                    "the $unionWith stage specification must be an object or string, \
+                         but found {}",
+                    bson_type_name(spec)
+                ),
+            )),
+            "$setWindowFields" if !matches!(spec, Bson::Document(_)) => Some((
+                9,
+                format!(
+                    "the $setWindowFields stage specification must be an object, found {}",
+                    bson_type_name(spec)
+                ),
+            )),
+            // Capital "The" on these two, lowercase "the" on $setWindowFields
+            // directly above. mongod's own inconsistency; fidelity means keeping it.
+            "$densify" if !matches!(spec, Bson::Document(_)) => Some((
+                9,
+                format!(
+                    "The $densify stage specification must be an object, found {}",
+                    bson_type_name(spec)
+                ),
+            )),
+            "$fill" if !matches!(spec, Bson::Document(_)) => Some((
+                9,
+                format!(
+                    "The $fill stage specification must be an object, found {}",
+                    bson_type_name(spec)
+                ),
+            )),
+            "$sample" if !matches!(spec, Bson::Document(_)) => Some((
+                28745,
+                "the $sample stage specification must be an object".to_string(),
+            )),
             _ => None,
         };
         if err.is_some() {
@@ -850,5 +1163,177 @@ mod stage_tests {
             Bson::Document(doc! {"$count": "n"}),
         ];
         assert!(stage_spec_error(&pipeline).is_none());
+    }
+
+    /// The 2026-08-31 sweep's stages. Each code is mongod 8.2.11's own; a
+    /// blanket "spec must be an object" rule would give one code to all of them
+    /// and match none.
+    #[test]
+    fn swept_stages_each_carry_their_own_code() {
+        for (stage, code) in [
+            ("$addFields", 40272),
+            ("$set", 40272),
+            ("$project", 15969),
+            ("$replaceRoot", 40229),
+            ("$replaceWith", 40229),
+            ("$facet", 40169),
+            ("$bucket", 40201),
+            ("$geoNear", 10065),
+            ("$graphLookup", 9),
+            ("$unionWith", 9),
+            ("$setWindowFields", 9),
+            ("$densify", 9),
+            ("$fill", 9),
+            ("$sample", 28745),
+        ] {
+            assert_eq!(err_for(stage, Bson::Int32(5)).0, code, "{stage}");
+        }
+    }
+
+    #[test]
+    fn swept_stages_use_mongods_own_wording() {
+        assert_eq!(
+            err_for("$addFields", Bson::String("x".into())).1,
+            "$addFields specification stage must be an object, got string"
+        );
+        assert_eq!(
+            err_for("$bucket", Bson::Boolean(true)).1,
+            "Argument to $bucket stage must be an object, but found type: bool."
+        );
+        // The only one that echoes the VALUE, and it repeats the stage name.
+        assert_eq!(
+            err_for("$facet", Bson::String("x".into())).1,
+            "the $facet specification must be a non-empty object, but found: $facet: \"x\""
+        );
+        // Capital "The" here, lowercase on $setWindowFields — mongod's own
+        // inconsistency, not a typo in the port.
+        assert!(err_for("$densify", Bson::Int32(5))
+            .1
+            .starts_with("The $densify"));
+        assert!(err_for("$setWindowFields", Bson::Int32(5))
+            .1
+            .starts_with("the $setWindowFields"));
+    }
+
+    #[test]
+    fn union_with_takes_a_string_and_sort_by_count_splits_three_ways() {
+        // $unionWith's string form names a collection, so it is valid.
+        assert!(stage_spec_error(&[Bson::Document(doc! {"$unionWith": "other"})]).is_none());
+        // $sortByCount: three codes, split by what the spec IS.
+        assert_eq!(err_for("$sortByCount", Bson::Int32(5)).0, 40149);
+        assert_eq!(
+            err_for("$sortByCount", Bson::String("nodollar".into())).0,
+            40148
+        );
+        assert_eq!(
+            err_for("$sortByCount", Bson::Document(Document::new())).0,
+            40147
+        );
+        assert!(stage_spec_error(&[Bson::Document(doc! {"$sortByCount": "$a"})]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod swept_slot_tests {
+    use super::*;
+    use bson::doc;
+
+    #[test]
+    fn hint_rejects_everything_that_is_not_a_string_or_object() {
+        assert!(require_hint(&doc! {"hint": "i_1"}, "hint").is_ok());
+        assert!(require_hint(&doc! {"hint": {"a": 1}}, "hint").is_ok());
+        assert!(require_hint(&doc! {}, "hint").is_ok());
+        for bad in [Bson::Int32(5), Bson::Boolean(true), Bson::Null] {
+            let err = require_hint(&doc! {"hint": bad}, "hint").unwrap_err();
+            assert_eq!(err.code, 9);
+            assert_eq!(err.errmsg, "Hint must be a string or an object");
+        }
+    }
+
+    #[test]
+    fn a_required_slot_reads_null_as_absent() {
+        // 40414 (missing), not 14 (wrong type) -- the null-means-absent rule.
+        for d in [doc! {"collection": Bson::Null}, doc! {}] {
+            let err = require_required_string(&d, "collection", "getMore.collection").unwrap_err();
+            assert_eq!(err.code, 40414);
+            assert_eq!(
+                err.errmsg,
+                "BSON field 'getMore.collection' is missing but a required field"
+            );
+        }
+        let err =
+            require_required_string(&doc! {"collection": 5}, "collection", "getMore.collection")
+                .unwrap_err();
+        assert_eq!(err.code, 14);
+    }
+
+    #[test]
+    fn count_limit_and_skip_take_different_families() {
+        // Two adjacent numeric slots on one command, two rules: `limit`
+        // rejects null with its own BadValue wording, `skip` accepts it.
+        let err = require_count_limit(&doc! {"limit": Bson::Null}, "limit").unwrap_err();
+        assert_eq!(err.code, 2);
+        assert_eq!(err.errmsg, "limit value is not a valid number");
+        assert!(require_number(&doc! {"skip": Bson::Null}, "skip", "count.skip").is_ok());
+    }
+
+    #[test]
+    fn drop_indexes_names_a_different_type_list_for_an_array() {
+        let err = require_index_name_or_key(&doc! {"index": [1]}, "index", "dropIndexes.index")
+            .unwrap_err();
+        assert!(
+            err.errmsg.ends_with("expected types '[string]'"),
+            "{}",
+            err.errmsg
+        );
+        let err = require_index_name_or_key(&doc! {"index": 5}, "index", "dropIndexes.index")
+            .unwrap_err();
+        assert!(
+            err.errmsg.ends_with("expected types '[string, object]'"),
+            "{}",
+            err.errmsg
+        );
+    }
+
+    #[test]
+    fn index_spec_bool_and_ttl_carry_mongods_broken_quoting() {
+        // mongod never closes the quote it opens before the field name. This
+        // asserts the defect on purpose: fidelity is the point.
+        let spec = doc! {"key": {"a": 1}, "name": "i", "unique": "x"};
+        let err = require_index_spec_bool(&spec, "unique").unwrap_err();
+        assert!(
+            err.errmsg.contains(
+                "The field 'unique has value unique: \"x\", which is not convertible to bool"
+            ),
+            "{}",
+            err.errmsg
+        );
+        // A number IS convertible, so this one is accepted.
+        let ok = doc! {"key": {"a": 1}, "name": "i", "unique": 1.5};
+        assert!(require_index_spec_bool(&ok, "unique").is_ok());
+
+        let ttl = doc! {"key": {"a": 1}, "name": "i", "expireAfterSeconds": "x"};
+        let err = require_index_spec_ttl(&ttl, "expireAfterSeconds").unwrap_err();
+        assert_eq!(err.code, 67);
+        assert!(err.errmsg.starts_with(". Index spec: "), "{}", err.errmsg);
+    }
+
+    #[test]
+    fn an_unmatched_array_filter_identifier_is_named() {
+        let update = doc! {"$set": {"a.$[e]": 1}};
+        let err = array_filter_identifier_error(&update, &[]).unwrap();
+        assert_eq!(err.code, 2);
+        assert_eq!(
+            err.errmsg,
+            "No array filter found for identifier 'e' in path 'a.$[e]'"
+        );
+        // Present -> fine. `$[]` (no identifier) never needs a filter.
+        let f = vec![doc! {"e.x": 1}];
+        assert!(array_filter_identifier_error(&update, &f).is_none());
+        assert!(array_filter_identifier_error(&doc! {"$set": {"a.$[]": 1}}, &[]).is_none());
+        // An identifier nested inside `$and` is named by that filter too — a
+        // top-level-keys-only read called this valid filter missing.
+        let nested = vec![doc! {"$and": [{"e.g": {"$gt": 8}}]}];
+        assert!(array_filter_identifier_error(&update, &nested).is_none());
     }
 }

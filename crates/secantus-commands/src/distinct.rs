@@ -10,12 +10,18 @@ use bson::{doc, Bson, Document};
 use secantus_core::collation::Collation;
 use secantus_core::get_path;
 
+use crate::argtypes;
 use crate::util::{coll_arg, collation_of, command_error, doc_field};
 use crate::{CommandContext, CommandError, HandlerResult};
 
 /// `distinct` — return the distinct values of `key` over docs matching `query`.
 pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "distinct")?;
+    // mongod reports these two under the IDL struct name
+    // (`distinctCommandRequest`), not under the command name `distinct` that
+    // `distinct.key` above uses. Two naming conventions on one command; probed.
+    argtypes::require_object(doc, "query", "distinctCommandRequest.query")?;
+    argtypes::require_object(doc, "collation", "distinctCommandRequest.collation")?;
     let key = match doc.get("key") {
         Some(Bson::String(s)) => s.clone(),
         // An explicit null is MISSING to mongod, not wrong-typed: a required

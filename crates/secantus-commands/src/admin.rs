@@ -77,6 +77,38 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Before the namespace checks: mongod parses the command before executing it,
     // so a wrong-typed option on a MISSING collection is still the type error.
     argtypes::require_object(doc, "storageEngine", "create.storageEngine")?;
+    argtypes::require_object(doc, "validator", "create.validator")?;
+    argtypes::require_object(doc, "timeseries", "create.timeseries")?;
+    // `capped` is bool-OR-number here; `size` / `max` are plain numeric. A null
+    // in any of the three is ACCEPTED as absent and then answers the semantic
+    // error ("the 'size' field is required when 'capped' is true"), not a type
+    // error — which is why these use the null-tolerant validators.
+    argtypes::require_bool_or_number(doc, "capped", "create.capped")?;
+    argtypes::require_number(doc, "size", "create.size")?;
+    argtypes::require_number(doc, "max", "create.max")?;
+    // Past the type checks, two SEMANTIC rules mongod applies to the same three
+    // options. A null reaches here (null means absent to the validators above),
+    // which is why `capped: null, size: 4096` lands on the second one.
+    let capped_true = matches!(doc.get("capped"), Some(Bson::Boolean(true)))
+        || matches!(doc.get("capped"), Some(Bson::Int32(n)) if *n != 0)
+        || matches!(doc.get("capped"), Some(Bson::Int64(n)) if *n != 0)
+        || matches!(doc.get("capped"), Some(Bson::Double(d)) if *d != 0.0);
+    let has = |f: &str| !matches!(doc.get(f), None | Some(Bson::Null));
+    if capped_true && !has("size") {
+        return Err(CommandError::new(
+            72,
+            "InvalidOptions",
+            "the 'size' field is required when 'capped' is true",
+        ));
+    }
+    if !capped_true && (has("size") || has("max")) {
+        return Err(CommandError::new(
+            72,
+            "InvalidOptions",
+            "the 'capped' field needs to be true when either the 'size' or 'max' fields \
+             are present",
+        ));
+    }
     let coll = coll_arg(doc, "create")?;
     if let Some(unknown) = first_unknown_field(doc, CREATE_KNOWN_OPTIONS) {
         return Ok(CommandError::new(
@@ -159,6 +191,13 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// when the collection doesn't exist. (TTL-index `index` modification deferred.)
 pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_object(doc, "index", "collMod.index")?;
+    argtypes::require_object(doc, "validator", "collMod.validator")?;
+    argtypes::require_object(
+        doc,
+        "changeStreamPreAndPostImages",
+        "collMod.changeStreamPreAndPostImages",
+    )?;
+    argtypes::require_string(doc, "viewOn", "collMod.viewOn")?;
     let coll = match doc.get("collMod").or_else(|| doc.get("collmod")) {
         Some(Bson::String(s)) => s.clone(),
         _ => {
@@ -633,6 +672,11 @@ pub fn archive_base_snapshot(doc: &Document, ctx: &mut CommandContext) -> Handle
 /// collation / timeseries / …) so drivers introspecting them see the real
 /// values. Mirrors `commands._list_collections`.
 pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    argtypes::require_object(doc, "filter", "listCollections.filter")?;
+    argtypes::require_object(doc, "cursor", "listCollections.cursor")?;
+    if let Some(Bson::Document(c)) = doc.get("cursor") {
+        argtypes::require_number(c, "batchSize", "listCollections.cursor.batchSize")?;
+    }
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
     let filter = doc
@@ -789,6 +833,9 @@ pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
 pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Nullable here, unlike aggregate's -- mongod accepts `cursor: null`.
     argtypes::require_cursor_object_nullable(doc)?;
+    if let Some(Bson::Document(c)) = doc.get("cursor") {
+        argtypes::require_number(c, "batchSize", "listIndexes.cursor.batchSize")?;
+    }
     let coll = coll_arg(doc, "listIndexes")?;
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
@@ -990,6 +1037,18 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
                 argtypes::require_index_spec_field(spec, "name", "a string", |v| {
                     matches!(v, bson::Bson::String(_))
                 })?;
+                for field in ["collation", "partialFilterExpression"] {
+                    argtypes::require_index_spec_field(spec, field, "an object", |v| {
+                        matches!(v, bson::Bson::Document(_))
+                    })?;
+                }
+                // Two more families INSIDE one spec: the bool options quote the
+                // spec back with mongod's unclosed quote, and the TTL option
+                // answers 67 rather than 14.
+                for field in ["unique", "sparse"] {
+                    argtypes::require_index_spec_bool(spec, field)?;
+                }
+                argtypes::require_index_spec_ttl(spec, "expireAfterSeconds")?;
             }
         }
     }
@@ -1152,6 +1211,7 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
 
 /// `dropIndexes` — drop a named index, or all of them with `"*"`.
 pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    argtypes::require_index_name_or_key(doc, "index", "dropIndexes.index")?;
     let coll = coll_arg(doc, "dropIndexes")?;
     let storage = ctx.storage()?;
     let before = storage
@@ -1181,12 +1241,35 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 .into_reply());
             }
         }
-        Some(Bson::Document(_)) => {
-            return Err(CommandError::new(
-                1,
-                "InternalError",
-                "dropIndexes by key spec is not yet supported by the Rust server",
-            ));
+        // Drop by KEY PATTERN rather than by name. This answered code 1
+        // (InternalError) — the crash code — for a shape mongod handles
+        // routinely, so a supported operation looked like a server fault. The
+        // lookup is just a scan of the catalog for a matching `key`.
+        Some(Bson::Document(key)) => {
+            let named = storage
+                .list_indexes(&ctx.db_name, &coll)
+                .map_err(command_error)?
+                .into_iter()
+                .find(|idx| idx.get_document("key").map(|k| k == key).unwrap_or(false))
+                .and_then(|idx| idx.get_str("name").ok().map(str::to_string));
+            match named {
+                Some(name) => {
+                    storage
+                        .drop_index(&ctx.db_name, &coll, &name)
+                        .map_err(command_error)?;
+                }
+                None => {
+                    return Ok(CommandError::new(
+                        27,
+                        "IndexNotFound",
+                        format!(
+                            "can't find index with key: {}",
+                            argtypes::render_stage_value(&Bson::Document(key.clone()))
+                        ),
+                    )
+                    .into_reply());
+                }
+            }
         }
         _ => {
             return Ok(CommandError::new(
@@ -1209,6 +1292,8 @@ pub fn drop_database(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
 
 /// `renameCollection` — rename `renameCollection` (a full `db.coll` ns) to `to`.
 pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    argtypes::require_required_string(doc, "to", "renameCollection.to")?;
+    argtypes::require_bool_or_bindata(doc, "dropTarget", "renameCollection.dropTarget")?;
     let src = match doc.get("renameCollection") {
         Some(Bson::String(s)) => s.clone(),
         _ => {

@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use bson::{doc, Bson, Document};
 
+use crate::argtypes;
 use crate::util::as_i64;
 use crate::{
     CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE, MAX_GETMORE_BATCH_BYTES,
@@ -601,6 +602,11 @@ fn mint_id(cursors: &HashMap<i64, Entry>, tailable: bool) -> Result<i64, CursorE
 /// `getMore` — pull the next batch from a cursor. Non-tailable path; the
 /// tailable change-stream path is deferred (see the module docs).
 pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    // mongod PARSES before it looks the cursor up, so a wrong-typed argument is
+    // its own error rather than CursorNotFound about a cursor that exists.
+    argtypes::require_required_string(doc, "collection", "getMore.collection")?;
+    argtypes::require_number(doc, "batchSize", "getMore.batchSize")?;
+    argtypes::require_number(doc, "maxTimeMS", "getMore.maxTimeMS")?;
     let cursor_id = doc
         .get("getMore")
         .and_then(as_i64)
@@ -764,6 +770,9 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
 /// `killCursors` — explicitly close cursors.
 pub fn kill_cursors(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    // A non-array `cursors` used to fall through to an empty list and report
+    // ok:1 — the caller was told cursors it named were killed when none were.
+    argtypes::require_required_array(doc, "cursors", "killCursors.cursors")?;
     let cursor_ids: Vec<i64> = match doc.get("cursors") {
         Some(Bson::Array(a)) => a.iter().filter_map(as_i64).collect(),
         _ => Vec::new(),

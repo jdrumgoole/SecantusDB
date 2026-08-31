@@ -199,13 +199,20 @@ Sub-ms `ORDER BY` is adjacent to work already landed and should be cheap.
       crashes + 44 divergences; closed across four PRs (#1078 document-valued,
       #1080 numeric/cursor, #1084 the 24 silently-accepted, plus the wrong-code
       slice). Detail and the per-slot lessons are in `backlog.md` §3.
-      **The Rust server has not been swept for this class as a whole** — point
-      the same probe at `secantusd-rs`; that measurement has still never been
-      taken. One data point exists as of 2026-08-30: the `maxTimeMS` slot was
-      checked, and the Rust server had the identical defect (the 6.0 contract,
-      applied to 3 commands instead of 1), fixed on both servers in the same PR.
-      That is one slot out of the sweep's 87, so it hints the class ports across
-      wholesale rather than settling it.
+      **The Rust server HAS been swept — twice, and this paragraph was stale
+      when it said otherwise** (`tasks/backlog.md` wins per `CLAUDE.md`, and it
+      recorded the first sweep on 2026-08-29: 78 of 87 divergent → clean, then
+      244/244). The hint that "the class ports across wholesale" was right: it
+      did.
+
+      **The sweep's own reach was the real gap.** `arg_types_extended.py`
+      compares CODES only. Comparing MESSAGES over 685 shapes on 2026-08-31
+      found **76 further slots** divergent on the Rust server, almost all
+      silently accepted — closed, with the residue recorded in `backlog.md`.
+      **The PYTHON server is now the open half of this item**: same 685 shapes,
+      ~61 slots, and **18 crashes** answering `internal server error` from an
+      `int()` over a wrong-typed value — the crash class #1080 closed, on the
+      slots its corpus never reached.
 - [ ] **Aggregation runtime errors lack mongod's wrapper prefix — STILL OPEN in
       general, but the framing "message text only" was WRONG and cost a real
       bug three weeks (measured 2026-08-31 against 8.2.11).** mongod picks
