@@ -13,7 +13,8 @@ command, which is why this needs more than one blanket check:
   missing space; fidelity means reproducing it)
 * ``count`` / ``distinct`` / ``delete`` / ``update`` / ``findAndModify`` --
   ``BSON field 'count.query' is the wrong type 'int', expected type 'object'``
-* ``aggregate`` -- ``'pipeline' option must be specified as an array``
+* ``aggregate`` -- ``A pipeline must be an array of objects`` (re-probed
+  8.2.11 2026-08-31; the old assertion here pinned OUR wording)
 * ``update``'s ``u`` -- accepts an object OR an array, so a scalar is
   ``FailedToParse`` (9) while an array of non-documents is the pipeline-element
   error (14)
@@ -68,7 +69,8 @@ def test_find_document_args(db, field, bad) -> None:
     "cmd,path",
     [
         ({"count": "c"}, "count.query"),
-        ({"distinct": "c", "key": "a"}, "distinct.query"),
+        # 8.x names the IDL STRUCT for distinct, as it does for `.key`.
+        ({"distinct": "c", "key": "a"}, "distinctCommandRequest.query"),
     ],
 )
 def test_query_arg_uses_the_bson_field_form(db, cmd, path, bad) -> None:
@@ -112,7 +114,7 @@ def test_update_statement_u_array_of_non_documents(db) -> None:
 def test_aggregate_pipeline_must_be_an_array(db, bad) -> None:
     err = _err(db, {"aggregate": "c", "pipeline": bad, "cursor": {}})
     assert err.code == 14
-    assert err.details["errmsg"] == "'pipeline' option must be specified as an array"
+    assert err.details["errmsg"] == "A pipeline must be an array of objects"
 
 
 @pytest.mark.parametrize("bad", BAD)

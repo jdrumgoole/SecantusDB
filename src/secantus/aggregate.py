@@ -2804,8 +2804,11 @@ def _stage_facet(
     # non-empty object (40171), and no nested $facet (40600). Without this a
     # non-object stage element (`{a: [5]}`) leaks a Python TypeError.
     if not isinstance(spec, Mapping) or not spec:
+        from secantus.bsontypes import render_bson
+
         raise AggregateError(
-            f"the $facet specification must be a non-empty object, but found: $facet: {spec!r}",
+            f"the $facet specification must be a non-empty object, but found: "
+            f"$facet: {render_bson(spec)}",
             code=40169,
             code_name="Location40169",
         )

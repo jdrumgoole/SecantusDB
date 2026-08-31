@@ -224,9 +224,16 @@ def _validate_write_concern(doc: Mapping[str, Any]) -> dict[str, Any] | None:
     if wc is None:
         return None
     if not isinstance(wc, Mapping):
+        # mongod names the command in the path (`insert.writeConcern`), and
+        # every command that takes a write concern puts its own name there.
+        # The first key of the request document IS the command name.
+        command = next(iter(doc), "writeConcern")
         return {
             "ok": 0.0,
-            "errmsg": "writeConcern must be a document",
+            "errmsg": (
+                f"BSON field '{command}.writeConcern' is the wrong type "
+                f"'{_bson_type_of(wc)}', expected type 'object'"
+            ),
             "code": 14,
             "codeName": "TypeMismatch",
         }
@@ -2233,6 +2240,11 @@ def _insert(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "codeName": "InvalidLength",
         }
     ordered = doc.get("ordered", True)
+    _err = _require_bool_or_number_bson_field(
+        doc.get("bypassDocumentValidation"), "insert.bypassDocumentValidation"
+    )
+    if _err is not None:
+        return _err
     bypass_validation = bool(doc.get("bypassDocumentValidation", False))
     # Collection-level ``validator`` (set via ``create`` / ``collMod``)
     # is enforced unless the caller passed ``bypassDocumentValidation:
@@ -2317,7 +2329,7 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     from secantus.storage import BadHint, MinMaxKeyError
 
     coll = doc["find"]
-    _err = _require_hint_type(doc.get("hint"))
+    _err = _require_hint_type(doc)
     if _err is not None:
         return _err
     _err = _require_object_bson_field(doc.get("readConcern"), "FindCommandRequest.readConcern")
@@ -2709,13 +2721,23 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     )
     if _err is not None:
         return _err
+    _updates = doc.get("updates")
+    if isinstance(_updates, (list, Mapping)) and not _updates:
+        # An empty batch, whether sent as `[]` or `{}` -- the wire layer merges
+        # a kind-1 document sequence into a list, so both arrive the same way.
+        return {
+            "ok": 0.0,
+            "errmsg": "Write batch sizes must be between 1 and 100000. Got 0 operations.",
+            "code": 16,
+            "codeName": "Location16",
+        }
     # Parsed up front, like ``delete``: mongod validates every statement before
     # applying any, so a wrong-typed hint / collation anywhere in the batch is
     # a command-level error and NOTHING is written.
     for _stmt in doc.get("updates") or []:
         if not isinstance(_stmt, Mapping):
             continue
-        _err = _require_hint_type(_stmt.get("hint"))
+        _err = _require_hint_type(_stmt)
         if _err is not None:
             return _err
         _err = _require_object_bson_field(_stmt.get("collation"), "update.updates.collation")
@@ -2727,6 +2749,11 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         return oplog_err
     updates = doc.get("updates", [])
     ordered = bool(doc.get("ordered", True))
+    _err = _require_bool_or_number_bson_field(
+        doc.get("bypassDocumentValidation"), "update.bypassDocumentValidation"
+    )
+    if _err is not None:
+        return _err
     bypass_validation = bool(doc.get("bypassDocumentValidation", False))
     # ``let`` — see ``_delete`` for the wire-shape rationale.
     let = _resolve_let_vars(doc.get("let"))
@@ -3218,13 +3245,21 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     )
     if _err is not None:
         return _err
+    _deletes = doc.get("deletes")
+    if isinstance(_deletes, (list, Mapping)) and not _deletes:
+        return {
+            "ok": 0.0,
+            "errmsg": "Write batch sizes must be between 1 and 100000. Got 0 operations.",
+            "code": 16,
+            "codeName": "Location16",
+        }
     # mongod parses every statement before running any, so a wrong-typed hint
     # or collation in ANY entry is a command-level error, not a writeError on
     # that entry -- and nothing is deleted. Probed 8.2.11.
     for _stmt in doc.get("deletes") or []:
         if not isinstance(_stmt, Mapping):
             continue
-        _err = _require_hint_type(_stmt.get("hint"))
+        _err = _require_hint_type(_stmt)
         if _err is not None:
             return _err
         _err = _require_object_bson_field(_stmt.get("collation"), "delete.deletes.collation")
@@ -3298,7 +3333,7 @@ def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     _err = _require_non_negative_number(doc.get("skip"), "skip")
     if _err is not None:
         return _err
-    _err = _require_hint_type(doc.get("hint"))
+    _err = _require_hint_type(doc)
     if _err is not None:
         return _err
     filter_ = doc.get("query") or {}
@@ -3366,7 +3401,7 @@ def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if _err is not None:
         return _err
     key = doc.get("key", "")
-    _err = _require_object_bson_field(doc.get("query"), "distinct.query")
+    _err = _require_object_bson_field(doc.get("query"), "distinctCommandRequest.query")
     if _err is not None:
         return _err
     filter_ = doc.get("query") or {}
@@ -3643,7 +3678,7 @@ def _index_spec_option_error(idx_spec: Mapping[str, Any]) -> dict[str, Any] | No
     return None
 
 
-def _require_hint_type(hint: Any) -> dict[str, Any] | None:
+def _require_hint_type(container: Mapping[str, Any], key: str = "hint") -> dict[str, Any] | None:
     """mongod's wrong-typed-``hint`` reply, or None if OK / absent.
 
     Probed 8.2.11 on find / count / aggregate / update / delete: every
@@ -3660,7 +3695,14 @@ def _require_hint_type(hint: Any) -> dict[str, Any] | None:
     RIGHT type naming an index that does not exist; that stays a per-statement
     writeError with code 2.
     """
-    if hint is None or isinstance(hint, (str, Mapping)):
+    if key not in container:
+        return None
+    hint = container[key]
+    # An explicit `hint: null` is REJECTED, where an absent hint is fine --
+    # re-probed 8.2.11 on find / count / aggregate / delete / findAndModify,
+    # all five answer 9. Taking the value alone could not tell the two apart,
+    # which is why this takes the container.
+    if isinstance(hint, (str, Mapping)):
         return None
     return {
         "ok": 0.0,
@@ -4212,14 +4254,15 @@ def _find_and_modify_impl(doc: dict[str, Any], ctx: CommandContext) -> dict[str,
     # 8.2.11, where it is still rejected (unlike ``find``). Note the WORDING
     # moved: 6.0.16 said "does not correspond to an existing index", 8.2.11
     # returns a planner error, so assert the rejection rather than the text.
+    _err = _require_hint_type(doc)
+    if _err is not None:
+        return _err
     hint = doc.get("hint")
-    if hint is not None and not isinstance(hint, (str, Mapping)):
-        return {
-            "ok": 0.0,
-            "errmsg": "Hint must be a string or an object",
-            "code": 9,
-            "codeName": "FailedToParse",
-        }
+    _err = _require_bool_or_number_bson_field(
+        doc.get("bypassDocumentValidation"), "findAndModify.bypassDocumentValidation"
+    )
+    if _err is not None:
+        return _err
     if isinstance(hint, Mapping) and not hint:
         hint = None  # ``hint: {}`` means "no hint", as it does on find
     if hint == "$natural" or (isinstance(hint, Mapping) and list(hint) == ["$natural"]):
@@ -4582,8 +4625,15 @@ def _rename_collection(doc: dict[str, Any], ctx: CommandContext) -> dict[str, An
     dst_ns = doc.get("to")
     # ``'[binData, bool]'`` is mongod's list verbatim (8.2.11) -- binData is
     # there because the IDL type is `safeBool`. Reproduced, not tidied.
+    if "to" in doc and doc["to"] is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "BSON field 'renameCollection.to' is missing but a required field",
+            "code": 40414,
+            "codeName": "IDLFailedToParse",
+        }
     _drop_target = doc.get("dropTarget")
-    if _drop_target is not None and not isinstance(_drop_target, (bool, bson.Binary, bytes)):
+    if "dropTarget" in doc and not isinstance(_drop_target, (bool, bson.Binary, bytes)):
         return {
             "ok": 0.0,
             "errmsg": (
@@ -4594,6 +4644,11 @@ def _rename_collection(doc: dict[str, Any], ctx: CommandContext) -> dict[str, An
             "codeName": "TypeMismatch",
         }
     drop_target = bool(doc.get("dropTarget", False))
+    _err = _require_typed_bson_field(
+        dst_ns, "renameCollection.to", expected="string", ok=lambda v: isinstance(v, str)
+    )
+    if _err is not None:
+        return _err
     if not isinstance(src_ns, str) or not isinstance(dst_ns, str):
         return {
             "ok": 0.0,
@@ -4659,28 +4714,60 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     oplog_err = _reject_oplog_rs_write(ctx, coll, "create")
     if oplog_err is not None:
         return oplog_err
-    capped = bool(doc.get("capped", False))
+    # Types before semantics: mongod parses the command, THEN validates the
+    # capped-collection rules, so a `size: "x"` is a TypeMismatch and never
+    # reaches the "required when capped is true" arm. All four rules below were
+    # re-probed on 8.2.11 (2026-08-31) and each contradicted what we did:
+    #
+    #   size / max wrong type      14, not our 72 with a semantic message
+    #   size or max without capped 72 "the 'capped' field needs to be true ..."
+    #                              -- we ACCEPTED this outright
+    #   capped: true, no size      72 "the 'size' field is required when
+    #                              'capped' is true" -- WITHOUT our trailing
+    #                              "and must be a positive number"
+    #   size < 1                   2 "BSON field 'size' value must be >= 1,
+    #                              actual value '<v>'" -- a bare name, floor 1
+    #   max                        has NO bounds at all: 0, -1 and 2.5 are all
+    #                              accepted, where we rejected anything <= 0
+    #
+    # `capped` takes a number as well as a bool (`capped: 1` is accepted).
+    _err = _require_bool_or_number_bson_field(doc.get("capped"), "create.capped")
+    if _err is not None:
+        return _err
+    _err = _require_number_bson_field(doc.get("size"), "create.size")
+    if _err is not None:
+        return _err
+    _err = _require_number_bson_field(doc.get("max"), "create.max")
+    if _err is not None:
+        return _err
+    capped = bool(doc.get("capped") or False)
+    if (doc.get("size") is not None or doc.get("max") is not None) and not capped:
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                "the 'capped' field needs to be true when either the 'size' "
+                "or 'max' fields are present"
+            ),
+            "code": 72,
+            "codeName": "InvalidOptions",
+        }
     if capped:
         size = doc.get("size")
-        if not isinstance(size, (int, float)) or isinstance(size, bool) or size <= 0:
+        if size is None:
             return {
                 "ok": 0.0,
-                "errmsg": (
-                    "the 'size' field is required when 'capped' is true "
-                    "and must be a positive number"
-                ),
+                "errmsg": "the 'size' field is required when 'capped' is true",
                 "code": 72,
                 "codeName": "InvalidOptions",
             }
-        max_docs = doc.get("max")
-        if max_docs is not None and (
-            not isinstance(max_docs, (int, float)) or isinstance(max_docs, bool) or max_docs <= 0
-        ):
+        size_number = _coerce_command_int(size) if not isinstance(size, float) else size
+        if size_number < 1:
+            rendered = int(size) if float(size) == int(size) else size
             return {
                 "ok": 0.0,
-                "errmsg": "the 'max' field must be a positive integer when set",
-                "code": 72,
-                "codeName": "InvalidOptions",
+                "errmsg": f"BSON field 'size' value must be >= 1, actual value '{rendered}'",
+                "code": 2,
+                "codeName": "BadValue",
             }
     stored: dict[str, Any] = {}
     if capped:
@@ -5111,15 +5198,14 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     cursor_opts = doc.get("cursor") or {}
     raw_bs = cursor_opts.get("batchSize")
     if raw_bs is not None:
-        try:
-            batch_size = int(raw_bs)
-        except (TypeError, ValueError):
-            return {
-                "ok": 0.0,
-                "errmsg": "BSON field 'batchSize' must be a number",
-                "code": 14,
-                "codeName": "TypeMismatch",
-            }
+        # `int()` took a bool happily (True -> 1) where mongod answers 14, and
+        # the fallback message was ours rather than mongod's. Same IDL path as
+        # listCollections: the TYPE error names `listIndexes.cursor.batchSize`,
+        # the value error below uses the bare name.
+        _err = _require_number_bson_field(raw_bs, "listIndexes.cursor.batchSize")
+        if _err is not None:
+            return _err
+        batch_size = _coerce_command_int(raw_bs)
         if batch_size < 0:
             return {
                 "ok": 0.0,
@@ -5425,13 +5511,44 @@ def _drop_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         return {
             "ok": 0.0,
             "errmsg": "cannot drop _id index",
-            "code": 67,
+            "code": 72,
             "codeName": "InvalidOptions",
         }
+    if isinstance(target, Mapping):
+        from secantus.bsontypes import render_bson
+
+        _match = next(
+            (
+                i.get("name")
+                for i in ctx.storage.list_indexes(ctx.db_name, coll)
+                if dict(i.get("key") or {}) == dict(target)
+            ),
+            None,
+        )
+        if _match is None:
+            return {
+                "ok": 0.0,
+                "errmsg": f"can't find index with key: {render_bson(target)}",
+                "code": 27,
+                "codeName": "IndexNotFound",
+            }
+        if _match == "_id_":
+            return {
+                "ok": 0.0,
+                "errmsg": "cannot drop _id index",
+                "code": 72,
+                "codeName": "InvalidOptions",
+            }
+        ctx.storage.drop_index(ctx.db_name, coll, _match)
+        return {"nIndexesWas": num_before, "ok": 1.0}
     if not isinstance(target, str):
+        _expected = "'[string]'" if isinstance(target, list) else "'[object, string]'"
         return {
             "ok": 0.0,
-            "errmsg": "index must be a string name or '*'",
+            "errmsg": (
+                f"BSON field 'dropIndexes.index' is the wrong type "
+                f"'{_bson_type_of(target)}', expected types {_expected}"
+            ),
             "code": 14,
             "codeName": "TypeMismatch",
         }
@@ -5750,7 +5867,11 @@ def _get_more(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 14,
             "codeName": "TypeMismatch",
         }
-    if "collection" not in doc:
+    if "collection" not in doc or doc["collection"] is None:
+        # An explicit null counts as MISSING for a required IDL field (40414),
+        # not as a wrong type -- probed 8.2.11, and the same rule holds for
+        # `renameCollection.to`. An OPTIONAL field with a declared type is the
+        # other way round: `renameCollection.dropTarget: null` is a 14.
         return {
             "ok": 0.0,
             "errmsg": "BSON field 'getMore.collection' is missing but a required field",
@@ -6023,7 +6144,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     _err = _require_object_bson_field(doc.get("readConcern"), "aggregate.readConcern")
     if _err is not None:
         return _err
-    _err = _require_hint_type(doc.get("hint"))
+    _err = _require_hint_type(doc)
     if _err is not None:
         return _err
     _err = _require_bool_value_field(doc, "allowDiskUse")
@@ -6076,7 +6197,7 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # "internal server error"; mongod names it as an option error.
         return {
             "ok": 0.0,
-            "errmsg": "'pipeline' option must be specified as an array",
+            "errmsg": "A pipeline must be an array of objects",
             "code": 14,
             "codeName": "TypeMismatch",
         }

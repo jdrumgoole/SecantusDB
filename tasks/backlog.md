@@ -615,8 +615,8 @@ Specific items that were left out of the slice that introduced their feature are
   stored document.
 
 - [ ] **OPEN — wrong-typed command arguments on the PYTHON server, measured by
-  MESSAGE rather than by code; 372 of 409 closed 2026-08-31, `create.*` and
-  `insert.bypassDocumentValidation` remain.** The 87/87 sweep
+  MESSAGE rather than by code. CODE divergences are at ZERO (2026-08-31); the
+  only residue is the unresolvable-`hint` planner dump, 6 message cases.** The 87/87 sweep
   below compares `(ok, code)`; comparing `(code, errmsg)` over 685 shapes
   (`tools/probes/arg_types_messages.py`, against mongod 8.2.11) found the
   Python server divergent on **409 CODE + 88 MSG**, including **18 shapes
@@ -657,10 +657,45 @@ Specific items that were left out of the slice that introduced their feature are
   the spec with Python's `repr`. Fixed; `tests/test_crud.py` had pinned our
   message rather than mongod's and was rewritten.
 
-  **The measured remainder is `create.capped` / `.size` / `.max` (18 cases)
-  and `insert.bypassDocumentValidation` (5), plus ~10 singletons** — CODE 37 /
-  MSG 57 as of 2026-08-31. Re-measure with the probe before working them; do
-  not work from this paragraph's counts alone.
+  **Third slice, 2026-08-31: CODE 36 → 0, MSG 55 → 6.** `create.capped` /
+  `.size` / `.max` (which was four separate defects, not one — see below),
+  `bypassDocumentValidation` on all three commands that take it,
+  `listIndexes.cursor.batchSize`, the explicit-`null` class, and the message
+  families (`insert.writeConcern`, `distinct` → `distinctCommandRequest.query`,
+  `aggregate.pipeline`, `renameCollection.to`, `dropIndexes.index`, `$facet`).
+
+  **The one thing deliberately NOT reproduced** is the unresolvable-`hint`
+  message, which is mongod's multi-line PLANNER DUMP rendering its parsed
+  match-expression tree (`{}` → `Tree: $and`, `{a: 1}` → `Tree: a $eq 1`,
+  plus `Sort:` / `Proj:` / `Collation:` lines). Reproducing it in general means
+  porting `MatchExpression::debugString`. It is 6 cases across the six commands
+  that take a hint, the CODE already matches (2), and a half-right tree
+  renderer would look authoritative while being wrong on anything nested.
+
+  Four things measured here that no amount of reading would have given, and
+  that a future slice should not re-derive:
+
+  * `create` was **four** defects, not one: `size`/`max` present without
+    `capped: true` was silently ACCEPTED (mongod: 72); our "size is required"
+    message carried a trailing clause mongod does not have; `size` has a floor
+    of **1** reported as `2 BSON field 'size' value must be >= 1`; and `max`
+    has **no bounds at all** (0, -1 and 2.5 all accepted) where we rejected
+    anything <= 0. Two tests pinned the old behaviour and were rewritten.
+  * An explicit **`hint: null` is rejected** (9) on all six commands, where an
+    absent hint is fine — so the validator has to take the container, not the
+    value.
+  * A **null in a REQUIRED field is "missing"** (40414: `getMore.collection`,
+    `renameCollection.to`); a null in an OPTIONAL typed field is a wrong TYPE
+    (14: `renameCollection.dropTarget`).
+  * **`dropIndexes` by KEY SPEC did not work at all** — every non-string was a
+    type error, so `{a: 1}` could not drop an index. mongod resolves the key
+    pattern and answers `27 can't find index with key: { z: 1 }` when none
+    matches. Also, `cannot drop _id index` is **72**, not the 67 both arms
+    used. The Rust server already supported the key form
+    (`tests/test_rust_arg_types_sweep.py`), so this was a Python-only gap.
+
+  Re-measure with `tools/probes/arg_types_messages.py` before working the
+  residue; do not work from this paragraph's counts alone.
 
   Two mongod asymmetries worth not re-deriving: `count`'s `limit` and `skip`
   take different parse paths (`limit` → `2 limit value is not a valid number`,
