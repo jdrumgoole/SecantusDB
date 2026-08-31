@@ -777,29 +777,14 @@ def validate_spec(spec: Mapping[str, Any]) -> None:
 
 
 def _bson_type_name(v: Any) -> str:
-    from bson import Decimal128, Int64
+    """mongod's type vocabulary for ``$changeStream`` option type errors.
 
-    if isinstance(v, bool):
-        return "bool"
-    if isinstance(v, Int64):
-        return "long"
-    if isinstance(v, int):
-        return "int"
-    if isinstance(v, float):
-        return "double"
-    if isinstance(v, Decimal128):
-        return "decimal"
-    if isinstance(v, str):
-        return "string"
-    if v is None:
-        return "null"
-    if isinstance(v, Timestamp):
-        return "timestamp"
-    if isinstance(v, Mapping):
-        return "object"
-    if isinstance(v, (list, tuple)):
-        return "array"
-    return type(v).__name__
+    Delegates to `secantus.bsontypes`. This copy also named every int ``int``,
+    where mongod calls an out-of-int32-range value ``long``.
+    """
+    from secantus.bsontypes import bson_type_name
+
+    return bson_type_name(v)
 
 
 def parse_spec(spec: Mapping[str, Any]) -> ChangeStreamSpec:

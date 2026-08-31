@@ -614,6 +614,48 @@ Specific items that were left out of the slice that introduced their feature are
   UNwrapped -- the wrapper must not spread to errors that do not depend on the
   stored document.
 
+- [ ] **OPEN — wrong-typed command arguments on the PYTHON server, measured by
+  MESSAGE rather than by code; 311 of 409 closed 2026-08-31, `createIndexes.*`
+  and `collMod.*` remain.** The 87/87 sweep
+  below compares `(ok, code)`; comparing `(code, errmsg)` over 685 shapes
+  (`tools/probes/arg_types_messages.py`, against mongod 8.2.11) found the
+  Python server divergent on **409 CODE + 88 MSG**, including **18 shapes
+  answering `1 internal server error`** — the crash class #1080 closed, on the
+  slots its corpus never reached.
+
+  Now **98 CODE + 57 MSG, 0 crashes**. Closed in this slice:
+  the four crashing slots (`count.limit` / `count.skip` /
+  `listCollections.cursor.batchSize` / `update.updates.arrayFilters`); the
+  type-name vocabulary (three partial copies of `_bson_type_name` collapsed
+  into `secantus/bsontypes.py` — Python class names such as `'ObjectId'` and
+  `'datetime'` were reaching the wire in place of `objectId` / `date`, in ~90
+  message sites); `hint` (9, not our `2 invalid hint type`); the document-valued
+  option slots (`collation` / `readConcern` / `validator` / `timeseries` /
+  `filter` / `cursor`); the aggregation stage-spec codes (`$project` 15969,
+  `$addFields` 40272, `$replaceRoot` 40229, `$bucket` 40201, `$bucketAuto`
+  40240, `$sample` 28745, `$geoNear` 10065, `$redact` 17053, and 9 for
+  `$densify` / `$fill` / `$setWindowFields` / `$unionWith`); and the boolean
+  slots (`find`'s `tailable` / `awaitData` / `returnKey` / `showRecordId` /
+  `allowDiskUse`, `aggregate.allowDiskUse`, `ordered` on the three write
+  commands, `renameCollection.dropTarget`).
+
+  **The measured remainder is `createIndexes.*` and `collMod.*`** — about 50
+  cases: `createIndexes.collation` / `.partialFilterExpression` /
+  `.expireAfterSeconds` / `.sparse` / `.unique` (mongod wraps these in
+  `Error in specification { ... } :: caused by ::`, code 67 for the TTL one,
+  which is why they were not folded into the object-slot family) and
+  `collMod.validator` / `.preImages` / `.viewOn`. Re-measure with the probe
+  before working them; do not work from this paragraph's counts alone.
+
+  Two mongod asymmetries worth not re-deriving: `count`'s `limit` and `skip`
+  take different parse paths (`limit` → `2 limit value is not a valid number`,
+  a non-integral double → `9 Expected an integer`, a non-integral Decimal128 →
+  `9 Cannot represent as a 64-bit integer`, and a NEGATIVE limit is accepted
+  and means its absolute value; `skip` → `14` with the IDL type list and
+  rejects a negative). And `listCollections` names the IDL path in its type
+  error (`listCollections.cursor.batchSize`) but the bare name in its
+  negative-value error (`batchSize`).
+
 - [x] **RESOLVED 2026-08-28/29 — wrong-typed command arguments (Python server).
   The sweep is 87/87 clean**, from 24 crashes + 44 divergences when it started.
   Reproduce with `tools/probes/arg_types_extended.py` against the mongod on PATH
