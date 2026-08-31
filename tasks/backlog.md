@@ -1570,25 +1570,23 @@ These are explicit non-goals. Don't add them without a reason.
 
   Pinned by 23 differential cases against a live mongod.
 
-  **Found while measuring, NOT fixed here — its own slice:**
-  - [ ] **"Missing" does not propagate through the control-flow operators**, on
-        BOTH servers. mongod omits the field when the value a *field-value*
-        position selects is missing; we write `null`. Measured 2026-08-31,
-        **1 of 7** shapes correct:
+  **Found while measuring, and fixed in the slice after this one:**
+  - [x] **RESOLVED 2026-08-31 — "missing" now propagates through the
+        control-flow operators on both servers** (`$cond` / `$switch` / `$let` /
+        `$ifNull`; `$getField` was already right, making it 1 of 7 before).
+        The rule held exactly as predicted: operators that RETURN one of their
+        sub-expressions propagate missing-ness, operators that COMPUTE collapse
+        it to null. Implemented by parameterising those four with the evaluator
+        to use for the value they return, so the field-value position can hand
+        them its own — no duplicated selection logic.
 
-            $cond    -> then/else branch      mongod OMITS, both write null
-            $switch  -> then/default branch   mongod OMITS, both write null
-            $let     -> its `in` expression   mongod OMITS, both write null
-            $ifNull  -> all args missing      mongod OMITS, both write null
-            $getField                         already correct on both
+        **It matters in operator position too**, which the original note did not
+        anticipate: `{$eq: [{$cond: [true, "$nosuch", 1]}, null]}` is FALSE on
+        mongod because the result is missing, not null. We answered true.
 
-        The rule is clean and worth keeping: operators that RETURN one of their
-        sub-expressions propagate missing, operators that COMPUTE a value
-        (`$add`, `$concat`, `$arrayElemAt`, `$first`) collapse it to null, which
-        both engines already get right. The fix is to have each engine's
-        field-value evaluator handle those four operators itself, recursing in
-        field-value position — the position is lost once evaluation drops into
-        the generic operator path, which is why they are wrong today.
+        Also collapsed `evaluate_or_missing`, which was a SECOND copy of the
+        field-value rule — the copies had already drifted once (the `$$REMOVE`
+        fix had to be written twice). One implementation now.
 
 
 - [x] **RESOLVED 2026-08-31 — an undefined `$$variable` is a PARSE error, and
