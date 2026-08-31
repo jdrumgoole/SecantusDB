@@ -1586,14 +1586,36 @@ These are explicit non-goals. Don't add them without a reason.
 
         Result: python crashes 274 -> 21, rust 274 -> 1; the 16020 family 907 ->
         0 on both; rust message-only 689 -> 0.
-  - [ ] **Decimal128: 29 CRASHES plus precision loss.** `{$abs: Decimal128}`
-        raises `TypeError: bad operand type for abs()` on the Python server and
-        defers on the Rust one; the trig and log operators convert to `float`
-        and lose digits mongod keeps (`$sin` of a Decimal128 returns 34
-        significant digits there, 17 here). Decimal128 is one of the types
-        `CLAUDE.md` names as the reason storage stays opaque BSON, so silently
-        narrowing it is the wrong direction. Also the one remaining hole in the
-        cross-type order: `cmp(string, Decimal128)` is inverted (4 of 121 pairs).
+  - [x] **RESOLVED 2026-08-31 (mostly) — Decimal128 through the math
+        operators: 13 crashes gone, 21/49 -> 38/49 against mongod 8.2.11.**
+        `math` rejects a `Decimal128`, and the `TypeError` escaped as
+        `internal server error`; the operators that did not crash narrowed 34
+        significant digits to `float`'s 17. `$abs` / `$ceil` / `$floor` /
+        `$trunc` / `$round` / `$exp` / `$ln` / `$log10` / `$sqrt` / `$mod` /
+        `$pow` / `$log` / `$avg` now compute in `decimal` at decimal128
+        precision, and the HYPERBOLICS keep full precision as exact identities
+        over exp/ln/sqrt.
+
+        Two rules that had to be measured rather than assumed: `$mod` truncates
+        toward zero (Python's `%` floors), and `$pow` is `exp(e * ln(b))` --
+        `2.5 ** 2` is exactly 6.25 but mongod answers
+        6.249999999999999999999999999999999.
+
+        **Do not be more accurate than the reference server.** Computing the
+        identities with GUARD DIGITS -- wide, then rounded back to 34 -- is more
+        accurate and matched mongod LESS, moving `$cosh` from agreeing to
+        differing in the last digit. mongod accumulates its own rounding at
+        decimal128 throughout. Reverted; the comment in `_make_trig` says so.
+
+        Pinned by 27 differential cases.
+
+  - [ ] **Decimal128, what is left: the CIRCULAR trig functions.** `$sin` /
+        `$cos` / `$tan` / `$asin` / `$acos` / `$atan` / `$atan2` still narrow to
+        `float`. Unlike the hyperbolics they have no identity over the
+        operations `decimal` provides and need series expansions at 34 digits.
+        Also `$acosh` agrees to 33 of 34 digits, and `cmp(string, Decimal128)`
+        is inverted in the cross-type order (4 of 121 pairs). Measured
+        2026-08-31: 38 of 49 shapes correct.
   - [ ] **`$toLower`/`$toUpper` do not coerce.** mongod returns `"5"` for
         `{$toLower: 5}`; we return the number unchanged (20 cases).
   - [ ] **`$ceil`/`$floor` narrow a double to an int.** mongod returns `2.0` for
