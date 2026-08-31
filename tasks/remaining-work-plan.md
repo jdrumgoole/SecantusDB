@@ -209,10 +209,28 @@ Sub-ms `ORDER BY` is adjacent to work already landed and should be cheap.
       compares CODES only. Comparing MESSAGES over 685 shapes on 2026-08-31
       found **76 further slots** divergent on the Rust server, almost all
       silently accepted — closed, with the residue recorded in `backlog.md`.
-      **The PYTHON server is now the open half of this item**: same 685 shapes,
-      ~61 slots, and **18 crashes** answering `internal server error` from an
-      `int()` over a wrong-typed value — the crash class #1080 closed, on the
-      slots its corpus never reached.
+      **The PYTHON server half was then measured and largely closed (#1152,
+      2026-08-31)**: the same 685 shapes started at **409 CODE + 88 MSG
+      divergent with 18 crashes** — `internal server error` from an `int()` or
+      an iteration over a value whose type was never checked, the crash class
+      #1080 closed on the slots its corpus never reached — and finished at
+      **98 CODE + 57 MSG, 0 crashes**.
+
+      Five families closed: the four crashing slots; the type-name vocabulary
+      (three partial `_bson_type_name` copies collapsed into
+      `secantus/bsontypes.py`, which had been putting Python class names —
+      `'ObjectId'`, `'datetime'`, `'bytes'` — on the wire in ~90 message sites,
+      and which the Rust engine already had right); `hint`; the document-valued
+      option slots; the aggregation stage-spec codes; and the boolean slots.
+
+      **What remains is `createIndexes.*` and `collMod.*`, ~50 cases.** mongod
+      wraps those in `Error in specification { ... } :: caused by ::` (code 67
+      for the TTL one), which is why they did not fall to the object-slot
+      helper the rest of the families used. Per-slot detail, and the two mongod
+      asymmetries worth not re-deriving (`count`'s `limit` vs `skip` parse
+      paths; `listCollections`'s IDL-path type error vs bare-name value error),
+      are in `backlog.md`. Re-measure with
+      `tools/probes/arg_types_messages.py` before working them.
 - [ ] **Aggregation runtime errors lack mongod's wrapper prefix — STILL OPEN in
       general, but the framing "message text only" was WRONG and cost a real
       bug three weeks (measured 2026-08-31 against 8.2.11).** mongod picks
