@@ -54,6 +54,18 @@ jobs:
           # (pyo3 <0.29 RUSTSEC-2025-0020 / RUSTSEC-2026-0177 cleared by the
           # 0.22 -> 0.29 bump, #584 — both ignores removed.)
           IGNORE=()
+          # RUSTSEC-2026-0235 (rkyv <0.8.17, OOB read) — tracking #1158.
+          # Reaches us ONLY as an unused optional dependency of rust_decimal,
+          # which pgwire's `server-api` feature requires. It cannot be bumped
+          # (rust_decimal pins `rkyv = "^0.7.46"`), and it is provably not in
+          # the build: `cargo tree -i rkyv` prints nothing, the enabled
+          # rust_decimal features are db-postgres/default/serde/std with no
+          # `rkyv`, and no rkyv artefact is ever compiled. Cargo records it in
+          # the lock because it is an optional dep of a dep, not because we use
+          # it. REMOVE THIS as soon as rust_decimal allows rkyv >=0.8.17 or
+          # pgwire makes rust_decimal optional — re-check with `cargo tree -i
+          # rkyv`, and if it starts printing a path, treat the advisory as live.
+          IGNORE+=(--ignore RUSTSEC-2026-0235)
           # Production Rust lives under crates/. The rust/ tree is a throwaway
           # Phase-0 spike (see rust/Cargo.toml's header) and tests/cross_driver
           # is a gauge harness — neither ships, so neither gates here.
