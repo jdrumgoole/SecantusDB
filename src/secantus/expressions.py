@@ -104,14 +104,23 @@ def _eval_field_value(expr: Any, ctx: _Ctx) -> Any:
     if isinstance(expr, str) and expr.startswith("$") and not expr.startswith("$$"):
         d = ctx.doc if isinstance(ctx.doc, dict) else dict(ctx.doc)
         return get_path(d, expr[1:], default=MISSING)
+    # ``$$REMOVE`` IS the missing value -- probed 9-for-9 against mongod 8.2.11,
+    # in every position, against the equivalent absent field path. So it follows
+    # the same two-position rule as one: MISSING here, ``null`` in ``_eval``.
+    # It used to return MISSING from ``_resolve_var`` in BOTH positions, which
+    # leaked the marker object into results: ``{arr: [1, "$$REMOVE", 2]}``
+    # reached ``bson.encode`` and CRASHED the command, ``$type`` answered
+    # "object" instead of "missing", and ``$concat`` raised 16702.
+    if expr == "$$REMOVE":
+        return MISSING
     return _eval(expr, ctx)
 
 
-_REMOVE_SENTINEL: Any = object()
-
 #: Sentinel for "the expression resolved to a missing field" (distinct from an
-#: explicit ``null``). Reuses the ``$$REMOVE`` marker.
-MISSING: Any = _REMOVE_SENTINEL
+#: explicit ``null``). ``$$REMOVE`` resolves to this in field-value position --
+#: it IS the missing value, not a marker of its own (probed 9-for-9 against
+#: mongod 8.2.11 versus the equivalent absent field path).
+MISSING: Any = object()
 
 
 def evaluate_or_missing(
@@ -124,6 +133,10 @@ def evaluate_or_missing(
     if isinstance(expr, str) and expr.startswith("$") and not expr.startswith("$$"):
         d = doc if isinstance(doc, dict) else dict(doc)
         return get_path(d, expr[1:], default=MISSING)
+    # `$$REMOVE` IS the missing value, so it belongs on this branch with the
+    # absent paths -- see `_eval_field_value`, which this function mirrors.
+    if expr == "$$REMOVE":
+        return MISSING
     return evaluate(expr, doc, vars)
 
 
@@ -139,11 +152,11 @@ def _resolve_var(name: str, ctx: _Ctx) -> Any:
     elif base in ("ROOT", "CURRENT"):
         value = ctx.doc
     elif base == "REMOVE":
-        # MongoDB 5.0+ ``$$REMOVE`` is a sentinel that, when used as a
-        # ``$setField`` / ``$addFields`` / ``$project`` value, deletes
-        # the field instead of writing it. ``_op_set_field`` checks for
-        # this identity to drop the key.
-        return _REMOVE_SENTINEL
+        # Value position: an absent field path is ``null`` here, and
+        # ``$$REMOVE`` is exactly an absent field path. ``_eval_field_value``
+        # above returns MISSING for the field-value position, which is what
+        # makes ``$project`` / ``$addFields`` omit the key.
+        return None
     else:
         # ``$$KEEP`` / ``$$PRUNE`` / ``$$DESCEND`` deliberately fall through to
         # here. They are NOT globally-defined variables: mongod binds them only
@@ -851,11 +864,15 @@ def _op_set_field(arg: Any, ctx: _Ctx) -> Any:
     """
     if not isinstance(arg, Mapping):
         raise ExpressionError("$setField requires {field, input, value}")
-    field_expr = arg.get("field")
-    input_expr = arg.get("input")
-    value_expr = arg.get("value")
-    if field_expr is None or input_expr is None or value_expr is None:
+    # Membership, not `is None`: `value: null` is a PRESENT argument that writes
+    # a null (`{$setField: {field: "a", input: "$$ROOT", value: null}}` sets
+    # `a: null` -- probed 8.2.11). Testing for None read it as absent and
+    # rejected the one form that distinguishes "write null" from "remove".
+    if not all(k in arg for k in ("field", "input", "value")):
         raise ExpressionError("$setField requires field, input, value")
+    field_expr = arg["field"]
+    input_expr = arg["input"]
+    value_expr = arg["value"]
     field = _eval(field_expr, ctx)
     if not isinstance(field, str):
         raise ExpressionError(
@@ -869,13 +886,13 @@ def _op_set_field(arg: Any, ctx: _Ctx) -> Any:
         return None
     if not isinstance(input_doc, Mapping):
         raise ExpressionError("$setField input must evaluate to a document")
-    value = _eval(value_expr, ctx)
+    # FIELD-VALUE position: mongod removes the field for `$$REMOVE` *and* for an
+    # absent path (`value: "$nosuch"` -- probed 8.2.11), and only an explicit
+    # null writes a null. This used to use `_eval`, so an absent path wrote a
+    # null where mongod removes.
+    value = _eval_field_value(value_expr, ctx)
     result = dict(input_doc)
-    # Sentinel-equivalent for removal: ``$$REMOVE`` (system var) maps
-    # to the same MISSING marker we use for "field doesn't exist". If
-    # the user supplied ``"$$REMOVE"`` or it resolved to None-via-
-    # MISSING, drop the key. Anything else is a normal assignment.
-    if value is _REMOVE_SENTINEL:
+    if value is MISSING:
         result.pop(field, None)
     else:
         result[field] = value
@@ -919,11 +936,11 @@ def _op_get_field(arg: Any, ctx: _Ctx) -> Any:
         and input_expr.startswith("$")
         and not input_expr.startswith("$$")
     ):
-        input_doc = get_path(dict(ctx.doc), input_expr[1:], default=_REMOVE_SENTINEL)
+        input_doc = get_path(dict(ctx.doc), input_expr[1:], default=MISSING)
     else:
         input_doc = _eval(input_expr, ctx)
-    if input_doc is _REMOVE_SENTINEL:
-        return _REMOVE_SENTINEL
+    if input_doc is MISSING:
+        return MISSING
     if input_doc is None or not isinstance(input_doc, Mapping):
         return None
     # A field absent from the input document resolves to "missing" (the same
@@ -931,7 +948,7 @@ def _op_get_field(arg: Any, ctx: _Ctx) -> Any:
     # that reads it is omitted from the output. A field present with an explicit
     # ``null`` still returns ``None`` (and is emitted).
     if field not in input_doc:
-        return _REMOVE_SENTINEL
+        return MISSING
     return input_doc[field]
 
 
@@ -1401,6 +1418,8 @@ def _op_type(arg: Any, ctx: _Ctx) -> Any:
     """``$type``: the BSON type string of the argument. A field path that doesn't
     exist yields ``"missing"`` (mongod distinguishes an absent field from an
     explicit null)."""
+    if arg == "$$REMOVE":
+        return "missing"  # `$$REMOVE` IS the missing value -- probed
     if (
         isinstance(arg, str)
         and arg.startswith("$")

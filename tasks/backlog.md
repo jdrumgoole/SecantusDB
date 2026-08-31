@@ -1499,6 +1499,59 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [x] **RESOLVED 2026-08-31 — `$$REMOVE` IS the missing value, and treating it
+  as a marker of its own leaked it into results (one CRASH).** Probed 9-for-9
+  against mongod 8.2.11: in every position — projected field, array element,
+  nested document, `$ifNull`, `$type`, `$eq`, `$cond`, `$concat`, `$sum`,
+  `$group._id` — `$$REMOVE` answers exactly what the equivalent **absent field
+  path** answers. That single hypothesis, once measured, replaced what looked
+  like a per-operator feature build with a two-line rule in each engine.
+
+      python  [1, "$$REMOVE", 2]      CRASH: bson.encode of the marker object
+      python  $type: "$$REMOVE"       "object" (the marker's Python type)
+      python  $concat with $$REMOVE   raised 16702
+      python  $ifNull: [$$REMOVE, 9]  omitted the field; mongod returns 9
+      rust    every shape             BadValue(2) -- the variable deferred to
+                                      Python, on a server that has none
+
+  Both engines now route it through the two-position rule they already applied
+  to absent paths: the missing marker in field-value position, `null` as an
+  operator argument.
+
+  **Two more found next door, both pre-existing:** `$setField` evaluated its
+  `value` in operator position, so `{"value": "$nosuch"}` wrote a null where
+  mongod removes the field; and it rejected `value: null` outright, because a
+  present-but-null argument was tested with `is None` and read as absent — the
+  one form that distinguishes *write a null* from *remove*.
+
+  **The lesson is the probe shape, not the operator.** Pairing every case with
+  its absent-path twin turned a vague "is `$$REMOVE` right?" into a yes/no with
+  a one-line fix, and five of those twins are now in the differential gate so
+  the equivalence cannot silently drift.
+
+  Pinned by 23 differential cases against a live mongod.
+
+  **Found while measuring, NOT fixed here — its own slice:**
+  - [ ] **"Missing" does not propagate through the control-flow operators**, on
+        BOTH servers. mongod omits the field when the value a *field-value*
+        position selects is missing; we write `null`. Measured 2026-08-31,
+        **1 of 7** shapes correct:
+
+            $cond    -> then/else branch      mongod OMITS, both write null
+            $switch  -> then/default branch   mongod OMITS, both write null
+            $let     -> its `in` expression   mongod OMITS, both write null
+            $ifNull  -> all args missing      mongod OMITS, both write null
+            $getField                         already correct on both
+
+        The rule is clean and worth keeping: operators that RETURN one of their
+        sub-expressions propagate missing, operators that COMPUTE a value
+        (`$add`, `$concat`, `$arrayElemAt`, `$first`) collapse it to null, which
+        both engines already get right. The fix is to have each engine's
+        field-value evaluator handle those four operators itself, recursing in
+        field-value position — the position is lost once evaluation drops into
+        the generic operator path, which is why they are wrong today.
+
+
 - [x] **RESOLVED 2026-08-31 — an undefined `$$variable` is a PARSE error, and
   both servers only noticed it at evaluation time.** Filed as "the Rust server
   answers BadValue (2) where mongod answers 17276". True, and not the whole
@@ -1540,13 +1593,12 @@ These are explicit non-goals. Don't add them without a reason.
   broadest false-positive check and stayed green.
 
   **Still open, unrelated to this and pre-existing:**
-  - [ ] **`$$REMOVE` is not implemented on the Rust server.** `{"$project":
-        {"x": "$$REMOVE"}}` answers `BadValue` (2) where mongod omits the field.
-        `resolve_var` has always deferred it ("tied to unported $setField /
-        $project-remove"), and on a server with no Python that deferral is a
-        generic error. The walker correctly does NOT flag it — it is a defined
-        variable — so this is a missing feature, not a naming gap. Measured
-        2026-08-31 as the single remaining difference in a 66-case sweep.
+  - [x] **RESOLVED 2026-08-31 — and again the Rust half was the smaller one.**
+        Filed as "`$$REMOVE` is not implemented on the Rust server". True; but
+        probing it found the PYTHON server **crashing** (code 1) on
+        `{"$addFields": {"arr": [1, "$$REMOVE", 2]}}` — the marker object
+        reached `bson.encode` — plus `$type` answering "object", `$concat`
+        raising 16702, and `$ifNull` omitting the field. See §5.
 
 
 - [x] **RESOLVED 2026-08-31 — `$redact` returned data it exists to withhold:
