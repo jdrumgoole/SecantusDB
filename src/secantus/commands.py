@@ -2349,6 +2349,9 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     _err = _require_object_bson_field(doc.get("readConcern"), "FindCommandRequest.readConcern")
     if _err is not None:
         return _err
+    _err = _require_collation_spec(doc.get("collation"))
+    if _err is not None:
+        return _err
     for _fld in ("limit", "skip", "batchSize"):
         # mongod reports these under its IDL name, `FindCommandRequest.limit`,
         # not `find.limit` -- probed, not guessed.
@@ -3392,6 +3395,9 @@ def _count(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     _err = _require_hint_type(doc)
     if _err is not None:
         return _err
+    _err = _require_collation_spec(doc.get("collation"))
+    if _err is not None:
+        return _err
     filter_ = doc.get("query") or {}
     # View support: if the collection is a view (``viewOn`` set),
     # run the view's pipeline + the count's query filter via the
@@ -3461,6 +3467,9 @@ def _distinct(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         }
     coll = doc["distinct"]
     _err = _require_object_bson_field(doc.get("collation"), "distinctCommandRequest.collation")
+    if _err is not None:
+        return _err
+    _err = _require_collation_spec(doc.get("collation"))
     if _err is not None:
         return _err
     # 8.x names the IDL STRUCT, not the command: 'distinctCommandRequest.zz',
@@ -3743,6 +3752,161 @@ def _index_spec_option_error(idx_spec: Mapping[str, Any]) -> dict[str, Any] | No
                     "code": 14,
                     "codeName": "TypeMismatch",
                 }
+    return None
+
+
+_COLLATION_KNOWN_FIELDS = frozenset(
+    {
+        "locale",
+        "caseLevel",
+        "caseFirst",
+        "strength",
+        "numericOrdering",
+        "alternate",
+        "maxVariable",
+        "normalization",
+        "backwards",
+        "version",
+    }
+)
+
+_COLLATION_ENUMS = {
+    "caseFirst": frozenset({"off", "upper", "lower"}),
+    "alternate": frozenset({"non-ignorable", "shifted"}),
+    "maxVariable": frozenset({"punct", "space"}),
+}
+
+
+def _require_collation_spec(spec: Any) -> dict[str, Any] | None:
+    """Validate a ``collation`` argument's CONTENTS, or None if OK.
+
+    The type check (`_require_object_bson_field`) only says it is a document.
+    Everything inside was accepted silently, so a misspelled field or an
+    out-of-range strength produced a query that ran with a DIFFERENT collation
+    than the caller asked for and reported success -- the same shape as the
+    ignored-argument class in `backlog.md` §3.
+
+    Every rule probed against mongod 8.2.11 (2026-08-31), and several are not
+    what symmetry would suggest:
+
+    * an EMPTY ``{}`` is accepted, but any non-empty spec must carry a
+      ``locale``; an explicit ``locale: null`` counts as missing (40414);
+    * ``strength: 0`` is an ENUM error while ``6`` is a RANGE error, with
+      different wording, and ``-1`` is the range error from the other side;
+    * ``strength: 2.5`` is accepted (it truncates) but ``strength: true`` is
+      not (bool is not a number here);
+    * ``caseLevel`` rejects ``1`` -- these are strict bools, not the
+      bool-or-number family;
+    * ``backwards`` uses the ``find``-family bool wording
+      (``Field 'backwards' should be a boolean value``) where its neighbours
+      use the ``BSON field`` form. One spec, two message families.
+
+    NOT validated here, deliberately: whether the ``locale`` NAMES a real ICU
+    locale (mongod answers ``2 Field 'locale' is invalid in: { locale: "xx_YY" }``,
+    sometimes with a "Did you mean" suffix). Enumerating ICU's locales without
+    ICU would mean guessing, and wrongly rejecting a locale mongod accepts is
+    worse than accepting one it rejects. Recorded in `tasks/backlog.md`.
+
+    Applied to ``find`` / ``aggregate`` / ``count`` / ``distinct`` /
+    ``findAndModify`` only. ``update`` and ``delete`` accept ANY spec contents
+    (probed: a missing locale, ``strength: 9`` and a bad enum all run) -- so
+    validating them "for consistency" would reject what mongod accepts.
+    """
+    if not isinstance(spec, Mapping) or not spec:
+        return None
+
+    def _type_err(field: str, value: Any, expected: str) -> dict[str, Any]:
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"BSON field 'collation.{field}' is the wrong type "
+                f"'{_bson_type_of(value)}', expected type '{expected}'"
+            ),
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+
+    def _enum_err(field: str, value: Any) -> dict[str, Any]:
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"Enumeration value '{value}' for field 'collation.{field}' is not a valid value."
+            ),
+            "code": 2,
+            "codeName": "BadValue",
+        }
+
+    unknown = next((k for k in spec if k not in _COLLATION_KNOWN_FIELDS), None)
+    if unknown is not None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"BSON field 'collation.{unknown}' is an unknown field.",
+            "code": 40415,
+            "codeName": "IDLUnknownField",
+        }
+    locale = spec.get("locale")
+    if locale is None:
+        return {
+            "ok": 0.0,
+            "errmsg": "BSON field 'collation.locale' is missing but a required field",
+            "code": 40414,
+            "codeName": "IDLFailedToParse",
+        }
+    if not isinstance(locale, str):
+        return _type_err("locale", locale, "string")
+    if "strength" in spec:
+        strength = spec["strength"]
+        if isinstance(strength, bool) or not isinstance(strength, (int, float, bson.Decimal128)):
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    f"BSON field 'collation.strength' is the wrong type "
+                    f"'{_bson_type_of(strength)}', expected types "
+                    f"'[double, decimal, long, int]'"
+                ),
+                "code": 14,
+                "codeName": "TypeMismatch",
+            }
+        number = _coerce_command_int(strength) if not isinstance(strength, float) else strength
+        rendered = int(number) if float(number) == int(number) else number
+        if number < 0:
+            return {
+                "ok": 0.0,
+                "errmsg": f"BSON field 'strength' value must be >= 0, actual value '{rendered}'",
+                "code": 2,
+                "codeName": "BadValue",
+            }
+        if number > 5:
+            return {
+                "ok": 0.0,
+                "errmsg": f"BSON field 'strength' value must be <= 5, actual value '{rendered}'",
+                "code": 2,
+                "codeName": "BadValue",
+            }
+        if int(number) == 0:
+            return _enum_err("strength", rendered)
+    for field in ("caseLevel", "normalization", "numericOrdering"):
+        if field in spec and not isinstance(spec[field], bool):
+            return _type_err(field, spec[field], "bool")
+    if "backwards" in spec and not isinstance(spec["backwards"], bool):
+        # mongod's OTHER boolean wording, on this field only.
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"Field 'backwards' should be a boolean value, but found: "
+                f"{_bson_type_of(spec['backwards'])}"
+            ),
+            "code": 14,
+            "codeName": "TypeMismatch",
+        }
+    for field, allowed in _COLLATION_ENUMS.items():
+        if field not in spec:
+            continue
+        value = spec[field]
+        if not isinstance(value, str):
+            return _type_err(field, value, "string")
+        if value not in allowed:
+            return _enum_err(field, value)
     return None
 
 
@@ -4376,6 +4540,9 @@ def _find_and_modify_impl(doc: dict[str, Any], ctx: CommandContext) -> dict[str,
     array_filters = doc.get("arrayFilters")
     collation = doc.get("collation")
     _err = _require_object_bson_field(collation, "findAndModify.collation")
+    if _err is not None:
+        return _err
+    _err = _require_collation_spec(collation)
     if _err is not None:
         return _err
 
@@ -6222,6 +6389,9 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if _err is not None:
         return _err
     _err = _require_object_bson_field(doc.get("collation"), "aggregate.collation")
+    if _err is not None:
+        return _err
+    _err = _require_collation_spec(doc.get("collation"))
     if _err is not None:
         return _err
     _err = _require_object_bson_field(doc.get("readConcern"), "aggregate.readConcern")
