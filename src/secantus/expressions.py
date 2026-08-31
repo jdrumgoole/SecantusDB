@@ -10,8 +10,9 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import bson
-from bson import Decimal128, Int64
+from bson import Decimal128, Int64, ObjectId
 
+from secantus.numerics import IntegerOverflowError, bson_int_width
 from secantus.ordering import bson_equal as _bson_equal
 from secantus.paths import get_path
 
@@ -535,10 +536,17 @@ def _is_numeric(v: Any) -> bool:
 
 
 def _fmt_double(v: float) -> str:
-    """Render a double the way mongod prints it in an error message: a
-    shortest round-trip form (Python's `repr` matches for the values that
-    reach these paths — small fractionals like `2.7`)."""
-    return repr(v)
+    """Render a double the way mongod prints it in an error message.
+
+    mongod streams a double into a message with C++'s `ostream <<` at its
+    default precision -- six significant digits -- so this is `printf("%g")`,
+    not a round-trip form. The two agree on the small fractionals most of these
+    messages carry (`2.7`), which is why `repr` stood here for so long, and
+    diverge as soon as a value needs more digits: 1099511627776.0 prints as
+    `1.09951e+12` and 0.0 as `0`. Probed 8.2.11 via `$acos`'s Location50989.
+    `$toString` uses the round-trip form instead -- see `convert_to_string`.
+    """
+    return f"{v:g}"
 
 
 class _FractionalIndex(Exception):
@@ -558,6 +566,33 @@ def _int_index(v: Any) -> Any:
     return v
 
 
+def _int_result(value: Any, *operands: Any) -> Any:
+    """mongod's width rule for an integer arithmetic result.
+
+    Three parts, all probed on 8.2.11: `long` is contagious, so a long operand
+    makes the answer a long even when it would fit in 32 bits (`Int64(1) + 1`
+    is a long); an int result that outgrows 32 bits widens to long
+    (`$abs` of -2147483648 is a long); and one that outgrows *64* bits
+    saturates to a double rather than failing (`$pow: [2, 64]` is a double,
+    and `$pow: [10, 400]` is `inf`).
+
+    Python's ints are unbounded and `Int64.__add__` hands back a plain `int`,
+    so without this every long silently narrowed to an int, and every 64-bit
+    overflow reached `bson.encode` as an out-of-range int -- which raised
+    `OverflowError` from inside the cursor-splitting code and surfaced to the
+    client as an internal error instead of a double.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        return value
+    try:
+        return bson_int_width(value, wide=any(isinstance(v, Int64) for v in operands))
+    except IntegerOverflowError:
+        try:
+            return float(value)
+        except OverflowError:
+            return math.inf if value > 0 else -math.inf
+
+
 def _fold_numeric(values: list[Any], *, mul: bool) -> Any:
     """Sum or product over validated numeric operands. Mixing in a
     Decimal128 promotes the whole fold to decimal, like mongod's
@@ -572,7 +607,7 @@ def _fold_numeric(values: list[Any], *, mul: bool) -> Any:
     acc2: Any = 1 if mul else 0
     for v in values:
         acc2 = acc2 * v if mul else acc2 + v
-    return acc2
+    return _int_result(acc2, *values)
 
 
 def _op_add(arg: Any, ctx: _Ctx) -> Any:
@@ -614,7 +649,7 @@ def _op_subtract(arg: Any, ctx: _Ctx) -> Any:
             da = a.to_decimal() if isinstance(a, Decimal128) else Decimal(a)
             db = b.to_decimal() if isinstance(b, Decimal128) else Decimal(b)
             return Decimal128(da - db)
-        return a - b
+        return _int_result(a - b, a, b)
     raise ExpressionError(f"can't $subtract {_bson_type_name(b)} from {_bson_type_name(a)}")
 
 
@@ -664,7 +699,12 @@ def _op_mod(arg: Any, ctx: _Ctx) -> Any:
         # mongod's rule -- Python's `%` on ints/floats floors instead, which is
         # why this cannot just widen the existing expression.
         return _decimal_result(lambda x, y: x % y, a, b)
-    return a % b
+    if isinstance(a, float) or isinstance(b, float):
+        # Truncating, not flooring: mongod answers -1.5 for `$mod: [-5.5, 2]`
+        # where Python's `%` answers 0.5. Probed 8.2.11.
+        return math.fmod(a, b)
+    remainder = abs(a) % abs(b)
+    return _int_result(-remainder if a < 0 else remainder, a, b)
 
 
 def _operands(arg: Any) -> list[Any]:
@@ -855,21 +895,114 @@ def _op_size(arg: Any, ctx: _Ctx) -> int:
     return len(value)
 
 
-def _op_to_string(arg: Any, ctx: _Ctx) -> Any:
-    value = _eval(arg, ctx)
-    if value is None:
+def _render_date_iso(v: _dt.datetime) -> str:
+    """A date as mongod renders it into a string: ISO-8601, always three
+    fractional digits, always `Z`."""
+    return v.strftime("%Y-%m-%dT%H:%M:%S.") + f"{v.microsecond // 1000:03d}Z"
+
+
+def coerce_to_string(value: Any) -> str:
+    """mongod's `Value::coerceToString` -- what `$toLower` / `$toUpper` run
+    their operand through before case-folding it.
+
+    This is NOT `$toString`'s conversion, and the difference is not cosmetic:
+    the two accept *different types* and render numbers *differently*.
+    coerceToString takes a timestamp and a javascript value but rejects a bool
+    and an ObjectId (Location16007); `$toString` does the reverse. A double
+    here goes through `%g` (`1099511627776.0` -> `1.09951e+12`), where
+    `$toString` round-trips it. Null and missing both become the empty string
+    here, and null there. All probed against 8.2.11.
+    """
+    if value is None or value is MISSING:
+        return ""
+    # `bson.Code` subclasses `str`, so this branch already covers it -- and
+    # mongod does convert a javascript value to its source text. `str()`
+    # normalises it to a plain string rather than handing back the `Code`.
+    if isinstance(value, str):
+        return str(value)
+    # bool is an int subclass, so it has to be rejected before the int branch.
+    if isinstance(value, bool):
+        raise ExpressionError(
+            "can't convert from BSON type bool to String", code=16007, code_name="Location16007"
+        )
+    if isinstance(value, float):
+        return _fmt_double(value)
+    if isinstance(value, (int, Decimal128)):
+        return str(value)
+    if isinstance(value, _dt.datetime):
+        return _render_date_iso(value)
+    if isinstance(value, bson.Code):
+        return str(value)
+    if isinstance(value, bson.Timestamp):
+        # mongod formats a timestamp for this one conversion as `%b %e
+        # %H:%M:%S` in *local* time, with the increment appended after a colon:
+        # `Jan  1 01:00:01:2`. Local, not UTC -- confirmed against four values
+        # on 8.2.11, and it is why this rendering can't be checked against a
+        # server in another zone.
+        import time as _time
+
+        stamp = _time.strftime("%b %e %H:%M:%S", _time.localtime(value.time))
+        return f"{stamp}:{value.inc}"
+    raise ExpressionError(
+        f"can't convert from BSON type {_bson_type_name(value)} to String",
+        code=16007,
+        code_name="Location16007",
+    )
+
+
+def convert_to_string(value: Any) -> Any:
+    """mongod's `$convert` to string -- what `$toString` does. See
+    `coerce_to_string` for how the two differ."""
+    if value is None or value is MISSING:
         return None
-    return str(value)
+    # `bson.Code` subclasses `str` but mongod refuses to convert one, so it is
+    # rejected here rather than falling into the str branch below.
+    if isinstance(value, bson.Code):
+        raise ExpressionError(
+            "Unsupported conversion from javascript to string in $convert with no onError value",
+            code=241,
+            code_name="ConversionFailure",
+        )
+    if isinstance(value, str):
+        return str(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        # The round-trip form, with a whole double's trailing `.0` dropped:
+        # `4.0` -> `4`, `1099511627776.0` -> `1099511627776`, `1e+300`
+        # unchanged. Python's `repr` is already shortest-round-trip.
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        text = repr(value)
+        return text[:-2] if text.endswith(".0") else text
+    if isinstance(value, (int, Decimal128, ObjectId)):
+        return str(value)
+    if isinstance(value, _dt.datetime):
+        return _render_date_iso(value)
+    if isinstance(value, bytes):
+        import base64
+
+        return base64.b64encode(value).decode("ascii")
+    raise ExpressionError(
+        f"Unsupported conversion from {_bson_type_name(value)} to string in "
+        "$convert with no onError value",
+        code=241,
+        code_name="ConversionFailure",
+    )
+
+
+def _op_to_string(arg: Any, ctx: _Ctx) -> Any:
+    return convert_to_string(_eval(arg, ctx))
 
 
 def _op_to_lower(arg: Any, ctx: _Ctx) -> Any:
-    value = _eval(arg, ctx)
-    return value.lower() if isinstance(value, str) else value
+    return coerce_to_string(_eval(arg, ctx)).lower()
 
 
 def _op_to_upper(arg: Any, ctx: _Ctx) -> Any:
-    value = _eval(arg, ctx)
-    return value.upper() if isinstance(value, str) else value
+    return coerce_to_string(_eval(arg, ctx)).upper()
 
 
 #: IEEE 754 decimal128 carries 34 significant digits, and that is the precision
@@ -884,6 +1017,11 @@ _DEC128_CTX = _decimal.Context(prec=34)
 #: pi to more digits than decimal128 carries, so the conversion below rounds
 #: rather than truncates.
 _PI = _decimal.Decimal("3.14159265358979323846264338327950288419716939937510")
+
+#: The double conversion factors, computed once so the multiplication below
+#: associates the way mongod's does.
+_RADIANS_PER_DEGREE = math.pi / 180.0
+_DEGREES_PER_RADIAN = 180.0 / math.pi
 
 
 def _to_decimal(v: Any) -> _decimal.Decimal:
@@ -929,7 +1067,7 @@ def _op_abs(arg: Any, ctx: _Ctx) -> Any:
     _require_math_numeric(v, "$abs")
     if _has_decimal(v):
         return _decimal_result(abs, v)
-    return abs(v)
+    return _int_result(abs(v), v)
 
 
 def _op_round(arg: Any, ctx: _Ctx) -> Any:
@@ -963,7 +1101,7 @@ def _op_round(arg: Any, ctx: _Ctx) -> Any:
             ),
             n,
         )
-    return round(n, place)
+    return _int_result(round(n, place), n)
 
 
 def _op_floor(arg: Any, ctx: _Ctx) -> Any:
@@ -975,7 +1113,11 @@ def _op_floor(arg: Any, ctx: _Ctx) -> Any:
     _require_math_numeric(v, "$floor")
     if _has_decimal(v):
         return _decimal_result(lambda d: d.to_integral_value(rounding=_decimal.ROUND_FLOOR), v)
-    return math.floor(v)
+    # These operators are type-preserving in mongod: a double in is a double
+    # out (`$floor` of 1.5 is 2.0, not 2), an int stays an int. Python's
+    # `math.floor` returns an int for either, which changed the BSON type of
+    # every double that reached it. Probed 8.2.11.
+    return float(math.floor(v)) if isinstance(v, float) else _int_result(math.floor(v), v)
 
 
 def _op_ceil(arg: Any, ctx: _Ctx) -> Any:
@@ -987,7 +1129,8 @@ def _op_ceil(arg: Any, ctx: _Ctx) -> Any:
     _require_math_numeric(v, "$ceil")
     if _has_decimal(v):
         return _decimal_result(lambda d: d.to_integral_value(rounding=_decimal.ROUND_CEILING), v)
-    return math.ceil(v)
+    # Type-preserving, as `$floor` above.
+    return float(math.ceil(v)) if isinstance(v, float) else _int_result(math.ceil(v), v)
 
 
 def _op_sqrt(arg: Any, ctx: _Ctx) -> Any:
@@ -1036,7 +1179,7 @@ def _op_pow(arg: Any, ctx: _Ctx) -> Any:
     # is unencodable (crashes BSON) — mongod returns NaN instead.
     if isinstance(result, complex):
         return float("nan")
-    return result
+    return _int_result(result, base, exponent)
 
 
 def _op_exp(arg: Any, ctx: _Ctx) -> Any:
@@ -1149,6 +1292,124 @@ def _trig_coerce(name: str, v: Any, code: int = 28765) -> float:
 #: the full 34 digits mongod does. The CIRCULAR functions (sin / cos / tan and
 #: their inverses) have no such identity and would need series expansions; they
 #: still narrow to `float`. See `tasks/backlog.md`.
+#: Working precision for the circular functions below. `decimal` supplies
+#: `exp` / `ln` / `sqrt` -- which is all the hyperbolics need -- but nothing
+#: for sin / cos / tan / atan, so those are summed here. The series are
+#: evaluated with guard digits and the result handed back at decimal128's 34,
+#: so the rounding happens once, at the end.
+_DEC_TRIG_CTX = _decimal.Context(prec=60)
+
+
+def _dec_series_sin(x: _decimal.Decimal) -> _decimal.Decimal:
+    """sin(x) by Taylor series, x already reduced into [-pi, pi]."""
+    term = total = x
+    x2 = x * x
+    n = 1
+    while term:
+        n += 2
+        term = -term * x2 / (n * (n - 1))
+        total += term
+    return total
+
+
+def _dec_series_cos(x: _decimal.Decimal) -> _decimal.Decimal:
+    """cos(x) by Taylor series, x already reduced into [-pi, pi]."""
+    term = total = _decimal.Decimal(1)
+    x2 = x * x
+    n = 0
+    while term:
+        n += 2
+        term = -term * x2 / (n * (n - 1))
+        total += term
+    return total
+
+
+def _dec_reduce(x: _decimal.Decimal) -> _decimal.Decimal:
+    """x mod 2*pi, brought into [-pi, pi] where the series converge fast."""
+    two_pi = 2 * _PI
+    r = x - (x / two_pi).to_integral_value(rounding=_decimal.ROUND_FLOOR) * two_pi
+    return r - two_pi if r > _PI else r
+
+
+def _dec_sin(x: _decimal.Decimal) -> _decimal.Decimal:
+    with _decimal.localcontext(_DEC_TRIG_CTX):
+        return _DEC128_CTX.plus(_dec_series_sin(_dec_reduce(x)))
+
+
+def _dec_cos(x: _decimal.Decimal) -> _decimal.Decimal:
+    with _decimal.localcontext(_DEC_TRIG_CTX):
+        return _DEC128_CTX.plus(_dec_series_cos(_dec_reduce(x)))
+
+
+def _dec_tan(x: _decimal.Decimal) -> _decimal.Decimal:
+    with _decimal.localcontext(_DEC_TRIG_CTX):
+        r = _dec_reduce(x)
+        return _DEC128_CTX.plus(_dec_series_sin(r) / _dec_series_cos(r))
+
+
+def _dec_atan_raw(x: _decimal.Decimal) -> _decimal.Decimal:
+    """atan(x) for any finite x, at the working precision.
+
+    The Taylor series only converges for |x| < 1 and crawls as |x| nears it,
+    so the argument is shrunk with the identity
+    `atan(x) = 2*atan(x / (1 + sqrt(1 + x*x)))` until it is comfortably small.
+
+    Unrounded on purpose: `$asin` / `$acos` / `$atan2` build on this and must
+    round once, at the end, rather than at every step.
+    """
+    if x.is_zero():
+        return x
+    sign, x = (-1, -x) if x < 0 else (1, x)
+    halvings = 0
+    while x > _decimal.Decimal("0.05"):
+        x = x / (1 + (1 + x * x).sqrt())
+        halvings += 1
+    term = total = x
+    x2 = x * x
+    n = 1
+    while term:
+        n += 2
+        term = -term * x2
+        total += term / n
+    return sign * total * (2**halvings)
+
+
+def _dec_asin_raw(x: _decimal.Decimal) -> _decimal.Decimal:
+    if abs(x) == 1:
+        return x * _PI / 2
+    return _dec_atan_raw(x / (1 - x * x).sqrt())
+
+
+def _dec_atan(x: _decimal.Decimal) -> _decimal.Decimal:
+    with _decimal.localcontext(_DEC_TRIG_CTX):
+        return _DEC128_CTX.plus(_dec_atan_raw(x))
+
+
+def _dec_asin(x: _decimal.Decimal) -> _decimal.Decimal:
+    with _decimal.localcontext(_DEC_TRIG_CTX):
+        return _DEC128_CTX.plus(_dec_asin_raw(x))
+
+
+def _dec_acos(x: _decimal.Decimal) -> _decimal.Decimal:
+    with _decimal.localcontext(_DEC_TRIG_CTX):
+        return _DEC128_CTX.plus(_PI / 2 - _dec_asin_raw(x))
+
+
+def _dec_atan2(y: _decimal.Decimal, x: _decimal.Decimal) -> _decimal.Decimal:
+    """atan2(y, x) at decimal128 precision, with mongod's quadrant rules --
+    probed 8.2.11, including that a negative-zero `y` carries its sign into
+    the answer (atan2(-0, -1) is -pi, not pi)."""
+    with _decimal.localcontext(_DEC_TRIG_CTX):
+        if x.is_zero():
+            if y.is_zero():
+                return _DEC128_CTX.plus(y)
+            return _DEC128_CTX.plus(-_PI / 2 if y.is_signed() else _PI / 2)
+        result = _dec_atan_raw(y / x)
+        if x < 0:
+            result = result - _PI if y.is_signed() else result + _PI
+        return _DEC128_CTX.plus(result)
+
+
 _DEC_TRIG: dict[str, Any] = {
     "$sinh": lambda d: (d.exp() - (-d).exp()) / 2,
     "$cosh": lambda d: (d.exp() + (-d).exp()) / 2,
@@ -1156,6 +1417,16 @@ _DEC_TRIG: dict[str, Any] = {
     "$asinh": lambda d: (d + (d * d + 1).sqrt()).ln(),
     "$acosh": lambda d: (d + (d * d - 1).sqrt()).ln(),
     "$atanh": lambda d: ((1 + d) / (1 - d)).ln() / 2,
+    # Without these six a Decimal128 operand fell through to the double path,
+    # so `{$sin: Decimal128("2.5")}` answered a *double* -- the wrong BSON
+    # type, which then compares and sorts differently downstream. Probed
+    # against 8.2.11, which answers Decimal128 for all six.
+    "$sin": _dec_sin,
+    "$cos": _dec_cos,
+    "$tan": _dec_tan,
+    "$asin": _dec_asin,
+    "$acos": _dec_acos,
+    "$atan": _dec_atan,
 }
 
 
@@ -1173,15 +1444,16 @@ def _make_trig(name: str, fn: Any, domain: str) -> Any:
         x = _trig_coerce(name, v)
         if domain == "finite" and not math.isfinite(x):
             raise ExpressionError(
-                f"cannot apply {name} to {x}, value must be in (-inf,inf)", code=50989
+                f"cannot apply {name} to {_fmt_double(x)}, value must be in (-inf,inf)",
+                code=50989,
             )
         if domain in ("unit", "atanh") and not (-1.0 <= x <= 1.0):
             raise ExpressionError(
-                f"cannot apply {name} to {x}, value must be in [-1,1]", code=50989
+                f"cannot apply {name} to {_fmt_double(x)}, value must be in [-1,1]", code=50989
             )
         if domain == "geq1" and not x >= 1.0:
             raise ExpressionError(
-                f"cannot apply {name} to {x}, value must be in [1,inf]", code=50989
+                f"cannot apply {name} to {_fmt_double(x)}, value must be in [1,inf]", code=50989
             )
         if domain == "atanh" and abs(x) == 1.0:
             return math.inf if x > 0 else -math.inf
@@ -1215,6 +1487,11 @@ def _op_atan2(arg: Any, ctx: _Ctx) -> Any:
         return None
     fy = _trig_coerce("$atan2", y, code=51044)
     fx = _trig_coerce("$atan2", x, code=51044)
+    if _has_decimal(y, x):
+        # One decimal operand is enough: mongod answers a Decimal128 whichever
+        # side it is on. Falling through to `math.atan2` narrowed the answer to
+        # a double -- the wrong BSON type, as with the unary trig above.
+        return _decimal_result(_dec_atan2, y, x)
     return math.atan2(fy, fx)
 
 
@@ -1258,7 +1535,10 @@ def _op_trunc(arg: Any, ctx: _Ctx) -> Any:
             n,
         )
     factor = 10**place
-    return math.trunc(n * factor) / factor
+    # Type-preserving, as `$floor` / `$ceil`: dividing by `factor` made every
+    # int result a double (`$trunc` of 1 answered 1.0). Probed 8.2.11.
+    truncated = math.trunc(n * factor) / factor
+    return _int_result(int(truncated), n) if isinstance(n, int) else truncated
 
 
 def _op_merge_objects(arg: Any, ctx: _Ctx) -> Any:
@@ -3613,31 +3893,27 @@ def _op_bson_size(arg: Any, ctx: _Ctx) -> Any:
 
 
 def _op_degrees_to_radians(arg: Any, ctx: _Ctx) -> Any:
-    import math
-
     v = _eval(arg, ctx)
     if v is None:
         return None
-    if isinstance(v, bool) or not isinstance(v, (int, float, Decimal128)):
-        raise ExpressionError("$degreesToRadians requires a number")
+    _require_math_numeric(v, "$degreesToRadians")
     if _has_decimal(v):
         return _decimal_result(lambda d: d * _PI / _decimal.Decimal(180), v)
-    x = float(v)
-    return x * math.pi / 180.0
+    # `x * (pi/180)`, not `x * pi / 180`: mongod multiplies by a single
+    # precomputed constant, and the two associations differ in the last bit
+    # (1.5 degrees -> 0.026179938779914945, not ...94). Probed 8.2.11.
+    return float(v) * _RADIANS_PER_DEGREE
 
 
 def _op_radians_to_degrees(arg: Any, ctx: _Ctx) -> Any:
-    import math
-
     v = _eval(arg, ctx)
     if v is None:
         return None
-    if isinstance(v, bool) or not isinstance(v, (int, float, Decimal128)):
-        raise ExpressionError("$radiansToDegrees requires a number")
+    _require_math_numeric(v, "$radiansToDegrees")
     if _has_decimal(v):
         return _decimal_result(lambda d: d * _decimal.Decimal(180) / _PI, v)
-    x = float(v)
-    return x * 180.0 / math.pi
+    # One precomputed constant, as `$degreesToRadians` above.
+    return float(v) * _DEGREES_PER_RADIAN
 
 
 def _bit_operand(op: str, v: Any) -> tuple[int, bool]:

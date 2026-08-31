@@ -1795,18 +1795,23 @@ These are explicit non-goals. Don't add them without a reason.
 
         Pinned by 27 differential cases.
 
-  - [ ] **Decimal128, what is left: the CIRCULAR trig functions.** `$sin` /
-        `$cos` / `$tan` / `$asin` / `$acos` / `$atan` / `$atan2` still narrow to
-        `float`. Unlike the hyperbolics they have no identity over the
-        operations `decimal` provides and need series expansions at 34 digits.
-        Also `$acosh` agrees to 33 of 34 digits, and `cmp(string, Decimal128)`
-        is inverted in the cross-type order (4 of 121 pairs). Measured
-        2026-08-31: 38 of 49 shapes correct.
-  - [ ] **`$toLower`/`$toUpper` do not coerce.** mongod returns `"5"` for
-        `{$toLower: 5}`; we return the number unchanged (20 cases).
-  - [ ] **`$ceil`/`$floor` narrow a double to an int.** mongod returns `2.0` for
-        `{$ceil: 1.5}`, keeping the type; we return `2`.
-  - [ ] **689 message-only differences** across the family, once the codes agree.
+  - [ ] **Decimal128 transcendentals: the last digit of 34.** `$sin`, `$tan`,
+        `$ln`, `$log10` and `$acosh` disagree with mongod in the final digit
+        for a Decimal128 operand. Measured 2026-08-31 at 80 digits: **our value
+        is the correctly-rounded one** and mongod's is 1-2 ulp low (true
+        sin(2.5) is `...18616227170…`, which rounds to `...1861623`; mongod
+        answers `...1861622`). Matching would mean reproducing the rounding of
+        Intel's decimal library rather than computing the right answer, so this
+        is recorded rather than chased. The circular functions themselves now
+        keep the Decimal128 *type* (they used to narrow to a double) and
+        `$cos` / `$atan` / `$atan2` / `$asin` / `$acos` agree exactly.
+
+        Related and still open: `cmp(string, Decimal128)` is inverted in the
+        cross-type order (4 of 121 pairs).
+  - [ ] **135 message-only differences** remain on the Python server across
+        the expression family (Rust: 4), down from 689. The largest remaining
+        group is wording rather than rendering — the number rendering itself is
+        fixed (`expressions._fmt_double` is mongod's `%g`).
 
 
 - [ ] **OPEN — six `_secantus_server`-gated test files never run in CI**

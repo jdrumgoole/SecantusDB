@@ -531,3 +531,34 @@ def test_rename_validation_and_no_corruption() -> None:
     with pytest.raises(UpdateError):
         apply_update(d, {"$rename": {"arr.0": "x"}})
     assert d["arr"] == [1, 2, 3]
+
+
+def test_inc_and_mul_past_int64_fail_the_write() -> None:
+    """An `$inc`/`$mul` that outgrows int64 is mongod's code 2, not a crash.
+
+    The *aggregation* operators saturate to a double here; the update operators
+    fail. Before this, the unbounded Python int reached `bson.encode` inside the
+    storage layer's update transaction, and the `OverflowError` it raised
+    surfaced to the client as an internal server error with a traceback in the
+    log. Message and code probed against mongod 8.2.11.
+    """
+    from bson import Int64
+
+    biggest = 9223372036854775807
+    for op, current in (("$inc", Int64(biggest)), ("$mul", Int64(biggest))):
+        delta = 1 if op == "$inc" else 2
+        with pytest.raises(UpdateError) as exc:
+            apply_update({"_id": 1, "n": current}, {op: {"n": delta}})
+        assert exc.value.code == 2
+        assert str(exc.value) == (
+            f"Failed to apply {op} operations to current value "
+            f"((NumberLong){biggest}) for document {{_id: 1}}"
+        )
+    # the negative end, and the cases that must still succeed
+    with pytest.raises(UpdateError) as exc:
+        apply_update({"_id": 2, "n": Int64(-biggest - 1)}, {"$inc": {"n": -1}})
+    assert exc.value.code == 2
+    # a double operand moves the whole thing into the double domain
+    widened = apply_update({"_id": 3, "n": Int64(biggest)}, {"$inc": {"n": 1.0}})
+    assert widened["n"] == 9.223372036854776e18
+    assert apply_update({"_id": 4, "n": Int64(5)}, {"$inc": {"n": 1}})["n"] == 6

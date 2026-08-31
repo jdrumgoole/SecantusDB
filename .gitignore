@@ -90,6 +90,9 @@ website/output/
 website/themes/secantus/static/img/
 website/infra/aws-state.json
 website/secantus-data/
+# ...and the same stray dir at the repo root, from a server started with
+# the checkout as cwd (an ad-hoc probe script, typically).
+/secantus-data/
 website/__pycache__/
 xunit-results/
 

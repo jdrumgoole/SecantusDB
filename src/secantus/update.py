@@ -6,7 +6,9 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from secantus.numerics import bson_add, bson_mul
+from bson import Int64
+
+from secantus.numerics import IntegerOverflowError, bson_add, bson_mul
 from secantus.paths import get_path, has_path, path_block, set_path, unset_path
 
 _ARRAY_FILTER_TOKEN = re.compile(r"\$\[([^\]]*)\]")
@@ -73,6 +75,40 @@ class UpdateError(Exception):
 # itself and array-filter problems come back BARE, so the execution-vs-parse
 # classification stays load-bearing and ``exec_error`` carries it to the
 # command layer.
+def _render_arith_operand(v: Any) -> str:
+    """The type-tagged rendering mongod puts in an overflow message:
+    ``(NumberLong)9223372036854775807``. Only a long can reach it -- an int32
+    that outgrows its width widens to long rather than overflowing."""
+    if isinstance(v, Int64):
+        return f"(NumberLong){int(v)}"
+    return _render_bson_scalar(v)
+
+
+def _arith_or_overflow(
+    op: str,
+    doc: Mapping[str, Any],
+    current: Any,
+    operand: Any,
+    combine: Any,
+) -> Any:
+    """Apply `$inc` / `$mul`, turning a 64-bit overflow into mongod's error.
+
+    mongod fails the write here rather than widening to a double the way the
+    *aggregation* operators do (probed 8.2.11 -- see
+    `numerics.IntegerOverflowError`). Without this the unbounded Python int
+    reached `bson.encode` inside the storage layer's update transaction, where
+    the `OverflowError` it raised escaped as an internal server error.
+    """
+    try:
+        return combine(current, operand)
+    except IntegerOverflowError:
+        raise _exec_error(
+            f"Failed to apply {op} operations to current value "
+            f"({_render_arith_operand(current)}) for document {_render_doc_id(doc)}",
+            code=2,
+        ) from None
+
+
 def _exec_error(message: str, code: int) -> UpdateError:
     """An execution-time update error (see the note above on the wrappers)."""
     return UpdateError(message, code=code, exec_error=True)
@@ -907,7 +943,7 @@ def _apply_op(
                 # bson_add preserves the BSON numeric type (mongod widens
                 # int32 < int64 < double < decimal128) — Int64(5) + 3 → Int64(8),
                 # not a bare int that narrows to int32 on the wire.
-                _set_path(doc, concrete, bson_add(current, delta))
+                _set_path(doc, concrete, _arith_or_overflow("$inc", doc, current, delta, bson_add))
     elif op == "$mul":
         for path, factor in payload.items():
             _require_numeric_operand("multiply", path, factor)
@@ -926,7 +962,7 @@ def _apply_op(
                             f"of non-numeric type {_bson_type_name(current)}",
                             code=14,
                         )
-                _set_path(doc, concrete, bson_mul(current, factor))
+                _set_path(doc, concrete, _arith_or_overflow("$mul", doc, current, factor, bson_mul))
     elif op == "$min":
         # A missing field is set unconditionally; otherwise compare by MongoDB's
         # BSON cross-type order (`_bson_lt`), not Python `<` — so a cross-type

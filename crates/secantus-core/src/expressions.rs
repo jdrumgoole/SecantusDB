@@ -45,7 +45,7 @@ use std::cmp::Ordering;
 
 use bson::{Bson, Document};
 
-use crate::numeric::{self, as_float_like, as_int_like, int_to_bson};
+use crate::numeric::{self, as_float_like, as_int_like, int_result, int_to_bson, is_int64};
 use crate::paths;
 use crate::regexutil;
 
@@ -1034,7 +1034,7 @@ fn fold_arith(vals: &[Bson], mul: bool) -> R {
                 acc.checked_add(n).ok_or(Fallback)?
             };
         }
-        return int_to_bson(acc).ok_or(Fallback);
+        return Ok(int_result(acc, vals.iter().any(is_int64)));
     }
     if vals.iter().all(|v| as_float_like(v).is_some()) {
         let mut acc: f64 = if mul { 1.0 } else { 0.0 };
@@ -1060,7 +1060,10 @@ fn op_subtract(arg: &Bson, ctx: &Ctx) -> R {
         return Err(Fallback);
     }
     if let (Some(a), Some(b)) = (as_int_like(&vals[0]), as_int_like(&vals[1])) {
-        return int_to_bson(a.checked_sub(b).ok_or(Fallback)?).ok_or(Fallback);
+        return Ok(int_result(
+            a.checked_sub(b).ok_or(Fallback)?,
+            is_int64(&vals[0]) || is_int64(&vals[1]),
+        ));
     }
     if let (Some(a), Some(b)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) {
         return Ok(Bson::Double(a - b));
@@ -1102,15 +1105,21 @@ fn op_mod(arg: &Bson, ctx: &Ctx) -> R {
     if matches!(vals[0], Bson::Boolean(_)) || matches!(vals[1], Bson::Boolean(_)) {
         return Err(Fallback);
     }
-    // Only integer mod with a positive divisor is reproduced cheaply; Python's
-    // float mod and divisor-signed semantics are deferred.
+    // mongod truncates toward zero (C's fmod), so the remainder takes the
+    // *dividend's* sign: `$mod: [-5, 2]` is -1, not the 1 a flooring `%`
+    // gives. Rust's `%` is already truncating for both ints and floats, which
+    // is why this needs no sign fixup. Probed 8.2.11.
     if let (Some(a), Some(b)) = (as_int_like(&vals[0]), as_int_like(&vals[1])) {
         if b == 0 {
             return Err(Fallback); // Python raises "can't $mod by zero" (16610)
         }
-        if b > 0 {
-            return int_to_bson(a.rem_euclid(b)).ok_or(Fallback);
+        return Ok(int_result(a % b, is_int64(&vals[0]) || is_int64(&vals[1])));
+    }
+    if let (Some(a), Some(b)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) {
+        if b == 0.0 {
+            return Err(Fallback); // Python raises "can't $mod by zero" (16610)
         }
+        return Ok(Bson::Double(a % b));
     }
     Err(Fallback)
 }
@@ -1556,21 +1565,115 @@ fn op_concat(arg: &Bson, ctx: &Ctx) -> R {
     Ok(Bson::String(out))
 }
 
-fn op_to_case(arg: &Bson, ctx: &Ctx, upper: bool) -> R {
-    match eval(arg, ctx)? {
-        Bson::String(s) => {
-            if s.is_ascii() {
-                Ok(Bson::String(if upper {
-                    s.to_ascii_uppercase()
-                } else {
-                    s.to_ascii_lowercase()
-                }))
-            } else {
-                Err(Fallback) // Unicode case mapping may differ from Python -> defer
-            }
-        }
-        other => Ok(other), // non-string passes through unchanged (matches Python)
+/// Render a double the way mongod streams one into a message, and into the
+/// string `$toLower` / `$toUpper` coerce it to: C++'s `ostream <<` at its
+/// default precision of six significant digits, i.e. `printf("%g")`. So
+/// 1099511627776.0 prints as `1.09951e+12` and 4.0 as `4`. NOT the round-trip
+/// form `$toString` uses (`format_double_roundtrip`). Probed 8.2.11; mirrors
+/// `expressions._fmt_double`.
+pub fn format_double_g(d: f64) -> String {
+    if d.is_nan() {
+        return "nan".to_string();
     }
+    if d.is_infinite() {
+        return if d > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
+    // Take the exponent from the *rounded* value, as C does: 9.99999e5 rounds
+    // to 1e+06 at six digits and must then print in the exponent form.
+    let sci = format!("{:.5e}", d);
+    let (mantissa, exp_text) = sci.split_once('e').expect("{:e} always emits an exponent");
+    let exp: i32 = exp_text
+        .parse()
+        .expect("{:e} always emits an integer exponent");
+    if !(-4..6).contains(&exp) {
+        let mantissa = if mantissa.contains('.') {
+            mantissa.trim_end_matches('0').trim_end_matches('.')
+        } else {
+            mantissa
+        };
+        format!(
+            "{}e{}{:02}",
+            mantissa,
+            if exp < 0 { '-' } else { '+' },
+            exp.abs()
+        )
+    } else {
+        let text = format!("{:.*}", (5 - exp).max(0) as usize, d);
+        if text.contains('.') {
+            text.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            text
+        }
+    }
+}
+
+/// Render a double the way `$toString` does: the shortest round-trip form,
+/// with a whole double's trailing `.0` dropped (`4.0` -> `4`) and the
+/// exponent form used outside 1e-4..1e16, matching Python's `repr`. Probed
+/// 8.2.11; mirrors `expressions.convert_to_string`.
+pub fn format_double_roundtrip(d: f64) -> String {
+    if d.is_nan() {
+        return "NaN".to_string();
+    }
+    if d.is_infinite() {
+        return if d > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    let sci = format!("{:e}", d);
+    let (mantissa, exp_text) = sci.split_once('e').expect("{:e} always emits an exponent");
+    let exp: i32 = exp_text
+        .parse()
+        .expect("{:e} always emits an integer exponent");
+    if !(-4..16).contains(&exp) {
+        format!(
+            "{}e{}{:02}",
+            mantissa,
+            if exp < 0 { '-' } else { '+' },
+            exp.abs()
+        )
+    } else {
+        // Rust's `Display` for f64 is the shortest round-trip form in fixed
+        // notation and already omits a whole value's `.0`.
+        format!("{d}")
+    }
+}
+
+/// mongod's `Value::coerceToString` -- what `$toLower` / `$toUpper` run their
+/// operand through before case-folding it.
+///
+/// NOT `$toString`'s conversion: the two accept *different types* and render
+/// numbers *differently*. coerceToString takes a javascript value but rejects
+/// a bool and an ObjectId (Location16007); `$toString` does the reverse. A
+/// double here goes through `%g`, where `$toString` round-trips it. Null and
+/// missing both become the empty string here, and null there. Probed 8.2.11;
+/// mirrors `expressions.coerce_to_string`.
+///
+/// Defers on every type mongod rejects (the error needs a code this engine
+/// can't name) and on a timestamp, whose rendering mongod does in *local*
+/// time -- `chrono` is built here without its clock feature.
+fn coerce_to_string(v: &Bson) -> Result<String, Fallback> {
+    Ok(match v {
+        Bson::Null | Bson::Undefined => String::new(),
+        Bson::String(s) => s.clone(),
+        Bson::Int32(n) => n.to_string(),
+        Bson::Int64(n) => n.to_string(),
+        Bson::Double(d) => format_double_g(*d),
+        Bson::Decimal128(d) => d.to_string(),
+        Bson::DateTime(dt) => render_date(dt.timestamp_millis(), "%Y-%m-%dT%H:%M:%S.%LZ")?,
+        Bson::JavaScriptCode(c) => c.clone(),
+        _ => return Err(Fallback),
+    })
+}
+
+fn op_to_case(arg: &Bson, ctx: &Ctx, upper: bool) -> R {
+    let text = coerce_to_string(&eval(arg, ctx)?)?;
+    if !text.is_ascii() {
+        return Err(Fallback); // Unicode case mapping may differ from Python -> defer
+    }
+    Ok(Bson::String(if upper {
+        text.to_ascii_uppercase()
+    } else {
+        text.to_ascii_lowercase()
+    }))
 }
 
 fn op_str_len_cp(arg: &Bson, ctx: &Ctx) -> R {
@@ -2175,10 +2278,15 @@ fn op_deg_rad(arg: &Bson, ctx: &Ctx, to_rad: bool) -> R {
         Bson::Double(d) => d,
         _ => return Err(Fallback),
     };
+    // `x * (pi/180)`, not `x * pi / 180`: mongod multiplies by a single
+    // precomputed constant, and the two associations differ in the last bit
+    // (1.5 degrees -> 0.026179938779914945, not ...94). Probed 8.2.11.
+    const RADIANS_PER_DEGREE: f64 = std::f64::consts::PI / 180.0;
+    const DEGREES_PER_RADIAN: f64 = 180.0 / std::f64::consts::PI;
     Ok(Bson::Double(if to_rad {
-        x * std::f64::consts::PI / 180.0
+        x * RADIANS_PER_DEGREE
     } else {
-        x * 180.0 / std::f64::consts::PI
+        x * DEGREES_PER_RADIAN
     }))
 }
 
@@ -3331,16 +3439,25 @@ fn op_to_bool(arg: &Bson, ctx: &Ctx) -> R {
     })
 }
 
+/// `$toString` -- mongod's `$convert` to string. See `coerce_to_string` for
+/// how this differs from the conversion `$toLower` / `$toUpper` use. Defers on
+/// the types mongod rejects with ConversionFailure (241), which needs a code
+/// this engine can't name.
 fn op_to_string(arg: &Bson, ctx: &Ctx) -> R {
     Ok(match eval(arg, ctx)? {
-        Bson::Null => Bson::Null,
+        Bson::Null | Bson::Undefined => Bson::Null,
         Bson::Int32(n) => Bson::String(n.to_string()),
         Bson::Int64(n) => Bson::String(n.to_string()),
-        // Python str(True) == "True" (capitalised — this impl uses str(), not
-        // mongod's lowercase). Reproduce that exactly.
-        Bson::Boolean(b) => Bson::String(if b { "True" } else { "False" }.to_string()),
+        Bson::Boolean(b) => Bson::String(if b { "true" } else { "false" }.to_string()),
+        Bson::Double(d) => Bson::String(format_double_roundtrip(d)),
+        Bson::Decimal128(d) => Bson::String(d.to_string()),
+        Bson::ObjectId(oid) => Bson::String(oid.to_hex()),
+        Bson::DateTime(dt) => {
+            Bson::String(render_date(dt.timestamp_millis(), "%Y-%m-%dT%H:%M:%S.%LZ")?)
+        }
         v @ Bson::String(_) => v,
-        // float str() / Decimal128 / datetime isoformat / ObjectId etc. -> Python.
+        // Binary is base64 here, which this engine has no encoder for; every
+        // other remaining type is a ConversionFailure. Both -> Python.
         _ => return Err(Fallback),
     })
 }
@@ -3447,8 +3564,8 @@ fn math_float(v: &Bson) -> Result<f64, Fallback> {
 fn op_abs(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
-        Bson::Int32(n) => int_to_bson((n as i128).abs()).ok_or(Fallback),
-        Bson::Int64(n) => int_to_bson((n as i128).abs()).ok_or(Fallback),
+        Bson::Int32(n) => Ok(int_result((n as i128).abs(), false)),
+        Bson::Int64(n) => Ok(int_result((n as i128).abs(), true)),
         Bson::Double(d) => Ok(Bson::Double(d.abs())),
         // bool / Decimal128 / non-numeric: Python raises 28765 -> defer.
         _ => Err(Fallback),
@@ -3460,16 +3577,9 @@ fn op_floor_ceil(arg: &Bson, ctx: &Ctx, ceil: bool) -> R {
         Bson::Null => Ok(Bson::Null),
         // math.floor/ceil of an int returns it unchanged.
         v @ (Bson::Int32(_) | Bson::Int64(_)) => Ok(v),
-        Bson::Double(d) => {
-            if !d.is_finite() {
-                return Err(Fallback); // math.floor(nan/inf) raises
-            }
-            let r = if ceil { d.ceil() } else { d.floor() };
-            if r < i64::MIN as f64 || r > i64::MAX as f64 {
-                return Err(Fallback);
-            }
-            int_to_bson(r as i128).ok_or(Fallback)
-        }
+        // Type-preserving: a double in is a double out (`$ceil` of 1.5 is
+        // 2.0, not 2), an int stays an int. Probed 8.2.11.
+        Bson::Double(d) => Ok(Bson::Double(if ceil { d.ceil() } else { d.floor() })),
         _ => Err(Fallback),
     }
 }
@@ -3581,13 +3691,12 @@ fn op_pow(arg: &Bson, ctx: &Ctx) -> R {
         let base = as_int_like(b).unwrap();
         let exp = as_int_like(e).unwrap();
         if exp >= 0 {
-            // checked_pow on i128, then narrow; overflow / exp > u32 -> Python
-            // (a bignum pymongo couldn't encode anyway).
-            return u32::try_from(exp)
-                .ok()
-                .and_then(|e| base.checked_pow(e))
-                .and_then(int_to_bson)
-                .ok_or(Fallback);
+            // An integral result keeps an integral width; one that outgrows
+            // i128 falls through to the double path below, where mongod also
+            // lands (`$pow: [10, 400]` is `inf`).
+            if let Some(r) = u32::try_from(exp).ok().and_then(|e| base.checked_pow(e)) {
+                return Ok(int_result(r, is_int64(b) || is_int64(e)));
+            }
         }
         // negative exponent -> float, handled below.
     }
@@ -3641,7 +3750,11 @@ fn op_round(arg: &Bson, ctx: &Ctx) -> R {
             }
             let iv = as_int_like(&n).unwrap() as f64;
             let scale = 10f64.powi(-place);
-            int_to_bson(((iv / scale).round_ties_even() * scale) as i128).ok_or(Fallback)
+            let wide = is_int64(&n);
+            Ok(int_result(
+                ((iv / scale).round_ties_even() * scale) as i128,
+                wide,
+            ))
         }
         Bson::Double(d) => {
             let factor = 10f64.powi(place);
@@ -3661,7 +3774,13 @@ fn op_trunc(arg: &Bson, ctx: &Ctx) -> R {
         _ => {
             let nf = math_float(&n)?; // bool / non-numeric -> Python (51081)
             let factor = 10f64.powi(place);
-            Ok(Bson::Double((nf * factor).trunc() / factor))
+            let truncated = (nf * factor).trunc() / factor;
+            // Type-preserving, as `$floor` / `$ceil`: dividing by `factor`
+            // made every int result a double (`$trunc` of 1 answered 1.0).
+            match n {
+                Bson::Int32(_) | Bson::Int64(_) => Ok(int_result(truncated as i128, is_int64(&n))),
+                _ => Ok(Bson::Double(truncated)),
+            }
         }
     }
 }
@@ -5129,5 +5248,113 @@ mod tests {
             Bson::Int32(56)
         );
         assert_eq!(ev(d, bson::bson!({"$dayOfWeek": "$d"})), Bson::Int32(6)); // Friday
+    }
+
+    /// Both renderings, pinned to values measured against mongod 8.2.11 via
+    /// `$toLower` (the `%g` form) and `$toString` (the round-trip form). The
+    /// two disagree for exactly the values that need more than six
+    /// significant digits, which is why they are separate functions.
+    #[test]
+    fn double_renderings_match_mongod() {
+        for (input, g, roundtrip) in [
+            (0.0, "0", "0"),
+            (1.0, "1", "1"),
+            (-1.0, "-1", "-1"),
+            (1.5, "1.5", "1.5"),
+            (4.0, "4", "4"),
+            (0.1, "0.1", "0.1"),
+            (1e-7, "1e-07", "1e-07"),
+            (1e20, "1e+20", "1e+20"),
+            (1099511627776.0, "1.09951e+12", "1099511627776"),
+            (123456789.0, "1.23457e+08", "123456789"),
+            (1234567.0, "1.23457e+06", "1234567"),
+            (123456.0, "123456", "123456"),
+            (0.000123456789, "0.000123457", "0.000123456789"),
+            #[allow(clippy::approx_constant)] // a measured input, not an attempt at PI
+            (3.14159265358979, "3.14159", "3.14159265358979"),
+            (1e300, "1e+300", "1e+300"),
+            (-2.5e-8, "-2.5e-08", "-2.5e-08"),
+            (1.0 / 3.0, "0.333333", "0.3333333333333333"),
+            (9007199254740992.0, "9.0072e+15", "9007199254740992"),
+        ] {
+            assert_eq!(format_double_g(input), g, "%g of {input}");
+            assert_eq!(
+                format_double_roundtrip(input),
+                roundtrip,
+                "round-trip of {input}"
+            );
+        }
+        assert_eq!(format_double_g(f64::NAN), "nan");
+        assert_eq!(format_double_g(f64::INFINITY), "inf");
+        assert_eq!(format_double_g(f64::NEG_INFINITY), "-inf");
+        assert_eq!(format_double_roundtrip(f64::NAN), "NaN");
+        assert_eq!(format_double_roundtrip(f64::INFINITY), "Infinity");
+        assert_eq!(format_double_roundtrip(f64::NEG_INFINITY), "-Infinity");
+    }
+
+    /// `long` is contagious, an int32 result that outgrows its width widens,
+    /// and one past int64 saturates to a double. Probed 8.2.11.
+    #[test]
+    fn integer_width_matches_mongod() {
+        let d = bson::doc! {"small": 5i64, "big": i64::MAX};
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$add": ["$small", 1]})),
+            Bson::Int64(6)
+        );
+        assert_eq!(ev(d.clone(), bson::bson!({"$add": [1, 2]})), Bson::Int32(3));
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$add": [2147483647, 1]})),
+            Bson::Int64(2147483648)
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$abs": -2147483648i64})),
+            Bson::Int64(2147483648)
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$trunc": "$small"})),
+            Bson::Int64(5)
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$floor": "$small"})),
+            Bson::Int64(5)
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$pow": ["$small", 2]})),
+            Bson::Int64(25)
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$add": ["$big", 1]})),
+            Bson::Double(9.223372036854776e18)
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$pow": [2, 64]})),
+            Bson::Double(1.8446744073709552e19)
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$pow": [10, 400]})),
+            Bson::Double(f64::INFINITY)
+        );
+        // Type-preserving rounding: a double stays a double.
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$ceil": 1.5})),
+            Bson::Double(2.0)
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$floor": 1.5})),
+            Bson::Double(1.0)
+        );
+        // `$mod` truncates toward zero, so the sign follows the dividend.
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$mod": [-5, 2]})),
+            Bson::Int32(-1)
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$mod": [5, -2]})),
+            Bson::Int32(1)
+        );
+        assert_eq!(
+            ev(d.clone(), bson::bson!({"$mod": [-5.5, 2.0]})),
+            Bson::Double(-1.5)
+        );
     }
 }
