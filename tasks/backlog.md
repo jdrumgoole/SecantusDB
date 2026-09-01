@@ -7067,6 +7067,40 @@ shared storage engine or building large new protocol subsystems:
          do not honour" shape that the unnest element-type work already fixed
          once elsewhere.
 
+- [x] **RESOLVED (2026-09-01) — `UPDATE … SET col = DEFAULT` was
+      `42703 column "default" does not exist`.** In an UPDATE, sqlglot parses
+      the `DEFAULT` keyword as an unquoted **Column** named `default`, not the
+      `Var` a VALUES tuple gets, so `_is_default_cell` never matched and the
+      assignment fell through to the per-row expression path where `default`
+      was resolved as a column name. The same mis-detection sat under the
+      GENERATED-column guard, which uses the same helper to decide whether an
+      update is legal. A QUOTED `"default"` stays a real column reference.
+      `SET serial_col = DEFAULT` is refused (0A000) rather than guessed at —
+      a serial's default draws from its sequence, which the planner cannot do.
+      Pinned by `tests/test_sql_update_default.py`.
+
+- [ ] **OPEN — a NOT NULL violation does not consume a sequence value; a CHECK
+      or UNIQUE violation does (measured 2026-09-01).** PG evaluates DEFAULTs
+      (including `nextval`) BEFORE checking NOT NULL, so a failed insert still
+      burns a serial value:
+
+          INSERT ok            pg id 1     us id 1
+          INSERT NOT NULL fail pg (error)  us (error)
+          INSERT ok            pg id 3     us id 2      <-- no gap here
+
+      CHECK and UNIQUE violations match exactly (both consume), so this is an
+      inconsistency **within our own server** as much as against PG.
+
+      Cause: the NOT NULL check runs in the PLANNER
+      (`planner._insert_doc`, two sites) and the sequence draw runs in the
+      EXECUTOR, so the check happens first. Matching PG means moving that
+      validation across the planner/executor boundary — deliberately NOT done
+      here: planning is storage-free by design, the write-path validation was
+      consolidated on purpose (see the "Enforcement made uniform across all
+      write paths" entry), and PG itself documents sequences as gappy, so a
+      client depending on the exact value is already outside PG's contract.
+      Worth doing only alongside other write-path work.
+
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
   **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,
   from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn campaign
