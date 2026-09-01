@@ -1337,16 +1337,37 @@ def _op_regex(values: list[Any], pattern: Any, options: Any) -> bool:
             raise QueryError(f"invalid regex: {e}") from e
         except Exception as e:
             raise QueryError(f"invalid regex: {exc}") from e
+    # mongod matches a regex against a STRING by pattern, and against a stored
+    # REGEX by equality -- exact pattern, and options compared as a SET, so
+    # `/ab/im` equals `/ab/mi` but `/ab/i` does not equal `/ab/mi` (probed
+    # 8.2.11). `bson.Regex.__eq__` is that comparison: `flags` is already the
+    # normalised int, so the set semantics come for free. Without the equality
+    # arm `find({v: /ab/i})` missed every document whose `v` IS that regex.
+    query_regex = Regex(regex_pattern, flags) if isinstance(regex_pattern, str) else None
     for v in values:
         if v is MISSING:
             continue
-        if isinstance(v, str) and compiled.search(v):
+        if _regex_matches_value(v, compiled, query_regex):
             return True
-        if isinstance(v, list):
-            for elem in v:
-                if isinstance(elem, str) and compiled.search(elem):
-                    return True
+        if isinstance(v, list) and any(
+            _regex_matches_value(elem, compiled, query_regex) for elem in v
+        ):
+            return True
     return False
+
+
+def _regex_matches_value(v: Any, compiled: re.Pattern, query_regex: Regex | None) -> bool:
+    """One document value against a compiled query regex.
+
+    ``_is_bson_string`` rather than ``isinstance(v, str)``: ``bson.Code``
+    subclasses ``str``, so a JavaScript value used to be pattern-matched as
+    though it were text. mongod does not apply a regex to code (probed 8.2.11)
+    -- `find({v: /ab/})` over `{v: Code("ab")}` returns nothing there and used
+    to return the document here.
+    """
+    if isinstance(v, Regex):
+        return query_regex is not None and v == query_regex
+    return _is_bson_string(v) and compiled.search(v) is not None
 
 
 def _is_int32(v: Any) -> bool:

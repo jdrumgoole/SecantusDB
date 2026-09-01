@@ -5163,19 +5163,45 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   `map_err(|_| QueryUnsupported)`, throwing the named error away exactly as the
   query path had before that PR.
 
-- [ ] **The Rust engines defer on some VALID operations (17 shapes,
-  2026-09-01).** Not error-surface gaps — these are constructs the engines
-  cannot evaluate, so the standalone server errors where mongod answers:
+- [x] **The Rust engines' VALID-operation defers — DONE 2026-09-01.** All 17
+  shapes now answer, and the standing `tools/probes/operator_error_surface.py`
+  is **0 divergent on both servers** across 3,074 shapes (it was 17 on the Rust
+  one). Two new probes cover the ground the sweep opened up:
+  `tools/probes/regex_value_semantics.py` (104 shapes) and
+  `tools/probes/addtoset_membership.py` (30).
 
-  - `{v: {$eq: /re/}}` — a regex as an equality operand (3).
-  - `$set` / `$max` with a `bson.Code` VALUE (6) — the update path defers on it.
-  - `$addToSet` with a bool, a document, or a `Code` (5) — a documented defer:
-    membership there is field-ORDER-sensitive for documents and type-sensitive
-    for bools, and `py_eq` mirrors Python's `==`, which is neither.
-  - `$pop` with `Decimal128("-0")` (3).
+  Reproducing the item first, as the header of this file keeps advising, is what
+  made it worth doing: **three of the bugs were on the PYTHON server**, and they
+  were silent wrong answers rather than errors.
 
-  Each is small and independent. They are listed separately from the error
-  surface on purpose: that was a reporting problem, this is a capability one.
+  - A bare regex filter matched strings by pattern but **never matched a stored
+    regex equal to it** — `find({v: /ab/i})` missed `{v: /ab/i}` on both
+    servers. Equality is exact-pattern plus options-as-a-SET (`/ab/im` is
+    `/ab/mi`; `/ab/i` is not). `$in` / `$nin` / `$regex` carry the same rule.
+  - `bson.Code` subclasses `str`, so a regex was applied to **JavaScript**
+    values. mongod never regex-matches code.
+  - `$max` / `$min` over two regexes **never moved**: `bson.Regex` defines no
+    `__lt__`, so the comparison fell to a type-name fallback that reported every
+    pair equal — and *both* Rust arms had that accident written in as a comment
+    citing what Python did, the exact "comment justifying behaviour by the other
+    engine" shape this file warns about. mongod orders by pattern, then option
+    string.
+  - `$eq` with a regex operand deferred on the Rust server — an error there, for
+    every document in the collection. On mongod `$eq` with a regex is equality
+    ONLY, the opposite of a bare regex.
+  - `$addToSet` of a bool / document / `Code` deferred on the strength of a
+    comment saying `py_eq` "mirrors Python's `==`". It had since grown the bool
+    and `Code` rules; only document field ORDER was still missing.
+  - A `Code` value made `$set` fail on the Rust server — the oplog update-diff
+    walks every field through `py_eq`.
+  - `$pop`'s error quoted the argument as written (`found: -0`); mongod reports
+    the coerced integer (`Decimal128("1E+2")` is `found: 100`).
+
+  The regex option-character table is now shared between the in-memory sort and
+  the index-entry encoder on both servers (`bsontypes.REGEX_OPTION_CHARS`,
+  `regexutil::regex_sort_key`). **No `entryFormat` bump** — unlike the
+  JavaScript-rank change, here the index encoder was the half that was already
+  right, and a driver's BSON encoder emits options alphabetically anyway.
 
 - [ ] **`$dateFromString` with a named IANA timezone (Rust server).** Measured
   divergent 2026-09-01: mongod resolves `America/New_York`; the Rust engine

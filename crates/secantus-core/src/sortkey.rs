@@ -305,7 +305,15 @@ pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, Unsup
             out.push(RANK_REGEX);
             out.extend(escape(r.pattern.as_bytes()));
             out.extend_from_slice(COMPOUND_SEP);
-            out.extend(escape(r.options.as_bytes()));
+            // Normalised, so these index bytes order regexes exactly as
+            // `order::cmp` does -- two functions disagreeing about a sort key is
+            // how an index comes to change the sort answer. No stored bytes
+            // move: a driver's BSON encoder already emits options
+            // alphabetically (pymongo renders `/a/mi` as `im` on the wire), so
+            // this only corrects a hand-built value no encoder produces, and
+            // needs no `entryFormat` bump.
+            let (_, options) = crate::regexutil::regex_sort_key(r);
+            out.extend(escape(options.as_bytes()));
         }
         other => return Err(UnsupportedValue(format!("{other:?}"))),
     }

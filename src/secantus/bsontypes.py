@@ -386,3 +386,27 @@ def coerce_int64_argument(value: Any, label: str) -> int:
 #: The 64-bit window `coerce_int64_argument` enforces.
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
+
+# mongod stores a regex's options ALPHABETICALLY SORTED, which is also ascending
+# bit order for the flags `bson.Regex` normalises an option string into. Both
+# the in-memory sort (`ordering._regex_sort_key`) and the persisted index-entry
+# encoder (`sortkey._regex_options`) have to render options the same way, or an
+# index changes the sort answer -- so the table lives here rather than in either
+# of them. Probed 8.2.11 (2026-09-01): `/a/i < /a/im < /a/m`.
+REGEX_OPTION_CHARS: tuple[tuple[int, str], ...] = (
+    (_re.I, "i"),
+    (_re.L, "l"),
+    (_re.M, "m"),
+    (_re.S, "s"),
+    (_re.U, "u"),
+    (_re.X, "x"),
+)
+
+
+def regex_options_string(flags: Any) -> str:
+    """The normalised option string for a `bson.Regex`'s flags."""
+    if isinstance(flags, str):
+        return flags
+    if isinstance(flags, (bytes, bytearray)):
+        return bytes(flags).decode("utf-8", "replace")
+    return "".join(c for bit, c in REGEX_OPTION_CHARS if flags & bit)

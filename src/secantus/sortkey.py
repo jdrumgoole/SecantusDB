@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import datetime as _dt
 import math
-import re as _re
 import struct
 from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
@@ -36,6 +35,8 @@ from typing import Any
 
 import bson
 from bson import Binary, Code, Decimal128, MaxKey, MinKey, ObjectId, Regex, Timestamp
+
+from secantus.bsontypes import regex_options_string
 
 # Type ranks — must match storage._bson_type_rank.
 RANK_MINKEY = 1
@@ -271,22 +272,8 @@ def _encode_array(arr: list[Any]) -> bytes:
 # branch turned e.g. flags=10 into ten NUL bytes instead of "im". Reconstruct
 # the option string the way pymongo serialises it so the key matches the stored
 # regex (and mongod's ordering).
-_RE_FLAG_CHARS = (
-    (_re.I, "i"),
-    (_re.L, "l"),
-    (_re.M, "m"),
-    (_re.S, "s"),
-    (_re.U, "u"),
-    (_re.X, "x"),
-)
-
-
 def _regex_options(flags: Any) -> bytes:
-    if isinstance(flags, str):
-        return flags.encode("utf-8")
-    if isinstance(flags, (bytes, bytearray)):
-        return bytes(flags)
-    return "".join(c for bit, c in _RE_FLAG_CHARS if flags & bit).encode("utf-8")
+    return regex_options_string(flags).encode("utf-8")
 
 
 def _encode_regex(r: Regex) -> bytes:

@@ -150,9 +150,14 @@ pub fn cmp(a: &Bson, b: &Bson) -> Ordering {
         }
         (Bson::ObjectId(x), Bson::ObjectId(y)) => x.bytes().cmp(&y.bytes()),
         (Bson::Binary(x), Bson::Binary(y)) => x.bytes.cmp(&y.bytes), // subtype ignored (bytes `<`)
-        // Two regexes: Python `<` raises TypeError -> type-name fallback ->
-        // "Regex" == "Regex" -> not less -> equal.
-        (Bson::RegularExpression(_), Bson::RegularExpression(_)) => Ordering::Equal,
+        // Two regexes compare by pattern, then by option string (probed
+        // 8.2.11). This used to report every pair EQUAL, justified by what
+        // Python's `<` did -- and Python was wrong: `bson.Regex` defines no
+        // `__lt__`, so it fell to a type-name fallback. `$max` over regexes
+        // never moved on either server.
+        (Bson::RegularExpression(x), Bson::RegularExpression(y)) => {
+            crate::regexutil::regex_sort_key(x).cmp(&crate::regexutil::regex_sort_key(y))
+        }
         (Bson::Document(x), Bson::Document(y)) => doc_cmp(x, y),
         (Bson::Array(x), Bson::Array(y)) => array_cmp(x, y),
         // Rank 3: the unified numeric type. NaN is unordered -> Python's `<` is
@@ -274,8 +279,10 @@ pub fn bson_lt(a: &Bson, b: &Bson) -> Option<bool> {
         }
         (Bson::ObjectId(x), Bson::ObjectId(y)) => Some(x.bytes() < y.bytes()),
         (Bson::Binary(x), Bson::Binary(y)) => Some(x.bytes < y.bytes),
-        // Two regexes: Python `<` raises TypeError → equal type names → False.
-        (Bson::RegularExpression(_), Bson::RegularExpression(_)) => Some(false),
+        // Pattern, then option string -- see the note in `cmp`.
+        (Bson::RegularExpression(x), Bson::RegularExpression(y)) => {
+            Some(crate::regexutil::regex_sort_key(x) < crate::regexutil::regex_sort_key(y))
+        }
         (Bson::MinKey, Bson::MinKey) | (Bson::MaxKey, Bson::MaxKey) => Some(false),
         (Bson::Document(x), Bson::Document(y)) => {
             for ((ak, av), (bk, bv)) in x.iter().zip(y.iter()) {

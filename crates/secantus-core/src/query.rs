@@ -454,19 +454,42 @@ fn op_regex(values: &[Option<&Bson>], pattern: &Bson, options: Option<&Bson>) ->
         return Err(Fallback::mongo(2, "$regex has to be a string"));
     }
     let re = regexutil::compile(pattern, options).map_err(|_| Fallback::Defer)?;
-    for v in values {
-        match v {
-            Some(Bson::String(s)) if re.is_match(s) => return Ok(true),
-            Some(Bson::Array(arr)) => {
-                for e in arr {
-                    if let Bson::String(s) = e {
-                        if re.is_match(s) {
-                            return Ok(true);
-                        }
-                    }
-                }
+    // The regex this query denotes, for the stored-regex case below. `$regex`
+    // with a separate `$options` participates too: `{$regex: "ab", $options:
+    // "i"}` equals a stored `/ab/i` on mongod, while a bare `{$regex: "ab"}`
+    // does not (probed 8.2.11).
+    let want = match (pattern, options) {
+        (Bson::RegularExpression(r), None) => Some(r.clone()),
+        (Bson::RegularExpression(r), Some(Bson::String(o))) => Some(bson::Regex {
+            pattern: r.pattern.clone(),
+            options: format!("{}{o}", r.options),
+        }),
+        (Bson::String(p), None) => Some(bson::Regex {
+            pattern: p.clone(),
+            options: String::new(),
+        }),
+        (Bson::String(p), Some(Bson::String(o))) => Some(bson::Regex {
+            pattern: p.clone(),
+            options: o.clone(),
+        }),
+        _ => None,
+    };
+    let hit = |e: &Bson| match e {
+        // mongod matches a regex against a STRING by pattern and against a
+        // stored REGEX by equality. Without the equality arm `find({v: /ab/i})`
+        // missed every document whose `v` IS that regex.
+        Bson::String(s) => re.is_match(s),
+        Bson::RegularExpression(r) => want.as_ref().is_some_and(|w| regexutil::regex_eq(r, w)),
+        _ => false,
+    };
+    for v in values.iter().flatten() {
+        if hit(v) {
+            return Ok(true);
+        }
+        if let Bson::Array(arr) = v {
+            if arr.iter().any(&hit) {
+                return Ok(true);
             }
-            _ => {}
         }
     }
     Ok(false)
@@ -731,9 +754,20 @@ fn eq_scalar(v: &Bson, expected: &Bson, coll: Option<&Collation>) -> R {
         (_, Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_)) => return Ok(false),
         _ => {}
     }
-    // Regex expected has its own match semantics; DbPointer / undefined equality
-    // is genuinely unreproduced. Both still defer.
-    if matches!(expected, Bson::RegularExpression(_)) || is_exotic(expected) {
+    // `$eq` with a regex operand is EQUALITY on mongod, never a pattern match:
+    // `{v: {$eq: /ab/i}}` matches a stored `/ab/i` and does NOT match the
+    // string "ab" (probed 8.2.11) -- the opposite of a BARE `/ab/i`, which
+    // routes to `op_regex` before reaching here. This used to defer, which on
+    // the standalone server is an error, so an ordinary `$eq` answered
+    // `BadValue` for every document in the collection.
+    if let Bson::RegularExpression(want) = expected {
+        return Ok(match v {
+            Bson::RegularExpression(got) => regexutil::regex_eq(got, want),
+            _ => false,
+        });
+    }
+    // DbPointer / undefined equality is genuinely unreproduced.
+    if is_exotic(expected) {
         return Err(Fallback::Defer);
     }
     let v_bool = matches!(v, Bson::Boolean(_));

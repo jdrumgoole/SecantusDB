@@ -661,12 +661,14 @@ fn apply_op(
                     Some(Ok(n)) => n,
                 };
                 if dir_int != 1 && dir_int != -1 {
+                    // mongod reports the COERCED integer, not the argument as
+                    // written: `Decimal128("1E+2")` is "found: 100", `2.000` is
+                    // "found: 2", and `Decimal128("-0")` is "found: 0" -- which
+                    // is the shape that caught this, since it is the only one
+                    // whose own rendering ("-0") differs from its value.
                     return Err(Fallback::mongo(
                         9,
-                        format!(
-                            "$pop expects 1 or -1, found: {}",
-                            crate::query::bson_value_repr(dir)
-                        ),
+                        format!("$pop expects 1 or -1, found: {dir_int}"),
                     ));
                 }
                 for cpath in expand_path(result, path, filters, pos)? {
@@ -902,31 +904,9 @@ fn apply_op(
                         }
                     };
                     for item in &items {
-                        // mongod's `$addToSet` membership test is field-ORDER-
-                        // sensitive for documents: `{y: 2, x: 1}` is a different
-                        // value from `{x: 1, y: 2}` and gets appended. `py_eq`
-                        // mirrors Python's `==`, which compares documents
-                        // order-INsensitively, so defer whenever a document is
-                        // involved and let the Python engine — which walks the
-                        // pairs in order — decide. Scalars keep the fast path.
-                        // Two cases `py_eq` gets wrong, both verified against
-                        // mongod 6.0.16:
-                        //   * documents — membership is field-ORDER-sensitive, so
-                        //     `{y:2,x:1}` is appended alongside `{x:1,y:2}`;
-                        //     `py_eq` mirrors Python `==`, which ignores order.
-                        //   * booleans — `true` is a distinct type from `1`, so
-                        //     `$addToSet: true` into `[1, 2]` yields `[1, 2, true]`
-                        //     (and `1` into `[true]` yields `[true, 1]`); Python's
-                        //     `==` says `1 == True`, so `py_eq` skips the append.
-                        // Defer both to the Python engine, whose equality ranks
-                        // bool separately and walks document pairs in order.
-                        let tricky = |v: &Bson| matches!(v, Bson::Document(_) | Bson::Boolean(_));
-                        if tricky(item) || a.iter().any(tricky) {
-                            return Err(Fallback::Defer);
-                        }
                         let mut present = false;
                         for e in &a {
-                            if expressions::py_eq(e, item)? {
+                            if addtoset_eq(e, item)? {
                                 present = true;
                                 break;
                             }
@@ -1296,6 +1276,58 @@ fn render_doc_id(doc: &Document) -> String {
     match doc.get("_id") {
         Some(id) => format!("{{_id: {}}}", render_scalar(id)),
         None => "{}".to_string(),
+    }
+}
+
+/// mongod's `$addToSet` membership equality.
+///
+/// This used to defer to the Python engine whenever a document or a bool was
+/// involved, on the strength of a comment saying `py_eq` "mirrors Python's
+/// `==`". `py_eq` has since grown both rules -- bool is its own BSON type, and
+/// Code compares by code text -- so the only thing left to add here is document
+/// and array field ORDER. Deferring is not free on the standalone server, where
+/// there is no Python behind the fallback: an `$addToSet` of a bool or a
+/// document answered `BadValue` instead of updating.
+///
+/// Probed against mongod 8.2.11 (2026-09-01):
+///   * numerics unify across the width: `1`, `1.0`, `Int64(1)` and
+///     `Decimal128("1")` all dedup against each other;
+///   * a bool is its OWN type -- `true` into `[1]` appends, `false` into `[0]`
+///     appends;
+///   * documents compare field-ORDER-sensitively and RECURSIVELY -- `{y:2,x:1}`
+///     is appended alongside `{x:1,y:2}`, and so is `{d:{y:2,x:1}}` beside
+///     `{d:{x:1,y:2}}`;
+///   * arrays are order-sensitive -- `[2,1]` appends beside `[1,2]`;
+///   * `Code("ab")` and the string `"ab"` are different values;
+///   * regexes compare by pattern and option SET.
+fn addtoset_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
+    match (a, b) {
+        (Bson::Document(x), Bson::Document(y)) => {
+            if x.len() != y.len() {
+                return Ok(false);
+            }
+            for ((ka, va), (kb, vb)) in x.iter().zip(y.iter()) {
+                if ka != kb || !addtoset_eq(va, vb)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (Bson::Array(x), Bson::Array(y)) => {
+            if x.len() != y.len() {
+                return Ok(false);
+            }
+            for (ea, eb) in x.iter().zip(y.iter()) {
+                if !addtoset_eq(ea, eb)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (Bson::RegularExpression(x), Bson::RegularExpression(y)) => {
+            Ok(crate::regexutil::regex_eq(x, y))
+        }
+        _ => expressions::py_eq(a, b),
     }
 }
 
