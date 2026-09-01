@@ -6848,6 +6848,70 @@ shared storage engine or building large new protocol subsystems:
       rather than only the lines you meant to test. Pinned by
       `tests/test_sql_in_syntax.py` (five rejected shapes, six valid ones).
 
+- [x] **RESOLVED (2026-09-01) — nine absent scalar builtins and four wrong
+      result TYPES, none of them filed.** Found by a broad expression sweep
+      against PG 14.13 rather than from this list.
+
+      `md5` / `btrim` / `quote_ident` / `quote_literal` / `quote_nullable` /
+      `concat_ws` / `starts_with` / `width_bucket` / `div` all answered
+      `0A000 function <name>() is not supported in this context`. **That wording
+      was misleading** — they were unreachable in EVERY context (FROM-less, over
+      a table, over a column), so "in this context" sent the reader looking for
+      a context where they worked.
+
+      The four type bugs are the worse half, because nothing reports them:
+
+          coalesce(NULL, NULL, 3)   pg 3      int4    us '3'  TEXT
+          x IS DISTINCT FROM y      pg t      bool    us 't'  TEXT
+          power(2, 10)              pg 1024.0 float8  us      numeric
+          sign(-3)                  pg -1.0   float8  us      numeric
+
+      `_BOOL_EXPR_TYPES` in `planner.py` already existed to prevent exactly the
+      `'t'`-as-text failure and even documents it; `NullSafeEQ` / `NullSafeNEQ`
+      / `StartsWith` had simply never been added to it.
+
+      **One cause is worth remembering.** `scalar._eval_typed_func` builds its
+      argument list from `node.expressions` ONLY, so a sqlglot node that carries
+      its first argument in `node.this` (`MD5`, `StartsWith`, `WidthBucket`)
+      reached the implementation with an EMPTY arg list and returned NULL —
+      a wrong answer wearing the shape of a right one, which is why adding the
+      functions was not enough on its own. Any future builtin whose node type
+      is not `exp.Anonymous` needs the same check.
+      Pinned by `tests/test_sql_scalar_builtins.py`.
+
+- [ ] **OPEN — four more expression-surface gaps (found 2026-09-01 by the same
+      sweep, NOT yet fixed).** Recorded with the measurement so the next pass
+      starts from evidence:
+
+      1. **`bool_and(<comparison>)` / `bool_or(<comparison>)` answer NULL** —
+         silently. `bool_and(b)` over a bare boolean COLUMN is correct; an
+         expression argument is not:
+
+             SELECT bool_and(n > 0) FROM ba    pg t     us NULL
+             SELECT bool_or(n > 9) FROM ba     pg f     us NULL
+
+         Cause: `_accumulator_for` builds `val` from a resolved FIELD PATH, and
+         an expression argument arrives with `field=None`, so the accumulator
+         body is literally `None`. Arithmetic arguments (`sum(n+1)`,
+         `avg(n*2)`, `min(n+1)`) DO work, so this is specific to the
+         comparison-argument shape reaching the bool accumulators.
+
+      2. **`sum(CASE …)` / `min(abs(n))` are `0A000`** — honest, not silent,
+         and the message is wrong: it says "unsupported array_agg argument"
+         for a `sum`/`min` call.
+
+      3. **`cume_dist()` / `percent_rank()` are `0A000`** — "window function
+         CumeDist is not supported". Every other window function measured
+         (`row_number` / `rank` / `lag` / `lead` / `sum OVER` / `ntile` /
+         `first_value` / `last_value`) matches PG.
+
+      4. **`avg()` / `stddev()` / `variance()` lose PG's numeric SCALE.**
+         `avg(n)` over integers is `4.0000000000000000` (scale 16) in PG and
+         `4` here; `stddev` comes back as a FLOAT where PG returns numeric, and
+         `variance` as `2.0000000000000004` where PG gives exactly
+         `2.0000000000000000` — a float-precision artifact of computing in
+         binary floating point rather than decimal.
+
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
   **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,
   from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn campaign

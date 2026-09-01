@@ -10646,6 +10646,14 @@ _BOOL_EXPR_TYPES = (
     exp.ILike,
     exp.RegexpLike,
     exp.RegexpILike,
+    # `IS DISTINCT FROM` / `IS NOT DISTINCT FROM`. Absent here they typed as
+    # text, so the value rode the wire as 't'/'f' and the RowDescription said
+    # oid 25 where PostgreSQL says 16 — the exact failure this tuple exists to
+    # prevent (measured against PG 14.13, 2026-09-01).
+    exp.NullSafeEQ,
+    exp.NullSafeNEQ,
+    # `starts_with()` returns boolean; it typed as text and sent 't'.
+    exp.StartsWith,
 )
 
 
@@ -11393,7 +11401,35 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         # Unknown element type: `any` lets the wire pick text rather than
         # asserting a type the values may not honour.
         return elem or "any"
-    # A boolean-producing expression (IS NOT NULL, comparisons, AND/OR) must type
+    # The pure string / numeric builtins added in `scalar._plain_scalar` — their
+    # result tags live beside them so the two cannot drift.
+    if isinstance(node, exp.Anonymous):
+        from secantus.sql import scalar as _scalar_mod  # lazy: circular import
+
+        _tag = _scalar_mod.PLAIN_SCALAR_TAGS.get(str(node.this).lower())
+        if _tag is not None:
+            return _tag
+    # `width_bucket()` returns integer; it typed as text and sent '3'.
+    if isinstance(node, exp.WidthBucket):
+        return "int4"
+    # `power()` and `sign()` return DOUBLE PRECISION in Postgres, not numeric —
+    # `power(2, 10)` is `1024.0` (oid 701), and typing it numeric put oid 1700
+    # on the wire.
+    if isinstance(node, (exp.Pow, exp.Sign)):
+        return "float8"
+    # COALESCE takes the type of its arguments, not text. `coalesce(NULL, 3)`
+    # typed as text and sent the STRING '3' with oid 25 where PG sends 3 as
+    # int4 — the first argument whose type we can pin wins, which is what PG's
+    # common-type resolution amounts to for the shapes we can decide.
+    if isinstance(node, exp.Coalesce):
+        parts = [node.this, *(node.expressions or [])]
+        for part in parts:
+            if part is None or isinstance(part, exp.Null):
+                continue
+            tag = _infer_scalar_tag(part, resolve)
+            if tag and tag != "any":
+                return tag
+        # A boolean-producing expression (IS NOT NULL, comparisons, AND/OR) must type
     # as bool, not text — else its value rides the wire as the string 'f'/'t' and
     # a driver reads ``if row["x"]`` as truthy (SQLAlchemy's duplicates_constraint).
     if isinstance(node, _BOOL_EXPR_TYPES):

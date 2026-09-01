@@ -1709,6 +1709,27 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
     # ``length()`` — a bytea's byte count, else the string's character length.
     exp.Length: _unary(lambda v: len(v) if isinstance(v, (bytes, bytearray)) else len(_as_text(v))),
     exp.Trim: _unary(lambda v: _as_text(v).strip()),
+    # These three carry their FIRST argument in ``node.this``, which the generic
+    # `_eval_typed_func` path drops (it reads ``node.expressions`` only) — so
+    # they reached `_call_func` with an empty arg list and answered NULL.
+    # Registering them here takes precedence over that path.
+    # `div(a, b)` parses to `Cast(IntDiv(a, b) AS DECIMAL)` — the cast target is
+    # already PG's numeric return; only the inner node had no handler.
+    exp.IntDiv: lambda n, s, c: _plain_scalar(
+        "div", [evaluate(n.this, s, c), evaluate(n.expression, s, c)]
+    ),
+    exp.MD5: lambda n, s, c: _plain_scalar("md5", [evaluate(n.this, s, c)]),
+    exp.StartsWith: lambda n, s, c: _plain_scalar(
+        "starts_with", [evaluate(n.this, s, c), evaluate(n.expression, s, c)]
+    ),
+    exp.WidthBucket: lambda n, s, c: _plain_scalar(
+        "width_bucket",
+        [
+            evaluate(n.args.get(k), s, c)
+            for k in ("this", "min_value", "max_value", "num_buckets")
+            if n.args.get(k) is not None
+        ],
+    ),
     exp.Abs: _unary(abs),
     exp.Ceil: _unary(lambda v: math.ceil(v)),
     exp.Floor: _unary(lambda v: math.floor(v)),
@@ -3117,7 +3138,104 @@ def _advisory_lock(name: str, args: list[Any], ctx: ScalarContext | None) -> Any
     return None  # pg_advisory_lock* return void (after blocking until granted)
 
 
+def _plain_scalar(name: str, args: list[Any]) -> Any:
+    """The pure string / numeric builtins — no session, storage or catalog.
+
+    Each was reachable only as `0A000 function <name>() is not supported in
+    this context`, in EVERY context (FROM-less and over a table alike, measured
+    against PG 14.13 on 2026-09-01), so the "in this context" wording was
+    misleading: they were simply absent.
+    """
+    a = args[0] if args else None
+    if name == "md5":
+        import hashlib
+
+        return None if a is None else hashlib.md5(_as_text(a).encode()).hexdigest()  # noqa: S324
+    if name == "btrim":
+        chars = _as_text(args[1]) if len(args) > 1 and args[1] is not None else None
+        return None if a is None else (_as_text(a).strip(chars) if chars else _as_text(a).strip())
+    if name == "quote_ident":
+        # PG quotes only when it must; a bare lower-case identifier is left as
+        # is. Embedded double quotes double.
+        if a is None:
+            return None
+        text = _as_text(a)
+        safe = text and (text[0].isalpha() or text[0] == "_")
+        safe = safe and all(ch.isalnum() or ch == "_" for ch in text) and text.islower()
+        return text if safe else '"' + text.replace('"', '""') + '"'
+    if name in ("quote_literal", "quote_nullable"):
+        if a is None:
+            return "NULL" if name == "quote_nullable" else None
+        return "'" + _as_text(a).replace("'", "''") + "'"
+    if name == "concat_ws":
+        # The SEPARATOR being NULL yields NULL; NULL arguments are skipped
+        # (unlike `concat`, which skips them too but has no separator).
+        if a is None:
+            return None
+        return _as_text(a).join(_as_text(v) for v in args[1:] if v is not None)
+    if name == "starts_with":
+        if a is None or len(args) < 2 or args[1] is None:
+            return None
+        return _as_text(a).startswith(_as_text(args[1]))
+    if name == "width_bucket":
+        if len(args) < 4 or any(v is None for v in args[:4]):
+            return None
+        from decimal import Decimal as _Dec
+
+        operand, low, high, count = (_Dec(str(v)) for v in args[:4])
+        count = int(count)
+        if count <= 0:
+            raise errors.SQLError("22004", "count must be greater than zero")
+        if low == high:
+            raise errors.SQLError("22004", "lower bound cannot equal upper bound")
+        if low < high:
+            if operand < low:
+                return 0
+            if operand >= high:
+                return count + 1
+            return int((operand - low) * count / (high - low)) + 1
+        # A DESCENDING span is legal in PG and buckets the other way.
+        if operand > low:
+            return 0
+        if operand <= high:
+            return count + 1
+        return int((low - operand) * count / (low - high)) + 1
+    if name == "div":
+        # Integer quotient of two numerics, truncated toward zero — PG returns
+        # NUMERIC, not int.
+        if a is None or len(args) < 2 or args[1] is None:
+            return None
+        from decimal import Decimal as _Dec
+
+        num, den = _Dec(str(a)), _Dec(str(args[1]))
+        if den == 0:
+            raise errors.SQLError("22012", "division by zero")
+        return _Dec(int(num / den))
+    return _UNSUPPORTED
+
+
+#: Sentinel: `_plain_scalar` did not recognise the name (distinct from a
+#: function that legitimately returned None for a NULL argument).
+_UNSUPPORTED = object()
+
+#: Result type tags for the builtins above, so the RowDescription is right.
+PLAIN_SCALAR_TAGS = {
+    "md5": "text",
+    "btrim": "text",
+    "quote_ident": "text",
+    "quote_literal": "text",
+    "quote_nullable": "text",
+    "concat_ws": "text",
+    "starts_with": "bool",
+    "width_bucket": "int4",
+    "div": "numeric",
+}
+
+
 def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> Any:
+    plain = _plain_scalar(name, args)
+    if plain is not _UNSUPPORTED:
+        return plain
     if name == "has_column_privilege":
         return _has_column_privilege(args, ctx)
     if name == "format_type":
