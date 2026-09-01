@@ -7,5 +7,6 @@ license = "Apache-2.0"
 
 [dependencies]
 bson = "2"
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 pg_query = "6"
 secantus-pgcatalog = { path = "../secantus-pgcatalog" }

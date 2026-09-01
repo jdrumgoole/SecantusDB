@@ -1321,6 +1321,7 @@ name = "secantus-pgplan"
 version = "0.1.0-beta.0"
 dependencies = [
  "bson",
+ "chrono",
  "pg_query",
  "secantus-pgcatalog",
 ]

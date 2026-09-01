@@ -13,6 +13,7 @@ excluded from the clean workspace):
 
 from __future__ import annotations
 
+import datetime as dt
 import shutil
 import socket
 import subprocess
@@ -535,3 +536,94 @@ def test_copy_to_stdout_round_trips(home: Path) -> None:
             cp.write(out)
         cur.execute("SELECT id, s, n FROM cp ORDER BY id")
         assert cur.fetchall() == [(1, "a", 10), (2, None, 20), (3, "has\ttab", 30)]
+
+
+def test_date_and_time_columns(home: Path) -> None:
+    """`date` and `time` as real column types.
+
+    Stored as canonical text (the representation the Python server uses, since
+    both share one store) but REPORTED with their true oids -- 1082 and 1083.
+    That distinction decides whether a client hands back a `date` object or a
+    string, and psycopg would never have caught it: it decodes varchar to `str`
+    either way.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t (id int PRIMARY KEY, d date, tm time)")
+        cur.execute("INSERT INTO t VALUES (1, '2026-09-01', '12:34:56')")
+        cur.execute("SELECT id, d, tm FROM t")
+        rows = cur.fetchall()
+        assert rows == [(1, dt.date(2026, 9, 1), dt.time(12, 34, 56))]
+        assert [c.type_code for c in cur.description] == [23, 1082, 1083]
+
+        # PostgreSQL accepts several spellings and stores exactly one.
+        cur.execute("INSERT INTO t VALUES (2, '2026-9-1', '12:34')")
+        cur.execute("SELECT d, tm FROM t WHERE id = 2")
+        assert cur.fetchall() == [(dt.date(2026, 9, 1), dt.time(12, 34, 0))]
+
+        # 22007 is "not a date"; 22008 is "a date that cannot exist".
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("SELECT 'not-a-date'::date")
+        assert exc.value.diag.sqlstate == "22007"
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("SELECT '2026-02-30'::date")
+        assert exc.value.diag.sqlstate == "22008"
+
+
+def test_timestamp_sub_millisecond_invariant(home: Path) -> None:
+    """Timestamps keep microseconds BSON cannot hold, via a hidden companion.
+
+    A BSON date is a MILLISECOND count, so `12:34:56.789012` would truncate to
+    `.789000`. The Python server stores the truncated date plus the lost 0-999
+    microseconds in a `__us_<field>` companion, and this server writes the same
+    thing -- the two share one database, so the representation is a contract.
+
+    THE INVARIANT under test: every write must SET or CLEAR the companion. A
+    stale one is worse than truncation, because it reports a time that was
+    never stored.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t (id int PRIMARY KEY, ts timestamp)")
+        cur.execute(
+            "INSERT INTO t VALUES (1,'2026-09-01 12:34:56.789012'),"
+            "(2,'2026-09-01 12:34:56'),(3,'2026-09-01')"
+        )
+        cur.execute("SELECT id, ts FROM t ORDER BY id")
+        assert cur.fetchall() == [
+            (1, dt.datetime(2026, 9, 1, 12, 34, 56, 789012)),
+            (2, dt.datetime(2026, 9, 1, 12, 34, 56)),
+            # A bare date is midnight.
+            (3, dt.datetime(2026, 9, 1, 0, 0)),
+        ]
+        assert cur.description[1].type_code == 1114  # timestamp, not varchar
+
+        # Overwrite a microsecond row with a whole-millisecond value: the
+        # companion must be CLEARED, not left behind.
+        cur.execute("UPDATE t SET ts = '2026-09-01 00:00:00' WHERE id = 1")
+        cur.execute("SELECT ts FROM t WHERE id = 1")
+        assert cur.fetchall() == [(dt.datetime(2026, 9, 1, 0, 0),)]
+
+        # ... and setting microseconds again restores it.
+        cur.execute("UPDATE t SET ts = '2026-09-01 01:02:03.456789' WHERE id = 1")
+        cur.execute("SELECT ts FROM t WHERE id = 1")
+        assert cur.fetchall() == [(dt.datetime(2026, 9, 1, 1, 2, 3, 456789),)]
+
+
+def test_python_server_reads_rust_timestamps(home: Path) -> None:
+    """The companion contract, across servers.
+
+    Getting this wrong is silent corruption rather than an error: the Python
+    server would read a time the Rust server never wrote.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t (id int PRIMARY KEY, ts timestamp)")
+        cur.execute(
+            "INSERT INTO t VALUES (1,'2026-09-01 01:02:03.456789'),(2,'2026-09-01 12:34:56')"
+        )
+
+    assert _python_sql(home, "SELECT id, ts FROM t ORDER BY id") == [
+        (1, dt.datetime(2026, 9, 1, 1, 2, 3, 456789)),
+        (2, dt.datetime(2026, 9, 1, 12, 34, 56)),
+    ]

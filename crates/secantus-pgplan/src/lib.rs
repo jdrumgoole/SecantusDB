@@ -12,6 +12,7 @@
 //! refusal, and the two-server model has no third option.
 
 use bson::{doc, Bson, Document};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use pg_query::protobuf::node::Node as N;
 use pg_query::protobuf::{
     a_const, AExpr, AExprKind, BoolExprType, DropBehavior, NullTestType, ObjectType, SortByDir,
@@ -36,6 +37,10 @@ pub enum Error {
     Parameter(String),
     /// A value that cannot be read as its target type -> 22P02.
     InvalidText(String),
+    /// A malformed date/time literal -> 22007.
+    InvalidDatetimeFormat(String),
+    /// A well-formed date/time naming an impossible value -> 22008.
+    DatetimeFieldOverflow(String),
     /// `x / 0` -> 22012.
     DivisionByZero,
     /// Integer overflow -> 22003.
@@ -52,6 +57,9 @@ impl std::fmt::Display for Error {
             Error::Grouping(m) => write!(f, "{m}"),
             Error::Parameter(m) => write!(f, "{m}"),
             Error::InvalidText(m) => write!(f, "{m}"),
+            Error::InvalidDatetimeFormat(m) | Error::DatetimeFieldOverflow(m) => {
+                write!(f, "{m}")
+            }
             Error::DivisionByZero => write!(f, "division by zero"),
             Error::NumericOutOfRange(m) => write!(f, "{m}"),
         }
@@ -69,6 +77,8 @@ impl Error {
             Error::Grouping(_) => "42803",    // grouping_error
             Error::Parameter(_) => "42P02",   // undefined_parameter
             Error::InvalidText(_) => "22P02", // invalid_text_representation
+            Error::InvalidDatetimeFormat(_) => "22007", // invalid_datetime_format
+            Error::DatetimeFieldOverflow(_) => "22008", // datetime_field_overflow
             Error::DivisionByZero => "22012",
             Error::NumericOutOfRange(_) => "22003", // numeric_value_out_of_range
         }
@@ -279,6 +289,10 @@ pub struct Update {
     pub table: String,
     /// Stored field -> new value.
     pub set: Document,
+    /// Hidden companion fields to REMOVE. An update to a whole-millisecond
+    /// timestamp must clear any remainder the row already carried, or it
+    /// reports a time that was never stored.
+    pub unset: Vec<String>,
     pub filter: Document,
 }
 
@@ -451,8 +465,17 @@ fn plan_insert(
         }
         let mut d = Document::new();
         for (col, item) in targets.iter().zip(items) {
-            let field = def.field_of(col).expect("checked above");
-            d.insert(field, const_value(item, params)?);
+            let column = def.column(col).expect("checked above");
+            // PostgreSQL coerces an assigned value to the column's type, so
+            // `INSERT INTO t(d) VALUES ('2026-9-1')` STORES `2026-09-01`.
+            // Without this the literal went in verbatim and a client reading
+            // the column back could not parse it as a date.
+            let value = cast_value(const_value(item, params)?, &column.pg_type)?;
+            // Resolves the hidden companion (setting or CLEARING it), so a
+            // whole-millisecond write cannot inherit stale microseconds.
+            let field = column.field();
+            let stored = carry_subms(&mut d, &field, value);
+            d.insert(field, stored);
         }
         rows.push(d);
     }
@@ -985,6 +1008,178 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
 /// a zero. A value that cannot be read as the target type is `22P02
 /// invalid_text_representation`, quoting the offending input the way
 /// PostgreSQL does.
+/// Parse a `date` literal and render it canonically.
+///
+/// PostgreSQL accepts several spellings and always renders `YYYY-MM-DD`
+/// (probed 14: `'2026-9-1'` and `'20260901'` both become `2026-09-01`). A
+/// malformed value is `22007`; a well-formed one naming a day that does not
+/// exist -- `2026-02-30` -- is `22008`, a different code.
+fn parse_date(text: &str) -> Result<String> {
+    let t = text.trim();
+    let parsed = if t.len() == 8 && t.chars().all(|c| c.is_ascii_digit()) {
+        NaiveDate::parse_from_str(t, "%Y%m%d")
+    } else {
+        NaiveDate::parse_from_str(t, "%Y-%m-%d")
+    };
+    match parsed {
+        Ok(d) => Ok(d.format("%Y-%m-%d").to_string()),
+        Err(_) => {
+            // Distinguish "not a date at all" from "a date that cannot exist".
+            let numeric_shape = t
+                .split(['-', '/'])
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+            Err(if numeric_shape {
+                Error::DatetimeFieldOverflow(format!("date/time field value out of range: \"{t}\""))
+            } else {
+                Error::InvalidDatetimeFormat(format!("invalid input syntax for type date: \"{t}\""))
+            })
+        }
+    }
+}
+
+/// Parse a `time` literal and render it as PostgreSQL does.
+///
+/// `'12:34'` fills in `:00` seconds; fractional seconds keep only the digits
+/// that matter (`12:34:56.5`, not `12:34:56.500000`). An hour past 24 is
+/// `22008`, not a parse error.
+fn parse_time(text: &str) -> Result<String> {
+    let t = text.trim();
+    let parsed = NaiveTime::parse_from_str(t, "%H:%M:%S%.f")
+        .or_else(|_| NaiveTime::parse_from_str(t, "%H:%M"));
+    let time = match parsed {
+        Ok(v) => v,
+        Err(_) => {
+            let numeric_shape = t
+                .split([':', '.'])
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+            return Err(if numeric_shape {
+                Error::DatetimeFieldOverflow(format!("date/time field value out of range: \"{t}\""))
+            } else {
+                Error::InvalidDatetimeFormat(format!("invalid input syntax for type time: \"{t}\""))
+            });
+        }
+    };
+    let micros = time.nanosecond() / 1_000;
+    Ok(if micros == 0 {
+        time.format("%H:%M:%S").to_string()
+    } else {
+        // PostgreSQL trims trailing zeros from the fraction.
+        let frac = format!("{micros:06}");
+        format!("{}.{}", time.format("%H:%M:%S"), frac.trim_end_matches('0'))
+    })
+}
+
+/// The hidden field carrying a timestamp's sub-millisecond remainder.
+///
+/// BSON's `Date` is a millisecond count, so a PostgreSQL `timestamp` -- which
+/// carries microseconds -- cannot round-trip through one. The Python server
+/// keeps the truncated date and stores the lost 0-999 microseconds beside it
+/// under this prefix (`src/secantus/sql/subms.py`), so a Mongo client still
+/// sees a real BSON date while SQL reads the microseconds back.
+///
+/// **THE INVARIANT: every write of a timestamp field must SET or CLEAR its
+/// companion.** A stale companion is worse than truncation -- it silently
+/// reports a time that was never stored. `carry_subms` below makes the clearing
+/// explicit so no write path can forget it.
+pub const SUBMS_PREFIX: &str = "__us_";
+
+pub fn companion_field(field: &str) -> String {
+    format!("{SUBMS_PREFIX}{field}")
+}
+
+/// Whether `name` is a hidden remainder field, so `SELECT *` and reflection
+/// can skip it.
+pub fn is_companion_field(name: &str) -> bool {
+    name.starts_with(SUBMS_PREFIX)
+}
+
+/// Keys of the composite `cast_value` returns for a timestamp that carries
+/// microseconds. The same convention the Python server uses for pipeline
+/// accumulators, so a real value cannot be mistaken for one.
+pub const COMPOSITE_DATE: &str = "__subms_d";
+pub const COMPOSITE_US: &str = "__subms_u";
+
+/// Split a full-precision timestamp into `(millisecond value, 0-999 remainder)`.
+fn split_subms(micros_since_epoch: i64) -> (i64, i32) {
+    // Rust's `%` truncates toward zero; a pre-epoch timestamp needs the
+    // remainder to stay non-negative or the reconstruction moves the time.
+    let ms = micros_since_epoch.div_euclid(1000);
+    let rem = micros_since_epoch.rem_euclid(1000) as i32;
+    (ms, rem)
+}
+
+/// Record `value`'s remainder for `field` in `doc`, returning what to store.
+///
+/// Always resolves the companion -- writing it when there is a remainder and
+/// REMOVING it when there is not -- so a field overwritten with a
+/// whole-millisecond value cannot keep the previous row's microseconds.
+pub fn carry_subms(doc: &mut Document, field: &str, value: Bson) -> Bson {
+    let companion = companion_field(field);
+    if let Bson::Document(d) = &value {
+        if let (Some(date), Some(us)) = (d.get(COMPOSITE_DATE), d.get(COMPOSITE_US)) {
+            let rem = us.as_i32().unwrap_or(0);
+            if rem != 0 {
+                doc.insert(companion, Bson::Int32(rem));
+            } else {
+                doc.remove(&companion);
+            }
+            return date.clone();
+        }
+    }
+    doc.remove(&companion);
+    value
+}
+
+/// Parse a `timestamp` literal to microseconds since the epoch.
+///
+/// PostgreSQL accepts a bare date (midnight), a `T` separator, and fractional
+/// seconds; it renders `YYYY-MM-DD HH:MM:SS` with the fraction only when
+/// non-zero (probed 14).
+fn parse_timestamp(text: &str) -> Result<i64> {
+    let t = text.trim();
+    let normalised = t.replacen('T', " ", 1);
+    let parsed = NaiveDateTime::parse_from_str(&normalised, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(&normalised, "%Y-%m-%d %H:%M"))
+        .or_else(|_| {
+            NaiveDate::parse_from_str(&normalised, "%Y-%m-%d")
+                .map(|d| d.and_hms_opt(0, 0, 0).expect("midnight is valid"))
+        });
+    match parsed {
+        Ok(dt) => Ok(dt.and_utc().timestamp_micros()),
+        Err(_) => {
+            let numeric_shape = normalised
+                .split([' ', '-', ':', '.'])
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+            Err(if numeric_shape {
+                Error::DatetimeFieldOverflow(format!("date/time field value out of range: \"{t}\""))
+            } else {
+                Error::InvalidDatetimeFormat(format!(
+                    "invalid input syntax for type timestamp: \"{t}\""
+                ))
+            })
+        }
+    }
+}
+
+/// Render stored microseconds as PostgreSQL renders a timestamp.
+pub fn render_timestamp(micros: i64) -> String {
+    let dt = chrono::DateTime::from_timestamp_micros(micros)
+        .map(|d| d.naive_utc())
+        .unwrap_or_default();
+    let frac = dt.and_utc().timestamp_subsec_micros();
+    if frac == 0 {
+        dt.format("%Y-%m-%d %H:%M:%S").to_string()
+    } else {
+        // The fraction keeps only the digits that matter.
+        let s = format!("{frac:06}");
+        format!(
+            "{}.{}",
+            dt.format("%Y-%m-%d %H:%M:%S"),
+            s.trim_end_matches('0')
+        )
+    }
+}
+
 fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     // A NULL survives every cast; only its declared type changes.
     if value == Bson::Null {
@@ -992,6 +1187,18 @@ fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     }
     let as_text = |v: &Bson| match v {
         Bson::String(s) => s.clone(),
+        // A timestamp renders as PostgreSQL renders it, not as a debug dump.
+        // `'...'::timestamp::text` casts through here, and the composite form
+        // carries the microseconds the BSON date alone cannot.
+        Bson::DateTime(d) => render_timestamp(d.timestamp_millis() * 1000),
+        Bson::Document(doc) if doc.contains_key(COMPOSITE_DATE) => {
+            let ms = match doc.get(COMPOSITE_DATE) {
+                Some(Bson::DateTime(d)) => d.timestamp_millis(),
+                _ => 0,
+            };
+            let us = doc.get(COMPOSITE_US).and_then(|v| v.as_i32()).unwrap_or(0);
+            render_timestamp(ms * 1000 + i64::from(us))
+        }
         Bson::Int32(i) => i.to_string(),
         Bson::Int64(i) => i.to_string(),
         Bson::Double(d) => {
@@ -1059,6 +1266,23 @@ fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             _ => Err(bad("boolean", &value)),
         },
         "text" | "varchar" | "bpchar" | "char" | "name" => Ok(Bson::String(as_text(&value))),
+        // `date` and `time` are stored as their canonical TEXT, matching what
+        // the Python server writes -- the two servers share one store, so the
+        // representation is a contract, not an implementation choice.
+        "date" => Ok(Bson::String(parse_date(&as_text(&value))?)),
+        // A timestamp becomes a BSON date plus, when it carries microseconds,
+        // a composite the assignment path unwraps into the hidden companion.
+        "timestamp" => {
+            let micros = parse_timestamp(&as_text(&value))?;
+            let (ms, rem) = split_subms(micros);
+            let date = Bson::DateTime(bson::DateTime::from_millis(ms));
+            Ok(if rem == 0 {
+                date
+            } else {
+                Bson::Document(doc! { COMPOSITE_DATE: date, COMPOSITE_US: rem })
+            })
+        }
+        "time" => Ok(Bson::String(parse_time(&as_text(&value))?)),
         other => Err(Error::Unsupported(format!("a cast to {other}"))),
     }
 }
@@ -1375,6 +1599,7 @@ fn plan_update(
     let def = lookup(&table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
 
     let mut set = Document::new();
+    let mut unset: Vec<String> = Vec::new();
     for t in &u.target_list {
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
             return Err(Error::Unsupported("this SET target".into()));
@@ -1388,13 +1613,27 @@ fn plan_update(
             return Err(Error::Unsupported("UPDATE of a PRIMARY KEY column".into()));
         }
         let field = column.field();
-        let value = const_value(
-            rt.val
-                .as_ref()
-                .ok_or_else(|| Error::Parse("SET without a value".into()))?,
-            params,
+        let value = cast_value(
+            const_value(
+                rt.val
+                    .as_ref()
+                    .ok_or_else(|| Error::Parse("SET without a value".into()))?,
+                params,
+            )?,
+            &column.pg_type,
         )?;
-        set.insert(field, value);
+        // `carry_subms` writes the companion into a scratch document; a
+        // remainder becomes another `$set`, its absence an explicit `$unset`.
+        let mut scratch = Document::new();
+        let stored = carry_subms(&mut scratch, &field, value);
+        let companion = companion_field(&field);
+        match scratch.get(&companion) {
+            Some(rem) => {
+                set.insert(companion, rem.clone());
+            }
+            None => unset.push(companion),
+        }
+        set.insert(field, stored);
     }
     if set.is_empty() {
         return Err(Error::Parse("UPDATE without a SET list".into()));
@@ -1403,7 +1642,12 @@ fn plan_update(
         None => Document::new(),
         Some(w) => lower_where(w, &def, params)?,
     };
-    Ok(Statement::Update(Update { table, set, filter }))
+    Ok(Statement::Update(Update {
+        table,
+        set,
+        unset,
+        filter,
+    }))
 }
 
 fn plan_delete(

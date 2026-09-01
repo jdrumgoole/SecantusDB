@@ -324,7 +324,70 @@ the Python server's 4,092 for less capability (no SCRAM, TLS or binary COPY),
 and it already covers everything ahead -- NoticeResponse, ParameterStatus,
 NotificationResponse, CancelRequest, SASL/SCRAM, SSL, PortalSuspended.
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904.**
+### 0.15 date + time (2026-09-01)
+
+`date` / `time` as column types AND cast targets. Stored as canonical TEXT --
+the representation the Python server writes, and therefore a contract -- but
+reported with oids **1082 / 1083**, not varchar. That is what makes a client
+return a `date` object instead of a string; psycopg decodes varchar to `str`
+either way, so only an OID comparison catches it.
+
+**`timestamp` LANDED in the same batch after all** (see below); the scoping
+note is kept because the reasoning still applies to anything touching the
+companion.
+
+**Original scoping note:** The Python server
+stores it as a BSON `Date` truncated to milliseconds plus a hidden
+`__us_<field>` companion for the microseconds BSON cannot hold, and
+`subms.py` warns: *"Every write of a timestamp field must set or clear its
+companion. A stale companion is worse than truncation: it silently reports a
+time that was never stored."* That is cross-server silent corruption, and the
+companion is PER-COLUMN so it cannot live in `cast_value`, which has no field
+name. It needs its own batch with the INSERT/UPDATE paths done carefully.
+
+**The batch's real find was not about dates.** Testing `date` as a COLUMN type
+rather than a cast exposed that assigned values were never coerced to the
+column's declared type: `INSERT INTO t(d) VALUES ('2026-9-1')` stored the
+literal verbatim and the client then failed with `can't parse date '2026-9-1'`.
+PostgreSQL coerces on assignment. Now fixed for INSERT and UPDATE, for EVERY
+type. **All 23 cast-level differential cases passed while the storage path was
+broken** -- casts and column types are different paths and need separate tests.
+
+22007 (not a date) and 22008 (a date that cannot exist, e.g. `2026-02-30`) are
+distinct codes and are kept distinct.
+
+### 0.16 timestamp + the sub-millisecond companion (2026-09-01): 904 -> 945
+
+BSON's `Date` is a MILLISECOND count; PostgreSQL's `timestamp` carries
+microseconds. The Python server stores the truncated date plus the lost 0-999us
+in a hidden `__us_<field>` companion (`subms.py`); this server now writes the
+identical representation, because both share one store.
+
+**THE INVARIANT, and it is the whole risk:** every write must SET or CLEAR the
+companion. `subms.py`: *"A stale companion is worse than truncation -- it
+silently reports a time that was never stored."* The dangerous sequence is
+covered by a test that drives it directly: insert `.789012`, **overwrite with a
+whole-millisecond value** (companion must be REMOVED), then set microseconds
+again. Clearing needs an `$unset` in the update path, not just an `$set` --
+which is why `Update` grew an `unset` field.
+
+**Three-way agreement verified:** Rust writes -> Python server reads at full
+precision -> both match real PG 14, oid 1114 throughout.
+
+Two details worth keeping:
+
+* `split_subms` uses `div_euclid`/`rem_euclid`, not `/` and `%`. Rust truncates
+  toward zero, so a PRE-EPOCH timestamp would get a negative remainder and
+  reconstruct to the wrong time.
+* The read path VALIDATES the stored remainder (integer, 1-999) instead of
+  trusting it, mirroring `subms.py::merge`, so a hand-edited or foreign
+  document cannot produce a time nobody wrote.
+
+Caught by the differential: `'...'::timestamp::text` fell through to a BSON
+debug dump rather than PostgreSQL's rendering -- casts to text are a separate
+path from the row encoder and needed their own case.
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945.**
 
 **A type-system trap worth remembering.** `Describe` runs BEFORE `Bind`, so a
 column's type cannot be inferred from its value — at that point `$1::int` has
