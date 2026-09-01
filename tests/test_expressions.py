@@ -976,8 +976,11 @@ def test_date_arg_validation() -> None:
     assert evaluate(
         {"$dateAdd": {"startDate": d, "unit": "day", "amount": 2.0}}, {}
     ) == dt.datetime(2021, 1, 3)
+    # 2020, not 2021: `$dateTrunc` bins from 2000-01-01, so an even binSize
+    # lands on even years (probed mongod 8.2.11). This asserted 2021 while the
+    # implementation binned from year 1.
     assert evaluate({"$dateTrunc": {"date": d, "unit": "year", "binSize": 2.0}}, {}) == dt.datetime(
-        2021, 1, 1
+        2020, 1, 1
     )
     # $dateAdd / $dateSubtract amount: fractional / bool / non-numeric -> 5166405.
     for op in ("$dateAdd", "$dateSubtract"):

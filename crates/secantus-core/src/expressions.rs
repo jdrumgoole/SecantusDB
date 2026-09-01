@@ -2809,9 +2809,11 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
     };
     // A fixed-offset `timezone` field interprets a *naive* dateString as being in
     // that zone (`utc = wall - offset`); a named zone / malformed offset defers.
-    let tz_offset = match spec.get("timezone") {
-        None => None,
-        Some(Bson::String(s)) => Some(resolve_tz_offset(s).ok_or(Fallback::Defer)?),
+    // A `timezone` interprets a NAIVE dateString as being in that zone, which is
+    // the wall-clock -> instant direction. Named IANA zones used to defer.
+    let tz_spec = match spec.get("timezone") {
+        None | Some(Bson::Null) => None,
+        Some(t @ Bson::String(_)) => Some(t),
         Some(_) => return Err(Fallback::Defer), // Python raises "timezone must be a string"
     };
     let raw = match spec.get("dateString") {
@@ -2838,8 +2840,15 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
             (parse_iso(&s).ok_or(Fallback::Defer)?, !has_embedded_offset)
         }
     };
-    let millis = match tz_offset {
-        Some(off) if apply_tz => millis - off as i128 * 60_000,
+    let millis = match tz_spec {
+        Some(tz) if apply_tz => {
+            // The parsed value is a local wall clock; ask the zone which
+            // instant it names. `i64` is safe here because the string forms
+            // this parser accepts are all inside the BSON date range, and
+            // `bounded_datetime` re-checks below.
+            let local = i64::try_from(millis).map_err(|_| Fallback::Defer)?;
+            tz_instant_from_local_ms(Some(tz), local)? as i128
+        }
         _ => millis,
     };
     bounded_datetime(millis)
@@ -3145,6 +3154,46 @@ fn resolve_tz_offset(name: &str) -> Option<i64> {
 /// Python `zoneinfo` return the identical offset for any instant whose governing
 /// rule both tz databases agree on — which is why `$dateToString` can compute
 /// natively here while `$dateFromString`'s named-zone form still defers.
+/// mongod's unrecognised-timezone failure (40485), in the two forms it has.
+///
+/// `$dateTrunc` and `$dateDiff` name the parameter they were parsing; every
+/// other date operator reports the bare message (probed 8.2.11, 2026-09-01).
+/// This used to be `Fallback::Defer`, which on the standalone Rust server is an
+/// error saying the OPERATOR is unsupported -- for what is really a bad
+/// argument to a supported one.
+fn tz_error(name: &str, operator: Option<&str>) -> Fallback {
+    let base = format!("unrecognized time zone identifier: \"{name}\"");
+    // Folded, always: mongod parses a LITERAL `timezone` while optimizing the
+    // pipeline, whether or not the rest of the expression is constant. So
+    // `{$hour: {date: "$d", timezone: "Not/AZone"}}` -- which reads the
+    // document and therefore does not fold -- still reports under the
+    // optimizer's prefix (probed 8.2.11).
+    match operator {
+        None => Fallback::mongo(40485, base),
+        Some(op) => Fallback::mongo(
+            40485,
+            format!("{op} parameter 'timezone' value parsing failed :: caused by :: {base}"),
+        ),
+    }
+    .with_folded(true)
+}
+
+/// Reject an unusable `timezone` before doing any work, so the message names
+/// the operator that was parsing it.
+fn validate_timezone(tz: Option<&Bson>, operator: Option<&str>) -> Result<(), Fallback> {
+    match tz {
+        None | Some(Bson::Null) => Ok(()),
+        Some(Bson::String(s)) => {
+            if resolve_tz_offset(s).is_some() || s.parse::<chrono_tz::Tz>().is_ok() {
+                Ok(())
+            } else {
+                Err(tz_error(s, operator))
+            }
+        }
+        Some(_) => Err(Fallback::Defer), // Python raises 40517 "must evaluate to a string"
+    }
+}
+
 fn named_tz_offset_ms(name: &str, utc_millis: i64) -> Option<i64> {
     use chrono::{DateTime, Offset, TimeZone, Utc};
     let tz: chrono_tz::Tz = name.parse().ok()?;
@@ -3172,7 +3221,7 @@ fn timezone_offset_ms(tz: Option<&Bson>, utc_millis: i64) -> Result<i64, Fallbac
         None | Some(Bson::Null) => Ok(0),
         Some(Bson::String(s)) => match resolve_tz_offset(s) {
             Some(off_min) => Ok(off_min * 60_000),
-            None => named_tz_offset_ms(s, utc_millis).ok_or(Fallback::Defer),
+            None => named_tz_offset_ms(s, utc_millis).ok_or_else(|| tz_error(s, None)),
         },
         Some(_) => Err(Fallback::Defer), // Python raises "timezone must be a string"
     }
@@ -3308,7 +3357,26 @@ fn op_date_add(arg: &Bson, ctx: &Ctx, sign: i128) -> R {
     let Some(amount) = date_int(&amount_v) else {
         return Err(Fallback::Defer); // fractional / bool / non-numeric -> Python raises 5166405
     };
-    shift_date(start_dt.timestamp_millis(), &unit, sign * amount)
+    // A CALENDAR unit shifts the LOCAL wall clock: noon Eastern plus one day is
+    // noon Eastern, which is 23 real hours across a spring-forward. The
+    // timezone was ignored outright, so every such shift was an hour out.
+    // Sub-day units are absolute, which is why +24 `hour` differs from +1 `day`.
+    let tz = d.get("timezone");
+    // `None`: only `$dateTrunc` and `$dateDiff` name the parameter in the
+    // failure message; `$dateAdd` / `$dateSubtract` report it bare.
+    validate_timezone(tz, None)?;
+    let millis = start_dt.timestamp_millis();
+    if tz.is_none() || matches!(tz, Some(Bson::Null)) || subday_unit_ms(&unit).is_some() {
+        return shift_date(millis, &unit, sign * amount);
+    }
+    let local = millis + timezone_offset_ms(tz, millis)?;
+    let shifted = shift_date(local, &unit, sign * amount)?;
+    let Bson::DateTime(shifted_dt) = shifted else {
+        return Ok(shifted);
+    };
+    Ok(Bson::DateTime(bson::DateTime::from_millis(
+        tz_instant_from_local_ms(tz, shifted_dt.timestamp_millis())?,
+    )))
 }
 
 fn op_date_diff(arg: &Bson, ctx: &Ctx) -> R {
@@ -3333,44 +3401,150 @@ fn op_date_diff(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::String(unit) = eval_opt(d.get("unit"), ctx)? else {
         return Err(Fallback::Defer);
     };
+    // mongod counts BOUNDARY CROSSINGS in the timezone, which is the same bin
+    // index `$dateTrunc` floors to -- so this is one subtraction, not a second
+    // implementation of the calendar. The timezone used to be ignored entirely
+    // and the calendar units computed "whole units elapsed": 02:00Z to 23:00Z
+    // answered 0 days where New York answers 1.
+    let tz = d.get("timezone");
+    validate_timezone(tz, Some("$dateDiff"))?;
+    let start_of_week = start_of_week_arg(d, ctx)?;
     let (sm, em) = (s.timestamp_millis(), e.timestamp_millis());
-    let (sy, smo, sd) = civil_from_days(sm.div_euclid(86_400_000));
-    let (ey, emo, ed) = civil_from_days(em.div_euclid(86_400_000));
-    let dms = (em - sm) as i128;
-    let value: i128 = match unit.as_str() {
-        "year" => (ey - sy - i64::from((emo, ed) < (smo, sd))) as i128,
-        "quarter" => {
-            let (sq, eq) = ((smo - 1) / 3, (emo - 1) / 3);
-            ((ey - sy) * 4 + (eq - sq)) as i128
-        }
-        "month" => ((ey - sy) * 12 + (emo - smo) - i64::from(ed < sd)) as i128,
-        // day/week use the integer `timedelta.days` (floor). The sub-day units
-        // go through Python's lossy `timedelta.total_seconds()`, which is
-        // `total_microseconds / 10**6` — an int/int *correctly-rounded* true
-        // division — then `// n` (floor) for hour/minute and `int(...)`
-        // (truncate toward zero) for second/ms. We reproduce that float path so
-        // the last-digit rounding matches. The `total_us as f64` conversion is
-        // exact only while `|total_us| <= 2**53`; beyond that a second rounding
-        // could diverge from CPython's single correctly-rounded int/int divide,
-        // so we defer extreme dates to Python.
-        "day" => dms.div_euclid(86_400_000),
-        "week" => dms.div_euclid(86_400_000).div_euclid(7),
-        "hour" | "minute" | "second" | "millisecond" => {
-            let total_us = dms * 1000;
-            if total_us.unsigned_abs() > (1u128 << 53) {
-                return Err(Fallback::Defer);
+    let value = date_bin_index(em, &unit, 1, tz, start_of_week.as_deref())?
+        - date_bin_index(sm, &unit, 1, tz, start_of_week.as_deref())?;
+    Ok(Bson::Int64(value))
+}
+
+// --- timezone-aware date binning ($dateTrunc / $dateDiff) ----------------
+
+/// mongod bins every `$dateTrunc` unit from 2000-01-01T00:00:00 IN THE TARGET
+/// ZONE. Probed 8.2.11 (2026-09-01).
+const TRUNC_REF_YEAR: i64 = 2000;
+
+/// A local wall clock back to the instant it names.
+///
+/// The counterpart of `timezone_offset_ms`, which only goes instant→wall-clock.
+/// `earliest()` matches Python `zoneinfo`'s `fold=0` for an ambiguous local time
+/// (the hour repeated when DST ends); a local time inside a DST GAP does not
+/// exist at all, and chrono answers `None` there, which defers.
+fn tz_instant_from_local_ms(tz: Option<&Bson>, local_millis: i64) -> Result<i64, Fallback> {
+    match tz {
+        None | Some(Bson::Null) => Ok(local_millis),
+        Some(Bson::String(s)) => {
+            if let Some(off_min) = resolve_tz_offset(s) {
+                return Ok(local_millis - off_min * 60_000);
             }
-            let ts = total_us as f64 / 1_000_000.0;
-            match unit.as_str() {
-                "hour" => (ts / 3600.0).floor() as i128,
-                "minute" => (ts / 60.0).floor() as i128,
-                "second" => ts.trunc() as i128,
-                _ => (ts * 1000.0).trunc() as i128, // millisecond
+            named_local_to_utc_ms(s, local_millis).ok_or_else(|| tz_error(s, None))
+        }
+        Some(_) => Err(Fallback::Defer),
+    }
+}
+
+fn named_local_to_utc_ms(name: &str, local_millis: i64) -> Option<i64> {
+    use chrono::{DateTime, TimeZone};
+    let tz: chrono_tz::Tz = name.parse().ok()?;
+    let secs = local_millis.div_euclid(1000);
+    let nanos = (local_millis.rem_euclid(1000) * 1_000_000) as u32;
+    let naive = DateTime::from_timestamp(secs, nanos)?.naive_utc();
+    Some(
+        tz.from_local_datetime(&naive)
+            .earliest()?
+            .timestamp_millis(),
+    )
+}
+
+/// Day number of the first `start_of_week` weekday on or after 2000-01-01.
+/// mongod's default is SUNDAY, which is what makes a week bucket land on one.
+fn week_reference_days(start_of_week: Option<&str>) -> Result<i64, Fallback> {
+    const NAMES: [&str; 7] = [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    ];
+    let want = match start_of_week {
+        None => 6, // sunday
+        Some(name) => {
+            let lower = name.to_ascii_lowercase();
+            match NAMES.iter().position(|n| *n == lower) {
+                Some(i) => i as i64,
+                None => return Err(Fallback::Defer), // Location5439015 -> Python
             }
         }
-        _ => return Err(Fallback::Defer),
     };
-    int_to_bson(value).ok_or(Fallback::Defer)
+    let reference = days_from_civil(TRUNC_REF_YEAR, 1, 1);
+    // 1970-01-01 was a Thursday, so Monday-based weekday is (days + 3) mod 7.
+    let weekday = (reference + 3).rem_euclid(7);
+    Ok(reference + (want - weekday).rem_euclid(7))
+}
+
+fn subday_unit_ms(unit: &str) -> Option<i64> {
+    match unit {
+        "hour" => Some(3_600_000),
+        "minute" => Some(60_000),
+        "second" => Some(1000),
+        "millisecond" => Some(1),
+        _ => None,
+    }
+}
+
+/// Which `unit` bin an instant falls in, counting from the reference.
+///
+/// The single source for both `$dateTrunc` (which rebuilds the datetime from
+/// this index) and `$dateDiff` (which subtracts two of them) -- mongod's
+/// `$dateDiff` counts BOUNDARY CROSSINGS, so it is exactly this subtraction.
+///
+/// Both operators used to ignore `timezone` outright, bucketing on UTC
+/// boundaries: a daily rollup for `America/New_York` bucketed at 00:00Z rather
+/// than 04:00Z. Nothing errored.
+///
+/// Two arithmetics, both mongod's (probed across the 2026-03-08 spring-forward):
+/// calendar units land on a LOCAL WALL-CLOCK boundary, so consecutive `day` bins
+/// can be 23 or 25 real hours apart; sub-day units bin by REAL ELAPSED TIME from
+/// the reference instant, so `binSize: 5` hours stays 5 real hours apart.
+fn date_bin_index(
+    utc_millis: i64,
+    unit: &str,
+    bin: i64,
+    tz: Option<&Bson>,
+    start_of_week: Option<&str>,
+) -> Result<i64, Fallback> {
+    if let Some(unit_ms) = subday_unit_ms(unit) {
+        let reference = trunc_reference_instant_ms(tz)?;
+        let step = unit_ms.checked_mul(bin).ok_or(Fallback::Defer)?;
+        return Ok((utc_millis - reference).div_euclid(step));
+    }
+    let local = utc_millis + timezone_offset_ms(tz, utc_millis)?;
+    let local_days = local.div_euclid(86_400_000);
+    let (y, m, _d) = civil_from_days(local_days);
+    Ok(match unit {
+        "year" => (y - TRUNC_REF_YEAR).div_euclid(bin),
+        "quarter" => ((y - TRUNC_REF_YEAR) * 4 + (m - 1) / 3).div_euclid(bin),
+        "month" => ((y - TRUNC_REF_YEAR) * 12 + (m - 1)).div_euclid(bin),
+        "week" => (local_days - week_reference_days(start_of_week)?)
+            .div_euclid(7)
+            .div_euclid(bin),
+        "day" => (local_days - days_from_civil(TRUNC_REF_YEAR, 1, 1)).div_euclid(bin),
+        _ => return Err(Fallback::Defer),
+    })
+}
+
+/// 2000-01-01T00:00:00 local, as a UTC instant.
+fn trunc_reference_instant_ms(tz: Option<&Bson>) -> Result<i64, Fallback> {
+    tz_instant_from_local_ms(tz, days_from_civil(TRUNC_REF_YEAR, 1, 1) * 86_400_000)
+}
+
+fn start_of_week_arg(d: &bson::Document, ctx: &Ctx) -> Result<Option<String>, Fallback> {
+    match d.get("startOfWeek") {
+        None => Ok(None),
+        Some(e) => match eval(e, ctx)? {
+            Bson::String(s) => Ok(Some(s)),
+            _ => Err(Fallback::Defer),
+        },
+    }
 }
 
 fn op_date_trunc(arg: &Bson, ctx: &Ctx) -> R {
@@ -3395,62 +3569,42 @@ fn op_date_trunc(arg: &Bson, ctx: &Ctx) -> R {
         },
         None => 1,
     };
+    let tz = d.get("timezone");
+    validate_timezone(tz, Some("$dateTrunc"))?;
+    let start_of_week = start_of_week_arg(d, ctx)?;
     let millis = dt.timestamp_millis();
-    let days = millis.div_euclid(86_400_000);
-    let ms_of_day = millis.rem_euclid(86_400_000);
-    let (y, m, _d) = civil_from_days(days);
-    let result: i128 = match unit.as_str() {
-        "year" => {
-            let ny = y - (y - 1).rem_euclid(bin);
-            days_from_civil(ny, 1, 1) as i128 * 86_400_000
-        }
-        "quarter" => {
-            let qi = (m - 1) / 3;
-            let qi = qi - qi.rem_euclid(bin);
-            days_from_civil(y, qi * 3 + 1, 1) as i128 * 86_400_000
-        }
-        "month" => {
-            let nm = m - (m - 1).rem_euclid(bin);
-            days_from_civil(y, nm, 1) as i128 * 86_400_000
-        }
-        "week" => {
-            let epoch = days_from_civil(1970, 1, 5); // a Monday
-            let wd = (days - epoch).div_euclid(7);
-            let wd = wd - wd.rem_euclid(bin);
-            (epoch as i128 + wd as i128 * 7) * 86_400_000
-        }
-        "day" => {
-            let dd = days - days.rem_euclid(bin);
-            dd as i128 * 86_400_000
-        }
-        // Python truncates the *field* (keeping the higher fields) via
-        // date.replace, not the total count since midnight.
-        "hour" => {
-            let hf = ms_of_day / 3_600_000;
-            let nh = hf - hf % bin;
-            days as i128 * 86_400_000 + nh as i128 * 3_600_000
-        }
-        "minute" => {
-            let hf = ms_of_day / 3_600_000;
-            let mf = (ms_of_day / 60_000) % 60;
-            let nm = mf - mf % bin;
-            days as i128 * 86_400_000 + hf as i128 * 3_600_000 + nm as i128 * 60_000
-        }
-        "second" => {
-            let hf = ms_of_day / 3_600_000;
-            let mf = (ms_of_day / 60_000) % 60;
-            let sf = (ms_of_day / 1000) % 60;
-            let ns = sf - sf % bin;
-            days as i128 * 86_400_000
-                + hf as i128 * 3_600_000
-                + mf as i128 * 60_000
-                + ns as i128 * 1000
-        }
-        "millisecond" => {
-            let sub = ms_of_day % 1000;
-            (millis - (sub % bin)) as i128
-        }
-        _ => return Err(Fallback::Defer),
+    let index = date_bin_index(millis, &unit, bin, tz, start_of_week.as_deref())?;
+
+    let result: i128 = if let Some(unit_ms) = subday_unit_ms(&unit) {
+        let reference = trunc_reference_instant_ms(tz)?;
+        let step = unit_ms.checked_mul(bin).ok_or(Fallback::Defer)? as i128;
+        reference as i128 + index as i128 * step
+    } else {
+        // Rebuild the LOCAL wall clock this bin starts at, then ask the zone
+        // which instant that names.
+        let local_days = match unit.as_str() {
+            "year" => days_from_civil(TRUNC_REF_YEAR + index * bin, 1, 1),
+            "quarter" => {
+                let quarters = index * bin;
+                days_from_civil(
+                    TRUNC_REF_YEAR + quarters.div_euclid(4),
+                    quarters.rem_euclid(4) * 3 + 1,
+                    1,
+                )
+            }
+            "month" => {
+                let months = index * bin;
+                days_from_civil(
+                    TRUNC_REF_YEAR + months.div_euclid(12),
+                    months.rem_euclid(12) + 1,
+                    1,
+                )
+            }
+            "week" => week_reference_days(start_of_week.as_deref())? + index * bin * 7,
+            "day" => days_from_civil(TRUNC_REF_YEAR, 1, 1) + index * bin,
+            _ => return Err(Fallback::Defer),
+        };
+        tz_instant_from_local_ms(tz, local_days * 86_400_000)? as i128
     };
     bounded_datetime(result)
 }
@@ -4648,14 +4802,12 @@ fn op_date_from_parts(arg: &Bson, ctx: &Ctx) -> R {
     };
     let mut millis =
         total_days * 86_400_000 + hour * 3_600_000 + minute * 60_000 + second * 1_000 + ms;
-    match d.get("timezone") {
-        None | Some(Bson::Null) => {}
-        Some(Bson::String(s)) => match resolve_tz_offset(s) {
-            Some(off_min) => millis -= off_min * 60_000, // local -> utc
-            None => return Err(Fallback::Defer),         // named zone -> Python
-        },
-        Some(_) => return Err(Fallback::Defer),
-    }
+    // The parts ARE a local wall clock, so this is the wall-clock -> instant
+    // direction. A named IANA zone used to defer here, which on the standalone
+    // server is an error -- `chrono-tz` was already a dependency and already
+    // bundled the database, but only the instant -> wall-clock direction had
+    // been wired up.
+    millis = tz_instant_from_local_ms(d.get("timezone"), millis)?;
     Ok(Bson::DateTime(bson::DateTime::from_millis(millis)))
 }
 
@@ -5580,12 +5732,23 @@ mod tests {
             ),
             Bson::Null
         );
-        // Non-integral, missing year, out-of-range year, named tz -> defer.
+        // A NAMED zone is answered now, not deferred -- the parts are a local
+        // wall clock, so 2023-01-01T00:00 in New York (EST) is 05:00Z. mongod
+        // 8.2.11 agrees (probed 2026-09-01).
+        assert_eq!(
+            evaluate(
+                &doc! {},
+                &bson::bson!({"$dateFromParts": {"year": 2023, "timezone": "America/New_York"}}),
+                &Document::new()
+            )
+            .unwrap(),
+            Bson::DateTime(bson::DateTime::from_millis(1_672_549_200_000))
+        );
+        // Non-integral, missing year, out-of-range year -> defer.
         for bad in [
             bson::bson!({"$dateFromParts": {"year": 2023, "month": 6.5}}),
             bson::bson!({"$dateFromParts": {"month": 6}}),
             bson::bson!({"$dateFromParts": {"year": 10000}}),
-            bson::bson!({"$dateFromParts": {"year": 2023, "timezone": "America/New_York"}}),
         ] {
             assert!(evaluate(&doc! {}, &bad, &Document::new()).is_err());
         }

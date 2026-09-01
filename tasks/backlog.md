@@ -5203,12 +5203,43 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   JavaScript-rank change, here the index encoder was the half that was already
   right, and a driver's BSON encoder emits options alphabetically anyway.
 
-- [ ] **`$dateFromString` with a named IANA timezone (Rust server).** Measured
-  divergent 2026-09-01: mongod resolves `America/New_York`; the Rust engine
-  defers, which errors the standalone server. Fixed `±HH:MM` offsets already
-  work. This one genuinely needs a timezone database — a dependency decision
-  (`chrono-tz` or a vendored subset), not an afternoon's port. The Python
-  server is correct here (it has `zoneinfo`).
+- [x] **The date family and timezones — DONE 2026-09-01.** This was filed as
+  `$dateFromString` with a named IANA zone on the Rust server, needing "a
+  timezone database — a dependency decision, not an afternoon's port". All
+  three parts of that were wrong, and reproducing it before working it is the
+  only reason that surfaced:
+
+  - **`chrono-tz` was ALREADY a dependency** with the IANA database bundled —
+    which is why `$hour` / `$dayOfWeek` / `$dateToString` with a named zone
+    already worked on the Rust server. What was missing is the wall-clock →
+    instant direction (`tz_instant_from_local_ms`), not a database.
+  - It was **`$dateFromParts` too**, not just `$dateFromString`.
+  - The sweep found **three silent WRONG ANSWERS on BOTH servers** that the
+    entry never mentioned. `tools/probes/date_timezones.py` is the standing
+    cover: 409 shapes, python 142 → 0, rust 191 → 0.
+
+  The wrong answers, all of them values rather than errors:
+
+  - **`$dateTrunc` ignored `timezone` outright** — read off the spec, never
+    applied — so every bucket landed on a UTC boundary. A daily rollup for
+    `America/New_York` bucketed at 00:00Z rather than 04:00Z. It also binned
+    from year 1 rather than mongod's **2000-01-01** reference, and defaulted
+    weeks to Monday where mongod uses **Sunday**.
+  - **`$dateDiff` ignored it too**, and computed "whole units elapsed" where
+    mongod counts BOUNDARY CROSSINGS: 02:00Z→23:00Z is 1 day in New York and 0
+    in UTC. It now shares one bin-index function with `$dateTrunc`.
+  - **`$dateAdd` / `$dateSubtract` ignored it as well.** A calendar shift moves
+    the LOCAL wall clock, so noon Eastern plus one day is noon Eastern — 23 real
+    hours across a spring-forward — while `+24 hour` is 24.
+
+  Two arithmetics, both mongod's (probed across 2026-03-08): calendar units land
+  on a local wall-clock boundary; sub-day units bin by real elapsed time.
+
+  Also fixed: zone names are **case-sensitive** (`zoneinfo` resolves through the
+  filesystem, so `America/new_york` loaded on macOS and failed on Linux — the
+  answer depended on the host), an unusable zone answers `40485` on the Rust
+  server instead of deferring, and a literal `timezone` is validated at pipeline
+  OPTIMIZATION time, which is where mongod reports it.
 
 - [x] **JavaScript sorts between Regex and MaxKey — DONE 2026-09-01.** It used
   to sort among the strings on both servers, because `bson.Code` subclasses

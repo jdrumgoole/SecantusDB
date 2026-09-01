@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import decimal as _decimal
+import functools
 import math
 import re
 import zoneinfo
@@ -1916,6 +1917,28 @@ def _add_months(d: _dt.datetime, months: int) -> _dt.datetime:
     return d.replace(year=new_year, month=new_month, day=new_day)
 
 
+def _shift_date_in_zone(
+    d: _dt.datetime, unit: str, amount: int, tz: _dt.tzinfo | None
+) -> _dt.datetime:
+    """`$dateAdd` / `$dateSubtract`, which shift a CALENDAR unit on the LOCAL
+    wall clock.
+
+    Probed 8.2.11 (2026-09-01): noon Eastern on 2026-03-07 plus one day is noon
+    Eastern on the 8th -- 23 real hours, because the spring-forward falls
+    between them -- while the same shift in UTC adds 24. The timezone was
+    ignored outright on both servers, so every calendar shift across a DST
+    boundary was an hour out. Sub-day units (`hour` and below) are absolute and
+    unaffected, which is why a 24-`hour` shift is NOT the same as a 1-`day` one.
+    """
+    if tz is None or unit in _SUBDAY_UNIT_MS:
+        return _shift_date(d, unit, amount)
+    aware = d if d.tzinfo is not None else d.replace(tzinfo=_dt.timezone.utc)
+    local = aware.astimezone(tz).replace(tzinfo=None)
+    shifted = _shift_date(local, unit, amount)
+    utc = _localize(shifted, tz).astimezone(_dt.timezone.utc)
+    return utc if d.tzinfo is not None else utc.replace(tzinfo=None)
+
+
 def _shift_date(d: _dt.datetime, unit: str, amount: int) -> _dt.datetime:
     if unit == "year":
         return _add_months(d, amount * 12)
@@ -1970,7 +1993,8 @@ def _op_date_add(arg: Any, ctx: _Ctx) -> Any:
             code=5166405,
             code_name="Location5166405",
         )
-    return _shift_date(start, unit, n)
+    tz = _resolve_timezone(arg.get("timezone")) if "timezone" in arg else None
+    return _shift_date_in_zone(start, unit, n, tz)
 
 
 def _op_date_subtract(arg: Any, ctx: _Ctx) -> Any:
@@ -1992,7 +2016,8 @@ def _op_date_subtract(arg: Any, ctx: _Ctx) -> Any:
             code=5166405,
             code_name="Location5166405",
         )
-    return _shift_date(start, unit, -n)
+    tz = _resolve_timezone(arg.get("timezone")) if "timezone" in arg else None
+    return _shift_date_in_zone(start, unit, -n, tz)
 
 
 def _op_date_trunc(arg: Any, ctx: _Ctx) -> Any:
@@ -2021,43 +2046,213 @@ def _op_date_trunc(arg: Any, ctx: _Ctx) -> Any:
             code=5439018,
             code_name="Location5439018",
         )
+    tz = (
+        _resolve_timezone(arg.get("timezone"), operator="$dateTrunc") if "timezone" in arg else None
+    )
+    return _truncate_date(date, unit, bin_size, tz, _eval(arg.get("startOfWeek"), ctx))
+
+
+_TRUNC_REFERENCE = _dt.datetime(2000, 1, 1)
+"""mongod bins every `$dateTrunc` unit from 2000-01-01T00:00:00 IN THE TARGET
+ZONE -- not from the epoch, and not from year 1. Probed 8.2.11 (2026-09-01):
+`binSize: 7` days over 2000-01-0N truncates to 2000-01-01 for N<8, and in
+`Asia/Kolkata` that same bin starts at 1999-12-31T18:30Z, i.e. local midnight."""
+
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+# Integer MILLISECONDS, not float seconds. The first version of this divided
+# `timedelta.total_seconds()` -- a float -- by a float step, and the rounding
+# put `$dateDiff` in milliseconds one out over a twenty-year span (mongod and
+# the Rust engine both answer the exact integer). `timedelta // timedelta` is
+# exact integer floor division, so nothing here goes through a float.
+_SUBDAY_UNIT_MS = {
+    "hour": 3_600_000,
+    "minute": 60_000,
+    "second": 1000,
+    "millisecond": 1,
+}
+
+
+def _localize(naive: _dt.datetime, tz: _dt.tzinfo | None) -> _dt.datetime:
+    """A local wall-clock reading back to the instant it names."""
+    return naive.replace(tzinfo=tz or _dt.timezone.utc)
+
+
+def _date_bin_index(
+    aware: _dt.datetime,
+    unit: str,
+    bin_size: int,
+    zone: _dt.tzinfo,
+    start_of_week: Any = None,
+) -> int:
+    """Which `unit` bin an instant falls in, counting from the reference.
+
+    The single source for both `$dateTrunc` (which rebuilds the datetime from
+    this index) and `$dateDiff` (which subtracts two of them). mongod's
+    `$dateDiff` counts BOUNDARY CROSSINGS, not elapsed whole units -- probed
+    8.2.11 (2026-09-01): 02:30 to 03:10 is 1 hour, 02:00 to 02:59 is 0, and
+    02:59:59.9 to 03:00 is 1 -- so it is exactly this subtraction, and keeping
+    one function means the two operators cannot drift apart.
+
+    Two arithmetics, because mongod uses both:
+
+    * **year / quarter / month / week / day** are CALENDAR units, indexed off
+      the local wall clock, so a `day` bin boundary is local midnight even
+      though DST makes consecutive ones 23 or 25 real hours apart.
+    * **hour / minute / second / millisecond** index by REAL ELAPSED TIME from
+      the reference instant, so `binSize: 5` hours stays 5 real hours apart
+      across a DST shift instead of re-aligning to the wall clock. The anchor
+      is still LOCAL midnight of 2000-01-01, which is why a half-hour-offset
+      zone like `Asia/Kolkata` puts hour boundaries on the half hour.
+    """
+    local = aware.astimezone(zone).replace(tzinfo=None)
+    if unit in _SUBDAY_UNIT_MS:
+        reference = _localize(_TRUNC_REFERENCE, zone).astimezone(_dt.timezone.utc)
+        step = _dt.timedelta(milliseconds=_SUBDAY_UNIT_MS[unit] * bin_size)
+        return (aware - reference) // step
     if unit == "year":
-        new_year = date.year - ((date.year - 1) % bin_size)
-        return _dt.datetime(new_year, 1, 1, tzinfo=date.tzinfo)
+        return (local.year - _TRUNC_REFERENCE.year) // bin_size
     if unit == "quarter":
-        q_index = (date.month - 1) // 3
-        q_index -= q_index % bin_size
-        return _dt.datetime(date.year, q_index * 3 + 1, 1, tzinfo=date.tzinfo)
+        quarters = (local.year - _TRUNC_REFERENCE.year) * 4 + (local.month - 1) // 3
+        return quarters // bin_size
     if unit == "month":
-        m = date.month - ((date.month - 1) % bin_size)
-        return _dt.datetime(date.year, m, 1, tzinfo=date.tzinfo)
+        months = (local.year - _TRUNC_REFERENCE.year) * 12 + (local.month - 1)
+        return months // bin_size
     if unit == "week":
-        epoch = _dt.datetime(1970, 1, 5, tzinfo=date.tzinfo)  # Mondays
-        weeks = (date - epoch).days // 7
-        weeks -= weeks % bin_size
-        return epoch + _dt.timedelta(weeks=weeks)
+        days = (
+            _dt.datetime(local.year, local.month, local.day) - _week_reference(start_of_week)
+        ).days
+        return (days // 7) // bin_size
     if unit == "day":
-        epoch = _dt.datetime(1970, 1, 1, tzinfo=date.tzinfo)
-        days = (date - epoch).days
-        days -= days % bin_size
-        return epoch + _dt.timedelta(days=days)
-    if unit == "hour":
-        zeroed = date.replace(minute=0, second=0, microsecond=0)
-        zeroed = zeroed.replace(hour=zeroed.hour - (zeroed.hour % bin_size))
-        return zeroed
-    if unit == "minute":
-        zeroed = date.replace(second=0, microsecond=0)
-        zeroed = zeroed.replace(minute=zeroed.minute - (zeroed.minute % bin_size))
-        return zeroed
-    if unit == "second":
-        zeroed = date.replace(microsecond=0)
-        zeroed = zeroed.replace(second=zeroed.second - (zeroed.second % bin_size))
-        return zeroed
-    if unit == "millisecond":
-        ms = date.microsecond // 1000
-        ms -= ms % bin_size
-        return date.replace(microsecond=ms * 1000)
+        days = (_dt.datetime(local.year, local.month, local.day) - _TRUNC_REFERENCE).days
+        return days // bin_size
     raise ExpressionError(f"unknown time unit value: {unit}", code=9, code_name="FailedToParse")
+
+
+def _truncate_date(
+    date: _dt.datetime,
+    unit: str,
+    bin_size: int,
+    tz: _dt.tzinfo | None,
+    start_of_week: Any = None,
+) -> _dt.datetime:
+    """mongod's `$dateTrunc`, which truncates IN the timezone.
+
+    The timezone used to be ignored outright -- read off the spec, never
+    applied -- so every bucket landed on a UTC boundary. A daily rollup for
+    `America/New_York` bucketed at 00:00Z rather than 04:00Z, silently
+    attributing four hours of each day to the wrong bucket. Nothing errored.
+    """
+    aware = date if date.tzinfo is not None else date.replace(tzinfo=_dt.timezone.utc)
+    zone = tz or _dt.timezone.utc
+    index = _date_bin_index(aware, unit, bin_size, zone, start_of_week)
+
+    def answer(instant: _dt.datetime) -> _dt.datetime:
+        # Same awareness as the input. Documents hold NAIVE UTC datetimes here
+        # (pymongo decodes BSON dates that way), so returning an aware one makes
+        # every later comparison against a stored date raise TypeError.
+        utc = instant.astimezone(_dt.timezone.utc)
+        return utc if date.tzinfo is not None else utc.replace(tzinfo=None)
+
+    if unit in _SUBDAY_UNIT_MS:
+        # In UTC, deliberately. Adding a `timedelta` to a ZONE-AWARE datetime is
+        # WALL-CLOCK arithmetic: the local reading advances and the offset is
+        # re-resolved, so crossing a DST boundary silently moves the instant by
+        # an hour. Anchoring in UTC keeps this absolute.
+        reference = _localize(_TRUNC_REFERENCE, zone).astimezone(_dt.timezone.utc)
+        step = _dt.timedelta(milliseconds=_SUBDAY_UNIT_MS[unit] * bin_size)
+        return answer(reference + index * step)
+
+    if unit == "year":
+        truncated = _dt.datetime(_TRUNC_REFERENCE.year + index * bin_size, 1, 1)
+    elif unit == "quarter":
+        quarters = index * bin_size
+        truncated = _dt.datetime(_TRUNC_REFERENCE.year + quarters // 4, (quarters % 4) * 3 + 1, 1)
+    elif unit == "month":
+        months = index * bin_size
+        truncated = _dt.datetime(_TRUNC_REFERENCE.year + months // 12, months % 12 + 1, 1)
+    elif unit == "week":
+        truncated = _week_reference(start_of_week) + _dt.timedelta(weeks=index * bin_size)
+    else:  # day
+        truncated = _TRUNC_REFERENCE + _dt.timedelta(days=index * bin_size)
+
+    return answer(_localize(truncated, zone))
+
+
+def _week_reference(start_of_week: Any) -> _dt.datetime:
+    """The first `start_of_week` weekday ON OR AFTER 2000-01-01.
+
+    mongod's default is SUNDAY -- 2000-01-02 -- which is what makes
+    `$dateTrunc` by week land on a Sunday. The old code used 1970-01-05, a
+    Monday, so the default bucket was a day out for every week truncation.
+    """
+    name = "sunday" if start_of_week is None else start_of_week
+    if not isinstance(name, str) or name.lower() not in _WEEKDAYS:
+        raise ExpressionError(
+            f"unknown startOfWeek value: {name}", code=5439015, code_name="Location5439015"
+        )
+    want = _WEEKDAYS.index(name.lower())
+    ref = _TRUNC_REFERENCE
+    return ref + _dt.timedelta(days=(want - ref.weekday()) % 7)
+
+
+def _date_int(v: Any) -> int | None:
+    """An integer date argument (mongod amount / binSize): an int or a whole
+    double coerces to int; a fractional double / bool / non-numeric returns None
+    for the caller to reject."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    return None
+
+
+def _op_date_add(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$dateAdd requires a document spec")
+    start = _eval(arg.get("startDate"), ctx)
+    unit = _eval(arg.get("unit"), ctx)
+    amount = _eval(arg.get("amount"), ctx)
+    if start is None or amount is None:
+        return None
+    if not isinstance(start, _dt.datetime):
+        raise ExpressionError("$dateAdd startDate must be a datetime")
+    if not isinstance(unit, str):
+        raise ExpressionError("$dateAdd needs a string unit")
+    n = _date_int(amount)
+    if n is None:
+        raise ExpressionError(
+            "$dateAdd expects integer amount of time units",
+            code=5166405,
+            code_name="Location5166405",
+        )
+    tz = _resolve_timezone(arg.get("timezone")) if "timezone" in arg else None
+    return _shift_date_in_zone(start, unit, n, tz)
+
+
+def _op_date_subtract(arg: Any, ctx: _Ctx) -> Any:
+    if not isinstance(arg, Mapping):
+        raise ExpressionError("$dateSubtract requires a document spec")
+    start = _eval(arg.get("startDate"), ctx)
+    unit = _eval(arg.get("unit"), ctx)
+    amount = _eval(arg.get("amount"), ctx)
+    if start is None or amount is None:
+        return None
+    if not isinstance(start, _dt.datetime):
+        raise ExpressionError("$dateSubtract startDate must be a datetime")
+    if not isinstance(unit, str):
+        raise ExpressionError("$dateSubtract needs a string unit")
+    n = _date_int(amount)
+    if n is None:
+        raise ExpressionError(
+            "$dateSubtract expects integer amount of time units",
+            code=5166405,
+            code_name="Location5166405",
+        )
+    tz = _resolve_timezone(arg.get("timezone")) if "timezone" in arg else None
+    return _shift_date_in_zone(start, unit, -n, tz)
 
 
 def _op_date_to_parts(arg: Any, ctx: _Ctx) -> Any:
@@ -2414,32 +2609,21 @@ def _op_date_diff(arg: Any, ctx: _Ctx) -> Any:
         raise ExpressionError("$dateDiff endpoints must be datetimes")
     if not isinstance(unit, str):
         raise ExpressionError("$dateDiff needs a string unit")
-    if unit == "year":
-        return end.year - start.year - (1 if (end.month, end.day) < (start.month, start.day) else 0)
-    if unit == "quarter":
-        sq = (start.year, (start.month - 1) // 3)
-        eq = (end.year, (end.month - 1) // 3)
-        return (eq[0] - sq[0]) * 4 + (eq[1] - sq[1])
-    if unit == "month":
-        return (
-            (end.year - start.year) * 12
-            + (end.month - start.month)
-            - (1 if end.day < start.day else 0)
-        )
-    delta = end - start
-    if unit == "week":
-        return delta.days // 7
-    if unit == "day":
-        return delta.days
-    if unit == "hour":
-        return int(delta.total_seconds() // 3600)
-    if unit == "minute":
-        return int(delta.total_seconds() // 60)
-    if unit == "second":
-        return int(delta.total_seconds())
-    if unit == "millisecond":
-        return int(delta.total_seconds() * 1000)
-    raise ExpressionError(f"unknown time unit value: {unit}", code=9, code_name="FailedToParse")
+    # mongod counts BOUNDARY CROSSINGS in the timezone, which is the same bin
+    # index `$dateTrunc` floors to -- so this is one subtraction, not a second
+    # implementation of the calendar. The timezone used to be ignored entirely
+    # and the calendar units computed "whole units elapsed" instead: 02:00Z to
+    # 23:00Z answered 0 days where New York answers 1 (locally that crosses
+    # midnight), and 2026-07-01 to 2026-07-31 answered 0 months where mongod
+    # answers 1. Both were silent wrong answers.
+    tz = _resolve_timezone(arg.get("timezone"), operator="$dateDiff") if "timezone" in arg else None
+    zone = tz or _dt.timezone.utc
+    start_aware = start if start.tzinfo is not None else start.replace(tzinfo=_dt.timezone.utc)
+    end_aware = end if end.tzinfo is not None else end.replace(tzinfo=_dt.timezone.utc)
+    start_of_week = _eval(arg.get("startOfWeek"), ctx) if "startOfWeek" in arg else None
+    return _date_bin_index(end_aware, unit, 1, zone, start_of_week) - _date_bin_index(
+        start_aware, unit, 1, zone, start_of_week
+    )
 
 
 def _op_regex_find_all(arg: Any, ctx: _Ctx) -> Any:
@@ -3148,7 +3332,30 @@ def _op_iso_week_year(arg: Any, ctx: _Ctx) -> Any:
     return d.isocalendar()[0] if d is not None else None
 
 
-def _resolve_timezone(name: Any) -> _dt.tzinfo | None:
+def resolve_timezone_argument(name: Any, *, operator: str | None = None) -> _dt.tzinfo | None:
+    """Public alias -- the aggregate layer validates literal timezones with it."""
+    return _resolve_timezone(name, operator=_WRAPPED_TZ_OPERATORS.get(operator or ""))
+
+
+# Only these two name the parameter in the message; every other date operator
+# reports the bare "unrecognized time zone identifier" (probed 8.2.11).
+_WRAPPED_TZ_OPERATORS = {"$dateTrunc": "$dateTrunc", "$dateDiff": "$dateDiff"}
+
+
+def _bad_timezone(name: str, operator: str | None) -> str:
+    """mongod's unrecognised-zone message, in the two forms it has.
+
+    `$dateTrunc` and `$dateDiff` name the parameter they were parsing;
+    every other date operator reports the bare message. Probed 8.2.11
+    (2026-09-01) -- and it really is only those two.
+    """
+    base = f'unrecognized time zone identifier: "{name}"'
+    if operator is None:
+        return base
+    return f"{operator} parameter 'timezone' value parsing failed :: caused by :: {base}"
+
+
+def _resolve_timezone(name: Any, *, operator: str | None = None) -> _dt.tzinfo | None:
     """Resolve MongoDB-style timezone strings to a Python ``tzinfo``.
 
     Accepts IANA names ("Europe/Dublin"), UTC offsets ("+05:30",
@@ -3173,12 +3380,24 @@ def _resolve_timezone(name: Any) -> _dt.tzinfo | None:
             hours = int(digits[:2])
             minutes = int(digits[2:])
             return _dt.timezone(sign * _dt.timedelta(hours=hours, minutes=minutes))
-        raise ExpressionError(f'unrecognized time zone identifier: "{name}"', code=40485)
+        raise ExpressionError(_bad_timezone(name, operator), code=40485)
+    # Case-sensitively, via the canonical name set. `zoneinfo.ZoneInfo` resolves
+    # through the filesystem, so on a case-INSENSITIVE one (macOS, Windows)
+    # "America/new_york" loads happily while mongod -- and this same server on
+    # Linux -- rejects it. That made the answer depend on the host filesystem.
+    if name not in _known_timezones():
+        # mongod: Location40485 "unrecognized time zone identifier: \"<name>\""
+        raise ExpressionError(_bad_timezone(name, operator), code=40485)
     try:
         return zoneinfo.ZoneInfo(name)
     except zoneinfo.ZoneInfoNotFoundError as exc:
-        # mongod: Location40485 "unrecognized time zone identifier: \"<name>\""
-        raise ExpressionError(f'unrecognized time zone identifier: "{name}"', code=40485) from exc
+        raise ExpressionError(_bad_timezone(name, operator), code=40485) from exc
+
+
+@functools.lru_cache(maxsize=1)
+def _known_timezones() -> frozenset[str]:
+    """Every IANA name this host knows, exactly as spelled."""
+    return frozenset(zoneinfo.available_timezones())
 
 
 def _op_date_from_string(arg: Any, ctx: _Ctx) -> Any:
