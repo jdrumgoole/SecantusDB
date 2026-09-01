@@ -105,7 +105,7 @@ fn match_clause_raw(
     match key {
         "$and" => {
             for c in doc_op_array(key, cond)? {
-                if !matches_raw(raw, as_doc(c)?, vars, coll)? {
+                if !matches_raw(raw, as_doc_entry(key, c)?, vars, coll)? {
                     return Ok(false);
                 }
             }
@@ -113,7 +113,7 @@ fn match_clause_raw(
         }
         "$or" => {
             for c in doc_op_array(key, cond)? {
-                if matches_raw(raw, as_doc(c)?, vars, coll)? {
+                if matches_raw(raw, as_doc_entry(key, c)?, vars, coll)? {
                     return Ok(true);
                 }
             }
@@ -121,7 +121,7 @@ fn match_clause_raw(
         }
         "$nor" => {
             for c in doc_op_array(key, cond)? {
-                if matches_raw(raw, as_doc(c)?, vars, coll)? {
+                if matches_raw(raw, as_doc_entry(key, c)?, vars, coll)? {
                     return Ok(false);
                 }
             }
@@ -187,10 +187,14 @@ fn resolve_path_raw(raw: &RawDocument, path: &str) -> Result<Vec<Option<Bson>>, 
         .collect()
 }
 
-fn as_doc(b: &Bson) -> Result<&Document, Fallback> {
+/// One `$and` / `$or` / `$nor` entry, which must be a document.
+fn as_doc_entry<'a>(key: &str, b: &'a Bson) -> Result<&'a Document, Fallback> {
     match b {
         Bson::Document(d) => Ok(d),
-        _ => Err(Fallback::Defer),
+        _ => Err(Fallback::mongo(
+            2,
+            format!("{key} argument's entries must be objects"),
+        )),
     }
 }
 
@@ -205,7 +209,7 @@ fn match_clause(
         "$and" => {
             let arr = cond.as_array().ok_or(Fallback::Defer)?;
             for c in arr {
-                if !matches(doc, as_doc(c)?, vars, coll)? {
+                if !matches(doc, as_doc_entry(key, c)?, vars, coll)? {
                     return Ok(false);
                 }
             }
@@ -214,7 +218,7 @@ fn match_clause(
         "$or" => {
             let arr = cond.as_array().ok_or(Fallback::Defer)?;
             for c in arr {
-                if matches(doc, as_doc(c)?, vars, coll)? {
+                if matches(doc, as_doc_entry(key, c)?, vars, coll)? {
                     return Ok(true);
                 }
             }
@@ -223,7 +227,7 @@ fn match_clause(
         "$nor" => {
             let arr = cond.as_array().ok_or(Fallback::Defer)?;
             for c in arr {
-                if matches(doc, as_doc(c)?, vars, coll)? {
+                if matches(doc, as_doc_entry(key, c)?, vars, coll)? {
                     return Ok(false);
                 }
             }
@@ -978,9 +982,20 @@ fn truthy(arg: &Bson) -> Result<bool, Fallback> {
         Bson::Null => false,
         // mongod truthiness: only false / 0 / null are falsy. An empty string,
         // array, or document is TRUTHY (unlike Python's bool()).
-        // Decimal128 truthiness in Python keys on object identity (always
-        // true), but $exists: Decimal128(0) is pathological — defer.
-        Bson::Decimal128(_) => return Err(Fallback::Defer),
+        // mongod reads a Decimal128 NUMERICALLY: zero (and negative zero) are
+        // falsy, NaN is truthy. This deferred, which on the standalone server
+        // made `{n: {$exists: Decimal128("1.5")}}` an error.
+        Bson::Decimal128(d) => {
+            let text = d.to_string();
+            if text.eq_ignore_ascii_case("nan") || text.eq_ignore_ascii_case("-nan") {
+                true
+            } else {
+                // Numerically, not structurally: `-0` parses to a Dec whose
+                // sign differs from `0`'s, so a structural compare called it
+                // truthy where mongod says falsy.
+                text.parse::<f64>().is_ok_and(|f| f != 0.0)
+            }
+        }
         _ => true,
     })
 }
@@ -1133,6 +1148,16 @@ pub fn bson_type_name(v: &Bson) -> &'static str {
         Bson::RegularExpression(_) => "regex",
         Bson::Binary(_) => "binData",
         Bson::Array(_) => "array",
+        // These four fell into the catch-all and reported "object" -- probed
+        // 8.2.11 (2026-09-01): `{$bit: {n: MinKey()}}` names `minKey`.
+        Bson::MinKey => "minKey",
+        Bson::MaxKey => "maxKey",
+        Bson::Timestamp(_) => "timestamp",
+        Bson::Undefined => "undefined",
+        Bson::JavaScriptCode(_) => "javascript",
+        Bson::JavaScriptCodeWithScope(_) => "javascriptWithScope",
+        Bson::Symbol(_) => "symbol",
+        Bson::DbPointer(_) => "dbPointer",
         _ => "object",
     }
 }
@@ -1784,13 +1809,18 @@ fn type_spec_valid(spec: &Bson) -> Result<(), Fallback> {
                     match parsed
                         .as_ref()
                         .and_then(crate::decimal::trunc_to_i64)
-                        .filter(|n| crate::decimal::parse(&n.to_string()) == parsed)
+                        .filter(|n| text.parse::<f64>().is_ok_and(|f| f == *n as f64))
                     {
                         Some(n) => n,
                         None => {
+                            // Rendered through the double form like every other
+                            // numeric code: `Decimal128("NaN")` prints `nan`.
                             return Err(Fallback::mongo(
                                 2,
-                                format!("Invalid numerical type code: {text}"),
+                                format!(
+                                    "Invalid numerical type code: {}",
+                                    format_g(text.parse::<f64>().unwrap_or(f64::NAN))
+                                ),
                             ));
                         }
                     }
@@ -1805,9 +1835,18 @@ fn type_spec_valid(spec: &Bson) -> Result<(), Fallback> {
                 } else {
                     ""
                 };
+                // Negative zero keeps its sign in the message, and `code` (an
+                // i64) has already lost it -- render from the original.
+                let rendered = match spec {
+                    Bson::Double(d) => format_g(*d),
+                    Bson::Decimal128(d) => {
+                        format_g(d.to_string().parse::<f64>().unwrap_or(f64::NAN))
+                    }
+                    _ => code.to_string(),
+                };
                 Err(Fallback::mongo(
                     2,
-                    format!("Invalid numerical type code: {code}{suffix}"),
+                    format!("Invalid numerical type code: {rendered}{suffix}"),
                 ))
             }
         }
@@ -1822,6 +1861,14 @@ fn type_spec_valid(spec: &Bson) -> Result<(), Fallback> {
 /// by the `$type` numeric-code message, which does NOT use the round-trip form
 /// its neighbours do.
 fn format_g(d: f64) -> String {
+    // `{:.5e}` of a non-finite emits no exponent, so the `split_once('e')`
+    // below panicked -- `{v: {$type: NaN}}` answered `1 internal server error`.
+    if d.is_nan() {
+        return "nan".to_string();
+    }
+    if d.is_infinite() {
+        return (if d > 0.0 { "inf" } else { "-inf" }).to_string();
+    }
     let text = format!("{:.5e}", d);
     let (mantissa, exp) = text.split_once('e').expect("scientific form");
     let exp: i32 = exp.parse().expect("integer exponent");
@@ -2113,9 +2160,11 @@ pub(crate) fn coerce_int64_argument(value: &Bson, label: &str) -> Option<Result<
             let whole = crate::decimal::parse(&text)
                 .as_ref()
                 .and_then(crate::decimal::trunc_to_i64)
-                .filter(|as_int| {
-                    crate::decimal::parse(&as_int.to_string()) == crate::decimal::parse(&text)
-                });
+                // Whole-ness is a NUMERIC question. Comparing the parsed
+                // forms structurally said `-0` was not whole (its sign differs
+                // from `0`'s), so every `Decimal128("-0")` argument was
+                // rejected as unrepresentable where mongod accepts it.
+                .filter(|as_int| text.parse::<f64>().is_ok_and(|f| f == *as_int as f64));
             match whole {
                 Some(n) => Some(Ok(n)),
                 None => bad(format!(

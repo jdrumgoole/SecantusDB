@@ -5048,26 +5048,34 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   What is left is listed as its own items below, with the dependency each one
   actually needs — not as an undifferentiated "principled" list.
 
-- [ ] **The Rust server's ARGUMENT-error surface is essentially absent
-  (measured 2026-09-01).** `tools/probes/operator_error_surface.py` crosses
-  every query and update operator with every pathological argument -- 2,226
-  shapes. The Python server is at **0 divergent**; the Rust server is at
-  **1,053**, and **999 of those answer `BadValue (2): "query uses a construct
-  the Rust server does not support"`** for an argument mongod names precisely
-  (`Unknown type name alias: x`, `Expected a number in: n: "x"`, ...).
+- [x] **The Rust server's argument-error surface — DONE 2026-09-01.** It went
+  from **1,053 divergent shapes to 17**, on a corpus that grew from 2,226 to
+  3,074 while the work was in progress.
 
-  840 of them have the *right code by accident* — mongod's parse errors are
-  BadValue too — so a code-only comparison makes this look far smaller than it
-  is. Only 54 are genuine wording differences.
+  999 of the original 1,053 answered `BadValue (2): "query uses a construct the
+  Rust server does not support"` for an argument mongod names precisely, and 840
+  of those had the right CODE by accident (mongod's parse errors are BadValue
+  too), so a code-only comparison had shown 159. `tools/probes/
+  operator_error_surface.py` is the standing cover.
 
-  This is the `Fallback::Defer` problem PR #1199 built `Fallback::Mongo` to
-  solve, now applied to the validation surface rather than the expression one.
-  The work is mechanical and the spec already exists: every message is in
-  `src/secantus/query.py` / `update.py`, each mongod-probed. `field` is already
-  threaded through the Rust matcher; the Rust update engine needs the same.
+  The enabling piece was already there: `Fallback::Mongo` from #1199. What was
+  missing was that the storage layer's UPDATE path still did
+  `map_err(|_| QueryUnsupported)`, throwing the named error away exactly as the
+  query path had before that PR.
 
-  Biggest single operators: `$pop` (62), `$type` (39), `$set` / `$addToSet` /
-  `$max` / `$min` / `$push` value-type defers.
+- [ ] **The Rust engines defer on some VALID operations (17 shapes,
+  2026-09-01).** Not error-surface gaps — these are constructs the engines
+  cannot evaluate, so the standalone server errors where mongod answers:
+
+  - `{v: {$eq: /re/}}` — a regex as an equality operand (3).
+  - `$set` / `$max` with a `bson.Code` VALUE (6) — the update path defers on it.
+  - `$addToSet` with a bool, a document, or a `Code` (5) — a documented defer:
+    membership there is field-ORDER-sensitive for documents and type-sensitive
+    for bools, and `py_eq` mirrors Python's `==`, which is neither.
+  - `$pop` with `Decimal128("-0")` (3).
+
+  Each is small and independent. They are listed separately from the error
+  surface on purpose: that was a reporting problem, this is a capability one.
 
 - [ ] **`$dateFromString` with a named IANA timezone (Rust server).** Measured
   divergent 2026-09-01: mongod resolves `America/New_York`; the Rust engine

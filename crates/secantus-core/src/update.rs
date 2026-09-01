@@ -624,7 +624,17 @@ fn apply_op(
                     let mut a = match get_path(result, &cpath).cloned() {
                         None | Some(Bson::Null) => Vec::new(),
                         Some(Bson::Array(a)) => a,
-                        Some(_) => return Err(Fallback::Defer), // $push on non-array -> Python raises
+                        Some(other) => {
+                            return Err(Fallback::mongo(
+                                2,
+                                format!(
+                                    "The field '{cpath}' must be an array but is of type {} \
+                                     in document {}",
+                                    crate::query::bson_type_name(&other),
+                                    render_doc_id(result)
+                                ),
+                            ));
+                        }
                     };
                     push_apply(&mut a, value)?;
                     set_path(result, &cpath, Bson::Array(a))?;
@@ -718,6 +728,9 @@ fn apply_op(
                 if has_positional(old) || has_positional(new) {
                     return Err(Fallback::Defer);
                 }
+                if old.is_empty() || new.is_empty() {
+                    return Err(Fallback::mongo(56, "An empty update path is not valid."));
+                }
                 if old == "_id" || new == "_id" {
                     return Err(Fallback::Defer); // immutable _id -> Python raises
                 }
@@ -791,7 +804,19 @@ fn apply_op(
                         None | Some(Bson::Null) => 0i64,
                         Some(Bson::Int32(n)) => *n as i64,
                         Some(Bson::Int64(n)) => *n,
-                        Some(_) => return Err(Fallback::Defer), // $bit on non-integer -> Python raises
+                        Some(other) => {
+                            return Err(Fallback::mongo(
+                                2,
+                                format!(
+                                    "Cannot apply $bit to a value of non-integral type.\
+                                     _id: {} has the field {cpath} of non-integer type {}",
+                                    crate::query::bson_value_repr(
+                                        result.get("_id").unwrap_or(&Bson::Null)
+                                    ),
+                                    crate::query::bson_type_name(other)
+                                ),
+                            ));
+                        }
                     };
                     for (bit_op, mask) in &parsed {
                         cur = match *bit_op {
@@ -848,7 +873,16 @@ fn apply_op(
                 let items: Vec<Bson> = match value {
                     Bson::Document(d) if d.contains_key("$each") => match d.get("$each") {
                         Some(Bson::Array(a)) => a.clone(),
-                        _ => return Err(Fallback::Defer), // $each not an array -> Python raises
+                        other => {
+                            return Err(Fallback::mongo(
+                                2,
+                                format!(
+                                    "The argument to $each in $addToSet must be an array but \
+                                     it was of type {}",
+                                    crate::query::bson_type_name(other.unwrap_or(&Bson::Null))
+                                ),
+                            ));
+                        }
                     },
                     _ => vec![value.clone()],
                 };
@@ -856,7 +890,16 @@ fn apply_op(
                     let mut a = match get_path(result, &cpath).cloned() {
                         None | Some(Bson::Null) => Vec::new(),
                         Some(Bson::Array(a)) => a,
-                        Some(_) => return Err(Fallback::Defer), // non-array -> Python raises
+                        Some(other) => {
+                            return Err(Fallback::mongo(
+                                2,
+                                format!(
+                                    "Cannot apply $addToSet to non-array field. Field named \
+                                     '{cpath}' has non-array type {}",
+                                    crate::query::bson_type_name(&other)
+                                ),
+                            ));
+                        }
                     };
                     for item in &items {
                         // mongod's `$addToSet` membership test is field-ORDER-
@@ -913,7 +956,13 @@ fn apply_op(
                             }
                             set_path(result, &cpath, Bson::Array(kept))?;
                         }
-                        Some(_) => return Err(Fallback::Defer),
+                        Some(_) => {
+                            // Both $pull and $pullAll report it as $pull.
+                            return Err(Fallback::mongo(
+                                2,
+                                "Cannot apply $pull to a non-array value",
+                            ));
+                        }
                         None => {}
                     }
                 }
@@ -945,7 +994,13 @@ fn apply_op(
                             }
                             set_path(result, &cpath, Bson::Array(kept))?;
                         }
-                        Some(_) => return Err(Fallback::Defer),
+                        Some(_) => {
+                            // Both $pull and $pullAll report it as $pull.
+                            return Err(Fallback::mongo(
+                                2,
+                                "Cannot apply $pull to a non-array value",
+                            ));
+                        }
                         None => {}
                     }
                 }
@@ -1226,18 +1281,13 @@ fn is_arith_numeric(v: &Bson) -> bool {
 }
 
 /// A scalar as mongod renders it inside an error message.
+/// mongod's rendering of an offending value. This used to be a partial copy
+/// that fell through to Rust's `Debug` for everything it did not name, so an
+/// array printed `Array([])` where mongod prints `[]` and a document printed
+/// its `Debug` form. It is now the one canonical renderer -- the same
+/// consolidation the Python side needed, where FIVE copies had accumulated.
 fn render_scalar(v: &Bson) -> String {
-    match v {
-        Bson::Boolean(b) => b.to_string(),
-        Bson::Null => "null".to_string(),
-        Bson::String(s) => format!("\"{s}\""),
-        Bson::ObjectId(o) => format!("ObjectId('{o}')"),
-        Bson::Int32(n) => n.to_string(),
-        Bson::Int64(n) => n.to_string(),
-        Bson::Double(d) => d.to_string(),
-        Bson::Decimal128(d) => d.to_string(),
-        other => format!("{other:?}"),
-    }
+    crate::query::bson_value_repr(v)
 }
 
 /// The `{_id: …}` prefix mongod puts in the non-numeric-field message. It is the
