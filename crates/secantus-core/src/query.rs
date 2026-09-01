@@ -658,17 +658,32 @@ fn eq_scalar(v: &Bson, expected: &Bson, coll: Option<&Collation>) -> R {
     }
     // Symbol / JS-Code (with or without scope) match by value — mongod compares
     // them directly (mongo-node-driver's "handles BSON type inserts" queries on
-    // a Symbol / Code value). Cross-type (Symbol vs String) and ordering keep
-    // deferring via the `is_exotic` checks below / in the comparison path.
+    // a Symbol / Code value).
     match (v, expected) {
         (Bson::Symbol(a), Bson::Symbol(b)) => return Ok(a == b),
         (Bson::JavaScriptCode(a), Bson::JavaScriptCode(b)) => return Ok(a == b),
         (Bson::JavaScriptCodeWithScope(a), Bson::JavaScriptCodeWithScope(b)) => {
             return Ok(a.code == b.code && a.scope == b.scope)
         }
+        // A Symbol IS a string to mongod, so the cross pair compares as text --
+        // through the collation when there is one.
+        (Bson::Symbol(x), Bson::String(y)) | (Bson::String(x), Bson::Symbol(y)) => {
+            return Ok(match coll {
+                Some(c) => collation::equal(x, y, c).ok_or(Fallback::Defer)?,
+                None => x == y,
+            });
+        }
+        // JavaScript is its own BSON type: it equals no value of another type.
+        // This used to fall into the blanket defer below, and a defer here is
+        // not local to the one document -- it errors the WHOLE query. So
+        // `{v: Code("x=1")}` over a collection holding any non-Code document
+        // answered "query uses a construct the Rust server does not support",
+        // even though the matching document was right there.
+        (_, Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_)) => return Ok(false),
         _ => {}
     }
-    // Regex / exotic expected -> special semantics we don't reproduce: defer.
+    // Regex expected has its own match semantics; DbPointer / undefined equality
+    // is genuinely unreproduced. Both still defer.
     if matches!(expected, Bson::RegularExpression(_)) || is_exotic(expected) {
         return Err(Fallback::Defer);
     }
@@ -855,20 +870,19 @@ fn compare_values(
         (Bson::Array(_), _) | (_, Bson::Array(_)) => return Ok(None),
         _ => {}
     }
-    // Exotic BSON types under a range operator. pymongo hands the Python
-    // engine plain `str` for a Symbol and the str-subclass `Code` for JS code
-    // (scope ignored), so the Python oracle compares those as strings —
-    // including cross Symbol/Code/String pairs. A DBPointer has no ordering in
-    // Python (TypeError) and undefined decodes to None: not comparable, clean
-    // no-match. Under a collation the string path above would have applied
-    // folding the exotic text skips, so defer that combination to Python.
+    // Exotic BSON types under a range operator. A Symbol IS a string to mongod
+    // (and pymongo decodes one as `str`), so it takes the string bracket and
+    // the collation with it. JavaScript is its own bracket and compares only
+    // with JavaScript -- comparing it with a String is how `{v: {$gt: "ab"}}`
+    // matched a `Code` document -- and a collation has nothing to say about
+    // code text, so it applies to neither side. A DBPointer has no ordering and
+    // undefined decodes to nothing: not comparable, clean no-match.
+    //
+    // This whole branch used to DEFER whenever a collation was present, which
+    // on the standalone Rust server answered "query uses a construct the Rust
+    // server does not support" for an ordinary collated query over a collection
+    // that merely happened to contain a JavaScript value.
     if is_exotic(a) || is_exotic(b) {
-        if coll.is_some() {
-            return Err(Fallback::Defer);
-        }
-        // A Symbol IS a string to mongod. JavaScript is its own bracket, so it
-        // compares only with JavaScript -- comparing it with a String is how
-        // `{v: {$gt: "ab"}}` matched a `Code` document.
         fn string_text(v: &Bson) -> Option<&str> {
             match v {
                 Bson::String(s) | Bson::Symbol(s) => Some(s),
@@ -885,10 +899,13 @@ fn compare_values(
         if let (Some(x), Some(y)) = (js_text(a), js_text(b)) {
             return Ok(Some(x.cmp(y)));
         }
-        return Ok(match (string_text(a), string_text(b)) {
-            (Some(x), Some(y)) => Some(x.cmp(y)),
-            _ => None,
-        });
+        let (Some(x), Some(y)) = (string_text(a), string_text(b)) else {
+            return Ok(None);
+        };
+        return Ok(Some(match coll {
+            Some(c) => collation::compare(x, y, c).ok_or(Fallback::Defer)?,
+            None => x.cmp(y),
+        }));
     }
     Ok(match (a, b) {
         (Bson::String(x), Bson::String(y)) => Some(x.cmp(y)),

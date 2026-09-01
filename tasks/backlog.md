@@ -4906,14 +4906,39 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   (`chrono-tz` or a vendored subset), not an afternoon's port. The Python
   server is correct here (it has `zoneinfo`).
 
-- [ ] **Collated queries over exotic BSON types (Rust server).** A collated
-  `$gt` against a `Code` / `Symbol` / DbPointer value defers, because the
-  collation path and the exotic-type path do not compose. Measured 2026-09-01;
-  the uncollated form is correct on both servers since the type-bracketing fix.
-  Narrow, and no dependency needed — just the two paths joined up.
-  `tools/probes/range_type_brackets.py` is the standing cover: it is 0/112 on
-  the Python server and 32/112 on the Rust one, and every one of those 32 is a
-  collated shape.
+- [ ] **JavaScript sorts among the strings, on BOTH servers.** mongod ranks it
+  between Regex and MaxKey; we rank it as a string, because `bson.Code`
+  subclasses `str` in pymongo and `sortkey.encode_value` — the encoder that
+  writes the rank byte **persisted index entries** are sorted by — followed
+  that. Measured against 8.2.11, 2026-09-01.
+
+  Moving the in-memory comparator alone was tried and **reverted**: it made an
+  index change the sort answer, which is the one failure class this project
+  treats as unshippable. Moving both is an on-disk format break (`entryFormat`)
+  out of all proportion to JavaScript-valued indexed fields.
+
+  The proportionate fix is the remedy already used for collations: a **sticky
+  catalog flag** on an index that has ever held a JavaScript value — written at
+  insert / update / `createIndexes` time exactly like `multikey`, stripped from
+  `listIndexes` the same way — which makes the sort picker decline that index
+  for ORDERING while still using it to FETCH. Then the in-memory rank can move
+  to mongod's with no format change and no inconsistency.
+
+  MATCHING is already correct and needs none of this: range operators bracket
+  JavaScript separately (`query._same_type_bracket`, which deliberately does not
+  use the sort rank), and the exact `matches()` pass rechecks every index
+  candidate — verified indexed and unindexed.
+
+- [x] **Collated queries over exotic BSON types (Rust server) — DONE
+  2026-09-01.** A collated `$gt` or `$eq` against a `Code` / `Symbol` value used
+  to defer, because the collation path and the exotic-type path did not compose;
+  on the standalone server that answered "query uses a construct the Rust server
+  does not support" for an ordinary query over a collection that merely happened
+  to contain a JavaScript value. A Symbol is a string to mongod and takes the
+  collation with it; JavaScript is its own bracket and a collation has nothing to
+  say about code text. `tools/probes/range_type_brackets.py` is the standing
+  cover and is now 0/112 on both servers (it was 32/112 on the Rust one, every
+  one of them a collated shape).
 
   (The regex expression operators — `$regexMatch` / `$regexFind` /
   `$regexFindAll` — were on the deferred list too. They **work**: 7 of 7 probed

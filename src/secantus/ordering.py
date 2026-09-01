@@ -46,14 +46,25 @@ def _bson_type_rank(value: Any) -> float:
     # expression relational operators started routing through this order.
     if isinstance(value, (int, float, Decimal128, Decimal)):
         return 3
-    # `bson.Code` SUBCLASSES `str`, so without this arm it took the string rank
-    # and sorted among the strings. mongod ranks JavaScript between Regex and
-    # MaxKey -- probed 8.2.11 (2026-09-01): a mixed corpus sorts
-    # `... Timestamp < Regex < Code < MaxKey`. The fractional rank keeps every
-    # other value's number unchanged; these ranks are in-memory only (the
-    # persisted index ordering is `sortkey`'s, which is deliberately untouched).
-    if isinstance(value, Code):
-        return 12.5
+    # `bson.Code` SUBCLASSES `str` and deliberately keeps the STRING rank here.
+    #
+    # mongod ranks JavaScript between Regex and MaxKey (probed 8.2.11,
+    # 2026-09-01: a mixed corpus sorts `... Timestamp < Regex < Code < MaxKey`),
+    # so this ORDER is wrong. Moving it was tried and reverted, because this
+    # function is only half the story: `sortkey.encode_value` writes the rank
+    # byte that PERSISTED index entries are sorted by, and it ranks Code as a
+    # string. Changing one and not the other made an index change the sort
+    # answer -- the one failure class this project treats as unshippable -- and
+    # changing both is an on-disk format break (`entryFormat`) out of all
+    # proportion to JavaScript-valued indexed fields.
+    #
+    # The proper fix is the remedy already used for collations: a sticky catalog
+    # flag on an index that has held a JavaScript value, which makes the sort
+    # picker decline it for ORDERING while still using it to fetch. Recorded in
+    # tasks/backlog.md. Note that MATCHING is unaffected either way -- range
+    # operators bracket JavaScript separately (see `query._same_type_bracket`,
+    # which deliberately does NOT use this function) and the exact `matches()`
+    # pass rechecks every index candidate.
     if isinstance(value, str):
         return 4
     if isinstance(value, Mapping):

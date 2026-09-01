@@ -41,12 +41,6 @@ fn type_rank(v: &Bson) -> u8 {
         Bson::DateTime(_) => 100,
         Bson::Timestamp(_) => 110,
         Bson::RegularExpression(_) => 120,
-        // mongod ranks JavaScript between Regex and MaxKey. It used to fall to
-        // the catch-all document rank here and to the STRING rank in `lt_rank`
-        // below -- deliberately, to match what the Python engine did, because
-        // `bson.Code` subclasses `str` there. Both engines were wrong together,
-        // which is the failure mode a parity suite cannot see.
-        Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_) => 125,
         Bson::MaxKey => 130,
         _ => 50, // matches Python's `return 5` fallback (never reached: is_sortable bars these)
     }
@@ -203,12 +197,29 @@ fn array_cmp(a: &[Bson], b: &[Bson]) -> Ordering {
 /// for undefined (rank 2). A DBPointer decodes to an unranked object (default
 /// rank 5) — [`bson_lt`] defers it rather than reproduce Python's
 /// type-*name* tiebreak.
+/// JavaScript deliberately keeps the STRING rank, which is wrong against
+/// mongod (it ranks JS between Regex and MaxKey) and is kept anyway: this
+/// function has to agree with `sortkey::encode_value`, the rank byte PERSISTED
+/// index entries are sorted by, which ranks Code as a string. Moving one and
+/// not the other makes an index change the sort answer; moving both is an
+/// on-disk format break. See the matching note in `ordering.py` and the backlog
+/// item for the proper fix (a sticky catalog flag that makes the sort picker
+/// decline such an index for ordering).
+///
+/// MATCHING is unaffected: `query::compare_values` brackets JavaScript
+/// separately without consulting this, and the exact match pass rechecks every
+/// index candidate.
 fn lt_rank(v: &Bson) -> u8 {
     match v {
-        // A BSON Symbol really is a string to mongod (and pymongo decodes one
-        // as `str`); JavaScript is NOT, and no longer shares the rank.
-        Bson::Symbol(_) => type_rank(&Bson::String(String::new())),
-        Bson::Undefined => 2,
+        // These used to be the literal numbers 4 and 2 -- Python's ranks, on
+        // Python's 1..13 scale -- returned into `type_rank`'s spaced-by-10
+        // table, where 4 sits BELOW MinKey (10). Latent until a caller compared
+        // a JavaScript value against a MinKey / MaxKey bound, which then sorted
+        // it under MinKey. Same values, expressed on this function's own scale.
+        Bson::Symbol(_) | Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_) => {
+            type_rank(&Bson::String(String::new()))
+        }
+        Bson::Undefined => type_rank(&Bson::Null),
         _ => type_rank(v),
     }
 }
@@ -218,10 +229,7 @@ fn lt_rank(v: &Bson) -> u8 {
 /// its code string, scope ignored).
 fn lt_text(v: &Bson) -> Option<&str> {
     match v {
-        Bson::String(s) | Bson::Symbol(s) => Some(s),
-        // Two JavaScript values compare by their code text, but they no longer
-        // share a rank with String, so this is only reached for a JS/JS pair.
-        Bson::JavaScriptCode(s) => Some(s),
+        Bson::String(s) | Bson::Symbol(s) | Bson::JavaScriptCode(s) => Some(s),
         Bson::JavaScriptCodeWithScope(c) => Some(&c.code),
         _ => None,
     }
