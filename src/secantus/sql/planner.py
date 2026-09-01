@@ -4719,6 +4719,30 @@ def _sorted_agg_key(key: exp.Expression, table: TableDef) -> Any:
     return _agg_arg_to_expr(key, table)
 
 
+def _sorted_agg_push_value(value_node: exp.Expression, table: TableDef) -> Any:
+    """The ``v`` an ordered aggregate pushes.
+
+    A bare timestamp column pushes the composite (`_sorted_agg_key`). A
+    timestamp CAST TO TEXT pushes the text-marked composite: the cast would
+    otherwise be evaluated inside the pipeline, where the companion is not in
+    scope, so `string_agg(t::text, …)` stringified the truncated date while
+    `t::text` on its own was already microsecond-exact.
+    """
+    node = value_node
+    if isinstance(node, exp.Cast) and isinstance(node.this, exp.Column):
+        to = node.to
+        tag_to = typemap.type_tag_for_sql(to) if isinstance(to, exp.DataType) else None
+        if tag_to in ("text", "citext"):
+            name = _column_name(node.this)
+            try:
+                tag = table.type_for(name)
+            except Exception:  # noqa: BLE001 -- unresolvable column: lower as-is
+                tag = None
+            if tag in subms.SUBMS_TAGS:
+                return subms.composite_text_expr(table.field_for(name))
+    return _sorted_agg_key(value_node, table)
+
+
 def _sorted_agg_push(
     value_node: exp.Expression,
     terms: list[tuple[exp.Expression, int, bool]],
@@ -4732,7 +4756,7 @@ def _sorted_agg_push(
             # key does. Only the key carried it, so `array_agg(t ORDER BY t)`
             # ordered correctly and then returned `.123000` for every row --
             # times that were never stored. `_sorted_agg_value` merges both.
-            "v": _sorted_agg_key(value_node, table),
+            "v": _sorted_agg_push_value(value_node, table),
             "k": [_sorted_agg_key(key, table) for key, _dir, _nf in terms],
         }
     }
@@ -7918,6 +7942,33 @@ def _on_is_simple_equality(
     return None
 
 
+def _subms_join_keys(
+    amap: dict[str, tuple[str, TableDef]],
+    known_alias: str,
+    known_col: str,
+    join_table: TableDef,
+    new_col: str,
+) -> bool:
+    """Whether an equality join key is a timestamp on EITHER side.
+
+    Either is enough: the sub-millisecond remainder lives beside whichever
+    column has one, and comparing a timestamp against a non-timestamp is not a
+    shape this reaches (the type check rejects it first).
+    """
+
+    def _tag(get: Any) -> str | None:
+        try:
+            return get()
+        except Exception:  # noqa: BLE001 -- unresolvable column: not a subms join
+            return None
+
+    tags = (
+        _tag(lambda: amap[known_alias][1].type_for(known_col)),
+        _tag(lambda: join_table.type_for(new_col)),
+    )
+    return any(t in subms.SUBMS_TAGS for t in tags)
+
+
 def _lookup_stage(
     on: exp.Expression, join_alias: str, join_table: TableDef, amap: dict[str, tuple[str, TableDef]]
 ) -> dict[str, Any]:
@@ -7945,11 +7996,58 @@ def _lookup_stage(
     simple = _on_is_simple_equality(on, join_alias, amap)
     if simple is not None:
         new_col, known_alias, known_col = simple
+        local_path = _alias_field_path(amap, known_alias, known_col)
+        foreign_field = join_table.field_for(new_col)
+        subms_join = _subms_join_keys(amap, known_alias, known_col, join_table, new_col)
+        if subms_join:
+            # A timestamp join key CANNOT use localField/foreignField: those are
+            # field PATHS, so they compare the stored BSON dates -- whole
+            # milliseconds -- and every value inside one millisecond joins to
+            # every other. Measured against PG 14.13: three times in one
+            # millisecond self-joined 3x3, so `a JOIN b ON a.t = b.t` over four
+            # distinct times returned TEN rows where PG returns four. A wrong
+            # answer, not a lost digit.
+            #
+            # The let/pipeline form can compare the companion too. It gives up
+            # the index acceleration the simple form has, which is the right
+            # trade: this shape was returning rows that do not match.
+            #
+            # NULL handling is deliberately unchanged -- `$eq` of two nulls is
+            # true, which is what localField/foreignField already did.
+            local_us = subms.companion_path(local_path)
+            foreign_us = subms.companion_field(foreign_field)
+            return {
+                "$lookup": {
+                    "from": join_table.collection,
+                    "let": {
+                        "secantus_sm_d": f"${local_path}",
+                        "secantus_sm_u": {"$ifNull": [f"${local_us}", 0]},
+                    },
+                    "pipeline": [
+                        {
+                            "$match": {
+                                "$expr": {
+                                    "$and": [
+                                        {"$eq": ["$$secantus_sm_d", f"${foreign_field}"]},
+                                        {
+                                            "$eq": [
+                                                "$$secantus_sm_u",
+                                                {"$ifNull": [f"${foreign_us}", 0]},
+                                            ]
+                                        },
+                                    ]
+                                }
+                            }
+                        }
+                    ],
+                    "as": join_alias,
+                }
+            }
         return {
             "$lookup": {
                 "from": join_table.collection,
-                "localField": _alias_field_path(amap, known_alias, known_col),
-                "foreignField": join_table.field_for(new_col),
+                "localField": local_path,
+                "foreignField": foreign_field,
                 "as": join_alias,
             }
         }
@@ -9316,6 +9414,22 @@ def _build_trailing_composite_pipeline(
     return a_table, amap, resolve, pipeline, derived
 
 
+def _join_project_expr(path: str, tag: str | None) -> Any:
+    """What a join's ``$project`` emits for one output column.
+
+    A timestamp emits the sub-millisecond COMPOSITE rather than the bare date.
+    A join reads a PROJECTED document, so the companion field is gone by the
+    time the executor could merge it back (`_with_subms` says as much) -- the
+    join therefore returned whole milliseconds even once the join KEY compared
+    microseconds correctly. The composite also sorts correctly, so an ORDER BY
+    over the projected name still orders by microseconds;
+    `_apply_post_aggregates` unwraps it before anything downstream sees it.
+    """
+    if tag in subms.SUBMS_TAGS:
+        return subms.composite_expr(path)
+    return f"${path}"
+
+
 def _plan_join_select(
     stmt: exp.Select, db: str, catalog: Any, storage: Any = None
 ) -> PipelineSelectPlan | EvaluatedSelectPlan:
@@ -9357,7 +9471,8 @@ def _plan_join_select(
             for a, (role, tdef) in amap.items():
                 for i, c in enumerate(tdef.columns, start=1):
                     name = names.fresh(c.name)
-                    project[name] = f"${c.field if role == 'base' else f'{a}.{c.field}'}"
+                    _p = c.field if role == "base" else f"{a}.{c.field}"
+                    project[name] = _join_project_expr(_p, c.type_tag)
                     if c.enum_type is not None:
                         out_enum_types[len(out_columns)] = c.enum_type
                     out_columns.append((name, c.type_tag))
@@ -9365,7 +9480,7 @@ def _plan_join_select(
             continue
         path, tag = resolve(inner)
         name = names.fresh(alias or _column_name(inner))
-        project[name] = f"${path}"
+        project[name] = _join_project_expr(path, tag)
         src_col = _column_for_order_node(inner, amap)
         if src_col is not None and src_col.enum_type is not None:
             out_enum_types[len(out_columns)] = src_col.enum_type

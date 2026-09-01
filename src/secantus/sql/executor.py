@@ -2388,7 +2388,12 @@ def _sorted_agg_value(kind: str, payload: Any, pairs: Any) -> Any:
         # ... and the VALUE, which rides as a composite when it is itself a
         # timestamp column (`array_agg(t ORDER BY t)`).
         value = p.get("v")
-        if isinstance(value, dict) and subms.COMPOSITE_DATE in value:
+        if isinstance(value, dict) and subms.COMPOSITE_AS_TEXT in value:
+            merged = subms.unwrap_composite(value[subms.COMPOSITE_AS_TEXT])
+            # Rendered through the same helper as `t::text`, so the two agree
+            # (Postgres trims trailing fractional zeros).
+            p["v"] = typemap.render_timestamp_text(merged) if merged is not None else None
+        elif isinstance(value, dict) and subms.COMPOSITE_DATE in value:
             p["v"] = subms.unwrap_composite(value)
     if kind == "sorted_array":
         specs = payload

@@ -478,6 +478,11 @@ def _as_text(value: Any) -> str:
     """Postgres text rendering of a scalar (for ``||`` / ``concat``)."""
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, _dt.datetime):
+        # Through the same renderer a ``::text`` cast uses, so `concat(t, '')`
+        # and `t::text` agree — `str(datetime)` pads the fractional seconds to
+        # six digits where Postgres prints the shortest form.
+        return typemap.render_timestamp_text(value)
     return str(value)
 
 
