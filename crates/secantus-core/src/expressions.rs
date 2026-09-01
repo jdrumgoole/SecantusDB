@@ -3337,13 +3337,18 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
             Bson::Double(_) => Conv::Ok(value.clone()),
             _ => Conv::Unsupported, // Decimal128 / string / date -> Python
         },
-        // bool — non-(bool/int/double/string/Decimal128) is truthy (Python's else).
+        // bool — non-(bool/int/double/string/Decimal128) is truthy.
         8 => match value {
             Bson::Boolean(_) => Conv::Ok(value.clone()),
             Bson::Int32(n) => Conv::Ok(Bson::Boolean(*n != 0)),
             Bson::Int64(n) => Conv::Ok(Bson::Boolean(*n != 0)),
             Bson::Double(d) => Conv::Ok(Bson::Boolean(*d != 0.0)),
-            Bson::String(s) => Conv::Ok(Bson::Boolean(!s.is_empty())),
+            // Every string is true, the EMPTY one included (probed 8.2.11).
+            // `op_to_bool` above already had this rule and cited the probe;
+            // THIS copy still had Python's own truthiness (`!s.is_empty()`),
+            // so `$toBool: ""` and `$convert: {input: "", to: "bool"}` -- the
+            // same operation -- disagreed with each other inside one engine.
+            Bson::String(_) => Conv::Ok(Bson::Boolean(true)),
             Bson::Decimal128(_) => Conv::Unsupported, // decimal compare -> Python
             _ => Conv::Ok(Bson::Boolean(true)),
         },
@@ -3384,8 +3389,13 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
             // `$convert`'s onError applies; without onError, Python raises 241.
             Bson::Boolean(_) => Conv::Failed,
             Bson::DateTime(_) => Conv::Ok(value.clone()),
-            // int / long / double: milliseconds since the Unix epoch -> date.
-            Bson::Int32(n) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(*n as i64))),
+            // An int32 is NOT convertible to a date -- only a LONG is epoch
+            // milliseconds (probed 8.2.11: `{$toDate: 1}` answers
+            // `241 Unsupported conversion from int to date`, the same class as
+            // bool -> date above). This converted it, so `{$toDate: 1}` gave
+            // 1970-01-01T00:00:00.001Z where mongod refuses outright.
+            Bson::Int32(_) => Conv::Failed,
+            // long / double: milliseconds since the Unix epoch -> date.
             Bson::Int64(n) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(*n))),
             Bson::Double(d) if d.is_finite() => {
                 Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(*d as i64)))

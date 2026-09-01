@@ -256,7 +256,10 @@ def test_meta_unknown_arg_errors_17308() -> None:
         apply_projection(doc, {"score": {"$meta": "bogus"}})
     assert e.value.code == 17308
     assert e.value.code_name == "Location17308"
-    assert str(e.value) == "Unsupported argument to $meta: bogus"
+    # mongod's exact wording, re-probed on 8.2.11 (2026-09-01). This test used
+    # to assert "Unsupported argument to $meta: bogus" -- our own phrasing, which
+    # the code matched, so the suite was green over a string mongod never sends.
+    assert str(e.value) == "Unsupported $meta field: bogus"
 
 
 def test_meta_textscore_without_text_errors_40218() -> None:

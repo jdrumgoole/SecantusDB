@@ -1298,9 +1298,16 @@ def test_to_date_noop_on_date() -> None:
 def test_to_date_from_int_millis() -> None:
     import datetime as dt
 
-    # milliseconds since the Unix epoch -> 2023-11-14T22:13:20Z
+    # milliseconds since the Unix epoch -> 2023-11-14T22:13:20Z.
+    #
+    # NAIVE UTC, matching how a stored BSON date decodes. It used to come back
+    # tz-AWARE, which compares fine against a literal but raises ``TypeError``
+    # against a date read out of a document -- the common case. Verified over
+    # the wire against mongod 8.2.11: ``{$eq: [{$toDate: "$ms"}, "$d"]}`` is
+    # true on both (2026-09-01).
     out = evaluate({"$toDate": 1700000000000}, {})
-    assert out == dt.datetime(2023, 11, 14, 22, 13, 20, tzinfo=dt.timezone.utc)
+    assert out == dt.datetime(2023, 11, 14, 22, 13, 20)
+    assert out.tzinfo is None
 
 
 def test_to_date_from_string() -> None:

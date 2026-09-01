@@ -149,14 +149,21 @@ introspection (`$binarySize` `$bsonSize`), bitwise (`$bitAnd` `$bitOr`
 (`$$ROOT` `$$CURRENT` `$$NOW` `$$REMOVE`, `$redact`'s `$$KEEP` / `$$PRUNE` /
 `$$DESCEND`).
 
-Missing from **both** servers (error cleanly):
+Missing from **both** servers (error cleanly). Re-measured against mongod
+8.2.11 on 2026-09-01, because a list like this goes stale silently and hides
+features that already work — most of what used to be here did:
 
-- the accumulator family in expression position — `$sum` / `$avg` / `$min` /
-  `$max` / `$stdDevPop` / `$stdDevSamp` over an array argument in `$project` /
-  `$addFields` (they work as `$group` / window accumulators)
-- `$median` / `$percentile` (expression form)
-- `$meta`, `$toLong`, `$toObjectId`
-- `$function` (no JS runtime)
+- `$meta` in an AGGREGATION stage. It works in a `find` projection
+  (`recordId` / `sortKey` / `indexKey` all compute); inside a pipeline mongod's
+  answer depends on its metadata *dependency analysis*, which is not a rule
+  that can be inferred — `$project` returns `recordId` where `$addFields`
+  silently omits it, and `recordId` survives a `$match` but not a `$limit`.
+- `$function` (no JS runtime).
+
+Previously listed here and **since verified working**: the accumulator family
+in expression position (`$sum` / `$avg` / `$min` / `$max` / `$stdDevPop` /
+`$stdDevSamp` over an array argument), `$median` / `$percentile` in expression
+form, `$toLong` and `$toObjectId`.
 
 Rust-server-only limitations: a handful of edge cases the Rust engine
 rejects rather than risk diverging from the Python oracle — some
@@ -179,7 +186,7 @@ still returns a generic `BadValue` for the `$project` case).
 | Partial (`partialFilterExpression` + planner implication) | ✅ | ✅ | ✅ |
 | TTL (`expireAfterSeconds`, background sweeper) | ✅ | ✅ | ✅ |
 | Multikey (array) | ✅ | ✅ | ✅ |
-| Per-index collation | ✅ | ⚠️ strength 1–3 + `caseLevel`; `numericOrdering` → COLLSCAN | ⚠️ same |
+| Per-index collation | ✅ | ⚠️ matching: strength 1–3 + `caseLevel`; `numericOrdering` → COLLSCAN. Ordering is a three-level key (accents, case, `caseFirst`, `backwards`, `numericOrdering`); locale-specific order (Swedish `ä`) needs ICU | ⚠️ same |
 | Hidden indexes | ✅ | ✅ | ✅ |
 | Geo `2dsphere` (S2 coverings) / `2d` (geohash) | ✅ | ✅ | ✅ |
 | Text | ✅ | ❌ rejected | ❌ rejected |

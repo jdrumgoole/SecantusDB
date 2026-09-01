@@ -588,14 +588,20 @@ def test_projection_meta_unknown_arg_is_17308(coll) -> None:
     with pytest.raises(OperationFailure) as exc:
         coll.find_one({}, {"score": {"$meta": "bogus"}})
     assert exc.value.code == 17308
-    assert "Unsupported argument to $meta: bogus" in str(exc.value)
+    # mongod's exact wording, re-probed on 8.2.11 (2026-09-01). This asserted
+    # our own phrasing ("Unsupported argument to $meta: bogus"), which the code
+    # matched -- so the suite was green over a string mongod never sends.
+    assert "Unsupported $meta field: bogus" in str(exc.value)
 
 
 def test_projection_meta_recognized_arg_omits_field(coll) -> None:
     coll.insert_one({"_id": 1, "a": 1, "b": 2})
     doc = coll.find_one({}, {"m": {"$meta": "indexKey"}})
-    # The $meta field is omitted (not computed), but the document is untouched —
-    # `$meta` is a value re-shaper, not an inclusion. mongod-probed 6.0.16.
+    # `indexKey` has no value under a COLLECTION SCAN, and mongod omits the
+    # field entirely rather than reporting null (re-probed 8.2.11, 2026-09-01).
+    # The document is otherwise untouched -- `$meta` is a value re-shaper, not
+    # an inclusion. When an index IS used the field is now computed; see
+    # tests/test_meta_projection.py.
     assert doc == {"_id": 1, "a": 1, "b": 2}
 
 

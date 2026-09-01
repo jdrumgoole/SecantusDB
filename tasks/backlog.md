@@ -18,6 +18,17 @@ failing test, the query); several "open" items were already fixed, and the wrong
 ones were wrong in the direction that costs most — they described work as missing
 when it existed.
 
+**The 2026-09-01 MongoDB-server sweep confirmed both rules again, at 95 → 57
+open items.** Of the MongoDB-Python-server entries worked that day, five were
+already FIXED and only the box was unflipped (`$limit`/`$skip` messages,
+expanded change events, the CI test-file list, timeseries `insertMany`, the
+`$stdDev` note), and one asserted a divergence that had never existed on the
+version we target (`$lookup`'s `as` field order — re-probing 8.2.11 showed
+mongod does exactly what we do). **And the sweep's real yield was not on the
+board at all**: measuring the items turned up five unfiled defects, three of
+them silent data loss and two of them crashes, recorded in §5. Reproducing an
+item is not overhead — it is where the findings come from.
+
 - [x] **RESOLVED (2026-08-31): the PostgreSQL-oracle suites DO run in the full
       suite, and the skip reason that hid the question now names its cause.**
       The entry this replaces said `test_sql_search_path.py`,
@@ -694,7 +705,17 @@ Specific items that were left out of the slice that introduced their feature are
   UNwrapped -- the wrapper must not spread to errors that do not depend on the
   stored document.
 
-- [ ] **OPEN — wrong-typed command arguments on the PYTHON server, measured by
+- [x] **CLOSED to the planner dump (2026-08-31): CODE divergences are ZERO and
+      the residue is 6 MESSAGE cases, all of them the unresolvable-`hint`
+      planner dump this entry already decided not to reproduce.** That
+      decision stands and is re-affirmed here rather than left looking open:
+      it means porting `MatchExpression::debugString`, whose rendering
+      (`Tree: a $eq 1`) is a DIFFERENT one from the `parsedQuery` normaliser
+      added 2026-09-01, and a half-right tree renderer would look
+      authoritative while being wrong on anything nested. Original entry
+      below.
+
+  **wrong-typed command arguments on the PYTHON server, measured by
   MESSAGE rather than by code. CODE divergences are at ZERO (2026-08-31); the
   only residue is the unresolvable-`hint` planner dump, 6 message cases.** The 87/87 sweep
   below compares `(ok, code)`; comparing `(code, errmsg)` over 685 shapes
@@ -1174,9 +1195,18 @@ Specific items that were left out of the slice that introduced their feature are
         its own reason to close it. Reproduce with the same probe and no
         `PROBE_SERVER`.
 
-- [ ] **OPEN — `$limit` / `$skip` stage-error messages render the offending value
-  as a PYTHON repr (Python server).** Found 2026-08-29 while porting the above.
-  mongod echoes the value shell-style — probed on 6.0.16:
+- [x] **RESOLVED (verified 2026-09-01): the `$limit` / `$skip` stage-error
+      messages match mongod exactly.** The fix landed with
+      `changelog.d/stage-arg-messages.md` (`aggregate._fmt_stage_val` renders
+      shell-style, and its docstring records the old `str()`/`repr()` form);
+      only the box was never flipped. **Re-measured rather than assumed**: 34
+      shapes across both stages — `"x"` / `""` / `true` / `false` / `null` /
+      `[1]` / `[1,"a"]` / `[]` / `{}` / `{a:1}` / `1.5` / `Decimal128("1.5")` /
+      `-1` / `-2.0` / ObjectId / date / `Int64(-3)` — compared as
+      `(code, errmsg)` against mongod 8.2.11: **0 divergences**. Original entry
+      below, kept for the detail about why the sweep missed it.
+
+      mongod echoes the value shell-style — probed on 6.0.16:
 
       $skip: "x"    ->  ... Expected a number in: $skip: "x"     (quoted)
       $skip: true   ->  ... Expected a number in: $skip: true
@@ -1191,15 +1221,31 @@ Specific items that were left out of the slice that introduced their feature are
   already-correct error) but it is a real divergence and the two engines should
   not differ; port the Rust renderer back to Python.
 
-- [ ] **OPEN — Admin UI saved-connections / settings page**: Slice 11 of the admin UI shipped schema sampler / logs viewer / geo viewer but skipped the planned `/settings` page with saved Mongo URIs and a manual dark/light toggle. The CLI today takes a single `--uri` per launch, so saved connections are bookmark-only (you can't switch targets after start). When the launcher gains hot-swap support, revisit this page — it's likely a small SQLite-backed list reusing the existing `~/.secantus/admin.db` store.
+- [x] **BLOCKED ON A PREREQUISITE, not on effort: the Admin UI
+      saved-connections / settings page.** The page's whole value is switching
+      targets, and the CLI takes a single `--uri` per launch, so a saved list
+      would be bookmarks that cannot be opened. It is waiting on launcher
+      hot-swap support, which is a different piece of work; building it first
+      ships a page that does nothing. Detail below.
+
+  **Admin UI saved-connections / settings page**: Slice 11 of the admin UI shipped schema sampler / logs viewer / geo viewer but skipped the planned `/settings` page with saved Mongo URIs and a manual dark/light toggle. The CLI today takes a single `--uri` per launch, so saved connections are bookmark-only (you can't switch targets after start). When the launcher gains hot-swap support, revisit this page — it's likely a small SQLite-backed list reusing the existing `~/.secantus/admin.db` store.
 
 ### 3.1 Authentication
 
 SCRAM-SHA-256 is implemented end-to-end. The wire-protocol shape (saslStart/saslContinue, `hello.saslSupportedMechs`, per-connection auth state, `--auth` gating) is conformant for pymongo and mongo-go-driver. The remaining gaps are mostly orthogonal:
 
 - ~~**MONGODB-X509**~~ — shipped on top of the b22 mTLS slice. Users with `mechanisms: ["MONGODB-X509"]` on `$external` (or `admin`) auth via cert-subject-DN-as-username; no password. The legacy `authenticate` command path (what pymongo / Java / Go / Node use for X509) is wired up alongside `saslStart`. See `docs/authentication.md` "MONGODB-X509" section.
-- [ ] **LDAP / Kerberos / GSSAPI / MONGODB-AWS / MONGODB-OIDC** — remaining alternative auth mechanisms. Out of scope for now (each one is its own slice with its own external-system dependency).
-- [ ] **Internal cluster auth (keyfile / x509)** — only meaningful with replica sets / sharding, both out of scope.
+- [x] **OUT OF SCOPE (recorded): LDAP / Kerberos / GSSAPI / MONGODB-AWS /
+      MONGODB-OIDC.** Each is its own slice with its own external-system
+      dependency, and none of them is something an ephemeral in-process test
+      server can satisfy without that system present. SCRAM-SHA-256 and
+      MONGODB-X509 -- the two the in-scope drivers exercise -- are shipped.
+      Detail below.
+
+  **LDAP / Kerberos / GSSAPI / MONGODB-AWS / MONGODB-OIDC** — remaining alternative auth mechanisms. Out of scope for now (each one is its own slice with its own external-system dependency).
+- [x] **OUT OF SCOPE (recorded): internal cluster auth (keyfile / x509).**
+      Only meaningful with replica sets / sharding, and `CLAUDE.md` scopes both
+      out: there are no other members to authenticate to.
 - ~~**`system.users` collection visibility**~~ shipped (b31). `admin.system.users` is a synthetic read-only view onto the `secantus_users` table; `find` / `aggregate` / `count` surface the stored records with their existing mongod-shaped fields (`_id`, `user`, `db`, `credentials`, `roles`, `mechanisms`). Writes are rejected with code 13 Unauthorized — mutate via `createUser` / `updateUser` / `dropUser`. Other dbs' `system.users` returns empty (matches mongod). See `storage._find_system_users` + `_count_system_users`.
 - ~~**`system.version` `authSchema`**~~ shipped (b33). `admin.system.version` is a synthetic read-only view returning a single hard-coded doc: `{_id: "authSchema", currentVersion: 5}` (SCRAM-SHA-256 baseline, MongoDB 4.0+). Tools that read the auth-schema version on startup now get an honest answer. Writes rejected (code 13). See `storage._find_system_version`.
 
@@ -1217,7 +1263,12 @@ Single-node change streams are implemented and conformant for typical pymongo `w
   `showExpandedEvents`; added the `modify` branch. A `showExpandedEvents` watch
   now sees `createIndexes` / `dropIndexes` / `modify`, and a default watch
   suppresses them.
-- [ ] **Read concern / write concern semantics** — read concern is accepted and ignored. **Write concern is NOT merely ignored** (re-probed 2026-08-20): an unsatisfiable `w` is rejected exactly as mongod rejects it, `{code: 100, codeName: "CannotSatisfyWriteConcern", errmsg: "Not enough data-bearing nodes"}`, on **both** servers — `w: 2` against a one-member set raises rather than silently succeeding. That is the faithful behaviour, and the ruby-gauge `w:2` expected-fail below is a consequence of it. What remains genuinely accept-and-ignore is `j` / `wtimeout` / `w: "majority"` durability semantics, which a single node satisfies trivially.
+- [x] **DECIDED (single-node): read concern / write concern semantics.** What
+      remains accept-and-ignore is exactly what a single node satisfies
+      trivially, so there is nothing left here that a one-member deployment
+      could get wrong. Kept as a record of the split. Detail below.
+
+  **Read concern / write concern semantics** — read concern is accepted and ignored. **Write concern is NOT merely ignored** (re-probed 2026-08-20): an unsatisfiable `w` is rejected exactly as mongod rejects it, `{code: 100, codeName: "CannotSatisfyWriteConcern", errmsg: "Not enough data-bearing nodes"}`, on **both** servers — `w: 2` against a one-member set raises rather than silently succeeding. That is the faithful behaviour, and the ruby-gauge `w:2` expected-fail below is a consequence of it. What remains genuinely accept-and-ignore is `j` / `wtimeout` / `w: "majority"` durability semantics, which a single node satisfies trivially.
 - [x] **C-driver (`libmongoc`) change-stream gauge tests — NOW RUNNING.** The
   `/change_stream` + `/change_streams` suites were excluded because the C
   fixture bootstraps them through `test_framework_replset_member_count()`,
@@ -1320,7 +1371,14 @@ Single-node change streams are implemented and conformant for typical pymongo `w
   its `/BulkOperation/OP_MSG/*` siblings and reproducing the accumulated-state
   interference that entry already documents. The lesson is the entry's own: the
   framing "the server doesn't split" is wrong and chasing it wastes time.
-- [ ] **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
+- [x] **OUT OF SCOPE (recorded): resume-token cross-server identity.**
+      Reproducing mongod's keystring layout would let a SecantusDB token be
+      presented to a real `mongod`, which is a MIGRATION property, not a
+      conformance one -- no driver reads inside the token, and the whole point
+      of the opaque `_data` blob is that nothing should. `tools/probes/
+      change_streams.py` is at 0 of 41 with the current layout. Detail below.
+
+  **Resume-token cross-server identity** — tokens are opaque to pymongo and round-trip fine, but the inner layout is `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's keystring format. Tokens minted by SecantusDB cannot be presented to a real `mongod`, and vice versa.
 
 ### 3.3 MongoDB CLI / tool conformance tests
 
@@ -1402,12 +1460,23 @@ into the thread-local, oplog entries buffered until commit). Conformance:
   `errorCode`. `11600` (`InterruptedAtShutdown`) makes the driver mark the
   topology unknown, so the follow-up fails on server selection and hides the
   transaction state you're trying to observe.
-- [ ] **No `recoveryToken` / mongos pinning, no prepared transactions, no
+- [x] **OUT OF SCOPE (recorded): no `recoveryToken` / mongos pinning, no
+      prepared transactions.** Every item here is a SHARDED- or multi-node-only
+      concept, and `CLAUDE.md` scopes those out by design: "If a feature only
+      makes sense in a multi-node deployment, SecantusDB does not implement
+      it." Detail below.
+
+  **No `recoveryToken` / mongos pinning, no prepared transactions, no
   `maxCommitTimeMS`, no `serverStatus.transactions` metrics, no
   `afterClusterTime` enforcement** — multi-node machinery; out of scope.
   (`$clusterTime` / `operationTime` ARE gossiped on every reply so drivers
   can send `afterClusterTime`; the value is accepted and ignored.)
-- [ ] **Expected-red in the pymongo transactions gauge**: the three
+- [x] **EXPECTED-RED, not a defect: the three secondary-readPreference
+      transaction tests.** They assume a multi-member replica set to have a
+      secondary to read from; a single-node topology has none. They fail on
+      mongod configured the same way. Detail below.
+
+  **Expected-red in the pymongo transactions gauge**: the three
   secondary-read-preference unified tests
   (`TestUnifiedRunCommand::test_run_command_fails_with_*secondary*`,
   `TestUnifiedReadPref::test_secondary_readPreference`) fail with a
@@ -1416,7 +1485,12 @@ into the thread-local, oplog entries buffered until commit). Conformance:
   server error ("read preference in a transaction must be primary")
   can only come from a server that received the command. Unfixable on
   a single node.
-- [ ] **readConcern levels inside transactions are accept-and-ignore** — every
+- [x] **DECIDED (single-node): readConcern levels inside transactions are
+      accept-and-ignore.** `local` / `majority` / `snapshot` / `linearizable`
+      are all satisfied trivially by one node -- there is no second member for
+      them to differ about. Recorded rather than left open. Detail below.
+
+  **readConcern levels inside transactions are accept-and-ignore** — every
   in-transaction read runs against the transaction's pinned WT snapshot
   regardless of level (`snapshot` is exactly that; `local`/`majority` are
   indistinguishable on a single node).
@@ -1427,7 +1501,24 @@ The 2026-06-13 gauge-gaps slice fixed projection `_id`/array semantics,
 `maxBsonObjectSize` enforcement, snapshot readConcern + `$$NOW`, and most of
 the change-stream batch. Still open, precisely characterized:
 
-- [ ] **OPEN — Cursor/collection misc from the 64-list** (task #14 of the slice).
+- [x] **CLOSED (2026-09-01): every remaining item is a HARNESS artifact or an
+      expected-red, not a server divergence.** Re-read against the list below:
+      the 3 `test_dbref.py` failures are xdist failing to serialize an ObjectId
+      in a subtest report (runner-side), `test_maxtime_ms_message` /
+      `test_to_list_csot_applied` are pymongo's CLIENT-side CSOT formatting,
+      and the 3 `test_transactions_unified` secondary-readPreference tests are
+      expected-red under a single-node topology.
+
+      The one item that would have been a genuine server gap -- the timeseries
+      `insertMany` bulk path -- was REPRODUCED before being worked, and it
+      already behaves: against mongod 8.2.11, a 5-document `insert_many` into a
+      `timeseries` collection returns 5 ids and reads back 5 documents on both
+      servers, and `count_documents`, a `$group` count and a `bulk_write`
+      `InsertOne` all agree too. Fixed at some point without this line being
+      flipped, which is exactly what a mixed list of five non-defects plus one
+      real one hides. Detail below.
+
+  **Cursor/collection misc from the 64-list** (task #14 of the slice).
   Fixed in the gauge-misc slice (2026-06-13): embedded-document equality is
   now order-sensitive + exact (real matcher correctness bug — `query_embedded`
   / `query_array` examples), the `validate` command is implemented
@@ -1579,6 +1670,142 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+### 2026-09-01 sweep: four ways an INDEX changed the answer, and a crash
+
+All four found the way this file keeps saying to find things -- by running the
+same operations against mongod 8.2.11 and diffing the ``_id`` SETS, not by
+reading the planner. Three are silent DATA LOSS: fewer documents came back WITH
+an index than without one, with no error. They are fixed and pinned by
+``tests/test_sparse_and_partial_index_fidelity.py``; the sweep that found them
+lives on as a randomised differential.
+
+- [x] **A SPARSE index was used for a query that matches a MISSING field.** A
+      sparse index omits documents that lack the field; ``{a: null}`` MATCHES
+      them, because the query language treats an absent field as null. So
+      ``find({a: null})`` with a sparse index on ``a`` skipped every document
+      without an ``a`` -- and so did ``$in`` lists containing null, and so did
+      ANY sort, because a sort walks the whole index and therefore drops
+      everything the index omits. Fixed by a gate
+      (``_sparse_index_usable`` / ``_predicate_may_match_missing``): a sparse
+      index is usable only when some indexed field carries a predicate that
+      GUARANTEES the field is present.
+
+      **The first version of that gate had a blind spot, found by widening the
+      probe rather than by review:** it treated only ``$eq: null`` as
+      missing-matching, and ``{a: {$lte: null}}`` / ``{a: {$gte: null}}`` match
+      an absent field too, so a sparse index still lost rows for them. ANY
+      comparison operator against null now counts. The lesson is that the FIX
+      needed its own sweep -- the corpus that found the bug did not contain the
+      case that broke the fix.
+- [x] **A COMPOUND sparse index was under-populated.** mongod indexes a
+      document that has **at least one** of the indexed fields, keying the
+      missing ones as null; we required ALL of them. ``{a: 1}`` with no ``b``
+      never reached a sparse ``{a: 1, b: 1}`` index, so ``find({a: 1})`` lost
+      it. Fixed in ``_sparse_covers``. **An index built before this change
+      under-indexes until it is dropped and recreated** -- nothing rewrites
+      existing entries.
+- [x] **A PARTIAL index's implication check compared ACROSS type brackets.**
+      ``_op_implies_bound`` compared with ``encode_value``, which is BSON SORT
+      order, where a string sorts above every number. The range operators are
+      type-BRACKETED (``{$gt: 0}`` matches numbers and nothing else), so the
+      check concluded ``{b: "x"}`` implied ``{b: {$gt: 0}}``, used an index that
+      does not contain those documents, and ``find({a: 5, b: "x"})`` returned
+      NOTHING. The type-bracketing rule was already established and written
+      down in §7's cross-type entry; the storage layer had simply never been
+      told. **Worth grepping for other comparisons that use ``encode_value``
+      where the QUERY language's bracketing is what applies.**
+- [x] **A query naming only a partial index's own filter fields CRASHED.**
+      ``find({b: 5})`` against an index on ``a`` partial on ``{b: {$gt: 0}}``
+      left no key prefix to pin, built an empty parts list and raised
+      ``IndexError`` out of the command handler -- reaching the client as
+      ``1 internal server error``. It now scans that index, which is sound:
+      every entry satisfies the implied clauses.
+- [x] **``Decimal128("Infinity")`` to an integer target crashed the same way**
+      (``int(Decimal("Infinity"))`` -> ``OverflowError`` -> internal server
+      error). Fixed with the rest of the ``$convert`` work in §7.
+
+### 2026-09-01: the parity suite caught the ENGINES drifting (found by CI)
+
+- [x] **The Rust engine disagreed with itself about `$toBool` vs
+      `$convert: {to: "bool"}`.** Fixing the Python side of "every BSON string
+      is true, the empty one included" turned the parity suite red on
+      `{$convert: {input: "", to: "bool"}}` -- Rust answered `false`. The cause
+      was not that Rust lagged: `op_to_bool` ALREADY had the right rule and
+      cited the 8.2.11 probe, while `convert_value`'s bool arm still carried
+      Python's own truthiness (`!s.is_empty()`). **Two copies of one rule, in
+      one engine, disagreeing** -- the identical shape to the Python
+      `$toX`-versus-`$convert` split this batch collapsed. Both now say true.
+- [x] **The Rust engine converted an int32 to a date** where mongod answers
+      `241 Unsupported conversion from int to date` -- only a LONG is epoch
+      milliseconds. Found by inspection while fixing the above, before it could
+      turn the suite red, because the curated corpus does not reach it. Now
+      `Conv::Failed`, so `$convert`'s `onError` applies and a bare `$toDate`
+      defers to Python, which raises mongod's error.
+
+      **Both were caught only in CI**, because a worktree venv without
+      `secantus-core` import-SKIPS all ~1,700 parity tests and still exits 0 --
+      the trap `CLAUDE.md` names, and comparing the collected count does not
+      reveal it when every run in that venv is missing the same tests. Build the
+      extension into the worktree venv (`uv pip install ./crates/secantus-core-py`,
+      ~15s, no WiredTiger needed) before trusting a green run that touched an
+      operator engine.
+
+### 2026-09-01: `let` broke every pipeline update (found by the pymongo gauge)
+
+- [x] **A `let` variable made a pipeline update FAIL with "undefined
+      variable".** `{update: "c", let: {x: 5}, updates: [{q: {}, u: [{$set:
+      {v: "$$x"}}]}]}` was refused for a variable the command DEFINES --
+      `update` applied nothing (`n: 0` plus a writeError), `findAndModify`
+      failed the whole command. The variable was bound; the parse-time
+      CONSTANT-FOLD check decides an expression is constant because every
+      `$$name` in it is bound, then EVALUATES it -- and the write paths passed
+      the bound NAMES without the VALUES, so the evaluation hit an unbound
+      variable and reported it as the query's error. `aggregate` passed both
+      and was unaffected, which is why it only ever showed on writes. Fixed on
+      both sides: the fold declines to fold a variable it has no value for
+      (`_undefined_but_bound`), and both write paths pass the values.
+
+      **This is the return on running the gauge rather than only the suite.**
+      Three `*_with_let_option` tests in `test_crud_unified.py` had been failing
+      against a `docs/validation-report.md` that records that file at 0 failures
+      -- the report predates the vendored pymongo the gauge now runs. Refresh
+      the report when the submodule moves, or its numbers stop being a baseline.
+- [x] **A statement's own `c` constants were never bound**, so
+      `{u: [...], c: {y: 7}}` failed the same way. `c` now binds and wins over a
+      command-level `let` of the same name. mongod also REJECTS `c` on a
+      non-pipeline update (`51198 Constant values may only be specified for
+      pipeline updates`), which we accepted.
+- [x] **A constant that genuinely fails takes the EXECUTOR prefix in a pipeline
+      update, naming the command** -- `Plan executor error during update` /
+      `... during findAndModify`, not `aggregate`'s `Failed to optimize
+      pipeline`.
+- [x] **Neither write command validated its statements' FIELD NAMES.** mongod
+      answers `40415` for anything unknown inside a `delete` / `update`
+      statement -- including `$`-prefixed names, which get no envelope carve-out
+      there, unlike the command level -- and refuses the whole command rather
+      than the one statement, because it parses every statement before running
+      any. The accepted sets were derived field by field from 8.2.11, not from
+      documentation.
+
+### 2026-09-01: two PLANNER differences, measured and dispositioned
+
+Found while making ``explain`` report a real stage tree. Both return CORRECT
+results and differ only in how much they scan, and the Python server is
+explicitly not a throughput target (`CLAUDE.md`: perf work goes to the Rust
+server), so they are recorded rather than scheduled. Anyone porting the picker
+to the Rust server should close them there.
+
+- [x] **A multi-field filter falls back to COLLSCAN when only SINGLE-field
+      indexes exist.** ``find({a: 1, b: "1"})`` with an index on ``a`` and one
+      on ``b`` scans the collection; mongod picks one, scans it, and re-checks
+      the other field in the FETCH. Our pickers require a COMPOUND index for a
+      multi-field filter (the one exception being the partial-residual path).
+- [x] **A sort cannot use an index while the filter is non-empty and
+      unindexed.** ``find({nope: 1}).sort({a: -1})`` with an index on ``a``
+      scans and sorts in Python; mongod walks ``a_1`` BACKWARD and filters in
+      the FETCH. Our sort-acceleration branches gate on an empty filter.
+
+
 - [x] **RESOLVED 2026-08-31 — the document-argument operator family (25
   operators, 675 shapes), and the LAST of the expression sweep's crashes.**
   The largest uniform block left: mongod requires a document argument for
@@ -1644,7 +1871,38 @@ These are explicit non-goals. Don't add them without a reason.
         and `0` where we print `0.0`. Same family as the `$limit` / `$skip`
         value-rendering entry above. Measured 2026-08-31.
 
-- [ ] **OPEN — collation ORDERING is not ICU; matching is correct.** Measured
+- [x] **RESOLVED except the LOCALE (2026-09-01): collated ordering is now a
+      three-level key, and 17 of 19 sweep cases match mongod exactly.**
+      `collation.sort_levels` builds ICU's shape without ICU: **primary** (base
+      letters, accents removed, case folded, or the digit-run tuple when
+      `numericOrdering` is on), **secondary** (each base character's combining
+      marks, weighted by a mark-order table derived from mongod rather than by
+      codepoint -- acute sorts before grave and the codepoints run the other
+      way; reversed when `backwards`), **tertiary** (case rank per character,
+      flipped by `caseFirst`). `strength` truncates the tuple; `caseLevel`
+      re-adds the case rank at 1/2. `ordering.sort_docs` takes a collation,
+      `find_matching` and the `$sort` stage pass theirs, and every row of the
+      table below now agrees with mongod 8.2.11.
+
+      **A bug found while measuring it, worse than the one being fixed:** a
+      collated sort returned a DIFFERENT ORDER depending on whether a collated
+      index existed. The index walk's byte order is the single-level
+      normalisation and could never express the levels, so
+      `["a","A","á","B","b"]` at strength 1 came back `A B a b á` without an
+      index and `a A á B b` with one. `find_matching` now withdraws the
+      "already in sort order" conclusion whenever a collation is in play -- the
+      index still FETCHES (so `explain`'s IXSCAN stays accurate and the scan
+      stays narrow), it just no longer satisfies the sort. An index must change
+      speed, never results.
+
+      **Still open, and it is the dependency decision the entry below names:**
+      LOCALE-specific ordering. Swedish sorts `ä` after `z` and Danish sorts
+      `å` last; that is CLDR data, not something decomposition can derive. Both
+      are listed as known gaps in `tools/probes/collation_order.py`, which is
+      the standing sweep. `alternate` / `maxVariable` remain unimplemented and
+      unprobed. Original entry below.
+
+  **collation ORDERING is not ICU; matching is correct.** Measured
   2026-08-31 against mongod 8.2.11 with a 39-case differential (39 cases, 29
   divergent; the 7 spec-validation ones are fixed, leaving 22). The split is
   the useful part: **every equality/matching case passed at every strength** —
@@ -1674,14 +1932,16 @@ These are explicit non-goals. Don't add them without a reason.
   dependency; both would close 4 of the 20 ordering cases without pretending
   the rest work.
 
-- [ ] **OPEN — an invalid collation `locale` is accepted where mongod rejects
-  it.** `{locale: "xx_YY"}` answers `2 Field 'locale' is invalid in: { locale:
-  "xx_YY" }`, and a malformed keyword form gets a "Did you mean 'en_US'?"
-  suffix. Deliberately NOT implemented alongside the rest of the spec
-  validation (2026-08-31): enumerating ICU's locale list without ICU means
-  guessing, and wrongly rejecting a locale mongod ACCEPTS is worse than
-  accepting one it rejects. Comes free with any ICU dependency taken for the
-  ordering item above.
+- [x] **DECIDED, not deferred (re-affirmed 2026-09-01): an invalid collation
+      `locale` stays accepted, because rejecting it correctly needs ICU's
+      locale list.** `{locale: "xx_YY"}` answers `2 Field 'locale' is invalid
+      in: { locale: "xx_YY" }` on mongod, with a "Did you mean 'en_US'?" suffix
+      for a malformed keyword form. Enumerating ICU's locales without ICU means
+      guessing, and wrongly rejecting a locale mongod ACCEPTS is worse than
+      accepting one it rejects. The 2026-09-01 ordering work did NOT change
+      this: it reproduces the ordering RULES without a locale table, so there
+      is still no list to validate against. Reopen only alongside an ICU
+      dependency, which is also what closes locale-specific ordering above.
 
 
 
@@ -1814,7 +2074,21 @@ These are explicit non-goals. Don't add them without a reason.
         fixed (`expressions._fmt_double` is mongod's `%g`).
 
 
-- [ ] **OPEN — six `_secantus_server`-gated test files never run in CI**
+- [x] **RESOLVED (verified 2026-09-01), and with the BETTER fix this entry
+      asked for.** All nine gated files are now named in the `storage-engine`
+      job (`.github/workflows/test.yml`), including the two data-integrity
+      suites (`test_crash_recovery.py`, `test_rust_pitr_cross_server.py`) and
+      the argument sweep -- and `tests/test_ci_runs_rust_server_tests.py` makes
+      the list self-maintaining: it scans `tests/` for the
+      `importorskip("_secantus_server")` idiom and FAILS if a gated file is
+      neither wired into the job nor given an explicit written reason in
+      `DELIBERATELY_NOT_IN_CI` (empty today). So the next file added is caught
+      by a test rather than by an audit. Re-verified by running that guard.
+      `test_rust_server_stress.py` was wired in after all; if its CI runtime
+      turns out to be a problem, the fix is an entry in that dict with the
+      reason, not a silent removal. Original entry below.
+
+  **six `_secantus_server`-gated test files never run in CI**
   (found 2026-08-31 while adding a seventh). Every Rust-server test file starts
   with `importorskip("_secantus_server")`, so it skips in all the ordinary
   `test` jobs, which do not build that extension. The one job that DOES build
@@ -2064,7 +2338,14 @@ These are explicit non-goals. Don't add them without a reason.
   (#1098) without revisiting the code. A wrong-typed non-null `indexes` still
   answers the ordinary 14.
 
-- [ ] **`_create_indexes` keeps an UNREACHABLE `10065` branch (found 2026-08-30
+- [x] **RESOLVED (2026-09-01): the unreachable `10065` branch in
+      `_create_indexes` is deleted**, and a comment in its place says why there
+      is no type arm there, so a later refactor of the check above it does not
+      quietly reintroduce the 6.0-era answer. Re-verified against mongod 8.2.11
+      after removal: `indexes` as null / omitted → `40414`, as `5` / `"x"` /
+      `{}` → `14`, as `[]` → ok. Original entry below.
+
+  **`_create_indexes` keeps an UNREACHABLE `10065` branch (found 2026-08-30
   while closing the maxTimeMS batch).** After the null-means-absent fix, the
   `if not isinstance(indexes, (list, tuple))` arm in `commands._create_indexes`
   cannot be reached: `_require_typed_bson_field` at the top of the handler
@@ -2077,7 +2358,33 @@ These are explicit non-goals. Don't add them without a reason.
   back. Delete the arm. Cosmetic; not worth its own full-suite cycle, so it is
   filed for the next batch that touches this handler.
 
-- [ ] **`maxTimeMS` is validated but still not ENFORCED (measured 2026-08-30).**
+- [x] **RESOLVED (2026-09-01): `maxTimeMS` is ENFORCED on the Python server.**
+      `secantus/deadline.py` holds a thread-local budget, `dispatch` arms it
+      around the handler call, and the loops whose length tracks the data poll
+      it: the storage scan and its predicate pass, `count`'s own scan, the
+      write paths' candidate SELECTION (before any write, so an expired budget
+      leaves nothing half-applied), the index build, and the aggregation
+      pipeline between stages. An expired budget answers
+      `50 MaxTimeMSExpired` / `operation exceeded time limit`, and
+      `createIndexes` wraps it in mongod's index-build envelope
+      (`Index build failed: <buildUUID>: Collection <ns> ( <collUUID> )
+      :: caused by :: ...`) — both verbatim from a probe of 8.2.11.
+
+      Cooperative, polled once every 64 documents, so an operation can overrun
+      by up to that many; mongod's own enforcement is interrupt-point-based and
+      has the same property. `getMore` is deliberately EXCLUDED
+      (`_MAX_TIME_MS_NOT_A_DEADLINE`): there `maxTimeMS` is the awaitData WAIT
+      budget, and arming a deadline would make every tailable poll answer 50
+      the moment it waited out its budget — the normal case, not an error.
+      Pinned by `tests/test_max_time_ms_enforcement.py`.
+
+      **Still not enforced:** the write LOOP itself (only candidate selection
+      is polled) and any handler that neither scans nor aggregates. Both are
+      bounded by the candidate set the poll already covers.
+
+      Original entry below.
+
+  **`maxTimeMS` is validated but still not ENFORCED (measured 2026-08-30).**
   Now that the validation matches, this is the whole of the remaining gap and it
   is the one the differential probe trips over: mongod times the operation out
   and answers `50 MaxTimeMSExpired` (`createIndexes` wraps it as "Index build
@@ -2169,7 +2476,18 @@ These are explicit non-goals. Don't add them without a reason.
   signatures on the Rust side. Omitting it means the value diff, which is what
   pipelines want.
 
-- [ ] **168 source comments still cite mongod 6.0.16 as their only evidence
+- [x] **STANDING PRACTICE, not a task (re-affirmed 2026-09-01): re-date a
+      6.0.16 citation when you touch the code it sits on.** The load-bearing
+      ones -- comments that JUSTIFIED a behaviour on 6.0 grounds -- were swept
+      and re-probed; what is left records WHEN something was measured, not a
+      claim that contradicts the current target, and the 150-case differential
+      gate is green on 8.2.11 over much of that surface. A bulk rewrite is
+      explicitly the wrong move: it would destroy the only signal separating
+      verified claims from assumed ones. This session followed the practice --
+      the collation, `$convert`, `$meta`, explain and change-stream comments it
+      touched now cite 8.2.11 with the date. Original entry below.
+
+  **168 source comments still cite mongod 6.0.16 as their only evidence
   (inventory taken 2026-08-30).** CLAUDE.md now says 8.x is the only version we
   target, so a comment citing 6.0 records *when* something was measured, not
   what the server does. Spread: 60 in `src/`, 61 in `tests/`, 46 in `crates/`,
@@ -2199,7 +2517,16 @@ These are explicit non-goals. Don't add them without a reason.
   not bulk-rewrite the citations to say 8.x without probing: that would destroy
   the only signal distinguishing verified claims from assumed ones.
 
-- [ ] **WATCH (not a defect today): `fullDocument`'s position in a change event
+- [x] **WATCH ITEM, correctly closed: `fullDocument`'s position in a change
+      event moved in mongod 8.3, and we match the 8.2 target.** Not a defect --
+      matching the version we target is the definition of correct here
+      (`CLAUDE.md`: when 8.x and an older series disagree, the target is right
+      by definition). Re-verified 2026-09-01: `tools/probes/change_streams.py`
+      against a mongod 8.2.11 replica set is at 0 of 41 divergences AND 0
+      field-order differences. Kept as the record of a version split to expect
+      if the target ever moves to 8.3. Detail below.
+
+  **`fullDocument`'s position in a change event
   moved in mongod 8.3, and we match the 8.2.1 target (2026-08-30).** Measured
   on all three servers:
 
@@ -2245,14 +2572,16 @@ These are explicit non-goals. Don't add them without a reason.
   The one thing still differing is the `rename` field-order WATCH below, kept
   deliberately.
 
-- [ ] **Expanded change events omit `collectionUUID`, and `collMod` omits
-  `stateBeforeChange` (2026-08-29).** With `showExpandedEvents: true`, mongod
-  puts `collectionUUID` on `create` / `createIndexes` / `dropIndexes` /
-  `collMod` events (immediately after `clusterTime`); we emit it only on CRUD
-  events. mongod's `collMod` event also carries `stateBeforeChange:
-  {collectionOptions: {uuid: …}}`, which we do not emit at all. Four content
-  divergences plus the four matching field-order ones, identical on both
-  servers. Measured with `tools/probes/change_streams.py`.
+- [x] **RESOLVED (verified 2026-09-01): expanded change events carry
+      `collectionUUID`, and `collMod` carries `stateBeforeChange`.** The fix
+      landed with `changelog.d/expanded-event-fields.md`; only the box was
+      never flipped. **Re-measured rather than assumed**: a fresh
+      `tools/probes/change_streams.py` run against a mongod 8.2.11 replica set
+      gives **0 of 41 cases divergent and 0 field-order differences** on the
+      Python server. `invalidate` remains the deliberate exception -- it
+      derives from an event that does carry a UUID and mongod still omits it
+      there, which is pinned by a test precisely because it is the sort of
+      asymmetry a later refactor tidies away.
 
 - [x] **RESOLVED (2026-08-30): `rename` leads with `to`, and we now match it.**
   Recorded first as "not replicated, deliberately" on the reasoning that leading
@@ -2299,15 +2628,30 @@ These are explicit non-goals. Don't add them without a reason.
   comparison operators failed to use it. An estimate made from READING was
   wrong in the expensive direction and one probe corrected it — the second such
   case that day, alongside the `$graphLookup` "does not recurse" misread.
-- [ ] **`$lookup`'s `as` field ORDER when it overwrites an existing field.**
-  mongod moves the overwritten field to the END of the document; we keep its
-  original position. Left alone rather than guessed at: this campaign has
-  already hit two mongod-version splits on field ordering, and one version's
-  observation is not enough to act on.
-- [ ] **`$graphLookup`'s result array is in a different ORDER than mongod's.**
-  The SET of documents now matches exactly; only the order within the `as`
-  array differs, and mongod's order reflects its internal traversal rather than
-  a documented contract. Not chased for the same reason as above.
+- [x] **RESOLVED (2026-09-01): `$lookup`'s `as` field ORDER was never wrong —
+      the ENTRY was.** This said "mongod moves the overwritten field to the END
+      of the document; we keep its original position", and declined to act on
+      one version's observation. Re-probed on **8.2.11**, which is the version
+      we target: mongod keeps the overwritten field in its ORIGINAL position,
+      and so do we. `{_id, x, items, z}` with `as: "items"` comes back
+      `{_id, x, items, z}` on both, in the `localField`/`foreignField` form and
+      the `pipeline` form alike, and a NEW `as` field appends on both. Zero
+      divergences.
+
+      The caution that wrote the entry was right in method and wrong in
+      conclusion: not acting on a single observation was correct, but the
+      observation itself was never re-taken, so a non-defect sat on the board
+      as one. **Re-probe before recording a divergence you are not going to
+      fix** — an unverified entry costs the next session the same measurement.
+- [x] **ACCEPTED, not fixable (measured 2026-09-01): `$graphLookup`'s result
+      array order is mongod's internal traversal, and it is not stable even
+      within one mongod.** The SET matches exactly; only the order inside the
+      `as` array differs. The new evidence is what closes it: the SAME graph,
+      queried twice in the same mongod 8.2.11 process, came back
+      `[5, 4, 2, 3]` and `[3, 2, 4, 5]`. There is no order to reproduce —
+      mongod is not reproducing one either. We return breadth-first, depth
+      ascending, which is at least deterministic. Recorded as a divergence and
+      closed rather than left open.
 
 - [x] **RESOLVED (2026-08-29): retargeted to mongod 8.2.1.** All 150 differential
   cases now pass against a live 8.2.1, both servers moved together, and
@@ -2377,7 +2721,65 @@ These are explicit non-goals. Don't add them without a reason.
   `{a: 5}`. Both serve the query and return identical documents — that is
   mongod's cost model, which this project has never claimed to reproduce.
   Six behavioural items were the real content.
-- [ ] **`explain`'s stage vocabulary is flat.** mongod wraps the scan in the
+- [x] **RESOLVED for `find` (2026-09-01): `explain` reports the STAGE TREE and
+      the normalised query.** Both halves of the entry below are closed, and
+      the measurement is `tools/probes/explain_shapes.py` against mongod
+      8.2.11: **`parsedQuery` 0 divergences of 56 filters**, `winningPlan`
+      stage chain 18 of 25 shapes exact (the residue is listed below).
+
+      * `secantus/explain.py` `canonical_match` reproduces mongod's
+        `MatchExpression` normalisation: bare equality grows `$eq`, several
+        clauses fold into an `$and` **sorted by mongod's internal match-type
+        ordinal then path** (derived from 91 pairwise probes -- it is not
+        documented, and it is not the enum order in mongod's source, which puts
+        `$not` early where the server puts it late), `$ne`/`$nin` become
+        `$not`, `$in` of one becomes `$eq`, `$in` of none becomes
+        `$alwaysFalse`, `$all` splits, `$type` becomes numeric BSON codes,
+        `$bitsAll*` becomes a bit-POSITION list, `$comment` is dropped, and a
+        `$nor` survives as a node only while it is the whole query.
+      * `build_stage_tree` emits `SORT` (with `sortPattern` / `memLimit` /
+        `type`, absorbing the limit as `limitAmount` counting the skip),
+        `SKIP`, `LIMIT` and `PROJECTION_SIMPLE` / `PROJECTION_DEFAULT` in
+        mongod's nesting. **The named consequence is gone**: a blocking `SORT`
+        above the scan is exactly how a client now reads "my sort is not served
+        by an index", and `Storage.explain_plan` grew `sorted_by_index` to
+        answer it.
+      * The IXSCAN node carries `multiKeyPaths` / `isUnique` / `isSparse` /
+        `isPartial` / `indexVersion` in mongod's key order; `COLLSCAN` carries
+        `direction` (`backward` under `{$natural: -1}`); `FETCH` carries only
+        the RESIDUAL filter and omits the key when the index bounds cover the
+        whole predicate; the top node carries `isCached`; the `find` reply
+        carries `explainVersion`.
+
+      **What is deliberately NOT reproduced, with the reason:**
+      - `indexBounds` (the `"[7, 7]"` / `"(3, 9)"` / `"[MaxKey, MinKey]"`
+        strings). The planner does not currently compute bounds as values —
+        it computes byte keys — so this needs the picker to return the bounds
+        it derived. 5 of the 7 remaining stage-chain differences are only this.
+      - `rejectedPlans`, `IDHACK` / `EXPRESS_IXSCAN` / `COUNT_SCAN` /
+        `DISTINCT_SCAN` / `PROJECTION_COVERED`, and `serverParameters`. These
+        describe mongod's COST MODEL and its specialised executors, which this
+        project has never claimed to reproduce (see the index-sweep entry
+        above, where picking `a_-1` over `a_1` was correctly ruled a non-defect
+        for the same reason).
+      - The stage tree is emitted for `find` only. `count` and `distinct` use a
+        different vocabulary that has not been measured, and inventing stages
+        for them would be worse than the flat node they get today.
+
+      **Two PLANNER differences found while measuring this, both PERFORMANCE
+      only and both dispositioned rather than left open** — the Python server
+      is explicitly not a throughput target (`CLAUDE.md`: perf work goes to the
+      Rust server), and both return correct results, just by scanning:
+      - a filter over several fields falls back to COLLSCAN when only
+        SINGLE-field indexes exist (`find({a: 1, b: "1"})` with indexes on `a`
+        and on `b`); mongod picks one and re-checks the rest.
+      - a sort cannot use an index while the filter is non-empty and unindexed
+        (`find({nope: 1}).sort({a: -1})` with an index on `a`); mongod walks
+        `a_1` backward and filters in the FETCH.
+
+      Original entry below.
+
+  **`explain`'s stage vocabulary is flat.** mongod wraps the scan in the
   stages that describe the query — `SORT` (with `sortPattern` / `memLimit` /
   `type`), `LIMIT` (`limitAmount`), `SKIP` (`skipAmount`),
   `PROJECTION_SIMPLE` (`transformBy`) — reports `direction` on `COLLSCAN`,
@@ -2457,7 +2859,13 @@ These are explicit non-goals. Don't add them without a reason.
   Python's `int()` raises) but does share the accepted-and-ignored family —
   covered by the standing "point the wrong-typed-argument probe at
   `secantusd-rs`" item, still open.
-- [ ] **`getMore` on a namespace that isn't the cursor's answers 43, not
+- [x] **DECIDED, not a defect to fix: `getMore` on a namespace that isn't the
+      cursor's answers 43, not mongod's 13.** Kept as-is deliberately (see
+      below); recorded here so it is not re-found and re-scheduled. Reverting
+      it would trade a real hardening property for message fidelity nobody's
+      driver reads.
+
+  **`getMore` on a namespace that isn't the cursor's answers 43, not
   mongod's 13.** mongod says `Requested getMore on namespace 'db.other', but
   cursor belongs to a different namespace db.c`. Ours answers `CursorNotFound`
   **deliberately** — the handler's comment explains it: `getMore` is in
@@ -2465,7 +2873,13 @@ These are explicit non-goals. Don't add them without a reason.
   confirm-or-deny which cursor ids exist on other connections. Recorded as a
   divergence, not scheduled as a fix: reverting it would trade a real hardening
   property for message fidelity nobody's driver reads.
-- [ ] **A `find` on a MISSING collection orders the cursor reply's keys
+- [x] **DECIDED, not scheduled: a `find` on a MISSING collection orders the
+      cursor reply's keys differently.** Left alone on purpose after two
+      mongod-version splits were found on BSON key order in this same campaign
+      -- a one-version observation is not enough to act on, and acting on one
+      is how you pin the wrong version's shape. Detail below.
+
+  **A `find` on a MISSING collection orders the cursor reply's keys
   differently.** mongod answers `{id, ns, firstBatch}` there and
   `{firstBatch, id, ns}` for every other find — a different code path in the
   server. Ours is consistent, so it matches on the common path and differs on
@@ -2529,7 +2943,16 @@ These are explicit non-goals. Don't add them without a reason.
     field-name order for the fields the *update* added, hold on both. We ship
     6.0's form per this project's standing convention; the gate asserts only
     the version-stable parts (`_upsert_key_shape`).
-- [ ] **A hint that names no index answers a shorter message than mongod's.**
+- [x] **DECIDED, not scheduled: a hint that names no index answers a shorter
+      message than mongod's.** Code (2) and `codeName` match and the causal
+      sentence is identical; only mongod's multi-line PLANNER DUMP prefix is
+      absent. Reproducing it means porting `MatchExpression::debugString`, a
+      DIFFERENT rendering from the `parsedQuery` normaliser added 2026-09-01
+      (`Tree: a $eq 1` rather than `{a: {$eq: 1}}`), and a half-right tree
+      renderer would look authoritative while being wrong on anything nested.
+      Message-only. Detail below.
+
+  **A hint that names no index answers a shorter message than mongod's.**
   Code (2) and `codeName` (`BadValue`) match, and the causal sentence is the
   same — `hint provided does not correspond to an existing index` — but mongod
   prefixes a dump of the parsed plan: `error processing query:
@@ -2540,7 +2963,14 @@ These are explicit non-goals. Don't add them without a reason.
   `find` and `count`**, which have always answered the short form; noticed on
   `findAndModify` only because that command previously ignored `hint` entirely.
   Message-only — no code, `codeName`, or behaviour differs.
-- [ ] **A `$`-prefixed unknown command field is accepted where mongod rejects
+- [x] **DECIDED, not scheduled: a `$`-prefixed unknown command field is
+      accepted where mongod rejects it.** The carve-out is deliberate --
+      `$`-keys are the wire envelope (`$db`, `$clusterTime`,
+      `$readPreference`, `$audit`, ...) and an allowlist that missed one would
+      break a driver over a message nobody reads. Revisit only with a
+      driver-verified envelope list. Detail below.
+
+  **A `$`-prefixed unknown command field is accepted where mongod rejects
   it.** mongod answers `Location40415` for `findAndModify.$zz` as it does for
   any other unknown field; we accept every `$`-prefixed key unconditionally.
   Deliberate, and the same carve-out `create` makes: `$`-keys are the wire
@@ -2881,8 +3311,11 @@ These are explicit non-goals. Don't add them without a reason.
   and was being thrown away by the harness that collected it. When a failure is
   persistently anonymous, suspect the collector before the code.
 
-- [ ] ~~**ws-changes xdist worker crash (Linux CI, recurring).**~~ (historical
-  investigation record for the item above; kept for the reasoning trail)
+- [x] ~~**ws-changes xdist worker crash (Linux CI, recurring).**~~ (historical
+  investigation record for the item above; kept for the reasoning trail. The
+  box was left unticked while the text said "historical record", which is how
+  an archive entry reads as live work -- the exact confusion the marker
+  convention at the top of this file exists to prevent.)
   `tests/test_admin_skeleton.py::test_ws_changes_streams_collection_event`
   intermittently hard-crashes its Linux xdist worker ("Not properly
   terminated", ~11-12 min into the lane) and the REMAINING workers' progress
@@ -3244,18 +3677,46 @@ Subtler than the above; these may bite specific test suites.
   superset of the guarantee. Recorded so nobody "fixes" our order to chase a mongod
   behaviour that is itself arbitrary.
 - ~~**`apiStrict: true` enforcement Java pool-clear cascade**~~ resolved (0.5.2b3) by narrowing the gate instead of the broad-whitelist invert. A focused `_API_V1_REJECTED_BY_NAME = {"distinct"}` rejects only the canary command the spec's unified runners actively probe (mongo-java-driver `crud-api-version-1-strict.yml` `distinct appends declared API version`). Empirical Java-gauge run: +1 pass for the canary, **zero** new failures and zero pool-clear symptoms across the 900-test suite. The previous cascade theory (broad whitelist would invalidate the pool through SDAM) is correct for the broad path but doesn't trigger from a single command rejection — the broad invert also rejected `count` (used internally by `estimatedDocumentCount`) and other handshake-adjacent admin commands, which is the actual mechanism for the 6 cascade failures, not pool-clear semantics. The narrow gate sidesteps that entirely.
-- [ ] **Java gauge: 5 remaining failures are all driver-internal / out-of-scope (triaged 2026-06-30, Python server, HEAD d8e75ff).** A broad multi-gauge survey left java the only gauge with fresh failures (5; node/ruby's single fails are the known text-index + single-node-`w:2` artifacts; rust/kotlin/dotnet/cxx are 100%). All 5 were triaged and proven **not** to be server divergences — driving the same operations via pymongo against an on-disk daemon produced exactly the spec-expected wire replies, and the pymongo gauge passes the *identical* upstream command-monitoring / versioned-api spec files (which assert the same event counts → the server induces no extra round-trips). Recorded in `validation_summary/expected_failures.py` (`JAVA` list):
+- [x] **TRIAGED, not server divergences: the Java gauge's 5 remaining
+      failures.** The entry's own evidence closes it -- driving the same
+      operations via pymongo produced exactly the spec-expected wire replies,
+      and the pymongo gauge passes the identical upstream spec files. Recorded
+      in `validation_summary/expected_failures.py`. Detail below.
+
+  **Java gauge: 5 remaining failures are all driver-internal / out-of-scope (triaged 2026-06-30, Python server, HEAD d8e75ff).** A broad multi-gauge survey left java the only gauge with fresh failures (5; node/ruby's single fails are the known text-index + single-node-`w:2` artifacts; rust/kotlin/dotnet/cxx are 100%). All 5 were triaged and proven **not** to be server divergences — driving the same operations via pymongo against an on-disk daemon produced exactly the spec-expected wire replies, and the pymongo gauge passes the *identical* upstream command-monitoring / versioned-api spec files (which assert the same event counts → the server induces no extra round-trips). Recorded in `validation_summary/expected_failures.py` (`JAVA` list):
   - `ClientMetadataTest … metadata append does not create new connections …` — client-side `appendMetadata` crosses no wire; driver connection/handshake logic. Not server-fixable.
   - `VersionedApiTest … find and getMore append API version` — asserts the *driver* decorates outbound find/getMore with `apiVersion:"1"`; SecantusDB already accepts the serverApi fields. pymongo passes the identical `crud-api-version-1` spec.
   - `CommandMonitoringTest … A successful deleteMany` — server reply is spec-correct (`delete` → `{ok:1, n:2}`); pymongo passes the identical spec. Java-driver event accounting vs standalone topology.
   - `CommandMonitoringTest … A successful find with a getMore` — server emits exactly the spec find→getMore wire sequence (firstBatch 3 + Int64 id, then nextBatch 2 + id:0, no extra round-trip); pymongo passes the identical spec.
   - `ConnectionPoolLoggingTest … Create a client, run a command, and close the client` — asserts the Java driver's CMAP connection-pool *log messages*; the server emits no log lines over the wire. Out of scope.
-- [ ] **Go gauge flake: `TestIndexView/drop_one` + `drop_all` server-selection timeouts** — **mitigated at the runner (2026-06-26), not server-fixable.** Root cause (not a server bug): under `validate-all`'s multi-gauge CPU / socket-buffer contention the daemon briefly misses a heartbeat and the Go driver's 30s server-selection deadline lapses mid-test (`context deadline exceeded`, topology `Type: Unknown`). Mitigation: `go_validation/runner.py` points the gauge `MONGODB_URI` at `serverSelectionTimeoutMS=60000`, so the transient blip is ridden out; a genuinely unreachable daemon still fails inside the 30m package timeout. **Unverified in its actual failure condition** (it only fires under the full `validate-all` fan-out, which wasn't re-run); the bump is a low-risk, well-motivated mitigation, not a confirmed fix. (History: surfaced 2026-05-14; the per-collection-lock-deadlock hypothesis was ruled out 2026-06-15 by a clean 12-thread DDL+CRUD stress — the cause was always cross-gauge resource exhaustion, not a SecantusDB fault.)
-- [ ] **Go gauge flake: `TestChangeStream_ReplicaSet/try_next/one_getMore_sent`** — **NOT server-fixable; confirmed go-harness / load-timing artifact (2026-06-26, with new hard evidence).** Fails intermittently (~1 in 3 full gauge runs) with `TryNext returned true on iteration 1` (elapsed ~0.3s instead of 1.0s): the first `getMore` on a freshly-opened, supposed-empty collection-scoped stream returns an event. **Two runner-side fix attempts both FAILED** (proving it isn't what their hypotheses assumed): (a) isolating change-stream tests from the rest of the suite still flaked 1/3; (b) running each change-stream top-level function in its own serial `go test` process *still* flaked 1/2. **The server is provably correct under load** (the decisive 2026-06-26 evidence — all on-disk, matching the gauge): a collection-scoped stream on an untouched collection saw **0** events across 400 polls while 8 threads did 2074 concurrent writes to other collections; and **0** events across 300 fresh stream-opens under heavy create/drop/insert churn (4110 ops). The flake also does **not** reproduce in any isolated loop (try_next alone 15/15; whole `TestChangeStream_ReplicaSet` group, on-disk, `-parallel=1`, 12/12; faithful Standalone-then-ReplicaSet on-disk with the gauge skip list, fresh daemon per iter, 10/10). It only manifests under the *full-gauge* concurrent load. Net: the change-stream wire/scope behaviour is correct; the flake is a timing/scheduling property of the shared-daemon mongo-go-driver mtest harness that the runner cannot suppress without per-test isolation that even then doesn't hold, nor without editing the vendored tests (forbidden). **Accepted.** The §5 verdict below has the harness-mechanism analysis.
+- [x] **NOT SERVER-FIXABLE, mitigated at the runner: the Go gauge's
+      `TestIndexView` server-selection timeouts.** Cross-gauge CPU/socket
+      contention, ruled out as a server fault by a clean 12-thread DDL+CRUD
+      stress. Detail below.
+
+  **Go gauge flake: `TestIndexView/drop_one` + `drop_all` server-selection timeouts** — **mitigated at the runner (2026-06-26), not server-fixable.** Root cause (not a server bug): under `validate-all`'s multi-gauge CPU / socket-buffer contention the daemon briefly misses a heartbeat and the Go driver's 30s server-selection deadline lapses mid-test (`context deadline exceeded`, topology `Type: Unknown`). Mitigation: `go_validation/runner.py` points the gauge `MONGODB_URI` at `serverSelectionTimeoutMS=60000`, so the transient blip is ridden out; a genuinely unreachable daemon still fails inside the 30m package timeout. **Unverified in its actual failure condition** (it only fires under the full `validate-all` fan-out, which wasn't re-run); the bump is a low-risk, well-motivated mitigation, not a confirmed fix. (History: surfaced 2026-05-14; the per-collection-lock-deadlock hypothesis was ruled out 2026-06-15 by a clean 12-thread DDL+CRUD stress — the cause was always cross-gauge resource exhaustion, not a SecantusDB fault.)
+- [x] **ACCEPTED, proven not server-fixable: the Go gauge's `try_next` flake.**
+      The entry carries the decisive evidence (0 events across 400 polls under
+      2074 concurrent writes; 0 across 300 fresh stream-opens under 4110 ops of
+      churn) and two failed runner-side fixes. It is a property of the
+      mongo-go-driver shared-daemon mtest harness. Detail below.
+
+  **Go gauge flake: `TestChangeStream_ReplicaSet/try_next/one_getMore_sent`** — **NOT server-fixable; confirmed go-harness / load-timing artifact (2026-06-26, with new hard evidence).** Fails intermittently (~1 in 3 full gauge runs) with `TryNext returned true on iteration 1` (elapsed ~0.3s instead of 1.0s): the first `getMore` on a freshly-opened, supposed-empty collection-scoped stream returns an event. **Two runner-side fix attempts both FAILED** (proving it isn't what their hypotheses assumed): (a) isolating change-stream tests from the rest of the suite still flaked 1/3; (b) running each change-stream top-level function in its own serial `go test` process *still* flaked 1/2. **The server is provably correct under load** (the decisive 2026-06-26 evidence — all on-disk, matching the gauge): a collection-scoped stream on an untouched collection saw **0** events across 400 polls while 8 threads did 2074 concurrent writes to other collections; and **0** events across 300 fresh stream-opens under heavy create/drop/insert churn (4110 ops). The flake also does **not** reproduce in any isolated loop (try_next alone 15/15; whole `TestChangeStream_ReplicaSet` group, on-disk, `-parallel=1`, 12/12; faithful Standalone-then-ReplicaSet on-disk with the gauge skip list, fresh daemon per iter, 10/10). It only manifests under the *full-gauge* concurrent load. Net: the change-stream wire/scope behaviour is correct; the flake is a timing/scheduling property of the shared-daemon mongo-go-driver mtest harness that the runner cannot suppress without per-test isolation that even then doesn't hold, nor without editing the vendored tests (forbidden). **Accepted.** The §5 verdict below has the harness-mechanism analysis.
 
   **Repro session 2026-06-15 — verdict: test-harness artifact, not a SecantusDB scope-filter bug; accepted.** Two things were established. (1) **The change-stream scope filter does not leak.** A direct stress — a collection-scoped `watch()` open on `db.A` while a writer hammered `db.B` on the same shared `:memory:` daemon — polled 1650 times and saw **0** cross-collection events. The projection layer (`changestreams.project`) and `_ns_filter` correctly confine a collection-scoped stream to its own namespace. So the `TryNext returned true on iteration 1` is *not* SecantusDB surfacing a foreign write through a mis-scoped filter. (2) **The Go mtest harness shares one namespace across tests and truncates collection names to a colliding suffix.** `dbName` defaults to a single shared constant `TestDB` for every test (`mongotest.go:117-118`), and `collName = t.Name()` is then truncated to its *trailing* bytes to fit the 120-byte namespace cap (`sanitizeCollectionName`, `mongotest.go:591-602`: `coll = coll[len(coll)-remaining:]`). Two different long subtest names can therefore collide on the same `TestDB.<suffix>` collection. Combined with the parallel top-level `Test*` functions that call `t.Parallel()` (encryption-prose, `TestClient_BSONOptions`) writing during the change-stream's await window, a genuinely same-namespace write from a *concurrent test* can legitimately wake the stream early — which is correct server behaviour, not a leak. This reproduces only under the one-shared-daemon gauge (each test gets its own server in normal CI), and is invisible running `TestChangeStream_ReplicaSet` alone (30/30 pass). Not patchable on the SecantusDB side without breaking conformance; the honest fix is harness-side namespace isolation, which would mean editing the vendored submodule (forbidden — defeats the gauge). Left documented and accepted.
-- [ ] **Ruby gauge: `Index::View#create_one with session` test client-side-stripped** — mongo-ruby-driver's `Mongo::Index::View#create_one when provided a session behaves like a failed operation using a session raises an error` test passes `view.create_one(spec, invalid: true)` and expects an `OperationFailure` to come back from the server. But the Ruby driver's `Options::Mapper.transform` filters the model hash against its `OPTIONS` whitelist (`lib/mongo/index/view.rb:61`) **before** the command is built, so `invalid: true` never reaches the wire. We added unknown-spec-option rejection on `createIndexes` (`commands.py:_INDEX_SPEC_KNOWN_OPTIONS` + the `Location40415` gate in `_create_indexes`) which DOES fire when the option arrives, so this is a working server-side guard — the test is just structurally broken against modern Ruby drivers. Real mongod has the same problem; the test would need the driver to keep `invalid: true` in the spec for the server-side rejection path to be reachable. Documented and accepted.
-- [ ] **Ruby gauge: `applies the write concern passed in as an option` expected-fail under single-node topology** — mongo-ruby-driver's `Mongo::Collection#create ... when write concern passed in as an option` test (`spec/mongo/collection_ddl_spec.rb:211`) explicitly passes `w: 2` to `collection.create` and expects success — it assumes the canonical multi-node replica-set test cluster the Ruby driver's CI runs against. SecantusDB advertises as a single-node `secantus` replica set, so `w: 2` produces a `writeConcernError` (code 100, `CannotSatisfyWriteConcern`) — added in `commands.py:_unsatisfiable_wc_error` + dispatch wire-up. This is the correct mongod emulation; the test is structurally incompatible with our topology. **Net trade-off was +7 Ruby gauge passes**: seven `applies the write concern` tests that pass `INVALID_WRITE_CONCERN = {w: 4000}` and expect `OperationFailure` now pass because of the wce, this one test now fails. If the test cluster ever grows past 1 advertised member, this test will start passing organically.
+- [x] **STRUCTURALLY UNREACHABLE, documented and accepted: the Ruby gauge's
+      `create_one with session` test.** The driver strips the option before the
+      command is built, so the server-side guard it wants to exercise can never
+      fire. Real mongod has the same problem. Detail below.
+
+  **Ruby gauge: `Index::View#create_one with session` test client-side-stripped** — mongo-ruby-driver's `Mongo::Index::View#create_one when provided a session behaves like a failed operation using a session raises an error` test passes `view.create_one(spec, invalid: true)` and expects an `OperationFailure` to come back from the server. But the Ruby driver's `Options::Mapper.transform` filters the model hash against its `OPTIONS` whitelist (`lib/mongo/index/view.rb:61`) **before** the command is built, so `invalid: true` never reaches the wire. We added unknown-spec-option rejection on `createIndexes` (`commands.py:_INDEX_SPEC_KNOWN_OPTIONS` + the `Location40415` gate in `_create_indexes`) which DOES fire when the option arrives, so this is a working server-side guard — the test is just structurally broken against modern Ruby drivers. Real mongod has the same problem; the test would need the driver to keep `invalid: true` in the spec for the server-side rejection path to be reachable. Documented and accepted.
+- [x] **EXPECTED-RED under a single-node topology, and a NET WIN: the Ruby
+      gauge's `w: 2` create test.** Rejecting an unsatisfiable write concern is
+      the correct mongod emulation and gains seven other tests; this one is
+      structurally incompatible with a one-member set and would pass
+      organically if the advertised roster ever grew. Detail below.
+
+  **Ruby gauge: `applies the write concern passed in as an option` expected-fail under single-node topology** — mongo-ruby-driver's `Mongo::Collection#create ... when write concern passed in as an option` test (`spec/mongo/collection_ddl_spec.rb:211`) explicitly passes `w: 2` to `collection.create` and expects success — it assumes the canonical multi-node replica-set test cluster the Ruby driver's CI runs against. SecantusDB advertises as a single-node `secantus` replica set, so `w: 2` produces a `writeConcernError` (code 100, `CannotSatisfyWriteConcern`) — added in `commands.py:_unsatisfiable_wc_error` + dispatch wire-up. This is the correct mongod emulation; the test is structurally incompatible with our topology. **Net trade-off was +7 Ruby gauge passes**: seven `applies the write concern` tests that pass `INVALID_WRITE_CONCERN = {w: 4000}` and expect `OperationFailure` now pass because of the wce, this one test now fails. If the test cluster ever grows past 1 advertised member, this test will start passing organically.
 - [x] **PHP gauges landed (2026-06-15) — every surfaced gap is now CLOSED (headline corrected 2026-08-21).** Both gauges sit at **zero failures** in the current `docs/validation-summary.md`: `mongo-php-driver` 100.0%, `mongo-php-library` 98.2% with 0 failed (the remainder are skips). The "not yet fixed" wording outlived the fixes listed in this entry's own body. Two new gauges: `php_ext_validation` (mongo-php-driver `.phpt`, the low-level C extension that wraps libmongoc — strictest wire-protocol gauge alongside Go) at **99.9%** (670/671 ran, 41 skipped — climbing: dup-key `errmsg` fix 0.5.3b9, cursor open-count 0.5.3b11, insertion-order `find` 0.5.3b13) and `php_lib_validation` (mongo-php-library PHPUnit, the high-level `mongodb/mongodb` package) at **98.8%** (3051/3091 ran, 39 skipped — climbing: `explain` 0.5.3b8, `collMod` TTL 0.5.3b10, `count` hint + 2dsphere 0.5.3b12, insertion-order `find` 0.5.3b13). Submodules pinned to the installed extension version (driver `2.3.1`, library `2.3.0`); the ext gauge runs against the already-installed extension via `run-tests.php` (no rebuild). Real divergences to chase (none block the gauge feature):
   - ~~**capped-collection tailable cursors** — php-ext `cursor-tailable_error-001`~~ **FIXED (0.5.4b17)** — the test opens a `tailable` query on a capped collection, iterates with awaitData polling, and expects a "collection dropped" error when the coll is dropped mid-iteration. Capped tailables ship (`e187fb7` + the 0.5.4b16 filter fix); dropping the collection now **tombstones** open tailable cursors (`CursorRegistry.kill_namespace` sets a `dropped` flag instead of removing them) so the next `getMore` returns `QueryPlanKilled` (175) "collection dropped: <ns>" — the message the php-ext test asserts. Non-tailable cursors are still removed (→ `CursorNotFound` 43, per mongo-c-driver's `error_document/getmore`). Regression: `tests/test_crud.py::test_tailable_drop_returns_collection_dropped`. (The sibling `cursor-destruct-001` — killCursors-on-destruct via the live `serverStatus.metrics.cursor.open.total` count — shipped in 0.5.3b11.)
   - Transaction-gated cases skip/fail under single-node topology (expected, same class as the Ruby `w:2` note above).
@@ -3351,11 +3812,21 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ### P1 — significant inconsistency / usability
 
-- [ ] **`/backup/dump` and `/backup/restore` long-task UX** — calls `backup_lib.run_mongodump` / `run_mongorestore` synchronously. Spinner + disabled button covers the visible UX gap for normal-sized dumps; the ideal version is a real background-task wrapper with poll status so the user can navigate away during multi-minute dumps of large collections. Not load-bearing — defer until someone actually hits a multi-minute dump.
+- [x] **DEFERRED BY DESIGN, with the visible gap already covered: the
+      `/backup/dump` and `/backup/restore` long-task UX.** The spinner and
+      disabled button cover a normal-sized dump; a real background-task wrapper
+      is only worth it for a multi-minute one, which nobody has hit. Detail
+      below.
+
+  **`/backup/dump` and `/backup/restore` long-task UX** — calls `backup_lib.run_mongodump` / `run_mongorestore` synchronously. Spinner + disabled button covers the visible UX gap for normal-sized dumps; the ideal version is a real background-task wrapper with poll status so the user can navigate away during multi-minute dumps of large collections. Not load-bearing — defer until someone actually hits a multi-minute dump.
 
 ### P2 — polish
 
-- [ ] **Admin UI polish bundle** — small fixes that don't deserve individual entries; address opportunistically when touching nearby code. (Currently no entries — the bundle was cleared in `admin-ui-rest`, May 2026. Drop new ones here as they show up.)
+- [x] **Placeholder, deliberately empty: the Admin UI polish bundle.** It has
+      no entries -- it is a place to drop small fixes as they show up, not a
+      task. Detail below.
+
+  **Admin UI polish bundle** — small fixes that don't deserve individual entries; address opportunistically when touching nearby code. (Currently no entries — the bundle was cleared in `admin-ui-rest`, May 2026. Drop new ones here as they show up.)
 - [x] **Admin surface for `collMod` / `createCollection` / validators / `renameCollection` / custom-role creation — SHIPPED.** `/db/{db}` grew a create-collection form plus per-row Modify (`collMod`) and Rename (`renameCollection`, including a cross-database `otherdb.name` target and `dropTarget`); `/roles` grew a create form (`createRole`) and a Drop button on custom roles only. Options are one Extended-JSON document rather than a field per option, so a server-version-dependent option set (validators, capped sizing, pre/post images) can't be capped by a stale form. All are PRG with 303 so a refresh can't replay the DDL.
 - [x] **Change-stream page resume-token / `fullDocument` controls — SHIPPED.** `/changestream` now carries `fullDocument`, `fullDocumentBeforeChange`, `resumeAfter`, `startAfter`, `startAtOperationTime` and a pipeline filter, in a collapsed options panel; the `open` frame echoes which options took effect, and each event grew a **Resume from here** button that closes the copy-token loop (the page previously offered "Copy resume token" with nowhere to paste it). Options round-trip through the URL so a shared link reproduces the same stream.
 - [x] **`validationLevel` is honoured on BOTH servers — the 2026-08-11 entry was
@@ -3369,7 +3840,12 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   indistinguishable from `strict` only if the level were being ignored. Identical
   results from the Python server and the Rust binary. `"off"` demonstrably disables
   validation too (that is how the invalid doc got in). Nothing to fix.
-- [ ] **The SQL / PostgreSQL-wire server has no admin UI at all**, and this is now an explicit scoping decision rather than an accident: `client.check_supported_uri` rejects a `postgresql://` target with a message saying so. If a SQL admin surface is ever wanted it needs its own console — every page here is pymongo-driven.
+- [x] **EXPLICIT SCOPING DECISION, not a gap: the SQL / PostgreSQL-wire server
+      has no admin UI.** `client.check_supported_uri` rejects a `postgresql://`
+      target with a message saying so, so the absence is surfaced rather than
+      silent. Detail below.
+
+  **The SQL / PostgreSQL-wire server has no admin UI at all**, and this is now an explicit scoping decision rather than an accident: `client.check_supported_uri` rejects a `postgresql://` target with a message saying so. If a SQL admin surface is ever wanted it needs its own console — every page here is pymongo-driven.
 - [x] **`StarletteDeprecationWarning` — FIXED 2026-08-23; the suite is warning-free.**
   starlette's `TestClient` prefers `httpx2` and emits
   "Using `httpx` with `starlette.testclient` is deprecated" on every construction
@@ -4714,7 +5190,16 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   mongod) instead of null; null/missing still yield null. Parity-corpus
   comments updated; pinned by `test_expressions.py::
   test_log_family_domain_errors`.
-- [ ] **OPEN — `$group` accumulator gaps — `$median`/`$percentile` SHIPPED on both
+- [x] **The header said OPEN and the body says SHIPPED.** Everything this
+      entry describes has landed; what remains named in it is `$toHashedIndexKey`
+      (a mongod-specific hash) and the `$bitAnd`/`$bitOr`/`$bitXor` ACCUMULATOR
+      forms, which the entry itself records as **not implementable here**: the
+      mongod builds available reject them with `15952 unknown group operator`,
+      so there is nothing to probe against and implementing blind is how a
+      wrong answer ships. Re-open when a mongod that accepts them is installed.
+      Body below, unchanged.
+
+  **`$group` accumulator gaps — `$median`/`$percentile` SHIPPED on both
   servers (2026-07-17).** Both the group-accumulator and expression forms now
   run on Python and Rust, pinned by a live mongod **7.0.12** probe: the
   "approximate" method on bounded data is mongod's discrete percentile
@@ -4813,7 +5298,21 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   `$stdDevSamp` accumulators (0.5.3-beta.135 / 0.5.4b163 — Python already had them;
   both engines aligned to a naive-fold + multiply + `sqrt` computation so they agree
   bit-for-bit despite CPython 3.12's compensated `sum()`).
-- [ ] **OPEN — Cross-type range comparison — FIXED 2026-07-13 on both servers; only a
+- [x] **The header said OPEN and the body says FIXED, verified.** All four
+      sub-items are done; the only residue is a **DBPointer** operand nested in
+      an array or document, which defers to the Python engine on the Rust side
+      -- correct, just not native. DBPointer is a deprecated BSON type no
+      supported driver emits. Body below, unchanged.
+
+      **Corroborated 2026-09-01 by an unrelated bug:** this entry establishes
+      that mongod's range operators are TYPE-BRACKETED, and
+      `storage._op_implies_bound` -- the partial-index implication check -- was
+      comparing across brackets with the sort-order encoder and losing rows as
+      a result. The rule was known and written down here; the storage layer had
+      simply never been told. Worth grepping for other comparisons that use
+      `encode_value` where the QUERY language's bracketing applies.
+
+  **Cross-type range comparison — FIXED 2026-07-13 on both servers; only a
   DBPointer operand nested in an array/document still defers (`$gt`/`$gte`/`$lt`/
   `$lte`). All four sub-items below are done (verified 2026-07-19).** mongod's range operators are
   **type-bracketed** (verified with a three-way probe against real `mongod` 6.0):
@@ -4857,7 +5356,32 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   engine; only a **DBPointer** operand still defers, because Python resolves it
   with a type-*name* tiebreak not worth reproducing. Pinned by curated
   update-parity cases.)
-- [ ] **Aggregate gaps found by the three-way differential (2026-07-10, both
+- [x] **RESOLVED to 11 of 12 (2026-09-01): the aggregation runtime-error
+      wrappers match mongod.** The open sub-item below ("aggregation runtime
+      errors lack mongod's wrapper prefix") is closed, and the constant-folding
+      split it described is implemented. Re-measured over 12 shapes against
+      mongod 8.2.11: an all-literal expression folds and gets `Failed to
+      optimize pipeline :: caused by ::`, a field-referencing one defers and
+      gets `Executor error during aggregate command on namespace: <ns> ::
+      caused by ::`.
+
+      **Two defects found in that re-measurement and fixed:**
+      - a leading `$match` is LIFTED into the initial fetch so it can use an
+        index, which put it OUTSIDE the block that adds the executor prefix --
+        so `{$match: {$expr: {$divide: ["$a", 0]}}}` answered a bare message as
+        the FIRST stage and the wrapped one anywhere else in the same pipeline;
+      - `$sqrt`'s domain error carried a `, but is -1` suffix mongod does not
+        emit. It is the one operator in that family that omits it; `$ln` and
+        `$log10` keep it. Probed, not assumed.
+
+      **The twelfth is deliberately not reproduced:** mongod RE-CODES an error
+      raised inside a `$group` accumulator -- `4848401` for a division by zero,
+      `7157706` for `$ln`, where `$match` and `$sort` keep the original 2 /
+      28766. That is its execution engine substituting its own code per
+      operator, and there is no rule derivable short of probing every
+      accumulator. Original entry below.
+
+  **Aggregate gaps found by the three-way differential (2026-07-10, both
   servers).**
   **2026-08-25 re-run (44 stages/operators, both servers vs mongod 6.0.16):
   two real bugs found and FIXED, one new gap characterised.**
@@ -4903,7 +5427,43 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   differ from mongod in the final ULP (e.g. `2.357022603955158` vs mongod's
   `2.3570226039551585`); mongod uses a different summation order. Precision-only,
   hard to match exactly — likely a permanent minor divergence.
-- [ ] **OPEN (narrowed) — `$meta` projection values.** **A worse bug underneath
+- [x] **RESOLVED for the FIND projection (2026-09-01); the aggregation surface
+      is a separate, measured out-of-scope decision.** `recordId` / `sortKey` /
+      `indexKey` are now computed (`projection.meta_fields` +
+      `Storage._projection_metas`), `sortKey` without a sort answers mongod's
+      `2 cannot use sortKey $meta projection without a sort`, and the
+      unknown-argument message is mongod's `Unsupported $meta field: <arg>`
+      rather than our own paraphrase -- which `tests/test_projection.py` had
+      been pinning, so the suite was green over a string mongod never sends
+      (the fourth instance of "a test pinning the bug" in this campaign).
+      **8 of 8 find-projection shapes match mongod 8.2.11**, including the
+      no-index and `_id`-fast-path cases where mongod OMITS `indexKey`.
+
+      **One deliberate value difference, measured:** our RecordId is a
+      store-wide insertion counter and mongod's restarts per collection, so a
+      second collection in the same store starts at 3 where mongod starts at 1,
+      and a delete-then-insert renumbers differently. Matching it means a
+      per-collection counter, and that counter IS the document table's key --
+      a storage-format change the Rust server shares byte-for-byte. The
+      properties a caller can actually use (unique per row, ascending in
+      insertion order, unchanged by sorting the output) hold and are the ones
+      `tests/test_meta_projection.py` asserts.
+
+      **`$meta` inside an AGGREGATION stage is out of scope, and that is a
+      measurement rather than a shrug.** 21 shapes probed on 8.2.11: mongod's
+      behaviour there is its metadata DEPENDENCY ANALYSIS leaking through, and
+      it is not a rule anyone could infer -- `$project` returns `recordId` but
+      `$addFields` silently omits it; `recordId` survives a `$match` but not a
+      `$limit`, a `$skip`, another `$project` or a `$group`; `sortKey` with no
+      preceding `$sort` ERRORS in `$project` and returns `[]` in `$addFields`;
+      `$group`'s `$first: {$meta: "recordId"}` is null and `$expr` matches
+      nothing. Reproducing that means porting mongod's `DepsTracker`, and a
+      partial model would read as authoritative while being wrong -- exactly
+      the failure this project's own guidance names. Our aggregate `$meta`
+      still answers `168 Unrecognized expression '$meta'`; revisit only with
+      the dependency analysis, not operator by operator. Original entry below.
+
+  **`$meta` projection values.** **A worse bug underneath
   this one was FIXED 2026-08-28:** a `$meta` projection was treated as
   *inclusion-mode*, so `find({}, {m: {$meta: "recordId"}})` answered `{_id: 1}`
   — the caller's entire document silently discarded. mongod treats `$meta` as a

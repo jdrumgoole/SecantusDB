@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as _dt
 import decimal as _decimal
 import math
+import re
 import zoneinfo
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -10,7 +11,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import bson
-from bson import Decimal128, Int64, ObjectId
+from bson import Decimal128, Int64, ObjectId, Timestamp
 
 from secantus.numerics import IntegerOverflowError, bson_int_width
 from secantus.ordering import bson_equal as _bson_equal
@@ -437,8 +438,33 @@ def _object_arg_problem(op: str, arg: Any) -> tuple[int, str] | None:
     return (code, template.format(t=_bson_type_name(arg)))
 
 
+#: The conversion shorthands. Single-argument like the ``_FIXED_ARITY`` family
+#: -- and they accept the ``{$toInt: [expr]}`` list form the same way -- but
+#: mongod gives them their OWN wrong-arity error (``50723 $toInt requires a
+#: single argument, got 2``) rather than the 16020 wording, so they cannot just
+#: join that table. Probed 8.2.11, 2026-09-01; before this they were absent
+#: from both, so ``{$toInt: ["$s"]}`` -- the form every ``$`` field reference
+#: naturally takes -- tried to convert the ARRAY and answered a type error.
+_CONVERSION_SHORTHANDS = frozenset(
+    {
+        "$toBool",
+        "$toDate",
+        "$toDecimal",
+        "$toDouble",
+        "$toInt",
+        "$toLong",
+        "$toObjectId",
+        "$toString",
+    }
+)
+
+
 def _arity_problem(op: str, arg: Any) -> tuple[int, str] | None:
     """mongod's 16020 when a fixed-arity operator gets the wrong count."""
+    if op in _CONVERSION_SHORTHANDS:
+        if isinstance(arg, list) and len(arg) != 1:
+            return (50723, f"{op} requires a single argument, got {len(arg)}")
+        return None
     want = _FIXED_ARITY.get(op)
     if want is None:
         return None
@@ -466,8 +492,23 @@ def _apply_op(op: str, arg: Any, ctx: _Ctx) -> Any:
     # through, which produced silent WRONG VALUES rather than errors:
     # `{$size: [[1, 2]]}` counted the outer array (1, not 2), `{$toUpper: ["a"]}`
     # returned `["a"]`, and `{$first: ["$arr"]}` returned the whole array.
-    if isinstance(arg, list) and len(arg) == 1 and _FIXED_ARITY.get(op) == 1:
+    if (
+        isinstance(arg, list)
+        and len(arg) == 1
+        and (_FIXED_ARITY.get(op) == 1 or op in _CONVERSION_SHORTHANDS)
+    ):
         arg = arg[0]
+    elif isinstance(arg, list) and op in _CONVERSION_SHORTHANDS and len(arg) != 1:
+        # Belt and braces: `_arity_problem` already reports this at PARSE time
+        # for anything going through the pipeline, and answers the same code and
+        # message. This catches a direct `evaluate()` call, which skips that
+        # scan -- without it the bad arity would fall through and be reported as
+        # a conversion of the ARRAY.
+        raise ExpressionError(
+            f"{op} requires a single argument, got {len(arg)}",
+            code=50723,
+            code_name="Location50723",
+        )
     handler = _OPS.get(op)
     if handler is None:
         raise UnknownExpressionOperatorError(op)
@@ -1143,7 +1184,9 @@ def _op_sqrt(arg: Any, ctx: _Ctx) -> Any:
     # mongod's domain error (probed 7.0.12): Location28714, not a null result.
     if isinstance(v, (int, float)) and v < 0:
         raise ExpressionError(
-            f"$sqrt's argument must be greater than or equal to 0, but is {v}",
+            # No ", but is <v>" suffix -- $sqrt is the one operator in this
+            # family that omits it, where $ln / $log10 keep it (probed 8.2.11).
+            "$sqrt's argument must be greater than or equal to 0",
             code=28714,
             code_name="Location28714",
         )
@@ -3376,100 +3419,159 @@ def _op_in(arg: Any, ctx: _Ctx) -> bool:
 _MAX_INT_STR_DIGITS = 4300
 
 
-def _safe_int_from_str(value: str, op_name: str) -> int:
-    if len(value) > _MAX_INT_STR_DIGITS:
-        raise ExpressionError(
-            f"{op_name} input string of {len(value)} chars exceeds the "
-            f"{_MAX_INT_STR_DIGITS}-char int-conversion cap"
-        )
-    try:
-        return int(value)
-    except ValueError as exc:
-        # mongod routes $toInt/$toLong/$convert(int/long) through $convert and
-        # reports an unparseable string as ConversionFailure (241), not the
-        # generic TypeMismatch (14).
-        raise ExpressionError(
-            f"Failed to parse number {value!r} in {op_name} with no onError value",
-            code=241,
-            code_name="ConversionFailure",
-        ) from exc
-
-
 _INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
 _INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
 _OVERFLOW_MSG = "Conversion would overflow target type in $convert"
 
+#: Strict integer syntax: an optional sign then ASCII digits, whole string.
+#: Python's own ``int()`` is much more permissive -- it strips surrounding
+#: whitespace and accepts PEP-515 underscores -- so ``$toInt: " 5 "`` and
+#: ``$toInt: "1_0"`` both returned a NUMBER where mongod rejects the string.
+#: Wrong values, not wrong messages (measured against 8.2.11, 2026-09-01).
+_STRICT_INT_RE = re.compile(r"[+-]?[0-9]+\Z")
+
+#: Strict C ``strtod`` syntax, which is what mongod's double / decimal parsing
+#: accepts: decimal or exponent form, plus the infinity and NaN spellings.
+#: Deliberately does NOT allow surrounding whitespace or underscores.
+_STRICT_FLOAT_RE = re.compile(
+    r"[+-]?(?:inf(?:inity)?|nan|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)\Z",
+    re.IGNORECASE,
+)
+
+#: The prefix of a numeric string that ``strtod`` WOULD consume. Used only to
+#: tell mongod's two "not a number" reasons apart: nothing consumed at all
+#: (``"x"``) versus a valid prefix with junk after it (``"12abc"``).
+_FLOAT_PREFIX_RE = re.compile(
+    r"[+-]?(?:inf(?:inity)?|nan|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)",
+    re.IGNORECASE,
+)
+
+_HEX_PREFIX_RE = re.compile(r"[+-]?0[xX]")
+
+
+#: Sentinel reason selecting the hexadecimal message shape below.
+_HEX_REASON = "<hex>"
+
+
+def _number_parse_error(value: str, reason: str) -> ExpressionError:
+    """mongod's ConversionFailure for an unreadable numeric string.
+
+    Two shapes, both probed on 8.2.11 (2026-09-01)::
+
+        Failed to parse number 'x' in $convert with no onError value: Did not consume whole string.
+        Illegal hexadecimal input in $convert with no onError value: 0x10
+
+    The operator is always named ``$convert`` even when the caller wrote
+    ``$toInt`` -- mongod routes every conversion through it -- and the reason
+    suffix is what this used to omit entirely. It is an ordinary
+    ``ExpressionError``, so ``$convert``'s ``onError`` still catches it.
+    """
+    if reason == _HEX_REASON:
+        message = f"Illegal hexadecimal input in $convert with no onError value: {value}"
+    else:
+        message = f"Failed to parse number '{value}' in $convert with no onError value: {reason}"
+    return ExpressionError(message, code=241, code_name="ConversionFailure")
+
+
+def _parse_int_string(value: str) -> int:
+    """Parse ``value`` as mongod's int/long conversion does. Strict."""
+    if len(value) > _MAX_INT_STR_DIGITS:
+        raise ExpressionError(
+            f"$convert input string of {len(value)} chars exceeds the "
+            f"{_MAX_INT_STR_DIGITS}-char int-conversion cap"
+        )
+    if not value:
+        raise _number_parse_error(value, "No digits")
+    if _HEX_PREFIX_RE.match(value):
+        raise _number_parse_error(value, _HEX_REASON)
+    if not _STRICT_INT_RE.match(value):
+        raise _number_parse_error(value, "Did not consume whole string.")
+    return int(value)
+
+
+def _parse_float_string(value: str) -> float:
+    """Parse ``value`` as mongod's double conversion does. Strict."""
+    if not value:
+        raise _number_parse_error(value, "Empty string")
+    if value[0].isspace():
+        raise _number_parse_error(value, "Leading whitespace")
+    if _HEX_PREFIX_RE.match(value):
+        raise _number_parse_error(value, _HEX_REASON)
+    if not _STRICT_FLOAT_RE.match(value):
+        # Distinguish "strtod consumed nothing" from "strtod consumed a prefix".
+        prefix = _FLOAT_PREFIX_RE.match(value)
+        if prefix is None or prefix.end() == 0:
+            raise _number_parse_error(value, "Did not consume any digits")
+        raise _number_parse_error(value, "Did not consume whole string.")
+    return float(value)
+
+
+def _parse_decimal_string(value: str) -> Decimal128:
+    """Parse ``value`` as mongod's decimal conversion does. Strict.
+
+    Decimal has only ONE failure reason beyond the empty and hex cases -- it
+    does not separate "no digits" from "trailing junk" the way double does.
+    """
+    if not value:
+        raise _number_parse_error(value, "Empty string")
+    if _HEX_PREFIX_RE.match(value):
+        raise _number_parse_error(value, _HEX_REASON)
+    if len(value) > _MAX_INT_STR_DIGITS:
+        raise ExpressionError(
+            f"$convert (decimal) input string of {len(value)} chars "
+            f"exceeds the {_MAX_INT_STR_DIGITS}-char cap"
+        )
+    if not _STRICT_FLOAT_RE.match(value):
+        raise _number_parse_error(value, "Failed to parse string to decimal")
+    try:
+        return Decimal128(value)
+    except (InvalidOperation, ValueError) as exc:
+        raise _number_parse_error(value, "Failed to parse string to decimal") from exc
+
 
 def _op_to_int(arg: Any, ctx: _Ctx) -> Any:
+    """``$toInt: <expr>`` is exactly ``$convert`` to int.
+
+    Delegates rather than repeating the conversion. The two copies HAD drifted:
+    the ``$toX`` side answered its own overflow and unsupported-type messages,
+    missed mongod's separate NaN and infinity cases, and one path reached
+    ``int(Decimal("Infinity"))`` whose ``OverflowError`` escaped as
+    ``1 internal server error`` (found and fixed 2026-09-01).
+    """
     value = _eval(arg, ctx)
     if value is None:
         return None
-    if isinstance(value, bool):
-        return 1 if value else 0
-    if isinstance(value, int):
-        result = int(value)  # strip Int64 -> plain int (int32 on the wire)
-    elif isinstance(value, float):
-        if not math.isfinite(value):
-            raise ExpressionError(_OVERFLOW_MSG, code=241)
-        result = int(value)  # truncates toward zero
-    elif isinstance(value, Decimal128):
-        result = int(value.to_decimal())
-    elif isinstance(value, str):
-        result = _safe_int_from_str(value, "$toInt")
-    else:
-        raise ExpressionError(f"$toInt cannot convert {type(value).__name__}")
-    # mongod: an int32 target must fit [-2^31, 2^31-1], else overflow (241).
-    if not _INT32_MIN <= result <= _INT32_MAX:
-        raise ExpressionError(_OVERFLOW_MSG, code=241)
-    return result
+    return _convert_value(value, "int")
 
 
 def _op_to_long(arg: Any, ctx: _Ctx) -> Any:
-    # Mirrors `_op_to_int` but targets int64: a double truncates toward zero, a
-    # string parses, bool -> 0/1, and the result is wrapped as `Int64` so it
-    # renders as `$type: "long"`. An out-of-[-2^63, 2^63-1] result overflows (241).
+    """``$toLong: <expr>`` is exactly ``$convert`` to long.
+
+    Delegates rather than repeating the conversion. The two copies HAD drifted:
+    the ``$toX`` side answered its own overflow and unsupported-type messages,
+    missed mongod's separate NaN and infinity cases, and one path reached
+    ``int(Decimal("Infinity"))`` whose ``OverflowError`` escaped as
+    ``1 internal server error`` (found and fixed 2026-09-01).
+    """
     value = _eval(arg, ctx)
     if value is None:
         return None
-    if isinstance(value, bool):
-        return Int64(1 if value else 0)
-    if isinstance(value, int):
-        result = int(value)
-    elif isinstance(value, float):
-        if not math.isfinite(value):
-            raise ExpressionError(_OVERFLOW_MSG, code=241)
-        result = int(value)  # truncates toward zero
-    elif isinstance(value, Decimal128):
-        result = int(value.to_decimal())
-    elif isinstance(value, str):
-        result = _safe_int_from_str(value, "$toLong")
-    else:
-        raise ExpressionError(f"$toLong cannot convert {type(value).__name__}")
-    if not _INT64_MIN <= result <= _INT64_MAX:
-        raise ExpressionError(_OVERFLOW_MSG, code=241)
-    return Int64(result)
+    return _convert_value(value, "long")
 
 
 def _op_to_double(arg: Any, ctx: _Ctx) -> Any:
+    """``$toDouble: <expr>`` is exactly ``$convert`` to double.
+
+    Delegates rather than repeating the conversion. The two copies HAD drifted:
+    the ``$toX`` side answered its own overflow and unsupported-type messages,
+    missed mongod's separate NaN and infinity cases, and one path reached
+    ``int(Decimal("Infinity"))`` whose ``OverflowError`` escaped as
+    ``1 internal server error`` (found and fixed 2026-09-01).
+    """
     value = _eval(arg, ctx)
     if value is None:
         return None
-    if isinstance(value, bool):
-        return 1.0 if value else 0.0
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, Decimal128):
-        return float(value.to_decimal())
-    if isinstance(value, str):
-        try:
-            return float(value)
-        except ValueError as exc:
-            raise ExpressionError(
-                f"Failed to parse number {value!r} in $convert with no onError value",
-                code=241,
-                code_name="ConversionFailure",
-            ) from exc
-    raise ExpressionError(f"$toDouble cannot convert {type(value).__name__}")
+    return _convert_value(value, "double")
 
 
 def _op_to_bool(arg: Any, ctx: _Ctx) -> Any:
@@ -3509,6 +3611,115 @@ _CONVERT_TARGETS = {
 }
 
 
+#: The target-type NAME mongod uses in an "Unsupported conversion" message,
+#: keyed by the numeric BSON type code the target resolves to. A caller may
+#: have written the code rather than the name, and mongod always answers with
+#: the name.
+_CONVERT_TARGET_NAMES = {
+    1: "double",
+    2: "string",
+    7: "objectId",
+    8: "bool",
+    9: "date",
+    16: "int",
+    18: "long",
+    19: "decimal",
+}
+
+
+def _render_number(value: Any) -> str:
+    """A numeric value as mongod prints it in a conversion-overflow message.
+
+    Probed 8.2.11: a double takes ``%g``-style exponent form with a two-digit
+    exponent (``2.5e+09``, ``1e+300``), and a Decimal128 keeps its own
+    rendering (``1E+300``).
+    """
+    if isinstance(value, float):
+        return repr(value) if abs(value) < 1e16 else f"{value:g}"
+    return str(value)
+
+
+def _overflow_error(rendered: str | None = None) -> ExpressionError:
+    """mongod's overflow message. The value is named only when it is a NUMBER;
+    a string overflow goes through :func:`_number_parse_error` instead."""
+    if rendered is None:
+        return ExpressionError(_OVERFLOW_MSG, code=241, code_name="ConversionFailure")
+    return ExpressionError(
+        f"{_OVERFLOW_MSG} with no onError value: {rendered}",
+        code=241,
+        code_name="ConversionFailure",
+    )
+
+
+def _nan_to_integer_error() -> ExpressionError:
+    return ExpressionError(
+        "Attempt to convert NaN value to integer type in $convert with no onError value",
+        code=241,
+        code_name="ConversionFailure",
+    )
+
+
+def _infinity_to_integer_error() -> ExpressionError:
+    return ExpressionError(
+        "Attempt to convert infinity value to integer type in $convert with no onError value",
+        code=241,
+        code_name="ConversionFailure",
+    )
+
+
+def _epoch_millis_to_date(millis: float) -> _dt.datetime:
+    """Epoch milliseconds -> a naive UTC datetime, the way BSON dates decode."""
+    return _dt.datetime.fromtimestamp(millis / 1000.0, tz=_dt.timezone.utc).replace(tzinfo=None)
+
+
+def _parse_date_string(value: str) -> _dt.datetime:
+    """mongod's string -> date conversion.
+
+    The VALUE rules are reproduced (ISO-8601 with an optional time, an optional
+    fractional second truncated to milliseconds, ``Z`` or an offset, and
+    surrounding whitespace tolerated). The failure TEXT is not: mongod's parser
+    reports a per-character diagnosis (``Error parsing date string '20'; 0:
+    Unexpected character '2'; 1: Unexpected character '0'``) that depends on how
+    far its own state machine got, and a half-right imitation of that would look
+    authoritative while being wrong. Every failure here answers the code (241)
+    and the general wording mongod uses for a string it cannot start to read.
+    """
+    text = value.strip()
+    if not text:
+        raise ExpressionError(
+            # The character in mongod's message is a literal NUL, not a space.
+            f"Error parsing date string '{value}'; 0: Empty string '\x00'",
+            code=241,
+            code_name="ConversionFailure",
+        )
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    # mongod truncates a sub-millisecond fraction rather than rejecting it;
+    # `fromisoformat` accepts only 3 or 6 fractional digits.
+    if "." in candidate:
+        head, _, tail = candidate.partition(".")
+        digits = ""
+        while tail and tail[0].isdigit():
+            digits, tail = digits + tail[0], tail[1:]
+        if digits:
+            # BSON dates hold MILLISECONDS, so mongod truncates the fraction to
+            # three digits rather than rejecting a longer one:
+            # ``...00.1234567Z`` is 123 ms, not 123456 us.
+            candidate = f"{head}.{digits[:3].ljust(3, '0')}000{tail}"
+    for form in (candidate, f"{candidate}-01" if len(candidate) == 7 else candidate):
+        try:
+            parsed = _dt.datetime.fromisoformat(form)
+        except ValueError:
+            continue
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+        return parsed
+    raise ExpressionError(
+        f'an incomplete date/time string has been found, with elements missing: "{value}"',
+        code=241,
+        code_name="ConversionFailure",
+    )
+
+
 def _convert_value(value: Any, target: Any) -> Any:
     from bson import ObjectId as _ObjectId
 
@@ -3523,18 +3734,41 @@ def _convert_value(value: Any, target: Any) -> Any:
         if isinstance(value, Decimal128):
             return float(value.to_decimal())
         if isinstance(value, str):
-            return float(value)
+            return _parse_float_string(value)
         if isinstance(value, _dt.datetime):
             return value.timestamp() * 1000.0
     elif code == 2:
+        # ``str()`` is Python's rendering, not BSON's: it prints ``True`` for a
+        # bool and ``inf`` / ``nan`` for the non-finite doubles, and it happily
+        # stringifies an array or a document that mongod refuses outright
+        # (probed 8.2.11).
         if isinstance(value, _dt.datetime):
             return value.isoformat()
-        return str(value)
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, float):
+            if math.isnan(value):
+                return "NaN"
+            if math.isinf(value):
+                return "Infinity" if value > 0 else "-Infinity"
+            return _render_number(value)
+        if isinstance(value, (str, int, Decimal128, ObjectId)):
+            return str(value)
     elif code == 7:
         if isinstance(value, _ObjectId):
             return value
         if isinstance(value, str):
-            return _ObjectId(value)
+            try:
+                return _ObjectId(value)
+            except Exception as exc:
+                # mongod names the LENGTH it wanted, whatever went wrong.
+                raise ExpressionError(
+                    f"Failed to parse objectId '{value}' in $convert with no onError value: "
+                    f"Invalid string length for parsing to OID, expected 24 but found "
+                    f"{len(value)}",
+                    code=241,
+                    code_name="ConversionFailure",
+                ) from exc
     elif code == 8:
         if isinstance(value, bool):
             return value
@@ -3543,46 +3777,81 @@ def _convert_value(value: Any, target: Any) -> Any:
         if isinstance(value, Decimal128):
             return value.to_decimal() != Decimal(0)
         if isinstance(value, str):
-            return len(value) > 0
+            # EVERY string is true, the empty one included (probed 8.2.11) --
+            # this is BSON truthiness, not Python's.
+            return True
         return True
     elif code == 9:
-        # mongod rejects bool -> date (no int coercion): ConversionFailure (241).
+        # bool and int32 are BOTH rejected (probed 8.2.11): only a LONG is
+        # epoch milliseconds. We accepted a plain int, so `{$toDate: 1}`
+        # answered 1970-01-01T00:00:00.001Z where mongod refuses the
+        # conversion outright -- a wrong value, not a wrong message.
         if isinstance(value, bool):
-            raise ExpressionError(
-                "Unsupported conversion from bool to date in $convert with no onError value",
-                code=241,
-                code_name="ConversionFailure",
-            )
-        if isinstance(value, _dt.datetime):
+            pass  # falls through to the unsupported-conversion tail
+        elif isinstance(value, _dt.datetime):
             return value
-        if isinstance(value, str):
-            return _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if isinstance(value, (int, float)):
-            return _dt.datetime.fromtimestamp(value / 1000.0, tz=_dt.timezone.utc)
+        elif isinstance(value, ObjectId):
+            return value.generation_time.replace(tzinfo=None)
+        elif isinstance(value, Timestamp):
+            return _dt.datetime.fromtimestamp(value.time, tz=_dt.timezone.utc).replace(tzinfo=None)
+        elif isinstance(value, int):
+            # A LONG is epoch milliseconds; an int32 is not convertible at all
+            # (probed 8.2.11). The test is the BSON width, not the Python type:
+            # a plain Python ``int`` too large for int32 IS a long on the wire,
+            # and ``_bson_type_name`` already calls it one.
+            if not isinstance(value, Int64) and _INT32_MIN <= value <= _INT32_MAX:
+                pass  # falls through to the unsupported-conversion tail
+            else:
+                return _epoch_millis_to_date(int(value))
+        elif isinstance(value, float):
+            return _epoch_millis_to_date(value)
+        elif isinstance(value, Decimal128):
+            return _epoch_millis_to_date(float(value.to_decimal()))
+        elif isinstance(value, str):
+            return _parse_date_string(value)
     elif code in (16, 18):
         # 16 = int32, 18 = int64. Wrap as ``Int64`` for code 18 so the
         # result matches ``$type: "long"`` downstream — the bson decoder
         # preserves the int32/int64 distinction by type, and ``$convert``
         # must respect the requested target type.
-        def _wrap(n: int) -> int:
-            # int32 (16) / int64 (18) targets range-check like mongod (241).
-            lo, hi = (_INT64_MIN, _INT64_MAX) if code == 18 else (_INT32_MIN, _INT32_MAX)
+        lo, hi = (_INT64_MIN, _INT64_MAX) if code == 18 else (_INT32_MIN, _INT32_MAX)
+
+        def _wrap(n: int, rendered: str | None = None) -> int:
             if not lo <= n <= hi:
-                raise ExpressionError(_OVERFLOW_MSG, code=241)
+                raise _overflow_error(rendered)
             return Int64(n) if code == 18 else int(n)
 
         if isinstance(value, bool):
             return _wrap(1 if value else 0)
         if isinstance(value, int):
-            return _wrap(int(value))
+            return _wrap(int(value), _render_number(value))
         if isinstance(value, float):
-            if not math.isfinite(value):
-                raise ExpressionError(_OVERFLOW_MSG, code=241)
-            return _wrap(int(value))
+            # mongod separates the three ways a float refuses to be an integer:
+            # NaN, infinity, and merely out of range each get their own message
+            # (probed 8.2.11). One ``_OVERFLOW_MSG`` covered all three.
+            if math.isnan(value):
+                raise _nan_to_integer_error()
+            if math.isinf(value):
+                raise _infinity_to_integer_error()
+            return _wrap(int(value), _render_number(value))
         if isinstance(value, Decimal128):
-            return _wrap(int(value.to_decimal()))
+            dec = value.to_decimal()
+            if dec.is_nan():
+                raise _nan_to_integer_error()
+            if dec.is_infinite():
+                # This used to reach ``int(Decimal("Infinity"))``, whose
+                # ``OverflowError`` escaped the handler and answered the client
+                # ``1 internal server error``.
+                raise _infinity_to_integer_error()
+            return _wrap(int(dec), _render_number(value))
         if isinstance(value, str):
-            return _wrap(_safe_int_from_str(value, "$convert (int/long)"))
+            n = _parse_int_string(value)
+            if not lo <= n <= hi:
+                # From a STRING, mongod reports the overflow as a parse
+                # failure, with the original text -- not as the conversion
+                # overflow a numeric input gets.
+                raise _number_parse_error(value, "Overflow")
+            return Int64(n) if code == 18 else int(n)
     elif code == 19:
         if isinstance(value, Decimal128):
             return value
@@ -3596,13 +3865,13 @@ def _convert_value(value: Any, target: Any) -> Any:
 
             return Decimal128(decimal_from_double(value))
         if isinstance(value, str):
-            if len(value) > _MAX_INT_STR_DIGITS:
-                raise ExpressionError(
-                    f"$convert (decimal) input string of {len(value)} chars "
-                    f"exceeds the {_MAX_INT_STR_DIGITS}-char cap"
-                )
-            return Decimal128(value)
-    raise ExpressionError(f"$convert cannot convert {type(value).__name__} to {target!r}")
+            return _parse_decimal_string(value)
+    raise ExpressionError(
+        f"Unsupported conversion from {_bson_type_name(value)} to "
+        f"{_CONVERT_TARGET_NAMES.get(code, target)} in $convert with no onError value",
+        code=241,
+        code_name="ConversionFailure",
+    )
 
 
 def _op_convert(arg: Any, ctx: _Ctx) -> Any:
@@ -3634,28 +3903,31 @@ def _op_convert(arg: Any, ctx: _Ctx) -> Any:
 
 
 def _op_to_decimal(arg: Any, ctx: _Ctx) -> Any:
+    """``$toDecimal: <expr>`` is exactly ``$convert`` to decimal.
+
+    Delegates rather than repeating the conversion. The two copies HAD drifted:
+    the ``$toX`` side answered its own overflow and unsupported-type messages,
+    missed mongod's separate NaN and infinity cases, and one path reached
+    ``int(Decimal("Infinity"))`` whose ``OverflowError`` escaped as
+    ``1 internal server error`` (found and fixed 2026-09-01).
+    """
     value = _eval(arg, ctx)
     if value is None:
         return None
-    if isinstance(value, Decimal128):
-        return value
-    if isinstance(value, (int, float)):
-        from secantus.numerics import decimal_from_double
+    return _convert_value(value, "decimal")
 
-        # mongod converts a double at 15 significant digits; ints stay exact.
-        return Decimal128(
-            decimal_from_double(value) if isinstance(value, float) else Decimal(value)
-        )
-    if isinstance(value, str):
-        try:
-            return Decimal128(value)
-        except (InvalidOperation, ValueError) as exc:
-            raise ExpressionError(
-                f"Failed to parse number {value!r} in $convert with no onError value",
-                code=241,
-                code_name="ConversionFailure",
-            ) from exc
-    raise ExpressionError(f"$toDecimal cannot convert {type(value).__name__}")
+
+def _op_to_object_id(arg: Any, ctx: _Ctx) -> Any:
+    """``$toObjectId: <expr>`` is ``$convert: {input: <expr>, to: "objectId"}``.
+
+    It was simply MISSING -- the whole operator answered ``Unrecognized
+    expression '$toObjectId'`` (168), which is what mongod says for an operator
+    that does not exist rather than one it ships (found 2026-09-01).
+    """
+    value = _eval(arg, ctx)
+    if value is None:
+        return None
+    return _convert_value(value, "objectId")
 
 
 def _op_to_date(arg: Any, ctx: _Ctx) -> Any:
@@ -4022,6 +4294,35 @@ def _op_expr_avg(arg: Any, ctx: _Ctx) -> Any:
     return total / len(values)
 
 
+def _op_expr_std_dev_pop(arg: Any, ctx: _Ctx) -> Any:
+    return _expr_std_dev(arg, ctx, pop=True)
+
+
+def _op_expr_std_dev_samp(arg: Any, ctx: _Ctx) -> Any:
+    return _expr_std_dev(arg, ctx, pop=False)
+
+
+def _expr_std_dev(arg: Any, ctx: _Ctx, *, pop: bool) -> Any:
+    """``$stdDevPop`` / ``$stdDevSamp`` in EXPRESSION position.
+
+    The accumulator forms shipped long ago; the expression forms -- over an
+    array argument in ``$project`` / ``$addFields`` -- did not, and answered
+    ``Unknown expression`` where mongod computes (probed 8.2.11, 2026-09-01:
+    ``{$stdDevPop: [1, 2, 3]}`` is ``0.816496580927726`` and ``$stdDevSamp`` is
+    ``1.0``). Shares ``aggregate._std_dev`` with the accumulators so the two
+    forms cannot answer different numbers, and non-numeric members are dropped
+    exactly as the accumulator drops them.
+    """
+    from secantus.aggregate import _std_dev, _std_dev_operand
+
+    values = [
+        _std_dev_operand(x)
+        for x in _expr_acc_values(arg, ctx)
+        if _expr_is_number(x) and not isinstance(x, bool)
+    ]
+    return _std_dev(values, pop=pop)
+
+
 def _op_expr_max(arg: Any, ctx: _Ctx) -> Any:
     from secantus.ordering import _SortKey
 
@@ -4047,6 +4348,8 @@ def _op_expr_min(arg: Any, ctx: _Ctx) -> Any:
 
 
 _OPS = {
+    "$stdDevPop": _op_expr_std_dev_pop,
+    "$stdDevSamp": _op_expr_std_dev_samp,
     "$sum": _op_expr_sum,
     "$avg": _op_expr_avg,
     "$max": _op_expr_max,
@@ -4167,6 +4470,7 @@ _OPS = {
     "$reverseArray": _op_reverse_array,
     "$in": _op_in,
     "$toInt": _op_to_int,
+    "$toObjectId": _op_to_object_id,
     "$toLong": _op_to_long,
     "$toDouble": _op_to_double,
     "$toBool": _op_to_bool,

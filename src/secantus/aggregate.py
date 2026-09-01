@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from bson import Binary, Decimal128, ObjectId
 
+from secantus import deadline as _deadline
 from secantus.expressions import (
     MISSING,
     ExpressionError,
@@ -259,6 +260,12 @@ def apply_pipeline(
     if ctx.shared_unwind_ok and _pipeline_mutates_in_place(pipeline):
         ctx.shared_unwind_ok = False
     for stage in pipeline:
+        # ``maxTimeMS``: between stages rather than inside them. A pipeline's
+        # cost is dominated by stage count times document count, and the
+        # per-document half is already polled by the storage scan that fed it;
+        # this catches a long pipeline over an already-materialised set without
+        # putting a clock read inside every stage's inner loop.
+        _deadline.check_now()
         docs = _apply_stage(stage, docs, ctx)
         if len(docs) > MAX_PIPELINE_DOCS:
             name = next(iter(stage)) if isinstance(stage, Mapping) and stage else "stage"
@@ -427,10 +434,19 @@ def expression_problem_in_filter(filter_doc: Any, bound: frozenset[str]) -> tupl
 FOLD_WRAPPER = "\0fold"
 
 
-def wrap_expression_problem(message: str, stage: str) -> str:
+def wrap_expression_problem(message: str, stage: str, *, in_update: str = "") -> str:
     """mongod's wrapper: `Invalid $<stage> :: caused by ::` inside `$project` /
-    `$addFields` / `$set`, and nothing anywhere else."""
+    `$addFields` / `$set`, and nothing anywhere else.
+
+    A CONSTANT-FOLD failure takes `Failed to optimize pipeline :: caused by ::`
+    in an `aggregate`, and the EXECUTOR prefix inside a pipeline update --
+    naming the command, so `update` and `findAndModify` differ from each other
+    (probed 8.2.11, 2026-09-01: `{$abs: "$$cv"}` with `cv: "x"`). Pass the
+    command name as ``in_update`` from those two paths.
+    """
     if stage == FOLD_WRAPPER:
+        if in_update:
+            return f"Plan executor error during {in_update} :: caused by :: {message}"
         return f"Failed to optimize pipeline :: caused by :: {message}"
     return f"Invalid {stage} :: caused by :: {message}" if stage else message
 
@@ -441,6 +457,16 @@ def _contains_switch(expr: Any) -> bool:
     if isinstance(expr, list):
         return any(_contains_switch(v) for v in expr)
     return False
+
+
+_UNDEFINED_VAR_PREFIX = "Use of undefined variable: "
+
+
+def _undefined_but_bound(message: str, bound: frozenset[str]) -> bool:
+    """Is this fold failure just a bound variable with no value supplied?"""
+    if not message.startswith(_UNDEFINED_VAR_PREFIX):
+        return False
+    return message[len(_UNDEFINED_VAR_PREFIX) :].strip() in bound
 
 
 def _fold_problem(
@@ -478,6 +504,16 @@ def _fold_problem(
     except ExpressionError as exc:
         code = getattr(exc, "code", None)
         if code is None:
+            return None
+        if _undefined_but_bound(str(exc), bound):
+            # The caller told us the name is BOUND but did not give us its
+            # value, so the fold failed for want of a binding rather than
+            # because the query is wrong. Reporting it would answer
+            # `Use of undefined variable: x` for a variable the command
+            # DEFINES -- which is what `update` and `findAndModify` with a
+            # `let` and a pipeline update did, refusing every such write
+            # (found via the pymongo gauge, 2026-09-01). A caller that wants
+            # the fold has to pass `fold_vars`, as `aggregate` does.
             return None
         return (code, str(exc))
     except AggregateError as exc:
@@ -831,10 +867,14 @@ def _validate_sort_spec(spec: Any) -> None:
 def _stage_sort(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
+    from secantus.collation import parse as _parse_collation
     from secantus.ordering import sort_docs
 
     _validate_sort_spec(spec)
-    return sort_docs(list(docs), spec)
+    # The context's collation reaches string ORDERING here, not just the
+    # bucket-key equality ``$group`` uses. Without it a collated aggregation
+    # sorted by codepoint while the same collated ``find().sort()`` did not.
+    return sort_docs(list(docs), spec, collation=_parse_collation(_ctx.collation))
 
 
 def _stage_project(

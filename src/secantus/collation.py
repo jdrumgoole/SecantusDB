@@ -44,6 +44,7 @@ Public API:
 
 from __future__ import annotations
 
+import functools
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -58,6 +59,11 @@ class Collation:
     strength: int = 3
     case_level: bool = False
     numeric_ordering: bool = False
+    #: ``"off"`` (ICU's default), ``"lower"`` or ``"upper"``. Only affects
+    #: ORDER, never matching, and only at the tertiary level.
+    case_first: str = "off"
+    #: French secondary ordering: accents compare from the END of the string.
+    backwards: bool = False
 
     @property
     def case_insensitive(self) -> bool:
@@ -98,10 +104,15 @@ def parse(spec: Any) -> Collation | None:
         strength = int(strength)
     except (TypeError, ValueError):
         strength = 3
+    case_first = spec.get("caseFirst", "off")
+    if case_first not in ("off", "lower", "upper"):
+        case_first = "off"
     return Collation(
         strength=strength,
         case_level=bool(spec.get("caseLevel", False)),
         numeric_ordering=bool(spec.get("numericOrdering", False)),
+        case_first=case_first,
+        backwards=bool(spec.get("backwards", False)),
     )
 
 
@@ -128,6 +139,127 @@ def _normalize_string(s: str, collation: Collation) -> Any:
         parts = _NUMERIC_SPLIT.split(out)
         return tuple((int(p) if p.isdigit() else p) for p in parts if p != "")
     return out
+
+
+#: The order ICU gives the common Latin combining marks at the SECONDARY level.
+#: Codepoint order is not it -- mongod sorts ``á`` before ``à`` where the
+#: codepoints run the other way (U+0300 grave, U+0301 acute). Derived by sorting
+#: ``a`` plus each mark against mongod 8.2.11 (2026-09-01,
+#: ``tools/probes/collation_order.py``), not copied from a specification, and
+#: covering only the marks that probe reached. Anything not listed falls back to
+#: its codepoint, which keeps the key total and deterministic -- and wrong only
+#: in the same way the whole table was before.
+_MARK_ORDER: tuple[int, ...] = (
+    0x332,  # low line
+    0x301,  # acute
+    0x300,  # grave
+    0x306,  # breve
+    0x302,  # circumflex
+    0x30C,  # caron
+    0x30A,  # ring above
+    0x308,  # diaeresis
+    0x30B,  # double acute
+    0x303,  # tilde
+    0x307,  # dot above
+    0x327,  # cedilla
+    0x328,  # ogonek
+    0x304,  # macron
+    0x309,  # hook above
+    0x30F,  # double grave
+    0x311,  # inverted breve
+    0x323,  # dot below
+    0x326,  # comma below
+    0x331,  # macron below
+)
+_MARK_RANK: dict[int, int] = {cp: i for i, cp in enumerate(_MARK_ORDER)}
+#: Unlisted marks sort after every listed one, by codepoint.
+_MARK_RANK_FLOOR = len(_MARK_ORDER)
+
+
+def _mark_weight(codepoint: int) -> tuple[int, int]:
+    """Secondary weight for one combining mark: (table rank, codepoint)."""
+    rank = _MARK_RANK.get(codepoint)
+    if rank is None:
+        return (_MARK_RANK_FLOOR, codepoint)
+    return (rank, 0)
+
+
+@functools.lru_cache(maxsize=8192)
+def sort_levels(s: str, collation: Collation) -> tuple[Any, ...]:
+    """A multi-level ORDERING key for ``s``, in the shape ICU uses.
+
+    Ordering is not the same problem as matching, and this module only ever
+    solved matching: ``_normalize_string`` folds a string down to one value, so
+    two strings that differ only in an accent fall back to comparing whole
+    CODEPOINTS -- which puts every accented word after ``z`` instead of beside
+    its base letter, drops tertiary case order entirely, and ignores
+    ``caseFirst`` / ``backwards`` / ``numericOrdering``. Measured against mongod
+    8.2.11 on 2026-09-01, that was wrong on every ordering probe:
+    ``["a","á","ä","az","b"]`` came back ``a az b á ä``.
+
+    Three levels, compared in order:
+
+    * **primary** -- the base letters: accents removed, case folded (or the
+      digit-run tuple when ``numericOrdering`` is on, so ``"a2" < "a10"``).
+    * **secondary** -- the accents, as one entry per base character holding
+      that character's combining marks, weighted by ``_MARK_ORDER`` (codepoint
+      order is NOT ICU's -- acute sorts before grave and the codepoints run the
+      other way). ``backwards`` (French) REVERSES this level, which is what
+      makes ``cote < côte < coté`` instead of ``cote < coté < côte``.
+    * **tertiary** -- case, one rank per base character. ``caseFirst: "upper"``
+      flips it.
+
+    ``strength`` truncates the tuple: 1 keeps the primary alone (so ``a``,
+    ``A`` and ``á`` tie, and mongod's stable order among them is the input
+    order we also produce), 2 adds the secondary, 3 adds the tertiary.
+    ``caseLevel`` re-adds the case rank at strength 1/2.
+
+    NOT a substitute for :func:`_normalize_string`. Equality still goes through
+    that one, unchanged: an index's on-disk bytes are built from it, and moving
+    equality here would change which rows an index lookup finds. What this does
+    change is that a collated SORT is no longer served by an index walk (see
+    ``storage.find_matching``) -- the byte order in the entries table is the
+    single-level normalisation and cannot reproduce these levels.
+
+    What is still missing without ICU is the LOCALE: Swedish sorts ``ä`` after
+    ``z`` rather than beside ``a``, and no amount of decomposition finds that
+    out. Locale-specific ordering needs the CLDR data.
+
+    Memoised because a comparison sort calls this O(n log n) times over the same
+    n strings, and building the key is the expensive half. ``Collation`` is a
+    frozen dataclass, so it is a valid cache key.
+    """
+    nfd = unicodedata.normalize("NFD", s)
+    bases: list[str] = []
+    marks: list[tuple[tuple[int, int], ...]] = []
+    cases: list[int] = []
+    for ch in nfd:
+        if unicodedata.combining(ch):
+            if marks:
+                marks[-1] = marks[-1] + (_mark_weight(ord(ch)),)
+            continue
+        bases.append(ch)
+        marks.append(())
+        cases.append(1 if ch.isupper() else 0)
+    primary_str = "".join(bases).casefold()
+    primary: Any = primary_str
+    if collation.numeric_ordering:
+        parts = _NUMERIC_SPLIT.split(primary_str)
+        primary = tuple((int(p) if p.isdigit() else p) for p in parts if p != "")
+
+    secondary: tuple[Any, ...] = tuple(marks)
+    if collation.backwards:
+        secondary = tuple(reversed(secondary))
+
+    case_ranks = tuple(cases)
+    if collation.case_first == "upper":
+        case_ranks = tuple(1 - c for c in case_ranks)
+
+    if collation.strength <= 1:
+        return (primary, case_ranks) if collation.case_level else (primary,)
+    if collation.strength == 2:
+        return (primary, secondary, case_ranks) if collation.case_level else (primary, secondary)
+    return (primary, secondary, case_ranks)
 
 
 def normalize_for_index_bytes(s: str, collation: Collation) -> bytes:

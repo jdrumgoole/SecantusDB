@@ -68,11 +68,12 @@ def _bson_type_rank(value: Any) -> float:
 
 
 class _SortKey:
-    __slots__ = ("val", "_reverse")
+    __slots__ = ("_collation", "_reverse", "val")
 
-    def __init__(self, val: Any, reverse: bool = False) -> None:
+    def __init__(self, val: Any, reverse: bool = False, collation: Any = None) -> None:
         self.val = val
         self._reverse = reverse
+        self._collation = collation
 
     def __lt__(self, other: _SortKey) -> bool:
         # Swap operands when this key is descending — the same comparison
@@ -85,6 +86,10 @@ class _SortKey:
             a, b = other.val, self.val
         else:
             a, b = self.val, other.val
+        if self._collation is not None and isinstance(a, str) and isinstance(b, str):
+            from secantus.collation import sort_levels
+
+            return sort_levels(a, self._collation) < sort_levels(b, self._collation)
         return _bson_lt(a, b)
 
     def __eq__(self, other: object) -> bool:
@@ -175,8 +180,18 @@ _EMPTY_ARRAY_SORTS_AS = _EmptyArraySortsAs()
 
 
 def sort_docs(
-    docs: list[dict[str, Any]], sort_spec: Mapping[str, Any] | None
+    docs: list[dict[str, Any]],
+    sort_spec: Mapping[str, Any] | None,
+    collation: Any = None,
 ) -> list[dict[str, Any]]:
+    """Sort ``docs`` by ``sort_spec``, in MongoDB's cross-type order.
+
+    ``collation`` changes how STRINGS compare (``secantus.collation
+    .sort_levels``); every other type is unaffected. Passing it is what makes
+    ``numericOrdering`` / accent placement / tertiary case order reach a sort at
+    all -- without it a collated ``find().sort()`` silently fell back to
+    codepoint order.
+    """
     if not sort_spec:
         return docs
     fields = [(f, int(d) == -1) for f, d in sort_spec.items()]
@@ -185,7 +200,8 @@ def sort_docs(
     return sorted(
         docs,
         key=lambda d: tuple(
-            _SortKey(_array_sort_value(get_path(d, f), rev), reverse=rev) for f, rev in fields
+            _SortKey(_array_sort_value(get_path(d, f), rev), reverse=rev, collation=collation)
+            for f, rev in fields
         ),
     )
 
