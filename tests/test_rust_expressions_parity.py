@@ -1462,6 +1462,62 @@ def test_numeric_string_conversion_parity():
     assert compared > 200, f"expected broad coverage, only {compared} comparisons"
 
 
+def test_date_format_directive_parity():
+    """Every `$dateToString` directive mongod accepts, over dates chosen for the
+    week-numbering edges, plus the ones it REFUSES.
+
+    `%G` / `%V` (ISO week-based year and week) and `%U` (Sunday-start week) are
+    the reason this exists: they disagree with the calendar year around New
+    Year, so 2021-01-03 is 2020-W53 and 2012-12-31 is week 53 of 2012. The Rust
+    `%U` was off by one week for exactly that last date while agreeing on the
+    other fifteen -- the kind of gap a handful of round-number dates misses.
+    """
+    dates = [
+        datetime.datetime(y, m, d, tzinfo=datetime.timezone.utc)
+        for y, m, d in [
+            (2026, 1, 2),
+            (2021, 1, 1),
+            (2021, 1, 3),
+            (2021, 1, 4),
+            (2020, 12, 31),
+            (2024, 12, 30),
+            (2019, 12, 29),
+            (2000, 2, 29),
+            (2015, 6, 15),
+            (1999, 12, 31),
+            (2100, 3, 1),
+            (2016, 1, 1),
+            (2010, 1, 1),
+            (2011, 1, 2),
+            (2012, 12, 31),
+            (2013, 12, 30),
+        ]
+    ]
+    accepted = list("bdjmuwzBGHLMSUVYZ") + ["%"]
+    refused = list("acefghiklnopqrstvxyACDEFIJKNOPQRTWX")
+    compared = named = 0
+    for value in dates:
+        doc = bson.decode(bson.encode({"d": value}))
+        for ch in accepted + refused:
+            expr = bson.decode(
+                bson.encode({"e": {"$dateToString": {"date": "$d", "format": f"[%{ch}]"}}})
+            )["e"]
+            try:
+                rust = _rust_eval(expr, doc)
+            except RustMongoError as exc:
+                assert_named_error_matches_pure(exc, expr, doc)
+                named += 1
+                continue
+            if rust is None:
+                continue
+            compared += 1
+            assert rust == _bson_norm(_pure.evaluate(expr, doc)), (
+                f"%{ch} on {value.date()}: rust={rust!r}"
+            )
+    assert compared > 200, f"expected broad coverage, only {compared}"
+    assert named > 100, f"expected the refused directives to be named, only {named}"
+
+
 def test_conversion_fuzz():
     """$toInt / $toDouble / $toBool / $toString over a mix of scalar types,
     checked against Python wherever the Rust path doesn't defer."""

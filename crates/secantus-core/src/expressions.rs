@@ -2876,10 +2876,71 @@ fn op_date_to_string(arg: &Bson, ctx: &Ctx) -> R {
         Some(Bson::String(s)) => s.as_str(),
         Some(_) => return Err(Fallback::Defer), // Python raises "format must be a string"
     };
-    Ok(Bson::String(render_date(millis + tz_offset, fmt)?))
+    Ok(Bson::String(render_date_at(
+        millis + tz_offset,
+        fmt,
+        tz_offset,
+    )?))
+}
+
+/// The month names `%b` / `%B` render. Hard-coded English -- mongod does not
+/// consult a locale.
+const MONTH_ABBR: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+const MONTH_FULL: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// The ISO-8601 week-based year and week number for a civil date. ISO weeks
+/// start on Monday and week 1 is the one holding the first Thursday, so the
+/// first days of January can belong to the PREVIOUS ISO year (2021-01-03 is
+/// 2020-W53) and the last days of December to the next.
+fn iso_week(days: i64) -> (i64, i64) {
+    // Thursday of this week decides which year the week belongs to.
+    let weekday = (days + 3).rem_euclid(7); // Mon=0 .. Sun=6
+    let thursday = days - weekday + 3;
+    let (year, _, _) = civil_from_days(thursday);
+    let jan1 = days_from_civil(year, 1, 1);
+    ((year), (thursday - jan1) / 7 + 1)
+}
+
+/// `%U`: the week number with weeks starting on SUNDAY, week 1 beginning at the
+/// first Sunday of the year (days before it are week 00).
+///
+/// This is glibc's `(tm_yday + 7 - tm_wday) / 7`, which is what mongod inherits.
+/// An earlier version keyed off January 1st's weekday instead and was right for
+/// fifteen of sixteen probed dates -- 2012-12-31 (a Monday in a leap year that
+/// began on a Sunday) came out 52 where mongod says 53. Off-by-one week, once
+/// per several years, on dates nobody tests.
+fn sunday_week(days: i64, year: i64) -> i64 {
+    let day_of_year = days - days_from_civil(year, 1, 1); // 0-based
+    let weekday_sun0 = (days + 4).rem_euclid(7); // Sun=0 .. Sat=6
+    (day_of_year + 7 - weekday_sun0) / 7
 }
 
 fn render_date(millis: i64, fmt: &str) -> Result<String, Fallback> {
+    render_date_at(millis, fmt, 0)
+}
+
+/// `$dateToString`'s format language, which is NOT `strftime`. mongod accepts
+/// exactly `%b %d %j %m %u %w %z %B %G %H %L %M %S %U %V %Y %%` and refuses
+/// every other directive with Location18536 (probed 8.2.11, 2026-09-01 by
+/// walking the whole alphabet). `offset_ms` is the resolved timezone offset,
+/// which `%z` renders as `+HHMM` and `%Z` as the offset in MINUTES -- a bare
+/// integer, not the zone abbreviation the name suggests.
+fn render_date_at(millis: i64, fmt: &str, offset_ms: i64) -> Result<String, Fallback> {
     let days = millis.div_euclid(86_400_000);
     let ms_of_day = millis.rem_euclid(86_400_000);
     let (y, m, d) = civil_from_days(days);
@@ -2892,6 +2953,13 @@ fn render_date(millis: i64, fmt: &str) -> Result<String, Fallback> {
     let frac_ms = ms_of_day % 1000;
     let py_weekday = (days + 3).rem_euclid(7); // 1970-01-01 = Thursday(3); Mon=0..Sun=6
     let day_of_year = days - days_from_civil(y, 1, 1) + 1;
+    let (iso_y, iso_w) = iso_week(days);
+    let off_minutes = offset_ms / 60_000;
+    let (sign, abs_min) = if off_minutes < 0 {
+        ('-', -off_minutes)
+    } else {
+        ('+', off_minutes)
+    };
     let mut out = String::with_capacity(fmt.len());
     let mut chars = fmt.chars();
     while let Some(c) = chars.next() {
@@ -2910,8 +2978,23 @@ fn render_date(millis: i64, fmt: &str) -> Result<String, Fallback> {
             Some('j') => out.push_str(&format!("{day_of_year:03}")),
             Some('w') => out.push_str(&(((py_weekday + 1) % 7) + 1).to_string()),
             Some('u') => out.push_str(&(py_weekday + 1).to_string()),
+            Some('G') => out.push_str(&format!("{iso_y:04}")),
+            Some('V') => out.push_str(&format!("{iso_w:02}")),
+            Some('U') => out.push_str(&format!("{:02}", sunday_week(days, y))),
+            Some('b') => out.push_str(MONTH_ABBR[(m - 1) as usize]),
+            Some('B') => out.push_str(MONTH_FULL[(m - 1) as usize]),
+            Some('z') => out.push_str(&format!("{sign}{:02}{:02}", abs_min / 60, abs_min % 60)),
+            Some('Z') => out.push_str(&off_minutes.to_string()),
             Some('%') => out.push('%'),
-            _ => return Err(Fallback::Defer), // unknown directive -> Python strftime
+            other => {
+                return Err(Fallback::mongo(
+                    18536,
+                    format!(
+                        "Invalid format character '%{}' in format string",
+                        other.unwrap_or_default()
+                    ),
+                ));
+            }
         }
     }
     Ok(out)

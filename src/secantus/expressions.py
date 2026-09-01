@@ -3210,6 +3210,102 @@ def _op_date_from_string(arg: Any, ctx: _Ctx) -> Any:
     return parsed
 
 
+#: The month names `%b` / `%B` render. Hard-coded English: mongod does not
+#: consult a locale, and `strftime` does, so a machine with a non-English
+#: `LC_TIME` used to answer month names no mongod ever emits.
+_MONTH_ABBR = (
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+)
+_MONTH_FULL = (
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+)
+
+
+def _render_date_format(d: _dt.datetime, fmt: str) -> str:
+    """``$dateToString``'s format language, which is NOT ``strftime``.
+
+    This used to hand the format to Python's ``strftime`` after rewriting three
+    tokens. Three consequences, all probed against 8.2.11 (2026-09-01):
+
+    * ``strftime`` accepts directives mongod REFUSES. The full accepted set is
+      ``%b %d %j %m %u %w %z %B %G %H %L %M %S %U %V %Y %%`` and nothing else;
+      everything from ``%a`` to ``%Y``'s neighbours is Location18536. We
+      rendered ``%a`` as ``Fri`` where mongod raises, so a typo'd format
+      silently produced a wrong string instead of an error.
+    * ``%z`` and ``%Z`` came out EMPTY, because the datetime is naive unless a
+      timezone was asked for. mongod always has an offset: ``%z`` is ``+0000``
+      and ``%Z`` is the offset in MINUTES as a bare integer (``0``, ``330``,
+      ``-240``) -- not a zone abbreviation, which is what the name suggests.
+    * ``%b`` / ``%B`` were locale-dependent.
+    """
+    offset = d.utcoffset() or _dt.timedelta(0)
+    off_minutes = int(offset.total_seconds()) // 60
+    sign = "-" if off_minutes < 0 else "+"
+    iso_year, iso_week, _ = d.isocalendar()
+    fields = {
+        "Y": f"{d.year:04d}",
+        "m": f"{d.month:02d}",
+        "d": f"{d.day:02d}",
+        "H": f"{d.hour:02d}",
+        "M": f"{d.minute:02d}",
+        "S": f"{d.second:02d}",
+        "L": f"{d.microsecond // 1000:03d}",
+        "j": f"{d.timetuple().tm_yday:03d}",
+        # mongod numbers days 1-Sunday through 7-Saturday; Python's `weekday()`
+        # is 0-Monday through 6-Sunday.
+        "w": str(((d.weekday() + 1) % 7) + 1),
+        "u": str(d.isoweekday()),
+        "U": f"{int(d.strftime('%U')):02d}",
+        "G": f"{iso_year:04d}",
+        "V": f"{iso_week:02d}",
+        "b": _MONTH_ABBR[d.month - 1],
+        "B": _MONTH_FULL[d.month - 1],
+        "z": f"{sign}{abs(off_minutes) // 60:02d}{abs(off_minutes) % 60:02d}",
+        "Z": str(off_minutes),
+        "%": "%",
+    }
+    out: list[str] = []
+    i = 0
+    while i < len(fmt):
+        ch = fmt[i]
+        if ch != "%":
+            out.append(ch)
+            i += 1
+            continue
+        directive = fmt[i + 1] if i + 1 < len(fmt) else ""
+        if directive not in fields:
+            raise ExpressionError(
+                f"Invalid format character '%{directive}' in format string",
+                code=18536,
+                code_name="Location18536",
+            )
+        out.append(fields[directive])
+        i += 2
+    return "".join(out)
+
+
 def _op_date_to_string(arg: Any, ctx: _Ctx) -> Any:
     if not isinstance(arg, Mapping):
         raise ExpressionError("$dateToString requires {date, format}")
@@ -3232,25 +3328,7 @@ def _op_date_to_string(arg: Any, ctx: _Ctx) -> Any:
         # Naive input is treated as UTC, matching MongoDB's BSON Date semantics.
         d_aware = d if d.tzinfo is not None else d.replace(tzinfo=_dt.timezone.utc)
         d = d_aware.astimezone(tz)
-    out = fmt
-    # Pre-process tokens whose mongod semantics differ from Python's
-    # strftime, then hand the rest off to strftime untouched.
-    # ``%L`` — 3-digit milliseconds (mongod-only token).
-    if "%L" in out:
-        out = out.replace("%L", f"{d.microsecond // 1000:03d}")
-    # ``%w`` — mongod numbers days 1-Sunday through 7-Saturday;
-    # Python's strftime numbers them 0-Sunday through 6-Saturday.
-    # Substitute the resolved digit directly so strftime never sees
-    # the token. Formula: ((weekday() + 1) % 7) + 1 maps
-    # Mon..Sun (0..6) → 2..7,1 i.e. mongod's Sunday=1 numbering.
-    if "%w" in out:
-        out = out.replace("%w", str(((d.weekday() + 1) % 7) + 1))
-    # ``%G`` (ISO year), ``%V`` (ISO week 1-53), ``%j`` (day of year
-    # 001-366), ``%U`` (Sunday-start week 00-53), ``%u`` (ISO weekday
-    # 1-Mon … 7-Sun), ``%Y``, ``%m``, ``%d``, ``%H``, ``%M``, ``%S``,
-    # ``%z``, ``%Z``, ``%%`` — all match mongod's tokens and pass
-    # straight through to Python's strftime.
-    return d.strftime(out)
+    return _render_date_format(d, fmt)
 
 
 def _op_array_elem_at(arg: Any, ctx: _Ctx) -> Any:
