@@ -12,6 +12,9 @@
 //! refusal, and the two-server model has no third option.
 
 use bson::{doc, Bson, Document};
+use std::str::FromStr;
+
+use bson::Decimal128;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use pg_query::protobuf::node::Node as N;
 use pg_query::protobuf::{
@@ -370,6 +373,19 @@ pub fn plan_with_params(
     }
 }
 
+/// The declared type of a `TypeName`, including its array brackets.
+///
+/// libpg_query keeps `int[]` as the name `int4` plus a non-empty
+/// `array_bounds`, so reading only the name loses the array-ness entirely.
+fn type_name_of(t: &pg_query::protobuf::TypeName) -> String {
+    let base = type_name(&t.names);
+    if t.array_bounds.is_empty() {
+        base
+    } else {
+        format!("{base}[]")
+    }
+}
+
 fn type_name(names: &[pg_query::protobuf::Node]) -> String {
     // libpg_query qualifies built-ins as pg_catalog.<name>; the catalog stores
     // the bare PostgreSQL name (`int4`, `text`), matching the Python server.
@@ -394,11 +410,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     for el in &c.table_elts {
         match el.node.as_ref() {
             Some(N::ColumnDef(cd)) => {
-                let ty = cd
-                    .type_name
-                    .as_ref()
-                    .map(|t| type_name(&t.names))
-                    .unwrap_or_default();
+                let ty = cd.type_name.as_ref().map(type_name_of).unwrap_or_default();
                 let pk = cd.constraints.iter().any(|c| {
                     matches!(c.node.as_ref(), Some(N::Constraint(k))
                         if k.contype == pg_query::protobuf::ConstrType::ConstrPrimary as i32)
@@ -894,8 +906,9 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
         Some(N::TypeCast(tc)) => tc
             .type_name
             .as_ref()
-            .map(|n| type_name(&n.names))
+            .map(type_name_of)
             .unwrap_or_else(|| inferred_type(value).to_string()),
+        Some(N::AArrayExpr(_)) => inferred_type(value).to_string(),
         Some(N::AExpr(e)) => {
             let op = operator_name(e).unwrap_or("");
             match op {
@@ -923,6 +936,15 @@ fn inferred_type(v: &Bson) -> &'static str {
         Bson::Int32(_) => "int4",
         Bson::Int64(_) => "int8",
         Bson::Double(_) => "float8",
+        Bson::Decimal128(_) => "numeric",
+        Bson::Array(items) => match items.first() {
+            Some(Bson::Int32(_)) | None => "int4[]",
+            Some(Bson::Int64(_)) => "int8[]",
+            Some(Bson::Double(_)) => "float8[]",
+            Some(Bson::Decimal128(_)) => "numeric[]",
+            Some(Bson::Boolean(_)) => "bool[]",
+            _ => "text[]",
+        },
         Bson::Boolean(_) => "bool",
         _ => "text",
     }
@@ -979,7 +1001,13 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 let t = inferred_type(&v).to_string();
                 (name, ConstCol::Value(v), t)
             }
-            Some(node @ (N::AConst(_) | N::ParamRef(_) | N::TypeCast(_) | N::AExpr(_))) => {
+            Some(
+                node @ (N::AConst(_)
+                | N::ParamRef(_)
+                | N::TypeCast(_)
+                | N::AExpr(_)
+                | N::AArrayExpr(_)),
+            ) => {
                 let v = const_value(rt.val.as_ref().expect("checked"), params)?;
                 let t = static_type(rt.val.as_ref().expect("checked"), &v);
                 let _ = node;
@@ -1180,6 +1208,156 @@ pub fn render_timestamp(micros: i64) -> String {
     }
 }
 
+/// Parse a `numeric` literal.
+///
+/// PostgreSQL's `numeric` carries its SCALE as part of the value: `1.50` is not
+/// `1.5`, and `SELECT 1.50::numeric::text` answers `'1.50'`. BSON's
+/// `Decimal128` preserves scale the same way, so the two agree without any
+/// extra bookkeeping (`1.50` -> `1.50`, `2.5000000000000000` round-trips).
+///
+/// Decimal128 holds 34 significant digits; PostgreSQL's `numeric` is arbitrary
+/// precision. A value that will not fit is REFUSED rather than silently
+/// rounded -- the same line drawn everywhere else here, because a quietly
+/// rounded number is a wrong answer while an error is merely a missing feature.
+fn parse_numeric(text: &str) -> Result<Decimal128> {
+    let t = text.trim();
+    Decimal128::from_str(t).map_err(|_| {
+        // Distinguish "too big for us" from "not a number at all": the first is
+        // a real PostgreSQL value we cannot represent, the second is the
+        // client's mistake.
+        let numeric_shape = {
+            let body = t.strip_prefix(['+', '-']).unwrap_or(t);
+            !body.is_empty()
+                && body.chars().all(|c| {
+                    c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-'
+                })
+                && body.chars().any(|c| c.is_ascii_digit())
+        };
+        if numeric_shape {
+            Error::NumericOutOfRange(format!(
+                "numeric value out of range: \"{t}\" exceeds the 34 significant \
+                 digits this server stores"
+            ))
+        } else {
+            Error::InvalidText(format!("invalid input syntax for type numeric: \"{t}\""))
+        }
+    })
+}
+
+/// Render one array element as PostgreSQL renders it inside `{...}`.
+///
+/// Quoting is not cosmetic: an element containing a comma, brace, quote,
+/// backslash or whitespace -- or one that is empty, or that spells `NULL` --
+/// must be quoted, or reading the array back would split it in the wrong place
+/// or turn a literal `"NULL"` string into a null.
+pub fn render_array_element_text(v: &Bson) -> String {
+    render_array_element(v)
+}
+
+fn render_array_element(v: &Bson) -> String {
+    let raw = match v {
+        Bson::Null => return "NULL".to_string(),
+        Bson::String(s) => s.clone(),
+        Bson::Int32(i) => return i.to_string(),
+        Bson::Int64(i) => return i.to_string(),
+        Bson::Double(d) => return d.to_string(),
+        Bson::Decimal128(d) => return d.to_string(),
+        Bson::Boolean(b) => return (if *b { "t" } else { "f" }).to_string(),
+        Bson::Array(items) => return render_array(items),
+        other => format!("{other:?}"),
+    };
+    let needs_quotes = raw.is_empty()
+        || raw.eq_ignore_ascii_case("null")
+        || raw
+            .chars()
+            .any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\') || c.is_whitespace());
+    if needs_quotes {
+        let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        raw
+    }
+}
+
+/// An array as PostgreSQL's text form: `{1,2,3}`, `{{1,2},{3,4}}`, `{}`.
+pub fn render_array(items: &[Bson]) -> String {
+    let inner: Vec<String> = items.iter().map(render_array_element).collect();
+    format!("{{{}}}", inner.join(","))
+}
+
+/// Parse PostgreSQL's array text form into elements, coercing each to
+/// `element_type`.
+///
+/// Handles quoting and nesting; a malformed literal is `22P02`, matching what
+/// PostgreSQL answers for text that is not a valid array.
+fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
+    let t = text.trim();
+    if !t.starts_with('{') || !t.ends_with('}') {
+        return Err(Error::InvalidText(format!(
+            "malformed array literal: \"{t}\""
+        )));
+    }
+    let body = &t[1..t.len() - 1];
+    if body.trim().is_empty() {
+        return Ok(Bson::Array(Vec::new()));
+    }
+
+    let mut items: Vec<Bson> = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    let mut was_quoted = false;
+    for c in body.chars() {
+        if escaped {
+            cur.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if quoted => escaped = true,
+            '"' => {
+                quoted = !quoted;
+                was_quoted = true;
+            }
+            '{' if !quoted => {
+                depth += 1;
+                cur.push(c);
+            }
+            '}' if !quoted => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' if !quoted && depth == 0 => {
+                items.push(array_element(&cur, was_quoted, element_type)?);
+                cur.clear();
+                was_quoted = false;
+            }
+            _ => cur.push(c),
+        }
+    }
+    if quoted || depth != 0 {
+        return Err(Error::InvalidText(format!(
+            "malformed array literal: \"{t}\""
+        )));
+    }
+    items.push(array_element(&cur, was_quoted, element_type)?);
+    Ok(Bson::Array(items))
+}
+
+fn array_element(raw: &str, was_quoted: bool, element_type: &str) -> Result<Bson> {
+    let trimmed = raw.trim();
+    // An UNQUOTED `NULL` is the null element; a quoted one is the string.
+    if !was_quoted && trimmed.eq_ignore_ascii_case("null") {
+        return Ok(Bson::Null);
+    }
+    if trimmed.starts_with('{') {
+        return parse_array(trimmed, element_type);
+    }
+    let text = if was_quoted { raw } else { trimmed };
+    cast_value(Bson::String(text.to_string()), element_type)
+}
+
 fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     // A NULL survives every cast; only its declared type changes.
     if value == Bson::Null {
@@ -1210,6 +1388,9 @@ fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             }
         }
         Bson::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
+        // Decimal128's own rendering keeps the scale (`1.50`, not `1.5`).
+        Bson::Decimal128(d) => d.to_string(),
+        Bson::Array(items) => render_array(items),
         other => format!("{other:?}"),
     };
     let bad = |want: &str, v: &Bson| {
@@ -1244,7 +1425,30 @@ fn cast_value(value: Bson, target: &str) -> Result<Bson> {
                 .map_err(|_| bad("bigint", &value)),
             _ => Err(bad("bigint", &value)),
         },
-        "float4" | "float8" | "numeric" | "real" | "double" => match &value {
+        // `numeric` is its own type, not a float: it keeps scale and does not
+        // round. Reported as oid 1700, which is what a client reads to decide
+        // whether it gets a Decimal or a float.
+        t if t.ends_with("[]") => {
+            let element = t.trim_end_matches("[]");
+            match &value {
+                Bson::Array(items) => Ok(Bson::Array(
+                    items
+                        .iter()
+                        .map(|v| cast_value(v.clone(), element))
+                        .collect::<Result<Vec<_>>>()?,
+                )),
+                Bson::String(text) => parse_array(text, element),
+                other => Err(Error::InvalidText(format!(
+                    "cannot cast {} to {t}",
+                    inferred_type(other)
+                ))),
+            }
+        }
+        "numeric" | "decimal" => match &value {
+            Bson::Decimal128(_) => Ok(value),
+            other => Ok(Bson::Decimal128(parse_numeric(&as_text(other))?)),
+        },
+        "float4" | "float8" | "real" | "double" => match &value {
             Bson::Int32(i) => Ok(Bson::Double(f64::from(*i))),
             Bson::Int64(i) => Ok(Bson::Double(*i as f64)),
             Bson::Double(_) => Ok(value),
@@ -1405,6 +1609,27 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
 fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Bson::String(x), Bson::String(y)) => Some(x.cmp(y)),
+        // PostgreSQL orders arrays element by element, and when one is a
+        // prefix of the other the shorter one sorts first.
+        (Bson::Array(x), Bson::Array(y)) => {
+            for (ex, ey) in x.iter().zip(y.iter()) {
+                // Inside an array, PostgreSQL compares NULLs directly rather
+                // than through scalar `=`: two NULLs are equal, and a NULL
+                // sorts after any non-NULL. (Probed, not assumed - scalar
+                // `NULL = NULL` is NULL, so the array rule is the surprise.)
+                match (ex == &Bson::Null, ey == &Bson::Null) {
+                    (true, true) => continue,
+                    (true, false) => return Some(std::cmp::Ordering::Greater),
+                    (false, true) => return Some(std::cmp::Ordering::Less),
+                    (false, false) => {}
+                }
+                match compare_constants(ex, ey)? {
+                    std::cmp::Ordering::Equal => continue,
+                    other => return Some(other),
+                }
+            }
+            Some(x.len().cmp(&y.len()))
+        }
         (Bson::Boolean(x), Bson::Boolean(y)) => Some(x.cmp(y)),
         _ => {
             let f = |v: &Bson| match v {
@@ -1728,12 +1953,16 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             .as_ref()
             .ok_or_else(|| Error::Parse("cast with no operand".into()))?;
         let value = const_value(arg, params)?;
-        let target = tc
-            .type_name
-            .as_ref()
-            .map(|t| type_name(&t.names))
-            .unwrap_or_default();
+        let target = tc.type_name.as_ref().map(type_name_of).unwrap_or_default();
         return cast_value(value, &target);
+    }
+    if let Some(N::AArrayExpr(a)) = node.node.as_ref() {
+        let items = a
+            .elements
+            .iter()
+            .map(|e| const_value(e, params))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Bson::Array(items));
     }
     if let Some(N::AExpr(e)) = node.node.as_ref() {
         if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp) {
@@ -1775,11 +2004,10 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             match c.val.as_ref() {
                 Some(a_const::Val::Ival(i)) => Ok(Bson::Int32(i.ival)),
                 Some(a_const::Val::Sval(s)) => Ok(Bson::String(s.sval.clone())),
-                Some(a_const::Val::Fval(f)) => f
-                    .fval
-                    .parse::<f64>()
-                    .map(Bson::Double)
-                    .map_err(|_| Error::Unsupported("this numeric literal".into())),
+                // PostgreSQL types a decimal LITERAL as `numeric`, not
+                // float8: `SELECT 1.5` answers oid 1700. Treating it as a
+                // double gave the right value under the wrong type.
+                Some(a_const::Val::Fval(f)) => Ok(Bson::Decimal128(parse_numeric(&f.fval)?)),
                 Some(a_const::Val::Boolval(b)) => Ok(Bson::Boolean(b.boolval)),
                 _ => Err(Error::Unsupported("this constant".into())),
             }

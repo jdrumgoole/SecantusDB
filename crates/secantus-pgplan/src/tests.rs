@@ -747,3 +747,137 @@ fn bad_dates_distinguish_22007_from_22008() {
         other => panic!("wrong statement: {other:?}"),
     }
 }
+
+/// `numeric` keeps its SCALE, which is part of the value rather than
+/// formatting: PostgreSQL answers `'1.50'`, not `'1.5'`.
+#[test]
+fn numeric_preserves_scale() {
+    for (sql, want) in [
+        ("SELECT 1.5", "1.5"),
+        ("SELECT 1.50", "1.50"),
+        ("SELECT '0.1'::numeric", "0.1"),
+        ("SELECT '-0.30'::numeric", "-0.30"),
+        ("SELECT '2.5000000000000000'::numeric", "2.5000000000000000"),
+    ] {
+        match plan_ok(sql) {
+            Statement::SelectConstant(sc) => {
+                let ConstCol::Value(Bson::Decimal128(d)) = &sc.columns[0].1 else {
+                    panic!("{sql} should be a Decimal128, got {:?}", sc.columns[0].1);
+                };
+                assert_eq!(d.to_string(), want, "for {sql}");
+                // A decimal literal is `numeric` in PostgreSQL, not float8.
+                assert_eq!(sc.columns[0].2, "numeric", "for {sql}");
+            }
+            other => panic!("wrong statement for {sql}: {other:?}"),
+        }
+    }
+}
+
+/// Beyond 34 significant digits we REFUSE rather than round.
+///
+/// PostgreSQL's `numeric` is arbitrary precision and Decimal128 is not, so
+/// there are values PostgreSQL accepts that this server cannot store. Quietly
+/// rounding one would be a wrong answer; an error is a missing feature.
+#[test]
+fn numeric_refuses_rather_than_rounds() {
+    let err = plan(
+        "SELECT '1.2345678901234567890123456789012345'::numeric",
+        &lookup,
+    )
+    .expect_err("35 significant digits");
+    assert_eq!(err.sqlstate(), "22003"); // numeric_value_out_of_range
+                                         // Not a number at all is a different code.
+    let err = plan("SELECT 'x'::numeric", &lookup).expect_err("not numeric");
+    assert_eq!(err.sqlstate(), "22P02");
+}
+
+/// Array text form: `{...}`, nested, with the quoting PostgreSQL uses.
+///
+/// An element is quoted only when leaving it bare would change how the array
+/// reads back — a comma, a brace, a space, a quote, a backslash, or the bare
+/// word NULL (which would otherwise become a real NULL).
+#[test]
+fn array_renders_like_postgres() {
+    for (sql, want) in [
+        ("SELECT ARRAY[1,2,3]::int[]", "{1,2,3}"),
+        ("SELECT '{}'::int[]", "{}"),
+        ("SELECT '{{1,2},{3,4}}'::int[]", "{{1,2},{3,4}}"),
+        ("SELECT ARRAY['a','b']::text[]", "{a,b}"),
+        ("SELECT ARRAY['a b']::text[]", "{\"a b\"}"),
+        ("SELECT ARRAY['a,b']::text[]", "{\"a,b\"}"),
+        ("SELECT ARRAY['NULL']::text[]", "{\"NULL\"}"),
+        ("SELECT '{a,NULL,b}'::text[]", "{a,NULL,b}"),
+    ] {
+        match plan_ok(sql) {
+            Statement::SelectConstant(sc) => {
+                let ConstCol::Value(v) = &sc.columns[0].1 else {
+                    panic!("{sql} should be a value, got {:?}", sc.columns[0].1);
+                };
+                let Bson::Array(items) = v else {
+                    panic!("{sql} should be an Array, got {v:?}");
+                };
+                assert_eq!(render_array(items), want, "for {sql}");
+            }
+            other => panic!("wrong statement for {sql}: {other:?}"),
+        }
+    }
+}
+
+/// Inside an array, NULL does NOT behave the way it does in scalar SQL.
+///
+/// Scalar `NULL = NULL` is NULL, so the obvious implementation — compare
+/// elementwise through the scalar path — gets every one of these wrong. All
+/// four rules were probed against a live PostgreSQL 14 rather than reasoned
+/// out; see the matching cases in `tests/test_rust_pgserver_differential.py`.
+#[test]
+fn array_comparison_follows_postgres_null_rules() {
+    for (sql, want) in [
+        // Two NULLs are EQUAL inside an array.
+        ("SELECT ARRAY[NULL]::text[] = ARRAY[NULL]::text[]", true),
+        // A NULL sorts AFTER any non-NULL element.
+        (
+            "SELECT ARRAY['a',NULL]::text[] > ARRAY['a','z']::text[]",
+            true,
+        ),
+        // A common prefix makes the SHORTER array the smaller one.
+        ("SELECT ARRAY['a']::text[] < ARRAY['a','b']::text[]", true),
+        ("SELECT '{}'::int[] < ARRAY[1]::int[]", true),
+        // Ordinary elementwise comparison, for contrast.
+        ("SELECT ARRAY[1,2]::int[] = ARRAY[1,2]::int[]", true),
+        ("SELECT ARRAY[1,2]::int[] = ARRAY[1,3]::int[]", false),
+        ("SELECT ARRAY[1,2]::int[] < ARRAY[1,3]::int[]", true),
+        // The first differing element decides, not the length.
+        ("SELECT ARRAY[2]::int[] > ARRAY[1,9,9]::int[]", true),
+        ("SELECT ARRAY[1,2,3]::int[] <> ARRAY[1,2]::int[]", true),
+    ] {
+        match plan_ok(sql) {
+            Statement::SelectConstant(sc) => {
+                assert_eq!(
+                    sc.columns[0].1,
+                    ConstCol::Value(Bson::Boolean(want)),
+                    "for {sql}"
+                );
+            }
+            other => panic!("wrong statement for {sql}: {other:?}"),
+        }
+    }
+}
+
+/// `int[]` is a DIFFERENT declared type from `int`, and losing the brackets is
+/// silent: libpg_query keeps the array-ness in `array_bounds`, not in the type
+/// name, so reading only the name types an array column as its element type.
+///
+/// That mistake reads as harmless — until a cast target loses its brackets
+/// too, at which point `%s::text[] = %s::text[]` degrades to comparing two
+/// rendered STRINGS. That happens to give the right answer often enough to
+/// look fine, which is why this is pinned here.
+#[test]
+fn array_type_keeps_its_brackets() {
+    match plan_ok("CREATE TABLE t (id int PRIMARY KEY, xs int[], names text[])") {
+        Statement::CreateTable(ct) => {
+            let types: Vec<&str> = ct.columns.iter().map(|c| c.pg_type.as_str()).collect();
+            assert_eq!(types, vec!["int4", "int4[]", "text[]"]);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}

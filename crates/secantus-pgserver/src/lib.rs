@@ -33,8 +33,9 @@ use pgwire::messages::response::CommandComplete;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use secantus_pgcatalog::{TableDef, CATALOG_COLLECTION};
 use secantus_pgplan::{
-    companion_field, plan_with_params, render_timestamp, AggFunc, AggItem, ConstCol,
-    Error as PlanError, Nulls, OrderKey, OutputCol, Statement, TransactionControl,
+    companion_field, plan_with_params, render_array_element_text, render_timestamp, AggFunc,
+    AggItem, ConstCol, Error as PlanError, Nulls, OrderKey, OutputCol, Statement,
+    TransactionControl,
 };
 use secantus_storage::{Storage, UserTransactionHandle};
 
@@ -221,6 +222,17 @@ fn wire_type(pg_type: &str) -> Type {
         "date" => Type::DATE,
         "time" => Type::TIME,
         "timestamp" => Type::TIMESTAMP,
+        "numeric" | "decimal" => Type::NUMERIC,
+        // Array oids are their own types (int4[] is 1007, not 23).
+        "int4[]" | "int[]" | "integer[]" => Type::INT4_ARRAY,
+        "int8[]" | "bigint[]" => Type::INT8_ARRAY,
+        "int2[]" | "smallint[]" => Type::INT2_ARRAY,
+        "float8[]" | "double[]" => Type::FLOAT8_ARRAY,
+        "float4[]" | "real[]" => Type::FLOAT4_ARRAY,
+        "bool[]" | "boolean[]" => Type::BOOL_ARRAY,
+        "numeric[]" | "decimal[]" => Type::NUMERIC_ARRAY,
+        "text[]" => Type::TEXT_ARRAY,
+        "varchar[]" => Type::VARCHAR_ARRAY,
         // Everything else renders as text for now; P4 owns the real type map.
         _ => Type::VARCHAR,
     }
@@ -883,6 +895,58 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
         Some(Bson::Double(x)) => enc.encode_field(&Some(*x)),
         Some(Bson::Boolean(x)) => enc.encode_field(&Some(*x)),
         Some(Bson::String(x)) => enc.encode_field(&Some(x.as_str())),
+        // Decimal128's rendering already carries the scale (`1.50`, not `1.5`),
+        // which is part of a PostgreSQL `numeric` value rather than formatting.
+        Some(Bson::Decimal128(x)) => enc.encode_field(&Some(x.to_string().as_str())),
+        // An array must be handed over as a TYPED vector, not as pre-rendered
+        // text: `encode_field` encodes against the column's declared type, so
+        // giving it a `&str` for an `int4[]` field wraps the whole literal as a
+        // single element (`{1,2,3}` came out as `"{1,2,3}"`).
+        // A nested array is REFUSED rather than flattened. rust-postgres
+        // encodes only one dimension, so the typed path below silently turned
+        // `{{1,2},{3,4}}` into two elements whose text was `{1,2}` and
+        // `{3,4}` -- a wrong answer that a client cannot tell from a real one.
+        // Guessing the client's format code to smuggle the literal through as
+        // text would be the same trade in a less visible place.
+        Some(Bson::Array(items)) if items.iter().any(|x| matches!(x, Bson::Array(_))) => {
+            Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "0A000".to_owned(),
+                "multidimensional arrays are not supported yet".to_owned(),
+            ))))
+        }
+        Some(Bson::Array(items)) => match items.first() {
+            Some(Bson::Int32(_)) => {
+                let v: Vec<Option<i32>> = items.iter().map(|x| x.as_i32()).collect();
+                enc.encode_field(&v)
+            }
+            Some(Bson::Int64(_)) => {
+                let v: Vec<Option<i64>> = items.iter().map(|x| x.as_i64()).collect();
+                enc.encode_field(&v)
+            }
+            Some(Bson::Double(_)) => {
+                let v: Vec<Option<f64>> = items.iter().map(|x| x.as_f64()).collect();
+                enc.encode_field(&v)
+            }
+            Some(Bson::Boolean(_)) => {
+                let v: Vec<Option<bool>> = items.iter().map(|x| x.as_bool()).collect();
+                enc.encode_field(&v)
+            }
+            // Text, decimals and an EMPTY array all go as strings; an empty
+            // one has no element to read a type from and renders as `{}`
+            // whatever the column type is.
+            _ => {
+                let v: Vec<Option<String>> = items
+                    .iter()
+                    .map(|x| match x {
+                        Bson::Null => None,
+                        Bson::String(t) => Some(t.clone()),
+                        other => Some(render_array_element_text(other)),
+                    })
+                    .collect();
+                enc.encode_field(&v)
+            }
+        },
         _ => enc.encode_field(&None::<i32>),
     }
 }
