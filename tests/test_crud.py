@@ -3515,11 +3515,29 @@ def test_graph_lookup_max_depth(client: MongoClient) -> None:
 
 
 def test_documents_stage(client: MongoClient) -> None:
+    """`$documents` is a COLLECTION-LESS stage: `db.aggregate`, not
+    `db.coll.aggregate`.
+
+    This test used to run it against a collection, with a comment saying it
+    "need[ed] some collection to attach to" -- a workaround for our own
+    behaviour, not mongod's. mongod refuses that form outright with
+    InvalidNamespace, before it even looks at the argument (probed 8.2.11).
+    """
     db = client["documents_db"]
-    db["any"].insert_one({"x": 1})  # need some collection to attach to
     pipeline = [{"$documents": [{"_id": 1, "n": 10}, {"_id": 2, "n": 20}]}]
-    out = list(db["any"].aggregate(pipeline))
+    out = list(db.aggregate(pipeline))
     assert sorted(d["_id"] for d in out) == [1, 2]
+
+
+def test_documents_stage_refuses_a_collection(client: MongoClient) -> None:
+    from pymongo.errors import OperationFailure
+
+    db = client["documents_db2"]
+    db["any"].insert_one({"x": 1})
+    with pytest.raises(OperationFailure) as exc:
+        list(db["any"].aggregate([{"$documents": [{"_id": 1}]}]))
+    assert exc.value.code == 73
+    assert "'$documents' can only be run with {aggregate: 1}" in str(exc.value)
 
 
 def test_coll_stats_aggregation_stage(client: MongoClient) -> None:

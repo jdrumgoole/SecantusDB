@@ -3167,15 +3167,35 @@ def _enforce_target_validator(
 def _stage_out(spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext) -> list[dict[str, Any]]:
     if ctx.storage is None:
         raise AggregateError("$out requires storage context")
+    # mongod's four distinct refusals, probed 8.2.11 (2026-09-01). An EMPTY
+    # string used to be accepted and silently wrote to a nameless collection.
     if isinstance(spec, str):
+        if not spec:
+            raise AggregateError(
+                f"Invalid $out target namespace, {ctx.db_name}",
+                code=73,
+                code_name="InvalidNamespace",
+            )
         target_db, target_coll = ctx.db_name, spec
     elif isinstance(spec, Mapping):
-        target_db = spec.get("db", ctx.db_name)
-        target_coll = spec.get("coll")
+        for key in spec:
+            if key not in ("db", "coll"):
+                raise AggregateError(f"BSON field '$out.{key}' is an unknown field.", code=40415)
+        # `coll` is reported missing before `db`, whichever is absent.
+        for key in ("coll", "db"):
+            if key not in spec:
+                raise AggregateError(
+                    f"BSON field '$out.{key}' is missing but a required field", code=40414
+                )
+        target_db = spec["db"]
+        target_coll = spec["coll"]
         if not isinstance(target_coll, str):
             raise AggregateError("$out requires a coll string")
     else:
-        raise AggregateError("$out requires a string or {db, coll}")
+        raise AggregateError(
+            f"$out only supports a string or object argument, but found {_bson_type_name(spec)}",
+            code=16990,
+        )
     _enforce_target_validator(ctx, target_db, target_coll, docs)
     ctx.storage.drop_collection(target_db, target_coll)
     if docs:
@@ -3232,6 +3252,11 @@ def _validate_on_field_index(
     )
 
 
+#: The fields `$merge` accepts. `$out` takes `{db, coll}`; `$merge` takes
+#: `{into: ...}` and rejects `db` / `coll` at the top level -- probed 8.2.11.
+_MERGE_SPEC_FIELDS = frozenset({"into", "on", "let", "whenMatched", "whenNotMatched"})
+
+
 def _stage_merge(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -3239,13 +3264,31 @@ def _stage_merge(
         raise AggregateError("$merge requires storage context")
     let_spec: Mapping[str, Any] = {}
     if isinstance(spec, str):
+        # An EMPTY string used to be accepted and merged into a nameless
+        # collection. Note the message shape differs from `$out`'s -- mongod
+        # quotes the namespace here and does not there.
+        if not spec:
+            raise AggregateError(
+                f"Invalid $merge target namespace: '{ctx.db_name}'",
+                code=73,
+                code_name="InvalidNamespace",
+            )
         target_db, target_coll = ctx.db_name, spec
         on_fields: list[str] = ["_id"]
         when_matched: Any = "merge"
         when_not_matched: str = "insert"
     elif isinstance(spec, Mapping):
+        for key in spec:
+            if key not in _MERGE_SPEC_FIELDS:
+                raise AggregateError(f"BSON field '$merge.{key}' is an unknown field.", code=40415)
+        if "into" not in spec:
+            raise AggregateError(
+                "BSON field '$merge.into' is missing but a required field", code=40414
+            )
         into = spec.get("into")
         if isinstance(into, str):
+            if not into:
+                raise AggregateError("$merge 'into' field cannot be an empty string", code=5786800)
             target_db, target_coll = ctx.db_name, into
         elif isinstance(into, Mapping):
             target_db = into.get("db", ctx.db_name)
@@ -3262,7 +3305,10 @@ def _stage_merge(
         if not isinstance(let_spec, Mapping):
             raise AggregateError("$merge let must be an object")
     else:
-        raise AggregateError("$merge requires a string or document spec")
+        raise AggregateError(
+            f"$merge requires a string or object argument, but found {_bson_type_name(spec)}",
+            code=14,
+        )
 
     if isinstance(when_matched, str) and when_matched not in _VALID_WHEN_MATCHED_STRINGS:
         raise AggregateError(
@@ -4459,13 +4505,34 @@ def _stage_change_stream_split_large_event(
 def _stage_documents(
     spec: Any, _docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
+    # The NAMESPACE check comes first, before the argument is looked at at all:
+    # `$documents` is only legal in a collection-less aggregate (`aggregate: 1`),
+    # and mongod answers 73 for every argument when it is not. This ran happily
+    # against a collection and reported an argument error instead (probed
+    # 8.2.11, 2026-09-01).
+    if ctx.coll_name:
+        raise AggregateError(
+            "'$documents' can only be run with {aggregate: 1}",
+            code=73,
+            code_name="InvalidNamespace",
+        )
     if not isinstance(spec, list):
-        raise AggregateError("$documents requires an array of documents")
+        raise AggregateError(
+            f"error during aggregation :: caused by :: $documents' array argument "
+            f"must be an array, but found type: {_bson_type_name(spec)}",
+            code=5858203,
+            exec_error=True,
+        )
     out: list[dict[str, Any]] = []
     for entry in spec:
         evaluated = evaluate(entry, {}, ctx.vars)
         if not isinstance(evaluated, Mapping):
-            raise AggregateError("$documents entries must evaluate to documents")
+            raise AggregateError(
+                f"$documents entries must be an object, but found type: "
+                f"{_bson_type_name(evaluated)}",
+                code=40228,
+                exec_error=True,
+            )
         out.append(dict(evaluated))
     return out
 
