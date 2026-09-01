@@ -5165,6 +5165,43 @@ def _agg_arg_to_expr(node: exp.Expression, table: TableDef) -> Any:
         return {"$multiply": [-1, _agg_arg_to_expr(node.this, table)]}
     if isinstance(node, (exp.Literal, exp.Boolean, exp.Null, exp.Neg)):
         return {"$literal": _literal(node)}
+    # Comparison and boolean connectives — what `bool_and(n > 0)` needs. Mongo's
+    # comparison operators return a BOOLEAN, which is exactly the aggregate's
+    # input; without these the argument could not be lowered at all.
+    _cmp_ops = {
+        exp.EQ: "$eq",
+        exp.NEQ: "$ne",
+        exp.GT: "$gt",
+        exp.GTE: "$gte",
+        exp.LT: "$lt",
+        exp.LTE: "$lte",
+    }
+    cmp_op = _cmp_ops.get(type(node))
+    if cmp_op is not None and node.expression is not None:
+        left = _agg_arg_to_expr(node.this, table)
+        right = _agg_arg_to_expr(node.expression, table)
+        # SQL three-valued logic: a comparison with a NULL operand is NULL, not
+        # false, and the bool aggregates SKIP nulls. Mongo's `$gt` would answer
+        # false, which would turn `bool_and` from true into false.
+        null_operand = {"$or": [{"$eq": [left, None]}, {"$eq": [right, None]}]}
+        return {"$cond": [null_operand, None, {cmp_op: [left, right]}]}
+    if isinstance(node, exp.Not):
+        inner = _agg_arg_to_expr(node.this, table)
+        return {"$cond": [{"$eq": [inner, None]}, None, {"$not": [inner]}]}
+    if isinstance(node, exp.Case):
+        # `sum(CASE WHEN … THEN … ELSE … END)` — the counting idiom. Lowered to
+        # nested `$cond`s, innermost default being the ELSE (or NULL).
+        default = node.args.get("default")
+        out: Any = _agg_arg_to_expr(default, table) if default is not None else None
+        for cond in reversed(node.args.get("ifs") or []):
+            out = {
+                "$cond": [
+                    _agg_arg_to_expr(cond.this, table),
+                    _agg_arg_to_expr(cond.args["true"], table),
+                    out,
+                ]
+            }
+        return out
     _arith_ops = {
         exp.Add: "$add",
         exp.Sub: "$subtract",
@@ -5191,7 +5228,11 @@ def _agg_arg_to_expr(node: exp.Expression, table: TableDef) -> Any:
         "pg_get_expr",
     ):
         return {"$literal": None}
-    raise errors.feature_not_supported(f"unsupported array_agg argument: {node.sql()}")
+    # Not only array_agg reaches here — sum / min / max / avg / bool_and lower
+    # their expression arguments through this helper too, so naming array_agg
+    # sent the reader to the wrong function ("unsupported array_agg argument"
+    # for a `sum(CASE …)` call).
+    raise errors.feature_not_supported(f"unsupported aggregate argument: {node.sql()}")
 
 
 def select_needs_pipeline(stmt: exp.Select) -> bool:
@@ -6161,11 +6202,17 @@ def _accumulator(
         col is None
         and arg_node is not None
         and not isinstance(arg_node, exp.Star)
-        and func in ("count", "sum", "avg", "min", "max")
+        and func in ("count", "sum", "avg", "min", "max", "bool_and", "bool_or")
     ):
         # An expression argument (``SUM(- 83)``, ``MAX(col0 + 1)``) lowers to a
         # Mongo aggregation expression (_agg_arg_to_expr raises 0A000 for
         # shapes it can't lower).
+        #
+        # `bool_and` / `bool_or` were NOT in this list, so a comparison
+        # argument fell through to the field-path branch below, arrived with
+        # `field=None`, and the accumulator body became literally `None` —
+        # `bool_and(n > 0)` answered NULL where PG says `t`, SILENTLY. Over a
+        # bare boolean column it was always correct, which is what hid it.
         body = _agg_arg_to_expr(arg_node, table)
         if func == "count":  # COUNT(<expr>) counts non-null values (COUNT(NULL) is 0)
             matched = {"$ne": [{"$ifNull": [body, None]}, None]}
@@ -6173,6 +6220,10 @@ def _accumulator(
             return {"$sum": {"$cond": [cond, 1, 0]}}, "int8"
         if filter_cond is not None:
             body = {"$cond": [filter_cond, body, 0 if func == "sum" else None]}
+        # The bool aggregates ARE min/max over booleans (false < true), which is
+        # the same lowering the bare-column path uses.
+        if func in ("bool_and", "bool_or"):
+            return {"$min" if func == "bool_and" else "$max": body}, "bool"
         tag = _agg_out_tag(func, _infer_scalar_tag(arg_node, table_resolver(table)))
         return {f"${func}": body}, tag
     if col is None:
@@ -10646,6 +10697,14 @@ _BOOL_EXPR_TYPES = (
     exp.ILike,
     exp.RegexpLike,
     exp.RegexpILike,
+    # `IS DISTINCT FROM` / `IS NOT DISTINCT FROM`. Absent here they typed as
+    # text, so the value rode the wire as 't'/'f' and the RowDescription said
+    # oid 25 where PostgreSQL says 16 — the exact failure this tuple exists to
+    # prevent (measured against PG 14.13, 2026-09-01).
+    exp.NullSafeEQ,
+    exp.NullSafeNEQ,
+    # `starts_with()` returns boolean; it typed as text and sent 't'.
+    exp.StartsWith,
 )
 
 
@@ -11393,7 +11452,35 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         # Unknown element type: `any` lets the wire pick text rather than
         # asserting a type the values may not honour.
         return elem or "any"
-    # A boolean-producing expression (IS NOT NULL, comparisons, AND/OR) must type
+    # The pure string / numeric builtins added in `scalar._plain_scalar` — their
+    # result tags live beside them so the two cannot drift.
+    if isinstance(node, exp.Anonymous):
+        from secantus.sql import scalar as _scalar_mod  # lazy: circular import
+
+        _tag = _scalar_mod.PLAIN_SCALAR_TAGS.get(str(node.this).lower())
+        if _tag is not None:
+            return _tag
+    # `width_bucket()` returns integer; it typed as text and sent '3'.
+    if isinstance(node, exp.WidthBucket):
+        return "int4"
+    # `power()` and `sign()` return DOUBLE PRECISION in Postgres, not numeric —
+    # `power(2, 10)` is `1024.0` (oid 701), and typing it numeric put oid 1700
+    # on the wire.
+    if isinstance(node, (exp.Pow, exp.Sign)):
+        return "float8"
+    # COALESCE takes the type of its arguments, not text. `coalesce(NULL, 3)`
+    # typed as text and sent the STRING '3' with oid 25 where PG sends 3 as
+    # int4 — the first argument whose type we can pin wins, which is what PG's
+    # common-type resolution amounts to for the shapes we can decide.
+    if isinstance(node, exp.Coalesce):
+        parts = [node.this, *(node.expressions or [])]
+        for part in parts:
+            if part is None or isinstance(part, exp.Null):
+                continue
+            tag = _infer_scalar_tag(part, resolve)
+            if tag and tag != "any":
+                return tag
+        # A boolean-producing expression (IS NOT NULL, comparisons, AND/OR) must type
     # as bool, not text — else its value rides the wire as the string 'f'/'t' and
     # a driver reads ``if row["x"]`` as truthy (SQLAlchemy's duplicates_constraint).
     if isinstance(node, _BOOL_EXPR_TYPES):
