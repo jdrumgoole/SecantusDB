@@ -1148,6 +1148,80 @@ def _op_abs(arg: Any, ctx: _Ctx) -> Any:
     return _int_result(abs(v), v)
 
 
+#: The inclusive range mongod accepts for a `$round` / `$trunc` precision.
+_PRECISION_MIN, _PRECISION_MAX = -20, 100
+
+#: `Value::integral()` is a 32-bit test, not a "has no fractional part" test —
+#: which is why an int64 precision of 2**31 is rejected as "not integral" while
+#: 2**31 - 1 gets as far as the range check.
+_INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
+
+
+def _round_precision(place: Any, op: str) -> int | None:
+    """Validate a ``$round`` / ``$trunc`` precision the way mongod does.
+
+    Reconstructed from probes against 8.2.11 (2026-09-01), which pinned a
+    three-step order that produces three *different* error codes:
+
+    1. ``Value::coerceToLong`` — a non-numeric (string, bool, ...) is
+       Location16004, and a NaN / Infinity double is Location31109.
+    2. ``Value::integral()`` — Location51082. This is the step the old code
+       only half-had: it rejected a fractional ``float`` but silently ignored a
+       fractional ``Decimal128`` (``$round: ["$n", Decimal128("1.5")]``
+       answered 8.0) and an out-of-int32 integer (``1e10`` answered 7.5).
+    3. the ``[-20, 100]`` bounds — Location51083, which was missing entirely:
+       ``$round: ["$n", -25]`` answered 0.0 where mongod refuses.
+
+    A null / missing precision short-circuits to a null *result*, so this
+    returns ``None`` to mean "the whole operator is null" — distinct from a
+    precision of 0.
+    """
+    if place is None:
+        return None
+    if isinstance(place, bool) or not isinstance(place, (int, float, Decimal128)):
+        raise ExpressionError(
+            f"can't convert from BSON type {_bson_type_name(place)} to long",
+            code=16004,
+            code_name="Location16004",
+        )
+    as_dec = place.to_decimal() if isinstance(place, Decimal128) else None
+    if isinstance(place, float) and not math.isfinite(place):
+        raise ExpressionError(
+            f"Can't coerce out of range value {_fmt_double(place)} to long",
+            code=31109,
+            code_name="Location31109",
+        )
+    if as_dec is not None and not as_dec.is_finite():
+        raise ExpressionError(
+            f"Can't coerce out of range value {as_dec} to long",
+            code=31109,
+            code_name="Location31109",
+        )
+    numeric = (
+        float(place) if isinstance(place, float) else (as_dec if as_dec is not None else place)
+    )
+    integral = _INT32_MIN <= numeric <= _INT32_MAX and (
+        numeric == int(numeric) if not isinstance(place, int) else True
+    )
+    if not integral:
+        raise ExpressionError(
+            # The doubled space after "to" is mongod's own — it streams the
+            # operator name into a slot that already carries a trailing space.
+            f"precision argument to  {op} must be a integral value",
+            code=51082,
+            code_name="Location51082",
+        )
+    value = int(numeric)
+    if not (_PRECISION_MIN <= value <= _PRECISION_MAX):
+        raise ExpressionError(
+            f"cannot apply {op} with precision value {value} value must be in "
+            f"[{_PRECISION_MIN}, {_PRECISION_MAX}]",
+            code=51083,
+            code_name="Location51083",
+        )
+    return value
+
+
 def _op_round(arg: Any, ctx: _Ctx) -> Any:
     if isinstance(arg, list):
         if not arg:
@@ -1160,16 +1234,9 @@ def _op_round(arg: Any, ctx: _Ctx) -> Any:
     if n is None:
         return None
     _require_math_numeric(n, "$round", 51081)
-    if isinstance(place, bool):
-        raise ExpressionError("can't convert from BSON type bool to long", code=16004)
-    if isinstance(place, float):
-        if not place.is_integer():
-            raise ExpressionError(
-                "precision argument to  $round must be a integral value", code=51082
-            )
-        place = int(place)
-    if not isinstance(place, int):
-        place = 0
+    place = _round_precision(place, "$round")
+    if place is None:
+        return None
     if _has_decimal(n):
         # Half-to-even, which is what `round` does for floats and what mongod
         # documents for `$round`.
@@ -1597,16 +1664,9 @@ def _op_trunc(arg: Any, ctx: _Ctx) -> Any:
     if n is None:
         return None
     _require_math_numeric(n, "$trunc", 51081)
-    if isinstance(place, bool):
-        raise ExpressionError("can't convert from BSON type bool to long", code=16004)
-    if isinstance(place, float):
-        if not place.is_integer():
-            raise ExpressionError(
-                "precision argument to  $trunc must be a integral value", code=51082
-            )
-        place = int(place)
-    if not isinstance(place, int):
-        place = 0
+    place = _round_precision(place, "$trunc")
+    if place is None:
+        return None
     if _has_decimal(n):
         # `quantize` at the requested place, truncating toward zero.
         return _decimal_result(
@@ -2594,32 +2654,41 @@ def _op_str_len_cp(arg: Any, ctx: _Ctx) -> Any:
     return len(s)
 
 
+#: `$indexOfArray` was given its OWN error codes at some point after the string
+#: forms got theirs, and mongod still carries both pairs (probed 8.2.11,
+#: 2026-09-01): the string operators raise 40096 / 40097, the array operator
+#: 9711600 / 9711601, with the same two message texts.
+_INDEX_OF_CODES = {"$indexOfArray": (9711600, 9711601)}
+_INDEX_OF_DEFAULT_CODES = (40096, 40097)
+
+
 def _index_of_pos(op: str, which: str, v: Any) -> int:
     """Validate a ``$indexOf*`` start / end index. mongod accepts an int or whole
-    double; a fractional double / bool / non-numeric is Location40096 (note its
-    verbatim missing space after the operator name), and a negative index is
-    Location40097."""
+    double; a fractional double / bool / non-numeric is the operator's "integral"
+    code (note the message's verbatim missing space after the operator name),
+    and a negative index is its "nonnegative" code."""
+    integral_code, nonneg_code = _INDEX_OF_CODES.get(op, _INDEX_OF_DEFAULT_CODES)
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise ExpressionError(
             f"{op}requires an integral {which} index, found a value of type: "
             f"{_bson_type_name(v)}, with value: {_mongo_val_repr(v)}",
-            code=40096,
-            code_name="Location40096",
+            code=integral_code,
+            code_name=f"Location{integral_code}",
         )
     if isinstance(v, float):
         if not v.is_integer():
             raise ExpressionError(
                 f"{op}requires an integral {which} index, found a value of type: "
                 f"{_bson_type_name(v)}, with value: {_mongo_val_repr(v)}",
-                code=40096,
-                code_name="Location40096",
+                code=integral_code,
+                code_name=f"Location{integral_code}",
             )
         v = int(v)
     if v < 0:
         raise ExpressionError(
             f"{op} requires a nonnegative {which} index, found: {v}",
-            code=40097,
-            code_name="Location40097",
+            code=nonneg_code,
+            code_name=f"Location{nonneg_code}",
         )
     return v
 
@@ -2749,41 +2818,17 @@ def _op_index_of_array(arg: Any, ctx: _Ctx) -> Any:
             code_name="Location40090",
         )
     needle = _eval(arg[1], ctx)
-    start = _eval(arg[2], ctx) if len(arg) >= 3 else 0
-    end = _eval(arg[3], ctx) if len(arg) >= 4 else len(arr)
-    # mongod's message text is verbatim, including the missing space in
-    # "$indexOfArrayrequires" (a real mongod quirk) so a surrogate matches.
-    if isinstance(start, bool):
-        raise ExpressionError(
-            "$indexOfArrayrequires an integral starting index, found a value of "
-            f"type: bool, with value: {'true' if start else 'false'}",
-            code=40096,
-        )
-    if isinstance(end, bool):
-        raise ExpressionError(
-            "$indexOfArrayrequires an integral ending index, found a value of "
-            f"type: bool, with value: {'true' if end else 'false'}",
-            code=40096,
-        )
-    try:
-        start = _int_index(start)
-    except _FractionalIndex:
-        raise ExpressionError(
-            "$indexOfArrayrequires an integral starting index, found a value of "
-            f"type: double, with value: {_fmt_double(start)}",
-            code=40096,
-        ) from None
-    try:
-        end = _int_index(end)
-    except _FractionalIndex:
-        raise ExpressionError(
-            "$indexOfArrayrequires an integral ending index, found a value of "
-            f"type: double, with value: {_fmt_double(end)}",
-            code=40096,
-        ) from None
-    if not isinstance(start, int) or not isinstance(end, int):
-        return -1
-    for i in range(max(0, start), min(len(arr), end)):
+    # Shares the string forms' validator, which this used to duplicate by hand
+    # and get wrong in three ways (probed 8.2.11, 2026-09-01): the codes were
+    # the string operators' 40096 / 40097 rather than this operator's own
+    # 9711600 / 9711601; a non-numeric index (`"x"`) silently answered -1 where
+    # mongod refuses; and a NEGATIVE index was clamped to 0 by `max(0, start)`,
+    # so `{$indexOfArray: [[1, 2, 3], 3, -1]}` answered 2 where mongod raises.
+    start = _index_of_pos("$indexOfArray", "starting", _eval(arg[2], ctx)) if len(arg) >= 3 else 0
+    end = (
+        _index_of_pos("$indexOfArray", "ending", _eval(arg[3], ctx)) if len(arg) >= 4 else len(arr)
+    )
+    for i in range(start, min(len(arr), end)):
         if arr[i] == needle:
             return i
     return -1
@@ -2866,7 +2911,13 @@ def _op_range(arg: Any, ctx: _Ctx) -> Any:
     if not all(isinstance(v, int) for v in (start, end, step)):
         raise ExpressionError("$range requires integer arguments")
     if step == 0:
-        raise ExpressionError("$range step cannot be zero")
+        # Location34449 — the generic BadValue this used to raise had neither
+        # mongod's code nor its wording (probed 8.2.11, 2026-09-01).
+        raise ExpressionError(
+            "$range requires a non-zero step value",
+            code=34449,
+            code_name="Location34449",
+        )
     # Compute the size symbolically so we never call list(range(...)) on
     # a billion-element range.
     delta = end - start
