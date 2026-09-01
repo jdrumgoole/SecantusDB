@@ -157,6 +157,14 @@ QUERIES = [
     # `$1::int` as varchar and the client decoded an integer as a string.
     # --- constant expressions. `7/2` is 3 (integer division truncates) and
     # `5/0` is 22012 -- both probed, neither guessed.
+    # --- session settings (GUCs). Column CASING is part of the contract:
+    # `SHOW datestyle` answers a column called `DateStyle`.
+    "SHOW client_encoding",
+    "SHOW datestyle",
+    "SHOW standard_conforming_strings",
+    "SHOW transaction_read_only",
+    "SELECT current_setting('client_encoding')",
+    "SELECT current_setting('nope.zz', true)",
     "SELECT 1+1",
     "SELECT 1-2",
     "SELECT 2*3",

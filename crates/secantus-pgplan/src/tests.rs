@@ -495,8 +495,8 @@ fn select_without_from_answers_session_functions() {
         Statement::SelectConstant(sc) => {
             assert_eq!(sc.columns.len(), 1);
             assert_eq!(sc.columns[0].0, "version");
-            let Bson::String(v) = &sc.columns[0].1 else {
-                panic!("version() must be text");
+            let ConstCol::Value(Bson::String(v)) = &sc.columns[0].1 else {
+                panic!("version() must be a text value");
             };
             // The gauges refuse to score a daemon whose version() does not
             // name SecantusDB, so a real PostgreSQL cannot inflate the number.
@@ -508,13 +508,17 @@ fn select_without_from_answers_session_functions() {
         Statement::SelectConstant(sc) => {
             assert_eq!(
                 sc.columns[0],
-                ("one".to_string(), Bson::Int32(1), "int4".to_string())
+                (
+                    "one".to_string(),
+                    ConstCol::Value(Bson::Int32(1)),
+                    "int4".to_string()
+                )
             );
             assert_eq!(
                 sc.columns[1],
                 (
                     "current_database".to_string(),
-                    Bson::String("postgres".into()),
+                    ConstCol::Value(Bson::String("postgres".into())),
                     "text".to_string()
                 )
             );
@@ -535,7 +539,7 @@ fn select_without_from_answers_session_functions() {
 fn a_cast_declares_the_column_type() {
     match plan_ok("SELECT '1'::int") {
         Statement::SelectConstant(sc) => {
-            assert_eq!(sc.columns[0].1, Bson::Int32(1));
+            assert_eq!(sc.columns[0].1, ConstCol::Value(Bson::Int32(1)));
             assert_eq!(sc.columns[0].2, "int4");
         }
         other => panic!("wrong statement: {other:?}"),
@@ -543,7 +547,7 @@ fn a_cast_declares_the_column_type() {
     // The value is NULL, but the declared type is still int4.
     match plan_with_params("SELECT $1::int", &lookup, &[Bson::Null]).unwrap() {
         Statement::SelectConstant(sc) => {
-            assert_eq!(sc.columns[0].1, Bson::Null);
+            assert_eq!(sc.columns[0].1, ConstCol::Value(Bson::Null));
             assert_eq!(sc.columns[0].2, "int4");
         }
         other => panic!("wrong statement: {other:?}"),
@@ -605,7 +609,9 @@ fn constant_expressions_follow_postgres() {
     ];
     for (sql, want) in cases {
         match plan_ok(sql) {
-            Statement::SelectConstant(sc) => assert_eq!(sc.columns[0].1, want, "for {sql}"),
+            Statement::SelectConstant(sc) => {
+                assert_eq!(sc.columns[0].1, ConstCol::Value(want), "for {sql}")
+            }
             other => panic!("wrong statement for {sql}: {other:?}"),
         }
     }
@@ -621,7 +627,7 @@ fn constant_expressions_follow_postgres() {
 fn an_expression_is_typed_by_its_operator() {
     match plan_with_params("SELECT $1 + 1", &lookup, &[Bson::Null]).unwrap() {
         Statement::SelectConstant(sc) => {
-            assert_eq!(sc.columns[0].1, Bson::Null);
+            assert_eq!(sc.columns[0].1, ConstCol::Value(Bson::Null));
             assert_eq!(sc.columns[0].2, "int4");
         }
         other => panic!("wrong statement: {other:?}"),
@@ -631,5 +637,66 @@ fn an_expression_is_typed_by_its_operator() {
             Statement::SelectConstant(sc) => assert_eq!(sc.columns[0].2, want, "for {sql}"),
             other => panic!("wrong statement for {sql}: {other:?}"),
         }
+    }
+}
+
+#[test]
+fn session_settings_are_planned() {
+    match plan_ok("SHOW client_encoding") {
+        Statement::Show(n) => assert_eq!(n, "client_encoding"),
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("SET my.x = '7'") {
+        Statement::Set { name, value } => {
+            assert_eq!(name, "my.x");
+            assert_eq!(value, "7");
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("RESET my.x") {
+        Statement::Reset(n) => assert_eq!(n, "my.x"),
+        other => panic!("wrong statement: {other:?}"),
+    }
+    // RESET ALL is an empty name rather than its own variant.
+    match plan_ok("RESET ALL") {
+        Statement::Reset(n) => assert!(n.is_empty()),
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+/// The GUC functions resolve at EXECUTION, not while planning: the settings
+/// live on the connection and the planner is stateless.
+#[test]
+fn guc_functions_defer_to_the_connection() {
+    match plan_ok("SELECT current_setting('x')") {
+        Statement::SelectConstant(sc) => assert_eq!(
+            sc.columns[0].1,
+            ConstCol::CurrentSetting {
+                name: "x".into(),
+                missing_ok: false
+            }
+        ),
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("SELECT current_setting('x', true)") {
+        Statement::SelectConstant(sc) => assert_eq!(
+            sc.columns[0].1,
+            ConstCol::CurrentSetting {
+                name: "x".into(),
+                missing_ok: true
+            }
+        ),
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("SELECT set_config('a', 'b', false)") {
+        Statement::SelectConstant(sc) => assert_eq!(
+            sc.columns[0].1,
+            ConstCol::SetConfig {
+                name: "a".into(),
+                value: Bson::String("b".into()),
+                is_local: false,
+            }
+        ),
+        other => panic!("wrong statement: {other:?}"),
     }
 }

@@ -109,6 +109,27 @@ item is not overhead — it is where the findings come from.
       delegates to the OS locale; ICU or a `C`-collation-only restriction are
       the two honest options. Numeric and boolean ORDER BY are unaffected.
 
+- [ ] **`test_concurrent_server_lifecycle_no_panic` is load-sensitive on the
+      Windows CI runner — observed 2026-09-01.** Failed once on
+      `windows-latest` with
+      `ServerSelectionTimeoutError(... Timeout: 5.0s ...)`, then PASSED on a
+      plain re-run of the same commit, with `main` green throughout. The test
+      starts 8 Rust Mongo servers across 4 threads (`workers, iters = 4, 2`) and
+      each connection gets a **5-second** server-selection budget; on a loaded
+      Windows runner that is evidently marginal.
+
+      **Not dismissed as a flake — filed because it is one.** Per `CLAUDE.md`,
+      "flaky is a description of a bug, not an excuse to ignore one". Two
+      candidate causes, neither confirmed: a genuine startup race in the Rust
+      server's accept loop that only a slow machine exposes, or simply a timeout
+      too tight for Windows CI. The distinction matters — the first is a server
+      bug, the second is a test bug — and telling them apart needs the failure
+      reproduced under `-n0` with the timeout raised and startup instrumented.
+
+      Noticed from a PostgreSQL-server PR that touches none of this code;
+      deliberately not fixed there, because a timing fix in the Mongo server
+      does not belong in a PG batch.
+
 ## Triage: what is actually broken (2026-08-26)
 
 > **Sequenced in `tasks/remaining-work-plan.md` (2026-08-27)** — which phase to
