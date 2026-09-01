@@ -2917,6 +2917,18 @@ from PostgreSQL, which implements true serializable snapshot isolation. It is
 documented here rather than signalled at runtime so that drivers and ORMs that
 request the level keep working.
 
+**The alternatives were weighed and rejected (decision recorded 2026-09-01).**
+Rejecting `BEGIN ISOLATION LEVEL SERIALIZABLE` outright would make the
+divergence impossible to miss, but it breaks every driver and framework that
+requests the level as a matter of course — a heavy price for a server whose
+purpose is to stand in for PostgreSQL in tests. Echoing back `repeatable read`
+instead would be honest about the guarantee, but it diverges from PostgreSQL's
+own echo, so a client that asserts on the reported level sees a difference
+where the mapping alone would not have shown one. Accepting the level and
+stating the limitation plainly — here, in the capability matrix, and in the
+`test_known_divergence_*` pins — keeps working clients working and puts the
+risk where someone relying on it will read it.
+
 All four rows of the table above are pinned by
 `tests/test_sql_isolation_level.py`, with the two divergent ones named
 `test_known_divergence_*`.
@@ -3598,7 +3610,7 @@ ORM's FK / sequence reflection resolves to "none" instead of erroring.
 | Window | `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` `OVER`, `LAG`/`LEAD`, `PARTITION BY`, `ORDER BY`, `ROWS` frames + `RANGE` frames (`UNBOUNDED`/`CURRENT ROW`, numeric `n PRECEDING`/`n FOLLOWING` offsets, **and** `INTERVAL` offsets over a date/timestamp key) | a `RANGE` interval offset on a non-temporal key |
 | Joins | multi-table `INNER`/`LEFT JOIN`, two-table `RIGHT`/`FULL OUTER JOIN`, a **pure-`RIGHT` adjacent chain of 3+ tables**, a **leading `RIGHT`/`FULL` join + `INNER`/`LEFT` tail**, a **trailing `RIGHT`/`FULL` join over an `N`-table `INNER`/`LEFT` composite** (`A [INNER|LEFT] JOIN B [… JOIN …] RIGHT|FULL JOIN C`, outer `ON` over any subset of composite tables), `CROSS JOIN` / comma-join, `[LEFT/CROSS] JOIN LATERAL` (simple single-table subquery, or a **rich** subquery — join / `GROUP BY` / `DISTINCT` / aggregate — evaluated per outer row; correlate in its `WHERE`), equality + non-equi / `OR` `ON`, JOIN + GROUP BY / aggregates / HAVING | a `RIGHT`/`FULL` join that isn't first in a 3+ chain (other than the trailing-outer-over-a-composite case), a non-adjacent `RIGHT` `ON`, a second `FULL` in the tail, a composite whose own joins aren't adjacent |
 | DDL | `CREATE TABLE` (incl. `REFERENCES` / `FOREIGN KEY` named or unnamed, `CHECK` / `UNIQUE` — all enforced, literal column `DEFAULT`, `SERIAL`/`BIGSERIAL`/`SMALLSERIAL`, `GENERATED … AS IDENTITY`, `GENERATED ALWAYS AS (…) STORED`, enum-typed columns), `DROP TABLE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`, `SET`/`DROP NOT NULL`, `ALTER COLUMN TYPE`, `SET`/`DROP DEFAULT`, `ADD [CONSTRAINT] { FOREIGN KEY \| CHECK \| UNIQUE }`, `DROP CONSTRAINT`, multi-action lists `ADD …, DROP …`), `CREATE`/`DROP INDEX` (incl. `UNIQUE`, partial `… WHERE …`), `CREATE`/`DROP`/`ALTER SEQUENCE`, `CREATE TYPE … AS ENUM` / `DROP TYPE`, `CREATE`/`DROP VIEW`, `CREATE MATERIALIZED VIEW` / `REFRESH`, `CREATE [OR REPLACE]`/`DROP FUNCTION` (`LANGUAGE sql` single-statement body, or `LANGUAGE plpgsql` scalar body — `DECLARE` / `:=` / `IF` / `RAISE` / `RETURN` / `SELECT … INTO`), `COMMENT ON TABLE`/`COLUMN`, **expression column `DEFAULT`** (`now()` / `gen_random_uuid()` / arithmetic, evaluated per row) | a column `DEFAULT` that references another column, multi-statement `LANGUAGE sql` bodies, `plpgsql` loops / set-returning / `CASE` / cursors / exception handlers |
-| Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (real nested rollback), two-phase commit `PREPARE TRANSACTION` / `COMMIT`/`ROLLBACK PREPARED` (cross-connection, `pg_prepared_xacts`) | prepared xacts surviving a restart, two-phase over the extended protocol |
+| Transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TRANSACTION` / `BEGIN ISOLATION LEVEL`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (real nested rollback), two-phase commit `PREPARE TRANSACTION` / `COMMIT`/`ROLLBACK PREPARED` (cross-connection, `pg_prepared_xacts`) | **true `SERIALIZABLE` — every level runs snapshot isolation, so write skew is not prevented ([Isolation levels](#isolation-levels--read-this-before-relying-on-serializable))**, prepared xacts surviving a restart, two-phase over the extended protocol |
 | Sessions | `LISTEN`/`NOTIFY`/`UNLISTEN` + `pg_notify()` (cross-connection pub/sub), `PREPARE`/`EXECUTE`/`DEALLOCATE` (SQL-level prepared statements), `DECLARE`/`FETCH`/`MOVE`/`CLOSE` (server-side cursors), `EXPLAIN [ANALYZE]` (`FORMAT TEXT`/`JSON`, faithful Index/Seq Scan) | async push to a fully-idle connection, cursor `SCROLL` past materialized rows, per-node `EXPLAIN` costs / timing |
 | Protocol | simple + extended query, `$1` params (text + binary), prepared statements, portals, binary result format, `COPY … FROM/TO STDIN/STDOUT` (text + CSV) | binary-format `COPY`, `COPY` from/to a server-side file |
 | Auth | trust, SCRAM-SHA-256, TLS, SQL `CREATE`/`ALTER`/`DROP ROLE`/`USER` (reflected via `pg_roles`), `GRANT`/`REVOKE` (accepted) | channel binding, mTLS, enforced privileges, SQL roles wired to SCRAM login |

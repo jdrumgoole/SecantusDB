@@ -60,9 +60,13 @@ def run(storage, session, sql):
 @pytest.fixture
 def rule(storage):
     """The analysis verdict for one statement against the real catalog: None
-    when the comparison is resolvable (or undecidable), else the 42883
-    message. Drives ``check_statement`` directly so the verdict is observable
-    without the rest of the planner in the way."""
+    when the expression is resolvable (or undecidable), else the message.
+    Drives ``check_statement`` directly so the verdict is observable without
+    the rest of the planner in the way.
+
+    Two SQLSTATEs are legitimate here: ``42883`` for an unresolvable COMPARISON
+    and ``42804`` for an unassignable ``UPDATE … SET`` value, which is a
+    separate rule (assignment casts, not implicit ones)."""
     catalog = Catalog(storage)
 
     def verdict(sql):
@@ -70,7 +74,7 @@ def rule(storage):
         try:
             typecheck.check_statement(stmt, catalog, DB)
         except errors.SQLError as exc:
-            assert exc.sqlstate == "42883"
+            assert exc.sqlstate in ("42883", "42804"), exc.sqlstate
             return exc.message
         return None
 
@@ -167,11 +171,21 @@ def test_enum_column_is_named_by_its_declared_type(storage, session):
 
 
 def test_update_set_assignment_is_not_a_comparison(rule):
-    # sqlglot parses ``SET txt = 42`` as an EQ, but Postgres reports an
-    # unassignable value as 42804 datatype_mismatch, under assignment-cast
-    # rules — a different analysis, so this one keeps its hands off.
+    # sqlglot parses ``SET txt = 42`` as an EQ, but it is not a comparison:
+    # assignment goes through ASSIGNMENT casts, so it gets 42804 (or nothing)
+    # rather than the 42883 a comparison would get. See
+    # tests/test_sql_assignment_types.py for the full rule.
+    #
+    # `txt = 42` is ACCEPTED — everything has an assignment cast to text — where
+    # the comparison `txt = 42` is 42883. That contrast is the point of this
+    # test. `flag = 1` (boolean ← integer) has no assignment cast either way,
+    # so Postgres rejects it with 42804 (probed on 14.13); this asserted `None`
+    # while assignment was analysed by nothing at all.
     assert rule("UPDATE t SET txt = 42 WHERE id = 1") is None
-    assert rule("UPDATE t SET flag = 1 WHERE id = 1") is None
+    assert (
+        rule("UPDATE t SET flag = 1 WHERE id = 1")
+        == 'column "flag" is of type boolean but expression is of type integer'
+    )
     # …but the WHERE clause of the same statement is still analysed.
     assert rule("UPDATE t SET n = 1 WHERE txt = 42") == "operator does not exist: text = integer"
 

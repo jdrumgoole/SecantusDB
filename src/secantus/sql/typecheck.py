@@ -411,6 +411,52 @@ def _check_arithmetic(node: exp.Expression, resolver: _Resolver) -> None:
     raise errors.SQLError("42883", f"operator does not exist: {left[1]} {op} {right[1]}")
 
 
+def _check_assignment(node: exp.Expression, resolver: _Resolver) -> None:
+    """Raise 42804 for an ``UPDATE … SET col = expr`` Postgres would not assign.
+
+    Assignment uses ASSIGNMENT casts, which are more permissive than the
+    implicit casts a comparison gets — so this is a different rule from
+    `_check_comparison`, not the same one on a different node. Probed against
+    PostgreSQL 14.13 across 25 shapes:
+
+        UPDATE t SET text_col = 42          OK      -- anything casts to text
+        UPDATE t SET varchar_col = 42       OK
+        UPDATE t SET int_col = '42'         OK      -- unknown literal, parsed
+        UPDATE t SET int_col = 'abc'        22P02   -- ... and it fails at RUNTIME
+        UPDATE t SET int_col = 1.7          OK      -- within the numeric family
+        UPDATE t SET bigint_col = int_col   OK
+        UPDATE t SET int_col = text_col     42804
+        UPDATE t SET int_col = true         42804
+        UPDATE t SET bool_col = 1           42804
+        UPDATE t SET date_col = 42          42804
+
+    Three rules cover all of it. A STRING target accepts anything (Postgres
+    defines an assignment cast to text/varchar/char from every type here). An
+    operand whose type is not statically certain — an unknown literal, a
+    parameter, a subquery, NULL — is left alone, so a bad value still surfaces
+    as Postgres's own runtime 22P02 rather than a plan-time guess. Otherwise a
+    CATEGORY mismatch is the error, which is what makes ``bigint = int`` and
+    ``int = real`` fine while ``int = text`` is not.
+
+    Same soundness bar as the rest of this module: when in doubt, stay lenient.
+    A false 42804 rejects a statement Postgres would run, which is worse than
+    the silent coercion this replaces.
+    """
+    target = _static_type(node.this, resolver)
+    value = _static_type(node.expression, resolver)
+    if target is None or value is None:
+        return
+    if target[0] == "string" or target[0] == value[0]:
+        return
+    column = node.this.name if isinstance(node.this, (exp.Column, exp.Identifier)) else None
+    if not column:
+        return
+    raise errors.SQLError(
+        "42804",
+        f'column "{column}" is of type {target[1]} but expression is of type {value[1]}',
+    )
+
+
 def _has_nested_query(node: exp.Expression, root: exp.Expression) -> bool:
     """Whether ``node`` sits inside a nested query relative to ``root`` — its
     columns may resolve against a scope the resolver knows nothing about."""
@@ -454,7 +500,10 @@ def _analyse(
         return
     assignments = _set_assignments(stmt)
     for node in stmt.find_all(*_COMPARISONS):
-        if id(node) in assignments or _has_nested_query(node, stmt):
+        if _has_nested_query(node, stmt):
+            continue
+        if id(node) in assignments:
+            _check_assignment(node, resolver)
             continue
         _check_comparison(node, resolver)
     for node in stmt.find_all(*_ARITHMETIC):
@@ -468,7 +517,8 @@ def _set_assignments(stmt: exp.Expression) -> set[int]:
     assignment as an ``EQ``, but it is not a comparison: Postgres reports an
     unassignable value as ``42804 datatype_mismatch`` ("column is of type text
     but expression is of type integer"), a different analysis with different
-    coercion rules (assignment casts, not implicit ones)."""
+    coercion rules (assignment casts, not implicit ones) — see
+    `_check_assignment`, which is where these nodes are routed."""
     if not isinstance(stmt, exp.Update):
         return set()
     return {id(e) for e in stmt.args.get("expressions") or []}

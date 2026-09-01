@@ -81,7 +81,28 @@ item is not overhead — it is where the findings come from.
       `tests/test_rust_pgserver_differential.py` asserted the leak in a
       docstring; that claim is corrected in place.
 
-- [ ] **CI has no PostgreSQL reference server at all**, so the six oracle
+- [x] **RESOLVED (2026-09-01) — CI now stands up a PostgreSQL reference
+      server.** `.github/workflows/test.yml` gained a Linux-only `pg-oracle`
+      job with a **`postgres:14.13`** service container that runs the oracle
+      suites. Decision recorded, since the entry framed it as the open
+      question: the image is pinned to the PATCH, not `postgres:14`, because
+      these suites assert exact error TEXT and this repo has already been bitten
+      by a *patch* bump rewording a message (the mongod expected-type
+      ordering) — 14.13 is what the local reference server runs, so CI and the
+      dev box compare against the same wording. Moving that pin is a deliberate
+      act: re-probe first.
+
+      Two details worth keeping. The job is separate rather than folded into
+      `test` because GitHub service containers run on **Linux runners only**,
+      so adding a service to that mixed-OS job would break its weekly macOS
+      cells. And it **fails closed**: a step asserts `pg_oracle.available()`
+      before pytest runs, because a skip is invisible in a green pytest summary
+      — which is exactly how this went unnoticed. The suite list is enumerated
+      by `grep -rl '^import pg_oracle' tests/`, so a new oracle suite is picked
+      up without editing the workflow. Measured locally with the job's own
+      command: **195 passed, 0 skipped**. Original entry:
+
+- **CI has no PostgreSQL reference server at all**, so the six oracle
       suites above only ever execute on a dev box that happens to have one.
       They skip silently in CI — now with a reason that says why, but still
       skipping. Split out of the resolved entry above (2026-08-31), which
@@ -960,8 +981,22 @@ Specific items that were left out of the slice that introduced their feature are
   so there is precedent — but it must be DOCUMENTED, not silent. Options:
   (a) keep accepting and document loudly, (b) reject SERIALIZABLE outright
   (safe, breaks drivers that request it), (c) report `repeatable read` when
-  serializable is requested (honest, diverges from PG's echo). **A product
-  decision, not a code one — ask before implementing.**
+  serializable is requested (honest, diverges from PG's echo). ~~**A product
+  decision, not a code one — ask before implementing.**~~
+
+  **DECIDED 2026-09-01: (a), keep accepting and document loudly.** Rejecting
+  the level outright breaks every driver and framework that requests it as a
+  matter of course, which is a heavy price for a server whose purpose is to
+  stand in for PostgreSQL in tests; echoing `repeatable read` is honest about
+  the guarantee but diverges from PG's own echo, so a client asserting on the
+  reported level sees a difference the mapping alone would not have caused.
+  `docs/sql.md` "Isolation levels — read this before relying on `SERIALIZABLE`"
+  carries the table, a worked write-skew example, the precedent, and now the
+  rejected alternatives; the SQL capability matrix names the divergence in the
+  Transactions row so it is visible to someone scanning capabilities rather
+  than reading the transaction section. **The SERIALIZABLE half of this entry
+  is closed.** What remains open is the READ COMMITTED row below, which is a
+  redesign (`tasks/sql-mvcc-plan.md`), not a decision.
 
   **READ COMMITTED inside an explicit transaction is a REDESIGN, not a fix —
   scoped in `tasks/sql-mvcc-plan.md` (2026-08-29).** Both obvious designs fail:
@@ -1148,6 +1183,24 @@ Specific items that were left out of the slice that introduced their feature are
   clause at all, so the query is 42P01. Only reached by a client that
   introspects a sequence directly — `nextval` / `currval` / `setval` and
   `information_schema.sequences` all work.
+- [ ] **OPEN — the RUST pgserver has none of the Python side's assignment /
+  coercion error codes (noted 2026-09-01, NOT measured against a running Rust
+  server).** The Python server gained `42804` for an unassignable
+  `UPDATE … SET`, and split datetime coercion into `22007` (unparseable) /
+  `22008` (datetime-shaped, field out of range), keeping `22P02` for the
+  numeric types. `grep` over `crates/` finds **no `42804`, `22007` or `22008`
+  at all** — only the shared `invalid input syntax for type …` wording in
+  `secantus-pgserver/src/lib.rs` and `secantus-pgplan/src/lib.rs` — so the Rust
+  server most likely answers one code for all of these and does no assignment
+  typecheck.
+
+  This is the exact shape CLAUDE.md warns about: a fix lands on one side and
+  nothing but a grep tells the other. **Confirm by running the shapes in
+  `tests/test_sql_assignment_types.py` against the Rust pgserver before
+  building anything** — the Python side's own history here is that a filed
+  description was wrong twice in one session. Deliberately not fixed in the
+  same batch: `rust-pgserver-date-time` was an active branch when this was
+  written and owns that surface.
 
 - [ ] **OPEN — `test_tls_against_rust_server` flakes on the Windows runner
   (first seen 2026-08-29, PR #1089).** `storage-engine (windows-latest)` failed
@@ -6285,10 +6338,25 @@ be worth naming: **this backlog's prose is a hypothesis, not evidence.**
     is driven by declared column types, and constant-only expressions are most
     of what the psycopg / SQLAlchemy gauges evaluate, so widening to them wants
     its own gauge run.
-  - **`UPDATE … SET col = expr`** is an assignment, not a comparison: Postgres
-    reports an unassignable value as `42804 datatype_mismatch` under
-    assignment-cast rules. Still unimplemented — a `SET text_col = 42` is
-    silently coerced.
+  - ~~**`UPDATE … SET col = expr`** is an assignment, not a comparison~~ —
+    **DONE (2026-09-01).** `typecheck._check_assignment` applies PG's
+    assignment-cast rule: a STRING target takes anything, an operand whose type
+    is not statically certain is left to the runtime, and otherwise a category
+    mismatch is `42804 column "…" is of type … but expression is of type …`.
+    That keeps `bigint = int`, `int = real`, `int = 1.7` and `text_col = 42`
+    working while rejecting `int = text` / `bool = 1` / `date = 42`. Reflected
+    tables stay exempt for free — the shared resolver already refuses them.
+    25 shapes match PostgreSQL 14.13 exactly (`tests/test_sql_assignment_types.py`).
+
+    Two coercion-error defects fell out of the same probe and are fixed with
+    it: `SET numeric_col = 'abc'` reached the wire as a raw
+    `[<class 'decimal.ConversionSyntax'>]` (the `Decimal(str(value))` call sat
+    outside the `try`), and date/time coercion used our own wording and the
+    wrong SQLSTATE. PG splits these THREE ways, and the existing
+    `TestOutOfRangeIsAnError` asserted a code PG gives to none of its four
+    inputs: `22007` for an unparseable datetime, **`22008` for a
+    datetime-shaped literal with an out-of-range field** (`23:59:61`,
+    `23:59:60.5`), `22P02` for the numeric types.
   - **Not yet verified against the psycopg / sqllogictest / SQLAlchemy
     gauges** (`invoke validate-psycopg` / `validate-slt` /
     `validate-sqlalchemy`). The 2812-test `tests/test_sql*.py` suite and the

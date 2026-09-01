@@ -350,6 +350,49 @@ class DateTimeError(ValueError):
     """A malformed date / time / timetz literal."""
 
 
+#: A datetime-shaped literal, for telling "out of range" apart from "not a
+#: date at all". Both halves are optional so a bare time matches too.
+_FIELD_SHAPE_RE = re.compile(
+    r"(?:(?P<y>\d{1,7})-(?P<mon>\d{1,2})-(?P<day>\d{1,2}))?"
+    r"(?:[ T]*(?P<h>\d{1,2}):(?P<min>\d{1,2})(?::(?P<s>\d{1,2})(?P<frac>[.,]\d+)?)?)?"
+)
+
+
+def field_out_of_range(text: Any) -> bool:
+    """Whether ``text`` LOOKS like a date/time but carries an out-of-range field.
+
+    Postgres splits these two failures, and we reported one code for both:
+
+        '2015-06-30 23:59:61'    22008 date/time field value out of range
+        '2015-06-30 23:59:60.5'  22008 date/time field value out of range
+        'not-a-date'             22007 invalid input syntax for type timestamp
+        ''                       22007 invalid input syntax for type timestamp
+
+    (Measured on 14.13. A *whole* second 60 is accepted and rolls forward —
+    see `_strip_leap_second` — so only a FRACTIONAL :60 is out of range.)
+    """
+    if not isinstance(text, str):
+        return False
+    m = _FIELD_SHAPE_RE.search(text)
+    if m is None or not any(m.group(g) for g in ("y", "h")):
+        return False
+
+    def _n(name: str) -> int | None:
+        raw = m.group(name)
+        return int(raw) if raw else None
+
+    mon, day, hour, minute, sec = (_n("mon"), _n("day"), _n("h"), _n("min"), _n("s"))
+    if mon is not None and not 1 <= mon <= 12:
+        return True
+    if day is not None and not 1 <= day <= 31:
+        return True
+    if hour is not None and hour > 24:
+        return True
+    if minute is not None and minute > 59:
+        return True
+    return sec is not None and (sec > 60 or (sec == 60 and bool(m.group("frac"))))
+
+
 # A BC date may carry a trailing zone offset (pgjdbc sends
 # ``0101-01-01 BC +00`` for a date parameter); the offset is irrelevant
 # to a date and ignored.

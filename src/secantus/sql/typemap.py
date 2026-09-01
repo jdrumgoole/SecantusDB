@@ -1007,6 +1007,41 @@ def _parse_pg_array_body(s: str, i: int) -> tuple[list, int]:
         i += 1
 
 
+#: Postgres names date/time types differently in a COERCION error than in a
+#: type-mismatch one: the input-syntax message says bare ``timestamp`` where
+#: `_PG_NAME`-style spellings say ``timestamp without time zone`` (probed on
+#: 14.13). Coercion of these is also `22007 invalid_datetime_format`, NOT the
+#: `22P02` the numeric types use.
+_DATETIME_INPUT_NAME = {
+    "date": "date",
+    "time": "time",
+    "timetz": "time with time zone",
+    "timestamp": "timestamp",
+    "timestamptz": "timestamp with time zone",
+}
+
+
+def _datetime_coercion_error(tag: str, value: Any) -> Exception:
+    """The date/time counterpart of `_coercion_error`: `22007`, not `22P02`.
+
+    Also a ValueError for the same reason — callers that soft-catch ValueError
+    around ``coerce`` keep their fallbacks.
+    """
+    from secantus.sql import errors as _sql_errors
+
+    class _DateTimeCoercionError(_sql_errors.SQLError, ValueError):
+        pass
+
+    from secantus.sql.datetimes import field_out_of_range
+
+    if field_out_of_range(value):
+        # Postgres splits these: a datetime-SHAPED literal whose field is out
+        # of range is 22008, not the 22007 an unparseable one gets.
+        return _DateTimeCoercionError("22008", f'date/time field value out of range: "{value}"')
+    name = _DATETIME_INPUT_NAME.get(tag, SQL_TYPE_NAME.get(tag, tag))
+    return _DateTimeCoercionError("22007", f'invalid input syntax for type {name}: "{value}"')
+
+
 def _coercion_error(tag: str, value: Any) -> Exception:
     """A 22P02 that is ALSO a ValueError: paths that soft-catch ValueError
     around ``coerce`` keep their fallbacks, while an uncaught failure reaches
@@ -1218,7 +1253,13 @@ def coerce(value: Any, tag: str) -> Any:
         except (TypeError, ValueError) as e:
             raise _coercion_error(tag, value) from e
     if tag == "numeric":
-        d = value if isinstance(value, Decimal) else Decimal(str(value))
+        try:
+            d = value if isinstance(value, Decimal) else Decimal(str(value))
+        except (_decimal.DecimalException, TypeError, ValueError) as e:
+            # `Decimal("abc")` raises InvalidOperation, which was OUTSIDE the
+            # try below and reached the wire as a raw
+            # `[<class 'decimal.ConversionSyntax'>]`.
+            raise _coercion_error(tag, value) from e
         try:
             return bson.Decimal128(d)
         except _decimal.DecimalException:
@@ -1332,16 +1373,26 @@ def coerce(value: Any, tag: str) -> Any:
                 # An unparseable timestamp reached the wire as "internal
                 # error" — Python's ValueError escaped uncaught. Postgres
                 # reports invalid input syntax, and so does this now.
-                raise _coercion_error(tag, value) from exc
+                raise _datetime_coercion_error(tag, value) from exc
         return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
     if tag in ("date", "time", "timetz"):
         from secantus.sql import datetimes as _datetimes
+        from secantus.sql import errors as _sql_errors
 
-        if tag == "date":
-            return _datetimes.parse_date(value)
-        if tag == "time":
-            return _datetimes.parse_time(value)
-        return _datetimes.parse_timetz(value)
+        try:
+            if tag == "date":
+                return _datetimes.parse_date(value)
+            if tag == "time":
+                return _datetimes.parse_time(value)
+            return _datetimes.parse_timetz(value)
+        except _sql_errors.SQLError:
+            raise  # already a typed error; do not re-wrap
+        except Exception as exc:
+            # The parsers raise their own `DateTimeError` ("invalid date value:
+            # 'nope'"), which is neither Postgres's wording nor a SQLSTATE the
+            # wire layer can classify. Postgres answers 22007 with the input it
+            # could not read.
+            raise _datetime_coercion_error(tag, value) from exc
     if tag == "json":
         parsed = _json.loads(value) if isinstance(value, str) else value
         return _bson_safe_json(parsed)
