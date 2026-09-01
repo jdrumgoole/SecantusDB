@@ -170,6 +170,8 @@ def _window_values(
         return [i + 1 for i in range(n)]
     if isinstance(func, (exp.Rank, exp.DenseRank)):
         return _rank_values(func, okeys)
+    if isinstance(func, (exp.CumeDist, exp.PercentRank)):
+        return _dist_values(func, okeys)
     if isinstance(func, exp.Ntile):
         return _ntile_values(func, n, scope_of, sctx)
     if isinstance(func, (exp.Lag, exp.Lead)):
@@ -441,6 +443,31 @@ def _rank_values(func: exp.Expression, okeys: list[tuple]) -> list[Any]:
             prev = key
         out.append(dense_rank if dense else rank)
     return out
+
+
+def _dist_values(func: exp.Expression, okeys: list[tuple]) -> list[Any]:
+    """``cume_dist()`` and ``percent_rank()`` — both double precision in PG.
+
+        percent_rank = (rank - 1) / (rows - 1)      0 when there is one row
+        cume_dist    = (rows at or before this PEER GROUP) / rows
+
+    Both are peer-aware: rows that tie under the ORDER BY share a value, which
+    is what makes them different from `row_number() / n`. Frame-insensitive,
+    like the other rank-likes, so they never consult the frame.
+    """
+    n = len(okeys)
+    if n == 0:
+        return []
+    ranks = _rank_values(exp.Rank(), okeys)
+    if isinstance(func, exp.PercentRank):
+        if n == 1:
+            return [0.0]
+        return [(r - 1) / (n - 1) for r in ranks]
+    # cume_dist: every row in a peer group gets the group's LAST position / n.
+    last_of_peer: dict[Any, int] = {}
+    for i, key in enumerate(okeys):
+        last_of_peer[key] = i + 1
+    return [last_of_peer[key] / n for key in okeys]
 
 
 def _lag_lead_values(
