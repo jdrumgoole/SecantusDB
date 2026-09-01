@@ -182,9 +182,30 @@ def _regex_flag_string(flags: Any) -> str:
 
 
 def fmt_double_g(value: float) -> str:
-    """A double as mongod streams it into an error message: C++'s ``ostream <<``
-    at its default six significant digits, so ``1e20`` prints ``1e+20``."""
+    """A double as mongod streams it into an ARITHMETIC error message: C++'s
+    ``ostream <<`` at its default six significant digits, so ``1234567890123.0``
+    prints ``1.23457e+12``.
+
+    NOT the rendering a query / update PARSE error uses -- see
+    :func:`fmt_double_parse`, and do not merge the two. Probed 8.2.11
+    (2026-09-01): ``$toInt: 1234567890123.0`` overflows with ``1.23457e+12``
+    while ``$size: 1234567890123.0`` reports ``1234567890123.0``.
+    """
     return f"{value:g}"
+
+
+def fmt_double_parse(value: float) -> str:
+    """A double as mongod echoes it in a query / update PARSE error: the
+    shortest round-trip form, keeping a whole double's ``.0``.
+
+    ``-1.0`` stays ``-1.0`` (``%g`` would say ``-1``) and ``1e16`` stays
+    ``1e+16``, which is exactly Python's ``repr``.
+    """
+    if value != value:
+        return "nan"
+    if value in (float("inf"), float("-inf")):
+        return "inf" if value > 0 else "-inf"
+    return repr(value)
 
 
 def bson_value_repr(value: Any) -> str:
@@ -207,7 +228,7 @@ def bson_value_repr(value: Any) -> str:
     if isinstance(value, Code):
         return str(value)
     if isinstance(value, float):
-        return fmt_double_g(value)
+        return fmt_double_parse(value)
     if isinstance(value, Decimal128):
         return str(value)
     if isinstance(value, (int, Int64)):
@@ -302,10 +323,10 @@ def coerce_int64_argument(value: Any, label: str) -> int:
             raise Int64CoercionError(f"Expected an integer, but found NaN in: {label}: nan")
         if value in (float("inf"), float("-inf")) or not (_INT64_MIN <= value <= _INT64_MAX):
             raise Int64CoercionError(
-                f"Cannot represent as a 64-bit integer: {label}: {fmt_double_g(value)}"
+                f"Cannot represent as a 64-bit integer: {label}: {fmt_double_parse(value)}"
             )
         if not value.is_integer():
-            raise Int64CoercionError(f"Expected an integer: {label}: {fmt_double_g(value)}")
+            raise Int64CoercionError(f"Expected an integer: {label}: {fmt_double_parse(value)}")
         return int(value)
     return value
 

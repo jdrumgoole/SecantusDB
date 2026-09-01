@@ -122,7 +122,10 @@ def _match_clause(
                 code_name="FailedToParse",
             ) from exc
     if key.startswith("$"):
-        raise QueryError(f"unsupported top-level operator: {key}")
+        raise QueryError(
+            f"unknown top level operator: {key}. If you have a field name that "
+            "starts with a '$' symbol, consider using $getField or $setField."
+        )
     return _field_matches(_resolve_path(doc, key), condition, collation, field=key)
 
 
@@ -446,6 +449,39 @@ def _resolve_path(doc: Any, path: str) -> list[Any]:
 # per clause inside _field_matches).
 _SIBLING_MODIFIERS = frozenset(("$options", "$maxDistance", "$minDistance"))
 
+#: Every field-level operator `_op_matches` dispatches, plus the sibling
+#: modifiers that tune one. `$not` validates its inner document against this:
+#: mongod requires those keys to be operators, and a document of ordinary field
+#: names used to degrade to an equality match that `$not` then negated.
+_KNOWN_FIELD_OPERATORS = _SIBLING_MODIFIERS | frozenset(
+    (
+        "$eq",
+        "$ne",
+        "$gt",
+        "$gte",
+        "$lt",
+        "$lte",
+        "$in",
+        "$nin",
+        "$exists",
+        "$not",
+        "$type",
+        "$size",
+        "$all",
+        "$mod",
+        "$elemMatch",
+        "$regex",
+        "$bitsAllSet",
+        "$bitsAnySet",
+        "$bitsAllClear",
+        "$bitsAnyClear",
+        "$geoWithin",
+        "$geoIntersects",
+        "$near",
+        "$nearSphere",
+    )
+)
+
 
 def _field_matches(
     values: list[Any],
@@ -496,15 +532,26 @@ def _field_matches(
 
 def _validate_not_arg(arg: Any) -> None:
     """mongod's ``$not`` argument must be a regex or a non-empty document of
-    operators (BadValue): a scalar / array / bool is "$not needs a regex or a
-    document", an empty document is "$not cannot be empty". Without this a bare
-    ``{$not: 5}`` silently degrades to "not equal to 5"."""
+    operators (BadValue): a scalar / array / bool is "$not argument must be a
+    regex or an object", an empty document is "$not argument must be a non-empty
+    object". Without this a bare ``{$not: 5}`` silently degrades to "not equal
+    to 5". Wording probed 8.2.11, 2026-09-01.
+
+    A ``Code`` is NOT an object here -- it subclasses ``str``, so it takes the
+    scalar branch, which is what mongod does with it too."""
     if isinstance(arg, Regex):
         return
     if not isinstance(arg, Mapping):
-        raise QueryError("$not needs a regex or a document")
+        raise QueryError("$not argument must be a regex or an object", code=2)
     if not arg:
-        raise QueryError("$not cannot be empty")
+        raise QueryError("$not argument must be a non-empty object", code=2)
+    # Every key inside `$not` must be a known operator. Without this a document
+    # of ordinary field names degraded to an equality match and the `$not`
+    # NEGATED it, so `{n: {$not: {a: 1}}}` returned the document -- a wrong
+    # answer, where mongod refuses the query.
+    for key in arg:
+        if key not in _KNOWN_FIELD_OPERATORS:
+            raise QueryError(f"unknown operator: {key}", code=2)
 
 
 def _validate_in_arg(op: str, arg: Any) -> None:
@@ -706,7 +753,7 @@ def _op_matches(
         return _op_geo_near(values, arg, default_spherical=False)
     if op == "$nearSphere":
         return _op_geo_near(values, arg, default_spherical=True)
-    raise QueryError(f"unsupported query operator: {op}")
+    raise QueryError(f"unknown operator: {op}")
 
 
 def _op_geo_within(values: list[Any], arg: Any) -> bool:
@@ -1238,7 +1285,11 @@ def _validate_regex_options(options: Any) -> None:
     for c in options:
         if c not in _VALID_REGEX_FLAGS:
             raise QueryError(
-                f"invalid flag in regex options: {c}", code=51108, code_name="Location51108"
+                # The leading space is mongod's own -- it streams an empty slot before
+                # the sentence. Verbatim, not a typo here.
+                f" invalid flag in regex options: {c}",
+                code=51108,
+                code_name="Location51108",
             )
 
 
@@ -1477,31 +1528,24 @@ def _op_type(values: list[Any], type_spec: Any, field: str = "") -> bool:
 
 
 def _op_size(values: list[Any], size: Any) -> bool:
-    # mongod validates $size strictly (probed 7.0.12): it must be a number
-    # (bool and string are rejected), integer-valued (2.0 is accepted as 2, 2.5
-    # is not), and non-negative. Each failure is a distinct parse error, not a
-    # silent no-match.
-    if isinstance(size, bool) or not isinstance(size, (int, float, Decimal128)):
-        raise QueryError(f"Failed to parse $size. Expected a number in: $size: {size!r}")
-    if isinstance(size, Decimal128):
-        try:
-            dec = size.to_decimal()
-        except (InvalidOperation, ValueError):
-            raise QueryError(
-                f"Failed to parse $size. Expected a number in: $size: {size!r}"
-            ) from None
-        if dec != dec.to_integral_value():
-            raise QueryError(f"Failed to parse $size. Expected an integer: $size: {size!r}")
-        n = int(dec)
-    elif isinstance(size, float):
-        if not size.is_integer():
-            raise QueryError(f"Failed to parse $size. Expected an integer: $size: {size!r}")
-        n = int(size)
-    else:
-        n = size
+    """``$size`` takes a non-negative whole number.
+
+    mongod validates it through the same numeric ladder as ``$pop`` and the
+    ``$bits*`` mask -- NaN, out-of-range, fractional and non-integral
+    Decimal128 each get their own sentence -- under a
+    ``"Failed to parse $size. "`` prefix. A whole ``Decimal128`` is accepted.
+    Probed 8.2.11 (2026-09-01).
+    """
+    prefix = "Failed to parse $size. "
+    try:
+        n = coerce_int64_argument(size, "$size")
+    except TypeError:
+        raise QueryError(f"{prefix}Expected a number in: $size: {_mongo_bson_repr(size)}") from None
+    except Int64CoercionError as exc:
+        raise QueryError(f"{prefix}{exc.message}") from None
     if n < 0:
         raise QueryError(
-            f"Failed to parse $size. Expected a non-negative number in: $size: {size!r}"
+            f"{prefix}Expected a non-negative number in: $size: {_mongo_bson_repr(size)}"
         )
     return any(isinstance(v, list) and len(v) == n for v in values)
 
@@ -1583,7 +1627,11 @@ def _mod_int(v: Any) -> int | None:
 
 
 def _op_mod(values: list[Any], mod_spec: Any) -> bool:
-    if not isinstance(mod_spec, (list, tuple)) or len(mod_spec) < 2:
+    # mongod separates "not an array at all" from "an array that is too short";
+    # this answered the too-short message for both.
+    if not isinstance(mod_spec, (list, tuple)):
+        raise QueryError("malformed mod, needs to be an array")
+    if len(mod_spec) < 2:
         raise QueryError("malformed mod, not enough elements")
     div = _mod_int(mod_spec[0])
     if div is None:

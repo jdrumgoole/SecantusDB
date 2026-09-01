@@ -261,7 +261,11 @@ def _apply_push(arr: list[Any], value: Any) -> list[Any]:
         raise UpdateError(f"Unrecognized $push modifier: {next(iter(unknown))!r}")
     each = value["$each"]
     if not isinstance(each, list):
-        raise UpdateError("$each must be an array")
+        raise UpdateError(
+            "The argument to $each in $push must be an array but it was of "
+            f"type: {_bson_type_name(each)}",
+            code=2,
+        )
     position = value.get("$position")
     if position is not None:
         if not isinstance(position, int) or isinstance(position, bool):
@@ -998,7 +1002,14 @@ def _apply_op(
                 # `$each` adds each element (deduped); otherwise the value itself.
                 to_add = value["$each"] if _is_each_modifier(value) else [value]
                 if _is_each_modifier(value) and not isinstance(value["$each"], list):
-                    raise UpdateError("$each must be an array")
+                    # `$addToSet` words this differently from `$push`: it names
+                    # itself, and omits the colon before the type. mongod's own
+                    # inconsistency, reproduced verbatim.
+                    raise UpdateError(
+                        "The argument to $each in $addToSet must be an array but "
+                        f"it was of type {_bson_type_name(value['$each'])}",
+                        code=2,
+                    )
                 for elem in to_add:
                     # `elem not in arr` uses Python `==`, which compares dicts
                     # ORDER-INSENSITIVELY. mongod does not: `{y: 2, x: 1}` is a
@@ -1131,23 +1142,51 @@ def _apply_op(
         for path, ops in payload.items():
             # mongod applies every listed operation to the field in order
             # (e.g. {and: X, or: Y} is (v & X) | Y), not just a single op.
-            if not isinstance(ops, Mapping) or not ops:
-                raise UpdateError("$bit requires a document with at least one bitwise operation")
+            # mongod separates "that is not a document at all" from "that is
+            # an EMPTY document"; this answered one generic FailedToParse (9)
+            # for both, where mongod uses BadValue (2) with two different texts.
+            # The unbalanced braces in both are mongod's own.
+            if not isinstance(ops, Mapping):
+                raise UpdateError(
+                    f"The $bit modifier is not compatible with a {_bson_type_name(ops)}. "
+                    "You must pass in an embedded document: "
+                    "{$bit: {field: {and/or/xor: #}}",
+                    code=2,
+                )
+            if not ops:
+                raise UpdateError(
+                    "You must pass in at least one bitwise operation. The format is: "
+                    "{$bit: {field: {and/or/xor: #}}",
+                    code=2,
+                )
             parsed_ops: list[tuple[str, int]] = []
             for bit_op, mask in ops.items():
                 if bit_op not in ("and", "or", "xor"):
-                    raise UpdateError(f"$bit unsupported sub-op: {bit_op}")
+                    raise UpdateError(
+                        f"The $bit modifier only supports 'and', 'or', and 'xor', not "
+                        f"'{bit_op}' which is an unknown operator: "
+                        f"{{{bit_op}: {bson_value_repr(mask)}}}",
+                        code=2,
+                    )
                 if not isinstance(mask, int) or isinstance(mask, bool):
+                    # mongod echoes the offending sub-document and ends with a
+                    # colon, not a full stop.
                     raise UpdateError(
                         "The $bit modifier field must be an Integer(32/64 bit); a "
-                        f"'{_bson_type_name(mask)}' is not supported here.",
+                        f"'{_bson_type_name(mask)}' is not supported here: "
+                        f"{{{bit_op}: {bson_value_repr(mask)}}}",
                         code=2,
                     )
                 parsed_ops.append((bit_op, mask))
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 current = get_path(doc, concrete, default=0) or 0
                 if not isinstance(current, int) or isinstance(current, bool):
-                    raise UpdateError(f"$bit on non-integer at {concrete!r}")
+                    raise _exec_error(
+                        "Cannot apply $bit to a value of non-integral type."
+                        f"_id: {bson_value_repr(doc.get('_id'))} has the field "
+                        f"{concrete} of non-integer type {_bson_type_name(current)}",
+                        code=2,
+                    )
                 for bit_op, mask in parsed_ops:
                     if bit_op == "and":
                         current = current & mask
