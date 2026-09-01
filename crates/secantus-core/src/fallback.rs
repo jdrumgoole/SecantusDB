@@ -29,7 +29,20 @@ pub enum Fallback {
     Defer,
     /// mongod rejects this input, with exactly this code and message. Returned
     /// to the client verbatim rather than as a "not supported" error.
-    Mongo { code: i32, message: String },
+    ///
+    /// `folded` records WHICH of mongod's two pipeline wrappers the message
+    /// belongs under: `Some(true)` for a wholly constant expression, which
+    /// mongod rejects at optimization time ("Failed to optimize pipeline"), and
+    /// `Some(false)` for one that reads a field, which fails per document
+    /// ("Executor error during aggregate command..."). `None` means nothing has
+    /// decided yet; the expression evaluator stamps it at the operator that
+    /// raised, so the verdict follows the offending sub-expression rather than
+    /// the whole stage.
+    Mongo {
+        code: i32,
+        message: String,
+        folded: Option<bool>,
+    },
 }
 
 impl Fallback {
@@ -39,14 +52,28 @@ impl Fallback {
         Fallback::Mongo {
             code,
             message: message.into(),
+            folded: None,
         }
     }
 
     /// The `(code, message)` pair when this is a real server error.
     pub fn as_mongo(&self) -> Option<(i32, &str)> {
         match self {
-            Fallback::Mongo { code, message } => Some((*code, message.as_str())),
+            Fallback::Mongo { code, message, .. } => Some((*code, message.as_str())),
             Fallback::Defer => None,
         }
+    }
+
+    /// Whether this error belongs under mongod's constant-folding wrapper.
+    /// Undecided counts as not folded — the executor prefix is the one that
+    /// applies to anything reading a document.
+    pub fn folded(&self) -> bool {
+        matches!(
+            self,
+            Fallback::Mongo {
+                folded: Some(true),
+                ..
+            }
+        )
     }
 }

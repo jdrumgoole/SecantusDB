@@ -228,7 +228,7 @@ fn evaluate(
             // `ExpressionError`; collapsing it into a defer would have made
             // parity vacuously green on exactly the inputs the Rust server has
             // to get right on its own.
-            Err(Fallback::Mongo { code, message }) => {
+            Err(Fallback::Mongo { code, message, .. }) => {
                 let mut wrap = Document::new();
                 wrap.insert(
                     "err".to_string(),

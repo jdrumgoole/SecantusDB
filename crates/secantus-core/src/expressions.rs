@@ -202,7 +202,29 @@ fn eval(expr: &Bson, ctx: &Ctx) -> R {
             if d.len() == 1 {
                 let (key, val) = d.iter().next().unwrap();
                 if key.starts_with('$') {
-                    return apply_op(key, val, ctx);
+                    // Stamp the constant-folding verdict at the operator that
+                    // raised, not at the stage. mongod folds a wholly constant
+                    // expression at optimization time and reports it under a
+                    // different wrapper, and the verdict follows the offending
+                    // SUB-expression: `{$log: ["$n", 1]}` has a constant base
+                    // and is still an executor error (probed 8.2.11). Only the
+                    // innermost frame decides -- an outer one finds it already
+                    // set and leaves it.
+                    return apply_op(key, val, ctx).map_err(|fault| match fault {
+                        Fallback::Mongo {
+                            code,
+                            message,
+                            folded: None,
+                        } => Fallback::Mongo {
+                            code,
+                            message,
+                            folded: Some(crate::aggregate::is_constant_expression(
+                                val,
+                                &ctx.vars.keys().cloned().collect::<Vec<_>>(),
+                            )),
+                        },
+                        other => other,
+                    });
                 }
             }
             // A document *literal*. Each member is in field-value position, so
@@ -1142,11 +1164,23 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
     let arr = eval(&pair[0], ctx)?;
     let idx = eval(&pair[1], ctx)?;
     if matches!(idx, Bson::Boolean(_)) {
-        return Err(Fallback::Defer); // Python raises 28690
+        return Err(Fallback::mongo(
+            28690,
+            "$arrayElemAt's second argument must be a numeric value, but is bool",
+        ));
     }
     let i = match coerce_index(&idx) {
         IdxCoerce::Int(i) => i as i128,
-        IdxCoerce::Fractional => return Err(Fallback::Defer), // Python raises 28691
+        IdxCoerce::Fractional => {
+            return Err(Fallback::mongo(
+                28691,
+                format!(
+                    "$arrayElemAt's second argument must be representable as a \
+                     32-bit integer: {}",
+                    format_double_g(as_float_like(&idx).unwrap_or(f64::NAN))
+                ),
+            ));
+        }
         IdxCoerce::NotNumber => return Ok(Bson::Null),
     };
     let a = match &arr {
@@ -1183,27 +1217,81 @@ fn op_first_last(arg: &Bson, ctx: &Ctx, first: bool) -> R {
     }
 }
 
+/// Render a value the way mongod does in the "found <v>" tail of an `n` type
+/// error: strings quoted, other scalars stringified. Mirrors
+/// `expressions.py::_nelem_render`.
+fn nelem_render(v: &Bson) -> String {
+    match v {
+        Bson::String(s) => format!("\"{s}\""),
+        other => py_num_str(other),
+    }
+}
+
 /// Shared `{n, input}` validation for `$firstN` / `$lastN` / `$maxN` / `$minN`.
-/// Returns `(n, array)` for a valid spec, else `Fallback` so Python raises the
-/// exact mongod error (5788200 / 5787902-8, verified against mongod 6.0). Accepts
+/// Returns `(n, array)` for a valid spec, else the mongod error itself. Accepts
 /// an integral double `n` (mongod does). A null / missing / non-array `input` is
-/// an **error** (defer), not null. Mirrors the pure `_nelem_n_and_input`.
+/// an **error**, not null.
+///
+/// mongod splits the same sentence across two codes by how `n` is wrong -- a
+/// non-integral NUMBER is Location5787903 and a non-number is Location5787902 --
+/// which is why the double arm has to fall through to a check rather than a
+/// catch-all. Mirrors the pure `_nelem_n_and_input` / `nelem_parse_n`.
 fn nelem_n_and_input(arg: &Bson, ctx: &Ctx) -> Result<(usize, Vec<Bson>), Fallback> {
     let Bson::Document(d) = arg else {
         return Err(Fallback::Defer);
     };
-    let n = match eval(d.get("n").ok_or(Fallback::Defer)?, ctx)? {
-        Bson::Int32(x) => x as i64,
-        Bson::Int64(x) => x,
-        Bson::Double(x) if x.is_finite() && x.fract() == 0.0 => x as i64,
-        _ => return Err(Fallback::Defer), // non-integral / non-numeric -> Python raises
+    let Some(n_expr) = d.get("n") else {
+        return Err(Fallback::mongo(5787906, "Missing value for 'n'"));
+    };
+    let n_val = eval(n_expr, ctx)?;
+    let n = match &n_val {
+        Bson::Boolean(_) => {
+            return Err(Fallback::mongo(
+                5787902,
+                format!(
+                    "Value for 'n' must be of integral type, but found {}",
+                    nelem_render(&n_val)
+                ),
+            ));
+        }
+        Bson::Int32(x) => *x as i64,
+        Bson::Int64(x) => *x,
+        Bson::Double(x) if x.is_finite() && x.fract() == 0.0 => *x as i64,
+        // Decimal128 goes to Python: whether its value is integral needs the
+        // decimal engine, and the two codes hang off exactly that question.
+        Bson::Decimal128(_) => return Err(Fallback::Defer),
+        Bson::Double(_) => {
+            return Err(Fallback::mongo(
+                5787903,
+                format!(
+                    "Value for 'n' must be of integral type, but found {}",
+                    nelem_render(&n_val)
+                ),
+            ));
+        }
+        other => {
+            return Err(Fallback::mongo(
+                5787902,
+                format!(
+                    "Value for 'n' must be of integral type, but found {}",
+                    nelem_render(other)
+                ),
+            ));
+        }
     };
     if n <= 0 {
-        return Err(Fallback::Defer); // Python raises 5787908
+        return Err(Fallback::mongo(
+            5787908,
+            format!("'n' must be greater than 0, found {n}"),
+        ));
     }
-    let arr = match eval(d.get("input").ok_or(Fallback::Defer)?, ctx)? {
+    let Some(input_expr) = d.get("input") else {
+        return Err(Fallback::mongo(5787907, "Missing value for 'input'"));
+    };
+    let arr = match eval(input_expr, ctx)? {
         Bson::Array(a) => a,
-        _ => return Err(Fallback::Defer), // null / missing / non-array -> Python raises 5788200
+        // mongod does NOT treat a null input as null here -- it raises.
+        _ => return Err(Fallback::mongo(5788200, "Input must be an array")),
     };
     Ok((n as usize, arr))
 }
@@ -1347,6 +1435,21 @@ fn coerce_index(b: &Bson) -> IdxCoerce {
     }
 }
 
+/// mongod names the POSITION argument "Second" in both the two-arg and the
+/// three-arg form, so the same text covers both.
+const SLICE_SECOND_BOOL: &str =
+    "Second argument to $slice must be a numeric value, but is of type: bool";
+
+fn slice_second_not_32bit(v: &Bson) -> Fallback {
+    Fallback::mongo(
+        28726,
+        format!(
+            "Second argument to $slice can't be represented as a 32-bit integer: {}",
+            format_double_g(as_float_like(v).unwrap_or(f64::NAN))
+        ),
+    )
+}
+
 fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::Array(a) = arg else {
         return Err(Fallback::Defer);
@@ -1363,11 +1466,11 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
     let (start, stop) = if a.len() == 2 {
         let n_v = eval(&a[1], ctx)?;
         if matches!(n_v, Bson::Boolean(_)) {
-            return Err(Fallback::Defer); // Python raises 28725
+            return Err(Fallback::mongo(28725, SLICE_SECOND_BOOL));
         }
         let n = match coerce_index(&n_v) {
             IdxCoerce::Int(n) => n,
-            IdxCoerce::Fractional => return Err(Fallback::Defer), // Python raises 28726
+            IdxCoerce::Fractional => return Err(slice_second_not_32bit(&n_v)),
             IdxCoerce::NotNumber => return Ok(Bson::Null),
         };
         if n >= 0 {
@@ -1378,12 +1481,18 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
     } else {
         let pos_v = eval(&a[1], ctx)?;
         let n_v = eval(&a[2], ctx)?;
-        if matches!(pos_v, Bson::Boolean(_)) || matches!(n_v, Bson::Boolean(_)) {
-            return Err(Fallback::Defer); // Python raises 28725 / 28727
+        if matches!(pos_v, Bson::Boolean(_)) {
+            return Err(Fallback::mongo(28725, SLICE_SECOND_BOOL));
+        }
+        if matches!(n_v, Bson::Boolean(_)) {
+            return Err(Fallback::mongo(
+                28727,
+                "Third argument to $slice must be numeric, but is of type: bool",
+            ));
         }
         let pos = match coerce_index(&pos_v) {
             IdxCoerce::Int(p) => p,
-            IdxCoerce::Fractional => return Err(Fallback::Defer), // Python raises 28726
+            IdxCoerce::Fractional => return Err(slice_second_not_32bit(&pos_v)),
             IdxCoerce::NotNumber => return Ok(Bson::Null),
         };
         let n = match coerce_index(&n_v) {
@@ -1780,18 +1889,63 @@ fn op_substr_cp(arg: &Bson, ctx: &Ctx) -> R {
     };
     let start_v = eval(&a[1], ctx)?;
     let length_v = eval(&a[2], ctx)?;
-    if matches!(start_v, Bson::Boolean(_)) || matches!(length_v, Bson::Boolean(_)) {
-        return Err(Fallback::Defer); // Python raises 34450 / 34452
+    // These five refusals used to defer so Python would raise them, which is
+    // right on the Python server and reaches a client of the standalone Rust
+    // server as "$substrCP is not supported". mongod's texts, verbatim
+    // (probed 8.2.11, 2026-09-01) -- note the mixed punctuation between the
+    // two "nonnegative" messages: 34455 ends "nonnegative integer." with a
+    // leading "the", 34454 does not. Both are mongod's.
+    if matches!(start_v, Bson::Boolean(_)) {
+        return Err(Fallback::mongo(
+            34450,
+            "$substrCP: starting index must be a numeric type (is BSON type bool)",
+        ));
     }
-    // Whole-number double coerces to int; fractional (34451/34453) and
-    // non-numeric both defer to the Python oracle.
-    let (IdxCoerce::Int(start), IdxCoerce::Int(length)) =
-        (coerce_index(&start_v), coerce_index(&length_v))
-    else {
-        return Err(Fallback::Defer);
+    if matches!(length_v, Bson::Boolean(_)) {
+        return Err(Fallback::mongo(
+            34452,
+            "$substrCP: length must be a numeric type (is BSON type bool)",
+        ));
+    }
+    let start = match coerce_index(&start_v) {
+        IdxCoerce::Int(n) => n,
+        IdxCoerce::Fractional => {
+            return Err(Fallback::mongo(
+                34451,
+                format!(
+                    "$substrCP: starting index cannot be represented as a 32-bit \
+                     integral value: {}",
+                    format_double_g(as_float_like(&start_v).unwrap_or(f64::NAN))
+                ),
+            ));
+        }
+        IdxCoerce::NotNumber => return Err(Fallback::Defer),
     };
-    if start < 0 || length < 0 {
-        return Err(Fallback::Defer); // Python raises 34455 (start) / 34454 (length)
+    let length = match coerce_index(&length_v) {
+        IdxCoerce::Int(n) => n,
+        IdxCoerce::Fractional => {
+            return Err(Fallback::mongo(
+                34453,
+                format!(
+                    "$substrCP: length cannot be represented as a 32-bit integral \
+                     value: {}",
+                    format_double_g(as_float_like(&length_v).unwrap_or(f64::NAN))
+                ),
+            ));
+        }
+        IdxCoerce::NotNumber => return Err(Fallback::Defer),
+    };
+    if start < 0 {
+        return Err(Fallback::mongo(
+            34455,
+            "$substrCP: the starting index must be nonnegative integer.",
+        ));
+    }
+    if length < 0 {
+        return Err(Fallback::mongo(
+            34454,
+            "$substrCP: length must be a nonnegative integer.",
+        ));
     }
     let chars: Vec<char> = s.chars().collect();
     let clen = chars.len() as i64;
@@ -3650,15 +3804,43 @@ fn op_floor_ceil(arg: &Bson, ctx: &Ctx, ceil: bool) -> R {
     }
 }
 
+/// Render a number the way these domain-error messages carry it, which is
+/// Python's `str()` on the operand: an int has no decimal point, a double
+/// always keeps one (`0.0`, not `0`), and the non-finites are lowercase.
+/// `format_double_roundtrip` is the `$toString` form and deliberately DROPS a
+/// whole double's `.0`, so it is the wrong renderer here.
+fn py_num_str(v: &Bson) -> String {
+    match v {
+        Bson::Int32(n) => n.to_string(),
+        Bson::Int64(n) => n.to_string(),
+        Bson::Double(d) if d.is_nan() => "nan".to_string(),
+        Bson::Double(d) if d.is_infinite() => (if *d > 0.0 { "inf" } else { "-inf" }).to_string(),
+        Bson::Double(d) => {
+            let t = format_double_roundtrip(*d);
+            if t.contains('.') || t.contains('e') {
+                t
+            } else {
+                format!("{t}.0")
+            }
+        }
+        other => format!("{other}"),
+    }
+}
+
 fn op_sqrt(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         v => {
             let f = math_float(&v)?; // bool / Decimal128 / non-numeric -> Python
-                                     // A negative argument is mongod's Location28714 — defer so
-                                     // Python raises it (NaN passes through as sqrt(nan) = nan).
+                                     // NaN passes through as sqrt(nan) = nan; a negative argument is a
+                                     // domain error mongod names, and `$sqrt` is the one operator in
+                                     // this family that omits the ", but is <v>" suffix the others carry
+                                     // (probed 8.2.11).
             if f < 0.0 {
-                Err(Fallback::Defer)
+                Err(Fallback::mongo(
+                    28714,
+                    "$sqrt's argument must be greater than or equal to 0",
+                ))
             } else {
                 Ok(Bson::Double(f.sqrt()))
             }
@@ -3684,7 +3866,13 @@ fn op_ln(arg: &Bson, ctx: &Ctx) -> R {
         v => {
             let f = math_float(&v)?;
             if f <= 0.0 {
-                Err(Fallback::Defer)
+                Err(Fallback::mongo(
+                    28766,
+                    format!(
+                        "$ln's argument must be a positive number, but is {}",
+                        py_num_str(&v)
+                    ),
+                ))
             } else {
                 Ok(Bson::Double(f.ln()))
             }
@@ -3697,10 +3885,15 @@ fn op_log10(arg: &Bson, ctx: &Ctx) -> R {
         Bson::Null => Ok(Bson::Null),
         v => {
             let f = math_float(&v)?;
-            // A non-positive argument is mongod's Location28761 — defer so
-            // Python raises it (NaN passes through as log10(nan) = nan).
+            // NaN passes through as log10(nan) = nan.
             if f <= 0.0 {
-                Err(Fallback::Defer)
+                Err(Fallback::mongo(
+                    28761,
+                    format!(
+                        "$log10's argument must be a positive number, but is {}",
+                        py_num_str(&v)
+                    ),
+                ))
             } else {
                 Ok(Bson::Double(f.log10()))
             }
@@ -3724,10 +3917,24 @@ fn op_log(arg: &Bson, ctx: &Ctx) -> R {
     let (Ok(n), Ok(base)) = (math_float(&vals[0]), math_float(&vals[1])) else {
         return Err(Fallback::Defer);
     };
-    // Out-of-domain args are mongod's Location28758 (argument) / 28759
-    // (base) — defer so Python raises them (NaN passes through as nan).
-    if n <= 0.0 || base <= 0.0 || base == 1.0 {
-        return Err(Fallback::Defer);
+    // Out-of-domain args, named rather than deferred (NaN passes through).
+    if n <= 0.0 {
+        return Err(Fallback::mongo(
+            28758,
+            format!(
+                "$log's argument must be a positive number, but is {}",
+                py_num_str(&vals[0])
+            ),
+        ));
+    }
+    if base <= 0.0 || base == 1.0 {
+        return Err(Fallback::mongo(
+            28759,
+            format!(
+                "$log's base must be a positive number not equal to 1, but is {}",
+                py_num_str(&vals[1])
+            ),
+        ));
     }
     // CPython's math.log(n, base) is log(n)/log(base); same operations -> same
     // result under the shared platform libm.
@@ -3770,7 +3977,10 @@ fn op_pow(arg: &Bson, ctx: &Ctx) -> R {
         return Err(Fallback::Defer);
     };
     if a == 0.0 && b < 0.0 {
-        return Err(Fallback::Defer); // Python raises 28764 (base 0, negative exponent)
+        return Err(Fallback::mongo(
+            28764,
+            "$pow cannot take a base of 0 and a negative exponent",
+        ));
     }
     // f64::powf already yields NaN for a negative base with a fractional
     // exponent (matching mongod / the Python complex->NaN guard).
@@ -3780,26 +3990,88 @@ fn op_pow(arg: &Bson, ctx: &Ctx) -> R {
 // Shared arg parse for `$round` / `$trunc`: `[n, place?]` or a bare `n`. A
 // non-integer `place` becomes 0 (mirrors the Python impls). An empty list defers
 // (Python raises / index-errors).
-fn round_trunc_args(arg: &Bson, ctx: &Ctx) -> Result<(Bson, i32), Fallback> {
+/// The inclusive range mongod accepts for a `$round` / `$trunc` precision.
+const PRECISION_MIN: i64 = -20;
+const PRECISION_MAX: i64 = 100;
+
+/// `Value::integral()` is a 32-BIT test, not a "has no fractional part" test,
+/// which is why an int64 precision of 2^31 is refused as "not integral" while
+/// 2^31 - 1 gets as far as the range check. Probed 8.2.11, 2026-09-01.
+const INT32_MIN_F: f64 = i32::MIN as f64;
+const INT32_MAX_F: f64 = i32::MAX as f64;
+
+/// Validate a `$round` / `$trunc` precision the way mongod does. Three steps in
+/// this order, each with its own code:
+///
+/// 1. `Value::coerceToLong` — a non-numeric (string, bool, ...) is
+///    Location16004, a NaN / Infinity is Location31109.
+/// 2. `Value::integral()` — Location51082.
+/// 3. the `[-20, 100]` bounds — Location51083.
+///
+/// `Ok(None)` means a null / missing precision, which makes the whole operator
+/// null. Mirrors `expressions.py::_round_precision`.
+fn round_precision(place: &Bson, op: &str) -> Result<Option<i64>, Fallback> {
+    let value: f64 = match place {
+        Bson::Null | Bson::Undefined => return Ok(None),
+        Bson::Int32(n) => *n as f64,
+        Bson::Int64(n) => *n as f64,
+        Bson::Double(d) => *d,
+        // The canonical decimal string parses exactly over the whole region
+        // this function can accept; anything it cannot represent is far outside
+        // the int32 window and lands on Location51082 either way.
+        Bson::Decimal128(d) => d.to_string().parse::<f64>().unwrap_or(f64::NAN),
+        other => {
+            return Err(Fallback::mongo(
+                16004,
+                format!(
+                    "can't convert from BSON type {} to long",
+                    crate::query::bson_type_name(other)
+                ),
+            ));
+        }
+    };
+    if !value.is_finite() {
+        return Err(Fallback::mongo(
+            31109,
+            format!(
+                "Can't coerce out of range value {} to long",
+                format_double_g(value)
+            ),
+        ));
+    }
+    if !(INT32_MIN_F..=INT32_MAX_F).contains(&value) || value.fract() != 0.0 {
+        return Err(Fallback::mongo(
+            51082,
+            // The doubled space after "to" is mongod's own.
+            format!("precision argument to  {op} must be a integral value"),
+        ));
+    }
+    let n = value as i64;
+    if !(PRECISION_MIN..=PRECISION_MAX).contains(&n) {
+        return Err(Fallback::mongo(
+            51083,
+            format!(
+                "cannot apply {op} with precision value {n} value must be in \
+                 [{PRECISION_MIN}, {PRECISION_MAX}]"
+            ),
+        ));
+    }
+    Ok(Some(n))
+}
+
+fn round_trunc_args(arg: &Bson, ctx: &Ctx, op: &str) -> Result<(Bson, Option<i32>), Fallback> {
     match arg {
         Bson::Array(a) if !a.is_empty() => {
             let n = eval(&a[0], ctx)?;
             let place = if a.len() > 1 {
-                match eval(&a[1], ctx)? {
-                    Bson::Boolean(_) => return Err(Fallback::Defer), // Python raises 16004
-                    Bson::Int32(i) => i,
-                    Bson::Int64(i) => i as i32,
-                    Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => d as i32,
-                    Bson::Double(_) => return Err(Fallback::Defer), // fractional -> Python raises 51082
-                    _ => 0,
-                }
+                round_precision(&eval(&a[1], ctx)?, op)?.map(|p| p as i32)
             } else {
-                0
+                Some(0)
             };
             Ok((n, place))
         }
         Bson::Array(_) => Err(Fallback::Defer),
-        other => Ok((eval(other, ctx)?, 0)),
+        other => Ok((eval(other, ctx)?, Some(0))),
     }
 }
 
@@ -3807,7 +4079,12 @@ fn round_trunc_args(arg: &Bson, ctx: &Ctx) -> Result<(Bson, i32), Fallback> {
 // for place >= 0; rounded to the 10^|place| place for place < 0); a double rounds
 // to `place` decimals as a double. Mirrors `expressions._op_round`.
 fn op_round(arg: &Bson, ctx: &Ctx) -> R {
-    let (n, place) = round_trunc_args(arg, ctx)?;
+    let (n, place) = round_trunc_args(arg, ctx, "$round")?;
+    let Some(place) = place else {
+        // A null precision makes the whole operator null, which is
+        // distinct from a precision of 0.
+        return Ok(Bson::Null);
+    };
     match n {
         Bson::Null => Ok(Bson::Null),
         Bson::Int32(_) | Bson::Int64(_) => {
@@ -3834,7 +4111,12 @@ fn op_round(arg: &Bson, ctx: &Ctx) -> R {
 // `math.trunc(n * 10**place) / 10**place`, and `/` is float division, so the
 // result is always a double (even for an int input). Mirrors `_op_trunc`.
 fn op_trunc(arg: &Bson, ctx: &Ctx) -> R {
-    let (n, place) = round_trunc_args(arg, ctx)?;
+    let (n, place) = round_trunc_args(arg, ctx, "$trunc")?;
+    let Some(place) = place else {
+        // A null precision makes the whole operator null, which is
+        // distinct from a precision of 0.
+        return Ok(Bson::Null);
+    };
     match n {
         Bson::Null => Ok(Bson::Null),
         _ => {
@@ -4210,12 +4492,35 @@ fn op_replace(arg: &Bson, ctx: &Ctx, all: bool) -> R {
 
 const MAX_RANGE_SIZE: i128 = 100_000;
 
-fn range_int(b: &Bson) -> Result<i64, Fallback> {
-    // int or whole-number double is the value; bool / fractional double /
-    // non-number all defer to the Python oracle (which raises 34443-34448).
+/// One `$range` argument. mongod has a separate code for each position and for
+/// each of the two ways it can be wrong -- non-numeric vs not representable as
+/// a 32-bit integer -- so this takes both. These used to defer, which on the
+/// standalone Rust server told the client `$range` itself was unsupported.
+///
+/// The "type:bool" run-together in the STEP message is mongod's own; the
+/// starting and ending messages have the space. Probed 8.2.11, 2026-09-01.
+fn range_int(b: &Bson, which: &str, numeric_code: i32, repr_code: i32) -> Result<i64, Fallback> {
+    if matches!(b, Bson::Boolean(_)) || as_float_like(b).is_none() {
+        let sep = if numeric_code == 34447 { "" } else { " " };
+        return Err(Fallback::mongo(
+            numeric_code,
+            format!(
+                "$range requires a numeric {which} value, found value of type:{sep}{}",
+                crate::query::bson_type_name(b)
+            ),
+        ));
+    }
     match coerce_index(b) {
         IdxCoerce::Int(i) => Ok(i),
-        _ => Err(Fallback::Defer),
+        _ => Err(Fallback::mongo(
+            repr_code,
+            format!(
+                "$range requires {} {which} value that can be represented as a \
+                 32-bit integer, found value: {}",
+                if which == "ending" { "an" } else { "a" },
+                format_double_g(as_float_like(b).unwrap_or(f64::NAN))
+            ),
+        )),
     }
 }
 
@@ -4226,15 +4531,24 @@ fn op_range(arg: &Bson, ctx: &Ctx) -> R {
     if !(2..=3).contains(&a.len()) {
         return Err(Fallback::Defer);
     }
-    let start = range_int(&eval(&a[0], ctx)?)? as i128;
-    let end = range_int(&eval(&a[1], ctx)?)? as i128;
-    let step = if a.len() == 3 {
-        range_int(&eval(&a[2], ctx)?)? as i128
+    // mongod validates all three for TYPE first, then all three for
+    // representability -- so `{$range: ["x", 5.5]}` reports the string, not the
+    // 5.5. Matching that order is why the two checks are separate codes here.
+    let start_v = eval(&a[0], ctx)?;
+    let end_v = eval(&a[1], ctx)?;
+    let step_v = if a.len() == 3 {
+        eval(&a[2], ctx)?
     } else {
-        1
+        Bson::Int32(1)
     };
+    let start = range_int(&start_v, "starting", 34443, 34444)? as i128;
+    let end = range_int(&end_v, "ending", 34445, 34446)? as i128;
+    let step = range_int(&step_v, "step", 34447, 34448)? as i128;
     if step == 0 {
-        return Err(Fallback::Defer);
+        return Err(Fallback::mongo(
+            34449,
+            "$range requires a non-zero step value",
+        ));
     }
     let delta = end - start;
     if (delta > 0) == (step > 0) && delta != 0 {

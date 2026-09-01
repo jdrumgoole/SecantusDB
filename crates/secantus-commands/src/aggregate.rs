@@ -893,17 +893,7 @@ fn core_run(
         // reply below, which told the client the server could not do `$round`
         // when in fact `$round` is fine and 1.5 is not a precision.
         if let Some((code, errmsg)) = fault.as_mongo() {
-            // Which prefix mongod uses is decided by WHEN it failed, and the
-            // test for that is exact: mongod constant-folds at optimization
-            // time, before any document exists, so an expression that still
-            // fails against NO documents is the folded one. Probed 8.2.11
-            // (2026-09-01) over ten shapes -- error-on-empty matched "Failed to
-            // optimize pipeline" and no-error-on-empty matched "Executor error"
-            // in every one.
-            let folded = matches!(
-                secantus_core::aggregate::apply_pipeline(Vec::new(), stages, vars, collation),
-                Err(ref f) if f.as_mongo().is_some()
-            );
+            let folded = fault.folded();
             let errmsg = wrap_pipeline_error(errmsg.to_string(), folded, ns);
             return CommandError::new(code, crate::util::error_code_name(code), errmsg);
         }

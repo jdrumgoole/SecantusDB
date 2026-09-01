@@ -1334,7 +1334,12 @@ def test_math_and_range_fuzz():
         )
         for op in ("$abs", "$floor", "$ceil", "$sqrt"):
             expr = {op: v}
-            rust = _rust_eval(expr, {})
+            try:
+                rust = _rust_eval(expr, {})
+            except RustMongoError as exc:
+                # e.g. $sqrt of a negative — a domain error mongod names.
+                assert_named_error_matches_pure(exc, expr)
+                continue
             if rust is None:
                 continue
             try:
@@ -1346,7 +1351,11 @@ def test_math_and_range_fuzz():
         lo, hi = rng.randint(-20, 20), rng.randint(-20, 20)
         step = rng.choice([1, 2, 3, -1, -2])
         expr = {"$range": [lo, hi, step]}
-        rust = _rust_eval(expr, {})
+        try:
+            rust = _rust_eval(expr, {})
+        except RustMongoError as exc:
+            assert_named_error_matches_pure(exc, expr)
+            continue
         if rust is not None:
             assert rust == _pure.evaluate(expr, {}), f"$range lo={lo} hi={hi} step={step}"
 
@@ -1425,18 +1434,22 @@ def test_randomised_fuzz_parity():
     ],
 )
 def test_array_set_typeguard_defers_and_raises(expr, code):
-    # A non-array/non-object argument to these operators: Rust must *defer* (the
-    # raw evaluate returns None) so the pure engine raises mongod's exact
-    # Location code — checking the raw result, not `_rust_eval`, because a
+    # A non-array/non-object argument to these operators. Rust must NOT answer a
+    # value: it either defers (raw evaluate returns None) so the pure engine
+    # raises mongod's exact Location code, or -- better -- names that same error
+    # itself. Checking the RAW result rather than `_rust_eval`, because a
     # computed BSON null would also decode to Python None and hide a silent
     # accept (as it did for $arrayElemAt before the Rust fix).
     doc = bson.decode(bson.encode({"_id": 1}))
     expr = bson.decode(bson.encode({"e": expr}))["e"]
     raw = _rust.evaluate(bson.encode(doc), bson.encode({"e": expr}), bson.encode({}))
-    assert raw is None
+    named = None if raw is None else bson.decode(raw).get("err")
+    assert raw is None or named is not None, f"Rust answered a value for {expr}"
     with pytest.raises(_pure.ExpressionError) as exc:
         _pure.evaluate(expr, doc)
     assert exc.value.code == code
+    if named is not None:
+        assert (named["code"], named["errmsg"]) == (exc.value.code, str(exc.value))
 
 
 @pytest.mark.parametrize(
