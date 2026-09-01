@@ -82,4 +82,44 @@ print(f"total {len(rows)}  divergent {len(bad)}")
 for q, d, r in bad:
     print(f"  {q:16s} doc={d:12s} " + "  ".join(f"{k}={v}" for k, v in r.items()))
 
+
+# A sort-order change is only safe if the INDEX agrees with it: the entry
+# encoder writes its own sort key, so the two can disagree and an index then
+# changes the sort answer (that is what the JavaScript rank bug was).
+SORT_CORPUS = [
+    Regex("b", ""),
+    Regex("a", "m"),
+    Regex("a", ""),
+    Regex("ab", ""),
+    Regex("a", "mi"),
+    Regex("A", ""),
+    Regex("a", "i"),
+    Regex("", ""),
+]
+
+
+def sorted_ids(cli, indexed):
+    c = cli["rxsort"]["idx" if indexed else "plain"]
+    c.drop()
+    c.insert_many([{"_id": i, "v": v} for i, v in enumerate(SORT_CORPUS)])
+    if indexed:
+        c.create_index([("v", 1)])
+    return [d["_id"] for d in c.find({}, {"_id": 1}).sort("v", 1)]
+
+
+print("\nregex sort, indexed vs unindexed:")
+reference = None
+for label, cli in targets:
+    plain, idx = sorted_ids(cli, False), sorted_ids(cli, True)
+    if reference is None:
+        reference = plain
+    notes = []
+    if plain != idx:
+        notes.append("INDEXED != UNINDEXED")
+        bad += 1
+    if plain != reference:
+        notes.append("differs from mongod")
+        bad += 1
+    print(f"  {label:8s} unindexed={plain} indexed={idx} {' '.join(notes)}")
+
 sys.exit(1 if bad else 0)
