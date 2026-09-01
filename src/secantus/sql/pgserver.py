@@ -974,6 +974,34 @@ class SecantusPGServer:
         conn.sendall(pgwire.command_complete(f"COPY {n}"))
         conn.sendall(pgwire.ready_for_query(session.txn_status()))
 
+    #: Rows buffered between cancellation checks during COPY … TO STDOUT.
+    #: Small enough that an abort is noticed promptly, large enough that a
+    #: big copy does not become one syscall per row.
+    _COPY_OUT_FLUSH_ROWS = 128
+
+    @staticmethod
+    def _copy_out_flush(conn: socket.socket, session: Session, buf: bytearray) -> None:
+        """Send one batch of CopyData, first observing a pending cancel.
+
+        COPY TO used to materialise the whole result and hand it to a single
+        ``sendall``, so a client that read one row and abandoned the copy found
+        it already finished: the transaction stayed INTRANS where PostgreSQL
+        leaves it INERROR (probed on 14.13 with a 200k-row copy — a small one
+        buffers on both servers and shows nothing). There was no point at which
+        the stream could notice the CancelRequest, even though the machinery to
+        deliver it already existed — `session.py` had described the "COPY TO row
+        stream" as a cancellation point since before it was one.
+
+        Raising here is enough: `_handle_copy` already marks the enclosing block
+        failed and answers ErrorResponse + ReadyForQuery for any `SQLError`.
+        """
+        if session.cancel_event.is_set():
+            session.cancel_event.clear()
+            raise errors.SQLError("57014", "canceling statement due to user request")
+        if buf:
+            conn.sendall(bytes(buf))
+            buf.clear()
+
     def _copy_out(self, conn: socket.socket, session: Session, catalog: Any, plan: Any) -> None:
         if plan.fmt == "binary":
             self._copy_out_binary(conn, session, plan)
@@ -1009,12 +1037,13 @@ class SecantusPGServer:
             chunks += [
                 copyfmt.format_text([row], delimiter=plan.delimiter, null=plan.null) for row in rows
             ]
-        if chunks:
-            out = bytearray()
-            for chunk in chunks:
-                if chunk:
-                    out += pgwire.copy_data(pgwire.encode_text(chunk, session.wire_encoding))
-            conn.sendall(bytes(out))
+        out = bytearray()
+        for i, chunk in enumerate(chunks):
+            if chunk:
+                out += pgwire.copy_data(pgwire.encode_text(chunk, session.wire_encoding))
+            if (i + 1) % self._COPY_OUT_FLUSH_ROWS == 0:
+                self._copy_out_flush(conn, session, out)
+        self._copy_out_flush(conn, session, out)
         conn.sendall(pgwire.copy_done())
         conn.sendall(pgwire.command_complete(f"COPY {len(rows)}"))
         conn.sendall(pgwire.ready_for_query(session.txn_status()))
@@ -1033,6 +1062,7 @@ class SecantusPGServer:
         # (psycopg's copy.read() row framing depends on it); each later row is
         # its own message and the int16 -1 trailer ends the stream.
         pending = bytearray(_PGCOPY_SIGNATURE + struct.pack("!ii", 0, 0))
+        sent = 0
         for row in rows:
             buf = bytearray(struct.pack("!h", len(plan.columns)))
             for value, oid, tag in zip(row, plan.col_oids, plan.col_tags, strict=True):
@@ -1044,10 +1074,13 @@ class SecantusPGServer:
             pending += buf
             out += pgwire.copy_data(bytes(pending))
             pending = bytearray()
+            sent += 1
+            if sent % self._COPY_OUT_FLUSH_ROWS == 0:
+                self._copy_out_flush(conn, session, out)
         if pending:  # zero rows — the header still has to go out
             out += pgwire.copy_data(bytes(pending))
         out += pgwire.copy_data(struct.pack("!h", -1))
-        conn.sendall(bytes(out))
+        self._copy_out_flush(conn, session, out)
         conn.sendall(pgwire.copy_done())
         conn.sendall(pgwire.command_complete(f"COPY {len(rows)}"))
         conn.sendall(pgwire.ready_for_query(session.txn_status()))
