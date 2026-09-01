@@ -1930,7 +1930,7 @@ def _shift_date_in_zone(
     boundary was an hour out. Sub-day units (`hour` and below) are absolute and
     unaffected, which is why a 24-`hour` shift is NOT the same as a 1-`day` one.
     """
-    if tz is None or unit in _SUBDAY_UNIT_SECONDS:
+    if tz is None or unit in _SUBDAY_UNIT_MS:
         return _shift_date(d, unit, amount)
     aware = d if d.tzinfo is not None else d.replace(tzinfo=_dt.timezone.utc)
     local = aware.astimezone(tz).replace(tzinfo=None)
@@ -2060,11 +2060,16 @@ ZONE -- not from the epoch, and not from year 1. Probed 8.2.11 (2026-09-01):
 
 _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
-_SUBDAY_UNIT_SECONDS = {
-    "hour": 3600.0,
-    "minute": 60.0,
-    "second": 1.0,
-    "millisecond": 0.001,
+# Integer MILLISECONDS, not float seconds. The first version of this divided
+# `timedelta.total_seconds()` -- a float -- by a float step, and the rounding
+# put `$dateDiff` in milliseconds one out over a twenty-year span (mongod and
+# the Rust engine both answer the exact integer). `timedelta // timedelta` is
+# exact integer floor division, so nothing here goes through a float.
+_SUBDAY_UNIT_MS = {
+    "hour": 3_600_000,
+    "minute": 60_000,
+    "second": 1000,
+    "millisecond": 1,
 }
 
 
@@ -2101,10 +2106,10 @@ def _date_bin_index(
       zone like `Asia/Kolkata` puts hour boundaries on the half hour.
     """
     local = aware.astimezone(zone).replace(tzinfo=None)
-    if unit in _SUBDAY_UNIT_SECONDS:
+    if unit in _SUBDAY_UNIT_MS:
         reference = _localize(_TRUNC_REFERENCE, zone).astimezone(_dt.timezone.utc)
-        step = _SUBDAY_UNIT_SECONDS[unit] * bin_size
-        return math.floor((aware - reference).total_seconds() / step)
+        step = _dt.timedelta(milliseconds=_SUBDAY_UNIT_MS[unit] * bin_size)
+        return (aware - reference) // step
     if unit == "year":
         return (local.year - _TRUNC_REFERENCE.year) // bin_size
     if unit == "quarter":
@@ -2149,14 +2154,14 @@ def _truncate_date(
         utc = instant.astimezone(_dt.timezone.utc)
         return utc if date.tzinfo is not None else utc.replace(tzinfo=None)
 
-    if unit in _SUBDAY_UNIT_SECONDS:
+    if unit in _SUBDAY_UNIT_MS:
         # In UTC, deliberately. Adding a `timedelta` to a ZONE-AWARE datetime is
         # WALL-CLOCK arithmetic: the local reading advances and the offset is
         # re-resolved, so crossing a DST boundary silently moves the instant by
         # an hour. Anchoring in UTC keeps this absolute.
         reference = _localize(_TRUNC_REFERENCE, zone).astimezone(_dt.timezone.utc)
-        step = _SUBDAY_UNIT_SECONDS[unit] * bin_size
-        return answer(reference + _dt.timedelta(seconds=index * step))
+        step = _dt.timedelta(milliseconds=_SUBDAY_UNIT_MS[unit] * bin_size)
+        return answer(reference + index * step)
 
     if unit == "year":
         truncated = _dt.datetime(_TRUNC_REFERENCE.year + index * bin_size, 1, 1)
