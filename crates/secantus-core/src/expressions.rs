@@ -5105,11 +5105,34 @@ pub fn py_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
         }
         _ => {}
     }
-    if matches!(a, Bson::Decimal128(_))
-        || matches!(b, Bson::Decimal128(_))
-        || is_exotic(a)
-        || is_exotic(b)
-    {
+    // Decimal128 used to defer here, and the cost of that was out of all
+    // proportion to the operator: the oplog update-diff walks every field of
+    // the OLD and NEW document through `py_eq`, so a single Decimal128 anywhere
+    // in a document made `compute_update_description` defer -- and a defer on
+    // the standalone Rust server is an error, so `{$set: {z: 1}}` against a
+    // document holding one answered "query uses a construct the Rust server
+    // does not support". A collection with a Decimal128 field was effectively
+    // un-updatable (probed 2026-09-01).
+    //
+    // `numeric::classify` has handled Decimal128 all along -- only the
+    // `fast_cmp_numberish` path above declines it -- so the comparison is
+    // already available; equality just was not asking for it. NaN equals NaN
+    // for query purposes (see the note below), which `numeric::cmp` reports as
+    // incomparable, so that case is answered before asking.
+    if matches!(a, Bson::Decimal128(_)) || matches!(b, Bson::Decimal128(_)) {
+        if is_exotic(a) || is_exotic(b) {
+            return Err(Fallback::Defer);
+        }
+        let (Some(na), Some(nb)) = (numeric::classify(a), numeric::classify(b)) else {
+            // One side is not a number at all: different BSON types, not equal.
+            return Ok(false);
+        };
+        if crate::query::is_nan_bson(a) || crate::query::is_nan_bson(b) {
+            return Ok(crate::query::is_nan_bson(a) && crate::query::is_nan_bson(b));
+        }
+        return Ok(numeric::cmp(&na, &nb) == Some(std::cmp::Ordering::Equal));
+    }
+    if is_exotic(a) || is_exotic(b) {
         return Err(Fallback::Defer);
     }
     // A bool is NOT a number to mongod, so `{$eq: [true, 1]}` is false. The

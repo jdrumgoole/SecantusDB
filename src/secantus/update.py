@@ -6,8 +6,9 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from bson import Int64
+from bson import Code, Int64
 
+from secantus.bsontypes import Int64CoercionError, bson_value_repr, coerce_int64_argument
 from secantus.numerics import IntegerOverflowError, bson_add, bson_mul
 from secantus.paths import get_path, has_path, path_block, set_path, unset_path
 
@@ -152,43 +153,17 @@ def _bson_type_name(v: Any) -> str:
     return bson_type_name(v)
 
 
-def _render_bson_scalar(v: Any) -> str:
-    """A mongod-ish rendering of a scalar for an error message: ``true`` /
-    ``false`` / ``null`` lowercase, strings double-quoted, ObjectId in its
-    constructor form, else ``str()``."""
-    from bson import ObjectId
-
-    if v is True:
-        return "true"
-    if v is False:
-        return "false"
-    if v is None:
-        return "null"
-    if isinstance(v, str):
-        return f'"{v}"'
-    if isinstance(v, ObjectId):
-        # `str(ObjectId)` is the bare hex; mongod prints `ObjectId('…')`, and
-        # this is the *default* `_id` type, so it's the common case in the
-        # `$inc`/`$mul` type-error message below.
-        return f"ObjectId('{v}')"
-    return str(v)
-
-
-def _render_bson_value(v: Any) -> str:
-    """``_render_bson_scalar`` extended to arrays and sub-documents.
-
-    mongod spaces the brackets -- ``[ 1 ]``, ``{ a: 1 }`` -- which is what its
-    ``PathNotViable`` message prints for the element in the way.
-    """
-    if isinstance(v, Mapping):
-        if not v:
-            return "{}"
-        return "{ " + ", ".join(f"{k}: {_render_bson_value(x)}" for k, x in v.items()) + " }"
-    if isinstance(v, list):
-        if not v:
-            return "[]"
-        return "[ " + ", ".join(_render_bson_value(x) for x in v) + " ]"
-    return _render_bson_scalar(v)
+#: mongod echoes an offending value in its own shell-ish rendering, and this
+#: module used to carry TWO partial copies of that: `_render_bson_scalar`
+#: (scalars only) and `_render_bson_value` (containers, delegating to the
+#: first). `$inc` / `$mul` / `$pop` / `$rename` all called the SCALAR one, so an
+#: array argument printed Python's `[1]` where mongod prints `[ 1 ]` and a
+#: sub-document printed `{'a': 1}` where mongod prints `{ a: 1 }`. Both names
+#: now point at the one canonical renderer in `bsontypes`, which is where this
+#: kind of vocabulary lives precisely because it had already drifted into
+#: several copies once.
+_render_bson_scalar = bson_value_repr
+_render_bson_value = bson_value_repr
 
 
 def _set_path(doc: dict[str, Any], path: str, value: Any) -> None:
@@ -286,7 +261,11 @@ def _apply_push(arr: list[Any], value: Any) -> list[Any]:
         raise UpdateError(f"Unrecognized $push modifier: {next(iter(unknown))!r}")
     each = value["$each"]
     if not isinstance(each, list):
-        raise UpdateError("$each must be an array")
+        raise UpdateError(
+            "The argument to $each in $push must be an array but it was of "
+            f"type: {_bson_type_name(each)}",
+            code=2,
+        )
     position = value.get("$position")
     if position is not None:
         if not isinstance(position, int) or isinstance(position, bool):
@@ -891,6 +870,14 @@ def _apply_op(
             if isinstance(opts, bool):
                 stamp: Any = _dt.datetime.now(_dt.timezone.utc)
             elif isinstance(opts, Mapping):
+                # An unrecognized KEY is reported before the `$type` value is
+                # looked at -- `{$type: "date", a: 1}` names `a` even though the
+                # `$type` is perfectly valid (probed 8.2.11, 2026-09-01). This
+                # answered the generic "'$type' string field is required"
+                # message for every one of those.
+                for key in opts:
+                    if key != "$type":
+                        raise UpdateError(f"Unrecognized $currentDate option: {key}", code=2)
                 kind = opts.get("$type")
                 if kind == "date":
                     stamp = _dt.datetime.now(_dt.timezone.utc)
@@ -1015,7 +1002,14 @@ def _apply_op(
                 # `$each` adds each element (deduped); otherwise the value itself.
                 to_add = value["$each"] if _is_each_modifier(value) else [value]
                 if _is_each_modifier(value) and not isinstance(value["$each"], list):
-                    raise UpdateError("$each must be an array")
+                    # `$addToSet` words this differently from `$push`: it names
+                    # itself, and omits the colon before the type. mongod's own
+                    # inconsistency, reproduced verbatim.
+                    raise UpdateError(
+                        "The argument to $each in $addToSet must be an array but "
+                        f"it was of type {_bson_type_name(value['$each'])}",
+                        code=2,
+                    )
                 for elem in to_add:
                     # `elem not in arr` uses Python `==`, which compares dicts
                     # ORDER-INSENSITIVELY. mongod does not: `{y: 2, x: 1}` is a
@@ -1057,13 +1051,19 @@ def _apply_op(
             # "not a number" (code 9), and a number other than ±1 is
             # "$pop expects 1 or -1" (code 9). Python's bool-is-int would treat
             # `True` as `1` (pop last) without this guard.
-            if isinstance(direction, bool) or not isinstance(direction, (int, float)):
+            try:
+                direction = coerce_int64_argument(direction, path)
+            except TypeError:
                 raise UpdateError(
-                    f"Expected a number in: {path}: {_render_bson_scalar(direction)}", code=9
-                )
+                    f"Expected a number in: {path}: {bson_value_repr(direction)}", code=9
+                ) from None
+            except Int64CoercionError as exc:
+                # NaN / out-of-range / fractional each have their own message,
+                # and this used to answer "$pop expects 1 or -1" for all three.
+                raise UpdateError(exc.message, code=exc.code) from None
             if direction not in (1, -1):
                 raise UpdateError(
-                    f"$pop expects 1 or -1, found: {_render_bson_scalar(direction)}", code=9
+                    f"$pop expects 1 or -1, found: {bson_value_repr(direction)}", code=9
                 )
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 arr = get_path(doc, concrete, default=None)
@@ -1088,10 +1088,10 @@ def _apply_op(
             # mongod validates the whole $rename spec before touching the doc —
             # otherwise several of these silently corrupt data or leak a raw
             # Python exception (e.g. a non-string target hit `new.split`).
-            if not isinstance(new, str):
-                tgt = "true" if new is True else "false" if new is False else str(new)
+            if not isinstance(new, str) or isinstance(new, Code):
                 raise UpdateError(
-                    f"The 'to' field for $rename must be a string: {old}: {tgt}", code=2
+                    f"The 'to' field for $rename must be a string: {old}: {bson_value_repr(new)}",
+                    code=2,
                 )
             if old == "" or new == "":
                 raise UpdateError("An empty update path is not valid.", code=56)
@@ -1142,23 +1142,51 @@ def _apply_op(
         for path, ops in payload.items():
             # mongod applies every listed operation to the field in order
             # (e.g. {and: X, or: Y} is (v & X) | Y), not just a single op.
-            if not isinstance(ops, Mapping) or not ops:
-                raise UpdateError("$bit requires a document with at least one bitwise operation")
+            # mongod separates "that is not a document at all" from "that is
+            # an EMPTY document"; this answered one generic FailedToParse (9)
+            # for both, where mongod uses BadValue (2) with two different texts.
+            # The unbalanced braces in both are mongod's own.
+            if not isinstance(ops, Mapping):
+                raise UpdateError(
+                    f"The $bit modifier is not compatible with a {_bson_type_name(ops)}. "
+                    "You must pass in an embedded document: "
+                    "{$bit: {field: {and/or/xor: #}}",
+                    code=2,
+                )
+            if not ops:
+                raise UpdateError(
+                    "You must pass in at least one bitwise operation. The format is: "
+                    "{$bit: {field: {and/or/xor: #}}",
+                    code=2,
+                )
             parsed_ops: list[tuple[str, int]] = []
             for bit_op, mask in ops.items():
                 if bit_op not in ("and", "or", "xor"):
-                    raise UpdateError(f"$bit unsupported sub-op: {bit_op}")
+                    raise UpdateError(
+                        f"The $bit modifier only supports 'and', 'or', and 'xor', not "
+                        f"'{bit_op}' which is an unknown operator: "
+                        f"{{{bit_op}: {bson_value_repr(mask)}}}",
+                        code=2,
+                    )
                 if not isinstance(mask, int) or isinstance(mask, bool):
+                    # mongod echoes the offending sub-document and ends with a
+                    # colon, not a full stop.
                     raise UpdateError(
                         "The $bit modifier field must be an Integer(32/64 bit); a "
-                        f"'{_bson_type_name(mask)}' is not supported here.",
+                        f"'{_bson_type_name(mask)}' is not supported here: "
+                        f"{{{bit_op}: {bson_value_repr(mask)}}}",
                         code=2,
                     )
                 parsed_ops.append((bit_op, mask))
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 current = get_path(doc, concrete, default=0) or 0
                 if not isinstance(current, int) or isinstance(current, bool):
-                    raise UpdateError(f"$bit on non-integer at {concrete!r}")
+                    raise _exec_error(
+                        "Cannot apply $bit to a value of non-integral type."
+                        f"_id: {bson_value_repr(doc.get('_id'))} has the field "
+                        f"{concrete} of non-integer type {_bson_type_name(current)}",
+                        code=2,
+                    )
                 for bit_op, mask in parsed_ops:
                     if bit_op == "and":
                         current = current & mask

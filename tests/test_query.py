@@ -259,15 +259,22 @@ def test_in_with_regex() -> None:
 
 
 def test_not_argument_validation() -> None:
-    # mongod: $not needs a regex or a non-empty document; scalar/array/bool ->
-    # "needs a regex or a document", empty doc -> "cannot be empty" (both code 2).
+    # mongod's wording, re-probed against 8.2.11 (2026-09-01) -- both code 2.
     for bad in (5, "x", [], True):
         with pytest.raises(QueryError) as exc:
             matches({"a": 5}, {"a": {"$not": bad}})
-        assert exc.value.code == 2 and "needs a regex or a document" in str(exc.value)
+        assert exc.value.code == 2
+        assert str(exc.value) == "$not argument must be a regex or an object"
     with pytest.raises(QueryError) as exc:
         matches({"a": 5}, {"a": {"$not": {}}})
-    assert exc.value.code == 2 and "cannot be empty" in str(exc.value)
+    assert exc.value.code == 2
+    assert str(exc.value) == "$not argument must be a non-empty object"
+    # Every key inside `$not` must be an OPERATOR. A document of ordinary field
+    # names used to degrade to an equality match that `$not` then negated, so
+    # `{a: {$not: {b: 1}}}` MATCHED where mongod refuses the query.
+    with pytest.raises(QueryError) as exc:
+        matches({"a": 5}, {"a": {"$not": {"b": 1}}})
+    assert exc.value.code == 2 and str(exc.value) == "unknown operator: b"
     # A regex and an operator document are valid.
     assert matches({"a": 5}, {"a": {"$not": Regex("x")}})
     assert not matches({"a": 5}, {"a": {"$not": {"$gt": 3}}})

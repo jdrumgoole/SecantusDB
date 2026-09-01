@@ -10,6 +10,9 @@ from typing import Any
 
 from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex
 
+from secantus.bsontypes import Int64CoercionError, coerce_int64_argument
+from secantus.bsontypes import bson_value_repr as _mongo_bson_repr
+from secantus.bsontypes import fmt_double_g as _fmt_g
 from secantus.collation import Collation
 from secantus.collation import compare_keys as _coll_compare
 from secantus.collation import equal as _coll_equal
@@ -84,12 +87,12 @@ def _match_clause(
         # ``{$or: true}``, which leaked out of the QueryError catch and
         # surfaced as a generic InternalError (1) instead of mongod's BadValue.
         if not isinstance(condition, list):
-            raise QueryError(f"{key} must be an array")
+            raise QueryError(f"{key} argument must be an array")
         if not condition:
-            raise QueryError(f"{key} must be a nonempty array")
+            raise QueryError(f"{key} argument must be a non-empty array")
         for c in condition:
             if not isinstance(c, Mapping):
-                raise QueryError(f"{key} entries need to be full objects")
+                raise QueryError(f"{key} argument's entries must be objects")
         if key == "$and":
             return all(matches(doc, c, vars=vars, collation=collation) for c in condition)
         if key == "$or":
@@ -119,7 +122,10 @@ def _match_clause(
                 code_name="FailedToParse",
             ) from exc
     if key.startswith("$"):
-        raise QueryError(f"unsupported top-level operator: {key}")
+        raise QueryError(
+            f"unknown top level operator: {key}. If you have a field name that "
+            "starts with a '$' symbol, consider using $getField or $setField."
+        )
     return _field_matches(_resolve_path(doc, key), condition, collation, field=key)
 
 
@@ -443,6 +449,39 @@ def _resolve_path(doc: Any, path: str) -> list[Any]:
 # per clause inside _field_matches).
 _SIBLING_MODIFIERS = frozenset(("$options", "$maxDistance", "$minDistance"))
 
+#: Every field-level operator `_op_matches` dispatches, plus the sibling
+#: modifiers that tune one. `$not` validates its inner document against this:
+#: mongod requires those keys to be operators, and a document of ordinary field
+#: names used to degrade to an equality match that `$not` then negated.
+_KNOWN_FIELD_OPERATORS = _SIBLING_MODIFIERS | frozenset(
+    (
+        "$eq",
+        "$ne",
+        "$gt",
+        "$gte",
+        "$lt",
+        "$lte",
+        "$in",
+        "$nin",
+        "$exists",
+        "$not",
+        "$type",
+        "$size",
+        "$all",
+        "$mod",
+        "$elemMatch",
+        "$regex",
+        "$bitsAllSet",
+        "$bitsAnySet",
+        "$bitsAllClear",
+        "$bitsAnyClear",
+        "$geoWithin",
+        "$geoIntersects",
+        "$near",
+        "$nearSphere",
+    )
+)
+
 
 def _field_matches(
     values: list[Any],
@@ -493,15 +532,26 @@ def _field_matches(
 
 def _validate_not_arg(arg: Any) -> None:
     """mongod's ``$not`` argument must be a regex or a non-empty document of
-    operators (BadValue): a scalar / array / bool is "$not needs a regex or a
-    document", an empty document is "$not cannot be empty". Without this a bare
-    ``{$not: 5}`` silently degrades to "not equal to 5"."""
+    operators (BadValue): a scalar / array / bool is "$not argument must be a
+    regex or an object", an empty document is "$not argument must be a non-empty
+    object". Without this a bare ``{$not: 5}`` silently degrades to "not equal
+    to 5". Wording probed 8.2.11, 2026-09-01.
+
+    A ``Code`` is NOT an object here -- it subclasses ``str``, so it takes the
+    scalar branch, which is what mongod does with it too."""
     if isinstance(arg, Regex):
         return
     if not isinstance(arg, Mapping):
-        raise QueryError("$not needs a regex or a document")
+        raise QueryError("$not argument must be a regex or an object", code=2)
     if not arg:
-        raise QueryError("$not cannot be empty")
+        raise QueryError("$not argument must be a non-empty object", code=2)
+    # Every key inside `$not` must be a known operator. Without this a document
+    # of ordinary field names degraded to an equality match and the `$not`
+    # NEGATED it, so `{n: {$not: {a: 1}}}` returned the document -- a wrong
+    # answer, where mongod refuses the query.
+    for key in arg:
+        if key not in _KNOWN_FIELD_OPERATORS:
+            raise QueryError(f"unknown operator: {key}", code=2)
 
 
 def _validate_in_arg(op: str, arg: Any) -> None:
@@ -676,7 +726,7 @@ def _op_matches(
         _validate_not_arg(arg)
         return not _field_matches(values, arg, collation)
     if op == "$type":
-        return _op_type(values, arg)
+        return _op_type(values, arg, field)
     if op == "$size":
         return _op_size(values, arg)
     if op == "$all":
@@ -688,13 +738,13 @@ def _op_matches(
             raise QueryError("$elemMatch needs an Object")
         return _op_elem_match(values, arg)
     if op == "$bitsAllSet":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) == m, op)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) == m, op, field)
     if op == "$bitsAnySet":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) != 0, op)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) != 0, op, field)
     if op == "$bitsAllClear":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) == 0, op)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) == 0, op, field)
     if op == "$bitsAnyClear":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) != m, op)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) != m, op, field)
     if op == "$geoWithin":
         return _op_geo_within(values, arg)
     if op == "$geoIntersects":
@@ -703,7 +753,7 @@ def _op_matches(
         return _op_geo_near(values, arg, default_spherical=False)
     if op == "$nearSphere":
         return _op_geo_near(values, arg, default_spherical=True)
-    raise QueryError(f"unsupported query operator: {op}")
+    raise QueryError(f"unknown operator: {op}")
 
 
 def _op_geo_within(values: list[Any], arg: Any) -> bool:
@@ -901,32 +951,85 @@ def _opt_number(value: Any, label: str, code: int = 2) -> float | None:
     return float(value)
 
 
-def _resolve_bitmask(arg: Any, op: str) -> int:
+#: The widest integer mongod will build a `$bits*` mask from.
+_INT64_MAX = 2**63 - 1
+_INT64_MIN = -(2**63)
+
+
+def bindata_to_bits(data: bytes) -> int:
+    """A BinData value as a bit set: LITTLE-endian bytes, least-significant bit
+    first within each byte, so ``b"\x00\x01"`` is bit 8.
+
+    Probed against mongod 8.2.11 (2026-09-01) by asking for one bit position at
+    a time. BinData is accepted both as a ``$bits*`` MASK and as a stored field
+    VALUE; neither was supported before.
+    """
+    return int.from_bytes(data, "little")
+
+
+def bit_source(value: Any) -> int | None:
+    """The integer a stored value contributes to a ``$bits*`` test, or ``None``
+    when the value is not bit-eligible at all.
+
+    mongod accepts int32 / int64, a **whole finite double in int64 range**, a
+    **whole Decimal128**, and **BinData** — and rejects strings, bools,
+    fractional doubles, NaN / Infinity, and out-of-range doubles. This used to
+    accept `int` and nothing else, so a double, a Decimal128 and a BinData value
+    were silently skipped: `{v: {$bitsAllSet: 5}}` missed a document holding
+    `5.0`.
+
+    Negative values are two's complement with infinite sign extension, which is
+    exactly what Python's arbitrary-precision `&` already does (`-1 & 5 == 5`),
+    so they need no special handling here — only admission.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        return int(value) if _INT64_MIN <= value <= _INT64_MAX else None
+    if isinstance(value, Decimal128):
+        try:
+            dec = value.to_decimal()
+        except (ValueError, ArithmeticError):
+            return None
+        if not dec.is_finite() or dec != dec.to_integral_value():
+            return None
+        as_int = int(dec)
+        return as_int if _INT64_MIN <= as_int <= _INT64_MAX else None
+    if isinstance(value, (bytes, Binary, bytearray)):
+        return bindata_to_bits(bytes(value))
+    return None
+
+
+def _resolve_bitmask(arg: Any, op: str, field: str = "") -> int:
     """Build the bitmask for a `$bits*` query, mongod-style. The argument is an
-    array of bit positions or a non-negative integer / whole-number-double mask.
-    A whole double is accepted (truncated); a fractional double, a bool, or a
-    negative value is rejected — a bad *position* with code 2, a bad non-array
-    *mask* with code 9 (a bool mask with code 2). Codes verified vs mongod 7.0.12."""
+    array of bit positions, a non-negative integer / whole-double / whole-decimal
+    mask, or a BinData mask. A fractional double, a bool, or a negative value is
+    rejected — a bad *position* with code 2, a bad non-array *mask* with code 9
+    (a bool mask with code 2). Codes verified vs mongod 7.0.12 and 8.2.11."""
+    if isinstance(arg, (bytes, Binary, bytearray)):
+        return bindata_to_bits(bytes(arg))
     if isinstance(arg, bool):
         raise QueryError(
-            f"n takes an Array, a number, or a BinData but received: {op}: "
-            f"{'true' if arg else 'false'}",
+            f"{field} takes an Array, a number, or a BinData but received: "
+            f"{op}: {_mongo_bson_repr(arg)}",
             code=2,
         )
-    if isinstance(arg, (int, float)):
-        if isinstance(arg, float):
-            if not arg.is_integer():
-                raise QueryError(
-                    f"Expected an integer: {op}: {arg!r}", code=9, code_name="FailedToParse"
-                )
-            arg = int(arg)
-        if arg < 0:
+    if isinstance(arg, (int, float, Decimal128)):
+        try:
+            mask = coerce_int64_argument(arg, op)
+        except Int64CoercionError as exc:
+            raise QueryError(exc.message, code=exc.code, code_name="FailedToParse") from None
+        if mask < 0:
             raise QueryError(
-                f"Expected a non-negative number in: {op}: {arg}",
+                f"Expected a non-negative number in: {op}: {_mongo_bson_repr(arg)}",
                 code=9,
                 code_name="FailedToParse",
             )
-        return arg
+        return mask
     if isinstance(arg, list):
         mask = 0
         for i, bit in enumerate(arg):
@@ -955,16 +1058,32 @@ def _resolve_bitmask(arg: Any, op: str) -> int:
                 )
             mask |= 1 << bit
         return mask
-    raise QueryError(f"n takes an Array, a number, or a BinData but received: {op}", code=2)
+    # The field name used to be the literal string "n" -- whatever field the
+    # original probe happened to use -- so every one of these messages named the
+    # wrong field. mongod also echoes the offending value.
+    raise QueryError(
+        f"{field} takes an Array, a number, or a BinData but received: "
+        f"{op}: {_mongo_bson_repr(arg)}",
+        code=2,
+    )
 
 
 def _op_bitwise(
-    values: list[Any], arg: Any, predicate: Callable[[int, int], bool], op: str
+    values: list[Any], arg: Any, predicate: Callable[[int, int], bool], op: str, field: str = ""
 ) -> bool:
-    mask = _resolve_bitmask(arg, op)
+    mask = _resolve_bitmask(arg, op, field)
     for v in values:
-        if isinstance(v, int) and not isinstance(v, bool) and predicate(v, mask):
+        source = bit_source(v)
+        if source is not None and predicate(source, mask):
             return True
+        # An ARRAY field is matched element-wise, one level deep -- the same
+        # multikey rule the comparison operators follow. Without it a document
+        # holding `[1, 4]` was skipped entirely.
+        if isinstance(v, list):
+            for elem in v:
+                source = bit_source(elem)
+                if source is not None and predicate(source, mask):
+                    return True
     return False
 
 
@@ -1166,7 +1285,11 @@ def _validate_regex_options(options: Any) -> None:
     for c in options:
         if c not in _VALID_REGEX_FLAGS:
             raise QueryError(
-                f"invalid flag in regex options: {c}", code=51108, code_name="Location51108"
+                # The leading space is mongod's own -- it streams an empty slot before
+                # the sentence. Verbatim, not a typo here.
+                f" invalid flag in regex options: {c}",
+                code=51108,
+                code_name="Location51108",
             )
 
 
@@ -1182,8 +1305,15 @@ def _op_regex(values: list[Any], pattern: Any, options: Any) -> bool:
     if isinstance(pattern, Regex):
         regex_pattern = pattern.pattern
         flags |= _re_flags(pattern.flags)
-    else:
+    elif isinstance(pattern, str) and not isinstance(pattern, Code):
         regex_pattern = pattern
+    else:
+        # mongod takes a string or a BSON regex and nothing else. A `Binary`
+        # pattern used to compile as a BYTES regex and then raise
+        # `TypeError: cannot use a bytes pattern on a string-like object` from
+        # `search()` -- an unhandled exception, i.e. `1 internal server error`.
+        # Every other type silently matched nothing.
+        raise QueryError("$regex has to be a string", code=2)
     try:
         compiled = _compile_regex(regex_pattern, flags)
     except re.error as exc:
@@ -1343,7 +1473,12 @@ def _validate_type_arg(t: Any) -> None:
     in {-1, 1..19, 127} (a whole double is accepted). A bool / other type is
     TypeMismatch (14); an unknown alias or an out-of-range / fractional code is
     BadValue (2), with a special hint for code 0."""
-    if isinstance(t, bool):
+    # `bson.Code` subclasses `str` AND is unhashable, so it reached the
+    # `t not in _VALID_TYPE_ALIASES` set test below and raised
+    # `TypeError: unhashable type` -- which the dispatcher turned into
+    # `1 internal server error` for an ordinary bad argument. mongod answers
+    # TypeMismatch here, like any other non-string non-number.
+    if isinstance(t, (bool, Code)):
         raise QueryError(
             "type must be represented as a number or a string", code=14, code_name="TypeMismatch"
         )
@@ -1351,10 +1486,15 @@ def _validate_type_arg(t: Any) -> None:
         if t not in _VALID_TYPE_ALIASES:
             raise QueryError(f"Unknown type name alias: {t}")
         return
-    if isinstance(t, (int, float)):
-        if isinstance(t, float):
-            if not t.is_integer():
+    if isinstance(t, (int, float, Decimal128)):
+        if isinstance(t, Decimal128):
+            dec = t.to_decimal()
+            if not dec.is_finite() or dec != dec.to_integral_value():
                 raise QueryError(f"Invalid numerical type code: {t}")
+            code = int(dec)
+        elif isinstance(t, float):
+            if not t.is_integer():
+                raise QueryError(f"Invalid numerical type code: {_fmt_g(t)}")
             code = int(t)
         else:
             code = t
@@ -1367,8 +1507,12 @@ def _validate_type_arg(t: Any) -> None:
     )
 
 
-def _op_type(values: list[Any], type_spec: Any) -> bool:
+def _op_type(values: list[Any], type_spec: Any, field: str = "") -> bool:
     types = type_spec if isinstance(type_spec, list) else [type_spec]
+    if isinstance(type_spec, list) and not type_spec:
+        # An empty alias list is a parse error, not "matches nothing" -- probed
+        # 8.2.11 (2026-09-01), where this answered an empty result set.
+        raise QueryError(f"{field} must match at least one type", code=9, code_name="FailedToParse")
     for t in types:
         _validate_type_arg(t)
     for v in values:
@@ -1384,31 +1528,24 @@ def _op_type(values: list[Any], type_spec: Any) -> bool:
 
 
 def _op_size(values: list[Any], size: Any) -> bool:
-    # mongod validates $size strictly (probed 7.0.12): it must be a number
-    # (bool and string are rejected), integer-valued (2.0 is accepted as 2, 2.5
-    # is not), and non-negative. Each failure is a distinct parse error, not a
-    # silent no-match.
-    if isinstance(size, bool) or not isinstance(size, (int, float, Decimal128)):
-        raise QueryError(f"Failed to parse $size. Expected a number in: $size: {size!r}")
-    if isinstance(size, Decimal128):
-        try:
-            dec = size.to_decimal()
-        except (InvalidOperation, ValueError):
-            raise QueryError(
-                f"Failed to parse $size. Expected a number in: $size: {size!r}"
-            ) from None
-        if dec != dec.to_integral_value():
-            raise QueryError(f"Failed to parse $size. Expected an integer: $size: {size!r}")
-        n = int(dec)
-    elif isinstance(size, float):
-        if not size.is_integer():
-            raise QueryError(f"Failed to parse $size. Expected an integer: $size: {size!r}")
-        n = int(size)
-    else:
-        n = size
+    """``$size`` takes a non-negative whole number.
+
+    mongod validates it through the same numeric ladder as ``$pop`` and the
+    ``$bits*`` mask -- NaN, out-of-range, fractional and non-integral
+    Decimal128 each get their own sentence -- under a
+    ``"Failed to parse $size. "`` prefix. A whole ``Decimal128`` is accepted.
+    Probed 8.2.11 (2026-09-01).
+    """
+    prefix = "Failed to parse $size. "
+    try:
+        n = coerce_int64_argument(size, "$size")
+    except TypeError:
+        raise QueryError(f"{prefix}Expected a number in: $size: {_mongo_bson_repr(size)}") from None
+    except Int64CoercionError as exc:
+        raise QueryError(f"{prefix}{exc.message}") from None
     if n < 0:
         raise QueryError(
-            f"Failed to parse $size. Expected a non-negative number in: $size: {size!r}"
+            f"{prefix}Expected a non-negative number in: $size: {_mongo_bson_repr(size)}"
         )
     return any(isinstance(v, list) and len(v) == n for v in values)
 
@@ -1490,7 +1627,11 @@ def _mod_int(v: Any) -> int | None:
 
 
 def _op_mod(values: list[Any], mod_spec: Any) -> bool:
-    if not isinstance(mod_spec, (list, tuple)) or len(mod_spec) < 2:
+    # mongod separates "not an array at all" from "an array that is too short";
+    # this answered the too-short message for both.
+    if not isinstance(mod_spec, (list, tuple)):
+        raise QueryError("malformed mod, needs to be an array")
+    if len(mod_spec) < 2:
         raise QueryError("malformed mod, not enough elements")
     div = _mod_int(mod_spec[0])
     if div is None:
