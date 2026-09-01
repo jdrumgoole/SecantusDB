@@ -2536,6 +2536,11 @@ def _run_statement(
 ) -> SQLResult:
     planner.qualify_from_search_path(stmt, catalog, db, session)
     if isinstance(stmt, exp.Select):
+        # Before ANY routing decision: a `COLLATE` wrapper is not a plain
+        # column, so leaving it in the tree sent the statement down the
+        # evaluated-select path, which never consulted it.
+        planner.hoist_collations(stmt)
+    if isinstance(stmt, exp.Select):
         # Star merge must see the USING list — the desugar below rewrites it
         # to ON, after which the join shape is indistinguishable.
         planner.expand_using_star(stmt, catalog, db)
