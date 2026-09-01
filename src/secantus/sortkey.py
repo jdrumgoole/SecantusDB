@@ -28,16 +28,15 @@ from __future__ import annotations
 
 import datetime as _dt
 import math
-import re as _re
 import struct
 from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import bson
-from secantus.bsontypes import regex_options_string
-
 from bson import Binary, Code, Decimal128, MaxKey, MinKey, ObjectId, Regex, Timestamp
+
+from secantus.bsontypes import regex_options_string
 
 # Type ranks — must match storage._bson_type_rank.
 RANK_MINKEY = 1

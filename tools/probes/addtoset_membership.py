@@ -12,13 +12,18 @@ encoded that accident as "they are equal".
     PROBE_SERVER="mongodb://127.0.0.1:27055" ... # adds the Rust column
 """
 
-import os, sys, tempfile, pymongo
-from bson import Code, Decimal128, Int64, Regex, Binary, ObjectId
+import os
+import sys
+import tempfile
+
+import pymongo
+from bson import Code, Decimal128, Int64, ObjectId, Regex
+
+from secantus import SecantusDBServer
 
 targets = [
     ("mongod", pymongo.MongoClient(os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041")))
 ]
-from secantus import SecantusDBServer
 
 _s = SecantusDBServer(port=0, storage_path=tempfile.mkdtemp())
 _s.start()

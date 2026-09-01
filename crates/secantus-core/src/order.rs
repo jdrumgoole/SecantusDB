@@ -280,9 +280,9 @@ pub fn bson_lt(a: &Bson, b: &Bson) -> Option<bool> {
         (Bson::ObjectId(x), Bson::ObjectId(y)) => Some(x.bytes() < y.bytes()),
         (Bson::Binary(x), Bson::Binary(y)) => Some(x.bytes < y.bytes),
         // Pattern, then option string -- see the note in `cmp`.
-        (Bson::RegularExpression(x), Bson::RegularExpression(y)) => Some(
-            crate::regexutil::regex_sort_key(x) < crate::regexutil::regex_sort_key(y),
-        ),
+        (Bson::RegularExpression(x), Bson::RegularExpression(y)) => {
+            Some(crate::regexutil::regex_sort_key(x) < crate::regexutil::regex_sort_key(y))
+        }
         (Bson::MinKey, Bson::MinKey) | (Bson::MaxKey, Bson::MaxKey) => Some(false),
         (Bson::Document(x), Bson::Document(y)) => {
             for ((ak, av), (bk, bv)) in x.iter().zip(y.iter()) {

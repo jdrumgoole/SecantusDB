@@ -464,12 +464,14 @@ fn op_regex(values: &[Option<&Bson>], pattern: &Bson, options: Option<&Bson>) ->
             pattern: r.pattern.clone(),
             options: format!("{}{o}", r.options),
         }),
-        (Bson::String(p), None) => {
-            Some(bson::Regex { pattern: p.clone(), options: String::new() })
-        }
-        (Bson::String(p), Some(Bson::String(o))) => {
-            Some(bson::Regex { pattern: p.clone(), options: o.clone() })
-        }
+        (Bson::String(p), None) => Some(bson::Regex {
+            pattern: p.clone(),
+            options: String::new(),
+        }),
+        (Bson::String(p), Some(Bson::String(o))) => Some(bson::Regex {
+            pattern: p.clone(),
+            options: o.clone(),
+        }),
         _ => None,
     };
     let hit = |e: &Bson| match e {

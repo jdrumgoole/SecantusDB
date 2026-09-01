@@ -5114,7 +5114,10 @@ pub fn py_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
     // update-diff walks every field through here).
     {
         let js = |v: &Bson| {
-            matches!(v, Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_))
+            matches!(
+                v,
+                Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_)
+            )
         };
         if js(a) || js(b) {
             return Ok(false);

@@ -18,11 +18,16 @@ suites are satisfied by both being wrong together.
     PROBE_SERVER="mongodb://127.0.0.1:27055" ... # adds the Rust column
 """
 
-import os, sys, tempfile, pymongo
-from bson import Code, Decimal128, Regex, Binary, ObjectId
+import os
+import sys
+import tempfile
+
+import pymongo
+from bson import Code, Regex
+
+from secantus import SecantusDBServer
 
 mon = pymongo.MongoClient(os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041"))
-from secantus import SecantusDBServer
 
 s = SecantusDBServer(port=0, storage_path=tempfile.mkdtemp())
 s.start()

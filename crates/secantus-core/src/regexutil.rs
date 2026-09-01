@@ -200,7 +200,10 @@ mod regex_eq_tests {
     use super::regex_eq;
 
     fn r(pattern: &str, options: &str) -> bson::Regex {
-        bson::Regex { pattern: pattern.into(), options: options.into() }
+        bson::Regex {
+            pattern: pattern.into(),
+            options: options.into(),
+        }
     }
 
     #[test]
@@ -214,7 +217,14 @@ mod regex_eq_tests {
     #[test]
     fn sort_key_orders_by_pattern_then_options() {
         use super::regex_sort_key;
-        let corpus = [r("", ""), r("A", ""), r("a", ""), r("a", "i"), r("a", "mi"), r("a", "m")];
+        let corpus = [
+            r("", ""),
+            r("A", ""),
+            r("a", ""),
+            r("a", "i"),
+            r("a", "mi"),
+            r("a", "m"),
+        ];
         let mut keys: Vec<_> = corpus.iter().map(regex_sort_key).collect();
         keys.sort();
         let rendered: Vec<String> = keys.iter().map(|(p, o)| format!("/{p}/{o}")).collect();
@@ -249,7 +259,10 @@ mod regex_key_agreement {
         let vals: Vec<Bson> = corpus
             .iter()
             .map(|(p, o)| {
-                Bson::RegularExpression(bson::Regex { pattern: (*p).into(), options: (*o).into() })
+                Bson::RegularExpression(bson::Regex {
+                    pattern: (*p).into(),
+                    options: (*o).into(),
+                })
             })
             .collect();
 
