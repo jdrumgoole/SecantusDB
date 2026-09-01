@@ -97,6 +97,8 @@ pub enum Statement {
     Reset(String),
     /// `COPY <table> [(cols)] FROM STDIN`.
     CopyFrom(CopyFrom),
+    /// `COPY <table> [(cols)] TO STDOUT`.
+    CopyTo(CopyFrom),
     Aggregate(Aggregate),
     Update(Update),
     Delete(Delete),
@@ -253,11 +255,9 @@ pub struct SelectConstant {
     pub columns: Vec<(String, ConstCol, String)>,
 }
 
-/// `COPY <table> FROM STDIN`.
+/// `COPY <table> FROM STDIN` or `TO STDOUT`. Text format only.
 ///
-/// Only the text format and only STDIN. `COPY ... TO STDOUT` needs to push
-/// `CopyData` messages back through the connection sink, which pgwire's simple
-/// query handler does not expose; refusing is honest until that hook exists.
+/// Both directions share a shape: a table and an optional column list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CopyFrom {
     pub table: String,
@@ -1236,13 +1236,12 @@ fn plan_copy(
     c: &pg_query::protobuf::CopyStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Result<Statement> {
-    if !c.is_from {
-        return Err(Error::Unsupported("COPY ... TO".into()));
-    }
-    if c.filename.is_empty() {
-        // Empty filename means STDIN, which is the only source supported.
-    } else {
-        return Err(Error::Unsupported("COPY from a server-side file".into()));
+    if !c.filename.is_empty() {
+        // An empty filename means STDIN/STDOUT, the only endpoints supported:
+        // a server-side file would read or write the server's disk.
+        return Err(Error::Unsupported(
+            "COPY to or from a server-side file".into(),
+        ));
     }
     // Only the default text format. A binary or CSV COPY parses differently,
     // and guessing would corrupt the data rather than fail.
@@ -1287,7 +1286,12 @@ fn plan_copy(
         }
         columns.push(name);
     }
-    Ok(Statement::CopyFrom(CopyFrom { table, columns }))
+    let spec = CopyFrom { table, columns };
+    Ok(if c.is_from {
+        Statement::CopyFrom(spec)
+    } else {
+        Statement::CopyTo(spec)
+    })
 }
 
 fn plan_set(v: &pg_query::protobuf::VariableSetStmt) -> Result<Statement> {
