@@ -524,10 +524,11 @@ fn op_matches(
             op_elem_match(values, arg, field)
         }
         "$mod" => op_mod(values, arg),
-        "$bitsAllSet" => op_bits(values, arg, |v, m| v & m == m),
-        "$bitsAnySet" => op_bits(values, arg, |v, m| v & m != 0),
-        "$bitsAllClear" => op_bits(values, arg, |v, m| v & m == 0),
-        "$bitsAnyClear" => op_bits(values, arg, |v, m| v & m != m),
+        // all mask bits SET / any SET / all CLEAR / any CLEAR.
+        "$bitsAllSet" => op_bits(values, arg, |b| b, true, op, field),
+        "$bitsAnySet" => op_bits(values, arg, |b| b, false, op, field),
+        "$bitsAllClear" => op_bits(values, arg, |b| !b, true, op, field),
+        "$bitsAnyClear" => op_bits(values, arg, |b| !b, false, op, field),
         "$geoWithin" => crate::geo::op_geo_within(values, arg),
         "$geoIntersects" => crate::geo::op_geo_intersects(values, arg),
         // The legacy 2d *sibling* `$maxDistance`/`$minDistance` form is handled in
@@ -986,6 +987,94 @@ fn matches_type(v: &Bson, spec: &Bson) -> bool {
 /// straight match suffices (Python orders `bool`/`Int64` ahead of `int` only
 /// because they're `int` subclasses there). Unknown variants → `"object"`,
 /// matching Python's default.
+/// Render a BSON value the way mongod echoes an offending one back in a parse
+/// error. Its shell-ish form, NOT Rust's `Debug`: strings take DOUBLE quotes, a
+/// document prints `{ a: 1 }` with inner spaces, a regex prints `/a/i`, a date
+/// prints `new Date(<millis>)`. Probed across every BSON type against 8.2.11
+/// (2026-09-01); mirrors `secantus.bsontypes.bson_value_repr`.
+pub fn bson_value_repr(v: &Bson) -> String {
+    match v {
+        Bson::Null | Bson::Undefined => "null".to_string(),
+        Bson::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
+        Bson::String(s) => format!("\"{s}\""),
+        Bson::Symbol(s) => format!("\"{s}\""),
+        Bson::JavaScriptCode(c) => c.clone(),
+        Bson::JavaScriptCodeWithScope(c) => c.code.clone(),
+        // A double in a PARSE error keeps its round-trip form -- `-1.0` stays
+        // `-1.0`, where the arithmetic overflow messages would print `-1`.
+        Bson::Double(d) => fmt_double_parse(*d),
+        Bson::Decimal128(d) => d.to_string(),
+        Bson::Int32(n) => n.to_string(),
+        Bson::Int64(n) => n.to_string(),
+        Bson::ObjectId(oid) => format!("ObjectId('{oid}')"),
+        Bson::MinKey => "MinKey".to_string(),
+        Bson::MaxKey => "MaxKey".to_string(),
+        Bson::Timestamp(t) => format!("Timestamp({}, {})", t.time, t.increment),
+        Bson::DateTime(dt) => format!("new Date({})", dt.timestamp_millis()),
+        Bson::RegularExpression(r) => format!("/{}/{}", r.pattern, r.options),
+        Bson::Binary(b) => format!(
+            "BinData({}, {})",
+            u8::from(b.subtype),
+            b.bytes
+                .iter()
+                .map(|x| format!("{x:02X}"))
+                .collect::<String>()
+        ),
+        Bson::Array(a) => {
+            if a.is_empty() {
+                "[]".to_string()
+            } else {
+                format!(
+                    "[ {} ]",
+                    a.iter().map(bson_value_repr).collect::<Vec<_>>().join(", ")
+                )
+            }
+        }
+        Bson::Document(d) => {
+            if d.is_empty() {
+                "{}".to_string()
+            } else {
+                format!(
+                    "{{ {} }}",
+                    d.iter()
+                        .map(|(k, val)| format!("{k}: {}", bson_value_repr(val)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        }
+        other => format!("{other}"),
+    }
+}
+
+/// A double as mongod echoes it in a PARSE error: the shortest round-trip form,
+/// keeping a whole double's `.0`. Rust's `{}` already drops nothing and prints
+/// `1e20` as `100000000000000000000`, so the exponent form is applied by hand
+/// at the same threshold Python's `repr` uses.
+pub fn fmt_double_parse(d: f64) -> String {
+    if d.is_nan() {
+        return "nan".to_string();
+    }
+    if d.is_infinite() {
+        return (if d > 0.0 { "inf" } else { "-inf" }).to_string();
+    }
+    let abs = d.abs();
+    if d != 0.0 && !(1e-4..1e16).contains(&abs) {
+        let text = format!("{d:e}");
+        // Rust writes `1e20`; the form here is `1e+20`.
+        return match text.split_once('e') {
+            Some((m, exp)) if !exp.starts_with('-') => format!("{m}e+{exp}"),
+            _ => text,
+        };
+    }
+    let text = format!("{d}");
+    if text.contains(['.', 'e']) {
+        text
+    } else {
+        format!("{text}.0")
+    }
+}
+
 pub fn bson_type_name(v: &Bson) -> &'static str {
     match v {
         Bson::Boolean(_) => "bool",
@@ -1873,49 +1962,156 @@ fn op_mod(values: &[Option<&Bson>], spec: &Bson) -> R {
 
 // --- $bits* -------------------------------------------------------------
 
-fn resolve_bitmask(arg: &Bson) -> Result<u64, Fallback> {
-    // mongod accepts a whole-number double mask / bit position (truncated);
-    // fractional / negative / bool defer to the Python oracle (which raises the
-    // exact code -- mask 9, position 2).
-    match arg {
-        Bson::Boolean(_) => Err(Fallback::Defer),
-        Bson::Int32(n) if *n >= 0 => Ok(*n as u64),
-        Bson::Int64(n) if *n >= 0 => Ok(*n as u64),
-        Bson::Double(d) if d.is_finite() && d.fract() == 0.0 && *d >= 0.0 => Ok(*d as u64),
-        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => Err(Fallback::Defer),
-        Bson::Array(a) => {
-            let mut mask = 0u64;
-            for bit in a {
-                let p = match bit {
-                    Bson::Int32(p) => *p as i64,
-                    Bson::Int64(p) => *p,
-                    Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => *d as i64,
-                    _ => return Err(Fallback::Defer),
-                };
-                if !(0..64).contains(&p) {
-                    return Err(Fallback::Defer);
+/// A value's bits, for the `$bits*` operators.
+///
+/// Two representations because mongod accepts two shapes that no single integer
+/// width covers: a NUMBER (int32 / int64 / whole double / whole Decimal128),
+/// which is two's complement with infinite sign extension so `-1` has every bit
+/// set however far you look; and BinData, which is an arbitrarily long
+/// little-endian bit string, least-significant bit first within each byte.
+#[derive(Debug)]
+enum Bits {
+    Num(i128),
+    Bytes(Vec<u8>),
+}
+
+impl Bits {
+    fn bit(&self, i: usize) -> bool {
+        match self {
+            // Past i128's width, a non-negative value reads 0 and a negative
+            // one reads 1 -- that IS the sign extension.
+            Bits::Num(v) => {
+                if i < 127 {
+                    (v >> i) & 1 == 1
+                } else {
+                    *v < 0
                 }
-                mask |= 1 << p;
             }
-            Ok(mask)
+            Bits::Bytes(b) => b.get(i / 8).is_some_and(|byte| (byte >> (i % 8)) & 1 == 1),
         }
+    }
+
+    /// The positions this value sets. Only meaningful for a MASK, which is
+    /// always non-negative and finite, so the scan terminates.
+    fn set_positions(&self) -> Vec<usize> {
+        match self {
+            Bits::Num(v) => (0..127).filter(|i| (v >> i) & 1 == 1).collect(),
+            Bits::Bytes(b) => (0..b.len() * 8).filter(|i| self.bit(*i)).collect(),
+        }
+    }
+}
+
+/// The bits a STORED value contributes, or `None` when it is not bit-eligible.
+///
+/// mongod accepts int32 / int64, a whole finite double in int64 range, a whole
+/// Decimal128, and BinData -- and skips strings, bools, fractional doubles,
+/// NaN / Infinity and out-of-range doubles. This used to accept int32 / int64
+/// and nothing else, so a document holding `5.0` or `BinData(0x05)` was
+/// invisible to `{v: {$bitsAllSet: 5}}`, and a negative value DEFERRED (an
+/// error on the standalone server) rather than sign-extending.
+fn bit_source(value: &Bson) -> Option<Bits> {
+    match value {
+        Bson::Boolean(_) => None,
+        Bson::Int32(n) => Some(Bits::Num(*n as i128)),
+        Bson::Int64(n) => Some(Bits::Num(*n as i128)),
+        Bson::Double(d) => {
+            if !d.is_finite() || d.fract() != 0.0 || *d < i64::MIN as f64 || *d > i64::MAX as f64 {
+                None
+            } else {
+                Some(Bits::Num(*d as i128))
+            }
+        }
+        Bson::Decimal128(d) => {
+            let dec = crate::decimal::parse(&d.to_string())?;
+            crate::decimal::trunc_to_i64(&dec).and_then(|as_int| {
+                // `trunc_to_i64` truncates; only a WHOLE decimal is eligible.
+                (crate::decimal::parse(&as_int.to_string())? == dec)
+                    .then_some(Bits::Num(as_int as i128))
+            })
+        }
+        Bson::Binary(b) => Some(Bits::Bytes(b.bytes.clone())),
+        _ => None,
+    }
+}
+
+/// Build the `$bits*` mask: a bit-position array, a non-negative whole number,
+/// or BinData. `field` names the field in mongod's type error.
+fn resolve_bitmask(arg: &Bson, op: &str, field: &str) -> Result<Bits, Fallback> {
+    if let Bson::Binary(b) = arg {
+        return Ok(Bits::Bytes(b.bytes.clone()));
+    }
+    if let Bson::Array(a) = arg {
+        let mut bytes: Vec<u8> = Vec::new();
+        for bit in a {
+            let p = match bit {
+                Bson::Boolean(_) => return Err(Fallback::Defer),
+                Bson::Int32(p) => *p as i64,
+                Bson::Int64(p) => *p,
+                Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => *d as i64,
+                _ => return Err(Fallback::Defer),
+            };
+            if p < 0 {
+                return Err(Fallback::Defer); // Python raises the exact code 2
+            }
+            let idx = (p / 8) as usize;
+            if idx >= bytes.len() {
+                bytes.resize(idx + 1, 0);
+            }
+            bytes[idx] |= 1 << (p % 8);
+        }
+        return Ok(Bits::Bytes(bytes));
+    }
+    if matches!(arg, Bson::Boolean(_)) || bit_source(arg).is_none() {
+        return Err(Fallback::mongo(
+            2,
+            format!(
+                "{field} takes an Array, a number, or a BinData but received: {op}: {}",
+                bson_value_repr(arg)
+            ),
+        ));
+    }
+    match bit_source(arg) {
+        Some(Bits::Num(v)) if v >= 0 => Ok(Bits::Num(v)),
+        // A negative mask is Location9; Python raises the exact sentence.
         _ => Err(Fallback::Defer),
     }
 }
 
-fn op_bits(values: &[Option<&Bson>], arg: &Bson, pred: fn(u64, u64) -> bool) -> R {
-    let mask = resolve_bitmask(arg)?;
-    for v in values {
-        let val = match v {
-            Some(Bson::Int32(n)) => *n as i64,
-            Some(Bson::Int64(n)) => *n,
-            _ => continue, // bool/non-int values are skipped (matches Python)
-        };
-        if val < 0 {
-            return Err(Fallback::Defer); // two's-complement-infinite semantics -> Python
+fn op_bits(
+    values: &[Option<&Bson>],
+    arg: &Bson,
+    pred: fn(bool) -> bool,
+    all: bool,
+    op: &str,
+    field: &str,
+) -> R {
+    let mask = resolve_bitmask(arg, op, field)?;
+    let positions = mask.set_positions();
+    let test = |bits: &Bits| -> bool {
+        if all {
+            positions.iter().all(|i| pred(bits.bit(*i)))
+        } else {
+            positions.iter().any(|i| pred(bits.bit(*i)))
         }
-        if pred(val as u64, mask) {
-            return Ok(true);
+    };
+    for v in values {
+        let Some(val) = v else { continue };
+        if let Some(bits) = bit_source(val) {
+            if test(&bits) {
+                return Ok(true);
+            }
+        }
+        // An ARRAY field matches element-wise, one level deep -- the multikey
+        // rule every other operator follows. Without it a document holding
+        // `[1, 4]` was skipped entirely.
+        if let Bson::Array(arr) = val {
+            for elem in arr {
+                if let Some(bits) = bit_source(elem) {
+                    if test(&bits) {
+                        return Ok(true);
+                    }
+                }
+            }
         }
     }
     Ok(false)
