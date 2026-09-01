@@ -5048,6 +5048,27 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   What is left is listed as its own items below, with the dependency each one
   actually needs — not as an undifferentiated "principled" list.
 
+- [ ] **The Rust server's ARGUMENT-error surface is essentially absent
+  (measured 2026-09-01).** `tools/probes/operator_error_surface.py` crosses
+  every query and update operator with every pathological argument -- 2,226
+  shapes. The Python server is at **0 divergent**; the Rust server is at
+  **1,053**, and **999 of those answer `BadValue (2): "query uses a construct
+  the Rust server does not support"`** for an argument mongod names precisely
+  (`Unknown type name alias: x`, `Expected a number in: n: "x"`, ...).
+
+  840 of them have the *right code by accident* — mongod's parse errors are
+  BadValue too — so a code-only comparison makes this look far smaller than it
+  is. Only 54 are genuine wording differences.
+
+  This is the `Fallback::Defer` problem PR #1199 built `Fallback::Mongo` to
+  solve, now applied to the validation surface rather than the expression one.
+  The work is mechanical and the spec already exists: every message is in
+  `src/secantus/query.py` / `update.py`, each mongod-probed. `field` is already
+  threaded through the Rust matcher; the Rust update engine needs the same.
+
+  Biggest single operators: `$pop` (62), `$type` (39), `$set` / `$addToSet` /
+  `$max` / `$min` / `$push` value-type defers.
+
 - [ ] **`$dateFromString` with a named IANA timezone (Rust server).** Measured
   divergent 2026-09-01: mongod resolves `America/New_York`; the Rust engine
   defers, which errors the standalone server. Fixed `±HH:MM` offsets already
