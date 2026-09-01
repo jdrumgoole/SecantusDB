@@ -10120,11 +10120,19 @@ impl Storage {
                 }
                 let pos = secantus_core::update::find_positional_matches(doc, filter);
                 secantus_core::update::apply_update_with(doc, update, up, array_filters, &pos)
-                    .map_err(|_| {
-                        // Prefer the error mongod actually names. A bare defer
-                        // becomes a generic BadValue (2) on this server, which
-                        // has no Python to fall back to, where mongod answers
-                        // TypeMismatch (14).
+                    .map_err(|fault| {
+                        // The engine names most of them itself now; this used to
+                        // be `map_err(|_| ...)`, which threw that away and left
+                        // every one of them a generic BadValue.
+                        if let Some((code, errmsg)) = fault.as_mongo() {
+                            return StorageError::QueryError {
+                                code,
+                                errmsg: errmsg.to_string(),
+                            };
+                        }
+                        // The three below are recovered by RE-RUNNING a
+                        // narrower check, because they are properties of the
+                        // update as a whole rather than of one operator.
                         if let Some(m) = secantus_core::update::path_conflict_error(update) {
                             // Overlapping operator paths -> mongod's code 40.
                             return StorageError::UpdatePathConflict(m);

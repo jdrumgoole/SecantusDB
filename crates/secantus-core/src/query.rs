@@ -1775,13 +1775,26 @@ fn type_spec_valid(spec: &Bson) -> Result<(), Fallback> {
                 Bson::Int32(n) => *n as i64,
                 Bson::Int64(n) => *n,
                 Bson::Double(d) => *d as i64,
-                Bson::Decimal128(d) => match crate::decimal::parse(&d.to_string())
-                    .as_ref()
-                    .and_then(crate::decimal::trunc_to_i64)
-                {
-                    Some(n) => n,
-                    None => return Err(Fallback::Defer),
-                },
+                Bson::Decimal128(d) => {
+                    // `trunc_to_i64` TRUNCATES, so 1.5 would become the valid
+                    // code 1 and the query would be accepted. Only a WHOLE
+                    // decimal is a type code.
+                    let text = d.to_string();
+                    let parsed = crate::decimal::parse(&text);
+                    match parsed
+                        .as_ref()
+                        .and_then(crate::decimal::trunc_to_i64)
+                        .filter(|n| crate::decimal::parse(&n.to_string()) == parsed)
+                    {
+                        Some(n) => n,
+                        None => {
+                            return Err(Fallback::mongo(
+                                2,
+                                format!("Invalid numerical type code: {text}"),
+                            ));
+                        }
+                    }
+                }
                 _ => unreachable!(),
             };
             if valid_code(code) {
@@ -2069,7 +2082,7 @@ fn mod_int(val: &Bson) -> Result<Option<i64>, Fallback> {
 /// A whole `Decimal128` is accepted. `None` means "not a numeric argument at
 /// all", which each caller words differently. Mirrors
 /// `secantus.bsontypes.coerce_int64_argument`.
-fn coerce_int64_argument(value: &Bson, label: &str) -> Option<Result<i64, Fallback>> {
+pub(crate) fn coerce_int64_argument(value: &Bson, label: &str) -> Option<Result<i64, Fallback>> {
     let bad = |msg: String| Some(Err(Fallback::mongo(9, msg)));
     match value {
         Bson::Boolean(_) => None,
@@ -2290,20 +2303,30 @@ fn resolve_bitmask(arg: &Bson, op: &str, field: &str) -> Result<Bits, Fallback> 
         }
         return Ok(Bits::Bytes(bytes));
     }
-    if matches!(arg, Bson::Boolean(_)) || bit_source(arg).is_none() {
+    let mask = match coerce_int64_argument(arg, op) {
+        // Not a number at all (string, document, bool, ...).
+        None => {
+            return Err(Fallback::mongo(
+                2,
+                format!(
+                    "{field} takes an Array, a number, or a BinData but received: {op}: {}",
+                    bson_value_repr(arg)
+                ),
+            ));
+        }
+        Some(Err(e)) => return Err(e),
+        Some(Ok(n)) => n,
+    };
+    if mask < 0 {
         return Err(Fallback::mongo(
-            2,
+            9,
             format!(
-                "{field} takes an Array, a number, or a BinData but received: {op}: {}",
+                "Expected a non-negative number in: {op}: {}",
                 bson_value_repr(arg)
             ),
         ));
     }
-    match bit_source(arg) {
-        Some(Bits::Num(v)) if v >= 0 => Ok(Bits::Num(v)),
-        // A negative mask is Location9; Python raises the exact sentence.
-        _ => Err(Fallback::Defer),
-    }
+    Ok(Bits::Num(mask as i128))
 }
 
 fn op_bits(
