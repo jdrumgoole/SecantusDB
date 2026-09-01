@@ -91,6 +91,19 @@ _CATEGORY: dict[str, str] = {
     "date": "datetime",
     "timestamp": "datetime",
     "timestamptz": "datetime",
+    # json / jsonb have no implicit cast to or from text or numeric, which is
+    # what makes `INSERT INTO t (jsonb_col) VALUES ('{}'::text)` a 42804 while
+    # the same value as an UNKNOWN literal casts in fine. Measured on 14.13:
+    # `jsonb = text`, `jsonb = integer` and `json = text` are all 42883.
+    #
+    # ONE category for both, because a `json` and a `jsonb` column store the
+    # same `type_tag` here — only the pg_oid tells them apart — so there is
+    # nothing to key a split on. Two consequences, both LENIENT and therefore
+    # safe: `jsonb = json` is accepted where Postgres rejects it, and so is
+    # `json = json` / `json = '{}'` (Postgres gives `json` no equality operator
+    # at all, so even those are 42883 there). Saying either needs the declared
+    # oid, not the storage tag.
+    "json": "json",
 }
 
 #: Categories for types that only ever arrive as a DECLARED parameter type —
@@ -444,17 +457,76 @@ def _check_assignment(node: exp.Expression, resolver: _Resolver) -> None:
     """
     target = _static_type(node.this, resolver)
     value = _static_type(node.expression, resolver)
-    if target is None or value is None:
+    column = node.this.name if isinstance(node.this, (exp.Column, exp.Identifier)) else None
+    _assert_assignable(column, target, value)
+
+
+def _assert_assignable(
+    column: str | None,
+    target: tuple[str, str] | None,
+    value: tuple[str, str] | None,
+) -> None:
+    """The shared assignment rule, for ``UPDATE … SET`` and ``INSERT … VALUES``.
+
+    Postgres applies the same assignment-cast rules to both, and reports the
+    same 42804 message naming the target column.
+    """
+    if target is None or value is None or not column:
         return
     if target[0] == "string" or target[0] == value[0]:
-        return
-    column = node.this.name if isinstance(node.this, (exp.Column, exp.Identifier)) else None
-    if not column:
         return
     raise errors.SQLError(
         "42804",
         f'column "{column}" is of type {target[1]} but expression is of type {value[1]}',
     )
+
+
+def _check_insert(stmt: exp.Insert, catalog: Any, db: str, param_oids: list[int] | None) -> None:
+    """Apply the assignment rule to ``INSERT INTO t (cols) VALUES (…)``.
+
+    Only the plain literal-VALUES shape is analysed. `INSERT … SELECT`, a
+    missing column list, `DEFAULT`, and anything else are left alone — the same
+    when-in-doubt-stay-lenient bar as the rest of the module.
+
+    This is what psycopg's `test_return_untyped` exercises: `'{}'` as an
+    UNKNOWN literal casts into a `jsonb` column, but `'{}'::text` does not
+    (`42804 column "data" is of type jsonb but expression is of type text`,
+    probed on 14.13). The backlog filed it as a binary-parameter nicety; it is
+    neither binary-specific nor parameter-specific — a bare `42` into a `jsonb`
+    column diverged the same way.
+    """
+    target = stmt.this
+    if not isinstance(target, exp.Schema):
+        return  # no explicit column list
+    table_node = target.this
+    if not isinstance(table_node, exp.Table):
+        return
+    columns = [c.name for c in target.expressions if isinstance(c, (exp.Column, exp.Identifier))]
+    if not columns or len(columns) != len(target.expressions):
+        return
+    table = catalog.get(db, _table_name(table_node))
+    if table is None or table.reflected:
+        return
+    values = stmt.expression
+    if not isinstance(values, exp.Values):
+        return
+    # Columns cannot be resolved inside VALUES, so an empty resolver is right:
+    # `_static_type` answers only for casts, literals and parameters.
+    resolver = _Resolver([], frozenset(), param_oids)
+    for row in values.expressions:
+        if not isinstance(row, exp.Tuple) or len(row.expressions) != len(columns):
+            continue
+        for name, expr in zip(columns, row.expressions, strict=True):
+            col = table.column(name)
+            if col is None:
+                continue
+            cat = _CATEGORY.get(col.type_tag)
+            if cat is None:
+                continue
+            declared = col.enum_type or col.domain_type or _DECL_OID_NAME.get(col.decl_oid or 0)
+            _assert_assignable(
+                name, (cat, declared or _describe(col.type_tag)), _static_type(expr, resolver)
+            )
 
 
 def _has_nested_query(node: exp.Expression, root: exp.Expression) -> bool:
@@ -488,6 +560,9 @@ def check_statement(
 def _analyse(
     stmt: exp.Expression, catalog: Any, db: str, param_oids: list[int] | None = None
 ) -> None:
+    if isinstance(stmt, exp.Insert):
+        _check_insert(stmt, catalog, db, param_oids)
+        return
     if not isinstance(stmt, (exp.Select, exp.Update, exp.Delete)):
         return
     if any(True for _ in stmt.find_all(exp.Select, exp.Subquery)) and not isinstance(

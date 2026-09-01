@@ -35,7 +35,7 @@ def storage(tmp_path, session):
             DB,
             "CREATE TABLE t (id int PRIMARY KEY, txt text, vc varchar(10), n int, "
             "big bigint, num numeric, flag boolean, d date, ts timestamp, "
-            "b bytea, u uuid, j jsonb, m money, tm time)",
+            "b bytea, u uuid, j jsonb, jj json, m money, tm time)",
             session=session,
         )
         run_sql(
@@ -97,6 +97,11 @@ def rule(storage):
         ("n = lower(txt)", "operator does not exist: integer = text"),
         ("n = substr(txt, 1, 1)", "operator does not exist: integer = text"),
         ("txt = length(txt)", "operator does not exist: text = integer"),
+        # json / jsonb: no implicit cast to text or numeric, and none between
+        # the two. All four measured against PostgreSQL 14.13 on 2026-09-01.
+        ("j = txt", "operator does not exist: jsonb = text"),
+        ("j = 42", "operator does not exist: jsonb = integer"),
+        ("j = n", "operator does not exist: jsonb = integer"),
     ],
 )
 def test_incomparable_pairs_are_42883(rule, where, message):
@@ -126,11 +131,17 @@ def test_incomparable_pairs_are_42883(rule, where, message):
         # Casts that agree.
         "txt = n::text",
         "n = txt::int",
-        # Categories we deliberately refuse to judge: bytea, uuid, json, money,
-        # time, interval, arrays, ranges, geo, network, bit.
+        # Categories we deliberately refuse to judge: bytea, uuid, money,
+        # time, interval, arrays, ranges, geo, network, bit. json/jsonb moved
+        # OUT of this list on 2026-09-01 — `j = txt` is
+        # `42883 operator does not exist: jsonb = text` in PostgreSQL 14.13,
+        # so the leniency was hiding a real error (see the rejected list above).
         "b = txt",
         "b = 42",
-        "j = txt",
+        # `jsonb = json` IS 42883 in Postgres, but a json and a jsonb column
+        # share one storage type_tag here, so there is nothing to key the
+        # distinction on — lenient, and safe.
+        "j = jj",
         # NULL is not a type.
         "txt = NULL",
         # Function whose argument type we cannot pin stays unjudged.

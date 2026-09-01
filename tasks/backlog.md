@@ -6372,7 +6372,18 @@ slice). The remaining ~22 failures fall into these buckets, which are the
 honest edge of what the Postgres front-end can reach WITHOUT changing the
 shared storage engine or building large new protocol subsystems:
 
-- [ ] **Sub-millisecond timestamp fidelity (~11 gauge tests).** `timestamp`/
+- [x] **RESOLVED — STALE (re-measured 2026-09-01). Sub-millisecond timestamps
+  round-trip exactly.** The entry below says `timestamp`/`timestamptz`
+  "truncate to milliseconds"; that stopped being true when the `__us_`
+  companion field landed (`sql/subms.py`). Measured over the wire against the
+  Python pgserver: four hand-picked microsecond values and **200 random draws
+  round-tripped with zero loss**, `timestamptz` included — which is exactly the
+  psycopg faker-suite shape this entry blamed. Nothing was rewritten to close
+  it; the entry simply outlived the fix. `docs/sql.md` had already dropped it
+  from its precision-ceiling list ("One precision ceiling", singular), which is
+  the tell nobody followed up. Original entry:
+
+- **Sub-millisecond timestamp fidelity (~11 gauge tests).** `timestamp`/
   `timestamptz` (and ts/tstz ranges) truncate to milliseconds — BSON datetime
   is an int64 of millis, the SAME representation the Mongo side uses, so this
   isn't a SQL-layer bug but a shared-storage constraint. Exact microseconds
@@ -6384,13 +6395,45 @@ shared storage engine or building large new protocol subsystems:
   faker suites (`test_adapt::test_random`, `test_copy::test_copy_from_leaks`/
   `test_copy_table_across`) that assert exact round-trips, so they flap on
   whether a random draw's microseconds land on a whole millisecond.
-- [ ] **`numeric` beyond 34 significant digits.** Stored as Decimal128, which
+- [x] **CONFIRMED REAL, and a DOCUMENTED PERMANENT CEILING (re-measured
+  2026-09-01) — not an open task.** Unlike the sub-millisecond entry above,
+  this one still reproduces: a 39-digit value stores as
+  `123456789012345678901234567890123500000` and a 50-digit one rounds at digit
+  34. That is IEEE 754-2008 Decimal128 doing what it does, and `docs/sql.md`
+  already lists it under "precision ceilings" as *a permanent divergence from
+  real Postgres*, so it is recorded in the place a user looks rather than
+  pending here.
+
+  **Deliberately not "fixed" with a companion field**, though the sub-ms work
+  proves the pattern would store the exact digits: reads would then return the
+  exact value while predicates and ORDER BY still compared the ROUNDED
+  Decimal128, so two values differing beyond digit 34 could sort inconsistently
+  with what they display. Today both sides are rounded and therefore agree.
+  Trading a consistent ceiling for an inconsistent one is the worse deal;
+  closing this properly means a text/dual representation for `numeric` that the
+  comparison and sort paths also use. Original entry:
+
+- **`numeric` beyond 34 significant digits.** Stored as Decimal128, which
   caps at 34 digits (same shared constraint); wider *stored* values round.
   The binary wire codec now round-trips arbitrarily wide values (PR #564), so
   the param-only `test_dump_numeric_exhaustive` passes; only values that
   actually persist through Decimal128 storage lose precision. Exact wide
   storage would need a text/dual representation for `numeric`.
-- [ ] **Query pipelining (`test_generators::test_pipeline_communicate_abort`).**
+- [x] **RESOLVED — STALE (measured 2026-09-01). Pipeline abort works.** Ran the
+  test's own body through libpq's `PGconn` pipeline API against both servers:
+
+      statuses  COMMAND_OK, FATAL_ERROR, PIPELINE_ABORTED, PIPELINE_SYNC,
+                COMMAND_OK, PIPELINE_SYNC          identical to PG 14.13
+      rows      [b'3']                             identical to PG 14.13
+
+  So the server DOES discard queued messages after an error until the next
+  Sync, and the batch is all-or-nothing. Cross-checked with psycopg's
+  higher-level `conn.pipeline()`: a duplicate-key error mid-pipeline leaves
+  **no** rows behind on either server, and a later pipeline still works. The
+  entry describes a limitation that the implicit-transaction work removed.
+  Original entry:
+
+- **Query pipelining (`test_generators::test_pipeline_communicate_abort`).**
   psycopg's pipeline mode batches many extended-protocol messages before a
   Sync; the server processes each `Sync` synchronously rather than tracking a
   pipeline-abort boundary. A real feature (its own subsystem), not a bug.
@@ -6411,13 +6454,45 @@ shared storage engine or building large new protocol subsystems:
   ephemeral-db model shared with the Mongo server), so connecting to
   `dbname=nosuchdb` succeeds where real PG raises. A deliberate divergence —
   rejecting unknown dbs would break the in-process test-db ergonomic.
-- [ ] **Streaming COPY OUT abort (`test_copy_out_error_with_copy_not_finished`).**
+- [x] **FIXED (2026-09-01) — streaming COPY OUT abort.** `COPY … TO STDOUT`
+  now flushes in 128-row batches and checks `session.cancel_event` between
+  them, so an abandoned copy raises `57014` mid-stream; `_handle_copy` already
+  marked the block failed for any `SQLError`, so the transaction lands in
+  `INERROR` and the next statement gets `25P02`, exactly as PG does.
+
+  **The reproducer needs a BIG copy.** At 100 rows both servers buffer the
+  whole result and end `INTRANS`, so a small probe shows nothing — the
+  divergence only appears at ~200k rows, where PG is genuinely still streaming.
+  That is why this sat open looking untestable. Note `sql/session.py` had
+  described "the COPY TO row stream" as a cancellation point since before it
+  was one — a comment asserting behaviour that did not exist, the shape
+  CLAUDE.md says to grep for. Pinned by `tests/test_pgserver_copy_abort.py`,
+  including a control that a small copy still leaves the block usable and that
+  no format drops or duplicates rows across the flush boundary. Original entry:
+
+- **Streaming COPY OUT abort (`test_copy_out_error_with_copy_not_finished`).**
   COPY OUT materializes the whole result and sends it in one burst, so a
   client that reads one row and aborts finds the copy already finished
   (transaction stays INTRANS instead of INERROR). Needs interleaved
   client-abort detection during a streamed COPY OUT.
-- [ ] **`test_return_untyped[b]` / DatatypeMismatch.** A binary untyped
-  parameter used in a context that PG rejects with 42804 — niche.
+- [x] **FIXED (2026-09-01) — `test_return_untyped[b]` / DatatypeMismatch.**
+  **The filed description was wrong twice.** It is not "niche", and it is
+  neither binary-specific nor parameter-specific: measured against PG 14.13,
+  the TEXT mode diverged too, and a bare `INSERT INTO t (jsonb_col) VALUES
+  (42)` diverged the same way. It is simply the INSERT half of the assignment
+  rule — the UPDATE half of which shipped the same day (see §6045).
+
+  `typecheck._check_insert` applies the shared `_assert_assignable` to
+  `INSERT INTO t (cols) VALUES (…)`, and `json`/`jsonb` joined `_CATEGORY` so a
+  jsonb column is typed at all. All three `fmt_in` variants of the upstream
+  test body now pass, including the binary one (the declared parameter oid
+  reaches the check through `param_oids`).
+
+  Two knock-ons worth recording. `jsonb = text` is now correctly `42883` — an
+  existing test listed it as deliberately lenient, and PG rejects it. And a
+  `json` column and a `jsonb` column share ONE storage `type_tag` here (only
+  the pg_oid separates them), so `jsonb = json` stays lenient where PG rejects
+  it; splitting that needs the declared oid, not the tag.
 - [ ] **Write-conflict retry semantics (40001 under contention)**: concurrent
   writers to the same row surface WiredTiger's optimistic write conflict as a
   PG-SERIALIZABLE-style `40001 could not serialize access` instead of real

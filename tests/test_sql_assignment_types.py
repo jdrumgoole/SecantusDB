@@ -156,6 +156,78 @@ class TestCoercionErrors:
         assert "ConversionSyntax" not in msg
 
 
+class TestInsertAssignments:
+    """The same rule applies to ``INSERT INTO t (cols) VALUES (…)``.
+
+    This is what psycopg's `test_return_untyped` exercises: `'{}'` as an
+    UNKNOWN literal casts into a `jsonb` column, but the same value with a
+    declared `text` type does not. The backlog filed it as a binary-parameter
+    nicety; measured against PostgreSQL 14.13 it is neither binary-specific nor
+    parameter-specific — a bare `42` into a `jsonb` column diverged the same
+    way, and the text (non-binary) mode diverged too.
+    """
+
+    @pytest.fixture()
+    def jdb(self, tmp_path):
+        storage = Storage(str(tmp_path))
+        session = Session(database="t")
+
+        def run(sql: str):
+            return [r.rows for r in run_sql(storage, "t", sql, session=session)][0]
+
+        run("CREATE TABLE ins (i int, t text, j jsonb, bo bool)")
+        try:
+            yield run
+        finally:
+            storage.close()
+
+    @pytest.mark.parametrize(
+        ("sql", "msg"),
+        [
+            (
+                "INSERT INTO ins (j) VALUES ('{}'::text)",
+                'column "j" is of type jsonb but expression is of type text',
+            ),
+            (
+                "INSERT INTO ins (j) VALUES (42)",
+                'column "j" is of type jsonb but expression is of type integer',
+            ),
+            (
+                "INSERT INTO ins (i) VALUES ('x'::text)",
+                'column "i" is of type integer but expression is of type text',
+            ),
+            (
+                "INSERT INTO ins (bo) VALUES (1)",
+                'column "bo" is of type boolean but expression is of type integer',
+            ),
+        ],
+    )
+    def test_unassignable_value_is_42804(self, jdb, sql, msg):
+        assert _err(jdb, sql) == ("42804", msg)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            # An UNKNOWN literal is resolved by the target type, not judged.
+            "INSERT INTO ins (j) VALUES ('{}')",
+            "INSERT INTO ins (i) VALUES ('42')",
+            "INSERT INTO ins (bo) VALUES ('yes')",
+            # A string target still takes anything.
+            "INSERT INTO ins (t) VALUES (42)",
+            "INSERT INTO ins (t) VALUES (true)",
+            # Same category, and NULL.
+            "INSERT INTO ins (i) VALUES (1.7)",
+            "INSERT INTO ins (i) VALUES (NULL)",
+            # Shapes the analysis deliberately does not judge.
+            "INSERT INTO ins VALUES (1, 'x', '{}', true)",
+            "INSERT INTO ins (i) SELECT 1",
+            "INSERT INTO ins (i) VALUES (1), (2)",
+        ],
+    )
+    def test_assignable_or_undecidable(self, jdb, sql):
+        jdb(sql)  # must not raise
+
+
 #: Every shape from the probe that drove this work.
 _ORACLE_SHAPES = [
     "UPDATE asg SET t = 42",
