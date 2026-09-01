@@ -19,6 +19,7 @@ import socket
 import subprocess
 import time
 from collections.abc import Iterator
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -627,3 +628,83 @@ def test_python_server_reads_rust_timestamps(home: Path) -> None:
         (1, dt.datetime(2026, 9, 1, 1, 2, 3, 456789)),
         (2, dt.datetime(2026, 9, 1, 12, 34, 56)),
     ]
+
+
+def test_numeric_keeps_its_scale(home: Path) -> None:
+    """`numeric` carries scale as part of the VALUE, not as formatting.
+
+    PostgreSQL answers `'1.50'` for `1.50::numeric::text`, not `'1.5'`, and a
+    client reading oid 1700 gets a Decimal rather than a float. Storing these
+    as doubles would have given the right magnitude under the wrong type — the
+    same failure that made a cast integer arrive as a string.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1.5")
+        assert cur.fetchone()[0] == Decimal("1.5")
+        assert cur.description[0].type_code == 1700  # numeric, not float8
+
+        cur.execute("SELECT 1.50::numeric::text")
+        assert cur.fetchone()[0] == "1.50"
+        cur.execute("SELECT '-0.30'::numeric::text")
+        assert cur.fetchone()[0] == "-0.30"
+
+        cur.execute("CREATE TABLE n (id int PRIMARY KEY, amt numeric)")
+        cur.execute("INSERT INTO n VALUES (1, 1.50), (2, '0.1')")
+        cur.execute("SELECT id, amt FROM n ORDER BY id")
+        assert cur.fetchall() == [(1, Decimal("1.50")), (2, Decimal("0.1"))]
+        assert cur.description[1].type_code == 1700
+
+        # Beyond 34 significant digits we refuse rather than round: a quietly
+        # rounded number is a wrong answer, an error is a missing feature.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("SELECT '1.2345678901234567890123456789012345'::numeric")
+        assert exc.value.diag.sqlstate == "22003"
+
+
+def test_arrays_round_trip_with_their_own_oids(home: Path) -> None:
+    """Arrays are their own types, and `int[]` is not `int`.
+
+    libpg_query keeps the array-ness of `int[]` in `array_bounds` rather than
+    in the type name, so a server that reads only the name types an array
+    column as its element type. That looks harmless until a CAST loses its
+    brackets too, at which point `%s::text[] = %s::text[]` quietly degrades to
+    comparing two rendered strings — which agrees with PostgreSQL often enough
+    to pass for correct.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+
+        cur.execute("SELECT ARRAY[1,2,3]::int[]")
+        assert cur.fetchone()[0] == [1, 2, 3]
+        assert cur.description[0].type_code == 1007  # int4[], not int4
+
+        cur.execute("SELECT ARRAY['a','b']::text[]")
+        assert cur.fetchone()[0] == ["a", "b"]
+        assert cur.description[0].type_code == 1009  # text[]
+
+        cur.execute("SELECT '{}'::text[]")
+        assert cur.fetchone()[0] == []
+
+        # Inside an array two NULLs are EQUAL and a NULL sorts after every
+        # non-NULL — neither rule holds for scalar `=`, where `NULL = NULL` is
+        # NULL. All four were probed against a live PostgreSQL 14.
+        cur.execute("SELECT ARRAY[NULL]::text[] = ARRAY[NULL]::text[]")
+        assert cur.fetchone()[0] is True
+        cur.execute("SELECT ARRAY['a',NULL]::text[] > ARRAY['a','z']::text[]")
+        assert cur.fetchone()[0] is True
+        cur.execute("SELECT ARRAY['a']::text[] < ARRAY['a','b']::text[]")
+        assert cur.fetchone()[0] is True
+
+        cur.execute("CREATE TABLE a (id int PRIMARY KEY, xs int[], names text[])")
+        cur.execute("INSERT INTO a VALUES (1, '{1,2}', '{x,y}')")
+        cur.execute("SELECT xs, names FROM a WHERE id = 1")
+        assert cur.fetchone() == ([1, 2], ["x", "y"])
+
+        # A nested array is refused, not flattened. rust-postgres encodes one
+        # dimension only, and the flattening it produced turned `{{1,2},{3,4}}`
+        # into two elements whose text was `{1,2}` and `{3,4}` — indistinguish-
+        # able, at the client, from a real answer.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("SELECT '{{1,2},{3,4}}'::int[]")
+        assert exc.value.diag.sqlstate == "0A000"

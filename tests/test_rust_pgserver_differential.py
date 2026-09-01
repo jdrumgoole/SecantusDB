@@ -180,6 +180,13 @@ QUERIES = [
     "SELECT 2<>2",
     # --- date / time. `22007` (not a date) and `22008` (a date that cannot
     # exist) are DIFFERENT codes, and PostgreSQL canonicalises the spelling.
+    # --- numeric. SCALE is part of the value: `1.50` is not `1.5`.
+    "SELECT 1.5",
+    "SELECT 1.50::numeric::text",
+    "SELECT '0.1'::numeric::text",
+    "SELECT '-0.30'::numeric::text",
+    "SELECT '2.5000000000000000'::numeric::text",
+    "SELECT NULL::numeric",
     "SELECT '2026-09-01 12:34:56'::timestamp::text",
     "SELECT '2026-09-01 12:34:56.789'::timestamp::text",
     "SELECT '2026-09-01 12:34:56.789012'::timestamp::text",
@@ -271,6 +278,28 @@ QUERIES = [
     "SELECT s AS grp, count(*) AS c FROM d GROUP BY s ORDER BY s",
     "SELECT s, count(*) FROM d GROUP BY s ORDER BY s LIMIT 2",
     "SELECT count(*) FROM d GROUP BY s ORDER BY s",
+    # --- arrays: text form, comparison, and NULL's array-only rule ----------
+    # Array `=` is NOT scalar `=` applied elementwise: inside an array two
+    # NULLs compare EQUAL and a NULL sorts after every non-NULL. Scalar
+    # `NULL = NULL` is NULL, so this is the case that catches a compare
+    # written by analogy with the scalar path.
+    "SELECT ARRAY[1,2,3]::int[]",
+    "SELECT ARRAY['a','b']::text[]",
+    "SELECT '{}'::text[]",
+    "SELECT '{1,2,3}'::int[]",
+    "SELECT '{foo,\"bar baz\",qux}'::text[]",
+    "SELECT ARRAY[NULL]::text[] = ARRAY[NULL]::text[]",
+    "SELECT ARRAY['a',NULL]::text[] = ARRAY['a',NULL]::text[]",
+    "SELECT ARRAY['a',NULL]::text[] > ARRAY['a','z']::text[]",
+    "SELECT ARRAY['a']::text[] < ARRAY['a','b']::text[]",
+    "SELECT ARRAY[1,2]::int[] = ARRAY[1,2]::int[]",
+    "SELECT ARRAY[1,2]::int[] = ARRAY[1,3]::int[]",
+    "SELECT ARRAY[1,2]::int[] < ARRAY[1,3]::int[]",
+    "SELECT ARRAY[2]::int[] > ARRAY[1,9,9]::int[]",
+    "SELECT '{}'::int[] = '{}'::int[]",
+    "SELECT '{}'::int[] < ARRAY[1]::int[]",
+    "SELECT ARRAY[1,2,3]::int[] <> ARRAY[1,2]::int[]",
+    "SELECT '{a,NULL,b}'::text[]",
 ]
 
 # (statement, verification query) — the write is compared by its row count AND

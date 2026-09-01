@@ -387,7 +387,94 @@ Caught by the differential: `'...'::timestamp::text` fell through to a BSON
 debug dump rather than PostgreSQL's rendering -- casts to text are a separate
 path from the row encoder and needed their own case.
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945.**
+### 0.17 numeric (2026-09-01): 945 -> 965
+
+`numeric` as a column type, cast target, and the type of a DECIMAL LITERAL --
+`SELECT 1.5` is oid 1700 in PostgreSQL, not float8. Stored as BSON
+`Decimal128`, which preserves SCALE exactly as PostgreSQL does: `1.50` stays
+`1.50`, `-0.30` stays `-0.30`, `2.5000000000000000` round-trips. Scale is part
+of the VALUE, not formatting. 8 of 8 shapes match PG 14.
+
+**This retires a refusal carried since §0.11.** Decimal arithmetic and `avg()`
+were deferred precisely because returning a double under a `numeric` oid is the
+wrong-type bug that made `$1::int` arrive as a string. Now the type exists, the
+refusal can be lifted incrementally.
+
+**The limit is honest and enforced:** Decimal128 holds 34 significant digits,
+PostgreSQL's `numeric` is arbitrary precision. A value needing more is **22003**,
+not a silent rounding -- a quietly shortened number is indistinguishable from a
+correct one. `'x'::numeric` stays 22P02, a different failure.
+
+**Still deferred: decimal ARITHMETIC.** `bson`'s Decimal128 is a container with
+no arithmetic, so `1 + 1.5` needs `rust_decimal` (28-29 digits, FEWER than
+Decimal128's 34) plus PostgreSQL's scale-derivation rules (`+`/`-` take
+max(s1,s2), `*` takes s1+s2, `/` gets scale ~16 -- `10.0/4` is
+`2.5000000000000000`). That is its own increment with its own precision
+tradeoff, and it stays refused until then.
+
+### 0.18 arrays: SHIPPED after the regression was root-caused (2026-09-01)
+
+**Arrays first measured as a 16-test REGRESSION (965 -> 949), were bisected to a
+single missing comparison arm, and shipped at 984 -- the best number so far.**
+
+The park was right and the diagnosis in it was wrong. Recorded here because the
+wrong diagnosis is the more useful half.
+
+**The bisect took two runs, not the four the park expected.** Applying
+`type_name_of` ALONE reproduced 949 exactly, and applying everything EXCEPT
+`type_name_of` gave 963. So the entire cost sat on the one change that was not
+array-local -- as the park guessed -- but not for the reason it assumed.
+
+**The actual cause: `eval_binary` had no `Bson::Array` arm.** psycopg asks
+`select %s::text[] = %s::text[]`. While a cast to `text[]` quietly degraded to
+`text`, BOTH sides rendered to strings and string comparison gave the right
+answer by accident. Typing the cast correctly turned them into real arrays, and
+`compare_constants` returned `None` for those -- so 16 tests that had been
+passing on a coincidence started failing on a missing feature. **Making the
+types right exposed a gap that wrong types had been hiding.** Adding array
+comparison took it to 970, and a third missed `type_name` call site in
+`static_type` (the one that decides the REPORTED wire type, so `ARRAY[1,2,3]`
+came back as a string) took it to 984.
+
+`type_name` now has exactly ONE caller, inside `type_name_of`. There is no
+longer a way to read a type name without its brackets, which is what let this
+hide in three places at once.
+
+**Array NULL rules are not scalar NULL rules**, all four probed against a live
+PG 14 rather than reasoned out: inside an array two NULLs are EQUAL, a NULL
+sorts AFTER every non-NULL, a common prefix makes the shorter array smaller,
+and empty equals empty. Scalar `NULL = NULL` is NULL, so an elementwise
+comparison written by analogy with the scalar path gets every one of these
+wrong.
+
+**Nested arrays are REFUSED (0A000), not flattened.** rust-postgres encodes one
+dimension only, so the typed path turned `{{1,2},{3,4}}` into two elements whose
+text was `{1,2}` and `{3,4}` -- a wrong answer a client cannot distinguish from
+a real one. Smuggling the literal through as text by guessing the client's
+format code is the same trade somewhere less visible. **Refusing cost zero gauge
+tests** (984 both ways), so the wrong answer was never buying anything.
+
+**The lesson, and it is the batch's real output: a feature verified correct
+against the oracle can still make the gauge worse, and the drop can mean the
+feature EXPOSED a bug rather than caused one.** Nine probed shapes proved the
+implementation and said nothing about interactions. Measure before and after,
+treat a drop as a blocker -- and when bisecting, run the complement (everything
+except the suspect) as well as the suspect alone: that pair is what turned four
+candidates into one answer in two runs.
+
+**Still open:** multidimensional arrays over the wire (needs hand-built array
+encoding, since rust-postgres will not do it); `test_array.py` is 34/124, so
+psycopg's array corpus goes much deeper than 1-D round-trips.
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984.**
+
+**Re-measured after rebasing onto a `main` that had gained seven parallel
+pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the
+batch is +36 there.** The 965 and 984 figures above were taken against the
+older `main` WITH this batch's numeric half already applied, which is why they
+do not subtract to the same number. **A gauge figure is only meaningful next to
+the baseline it was measured against**, and with several sessions landing in
+these crates the baseline moves within a day.
 
 **A type-system trap worth remembering.** `Describe` runs BEFORE `Bind`, so a
 column's type cannot be inferred from its value — at that point `$1::int` has

@@ -4147,6 +4147,15 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   than the namespace 73 every other argument gets — a document spec is parsed
   down a different path there, and it was not worth guessing at.
 
+- **Rust PG server: multidimensional arrays are refused (`0A000`), not
+  answered.** `{{1,2},{3,4}}` plans and compares correctly; only returning one
+  to a client is unsupported, because rust-postgres encodes a single dimension
+  and the flattening it produced was a wrong answer rather than a missing
+  feature. Needs hand-built PostgreSQL array wire encoding (text and binary).
+- **Rust PG server: psycopg's `test_array.py` is 34/124.** 1-D round-trips,
+  comparison and oids are done; the rest of that corpus (multidimensional,
+  binary format, the full type matrix, `ARRAY` subscripting) is not.
+
 ### 7.0 Cache-pressure rollback — CI exercises it now
 
 `WT_ROLLBACK` is two conditions wearing one code: a write-write conflict
