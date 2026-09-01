@@ -46,25 +46,20 @@ def _bson_type_rank(value: Any) -> float:
     # expression relational operators started routing through this order.
     if isinstance(value, (int, float, Decimal128, Decimal)):
         return 3
-    # `bson.Code` SUBCLASSES `str` and deliberately keeps the STRING rank here.
+    # Before the `str` arm: `bson.Code` SUBCLASSES `str`, so an
+    # `isinstance(value, str)` test catches one and used to rank every
+    # JavaScript value among the strings. mongod ranks JavaScript between Regex
+    # and MaxKey -- probed 8.2.11 (2026-09-01): a mixed corpus sorts
+    # `... Timestamp < Regex < Code < MaxKey`.
     #
-    # mongod ranks JavaScript between Regex and MaxKey (probed 8.2.11,
-    # 2026-09-01: a mixed corpus sorts `... Timestamp < Regex < Code < MaxKey`),
-    # so this ORDER is wrong. Moving it was tried and reverted, because this
-    # function is only half the story: `sortkey.encode_value` writes the rank
-    # byte that PERSISTED index entries are sorted by, and it ranks Code as a
-    # string. Changing one and not the other made an index change the sort
-    # answer -- the one failure class this project treats as unshippable -- and
-    # changing both is an on-disk format break (`entryFormat`) out of all
-    # proportion to JavaScript-valued indexed fields.
-    #
-    # The proper fix is the remedy already used for collations: a sticky catalog
-    # flag on an index that has held a JavaScript value, which makes the sort
-    # picker decline it for ORDERING while still using it to fetch. Recorded in
-    # tasks/backlog.md. Note that MATCHING is unaffected either way -- range
-    # operators bracket JavaScript separately (see `query._same_type_bracket`,
-    # which deliberately does NOT use this function) and the exact `matches()`
-    # pass rechecks every index candidate.
+    # This must stay in step with `sortkey.RANK_JAVASCRIPT`: that encoder writes
+    # the rank byte PERSISTED index entries are sorted by, this function drives
+    # the in-memory sort, and moving one alone makes an index change the sort
+    # answer. They were changed together, and the index-entry format version was
+    # bumped so a store written before it is refused rather than read back in
+    # the old order.
+    if isinstance(value, Code):
+        return 12.5
     if isinstance(value, str):
         return 4
     if isinstance(value, Mapping):

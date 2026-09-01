@@ -124,25 +124,25 @@ def test_ne_with_a_regex_bound_is_rejected(coll):
     assert "Can't have regex as arg to $ne." in str(exc.value)
 
 
-def test_javascript_sort_order_is_consistent_with_and_without_an_index(coll):
-    """The sort ORDER for a JavaScript value is a known divergence; what must
-    never differ is the answer with and without an index.
+def test_javascript_sorts_between_regex_and_maxkey(coll):
+    """mongod's cross-type sort order, with and without an index.
 
-    mongod ranks JavaScript between Regex and MaxKey. Both servers rank it among
-    the strings, because `sortkey.encode_value` -- the encoder that writes the
-    rank byte PERSISTED index entries are sorted by -- does, and moving the
-    in-memory comparator alone made an index change the sort answer. Fixing it
-    properly needs a sticky catalog flag that makes the sort picker decline such
-    an index for ordering; see tasks/backlog.md.
-
-    This test pins the invariant that does hold, so the day the order is fixed
-    it fails loudly unless BOTH halves move together.
+    `bson.Code` subclasses `str`, so an `isinstance(value, str)` test catches
+    one -- and BOTH rank tables had such a test, so every JavaScript value
+    sorted among the strings. The two have to move together:
+    `ordering._bson_type_rank` drives the in-memory sort while
+    `sortkey.encode_value` writes the rank byte persisted index entries are
+    sorted by, so changing one alone makes an index change the sort answer.
+    They moved together, and `entryFormat` went to 3 so a store written before
+    it is refused rather than read back in the old order.
     """
     ids = {"_id": {"$in": [1, 2, 5, 6, 8]}}
-    unindexed = [d["_id"] for d in coll.find(ids).sort("v", 1)]
+    expected = [2, 6, 5, 1, 8]  # string < Timestamp < Regex < JavaScript < MaxKey
+    assert [d["_id"] for d in coll.find(ids).sort("v", 1)] == expected
     coll.create_index([("v", 1)])
-    indexed = [d["_id"] for d in coll.find(ids).sort("v", 1)]
-    assert unindexed == indexed, "an index changed the sort answer"
+    assert [d["_id"] for d in coll.find(ids).sort("v", 1)] == expected, (
+        "an index changed the sort answer"
+    )
 
 
 def test_javascript_matching_is_bracketed_even_with_an_index(coll):
@@ -157,15 +157,11 @@ def test_collated_sort_over_a_javascript_value_does_not_crash(coll):
     """`sort_levels` is `lru_cache`d and `Code` is unhashable, so a collated
     sort over a collection holding one answered `1 internal server error`.
 
-    The ORDER asserted here is ours, not mongod's (which puts JavaScript after
-    Regex) -- see the sort-consistency test above for why that divergence
-    stands. What this pins is that the query completes at all, and that the
-    collated and uncollated orders agree, since a collation has nothing to say
-    about JavaScript.
     """
     ids = {"_id": {"$in": [1, 2, 5]}}
     collated = [
         d["_id"] for d in coll.find(ids).sort("v", 1).collation({"locale": "en", "strength": 2})
     ]
+    # A collation has nothing to say about JavaScript, so the two orders agree.
     assert collated == [d["_id"] for d in coll.find(ids).sort("v", 1)]
-    assert collated == [2, 1, 5]
+    assert collated == [2, 5, 1]

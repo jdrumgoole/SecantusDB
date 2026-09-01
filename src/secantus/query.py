@@ -1006,28 +1006,15 @@ def _same_type_bracket(value: Any, bound: Any) -> bool:
     collation) shapes disagreed with mongod.
 
     Numbers share one bracket (int / long / double / Decimal128 compare across
-    themselves), which is why this asks for a RANK rather than comparing Python
-    types.
-
-    Deliberately not `ordering._bson_type_rank`: that one has to agree with the
-    persisted index-key encoder, which ranks `bson.Code` as a string (see the
-    comment there). Bracketing has no such constraint -- an index candidate is
-    rechecked by the exact `matches()` pass either way -- so JavaScript gets its
-    own bracket here, which is what stops `{v: {$gt: "ab"}}` matching a `Code`
-    document.
+    themselves), which is why this asks :func:`_bson_type_rank` rather than
+    comparing Python types -- and JavaScript has its own rank there, which is
+    what stops ``{v: {$gt: "ab"}}`` matching a ``Code`` document.
     """
-    if isinstance(bound, (MinKey, MaxKey)):
-        return True
-    return _bracket_rank(value) == _bracket_rank(bound)
-
-
-def _bracket_rank(value: Any) -> float:
-    """The sort rank, with JavaScript split out of the string bracket."""
     from secantus.ordering import _bson_type_rank
 
-    if isinstance(value, Code):
-        return 12.5  # mongod: between Regex and MaxKey
-    return _bson_type_rank(value)
+    if isinstance(bound, (MinKey, MaxKey)):
+        return True
+    return _bson_type_rank(value) == _bson_type_rank(bound)
 
 
 def _try_cmp(

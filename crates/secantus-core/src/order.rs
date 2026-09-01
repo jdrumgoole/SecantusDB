@@ -41,6 +41,11 @@ fn type_rank(v: &Bson) -> u8 {
         Bson::DateTime(_) => 100,
         Bson::Timestamp(_) => 110,
         Bson::RegularExpression(_) => 120,
+        // mongod ranks JavaScript between Regex and MaxKey. Kept in step with
+        // `sortkey::RANK_JAVASCRIPT` -- that encoder writes the rank byte
+        // persisted index entries are sorted by, and moving one alone makes an
+        // index change the sort answer.
+        Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_) => 125,
         Bson::MaxKey => 130,
         _ => 50, // matches Python's `return 5` fallback (never reached: is_sortable bars these)
     }
@@ -211,14 +216,15 @@ fn array_cmp(a: &[Bson], b: &[Bson]) -> Ordering {
 /// index candidate.
 fn lt_rank(v: &Bson) -> u8 {
     match v {
-        // These used to be the literal numbers 4 and 2 -- Python's ranks, on
+        // A BSON Symbol really IS a string to mongod (and pymongo decodes one
+        // as `str`); JavaScript is not, and takes `type_rank`'s own arm.
+        //
+        // These two used to be the literal numbers 4 and 2 -- Python's ranks, on
         // Python's 1..13 scale -- returned into `type_rank`'s spaced-by-10
         // table, where 4 sits BELOW MinKey (10). Latent until a caller compared
-        // a JavaScript value against a MinKey / MaxKey bound, which then sorted
-        // it under MinKey. Same values, expressed on this function's own scale.
-        Bson::Symbol(_) | Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_) => {
-            type_rank(&Bson::String(String::new()))
-        }
+        // such a value against a MinKey / MaxKey bound, which then sorted it
+        // under MinKey.
+        Bson::Symbol(_) => type_rank(&Bson::String(String::new())),
         Bson::Undefined => type_rank(&Bson::Null),
         _ => type_rank(v),
     }
@@ -229,7 +235,10 @@ fn lt_rank(v: &Bson) -> u8 {
 /// its code string, scope ignored).
 fn lt_text(v: &Bson) -> Option<&str> {
     match v {
-        Bson::String(s) | Bson::Symbol(s) | Bson::JavaScriptCode(s) => Some(s),
+        Bson::String(s) | Bson::Symbol(s) => Some(s),
+        // JavaScript no longer shares a rank with String, so these are only
+        // reached for a JS/JS pair, which compares by code text.
+        Bson::JavaScriptCode(s) => Some(s),
         Bson::JavaScriptCodeWithScope(c) => Some(&c.code),
         _ => None,
     }

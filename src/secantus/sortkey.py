@@ -13,7 +13,7 @@ blob in ``table:secantus_documents``; the index entry's ``key_bytes`` is just
 a sortable fingerprint.
 
 Layout: ``<rank_byte><payload>``. ``rank_byte`` is the BSON type rank
-(MinKey=1 .. MaxKey=13). Payload format depends on type — see ``_encode_*``
+(MinKey=1 .. MaxKey=14). Payload format depends on type — see ``_encode_*``
 helpers. Compound keys are joined with ``\\x00\\x00`` after payload nulls
 have been escaped to ``\\x00\\xff``, so the join is unambiguous and
 byte-sortable.
@@ -35,7 +35,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import bson
-from bson import Binary, Decimal128, MaxKey, MinKey, ObjectId, Regex, Timestamp
+from bson import Binary, Code, Decimal128, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
 # Type ranks — must match storage._bson_type_rank.
 RANK_MINKEY = 1
@@ -50,7 +50,17 @@ RANK_BOOL = 9
 RANK_DATE = 10
 RANK_TIMESTAMP = 11
 RANK_REGEX = 12
-RANK_MAXKEY = 13
+#: JavaScript is its OWN type to mongod, which sorts it between Regex and
+#: MaxKey -- probed 8.2.11 (2026-09-01): a mixed corpus orders
+#: ``... Timestamp < Regex < Code < MaxKey``. It used to take ``RANK_STRING``,
+#: because ``bson.Code`` subclasses ``str`` and an ``isinstance(value, str)``
+#: test catches one. That put every JavaScript value among the strings, in this
+#: encoder AND in ``ordering._bson_type_rank`` -- and the two HAVE to agree,
+#: because this one writes the rank byte that persisted index entries are
+#: sorted by while that one drives the in-memory sort. Fixing only one made an
+#: index change the sort answer.
+RANK_JAVASCRIPT = 13
+RANK_MAXKEY = 14
 
 
 def _rank(value: Any) -> int:
@@ -62,6 +72,9 @@ def _rank(value: Any) -> int:
         return RANK_BOOL
     if isinstance(value, (int, float, Decimal128)):
         return RANK_NUMBER
+    # Before the `str` arm: `bson.Code` subclasses `str`.
+    if isinstance(value, Code):
+        return RANK_JAVASCRIPT
     if isinstance(value, str):
         return RANK_STRING
     if isinstance(value, Mapping):
@@ -299,6 +312,12 @@ def encode_value(value: Any, *, collation: Any = None) -> bytes:
         return head + _encode_number(value)
     if rank == RANK_STRING:
         return head + _encode_string(value, collation)
+    if rank == RANK_JAVASCRIPT:
+        # The code text, byte-ordered. A collation has nothing to say about
+        # JavaScript, so it is deliberately not applied (mongod compares code
+        # text directly); `str(value)` drops `Code`'s scope, which mongod also
+        # ignores for ordering.
+        return head + _escape(str(value).encode("utf-8"))
     if rank == RANK_DOCUMENT:
         return head + _encode_doc(value)
     if rank == RANK_ARRAY:

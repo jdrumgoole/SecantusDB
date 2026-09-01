@@ -19,7 +19,18 @@ reported that the server cannot do `$round`.
   took the string type rank, sorted among the strings, and matched a string
   bound. Being unhashable, it also crashed the cached collation key, so an
   ordinary collated sort over a collection holding one answered `internal
-  server error`. mongod ranks JavaScript between Regex and MaxKey.
+  server error`. mongod ranks JavaScript between Regex and MaxKey, and it now
+  sorts there — in the in-memory comparator *and* in the persisted index-key
+  encoder, which had to move together or an index would change the sort answer.
+
+#### Storage format
+
+- **Index entries are `entryFormat` 3.** Giving JavaScript its own type rank
+  shifts MaxKey's rank byte from 13 to 14, so every index key for a JavaScript
+  or MaxKey value changes. A store written by an earlier build is refused at
+  open rather than read back in the old order; there is no migration, as with
+  the two format bumps before it. Start from a fresh data directory, or drop and
+  recreate the indexes.
 - **`$round` / `$trunc` validate their precision** the way mongod does — three
   ordered checks with three different codes. A fractional `Decimal128`, an
   out-of-int32 integer, a string and a bool were all silently accepted:

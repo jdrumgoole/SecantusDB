@@ -4906,28 +4906,25 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   (`chrono-tz` or a vendored subset), not an afternoon's port. The Python
   server is correct here (it has `zoneinfo`).
 
-- [ ] **JavaScript sorts among the strings, on BOTH servers.** mongod ranks it
-  between Regex and MaxKey; we rank it as a string, because `bson.Code`
-  subclasses `str` in pymongo and `sortkey.encode_value` — the encoder that
-  writes the rank byte **persisted index entries** are sorted by — followed
-  that. Measured against 8.2.11, 2026-09-01.
+- [x] **JavaScript sorts between Regex and MaxKey — DONE 2026-09-01.** It used
+  to sort among the strings on both servers, because `bson.Code` subclasses
+  `str` and both rank tables identified a value with `isinstance(value, str)`.
+  mongod ranks JavaScript as its own type between Regex and MaxKey (probed
+  8.2.11).
 
-  Moving the in-memory comparator alone was tried and **reverted**: it made an
-  index change the sort answer, which is the one failure class this project
-  treats as unshippable. Moving both is an on-disk format break (`entryFormat`)
-  out of all proportion to JavaScript-valued indexed fields.
+  The reason this took a format bump: there are TWO rank tables per server and
+  they have to agree. `ordering._bson_type_rank` (Rust `order::type_rank`)
+  drives the in-memory sort; `sortkey.encode_value` writes the rank byte that
+  **persisted index entries** are sorted by. Changing only the first was tried
+  first and made an index change the sort answer. Both moved, and the
+  index-entry format went to **`entryFormat` 3** (`_ENTRY_FORMAT` /
+  `ENTRY_FORMAT`), so a store written by an earlier build is refused at open
+  rather than read back in the old order — MaxKey's rank byte shifted from 13
+  to 14 as well, so this is not only about JavaScript keys. There is no
+  migration, as with the two format bumps before it.
 
-  The proportionate fix is the remedy already used for collations: a **sticky
-  catalog flag** on an index that has ever held a JavaScript value — written at
-  insert / update / `createIndexes` time exactly like `multikey`, stripped from
-  `listIndexes` the same way — which makes the sort picker decline that index
-  for ORDERING while still using it to FETCH. Then the in-memory rank can move
-  to mongod's with no format change and no inconsistency.
-
-  MATCHING is already correct and needs none of this: range operators bracket
-  JavaScript separately (`query._same_type_bracket`, which deliberately does not
-  use the sort rank), and the exact `matches()` pass rechecks every index
-  candidate — verified indexed and unindexed.
+  Verified: `tools/probes/range_type_brackets.py` is 0/112 on both servers, and
+  a mixed-type sort matches mongod indexed AND unindexed on both.
 
 - [x] **Collated queries over exotic BSON types (Rust server) — DONE
   2026-09-01.** A collated `$gt` or `$eq` against a `Code` / `Symbol` value used
