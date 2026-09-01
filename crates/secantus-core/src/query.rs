@@ -1923,7 +1923,7 @@ fn op_bits(values: &[Option<&Bson>], arg: &Bson, pred: fn(u64, u64) -> bool) -> 
 
 /// A float or Decimal128 NaN. Used only by equality — ordering keeps IEEE
 /// semantics, where NaN is incomparable with everything including itself.
-fn is_nan_bson(b: &Bson) -> bool {
+pub(crate) fn is_nan_bson(b: &Bson) -> bool {
     match b {
         Bson::Double(d) => d.is_nan(),
         // Decimal128's NaN is a bit pattern, not a value we can compare; parse
