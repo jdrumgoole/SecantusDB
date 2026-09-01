@@ -283,7 +283,48 @@ Also worth noting: pgwire sends `ReadyForQuery` after `on_copy_done` but NOT
 `CommandComplete` -- the handler must send that itself, or the client waits for
 a result that never arrives (psycopg: "not enough values to unpack").
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900.**
+### 0.14 pgwire 0.31 -> 0.40 (2026-09-01): 900 -> 904
+
+**A review of the "pgwire vs hand-roll" decision found that both recorded costs
+of the crate were actually costs of OUR PIN.** We were on 0.31.1; current was
+0.40.7, released three weeks earlier and actively maintained. `pgwire = "0.31"`
+is pre-1.0, so cargo would never cross the minor boundary.
+
+| recorded limitation | reality |
+|---|---|
+| `ErrorInfo` cannot carry `constraint_name` (§0.6) | **fixed in 0.39.0** -- 18 fields now, incl. schema/table/column/datatype/constraint |
+| `COPY TO STDOUT` impossible, no `Sink` (§0.13) | **fixed in 0.38.0** -- CopyEncoder + full copy-out API; `SimpleQueryHandler::do_query` now takes a Sink |
+
+Both are now closed in our code: a 23505 carries constraint/table/schema
+identically to PG 14 (`column` stays UNSET, because PostgreSQL leaves it unset
+and populating it looked helpful but was wrong), and `COPY TO STDOUT` emits
+BYTE-IDENTICAL text that round-trips through `COPY FROM`.
+
+Migration cost: 12 compile errors. `Response` lost its lifetime parameter,
+`QueryParser` gained `get_parameter_types` / `get_result_schema`, `parse_sql`
+takes `&[Option<Type>]` (unspecified is `None`, not oid 0), `CopyResponse::new`
+takes a data stream, and `DataRowEncoder::finish` is deprecated in favour of
+`take_row`. All 200 PG tests passed unchanged afterwards -- the upgrade is
+behaviour-neutral.
+
+**Run `./inv sync` BEFORE the final full suite, not after it fails.** Stale
+`_secantus_core` produced phantom parity failures THREE times in this session
+alone -- each costing a ~15-minute suite run -- because parallel sessions keep
+merging engine changes to `main` while a long PG batch is in flight. The trap is
+documented in `CLAUDE.md`; what is new is how often it fires when sessions
+overlap. Sync is cheap; a wasted suite run is not.
+
+**The standing lesson: a sub-1.0 pin silently stops receiving compatible
+updates.** Two batches were spent writing careful notes about limitations that
+`cargo search pgwire` would have disproved in seconds. Check the upstream
+version BEFORE recording a limitation as permanent.
+
+Verdict on the original decision: **keep pgwire.** It is 9,545 lines against
+the Python server's 4,092 for less capability (no SCRAM, TLS or binary COPY),
+and it already covers everything ahead -- NoticeResponse, ParameterStatus,
+NotificationResponse, CancelRequest, SASL/SCRAM, SSL, PortalSuspended.
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904.**
 
 **A type-system trap worth remembering.** `Describe` runs BEFORE `Bind`, so a
 column's type cannot be inferred from its value — at that point `$1::int` has

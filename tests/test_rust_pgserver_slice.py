@@ -199,6 +199,14 @@ def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
     assert diag.message_primary == ('duplicate key value violates unique constraint "t_pkey"')
     assert diag.message_detail == "Key (id)=(1) already exists."
     assert "E11000" not in str(exc.value)
+    # The protocol's constraint fields, available since pgwire 0.39 and read by
+    # pgjdbc via getServerErrorMessage().getConstraint(). `column_name` stays
+    # unset because PostgreSQL leaves it unset on a 23505 -- it identifies the
+    # column through the constraint (probed 14).
+    assert diag.constraint_name == "t_pkey"
+    assert diag.table_name == "t"
+    assert diag.schema_name == "public"
+    assert diag.column_name is None
 
 
 @pytest.mark.parametrize(
@@ -505,19 +513,25 @@ def test_copy_from_stdin(home: Path) -> None:
         assert cur.fetchall() == [(1, "abc"), (2, "def")]
 
 
-def test_copy_to_stdout_is_refused_honestly(home: Path) -> None:
-    """`COPY ... TO STDOUT` is blocked by pgwire, not by us.
+def test_copy_to_stdout_round_trips(home: Path) -> None:
+    """`COPY ... TO STDOUT` in text format.
 
-    pgwire sends the CopyOutResponse header and leaves the connection in
-    CopyInProgress, but its simple-query handler has no `Sink` bound, so there
-    is no way to push the CopyData rows back. Refusing beats half-answering.
+    Was refused until pgwire 0.38 added the copy-out API (0.31 had no way to
+    push CopyData rows from the simple handler). The output is byte-identical
+    to PostgreSQL's, so it round-trips straight back through COPY FROM.
     """
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
-        cur.execute("CREATE TABLE cp (id int PRIMARY KEY)")
-        with (
-            pytest.raises(psycopg.Error) as exc,
-            cur.copy("COPY cp TO STDOUT") as cp,
-        ):
-            list(cp)
-        assert exc.value.diag.sqlstate == "0A000"
+        cur.execute("CREATE TABLE cp (id int, s text, n int)")
+        cur.execute("INSERT INTO cp VALUES (1,'a',10),(2,NULL,20),(3,'has\ttab',30)")
+
+        with cur.copy("COPY cp TO STDOUT") as cp:
+            out = b"".join(cp).decode()
+        # PostgreSQL's own text encoding: `\N` for NULL, escaped tabs.
+        assert out == "1\ta\t10\n2\t\\N\t20\n3\thas\\ttab\t30\n"
+
+        cur.execute("DELETE FROM cp")
+        with cur.copy("COPY cp FROM STDIN") as cp:
+            cp.write(out)
+        cur.execute("SELECT id, s, n FROM cp ORDER BY id")
+        assert cur.fetchall() == [(1, "a", 10), (2, None, 20), (3, "has\ttab", 30)]

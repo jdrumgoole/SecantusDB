@@ -21,7 +21,9 @@ use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::results::{CopyResponse, DescribePortalResponse, DescribeStatementResponse};
+use pgwire::api::results::{
+    CopyEncoder, CopyResponse, CopyTextOptions, DescribePortalResponse, DescribeStatementResponse,
+};
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
@@ -134,14 +136,18 @@ impl PgHandler {
                 format!("duplicate key value violates unique constraint \"{table}_pkey\""),
             );
             info.detail = detail;
-            // LIMITATION (pgwire 0.31): `ErrorInfo` exposes severity/code/
-            // message/detail/hint/position/where/file/line/routine, but NOT the
-            // protocol's schema/table/column/constraint fields. Real PostgreSQL
-            // sends `constraint_name = "<table>_pkey"` and `table_name` here,
-            // and pgjdbc surfaces them as
-            // `PSQLException.getServerErrorMessage().getConstraint()`. Tracked
-            // in tasks/rust-pgserver-plan.md; either upstream the fields or
-            // hand-roll the codec if a gauge starts asserting them.
+            // pgwire 0.39 added the protocol's schema/table/column/constraint
+            // fields (they were absent in 0.31, which is why this used to be a
+            // recorded limitation). Real PostgreSQL sends them on a 23505, and
+            // pgjdbc surfaces them as
+            // `PSQLException.getServerErrorMessage().getConstraint()`.
+            info.table = Some(table.to_string());
+            info.schema = Some("public".to_string());
+            info.constraint = Some(format!("{table}_pkey"));
+            // `column` stays UNSET: PostgreSQL identifies the offending column
+            // through the constraint on a 23505, not through this field
+            // (probed 14 -- it sends None). Populating it looked more helpful
+            // and was simply wrong.
             return PgWireError::UserError(Box::new(info));
         }
         Self::storage_err("could not insert", msg)
@@ -227,7 +233,7 @@ impl NoopStartupHandler for PgHandler {
 
 #[async_trait]
 impl SimpleQueryHandler for PgHandler {
-    async fn do_query<'a, C>(&self, _c: &mut C, query: &str) -> PgWireResult<Vec<Response<'a>>>
+    async fn do_query<C>(&self, _c: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
@@ -240,12 +246,12 @@ impl PgHandler {
     /// Execute one statement. Shared by BOTH protocols so they cannot drift:
     /// the simple path passes no parameters, the extended path passes the
     /// portal's bound values and `Execute`'s row limit.
-    async fn run<'a>(
+    async fn run(
         &self,
         query: &str,
         params: &[Bson],
         max_rows: usize,
-    ) -> PgWireResult<Vec<Response<'a>>> {
+    ) -> PgWireResult<Vec<Response>> {
         let sql = query.trim().trim_end_matches(';').trim();
         if sql.is_empty() {
             return Ok(vec![Response::EmptyQuery]);
@@ -306,10 +312,7 @@ impl PgHandler {
     }
 
     /// BEGIN / COMMIT / ROLLBACK.
-    fn transaction_control<'a>(
-        &self,
-        control: TransactionControl,
-    ) -> PgWireResult<Vec<Response<'a>>> {
+    fn transaction_control(&self, control: TransactionControl) -> PgWireResult<Vec<Response>> {
         let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
         let tag = match control {
             TransactionControl::Begin => {
@@ -345,7 +348,7 @@ impl PgHandler {
     }
 
     /// Execute one planned statement against storage.
-    fn execute<'a>(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response<'a>>> {
+    fn execute(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
         match stmt {
             Statement::Transaction(_) => unreachable!("handled before execute"),
             Statement::CreateTable(def) => {
@@ -448,7 +451,7 @@ impl PgHandler {
                     for f in &fields {
                         encode_value(&mut enc, d.get(f))?;
                     }
-                    enc.finish()
+                    Ok(enc.take_row())
                 });
                 Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
             }
@@ -506,7 +509,71 @@ impl PgHandler {
                     buffer: Vec::new(),
                 });
                 // format 0 = text, and every column is text-formatted.
-                Ok(vec![Response::CopyIn(CopyResponse::new(0, n, vec![0; n]))])
+                // The stream is the COPY OUT direction; an IN response has none.
+                Ok(vec![Response::CopyIn(CopyResponse::new(
+                    0,
+                    n,
+                    futures::stream::empty(),
+                ))])
+            }
+
+            Statement::CopyTo(ct) => {
+                let def = self
+                    .lookup(&ct.table)
+                    .ok_or_else(|| Self::err(&PlanError::UndefinedTable(ct.table.clone())))?;
+                let cols: Vec<&secantus_pgcatalog::Column> = if ct.columns.is_empty() {
+                    def.columns.iter().collect()
+                } else {
+                    ct.columns
+                        .iter()
+                        .map(|n| def.column(n).expect("planner checked"))
+                        .collect()
+                };
+                let schema = Arc::new(
+                    cols.iter()
+                        .map(|c| {
+                            FieldInfo::new(
+                                c.name.clone(),
+                                None,
+                                None,
+                                wire_type(&c.pg_type),
+                                FieldFormat::Text,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let fields: Vec<String> = cols.iter().map(|c| c.field()).collect();
+
+                let raw = self
+                    .storage
+                    .find_matching(&self.db, &ct.table, &Document::new())
+                    .map_err(|e| Self::storage_err("could not read", e))?;
+                let docs: Vec<Document> = raw
+                    .iter()
+                    .map(|b| bson::from_slice(b))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| Self::storage_err("could not decode a row", e))?;
+
+                // The text encoder writes PostgreSQL's own escaping -- `\N`
+                // for NULL, and escaped tabs/newlines -- so this round-trips
+                // through the COPY FROM path above.
+                let mut encoder = CopyEncoder::new_text(schema.clone(), CopyTextOptions::default());
+                let n = schema.len();
+                let data = stream::iter(docs).map(move |d| {
+                    for f in &fields {
+                        match d.get(f) {
+                            Some(Bson::Int32(v)) => encoder.encode_field(&Some(*v))?,
+                            Some(Bson::Int64(v)) => encoder.encode_field(&Some(*v))?,
+                            Some(Bson::Double(v)) => encoder.encode_field(&Some(*v))?,
+                            Some(Bson::Boolean(v)) => encoder.encode_field(&Some(*v))?,
+                            Some(Bson::String(v)) => encoder.encode_field(&Some(v.as_str()))?,
+                            _ => encoder.encode_field(&None::<i32>)?,
+                        }
+                    }
+                    Ok(encoder.take_copy())
+                });
+                // format 0 = text.
+                Ok(vec![Response::CopyOut(CopyResponse::new(0, n, data))])
             }
 
             Statement::Show(name) => {
@@ -530,7 +597,7 @@ impl PgHandler {
                 let rows = stream::iter(std::iter::once(value)).map(move |v| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
                     enc.encode_field(&Some(v.as_str()))?;
-                    enc.finish()
+                    Ok(enc.take_row())
                 });
                 Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
             }
@@ -589,7 +656,7 @@ impl PgHandler {
                     for v in &vals {
                         encode_value(&mut enc, Some(v))?;
                     }
-                    enc.finish()
+                    Ok(enc.take_row())
                 });
                 Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
             }
@@ -723,7 +790,7 @@ impl PgHandler {
                         };
                         encode_value(&mut enc, Some(&v))?;
                     }
-                    enc.finish()
+                    Ok(enc.take_row())
                 });
                 Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
             }
@@ -952,14 +1019,37 @@ pub struct SqlParser;
 impl QueryParser for SqlParser {
     type Statement = ParsedStatement;
 
-    async fn parse_sql<C>(&self, _c: &C, sql: &str, types: &[Type]) -> PgWireResult<Self::Statement>
+    async fn parse_sql<C>(
+        &self,
+        _c: &C,
+        sql: &str,
+        types: &[Option<Type>],
+    ) -> PgWireResult<Self::Statement>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
         Ok(ParsedStatement {
             sql: sql.to_string(),
-            declared_types: types.to_vec(),
+            // 0.40 reports an unspecified parameter as `None` rather than a
+            // zero oid; both mean "the server decides", so flatten them.
+            declared_types: types.iter().flatten().cloned().collect(),
         })
+    }
+
+    // These two exist so `ExtendedQueryHandler` can AUTO-implement Describe.
+    // We override `do_describe_statement` / `do_describe_portal` explicitly --
+    // resolving a result schema needs the catalog, which the parser has no
+    // access to -- so the auto path is never taken and these stay empty.
+    fn get_parameter_types(&self, stmt: &Self::Statement) -> PgWireResult<Vec<Type>> {
+        Ok(stmt.declared_types.clone())
+    }
+
+    fn get_result_schema(
+        &self,
+        _stmt: &Self::Statement,
+        _column_format: Option<&Format>,
+    ) -> PgWireResult<Vec<FieldInfo>> {
+        Ok(Vec::new())
     }
 }
 
@@ -1069,7 +1159,12 @@ impl PgHandler {
                     Format::UnifiedBinary => true,
                     Format::Individual(codes) => codes.get(i).copied().unwrap_or(0) == 1,
                 };
-                decode_parameter(raw.as_ref(), declared.get(i), binary)
+                // 0.40 stores an unspecified parameter type as `None`.
+                decode_parameter(
+                    raw.as_ref(),
+                    declared.get(i).and_then(|t| t.as_ref()),
+                    binary,
+                )
             })
             .collect()
     }
@@ -1156,8 +1251,14 @@ impl ExtendedQueryHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let types = target.parameter_types.clone();
-        let fields = self.describe_fields(&target.statement.sql, types.len())?;
+        let declared = &target.parameter_types;
+        let fields = self.describe_fields(&target.statement.sql, declared.len())?;
+        // An unspecified parameter (`None`) is reported to the client as
+        // `unknown`, which is what PostgreSQL does when it cannot infer.
+        let types: Vec<Type> = declared
+            .iter()
+            .map(|t| t.clone().unwrap_or(Type::UNKNOWN))
+            .collect();
         Ok(DescribeStatementResponse::new(types, fields))
     }
 
@@ -1179,12 +1280,12 @@ impl ExtendedQueryHandler for PgHandler {
         Ok(DescribePortalResponse::new(fields))
     }
 
-    async fn do_query<'a, C>(
+    async fn do_query<C>(
         &self,
         _c: &mut C,
         portal: &Portal<Self::Statement>,
         max_rows: usize,
-    ) -> PgWireResult<Response<'a>>
+    ) -> PgWireResult<Response>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
