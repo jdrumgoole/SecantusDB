@@ -700,3 +700,50 @@ fn guc_functions_defer_to_the_connection() {
         other => panic!("wrong statement: {other:?}"),
     }
 }
+
+/// `date` and `time` are stored as canonical TEXT -- the same representation
+/// the Python server writes, because the two share one store.
+#[test]
+fn date_and_time_canonicalise() {
+    let cases = [
+        ("SELECT '2026-09-01'::date", "2026-09-01"),
+        // PostgreSQL accepts several spellings and renders exactly one.
+        ("SELECT '2026-9-1'::date", "2026-09-01"),
+        ("SELECT '20260901'::date", "2026-09-01"),
+        ("SELECT '12:34:56'::time", "12:34:56"),
+        ("SELECT '12:34'::time", "12:34:00"),
+        // A fraction keeps only the digits that matter.
+        ("SELECT '12:34:56.5'::time", "12:34:56.5"),
+        ("SELECT '12:34:56.000'::time", "12:34:56"),
+    ];
+    for (sql, want) in cases {
+        match plan_ok(sql) {
+            Statement::SelectConstant(sc) => assert_eq!(
+                sc.columns[0].1,
+                ConstCol::Value(Bson::String(want.into())),
+                "for {sql}"
+            ),
+            other => panic!("wrong statement for {sql}: {other:?}"),
+        }
+    }
+}
+
+/// Malformed and impossible are DIFFERENT SQLSTATEs, probed on PG 14.
+#[test]
+fn bad_dates_distinguish_22007_from_22008() {
+    // Not a date at all.
+    for sql in ["SELECT 'not-a-date'::date", "SELECT 'xx:yy'::time"] {
+        let err = plan(sql, &lookup).expect_err(sql);
+        assert_eq!(err.sqlstate(), "22007", "for {sql}");
+    }
+    // Well-formed, but naming a value that cannot exist.
+    for sql in ["SELECT '2026-02-30'::date", "SELECT '25:00:00'::time"] {
+        let err = plan(sql, &lookup).expect_err(sql);
+        assert_eq!(err.sqlstate(), "22008", "for {sql}");
+    }
+    // NULL survives every cast, including these.
+    match plan_ok("SELECT NULL::date") {
+        Statement::SelectConstant(sc) => assert_eq!(sc.columns[0].1, ConstCol::Value(Bson::Null)),
+        other => panic!("wrong statement: {other:?}"),
+    }
+}

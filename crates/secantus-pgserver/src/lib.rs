@@ -33,8 +33,8 @@ use pgwire::messages::response::CommandComplete;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use secantus_pgcatalog::{TableDef, CATALOG_COLLECTION};
 use secantus_pgplan::{
-    plan_with_params, AggFunc, AggItem, ConstCol, Error as PlanError, Nulls, OrderKey, OutputCol,
-    Statement, TransactionControl,
+    companion_field, plan_with_params, render_timestamp, AggFunc, AggItem, ConstCol,
+    Error as PlanError, Nulls, OrderKey, OutputCol, Statement, TransactionControl,
 };
 use secantus_storage::{Storage, UserTransactionHandle};
 
@@ -214,6 +214,13 @@ fn wire_type(pg_type: &str) -> Type {
         "varchar" | "character varying" => Type::VARCHAR,
         "bpchar" | "char" | "character" => Type::BPCHAR,
         "name" => Type::NAME,
+        // Stored as canonical TEXT but reported with their real oids: a client
+        // reading 1082/1083 parses the value into a date/time object, whereas
+        // varchar hands it back as a string. Same shape as the text-vs-varchar
+        // bug -- psycopg would not notice, pgjdbc and pgx would.
+        "date" => Type::DATE,
+        "time" => Type::TIME,
+        "timestamp" => Type::TIMESTAMP,
         // Everything else renders as text for now; P4 owns the real type map.
         _ => Type::VARCHAR,
     }
@@ -449,7 +456,12 @@ impl PgHandler {
                 let rows = stream::iter(docs).map(move |d| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
                     for f in &fields {
-                        encode_value(&mut enc, d.get(f))?;
+                        // A timestamp is reassembled from its stored date plus
+                        // the hidden companion before it goes on the wire.
+                        match timestamp_text(&d, f) {
+                            Some(text) => enc.encode_field(&Some(text.as_str()))?,
+                            None => encode_value(&mut enc, d.get(f))?,
+                        }
                     }
                     Ok(enc.take_row())
                 });
@@ -802,7 +814,17 @@ impl PgHandler {
                         &self.db,
                         &upd.table,
                         &upd.filter,
-                        &bson::doc! { "$set": upd.set },
+                        &{
+                            let mut ops = bson::doc! { "$set": upd.set };
+                            if !upd.unset.is_empty() {
+                                let mut u = Document::new();
+                                for f in &upd.unset {
+                                    u.insert(f.clone(), "");
+                                }
+                                ops.insert("$unset", u);
+                            }
+                            ops
+                        },
                         true,  // multi: SQL UPDATE has no single-row default
                         false, // upsert: never; PostgreSQL UPDATE does not insert
                         &[],
@@ -831,6 +853,25 @@ impl PgHandler {
             }
         }
     }
+}
+
+/// A stored timestamp, with its hidden companion added back.
+///
+/// The remainder is validated rather than trusted: a value outside 0-999, or
+/// not an integer at all, is ignored. A hand-edited or foreign document must
+/// not be able to produce a time that was never written -- the same
+/// defensiveness `subms.py::merge` applies on the Python side.
+fn timestamp_text(doc: &Document, field: &str) -> Option<String> {
+    let ms = match doc.get(field) {
+        Some(Bson::DateTime(d)) => d.timestamp_millis(),
+        _ => return None,
+    };
+    let rem = match doc.get(companion_field(field)) {
+        Some(Bson::Int32(v)) if (1..1000).contains(v) => i64::from(*v),
+        Some(Bson::Int64(v)) if (1..1000).contains(v) => *v,
+        _ => 0,
+    };
+    Some(render_timestamp(ms * 1000 + rem))
 }
 
 /// Encode one stored value as a SQL datum. Absent and explicit null are both
