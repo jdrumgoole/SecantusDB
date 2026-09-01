@@ -122,7 +122,7 @@ fn match_clause_raw(
         _ => {
             let reached = resolve_path_raw(raw, key)?;
             let refs: Vec<Option<&Bson>> = reached.iter().map(Option::as_ref).collect();
-            field_matches(&refs, cond, coll)
+            field_matches(&refs, cond, coll, key)
         }
     }
 }
@@ -221,7 +221,7 @@ fn match_clause(
         "$jsonSchema" => validate_json_schema(&Bson::Document(doc.clone()), cond),
         // $where, $text, ... -> Python.
         _ if key.starts_with('$') => Err(Fallback::Defer),
-        _ => field_matches(&resolve_path(doc, key), cond, coll),
+        _ => field_matches(&resolve_path(doc, key), cond, coll, key),
     }
 }
 
@@ -350,7 +350,12 @@ fn regex_options_ok(arg: &Bson) -> Result<(), Fallback> {
     Ok(())
 }
 
-fn field_matches(values: &[Option<&Bson>], cond: &Bson, coll: Option<&Collation>) -> R {
+fn field_matches(
+    values: &[Option<&Bson>],
+    cond: &Bson,
+    coll: Option<&Collation>,
+    field: &str,
+) -> R {
     match cond {
         // A bare BSON regex literal: `{field: /pat/flags}` matches as a pattern.
         Bson::RegularExpression(_) => op_regex(values, cond, None),
@@ -404,7 +409,7 @@ fn field_matches(values: &[Option<&Bson>], cond: &Bson, coll: Option<&Collation>
                         }
                     }
                     _ => {
-                        if !op_matches(values, op, arg, coll)? {
+                        if !op_matches(values, op, arg, coll, field)? {
                             return Ok(false);
                         }
                     }
@@ -441,7 +446,28 @@ fn op_regex(values: &[Option<&Bson>], pattern: &Bson, options: Option<&Bson>) ->
     Ok(false)
 }
 
-fn op_matches(values: &[Option<&Bson>], op: &str, arg: &Bson, coll: Option<&Collation>) -> R {
+fn op_matches(
+    values: &[Option<&Bson>],
+    op: &str,
+    arg: &Bson,
+    coll: Option<&Collation>,
+    field: &str,
+) -> R {
+    // mongod rejects a regex bound on a non-equality predicate at PARSE time
+    // (probed 8.2.11, 2026-09-01) -- a regex is only meaningful under equality,
+    // where it matches rather than compares. Answering an empty result set
+    // instead hid a malformed query behind "nothing matched".
+    if matches!(arg, Bson::RegularExpression(_)) {
+        if matches!(op, "$gt" | "$gte" | "$lt" | "$lte") {
+            return Err(Fallback::mongo(
+                2,
+                format!("Can't have RegEx as arg to non-equality predicate over field '{field}'."),
+            ));
+        }
+        if op == "$ne" {
+            return Err(Fallback::mongo(2, "Can't have regex as arg to $ne."));
+        }
+    }
     match op {
         "$eq" => eq_with_array(values, arg, coll),
         "$ne" => Ok(!eq_with_array(values, arg, coll)?),
@@ -485,17 +511,17 @@ fn op_matches(values: &[Option<&Bson>], op: &str, arg: &Bson, coll: Option<&Coll
                 Bson::Document(d) if !d.is_empty() => {}
                 _ => return Err(Fallback::Defer),
             }
-            Ok(!field_matches(values, arg, coll)?)
+            Ok(!field_matches(values, arg, coll, field)?)
         }
         "$type" => op_type(values, arg),
         "$size" => op_size(values, arg),
-        "$all" => op_all(values, arg),
+        "$all" => op_all(values, arg, field),
         "$elemMatch" => {
             // mongod: $elemMatch needs an Object (else BadValue) -> defer.
             if !matches!(arg, Bson::Document(_)) {
                 return Err(Fallback::Defer);
             }
-            op_elem_match(values, arg)
+            op_elem_match(values, arg, field)
         }
         "$mod" => op_mod(values, arg),
         "$bitsAllSet" => op_bits(values, arg, |v, m| v & m == m),
@@ -737,6 +763,22 @@ fn compare_values(
     b: &Bson,
     coll: Option<&Collation>,
 ) -> Result<Option<Ordering>, Fallback> {
+    // mongod's ONE exception to type bracketing: a `MinKey` / `MaxKey` BOUND
+    // compares against every type, through the full cross-type order. Only the
+    // bound -- a document whose VALUE is a MaxKey stays bracketed out of
+    // `{v: {$gt: 3}}`. These used to fall through to the "not comparable"
+    // catch-all, so `{v: {$lt: MaxKey()}}` matched NOTHING where mongod matches
+    // everything but the MaxKey itself (probed 8.2.11, 2026-09-01).
+    if matches!(b, Bson::MinKey | Bson::MaxKey) {
+        let ord = if crate::order::bson_lt(a, b).ok_or(Fallback::Defer)? {
+            Ordering::Less
+        } else if crate::order::bson_lt(b, a).ok_or(Fallback::Defer)? {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        };
+        return Ok(Some(ord));
+    }
     // MongoDB ranks bool as its own type bracket: under range operators a bool
     // compares only with another bool, never with a number or any other type
     // (verified against mongod — `{a: {$gt: 0}}` skips a bool-valued `a`). A bool
@@ -824,14 +866,26 @@ fn compare_values(
         if coll.is_some() {
             return Err(Fallback::Defer);
         }
-        fn text_of(v: &Bson) -> Option<&str> {
+        // A Symbol IS a string to mongod. JavaScript is its own bracket, so it
+        // compares only with JavaScript -- comparing it with a String is how
+        // `{v: {$gt: "ab"}}` matched a `Code` document.
+        fn string_text(v: &Bson) -> Option<&str> {
             match v {
-                Bson::String(s) | Bson::Symbol(s) | Bson::JavaScriptCode(s) => Some(s),
+                Bson::String(s) | Bson::Symbol(s) => Some(s),
+                _ => None,
+            }
+        }
+        fn js_text(v: &Bson) -> Option<&str> {
+            match v {
+                Bson::JavaScriptCode(s) => Some(s),
                 Bson::JavaScriptCodeWithScope(c) => Some(&c.code),
                 _ => None,
             }
         }
-        return Ok(match (text_of(a), text_of(b)) {
+        if let (Some(x), Some(y)) = (js_text(a), js_text(b)) {
+            return Ok(Some(x.cmp(y)));
+        }
+        return Ok(match (string_text(a), string_text(b)) {
             (Some(x), Some(y)) => Some(x.cmp(y)),
             _ => None,
         });
@@ -1592,7 +1646,8 @@ fn op_type(values: &[Option<&Bson>], spec: &Bson) -> R {
 /// element. Element equality uses Python `==` (`expressions::py_eq` — numeric
 /// bridge + bool-as-int), matching `secantus.query._op_all`. Regex elements
 /// (which Python matches as patterns) defer to Python.
-fn op_all(values: &[Option<&Bson>], required: &Bson) -> R {
+fn op_all(values: &[Option<&Bson>], required: &Bson, field: &str) -> R {
+    let field_name = field;
     let Bson::Array(required) = required else {
         return Err(Fallback::Defer); // Python raises QueryError on a non-array $all
     };
@@ -1634,7 +1689,9 @@ fn op_all(values: &[Option<&Bson>], required: &Bson) -> R {
                     if let Some(sub) = rd.get("$elemMatch") {
                         let ok = is_array && {
                             let arr_bson = Bson::Array(elems.to_vec());
-                            op_elem_match(&[Some(&arr_bson)], sub)?
+                            // `field` is shadowed here by a local `&Bson`, so
+                            // reach past it for the name the error message wants.
+                            op_elem_match(&[Some(&arr_bson)], sub, field_name)?
                         };
                         if !ok {
                             all_present = false;
@@ -1696,7 +1753,7 @@ fn op_size(values: &[Option<&Bson>], size: &Bson) -> R {
 
 // --- $elemMatch ---------------------------------------------------------
 
-fn op_elem_match(values: &[Option<&Bson>], cond: &Bson) -> R {
+fn op_elem_match(values: &[Option<&Bson>], cond: &Bson, field: &str) -> R {
     let Bson::Document(condd) = cond else {
         return Ok(false); // Python: non-mapping condition -> False
     };
@@ -1706,7 +1763,7 @@ fn op_elem_match(values: &[Option<&Bson>], cond: &Bson) -> R {
         for elem in arr {
             if scalar_form {
                 // Python's $elemMatch passes no collation to the inner match.
-                if field_matches(&[Some(elem)], cond, None)? {
+                if field_matches(&[Some(elem)], cond, None, field)? {
                     return Ok(true);
                 }
             } else if let Bson::Document(ed) = elem {

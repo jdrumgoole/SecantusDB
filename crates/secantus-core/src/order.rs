@@ -41,6 +41,12 @@ fn type_rank(v: &Bson) -> u8 {
         Bson::DateTime(_) => 100,
         Bson::Timestamp(_) => 110,
         Bson::RegularExpression(_) => 120,
+        // mongod ranks JavaScript between Regex and MaxKey. It used to fall to
+        // the catch-all document rank here and to the STRING rank in `lt_rank`
+        // below -- deliberately, to match what the Python engine did, because
+        // `bson.Code` subclasses `str` there. Both engines were wrong together,
+        // which is the failure mode a parity suite cannot see.
+        Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_) => 125,
         Bson::MaxKey => 130,
         _ => 50, // matches Python's `return 5` fallback (never reached: is_sortable bars these)
     }
@@ -199,7 +205,9 @@ fn array_cmp(a: &[Bson], b: &[Bson]) -> Ordering {
 /// type-*name* tiebreak.
 fn lt_rank(v: &Bson) -> u8 {
     match v {
-        Bson::Symbol(_) | Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_) => 4,
+        // A BSON Symbol really is a string to mongod (and pymongo decodes one
+        // as `str`); JavaScript is NOT, and no longer shares the rank.
+        Bson::Symbol(_) => type_rank(&Bson::String(String::new())),
         Bson::Undefined => 2,
         _ => type_rank(v),
     }
@@ -210,7 +218,10 @@ fn lt_rank(v: &Bson) -> u8 {
 /// its code string, scope ignored).
 fn lt_text(v: &Bson) -> Option<&str> {
     match v {
-        Bson::String(s) | Bson::Symbol(s) | Bson::JavaScriptCode(s) => Some(s),
+        Bson::String(s) | Bson::Symbol(s) => Some(s),
+        // Two JavaScript values compare by their code text, but they no longer
+        // share a rank with String, so this is only reached for a JS/JS pair.
+        Bson::JavaScriptCode(s) => Some(s),
         Bson::JavaScriptCodeWithScope(c) => Some(&c.code),
         _ => None,
     }

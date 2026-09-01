@@ -1444,6 +1444,16 @@ pub enum StorageError {
     /// (the `matches` "defer to Python" signal). The server's engine selection
     /// is responsible for not routing such queries to the Rust storage.
     QueryUnsupported,
+    /// A query filter the Rust engine REFUSES, with mongod's own code and
+    /// message -- `{v: {$gt: /re/}}` is BadValue "Can't have RegEx as arg to a
+    /// non-equality predicate", not an unsupported construct. Same reason
+    /// `UpdatePathNotViable` above exists: without a variant that carries the
+    /// error, the refusal collapses into the generic BadValue (2) "not
+    /// supported by the Rust server", which tells the caller the wrong thing.
+    QueryError {
+        code: i32,
+        errmsg: String,
+    },
     /// A multi-document transaction's buffered write volume exceeded the
     /// cache-derived dirty budget (see `Storage::txn_dirty_limit`). Raised
     /// BEFORE the transaction can pin enough unevictable dirty content to
@@ -1474,6 +1484,18 @@ pub enum StorageError {
     ImmutableField,
 }
 
+/// Map a query-engine fault to a storage error, keeping mongod's code and
+/// message when the engine named one.
+pub(crate) fn query_fault(fault: secantus_core::fallback::Fallback) -> StorageError {
+    match fault.as_mongo() {
+        Some((code, errmsg)) => StorageError::QueryError {
+            code,
+            errmsg: errmsg.to_string(),
+        },
+        None => StorageError::QueryUnsupported,
+    }
+}
+
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1496,6 +1518,7 @@ impl std::fmt::Display for StorageError {
             StorageError::QueryUnsupported => {
                 write!(f, "query construct not supported by the Rust query engine")
             }
+            StorageError::QueryError { errmsg, .. } => write!(f, "{errmsg}"),
             StorageError::TransactionTooLargeForCache => write!(
                 f,
                 "Transaction is too large and will not fit in the storage engine cache"
@@ -4924,8 +4947,7 @@ impl Storage {
         for (_seq, blob) in rows {
             let d = decode_doc(&blob)?;
             if filter.is_empty()
-                || query_matches(&d, filter, vars, coll_opt)
-                    .map_err(|_| StorageError::QueryUnsupported)?
+                || query_matches(&d, filter, vars, coll_opt).map_err(query_fault)?
             {
                 out.push((d, blob));
             }
@@ -8088,9 +8110,7 @@ impl Storage {
             for (rid, _id_k, blob) in self.scan_docs(session, db, coll)? {
                 let d = decode_doc(&blob)?;
                 if let Some(pf) = &partial {
-                    if !query_matches(&d, pf, &Document::new(), None)
-                        .map_err(|_| StorageError::QueryUnsupported)?
-                    {
+                    if !query_matches(&d, pf, &Document::new(), None).map_err(query_fault)? {
                         continue;
                     }
                 }
@@ -9194,8 +9214,7 @@ impl Storage {
     fn doc_in_partial(&self, doc: &Document, desc: &IndexDesc) -> Result<bool> {
         match &desc.partial {
             None => Ok(true),
-            Some(pf) => query_matches(doc, pf, &Document::new(), None)
-                .map_err(|_| StorageError::QueryUnsupported),
+            Some(pf) => query_matches(doc, pf, &Document::new(), None).map_err(query_fault),
         }
     }
 
@@ -9871,7 +9890,7 @@ impl Storage {
                 let raw = bson::RawDocument::from_bytes(&blob)
                     .map_err(|_| StorageError::QueryUnsupported)?;
                 if secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
-                    .map_err(|_| StorageError::QueryUnsupported)?
+                    .map_err(query_fault)?
                 {
                     out.push(blob);
                 }
@@ -9976,7 +9995,7 @@ impl Storage {
                 let raw = bson::RawDocument::from_bytes(&blob)
                     .map_err(|_| StorageError::QueryUnsupported)?;
                 if secantus_core::query::matches_raw(raw, filter, &vars, coll_opt)
-                    .map_err(|_| StorageError::QueryUnsupported)?
+                    .map_err(query_fault)?
                 {
                     n += 1;
                 }
@@ -10160,7 +10179,7 @@ impl Storage {
                     let_vars,
                     None,
                 )
-                .map_err(|_| StorageError::QueryUnsupported)?;
+                .map_err(query_fault)?;
                 let mut new = out
                     .into_iter()
                     .next()
@@ -10291,7 +10310,7 @@ impl Storage {
                     let raw = bson::RawDocument::from_bytes(&blob)
                         .map_err(|_| StorageError::QueryUnsupported)?;
                     if secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
-                        .map_err(|_| StorageError::QueryUnsupported)?
+                        .map_err(query_fault)?
                     {
                         rids.push(recordid);
                     }
@@ -10418,7 +10437,7 @@ impl Storage {
             let raw =
                 bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
             if !secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
-                .map_err(|_| StorageError::QueryUnsupported)?
+                .map_err(query_fault)?
             {
                 continue;
             }
@@ -10469,7 +10488,7 @@ impl Storage {
                         "diff",
                         Bson::Document(
                             compute_update_description_for(&doc, &new, update_spec)
-                                .map_err(|_| StorageError::QueryUnsupported)?,
+                                .map_err(query_fault)?,
                         ),
                     );
                     o_owned = encode_doc(&o)?;
@@ -10550,7 +10569,7 @@ impl Storage {
                     let raw = bson::RawDocument::from_bytes(&blob)
                         .map_err(|_| StorageError::QueryUnsupported)?;
                     if !secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
-                        .map_err(|_| StorageError::QueryUnsupported)?
+                        .map_err(query_fault)?
                     {
                         continue;
                     }
@@ -10621,7 +10640,7 @@ impl Storage {
                                     "diff",
                                     Bson::Document(
                                         compute_update_description_for(&doc, &new, update_spec)
-                                            .map_err(|_| StorageError::QueryUnsupported)?,
+                                            .map_err(query_fault)?,
                                     ),
                                 );
                                 o_owned = encode_doc(&o)?;
@@ -10773,7 +10792,7 @@ impl Storage {
                 let raw = bson::RawDocument::from_bytes(&blob)
                     .map_err(|_| StorageError::QueryUnsupported)?;
                 if secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt)
-                    .map_err(|_| StorageError::QueryUnsupported)?
+                    .map_err(query_fault)?
                 {
                     rids.push(recordid);
                 }
@@ -10854,7 +10873,7 @@ impl Storage {
             let raw =
                 bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
             if !secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt)
-                .map_err(|_| StorageError::QueryUnsupported)?
+                .map_err(query_fault)?
             {
                 continue;
             }
@@ -10933,7 +10952,7 @@ impl Storage {
                     let raw = bson::RawDocument::from_bytes(&blob)
                         .map_err(|_| StorageError::QueryUnsupported)?;
                     if !secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt)
-                        .map_err(|_| StorageError::QueryUnsupported)?
+                        .map_err(query_fault)?
                     {
                         continue;
                     }
