@@ -6883,7 +6883,14 @@ shared storage engine or building large new protocol subsystems:
       sweep, NOT yet fixed).** Recorded with the measurement so the next pass
       starts from evidence:
 
-      1. **`bool_and(<comparison>)` / `bool_or(<comparison>)` answer NULL** —
+      1. ~~**`bool_and(<comparison>)` / `bool_or(<comparison>)` answer NULL**~~
+         — **FIXED 2026-09-01.** Two layers: `_accumulator`'s
+         expression-argument branch was gated on a function list that omitted
+         the bool aggregates, and `_agg_arg_to_expr` could not lower a
+         comparison at all. It now lowers comparisons, `NOT` and `CASE`, with
+         SQL's three-valued logic (a comparison against NULL stays NULL —
+         Mongo's `$gt` would answer false and flip `bool_and` from true to
+         false). `sum(CASE WHEN … END)` works as a side effect. Original:
          silently. `bool_and(b)` over a bare boolean COLUMN is correct; an
          expression argument is not:
 
@@ -6896,9 +6903,11 @@ shared storage engine or building large new protocol subsystems:
          `avg(n*2)`, `min(n+1)`) DO work, so this is specific to the
          comparison-argument shape reaching the bool accumulators.
 
-      2. **`sum(CASE …)` / `min(abs(n))` are `0A000`** — honest, not silent,
-         and the message is wrong: it says "unsupported array_agg argument"
-         for a `sum`/`min` call.
+      2. **PARTLY FIXED.** `sum(CASE …)` works now (see 1). `min(abs(n))` —
+         a FUNCTION call as an aggregate argument — is still `0A000`, but the
+         message no longer names the wrong function: it said "unsupported
+         array_agg argument" for a `min()` call and now says "unsupported
+         aggregate argument".
 
       3. **`cume_dist()` / `percent_rank()` are `0A000`** — "window function
          CumeDist is not supported". Every other window function measured

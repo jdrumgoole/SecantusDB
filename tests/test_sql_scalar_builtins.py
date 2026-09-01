@@ -131,3 +131,71 @@ class TestResultTypes:
         with pytest.raises(SQLError) as ei:
             db("SELECT div(1, 0)")
         assert ei.value.sqlstate == "22012"
+
+
+class TestAggregateExpressionArguments:
+    """`bool_and(n > 0)` answered NULL — silently.
+
+    `bool_and(b)` over a bare boolean COLUMN was always correct, which is what
+    hid it. `_accumulator`'s expression-argument branch was gated on a function
+    list that omitted the bool aggregates, so a comparison argument fell
+    through to the field-path branch, arrived with `field=None`, and the
+    accumulator body became literally `None`.
+
+    Fixing the gate then exposed a second layer: `_agg_arg_to_expr` could not
+    lower a comparison at all. It now lowers comparisons, `NOT`, and `CASE` —
+    with SQL's three-valued logic, so a comparison against NULL stays NULL
+    (Mongo's `$gt` would answer false, which would turn `bool_and` from true
+    into false).
+    """
+
+    @pytest.fixture()
+    def agg(self, tmp_path):
+        storage = Storage(str(tmp_path))
+        session = Session(database="t")
+
+        def run(sql: str):
+            return [r.rows for r in run_sql(storage, "t", sql, session=session)][0]
+
+        run("CREATE TABLE ba (id int, n int, b bool)")
+        run("INSERT INTO ba VALUES (1,5,true),(2,NULL,NULL),(3,3,true)")
+        try:
+            yield run
+        finally:
+            storage.close()
+
+    @pytest.mark.parametrize(
+        ("expr", "value"),
+        [
+            ("bool_and(b)", True),
+            ("bool_or(b)", True),
+            ("every(b)", True),
+            ("bool_and(n > 0)", True),
+            ("bool_or(n > 4)", True),
+            ("bool_and(n > 9)", False),
+            ("bool_or(n > 9)", False),
+        ],
+    )
+    def test_bool_aggregates(self, agg, expr, value):
+        assert agg(f"SELECT {expr} FROM ba") == [(value,)]
+
+    def test_a_null_row_is_skipped_not_treated_as_false(self, agg):
+        """Row 2 has `n IS NULL`, so `n > 0` is NULL there. PostgreSQL skips it
+        and answers true; a plain `$gt` would answer false and flip the result."""
+        assert agg("SELECT bool_and(n > 0) FROM ba") == [(True,)]
+
+    def test_bool_and_over_no_rows_is_null(self, agg):
+        assert agg("SELECT bool_and(b) FROM ba WHERE false") == [(None,)]
+
+    def test_sum_of_a_case_expression(self, agg):
+        assert agg("SELECT sum(CASE WHEN n > 3 THEN 1 ELSE 0 END) FROM ba") == [(1,)]
+
+    def test_unsupported_argument_names_the_aggregate_not_array_agg(self, agg):
+        """The message said "unsupported array_agg argument" for a `min()`
+        call, sending the reader to the wrong function."""
+        from secantus.sql.errors import SQLError
+
+        with pytest.raises(SQLError) as ei:
+            agg("SELECT min(abs(n)) FROM ba")
+        assert "array_agg" not in str(ei.value)
+        assert "unsupported aggregate argument" in str(ei.value)
