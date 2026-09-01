@@ -2149,15 +2149,16 @@ def test_unpack_entry_reports_a_pre_recordid_entry_as_none() -> None:
 
 
 def test_created_index_records_the_entry_format(storage: Storage) -> None:
-    """Every index we create is stamped ``entryFormat: 2`` in the catalog — the
-    only on-disk signal of the entry layout (the WT key_format is ``SSSu`` either
-    way) — and that internal marker never reaches a client."""
-    from secantus.storage import _ENTRY_FORMAT_RECORDID
+    """Every index we create is stamped with the current ``entryFormat`` in the
+    catalog — the only on-disk signal of the entry layout (the WT key_format is
+    ``SSSu`` for every version) — and that internal marker never reaches a
+    client."""
+    from secantus.storage import _ENTRY_FORMAT
 
     storage.insert("db", "c", [{"x": 1}])
     storage.create_index("db", "c", "x_1", {"x": 1}, {})
     for _name, _key_spec, opts in storage._iter_indexes("db", "c"):
-        assert opts.get("entryFormat") == _ENTRY_FORMAT_RECORDID
+        assert opts.get("entryFormat") == _ENTRY_FORMAT
     # list_indexes is the storage-level view; the wire-level strip is in
     # commands._list_indexes (tested there).
     assert all(
@@ -2192,6 +2193,41 @@ def test_open_refuses_pre_recordid_index_entries(tmp_path) -> None:
     with pytest.raises(IncompatibleStorageFormatError) as exc:
         Storage(str(tmp_path), ttl_sweep_seconds=0)
     assert "x_1" in str(exc.value) and "entryFormat" in str(exc.value)
+
+
+def test_open_refuses_pre_javascript_rank_index_entries(tmp_path) -> None:
+    """A store at entryFormat 2 has index keys built when ``sortkey`` ranked
+    JavaScript as a string and MaxKey as 13.
+
+    Both of those rank bytes changed, so such entries sort in the OLD order
+    while ``ordering._bson_type_rank`` — which moved with the encoder — sorts in
+    the new one. Reading them back would mean an index that disagrees with a
+    collection scan, so the open must refuse instead. Unlike the version-1 case
+    above, the marker is PRESENT and merely too low, which is the branch this
+    covers.
+    """
+    import bson
+
+    from secantus.storage import _ENTRY_FORMAT, _IDX_TABLE, IncompatibleStorageFormatError
+
+    s = Storage(str(tmp_path), ttl_sweep_seconds=0)
+    try:
+        s.insert("db", "c", [{"x": 1}])
+        s.create_index("db", "c", "x_1", {"x": 1}, {})
+        with s._lock:
+            c = s._cursor(_IDX_TABLE)
+            c.set_key("db", "c", "x_1")
+            assert c.search() == 0
+            payload = bson.decode(bytes(c.get_value()))
+            payload["options"]["entryFormat"] = _ENTRY_FORMAT - 1
+            c.reset()
+            c["db", "c", "x_1"] = bson.encode(payload)
+    finally:
+        s.close()
+
+    with pytest.raises(IncompatibleStorageFormatError) as exc:
+        Storage(str(tmp_path), ttl_sweep_seconds=0)
+    assert "x_1" in str(exc.value) and str(_ENTRY_FORMAT) in str(exc.value)
 
 
 def test_rename_keeps_secondary_index_reachable(storage: Storage) -> None:
