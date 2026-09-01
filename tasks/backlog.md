@@ -4132,6 +4132,21 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ## 7. Python → Rust rewrite (in progress)
 
+- [ ] **Aggregation stage-spec messages: 22 shapes left (2026-09-01).**
+  `tools/probes/aggregation_stage_specs.py` is the standing cover; it started at
+  167 of 725 divergent and is now 22. Everything remaining is a message or a
+  validation-ORDER difference, not a wrong answer:
+
+  mongod checks an unknown / specific missing field BEFORE the generic
+  "requires X and Y", so `{$bucket: {a: 1}}` names `a` where we say
+  "requires 'groupBy' and 'boundaries'". The same shape applies to `$group`,
+  `$replaceRoot`, `$sample`, `$sortByCount`, `$bucketAuto`, `$densify`, `$fill`,
+  `$graphLookup`, `$lookup`, `$geoNear` and `$unionWith`.
+
+  Also: `{$documents: {}}` against a collection answers 51270 on mongod rather
+  than the namespace 73 every other argument gets — a document spec is parsed
+  down a different path there, and it was not worth guessing at.
+
 ### 7.0 Cache-pressure rollback — CI exercises it now
 
 `WT_ROLLBACK` is two conditions wearing one code: a write-write conflict
