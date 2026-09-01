@@ -482,15 +482,14 @@ fn op_regex(values: &[Option<&Bson>], pattern: &Bson, options: Option<&Bson>) ->
         Bson::RegularExpression(r) => want.as_ref().is_some_and(|w| regexutil::regex_eq(r, w)),
         _ => false,
     };
-    for v in values {
-        match v {
-            Some(e) if hit(e) => return Ok(true),
-            Some(Bson::Array(arr)) => {
-                if arr.iter().any(&hit) {
-                    return Ok(true);
-                }
+    for v in values.iter().flatten() {
+        if hit(v) {
+            return Ok(true);
+        }
+        if let Bson::Array(arr) = v {
+            if arr.iter().any(&hit) {
+                return Ok(true);
             }
-            _ => {}
         }
     }
     Ok(false)
