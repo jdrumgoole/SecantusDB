@@ -4911,6 +4911,9 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   collation path and the exotic-type path do not compose. Measured 2026-09-01;
   the uncollated form is correct on both servers since the type-bracketing fix.
   Narrow, and no dependency needed — just the two paths joined up.
+  `tools/probes/range_type_brackets.py` is the standing cover: it is 0/112 on
+  the Python server and 32/112 on the Rust one, and every one of those 32 is a
+  collated shape.
 
   (The regex expression operators — `$regexMatch` / `$regexFind` /
   `$regexFindAll` — were on the deferred list too. They **work**: 7 of 7 probed
