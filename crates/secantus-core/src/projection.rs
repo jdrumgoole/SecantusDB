@@ -9,8 +9,7 @@ use bson::{Bson, Document, RawDocument};
 
 use crate::{paths, query};
 
-#[derive(Debug)]
-pub struct Fallback;
+pub use crate::fallback::Fallback;
 
 type R<T> = Result<T, Fallback>;
 
@@ -139,7 +138,7 @@ fn spec_truthy(v: &Bson) -> R<bool> {
         Bson::Int64(n) => Ok(*n != 0),
         Bson::Boolean(b) => Ok(*b),
         Bson::Double(d) => Ok(*d != 0.0),
-        _ => Err(Fallback),
+        _ => Err(Fallback::Defer),
     }
 }
 
@@ -183,7 +182,7 @@ fn apply_slice(value: Bson, slice_arg: &Bson) -> R<Bson> {
     // Validate the argument shape up front (mongod parse-time) so an invalid
     // $slice on a non-array field also defers to Python.
     let Some((first, limit)) = slice_bounds(slice_arg) else {
-        return Err(Fallback);
+        return Err(Fallback::Defer);
     };
     let Bson::Array(a) = &value else {
         return Ok(value); // non-array passes through unchanged
@@ -249,7 +248,7 @@ fn positional_predicate(
 }
 
 /// Validate a positional projection up-front (mongod validates at parse time, so
-/// an invalid `arr.$` errors even when nothing matches). `Err(Fallback)` for the
+/// an invalid `arr.$` errors even when nothing matches). `Err(Fallback::Defer)` for the
 /// error cases (>1 positional / exclusion / array field not in the query) — the
 /// find handler surfaces it as `BadValue`, and the pure-Python oracle raises the
 /// exact Location code (31276 / 31395 / 51246).
@@ -259,15 +258,15 @@ pub fn validate_projection(spec: &Document, query: Option<&Document>) -> R<()> {
         return Ok(());
     }
     if positional.len() > 1 {
-        return Err(Fallback);
+        return Err(Fallback::Defer);
     }
     let key = positional[0];
     if !spec_truthy(&spec[key])? {
-        return Err(Fallback);
+        return Err(Fallback::Defer);
     }
     let array_path = &key[..key.len() - 2];
     if positional_predicate(query, array_path).is_none() {
-        return Err(Fallback);
+        return Err(Fallback::Defer);
     }
     Ok(())
 }
@@ -286,7 +285,7 @@ fn positional_first(
         if !doc_pred.is_empty() {
             match elem {
                 Bson::Document(ed) => {
-                    if !query::matches(ed, doc_pred, &empty, None).map_err(|_| Fallback)? {
+                    if !query::matches(ed, doc_pred, &empty, None)? {
                         continue;
                     }
                 }
@@ -298,7 +297,7 @@ fn positional_first(
             wrapper.insert("_".to_string(), elem.clone());
             let mut q = Document::new();
             q.insert("_".to_string(), vp.clone());
-            if !query::matches(&wrapper, &q, &empty, None).map_err(|_| Fallback)? {
+            if !query::matches(&wrapper, &q, &empty, None)? {
                 continue;
             }
         }
@@ -336,7 +335,7 @@ fn apply_positional(
     // Positional forces inclusion; a companion exclusion is the mix mongod rejects.
     for (_, v) in &non_id {
         if elem_match_spec(v).is_none() && !spec_truthy(v)? {
-            return Err(Fallback); // Location31254 -> Python
+            return Err(Fallback::Defer); // Location31254 -> Python
         }
     }
     let plain: Vec<&str> = non_id
@@ -352,7 +351,7 @@ fn apply_positional(
     for (path, value) in &non_id {
         if let Some(sub) = elem_match_spec(value) {
             let Bson::Document(subf) = sub else {
-                return Err(Fallback);
+                return Err(Fallback::Defer);
             };
             if let Some(first) = first_match(doc, path, subf)? {
                 set(&mut result, path, Bson::Array(vec![first]))?;
@@ -389,16 +388,14 @@ fn first_match(doc: &Document, path: &str, sub_filter: &Document) -> R<Option<Bs
     let empty = Document::new();
     for elem in arr {
         let hit = match elem {
-            Bson::Document(ed) => {
-                query::matches(ed, sub_filter, &empty, None).map_err(|_| Fallback)?
-            }
+            Bson::Document(ed) => query::matches(ed, sub_filter, &empty, None)?,
             scalar => {
                 // matches({"_": elem}, {"_": sub_filter})
                 let mut wrapper = Document::new();
                 wrapper.insert("_".to_string(), scalar.clone());
                 let mut q = Document::new();
                 q.insert("_".to_string(), Bson::Document(sub_filter.clone()));
-                query::matches(&wrapper, &q, &empty, None).map_err(|_| Fallback)?
+                query::matches(&wrapper, &q, &empty, None)?
             }
         };
         if hit {
@@ -409,10 +406,10 @@ fn first_match(doc: &Document, path: &str, sub_filter: &Document) -> R<Option<Bs
 }
 
 fn set(doc: &mut Document, path: &str, value: Bson) -> R<()> {
-    paths::set_path(doc, path, value).map_err(|_| Fallback)
+    paths::set_path(doc, path, value).map_err(|_| Fallback::Defer)
 }
 
-/// Apply a projection spec to a document. `Err(Fallback)` => defer to the
+/// Apply a projection spec to a document. `Err(Fallback::Defer)` => defer to the
 /// pure-Python `apply_projection` (which also raises the mixed-mode error).
 pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document>) -> R<Document> {
     if spec.is_empty() {
@@ -465,15 +462,15 @@ pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document
         // isn't in the query all error in mongod — defer to Python for the exact
         // Location code (31276 / 31395 / 51246).
         if positional.len() > 1 {
-            return Err(Fallback);
+            return Err(Fallback::Defer);
         }
         let (pos_key, pos_val) = positional[0];
         if !spec_truthy(pos_val)? {
-            return Err(Fallback);
+            return Err(Fallback::Defer);
         }
         let array_path = &pos_key[..pos_key.len() - 2]; // strip ".$"
         let Some((doc_pred, value_pred)) = positional_predicate(query, array_path) else {
-            return Err(Fallback); // no query clause on the array -> 51246
+            return Err(Fallback::Defer); // no query clause on the array -> 51246
         };
         return apply_positional(
             doc,
@@ -536,7 +533,7 @@ pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document
     } else if !truthy.iter().any(|&t| t) {
         false
     } else {
-        return Err(Fallback); // mixed inclusion/exclusion -> Python raises
+        return Err(Fallback::Defer); // mixed inclusion/exclusion -> Python raises
     };
 
     if inclusion {
@@ -567,7 +564,7 @@ pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document
         for (path, value) in &non_id {
             if let Some(sub) = elem_match_spec(value) {
                 let Bson::Document(subf) = sub else {
-                    return Err(Fallback);
+                    return Err(Fallback::Defer);
                 };
                 if let Some(first) = first_match(doc, path, subf)? {
                     set(&mut result, path, Bson::Array(vec![first]))?;

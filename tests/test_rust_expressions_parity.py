@@ -54,9 +54,42 @@ def _load_pure_expr():
 _pure = _load_pure_expr()
 
 
+class RustMongoError(Exception):
+    """The Rust engine named a real mongod error rather than deferring.
+
+    A defer on the Python server is harmless -- the pure engine runs -- but the
+    standalone Rust server has no Python behind it, so a deferred *argument*
+    error reaches the client as "not supported by the Rust server". The engine
+    can now carry the code and message instead, and this is how the parity suite
+    sees it: whenever Rust names an error, the pure engine must raise the same
+    one, verbatim. Comparing "both deferred" would have been vacuously green on
+    exactly the inputs the Rust server has to get right alone.
+    """
+
+    def __init__(self, code, errmsg):
+        super().__init__(f"[{code}] {errmsg}")
+        self.code = code
+        self.errmsg = errmsg
+
+
 def _rust_eval(expr, doc, vars=None):
     res = _rust.evaluate(bson.encode(doc), bson.encode({"e": expr}), bson.encode(vars or {}))
-    return None if res is None else bson.decode(res)["r"]
+    if res is None:
+        return None
+    out = bson.decode(res)
+    if "err" in out:
+        raise RustMongoError(out["err"]["code"], out["err"]["errmsg"])
+    return out["r"]
+
+
+def assert_named_error_matches_pure(exc, expr, doc=None, vars=None):
+    """The pure engine must raise exactly the error the Rust engine named."""
+    with pytest.raises(_pure.ExpressionError) as caught:
+        _pure.evaluate(expr, doc if doc is not None else {}, vars)
+    assert (caught.value.code, str(caught.value)) == (exc.code, exc.errmsg), (
+        f"named-error drift on {expr}: rust=({exc.code}, {exc.errmsg!r}) "
+        f"pure=({caught.value.code}, {str(caught.value)!r})"
+    )
 
 
 def _bson_norm(v):
@@ -993,7 +1026,11 @@ CURATED = [
 @pytest.mark.parametrize("expr,doc", CURATED)
 def test_curated_parity(expr, doc):
     doc = bson.decode(bson.encode(doc))
-    rust = _rust_eval(expr, doc)
+    try:
+        rust = _rust_eval(expr, doc)
+    except RustMongoError as exc:
+        assert_named_error_matches_pure(exc, expr, doc)
+        return
     if rust is None:
         return
     py = _bson_norm(_pure.evaluate(expr, doc))
@@ -1080,7 +1117,7 @@ def test_index_math_fuzz():
     """Stress $slice / $substrCP / $indexOfArray index arithmetic (the riskiest
     part — negative indices, out-of-range, clamping) against pure Python."""
     rng = random.Random(0x51CE)
-    handled = 0
+    handled = named = 0
     for _ in range(6000):
         arr = [rng.randint(0, 4) for _ in range(rng.randint(0, 6))]
         s = "".join(rng.choice("abcde") for _ in range(rng.randint(0, 6)))
@@ -1096,13 +1133,21 @@ def test_index_math_fuzz():
             ]
         )
         expr = bson.decode(bson.encode({"e": expr}))["e"]
-        rust = _rust_eval(expr, {})
+        try:
+            rust = _rust_eval(expr, {})
+        except RustMongoError as exc:
+            # A negative / non-integral index is an ERROR in mongod, not a
+            # clamp; both engines used to answer a value for it.
+            assert_named_error_matches_pure(exc, expr)
+            named += 1
+            continue
         if rust is None:
             continue
         handled += 1
         py = _pure.evaluate(expr, {})
         assert rust == py, f"divergence: rust={rust!r} pure={py!r} expr={expr}"
     assert handled > 2000, f"expected many handled cases, only {handled}"
+    assert named > 100, f"expected many named errors, only {named}"
 
 
 def test_date_extractor_fuzz():
@@ -1261,7 +1306,11 @@ def test_string_index_fuzz():
             ]
         )
         expr = bson.decode(bson.encode({"e": expr}))["e"]
-        rust = _rust_eval(expr, {})
+        try:
+            rust = _rust_eval(expr, {})
+        except RustMongoError as exc:
+            assert_named_error_matches_pure(exc, expr)
+            continue
         if rust is None:
             continue
         try:

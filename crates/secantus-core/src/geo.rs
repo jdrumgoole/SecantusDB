@@ -248,8 +248,8 @@ fn within(doc: &Geometry<f64>, q: &QGeom) -> bool {
 /// `$geoWithin` field operator. `Fallback` for malformed / `$center` /
 /// non-document args (Python raises the proper `QueryError`).
 pub fn op_geo_within(values: &[Option<&Bson>], arg: &Bson) -> R {
-    let arg = arg.as_document().ok_or(Fallback)?;
-    let q = parse_query_geometry(arg).ok_or(Fallback)?;
+    let arg = arg.as_document().ok_or(Fallback::Defer)?;
+    let q = parse_query_geometry(arg).ok_or(Fallback::Defer)?;
     for v in values.iter().flatten() {
         if let Some(g) = parse_doc_geometry(v) {
             if within(&g, &q) {
@@ -263,13 +263,13 @@ pub fn op_geo_within(values: &[Option<&Bson>], arg: &Bson) -> R {
 /// `$geoIntersects` field operator — `$geometry` (planar) only, mirroring
 /// mongod / `geo.py`. `Fallback` otherwise.
 pub fn op_geo_intersects(values: &[Option<&Bson>], arg: &Bson) -> R {
-    let arg = arg.as_document().ok_or(Fallback)?;
+    let arg = arg.as_document().ok_or(Fallback::Defer)?;
     if !arg.contains_key("$geometry") {
-        return Err(Fallback);
+        return Err(Fallback::Defer);
     }
-    let q = match parse_query_geometry(arg).ok_or(Fallback)? {
+    let q = match parse_query_geometry(arg).ok_or(Fallback::Defer)? {
         QGeom::Planar(g) => g,
-        QGeom::Sphere { .. } | QGeom::Disk { .. } => return Err(Fallback),
+        QGeom::Sphere { .. } | QGeom::Disk { .. } => return Err(Fallback::Defer),
     };
     for v in values.iter().flatten() {
         if let Some(g) = parse_doc_geometry(v) {
@@ -315,20 +315,20 @@ fn parse_near_spec(
             None => Ok(None),
             // Null / non-number / negative are all errors mongod names
             // precisely; defer so the Python engine raises the exact message.
-            Some(Bson::Null) => Err(Fallback),
+            Some(Bson::Null) => Err(Fallback::Defer),
             Some(v) => match num(v) {
                 Some(n) if n >= 0.0 => Ok(Some(n)),
-                _ => Err(Fallback),
+                _ => Err(Fallback::Defer),
             },
         }
     };
     match arg {
         Bson::Document(d) => {
-            let geom = d.get_document("$geometry").map_err(|_| Fallback)?;
+            let geom = d.get_document("$geometry").map_err(|_| Fallback::Defer)?;
             if geom.get_str("type") != Ok("Point") {
-                return Err(Fallback);
+                return Err(Fallback::Defer);
             }
-            let c = pair(geom.get("coordinates").ok_or(Fallback)?).ok_or(Fallback)?;
+            let c = pair(geom.get("coordinates").ok_or(Fallback::Defer)?).ok_or(Fallback::Defer)?;
             Ok((
                 (c.x, c.y),
                 opt_number(d.get("$maxDistance"))?,
@@ -338,10 +338,10 @@ fn parse_near_spec(
             ))
         }
         Bson::Array(a) if a.len() == 2 || a.len() == 3 => {
-            let cx = num(&a[0]).ok_or(Fallback)?;
-            let cy = num(&a[1]).ok_or(Fallback)?;
+            let cx = num(&a[0]).ok_or(Fallback::Defer)?;
+            let cy = num(&a[1]).ok_or(Fallback::Defer)?;
             let mut max_d = if a.len() == 3 {
-                Some(num(&a[2]).ok_or(Fallback)?)
+                Some(num(&a[2]).ok_or(Fallback::Defer)?)
             } else {
                 None
             };
@@ -355,7 +355,7 @@ fn parse_near_spec(
             let min_d = opt_number(sibling_min)?;
             Ok(((cx, cy), max_d, min_d, default_spherical, true))
         }
-        _ => Err(Fallback),
+        _ => Err(Fallback::Defer),
     }
 }
 

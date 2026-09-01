@@ -886,7 +886,27 @@ fn core_run(
     // shapes that can actually fail this way.
     let nameable = secantus_core::aggregate::may_name_runtime_error(stages);
     let saved = nameable.then(|| docs.clone());
-    secantus_core::aggregate::apply_pipeline(docs, stages, vars, collation).map_err(|_| {
+    secantus_core::aggregate::apply_pipeline(docs, stages, vars, collation).map_err(|fault| {
+        // The engine can now name the error itself, which is the common case for
+        // a bad ARGUMENT (`{$round: ["$n", 1.5]}`, `{$range: [0, 5, 0]}`,
+        // `{$ln: 0}`, ...). Those used to land in the generic "not supported"
+        // reply below, which told the client the server could not do `$round`
+        // when in fact `$round` is fine and 1.5 is not a precision.
+        if let Some((code, errmsg)) = fault.as_mongo() {
+            // Which prefix mongod uses is decided by WHEN it failed, and the
+            // test for that is exact: mongod constant-folds at optimization
+            // time, before any document exists, so an expression that still
+            // fails against NO documents is the folded one. Probed 8.2.11
+            // (2026-09-01) over ten shapes -- error-on-empty matched "Failed to
+            // optimize pipeline" and no-error-on-empty matched "Executor error"
+            // in every one.
+            let folded = matches!(
+                secantus_core::aggregate::apply_pipeline(Vec::new(), stages, vars, collation),
+                Err(ref f) if f.as_mongo().is_some()
+            );
+            let errmsg = wrap_pipeline_error(errmsg.to_string(), folded, ns);
+            return CommandError::new(code, crate::util::error_code_name(code), errmsg);
+        }
         if let Some(docs) = saved {
             if let Some((code, errmsg, folded)) =
                 secantus_core::aggregate::runtime_error(&docs, stages, vars, collation)
@@ -895,17 +915,7 @@ fn core_run(
                 // constant expression is folded at optimization time and says
                 // so; a document-dependent one fails per document under the
                 // executor prefix. This server had no wrapper at all.
-                let errmsg = if folded {
-                    format!("Failed to optimize pipeline :: caused by :: {errmsg}")
-                } else {
-                    match ns {
-                        Some(ns) => format!(
-                            "Executor error during aggregate command on namespace: \
-                             {ns} :: caused by :: {errmsg}"
-                        ),
-                        None => errmsg,
-                    }
-                };
+                let errmsg = wrap_pipeline_error(errmsg, folded, ns);
                 return CommandError::new(code, crate::util::error_code_name(code), errmsg);
             }
         }
@@ -915,6 +925,22 @@ fn core_run(
             "aggregation pipeline uses a stage or operator not supported by the Rust server",
         )
     })
+}
+
+/// mongod's two wrappers for an error raised inside a pipeline: a
+/// constant-folded expression fails at optimization time and says so, while a
+/// document-dependent one fails per document under the executor prefix.
+fn wrap_pipeline_error(errmsg: String, folded: bool, ns: Option<&str>) -> String {
+    if folded {
+        return format!("Failed to optimize pipeline :: caused by :: {errmsg}");
+    }
+    match ns {
+        Some(ns) => format!(
+            "Executor error during aggregate command on namespace: \
+             {ns} :: caused by :: {errmsg}"
+        ),
+        None => errmsg,
+    }
 }
 
 fn bad_value(msg: impl Into<String>) -> CommandError {
