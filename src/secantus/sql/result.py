@@ -50,3 +50,10 @@ class SQLResult:
     # NOTICE/WARNING messages to send ahead of the result (``DO $$ … RAISE
     # NOTICE …$$``): ``(severity, message)`` pairs.
     notices: list[tuple[str, str]] = field(default_factory=list)
+    # ``CREATE TABLE AS`` / ``SELECT INTO`` / ``CREATE MATERIALIZED VIEW`` carry
+    # a ``SELECT n`` command tag — PG counts the rows it wrote — but send NO
+    # RowDescription, because the rows went into a table rather than to the
+    # client. The wire layer keys RowDescription off the ``SELECT`` tag, so
+    # without this flag it emitted an EMPTY RowDescription and clients then read
+    # `rowcount` as 0 instead of the number of rows written.
+    suppress_row_description: bool = False

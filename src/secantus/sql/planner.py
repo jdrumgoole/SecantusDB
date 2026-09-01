@@ -116,6 +116,10 @@ class AlterTablePlan:
     name: str
     if_exists: bool
     actions: list[Any]  # the raw sqlglot action nodes, applied by the executor
+    #: The relation as the user spelled it, for a "does not exist" message.
+    #: `name` is the resolved catalog key and would name a schema the user
+    #: never wrote (see `written_table_name`).
+    written: str | None = None
 
 
 @dataclass
@@ -2129,9 +2133,17 @@ def plan_alter_table(stmt: exp.Alter) -> AlterTablePlan:
     if kind != "TABLE":
         raise errors.feature_not_supported(f"ALTER {kind} is not supported")
     return AlterTablePlan(
-        name=stmt.this.name,
+        # The catalog key, NOT the bare name: `qualify_from_search_path` has
+        # already resolved the reference, and taking `.name` here threw that
+        # qualifier away -- so EVERY `ALTER TABLE` form (ADD/DROP/RENAME
+        # COLUMN, RENAME TO, ALTER COLUMN, ADD CONSTRAINT/PRIMARY KEY) answered
+        # 42P01 for any table outside `public`, whether reached through
+        # `search_path` or written out as `schema.table`. Probed against
+        # PostgreSQL 14.13: all seven shapes succeed there.
+        name=qualified_table_name(stmt.this),
         if_exists=bool(stmt.args.get("exists")),
         actions=list(stmt.args.get("actions") or []),
+        written=written_table_name(stmt.this),
     )
 
 
@@ -5136,6 +5148,29 @@ def qualified_table_name(table_node: exp.Table) -> str:
     return f"{sname}.{table_node.name}"
 
 
+def written_table_name(table_node: exp.Table) -> str:
+    """The relation name AS THE USER WROTE IT, for an error message.
+
+    PG names the relation the statement actually contained: a bare `t` stays
+    `t` even when resolution qualified it, and an explicit `public.t` keeps
+    its prefix (`relation "public.t" does not exist`, probed on 14.13).
+    `qualified_table_name` cannot answer this — it returns the CATALOG KEY,
+    which drops `public.` and carries whatever schema the search_path walk
+    chose. Reporting that key told the user a relation they never named did
+    not exist (`sa.onlypub` for a written `onlypub`).
+
+    `qualify_from_search_path` stamps the original spelling on the node before
+    it rewrites it; absent the stamp (a node that never went through the
+    resolver) the current args are the original.
+    """
+    written = getattr(table_node, "_written_name", None)
+    if written is not None:
+        return written
+    schema = table_node.args.get("db")
+    sname = schema.name if schema is not None else None
+    return f"{sname}.{table_node.name}" if sname else table_node.name
+
+
 def _join_source_alias(node: exp.Expression | None) -> str | None:
     """The name a join source is referenced by: its alias if it has one, else
     the table name. Returns None for a source we cannot name (and therefore
@@ -5196,15 +5231,43 @@ def _create_target(stmt: exp.Expression) -> exp.Table | None:
     must leave alone: Postgres creates into the path's first schema and never
     binds a create target to an existing relation elsewhere on the path. The
     body of a CREATE TABLE AS / CREATE VIEW still resolves normally, as does a
-    CREATE INDEX's target table (that one names an existing relation)."""
+    CREATE INDEX's target table (that one names an existing relation).
+
+    ``SEQUENCE`` belongs here for the same reason TABLE does. Without it a bare
+    ``CREATE SEQUENCE s`` fell through the resolve loop -- which only looks up
+    *tables*, so it never matched a sequence -- and was left unqualified, i.e.
+    created in ``public`` no matter what ``search_path`` said. PG creates it in
+    the path's first schema, so a later ``CREATE SEQUENCE schema.s`` saw a free
+    name and silently created a SECOND sequence where PG raises 42P07."""
+    # `SELECT … INTO t` is `CREATE TABLE t AS SELECT …` in PG's older spelling,
+    # so its INTO target is a definition too — it must not bind to an existing
+    # relation elsewhere on the path.
+    if isinstance(stmt, exp.Select):
+        into = stmt.args.get("into")
+        target = into.this if into is not None else None
+        return target if isinstance(target, exp.Table) else None
     if not isinstance(stmt, exp.Create):
         return None
-    if (stmt.args.get("kind") or "TABLE").upper() not in ("TABLE", "VIEW"):
+    if (stmt.args.get("kind") or "TABLE").upper() not in ("TABLE", "VIEW", "SEQUENCE"):
         return None
     target = stmt.this
     if isinstance(target, exp.Schema):
         target = target.this
     return target if isinstance(target, exp.Table) else None
+
+
+def _relation_on_path(catalog: Any, db: str, key: str) -> bool:
+    """Does ``key`` name a relation ``search_path`` resolution should stop on?
+
+    Tables (which is what a matview also registers as) and SEQUENCES both
+    count: PG puts every relation kind in one namespace, so a bare reference to
+    a sequence resolves through the path exactly like a table. Consulting only
+    `catalog.get` left `SELECT … FROM <a sequence in a path schema>` unresolved
+    and therefore 42P01.
+    """
+    if catalog.get(db, key) is not None:
+        return True
+    return bool(catalog.sequence_exists(db, key))
 
 
 def qualify_from_search_path(stmt: exp.Expression, catalog: Any, db: str, session: Any) -> None:
@@ -5241,11 +5304,25 @@ def qualify_from_search_path(stmt: exp.Expression, catalog: Any, db: str, sessio
     temp_ns = getattr(session, "temp_schema", None)
     cte_names = {cte.alias_or_name.lower() for cte in stmt.find_all(exp.CTE) if cte.alias_or_name}
     skip = _create_target(stmt)
+    # An `ALTER TABLE … RENAME TO x` target is a name being DEFINED, not a
+    # reference to resolve. Qualifying it made the resolver's own prefix
+    # indistinguishable from one the user wrote, so `RENAME TO t` (where `t`
+    # exists) came back as a 42601 syntax error instead of 42P07.
+    defining = {
+        id(a.this)
+        for a in (stmt.args.get("actions") or [])
+        if isinstance(a, exp.AlterRename) and isinstance(a.this, exp.Table)
+    }
     temp_first = temp_ns is not None and "pg_temp" not in path
     for table in stmt.find_all(exp.Table):
         if not table.name:
             continue
+        # Record the spelling before any rewrite — `written_table_name` reads
+        # it back so a "does not exist" error names what the user typed.
         schema_arg = table.args.get("db")
+        table._written_name = (
+            f"{schema_arg.name}.{table.name}" if schema_arg is not None else table.name
+        )
         if schema_arg is not None:
             # ``pg_temp.<name>`` means *this session's* temp namespace. A create
             # target resolves here too — CREATE TABLE pg_temp.t IS a temp table
@@ -5254,6 +5331,8 @@ def qualify_from_search_path(stmt: exp.Expression, catalog: Any, db: str, sessio
                 table.set("db", exp.to_identifier(session.ensure_temp_schema()))
             continue
         if table.name.lower() in cte_names:
+            continue
+        if id(table) in defining:
             continue
         if table is skip:
             # A CREATE target does not RESOLVE onto an existing relation, but it
@@ -5274,10 +5353,10 @@ def qualify_from_search_path(stmt: exp.Expression, catalog: Any, db: str, sessio
             # `public` keys as the bare name (see `qualified_table_name`), so it
             # is looked up — and left — unqualified.
             if resolved == "public":
-                if catalog.get(db, table.name) is not None:
+                if _relation_on_path(catalog, db, table.name):
                     break
                 continue
-            if catalog.get(db, f"{resolved}.{table.name}") is not None:
+            if _relation_on_path(catalog, db, f"{resolved}.{table.name}"):
                 table.set("db", exp.to_identifier(resolved))
                 break
         else:

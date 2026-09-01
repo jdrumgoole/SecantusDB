@@ -987,7 +987,14 @@ Specific items that were left out of the slice that introduced their feature are
   divergent ones named `test_known_divergence_*` so they cannot be misread as
   conformance, plus an oracle test for the two that match.
 
-- [ ] **OPEN — `CREATE INDEX` is not undone by `ROLLBACK TO SAVEPOINT`.** Found
+- [x] **RESOLVED (verified 2026-09-01) — `CREATE INDEX` IS undone by `ROLLBACK
+      TO SAVEPOINT`.** Fixed by the `sql-index-savepoint` slice; only the
+      checkbox here was stale. Re-probed against PostgreSQL 14.13 over the wire
+      on both halves — `CREATE INDEX` after a savepoint is gone after
+      `ROLLBACK TO SAVEPOINT`, and a `DROP INDEX` after one comes back — and
+      both servers now answer identically. Original entry:
+
+- ~~**OPEN — `CREATE INDEX` is not undone by `ROLLBACK TO SAVEPOINT`.**~~ Found
   2026-08-29 while checking whether DDL is transactional at all. Measured
   against PostgreSQL 14:
 
@@ -1011,8 +1018,19 @@ Specific items that were left out of the slice that introduced their feature are
   back. The doc understated the engine everywhere except the one place it was
   right.
 
-- [ ] **OPEN — an unresolvable bare relation is named with the schema we tried,
-  not the name the user wrote.** Fallout from the search_path work above, and
+- [x] **RESOLVED (2026-09-01) — an unresolvable relation is named as the user
+  wrote it.** `planner.written_table_name` stamps the spelling on the table
+  node before `qualify_from_search_path` rewrites it, and the SELECT / INSERT /
+  UPDATE / DELETE / ALTER error sites report that instead of the resolved
+  catalog key. `SET search_path TO sa` then `SELECT * FROM onlypub` now says
+  `relation "onlypub" does not exist`, and an explicit `public.` qualifier is
+  kept (`relation "public.nope" does not exist`) where composing the catalog
+  key had dropped it. Pinned by `tests/test_sql_ddl_name_resolution.py`
+  (`TestErrorNaming`) including an exact-message oracle test against
+  PostgreSQL 14.13. Original entry:
+
+- ~~**OPEN — an unresolvable bare relation is named with the schema we tried,
+  not the name the user wrote.**~~ Fallout from the search_path work above, and
   the only part of it that still diverges. PG says `relation "onlypub" does not
   exist` / `relation "t" already exists`; we say `"sa.onlypub"` / `"s1.t"`. The
   CODE is right in both (42P01 / 42P07) and the behaviour is right — this is
@@ -1020,6 +1038,116 @@ Specific items that were left out of the slice that introduced their feature are
   the lookup fails, and `errors.undefined_table` is handed the composed key by
   five call sites in `executor.py` / `engine.py`. Fixing it means carrying the
   as-written name to the error, not the resolved one.
+
+- [x] **RESOLVED (2026-09-01) — `ALTER TABLE` ignored the schema entirely, plus
+  four more DDL naming defects.** Found by running each shape against the live
+  PostgreSQL 14.13 rather than reading code; none of them was on this list.
+
+      ALTER TABLE <bare or qualified> ...   us 42P01   pg OK     <- every form
+      DROP SCHEMA s CASCADE                 views/matviews/sequences SURVIVE
+      CREATE SEQUENCE <bare>                created in public, not path[0]
+      DROP TABLE <a view>                   us 42P01   pg 42809
+      DROP TABLE <missing>                  us "relation"  pg "table"
+
+  `plan_alter_table` read `stmt.this.name` — the BARE name — discarding the
+  qualifier `qualify_from_search_path` had just resolved, so **every** ALTER
+  form (ADD/DROP/RENAME COLUMN, RENAME TO, ALTER COLUMN, ADD CONSTRAINT, ADD
+  PRIMARY KEY) answered 42P01 for any table outside `public`, whether reached
+  through `search_path` or written out as `schema.table`. `TRUNCATE`,
+  `CREATE INDEX`, `DROP TABLE` and `COMMENT ON` all resolved correctly, which
+  is what hid it. Latent behind it: the rename target was read bare too, so a
+  successful `ALTER TABLE s.a RENAME TO b` would have written the table back as
+  `public.b`, moving it out of its schema.
+
+  The other four: `DROP SCHEMA … CASCADE` dropped tables and types but left
+  views, matviews and sequences behind (and a bare `DROP SCHEMA` did not count
+  them as dependants), so they outlived their schema and collided with a later
+  `CREATE`; a bare `CREATE SEQUENCE` ignored `search_path`, so a following
+  `CREATE SEQUENCE schema.s` saw a free name and silently made a SECOND
+  sequence; a `DROP` naming a relation of a different kind answered "does not
+  exist" instead of `42809 "x" is not a table`, which made
+  `DROP TABLE IF EXISTS <a view>` succeed while the view survived; and 42P07
+  named the schema-qualified catalog key where PG names the bare relation.
+
+  Pinned by `tests/test_sql_ddl_name_resolution.py`, whose last test diffs 17
+  shapes against PostgreSQL 14.13 on **both SQLSTATE and message text**.
+
+  **The lesson is the one this file keeps re-learning.** None of the five was
+  filed; the two entries that WERE filed nearby were one stale (the savepoint
+  item was already fixed) and one overstated (the naming item was mostly fixed,
+  and its live remainder was a different statement class than described). The
+  probe found five unfiled defects in the same half-hour.
+
+- [x] **RESOLVED (2026-09-01) — `SELECT … INTO t` was not dispatched at all.**
+  PG's older spelling of `CREATE TABLE t AS SELECT …`. The statement fell
+  through to the ordinary SELECT path, which resolved the INTO TARGET as if it
+  were a source relation, so every `SELECT INTO` — qualified or bare — failed
+  with `relation "t" does not exist`. It now routes to the existing
+  `_run_create_table_as`, and the target is treated as a DEFINITION by
+  `_create_target` so it is homed in the path's first schema and cannot bind to
+  an existing relation of the same name.
+
+- [x] **RESOLVED (2026-09-01) — row-writing DDL reported `rowcount` 0.**
+  `CREATE TABLE AS`, `SELECT INTO` and `CREATE MATERIALIZED VIEW` carry a
+  `SELECT n` command tag (PG counts the rows it WROTE), and the wire layer
+  decided whether to send a RowDescription from the tag alone — so all three
+  sent an EMPTY one. psycopg then read the reply as a zero-row RESULT SET,
+  reporting `cursor.rowcount` 0 instead of the rows written and `description`
+  `[]` instead of `None`. `SQLResult.suppress_row_description` marks the three;
+  pinned by `tests/test_pgserver_ddl_wire.py`, whose control case checks a real
+  SELECT (including a zero-row one) still describes its columns.
+
+- [x] **RESOLVED (2026-09-01) — materialized views are schema-aware.** Fixed in
+  the same batch that found it: `_create_matview` / `_drop_matview` and the
+  not-populated gate now key on `qualified_table_name`, the `CREATE … AS`
+  Command re-parse is put through `qualify_from_search_path` before it is
+  planned, and `REFRESH` / `ALTER MATERIALIZED VIEW` resolve their raw-text
+  name through `_matview_key` (explicit qualifier wins, else the `search_path`
+  walk). A rename keeps the matview in its own schema. Pinned by
+  `TestMatviewsAreSchemaAware` plus four oracle shapes. Original entry:
+
+- ~~**OPEN — materialized views are not schema-aware (found 2026-09-01).**~~
+  Every matview path takes the bare `stmt.this.name`, so a matview is created,
+  catalogued and stored under its unqualified name no matter what schema the
+  statement named or `search_path` said:
+
+      SET search_path TO mz, public; CREATE MATERIALIZED VIEW mv AS ...
+        pg  -> mz.mv          us -> public.mv
+      CREATE MATERIALIZED VIEW mz.mv AS ...
+        us  -> stored as `mv`, so a second CREATE in another schema collides
+
+  So `SELECT … FROM mz.mv` raises 42P01, and two schemas cannot hold
+  same-named matviews. Same root cause as the `ALTER TABLE` defect resolved
+  above (bare `.name` where the catalog key is wanted), but a wider fix:
+  `_create_matview`, `_drop_matview`, `_alter_matview_command`, the
+  not-populated gate in `_run_query` (which explicitly requires *no* `db`
+  qualifier), and `_refresh_matview` — which recovers the name from RAW TAIL
+  TEXT with `_MATVIEW_NAME_RE` and would need to parse a qualified name.
+  `DROP` / `REFRESH` of a bare matview in `public` works today, which is the
+  only shape the tests and gauges use.
+
+- [x] **RESOLVED (2026-09-01) — a sequence is selectable as a relation.**
+  `virtual.sequence_relation` exposes PG's `last_value / log_cnt /
+  is_called` one-row shape through the same `MemoryBackend` the catalog
+  tables use, so WHERE / projection / ORDER BY over it needed no new query
+  code, and `search_path` resolution now stops on a sequence as well as a
+  table (`_relation_on_path`) so a bare reference resolves.
+
+  **`last_value` had to come from the alloc cache, not the stored doc.**
+  The persisted value is the pre-allocated batch's HIGH-WATER MARK, so a
+  direct read reported 128 after two `nextval` where PG says 2;
+  `catalog.sequence_relation_state` reads the live position instead — the
+  same one `_invalidate_sequence_cache` writes back. `log_cnt` is the one
+  field not reproduced (a WAL pre-log counter with no counterpart here); it
+  reads 0 rather than an invented 32. Original entry:
+
+- ~~**OPEN — a sequence is not selectable as a relation (found 2026-09-01).**~~
+  PG lets `SELECT last_value FROM <sequence>` read the sequence's row;
+  `SELECT * FROM s` returns `last_value / log_cnt / is_called`. Sequences here
+  live in their own catalog collection and are not reachable from the FROM
+  clause at all, so the query is 42P01. Only reached by a client that
+  introspects a sequence directly — `nextval` / `currval` / `setval` and
+  `information_schema.sequences` all work.
 
 - [ ] **OPEN — `test_tls_against_rust_server` flakes on the Windows runner
   (first seen 2026-08-29, PR #1089).** `storage-engine (windows-latest)` failed

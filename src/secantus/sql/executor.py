@@ -242,10 +242,9 @@ def execute_create_table(
     if catalog.exists(db, plan.table.name):
         if plan.if_not_exists:
             return SQLResult(command_tag="CREATE TABLE")
-        # A temp table's catalog key carries its session namespace; the error
-        # names the bare relation like real PG ('relation "foo" already exists').
-        name = plan.table.name
-        raise errors.duplicate_table(name.split(".", 1)[1] if plan.table.temp else name)
+        # `duplicate_table` strips the schema/temp-namespace prefix a catalog
+        # key carries — PG names the bare relation.
+        raise errors.duplicate_table(plan.table.name)
     if "." in plan.table.name and not plan.table.temp:
         schema = plan.table.name.split(".", 1)[0]
         if not catalog.schema_exists(db, schema):
@@ -278,7 +277,9 @@ def execute_drop_table(
     if table is None:
         if plan.if_exists:
             return SQLResult(command_tag="DROP TABLE")
-        raise errors.undefined_table(plan.name)
+        # PG says `table "x" does not exist` here, not `relation "x"` — the
+        # noun follows the DROP verb (probed on 14.13).
+        raise errors.undefined_relation_of_kind("TABLE", plan.name)
     catalog.drop_triggers_for_table(db, plan.name)  # triggers die with the table
     catalog.drop(db, plan.name)
     storage.drop_collection(db, table.collection)
@@ -301,10 +302,10 @@ def execute_alter_table(
     if table is None:
         if plan.if_exists:
             return SQLResult(command_tag="ALTER TABLE")
-        raise errors.undefined_table(plan.name)
+        raise errors.undefined_table(plan.written or plan.name)
     old_name = table.name
     for action in plan.actions:
-        _apply_alter_action(action, table, storage, db)
+        _apply_alter_action(action, table, storage, db, catalog)
     catalog.replace(db, table, old_name=old_name)
     return SQLResult(command_tag="ALTER TABLE")
 
@@ -540,9 +541,9 @@ def execute_create_view(
     name = planner.qualified_table_name(name_node)
     replace = bool(stmt.args.get("replace"))
     if catalog.exists(db, name):
-        raise errors.SQLError("42P07", f'relation "{name}" already exists')
+        raise errors.duplicate_table(name)
     if not replace and catalog.get_view(db, name) is not None:
-        raise errors.SQLError("42P07", f'relation "{name}" already exists')
+        raise errors.duplicate_table(name)
     body = stmt.expression
     if column_names:
         if not isinstance(body, _exp.Select):
@@ -557,11 +558,13 @@ def execute_create_view(
 def execute_drop_view(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLResult:
     name = planner.qualified_table_name(stmt.this)
     if not catalog.drop_view(db, name) and not stmt.args.get("exists"):
-        raise errors.SQLError("42P01", f'view "{name}" does not exist')
+        raise errors.undefined_relation_of_kind("VIEW", name)
     return SQLResult(command_tag="DROP VIEW")
 
 
-def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
+def _apply_alter_action(
+    action: Any, table: Any, storage: Any, db: str, catalog: Catalog | None = None
+) -> None:
     from sqlglot import exp
 
     from secantus.sql.catalog import Column
@@ -644,14 +647,29 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
             storage.update_matching(db, coll, {}, {"$rename": {col.field: new_field}}, multi=True)
         return
     if isinstance(action, exp.AlterRename):  # RENAME TO newname
+        # PG renames WITHIN the relation's schema and rejects a qualified new
+        # name outright (`RENAME TO s.t` is a 42601 syntax error, probed on
+        # 14.13), so the new catalog key carries the OLD name's schema. Taking
+        # the bare name moved a renamed `s.t` to `public.t`.
+        if action.this.args.get("db") is not None:
+            raise errors.SQLError("42601", 'syntax error at or near "."')
         new_name = action.this.name
+        schema = table.name.rsplit(".", 1)[0] if "." in table.name else None
+        if schema is not None:
+            new_name = f"{schema}.{new_name}"
+        # Includes RENAME TO <its own name>, which PG also answers 42P07.
+        # Checked before any storage move: `rename_collection` onto an
+        # occupied name is not guaranteed to fail, so a rename could
+        # otherwise land one relation on top of another.
+        if new_name == table.name or (catalog is not None and catalog.exists(db, new_name)):
+            raise errors.duplicate_table(new_name)
         if table.collection == table.name:
             # A declared table maps 1:1 to a same-named collection — move the
             # collection too, so the old name stops resolving (a leftover
             # collection would otherwise reflect as a phantom table).
             ok, err = storage.rename_collection(db, table.collection, db, new_name)
             if not ok:
-                raise errors.SQLError("42P07", err or f'relation "{new_name}" already exists')
+                raise errors.duplicate_table(new_name)
             table.collection = new_name
         table.name = new_name
         return
@@ -762,7 +780,7 @@ def _apply_alter_action(action: Any, table: Any, storage: Any, db: str) -> None:
                 f'ALTER TABLE "{table.name}" DROP COLUMN {ie}{m.group("col")}'
             )[0]
             for sub in reparsed.args.get("actions") or []:
-                _apply_alter_action(sub, table, storage, db)
+                _apply_alter_action(sub, table, storage, db, catalog)
             return
     raise errors.feature_not_supported(f"unsupported ALTER TABLE action: {action.sql()}")
 
@@ -774,7 +792,7 @@ def execute_create_index(
     if plan.name in existing:
         if plan.if_not_exists:
             return SQLResult(command_tag="CREATE INDEX")
-        raise errors.SQLError("42P07", f'relation "{plan.name}" already exists')
+        raise errors.duplicate_table(plan.name)
     # An expression index materialises the indexed expression into a hidden field
     # (registered on the table, recomputed on every write); backfill it into every
     # existing row *before* building the B-tree so the entries are populated.
@@ -839,7 +857,7 @@ def execute_drop_index(
             return SQLResult(command_tag="DROP INDEX")
     if plan.if_exists:
         return SQLResult(command_tag="DROP INDEX")
-    raise errors.SQLError("42704", f'index "{plan.name}" does not exist')
+    raise errors.undefined_relation_of_kind("INDEX", plan.name)
 
 
 def _drop_expr_index(table: Any, index_name: str, catalog: Catalog, storage: Any, db: str) -> None:
