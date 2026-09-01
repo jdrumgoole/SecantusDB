@@ -217,6 +217,9 @@ class SelectPlan:
     # ORDER BY field paths that are citext columns: the executor folds their string
     # values to lower case before comparing, so the sort is case-insensitive.
     citext_orders: set[str] = field(default_factory=set)
+    # ORDER BY field paths carrying an explicit ``COLLATE`` — field path to the
+    # collation name. The executor builds a locale-aware key for these.
+    collate_orders: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -2581,6 +2584,77 @@ def _order_terms(stmt: exp.Expression, table: TableDef) -> list[tuple[str, int, 
     return terms
 
 
+#: Collation names that mean BYTE order — which is what SecantusDB does
+#: natively, so these need no key transform at all. `default` follows the
+#: database collation, and this database's is `C` (reported as such through
+#: `lc_collate` / `pg_database.datcollate`).
+BYTEWISE_COLLATIONS = frozenset({"c", "posix", "ucs_basic", "default"})
+
+#: Locale collations served by `collation.sort_levels` — a three-level
+#: ICU-SHAPED key computed WITHOUT ICU. Deliberately a short list: naming one
+#: we cannot actually apply would be worse than refusing it, because the
+#: previous behaviour (accept the clause, sort by bytes anyway) is exactly the
+#: silent-wrong-answer this replaces.
+LOCALE_COLLATIONS = frozenset({"en_us.utf-8", "en_us", "und-x-icu"})
+
+
+def collation_kind(name: str) -> str:
+    """``"bytes"``, ``"locale"``, or raise PG's 42704 for a name we cannot serve."""
+    key = name.strip('"').lower()
+    if key in BYTEWISE_COLLATIONS:
+        return "bytes"
+    if key in LOCALE_COLLATIONS:
+        return "locale"
+    raise errors.SQLError(
+        "42704", f'collation "{name.strip(chr(34))}" for encoding "UTF8" does not exist'
+    )
+
+
+def hoist_collations(stmt: exp.Expression) -> None:
+    """Record each ORDER BY ``COLLATE`` on the statement, then strip the nodes.
+
+    Must run BEFORE the planner picks a path. A `Collate` wrapper is not a
+    plain column, so its mere presence routed the statement down the
+    evaluated-select path — which never consulted the collation, so
+    `ORDER BY w COLLATE "en_US.UTF-8"` was accepted and then sorted by BYTES.
+    Stripping the node early puts the query back on its ordinary path and
+    carries the collation alongside (`_collate_order_map` reads it back).
+
+    Unknown collations raise `42704` here, as PostgreSQL does, rather than
+    being silently ignored.
+    """
+    order = stmt.args.get("order")
+    if order is None:
+        return
+    wanted: dict[str, str] = {}
+    for o in order.expressions:
+        node = o.this
+        if not isinstance(node, exp.Collate):
+            continue
+        name = node.expression.name if node.expression is not None else ""
+        kind = collation_kind(name)  # validates; raises 42704 when unknown
+        inner = node.this
+        if kind == "locale" and isinstance(inner, exp.Column):
+            wanted[_column_name(inner)] = name.strip('"')
+    for node in list(stmt.find_all(exp.Collate)):
+        node.replace(node.this)
+    if wanted:
+        stmt._secantus_collations = wanted
+
+
+def _collate_order_map(stmt: exp.Expression, table: TableDef) -> dict[str, str]:
+    """The hoisted collations, keyed by storage FIELD path for the executor."""
+    wanted = getattr(stmt, "_secantus_collations", None)
+    if not wanted:
+        return {}
+    out: dict[str, str] = {}
+    for colname, name in wanted.items():
+        col = table.column(colname)
+        if col is not None:
+            out[table.field_for(col.name)] = name
+    return out
+
+
 def _citext_order_set(stmt: exp.Expression, table: TableDef) -> set[str]:
     """The ORDER BY field paths whose column is citext — the executor folds those
     to lower case before comparing, so citext sorts case-insensitively."""
@@ -3197,6 +3271,10 @@ def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = 
 
     rewrite_expr_index_refs(stmt, table)
     _rewrite_order_by_aliases(stmt, table)
+    # Read the COLLATE clauses onto the plan, then strip the nodes: every path
+    # below resolves an ORDER BY term to a COLUMN and would not recognise a
+    # `Collate` wrapper. Validation (unknown collation -> 42704) happens here.
+    collate_orders = _collate_order_map(stmt, table)
     filt = _where_filter(stmt, table, subctx)
     order = _order_terms(stmt, table)
     limit, skip = _limit_skip(stmt)
@@ -3221,6 +3299,7 @@ def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = 
         out_columns=_select_out_columns(stmt, table),
         enum_orders=_enum_order_map(stmt, table, subctx),
         citext_orders=_citext_order_set(stmt, table),
+        collate_orders=collate_orders,
     )
 
 

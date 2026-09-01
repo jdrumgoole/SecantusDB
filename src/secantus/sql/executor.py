@@ -18,6 +18,7 @@ from typing import Any
 
 import bson
 
+from secantus import collation as _collation
 from secantus.paths import get_path, has_path
 from secantus.sql import errors, planner, subms, typemap
 from secantus.sql.catalog import USER_TYPE_ARRAY_OID_OFFSET, Catalog
@@ -61,6 +62,11 @@ def _serialized_write(fn: Any) -> Any:
     return wrapper
 
 
+#: The collation an explicit `COLLATE "<locale>"` gets. Strength 3 is
+#: PostgreSQL's own default level (case and accents both significant).
+_LOCALE_COLLATION = _collation.Collation(strength=3)
+
+
 def _pg_sort(items: list[Any], key_of: Any, specs: list[tuple[int, bool]]) -> None:
     """Stable in-place sort with Postgres ORDER BY semantics.
 
@@ -93,6 +99,7 @@ def _order_key_fn(
     order: list[tuple[str, int, bool]],
     enum_orders: dict[str, list[str]] | None = None,
     citext_orders: set[str] | None = None,
+    collate_orders: dict[str, str] | None = None,
 ) -> Any:
     """Build the ``key_of(doc)`` used by ``_pg_sort`` for a list of ORDER BY field
     paths. An enum-typed order field maps its label value to the label's ordinal in
@@ -106,6 +113,7 @@ def _order_key_fn(
             f: {lbl: i for i, lbl in enumerate(labels)} for f, labels in enum_orders.items()
         }
     citext_fields = citext_orders or set()
+    collate_fields = collate_orders or {}
 
     def key_of(doc: Any) -> tuple:
         out = []
@@ -120,6 +128,12 @@ def _order_key_fn(
                 value = omap.get(value, len(omap))  # unknown label sorts last
             elif field_path in citext_fields and isinstance(value, str):
                 value = value.lower()
+            elif field_path in collate_fields and isinstance(value, str):
+                # An explicit `COLLATE "<locale>"`. The three-level key is
+                # computed WITHOUT ICU (`collation.sort_levels`); the two
+                # documented limits are `ß` (PG expands it to `ss`) and the
+                # relative weight of `-` versus `_`.
+                value = _collation.sort_levels(value, _LOCALE_COLLATION)
             out.append(value)
         return tuple(out)
 
@@ -1829,7 +1843,12 @@ def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult
         # NULL placement follows Postgres, not Mongo sort order, so order in
         # Python; that also pulls OFFSET/LIMIT off the storage fetch.
         docs = storage.find_matching(db, plan.table.collection, plan.filter)
-        key_of = _order_key_fn(plan.order, plan.enum_orders, getattr(plan, "citext_orders", None))
+        key_of = _order_key_fn(
+            plan.order,
+            plan.enum_orders,
+            getattr(plan, "citext_orders", None),
+            getattr(plan, "collate_orders", None),
+        )
         _pg_sort(docs, key_of, [(direction, nf) for _, direction, nf in plan.order])
         if plan.skip:
             docs = docs[plan.skip :]

@@ -109,7 +109,39 @@ item is not overhead — it is where the findings come from.
       raised it as "worth a CI thought" and never separated it. Deciding
       whether CI should stand one up is the open question; nothing is broken.
 
-- [ ] **`ORDER BY` on a text column sorts by BYTES, not by the database's
+- [x] **RESOLVED (2026-09-01) — and the entry's PREMISE was wrong.** It says
+      "this box: `en_US.UTF-8`". This box's PostgreSQL is initialised with
+      **`C`** (`SHOW lc_collate` -> `C`, `pg_database.datcollate` -> `C`), and
+      under `C` PostgreSQL sorts by BYTES — byte-identical to SecantusDB on the
+      entry's own nine values. The recorded "postgres (en_US)" row must have
+      come from an explicit `COLLATE "en_US.UTF-8"` clause (reproduced), so the
+      comparison was PG-with-a-collate against SecantusDB's default.
+
+      **The default ordering was therefore never wrong, and is deliberately
+      unchanged** — "fixing" it would have BROKEN the match with a
+      `C`-collation database. What was actually broken, and is now fixed:
+
+      * `ORDER BY … COLLATE "en_US.UTF-8"` was accepted and then SILENTLY
+        IGNORED (a `Collate` wrapper is not a plain column, so it routed the
+        statement down the evaluated-select path, which never consulted it).
+        `planner.hoist_collations` records and strips it before any routing
+        decision; the executor builds the key.
+      * an unknown collation was accepted too; now `42704 collation "x" for
+        encoding "UTF8" does not exist`, as PG.
+      * `SHOW lc_collate` returned `''` — not a collation name. Now `C`.
+      * `pg_collation` was present-but-EMPTY, so a client enumerating
+        collations was told there are none. Now lists what we can serve.
+
+      The locale key is `collation.sort_levels` — the three-level ICU-SHAPED
+      key already built for the Mongo side, computed **without ICU**. It
+      matches PG's `en_US.UTF-8` on **9 of 11** measured corpora; the two
+      misses are `ß` (PG expands it to `ss`) and the relative weight of `-`
+      versus `_`, both pinned in `TestKnownNonIcuLimits` so a future
+      ICU-backed implementation has a target. **The Rust server still sorts by
+      bytes only** — this entry covered both servers and only the Python half
+      is done. Original entry:
+
+- **`ORDER BY` on a text column sorts by BYTES, not by the database's
       collation — BOTH servers, found 2026-08-31.** PostgreSQL sorts text using
       the database collation (this box: `en_US.UTF-8`), which ignores case and
       punctuation at the primary level. Both SecantusDB servers sort by raw
@@ -8759,15 +8791,29 @@ shared storage engine or building large new protocol subsystems:
   (`adbin` = the rendered default text via `virtual._pg_attrdef` / `_column_default_text`, b206 #171),
   matching `information_schema.columns.column_default`. **Limitations:** a `TYPE` change doesn't recast
   existing rows.
-- [ ] **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
+- [x] **STALE, corrected 2026-09-01 — `SET` is NOT merely accept-and-record.**
+  The example this entry gave is exactly the case that stopped being true:
+  `search_path` DOES affect name resolution (`planner.qualify_from_search_path`,
+  and the whole `ALTER TABLE` / matview / sequence resolution work of
+  2026-09-01 builds on it). `SET TIME ZONE`, `statement_timeout`,
+  `idle_in_transaction_session_timeout`, `SET LOCAL` and `SET ROLE` act too.
+  Reportable GUCs still echo a `ParameterStatus`. Original entry:
+
+- **`SET` is accept-and-record.** GUCs persist on the session and reportable ones
   echo a `ParameterStatus`, but nothing acts on them (e.g. `search_path` doesn't affect
   name resolution). (`BEGIN`/`COMMIT`/`ROLLBACK` are now real transactions — see below.)
 - [ ] **Transactions: single-connection atomicity; savepoints are real (DDL excepted).**
   `BEGIN`/`COMMIT`/`ROLLBACK` open/commit/abort a real `Storage` user-transaction
   (statements in the block run on its WT session; ROLLBACK undoes them; an error poisons
-  the block with `25P02` until it ends). `SET TRANSACTION ISOLATION LEVEL` / `READ ONLY` /
+  the block with `25P02` until it ends). ~~`SET TRANSACTION ISOLATION LEVEL` / `READ ONLY` /
   `READ WRITE`, `SET SESSION CHARACTERISTICS`, and `BEGIN ISOLATION LEVEL …` are
-  **accepted as no-ops** (single-node — isolation/read-only don't change behaviour).
+  **accepted as no-ops** (single-node — isolation/read-only don't change
+  behaviour).~~ **Corrected 2026-09-01:** isolation levels are honoured and
+  echoed back. Every explicit transaction runs on WiredTiger's snapshot
+  isolation, which IS PostgreSQL's REPEATABLE READ, and the divergences are
+  measured and documented (see the isolation-level entry above and
+  `docs/sql.md` "Isolation levels"). Calling them no-ops understated both what
+  works and what diverges.
   **Real nested savepoints landed** (b71): `SAVEPOINT name` / `ROLLBACK TO SAVEPOINT name` /
   `RELEASE SAVEPOINT name` do actual partial rollback. Each open savepoint (`session.savepoints`,
   a stack of `_Savepoint`) lazily captures a touched collection's deep-copied pre-image the first

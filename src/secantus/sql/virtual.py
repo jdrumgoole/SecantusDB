@@ -2000,9 +2000,33 @@ def _role_row(oid: int, name: str, role: dict) -> dict:
     }
 
 
+#: Collations this server can actually apply, with PostgreSQL's own oids for
+#: the three built-ins. `default` follows the database collation (`C` here),
+#: and `C` / `POSIX` / `ucs_basic` are byte order — which is what SecantusDB
+#: does natively. The locale entries are served by `collation.sort_levels`,
+#: a three-level ICU-SHAPED key computed without ICU: see
+#: `sql/ordering.py` and the limits documented there.
+_COLLATIONS: list[tuple[int, str]] = [
+    (100, "default"),
+    (950, "C"),
+    (951, "POSIX"),
+    (12547, "ucs_basic"),
+    (12548, "en_US.UTF-8"),
+    (12549, "en_US"),
+    (12550, "und-x-icu"),
+]
+
+
 def _pg_collation(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
-    # No non-default collations — present-but-empty.
-    return []
+    """The collations a client can name in a ``COLLATE`` clause.
+
+    This was present-but-EMPTY, so a client enumerating available collations
+    was told there are none — while `ORDER BY … COLLATE "en_US.UTF-8"` was
+    silently accepted and then ignored. Both halves were wrong in the same
+    direction: the server claimed less than it did, then did less than it said.
+    """
+    ns = _NS_OIDS["pg_catalog"]
+    return [{"oid": oid, "collname": name, "collnamespace": ns} for oid, name in _COLLATIONS]
 
 
 _ENUM_OID_BASE = ENUM_TYPE_OID_BASE

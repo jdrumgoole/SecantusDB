@@ -37,6 +37,13 @@ GUC_DEFAULTS: dict[str, str] = {
     "server_version_num": "150000",
     "server_encoding": "UTF8",
     "client_encoding": "UTF8",
+    # SecantusDB sorts text by BYTES, which is exactly what a `C`-collation
+    # PostgreSQL does, so this is the truth rather than a placeholder — a
+    # database initdb'd with `C` gives byte-identical ORDER BY. Reported so a
+    # client that introspects the collation is not told an empty string (the
+    # previous answer, which is not a collation name at all).
+    "lc_collate": "C",
+    "lc_ctype": "C",
     "DateStyle": "ISO, MDY",
     "IntervalStyle": "postgres",
     "TimeZone": "UTC",
