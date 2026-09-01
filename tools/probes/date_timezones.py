@@ -47,6 +47,9 @@ if os.environ.get("PROBE_SERVER"):
 # what catches an implementation that only handles whole-hour offsets.
 D = dt.datetime(2026, 7, 4, 15, 30, 45, 123000, tzinfo=dt.timezone.utc)
 W = dt.datetime(2026, 1, 4, 15, 30, 45, tzinfo=dt.timezone.utc)
+# The day BEFORE the US spring-forward, at noon Eastern -- so a +1 day shift
+# crosses the transition and the wall-clock answer differs from the 24h one.
+DST = dt.datetime(2026, 3, 7, 17, 0, tzinfo=dt.timezone.utc)
 
 ZONES = [
     "UTC",
@@ -64,6 +67,19 @@ ZONES = [
     "",
 ]
 UNITS = ["year", "quarter", "month", "week", "day", "hour", "minute", "second", "millisecond"]
+
+# Endpoint pairs for `$dateDiff`, stored as real BSON dates on the document
+# rather than built with `$dateFromString` -- otherwise a server that cannot
+# parse the string form fails every shape and hides what is being measured.
+DIFF_PAIRS = [
+    (dt.datetime(2026, 7, 4, 2), dt.datetime(2026, 7, 4, 23)),
+    (dt.datetime(2026, 7, 4, 23), dt.datetime(2026, 7, 4, 2)),
+    (dt.datetime(2025, 12, 31, 23), dt.datetime(2026, 1, 1, 2)),
+    (dt.datetime(2026, 7, 1, 2), dt.datetime(2026, 7, 31, 23)),
+    (dt.datetime(2026, 1, 1, 2), dt.datetime(2026, 1, 1, 23)),
+    (dt.datetime(2026, 7, 5, 2), dt.datetime(2026, 7, 5, 23)),
+    (dt.datetime(2026, 2, 28, 12), dt.datetime(2026, 3, 1, 12)),
+]
 
 
 def shapes():
@@ -115,25 +131,33 @@ def shapes():
 
     # `$dateDiff` counts BOUNDARY CROSSINGS, and the boundaries are local -- so
     # two instants inside one UTC day can be one local day apart.
-    diff_pairs = [
-        ("2026-07-04T02:00", "2026-07-04T23:00"),
-        ("2026-07-04T23:00", "2026-07-04T02:00"),
-        ("2025-12-31T23:00", "2026-01-01T02:00"),
-        ("2026-07-01T02:00", "2026-07-31T23:00"),
-        ("2026-01-01T02:00", "2026-01-01T23:00"),
-        ("2026-07-05T02:00", "2026-07-05T23:00"),
-        ("2026-02-28T12:00", "2026-03-01T12:00"),
-    ]
-    for a, b in diff_pairs:
+    for i, _pair in enumerate(DIFF_PAIRS):
         for tz in ["UTC", "America/New_York", "Asia/Kolkata"]:
             for unit in ["year", "quarter", "month", "week", "day", "hour"]:
                 yield (
-                    f"$dateDiff {unit} {tz} {a}->{b}",
+                    f"$dateDiff {unit} {tz} pair{i}",
                     {
                         "$dateDiff": {
-                            "startDate": {"$dateFromString": {"dateString": a + "Z"}},
-                            "endDate": {"$dateFromString": {"dateString": b + "Z"}},
+                            "startDate": f"$p{i}a",
+                            "endDate": f"$p{i}b",
                             "unit": unit,
+                            "timezone": tz,
+                        }
+                    },
+                )
+
+    # `$dateAdd` / `$dateSubtract` of a CALENDAR unit keeps the local wall
+    # clock, so +1 day across a spring-forward is 23 real hours, not 24.
+    for tz in ["UTC", "America/New_York", "Australia/Lord_Howe"]:
+        for unit, amount in [("day", 1), ("day", -1), ("week", 1), ("month", 1), ("hour", 24)]:
+            for op in ["$dateAdd", "$dateSubtract"]:
+                yield (
+                    f"{op} {unit}{amount:+d} {tz} dst",
+                    {
+                        op: {
+                            "startDate": "$dst",
+                            "unit": unit,
+                            "amount": amount,
                             "timezone": tz,
                         }
                     },
@@ -159,7 +183,11 @@ def run(cli, expr):
     c = cli["dtz"]["c"]
     try:
         c.drop()
-        c.insert_one({"_id": 1, "d": D, "w": W})
+        doc = {"_id": 1, "d": D, "w": W, "dst": DST}
+        for i, (a, b) in enumerate(DIFF_PAIRS):
+            doc[f"p{i}a"] = a.replace(tzinfo=dt.timezone.utc)
+            doc[f"p{i}b"] = b.replace(tzinfo=dt.timezone.utc)
+        c.insert_one(doc)
         out = list(c.aggregate([{"$project": {"r": expr}}]))
         return repr(out[0].get("r"))
     except Exception as e:  # noqa: BLE001 - the error IS the measurement

@@ -56,6 +56,14 @@ impl Fallback {
         }
     }
 
+    /// Stamp which pipeline wrapper this error belongs under.
+    pub fn with_folded(mut self, is_folded: bool) -> Self {
+        if let Fallback::Mongo { folded, .. } = &mut self {
+            *folded = Some(is_folded);
+        }
+        self
+    }
+
     /// The `(code, message)` pair when this is a real server error.
     pub fn as_mongo(&self) -> Option<(i32, &str)> {
         match self {

@@ -1917,6 +1917,28 @@ def _add_months(d: _dt.datetime, months: int) -> _dt.datetime:
     return d.replace(year=new_year, month=new_month, day=new_day)
 
 
+def _shift_date_in_zone(
+    d: _dt.datetime, unit: str, amount: int, tz: _dt.tzinfo | None
+) -> _dt.datetime:
+    """`$dateAdd` / `$dateSubtract`, which shift a CALENDAR unit on the LOCAL
+    wall clock.
+
+    Probed 8.2.11 (2026-09-01): noon Eastern on 2026-03-07 plus one day is noon
+    Eastern on the 8th -- 23 real hours, because the spring-forward falls
+    between them -- while the same shift in UTC adds 24. The timezone was
+    ignored outright on both servers, so every calendar shift across a DST
+    boundary was an hour out. Sub-day units (`hour` and below) are absolute and
+    unaffected, which is why a 24-`hour` shift is NOT the same as a 1-`day` one.
+    """
+    if tz is None or unit in _SUBDAY_UNIT_SECONDS:
+        return _shift_date(d, unit, amount)
+    aware = d if d.tzinfo is not None else d.replace(tzinfo=_dt.timezone.utc)
+    local = aware.astimezone(tz).replace(tzinfo=None)
+    shifted = _shift_date(local, unit, amount)
+    utc = _localize(shifted, tz).astimezone(_dt.timezone.utc)
+    return utc if d.tzinfo is not None else utc.replace(tzinfo=None)
+
+
 def _shift_date(d: _dt.datetime, unit: str, amount: int) -> _dt.datetime:
     if unit == "year":
         return _add_months(d, amount * 12)
@@ -1971,7 +1993,8 @@ def _op_date_add(arg: Any, ctx: _Ctx) -> Any:
             code=5166405,
             code_name="Location5166405",
         )
-    return _shift_date(start, unit, n)
+    tz = _resolve_timezone(arg.get("timezone")) if "timezone" in arg else None
+    return _shift_date_in_zone(start, unit, n, tz)
 
 
 def _op_date_subtract(arg: Any, ctx: _Ctx) -> Any:
@@ -1993,7 +2016,8 @@ def _op_date_subtract(arg: Any, ctx: _Ctx) -> Any:
             code=5166405,
             code_name="Location5166405",
         )
-    return _shift_date(start, unit, -n)
+    tz = _resolve_timezone(arg.get("timezone")) if "timezone" in arg else None
+    return _shift_date_in_zone(start, unit, -n, tz)
 
 
 def _op_date_trunc(arg: Any, ctx: _Ctx) -> Any:
@@ -2199,7 +2223,8 @@ def _op_date_add(arg: Any, ctx: _Ctx) -> Any:
             code=5166405,
             code_name="Location5166405",
         )
-    return _shift_date(start, unit, n)
+    tz = _resolve_timezone(arg.get("timezone")) if "timezone" in arg else None
+    return _shift_date_in_zone(start, unit, n, tz)
 
 
 def _op_date_subtract(arg: Any, ctx: _Ctx) -> Any:
@@ -2221,7 +2246,8 @@ def _op_date_subtract(arg: Any, ctx: _Ctx) -> Any:
             code=5166405,
             code_name="Location5166405",
         )
-    return _shift_date(start, unit, -n)
+    tz = _resolve_timezone(arg.get("timezone")) if "timezone" in arg else None
+    return _shift_date_in_zone(start, unit, -n, tz)
 
 
 def _op_date_to_parts(arg: Any, ctx: _Ctx) -> Any:

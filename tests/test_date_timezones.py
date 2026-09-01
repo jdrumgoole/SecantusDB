@@ -164,3 +164,55 @@ class TestUnrecognisedZones:
         with pytest.raises(ExpressionError) as exc:
             evaluate({op: spec}, {"d": D})
         assert f"{op} parameter 'timezone' value parsing failed :: caused by ::" in str(exc.value)
+
+
+class TestDateAddKeepsTheWallClock:
+    """A CALENDAR shift moves the local clock; a sub-day one is absolute."""
+
+    # Noon Eastern on 2026-03-07, the day before the US spring-forward.
+    NOON_EASTERN = dt.datetime(2026, 3, 7, 17)
+
+    def add(self, unit, amount, tz):
+        return evaluate(
+            {
+                "$dateAdd": {
+                    "startDate": "$d",
+                    "unit": unit,
+                    "amount": amount,
+                    "timezone": tz,
+                }
+            },
+            {"d": self.NOON_EASTERN},
+        )
+
+    def test_one_day_across_the_transition_is_23_real_hours(self):
+        assert self.add("day", 1, "America/New_York") == dt.datetime(2026, 3, 8, 16)
+
+    def test_the_same_shift_in_utc_is_24(self):
+        assert self.add("day", 1, "UTC") == dt.datetime(2026, 3, 8, 17)
+
+    def test_24_hours_is_not_1_day(self):
+        """Sub-day units are absolute, so they do NOT follow the wall clock."""
+        assert self.add("hour", 24, "America/New_York") == dt.datetime(2026, 3, 8, 17)
+
+    def test_week_and_month_follow_the_wall_clock_too(self):
+        assert self.add("week", 1, "America/New_York") == dt.datetime(2026, 3, 14, 16)
+        assert self.add("month", 1, "America/New_York") == dt.datetime(2026, 4, 7, 16)
+
+    def test_a_half_hour_dst_zone(self):
+        """Lord Howe shifts by 30 minutes, not an hour."""
+        assert self.add("month", 1, "Australia/Lord_Howe") == dt.datetime(2026, 4, 7, 17, 30)
+
+    def test_subtract_is_symmetric(self):
+        got = evaluate(
+            {
+                "$dateSubtract": {
+                    "startDate": "$d",
+                    "unit": "day",
+                    "amount": -1,
+                    "timezone": "America/New_York",
+                }
+            },
+            {"d": self.NOON_EASTERN},
+        )
+        assert got == dt.datetime(2026, 3, 8, 16)
