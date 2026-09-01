@@ -14,7 +14,11 @@ from typing import TYPE_CHECKING, Any
 from bson import Binary, Code, Decimal128
 
 from secantus import deadline as _deadline
-from secantus.bsontypes import bson_value_repr, bson_value_repr_stage
+from secantus.bsontypes import (
+    bson_value_repr,
+    bson_value_repr_stage,
+    is_bson_string,
+)
 from secantus.expressions import (
     MISSING,
     ExpressionError,
@@ -673,7 +677,7 @@ def _stage_count(
 ) -> list[dict[str, Any]]:
     # mongod: the count field must be a non-empty string (40156/40157), not
     # $-prefixed (40158), without a '.' (40160), and not "_id" (15948).
-    if not isinstance(spec, str):
+    if not is_bson_string(spec):
         raise AggregateError(
             "the count field must be a non-empty string", code=40156, code_name="Location40156"
         )
@@ -730,6 +734,15 @@ def _stage_nonneg_int(spec: Any, stage: str, code: int) -> int:
             code=code,
         )
     if isinstance(spec, float):
+        if spec != spec:
+            # NaN gets its own sentence, as it does in every other numeric
+            # ladder mongod uses -- this reported the generic "Expected an
+            # integer" instead.
+            raise AggregateError(
+                f"invalid argument to {stage} stage: Expected an integer, but found "
+                f"NaN in: {stage}: nan",
+                code=code,
+            )
         if not spec.is_integer():
             # A fourth message family, and only for decimals (probed 6.0.16):
             #   1.5             -> Expected an integer
@@ -766,15 +779,12 @@ def _stage_skip(
 
 
 def _sort_val_repr(v: Any) -> str:
-    """mongod renders the offending value in the Location15974 message as
-    shell/JSON (`"asc"`, `true`, `null`), not Python repr."""
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, str):
-        return f'"{v}"'
-    if v is None:
-        return "null"
-    return str(v)
+    """The Location15974 rendering -- the query family's, not the stage one.
+
+    A tenth partial copy of mongod's value vocabulary, naming three types and
+    falling through to `str()` for the rest.
+    """
+    return bson_value_repr(v)
 
 
 def _validate_sort_spec(spec: Any) -> None:
@@ -966,7 +976,7 @@ def _stage_unset(
     # `list(spec)` and raised a bare TypeError (`1 internal server error` for an
     # int, and a silent no-op for a document, whose iteration yields its keys),
     # while an empty string and an empty array were accepted and did nothing.
-    if isinstance(spec, str):
+    if is_bson_string(spec):
         if not spec:
             raise AggregateError("FieldPath cannot be constructed with empty string", code=40352)
         paths = [spec]
@@ -1293,7 +1303,7 @@ def _stage_unwind(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
     include_index: str | None = None
-    if isinstance(spec, str):
+    if is_bson_string(spec):
         raw_path: Any = spec
         preserve_null = False
     elif isinstance(spec, Mapping):
@@ -2935,7 +2945,7 @@ def _validate_sort_by_count_arg(spec: Any) -> None:
     """mongod: the $sortByCount argument is a $-prefixed path string (40148) or an
     expression object — a single `$`-prefixed key (40147); anything else (number,
     bool, array, null) is 40149."""
-    if isinstance(spec, str):
+    if is_bson_string(spec):
         if not spec.startswith("$"):
             raise AggregateError(
                 "the sortByCount field must be defined as a $-prefixed path or an "
@@ -3169,7 +3179,7 @@ def _stage_out(spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext) -> l
         raise AggregateError("$out requires storage context")
     # mongod's four distinct refusals, probed 8.2.11 (2026-09-01). An EMPTY
     # string used to be accepted and silently wrote to a nameless collection.
-    if isinstance(spec, str):
+    if is_bson_string(spec):
         if not spec:
             raise AggregateError(
                 f"Invalid $out target namespace, {ctx.db_name}",
@@ -3263,7 +3273,7 @@ def _stage_merge(
     if ctx.storage is None:
         raise AggregateError("$merge requires storage context")
     let_spec: Mapping[str, Any] = {}
-    if isinstance(spec, str):
+    if is_bson_string(spec):
         # An EMPTY string used to be accepted and merged into a nameless
         # collection. Note the message shape differs from `$out`'s -- mongod
         # quotes the namespace here and does not there.
@@ -5316,7 +5326,7 @@ def _stage_union_with(
     implementation. No deduplication — duplicates across the boundary
     survive.
     """
-    if isinstance(spec, str):
+    if is_bson_string(spec):
         from_coll = spec
         sub_pipeline: list[dict[str, Any]] | None = None
     elif isinstance(spec, Mapping):

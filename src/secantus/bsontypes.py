@@ -208,6 +208,19 @@ def fmt_double_parse(value: float) -> str:
     return repr(value)
 
 
+def is_bson_string(value: Any) -> bool:
+    """A BSON string -- which ``bson.Code`` is NOT, however much it subclasses
+    ``str``.
+
+    An ``isinstance(v, str)`` that meant "a BSON string" has now produced
+    eleven bugs across four batches: a crash wherever the value then reaches a
+    dict key or a set, and a wrong answer wherever it is treated as text. Use
+    this instead of a bare ``isinstance`` anywhere the distinction is a BSON
+    one.
+    """
+    return isinstance(value, str) and not isinstance(value, Code)
+
+
 def bson_value_repr_stage(value: Any) -> str:
     """Render a BSON value the way an AGGREGATION STAGE error echoes it.
 
