@@ -652,3 +652,46 @@ def test_subms_distinct_matches_real_postgres(distinct_table):
             assert ours == theirs, sql
     finally:
         pg.close()
+
+
+class TestOrderedAggregateValues:
+    """`array_agg(t ORDER BY t)` returned the truncated date.
+
+    The ordered-aggregate push carried the sub-millisecond composite on the
+    sort KEY but not on the VALUE, so the ordering was microsecond-exact and
+    then every element came back `.123000` — times that were never stored.
+    Found 2026-09-01 by probing the routes the backlog entry listed as "closed
+    across all five", which is why that entry warned a sixth was possible.
+    """
+
+    def test_array_agg_ordered_by_the_same_column(self, storage, session):
+        run(storage, session, "CREATE TABLE oa (id int, t timestamp)")
+        for i, us in enumerate((123100, 123500, 123900)):
+            run(storage, session, f"INSERT INTO oa VALUES ({i}, '2020-01-01 00:00:00.{us:06d}')")
+        got = run(storage, session, "SELECT array_agg(t ORDER BY t) FROM oa").rows
+        assert got == [
+            (
+                [
+                    dt.datetime(2020, 1, 1, 0, 0, 0, 123100),
+                    dt.datetime(2020, 1, 1, 0, 0, 0, 123500),
+                    dt.datetime(2020, 1, 1, 0, 0, 0, 123900),
+                ],
+            )
+        ]
+
+    def test_array_agg_ordered_by_another_column(self, storage, session):
+        """The pre-existing shape — ordering by a DIFFERENT column — must keep
+        working, and its values must be exact too."""
+        run(storage, session, "CREATE TABLE ob (id int, t timestamp)")
+        for i, us in enumerate((123900, 123100, 123500)):
+            run(storage, session, f"INSERT INTO ob VALUES ({i}, '2020-01-01 00:00:00.{us:06d}')")
+        got = run(storage, session, "SELECT array_agg(t ORDER BY id) FROM ob").rows
+        assert got == [
+            (
+                [
+                    dt.datetime(2020, 1, 1, 0, 0, 0, 123900),
+                    dt.datetime(2020, 1, 1, 0, 0, 0, 123100),
+                    dt.datetime(2020, 1, 1, 0, 0, 0, 123500),
+                ],
+            )
+        ]

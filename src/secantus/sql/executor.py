@@ -2385,6 +2385,11 @@ def _sorted_agg_value(kind: str, payload: Any, pairs: Any) -> Any:
             isinstance(k, dict) and subms.COMPOSITE_DATE in k for k in keys
         ):
             p["k"] = [subms.unwrap_composite(k) for k in keys]
+        # ... and the VALUE, which rides as a composite when it is itself a
+        # timestamp column (`array_agg(t ORDER BY t)`).
+        value = p.get("v")
+        if isinstance(value, dict) and subms.COMPOSITE_DATE in value:
+            p["v"] = subms.unwrap_composite(value)
     if kind == "sorted_array":
         specs = payload
         _pg_sort(items, lambda p: tuple(p.get("k") or []), specs)
