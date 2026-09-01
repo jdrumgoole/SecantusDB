@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from dataclasses import field as _dc_field
 from typing import TYPE_CHECKING, Any
 
-from bson import Binary, Decimal128, ObjectId
+from bson import Binary, Code, Decimal128, ObjectId
 
 from secantus import deadline as _deadline
 from secantus.expressions import (
@@ -1895,6 +1895,11 @@ def _stage_group(
 def _hashable_with_collation(value: Any, collation: Any) -> Any:
     from secantus.collation import cmp_key
 
+    # Before the string branch below: `Code` subclasses `str`, and folding a
+    # JavaScript value through the collation would both merge it with an equal
+    # string and (being unhashable) crash on the way.
+    if isinstance(value, Code):
+        return _hashable_scalar(value)
     if isinstance(value, Mapping):
         return tuple(sorted((k, _hashable_with_collation(v, collation)) for k, v in value.items()))
     if isinstance(value, list):
@@ -2491,10 +2496,35 @@ def _accumulate(
 
 
 def _hashable(value: Any) -> Any:
+    """A hashable stand-in for a ``$group`` bucket key.
+
+    Containers become tuples; scalars pass through -- except the ones that are
+    not hashable at all. ``bson.Code`` is the live case: it subclasses ``str``
+    but defines ``__eq__`` without ``__hash__``, so grouping a collection that
+    held a JavaScript value raised ``TypeError: unhashable type`` and the
+    client saw ``1 internal server error``.
+
+    The stand-in has to keep Code and an equal STRING apart, because mongod
+    does: grouping ``Code("x=1")`` and ``"x=1"`` yields two buckets, so a bare
+    ``str(value)`` surrogate would wrongly merge them.
+    """
     if isinstance(value, Mapping):
         return tuple(sorted((k, _hashable(v)) for k, v in value.items()))
     if isinstance(value, list):
         return tuple(_hashable(v) for v in value)
+    return _hashable_scalar(value)
+
+
+def _hashable_scalar(value: Any) -> Any:
+    """``value`` itself when hashable, else a type-tagged surrogate."""
+    if isinstance(value, Code):
+        return ("\x00code", str(value), _hashable(value.scope) if value.scope else None)
+    try:
+        hash(value)
+    except TypeError:
+        # Anything else unhashable: tag by type so two different types cannot
+        # collide, and fall back to the repr for identity within the type.
+        return ("\x00unhashable", type(value).__name__, repr(value))
     return value
 
 

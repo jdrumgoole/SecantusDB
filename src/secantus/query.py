@@ -8,7 +8,7 @@ from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from typing import Any
 
-from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex
+from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
 from secantus.bsontypes import Int64CoercionError, coerce_int64_argument
 from secantus.bsontypes import bson_value_repr as _mongo_bson_repr
@@ -1374,11 +1374,30 @@ def _is_bson_number(v: Any) -> bool:
     return isinstance(v, (float, Decimal128)) or _is_int32(v) or _is_int64(v)
 
 
+def _is_bson_string(v: Any) -> bool:
+    """A BSON string. `bson.Code` subclasses `str` and is NOT one."""
+    return isinstance(v, str) and not isinstance(v, Code)
+
+
+def _is_javascript(v: Any) -> bool:
+    """BSON type 13. A `Code` carrying a scope is type 15 instead -- probed
+    8.2.11: `$type: "javascript"` matches only the scope-less one."""
+    return isinstance(v, Code) and v.scope is None
+
+
+def _is_javascript_with_scope(v: Any) -> bool:
+    """BSON type 15."""
+    return isinstance(v, Code) and v.scope is not None
+
+
 _TYPE_PREDS: dict[Any, Callable[[Any], bool]] = {
     1: lambda v: isinstance(v, float),
     "double": lambda v: isinstance(v, float),
-    2: lambda v: isinstance(v, str),
-    "string": lambda v: isinstance(v, str),
+    # `bson.Code` subclasses `str`, so a bare `isinstance(v, str)` matched a
+    # JavaScript value as a string -- and `javascript` matched nothing at all,
+    # because the table had no entry for it.
+    2: _is_bson_string,
+    "string": _is_bson_string,
     3: lambda v: isinstance(v, dict),
     "object": lambda v: isinstance(v, dict),
     4: lambda v: isinstance(v, list),
@@ -1401,6 +1420,19 @@ _TYPE_PREDS: dict[Any, Callable[[Any], bool]] = {
     "long": _is_int64,
     19: lambda v: isinstance(v, Decimal128),
     "decimal": lambda v: isinstance(v, Decimal128),
+    # These five aliases VALIDATED but had no predicate, so `_matches_type`
+    # fell through to `False` and the query silently matched nothing -- four
+    # whole BSON types were unreachable by `$type` (probed 8.2.11, 2026-09-01).
+    13: _is_javascript,
+    "javascript": _is_javascript,
+    15: _is_javascript_with_scope,
+    "javascriptWithScope": _is_javascript_with_scope,
+    17: lambda v: isinstance(v, Timestamp),
+    "timestamp": lambda v: isinstance(v, Timestamp),
+    -1: lambda v: isinstance(v, MinKey),
+    "minKey": lambda v: isinstance(v, MinKey),
+    127: lambda v: isinstance(v, MaxKey),
+    "maxKey": lambda v: isinstance(v, MaxKey),
     "number": _is_bson_number,
 }
 
