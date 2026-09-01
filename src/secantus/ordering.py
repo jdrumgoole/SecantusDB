@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from bson import Binary, Decimal128, MaxKey, MinKey, ObjectId, Regex, Timestamp
+from bson import Binary, Code, Decimal128, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
 from secantus.paths import get_path
 
@@ -46,6 +46,20 @@ def _bson_type_rank(value: Any) -> float:
     # expression relational operators started routing through this order.
     if isinstance(value, (int, float, Decimal128, Decimal)):
         return 3
+    # Before the `str` arm: `bson.Code` SUBCLASSES `str`, so an
+    # `isinstance(value, str)` test catches one and used to rank every
+    # JavaScript value among the strings. mongod ranks JavaScript between Regex
+    # and MaxKey -- probed 8.2.11 (2026-09-01): a mixed corpus sorts
+    # `... Timestamp < Regex < Code < MaxKey`.
+    #
+    # This must stay in step with `sortkey.RANK_JAVASCRIPT`: that encoder writes
+    # the rank byte PERSISTED index entries are sorted by, this function drives
+    # the in-memory sort, and moving one alone makes an index change the sort
+    # answer. They were changed together, and the index-entry format version was
+    # bumped so a store written before it is refused rather than read back in
+    # the old order.
+    if isinstance(value, Code):
+        return 12.5
     if isinstance(value, str):
         return 4
     if isinstance(value, Mapping):
@@ -86,7 +100,17 @@ class _SortKey:
             a, b = other.val, self.val
         else:
             a, b = self.val, other.val
-        if self._collation is not None and isinstance(a, str) and isinstance(b, str):
+        # `Code` passes `isinstance(str)` and is UNHASHABLE, so it reached the
+        # `lru_cache`d `sort_levels` and raised `TypeError: unhashable type` --
+        # which `dispatch` turned into `1 internal server error` for an ordinary
+        # collated sort over a collection holding a JavaScript value.
+        if (
+            self._collation is not None
+            and isinstance(a, str)
+            and isinstance(b, str)
+            and not isinstance(a, Code)
+            and not isinstance(b, Code)
+        ):
             from secantus.collation import sort_levels
 
             return sort_levels(a, self._collation) < sort_levels(b, self._collation)

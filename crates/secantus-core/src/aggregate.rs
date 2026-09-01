@@ -26,20 +26,19 @@ use crate::collation::Collation;
 use crate::numeric::{as_int_like, int_to_bson};
 use crate::{densify, expressions, fill, group, order, paths, query, windowfields};
 
-#[derive(Debug)]
-pub struct Fallback;
+pub use crate::fallback::Fallback;
 
 type R<T> = Result<T, Fallback>;
 
 fn evaluate(expr: &Bson, doc: &Document, vars: &Document) -> R<Bson> {
-    expressions::evaluate(doc, expr, vars).map_err(|_| Fallback)
+    expressions::evaluate(doc, expr, vars)
 }
 
 /// [`evaluate`] in *field-value* position: an absent field path yields the
 /// missing marker so `$project` / `$addFields` omit the key instead of writing
 /// null.
 fn evaluate_or_missing(expr: &Bson, doc: &Document, vars: &Document) -> R<Bson> {
-    expressions::evaluate_or_missing(doc, expr, vars).map_err(|_| Fallback)
+    expressions::evaluate_or_missing(doc, expr, vars)
 }
 
 pub fn apply_pipeline(
@@ -50,10 +49,10 @@ pub fn apply_pipeline(
 ) -> R<Vec<Document>> {
     for stage in pipeline {
         let Bson::Document(s) = stage else {
-            return Err(Fallback);
+            return Err(Fallback::Defer);
         };
         if s.len() != 1 {
-            return Err(Fallback); // Python raises; defer so it raises there
+            return Err(Fallback::Defer); // Python raises; defer so it raises there
         }
         let (name, spec) = s.iter().next().unwrap();
         docs = apply_stage(name, spec, docs, vars, coll)?;
@@ -71,11 +70,11 @@ fn apply_stage(
     match name {
         "$match" => {
             let Bson::Document(q) = spec else {
-                return Err(Fallback);
+                return Err(Fallback::Defer);
             };
             let mut out = Vec::new();
             for d in docs {
-                if query::matches(&d, q, vars, coll).map_err(|_| Fallback)? {
+                if query::matches(&d, q, vars, coll)? {
                     out.push(d);
                 }
             }
@@ -84,7 +83,7 @@ fn apply_stage(
         "$limit" => {
             let n = stage_nonneg_int(spec)?;
             if n == 0 {
-                return Err(Fallback); // Python raises 15958 "the limit must be positive"
+                return Err(Fallback::Defer); // Python raises 15958 "the limit must be positive"
             }
             docs.truncate(n);
             Ok(docs)
@@ -99,23 +98,23 @@ fn apply_stage(
         }
         "$count" => {
             let Bson::String(field) = spec else {
-                return Err(Fallback); // Python raises on non-string (40156)
+                return Err(Fallback::Defer); // Python raises on non-string (40156)
             };
             // empty (40157) / $-prefixed (40158) / dotted (40160) / "_id" (15948).
             if field.is_empty() || field.starts_with('$') || field.contains('.') || field == "_id" {
-                return Err(Fallback);
+                return Err(Fallback::Defer);
             }
             let mut out = Document::new();
             out.insert(
                 field.clone(),
-                int_to_bson(docs.len() as i128).ok_or(Fallback)?,
+                int_to_bson(docs.len() as i128).ok_or(Fallback::Defer)?,
             );
             Ok(vec![out])
         }
         "$project" => {
             let sd = spec_doc(spec)?;
             if sd.is_empty() {
-                return Err(Fallback); // Python raises 51272 (needs >= 1 field)
+                return Err(Fallback::Defer); // Python raises 51272 (needs >= 1 field)
             }
             map_docs(docs, |d| project_one(&d, sd, vars))
         }
@@ -131,29 +130,31 @@ fn apply_stage(
         }
         "$replaceRoot" => {
             let Bson::Document(s) = spec else {
-                return Err(Fallback);
+                return Err(Fallback::Defer);
             };
             let Some(new_root) = s.get("newRoot") else {
-                return Err(Fallback);
+                return Err(Fallback::Defer);
             };
             map_docs(docs, |d| replace_root_one(&d, new_root, vars))
         }
         "$replaceWith" => map_docs(docs, |d| replace_root_one(&d, spec, vars)),
         "$sort" => sort_stage(docs, spec),
         "$unwind" => unwind_stage(docs, spec),
-        "$group" => group::group_stage(spec, &docs, vars).map_err(|_| Fallback),
-        "$sortByCount" => group::sort_by_count_stage(spec, &docs, vars).map_err(|_| Fallback),
-        "$bucket" => group::bucket_stage(spec, &docs, vars).map_err(|_| Fallback),
-        "$bucketAuto" => group::bucket_auto_stage(spec, &docs, vars).map_err(|_| Fallback),
+        "$group" => group::group_stage(spec, &docs, vars).map_err(|_| Fallback::Defer),
+        "$sortByCount" => {
+            group::sort_by_count_stage(spec, &docs, vars).map_err(|_| Fallback::Defer)
+        }
+        "$bucket" => group::bucket_stage(spec, &docs, vars).map_err(|_| Fallback::Defer),
+        "$bucketAuto" => group::bucket_auto_stage(spec, &docs, vars).map_err(|_| Fallback::Defer),
         "$redact" => redact_stage(spec, docs, vars),
         "$facet" => facet_stage(spec, docs, vars, coll),
-        "$densify" => densify::densify_stage(spec, &docs).map_err(|_| Fallback),
-        "$fill" => fill::fill_stage(spec, docs, vars).map_err(|_| Fallback),
+        "$densify" => densify::densify_stage(spec, &docs).map_err(|_| Fallback::Defer),
+        "$fill" => fill::fill_stage(spec, docs, vars).map_err(|_| Fallback::Defer),
         "$setWindowFields" => {
-            windowfields::set_window_fields_stage(spec, docs, vars).map_err(|_| Fallback)
+            windowfields::set_window_fields_stage(spec, docs, vars).map_err(|_| Fallback::Defer)
         }
         // storage-backed ($lookup/$geoNear/$out/$merge) / $sample / … -> Python.
-        _ => Err(Fallback),
+        _ => Err(Fallback::Defer),
     }
 }
 
@@ -232,7 +233,7 @@ fn redact_subdoc(doc: &Document, spec: &Bson, vars: &Document) -> R<Option<Docum
         Decision::Descend => Ok(Some(redact_descend(doc, spec, vars)?)),
         // Nameable at the command layer as mongod's 17053 — see
         // [`redact_runtime_error`], which recovers the offending value.
-        Decision::Other(_) => Err(Fallback),
+        Decision::Other(_) => Err(Fallback::Defer),
     }
 }
 
@@ -772,23 +773,23 @@ fn facet_stage(
     coll: Option<&Collation>,
 ) -> R<Vec<Document>> {
     let Bson::Document(s) = spec else {
-        return Err(Fallback);
+        return Err(Fallback::Defer);
     };
     if s.is_empty() {
-        return Err(Fallback); // Python raises 40169 (must be a non-empty object)
+        return Err(Fallback::Defer); // Python raises 40169 (must be a non-empty object)
     }
     let n = s.len();
     let mut out = Document::new();
     for (i, (name, sub)) in s.iter().enumerate() {
         let Bson::Array(sub_pipeline) = sub else {
-            return Err(Fallback); // Python raises 40170 (entry must be an array)
+            return Err(Fallback::Defer); // Python raises 40170 (entry must be an array)
         };
         // Each stage must be a non-empty object and not a nested $facet — else
         // defer so Python raises 40171 / 40600.
         for stage in sub_pipeline {
             match stage {
                 Bson::Document(d) if !d.is_empty() && !d.contains_key("$facet") => {}
-                _ => return Err(Fallback),
+                _ => return Err(Fallback::Defer),
             }
         }
         // The last sub-pipeline can consume the input docs directly; earlier
@@ -814,10 +815,10 @@ fn facet_stage(
 /// floats, ...) defers.
 fn sort_fields(spec: &Bson) -> R<Vec<(String, bool)>> {
     let Bson::Document(d) = spec else {
-        return Err(Fallback);
+        return Err(Fallback::Defer);
     };
     if d.is_empty() {
-        return Err(Fallback); // Python raises 15976 (must have at least one key)
+        return Err(Fallback::Defer); // Python raises 15976 (must have at least one key)
     }
     let mut out = Vec::with_capacity(d.len());
     for (field, dir) in d {
@@ -833,7 +834,7 @@ fn sort_fields(spec: &Bson) -> R<Vec<(String, bool)>> {
         match n {
             Some(1) => out.push((field.clone(), false)),
             Some(-1) => out.push((field.clone(), true)),
-            _ => return Err(Fallback),
+            _ => return Err(Fallback::Defer),
         }
     }
     Ok(out)
@@ -850,11 +851,11 @@ fn sort_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
         for (path, rev) in &fields {
             let v = paths::get_path(&d, path).cloned().unwrap_or(Bson::Null);
             if !order::is_sortable(&v) {
-                return Err(Fallback);
+                return Err(Fallback::Defer);
             }
             // mongod sorts an array-valued field by one representative element:
             // its minimum ascending, its maximum descending.
-            keys.push(order::array_sort_value(v, *rev).ok_or(Fallback)?);
+            keys.push(order::array_sort_value(v, *rev).ok_or(Fallback::Defer)?);
         }
         keyed.push((keys, d));
     }
@@ -878,31 +879,31 @@ fn unwind_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
     let (path, preserve_null, include_index) = match spec {
         Bson::String(s) => {
             if !s.starts_with('$') {
-                return Err(Fallback); // bare path -> Python raises 28818
+                return Err(Fallback::Defer); // bare path -> Python raises 28818
             }
             (s.trim_start_matches('$').to_string(), false, None)
         }
         Bson::Document(d) => {
             let Some(Bson::String(raw)) = d.get("path") else {
-                return Err(Fallback); // non-string path -> Python raises 28808
+                return Err(Fallback::Defer); // non-string path -> Python raises 28808
             };
             if !raw.starts_with('$') {
-                return Err(Fallback); // bare path -> Python raises 28818
+                return Err(Fallback::Defer); // bare path -> Python raises 28818
             }
             let preserve = match d.get("preserveNullAndEmptyArrays") {
                 None => false,
                 Some(Bson::Boolean(b)) => *b,
-                _ => return Err(Fallback), // non-bool -> Python raises 28809
+                _ => return Err(Fallback::Defer), // non-bool -> Python raises 28809
             };
             let include = match d.get("includeArrayIndex") {
                 None | Some(Bson::Null) => None,
                 // A non-empty, non-`$`-prefixed string; else defer (28810 / 28822).
                 Some(Bson::String(s)) if !s.is_empty() && !s.starts_with('$') => Some(s.clone()),
-                _ => return Err(Fallback),
+                _ => return Err(Fallback::Defer),
             };
             (raw.trim_start_matches('$').to_string(), preserve, include)
         }
-        _ => return Err(Fallback),
+        _ => return Err(Fallback::Defer),
     };
 
     let mut out: Vec<Document> = Vec::new();
@@ -925,9 +926,9 @@ fn unwind_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
                 // doc's copy overwrites the field) doubled the per-element work.
                 for (i, elem) in arr.iter().enumerate() {
                     let mut new = doc.clone();
-                    paths::set_path(&mut new, &path, elem.clone()).map_err(|_| Fallback)?;
+                    paths::set_path(&mut new, &path, elem.clone()).map_err(|_| Fallback::Defer)?;
                     if let Some(idx) = &include_index {
-                        new.insert(idx.clone(), int_to_bson(i as i128).ok_or(Fallback)?);
+                        new.insert(idx.clone(), int_to_bson(i as i128).ok_or(Fallback::Defer)?);
                     }
                     out.push(new);
                 }
@@ -966,7 +967,7 @@ fn map_docs(docs: Vec<Document>, mut f: impl FnMut(Document) -> R<Document>) -> 
 fn spec_doc(spec: &Bson) -> R<&Document> {
     match spec {
         Bson::Document(d) => Ok(d),
-        _ => Err(Fallback),
+        _ => Err(Fallback::Defer),
     }
 }
 
@@ -987,12 +988,12 @@ fn stage_nonneg_int(spec: &Bson) -> R<usize> {
         // answers rows.
         Bson::Decimal128(d) => match d.to_string().parse::<f64>() {
             Ok(v) if v.is_finite() && v.fract() == 0.0 => v as i64,
-            _ => return Err(Fallback),
+            _ => return Err(Fallback::Defer),
         },
-        _ => return Err(Fallback), // bool / fractional / non-number
+        _ => return Err(Fallback::Defer), // bool / fractional / non-number
     };
     if n < 0 {
-        return Err(Fallback); // Python raises "Expected a non-negative number"
+        return Err(Fallback::Defer); // Python raises "Expected a non-negative number"
     }
     Ok(n as usize)
 }
@@ -1005,12 +1006,12 @@ fn unset_paths(spec: &Bson) -> R<Vec<String>> {
             for v in a {
                 match v {
                     Bson::String(s) => out.push(s.clone()),
-                    _ => return Err(Fallback),
+                    _ => return Err(Fallback::Defer),
                 }
             }
             Ok(out)
         }
-        _ => Err(Fallback),
+        _ => Err(Fallback::Defer),
     }
 }
 
@@ -1032,7 +1033,7 @@ fn add_fields_one(mut doc: Document, spec: &Document, vars: &Document) -> R<Docu
             paths::unset_path(&mut doc, path);
             continue;
         }
-        paths::set_path(&mut doc, path, v).map_err(|_| Fallback)?;
+        paths::set_path(&mut doc, path, v).map_err(|_| Fallback::Defer)?;
     }
     Ok(doc)
 }
@@ -1040,7 +1041,7 @@ fn add_fields_one(mut doc: Document, spec: &Document, vars: &Document) -> R<Docu
 fn replace_root_one(doc: &Document, expr: &Bson, vars: &Document) -> R<Document> {
     match evaluate(expr, doc, vars)? {
         Bson::Document(d) => Ok(d),
-        _ => Err(Fallback), // Python raises if newRoot isn't a document
+        _ => Err(Fallback::Defer), // Python raises if newRoot isn't a document
     }
 }
 
@@ -1101,7 +1102,7 @@ fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> 
     let has_inclusion = !inclusions.is_empty() || !computed.is_empty();
     let has_exclusion = !exclusions.is_empty();
     if has_inclusion && has_exclusion {
-        return Err(Fallback); // Python raises (mix of inclusion/exclusion)
+        return Err(Fallback::Defer); // Python raises (mix of inclusion/exclusion)
     }
 
     if has_inclusion {
@@ -1117,7 +1118,7 @@ fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> 
                 matches!(gp, Some(v) if !matches!(v, Bson::Null)) || path_present(doc, path);
             if present {
                 let v = gp.cloned().unwrap_or(Bson::Null);
-                paths::set_path(&mut result, path, v).map_err(|_| Fallback)?;
+                paths::set_path(&mut result, path, v).map_err(|_| Fallback::Defer)?;
             }
         }
         for (key, expr) in computed {
@@ -1127,7 +1128,7 @@ fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> 
             if matches!(v, Bson::Undefined) {
                 continue;
             }
-            paths::set_path(&mut result, key, v).map_err(|_| Fallback)?;
+            paths::set_path(&mut result, key, v).map_err(|_| Fallback::Defer)?;
         }
         return Ok(result);
     }

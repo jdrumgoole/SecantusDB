@@ -13,8 +13,7 @@ use bson::{Bson, Document};
 
 use crate::expressions;
 
-#[derive(Debug)]
-pub struct Fallback;
+pub use crate::fallback::Fallback;
 
 type R<T> = Result<T, Fallback>;
 
@@ -48,7 +47,7 @@ fn record_ambiguous(path: &str, segments: &[Bson], acc: &mut Acc) {
 }
 
 fn eq(a: &Bson, b: &Bson) -> R<bool> {
-    expressions::py_eq(a, b).map_err(|_| Fallback)
+    expressions::py_eq(a, b)
 }
 
 fn child_path(path: &str, key: &str) -> String {
@@ -218,7 +217,7 @@ fn elementwise_array_paths(update: &Document) -> BTreeMap<String, Option<BTreeSe
 }
 
 /// `{updatedFields, removedFields, truncatedArrays}` for `pre` -> `post`.
-/// `Err(Fallback)` => defer to the pure-Python implementation.
+/// `Err(Fallback::Defer)` => defer to the pure-Python implementation.
 pub fn compute_update_description(pre: &Document, post: &Document) -> R<Document> {
     compute_update_description_for(pre, post, None)
 }
@@ -267,7 +266,8 @@ pub fn compute_update_description_for(
 pub fn apply_update_description(mut doc: Document, diff: &Document) -> R<Document> {
     if let Ok(updated) = diff.get_document("updatedFields") {
         for (path, value) in updated {
-            crate::paths::set_path(&mut doc, path.as_str(), value.clone()).map_err(|_| Fallback)?;
+            crate::paths::set_path(&mut doc, path.as_str(), value.clone())
+                .map_err(|_| Fallback::Defer)?;
         }
     }
     if let Ok(removed) = diff.get_array("removedFields") {
@@ -299,7 +299,8 @@ pub fn apply_update_description(mut doc: Document, diff: &Document) -> R<Documen
                 _ => None,
             };
             if let Some(a) = shorter {
-                crate::paths::set_path(&mut doc, field, Bson::Array(a)).map_err(|_| Fallback)?;
+                crate::paths::set_path(&mut doc, field, Bson::Array(a))
+                    .map_err(|_| Fallback::Defer)?;
             }
         }
     }

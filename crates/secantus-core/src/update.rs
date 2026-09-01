@@ -31,8 +31,7 @@ use crate::numeric::{as_float_like, as_int_like, int_promoted_to_bson, is_int64}
 use crate::paths::{self, get_path, has_path};
 use crate::{expressions, query};
 
-#[derive(Debug)]
-pub struct Fallback;
+pub use crate::fallback::Fallback;
 
 type R<T> = Result<T, Fallback>;
 
@@ -276,7 +275,7 @@ fn walk_positional(
         let idx = match idx {
             Some(i) if i >= 0 && (i as usize) < arr.len() => i as usize,
             // Unresolvable `$` — Python raises; we defer (server → BadValue).
-            _ => return Err(Fallback),
+            _ => return Err(Fallback::Defer),
         };
         prefix.push(idx.to_string());
         walk_positional(&arr[idx], rest, prefix, out, filters, pos)?;
@@ -291,11 +290,11 @@ fn walk_positional(
     } else if head.starts_with("$[") && head.ends_with(']') {
         let name = &head[2..head.len() - 1];
         let Bson::Array(arr) = cur else { return Ok(()) };
-        let sub = filters.get(name).ok_or(Fallback)?;
+        let sub = filters.get(name).ok_or(Fallback::Defer)?;
         for (i, elem) in arr.iter().enumerate() {
             let mut elem_doc = Document::new();
             elem_doc.insert(name.to_string(), elem.clone());
-            if query::matches(&elem_doc, sub, &Document::new(), None).map_err(|_| Fallback)? {
+            if query::matches(&elem_doc, sub, &Document::new(), None)? {
                 prefix.push(i.to_string());
                 walk_positional(elem, rest, prefix, out, filters, pos)?;
                 prefix.pop();
@@ -330,9 +329,9 @@ fn set_path(doc: &mut Document, path: &str, value: Bson) -> R<()> {
     // nothing. Defer: the Python engine raises the exact error, and the
     // standalone Rust server names it via `path_not_viable_error`.
     if paths::path_block(doc, path).is_some() {
-        return Err(Fallback);
+        return Err(Fallback::Defer);
     }
-    paths::set_path(doc, path, value).map_err(|_| Fallback)
+    paths::set_path(doc, path, value).map_err(|_| Fallback::Defer)
 }
 
 use crate::paths::unset_path;
@@ -348,22 +347,22 @@ fn arith(current: &Bson, operand: &Bson, mul: bool) -> R<Bson> {
     // Rust server surfaces a generic BadValue — the standing update error-code
     // gap. String / null operands already fall through to Fallback below.)
     if matches!(operand, Bson::Boolean(_)) {
-        return Err(Fallback);
+        return Err(Fallback::Defer);
     }
     // Decimal dominates the widening order (int32 < int64 < double < decimal),
     // so either side being decimal puts the whole operation in the decimal
     // domain — computed exactly at decimal128's 34 digits, quantum preserved.
     if matches!(current, Bson::Decimal128(_)) || matches!(operand, Bson::Decimal128(_)) {
         let (a, b) = (
-            decimal::from_bson(current).ok_or(Fallback)?,
-            decimal::from_bson(operand).ok_or(Fallback)?,
+            decimal::from_bson(current).ok_or(Fallback::Defer)?,
+            decimal::from_bson(operand).ok_or(Fallback::Defer)?,
         );
         let r = if mul {
             decimal::mul(&a, &b)
         } else {
             decimal::add(&a, &b)
         };
-        return decimal::to_bson(&r.ok_or(Fallback)?).ok_or(Fallback);
+        return decimal::to_bson(&r.ok_or(Fallback::Defer)?).ok_or(Fallback::Defer);
     }
     if let (Some(a), Some(b)) = (as_int_like(current), as_int_like(operand)) {
         let r = if mul {
@@ -374,11 +373,11 @@ fn arith(current: &Bson, operand: &Bson, mul: bool) -> R<Bson> {
         // MongoDB promotes the result to int64 if either operand is already
         // int64 (or a 32-bit result would overflow) — matching `numerics.bson_*`.
         let wide = is_int64(current) || is_int64(operand);
-        return int_promoted_to_bson(r.ok_or(Fallback)?, wide).ok_or(Fallback);
+        return int_promoted_to_bson(r.ok_or(Fallback::Defer)?, wide).ok_or(Fallback::Defer);
     }
     // Float path: any non-numeric operand (current/operand) makes Python raise.
-    let a = as_float_like(current).ok_or(Fallback)?;
-    let b = as_float_like(operand).ok_or(Fallback)?;
+    let a = as_float_like(current).ok_or(Fallback::Defer)?;
+    let b = as_float_like(operand).ok_or(Fallback::Defer)?;
     Ok(Bson::Double(if mul { a * b } else { a + b }))
 }
 
@@ -404,7 +403,7 @@ fn current_or_zero(result: &Document, path: &str) -> R<Bson> {
             Ok(get_path(result, path).expect("just matched").clone())
         }
         // Bson::Boolean lands here deliberately: it is not numeric for arithmetic.
-        Some(_) => Err(Fallback),
+        Some(_) => Err(Fallback::Defer),
     }
 }
 
@@ -413,7 +412,7 @@ fn current_or_zero(result: &Document, path: &str) -> R<Bson> {
 fn payload_doc(payload: &Bson) -> R<&Document> {
     match payload {
         Bson::Document(d) => Ok(d),
-        _ => Err(Fallback),
+        _ => Err(Fallback::Defer),
     }
 }
 
@@ -433,12 +432,12 @@ fn push_apply(arr: &mut Vec<Bson>, value: &Bson) -> R<()> {
     for k in m.keys() {
         match k.as_str() {
             "$each" | "$position" | "$slice" | "$sort" => {}
-            _ => return Err(Fallback), // unknown modifier -> Python raises
+            _ => return Err(Fallback::Defer), // unknown modifier -> Python raises
         }
     }
     let each = match m.get("$each") {
         Some(Bson::Array(a)) => a,
-        _ => return Err(Fallback),
+        _ => return Err(Fallback::Defer),
     };
     match m.get("$position") {
         None => arr.extend(each.iter().cloned()),
@@ -446,9 +445,9 @@ fn push_apply(arr: &mut Vec<Bson>, value: &Bson) -> R<()> {
             // A bool $position is a parse error in mongod (code 2), not index 1
             // — `as_int_like` would coerce it, so guard first.
             if matches!(p, Bson::Boolean(_)) {
-                return Err(Fallback);
+                return Err(Fallback::Defer);
             }
-            let n = as_int_like(p).ok_or(Fallback)?;
+            let n = as_int_like(p).ok_or(Fallback::Defer)?;
             let idx = if n >= 0 {
                 (n as usize).min(arr.len())
             } else {
@@ -466,9 +465,9 @@ fn push_apply(arr: &mut Vec<Bson>, value: &Bson) -> R<()> {
     if let Some(s) = m.get("$slice") {
         // A bool $slice is a parse error in mongod (code 2), not "keep 1".
         if matches!(s, Bson::Boolean(_)) {
-            return Err(Fallback);
+            return Err(Fallback::Defer);
         }
-        let n = as_int_like(s).ok_or(Fallback)?;
+        let n = as_int_like(s).ok_or(Fallback::Defer)?;
         if n == 0 {
             arr.clear();
         } else if n > 0 {
@@ -513,9 +512,9 @@ fn push_sort(arr: &mut [Bson], spec: &Bson) -> R<()> {
     }
     match spec {
         Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => {
-            let dir = dir_pm1(spec).ok_or(Fallback)?;
+            let dir = dir_pm1(spec).ok_or(Fallback::Defer)?;
             if !arr.iter().all(crate::order::is_sortable) {
-                return Err(Fallback);
+                return Err(Fallback::Defer);
             }
             if dir == -1 {
                 arr.sort_by(|a, b| crate::order::cmp(b, a));
@@ -526,14 +525,14 @@ fn push_sort(arr: &mut [Bson], spec: &Bson) -> R<()> {
         Bson::Document(spec_doc) => {
             let fields: Vec<(&String, i128)> = spec_doc
                 .iter()
-                .map(|(f, d)| dir_pm1(d).map(|di| (f, di)).ok_or(Fallback))
+                .map(|(f, d)| dir_pm1(d).map(|di| (f, di)).ok_or(Fallback::Defer))
                 .collect::<R<Vec<_>>>()?;
             for (field, _) in &fields {
                 if !arr
                     .iter()
                     .all(|e| crate::order::is_sortable(&key_of(e, field)))
                 {
-                    return Err(Fallback);
+                    return Err(Fallback::Defer);
                 }
             }
             // Stable field-by-field, applied in reverse spec order (Python parity).
@@ -548,7 +547,7 @@ fn push_sort(arr: &mut [Bson], spec: &Bson) -> R<()> {
                 });
             }
         }
-        _ => return Err(Fallback), // non-int / non-doc $sort -> Python raises
+        _ => return Err(Fallback::Defer), // non-int / non-doc $sort -> Python raises
     }
     Ok(())
 }
@@ -564,18 +563,16 @@ fn pull_matches(element: &Bson, criterion: &Bson) -> R<bool> {
         Bson::Document(c) if !c.is_empty() && c.keys().all(|k| k.starts_with('$')) => {
             let d = doc! { "__e": element.clone() };
             let q = doc! { "__e": criterion.clone() };
-            crate::query::matches(&d, &q, &Document::new(), None).map_err(|_| Fallback)
+            crate::query::matches(&d, &q, &Document::new(), None)
         }
         Bson::Document(c) => match element {
-            Bson::Document(ed) => {
-                crate::query::matches(ed, c, &Document::new(), None).map_err(|_| Fallback)
-            }
+            Bson::Document(ed) => crate::query::matches(ed, c, &Document::new(), None),
             _ => Ok(false),
         },
         _ => {
             let d = doc! { "__e": element.clone() };
             let q = doc! { "__e": criterion.clone() };
-            crate::query::matches(&d, &q, &Document::new(), None).map_err(|_| Fallback)
+            crate::query::matches(&d, &q, &Document::new(), None)
         }
     }
 }
@@ -627,7 +624,7 @@ fn apply_op(
                     let mut a = match get_path(result, &cpath).cloned() {
                         None | Some(Bson::Null) => Vec::new(),
                         Some(Bson::Array(a)) => a,
-                        Some(_) => return Err(Fallback), // $push on non-array -> Python raises
+                        Some(_) => return Err(Fallback::Defer), // $push on non-array -> Python raises
                     };
                     push_apply(&mut a, value)?;
                     set_path(result, &cpath, Bson::Array(a))?;
@@ -644,7 +641,7 @@ fn apply_op(
                     // reported success. Defer so Python raises the exact error.
                     if let Some(v) = get_path(result, &cpath) {
                         if !matches!(v, Bson::Array(_)) {
-                            return Err(Fallback);
+                            return Err(Fallback::Defer);
                         }
                     }
                     if let Some(Bson::Array(a)) = get_path(result, &cpath) {
@@ -658,7 +655,7 @@ fn apply_op(
                         // the old `_ => continue` silently no-op'd a bad value;
                         // defer so the Python oracle raises the exact error.
                         if matches!(dir, Bson::Boolean(_)) {
-                            return Err(Fallback);
+                            return Err(Fallback::Defer);
                         }
                         match as_int_like(dir) {
                             Some(1) => {
@@ -667,7 +664,7 @@ fn apply_op(
                             Some(-1) => {
                                 a.remove(0);
                             }
-                            _ => return Err(Fallback),
+                            _ => return Err(Fallback::Defer),
                         }
                         set_path(result, &cpath, Bson::Array(a))?;
                     }
@@ -678,27 +675,27 @@ fn apply_op(
             for (old, new) in payload {
                 let new = match new {
                     Bson::String(s) => s.as_str(),
-                    _ => return Err(Fallback),
+                    _ => return Err(Fallback::Defer),
                 };
                 // $rename doesn't support positional tokens (mongod rejects);
                 // defer the rare case to keep semantics exact.
                 if has_positional(old) || has_positional(new) {
-                    return Err(Fallback);
+                    return Err(Fallback::Defer);
                 }
                 if old == "_id" || new == "_id" {
-                    return Err(Fallback); // immutable _id -> Python raises
+                    return Err(Fallback::Defer); // immutable _id -> Python raises
                 }
                 // mongod validation (Python raises 56 / 2; the Rust server renders
                 // BadValue). These previously silently corrupted the array or
                 // created a bad field.
                 if old.is_empty() || new.is_empty() {
-                    return Err(Fallback); // empty path -> Python raises 56
+                    return Err(Fallback::Defer); // empty path -> Python raises 56
                 }
                 if old == new || rename_same_path(old, new) {
-                    return Err(Fallback); // differ / same path -> Python raises 2
+                    return Err(Fallback::Defer); // differ / same path -> Python raises 2
                 }
                 if rename_traverses_array(result, old) || rename_traverses_array(result, new) {
-                    return Err(Fallback); // array element -> Python raises 2
+                    return Err(Fallback::Defer); // array element -> Python raises 2
                 }
                 if has_path(result, old) {
                     let value = get_path(result, old).unwrap().clone();
@@ -713,18 +710,18 @@ fn apply_op(
                 // listed operation to the field in order (e.g. (v & X) | Y).
                 let ops = match ops {
                     Bson::Document(d) if !d.is_empty() => d,
-                    _ => return Err(Fallback), // empty / non-doc -> Python raises
+                    _ => return Err(Fallback::Defer), // empty / non-doc -> Python raises
                 };
                 let mut parsed: Vec<(&str, i64)> = Vec::with_capacity(ops.len());
                 for (bit_op, mask_b) in ops {
                     let op_s = bit_op.as_str();
                     if !matches!(op_s, "and" | "or" | "xor") {
-                        return Err(Fallback); // unknown sub-op -> Python raises
+                        return Err(Fallback::Defer); // unknown sub-op -> Python raises
                     }
                     let mask = match mask_b {
                         Bson::Int32(n) => *n as i64,
                         Bson::Int64(n) => *n,
-                        _ => return Err(Fallback), // non-integer mask -> Python raises
+                        _ => return Err(Fallback::Defer), // non-integer mask -> Python raises
                     };
                     parsed.push((op_s, mask));
                 }
@@ -733,7 +730,7 @@ fn apply_op(
                         None | Some(Bson::Null) => 0i64,
                         Some(Bson::Int32(n)) => *n as i64,
                         Some(Bson::Int64(n)) => *n,
-                        Some(_) => return Err(Fallback), // $bit on non-integer -> Python raises
+                        Some(_) => return Err(Fallback::Defer), // $bit on non-integer -> Python raises
                     };
                     for (bit_op, mask) in &parsed {
                         cur = match *bit_op {
@@ -774,7 +771,7 @@ fn apply_op(
                             };
                             match lt {
                                 Some(l) => l,
-                                None => return Err(Fallback),
+                                None => return Err(Fallback::Defer),
                             }
                         }
                     };
@@ -790,7 +787,7 @@ fn apply_op(
                 let items: Vec<Bson> = match value {
                     Bson::Document(d) if d.contains_key("$each") => match d.get("$each") {
                         Some(Bson::Array(a)) => a.clone(),
-                        _ => return Err(Fallback), // $each not an array -> Python raises
+                        _ => return Err(Fallback::Defer), // $each not an array -> Python raises
                     },
                     _ => vec![value.clone()],
                 };
@@ -798,7 +795,7 @@ fn apply_op(
                     let mut a = match get_path(result, &cpath).cloned() {
                         None | Some(Bson::Null) => Vec::new(),
                         Some(Bson::Array(a)) => a,
-                        Some(_) => return Err(Fallback), // non-array -> Python raises
+                        Some(_) => return Err(Fallback::Defer), // non-array -> Python raises
                     };
                     for item in &items {
                         // mongod's `$addToSet` membership test is field-ORDER-
@@ -821,11 +818,11 @@ fn apply_op(
                         // bool separately and walks document pairs in order.
                         let tricky = |v: &Bson| matches!(v, Bson::Document(_) | Bson::Boolean(_));
                         if tricky(item) || a.iter().any(tricky) {
-                            return Err(Fallback);
+                            return Err(Fallback::Defer);
                         }
                         let mut present = false;
                         for e in &a {
-                            if expressions::py_eq(e, item).map_err(|_| Fallback)? {
+                            if expressions::py_eq(e, item)? {
                                 present = true;
                                 break;
                             }
@@ -855,7 +852,7 @@ fn apply_op(
                             }
                             set_path(result, &cpath, Bson::Array(kept))?;
                         }
-                        Some(_) => return Err(Fallback),
+                        Some(_) => return Err(Fallback::Defer),
                         None => {}
                     }
                 }
@@ -864,7 +861,7 @@ fn apply_op(
         "$pullAll" => {
             for (path, values) in payload {
                 let Bson::Array(vals) = values else {
-                    return Err(Fallback); // non-array arg -> Python raises
+                    return Err(Fallback::Defer); // non-array arg -> Python raises
                 };
                 for cpath in expand_path(result, path, filters, pos)? {
                     // Remove every element equal to any listed value (literal
@@ -876,7 +873,7 @@ fn apply_op(
                             for e in a {
                                 let mut drop = false;
                                 for v in vals {
-                                    if expressions::py_eq(&e, v).map_err(|_| Fallback)? {
+                                    if expressions::py_eq(&e, v)? {
                                         drop = true;
                                         break;
                                     }
@@ -887,19 +884,19 @@ fn apply_op(
                             }
                             set_path(result, &cpath, Bson::Array(kept))?;
                         }
-                        Some(_) => return Err(Fallback),
+                        Some(_) => return Err(Fallback::Defer),
                         None => {}
                     }
                 }
             }
         }
         // $currentDate (non-deterministic) and unknown ops -> Python.
-        _ => return Err(Fallback),
+        _ => return Err(Fallback::Defer),
     }
     Ok(())
 }
 
-/// Apply an operator/replacement update document. `Err(Fallback)` => defer to
+/// Apply an operator/replacement update document. `Err(Fallback::Defer)` => defer to
 /// the pure-Python `apply_update` (which also raises the right errors).
 pub fn apply_update(doc: &Document, update: &Document, is_upsert: bool) -> R<Document> {
     apply_update_with(doc, update, is_upsert, &[], &Document::new())
@@ -923,19 +920,19 @@ pub fn apply_update_with(
     // here silently kept every field the client asked to drop. An empty
     // *pipeline* is the genuine no-op, and is a different entry point.
     if !array_filters_valid(array_filters, update) {
-        return Err(Fallback); // invalid arrayFilters -> Python raises the exact code
+        return Err(Fallback::Defer); // invalid arrayFilters -> Python raises the exact code
     }
     // An update whose operators touch overlapping paths is rejected by mongod
     // (code 40) rather than applied. Defer so the Python engine raises the exact
     // error; the Rust server names it via `path_conflict_error` (it has no
     // Python to fall back to).
     if conflicting_update_paths(update).is_some() {
-        return Err(Fallback);
+        return Err(Fallback::Defer);
     }
     let has_op = update.keys().any(|k| k.starts_with('$'));
     if has_op {
         if !update.keys().all(|k| k.starts_with('$')) {
-            return Err(Fallback); // mixing operators with fields -> Python raises
+            return Err(Fallback::Defer); // mixing operators with fields -> Python raises
         }
         let filters = index_array_filters(array_filters);
         let mut result = doc.clone();
@@ -948,7 +945,7 @@ pub fn apply_update_with(
         // _id is immutable: a changed _id is an error (let Python raise).
         if let Some(orig) = doc.get("_id") {
             if result.get("_id") != Some(orig) {
-                return Err(Fallback);
+                return Err(Fallback::Defer);
             }
         }
         Ok(result)
@@ -957,7 +954,7 @@ pub fn apply_update_with(
         let mut new = update.clone();
         if let Some(orig) = doc.get("_id") {
             match new.get("_id") {
-                Some(v) if v != orig => return Err(Fallback), // changed _id -> Python raises
+                Some(v) if v != orig => return Err(Fallback::Defer), // changed _id -> Python raises
                 _ => {
                     // `_id` leads the stored document, as it does in mongod.
                     // `insert` on a Document APPENDS when the key is absent,

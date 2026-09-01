@@ -28,7 +28,15 @@ const RANK_BOOL: u8 = 9;
 const RANK_DATE: u8 = 10;
 const RANK_TIMESTAMP: u8 = 11;
 const RANK_REGEX: u8 = 12;
-const RANK_MAXKEY: u8 = 13;
+/// JavaScript is its OWN type to mongod, which sorts it between Regex and
+/// MaxKey (probed 8.2.11, 2026-09-01). It used to share `RANK_STRING`, because
+/// `bson.Code` subclasses `str` in pymongo and the Python encoder this mirrors
+/// caught one with an `isinstance(value, str)` test. Must stay in step with
+/// `order::type_rank`: this writes the rank byte persisted index entries are
+/// sorted by, that drives the in-memory sort, and moving one alone makes an
+/// index change the sort answer.
+const RANK_JAVASCRIPT: u8 = 13;
+const RANK_MAXKEY: u8 = 14;
 
 const NUM_NAN: u8 = 0x00;
 const NUM_NEG_INF: u8 = 0x20;
@@ -243,10 +251,7 @@ pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, Unsup
             out.push(RANK_NUMBER);
             out.extend(encode_number(v));
         }
-        // `bson.Code` subclasses `str` in pymongo, so Python's sortkey ranks it as
-        // a string (RANK_STRING) — mirror that so a `Code` value can serve as an
-        // `_id` / index key (mongo-php-driver getUpsertedIds upserts a Code `_id`).
-        Bson::String(s) | Bson::JavaScriptCode(s) => {
+        Bson::String(s) => {
             out.push(RANK_STRING);
             let bytes = match coll {
                 Some(c) => collation::normalize_index_bytes(s, c)
@@ -254,6 +259,17 @@ pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, Unsup
                 None => s.as_bytes().to_vec(),
             };
             out.extend(escape(&bytes));
+        }
+        // A collation has nothing to say about JavaScript, so it is deliberately
+        // not applied here (mongod compares code text directly). A with-scope
+        // Code orders by its code text; mongod ignores the scope for ordering.
+        Bson::JavaScriptCode(s) => {
+            out.push(RANK_JAVASCRIPT);
+            out.extend(escape(s.as_bytes()));
+        }
+        Bson::JavaScriptCodeWithScope(c) => {
+            out.push(RANK_JAVASCRIPT);
+            out.extend(escape(c.code.as_bytes()));
         }
         Bson::Document(d) => {
             out.push(RANK_DOCUMENT);

@@ -500,12 +500,12 @@ fn reject_legacy_index_entry_format(session: &Session) -> Result<()> {
                 .ok()
                 .and_then(|o| o.get_i32("entryFormat").ok())
                 .unwrap_or(1);
-            if fmt < ENTRY_FORMAT_RECORDID {
+            if fmt < ENTRY_FORMAT {
                 return Err(StorageError::Internal(format!(
                     "SecantusDB storage at this path has index entries written by a \
                      build before the RecordId index-entry change: index '{name}' on \
                      '{db}.{coll}' is entryFormat {fmt}, but this build requires \
-                     {ENTRY_FORMAT_RECORDID}. There is no in-place upgrade (pre-1.0 \
+                     {ENTRY_FORMAT}. There is no in-place upgrade (pre-1.0 \
                      beta, no migration) — start from a fresh data directory, drop and \
                      recreate the indexes, or downgrade to the build that wrote it."
                 )));
@@ -1444,6 +1444,16 @@ pub enum StorageError {
     /// (the `matches` "defer to Python" signal). The server's engine selection
     /// is responsible for not routing such queries to the Rust storage.
     QueryUnsupported,
+    /// A query filter the Rust engine REFUSES, with mongod's own code and
+    /// message -- `{v: {$gt: /re/}}` is BadValue "Can't have RegEx as arg to a
+    /// non-equality predicate", not an unsupported construct. Same reason
+    /// `UpdatePathNotViable` above exists: without a variant that carries the
+    /// error, the refusal collapses into the generic BadValue (2) "not
+    /// supported by the Rust server", which tells the caller the wrong thing.
+    QueryError {
+        code: i32,
+        errmsg: String,
+    },
     /// A multi-document transaction's buffered write volume exceeded the
     /// cache-derived dirty budget (see `Storage::txn_dirty_limit`). Raised
     /// BEFORE the transaction can pin enough unevictable dirty content to
@@ -1474,6 +1484,18 @@ pub enum StorageError {
     ImmutableField,
 }
 
+/// Map a query-engine fault to a storage error, keeping mongod's code and
+/// message when the engine named one.
+pub(crate) fn query_fault(fault: secantus_core::fallback::Fallback) -> StorageError {
+    match fault.as_mongo() {
+        Some((code, errmsg)) => StorageError::QueryError {
+            code,
+            errmsg: errmsg.to_string(),
+        },
+        None => StorageError::QueryUnsupported,
+    }
+}
+
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1496,6 +1518,7 @@ impl std::fmt::Display for StorageError {
             StorageError::QueryUnsupported => {
                 write!(f, "query construct not supported by the Rust query engine")
             }
+            StorageError::QueryError { errmsg, .. } => write!(f, "{errmsg}"),
             StorageError::TransactionTooLargeForCache => write!(
                 f,
                 "Transaction is too large and will not fit in the storage engine cache"
@@ -1821,12 +1844,21 @@ fn escape_kb(kb: &[u8]) -> Vec<u8> {
 }
 
 /// On-disk index-ENTRY format version, recorded per index as
-/// `options.entryFormat` in the index catalog. 1 (implicit, absent) = step-1
-/// entries whose trailing half is the doc's `id_key`; 2 = step-2 entries whose
-/// trailing half is the 8-byte RecordId. The catalog is the only place this is
-/// visible — the WT `key_format` is `SSSu` either way — so an absent marker is
-/// how a legacy store is detected (`reject_legacy_index_entry_format`).
-const ENTRY_FORMAT_RECORDID: i32 = 2;
+/// `options.entryFormat` in the index catalog:
+///
+/// * 1 (implicit, absent) — entries whose trailing half is the doc's `id_key`.
+/// * 2 — entries whose trailing half is the 8-byte RecordId.
+/// * 3 — `sortkey` gives JavaScript its own type rank (13) instead of the
+///   string rank, which shifts MaxKey from 13 to 14. Every key byte for a
+///   JavaScript or MaxKey value therefore changes. A version-2 store would read
+///   back in the OLD order, and since `order::type_rank` moved with it, the
+///   index and a collection scan would disagree — an index that changes the
+///   sort answer.
+///
+/// The catalog is the only place this is visible — the WT `key_format` is
+/// `SSSu` for all three — so the marker is how an older store is detected
+/// (`reject_legacy_index_entry_format`). Mirrors the Python `_ENTRY_FORMAT`.
+const ENTRY_FORMAT: i32 = 3;
 
 /// Pack an index-entry payload into a single trailing `u` column:
 /// `escape(kb) + b"\x00\x00" + RecordId(8B big-endian)`. WiredTiger
@@ -1834,7 +1866,7 @@ const ENTRY_FORMAT_RECORDID: i32 = 2;
 /// order — so both halves live in one column and the B-tree sorts by
 /// `escape(kb)` first, then by RecordId.
 ///
-/// **Step 2 format (`ENTRY_FORMAT_RECORDID`).** The trailing half used to be the
+/// **Step 2 format (`ENTRY_FORMAT` 2).** The trailing half used to be the
 /// doc's `id_key`, which made an IXSCAN fetch pay `id_key → _id index → RecordId
 /// → doc`. Storing the RecordId directly drops that hop (measured at +14.7% on
 /// `find_indexed_range` — see `tasks/rust-recordid-plan.md`). Big-endian is
@@ -4924,8 +4956,7 @@ impl Storage {
         for (_seq, blob) in rows {
             let d = decode_doc(&blob)?;
             if filter.is_empty()
-                || query_matches(&d, filter, vars, coll_opt)
-                    .map_err(|_| StorageError::QueryUnsupported)?
+                || query_matches(&d, filter, vars, coll_opt).map_err(query_fault)?
             {
                 out.push((d, blob));
             }
@@ -8034,7 +8065,7 @@ impl Storage {
         // step-1 ones. Not a user option: `listIndexes` strips it (like
         // `multikey`), and the options-conflict check compares only the
         // enumerated user-facing options, so it never provokes a false conflict.
-        stored_options.insert("entryFormat", ENTRY_FORMAT_RECORDID);
+        stored_options.insert("entryFormat", ENTRY_FORMAT);
         let entries: Vec<(Vec<u8>, i64)> = if let Some(geo) = &geo {
             // 2d geo index: one geohash cell per point-valued doc. Always flagged
             // multikey so the regular (numeric) pickers skip it.
@@ -8088,9 +8119,7 @@ impl Storage {
             for (rid, _id_k, blob) in self.scan_docs(session, db, coll)? {
                 let d = decode_doc(&blob)?;
                 if let Some(pf) = &partial {
-                    if !query_matches(&d, pf, &Document::new(), None)
-                        .map_err(|_| StorageError::QueryUnsupported)?
-                    {
+                    if !query_matches(&d, pf, &Document::new(), None).map_err(query_fault)? {
                         continue;
                     }
                 }
@@ -9194,8 +9223,7 @@ impl Storage {
     fn doc_in_partial(&self, doc: &Document, desc: &IndexDesc) -> Result<bool> {
         match &desc.partial {
             None => Ok(true),
-            Some(pf) => query_matches(doc, pf, &Document::new(), None)
-                .map_err(|_| StorageError::QueryUnsupported),
+            Some(pf) => query_matches(doc, pf, &Document::new(), None).map_err(query_fault),
         }
     }
 
@@ -9871,7 +9899,7 @@ impl Storage {
                 let raw = bson::RawDocument::from_bytes(&blob)
                     .map_err(|_| StorageError::QueryUnsupported)?;
                 if secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
-                    .map_err(|_| StorageError::QueryUnsupported)?
+                    .map_err(query_fault)?
                 {
                     out.push(blob);
                 }
@@ -9976,7 +10004,7 @@ impl Storage {
                 let raw = bson::RawDocument::from_bytes(&blob)
                     .map_err(|_| StorageError::QueryUnsupported)?;
                 if secantus_core::query::matches_raw(raw, filter, &vars, coll_opt)
-                    .map_err(|_| StorageError::QueryUnsupported)?
+                    .map_err(query_fault)?
                 {
                     n += 1;
                 }
@@ -10160,7 +10188,7 @@ impl Storage {
                     let_vars,
                     None,
                 )
-                .map_err(|_| StorageError::QueryUnsupported)?;
+                .map_err(query_fault)?;
                 let mut new = out
                     .into_iter()
                     .next()
@@ -10291,7 +10319,7 @@ impl Storage {
                     let raw = bson::RawDocument::from_bytes(&blob)
                         .map_err(|_| StorageError::QueryUnsupported)?;
                     if secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
-                        .map_err(|_| StorageError::QueryUnsupported)?
+                        .map_err(query_fault)?
                     {
                         rids.push(recordid);
                     }
@@ -10418,7 +10446,7 @@ impl Storage {
             let raw =
                 bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
             if !secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
-                .map_err(|_| StorageError::QueryUnsupported)?
+                .map_err(query_fault)?
             {
                 continue;
             }
@@ -10469,7 +10497,7 @@ impl Storage {
                         "diff",
                         Bson::Document(
                             compute_update_description_for(&doc, &new, update_spec)
-                                .map_err(|_| StorageError::QueryUnsupported)?,
+                                .map_err(query_fault)?,
                         ),
                     );
                     o_owned = encode_doc(&o)?;
@@ -10550,7 +10578,7 @@ impl Storage {
                     let raw = bson::RawDocument::from_bytes(&blob)
                         .map_err(|_| StorageError::QueryUnsupported)?;
                     if !secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
-                        .map_err(|_| StorageError::QueryUnsupported)?
+                        .map_err(query_fault)?
                     {
                         continue;
                     }
@@ -10621,7 +10649,7 @@ impl Storage {
                                     "diff",
                                     Bson::Document(
                                         compute_update_description_for(&doc, &new, update_spec)
-                                            .map_err(|_| StorageError::QueryUnsupported)?,
+                                            .map_err(query_fault)?,
                                     ),
                                 );
                                 o_owned = encode_doc(&o)?;
@@ -10773,7 +10801,7 @@ impl Storage {
                 let raw = bson::RawDocument::from_bytes(&blob)
                     .map_err(|_| StorageError::QueryUnsupported)?;
                 if secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt)
-                    .map_err(|_| StorageError::QueryUnsupported)?
+                    .map_err(query_fault)?
                 {
                     rids.push(recordid);
                 }
@@ -10854,7 +10882,7 @@ impl Storage {
             let raw =
                 bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
             if !secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt)
-                .map_err(|_| StorageError::QueryUnsupported)?
+                .map_err(query_fault)?
             {
                 continue;
             }
@@ -10933,7 +10961,7 @@ impl Storage {
                     let raw = bson::RawDocument::from_bytes(&blob)
                         .map_err(|_| StorageError::QueryUnsupported)?;
                     if !secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt)
-                        .map_err(|_| StorageError::QueryUnsupported)?
+                        .map_err(query_fault)?
                     {
                         continue;
                     }
@@ -12749,10 +12777,7 @@ mod tests {
             c.search().unwrap();
             let mut d = decode_doc(&c.get_value_u().unwrap()).unwrap();
             let mut opts = d.get_document("options").cloned().unwrap_or_default();
-            assert_eq!(
-                opts.get_i32("entryFormat").ok(),
-                Some(ENTRY_FORMAT_RECORDID)
-            );
+            assert_eq!(opts.get_i32("entryFormat").ok(), Some(ENTRY_FORMAT));
             opts.remove("entryFormat");
             d.insert("options", Bson::Document(opts));
             c.reset().unwrap();

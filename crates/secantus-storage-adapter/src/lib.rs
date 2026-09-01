@@ -888,6 +888,9 @@ fn map_err(e: WtError) -> StorageError {
             code: 2,
             errmsg: "query uses a construct the Rust server does not support".to_string(),
         },
+        // The engine named mongod's error; pass it through rather than
+        // reporting an unsupported construct.
+        WtError::QueryError { code, errmsg } => StorageError::WriteError { code, errmsg },
         WtError::UnsupportedId => StorageError::WriteError {
             code: 2,
             errmsg: "_id is of a type the Rust server does not support".to_string(),

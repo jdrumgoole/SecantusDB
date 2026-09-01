@@ -24,6 +24,7 @@ pub mod aggregate;
 pub mod collation;
 pub mod diff;
 pub mod expressions;
+pub mod fallback;
 pub mod geo;
 pub mod projection;
 pub mod query;

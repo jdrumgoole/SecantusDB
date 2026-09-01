@@ -1521,8 +1521,8 @@ def test_bool_argument_rejected_where_int_expected() -> None:
         ({"$range": [True, 5]}, 34443),
         ({"$range": [0, True]}, 34445),
         ({"$range": [0, 5, True]}, 34447),
-        ({"$indexOfArray": [[1, 2, 3], 2, True]}, 40096),
-        ({"$indexOfArray": [[1, 2, 3], 2, 0, True]}, 40096),
+        ({"$indexOfArray": [[1, 2, 3], 2, True]}, 9711600),
+        ({"$indexOfArray": [[1, 2, 3], 2, 0, True]}, 9711600),
     ]:
         with pytest.raises(ExpressionError) as exc:
             evaluate(expr, {}, None)
@@ -1551,8 +1551,8 @@ def test_whole_number_double_index_accepted_fractional_rejected() -> None:
         ({"$slice": [[1, 2, 3, 4], 2.7]}, 28726),
         ({"$slice": [[1, 2, 3, 4], 1.7, 2]}, 28726),
         ({"$slice": [[1, 2, 3, 4], 1, 1.7]}, 28728),
-        ({"$indexOfArray": [[1, 2, 3], 2, 0.7]}, 40096),
-        ({"$indexOfArray": [[1, 2, 3], 2, 0, 0.7]}, 40096),
+        ({"$indexOfArray": [[1, 2, 3], 2, 0.7]}, 9711600),
+        ({"$indexOfArray": [[1, 2, 3], 2, 0, 0.7]}, 9711600),
         ({"$substrCP": ["hello", 1.7, 2]}, 34451),
         ({"$substrCP": ["hello", 1, 1.7]}, 34453),
         ({"$range": [0.7, 5]}, 34444),

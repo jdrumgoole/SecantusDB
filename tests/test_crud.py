@@ -5222,7 +5222,7 @@ def test_aggregation_expr_bool_argument_rejected(coll) -> None:
         ({"$range": [True, 5]}, 34443),
         ({"$range": [0, True]}, 34445),
         ({"$range": [0, 5, True]}, 34447),
-        ({"$indexOfArray": [[1, 2, 3], 2, True]}, 40096),
+        ({"$indexOfArray": [[1, 2, 3], 2, True]}, 9711600),
     ]:
         with pytest.raises(OperationFailure) as exc:
             list(coll.aggregate([{"$project": {"r": expr, "_id": 0}}]))
@@ -5252,7 +5252,7 @@ def test_aggregation_whole_double_index_accepted(coll) -> None:
         ({"$arrayElemAt": [[10, 20, 30], 2.7]}, 28691),
         ({"$slice": [[1, 2, 3, 4], 2.7]}, 28726),
         ({"$slice": [[1, 2, 3, 4], 1, 1.7]}, 28728),
-        ({"$indexOfArray": [[1, 2, 3], 2, 0.7]}, 40096),
+        ({"$indexOfArray": [[1, 2, 3], 2, 0.7]}, 9711600),
         ({"$substrCP": ["hello", 1.7, 2]}, 34451),
         ({"$range": [0, 5.7]}, 34446),
         ({"$round": [3.14159, 2.7]}, 51082),

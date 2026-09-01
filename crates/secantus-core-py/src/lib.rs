@@ -35,6 +35,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+use secantus_core::fallback::Fallback;
 use secantus_core::{aggregate, collation, diff, expressions, projection, query, sortkey, update};
 
 /// Decode the one-key wrapper document and hand back the wrapped value.
@@ -220,7 +221,22 @@ fn evaluate(
                 wrap.insert("r".to_string(), value);
                 encode_doc(&wrap).map(Some)
             }
-            Err(expressions::Fallback) => Ok(None),
+            // Three outcomes now, not two: `{r: value}` is a result, `None`
+            // is "defer to the pure engine", and `{err: {code, errmsg}}` is a
+            // mongod error the Rust engine knows verbatim. The parity suite
+            // compares that third shape against the Python engine's
+            // `ExpressionError`; collapsing it into a defer would have made
+            // parity vacuously green on exactly the inputs the Rust server has
+            // to get right on its own.
+            Err(Fallback::Mongo { code, message, .. }) => {
+                let mut wrap = Document::new();
+                wrap.insert(
+                    "err".to_string(),
+                    bson::bson!({"code": code, "errmsg": message}),
+                );
+                encode_doc(&wrap).map(Some)
+            }
+            Err(Fallback::Defer) => Ok(None),
         })
         .map_err(PyValueError::new_err)?;
     Ok(out.map(|b| to_pybytes(py, b)))
@@ -246,7 +262,7 @@ fn apply_update(
     let out = py
         .detach(|| match update::apply_update(&doc, &update, is_upsert) {
             Ok(new) => encode_doc(&new).map(Some),
-            Err(update::Fallback) => Ok(None),
+            Err(_) => Ok(None),
         })
         .map_err(PyValueError::new_err)?;
     Ok(out.map(|b| to_pybytes(py, b)))
@@ -282,7 +298,7 @@ fn apply_update_with(
         .detach(|| {
             match update::apply_update_with(&doc, &update, is_upsert, &array_filters, &pos) {
                 Ok(new) => encode_doc(&new).map(Some),
-                Err(update::Fallback) => Ok(None),
+                Err(_) => Ok(None),
             }
         })
         .map_err(PyValueError::new_err)?;
@@ -320,7 +336,7 @@ fn apply_update_batch(
             for doc in &docs {
                 match update::apply_update(doc, &update, is_upsert) {
                     Ok(new) => results.push(Bson::Document(new)),
-                    Err(update::Fallback) => return Ok(None),
+                    Err(_) => return Ok(None),
                 }
             }
             let mut wrap = Document::new();
@@ -350,7 +366,7 @@ fn apply_projection(
         .detach(
             || match projection::apply_projection(&doc, &spec, query.as_ref()) {
                 Ok(out) => encode_doc(&out).map(Some),
-                Err(projection::Fallback) => Ok(None),
+                Err(_) => Ok(None),
             },
         )
         .map_err(PyValueError::new_err)?;
@@ -442,7 +458,7 @@ fn apply_projection_batch(
             for doc in &docs {
                 match projection::apply_projection(doc, &spec, query.as_ref()) {
                     Ok(p) => results.push(Bson::Document(p)),
-                    Err(projection::Fallback) => return Ok(None),
+                    Err(_) => return Ok(None),
                 }
             }
             let mut wrap = Document::new();
@@ -482,7 +498,7 @@ fn compute_update_description(
         .detach(
             || match diff::compute_update_description_for(&pre, &post, update.as_ref()) {
                 Ok(out) => encode_doc(&out).map(Some),
-                Err(diff::Fallback) => Ok(None),
+                Err(_) => Ok(None),
             },
         )
         .map_err(PyValueError::new_err)?;
@@ -506,7 +522,7 @@ fn apply_update_description(
     let out = py
         .detach(|| match diff::apply_update_description(doc, &diff) {
             Ok(out) => encode_doc(&out).map(Some),
-            Err(diff::Fallback) => Ok(None),
+            Err(_) => Ok(None),
         })
         .map_err(PyValueError::new_err)?;
     Ok(out.map(|b| to_pybytes(py, b)))
@@ -560,7 +576,7 @@ fn apply_pipeline(
                     );
                     encode_doc(&wrap).map(Some)
                 }
-                Err(aggregate::Fallback) => Ok(None),
+                Err(_) => Ok(None),
             },
         )
         .map_err(PyValueError::new_err)?;

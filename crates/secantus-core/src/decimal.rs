@@ -532,6 +532,41 @@ pub fn to_bson(d: &Dec) -> Option<Bson> {
         .map(Bson::Decimal128)
 }
 
+/// The integer part of a finite decimal, truncated TOWARD ZERO, when it fits in
+/// an `i64`. `$mod` needs exactly this and nothing more: mongod truncates an
+/// int / long / double / Decimal128 operand toward zero before taking the
+/// remainder (probed 7.0.12).
+///
+/// Deliberately not routed through `f64`: a Decimal128 carries 34 significant
+/// digits and a double 17, so `"12345678901234567890.5"` would round before the
+/// modulo and answer a remainder mongod does not report. Working on the
+/// coefficient digits keeps it exact.
+pub fn trunc_to_i64(d: &Dec) -> Option<i64> {
+    let Dec::Fin { sign, coeff, exp } = d else {
+        return None; // NaN / Infinity contribute nothing to $mod
+    };
+    // 19 digits is i64's width; past that the accumulate below would overflow
+    // anyway, and this keeps a huge positive exponent from allocating.
+    if *exp > 19 {
+        return None;
+    }
+    let mut digits: Vec<u8> = coeff.clone();
+    if *exp < 0 {
+        let drop = exp.unsigned_abs() as usize;
+        if drop >= digits.len() {
+            return Some(0); // everything was fractional
+        }
+        digits.truncate(digits.len() - drop);
+    } else {
+        digits.resize(digits.len() + *exp as usize, 0);
+    }
+    let mut acc: i64 = 0;
+    for digit in digits {
+        acc = acc.checked_mul(10)?.checked_add(digit as i64)?;
+    }
+    Some(acc * *sign as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

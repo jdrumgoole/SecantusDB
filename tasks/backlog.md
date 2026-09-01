@@ -4890,18 +4890,80 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   reproduces the same single-rounding float path, guarded to `|total_us| <=
   2**53` (where the `as f64` conversion is exact) and deferring extreme dates
   to Python so the double-rounding can't diverge.
-- [ ] **Remaining expression operators are principled defers** (cannot be
-  reproduced without a fidelity risk; all run pure-Python): regex
-  (`$regexMatch`/`$regexFind`/`$regexFindAll` — Python `re`);
-  `$dateToString`/`$dateFromString` (`strftime`/`strptime` + timezones);
-  `$convert`/`$toDecimal` and float-`str()` / string→number / Decimal128
-  conversion edges; `$round`/`$pow`/`$trunc` (rounding mode) and the
-  transcendentals `$exp`/`$ln`/`$log`/`$log10` (last-ULP vs Python's libm);
-  `$sortArray` (Python `sorted()` ordering/stability, raises on mixed types);
-  non-ASCII `$toLower`/`$toUpper` and default-whitespace `$trim`. Each is a
-  deliberate fallback, not a gap. (`$rand` is the lone exception that is
-  *evaluated* in Rust rather than deferred — see the "now also handled" item —
-  because deferring would error the standalone server, which has no Python.)
+- [x] **"Remaining expression operators are principled defers" — the premise
+  was wrong, and measuring it closed most of the list (2026-09-01).**
+
+  This entry used to argue that each remaining defer was "a deliberate
+  fallback, not a gap", while its own parenthetical noted that `$rand` had to
+  be evaluated natively "because deferring would error the standalone server,
+  which has no Python". That argument applies to **every** item on the list: on
+  the Rust server a defer is not a fallback. A sweep against mongod 8.2.11
+  found the deferred operators reaching clients as
+  `BadValue: not supported by the Rust server` — for inputs mongod answers
+  fine, and for ordinary *argument* errors it names precisely.
+
+  Worse, two of the stated reasons were backwards. "Non-ASCII case / trim
+  defers for Unicode-fidelity safety" had it inverted: mongod's case operators
+  are ASCII-only, so the faithful answer is the simple one, and it was the
+  PYTHON server diverging (11 of 18 probed strings). "String→number conversion
+  edges" likewise: mongod is C's `strtod`, stricter than Python about
+  whitespace and looser about hexadecimal, and both engines were wrong.
+
+  Now handled natively on both servers, verified against 8.2.11: the ASCII case
+  operators and `$trim`; `$round` / `$trunc` precision validation; `$substrCP`,
+  `$range`, `$slice`, `$arrayElemAt`, `$indexOf*`, `$firstN` / `$lastN` /
+  `$maxN` / `$minN` argument errors; the `$sqrt` / `$ln` / `$log10` / `$log` /
+  `$pow` domain and type guards; `$convert` and all six `$toX` shorthands over
+  numeric strings, including the objectId and string targets; `$dateToString`'s
+  full directive set; and `$mod` over Decimal128 in the query engine.
+
+  What is left is listed as its own items below, with the dependency each one
+  actually needs — not as an undifferentiated "principled" list.
+
+- [ ] **`$dateFromString` with a named IANA timezone (Rust server).** Measured
+  divergent 2026-09-01: mongod resolves `America/New_York`; the Rust engine
+  defers, which errors the standalone server. Fixed `±HH:MM` offsets already
+  work. This one genuinely needs a timezone database — a dependency decision
+  (`chrono-tz` or a vendored subset), not an afternoon's port. The Python
+  server is correct here (it has `zoneinfo`).
+
+- [x] **JavaScript sorts between Regex and MaxKey — DONE 2026-09-01.** It used
+  to sort among the strings on both servers, because `bson.Code` subclasses
+  `str` and both rank tables identified a value with `isinstance(value, str)`.
+  mongod ranks JavaScript as its own type between Regex and MaxKey (probed
+  8.2.11).
+
+  The reason this took a format bump: there are TWO rank tables per server and
+  they have to agree. `ordering._bson_type_rank` (Rust `order::type_rank`)
+  drives the in-memory sort; `sortkey.encode_value` writes the rank byte that
+  **persisted index entries** are sorted by. Changing only the first was tried
+  first and made an index change the sort answer. Both moved, and the
+  index-entry format went to **`entryFormat` 3** (`_ENTRY_FORMAT` /
+  `ENTRY_FORMAT`), so a store written by an earlier build is refused at open
+  rather than read back in the old order — MaxKey's rank byte shifted from 13
+  to 14 as well, so this is not only about JavaScript keys. There is no
+  migration, as with the two format bumps before it.
+
+  Verified: `tools/probes/range_type_brackets.py` is 0/112 on both servers, and
+  a mixed-type sort matches mongod indexed AND unindexed on both.
+
+- [x] **Collated queries over exotic BSON types (Rust server) — DONE
+  2026-09-01.** A collated `$gt` or `$eq` against a `Code` / `Symbol` value used
+  to defer, because the collation path and the exotic-type path did not compose;
+  on the standalone server that answered "query uses a construct the Rust server
+  does not support" for an ordinary query over a collection that merely happened
+  to contain a JavaScript value. A Symbol is a string to mongod and takes the
+  collation with it; JavaScript is its own bracket and a collation has nothing to
+  say about code text. `tools/probes/range_type_brackets.py` is the standing
+  cover and is now 0/112 on both servers (it was 32/112 on the Rust one, every
+  one of them a collated shape).
+
+  (The regex expression operators — `$regexMatch` / `$regexFind` /
+  `$regexFindAll` — were on the deferred list too. They **work**: 7 of 7 probed
+  shapes match mongod on the Rust server, captures, indices, lookahead and the
+  `i` option included. This nearly went into the backlog as "stays deferred" on
+  the strength of the old entry; running it first is the only reason it did
+  not.)
 - [x] **Widen the Rust expression evaluator** — now also handled:
   `$slice`/`$indexOfArray`; ASCII `$concat`/`$toLower`/`$toUpper`/`$strLenCP`/
   `$split`/`$substrCP`; `$mergeObjects`/`$objectToArray`; the scope-introducing
@@ -5031,14 +5093,18 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   `from_f64` and `group::gkey`/`GKey` are now exposed. Validated across curated
   cases + a dedicated 4000-case densify fuzz in-repo **and** 8 extra local seeds
   (5000 densify pipelines each, all handled, zero mismatches).
-- [ ] **Pipeline: only the storage-backed stages remain.** Every pipeline stage
-  that doesn't touch `Storage` is now ported. Still deferring to Python:
-  `$lookup`/`$graphLookup`/`$geoNear`/`$out`/`$merge` (read/write collections via
-  `ctx.storage`), non-deterministic `$sample`, and date-unit `$densify`. These
-  wait for Phase 3+ (storage / wire / dispatch into Rust) per
-  tasks/rust-rewrite-plan.md. Also still open: `$sort` defers on bool / NaN sort
-  keys (the non-transitive `_SortKey` cases above) — reproducing Python's exact
-  Timsort comparison sequence would widen it, but the risk/reward is poor.
+- [ ] **Pipeline stages — the list below was STALE; re-measured 2026-09-01.**
+  `$lookup`, `$graphLookup`, `$densify` and `$sample` all work on the Rust
+  server today (probed against mongod 8.2.11 through the standalone server, not
+  read off this file). What this entry described as waiting for Phase 3+ had
+  already landed with the Rust server's own storage. Still genuinely open:
+  `$out` / `$merge`, and `$sort` deferring on bool / NaN sort keys (the
+  non-transitive `_SortKey` cases above) — reproducing Python's exact Timsort
+  comparison sequence would widen it, but the risk/reward is poor.
+
+  **Read this as a warning about the entries around it.** Every other "still
+  deferring" list in §7 was written at porting time and none is re-verified on
+  a schedule; reproduce before working one (CLAUDE.md, "Finding bugs").
 
 ### Two latent `sortkey` bugs fixed while porting (now Python == Rust == mongod)
 
