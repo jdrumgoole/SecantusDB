@@ -34,6 +34,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import bson
+from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
 
 def bson_type_name(v: Any) -> str:
@@ -178,3 +179,137 @@ def _regex_flag_string(flags: Any) -> str:
                 out += ch
         return out
     return str(flags or "")
+
+
+def fmt_double_g(value: float) -> str:
+    """A double as mongod streams it into an error message: C++'s ``ostream <<``
+    at its default six significant digits, so ``1e20`` prints ``1e+20``."""
+    return f"{value:g}"
+
+
+def bson_value_repr(value: Any) -> str:
+    """Render a BSON value the way mongod echoes an offending one back.
+
+    This is the shell-ish form its parse errors use, and it is NOT Python's
+    ``repr``: strings take DOUBLE quotes, a document prints ``{ a: 1 }`` with
+    inner spaces, a regex prints ``/a/i``, a date prints ``new Date(<millis>)``.
+    Probed across every BSON type against 8.2.11 (2026-09-01).
+
+    Messages that echoed a value with ``repr`` therefore said ``'x'`` where
+    mongod says ``"x"`` -- a difference a client comparing error text sees.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str) and not isinstance(value, Code):
+        return f'"{value}"'
+    if isinstance(value, Code):
+        return str(value)
+    if isinstance(value, float):
+        return fmt_double_g(value)
+    if isinstance(value, Decimal128):
+        return str(value)
+    if isinstance(value, (int, Int64)):
+        return str(int(value))
+    if isinstance(value, ObjectId):
+        return f"ObjectId('{value}')"
+    if isinstance(value, MinKey):
+        return "MinKey"
+    if isinstance(value, MaxKey):
+        return "MaxKey"
+    if isinstance(value, Timestamp):
+        return f"Timestamp({value.time}, {value.inc})"
+    if isinstance(value, _dt.datetime):
+        millis = int(value.replace(tzinfo=value.tzinfo or _dt.timezone.utc).timestamp() * 1000)
+        return f"new Date({millis})"
+    if isinstance(value, Regex):
+        return f"/{value.pattern}/{_regex_flag_text(value.flags)}"
+    if isinstance(value, (bytes, Binary, bytearray)):
+        subtype = getattr(value, "subtype", 0)
+        return f"BinData({subtype}, {bytes(value).hex().upper()})"
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        return "[ " + ", ".join(bson_value_repr(v) for v in value) + " ]"
+    if isinstance(value, Mapping):
+        if not value:
+            return "{}"
+        return "{ " + ", ".join(f"{k}: {bson_value_repr(v)}" for k, v in value.items()) + " }"
+    return str(value)
+
+
+#: `re` flag bits to the regex-literal letters mongod prints, in its order.
+_REGEX_FLAG_LETTERS = (
+    (_re.IGNORECASE, "i"),
+    (_re.MULTILINE, "m"),
+    (_re.DOTALL, "s"),
+    (_re.VERBOSE, "x"),
+)
+
+
+def _regex_flag_text(flags: int | str) -> str:
+    if isinstance(flags, str):
+        return flags
+    return "".join(letter for bit, letter in _REGEX_FLAG_LETTERS if flags & bit)
+
+
+class Int64CoercionError(Exception):
+    """A numeric argument mongod refuses to read as a 64-bit integer.
+
+    Carries the message and code so each caller can raise its own error class
+    without restating the four-way ladder.
+    """
+
+    def __init__(self, message: str, code: int = 9) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+def coerce_int64_argument(value: Any, label: str) -> int:
+    """mongod's numeric-argument ladder, shared by `$pop` and the `$bits*` mask.
+
+    Four distinct failures, in this order (probed 8.2.11, 2026-09-01, and
+    identical for both operators -- only the ``label`` before the colon
+    differs)::
+
+        NaN                       Expected an integer, but found NaN in: <label>: nan
+        non-finite / out of range Cannot represent as a 64-bit integer: <label>: 1e+20
+        fractional                Expected an integer: <label>: 1.5
+        non-integral Decimal128   Cannot represent as a 64-bit integer: <label>: 1.5
+
+    A whole ``Decimal128`` is accepted, which is easy to miss: both callers
+    rejected it outright. Raises `Int64CoercionError`; a non-numeric type is
+    the caller's to report, because the two word it differently.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal128)):
+        raise TypeError("not a numeric argument")
+    if isinstance(value, Decimal128):
+        dec = value.to_decimal()
+        if not dec.is_finite() or dec != dec.to_integral_value():
+            raise Int64CoercionError(
+                f"Cannot represent as a 64-bit integer: {label}: {bson_value_repr(value)}"
+            )
+        as_int = int(dec)
+        if not (_INT64_MIN <= as_int <= _INT64_MAX):
+            raise Int64CoercionError(
+                f"Cannot represent as a 64-bit integer: {label}: {bson_value_repr(value)}"
+            )
+        return as_int
+    if isinstance(value, float):
+        if value != value:  # NaN — `math.isnan` without the import
+            raise Int64CoercionError(f"Expected an integer, but found NaN in: {label}: nan")
+        if value in (float("inf"), float("-inf")) or not (_INT64_MIN <= value <= _INT64_MAX):
+            raise Int64CoercionError(
+                f"Cannot represent as a 64-bit integer: {label}: {fmt_double_g(value)}"
+            )
+        if not value.is_integer():
+            raise Int64CoercionError(f"Expected an integer: {label}: {fmt_double_g(value)}")
+        return int(value)
+    return value
+
+
+#: The 64-bit window `coerce_int64_argument` enforces.
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1

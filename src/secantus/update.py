@@ -6,8 +6,9 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from bson import Int64
+from bson import Code, Int64
 
+from secantus.bsontypes import Int64CoercionError, bson_value_repr, coerce_int64_argument
 from secantus.numerics import IntegerOverflowError, bson_add, bson_mul
 from secantus.paths import get_path, has_path, path_block, set_path, unset_path
 
@@ -152,43 +153,17 @@ def _bson_type_name(v: Any) -> str:
     return bson_type_name(v)
 
 
-def _render_bson_scalar(v: Any) -> str:
-    """A mongod-ish rendering of a scalar for an error message: ``true`` /
-    ``false`` / ``null`` lowercase, strings double-quoted, ObjectId in its
-    constructor form, else ``str()``."""
-    from bson import ObjectId
-
-    if v is True:
-        return "true"
-    if v is False:
-        return "false"
-    if v is None:
-        return "null"
-    if isinstance(v, str):
-        return f'"{v}"'
-    if isinstance(v, ObjectId):
-        # `str(ObjectId)` is the bare hex; mongod prints `ObjectId('…')`, and
-        # this is the *default* `_id` type, so it's the common case in the
-        # `$inc`/`$mul` type-error message below.
-        return f"ObjectId('{v}')"
-    return str(v)
-
-
-def _render_bson_value(v: Any) -> str:
-    """``_render_bson_scalar`` extended to arrays and sub-documents.
-
-    mongod spaces the brackets -- ``[ 1 ]``, ``{ a: 1 }`` -- which is what its
-    ``PathNotViable`` message prints for the element in the way.
-    """
-    if isinstance(v, Mapping):
-        if not v:
-            return "{}"
-        return "{ " + ", ".join(f"{k}: {_render_bson_value(x)}" for k, x in v.items()) + " }"
-    if isinstance(v, list):
-        if not v:
-            return "[]"
-        return "[ " + ", ".join(_render_bson_value(x) for x in v) + " ]"
-    return _render_bson_scalar(v)
+#: mongod echoes an offending value in its own shell-ish rendering, and this
+#: module used to carry TWO partial copies of that: `_render_bson_scalar`
+#: (scalars only) and `_render_bson_value` (containers, delegating to the
+#: first). `$inc` / `$mul` / `$pop` / `$rename` all called the SCALAR one, so an
+#: array argument printed Python's `[1]` where mongod prints `[ 1 ]` and a
+#: sub-document printed `{'a': 1}` where mongod prints `{ a: 1 }`. Both names
+#: now point at the one canonical renderer in `bsontypes`, which is where this
+#: kind of vocabulary lives precisely because it had already drifted into
+#: several copies once.
+_render_bson_scalar = bson_value_repr
+_render_bson_value = bson_value_repr
 
 
 def _set_path(doc: dict[str, Any], path: str, value: Any) -> None:
@@ -891,6 +866,14 @@ def _apply_op(
             if isinstance(opts, bool):
                 stamp: Any = _dt.datetime.now(_dt.timezone.utc)
             elif isinstance(opts, Mapping):
+                # An unrecognized KEY is reported before the `$type` value is
+                # looked at -- `{$type: "date", a: 1}` names `a` even though the
+                # `$type` is perfectly valid (probed 8.2.11, 2026-09-01). This
+                # answered the generic "'$type' string field is required"
+                # message for every one of those.
+                for key in opts:
+                    if key != "$type":
+                        raise UpdateError(f"Unrecognized $currentDate option: {key}", code=2)
                 kind = opts.get("$type")
                 if kind == "date":
                     stamp = _dt.datetime.now(_dt.timezone.utc)
@@ -1057,13 +1040,19 @@ def _apply_op(
             # "not a number" (code 9), and a number other than ±1 is
             # "$pop expects 1 or -1" (code 9). Python's bool-is-int would treat
             # `True` as `1` (pop last) without this guard.
-            if isinstance(direction, bool) or not isinstance(direction, (int, float)):
+            try:
+                direction = coerce_int64_argument(direction, path)
+            except TypeError:
                 raise UpdateError(
-                    f"Expected a number in: {path}: {_render_bson_scalar(direction)}", code=9
-                )
+                    f"Expected a number in: {path}: {bson_value_repr(direction)}", code=9
+                ) from None
+            except Int64CoercionError as exc:
+                # NaN / out-of-range / fractional each have their own message,
+                # and this used to answer "$pop expects 1 or -1" for all three.
+                raise UpdateError(exc.message, code=exc.code) from None
             if direction not in (1, -1):
                 raise UpdateError(
-                    f"$pop expects 1 or -1, found: {_render_bson_scalar(direction)}", code=9
+                    f"$pop expects 1 or -1, found: {bson_value_repr(direction)}", code=9
                 )
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 arr = get_path(doc, concrete, default=None)
@@ -1088,10 +1077,10 @@ def _apply_op(
             # mongod validates the whole $rename spec before touching the doc —
             # otherwise several of these silently corrupt data or leak a raw
             # Python exception (e.g. a non-string target hit `new.split`).
-            if not isinstance(new, str):
-                tgt = "true" if new is True else "false" if new is False else str(new)
+            if not isinstance(new, str) or isinstance(new, Code):
                 raise UpdateError(
-                    f"The 'to' field for $rename must be a string: {old}: {tgt}", code=2
+                    f"The 'to' field for $rename must be a string: {old}: {bson_value_repr(new)}",
+                    code=2,
                 )
             if old == "" or new == "":
                 raise UpdateError("An empty update path is not valid.", code=56)

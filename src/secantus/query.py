@@ -8,8 +8,11 @@ from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from typing import Any
 
-from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex, Timestamp
+from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex
 
+from secantus.bsontypes import Int64CoercionError, coerce_int64_argument
+from secantus.bsontypes import bson_value_repr as _mongo_bson_repr
+from secantus.bsontypes import fmt_double_g as _fmt_g
 from secantus.collation import Collation
 from secantus.collation import compare_keys as _coll_compare
 from secantus.collation import equal as _coll_equal
@@ -84,12 +87,12 @@ def _match_clause(
         # ``{$or: true}``, which leaked out of the QueryError catch and
         # surfaced as a generic InternalError (1) instead of mongod's BadValue.
         if not isinstance(condition, list):
-            raise QueryError(f"{key} must be an array")
+            raise QueryError(f"{key} argument must be an array")
         if not condition:
-            raise QueryError(f"{key} must be a nonempty array")
+            raise QueryError(f"{key} argument must be a non-empty array")
         for c in condition:
             if not isinstance(c, Mapping):
-                raise QueryError(f"{key} entries need to be full objects")
+                raise QueryError(f"{key} argument's entries must be objects")
         if key == "$and":
             return all(matches(doc, c, vars=vars, collation=collation) for c in condition)
         if key == "$or":
@@ -901,79 +904,6 @@ def _opt_number(value: Any, label: str, code: int = 2) -> float | None:
     return float(value)
 
 
-def _fmt_g(value: float) -> str:
-    """A double as mongod streams it into an error message: C++'s ``ostream <<``
-    at its default six significant digits, so ``1e20`` prints ``1e+20``."""
-    return f"{value:g}"
-
-
-def _mongo_bson_repr(value: Any) -> str:
-    """Render a BSON value the way mongod echoes an offending one back.
-
-    This is the shell-ish form its parse errors use, and it is NOT Python's
-    ``repr``: strings take DOUBLE quotes, a document prints ``{ a: 1 }`` with
-    inner spaces, a regex prints ``/a/i``, a date prints ``new Date(<millis>)``.
-    Probed across every BSON type against 8.2.11 (2026-09-01).
-
-    Messages that echoed a value with ``repr`` therefore said ``'x'`` where
-    mongod says ``"x"`` -- a difference a client comparing error text sees.
-    """
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, str) and not isinstance(value, Code):
-        return f'"{value}"'
-    if isinstance(value, Code):
-        return str(value)
-    if isinstance(value, float):
-        return _fmt_g(value)
-    if isinstance(value, Decimal128):
-        return str(value)
-    if isinstance(value, (int, Int64)):
-        return str(int(value))
-    if isinstance(value, ObjectId):
-        return f"ObjectId('{value}')"
-    if isinstance(value, MinKey):
-        return "MinKey"
-    if isinstance(value, MaxKey):
-        return "MaxKey"
-    if isinstance(value, Timestamp):
-        return f"Timestamp({value.time}, {value.inc})"
-    if isinstance(value, _dt.datetime):
-        millis = int(value.replace(tzinfo=value.tzinfo or _dt.timezone.utc).timestamp() * 1000)
-        return f"new Date({millis})"
-    if isinstance(value, Regex):
-        return f"/{value.pattern}/{_regex_flag_text(value.flags)}"
-    if isinstance(value, (bytes, Binary, bytearray)):
-        subtype = getattr(value, "subtype", 0)
-        return f"BinData({subtype}, {bytes(value).hex().upper()})"
-    if isinstance(value, list):
-        if not value:
-            return "[]"
-        return "[ " + ", ".join(_mongo_bson_repr(v) for v in value) + " ]"
-    if isinstance(value, Mapping):
-        if not value:
-            return "{}"
-        return "{ " + ", ".join(f"{k}: {_mongo_bson_repr(v)}" for k, v in value.items()) + " }"
-    return str(value)
-
-
-#: `re` flag bits to the regex-literal letters mongod prints, in its order.
-_REGEX_FLAG_LETTERS = (
-    (re.IGNORECASE, "i"),
-    (re.MULTILINE, "m"),
-    (re.DOTALL, "s"),
-    (re.VERBOSE, "x"),
-)
-
-
-def _regex_flag_text(flags: int | str) -> str:
-    if isinstance(flags, str):
-        return flags
-    return "".join(letter for bit, letter in _REGEX_FLAG_LETTERS if flags & bit)
-
-
 #: The widest integer mongod will build a `$bits*` mask from.
 _INT64_MAX = 2**63 - 1
 _INT64_MIN = -(2**63)
@@ -1035,47 +965,24 @@ def _resolve_bitmask(arg: Any, op: str, field: str = "") -> int:
     (a bool mask with code 2). Codes verified vs mongod 7.0.12 and 8.2.11."""
     if isinstance(arg, (bytes, Binary, bytearray)):
         return bindata_to_bits(bytes(arg))
-    if isinstance(arg, Decimal128):
-        # A whole Decimal128 is a valid mask (probed 8.2.11); the shared
-        # eligibility rule decides, and a non-whole one falls through to the
-        # type error below.
-        as_int = bit_source(arg)
-        if as_int is not None and as_int >= 0:
-            return as_int
     if isinstance(arg, bool):
         raise QueryError(
-            f"n takes an Array, a number, or a BinData but received: {op}: "
-            f"{'true' if arg else 'false'}",
+            f"{field} takes an Array, a number, or a BinData but received: "
+            f"{op}: {_mongo_bson_repr(arg)}",
             code=2,
         )
-    if isinstance(arg, (int, float)):
-        if isinstance(arg, float):
-            # mongod separates the three ways a double refuses to be a mask, and
-            # this had only the middle one.
-            if math.isnan(arg):
-                raise QueryError(
-                    f"Expected an integer, but found NaN in: {op}: nan",
-                    code=9,
-                    code_name="FailedToParse",
-                )
-            if not math.isfinite(arg) or not (_INT64_MIN <= arg <= _INT64_MAX):
-                raise QueryError(
-                    f"Cannot represent as a 64-bit integer: {op}: {_fmt_g(arg)}",
-                    code=9,
-                    code_name="FailedToParse",
-                )
-            if not arg.is_integer():
-                raise QueryError(
-                    f"Expected an integer: {op}: {arg!r}", code=9, code_name="FailedToParse"
-                )
-            arg = int(arg)
-        if arg < 0:
+    if isinstance(arg, (int, float, Decimal128)):
+        try:
+            mask = coerce_int64_argument(arg, op)
+        except Int64CoercionError as exc:
+            raise QueryError(exc.message, code=exc.code, code_name="FailedToParse") from None
+        if mask < 0:
             raise QueryError(
-                f"Expected a non-negative number in: {op}: {arg}",
+                f"Expected a non-negative number in: {op}: {_mongo_bson_repr(arg)}",
                 code=9,
                 code_name="FailedToParse",
             )
-        return arg
+        return mask
     if isinstance(arg, list):
         mask = 0
         for i, bit in enumerate(arg):
