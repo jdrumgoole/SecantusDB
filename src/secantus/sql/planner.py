@@ -2265,6 +2265,26 @@ def _is_default_cell(cell: exp.Expression) -> bool:
     return isinstance(cell, exp.Var) and cell.name.upper() == "DEFAULT"
 
 
+def _is_default_keyword(node: exp.Expression) -> bool:
+    """A ``DEFAULT`` keyword on the right of an ``UPDATE … SET`` assignment.
+
+    sqlglot parses it as an unquoted **Column** there, not the ``Var`` a VALUES
+    tuple gets — so `_is_default_cell` never matched in an UPDATE and
+    `SET n = DEFAULT` fell through to the per-row expression path, where
+    `default` was resolved as a column name: `42703 column "default" does not
+    exist`. A QUOTED `"default"` is a real column reference and is left alone.
+    """
+    if _is_default_cell(node):
+        return True
+    return (
+        isinstance(node, exp.Column)
+        and not node.table
+        and isinstance(node.this, exp.Identifier)
+        and not node.this.args.get("quoted")
+        and node.name.upper() == "DEFAULT"
+    )
+
+
 def _insert_cell_value(cell: exp.Expression, subctx: Any = None) -> Any:
     """A VALUES cell: a plain literal, else any constant expression PG allows
     there (``nextval('seq')``, arithmetic, casts …) evaluated by the scalar
@@ -3833,10 +3853,35 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
         if col.generated is not None:
             # A generated column can only be set to DEFAULT (which recomputes it);
             # any other value is rejected. The executor recomputes it either way.
-            if not _is_default_cell(assign.expression):
+            if not _is_default_keyword(assign.expression):
                 raise errors.SQLError(
                     "428C9", f'column "{col_name}" can only be updated to DEFAULT'
                 )
+            continue
+        if _is_default_keyword(assign.expression):
+            # ``SET col = DEFAULT`` — the column's own DEFAULT, or NULL when it
+            # has none (Postgres). This reached `_column_name` on the DEFAULT
+            # keyword and answered `42703 column "default" does not exist`.
+            if col.sequence is not None:
+                # A serial's DEFAULT is `nextval(...)`, which needs the
+                # sequence — refuse it rather than write something else.
+                raise errors.feature_not_supported(
+                    f"SET {col_name} = DEFAULT on a sequence-backed column is not supported"
+                )
+            if col.has_default:
+                set_doc[col.field] = typemap.coerce(col.default, col.type_tag)
+            elif col.default_expr is not None:
+                from secantus.sql import scalar as _scalar
+
+                _ctx = _scalar.ScalarContext(storage=None, catalog=None, db="", session=None)
+                _val = _scalar.evaluate(
+                    _parse_default_expr(col.default_expr), _default_col_scope, _ctx
+                )
+                set_doc[col.field] = typemap.coerce(_val, col.type_tag)
+            elif not col.nullable:
+                raise errors.not_null_violation(col_name, table.name)
+            else:
+                set_doc[col.field] = None
             continue
         raw = _try_literal(assign.expression)
         if raw is _LITERAL_SENTINEL:  # ``SET col = <expr>`` — evaluated per row
