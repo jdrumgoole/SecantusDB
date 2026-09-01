@@ -8,7 +8,7 @@ from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from typing import Any
 
-from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex
+from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
 from secantus.collation import Collation
 from secantus.collation import compare_keys as _coll_compare
@@ -676,7 +676,7 @@ def _op_matches(
         _validate_not_arg(arg)
         return not _field_matches(values, arg, collation)
     if op == "$type":
-        return _op_type(values, arg)
+        return _op_type(values, arg, field)
     if op == "$size":
         return _op_size(values, arg)
     if op == "$all":
@@ -688,13 +688,13 @@ def _op_matches(
             raise QueryError("$elemMatch needs an Object")
         return _op_elem_match(values, arg)
     if op == "$bitsAllSet":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) == m, op)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) == m, op, field)
     if op == "$bitsAnySet":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) != 0, op)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) != 0, op, field)
     if op == "$bitsAllClear":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) == 0, op)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) == 0, op, field)
     if op == "$bitsAnyClear":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) != m, op)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) != m, op, field)
     if op == "$geoWithin":
         return _op_geo_within(values, arg)
     if op == "$geoIntersects":
@@ -901,12 +901,147 @@ def _opt_number(value: Any, label: str, code: int = 2) -> float | None:
     return float(value)
 
 
-def _resolve_bitmask(arg: Any, op: str) -> int:
+def _fmt_g(value: float) -> str:
+    """A double as mongod streams it into an error message: C++'s ``ostream <<``
+    at its default six significant digits, so ``1e20`` prints ``1e+20``."""
+    return f"{value:g}"
+
+
+def _mongo_bson_repr(value: Any) -> str:
+    """Render a BSON value the way mongod echoes an offending one back.
+
+    This is the shell-ish form its parse errors use, and it is NOT Python's
+    ``repr``: strings take DOUBLE quotes, a document prints ``{ a: 1 }`` with
+    inner spaces, a regex prints ``/a/i``, a date prints ``new Date(<millis>)``.
+    Probed across every BSON type against 8.2.11 (2026-09-01).
+
+    Messages that echoed a value with ``repr`` therefore said ``'x'`` where
+    mongod says ``"x"`` -- a difference a client comparing error text sees.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str) and not isinstance(value, Code):
+        return f'"{value}"'
+    if isinstance(value, Code):
+        return str(value)
+    if isinstance(value, float):
+        return _fmt_g(value)
+    if isinstance(value, Decimal128):
+        return str(value)
+    if isinstance(value, (int, Int64)):
+        return str(int(value))
+    if isinstance(value, ObjectId):
+        return f"ObjectId('{value}')"
+    if isinstance(value, MinKey):
+        return "MinKey"
+    if isinstance(value, MaxKey):
+        return "MaxKey"
+    if isinstance(value, Timestamp):
+        return f"Timestamp({value.time}, {value.inc})"
+    if isinstance(value, _dt.datetime):
+        millis = int(value.replace(tzinfo=value.tzinfo or _dt.timezone.utc).timestamp() * 1000)
+        return f"new Date({millis})"
+    if isinstance(value, Regex):
+        return f"/{value.pattern}/{_regex_flag_text(value.flags)}"
+    if isinstance(value, (bytes, Binary, bytearray)):
+        subtype = getattr(value, "subtype", 0)
+        return f"BinData({subtype}, {bytes(value).hex().upper()})"
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        return "[ " + ", ".join(_mongo_bson_repr(v) for v in value) + " ]"
+    if isinstance(value, Mapping):
+        if not value:
+            return "{}"
+        return "{ " + ", ".join(f"{k}: {_mongo_bson_repr(v)}" for k, v in value.items()) + " }"
+    return str(value)
+
+
+#: `re` flag bits to the regex-literal letters mongod prints, in its order.
+_REGEX_FLAG_LETTERS = (
+    (re.IGNORECASE, "i"),
+    (re.MULTILINE, "m"),
+    (re.DOTALL, "s"),
+    (re.VERBOSE, "x"),
+)
+
+
+def _regex_flag_text(flags: int | str) -> str:
+    if isinstance(flags, str):
+        return flags
+    return "".join(letter for bit, letter in _REGEX_FLAG_LETTERS if flags & bit)
+
+
+#: The widest integer mongod will build a `$bits*` mask from.
+_INT64_MAX = 2**63 - 1
+_INT64_MIN = -(2**63)
+
+
+def bindata_to_bits(data: bytes) -> int:
+    """A BinData value as a bit set: LITTLE-endian bytes, least-significant bit
+    first within each byte, so ``b"\x00\x01"`` is bit 8.
+
+    Probed against mongod 8.2.11 (2026-09-01) by asking for one bit position at
+    a time. BinData is accepted both as a ``$bits*`` MASK and as a stored field
+    VALUE; neither was supported before.
+    """
+    return int.from_bytes(data, "little")
+
+
+def bit_source(value: Any) -> int | None:
+    """The integer a stored value contributes to a ``$bits*`` test, or ``None``
+    when the value is not bit-eligible at all.
+
+    mongod accepts int32 / int64, a **whole finite double in int64 range**, a
+    **whole Decimal128**, and **BinData** — and rejects strings, bools,
+    fractional doubles, NaN / Infinity, and out-of-range doubles. This used to
+    accept `int` and nothing else, so a double, a Decimal128 and a BinData value
+    were silently skipped: `{v: {$bitsAllSet: 5}}` missed a document holding
+    `5.0`.
+
+    Negative values are two's complement with infinite sign extension, which is
+    exactly what Python's arbitrary-precision `&` already does (`-1 & 5 == 5`),
+    so they need no special handling here — only admission.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        return int(value) if _INT64_MIN <= value <= _INT64_MAX else None
+    if isinstance(value, Decimal128):
+        try:
+            dec = value.to_decimal()
+        except (ValueError, ArithmeticError):
+            return None
+        if not dec.is_finite() or dec != dec.to_integral_value():
+            return None
+        as_int = int(dec)
+        return as_int if _INT64_MIN <= as_int <= _INT64_MAX else None
+    if isinstance(value, (bytes, Binary, bytearray)):
+        return bindata_to_bits(bytes(value))
+    return None
+
+
+def _resolve_bitmask(arg: Any, op: str, field: str = "") -> int:
     """Build the bitmask for a `$bits*` query, mongod-style. The argument is an
-    array of bit positions or a non-negative integer / whole-number-double mask.
-    A whole double is accepted (truncated); a fractional double, a bool, or a
-    negative value is rejected — a bad *position* with code 2, a bad non-array
-    *mask* with code 9 (a bool mask with code 2). Codes verified vs mongod 7.0.12."""
+    array of bit positions, a non-negative integer / whole-double / whole-decimal
+    mask, or a BinData mask. A fractional double, a bool, or a negative value is
+    rejected — a bad *position* with code 2, a bad non-array *mask* with code 9
+    (a bool mask with code 2). Codes verified vs mongod 7.0.12 and 8.2.11."""
+    if isinstance(arg, (bytes, Binary, bytearray)):
+        return bindata_to_bits(bytes(arg))
+    if isinstance(arg, Decimal128):
+        # A whole Decimal128 is a valid mask (probed 8.2.11); the shared
+        # eligibility rule decides, and a non-whole one falls through to the
+        # type error below.
+        as_int = bit_source(arg)
+        if as_int is not None and as_int >= 0:
+            return as_int
     if isinstance(arg, bool):
         raise QueryError(
             f"n takes an Array, a number, or a BinData but received: {op}: "
@@ -915,6 +1050,20 @@ def _resolve_bitmask(arg: Any, op: str) -> int:
         )
     if isinstance(arg, (int, float)):
         if isinstance(arg, float):
+            # mongod separates the three ways a double refuses to be a mask, and
+            # this had only the middle one.
+            if math.isnan(arg):
+                raise QueryError(
+                    f"Expected an integer, but found NaN in: {op}: nan",
+                    code=9,
+                    code_name="FailedToParse",
+                )
+            if not math.isfinite(arg) or not (_INT64_MIN <= arg <= _INT64_MAX):
+                raise QueryError(
+                    f"Cannot represent as a 64-bit integer: {op}: {_fmt_g(arg)}",
+                    code=9,
+                    code_name="FailedToParse",
+                )
             if not arg.is_integer():
                 raise QueryError(
                     f"Expected an integer: {op}: {arg!r}", code=9, code_name="FailedToParse"
@@ -955,16 +1104,32 @@ def _resolve_bitmask(arg: Any, op: str) -> int:
                 )
             mask |= 1 << bit
         return mask
-    raise QueryError(f"n takes an Array, a number, or a BinData but received: {op}", code=2)
+    # The field name used to be the literal string "n" -- whatever field the
+    # original probe happened to use -- so every one of these messages named the
+    # wrong field. mongod also echoes the offending value.
+    raise QueryError(
+        f"{field} takes an Array, a number, or a BinData but received: "
+        f"{op}: {_mongo_bson_repr(arg)}",
+        code=2,
+    )
 
 
 def _op_bitwise(
-    values: list[Any], arg: Any, predicate: Callable[[int, int], bool], op: str
+    values: list[Any], arg: Any, predicate: Callable[[int, int], bool], op: str, field: str = ""
 ) -> bool:
-    mask = _resolve_bitmask(arg, op)
+    mask = _resolve_bitmask(arg, op, field)
     for v in values:
-        if isinstance(v, int) and not isinstance(v, bool) and predicate(v, mask):
+        source = bit_source(v)
+        if source is not None and predicate(source, mask):
             return True
+        # An ARRAY field is matched element-wise, one level deep -- the same
+        # multikey rule the comparison operators follow. Without it a document
+        # holding `[1, 4]` was skipped entirely.
+        if isinstance(v, list):
+            for elem in v:
+                source = bit_source(elem)
+                if source is not None and predicate(source, mask):
+                    return True
     return False
 
 
@@ -1182,8 +1347,15 @@ def _op_regex(values: list[Any], pattern: Any, options: Any) -> bool:
     if isinstance(pattern, Regex):
         regex_pattern = pattern.pattern
         flags |= _re_flags(pattern.flags)
-    else:
+    elif isinstance(pattern, str) and not isinstance(pattern, Code):
         regex_pattern = pattern
+    else:
+        # mongod takes a string or a BSON regex and nothing else. A `Binary`
+        # pattern used to compile as a BYTES regex and then raise
+        # `TypeError: cannot use a bytes pattern on a string-like object` from
+        # `search()` -- an unhandled exception, i.e. `1 internal server error`.
+        # Every other type silently matched nothing.
+        raise QueryError("$regex has to be a string", code=2)
     try:
         compiled = _compile_regex(regex_pattern, flags)
     except re.error as exc:
@@ -1343,7 +1515,12 @@ def _validate_type_arg(t: Any) -> None:
     in {-1, 1..19, 127} (a whole double is accepted). A bool / other type is
     TypeMismatch (14); an unknown alias or an out-of-range / fractional code is
     BadValue (2), with a special hint for code 0."""
-    if isinstance(t, bool):
+    # `bson.Code` subclasses `str` AND is unhashable, so it reached the
+    # `t not in _VALID_TYPE_ALIASES` set test below and raised
+    # `TypeError: unhashable type` -- which the dispatcher turned into
+    # `1 internal server error` for an ordinary bad argument. mongod answers
+    # TypeMismatch here, like any other non-string non-number.
+    if isinstance(t, (bool, Code)):
         raise QueryError(
             "type must be represented as a number or a string", code=14, code_name="TypeMismatch"
         )
@@ -1351,10 +1528,15 @@ def _validate_type_arg(t: Any) -> None:
         if t not in _VALID_TYPE_ALIASES:
             raise QueryError(f"Unknown type name alias: {t}")
         return
-    if isinstance(t, (int, float)):
-        if isinstance(t, float):
-            if not t.is_integer():
+    if isinstance(t, (int, float, Decimal128)):
+        if isinstance(t, Decimal128):
+            dec = t.to_decimal()
+            if not dec.is_finite() or dec != dec.to_integral_value():
                 raise QueryError(f"Invalid numerical type code: {t}")
+            code = int(dec)
+        elif isinstance(t, float):
+            if not t.is_integer():
+                raise QueryError(f"Invalid numerical type code: {_fmt_g(t)}")
             code = int(t)
         else:
             code = t
@@ -1367,8 +1549,12 @@ def _validate_type_arg(t: Any) -> None:
     )
 
 
-def _op_type(values: list[Any], type_spec: Any) -> bool:
+def _op_type(values: list[Any], type_spec: Any, field: str = "") -> bool:
     types = type_spec if isinstance(type_spec, list) else [type_spec]
+    if isinstance(type_spec, list) and not type_spec:
+        # An empty alias list is a parse error, not "matches nothing" -- probed
+        # 8.2.11 (2026-09-01), where this answered an empty result set.
+        raise QueryError(f"{field} must match at least one type", code=9, code_name="FailedToParse")
     for t in types:
         _validate_type_arg(t)
     for v in values:
