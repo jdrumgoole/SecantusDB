@@ -92,6 +92,14 @@ def assert_named_error_matches_pure(exc, expr, doc=None, vars=None):
     )
 
 
+def _same(a, b):
+    """Equality that treats two NaNs as equal — `nan != nan` would otherwise
+    report a divergence on inputs where both engines correctly answer NaN."""
+    if isinstance(a, float) and isinstance(b, float) and a != a and b != b:
+        return True
+    return a == b
+
+
 def _bson_norm(v):
     """Normalise a pure-Python result the way BSON storage would — the wire form
     both servers actually return. In particular a tz-aware ``datetime`` collapses
@@ -1360,6 +1368,100 @@ def test_math_and_range_fuzz():
             assert rust == _pure.evaluate(expr, {}), f"$range lo={lo} hi={hi} step={step}"
 
 
+def test_numeric_string_conversion_parity():
+    """$convert / $toInt / $toLong / $toDouble / $toObjectId over numeric-ish
+    strings, including every shape that separates mongod's parsing from the host
+    language's.
+
+    Python's `int()` / `float()` and Rust's `str::parse` each accept things
+    mongod refuses, and not the SAME things -- Python takes PEP-515 underscores
+    and surrounding whitespace, Rust takes neither but does take `inf`. So this
+    is not a "both use the standard parser" case where parity is free; each
+    engine had to gate the syntax itself, and the reason strings differ per
+    target (int says "No digits" where double says "Empty string"). Drift here
+    is silent: a wrong reason still errors, just with the wrong sentence.
+    """
+    strings = [
+        "",
+        " ",
+        "5",
+        " 5 ",
+        "5 ",
+        "-5",
+        "+5",
+        "0",
+        "-0",
+        "007",
+        "1_000",
+        "1,000",
+        "12abc",
+        "abc",
+        "0x10",
+        "-0x10",
+        "0X1f",
+        "1.5",
+        "-1.5",
+        ".5",
+        "5.",
+        "1e3",
+        "1E3",
+        "1e",
+        "1e+",
+        "1e-3",
+        "inf",
+        "-inf",
+        "Infinity",
+        "nan",
+        "NaN",
+        "-NaN",
+        "99999999999999999999",
+        "-99999999999999999999",
+        "2147483647",
+        "2147483648",
+        "-2147483648",
+        "-2147483649",
+        "9223372036854775807",
+        "9223372036854775808",
+        "507f1f77bcf86cd799439011",
+        "507f1f77bcf86cd79943901",
+        "zzzzzzzzzzzzzzzzzzzzzzzz",
+        "true",
+        "null",
+        "\t5",
+        "5\n",
+    ]
+    ops = ["$toInt", "$toLong", "$toDouble", "$toObjectId", "$toString"]
+    compared = 0
+    for text in strings:
+        for op in ops:
+            expr = bson.decode(bson.encode({"e": {op: text}}))["e"]
+            try:
+                rust = _rust_eval(expr, {})
+            except RustMongoError as exc:
+                assert_named_error_matches_pure(exc, expr)
+                compared += 1
+                continue
+            if rust is None:
+                continue
+            compared += 1
+            py = _bson_norm(_pure.evaluate(expr, {}))
+            assert _same(rust, py), f"{op}({text!r}): rust={rust!r} pure={py!r}"
+        # The same inputs through $convert with an onError sink: the error must
+        # not escape, and both engines must reach the sink for the same inputs.
+        for target in ("int", "long", "double", "objectId"):
+            expr = bson.decode(
+                bson.encode({"e": {"$convert": {"input": text, "to": target, "onError": "E"}}})
+            )["e"]
+            rust = _rust_eval(expr, {})
+            if rust is None:
+                continue
+            compared += 1
+            assert _same(rust, _bson_norm(_pure.evaluate(expr, {}))), (
+                f"$convert({text!r} -> {target}, onError): rust={rust!r}"
+            )
+    assert compared > 200, f"expected broad coverage, only {compared} comparisons"
+
+
 def test_conversion_fuzz():
     """$toInt / $toDouble / $toBool / $toString over a mix of scalar types,
     checked against Python wherever the Rust path doesn't defer."""
@@ -1387,14 +1489,18 @@ def test_conversion_fuzz():
         doc = bson.decode(bson.encode({"v": v}))
         for op in ("$toInt", "$toDouble", "$toBool", "$toString"):
             expr = {op: "$v"}
-            rust = _rust_eval(expr, doc)
+            try:
+                rust = _rust_eval(expr, doc)
+            except RustMongoError as exc:
+                assert_named_error_matches_pure(exc, expr, doc)
+                continue
             if rust is None:
                 continue
             try:
                 py = _pure.evaluate(expr, doc)
             except Exception:
                 pytest.fail(f"{op}: rust={rust!r} but pure raised; v={v!r}")
-            assert rust == py, f"{op}: rust={rust!r} pure={py!r} v={v!r}"
+            assert _same(rust, py), f"{op}: rust={rust!r} pure={py!r} v={v!r}"
 
 
 def test_randomised_fuzz_parity():

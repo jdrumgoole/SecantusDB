@@ -3540,7 +3540,29 @@ _FLOAT_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
-_HEX_PREFIX_RE = re.compile(r"[+-]?0[xX]")
+#: mongod's hexadecimal gate is a LITERAL `startsWith("0x")` -- lower-case, and
+#: with no sign allowed before it. Probed 8.2.11 (2026-09-01): `"0x10"` is
+#: "Illegal hexadecimal input", while `"0X10"`, `"-0x10"` and `"+0x10"` all slip
+#: past it and are then handled by the ordinary per-target parser. This used to
+#: be `[+-]?0[xX]`, which caught all four and reported the hex message for three
+#: strings mongod describes differently -- and, for `$toDouble`, refused two it
+#: successfully converts.
+_HEX_PREFIX_RE = re.compile(r"0x")
+
+
+#: The spellings that legitimately MEAN infinity, so an infinite parse result
+#: is the answer rather than an out-of-range failure.
+_INFINITY_SPELLING_RE = re.compile(r"[+-]?inf(?:inity)?\Z", re.IGNORECASE)
+
+
+#: C99 hexadecimal-float syntax, which `strtod` accepts and `float()` does not.
+#: Only reachable for the spellings `_HEX_PREFIX_RE` lets through.
+_HEX_FLOAT_RE = re.compile(r"[+-]?0[xX][0-9a-fA-F]*\.?[0-9a-fA-F]*(?:[pP][+-]?[0-9]+)?\Z")
+
+
+#: The characters an ObjectId string may hold. Case-insensitive: mongod accepts
+#: `"507F1F77BCF86CD799439011"`.
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
 
 #: Sentinel reason selecting the hexadecimal message shape below.
@@ -3591,13 +3613,32 @@ def _parse_float_string(value: str) -> float:
         raise _number_parse_error(value, "Leading whitespace")
     if _HEX_PREFIX_RE.match(value):
         raise _number_parse_error(value, _HEX_REASON)
-    if not _STRICT_FLOAT_RE.match(value):
+    if _STRICT_FLOAT_RE.match(value):
+        parsed = float(value)
+        # `strtod` reports a magnitude it cannot represent as a RANGE error
+        # rather than saturating: `$toDouble: "1e400"` is a 241, not `inf`
+        # (probed 8.2.11). Python's `float()` happily answers `inf`, so this
+        # returned a wrong VALUE. A literal "inf" / "Infinity" spelling is of
+        # course still infinity.
+        if math.isinf(parsed) and not _INFINITY_SPELLING_RE.match(value):
+            raise _number_parse_error(value, "Out of range")
+        return parsed
+    if True:
+        # `strtod` is a C99 parser, so it reads HEXADECIMAL floats too -- the
+        # ones the gate above did not catch because they carry a sign or a
+        # capital X. mongod converts them: `$toDouble: "0X1f"` is 31.0 and
+        # `"-0x10"` is -16.0 (probed 8.2.11). Rejecting them was a wrong answer,
+        # not just a wrong message.
+        if _HEX_FLOAT_RE.match(value):
+            try:
+                return float.fromhex(value)
+            except ValueError:
+                pass
         # Distinguish "strtod consumed nothing" from "strtod consumed a prefix".
         prefix = _FLOAT_PREFIX_RE.match(value)
         if prefix is None or prefix.end() == 0:
             raise _number_parse_error(value, "Did not consume any digits")
         raise _number_parse_error(value, "Did not consume whole string.")
-    return float(value)
 
 
 def _parse_decimal_string(value: str) -> Decimal128:
@@ -3724,12 +3765,22 @@ _CONVERT_TARGET_NAMES = {
 def _render_number(value: Any) -> str:
     """A numeric value as mongod prints it in a conversion-overflow message.
 
-    Probed 8.2.11: a double takes ``%g``-style exponent form with a two-digit
-    exponent (``2.5e+09``, ``1e+300``), and a Decimal128 keeps its own
-    rendering (``1E+300``).
+    Three different renderings, all probed on 8.2.11 (2026-09-01):
+
+    * a **double** is always ``%g`` -- six significant digits, two-digit
+      exponent (``3e+09``, ``2.14748e+09``, ``1.23457e+12``, ``1e+300``). The
+      ``abs(value) < 1e16`` guard this used to carry sent every ordinary
+      overflow through ``repr`` instead, so ``$toInt: 1e10`` named
+      ``10000000000.0`` where mongod names ``1e+10``.
+    * an **int64** names NOTHING -- mongod's message ends at the colon and a
+      space. Naming the number looked more helpful and was simply not what the
+      server says.
+    * a **Decimal128** keeps its own rendering (``1E+10``).
     """
     if isinstance(value, float):
-        return repr(value) if abs(value) < 1e16 else f"{value:g}"
+        return _fmt_double(value)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return ""
     return str(value)
 
 
@@ -3855,11 +3906,22 @@ def _convert_value(value: Any, target: Any) -> Any:
             try:
                 return _ObjectId(value)
             except Exception as exc:
-                # mongod names the LENGTH it wanted, whatever went wrong.
+                # mongod reports the LENGTH only when the length is actually
+                # wrong; a 24-character string with a non-hex character in it
+                # names that CHARACTER instead (probed 8.2.11, 2026-09-01 --
+                # `"z" * 24` says "Invalid character found in hex string: z").
+                # Reporting "expected 24 but found 24" was a nonsense sentence.
+                if len(value) == 24:
+                    bad = next(c for c in value if c not in _HEX_DIGITS)
+                    reason = f"Invalid character found in hex string: {bad}"
+                else:
+                    reason = (
+                        f"Invalid string length for parsing to OID, expected 24 "
+                        f"but found {len(value)}"
+                    )
                 raise ExpressionError(
-                    f"Failed to parse objectId '{value}' in $convert with no onError value: "
-                    f"Invalid string length for parsing to OID, expected 24 but found "
-                    f"{len(value)}",
+                    f"Failed to parse objectId '{value}' in $convert with no onError "
+                    f"value: {reason}",
                     code=241,
                     code_name="ConversionFailure",
                 ) from exc

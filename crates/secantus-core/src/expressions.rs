@@ -463,16 +463,17 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$dateSubtract" => op_date_add(arg, ctx, -1),
         "$dateDiff" => op_date_diff(arg, ctx),
         "$dateTrunc" => op_date_trunc(arg, ctx),
-        // type conversions (safe subset; Decimal128 / string-parse / float
-        // str() defer to Python)
-        "$toInt" => op_to_int(arg, ctx),
-        "$toLong" => op_to_long(arg, ctx),
-        "$toDouble" => op_to_double(arg, ctx),
-        "$toDecimal" => op_to_decimal(arg, ctx),
-        "$toDate" => op_to_date(arg, ctx),
+        // type conversions -- every shorthand IS `$convert` with that target,
+        // routed through the one implementation. See `op_to_shorthand`.
+        "$toInt" => op_to_shorthand(arg, ctx, 16),
+        "$toLong" => op_to_shorthand(arg, ctx, 18),
+        "$toDouble" => op_to_shorthand(arg, ctx, 1),
+        "$toDecimal" => op_to_shorthand(arg, ctx, 19),
+        "$toDate" => op_to_shorthand(arg, ctx, 9),
+        "$toObjectId" => op_to_shorthand(arg, ctx, 7),
         "$convert" => op_convert(arg, ctx),
-        "$toBool" => op_to_bool(arg, ctx),
-        "$toString" => op_to_string(arg, ctx),
+        "$toBool" => op_to_shorthand(arg, ctx, 8),
+        "$toString" => op_to_shorthand(arg, ctx, 2),
         "$regexMatch" => op_regex_match(arg, ctx),
         "$regexFind" => op_regex_find(arg, ctx),
         "$regexFindAll" => op_regex_find_all(arg, ctx),
@@ -637,6 +638,7 @@ pub const KNOWN_EXPR_OPS: &[&str] = &[
     "$toDouble",
     "$toDecimal",
     "$toDate",
+    "$toObjectId",
     "$convert",
     "$toBool",
     "$toString",
@@ -3372,117 +3374,21 @@ fn op_date_trunc(arg: &Bson, ctx: &Ctx) -> R {
 
 // --- type conversions ---------------------------------------------------
 
-fn op_to_int(arg: &Bson, ctx: &Ctx) -> R {
-    // $toInt targets int32: an int64 or a double outside [i32::MIN, i32::MAX]
-    // overflows (Python raises 241). Non-finite / Decimal128 / string -> Python.
-    let n: i64 = match eval(arg, ctx)? {
-        Bson::Null => return Ok(Bson::Null),
-        Bson::Int32(v) => v as i64,
-        Bson::Int64(v) => v,
-        Bson::Boolean(b) => i64::from(b),
-        Bson::Double(d) => {
-            if !d.is_finite() {
-                return Err(Fallback::Defer);
-            }
-            let t = d.trunc();
-            if t < i32::MIN as f64 || t > i32::MAX as f64 {
-                return Err(Fallback::Defer);
-            }
-            t as i64
-        }
-        _ => return Err(Fallback::Defer),
-    };
-    if !(i32::MIN as i64..=i32::MAX as i64).contains(&n) {
-        return Err(Fallback::Defer); // overflow int32 -> Python raises 241
-    }
-    Ok(Bson::Int32(n as i32))
-}
-
-fn op_to_long(arg: &Bson, ctx: &Ctx) -> R {
-    // $toLong targets int64: a double is truncated toward zero (out of i64 range
-    // -> Python raises 241). Non-finite / Decimal128 / string -> Python.
-    let n: i64 = match eval(arg, ctx)? {
-        Bson::Null => return Ok(Bson::Null),
-        Bson::Int32(v) => v as i64,
-        Bson::Int64(v) => v,
-        Bson::Boolean(b) => i64::from(b),
-        Bson::Double(d) => {
-            if !d.is_finite() {
-                return Err(Fallback::Defer);
-            }
-            let t = d.trunc();
-            // [-2^63, 2^63): a double at or beyond 2^63 can't be an i64.
-            if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&t) {
-                return Err(Fallback::Defer); // overflow int64 -> Python raises 241
-            }
-            t as i64
-        }
-        _ => return Err(Fallback::Defer),
-    };
-    Ok(Bson::Int64(n))
-}
-
-fn op_to_double(arg: &Bson, ctx: &Ctx) -> R {
-    match eval(arg, ctx)? {
-        Bson::Null => Ok(Bson::Null),
-        Bson::Boolean(b) => Ok(Bson::Double(if b { 1.0 } else { 0.0 })),
-        Bson::Int32(n) => Ok(Bson::Double(n as f64)),
-        Bson::Int64(n) => Ok(Bson::Double(n as f64)),
-        v @ Bson::Double(_) => Ok(v),
-        _ => Err(Fallback::Defer), // Decimal128 / string parsing -> Python
-    }
-}
-
-fn op_to_decimal(arg: &Bson, ctx: &Ctx) -> R {
-    let v = eval(arg, ctx)?;
-    match v {
-        Bson::Null => Ok(Bson::Null),
-        Bson::Decimal128(_) => Ok(v),
-        Bson::Int32(n) => decimal_from_str(&n.to_string()),
-        Bson::Int64(n) => decimal_from_str(&n.to_string()),
-        Bson::Boolean(b) => decimal_from_str(if b { "1" } else { "0" }),
-        // mongod converts a double at a fixed 15 significant digits, so
-        // `$toDecimal: 4.125` is `4.12500000000000` — the shortest round-trip
-        // text would answer `4.125`, a different quantum. (The `$sum`/`$avg`
-        // accumulators use a *different* rule; see `crate::decimal`.)
-        Bson::Double(d) if d.is_finite() => crate::decimal::from_bson(&Bson::Double(d))
-            .and_then(|v| crate::decimal::to_bson(&v))
-            .ok_or(Fallback::Defer),
-        Bson::String(ref s) => decimal_from_str(s),
-        _ => Err(Fallback::Defer),
-    }
-}
-
-fn decimal_from_str(s: &str) -> R {
-    s.parse::<bson::Decimal128>()
-        .map(Bson::Decimal128)
-        .map_err(|_| Fallback::Defer)
-}
-
-/// `$toDate: <expr>` — shorthand for `$convert: {input: <expr>, to: "date"}`.
-/// Delegates to the exact `convert_value(.., 9)` date path so the two stay
-/// identical. `null` -> null; a `DateTime` is returned unchanged; every other
-/// source type (int/long/double millis, ISO string, ObjectId) defers to Python,
-/// mirroring the `$convert` date path (which defers those to keep the tz-aware /
-/// naive datetime parity intact).
-fn op_to_date(arg: &Bson, ctx: &Ctx) -> R {
-    let v = eval(arg, ctx)?;
-    if matches!(v, Bson::Null) {
-        return Ok(Bson::Null);
-    }
-    match convert_value(&v, 9) {
-        Conv::Ok(out) => Ok(out),
-        Conv::Failed | Conv::Unsupported => Err(Fallback::Defer),
-    }
-}
-
 /// `$convert` outcome for one (value, target): a successful conversion, a
 /// supported conversion that *failed* (Python would raise → `onError` applies),
 /// or a target/source combination this bounded port doesn't implement (defer the
 /// whole `$convert` to Python).
 enum Conv {
     Ok(Bson),
+    /// The conversion is supported and FAILED, with no message of its own --
+    /// `onError` covers it, and without `onError` the pure engine states it.
     Failed,
+    /// The conversion failed with an error mongod names (a bad numeric string
+    /// says WHY: "Did not consume whole string.", "Leading whitespace", ...).
+    /// `onError` still covers it; without `onError` the message goes to the
+    /// client, which is the difference between the Rust server reporting the
+    /// bad input and reporting that it cannot do `$convert`.
+    Named(Fallback),
     Unsupported,
 }
 
@@ -3491,6 +3397,30 @@ enum Conv {
 /// here; string / objectId targets and string/Decimal128 numeric sources defer
 /// to Python. `null` input → `onNull` (or null); a failed *supported* conversion
 /// → `onError` (or defer so Python raises the same error).
+/// The `$toX` shorthands ARE `$convert: {input: <expr>, to: "X"}` with no
+/// `onNull` / `onError`. mongod routes every one through the same conversion --
+/// which is why a failure names `$convert` even when the caller wrote `$toInt`
+/// -- and so does the pure engine.
+///
+/// They used to be six separate implementations here, and they had drifted:
+/// `$toBool` and `$convert {to: "bool"}` disagreed on the empty string inside
+/// this one engine, and `$toInt` / `$toLong` / `$toDouble` / `$toDecimal` all
+/// deferred on a string source long after `$convert` learned to parse one --
+/// so on the standalone Rust server `{$toInt: "5"}` reported that the server
+/// could not do `$toInt`. One implementation, one behaviour.
+fn op_to_shorthand(arg: &Bson, ctx: &Ctx, code: i32) -> R {
+    let v = eval(arg, ctx)?;
+    if matches!(v, Bson::Null | Bson::Undefined) {
+        return Ok(Bson::Null);
+    }
+    match convert_value(&v, code) {
+        Conv::Ok(out) => Ok(out),
+        // With no `onError` to catch it, a named failure IS the answer.
+        Conv::Named(fault) => Err(fault),
+        Conv::Failed | Conv::Unsupported => Err(Fallback::Defer),
+    }
+}
+
 fn op_convert(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback::Defer)?;
     let (Some(input), Some(to)) = (spec.get("input"), spec.get("to")) else {
@@ -3510,6 +3440,10 @@ fn op_convert(arg: &Bson, ctx: &Ctx) -> R {
         Conv::Failed => match spec.get("onError") {
             Some(on) => eval(on, ctx),
             None => Err(Fallback::Defer), // Python raises "$convert failed"
+        },
+        Conv::Named(fault) => match spec.get("onError") {
+            Some(on) => eval(on, ctx),
+            None => Err(fault),
         },
         Conv::Unsupported => Err(Fallback::Defer),
     }
@@ -3537,6 +3471,209 @@ fn convert_target_code(target: &Bson) -> Option<i32> {
     matches!(code, 1 | 2 | 7 | 8 | 9 | 16 | 18 | 19).then_some(code)
 }
 
+/// mongod's numeric-string syntax, which is C's `strtod` and NOT the host
+/// language's number parser. `str::parse` (like Python's `float()`) accepts
+/// things mongod refuses -- leading/trailing whitespace above all -- so these
+/// gates run BEFORE any parse. Mirrors `expressions.py::_STRICT_*_RE`.
+fn strict_int_syntax(v: &str) -> bool {
+    let body = v.strip_prefix(['+', '-']).unwrap_or(v);
+    !body.is_empty() && body.bytes().all(|c| c.is_ascii_digit())
+}
+
+/// How much of `v` C's `strtod` would consume, in bytes. Used both as the
+/// whole-string gate (`consumed == v.len()`) and to tell mongod's two "not a
+/// number" reasons apart: nothing consumed at all versus a valid prefix with
+/// junk after it.
+fn strtod_prefix_len(v: &str) -> usize {
+    let b = v.as_bytes();
+    let mut i = 0;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        i += 1;
+    }
+    let rest = &v[i..];
+    let low = rest.to_ascii_lowercase();
+    for word in ["infinity", "inf", "nan"] {
+        if low.starts_with(word) {
+            return i + word.len();
+        }
+    }
+    let start_digits = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    let int_digits = i - start_digits;
+    let mut frac_digits = 0;
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+            frac_digits += 1;
+        }
+    }
+    if int_digits == 0 && frac_digits == 0 {
+        return 0; // strtod consumed nothing, not even the sign
+    }
+    // An exponent counts only if it is complete: "1e" consumes just "1".
+    let before_exp = i;
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        i += 1;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            i += 1;
+        }
+        let exp_start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == exp_start {
+            return before_exp;
+        }
+    }
+    i
+}
+
+fn strict_float_syntax(v: &str) -> bool {
+    !v.is_empty() && strtod_prefix_len(v) == v.len()
+}
+
+/// mongod's hexadecimal gate is a LITERAL `startsWith("0x")` -- lower-case
+/// only, and with no sign allowed before it. Probed 8.2.11 (2026-09-01):
+/// `"0x10"` is "Illegal hexadecimal input", while `"0X10"`, `"-0x10"` and
+/// `"+0x10"` all slip past and go to the ordinary per-target parser.
+fn hex_prefixed(v: &str) -> bool {
+    v.starts_with("0x")
+}
+
+/// C99 hexadecimal-FLOAT syntax, which `strtod` reads and `f64::from_str` does
+/// not. Only reachable for the spellings [`hex_prefixed`] lets through, and
+/// mongod really does convert those: `$toDouble: "0X1f"` is 31.0 and `"-0x10"`
+/// is -16.0. Refusing them was a wrong ANSWER, not just a wrong message.
+fn parse_hex_float(v: &str) -> Option<f64> {
+    let (neg, body) = match v.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, v.strip_prefix('+').unwrap_or(v)),
+    };
+    let body = body
+        .strip_prefix("0x")
+        .or_else(|| body.strip_prefix("0X"))?;
+    let (digits, exp) = match body.find(['p', 'P']) {
+        Some(i) => (&body[..i], body[i + 1..].parse::<i32>().ok()?),
+        None => (body, 0),
+    };
+    let (int_part, frac_part) = match digits.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (digits, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    let mut value = 0.0f64;
+    for c in int_part.chars() {
+        value = value * 16.0 + c.to_digit(16)? as f64;
+    }
+    let mut scale = 1.0f64 / 16.0;
+    for c in frac_part.chars() {
+        value += c.to_digit(16)? as f64 * scale;
+        scale /= 16.0;
+    }
+    value *= 2f64.powi(exp);
+    Some(if neg { -value } else { value })
+}
+
+/// The spellings that legitimately MEAN infinity, so an infinite parse result
+/// is the answer rather than an out-of-range failure.
+fn spells_infinity(v: &str) -> bool {
+    let body = v.strip_prefix(['+', '-']).unwrap_or(v).to_ascii_lowercase();
+    body == "inf" || body == "infinity"
+}
+
+/// mongod's ConversionFailure for an unreadable numeric string. Two shapes,
+/// both probed on 8.2.11 (2026-09-01); the operator is always named `$convert`
+/// even when the caller wrote `$toInt`, because mongod routes every conversion
+/// through it. Mirrors `expressions.py::_number_parse_error`.
+fn number_parse_error(value: &str, reason: &str) -> Fallback {
+    let message = if reason == HEX_REASON {
+        format!("Illegal hexadecimal input in $convert with no onError value: {value}")
+    } else {
+        format!("Failed to parse number '{value}' in $convert with no onError value: {reason}")
+    };
+    Fallback::mongo(241, message)
+}
+
+const HEX_REASON: &str = "<hex>";
+
+/// The reasons are NOT the same set per target -- int says "No digits" where
+/// double says "Empty string", double alone separates "consumed nothing" from
+/// "consumed a prefix", and decimal has only the one. That asymmetry is
+/// mongod's, measured, not a simplification here.
+fn parse_int_string(value: &str) -> Result<i128, Fallback> {
+    if value.is_empty() {
+        return Err(number_parse_error(value, "No digits"));
+    }
+    if hex_prefixed(value) {
+        return Err(number_parse_error(value, HEX_REASON));
+    }
+    if !strict_int_syntax(value) {
+        return Err(number_parse_error(value, "Did not consume whole string."));
+    }
+    value.parse::<i128>().map_err(|_| Fallback::Defer) // past i128 -> Python
+}
+
+/// Gate a string for the DECIMAL target. Decimal has only one failure reason
+/// beyond the empty and hex cases -- unlike double, it does not separate "did
+/// not consume any digits" from "did not consume whole string". That asymmetry
+/// is mongod's, measured on 8.2.11 (2026-09-01), and it is also why decimal
+/// does NOT get the hex-float acceptance double has: `$toDecimal: "0X1f"` is a
+/// failure where `$toDouble: "0X1f"` is 31.0.
+fn parse_decimal_string(value: &str) -> Result<(), Fallback> {
+    if value.is_empty() {
+        return Err(number_parse_error(value, "Empty string"));
+    }
+    if hex_prefixed(value) {
+        return Err(number_parse_error(value, HEX_REASON));
+    }
+    if !strict_float_syntax(value) {
+        return Err(number_parse_error(
+            value,
+            "Failed to parse string to decimal",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_float_string(value: &str) -> Result<f64, Fallback> {
+    if value.is_empty() {
+        return Err(number_parse_error(value, "Empty string"));
+    }
+    if value.starts_with(char::is_whitespace) {
+        return Err(number_parse_error(value, "Leading whitespace"));
+    }
+    if hex_prefixed(value) {
+        return Err(number_parse_error(value, HEX_REASON));
+    }
+    if !strict_float_syntax(value) {
+        if let Some(hex) = parse_hex_float(value) {
+            return Ok(hex);
+        }
+        return Err(number_parse_error(
+            value,
+            if strtod_prefix_len(value) == 0 {
+                "Did not consume any digits"
+            } else {
+                "Did not consume whole string."
+            },
+        ));
+    }
+    // Rust's `f64::from_str` accepts exactly this syntax once the gates above
+    // have passed, and both engines land on the same libm-rounded value.
+    let parsed = value.parse::<f64>().map_err(|_| Fallback::Defer)?;
+    // `strtod` reports a magnitude it cannot represent as a RANGE error rather
+    // than saturating: `$toDouble: "1e400"` is a 241, not `inf`.
+    if parsed.is_infinite() && !spells_infinity(value) {
+        return Err(number_parse_error(value, "Out of range"));
+    }
+    Ok(parsed)
+}
+
 fn convert_value(value: &Bson, code: i32) -> Conv {
     match code {
         // double
@@ -3545,7 +3682,50 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
             Bson::Int32(n) => Conv::Ok(Bson::Double(*n as f64)),
             Bson::Int64(n) => Conv::Ok(Bson::Double(*n as f64)),
             Bson::Double(_) => Conv::Ok(value.clone()),
-            _ => Conv::Unsupported, // Decimal128 / string / date -> Python
+            Bson::String(s) => match parse_float_string(s) {
+                Ok(d) => Conv::Ok(Bson::Double(d)),
+                Err(Fallback::Defer) => Conv::Unsupported,
+                Err(e) => Conv::Named(e),
+            },
+            _ => Conv::Unsupported, // Decimal128 / date -> Python
+        },
+        // objectId
+        7 => match value {
+            Bson::ObjectId(_) => Conv::Ok(value.clone()),
+            Bson::String(text) => match text.parse::<bson::oid::ObjectId>() {
+                Ok(oid) => Conv::Ok(Bson::ObjectId(oid)),
+                // mongod reports the LENGTH only when the length is actually
+                // wrong; a 24-character string holding a non-hex character
+                // names that CHARACTER instead (probed 8.2.11) -- "expected 24
+                // but found 24" is a sentence the server never says.
+                Err(_) => {
+                    let count = text.chars().count();
+                    let reason = match text.chars().find(|c| !c.is_ascii_hexdigit()) {
+                        Some(bad) if count == 24 => {
+                            format!("Invalid character found in hex string: {bad}")
+                        }
+                        _ => format!(
+                            "Invalid string length for parsing to OID, expected 24 but \
+                             found {count}"
+                        ),
+                    };
+                    Conv::Named(Fallback::mongo(
+                        241,
+                        format!(
+                            "Failed to parse objectId '{text}' in $convert with no \
+                             onError value: {reason}"
+                        ),
+                    ))
+                }
+            },
+            _ => Conv::Unsupported,
+        },
+        // string
+        2 => match to_string_value(value) {
+            Some(text) => Conv::Ok(Bson::String(text)),
+            // Binary wants a base64 encoder this crate does not carry, and
+            // JavaScript is a ConversionFailure mongod names -- both to Python.
+            None => Conv::Unsupported,
         },
         // bool — non-(bool/int/double/string/Decimal128) is truthy.
         8 => match value {
@@ -3571,7 +3751,18 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
                 wrap_int(d.trunc() as i128, code)
             }
             Bson::Double(_) => Conv::Failed, // int(inf/overflow) raises -> onError
-            _ => Conv::Unsupported,          // Decimal128 / string -> Python
+            Bson::String(s) => match parse_int_string(s) {
+                // From a STRING, mongod reports an out-of-range value as a
+                // parse failure carrying the original text -- not as the
+                // "Conversion would overflow target type" a numeric input gets.
+                Ok(n) => match wrap_int(n, code) {
+                    Conv::Failed => Conv::Named(number_parse_error(s, "Overflow")),
+                    other => other,
+                },
+                Err(Fallback::Defer) => Conv::Unsupported,
+                Err(e) => Conv::Named(e),
+            },
+            _ => Conv::Unsupported, // Decimal128 -> Python
         },
         // decimal (the full $toDecimal set, incl. parseable strings)
         19 => match value {
@@ -3588,7 +3779,10 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
                     None => Conv::Unsupported,
                 }
             }
-            Bson::String(s) => decimal_conv(s),
+            Bson::String(s) => match parse_decimal_string(s) {
+                Ok(()) => decimal_conv(s),
+                Err(e) => Conv::Named(e),
+            },
             _ => Conv::Unsupported,
         },
         // date — passthrough only. int/float/string -> Python: the oracle
@@ -3643,42 +3837,26 @@ fn decimal_conv(s: &str) -> Conv {
     }
 }
 
-fn op_to_bool(arg: &Bson, ctx: &Ctx) -> R {
-    Ok(match eval(arg, ctx)? {
-        Bson::Null => Bson::Null,
-        Bson::Boolean(b) => Bson::Boolean(b),
-        Bson::Int32(n) => Bson::Boolean(n != 0),
-        Bson::Int64(n) => Bson::Boolean(n != 0),
-        Bson::Double(d) => Bson::Boolean(d != 0.0), // NaN -> true
-        // Every string is true, the EMPTY one included -- `{$toBool: ""}` is
-        // true on mongod (probed 8.2.11); this used Python's own truthiness.
-        Bson::String(_) => Bson::Boolean(true),
-        Bson::Decimal128(_) => return Err(Fallback::Defer),
-        // every other type is truthy.
-        _ => Bson::Boolean(true),
-    })
-}
-
 /// `$toString` -- mongod's `$convert` to string. See `coerce_to_string` for
 /// how this differs from the conversion `$toLower` / `$toUpper` use. Defers on
 /// the types mongod rejects with ConversionFailure (241), which needs a code
 /// this engine can't name.
-fn op_to_string(arg: &Bson, ctx: &Ctx) -> R {
-    Ok(match eval(arg, ctx)? {
-        Bson::Null | Bson::Undefined => Bson::Null,
-        Bson::Int32(n) => Bson::String(n.to_string()),
-        Bson::Int64(n) => Bson::String(n.to_string()),
-        Bson::Boolean(b) => Bson::String(if b { "true" } else { "false" }.to_string()),
-        Bson::Double(d) => Bson::String(format_double_roundtrip(d)),
-        Bson::Decimal128(d) => Bson::String(d.to_string()),
-        Bson::ObjectId(oid) => Bson::String(oid.to_hex()),
-        Bson::DateTime(dt) => {
-            Bson::String(render_date(dt.timestamp_millis(), "%Y-%m-%dT%H:%M:%S.%LZ")?)
-        }
-        v @ Bson::String(_) => v,
-        // Binary is base64 here, which this engine has no encoder for; every
-        // other remaining type is a ConversionFailure. Both -> Python.
-        _ => return Err(Fallback::Defer),
+/// mongod's `$convert`-to-string rendering. `None` for the values this engine
+/// cannot render: Binary (base64, no encoder here) and JavaScript / the other
+/// ConversionFailure types. Shared by `$toString` and `$convert {to: "string"}`
+/// -- they are the same operation in mongod, and two copies is exactly how
+/// `$toBool` and `$convert {to: "bool"}` came to disagree inside one engine.
+fn to_string_value(v: &Bson) -> Option<String> {
+    Some(match v {
+        Bson::Int32(n) => n.to_string(),
+        Bson::Int64(n) => n.to_string(),
+        Bson::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
+        Bson::Double(d) => format_double_roundtrip(*d),
+        Bson::Decimal128(d) => d.to_string(),
+        Bson::ObjectId(oid) => oid.to_hex(),
+        Bson::DateTime(dt) => render_date(dt.timestamp_millis(), "%Y-%m-%dT%H:%M:%S.%LZ").ok()?,
+        Bson::String(s) => s.clone(),
+        _ => return None,
     })
 }
 
@@ -3781,6 +3959,44 @@ fn math_float(v: &Bson) -> Result<f64, Fallback> {
     as_float_like(v).ok_or(Fallback::Defer)
 }
 
+/// [`math_float`] that NAMES the type error rather than deferring. Decimal128
+/// still defers -- it is numeric to mongod, so the operator has a real answer
+/// and computing it needs the decimal engine -- but a bool / string / document /
+/// date operand is a type error mongod states, and stating it is the difference
+/// between the standalone Rust server saying "$ln only supports numeric types,
+/// not string" and saying it cannot do `$ln`.
+fn math_float_named(v: &Bson, op: &str, code: i32) -> Result<f64, Fallback> {
+    if matches!(v, Bson::Decimal128(_)) {
+        return Err(Fallback::Defer);
+    }
+    if matches!(v, Bson::Boolean(_)) || as_float_like(v).is_none() {
+        return Err(Fallback::mongo(
+            code,
+            format!(
+                "{op} only supports numeric types, not {}",
+                crate::query::bson_type_name(v)
+            ),
+        ));
+    }
+    Ok(as_float_like(v).expect("checked numeric above"))
+}
+
+/// The `$log` / `$pow` type guards, which do NOT use the shared "only supports
+/// numeric types" wording -- each names the argument position instead, with its
+/// own code. Probed 8.2.11.
+fn math_operand_named(v: &Bson, message: &str, code: i32) -> Result<f64, Fallback> {
+    if matches!(v, Bson::Decimal128(_)) {
+        return Err(Fallback::Defer);
+    }
+    if matches!(v, Bson::Boolean(_)) || as_float_like(v).is_none() {
+        return Err(Fallback::mongo(
+            code,
+            format!("{message}{}", crate::query::bson_type_name(v)),
+        ));
+    }
+    Ok(as_float_like(v).expect("checked numeric above"))
+}
+
 fn op_abs(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
@@ -3831,11 +4047,11 @@ fn op_sqrt(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         v => {
-            let f = math_float(&v)?; // bool / Decimal128 / non-numeric -> Python
-                                     // NaN passes through as sqrt(nan) = nan; a negative argument is a
-                                     // domain error mongod names, and `$sqrt` is the one operator in
-                                     // this family that omits the ", but is <v>" suffix the others carry
-                                     // (probed 8.2.11).
+            let f = math_float_named(&v, "$sqrt", 28765)?;
+            // NaN passes through as sqrt(nan) = nan; a negative argument is a
+            // domain error mongod names, and `$sqrt` is the one operator in
+            // this family that omits the ", but is <v>" suffix the others carry
+            // (probed 8.2.11).
             if f < 0.0 {
                 Err(Fallback::mongo(
                     28714,
@@ -3853,7 +4069,7 @@ fn op_sqrt(arg: &Bson, ctx: &Ctx) -> R {
 fn op_exp(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
-        v => Ok(Bson::Double(math_float(&v)?.exp())),
+        v => Ok(Bson::Double(math_float_named(&v, "$exp", 28765)?.exp())),
     }
 }
 
@@ -3864,7 +4080,7 @@ fn op_ln(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         v => {
-            let f = math_float(&v)?;
+            let f = math_float_named(&v, "$ln", 28765)?;
             if f <= 0.0 {
                 Err(Fallback::mongo(
                     28766,
@@ -3884,7 +4100,7 @@ fn op_log10(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         v => {
-            let f = math_float(&v)?;
+            let f = math_float_named(&v, "$log10", 28765)?;
             // NaN passes through as log10(nan) = nan.
             if f <= 0.0 {
                 Err(Fallback::mongo(
@@ -3912,11 +4128,8 @@ fn op_log(arg: &Bson, ctx: &Ctx) -> R {
     if is_null(&vals[0]) || is_null(&vals[1]) {
         return Ok(Bson::Null);
     }
-    // bool / non-numeric argument or base is mongod's Location28756 / 28757 —
-    // defer so Python raises them (math_float rejects bool, unlike as_float_like).
-    let (Ok(n), Ok(base)) = (math_float(&vals[0]), math_float(&vals[1])) else {
-        return Err(Fallback::Defer);
-    };
+    let n = math_operand_named(&vals[0], "$log's argument must be numeric, not ", 28756)?;
+    let base = math_operand_named(&vals[1], "$log's base must be numeric, not ", 28757)?;
     // Out-of-domain args, named rather than deferred (NaN passes through).
     if n <= 0.0 {
         return Err(Fallback::mongo(
@@ -3953,11 +4166,12 @@ fn op_pow(arg: &Bson, ctx: &Ctx) -> R {
     if is_null(&vals[0]) || is_null(&vals[1]) {
         return Ok(Bson::Null);
     }
-    // A bool operand defers (Python raises 28762 base / 28763 exponent);
-    // as_float_like would otherwise coerce it to 1.0.
-    if matches!(vals[0], Bson::Boolean(_)) || matches!(vals[1], Bson::Boolean(_)) {
-        return Err(Fallback::Defer);
-    }
+    // The type guard runs before the integer fast path below: `as_float_like`
+    // would otherwise coerce a bool to 1.0 and answer a number where mongod
+    // refuses. Decimal128 still defers (it is numeric -- the decimal engine
+    // computes it).
+    math_operand_named(&vals[0], "$pow's base must be numeric, not ", 28762)?;
+    math_operand_named(&vals[1], "$pow's exponent must be numeric, not ", 28763)?;
     if let (b @ (Bson::Int32(_) | Bson::Int64(_)), e @ (Bson::Int32(_) | Bson::Int64(_))) =
         (&vals[0], &vals[1])
     {

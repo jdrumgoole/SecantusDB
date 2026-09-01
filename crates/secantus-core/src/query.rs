@@ -1747,7 +1747,13 @@ fn mod_int(val: &Bson) -> Result<Option<i64>, Fallback> {
                 Some(d.trunc() as i64)
             }
         }
-        Bson::Decimal128(_) => return Err(Fallback::Defer),
+        // Truncated toward zero on the decimal digits, not through f64 --
+        // this used to defer, which on the standalone Rust server made
+        // `{dec: {$mod: [2, 0]}}` answer "query uses a construct the Rust
+        // server does not support" for an ordinary query.
+        Bson::Decimal128(d) => crate::decimal::parse(&d.to_string())
+            .as_ref()
+            .and_then(crate::decimal::trunc_to_i64),
         // bool and every non-numeric type: not eligible (no match), not an error.
         _ => None,
     })
