@@ -1724,6 +1724,32 @@ lives on as a randomised differential.
       (``int(Decimal("Infinity"))`` -> ``OverflowError`` -> internal server
       error). Fixed with the rest of the ``$convert`` work in §7.
 
+### 2026-09-01: the parity suite caught the ENGINES drifting (found by CI)
+
+- [x] **The Rust engine disagreed with itself about `$toBool` vs
+      `$convert: {to: "bool"}`.** Fixing the Python side of "every BSON string
+      is true, the empty one included" turned the parity suite red on
+      `{$convert: {input: "", to: "bool"}}` -- Rust answered `false`. The cause
+      was not that Rust lagged: `op_to_bool` ALREADY had the right rule and
+      cited the 8.2.11 probe, while `convert_value`'s bool arm still carried
+      Python's own truthiness (`!s.is_empty()`). **Two copies of one rule, in
+      one engine, disagreeing** -- the identical shape to the Python
+      `$toX`-versus-`$convert` split this batch collapsed. Both now say true.
+- [x] **The Rust engine converted an int32 to a date** where mongod answers
+      `241 Unsupported conversion from int to date` -- only a LONG is epoch
+      milliseconds. Found by inspection while fixing the above, before it could
+      turn the suite red, because the curated corpus does not reach it. Now
+      `Conv::Failed`, so `$convert`'s `onError` applies and a bare `$toDate`
+      defers to Python, which raises mongod's error.
+
+      **Both were caught only in CI**, because a worktree venv without
+      `secantus-core` import-SKIPS all ~1,700 parity tests and still exits 0 --
+      the trap `CLAUDE.md` names, and comparing the collected count does not
+      reveal it when every run in that venv is missing the same tests. Build the
+      extension into the worktree venv (`uv pip install ./crates/secantus-core-py`,
+      ~15s, no WiredTiger needed) before trusting a green run that touched an
+      operator engine.
+
 ### 2026-09-01: `let` broke every pipeline update (found by the pymongo gauge)
 
 - [x] **A `let` variable made a pipeline update FAIL with "undefined

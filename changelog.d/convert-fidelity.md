@@ -49,3 +49,11 @@ against MongoDB 8.2.11 is now at zero divergences.
   accumulator's fold, so the two forms cannot disagree. Found by the same sweep,
   which also confirmed that most of the "missing operators" list in
   `docs/feature-comparison.md` had quietly started working.
+
+#### Fixed (Rust engine, to keep the two in step)
+
+- `secantus-core`: `$convert: {to: "bool"}` returns true for every string. The
+  `$toBool` shorthand already did — the two copies had drifted *inside one
+  engine*, the same shape as the Python split this change collapses.
+- `secantus-core`: `to: "date"` refuses an int32, matching MongoDB; it used to
+  read one as epoch milliseconds.
