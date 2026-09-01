@@ -574,9 +574,74 @@ def expression_problem_in_pipeline(
         # No structural problem: mongod would now FOLD the constant
         # sub-expressions, and an error in one is reported at optimization time
         # under its own prefix rather than the stage's.
+        # A LITERAL timezone is validated eagerly, before folding. mongod parses
+        # a date operator's `timezone` at optimization time whether or not the
+        # rest of the expression is constant, so `{$hour: {date: "$d",
+        # timezone: "Not/AZone"}}` -- which reads the document and therefore
+        # does not fold -- still reports under the optimizer's prefix. Probed
+        # 8.2.11 (2026-09-01).
+        bad_zone = _literal_timezone_problem(spec)
+        if bad_zone:
+            return (bad_zone[0], bad_zone[1], FOLD_WRAPPER)
         folded = _fold_in_stage(name, spec, bound, fold_vars)
         if folded:
             return (folded[0], folded[1], FOLD_WRAPPER)
+    return None
+
+
+# The date operators that take a `timezone`, and the two that name the parameter
+# in the failure message rather than reporting it bare.
+_TIMEZONE_OPERATORS = frozenset(
+    {
+        "$dateAdd",
+        "$dateDiff",
+        "$dateFromParts",
+        "$dateFromString",
+        "$dateSubtract",
+        "$dateToParts",
+        "$dateToString",
+        "$dateTrunc",
+        "$dayOfMonth",
+        "$dayOfWeek",
+        "$dayOfYear",
+        "$hour",
+        "$isoDayOfWeek",
+        "$isoWeek",
+        "$isoWeekYear",
+        "$millisecond",
+        "$minute",
+        "$month",
+        "$second",
+        "$week",
+        "$year",
+    }
+)
+
+
+def _literal_timezone_problem(spec: Any) -> tuple[int, str] | None:
+    """The first date operator in `spec` carrying an unusable literal timezone."""
+    from secantus.expressions import ExpressionError, resolve_timezone_argument
+
+    if isinstance(spec, Mapping):
+        for key, value in spec.items():
+            if (
+                key in _TIMEZONE_OPERATORS
+                and isinstance(value, Mapping)
+                and isinstance(value.get("timezone"), str)
+            ):
+                try:
+                    resolve_timezone_argument(value["timezone"], operator=key)
+                except ExpressionError as exc:
+                    return (exc.code, str(exc))
+            found = _literal_timezone_problem(value)
+            if found:
+                return found
+        return None
+    if isinstance(spec, list):
+        for item in spec:
+            found = _literal_timezone_problem(item)
+            if found:
+                return found
     return None
 
 
