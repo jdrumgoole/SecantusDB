@@ -208,6 +208,45 @@ def fmt_double_parse(value: float) -> str:
     return repr(value)
 
 
+def bson_value_repr_stage(value: Any) -> str:
+    """Render a BSON value the way an AGGREGATION STAGE error echoes it.
+
+    mongod has **two** renderings and they are not interchangeable. Probed
+    side by side on 8.2.11 (2026-09-01) -- `$size` for the query family,
+    `$redact` for this one -- they differ in six places::
+
+        type        query family              stage family
+        array       [ 1 ]                     [1]
+        document    { a: 1 }                  {a: 1}
+        binary      BinData(0, 7A)            BinData(0, "7A")
+        objectId    ObjectId('507f…')         507f…
+        date        new Date(1577923200000)   2020-01-02T00:00:00.000Z
+        javascript  x=1                       Code("x=1")
+
+    Everything else -- strings, numbers, bools, null, regex, MinKey / MaxKey,
+    Timestamp, Decimal128 -- is identical, which is what makes the difference
+    easy to miss: reusing :func:`bson_value_repr` here fixes the types a
+    probe happens to cover and quietly breaks the six above.
+    """
+    if isinstance(value, Code):
+        return f'Code("{value}")'
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, _dt.datetime):
+        aware = value if value.tzinfo else value.replace(tzinfo=_dt.timezone.utc)
+        return aware.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + (
+            f"{aware.microsecond // 1000:03d}Z"
+        )
+    if isinstance(value, (bytes, Binary, bytearray)):
+        subtype = getattr(value, "subtype", 0)
+        return f'BinData({subtype}, "{bytes(value).hex().upper()}")'
+    if isinstance(value, list):
+        return "[" + ", ".join(bson_value_repr_stage(v) for v in value) + "]"
+    if isinstance(value, Mapping):
+        return "{" + ", ".join(f"{k}: {bson_value_repr_stage(v)}" for k, v in value.items()) + "}"
+    return bson_value_repr(value)
+
+
 def bson_value_repr(value: Any) -> str:
     """Render a BSON value the way mongod echoes an offending one back.
 

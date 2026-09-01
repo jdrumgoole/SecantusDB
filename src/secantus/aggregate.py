@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import datetime as _dt
 import decimal as _decimal
+import functools
 import math
 import os
 from collections.abc import Callable, Mapping
@@ -10,9 +11,10 @@ from dataclasses import dataclass
 from dataclasses import field as _dc_field
 from typing import TYPE_CHECKING, Any
 
-from bson import Binary, Code, Decimal128, ObjectId
+from bson import Binary, Code, Decimal128
 
 from secantus import deadline as _deadline
+from secantus.bsontypes import bson_value_repr, bson_value_repr_stage
 from secantus.expressions import (
     MISSING,
     ExpressionError,
@@ -88,45 +90,23 @@ REDACT_SENTINELS: dict[str, Any] = {"KEEP": _KEEP, "PRUNE": _PRUNE, "DESCEND": _
 
 
 def format_value_compact(value: Any) -> str:
-    """mongod's ``Value::toString`` -- the rendering ``$redact``'s 17053 uses.
+    """mongod's ``Value::toString`` -- the rendering the aggregation STAGE errors
+    use (``$redact``'s 17053, ``$replaceRoot``'s 40228).
 
-    NOT the shell form ``aggregate._fmt_stage_val`` / the Rust
-    ``argtypes::render_stage_value`` produce: this one has no inner spaces in
-    containers (``{k: 1}`` / ``[1, "a"]``, not ``{ k: 1 }`` / ``[ 1, "a" ]``),
-    renders an ObjectId bare rather than as ``ObjectId('...')``, and a date as
-    ISO-8601 rather than ``new Date(<ms>)``. Two renderers, both mongod's,
-    used by different messages -- probed on 8.2.11.
+    NOT the shell form the query and update parse errors use: no inner spaces in
+    containers (``{k: 1}``, not ``{ k: 1 }``), an ObjectId bare rather than
+    ``ObjectId('...')``, a date as ISO-8601 rather than ``new Date(<ms>)``, a
+    Binary with its hex QUOTED, and a Code as ``Code("x=1")``. Six differences
+    in all, probed side by side on 8.2.11 -- see
+    :func:`~secantus.bsontypes.bson_value_repr_stage`, which this now is.
+
+    It used to be a partial copy that named the types its author had probed and
+    fell through for the rest, so a Regex, a Binary and a MinKey came out in
+    Python's ``repr``.
     """
-    if value is None:
-        return "null"
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    if isinstance(value, str):
-        return f'"{value}"'
-    if isinstance(value, ObjectId):
-        return str(value)
-    if isinstance(value, _dt.datetime):
-        return value.strftime("%Y-%m-%dT%H:%M:%S.") + f"{value.microsecond // 1000:03d}Z"
-    if isinstance(value, Decimal128):
-        return str(value)
-    if isinstance(value, float):
-        return repr(int(value)) if value.is_integer() else repr(value)
-    if isinstance(value, Mapping):
-        inner = ", ".join(f"{k}: {format_value_compact(v)}" for k, v in value.items())
-        return "{" + inner + "}"
-    if isinstance(value, list):
-        return "[" + ", ".join(format_value_compact(v) for v in value) + "]"
-    return str(value)
+    return bson_value_repr_stage(value)
 
 
-# Atlas Search is an Atlas-only feature. A real non-Atlas mongod rejects the
-# ``$listSearchIndexes`` aggregation stage (and the createSearchIndexes /
-# updateSearchIndex / dropSearchIndex commands, see ``commands.py``) with a
-# message naming Atlas; the driver index-management spec tests assert only that
-# the error mentions "Atlas". Shared with ``commands.py`` so the stage and the
-# commands stay in lockstep.
 #: Hard ceiling on documents materialized by a single pipeline stage. A join
 #: whose predicates can't be pushed into the ``$lookup`` degenerates into a
 #: cartesian product (an unkeyed comma-join over system catalogs — pgjdbc's
@@ -717,44 +697,15 @@ def _stage_count(
 
 
 def _fmt_stage_val(v: Any) -> str:
-    """Render a $limit/$skip argument the way mongod prints it in the error.
+    """Render a `$limit` / `$skip` argument the way mongod prints it.
 
-    mongod echoes the offending value shell-style, probed on 6.0.16:
-
-        "x"   ""   true   false   null   1.5
-        [ 1 ]   [ 1, "a" ]   []
-        { a: 1 }   {}
-        ObjectId('64b7…')      new Date(1767323045000)
-
-    This used to be `str()` / `repr()`, which renders a string bare (`x`) and an
-    array unspaced (`[1]`) — the CODE was right, so the differential sweep never
-    caught it (`arg_types_extended.py` compares codes only). Found 2026-08-29
-    while porting this validation to the Rust server, which forced the question
-    of what the message should actually say.
+    This was a seventh partial copy of mongod's value rendering, and it had the
+    same shortfall as the other six: it named the types its author had probed
+    and fell through to `str()` for the rest, so a Regex printed
+    `Regex('a', 0)`, a Binary printed `b'z'` and a MinKey printed `MinKey()` --
+    where mongod prints `/a/`, `BinData(0, 7A)` and `MinKey`. One renderer now.
     """
-    from bson import Decimal128, ObjectId
-
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if v is None:
-        return "null"
-    if isinstance(v, str):
-        return f'"{v}"'
-    if isinstance(v, ObjectId):
-        return f"ObjectId('{v}')"
-    if isinstance(v, _dt.datetime):
-        return f"new Date({int(v.timestamp() * 1000)})"
-    if isinstance(v, Decimal128):
-        return str(v)
-    if isinstance(v, (list, tuple)):
-        if not v:
-            return "[]"
-        return "[ " + ", ".join(_fmt_stage_val(x) for x in v) + " ]"
-    if isinstance(v, Mapping):
-        if not v:
-            return "{}"
-        return "{ " + ", ".join(f"{k}: {_fmt_stage_val(x)}" for k, x in v.items()) + " }"
-    return repr(v) if isinstance(v, float) else str(v)
+    return bson_value_repr(v)
 
 
 def _stage_nonneg_int(spec: Any, stage: str, code: int) -> int:
@@ -975,11 +926,14 @@ def _path_present(doc: Mapping[str, Any], path: str) -> bool:
 
 
 def _stage_add_fields(
-    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
+    spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext, name: str = "$addFields"
 ) -> list[dict[str, Any]]:
     if not isinstance(spec, Mapping):
+        # mongod names the stage the CALLER wrote. `$set` is an alias of
+        # `$addFields` and shares this handler, so it used to report
+        # "$addFields specification stage must be an object" for a `$set`.
         raise AggregateError(
-            f"$addFields specification stage must be an object, got {_bson_type_name(spec)}",
+            f"{name} specification stage must be an object, got {_bson_type_name(spec)}",
             code=40272,
         )
     return [_add_fields_one(d, spec, ctx.vars) for d in docs]
@@ -1007,7 +961,35 @@ def _add_fields_one(
 def _stage_unset(
     spec: Any, docs: list[dict[str, Any]], _ctx: PipelineContext
 ) -> list[dict[str, Any]]:
-    paths = [spec] if isinstance(spec, str) else list(spec)
+    # mongod distinguishes four ways the spec is wrong, each with its own code.
+    # This validated none of them: a non-string, non-array spec reached
+    # `list(spec)` and raised a bare TypeError (`1 internal server error` for an
+    # int, and a silent no-op for a document, whose iteration yields its keys),
+    # while an empty string and an empty array were accepted and did nothing.
+    if isinstance(spec, str):
+        if not spec:
+            raise AggregateError("FieldPath cannot be constructed with empty string", code=40352)
+        paths = [spec]
+    elif isinstance(spec, list):
+        if not spec:
+            raise AggregateError(
+                "$unset specification must be a string or an array with at least one field",
+                code=31119,
+            )
+        for element in spec:
+            if not isinstance(element, str):
+                raise AggregateError(
+                    "$unset specification must be a string or an array containing only "
+                    "string values",
+                    code=31120,
+                )
+            if not element:
+                raise AggregateError(
+                    "FieldPath cannot be constructed with empty string", code=40352
+                )
+        paths = list(spec)
+    else:
+        raise AggregateError("$unset specification must be a string or an array", code=31002)
     out: list[dict[str, Any]] = []
     for d in docs:
         new = copy.deepcopy(d)
@@ -1600,35 +1582,12 @@ def _stage_fill(
 
 
 def _render_compact(v: Any) -> str:
-    """A value as mongod prints it in a ``$replaceRoot`` 40228 message.
+    """The ``$replaceRoot`` / ``$replaceWith`` 40228 rendering.
 
-    Distinct from ``update.py``'s ``_render_bson_value``, which pads its
-    brackets (``{ a: 1 }``) because the ``PathNotViable`` message it feeds
-    does. This one does not (``{a: 1}``), and prints an ObjectId as bare hex
-    rather than in constructor form -- both probed against mongod 8.2.11.
+    The same one :func:`format_value_compact` produces -- these were two
+    near-duplicate copies of a single mongod behaviour.
     """
-    import bson
-
-    if v is True:
-        return "true"
-    if v is False:
-        return "false"
-    if v is None:
-        return "null"
-    if isinstance(v, str):
-        return f'"{v}"'
-    if isinstance(v, float):
-        return _fmt_double(v)
-    if isinstance(v, _dt.datetime):
-        # mongod's ISO-8601 with milliseconds and a literal Z.
-        return v.strftime("%Y-%m-%dT%H:%M:%S.") + f"{v.microsecond // 1000:03d}Z"
-    if isinstance(v, bson.ObjectId):
-        return str(v)
-    if isinstance(v, Mapping):
-        return "{" + ", ".join(f"{k}: {_render_compact(x)}" for k, x in v.items()) + "}"
-    if isinstance(v, (list, tuple)):
-        return "[" + ", ".join(_render_compact(x) for x in v) + "]"
-    return str(v)
+    return bson_value_repr_stage(v)
 
 
 # Sentinel: the expression depends on the whole document (a bare ``$$ROOT``),
@@ -5504,7 +5463,7 @@ _STAGES = {
     "$sort": _stage_sort,
     "$project": _stage_project,
     "$addFields": _stage_add_fields,
-    "$set": _stage_add_fields,
+    "$set": functools.partial(_stage_add_fields, name="$set"),
     "$unset": _stage_unset,
     "$unwind": _stage_unwind,
     "$densify": _stage_densify,
