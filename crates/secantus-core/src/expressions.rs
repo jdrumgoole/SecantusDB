@@ -1664,11 +1664,16 @@ fn coerce_to_string(v: &Bson) -> Result<String, Fallback> {
     })
 }
 
+/// `$toUpper` / `$toLower`. The case mapping is **ASCII ONLY**, which is what
+/// mongod does -- probed against 8.2.11 (2026-09-01): `'Ünïcodé'` upper-cases to
+/// `'ÜNïCODé'` and `'straße'` to `'STRAßE'`, every non-ASCII character left
+/// alone. This used to defer on any non-ASCII input "because Unicode case
+/// mapping may differ from Python", which had it backwards -- Python's
+/// `.upper()` was the side that diverged from the server, and the deferral made
+/// the standalone Rust server error on a perfectly ordinary operator. Rust's
+/// `to_ascii_uppercase` leaves non-ASCII untouched, so it IS mongod's mapping.
 fn op_to_case(arg: &Bson, ctx: &Ctx, upper: bool) -> R {
     let text = coerce_to_string(&eval(arg, ctx)?)?;
-    if !text.is_ascii() {
-        return Err(Fallback); // Unicode case mapping may differ from Python -> defer
-    }
     Ok(Bson::String(if upper {
         text.to_ascii_uppercase()
     } else {
@@ -4096,8 +4101,9 @@ fn op_is_array(arg: &Bson, ctx: &Ctx) -> R {
 }
 
 /// `$strcasecmp`: case-insensitive compare of two strings → -1 / 0 / 1. A null
-/// operand is the empty string; non-ASCII defers (case mapping may differ from
-/// Python — same contract as `$toUpper`); a non-string operand defers.
+/// operand is the empty string; the upper-casing is ASCII-only, like `$toUpper`
+/// (mongod reports `strcasecmp("ß", "SS")` as 1, not 0); a non-string,
+/// non-integer operand defers.
 fn op_strcasecmp(arg: &Bson, ctx: &Ctx) -> R {
     let vals = eval_args(arg, ctx)?;
     if vals.len() != 2 {
@@ -4106,7 +4112,7 @@ fn op_strcasecmp(arg: &Bson, ctx: &Ctx) -> R {
     let to_str = |v: &Bson| -> Result<String, Fallback> {
         match v {
             Bson::Null => Ok(String::new()),
-            Bson::String(s) if s.is_ascii() => Ok(s.to_ascii_uppercase()),
+            Bson::String(s) => Ok(s.to_ascii_uppercase()),
             // mongod $toString-coerces an operand; an integer matches Python's
             // `str(int)`. Double / date / Decimal128 / bool defer (double string
             // formatting + bool -> Location16007 are Python's).
@@ -4346,6 +4352,18 @@ fn op_substr_bytes(arg: &Bson, ctx: &Ctx) -> R {
     }
 }
 
+/// The code points `$trim` / `$ltrim` / `$rtrim` strip when no `chars` is
+/// given. This is mongod's documented table, confirmed by probe against 8.2.11
+/// (2026-09-01) -- it is NOT "Unicode whitespace": U+0085, U+2028, U+2029,
+/// U+202F, U+205F and U+3000 are all whitespace to Python and to Rust, and
+/// mongod leaves every one of them in place. Kept in lockstep with
+/// `secantus.expressions.TRIM_WHITESPACE`.
+const TRIM_WHITESPACE: [char; 20] = [
+    '\u{0000}', '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', '\u{0020}', '\u{00a0}',
+    '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}',
+    '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}',
+];
+
 #[derive(Clone, Copy)]
 enum TrimSide {
     Both,
@@ -4364,12 +4382,15 @@ fn op_trim(arg: &Bson, ctx: &Ctx, side: TrimSide) -> R {
     let Bson::String(s) = input else {
         return Err(Fallback); // non-string input -> Python raises
     };
-    // Only the explicit `chars`-string form is reproduced; the default
-    // whitespace strip (Python `str.strip()`) defers — Python's whitespace set
-    // differs from Rust's at the edges (e.g. U+001C..U+001F).
+    // With no `chars`, mongod trims a FIXED table of 20 whitespace code points
+    // (TRIM_WHITESPACE) -- not "whatever the language calls whitespace". Probed
+    // 8.2.11 (2026-09-01): mongod leaves U+2028 / U+3000 in place, where both
+    // Python's `str.strip()` and Rust's `str::trim` remove them. Deferring here
+    // made the standalone Rust server error on the *default* form of the
+    // operator, which is the common one.
     let chars = match d.get("chars") {
         Some(e) => eval(e, ctx)?,
-        None => return Err(Fallback),
+        None => Bson::String(TRIM_WHITESPACE.iter().collect()),
     };
     if is_null(&chars) {
         return Ok(Bson::Null); // chars: null -> null result (mongod)
@@ -4972,20 +4993,62 @@ mod tests {
         );
     }
 
+    /// `$toUpper` / `$toLower` / `$strcasecmp` / `$trim` are ASCII-case and
+    /// fixed-whitespace, which is mongod's behaviour (probed 8.2.11,
+    /// 2026-09-01) — non-ASCII input is handled natively, NOT deferred.
+    #[test]
+    fn ascii_case_and_trim_are_native() {
+        let up =
+            |s: &str| evaluate(&doc! {}, &bson::bson!({"$toUpper": s}), &Document::new()).unwrap();
+        assert_eq!(up("Ünïcodé"), Bson::String("ÜNïCODé".into()));
+        assert_eq!(up("straße"), Bson::String("STRAßE".into()));
+        assert_eq!(
+            evaluate(
+                &doc! {},
+                &bson::bson!({"$toLower": "ΣΊΣΥΦΟΣ"}),
+                &Document::new()
+            )
+            .unwrap(),
+            Bson::String("ΣΊΣΥΦΟΣ".into())
+        );
+        // .upper()/full case folding would fold ß to SS and report 0 here.
+        assert_eq!(
+            evaluate(
+                &doc! {},
+                &bson::bson!({"$strcasecmp": ["ß", "SS"]}),
+                &Document::new()
+            )
+            .unwrap(),
+            Bson::Int32(1)
+        );
+        // Default (no `chars`) trim: ASCII space goes, U+3000 and U+2028 stay.
+        let trim = |s: &str| {
+            evaluate(
+                &doc! {},
+                &bson::bson!({"$trim": {"input": s}}),
+                &Document::new(),
+            )
+            .unwrap()
+        };
+        assert_eq!(trim("  pad\t\n"), Bson::String("pad".into()));
+        assert_eq!(
+            trim("\u{3000}pad\u{3000}"),
+            Bson::String("\u{3000}pad\u{3000}".into())
+        );
+        assert_eq!(
+            trim("\u{2028}pad\u{2028}"),
+            Bson::String("\u{2028}pad\u{2028}".into())
+        );
+    }
+
     #[test]
     fn unsupported_falls_back() {
-        // An *unknown* zone name still defers (Python resolves it or raises), as do
-        // non-ASCII $toUpper and string $add.
+        // An *unknown* zone name still defers (Python resolves it or raises), as
+        // does string $add.
         let d = bson::DateTime::from_millis(1_689_438_600_000);
         assert!(evaluate(
             &doc! {"d": d},
             &bson::bson!({"$dateToString": {"date": "$d", "timezone": "Not/AZone"}}),
-            &Document::new()
-        )
-        .is_err());
-        assert!(evaluate(
-            &doc! {},
-            &bson::bson!({"$toUpper": "café"}),
             &Document::new()
         )
         .is_err());

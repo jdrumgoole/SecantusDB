@@ -1038,12 +1038,49 @@ def _op_to_string(arg: Any, ctx: _Ctx) -> Any:
     return convert_to_string(_eval(arg, ctx))
 
 
+#: mongod's ``$trim`` default whitespace set — its documented 20-character
+#: table, confirmed character by character against 8.2.11 (2026-09-01). It is
+#: NOT Python's ``str.strip()`` set: it INCLUDES U+00A0 / U+1680 / U+2000-200A
+#: and EXCLUDES U+0085 / U+2028 / U+2029 / U+202F / U+205F / U+3000, which
+#: ``strip()`` removes. `"\u3000pad\u3000"` came back `"pad"` where mongod
+#: leaves it untouched.
+TRIM_WHITESPACE = "".join(
+    chr(c) for c in (0x00, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0xA0, 0x1680, *range(0x2000, 0x200B))
+)
+
+
+def ascii_upper(s: str) -> str:
+    """``$toUpper``'s case mapping: ASCII ONLY, which is mongod's.
+
+    Python's ``str.upper()`` does full Unicode case mapping and is WRONG here --
+    probed against 8.2.11 (2026-09-01), mongod answers ``'ÜNïCODé'`` for
+    ``'Ünïcodé'`` and ``'STRAßE'`` for ``'straße'``, leaving every non-ASCII
+    character alone, where ``.upper()`` gives ``'ÜNÏCODÉ'`` and ``'STRASSE'``.
+    11 of 18 probed strings diverged.
+
+    The Rust engine used to DEFER these operators "for Unicode-fidelity safety",
+    which had it backwards: the faithful answer is the simple one, and the
+    deferral is what made the standalone Rust server error on them. Both engines
+    now do the same ASCII mapping natively.
+    """
+    return s.translate(_ASCII_UPPER)
+
+
+def ascii_lower(s: str) -> str:
+    """``$toLower``'s case mapping: ASCII ONLY. See :func:`ascii_upper`."""
+    return s.translate(_ASCII_LOWER)
+
+
+_ASCII_UPPER = {c: c - 32 for c in range(ord("a"), ord("z") + 1)}
+_ASCII_LOWER = {c: c + 32 for c in range(ord("A"), ord("Z") + 1)}
+
+
 def _op_to_lower(arg: Any, ctx: _Ctx) -> Any:
-    return coerce_to_string(_eval(arg, ctx)).lower()
+    return ascii_lower(coerce_to_string(_eval(arg, ctx)))
 
 
 def _op_to_upper(arg: Any, ctx: _Ctx) -> Any:
-    return coerce_to_string(_eval(arg, ctx)).upper()
+    return ascii_upper(coerce_to_string(_eval(arg, ctx)))
 
 
 #: IEEE 754 decimal128 carries 34 significant digits, and that is the precision
@@ -2226,7 +2263,10 @@ def _op_strcasecmp(arg: Any, ctx: _Ctx) -> int:
     vals = _eval_args(arg, ctx)
     if len(vals) != 2:
         raise ExpressionError("$strcasecmp requires two arguments")
-    au, bu = _strcasecmp_coerce(vals[0]).upper(), _strcasecmp_coerce(vals[1]).upper()
+    # ASCII-only upper, like `$toUpper` — `.upper()` folded `ß` to `SS` and
+    # reported `strcasecmp("ß", "SS")` as 0 where mongod says 1 (probed 8.2.11).
+    au = ascii_upper(_strcasecmp_coerce(vals[0]))
+    bu = ascii_upper(_strcasecmp_coerce(vals[1]))
     return -1 if au < bu else (1 if au > bu else 0)
 
 
@@ -2470,11 +2510,14 @@ def _trim_impl(op: str, side: str, arg: Any, ctx: _Ctx) -> Any:
                 code=50700,
                 code_name="Location50700",
             )
+    # The DEFAULT set is mongod's own table, not Python's `strip()` set --
+    # see TRIM_WHITESPACE. An explicit `chars` is used verbatim either way.
+    cut = chars if chars else TRIM_WHITESPACE
     if side == "l":
-        return s.lstrip(chars) if chars else s.lstrip()
+        return s.lstrip(cut)
     if side == "r":
-        return s.rstrip(chars) if chars else s.rstrip()
-    return s.strip(chars) if chars else s.strip()
+        return s.rstrip(cut)
+    return s.strip(cut)
 
 
 def _op_trim(arg: Any, ctx: _Ctx) -> Any:
