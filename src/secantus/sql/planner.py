@@ -12429,6 +12429,28 @@ def parse(sql: str) -> list[exp.Expression]:
     return stmts
 
 
+def _reject_unparenthesised_in(stmt: exp.Expression) -> None:
+    """``x IN <expr>`` without parentheses is a SYNTAX ERROR in Postgres.
+
+    `IN` takes a parenthesised list or a subquery. sqlglot accepts a bare
+    right-hand side and parks it under ``field``, and we then compared against
+    it and quietly matched nothing -- so ``WHERE id IN %s`` (the common psycopg
+    slip; the working spelling is ``= ANY(%s)``) returned ZERO ROWS where
+    Postgres 14.13 answers ``42601 syntax error at or near "$1"``. Silent
+    emptiness is the worst answer available: it looks like data, not a bug.
+
+    The valid shapes carry ``expressions`` (a list) or ``query`` (a subquery),
+    so keying on ``field`` alone leaves them untouched.
+    """
+    for node in stmt.find_all(exp.In):
+        field = node.args.get("field")
+        if field is None:
+            continue
+        if node.expressions or node.args.get("query") is not None:
+            continue
+        raise errors.syntax_error(f'syntax error at or near "{field.sql(dialect="postgres")}"')
+
+
 def _parse_uncached(sql: str) -> list[exp.Expression]:
     # Cap the statement length before parsing — a cheap upper bound on parse cost
     # so a flood of oversized statements can't pin CPU (the Mongo wire has
@@ -12547,6 +12569,7 @@ def _parse_uncached(sql: str) -> list[exp.Expression]:
                 out.extend(_parse_uncached(seg))
             return out
         for s in stmts:
+            _reject_unparenthesised_in(s)
             _fold_unquoted_identifiers(s)
             _resolve_group_by_ordinals(s)
             # Dollar-quoted strings tokenize as RawString — downstream code
