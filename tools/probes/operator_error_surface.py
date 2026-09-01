@@ -62,21 +62,32 @@ DOC = {
     "dt": datetime.datetime(2020, 1, 1),
 }
 
+#: The arguments each operator is crossed with. Zero and negative-zero
+#: `Decimal128` are here because their ABSENCE hid a real bug: `$exists` read
+#: every Decimal128 as truthy, and the corpus carried only `Decimal128("1.5")`,
+#: which is truthy anyway. A value that is falsy in one BSON type and truthy in
+#: another is exactly what this list needs to carry.
 BAD = [
     "x",
+    "",
     5,
     1.5,
     -1,
     0,
     True,
+    False,
     None,
     [],
     [1],
     {},
     {"a": 1},
     Decimal128("1.5"),
+    Decimal128("0"),
+    Decimal128("-0"),
+    Decimal128("NaN"),
     Regex("a", ""),
     Binary(b"z"),
+    Binary(b""),
     ObjectId(),
     MinKey(),
     MaxKey(),
@@ -84,6 +95,8 @@ BAD = [
     Int64(3),
     datetime.datetime(2020, 1, 1),
     Code("x=1"),
+    float("nan"),
+    float("inf"),
 ]
 
 QUERY_OPS = [
