@@ -5105,6 +5105,21 @@ pub fn py_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
         }
         _ => {}
     }
+    // JavaScript is its own BSON type, so a `Code` is never equal to a string,
+    // a number or anything else -- the same-type cases are answered above, and
+    // `Code` vs `CodeWithScope` are different types too. This fell through to
+    // the `is_exotic` defer below, which on the standalone server made
+    // `$addToSet: Code("ab")` into `["ab"]` answer `BadValue` instead of
+    // appending, and `$set` of a `Code` value fail outright (the oplog
+    // update-diff walks every field through here).
+    {
+        let js = |v: &Bson| {
+            matches!(v, Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_))
+        };
+        if js(a) || js(b) {
+            return Ok(false);
+        }
+    }
     // Decimal128 used to defer here, and the cost of that was out of all
     // proportion to the operator: the oplog update-diff walks every field of
     // the OLD and NEW document through `py_eq`, so a single Decimal128 anywhere

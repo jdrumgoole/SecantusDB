@@ -159,3 +159,106 @@ pub(crate) fn compile(pattern: &Bson, options: Option<&Bson>) -> Result<Compiled
         .map(CompiledRegex::Fancy)
         .map_err(|_| ())
 }
+
+/// mongod's regex-to-regex equality: exact pattern, and options compared as a
+/// SET.
+///
+/// Probed against 8.2.11 (2026-09-01): `/ab/im` equals `/ab/mi`, and `/ab/i`
+/// does NOT equal `/ab/mi` -- so the option string is order-insensitive but not
+/// subset-tolerant. This is the comparison behind a bare regex matching a
+/// stored regex (`find({v: /ab/i})` over `{v: /ab/i}`), behind `$eq` with a
+/// regex operand -- which is equality ONLY on mongod, never a pattern match --
+/// and behind `$addToSet` membership.
+pub(crate) fn regex_eq(a: &bson::Regex, b: &bson::Regex) -> bool {
+    if a.pattern != b.pattern {
+        return false;
+    }
+    let mut ao: Vec<char> = a.options.chars().collect();
+    let mut bo: Vec<char> = b.options.chars().collect();
+    ao.sort_unstable();
+    ao.dedup();
+    bo.sort_unstable();
+    bo.dedup();
+    ao == bo
+}
+
+/// The `(pattern, normalised options)` pair mongod ORDERS regexes by.
+///
+/// Probed 8.2.11 (2026-09-01): a mixed corpus sorts
+/// `// < /A/ < /a/ < /a/i < /a/im < /a/m < /ab/ < /b/` -- pattern first, then
+/// the option string. mongod stores options alphabetically sorted, so sorting
+/// here is what makes an unsorted input compare the same as the stored form.
+pub(crate) fn regex_sort_key(r: &bson::Regex) -> (&str, String) {
+    let mut o: Vec<char> = r.options.chars().collect();
+    o.sort_unstable();
+    o.dedup();
+    (r.pattern.as_str(), o.into_iter().collect())
+}
+
+#[cfg(test)]
+mod regex_eq_tests {
+    use super::regex_eq;
+
+    fn r(pattern: &str, options: &str) -> bson::Regex {
+        bson::Regex { pattern: pattern.into(), options: options.into() }
+    }
+
+    #[test]
+    fn options_compare_as_a_set() {
+        assert!(regex_eq(&r("ab", "im"), &r("ab", "mi")));
+        assert!(regex_eq(&r("ab", ""), &r("ab", "")));
+        assert!(!regex_eq(&r("ab", "i"), &r("ab", "mi")));
+        assert!(!regex_eq(&r("ab", "i"), &r("ab", "")));
+    }
+
+    #[test]
+    fn sort_key_orders_by_pattern_then_options() {
+        use super::regex_sort_key;
+        let corpus = [r("", ""), r("A", ""), r("a", ""), r("a", "i"), r("a", "mi"), r("a", "m")];
+        let mut keys: Vec<_> = corpus.iter().map(regex_sort_key).collect();
+        keys.sort();
+        let rendered: Vec<String> = keys.iter().map(|(p, o)| format!("/{p}/{o}")).collect();
+        assert_eq!(rendered, ["//", "/A/", "/a/", "/a/i", "/a/im", "/a/m"]);
+    }
+
+    #[test]
+    fn pattern_is_exact() {
+        assert!(!regex_eq(&r("ab", "i"), &r("abc", "i")));
+        assert!(!regex_eq(&r("ab", ""), &r("AB", "")));
+    }
+}
+
+#[cfg(test)]
+mod regex_key_agreement {
+    /// The index-entry encoder and the in-memory comparator must order two
+    /// regexes identically -- the failure mode is an index changing the sort
+    /// answer, which is how the JavaScript rank bug was found.
+    #[test]
+    fn sortkey_bytes_and_cmp_agree() {
+        use bson::Bson;
+        let corpus = [
+            ("b", ""),
+            ("a", "m"),
+            ("a", ""),
+            ("ab", ""),
+            ("a", "mi"),
+            ("A", ""),
+            ("a", "i"),
+            ("", ""),
+        ];
+        let vals: Vec<Bson> = corpus
+            .iter()
+            .map(|(p, o)| {
+                Bson::RegularExpression(bson::Regex { pattern: (*p).into(), options: (*o).into() })
+            })
+            .collect();
+
+        let mut by_cmp: Vec<usize> = (0..vals.len()).collect();
+        by_cmp.sort_by(|&i, &j| crate::order::cmp(&vals[i], &vals[j]));
+
+        let mut by_bytes: Vec<usize> = (0..vals.len()).collect();
+        by_bytes.sort_by_key(|&i| crate::sortkey::encode_value(&vals[i], None).unwrap());
+
+        assert_eq!(by_cmp, by_bytes);
+    }
+}

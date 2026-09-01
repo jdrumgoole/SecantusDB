@@ -16,6 +16,7 @@ from typing import Any
 
 from bson import Binary, Code, Decimal128, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
+from secantus.bsontypes import regex_options_string
 from secantus.paths import get_path
 
 
@@ -138,6 +139,14 @@ def bson_equal(a: Any, b: Any) -> bool:
     return bool(a == b)
 
 
+def _regex_sort_key(r: Regex) -> tuple[Any, str]:
+    """The `(pattern, options)` pair mongod orders regexes by."""
+    pattern = r.pattern
+    if isinstance(pattern, bytes):
+        pattern = pattern.decode("utf-8", "replace")
+    return (pattern, regex_options_string(r.flags))
+
+
 def _bson_lt(a: Any, b: Any) -> bool:
     """BSON sort-order ``<`` for two values.
 
@@ -176,6 +185,13 @@ def _bson_lt(a: Any, b: Any) -> bool:
             if _bson_lt(bv, av):
                 return False
         return len(a_items) < len(b_items)
+    # Two regexes compare by PATTERN first, then by their option string --
+    # probed 8.2.11 (2026-09-01), where a mixed corpus sorts
+    # `// < /A/ < /a/ < /a/i < /a/im < /a/m < /ab/ < /b/`. `bson.Regex` defines
+    # no `__lt__`, so both fell to the `TypeError` arm below and reported
+    # `"Regex" < "Regex"` -- i.e. EQUAL -- and `$max` over regexes never moved.
+    if isinstance(a, Regex) and isinstance(b, Regex):
+        return _regex_sort_key(a) < _regex_sort_key(b)
     # Arrays: lexicographic, element-by-element. Same TypeError trap
     # as the dict case for arrays-of-mixed-types.
     if isinstance(a, list) and isinstance(b, list):
