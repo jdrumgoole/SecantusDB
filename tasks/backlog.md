@@ -6801,6 +6801,21 @@ shared storage engine or building large new protocol subsystems:
   15s" (the same wrapper issue the psycopg gauge has).
 
 
+- [x] **RESOLVED (2026-09-01) — `x IN <bare expr>` returned zero rows instead
+      of a syntax error.** `IN` takes a parenthesised list or a subquery;
+      sqlglot accepts a bare right-hand side and parks it under the node's
+      `field` arg, and we compared against it and matched nothing. So
+      `WHERE id IN %s` — the common psycopg slip, whose working spelling is
+      `= ANY(%s)` — answered ZERO ROWS where PG 14.13 gives
+      `42601 syntax error at or near "$1"`. Silent emptiness is the worst
+      answer available: it reads as data, not as a bug.
+
+      Found by a probe that itself contained the mistake — the sweep flagged
+      the difference before the probe's own bug was noticed, which is the
+      argument for diffing every line of a probe against the reference server
+      rather than only the lines you meant to test. Pinned by
+      `tests/test_sql_in_syntax.py` (five rejected shapes, six valid ones).
+
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
   **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,
   from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn campaign
