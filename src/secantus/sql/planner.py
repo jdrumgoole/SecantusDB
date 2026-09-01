@@ -683,13 +683,27 @@ def _rewrite_explicit_operator(node: exp.Operator) -> exp.Expression | None:
     return exp.Not(this=out) if negated else out
 
 
-def _like_to_regex(pattern: str, escape: str | None = None) -> str:
-    """Translate a SQL LIKE pattern to an anchored regex.
+#: Sentinel for "no ESCAPE clause was written", which is NOT the same as
+#: ``ESCAPE ''``. Postgres defaults LIKE's escape to BACKSLASH and only an
+#: explicit empty string disables escaping — collapsing the two made
+#: ``'a_c' LIKE 'a\_c'`` false where PG says true.
+_ESCAPE_UNSET = object()
+
+
+def _like_to_regex(pattern: str, escape: Any = _ESCAPE_UNSET) -> str:
+    r"""Translate a SQL LIKE pattern to an anchored regex.
 
     ``%`` -> ``.*`` and ``_`` -> ``.``; every other character is escaped so it
-    matches literally. With an ``ESCAPE`` character, ``<esc>X`` matches ``X``
-    literally (PG semantics — the escape applies to the next character).
+    matches literally. ``<esc>X`` matches ``X`` literally (PG semantics — the
+    escape applies to the next character).
+
+    The default escape is ``\``, as in Postgres: `'a_c' LIKE 'a\_c'` is TRUE
+    there (measured on 14.13) because the backslash makes the `_` literal.
+    ``ESCAPE ''`` disables escaping entirely and is passed as an empty string,
+    which is why "unset" needs a sentinel rather than ``None``.
     """
+    if escape is _ESCAPE_UNSET:
+        escape = "\\"
     if escape is not None and len(escape) > 1:
         raise errors.SQLError("22025", "invalid escape string")
     if not escape:
@@ -10705,6 +10719,10 @@ _BOOL_EXPR_TYPES = (
     exp.NullSafeNEQ,
     # `starts_with()` returns boolean; it typed as text and sent 't'.
     exp.StartsWith,
+    # `x BETWEEN a AND b` and `EXISTS (…)` are booleans too, and typed as text
+    # for the same reason — oid 25 with a 't'/'f' body where PG sends oid 16.
+    exp.Between,
+    exp.Exists,
 )
 
 
@@ -11457,12 +11475,34 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     if isinstance(node, exp.Anonymous):
         from secantus.sql import scalar as _scalar_mod  # lazy: circular import
 
-        _tag = _scalar_mod.PLAIN_SCALAR_TAGS.get(str(node.this).lower())
+        _name = str(node.this).lower()
+        # `array_replace(arr, from, to)` keeps the ARRAY's own type; a fixed tag
+        # would report text and render the array as its literal `{1,9}` text.
+        if _name == "array_replace" and node.expressions:
+            _argtag = _infer_scalar_tag(node.expressions[0], resolve)
+            if _argtag and _argtag != "any":
+                return _argtag
+        _tag = _scalar_mod.PLAIN_SCALAR_TAGS.get(_name)
         if _tag is not None:
             return _tag
     # `width_bucket()` returns integer; it typed as text and sent '3'.
     if isinstance(node, exp.WidthBucket):
         return "int4"
+    if isinstance(node, exp.StringToArray):
+        return "text[]"
+    # A scalar subquery takes the type of its single projected expression.
+    # `SELECT (SELECT 1)` typed as text and sent the STRING '1'. The
+    # column-reference case is handled further down (it needs the catalog to
+    # resolve the inner table); this covers a computed projection, which needs
+    # nothing but the inner node.
+    if isinstance(node, exp.Subquery) and isinstance(node.this, exp.Select):
+        _exprs = node.this.expressions
+        if len(_exprs) == 1:
+            _target = _exprs[0].this if isinstance(_exprs[0], exp.Alias) else _exprs[0]
+            if not isinstance(_target, exp.Column):
+                _tag = _infer_scalar_tag(_target, resolve)
+                if _tag and _tag != "any":
+                    return _tag
     # `power()` and `sign()` return DOUBLE PRECISION in Postgres, not numeric —
     # `power(2, 10)` is `1024.0` (oid 701), and typing it numeric put oid 1700
     # on the wire.

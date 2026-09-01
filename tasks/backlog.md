@@ -6991,6 +6991,42 @@ shared storage engine or building large new protocol subsystems:
          an exact-typed input. Fixing the tag without the value would make it
          worse, so these move together.
 
+- [x] **RESOLVED (2026-09-01) — a leaked INTERNAL ERROR, a wrong LIKE answer,
+      three more wrong types, and four absent functions.** Sweep 4 (patterns,
+      ordering, arrays, subqueries) against PG 14.13.
+
+      * `substring('abc123' from '[0-9]+')` answered **`XX000 internal
+        error`** — sqlglot parks the POSIX pattern in the same `start` slot as
+        the positional form, so `int('[0-9]+')` raised `ValueError` and it
+        escaped to the wire. A leaked internal error is never acceptable here.
+      * `'a_c' LIKE 'a\_c'` was **FALSE**; PG says true. Backslash is PG's
+        DEFAULT LIKE escape. `_like_to_regex` escaped only with an explicit
+        `ESCAPE`, and collapsed "unset" with `ESCAPE ''` — which genuinely
+        disables escaping, so the two needed a sentinel to tell apart.
+      * `BETWEEN` / `EXISTS` / a scalar subquery all reported TEXT (`'t'`,
+        `'f'`, `'1'`) where PG sends bool / bool / int4.
+      * `regexp_match`, `regexp_split_to_array`, `string_to_array` and
+        `array_replace` were absent; `array_replace` also needed the ARRAY's
+        own tag or it rendered as the literal text `{1,9}`.
+
+      Pinned by `tests/test_sql_regex_and_bool_types.py`.
+
+- [ ] **OPEN — three residuals from sweep 4 (2026-09-01).**
+
+      1. **`SIMILAR TO` is `0A000`.** SQL's own regex dialect; PG maps it onto
+         POSIX internally, so this is a pattern TRANSLATION (`%`/`_` wildcards
+         plus a regex subset), not a new matcher.
+      2. **A scalar subquery over a DERIVED table is `42P01 relation ""`.**
+         `SELECT (SELECT max(x) FROM (VALUES (1),(2)) t(x))`. The derived table
+         inside a scalar subquery resolves to the empty name, so this is a
+         scope-plumbing gap, not a typing one.
+      3. **`unnest(ARRAY[1,2])` FROM-LESS reports text**, though
+         `_infer_scalar_tag` already types it `int4` correctly — so the
+         constant-select / SRF path assigns its own tag instead of asking. Over
+         a table it is fine. Narrow, but it is the "declared a type the values
+         do not honour" shape that the unnest element-type work already fixed
+         once elsewhere.
+
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
   **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,
   from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn campaign

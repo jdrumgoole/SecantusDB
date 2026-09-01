@@ -985,11 +985,29 @@ def _eval_substring(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> A
         return None
     text = _as_text(v)
     start_node, length_node = node.args.get("start"), node.args.get("length")
-    start = int(evaluate(start_node, scope, ctx)) if start_node is not None else 1
+    start_val = evaluate(start_node, scope, ctx) if start_node is not None else None
+    if start_val is None and start_node is not None:
+        return None
+    # `substring(str FROM pattern)` — the POSIX-REGEX form. sqlglot parks the
+    # pattern in the same `start` slot as the positional form, so `int()` on it
+    # raised ValueError and the wire got `XX000 internal error`. Postgres
+    # returns the FIRST capture group when the pattern has one, the whole match
+    # when it does not, and NULL when it does not match (probed on 14.13).
+    if length_node is None and isinstance(start_val, str) and not _looks_like_int(start_val):
+        m = _re_compile(start_val, "").search(text)
+        if m is None:
+            return None
+        return m.group(1) if m.re.groups else m.group(0)
+    start = int(start_val) if start_val is not None else 1
     begin = max(start - 1, 0)  # SQL substring is 1-based
     if length_node is not None:
         return text[begin : begin + int(evaluate(length_node, scope, ctx))]
     return text[begin:]
+
+
+def _looks_like_int(text: str) -> bool:
+    stripped = text.strip()
+    return bool(stripped) and (stripped[1:] if stripped[0] in "+-" else stripped).isdigit()
 
 
 def _eval_array_size(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
@@ -1717,6 +1735,10 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
     # already PG's numeric return; only the inner node had no handler.
     exp.IntDiv: lambda n, s, c: _plain_scalar(
         "div", [evaluate(n.this, s, c), evaluate(n.expression, s, c)]
+    ),
+    exp.StringToArray: lambda n, s, c: _plain_scalar(
+        "string_to_array",
+        [evaluate(x, s, c) for x in (n.this, n.expression, n.args.get("null")) if x is not None],
     ),
     exp.MD5: lambda n, s, c: _plain_scalar("md5", [evaluate(n.this, s, c)]),
     exp.StartsWith: lambda n, s, c: _plain_scalar(
@@ -3200,6 +3222,40 @@ def _plain_scalar(name: str, args: list[Any]) -> Any:
         if operand <= high:
             return count + 1
         return int((low - operand) * count / (low - high)) + 1
+    if name == "regexp_match":
+        # PG returns text[] of the capture groups, or a single-element array of
+        # the whole match when the pattern has none; NULL when it does not match.
+        if a is None or len(args) < 2 or args[1] is None:
+            return None
+        m = _re_compile(_as_text(args[1]), _as_text(args[2]) if len(args) > 2 else "").search(
+            _as_text(a)
+        )
+        if m is None:
+            return None
+        return list(m.groups()) if m.re.groups else [m.group(0)]
+    if name == "regexp_split_to_array":
+        if a is None or len(args) < 2 or args[1] is None:
+            return None
+        return _re_compile(_as_text(args[1]), _as_text(args[2]) if len(args) > 2 else "").split(
+            _as_text(a)
+        )
+    if name == "string_to_array":
+        # A NULL delimiter splits into single characters, as PG does.
+        if a is None:
+            return None
+        delim = args[1] if len(args) > 1 else None
+        text = _as_text(a)
+        parts = list(text) if delim is None else text.split(_as_text(delim))
+        null_str = _as_text(args[2]) if len(args) > 2 and args[2] is not None else None
+        return [None if null_str is not None and x == null_str else x for x in parts]
+    if name == "array_replace":
+        if a is None:
+            return None
+        if not isinstance(a, (list, tuple)):
+            return a
+        old_v = args[1] if len(args) > 1 else None
+        new_v = args[2] if len(args) > 2 else None
+        return [new_v if x == old_v else x for x in a]
     if name == "div":
         # Integer quotient of two numerics, truncated toward zero — PG returns
         # NUMERIC, not int.
@@ -3229,6 +3285,9 @@ PLAIN_SCALAR_TAGS = {
     "starts_with": "bool",
     "width_bucket": "int4",
     "div": "numeric",
+    "regexp_match": "text[]",
+    "regexp_split_to_array": "text[]",
+    "string_to_array": "text[]",
 }
 
 
@@ -4641,7 +4700,11 @@ def _eval_like(node: exp.Expression, outer: Scope, ctx: ScalarContext, escape: A
     if val is None or pattern is None:
         return None
     flags = re.IGNORECASE if isinstance(node, exp.ILike) else 0
-    esc = _as_text(escape) if escape is not None else None
+    # No ESCAPE clause means PG's DEFAULT escape (backslash), not "no escape" —
+    # the two are different and only `ESCAPE ''` disables it.
+    from secantus.sql.planner import _ESCAPE_UNSET
+
+    esc = _as_text(escape) if escape is not None else _ESCAPE_UNSET
     hit = re.match(_like_to_regex(_as_text(pattern), escape=esc), _as_text(val), flags) is not None
     # sqlglot parses ``NOT LIKE`` as ``Like(negate=True)``, not Not(Like).
     return not hit if node.args.get("negate") else hit
