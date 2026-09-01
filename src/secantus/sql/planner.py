@@ -4728,7 +4728,11 @@ def _sorted_agg_push(
     (``v`` the value, ``k`` the list of sort-key values) that the executor sorts."""
     return {
         "$push": {
-            "v": _agg_arg_to_expr(value_node, table),
+            # The VALUE needs the sub-millisecond composite as much as the sort
+            # key does. Only the key carried it, so `array_agg(t ORDER BY t)`
+            # ordered correctly and then returned `.123000` for every row --
+            # times that were never stored. `_sorted_agg_value` merges both.
+            "v": _sorted_agg_key(value_node, table),
             "k": [_sorted_agg_key(key, table) for key, _dir, _nf in terms],
         }
     }
