@@ -4132,20 +4132,48 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ## 7. Python → Rust rewrite (in progress)
 
-- [ ] **Aggregation stage-spec messages: 22 shapes left (2026-09-01).**
-  `tools/probes/aggregation_stage_specs.py` is the standing cover; it started at
-  167 of 725 divergent and is now 22. Everything remaining is a message or a
-  validation-ORDER difference, not a wrong answer:
+- [x] **Aggregation stage-spec messages — the PYTHON server is DONE 2026-09-02.**
+  `tools/probes/aggregation_stage_specs.py` went 167 → 22 → **0 of 725**. The
+  rule the remaining 22 all turned on: mongod parses a stage spec field by
+  field, so an **unknown or specifically-missing field is reported before** the
+  generic "requires X and Y" — `{$bucket: {a: 1}}` names `a`. Each stage has
+  its own code and wording (`$sample` 28748, `$bucket` 40197 *with* a trailing
+  period, `$bucketAuto` 40245 *without* one, everything else the IDL's 40415).
 
-  mongod checks an unknown / specific missing field BEFORE the generic
-  "requires X and Y", so `{$bucket: {a: 1}}` names `a` where we say
-  "requires 'groupBy' and 'boundaries'". The same shape applies to `$group`,
-  `$replaceRoot`, `$sample`, `$sortByCount`, `$bucketAuto`, `$densify`, `$fill`,
-  `$graphLookup`, `$lookup`, `$geoNear` and `$unionWith`.
+  Three stages invert it, which is why this needed probing rather than a single
+  helper: `$lookup` and `$graphLookup` report a missing `from` first (and
+  `$graphLookup` echoes the whole spec in mongod's SPACED document rendering,
+  `{ a: 1 }`, unlike the value renderer's compact form), and `$geoNear` reports
+  a missing `near` before it objects to the spec's own type — an ARRAY is a
+  document in BSON, so `{$geoNear: []}` gets the `near` message while a scalar
+  gets the type error.
 
-  Also: `{$documents: {}}` against a collection answers 51270 on mongod rather
-  than the namespace 73 every other argument gets — a document spec is parsed
-  down a different path there, and it was not worth guessing at.
+  One of the 22 was a **wrong ANSWER, not a message**: `{$unionWith: ""}`
+  returned the outer documents unchanged where mongod rejects the empty
+  namespace (73). And `{$documents: {}}` is rejected while the stage is
+  desugared into a projection, so it answers 51270 even against a collection,
+  where every other argument gets the namespace error.
+
+- [ ] **Aggregation stage specs on the RUST server: 219 of 725 (2026-09-02).**
+  Newly visible: the probe compared only the Python server until it grew a
+  `PROBE_SERVER` column, so this surface had never been measured. Roughly the
+  size the Python side started at. Two families:
+
+  - **61 whole-stage defers** (code 2, "not supported by the Rust server") —
+    `$unset`, `$out`, `$merge`, `$set`, `$replaceWith`, `$bucketAuto`,
+    `$documents`, `$facet`. A capability gap, and on the standalone server a
+    defer is an error, so these stages fail outright there.
+  - **~158 message differences**, most of them one root cause: the Rust side
+    renders a BSON value with Rust's `Debug` formatting where mongod has its
+    own —  `Regex { pattern: "a", options: "" }` for `/a/`,
+    `Binary { subtype: Generic, bytes: [122] }` for `BinData(0, 7A)`,
+    `Timestamp { time: 1, increment: 1 }`, `JavaScriptCode("x=1")`, `NaN` for
+    `nan`. `crate::query::bson_value_repr` already exists and is what these
+    sites should be calling. The rest are validation-order differences of the
+    same shape the Python server just fixed.
+
+  Fix the renderer first — it is one change covering the largest family, and it
+  will make the remainder legible.
 
 - **Rust PG server: multidimensional arrays are refused (`0A000`), not
   answered.** `{{1,2},{3,4}}` plans and compares correctly; only returning one
