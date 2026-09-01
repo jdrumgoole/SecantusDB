@@ -230,6 +230,17 @@ engines.
   Python" signal for constructs it can't reproduce exactly (regex → Python `re`,
   collation, Decimal128 edges, non-ASCII case, etc.). When porting/widening a Rust
   engine, **extend the parity suite first**; never let the two engines drift.
+- **The parity suites do NOT cover the STORAGE layer** — they pin `query` /
+  `update` / `expressions` / `projection` / `sortkey` / `diff` / `aggregate`,
+  the pure engines. `secantus-storage` has its own port of the index helpers
+  (`op_implies_bound`, `index_key_variants`, the pickers), and on 2026-09-01 it
+  still carried four index defects — three of them silent data loss — for as long
+  as it took someone to grep for them after the Python side was fixed. **When a
+  fix lands in `src/secantus/storage.py`, grep `crates/secantus-storage/` for the
+  same helper**: nothing else will tell you. `tools/probes/index_result_sets.py`
+  is the standing cover for the index half — it compares a server against ITSELF,
+  with and without the index, so it isolates the index from the sort engine and
+  needs no oracle to say which side is wrong.
 - **Implication for changes:** a change to an operator's semantics must land in
   *both* the Python module and the Rust port (or the Rust port must explicitly
   defer that case), and the parity suite must stay green. Both servers must keep

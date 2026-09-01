@@ -1931,6 +1931,100 @@ fn index_field_exists(doc: &Document, field: &str) -> bool {
     !get_path_values(doc, field).0.is_empty()
 }
 
+/// Does a SPARSE index over `key_spec` hold an entry for `doc`?
+///
+/// mongod's rule for a compound sparse index is "at least ONE of the indexed
+/// fields is present" — a document missing some of them is still indexed, with
+/// the missing ones keyed as null. This required ALL of them, which silently
+/// dropped documents from the index and then, because the pickers happily used
+/// that index, from query RESULTS: with a sparse `{a: 1, b: 1}` over
+/// `[{a: 1, b: 1}, {a: 1}]`, `find({a: 1})` returned one document where mongod
+/// returns two. Measured against mongod 8.2.11; the Python server carried the
+/// same bug and was fixed in the same batch (`storage._sparse_covers`).
+///
+/// An index BUILT before this fix under-indexes until it is dropped and
+/// recreated; nothing rewrites existing entries.
+fn sparse_covers(doc: &Document, key_spec: &Document) -> bool {
+    key_spec.keys().any(|f| index_field_exists(doc, f))
+}
+
+/// The comparison operators that match an ABSENT field when their operand is
+/// null. `$lt` / `$gt` are included conservatively: they match nothing against
+/// null, so listing them costs at most a collection scan.
+const NULL_COMPARABLE_OPS: &[&str] = &["$eq", "$lte", "$gte", "$lt", "$gt"];
+
+/// Can this field predicate match a document where the field is ABSENT?
+///
+/// mongod's query language treats a missing field as null, so `{a: null}`
+/// matches `{}` — and the negations (`$ne` / `$nin` / `$not` /
+/// `$exists: false`) match it too, as does ANY comparison against null, not
+/// just `$eq`. Anything else (an equality against a non-null value, a range
+/// bound, `$exists: true`) requires the field to be there.
+///
+/// This is the sparse-index gate: an index that omits the absent-field
+/// documents cannot answer a query those documents could match.
+fn predicate_may_match_missing(clause: Option<&Bson>) -> bool {
+    let clause = match clause {
+        None => return true, // the query does not constrain this field at all
+        Some(Bson::Null) => return true,
+        Some(c) => c,
+    };
+    let doc = match clause.as_document() {
+        Some(d) => d,
+        None => return false,
+    };
+    if !doc.keys().any(|k| k.starts_with('$')) {
+        return false; // an equality against a whole sub-document
+    }
+    for (op, arg) in doc {
+        if NULL_COMPARABLE_OPS.contains(&op.as_str()) && matches!(arg, Bson::Null) {
+            return true;
+        }
+        if op == "$in" {
+            if let Some(arr) = arg.as_array() {
+                if arr.iter().any(|v| matches!(v, Bson::Null)) {
+                    return true;
+                }
+            }
+        }
+        if op == "$exists" && !bson_truthy_exists(arg) {
+            return true;
+        }
+        if matches!(op.as_str(), "$ne" | "$nin" | "$not") {
+            return true;
+        }
+    }
+    false
+}
+
+/// `$exists`'s argument as a boolean, mongod-style.
+fn bson_truthy_exists(v: &Bson) -> bool {
+    match v {
+        Bson::Boolean(b) => *b,
+        Bson::Null => false,
+        Bson::Int32(n) => *n != 0,
+        Bson::Int64(n) => *n != 0,
+        Bson::Double(d) => *d != 0.0,
+        _ => true,
+    }
+}
+
+/// May a SPARSE index over `key_spec` serve a query filtered by `filter`?
+///
+/// Only when at least one indexed field carries a predicate that GUARANTEES the
+/// field is present — that is what guarantees every matching document has an
+/// entry in the index (see `sparse_covers`).
+///
+/// Without this gate a sparse index silently loses rows: a sparse index on `a`
+/// made `find({a: null})` skip every document missing `a`, and a sort over one
+/// skipped them too, because a sort walks the WHOLE index. Measured against
+/// mongod 8.2.11; mirrors `storage._sparse_index_usable`.
+fn sparse_index_usable(key_spec: &Document, filter: &Document) -> bool {
+    key_spec
+        .keys()
+        .any(|field| !predicate_may_match_missing(filter.get(field)))
+}
+
 /// True if any field of `key_spec` is array-valued in `doc` — either an array
 /// leaf or a dotted path descending through an array. That's the signal that
 /// marks an index multikey. Mirrors `storage._doc_makes_multikey`.
@@ -1941,16 +2035,16 @@ fn doc_makes_multikey(doc: &Document, key_spec: &Document) -> bool {
 /// All byte-keys `doc` contributes to an index under `key_spec`. Scalars give
 /// one key; arrays give one key per (deduped) element *plus* the whole-array
 /// key (the multikey layout); compound indexes take the cartesian product
-/// across each field's candidate values. A `sparse` index produces no keys when
-/// any indexed field is missing. Missing fields otherwise encode as `null`.
-/// Mirrors `storage._index_key_variants`.
+/// across each field's candidate values. A `sparse` index produces no keys only
+/// when the doc has NONE of the indexed fields (see `sparse_covers`). Missing
+/// fields otherwise encode as `null`. Mirrors `storage._index_key_variants`.
 fn index_key_variants(doc: &Document, key_spec: &Document, sparse: bool) -> Result<Vec<Vec<u8>>> {
     let fields: Vec<(&String, i32)> = key_spec
         .iter()
         .map(|(k, v)| (k, direction_of(v).unwrap_or(1)))
         .collect();
 
-    if sparse && fields.iter().any(|(f, _)| !index_field_exists(doc, f)) {
+    if sparse && !sparse_covers(doc, key_spec) {
         return Ok(Vec::new());
     }
 
@@ -2166,6 +2260,15 @@ fn is_op_doc(v: &Bson) -> bool {
 /// `(pop, pv)`? Comparison uses `encode_value` so it follows MongoDB's
 /// cross-type BSON sort order. Returns `false` for any pairing it can't prove
 /// (soundness over completeness). Mirrors `storage._op_implies_bound`.
+/// The BSON comparison bracket of an `encode_value` result.
+///
+/// `sortkey`'s layout is `<rank_byte><payload>`, so the leading byte IS the type
+/// rank — and the numeric types deliberately share one, exactly like mongod's
+/// "numbers compare with numbers" bracket.
+fn type_bracket(encoded: &[u8]) -> i16 {
+    encoded.first().map_or(-1, |b| i16::from(*b))
+}
+
 fn op_implies_bound(qop: &str, qv: &Bson, pop: &str, pv: &Bson) -> bool {
     let (a, b) = match (
         sortkey::encode_value(qv, None),
@@ -2174,6 +2277,17 @@ fn op_implies_bound(qop: &str, qv: &Bson, pop: &str, pv: &Bson) -> bool {
         (Ok(a), Ok(b)) => (a, b),
         _ => return false,
     };
+    // The range operators are TYPE-BRACKETED: `{b: {$gt: 0}}` matches numbers
+    // greater than zero and NOTHING of another type, even though a string sorts
+    // above every number in BSON order. Comparing across brackets is what a
+    // plain `encode_value` byte compare does, and it made this claim that
+    // `{b: "x"}` implies `{b: {$gt: 0}}` — so a partial index on that filter was
+    // used for a query whose matching documents it does not contain, and
+    // `find({a: 5, b: "x"})` returned NOTHING. Measured against mongod 8.2.11;
+    // the Python server carried the same bug (`storage._op_implies_bound`).
+    if pop != "$eq" && type_bracket(&a) != type_bracket(&b) {
+        return false;
+    }
     let (le, lt, ge, gt, eq) = (a <= b, a < b, a >= b, a > b, a == b);
     match pop {
         // query upper-bounds the field; need its max <= / < pv.
@@ -11128,6 +11242,13 @@ impl Storage {
             if opts.get_bool("multikey").unwrap_or(false) {
                 continue;
             }
+            // A sort walks the WHOLE index, so a sparse one drops every
+            // document it omits straight out of the result set. This picker is
+            // only reached with an EMPTY filter, so nothing can guarantee the
+            // indexed fields are present.
+            if opts.get_bool("sparse").unwrap_or(false) {
+                continue;
+            }
             let idx_pairs: Vec<(String, i32)> = match key_spec
                 .iter()
                 .map(|(f, d)| direction_of(d).map(|di| (f.clone(), di)))
@@ -11376,6 +11497,9 @@ impl Storage {
                 if !query_implies_partial(query, pf) {
                     continue;
                 }
+            }
+            if desc.sparse && !sparse_index_usable(&desc.key_spec, query) {
+                continue;
             }
             let n_fields = desc.key_spec.len();
             let leads = desc
@@ -11984,6 +12108,9 @@ impl Storage {
         let filter_fields: HashSet<&str> = filter.keys().map(|s| s.as_str()).collect();
         let mut best: Option<(String, Document)> = None;
         for desc in self.index_descs(session, db, coll)? {
+            if desc.sparse && !sparse_index_usable(&desc.key_spec, filter) {
+                continue;
+            }
             let eff_fields: HashSet<&str> = match &desc.partial {
                 Some(pf) => {
                     if !query_implies_partial(filter, pf) {
@@ -12050,6 +12177,26 @@ impl Storage {
             .copied()
             .filter(|f| filter.contains_key(f.as_str()))
             .collect();
+        if prefix_fields.is_empty() {
+            // A PARTIAL index whose `partialFilterExpression` already covers
+            // every field the query names — e.g. an index on `a` partial on
+            // `{b: {$gt: 0}}`, queried as `{b: 5}`. There is no key prefix to
+            // pin, and every entry satisfies the implied clauses, so the whole
+            // index is the candidate set (`matches()` still applies the exact
+            // filter). This used to build an EMPTY prefix and then prefix-scan
+            // for the bare separator, which matches no key at all — so the query
+            // silently returned nothing. (The Python server hit the same shape
+            // as an `IndexError` out of the command handler; here it was quiet.)
+            // An empty prefix matches every entry of this index.
+            return Ok(Some(self.scan_index_for_id_keys(
+                session,
+                db,
+                coll,
+                &name,
+                &[],
+                true,
+            )?));
+        }
         let mut parts: Vec<Vec<u8>> = Vec::with_capacity(prefix_fields.len());
         for f in &prefix_fields {
             let dir = direction_of(key_spec.get(f.as_str()).unwrap()).unwrap();
@@ -12087,6 +12234,9 @@ impl Storage {
         let target = eq_set.len();
         let mut best: Option<(String, Document)> = None;
         for desc in self.index_descs(session, db, coll)? {
+            if desc.sparse && !sparse_index_usable(&desc.key_spec, filter) {
+                continue;
+            }
             if let Some(pf) = &desc.partial {
                 if !query_implies_partial(filter, pf) {
                     continue;
@@ -12886,6 +13036,183 @@ mod tests {
             decode_doc(assigned).unwrap().get_object_id("_id").is_ok(),
             "missing _id must be assigned an ObjectId"
         );
+    }
+
+    /// An index must never change which documents a query returns. Each case
+    /// below was a real divergence from mongod 8.2.11 (measured 2026-09-01) and
+    /// three of them are silent DATA LOSS — fewer documents came back WITH the
+    /// index than without it, no error. The Python server carried the same four
+    /// and was fixed in the same batch; nothing caught these on the Rust side
+    /// because the parity suites cover the pure operator engines, not storage.
+    #[test]
+    fn sparse_index_never_drops_absent_field_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.create_index(
+            "app",
+            "t",
+            "a_sparse",
+            &doc! {"a": 1i32},
+            &doc! {"sparse": true},
+        )
+        .unwrap();
+        s.insert(
+            "app",
+            "t",
+            vec![
+                encode_doc(&doc! {"_id": 1i32, "a": Bson::Null, "b": 1i32}).unwrap(),
+                // `a` ABSENT — the document a sparse index omits.
+                encode_doc(&doc! {"_id": 2i32, "b": 1i32}).unwrap(),
+                encode_doc(&doc! {"_id": 3i32, "a": 5i32, "b": 1i32}).unwrap(),
+            ],
+            true,
+        )
+        .unwrap();
+
+        let ids = |f: Document| -> Vec<i32> {
+            let mut out: Vec<i32> = s
+                .find_matching("app", "t", &f)
+                .unwrap()
+                .iter()
+                .map(|b| decode_doc(b).unwrap().get_i32("_id").unwrap())
+                .collect();
+            out.sort_unstable();
+            out
+        };
+
+        // `{a: null}` MATCHES a missing field, so the sparse index cannot serve
+        // it — using it skipped `_id: 2` entirely.
+        assert_eq!(ids(doc! {"a": Bson::Null}), vec![1, 2]);
+        assert_eq!(ids(doc! {"a": {"$eq": Bson::Null}}), vec![1, 2]);
+        assert_eq!(ids(doc! {"a": {"$in": [Bson::Null, 5i32]}}), vec![1, 2, 3]);
+        // A RANGE bound against null matches an absent field too, not just $eq.
+        assert_eq!(ids(doc! {"a": {"$lte": Bson::Null}}), vec![1, 2]);
+        assert_eq!(ids(doc! {"a": {"$gte": Bson::Null}}), vec![1, 2]);
+        // Unaffected: this cannot match an absent field, so the index stays
+        // usable for it.
+        assert_eq!(ids(doc! {"a": 5i32}), vec![3]);
+    }
+
+    #[test]
+    fn compound_sparse_index_holds_documents_missing_some_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.create_index(
+            "app",
+            "t",
+            "ab_sparse",
+            &doc! {"a": 1i32, "b": 1i32},
+            &doc! {"sparse": true},
+        )
+        .unwrap();
+        s.insert(
+            "app",
+            "t",
+            vec![
+                encode_doc(&doc! {"_id": 1i32, "a": 1i32, "b": 1i32}).unwrap(),
+                // has `a` but not `b` — mongod indexes it, we used to not
+                encode_doc(&doc! {"_id": 2i32, "a": 1i32}).unwrap(),
+                encode_doc(&doc! {"_id": 3i32, "b": 1i32}).unwrap(),
+                encode_doc(&doc! {"_id": 4i32, "a": 1i32, "b": Bson::Null}).unwrap(),
+                // neither — the only doc a sparse compound index legitimately omits
+                encode_doc(&doc! {"_id": 5i32}).unwrap(),
+            ],
+            true,
+        )
+        .unwrap();
+        let mut ids: Vec<i32> = s
+            .find_matching("app", "t", &doc! {"a": 1i32})
+            .unwrap()
+            .iter()
+            .map(|b| decode_doc(b).unwrap().get_i32("_id").unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn partial_filter_implication_is_type_bracketed() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.create_index(
+            "app",
+            "t",
+            "ix",
+            &doc! {"a": 1i32},
+            &doc! {"partialFilterExpression": {"b": {"$gt": 0i32}}},
+        )
+        .unwrap();
+        s.insert(
+            "app",
+            "t",
+            vec![
+                encode_doc(&doc! {"_id": 1i32, "a": 5i32, "b": "x"}).unwrap(),
+                encode_doc(&doc! {"_id": 2i32, "a": 5i32, "b": 7i32}).unwrap(),
+            ],
+            true,
+        )
+        .unwrap();
+        let ids = |f: Document| -> Vec<i32> {
+            s.find_matching("app", "t", &f)
+                .unwrap()
+                .iter()
+                .map(|b| decode_doc(b).unwrap().get_i32("_id").unwrap())
+                .collect()
+        };
+        // A string sorts above every number in BSON order, but `$gt: 0` is
+        // type-bracketed and matches numbers only — so `{b: "x"}` does NOT imply
+        // the partial filter, and the index does not contain `_id: 1`. Comparing
+        // across brackets used the index anyway and returned nothing.
+        assert_eq!(ids(doc! {"a": 5i32, "b": "x"}), vec![1]);
+        // Same-bracket implication still holds, so the index is still used here.
+        assert_eq!(ids(doc! {"a": 5i32, "b": 7i32}), vec![2]);
+    }
+
+    #[test]
+    fn query_covered_entirely_by_a_partial_filter_returns_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.create_index(
+            "app",
+            "t",
+            "ix",
+            &doc! {"a": 1i32},
+            &doc! {"partialFilterExpression": {"b": {"$gt": 0i32}}},
+        )
+        .unwrap();
+        s.insert(
+            "app",
+            "t",
+            vec![
+                encode_doc(&doc! {"_id": 1i32, "a": 1i32, "b": 5i32}).unwrap(),
+                encode_doc(&doc! {"_id": 2i32, "a": 2i32, "b": 0i32}).unwrap(),
+                encode_doc(&doc! {"_id": 3i32, "b": 9i32}).unwrap(),
+            ],
+            true,
+        )
+        .unwrap();
+        let ids = |f: Document| -> Vec<i32> {
+            s.find_matching("app", "t", &f)
+                .unwrap()
+                .iter()
+                .map(|b| decode_doc(b).unwrap().get_i32("_id").unwrap())
+                .collect()
+        };
+        // The query names ONLY the partial filter's own field, so no key prefix
+        // can be pinned. This used to prefix-scan for the bare separator, which
+        // matches no key, and silently returned nothing.
+        assert_eq!(ids(doc! {"b": 5i32}), vec![1]);
+        assert_eq!(ids(doc! {"b": 9i32}), vec![3]);
+        // `b: 0` does not imply `b > 0`, so this one legitimately falls back.
+        assert_eq!(ids(doc! {"b": 0i32}), vec![2]);
     }
 
     #[test]

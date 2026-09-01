@@ -1670,6 +1670,45 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+### 2026-09-01: all four were in the RUST server too, and nothing covered it
+
+- [x] **The Rust storage layer had every one of the four defects below**, found
+      by grepping for the helpers after the Python fixes landed --
+      `op_implies_bound` compared with `sortkey::encode_value` and no bracket
+      gate, `index_key_variants` required ALL indexed fields for a sparse index,
+      the pickers had no sparse gate, and the empty-prefix case built a key of
+      nothing. Fixed with the same four gates, ported.
+
+      **The gap that let it happen is worth more than the bugs.** The
+      engine-parity suites pin `query` / `update` / `expressions` / `projection`
+      / `sortkey` / `diff` / `aggregate` -- the PURE engines. The storage layer
+      is not among them, so the one mechanism built to catch the two servers
+      drifting cannot see the layer where these live. `tools/probes/
+      index_result_sets.py` is the standing cover: it compares a server against
+      ITSELF, with and without the index, so it isolates the index from the sort
+      engine and needs no oracle to say which side is wrong. Pre-fix Rust: 12 of
+      15 curated, 53 of 1692 randomised. Post-fix, both servers: 0 and 0.
+
+      **The Rust variant of the empty-prefix bug was WORSE than Python's.**
+      Python raised `IndexError` out of the command handler -- loud. Rust
+      prefix-scanned for the bare separator, which matches no key, and returned
+      nothing. A crash gets fixed; a quiet empty result gets believed.
+
+      **Two false trails, recorded so they are not re-walked.** (a) 15 of 48
+      `secantus-storage` tests failed with `WtError code 22 "Invalid argument"`
+      on a freshly built WT -- NOT the change: the storage crate switched
+      `block_compressor` from zlib to **lz4** on 2026-08-22, and the local build
+      recipe still only enabled zlib, so every table create failed. Take the WT
+      flags from `CMakeLists.txt`'s `WT_ZLIB_ARG`, which is the project's own
+      source of truth. Stashing the change and re-running settled it in one
+      command -- an identical failure list on pristine `main` is proof. (b) The
+      probe's first version compared ordered `_id` lists against mongod and
+      reported 58 of 1692 divergences that were all TIE ORDER under equal sort
+      keys, which mongod does not promise and does not itself reproduce.
+      Comparing sort-key VALUES cut it to 8, and those 8 were pre-existing
+      array-sort and cross-type ordering with nothing to do with indexes.
+      **A probe that measures more than its question buries the answer.**
+
 ### 2026-09-01 sweep: four ways an INDEX changed the answer, and a crash
 
 All four found the way this file keeps saying to find things -- by running the
