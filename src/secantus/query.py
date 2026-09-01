@@ -419,6 +419,16 @@ def _truthy(value: Any) -> bool:
         return False
     if isinstance(value, (bool, int, float)):
         return bool(value)
+    if isinstance(value, Decimal128):
+        # mongod reads a Decimal128 NUMERICALLY here, so `$exists:
+        # Decimal128("0")` is falsy and matches nothing (probed 8.2.11,
+        # 2026-09-01). Falling through to the catch-all made every Decimal128
+        # truthy, including zero.
+        try:
+            dec = value.to_decimal()
+        except (InvalidOperation, ValueError):
+            return True
+        return dec.is_nan() or bool(dec)
     return True
 
 
@@ -1490,8 +1500,17 @@ def _validate_type_arg(t: Any) -> None:
         if isinstance(t, Decimal128):
             dec = t.to_decimal()
             if not dec.is_finite() or dec != dec.to_integral_value():
-                raise QueryError(f"Invalid numerical type code: {t}")
+                # Rendered through the DOUBLE form, like every other numeric
+                # code: `Decimal128("NaN")` prints `nan`, not `NaN`.
+                raise QueryError(f"Invalid numerical type code: {_fmt_g(float(dec))}")
             code = int(dec)
+            if code == 0:
+                # `%g` keeps the sign of negative zero, and mongod's message
+                # does too -- `Decimal128("-0")` reports `-0`, not `0`.
+                raise QueryError(
+                    f"Invalid numerical type code: {_fmt_g(float(dec))}"
+                    ". Instead use {$exists:false}."
+                )
         elif isinstance(t, float):
             if not t.is_integer():
                 raise QueryError(f"Invalid numerical type code: {_fmt_g(t)}")

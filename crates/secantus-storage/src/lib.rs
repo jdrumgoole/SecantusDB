@@ -1740,12 +1740,40 @@ fn resolve_current_date(update: &Document) -> Result<Document> {
             // A boolean (true OR false) sets the current Date, matching mongod
             // and the Python `$currentDate` branch.
             Bson::Boolean(_) => date.clone(),
-            Bson::Document(o) => match o.get_str("$type") {
-                Ok("date") => date.clone(),
-                Ok("timestamp") => ts.clone(),
-                _ => return Err(StorageError::QueryUnsupported),
-            },
-            _ => return Err(StorageError::QueryUnsupported),
+            Bson::Document(o) => {
+                // An unrecognized KEY is reported before the `$type` value is
+                // looked at, so `{$type: "date", a: 1}` names `a` even though
+                // the `$type` is valid (probed 8.2.11). These three all used to
+                // be a generic "not supported".
+                if let Some(bad) = o.keys().find(|k| k.as_str() != "$type") {
+                    return Err(StorageError::QueryError {
+                        code: 2,
+                        errmsg: format!("Unrecognized $currentDate option: {bad}"),
+                    });
+                }
+                match o.get_str("$type") {
+                    Ok("date") => date.clone(),
+                    Ok("timestamp") => ts.clone(),
+                    _ => {
+                        return Err(StorageError::QueryError {
+                            code: 2,
+                            errmsg: "The '$type' string field is required to be 'date' or \
+                                     'timestamp': {$currentDate: {field : {$type: 'date'}}}"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+            other => {
+                return Err(StorageError::QueryError {
+                    code: 2,
+                    errmsg: format!(
+                        "{} is not valid type for $currentDate. Please use a boolean \
+                         ('true') or a $type expression ({{$type: 'timestamp/date'}}).",
+                        secantus_core::query::bson_type_name(other)
+                    ),
+                });
+            }
         };
         set.insert(path.clone(), value);
     }
