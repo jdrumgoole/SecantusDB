@@ -315,13 +315,23 @@ and `caseLevel` are supported; `numericOrdering` is not (would
 need a length-prefixed digit-run encoding to stay byte-sortable —
 queries combining it with an index fall back to COLLSCAN).
 
-That support is for **matching**. Collation *ordering* is not ICU:
-measured against mongod 8.2.11 on 2026-08-31, every equality case
-agreed at every strength, but a collated `sort` falls back to
-codepoint order — accents sort after `z` rather than beside their
-base letter, and `caseFirst`, `backwards` and the locale itself are
-accepted and ignored. See `tasks/backlog.md` §5 for the measurements
-and what closing it would take.
+That support is for **matching**. Collation *ordering* is a separate
+three-level key (`collation.sort_levels`): base letters first, then
+each character's accents, then case. So accents sort beside their base
+letter, tertiary case order applies, and `caseFirst`, `backwards` and
+`numericOrdering` all take effect in a `sort`. Seventeen of nineteen
+cases in `tools/probes/collation_order.py` match mongod 8.2.11
+(measured 2026-09-01); the two that do not are **locale-specific** —
+Swedish sorts `ä` after `z` and Danish sorts `å` last, which is CLDR
+data rather than something character decomposition can derive, and
+needs an ICU dependency.
+
+One consequence worth knowing: **a collated sort is never served by an
+index walk.** The entries table stores one normalised byte string per
+value, which cannot express the three levels, so the index is still
+used to fetch (and `explain` still reports IXSCAN) but the ordering is
+applied afterwards. Before that rule, the same query returned a
+*different order* depending on whether a collated index existed.
 
 ```python
 coll.create_index("name", collation={"locale": "en", "strength": 2})

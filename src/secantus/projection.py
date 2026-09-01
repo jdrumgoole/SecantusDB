@@ -29,10 +29,14 @@ def _is_elem_match_spec(value: Any) -> bool:
 
 
 # Recognized ``$meta`` keywords (mongod). An unrecognized argument is a
-# Location17308; ``textScore`` without a ``$text`` query is a Location40218.
-# Everything here is accepted at parse time; SecantusDB doesn't actually compute
-# any of these metadata values, so the projected field is omitted (partial —
-# graceful degradation — rather than a wrong value or a spurious error).
+# Location17308; ``textScore`` without a ``$text`` query is a Location40218;
+# ``sortKey`` without a sort is a BadValue.
+#
+# ``recordId`` / ``sortKey`` / ``indexKey`` are COMPUTED (the caller supplies
+# them per document -- see ``apply_projection_batch``'s ``metas``). The rest
+# describe machinery SecantusDB does not have (text scoring, Atlas Search,
+# ``$geoNear`` metadata), and their field is omitted rather than filled with a
+# wrong value.
 _META_KEYWORDS = frozenset(
     {
         "textScore",
@@ -70,17 +74,32 @@ def _query_has_text(query: Mapping[str, Any] | None) -> bool:
     return False
 
 
+def meta_fields(spec: Mapping[str, Any] | None) -> dict[str, str]:
+    """``{output field: $meta keyword}`` for every ``$meta`` in ``spec``."""
+    if not spec:
+        return {}
+    return {k: v["$meta"] for k, v in spec.items() if _is_meta_spec(v)}
+
+
 def validate_meta_projection(
-    spec: Mapping[str, Any] | None, query: Mapping[str, Any] | None = None
+    spec: Mapping[str, Any] | None,
+    query: Mapping[str, Any] | None = None,
+    *,
+    has_sort: bool = True,
 ) -> None:
     """Raise ``ProjectionError`` for a faulty ``{$meta: ...}`` projection value.
-    Oracle-pinned against mongod 6.0:
+    Probed against mongod 8.2.11 (2026-09-01):
       * an unrecognized ``$meta`` argument => Location17308
-        ``Unsupported argument to $meta: <arg>``
+        ``Unsupported $meta field: <arg>``
       * ``{$meta: "textScore"}`` without a ``$text`` query => Location40218
         ``query requires text score metadata, but it is not available``
-    Recognized-but-unsupported args (``indexKey`` / ``recordId`` / ``sortKey`` /
-    …) validate cleanly here; :func:`apply_projection` omits the field."""
+      * ``{$meta: "sortKey"}`` without a ``sort`` => BadValue
+        ``cannot use sortKey $meta projection without a sort``
+
+    ``has_sort`` defaults to True so a caller that has no sort context (the SQL
+    layer, a bare ``apply_projection``) does not start rejecting sortKey; the
+    ``find`` path passes the real answer.
+    """
     if not spec:
         return
     for value in spec.values():
@@ -89,9 +108,15 @@ def validate_meta_projection(
         arg = value["$meta"]
         if arg not in _META_KEYWORDS:
             raise ProjectionError(
-                f"Unsupported argument to $meta: {arg}",
+                f"Unsupported $meta field: {arg}",
                 code=17308,
                 code_name="Location17308",
+            )
+        if arg == "sortKey" and not has_sort:
+            raise ProjectionError(
+                "cannot use sortKey $meta projection without a sort",
+                code=2,
+                code_name="BadValue",
             )
         if arg == "textScore" and not _query_has_text(query):
             raise ProjectionError(
@@ -289,16 +314,22 @@ def apply_projection_batch(
     docs: list[dict[str, Any]],
     spec: Mapping[str, Any] | None,
     query: Mapping[str, Any] | None = None,
+    *,
+    metas: list[Mapping[str, Any]] | None = None,
+    has_sort: bool = True,
 ) -> list[dict[str, Any]]:
     """Project every doc in ``docs`` against ``spec`` in one shot.
 
     Every ``find`` result is projected; an empty spec is a no-op copy. ``query`` is
     the find filter, needed only to resolve a positional ``arr.$`` projection.
+    ``metas`` is the per-document ``$meta`` values, aligned with ``docs``.
     """
     if not spec:
         return [copy.deepcopy(d) for d in docs]
-    plan = compile_projection(spec, query)
-    return [apply_projection_plan(d, plan) for d in docs]
+    plan = compile_projection(spec, query, has_sort=has_sort)
+    if metas is None:
+        return [apply_projection_plan(d, plan) for d in docs]
+    return [apply_projection_plan(d, plan, m) for d, m in zip(docs, metas, strict=True)]
 
 
 class _ProjectionPlan:
@@ -321,6 +352,7 @@ class _ProjectionPlan:
         "doc_pred",
         "value_pred",
         "non_id",
+        "meta_fields",
     )
 
     def __init__(self) -> None:
@@ -336,6 +368,7 @@ class _ProjectionPlan:
         self.doc_pred: Mapping[str, Any] | None = None
         self.value_pred: Any = None
         self.non_id: dict[str, Any] = {}
+        self.meta_fields: dict[str, str] = {}
 
 
 def apply_projection(
@@ -351,6 +384,8 @@ def apply_projection(
 def compile_projection(
     spec: Mapping[str, Any],
     query: Mapping[str, Any] | None = None,
+    *,
+    has_sort: bool = True,
 ) -> _ProjectionPlan:
     plan = _ProjectionPlan()
 
@@ -373,7 +408,8 @@ def compile_projection(
     # simply not what mongod does. Asking for a metadata field silently threw
     # away the caller's entire document.
     if any(_is_meta_spec(v) for v in spec.values()):
-        validate_meta_projection(spec, query)
+        validate_meta_projection(spec, query, has_sort=has_sort)
+        plan.meta_fields = meta_fields(spec)
         spec = {k: v for k, v in spec.items() if not _is_meta_spec(v)}
 
     # Separate ``$slice`` and positional (``arr.$``) projections — they don't
@@ -458,9 +494,43 @@ def compile_projection(
     return plan
 
 
-def apply_projection_plan(doc: dict[str, Any], plan: _ProjectionPlan) -> dict[str, Any]:
+def apply_projection_plan(
+    doc: dict[str, Any],
+    plan: _ProjectionPlan,
+    meta: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """The per-document half of a compiled projection — branch bodies verbatim
-    from the pre-split ``apply_projection``."""
+    from the pre-split ``apply_projection``.
+
+    ``meta`` supplies this document's ``$meta`` values, keyed by keyword
+    (``recordId`` / ``sortKey`` / ``indexKey``). A keyword the caller cannot
+    supply is OMITTED from the output, which is also what mongod does for
+    ``indexKey`` when the plan is a collection scan.
+    """
+    if plan.meta_fields:
+        return _with_meta(_apply_projection_body(doc, plan), plan, meta)
+    return _apply_projection_body(doc, plan)
+
+
+def _with_meta(
+    result: dict[str, Any],
+    plan: _ProjectionPlan,
+    meta: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Append the requested ``$meta`` values to an already-projected document.
+
+    mongod appends them at the END, after everything the projection itself
+    produced (probed 8.2.11), which is what a plain assignment gives here.
+    """
+    if not meta:
+        return result
+    for out_field, keyword in plan.meta_fields.items():
+        if keyword in meta:
+            set_path(result, out_field, meta[keyword])
+    return result
+
+
+def _apply_projection_body(doc: dict[str, Any], plan: _ProjectionPlan) -> dict[str, Any]:
     slice_specs = plan.slice_specs
     if plan.kind == "positional":
         assert plan.doc_pred is not None

@@ -36,6 +36,7 @@ import wiredtiger as wt
 from bson.int64 import Int64
 from bson.timestamp import Timestamp
 
+from secantus import deadline as _deadline
 from secantus.diff import compute_update_description
 from secantus.geo import GeoError, parse_doc_geometry, parse_query_geometry, validate_coordinates
 from secantus.geo_index import (
@@ -794,6 +795,100 @@ def _index_field_exists(doc: Mapping[str, Any], field: str) -> bool:
     return bool(get_path_values(doc, field)[0])
 
 
+def _sparse_covers(doc: Mapping[str, Any], key_spec: Mapping[str, Any]) -> bool:
+    """Does a SPARSE index over ``key_spec`` hold an entry for ``doc``?
+
+    mongod's rule for a compound sparse index is "at least ONE of the indexed
+    fields is present" -- a document missing some of them is still indexed, with
+    the missing ones keyed as null. We required ALL of them, which silently
+    dropped documents from the index and then, because the planner happily used
+    that index, from query RESULTS: with a sparse ``{a: 1, b: 1}`` over
+    ``[{a: 1, b: 1}, {a: 1}]``, ``find({a: 1})`` returned one document where
+    mongod returns two (measured against 8.2.11, 2026-09-01).
+
+    Single-field indexes are unaffected -- "at least one of one" is "the one".
+
+    An index BUILT before this fix under-indexes until it is dropped and
+    recreated; nothing rewrites existing entries.
+    """
+    return any(_index_field_exists(doc, field) for field in key_spec)
+
+
+#: The comparison operators that match an ABSENT field when their operand is
+#: null. ``$lt`` / ``$gt`` are included conservatively: they match nothing
+#: against null, so listing them costs at most a collection scan.
+_NULL_COMPARABLE_OPS = frozenset({"$eq", "$lte", "$gte", "$lt", "$gt"})
+
+
+def _predicate_may_match_missing(clause: Any) -> bool:
+    """Can this field predicate match a document where the field is ABSENT?
+
+    mongod's query language treats a missing field as null, so ``{a: null}``
+    matches ``{}`` -- and the negations (``$ne`` / ``$nin`` / ``$not`` /
+    ``$exists: false``) match it too. Anything else (an equality against a
+    non-null value, a range bound, ``$exists: true``) requires the field to be
+    there.
+
+    This is the sparse-index gate: an index that omits the absent-field
+    documents cannot answer a query those documents could match. Conservative
+    on purpose -- an unrecognised operator counts as "might", which costs a
+    COLLSCAN and never a wrong answer.
+    """
+    if clause is _ABSENT_CLAUSE:
+        return True
+    if clause is None:
+        return True
+    if not isinstance(clause, Mapping):
+        return False
+    if not any(isinstance(k, str) and k.startswith("$") for k in clause):
+        # An equality against a whole sub-document.
+        return False
+    for op, arg in clause.items():
+        # ANY comparison against null, not just ``$eq``: ``{a: {$lte: null}}``
+        # and ``{a: {$gte: null}}`` match an absent field too (probed 8.2.11 --
+        # they were the gate's blind spot, and a sparse index still lost rows
+        # for them after the first fix).
+        if op in _NULL_COMPARABLE_OPS and arg is None:
+            return True
+        if op == "$in" and isinstance(arg, (list, tuple)) and any(v is None for v in arg):
+            return True
+        if op == "$exists" and not arg:
+            return True
+        if op in ("$ne", "$nin", "$not"):
+            return True
+    return False
+
+
+class _AbsentClause:
+    """Sentinel for "the query does not constrain this field at all"."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<absent>"
+
+
+_ABSENT_CLAUSE = _AbsentClause()
+
+
+def _sparse_index_usable(key_spec: Mapping[str, Any], filter: Mapping[str, Any] | None) -> bool:
+    """May a SPARSE index over ``key_spec`` serve a query filtered by ``filter``?
+
+    Only when at least one indexed field carries a predicate that GUARANTEES
+    the field is present -- that is what guarantees every matching document has
+    an entry in the index (see :func:`_sparse_covers`).
+
+    Without this gate a sparse index silently loses rows, and it did: a sparse
+    index on ``a`` made ``find({a: null})`` skip every document missing ``a``,
+    and an unfiltered ``find().sort({a: 1})`` skip them too. Measured against
+    mongod 8.2.11, 2026-09-01.
+    """
+    filter = filter or {}
+    return any(
+        not _predicate_may_match_missing(filter.get(field, _ABSENT_CLAUSE)) for field in key_spec
+    )
+
+
 def _doc_makes_multikey(doc: Mapping[str, Any], key_spec: Mapping[str, Any]) -> bool:
     """True if any field in ``key_spec`` is array-valued in ``doc`` — either
     an array leaf or a dotted path that descends through an array.
@@ -834,10 +929,8 @@ def _index_key(
     key a doc contributes. What's left here is encoding synthetic
     min/max bound specs, which have no array shape to lose.
     """
-    if sparse:
-        for field in key_spec:
-            if not _index_field_exists(doc, field):
-                return None
+    if sparse and not _sparse_covers(doc, key_spec):
+        return None
     fields = list(key_spec)
     if len(fields) == 1:
         d = int(key_spec[fields[0]])
@@ -884,16 +977,15 @@ def _index_key_variants(
     is correct (over-includes; the post-filter discards) but pays a
     cardinality blow-up the user is then on the hook for.
 
-    Returns an empty list when ``sparse`` and any field is missing.
+    Returns an empty list when ``sparse`` and the doc has NONE of the
+    indexed fields (see :func:`_sparse_covers`).
     Per-element values are deduplicated against their encoded bytes,
     so ``[1, 1, 2]`` writes two element entries (``1`` and ``2``) plus
     the whole-array entry, not three.
     """
     fields = list(key_spec)
-    if sparse:
-        for field in fields:
-            if not _index_field_exists(doc, field):
-                return []
+    if sparse and not _sparse_covers(doc, key_spec):
+        return []
 
     # Per-field candidate values (see ``_index_field_values``), deduped
     # on their encoded bytes so a repeated array element doesn't inflate
@@ -1322,14 +1414,36 @@ class MinMaxKeyError(Exception):
     pattern (mongod surfaces this as 51174)."""
 
 
+def _type_bracket(encoded: bytes) -> int:
+    """The BSON comparison bracket of an ``encode_value`` result.
+
+    ``sortkey``'s layout is ``<rank_byte><payload>``, so the leading byte IS
+    the type rank -- and the numeric types deliberately share one, exactly like
+    MongoDB's "numbers compare with numbers" bracket.
+    """
+    return encoded[0] if encoded else -1
+
+
 def _op_implies_bound(qop: str, qv: Any, pop: str, pv: Any) -> bool:
     """Does a single query constraint ``(qop, qv)`` guarantee the partial
-    bound ``(pop, pv)``? Comparison uses ``encode_value`` so it follows
-    MongoDB's cross-type BSON sort order. Returns ``False`` for any
-    operator pairing it can't prove (soundness over completeness)."""
+    bound ``(pop, pv)``? Returns ``False`` for any operator pairing it can't
+    prove (soundness over completeness).
+
+    The range operators are TYPE-BRACKETED: ``{b: {$gt: 0}}`` matches numbers
+    greater than zero and NOTHING of another type, even though a string sorts
+    above every number in BSON order. Comparing across brackets is what a plain
+    ``encode_value`` byte compare does, and it made this function claim that
+    ``{b: "x"}`` implies ``{b: {$gt: 0}}`` -- so a partial index on that filter
+    was used for a query whose matching documents it does not contain, and
+    ``find({a: 5, b: "x"})`` returned NOTHING where mongod returns the document.
+    Measured against mongod 8.2.11, 2026-09-01. Within one bracket the byte
+    compare is exactly right, which is why the bracket gate is the whole fix.
+    """
     try:
         a, b = encode_value(qv), encode_value(pv)
     except Exception:
+        return False
+    if pop != "$eq" and _type_bracket(a) != _type_bracket(b):
         return False
     le, lt, ge, gt, eq = a <= b, a < b, a >= b, a > b, a == b
     if pop in ("$lte", "$lt"):
@@ -4806,23 +4920,129 @@ class Storage:
                     # below reorders anyway, and feeding it insertion order makes
                     # equal-key ties break like mongod's RecordId order.)
                     raw_blobs = [b for _rid, _idk, b in self._scan_docs_natural(db, coll)]
+        # A COLLATED sort is never SATISFIED by the index walk, even when the
+        # walk is what fetched the candidates. The entries table holds one
+        # normalised byte string per value; the collation's ORDER is a
+        # three-level key (base letters, then accents, then case) those bytes
+        # cannot express. Skipping the post-sort on the strength of the walk
+        # made the same query return a different ORDER depending on whether a
+        # collated index happened to exist -- an index must change speed, never
+        # results. The index is still used to FETCH (so ``explain``'s IXSCAN
+        # remains accurate and the scan stays narrow); only the "already
+        # ordered" conclusion is withdrawn.
+        if collation_obj is not None:
+            in_sort_order = False
         if candidates is None:
             assert raw_blobs is not None
-            candidates = [bson.decode(b) for b in raw_blobs]
-        out = [d for d in candidates if matches(d, filter, vars=let, collation=collation_obj)]
+            candidates = []
+            for b in raw_blobs:
+                _deadline.check()
+                candidates.append(bson.decode(b))
+        # ``maxTimeMS``: the predicate pass is the loop whose length tracks the
+        # collection, so it is where an over-budget scan notices. Cooperative --
+        # a single ``matches()`` is never interrupted.
+        out = []
+        for d in candidates:
+            _deadline.check()
+            if matches(d, filter, vars=let, collation=collation_obj):
+                out.append(d)
         if min_bound is not None or max_bound is not None:
             out = self._apply_minmax_bounds(
                 db, coll, out, hint, min_bound, max_bound, collation_obj
             )
         if sort and not in_sort_order:
-            out = sort_docs(out, sort)
+            out = sort_docs(out, sort, collation=collation_obj)
         if skip:
             out = out[skip:]
         if limit > 0:
             out = out[:limit]
         if projection:
-            out = apply_projection_batch(out, projection, filter)
+            out = apply_projection_batch(
+                out,
+                projection,
+                filter,
+                metas=self._projection_metas(
+                    db, coll, out, projection, filter, sort, hint, collation_obj
+                ),
+                has_sort=bool(sort),
+            )
         return out
+
+    def _projection_metas(
+        self,
+        db: str,
+        coll: str,
+        docs: list[dict[str, Any]],
+        projection: Mapping[str, Any] | None,
+        filter: Mapping[str, Any] | None,
+        sort: Mapping[str, Any] | None,
+        hint: str | Mapping[str, Any] | None,
+        collation: Any,
+    ) -> list[dict[str, Any]] | None:
+        """Per-document ``$meta`` values for the documents about to be projected.
+
+        Returns ``None`` -- and does no work at all -- unless the projection
+        actually asks for one of the three keywords SecantusDB can answer, so
+        the ordinary projected ``find`` is unchanged.
+
+        * ``recordId`` is resolved through the ``_id`` index, one point lookup
+          per RETURNED document (skip / limit have already been applied), rather
+          than by threading a RecordId down every candidate path. A TIMESERIES
+          row's key carries a uniqueness suffix that is not derivable from
+          ``_id``, so the lookup misses there and the field is omitted -- the
+          same graceful degradation the uncomputable ``$meta`` keywords get.
+          Note the numbers are STORE-wide where mongod's restart per
+          collection; ``tests/test_meta_projection.py`` explains why matching
+          them would be a storage-format change.
+        * ``sortKey`` is the sort spec's fields in order, taking the same
+          representative element for an array-valued field that the sort itself
+          took, and ``null`` for a missing one (probed 8.2.11).
+        * ``indexKey`` is the indexed fields' values, and mongod emits it ONLY
+          for a real secondary-index scan -- a collection scan and the ``_id``
+          fast path both omit the field entirely.
+        """
+        from secantus.ordering import _array_sort_value
+        from secantus.projection import meta_fields as _meta_fields
+
+        wanted = set(_meta_fields(projection).values()) & {"recordId", "sortKey", "indexKey"}
+        if not wanted or not docs:
+            return None
+
+        sort_fields: list[tuple[str, bool]] = []
+        if "sortKey" in wanted and sort:
+            sort_fields = [(f, int(d) == -1) for f, d in sort.items()]
+
+        index_fields: list[str] = []
+        if "indexKey" in wanted:
+            # Mirrors the routing this very call took; no execution.
+            plan = self._explain_plan_uncached(
+                db, coll, dict(filter or {}), sort=sort, hint=hint, collation=collation
+            )
+            if plan.get("kind") == "IXSCAN" and plan.get("index_name") != _ID_INDEX_NAME:
+                index_fields = list(plan.get("key_pattern") or {})
+
+        metas: list[dict[str, Any]] = []
+        # The RecordId lookups touch WT cursors, so they take the storage lock
+        # like every other public path -- ``find_matching`` has already released
+        # it by the time it projects.
+        record_ids: dict[int, int | None] = {}
+        if "recordId" in wanted:
+            with self._lock:
+                for i, doc in enumerate(docs):
+                    record_ids[i] = self._doc_recordid(db, coll, encode_value(doc.get("_id")))
+        for i, doc in enumerate(docs):
+            meta: dict[str, Any] = {}
+            recordid = record_ids.get(i)
+            if recordid is not None:
+                meta["recordId"] = recordid
+            if sort_fields:
+                meta["sortKey"] = [
+                    _array_sort_value(get_path(doc, f), rev) for f, rev in sort_fields
+                ]
+            if index_fields:
+                meta["indexKey"] = {f: get_path(doc, f) for f in index_fields}
+            metas.append(meta)
+        return metas
 
     def _apply_minmax_bounds(
         self,
@@ -5086,8 +5306,14 @@ class Storage:
         index_options = self._index_options_map(db, coll)
         target = list(sort_fields)
         inverted = [(f, -d) for f, d in target]
-        for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+        for name, key_spec, sparse, _unique in self._all_indexes(db, coll):
             if name in multikey:
+                continue
+            # A sort walks the WHOLE index, so a sparse one drops every
+            # document it omits straight out of the result set. This picker is
+            # only reached with an EMPTY filter (both callers gate on it), so
+            # nothing can guarantee the indexed fields are present.
+            if sparse:
                 continue
             try:
                 idx_pairs = [(f, int(d)) for f, d in key_spec.items()]
@@ -5170,10 +5396,13 @@ class Storage:
 
         No execution; mirrors the same routing decisions. Returns
         ``{"kind": "COLLSCAN"}`` or ``{"kind": "IXSCAN", "index_name",
-        "key_pattern", "direction", "multikey"}``. ``direction`` is
-        ``"forward"`` unless a sort spec inverts it relative to the
-        chosen index; ``multikey`` is the index's sticky multikey flag,
-        surfaced as ``isMultiKey`` in the command's ``winningPlan``.
+        "key_pattern", "direction", "multikey", "sorted_by_index"}``.
+        ``direction`` is ``"forward"`` unless a sort spec inverts it
+        relative to the chosen index; ``multikey`` is the index's sticky
+        multikey flag, surfaced as ``isMultiKey`` in the command's
+        ``winningPlan``; ``sorted_by_index`` says whether the walk already
+        satisfies the sort, which is what decides whether ``explain``
+        reports a blocking ``SORT`` stage.
         """
         plan = self._explain_plan_uncached(
             db, coll, filter, sort=sort, hint=hint, collation=collation
@@ -5233,6 +5462,7 @@ class Storage:
                         "index_name": _ID_INDEX_NAME,
                         "key_pattern": {"_id": 1},
                         "direction": direction,
+                        "sorted_by_index": sort_field == "_id",
                     }
                 key_spec = self._key_spec_for(db, coll, resolved)
                 if key_spec is None:
@@ -5269,6 +5499,10 @@ class Storage:
                                 "index_name": name,
                                 "key_pattern": key_spec,
                                 "direction": "backward" if reverse else "forward",
+                                # The whole point of this branch: the compound
+                                # key spec matches (or fully inverts) the sort,
+                                # so the walk IS the sort.
+                                "sorted_by_index": True,
                             }
             return {"kind": "COLLSCAN"}
 
@@ -5388,11 +5622,18 @@ class Storage:
             idx_dir = int(key_spec[sort_field])
             if sort_dir != 0 and sort_dir != idx_dir:
                 direction = "backward"
+        # ``sorted_by_index`` mirrors ``_candidates_from_hint``'s
+        # ``in_sort_order``: the walk comes out in sort order only when the
+        # index's LEADING field is the one being sorted on. ``explain`` reads
+        # it to decide whether to report a blocking ``SORT`` stage, which is
+        # the question a client runs explain to answer.
+        leading = next(iter(key_spec), None)
         return {
             "kind": "IXSCAN",
             "index_name": name,
             "key_pattern": dict(key_spec),
             "direction": direction,
+            "sorted_by_index": sort_field is not None and sort_field == leading,
         }
 
     def count_matching(
@@ -5414,14 +5655,22 @@ class Storage:
 
         collation_obj = _parse_collation(collation)
         self._refresh_read_snapshot()
+        # ``maxTimeMS``: ``count`` has its own scan (it never materialises the
+        # documents), so it needs its own poll -- the one in ``find_matching``
+        # does not run for it.
         if not filter:
             with self._lock:
-                return sum(1 for _ in self._scan_docs(db, coll))
-        return sum(
-            1
-            for doc in self._all_docs(db, coll)
-            if matches(doc, filter, vars=let, collation=collation_obj)
-        )
+                total = 0
+                for _ in self._scan_docs(db, coll):
+                    _deadline.check()
+                    total += 1
+                return total
+        total = 0
+        for doc in self._all_docs(db, coll):
+            _deadline.check()
+            if matches(doc, filter, vars=let, collation=collation_obj):
+                total += 1
+        return total
 
     def collection_data_size(self, db: str, coll: str) -> int:
         """Sum of bson-encoded doc bytes for ``coll``.
@@ -5560,11 +5809,11 @@ class Storage:
                 candidates = self._scan_docs(db, coll)
             else:
                 candidates = self._candidates_iter(db, coll, filter)
-            rids = [
-                recordid
-                for recordid, _id_k, blob in candidates
-                if matches(bson.decode(blob), filter, vars=let, collation=collation_obj)
-            ]
+            rids = []
+            for recordid, _id_k, blob in candidates:
+                _deadline.check()
+                if matches(bson.decode(blob), filter, vars=let, collation=collation_obj):
+                    rids.append(recordid)
             idx = 0
             while idx < len(rids):
                 consumed, m, w, posts = self._update_chunk(
@@ -6093,11 +6342,11 @@ class Storage:
                 candidates = self._scan_docs(db, coll)
             else:
                 candidates = self._candidates_iter(db, coll, filter)
-            rids = [
-                recordid
-                for recordid, _id_k, blob in candidates
-                if matches(bson.decode(blob), filter, vars=let, collation=collation_obj)
-            ]
+            rids = []
+            for recordid, _id_k, blob in candidates:
+                _deadline.check()
+                if matches(bson.decode(blob), filter, vars=let, collation=collation_obj):
+                    rids.append(recordid)
             idx = 0
             while idx < len(rids):
                 consumed, d = self._delete_chunk(
@@ -6812,6 +7061,7 @@ class Storage:
                 options["multikey"] = True
                 entries: list[tuple[bytes, int]] = []
                 for recordid, _id_k, blob in self._scan_docs(db, coll):
+                    _deadline.check()
                     d = bson.decode(blob)
                     if partial_filter is not None and not matches(d, partial_filter):
                         continue
@@ -6849,6 +7099,9 @@ class Storage:
                 entries = []
                 coll_opt = _parse_index_collation(options.get("collation"))
                 for recordid, _id_k, blob in self._scan_docs(db, coll):
+                    # ``maxTimeMS`` on ``createIndexes``: mongod aborts the
+                    # build and answers 50 wrapped in "Index build failed".
+                    _deadline.check()
                     d = bson.decode(blob)
                     if partial_filter is not None and not matches(d, partial_filter):
                         continue
@@ -8034,13 +8287,23 @@ class Storage:
                 # Same dedup contract as ``_docs_by_recordids``: multikey
                 # indexes can yield duplicate RecordIds for one doc.
                 for recordid in dict.fromkeys(recordids):
+                    # ``maxTimeMS``: candidate SELECTION only. Every call site
+                    # materialises this list before it writes anything, so an
+                    # expired budget aborts the statement with nothing applied
+                    # -- polling inside the write loop instead could abandon a
+                    # document between its row and its index entries.
+                    _deadline.check()
                     c.reset()
                     c.set_key(db, coll, recordid)
                     if c.search() == 0:
                         id_k, blob = _unframe_doc_value(bytes(c.get_value()))
                         out.append((recordid, id_k, blob))
                 return out
-        return list(self._scan_docs(db, coll))
+        scanned: list[tuple[int, bytes, bytes]] = []
+        for row in self._scan_docs(db, coll):
+            _deadline.check()
+            scanned.append(row)
+        return scanned
 
     def _find_leading_field_index(
         self,
@@ -8075,9 +8338,11 @@ class Storage:
         index_options = self._index_options_map(db, coll)
         query = query or {}
         compound_fallback: tuple[str, int, bool] | None = None
-        for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+        for name, key_spec, sparse, _unique in self._all_indexes(db, coll):
             pf = partials.get(name)
             if pf is not None and not self._query_implies_partial(query, pf):
+                continue
+            if sparse and not _sparse_index_usable(key_spec, query):
                 continue
             idx_fields = list(key_spec)
             if not idx_fields or idx_fields[0] != field:
@@ -8237,7 +8502,9 @@ class Storage:
         partials = self._partial_filters(db, coll)
         index_options = self._index_options_map(db, coll)
         best: tuple[str, dict[str, Any]] | None = None
-        for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+        for name, key_spec, sparse, _unique in self._all_indexes(db, coll):
+            if sparse and not _sparse_index_usable(key_spec, filter):
+                continue
             pf = partials.get(name)
             if pf is not None:
                 if not self._query_implies_partial(filter, pf):
@@ -8287,6 +8554,16 @@ class Storage:
         # Build kb from the filter fields that are in the index (partial-filter
         # clauses live outside the key and are guaranteed by index population).
         prefix_fields = [f for f in idx_fields if f in filter]
+        if not prefix_fields:
+            # A PARTIAL index whose ``partialFilterExpression`` already covers
+            # every field the query names -- e.g. an index on ``a`` partial on
+            # ``{b: {$gt: 0}}``, queried as ``{b: 5}``. There is no key prefix
+            # to pin, and every entry in the index satisfies the implied
+            # clauses, so the whole index is the candidate set (``matches()``
+            # still applies the exact filter). This used to build an empty
+            # ``parts`` list and raise ``IndexError`` out of the command
+            # handler, which reached the client as an internal error.
+            return self._all_id_keys_for_index(db, coll, name)
         parts = [
             encode_value_directed(filter[f], int(key_spec[f]), collation=collation)
             for f in prefix_fields
@@ -8346,7 +8623,9 @@ class Storage:
         partials = self._partial_filters(db, coll)
         index_options = self._index_options_map(db, coll)
         best: tuple[str, dict[str, Any]] | None = None
-        for name, key_spec, _sparse, _unique in self._all_indexes(db, coll):
+        for name, key_spec, sparse, _unique in self._all_indexes(db, coll):
+            if sparse and not _sparse_index_usable(key_spec, filter):
+                continue
             pf = partials.get(name)
             if pf is not None and not self._query_implies_partial(filter, pf):
                 continue

@@ -1254,6 +1254,8 @@ def test_explain_plan_single_field_eq_uses_index(storage: Storage) -> None:
         "index_name": "x_1",
         "key_pattern": {"x": 1},
         "direction": "forward",
+        # No sort spec, so nothing is being satisfied by the walk order.
+        "sorted_by_index": False,
     }
 
 
@@ -1288,6 +1290,7 @@ def test_exists_true_uses_sparse_index(storage: Storage) -> None:
         "index_name": "f_1",
         "key_pattern": {"f": 1},
         "direction": "forward",
+        "sorted_by_index": False,
     }
     got = sorted(d["_id"] for d in storage.find_matching("db", "c", {"f": {"$exists": True}}))
     assert got == [1, 2, 4, 5]
@@ -1322,6 +1325,7 @@ def test_explain_plan_compound_eq_uses_compound_index(storage: Storage) -> None:
         "index_name": "ab_1",
         "key_pattern": {"a": 1, "b": 1},
         "direction": "forward",
+        "sorted_by_index": False,
     }
 
 
@@ -1355,6 +1359,7 @@ def test_explain_plan_hint_by_name(storage: Storage) -> None:
         "index_name": "x_1",
         "key_pattern": {"x": 1},
         "direction": "forward",
+        "sorted_by_index": False,
     }
 
 
@@ -1378,6 +1383,7 @@ def test_explain_plan_hint_id_index(storage: Storage) -> None:
         "index_name": "_id_",
         "key_pattern": {"_id": 1},
         "direction": "forward",
+        "sorted_by_index": False,
     }
 
 
@@ -1390,6 +1396,9 @@ def test_explain_plan_sort_no_filter_uses_index(storage: Storage) -> None:
         "index_name": "x_1",
         "key_pattern": {"x": 1},
         "direction": "forward",
+        # The walk IS the sort -- this is what stops ``explain`` reporting a
+        # blocking SORT stage above the scan.
+        "sorted_by_index": True,
     }
 
 

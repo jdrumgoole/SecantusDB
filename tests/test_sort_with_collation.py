@@ -43,20 +43,40 @@ def client(server):
 CI = {"locale": "en", "strength": 2}
 
 
+#: The stages mongod wraps AROUND the access method to describe the rest of the
+#: query. They sit above the scan, so a test asking "was the index used?" has to
+#: descend past them.
+_QUERY_SHAPE_STAGES = (
+    "SORT",
+    "SKIP",
+    "LIMIT",
+    "PROJECTION_SIMPLE",
+    "PROJECTION_DEFAULT",
+)
+
+
 def _winning_plan(explain_doc: dict) -> dict:
     return explain_doc.get("queryPlanner", {}).get("winningPlan", {})
 
 
+def _scan_root(explain_doc: dict) -> dict:
+    """The FETCH / COLLSCAN node that names the access method."""
+    node = _winning_plan(explain_doc)
+    while node.get("stage") in _QUERY_SHAPE_STAGES:
+        node = node.get("inputStage", {})
+    return node
+
+
 def _input_stage(explain_doc: dict) -> str:
-    return _winning_plan(explain_doc).get("inputStage", {}).get("stage", "")
+    return _scan_root(explain_doc).get("inputStage", {}).get("stage", "")
 
 
 def _index_name(explain_doc: dict) -> str:
-    return _winning_plan(explain_doc).get("inputStage", {}).get("indexName", "")
+    return _scan_root(explain_doc).get("inputStage", {}).get("indexName", "")
 
 
 def _direction(explain_doc: dict) -> str:
-    return _winning_plan(explain_doc).get("inputStage", {}).get("direction", "")
+    return _scan_root(explain_doc).get("inputStage", {}).get("direction", "")
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +149,7 @@ def test_single_field_sort_no_collation_query_against_collation_index_collscan(
     coll.create_index("name", collation=CI)
 
     plan = coll.find().sort("name", 1).explain()
-    assert _winning_plan(plan).get("stage") == "COLLSCAN"
+    assert _scan_root(plan).get("stage") == "COLLSCAN"
 
     docs = list(coll.find().sort("name", 1))
     # Codepoint order: "Alice" < "BOB" < "carol" (uppercase before lowercase).
@@ -144,7 +164,7 @@ def test_single_field_sort_collation_mismatch_collscan(client) -> None:
     coll.create_index("name", collation=CI)
 
     plan = coll.find().sort("name", 1).collation({"locale": "en", "strength": 3}).explain()
-    assert _winning_plan(plan).get("stage") == "COLLSCAN"
+    assert _scan_root(plan).get("stage") == "COLLSCAN"
 
 
 # ---------------------------------------------------------------------------
@@ -236,4 +256,4 @@ def test_multi_field_sort_compound_collation_mismatch(client) -> None:
     coll.create_index([("a", 1), ("b", 1)], collation=CI)
 
     plan = coll.find().sort([("a", 1), ("b", 1)]).explain()  # no collation
-    assert _winning_plan(plan).get("stage") == "COLLSCAN"
+    assert _scan_root(plan).get("stage") == "COLLSCAN"

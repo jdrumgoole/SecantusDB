@@ -6,6 +6,7 @@ import os
 import random as _random
 import sys
 import time as _time
+import uuid as _uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
@@ -13,6 +14,8 @@ from typing import Any
 import bson
 
 from secantus import changestreams
+from secantus import deadline as _deadline
+from secantus import explain as _explain_mod
 from secantus.aggregate import (
     SEARCH_INDEX_ATLAS_MSG,
     AggregateError,
@@ -2090,42 +2093,92 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             docs_examined = n_returned
         else:
             docs_examined = ctx.storage.count_matching(ctx.db_name, coll, {})
+    parsed_query = _explain_mod.canonical_match(filter_)
     if plan["kind"] == "IXSCAN":
+        index_spec = {}
+        if coll:
+            index_spec = next(
+                (
+                    ix
+                    for ix in ctx.storage.list_indexes(ctx.db_name, coll)
+                    if ix.get("name") == plan["index_name"]
+                ),
+                {},
+            )
+        key_pattern = plan["key_pattern"]
+        # mongod's IXSCAN key order, verbatim -- drivers and Compass read the
+        # node positionally in places, and a reordered document is a needless
+        # difference. ``multiKeyPaths`` names, per indexed field, the array
+        # paths that made it multikey; we do not track WHICH path did, so a
+        # non-multikey index reports the empty list mongod reports and a
+        # multikey one reports the field itself.
         input_stage: dict[str, Any] = {
             "stage": "IXSCAN",
+            "keyPattern": key_pattern,
             "indexName": plan["index_name"],
-            "keyPattern": plan["key_pattern"],
-            "direction": plan["direction"],
             # mongod always reports whether the scanned index is multikey;
             # planners (Compass, aggregation optimisers) read it to decide
             # what the index can be trusted for.
             "isMultiKey": bool(plan.get("multikey")),
+            "multiKeyPaths": {
+                field: ([field] if plan.get("multikey") else []) for field in key_pattern
+            },
+            "isUnique": bool(index_spec.get("unique")),
+            "isSparse": bool(index_spec.get("sparse")),
+            # mongod flags an IXSCAN over a partial index with ``isPartial``,
+            # and reports the key as ``false`` otherwise rather than omitting
+            # it -- a client testing for the key finds it either way.
+            "isPartial": "partialFilterExpression" in index_spec,
+            "indexVersion": int(index_spec.get("v", 2)),
+            "direction": plan["direction"],
         }
-        # mongod flags an IXSCAN over a partial index with ``isPartial``.
-        if coll:
-            partial = any(
-                ix.get("name") == plan["index_name"] and "partialFilterExpression" in ix
-                for ix in ctx.storage.list_indexes(ctx.db_name, coll)
-            )
-            if partial:
-                input_stage["isPartial"] = True
-        winning_plan = {
-            "stage": "FETCH",
-            "filter": filter_,
-            "inputStage": input_stage,
-        }
+        # The FETCH stage carries only the RESIDUAL filter -- the predicate the
+        # index bounds did not already satisfy. mongod omits the key entirely
+        # when the bounds cover the whole filter, which is how a reader tells a
+        # fully-index-served query from one that re-checks documents.
+        residual = {k: v for k, v in filter_.items() if k not in key_pattern}
+        winning_plan = {"stage": "FETCH"}
+        if residual:
+            winning_plan["filter"] = _explain_mod.canonical_match(residual)
+        winning_plan["inputStage"] = input_stage
         execution_stage = {
             "stage": "FETCH",
             "nReturned": n_returned,
             "inputStage": {"stage": "IXSCAN", "nReturned": n_returned},
         }
     else:
-        winning_plan = {"stage": "COLLSCAN", "filter": filter_}
+        winning_plan = {"stage": "COLLSCAN"}
+        if parsed_query:
+            winning_plan["filter"] = parsed_query
+        # A ``$natural: -1`` hint is the only thing that walks the collection
+        # backwards; every other collection scan is forward.
+        winning_plan["direction"] = (
+            "backward" if isinstance(hint, Mapping) and hint.get("$natural") == -1 else "forward"
+        )
         execution_stage = {"stage": "COLLSCAN", "nReturned": n_returned}
+    # mongod wraps the scan in the stages that describe the rest of the query.
+    # Only ``find`` is done here: ``count`` and ``distinct`` use a different
+    # vocabulary (``COUNT`` / ``COUNT_SCAN`` / ``DISTINCT_SCAN``) that has not
+    # been measured, and inventing stages for them would be worse than the flat
+    # node they get today.
+    if _inner_name == "find":
+        winning_plan = _explain_mod.build_stage_tree(
+            winning_plan,
+            sort=sort if isinstance(sort, Mapping) else None,
+            sort_served_by_index=bool(plan.get("sorted_by_index")),
+            projection=(
+                inner.get("projection") if isinstance(inner.get("projection"), Mapping) else None
+            ),
+            skip=inner.get("skip"),
+            limit=inner.get("limit"),
+        )
+    # ``isCached`` sits on the OUTERMOST plan node only (the plan cache is a
+    # whole-plan property). We never cache plans, so it is always false.
+    winning_plan = {"isCached": False, **winning_plan}
     query_planner = {
         "namespace": namespace,
         "indexFilterSet": False,
-        "parsedQuery": filter_,
+        "parsedQuery": parsed_query,
         "winningPlan": winning_plan,
         "rejectedPlans": [],
     }
@@ -2189,6 +2242,7 @@ def _explain(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             reply_agg["executionStats"] = execution_stats
         return reply_agg
     reply: dict[str, Any] = {
+        "explainVersion": "1",
         "queryPlanner": query_planner,
         "command": inner if isinstance(inner, dict) else {},
         "serverInfo": server_info,
@@ -2757,6 +2811,9 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         _err = _require_hint_type(_stmt)
         if _err is not None:
             return _err
+        _err = _unknown_statement_field(_stmt, _UPDATE_STATEMENT_FIELDS, "update.updates")
+        if _err is not None:
+            return _err
         _err = _require_object_bson_field(_stmt.get("collation"), "update.updates.collation")
         if _err is not None:
             return _err
@@ -2813,17 +2870,36 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # per-statement writeError with mongod's 17276 (probed: an earlier
         # statement in the batch still applies, `n: 1` with the error at
         # `index: 1`). We raised it as a COMMAND error, failing the whole batch.
-        _uv_bound = frozenset(_let) if isinstance(_let := doc.get("let"), Mapping) else frozenset()
+        # `let` is command-level; `c` is this STATEMENT's own constants, and
+        # mongod binds BOTH (probed 8.2.11, 2026-09-01 -- `c` was not bound at
+        # all, so a pipeline update referring to one was refused outright).
+        if spec.get("c") is not None and not isinstance(spec.get("u"), list):
+            # `c` is only meaningful for a pipeline update; mongod refuses it
+            # outright on an operator or replacement one (probed 8.2.11).
+            write_errors.append(
+                {
+                    "index": index,
+                    "code": 51198,
+                    "errmsg": "Constant values may only be specified for pipeline updates",
+                }
+            )
+            if ordered:
+                break
+            continue
+        _stmt_vars = _merged_statement_vars(doc.get("let"), spec.get("c"))
+        _uv_bound = frozenset(_stmt_vars or {})
         _uv = expression_problem_in_filter(spec.get("q"), _uv_bound)
         _uv = (_uv[0], _uv[1], "") if _uv else None
         if _uv is None and isinstance(spec.get("u"), list):
-            _uv = expression_problem_in_pipeline(spec.get("u"), _uv_bound)
+            # The real VALUES too, so a constant sub-expression folds the way
+            # mongod's optimizer folds it -- same as `aggregate`.
+            _uv = expression_problem_in_pipeline(spec.get("u"), _uv_bound, _stmt_vars)
         if _uv is not None:
             write_errors.append(
                 {
                     "index": index,
                     "code": _uv[0],
-                    "errmsg": wrap_expression_problem(_uv[1], _uv[2]),
+                    "errmsg": wrap_expression_problem(_uv[1], _uv[2], in_update="update"),
                 }
             )
             if ordered:
@@ -2939,7 +3015,7 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 multi=bool(spec.get("multi", False)),
                 upsert=bool(spec.get("upsert", False)),
                 array_filters=spec.get("arrayFilters"),
-                let=let,
+                let=_resolve_let_vars(_stmt_vars) if _stmt_vars else let,
                 collation=spec.get("collation"),
                 validator=validator_spec if validator_active else None,
                 validator_moderate=_validation_is_moderate(coll_opts_for_validation),
@@ -3383,6 +3459,9 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     for _stmt in doc.get("deletes") or []:
         if not isinstance(_stmt, Mapping):
             continue
+        _err = _unknown_statement_field(_stmt, _DELETE_STATEMENT_FIELDS, "delete.deletes")
+        if _err is not None:
+            return _err
         _err = _require_hint_type(_stmt)
         if _err is not None:
             return _err
@@ -4531,6 +4610,134 @@ def _require_max_time_ms(doc: Mapping[str, Any], command: str) -> dict[str, Any]
     return None
 
 
+#: ``getMore`` reads ``maxTimeMS`` as the awaitData WAIT budget, not as a
+#: deadline on the work -- a tailable cursor is supposed to sit there for the
+#: whole of it. Arming a deadline would make every awaitData poll answer
+#: ``MaxTimeMSExpired`` the moment it waited out its budget, which is the normal
+#: case rather than an error. ``_get_more`` handles the value itself.
+_MAX_TIME_MS_NOT_A_DEADLINE = frozenset({"getMore"})
+
+
+def _max_time_ms_budget(doc: Mapping[str, Any], command: str) -> int:
+    """The armed ``maxTimeMS`` budget in whole milliseconds, or 0 for none.
+
+    Reads the already-VALIDATED field (``_require_max_time_ms`` ran first in
+    ``dispatch``), so anything unparseable here means the validator let it
+    through and the right answer is "no limit" rather than an exception from
+    the timing layer.
+    """
+    if command in _MAX_TIME_MS_NOT_A_DEADLINE:
+        return 0
+    value = doc.get("maxTimeMS")
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        if isinstance(value, bson.Decimal128):
+            return max(0, int(value.to_decimal()))
+        return max(0, int(value))
+    except (TypeError, ValueError, ArithmeticError):
+        return 0
+
+
+def _max_time_expired_reply(
+    exc: _deadline.MaxTimeMSExpired,
+    command: str,
+    ctx: CommandContext,
+    doc: Mapping[str, Any],
+) -> dict[str, Any]:
+    """mongod's reply for an operation that outlived its ``maxTimeMS``.
+
+    Bare ``operation exceeded time limit`` on every command probed against
+    8.2.11 (``find`` / ``count`` / ``distinct`` / ``aggregate`` / ``update`` /
+    ``delete``) -- except ``createIndexes``, which wraps it in the index-build
+    failure envelope naming the collection and its UUID.
+    """
+    message = str(exc)
+    if command == "createIndexes":
+        coll = doc.get(command)
+        ns = _ns(ctx.db_name, coll) if isinstance(coll, str) else ctx.db_name
+        uuid = ""
+        if isinstance(coll, str):
+            try:
+                uuid = str(ctx.storage.collection_uuid(ctx.db_name, coll) or "")
+            except Exception:  # pragma: no cover - a missing collection cannot time out
+                uuid = ""
+        suffix = f" ( {uuid} )" if uuid else ""
+        # mongod leads with the BUILD uuid (a fresh one per attempt, distinct
+        # from the collection's) and then names the collection and its uuid:
+        #   Index build failed: <buildUUID>: Collection <ns> ( <collUUID> )
+        #     :: caused by :: operation exceeded time limit
+        build_uuid = _uuid.uuid4()
+        message = (
+            f"Index build failed: {build_uuid}: Collection {ns}{suffix} :: caused by :: {message}"
+        )
+    return {
+        "ok": 0.0,
+        "errmsg": message,
+        "code": exc.code,
+        "codeName": exc.code_name,
+    }
+
+
+#: Everything mongod accepts inside one ``delete`` / ``update`` statement.
+#: Derived by asking mongod 8.2.11 field by field (2026-09-01), not from docs.
+#: Unlike the COMMAND envelope, a nested statement gets NO ``$``-prefix
+#: carve-out -- mongod rejects ``$db`` here as readily as ``zz``.
+_DELETE_STATEMENT_FIELDS = frozenset({"q", "limit", "collation", "hint", "sampleId"})
+_UPDATE_STATEMENT_FIELDS = frozenset(
+    {
+        "q",
+        "u",
+        "c",
+        "multi",
+        "upsert",
+        "upsertSupplied",
+        "arrayFilters",
+        "collation",
+        "hint",
+        "sort",
+        "sampleId",
+    }
+)
+
+
+def _unknown_statement_field(
+    statement: Any, known: frozenset[str], struct: str
+) -> dict[str, Any] | None:
+    """mongod's ``40415`` for an unknown field in a write statement.
+
+    Command-level, not a per-statement ``writeError``: mongod parses every
+    statement before running any, so one bad field means nothing is written.
+    """
+    if not isinstance(statement, Mapping):
+        return None
+    for field in statement:
+        if field not in known:
+            return {
+                "ok": 0.0,
+                "errmsg": f"BSON field '{struct}.{field}' is an unknown field.",
+                "code": 40415,
+                "codeName": _code_name_for(40415),
+            }
+    return None
+
+
+def _merged_statement_vars(command_let: Any, statement_constants: Any) -> dict[str, Any] | None:
+    """The variables one write STATEMENT can see: command ``let`` plus its own
+    ``c``, with the statement's own winning a collision.
+
+    ``c`` is the per-statement constants map on ``update`` / ``delete``. It was
+    never bound, so a pipeline update naming one was refused with
+    ``Use of undefined variable`` -- mongod applies it (probed 8.2.11).
+    """
+    merged: dict[str, Any] = {}
+    if isinstance(command_let, Mapping):
+        merged.update(command_let)
+    if isinstance(statement_constants, Mapping):
+        merged.update(statement_constants)
+    return merged or None
+
+
 def _failed_to_parse(errmsg: str) -> dict[str, Any]:
     return {"ok": 0.0, "errmsg": errmsg, "code": 9, "codeName": "FailedToParse"}
 
@@ -4573,12 +4780,18 @@ def _find_and_modify_impl(doc: dict[str, Any], ctx: CommandContext) -> dict[str,
     _uv_bound = frozenset(_l) if isinstance(_l := doc.get("let"), Mapping) else frozenset()
     _uv = expression_problem_in_filter(doc.get("query"), _uv_bound)
     _uv = (_uv[0], _uv[1], "") if _uv else None
+    _uv_in_update = ""
     if _uv is None and isinstance(doc.get("update"), list):
-        _uv = expression_problem_in_pipeline(doc.get("update"), _uv_bound)
+        _uv = expression_problem_in_pipeline(
+            doc.get("update"), _uv_bound, _l if isinstance(_l, Mapping) else None
+        )
+        # A fold failure in a pipeline UPDATE takes the executor prefix, not
+        # `aggregate`'s optimize one (probed 8.2.11).
+        _uv_in_update = "findAndModify" if _uv is not None else ""
     if _uv is not None:
         return {
             "ok": 0.0,
-            "errmsg": wrap_expression_problem(_uv[1], _uv[2]),
+            "errmsg": wrap_expression_problem(_uv[1], _uv[2], in_update=_uv_in_update),
             "code": _uv[0],
             "codeName": _code_name_for(_uv[0]),
         }
@@ -5631,13 +5844,14 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "code": 40414,
             "codeName": "IDLFailedToParse",
         }
-    if not isinstance(indexes, (list, tuple)):
-        return {
-            "ok": 0.0,
-            "errmsg": "invalid parameter: expected an object (indexes)",
-            "code": 10065,
-            "codeName": "Location10065",
-        }
+    # There is deliberately no ``not isinstance(indexes, (list, tuple))`` arm
+    # here. ``_require_typed_bson_field`` above already answers 14 for any
+    # non-null non-list and the 40414 arm answers the null/missing case, so only
+    # a list reaches this point. The arm that used to sit here held a 6.0-era
+    # ``10065`` that no input could reach (confirmed 2026-08-30 against the
+    # differential cases for ``indexes`` as null / omitted / ``5`` / ``"x"``);
+    # dead code holding a stale answer comes back the moment the type check
+    # above is refactored.
     # ``commitQuorum`` is a top-level option on ``createIndexes`` (not
     # per-index). MongoDB 4.4+ accepts an integer, ``"majority"``, or
     # ``"votingMembers"``; unknown strings trigger a write-concern-mode
@@ -6727,6 +6941,23 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 )
             except BadHint as exc:
                 return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
+            except ExpressionError as exc:
+                # A leading ``$match`` is LIFTED into this fetch, so an ``$expr``
+                # that fails at runtime raises HERE rather than inside the
+                # pipeline -- outside the block below that adds mongod's
+                # executor prefix. It reached the client bare, and only for the
+                # first stage: the same ``$match`` anywhere else in the pipeline
+                # was wrapped correctly. Probed 8.2.11, 2026-09-01.
+                _code = getattr(exc, "code", None) or 14
+                return {
+                    "ok": 0.0,
+                    "errmsg": (
+                        f"Executor error during aggregate command on namespace: "
+                        f"{ctx.db_name}.{base_coll} :: caused by :: {exc}"
+                    ),
+                    "code": _code,
+                    "codeName": getattr(exc, "code_name", None) or _code_name_for(_code),
+                }
         ns = _ns(ctx.db_name, coll)
     else:
         docs = []
@@ -9541,10 +9772,18 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # clock on every platform, which is what measuring an interval wants.
     start_ns = _time.perf_counter_ns() if _timed else 0
     try:
-        if txn is not None:
-            result = _run_txn_statement(txn, handler, doc, ctx)
-        else:
-            result = handler(doc, ctx)
+        # ``maxTimeMS`` is armed HERE, around the whole handler, because that is
+        # the span mongod bounds: the operation, not any one loop inside it.
+        # ``_max_time_ms_budget`` already knows the value is a valid
+        # non-negative integer -- the validator ran above -- and returns 0 for
+        # the "no limit" encodings mongod uses (absent, or an explicit 0).
+        with _deadline.arm(_max_time_ms_budget(doc, name)):
+            if txn is not None:
+                result = _run_txn_statement(txn, handler, doc, ctx)
+            else:
+                result = handler(doc, ctx)
+    except _deadline.MaxTimeMSExpired as exc:
+        result = _max_time_expired_reply(exc, name, ctx, doc)
     except WriteConflictError:
         result = _write_conflict_reply(label=txn is not None)
     except TransactionTooLargeError as exc:
