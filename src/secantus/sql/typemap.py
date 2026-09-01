@@ -1063,6 +1063,37 @@ def _int_or_22p02(value: Any, tag: str) -> int:
         raise _coercion_error(tag, value) from e
 
 
+def _trim_fractional_zeros(text: str) -> str:
+    """Strip trailing zeros from a timestamp's fractional seconds, as PG does.
+
+    Python's ``isoformat`` pads to six digits (``00:00:00.123100``); Postgres
+    prints the shortest form (``00:00:00.1231``) and omits the fraction
+    entirely when it is zero -- probed on 14.13. ``isoformat`` already omits a
+    zero fraction, so only the trailing zeros need removing.
+
+    Only the FRACTION is touched: the offset, if any, is appended after it and
+    is handled by the caller, so this runs before the offset is trimmed.
+    """
+    head, dot, rest = text.partition(".")
+    if not dot:
+        return text
+    # The fraction runs to the first non-digit (an offset sign, or the end).
+    digits = ""
+    for ch in rest:
+        if not ch.isdigit():
+            break
+        digits += ch
+    tail = rest[len(digits) :]
+    trimmed = digits.rstrip("0")
+    return f"{head}.{trimmed}{tail}" if trimmed else f"{head}{tail}"
+
+
+def render_timestamp_text(value: _dt.datetime) -> str:
+    """Public spelling of `_render_timestamp_iso`, for callers outside this
+    module that must render a timestamp exactly as a ``::text`` cast does."""
+    return _render_timestamp_iso(value)
+
+
 def _render_timestamp_iso(value: _dt.datetime) -> str:
     """ISO text with Postgres' offset spelling.
 
@@ -1071,7 +1102,7 @@ def _render_timestamp_iso(value: _dt.datetime) -> str:
     the rendered text — pgjdbc's TimezoneTest asserts ``12:00:00+00`` — so the
     trailing ``:00`` is not cosmetic.
     """
-    text = value.isoformat(sep=" ")
+    text = _trim_fractional_zeros(value.isoformat(sep=" "))
     if value.tzinfo is None:
         return text
     head, sign, offset = text.rpartition("+") if "+" in text[10:] else text.rpartition("-")

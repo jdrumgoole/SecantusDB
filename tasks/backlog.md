@@ -6810,9 +6810,15 @@ shared storage engine or building large new protocol subsystems:
   documented in the pgconn findings section), `pgproto3` / `bgreader` /
   `ctxwatch` 100%. Remaining work is only the load-sensitivity
   re-measurement on a quiet machine.
-- [ ] **Sub-millisecond timestamps — the remaining routes: JOIN keys and a cast.**
-  (Headline was "PREDICATES are not"; predicates were fixed 2026-08-27. See
-  items 3 and 4 at the end of this entry for what is actually open.)
+- [x] **RESOLVED (2026-09-01) — sub-millisecond timestamps, all eight routes.**
+  Read / ORDER BY / predicates / accumulators / group key / DISTINCT closed
+  earlier; `array_agg(t ORDER BY t)`, JOIN keys+projection, and
+  `string_agg(t::text, …)` closed 2026-09-01 after a 16-shape sweep found them.
+  A 20-shape sweep now matches PostgreSQL 14.13 exactly.
+
+  **Read the history before adding a "closed" claim here.** This entry has
+  asserted completeness twice and been wrong twice; the only thing that ever
+  established the truth was running the shapes.
   BSON has no sub-ms date (a date is int64 milliseconds; `Timestamp` is
   seconds+ordinal, an internal replication type), so the remainder is stored
   beside the date in a hidden `__us_<field>` companion — see
@@ -6928,9 +6934,17 @@ shared storage engine or building large new protocol subsystems:
        `array_agg(x ORDER BY t)` shape the entry above records as fixed — that
        one aggregates a DIFFERENT column, so only the key mattered.
 
-  3. **OPEN — a JOIN on a timestamp column matches on the TRUNCATED date, so
-     it returns rows that do not match.** The worst of the three: it is a wrong
-     ANSWER, not a lost digit.
+  3. **FIXED 2026-09-01 — a JOIN on a timestamp column matched on the
+     TRUNCATED date, so it returned rows that do not match.** Two changes, not
+     one: the join KEY now uses the `let`/`pipeline` `$lookup` form with an
+     `$expr` comparing the date AND the companion (`localField`/`foreignField`
+     are field PATHS and cannot express it), and the join PROJECTION now emits
+     the composite — a join reads a projected document, so the companion was
+     gone before the executor could merge it, and the rows came back at whole
+     milliseconds even once the key was right. Trading the simple form's index
+     acceleration for a correct answer is the right way round. Pinned by
+     `TestJoinOnATimestamp`, including a join on a NON-timestamp key to cover
+     the projection half on its own. Original entry:
 
          SELECT a.t FROM sm a JOIN sm b ON a.t = b.t     -- 4 distinct times
            pg  4 rows      us  10 rows
@@ -6943,12 +6957,20 @@ shared storage engine or building large new protocol subsystems:
      a change to join planning rather than another composite call site. That is
      why it is not fixed alongside the other two.
 
-  4. **OPEN — `string_agg(t::text, …)` renders the truncated date.** PG gives
-     `2020-01-01 00:00:00.1231`; we give `.123000`. Unlike `array_agg`, the
-     aggregated node is a CAST over the column, so the composite would have to
-     be merged BEFORE the cast is lowered — `_sorted_agg_key` only recognises a
-     bare `exp.Column`. Same shape as any other `t::text` in a projection, so
-     the fix likely belongs at the cast, not the aggregate.
+  4. **FIXED 2026-09-01 — `string_agg(t::text, …)` rendered the truncated
+     date.** The guess recorded here ("the fix likely belongs at the cast") was
+     WRONG, and measuring said so: plain `t::text` was already
+     microsecond-exact, and only the ordered-aggregate path truncated, because
+     it evaluates the cast INSIDE the pipeline where the companion is not in
+     scope. The push now carries a text-marked composite
+     (`subms.composite_text_expr`) and the executor renders it after merging.
+
+     **A separate rendering divergence fell out of the same probe and is fixed
+     with it.** `t::text` padded the fractional seconds to six digits
+     (`.123100`) where PG prints the shortest form (`.1231`) and omits the
+     fraction entirely when it is zero. `typemap._trim_fractional_zeros` does
+     that now, and `concat(t, '')` / `||` were routed through the same renderer
+     so the two agree — they had disagreed with each other as well as with PG.
 
   3. **COPY and the Rust server** don't write the companion — they truncate, as
      before. Not wrong, just not precise.

@@ -76,6 +76,20 @@ def companion_path(field: str) -> str:
     return f"{head}.{_PREFIX}{last}" if head else f"{_PREFIX}{last}"
 
 
+#: Marker wrapping a composite whose merged value must be rendered as TEXT.
+#: `string_agg(t::text, …)` evaluates its cast INSIDE the pipeline, where the
+#: companion is not in scope, so it stringified the truncated date. The push
+#: carries the composite under this key instead and the executor renders it
+#: after merging.
+COMPOSITE_AS_TEXT = "__subms_text"
+
+
+def composite_text_expr(field: str) -> dict[str, Any]:
+    """`composite_expr` marked so the executor renders it as text on the way
+    out — see `COMPOSITE_AS_TEXT`."""
+    return {COMPOSITE_AS_TEXT: composite_expr(field)}
+
+
 def composite_expr(field: str) -> dict[str, Any]:
     """A Mongo aggregation expression producing the sortable composite for
     ``field``, or NULL when the column is NULL so accumulators keep skipping it.

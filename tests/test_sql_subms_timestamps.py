@@ -695,3 +695,76 @@ class TestOrderedAggregateValues:
                 ],
             )
         ]
+
+
+class TestJoinOnATimestamp:
+    """A join on a timestamp column matched on the TRUNCATED date.
+
+    Three times inside one millisecond all compared equal, so a self-join
+    cross-joined them 3x3: four distinct times returned TEN rows where
+    PostgreSQL 14.13 returns four. A wrong ANSWER, not a lost digit.
+
+    A join lowers to `$lookup`, whose `localField` / `foreignField` are field
+    PATHS and cannot express the companion, so this needed the `let` /
+    `pipeline` form. The projected VALUE needed the composite too — a join
+    reads a projected document, so the companion is gone by the time the
+    executor could merge it.
+    """
+
+    def _seed(self, storage, session):
+        run(storage, session, "CREATE TABLE jt (id int, t timestamp)")
+        for i, us in enumerate((123100, 123500, 123900)):
+            run(storage, session, f"INSERT INTO jt VALUES ({i}, '2020-01-01 00:00:00.{us:06d}')")
+        run(storage, session, "INSERT INTO jt VALUES (3, '2020-01-01 00:00:01')")
+
+    def test_self_join_matches_only_equal_times(self, storage, session):
+        self._seed(storage, session)
+        got = run(storage, session, "SELECT a.t FROM jt a JOIN jt b ON a.t = b.t ORDER BY a.t").rows
+        assert got == [
+            (dt.datetime(2020, 1, 1, 0, 0, 0, 123100),),
+            (dt.datetime(2020, 1, 1, 0, 0, 0, 123500),),
+            (dt.datetime(2020, 1, 1, 0, 0, 0, 123900),),
+            (dt.datetime(2020, 1, 1, 0, 0, 1),),
+        ]
+
+    def test_join_output_keeps_microseconds(self, storage, session):
+        """Even a join on a NON-timestamp key must project the timestamp with
+        its remainder — the projection, not the join key, is what dropped it."""
+        self._seed(storage, session)
+        got = run(
+            storage, session, "SELECT a.t FROM jt a JOIN jt b ON a.id = b.id ORDER BY a.t"
+        ).rows
+        assert got[0] == (dt.datetime(2020, 1, 1, 0, 0, 0, 123100),)
+        assert got[2] == (dt.datetime(2020, 1, 1, 0, 0, 0, 123900),)
+
+
+class TestTimestampTextRendering:
+    """`t::text` pads the fractional seconds; PostgreSQL prints the shortest
+    form (`.1231`, not `.123100`) and omits the fraction when it is zero."""
+
+    def _seed(self, storage, session):
+        run(storage, session, "CREATE TABLE tx (id int, t timestamp)")
+        run(storage, session, "INSERT INTO tx VALUES (0, '2020-01-01 00:00:00.123100')")
+        run(storage, session, "INSERT INTO tx VALUES (1, '2020-01-01 00:00:01')")
+
+    def test_cast_to_text(self, storage, session):
+        self._seed(storage, session)
+        assert run(storage, session, "SELECT t::text FROM tx ORDER BY id").rows == [
+            ("2020-01-01 00:00:00.1231",),
+            ("2020-01-01 00:00:01",),
+        ]
+
+    def test_concat_agrees_with_the_cast(self, storage, session):
+        self._seed(storage, session)
+        assert run(storage, session, "SELECT concat(t, '') FROM tx ORDER BY id").rows == [
+            ("2020-01-01 00:00:00.1231",),
+            ("2020-01-01 00:00:01",),
+        ]
+
+    def test_string_agg_of_a_cast_keeps_microseconds(self, storage, session):
+        """`string_agg(t::text, …)` evaluated the cast inside the pipeline,
+        where the companion is not in scope, so it stringified the truncated
+        date — while `t::text` on its own was already exact."""
+        self._seed(storage, session)
+        got = run(storage, session, "SELECT string_agg(t::text, ',' ORDER BY t) FROM tx").rows
+        assert got == [("2020-01-01 00:00:00.1231,2020-01-01 00:00:01",)]
