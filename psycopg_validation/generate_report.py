@@ -76,7 +76,9 @@ def main() -> None:
     args = parser.parse_args()
 
     data = json.loads(Path(args.raw_json).read_text())
-    per_cat: dict[str, dict[str, int]] = defaultdict(lambda: {"passed": 0, "failed": 0, "skipped": 0})
+    per_cat: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"passed": 0, "failed": 0, "skipped": 0}
+    )
     failures: list[str] = []
     for t in data.get("tests", []):
         bucket = _OUTCOME_BUCKETS.get(t.get("outcome", ""), "failed")

@@ -515,7 +515,9 @@ def test_copy_to_stdout_is_refused_honestly(home: Path) -> None:
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
         cur.execute("CREATE TABLE cp (id int PRIMARY KEY)")
-        with pytest.raises(psycopg.Error) as exc:
-            with cur.copy("COPY cp TO STDOUT") as cp:
-                list(cp)
+        with (
+            pytest.raises(psycopg.Error) as exc,
+            cur.copy("COPY cp TO STDOUT") as cp,
+        ):
+            list(cp)
         assert exc.value.diag.sqlstate == "0A000"
