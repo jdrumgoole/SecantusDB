@@ -10,6 +10,7 @@
 //! including the shared on-disk catalog format. Breadth is P5's problem.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -27,8 +28,8 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use secantus_pgcatalog::{TableDef, CATALOG_COLLECTION};
 use secantus_pgplan::{
-    plan_with_params, AggFunc, AggItem, Error as PlanError, Nulls, OrderKey, OutputCol, Statement,
-    TransactionControl,
+    plan_with_params, AggFunc, AggItem, ConstCol, Error as PlanError, Nulls, OrderKey, OutputCol,
+    Statement, TransactionControl,
 };
 use secantus_storage::{Storage, UserTransactionHandle};
 
@@ -43,6 +44,8 @@ pub struct PgHandler {
     /// flag: a `ROLLBACK` that did not actually roll back would be a silent
     /// wrong answer, which is worse than refusing `BEGIN` outright.
     txn: Mutex<Option<UserTransactionHandle>>,
+    /// Session settings (GUCs), per connection as PostgreSQL's are.
+    settings: Mutex<HashMap<String, String>>,
 }
 
 impl PgHandler {
@@ -51,6 +54,7 @@ impl PgHandler {
             storage,
             db: db.to_string(),
             txn: Mutex::new(None),
+            settings: Mutex::new(default_settings()),
         }
     }
 
@@ -138,6 +142,40 @@ impl PgHandler {
     }
 }
 
+/// PostgreSQL's canonical spelling for a setting name.
+///
+/// `SHOW datestyle` answers a column called `DateStyle` -- lookups are
+/// case-insensitive but the reported name is not, and clients match on it.
+fn canonical_setting(name: &str) -> String {
+    match name.to_ascii_lowercase().as_str() {
+        "datestyle" => "DateStyle".to_string(),
+        "timezone" => "TimeZone".to_string(),
+        "intervalstyle" => "IntervalStyle".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The settings a fresh connection starts with, matching what a client expects
+/// to read back before it has set anything.
+fn default_settings() -> HashMap<String, String> {
+    [
+        ("client_encoding", "UTF8"),
+        ("DateStyle", "ISO, MDY"),
+        ("TimeZone", "UTC"),
+        ("IntervalStyle", "postgres"),
+        ("standard_conforming_strings", "on"),
+        ("integer_datetimes", "on"),
+        ("transaction_read_only", "off"),
+        ("search_path", "\"$user\", public"),
+        ("application_name", ""),
+        ("server_encoding", "UTF8"),
+        ("server_version", "15.0"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
 /// The PostgreSQL type a column's declared type maps onto over the wire.
 fn wire_type(pg_type: &str) -> Type {
     match pg_type {
@@ -213,6 +251,41 @@ impl PgHandler {
                 .with_user_transaction(handle, || self.execute(stmt, max_rows))
                 .map_err(|e| Self::storage_err("transaction failed", e))?,
             None => self.execute(stmt, max_rows),
+        }
+    }
+
+    /// Resolve a FROM-less SELECT column that needs connection state.
+    fn resolve_const_col(&self, col: &ConstCol) -> PgWireResult<Bson> {
+        match col {
+            ConstCol::Value(v) => Ok(v.clone()),
+            ConstCol::CurrentSetting { name, missing_ok } => {
+                let key = canonical_setting(name);
+                let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+                match settings.get(&key) {
+                    Some(v) => Ok(Bson::String(v.clone())),
+                    // `current_setting(x)` errors on an unknown name;
+                    // `current_setting(x, true)` answers NULL (probed PG 14).
+                    None if *missing_ok => Ok(Bson::Null),
+                    None => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42704".into(),
+                        format!("unrecognized configuration parameter \"{name}\""),
+                    )))),
+                }
+            }
+            ConstCol::SetConfig { name, value, .. } => {
+                // `is_local` is accepted and ignored: this server has no
+                // statement-scoped settings, and the difference is only
+                // observable across a rollback.
+                let text = match value {
+                    Bson::String(s) => s.clone(),
+                    Bson::Null => String::new(),
+                    other => format!("{other}"),
+                };
+                let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+                settings.insert(canonical_setting(name), text.clone());
+                Ok(Bson::String(text))
+            }
         }
     }
 
@@ -397,6 +470,59 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("DROP TABLE"))])
             }
 
+            Statement::Show(name) => {
+                let key = canonical_setting(&name);
+                let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+                let value = settings.get(&key).cloned().ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42704".into(), // undefined_object
+                        format!("unrecognized configuration parameter \"{name}\""),
+                    )))
+                })?;
+                let schema = Arc::new(vec![FieldInfo::new(
+                    key,
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                )]);
+                let schema_ref = schema.clone();
+                let rows = stream::iter(std::iter::once(value)).map(move |v| {
+                    let mut enc = DataRowEncoder::new(schema_ref.clone());
+                    enc.encode_field(&Some(v.as_str()))?;
+                    enc.finish()
+                });
+                Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
+            }
+
+            Statement::Set { name, value } => {
+                let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+                settings.insert(canonical_setting(&name), value);
+                Ok(vec![Response::Execution(Tag::new("SET"))])
+            }
+
+            Statement::Reset(name) => {
+                let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+                if name.is_empty() {
+                    *settings = default_settings();
+                } else {
+                    let key = canonical_setting(&name);
+                    // RESET restores the DEFAULT, which is not the same as
+                    // removing the setting: a client reading it back afterwards
+                    // must see the default, not an error.
+                    match default_settings().get(&key) {
+                        Some(d) => {
+                            settings.insert(key, d.clone());
+                        }
+                        None => {
+                            settings.remove(&key);
+                        }
+                    }
+                }
+                Ok(vec![Response::Execution(Tag::new("RESET"))])
+            }
+
             Statement::SelectConstant(sc) => {
                 // One row, no storage touched.
                 let schema = Arc::new(
@@ -413,7 +539,11 @@ impl PgHandler {
                         })
                         .collect::<Vec<_>>(),
                 );
-                let values: Vec<Bson> = sc.columns.iter().map(|(_, v, _)| v.clone()).collect();
+                let values: Vec<Bson> = sc
+                    .columns
+                    .iter()
+                    .map(|(_, c, _)| self.resolve_const_col(c))
+                    .collect::<PgWireResult<Vec<_>>>()?;
                 let schema_ref = schema.clone();
                 let rows = stream::iter(std::iter::once(values)).map(move |vals| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
@@ -947,6 +1077,13 @@ impl PgHandler {
                     })
                     .collect()
             }
+            Statement::Show(name) => vec![FieldInfo::new(
+                canonical_setting(&name),
+                None,
+                None,
+                Type::TEXT,
+                FieldFormat::Text,
+            )],
             Statement::SelectConstant(sc) => sc
                 .columns
                 .iter()

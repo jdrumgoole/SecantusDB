@@ -15,7 +15,7 @@ use bson::{doc, Bson, Document};
 use pg_query::protobuf::node::Node as N;
 use pg_query::protobuf::{
     a_const, AExpr, AExprKind, BoolExprType, DropBehavior, NullTestType, ObjectType, SortByDir,
-    SortByNulls, TransactionStmtKind,
+    SortByNulls, TransactionStmtKind, VariableSetKind,
 };
 use secantus_pgcatalog::{Column, TableDef};
 
@@ -86,6 +86,15 @@ pub enum Statement {
     SelectConstant(SelectConstant),
     Transaction(TransactionControl),
     DropTable(DropTable),
+    /// `SHOW name` -- one row, one text column named canonically.
+    Show(String),
+    /// `SET name = value`.
+    Set {
+        name: String,
+        value: String,
+    },
+    /// `RESET name` / `RESET ALL`.
+    Reset(String),
     Aggregate(Aggregate),
     Update(Update),
     Delete(Delete),
@@ -210,15 +219,36 @@ pub enum TransactionControl {
 /// Clients lean on this constantly -- psycopg, pgjdbc and pgx all probe
 /// `version()` and friends during connection setup -- so a server that cannot
 /// answer it is unusable by real drivers even if every table query works.
+/// One column of a FROM-less SELECT.
+///
+/// The session-setting variants are resolved at EXECUTION rather than during
+/// planning, because the settings live on the connection and the planner is
+/// stateless.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConstCol {
+    Value(Bson),
+    /// `current_setting(name [, missing_ok])`.
+    CurrentSetting {
+        name: String,
+        missing_ok: bool,
+    },
+    /// `set_config(name, value, is_local)` -- sets AND returns.
+    SetConfig {
+        name: String,
+        value: Bson,
+        is_local: bool,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectConstant {
-    /// (output name, value, declared PostgreSQL type).
+    /// (output name, column, declared PostgreSQL type).
     ///
     /// The type is carried EXPLICITLY rather than inferred from the value.
     /// `Describe` arrives before `Bind` and is planned against NULL
     /// placeholders, so inferring from the value typed `$1::int` as `varchar`
     /// and the client then decoded a perfectly good integer as a string.
-    pub columns: Vec<(String, Bson, String)>,
+    pub columns: Vec<(String, ConstCol, String)>,
 }
 
 /// `DROP TABLE a, b` / `DROP TABLE IF EXISTS a`.
@@ -287,6 +317,8 @@ pub fn plan_with_params(
         N::InsertStmt(i) => plan_insert(&i, lookup, params),
         N::SelectStmt(s) => plan_select(&s, lookup, params),
         N::DropStmt(d) => plan_drop(&d),
+        N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
+        N::VariableSetStmt(v) => plan_set(&v),
         N::TransactionStmt(t) => {
             // Named enum, not the wire integer -- twice bitten already.
             match TransactionStmtKind::try_from(t.kind) {
@@ -859,7 +891,7 @@ fn inferred_type(v: &Bson) -> &'static str {
 }
 
 fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> Result<Statement> {
-    let mut columns: Vec<(String, Bson, String)> = Vec::new();
+    let mut columns: Vec<(String, ConstCol, String)> = Vec::new();
     for t in &s.target_list {
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
             return Err(Error::Unsupported("this target".into()));
@@ -875,10 +907,23 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     })
                     .next_back()
                     .unwrap_or_default();
+                if let Some(col) = guc_function(&name, f, params)? {
+                    let out_name = name.clone();
+                    columns.push((
+                        if rt.name.is_empty() {
+                            out_name
+                        } else {
+                            rt.name.clone()
+                        },
+                        col,
+                        "text".to_string(),
+                    ));
+                    continue;
+                }
                 let v = session_function(&name)
                     .ok_or_else(|| Error::Unsupported(format!("function {name}()")))?;
                 let t = inferred_type(&v).to_string();
-                (name, v, t)
+                (name, ConstCol::Value(v), t)
             }
             // `current_user` and friends parse as bare column refs, not calls.
             Some(N::ColumnRef(c)) => {
@@ -894,13 +939,13 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 let v =
                     session_function(&name).ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
                 let t = inferred_type(&v).to_string();
-                (name, v, t)
+                (name, ConstCol::Value(v), t)
             }
             Some(node @ (N::AConst(_) | N::ParamRef(_) | N::TypeCast(_) | N::AExpr(_))) => {
                 let v = const_value(rt.val.as_ref().expect("checked"), params)?;
                 let t = static_type(rt.val.as_ref().expect("checked"), &v);
                 let _ = node;
-                ("?column?".to_string(), v, t)
+                ("?column?".to_string(), ConstCol::Value(v), t)
             }
             Some(other) => return Err(Error::Unsupported(disc(other))),
             None => return Err(Error::Unsupported("an empty target".into())),
@@ -1132,6 +1177,74 @@ fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
             f(a)?.partial_cmp(&f(b)?)
         }
     }
+}
+
+/// `SET` / `RESET`. `SET LOCAL` is treated as `SET`: this server has no
+/// statement-scoped settings, and the difference only shows on rollback.
+/// `current_setting(...)` / `set_config(...)`, which need connection state and
+/// so are resolved at execution rather than here.
+fn guc_function(
+    name: &str,
+    f: &pg_query::protobuf::FuncCall,
+    params: &[Bson],
+) -> Result<Option<ConstCol>> {
+    let text_arg = |i: usize| -> Result<String> {
+        match const_value(&f.args[i], params)? {
+            Bson::String(s) => Ok(s),
+            other => Err(Error::Unsupported(format!(
+                "a non-text argument to {name}(): {other:?}"
+            ))),
+        }
+    };
+    match name {
+        "current_setting" if !f.args.is_empty() && f.args.len() <= 2 => {
+            let missing_ok = if f.args.len() == 2 {
+                matches!(const_value(&f.args[1], params)?, Bson::Boolean(true))
+            } else {
+                false
+            };
+            Ok(Some(ConstCol::CurrentSetting {
+                name: text_arg(0)?,
+                missing_ok,
+            }))
+        }
+        "set_config" if f.args.len() == 3 => Ok(Some(ConstCol::SetConfig {
+            name: text_arg(0)?,
+            value: const_value(&f.args[1], params)?,
+            is_local: matches!(const_value(&f.args[2], params)?, Bson::Boolean(true)),
+        })),
+        _ => Ok(None),
+    }
+}
+
+fn plan_set(v: &pg_query::protobuf::VariableSetStmt) -> Result<Statement> {
+    // VariableSetKind: Value = 1, Default = 2, Current = 3, Multi = 4, Reset = 5,
+    // ResetAll = 6.
+    match VariableSetKind::try_from(v.kind) {
+        Ok(VariableSetKind::VarReset) => return Ok(Statement::Reset(v.name.clone())),
+        Ok(VariableSetKind::VarResetAll) => return Ok(Statement::Reset(String::new())),
+        Ok(VariableSetKind::VarSetValue | VariableSetKind::VarSetDefault) => {}
+        _ => return Err(Error::Unsupported("this SET form".into())),
+    }
+    // The value is one or more A_Const / TypeName items; render them as the
+    // text PostgreSQL stores, joined by commas (`SET DateStyle = 'ISO','MDY'`).
+    let mut parts = Vec::new();
+    for a in &v.args {
+        let text = match const_value(a, &[])? {
+            Bson::String(s) => s,
+            Bson::Int32(i) => i.to_string(),
+            Bson::Int64(i) => i.to_string(),
+            Bson::Double(d) => d.to_string(),
+            Bson::Boolean(b) => (if b { "on" } else { "off" }).to_string(),
+            Bson::Null => "".to_string(),
+            other => format!("{other:?}"),
+        };
+        parts.push(text);
+    }
+    Ok(Statement::Set {
+        name: v.name.clone(),
+        value: parts.join(", "),
+    })
 }
 
 fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {

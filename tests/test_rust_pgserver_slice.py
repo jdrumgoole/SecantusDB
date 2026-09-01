@@ -424,3 +424,45 @@ def test_constant_expressions_match_postgres(home: Path) -> None:
         with pytest.raises(psycopg.Error) as exc:
             cur.execute("SELECT 5/0")
         assert exc.value.diag.sqlstate == "22012"
+
+
+def test_session_settings(home: Path) -> None:
+    """SET / SHOW / RESET and the GUC functions.
+
+    Settings are per CONNECTION, as PostgreSQL's are, and the reported column
+    name uses PostgreSQL's canonical casing (`SHOW datestyle` answers a column
+    called `DateStyle`) because clients match on it.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SHOW client_encoding")
+        assert cur.fetchone()[0] == "UTF8"
+        cur.execute("SHOW datestyle")
+        assert cur.fetchone()[0] == "ISO, MDY"
+        assert cur.description[0].name == "DateStyle"
+
+        cur.execute("SET my.x = '7'")
+        assert cur.statusmessage == "SET"
+        cur.execute("SELECT current_setting('my.x')")
+        assert cur.fetchone()[0] == "7"
+
+        cur.execute("SELECT set_config('my.y', '9', false)")
+        assert cur.fetchone()[0] == "9"
+        cur.execute("SELECT current_setting('my.y')")
+        assert cur.fetchone()[0] == "9"
+
+        # An unknown name errors; with missing_ok it is NULL (probed PG 14).
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("SELECT current_setting('nope.zz')")
+        assert exc.value.diag.sqlstate == "42704"
+        cur.execute("SELECT current_setting('nope.zz', true)")
+        assert cur.fetchone()[0] is None
+
+        cur.execute("RESET my.x")
+        assert cur.statusmessage == "RESET"
+
+    # A new connection starts from the defaults, not the previous session's.
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        with pytest.raises(psycopg.Error):
+            cur.execute("SELECT current_setting('my.y')")

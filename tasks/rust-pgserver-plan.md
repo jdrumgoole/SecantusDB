@@ -234,7 +234,27 @@ Ranking now:
 | 179 | `AArrayExpr` — array literals |
 | 80 | casts to `interval` |
 
-**Trajectory: 694 -> 746 -> 853.**
+### 0.12 Session settings (2026-09-01): 853 -> 899
+
+`SET`/`SHOW`/`RESET` plus `current_setting()` / `set_config()`, held per
+connection. `VariableSetStmt` closed; 11 of 11 shapes match PG 14.
+
+Three details that decide whether a client is satisfied, all probed:
+
+* **`SHOW datestyle` answers a column named `DateStyle`.** Lookups are
+  case-insensitive, the REPORTED name is not, and clients match on it.
+* `current_setting('nope')` is **42704**; `current_setting('nope', true)` is
+  **NULL**.
+* **`RESET` restores the DEFAULT, it does not delete.** A client reading the
+  setting back afterwards must see the default, not an error.
+
+The GUC functions resolve at EXECUTION, not while planning -- settings live on
+the connection and the planner is stateless. That is why `ConstCol` exists.
+
+Ranking now: `FuncCall` 325, `CopyStmt` 274, `AArrayExpr` 179,
+`DeclareCursorStmt` 72, casts to `interval` 80.
+
+**Trajectory: 694 -> 746 -> 853 -> 899.**
 
 **A type-system trap worth remembering.** `Describe` runs BEFORE `Bind`, so a
 column's type cannot be inferred from its value — at that point `$1::int` has
