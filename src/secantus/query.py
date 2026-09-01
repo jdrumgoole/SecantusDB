@@ -8,7 +8,7 @@ from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from typing import Any
 
-from bson import Binary, Decimal128, Int64, ObjectId, Regex
+from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex
 
 from secantus.collation import Collation
 from secantus.collation import compare_keys as _coll_compare
@@ -120,7 +120,7 @@ def _match_clause(
             ) from exc
     if key.startswith("$"):
         raise QueryError(f"unsupported top-level operator: {key}")
-    return _field_matches(_resolve_path(doc, key), condition, collation)
+    return _field_matches(_resolve_path(doc, key), condition, collation, field=key)
 
 
 def _unique_items_key(value: Any) -> Any:
@@ -444,7 +444,13 @@ def _resolve_path(doc: Any, path: str) -> list[Any]:
 _SIBLING_MODIFIERS = frozenset(("$options", "$maxDistance", "$minDistance"))
 
 
-def _field_matches(values: list[Any], condition: Any, collation: Collation | None = None) -> bool:
+def _field_matches(
+    values: list[Any],
+    condition: Any,
+    collation: Collation | None = None,
+    *,
+    field: str = "",
+) -> bool:
     if isinstance(condition, Regex):
         return _op_regex(values, condition.pattern, condition.flags)
     if isinstance(condition, Mapping) and condition and all(k.startswith("$") for k in condition):
@@ -479,7 +485,7 @@ def _field_matches(values: list[Any], condition: Any, collation: Collation | Non
                     siblings=condition,
                 ):
                     return False
-            elif not _op_matches(values, op, arg, collation):
+            elif not _op_matches(values, op, arg, collation, field=field):
                 return False
         return True
     return _eq_with_array(values, condition, collation)
@@ -611,7 +617,31 @@ def _is_nan(v: Any) -> bool:
     return False
 
 
-def _op_matches(values: list[Any], op: str, arg: Any, collation: Collation | None = None) -> bool:
+#: The range operators, which mongod refuses to take a regex for -- a regex is
+#: only meaningful under equality, where it MATCHES rather than compares.
+_RANGE_OPS = frozenset({"$gt", "$gte", "$lt", "$lte"})
+
+
+def _op_matches(
+    values: list[Any],
+    op: str,
+    arg: Any,
+    collation: Collation | None = None,
+    *,
+    field: str = "",
+) -> bool:
+    # mongod rejects this at parse time rather than matching nothing (probed
+    # 8.2.11, 2026-09-01). Answering an empty result set instead hid a
+    # malformed query -- the caller cannot tell "no documents match" from
+    # "that predicate is meaningless".
+    if isinstance(arg, Regex) and op in _RANGE_OPS:
+        raise QueryError(
+            f"Can't have RegEx as arg to non-equality predicate over field '{field}'.",
+            code=2,
+            code_name="BadValue",
+        )
+    if isinstance(arg, Regex) and op == "$ne":
+        raise QueryError("Can't have regex as arg to $ne.", code=2, code_name="BadValue")
     if op == "$eq":
         return _eq_with_array(values, arg, collation)
     if op == "$ne":
@@ -956,10 +986,50 @@ def _cmp(
     return False
 
 
+def _same_type_bracket(value: Any, bound: Any) -> bool:
+    """Whether a range operator may compare these two values at all.
+
+    mongod's range operators (``$gt`` / ``$gte`` / ``$lt`` / ``$lte``) are
+    **type-bracketed**: ``{v: {$gt: 3}}`` matches numbers greater than 3 and
+    NOTHING else -- not the string "z", not a MaxKey, not a date. The one
+    exception is a ``MinKey`` / ``MaxKey`` **bound**, which mongod compares
+    against every type -- and only the bound: a document whose VALUE is a
+    ``MaxKey`` is still bracketed out of ``{v: {$gt: 3}}``. Getting that
+    direction wrong keeps the original bug, because the MaxKey is on the
+    document side.
+
+    Only three brackets were enforced before this (bool, document, array), and
+    the gap was not a message-level nicety: a collection holding a ``MaxKey``
+    returned that document for *every* ``$gt`` query, and ``pymongo``'s
+    ``MaxKey.__gt__`` returning True unconditionally is what made it look like a
+    match. Measured against 8.2.11 (2026-09-01), 96 of 112 (bound, operator,
+    collation) shapes disagreed with mongod.
+
+    Numbers share one bracket (int / long / double / Decimal128 compare across
+    themselves), which is why this asks :func:`_bson_type_rank` rather than
+    comparing Python types.
+    """
+    from secantus.ordering import _bson_type_rank
+
+    if isinstance(bound, (MinKey, MaxKey)):
+        return True
+    return _bson_type_rank(value) == _bson_type_rank(bound)
+
+
 def _try_cmp(
     a: Any, b: Any, op: Callable[[Any, Any], bool], collation: Collation | None = None
 ) -> bool:
-    if collation is not None and isinstance(a, str) and isinstance(b, str):
+    if not _same_type_bracket(a, b):
+        return False
+    if (
+        collation is not None
+        # `bson.Code` subclasses `str`; without this guard a JavaScript value
+        # compared as a collated string against a string bound, and matched.
+        and isinstance(a, str)
+        and isinstance(b, str)
+        and not isinstance(a, Code)
+        and not isinstance(b, Code)
+    ):
         # Route through collation-aware compare. ``op`` operates on the
         # numeric result of ``compare_keys`` interpreted as the sign of
         # ``a - b``.
@@ -968,13 +1038,6 @@ def _try_cmp(
             return bool(op(c, 0))
         except TypeError:
             return False
-    # MongoDB ranks bool as its own type bracket: under range operators a bool
-    # compares only with another bool, never with a number. Python treats bool as
-    # an int subclass, so `op(True, 2)` would otherwise evaluate `1 < 2` and
-    # spuriously match — guard against that (equality already brackets bool
-    # separately). Both-bool falls through to a normal (correct) bool compare.
-    if isinstance(a, bool) != isinstance(b, bool):
-        return False
     # Two embedded documents order field-by-field under range operators
     # (mongod: first differing key compares as a string, else recurse into the
     # value, else the shorter document sorts first). Python's ``operator.gt``
