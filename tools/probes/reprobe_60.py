@@ -3,7 +3,6 @@
 Each case runs identically on both and the answers are compared, so a claim is
 only 'still true' when the two agree.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -45,9 +44,7 @@ CASES = {
     # expressions.py
     "add-missing-is-null": lambda db: _agg(db, [{"$project": {"r": {"$add": ["$nope", 1]}}}]),
     "cmp-missing-below-null": lambda db: _agg(db, [{"$project": {"r": {"$cmp": ["$nope", None]}}}]),
-    "arrayelemat-missing-null": lambda db: _agg(
-        db, [{"$project": {"r": {"$arrayElemAt": ["$nope", 0]}}}]
-    ),
+    "arrayelemat-missing-null": lambda db: _agg(db, [{"$project": {"r": {"$arrayElemAt": ["$nope", 0]}}}]),
     # aggregate.py
     "stddevpop-decimal-is-double": lambda db: _agg(
         db, [{"$group": {"_id": None, "r": {"$stdDevPop": "$dec"}}}]
@@ -144,9 +141,7 @@ def main() -> int:
     try:
         for _ in range(60):
             try:
-                MongoClient(
-                    f"mongodb://127.0.0.1:{port}/", serverSelectionTimeoutMS=500
-                ).admin.command("ping")
+                MongoClient(f"mongodb://127.0.0.1:{port}/", serverSelectionTimeoutMS=500).admin.command("ping")
                 break
             except Exception:  # noqa: BLE001, PERF203
                 time.sleep(0.25)
@@ -154,9 +149,7 @@ def main() -> int:
         ours = run(srv.uri)
         agree = [k for k in CASES if theirs[k] == ours[k]]
         differ = [k for k in CASES if theirs[k] != ours[k]]
-        print(
-            f"mongod {pymongo.MongoClient(f'mongodb://127.0.0.1:{port}/').admin.command('buildInfo')['version']}"
-        )
+        print(f"mongod {pymongo.MongoClient(f'mongodb://127.0.0.1:{port}/').admin.command('buildInfo')['version']}")
         print(f"\nAGREE  ({len(agree)}/{len(CASES)}): {', '.join(agree)}")
         print(f"\nDIFFER ({len(differ)}):")
         for k in differ:
