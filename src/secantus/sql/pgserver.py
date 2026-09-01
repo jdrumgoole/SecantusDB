@@ -1087,7 +1087,7 @@ def _render_result(res: Any, encoding: str | None = "utf-8", session: Any = None
         # Reportable GUCs changed mid-statement by set_config().
         status += session.pending_parameter_status
         session.pending_parameter_status = []
-    if res.columns or res.command_tag.startswith("SELECT"):
+    if res.columns or (res.command_tag.startswith("SELECT") and not res.suppress_row_description):
         out += pgwire.row_description(
             [(c.name, c.pg_oid, c.typmod, c.table_oid, c.attnum) for c in res.columns],
             encoding=encoding,

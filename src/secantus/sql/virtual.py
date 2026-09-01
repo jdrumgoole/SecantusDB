@@ -61,6 +61,45 @@ class VirtualTable:
         )
 
 
+#: A sequence's on-disk relation shape in PostgreSQL. `SELECT * FROM <seq>`
+#: reads these three columns (probed on 14.13).
+SEQUENCE_RELATION_COLUMNS: ColumnsSpec = [
+    ("last_value", "int8"),
+    ("log_cnt", "int8"),
+    ("is_called", "bool"),
+]
+
+
+def sequence_relation(name: str, db: str, catalog: Catalog) -> VirtualTable | None:
+    """A sequence addressed as a relation, or None if ``name`` is not one.
+
+    PostgreSQL lets a sequence be read from the FROM clause — it is a relation
+    with one row — which is how a client inspects a sequence without calling
+    `currval`. Both stored fields mean exactly what PG's do, so `last_value`
+    and `is_called` are reported verbatim.
+
+    `log_cnt` is the only field not reproduced: it counts how many values PG
+    has pre-logged to WAL (0 on a fresh sequence, 32 after the first `nextval`
+    at the default cache), which is a durability-bookkeeping internal with no
+    counterpart here. It reads 0 rather than an invented 32 — faking the
+    default would be wrong for any other cache setting.
+    """
+    seq = catalog.sequence_relation_state(db, name)
+    if seq is None:
+        return None
+    row = {
+        "last_value": seq.get("last_value"),
+        "log_cnt": 0,
+        "is_called": bool(seq.get("is_called")),
+    }
+    return VirtualTable(
+        schema="public",
+        name=name,
+        columns=SEQUENCE_RELATION_COLUMNS,
+        builder=lambda _db, _session, _storage, _catalog: [dict(row)],
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Row builders
 # --------------------------------------------------------------------------- #

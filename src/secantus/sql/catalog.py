@@ -809,6 +809,25 @@ class Catalog:
         cache[(db, name)] = [rest, first]
         return first
 
+    def sequence_relation_state(self, db: str, name: str) -> dict[str, Any] | None:
+        """A sequence's state as PG's one-row RELATION reports it, or None.
+
+        The persisted ``last_value`` is the pre-allocated batch's HIGH-WATER
+        MARK, not the value most recently handed out — reading the doc directly
+        would report a position up to ``SEQUENCE_ALLOC_BATCH`` values ahead of
+        the truth. The live position is the same one ``_invalidate_sequence_
+        cache`` writes back, so it is read from the cache entry when a run is
+        open.
+        """
+        doc = self.get_sequence(db, name)
+        if doc is None:
+            return None
+        cache = _SEQ_ALLOC_CACHE.get(self._storage)
+        entry = cache.get((db, name)) if cache is not None else None
+        if entry is not None:
+            return {**doc, "last_value": entry[1], "is_called": True}
+        return doc
+
     def _invalidate_sequence_cache(self, db: str, name: str) -> None:
         """Retire ``name``'s pre-allocated run, writing the last value actually
         handed out back to the stored doc first — so ``setval`` / ``ALTER`` /

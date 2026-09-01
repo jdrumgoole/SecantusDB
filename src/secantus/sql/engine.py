@@ -1161,7 +1161,13 @@ def _run_merge(
 
     if not isinstance(stmt.this, exp.Table):
         raise errors.feature_not_supported("MERGE target must be a table")
-    target = _require_table(catalog, db, planner.qualified_table_name(stmt.this), storage)
+    target = _require_table(
+        catalog,
+        db,
+        planner.qualified_table_name(stmt.this),
+        storage,
+        planner.written_table_name(stmt.this),
+    )
     target_alias = (stmt.this.alias or stmt.this.name).lower()
     src_alias, source_rows, source_cols = _merge_source(
         stmt.args["using"], db, catalog, session, storage
@@ -1396,7 +1402,13 @@ def _run_delete_using(
 ) -> SQLResult:
     """``DELETE FROM t USING u [, v …] WHERE …`` — delete each target row that
     joins a source row satisfying the WHERE (a semi-join)."""
-    target = _require_table(catalog, db, planner.qualified_table_name(stmt.this), storage)
+    target = _require_table(
+        catalog,
+        db,
+        planner.qualified_table_name(stmt.this),
+        storage,
+        planner.written_table_name(stmt.this),
+    )
     target_alias = (stmt.this.alias or stmt.this.name).lower()
     sources = _collect_dml_sources(stmt.args["using"], db, catalog, session, storage)
     sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
@@ -1501,7 +1513,13 @@ def _run_update_from(
     a source row satisfying the WHERE; the SET right-hand sides may reference the
     source (``SET col = u.col``)."""
     target_node = stmt.this
-    target = _require_table(catalog, db, planner.qualified_table_name(target_node), storage)
+    target = _require_table(
+        catalog,
+        db,
+        planner.qualified_table_name(target_node),
+        storage,
+        planner.written_table_name(target_node),
+    )
     target_alias = (target_node.alias or target_node.name).lower()
     from_node = stmt.args["from_"]
     sources = _collect_dml_sources([from_node.this], db, catalog, session, storage)
@@ -2083,14 +2101,17 @@ def _show_name(stmt: exp.Command) -> str:
     return str(arg.name).strip() if arg is not None else ""
 
 
-def _require_table(catalog: Catalog, db: str, name: str, storage: Any = None) -> Any:
+def _require_table(
+    catalog: Catalog, db: str, name: str, storage: Any = None, written: str | None = None
+) -> Any:
     table = catalog.get(db, name)
     if table is None and storage is not None:
         # Schema-on-read: a write to an un-declared collection reflects its
         # sampled shape, so INSERT/UPDATE/DELETE reach Mongo data with no DDL.
         table = reflect.reflect(storage, db, name)
     if table is None:
-        raise errors.undefined_table(name)
+        # `written` is the user's spelling; `name` is the resolved catalog key.
+        raise errors.undefined_table(written or name)
     return table
 
 
@@ -2468,7 +2489,46 @@ def _run_create_table_as(
     insert_stmt = exp.Insert(this=exp.to_table(quoted))
     plan = planner.plan_insert_rows(insert_stmt, table, result.rows)
     inserted = executor.execute_insert(plan, storage, db, catalog, session).rowcount
-    return SQLResult(command_tag=f"SELECT {inserted}", rowcount=inserted)
+    # Rows went into the new table, not to the client — no RowDescription.
+    return SQLResult(
+        command_tag=f"SELECT {inserted}", rowcount=inserted, suppress_row_description=True
+    )
+
+
+def _check_drop_kind(kind: str, stmt: exp.Drop, db: str, catalog: Catalog, storage: Any) -> None:
+    """Raise PG's `42809 "x" is not a <kind>` when a DROP names a relation that
+    exists under a DIFFERENT kind.
+
+    Probed against PostgreSQL 14.13: `DROP TABLE <a view>` is
+    `42809 "v" is not a table`, not `42P01 ... does not exist`. Answering
+    "does not exist" for a name that is very much taken sent a client looking
+    for a missing object instead of the right DROP verb — and made
+    `DROP TABLE IF EXISTS v` silently succeed while the view survived.
+    `IF EXISTS` does NOT suppress this: PG raises 42809 either way, because
+    the object is present.
+    """
+    if not isinstance(stmt.this, exp.Table) or not stmt.this.name:
+        return
+    name = planner.qualified_table_name(stmt.this)
+    # The kind this name actually has, if any. A materialized view ALSO carries
+    # an ordinary catalog table entry (that is what gives `SELECT *` its column
+    # shape), so it has to be tested before the table case or every
+    # `DROP MATERIALIZED VIEW` would look like a table/view mismatch.
+    if catalog.get_matview(db, name) is not None:
+        actual = "MATERIALIZED VIEW"
+    elif catalog.get_view(db, name) is not None:
+        actual = "VIEW"
+    elif catalog.get(db, name) is not None:
+        actual = "TABLE"
+    elif catalog.sequence_exists(db, name):
+        actual = "SEQUENCE"
+    else:
+        return  # absent, or an index — the per-kind handler reports it
+    # PG keeps VIEW and MATERIALIZED VIEW strictly distinct: `DROP VIEW <mv>` is
+    # `"mv" is not a view` and `DROP MATERIALIZED VIEW <v>` is `"v" is not a
+    # materialized view` (probed on 14.13), so no aliasing between them.
+    if kind != actual:
+        raise errors.wrong_object_type(name, kind)
 
 
 def _run_statement(
@@ -2538,6 +2598,10 @@ def _run_statement(
 
     if isinstance(stmt, exp.Drop):
         kind = (stmt.args.get("kind") or "TABLE").upper()
+        if stmt.args.get("materialized"):
+            kind = "MATERIALIZED VIEW" if kind == "VIEW" else kind
+        _check_drop_kind(kind, stmt, db, catalog, storage)
+        kind = "VIEW" if kind == "MATERIALIZED VIEW" else kind
         if kind == "TABLE":
             plan = planner.plan_drop_table(stmt)
             _check_portal_table_pin(session, plan.name)
@@ -2587,6 +2651,22 @@ def _run_statement(
     # into a single-table SELECT / UPDATE / DELETE WHERE before planning.
     _apply_rls_read(stmt, catalog, db, session)
 
+    if isinstance(stmt, exp.Select) and stmt.args.get("into") is not None:
+        # `SELECT … INTO t FROM …` is PG's older spelling of `CREATE TABLE t AS
+        # SELECT …`, and reaches the same handler. Without this the INTO target
+        # was resolved as if it were a SOURCE relation, so every SELECT INTO
+        # failed with `relation "t" does not exist`.
+        into = stmt.args["into"]
+        source = stmt.copy()
+        source.set("into", None)
+        props = (
+            exp.Properties(expressions=[exp.TemporaryProperty()])
+            if into.args.get("temporary")
+            else None
+        )
+        create = exp.Create(this=into.this.copy(), kind="TABLE", properties=props)
+        return _run_create_table_as(create, source, storage, db, catalog, session)
+
     if isinstance(stmt, exp.SetOperation):
         return _run_set_operation(stmt, storage, db, catalog, session)
 
@@ -2611,8 +2691,13 @@ def _run_statement(
             return _run_pg_description_dml(stmt, storage, db, catalog, session)
         if stmt.args.get("from_") is not None:
             return _run_update_from(stmt, storage, db, catalog, session)
+        _t = stmt.find(exp.Table)
         table = _require_table(
-            catalog, db, planner.qualified_table_name(stmt.find(exp.Table)), storage
+            catalog,
+            db,
+            planner.qualified_table_name(_t),
+            storage,
+            planner.written_table_name(_t),
         )
         plan = planner.plan_update(stmt, table)
         plan.check_option = check_pred
@@ -2623,8 +2708,13 @@ def _run_statement(
             return _run_pg_description_dml(stmt, storage, db, catalog, session)
         if stmt.args.get("using"):
             return _run_delete_using(stmt, storage, db, catalog, session)
+        _t = stmt.find(exp.Table)
         table = _require_table(
-            catalog, db, planner.qualified_table_name(stmt.find(exp.Table)), storage
+            catalog,
+            db,
+            planner.qualified_table_name(_t),
+            storage,
+            planner.written_table_name(_t),
         )
         return executor.execute_delete(
             planner.plan_delete(stmt, table), storage, db, catalog, session
@@ -3252,11 +3342,14 @@ def _run_select(
         )
 
     # A WITH NO DATA materialized view is not scannable until its first REFRESH.
+    # Keyed on the resolved catalog key, not a bare name — the old form
+    # required the reference to carry NO schema qualifier, so a matview read
+    # through `schema.mv` skipped the gate entirely.
+    _mv_key = planner.qualified_table_name(table_node) if table_node is not None else None
     if (
-        table_node is not None
-        and not table_node.args.get("db")
-        and catalog.get_matview(db, table_node.name) is not None
-        and not catalog.matview_populated(db, table_node.name)
+        _mv_key is not None
+        and catalog.get_matview(db, _mv_key) is not None
+        and not catalog.matview_populated(db, _mv_key)
     ):
         raise errors.SQLError(
             "55000",
@@ -3278,6 +3371,11 @@ def _run_select(
     schema = table_node.args.get("db")
     schema_name = schema.name if schema is not None else None
     vtable = virtual.lookup(schema_name, table_node.name)
+    if vtable is None:
+        # A sequence read from the FROM clause is a one-row relation in PG.
+        # Served through the same in-memory backend as the catalog tables, so
+        # WHERE / projection / ORDER BY over it need no new query code.
+        vtable = virtual.sequence_relation(planner.qualified_table_name(table_node), db, catalog)
     if vtable is not None:
         rows = vtable.builder(db, session, storage, catalog)
         backend = virtual.MemoryBackend(rows)
@@ -3311,7 +3409,7 @@ def _run_select(
     _qn = planner.qualified_table_name(table_node)
     table = catalog.get(db, _qn) or reflect.reflect(storage, db, _qn)
     if table is None:
-        raise errors.undefined_table(_qn)
+        raise errors.undefined_table(planner.written_table_name(table_node))
     # A WHERE with EXISTS or a correlated subquery can't lower to a pushdown
     # filter — evaluate it per row (the inner query reads through the same
     # storage view, with outer-row references resolved by the scalar evaluator).
@@ -3396,14 +3494,14 @@ def _run_insert(
     its result rows positionally onto the target columns. ``check_option`` is an
     auto-updatable view's WITH CHECK OPTION predicate, enforced per inserted row."""
     target = stmt.this
+    target_tbl = target.this if isinstance(target, exp.Schema) else target
     name = (
-        planner.qualified_table_name(target.this)
-        if isinstance(target, exp.Schema)
-        else planner.qualified_table_name(target)
-        if isinstance(target, exp.Table)
+        planner.qualified_table_name(target_tbl)
+        if isinstance(target_tbl, exp.Table)
         else target.name
     )
-    table = _require_table(catalog, db, name, storage)
+    written = planner.written_table_name(target_tbl) if isinstance(target_tbl, exp.Table) else None
+    table = _require_table(catalog, db, name, storage, written)
     source = stmt.expression
     if isinstance(source, (exp.Select, exp.SetOperation)):
         result = _run_query(source, storage, db, catalog, session)
@@ -3458,6 +3556,32 @@ def _run_query(
 _MATVIEW_NAME_RE = re.compile(r"(?is)^\s*MATERIALIZED\s+VIEW\s+(?:CONCURRENTLY\s+)?(.+?)\s*;?\s*$")
 
 
+def _matview_key(raw: str, db: str, catalog, session) -> str:
+    """The catalog key for a matview named in RAW command text.
+
+    ``REFRESH`` and ``ALTER MATERIALIZED VIEW`` arrive as `exp.Command`s whose
+    tail is unparsed text, so they never pass through
+    `qualify_from_search_path` and have to resolve the name themselves. An
+    explicit qualifier wins; a bare name walks ``search_path`` for the first
+    schema that holds a matview of that name (PG's rule), falling back to the
+    key a CREATE would have used so the "does not exist" error is about the
+    right relation.
+    """
+    raw = raw.strip()
+    if "." in raw:
+        schema, _, bare = raw.partition(".")
+        schema, bare = schema.strip().strip('"'), bare.strip().strip('"')
+        return bare if schema == "public" else f"{schema}.{bare}"
+    bare = raw.strip('"')
+    path = list(getattr(session, "search_path", None) or ["public"])
+    for schema in path:
+        key = bare if schema == "public" else f"{schema}.{bare}"
+        if catalog.get_matview(db, key) is not None:
+            return key
+    first = next((sc for sc in path if sc != "public"), None)
+    return bare if (first is None or "public" in path) else f"{first}.{bare}"
+
+
 def _is_materialized(stmt: exp.Create) -> bool:
     props = stmt.args.get("properties")
     return bool(props) and any(isinstance(p, exp.MaterializedProperty) for p in props.expressions)
@@ -3496,9 +3620,13 @@ def _materialize(name: str, definition: str, storage: Any, db: str, catalog, ses
 def _create_matview(
     stmt: exp.Create, storage: Any, db: str, catalog, session, populate: bool = True
 ) -> SQLResult:
-    name = stmt.this.name
+    # The catalog key, not the bare name: a matview lives in a schema like any
+    # other relation, and reading `.name` created / stored / catalogued every
+    # matview under its unqualified name regardless of the schema the statement
+    # gave or `search_path` said.
+    name = planner.qualified_table_name(stmt.this)
     if catalog.exists(db, name) or catalog.get_matview(db, name) is not None:
-        raise errors.SQLError("42P07", f'relation "{name}" already exists')
+        raise errors.duplicate_table(name)
     definition = stmt.expression.sql(dialect="postgres")
     storage.create_collection(db, name)
     # Run the SELECT for its column shape either way; only write rows for WITH
@@ -3516,7 +3644,11 @@ def _create_matview(
             storage.insert(db, name, docs)
     catalog.put_matview(db, name, definition, populated=populate)
     if populate:
-        return SQLResult(command_tag=f"SELECT {len(result.rows)}", rowcount=len(result.rows))
+        return SQLResult(
+            command_tag=f"SELECT {len(result.rows)}",
+            rowcount=len(result.rows),
+            suppress_row_description=True,
+        )
     return SQLResult(command_tag="CREATE MATERIALIZED VIEW")
 
 
@@ -3528,11 +3660,12 @@ def _refresh_matview(stmt: exp.Command, storage: Any, db: str, catalog, session)
     m = _MATVIEW_NAME_RE.match(text)
     if m is None:
         raise errors.feature_not_supported(f"unsupported REFRESH: {stmt.sql()}")
-    name = m.group(1).strip().strip('"')
+    written = m.group(1).strip().strip('"')
     concurrently = re.search(r"(?i)\bCONCURRENTLY\b", text) is not None
+    name = _matview_key(m.group(1), db, catalog, session)
     definition = catalog.get_matview(db, name)
     if definition is None:
-        raise errors.SQLError("42P01", f'materialized view "{name}" does not exist')
+        raise errors.undefined_relation_of_kind("MATERIALIZED VIEW", written)
     if concurrently:
         # Postgres requires CONCURRENTLY to diff against an existing snapshot keyed
         # by a unique index, so it rejects an unpopulated view and one with no
@@ -4122,6 +4255,10 @@ def _create_matview_command(
         return _run_command(stmt, session)
     populate = m.group(2) is None  # "WITH NO DATA" → don't populate
     inner = sqlglot.parse_one(f"CREATE MATERIALIZED VIEW {m.group(1)}", read="postgres")
+    # This statement arrived as a Command, so the freshly parsed form has not
+    # been through search_path resolution — without this the re-parse would
+    # home the matview in `public` whatever the path said.
+    planner.qualify_from_search_path(inner, catalog, db, session)
     return _create_matview(inner, storage, db, catalog, session, populate=populate)
 
 
@@ -4130,16 +4267,21 @@ def _alter_matview_command(stmt: exp.Command, storage: Any, db: str, catalog, se
     m = _MATVIEW_ALTER_RE.match(_command_text(stmt))
     if m is None:
         return _run_command(stmt, session)
-    old = m.group(1).strip().strip('"')
+    written = m.group(1).strip().strip('"')
+    old = _matview_key(m.group(1), db, catalog, session)
+    # PG renames within the relation's own schema, so the new key carries the
+    # old one's prefix (a qualified new name is a syntax error there).
     new = m.group(2).strip().strip('"')
+    if "." in old:
+        new = f"{old.rsplit('.', 1)[0]}.{new.rsplit('.', 1)[-1]}"
     definition = catalog.get_matview(db, old)
     if definition is None:
-        raise errors.SQLError("42P01", f'materialized view "{old}" does not exist')
+        raise errors.undefined_relation_of_kind("MATERIALIZED VIEW", written)
     if catalog.exists(db, new) or catalog.get_matview(db, new) is not None:
-        raise errors.SQLError("42P07", f'relation "{new}" already exists')
+        raise errors.duplicate_table(new)
     ok, err = storage.rename_collection(db, old, db, new)
     if not ok:
-        raise errors.SQLError("42P07", err or f'relation "{new}" already exists')
+        raise errors.duplicate_table(new)
     populated = catalog.matview_populated(db, old)
     table = catalog.get(db, old)
     if table is not None:
@@ -4151,11 +4293,11 @@ def _alter_matview_command(stmt: exp.Command, storage: Any, db: str, catalog, se
 
 
 def _drop_matview(stmt: exp.Drop, storage: Any, db: str, catalog) -> SQLResult:
-    name = stmt.this.name
+    name = planner.qualified_table_name(stmt.this)
     if not catalog.drop_matview(db, name):
         if stmt.args.get("exists"):
             return SQLResult(command_tag="DROP MATERIALIZED VIEW")
-        raise errors.SQLError("42P01", f'materialized view "{name}" does not exist')
+        raise errors.undefined_relation_of_kind("MATERIALIZED VIEW", name)
     catalog.drop(db, name)
     storage.drop_collection(db, name)
     return SQLResult(command_tag="DROP MATERIALIZED VIEW")
@@ -4196,7 +4338,7 @@ def _create_sequence(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
     if catalog.sequence_exists(db, name):
         if stmt.args.get("exists"):
             return SQLResult(command_tag="CREATE SEQUENCE")
-        raise errors.SQLError("42P07", f'relation "{name}" already exists')
+        raise errors.duplicate_table(name)
     props = stmt.args.get("properties")
     increment = _seq_prop_int(props, "increment") or 1
     start = _seq_prop_int(props, "start")
@@ -4217,7 +4359,7 @@ def _create_sequence(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
 def _drop_sequence(stmt: exp.Drop, db: str, catalog: Catalog) -> SQLResult:
     name = planner.qualified_table_name(stmt.this)
     if not catalog.drop_sequence(db, name) and not stmt.args.get("exists"):
-        raise errors.SQLError("42P01", f'sequence "{name}" does not exist')
+        raise errors.undefined_relation_of_kind("SEQUENCE", name)
     return SQLResult(command_tag="DROP SEQUENCE")
 
 
@@ -4238,7 +4380,14 @@ def _create_schema(stmt: exp.Create, db: str, catalog: Catalog) -> SQLResult:
 
 def _drop_schema(stmt: exp.Drop, db: str, catalog: Catalog, storage: Any = None) -> SQLResult:
     """``DROP SCHEMA [IF EXISTS] name [CASCADE]`` — CASCADE drops the schema's
-    types; without it, a non-empty schema is a 2BP01 dependency error."""
+    types, tables, views, materialized views and sequences; without it, a
+    non-empty schema is a 2BP01 dependency error.
+
+    Views, matviews and sequences used to be counted by NEITHER half: they did
+    not block a bare ``DROP SCHEMA`` (PG raises 2BP01) and CASCADE did not
+    remove them, so they outlived the schema that contained them and then
+    collided with a later ``CREATE`` of the same name in a re-created schema.
+    """
     name = stmt.this.args["db"].name
     if not catalog.schema_exists(db, name):
         if stmt.args.get("exists"):
@@ -4249,7 +4398,12 @@ def _drop_schema(stmt: exp.Drop, db: str, catalog: Catalog, storage: Any = None)
     composites = [n for n in catalog.list_composites(db) if n.startswith(prefix)]
     domains = [n for n in catalog.list_domains(db) if n.startswith(prefix)]
     tables = [n for n in catalog.list_tables(db) if n.startswith(prefix)]
-    if (enums or composites or domains or tables) and not stmt.args.get("cascade"):
+    views = [n for n in catalog.list_views(db) if n.startswith(prefix)]
+    matviews = [n for n in catalog.list_matviews(db) if n.startswith(prefix)]
+    sequences = [n for n in catalog.list_sequences(db) if n.startswith(prefix)]
+    if (
+        enums or composites or domains or tables or views or matviews or sequences
+    ) and not stmt.args.get("cascade"):
         raise errors.SQLError(
             "2BP01", f'cannot drop schema "{name}" because other objects depend on it'
         )
@@ -4259,6 +4413,14 @@ def _drop_schema(stmt: exp.Drop, db: str, catalog: Catalog, storage: Any = None)
         catalog.drop_composite(db, n)
     for n in domains:
         catalog.drop_domain(db, n)
+    for n in views:
+        catalog.drop_view(db, n)
+    for n in matviews:
+        catalog.drop_matview(db, n)
+        if storage is not None:
+            storage.drop_collection(db, n)
+    for n in sequences:
+        catalog.drop_sequence(db, n)
     for n in tables:
         executor.execute_drop_table(
             planner.DropTablePlan(name=n, if_exists=True), catalog, storage, db
