@@ -466,3 +466,56 @@ def test_session_settings(home: Path) -> None:
         cur = conn.cursor()
         with pytest.raises(psycopg.Error):
             cur.execute("SELECT current_setting('my.y')")
+
+
+def test_copy_from_stdin(home: Path) -> None:
+    """`COPY ... FROM STDIN` in PostgreSQL's text format.
+
+    The escaping is the substance: `\\N` is NULL and is distinct from an empty
+    string, and a literal tab inside a value arrives as `\\t` and must not be
+    read as a field separator. A chunk boundary can also land anywhere,
+    including mid-row, so the data is buffered and parsed only at CopyDone.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE cp (id int PRIMARY KEY, s text, n int)")
+        with cur.copy("COPY cp FROM STDIN") as cp:
+            cp.write("1\ta\t10\n2\t\\N\t20\n3\thas\\ttab\t30\n")
+        assert cur.statusmessage == "COPY 3"
+
+        cur.execute("SELECT id, s, n FROM cp ORDER BY id")
+        rows = cur.fetchall()
+        assert rows[0] == (1, "a", 10)
+        assert rows[1] == (2, None, 20), "\\N must be NULL, not the string"
+        assert rows[2] == (3, "has\ttab", 30), "an escaped tab is data, not a separator"
+
+        # An explicit column list leaves the others NULL.
+        cur.execute("CREATE TABLE cp2 (id int PRIMARY KEY, s text, n int)")
+        with cur.copy("COPY cp2 (id, n) FROM STDIN") as cp:
+            cp.write("7\t70\n")
+        cur.execute("SELECT id, s, n FROM cp2")
+        assert cur.fetchall() == [(7, None, 70)]
+
+        # A chunk boundary mid-row must not split a value.
+        cur.execute("CREATE TABLE cp3 (id int PRIMARY KEY, s text)")
+        with cur.copy("COPY cp3 FROM STDIN") as cp:
+            cp.write("1\tab")
+            cp.write("c\n2\tdef\n")
+        cur.execute("SELECT id, s FROM cp3 ORDER BY id")
+        assert cur.fetchall() == [(1, "abc"), (2, "def")]
+
+
+def test_copy_to_stdout_is_refused_honestly(home: Path) -> None:
+    """`COPY ... TO STDOUT` is blocked by pgwire, not by us.
+
+    pgwire sends the CopyOutResponse header and leaves the connection in
+    CopyInProgress, but its simple-query handler has no `Sink` bound, so there
+    is no way to push the CopyData rows back. Refusing beats half-answering.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE cp (id int PRIMARY KEY)")
+        with pytest.raises(psycopg.Error) as exc:
+            with cur.copy("COPY cp TO STDOUT") as cp:
+                list(cp)
+        assert exc.value.diag.sqlstate == "0A000"

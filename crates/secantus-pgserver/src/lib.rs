@@ -16,15 +16,18 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bson::{Bson, Document};
 use bytes::Bytes;
-use futures::{stream, Sink, StreamExt};
+use futures::{stream, Sink, SinkExt, StreamExt};
 use pgwire::api::auth::noop::NoopStartupHandler;
+use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::results::{CopyResponse, DescribePortalResponse, DescribeStatementResponse};
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
-use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse};
 use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
+use pgwire::messages::response::CommandComplete;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use secantus_pgcatalog::{TableDef, CATALOG_COLLECTION};
 use secantus_pgplan::{
@@ -46,6 +49,18 @@ pub struct PgHandler {
     txn: Mutex<Option<UserTransactionHandle>>,
     /// Session settings (GUCs), per connection as PostgreSQL's are.
     settings: Mutex<HashMap<String, String>>,
+    /// The in-progress `COPY ... FROM STDIN`, if any: target plus the bytes
+    /// received so far. Per connection, like PostgreSQL's.
+    copy_in: Mutex<Option<CopyInState>>,
+}
+
+struct CopyInState {
+    table: String,
+    /// Stored field per target column, in the order the data supplies them.
+    fields: Vec<String>,
+    /// The declared PostgreSQL type of each target column, for parsing.
+    types: Vec<String>,
+    buffer: Vec<u8>,
 }
 
 impl PgHandler {
@@ -55,6 +70,7 @@ impl PgHandler {
             db: db.to_string(),
             txn: Mutex::new(None),
             settings: Mutex::new(default_settings()),
+            copy_in: Mutex::new(None),
         }
     }
 
@@ -468,6 +484,29 @@ impl PgHandler {
                         .map_err(|e| Self::storage_err("could not drop the catalog entry", e))?;
                 }
                 Ok(vec![Response::Execution(Tag::new("DROP TABLE"))])
+            }
+
+            Statement::CopyFrom(cf) => {
+                let def = self
+                    .lookup(&cf.table)
+                    .ok_or_else(|| Self::err(&PlanError::UndefinedTable(cf.table.clone())))?;
+                let cols: Vec<&secantus_pgcatalog::Column> = if cf.columns.is_empty() {
+                    def.columns.iter().collect()
+                } else {
+                    cf.columns
+                        .iter()
+                        .map(|n| def.column(n).expect("planner checked"))
+                        .collect()
+                };
+                let n = cols.len();
+                *self.copy_in.lock().unwrap_or_else(|e| e.into_inner()) = Some(CopyInState {
+                    table: cf.table.clone(),
+                    fields: cols.iter().map(|c| c.field()).collect(),
+                    types: cols.iter().map(|c| c.pg_type.clone()).collect(),
+                    buffer: Vec::new(),
+                });
+                // format 0 = text, and every column is text-formatted.
+                Ok(vec![Response::CopyIn(CopyResponse::new(0, n, vec![0; n]))])
             }
 
             Statement::Show(name) => {
@@ -1161,6 +1200,182 @@ impl ExtendedQueryHandler for PgHandler {
     }
 }
 
+/// Undo COPY's text-format escaping for one field.
+///
+/// PostgreSQL escapes the delimiter, newline and backslash itself, so a tab
+/// inside a value arrives as `\\t` and must NOT be read as a field separator.
+fn copy_unescape(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut chars = field.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Parse one COPY text field into the value its column stores.
+///
+/// `\N` is NULL -- distinct from the empty string, which is a real empty text
+/// value. That distinction is the whole reason COPY has an escape at all.
+fn copy_field(raw: &str, pg_type: &str) -> PgWireResult<Bson> {
+    if raw == "\\N" {
+        return Ok(Bson::Null);
+    }
+    let text = copy_unescape(raw);
+    let bad = |want: &str| {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "22P02".into(),
+            format!("invalid input syntax for type {want}: \"{text}\""),
+        )))
+    };
+    Ok(match pg_type {
+        "int2" | "int4" | "integer" | "int" | "smallint" => {
+            Bson::Int32(text.trim().parse().map_err(|_| bad("integer"))?)
+        }
+        "int8" | "bigint" => Bson::Int64(text.trim().parse().map_err(|_| bad("bigint"))?),
+        "float4" | "float8" | "real" | "numeric" => {
+            Bson::Double(text.trim().parse().map_err(|_| bad("double precision"))?)
+        }
+        "bool" | "boolean" => match text.trim() {
+            "t" | "true" | "y" | "yes" | "on" | "1" => Bson::Boolean(true),
+            "f" | "false" | "n" | "no" | "off" | "0" => Bson::Boolean(false),
+            _ => return Err(bad("boolean")),
+        },
+        _ => Bson::String(text),
+    })
+}
+
+#[async_trait]
+impl CopyHandler for PgHandler {
+    async fn on_copy_data<C>(&self, _c: &mut C, data: CopyData) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let mut guard = self.copy_in.lock().unwrap_or_else(|e| e.into_inner());
+        // A chunk may split a row anywhere, so buffer and parse only at Done.
+        match guard.as_mut() {
+            Some(state) => state.buffer.extend_from_slice(&data.data),
+            None => {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "57014".into(),
+                    "COPY data arrived with no COPY in progress".into(),
+                ))))
+            }
+        }
+        Ok(())
+    }
+
+    async fn on_copy_done<C>(&self, client: &mut C, _done: CopyDone) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let state = match self
+            .copy_in
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let text = String::from_utf8(state.buffer).map_err(|_| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "22021".into(), // character_not_in_repertoire
+                "COPY data is not valid UTF-8".into(),
+            )))
+        })?;
+
+        let mut docs = Vec::new();
+        for line in text.split('\n') {
+            // A trailing newline leaves an empty final line, and `\.` is the
+            // end-of-data marker from the historical protocol.
+            if line.is_empty() || line == "\\." {
+                continue;
+            }
+            let raw: Vec<&str> = line.split('\t').collect();
+            if raw.len() != state.fields.len() {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "22P04".into(), // bad_copy_file_format
+                    format!(
+                        "extra or missing columns for COPY (expected {}, got {})",
+                        state.fields.len(),
+                        raw.len()
+                    ),
+                ))));
+            }
+            let mut doc = Document::new();
+            for ((field, ty), value) in state.fields.iter().zip(&state.types).zip(raw) {
+                doc.insert(field.clone(), copy_field(value, ty)?);
+            }
+            docs.push(
+                bson::to_vec(&doc)
+                    .map_err(|e| Self::storage_err("could not encode a COPY row", e))?,
+            );
+        }
+
+        let written = docs.len();
+        if !docs.is_empty() {
+            let (_, errors) = self
+                .storage
+                .insert(&self.db, &state.table, docs, true)
+                .map_err(|e| Self::storage_err("could not insert COPY rows", e))?;
+            if let Some(first) = errors.first() {
+                let def = self
+                    .lookup(&state.table)
+                    .ok_or_else(|| Self::err(&PlanError::UndefinedTable(state.table.clone())))?;
+                return Err(Self::write_error(&state.table, &def, first));
+            }
+        }
+
+        // pgwire sends ReadyForQuery after this, but NOT CommandComplete --
+        // without it the client waits for a result that never comes and
+        // psycopg fails with "not enough values to unpack".
+        client
+            .feed(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                format!("COPY {written}"),
+            )))
+            .await?;
+        client.flush().await.map_err(PgWireError::from)?;
+        Ok(())
+    }
+
+    async fn on_copy_fail<C>(&self, _c: &mut C, fail: CopyFail) -> PgWireError
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        // The client abandoned the COPY: drop everything buffered rather than
+        // insert a partial load.
+        *self.copy_in.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "57014".into(), // query_canceled
+            format!("COPY from stdin failed: {}", fail.message),
+        )))
+    }
+}
+
 pub struct HandlerFactory(pub Arc<PgHandler>);
 
 impl PgWireServerHandlers for HandlerFactory {
@@ -1168,6 +1383,9 @@ impl PgWireServerHandlers for HandlerFactory {
         self.0.clone()
     }
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
+        self.0.clone()
+    }
+    fn copy_handler(&self) -> Arc<impl CopyHandler> {
         self.0.clone()
     }
     fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {

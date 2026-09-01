@@ -254,7 +254,36 @@ the connection and the planner is stateless. That is why `ConstCol` exists.
 Ranking now: `FuncCall` 325, `CopyStmt` 274, `AArrayExpr` 179,
 `DeclareCursorStmt` 72, casts to `interval` 80.
 
-**Trajectory: 694 -> 746 -> 853 -> 899.**
+### 0.13 COPY FROM STDIN (2026-09-01): 899 -> 900
+
+`COPY ... FROM STDIN` in text format: `\N` nulls, escaped tab/newline/
+backslash, optional column list, and chunk boundaries that fall mid-row (buffer
+until CopyDone, parse then).
+
+**+1, and the reason matters more than the number.** `CopyStmt` was 274, but
+psycopg's copy tests ROUND-TRIP: roughly 6 `TO STDOUT` against 6 `FROM STDIN`,
+so most still fail on the half that is missing. Another instance of the rule
+from 0.10 -- the ranking says what to build, never how many tests it wins.
+
+The value is elsewhere: this is how `pgbench -i` loads its tables, so it is a
+prerequisite for the `sql-stress` gauge that has been 0/6.
+
+**`COPY TO STDOUT` is blocked by pgwire, not by us.** It sends the
+CopyOutResponse header and sets CopyInProgress, but `SimpleQueryHandler::
+do_query` has no `Sink` bound, so there is no way to push the CopyData rows
+that must follow. The extended handler's `do_query` DOES have the sink, so an
+asymmetric implementation is possible but would be worse than refusing.
+
+**This is the SECOND concrete cost of choosing the pgwire crate over
+hand-rolling** (the first: `ErrorInfo` cannot carry `constraint_name`, §0.6).
+Both are recoverable by upstreaming, and both should be weighed if a third
+appears.
+
+Also worth noting: pgwire sends `ReadyForQuery` after `on_copy_done` but NOT
+`CommandComplete` -- the handler must send that itself, or the client waits for
+a result that never arrives (psycopg: "not enough values to unpack").
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900.**
 
 **A type-system trap worth remembering.** `Describe` runs BEFORE `Bind`, so a
 column's type cannot be inferred from its value — at that point `$1::int` has

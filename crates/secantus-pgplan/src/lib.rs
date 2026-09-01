@@ -95,6 +95,8 @@ pub enum Statement {
     },
     /// `RESET name` / `RESET ALL`.
     Reset(String),
+    /// `COPY <table> [(cols)] FROM STDIN`.
+    CopyFrom(CopyFrom),
     Aggregate(Aggregate),
     Update(Update),
     Delete(Delete),
@@ -251,6 +253,18 @@ pub struct SelectConstant {
     pub columns: Vec<(String, ConstCol, String)>,
 }
 
+/// `COPY <table> FROM STDIN`.
+///
+/// Only the text format and only STDIN. `COPY ... TO STDOUT` needs to push
+/// `CopyData` messages back through the connection sink, which pgwire's simple
+/// query handler does not expose; refusing is honest until that hook exists.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopyFrom {
+    pub table: String,
+    /// Target columns in order; empty means every column in declared order.
+    pub columns: Vec<String>,
+}
+
 /// `DROP TABLE a, b` / `DROP TABLE IF EXISTS a`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropTable {
@@ -317,6 +331,7 @@ pub fn plan_with_params(
         N::InsertStmt(i) => plan_insert(&i, lookup, params),
         N::SelectStmt(s) => plan_select(&s, lookup, params),
         N::DropStmt(d) => plan_drop(&d),
+        N::CopyStmt(c) => plan_copy(&c, lookup),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
         N::VariableSetStmt(v) => plan_set(&v),
         N::TransactionStmt(t) => {
@@ -1215,6 +1230,64 @@ fn guc_function(
         })),
         _ => Ok(None),
     }
+}
+
+fn plan_copy(
+    c: &pg_query::protobuf::CopyStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<Statement> {
+    if !c.is_from {
+        return Err(Error::Unsupported("COPY ... TO".into()));
+    }
+    if c.filename.is_empty() {
+        // Empty filename means STDIN, which is the only source supported.
+    } else {
+        return Err(Error::Unsupported("COPY from a server-side file".into()));
+    }
+    // Only the default text format. A binary or CSV COPY parses differently,
+    // and guessing would corrupt the data rather than fail.
+    for opt in &c.options {
+        if let Some(N::DefElem(d)) = opt.node.as_ref() {
+            let name = d.defname.to_ascii_lowercase();
+            let value = d
+                .arg
+                .as_ref()
+                .and_then(|a| a.node.as_ref())
+                .and_then(|n| match n {
+                    N::String(s) => Some(s.sval.to_ascii_lowercase()),
+                    _ => None,
+                });
+            match (name.as_str(), value.as_deref()) {
+                ("format", Some("text")) => {}
+                ("format", other) => {
+                    return Err(Error::Unsupported(format!(
+                        "COPY ... FORMAT {}",
+                        other.unwrap_or("?")
+                    )))
+                }
+                (other, _) => return Err(Error::Unsupported(format!("COPY option {other}"))),
+            }
+        }
+    }
+    let table = c
+        .relation
+        .as_ref()
+        .map(|r| r.relname.clone())
+        .ok_or_else(|| Error::Unsupported("COPY without a table".into()))?;
+    let def = lookup(&table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
+
+    let mut columns = Vec::new();
+    for a in &c.attlist {
+        let name = match a.node.as_ref() {
+            Some(N::String(s)) => s.sval.clone(),
+            _ => return Err(Error::Unsupported("this COPY column list".into())),
+        };
+        if def.column(&name).is_none() {
+            return Err(Error::UndefinedColumn(name));
+        }
+        columns.push(name);
+    }
+    Ok(Statement::CopyFrom(CopyFrom { table, columns }))
 }
 
 fn plan_set(v: &pg_query::protobuf::VariableSetStmt) -> Result<Statement> {
