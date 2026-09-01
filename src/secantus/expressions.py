@@ -3277,7 +3277,12 @@ def _render_date_format(d: _dt.datetime, fmt: str) -> str:
         # is 0-Monday through 6-Sunday.
         "w": str(((d.weekday() + 1) % 7) + 1),
         "u": str(d.isoweekday()),
-        "U": f"{int(d.strftime('%U')):02d}",
+        # glibc's `(tm_yday + 7 - tm_wday) / 7`, computed rather than delegated:
+        # `strftime("%U")` is the platform's libc, and this format has to answer
+        # the same on every platform SecantusDB runs on. The Rust engine
+        # computes it, so delegating here also put a libc between two engines
+        # the parity suite pins to each other.
+        "U": f"{(d.timetuple().tm_yday - 1 + 7 - (d.weekday() + 1) % 7) // 7:02d}",
         "G": f"{iso_year:04d}",
         "V": f"{iso_week:02d}",
         "b": _MONTH_ABBR[d.month - 1],
