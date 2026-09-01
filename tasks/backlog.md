@@ -6924,17 +6924,46 @@ shared storage engine or building large new protocol subsystems:
          array_agg argument" for a `min()` call and now says "unsupported
          aggregate argument".
 
-      3. **`cume_dist()` / `percent_rank()` are `0A000`** — "window function
-         CumeDist is not supported". Every other window function measured
-         (`row_number` / `rank` / `lag` / `lead` / `sum OVER` / `ntile` /
-         `first_value` / `last_value`) matches PG.
+      3. ~~**`cume_dist()` / `percent_rank()` are `0A000`**~~ — **FIXED
+         2026-09-01** (`window._dist_values`). Both are rank-like and so
+         frame-insensitive. The part that matters is that they are
+         **peer-aware** — tied rows share a value, which is what makes them
+         different from `row_number() / n`, and a test over distinct values
+         alone would pass with the naive formula. Six shapes match PG 14.13
+         including ties, partitions, a single-row partition (the `rows - 1`
+         denominator) and an empty OVER ().
 
-      4. **`avg()` / `stddev()` / `variance()` lose PG's numeric SCALE.**
-         `avg(n)` over integers is `4.0000000000000000` (scale 16) in PG and
-         `4` here; `stddev` comes back as a FLOAT where PG returns numeric, and
-         `variance` as `2.0000000000000004` where PG gives exactly
-         `2.0000000000000000` — a float-precision artifact of computing in
-         binary floating point rather than decimal.
+      4. **OPEN — `avg()` / `stddev()` / `variance()` lose PG's numeric SCALE**,
+         and the DIAGNOSIS is now sharp enough to act on (re-probed
+         2026-09-01):
+
+         **`avg` should be `sum / count` through `typemap.numeric_div`, which
+         already matches PG exactly.** The scale is not a fixed 16 — it is
+         PG's numeric-DIVISION scale, and it varies with magnitude:
+
+             8::numeric/2   pg 4.0000000000000000     us IDENTICAL
+             1::numeric/3   pg 0.33333333333333333333 us IDENTICAL
+             avg(int) 8,3   pg 4.0000000000000000     us 4
+             avg(int) 1/3   pg 0.33333333333333333333 us (unscaled)
+
+         So numeric division is already right and `avg` is the outlier: it
+         goes through Mongo's `$avg`, which returns an unscaled Decimal128.
+         Routing it through the existing helper would close it. The obstacle is
+         mechanical, not conceptual — `$avg` yields ONE value, so computing
+         sum/count needs either two accumulators plus a post-aggregate that
+         reads both, or a `$push` of the values (the `bit_and` precedent, but
+         O(n) memory per group). Four `post_aggregates.append` sites would need
+         the change.
+
+         **`stddev` / `variance` need decimal arithmetic, not just scale.**
+         `variance` is computed as `float(stdDevSamp) ** 2`
+         (`executor._stat_bit_value`), so `[5,3]` gives `2.0000000000000004`
+         where PG gives exactly `2.0000000000000000`; `stddev(int)` is
+         `1.4142135623730951` against PG's `1.4142135623730950`, because PG
+         computes sqrt in numeric at higher precision and rounds to the target
+         scale. `stddev` is also tagged `float8` where PG returns NUMERIC for
+         an exact-typed input. Fixing the tag without the value would make it
+         worse, so these move together.
 
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
   **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,

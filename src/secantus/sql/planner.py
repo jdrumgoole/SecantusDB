@@ -11416,7 +11416,7 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         func = node.this
         if isinstance(func, (exp.RowNumber, exp.Rank, exp.DenseRank, exp.Count, exp.Ntile)):
             return "int8"
-        if isinstance(func, exp.Avg):
+        if isinstance(func, (exp.Avg, exp.CumeDist, exp.PercentRank)):
             return "float8"
         value_funcs = (
             exp.Sum,
