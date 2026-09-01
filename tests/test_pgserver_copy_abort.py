@@ -24,8 +24,13 @@ from secantus.storage import Storage
 
 psycopg = pytest.importorskip("psycopg")
 
-#: Enough rows that the server is still streaming when the client gives up.
-_ROWS = 200_000
+#: What decides whether the server is still streaming is BYTES on the socket,
+#: not row count — so this uses few, WIDE rows. 2,000 x ~4 KB is ~8 MB, far
+#: past any socket buffer, and seeds in a fraction of the time 200k narrow
+#: rows took. (The first cut used 200k narrow rows and blew the 25-minute hang
+#: watchdog on CI's durable lane, where every insert is fully journalled.)
+_WIDE_ROWS = 2_000
+_WIDTH = 4_000
 
 
 @pytest.fixture()
@@ -45,15 +50,20 @@ def _connect(srv):
     return psycopg.connect(host=host, port=port, dbname="db", user="joe")
 
 
-def _seed(cur, rows):
-    cur.execute("CREATE TABLE cp (id int)")
-    cur.executemany("INSERT INTO cp (id) VALUES (%s)", [(i,) for i in range(rows)])
+def _seed(cur, rows, width=1):
+    """Seed with a single set-returning INSERT — `executemany` of this many
+    rows is what made the durable CI lane time out."""
+    cur.execute("CREATE TABLE cp (id int, pad text)")
+    cur.execute(
+        "INSERT INTO cp (id, pad) SELECT g, repeat('x', %s) FROM generate_series(1, %s) g",
+        (width, rows),
+    )
 
 
 def test_abandoning_a_large_copy_out_aborts_the_block(server):
     with _connect(server) as conn:
         cur = conn.cursor()
-        _seed(cur, _ROWS)
+        _seed(cur, _WIDE_ROWS, _WIDTH)
         conn.commit()
         with pytest.raises(ZeroDivisionError), cur.copy("COPY cp TO STDOUT") as copy:
             next(iter(copy))
@@ -91,7 +101,7 @@ _COPY_FORMATS = [("", 0), (" (FORMAT csv)", 0), (" (FORMAT binary)", 1)]
 def test_a_completed_copy_out_still_returns_every_row(server, fmt, extra):
     """Chunked flushing must not drop or duplicate rows in any format — the
     row count has to survive being split across several ``sendall`` calls."""
-    rows = 5000
+    rows = 2000
     with _connect(server) as conn:
         cur = conn.cursor()
         _seed(cur, rows)
