@@ -13,9 +13,11 @@ Needs BOTH:
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import time
 from collections.abc import Iterator
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -331,6 +333,12 @@ QUERIES = [
     "SELECT 1.5::int8, 1.5::int2",
     # A decimal literal is `numeric`, so these cast FROM numeric, not float.
     "SELECT 1.5::float8, 1.5::float4",
+    # --- a timestamp CONSTANT reaches the wire by a different route than a
+    # stored one, and used to come back NULL --------------------------------
+    "SELECT '2026-01-01 12:00'::timestamp",
+    "SELECT '2026-01-01 12:00:00.123456'::timestamp",
+    "SELECT '1969-07-20 20:17:40'::timestamp",
+    "SELECT '2026-01-01 12:00'::timestamp::text",
 ]
 
 # (statement, verification query) — the write is compared by its row count AND
@@ -447,6 +455,18 @@ PARAMETERISED = [
     ("SELECT count(*) FROM d WHERE n > %s", (99,)),
     ("SELECT sum(n) FROM d WHERE n > %s", (99,)),
     ("SELECT s, count(*) FROM d GROUP BY s ORDER BY s", ()),
+    # Bound values of every type this server decodes, which psycopg sends in
+    # BINARY by default — a format decoded by entirely separate code.
+    ("SELECT %s::numeric", (Decimal("1.50"),)),
+    ("SELECT %s::numeric", (Decimal("-12345.6789"),)),
+    ("SELECT %s::date", (dt.date(2026, 9, 2),)),
+    ("SELECT %s::time", (dt.time(23, 59, 59, 123456),)),
+    ("SELECT %s::timestamp", (dt.datetime(2026, 9, 2, 12, 34, 56),)),
+    ("SELECT %s::timestamp", (dt.datetime(1969, 7, 20, 20, 17, 40),)),
+    ("SELECT %s::int4[]", ([1, 2, 3],)),
+    ("SELECT %s::int4[]", ([1, None, 3],)),
+    ("SELECT %s::text[]", (["a", "b"],)),
+    ("SELECT %s::int8[]", ([10**12, 2],)),
     # A bound NULL must behave exactly like a literal one.
     ("SELECT id FROM d WHERE n = %s", (None,)),
     ("SELECT id FROM d WHERE n <> %s", (None,)),

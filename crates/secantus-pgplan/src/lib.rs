@@ -1331,6 +1331,65 @@ fn parse_timestamp(text: &str) -> Result<i64> {
 }
 
 /// Render stored microseconds as PostgreSQL renders a timestamp.
+/// Days since 2000-01-01 as PostgreSQL's `date` text.
+///
+/// PostgreSQL's binary `date` is a day count from 2000-01-01, not from the Unix
+/// epoch. Rendering it back to canonical text lets a binary parameter take the
+/// exact same path through the planner as a text one.
+pub fn render_date_from_pg_days(days: i32) -> String {
+    // 2000-01-01 is 10957 days after 1970-01-01.
+    let unix_days = i64::from(days) + 10_957;
+    render_timestamp(unix_days * 86_400 * 1_000_000)
+        .split(' ')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Microseconds since midnight as PostgreSQL's `time` text.
+pub fn render_time_from_micros(micros: i64) -> String {
+    let total_us = micros.rem_euclid(86_400 * 1_000_000);
+    let us = total_us % 1_000_000;
+    let secs = total_us / 1_000_000;
+    let (h, m, sec) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if us == 0 {
+        format!("{h:02}:{m:02}:{sec:02}")
+    } else {
+        format!("{h:02}:{m:02}:{sec:02}.{:06}", us)
+            .trim_end_matches('0')
+            .to_string()
+    }
+}
+
+/// Microseconds since 2000-01-01 as PostgreSQL's `timestamp` text.
+pub fn render_timestamp_from_pg_micros(micros: i64) -> String {
+    // 2000-01-01T00:00:00Z is 946684800 seconds after the Unix epoch.
+    render_timestamp(micros + 946_684_800 * 1_000_000)
+}
+
+/// A timestamp VALUE as PostgreSQL's text, whether it arrived as a BSON date
+/// or as the composite that carries sub-millisecond digits.
+///
+/// A stored timestamp is reassembled from its column plus a hidden companion
+/// field, which the row path already did. A timestamp that is a CONSTANT never
+/// touches a row, so it reached the wire as a composite document that the
+/// encoder had no arm for — and `select '2026-01-01 12:00'::timestamp`
+/// answered NULL while the same value through a column answered correctly.
+pub fn timestamp_value_text(v: &Bson) -> Option<String> {
+    match v {
+        Bson::DateTime(d) => Some(render_timestamp(d.timestamp_millis() * 1000)),
+        Bson::Document(doc) if doc.contains_key(COMPOSITE_DATE) => {
+            let ms = match doc.get(COMPOSITE_DATE) {
+                Some(Bson::DateTime(d)) => d.timestamp_millis(),
+                _ => return None,
+            };
+            let us = doc.get(COMPOSITE_US).and_then(|v| v.as_i32()).unwrap_or(0);
+            Some(render_timestamp(ms * 1000 + i64::from(us)))
+        }
+        _ => None,
+    }
+}
+
 pub fn render_timestamp(micros: i64) -> String {
     let dt = chrono::DateTime::from_timestamp_micros(micros)
         .map(|d| d.naive_utc())
@@ -1360,7 +1419,7 @@ pub fn render_timestamp(micros: i64) -> String {
 /// precision. A value that will not fit is REFUSED rather than silently
 /// rounded -- the same line drawn everywhere else here, because a quietly
 /// rounded number is a wrong answer while an error is merely a missing feature.
-fn parse_numeric(text: &str) -> Result<Decimal128> {
+pub fn parse_numeric(text: &str) -> Result<Decimal128> {
     let t = text.trim();
     Decimal128::from_str(t).map_err(|_| {
         // Distinguish "too big for us" from "not a number at all": the first is

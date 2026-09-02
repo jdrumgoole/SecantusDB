@@ -805,3 +805,80 @@ def test_pg_typeof_reports_the_display_type(home: Path) -> None:
         ]:
             cur.execute(f"select pg_typeof({expr})::text")
             assert cur.fetchone()[0] == want, expr
+
+
+# (declared type, value). Each is bound over BOTH wire formats: psycopg picks
+# binary for most of these by default, and the two paths decode independently,
+# so a type can be right in one and wrong in the other.
+_BOUND_VALUES = [
+    ("numeric", Decimal("1.50")),
+    ("numeric", Decimal("0.1")),
+    ("numeric", Decimal("-12345.6789")),
+    ("numeric", Decimal("0")),
+    ("numeric", Decimal("12345678901234567890.123")),
+    ("date", dt.date(2026, 9, 2)),
+    ("date", dt.date(1970, 1, 1)),
+    ("date", dt.date(1999, 12, 31)),
+    ("time", dt.time(12, 34, 56)),
+    ("time", dt.time(0, 0, 0)),
+    ("time", dt.time(23, 59, 59, 123456)),
+    ("timestamp", dt.datetime(2026, 9, 2, 12, 34, 56)),
+    ("timestamp", dt.datetime(1969, 7, 20, 20, 17, 40)),
+    ("timestamp", dt.datetime(2026, 1, 1, 0, 0, 0, 123456)),
+    ("int4[]", [1, 2, 3]),
+    ("int4[]", []),
+    ("int4[]", [1, None, 3]),
+    ("text[]", ["a", "b"]),
+    ("text[]", ["a", None]),
+    ("int8[]", [10**12, 2]),
+    ("float8[]", [1.5, 2.5]),
+]
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+@pytest.mark.parametrize("typename,value", _BOUND_VALUES, ids=lambda v: str(v)[:26])
+def test_bound_parameter_round_trips_in_both_formats(
+    home: Path, typename: str, value: object, binary: bool
+) -> None:
+    """A bound parameter must survive both wire formats unchanged.
+
+    psycopg sends most of these in BINARY by default, and the two formats are
+    decoded by separate code, so a type can be right in one and wrong in the
+    other — which is exactly what happened: every one of these was refused in
+    binary, and `numeric` in *text* was being parsed as a float, so a client
+    binding `Decimal("1.50")` got a float that had already lost the scale that
+    distinguishes it from `1.5`.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor(binary=binary)
+        cur.execute(f"select %s::{typename}", (value,))
+        assert cur.fetchone()[0] == value
+
+
+def test_timestamp_constants_are_not_null(home: Path) -> None:
+    """`select '...'::timestamp` must answer the timestamp, not NULL.
+
+    A stored timestamp is reassembled from its column plus a hidden companion
+    field carrying sub-millisecond digits. A timestamp CONSTANT never passes
+    through a row, so it reached the encoder as that composite with no arm to
+    match it and came out as NULL — while the same value read from a column, or
+    cast to text, was correct. A wrong answer that only appears in one of three
+    paths to the same value.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("select '2026-01-01 12:00'::timestamp")
+        assert cur.fetchone()[0] == dt.datetime(2026, 1, 1, 12, 0)
+        assert cur.description[0].type_code == 1114
+
+        # Sub-millisecond digits survive the same path.
+        cur.execute("select '2026-01-01 12:00:00.123456'::timestamp")
+        assert cur.fetchone()[0] == dt.datetime(2026, 1, 1, 12, 0, 0, 123456)
+
+        # The other two routes to the same value still agree.
+        cur.execute("select '2026-01-01 12:00'::timestamp::text")
+        assert cur.fetchone()[0] == "2026-01-01 12:00:00"
+        cur.execute("create table ts (id int primary key, t timestamp)")
+        cur.execute("insert into ts values (1, '2026-01-01 12:00')")
+        cur.execute("select t from ts where id = 1")
+        assert cur.fetchone()[0] == dt.datetime(2026, 1, 1, 12, 0)

@@ -511,7 +511,47 @@ debug formatting: `DROP of Ok(ObjectType) is not supported yet`), `interval`
 126, COPY binary 119, `timestamptz` 99, cursors 73, `CREATE SCHEMA` 71,
 `json`/`jsonb` 68 each, binary-format parameters 54.
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043.**
+### 0.20 binary-format parameters (2026-09-02)
+
+**~1040 -> 1215, the largest single jump so far, and stable across two runs.**
+
+**Clients do not send parameters as text.** psycopg sends numbers, dates,
+timestamps and arrays in the BINARY format by default and falls back to text
+only where it must. This server decoded int / float / bool / text that way and
+refused everything else — so binding a `Decimal`, a `date`, a `datetime` or a
+list failed while the identical value written as a SQL literal worked. That one
+mechanism was blocking 242 tests spread across `test_numeric`, `test_datetime`
+and `test_json`, which is why it beat every per-type item on the board.
+
+**Decode to canonical TEXT, then reuse the text path.** Every new decoder
+(`numeric` 1700, `date` 1082, `time` 1083, `timestamp` 1114, and all the array
+oids through the ELEMENT's own decoder) produces the same string a literal
+would have. The alternative — a parallel set of binary-specific conversions —
+is precisely how two formats drift into disagreeing about one value.
+
+**Two bugs found while building it, neither visible on the gauge:**
+
+* A `numeric` parameter sent as TEXT was parsed with `parse::<f64>()`. A client
+  binding `Decimal("1.50")` got a float that had already lost the exactness and
+  the scale that make it a different value from `1.5`. The binary work is what
+  made anyone look at the text arm.
+* `SELECT '2026-01-01 12:00'::timestamp` answered **NULL**. A stored timestamp
+  is reassembled from its column plus a hidden sub-millisecond companion; a
+  CONSTANT never passes through a row, so it reached the encoder as that
+  composite with no arm to match. The same value via a column, or cast to text,
+  was correct — three routes to one value and only the least-used one empty.
+
+**The probe was 21 values x 2 formats compared against PG 14, and went from 6
+divergences to 0.** Building the probe as a matrix over both formats is what
+caught the text-format numeric bug; a binary-only probe would have passed.
+
+**Next, re-ranked at 1215:** `DROP <non-table>` 207 — but that is really
+user-defined types (`test_enum.py` 197, `test_composite.py` 48), which needs
+`CREATE TYPE` plus `pg_catalog` queries, so it is a campaign rather than a
+slice. Cheaper: `interval` 126, COPY binary 119, `timestamptz` 99, `CREATE
+SCHEMA` 71, cursors 70, `json`/`jsonb` 68 each, `chr` 47, `generate_series` 43.
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215.**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

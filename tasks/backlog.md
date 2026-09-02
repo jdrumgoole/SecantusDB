@@ -4199,6 +4199,13 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `$lookup` missing only its `as`. The corpus now carries a `NEARLY_VALID` list
   of spec-is-fine-except-for-one-thing shapes (740 total).
 
+- **Rust PG server: `json` / `jsonb`, `interval`, `timestamptz`, `timetz` and
+  `oid` casts are unsupported**, and binary parameters of those oids with them
+  (the binary decoder covers `numeric` / `date` / `time` / `timestamp` / arrays;
+  a type it does not have cannot be decoded into one).
+- **Rust PG server: a multidimensional array sent as a BINARY parameter is
+  refused (`0A000`)**, matching the refusal when returning one. Both lift
+  together when array wire encoding grows a second dimension.
 - **Rust PG server: `DROP` of anything but a table leaks Rust debug
   formatting into the client-facing message** — `DROP of Ok(ObjectType) is not
   supported yet`. Whatever the eventual support, the MESSAGE is a bug on its
