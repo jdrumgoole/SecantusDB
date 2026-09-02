@@ -33,9 +33,8 @@ use pgwire::messages::response::CommandComplete;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use secantus_pgcatalog::{TableDef, CATALOG_COLLECTION};
 use secantus_pgplan::{
-    companion_field, plan_with_params, render_array_element_text, render_timestamp, AggFunc,
-    AggItem, ConstCol, Error as PlanError, Nulls, OrderKey, OutputCol, Statement,
-    TransactionControl,
+    companion_field, render_array_element_text, render_timestamp, AggFunc, AggItem, ConstCol,
+    Error as PlanError, Nulls, OrderKey, OutputCol, Statement, TransactionControl,
 };
 use secantus_storage::{Storage, UserTransactionHandle};
 
@@ -222,6 +221,10 @@ fn wire_type(pg_type: &str) -> Type {
         "date" => Type::DATE,
         "time" => Type::TIME,
         "timestamp" => Type::TIMESTAMP,
+        // Their own oids: a client reading 1184 builds an aware datetime,
+        // where 1114 builds a naive one from the same characters.
+        "timestamptz" => Type::TIMESTAMPTZ,
+        "timetz" => Type::TIMETZ,
         "numeric" | "decimal" => Type::NUMERIC,
         // `pg_typeof` answers a `regtype` (2206), not text: a client reading
         // 25 would print the same characters but compare unequal to a regtype.
@@ -325,6 +328,15 @@ impl PgHandler {
         Ok(out)
     }
 
+    /// The session's `TimeZone` GUC, resolved.
+    fn session_timezone(&self) -> secantus_pgplan::TimeZoneSetting {
+        let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        settings
+            .get("TimeZone")
+            .map(|v| secantus_pgplan::TimeZoneSetting::parse(v))
+            .unwrap_or_default()
+    }
+
     fn begin_implicit(&self) -> PgWireResult<()> {
         let handle = self
             .storage
@@ -366,7 +378,16 @@ impl PgHandler {
             return Ok(vec![Response::EmptyQuery]);
         }
 
-        let stmt = plan_with_params(sql, &|n| self.lookup(n), params).map_err(|e| Self::err(&e))?;
+        // The session's TimeZone is part of what a statement MEANS: the same
+        // `'2026-01-01 12:00'::timestamptz` names a different instant under a
+        // different zone, so it is passed in rather than defaulted.
+        let stmt = secantus_pgplan::plan_with_session(
+            sql,
+            &|n| self.lookup(n),
+            params,
+            &self.session_timezone(),
+        )
+        .map_err(|e| Self::err(&e))?;
 
         // Transaction control is session state, not a storage operation.
         if let Statement::Transaction(control) = stmt {
@@ -1335,7 +1356,7 @@ fn binary_numeric_text(bytes: &[u8]) -> Option<String> {
 /// Wire shape: `ndim`, `has_null`, `element oid`, then per dimension a length
 /// and a lower bound, then each element as a 4-byte length (-1 for NULL)
 /// followed by that many bytes in the ELEMENT's binary format.
-fn binary_array(bytes: &[u8]) -> PgWireResult<Bson> {
+fn binary_array(bytes: &[u8], tz: &secantus_pgplan::TimeZoneSetting) -> PgWireResult<Bson> {
     if bytes.len() < 12 {
         return Err(unsupported_binary_oid(None));
     }
@@ -1373,7 +1394,7 @@ fn binary_array(bytes: &[u8]) -> PgWireResult<Bson> {
         }
         let elem = Bytes::copy_from_slice(&bytes[pos..end]);
         let ty = Type::from_oid(elem_oid);
-        items.push(decode_parameter(Some(&elem), ty.as_ref(), true)?);
+        items.push(decode_parameter(Some(&elem), ty.as_ref(), true, tz)?);
         pos = end;
     }
     Ok(Bson::Array(items))
@@ -1392,7 +1413,12 @@ fn unsupported_binary_oid(oid: Option<u32>) -> PgWireError {
 /// `None` is SQL NULL. A client may declare a parameter's type as oid 0
 /// ("unspecified") and leave the server to infer it, which is why the text path
 /// falls back to sniffing the literal rather than assuming `text`.
-fn decode_parameter(raw: Option<&Bytes>, ty: Option<&Type>, binary: bool) -> PgWireResult<Bson> {
+fn decode_parameter(
+    raw: Option<&Bytes>,
+    ty: Option<&Type>,
+    binary: bool,
+    tz: &secantus_pgplan::TimeZoneSetting,
+) -> PgWireResult<Bson> {
     let Some(bytes) = raw else {
         return Ok(Bson::Null);
     };
@@ -1439,6 +1465,23 @@ fn decode_parameter(raw: Option<&Bytes>, ty: Option<&Type>, binary: bool) -> PgW
                     i64::from_be_bytes(bytes[..8].try_into().expect("checked")),
                 )))
             }
+            // An instant on the wire, rendered into the session's zone -- the
+            // same value a `::timestamptz` literal would have produced.
+            Some(1184) if bytes.len() == 8 => {
+                let pg_micros = i64::from_be_bytes(bytes[..8].try_into().expect("checked"));
+                let micros = pg_micros + 946_684_800 * 1_000_000;
+                Ok(Bson::String(secantus_pgplan::render_timestamptz(
+                    micros, tz,
+                )))
+            }
+            // `timetz` is 8 bytes of microseconds since midnight plus a 4-byte
+            // offset in SECONDS WEST of UTC -- the opposite sign to the one the
+            // text form prints, which is why this negates.
+            Some(1266) if bytes.len() == 12 => {
+                let us = i64::from_be_bytes(bytes[..8].try_into().expect("checked"));
+                let west = i32::from_be_bytes(bytes[8..12].try_into().expect("checked"));
+                Ok(Bson::String(secantus_pgplan::render_timetz(us, -west)))
+            }
             Some(1114) if bytes.len() == 8 => Ok(Bson::String(
                 secantus_pgplan::render_timestamp_from_pg_micros(i64::from_be_bytes(
                     bytes[..8].try_into().expect("checked"),
@@ -1447,7 +1490,9 @@ fn decode_parameter(raw: Option<&Bytes>, ty: Option<&Type>, binary: bool) -> PgW
             // Every array oid this server knows, decoded through the element's
             // own binary decoder rather than a per-type array reader.
             Some(1000) | Some(1005) | Some(1007) | Some(1009) | Some(1015) | Some(1016)
-            | Some(1021) | Some(1022) | Some(1231) | Some(1182) | Some(1115) => binary_array(bytes),
+            | Some(1021) | Some(1022) | Some(1231) | Some(1182) | Some(1115) => {
+                binary_array(bytes, tz)
+            }
             other => Err(unsupported_binary_oid(other)),
         };
     }
@@ -1526,6 +1571,7 @@ impl PgHandler {
                     raw.as_ref(),
                     declared.get(i).and_then(|t| t.as_ref()),
                     binary,
+                    &self.session_timezone(),
                 )
             })
             .collect()
@@ -1537,8 +1583,13 @@ impl PgHandler {
     /// no values exist yet, and the result SHAPE does not depend on them.
     fn describe_fields(&self, sql: &str, n_params: usize) -> PgWireResult<Vec<FieldInfo>> {
         let params = vec![Bson::Null; n_params];
-        let stmt =
-            plan_with_params(sql, &|n| self.lookup(n), &params).map_err(|e| Self::err(&e))?;
+        let stmt = secantus_pgplan::plan_with_session(
+            sql,
+            &|n| self.lookup(n),
+            &params,
+            &self.session_timezone(),
+        )
+        .map_err(|e| Self::err(&e))?;
         Ok(match stmt {
             Statement::Select(sel) => {
                 let def = self

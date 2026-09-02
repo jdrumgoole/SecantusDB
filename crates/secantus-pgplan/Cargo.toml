@@ -8,5 +8,11 @@ license = "Apache-2.0"
 [dependencies]
 bson = "2"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+# The IANA tz database, for `timestamptz`: PostgreSQL interprets a zone-less
+# literal in the session TimeZone and renders every timestamptz in it, so a
+# named zone like `Europe/Rome` has to resolve to a real offset (with its DST
+# rule) rather than to a guess. Already used by `secantus-core` for the same
+# reason on the MongoDB side.
+chrono-tz = { version = "0.10", default-features = false }
 pg_query = "6"
 secantus-pgcatalog = { path = "../secantus-pgcatalog" }

@@ -1528,6 +1528,7 @@ version = "0.1.0-beta.0"
 dependencies = [
  "bson",
  "chrono",
+ "chrono-tz",
  "pg_query",
  "secantus-pgcatalog",
 ]

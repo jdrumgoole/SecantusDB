@@ -4199,8 +4199,21 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `$lookup` missing only its `as`. The corpus now carries a `NEARLY_VALID` list
   of spec-is-fine-except-for-one-thing shapes (740 total).
 
-- **Rust PG server: `json` / `jsonb`, `interval`, `timestamptz`, `timetz` and
-  `oid` casts are unsupported**, and binary parameters of those oids with them
+- **Rust PG server: a `timestamptz` / `timetz` COLUMN is refused (`0A000`)**,
+  though the types work as casts, literals and bound parameters. They are stored
+  as canonical TEXT (as `date` and `time` already are), and a timestamptz renders
+  in the SESSION zone — so the stored text is right only for the session that
+  wrote it. This was found as a WRONG ANSWER, not designed as a refusal: a row
+  written under UTC read back as `12:00:00+00` under `Europe/Rome`, where
+  PostgreSQL answers `13:00:00+01` — the right instant printed in the wrong zone,
+  undetectable by any client. Refusing cost zero gauge tests. Needs an
+  instant-valued stored form, plus a read path that knows the column's declared
+  type, before columns can be allowed.
+- **Rust PG server: `'infinity'` / `'-infinity'` timestamps and dates (60
+  psycopg tests), BC-era dates (30), and `'epoch'` (6) do not parse.** These
+  need sentinel values that survive the whole pipeline rather than a parse fix.
+- **Rust PG server: `json` / `jsonb`, `interval` and `oid` casts are
+  unsupported**, and binary parameters of those oids with them
   (the binary decoder covers `numeric` / `date` / `time` / `timestamp` / arrays;
   a type it does not have cannot be decoded into one).
 - **Rust PG server: a multidimensional array sent as a BINARY parameter is

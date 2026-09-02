@@ -1009,3 +1009,92 @@ fn pg_typeof_reports_display_names() {
         }
     }
 }
+
+/// `SET TimeZone` uses the POSIX sign, which is the REVERSE of the sign in a
+/// timestamp literal: `SET TimeZone TO '+02:00'` means two hours WEST of
+/// Greenwich and renders as `-02`, while `'12:00+02'` is two hours EAST.
+///
+/// Probed against PostgreSQL 14. Getting this backwards is invisible in UTC
+/// and wrong by four hours everywhere else.
+#[test]
+fn set_timezone_uses_the_posix_sign() {
+    let east = |secs: i32| chrono::FixedOffset::east_opt(secs).unwrap();
+    for (value, want) in [
+        ("+02:00", east(-2 * 3600)),
+        ("-02:00", east(2 * 3600)),
+        ("+05:30", east(-(5 * 3600 + 30 * 60))),
+        ("2", east(-2 * 3600)),
+    ] {
+        match TimeZoneSetting::parse(value) {
+            TimeZoneSetting::Fixed(off) => assert_eq!(off, want, "for {value}"),
+            other => panic!("{value} should be a fixed offset, got {other:?}"),
+        }
+    }
+    assert_eq!(TimeZoneSetting::parse("UTC"), TimeZoneSetting::Utc);
+    assert_eq!(TimeZoneSetting::parse("gmt"), TimeZoneSetting::Utc);
+    assert!(matches!(
+        TimeZoneSetting::parse("Europe/Rome"),
+        TimeZoneSetting::Named(_)
+    ));
+    // An unknown name falls back to UTC rather than failing: the setting is
+    // applied when it is SET, and refusing a later query would be worse.
+    assert_eq!(TimeZoneSetting::parse("Mars/Olympus"), TimeZoneSetting::Utc);
+}
+
+/// A named zone carries a DST rule, so the SAME wall-clock reading resolves to
+/// different offsets in January and July. A fixed offset does not.
+#[test]
+fn a_named_zone_changes_offset_across_dst() {
+    let rome = TimeZoneSetting::parse("Europe/Rome");
+    let jan = "2026-01-01 12:00";
+    let jul = "2026-07-01 12:00";
+    let of = |t: &str, tz: &TimeZoneSetting| {
+        let micros = super::parse_timestamptz(t, tz).expect("parses");
+        super::render_timestamptz(micros, tz)
+    };
+    assert_eq!(of(jan, &rome), "2026-01-01 12:00:00+01");
+    assert_eq!(of(jul, &rome), "2026-07-01 12:00:00+02");
+
+    let fixed = TimeZoneSetting::parse("-02:00"); // POSIX: two hours EAST
+    assert_eq!(of(jan, &fixed), "2026-01-01 12:00:00+02");
+    assert_eq!(of(jul, &fixed), "2026-07-01 12:00:00+02");
+}
+
+/// An offset can carry MINUTES and SECONDS, and both must survive the round
+/// trip. A comment here once claimed no zone in use carried seconds; psycopg's
+/// own corpus contains `+01:02:03`.
+#[test]
+fn offsets_keep_their_minutes_and_seconds() {
+    let utc = TimeZoneSetting::Utc;
+    for (literal, want) in [
+        ("2000-01-01 00:00+01:02:03", "1999-12-31 22:57:57+00"),
+        ("2026-01-01 12:00+02", "2026-01-01 10:00:00+00"),
+        ("2026-01-01 12:00+05:30", "2026-01-01 06:30:00+00"),
+        ("2026-01-01 12:00Z", "2026-01-01 12:00:00+00"),
+        ("2026-01-01 12:00-02", "2026-01-01 14:00:00+00"),
+    ] {
+        let micros = super::parse_timestamptz(literal, &utc).expect("parses");
+        assert_eq!(
+            super::render_timestamptz(micros, &utc),
+            want,
+            "for {literal}"
+        );
+    }
+}
+
+/// A `-` inside a DATE must not be mistaken for the start of an offset.
+#[test]
+fn a_dates_hyphen_is_not_an_offset() {
+    let utc = TimeZoneSetting::Utc;
+    let micros = super::parse_timestamptz("2026-01-01 12:00", &utc).expect("parses");
+    assert_eq!(
+        super::render_timestamptz(micros, &utc),
+        "2026-01-01 12:00:00+00"
+    );
+    // A bare date has no time at all, so nothing that follows can be an offset.
+    let micros = super::parse_timestamptz("2026-01-01", &utc).expect("parses");
+    assert_eq!(
+        super::render_timestamptz(micros, &utc),
+        "2026-01-01 00:00:00+00"
+    );
+}
