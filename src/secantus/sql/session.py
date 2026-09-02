@@ -729,6 +729,19 @@ class Session:
         for key, value in defaults.items():
             self.settings.setdefault(canonical_guc_name(key), value)
 
+    def has_setting(self, name: str) -> bool:
+        """Whether the GUC is one this server knows — set in the session, a
+        server GUC, or a documented default. `current_setting` needs to tell an
+        unknown parameter (42704, or NULL under `missing_ok`) from one that is
+        merely empty."""
+        key = canonical_guc_name(name)
+        return (
+            key in self.settings
+            or key in self.server_gucs
+            or key in GUC_DEFAULTS
+            or key in ("transaction_isolation", "transaction_read_only", "transaction_deferrable")
+        )
+
     def get_setting(self, name: str) -> str:
         key = canonical_guc_name(name)
         if key in self.settings:

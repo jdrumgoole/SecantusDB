@@ -1522,6 +1522,93 @@ def _eval_trunc(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     return math.trunc(v * factor) / factor
 
 
+def _split_qualified_ident(text: str) -> list[str]:
+    """`parse_ident('a.B')` → `['a','b']`, `parse_ident('"A".b')` → `['A','b']`."""
+    parts: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        while i < n and text[i] in " \t":
+            i += 1
+        if i < n and text[i] == '"':
+            i += 1
+            buf: list[str] = []
+            while i < n:
+                if text[i] == '"':
+                    if i + 1 < n and text[i + 1] == '"':
+                        buf.append('"')
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                buf.append(text[i])
+                i += 1
+            parts.append("".join(buf))
+        else:
+            start = i
+            while i < n and text[i] != ".":
+                i += 1
+            parts.append(text[start:i].strip().lower())
+        while i < n and text[i] in " \t":
+            i += 1
+        if i < n and text[i] == ".":
+            i += 1
+    return [p for p in parts if p != ""]
+
+
+def _unistr(text: str) -> str:
+    r"""`unistr` — Postgres' backslash unicode escapes: 4 hex digits, `+` and
+    6, `u` and 4, `U` and 8; a doubled backslash is a literal one."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != "\\":
+            out.append(text[i])
+            i += 1
+            continue
+        if i + 1 < n and text[i + 1] == "\\":
+            out.append("\\")
+            i += 2
+            continue
+        if i + 1 < n and text[i + 1] == "+":
+            out.append(chr(int(text[i + 2 : i + 8], 16)))
+            i += 8
+            continue
+        if i + 1 < n and text[i + 1] in "uU":
+            width = 4 if text[i + 1] == "u" else 8
+            out.append(chr(int(text[i + 2 : i + 2 + width], 16)))
+            i += 2 + width
+            continue
+        out.append(chr(int(text[i + 1 : i + 5], 16)))
+        i += 5
+    return "".join(out)
+
+
+def _eval_normalize(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """`normalize(text [, form])` — Unicode normalisation, NFC by default."""
+    import unicodedata
+
+    value = evaluate(node.this, scope, ctx)
+    if value is None:
+        return None
+    form_node = node.args.get("form")
+    form = str(form_node.this if hasattr(form_node, "this") else form_node or "NFC").upper()
+    if form not in ("NFC", "NFD", "NFKC", "NFKD"):
+        form = "NFC"
+    return unicodedata.normalize(form, _as_text(value))
+
+
+def _local_timestamp(ctx: ScalarContext | None) -> Any:
+    """`localtimestamp` — now in the SESSION's time zone, without the zone.
+
+    `datetime.now()` is the machine's local wall clock, which is a different
+    instant from the session's whenever the two zones differ: with the default
+    UTC session on a UTC+1 host, `localtimestamp <= now()` was FALSE."""
+    from secantus.sql.datetimes import session_tzinfo
+
+    tz = session_tzinfo(getattr(ctx, "session", None))
+    return _dt.datetime.now(tz).replace(tzinfo=None)
+
+
 def _session_version() -> str:
     """The `version()` banner — the same string the session-function path
     returns, so the two spellings cannot drift."""
@@ -2278,6 +2365,11 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
     # the generic dispatcher and reported `function current_version() is not
     # supported` — sqlglot's node name, not one the user wrote.
     exp.CurrentVersion: lambda n, s, c: _session_version(),
+    # `localtimestamp` works as a bare projection through the session-function
+    # path; nested in an expression it reached the generic dispatcher and
+    # reported `function localtimestamp() is not supported`.
+    exp.Localtimestamp: lambda n, s, c: _local_timestamp(c),
+    exp.Normalize: lambda n, s, c: _eval_normalize(n, s, c),
     # sqlglot renames `make_time` / `make_timestamp` to these typed nodes, so
     # they never reached the plain-builtin table and reported
     # `function time_from_parts() is not supported` — a name the user never
@@ -4089,6 +4181,8 @@ PLAIN_SCALAR_TAGS = {
     "regexp_split_to_array": "text[]",
     "string_to_array": "text[]",
     "array_positions": "int8[]",
+    "parse_ident": "text[]",
+    "unistr": "text",
     "make_date": "date",
     "make_time": "time",
     "make_timestamp": "timestamp",
@@ -4635,8 +4729,26 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
                     out.append("%")
                     i += 2
                     continue
+                # `%n$s` names its argument by POSITION, and may repeat one:
+                # `format('%1$s-%1$s-%2$s','a','b')` is `a-a-b`. Unrecognised,
+                # the whole directive was copied through as literal text, so
+                # the format string came back unformatted.
+                width = 2
+                explicit: int | None = None
+                j = i + 1
+                digits = ""
+                while j < len(fmt) and fmt[j].isdigit():
+                    digits += fmt[j]
+                    j += 1
+                if digits and j < len(fmt) and fmt[j] == "$" and j + 1 < len(fmt):
+                    explicit = int(digits)
+                    spec = fmt[j + 1]
+                    width = j + 2 - i
                 if spec in "sIL":
-                    val = rest.pop(0) if rest else None
+                    if explicit is not None:
+                        val = rest[explicit - 1] if 0 < explicit <= len(rest) else None
+                    else:
+                        val = rest.pop(0) if rest else None
                     if spec == "s":
                         out.append("" if val is None else _as_text(val))
                     elif spec == "I":
@@ -4646,7 +4758,7 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
                         out.append(
                             "NULL" if val is None else "'" + _as_text(val).replace("'", "''") + "'"
                         )
-                    i += 2
+                    i += width
                     continue
             out.append(c)
             i += 1
@@ -4673,6 +4785,17 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
             if ctx.catalog.get(db, probe) is not None:
                 return schema == rel_schema
         return False
+    if name == "parse_ident":
+        # Split a qualified identifier. An UNQUOTED part folds to lower case,
+        # a double-quoted one keeps its spelling — `parse_ident('"A".b')` is
+        # `{A,b}`.
+        if not args or args[0] is None:
+            return None
+        return _split_qualified_ident(str(args[0]))
+    if name == "unistr":
+        if not args or args[0] is None:
+            return None
+        return _unistr(str(args[0]))
     if name == "array_positions":
         # Every 1-based index at which the element appears; an empty array when
         # it does not. PG returns `bigint[]`.

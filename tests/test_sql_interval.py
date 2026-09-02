@@ -61,8 +61,12 @@ def test_to_date_clamps_month_end():
 
 
 def test_age_and_diff():
+    # 26, not 23: the day borrow takes the START date's month (January's 31),
+    # which is what PG does — re-probed against 14.13, where this is
+    # `1 year 1 mon 26 days`. The old expectation recorded a borrow of
+    # February's 28.
     assert intervals.render(intervals.age(dt.date(2021, 3, 15), dt.date(2020, 1, 20))) == (
-        "1 year 1 mon 23 days"
+        "1 year 1 mon 26 days"
     )
     assert (
         intervals.render(intervals.diff(dt.datetime(2020, 1, 2, 12), dt.datetime(2020, 1, 1, 10)))
@@ -187,7 +191,8 @@ def test_age(storage, session):
     )
     assert (
         rendered(storage, session, "SELECT age(timestamp '2021-03-15', timestamp '2020-01-20')")
-        == "1 year 1 mon 23 days"
+        # The day borrow takes the START date's month (re-probed, PG 14.13).
+        == "1 year 1 mon 26 days"
     )
 
 
