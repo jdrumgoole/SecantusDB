@@ -7860,6 +7860,52 @@ shared storage engine or building large new protocol subsystems:
       `0A000 unsupported aggregate argument: DISTINCT t`. `count` / `sum` /
       `avg` accept DISTINCT; the push-based aggregates do not.
 
+- [x] **RESOLVED (2026-09-02) — a FOURTH sweep (windows, aggregates, bytea,
+      subqueries): 25 of 35, now 30.** Two badly wrong answers and three wrong
+      types.
+
+      - `substring(b from 1 for 1)` over a BYTEA answered the STRING `'b'` —
+        the first character of the Python repr `b'\x01\x02'`. `_as_text` on a
+        bytes value renders a repr, and nothing downstream could tell.
+      - `every(n > 5)` answered NULL. `every` is the standard-SQL spelling of
+        `bool_and` and parses as an ANONYMOUS call, so `_agg_expr_arg` — which
+        walks `_AGG_CLASSES` — never saw it and the expression argument was
+        dropped. `bool_and(n > 5)` was right all along, which is what made it
+        look like a NULL-handling bug rather than a lost argument.
+      - A SCALAR SUBQUERY typed as `text`, so `(SELECT count(*) FROM t)` sent
+        the string `'3'` under oid 25. `count` is bigint outright; the value
+        aggregates take their argument's type, which resolves whenever the
+        inner column is also visible outside — a correlated subquery over the
+        same table, which is what these mostly are.
+      - A `::numeric(p, s)` CAST did not round to its declared scale even
+        though the COLUMN path does, so the same declared type meant two
+        different values depending on where it was written.
+      - `round()` / `floor()` / `ceil()` claimed `numeric` for a float result.
+      - `GROUPS` window frames were not handled and fell through to the RANGE
+        branch, reporting `RANGE with a numeric offset requires a numeric ORDER
+        BY key` — an error about a clause the user had not written. The offset
+        counts PEER GROUPS; all seven frame shapes now match.
+
+      Pinned by `tests/test_sql_sweep_four.py` (30 cases vs PG 14.13).
+
+- [ ] **OPEN — `sqrt(numeric)` returns float8 (2026-09-02).** PG returns
+      NUMERIC at a scale its `sqrt_var` estimator picks — probed:
+      sqrt(2)=1.414213562373095 (15 dp), sqrt(10000)=100.0000000000000 (13 dp),
+      sqrt(0.5)=0.70710678118654752 (17 dp). No simple `16 - weight` rule fits.
+      **Same class as the two-argument `log`**: needs a faithful port of PG's
+      scale estimator, not a guess. Do both together.
+
+- [ ] **OPEN — `corr` / `covar_pop` / `covar_samp` / `regr_*` (2026-09-02).**
+      `0A000 unsupported aggregate`. The two-argument statistical family; the
+      exact-numeric accumulation machinery added for stddev/variance is the
+      shape to build them on.
+
+- [ ] **OPEN — a scalar subquery under GROUP BY is typed text (2026-09-02).**
+      `SELECT g, (SELECT max(n) FROM t b WHERE b.g=t.g) FROM t GROUP BY g`.
+      The projection is typed with the SYNTHETIC resolver, under which the
+      inner table's column does not resolve. The ungrouped form works. Needs
+      the catalog at that point.
+
 - [ ] **OPEN — arithmetic in a WHERE clause is still unchecked (2026-09-02).**
       `SELECT * FROM t WHERE i + 1 > 0` returns rows where PG raises `22003`.
       The predicate lowers to a Mongo `$expr` (`planner._to_agg_expr` /

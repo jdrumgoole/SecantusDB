@@ -1116,7 +1116,11 @@ def _eval_substring(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> A
     v = evaluate(node.this, scope, ctx)
     if v is None:
         return None
-    text = _as_text(v)
+    # A BYTEA is sliced as bytes. `_as_text` renders it as a Python repr, so
+    # `substring(b from 1 for 1)` over `\x0102` answered the string `'b'` —
+    # the first character of `b'\x01\x02'` — where PG answers `\x01`.
+    is_bytes = isinstance(v, (bytes, bytearray))
+    text = bytes(v) if is_bytes else _as_text(v)
     start_node, length_node = node.args.get("start"), node.args.get("length")
     start_val = evaluate(start_node, scope, ctx) if start_node is not None else None
     if start_val is None and start_node is not None:
@@ -1126,7 +1130,12 @@ def _eval_substring(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> A
     # raised ValueError and the wire got `XX000 internal error`. Postgres
     # returns the FIRST capture group when the pattern has one, the whole match
     # when it does not, and NULL when it does not match (probed on 14.13).
-    if length_node is None and isinstance(start_val, str) and not _looks_like_int(start_val):
+    if (
+        not is_bytes
+        and length_node is None
+        and isinstance(start_val, str)
+        and not _looks_like_int(start_val)
+    ):
         m = _re_compile(start_val, "").search(text)
         if m is None:
             return None
@@ -3004,6 +3013,20 @@ def _is_zero_input(original: Any) -> bool:
     return False
 
 
+def _cast_numeric_typmod(node: exp.Expression, value: Decimal) -> Any:
+    """Apply a `::numeric(p, s)` cast's declared precision and scale.
+
+    The COLUMN path rounds to the declared scale; the cast did not, so
+    `10::numeric(5,2)` answered `10` where PG answers `10.00`. Same gate, same
+    `22003 numeric field overflow` when the rounded value no longer fits."""
+    to = getattr(node, "to", None)
+    identity = typemap.cast_type_identity(to) if to is not None else None
+    if identity is None:
+        return value
+    pg_oid, typmod = identity
+    return typemap.enforce_numeric_typmod(value, pg_oid, typmod)
+
+
 def _eval_cast_impl(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     value = evaluate(node.this, scope, ctx)
     # ``'ok'::mood`` — a cast to a declared enum validates the label (22P02) and
@@ -3462,7 +3485,13 @@ def _eval_cast_impl(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         "char1",
         "jsonpath",
     ):
-        return _cast_scalar(value, to_tag)
+        cast_value = _cast_scalar(value, to_tag)
+        # A declared `numeric(p, s)` on the CAST rounds too: `10::numeric(5,2)`
+        # is `10.00`. Only the column path applied it, so the same declared type
+        # meant two different values depending on where it was written.
+        if to_tag == "numeric" and isinstance(cast_value, Decimal):
+            return _cast_numeric_typmod(node, cast_value)
+        return cast_value
     # ``ts::text`` renders through the session-aware datetime renderer (TimeZone
     # / DateStyle GUCs), like PG's timestamp_out — not raw isoformat.
     if to_tag == "text" and isinstance(value, _dt.datetime):

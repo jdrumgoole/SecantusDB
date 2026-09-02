@@ -4791,6 +4791,14 @@ def _agg_expr_arg(node: exp.Expression) -> exp.Expression | None:
             if isinstance(arg, exp.Distinct):
                 arg = arg.expressions[0] if arg.expressions else None
             return _strip_identity_wrappers(arg)
+    # `every(x)` is the standard-SQL spelling of `bool_and(x)` and parses as an
+    # Anonymous call, so this loop never saw it: an EXPRESSION argument was
+    # dropped and `every(n > 5)` answered NULL where `bool_and(n > 5)` — the
+    # same aggregate — answered true.
+    if isinstance(inner, exp.Anonymous):
+        fname = (inner.this if isinstance(inner.this, str) else inner.name).lower()
+        if fname == "every" and inner.expressions:
+            return _strip_identity_wrappers(inner.expressions[0])
     return None
 
 
@@ -11874,6 +11882,33 @@ def _stamp_nested_int_widths(node: exp.Expression, resolve: Resolve) -> None:
                 unary._secantus_int_tag = tag  # noqa: SLF001
 
 
+def _scalar_subquery_tag(target: exp.Expression, resolve: Resolve) -> str | None:
+    """The type of a scalar subquery's single projected expression.
+
+    An AGGREGATE is the common shape and was not typed at all, so
+    `(SELECT count(*) FROM t)` came back as the STRING `'3'` under oid 25 where
+    PG sends 3 as bigint. `count` is bigint outright; the value aggregates take
+    their argument's type, which resolves whenever the inner column is also
+    visible outside — a correlated subquery over the same table, which is what
+    these mostly are. When it is not, the answer is None and the caller keeps
+    its previous fallback rather than guessing."""
+    if isinstance(target, exp.Count):
+        return "int8"
+    agg = _AGG_CLASSES.get(type(target))
+    if agg is not None and target.this is not None:
+        try:
+            return _agg_out_tag(agg, _infer_scalar_tag(target.this, resolve))
+        except errors.SQLError:
+            return None
+    if isinstance(target, exp.Column):
+        # Needs the catalog to resolve the inner table; left to the caller.
+        return None
+    try:
+        return _infer_scalar_tag(target, resolve)
+    except errors.SQLError:
+        return None
+
+
 def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     """The uncached body of ``_infer_scalar_tag``."""
     # A literal minted by `rewrite_pg_typeof` is a regtype, not text.
@@ -12264,10 +12299,9 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         _exprs = node.this.expressions
         if len(_exprs) == 1:
             _target = _exprs[0].this if isinstance(_exprs[0], exp.Alias) else _exprs[0]
-            if not isinstance(_target, exp.Column):
-                _tag = _infer_scalar_tag(_target, resolve)
-                if _tag and _tag != "any":
-                    return _tag
+            _tag = _scalar_subquery_tag(_target, resolve)
+            if _tag and _tag != "any":
+                return _tag
     # `power()` and `sign()` return DOUBLE PRECISION in Postgres, not numeric —
     # `power(2, 10)` is `1024.0` (oid 701), and typing it numeric put oid 1700
     # on the wire.
@@ -12367,7 +12401,13 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         # abs() keeps its operand's numeric type.
         _at = _arith_operand_tag(node.this, resolve) if node.this is not None else None
         return _at if _at in _NUMERIC_FAMILY else "numeric"
-    if isinstance(node, (exp.Round, exp.Ceil, exp.Floor, exp.Pow)):
+    if isinstance(node, (exp.Round, exp.Ceil, exp.Floor)):
+        # These keep their argument's numeric type — PG's `round(2.3::float8)`
+        # is `double precision`, not numeric, and typing it numeric put oid
+        # 1700 on the wire for a float value.
+        _at = _arith_operand_tag(node.this, resolve) if node.this is not None else None
+        return _at if _at in _NUMERIC_FAMILY else "numeric"
+    if isinstance(node, exp.Pow):
         return "numeric"
     # Transcendental / root functions produce double precision; ``trunc`` / ``sign``
     # / ``factorial`` stay exact numeric. Classes are looked up by attribute because
@@ -12381,6 +12421,13 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     )
     if _num_math and isinstance(node, _num_math):
         return "numeric"
+    # `substring(bytea …)` slices BYTES and returns bytea — typing it text sent
+    # the slice as the string `\x01` under oid 25 where PG sends the two raw
+    # bytes under oid 17.
+    if isinstance(node, exp.Substring) and node.this is not None:
+        with contextlib.suppress(errors.SQLError):
+            if _infer_scalar_tag(node.this, resolve) == "bytea":
+                return "bytea"
     if isinstance(
         node,
         (
