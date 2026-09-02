@@ -68,6 +68,64 @@ pub fn require_object(doc: &Document, field: &str, path: &str) -> Result<(), Com
     }
 }
 
+/// A write statement's `q` (and `u`) -- validated per STATEMENT, because a
+/// malformed one used to fall through every match arm and the statement
+/// reported success. mongod rejects the whole command (probed 8.2.11):
+/// a non-document `q` is 14, a non-document/array `u` is 9, and an absent
+/// one of either is 40414.
+pub fn require_write_statement(spec: &Document, command: &str) -> Result<(), CommandError> {
+    let container = if command == "delete" {
+        "deletes"
+    } else {
+        "updates"
+    };
+    let path = |field: &str| format!("{command}.{container}.{field}");
+    match spec.get("q") {
+        None => {
+            return Err(CommandError::new(
+                40414,
+                "IDLFailedToParse",
+                format!("BSON field '{}' is missing but a required field", path("q")),
+            ))
+        }
+        Some(Bson::Document(_)) => {}
+        Some(v) => {
+            return Err(type_mismatch(format!(
+                "BSON field '{}' is the wrong type '{}', expected type 'object'",
+                path("q"),
+                bson_type_name(v)
+            )))
+        }
+    }
+    if command == "delete" {
+        return Ok(());
+    }
+    match spec.get("u") {
+        None => Err(CommandError::new(
+            40414,
+            "IDLFailedToParse",
+            format!("BSON field '{}' is missing but a required field", path("u")),
+        )),
+        Some(Bson::Document(_)) => Ok(()),
+        // An array is a pipeline-form update, and its ELEMENTS are stages --
+        // a non-document among them is 14, not the 9 that a non-array `u` gets.
+        Some(Bson::Array(stages)) => {
+            if stages.iter().all(|st| matches!(st, Bson::Document(_))) {
+                Ok(())
+            } else {
+                Err(type_mismatch(
+                    "Each element of the 'pipeline' array must be an object".to_string(),
+                ))
+            }
+        }
+        Some(_) => Err(CommandError::new(
+            9,
+            "FailedToParse",
+            "Update argument must be either an object or an array",
+        )),
+    }
+}
+
 /// `BSON field '<path>' is the wrong type '<t>', expected type 'array'`.
 pub fn require_array(doc: &Document, field: &str, path: &str) -> Result<(), CommandError> {
     match doc.get(field) {
@@ -2711,5 +2769,117 @@ mod stage_value_rendering_tests {
             "[ 1 ]"
         );
         assert_eq!(render_stage_value(&Bson::Array(vec![])), "[]");
+    }
+}
+
+#[cfg(test)]
+mod write_statement_tests {
+    //! A malformed `q` / `u` used to fall through every match arm, so the
+    //! statement APPLIED NOTHING and reported success. Probed against mongod
+    //! 8.2.11 (2026-09-02) via `tools/probes/arg_types_documents.py`, which had
+    //! no Rust column until then and so had never compared this server.
+
+    use super::*;
+    use bson::{doc, Bson};
+
+    fn err(command: &str, spec: bson::Document) -> (i32, String) {
+        let e = require_write_statement(&spec, command).expect_err("expected an error");
+        (e.code, e.errmsg)
+    }
+
+    #[test]
+    fn a_non_document_filter_is_a_type_mismatch() {
+        for bad in [
+            Bson::Int32(5),
+            Bson::String("x".into()),
+            Bson::Boolean(true),
+        ] {
+            let (code, msg) = err("update", doc! { "q": bad.clone(), "u": doc! {} });
+            assert_eq!(code, 14);
+            assert!(
+                msg.starts_with("BSON field 'update.updates.q' is the wrong type"),
+                "{msg}"
+            );
+            assert_eq!(err("delete", doc! { "q": bad, "limit": 0 }).0, 14);
+        }
+    }
+
+    #[test]
+    fn an_array_filter_is_a_type_mismatch_too() {
+        let (code, msg) = err("update", doc! { "q": vec![1, 2], "u": doc! {} });
+        assert_eq!(code, 14);
+        assert!(msg.contains("the wrong type 'array'"), "{msg}");
+    }
+
+    #[test]
+    fn a_non_document_update_is_failed_to_parse_not_a_type_mismatch() {
+        for bad in [
+            Bson::Int32(5),
+            Bson::String("x".into()),
+            Bson::Boolean(true),
+        ] {
+            assert_eq!(
+                err("update", doc! { "q": doc! {}, "u": bad }),
+                (
+                    9,
+                    "Update argument must be either an object or an array".to_string()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn an_array_update_is_a_pipeline_whose_elements_must_be_documents() {
+        // Legal: a pipeline, including an empty one.
+        require_write_statement(&doc! { "q": doc! {}, "u": Vec::<Bson>::new() }, "update").unwrap();
+        require_write_statement(
+            &doc! { "q": doc! {}, "u": vec![doc! {"$set": {"a": 1}}] },
+            "update",
+        )
+        .unwrap();
+        // A non-document element is 14, NOT the 9 a non-array `u` gets.
+        assert_eq!(
+            err("update", doc! { "q": doc! {}, "u": vec![Bson::Int32(1)] }),
+            (
+                14,
+                "Each element of the 'pipeline' array must be an object".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn an_absent_q_or_u_is_a_missing_required_field() {
+        assert_eq!(
+            err("update", doc! { "u": doc! {} }),
+            (
+                40414,
+                "BSON field 'update.updates.q' is missing but a required field".to_string()
+            )
+        );
+        assert_eq!(
+            err("update", doc! { "q": doc! {} }),
+            (
+                40414,
+                "BSON field 'update.updates.u' is missing but a required field".to_string()
+            )
+        );
+        // `delete` has no `u`, so it stops after `q`.
+        assert_eq!(
+            err("delete", doc! { "limit": 0 }),
+            (
+                40414,
+                "BSON field 'delete.deletes.q' is missing but a required field".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn well_formed_statements_pass() {
+        require_write_statement(
+            &doc! { "q": doc! {"a": 1}, "u": doc! {"$set": {"b": 2}} },
+            "update",
+        )
+        .unwrap();
+        require_write_statement(&doc! { "q": doc! {}, "limit": 0 }, "delete").unwrap();
     }
 }

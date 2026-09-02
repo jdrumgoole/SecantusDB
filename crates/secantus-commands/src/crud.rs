@@ -433,6 +433,7 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let let_vars = resolve_let_vars(doc.get("let"));
     for (index, spec) in deletes.iter().enumerate() {
         let Bson::Document(spec) = spec else { continue };
+        argtypes::require_write_statement(spec, "delete")?;
         // As in `update`: an undefined `$$variable` in the filter is a
         // per-statement writeError carrying mongod's 17276.
         {
@@ -766,6 +767,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     for (index, spec) in updates.iter().enumerate() {
         let Bson::Document(spec) = spec else { continue };
 
+        argtypes::require_write_statement(spec, "update")?;
         // Strict bool, unlike findAndModify's `upsert`, which takes a bool OR any
         // number. Adjacent slots, different rules -- probed, not inferred.
         argtypes::require_bool_field(spec, "multi", "update.updates.multi")?;

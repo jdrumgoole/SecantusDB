@@ -121,14 +121,46 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     };
     let update = doc.get("update");
 
-    // Mutually-exclusive arg validation (FailedToParse, code 9).
+    // Mutually-exclusive arg validation (FailedToParse, code 9). `remove` is
+    // incompatible with all THREE of these; only the first was checked, so
+    // `remove` alongside `new` or `upsert` was accepted and the delete ran --
+    // mongod refuses the command outright. Wordings probed 8.2.11 (2026-09-02),
+    // trailing space in the `upsert` one included.
     if is_remove && update.is_some() {
         return Ok(CommandError::new(
             9,
             "FailedToParse",
-            "Cannot specify both update and remove=true",
+            "Cannot specify both an update and remove=true",
         )
         .into_reply());
+    }
+    if is_remove && bool_field(doc, "new", false) {
+        return Ok(CommandError::new(
+            9,
+            "FailedToParse",
+            "Cannot specify both new=true and remove=true; 'remove' always returns the deleted \
+             document",
+        )
+        .into_reply());
+    }
+    if is_remove && upsert {
+        return Ok(CommandError::new(
+            9,
+            "FailedToParse",
+            "Cannot specify both upsert=true and remove=true ",
+        )
+        .into_reply());
+    }
+    // An `update` that is neither a document nor a pipeline is not an update.
+    if let Some(u) = update {
+        if !matches!(u, Bson::Document(_) | Bson::Array(_)) {
+            return Ok(CommandError::new(
+                9,
+                "FailedToParse",
+                "Update argument must be either an object or an array",
+            )
+            .into_reply());
+        }
     }
     if !is_remove && update.is_none() {
         return Ok(CommandError::new(
@@ -294,8 +326,15 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                     "ok": 1.0,
                 });
             }
+            // `updatedExisting` belongs to an UPDATE; a remove that matched
+            // nothing reports `n` alone.
+            let last_error = if is_remove {
+                doc! { "n": 0 }
+            } else {
+                doc! { "n": 0, "updatedExisting": false }
+            };
             return Ok(doc! {
-                "lastErrorObject": { "n": 0, "updatedExisting": false },
+                "lastErrorObject": last_error,
                 "value": Bson::Null,
                 "ok": 1.0,
             });
@@ -330,8 +369,10 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                 continue;
             }
             let value = project_value(matched_doc, fields, &query)?;
+            // No `updatedExisting`: mongod reports it only for an UPDATE, and
+            // drivers read `lastErrorObject` field by field.
             return Ok(doc! {
-                "lastErrorObject": { "n": 1, "updatedExisting": true },
+                "lastErrorObject": { "n": 1 },
                 "value": value,
                 "ok": 1.0,
             });

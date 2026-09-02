@@ -743,7 +743,15 @@ fn apply_op(
                     return Err(Fallback::Defer); // empty path -> Python raises 56
                 }
                 if old == new || rename_same_path(old, new) {
-                    return Err(Fallback::Defer); // differ / same path -> Python raises 2
+                    // Named rather than deferred: on the standalone server a
+                    // defer reports "a construct the Rust server does not
+                    // support" for an ordinary bad argument. Probed 8.2.11.
+                    return Err(Fallback::mongo(
+                        2,
+                        format!(
+                            "The source and target field for $rename must differ: {old}: \"{new}\""
+                        ),
+                    ));
                 }
                 if rename_traverses_array(result, old) || rename_traverses_array(result, new) {
                     return Err(Fallback::Defer); // array element -> Python raises 2

@@ -4208,6 +4208,46 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   comparison and oids are done; the rest of that corpus (multidimensional,
   binary format, the full type matrix, `ARRAY` subscripting) is not.
 
+- [x] **Five probes never compared the Rust server — instrumented 2026-09-02.**
+  `tools/probes/_servers.py` is now the shared `probe_targets()` helper, and
+  `update_operators`, `arg_types_documents`, `update_path_conflicts` and
+  `findandmodify_shapes` all carry a Rust column. It found **21 divergences,
+  Python 0 everywhere** — and three of them were the Rust server ACCEPTING a
+  malformed write and reporting success:
+
+  - A non-document `q`, or a non-document/array `u`, on `update` / `delete`
+    fell through every match arm: the statement applied nothing and answered
+    `ok`. mongod refuses the command (14 / 9 / 40414). 12 shapes.
+  - `findAndModify` with `remove` alongside `new` or `upsert`, or with an
+    `update` that is neither a document nor a pipeline, ran the delete where
+    mongod refuses the command.
+  - A remove's `lastErrorObject` carried `updatedExisting`, which mongod
+    reports only for an UPDATE. Drivers read that field by field.
+
+  19 of the 21 are fixed. The remaining 2 are recorded below.
+
+- [ ] **The Rust update path has no parse-time / execution-time distinction
+  (2 shapes, 2026-09-02).** mongod wraps an EXECUTION-time update failure as
+  `Plan executor error during update :: caused by :: <message>` and reports a
+  parse-time one bare; the Rust server sends every one bare. Code and message
+  body already match — `$inc` on a string and `$push` on a non-array are the two
+  the corpus reaches.
+
+  The Python engine carries this as `UpdateError.exec_error`, set at 14 sites.
+  Rust needs the same bit threaded from the engine through to
+  `util::write_error`, because the wrapper names the COMMAND (`update` vs
+  `findAndModify` vs a pipeline update) and so cannot be baked into the engine's
+  message.
+
+  **Scoped 2026-09-02, and it is wider than it looks.** `Fallback::Mongo` takes
+  the flag cheaply — only two sites construct it with all fields, the rest
+  destructure with `..`. The cost is downstream: `secantus-storage-adapter`
+  flattens BOTH `WtError::UpdateTypeMismatch` and `WtError::QueryError` into
+  `StorageError::WriteError { code, errmsg }`, so the distinction is already
+  lost by the time the command layer sees it. Carrying it means adding a field
+  to `WriteError` and touching its ~20 construction sites. Worth doing
+  deliberately; not worth bolting on, which is why it is still here.
+
 ### 7.0 Cache-pressure rollback — CI exercises it now
 
 `WT_ROLLBACK` is two conditions wearing one code: a write-write conflict
