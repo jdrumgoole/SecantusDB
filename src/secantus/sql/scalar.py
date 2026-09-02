@@ -4277,6 +4277,8 @@ PLAIN_SCALAR_TAGS = {
     "regexp_split_to_array": "text[]",
     "string_to_array": "text[]",
     "array_positions": "int8[]",
+    "num_nonnulls": "int4",
+    "num_nulls": "int4",
     "parse_ident": "text[]",
     "unistr": "text",
     "make_date": "date",
@@ -4883,6 +4885,9 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         return False
     if name in ("enum_range", "enum_first", "enum_last"):
         return _ENUM_FUNC_NEEDS_NODE
+    if name in ("num_nonnulls", "num_nulls"):
+        nulls = sum(1 for a in args if a is None)
+        return nulls if name == "num_nulls" else len(args) - nulls
     if name == "parse_ident":
         # Split a qualified identifier. An UNQUOTED part folds to lower case,
         # a double-quoted one keeps its spelling — `parse_ident('"A".b')` is
