@@ -7840,10 +7840,52 @@ shared storage engine or building large new protocol subsystems:
       node and is fine. Widening the collector to named anonymous aggregates
       is the fix, with the regression risk that implies.
 
-- [ ] **OPEN — `to_char`'s truncated ISO tokens (2026-09-02).** `IYY` / `IY` /
-      `I` (the last 3 / 2 / 1 digits of the ISO year) and `IDDD` (ISO day of
-      year) have no strftime directive, so they are not handled;
-      `IYYY` / `IW` / `ID` are. They would need computing rather than mapping.
+- [x] **RESOLVED (2026-09-02) — `to_char(<datetime>, …)` matched PG on 55 of
+      122 shapes; the whole template engine was replaced.** The same defect as
+      the numeric side, one layer worse. Rendering went through sqlglot's
+      Postgres `TIME_MAPPING` into `strftime`, which knows a handful of tokens
+      and matches single letters ANYWHERE — so two whole classes of answer were
+      wrong. Tokens it does not know came out as their own spelling (`Q`, `W`,
+      `CC`, `J`, `MS`, `FF1`–`FF6`, `RM`, `Y,YYY`, `YYY`, `Y`, `IYY`, `IY`,
+      `I`, `IDDD`, `HH`, `TZH`, `TZM`, `SSSS`, quoted `"literals"`, the `TM`
+      prefix); tokens it did know were matched INSIDE other tokens, so the `D`
+      in `AD` rendered the weekday and `to_char(ts, 'AD')` answered `'A3'`.
+
+      `src/secantus/sql/datetimeformat.py` now parses the Postgres template
+      directly, longest token first, the way `formatting.c` does. Three rules
+      that only a probe would give you:
+
+      * **Matching is case-SENSITIVE.** Postgres registers an all-upper and an
+        all-lower spelling of each keyword plus a Capitalized one for the four
+        word tokens, and nothing else — so `Ddth` is `D` + `d` + `th` and
+        answers `'44th'`, not `DD` + `th`.
+      * **`OF` / `TZH` / `TZM` have no lower-case spelling.** `'DDth of Month'`
+        is a date with the English word in it; `tzh` is `tz` plus a literal
+        `h`.
+      * **`FM` prefixes exactly ONE token** — it is not a mode that stays on.
+        `FMHH12:MI` is `'2:07'`, not `'2:7'`.
+
+      The template is captured RAW at parse time (`_install_to_char_raw_format`,
+      the stamp idiom) because the AST's converted form is lossy beyond
+      recovery: `d` and `D` both map to `%u`, so `'day'`, `'ad'` and `'Ddth'`
+      arrive with their case already destroyed.
+
+      The parsing side (`to_date` / `to_timestamp`) shares the token table, so
+      `Mon` / `Month` / `Dy` / `AM` / `MS` / `IYYY IW` / `J` / `DDD` templates
+      parse instead of raising `22007 invalid input syntax`; and `to_timestamp`
+      returns a **timestamptz** rather than a naive timestamp. Two sweeps:
+      122/122 and 190/192. `tests/test_sql_to_char_datetime.py`.
+
+- [ ] **OPEN — a year-less `to_date` / `to_timestamp` template defaults to
+      1 BC, and BC dates are unrepresentable (2026-09-02).**
+      `to_date('11:30:00 PM','HH12:MI:SS AM')` is `'0001-01-01 BC'` on
+      Postgres; SecantusDB answers `'0001-01-01'` (AD). Python's `datetime`
+      has a minimum year of 1 AD and no era, so this is not a formatting bug
+      to fix in `datetimeformat.py` — the whole engine stores datetimes as
+      `datetime.datetime` and cannot represent any BC instant. Fixing it means
+      a proleptic date representation of our own, which is a much larger
+      change than the two cases it buys. The only two divergences left in the
+      314-case datetime sweep.
 
 - [x] **RESOLVED (2026-09-02) — `to_char(numeric, …)` matched PG on 63 of 300
       shapes.** A 30-template x 10-value sweep. Four rules were missing
