@@ -600,6 +600,27 @@ def execute_drop_view(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQL
     return SQLResult(command_tag="DROP VIEW")
 
 
+def _backfill_added_column(column: Any, table: Any, storage: Any, db: str) -> None:
+    """Fill an added column's DEFAULT into the rows that already exist.
+
+    Postgres materialises the default for every existing row, so the column
+    reads as its default rather than NULL. A non-literal default (`now()`,
+    `gen_random_uuid()`) is evaluated once, which is what PG does too — the
+    value is computed at ALTER time, not per row."""
+    from secantus.sql import scalar
+
+    value = column.default
+    if not column.has_default and column.default_expr is not None:
+        import sqlglot
+
+        node = sqlglot.parse_one(column.default_expr, read="postgres")
+        ctx = scalar.ScalarContext(storage=storage, catalog=None, db=db, session=None)
+        value = typemap.coerce(scalar.evaluate(node, lambda _n: None, ctx), column.type_tag)
+    if value is None:
+        return
+    storage.update_matching(db, table.collection, {}, {"$set": {column.field: value}}, multi=True)
+
+
 def _apply_alter_action(
     action: Any, table: Any, storage: Any, db: str, catalog: Catalog | None = None
 ) -> None:
@@ -622,15 +643,28 @@ def _apply_alter_action(
                 f"unsupported column type: {action.args['kind'].sql()}"
             )
         cons = [type(c.kind).__name__ for c in (action.args.get("constraints") or [])]
-        table.columns.append(
-            Column(
-                name=name,
-                type_tag=tag,
-                field=name,
-                pk=False,
-                nullable="NotNullColumnConstraint" not in cons,
-            )
+        # A DEFAULT on ADD COLUMN was dropped on the floor: the column went in
+        # with no default at all, so EXISTING rows kept NULL (PG backfills) and
+        # — worse — a later INSERT that omitted the column got NULL too, which
+        # for `NOT NULL DEFAULT 7` left a NOT NULL column holding NULL.
+        from secantus.sql import planner as _planner
+
+        has_default, default = _planner._column_default(action, tag)
+        default_expr = None if has_default else _planner._default_expr(action)
+        column = Column(
+            name=name,
+            type_tag=tag,
+            field=name,
+            pk=False,
+            nullable="NotNullColumnConstraint" not in cons,
+            has_default=has_default,
+            default=default,
+            default_expr=default_expr,
+            **_planner._decl_identity(action.args["kind"]),
         )
+        table.columns.append(column)
+        if has_default or default_expr is not None:
+            _backfill_added_column(column, table, storage, db)
         return
     if (
         isinstance(action, exp.Drop)

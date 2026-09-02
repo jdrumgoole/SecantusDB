@@ -1522,6 +1522,14 @@ def _eval_trunc(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     return math.trunc(v * factor) / factor
 
 
+def _session_version() -> str:
+    """The `version()` banner — the same string the session-function path
+    returns, so the two spellings cannot drift."""
+    from secantus.sql.session import VERSION_STRING
+
+    return VERSION_STRING
+
+
 def _eval_to_hex(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     """`to_hex(int)` / `to_hex(bigint)` — was `0A000 function hex() is not
     supported`, naming a function the user did not write.
@@ -2265,6 +2273,11 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
     ),
     exp.MD5: lambda n, s, c: _plain_scalar("md5", [evaluate(n.this, s, c)]),
     exp.Hex: lambda n, s, c: _eval_to_hex(n, s, c),
+    # `version()` works as a bare projection through the session-function path,
+    # but nested in an expression (`version() LIKE 'PostgreSQL%'`) it reached
+    # the generic dispatcher and reported `function current_version() is not
+    # supported` — sqlglot's node name, not one the user wrote.
+    exp.CurrentVersion: lambda n, s, c: _session_version(),
     # sqlglot renames `make_time` / `make_timestamp` to these typed nodes, so
     # they never reached the plain-builtin table and reported
     # `function time_from_parts() is not supported` — a name the user never
@@ -4075,6 +4088,7 @@ PLAIN_SCALAR_TAGS = {
     "regexp_match": "text[]",
     "regexp_split_to_array": "text[]",
     "string_to_array": "text[]",
+    "array_positions": "int8[]",
     "make_date": "date",
     "make_time": "time",
     "make_timestamp": "timestamp",
@@ -4659,6 +4673,14 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
             if ctx.catalog.get(db, probe) is not None:
                 return schema == rel_schema
         return False
+    if name == "array_positions":
+        # Every 1-based index at which the element appears; an empty array when
+        # it does not. PG returns `bigint[]`.
+        arr = args[0] if args else None
+        if arr is None:
+            return None
+        elem = args[1] if len(args) > 1 else None
+        return [i for i, v in enumerate(_as_list(arr), start=1) if v == elem]
     if name == "array_fill":
         # ``array_fill(value, ARRAY[d1, d2, ...])`` — an array of the given
         # dimensions with every element set to value (lower-bounds arg

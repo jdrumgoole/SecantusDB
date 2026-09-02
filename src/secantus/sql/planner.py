@@ -1771,7 +1771,67 @@ def _where_filter(
     # The pipeline planners don't thread `subctx`; fall back to the one published
     # by `plan_pipeline_select` so WHERE subqueries work there too.
     ctx = subctx or _pipeline_subctx.get()
-    return _expr_to_filter(where.this, table_resolver(table), ctx)
+    rewritten = _rewrite_enum_comparisons(where.this, table, ctx)
+    return _expr_to_filter(rewritten, table_resolver(table), ctx)
+
+
+def _rewrite_enum_comparisons(
+    node: exp.Expression, table: TableDef, subctx: SubqueryCtx | None = None
+) -> exp.Expression:
+    """Rewrite a range comparison on an ENUM column into the set of labels that
+    satisfy it.
+
+    An enum's order is its DECLARED label order, not the text order of the
+    labels — `'happy' > 'ok'` is true for `mood AS ENUM ('sad','ok','happy')`
+    and false as text. Sorting already knew that (`enum_orders`), but a WHERE
+    comparison lowered to a Mongo string comparison and answered by spelling,
+    so `WHERE m > 'ok'` returned `sad`. Silently wrong.
+
+    An enum has a FINITE label set, so a range comparison is exactly a set
+    membership — which needs no ordinal at query time and reuses `IN`. The
+    column's output tag is plain `text`, so the enum-ness has to come from the
+    TABLE, which is why this sits here rather than in the filter builder.
+
+    Works on a COPY: the WHERE node belongs to a cached parse tree."""
+    root = node.copy()
+    rewritten = False
+    replaced_root: exp.Expression | None = None
+    for cmp_node in list(root.find_all(*_CMP_OPS)):
+        op, flipped = _CMP_OPS[type(cmp_node)]
+        left, right = cmp_node.this, cmp_node.expression
+        if isinstance(left, exp.Column):
+            col_node, lit_node, effective = left, right, op
+        elif isinstance(right, exp.Column):
+            col_node, lit_node, effective = right, left, flipped
+        else:
+            continue
+        labels = _enum_labels_for_column(table.column(_column_name(col_node)), subctx)
+        if not labels:
+            continue
+        try:
+            bound = _literal(_strip_identity_wrappers(lit_node))
+        except errors.SQLError:
+            continue
+        if bound not in labels:
+            continue
+        idx = labels.index(bound)
+        keep = {
+            "$gt": labels[idx + 1 :],
+            "$gte": labels[idx:],
+            "$lt": labels[:idx],
+            "$lte": labels[: idx + 1],
+        }[effective]
+        membership = exp.In(this=col_node.copy(), expressions=[exp.Literal.string(v) for v in keep])
+        if cmp_node is root:
+            # `WHERE m > 'ok'` — the comparison IS the whole clause, so it has
+            # no parent and `replace()` would quietly do nothing.
+            replaced_root = membership
+        else:
+            cmp_node.replace(membership)
+        rewritten = True
+    if replaced_root is not None:
+        return replaced_root
+    return root if rewritten else node
 
 
 # ---------------------------------------------------------------------------
@@ -2776,14 +2836,20 @@ def _enum_order_map(
     return out
 
 
-def _enum_labels_for_column(col: Column | None) -> list[str] | None:
-    """The declared label list of an enum-typed column (via the planning-scoped
-    catalog on ``_pipeline_subctx``), or None if the column isn't enum-typed / no
-    catalog is available. Lets a pipeline ``$sort`` order an enum column by its
-    declared order instead of lexically."""
+def _enum_labels_for_column(
+    col: Column | None, subctx: SubqueryCtx | None = None
+) -> list[str] | None:
+    """The declared label list of an enum-typed column, or None if the column
+    isn't enum-typed / no catalog is available. Lets a pipeline ``$sort`` order
+    an enum column by its declared order instead of lexically.
+
+    The catalog comes from ``subctx`` when the caller has one and from the
+    planning-scoped ``_pipeline_subctx`` otherwise — the single-table planner
+    is PASSED a context but publishes none, so reading only the ContextVar
+    silently found no labels there."""
     if col is None or col.enum_type is None:
         return None
-    ctx = _pipeline_subctx.get()
+    ctx = subctx or _pipeline_subctx.get()
     if ctx is None or ctx.catalog is None:
         return None
     enum = ctx.catalog.get_enum(ctx.db, col.enum_type)
@@ -11656,6 +11722,14 @@ def _range_tag_of(operands: Any, resolve: Resolve) -> str | None:
             continue
         if isinstance(operand, exp.Anonymous) and str(operand.this).lower() in typemap._RANGE_TAGS:
             return str(operand.this).lower()
+        if isinstance(operand, exp.Cast):
+            # `'[1,3)'::int4range` — a CAST is as much a range operand as the
+            # constructor is, and only the constructor was recognised, so
+            # `range_merge` over two casts typed as text and sent the literal
+            # `[1,7)` as a string.
+            cast_tag = typemap.type_tag_for_sql(operand.to)
+            if cast_tag in typemap._RANGE_TAGS:
+                return cast_tag
         if isinstance(operand, exp.Column):
             try:
                 tag = resolve(operand)[1]
@@ -12366,6 +12440,8 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         return "timestamp"
     if getattr(exp, "Hex", None) is not None and isinstance(node, exp.Hex):
         return "text"
+    if getattr(exp, "CurrentVersion", None) is not None and isinstance(node, exp.CurrentVersion):
+        return "text"
     # ``ts ± interval`` keeps the timestamp's type (the non-interval operand's).
     if isinstance(node, (exp.Add, exp.Sub)):
         left, right = node.this, node.expression
@@ -12520,6 +12596,13 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
             "json_object_agg",
         ):
             return "json"
+        if fname == "array_fill" and node.expressions:
+            # `array_fill(v, ARRAY[n])` is an array OF v's type — typing it
+            # text sent the array literal as a string.
+            with contextlib.suppress(errors.SQLError):
+                elem = _infer_scalar_tag(node.expressions[0], resolve)
+                if elem and not typemap.is_array_tag(elem) and f"{elem}[]" in typemap.PG_OID:
+                    return f"{elem}[]"
         if fname in (
             "jsonb_array_length",
             "json_array_length",
