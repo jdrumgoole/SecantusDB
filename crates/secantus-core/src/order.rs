@@ -125,9 +125,17 @@ pub fn is_sortable(v: &Bson) -> bool {
         // Python is a generic BadValue. `{$gt: [true, 1]}` is true on mongod.
         | Bson::Boolean(_) => true,
         Bson::Double(d) => !d.is_nan(),
+        // Decimal128 is part of the unified NUMERIC type -- `type_rank` has
+        // always put it at rank 3 with the others, and `cmp` has always routed
+        // it through `numeric::classify`. Only this predicate excluded it, so
+        // every comparison involving a decimal DEFERRED, which on a server with
+        // no Python is a generic BadValue: `{$gt: [Decimal128("2.5"), 2]}` is
+        // true on mongod and answered "not supported" here. NaN is excluded for
+        // the same reason a double NaN is -- it has no place in a total order.
+        Bson::Decimal128(_) => !crate::query::is_nan_bson(v),
         Bson::Document(d) => d.values().all(is_sortable),
         Bson::Array(a) => a.iter().all(is_sortable),
-        // NaN, Binary, Timestamp, Regex, Min/MaxKey, Decimal128, exotic.
+        // NaN, Binary, Timestamp, Regex, Min/MaxKey, exotic.
         _ => false,
     }
 }
@@ -370,9 +378,17 @@ mod tests {
         // An array of sortable elements is sortable, and a bool is now one of
         // them; this case existed only because bools were excluded.
         assert!(is_sortable(&b(bson!([1, "x", true]))));
-        assert!(!is_sortable(&Bson::Decimal128("1.5".parse().unwrap())));
-        assert!(!is_sortable(&b(
+        // Decimal128 IS sortable, for the same reason bools turned out to be:
+        // this asserted a gating decision, not a behaviour. mongod interleaves
+        // decimals with the other numerics -- a mixed field sorts
+        // `NaN, Decimal128("1"), 2, Decimal128("2.5"), 3.0, "s"` (probed
+        // 8.2.11, 2026-09-02) -- and `cmp` has always routed rank 3 through
+        // `numeric::classify`, which handles them.
+        assert!(is_sortable(&Bson::Decimal128("1.5".parse().unwrap())));
+        assert!(is_sortable(&b(
             bson!({"a": Bson::Decimal128("1".parse().unwrap())})
         )));
+        // ... except NaN, excluded exactly as a double NaN is.
+        assert!(!is_sortable(&Bson::Decimal128("NaN".parse().unwrap())));
     }
 }

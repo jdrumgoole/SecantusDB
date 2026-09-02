@@ -4332,6 +4332,13 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   collection holding Decimal128 values cannot use most math operators on the
   Rust server.** mongod answers all 38.
 
+  **Partly closed 2026-09-02**: the COMPARISON half is done. `order::cmp` had
+  always handled decimals (rank 3 routes through `numeric::classify`); only
+  `order::is_sortable` excluded them, and that predicate is what every
+  comparison consults first. `$gt` / `$lt` / `$cmp`, `sort()` and range queries
+  now work on a collection holding decimals — five corpus shapes, but a whole
+  capability in practice. What remains is the ARITHMETIC and conversions.
+
   **Scoped, not guessed** (2026-09-02): `crates/secantus-core/src/decimal.rs`
   represents a value as sign / coefficient / exponent with `add`, `mul`,
   `div_int`, `parse`, `to_string`, `to_bson` and `trunc_to_i64`. So roughly
