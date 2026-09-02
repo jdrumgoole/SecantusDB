@@ -2649,6 +2649,18 @@ def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any
     if _is_nan(left) and _is_nan(right):
         # Postgres treats NaN as equal to NaN (and greater than every number).
         return isinstance(node, (exp.EQ, exp.GTE, exp.LTE))
+    # An ENUM compares by its DECLARED label order, not by spelling. The
+    # labels are stamped on the node by the planner, which has the catalog;
+    # without them `SELECT m > 'ok'` answered `sad > ok` as text.
+    labels = getattr(node, "_secantus_enum_labels", None)
+    if (
+        labels is not None
+        and isinstance(left, str)
+        and isinstance(right, str)
+        and left in labels
+        and right in labels
+    ):
+        left, right = labels.index(left), labels.index(right)
     # A record is a dict of `f1..fN` and has no ordering of its own, so
     # `(1,2) < (1,3)` raised `TypeError` and reached the client as `XX000`.
     # Postgres compares records field by field, left to right.
@@ -3848,7 +3860,10 @@ def _eval_func_impl(node: exp.Anonymous, scope: Scope, ctx: ScalarContext) -> An
         rec = typemap.RecordValue((f"f{i + 1}", v) for i, v in enumerate(args))
         rec.field_oids = tuple(_row_field_oid(a) for a in node.expressions)
         return rec
-    return _call_func(name, args, ctx)
+    result = _call_func(name, args, ctx)
+    if result is _ENUM_FUNC_NEEDS_NODE:
+        return _eval_enum_func(name, node, ctx)
+    return result
 
 
 def _row_field_oid(arg: exp.Expression) -> int:
@@ -3900,7 +3915,39 @@ def _eval_typed_func(node: exp.Func, scope: Scope, ctx: ScalarContext) -> Any:
         ]
         return _call_func("format", args, ctx)
     args = [evaluate(a, scope, ctx) for a in node.expressions if isinstance(a, exp.Expression)]
-    return _call_func(name, args, ctx)
+    result = _call_func(name, args, ctx)
+    if result is _ENUM_FUNC_NEEDS_NODE:
+        return _eval_enum_func(name, node, ctx)
+    return result
+
+
+def _eval_enum_func(name: str, node: exp.Expression, ctx: ScalarContext | None) -> Any:
+    """`enum_range(NULL::mood)` / `enum_first` / `enum_last`.
+
+    The enum type is named by the ARGUMENT'S CAST, not by any value — the
+    argument is a NULL — so these cannot go through the value-only builtin
+    table and were `0A000 function enum_range() is not supported`."""
+    args = list(node.expressions or [])
+    type_name = None
+    for arg in args:
+        inner = arg
+        while isinstance(inner, exp.Paren):
+            inner = inner.this
+        if isinstance(inner, exp.Cast):
+            type_name = inner.to.sql(dialect="postgres").strip('"')
+            break
+    catalog = getattr(ctx, "catalog", None)
+    if type_name is None or catalog is None:
+        raise errors.feature_not_supported(f"{name}() requires an enum-typed argument")
+    enum = catalog.get_enum(getattr(ctx, "db", ""), type_name.lower())
+    if enum is None:
+        raise errors.SQLError("42704", f'type "{type_name}" does not exist')
+    labels = list(enum["labels"])
+    if name == "enum_first":
+        return labels[0] if labels else None
+    if name == "enum_last":
+        return labels[-1] if labels else None
+    return labels
 
 
 def _seq_name(arg: Any) -> str:
@@ -4207,6 +4254,11 @@ def _time_secs(value: Any) -> str:
 #: Sentinel: `_plain_scalar` did not recognise the name (distinct from a
 #: function that legitimately returned None for a NULL argument).
 _UNSUPPORTED = object()
+
+#: `enum_range` / `enum_first` / `enum_last` take their enum type from the
+#: ARGUMENT'S CAST (`enum_range(NULL::mood)`), which the value-only helper
+#: cannot see — the caller routes them through `_eval_enum_func` instead.
+_ENUM_FUNC_NEEDS_NODE = object()
 
 #: Result type tags for the builtins above, so the RowDescription is right.
 PLAIN_SCALAR_TAGS = {
@@ -4829,6 +4881,8 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
             if ctx.catalog.get(db, probe) is not None:
                 return schema == rel_schema
         return False
+    if name in ("enum_range", "enum_first", "enum_last"):
+        return _ENUM_FUNC_NEEDS_NODE
     if name == "parse_ident":
         # Split a qualified identifier. An UNQUOTED part folds to lower case,
         # a double-quoted one keeps its spelling — `parse_ident('"A".b')` is

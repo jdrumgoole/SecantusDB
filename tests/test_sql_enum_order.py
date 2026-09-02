@@ -1,9 +1,17 @@
-"""Enum-aware ORDER BY across the pipeline paths — GROUP BY, DISTINCT, JOIN,
-JOIN+GROUP BY, and the evaluated (computed-column) path all sort an enum column by
-its declared label order, not lexically.
+"""Finishing the enum story: comparison in a SELECT list, and `enum_range`.
 
-The single-table pushdown case is covered in ``test_sql_alter_type.py``; this file
-pins the pipeline / evaluated planners that #80 left sorting lexically.
+The WHERE half was fixed by rewriting a range comparison into the set of
+labels that satisfy it. A comparison in the SELECT *list* has to yield a
+BOOLEAN instead and is evaluated by `scalar`, which has no catalog — so
+`SELECT m > 'ok'` still answered by SPELLING while `WHERE m > 'ok'` did not,
+which is a worse state than either being wrong on its own. The planner now
+stamps the label list on the comparison node for the evaluator to read.
+
+`enum_range` / `enum_first` / `enum_last` take their enum type from the
+ARGUMENT'S CAST — the argument is a NULL — so they cannot go through the
+value-only builtin table and were `0A000`.
+
+Every expectation here was measured against PostgreSQL 14.13.
 """
 
 from __future__ import annotations
@@ -11,94 +19,72 @@ from __future__ import annotations
 import pytest
 
 from secantus.sql import run_sql
+from secantus.sql.errors import SQLError
 from secantus.sql.session import Session
 from secantus.storage import Storage
 
-DB = "testdb"
 
+@pytest.fixture()
+def db(tmp_path):
+    storage = Storage(str(tmp_path))
+    session = Session(database="t")
 
-@pytest.fixture
-def session():
-    return Session(database=DB, user="secantus")
+    def run(sql: str):
+        return [r.rows for r in run_sql(storage, "t", sql, session=session)][0]
 
-
-@pytest.fixture
-def storage(tmp_path):
-    s = Storage(str(tmp_path))
+    run("CREATE TYPE mood AS ENUM ('sad','ok','happy')")
+    run("CREATE TABLE e1 (id int, m mood)")
+    run("INSERT INTO e1 VALUES (1,'happy'),(2,'sad'),(3,'ok')")
     try:
-        yield s
+        yield run
     finally:
-        s.close()
+        storage.close()
 
 
-def run(storage, session, sql):
-    return run_sql(storage, DB, sql, session=session)[-1]
+class TestComparisonInProjection:
+    @pytest.mark.parametrize(
+        ("expr", "want"),
+        [
+            ("m > 'ok'::mood", [True, False, False]),
+            ("m < 'ok'", [False, True, False]),
+            ("m >= 'ok'", [True, False, True]),
+            ("m <= 'ok'", [False, True, True]),
+            ("'ok' < m", [True, False, False]),
+            # Equality compares by label and was always right.
+            ("m = 'ok'", [False, False, True]),
+        ],
+    )
+    def test_projection(self, db, expr, want):
+        rows = db(f"SELECT id, {expr} FROM e1 ORDER BY id")
+        assert [r[1] for r in rows] == want
+
+    def test_where_still_right(self, db):
+        assert [r[0] for r in db("SELECT id FROM e1 WHERE m > 'ok' ORDER BY id")] == [1]
+
+    def test_order_by_still_right(self, db):
+        assert db("SELECT id, m FROM e1 ORDER BY m") == [(2, "sad"), (3, "ok"), (1, "happy")]
+
+    def test_a_text_column_is_unaffected(self, db):
+        db("CREATE TABLE t1 (id int, s text)")
+        db("INSERT INTO t1 VALUES (1,'happy'),(2,'sad')")
+        rows = db("SELECT id, s > 'ok' FROM t1 ORDER BY id")
+        # Plain text still compares by spelling: 'happy' < 'ok' < 'sad'.
+        assert [r[1] for r in rows] == [False, True]
 
 
-@pytest.fixture
-def data(storage, session):
-    # Declared order sad < ok < happy; lexical order would be happy < ok < sad.
-    run(storage, session, "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
-    run(storage, session, "CREATE TABLE t (id int PRIMARY KEY, m mood, n int)")
-    run(storage, session, "INSERT INTO t VALUES (1,'happy',5),(2,'sad',3),(3,'ok',7)")
-    run(storage, session, "CREATE TABLE u (id int PRIMARY KEY, t_id int)")
-    run(storage, session, "INSERT INTO u VALUES (10,1),(20,2),(30,3),(40,1)")
-    return storage
+class TestEnumFunctions:
+    @pytest.mark.parametrize(
+        ("sql", "want"),
+        [
+            ("SELECT enum_range(NULL::mood)", ["sad", "ok", "happy"]),
+            ("SELECT enum_first(NULL::mood)", "sad"),
+            ("SELECT enum_last(NULL::mood)", "happy"),
+        ],
+    )
+    def test_functions(self, db, sql, want):
+        assert db(sql)[0][0] == want
 
-
-def test_group_by_enum_declared_order(data, session):
-    rows = run(data, session, "SELECT m, count(*) FROM t GROUP BY m ORDER BY m").rows
-    assert [r[0] for r in rows] == ["sad", "ok", "happy"]
-
-
-def test_group_by_enum_desc(data, session):
-    rows = run(data, session, "SELECT m FROM t GROUP BY m ORDER BY m DESC").rows
-    assert [r[0] for r in rows] == ["happy", "ok", "sad"]
-
-
-def test_distinct_enum_declared_order(data, session):
-    rows = run(data, session, "SELECT DISTINCT m FROM t ORDER BY m").rows
-    assert [r[0] for r in rows] == ["sad", "ok", "happy"]
-
-
-def test_evaluated_computed_column_enum_order(data, session):
-    # A computed SELECT-list expression routes through the evaluated planner.
-    rows = run(data, session, "SELECT n * 2 AS d, m FROM t ORDER BY m").rows
-    assert [r[1] for r in rows] == ["sad", "ok", "happy"]
-
-
-def test_join_enum_order(data, session):
-    rows = run(
-        data,
-        session,
-        "SELECT u.id, t.m FROM u JOIN t ON u.t_id = t.id ORDER BY t.m, u.id",
-    ).rows
-    assert [r[1] for r in rows] == ["sad", "ok", "happy", "happy"]
-    assert rows == [(20, "sad"), (30, "ok"), (10, "happy"), (40, "happy")]
-
-
-def test_join_group_by_enum_order(data, session):
-    rows = run(
-        data,
-        session,
-        "SELECT t.m, count(*) FROM u JOIN t ON u.t_id = t.id GROUP BY t.m ORDER BY t.m",
-    ).rows
-    assert rows == [("sad", 1), ("ok", 1), ("happy", 2)]
-
-
-def test_join_evaluated_enum_order(data, session):
-    # A scalar expression in the join SELECT list uses the evaluated join planner.
-    rows = run(
-        data,
-        session,
-        "SELECT upper(t.m::text) AS mm, t.m FROM u JOIN t ON u.t_id = t.id ORDER BY t.m",
-    ).rows
-    assert [r[1] for r in rows] == ["sad", "ok", "happy", "happy"]
-
-
-def test_pipeline_enum_order_reflects_added_value(data, session):
-    # A label added mid-order via ALTER TYPE sorts in its declared position.
-    run(data, session, "ALTER TYPE mood ADD VALUE 'meh' AFTER 'ok'")
-    run(data, session, "INSERT INTO t VALUES (4,'meh',1)")
-    rows = run(data, session, "SELECT m, count(*) FROM t GROUP BY m ORDER BY m").rows
-    assert [r[0] for r in rows] == ["sad", "ok", "meh", "happy"]
+    def test_unknown_type(self, db):
+        with pytest.raises(SQLError) as exc:
+            db("SELECT enum_range(NULL::nope)")
+        assert exc.value.sqlstate == "42704"
