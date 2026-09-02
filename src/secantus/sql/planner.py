@@ -12246,6 +12246,15 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         return "numeric"
     if getattr(exp, "TimeToStr", None) is not None and isinstance(node, exp.TimeToStr):
         return "text"
+    # `make_time` / `make_timestamp` — sqlglot's renamed nodes.
+    if getattr(exp, "TimeFromParts", None) is not None and isinstance(node, exp.TimeFromParts):
+        return "time"
+    if getattr(exp, "TimestampFromParts", None) is not None and isinstance(
+        node, exp.TimestampFromParts
+    ):
+        return "timestamp"
+    if getattr(exp, "Hex", None) is not None and isinstance(node, exp.Hex):
+        return "text"
     # ``ts ± interval`` keeps the timestamp's type (the non-interval operand's).
     if isinstance(node, (exp.Add, exp.Sub)):
         left, right = node.this, node.expression

@@ -324,6 +324,37 @@ def _tag_for_value(value: Any) -> str:
     return "any"
 
 
+#: Widest value an `integer` holds — a literal above it is `bigint` in
+#: Postgres, which is what decides an `ARRAY[…]` constructor's element type.
+_INT4_MAX = 2**31 - 1
+
+
+def _unnest_elem_tag(arg: Any, values: list[Any]) -> str:
+    """The element type of an `unnest(...)` without a FROM.
+
+    It was `any`, so the elements went out as text: `unnest('{1,2,3}'::int[])`
+    handed a driver `'1'` rather than `1`. A cast names the element type
+    outright; otherwise it comes from the values, where Postgres' own rule for
+    an `ARRAY[…]` of integer literals is `integer` unless one does not fit."""
+    from secantus.sql import typemap
+
+    node = arg
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if isinstance(node, exp.Cast):
+        cast_tag = typemap.type_tag_for_sql(node.to)
+        if cast_tag and typemap.is_array_tag(cast_tag):
+            return typemap.array_element_tag(cast_tag)
+    if not values:
+        return "any"
+    tag = typemap.infer_elem_tag(values)
+    if tag == "int8" and all(
+        v is None or (isinstance(v, int) and -_INT4_MAX - 1 <= v <= _INT4_MAX) for v in values
+    ):
+        return "int4"
+    return tag
+
+
 def _values_and_tag(
     node: exp.Expression, ctx: Any, describe_only: bool = False
 ) -> tuple[list[Any], str]:
@@ -351,18 +382,17 @@ def _values_and_tag(
             ev(node.args.get("start")), ev(node.args.get("end")), ev(node.args.get("step"))
         )
     if isinstance(node, (exp.Unnest, exp.Explode)):
-        arr = ev(node.expressions[0] if node.expressions else node.this)
-        return (
-            list(arr) if isinstance(arr, (list, tuple)) else ([] if arr is None else [arr])
-        ), "any"
+        arg = node.expressions[0] if node.expressions else node.this
+        arr = ev(arg)
+        values = list(arr) if isinstance(arr, (list, tuple)) else ([] if arr is None else [arr])
+        return values, _unnest_elem_tag(arg, values)
     if isinstance(node, exp.Anonymous):
         name = str(node.this).rsplit(".", 1)[-1].lower()
         args = node.expressions
         val = ev(args[0]) if args else None
         if name in ("unnest",):
-            return (
-                list(val) if isinstance(val, (list, tuple)) else ([] if val is None else [val])
-            ), "any"
+            values = list(val) if isinstance(val, (list, tuple)) else ([] if val is None else [val])
+            return values, _unnest_elem_tag(args[0] if args else None, values)
         if name == "generate_subscripts":
             n = len(val) if isinstance(val, (list, tuple)) else 0
             return list(range(1, n + 1)), "int4"
