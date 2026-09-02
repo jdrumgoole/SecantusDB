@@ -258,6 +258,9 @@ def _frames(
         if kind == "ROWS":
             lo = _rows_bound(start, start_side, i, n, is_start=True)
             hi = _rows_bound(end, end_side, i, n, is_start=False)
+        elif kind == "GROUPS":
+            lo = _groups_bound(start, start_side, i, n, okeys, is_start=True)
+            hi = _groups_bound(end, end_side, i, n, okeys, is_start=False)
         else:
             lo = _range_bound(start, start_side, i, n, okeys, order_dirs, is_start=True)
             hi = _range_bound(end, end_side, i, n, okeys, order_dirs, is_start=False)
@@ -277,6 +280,44 @@ def _peer_start(okeys: list[tuple], i: int) -> int:
     while j > 0 and okeys[j - 1] == okeys[i]:
         j -= 1
     return j
+
+
+def _peer_group_bounds(okeys: list[tuple], n: int) -> tuple[list[int], list[int], list[int]]:
+    """Peer groups of the partition: each row's group index, and each group's
+    first and last row."""
+    gids: list[int] = []
+    starts: list[int] = []
+    ends: list[int] = []
+    for i in range(n):
+        if i == 0 or okeys[i] != okeys[i - 1]:
+            starts.append(i)
+            if ends or i:
+                ends.append(i - 1)
+        gids.append(len(starts) - 1)
+    ends.append(n - 1)
+    return gids, starts, ends[1:] if len(ends) > len(starts) else ends
+
+
+def _groups_bound(
+    val: Any, side: Any, i: int, n: int, okeys: list[tuple], *, is_start: bool
+) -> int:
+    """A `GROUPS` frame bound: the offset counts PEER GROUPS, not rows.
+
+    `GROUPS` was not handled at all — it fell through to the RANGE branch and
+    reported `RANGE with a numeric offset requires a numeric ORDER BY key`, an
+    error about a clause the user had not written. `GROUPS BETWEEN CURRENT ROW
+    AND 1 FOLLOWING` over `a, a, b` frames the first two rows across both
+    groups (3 rows) and the last across its own (1)."""
+    gids, starts, ends = _peer_group_bounds(okeys, n)
+    g = gids[i]
+    if val is None or val == "CURRENT ROW":
+        return starts[g] if is_start else ends[g]
+    if val == "UNBOUNDED":
+        return 0 if side == "PRECEDING" else n - 1
+    offset = int(val.this) if isinstance(val, exp.Literal) else int(val)
+    target = g - offset if side == "PRECEDING" else g + offset
+    target = max(0, min(target, len(starts) - 1))
+    return starts[target] if is_start else ends[target]
 
 
 def _rows_bound(val: Any, side: Any, i: int, n: int, *, is_start: bool) -> int:
