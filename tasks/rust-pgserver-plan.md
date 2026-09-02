@@ -602,7 +602,71 @@ about a real wrong answer.
 **Still failing in `test_datetime.py`, with counts:** `interval` 128, `inf` /
 `-inf` timestamps 60, BC dates 30, `'epoch'` 6.
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295.**
+### 0.22 interval (2026-09-02)
+
+**~1298 -> ~1372.** The last big single-type item on the board.
+
+**An interval refuses to be one number, and that is the whole design.**
+PostgreSQL keeps months, days and microseconds separately because none converts
+to another without a calendar: a month is 28-31 days depending on where you
+start, and `2026-01-31 + '1 mon'` is `2026-02-28` -- a result no count of
+microseconds expresses. `+ '30 days'` on the same date gives `2026-03-02`, and
+both are right for what was asked.
+
+**Comparison goes the other way**, which is the part that would be missed by
+anyone implementing from the arithmetic: PostgreSQL FLATTENS the parts for
+ordering using 30-day months and 24-hour days, so `'1 mon' = '30 days'` is TRUE
+while adding them lands on different dates. Ordering goes through
+`comparable_micros`; arithmetic keeps the parts apart.
+
+**Three input grammars, all of which combine**: verbose (`1 year 2 months`, with
+abbreviations, and `week` -> 7 days), a bare time (`02:03:04.5`, own sign, may
+exceed 24 hours), and ISO 8601 (`P1Y2M3D`, where `M` is months before the `T`
+and minutes after it). Each component keeps its own sign: `1 day -02:03:04`.
+
+**A silent factor-of-60,000 bug, caught by the differential.** Depluralising a
+unit with `trim_end_matches('s')` turned `s` (seconds) into the empty string and
+`ms` (milliseconds) into `m` (minutes). The first showed up as a parse failure;
+the second would have been a wrong ANSWER, and no probe in the first batch
+covered `ms`. The fix strips the `s` only when what remains is still a unit, and
+`interval_units_survive_depluralisation` pins all seven spellings.
+
+**Probe: 46 shapes plus 10 bound values across both wire formats, 0
+divergences.**
+
+**The BACKLOG predicted a bug in code that did not exist yet.** An entry from
+2026-08-30 recorded, for the Python server, that a bare unknown literal beside
+an interval coerces to an INTERVAL rather than a timestamp -- so
+`'2020-01-01' + interval '1 day'` is `22007`, not date arithmetic. The Rust
+implementation written today reproduced the identical bug, and the entry is
+what caught it: the differential probe had not covered the shape. Reading the
+backlog for the AREA you are working, not just for the item you claimed, is
+worth the minute it costs.
+
+The discrimination has to be made on the AST NODE rather than the value,
+because a `::date` cast is also a string at that point -- so a bare `AConst`
+string is what marks an unresolved literal. `+` / `-` only: for `*` / `/`
+PostgreSQL resolves the unknown to a NUMBER, which is why
+`interval '1 day' * '2'` is two days.
+
+**Scaling spills fractions downward** (`'1 mon' * 1.5` is `1 mon 15 days`,
+`'1 year' * 0.5` is `6 mons`), and `/ 0` is `22012` rather than an infinity.
+
+**A new differential lane: shared REFUSALS.** `test_error_sqlstate_matches_
+postgres` compares SQLSTATEs for statements both servers must reject -- a row
+comparison passes trivially when both sides raise, so wrong error CODES were
+invisible to the existing lane. Its guard immediately earned its keep by
+rejecting two cases drafted for it that PostgreSQL actually ACCEPTS (nested
+arrays, a 35-digit numeric): those are this server's documented limitations,
+not shared refusals. It also caught an unseeded-oracle bug in its own first
+draft, where a missing fixture table answered 42P01 there against 42703 here.
+
+**Next, re-ranked at ~1372:** `DROP <non-table>` 207 (really user-defined types:
+`test_enum.py` + `test_composite.py`, needing `CREATE TYPE` and `pg_catalog` --
+a campaign), `comparing these operands with =` 120, COPY binary 119, `CREATE
+SCHEMA` 71, cursors 70, `json`/`jsonb` 68 each, `chr` 47, `generate_series` 43.
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372.**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

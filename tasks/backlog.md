@@ -4212,8 +4212,8 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 - **Rust PG server: `'infinity'` / `'-infinity'` timestamps and dates (60
   psycopg tests), BC-era dates (30), and `'epoch'` (6) do not parse.** These
   need sentinel values that survive the whole pipeline rather than a parse fix.
-- **Rust PG server: `json` / `jsonb`, `interval` and `oid` casts are
-  unsupported**, and binary parameters of those oids with them
+- **Rust PG server: `json` / `jsonb` and `oid` casts are unsupported**, and
+  binary parameters of those oids with them
   (the binary decoder covers `numeric` / `date` / `time` / `timestamp` / arrays;
   a type it does not have cannot be decoded into one).
 - **Rust PG server: a multidimensional array sent as a BINARY parameter is

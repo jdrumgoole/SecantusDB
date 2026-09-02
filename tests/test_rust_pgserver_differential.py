@@ -13,6 +13,7 @@ Needs BOTH:
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import os
 import time
@@ -339,6 +340,60 @@ QUERIES = [
     "SELECT '2026-01-01 12:00:00.123456'::timestamp",
     "SELECT '1969-07-20 20:17:40'::timestamp",
     "SELECT '2026-01-01 12:00'::timestamp::text",
+    # --- interval: three independent parts, flattened only for comparison ---
+    "SELECT '1 day'::interval::text",
+    "SELECT '1 day 02:03:04'::interval::text",
+    "SELECT '1d 3h 4m 5.678s'::interval::text",
+    "SELECT '1 year 2 months'::interval::text",
+    "SELECT 'P1Y2M3D'::interval::text",
+    "SELECT 'PT1H2M3S'::interval::text",
+    "SELECT '1 mon -1 day'::interval::text",
+    "SELECT '1.5 days'::interval::text",
+    "SELECT '1 week'::interval::text",
+    "SELECT '12 mons'::interval::text",
+    "SELECT '13 mons'::interval::text",
+    "SELECT '0'::interval::text",
+    "SELECT '25:00:00'::interval::text",
+    "SELECT '0.5 sec'::interval::text",
+    "SELECT '500 ms'::interval::text",
+    "SELECT '1000 us'::interval::text",
+    "SELECT '2 hrs 30 mins'::interval::text",
+    "SELECT '-1 day'::interval::text",
+    "SELECT '-1 mon'::interval::text",
+    "SELECT '-13 mons'::interval::text",
+    "SELECT '-1.5 hours'::interval::text",
+    "SELECT '1 day -02:03:04'::interval::text",
+    "SELECT '100 years'::interval::text",
+    "SELECT pg_typeof('1 day'::interval)::text",
+    # Comparison flattens: 30-day months, 24-hour days.
+    "SELECT '1 day'::interval = '24:00:00'::interval",
+    "SELECT '1 mon'::interval = '30 days'::interval",
+    "SELECT '1 day'::interval < '25:00:00'::interval",
+    "SELECT '1 day'::interval > '1 hour'::interval",
+    # Arithmetic keeps them apart: months clamp to the month end.
+    "SELECT ('2026-01-31'::timestamp + '1 mon'::interval)::text",
+    "SELECT ('2026-01-31'::timestamp + '2 mons'::interval)::text",
+    "SELECT ('2024-02-29'::timestamp + '1 year'::interval)::text",
+    "SELECT ('2026-03-01 12:00'::timestamp - '1 day'::interval)::text",
+    "SELECT ('2026-01-01 00:00'::timestamp + '1d 3h 4m 5.678s'::interval)::text",
+    "SELECT ('1 day'::interval + '2 hours'::interval)::text",
+    "SELECT ('1 mon'::interval - '1 day'::interval)::text",
+    # Beside an interval, a bare UNKNOWN literal coerces to an INTERVAL — not
+    # to a timestamp — so this is 22007 rather than date arithmetic. A typed
+    # operand keeps datetime arithmetic. `tasks/backlog.md` recorded this rule
+    # from the Python server; the Rust one reproduced the same bug until it did.
+    "SELECT ('1 day' + interval '1 day')::text",
+    "SELECT (interval '1 day' - '2 hours')::text",
+    "SELECT ('2020-01-01'::timestamp + interval '1 day')::text",
+    "SELECT ('2020-01-01'::date + interval '1 day')::text",
+    # Scaling spills fractions downward: months to days, days to time.
+    "SELECT (interval '1 day' * 2)::text",
+    "SELECT (interval '1 day' * 0.5)::text",
+    "SELECT (interval '1 mon' * 1.5)::text",
+    "SELECT (interval '1 year' * 0.5)::text",
+    "SELECT (interval '1 day' / 2)::text",
+    "SELECT (interval '1 mon 1 day' * 2)::text",
+    "SELECT (2 * interval '1 day')::text",
 ]
 
 # (statement, verification query) — the write is compared by its row count AND
@@ -467,6 +522,10 @@ PARAMETERISED = [
     ("SELECT %s::int4[]", ([1, None, 3],)),
     ("SELECT %s::text[]", (["a", "b"],)),
     ("SELECT %s::int8[]", ([10**12, 2],)),
+    ("SELECT %s::interval", (dt.timedelta(days=1),)),
+    ("SELECT %s::interval", (dt.timedelta(days=1, hours=2, minutes=3, seconds=4),)),
+    ("SELECT %s::interval", (dt.timedelta(seconds=-1),)),
+    ("SELECT %s::interval", (dt.timedelta(microseconds=500000),)),
     # A bound NULL must behave exactly like a literal one.
     ("SELECT id FROM d WHERE n = %s", (None,)),
     ("SELECT id FROM d WHERE n <> %s", (None,)),
@@ -527,6 +586,54 @@ def test_timezone_query_matches_postgres(
     assert mine == theirs, f"[{tz}] {sql}\n  postgres={theirs}\n  ours    ={mine}"
     for conn in (oracle, ours):
         conn.cursor().execute("set timezone to 'UTC'")
+
+
+# Statements both servers must REFUSE, with the same SQLSTATE. A wrong answer
+# and a wrong error code are both divergences, and only the first shows up in a
+# row comparison — these would pass a `_rows` test by raising on both sides.
+ERROR_QUERIES = [
+    # Beside an interval a bare unknown literal coerces to an INTERVAL, so this
+    # is a bad interval rather than date arithmetic.
+    "SELECT ('2020-01-01' + interval '1 day')::text",
+    "SELECT (interval '1 day' + '2020-01-01')::text",
+    "SELECT 1/0",
+    "SELECT 'x'::numeric",
+    "SELECT 'x'::int",
+    "SELECT '2026-13-01'::date",
+    "SELECT nosuchcolumn FROM d",
+    "SELECT * FROM nosuchtable",
+]
+
+
+@pytest.mark.parametrize("sql", ERROR_QUERIES, ids=lambda s: s[:52])
+def test_error_sqlstate_matches_postgres(
+    sql: str, ours: psycopg.Connection, oracle: psycopg.Connection
+) -> None:
+    """Both servers refuse, and name the same SQLSTATE."""
+    # Seed the oracle, exactly as the row comparison does. Without this the
+    # fixture table is missing THERE and present HERE, so a bad-column case
+    # answers 42P01 against 42703 and looks like a server divergence.
+    _reset_oracle(oracle)
+
+    def refusal(conn: psycopg.Connection) -> str:
+        try:
+            conn.cursor().execute(sql)
+        except psycopg.Error as exc:
+            return exc.diag.sqlstate or "?"
+        else:
+            return "accepted"
+        finally:
+            with contextlib.suppress(Exception):
+                conn.rollback()
+
+    theirs = refusal(oracle)
+    mine = refusal(ours)
+    # This guard has already earned its keep: two cases drafted for this list
+    # were ones PostgreSQL ACCEPTS and this server deliberately refuses
+    # (nested arrays, a 35-digit numeric). Those are documented limitations,
+    # not shared refusals, and belong in the backlog rather than here.
+    assert theirs != "accepted", f"the oracle accepted {sql}; the case is wrong"
+    assert mine == theirs, f"{sql}\n  postgres={theirs}\n  ours    ={mine}"
 
 
 @pytest.mark.parametrize("sql,params", PARAMETERISED, ids=lambda v: str(v)[:52])
