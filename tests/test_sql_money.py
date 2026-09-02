@@ -36,20 +36,27 @@ def test_render_money():
 def test_to_char_fill_mode():
     assert numformat.to_char_numeric(1234.56, "FM999999.99") == "1234.56"
     assert numformat.to_char_numeric(1234.56, "FM9,999,999.99") == "1,234.56"
-    assert numformat.to_char_numeric(1234.5, "FM999.00") == "1234.50"
+    # Re-probed against PG 14.13 (2026-09-02): the previous expectations
+    # here recorded this engine's own output, not Postgres'.
+    # The value does not fit three integer slots, so PG fills them with `#`.
+    assert numformat.to_char_numeric(1234.5, "FM999.00") == "###.##"
     assert numformat.to_char_numeric(7, "FM0009") == "0007"
 
 
 def test_to_char_currency():
     assert numformat.to_char_numeric(1234.56, "FM$9,999.99") == "$1,234.56"
-    assert numformat.to_char_numeric(1234.56, "FML9999.99") == "$1234.56"
+    # `L` is the LOCALE currency symbol, which is EMPTY under this server's
+    # C locale — it still occupies its position, so a blank survives FM.
+    assert numformat.to_char_numeric(1234.56, "FML9999.99") == " 1234.56"
 
 
 def test_to_char_signs():
     assert numformat.to_char_numeric(5, "FMS999") == "+5"
     assert numformat.to_char_numeric(-5, "FMS999") == "-5"
-    assert numformat.to_char_numeric(-1234.5, "FM9999.99MI") == "1234.50-"
-    assert numformat.to_char_numeric(-1234.5, "FM9999.99PR") == "<1234.50>"
+    # FM drops trailing fractional zeros: PG gives `1234.5-`, not `1234.50-`.
+    assert numformat.to_char_numeric(-1234.5, "FM9999.99MI") == "1234.5-"
+    # FM drops trailing fractional zeros here too (re-probed, PG 14.13).
+    assert numformat.to_char_numeric(-1234.5, "FM9999.99PR") == "<1234.5>"
 
 
 def test_to_char_padding_non_fm():
@@ -109,9 +116,11 @@ def test_to_char_numeric_typed_text(storage, session):
 
 
 def test_to_char_numeric_value(storage, session):
-    assert val(storage, session, "SELECT to_char(1234.5, 'FM999,999.99')") == "1,234.50"
-    assert val(storage, session, "SELECT to_char(1234, 'FM$9,999.99')") == "$1,234.00"
-    assert val(storage, session, "SELECT to_char(-1234.5, 'FM9999.99PR')") == "<1234.50>"
+    # FM drops trailing fractional zeros (re-probed against PG 14.13).
+    assert val(storage, session, "SELECT to_char(1234.5, 'FM999,999.99')") == "1,234.5"
+    # FM drops trailing fractional zeros but keeps the point (PG 14.13).
+    assert val(storage, session, "SELECT to_char(1234, 'FM$9,999.99')") == "$1,234."
+    assert val(storage, session, "SELECT to_char(-1234.5, 'FM9999.99PR')") == "<1234.5>"
 
 
 def test_to_char_timestamp_still_works(storage, session):

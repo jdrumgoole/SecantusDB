@@ -1450,7 +1450,8 @@ def test_money_and_to_char_via_driver(server):
 
     # numeric to_char.
     cur.execute("SELECT to_char(1234.5, 'FM$9,999.99')")
-    assert cur.fetchone()[0] == "$1,234.50"
+    # FM drops trailing fractional zeros (re-probed against PG 14.13).
+    assert cur.fetchone()[0] == "$1,234.5"
 
     # equality lowers to a Mongo filter.
     cur.execute("SELECT id FROM items WHERE price = '19.99'")

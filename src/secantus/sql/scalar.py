@@ -2063,7 +2063,11 @@ def _eval_to_char(node: exp.TimeToStr, scope: Scope, ctx: ScalarContext) -> Any:
         from secantus.sql import numformat as _numformat
 
         num = src.to_decimal() if isinstance(src, bson.Decimal128) else src
-        return _numformat.to_char_numeric(num, fmt)
+        # The template in the AST has already been part-converted to strftime by
+        # sqlglot's postgres dialect — `MI999` arrives as `%M999` and `9999D99`
+        # as `9999%u99` — so the NUMERIC formatter saw tokens that are not its
+        # own and silently dropped them. Recover the original template first.
+        return _numformat.to_char_numeric(num, _recover_pg_format(fmt))
     from secantus.sql import intervals as _intervals
 
     if _intervals.is_interval(src):
