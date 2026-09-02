@@ -400,6 +400,8 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$indexOfArray" => op_index_of_array(arg, ctx),
         // $sum/$avg/$max/$min as expression operators (MongoDB 5.0+)
         "$sum" => op_expr_sum(arg, ctx),
+        "$stdDevPop" => op_expr_std_dev(arg, ctx, true),
+        "$stdDevSamp" => op_expr_std_dev(arg, ctx, false),
         "$avg" => op_expr_avg(arg, ctx),
         "$max" => op_expr_max(arg, ctx),
         "$min" => op_expr_min(arg, ctx),
@@ -1522,6 +1524,35 @@ fn expr_acc_values(arg: &Bson, ctx: &Ctx) -> Result<Vec<Bson>, Fallback> {
         Bson::Null => Ok(Vec::new()),
         other => Ok(vec![other]),
     }
+}
+
+/// `$stdDevPop` / `$stdDevSamp` in EXPRESSION position.
+///
+/// The ACCUMULATOR forms shipped long ago; the expression forms -- over an array
+/// argument in `$project` / `$addFields` -- did not, so all 28 shapes of each
+/// answered "operator not supported by the Rust server" where mongod computes.
+/// On the standalone server that is an error, not a fallback.
+///
+/// Shares `group::std_dev` with the accumulators so the two forms cannot answer
+/// different numbers, and drops non-numeric members exactly as they do: mongod
+/// counts int / long / double / decimal and silently SKIPS bool, null, string,
+/// array and document (probed 8.2.11 -- `{$stdDevPop: [1, 2, 3]}` is
+/// 0.816496580927726 and `$stdDevSamp` is 1.0).
+fn op_expr_std_dev(arg: &Bson, ctx: &Ctx, pop: bool) -> R {
+    let values: Vec<f64> = expr_acc_values(arg, ctx)?
+        .iter()
+        .filter_map(|v| match v {
+            // A bool is NOT a number here, as everywhere else in this engine.
+            Bson::Boolean(_) => None,
+            Bson::Int32(n) => Some(f64::from(*n)),
+            Bson::Int64(n) => Some(*n as f64),
+            Bson::Double(d) => Some(*d),
+            Bson::Decimal128(_) => crate::decimal::from_bson(v)
+                .and_then(|d| crate::decimal::to_string(&d).parse::<f64>().ok()),
+            _ => None,
+        })
+        .collect();
+    Ok(crate::group::std_dev(&values, pop).map_or(Bson::Null, Bson::Double))
 }
 
 fn op_expr_sum(arg: &Bson, ctx: &Ctx) -> R {
@@ -6348,5 +6379,86 @@ mod set_equals_arity_tests {
             eval_expr(bson::bson!({"$setEquals": [[1], [1], [1]]})).unwrap(),
             Bson::Boolean(true)
         );
+    }
+}
+
+#[cfg(test)]
+mod std_dev_expression_tests {
+    //! The `$group` ACCUMULATOR forms shipped long ago; the EXPRESSION forms did
+    //! not, so all 56 shapes in the probe corpus answered "operator not
+    //! supported by the Rust server" where mongod computes a number. On the
+    //! standalone server that is an error, not a fallback.
+    //!
+    //! Values probed against mongod 8.2.11 (2026-09-02).
+
+    use super::*;
+    use bson::{doc, Bson};
+
+    fn eval_expr(expr: Bson) -> Bson {
+        evaluate(&doc! {}, &expr, &Document::new()).expect("should evaluate")
+    }
+
+    fn approx(v: Bson) -> f64 {
+        match v {
+            Bson::Double(d) => d,
+            other => panic!("expected a double, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn population_and_sample_differ_by_their_denominator() {
+        assert!(
+            (approx(eval_expr(bson::bson!({"$stdDevPop": [1, 2, 3]}))) - 0.816_496_580_927_726)
+                .abs()
+                < 1e-12
+        );
+        assert!((approx(eval_expr(bson::bson!({"$stdDevSamp": [1, 2, 3]}))) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_single_value_is_zero_for_pop_and_null_for_samp() {
+        assert_eq!(
+            eval_expr(bson::bson!({"$stdDevPop": [5]})),
+            Bson::Double(0.0)
+        );
+        assert_eq!(eval_expr(bson::bson!({"$stdDevSamp": [5]})), Bson::Null);
+    }
+
+    #[test]
+    fn non_numeric_members_are_skipped_not_errors() {
+        // Probed: `$stdDevPop` over [5, "x", 7] is 1.0 -- the string is dropped,
+        // leaving two values, not an error and not a zero.
+        let got = approx(eval_expr(bson::bson!({"$stdDevPop": [5, "x", 7]})));
+        assert!((got - 1.0).abs() < 1e-12, "{got}");
+    }
+
+    #[test]
+    fn a_bool_is_not_a_number_here_either() {
+        // Bools alone leave no values at all.
+        assert_eq!(
+            eval_expr(bson::bson!({"$stdDevPop": [true, false]})),
+            Bson::Null
+        );
+    }
+
+    #[test]
+    fn an_empty_or_null_argument_is_null() {
+        assert_eq!(eval_expr(bson::bson!({"$stdDevPop": []})), Bson::Null);
+        assert_eq!(
+            eval_expr(bson::bson!({"$stdDevPop": Bson::Null})),
+            Bson::Null
+        );
+    }
+
+    #[test]
+    fn a_single_non_array_value_is_one_element() {
+        assert_eq!(eval_expr(bson::bson!({"$stdDevPop": 5})), Bson::Double(0.0));
+        assert_eq!(eval_expr(bson::bson!({"$stdDevSamp": 5})), Bson::Null);
+    }
+
+    #[test]
+    fn the_numeric_widths_all_count() {
+        let got = approx(eval_expr(bson::bson!({"$stdDevPop": [1i32, 2i64, 3.0f64]})));
+        assert!((got - 0.816_496_580_927_726).abs() < 1e-12, "{got}");
     }
 }
