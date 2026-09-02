@@ -4306,16 +4306,37 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   expression forms never did, so all 56 shapes refused valid input).
 
   **116 of the original 946 defers were valid input being REFUSED** — mongod
-  answers, the Rust server errors. 56 of those were `$stdDev*`; the other 60 are
-  almost all a **Decimal128 operand** reaching a math operator (`$abs`, `$add`,
-  `$acosh`, `$asinh`, `$atan`, `$atan2`, `$ceil`, `$cmp`, …), which the engine
-  declines with comments reading "-> Python" / "defers to the pure oracle" — the
-  exact phrasing this file warns about, and meaningless on a server with no
-  Python behind it. In practice **a collection holding Decimal128 values cannot
-  use most math operators on the Rust server.** `crates/secantus-core/src/
-  decimal.rs` already has `add` / `mul` / `div_int` / `parse` / `to_string`; the
-  transcendental functions would need real decimal math, which is a dependency
-  decision rather than a port.
+  answers, the Rust server errors. Broken down and partly closed:
+
+  - **56 `$stdDev*`** — fixed (the expression forms were never implemented).
+  - **13 ObjectId-as-date** — fixed, a straight port of the Python change:
+    mongod accepts every BSON type CARRYING a timestamp (Date, ObjectId,
+    Timestamp) and a one-element array as the argument.
+  - **38 a `Decimal128` operand reaching a math / comparison / conversion
+    operator** — still open, see below.
+  - ~9 stragglers: `$rand: []`, `$substr*` with an array argument, `$toDouble`
+    / `$toLong` / `$toDecimal` of a datetime, `$strcasecmp` of a double.
+
+- [ ] **Decimal128 operands are refused by 38 Rust operators (2026-09-02).**
+  `$abs`, `$add`, `$subtract`, `$multiply`, `$divide`, `$mod`, `$ceil`,
+  `$floor`, `$trunc`, `$round`, `$cmp`, `$gt`, `$gte`, `$lt`, `$lte`, `$pow`,
+  `$sqrt`, `$exp`, `$ln`, `$log10`, the six trig and four hyperbolic functions,
+  `$degreesToRadians` / `$radiansToDegrees`, and `$toBool` / `$toDate` /
+  `$toDouble` / `$toInt` / `$toLong`. Each declines with a comment reading
+  "-> Python" or "defers to the pure oracle" — meaningless here — so **a
+  collection holding Decimal128 values cannot use most math operators on the
+  Rust server.** mongod answers all 38.
+
+  **Scoped, not guessed** (2026-09-02): `crates/secantus-core/src/decimal.rs`
+  represents a value as sign / coefficient / exponent with `add`, `mul`,
+  `div_int`, `parse`, `to_string`, `to_bson` and `trunc_to_i64`. So roughly
+  **19 of the 38 are reachable with what is already there** — `$abs` is a sign
+  flip, `$subtract` is `add` with a flipped sign, the comparisons need one
+  `cmp`, and the conversions have their primitives. The other ~17 are
+  transcendental and need real decimal math: a dependency decision, and the
+  place to start is a probe of what mongod returns for each (result TYPE,
+  precision and overflow behaviour all differ per operator, so this is 19
+  individually-probed operators rather than one change).
 
   Original entry, for the record: **1,376 of 3,968 (2026-09-02).**
   Was 1,376; the parse pass below took out the systematic half. **946 of the

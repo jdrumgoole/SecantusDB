@@ -2694,23 +2694,52 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 /// instant via `chrono-tz` (the unambiguous instant→wall-clock direction, matching
 /// `$dateToString` and Python `zoneinfo`). An unknown zone / non-string timezone
 /// defers to Python.
+/// The instant a date-operator OPERAND names, in epoch milliseconds.
+///
+/// mongod accepts every BSON type that CARRIES a timestamp -- Date, ObjectId
+/// (its 4-byte generation time) and Timestamp (its seconds field) -- and a
+/// ONE-ELEMENT array is the argument itself. Probed 8.2.11 (2026-09-02):
+/// `{$year: ObjectId("64b7f9a2…")}` answers 2023, where this used to defer and
+/// so ERRORED on the standalone server for input mongod answers. The Python
+/// engine took the same fix.
+fn timestamp_bearing_millis(v: &Bson) -> Option<i64> {
+    match v {
+        Bson::DateTime(dt) => Some(dt.timestamp_millis()),
+        // The ObjectId's first four bytes are the generation time in SECONDS.
+        Bson::ObjectId(oid) => {
+            let b = oid.bytes();
+            let secs = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as i64;
+            Some(secs * 1000)
+        }
+        Bson::Timestamp(ts) => Some(i64::from(ts.time) * 1000),
+        Bson::Array(a) if a.len() == 1 => timestamp_bearing_millis(&a[0]),
+        _ => None,
+    }
+}
+
 fn date_operand_millis(arg: &Bson, ctx: &Ctx) -> Result<Option<i64>, Fallback> {
     if let Bson::Document(d) = arg {
         let is_operator = d.len() == 1 && d.keys().next().is_some_and(|k| k.starts_with('$'));
         if d.contains_key("date") && !is_operator {
-            let millis = match eval(d.get("date").unwrap(), ctx)? {
-                Bson::DateTime(dt) => dt.timestamp_millis(),
-                Bson::Null => return Ok(None), // null / missing -> null
-                _ => return Err(Fallback::Defer), // non-date -> Python raises Location16006
+            let value = eval(d.get("date").unwrap(), ctx)?;
+            if matches!(value, Bson::Null) {
+                return Ok(None); // null / missing -> null
+            }
+            // Non-date, and not a type carrying a timestamp -> Location16006.
+            let Some(millis) = timestamp_bearing_millis(&value) else {
+                return Err(Fallback::Defer);
             };
             let offset_ms = timezone_offset_ms(d.get("timezone"), millis)?;
             return Ok(Some(millis + offset_ms));
         }
     }
-    match eval(arg, ctx)? {
-        Bson::DateTime(dt) => Ok(Some(dt.timestamp_millis())),
-        Bson::Null => Ok(None),    // null / missing -> null
-        _ => Err(Fallback::Defer), // non-date -> Python raises Location16006
+    let value = eval(arg, ctx)?;
+    if matches!(value, Bson::Null) {
+        return Ok(None); // null / missing -> null
+    }
+    match timestamp_bearing_millis(&value) {
+        Some(millis) => Ok(Some(millis)),
+        None => Err(Fallback::Defer), // Location16006
     }
 }
 
@@ -6460,5 +6489,84 @@ mod std_dev_expression_tests {
     fn the_numeric_widths_all_count() {
         let got = approx(eval_expr(bson::bson!({"$stdDevPop": [1i32, 2i64, 3.0f64]})));
         assert!((got - 0.816_496_580_927_726).abs() < 1e-12, "{got}");
+    }
+}
+
+#[cfg(test)]
+mod timestamp_bearing_date_tests {
+    //! mongod accepts every BSON type that CARRIES a timestamp as a date, so
+    //! `{$year: ObjectId("64b7f9a2…")}` answers 2023. This engine deferred, and
+    //! on the standalone server a defer is an ERROR -- so 13 shapes refused
+    //! input mongod answers. The Python engine took the same fix.
+    //!
+    //! Probed against mongod 8.2.11 (2026-09-02).
+
+    use super::*;
+    use bson::{doc, oid::ObjectId, Bson};
+
+    /// Generated 2023-07-19 14:56:34 UTC -- the first four bytes are the
+    /// generation time in seconds.
+    fn oid() -> ObjectId {
+        ObjectId::parse_str("64b7f9a2c1d2e3f4a5b6c7d8").unwrap()
+    }
+
+    fn eval_expr(expr: Bson) -> Bson {
+        evaluate(&doc! {}, &expr, &Document::new()).expect("should evaluate")
+    }
+
+    #[test]
+    fn an_objectid_is_a_date() {
+        assert_eq!(eval_expr(bson::bson!({"$year": oid()})), Bson::Int32(2023));
+        assert_eq!(
+            eval_expr(bson::bson!({"$dayOfMonth": oid()})),
+            Bson::Int32(19)
+        );
+        assert_eq!(eval_expr(bson::bson!({"$hour": oid()})), Bson::Int32(14));
+        assert_eq!(eval_expr(bson::bson!({"$minute": oid()})), Bson::Int32(56));
+    }
+
+    #[test]
+    fn a_timestamp_is_a_date() {
+        let ts = Bson::Timestamp(bson::Timestamp {
+            time: 1_689_778_594,
+            increment: 1,
+        });
+        assert_eq!(eval_expr(bson::bson!({"$year": ts})), Bson::Int32(2023));
+    }
+
+    #[test]
+    fn a_one_element_array_is_the_argument_itself() {
+        assert_eq!(
+            eval_expr(bson::bson!({"$year": [oid()]})),
+            Bson::Int32(2023)
+        );
+    }
+
+    #[test]
+    fn the_object_form_takes_them_too() {
+        assert_eq!(
+            eval_expr(bson::bson!({"$year": {"date": oid()}})),
+            Bson::Int32(2023)
+        );
+    }
+
+    #[test]
+    fn a_real_date_and_null_are_unchanged() {
+        let dt = Bson::DateTime(bson::DateTime::from_millis(1_689_778_594_000));
+        assert_eq!(eval_expr(bson::bson!({"$year": dt})), Bson::Int32(2023));
+        assert_eq!(eval_expr(bson::bson!({"$year": Bson::Null})), Bson::Null);
+    }
+
+    #[test]
+    fn types_with_no_timestamp_in_them_still_defer() {
+        // 16006 territory -- named by the Python oracle, not answered here.
+        for bad in [
+            Bson::Int32(5),
+            Bson::String("x".into()),
+            Bson::Boolean(true),
+        ] {
+            let expr = bson::bson!({"$year": bad});
+            assert!(evaluate(&doc! {}, &expr, &Document::new()).is_err());
+        }
     }
 }
