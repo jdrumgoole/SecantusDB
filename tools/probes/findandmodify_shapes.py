@@ -6,13 +6,11 @@ drivers key on, and nothing in the gauges compares them field for field.
 """
 
 import os
-import tempfile
+import sys
 
-import pymongo
+sys.path.insert(0, os.path.dirname(__file__))
 
-from secantus import SecantusDBServer
-
-MONGOD = os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041")
+from _servers import probe_targets, report  # noqa: E402
 
 CASES = [
     # (label, seed docs, command-extras)
@@ -97,24 +95,23 @@ def run(cli, dbname, seed, extras):
 
 
 def main():
-    d = tempfile.mkdtemp()
-    s = SecantusDBServer(port=0, storage_path=d, replica_set_name="secantus")
-    s.start()
-    sec = pymongo.MongoClient(f"mongodb://{s.address[0]}:{s.address[1]}", directConnection=True)
-    mon = pymongo.MongoClient(MONGOD, directConnection=True, serverSelectionTimeoutMS=8000)
-    diffs = []
-    for i, (label, seed, extras) in enumerate(CASES):
-        a = run(mon, f"fam{i}", seed, extras)
-        b = run(sec, f"fam{i}", seed, extras)
-        if a != b:
-            diffs.append((label, a, b))
-    print(f"  cases: {len(CASES)}   divergences: {len(diffs)}\n")
-    for label, mongo, ours in diffs:
-        print(f"  {label}")
-        print(f"    mongod  : {mongo}")
-        print(f"    secantus: {ours}\n")
-    sec.close()
-    s.stop()
+    with probe_targets(replica_set="secantus") as (mon, targets):
+        divergent = {label: 0 for label, _ in targets}
+        for i, (label, seed, extras) in enumerate(CASES):
+            expected = run(mon, f"fam{i}", seed, extras)
+            got = {name: run(cli, f"fam{i}", seed, extras) for name, cli in targets}
+            off = {k for k, v in got.items() if v != expected}
+            if not off:
+                continue
+            for name in off:
+                divergent[name] += 1
+            print(f"  {label}")
+            print(f"    mongod  : {expected}")
+            for name, value in got.items():
+                mark = "   <-- diverges" if name in off else ""
+                print(f"    {name:8s}: {value}{mark}")
+            print()
+        return report("findAndModify reply shapes", len(CASES), divergent)
 
 
-main()
+sys.exit(main())

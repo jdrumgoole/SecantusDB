@@ -1,8 +1,9 @@
-import tempfile
+import os
+import sys
 
-import pymongo
+sys.path.insert(0, os.path.dirname(__file__))
 
-from secantus import SecantusDBServer
+from _servers import probe_targets, report  # noqa: E402
 
 CASES = [
     ("same path, two ops", {"a": 1}, {"$set": {"a": 2}, "$inc": {"a": 1}}),
@@ -37,22 +38,20 @@ def run(cli, dbn, seed, upd):
         return f"RAISE {getattr(e, 'code', None)}"
 
 
-d = tempfile.mkdtemp()
-s = SecantusDBServer(port=0, storage_path=d, replica_set_name="secantus")
-s.start()
-sec = pymongo.MongoClient(f"mongodb://{s.address[0]}:{s.address[1]}", directConnection=True)
-mon = pymongo.MongoClient(
-    "mongodb://127.0.0.1:27036", directConnection=True, serverSelectionTimeoutMS=8000
-)
-bad = 0
-print(f"  {'case':<26}{'mongod':<26}{'secantus':<26}")
-for i, (label, seed, upd) in enumerate(CASES):
-    a = run(mon, f"cf{i}", seed, upd)
-    b = run(sec, f"cf{i}", seed, upd)
-    ok = a == b
-    if not ok:
-        bad += 1
-    print(f"  {label:<26}{a:<26}{b:<26}{'OK' if ok else 'DIFF'}")
-print(f"\n  {len(CASES) - bad}/{len(CASES)} match")
-sec.close()
-s.stop()
+with probe_targets(replica_set="secantus") as (mon, targets):
+    divergent = {label: 0 for label, _ in targets}
+    for i, (label, seed, upd) in enumerate(CASES):
+        expected = run(mon, f"cf{i}", seed, upd)
+        got = {name: run(cli, f"cf{i}", seed, upd) for name, cli in targets}
+        off = {k for k, v in got.items() if v != expected}
+        if not off:
+            continue
+        for name in off:
+            divergent[name] += 1
+        print(f"  {label}")
+        print(f"    mongod  : {expected}")
+        for name, value in got.items():
+            mark = "   <-- diverges" if name in off else ""
+            print(f"    {name:8s}: {value}{mark}")
+        print()
+    sys.exit(report("update path conflicts", len(CASES), divergent))

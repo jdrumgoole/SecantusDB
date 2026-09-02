@@ -7,13 +7,12 @@ arrays, or nested specs, and compares against mongod.
 """
 
 import os
-import tempfile
+import sys
 
-import pymongo
+sys.path.insert(0, os.path.dirname(__file__))
 
-from secantus import SecantusDBServer
+from _servers import probe_targets, report  # noqa: E402
 
-MONGOD = os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041")
 BAD = [5, "x", True, [1, 2]]
 
 
@@ -58,26 +57,35 @@ def run(cli, dbn, cmd):
         return ("ERR", getattr(e, "code", None))
 
 
-d = tempfile.mkdtemp()
-s = SecantusDBServer(port=0, storage_path=d)
-s.start()
-sec = pymongo.MongoClient(f"mongodb://{s.address[0]}:{s.address[1]}", directConnection=True)
-mon = pymongo.MongoClient(MONGOD, directConnection=True, serverSelectionTimeoutMS=8000)
-crashes, diffs, total = [], [], 0
-for i, (label, cmd) in enumerate(cases()):
-    total += 1
-    a = run(mon, f"t{i}", cmd)
-    b = run(sec, f"t{i}", cmd)
-    if b == ("ERR", 1):
-        crashes.append((label, a, b))
-    elif a != b:
-        diffs.append((label, a, b))
-print(f"  cases: {total}   CRASHES (code 1): {len(crashes)}   other divergences: {len(diffs)}\n")
-if crashes:
-    print("  === crashes (internal server error) ===")
-    for label, mongo, _ours in crashes:
-        print(f"    {label:<34} mongod={mongo}")
-for label, mongo, ours in diffs:
-    print(f"    {label:<34} mongod={str(mongo):<18} secantus={ours}")
-sec.close()
-s.stop()
+with probe_targets() as (mon, targets):
+    divergent = {label: 0 for label, _ in targets}
+    crashes = {label: 0 for label, _ in targets}
+    total = 0
+    for i, (label, cmd) in enumerate(cases()):
+        total += 1
+        expected = run(mon, f"t{i}", cmd)
+        got = {name: run(cli, f"t{i}", cmd) for name, cli in targets}
+        # A code-1 answer is an unhandled exception reaching the wire, which is
+        # what this probe exists to catch; it is called out separately from an
+        # ordinary mismatch.
+        for name, value in got.items():
+            if value == ("ERR", 1):
+                crashes[name] += 1
+        off = {k for k, v in got.items() if v != expected}
+        if not off:
+            continue
+        for name in off:
+            divergent[name] += 1
+        print(f"  {label}")
+        print(f"    mongod  : {expected}")
+        for name, value in got.items():
+            mark = "   <-- diverges" if name in off else ""
+            crash = "  CRASH" if value == ("ERR", 1) else ""
+            print(f"    {name:8s}: {value}{crash}{mark}")
+        print()
+    if any(crashes.values()):
+        print(
+            "  CRASHES (code 1, an unhandled exception on the wire): "
+            + ", ".join(f"{k} {v}" for k, v in crashes.items() if v)
+        )
+    sys.exit(report("wrong-typed document arguments", total, divergent))

@@ -5,13 +5,12 @@ the resulting document AND the reply's n/nModified/upserted, plus the error
 code+message when one rejects it. Any divergence is a fidelity bug in one of them.
 """
 
-import tempfile
+import os
+import sys
 
-import pymongo
+sys.path.insert(0, os.path.dirname(__file__))
 
-from secantus import SecantusDBServer
-
-MONGOD = "mongodb://127.0.0.1:27036"
+from _servers import probe_targets, report  # noqa: E402
 
 CASES = [
     # ---- $set / $unset edge cases
@@ -85,24 +84,23 @@ def run(cli, dbname, seed, upd):
 
 
 def main():
-    d = tempfile.mkdtemp()
-    s = SecantusDBServer(port=0, storage_path=d, replica_set_name="secantus")
-    s.start()
-    sec = pymongo.MongoClient(f"mongodb://{s.address[0]}:{s.address[1]}", directConnection=True)
-    mon = pymongo.MongoClient(MONGOD, directConnection=True, serverSelectionTimeoutMS=8000)
-    diffs = []
-    for i, (seed, upd) in enumerate(CASES):
-        a = run(mon, f"du{i}", seed, upd)
-        b = run(sec, f"du{i}", seed, upd)
-        if a != b:
-            diffs.append((seed, upd, a, b))
-    print(f"  cases: {len(CASES)}   divergences: {len(diffs)}\n")
-    for seed, upd, mongo, ours in diffs:
-        print(f"  seed={seed}  update={upd}")
-        print(f"    mongod  : {mongo}")
-        print(f"    secantus: {ours}\n")
-    sec.close()
-    s.stop()
+    with probe_targets(replica_set="secantus") as (mon, targets):
+        divergent = {label: 0 for label, _ in targets}
+        for i, (seed, upd) in enumerate(CASES):
+            expected = run(mon, f"du{i}", seed, upd)
+            got = {label: run(cli, f"du{i}", seed, upd) for label, cli in targets}
+            off = {k for k, v in got.items() if v != expected}
+            if not off:
+                continue
+            for label in off:
+                divergent[label] += 1
+            print(f"  seed={seed}  update={upd}")
+            print(f"    mongod  : {expected}")
+            for label, value in got.items():
+                mark = "   <-- diverges" if label in off else ""
+                print(f"    {label:8s}: {value}{mark}")
+            print()
+        return report("update operators", len(CASES), divergent)
 
 
-main()
+sys.exit(main())

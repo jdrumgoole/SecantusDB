@@ -4208,6 +4208,38 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   comparison and oids are done; the rest of that corpus (multidimensional,
   binary format, the full type matrix, `ARRAY` subscripting) is not.
 
+- [x] **Five probes never compared the Rust server — instrumented 2026-09-02.**
+  `tools/probes/_servers.py` is now the shared `probe_targets()` helper, and
+  `update_operators`, `arg_types_documents`, `update_path_conflicts` and
+  `findandmodify_shapes` all carry a Rust column. It found **21 divergences,
+  Python 0 everywhere** — and three of them were the Rust server ACCEPTING a
+  malformed write and reporting success:
+
+  - A non-document `q`, or a non-document/array `u`, on `update` / `delete`
+    fell through every match arm: the statement applied nothing and answered
+    `ok`. mongod refuses the command (14 / 9 / 40414). 12 shapes.
+  - `findAndModify` with `remove` alongside `new` or `upsert`, or with an
+    `update` that is neither a document nor a pipeline, ran the delete where
+    mongod refuses the command.
+  - A remove's `lastErrorObject` carried `updatedExisting`, which mongod
+    reports only for an UPDATE. Drivers read that field by field.
+
+  19 of the 21 are fixed. The remaining 2 are recorded below.
+
+- [ ] **The Rust update path has no parse-time / execution-time distinction
+  (2 shapes, 2026-09-02).** mongod wraps an EXECUTION-time update failure as
+  `Plan executor error during update :: caused by :: <message>` and reports a
+  parse-time one bare; the Rust server sends every one bare. Code and message
+  body already match — `$inc` on a string and `$push` on a non-array are the two
+  the corpus reaches.
+
+  The Python engine carries this as `UpdateError.exec_error`, set at 14 sites.
+  Rust needs the same bit threaded from the engine through
+  `StorageError::WriteError` to `util::write_error`, because the wrapper names
+  the COMMAND (`update` vs `findAndModify` vs a pipeline update) and so cannot
+  be baked into the engine's message. That is the whole change; it is plumbing
+  across four files rather than a judgement call.
+
 ### 7.0 Cache-pressure rollback — CI exercises it now
 
 `WT_ROLLBACK` is two conditions wearing one code: a write-write conflict
