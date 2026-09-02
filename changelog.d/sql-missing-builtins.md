@@ -16,7 +16,8 @@ rather than `100`.
 
 #### Fixed
 
-- `cbrt()` accepts a decimal argument, and is exact for perfect cubes.
+- `cbrt()` accepts a decimal argument, and is exact for perfect cubes
+  (`math.cbrt` on Python 3.11+, a Newton-refined fallback on 3.10).
 - `justify_hours()`, `justify_days()` and `justify_interval()` accept a time.
 
 #### Still unsupported

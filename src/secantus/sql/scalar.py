@@ -1397,10 +1397,30 @@ def _cbrt(v: Any) -> float | None:
     if v is None:
         return None
     x = float(str(v.to_decimal() if isinstance(v, bson.Decimal128) else v))
-    # `math.cbrt` (3.11+), not `abs(x) ** (1/3)`: the power form is inaccurate
-    # for perfect cubes — `cbrt(1000000)` came out 99.99999999999997 where PG
-    # gives exactly 100 — and it handles negatives natively.
-    return math.cbrt(x)
+    return _real_cbrt(x)
+
+
+def _real_cbrt(x: float) -> float:
+    """A cube root that is exact for perfect cubes.
+
+    Not `math.copysign(abs(x) ** (1/3), x)`: the power form loses the last
+    digits, so `cbrt(1000000)` came out 99.99999999999997 where PG gives
+    exactly 100.
+
+    `math.cbrt` is the right answer — it and PG both call libm's `cbrt`, so it
+    agrees to the bit — but it only exists from Python 3.11 and this package
+    supports 3.10. The fallback refines the power form with one Newton step,
+    which is exact on every perfect cube and within one ULP elsewhere. Chasing
+    that last bit is not worth it: a correctly-rounded cube root disagrees with
+    libm on ~8% of random inputs, so being *more* accurate than libm would move
+    us AWAY from Postgres."""
+    if x == 0.0 or not math.isfinite(x):
+        return x
+    cbrt = getattr(math, "cbrt", None)
+    if cbrt is not None:
+        return cbrt(x)
+    y = math.copysign(abs(x) ** (1.0 / 3.0), x)
+    return y - (y * y * y - x) / (3.0 * y * y)
 
 
 # -- date / time ------------------------------------------------------------- #

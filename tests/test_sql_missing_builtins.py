@@ -78,6 +78,24 @@ class TestCbrt:
     def test_cube_root(self, db, expr, want):
         assert db(f"SELECT cbrt({expr})")[0] == [(want,)]
 
+    def test_python_310_fallback(self, monkeypatch):
+        """`math.cbrt` arrived in 3.11 and this package supports 3.10, so there
+        are two code paths and each version's CI exercises only one of them.
+        Pin the fallback everywhere: it must be exact on perfect cubes, which
+        is the whole reason the power form was replaced."""
+        from secantus.sql import scalar
+
+        monkeypatch.delattr(scalar.math, "cbrt", raising=False)
+        for value, want in [
+            (8.0, 2.0),
+            (27.0, 3.0),
+            (-8.0, -2.0),
+            (1000000.0, 100.0),
+            (1e9, 1000.0),
+            (0.0, 0.0),
+        ]:
+            assert scalar._real_cbrt(value) == want
+
     def test_a_numeric_argument_is_not_a_missing_overload(self, db):
         """`cbrt(27.0)` raised TypeError on the Decimal128, which the
         internal-error guard reported as `function cbrt(numeric) does not
