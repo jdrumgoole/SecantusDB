@@ -666,7 +666,49 @@ draft, where a missing fixture table answered 42P01 there against 42703 here.
 a campaign), `comparing these operands with =` 120, COPY binary 119, `CREATE
 SCHEMA` 71, cursors 70, `json`/`jsonb` 68 each, `chr` 47, `generate_series` 43.
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372.**
+### 0.23 comparison, and a regression the gauge never showed (2026-09-02)
+
+**~1372 -> 1388.** A small number in front of the largest correctness find of
+the session.
+
+**Naming the types in one error split it into five causes.** "comparing these
+operands with =" was the second largest signature at 120 and named neither
+operand. Naming them gave `text vs text` 71, `numeric vs numeric` 18,
+`float8 vs float8` 3 -- which was still wrong, because `inferred_type` collapses
+several BSON kinds onto `text`. Naming the BSON kind instead gave the real list:
+`interval vs string` 32, `document vs string` 30, `array vs string` 28,
+`decimal128 vs decimal128` 18, `datetime vs string` 9, `double vs double` 3.
+**Two rounds of diagnostic sharpening, each of which changed the answer.**
+
+**Four of the five were ONE rule, already implemented for the wrong half.** In
+0.22 the unknown-literal coercion was written for `+` / `-` only. It applies to
+COMPARISON identically -- `interval '1 day' = '1 day'` is true,
+`ARRAY[1,2] = '{1,2}'` is true, and `interval '1 day' = '2020-01-01'` is 22007
+rather than false. Implementing a PostgreSQL resolution rule for one operator
+family and not the other is a shape worth remembering.
+
+**The find that matters: ALL DECIMAL ARITHMETIC WAS BROKEN.** `1.5 + 1.5` was an
+error. This regressed in 0.19 when decimal literals became `Decimal128` and no
+arithmetic path learned the type. It went unnoticed for four batches because no
+test covered it and the gauge barely moved -- the psycopg corpus tests decimals
+through parameters far more than through literal arithmetic. **A feature that
+"only" costs 16 gauge tests can still be a total break of a basic operation**;
+the gauge measures a client's corpus, not this server's surface.
+
+Now exact, on `i128` digits with PostgreSQL's measured scale rules: add and
+subtract take `max(s1, s2)`, multiply takes `s1 + s2`, so `1.50 + 1.5` is `3.00`
+and `1.50 * 1.50` is `2.2500`. **Division stays refused** -- its result scale
+depends on operand weights in a way not measured here, and a plausible number of
+decimal places that is not PostgreSQL's would be a wrong answer.
+
+**Two more real gaps:** decimals compared through an `f64` reported
+`12345678901234567890.1` and `...2` as EQUAL (34 digits versus 15); and NaN got
+"cannot compare" because IEEE says every NaN comparison is false, where
+PostgreSQL orders it TOTALLY -- NaN equals itself and sorts above infinity.
+
+**Probe: 28 shapes, 0 divergences.**
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388.**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

@@ -394,6 +394,38 @@ QUERIES = [
     "SELECT (interval '1 day' / 2)::text",
     "SELECT (interval '1 mon 1 day' * 2)::text",
     "SELECT (2 * interval '1 day')::text",
+    # --- numeric arithmetic is EXACT and its scale is part of the answer ----
+    "SELECT (1.5 + 1.5)::text",
+    "SELECT (1.50 + 1.5)::text",
+    "SELECT (1 + 1.5)::text",
+    "SELECT (1.234 + 1.1)::text",
+    "SELECT (2.00 - 1.0)::text",
+    "SELECT (2.5 * 2)::text",
+    "SELECT (2.5 * 2.0)::text",
+    "SELECT (1.50 * 1.50)::text",
+    "SELECT (0.1 * 0.1)::text",
+    "SELECT (0.1 + 0.2)::text",
+    "SELECT (-1.5)::text",
+    "SELECT (2 * 3)::text",
+    # --- NaN has a place in PostgreSQL's TOTAL order, unlike IEEE's ---------
+    "SELECT 'NaN'::float8 = 'NaN'::float8",
+    "SELECT 'NaN'::float8 > 1e308",
+    "SELECT 'NaN'::float8 > 'Infinity'::float8",
+    "SELECT 'Infinity'::float8 > 1e308",
+    "SELECT -'Infinity'::float8 < -1e308",
+    "SELECT 'NaN'::numeric = 'NaN'::numeric",
+    # --- exact decimal comparison: the same f64, different numerics --------
+    "SELECT 1.50::numeric = 1.5::numeric",
+    "SELECT 0::numeric = -0::numeric",
+    "SELECT '12345678901234567890.1'::numeric < '12345678901234567890.2'::numeric",
+    "SELECT (-1.5)::numeric < (-1.4)::numeric",
+    # --- an unknown literal takes the type of the operand beside it --------
+    "SELECT interval '1 day' = '1 day'",
+    "SELECT '1 day' = interval '1 day'",
+    "SELECT '2026-01-01'::timestamp = '2026-01-01'",
+    "SELECT '2026-01-01'::date = '2026-01-01'",
+    "SELECT ARRAY[1,2] = '{1,2}'",
+    "SELECT ARRAY['a','b'] = '{a,b}'",
 ]
 
 # (statement, verification query) — the write is compared by its row count AND
@@ -596,6 +628,8 @@ ERROR_QUERIES = [
     # is a bad interval rather than date arithmetic.
     "SELECT ('2020-01-01' + interval '1 day')::text",
     "SELECT (interval '1 day' + '2020-01-01')::text",
+    # …and the same rule in a COMPARISON, not just arithmetic.
+    "SELECT interval '1 day' = '2020-01-01'",
     "SELECT 1/0",
     "SELECT 'x'::numeric",
     "SELECT 'x'::int",

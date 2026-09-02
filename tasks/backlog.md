@@ -4212,6 +4212,11 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 - **Rust PG server: `'infinity'` / `'-infinity'` timestamps and dates (60
   psycopg tests), BC-era dates (30), and `'epoch'` (6) do not parse.** These
   need sentinel values that survive the whole pipeline rather than a parse fix.
+- **Rust PG server: `numeric` DIVISION is refused (`0A000`).** Add, subtract and
+  multiply are exact with PostgreSQL's measured scale rules; division's result
+  scale depends on the operands' weights (`1.5 / 3` is `0.50000000000000000000`,
+  twenty places) in a way not yet measured, and emitting a plausible-but-wrong
+  number of decimal places would be a wrong answer.
 - **Rust PG server: `json` / `jsonb` and `oid` casts are unsupported**, and
   binary parameters of those oids with them
   (the binary decoder covers `numeric` / `date` / `time` / `timestamp` / arrays;
