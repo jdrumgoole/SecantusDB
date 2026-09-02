@@ -264,6 +264,58 @@ def _find_ninja() -> str | None:
     return None
 
 
+def _find_swig() -> str | None:
+    """A ``swig`` executable, or ``None``. PATH first, else the `swig` PyPI wheel
+    in the project venv.
+
+    Only the storage-engine wheel build needs it (WiredTiger's Python bindings go
+    through SWIG). WiredTiger 7.0's typemaps still reference the Python-2 C API
+    (``PyInt_FromLong`` / ``PyString_InternFromString``), whose Py3 compatibility
+    shims SWIG **removed in 4.3** — so a working build needs SWIG < 4.3, which the
+    `rust` extra pins on Windows (``uv sync --extra rust``).
+    """
+    found = shutil.which("swig")
+    if found:
+        return found
+    cand = _REPO / ".venv" / "Scripts" / "swig.exe"
+    return str(cand) if cand.exists() else None
+
+
+def _storage_engine_build_env() -> dict[str, str]:
+    """Environment for the ``SECANTUS_BUILD_STORAGE_ENGINE=ON`` build (wheel / sync).
+
+    Extends ``_rust_env`` (WiredTiger + libclang, plus the MSVC env on Windows)
+    with the CMake flag that bundles the Rust storage engine, embedded server and
+    ``secantusd-rs`` binary. On Windows it also puts ``swig`` + ``ninja`` on
+    ``PATH``: the inner WiredTiger ExternalProject uses the Ninja generator with
+    ``ENABLE_PYTHON=ON`` (→ SWIG), and both are resolved from the ambient PATH —
+    without ninja there, scikit-build-core falls back to the MSBuild generator and
+    the inner Ninja build can't find the compiler.
+    """
+    env = _rust_env()
+    env["SKBUILD_CMAKE_DEFINE"] = "SECANTUS_BUILD_STORAGE_ENGINE=ON"
+    if os.name == "nt":
+        swig = _find_swig()
+        if not swig:
+            raise SystemExit(
+                "swig not found — the storage-engine build compiles WiredTiger's "
+                "Python bindings with it. Install SWIG < 4.3 (newer SWIG dropped "
+                "the Python-2 compatibility shims WiredTiger 7.0's typemaps rely "
+                "on):\n  uv sync --extra rust   (installs swig<4.3 + libclang)"
+            )
+        ninja = _find_ninja()
+        if not ninja:
+            raise SystemExit(
+                "ninja not found. Install Ninja, or the VS 'C++ CMake tools' component."
+            )
+        # Prepend the tool dirs to the MSVC PATH `_rust_env` already resolved
+        # (falling back to the ambient PATH). de-dup, order-preserving.
+        base_path = env.get("PATH") or os.environ.get("PATH", "")
+        tool_dirs = list(dict.fromkeys(str(pathlib.Path(p).parent) for p in (swig, ninja)))
+        env["PATH"] = os.pathsep.join([*tool_dirs, base_path])
+    return env
+
+
 def _build_wiredtiger(*, force: bool = False) -> pathlib.Path:
     """Build the vendored WiredTiger static lib the Rust crates link (cross-platform).
 
@@ -651,13 +703,35 @@ def rust_server_build(c: Context) -> None:
     website publish) and ``secantus-core`` (making the parity suite skip) for
     anyone who also had the sql / rust / website extras installed. ``--inexact``
     leaves extraneous packages alone so the rebuild is purely additive.
+
+    Cross-platform: the CMake flag is passed via the environment (not an inline
+    ``VAR=val`` shell prefix, which only works in a POSIX shell), and Windows
+    needs swig<4.3 + libclang on top of the MSVC toolchain — see
+    ``_storage_engine_build_env`` and the ``rust`` extra (``uv sync --extra rust``).
     """
     c.run(
-        "SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON "
         "uv sync --inexact --extra dev --extra admin --reinstall-package secantusdb",
-        pty=True,
-        env=_rust_env(),
+        pty=os.name != "nt",
+        env=_storage_engine_build_env(),
     )
+
+
+@task(name="rust-wheel-build")
+def rust_wheel_build(c: Context, out: str = "dist-storage") -> None:
+    """Build the full ``secantus`` wheel with the Rust storage engine bundled.
+
+    The ``SECANTUS_BUILD_STORAGE_ENGINE=ON`` wheel build (cross-platform): the
+    produced wheel ships ``_secantus_storage``, the embedded ``_secantus_server``
+    and the ``secantusd-rs`` binary alongside WiredTiger's Python bindings — the
+    same artifact the ``storage-engine`` CI job builds. Unlike ``rust-server-build``
+    (which installs editable into the project venv), this emits a distributable
+    ``.whl`` into ``--out`` (default ``dist-storage/``).
+
+    Prerequisites as ``rust-server-build``; on Windows: Visual Studio C++ tools +
+    Windows SDK, plus swig<4.3 + libclang (``uv sync --extra rust``).
+    """
+    c.run(f"uv build --wheel --out-dir {out}", pty=os.name != "nt", env=_storage_engine_build_env())
+    print(f"wheel written to {out}/")
 
 
 def _llvm_profdata() -> str:

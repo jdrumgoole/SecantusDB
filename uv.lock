@@ -956,6 +956,16 @@ wheels = [
 ]
 
 [[package]]
+name = "libclang"
+version = "18.1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6e/5c/ca35e19a4f142adffa27e3d652196b7362fa612243e2b916845d801454fc/libclang-18.1.1.tar.gz", hash = "sha256:a1214966d08d73d971287fc3ead8dfaf82eb07fb197680d8b3859dbbbbf78250", size = 39612, upload-time = "2024-03-17T16:04:37.434Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0b/2d/3f480b1e1d31eb3d6de5e3ef641954e5c67430d5ac93b7fa7e07589576c7/libclang-18.1.1-py2.py3-none-win_amd64.whl", hash = "sha256:4dd2d3b82fab35e2bf9ca717d7b63ac990a3519c7e312f19fa8e86dcc712f7fb", size = 26415083, upload-time = "2024-03-17T16:42:21.703Z" },
+    { url = "https://files.pythonhosted.org/packages/71/cf/e01dc4cc79779cd82d77888a88ae2fa424d93b445ad4f6c02bfc18335b70/libclang-18.1.1-py2.py3-none-win_arm64.whl", hash = "sha256:3f0e1f49f04d3cd198985fea0511576b0aee16f9ff0e0f0cad7f9c57ec3c20e8", size = 22361112, upload-time = "2024-03-17T16:42:59.565Z" },
+]
+
+[[package]]
 name = "librt"
 version = "0.13.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2458,7 +2468,9 @@ opsboard = [
     { name = "uvicorn", extra = ["standard"] },
 ]
 rust = [
+    { name = "libclang", marker = "sys_platform == 'win32'" },
     { name = "secantus-core" },
+    { name = "swig", marker = "sys_platform == 'win32'" },
 ]
 screenshots = [
     { name = "playwright" },
@@ -2486,6 +2498,7 @@ requires-dist = [
     { name = "invoke", marker = "extra == 'dev'", specifier = ">=2.2" },
     { name = "jinja2", marker = "extra == 'admin'", specifier = ">=3.1" },
     { name = "jinja2", marker = "extra == 'opsboard'", specifier = ">=3.1" },
+    { name = "libclang", marker = "sys_platform == 'win32' and extra == 'rust'" },
     { name = "markdown", marker = "extra == 'website'", specifier = ">=3.6" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.14" },
     { name = "myst-parser", marker = "extra == 'dev'", specifier = ">=2.0" },
@@ -2520,6 +2533,7 @@ requires-dist = [
     { name = "sqlglot", marker = "extra == 'sql'", specifier = ">=25" },
     { name = "starlette", marker = "extra == 'admin'", specifier = ">=1.0.1" },
     { name = "starlette", marker = "extra == 'opsboard'", specifier = ">=1.0.1" },
+    { name = "swig", marker = "sys_platform == 'win32' and extra == 'rust'", specifier = "<4.3" },
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
     { name = "trustme", marker = "extra == 'dev'", specifier = ">=1.2" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'admin'", specifier = ">=0.27" },
@@ -2943,6 +2957,16 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/eb/e3/7c1dc7381d9f8ab7d854328ebfa884e62cb3f3d8549ddfd37c7814f42afa/starlette-1.3.1.tar.gz", hash = "sha256:05d0213193f2fbaae60e2ecb593b4add4262ad4e46536b54abe36f11a71724e0", size = 2703240, upload-time = "2026-06-12T09:23:11.602Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ec/bb/2799cc2ede3ed41131f8975621e7213dfc7ef4acbbaadfa440f32500c370/starlette-1.3.1-py3-none-any.whl", hash = "sha256:c7372aae11c3c3f26a42df7bd626cec2f47d03483d261d369516a615a53714c6", size = 73632, upload-time = "2026-06-12T09:23:10.017Z" },
+]
+
+[[package]]
+name = "swig"
+version = "4.2.1.post0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/75/75/a6a53f7ba9189de95f68702da9640198d051aea97643ca6fbad52f4d7977/swig-4.2.1.post0.tar.gz", hash = "sha256:92c11267dd66ba5a3f3eab5d4a33f5b4766157b37898479ee2cfb352d9b71689", size = 25755, upload-time = "2024-10-23T20:34:57.454Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a7/8c/54cf297395d2c3ebcf584f06bf0562e357abb105c805031cc6fead74ad4b/swig-4.2.1.post0-py2.py3-none-win32.whl", hash = "sha256:45c5865529061d48dc83a88d953ddc16515bb9083d5886e69547ef9a2c0df657", size = 2532025, upload-time = "2024-10-23T20:34:54.683Z" },
+    { url = "https://files.pythonhosted.org/packages/3a/4c/22107234973fe82572b515fc4a2857422d59772f88f136bd04b6726563af/swig-4.2.1.post0-py2.py3-none-win_amd64.whl", hash = "sha256:a234bbd400653faf4a742a6cbc40c993cb73bd493d7bd7783bbd428b32661a72", size = 2532033, upload-time = "2024-10-23T20:34:55.959Z" },
 ]
 
 [[package]]

@@ -143,6 +143,12 @@ rust = [
     # Linux/macOS the system/Xcode libclang is used, so the marker excludes it
     # there; the shipping `secantus` wheel never pulls the `rust` extra.
     "libclang; sys_platform == 'win32'",
+    # Windows-only: the storage-engine wheel build (`invoke rust-wheel-build` /
+    # `rust-server-build`) compiles WiredTiger's Python bindings through SWIG.
+    # WiredTiger 7.0's typemaps reference the Python-2 C API, whose Py3
+    # compatibility shims SWIG removed in 4.3 — so the build needs SWIG < 4.3.
+    # Linux/macOS use the system swig (apt/brew), so the marker excludes them.
+    "swig<4.3; sys_platform == 'win32'",
 ]
 sql = [
     # The embedded SQL engine + (later) the PostgreSQL-wire server. sqlglot is
