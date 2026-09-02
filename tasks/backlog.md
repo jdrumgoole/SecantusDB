@@ -4234,11 +4234,19 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   the corpus reaches.
 
   The Python engine carries this as `UpdateError.exec_error`, set at 14 sites.
-  Rust needs the same bit threaded from the engine through
-  `StorageError::WriteError` to `util::write_error`, because the wrapper names
-  the COMMAND (`update` vs `findAndModify` vs a pipeline update) and so cannot
-  be baked into the engine's message. That is the whole change; it is plumbing
-  across four files rather than a judgement call.
+  Rust needs the same bit threaded from the engine through to
+  `util::write_error`, because the wrapper names the COMMAND (`update` vs
+  `findAndModify` vs a pipeline update) and so cannot be baked into the engine's
+  message.
+
+  **Scoped 2026-09-02, and it is wider than it looks.** `Fallback::Mongo` takes
+  the flag cheaply — only two sites construct it with all fields, the rest
+  destructure with `..`. The cost is downstream: `secantus-storage-adapter`
+  flattens BOTH `WtError::UpdateTypeMismatch` and `WtError::QueryError` into
+  `StorageError::WriteError { code, errmsg }`, so the distinction is already
+  lost by the time the command layer sees it. Carrying it means adding a field
+  to `WriteError` and touching its ~20 construction sites. Worth doing
+  deliberately; not worth bolting on, which is why it is still here.
 
 ### 7.0 Cache-pressure rollback — CI exercises it now
 
