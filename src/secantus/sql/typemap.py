@@ -1633,6 +1633,51 @@ def enforce_declared_length(value: Any, pg_oid: int | None, typmod: int, column:
     )
 
 
+#: pg_type oid of ``numeric`` / ``decimal``.
+NUMERIC_OID = 1700
+
+
+def enforce_numeric_typmod(value: Any, pg_oid: int | None, typmod: int, column: str = "") -> Any:
+    """Apply a ``numeric(p, s)`` declared precision and scale, Postgres-style.
+
+    Postgres ROUNDS a stored value to the declared scale: `0.12345` into a
+    `numeric(10,3)` column is stored as `0.123`, and a bare `1` as `1.000`.
+    Without this the column kept whatever scale the literal happened to carry,
+    so the STORED VALUE was wrong — not merely its rendering — and every `sum`,
+    `min` / `max` and arithmetic result over the column inherited the error.
+
+    A value whose integer part still does not fit is `22003 numeric field
+    overflow`, never a truncation. `NaN` and the infinities have no scale and
+    are stored as they are.
+
+    ``atttypmod`` is ``((p << 16) | s) + 4``; anything without one is an
+    unconstrained ``numeric`` and keeps its own scale, as Postgres does."""
+    if pg_oid != NUMERIC_OID or typmod < 4 or value is None:
+        return value
+    dec = value.to_decimal() if isinstance(value, bson.Decimal128) else value
+    if not isinstance(dec, Decimal) or not dec.is_finite():
+        return value
+    packed = typmod - 4
+    precision, scale = (packed >> 16) & 0xFFFF, packed & 0xFFFF
+    with _decimal.localcontext() as ctx:
+        ctx.prec = max(precision, len(dec.as_tuple().digits)) + scale + 10
+        rounded = dec.quantize(Decimal(1).scaleb(-scale), rounding=_decimal.ROUND_HALF_UP)
+    if abs(rounded) >= Decimal(10) ** (precision - scale):
+        from secantus.sql import errors
+
+        # `D` is the wire's DETAIL field, which is where PG puts the limit.
+        diag = {
+            "D": (
+                f"A field with precision {precision}, scale {scale} must round "
+                f"to an absolute value less than 10^{precision - scale}."
+            )
+        }
+        if column:
+            diag["c"] = column
+        raise errors.SQLError("22003", "numeric field overflow", diag=diag)
+    return bson.Decimal128(rounded)
+
+
 def blank_pad(value: Any, pg_oid: int, typmod: int) -> Any:
     """Blank-pad a ``character(n)`` value to its declared width for output.
 
