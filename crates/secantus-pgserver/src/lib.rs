@@ -985,6 +985,15 @@ fn timestamp_text(doc: &Document, field: &str) -> Option<String> {
 /// Encode one stored value as a SQL datum. Absent and explicit null are both
 /// SQL NULL.
 fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> {
+    // A timestamp CONSTANT never passes through a row, so it arrives here as a
+    // BSON date or as the sub-millisecond composite rather than as something
+    // `timestamp_text` reassembled. Without this arm it fell through to the
+    // catch-all and `select '2026-01-01 12:00'::timestamp` answered NULL.
+    if let Some(value) = v {
+        if let Some(text) = secantus_pgplan::timestamp_value_text(value) {
+            return enc.encode_field(&Some(text.as_str()));
+        }
+    }
     match v {
         Some(Bson::Int32(x)) => enc.encode_field(&Some(*x)),
         Some(Bson::Int64(x)) => enc.encode_field(&Some(*x)),
@@ -1254,6 +1263,130 @@ impl QueryParser for SqlParser {
     }
 }
 
+/// A PostgreSQL binary `numeric` as its exact decimal text.
+///
+/// Wire shape: `ndigits`, `weight`, `sign`, `dscale`, then `ndigits` base-10000
+/// groups. The value is `sum(digits[i] * 10000^(weight - i))`, and `dscale` is
+/// how many digits after the point to SHOW — which is part of the value here,
+/// since `1.50` and `1.5` are different numerics.
+///
+/// Rendered back to text rather than computed into a float: a numeric carries
+/// more digits than an f64 can hold, and the text path already knows how to
+/// turn this into an exact value.
+fn binary_numeric_text(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let be16 = |i: usize| i16::from_be_bytes([bytes[i], bytes[i + 1]]);
+    let ndigits = be16(0);
+    let weight = i32::from(be16(2));
+    let sign = u16::from_be_bytes([bytes[4], bytes[5]]);
+    let dscale = usize::from(u16::from_be_bytes([bytes[6], bytes[7]]));
+    // 0xC000 is NaN; the infinities (0xD000 / 0xF000) arrived with PG 14.
+    match sign {
+        0xC000 => return Some("NaN".to_string()),
+        0xD000 => return Some("Infinity".to_string()),
+        0xF000 => return Some("-Infinity".to_string()),
+        _ => {}
+    }
+    if ndigits < 0 || bytes.len() < 8 + (ndigits as usize) * 2 {
+        return None;
+    }
+    let digits: Vec<i16> = (0..ndigits as usize).map(|i| be16(8 + i * 2)).collect();
+
+    let mut out = String::new();
+    if sign == 0x4000 {
+        out.push('-');
+    }
+    if weight < 0 {
+        out.push('0');
+    } else {
+        for i in 0..=weight as usize {
+            let d = digits.get(i).copied().unwrap_or(0);
+            if i == 0 {
+                out.push_str(&d.to_string());
+            } else {
+                out.push_str(&format!("{d:04}"));
+            }
+        }
+    }
+    if dscale > 0 {
+        out.push('.');
+        let mut frac = String::new();
+        let mut group = 1i32;
+        while frac.len() < dscale {
+            let idx = weight + group;
+            let d = if idx >= 0 {
+                digits.get(idx as usize).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            frac.push_str(&format!("{d:04}"));
+            group += 1;
+        }
+        frac.truncate(dscale);
+        out.push_str(&frac);
+    }
+    Some(out)
+}
+
+/// One element of a PostgreSQL binary array, plus the reader position.
+///
+/// Wire shape: `ndim`, `has_null`, `element oid`, then per dimension a length
+/// and a lower bound, then each element as a 4-byte length (-1 for NULL)
+/// followed by that many bytes in the ELEMENT's binary format.
+fn binary_array(bytes: &[u8]) -> PgWireResult<Bson> {
+    if bytes.len() < 12 {
+        return Err(unsupported_binary_oid(None));
+    }
+    let be32 = |i: usize| i32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+    let ndim = be32(0);
+    let elem_oid = be32(8) as u32;
+    if ndim == 0 {
+        return Ok(Bson::Array(Vec::new()));
+    }
+    // Only one dimension: a nested array cannot be returned to a client here
+    // either, so accepting one as a parameter would only move the wrong answer.
+    if ndim != 1 {
+        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "0A000".into(),
+            "multidimensional arrays are not supported yet".into(),
+        ))));
+    }
+    let count = be32(12);
+    let mut pos = 20; // 12 header + 8 for one dimension's length and lower bound
+    let mut items = Vec::with_capacity(count.max(0) as usize);
+    for _ in 0..count.max(0) {
+        if pos + 4 > bytes.len() {
+            return Err(unsupported_binary_oid(None));
+        }
+        let len = be32(pos);
+        pos += 4;
+        if len < 0 {
+            items.push(Bson::Null);
+            continue;
+        }
+        let end = pos + len as usize;
+        if end > bytes.len() {
+            return Err(unsupported_binary_oid(None));
+        }
+        let elem = Bytes::copy_from_slice(&bytes[pos..end]);
+        let ty = Type::from_oid(elem_oid);
+        items.push(decode_parameter(Some(&elem), ty.as_ref(), true)?);
+        pos = end;
+    }
+    Ok(Bson::Array(items))
+}
+
+fn unsupported_binary_oid(oid: Option<u32>) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".into(),
+        "0A000".into(),
+        format!("binary parameters of type oid {oid:?} are not supported yet"),
+    )))
+}
+
 /// Decode one bound parameter into the value the planner will substitute.
 ///
 /// `None` is SQL NULL. A client may declare a parameter's type as oid 0
@@ -1283,17 +1416,39 @@ fn decode_parameter(raw: Option<&Bytes>, ty: Option<&Type>, binary: bool) -> PgW
                 bytes[..4].try_into().expect("checked"),
             )))),
             Some(16) if bytes.len() == 1 => Ok(Bson::Boolean(bytes[0] != 0)),
-            Some(25) | Some(1043) | Some(19) => {
+            Some(25) | Some(1043) | Some(19) | Some(1042) => {
                 Ok(Bson::String(String::from_utf8_lossy(bytes).into_owned()))
             }
-            _ => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".into(),
-                "0A000".into(),
-                format!(
-                    "binary parameters of type oid {:?} are not supported yet",
-                    ty.map(|t| t.oid())
-                ),
-            )))),
+            // These decode to their CANONICAL TEXT so a binary parameter takes
+            // exactly the same path through the planner as a text one -- the
+            // text path already turns each of these into the right value, and
+            // duplicating that here is how the two formats drift apart.
+            Some(1700) => match binary_numeric_text(bytes) {
+                Some(t) => secantus_pgplan::parse_numeric(&t)
+                    .map(Bson::Decimal128)
+                    .map_err(|e| PgHandler::err(&e)),
+                None => Err(unsupported_binary_oid(Some(1700))),
+            },
+            Some(1082) if bytes.len() == 4 => {
+                Ok(Bson::String(secantus_pgplan::render_date_from_pg_days(
+                    i32::from_be_bytes(bytes[..4].try_into().expect("checked")),
+                )))
+            }
+            Some(1083) if bytes.len() == 8 => {
+                Ok(Bson::String(secantus_pgplan::render_time_from_micros(
+                    i64::from_be_bytes(bytes[..8].try_into().expect("checked")),
+                )))
+            }
+            Some(1114) if bytes.len() == 8 => Ok(Bson::String(
+                secantus_pgplan::render_timestamp_from_pg_micros(i64::from_be_bytes(
+                    bytes[..8].try_into().expect("checked"),
+                )),
+            )),
+            // Every array oid this server knows, decoded through the element's
+            // own binary decoder rather than a per-type array reader.
+            Some(1000) | Some(1005) | Some(1007) | Some(1009) | Some(1015) | Some(1016)
+            | Some(1021) | Some(1022) | Some(1231) | Some(1182) | Some(1115) => binary_array(bytes),
+            other => Err(unsupported_binary_oid(other)),
         };
     }
 
@@ -1307,10 +1462,16 @@ fn decode_parameter(raw: Option<&Bytes>, ty: Option<&Type>, binary: bool) -> PgW
             .parse::<i64>()
             .map(Bson::Int64)
             .map_err(|_| invalid_text(&text, "bigint")),
-        Some(700) | Some(701) | Some(1700) => text
+        Some(700) | Some(701) => text
             .parse::<f64>()
             .map(Bson::Double)
             .map_err(|_| invalid_text(&text, "double precision")),
+        // A `numeric` parameter is EXACT, and was being parsed as an f64 --
+        // so a client binding Decimal("0.1") got a float, and one binding
+        // `1.50` lost the scale that makes it a different value from `1.5`.
+        Some(1700) => secantus_pgplan::parse_numeric(&text)
+            .map(Bson::Decimal128)
+            .map_err(|e| PgHandler::err(&e)),
         Some(16) => Ok(Bson::Boolean(matches!(
             text.as_ref(),
             "t" | "true" | "TRUE" | "1" | "y" | "yes" | "on"
