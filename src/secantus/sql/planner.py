@@ -4628,6 +4628,12 @@ class EvaluatedSelectPlan:
     # Per output position, the ``(TableDef | ViewSource, 1-based attnum)`` the
     # column came from, or None for a computed / unattributable output.
     out_sources: list[tuple[Any, int] | None] = field(default_factory=list)
+    # Aggregates the pipeline cannot finish on its own, completed in Python over
+    # the grouped rows — same mechanism and same executor helper as
+    # `PipelineSelectPlan.post_aggregates`. This path needs it for an
+    # `array_agg(x ORDER BY y)` that is NOT the whole projection: the group
+    # pushes `{v, k}` pairs and the sort happens afterwards.
+    post_aggregates: list[tuple[str, str, Any]] = field(default_factory=list)
 
 
 def _evaluated_enum_orders(
@@ -6915,11 +6921,23 @@ def _plan_grouping_sets_window_select(
     agg_fields: dict[tuple[str, str | None, bool], str] = {}
     agg_field_names: list[str] = []
 
+    post_aggregates: list[tuple[str, str, Any]] = []
+
     def register_agg(node: exp.AggFunc) -> str:
         arr_arg = _array_agg_arg(node)
         if arr_arg is not None:
             fname = names.fresh("array_agg")
-            accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
+            # An in-call ORDER BY has to be honoured HERE too, not only on the
+            # top-level projection path. A NESTED `array_agg` — under a cast, an
+            # operator, a subscript — registered a plain `$push` and dropped the
+            # ordering SILENTLY: `array_agg(i ORDER BY i DESC)` answered
+            # `{3,2,1}` on its own and `{1,2,3}` the moment it was wrapped.
+            value_node, terms = _agg_order_spec(arr_arg)
+            if terms:
+                accumulators[fname] = _sorted_agg_push(value_node, terms, table)
+                post_aggregates.append((fname, "sorted_array", [(d, nf) for _k, d, nf in terms]))
+            else:
+                accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
             field_tags[fname] = "json"
             agg_field_names.append(fname)
             return fname
@@ -7044,7 +7062,14 @@ def _plan_grouping_sets_window_select(
                 }
             }
         )
-    return _finish_group_window(stmt, table.collection, base_filter, pipeline, field_tags)
+    return _finish_group_window(
+        stmt,
+        table.collection,
+        base_filter,
+        pipeline,
+        field_tags,
+        post_aggregates=post_aggregates,
+    )
 
 
 def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
@@ -7523,11 +7548,23 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
     agg_fields: dict[tuple[str, str | None, bool], str] = {}
     agg_field_names: list[str] = []
 
+    post_aggregates: list[tuple[str, str, Any]] = []
+
     def register_agg(node: exp.AggFunc) -> str:
         arr_arg = _array_agg_arg(node)
         if arr_arg is not None:
             fname = names.fresh("array_agg")
-            accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
+            # An in-call ORDER BY has to be honoured HERE too, not only on the
+            # top-level projection path. A NESTED `array_agg` — under a cast, an
+            # operator, a subscript — registered a plain `$push` and dropped the
+            # ordering SILENTLY: `array_agg(i ORDER BY i DESC)` answered
+            # `{3,2,1}` on its own and `{1,2,3}` the moment it was wrapped.
+            value_node, terms = _agg_order_spec(arr_arg)
+            if terms:
+                accumulators[fname] = _sorted_agg_push(value_node, terms, table)
+                post_aggregates.append((fname, "sorted_array", [(d, nf) for _k, d, nf in terms]))
+            else:
+                accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
             field_tags[fname] = "json"
             agg_field_names.append(fname)
             return fname
@@ -7656,6 +7693,7 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
         where=residual_having,
         pre_where=residual_pre,
         pre_where_resolve=table_resolver(table) if residual_pre is not None else None,
+        post_aggregates=post_aggregates,
     )
 
 
@@ -7670,6 +7708,7 @@ def _finish_group_window(
     pre_where: exp.Expression | None = None,
     pre_where_resolve: Resolve | None = None,
     pre_where_split: int = 0,
+    post_aggregates: list[tuple[str, str, Any]] | None = None,
 ) -> EvaluatedSelectPlan:
     """Shared tail of the group-then-window planners: with the grouped rows'
     field→tag map in hand, build the per-row output expressions, the window-alias
@@ -7713,6 +7752,7 @@ def _finish_group_window(
 
     limit, skip = _limit_skip(stmt)
     return EvaluatedSelectPlan(
+        post_aggregates=post_aggregates or [],
         base_collection=base_collection,
         base_filter=base_filter,
         pipeline=pipeline,
@@ -10287,12 +10327,24 @@ def _plan_join_grouping_sets_window_select(
     agg_fields: dict[str, str] = {}  # _agg_key -> field name
     agg_field_names: list[str] = []
 
+    post_aggregates: list[tuple[str, str, Any]] = []
+
     def register_agg(node: exp.AggFunc) -> str:
         arr_arg = _array_agg_arg(node)
         if arr_arg is not None:
             fname = names.fresh("array_agg")
-            path, _ = resolve(arr_arg)
-            accumulators[fname] = {"$push": f"${path}"}
+            # An in-call ORDER BY has to be honoured HERE too, not only on the
+            # top-level projection path. A NESTED `array_agg` — under a cast, an
+            # operator, a subscript — registered a plain `$push` and dropped the
+            # ordering SILENTLY: `array_agg(i ORDER BY i DESC)` answered
+            # `{3,2,1}` on its own and `{1,2,3}` the moment it was wrapped.
+            value_node, terms = _agg_order_spec(arr_arg)
+            if terms:
+                accumulators[fname] = _sorted_agg_push_resolve(value_node, terms, resolve)
+                post_aggregates.append((fname, "sorted_array", [(d, nf) for _k, d, nf in terms]))
+            else:
+                path, _ = resolve(arr_arg)
+                accumulators[fname] = {"$push": f"${path}"}
             field_tags[fname] = "json"
             agg_field_names.append(fname)
             return fname
@@ -10393,7 +10445,15 @@ def _plan_join_grouping_sets_window_select(
         pipeline.append(
             {"$unionWith": {"coll": base.collection, "pipeline": list(join_prefix) + branch(gset)}}
         )
-    return _finish_group_window(stmt, base.collection, {}, pipeline, field_tags, derived)
+    return _finish_group_window(
+        stmt,
+        base.collection,
+        {},
+        pipeline,
+        field_tags,
+        derived,
+        post_aggregates=post_aggregates,
+    )
 
 
 def _plan_join_group_window_select(
@@ -10451,12 +10511,24 @@ def _plan_join_group_window_select(
     agg_fields: dict[str, str] = {}  # _agg_key -> field name
     agg_field_names: list[str] = []
 
+    post_aggregates: list[tuple[str, str, Any]] = []
+
     def register_agg(node: exp.AggFunc) -> str:
         arr_arg = _array_agg_arg(node)
         if arr_arg is not None:
             fname = names.fresh("array_agg")
-            path, _ = resolve(arr_arg)
-            accumulators[fname] = {"$push": f"${path}"}
+            # An in-call ORDER BY has to be honoured HERE too, not only on the
+            # top-level projection path. A NESTED `array_agg` — under a cast, an
+            # operator, a subscript — registered a plain `$push` and dropped the
+            # ordering SILENTLY: `array_agg(i ORDER BY i DESC)` answered
+            # `{3,2,1}` on its own and `{1,2,3}` the moment it was wrapped.
+            value_node, terms = _agg_order_spec(arr_arg)
+            if terms:
+                accumulators[fname] = _sorted_agg_push_resolve(value_node, terms, resolve)
+                post_aggregates.append((fname, "sorted_array", [(d, nf) for _k, d, nf in terms]))
+            else:
+                path, _ = resolve(arr_arg)
+                accumulators[fname] = {"$push": f"${path}"}
             field_tags[fname] = "json"
             agg_field_names.append(fname)
             return fname
@@ -10558,6 +10630,7 @@ def _plan_join_group_window_select(
         pre_where=residual_pre,
         pre_where_resolve=resolve if residual_pre is not None else None,
         pre_where_split=pre_split,
+        post_aggregates=post_aggregates,
     )
 
 
