@@ -426,6 +426,28 @@ QUERIES = [
     "SELECT '2026-01-01'::date = '2026-01-01'",
     "SELECT ARRAY[1,2] = '{1,2}'",
     "SELECT ARRAY['a','b'] = '{a,b}'",
+    # --- json keeps what it was given; jsonb normalises --------------------
+    """SELECT '{"b":1, "a":2}'::json::text""",
+    """SELECT '{"b":1, "a":2}'::jsonb::text""",
+    """SELECT '{"a":1, "a":2}'::jsonb::text""",
+    """SELECT '[1,  2,   3]'::jsonb::text""",
+    # Keys sort by BYTE length first, then bytewise.
+    """SELECT '{"aa":1,"ab":2,"b":3}'::jsonb::text""",
+    """SELECT '{"é":1,"z":2}'::jsonb::text""",
+    """SELECT '{"b":1,"A":2}'::jsonb::text""",
+    """SELECT '{"nested": {"z":1,"a":2}}'::jsonb::text""",
+    # A jsonb number is a numeric: the exponent expands, the scale survives.
+    """SELECT '{"x": 1.10}'::jsonb::text""",
+    """SELECT '{"n":-1.5e10}'::jsonb::text""",
+    """SELECT '{"n":1e3}'::jsonb::text""",
+    """SELECT '{"n":1.5E-3}'::jsonb::text""",
+    """SELECT '{"big":123456789012345678901234567890}'::jsonb::text""",
+    "SELECT '\"str\"'::jsonb::text",
+    "SELECT 'null'::jsonb::text",
+    "SELECT '[]'::jsonb::text",
+    "SELECT '{}'::jsonb::text",
+    "SELECT pg_typeof('{}'::json)::text",
+    "SELECT pg_typeof('{}'::jsonb)::text",
 ]
 
 # (statement, verification query) — the write is compared by its row count AND
@@ -651,6 +673,9 @@ ERROR_QUERIES = [
     "SELECT '2026-13-01'::date",
     "SELECT nosuchcolumn FROM d",
     "SELECT * FROM nosuchtable",
+    "SELECT '{bad}'::json",
+    "SELECT '[1,]'::json",
+    "SELECT '{\"a\":1} x'::json",
 ]
 
 

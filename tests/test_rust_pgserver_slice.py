@@ -1166,3 +1166,72 @@ def test_typed_parameter_compares_equal_in_both_formats(
         cur = conn.cursor(binary=binary)
         cur.execute(sql, (arg,))
         assert cur.fetchone()[0] is True
+
+
+def test_json_preserves_and_jsonb_normalises(home: Path) -> None:
+    """The one difference that matters between the two types.
+
+    `json` validates and stores the text it was given, so whitespace, key order
+    and duplicate keys all survive. `jsonb` stores a parsed structure, so it
+    comes back with keys sorted, the last of any duplicate pair kept, and one
+    canonical spacing.
+
+    Keys sort by BYTE length first and then bytewise, which is neither
+    lexicographic nor by character count: `z` (one byte) precedes `é` (two).
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+
+        cur.execute("""select '{"b":1, "a":2}'::json::text""")
+        assert cur.fetchone()[0] == '{"b":1, "a":2}'
+        cur.execute("""select '{"b":1, "a":2}'::jsonb::text""")
+        assert cur.fetchone()[0] == '{"a": 2, "b": 1}'
+
+        cur.execute("""select '{"a":1, "a":2}'::jsonb::text""")
+        assert cur.fetchone()[0] == '{"a": 2}'
+        cur.execute("""select '{"aa":1,"ab":2,"b":3}'::jsonb::text""")
+        assert cur.fetchone()[0] == '{"b": 3, "aa": 1, "ab": 2}'
+        cur.execute("""select '{"é":1,"z":2}'::jsonb::text""")
+        assert cur.fetchone()[0] == '{"z": 2, "é": 1}'
+
+        # Their own oids, so a client decodes each as the type it is.
+        cur.execute("select '{}'::json")
+        assert cur.description[0].type_code == 114
+        cur.execute("select '{}'::jsonb")
+        assert cur.description[0].type_code == 3802
+
+
+def test_jsonb_numbers_are_numerics(home: Path) -> None:
+    """A `jsonb` number prints the way a `numeric` does.
+
+    So an exponent is expanded, and a trailing zero written in the literal
+    survives — it is the value's scale. Routing numbers through a float would
+    give the first and lose the second.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for literal, want in [
+            ('{"x": 1.10}', '{"x": 1.10}'),
+            ('{"n":-1.5e10}', '{"n": -15000000000}'),
+            ('{"n":1e3}', '{"n": 1000}'),
+            ('{"n":1.5E-3}', '{"n": 0.0015}'),
+        ]:
+            cur.execute("select %s::jsonb::text", (literal,))
+            assert cur.fetchone()[0] == want, literal
+
+
+def test_malformed_json_is_refused(home: Path) -> None:
+    """Invalid JSON is 22P02, and sniffing must not rescue it.
+
+    `'01'` is the interesting one: a bound parameter whose type the client left
+    unspecified used to be sniffed into an integer *before* the cast ran, so
+    `'01'::json` became `1` and was accepted — invalid JSON turned valid by a
+    guess this server made on the client's behalf. Sniffing now requires the
+    number to round-trip to the same text.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for bad in ["{bad}", '{"a":}', "[1,]", "01", '{"a":1} x', "", '{"a" 1}']:
+            with pytest.raises(psycopg.Error) as exc:
+                cur.execute("select %s::json", (bad,))
+            assert exc.value.diag.sqlstate == "22P02", bad

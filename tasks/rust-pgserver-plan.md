@@ -742,7 +742,35 @@ into the backlog.
 
 **Probe: 9 shapes x 2 formats, 0 divergences.**
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485.**
+### 0.25 json and jsonb (2026-09-02)
+
+**~1487 -> ~1615, +128.** The predicted ceiling was 136 (json 68 + jsonb 68), so
+nearly all of it.
+
+**Two rules, both measured, neither derivable.** `json` keeps its input text
+verbatim -- whitespace, key order, duplicate keys. `jsonb` normalises: keys
+sorted, last duplicate wins, canonical spacing. And `jsonb` sorts keys by BYTE
+LENGTH first, then bytewise: `z` before `é` (one byte against two), `b` before
+`aa`. Not alphabetical, not by character count.
+
+**Numbers are what rule out a library.** A `jsonb` number is a `numeric` and
+prints as one: the exponent expands (`-1.5e10` -> `-15000000000`) AND the
+literal's trailing zero survives (`1.10` stays `1.10`, it is the scale). Every
+general-purpose JSON parser reads numbers into `f64` by default, which gets the
+first right and silently loses the second. So the parser here keeps number
+tokens as TEXT and normalises them the way `numeric` renders.
+
+**A sniffing bug found by the malformed-input half of the probe.** `'01'::json`
+was ACCEPTED, because an unspecified-type parameter is guessed from its text and
+`01` parsed as the integer 1 -- so invalid JSON became valid before the cast
+ran. **A guess made on the client's behalf must never make a value more
+acceptable than the client wrote it.** Sniffing now requires the number to
+round-trip to the same text. Probing the REFUSALS as well as the accepted shapes
+is what surfaced it; a probe of valid documents alone passes.
+
+**Probe: 38 shapes -- 29 valid, 9 malformed -- 0 divergences.**
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615.**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

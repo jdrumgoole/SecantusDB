@@ -1315,3 +1315,84 @@ fn nan_sorts_above_everything_and_equals_itself() {
         Some(Ordering::Equal)
     );
 }
+
+/// `json` keeps what it was given; `jsonb` normalises. Every pair measured
+/// against PostgreSQL 14.
+#[test]
+fn jsonb_normalises_where_json_preserves() {
+    let jsonb = |t: &str| {
+        let v = crate::json::parse(t).expect("valid json");
+        crate::json::render_jsonb(&v)
+    };
+    for (input, want) in [
+        // Keys sort by BYTE LENGTH first, then bytewise — not lexicographically.
+        (r#"{"bb":1,"a":2}"#, r#"{"a": 2, "bb": 1}"#),
+        (r#"{"aa":1,"ab":2,"b":3}"#, r#"{"b": 3, "aa": 1, "ab": 2}"#),
+        // `z` is one byte and `é` is two, so `z` sorts first.
+        (r#"{"é":1,"z":2}"#, r#"{"z": 2, "é": 1}"#),
+        // Bytewise, so uppercase precedes lowercase.
+        (r#"{"b":1,"A":2}"#, r#"{"A": 2, "b": 1}"#),
+        // The LAST of a duplicate pair wins.
+        (r#"{"a":1, "a":2}"#, r#"{"a": 2}"#),
+        // Whitespace is canonical, and nesting is normalised too.
+        ("  {\"a\" : 1 }  ", r#"{"a": 1}"#),
+        (r#"[1,  2,   3]"#, "[1, 2, 3]"),
+        (
+            r#"{"nested": {"z":1,"a":2}}"#,
+            r#"{"nested": {"a": 2, "z": 1}}"#,
+        ),
+        (r#"{}"#, "{}"),
+        (r#"[]"#, "[]"),
+    ] {
+        assert_eq!(jsonb(input), want, "for {input}");
+    }
+}
+
+/// A `jsonb` number is a `numeric`, and prints the way one does.
+///
+/// So the exponent is expanded, but a trailing zero written in the literal
+/// SURVIVES — it is the value's scale. Any parser that routes numbers through
+/// an `f64` loses the second half.
+#[test]
+fn jsonb_numbers_print_as_numerics() {
+    let jsonb = |t: &str| {
+        let v = crate::json::parse(t).expect("valid json");
+        crate::json::render_jsonb(&v)
+    };
+    for (input, want) in [
+        (r#"{"x": 1.10}"#, r#"{"x": 1.10}"#),
+        (r#"{"n":-1.5e10}"#, r#"{"n": -15000000000}"#),
+        (r#"{"n":1e3}"#, r#"{"n": 1000}"#),
+        (r#"{"n":1.5E-3}"#, r#"{"n": 0.0015}"#),
+        (r#"{"n":0.0}"#, r#"{"n": 0.0}"#),
+        (r#"{"n":100}"#, r#"{"n": 100}"#),
+        (
+            r#"{"big":123456789012345678901234567890}"#,
+            r#"{"big": 123456789012345678901234567890}"#,
+        ),
+    ] {
+        assert_eq!(jsonb(input), want, "for {input}");
+    }
+}
+
+/// Malformed JSON is refused. `01` matters beyond JSON: it is the case that
+/// showed parameter sniffing was making a value MORE acceptable than the
+/// client wrote it.
+#[test]
+fn malformed_json_is_refused() {
+    for bad in [
+        "{bad}",
+        r#"{"a":}"#,
+        "[1,]",
+        "01",
+        r#"{"a":1} x"#,
+        "",
+        r#"{"a" 1}"#,
+        "[1 2]",
+        r#""unterminated"#,
+        "{",
+        "tru",
+    ] {
+        assert!(crate::json::parse(bad).is_err(), "{bad:?} should not parse");
+    }
+}

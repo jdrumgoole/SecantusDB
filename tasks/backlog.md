@@ -4224,8 +4224,8 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `true` here. Reproducing it needs PostgreSQL's operator-resolution table for
   arrays, not a comparison fix. Being more permissive, so it accepts queries
   PostgreSQL rejects rather than answering them differently.
-- **Rust PG server: `json` / `jsonb` and `oid` casts are unsupported**, and
-  binary parameters of those oids with them
+- **Rust PG server: the `oid` cast is unsupported**, and binary parameters of
+  that oid with it
   (the binary decoder covers `numeric` / `date` / `time` / `timestamp` / arrays;
   a type it does not have cannot be decoded into one).
 - **Rust PG server: a multidimensional array sent as a BINARY parameter is

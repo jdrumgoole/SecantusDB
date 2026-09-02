@@ -14,6 +14,8 @@
 use bson::{doc, Bson, Document};
 use std::str::FromStr;
 
+pub mod json;
+
 use bson::Decimal128;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use pg_query::protobuf::node::Node as N;
@@ -1081,6 +1083,8 @@ pub fn display_type(internal: &str) -> String {
         "timestamptz" => "timestamp with time zone",
         "timetz" => "time with time zone",
         "interval" => "interval",
+        "json" => "json",
+        "jsonb" => "jsonb",
         // A bare NULL literal has no type yet: PostgreSQL calls it `unknown`,
         // and resolves it from context when there is any.
         "unknown" => "unknown",
@@ -2378,6 +2382,23 @@ fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         // `integer`. Only the naming is reproduced here; a regtype is really an
         // oid, and this server has no `pg_type` to resolve one against.
         "regtype" => Ok(Bson::String(display_type(as_text(&value).trim()))),
+        // `json` VALIDATES and keeps the text it was given -- whitespace, key
+        // order and duplicate keys all survive. `jsonb` parses and stores a
+        // structure, so it comes back normalised.
+        "json" | "jsonb" => {
+            let text = as_text(&value);
+            let parsed = json::parse(&text).map_err(|_| {
+                Error::InvalidText(format!(
+                    "invalid input syntax for type {target}: \"{}\"",
+                    text.trim()
+                ))
+            })?;
+            Ok(Bson::String(if target == "json" {
+                text
+            } else {
+                json::render_jsonb(&parsed)
+            }))
+        }
         "interval" => match Interval::from_bson(&value) {
             Some(iv) => Ok(iv.to_bson()),
             None => Ok(parse_interval(&as_text(&value))?.to_bson()),
