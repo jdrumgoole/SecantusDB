@@ -2343,6 +2343,21 @@ def _plain_json_operand_text(operand: exp.Expression) -> str | None:
 
 
 def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
+    """``x::type``, with Postgres' integer range check on the way out.
+
+    The check is applied HERE rather than inside each branch: the cast body has
+    a dozen exits (enum, bit, char-length, range, array …) and adding a guard to
+    each is how one gets missed. `1e10::int` returned 10000000000 before this.
+    """
+    out = _eval_cast_impl(node, scope, ctx)
+    if isinstance(out, int) and not isinstance(out, bool):
+        to_tag = typemap.type_tag_for_sql(node.to) if node.to is not None else None
+        if to_tag in ("int2", "int4", "int8"):
+            typemap.check_int_range(out, to_tag)
+    return out
+
+
+def _eval_cast_impl(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     value = evaluate(node.this, scope, ctx)
     # ``'ok'::mood`` — a cast to a declared enum validates the label (22P02) and
     # yields the label text (an enum's value form IS its text).
