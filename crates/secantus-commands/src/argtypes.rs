@@ -1323,11 +1323,189 @@ pub fn expression_problem_in_pipeline(
         } else {
             None // every other stage is left alone on purpose
         };
+        // An expression's ARITY and SPEC SHAPE are parse errors, checked before
+        // anything is folded, which is why they carry the STAGE wrapper and not
+        // the optimizer's. Mirrors `aggregate._expression_shape_problem`; the
+        // Python server took the same fix.
+        let found = found.or_else(|| expression_shape_problem(spec));
         if let Some((code, msg)) = found {
             return Some((code, msg, wrapper));
         }
     }
     None
+}
+
+/// `(low, high)` argument counts for the expressions mongod range-checks by
+/// arity. A NON-array argument counts as one.
+const EXPRESSION_ARITY: &[(&str, usize, usize)] = &[
+    ("$indexOfArray", 2, 4),
+    ("$indexOfBytes", 2, 4),
+    ("$indexOfCP", 2, 4),
+    ("$range", 2, 3),
+    ("$slice", 2, 3),
+];
+
+/// The date extractors, which take a bare expression OR a one-element array.
+const DATE_EXTRACTORS: &[&str] = &[
+    "$dayOfMonth",
+    "$dayOfWeek",
+    "$dayOfYear",
+    "$hour",
+    "$isoDayOfWeek",
+    "$isoWeek",
+    "$isoWeekYear",
+    "$millisecond",
+    "$minute",
+    "$month",
+    "$second",
+    "$week",
+    "$year",
+];
+
+/// Accumulator-style expressions whose spec must be a document. Each carries its
+/// OWN Location code -- probed 8.2.11 (2026-09-02), they do not share one.
+const OBJECT_SPEC_EXPRESSIONS: &[(&str, i32)] = &[
+    ("$firstN", 5787801),
+    ("$lastN", 5787801),
+    ("$minN", 5787900),
+    ("$maxN", 5787900),
+    ("$median", 7436201),
+    ("$percentile", 7436200),
+    ("$topN", 168),
+    ("$bottomN", 168),
+];
+
+/// An unrecognised argument inside a date-operator spec: the operator's known
+/// arguments, its code, and the tail three of them append.
+const DATE_SPEC_ARGUMENTS: &[(&str, &[&str], i32, &str)] = &[
+    (
+        "$dateAdd",
+        &["startDate", "unit", "amount", "timezone"],
+        5166401,
+        ". Expected arguments are startDate, unit, amount, and optionally timezone.",
+    ),
+    (
+        "$dateSubtract",
+        &["startDate", "unit", "amount", "timezone"],
+        5166401,
+        ". Expected arguments are startDate, unit, amount, and optionally timezone.",
+    ),
+    (
+        "$dateDiff",
+        &["startDate", "endDate", "unit", "timezone", "startOfWeek"],
+        5166302,
+        "",
+    ),
+    (
+        "$dateFromParts",
+        &[
+            "year",
+            "isoWeekYear",
+            "month",
+            "isoWeek",
+            "day",
+            "isoDayOfWeek",
+            "hour",
+            "minute",
+            "second",
+            "millisecond",
+            "timezone",
+        ],
+        40518,
+        "",
+    ),
+    ("$dateToParts", &["date", "timezone", "iso8601"], 40520, ""),
+    (
+        "$dateFromString",
+        &["dateString", "format", "timezone", "onError", "onNull"],
+        40541,
+        "",
+    ),
+    (
+        "$dateToString",
+        &["date", "format", "timezone", "onNull"],
+        18534,
+        "",
+    ),
+    (
+        "$dateTrunc",
+        &["date", "unit", "binSize", "timezone", "startOfWeek"],
+        5439008,
+        ". Expected arguments are date, unit, and optionally, binSize, timezone, startOfWeek",
+    ),
+];
+
+/// The first arity / spec-shape error in an expression, as mongod PARSES it.
+///
+/// These are raised while building the expression tree, before anything folds,
+/// so the caller gives them the stage's wrapper. Several of them were answered
+/// `ok` here -- a spec with an unrecognised date argument simply ignored it.
+pub(crate) fn expression_shape_problem(spec: &Bson) -> Option<(i32, String)> {
+    match spec {
+        Bson::Document(d) => {
+            for (key, value) in d {
+                if let Some((_, low, high)) = EXPRESSION_ARITY.iter().find(|(op, _, _)| *op == key)
+                {
+                    let count = match value {
+                        Bson::Array(a) => a.len(),
+                        _ => 1,
+                    };
+                    if count < *low || count > *high {
+                        return Some((
+                            28667,
+                            format!(
+                                "Expression {key} takes at least {low} arguments, and at most {high}, but {count} were passed in."
+                            ),
+                        ));
+                    }
+                }
+                if DATE_EXTRACTORS.contains(&key.as_str()) {
+                    if let Bson::Array(a) = value {
+                        if a.len() != 1 {
+                            return Some((
+                                40536,
+                                format!(
+                                    "{key} accepts exactly one argument if given an array, but was given {}",
+                                    a.len()
+                                ),
+                            ));
+                        }
+                    }
+                }
+                if let Some((_, fields, code, tail)) =
+                    DATE_SPEC_ARGUMENTS.iter().find(|(op, _, _, _)| *op == key)
+                {
+                    if let Bson::Document(inner) = value {
+                        for field in inner.keys() {
+                            if !fields.contains(&field.as_str()) {
+                                return Some((
+                                    *code,
+                                    format!("Unrecognized argument to {key}: {field}{tail}"),
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some((_, code)) = OBJECT_SPEC_EXPRESSIONS.iter().find(|(op, _)| *op == key) {
+                    if !matches!(value, Bson::Document(_)) {
+                        return Some((
+                            *code,
+                            format!(
+                                "specification must be an object; found {key}: {}",
+                                render_stage_value(value)
+                            ),
+                        ));
+                    }
+                }
+                if let Some(found) = expression_shape_problem(value) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Bson::Array(a) => a.iter().find_map(expression_shape_problem),
+        _ => None,
+    }
 }
 
 /// A malformed aggregation STAGE spec, named with mongod's own code.
@@ -2881,5 +3059,156 @@ mod write_statement_tests {
         )
         .unwrap();
         require_write_statement(&doc! { "q": doc! {}, "limit": 0 }, "delete").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod expression_shape_tests {
+    //! Expression arity and spec shape are PARSE errors, carrying the stage's
+    //! wrapper rather than the optimizer's. Mirrors the Python server's
+    //! `aggregate._expression_shape_problem`; both took this fix on 2026-09-02.
+    //!
+    //! Pinned against mongod 8.2.11 via `tools/probes/agg_expressions.py`,
+    //! which went from 1,376 divergent shapes on this server to 981.
+
+    use super::*;
+    use bson::{doc, Bson};
+
+    fn problem(expr: Bson) -> (i32, String) {
+        expression_shape_problem(&expr).expect("expected a parse error")
+    }
+
+    #[test]
+    fn arity_names_the_bounds_and_the_count() {
+        assert_eq!(
+            problem(bson::bson!({"$indexOfArray": [[1, 2]]})),
+            (
+                28667,
+                "Expression $indexOfArray takes at least 2 arguments, and at most 4, \
+                 but 1 were passed in."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            problem(bson::bson!({"$range": [1]})).0,
+            28667,
+            "$range is 2..3, not 2..4 -- the bounds are per operator"
+        );
+    }
+
+    #[test]
+    fn a_non_array_argument_counts_as_one() {
+        assert_eq!(problem(bson::bson!({"$indexOfCP": "x"})).0, 28667);
+    }
+
+    #[test]
+    fn a_date_extractor_takes_a_one_element_array_or_a_bare_value() {
+        // Legal: exactly one element, or not an array at all.
+        assert_eq!(
+            expression_shape_problem(&bson::bson!({"$year": ["$d"]})),
+            None
+        );
+        assert_eq!(
+            expression_shape_problem(&bson::bson!({"$year": "$d"})),
+            None
+        );
+        for n in [0usize, 2, 3] {
+            let arg: Vec<Bson> = (0..n).map(|_| Bson::Int32(1)).collect();
+            assert_eq!(
+                problem(bson::bson!({"$dayOfMonth": arg})),
+                (
+                    40536,
+                    format!(
+                        "$dayOfMonth accepts exactly one argument if given an array, \
+                         but was given {n}"
+                    )
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn each_object_spec_expression_carries_its_own_code() {
+        for (op, code) in [
+            ("$firstN", 5787801),
+            ("$lastN", 5787801),
+            ("$minN", 5787900),
+            ("$maxN", 5787900),
+            ("$median", 7436201),
+            ("$percentile", 7436200),
+            ("$topN", 168),
+            ("$bottomN", 168),
+        ] {
+            let mut d = bson::Document::new();
+            d.insert(op, 0);
+            let (got, msg) = problem(Bson::Document(d));
+            assert_eq!(got, code, "{op}");
+            assert_eq!(
+                msg,
+                format!("specification must be an object; found {op}: 0")
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_date_argument_is_named() {
+        // Eight operators, eight codes -- they do not share one.
+        for (op, code) in [
+            ("$dateAdd", 5166401),
+            ("$dateSubtract", 5166401),
+            ("$dateDiff", 5166302),
+            ("$dateFromParts", 40518),
+            ("$dateToParts", 40520),
+            ("$dateFromString", 40541),
+            ("$dateToString", 18534),
+            ("$dateTrunc", 5439008),
+        ] {
+            let mut d = bson::Document::new();
+            d.insert(op, doc! {"k": 1});
+            let (got, msg) = problem(Bson::Document(d));
+            assert_eq!(got, code, "{op}");
+            assert!(
+                msg.starts_with(&format!("Unrecognized argument to {op}: k")),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn three_of_them_append_what_they_expected() {
+        let (_, msg) = problem(bson::bson!({"$dateAdd": {"k": 1}}));
+        assert!(
+            msg.ends_with(
+                ". Expected arguments are startDate, unit, amount, and optionally timezone."
+            ),
+            "{msg}"
+        );
+        let (_, msg) = problem(bson::bson!({"$dateDiff": {"k": 1}}));
+        assert!(msg.ends_with("$dateDiff: k"), "no tail on $dateDiff: {msg}");
+    }
+
+    #[test]
+    fn it_recurses_into_nested_expressions() {
+        assert_eq!(
+            problem(bson::bson!({"$add": [1, {"$range": [1]}]})).0,
+            28667
+        );
+    }
+
+    #[test]
+    fn well_formed_expressions_are_left_alone() {
+        // The guard against over-eager validation: each of these is legal.
+        for expr in [
+            bson::bson!({"$indexOfCP": ["abc", "b"]}),
+            bson::bson!({"$range": [0, 3]}),
+            bson::bson!({"$slice": [[1, 2, 3], 2]}),
+            bson::bson!({"$firstN": {"n": 1, "input": "$a"}}),
+            bson::bson!({"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 1}}),
+            bson::bson!({"$dateTrunc": {"date": "$d", "unit": "day", "binSize": 2}}),
+            bson::bson!({"$year": "$d"}),
+            bson::bson!({"$add": [1, 2]}),
+        ] {
+            assert_eq!(expression_shape_problem(&expr), None, "{expr:?}");
+        }
     }
 }
