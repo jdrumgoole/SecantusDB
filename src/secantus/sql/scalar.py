@@ -1388,9 +1388,39 @@ def _sign(v: Any) -> Any:
     return float(s) if isinstance(v, float) else s
 
 
-def _cbrt(v: Any) -> float:
-    """Real cube root — Python's ``** (1/3)`` goes complex for negatives."""
-    return math.copysign(abs(v) ** (1.0 / 3.0), v)
+def _cbrt(v: Any) -> float | None:
+    """Real cube root — Python's ``** (1/3)`` goes complex for negatives.
+
+    A NUMERIC argument arrives as `Decimal128`, which has no `__abs__`, so
+    `cbrt(27.0)` raised TypeError while `cbrt(27)` worked. Coerce first.
+    """
+    if v is None:
+        return None
+    x = float(str(v.to_decimal() if isinstance(v, bson.Decimal128) else v))
+    return _real_cbrt(x)
+
+
+def _real_cbrt(x: float) -> float:
+    """A cube root that is exact for perfect cubes.
+
+    Not `math.copysign(abs(x) ** (1/3), x)`: the power form loses the last
+    digits, so `cbrt(1000000)` came out 99.99999999999997 where PG gives
+    exactly 100.
+
+    `math.cbrt` is the right answer — it and PG both call libm's `cbrt`, so it
+    agrees to the bit — but it only exists from Python 3.11 and this package
+    supports 3.10. The fallback refines the power form with one Newton step,
+    which is exact on every perfect cube and within one ULP elsewhere. Chasing
+    that last bit is not worth it: a correctly-rounded cube root disagrees with
+    libm on ~8% of random inputs, so being *more* accurate than libm would move
+    us AWAY from Postgres."""
+    if x == 0.0 or not math.isfinite(x):
+        return x
+    cbrt = getattr(math, "cbrt", None)
+    if cbrt is not None:
+        return cbrt(x)
+    y = math.copysign(abs(x) ** (1.0 / 3.0), x)
+    return y - (y * y * y - x) / (3.0 * y * y)
 
 
 # -- date / time ------------------------------------------------------------- #
@@ -3569,6 +3599,28 @@ def _plain_scalar(name: str, args: list[Any]) -> Any:
         old_v = args[1] if len(args) > 1 else None
         new_v = args[2] if len(args) > 2 else None
         return [new_v if x == old_v else x for x in a]
+    if name == "isfinite":
+        # A date / timestamp / interval is finite unless it is one of PG's
+        # infinity sentinels. NULL propagates.
+        if a is None:
+            return None
+        from secantus.sql import datetimes as _dtm
+
+        sentinel = getattr(_dtm, "datetime_sentinel", None)
+        if sentinel is not None and isinstance(a, str) and sentinel(a) is not None:
+            return False
+        return not (isinstance(a, float) and (a != a or a in (float("inf"), float("-inf"))))
+    if name == "scale":
+        # The COUNT of decimal digits a numeric carries — `scale(1.50)` is 2,
+        # `scale(100)` is 0. Not the same as "digits after stripping zeros".
+        if a is None:
+            return None
+        from decimal import Decimal as _Dec
+
+        d = a.to_decimal() if isinstance(a, bson.Decimal128) else a
+        if not isinstance(d, _Dec):
+            d = _Dec(str(d))
+        return max(0, -d.as_tuple().exponent)
     if name == "div":
         # Integer quotient of two numerics, truncated toward zero — PG returns
         # NUMERIC, not int.
@@ -3598,6 +3650,8 @@ PLAIN_SCALAR_TAGS = {
     "starts_with": "bool",
     "width_bucket": "int4",
     "div": "numeric",
+    "isfinite": "bool",
+    "scale": "int4",
     "regexp_match": "text[]",
     "regexp_split_to_array": "text[]",
     "string_to_array": "text[]",
