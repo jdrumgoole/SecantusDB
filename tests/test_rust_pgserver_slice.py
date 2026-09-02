@@ -708,3 +708,100 @@ def test_arrays_round_trip_with_their_own_oids(home: Path) -> None:
         with pytest.raises(psycopg.Error) as exc:
             cur.execute("SELECT '{{1,2},{3,4}}'::int[]")
         assert exc.value.diag.sqlstate == "0A000"
+
+
+def test_simple_query_runs_a_batch_in_one_implicit_transaction(home: Path) -> None:
+    """Several commands in one simple query, as PostgreSQL runs them.
+
+    The transaction is the part that cannot be faked afterwards, and both rules
+    below were measured against PostgreSQL 14:
+
+    * a failure anywhere in the batch rolls back what earlier commands wrote —
+      the batch is one implicit transaction, not a sequence of autocommits;
+    * an explicit ``COMMIT`` inside the batch ends that transaction, so what it
+      committed survives a later failure.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+
+        cur.execute("select 1; select 2")
+        assert cur.fetchall() == [(1,)]
+        assert cur.nextset() is True
+        assert cur.fetchall() == [(2,)]
+
+        cur.execute("create table t (id int primary key)")
+
+        # A later failure discards the earlier insert.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("insert into t values (1); select * from nosuchtable")
+        assert exc.value.diag.sqlstate == "42P01"
+        cur.execute("select count(*) from t")
+        assert cur.fetchone()[0] == 0
+
+        # An explicit COMMIT inside the batch is a real commit.
+        with pytest.raises(psycopg.Error):
+            cur.execute("begin; insert into t values (2); commit; select * from nosuchtable")
+        cur.execute("select count(*) from t")
+        assert cur.fetchone()[0] == 1
+
+        # Empty commands are accepted and produce no result.
+        cur.execute("select 1;;")
+        assert cur.fetchone() == (1,)
+        cur.execute(";")
+        assert cur.statusmessage is None
+
+        # The EXTENDED protocol still refuses several commands: it has one
+        # parameter list and one row description, which two commands cannot
+        # share. PostgreSQL says exactly this, with this SQLSTATE.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("select 1; select %s", (2,))
+        assert exc.value.diag.sqlstate == "42601"
+        assert "cannot insert multiple commands" in str(exc.value)
+
+
+def test_deallocate_all_is_accepted(home: Path) -> None:
+    """`DEALLOCATE ALL` must succeed, and with PostgreSQL's own tag.
+
+    psycopg issues it to reset its prepared-statement cache, but only when the
+    connection happens to have one — so refusing it failed a scattered handful
+    of tests depending on execution order, which reads as flakiness rather than
+    as a missing feature. The prepared-statement store belongs to the wire
+    layer here, so there is nothing to free; the tag is what the client needs.
+
+    `DEALLOCATE <name>` is still refused rather than treated as a no-op:
+    PostgreSQL answers 26000 for a name that does not exist, and silently
+    succeeding would be a wrong answer.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("DEALLOCATE ALL")
+        assert cur.statusmessage == "DEALLOCATE ALL"
+
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("DEALLOCATE nosuchstmt")
+        assert exc.value.diag.sqlstate == "0A000"
+
+
+def test_pg_typeof_reports_the_display_type(home: Path) -> None:
+    """`pg_typeof` prints `integer`, not `int4`, and answers a regtype.
+
+    It reports the STATIC type of its argument, which is why `pg_typeof(NULL)`
+    is `unknown`: no value could tell us that.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("select pg_typeof(1)")
+        assert cur.fetchone()[0] == "integer"
+        assert cur.description[0].type_code == 2206  # regtype, not text
+
+        for expr, want in [
+            ("1::int8", "bigint"),
+            ("1.5", "numeric"),
+            ("1.5::float8", "double precision"),
+            ("'a'::varchar", "character varying"),
+            ("'2026-01-01 12:00'::timestamp", "timestamp without time zone"),
+            ("ARRAY[1,2]", "integer[]"),
+            ("null", "unknown"),
+        ]:
+            cur.execute(f"select pg_typeof({expr})::text")
+            assert cur.fetchone()[0] == want, expr

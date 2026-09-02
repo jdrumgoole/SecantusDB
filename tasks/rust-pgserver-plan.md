@@ -466,7 +466,52 @@ candidates into one answer in two runs.
 encoding, since rust-postgres will not do it); `test_array.py` is 34/124, so
 psycopg's array corpus goes much deeper than 1-D round-trips.
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984.**
+### 0.19 multi-statement, and a gauge that had been lying (2026-09-02)
+
+**986 -> ~1040.** Multi-command simple queries, `DEALLOCATE ALL`, `pg_typeof`,
+and two cast bugs the probes turned up.
+
+**The instrument was broken before any of this.** Two runs of the SAME build
+gave 1014 and 993 — a 21-test swing that looked like noise and was not. psycopg
+issues `DEALLOCATE ALL` to reset its prepared-statement cache, but only when a
+connection happens to have one, so refusing it failed a scattered set of tests
+depending on execution order. **A bimodal gauge is a missing feature until
+proven otherwise**; supporting `DEALLOCATE ALL` collapsed the spread to 3
+(1011 / 1013 / 1010). Every number recorded in 0.18 was measured on the
+unstable instrument, which is why the arrays batch re-measured as +36 against a
+`main` that had itself moved.
+
+**Multi-statement is mostly a transaction feature.** The splitting is one call
+to libpg_query. What cannot be added afterwards is that a batch runs as ONE
+implicit transaction: a failure in the third command discards what the first
+two wrote, and an explicit `COMMIT` inside the batch ends the transaction so
+its work survives a later failure. Both probed against PG 14. Both fall out of
+reusing the session's own transaction slot rather than tracking a second one —
+`BEGIN` inside a transaction was already a no-op and `COMMIT` already took the
+handle, so the composition was free.
+
+**Naming the function in the error is what made the rest rankable.** `FuncCall
+is not supported yet` was the single largest failure signature at 367 and said
+nothing about which function to build. Naming it split into `pg_typeof` 225,
+`chr` 47, `generate_series` 43, `set_byte` 22, the range constructors ~90.
+`pg_typeof` alone was two thirds of it. **A diagnostic change can be the
+highest-value change on the board** — it cost four lines and re-ranked
+everything behind it.
+
+**Two cast bugs found by the pg_typeof probe, not by the gauge.** `1.5::float8`
+failed outright, and so did `1.5::int`: decimal literals became `numeric` in the
+previous batch and neither cast path was taught about `Decimal128`. Then
+`2.5::float8::int` answered 3 — PostgreSQL rounds float-to-integer HALF TO EVEN
+and numeric-to-integer HALF AWAY FROM ZERO, and one rule was doing both.
+Writing a probe for the feature you are adding keeps finding bugs in the
+feature you added last.
+
+**Next, re-ranked at 1043:** `DROP <non-table>` 207 (and its message leaks Rust
+debug formatting: `DROP of Ok(ObjectType) is not supported yet`), `interval`
+126, COPY binary 119, `timestamptz` 99, cursors 73, `CREATE SCHEMA` 71,
+`json`/`jsonb` 68 each, binary-format parameters 54.
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043.**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

@@ -223,6 +223,9 @@ fn wire_type(pg_type: &str) -> Type {
         "time" => Type::TIME,
         "timestamp" => Type::TIMESTAMP,
         "numeric" | "decimal" => Type::NUMERIC,
+        // `pg_typeof` answers a `regtype` (2206), not text: a client reading
+        // 25 would print the same characters but compare unequal to a regtype.
+        "regtype" => Type::REGTYPE,
         // Array oids are their own types (int4[] is 1007, not 23).
         "int4[]" | "int[]" | "integer[]" => Type::INT4_ARRAY,
         "int8[]" | "bigint[]" => Type::INT8_ARRAY,
@@ -256,12 +259,99 @@ impl SimpleQueryHandler for PgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        // The simple protocol has no parameters and no row limit.
-        self.run(query, &[], 0).await
+        // The simple protocol takes any number of commands separated by
+        // semicolons and answers with one result each. The extended protocol
+        // does not, and still refuses -- see `Error::MultipleCommands`.
+        let stmts = secantus_pgplan::split_statements(query).map_err(|e| Self::err(&e))?;
+        if stmts.len() <= 1 {
+            // The one-statement path is left exactly as it was, so the common
+            // case cannot be changed by the batching logic below.
+            return self.run(query, &[], 0).await;
+        }
+        self.run_batch(&stmts).await
     }
 }
 
 impl PgHandler {
+    /// Run a multi-command simple query as PostgreSQL does: every command in
+    /// order, one result each, the whole batch in an IMPLICIT TRANSACTION.
+    ///
+    /// The transaction is the part that is easy to miss and impossible to fake
+    /// afterwards. Measured against PostgreSQL 14:
+    ///
+    /// * `insert into t values (1); select * from nosuchtable` leaves **no**
+    ///   row in `t` -- the failure rolls the earlier write back.
+    /// * `begin; insert into t values (2); commit; select * from nosuchtable`
+    ///   leaves the row -- an explicit COMMIT inside the batch ends the
+    ///   transaction, and what it committed survives the later failure.
+    ///
+    /// Both fall out of reusing the session's own transaction slot rather than
+    /// tracking a second one: `BEGIN` inside an open transaction is already a
+    /// no-op here (as it is a warning in PostgreSQL), and `COMMIT` already
+    /// takes the handle. After a mid-batch COMMIT a fresh implicit transaction
+    /// is opened for the commands that follow, which is what PostgreSQL does.
+    async fn run_batch(&self, stmts: &[String]) -> PgWireResult<Vec<Response>> {
+        let implicit = self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+        if implicit {
+            self.begin_implicit()?;
+        }
+
+        let mut out = Vec::with_capacity(stmts.len());
+        for (i, sql) in stmts.iter().enumerate() {
+            match self.run(sql, &[], 0).await {
+                Ok(responses) => out.extend(responses),
+                Err(e) => {
+                    if implicit {
+                        // Roll back whatever this batch opened. A failure to
+                        // roll back must not mask the error that caused it.
+                        let _ = self.rollback_implicit();
+                    }
+                    return Err(e);
+                }
+            }
+            // An explicit COMMIT or ROLLBACK inside the batch closed the
+            // transaction; PostgreSQL starts another for what follows.
+            if implicit
+                && i + 1 < stmts.len()
+                && self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+            {
+                self.begin_implicit()?;
+            }
+        }
+
+        if implicit {
+            self.commit_implicit()?;
+        }
+        Ok(out)
+    }
+
+    fn begin_implicit(&self) -> PgWireResult<()> {
+        let handle = self
+            .storage
+            .begin_user_transaction()
+            .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
+        *self.txn.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        Ok(())
+    }
+
+    fn commit_implicit(&self) -> PgWireResult<()> {
+        if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            self.storage
+                .commit_user_transaction(&mut handle)
+                .map_err(|e| Self::storage_err("could not commit a transaction", e))?;
+        }
+        Ok(())
+    }
+
+    fn rollback_implicit(&self) -> PgWireResult<()> {
+        if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            self.storage
+                .rollback_user_transaction(&mut handle)
+                .map_err(|e| Self::storage_err("could not roll back a transaction", e))?;
+        }
+        Ok(())
+    }
+
     /// Execute one statement. Shared by BOTH protocols so they cannot drift:
     /// the simple path passes no parameters, the extended path passes the
     /// portal's bound values and `Execute`'s row limit.
@@ -625,6 +715,12 @@ impl PgHandler {
                 });
                 Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
             }
+
+            // The wire layer owns the prepared-statement store, so there is
+            // nothing here to free: psycopg issues this to reset its own cache
+            // and then re-prepares under fresh names. The TAG is the part that
+            // matters, and PostgreSQL's is `DEALLOCATE ALL`, not `DEALLOCATE`.
+            Statement::DeallocateAll => Ok(vec![Response::Execution(Tag::new("DEALLOCATE ALL"))]),
 
             Statement::Set { name, value } => {
                 let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());

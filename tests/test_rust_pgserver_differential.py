@@ -300,6 +300,37 @@ QUERIES = [
     "SELECT '{}'::int[] < ARRAY[1]::int[]",
     "SELECT ARRAY[1,2,3]::int[] <> ARRAY[1,2]::int[]",
     "SELECT '{a,NULL,b}'::text[]",
+    # --- pg_typeof: the DISPLAY name, which is not the internal one ---------
+    "SELECT pg_typeof(1)::text",
+    "SELECT pg_typeof(1::int8)::text",
+    "SELECT pg_typeof(1::int2)::text",
+    "SELECT pg_typeof(1.5)::text",
+    "SELECT pg_typeof(1.5::float8)::text",
+    "SELECT pg_typeof(1.5::float4)::text",
+    "SELECT pg_typeof('a'::text)::text",
+    "SELECT pg_typeof('a'::varchar)::text",
+    "SELECT pg_typeof('a'::bpchar)::text",
+    "SELECT pg_typeof('x'::name)::text",
+    "SELECT pg_typeof(true)::text",
+    "SELECT pg_typeof('2026-01-01'::date)::text",
+    "SELECT pg_typeof('12:00'::time)::text",
+    "SELECT pg_typeof('2026-01-01 12:00'::timestamp)::text",
+    "SELECT pg_typeof(ARRAY[1,2])::text",
+    "SELECT pg_typeof(ARRAY['a']::text[])::text",
+    # A bare NULL has no type yet — PostgreSQL calls it `unknown`.
+    "SELECT pg_typeof(null)::text",
+    "SELECT pg_typeof(1+1)::text",
+    "SELECT pg_typeof('a'||'b')::text",
+    "SELECT pg_typeof(1=1)::text",
+    # --- casts to integer use TWO different rounding rules ------------------
+    # numeric -> integer rounds half AWAY FROM ZERO; float -> integer rounds
+    # half TO EVEN. Using one rule for both answers 3 for `2.5::float8::int`.
+    "SELECT 1.5::int, 2.5::int, -1.5::int, 0.5::int, 1.4::int, -0.5::int",
+    "SELECT 0.5::float8::int, 1.5::float8::int, 2.5::float8::int",
+    "SELECT 3.5::float8::int, -0.5::float8::int, -2.5::float8::int",
+    "SELECT 1.5::int8, 1.5::int2",
+    # A decimal literal is `numeric`, so these cast FROM numeric, not float.
+    "SELECT 1.5::float8, 1.5::float4",
 ]
 
 # (statement, verification query) — the write is compared by its row count AND

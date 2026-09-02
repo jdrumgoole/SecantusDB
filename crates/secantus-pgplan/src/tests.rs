@@ -881,3 +881,131 @@ fn array_type_keeps_its_brackets() {
         other => panic!("wrong statement: {other:?}"),
     }
 }
+
+/// Splitting a multi-command string goes through the PARSER, not a scan for
+/// `;`, so a semicolon inside a literal or a comment does not split the batch.
+#[test]
+fn split_statements_respects_quoting() {
+    for (sql, want) in [
+        ("select 1", vec!["select 1"]),
+        ("select 1; select 2", vec!["select 1", " select 2"]),
+        // A trailing or doubled semicolon produces no extra command.
+        ("select 1;", vec!["select 1"]),
+        ("select 1;;", vec!["select 1"]),
+        (";", vec![]),
+        ("", vec![]),
+        // The semicolon here is DATA, not a separator.
+        ("select 'a;b'", vec!["select 'a;b'"]),
+        ("select 'a;b'; select 2", vec!["select 'a;b'", " select 2"]),
+    ] {
+        let got = split_statements(sql).expect("split");
+        let want: Vec<String> = want.into_iter().map(|s| s.trim().to_string()).collect();
+        assert_eq!(got, want, "for {sql:?}");
+    }
+}
+
+/// The extended protocol takes ONE command: it has a single parameter list and
+/// a single row description, which two commands cannot share. PostgreSQL says
+/// so with 42601, not with "not supported".
+#[test]
+fn a_prepared_statement_refuses_several_commands() {
+    let err = plan("select 1; select 2", &lookup).expect_err("two commands");
+    assert_eq!(err.sqlstate(), "42601");
+    assert_eq!(
+        err.to_string(),
+        "cannot insert multiple commands into a prepared statement"
+    );
+}
+
+/// Casting to an integer uses TWO DIFFERENT rounding rules in PostgreSQL, and
+/// using one for both is a wrong answer rather than a rounding preference.
+///
+/// numeric -> integer rounds half AWAY FROM ZERO; float -> integer rounds half
+/// TO EVEN. Rust's `f64::round()` is the former, so it answered 3 for
+/// `2.5::float8::int` where PostgreSQL answers 2. Measured on PostgreSQL 14.
+#[test]
+fn integer_casts_round_by_source_type() {
+    for (sql, want) in [
+        // numeric: half away from zero.
+        ("SELECT 0.5::int", 1),
+        ("SELECT 1.5::int", 2),
+        ("SELECT 2.5::int", 3),
+        ("SELECT 3.5::int", 4),
+        ("SELECT -1.5::int", -2),
+        ("SELECT -0.5::int", -1),
+        ("SELECT 1.4::int", 1),
+        // float8: half to even.
+        ("SELECT 0.5::float8::int", 0),
+        ("SELECT 1.5::float8::int", 2),
+        ("SELECT 2.5::float8::int", 2),
+        ("SELECT 3.5::float8::int", 4),
+        ("SELECT -2.5::float8::int", -2),
+    ] {
+        match plan_ok(sql) {
+            Statement::SelectConstant(sc) => {
+                assert_eq!(
+                    sc.columns[0].1,
+                    ConstCol::Value(Bson::Int32(want)),
+                    "for {sql}"
+                );
+            }
+            other => panic!("wrong statement for {sql}: {other:?}"),
+        }
+    }
+}
+
+/// A `numeric` is rounded on its DIGITS, not through an f64.
+///
+/// Decimal128 carries up to 34 significant digits and an f64 has 15, so a big
+/// value routed through a float would round twice and could land on a
+/// different integer than PostgreSQL reports.
+#[test]
+fn numeric_to_integer_does_not_go_through_a_float() {
+    // Exactly representable as i64, but NOT as f64.
+    match plan_ok("SELECT '9007199254740993'::numeric::int8") {
+        Statement::SelectConstant(sc) => {
+            assert_eq!(
+                sc.columns[0].1,
+                ConstCol::Value(Bson::Int64(9_007_199_254_740_993))
+            );
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    // Too large for the target: an error, never a truncation.
+    let err =
+        plan("SELECT '12345678901234567890.5'::numeric::int8", &lookup).expect_err("out of range");
+    assert_eq!(err.sqlstate(), "22003");
+}
+
+/// `pg_typeof` answers the DISPLAY name of the STATIC type.
+#[test]
+fn pg_typeof_reports_display_names() {
+    for (sql, want) in [
+        ("SELECT pg_typeof(1)", "integer"),
+        ("SELECT pg_typeof(1::int8)", "bigint"),
+        ("SELECT pg_typeof(1.5)", "numeric"),
+        ("SELECT pg_typeof(1.5::float8)", "double precision"),
+        ("SELECT pg_typeof('a'::varchar)", "character varying"),
+        ("SELECT pg_typeof('a'::bpchar)", "character"),
+        ("SELECT pg_typeof('12:00'::time)", "time without time zone"),
+        ("SELECT pg_typeof(ARRAY[1,2])", "integer[]"),
+        ("SELECT pg_typeof(ARRAY['a']::text[])", "text[]"),
+        // Static, not read off the value: no value can report `unknown`.
+        ("SELECT pg_typeof(null)", "unknown"),
+        ("SELECT pg_typeof(1=1)", "boolean"),
+    ] {
+        match plan_ok(sql) {
+            Statement::SelectConstant(sc) => {
+                assert_eq!(
+                    sc.columns[0].1,
+                    ConstCol::Value(Bson::String(want.to_string())),
+                    "for {sql}"
+                );
+                // A regtype, not text: a client reading oid 25 would print the
+                // same characters but compare unequal to a regtype.
+                assert_eq!(sc.columns[0].2, "regtype", "for {sql}");
+            }
+            other => panic!("wrong statement for {sql}: {other:?}"),
+        }
+    }
+}

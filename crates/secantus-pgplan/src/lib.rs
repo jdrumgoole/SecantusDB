@@ -48,6 +48,13 @@ pub enum Error {
     DivisionByZero,
     /// Integer overflow -> 22003.
     NumericOutOfRange(String),
+    /// More than one command where only one is allowed -> 42601.
+    ///
+    /// PostgreSQL accepts a multi-command string over the SIMPLE query
+    /// protocol and refuses it in a prepared statement, so this is a real
+    /// error rather than a gap: the extended protocol has one parameter list
+    /// and one row description, which two commands cannot share.
+    MultipleCommands,
 }
 
 impl std::fmt::Display for Error {
@@ -65,6 +72,12 @@ impl std::fmt::Display for Error {
             }
             Error::DivisionByZero => write!(f, "division by zero"),
             Error::NumericOutOfRange(m) => write!(f, "{m}"),
+            Error::MultipleCommands => {
+                write!(
+                    f,
+                    "cannot insert multiple commands into a prepared statement"
+                )
+            }
         }
     }
 }
@@ -84,6 +97,7 @@ impl Error {
             Error::DatetimeFieldOverflow(_) => "22008", // datetime_field_overflow
             Error::DivisionByZero => "22012",
             Error::NumericOutOfRange(_) => "22003", // numeric_value_out_of_range
+            Error::MultipleCommands => "42601",     // syntax_error, as PostgreSQL reports it
         }
     }
 }
@@ -108,6 +122,15 @@ pub enum Statement {
     },
     /// `RESET name` / `RESET ALL`.
     Reset(String),
+    /// `DEALLOCATE ALL`.
+    ///
+    /// Only the ALL form. The prepared-statement store belongs to the wire
+    /// layer here, not to the planner, so this is a no-op that answers with
+    /// PostgreSQL's tag — which is what a client asking to reset its cache
+    /// needs. `DEALLOCATE <name>` is still refused rather than treated as a
+    /// no-op: PostgreSQL answers 26000 for a name that does not exist, and
+    /// silently succeeding there would be a wrong answer.
+    DeallocateAll,
     /// `COPY <table> [(cols)] FROM STDIN`.
     CopyFrom(CopyFrom),
     /// `COPY <table> [(cols)] TO STDOUT`.
@@ -305,7 +328,20 @@ pub struct Delete {
     pub filter: Document,
 }
 
+/// Name an unsupported node in an error message.
+///
+/// A bare node kind is the right answer for most of these -- `RowExpr` says
+/// what is missing -- but NOT for a function call, where the kind is the same
+/// for every function in PostgreSQL's catalog. `FuncCall is not supported yet`
+/// was the single most common failure on the psycopg gauge and said nothing
+/// about which function to implement; naming it is what makes the remainder
+/// rankable.
 fn disc(n: &N) -> String {
+    if let N::FuncCall(f) = n {
+        if let Some(name) = func_name(f) {
+            return format!("function {name}()");
+        }
+    }
     format!("{n:?}")
         .split('(')
         .next()
@@ -313,11 +349,45 @@ fn disc(n: &N) -> String {
         .to_string()
 }
 
+/// The bare (schema-less) name of a called function, as PostgreSQL prints it.
+fn func_name(f: &pg_query::protobuf::FuncCall) -> Option<String> {
+    f.funcname
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::String(st) => Some(st.sval.clone()),
+            _ => None,
+        })
+        .next_back()
+}
+
+/// Split a multi-command string into its individual commands.
+///
+/// PostgreSQL's SIMPLE query protocol takes any number of commands separated by
+/// semicolons and answers with one result per command; only the extended
+/// protocol is limited to one. Splitting goes through libpg_query's own parser
+/// rather than a scan for `;`, so a semicolon inside a string literal, a dollar-
+/// quoted body or a comment does not split the batch.
+///
+/// Empty commands (a trailing `;`, or `;;`) are dropped: PostgreSQL accepts them
+/// and produces no result for them.
+pub fn split_statements(sql: &str) -> Result<Vec<String>> {
+    let parts = pg_query::split_with_parser(sql).map_err(|e| Error::Parse(e.to_string()))?;
+    Ok(parts
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 fn parse_one(sql: &str) -> Result<N> {
     let parsed = pg_query::parse(sql).map_err(|e| Error::Parse(e.to_string()))?;
     let mut stmts = parsed.protobuf.stmts;
-    if stmts.len() != 1 {
-        return Err(Error::Unsupported("multi-statement input".into()));
+    if stmts.len() > 1 {
+        return Err(Error::MultipleCommands);
+    }
+    if stmts.is_empty() {
+        return Err(Error::Parse("empty statement".into()));
     }
     stmts
         .remove(0)
@@ -350,6 +420,9 @@ pub fn plan_with_params(
         N::DropStmt(d) => plan_drop(&d),
         N::CopyStmt(c) => plan_copy(&c, lookup),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
+        // `DEALLOCATE ALL` carries no name; `DEALLOCATE x` names one.
+        N::DeallocateStmt(d) if d.name.is_empty() => Ok(Statement::DeallocateAll),
+        N::DeallocateStmt(_) => Err(Error::Unsupported("DEALLOCATE <name>".into())),
         N::VariableSetStmt(v) => plan_set(&v),
         N::TransactionStmt(t) => {
             // Named enum, not the wire integer -- twice bitten already.
@@ -950,6 +1023,58 @@ fn inferred_type(v: &Bson) -> &'static str {
     }
 }
 
+/// `pg_typeof(x)` — the display name of x's STATIC type.
+///
+/// Static, not read off the value: `pg_typeof(NULL)` is `unknown`, which no
+/// value could report. Lives in one place so the FROM-less target list and the
+/// general expression evaluator cannot disagree — `pg_typeof(1)` and
+/// `pg_typeof(1)::text` reach it by different routes.
+fn pg_typeof(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> {
+    if f.args.len() != 1 {
+        return Err(Error::Parse(
+            "function pg_typeof() requires exactly one argument".into(),
+        ));
+    }
+    let arg = &f.args[0];
+    let value = const_value(arg, params)?;
+    let internal = if value == Bson::Null && matches!(arg.node.as_ref(), Some(N::AConst(_))) {
+        "unknown".to_string()
+    } else {
+        static_type(arg, &value)
+    };
+    Ok(Bson::String(display_type(&internal)))
+}
+
+/// PostgreSQL's DISPLAY name for a type, which is not its internal name.
+///
+/// `pg_typeof` prints `integer`, not `int4`, and `timestamp without time zone`,
+/// not `timestamp` — the spelling a client sees in `\d` and in error messages.
+/// Array types print as the element's display name plus `[]`. Measured against
+/// PostgreSQL 14 rather than transcribed from memory.
+pub fn display_type(internal: &str) -> String {
+    if let Some(base) = internal.strip_suffix("[]") {
+        return format!("{}[]", display_type(base));
+    }
+    match internal {
+        "int2" | "smallint" => "smallint",
+        "int4" | "int" | "integer" => "integer",
+        "int8" | "bigint" => "bigint",
+        "float4" | "real" => "real",
+        "float8" | "double" => "double precision",
+        "numeric" | "decimal" => "numeric",
+        "bool" | "boolean" => "boolean",
+        "varchar" => "character varying",
+        "bpchar" | "char" | "character" => "character",
+        "time" => "time without time zone",
+        "timestamp" => "timestamp without time zone",
+        // A bare NULL literal has no type yet: PostgreSQL calls it `unknown`,
+        // and resolves it from context when there is any.
+        "unknown" => "unknown",
+        other => other,
+    }
+    .to_string()
+}
+
 fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> Result<Statement> {
     let mut columns: Vec<(String, ConstCol, String)> = Vec::new();
     for t in &s.target_list {
@@ -967,6 +1092,22 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     })
                     .next_back()
                     .unwrap_or_default();
+                // `pg_typeof(x)` reports the STATIC type of its argument,
+                // so it is answered from the same `static_type` the row
+                // description uses rather than from the value: `pg_typeof(NULL)`
+                // is `unknown`, which no value could tell us.
+                if name == "pg_typeof" {
+                    columns.push((
+                        if rt.name.is_empty() {
+                            "pg_typeof".to_string()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::Value(pg_typeof(f, params)?),
+                        "regtype".to_string(),
+                    ));
+                    continue;
+                }
                 if let Some(col) = guc_function(&name, f, params)? {
                     let out_name = name.clone();
                     columns.push((
@@ -1358,6 +1499,40 @@ fn array_element(raw: &str, was_quoted: bool, element_type: &str) -> Result<Bson
     cast_value(Bson::String(text.to_string()), element_type)
 }
 
+/// A `numeric` rounded to a whole number, as PostgreSQL rounds it.
+///
+/// PostgreSQL rounds numeric->integer HALF AWAY FROM ZERO (`1.5`->2, `2.5`->3,
+/// `-1.5`->-2), which is not what it does for float->integer (that is
+/// half-to-even). Measured on PostgreSQL 14.
+///
+/// Done on the DIGITS rather than through `f64`: a `numeric` carries up to 34
+/// significant digits and an f64 has 15, so routing a big one through a float
+/// would round twice and silently return a different integer.
+fn decimal_to_integer(d: &bson::Decimal128) -> Option<i128> {
+    let text = d.to_string();
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => (-1i128, rest),
+        None => (1i128, text.as_str()),
+    };
+    // NaN / Infinity / exponent forms are not whole numbers we can name.
+    if digits.chars().any(|c| !c.is_ascii_digit() && c != '.') {
+        return None;
+    }
+    let (int_part, frac) = match digits.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (digits, ""),
+    };
+    let mut magnitude: i128 = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse().ok()?
+    };
+    if frac.starts_with(|c: char| ('5'..='9').contains(&c)) {
+        magnitude = magnitude.checked_add(1)?;
+    }
+    Some(sign * magnitude)
+}
+
 fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     // A NULL survives every cast; only its declared type changes.
     if value == Bson::Null {
@@ -1406,7 +1581,15 @@ fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             Bson::Int64(i) => i32::try_from(*i)
                 .map(Bson::Int32)
                 .map_err(|_| Error::InvalidText(format!("integer out of range: \"{i}\""))),
-            Bson::Double(d) => Ok(Bson::Int32(d.round() as i32)),
+            // float->integer rounds HALF TO EVEN in PostgreSQL (`2.5` -> 2,
+            // `3.5` -> 4), which is NOT the half-away-from-zero rule it uses
+            // for numeric->integer. Rust's `round()` is the latter, so using
+            // it here answered 3 for `2.5::float8::int`. Measured on PG 14.
+            Bson::Double(d) => Ok(Bson::Int32(d.round_ties_even() as i32)),
+            Bson::Decimal128(d) => decimal_to_integer(d)
+                .and_then(|n| i32::try_from(n).ok())
+                .map(Bson::Int32)
+                .ok_or_else(|| Error::NumericOutOfRange(format!("integer out of range: \"{d}\""))),
             Bson::String(s) => s
                 .trim()
                 .parse::<i32>()
@@ -1417,7 +1600,11 @@ fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         "int8" | "bigint" => match &value {
             Bson::Int32(i) => Ok(Bson::Int64(i64::from(*i))),
             Bson::Int64(_) => Ok(value),
-            Bson::Double(d) => Ok(Bson::Int64(d.round() as i64)),
+            Bson::Double(d) => Ok(Bson::Int64(d.round_ties_even() as i64)),
+            Bson::Decimal128(d) => decimal_to_integer(d)
+                .and_then(|n| i64::try_from(n).ok())
+                .map(Bson::Int64)
+                .ok_or_else(|| Error::NumericOutOfRange(format!("bigint out of range: \"{d}\""))),
             Bson::String(s) => s
                 .trim()
                 .parse::<i64>()
@@ -1452,6 +1639,14 @@ fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             Bson::Int32(i) => Ok(Bson::Double(f64::from(*i))),
             Bson::Int64(i) => Ok(Bson::Double(*i as f64)),
             Bson::Double(_) => Ok(value),
+            // A decimal literal is `numeric`, so `1.5::float8` arrives here as
+            // a Decimal128 rather than a Double. Missing this arm made the
+            // cast fail outright once decimal literals stopped being floats.
+            Bson::Decimal128(d) => d
+                .to_string()
+                .parse::<f64>()
+                .map(Bson::Double)
+                .map_err(|_| bad("double precision", &value)),
             Bson::String(s) => s
                 .trim()
                 .parse::<f64>()
@@ -1955,6 +2150,11 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         let value = const_value(arg, params)?;
         let target = tc.type_name.as_ref().map(type_name_of).unwrap_or_default();
         return cast_value(value, &target);
+    }
+    if let Some(N::FuncCall(f)) = node.node.as_ref() {
+        if func_name(f).as_deref() == Some("pg_typeof") {
+            return pg_typeof(f, params);
+        }
     }
     if let Some(N::AArrayExpr(a)) = node.node.as_ref() {
         let items = a
