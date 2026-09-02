@@ -569,6 +569,13 @@ def expression_problem_in_pipeline(
                     if nested:
                         return nested
         # Every other stage is left alone on purpose: see the docstring above.
+        # An expression's ARITY and SPEC SHAPE are parse errors, checked before
+        # anything is folded -- which is why they carry the STAGE wrapper
+        # (`Invalid $addFields :: caused by ::`) and not the optimizer's. We
+        # were folding them first and reporting "Failed to optimize pipeline",
+        # so 279 shapes had both the wrong wrapper and the wrong code.
+        if not found:
+            found = _expression_shape_problem(spec)
         if found:
             return (found[0], found[1], wrapper)
         # No structural problem: mongod would now FOLD the constant
@@ -586,6 +593,162 @@ def expression_problem_in_pipeline(
         folded = _fold_in_stage(name, spec, bound, fold_vars)
         if folded:
             return (folded[0], folded[1], FOLD_WRAPPER)
+    return None
+
+
+# `(low, high)` argument counts for the expressions mongod range-checks by
+# arity, and the message it uses. A non-array argument counts as ONE.
+_EXPRESSION_ARITY: dict[str, tuple[int, int]] = {
+    "$indexOfArray": (2, 4),
+    "$indexOfBytes": (2, 4),
+    "$indexOfCP": (2, 4),
+    "$range": (2, 3),
+    "$slice": (2, 3),
+}
+
+# The date extractors, which accept a bare expression OR a one-element array.
+_DATE_EXTRACTORS = frozenset(
+    {
+        "$dayOfMonth",
+        "$dayOfWeek",
+        "$dayOfYear",
+        "$hour",
+        "$isoDayOfWeek",
+        "$isoWeek",
+        "$isoWeekYear",
+        "$millisecond",
+        "$minute",
+        "$month",
+        "$second",
+        "$week",
+        "$year",
+    }
+)
+
+# Accumulator-style expressions whose spec must be a document, each with its own
+# Location code. Probed 8.2.11 (2026-09-02) -- they do NOT share one.
+#
+# `$sortArray` and `$setField` are deliberately ABSENT: they also take an object
+# spec, but their messages are their own ("requires an object as an argument,
+# found: int" / "only supports an object as its argument") and the existing
+# checks already produce them. Adding them here would have replaced two correct
+# messages with a wrong one.
+_OBJECT_SPEC_EXPRESSIONS: dict[str, int] = {
+    "$firstN": 5787801,
+    "$lastN": 5787801,
+    "$minN": 5787900,
+    "$maxN": 5787900,
+    "$median": 7436201,
+    "$percentile": 7436200,
+    "$topN": 168,
+    "$bottomN": 168,
+}
+
+
+# An unrecognised argument in a date-operator spec, per operator: its known
+# arguments, its Location code, and the tail some of them append naming what
+# they expected. Probed 8.2.11 (2026-09-02) -- the codes are all different, and
+# only `$dateAdd` / `$dateSubtract` / `$dateTrunc` carry the tail.
+_DATE_SPEC_ARGUMENTS: dict[str, tuple[frozenset[str], int, str]] = {
+    "$dateAdd": (
+        frozenset({"startDate", "unit", "amount", "timezone"}),
+        5166401,
+        ". Expected arguments are startDate, unit, amount, and optionally timezone.",
+    ),
+    "$dateSubtract": (
+        frozenset({"startDate", "unit", "amount", "timezone"}),
+        5166401,
+        ". Expected arguments are startDate, unit, amount, and optionally timezone.",
+    ),
+    "$dateDiff": (
+        frozenset({"startDate", "endDate", "unit", "timezone", "startOfWeek"}),
+        5166302,
+        "",
+    ),
+    "$dateFromParts": (
+        frozenset(
+            {
+                "year",
+                "isoWeekYear",
+                "month",
+                "isoWeek",
+                "day",
+                "isoDayOfWeek",
+                "hour",
+                "minute",
+                "second",
+                "millisecond",
+                "timezone",
+            }
+        ),
+        40518,
+        "",
+    ),
+    "$dateToParts": (frozenset({"date", "timezone", "iso8601"}), 40520, ""),
+    "$dateFromString": (
+        frozenset({"dateString", "format", "timezone", "onError", "onNull"}),
+        40541,
+        "",
+    ),
+    "$dateToString": (
+        frozenset({"date", "format", "timezone", "onNull"}),
+        18534,
+        "",
+    ),
+    "$dateTrunc": (
+        frozenset({"date", "unit", "binSize", "timezone", "startOfWeek"}),
+        5439008,
+        ". Expected arguments are date, unit, and optionally, binSize, timezone, startOfWeek",
+    ),
+}
+
+
+def _expression_shape_problem(spec: Any) -> tuple[int, str] | None:
+    """The first arity / spec-shape error in `spec`, as mongod parses it.
+
+    These are PARSE errors: mongod raises them while building the expression
+    tree, before it folds anything, so they carry the stage's wrapper. Checked
+    here rather than in the evaluator because the evaluator only runs on values
+    that survived parsing.
+    """
+    if isinstance(spec, Mapping):
+        for key, value in spec.items():
+            if (bounds := _EXPRESSION_ARITY.get(key)) is not None:
+                low, high = bounds
+                count = len(value) if isinstance(value, list) else 1
+                if not low <= count <= high:
+                    return (
+                        28667,
+                        f"Expression {key} takes at least {low} arguments, and at most "
+                        f"{high}, but {count} were passed in.",
+                    )
+            if key in _DATE_EXTRACTORS and isinstance(value, list) and len(value) != 1:
+                return (
+                    40536,
+                    f"{key} accepts exactly one argument if given an array, but was "
+                    f"given {len(value)}",
+                )
+            if (known := _DATE_SPEC_ARGUMENTS.get(key)) is not None and isinstance(value, Mapping):
+                fields, code, tail = known
+                for field in value:
+                    if field not in fields:
+                        return (code, f"Unrecognized argument to {key}: {field}{tail}")
+            if (code := _OBJECT_SPEC_EXPRESSIONS.get(key)) is not None and not isinstance(
+                value, Mapping
+            ):
+                return (
+                    code,
+                    f"specification must be an object; found {key}: {bson_value_repr_stage(value)}",
+                )
+            found = _expression_shape_problem(value)
+            if found:
+                return found
+        return None
+    if isinstance(spec, list):
+        for item in spec:
+            found = _expression_shape_problem(item)
+            if found:
+                return found
     return None
 
 

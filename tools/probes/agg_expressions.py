@@ -85,6 +85,11 @@ def cases():
             yield (f"{op}/2:{v!r}", {op: [v, 1]})
 
 
+# Expressions whose VALUE cannot be compared: two correct servers disagree by
+# design. Their error behaviour is still compared.
+NON_DETERMINISTIC = frozenset({"$rand"})
+
+
 def run(cli, dbn, expr):
     db = cli[dbn]
     try:
@@ -131,6 +136,11 @@ def main():
         if m == o:
             continue
         if m[0] == "OK" and o[0] == "OK":
+            # `$rand` returns a different draw every call, so two successes
+            # ARE agreement -- comparing the values reported a "wrong answer"
+            # the moment `$rand` started succeeding correctly.
+            if label.split("/")[0] in NON_DETERMINISTIC:
+                continue
             value_diffs.append((label, m, o))
         elif m[0] != o[0]:
             code_diffs.append((label, m, o))

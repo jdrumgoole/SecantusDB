@@ -14,6 +14,7 @@ from typing import Any
 import bson
 from bson import Decimal128, Int64, ObjectId, Timestamp
 
+from secantus.bsontypes import is_bson_string
 from secantus.numerics import IntegerOverflowError, bson_int_width
 from secantus.ordering import bson_equal as _bson_equal
 from secantus.paths import get_path
@@ -1646,8 +1647,23 @@ def _op_rand(arg: Any, _ctx: _Ctx) -> float:
     # MongoDB 5.0+: ``{$rand: {}}`` returns a uniform random double in
     # [0, 1). Argument must be an empty document; anything else is a
     # parse error in mongod (we mirror).
-    if not (isinstance(arg, Mapping) and not arg):
-        raise ExpressionError("$rand expects an empty document")
+    # Three outcomes, not one (probed 8.2.11): an empty document OR an empty
+    # ARRAY is the legal no-argument form; a NON-empty array is 3040501 "does
+    # not currently accept arguments"; anything that is neither a document nor
+    # an array is 10065 "invalid parameter: expected an object ($rand)".
+    if isinstance(arg, (list, Mapping)):
+        if arg:
+            raise ExpressionError(
+                "$rand does not currently accept arguments",
+                code=3040501,
+                code_name="Location3040501",
+            )
+    else:
+        raise ExpressionError(
+            "invalid parameter: expected an object ($rand)",
+            code=10065,
+            code_name="Location10065",
+        )
     import random as _random
 
     return _random.random()
@@ -1766,11 +1782,26 @@ def _op_get_field(arg: Any, ctx: _Ctx) -> Any:
     contain dots / dollars without being interpreted as a path —
     that's the whole point of ``$getField`` vs. a bare ``$path``.
     """
-    if isinstance(arg, str):
+    if is_bson_string(arg):
         field, input_expr = arg, "$$CURRENT"
     elif isinstance(arg, Mapping):
+        # An UNKNOWN argument outranks everything else, and `input` is required
+        # once the object form is used (probed 8.2.11).
+        for key in arg:
+            if key not in ("field", "input"):
+                raise ExpressionError(
+                    f"$getField found an unknown argument: {key}",
+                    code=3041701,
+                    code_name="Location3041701",
+                )
         field_expr = arg.get("field")
-        input_expr = arg.get("input", "$$CURRENT")
+        if "input" not in arg:
+            raise ExpressionError(
+                "$getField requires 'input' to be specified",
+                code=3041703,
+                code_name="Location3041703",
+            )
+        input_expr = arg["input"]
         if field_expr is None:
             raise ExpressionError("$getField requires a field")
         field = _eval(field_expr, ctx)
@@ -1782,7 +1813,14 @@ def _op_get_field(arg: Any, ctx: _Ctx) -> Any:
                 code_name="Location5654602",
             )
     else:
-        raise ExpressionError("$getField requires a string or {field, input} document")
+        # NOT a shape complaint: mongod evaluates the bare argument as `field`
+        # and reports its type, with `$getField`'s own 3041704.
+        raise ExpressionError(
+            f"$getField requires 'field' to evaluate to type String, but got "
+            f"{_bson_type_name(arg)}",
+            code=3041704,
+            code_name="Location3041704",
+        )
     # Evaluate ``input`` in a missing-aware way so we can tell an input that
     # resolved to *missing* (an absent field path) apart from an explicit
     # ``null``. mongod (verified against 6.0):
@@ -2884,8 +2922,21 @@ def _op_index_of_cp(arg: Any, ctx: _Ctx) -> Any:
     needle = _eval(arg[1], ctx)
     if s is None:
         return None
-    if not isinstance(s, str) or not isinstance(needle, str):
-        raise ExpressionError("$indexOfCP requires string operands")
+    # mongod names the OFFENDING argument and its type, with a distinct code
+    # per position (probed 8.2.11): 40093 for the first, 40094 for the second.
+    if not is_bson_string(s):
+        raise ExpressionError(
+            f"$indexOfCP requires a string as the first argument, found: {_bson_type_name(s)}",
+            code=40093,
+            code_name="Location40093",
+        )
+    if not is_bson_string(needle):
+        raise ExpressionError(
+            f"$indexOfCP requires a string as the second argument, "
+            f"found: {_bson_type_name(needle)}",
+            code=40094,
+            code_name="Location40094",
+        )
     start = _index_of_pos("$indexOfCP", "starting", _eval(arg[2], ctx)) if len(arg) >= 3 else 0
     end = _index_of_pos("$indexOfCP", "ending", _eval(arg[3], ctx)) if len(arg) >= 4 else len(s)
     return s.find(needle, start, end)
@@ -3214,13 +3265,30 @@ def _ensure_datetime(value: Any) -> _dt.datetime | None:
 
 
 def _coerce_extractor_date(value: Any) -> _dt.datetime | None:
-    """A date-extractor operand (`$year`/`$dayOfYear`/…) must be a Date, null, or a
-    missing field. mongod raises ``Location16006`` on any other present value (a
-    string, a number, …); null / missing yield null."""
+    """A date-extractor operand (`$year`/`$dayOfYear`/…) resolved to a `datetime`.
+
+    mongod accepts every BSON type that CARRIES a timestamp -- Date, ObjectId
+    (its 4-byte generation time) and Timestamp (its seconds field) -- and raises
+    ``Location16006`` on anything else present; null / missing yield null.
+    Probed 8.2.11 (2026-09-02): `{$year: ObjectId("64b7f9a2…")}` answers 2023,
+    where this used to refuse the whole document as unconvertible. That was a
+    wrong ANSWER on 13 shapes: an error where mongod returns a value.
+    """
+    # mongod treats a ONE-ELEMENT array as the argument itself, so
+    # `{$year: [<date>]}` is `{$year: <date>}`. Any other length is a parse
+    # error caught before this (40536).
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
     if isinstance(value, _dt.datetime):
         return value
     if value is None:
         return None
+    if isinstance(value, ObjectId):
+        # `generation_time` is tz-aware UTC; the rest of the date family works
+        # in naive UTC, so strip it rather than mixing the two.
+        return value.generation_time.replace(tzinfo=None)
+    if isinstance(value, Timestamp):
+        return _dt.datetime.fromtimestamp(value.time, _dt.timezone.utc).replace(tzinfo=None)
     raise ExpressionError(f"can't convert from BSON type {_type_name(value)} to Date", code=16006)
 
 
@@ -4483,12 +4551,27 @@ _SET_OP_CODES = {
 }
 
 
+# The set operators mongod requires at least two arguments for, checked before
+# it looks at their types.
+# Only `$setEquals`. Its siblings accept a single array and report a
+# non-array operand without counting arguments first (probed 8.2.11).
+_SET_OPS_NEEDING_TWO = frozenset({"$setEquals"})
+
+
 def _set_arrays(op: str, arg: Any, ctx: _Ctx, *, n: int | None = None) -> list[list[Any]]:
     """Evaluate a set operator's array arguments, validating each is an array
     (mongod's per-operator Location code, not a generic TypeMismatch)."""
     vals = _eval_args(arg, ctx)
     if n is not None and len(vals) != n:
         raise ExpressionError(f"{op} requires {n} arguments")
+    # ARITY first: `{$setEquals: [[1]]}` is "needs at least two arguments", not
+    # a complaint about the one array it did get (probed 8.2.11).
+    if op in _SET_OPS_NEEDING_TWO and len(vals) < 2:
+        raise ExpressionError(
+            f"{op} needs at least two arguments had: {len(vals)}",
+            code=17045,
+            code_name="Location17045",
+        )
     code = _SET_OP_CODES.get(op, 14)
     for i, v in enumerate(vals):
         if not isinstance(v, list):
@@ -4499,6 +4582,16 @@ def _set_arrays(op: str, arg: Any, ctx: _Ctx, *, n: int | None = None) -> list[l
                     f"{_bson_type_name(v)}"
                 )
             else:
+                # `$setEquals` NUMBERS the argument (1-based) and uses its own
+                # 5887502; `$setUnion` / `$setIntersection` say "One argument"
+                # and keep their own codes. Again: not one family.
+                if op == "$setEquals":
+                    raise ExpressionError(
+                        f"All operands of {op} must be arrays. {i + 1}-th argument is of "
+                        f"type: {_bson_type_name(v)}",
+                        code=5887502,
+                        code_name="Location5887502",
+                    )
                 msg = (
                     f"All operands of {op} must be arrays. One argument is of type: "
                     f"{_bson_type_name(v)}"
@@ -4656,7 +4749,21 @@ def _bit_operand(op: str, v: Any) -> tuple[int, bool]:
         return int(v), True
     if isinstance(v, int):
         return v, False
-    raise ExpressionError(f"{op} only supports int and long operands, not {_bson_type_name(v)}")
+    # `$bitNot` alone splits by whether the operand is a NUMBER at all: a
+    # non-numeric type is 28765 "only supports numeric types, not string", while
+    # a double or decimal is the bare 14 "only supports int and long, not:
+    # double." (trailing period included). Its three siblings name NO type at
+    # all and always answer 14 "only supports int and long operands." -- the
+    # family looks uniform and is not (probed 8.2.11, all four).
+    if op != "$bitNot":
+        raise ExpressionError(f"{op} only supports int and long operands.")
+    if isinstance(v, (float, Decimal128)):
+        raise ExpressionError(f"{op} only supports int and long, not: {_bson_type_name(v)}.")
+    raise ExpressionError(
+        f"{op} only supports numeric types, not {_bson_type_name(v)}",
+        code=28765,
+        code_name="Location28765",
+    )
 
 
 def _bit_result(value: int, is_long: bool) -> Any:
