@@ -7279,6 +7279,48 @@ shared storage engine or building large new protocol subsystems:
       (their tail keeps its case) and are correct. Closing it needs the raw
       format literal, i.e. a parser-level change or a pre-parse capture.
 
+- [x] **RESOLVED (2026-09-01) — 397 shapes leaked `XX000 internal error`; now
+      zero.** Two such leaks turned up by ACCIDENT in consecutive sweeps
+      (`substring(x FROM regex)`, `to_char(interval, …)`), so the class was
+      hunted deliberately: every scalar function against every value type,
+      reporting only the shapes where we answered XX000.
+
+          before   397 shapes      after   0
+
+      Always the same cause — a bare Python `TypeError` / `ValueError` from a
+      builtin applied to a type it does not model, escaping to the wire. PG
+      14.13 answers `42883 function f(types) does not exist` for **353 of the
+      397**, so that is what the guard produces; the argument type names come
+      from the AST (a bare string literal is `unknown`, as PG names it, which
+      the evaluated VALUE cannot tell from `text`).
+
+      **The guard is at the two evaluation BOUNDARIES** — the typed-node table
+      and the named-function path — not inside each builtin, because
+      per-function guards are precisely what left 397 holes. `SQLError` is
+      re-raised untouched so a handler that already diagnosed the problem keeps
+      its own code (`to_char(interval,'Day')` stays 22007).
+
+      Watch the `Anonymous` node shape if extending this: it keeps the function
+      NAME in `node.this` and its arguments in `node.expressions`, so reading
+      `this` as an argument produces `function anonymous(unknown, text[])`.
+
+      Pinned by `tests/test_sql_no_internal_errors.py`, which re-runs the
+      matrix and fails on any XX000.
+
+- [ ] **OPEN — we are LENIENT where PG raises 42883 on operand type (measured
+      2026-09-01).** With the internal errors gone, the remaining gap in that
+      same matrix is the opposite direction: `upper(1)`, `upper(true)`,
+      `upper(date '…')` and similar RETURN A VALUE where PG refuses the call.
+      Across 396 measured shapes the SQLSTATE now agrees 52% of the time and
+      the message 120 times; almost every disagreement is this leniency.
+
+      Same root as the "Cross-type comparisons: the remaining lenient pairs"
+      entry — closing it needs declared-operand-type modelling per function,
+      and a FALSE 42883 is worse than a lenient answer, so it wants the same
+      care that entry describes. Three shapes go the other way and are real
+      gaps: `to_char(time, …)` and `justify_hours(time)` succeed in PG and
+      error here.
+
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
   **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,
   from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn campaign

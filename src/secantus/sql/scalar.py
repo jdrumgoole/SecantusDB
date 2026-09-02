@@ -412,7 +412,12 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return evaluate(node.this, scope, ctx)
     typed = _SCALAR_FUNC_NODES.get(type(node))
     if typed is not None:
-        return typed(node, scope, ctx)
+        try:
+            return typed(node, scope, ctx)
+        except errors.SQLError:
+            raise
+        except (TypeError, ValueError, AttributeError, KeyError, IndexError) as exc:
+            raise _no_such_function(node, scope, ctx) from exc
     # Schema-qualified function: pg_catalog.format_type(...) -> the call.
     if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Anonymous):
         return _eval_func(node.expression, scope, ctx)
@@ -1681,6 +1686,96 @@ def _unix_to_timestamp(value: Any) -> Any:
         return None
     seconds = float(str(value.to_decimal() if isinstance(value, bson.Decimal128) else value))
     return _dt.datetime.fromtimestamp(seconds, tz=_dt.timezone.utc)
+
+
+#: A PG type name for an argument NODE, for the `42883` message. Postgres
+#: names a bare string literal `unknown`, not `text`, so the node matters —
+#: the evaluated VALUE cannot tell the two apart.
+def _pg_arg_type_name(arg: exp.Expression, scope: Scope, ctx: ScalarContext) -> str:
+    while isinstance(arg, exp.Paren):
+        arg = arg.this
+    if isinstance(arg, exp.Cast) and arg.to is not None:
+        tag = typemap.type_tag_for_sql(arg.to)
+        return typemap.SQL_TYPE_NAME.get(tag, tag) if tag else "unknown"
+    if isinstance(arg, exp.Null):
+        return "unknown"
+    if isinstance(arg, exp.Boolean):
+        return "boolean"
+    if isinstance(arg, exp.Literal):
+        if arg.is_string:
+            return "unknown"  # PG's untyped literal
+        return "numeric" if "." in str(arg.this) else "integer"
+    if isinstance(arg, exp.Interval):
+        return "interval"
+    if isinstance(arg, exp.Array):
+        return "integer[]"
+    try:
+        value = evaluate(arg, scope, ctx)
+    except Exception:  # noqa: BLE001 -- naming a type must never itself fail
+        return "unknown"
+    return _pg_type_name_of(value)
+
+
+def _pg_type_name_of(value: Any) -> str:
+    """PG's spelling for a runtime value's type."""
+    from secantus.sql import intervals as _intervals
+
+    if value is None:
+        return "unknown"
+    if isinstance(value, bool):
+        return "boolean"
+    if _intervals.is_interval(value):
+        return "interval"
+    if isinstance(value, _dt.datetime):
+        return "timestamp without time zone"
+    if isinstance(value, _dt.date):
+        return "date"
+    if isinstance(value, _dt.time):
+        return "time without time zone"
+    if isinstance(value, (bytes, bytearray)):
+        return "bytea"
+    if isinstance(value, (list, tuple)):
+        return "integer[]"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, (float, Decimal, bson.Decimal128)):
+        return "numeric"
+    if isinstance(value, dict):
+        return "jsonb"
+    return "text"
+
+
+def _no_such_function(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> errors.SQLError:
+    """Postgres' `42883 function f(types) does not exist`.
+
+    A scalar builtin handed an operand type it does not model used to raise a
+    bare Python `TypeError` / `ValueError`, which escaped to the wire as
+    `XX000 internal error` — 397 shapes did this, measured across a
+    function x value-type sweep. PostgreSQL answers 42883 for 353 of them,
+    which is what this produces.
+
+    Deliberately NOT a catch-all for every exception: `SQLError` is re-raised
+    untouched, so a handler that already diagnosed the problem keeps its own
+    code and message.
+    """
+    # An `Anonymous` node keeps the FUNCTION NAME in `node.this` and its
+    # arguments in `node.expressions` — reading `this` as an argument produced
+    # `function anonymous(unknown, text[])`.
+    if isinstance(node, exp.Anonymous):
+        name = _func_name(node)
+        args: list[exp.Expression] = [
+            a for a in (node.expressions or []) if isinstance(a, exp.Expression)
+        ]
+    else:
+        name = node.sql_name().lower() if hasattr(node, "sql_name") else type(node).__name__.lower()
+        args = [a for a in (node.args.get("this"), node.expression) if a is not None]
+        args += [a for a in (node.expressions or []) if isinstance(a, exp.Expression)]
+        for key in ("format", "length", "start"):
+            extra = node.args.get(key)
+            if isinstance(extra, exp.Expression) and extra not in args:
+                args.append(extra)
+    names = [_pg_arg_type_name(a, scope, ctx) for a in args[:4]]
+    return errors.SQLError("42883", f"function {name}({', '.join(names)}) does not exist")
 
 
 def _recover_pg_format(fmt: str) -> str:
@@ -3165,6 +3260,18 @@ def _func_name(node: exp.Anonymous) -> str:
 
 
 def _eval_func(node: exp.Anonymous, scope: Scope, ctx: ScalarContext) -> Any:
+    """A named function call, with the same no-internal-errors guard the typed
+    node handlers get — `age(1)` reached the wire as `XX000` because this path
+    is separate from `_SCALAR_FUNC_NODES`."""
+    try:
+        return _eval_func_impl(node, scope, ctx)
+    except errors.SQLError:
+        raise
+    except (TypeError, ValueError, AttributeError, KeyError, IndexError) as exc:
+        raise _no_such_function(node, scope, ctx) from exc
+
+
+def _eval_func_impl(node: exp.Anonymous, scope: Scope, ctx: ScalarContext) -> Any:
     name = _func_name(node)
     if name == "xmlforest":
         # ``xmlforest(value AS name, …)`` needs the per-arg aliases, which are lost
