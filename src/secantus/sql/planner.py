@@ -7142,7 +7142,14 @@ def _plan_grouping_sets_window_select(
                 accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
             # The same out-tag the top-level projection path computes — pinned
             # to `json` here, an interval array rendered as its subdocuments.
-            field_tags[fname] = _array_agg_out_tag(arr_arg, table_resolver(table))
+            # `_is_true_array_agg` gates it: `json_agg` / `jsonb_agg` share this
+            # `$push` machinery but must keep the JSON output type. Typing them
+            # by element made `json_agg(i)::text` render the PG array `{1,2,3}`.
+            field_tags[fname] = (
+                _array_agg_out_tag(arr_arg, table_resolver(table))
+                if _is_true_array_agg(node)
+                else "json"
+            )
             agg_field_names.append(fname)
             return fname
         sa = _string_agg_arg(node)
@@ -7863,7 +7870,14 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
                 accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
             # The same out-tag the top-level projection path computes — pinned
             # to `json` here, an interval array rendered as its subdocuments.
-            field_tags[fname] = _array_agg_out_tag(arr_arg, table_resolver(table))
+            # `_is_true_array_agg` gates it: `json_agg` / `jsonb_agg` share this
+            # `$push` machinery but must keep the JSON output type. Typing them
+            # by element made `json_agg(i)::text` render the PG array `{1,2,3}`.
+            field_tags[fname] = (
+                _array_agg_out_tag(arr_arg, table_resolver(table))
+                if _is_true_array_agg(node)
+                else "json"
+            )
             agg_field_names.append(fname)
             return fname
         sa = _string_agg_arg(node)
@@ -10781,7 +10795,12 @@ def _plan_join_grouping_sets_window_select(
             else:
                 path, _ = resolve(arr_arg)
                 accumulators[fname] = {"$push": f"${path}"}
-            field_tags[fname] = _array_agg_out_tag(arr_arg, resolve)
+            # `_is_true_array_agg` gates it: `json_agg` / `jsonb_agg` share this
+            # `$push` machinery but must keep the JSON output type. Typing them
+            # by element made `json_agg(i)::text` render the PG array `{1,2,3}`.
+            field_tags[fname] = (
+                _array_agg_out_tag(arr_arg, resolve) if _is_true_array_agg(node) else "json"
+            )
             agg_field_names.append(fname)
             return fname
         agg = _join_aggregate_of(node)
@@ -11008,7 +11027,12 @@ def _plan_join_group_window_select(
             else:
                 path, _ = resolve(arr_arg)
                 accumulators[fname] = {"$push": f"${path}"}
-            field_tags[fname] = _array_agg_out_tag(arr_arg, resolve)
+            # `_is_true_array_agg` gates it: `json_agg` / `jsonb_agg` share this
+            # `$push` machinery but must keep the JSON output type. Typing them
+            # by element made `json_agg(i)::text` render the PG array `{1,2,3}`.
+            field_tags[fname] = (
+                _array_agg_out_tag(arr_arg, resolve) if _is_true_array_agg(node) else "json"
+            )
             agg_field_names.append(fname)
             return fname
         agg = _join_aggregate_of(node)
@@ -11811,6 +11835,16 @@ def _stamp_nested_int_widths(node: exp.Expression, resolve: Resolve) -> None:
     # `abs()` and unary minus overflow at exactly one value — `int4`'s range is
     # asymmetric, so `abs(-2147483648)` and `-(-2147483648)` have no int4 answer
     # and PG raises 22003 for both. They take the operand's own width.
+    # A `::text` cast whose OPERAND types as json has to render JSON, not an
+    # array literal. By the time the evaluator sees it the operand is often a
+    # synthetic column (an aggregate's output), so the call itself is no longer
+    # visible — `json_agg(i)::text` rendered `{1,2,3}` for PG's `[1, 2, 3]`.
+    for cast in node.find_all(exp.Cast):
+        if typemap.type_tag_for_sql(cast.to) != "text" or cast.this is None:
+            continue
+        with contextlib.suppress(errors.SQLError):
+            if _infer_scalar_tag(cast.this, resolve) == "json":
+                cast._secantus_json_operand = True  # noqa: SLF001
     for unary in node.find_all(exp.Abs, exp.Neg):
         if unary.this is None:
             continue
@@ -12390,6 +12424,12 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         name = node.expression.name
     elif isinstance(node, exp.Anonymous):
         name = node.this if isinstance(node.this, str) else node.name
+    # `json_agg(x)` has a dedicated sqlglot node whose `this` is the ARGUMENT,
+    # not a name, so the name-based table below never saw it and it typed as
+    # text — which then rendered `json_agg(i)::text` as the PG array `{1,2,3}`
+    # instead of `[1, 2, 3]`.
+    if getattr(exp, "JSONArrayAgg", None) is not None and isinstance(node, exp.JSONArrayAgg):
+        return "json"
     if name is not None:
         fname = str(name).rsplit(".", 1)[-1].lower()
         if fname in (
