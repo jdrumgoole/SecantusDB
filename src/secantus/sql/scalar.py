@@ -175,6 +175,7 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         hstore_result = _eval_hstore_exists(node, scope, ctx)
         if hstore_result is not _NOT_HSTORE:
             return hstore_result
+        return _eval_jsonb_exists(node, scope, ctx)
     if getattr(exp, "Distance", None) is not None and isinstance(node, exp.Distance):
         from secantus.sql import pggeo as _pggeo
 
@@ -2448,6 +2449,12 @@ def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any
     if _is_nan(left) and _is_nan(right):
         # Postgres treats NaN as equal to NaN (and greater than every number).
         return isinstance(node, (exp.EQ, exp.GTE, exp.LTE))
+    # A record is a dict of `f1..fN` and has no ordering of its own, so
+    # `(1,2) < (1,3)` raised `TypeError` and reached the client as `XX000`.
+    # Postgres compares records field by field, left to right.
+    lrec, rrec = _record_fields(left), _record_fields(right)
+    if lrec is not None and rrec is not None:
+        left, right = lrec, rrec
     if isinstance(node, exp.EQ):
         return left == right
     if isinstance(node, exp.NEQ):
@@ -4798,6 +4805,39 @@ def _eval_hstore_exists(node: exp.Expression, scope: Scope, ctx: ScalarContext) 
     return _hstore.exists_any(left, keys)  # ?|
 
 
+def _jsonb_has_key(value: Any, key: Any) -> bool:
+    """`jsonb ? text`: does the value have this key at the top level?
+
+    An OBJECT is asked about its keys, an ARRAY about its string elements, and
+    a jsonb STRING about equality — which is Postgres' rule, and the reason the
+    array and scalar cases are not just a dict lookup."""
+    if isinstance(value, Mapping):
+        return str(key) in {str(k) for k in value}
+    if isinstance(value, list):
+        return any(isinstance(v, str) and v == key for v in value)
+    return isinstance(value, str) and value == key
+
+
+def _eval_jsonb_exists(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """`?` / `?|` / `?&` over jsonb.
+
+    Only the hstore forms were wired here, so in a SELECT list these fell
+    through to the generic function path and reported
+    `function jsonb_contains() is not supported` — or, for the two-key forms, a
+    name mangled out of the node class (`j_s_o_n_b_contains_any_top_keys`).
+    They did work inside a WHERE."""
+    left = evaluate(node.this, scope, ctx)
+    right = evaluate(node.expression, scope, ctx)
+    if left is None or right is None:
+        return None
+    if isinstance(node, exp.JSONBContains):
+        return _jsonb_has_key(left, right)
+    keys = right if isinstance(right, (list, tuple)) else [right]
+    if isinstance(node, exp.JSONBContainsAllTopKeys):
+        return all(_jsonb_has_key(left, k) for k in keys)
+    return any(_jsonb_has_key(left, k) for k in keys)
+
+
 def _eval_geo_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     """``@>`` (contains) / ``<@`` (contained by) / ``&&`` (overlaps) on geometric
     operands. Returns ``_NOT_GEO`` when neither operand looks like a geometry so the
@@ -5324,6 +5364,11 @@ def _eval_between(node: exp.Between, outer: Scope, ctx: ScalarContext) -> Any:
     v = evaluate(node.this, outer, ctx)
     low = evaluate(node.args["low"], outer, ctx)
     high = evaluate(node.args["high"], outer, ctx)
+    # `BETWEEN SYMMETRIC` puts the bounds in order first, so
+    # `3 BETWEEN SYMMETRIC 5 AND 1` is TRUE. The keyword was parsed and then
+    # ignored, which made every reversed-bound test answer FALSE.
+    if node.args.get("symmetric") and low is not None and high is not None and _cmp_ge(low, high):
+        low, high = high, low
     lo_cmp = None if v is None or low is None else _cmp_ge(v, low)
     hi_cmp = None if v is None or high is None else _cmp_ge(high, v)
     if lo_cmp is False or hi_cmp is False:
@@ -5336,6 +5381,18 @@ def _eval_between(node: exp.Between, outer: Scope, ctx: ScalarContext) -> Any:
 def _cmp_ge(a: Any, b: Any) -> bool:
     a, b = _unwrap_decimal(a), _unwrap_decimal(b)
     return a >= b
+
+
+def _record_fields(value: Any) -> tuple | None:
+    """A record's field values in order, or None when it is not a record.
+
+    A `RecordValue` is a dict of `f1..fN`, and a dict has no `<` — so
+    `(1,2) < (1,3)` raised `TypeError` and reached the client as `XX000`.
+    Postgres compares records field by field, left to right, which is what
+    the ordered tuple gives."""
+    if not isinstance(value, typemap.RecordValue):
+        return None
+    return tuple(value[k] for k in sorted(value, key=lambda k: int(str(k)[1:] or 0)))
 
 
 def _as_bool_arg(value: Any) -> bool:
