@@ -3982,6 +3982,27 @@ fn parse_float_string(value: &str) -> Result<f64, Fallback> {
     Ok(parsed)
 }
 
+/// A `Decimal128` as the nearest `f64`, via its own string rendering.
+///
+/// `to_string` emits `NaN` / `Infinity` / `-Infinity`, which Rust's `f64`
+/// parser does not accept in that spelling, so they are mapped explicitly.
+fn decimal_as_f64(v: &Bson) -> Option<f64> {
+    let Bson::Decimal128(d) = v else { return None };
+    let text = d.to_string();
+    match text.as_str() {
+        t if t.eq_ignore_ascii_case("nan") || t.eq_ignore_ascii_case("-nan") => Some(f64::NAN),
+        t if t.eq_ignore_ascii_case("infinity") => Some(f64::INFINITY),
+        t if t.eq_ignore_ascii_case("-infinity") => Some(f64::NEG_INFINITY),
+        t => t.parse::<f64>().ok(),
+    }
+}
+
+/// Whether a `Decimal128` is zero -- of EITHER sign, since `$toBool` of
+/// `Decimal128("-0")` is false.
+fn decimal_is_zero(v: &Bson) -> bool {
+    decimal_as_f64(v).is_some_and(|d| d == 0.0)
+}
+
 fn convert_value(value: &Bson, code: i32) -> Conv {
     match code {
         // double
@@ -3995,7 +4016,14 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
                 Err(Fallback::Defer) => Conv::Unsupported,
                 Err(e) => Conv::Named(e),
             },
-            _ => Conv::Unsupported, // Decimal128 / date -> Python
+            // Every decimal converts, NaN and the infinities included (probed
+            // 8.2.11: `$toDouble` of `Decimal128("Infinity")` is `inf`). This
+            // used to defer, and a defer on the standalone server is an error.
+            Bson::Decimal128(_) => match decimal_as_f64(value) {
+                Some(d) => Conv::Ok(Bson::Double(d)),
+                None => Conv::Unsupported,
+            },
+            _ => Conv::Unsupported, // date -> Python
         },
         // objectId
         7 => match value {
@@ -4047,7 +4075,10 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
             // so `$toBool: ""` and `$convert: {input: "", to: "bool"}` -- the
             // same operation -- disagreed with each other inside one engine.
             Bson::String(_) => Conv::Ok(Bson::Boolean(true)),
-            Bson::Decimal128(_) => Conv::Unsupported, // decimal compare -> Python
+            // Zero (either sign) is false; EVERYTHING else is true, NaN and
+            // the infinities included -- probed 8.2.11, where `$toBool` of
+            // `Decimal128("NaN")` is `true`, not an error and not false.
+            Bson::Decimal128(_) => Conv::Ok(Bson::Boolean(!decimal_is_zero(value))),
             _ => Conv::Ok(Bson::Boolean(true)),
         },
         // int (16) / long (18)
@@ -4070,7 +4101,51 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
                 Err(Fallback::Defer) => Conv::Unsupported,
                 Err(e) => Conv::Named(e),
             },
-            _ => Conv::Unsupported, // Decimal128 -> Python
+            // A decimal TRUNCATES toward zero (2.5 -> 2, -2.5 -> -2), and each
+            // failure has its own wording -- three different messages under one
+            // code, probed 8.2.11.
+            Bson::Decimal128(d) => {
+                let text = d.to_string();
+                if crate::query::is_nan_bson(value) {
+                    return Conv::Named(Fallback::mongo(
+                        241,
+                        "Attempt to convert NaN value to integer type in $convert with no \
+                         onError value",
+                    ));
+                }
+                if text
+                    .trim_start_matches('-')
+                    .eq_ignore_ascii_case("infinity")
+                {
+                    return Conv::Named(Fallback::mongo(
+                        241,
+                        "Attempt to convert infinity value to integer type in $convert with \
+                         no onError value",
+                    ));
+                }
+                // The overflow message echoes the decimal's OWN rendering
+                // (`1E+30`), not a normalised form.
+                let overflow = || {
+                    Conv::Named(Fallback::mongo(
+                        241,
+                        format!(
+                            "Conversion would overflow target type in $convert with no \
+                             onError value: {text}"
+                        ),
+                    ))
+                };
+                match crate::decimal::parse(&text)
+                    .as_ref()
+                    .and_then(crate::decimal::trunc_to_i64)
+                {
+                    Some(n) => match wrap_int(i128::from(n), code) {
+                        Conv::Failed => overflow(),
+                        other => other,
+                    },
+                    None => overflow(),
+                }
+            }
+            _ => Conv::Unsupported,
         },
         // decimal (the full $toDecimal set, incl. parseable strings)
         19 => match value {
@@ -4311,9 +4386,34 @@ fn op_abs(arg: &Bson, ctx: &Ctx) -> R {
         Bson::Int32(n) => Ok(int_result((n as i128).abs(), false)),
         Bson::Int64(n) => Ok(int_result((n as i128).abs(), true)),
         Bson::Double(d) => Ok(Bson::Double(d.abs())),
-        // bool / Decimal128 / non-numeric: Python raises 28765 -> defer.
+        // A decimal's absolute value is its own rendering with the sign
+        // dropped -- no arithmetic, so the quantum survives (`$abs` of
+        // `Decimal128("-2.50")` is `2.50`). `-0` becomes `0` and `-Infinity`
+        // becomes `Infinity`; `NaN` stays `NaN`. Probed 8.2.11 -- this used to
+        // defer, which on the standalone server is an error for input mongod
+        // answers.
+        ref v @ Bson::Decimal128(_) => match decimal_abs(v) {
+            Some(out) => Ok(out),
+            None => Err(Fallback::Defer),
+        },
+        // bool / non-numeric: Python raises 28765 -> defer.
         _ => Err(Fallback::Defer),
     }
+}
+
+/// A `Decimal128` with its sign dropped, re-parsed from the unsigned text so
+/// the coefficient and exponent -- and therefore the quantum -- are untouched.
+fn decimal_abs(v: &Bson) -> Option<Bson> {
+    let Bson::Decimal128(d) = v else { return None };
+    let text = d.to_string();
+    if crate::query::is_nan_bson(v) {
+        return Some(v.clone());
+    }
+    let unsigned = text.strip_prefix('-').unwrap_or(&text);
+    unsigned
+        .parse::<bson::Decimal128>()
+        .ok()
+        .map(Bson::Decimal128)
 }
 
 fn op_floor_ceil(arg: &Bson, ctx: &Ctx, ceil: bool) -> R {
@@ -6568,5 +6668,146 @@ mod timestamp_bearing_date_tests {
             let expr = bson::bson!({"$year": bad});
             assert!(evaluate(&doc! {}, &expr, &Document::new()).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod decimal_conversion_tests {
+    //! `Decimal128` operands reaching `$abs` and the `$toX` conversions.
+    //!
+    //! All of these DEFERRED, and a defer on the standalone Rust server is an
+    //! error -- so a collection holding decimals could not be converted or
+    //! absolute-valued at all. Every value below was probed against mongod
+    //! 8.2.11 (2026-09-02).
+
+    use super::*;
+    use bson::{doc, Bson};
+
+    fn dec(s: &str) -> Bson {
+        Bson::Decimal128(s.parse().unwrap())
+    }
+
+    fn eval_expr(expr: Bson) -> Result<Bson, Fallback> {
+        evaluate(&doc! {}, &expr, &Document::new())
+    }
+
+    fn ok(expr: Bson) -> Bson {
+        eval_expr(expr).expect("should evaluate")
+    }
+
+    #[test]
+    fn abs_drops_the_sign_and_keeps_the_quantum() {
+        // No arithmetic happens, so trailing zeros survive.
+        assert_eq!(ok(bson::bson!({"$abs": dec("-2.50")})), dec("2.50"));
+        assert_eq!(ok(bson::bson!({"$abs": dec("2.5")})), dec("2.5"));
+        assert_eq!(ok(bson::bson!({"$abs": dec("-0")})), dec("0"));
+        assert_eq!(ok(bson::bson!({"$abs": dec("-Infinity")})), dec("Infinity"));
+    }
+
+    #[test]
+    fn abs_of_nan_is_nan() {
+        let got = ok(bson::bson!({"$abs": dec("NaN")}));
+        assert!(crate::query::is_nan_bson(&got), "{got:?}");
+    }
+
+    #[test]
+    fn to_double_takes_every_decimal() {
+        assert_eq!(
+            ok(bson::bson!({"$toDouble": dec("2.5")})),
+            Bson::Double(2.5)
+        );
+        assert_eq!(
+            ok(bson::bson!({"$toDouble": dec("-2.5")})),
+            Bson::Double(-2.5)
+        );
+        assert_eq!(
+            ok(bson::bson!({"$toDouble": dec("Infinity")})),
+            Bson::Double(f64::INFINITY)
+        );
+        match ok(bson::bson!({"$toDouble": dec("NaN")})) {
+            Bson::Double(d) => assert!(d.is_nan()),
+            other => panic!("expected a double NaN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_bool_is_zero_versus_everything_else() {
+        assert_eq!(ok(bson::bson!({"$toBool": dec("0")})), Bson::Boolean(false));
+        assert_eq!(
+            ok(bson::bson!({"$toBool": dec("-0")})),
+            Bson::Boolean(false)
+        );
+        assert_eq!(
+            ok(bson::bson!({"$toBool": dec("2.5")})),
+            Bson::Boolean(true)
+        );
+        // NaN and infinity are TRUE, not errors -- probed.
+        assert_eq!(
+            ok(bson::bson!({"$toBool": dec("NaN")})),
+            Bson::Boolean(true)
+        );
+        assert_eq!(
+            ok(bson::bson!({"$toBool": dec("Infinity")})),
+            Bson::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn to_int_and_to_long_truncate_toward_zero() {
+        assert_eq!(ok(bson::bson!({"$toInt": dec("2.5")})), Bson::Int32(2));
+        assert_eq!(ok(bson::bson!({"$toInt": dec("-2.5")})), Bson::Int32(-2));
+        assert_eq!(ok(bson::bson!({"$toLong": dec("2.5")})), Bson::Int64(2));
+        assert_eq!(ok(bson::bson!({"$toLong": dec("-2.5")})), Bson::Int64(-2));
+        assert_eq!(ok(bson::bson!({"$toInt": dec("1E-30")})), Bson::Int32(0));
+    }
+
+    #[test]
+    fn the_three_integer_failures_have_three_different_messages() {
+        let nan = eval_expr(bson::bson!({"$toInt": dec("NaN")})).unwrap_err();
+        assert_eq!(
+            nan.as_mongo(),
+            Some((
+                241,
+                "Attempt to convert NaN value to integer type in $convert with no onError value"
+            ))
+        );
+        let inf = eval_expr(bson::bson!({"$toInt": dec("-Infinity")})).unwrap_err();
+        assert_eq!(
+            inf.as_mongo(),
+            Some((
+                241,
+                "Attempt to convert infinity value to integer type in $convert with no \
+                 onError value"
+            ))
+        );
+        // The overflow message echoes the decimal's OWN rendering.
+        let over = eval_expr(bson::bson!({"$toInt": dec("1E+30")})).unwrap_err();
+        assert_eq!(
+            over.as_mongo(),
+            Some((
+                241,
+                "Conversion would overflow target type in $convert with no onError value: 1E+30"
+            ))
+        );
+    }
+
+    #[test]
+    fn int_overflows_where_long_still_fits() {
+        // 2147483648 is out of int32 range but well inside int64.
+        assert!(eval_expr(bson::bson!({"$toInt": dec("2147483648")})).is_err());
+        assert_eq!(
+            ok(bson::bson!({"$toLong": dec("2147483648")})),
+            Bson::Int64(2_147_483_648)
+        );
+    }
+
+    #[test]
+    fn on_error_still_covers_a_failed_conversion() {
+        assert_eq!(
+            ok(bson::bson!({
+                "$convert": {"input": dec("NaN"), "to": "int", "onError": "nope"}
+            })),
+            Bson::String("nope".into())
+        );
     }
 }

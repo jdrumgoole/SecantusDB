@@ -4339,6 +4339,30 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   now work on a collection holding decimals — five corpus shapes, but a whole
   capability in practice. What remains is the ARITHMETIC and conversions.
 
+  **Conversions done 2026-09-02**: `$abs`, `$toBool`, `$toInt`, `$toLong` and
+  `$toDouble` now take decimals (70 cross-server shapes verified). What remains
+  is the ARITHMETIC: `$add` / `$subtract` / `$multiply` / `$divide` / `$mod` and
+  the transcendentals.
+
+  **The arithmetic semantics, probed 8.2.11 so the next pass does not re-derive
+  them** — the quantum is load-bearing and several of these defeat a guess:
+
+  | case | mongod |
+  | --- | --- |
+  | `Decimal("2.5") + double 2.0` | `4.50000000000000` — the double's precision enters the quantum |
+  | `Decimal("2.5") * 2` | `5.0`, NOT `5` — trailing zeros are significant |
+  | `Decimal("2.50") + 2` | `4.50` — quantum survives |
+  | `Decimal("2.5") - Decimal("0.5")` | `2.0` |
+  | `1 / 3` | 34 significant digits |
+  | `Infinity + 1` | `Infinity`; `NaN + 1` is `NaN` |
+  | `-Infinity + Infinity` | `NaN` |
+  | `1 / 0` | **error 2** `can't $divide by zero`, not `Infinity` |
+
+  `decimal.rs` has `add` and `mul` (which preserve trailing zeros by design), so
+  `$add` / `$subtract` / `$multiply` look reachable; `$divide` and `$mod` need
+  division, and `Decimal + double` needs the double->decimal quantum rule, which
+  is its own probe.
+
   **Scoped, not guessed** (2026-09-02): `crates/secantus-core/src/decimal.rs`
   represents a value as sign / coefficient / exponent with `add`, `mul`,
   `div_int`, `parse`, `to_string`, `to_bson` and `trunc_to_i64`. So roughly
