@@ -8017,18 +8017,31 @@ shared storage engine or building large new protocol subsystems:
 
       Pinned by `tests/test_sql_sweep_six.py` (32 cases vs PG 14.13).
 
-- [ ] **OPEN — `AT TIME ZONE` (2026-09-02).** `'2020-06-15 12:00:00'::timestamp
-      AT TIME ZONE 'UTC'` is `0A000 unsupported scalar expression`. A real SQL
-      feature, not a function; sqlglot gives it its own node.
+- [x] **RESOLVED (2026-09-02) — `AT TIME ZONE`, `LIKE ALL/ANY`, and the
+      `timezone_*` extract fields.** Took the sixth sweep from 20 of 33 to 30.
 
-- [ ] **OPEN — `extract(timezone_hour|timezone_minute|timezone …)`
-      (2026-09-02).** `0A000 unsupported extract field`. Reports the SESSION's
-      UTC offset, not the literal's — PG normalises the value to the session
-      zone first.
+      `AT TIME ZONE` reads BOTH ways and the direction depends on the OPERAND:
+      a naive timestamp is interpreted as being in the zone and becomes an
+      instant; an aware one is converted into the zone and loses it. The result
+      TYPE flips with it, which is why the tag branch consults the operand.
 
-- [ ] **OPEN — `LIKE ALL(array)` / `LIKE ANY(array)` (2026-09-02).**
-      `0A000 unsupported scalar expression`. The scalar `LIKE` works; the
-      quantified form over an array does not.
+      `extract(timezone_hour …)` reports the SESSION zone's offset, not the
+      literal's — PG normalises a timestamptz into the session zone before
+      extracting, so `'…+05'::timestamptz` is 0 under a UTC session. Reporting
+      the value's own offset gave 5.
+
+      Also: the identity / generated-column insert errors folded PG's DETAIL
+      line into the MESSAGE, making a message no client can match on. Both now
+      carry `D` (and the identity one PG's `H` hint) separately.
+
+      Pinned by `tests/test_sql_at_time_zone.py` (20 cases vs PG 14.13).
+
+- [ ] **OPEN — `IS NORMALIZED` and `to_ascii()` (2026-09-02).**
+      `'abc' IS NORMALIZED` parses as a COLUMN REFERENCE (`42703 column
+      "normalized" does not exist`), so it needs parser-level handling rather
+      than a function. `to_ascii()` errors on both servers with different
+      messages — PG's is an encoding-conversion refusal, ours a missing
+      function.
 
 - [ ] **OPEN — arithmetic in a WHERE clause is still unchecked (2026-09-02).**
       `SELECT * FROM t WHERE i + 1 > 0` returns rows where PG raises `22003`.

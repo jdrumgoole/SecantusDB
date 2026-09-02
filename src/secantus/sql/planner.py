@@ -2400,16 +2400,25 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
             else:
                 raise errors.undefined_column(name)
         if col.identity == "always":
+            # PG puts the explanation in DETAIL, not in the message — folding
+            # the two together made a message no client can match on.
             raise errors.SQLError(
                 "428C9",
-                f'cannot insert a non-DEFAULT value into column "{name}" — it is an '
-                f"identity column defined as GENERATED ALWAYS",
+                f'cannot insert a non-DEFAULT value into column "{name}"',
+                diag={
+                    "D": (f'Column "{name}" is an identity column defined as GENERATED ALWAYS.'),
+                    "H": "Use OVERRIDING SYSTEM VALUE to override.",
+                    "c": name,
+                },
             )
         if col.generated is not None:
             raise errors.SQLError(
                 "428C9",
-                f'cannot insert a non-DEFAULT value into column "{name}" — it is a '
-                f"generated column",
+                f'cannot insert a non-DEFAULT value into column "{name}"',
+                diag={
+                    "D": f'Column "{name}" is a generated column.',
+                    "c": name,
+                },
             )
         if raw is None and not col.nullable:
             raise errors.not_null_violation(name, table.name)
@@ -12442,6 +12451,16 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         return "text"
     if getattr(exp, "CurrentVersion", None) is not None and isinstance(node, exp.CurrentVersion):
         return "text"
+    # `AT TIME ZONE` flips the operand's zone-awareness: a naive timestamp
+    # becomes an instant, an instant becomes naive.
+    if getattr(exp, "AtTimeZone", None) is not None and isinstance(node, exp.AtTimeZone):
+        with contextlib.suppress(errors.SQLError):
+            return (
+                "timestamp"
+                if _infer_scalar_tag(node.this, resolve) == "timestamptz"
+                else ("timestamptz")
+            )
+        return "timestamptz"
     # ``ts ± interval`` keeps the timestamp's type (the non-interval operand's).
     if isinstance(node, (exp.Add, exp.Sub)):
         left, right = node.this, node.expression

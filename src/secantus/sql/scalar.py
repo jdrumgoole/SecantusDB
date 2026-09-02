@@ -1583,6 +1583,32 @@ def _unistr(text: str) -> str:
     return "".join(out)
 
 
+def _eval_at_time_zone(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """`<timestamp> AT TIME ZONE <zone>` — the SQL operator, not a function.
+
+    It reads BOTH ways, and which way depends on the operand: a NAIVE
+    timestamp is interpreted as being in `zone` and becomes an instant, while
+    an AWARE one is converted into `zone` and loses the zone. So
+    `'2020-06-15 12:00'::timestamp AT TIME ZONE 'America/New_York'` is
+    16:00 UTC, and the same instant back through it is 08:00."""
+    import zoneinfo
+
+    value = evaluate(node.this, scope, ctx)
+    zone_node = node.args.get("zone")
+    zone = evaluate(zone_node, scope, ctx) if isinstance(zone_node, exp.Expression) else zone_node
+    if value is None or zone is None:
+        return None
+    if not isinstance(value, _dt.datetime):
+        value = _as_datetime(value)
+    try:
+        tz = zoneinfo.ZoneInfo(_as_text(zone))
+    except Exception:
+        raise errors.SQLError("22023", f'time zone "{_as_text(zone)}" not recognized') from None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=tz).astimezone(_dt.timezone.utc)
+    return value.astimezone(tz).replace(tzinfo=None)
+
+
 def _eval_normalize(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     """`normalize(text [, form])` — Unicode normalisation, NFC by default."""
     import unicodedata
@@ -1777,6 +1803,23 @@ def _eval_extract(node: exp.Extract, scope: Scope, ctx: ScalarContext) -> Any:
         if base.tzinfo is None:
             base = base.replace(tzinfo=_dt.timezone.utc)
         return base.timestamp()
+    if field in ("timezone", "timezone_hour", "timezone_minute"):
+        # The SESSION zone's offset at that instant, in seconds / hours /
+        # minutes — Postgres normalises a timestamptz into the session zone
+        # before extracting, so a literal's own `+05` does not survive:
+        # `extract(timezone_hour from '…+05'::timestamptz)` is 0 under a UTC
+        # session, not 5.
+        from secantus.sql.datetimes import session_tzinfo
+
+        seconds = 0
+        if isinstance(ts, _dt.datetime):
+            tz = session_tzinfo(getattr(ctx, "session", None))
+            local = ts.astimezone(tz) if ts.tzinfo is not None else ts.replace(tzinfo=tz)
+            offset = local.utcoffset()
+            seconds = int(offset.total_seconds()) if offset is not None else 0
+        if field == "timezone":
+            return seconds
+        return seconds // 3600 if field == "timezone_hour" else (seconds % 3600) // 60
     raise errors.feature_not_supported(f"unsupported extract field: {field}")
 
 
@@ -2370,6 +2413,7 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
     # reported `function localtimestamp() is not supported`.
     exp.Localtimestamp: lambda n, s, c: _local_timestamp(c),
     exp.Normalize: lambda n, s, c: _eval_normalize(n, s, c),
+    exp.AtTimeZone: lambda n, s, c: _eval_at_time_zone(n, s, c),
     # sqlglot renames `make_time` / `make_timestamp` to these typed nodes, so
     # they never reached the plain-builtin table and reported
     # `function time_from_parts() is not supported` — a name the user never
@@ -5702,12 +5746,45 @@ def _as_bool_arg(value: Any) -> bool:
     return str(value).strip().lower() in ("t", "true", "y", "yes", "on", "1")
 
 
+def _like_matches(node: exp.Expression, value: Any, pattern: Any, escape: Any) -> Any:
+    """One LIKE match, shared by the scalar and the quantified forms."""
+    import re
+
+    from secantus.sql.planner import _ESCAPE_UNSET, _like_to_regex
+
+    if value is None or pattern is None:
+        return None
+    flags = re.IGNORECASE if isinstance(node, exp.ILike) else 0
+    esc = _as_text(escape) if escape is not None else _ESCAPE_UNSET
+    hit = (
+        re.match(_like_to_regex(_as_text(pattern), escape=esc), _as_text(value), flags) is not None
+    )
+    return not hit if node.args.get("negate") else hit
+
+
 def _eval_like(node: exp.Expression, outer: Scope, ctx: ScalarContext, escape: Any = None) -> Any:
     import re
 
     from secantus.sql.planner import _like_to_regex
 
     val = evaluate(node.this, outer, ctx)
+    # `LIKE ALL(<array>)` / `LIKE ANY(<array>)` — the quantified form, which
+    # was `0A000 unsupported scalar expression` while the scalar `LIKE` worked.
+    quantifier = node.expression
+    while isinstance(quantifier, exp.Paren):
+        quantifier = quantifier.this
+    if isinstance(quantifier, (exp.All, exp.Any)):
+        patterns = evaluate(quantifier.this, outer, ctx)
+        if val is None or patterns is None:
+            return None
+        combine = all if isinstance(quantifier, exp.All) else any
+        hits = [
+            _like_matches(node, val, p, escape)
+            for p in (patterns if isinstance(patterns, (list, tuple)) else [patterns])
+        ]
+        if any(h is None for h in hits):
+            return None
+        return combine(hits)
     pattern = evaluate(node.expression, outer, ctx)
     if val is None or pattern is None:
         return None
