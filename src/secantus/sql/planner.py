@@ -2875,9 +2875,21 @@ def _emit_pipeline_sort(
 def _limit_skip(stmt: exp.Expression) -> tuple[int, int]:
     limit_node = stmt.args.get("limit")
     offset_node = stmt.args.get("offset")
-    limit = _const_int(limit_node.expression) if limit_node is not None else 0
-    skip = _const_int(offset_node.expression) if offset_node is not None else 0
+    limit = _const_int(_limit_count(limit_node)) if limit_node is not None else 0
+    skip = _const_int(_limit_count(offset_node)) if offset_node is not None else 0
     return limit, skip
+
+
+def _limit_count(node: exp.Expression) -> exp.Expression:
+    """The row count out of a LIMIT / OFFSET node.
+
+    `FETCH FIRST n ROWS ONLY` — the SQL-standard spelling PG accepts — parses
+    as `exp.Fetch`, which carries the count in `count` rather than
+    `expression`. Reading `expression` gave None, and the "unsupported" error
+    built from it then raised `AttributeError` on `None.sql()`, so the query
+    came back as `XX000` rather than either working or saying why."""
+    count = node.args.get("count") if isinstance(node, exp.Fetch) else None
+    return count if count is not None else node.expression
 
 
 def _const_int(node: exp.Expression) -> int:
@@ -11371,6 +11383,17 @@ _BOOL_EXPR_TYPES = (
     # for the same reason — oid 25 with a 't'/'f' body where PG sends oid 16.
     exp.Between,
     exp.Exists,
+    # The containment and key-existence operators — `@>`, `<@`, `&&`, `?`,
+    # `?|`, `?&`. Same failure again: they typed as text, so a driver was sent
+    # `'t'` under oid 25 where PG sends a real boolean under oid 16. They are
+    # boolean whatever the operands are (jsonb, array, range, hstore, inet or
+    # geometry), so no operand analysis is needed to say so.
+    exp.ArrayContainsAll,
+    exp.ArrayContainedBy,
+    exp.ArrayOverlaps,
+    exp.JSONBContains,
+    exp.JSONBContainsAllTopKeys,
+    exp.JSONBContainsAnyTopKeys,
 )
 
 

@@ -7726,6 +7726,46 @@ shared storage engine or building large new protocol subsystems:
       (`16 - adjusted(result)` matches only three). Needs a faithful port of
       `log_var`, not a guess.
 
+- [x] **RESOLVED (2026-09-02) — a SECOND sweep: two more XX000s and three
+      wrong answers.** A fresh corpus (jsonb operators, joins, casts, set ops,
+      ordering, FETCH/OFFSET, row comparisons) matched 29 of 44; this batch
+      took it to 34.
+
+      - `(1,2) < (1,3)` was XX000 — a record is a dict of `f1..fN` and has no
+        `<`. EQUALITY worked, which is why it had never been noticed.
+      - `FETCH FIRST 2 ROWS ONLY` was XX000 **twice over**: it parses as
+        `exp.Fetch`, whose count is in `count` not `expression`, and the
+        `feature_not_supported` message built from that None then raised
+        `AttributeError` on `None.sql()`. **An error path that itself crashes
+        hides the real gap** — worth grepping for other `f"...{node.sql()}"`
+        messages built from a possibly-None node.
+      - `3 BETWEEN SYMMETRIC 5 AND 1` answered FALSE; the keyword was parsed
+        and ignored.
+      - `jsonb ? 'k'` / `?|` / `?&` were wired only for hstore, so in a SELECT
+        list they fell through to the generic function path and reported
+        `function jsonb_contains() is not supported` — or, for the two-key
+        forms, `j_s_o_n_b_contains_any_top_keys`, a name mangled out of the
+        node class. They worked inside a WHERE.
+      - `@>` / `<@` / `&&` / `?` / `?|` / `?&` all typed as `text`, so a driver
+        got `'t'` under oid 25. Same failure `_BOOL_EXPR_TYPES` already exists
+        to prevent, three times over now.
+
+      Pinned by `tests/test_sql_row_fetch_between.py` (35 cases vs PG 14.13).
+
+- [ ] **OPEN — the jsonb FUNCTION family (2026-09-02).** Ten shapes the second
+      sweep found and this batch did not take, four of them silently wrong:
+      `jsonb_set` / `jsonb_insert` are NO-OPS (`jsonb_set('{"a":1}','{b}','2')`
+      returns the input unchanged); `jsonb_strip_nulls` is a no-op;
+      `jsonb_build_array` and `json_agg` / `to_jsonb` of an array return a PG
+      ARRAY literal (`{1,x,t}`) instead of jsonb (`[1, "x", true]`);
+      `to_jsonb('x'::text)` gives `x` not `"x"`; `jsonb_pretty` returns the
+      input JSON-quoted; `jsonb_object_keys` yields insertion order where PG
+      yields storage order (shorter keys first, then bytewise);
+      `jsonb_typeof(j->'arr')` is `0A000 unsupported scalar expression` because
+      `->` is not accepted as a function ARGUMENT. Also
+      `string_agg(DISTINCT t, ',')` and `to_char`'s ISO-week tokens
+      (`IYYY`/`IW`/`ID`).
+
 - [ ] **OPEN — arithmetic in a WHERE clause is still unchecked (2026-09-02).**
       `SELECT * FROM t WHERE i + 1 > 0` returns rows where PG raises `22003`.
       The predicate lowers to a Mongo `$expr` (`planner._to_agg_expr` /
