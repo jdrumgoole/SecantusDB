@@ -14,6 +14,7 @@ Out of scope: DST-aware day arithmetic (days are treated as 24h), the ``@`` /
 from __future__ import annotations
 
 import calendar
+import contextlib
 import datetime as _dt
 import re
 from typing import Any
@@ -75,6 +76,20 @@ def make(months: int = 0, days: int = 0, micros: int = 0) -> dict:
 
 
 def _fields(subdoc: Any) -> tuple[int, int, int]:
+    # A `time` coerces to an interval of that length, as Postgres does —
+    # `justify_hours(time '10:20:30')` is legal there and was `42883` here.
+    # A time VALUE rides this engine as ISO TEXT, so both forms are accepted; a
+    # string that is not a time falls through and raises exactly as before.
+    if isinstance(subdoc, str):
+        # `datetimes.parse_time` normalises but returns TEXT, so parse the ISO
+        # form here rather than assuming it hands back a `time`.
+        with contextlib.suppress(ValueError):  # not a time: fall through
+            subdoc = _dt.time.fromisoformat(subdoc)
+    if isinstance(subdoc, _dt.time):
+        micros = (
+            subdoc.hour * 3600 + subdoc.minute * 60 + subdoc.second
+        ) * 1_000_000 + subdoc.microsecond
+        return 0, 0, micros
     iv = subdoc["interval"] if isinstance(subdoc, dict) and "interval" in subdoc else subdoc
     return int(iv.get("months", 0)), int(iv.get("days", 0)), int(iv.get("micros", 0))
 

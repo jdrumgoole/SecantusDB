@@ -7321,6 +7321,43 @@ shared storage engine or building large new protocol subsystems:
       gaps: `to_char(time, …)` and `justify_hours(time)` succeed in PG and
       error here.
 
+- [x] **RESOLVED (2026-09-02) — the INVERSE hunt: 21 shapes PG accepts and we
+      refused; 7 left, all deliberate.** Same function x value-type matrix as
+      the XX000 hunt, run the other way round — the direction that finds
+      MISSING FUNCTIONALITY rather than leniency.
+
+      Added `isfinite` and `scale`; fixed `cbrt` for a NUMERIC argument and
+      made `justify_hours` / `justify_days` / `justify_interval` accept a
+      `time` (PG reads it as an interval of that length — the coercion went
+      into `intervals._fields`, the one accessor all three share).
+
+      **Two things worth remembering from this one.**
+
+      1. `cbrt(27.0)` was NOT a missing overload — `_cbrt` did `abs(v)` on a
+         `Decimal128` and raised TypeError. The internal-error guard added
+         hours earlier had turned that into a plausible
+         `42883 function cbrt(numeric) does not exist`, where before it was an
+         obvious XX000. **That is the cost of the guard**: a genuine
+         implementation bug now looks like an unsupported overload. The
+         PG-diff sweep is what pays it back, and is the reason to keep running
+         both directions.
+      2. A `time` VALUE rides this engine as ISO TEXT, and
+         `datetimes.parse_time` returns TEXT too — so an `isinstance(v,
+         datetime.time)` check never fires on it. Anything coercing a time has
+         to parse the string.
+
+      `cbrt` was also INACCURATE: `abs(x) ** (1/3)` gave `99.99999999999997`
+      for `cbrt(1000000)` where PG gives exactly 100. Now `math.cbrt`.
+
+      Pinned by `tests/test_sql_missing_builtins.py`.
+
+- [ ] **OPEN — three builtins deliberately still unsupported (2026-09-02).**
+      `numnode()` and `strip()` are tsquery / tsvector full-text functions —
+      that surface is not modelled. `hashtext()` is PG's INTERNAL hash: its
+      values come from `hash_any` and cannot be reproduced without porting it,
+      so returning a different number would be worse than refusing. Only worth
+      revisiting if a driver or gauge actually calls them.
+
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
   **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,
   from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn campaign
