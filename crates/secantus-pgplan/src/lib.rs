@@ -15,6 +15,7 @@ use bson::{doc, Bson, Document};
 use std::str::FromStr;
 
 pub mod json;
+pub mod scalar;
 
 use bson::Decimal128;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
@@ -995,7 +996,34 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             .map(type_name_of)
             .unwrap_or_else(|| inferred_type(value).to_string()),
         Some(N::AArrayExpr(_)) => inferred_type(value).to_string(),
+        // A LITERAL carries its own type in its node. Reading it from the
+        // value works until the value is NULL -- `nullif(1,1)` is NULL, and a
+        // NULL types as `text`, so the column came back as oid 25 where
+        // PostgreSQL says 23. A NULL still has a type; it just cannot report
+        // one itself.
+        Some(N::AConst(c)) if !c.isnull => match c.val.as_ref() {
+            Some(pg_query::protobuf::a_const::Val::Ival(_)) => "int4".to_string(),
+            Some(pg_query::protobuf::a_const::Val::Fval(_)) => "numeric".to_string(),
+            Some(pg_query::protobuf::a_const::Val::Boolval(_)) => "bool".to_string(),
+            _ => inferred_type(value).to_string(),
+        },
+        // These pick one of their arguments, so they report its type.
+        Some(N::CoalesceExpr(_)) | Some(N::MinMaxExpr(_)) => inferred_type(value).to_string(),
         Some(N::AExpr(e)) => {
+            // `NULLIF` is an operator node whose operator is `=`, but it
+            // answers its LEFT operand, not a boolean. Typing it from the
+            // operator made `select nullif(1,2)` report `false` under oid 16.
+            if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprNullif) {
+                // From the LEFT OPERAND's node, not from the value: when the
+                // two are equal the value is NULL, and typing a NULL gives
+                // `text` -- so `nullif(1,1)` reported oid 25 where PostgreSQL
+                // reports 23. A NULL still has a type; it just cannot tell you
+                // what it is.
+                return match e.lexpr.as_ref() {
+                    Some(l) => static_type(l, value),
+                    None => inferred_type(value).to_string(),
+                };
+            }
             let op = operator_name(e).unwrap_or("");
             match op {
                 "||" => "text".to_string(),
@@ -1126,6 +1154,32 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     ));
                     continue;
                 }
+                // A scalar built-in in the target list. Without this a BARE
+                // `select upper('a')` failed while `select upper('a')::text`
+                // worked, because only the cast route goes through
+                // `const_value` -- and a probe whose every case carried a cast
+                // would never notice.
+                if scalar::is_scalar(&name) {
+                    let args = f
+                        .args
+                        .iter()
+                        .map(|a| const_value(a, params))
+                        .collect::<Result<Vec<_>>>()?;
+                    if let Some(result) = scalar::call(&name, &args) {
+                        let value = result?;
+                        let t = inferred_type(&value).to_string();
+                        columns.push((
+                            if rt.name.is_empty() {
+                                name.clone()
+                            } else {
+                                rt.name.clone()
+                            },
+                            ConstCol::Value(value),
+                            t,
+                        ));
+                        continue;
+                    }
+                }
                 if let Some(col) = guc_function(&name, f, params)? {
                     let out_name = name.clone();
                     columns.push((
@@ -1165,7 +1219,9 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 | N::ParamRef(_)
                 | N::TypeCast(_)
                 | N::AExpr(_)
-                | N::AArrayExpr(_)),
+                | N::AArrayExpr(_)
+                | N::CoalesceExpr(_)
+                | N::MinMaxExpr(_)),
             ) => {
                 let v = const_value(rt.val.as_ref().expect("checked"), params)?;
                 let t = static_type(rt.val.as_ref().expect("checked"), &v);
@@ -2621,7 +2677,7 @@ fn align(a: Dec, b: Dec) -> Option<(i128, i128, u32)> {
 /// Division is deliberately absent: its result scale depends on the operands'
 /// weights in a way that has not been measured here, and guessing it would
 /// produce a plausible number of decimal places that is not PostgreSQL's.
-fn decimal_arith(op: &str, a: &str, b: &str) -> Option<Result<Bson>> {
+pub(crate) fn decimal_arith(op: &str, a: &str, b: &str) -> Option<Result<Bson>> {
     let (x, y) = (parse_dec(a)?, parse_dec(b)?);
     let overflow = || {
         Err(Error::NumericOutOfRange(
@@ -2965,7 +3021,7 @@ fn compare_decimal_text(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     Some(if an { magnitude.reverse() } else { magnitude })
 }
 
-fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
+pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Bson::String(x), Bson::String(y)) => Some(x.cmp(y)),
         // PostgreSQL orders arrays element by element, and when one is a
@@ -3365,6 +3421,43 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         if func_name(f).as_deref() == Some("pg_typeof") {
             return pg_typeof(f, params);
         }
+        if let Some(name) = func_name(f) {
+            if scalar::is_scalar(&name) {
+                let args = f
+                    .args
+                    .iter()
+                    .map(|a| const_value(a, params))
+                    .collect::<Result<Vec<_>>>()?;
+                if let Some(result) = scalar::call(&name, &args) {
+                    return result;
+                }
+            }
+        }
+    }
+    // `COALESCE`, `NULLIF` and `GREATEST` / `LEAST` are their own AST nodes
+    // rather than function calls, so they arrive here separately even though a
+    // user writes them like functions.
+    if let Some(N::CoalesceExpr(c)) = node.node.as_ref() {
+        for a in &c.args {
+            let v = const_value(a, params)?;
+            if v != Bson::Null {
+                return Ok(v);
+            }
+        }
+        return Ok(Bson::Null);
+    }
+    if let Some(N::MinMaxExpr(m)) = node.node.as_ref() {
+        let args = m
+            .args
+            .iter()
+            .map(|a| const_value(a, params))
+            .collect::<Result<Vec<_>>>()?;
+        let name = if m.op == pg_query::protobuf::MinMaxOp::IsGreatest as i32 {
+            "greatest"
+        } else {
+            "least"
+        };
+        return scalar::call(name, &args).expect("greatest/least are scalars");
     }
     if let Some(N::AArrayExpr(a)) = node.node.as_ref() {
         let items = a
@@ -3375,6 +3468,28 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         return Ok(Bson::Array(items));
     }
     if let Some(N::AExpr(e)) = node.node.as_ref() {
+        // `NULLIF(a, b)` is an operator node, not a function call: it is `a`
+        // unless the two are equal, in which case it is NULL.
+        if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprNullif) {
+            let lhs = match e.lexpr.as_ref() {
+                Some(l) => const_value(l, params)?,
+                None => return Err(Error::Parse("NULLIF without a left operand".into())),
+            };
+            let rhs = match e.rexpr.as_ref() {
+                Some(r) => const_value(r, params)?,
+                None => return Err(Error::Parse("NULLIF without a right operand".into())),
+            };
+            return Ok(
+                if lhs != Bson::Null
+                    && rhs != Bson::Null
+                    && compare_constants(&lhs, &rhs) == Some(std::cmp::Ordering::Equal)
+                {
+                    Bson::Null
+                } else {
+                    lhs
+                },
+            );
+        }
         if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp) {
             return Err(Error::Unsupported("this operator form".into()));
         }

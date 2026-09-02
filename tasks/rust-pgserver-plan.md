@@ -770,7 +770,48 @@ is what surfaced it; a probe of valid documents alone passes.
 
 **Probe: 38 shapes -- 29 valid, 9 malformed -- 0 divergences.**
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615.**
+### 0.26 scalar built-ins, of which there were NONE (2026-09-03)
+
+**1615 -> ~1633, +18 on the gauge and far more than that in surface.**
+
+**A survey of 37 common scalar functions found 37 missing.** `upper`, `length`,
+`abs`, `round`, `coalesce` -- the Rust planner had no scalar function table at
+all, only a zero-argument `session_function` for `current_user` and friends.
+(The Python server's `src/secantus/sql/scalar.py` has had them for months; the
+two servers share no code here.)
+
+**+18 is the honest number and it understates the work**, the same way the
+decimal-arithmetic batch did: the gauge measures psycopg's corpus, not this
+server's surface. Forty functions that did not exist now work.
+
+**A probe can hide the bug it was written to find.** Every case in the first
+probe was `select (f(...))::text` -- and a cast routes through `const_value`,
+where the new table was wired. A BARE `select upper('a')` goes through the
+target list, which was not. All 71 cases passed while the plainest possible
+call still failed. A unit test written from the same list caught it, because it
+did not carry the cast. **Vary the SHAPE of the call, not just the arguments.**
+
+**Result TYPES were where the remaining divergences were**, and only appeared
+once the probe compared result oids as well as values:
+
+* `sign(-3)` is `float8` (-1.0), not `int4`.
+* `div(7,3)` is `numeric`, not `int8` -- it is defined on numeric.
+* `round` splits by argument type exactly as the integer casts do: half away
+  from zero for numeric, half to even for float8.
+* `nullif(1,1)` is `int4` -- it answers its LEFT operand's type even when the
+  value is NULL. Typing from the value gave `text`, because a NULL cannot
+  report a type. Fixed generally: a literal now types from its own AST node.
+
+**NULL handling is not uniform.** Most built-ins propagate; `concat` /
+`concat_ws` SKIP nulls, and `greatest` / `least` IGNORE them
+(`greatest(1, NULL)` is 1). A comment claiming the last two were handled "by
+the filter below rather than by name" was contradicted by the code one line
+above it -- the third instance this session of a comment asserting something
+the code does not do.
+
+**Probe: 60 shapes, values AND result oids, 0 divergences.**
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633.**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the
