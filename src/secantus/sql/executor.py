@@ -2376,6 +2376,8 @@ def _apply_post_aggregates(plan: Any, result: list[dict[str, Any]]) -> list[dict
                 doc[field_name] = _sorted_agg_value(kind, payload, doc.get(field_name))
             elif kind in ("variance", "bit_and", "bit_or", "bit_xor"):
                 doc[field_name] = _stat_bit_value(kind, doc.get(field_name))
+            elif kind in ("interval_sum", "interval_avg"):
+                doc[field_name] = _interval_agg_value(kind, doc.get(field_name))
             elif kind == "range_agg":
                 from secantus.sql import ranges as _ranges
 
@@ -2383,6 +2385,26 @@ def _apply_post_aggregates(plan: Any, result: list[dict[str, Any]]) -> list[dict
             else:
                 doc[field_name] = _ordered_set_value(kind, payload, doc.get(field_name))
     return result
+
+
+def _interval_agg_value(kind: str, values: Any) -> Any:
+    """Finish `sum(interval)` / `avg(interval)` from the pushed values.
+
+    Mongo's `$sum` over interval SUBDOCUMENTS answered `0` and its `$avg`
+    answered NULL — silently wrong data rather than an error, and for `sum` a
+    plain zero where PG gives `3 days`. Both are folded here instead.
+
+    `intervals.add` is componentwise, which is what PG's `interval_pl` does;
+    the average divides the total, carrying months into days and days into
+    micros, which a per-field divide would get wrong. Zero non-NULL values is
+    NULL for both, as every SQL aggregate is."""
+    from secantus.sql import intervals as _intervals
+
+    nonnull = [v for v in (values or []) if v is not None]
+    if not nonnull:
+        return None
+    total = functools.reduce(_intervals.add, nonnull)
+    return total if kind == "interval_sum" else _intervals.mul(total, 1 / len(nonnull))
 
 
 def _stat_bit_value(kind: str, value: Any) -> Any:

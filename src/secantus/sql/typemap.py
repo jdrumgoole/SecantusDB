@@ -1940,6 +1940,16 @@ def infer_elem_tag(items: Any) -> str:
         return "float8"
     if isinstance(elem, _dt.datetime):
         return "timestamptz"
+    if isinstance(elem, dict):
+        # An interval rides as a subdocument, so the plain `dict` test below
+        # typed it `json` and `ARRAY[interval '1 day']::text` rendered the raw
+        # `{"interval": {"months": 0, …}}` where PG gives `{"1 day"}`. The
+        # element renderer already knows the `interval` tag; only this
+        # inference did not.
+        from secantus.sql import intervals as _intervals
+
+        if _intervals.is_interval(elem):
+            return "interval"
     if isinstance(elem, (dict, list)):
         return "json"
     if isinstance(elem, (bson.Decimal128, _decimal.Decimal)):
