@@ -11535,6 +11535,12 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         return "int4"
     if isinstance(node, exp.StringToArray):
         return "text[]"
+    # `to_date` -> date, `to_timestamp` -> timestamptz (both spellings). These
+    # typed as text, so the values rode the wire as strings with oid 25.
+    if isinstance(node, exp.StrToDate):
+        return "date"
+    if isinstance(node, (exp.StrToTime, exp.UnixToTime)):
+        return "timestamptz"
     # A scalar subquery takes the type of its single projected expression.
     # `SELECT (SELECT 1)` typed as text and sent the STRING '1'. The
     # column-reference case is handled further down (it needs the catalog to

@@ -7232,6 +7232,41 @@ shared storage engine or building large new protocol subsystems:
       computes the right answer for the SELECT list, so the plumbing exists; it
       is the per-row evaluator that lacks it.
 
+- [x] **RESOLVED (2026-09-01) — a second leaked INTERNAL ERROR, plus day-name
+      casing/padding, `to_date`/`to_timestamp`, and three `extract` fields.**
+      Date/interval sweep against PG 14.13.
+
+      * `to_char(interval '3 days','DD')` was **`XX000 internal error`**:
+        `to_char` assumed a datetime and an interval is a subdocument, so it
+        reached `_as_datetime` and raised ValueError. Interval templates now
+        work (fields are NOT folded into one another — `40 days` is `DD`=40 and
+        `30 hours` is `HH24`=30, while months ARE mod 12 with the carry in
+        YYYY), and calendar-name templates are `22007` as PG has them.
+        **`DD` contains `D`, which is a REJECTED token** — a substring test
+        made every `DD` format a spurious 22007, so the match is token-aware.
+      * `to_char(date,'Day')` did not blank-pad to 9 and `'DY'` did not
+        upper-case: the word tokens were mapped straight to strftime
+        directives, which pad nothing and always title-case. They are now
+        rendered as literal text while the token's own spelling is still
+        visible.
+      * `to_date` / `to_timestamp` were absent and reported
+        `function str_to_date() is not supported` — a name the user never
+        wrote, because sqlglot renames them (StrToDate / StrToTime /
+        UnixToTime). Both forms work and report `date` / `timestamptz` rather
+        than text.
+      * `extract(century | millennium | decade)` added; PG counts 1900 as
+        century 19, so it is `(year - 1) // 100 + 1`.
+
+      Pinned by `tests/test_sql_datetime_formatting.py`.
+
+- [ ] **OPEN — an all-lowercase `day` / `dy` to_char template renders
+      title-case (measured 2026-09-01).** PG gives `thursday `; we give
+      `Thursday `. **Not fixable in the evaluator**: sqlglot maps the leading
+      `D` to `%u` at PARSE time, so `day` and `Day` both arrive as `%uay` and
+      the distinction is gone before any of our code runs. `DAY` / `DY` survive
+      (their tail keeps its case) and are correct. Closing it needs the raw
+      format literal, i.e. a parser-level change or a pre-parse capture.
+
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
   **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,
   from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn campaign

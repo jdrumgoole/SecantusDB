@@ -229,12 +229,20 @@ class TestToCharWordTokens:
     @pytest.mark.parametrize(
         ("fmt", "want"),
         [
-            ("Day", "Monday"),
+            # The FULL names are blank-padded to 9 characters in Postgres —
+            # `to_char(date, 'Day')` is `'Monday   '`, not `'Monday'`. These
+            # expectations pinned the unpadded form; re-measured against
+            # PostgreSQL 14.13 on 2026-09-01 and corrected. The abbreviations
+            # (`Dy` / `Mon`) are NOT padded.
+            ("Day", "Monday   "),
             ("Dy", "Mon"),
-            ("Month", "January"),
+            ("Month", "January  "),
             ("Mon", "Jan"),
             ("YYYY-MM-DD", "2005-01-17"),
-            ("Day DD, Month YYYY", "Monday 17, January 2005"),
+            ("Day DD, Month YYYY", "Monday    17, January   2005"),
+            # `FM` suppresses the padding, which is how to get the old answer.
+            ("FMDay", "Monday"),
+            ("FMMonth", "January"),
         ],
     )
     def test_word_tokens(self, storage, session, fmt, want):

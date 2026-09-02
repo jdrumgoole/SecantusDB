@@ -1447,6 +1447,14 @@ def _eval_extract(node: exp.Extract, scope: Scope, ctx: ScalarContext) -> Any:
         return getattr(ts, "minute", 0)
     if field in ("second", "seconds"):
         return getattr(ts, "second", 0)
+    if field in ("decade", "decades"):
+        return ts.year // 10
+    if field in ("century", "centuries"):
+        # PG counts 1900 as century 19 and 2020 as 21 — the year BEFORE the
+        # boundary belongs to the previous century.
+        return (ts.year - 1) // 100 + 1 if ts.year > 0 else (ts.year // 100) - 1
+    if field in ("millennium", "millennia"):
+        return (ts.year - 1) // 1000 + 1 if ts.year > 0 else (ts.year // 1000) - 1
     if field == "epoch":
         base = ts if isinstance(ts, _dt.datetime) else _dt.datetime(ts.year, ts.month, ts.day)
         if base.tzinfo is None:
@@ -1543,8 +1551,44 @@ _PG_WORD_TOKENS = [
 ]
 
 
-_WORD_TIME_TOKEN_RE = re.compile(r"(?i)(month|mon|day|dy)")
+_WORD_TIME_TOKEN_RE = re.compile(r"(?i)(FM)?(month|mon|day|dy)")
+
+
+def _render_word_token(match: re.Match, ts: Any) -> str:
+    """The literal text a ``Day`` / ``Month`` / ``DY`` / ``MON`` token renders.
+
+    Postgres decides two things from the TOKEN's own spelling, neither of which
+    survives conversion to a strftime directive:
+
+    * **case** — `DAY`/`DY` upper-case, `Day`/`Dy` title-case, `day`/`dy` lower;
+    * **width** — the FULL names (`Day`, `Month`) are blank-padded to 9, so
+      `to_char(date, 'Day')` is `'Thursday '` with a trailing space. `FM`
+      before the token suppresses that padding.
+
+    We emitted `%A` / `%B` straight to strftime, which pads nothing and always
+    title-cases, so `Day` lost its padding and `DY` its upper-casing.
+    """
+    fm, token = match.group(1), match.group(2)
+    directive = _WORD_TIME_DIRECTIVES[token.lower()]
+    text = ts.strftime(directive)
+    if token.isupper():
+        text = text.upper()
+    elif token.islower():
+        text = text.lower()
+    width = _WORD_TIME_PAD.get(directive)
+    if width and not fm:
+        text = text.ljust(width)
+    return text
+
+
 _WORD_TIME_DIRECTIVES = {"month": "%B", "mon": "%b", "day": "%A", "dy": "%a"}
+
+#: `Day` and `Month` are BLANK-PADDED to 9 characters in Postgres
+#: (`to_char(date, 'Day')` is `'Thursday '`), and the token's own casing picks
+#: the output casing: `DAY`/`DY` upper-case, `Day`/`Dy` title-case. `FM` before
+#: the token suppresses the padding. None of that was applied — the directive
+#: table maps straight to strftime, which pads nothing and always title-cases.
+_WORD_TIME_PAD = {"%B": 9, "%A": 9}
 
 
 def _repair_time_format(fmt: str) -> str:
@@ -1575,6 +1619,116 @@ def _repair_time_format(fmt: str) -> str:
     return mapped
 
 
+#: `to_char(interval, …)` field templates, longest first so `HH24` is matched
+#: before `HH`. Each maps to a lambda over (months, days, micros) and the
+#: zero-padding width. Measured against PG 14.13: fields are NOT folded into
+#: one another — `interval '1 day 25 hours'` is `DD`=01 `HH24`=25, and
+#: `interval '14 months'` is `YYYY`=0001 `MM`=02.
+_INTERVAL_TOKENS: list[tuple[str, Any, int]] = [
+    ("YYYY", lambda mo, d, us: mo // 12, 4),
+    ("HH24", lambda mo, d, us: us // 3_600_000_000, 2),
+    ("MM", lambda mo, d, us: mo % 12, 2),
+    ("DD", lambda mo, d, us: d, 2),
+    ("MI", lambda mo, d, us: (us // 60_000_000) % 60, 2),
+    ("SS", lambda mo, d, us: (us // 1_000_000) % 60, 2),
+]
+
+#: Calendar-name templates PG REFUSES for an interval ("Intervals are not tied
+#: to specific calendar dates") with 22007.
+#: Longest first, so `MONTH` is seen before `MON` and `DAY` before `D`.
+_INTERVAL_REJECTED = ("MONTH", "A.M.", "P.M.", "MON", "DAY", "DY", "AM", "PM", "TZ", "D")
+
+
+def _fmt_arg(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> str | None:
+    """The format operand of a `to_date` / `to_timestamp` call, if present."""
+    fmt_node = node.args.get("format") or node.expression
+    if fmt_node is None:
+        return None
+    value = evaluate(fmt_node, scope, ctx) if isinstance(fmt_node, exp.Expression) else fmt_node
+    return None if value is None else _as_text(value)
+
+
+def _to_date_from_format(value: Any, fmt: str | None, *, date_only: bool) -> Any:
+    """``to_date(text, fmt)`` / ``to_timestamp(text, fmt)``.
+
+    The PG template is converted to strftime through the same mapping the
+    rendering side uses, so the two stay consistent.
+    """
+    if value is None:
+        return None
+    text = _as_text(value)
+    if fmt is None:
+        parsed = _as_datetime(text)
+    else:
+        from sqlglot.dialects.postgres import Postgres as _PGD
+        from sqlglot.time import format_time as _fmt_time
+
+        directive = _fmt_time(_recover_pg_format(fmt), _PGD.TIME_MAPPING) or fmt
+        try:
+            parsed = _dt.datetime.strptime(text, directive)
+        except ValueError as exc:
+            raise errors.SQLError(
+                "22007", f'invalid input syntax for type timestamp: "{text}"'
+            ) from exc
+    if date_only:
+        return parsed.date() if isinstance(parsed, _dt.datetime) else parsed
+    return parsed
+
+
+def _unix_to_timestamp(value: Any) -> Any:
+    """``to_timestamp(<epoch seconds>)`` — a timestamptz at UTC, as PG returns."""
+    if value is None:
+        return None
+    seconds = float(str(value.to_decimal() if isinstance(value, bson.Decimal128) else value))
+    return _dt.datetime.fromtimestamp(seconds, tz=_dt.timezone.utc)
+
+
+def _recover_pg_format(fmt: str) -> str:
+    """The ORIGINAL Postgres template behind sqlglot's partial strftime
+    conversion — the same inverse mapping `_repair_time_format` uses."""
+    from sqlglot.dialects.postgres import Postgres as _PG
+    from sqlglot.time import format_time as _format_time
+
+    return _format_time(fmt, _PG.INVERSE_TIME_MAPPING) or fmt
+
+
+def _to_char_interval(src: Any, fmt: str) -> str:
+    """``to_char(<interval>, fmt)``.
+
+    This used to fall through to `_as_datetime`, which raised ValueError on the
+    interval's subdocument and put `XX000 internal error` on the wire.
+    """
+    from secantus.sql import intervals as _intervals
+
+    months, days, micros = _intervals._fields(src)
+    # sqlglot partially converts the PG template to strftime at PARSE time
+    # (`HH24` arrives as `%H`, `Day` as `%uay`), so recover the original
+    # template first — the interval tokens are PG's, not strftime's.
+    fmt = _recover_pg_format(fmt)
+    upper = fmt.upper()
+    out: list[str] = []
+    i = 0
+    while i < len(fmt):
+        # Longest match first, and the ACCEPTED and REJECTED tables are tried
+        # together: a substring test cannot work here because `DD` (accepted)
+        # contains `D` (rejected), which is what made every `DD` format a
+        # spurious 22007.
+        for token, get, width in _INTERVAL_TOKENS:
+            if upper.startswith(token, i):
+                value = get(months, days, micros)
+                # A negative field keeps its sign rather than being padded
+                # (`to_char(interval '-3 days', 'DD')` is `-3`).
+                out.append(str(value) if value < 0 else str(value).zfill(width))
+                i += len(token)
+                break
+        else:
+            if any(upper.startswith(bad, i) for bad in _INTERVAL_REJECTED):
+                raise errors.SQLError("22007", "invalid format specification for an interval value")
+            out.append(fmt[i])
+            i += 1
+    return "".join(out)
+
+
 def _eval_to_char(node: exp.TimeToStr, scope: Scope, ctx: ScalarContext) -> Any:
     """``to_char(ts, 'YYYY-MM-DD HH24:MI:SS')`` (timestamps) or
     ``to_char(1234.5, '999,999.99')`` (numbers) -> a formatted string."""
@@ -1591,10 +1745,33 @@ def _eval_to_char(node: exp.TimeToStr, scope: Scope, ctx: ScalarContext) -> Any:
 
         num = src.to_decimal() if isinstance(src, bson.Decimal128) else src
         return _numformat.to_char_numeric(num, fmt)
+    from secantus.sql import intervals as _intervals
+
+    if _intervals.is_interval(src):
+        return _to_char_interval(src, fmt)
     ts = _as_datetime(src)
     if not isinstance(ts, _dt.datetime):
         ts = _dt.datetime(ts.year, ts.month, ts.day)
-    fmt = _repair_time_format(fmt)
+    # Render the word tokens to LITERAL text first, while the token's own
+    # spelling (which carries the case and padding rules) is still visible.
+    literals: list[str] = []
+    recovered = _recover_pg_format(fmt)
+    if _WORD_TIME_TOKEN_RE.search(recovered):
+
+        def _stash_word(m: re.Match) -> str:
+            literals.append(_render_word_token(m, ts))
+            return f"\x01{len(literals) - 1}\x01"
+
+        # Forward-map the REST explicitly: `_repair_time_format` only converts
+        # when it finds word tokens itself, and they are gone by now — without
+        # this, `YYYY-MM-DD Day` kept a literal `YYYY-MM-DD`.
+        from sqlglot.dialects.postgres import Postgres as _PGD
+        from sqlglot.time import format_time as _fmt_time
+
+        masked = _WORD_TIME_TOKEN_RE.sub(_stash_word, recovered)
+        fmt = _fmt_time(masked, _PGD.TIME_MAPPING) or masked
+    else:
+        fmt = _repair_time_format(fmt)
     out, i = [], 0
     up = fmt.upper()
     while i < len(fmt):
@@ -1610,7 +1787,10 @@ def _eval_to_char(node: exp.TimeToStr, scope: Scope, ctx: ScalarContext) -> Any:
         else:
             out.append(fmt[i])
             i += 1
-    return ts.strftime("".join(out))
+    rendered = ts.strftime("".join(out))
+    for idx, lit in enumerate(literals):
+        rendered = rendered.replace(f"\x01{idx}\x01", lit)
+    return rendered
 
 
 def _utcnow(ctx: ScalarContext | None) -> _dt.datetime:
@@ -1736,6 +1916,17 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
     exp.IntDiv: lambda n, s, c: _plain_scalar(
         "div", [evaluate(n.this, s, c), evaluate(n.expression, s, c)]
     ),
+    # `to_date` / `to_timestamp`. sqlglot renames them (StrToDate /
+    # UnixToTime / StrToTime), so they never reached a handler and answered
+    # `0A000 function str_to_date() is not supported` — an error naming a
+    # function the user did not write.
+    exp.StrToDate: lambda n, s, c: _to_date_from_format(
+        evaluate(n.this, s, c), _fmt_arg(n, s, c), date_only=True
+    ),
+    exp.StrToTime: lambda n, s, c: _to_date_from_format(
+        evaluate(n.this, s, c), _fmt_arg(n, s, c), date_only=False
+    ),
+    exp.UnixToTime: lambda n, s, c: _unix_to_timestamp(evaluate(n.this, s, c)),
     exp.StringToArray: lambda n, s, c: _plain_scalar(
         "string_to_array",
         [evaluate(x, s, c) for x in (n.this, n.expression, n.args.get("null")) if x is not None],
