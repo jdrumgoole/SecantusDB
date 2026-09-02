@@ -551,7 +551,58 @@ user-defined types (`test_enum.py` 197, `test_composite.py` 48), which needs
 slice. Cheaper: `interval` 126, COPY binary 119, `timestamptz` 99, `CREATE
 SCHEMA` 71, cursors 70, `json`/`jsonb` 68 each, `chr` 47, `generate_series` 43.
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215.**
+### 0.21 timestamptz, timetz and the session TimeZone (2026-09-02)
+
+**1215 -> ~1295.**
+
+**`timestamptz` is an instant, not a timestamp with an offset attached**, and
+what a client sees is the SESSION's view of it. That makes the session
+`TimeZone` part of what a statement MEANS: the same literal read under two
+zones names two different moments, and the same instant prints differently in
+each. So the zone is passed into the planner rather than defaulted.
+
+**Two sign conventions meet here and run opposite ways** — both probed, because
+either one backwards is invisible under UTC and wrong by hours everywhere else:
+
+* `SET TimeZone TO '+02:00'` is POSIX: positive is WEST, and it renders `-02`.
+* `'2026-01-01 12:00+02'` is ordinary: two hours EAST.
+
+**`chrono-tz` was already in the tree** for the MongoDB side's date operators,
+so named zones with real DST rules cost one dependency line rather than a
+campaign. `Europe/Rome` gives +01 in January and +02 in July; a fixed offset
+gives the same all year.
+
+**The session zone reaches the lowering code through a thread-local**, installed
+by `plan_with_session` around a SYNCHRONOUS call with no `await` inside, so no
+other task can observe it — the same shape as the Python server's `maxTimeMS`
+deadline. Threading a session argument through every intermediate signature to
+reach two leaves buys nothing.
+
+**A comment written in this batch was contradicted by the next probe.** It said
+no zone in use carries seconds in its offset; psycopg's corpus has `+01:02:03`
+in 16 tests. Fixed in both directions. That is the third instance in this file
+of the "comment justifying behaviour by something other than the oracle" shape
+CLAUDE.md warns about, and this one was self-inflicted within the hour.
+
+**A wrong answer inside the new feature, caught by checking a claim.** The
+backlog entry written for this batch asserted that a `timestamptz` COLUMN was
+refused. Nothing had tested that, and it was false: the column was ACCEPTED, and
+a row written under UTC read back as `12:00:00+00` under `Europe/Rome` where
+PostgreSQL answers `13:00:00+01` — the right instant printed in the wrong zone,
+undetectable by any client. `timestamptz` is stored as canonical TEXT (the
+choice `date` and `time` already make) and a timestamptz renders in the SESSION
+zone, so that text is only correct for the session that wrote it. Columns of
+both tz types are now refused with `0A000`, which cost **zero** gauge tests —
+the wrong answer was buying nothing, exactly as with nested arrays in 0.18.
+
+**The lesson: verify the claims in the write-up, not just the code.** This one
+was invented while documenting and would have shipped as a false statement
+about a real wrong answer.
+
+**Still failing in `test_datetime.py`, with counts:** `interval` 128, `inf` /
+`-inf` timestamps 60, BC dates 30, `'epoch'` 6.
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295.**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

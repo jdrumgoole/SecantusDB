@@ -882,3 +882,106 @@ def test_timestamp_constants_are_not_null(home: Path) -> None:
         cur.execute("insert into ts values (1, '2026-01-01 12:00')")
         cur.execute("select t from ts where id = 1")
         assert cur.fetchone()[0] == dt.datetime(2026, 1, 1, 12, 0)
+
+
+def test_timestamptz_renders_in_the_session_zone(home: Path) -> None:
+    """`timestamptz` is an instant; what you see is the session's view of it.
+
+    Two sign conventions meet here and they run opposite ways. In
+    ``SET TimeZone TO '+02:00'`` the sign is POSIX — positive is *west* of
+    Greenwich, so it renders as ``-02``. In a literal like ``'12:00+02'`` the
+    sign is the ordinary one, two hours *east*. Both were probed against a live
+    PostgreSQL; getting either backwards is invisible under UTC and wrong by
+    hours everywhere else.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+
+        cur.execute("set timezone to 'UTC'")
+        cur.execute("select '2026-01-01 12:00'::timestamptz::text")
+        assert cur.fetchone()[0] == "2026-01-01 12:00:00+00"
+        cur.execute("select '2026-01-01 12:00+02'::timestamptz::text")
+        assert cur.fetchone()[0] == "2026-01-01 10:00:00+00"
+
+        # POSIX sign: '+02:00' is UTC-02.
+        cur.execute("set timezone to '+02:00'")
+        cur.execute("select '2026-01-01 12:00'::timestamptz::text")
+        assert cur.fetchone()[0] == "2026-01-01 12:00:00-02"
+
+        # A named zone carries a DST rule; the same reading differs by season.
+        cur.execute("set timezone to 'Europe/Rome'")
+        cur.execute("select '2026-01-01 12:00'::timestamptz::text")
+        assert cur.fetchone()[0] == "2026-01-01 12:00:00+01"
+        cur.execute("select '2026-07-01 12:00'::timestamptz::text")
+        assert cur.fetchone()[0] == "2026-07-01 12:00:00+02"
+
+        # An offset may carry seconds.
+        cur.execute("set timezone to 'UTC'")
+        cur.execute("select '2000-01-01 00:00+01:02:03'::timestamptz::text")
+        assert cur.fetchone()[0] == "1999-12-31 22:57:57+00"
+
+        # Its own oid, so a client builds an aware datetime rather than a naive
+        # one from the same characters.
+        cur.execute("select '2026-01-01 12:00'::timestamptz")
+        assert cur.description[0].type_code == 1184
+        cur.execute("select pg_typeof('2026-01-01'::timestamptz)::text")
+        assert cur.fetchone()[0] == "timestamp with time zone"
+        cur.execute("select pg_typeof('12:00'::timetz)::text")
+        assert cur.fetchone()[0] == "time with time zone"
+        cur.execute("select '12:00+02'::timetz::text")
+        assert cur.fetchone()[0] == "12:00:00+02"
+
+
+def test_bound_aware_datetimes_keep_their_instant(home: Path) -> None:
+    """A bound aware datetime must name the same instant PostgreSQL would.
+
+    psycopg sends these in the binary format by default — 8 bytes of
+    microseconds from 2000-01-01 — so the text and binary paths are checked
+    separately.
+    """
+    aware = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.timezone.utc)
+    with _Server(home) as server, server.connect() as conn:
+        for binary in (False, True):
+            for zone in ("UTC", "Europe/Rome"):
+                conn.cursor().execute(f"set timezone to '{zone}'")
+                cur = conn.cursor(binary=binary)
+                cur.execute("select %s::timestamptz", (aware,))
+                assert cur.fetchone()[0] == aware, (binary, zone)
+
+
+def test_regtype_names_a_type(home: Path) -> None:
+    """`'int4'::regtype` is the type it names, printed as PostgreSQL prints it."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for given, want in [("int4", "integer"), ("integer", "integer"), ("text", "text")]:
+            cur.execute("select %s::regtype::text", (given,))
+            assert cur.fetchone()[0] == want
+
+
+def test_timestamptz_columns_are_refused_not_silently_wrong(home: Path) -> None:
+    """A `timestamptz` COLUMN is refused, because storing one would be wrong.
+
+    `timestamptz` is kept as canonical text here, the way `date` and `time`
+    already are — but a timestamptz *renders in the session's zone*, so that
+    text is only correct for the session that wrote it. Before this refusal, a
+    row written under UTC read back as `12:00:00+00` under `Europe/Rome`, where
+    PostgreSQL answers `13:00:00+01`: the right instant printed in the wrong
+    zone, which no client could detect.
+
+    The type still works everywhere it is a value rather than storage.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for ddl in (
+            "create table t (id int primary key, ts timestamptz)",
+            "create table u (id int primary key, tt timetz)",
+        ):
+            with pytest.raises(psycopg.Error) as exc:
+                cur.execute(ddl)
+            assert exc.value.diag.sqlstate == "0A000"
+
+        # A plain `timestamp` column is unaffected, and the tz types still work
+        # as casts and bound values.
+        cur.execute("create table v (id int primary key, ts timestamp)")
+        cur.execute("select '2026-01-01 12:00'::timestamptz::text")
+        assert cur.fetchone()[0] == "2026-01-01 12:00:00+00"

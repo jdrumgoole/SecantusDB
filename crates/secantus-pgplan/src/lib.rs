@@ -484,6 +484,17 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
         match el.node.as_ref() {
             Some(N::ColumnDef(cd)) => {
                 let ty = cd.type_name.as_ref().map(type_name_of).unwrap_or_default();
+                // `timestamptz` / `timetz` work as casts, literals and bound
+                // values, but NOT as a column: they are stored as canonical
+                // text, and a timestamptz renders in the SESSION zone, so the
+                // stored text is right only for the session that wrote it. A
+                // row written under UTC then read under Europe/Rome came back
+                // with UTC's wall clock and UTC's offset -- a wrong answer no
+                // client could detect. Refuse until the stored form is an
+                // instant rather than a rendering of one.
+                if matches!(ty.as_str(), "timestamptz" | "timetz") {
+                    return Err(Error::Unsupported(format!("a {ty} column")));
+                }
                 let pk = cd.constraints.iter().any(|c| {
                     matches!(c.node.as_ref(), Some(N::Constraint(k))
                         if k.contype == pg_query::protobuf::ConstrType::ConstrPrimary as i32)
@@ -1067,6 +1078,8 @@ pub fn display_type(internal: &str) -> String {
         "bpchar" | "char" | "character" => "character",
         "time" => "time without time zone",
         "timestamp" => "timestamp without time zone",
+        "timestamptz" => "timestamp with time zone",
+        "timetz" => "time with time zone",
         // A bare NULL literal has no type yet: PostgreSQL calls it `unknown`,
         // and resolves it from context when there is any.
         "unknown" => "unknown",
@@ -1330,7 +1343,268 @@ fn parse_timestamp(text: &str) -> Result<i64> {
     }
 }
 
-/// Render stored microseconds as PostgreSQL renders a timestamp.
+/// The session's `TimeZone`, resolved to something that can date arithmetic.
+///
+/// PostgreSQL accepts both a fixed offset (`SET TimeZone TO '+02:00'`) and a
+/// named IANA zone (`'Europe/Rome'`), and the two behave differently: a fixed
+/// offset is the same all year, a named zone carries a DST rule, so
+/// `2026-01-01 12:00` and `2026-07-01 12:00` resolve to different offsets in
+/// `Europe/Rome` and to the same one under `'+02:00'`.
+///
+/// Note PostgreSQL's POSIX sign convention: in `SET TimeZone`, `'+02:00'` means
+/// two hours WEST of Greenwich, i.e. UTC-02. Probed, because it is the reverse
+/// of the sign in a timestamp literal like `'12:00+02'`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TimeZoneSetting {
+    #[default]
+    Utc,
+    Fixed(chrono::FixedOffset),
+    Named(chrono_tz::Tz),
+}
+
+impl TimeZoneSetting {
+    /// Parse a `TimeZone` GUC value. Unknown names fall back to UTC rather than
+    /// failing: the setting is applied when it is SET, and this server has no
+    /// business refusing a query because it does not know a zone name.
+    pub fn parse(value: &str) -> Self {
+        let v = value.trim().trim_matches('\'');
+        if v.is_empty() || v.eq_ignore_ascii_case("utc") || v.eq_ignore_ascii_case("gmt") {
+            return TimeZoneSetting::Utc;
+        }
+        if let Some(off) = parse_utc_offset_posix(v) {
+            return TimeZoneSetting::Fixed(off);
+        }
+        match v.parse::<chrono_tz::Tz>() {
+            Ok(tz) => TimeZoneSetting::Named(tz),
+            Err(_) => TimeZoneSetting::Utc,
+        }
+    }
+
+    /// The offset in effect at a given instant.
+    pub fn offset_at(&self, micros: i64) -> chrono::FixedOffset {
+        use chrono::{Offset, TimeZone};
+        match self {
+            TimeZoneSetting::Utc => chrono::FixedOffset::east_opt(0).expect("zero is valid"),
+            TimeZoneSetting::Fixed(off) => *off,
+            TimeZoneSetting::Named(tz) => {
+                let instant = chrono::DateTime::from_timestamp_micros(micros).unwrap_or_default();
+                tz.from_utc_datetime(&instant.naive_utc()).offset().fix()
+            }
+        }
+    }
+
+    /// The offset this zone gives a LOCAL wall-clock reading, which is what a
+    /// zone-less literal needs: the instant is not known until the offset is.
+    pub fn offset_for_local(&self, naive_micros: i64) -> chrono::FixedOffset {
+        use chrono::{Offset, TimeZone};
+        match self {
+            TimeZoneSetting::Utc => chrono::FixedOffset::east_opt(0).expect("zero is valid"),
+            TimeZoneSetting::Fixed(off) => *off,
+            TimeZoneSetting::Named(tz) => {
+                let naive = chrono::DateTime::from_timestamp_micros(naive_micros)
+                    .unwrap_or_default()
+                    .naive_utc();
+                // A local time can be ambiguous (the hour DST repeats) or absent
+                // (the hour it skips). PostgreSQL takes the EARLIER offset for an
+                // ambiguous reading, which is what `earliest()` gives.
+                tz.from_local_datetime(&naive)
+                    .earliest()
+                    .or_else(|| tz.from_local_datetime(&naive).latest())
+                    .map(|d| d.offset().fix())
+                    .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).expect("zero is valid"))
+            }
+        }
+    }
+}
+
+/// `SET TimeZone TO '+02:00'` uses the POSIX sign: positive is WEST of
+/// Greenwich, so `'+02:00'` is UTC-02. A bare `'02:00'` is the same as `'+02:00'`.
+/// This is the OPPOSITE of the sign in `'2026-01-01 12:00+02'`, and was probed
+/// rather than assumed.
+fn parse_utc_offset_posix(v: &str) -> Option<chrono::FixedOffset> {
+    let (sign, rest) = match v.strip_prefix('-') {
+        Some(r) => (1i32, r),
+        None => (-1i32, v.strip_prefix('+').unwrap_or(v)),
+    };
+    if rest.is_empty() || !rest.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let (h, m) = match rest.split_once(':') {
+        Some((h, m)) => (h.parse::<i32>().ok()?, m.parse::<i32>().ok()?),
+        None => (rest.parse::<i32>().ok()?, 0),
+    };
+    if !(0..=15).contains(&h) || !(0..60).contains(&m) {
+        return None;
+    }
+    chrono::FixedOffset::east_opt(sign * (h * 3600 + m * 60))
+}
+
+thread_local! {
+    /// The session `TimeZone` in force for the statement being planned.
+    ///
+    /// `timestamptz` needs it in two places that are deep inside the lowering
+    /// code — interpreting a literal that carries no offset, and rendering one
+    /// back — and threading a session argument through every intermediate
+    /// signature to reach two leaves buys nothing.
+    ///
+    /// Safe because it is set around a SYNCHRONOUS call: `plan_with_session`
+    /// installs it, calls the planner, and restores it, with no `await` in
+    /// between, so no other task can observe or inherit it. The Python server
+    /// arms its `maxTimeMS` deadline the same way.
+    static PLAN_TIMEZONE: std::cell::RefCell<TimeZoneSetting> =
+        const { std::cell::RefCell::new(TimeZoneSetting::Utc) };
+}
+
+/// Plan a statement with the session's `TimeZone` in force.
+pub fn plan_with_session(
+    sql: &str,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+    timezone: &TimeZoneSetting,
+) -> Result<Statement> {
+    let previous = PLAN_TIMEZONE.with(|t| t.replace(timezone.clone()));
+    let out = plan_with_params(sql, lookup, params);
+    PLAN_TIMEZONE.with(|t| *t.borrow_mut() = previous);
+    out
+}
+
+fn session_timezone() -> TimeZoneSetting {
+    PLAN_TIMEZONE.with(|t| t.borrow().clone())
+}
+
+/// Split a trailing UTC offset off a timestamp literal.
+///
+/// Returns the body and the offset in seconds when one is present. Note the
+/// sign here is the ORDINARY one — `'12:00+02'` is two hours EAST — which is
+/// the reverse of `SET TimeZone TO '+02:00'`.
+fn split_trailing_offset(text: &str) -> (String, Option<i32>) {
+    let t = text.trim();
+    if let Some(body) = t.strip_suffix(['Z', 'z']) {
+        return (body.trim().to_string(), Some(0));
+    }
+    // Scan from the right for a sign that starts an offset, but not the `-`
+    // inside a date: an offset only appears after a time, so require a `:` or a
+    // space before it.
+    let bytes = t.as_bytes();
+    for i in (1..bytes.len()).rev() {
+        let c = bytes[i] as char;
+        if c != '+' && c != '-' {
+            continue;
+        }
+        let tail = &t[i + 1..];
+        if tail.is_empty() || !tail.chars().all(|c| c.is_ascii_digit() || c == ':') {
+            continue;
+        }
+        let head = &t[..i];
+        // A date's `-` never follows a `:` or a space-separated time.
+        if !head.contains(':') {
+            continue;
+        }
+        // An offset can carry SECONDS -- `+01:02:03` is a real PostgreSQL
+        // offset, and several historical zones used one before the hour-based
+        // convention settled. An earlier comment here asserted no zone in use
+        // carried seconds; the psycopg corpus contains them.
+        let mut parts = tail.split(':');
+        let h = parts.next().and_then(|v| v.parse::<i32>().ok());
+        let m = parts.next().map_or(Some(0), |v| v.parse::<i32>().ok());
+        let sec = parts.next().map_or(Some(0), |v| v.parse::<i32>().ok());
+        if parts.next().is_some() {
+            continue;
+        }
+        if let (Some(h), Some(m), Some(sec)) = (h, m, sec) {
+            if (0..=15).contains(&h) && (0..60).contains(&m) && (0..60).contains(&sec) {
+                let sign = if c == '-' { -1 } else { 1 };
+                return (
+                    head.trim().to_string(),
+                    Some(sign * (h * 3600 + m * 60 + sec)),
+                );
+            }
+        }
+    }
+    (t.to_string(), None)
+}
+
+/// A `timestamptz` literal as an absolute instant, in microseconds since the
+/// Unix epoch.
+///
+/// A literal that carries an offset names an instant outright. One that does
+/// not is a WALL-CLOCK reading in the session zone, so the offset — and with it
+/// the instant — depends on the zone's rule at that local time.
+fn parse_timestamptz(text: &str, tz: &TimeZoneSetting) -> Result<i64> {
+    let (body, offset) = split_trailing_offset(text);
+    let naive = parse_timestamp(&body).map_err(|e| match e {
+        Error::InvalidDatetimeFormat(_) => Error::InvalidDatetimeFormat(format!(
+            "invalid input syntax for type timestamp with time zone: \"{}\"",
+            text.trim()
+        )),
+        other => other,
+    })?;
+    let seconds = match offset {
+        Some(s) => s,
+        None => tz.offset_for_local(naive).local_minus_utc(),
+    };
+    Ok(naive - i64::from(seconds) * 1_000_000)
+}
+
+/// An instant as PostgreSQL renders a `timestamptz`: the wall clock in the
+/// session zone, then the offset that zone had at that instant.
+pub fn render_timestamptz(micros: i64, tz: &TimeZoneSetting) -> String {
+    let offset = tz.offset_at(micros);
+    let seconds = offset.local_minus_utc();
+    let local = micros + i64::from(seconds) * 1_000_000;
+    format!("{}{}", render_timestamp(local), render_offset(seconds))
+}
+
+/// PostgreSQL prints an offset as `+02`, widening to `+02:30` for minutes and
+/// `+01:02:03` for seconds -- second-precision offsets are real, and appear in
+/// the psycopg corpus.
+fn render_offset(seconds: i32) -> String {
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let a = seconds.abs();
+    let (h, m, s) = (a / 3600, (a % 3600) / 60, a % 60);
+    if s != 0 {
+        format!("{sign}{h:02}:{m:02}:{s:02}")
+    } else if m != 0 {
+        format!("{sign}{h:02}:{m:02}")
+    } else {
+        format!("{sign}{h:02}")
+    }
+}
+
+/// A `timetz` from its parts: microseconds since midnight, and the offset in
+/// seconds EAST of UTC.
+pub fn render_timetz(micros: i64, east_seconds: i32) -> String {
+    format!(
+        "{}{}",
+        render_time_from_micros(micros),
+        render_offset(east_seconds)
+    )
+}
+
+/// A `timetz` literal as canonical text: a time plus a fixed offset.
+///
+/// `timetz` is not an instant — it is a clock reading that remembers which
+/// offset it was read in, which is why PostgreSQL itself discourages the type.
+/// A literal with no offset takes the session zone's CURRENT offset, so the
+/// same literal can mean different things on either side of a DST change.
+fn parse_timetz(text: &str, tz: &TimeZoneSetting) -> Result<String> {
+    let (body, offset) = split_trailing_offset(text);
+    let time = parse_time(&body)?;
+    let seconds = match offset {
+        Some(s) => s,
+        None => {
+            // `chrono`'s clock feature is off here on purpose (the planner is
+            // otherwise deterministic), so the wall clock comes from std.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0);
+            tz.offset_at(now).local_minus_utc()
+        }
+    };
+    Ok(format!("{time}{}", render_offset(seconds)))
+}
+
 /// Days since 2000-01-01 as PostgreSQL's `date` text.
 ///
 /// PostgreSQL's binary `date` is a day count from 2000-01-01, not from the Unix
@@ -1390,6 +1664,7 @@ pub fn timestamp_value_text(v: &Bson) -> Option<String> {
     }
 }
 
+/// Render stored microseconds as PostgreSQL renders a timestamp.
 pub fn render_timestamp(micros: i64) -> String {
     let dt = chrono::DateTime::from_timestamp_micros(micros)
         .map(|d| d.naive_utc())
@@ -1724,10 +1999,33 @@ fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             _ => Err(bad("boolean", &value)),
         },
         "text" | "varchar" | "bpchar" | "char" | "name" => Ok(Bson::String(as_text(&value))),
+        // `'int4'::regtype` is the TYPE named by the text, printed the way
+        // PostgreSQL prints it -- so `int4` and `integer` both come back as
+        // `integer`. Only the naming is reproduced here; a regtype is really an
+        // oid, and this server has no `pg_type` to resolve one against.
+        "regtype" => Ok(Bson::String(display_type(as_text(&value).trim()))),
         // `date` and `time` are stored as their canonical TEXT, matching what
         // the Python server writes -- the two servers share one store, so the
         // representation is a contract, not an implementation choice.
         "date" => Ok(Bson::String(parse_date(&as_text(&value))?)),
+        // `timestamptz` and `timetz` are stored as their canonical TEXT, the
+        // same choice `date` and `time` already make here. A `timestamptz`
+        // renders in the SESSION zone, so the text is only canonical for the
+        // session that produced it -- fine for an expression or a bound value,
+        // which is all this server accepts (a timestamptz COLUMN is refused:
+        // storing session-relative text in a row would be a wrong answer for
+        // every other session that read it).
+        "timestamptz" | "timestamp with time zone" => {
+            let tz = session_timezone();
+            Ok(Bson::String(render_timestamptz(
+                parse_timestamptz(&as_text(&value), &tz)?,
+                &tz,
+            )))
+        }
+        "timetz" | "time with time zone" => Ok(Bson::String(parse_timetz(
+            &as_text(&value),
+            &session_timezone(),
+        )?)),
         // A timestamp becomes a BSON date plus, when it carries microseconds,
         // a composite the assignment path unwraps into the hidden companion.
         "timestamp" => {

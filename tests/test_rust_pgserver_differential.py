@@ -483,6 +483,52 @@ PARAM_MUTATIONS = [
 ]
 
 
+# (zone, query). `timestamptz` renders in the SESSION zone, so every one of
+# these is meaningless without setting it on BOTH servers first — the oracle's
+# own default here is `GB`, not UTC, which would make a zone-less comparison
+# look like a divergence in this server.
+TIMEZONE_QUERIES = [
+    (tz, sql)
+    for tz in ["UTC", "+02:00", "-02:00", "Europe/Rome", "America/Chicago"]
+    for sql in [
+        "SELECT '2026-01-01 12:00'::timestamptz::text",
+        # July as well as January: a named zone's offset differs across DST,
+        # a fixed one does not.
+        "SELECT '2026-07-01 12:00'::timestamptz::text",
+        "SELECT '2026-01-01 12:00+00'::timestamptz::text",
+        "SELECT '2026-01-01 12:00+02'::timestamptz::text",
+        "SELECT '2026-01-01 12:00Z'::timestamptz::text",
+        # Second-precision offsets are real and appear in psycopg's corpus.
+        "SELECT '2000-01-01 00:00+01:02:03'::timestamptz::text",
+        "SELECT '0258-1-8 1:12:32.358261+01:02:03'::timestamptz::text",
+        "SELECT pg_typeof('2026-01-01'::timestamptz)::text",
+        "SELECT pg_typeof('12:00'::timetz)::text",
+        "SELECT '12:00+02'::timetz::text",
+        "SELECT 'integer'::regtype::text",
+        "SELECT 'int4'::regtype::text",
+    ]
+]
+
+
+@pytest.mark.parametrize("tz,sql", TIMEZONE_QUERIES, ids=lambda v: str(v)[:44])
+def test_timezone_query_matches_postgres(
+    tz: str, sql: str, ours: psycopg.Connection, oracle: psycopg.Connection
+) -> None:
+    """`timestamptz` under an explicit session TimeZone, on both servers.
+
+    `SET TimeZone TO '+02:00'` uses the POSIX sign — positive is WEST of
+    Greenwich, so it renders as `-02`. That is the reverse of the sign in a
+    literal like `'12:00+02'`, and was probed rather than assumed.
+    """
+    for conn in (oracle, ours):
+        conn.cursor().execute(f"set timezone to '{tz}'")
+    theirs = _rows(oracle.cursor(), sql)
+    mine = _rows(ours.cursor(), sql)
+    assert mine == theirs, f"[{tz}] {sql}\n  postgres={theirs}\n  ours    ={mine}"
+    for conn in (oracle, ours):
+        conn.cursor().execute("set timezone to 'UTC'")
+
+
 @pytest.mark.parametrize("sql,params", PARAMETERISED, ids=lambda v: str(v)[:52])
 def test_parameterised_query_matches_postgres(
     sql: str, params: tuple, ours: psycopg.Connection, oracle: psycopg.Connection
