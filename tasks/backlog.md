@@ -7876,6 +7876,23 @@ shared storage engine or building large new protocol subsystems:
       returns a **timestamptz** rather than a naive timestamp. Two sweeps:
       122/122 and 190/192. `tests/test_sql_to_char_datetime.py`.
 
+- [ ] **OPEN — `to_char(numeric, …)`'s `V` and `TH` answer instead of refusing
+      (2026-09-02).** Three numeric template patterns are unimplemented, and
+      two of them return a WRONG number rather than an error, which is the bad
+      failure mode:
+
+      | template | PG 14.13 | SecantusDB |
+      | --- | --- | --- |
+      | `to_char(42, '9V99')` | `` ` ###` `` | `` `  42` `` |
+      | `to_char(42, '999TH')` | `` `  42ND` `` | `` `  42` `` |
+      | `to_char(42, '9.9EEEE')` | `` ` 4.2e+01` `` | `` ` #.#` `` |
+
+      `V` shifts the value by that many digits (and overflows here, hence PG's
+      `#`); a NUMERIC `TH` appends the ordinal — the datetime `TH` is
+      implemented, this one is not. `EEEE` at least prints `#`, which is wrong
+      but not silently plausible. Found while reconciling `docs/sql.md`, which
+      claimed `RN` was unimplemented too — it is implemented and matches PG.
+
 - [ ] **OPEN — a year-less `to_date` / `to_timestamp` template defaults to
       1 BC, and BC dates are unrepresentable (2026-09-02).**
       `to_date('11:30:00 PM','HH12:MI:SS AM')` is `'0001-01-01 BC'` on

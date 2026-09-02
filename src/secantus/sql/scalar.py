@@ -1291,7 +1291,6 @@ def _extremum(pick: Callable[[list[Any]], Any]) -> Callable[..., Any]:
 def _re_compile(pattern: str, flags_str: str) -> Any:
     """Compile a POSIX regex with Postgres flag letters (``i`` case-insensitive,
     ``m``/``n`` newline-sensitive, ``s`` dot-all, ``x`` extended)."""
-    import re
 
     fs = flags_str or ""
     f = 0
@@ -1897,104 +1896,6 @@ def _date_trunc_interval(unit: str, src: Any, _intervals: Any) -> Any:
     raise errors.feature_not_supported(f'unit "{unit}" not supported for interval date_trunc')
 
 
-# sqlglot's Postgres dialect already normalises the standard ``to_char`` tokens
-# (YYYY / MM / DD / HH24 / MI / SS …) to strftime directives; only the word-form
-# tokens are left as literals, so we map just those (longest-first) and then
-# strftime once. Existing ``%X`` directives are copied through untouched.
-_PG_WORD_TOKENS = [
-    ("MONTH", "%B"),
-    ("MON", "%b"),
-    ("DAY", "%A"),
-    ("DY", "%a"),
-    ("AM", "%p"),
-    ("PM", "%p"),
-]
-
-
-#: Longest-first, because the alternation takes the first match: `month`
-#: before `mon`, `iyyy` before `iw`/`id`. The ISO-week tokens ride the same
-#: stash-and-substitute machinery as the word tokens, and for the same reason —
-#: sqlglot's postgres mapping does not know them, so `IYYY-IW-ID` came out as
-#: the literal `I20Y-IW-I3` (the lone `Y` and `D` matched, the `I`s did not).
-_WORD_TIME_TOKEN_RE = re.compile(r"(?i)(FM)?(month|mon|day|dy|iyyy|iw|id)")
-
-
-def _render_word_token(match: re.Match, ts: Any) -> str:
-    """The literal text a ``Day`` / ``Month`` / ``DY`` / ``MON`` token renders.
-
-    Postgres decides two things from the TOKEN's own spelling, neither of which
-    survives conversion to a strftime directive:
-
-    * **case** — `DAY`/`DY` upper-case, `Day`/`Dy` title-case, `day`/`dy` lower;
-    * **width** — the FULL names (`Day`, `Month`) are blank-padded to 9, so
-      `to_char(date, 'Day')` is `'Thursday '` with a trailing space. `FM`
-      before the token suppresses that padding.
-
-    We emitted `%A` / `%B` straight to strftime, which pads nothing and always
-    title-cases, so `Day` lost its padding and `DY` its upper-casing.
-    """
-    fm, token = match.group(1), match.group(2)
-    directive = _WORD_TIME_DIRECTIVES[token.lower()]
-    text = ts.strftime(directive)
-    if token.isupper():
-        text = text.upper()
-    elif token.islower():
-        text = text.lower()
-    width = _WORD_TIME_PAD.get(directive)
-    if width and not fm:
-        text = text.ljust(width)
-    return text
-
-
-_WORD_TIME_DIRECTIVES = {
-    "month": "%B",
-    "mon": "%b",
-    "day": "%A",
-    "dy": "%a",
-    # ISO-8601 week-numbering: year, week, weekday. `IYY` / `IY` / `I` (the
-    # truncated ISO years) and `IDDD` have no strftime directive and are not
-    # handled — see `tasks/backlog.md`.
-    "iyyy": "%G",
-    "iw": "%V",
-    "id": "%u",
-}
-
-#: `Day` and `Month` are BLANK-PADDED to 9 characters in Postgres
-#: (`to_char(date, 'Day')` is `'Thursday '`), and the token's own casing picks
-#: the output casing: `DAY`/`DY` upper-case, `Day`/`Dy` title-case. `FM` before
-#: the token suppresses the padding. None of that was applied — the directive
-#: table maps straight to strftime, which pads nothing and always title-cases.
-_WORD_TIME_PAD = {"%B": 9, "%A": 9}
-
-
-def _repair_time_format(fmt: str) -> str:
-    """Undo sqlglot's partial PG→strftime format conversion and redo it with
-    the word tokens handled.
-
-    sqlglot's postgres TIME_MAPPING knows no ``Day`` / ``Month`` tokens, so
-    ``to_char(ts, 'Day')`` arrives here as ``%uay`` (the ``D`` matched alone).
-    Reverse-map back to the original PG template, replace the word tokens with
-    sentinels, forward-map the rest, then substitute the strftime directives.
-    A format with no word tokens round-trips unchanged."""
-    from sqlglot.dialects.postgres import Postgres as _PG
-    from sqlglot.time import format_time as _format_time
-
-    recovered = _format_time(fmt, _PG.INVERSE_TIME_MAPPING) or fmt
-    subs: list[str] = []
-
-    def _stash(m: re.Match) -> str:
-        subs.append(_WORD_TIME_DIRECTIVES[m.group(0).lower()])
-        return f"\x00{len(subs) - 1}\x00"
-
-    masked = _WORD_TIME_TOKEN_RE.sub(_stash, recovered)
-    if not subs:
-        return fmt
-    mapped = _format_time(masked, _PG.TIME_MAPPING) or masked
-    for i, directive in enumerate(subs):
-        mapped = mapped.replace(f"\x00{i}\x00", directive)
-    return mapped
-
-
 #: `to_char(interval, …)` field templates, longest first so `HH24` is matched
 #: before `HH`. Each maps to a lambda over (months, days, micros) and the
 #: zero-padding width. Measured against PG 14.13: fields are NOT folded into
@@ -2205,7 +2106,11 @@ _install_to_char_raw_format()
 
 def _recover_pg_format(fmt: str) -> str:
     """The ORIGINAL Postgres template behind sqlglot's partial strftime
-    conversion — the same inverse mapping `_repair_time_format` uses."""
+    conversion.
+
+    Only a fallback now: `_install_to_char_raw_format` captures the untouched
+    template at parse time, and this inverse cannot recover the token CASE that
+    the forward mapping destroys (`d` and `D` both become `%u`)."""
     from sqlglot.dialects.postgres import Postgres as _PG
     from sqlglot.time import format_time as _format_time
 
@@ -5837,7 +5742,6 @@ def _as_bool_arg(value: Any) -> bool:
 
 def _like_matches(node: exp.Expression, value: Any, pattern: Any, escape: Any) -> Any:
     """One LIKE match, shared by the scalar and the quantified forms."""
-    import re
 
     from secantus.sql.planner import _ESCAPE_UNSET, _like_to_regex
 
@@ -5852,7 +5756,6 @@ def _like_matches(node: exp.Expression, value: Any, pattern: Any, escape: Any) -
 
 
 def _eval_like(node: exp.Expression, outer: Scope, ctx: ScalarContext, escape: Any = None) -> Any:
-    import re
 
     from secantus.sql.planner import _like_to_regex
 
@@ -5892,7 +5795,6 @@ def _eval_regexp(node: exp.Expression, outer: Scope, ctx: ScalarContext) -> Any:
     """POSIX regex-match operators ``~`` (``RegexpLike``) / ``~*`` (``RegexpILike``).
     The pattern is a raw regex matched *unanchored* (``re.search``), unlike LIKE.
     ``!~`` / ``!~*`` arrive as ``Not(...)`` and are negated by the caller."""
-    import re
 
     val = evaluate(node.this, outer, ctx)
     pattern = evaluate(node.expression, outer, ctx)
