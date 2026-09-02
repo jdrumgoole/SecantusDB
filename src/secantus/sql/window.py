@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import functools
+from collections.abc import Mapping
 from typing import Any
 
 from sqlglot import exp
@@ -104,13 +105,13 @@ def _eval_window(w: exp.Window, docs: list[dict[str, Any]], scope_of: Any, sctx:
         # matters as much as ordering: these keys decide who are PEERS, and
         # `Decimal128` compares its BID encoding, so `1.0` and `1.00` ranked as
         # two rows rather than one tie.
-        okeys = [
-            tuple(
-                typemap.sort_key_value(scalar.evaluate(oe, scope_of(d), sctx))
-                for oe, _ in order_terms
-            )
-            for d in ordered
+        # Per-term keying, so a structured column is ordered consistently here
+        # too — these keys decide peers and frame bounds.
+        per_term = [
+            _window_comparable([scalar.evaluate(oe, scope_of(d), sctx) for d in ordered])
+            for oe, _ in order_terms
         ]
+        okeys = [tuple(term[i] for term in per_term) for i in range(len(ordered))]
         order_dirs = [d for _, d in order_terms]
         values = _window_values(
             func, spec, ordered, okeys, bool(order_terms), order_dirs, scope_of, sctx
@@ -151,11 +152,27 @@ def _order_partition(
     # Stable multi-key sort: apply each key from least to most significant. NULLs
     # sort last for ASC (Postgres default NULLS LAST), reversed for DESC.
     for oe, direction in reversed(order_terms):
-        ordered.sort(
-            key=lambda d, oe=oe: _null_key(scalar.evaluate(oe, scope_of(d), sctx)),
-            reverse=(direction == -1),
-        )
+        keys = _window_comparable([scalar.evaluate(oe, scope_of(d), sctx) for d in ordered])
+        by_id = dict(zip((id(d) for d in ordered), keys, strict=True))
+        ordered.sort(key=lambda d: (by_id[id(d)] is None, by_id[id(d)]), reverse=(direction == -1))
     return ordered
+
+
+def _window_comparable(values: list[Any]) -> list[Any]:
+    """One ORDER BY term's values, made comparable, decided for the TERM.
+
+    A `jsonb` column holds bare Python values, so `OVER (ORDER BY <jsonb>)` was
+    an `XX000` internal error. The choice cannot be made per value: keying only
+    the ones that fail to compare gives an order that is not even transitive,
+    because Python compares `False < 1` quite happily. So if ANY value in the
+    partition is structured, every value in it goes through Postgres' own total
+    order.
+
+    Returns bare values, not sort keys — these also serve as the PEER and frame
+    keys, where a RANGE offset does arithmetic on them."""
+    if any(isinstance(v, (Mapping, list)) for v in values):
+        return [None if v is None else typemap.total_order_key(v) for v in values]
+    return [typemap.sort_key_value(v) for v in values]
 
 
 def _null_key(v: Any) -> tuple[int, Any]:
