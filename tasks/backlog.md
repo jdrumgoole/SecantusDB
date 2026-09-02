@@ -7806,6 +7806,60 @@ shared storage engine or building large new protocol subsystems:
       year) have no strftime directive, so they are not handled;
       `IYYY` / `IW` / `ID` are. They would need computing rather than mapping.
 
+- [x] **RESOLVED (2026-09-02) — `to_char(numeric, …)` matched PG on 63 of 300
+      shapes.** A 30-template x 10-value sweep. Four rules were missing
+      outright: overflow prints `#` (a value too wide for the slots fills them
+      all — printing the number anyway violates the template's own declared
+      width); the SIGN sits against the digits, not in front of the padding;
+      a `0` slot zero-fills everything to its right; and an all-`9` integer
+      part renders BLANK when the value has none.
+
+      **The template never reached the numeric formatter intact.** sqlglot's
+      postgres dialect part-converts a `to_char` format to strftime at parse
+      time, so `MI999` arrives as `%M999` and `9999D99` as `9999%u99` — and the
+      numeric formatter silently dropped what it did not recognise, which is
+      why `D` produced no decimal point. `_recover_pg_format` (already used by
+      the interval path) undoes it. **Any format string read off a `TimeToStr`
+      node needs that recovery first.**
+
+      Now 300/300, `RN` Roman numerals included.
+
+      **A probe trap cost real time here**: the daemon on 27018 was not being
+      killed. `lsof -ti :27018` matches nothing on this box — the working form
+      is `lsof -nP -iTCP:27018`, or `pkill -f SecantusPGServer`. Two rounds of
+      "the fix does not work" were a stale daemon; the isolated function call
+      was right all along.
+
+      Six existing to_char expectations recorded THIS ENGINE's output rather
+      than PG's and were re-probed: FM drops trailing fractional zeros but
+      keeps the point, and `L` is the LOCALE currency symbol — empty under this
+      server's C locale, not `$`.
+
+      Pinned by `tests/test_sql_to_char_numeric.py` (60 cases vs PG 14.13).
+
+- [x] **RESOLVED (2026-09-02) — `IN (subquery)` in UPDATE / DELETE.**
+      `DELETE FROM t WHERE id IN (SELECT …)` was `0A000 IN (subquery) is not
+      supported` while the identical predicate in a SELECT has always worked.
+      The DML planners simply never published the `SubqueryCtx` that
+      `plan_pipeline_select` does; `_where_filter` already falls back to the
+      published one. `planner.dml_subquery_context` is the shared publisher.
+
+- [ ] **OPEN — `EXISTS (subquery)` in UPDATE / DELETE (2026-09-02).** Still
+      `0A000`. Unlike `IN`, `_expr_to_filter` refuses `exp.Exists` outright:
+      the SELECT path handles it as a RESIDUAL predicate evaluated per row, and
+      `UpdatePlan` / `DeletePlan` have no residual field. Needs one, plus the
+      executor filtering fetched docs through `scalar.evaluate` before the
+      write.
+
+- [ ] **OPEN — `UPDATE … FROM (VALUES …)` (2026-09-02).**
+      `UPDATE t SET n = s.x FROM (VALUES (1,111)) AS s(k,x) WHERE t.id = s.k`
+      is `0A000 unsupported MERGE source: …` — a message naming MERGE for a
+      statement the user wrote as an UPDATE. `UPDATE … FROM <table>` works.
+
+- [ ] **OPEN — `string_agg` / `array_agg` with DISTINCT (2026-09-02).**
+      `0A000 unsupported aggregate argument: DISTINCT t`. `count` / `sum` /
+      `avg` accept DISTINCT; the push-based aggregates do not.
+
 - [ ] **OPEN — arithmetic in a WHERE clause is still unchecked (2026-09-02).**
       `SELECT * FROM t WHERE i + 1 > 0` returns rows where PG raises `22003`.
       The predicate lowers to a Mongo `$expr` (`planner._to_agg_expr` /

@@ -3876,6 +3876,26 @@ def _composite_subfield_target(target: exp.Expression, table: TableDef):
     return comp_col, subfield, match[1], match[2]
 
 
+@contextlib.contextmanager
+def dml_subquery_context(storage: Any, db: str, catalog: Any, session: Any = None) -> Any:
+    """Publish the WHERE-subquery context for an UPDATE / DELETE.
+
+    A `SELECT … WHERE id IN (SELECT …)` has always worked, because
+    `plan_pipeline_select` publishes a `SubqueryCtx` that `_where_filter` picks
+    up. The UPDATE and DELETE planners published nothing, so the identical
+    predicate was `0A000 IN (subquery) is not supported` — one of the more
+    ordinary shapes in SQL. `EXISTS` was refused the same way."""
+    if session is None:
+        session = getattr(_pipeline_subctx.get(), "session", None)
+    token = _pipeline_subctx.set(
+        SubqueryCtx(storage=storage, db=db, catalog=catalog, session=session)
+    )
+    try:
+        yield
+    finally:
+        _pipeline_subctx.reset(token)
+
+
 def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
     set_doc: dict[str, Any] = {}
     # Companion fields to remove — see the invariant in `secantus.sql.subms`.

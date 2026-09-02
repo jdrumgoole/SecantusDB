@@ -2704,7 +2704,10 @@ def _run_statement(
             storage,
             planner.written_table_name(_t),
         )
-        plan = planner.plan_update(stmt, table)
+        # A WHERE subquery needs the same context the SELECT planner publishes;
+        # without it `UPDATE … WHERE id IN (SELECT …)` was 0A000.
+        with planner.dml_subquery_context(storage, db, catalog, session):
+            plan = planner.plan_update(stmt, table)
         plan.check_option = check_pred
         return executor.execute_update(plan, storage, db, catalog, session)
 
@@ -2721,9 +2724,9 @@ def _run_statement(
             storage,
             planner.written_table_name(_t),
         )
-        return executor.execute_delete(
-            planner.plan_delete(stmt, table), storage, db, catalog, session
-        )
+        with planner.dml_subquery_context(storage, db, catalog, session):
+            delete_plan = planner.plan_delete(stmt, table)
+        return executor.execute_delete(delete_plan, storage, db, catalog, session)
 
     if isinstance(stmt, exp.Merge):
         return _run_merge(stmt, storage, db, catalog, session)
