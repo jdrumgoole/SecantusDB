@@ -4287,7 +4287,17 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `$setEquals` each behave differently from their own families, and generalising
   either rule cost 46 shapes before the probe caught it. Probe per operator.
 
-- [ ] **The same probe against the RUST server: 1,376 of 3,968 (2026-09-02).**
+- [ ] **The same probe against the RUST server: 981 of 3,968 (2026-09-02).**
+  Was 1,376; the parse pass below took out the systematic half. **946 of the
+  981 are `Fallback::Defer`** -- the engine declining a bad ARGUMENT rather than
+  naming mongod's error, which on the standalone server is "operator not
+  supported" for what is a bad operand. Spread across ~120 operators and driven
+  by the operand TYPE (`Decimal128("2.5")` 110 shapes, `1.5` 72, `"abc"` 69,
+  `""` 69, `1099511627776` 65), so it is a per-operator campaign of the same
+  shape as the `operator_error_surface` one that went 583 -> 0, not another
+  systematic pass. Zero wrong VALUES throughout.
+
+  Original entry, for the record: **1,376 of 3,968 (2026-09-02).**
   Measured for the first time by pointing `agg_expressions.py` at the Rust
   server, which nobody had done. **Zero wrong VALUES** — the surface is entirely
   error-shaped, and most of it is one message: "aggregation pipeline uses a
