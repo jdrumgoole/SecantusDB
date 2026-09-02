@@ -1098,3 +1098,123 @@ fn a_dates_hyphen_is_not_an_offset() {
         "2026-01-01 00:00:00+00"
     );
 }
+
+/// Interval literals in every shape PostgreSQL accepts, rendered back the way
+/// it renders them. Each pair was measured against PostgreSQL 14.
+#[test]
+fn interval_literals_round_trip() {
+    for (literal, want) in [
+        ("1 day", "1 day"),
+        ("1 day 02:03:04", "1 day 02:03:04"),
+        ("1d 3h 4m 5.678s", "1 day 03:04:05.678"),
+        ("1 year 2 months", "1 year 2 mons"),
+        ("P1Y2M3D", "1 year 2 mons 3 days"),
+        ("PT1H2M3S", "01:02:03"),
+        ("1 mon -1 day", "1 mon -1 days"),
+        ("1.5 days", "1 day 12:00:00"),
+        ("1 week", "7 days"),
+        ("12 mons", "1 year"),
+        ("13 mons", "1 year 1 mon"),
+        ("0", "00:00:00"),
+        // An interval's time part may exceed 24 hours; it is not a clock.
+        ("25:00:00", "25:00:00"),
+        ("0.5 sec", "00:00:00.5"),
+        ("500 ms", "00:00:00.5"),
+        ("1000 us", "00:00:00.001"),
+        ("2 hrs 30 mins", "02:30:00"),
+        // Negative values pluralise, which reads like a typo and is what
+        // PostgreSQL emits.
+        ("-1 day", "-1 days"),
+        ("-1 mon", "-1 mons"),
+        ("-13 mons", "-1 years -1 mons"),
+        ("-1.5 hours", "-01:30:00"),
+        // Independent signs: a positive day and a negative time.
+        ("1 day -02:03:04", "1 day -02:03:04"),
+    ] {
+        let iv = super::parse_interval(literal).unwrap_or_else(|e| panic!("{literal}: {e:?}"));
+        assert_eq!(super::render_interval(&iv), want, "for {literal}");
+    }
+}
+
+/// Stripping a plural `s` from a unit must not eat the unit itself.
+///
+/// `trim_end_matches('s')` turned `s` (seconds) into the empty string and `ms`
+/// (milliseconds) into `m` (minutes) — a factor of sixty thousand, and silent.
+#[test]
+fn interval_units_survive_depluralisation() {
+    let us = |lit: &str| super::parse_interval(lit).expect("parses").micros;
+    assert_eq!(us("5s"), 5_000_000);
+    assert_eq!(us("5 s"), 5_000_000);
+    assert_eq!(us("5 secs"), 5_000_000);
+    assert_eq!(us("5 ms"), 5_000);
+    assert_eq!(us("5 m"), 5 * 60_000_000);
+    assert_eq!(us("5 mins"), 5 * 60_000_000);
+    assert_eq!(us("5 us"), 5);
+}
+
+/// Intervals compare FLATTENED — 30-day months, 24-hour days — even though
+/// they are stored as three parts. Probed: `'1 mon' = '30 days'` is true.
+#[test]
+fn intervals_compare_flattened() {
+    let iv = |s: &str| super::parse_interval(s).expect("parses").to_bson();
+    use std::cmp::Ordering;
+    assert_eq!(
+        super::compare_constants(&iv("1 day"), &iv("24:00:00")),
+        Some(Ordering::Equal)
+    );
+    assert_eq!(
+        super::compare_constants(&iv("1 mon"), &iv("30 days")),
+        Some(Ordering::Equal)
+    );
+    assert_eq!(
+        super::compare_constants(&iv("1 day"), &iv("25:00:00")),
+        Some(Ordering::Less)
+    );
+    assert_eq!(
+        super::compare_constants(&iv("1 day"), &iv("1 hour")),
+        Some(Ordering::Greater)
+    );
+}
+
+/// Adding months CLAMPS to the end of the target month, and that is why an
+/// interval cannot be flattened for arithmetic: January 31st plus one month is
+/// February 28th, which no number of microseconds expresses.
+#[test]
+fn adding_months_clamps_to_the_month_end() {
+    let at = |t: &str| super::parse_timestamp(t).expect("parses");
+    let add = |t: &str, i: &str| {
+        let iv = super::parse_interval(i).expect("parses");
+        super::render_timestamp(super::add_interval_to_micros(at(t), &iv, 1).expect("in range"))
+    };
+    assert_eq!(add("2026-01-31 00:00:00", "1 mon"), "2026-02-28 00:00:00");
+    assert_eq!(add("2026-01-31 00:00:00", "2 mons"), "2026-03-31 00:00:00");
+    assert_eq!(add("2024-02-29 00:00:00", "1 year"), "2025-02-28 00:00:00");
+    // Days and time are added AFTER the month shift, and are exact.
+    assert_eq!(
+        add("2026-01-01 00:00:00", "1d 3h 4m 5.678s"),
+        "2026-01-02 03:04:05.678"
+    );
+}
+
+/// Scaling an interval spills fractions DOWNWARD — months into days, days into
+/// time — because a fraction of a month has no calendar meaning even though a
+/// whole one does. `'1 mon' * 1.5` is `1 mon 15 days`, not `1.5 mons`.
+#[test]
+fn scaling_an_interval_spills_downward() {
+    let scale = |lit: &str, op: &str, n: Bson| {
+        let iv = super::parse_interval(lit).expect("parses").to_bson();
+        let out = super::eval_binary(op, iv, n).expect("scales");
+        super::render_interval(&Interval::from_bson(&out).expect("an interval"))
+    };
+    assert_eq!(scale("1 day", "*", Bson::Int32(2)), "2 days");
+    assert_eq!(scale("1 day", "*", Bson::Double(0.5)), "12:00:00");
+    assert_eq!(scale("1 mon", "*", Bson::Double(1.5)), "1 mon 15 days");
+    assert_eq!(scale("1 year", "*", Bson::Double(0.5)), "6 mons");
+    assert_eq!(scale("1 day", "/", Bson::Int32(2)), "12:00:00");
+    assert_eq!(scale("1 mon 1 day", "*", Bson::Int32(2)), "2 mons 2 days");
+
+    // Dividing by zero is an error, not an infinity.
+    let iv = super::parse_interval("1 day").expect("parses").to_bson();
+    let err = super::eval_binary("/", iv, Bson::Int32(0)).expect_err("div by zero");
+    assert_eq!(err.sqlstate(), "22012");
+}

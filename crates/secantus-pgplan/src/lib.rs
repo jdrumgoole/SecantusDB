@@ -1080,6 +1080,7 @@ pub fn display_type(internal: &str) -> String {
         "timestamp" => "timestamp without time zone",
         "timestamptz" => "timestamp with time zone",
         "timetz" => "time with time zone",
+        "interval" => "interval",
         // A bare NULL literal has no type yet: PostgreSQL calls it `unknown`,
         // and resolves it from context when there is any.
         "unknown" => "unknown",
@@ -1605,6 +1606,365 @@ fn parse_timetz(text: &str, tz: &TimeZoneSetting) -> Result<String> {
     Ok(format!("{time}{}", render_offset(seconds)))
 }
 
+/// PostgreSQL's `interval`: three INDEPENDENT components.
+///
+/// Months, days and microseconds are stored separately because they are not
+/// convertible without a calendar. A month is 28-31 days depending on where you
+/// start, and a day is 23, 24 or 25 hours across a DST boundary — so
+/// `'1 mon'` added to January 31st lands on February 28th, and no fixed number
+/// of microseconds expresses that.
+///
+/// COMPARISON, on the other hand, does flatten them: PostgreSQL answers true
+/// for `'1 day' = '24:00:00'` and for `'1 mon' = '30 days'`, using 30-day
+/// months and 24-hour days. So ordering and equality go through
+/// `comparable_micros` while arithmetic keeps the parts apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Interval {
+    pub months: i32,
+    pub days: i32,
+    pub micros: i64,
+}
+
+/// Marker keys for an interval carried as a BSON value. The composite shape
+/// follows the one a sub-millisecond timestamp already uses.
+pub const INTERVAL_MONTHS: &str = "__ivl_mon";
+pub const INTERVAL_DAYS: &str = "__ivl_day";
+pub const INTERVAL_MICROS: &str = "__ivl_us";
+
+impl Interval {
+    /// The value ordering and equality use: 30-day months, 24-hour days.
+    /// Probed — `'1 mon'::interval = '30 days'::interval` is true.
+    pub fn comparable_micros(&self) -> i128 {
+        const DAY: i128 = 86_400 * 1_000_000;
+        i128::from(self.months) * 30 * DAY + i128::from(self.days) * DAY + i128::from(self.micros)
+    }
+
+    pub fn to_bson(self) -> Bson {
+        Bson::Document(bson::doc! {
+            INTERVAL_MONTHS: self.months,
+            INTERVAL_DAYS: self.days,
+            INTERVAL_MICROS: self.micros,
+        })
+    }
+
+    pub fn from_bson(v: &Bson) -> Option<Interval> {
+        let Bson::Document(d) = v else { return None };
+        if !d.contains_key(INTERVAL_MONTHS) {
+            return None;
+        }
+        Some(Interval {
+            months: d.get(INTERVAL_MONTHS).and_then(|x| x.as_i32())?,
+            days: d.get(INTERVAL_DAYS).and_then(|x| x.as_i32())?,
+            micros: d.get(INTERVAL_MICROS).and_then(|x| match x {
+                Bson::Int64(v) => Some(*v),
+                Bson::Int32(v) => Some(i64::from(*v)),
+                _ => None,
+            })?,
+        })
+    }
+}
+
+/// Render an interval the way PostgreSQL's default `IntervalStyle` does.
+///
+/// Months split into years and months; each part is pluralised when its value
+/// is not exactly 1 — so `-1 day` prints as `-1 days`, which looks like a typo
+/// and is what PostgreSQL emits. The time part is `HH:MM:SS`, zero-padded, with
+/// hours allowed past 24 (`'25:00:00'` is a valid interval), a trimmed
+/// fraction, and its own sign. A wholly zero interval is `00:00:00`.
+pub fn render_interval(iv: &Interval) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let (years, months) = (iv.months / 12, iv.months % 12);
+    let unit = |n: i32, singular: &str| {
+        if n == 1 {
+            format!("{n} {singular}")
+        } else {
+            format!("{n} {singular}s")
+        }
+    };
+    if years != 0 {
+        parts.push(unit(years, "year"));
+    }
+    if months != 0 {
+        parts.push(unit(months, "mon"));
+    }
+    if iv.days != 0 {
+        parts.push(unit(iv.days, "day"));
+    }
+    if iv.micros != 0 || parts.is_empty() {
+        let neg = iv.micros < 0;
+        let a = iv.micros.unsigned_abs();
+        let (h, m, sec, frac) = (
+            a / 3_600_000_000,
+            (a % 3_600_000_000) / 60_000_000,
+            (a % 60_000_000) / 1_000_000,
+            a % 1_000_000,
+        );
+        let mut t = format!("{}{h:02}:{m:02}:{sec:02}", if neg { "-" } else { "" });
+        if frac != 0 {
+            t.push('.');
+            t.push_str(format!("{frac:06}").trim_end_matches('0'));
+        }
+        parts.push(t);
+    }
+    parts.join(" ")
+}
+
+/// An interval VALUE as its canonical text, when the value is one.
+pub fn interval_value_text(v: &Bson) -> Option<String> {
+    Interval::from_bson(v).map(|iv| render_interval(&iv))
+}
+
+/// Parse a PostgreSQL interval literal.
+///
+/// Three input shapes all reach here: the verbose form (`1 year 2 months`,
+/// with the abbreviations `y` / `mon` / `d` / `h` / `m` / `s` and a `week` that
+/// becomes 7 days), a bare time (`02:03:04.5`, which may carry its own sign and
+/// may exceed 24 hours), and ISO 8601 (`P1Y2M3D`, `PT1H2M3S`). They can be
+/// combined — `1 day -02:03:04` is a positive day and a negative time, which is
+/// why the components keep independent signs.
+fn parse_interval(text: &str) -> Result<Interval> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Err(bad_interval(text));
+    }
+    if let Some(rest) = t.strip_prefix(['P', 'p']) {
+        return parse_iso_interval(rest, text);
+    }
+    let mut iv = Interval::default();
+    let mut pending: Option<f64> = None;
+    let mut saw_any = false;
+
+    for token in t.split_whitespace() {
+        // A `HH:MM:SS` chunk, possibly signed.
+        if token.contains(':') {
+            let (sign, body) = match token.strip_prefix('-') {
+                Some(b) => (-1i64, b),
+                None => (1i64, token.strip_prefix('+').unwrap_or(token)),
+            };
+            let mut it = body.split(':');
+            let h: i64 = it
+                .next()
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| bad_interval(text))?;
+            let m: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let secs: f64 = it
+                .next()
+                .map_or(Ok(0.0), |v| v.parse::<f64>())
+                .map_err(|_| bad_interval(text))?;
+            if it.next().is_some() {
+                return Err(bad_interval(text));
+            }
+            iv.micros +=
+                sign * (h * 3_600_000_000 + m * 60_000_000 + (secs * 1_000_000.0).round() as i64);
+            saw_any = true;
+            continue;
+        }
+        // A number, or a number glued to its unit (`1d`, `3h`).
+        let split = token
+            .char_indices()
+            .find(|(_, c)| c.is_ascii_alphabetic())
+            .map(|(i, _)| i);
+        match split {
+            Some(0) => {
+                // A bare unit, applying to the number before it.
+                let n = pending.take().ok_or_else(|| bad_interval(text))?;
+                apply_interval_unit(&mut iv, n, token, text)?;
+                saw_any = true;
+            }
+            Some(i) => {
+                let n: f64 = token[..i].parse().map_err(|_| bad_interval(text))?;
+                if pending.is_some() {
+                    return Err(bad_interval(text));
+                }
+                apply_interval_unit(&mut iv, n, &token[i..], text)?;
+                saw_any = true;
+            }
+            None => {
+                if pending.is_some() {
+                    return Err(bad_interval(text));
+                }
+                pending = Some(token.parse().map_err(|_| bad_interval(text))?);
+            }
+        }
+    }
+    // A trailing bare number is seconds: `'1'::interval` is one second.
+    if let Some(n) = pending {
+        iv.micros += (n * 1_000_000.0).round() as i64;
+        saw_any = true;
+    }
+    if !saw_any {
+        return Err(bad_interval(text));
+    }
+    Ok(iv)
+}
+
+/// The unit spellings an interval literal may use, singular form.
+fn is_interval_unit(u: &str) -> bool {
+    matches!(
+        u,
+        "y" | "yr"
+            | "year"
+            | "mon"
+            | "month"
+            | "d"
+            | "day"
+            | "w"
+            | "week"
+            | "h"
+            | "hr"
+            | "hour"
+            | "m"
+            | "min"
+            | "minute"
+            | "s"
+            | "sec"
+            | "second"
+            | "ms"
+            | "msec"
+            | "millisecond"
+            | "us"
+            | "usec"
+            | "microsecond"
+    )
+}
+
+/// Add `n` of a named unit. A FRACTIONAL month or year spills into days and
+/// time the way PostgreSQL does (`1.5 days` is `1 day 12:00:00`), using 30-day
+/// months, because a fraction of a month has no calendar meaning.
+fn apply_interval_unit(iv: &mut Interval, n: f64, unit: &str, text: &str) -> Result<()> {
+    // Strip a plural `s` only when what remains is still a unit. Stripping it
+    // unconditionally destroyed `s` (seconds) itself, and turned `ms`
+    // (milliseconds) into `m` (minutes) -- a factor of 60,000.
+    let lower = unit.to_ascii_lowercase();
+    let u = if is_interval_unit(&lower) {
+        lower
+    } else {
+        let singular = lower.trim_end_matches('s').to_string();
+        if is_interval_unit(&singular) {
+            singular
+        } else {
+            lower
+        }
+    };
+    let months_per = match u.as_str() {
+        "y" | "yr" | "year" => Some(12.0),
+        "mon" | "month" => Some(1.0),
+        _ => None,
+    };
+    if let Some(per) = months_per {
+        let total = n * per;
+        iv.months += total.trunc() as i32;
+        let rest_months = total.fract();
+        // A leftover fraction of a month becomes days at 30 days per month.
+        let days = rest_months * 30.0;
+        iv.days += days.trunc() as i32;
+        iv.micros += (days.fract() * 86_400_000_000.0).round() as i64;
+        return Ok(());
+    }
+    let micros_per: f64 = match u.as_str() {
+        "d" | "day" => {
+            iv.days += n.trunc() as i32;
+            iv.micros += (n.fract() * 86_400_000_000.0).round() as i64;
+            return Ok(());
+        }
+        "w" | "week" => {
+            let days = n * 7.0;
+            iv.days += days.trunc() as i32;
+            iv.micros += (days.fract() * 86_400_000_000.0).round() as i64;
+            return Ok(());
+        }
+        "h" | "hr" | "hour" => 3_600_000_000.0,
+        "m" | "min" | "minute" => 60_000_000.0,
+        "s" | "sec" | "second" => 1_000_000.0,
+        "ms" | "msec" | "millisecond" => 1_000.0,
+        "us" | "usec" | "microsecond" => 1.0,
+        _ => return Err(bad_interval(text)),
+    };
+    iv.micros += (n * micros_per).round() as i64;
+    Ok(())
+}
+
+/// ISO 8601 durations: `P1Y2M3D`, `PT1H2M3S`, `P1DT2H`. `M` before the `T` is
+/// months and after it is minutes, which is the whole reason the `T` is there.
+fn parse_iso_interval(rest: &str, text: &str) -> Result<Interval> {
+    let mut iv = Interval::default();
+    let mut in_time = false;
+    let mut number = String::new();
+    for c in rest.chars() {
+        if c == 'T' || c == 't' {
+            in_time = true;
+            continue;
+        }
+        if c.is_ascii_digit() || c == '.' || c == '-' || c == '+' {
+            number.push(c);
+            continue;
+        }
+        let n: f64 = number.parse().map_err(|_| bad_interval(text))?;
+        number.clear();
+        let unit = match (c.to_ascii_uppercase(), in_time) {
+            ('Y', _) => "year",
+            ('M', false) => "mon",
+            ('M', true) => "min",
+            ('W', _) => "week",
+            ('D', _) => "day",
+            ('H', _) => "hour",
+            ('S', _) => "sec",
+            _ => return Err(bad_interval(text)),
+        };
+        apply_interval_unit(&mut iv, n, unit, text)?;
+    }
+    if !number.is_empty() {
+        return Err(bad_interval(text));
+    }
+    Ok(iv)
+}
+
+fn bad_interval(text: &str) -> Error {
+    Error::InvalidDatetimeFormat(format!(
+        "invalid input syntax for type interval: \"{}\"",
+        text.trim()
+    ))
+}
+
+/// Add an interval to an instant, in PostgreSQL's order: months first (with
+/// end-of-month CLAMPING, so January 31st plus one month is February 28th),
+/// then whole days, then the time.
+///
+/// The order matters and the clamping is not arithmetic: `2026-01-31 + 1 mon`
+/// cannot be February 31st, so PostgreSQL takes the last day of the target
+/// month. Probed.
+pub fn add_interval_to_micros(micros: i64, iv: &Interval, sign: i64) -> Option<i64> {
+    use chrono::Datelike;
+    let base = chrono::DateTime::from_timestamp_micros(micros)?.naive_utc();
+    let months = i64::from(iv.months) * sign;
+    let shifted = if months == 0 {
+        base
+    } else {
+        let total = i64::from(base.year()) * 12 + i64::from(base.month0()) + months;
+        let (y, m0) = (total.div_euclid(12), total.rem_euclid(12));
+        let year = i32::try_from(y).ok()?;
+        let month = u32::try_from(m0).ok()? + 1;
+        let last = last_day_of_month(year, month);
+        let day = base.day().min(last);
+        chrono::NaiveDate::from_ymd_opt(year, month, day)?.and_time(base.time())
+    };
+    let out = shifted.and_utc().timestamp_micros()
+        + sign * (i64::from(iv.days) * 86_400_000_000 + iv.micros);
+    Some(out)
+}
+
+fn last_day_of_month(year: i32, month: u32) -> u32 {
+    let (ny, nm) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    chrono::NaiveDate::from_ymd_opt(ny, nm, 1)
+        .and_then(|d| d.pred_opt())
+        .map(|d| chrono::Datelike::day(&d))
+        .unwrap_or(28)
+}
+
 /// Days since 2000-01-01 as PostgreSQL's `date` text.
 ///
 /// PostgreSQL's binary `date` is a day count from 2000-01-01, not from the Unix
@@ -1899,6 +2259,9 @@ fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         Bson::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
         // Decimal128's own rendering keeps the scale (`1.50`, not `1.5`).
         Bson::Decimal128(d) => d.to_string(),
+        Bson::Document(_) if Interval::from_bson(v).is_some() => {
+            render_interval(&Interval::from_bson(v).expect("checked"))
+        }
         Bson::Array(items) => render_array(items),
         other => format!("{other:?}"),
     };
@@ -2004,6 +2367,10 @@ fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         // `integer`. Only the naming is reproduced here; a regtype is really an
         // oid, and this server has no `pg_type` to resolve one against.
         "regtype" => Ok(Bson::String(display_type(as_text(&value).trim()))),
+        "interval" => match Interval::from_bson(&value) {
+            Some(iv) => Ok(iv.to_bson()),
+            None => Ok(parse_interval(&as_text(&value))?.to_bson()),
+        },
         // `date` and `time` are stored as their canonical TEXT, matching what
         // the Python server writes -- the two servers share one store, so the
         // representation is a contract, not an implementation choice.
@@ -2054,6 +2421,69 @@ fn cast_value(value: Bson, target: &str) -> Result<Bson> {
 /// double would give the right value with the wrong declared type, which is the
 /// bug class that made `$1::int` decode as a string. Explicit `::float8` casts
 /// work, because then the type IS float8.
+/// The instant behind a value that names one: a BSON date, the sub-millisecond
+/// composite, or the canonical text a date / timestamp / timestamptz is stored
+/// as. Returns `None` for anything that is not a moment in time.
+fn instant_micros(v: &Bson) -> Option<i64> {
+    match v {
+        Bson::DateTime(d) => Some(d.timestamp_millis() * 1000),
+        Bson::Document(doc) if doc.contains_key(COMPOSITE_DATE) => {
+            let ms = match doc.get(COMPOSITE_DATE) {
+                Some(Bson::DateTime(d)) => d.timestamp_millis(),
+                _ => return None,
+            };
+            let us = doc.get(COMPOSITE_US).and_then(|x| x.as_i32()).unwrap_or(0);
+            Some(ms * 1000 + i64::from(us))
+        }
+        Bson::String(t) => {
+            let (body, offset) = split_trailing_offset(t);
+            let naive = parse_timestamp(&body).ok()?;
+            Some(naive - i64::from(offset.unwrap_or(0)) * 1_000_000)
+        }
+        _ => None,
+    }
+}
+
+/// Coerce a bare unknown literal that sits beside an interval.
+///
+/// PostgreSQL resolves an `unknown` literal to the OTHER operand's type before
+/// it chooses an operator, so the interval decides both the parse and the
+/// error. `+` and `-` only: for `*` and `/` PostgreSQL picks a number instead,
+/// which is why `interval '1 day' * '2'` is two days.
+fn coerce_unknown_beside_interval(
+    e: &pg_query::protobuf::AExpr,
+    lhs: Bson,
+    rhs: Bson,
+    op: &str,
+) -> Result<(Bson, Bson)> {
+    if !matches!(op, "+" | "-") {
+        return Ok((lhs, rhs));
+    }
+    let bare_string = |n: Option<&Box<pg_query::protobuf::Node>>| {
+        matches!(
+            n.and_then(|x| x.node.as_ref()),
+            Some(N::AConst(c))
+                if matches!(c.val.as_ref(), Some(pg_query::protobuf::a_const::Val::Sval(_)))
+        )
+    };
+    let l_bare = bare_string(e.lexpr.as_ref());
+    let r_bare = bare_string(e.rexpr.as_ref());
+    let as_interval = |v: &Bson| -> Result<Bson> {
+        match v {
+            Bson::String(t) => Ok(parse_interval(t)?.to_bson()),
+            other => Ok(other.clone()),
+        }
+    };
+    if Interval::from_bson(&rhs).is_some() && l_bare {
+        return Ok((as_interval(&lhs)?, rhs));
+    }
+    if Interval::from_bson(&lhs).is_some() && r_bare {
+        let coerced = as_interval(&rhs)?;
+        return Ok((lhs, coerced));
+    }
+    Ok((lhs, rhs))
+}
+
 fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     // NULL propagates through every operator here (PG: `1 + NULL` is NULL).
     if lhs == Bson::Null || rhs == Bson::Null {
@@ -2070,6 +2500,73 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
             other => format!("{other:?}"),
         };
         return Ok(Bson::String(format!("{}{}", text(&lhs), text(&rhs))));
+    }
+
+    // Interval arithmetic, before the numeric paths: an interval is a
+    // Document, so it would otherwise fall through to "operator on these
+    // operands". Months are added FIRST and clamp to the end of the month --
+    // `2026-01-31 + '1 mon'` is `2026-02-28`, which no amount of microseconds
+    // could express, and is why an interval keeps three parts.
+    if matches!(op, "+" | "-") {
+        let sign = if op == "-" { -1 } else { 1 };
+        match (Interval::from_bson(&lhs), Interval::from_bson(&rhs)) {
+            (Some(a), Some(b)) => {
+                return Ok(Interval {
+                    months: a.months + sign as i32 * b.months,
+                    days: a.days + sign as i32 * b.days,
+                    micros: a.micros + sign * b.micros,
+                }
+                .to_bson());
+            }
+            (None, Some(iv)) => {
+                // <instant or date or timestamp text> +/- interval.
+                if let Some(micros) = instant_micros(&lhs) {
+                    let out = add_interval_to_micros(micros, &iv, sign).ok_or_else(|| {
+                        Error::DatetimeFieldOverflow("timestamp out of range".to_string())
+                    })?;
+                    return Ok(Bson::String(render_timestamp(out)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Scaling an interval by a number, in either order. A fractional result
+    // SPILLS DOWNWARD -- `'1 mon' * 1.5` is `1 mon 15 days`, not 1.5 months --
+    // using 30-day months and 24-hour days, because a fraction of a month has
+    // no calendar meaning even though a whole one does.
+    if matches!(op, "*" | "/") {
+        let numeric = |v: &Bson| match v {
+            Bson::Int32(i) => Some(f64::from(*i)),
+            Bson::Int64(i) => Some(*i as f64),
+            Bson::Double(d) => Some(*d),
+            Bson::Decimal128(d) => d.to_string().parse::<f64>().ok(),
+            _ => None,
+        };
+        let scaled = match (Interval::from_bson(&lhs), Interval::from_bson(&rhs)) {
+            (Some(iv), None) => numeric(&rhs).map(|f| (iv, f)),
+            // `2 * interval '1 day'` is the same interval; division is not
+            // commutative, so a number DIVIDED BY an interval is not defined.
+            (None, Some(iv)) if op == "*" => numeric(&lhs).map(|f| (iv, f)),
+            _ => None,
+        };
+        if let Some((iv, factor)) = scaled {
+            if op == "/" && factor == 0.0 {
+                return Err(Error::DivisionByZero);
+            }
+            let f = if op == "/" { 1.0 / factor } else { factor };
+            let months = f64::from(iv.months) * f;
+            let whole_months = months.trunc();
+            let days = f64::from(iv.days) * f + (months - whole_months) * 30.0;
+            let whole_days = days.trunc();
+            let micros = iv.micros as f64 * f + (days - whole_days) * 86_400_000_000.0;
+            return Ok(Interval {
+                months: whole_months as i32,
+                days: whole_days as i32,
+                micros: micros.round() as i64,
+            }
+            .to_bson());
+        }
     }
 
     if matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
@@ -2183,6 +2680,17 @@ fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
             Some(x.len().cmp(&y.len()))
         }
         (Bson::Boolean(x), Bson::Boolean(y)) => Some(x.cmp(y)),
+        // Intervals compare FLATTENED -- 30-day months, 24-hour days -- even
+        // though they are stored as three independent parts for arithmetic.
+        (Bson::Document(_), Bson::Document(_))
+            if Interval::from_bson(a).is_some() && Interval::from_bson(b).is_some() =>
+        {
+            Some(
+                Interval::from_bson(a)?
+                    .comparable_micros()
+                    .cmp(&Interval::from_bson(b)?.comparable_micros()),
+            )
+        }
         _ => {
             let f = |v: &Bson| match v {
                 Bson::Int32(i) => Some(f64::from(*i)),
@@ -2541,6 +3049,14 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 _ => return Err(Error::Unsupported(format!("unary {op}"))),
             },
         };
+        // Beside an interval, a bare UNKNOWN literal coerces to an interval --
+        // not to a timestamp. `'2020-01-01' + interval '1 day'` is therefore
+        // 22007 in PostgreSQL, not date arithmetic, and `'1 day' + interval
+        // '1 day'` is `2 days`. A TYPED operand (a `::date` cast, a column) is
+        // untouched and keeps datetime arithmetic, which is why this is decided
+        // on the NODE: after casting, a date is a string here too, so the value
+        // alone cannot tell a literal from a date.
+        let (lhs, rhs) = coerce_unknown_beside_interval(e, lhs, rhs, &op)?;
         return eval_binary(&op, lhs, rhs);
     }
     if let Some(N::ParamRef(p)) = node.node.as_ref() {

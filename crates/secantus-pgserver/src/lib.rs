@@ -225,6 +225,7 @@ fn wire_type(pg_type: &str) -> Type {
         // where 1114 builds a naive one from the same characters.
         "timestamptz" => Type::TIMESTAMPTZ,
         "timetz" => Type::TIMETZ,
+        "interval" => Type::INTERVAL,
         "numeric" | "decimal" => Type::NUMERIC,
         // `pg_typeof` answers a `regtype` (2206), not text: a client reading
         // 25 would print the same characters but compare unequal to a regtype.
@@ -1014,6 +1015,10 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
         if let Some(text) = secantus_pgplan::timestamp_value_text(value) {
             return enc.encode_field(&Some(text.as_str()));
         }
+        // An interval is three parts in a document; the wire wants its text.
+        if let Some(text) = secantus_pgplan::interval_value_text(value) {
+            return enc.encode_field(&Some(text.as_str()));
+        }
     }
     match v {
         Some(Bson::Int32(x)) => enc.encode_field(&Some(*x)),
@@ -1481,6 +1486,20 @@ fn decode_parameter(
                 let us = i64::from_be_bytes(bytes[..8].try_into().expect("checked"));
                 let west = i32::from_be_bytes(bytes[8..12].try_into().expect("checked"));
                 Ok(Bson::String(secantus_pgplan::render_timetz(us, -west)))
+            }
+            // `interval`: 8 bytes of microseconds, then days, then months --
+            // three parts on the wire for the same reason they are three parts
+            // in the value, since neither converts without a calendar.
+            Some(1186) if bytes.len() == 16 => {
+                let micros = i64::from_be_bytes(bytes[..8].try_into().expect("checked"));
+                let days = i32::from_be_bytes(bytes[8..12].try_into().expect("checked"));
+                let months = i32::from_be_bytes(bytes[12..16].try_into().expect("checked"));
+                Ok(secantus_pgplan::Interval {
+                    months,
+                    days,
+                    micros,
+                }
+                .to_bson())
             }
             Some(1114) if bytes.len() == 8 => Ok(Bson::String(
                 secantus_pgplan::render_timestamp_from_pg_micros(i64::from_be_bytes(

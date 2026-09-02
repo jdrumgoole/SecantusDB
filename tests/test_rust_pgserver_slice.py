@@ -985,3 +985,61 @@ def test_timestamptz_columns_are_refused_not_silently_wrong(home: Path) -> None:
         cur.execute("create table v (id int primary key, ts timestamp)")
         cur.execute("select '2026-01-01 12:00'::timestamptz::text")
         assert cur.fetchone()[0] == "2026-01-01 12:00:00+00"
+
+
+def test_interval_keeps_three_independent_parts(home: Path) -> None:
+    """An interval is months, days and microseconds — separately.
+
+    They cannot be collapsed into one number because a month is 28–31 days
+    depending on where you start: `2026-01-31 + '1 mon'` is `2026-02-28`, which
+    no fixed count of microseconds expresses. Comparison, by contrast, *does*
+    flatten them (30-day months, 24-hour days), so `'1 mon' = '30 days'` is
+    true while `+ '1 mon'` and `+ '30 days'` land on different dates.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+
+        cur.execute("select '1d 3h 4m 5.678s'::interval::text")
+        assert cur.fetchone()[0] == "1 day 03:04:05.678"
+        cur.execute("select 'P1Y2M3D'::interval::text")
+        assert cur.fetchone()[0] == "1 year 2 mons 3 days"
+        # A negative value pluralises — this is PostgreSQL's own spelling.
+        cur.execute("select '-1 day'::interval::text")
+        assert cur.fetchone()[0] == "-1 days"
+        # The time part is not a clock and may pass 24 hours.
+        cur.execute("select '25:00:00'::interval::text")
+        assert cur.fetchone()[0] == "25:00:00"
+
+        # Units that end in `s` are not plurals of something shorter.
+        cur.execute("select '500 ms'::interval::text, '5 s'::interval::text")
+        assert cur.fetchone() == ("00:00:00.5", "00:00:05")
+
+        cur.execute("select '1 mon'::interval = '30 days'::interval")
+        assert cur.fetchone()[0] is True
+        cur.execute("select ('2026-01-31'::timestamp + '1 mon'::interval)::text")
+        assert cur.fetchone()[0] == "2026-02-28 00:00:00"
+        cur.execute("select ('2026-01-31'::timestamp + '30 days'::interval)::text")
+        assert cur.fetchone()[0] == "2026-03-02 00:00:00"
+
+        cur.execute("select pg_typeof('1 day'::interval)::text")
+        assert cur.fetchone()[0] == "interval"
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+def test_bound_interval_round_trips(home: Path, binary: bool) -> None:
+    """A bound `timedelta` survives both wire formats.
+
+    The binary form is three parts too — microseconds, days, months — for the
+    same reason the value is.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        for value in (
+            dt.timedelta(days=1),
+            dt.timedelta(days=1, hours=2, minutes=3, seconds=4),
+            dt.timedelta(seconds=-1),
+            dt.timedelta(microseconds=500000),
+            dt.timedelta(0),
+        ):
+            cur = conn.cursor(binary=binary)
+            cur.execute("select %s::interval", (value,))
+            assert cur.fetchone()[0] == value
