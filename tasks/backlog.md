@@ -7757,19 +7757,54 @@ shared storage engine or building large new protocol subsystems:
 
       Pinned by `tests/test_sql_row_fetch_between.py` (35 cases vs PG 14.13).
 
-- [ ] **OPEN — the jsonb FUNCTION family (2026-09-02).** Ten shapes the second
-      sweep found and this batch did not take, four of them silently wrong:
-      `jsonb_set` / `jsonb_insert` are NO-OPS (`jsonb_set('{"a":1}','{b}','2')`
-      returns the input unchanged); `jsonb_strip_nulls` is a no-op;
-      `jsonb_build_array` and `json_agg` / `to_jsonb` of an array return a PG
-      ARRAY literal (`{1,x,t}`) instead of jsonb (`[1, "x", true]`);
-      `to_jsonb('x'::text)` gives `x` not `"x"`; `jsonb_pretty` returns the
-      input JSON-quoted; `jsonb_object_keys` yields insertion order where PG
-      yields storage order (shorter keys first, then bytewise);
-      `jsonb_typeof(j->'arr')` is `0A000 unsupported scalar expression` because
-      `->` is not accepted as a function ARGUMENT. Also
-      `string_agg(DISTINCT t, ',')` and `to_char`'s ISO-week tokens
-      (`IYYY`/`IW`/`ID`).
+- [x] **RESOLVED (2026-09-02) — the jsonb FUNCTION family.** Took the second
+      sweep from 29/44 to 43/44. Four were NO-OPS that looked like successes:
+      `jsonb_set('{"a":1}','{b}','2')` returned its input, as did
+      `jsonb_strip_nulls`. Both were implemented all along — they only worked
+      with an explicit `::jsonb` cast. **A bare literal is PG's `unknown`, and
+      a FUNCTION'S DECLARED PARAMETER TYPE is what resolves it**; here it
+      stayed a Python `str` and the navigation had nothing to walk.
+      `_as_jsonb_arg` is the coercion.
+
+      Rendering: a jsonb VALUE is an ordinary Python list / dict / str, so only
+      the CALL says `::text` should produce JSON — `_yields_json` now knows the
+      json-returning function names. For `json_agg` the call is not even
+      visible by then (its operand is a synthetic column), so the planner
+      stamps the cast.
+
+      `jsonb_object_keys` yields PG's STORAGE order — `(len(key), key)` —
+      while `json_object_keys` keeps the input's order and was right.
+
+      `jsonb_typeof(v->'arr')` was `0A000`: inside a call, `v -> 'arr'` parses
+      as an arrow-LAMBDA and only becomes `JSONExtract` when the left side is
+      something an identifier cannot be. **PG has no lambda syntax, so a
+      `Lambda` in a PG statement is always that misparse** — worth remembering
+      for any other `->` shape.
+
+      A regression of my own is fixed here too: the nested-`array_agg` batch
+      typed the registrar's output by ELEMENT, and `json_agg` / `jsonb_agg`
+      share that registrar, so they were typed `int4[]` instead of `json`.
+      `_is_true_array_agg` gates it — the docstring that says so was already
+      there.
+
+      Pinned by `tests/test_sql_jsonb_functions.py` (35 cases vs PG 14.13).
+
+- [ ] **OPEN — `string_agg(DISTINCT x, sep)` is unsupported (2026-09-02).**
+      `0A000 unsupported aggregate argument: DISTINCT t`. The last unmatched
+      shape in the second sweep.
+
+- [ ] **OPEN — `jsonb_agg(...)` inside a computed projection (2026-09-02).**
+      `jsonb_agg(i)` works alone; `jsonb_agg(i)::text` is
+      `0A000 function jsonb_agg() is not supported`. sqlglot models it as an
+      `Anonymous` call, and the aggregate collector walks
+      `find_all(exp.AggFunc)`, which never sees it. `json_agg` has a dedicated
+      node and is fine. Widening the collector to named anonymous aggregates
+      is the fix, with the regression risk that implies.
+
+- [ ] **OPEN — `to_char`'s truncated ISO tokens (2026-09-02).** `IYY` / `IY` /
+      `I` (the last 3 / 2 / 1 digits of the ISO year) and `IDDD` (ISO day of
+      year) have no strftime directive, so they are not handled;
+      `IYYY` / `IW` / `ID` are. They would need computing rather than mapping.
 
 - [ ] **OPEN — arithmetic in a WHERE clause is still unchecked (2026-09-02).**
       `SELECT * FROM t WHERE i + 1 > 0` returns rows where PG raises `22003`.

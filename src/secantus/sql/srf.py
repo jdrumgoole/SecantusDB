@@ -402,7 +402,17 @@ def _values_and_tag(
             return [None if v is None else str(v) for v in _as_json_list(val)], "text"
         if name in ("jsonb_object_keys", "json_object_keys"):
             doc = _as_json(val)
-            return (list(doc.keys()) if isinstance(doc, dict) else []), "text"
+            if not isinstance(doc, dict):
+                return [], "text"
+            keys = list(doc.keys())
+            if name == "jsonb_object_keys":
+                # `jsonb` yields its keys in STORAGE order — shorter first,
+                # then bytewise — while `json` keeps the input's own order and
+                # is right as it is. Both came back in insertion order, so
+                # `jsonb_object_keys('{"c":1,"aa":2,"b":3}')` gave `c, aa, b`
+                # where PG gives `b, c, aa` (probed on 14.13).
+                keys.sort(key=lambda k: (len(str(k)), str(k)))
+            return keys, "text"
         if name == "regexp_split_to_table":
             pattern = ev(args[1]) if len(args) > 1 else ""
             text = "" if val is None else str(val)

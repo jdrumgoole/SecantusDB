@@ -458,7 +458,29 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return _eval_typed_func(node, scope, ctx)
     if isinstance(node, (exp.Select, exp.Subquery)):
         return _eval_subquery(node, scope, ctx)
+    if isinstance(node, exp.Lambda):
+        # PostgreSQL has no lambda syntax, so a `Lambda` here is always a
+        # MISPARSE of the jsonb arrow: inside a function call, `v -> 'arr'`
+        # looks like `param -> body` to sqlglot's generic parser and only
+        # reaches `JSONExtract` when the left side is something an identifier
+        # cannot be (a cast, say). So `jsonb_typeof(v->'arr')` was
+        # `0A000 unsupported scalar expression` while
+        # `jsonb_typeof('…'::jsonb->'a')` worked.
+        rebuilt = _lambda_as_json_arrow(node)
+        if rebuilt is not None:
+            return evaluate(rebuilt, scope, ctx)
     raise errors.feature_not_supported(f"unsupported scalar expression: {node.sql()}")
+
+
+def _lambda_as_json_arrow(node: exp.Expression) -> exp.Expression | None:
+    """Rebuild a misparsed `x -> y` lambda as the jsonb extraction it is."""
+    params = node.expressions or []
+    if len(params) != 1 or node.this is None:
+        return None
+    left = params[0]
+    if isinstance(left, exp.Identifier):
+        left = exp.column(left.this, quoted=left.args.get("quoted"))
+    return exp.JSONExtract(this=left, expression=node.this)
 
 
 def _eval_bracket(node: exp.Bracket, scope: Scope, ctx: ScalarContext) -> Any:
@@ -1742,7 +1764,12 @@ _PG_WORD_TOKENS = [
 ]
 
 
-_WORD_TIME_TOKEN_RE = re.compile(r"(?i)(FM)?(month|mon|day|dy)")
+#: Longest-first, because the alternation takes the first match: `month`
+#: before `mon`, `iyyy` before `iw`/`id`. The ISO-week tokens ride the same
+#: stash-and-substitute machinery as the word tokens, and for the same reason —
+#: sqlglot's postgres mapping does not know them, so `IYYY-IW-ID` came out as
+#: the literal `I20Y-IW-I3` (the lone `Y` and `D` matched, the `I`s did not).
+_WORD_TIME_TOKEN_RE = re.compile(r"(?i)(FM)?(month|mon|day|dy|iyyy|iw|id)")
 
 
 def _render_word_token(match: re.Match, ts: Any) -> str:
@@ -1772,7 +1799,18 @@ def _render_word_token(match: re.Match, ts: Any) -> str:
     return text
 
 
-_WORD_TIME_DIRECTIVES = {"month": "%B", "mon": "%b", "day": "%A", "dy": "%a"}
+_WORD_TIME_DIRECTIVES = {
+    "month": "%B",
+    "mon": "%b",
+    "day": "%A",
+    "dy": "%a",
+    # ISO-8601 week-numbering: year, week, weekday. `IYY` / `IY` / `I` (the
+    # truncated ISO years) and `IDDD` have no strftime directive and are not
+    # handled — see `tasks/backlog.md`.
+    "iyyy": "%G",
+    "iw": "%V",
+    "id": "%u",
+}
 
 #: `Day` and `Month` are BLANK-PADDED to 9 characters in Postgres
 #: (`to_char(date, 'Day')` is `'Thursday '`), and the token's own casing picks
@@ -2790,15 +2828,57 @@ def _array_elem_render_tag(node: exp.Expression, value: list) -> str:
     return typemap.infer_elem_tag(value)
 
 
+#: Functions whose result is json / jsonb. Their VALUE is an ordinary Python
+#: list, dict or str here, so only the call itself says the `::text` rendering
+#: should be JSON — `jsonb_build_array(1,'x',true)::text` was rendered as the
+#: PG array `{1,x,t}` instead of `[1, "x", true]`, and `to_jsonb('x'::text)`
+#: as a bare `x` instead of `"x"`.
+_JSON_RETURNING_FUNCS = frozenset(
+    {
+        "json_build_object",
+        "jsonb_build_object",
+        "json_build_array",
+        "jsonb_build_array",
+        "jsonb_set",
+        "jsonb_set_lax",
+        "jsonb_insert",
+        "jsonb_strip_nulls",
+        "json_strip_nulls",
+        "jsonb_path_query",
+        "jsonb_path_query_array",
+        "to_jsonb",
+        "to_json",
+        "row_to_json",
+        "jsonb_agg",
+        "json_agg",
+        "jsonb_object_agg",
+        "json_object_agg",
+    }
+)
+
+
+def _json_returning_call(node: exp.Expression) -> bool:
+    """Whether a node is a call to one of the json-returning functions."""
+    name = None
+    if isinstance(node, exp.Anonymous):
+        name = str(node.this)
+    elif isinstance(node, exp.JSONArrayAgg):
+        name = "json_agg"
+    elif isinstance(node, exp.Func):
+        name = node.sql_name()
+    return name is not None and str(name).rsplit(".", 1)[-1].lower() in _JSON_RETURNING_FUNCS
+
+
 def _yields_json(node: exp.Expression) -> bool:
     """Whether an expression statically yields a json value — a ``::json/jsonb``
-    cast or ``->``-style navigation. Drives ``::text`` rendering (JSON text vs
-    array_out literal) for structured values."""
+    cast, ``->``-style navigation, or a json-returning function. Drives
+    ``::text`` rendering (JSON text vs array_out literal) for structured
+    values."""
     while isinstance(node, exp.Paren):
         node = node.this
     if isinstance(node, exp.Cast):
         return typemap.type_tag_for_sql(node.to) == "json"
-    return isinstance(node, _JSONB_NAV)
+    return isinstance(node, _JSONB_NAV) or _json_returning_call(node)
 
 
 def _operand_is_json(node: exp.Expression) -> bool:
@@ -3139,6 +3219,16 @@ def _eval_cast_impl(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
             from secantus.sql import datetimes as _datetimes
 
             return _datetimes.render_timetz(value)
+    if to_tag_early == "text" and isinstance(value, (list, str)):
+        inner = node.this
+        while isinstance(inner, exp.Paren):
+            inner = inner.this
+        # A json-returning call renders as JSON, not as an array literal — and
+        # a jsonb STRING renders quoted. Checked before the array branch below,
+        # which would otherwise turn `jsonb_build_array(1,'x',true)::text` into
+        # the PG array `{1,x,t}`.
+        if _yields_json(inner) or getattr(node, "_secantus_json_operand", False):
+            return typemap._render_json(value)
     if to_tag_early == "text" and isinstance(value, list):
         # ``(x::box[])::text`` — render the array literal NOW with the inner
         # cast's element rules (box's ``;`` delimiter); by output time the
@@ -4118,7 +4208,12 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         # composite / ROW(...) argument arrives as a subdocument, a scalar as itself.
         return _as_json_value(args[0]) if args else None
     if name in ("jsonb_array_length", "json_array_length"):
-        v = args[0] if args else None
+        v = _as_jsonb_arg(args[0] if args else None)
+        if v is None:
+            # A NULL argument is a NULL result, not an error — PG only rejects
+            # a non-array VALUE. `jsonb_array_length(v->'arr')` over a row
+            # without that key raised where PG answers NULL.
+            return None
         if not isinstance(v, list):
             raise errors.SQLError("22023", "cannot get array length of a non-array")
         return len(v)
@@ -4148,19 +4243,21 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         dims = _array_dim_lengths(v)
         return "".join(f"[1:{d}]" for d in dims) if dims else None
     if name in ("jsonb_typeof", "json_typeof"):
-        return _json_typeof(args[0] if args else None)
+        return _json_typeof(_as_jsonb_arg(args[0] if args else None))
     if name in ("jsonb_set", "jsonb_set_lax"):
-        target, path, value = args[0], _pg_text_path(args[1]), _as_json_value(args[2])
+        target = _as_jsonb_arg(args[0])
+        path, value = _pg_text_path(args[1]), _as_json_value(args[2])
         create = args[3] if len(args) > 3 else True
         return _jsonb_set(target, path, value, create=bool(create), insert=False)
     if name == "jsonb_insert":
-        target, path, value = args[0], _pg_text_path(args[1]), _as_json_value(args[2])
+        target = _as_jsonb_arg(args[0])
+        path, value = _pg_text_path(args[1]), _as_json_value(args[2])
         after = bool(args[3]) if len(args) > 3 else False
         return _jsonb_set(target, path, value, create=True, insert=True, insert_after=after)
     if name in ("jsonb_strip_nulls", "json_strip_nulls"):
-        return _jsonb_strip_nulls(args[0] if args else None)
+        return _jsonb_strip_nulls(_as_jsonb_arg(args[0] if args else None))
     if name in ("jsonb_pretty",):
-        v = args[0] if args else None
+        v = _as_jsonb_arg(args[0] if args else None)
         return None if v is None else json.dumps(v, indent=4, default=str)
     if name == "row":
         # ``row(a, b, …)`` — an anonymous record value (Postgres names the
@@ -4682,6 +4779,26 @@ def _as_json_value(value: Any) -> Any:
         except (ValueError, TypeError):
             return value
     return value
+
+
+def _as_jsonb_arg(value: Any) -> Any:
+    """Coerce an UNTYPED string argument to jsonb.
+
+    A bare `'{"a":1}'` literal is Postgres' `unknown`, and a function's
+    declared parameter type is what resolves it — so `jsonb_set('{"a":1}',
+    '{b}', '2')` is an ordinary call there. Here the literal stayed a Python
+    `str`, the navigation had nothing to walk, and `jsonb_set` /
+    `jsonb_strip_nulls` returned their input UNCHANGED: no-ops that looked like
+    successes. Only the `::jsonb`-cast spelling worked.
+
+    A value that is already parsed passes through, and a string that is not
+    JSON is left alone for the caller to reject."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (ValueError, TypeError):
+        return value
 
 
 def _jsonb_set(
