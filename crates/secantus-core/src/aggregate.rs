@@ -135,9 +135,13 @@ fn apply_stage(
             let Some(new_root) = s.get("newRoot") else {
                 return Err(Fallback::Defer);
             };
-            map_docs(docs, |d| replace_root_one(&d, new_root, vars))
+            map_docs(docs, |d| {
+                replace_root_one(&d, new_root, vars, "'newRoot' expression")
+            })
         }
-        "$replaceWith" => map_docs(docs, |d| replace_root_one(&d, spec, vars)),
+        "$replaceWith" => map_docs(docs, |d| {
+            replace_root_one(&d, spec, vars, "'replacement document'")
+        }),
         "$sort" => sort_stage(docs, spec),
         "$unwind" => unwind_stage(docs, spec),
         "$group" => group::group_stage(spec, &docs, vars).map_err(|_| Fallback::Defer),
@@ -292,7 +296,9 @@ pub fn render_value_compact(v: &Bson) -> String {
         Bson::Int32(n) => n.to_string(),
         Bson::Int64(n) => n.to_string(),
         Bson::Double(d) => {
-            if d.fract() == 0.0 && d.is_finite() {
+            if d.is_nan() {
+                "nan".to_string()
+            } else if d.fract() == 0.0 && d.is_finite() {
                 format!("{}", *d as i64)
             } else {
                 d.to_string()
@@ -332,6 +338,30 @@ pub fn render_value_compact(v: &Bson) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        // Same trap as `render_stage_value`: the catch-all was Rust's `Debug`,
+        // so `$redact` returning a regex reported
+        // `Regex { pattern: "a", options: "" }` where mongod says `/a/`.
+        //
+        // This is mongod's THIRD value rendering, not a duplicate of
+        // `render_stage_value`: the 40228 / 17053 family QUOTES binary
+        // (`BinData(0, "7A")` against `$limit`'s `BinData(0, 7A)`) and wraps
+        // code as `Code("x=1")` where the other renders the code text bare.
+        // Probed side by side on 8.2.11 (2026-09-02).
+        Bson::RegularExpression(r) => format!("/{}/{}", r.pattern, r.options),
+        Bson::Binary(b) => format!(
+            "BinData({}, \"{}\")",
+            u8::from(b.subtype),
+            b.bytes
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>()
+        ),
+        Bson::Timestamp(t) => format!("Timestamp({}, {})", t.time, t.increment),
+        Bson::JavaScriptCode(c) => format!("Code(\"{c}\")"),
+        Bson::JavaScriptCodeWithScope(c) => format!("Code(\"{}\")", c.code),
+        Bson::Symbol(sym) => format!("\"{sym}\""),
+        Bson::MinKey => "MinKey".to_string(),
+        Bson::MaxKey => "MaxKey".to_string(),
         other => format!("{other:?}"),
     }
 }
@@ -1038,10 +1068,93 @@ fn add_fields_one(mut doc: Document, spec: &Document, vars: &Document) -> R<Docu
     Ok(doc)
 }
 
-fn replace_root_one(doc: &Document, expr: &Bson, vars: &Document) -> R<Document> {
+fn replace_root_one(doc: &Document, expr: &Bson, vars: &Document, subject: &str) -> R<Document> {
     match evaluate(expr, doc, vars)? {
         Bson::Document(d) => Ok(d),
-        _ => Err(Fallback::Defer), // Python raises if newRoot isn't a document
+        other => Err(Fallback::mongo(
+            40228,
+            format!(
+                "{subject}  must evaluate to an object, but resulting value was: {}. \
+                 Type of resulting value: '{}'. Input document: {}",
+                render_value_compact(&other),
+                crate::query::bson_type_name(&other),
+                render_value_compact(&Bson::Document(input_document(doc, expr)))
+            ),
+        )),
+    }
+}
+
+/// The document mongod names in `Input document:` -- the input PRUNED to the
+/// fields the expression actually reads.
+///
+/// mongod runs its dependency analysis before the stage, so the message names
+/// the pruned document, not the stored one: `{_id: 1, n: 1}` with
+/// `newRoot: "$n"` reports `{n: 1}`. Field order follows the DOCUMENT, an
+/// absent path is omitted rather than rendered null, and a referenced parent
+/// subsumes a referenced child. Mirrors `aggregate._input_document`.
+fn input_document(doc: &Document, expr: &Bson) -> Document {
+    let mut paths = Vec::new();
+    if expression_field_paths(expr, &mut paths).is_none() {
+        return doc.clone();
+    }
+    // A path whose ancestor is also read adds nothing -- keeping both would
+    // narrow `a` to `a.b`, where mongod keeps the whole of `a`.
+    let roots: Vec<&String> = paths
+        .iter()
+        .filter(|p| {
+            !paths
+                .iter()
+                .any(|other| *other != **p && p.starts_with(&format!("{other}.")))
+        })
+        .collect();
+    let mut out = Document::new();
+    for (key, value) in doc {
+        if roots
+            .iter()
+            .any(|p| *p == key || p.starts_with(&format!("{key}.")))
+        {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    out
+}
+
+/// Collect the field paths an expression reads. `None` means it reads the WHOLE
+/// document (a bare `$$ROOT` / `$$CURRENT`), which cannot be pruned.
+fn expression_field_paths(expr: &Bson, out: &mut Vec<String>) -> Option<()> {
+    match expr {
+        Bson::String(s) => {
+            if let Some(var) = s.strip_prefix("$$") {
+                let (head, rest) = match var.split_once('.') {
+                    Some((h, r)) => (h, Some(r)),
+                    None => (var, None),
+                };
+                if head == "ROOT" || head == "CURRENT" {
+                    // A bare `$$ROOT` reads the WHOLE document and cannot be
+                    // pruned; `$$ROOT.a` is an ordinary path read.
+                    out.push(rest?.to_string());
+                }
+            } else if let Some(path) = s.strip_prefix('$') {
+                out.push(path.to_string());
+            }
+            Some(())
+        }
+        Bson::Document(d) => {
+            if d.len() == 1 && d.contains_key("$literal") {
+                return Some(());
+            }
+            for (_, value) in d {
+                expression_field_paths(value, out)?;
+            }
+            Some(())
+        }
+        Bson::Array(a) => {
+            for item in a {
+                expression_field_paths(item, out)?;
+            }
+            Some(())
+        }
+        _ => Some(()),
     }
 }
 

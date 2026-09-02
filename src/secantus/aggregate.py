@@ -1131,6 +1131,10 @@ def _stage_densify(
             f"The $densify stage specification must be an object, found {_bson_type_name(spec)}",
             code=9,
         )
+    _reject_unknown_stage_field(
+        spec, frozenset({"field", "range", "partitionByFields"}), "$densify"
+    )
+    _require_stage_field(spec, "field", "$densify")
     field = spec.get("field")
     if not isinstance(field, str):
         raise AggregateError("$densify requires a field name")
@@ -1562,6 +1566,10 @@ def _stage_fill(
             f"The $fill stage specification must be an object, found {_bson_type_name(spec)}",
             code=9,
         )
+    _reject_unknown_stage_field(
+        spec, frozenset({"output", "partitionBy", "partitionByFields", "sortBy"}), "$fill"
+    )
+    _require_stage_field(spec, "output", "$fill")
     output = spec.get("output")
     if not isinstance(output, Mapping) or not output:
         raise AggregateError("$fill requires a non-empty output object")
@@ -1830,6 +1838,32 @@ def _is_constant_expression(expr: Any) -> bool:
     return _expression_field_paths(expr, paths) is not _ALL_FIELDS and not paths
 
 
+# mongod parses a stage spec field-by-field, so an UNKNOWN field is reported
+# before the generic "requires X and Y" -- `{$bucket: {a: 1}}` names `a` rather
+# than listing what is missing. Each stage has its own code and wording for it,
+# probed 8.2.11 (2026-09-01); the shape is the same everywhere.
+def _reject_unknown_stage_field(spec: Mapping[str, Any], known: frozenset[str], stage: str) -> None:
+    for field in spec:
+        if field in known:
+            continue
+        if stage == "$sample":
+            raise AggregateError(f"unrecognized option to $sample: {field}", code=28748)
+        if stage == "$bucket":
+            raise AggregateError(f"Unrecognized option to $bucket: {field}.", code=40197)
+        if stage == "$bucketAuto":
+            raise AggregateError(f"Unrecognized option to $bucketAuto: {field}", code=40245)
+        raise AggregateError(f"BSON field '{stage}.{field}' is an unknown field.", code=40415)
+
+
+def _require_stage_field(spec: Mapping[str, Any], field: str, stage: str) -> None:
+    """mongod's missing-required-field message, checked AFTER the unknown-field
+    pass so a spec that is wrong in both ways reports the unknown one."""
+    if field not in spec:
+        raise AggregateError(
+            f"BSON field '{stage}.{field}' is missing but a required field", code=40414
+        )
+
+
 def _stage_replace_root(
     spec: Any, docs: list[dict[str, Any]], ctx: PipelineContext
 ) -> list[dict[str, Any]]:
@@ -1839,8 +1873,8 @@ def _stage_replace_root(
             f"{_bson_type_name(spec)}",
             code=40229,
         )
-    if "newRoot" not in spec:
-        raise AggregateError("$replaceRoot requires {newRoot: <expression>}")
+    _reject_unknown_stage_field(spec, frozenset({"newRoot"}), "$replaceRoot")
+    _require_stage_field(spec, "newRoot", "$replaceRoot")
     return [_replace_root_one(d, spec["newRoot"], ctx.vars, "'newRoot' expression") for d in docs]
 
 
@@ -1881,6 +1915,16 @@ def _stage_group(
             code=15947,
             code_name="Location15947",
         )
+    # A non-accumulator field is reported BEFORE the missing `_id`, so
+    # `{$group: {a: 1}}` names `a` rather than asking for an `_id` (probed
+    # 8.2.11).
+    for field, accumulator in spec.items():
+        if field != "_id" and not isinstance(accumulator, Mapping):
+            raise AggregateError(
+                f"The field '{field}' must be an accumulator object",
+                code=40234,
+                code_name="Location40234",
+            )
     if "_id" not in spec:
         raise AggregateError(
             "a group specification must include an _id",
@@ -2626,19 +2670,23 @@ def _stage_lookup(
     #
     # The unknown-field check runs FIRST: probed with a spec that is both
     # missing `as` and carries an unknown key, mongod answers 40415.
-    unknown = next((k for k in spec if k not in _LOOKUP_KNOWN_FIELDS), None)
-    if unknown is not None:
-        raise AggregateError(
-            f"BSON field '$lookup.{unknown}' is an unknown field.",
-            code=40415,
-            code_name="IDLUnknownField",
-        )
+    # ... but a spec with NEITHER `from` nor `pipeline` reports that first:
+    # `{$lookup: {a: 1}}` is "must specify 'pipeline' when 'from' is empty", not
+    # the unknown field (probed 8.2.11). With `from` present the unknown-field
+    # check wins, which is what the note above measured.
     from_coll = spec.get("from")
     as_field = spec.get("as")
     sub_pipeline = spec.get("pipeline")
     if from_coll is None and sub_pipeline is None:
         raise AggregateError(
             "must specify 'pipeline' when 'from' is empty", code=9, code_name="FailedToParse"
+        )
+    unknown = next((k for k in spec if k not in _LOOKUP_KNOWN_FIELDS), None)
+    if unknown is not None:
+        raise AggregateError(
+            f"BSON field '$lookup.{unknown}' is an unknown field.",
+            code=40415,
+            code_name="IDLUnknownField",
         )
     if not isinstance(from_coll, str):
         raise AggregateError(
@@ -2988,8 +3036,9 @@ def _stage_sample(
 
     if not isinstance(spec, Mapping):
         raise AggregateError("the $sample stage specification must be an object", code=28745)
+    _reject_unknown_stage_field(spec, frozenset({"size"}), "$sample")
     if "size" not in spec:
-        raise AggregateError("$sample requires {size: N}")
+        raise AggregateError("$sample stage must specify a size", code=28749)
     size_raw = spec["size"]
     # mongod: size must be a number (bool rejected) and non-negative; a
     # fractional double is accepted and truncated (unlike $limit/$skip).
@@ -3114,6 +3163,9 @@ def _stage_bucket(
     # mongod validates the whole spec before bucketing — several of these were
     # silently accepted, and an out-of-range value with no default silently
     # DROPPED the document.
+    _reject_unknown_stage_field(
+        spec, frozenset({"groupBy", "boundaries", "default", "output"}), "$bucket"
+    )
     if group_by is None or boundaries is None:
         raise AggregateError(
             "$bucket requires 'groupBy' and 'boundaries' to be specified.", code=40198
@@ -4317,6 +4369,9 @@ def _stage_bucket_auto(
     # a non-bool numeric value (40241), representable as a 32-bit integer —
     # a whole double is accepted, a fractional double is not (40242) — and
     # strictly greater than 0 (40243).
+    _reject_unknown_stage_field(
+        spec, frozenset({"groupBy", "buckets", "output", "granularity"}), "$bucketAuto"
+    )
     if "groupBy" not in spec or "buckets" not in spec:
         raise AggregateError(
             "$bucketAuto requires 'groupBy' and 'buckets' to be specified",
@@ -4410,6 +4465,18 @@ def _stage_graph_lookup(
     # Unknown arguments were accepted and ignored, so a misspelled option ran a
     # traversal the caller had not asked for. mongod's codes here are its own
     # Location numbers, not the generic ones.
+    # `from` is checked before anything else, and the message ECHOES the whole
+    # spec in mongod's document rendering -- spaced inside the braces, unlike
+    # the value renderer's compact form (probed 8.2.11).
+    if "from" not in spec:
+        rendered = bson_value_repr_stage(dict(spec))
+        if rendered != "{}":
+            rendered = "{ " + rendered[1:-1] + " }"
+        raise AggregateError(
+            f"missing 'from' option to $graphLookup stage specification: {rendered}",
+            code=9,
+            code_name="FailedToParse",
+        )
     unknown = next((k for k in spec if k not in _GRAPH_LOOKUP_KNOWN_FIELDS), None)
     if unknown is not None:
         raise AggregateError(
@@ -4585,6 +4652,16 @@ def _stage_documents(
     # and mongod answers 73 for every argument when it is not. This ran happily
     # against a collection and reported an argument error instead (probed
     # 8.2.11, 2026-09-01).
+    # ... with ONE exception: an EMPTY document spec is rejected earlier still,
+    # while the stage is being desugared into a projection, so it answers 51270
+    # even against a collection. A non-empty document, or any other type, still
+    # gets the namespace error (probed 8.2.11).
+    if isinstance(spec, Mapping) and not spec:
+        raise AggregateError(
+            "Invalid empty sub-projection: _tempDocumentsField",
+            code=51270,
+            code_name="Location51270",
+        )
     if ctx.coll_name:
         raise AggregateError(
             "'$documents' can only be run with {aggregate: 1}",
@@ -5395,10 +5472,23 @@ def _stage_union_with(
         from_coll = spec
         sub_pipeline: list[dict[str, Any]] | None = None
     elif isinstance(spec, Mapping):
+        _reject_unknown_stage_field(spec, frozenset({"coll", "pipeline"}), "$unionWith")
         from_coll = spec.get("coll")
         sub_pipeline = spec.get("pipeline")
+        if from_coll is None:
+            # A spec with no `coll` is legal only when the pipeline supplies its
+            # own documents; mongod says so rather than "requires 'coll'".
+            raise AggregateError(
+                "$unionWith stage without explicit collection must have a pipeline "
+                "with $documents as first stage",
+                code=9,
+            )
         if not isinstance(from_coll, str):
-            raise AggregateError("$unionWith requires 'coll' (string)")
+            raise AggregateError(
+                f"BSON field '$unionWith.coll' is the wrong type "
+                f"'{_bson_type_name(from_coll)}', expected type 'string'",
+                code=14,
+            )
         if sub_pipeline is not None and not isinstance(sub_pipeline, list):
             raise AggregateError("$unionWith 'pipeline' must be an array")
     else:
@@ -5407,6 +5497,12 @@ def _stage_union_with(
             f"{_bson_type_name(spec)}",
             code=9,
         )
+    if not from_coll:
+        # mongod renders the namespace with the collection half empty, which is
+        # why the database name runs straight into "is" (probed 8.2.11 -- the
+        # message really has no space there). We used to return the outer
+        # documents unchanged, i.e. a wrong ANSWER rather than an error.
+        raise AggregateError(f"Namespace {ctx.db_name}is not a valid collection name", code=73)
     if ctx.storage is None:
         raise AggregateError("$unionWith requires storage context")
 
@@ -5442,11 +5538,15 @@ def _stage_geo_near(
 
     from secantus.geo import distance, parse_doc_geometry
 
-    if not isinstance(spec, Mapping):
+    # An ARRAY is a document in BSON -- keys "0", "1", ... -- so mongod's parser
+    # accepts it as the spec object and then reports the missing `near`:
+    # `{$geoNear: []}` and `{$geoNear: [1]}` both answer 5860400, while a SCALAR
+    # is the type error (probed 8.2.11).
+    if not isinstance(spec, (Mapping, list)):
         raise AggregateError("invalid parameter: expected an object ($geoNear)", code=10065)
-    near = spec.get("near")
+    near = spec.get("near") if isinstance(spec, Mapping) else None
     if near is None:
-        raise AggregateError("$geoNear requires `near`")
+        raise AggregateError("$geoNear requires a 'near' argument", code=5860400)
     distance_field = spec.get("distanceField")
     if not isinstance(distance_field, str) or not distance_field:
         raise AggregateError("$geoNear requires a string `distanceField`")

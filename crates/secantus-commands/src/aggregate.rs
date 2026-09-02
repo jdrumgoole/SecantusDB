@@ -617,6 +617,15 @@ fn validate_unwind(spec: Option<&Bson>) -> Result<(), CommandError> {
         },
         _ => return Ok(()),
     };
+    // An empty path is "no path specified", which mongod reports before it
+    // objects to the missing `$` prefix (probed 8.2.11).
+    if path.is_empty() {
+        return Err(CommandError::new(
+            28812,
+            "Location28812",
+            "no path specified to $unwind stage",
+        ));
+    }
     if !path.starts_with('$') {
         return Err(CommandError::new(
             28818,
@@ -803,7 +812,7 @@ fn run_segmented(
                 buffer.clear();
             }
             let spec = stage.as_document().and_then(|d| d.get(name));
-            docs = documents_stage(spec, vars)?;
+            docs = documents_stage(spec, vars, coll)?;
         } else if is_source_stage(name) {
             // Source stages (e.g. `$currentOp` / `$listLocalSessions`) ignore the
             // input and emit a synthetic row. Run (and discard) any buffered
@@ -845,8 +854,32 @@ fn run_segmented(
 /// `$documents: [<expr>, …]` — evaluate each array element (against an empty
 /// root) into a document. The array itself may be an expression (e.g. a `$$var`)
 /// that resolves to an array of documents.
-fn documents_stage(spec: Option<&Bson>, vars: &Document) -> Result<Vec<Document>, CommandError> {
+fn documents_stage(
+    spec: Option<&Bson>,
+    vars: &Document,
+    coll: Option<&str>,
+) -> Result<Vec<Document>, CommandError> {
     let spec = spec.ok_or_else(|| bad_value("$documents requires an array"))?;
+    // An EMPTY document spec is rejected while the stage is desugared into a
+    // projection, so it answers 51270 even against a collection; every other
+    // argument gets the namespace error below (probed 8.2.11).
+    if matches!(spec, Bson::Document(d) if d.is_empty()) {
+        return Err(CommandError::new(
+            51270,
+            "Location51270",
+            "Invalid empty sub-projection: _tempDocumentsField",
+        ));
+    }
+    // The NAMESPACE check comes before the argument is looked at at all:
+    // `$documents` is only legal in a collection-less aggregate. This ran
+    // happily against a collection and reported an argument error instead.
+    if coll.is_some_and(|c| !c.is_empty()) {
+        return Err(CommandError::new(
+            73,
+            "InvalidNamespace",
+            "'$documents' can only be run with {aggregate: 1}",
+        ));
+    }
     let empty = Document::new();
     let value = secantus_core::expressions::evaluate(&empty, spec, vars)
         .map_err(|_| bad_value("$documents expression not supported"))?;
@@ -1233,10 +1266,15 @@ fn apply_facet(
         .and_then(Bson::as_document)
         .filter(|d| !d.is_empty())
         .ok_or_else(|| {
+            // mongod ECHOES the offending spec, which the message omitted.
+            let rendered = spec.map(argtypes::render_stage_value).unwrap_or_default();
             CommandError::new(
                 40169,
                 "Location40169",
-                "the $facet specification must be a non-empty object",
+                format!(
+                    "the $facet specification must be a non-empty object, \
+                     but found: $facet: {rendered}"
+                ),
             )
         })?;
     let mut out = Document::new();
@@ -1245,7 +1283,11 @@ fn apply_facet(
             CommandError::new(
                 40170,
                 "Location40170",
-                format!("arguments to $facet must be arrays, {name} is not an array"),
+                // mongod names the TYPE it found rather than restating the rule.
+                format!(
+                    "arguments to $facet must be arrays, {name} is type {}",
+                    secantus_core::query::bson_type_name(sub)
+                ),
             )
         })?;
         for stage in sub_pipeline {
@@ -1304,6 +1346,17 @@ fn apply_union_with(
     collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
     let (from, sub_pipeline): (&str, Option<&Vec<Bson>>) = match spec {
+        // An EMPTY collection name is not a namespace. This used to return the
+        // outer documents unchanged -- a wrong ANSWER. mongod renders the
+        // namespace with the collection half empty, so the database name runs
+        // straight into "is" (probed 8.2.11 -- the message really has no space).
+        Some(Bson::String(s)) if s.is_empty() => {
+            return Err(CommandError::new(
+                73,
+                "InvalidNamespace",
+                format!("Namespace {db}is not a valid collection name"),
+            ));
+        }
         Some(Bson::String(s)) => (s.as_str(), None),
         Some(Bson::Document(d)) => {
             let from = d
@@ -1906,6 +1959,15 @@ fn apply_out(
 /// Resolve `$out`'s target. Accepts `"coll"` or `{db, coll}`.
 fn out_target(spec: Option<&Bson>, db: &str) -> Result<(String, String), CommandError> {
     match spec {
+        // An EMPTY collection name is not a namespace. It used to be accepted
+        // and the stage wrote to a nameless collection, reporting success --
+        // a `$out` that silently did nothing. mongod renders the namespace with
+        // the collection half empty, so the database name stands alone (73).
+        Some(Bson::String(c)) if c.is_empty() => Err(CommandError::new(
+            73,
+            "InvalidNamespace",
+            format!("Invalid $out target namespace, {db}"),
+        )),
         Some(Bson::String(c)) => Ok((db.to_string(), c.clone())),
         Some(Bson::Document(d)) => {
             let coll = d
@@ -2052,6 +2114,15 @@ fn merge_spec(
     const VALID_MATCHED: &[&str] = &["merge", "replace", "keepExisting", "fail", "delete"];
     const VALID_NOT_MATCHED: &[&str] = &["insert", "discard", "fail"];
     let (out_db, out_coll, on, when_matched, when_not_matched) = match spec {
+        // Empty target: not a namespace. mongod QUOTES it here and does not in
+        // `$out` -- the two messages really are shaped differently.
+        Some(Bson::String(c)) if c.is_empty() => {
+            return Err(CommandError::new(
+                73,
+                "InvalidNamespace",
+                format!("Invalid $merge target namespace: '{db}'"),
+            ));
+        }
         Some(Bson::String(c)) => (
             db.to_string(),
             c.clone(),

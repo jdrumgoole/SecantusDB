@@ -44,6 +44,11 @@ mon = pymongo.MongoClient(os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27
 srv = SecantusDBServer(port=0, storage_path=tempfile.mkdtemp())
 srv.start()
 py = pymongo.MongoClient(srv.uri)
+# The Rust server has its OWN stage-spec validation, so a fix on the Python
+# side proves nothing about it. Optional so the probe still runs without the
+# extension built.
+rust = pymongo.MongoClient(os.environ["PROBE_SERVER"]) if os.environ.get("PROBE_SERVER") else None
+TARGETS = [("python", py)] + ([("rust", rust)] if rust is not None else [])
 DBN = "stagesweep"
 DOC = {"_id": 1, "n": 5, "s": "abc", "arr": [1, 2, 3], "d": {"x": 1}}
 
@@ -107,9 +112,9 @@ STAGES = [
     "$merge",
 ]
 
-for cli in (mon, py):
-    cli.drop_database(DBN)
-    cli[DBN].c.insert_one(dict(DOC))
+for _label, _cli in [("mongod", mon), *TARGETS]:
+    _cli.drop_database(DBN)
+    _cli[DBN].c.insert_one(dict(DOC))
 
 
 def run(cli, stage):
@@ -122,21 +127,59 @@ def run(cli, stage):
         )
 
 
-bad = tot = 0
+# A spec that is VALID except for one problem. The `BAD` corpus above is all
+# scalars and bare `{a: 1}`, so it never reaches the check that runs AFTER a
+# stage's leading required field is satisfied -- three real divergences hid
+# there ($lookup and $graphLookup with a `from` plus an unknown field, and
+# $lookup missing only its `as`). The probe's reach is exactly its case list.
+NEARLY_VALID: list[tuple[str, dict]] = [
+    ("$lookup", {"from": "c", "as": "x", "zz": 1}),
+    ("$lookup", {"from": "c"}),
+    ("$graphLookup", {"from": "c", "zz": 1}),
+    ("$graphLookup", {"from": "c"}),
+    ("$unionWith", {"coll": "c", "zz": 1}),
+    ("$sample", {"size": 1, "zz": 1}),
+    ("$bucket", {"groupBy": "$_id", "boundaries": [0, 9], "zz": 1}),
+    ("$bucketAuto", {"groupBy": "$_id", "buckets": 2, "zz": 1}),
+    ("$replaceRoot", {"newRoot": "$$ROOT", "zz": 1}),
+    ("$densify", {"field": "n", "range": {"step": 1, "bounds": "full"}, "zz": 1}),
+    ("$fill", {"output": {"n": {"value": 1}}, "zz": 1}),
+    ("$out", {"coll": "c", "zz": 1}),
+    ("$merge", {"into": "c", "zz": 1}),
+    ("$unwind", {"path": "$a", "zz": 1}),
+    ("$group", {"_id": None, "a": 1}),
+]
+
+tot = 0
 rows = []
-for st in STAGES:
-    for arg in BAD:
+bad = collections.Counter()
+cases = [(st, arg) for st in STAGES for arg in BAD] + NEARLY_VALID
+for st, arg in cases:
+    if True:
         tot += 1
         stage = {st: arg}
-        m, p = run(mon, stage), run(py, stage)
-        if m != p:
-            bad += 1
-            rows.append((f"{{{st}: {arg!r}}}", m, p))
-print(f"\n=== {tot} stage shapes: {bad} divergent on the Python server ===\n")
-for k, v in collections.Counter(r[0].split(":")[0].strip("{") for r in rows).most_common(14):
-    print(f"  {v:4}  {k}")
+        expected = run(mon, stage)
+        got = {label: run(cli, stage) for label, cli in TARGETS}
+        off = {label: v for label, v in got.items() if v != expected}
+        if off:
+            for label in off:
+                bad[label] += 1
+            rows.append((f"{{{st}: {arg!r}}}", expected, got, set(off)))
+
+summary = ", ".join(f"{label} {bad[label]}" for label, _ in TARGETS)
+print(f"\n=== {tot} stage shapes: {summary} divergent ===\n")
+for label, _ in TARGETS:
+    hits = [r for r in rows if label in r[3]]
+    if not hits:
+        continue
+    print(f"  --- {label} ---")
+    for k, v in collections.Counter(r[0].split(":")[0].strip("{") for r in hits).most_common(14):
+        print(f"  {v:4}  {k}")
 with open(os.environ.get("SWEEP_OUT", os.devnull), "w") as out:
-    for shape, m, p in rows:
-        out.write(f"{shape}\n   mongod {m}\n   python {p}\n")
+    for shape, expected, got, off in rows:
+        out.write(f"{shape}\n   mongod {expected}\n")
+        for label, v in got.items():
+            out.write(f"   {label:6s} {v}{'  <-- diverges' if label in off else ''}\n")
 srv.stop()
+sys.exit(1 if rows else 0)
 sys.exit(1 if bad else 0)

@@ -4132,20 +4132,72 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ## 7. Python → Rust rewrite (in progress)
 
-- [ ] **Aggregation stage-spec messages: 22 shapes left (2026-09-01).**
-  `tools/probes/aggregation_stage_specs.py` is the standing cover; it started at
-  167 of 725 divergent and is now 22. Everything remaining is a message or a
-  validation-ORDER difference, not a wrong answer:
+- [x] **Aggregation stage-spec messages — the PYTHON server is DONE 2026-09-02.**
+  `tools/probes/aggregation_stage_specs.py` went 167 → 22 → **0 of 725**. The
+  rule the remaining 22 all turned on: mongod parses a stage spec field by
+  field, so an **unknown or specifically-missing field is reported before** the
+  generic "requires X and Y" — `{$bucket: {a: 1}}` names `a`. Each stage has
+  its own code and wording (`$sample` 28748, `$bucket` 40197 *with* a trailing
+  period, `$bucketAuto` 40245 *without* one, everything else the IDL's 40415).
 
-  mongod checks an unknown / specific missing field BEFORE the generic
-  "requires X and Y", so `{$bucket: {a: 1}}` names `a` where we say
-  "requires 'groupBy' and 'boundaries'". The same shape applies to `$group`,
-  `$replaceRoot`, `$sample`, `$sortByCount`, `$bucketAuto`, `$densify`, `$fill`,
-  `$graphLookup`, `$lookup`, `$geoNear` and `$unionWith`.
+  Three stages invert it, which is why this needed probing rather than a single
+  helper: `$lookup` and `$graphLookup` report a missing `from` first (and
+  `$graphLookup` echoes the whole spec in mongod's SPACED document rendering,
+  `{ a: 1 }`, unlike the value renderer's compact form), and `$geoNear` reports
+  a missing `near` before it objects to the spec's own type — an ARRAY is a
+  document in BSON, so `{$geoNear: []}` gets the `near` message while a scalar
+  gets the type error.
 
-  Also: `{$documents: {}}` against a collection answers 51270 on mongod rather
-  than the namespace 73 every other argument gets — a document spec is parsed
-  down a different path there, and it was not worth guessing at.
+  One of the 22 was a **wrong ANSWER, not a message**: `{$unionWith: ""}`
+  returned the outer documents unchanged where mongod rejects the empty
+  namespace (73). And `{$documents: {}}` is rejected while the stage is
+  desugared into a projection, so it answers 51270 even against a collection,
+  where every other argument gets the namespace error.
+
+- [x] **Aggregation stage specs on the RUST server — DONE 2026-09-02.** 219 of
+  725 → **0**. This surface had never been measured: the probe compared only the
+  Python server until it grew a `PROBE_SERVER` column, and it turned out to be
+  roughly the size the Python side started at.
+
+  Two of the fixes were WRONG ANSWERS, not messages:
+
+  - `$out` and `$merge` with an EMPTY target namespace returned `ok` and wrote
+    to a nameless collection — a `$out` that silently did nothing.
+  - `$unionWith: ""` returned the outer documents unchanged, as on the Python
+    server.
+  - `$unset: ""` unset nothing and reported success.
+
+  The rest were three families:
+
+  - **A third value renderer.** `render_stage_value` and `render_value_compact`
+    both ended in `other => format!("{other:?}")`, so every type without an
+    explicit arm reached the client as Rust `Debug` —
+    `Regex { pattern: "a", options: "" }` for `/a/`. And the two are NOT
+    interchangeable: the 40228 / 17053 family QUOTES binary (`BinData(0, "7A")`)
+    and wraps code as `Code("x=1")` where `$limit`'s renders `BinData(0, 7A)`
+    and the code text bare. mongod has three renderings, not two.
+  - **`map_err(|_| Fallback::Defer)`** on seven stage dispatches threw away the
+    real error — the same shape as the storage layer's `map_err(|_|
+    QueryUnsupported)` fixed earlier. The inner functions carried `()` as their
+    error type, so there was nothing to preserve and each stage's validation had
+    to be ported.
+  - **Validation ORDER**, the same rule the Python server adopted: an unknown or
+    specifically-missing field is reported before the generic "requires X and
+    Y", with each stage's own code and wording.
+
+  Two Rust-specific traps worth remembering: `$set` reported its errors as
+  `$addFields` because the two share an implementation and the message was
+  hard-coded to the alias; and Rust match arms do NOT fall through, so an arm
+  that dispatches to a shared helper swallows every case the helper declines —
+  a follow-up arm for the same stage is unreachable.
+
+  **Writing the Rust unit tests found three more divergences the probe could not
+  reach**, which is the "the probe's reach is exactly its case list" lesson
+  again: its corpus was all scalars and a bare `{a: 1}`, so nothing exercised
+  the checks that run AFTER a stage's leading required field is satisfied —
+  `$lookup` / `$graphLookup` with a valid `from` plus an unknown field, and
+  `$lookup` missing only its `as`. The corpus now carries a `NEARLY_VALID` list
+  of spec-is-fine-except-for-one-thing shapes (740 total).
 
 - **Rust PG server: multidimensional arrays are refused (`0A000`), not
   answered.** `{{1,2},{3,4}}` plans and compares correctly; only returning one

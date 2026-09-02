@@ -754,7 +754,10 @@ pub(crate) fn render_stage_value(v: &Bson) -> String {
         Bson::Int32(n) => n.to_string(),
         Bson::Int64(n) => n.to_string(),
         Bson::Double(d) => {
-            if d.fract() == 0.0 {
+            if d.is_nan() {
+                // mongod renders it lower-case; Rust's `to_string` gives `NaN`.
+                "nan".to_string()
+            } else if d.fract() == 0.0 {
                 format!("{d:.1}")
             } else {
                 d.to_string()
@@ -784,6 +787,27 @@ pub(crate) fn render_stage_value(v: &Bson) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        // Rust's `Debug` is not mongod's rendering, and the catch-all reached
+        // every type without an arm above: a regex read
+        // `Regex { pattern: "a", options: "" }` where mongod says `/a/`, binary
+        // read `Binary { subtype: Generic, bytes: [122] }` against
+        // `BinData(0, 7A)`, and a timestamp `Timestamp { time: 1, increment: 1 }`
+        // against `Timestamp(1, 1)`. Probed 8.2.11 (2026-09-02).
+        Bson::RegularExpression(r) => format!("/{}/{}", r.pattern, r.options),
+        Bson::Binary(b) => format!(
+            "BinData({}, {})",
+            u8::from(b.subtype),
+            b.bytes
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>()
+        ),
+        Bson::Timestamp(t) => format!("Timestamp({}, {})", t.time, t.increment),
+        Bson::JavaScriptCode(c) => c.clone(),
+        Bson::JavaScriptCodeWithScope(c) => c.code.clone(),
+        Bson::Symbol(sym) => format!("\"{sym}\""),
+        Bson::MinKey => "MinKey".to_string(),
+        Bson::MaxKey => "MaxKey".to_string(),
         other => format!("{other:?}"),
     }
 }
@@ -1316,6 +1340,18 @@ pub fn stage_spec_error(pipeline: &[Bson]) -> Option<(i32, String)> {
                         ));
                     }
                 };
+                if n.is_nan() {
+                    // mongod names NaN rather than calling it a non-integer,
+                    // and renders it lower-case -- the same shape the rest of
+                    // the integer-argument family uses.
+                    return Some((
+                        code,
+                        format!(
+                            "invalid argument to {name} stage: Expected an integer, \
+                             but found NaN in: {name}: nan"
+                        ),
+                    ));
+                }
                 if n.fract() != 0.0 {
                     // A decimal gets its own wording here (probed 6.0.16):
                     // 1.5 is "Expected an integer", Decimal128("1.5") is
@@ -1355,10 +1391,22 @@ pub fn stage_spec_error(pipeline: &[Bson]) -> Option<(i32, String)> {
                     Some((28812, "no path specified to $unwind stage".to_string()))
                 }
                 Bson::String(_) => None,
-                Bson::Document(d) if !d.contains_key("path") => {
-                    Some((28812, "no path specified to $unwind stage".to_string()))
+                Bson::Document(d) => {
+                    // An UNKNOWN option is reported before the missing `path`,
+                    // so `{$unwind: {a: 1}}` names `a` (probed 8.2.11).
+                    const KNOWN: &[&str] =
+                        &["path", "includeArrayIndex", "preserveNullAndEmptyArrays"];
+                    if let Some(field) = d.keys().find(|k| !KNOWN.contains(&k.as_str())) {
+                        Some((
+                            28811,
+                            format!("unrecognized option to $unwind stage: {field}"),
+                        ))
+                    } else if !d.contains_key("path") {
+                        Some((28812, "no path specified to $unwind stage".to_string()))
+                    } else {
+                        None
+                    }
                 }
-                Bson::Document(_) => None,
                 other => Some((
                     15981,
                     format!(
@@ -1374,10 +1422,14 @@ pub fn stage_spec_error(pipeline: &[Bson]) -> Option<(i32, String)> {
             // object" / "expected an object as" / "Argument to … must be"),
             // two different capitalisations of "The", and `$project` names no
             // type at all while its neighbours all do. Probed on 8.2.11.
+            // `$set` names ITSELF, not `$addFields`. The two share an
+            // implementation and the message was hard-coded to the alias the
+            // implementation happened to be named after -- so a `$set` user saw
+            // an error about a stage they had not written (probed 8.2.11).
             "$addFields" | "$set" if !matches!(spec, Bson::Document(_)) => Some((
                 40272,
                 format!(
-                    "$addFields specification stage must be an object, got {}",
+                    "{name} specification stage must be an object, got {}",
                     bson_type_name(spec)
                 ),
             )),
@@ -1385,7 +1437,118 @@ pub fn stage_spec_error(pipeline: &[Bson]) -> Option<(i32, String)> {
                 15969,
                 "$project specification must be an object".to_string(),
             )),
-            "$replaceRoot" | "$replaceWith" if !matches!(spec, Bson::Document(_)) => Some((
+            // Each of these deferred, and a defer on the standalone server is
+            // "the STAGE is unsupported" -- for what is really a bad argument to
+            // a supported one. Every code and wording probed on 8.2.11; they do
+            // not share a shape, so they are listed rather than generated.
+            "$out" if !matches!(spec, Bson::String(_) | Bson::Document(_)) => Some((
+                16990,
+                format!(
+                    "$out only supports a string or object argument, but found {}",
+                    bson_type_name(spec)
+                ),
+            )),
+            "$merge" if !matches!(spec, Bson::String(_) | Bson::Document(_)) => Some((
+                14,
+                format!(
+                    "$merge requires a string or object argument, but found {}",
+                    bson_type_name(spec)
+                ),
+            )),
+            "$unset" if !matches!(spec, Bson::String(_) | Bson::Array(_)) => Some((
+                31002,
+                "$unset specification must be a string or an array".to_string(),
+            )),
+            // An EMPTY path is not a field path. This used to be accepted and
+            // unset nothing, reporting success.
+            "$unset" if matches!(spec, Bson::String(s) if s.is_empty()) => Some((
+                40352,
+                "FieldPath cannot be constructed with empty string".to_string(),
+            )),
+            "$bucketAuto" if !matches!(spec, Bson::Document(_)) => Some((
+                40240,
+                format!(
+                    "The argument to $bucketAuto must be an object, but found type: {}",
+                    bson_type_name(spec)
+                ),
+            )),
+            // --- spec-CONTENT validation (2026-09-02) -------------------------
+            // These all deferred, which on the standalone server reads as "the
+            // stage is unsupported". mongod parses a spec field by field, so an
+            // UNKNOWN or specifically-missing field is reported before the
+            // generic "requires X and Y" -- the same rule the Python server
+            // just adopted, with each stage's own code and wording.
+            "$project" if matches!(spec, Bson::Document(d) if d.is_empty()) => Some((
+                51272,
+                "projection specification must have at least one field".to_string(),
+            )),
+            "$sort" if matches!(spec, Bson::Document(d) if d.is_empty()) => Some((
+                15976,
+                "$sort stage must have at least one sort key".to_string(),
+            )),
+            "$count" if matches!(spec, Bson::String(s) if s.is_empty()) => Some((
+                40157,
+                "the count field must be a non-empty string".to_string(),
+            )),
+            "$unset" if matches!(spec, Bson::Array(a) if a.is_empty()) => Some((
+                31119,
+                "$unset specification must be a string or an array with at least one field"
+                    .to_string(),
+            )),
+            "$unset" if matches!(spec, Bson::Array(a) if a.iter().any(|e| !matches!(e, Bson::String(_)))) => {
+                Some((
+                    31120,
+                    "$unset specification must be a string or an array containing only \
+                     string values"
+                        .to_string(),
+                ))
+            }
+            "$group" => stage_group_problem(spec),
+            "$sortByCount" if matches!(spec, Bson::Document(_)) => Some((
+                40147,
+                "the sortByCount field must be defined as a $-prefixed path or an \
+                 expression inside an object"
+                    .to_string(),
+            )),
+            "$geoNear" if matches!(spec, Bson::Document(d) if !d.contains_key("near")) => {
+                Some((5860400, "$geoNear requires a 'near' argument".to_string()))
+            }
+            // An ARRAY is a document in BSON, so mongod accepts it as the spec
+            // and then reports the missing `near`; a scalar is the type error.
+            "$geoNear" if matches!(spec, Bson::Array(_)) => {
+                Some((5860400, "$geoNear requires a 'near' argument".to_string()))
+            }
+            "$lookup"
+                if matches!(spec, Bson::Document(d)
+                    if !d.contains_key("from") && !d.contains_key("pipeline")) =>
+            {
+                Some((
+                    9,
+                    "must specify 'pipeline' when 'from' is empty".to_string(),
+                ))
+            }
+            "$graphLookup" if matches!(spec, Bson::Document(d) if !d.contains_key("from")) => {
+                let rendered = render_spec_spaced(spec);
+                Some((
+                    9,
+                    format!(
+                        "missing 'from' option to $graphLookup stage specification: {rendered}"
+                    ),
+                ))
+            }
+            "$replaceRoot" | "$densify" | "$fill" | "$unionWith" | "$out" | "$merge"
+                if matches!(spec, Bson::Document(_)) =>
+            {
+                stage_field_problem(name, spec)
+            }
+            "$sample" if matches!(spec, Bson::Document(_)) => stage_field_problem(name, spec),
+            "$lookup" | "$graphLookup" if matches!(spec, Bson::Document(_)) => {
+                stage_field_problem(name, spec)
+            }
+            "$bucket" | "$bucketAuto" if matches!(spec, Bson::Document(_)) => {
+                stage_field_problem(name, spec)
+            }
+            "$replaceRoot" if !matches!(spec, Bson::Document(_)) => Some((
                 40229,
                 format!(
                     "expected an object as specification for $replaceRoot stage, got {}",
@@ -1635,7 +1798,10 @@ mod stage_tests {
             ("$set", 40272),
             ("$project", 15969),
             ("$replaceRoot", 40229),
-            ("$replaceWith", 40229),
+            // NOT 40229: `$replaceWith` takes an EXPRESSION, not a spec
+            // document, so a scalar is evaluated and reported as a non-object
+            // RESULT (40228) -- probed 8.2.11. This asserted `$replaceRoot`'s
+            // code because the two shared one arm.
             ("$facet", 40169),
             ("$bucket", 40201),
             ("$geoNear", 10065),
@@ -1977,5 +2143,573 @@ mod undefined_var_tests {
         assert_eq!(secantus_core::expressions::fixed_arity("$eq"), Some(2));
         assert_eq!(secantus_core::expressions::fixed_arity("$cond"), Some(3));
         assert_eq!(secantus_core::expressions::fixed_arity("$add"), None);
+    }
+}
+
+/// mongod's document rendering, spaced inside the braces -- what
+/// `$graphLookup`'s missing-`from` message echoes, unlike the compact value
+/// form used elsewhere.
+fn render_spec_spaced(spec: &Bson) -> String {
+    match spec {
+        Bson::Document(d) if d.is_empty() => "{}".to_string(),
+        Bson::Document(d) => format!(
+            "{{ {} }}",
+            d.iter()
+                .map(|(k, v)| format!("{k}: {}", render_stage_value(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        other => render_stage_value(other),
+    }
+}
+
+/// A non-accumulator field outranks the missing `_id`, so `{$group: {a: 1}}`
+/// names `a` rather than asking for an `_id`.
+fn stage_group_problem(spec: &Bson) -> Option<(i32, String)> {
+    let Bson::Document(d) = spec else { return None };
+    for (field, value) in d {
+        if field != "_id" && !matches!(value, Bson::Document(_)) {
+            return Some((
+                40234,
+                format!("The field '{field}' must be an accumulator object"),
+            ));
+        }
+    }
+    if !d.contains_key("_id") {
+        return Some((
+            15955,
+            "a group specification must include an _id".to_string(),
+        ));
+    }
+    None
+}
+
+/// The unknown-field / missing-required-field pair, per stage. Each stage has
+/// its own code and wording for the unknown half; the missing half is the IDL's
+/// 40414 everywhere except `$sample`. Probed 8.2.11 (2026-09-02).
+fn stage_field_problem(name: &str, spec: &Bson) -> Option<(i32, String)> {
+    let Bson::Document(d) = spec else { return None };
+    let (known, required): (&[&str], Option<&str>) = match name {
+        "$replaceRoot" => (&["newRoot"], Some("newRoot")),
+        "$densify" => (&["field", "range", "partitionByFields"], Some("field")),
+        "$fill" => (
+            &["output", "partitionBy", "partitionByFields", "sortBy"],
+            Some("output"),
+        ),
+        "$unionWith" => (&["coll", "pipeline"], None),
+        "$sample" => (&["size"], None),
+        "$bucket" => (&["groupBy", "boundaries", "default", "output"], None),
+        "$bucketAuto" => (&["groupBy", "buckets", "output", "granularity"], None),
+        "$out" => (&["coll", "db", "timeseries"], Some("coll")),
+        // Reached only once `from` is present -- the missing-`from` arms above
+        // outrank both of these.
+        "$lookup" => (
+            &[
+                "from",
+                "localField",
+                "foreignField",
+                "as",
+                "let",
+                "pipeline",
+            ],
+            Some("as"),
+        ),
+        "$graphLookup" => (
+            &[
+                "from",
+                "startWith",
+                "connectFromField",
+                "connectToField",
+                "as",
+                "maxDepth",
+                "depthField",
+                "restrictSearchWithMatch",
+            ],
+            None,
+        ),
+        "$merge" => (
+            &["into", "on", "let", "whenMatched", "whenNotMatched"],
+            Some("into"),
+        ),
+        _ => return None,
+    };
+    for field in d.keys() {
+        if known.contains(&field.as_str()) {
+            continue;
+        }
+        return Some(match name {
+            "$graphLookup" => (40104, format!("Unknown argument to $graphLookup: {field}")),
+            "$sample" => (28748, format!("unrecognized option to $sample: {field}")),
+            "$bucket" => (40197, format!("Unrecognized option to $bucket: {field}.")),
+            "$bucketAuto" => (
+                40245,
+                format!("Unrecognized option to $bucketAuto: {field}"),
+            ),
+            _ => (
+                40415,
+                format!("BSON field '{name}.{field}' is an unknown field."),
+            ),
+        });
+    }
+    if name == "$unionWith" && !d.contains_key("coll") {
+        // A spec with no `coll` is legal only when the pipeline supplies its own
+        // documents; mongod says so rather than "requires 'coll'". Checked here
+        // rather than in a separate match arm because Rust arms do not fall
+        // through -- the arm that dispatches here would have swallowed it.
+        return Some((
+            9,
+            "$unionWith stage without explicit collection must have a pipeline \
+             with $documents as first stage"
+                .to_string(),
+        ));
+    }
+    if name == "$sample" && !d.contains_key("size") {
+        return Some((28749, "$sample stage must specify a size".to_string()));
+    }
+    if name == "$bucket" && !(d.contains_key("groupBy") && d.contains_key("boundaries")) {
+        return Some((
+            40198,
+            "$bucket requires 'groupBy' and 'boundaries' to be specified.".to_string(),
+        ));
+    }
+    if name == "$bucketAuto" && !(d.contains_key("groupBy") && d.contains_key("buckets")) {
+        return Some((
+            40246,
+            "$bucketAuto requires 'groupBy' and 'buckets' to be specified".to_string(),
+        ));
+    }
+    if name == "$graphLookup"
+        && ![
+            "from",
+            "as",
+            "startWith",
+            "connectFromField",
+            "connectToField",
+        ]
+        .iter()
+        .all(|f| d.contains_key(*f))
+    {
+        return Some((
+            40105,
+            "$graphLookup requires 'from', 'as', 'startWith', 'connectFromField', \
+             and 'connectToField' to be specified."
+                .to_string(),
+        ));
+    }
+    if let Some(field) = required {
+        if !d.contains_key(field) {
+            return Some((
+                40414,
+                format!("BSON field '{name}.{field}' is missing but a required field"),
+            ));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod stage_validation_order_tests {
+    //! mongod checks a stage spec field by field, so ORDER decides the message.
+    //!
+    //! Every value here was probed against mongod 8.2.11 (2026-09-02) via
+    //! `tools/probes/aggregation_stage_specs.py`, which went from 219 divergent
+    //! shapes on this server to 0. Before that the probe had no Rust column at
+    //! all, so none of this surface had ever been compared.
+
+    use super::*;
+    use bson::Bson;
+
+    fn err(stage: &str, spec: Bson) -> (i32, String) {
+        let mut d = bson::Document::new();
+        d.insert(stage, spec);
+        stage_spec_error(&[Bson::Document(d)]).expect("expected an error")
+    }
+
+    fn ok(stage: &str, spec: Bson) {
+        let mut d = bson::Document::new();
+        d.insert(stage, spec);
+        assert_eq!(stage_spec_error(&[Bson::Document(d)]), None);
+    }
+
+    fn doc_of(pairs: &[(&str, Bson)]) -> Bson {
+        let mut d = bson::Document::new();
+        for (k, v) in pairs {
+            d.insert(*k, v.clone());
+        }
+        Bson::Document(d)
+    }
+
+    #[test]
+    fn an_unknown_field_beats_the_generic_requires_message() {
+        // Each stage has its OWN code and wording -- `$bucket` ends in a period
+        // and `$bucketAuto` does not.
+        let one = doc_of(&[("a", Bson::Int32(1))]);
+        assert_eq!(
+            err("$replaceRoot", one.clone()),
+            (
+                40415,
+                "BSON field '$replaceRoot.a' is an unknown field.".to_string()
+            )
+        );
+        assert_eq!(
+            err("$sample", one.clone()),
+            (28748, "unrecognized option to $sample: a".to_string())
+        );
+        assert_eq!(
+            err("$bucket", one.clone()),
+            (40197, "Unrecognized option to $bucket: a.".to_string())
+        );
+        assert_eq!(
+            err("$bucketAuto", one.clone()),
+            (40245, "Unrecognized option to $bucketAuto: a".to_string())
+        );
+        assert_eq!(
+            err("$densify", one.clone()),
+            (
+                40415,
+                "BSON field '$densify.a' is an unknown field.".to_string()
+            )
+        );
+        assert_eq!(
+            err("$fill", one.clone()),
+            (
+                40415,
+                "BSON field '$fill.a' is an unknown field.".to_string()
+            )
+        );
+        assert_eq!(
+            err("$unionWith", one),
+            (
+                40415,
+                "BSON field '$unionWith.a' is an unknown field.".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn it_wins_even_when_a_required_field_is_also_missing() {
+        // `$bucket` here is missing BOTH `groupBy` and `boundaries`.
+        assert_eq!(err("$bucket", doc_of(&[("a", Bson::Int32(1))])).0, 40197);
+    }
+
+    #[test]
+    fn a_missing_required_field_is_reported_after_that_pass() {
+        let empty = Bson::Document(bson::Document::new());
+        assert_eq!(
+            err("$replaceRoot", empty.clone()),
+            (
+                40414,
+                "BSON field '$replaceRoot.newRoot' is missing but a required field".to_string()
+            )
+        );
+        assert_eq!(
+            err("$densify", empty.clone()),
+            (
+                40414,
+                "BSON field '$densify.field' is missing but a required field".to_string()
+            )
+        );
+        assert_eq!(
+            err("$fill", empty.clone()),
+            (
+                40414,
+                "BSON field '$fill.output' is missing but a required field".to_string()
+            )
+        );
+        assert_eq!(
+            err("$out", empty.clone()),
+            (
+                40414,
+                "BSON field '$out.coll' is missing but a required field".to_string()
+            )
+        );
+        assert_eq!(
+            err("$merge", empty.clone()),
+            (
+                40414,
+                "BSON field '$merge.into' is missing but a required field".to_string()
+            )
+        );
+        // `$sample` has its own wording rather than the IDL's.
+        assert_eq!(
+            err("$sample", empty),
+            (28749, "$sample stage must specify a size".to_string())
+        );
+    }
+
+    #[test]
+    fn lookup_and_graph_lookup_report_a_missing_from_first() {
+        let one = doc_of(&[("a", Bson::Int32(1))]);
+        assert_eq!(
+            err("$lookup", one.clone()),
+            (
+                9,
+                "must specify 'pipeline' when 'from' is empty".to_string()
+            )
+        );
+        // ... and `$graphLookup` ECHOES the spec, in mongod's SPACED document
+        // rendering rather than the compact value one.
+        assert_eq!(
+            err("$graphLookup", one),
+            (
+                9,
+                "missing 'from' option to $graphLookup stage specification: { a: 1 }".to_string()
+            )
+        );
+        assert_eq!(
+            err("$graphLookup", Bson::Document(bson::Document::new())),
+            (
+                9,
+                "missing 'from' option to $graphLookup stage specification: {}".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn but_an_unknown_field_wins_once_lookup_has_its_from() {
+        let spec = doc_of(&[("from", Bson::String("c".into())), ("zz", Bson::Int32(1))]);
+        assert_eq!(err("$lookup", spec).0, 40415);
+    }
+
+    #[test]
+    fn geo_near_reports_a_missing_near_before_the_spec_type() {
+        let expected = (5860400, "$geoNear requires a 'near' argument".to_string());
+        assert_eq!(
+            err("$geoNear", Bson::Document(bson::Document::new())),
+            expected
+        );
+        assert_eq!(err("$geoNear", doc_of(&[("a", Bson::Int32(1))])), expected);
+        // An ARRAY is a document in BSON, so it reaches the `near` check ...
+        assert_eq!(err("$geoNear", Bson::Array(vec![])), expected);
+        assert_eq!(err("$geoNear", Bson::Array(vec![Bson::Int32(1)])), expected);
+        // ... while a SCALAR cannot be a spec at all.
+        assert_eq!(err("$geoNear", Bson::Int32(5)).0, 10065);
+    }
+
+    #[test]
+    fn group_reports_a_non_accumulator_before_the_missing_id() {
+        assert_eq!(
+            err("$group", doc_of(&[("a", Bson::Int32(1))])),
+            (
+                40234,
+                "The field 'a' must be an accumulator object".to_string()
+            )
+        );
+        assert_eq!(
+            err("$group", Bson::Document(bson::Document::new())),
+            (
+                15955,
+                "a group specification must include an _id".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn union_with_asks_for_a_documents_pipeline_when_it_has_no_coll() {
+        assert_eq!(
+            err("$unionWith", Bson::Document(bson::Document::new())),
+            (
+                9,
+                "$unionWith stage without explicit collection must have a pipeline \
+                 with $documents as first stage"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn unwind_names_an_unknown_option_before_the_missing_path() {
+        assert_eq!(
+            err("$unwind", doc_of(&[("a", Bson::Int32(1))])),
+            (28811, "unrecognized option to $unwind stage: a".to_string())
+        );
+        // An EMPTY path is "no path", not a missing `$` prefix.
+        assert_eq!(
+            err("$unwind", Bson::String(String::new())),
+            (28812, "no path specified to $unwind stage".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_specs_that_are_errors_in_their_own_right() {
+        assert_eq!(
+            err("$project", Bson::Document(bson::Document::new())),
+            (
+                51272,
+                "projection specification must have at least one field".to_string()
+            )
+        );
+        assert_eq!(
+            err("$sort", Bson::Document(bson::Document::new())),
+            (
+                15976,
+                "$sort stage must have at least one sort key".to_string()
+            )
+        );
+        assert_eq!(
+            err("$count", Bson::String(String::new())),
+            (
+                40157,
+                "the count field must be a non-empty string".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn unset_rejects_the_shapes_that_used_to_unset_nothing() {
+        assert_eq!(
+            err("$unset", Bson::Array(vec![])),
+            (
+                31119,
+                "$unset specification must be a string or an array with at least one field"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            err("$unset", Bson::Array(vec![Bson::Int32(1)])),
+            (
+                31120,
+                "$unset specification must be a string or an array containing only string values"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            err("$unset", Bson::Int32(5)),
+            (
+                31002,
+                "$unset specification must be a string or an array".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn out_and_merge_name_their_own_argument_types() {
+        assert_eq!(
+            err("$out", Bson::Int32(5)),
+            (
+                16990,
+                "$out only supports a string or object argument, but found int".to_string()
+            )
+        );
+        // Different code AND different verb from `$out` -- probed, not assumed.
+        assert_eq!(
+            err("$merge", Bson::Int32(5)),
+            (
+                14,
+                "$merge requires a string or object argument, but found int".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn set_names_itself_not_the_alias_it_shares_an_implementation_with() {
+        assert_eq!(
+            err("$set", Bson::Int32(5)).1,
+            "$set specification stage must be an object, got int"
+        );
+        assert_eq!(
+            err("$addFields", Bson::Int32(5)).1,
+            "$addFields specification stage must be an object, got int"
+        );
+    }
+
+    #[test]
+    fn valid_specs_are_left_alone() {
+        // The guard against over-eager validation: each of these is legal, and
+        // an arm that fired here would break working pipelines.
+        ok("$sample", doc_of(&[("size", Bson::Int32(1))]));
+        ok("$unset", Bson::String("a".into()));
+        ok("$unset", Bson::Array(vec![Bson::String("a".into())]));
+        ok("$unwind", Bson::String("$a".into()));
+        ok("$unwind", doc_of(&[("path", Bson::String("$a".into()))]));
+        ok("$group", doc_of(&[("_id", Bson::Null)]));
+        ok("$project", doc_of(&[("a", Bson::Int32(1))]));
+        ok("$sort", doc_of(&[("a", Bson::Int32(1))]));
+        ok("$unionWith", Bson::String("c".into()));
+        ok("$unionWith", doc_of(&[("coll", Bson::String("c".into()))]));
+        ok("$out", Bson::String("c".into()));
+        ok("$out", doc_of(&[("coll", Bson::String("c".into()))]));
+        ok("$merge", doc_of(&[("into", Bson::String("c".into()))]));
+        ok(
+            "$bucket",
+            doc_of(&[
+                ("groupBy", Bson::String("$a".into())),
+                (
+                    "boundaries",
+                    Bson::Array(vec![Bson::Int32(0), Bson::Int32(9)]),
+                ),
+            ]),
+        );
+        ok(
+            "$bucketAuto",
+            doc_of(&[
+                ("groupBy", Bson::String("$a".into())),
+                ("buckets", Bson::Int32(2)),
+            ]),
+        );
+        ok(
+            "$replaceRoot",
+            doc_of(&[("newRoot", Bson::String("$$ROOT".into()))]),
+        );
+    }
+}
+
+#[cfg(test)]
+mod stage_value_rendering_tests {
+    //! mongod has THREE value renderings, not two, and both Rust renderers used
+    //! to end in `other => format!("{other:?}")` -- so every type without an
+    //! explicit arm reached the client as Rust `Debug`.
+
+    use super::render_stage_value;
+    use bson::{spec::BinarySubtype, Binary, Bson};
+
+    #[test]
+    fn the_types_that_used_to_render_as_rust_debug() {
+        assert_eq!(
+            render_stage_value(&Bson::RegularExpression(bson::Regex {
+                pattern: "a".into(),
+                options: String::new(),
+            })),
+            "/a/"
+        );
+        assert_eq!(
+            render_stage_value(&Bson::Binary(Binary {
+                subtype: BinarySubtype::Generic,
+                bytes: vec![0x7A],
+            })),
+            // UNQUOTED here; the 40228 / 17053 family quotes it.
+            "BinData(0, 7A)"
+        );
+        assert_eq!(
+            render_stage_value(&Bson::Timestamp(bson::Timestamp {
+                time: 1,
+                increment: 1,
+            })),
+            "Timestamp(1, 1)"
+        );
+        assert_eq!(
+            render_stage_value(&Bson::JavaScriptCode("x=1".into())),
+            // Bare code text here; the other renderer wraps it as `Code("x=1")`.
+            "x=1"
+        );
+        assert_eq!(render_stage_value(&Bson::MinKey), "MinKey");
+        assert_eq!(render_stage_value(&Bson::MaxKey), "MaxKey");
+    }
+
+    #[test]
+    fn nan_is_lower_case() {
+        assert_eq!(render_stage_value(&Bson::Double(f64::NAN)), "nan");
+    }
+
+    #[test]
+    fn the_arms_that_were_already_right_are_unchanged() {
+        assert_eq!(render_stage_value(&Bson::String("x".into())), "\"x\"");
+        assert_eq!(render_stage_value(&Bson::Int32(5)), "5");
+        assert_eq!(render_stage_value(&Bson::Double(2.0)), "2.0");
+        assert_eq!(
+            render_stage_value(&Bson::Array(vec![Bson::Int32(1)])),
+            "[ 1 ]"
+        );
+        assert_eq!(render_stage_value(&Bson::Array(vec![])), "[]");
     }
 }
