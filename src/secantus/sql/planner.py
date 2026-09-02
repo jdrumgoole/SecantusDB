@@ -2360,6 +2360,12 @@ def _insert_doc(col_names: list[str], raw_values: list[Any], table: TableDef) ->
             value = typemap.enforce_declared_length(
                 value, getattr(col, "decl_oid", None), getattr(col, "typmod", -1), col.name
             )
+            # A declared numeric(p, s) ROUNDS the stored value to its scale;
+            # without it the column kept the literal's own scale and the stored
+            # value itself was wrong.
+            value = typemap.enforce_numeric_typmod(
+                value, getattr(col, "decl_oid", None), getattr(col, "typmod", -1), col.name
+            )
         _set_doc_field(doc, col.field, value, col.type_tag)
         provided.add(name)
     # An omitted column takes its DEFAULT if it has one; otherwise a NOT NULL
@@ -3927,7 +3933,9 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
                 # microseconds of whatever it held before this update.
                 unset_fields.append(companion)
         else:
-            set_doc[col.field] = typemap.coerce(raw, col.type_tag)
+            set_doc[col.field] = typemap.enforce_numeric_typmod(
+                typemap.coerce(raw, col.type_tag), col.decl_oid, col.typmod, col.name
+            )
     return UpdatePlan(
         table=table,
         filter=_where_filter(stmt, table),

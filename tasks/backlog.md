@@ -7605,6 +7605,46 @@ shared storage engine or building large new protocol subsystems:
       condition into the accumulator, so neither reaches
       `_register_numeric_avg` as written.
 
+- [x] **RESOLVED (2026-09-02) — `numeric(p, s)` never applied its declared
+      scale.** The STORED VALUE was wrong, not just its rendering: `0.12345`
+      into a `numeric(10,3)` column stayed `0.12345` where PG stores `0.123`,
+      and a bare `1` stayed `1` where PG stores `1.000`. Every `sum`, `min` /
+      `max`, `avg` and arithmetic result over the column inherited it —
+      `sum(a)` answered `3.62345` for PG's `3.623`.
+
+      `Column.typmod` already carried `((p << 16) | s) + 4`; nothing consulted
+      it on write. `typemap.enforce_numeric_typmod` is the new gate, called at
+      the same two sites as `enforce_declared_length` (the char(n) precedent),
+      which is why the parameterised and COPY paths were fixed for free — they
+      go through the same planner.
+
+      The overflow check runs on the ROUNDED value, so `9999.999` into a
+      `numeric(6,2)` overflows even though the input's integer part fits.
+      Rounding is half-away-from-zero, both signs.
+
+      Pinned by `tests/test_sql_numeric_typmod.py` (24 cases vs PG 14.13,
+      including the error's DETAIL line).
+
+- [ ] **OPEN — `ORDER BY` over `jsonb` or a range type is an XX000
+      (2026-09-02, sized).** `'<' not supported between instances of 'dict'
+      and 'dict'`. PG's jsonb order, measured on 14.13, is: an EMPTY ARRAY
+      first (a top-level scalar is stored as a 1-element array, so `[]` is
+      shorter than every scalar), then null < string < number < boolean <
+      non-empty array < object; arrays compare length then element-wise;
+      objects compare pair count then key/value pairs walked in STORAGE order,
+      which is `(len(key), key)`, not insertion order.
+
+      The blocker is not the rule but the PLUMBING: `typemap.sort_key_value`
+      sees only a value, and a jsonb string is indistinguishable from a text
+      one — so the jsonb field paths have to reach `_order_key_fn` the way
+      `citext_orders` / `collate_orders` do. **And note `'null'::jsonb` and SQL
+      NULL are both Python `None` in this engine**, so JSON null cannot sort
+      inside the jsonb order without a representation change.
+
+      Beware the probe trap: `SELECT j::text FROM … ORDER BY j` binds `ORDER
+      BY` to the TEXT output column (PG resolves an output name first), which
+      yields ASCII order and looks like a jsonb rule. Use `ORDER BY v.j`.
+
 - [ ] **OPEN — arithmetic in a WHERE clause is still unchecked (2026-09-02).**
       `SELECT * FROM t WHERE i + 1 > 0` returns rows where PG raises `22003`.
       The predicate lowers to a Mongo `$expr` (`planner._to_agg_expr` /
