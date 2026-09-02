@@ -4260,6 +4260,26 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   to `WriteError` and touching its ~20 construction sites. Worth doing
   deliberately; not worth bolting on, which is why it is still here.
 
+- [ ] **Aggregation expression error surface: 50 codes + 212 messages left
+  (2026-09-02).** `tools/probes/agg_expressions.py` had never been reported on;
+  running it found **551 wrong codes** across 58 operators on 3,968 cases, now
+  **50**. The systematic half is done — arity and spec-shape are PARSE errors
+  carrying the stage wrapper, not fold errors (`_expression_shape_problem`).
+
+  What is left is a long tail of individually-probed messages, plus:
+
+  - **5 genuine wrong VALUES**, all last-digit `Decimal128` on the
+    transcendental functions (`$acosh` / `$ln` / `$log10` / `$sin` / `$tan` of
+    `Decimal128("2.5")`). This is the documented 34-significant-digit vs
+    `float`'s 17 limitation, not a quick fix — see §2's note on `$abs` / `$ceil`.
+  - **212 message-only** differences. That number went UP as the codes were
+    fixed (123 → 212), which is progress: a shape with the right code and the
+    wrong wording moves from one bucket to the other.
+
+  Two traps for whoever takes the tail, both paid for already: `$bitNot` and
+  `$setEquals` each behave differently from their own families, and generalising
+  either rule cost 46 shapes before the probe caught it. Probe per operator.
+
 ### 7.0 Cache-pressure rollback — CI exercises it now
 
 `WT_ROLLBACK` is two conditions wearing one code: a write-write conflict
