@@ -2062,6 +2062,11 @@ def _evaluated_value_rows(
         synthesized = _empty_implicit_aggregate_row(tail, ctx)
         if synthesized is not None:
             docs = synthesized
+    # Aggregates the pipeline could not finish — an `array_agg(x ORDER BY y)`
+    # that is not the whole projection pushes `{v, k}` pairs, and the sort
+    # happens here. Same helper the pipeline path uses; without it a nested
+    # `array_agg` silently returned insertion order.
+    docs = _apply_post_aggregates(plan, docs)
     # A correlated / EXISTS WHERE that couldn't push into the pipeline is applied
     # per joined row here (before windows / projection see the survivors); the
     # scope resolves outer columns via the join resolver, and the subquery reads

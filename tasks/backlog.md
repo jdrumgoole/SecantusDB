@@ -7456,15 +7456,40 @@ shared storage engine or building large new protocol subsystems:
 
       Pinned by `tests/test_sql_order_by_unorderable.py` (23 cases vs PG 14.13).
 
-- [ ] **OPEN — an aggregate wrapped in a CAST loses its aggregate handling
-      (2026-09-02).** `array_agg(n ORDER BY n)` sorts; `array_agg(n ORDER BY
-      n)::text` returns INSERTION order — the in-call ORDER BY is silently
-      dropped. `mode() WITHIN GROUP (ORDER BY n)` works; `(mode() WITHIN GROUP
-      (ORDER BY n))::text` is `0A000 unsupported aggregate: MODE()`. Both
-      spellings of the cast (`::text` and `CAST(… AS text)`) do it, so it is
-      the `exp.Cast` wrapper the planner's aggregate recognition does not look
-      through, not the parse. Silently wrong output for the first, a refusal
-      for the second.
+- [x] **RESOLVED (2026-09-02) — a NESTED `array_agg` silently dropped its
+      in-call ORDER BY.** Not just under a cast, as first filed: under an
+      operator, a subscript, or another function too —
+      `array_to_string(array_agg(x ORDER BY y), ',')` is the shape that looks
+      like ordinary SQL and gets insertion order back with no error.
+
+      Two registrars exist. The top-level projection path pushes `{v, k}` pairs
+      and sorts them in a post-aggregate; the registrar for an aggregate inside
+      a COMPUTED projection registered a plain `$push` and carried no ordering.
+      `EvaluatedSelectPlan` had no `post_aggregates` field to carry it, so the
+      fix adds the same channel `PipelineSelectPlan` already had, threads it
+      through the shared `_finish_group_window` tail, and applies it in
+      `_evaluated_value_rows`.
+
+      Four near-identical `register_agg` bodies (single-table and join x plain
+      and GROUPING SETS) all had the defect — **when fixing one, grep for the
+      other three.**
+
+      Pinned by `tests/test_sql_nested_array_agg_order.py` (17 cases vs PG 14.13).
+
+- [ ] **OPEN — `GROUPING SETS` rejects ANY computed projection (2026-09-02).**
+      `SELECT g, count(*)::text FROM t GROUP BY GROUPING SETS ((g),())` is
+      `0A000 expected a column, got: CAST(COUNT(*) AS TEXT)` — nothing to do
+      with which aggregate it is. An honest refusal, but PG supports it, and
+      the plain (non-computed) GROUPING SETS projection works, so the gap is
+      the projection builder rather than the grouping.
+
+- [ ] **OPEN — an ordered-set aggregate under a cast is refused (2026-09-02).**
+      `mode() WITHIN GROUP (ORDER BY n)` works; `(mode() WITHIN GROUP (ORDER BY
+      n))::text` is `0A000 unsupported aggregate: MODE()`, as is `+ 1`.
+      `_ordered_set_agg` unwraps `exp.Alias` but not any other wrapper, so the
+      nested scan reaches the bare `Mode` node — which is not itself the
+      aggregate; the `WithinGroup` around it is. An honest refusal, unlike the
+      `array_agg` half of this, which was silently wrong and is fixed.
 
 - [ ] **OPEN — `ORDER BY` over `jsonb` or a range type is an XX000
       (2026-09-02).** `'<' not supported between instances of 'dict' and
