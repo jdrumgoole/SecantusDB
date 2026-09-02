@@ -74,10 +74,14 @@ def _pg_sort(items: list[Any], key_of: Any, specs: list[tuple[int, bool]]) -> No
     parallel list of ``(direction, nulls_first)`` (direction 1 asc / -1 desc).
     NULLs sort to the front or back per ``nulls_first`` independent of direction —
     Postgres orders NULL as though it were the largest value, so this can't be
-    delegated to Mongo's sort (which treats NULL/missing as the smallest)."""
+    delegated to Mongo's sort (which treats NULL/missing as the smallest).
 
-    def cmp(a: Any, b: Any) -> int:
-        ka, kb = key_of(a), key_of(b)
+    Keys are computed ONCE per item rather than on every comparison, which is
+    also where each value is normalised into something comparable."""
+    keyed = [(tuple(typemap.sort_key_value(v) for v in key_of(it)), it) for it in items]
+
+    def cmp(a: tuple, b: tuple) -> int:
+        ka, kb = a[0], b[0]
         for i, (direction, nulls_first) in enumerate(specs):
             x, y = ka[i], kb[i]
             if x is None and y is None:
@@ -92,7 +96,8 @@ def _pg_sort(items: list[Any], key_of: Any, specs: list[tuple[int, bool]]) -> No
             return -base if direction == -1 else base
         return 0
 
-    items.sort(key=functools.cmp_to_key(cmp))
+    keyed.sort(key=functools.cmp_to_key(cmp))
+    items[:] = [it for _, it in keyed]
 
 
 def _order_key_fn(
@@ -2305,7 +2310,11 @@ def _ordered_set_value(kind: str, fraction: float | None, values: Any) -> Any:
     Returns NULL when the (non-NULL) set is empty."""
     import math
 
-    vals = sorted(v for v in (values or []) if v is not None)
+    # Normalised for the same reason `_pg_sort` normalises: a `numeric` value is
+    # a `Decimal128`, which cannot be compared — `percentile_cont` and `mode`
+    # over a numeric column were an internal error — and the interpolation
+    # below needs a value it can do arithmetic on.
+    vals = sorted(typemap.sort_key_value(v) for v in (values or []) if v is not None)
     if not vals:
         return None
     n = len(vals)

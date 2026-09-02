@@ -719,6 +719,35 @@ def unwrap_numeric(value: Any) -> Any:
     return value.to_decimal() if isinstance(value, bson.Decimal128) else value
 
 
+def sort_key_value(value: Any) -> Any:
+    """Normalise one ORDER BY key value so Python can compare it.
+
+    Sorting compares stored values directly, and two of the types this engine
+    stores have no ``<`` at all. `Decimal128` — which is EVERY `numeric` and
+    `money` value — implements no Python numeric protocol, so `ORDER BY` on a
+    numeric column was an `XX000 internal error` (`'<' not supported between
+    instances of 'Decimal128' and 'Decimal128'`) on every sort path that does
+    not delegate to Mongo: a plain `ORDER BY`, a window's `OVER (ORDER BY …)`,
+    `array_agg(x ORDER BY x)` and `WITHIN GROUP (ORDER BY …)`. An interval
+    rides as a subdocument and has the same problem.
+
+    Decimal128 would be wrong here even where it did not raise: its equality
+    compares the BID encoding, so `1.0` and `1.00` are different values and a
+    `rank()` over them made two peers into two ranks.
+
+    Still unnormalised, and so still an internal error: `jsonb` and the range
+    types, both of which ride as subdocuments. Postgres has a documented total
+    order over each, and reproducing it is a slice of its own rather than a
+    coercion — see `tasks/backlog.md`."""
+    if isinstance(value, bson.Decimal128):
+        return value.to_decimal()
+    from secantus.sql import intervals as _intervals
+
+    if _intervals.is_interval(value):
+        return _intervals.total_micros(value)
+    return value
+
+
 def negate(value: Any) -> Any:
     """Arithmetic negation that also handles BSON ``Decimal128`` (which has no
     Python operators of its own)."""
