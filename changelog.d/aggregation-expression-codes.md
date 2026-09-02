@@ -30,3 +30,9 @@ Applying either rule to the family cost 46 shapes before the probe caught it.
 #### Also
 
 `agg_expressions.py` no longer compares `$rand`'s **value** — two correct servers disagree by design, and the moment `$rand` started succeeding the probe reported it as a wrong answer.
+
+#### And a panic
+
+Pointing the probe at the **Rust** server for the first time crashed a request thread: `{$setEquals: []}` reached `&arrays[1..]` on a zero-length slice. `arrays.first()` handled the empty case; the next line did not. Any client could take a thread down with a two-character argument. Fixed with mongod's arity check (17045), which is also what makes the slice safe.
+
+That measurement also put a number on the Rust server's expression error surface for the first time — **1,376 of 3,968**, with **zero wrong values**, almost all of it the engine deferring. Recorded in `tasks/backlog.md`.

@@ -2395,10 +2395,21 @@ fn op_set_difference(arg: &Bson, ctx: &Ctx) -> R {
 
 fn op_set_equals(arg: &Bson, ctx: &Ctx) -> R {
     let arrays = set_arrays(arg, ctx, None)?;
-    let base = match arrays.first() {
-        Some(a) => set_dedup_sorted(a.clone()),
-        None => Bson::Array(Vec::new()),
-    };
+    // ARITY FIRST -- and this is not only a message. `arrays.first()` handled
+    // the empty case, but the `&arrays[1..]` below then PANICKED the server
+    // thread on a zero-length slice: `{$setEquals: []}` from any client was
+    // "range start index 1 out of range for slice of length 0". mongod answers
+    // 17045 (probed 8.2.11), which is also the shape that makes the slice safe.
+    if arrays.len() < 2 {
+        return Err(Fallback::mongo(
+            17045,
+            format!(
+                "$setEquals needs at least two arguments had: {}",
+                arrays.len()
+            ),
+        ));
+    }
+    let base = set_dedup_sorted(arrays[0].clone());
     for other in &arrays[1..] {
         if set_dedup_sorted(other.clone()) != base {
             return Ok(Bson::Boolean(false));
@@ -6287,6 +6298,55 @@ mod tests {
         assert_eq!(
             ev(d.clone(), bson::bson!({"$mod": [-5.5, 2.0]})),
             Bson::Double(-1.5)
+        );
+    }
+}
+
+#[cfg(test)]
+mod set_equals_arity_tests {
+    //! `{$setEquals: []}` PANICKED the server thread: `arrays.first()` handled
+    //! the empty case and the `&arrays[1..]` on the next line did not, so any
+    //! client could take a request thread down with a two-character argument.
+    //! mongod answers 17045, which is also what makes the slice safe.
+
+    use super::*;
+    use bson::{doc, Bson};
+
+    fn eval_expr(expr: Bson) -> Result<Bson, Fallback> {
+        evaluate(&doc! {}, &expr, &Document::new())
+    }
+
+    #[test]
+    fn an_empty_argument_list_does_not_panic() {
+        let err = eval_expr(bson::bson!({"$setEquals": []})).expect_err("expected an error");
+        assert_eq!(
+            err.as_mongo(),
+            Some((17045, "$setEquals needs at least two arguments had: 0"))
+        );
+    }
+
+    #[test]
+    fn one_argument_is_refused_too() {
+        let err = eval_expr(bson::bson!({"$setEquals": [[1, 2]]})).expect_err("expected an error");
+        assert_eq!(
+            err.as_mongo(),
+            Some((17045, "$setEquals needs at least two arguments had: 1"))
+        );
+    }
+
+    #[test]
+    fn two_or_more_still_compare() {
+        assert_eq!(
+            eval_expr(bson::bson!({"$setEquals": [[1, 2], [2, 1]]})).unwrap(),
+            Bson::Boolean(true)
+        );
+        assert_eq!(
+            eval_expr(bson::bson!({"$setEquals": [[1], [2]]})).unwrap(),
+            Bson::Boolean(false)
+        );
+        assert_eq!(
+            eval_expr(bson::bson!({"$setEquals": [[1], [1], [1]]})).unwrap(),
+            Bson::Boolean(true)
         );
     }
 }

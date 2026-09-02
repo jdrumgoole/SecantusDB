@@ -4280,6 +4280,21 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `$setEquals` each behave differently from their own families, and generalising
   either rule cost 46 shapes before the probe caught it. Probe per operator.
 
+- [ ] **The same probe against the RUST server: 1,376 of 3,968 (2026-09-02).**
+  Measured for the first time by pointing `agg_expressions.py` at the Rust
+  server, which nobody had done. **Zero wrong VALUES** — the surface is entirely
+  error-shaped, and most of it is one message: "aggregation pipeline uses a
+  stage or operator not supported by the Rust server", i.e. the engine
+  `Fallback::Defer`s the expression. On the standalone server that is an error
+  with no Python behind it.
+
+  Running it also **panicked the server thread**: `{$setEquals: []}` hit
+  `&arrays[1..]` on a zero-length slice ("range start index 1 out of range for
+  slice of length 0"). `arrays.first()` handled the empty case and the very
+  next line did not. Fixed with the arity check mongod has (17045), which is
+  also what makes the slice safe — but the shape is worth grepping for: an
+  `Option`-safe accessor followed by a raw slice of the same collection.
+
 ### 7.0 Cache-pressure rollback — CI exercises it now
 
 `WT_ROLLBACK` is two conditions wearing one code: a write-write conflict
