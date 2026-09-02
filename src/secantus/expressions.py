@@ -364,6 +364,12 @@ _BINDING_OPS = frozenset({"$map", "$filter", "$reduce"})
 #: Non-deterministic, so never folded.
 _NON_DETERMINISTIC = frozenset({"$rand"})
 
+#: `$getField` reads `$$CURRENT`, so mongod never folds it -- not even with a
+#: wholly literal `input`: `{$getField: {field: 0, input: {a: 1}}}` is an
+#: EXECUTOR error on 8.2.11 (probed 2026-09-02), where treating it as constant
+#: reported the optimizer's prefix.
+_NEVER_FOLDED = frozenset({"$getField"})
+
 #: Variables that are constant for the whole pipeline. `$$ROOT` / `$$CURRENT`
 #: are the document, so they are not.
 _CONSTANT_VARS = frozenset({"NOW", "CLUSTER_TIME"})
@@ -395,7 +401,7 @@ def is_constant_expression(expr: Any, bound: frozenset[str]) -> bool:
     for op, arg in expr.items():
         if op == "$literal":
             continue
-        if op in _NON_DETERMINISTIC or op in _BINDING_OPS:
+        if op in _NON_DETERMINISTIC or op in _BINDING_OPS or op in _NEVER_FOLDED:
             return False
         if op == "$let":
             if not isinstance(arg, Mapping):
@@ -927,11 +933,26 @@ def _op_if_null(arg: Any, ctx: _Ctx, ret: _Eval = None) -> Any:
 _MISSING_PROPAGATING: dict[str, Any] = {}
 
 
+def _operand_type_name(arg: Any, value: Any, ctx: _Ctx) -> str:
+    """The type name mongod prints for `value`, which `arg` evaluated to.
+
+    `_eval` reports an absent field and an explicit null alike as ``None``, but
+    mongod's wrong-type messages distinguish them: ``{$size: "$nosuch"}`` says
+    `missing` where ``{$size: null}`` says `null` (probed 8.2.11, 2026-09-02).
+    Only the message needs the distinction, so it is recovered while one is
+    being built rather than threaded through evaluation.
+    """
+    if value is None and _eval_field_value(arg, ctx) is MISSING:
+        return "missing"
+    return _bson_type_name(value)
+
+
 def _op_size(arg: Any, ctx: _Ctx) -> int:
     value = _eval(arg, ctx)
     if not isinstance(value, list):
         raise ExpressionError(
-            f"The argument to $size must be an array, but was of type: {_bson_type_name(value)}",
+            "The argument to $size must be an array, but was of type: "
+            f"{_operand_type_name(arg, value, ctx)}",
             code=17124,
             code_name="Location17124",
         )
@@ -1777,14 +1798,38 @@ def _op_set_field(arg: Any, ctx: _Ctx) -> Any:
 def _op_get_field(arg: Any, ctx: _Ctx) -> Any:
     """MongoDB 5.0+ ``$getField`` — read a field by name from a document.
 
-    Accepts ``{field, input}`` (full form) or a bare string (shorthand
-    for ``{field: <string>, input: $$CURRENT}``). The field name may
-    contain dots / dollars without being interpreted as a path —
-    that's the whole point of ``$getField`` vs. a bare ``$path``.
+    Accepts ``{field, input}`` (full form) or a bare expression (shorthand
+    for ``{field: <expr>, input: $$CURRENT}``). ``field`` is EVALUATED, not
+    taken literally: a plain string evaluates to itself, so ``{$getField: "s"}``
+    still reads field ``s``, but ``{$getField: "$n"}`` resolves the path and
+    then refuses the int it finds. Taking the bare form literally looked for a
+    field NAMED ``$n`` and answered missing where mongod errors (probed 8.2.11,
+    2026-09-02). A literally-dollared name needs ``$literal`` — which is
+    mongod's rule, and the reason the bare form exists at all.
     """
-    if is_bson_string(arg):
-        field, input_expr = arg, "$$CURRENT"
-    elif isinstance(arg, Mapping):
+    is_options_form = isinstance(arg, Mapping) and not (
+        len(arg) == 1 and next(iter(arg)).startswith("$")
+    )
+    if not is_options_form:
+        field, input_expr = _eval(arg, ctx), "$$CURRENT"
+        if not is_bson_string(field):
+            # mongod distinguishes an ABSENT path from an explicit null here --
+            # `{$getField: "$nosuch"}` says `missing` -- and `_eval` collapses
+            # both to None, so the field-value evaluator supplies the name.
+            named = _eval_field_value(arg, ctx)
+            raise ExpressionError(
+                "$getField requires 'field' to evaluate to type String, but got "
+                f"{'missing' if named is MISSING else _bson_type_name(field)}",
+                code=3041704,
+                code_name="Location3041704",
+            )
+    else:
+        # A single `$`-key document is a nested EXPRESSION, not the
+        # `{field, input}` options form -- `{$getField: {$literal: "$odd"}}` is
+        # how a literally-dollared field name is written, and treating it as the
+        # options form answered "unknown argument: $literal" (probed 8.2.11,
+        # 2026-09-02). The same operator-vs-options rule the date extractors use.
+        #
         # An UNKNOWN argument outranks everything else, and `input` is required
         # once the object form is used (probed 8.2.11).
         for key in arg:
@@ -1808,19 +1853,10 @@ def _op_get_field(arg: Any, ctx: _Ctx) -> Any:
         if not isinstance(field, str):
             raise ExpressionError(
                 "$getField requires 'field' to evaluate to type String, but got "
-                f"{_bson_type_name(field)}",
-                code=5654602,
-                code_name="Location5654602",
+                f"{_operand_type_name(field_expr, field, ctx)}",
+                code=3041704,
+                code_name="Location3041704",
             )
-    else:
-        # NOT a shape complaint: mongod evaluates the bare argument as `field`
-        # and reports its type, with `$getField`'s own 3041704.
-        raise ExpressionError(
-            f"$getField requires 'field' to evaluate to type String, but got "
-            f"{_bson_type_name(arg)}",
-            code=3041704,
-            code_name="Location3041704",
-        )
     # Evaluate ``input`` in a missing-aware way so we can tell an input that
     # resolved to *missing* (an absent field path) apart from an explicit
     # ``null``. mongod (verified against 6.0):
@@ -2450,7 +2486,13 @@ def _op_ts_second(arg: Any, ctx: _Ctx) -> Any:
     if v is None:
         return None
     if not isinstance(v, bson.Timestamp):
-        raise ExpressionError("Argument to $tsSecond must be a timestamp", code=5687301)
+        # The leading space is mongod's own, and it names the offending type
+        # (probed 8.2.11, 2026-09-02).
+        raise ExpressionError(
+            f" Argument to $tsSecond must be a timestamp, but is {_bson_type_name(v)}",
+            code=5687301,
+            code_name="Location5687301",
+        )
     return Int64(v.time)
 
 
@@ -2461,7 +2503,11 @@ def _op_ts_increment(arg: Any, ctx: _Ctx) -> Any:
     if v is None:
         return None
     if not isinstance(v, bson.Timestamp):
-        raise ExpressionError("Argument to $tsIncrement must be a timestamp", code=5687302)
+        raise ExpressionError(
+            f" Argument to $tsIncrement must be a timestamp, but is {_bson_type_name(v)}",
+            code=5687302,
+            code_name="Location5687302",
+        )
     return Int64(v.inc)
 
 
@@ -2722,7 +2768,7 @@ def _op_array_to_object(arg: Any, ctx: _Ctx) -> Any:
 
 def _op_split(arg: Any, ctx: _Ctx) -> Any:
     # mongod: exactly 2 args (16020); a null string/separator -> null; a
-    # non-string first/second arg -> 40085/40086; an empty separator -> 40087.
+    # non-string first/second arg -> 40085/10503900; an empty separator -> 40087.
     if not isinstance(arg, list) or len(arg) != 2:
         n = len(arg) if isinstance(arg, list) else 1
         raise ExpressionError(
@@ -2745,8 +2791,11 @@ def _op_split(arg: Any, ctx: _Ctx) -> Any:
         raise ExpressionError(
             "$split requires an expression that evaluates to a string as a second "
             f"argument, found: {_bson_type_name(sep)}",
-            code=40086,
-            code_name="Location40086",
+            # 10503900 on 8.2.11, not the 40086 this recorded -- the first
+            # argument keeps 40085 and only the SECOND moved (probed
+            # 2026-09-02). We target 8.x, so the newer code is the right one.
+            code=10503900,
+            code_name="Location10503900",
         )
     if sep == "":
         raise ExpressionError(
@@ -3786,7 +3835,9 @@ def _op_slice(arg: Any, ctx: _Ctx) -> Any:
         raise ExpressionError("$slice requires [array, n] or [array, position, n]")
     arr = _eval(arg[0], ctx)
     _reject_non_array(
-        arr, f"First argument to $slice must be an array, but is {_bson_type_name(arr)}", 28724
+        arr,
+        f"First argument to $slice must be an array, but is of type: {_bson_type_name(arr)}",
+        28724,
     )
     if not isinstance(arr, list):
         return None
@@ -4347,6 +4398,12 @@ def _convert_value(value: Any, target: Any) -> Any:
                 raise _overflow_error(rendered)
             return Int64(n) if code == 18 else int(n)
 
+        if isinstance(value, _dt.datetime) and code == 18:
+            # A date is its epoch milliseconds -- but only for the LONG target.
+            # `$toInt` of a date is `241 Unsupported conversion from date to
+            # int`, so this cannot be one "numeric" arm (probed 8.2.11,
+            # 2026-09-02, where `$toLong` of a date answered 241 here).
+            return _wrap(int(value.replace(tzinfo=_dt.timezone.utc).timestamp() * 1000))
         if isinstance(value, bool):
             return _wrap(1 if value else 0)
         if isinstance(value, int):
@@ -4392,6 +4449,12 @@ def _convert_value(value: Any, target: Any) -> Any:
             return Decimal128(decimal_from_double(value))
         if isinstance(value, str):
             return _parse_decimal_string(value)
+        if isinstance(value, _dt.datetime):
+            # Epoch milliseconds, like the long and double targets. `$toInt` of
+            # a date is still 241 -- so this is not one "numeric" arm.
+            return Decimal128(
+                Decimal(int(value.replace(tzinfo=_dt.timezone.utc).timestamp() * 1000))
+            )
     raise ExpressionError(
         f"Unsupported conversion from {_bson_type_name(value)} to "
         f"{_CONVERT_TARGET_NAMES.get(code, target)} in $convert with no onError value",
@@ -4558,9 +4621,30 @@ _SET_OP_CODES = {
 _SET_OPS_NEEDING_TWO = frozenset({"$setEquals"})
 
 
-def _set_arrays(op: str, arg: Any, ctx: _Ctx, *, n: int | None = None) -> list[list[Any]]:
+# The set operators for which a NULL operand makes the whole expression null,
+# rather than being reported as a wrong type.
+#
+# Not uniform, and not guessable: `$setUnion` / `$setIntersection` /
+# `$setDifference` answer null, while `$setEquals` and `$setIsSubset` refuse it
+# by type (`{$setIsSubset: [null, [1]]}` is 17046 naming `null`). Operands are
+# scanned LEFT TO RIGHT, so `{$setUnion: [null, 1]}` is null while
+# `{$setUnion: [1, null]}` raises on the int -- the order decides which rule
+# fires. Probed 8.2.11 (2026-09-02); before this every one of them raised.
+_SET_OPS_NULL_IS_NULL = frozenset({"$setUnion", "$setIntersection", "$setDifference"})
+
+#: `(first, second)` Location codes for the two-operand set operators, which
+#: report a wrong-typed operand under a DIFFERENT code per position.
+_SET_OPS_BY_POSITION = {
+    "$setDifference": (17048, 17049),
+    "$setIsSubset": (17046, 17042),
+}
+
+
+def _set_arrays(op: str, arg: Any, ctx: _Ctx, *, n: int | None = None) -> list[list[Any]] | None:
     """Evaluate a set operator's array arguments, validating each is an array
-    (mongod's per-operator Location code, not a generic TypeMismatch)."""
+    (mongod's per-operator Location code, not a generic TypeMismatch).
+
+    ``None`` when a null operand makes the whole expression null."""
     vals = _eval_args(arg, ctx)
     if n is not None and len(vals) != n:
         raise ExpressionError(f"{op} requires {n} arguments")
@@ -4574,8 +4658,16 @@ def _set_arrays(op: str, arg: Any, ctx: _Ctx, *, n: int | None = None) -> list[l
         )
     code = _SET_OP_CODES.get(op, 14)
     for i, v in enumerate(vals):
+        if v is None and op in _SET_OPS_NULL_IS_NULL:
+            return None
         if not isinstance(v, list):
-            if op in ("$setDifference", "$setIsSubset"):
+            if op in _SET_OPS_BY_POSITION:
+                # One code per POSITION, not one per operator: `$setDifference`
+                # is 17048 for the first operand and 17049 for the second,
+                # `$setIsSubset` 17046 and 17042. Probed 8.2.11 (2026-09-02);
+                # both used to report the first-argument code either way.
+                first_code, second_code = _SET_OPS_BY_POSITION[op]
+                code = first_code if i == 0 else second_code
                 which = "First" if i == 0 else "Second"
                 msg = (
                     f"both operands of {op} must be arrays. {which} argument is of type: "
@@ -4600,15 +4692,20 @@ def _set_arrays(op: str, arg: Any, ctx: _Ctx, *, n: int | None = None) -> list[l
     return vals
 
 
-def _op_set_union(arg: Any, ctx: _Ctx) -> list[Any]:
+def _op_set_union(arg: Any, ctx: _Ctx) -> list[Any] | None:
+    arrays = _set_arrays("$setUnion", arg, ctx)
+    if arrays is None:
+        return None
     all_elems: list[Any] = []
-    for v in _set_arrays("$setUnion", arg, ctx):
+    for v in arrays:
         all_elems.extend(v)
     return _set_dedup_sorted(all_elems)
 
 
-def _op_set_intersection(arg: Any, ctx: _Ctx) -> list[Any]:
+def _op_set_intersection(arg: Any, ctx: _Ctx) -> list[Any] | None:
     arrays = _set_arrays("$setIntersection", arg, ctx)
+    if arrays is None:
+        return None
     if not arrays:
         return []
     result = [
@@ -4617,8 +4714,11 @@ def _op_set_intersection(arg: Any, ctx: _Ctx) -> list[Any]:
     return _set_dedup_sorted(result)
 
 
-def _op_set_difference(arg: Any, ctx: _Ctx) -> list[Any]:
-    a, b = _set_arrays("$setDifference", arg, ctx, n=2)
+def _op_set_difference(arg: Any, ctx: _Ctx) -> list[Any] | None:
+    arrays = _set_arrays("$setDifference", arg, ctx, n=2)
+    if arrays is None:
+        return None
+    a, b = arrays
     out: list[Any] = []
     for x in a:  # first-array order, deduplicated
         if not any(_set_eq(x, y) for y in b) and not any(_set_eq(x, y) for y in out):
@@ -4627,7 +4727,7 @@ def _op_set_difference(arg: Any, ctx: _Ctx) -> list[Any]:
 
 
 def _op_set_equals(arg: Any, ctx: _Ctx) -> bool:
-    arrays = _set_arrays("$setEquals", arg, ctx)
+    arrays = _set_arrays("$setEquals", arg, ctx) or []
     base = _set_dedup_sorted(arrays[0]) if arrays else []
     for other in arrays[1:]:
         o = _set_dedup_sorted(other)
@@ -4637,7 +4737,7 @@ def _op_set_equals(arg: Any, ctx: _Ctx) -> bool:
 
 
 def _op_set_is_subset(arg: Any, ctx: _Ctx) -> bool:
-    a, b = _set_arrays("$setIsSubset", arg, ctx, n=2)
+    a, b = _set_arrays("$setIsSubset", arg, ctx, n=2)  # type: ignore[misc]
     return all(any(_set_eq(x, y) for y in b) for x in a)
 
 
@@ -4743,8 +4843,20 @@ def _bit_operand(op: str, v: Any) -> tuple[int, bool]:
     operators accept only int (32-bit) and long (64-bit) — a bool, double,
     decimal, or anything else raises. ``bson.Int64`` marks a long; a plain ``int``
     is a 32-bit int (``bson`` widens on encode only when out of int32 range)."""
+    # A bool is not an operand for any of them, but the four do NOT agree on
+    # how to say so, and this raised one sentence for all of them:
+    # `{$bitOr: [1, true]}` is the fold family's bare 14 "only supports int and
+    # long operands." with NO type named, while `$bitNot` calls a bool
+    # non-numeric (28765). Probed 8.2.11 (2026-09-02). Checked before the `int`
+    # arm below because `isinstance(True, int)` is true in Python.
     if isinstance(v, bool):
-        raise ExpressionError(f"{op} only supports int and long operands, not bool")
+        if op != "$bitNot":
+            raise ExpressionError(f"{op} only supports int and long operands.")
+        raise ExpressionError(
+            f"{op} only supports numeric types, not bool",
+            code=28765,
+            code_name="Location28765",
+        )
     if isinstance(v, Int64):
         return int(v), True
     if isinstance(v, int):

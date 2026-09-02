@@ -509,7 +509,7 @@ def test_date_misc_typeguard_error_codes() -> None:
         ({"$let": {"vars": {}, "in": "$$x"}}, 17276),
         ({"$switch": {"branches": []}}, 40068),
         ({"$ifNull": [1]}, 1257300),
-        ({"$getField": {"field": 5, "input": {}}}, 5654602),
+        ({"$getField": {"field": 5, "input": {}}}, 3041704),
         ({"$setField": {"field": 5, "input": {}, "value": 1}}, 4161107),
         ({"$sortArray": {"input": [1], "sortBy": "x"}}, 2942507),
         ({"$convert": {"input": 5}}, 9),
@@ -654,12 +654,15 @@ def test_split() -> None:
 
 
 def test_split_argument_validation() -> None:
-    # mongod codes: empty separator 40087, non-string first/second 40085/40086,
-    # wrong arg count 16020; a null string / separator -> null.
+    # mongod codes: empty separator 40087, non-string first/second
+    # 40085/10503900, wrong arg count 16020; a null string / separator -> null.
+    # The SECOND argument's code is not 40086 -- 8.2.11 answers 10503900, while
+    # the first argument keeps 40085 (probed 2026-09-02, and caught by the Rust
+    # parity suite when only one engine had been moved).
     for expr, code in [
         ({"$split": ["a,b", ""]}, 40087),
         ({"$split": [5, ","]}, 40085),
-        ({"$split": ["a,b", 5]}, 40086),
+        ({"$split": ["a,b", 5]}, 10503900),
         ({"$split": ["a,b"]}, 16020),
         ({"$split": ["a,b", ",", "x"]}, 16020),
     ]:
