@@ -1043,3 +1043,85 @@ def test_bound_interval_round_trips(home: Path, binary: bool) -> None:
             cur = conn.cursor(binary=binary)
             cur.execute("select %s::interval", (value,))
             assert cur.fetchone()[0] == value
+
+
+def test_decimal_arithmetic_works_and_stays_exact(home: Path) -> None:
+    """Regression: arithmetic on decimal literals must work at all.
+
+    When decimal literals became `numeric` rather than floats, every arithmetic
+    operator on them started refusing outright — `select 1.5 + 1.5` was an
+    error — and nothing caught it. The exactness is the point of the type:
+    `0.1 + 0.2` is `0.3`, and the result *scale* is part of the answer, so
+    `1.50 + 1.5` is `3.00` while `1.5 + 1.5` is `3.0`.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for expr, want in [
+            ("1.5 + 1.5", "3.0"),
+            ("1.50 + 1.5", "3.00"),
+            ("0.1 + 0.2", "0.3"),
+            ("2.5 * 2", "5.0"),
+            ("1.50 * 1.50", "2.2500"),
+            ("2.00 - 1.0", "1.00"),
+            ("-1::numeric", "-1"),
+        ]:
+            cur.execute(f"select ({expr})::text")
+            assert cur.fetchone()[0] == want, expr
+
+        # More digits than a float holds: these are the same f64 and different
+        # numerics, so the comparison must not go through one.
+        cur.execute("select '12345678901234567890.1'::numeric < '12345678901234567890.2'::numeric")
+        assert cur.fetchone()[0] is True
+
+        # Division is refused rather than guessed at: its result scale depends
+        # on the operands' weights in a way this server has not measured.
+        with pytest.raises(psycopg.Error):
+            cur.execute("select 1.5::numeric / 3")
+
+
+def test_nan_has_a_place_in_the_order(home: Path) -> None:
+    """PostgreSQL orders floats totally; IEEE does not.
+
+    NaN equals itself and sorts above every number, infinity included. Rust's
+    `partial_cmp` reports each of those comparisons as "no answer", which this
+    server turned into an error where PostgreSQL has a result.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for expr in [
+            "'NaN'::float8 = 'NaN'::float8",
+            "'NaN'::float8 > 1e308",
+            "'NaN'::float8 > 'Infinity'::float8",
+            "'Infinity'::float8 > 1e308",
+            "-'Infinity'::float8 < -1e308",
+            "'NaN'::numeric = 'NaN'::numeric",
+        ]:
+            cur.execute(f"select {expr}")
+            assert cur.fetchone()[0] is True, expr
+
+
+def test_an_unknown_literal_takes_the_type_beside_it(home: Path) -> None:
+    """PostgreSQL resolves an unknown literal to the other operand's type.
+
+    That type then decides both the parse and the error — which is why
+    comparing an interval to `'2020-01-01'` is a *bad interval* rather than
+    `false`. The rule applies to comparison exactly as it does to arithmetic;
+    implementing it for arithmetic alone left five different failures hiding
+    behind one "cannot compare these operands" message.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for expr in [
+            "interval '1 day' = '1 day'",
+            "'1 day' = interval '1 day'",
+            "'2026-01-01'::timestamp = '2026-01-01'",
+            "'2026-01-01'::date = '2026-01-01'",
+            "ARRAY[1,2] = '{1,2}'",
+            "ARRAY['a','b'] = '{a,b}'",
+        ]:
+            cur.execute(f"select {expr}")
+            assert cur.fetchone()[0] is True, expr
+
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("select interval '1 day' = '2020-01-01'")
+        assert exc.value.diag.sqlstate == "22007"

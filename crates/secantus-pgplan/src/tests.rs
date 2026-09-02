@@ -1218,3 +1218,100 @@ fn scaling_an_interval_spills_downward() {
     let err = super::eval_binary("/", iv, Bson::Int32(0)).expect_err("div by zero");
     assert_eq!(err.sqlstate(), "22012");
 }
+
+/// `numeric` arithmetic is EXACT, and its result SCALE is part of the answer.
+///
+/// Measured on PostgreSQL 14: addition and subtraction take `max(s1, s2)`,
+/// multiplication takes `s1 + s2`. So `1.50 + 1.5` is `3.00`, not `3.0`, and
+/// `1.50 * 1.50` is `2.2500`. None of this survives a trip through an `f64`.
+///
+/// This is a REGRESSION test in the strict sense: when decimal literals became
+/// `numeric` rather than floats, every one of these operators started refusing
+/// outright — `1.5 + 1.5` was an error — and no test caught it.
+#[test]
+fn decimal_arithmetic_is_exact_and_keeps_its_scale() {
+    let calc = |sql: &str| match plan_ok(sql) {
+        Statement::SelectConstant(sc) => match &sc.columns[0].1 {
+            ConstCol::Value(Bson::Decimal128(d)) => d.to_string(),
+            other => panic!("{sql} should be a decimal, got {other:?}"),
+        },
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    for (sql, want) in [
+        ("SELECT 1.5 + 1.5", "3.0"),
+        ("SELECT 1.50 + 1.5", "3.00"),
+        ("SELECT 1 + 1.5", "2.5"),
+        ("SELECT 1.234 + 1.1", "2.334"),
+        ("SELECT 2.00 - 1.0", "1.00"),
+        ("SELECT 2.5 * 2", "5.0"),
+        ("SELECT 2.5 * 2.0", "5.00"),
+        ("SELECT 1.50 * 1.50", "2.2500"),
+        ("SELECT 0.1 * 0.1", "0.01"),
+        // The reason exactness matters at all.
+        ("SELECT 0.1 + 0.2", "0.3"),
+        ("SELECT -1.5", "-1.5"),
+    ] {
+        assert_eq!(calc(sql), want, "for {sql}");
+    }
+}
+
+/// Decimals compare on their DIGITS, not through a float.
+///
+/// A `numeric` holds 34 significant digits and an `f64` holds about 15, so two
+/// different 20-digit numbers are the SAME float. Scale is not part of
+/// equality — `1.50 = 1.5` — but precision is.
+#[test]
+fn decimals_compare_exactly() {
+    use std::cmp::Ordering;
+    let d = |t: &str| Bson::Decimal128(t.parse().expect("a decimal"));
+    assert_eq!(
+        super::compare_constants(&d("1.50"), &d("1.5")),
+        Some(Ordering::Equal)
+    );
+    assert_eq!(
+        super::compare_constants(&d("0"), &d("-0")),
+        Some(Ordering::Equal)
+    );
+    // Identical as f64, different as numerics.
+    assert_eq!(
+        super::compare_constants(&d("12345678901234567890.1"), &d("12345678901234567890.2")),
+        Some(Ordering::Less)
+    );
+    assert_eq!(
+        super::compare_constants(&d("-1.5"), &d("-1.4")),
+        Some(Ordering::Less)
+    );
+}
+
+/// PostgreSQL gives NaN a place in a TOTAL order, which IEEE does not: NaN
+/// equals itself and sorts ABOVE every number, infinity included.
+///
+/// `f64::partial_cmp` reports every NaN comparison as `None`, which this server
+/// turned into "cannot compare" — an error where PostgreSQL has an answer.
+#[test]
+fn nan_sorts_above_everything_and_equals_itself() {
+    use std::cmp::Ordering;
+    let f = |v: f64| Bson::Double(v);
+    assert_eq!(
+        super::compare_constants(&f(f64::NAN), &f(f64::NAN)),
+        Some(Ordering::Equal)
+    );
+    assert_eq!(
+        super::compare_constants(&f(f64::NAN), &f(f64::INFINITY)),
+        Some(Ordering::Greater)
+    );
+    assert_eq!(
+        super::compare_constants(&f(f64::INFINITY), &f(1e308)),
+        Some(Ordering::Greater)
+    );
+    assert_eq!(
+        super::compare_constants(&f(f64::NEG_INFINITY), &f(-1e308)),
+        Some(Ordering::Less)
+    );
+    // A decimal NaN follows the same rule.
+    let d = |t: &str| Bson::Decimal128(t.parse().expect("a decimal"));
+    assert_eq!(
+        super::compare_constants(&d("NaN"), &d("NaN")),
+        Some(Ordering::Equal)
+    );
+}

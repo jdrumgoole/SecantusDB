@@ -2444,19 +2444,27 @@ fn instant_micros(v: &Bson) -> Option<i64> {
     }
 }
 
-/// Coerce a bare unknown literal that sits beside an interval.
+/// Coerce a bare unknown literal to the type of the operand beside it.
 ///
 /// PostgreSQL resolves an `unknown` literal to the OTHER operand's type before
-/// it chooses an operator, so the interval decides both the parse and the
-/// error. `+` and `-` only: for `*` and `/` PostgreSQL picks a number instead,
-/// which is why `interval '1 day' * '2'` is two days.
-fn coerce_unknown_beside_interval(
+/// it chooses an operator, so that type decides both the parse and the error.
+/// It applies to comparison as much as to arithmetic — `interval '1 day' =
+/// '1 day'` is true, and `interval '1 day' = '2020-01-01'` is `22007` rather
+/// than false.
+///
+/// The decision is made on the AST NODE, not the value: by this point a
+/// `::date` cast is a string too, so only a bare string `AConst` marks a
+/// literal whose type is still unresolved.
+///
+/// `*` and `/` are excluded on purpose — there PostgreSQL resolves the unknown
+/// to a NUMBER instead, which is why `interval '1 day' * '2'` is two days.
+fn coerce_unknown_operand(
     e: &pg_query::protobuf::AExpr,
     lhs: Bson,
     rhs: Bson,
     op: &str,
 ) -> Result<(Bson, Bson)> {
-    if !matches!(op, "+" | "-") {
+    if !matches!(op, "+" | "-" | "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
         return Ok((lhs, rhs));
     }
     let bare_string = |n: Option<&Box<pg_query::protobuf::Node>>| {
@@ -2468,20 +2476,149 @@ fn coerce_unknown_beside_interval(
     };
     let l_bare = bare_string(e.lexpr.as_ref());
     let r_bare = bare_string(e.rexpr.as_ref());
-    let as_interval = |v: &Bson| -> Result<Bson> {
-        match v {
-            Bson::String(t) => Ok(parse_interval(t)?.to_bson()),
-            other => Ok(other.clone()),
-        }
+    if l_bare == r_bare {
+        // Both unresolved, or neither: nothing to resolve against.
+        return Ok((lhs, rhs));
+    }
+    let (typed, unknown) = if r_bare { (&lhs, &rhs) } else { (&rhs, &lhs) };
+    let Bson::String(text) = unknown else {
+        return Ok((lhs, rhs));
     };
-    if Interval::from_bson(&rhs).is_some() && l_bare {
-        return Ok((as_interval(&lhs)?, rhs));
+    let coerced = match typed {
+        v if Interval::from_bson(v).is_some() => Some(parse_interval(text)?.to_bson()),
+        // A timestamp, as the sub-millisecond composite or a BSON date.
+        Bson::Document(d) if d.contains_key(COMPOSITE_DATE) => {
+            Some(cast_value(Bson::String(text.clone()), "timestamp")?)
+        }
+        Bson::DateTime(_) => Some(cast_value(Bson::String(text.clone()), "timestamp")?),
+        // An array literal takes the element type from the array beside it.
+        Bson::Array(items) => {
+            let element = items.first().map(inferred_type).unwrap_or("text");
+            Some(cast_value(
+                Bson::String(text.clone()),
+                &format!("{element}[]"),
+            )?)
+        }
+        _ => None,
+    };
+    let Some(coerced) = coerced else {
+        return Ok((lhs, rhs));
+    };
+    Ok(if r_bare {
+        (lhs, coerced)
+    } else {
+        (coerced, rhs)
+    })
+}
+
+/// A decimal as an exact (unscaled value, scale) pair.
+///
+/// PostgreSQL's `numeric` arithmetic is EXACT and carries a defined result
+/// scale, so it cannot go through an `f64`: `0.1 + 0.2` is `0.3`, not
+/// `0.30000000000000004`, and a 34-digit operand has more digits than a float
+/// can hold. `i128` covers the 34 significant digits Decimal128 stores, and an
+/// operation that would exceed them is an error rather than a rounding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Dec {
+    unscaled: i128,
+    scale: u32,
+}
+
+fn parse_dec(text: &str) -> Option<Dec> {
+    let t = text.trim();
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if body.is_empty() || !body.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
     }
-    if Interval::from_bson(&lhs).is_some() && r_bare {
-        let coerced = as_interval(&rhs)?;
-        return Ok((lhs, coerced));
+    let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+    let digits: String = format!("{int}{frac}");
+    let unscaled: i128 = digits.parse().ok()?;
+    Some(Dec {
+        unscaled: if neg { -unscaled } else { unscaled },
+        scale: u32::try_from(frac.len()).ok()?,
+    })
+}
+
+fn render_dec(d: Dec) -> String {
+    if d.scale == 0 {
+        return d.unscaled.to_string();
     }
-    Ok((lhs, rhs))
+    let neg = d.unscaled < 0;
+    let digits = d.unscaled.unsigned_abs().to_string();
+    let scale = d.scale as usize;
+    let padded = if digits.len() <= scale {
+        format!("{}{}", "0".repeat(scale - digits.len() + 1), digits)
+    } else {
+        digits
+    };
+    let split = padded.len() - scale;
+    format!(
+        "{}{}.{}",
+        if neg { "-" } else { "" },
+        &padded[..split],
+        &padded[split..]
+    )
+}
+
+/// Line two decimals up on the greater scale, exactly.
+fn align(a: Dec, b: Dec) -> Option<(i128, i128, u32)> {
+    let scale = a.scale.max(b.scale);
+    let lift = |d: Dec| -> Option<i128> {
+        let steps = scale - d.scale;
+        d.unscaled.checked_mul(10i128.checked_pow(steps)?)
+    };
+    Some((lift(a)?, lift(b)?, scale))
+}
+
+/// Exact `+`, `-` and `*` on decimals, with PostgreSQL's result scales:
+/// addition and subtraction take `max(s1, s2)`, multiplication takes
+/// `s1 + s2`. Both were measured — `1.50 + 1.5` is `3.00` and `1.50 * 1.50` is
+/// `2.2500`, so the scale is part of the answer rather than formatting.
+///
+/// Division is deliberately absent: its result scale depends on the operands'
+/// weights in a way that has not been measured here, and guessing it would
+/// produce a plausible number of decimal places that is not PostgreSQL's.
+fn decimal_arith(op: &str, a: &str, b: &str) -> Option<Result<Bson>> {
+    let (x, y) = (parse_dec(a)?, parse_dec(b)?);
+    let overflow = || {
+        Err(Error::NumericOutOfRange(
+            "numeric value out of range: the result exceeds the 34 significant \
+             digits this server stores"
+                .to_string(),
+        ))
+    };
+    let out = match op {
+        "+" | "-" => {
+            let Some((xa, ya, scale)) = align(x, y) else {
+                return Some(overflow());
+            };
+            let sum = if op == "+" {
+                xa.checked_add(ya)
+            } else {
+                xa.checked_sub(ya)
+            };
+            match sum {
+                Some(unscaled) => Dec { unscaled, scale },
+                None => return Some(overflow()),
+            }
+        }
+        "*" => match x.unscaled.checked_mul(y.unscaled) {
+            Some(unscaled) => Dec {
+                unscaled,
+                scale: x.scale + y.scale,
+            },
+            None => return Some(overflow()),
+        },
+        _ => return None,
+    };
+    let text = render_dec(out);
+    Some(match parse_numeric(&text) {
+        Ok(d) => Ok(Bson::Decimal128(d)),
+        Err(e) => Err(e),
+    })
 }
 
 fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
@@ -2570,8 +2707,17 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     }
 
     if matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
-        let ord = compare_constants(&lhs, &rhs)
-            .ok_or_else(|| Error::Unsupported(format!("comparing these operands with {op}")))?;
+        let ord = compare_constants(&lhs, &rhs).ok_or_else(|| {
+            // Name the OPERAND TYPES. "comparing these operands" was the second
+            // largest failure signature on the psycopg gauge and said nothing
+            // about which pair to implement -- the same shape as the
+            // unnamed `FuncCall` error before it.
+            Error::Unsupported(format!(
+                "comparing {} with {} using {op}",
+                bson_kind(&lhs),
+                bson_kind(&rhs)
+            ))
+        })?;
         return Ok(Bson::Boolean(match op {
             "=" => ord == std::cmp::Ordering::Equal,
             "<>" | "!=" => ord != std::cmp::Ordering::Equal,
@@ -2580,6 +2726,28 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
             ">" => ord == std::cmp::Ordering::Greater,
             _ => ord != std::cmp::Ordering::Less,
         }));
+    }
+
+    // Decimal arithmetic, before the integer and float paths. A decimal
+    // literal is `numeric`, so `1.5 + 1.5` arrives here as two Decimal128s --
+    // and once decimal literals stopped being floats, every one of these
+    // operators refused outright until this arm existed.
+    if matches!(op, "+" | "-" | "*")
+        && (matches!(lhs, Bson::Decimal128(_)) || matches!(rhs, Bson::Decimal128(_)))
+        && !matches!(lhs, Bson::Double(_))
+        && !matches!(rhs, Bson::Double(_))
+    {
+        let text = |v: &Bson| match v {
+            Bson::Decimal128(d) => Some(d.to_string()),
+            Bson::Int32(i) => Some(i.to_string()),
+            Bson::Int64(i) => Some(i.to_string()),
+            _ => None,
+        };
+        if let (Some(a), Some(b)) = (text(&lhs), text(&rhs)) {
+            if let Some(result) = decimal_arith(op, &a, &b) {
+                return result;
+            }
+        }
     }
 
     let ints = |v: &Bson| match v {
@@ -2655,6 +2823,108 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     )
 }
 
+/// The BSON shape of a value, for diagnostics. Distinct from `inferred_type`,
+/// which answers a PostgreSQL type name and collapses several BSON kinds onto
+/// `text` -- which is exactly what hid three different comparison gaps behind
+/// one "text vs text" message.
+fn bson_kind(v: &Bson) -> &'static str {
+    match v {
+        Bson::String(_) => "string",
+        Bson::Int32(_) => "int32",
+        Bson::Int64(_) => "int64",
+        Bson::Double(_) => "double",
+        Bson::Decimal128(_) => "decimal128",
+        Bson::Boolean(_) => "boolean",
+        Bson::Array(_) => "array",
+        Bson::Binary(_) => "binary",
+        Bson::DateTime(_) => "datetime",
+        Bson::Null => "null",
+        Bson::Document(d) if d.contains_key(INTERVAL_MONTHS) => "interval",
+        Bson::Document(_) => "document",
+        _ => "other",
+    }
+}
+
+/// Compare two decimal texts EXACTLY, digit by digit.
+///
+/// A `numeric` carries up to 34 significant digits and an `f64` holds 15, so
+/// routing a comparison through a float can report two different numbers as
+/// equal. Scale is not part of equality — `1.50 = 1.5` is true — so trailing
+/// zeros are trimmed before comparing.
+///
+/// PostgreSQL gives NaN a place in a TOTAL order, unlike IEEE: NaN equals
+/// itself and sorts ABOVE every number, infinity included. Probed on PG 14.
+fn compare_decimal_text(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let rank = |t: &str| -> Option<i32> {
+        let u = t.trim().to_ascii_lowercase();
+        match u.as_str() {
+            "nan" => Some(2),
+            "infinity" | "inf" | "+infinity" | "+inf" => Some(1),
+            "-infinity" | "-inf" => Some(-1),
+            _ => None,
+        }
+    };
+    match (rank(a), rank(b)) {
+        (Some(x), Some(y)) => return Some(x.cmp(&y)),
+        (Some(x), None) => {
+            return Some(if x > 0 {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            })
+        }
+        (None, Some(y)) => {
+            return Some(if y > 0 {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            })
+        }
+        (None, None) => {}
+    }
+    let split = |t: &str| -> Option<(bool, String, String)> {
+        let t = t.trim();
+        let (neg, body) = match t.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, t.strip_prefix('+').unwrap_or(t)),
+        };
+        if body.is_empty() || !body.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return None;
+        }
+        let (i, f) = body.split_once('.').unwrap_or((body, ""));
+        // Leading zeros in the integer part and trailing zeros in the fraction
+        // change neither the value nor the ordering.
+        let int = i.trim_start_matches('0').to_string();
+        let frac = f.trim_end_matches('0').to_string();
+        Some((neg, int, frac))
+    };
+    let (an, ai, af) = split(a)?;
+    let (bn, bi, bf) = split(b)?;
+    let a_zero = ai.is_empty() && af.is_empty();
+    let b_zero = bi.is_empty() && bf.is_empty();
+    // Negative zero is zero.
+    let an = an && !a_zero;
+    let bn = bn && !b_zero;
+    if an != bn {
+        return Some(if an {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+    let magnitude = ai
+        .len()
+        .cmp(&bi.len())
+        .then_with(|| ai.cmp(&bi))
+        .then_with(|| {
+            let n = af.len().max(bf.len());
+            let pad = |f: &str| format!("{f:0<width$}", width = n);
+            pad(&af).cmp(&pad(&bf))
+        });
+    Some(if an { magnitude.reverse() } else { magnitude })
+}
+
 fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Bson::String(x), Bson::String(y)) => Some(x.cmp(y)),
@@ -2680,6 +2950,9 @@ fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
             Some(x.len().cmp(&y.len()))
         }
         (Bson::Boolean(x), Bson::Boolean(y)) => Some(x.cmp(y)),
+        // Two instants. Without this a timestamp compared to a timestamp fell
+        // through to the numeric path, which has no arm for a BSON date.
+        (Bson::DateTime(x), Bson::DateTime(y)) => Some(x.cmp(y)),
         // Intervals compare FLATTENED -- 30-day months, 24-hour days -- even
         // though they are stored as three independent parts for arithmetic.
         (Bson::Document(_), Bson::Document(_))
@@ -2692,13 +2965,45 @@ fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
             )
         }
         _ => {
+            // Decimals compare on their DIGITS: an f64 holds 15 significant
+            // digits where a numeric holds 34, so a float comparison can call
+            // two different numbers equal.
+            let dec = |v: &Bson| match v {
+                Bson::Decimal128(d) => Some(d.to_string()),
+                Bson::Int32(i) => Some(i.to_string()),
+                Bson::Int64(i) => Some(i.to_string()),
+                _ => None,
+            };
+            // A decimal beside a FLOAT compares as floats: PostgreSQL widens
+            // the numeric to float8 for that operator, so the float's own
+            // precision governs and the exact path would be the wrong answer.
+            let mixed_float = matches!(a, Bson::Double(_)) || matches!(b, Bson::Double(_));
+            if (matches!(a, Bson::Decimal128(_)) || matches!(b, Bson::Decimal128(_)))
+                && !mixed_float
+            {
+                return compare_decimal_text(&dec(a)?, &dec(b)?);
+            }
             let f = |v: &Bson| match v {
                 Bson::Int32(i) => Some(f64::from(*i)),
                 Bson::Int64(i) => Some(*i as f64),
                 Bson::Double(d) => Some(*d),
+                Bson::Decimal128(d) => d.to_string().parse::<f64>().ok(),
                 _ => None,
             };
-            f(a)?.partial_cmp(&f(b)?)
+            let (x, y) = (f(a)?, f(b)?);
+            // PostgreSQL orders floats TOTALLY: NaN equals itself and sorts
+            // above every number, infinity included. IEEE says every NaN
+            // comparison is false, which `partial_cmp` faithfully reports as
+            // `None` -- and that became "cannot compare" rather than an answer.
+            if x.is_nan() || y.is_nan() {
+                return Some(match (x.is_nan(), y.is_nan()) {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    (false, false) => unreachable!("one of them is NaN"),
+                });
+            }
+            x.partial_cmp(&y)
         }
     }
 }
@@ -3049,14 +3354,9 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 _ => return Err(Error::Unsupported(format!("unary {op}"))),
             },
         };
-        // Beside an interval, a bare UNKNOWN literal coerces to an interval --
-        // not to a timestamp. `'2020-01-01' + interval '1 day'` is therefore
-        // 22007 in PostgreSQL, not date arithmetic, and `'1 day' + interval
-        // '1 day'` is `2 days`. A TYPED operand (a `::date` cast, a column) is
-        // untouched and keeps datetime arithmetic, which is why this is decided
-        // on the NODE: after casting, a date is a string here too, so the value
-        // alone cannot tell a literal from a date.
-        let (lhs, rhs) = coerce_unknown_beside_interval(e, lhs, rhs, &op)?;
+        // A bare UNKNOWN literal takes the type of the operand beside it,
+        // which decides both the parse and the error.
+        let (lhs, rhs) = coerce_unknown_operand(e, lhs, rhs, &op)?;
         return eval_binary(&op, lhs, rhs);
     }
     if let Some(N::ParamRef(p)) = node.node.as_ref() {
