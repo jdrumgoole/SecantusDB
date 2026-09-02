@@ -7153,6 +7153,45 @@ shared storage engine or building large new protocol subsystems:
       client depending on the exact value is already outside PG's contract.
       Worth doing only alongside other write-path work.
 
+- [x] **RESOLVED (2026-09-01) — INTEGER COLUMNS STORED OUT-OF-RANGE VALUES.**
+      A data-integrity defect, found by a type-boundary sweep against PG 14.13
+      and not previously filed:
+
+          INSERT INTO t (i) VALUES (2147483648)   pg 22003   us INSERT 0 1
+          SELECT i FROM t                                    us 2147483648
+
+      So an `int` column held a value no int can hold, its declared type and
+      its contents disagreed, and the RowDescription advertised oid 23 (four
+      bytes) for it — the same "declared a type the values do not honour" shape
+      the unnest element-type work had to fix once already. `smallint` and
+      `bigint` were identical, and `1e10::int` returned 10000000000.
+
+      `typemap.check_int_range` is called from the shared integer coercion, so
+      every write path inherits it; the CAST path is guarded at `_eval_cast`'s
+      single exit rather than in each branch (that body has a dozen returns —
+      enum, bit, char-length, range, array — and per-branch guards are how one
+      gets missed). Verified that an overflowing EXPRESSION cannot reach a
+      column through INSERT or UPDATE either. Pinned by
+      `tests/test_sql_int_overflow.py`.
+
+      Note `-2147483648::int` is `22003` in PostgreSQL TOO — the cast binds to
+      the positive literal, which overflows. The test pins both spellings; the
+      first cut of it asserted the unparenthesised form should succeed, and the
+      reference server said otherwise.
+
+- [ ] **OPEN — arithmetic overflow is not detected (measured 2026-09-01).**
+      `SELECT 2147483647 + 1` returns 2147483648 where PG raises
+      `22003 integer out of range`; same for int8 and for underflow.
+
+      **Not an integrity risk** — storing the result anywhere goes through the
+      coercion above and is rejected — so this is a message/semantics gap, not
+      a data one. Closing it needs the arithmetic evaluator to know its
+      operands' declared types, which it currently does not: Python ints carry
+      no width, so `int4 + int4` and `int8 + int8` are indistinguishable at
+      evaluation time. The type inference in `_infer_scalar_tag` already
+      computes the right answer for the SELECT list, so the plumbing exists; it
+      is the per-row evaluator that lacks it.
+
 - [ ] **pgx gauge** (`invoke validate-pgx`, `docs/validation-report-pgx.md`):
   **2026-08-15 official run at `03d5c63b`: 376 P / 2 F / 22 S = 99.5%**,
   from the 2026-08-14 baseline 291/87/22 = 77.0% after the pgconn campaign

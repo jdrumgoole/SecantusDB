@@ -1056,11 +1056,45 @@ def _coercion_error(tag: str, value: Any) -> Exception:
     )
 
 
+#: Inclusive range of each integer type, and PG's spelling in the overflow
+#: message ("integer out of range", not "int4 out of range").
+_INT_RANGES: dict[str, tuple[int, int, str]] = {
+    "int2": (-(2**15), 2**15 - 1, "smallint"),
+    "int4": (-(2**31), 2**31 - 1, "integer"),
+    "int8": (-(2**63), 2**63 - 1, "bigint"),
+}
+
+
+def int_range_error(tag: str) -> Exception:
+    """PG's `22003 <type> out of range`."""
+    from secantus.sql import errors as _sql_errors
+
+    name = _INT_RANGES[tag][2] if tag in _INT_RANGES else SQL_TYPE_NAME.get(tag, tag)
+    return _sql_errors.SQLError("22003", f"{name} out of range")
+
+
+def check_int_range(value: int, tag: str) -> int:
+    """Reject an integer outside ``tag``'s range, as Postgres does.
+
+    Without this a value that no `int` can hold was accepted AND STORED in an
+    `int` column: `INSERT INTO t (i) VALUES (2147483648)` succeeded, so the
+    column's declared type and its contents disagreed and the RowDescription
+    advertised oid 23 for a value that does not fit four bytes. Probed against
+    PG 14.13, which answers `22003 integer out of range` for the cast, the
+    INSERT and the arithmetic alike.
+    """
+    rng = _INT_RANGES.get(tag)
+    if rng is not None and not (rng[0] <= value <= rng[1]):
+        raise int_range_error(tag)
+    return value
+
+
 def _int_or_22p02(value: Any, tag: str) -> int:
     try:
-        return int(value)
+        out = int(value)
     except (TypeError, ValueError) as e:
         raise _coercion_error(tag, value) from e
+    return check_int_range(out, tag)
 
 
 def _trim_fractional_zeros(text: str) -> str:
