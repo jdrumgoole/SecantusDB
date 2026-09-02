@@ -22,6 +22,7 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 
 from invoke.context import Context
@@ -35,6 +36,15 @@ _RUST_ADAPTER_DIR = "crates/secantus-storage-adapter"
 _RUST_PGSERVER_DIR = "crates/secantus-pgserver"
 _RUST_STORAGE_PY_DIR = "crates/secantus-storage-py"
 _RUST_BINARY_DIR = "crates/secantusdb"
+
+# Absolute repo root (this file lives at the repo root). Used by the Windows
+# toolchain probes and the cross-platform WiredTiger build, which need paths
+# that don't depend on the caller's cwd.
+_REPO = pathlib.Path(__file__).resolve().parent
+# The WiredTiger static-lib build the Rust binary/extension link against, built
+# by ``invoke rust-wt-build`` (or on demand by ``rust-binary-build``). Kept under
+# ``build/*/wt-build`` so ``_find_wt_build`` (which globs that) discovers it.
+_RUST_WT_BUILD_DIR = _REPO / "build" / "rust-wt" / "wt-build"
 
 # (No default deselect. The PITR cross-server tests once appeared to be a
 # local-only failure and were deselected; the real cause was a connection-drain
@@ -75,9 +85,122 @@ def _find_wt_build() -> pathlib.Path | None:
     for root in roots:
         d = pathlib.Path(root)
         header = d / "include" / "wiredtiger.h"
-        lib = any((d / f"libwiredtiger{ext}").exists() for ext in (".a", ".dylib", ".so"))
+        # Unix static/shared names plus MSVC's ``wiredtiger.lib`` — the same set
+        # ``secantus-wt``'s build.rs probes, so a Windows WT build is discovered
+        # here too.
+        lib = (
+            any((d / f"libwiredtiger{ext}").exists() for ext in (".a", ".dylib", ".so"))
+            or (d / "wiredtiger.lib").exists()
+        )
         if header.exists() and lib:
             return d
+    return None
+
+
+def _find_vs_install() -> str | None:
+    """Locate the latest Visual Studio install carrying the x64 VC tools (Windows).
+
+    Uses ``vswhere`` (shipped with every VS 2017+ installer) so we find VS
+    wherever it was installed. Returns the installation root, or ``None`` off
+    Windows / when VS with the C++ tools isn't present.
+    """
+    if os.name != "nt":
+        return None
+    pf86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+    vswhere = pathlib.Path(pf86) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if not vswhere.exists():
+        return None
+    out = subprocess.run(
+        [
+            str(vswhere),
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    return out or None
+
+
+_VCVARS_ENV_CACHE: dict[str, str] | None = None
+
+
+def _vcvars_env() -> dict[str, str]:
+    """The environment deltas ``vcvars64.bat`` applies (Windows only).
+
+    Rust's MSVC toolchain locates ``link.exe`` on its own, but bindgen's libclang
+    needs the MSVC + Windows-SDK include dirs, and CMake's Ninja generator needs
+    ``cl.exe`` on ``PATH`` — none of which are present in a plain shell. We invoke
+    ``vcvars64.bat`` once, diff the resulting environment against our own, and
+    return only the keys it added or changed (``PATH`` / ``INCLUDE`` / ``LIB`` /
+    ``LIBPATH`` / ``WindowsSdkDir`` …). Cached: vcvars is slow and invariant for
+    the process. Returns ``{}`` off Windows or when VS isn't found.
+    """
+    global _VCVARS_ENV_CACHE
+    if os.name != "nt":
+        return {}
+    if _VCVARS_ENV_CACHE is not None:
+        return _VCVARS_ENV_CACHE
+    vs = _find_vs_install()
+    vcvars = pathlib.Path(vs) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat" if vs else None
+    if not (vcvars and vcvars.exists()):
+        _VCVARS_ENV_CACHE = {}
+        return _VCVARS_ENV_CACHE
+    # `call vcvars && set` dumps the post-vcvars environment; parse KEY=VALUE.
+    # shell=True (a string, not a list) is deliberate: cmd's quoting rules mangle
+    # the space-laden vcvars path when subprocess builds the command line from a
+    # list, and a leading `call` (not `"`) dodges cmd's strip-the-outer-quotes
+    # rule. No `>nul` redirect — it made cmd exit 1 with no output here; vcvars'
+    # banner lines have no `KEY=VALUE` shape, so they filter out harmlessly.
+    out = subprocess.run(
+        f'call "{vcvars}" && set',
+        capture_output=True,
+        text=True,
+        shell=True,
+        check=False,
+    ).stdout
+    base = {k.upper(): v for k, v in os.environ.items()}
+    delta: dict[str, str] = {}
+    for line in out.splitlines():
+        key, sep, val = line.partition("=")
+        # A real env var name has no spaces; this drops vcvars' banner lines.
+        if sep and key and " " not in key and base.get(key.upper()) != val:
+            delta[key] = val
+    _VCVARS_ENV_CACHE = delta
+    return delta
+
+
+def _libclang_dir() -> str | None:
+    """A directory containing libclang for bindgen, or ``None``.
+
+    Honours ``LIBCLANG_PATH`` first. Otherwise probes, per OS: on Windows a choco
+    LLVM install and the ``libclang`` PyPI wheel bundled in the project venv
+    (``uv pip install libclang`` — no admin needed); on macOS/Linux the Xcode CLT
+    and a common LLVM path.
+    """
+    if os.environ.get("LIBCLANG_PATH"):
+        return os.environ["LIBCLANG_PATH"]
+    if os.name == "nt":
+        candidates = [
+            pathlib.Path(r"C:\Program Files\LLVM\bin"),
+            _REPO / ".venv" / "Lib" / "site-packages" / "clang" / "native",
+        ]
+        for d in candidates:
+            if (d / "libclang.dll").exists():
+                return str(d)
+        return None
+    for cand in (
+        "/Library/Developer/CommandLineTools/usr/lib",  # macOS / Xcode CLT
+        "/usr/lib/llvm-14/lib",  # common Linux
+    ):
+        if pathlib.Path(cand).exists():
+            return cand
     return None
 
 
@@ -95,22 +218,145 @@ def _rust_env() -> dict[str, str]:
     ``WT_BUILD_DIR`` is *not* read by it), so we resolve a complete WT build via
     ``_find_wt_build`` and export those two — which is what makes ``./inv
     rust-*`` build inside a git worktree (it reuses the main checkout's WT).
+
+    On Windows it also folds in the MSVC environment (``_vcvars_env``) so bindgen
+    and CMake's Ninja build find the compiler + SDK headers without the caller
+    opening a Developer Command Prompt.
     """
     env: dict[str, str] = {}
+    if os.name == "nt":
+        env.update(_vcvars_env())
     if not (os.environ.get("SECANTUS_WT_INCLUDE") and os.environ.get("SECANTUS_WT_LIB")):
         wt = _find_wt_build()
         if wt is not None:
             env["SECANTUS_WT_INCLUDE"] = str(wt / "include")
             env["SECANTUS_WT_LIB"] = str(wt)
     if not os.environ.get("LIBCLANG_PATH"):
-        for cand in (
-            "/Library/Developer/CommandLineTools/usr/lib",  # macOS / Xcode CLT
-            "/usr/lib/llvm-14/lib",  # common Linux
-        ):
-            if pathlib.Path(cand).exists():
-                env["LIBCLANG_PATH"] = cand
-                break
+        lc = _libclang_dir()
+        if lc:
+            env["LIBCLANG_PATH"] = lc
     return env
+
+
+def _find_cmake() -> str | None:
+    """A ``cmake`` executable: ``PATH`` first, else the VS-bundled one on Windows."""
+    found = shutil.which("cmake")
+    if found:
+        return found
+    vs = _find_vs_install()
+    if vs:
+        p = pathlib.Path(vs) / "Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe"
+        if p.exists():
+            return str(p)
+    return None
+
+
+def _find_ninja() -> str | None:
+    """A ``ninja`` executable: ``PATH`` first, else the VS-bundled one on Windows."""
+    found = shutil.which("ninja")
+    if found:
+        return found
+    vs = _find_vs_install()
+    if vs:
+        p = pathlib.Path(vs) / "Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe"
+        if p.exists():
+            return str(p)
+    return None
+
+
+def _build_wiredtiger(*, force: bool = False) -> pathlib.Path:
+    """Build the vendored WiredTiger static lib the Rust crates link (cross-platform).
+
+    A lean, no-SWIG build (``ENABLE_PYTHON=OFF``) straight from
+    ``vendor/wiredtiger`` into ``_RUST_WT_BUILD_DIR`` — enough for the standalone
+    ``secantusd-rs`` binary, unlike the wheel's ``CMakeLists.txt`` path which also
+    builds WT's Python bindings (and so needs SWIG). CMake writes only to the
+    binary dir, so the submodule stays clean. Idempotent: returns immediately if
+    the lib + generated header already exist (pass ``force=True`` to rebuild).
+
+    On Windows the compile runs under the MSVC environment (via ``_rust_env`` →
+    ``_vcvars_env``) with the VS-bundled CMake/Ninja, so no Developer Command
+    Prompt or admin is required beyond having the C++ tools + Windows SDK.
+    """
+    build_dir = _RUST_WT_BUILD_DIR
+    src = _REPO / "vendor" / "wiredtiger"
+    static_lib = build_dir / ("wiredtiger.lib" if os.name == "nt" else "libwiredtiger.a")
+    header = build_dir / "include" / "wiredtiger.h"
+    if static_lib.exists() and header.exists() and not force:
+        print(f"WiredTiger already built: {static_lib}")
+        return build_dir
+
+    if not (src / "CMakeLists.txt").exists():
+        raise SystemExit(
+            "vendor/wiredtiger is not checked out. Run:\n"
+            "  git submodule update --init --depth 1 vendor/wiredtiger"
+        )
+    cmake = _find_cmake()
+    if not cmake:
+        raise SystemExit(
+            "cmake not found. Install CMake, or on Windows the Visual Studio "
+            "'C++ CMake tools for Windows' component."
+        )
+    ninja = _find_ninja()
+    env = {**os.environ, **_rust_env()}
+    if os.name == "nt" and not env.get("INCLUDE"):
+        raise SystemExit(
+            "MSVC toolchain not found. Install Visual Studio (or Build Tools) with "
+            "the 'Desktop development with C++' workload — it provides the VC "
+            "compiler and the Windows SDK that native linking needs."
+        )
+
+    # Compressor flags mirror CMakeLists.txt's WT_ZLIB_ARG: on non-Windows WT is
+    # built with the builtin zlib + lz4 block-compressor extensions (which
+    # secantus-storage's table configs select), so libz / liblz4 must be present
+    # at build time (CI installs liblz4-dev). Windows omits them, matching the
+    # storage layer's Windows path.
+    if os.name == "nt":
+        zlib_args: list[str] = []
+    else:
+        zlib_args = [
+            "-DENABLE_ZLIB=OFF",
+            "-DHAVE_BUILTIN_EXTENSION_ZLIB=ON",
+            "-DENABLE_LZ4=OFF",
+            "-DHAVE_BUILTIN_EXTENSION_LZ4=ON",
+        ]
+
+    configure = [
+        cmake,
+        "-S",
+        str(src),
+        "-B",
+        str(build_dir),
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DENABLE_STATIC=ON",
+        "-DENABLE_SHARED=OFF",
+        "-DENABLE_PYTHON=OFF",
+        "-DENABLE_CPPSUITE=OFF",
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+        "-DWITH_PIC=ON",
+        "-DHAVE_DIAGNOSTIC=OFF",
+        *zlib_args,
+    ]
+    if ninja:
+        configure += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"]
+    elif os.name == "nt":
+        raise SystemExit("ninja not found. Install Ninja, or the VS 'C++ CMake tools' component.")
+
+    print(f"Configuring WiredTiger -> {build_dir}")
+    subprocess.run(configure, env=env, check=True)
+    print("Building wiredtiger_static ...")
+    subprocess.run(
+        [cmake, "--build", str(build_dir), "--target", "wiredtiger_static"],
+        env=env,
+        check=True,
+    )
+    if not (static_lib.exists() and header.exists()):
+        raise SystemExit(
+            f"WiredTiger build completed but expected outputs are missing:\n"
+            f"  {static_lib}\n  {header}"
+        )
+    print(f"WiredTiger built: {static_lib}")
+    return build_dir
 
 
 @task(name="rust-test")
@@ -334,21 +580,40 @@ def rust_storage_py(c: Context) -> None:
     )
 
 
+@task(name="rust-wt-build")
+def rust_wt_build(c: Context, force: bool = False) -> None:
+    """Build the vendored WiredTiger static lib the Rust crates link (cross-platform).
+
+    Runs on Linux, macOS and Windows: a lean ``ENABLE_PYTHON=OFF`` build (no SWIG)
+    from ``vendor/wiredtiger`` into ``build/rust-wt/wt-build``, discovered
+    thereafter by ``_find_wt_build`` / ``_rust_env``. On Windows it uses the
+    VS-bundled CMake + Ninja under the auto-detected MSVC environment — no
+    Developer Command Prompt needed. ``--force`` rebuilds even if already present.
+
+    Prerequisites: a C toolchain (Linux/macOS: cc + CMake + Ninja + liblz4-dev;
+    Windows: Visual Studio 'Desktop development with C++' — VC tools + Windows
+    SDK — which bundles CMake + Ninja). Idempotent; safe to call before every
+    Rust binary/extension build.
+    """
+    _build_wiredtiger(force=force)
+
+
 @task(name="rust-binary-test")
 def rust_binary_test(c: Context) -> None:
     """Build the standalone ``secantusdb`` binary and run its smoke test.
 
-    Builds the WiredTiger-linking bin crate, then launches it from
-    tests/test_rust_binary_smoke.py (ephemeral port, pymongo round-trip,
-    clean SIGTERM exit) in an isolated interpreter. Same WiredTiger /
-    libclang prerequisites as ``rust-wt-test``.
+    Builds WiredTiger if needed (``rust-wt-build``), then the WiredTiger-linking
+    bin crate, then launches it from tests/test_rust_binary_smoke.py (ephemeral
+    port, pymongo round-trip, clean SIGTERM exit) in an isolated interpreter.
+    Same WiredTiger / libclang prerequisites as ``rust-wt-test``.
     """
-    c.run(f"cd {_RUST_BINARY_DIR} && cargo build", pty=True, env=_rust_env())
+    _build_wiredtiger()
+    c.run(f"cd {_RUST_BINARY_DIR} && cargo build", pty=os.name != "nt", env=_rust_env())
     c.run(
         "uv run --no-project --with pymongo --with pytest "
         "python -m pytest tests/test_rust_binary_smoke.py "
         "-o addopts= -p no:cacheprovider -q",
-        pty=True,
+        pty=os.name != "nt",
     )
 
 
@@ -357,13 +622,17 @@ def rust_binary_build(c: Context, release: bool = False) -> None:
     """Build the standalone ``secantusdb`` binary (no smoke test) and print its path.
 
     The fast inner-loop build for the ten non-pymongo driver gauges, which run
-    against the daemon binary. ``--release`` for an optimised build. WiredTiger /
-    libclang prerequisites as ``rust-wt-test`` (auto-filled when unset).
+    against the daemon binary. Builds WiredTiger first if needed
+    (``rust-wt-build``) — which is what makes this work out-of-the-box on Windows.
+    ``--release`` for an optimised build. WiredTiger / libclang prerequisites are
+    auto-filled when unset (see ``_rust_env`` / ``_build_wiredtiger``).
     """
+    _build_wiredtiger()
     flag = " --release" if release else ""
-    c.run(f"cd {_RUST_BINARY_DIR} && cargo build{flag}", pty=True, env=_rust_env())
+    c.run(f"cd {_RUST_BINARY_DIR} && cargo build{flag}", pty=os.name != "nt", env=_rust_env())
     sub = "release" if release else "debug"
-    print(f"binary: {_RUST_BINARY_DIR}/target/{sub}/secantusd-rs")
+    ext = ".exe" if os.name == "nt" else ""
+    print(f"binary: {_RUST_BINARY_DIR}/target/{sub}/secantusd-rs{ext}")
 
 
 @task(name="rust-server-build")

@@ -136,6 +136,13 @@ rust = [
     # parity tests / using the engines as a library. Built from the PyO3 bindings
     # crate crates/secantus-core-py/ (wrapping crates/secantus-core/).
     "secantus-core==0.5.2b15",
+    # Windows-only: bindgen (in `secantus-wt`'s build.rs) needs libclang, and the
+    # standard Windows dev box has no system libclang. This wheel bundles
+    # `libclang.dll`; `rust_tasks._libclang_dir` discovers it in the venv so
+    # `invoke rust-wt-build` / `rust-binary-build` work with no extra install. On
+    # Linux/macOS the system/Xcode libclang is used, so the marker excludes it
+    # there; the shipping `secantus` wheel never pulls the `rust` extra.
+    "libclang; sys_platform == 'win32'",
 ]
 sql = [
     # The embedded SQL engine + (later) the PostgreSQL-wire server. sqlglot is
