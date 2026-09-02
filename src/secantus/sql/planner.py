@@ -1775,6 +1775,27 @@ def _where_filter(
     return _expr_to_filter(rewritten, table_resolver(table), ctx)
 
 
+def stamp_enum_comparisons(
+    stmt: exp.Expression, table: TableDef, subctx: SubqueryCtx | None = None
+) -> None:
+    """Mark every enum range comparison in a statement with its label list.
+
+    The WHERE clause is rewritten to an `IN` over the satisfying labels, which
+    the Mongo filter can push down. A comparison in the SELECT LIST has to
+    yield a BOOLEAN instead, and is evaluated by `scalar`, which has no
+    catalog — so the labels are stamped on the node for it to read. Without
+    this `SELECT m > 'ok'` answered by SPELLING while `WHERE m > 'ok'` did
+    not, which is a worse state than either being wrong on its own."""
+    for cmp_node in stmt.find_all(*_CMP_OPS):
+        for side in (cmp_node.this, cmp_node.expression):
+            if not isinstance(side, exp.Column):
+                continue
+            labels = _enum_labels_for_column(table.column(_column_name(side)), subctx)
+            if labels:
+                cmp_node._secantus_enum_labels = list(labels)  # noqa: SLF001
+                break
+
+
 def _rewrite_enum_comparisons(
     node: exp.Expression, table: TableDef, subctx: SubqueryCtx | None = None
 ) -> exp.Expression:
@@ -3450,6 +3471,7 @@ def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = 
     # below resolves an ORDER BY term to a COLUMN and would not recognise a
     # `Collate` wrapper. Validation (unknown collation -> 42704) happens here.
     collate_orders = _collate_order_map(stmt, table)
+    stamp_enum_comparisons(stmt, table, subctx)
     filt = _where_filter(stmt, table, subctx)
     order = _order_terms(stmt, table)
     limit, skip = _limit_skip(stmt)
@@ -6082,6 +6104,11 @@ def _plan_pipeline_select(
     # Route a WHERE / ORDER BY on an indexed expression onto its hidden field so the
     # leading ``$match`` / sort can use the storage index.
     rewrite_expr_index_refs(stmt, table)
+
+    # Mark enum comparisons once, for every single-table shape this umbrella
+    # dispatches to — a comparison in the SELECT list is evaluated by `scalar`,
+    # which has no catalog of its own.
+    stamp_enum_comparisons(stmt, table, _pipeline_subctx.get())
 
     # Computed GROUP BY keys (``GROUP BY lower(name)`` / ``x + 1`` / ``ROLLUP(lower(x))``)
     # — rewrite each into a synthetic column materialised by a pre-``$group``

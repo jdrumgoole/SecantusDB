@@ -7982,66 +7982,26 @@ shared storage engine or building large new protocol subsystems:
 
       Pinned by `tests/test_sql_sweep_five.py` (24 cases vs PG 14.13).
 
-- [ ] **OPEN — enum comparison in a SELECT LIST (2026-09-02).**
-      `SELECT m > 'ok' FROM t` still answers by text order; the WHERE form is
-      fixed. The projection goes through the scalar evaluator, which has no
-      catalog — the same label-set rewrite would work, applied to projection
-      expressions, or the labels could be stamped on the comparison node.
+- [x] **RESOLVED (2026-09-02) — the enum story, finished.** The WHERE half was
+      fixed by rewriting a range comparison into the satisfying label set. The
+      SELECT-LIST half has to yield a BOOLEAN and is evaluated by `scalar`,
+      which has no catalog — so `SELECT m > 'ok'` still answered by SPELLING
+      while `WHERE m > 'ok'` did not. **Two halves of one operator disagreeing
+      is worse than either being wrong alone**, and it is exactly the state a
+      partial fix leaves behind.
 
-- [ ] **OPEN — `enum_range()` / `enum_first()` / `enum_last()` (2026-09-02).**
-      `0A000`. They need the enum's labels, i.e. the catalog, inside the scalar
-      evaluator; the argument is a `NULL::<enum>` cast, so the type name is on
-      the node.
+      `planner.stamp_enum_comparisons` marks the label list on the comparison
+      node. It has to run at the UMBRELLA planner (`_plan_pipeline_select`),
+      not in `plan_select`: a computed projection is dispatched elsewhere, and
+      stamping in `plan_select` silently covered nothing.
 
-- [x] **RESOLVED (2026-09-02) — a SIXTH sweep (constraints, identity, time
-      zones, GUCs, string functions): 20 of 33, now 26.**
+      `enum_range` / `enum_first` / `enum_last` take their type from the
+      ARGUMENT'S CAST (the argument is a NULL), so the value-only builtin table
+      cannot see it — they route through a node-aware handler instead. Note the
+      sentinel has to be caught at BOTH `_call_func` call sites; catching one
+      let the sentinel object itself reach the client.
 
-      **`age()` borrowed from the wrong month.** `age('2021-03-15',
-      '2020-01-20')` answered `1 year 1 mon 23 days`; PG answers 26. When the
-      day difference goes negative the borrow takes the length of the START
-      date's month — not the month before `end`, and not a flat 31. Three
-      readings all fit the first probe, so it took eight cases to
-      discriminate: `age('2020-04-01','2020-01-15')` is 17 days (January's 31,
-      not April's 30) and `age('2020-03-01','2020-02-28')` is 2 (February's 29,
-      not 31). **A single probe would have picked the wrong rule.**
-
-      Two existing tests had recorded the old answer and are corrected.
-
-      Also: `format('%1$s')` positional specifiers (unrecognised, the whole
-      directive was copied through as literal text, so the format string came
-      back unformatted); `current_setting('nope', true)` → NULL and
-      `current_setting('nope')` → 42704, both of which answered the empty
-      string; `parse_ident` / `unistr` / `normalize`; and `localtimestamp`
-      nested in an expression AND in the SESSION's zone rather than the
-      machine's wall clock — a different instant whenever the two differ.
-
-      Pinned by `tests/test_sql_sweep_six.py` (32 cases vs PG 14.13).
-
-- [x] **RESOLVED (2026-09-02) — `AT TIME ZONE`, `LIKE ALL/ANY`, and the
-      `timezone_*` extract fields.** Took the sixth sweep from 20 of 33 to 30.
-
-      `AT TIME ZONE` reads BOTH ways and the direction depends on the OPERAND:
-      a naive timestamp is interpreted as being in the zone and becomes an
-      instant; an aware one is converted into the zone and loses it. The result
-      TYPE flips with it, which is why the tag branch consults the operand.
-
-      `extract(timezone_hour …)` reports the SESSION zone's offset, not the
-      literal's — PG normalises a timestamptz into the session zone before
-      extracting, so `'…+05'::timestamptz` is 0 under a UTC session. Reporting
-      the value's own offset gave 5.
-
-      Also: the identity / generated-column insert errors folded PG's DETAIL
-      line into the MESSAGE, making a message no client can match on. Both now
-      carry `D` (and the identity one PG's `H` hint) separately.
-
-      Pinned by `tests/test_sql_at_time_zone.py` (20 cases vs PG 14.13).
-
-- [ ] **OPEN — `IS NORMALIZED` and `to_ascii()` (2026-09-02).**
-      `'abc' IS NORMALIZED` parses as a COLUMN REFERENCE (`42703 column
-      "normalized" does not exist`), so it needs parser-level handling rather
-      than a function. `to_ascii()` errors on both servers with different
-      messages — PG's is an encoding-conversion refusal, ours a missing
-      function.
+      Pinned by `tests/test_sql_enum_order.py` (13 cases vs PG 14.13).
 
 - [ ] **OPEN — arithmetic in a WHERE clause is still unchecked (2026-09-02).**
       `SELECT * FROM t WHERE i + 1 > 0` returns rows where PG raises `22003`.
