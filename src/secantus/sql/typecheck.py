@@ -585,6 +585,27 @@ def _analyse(
         if _has_nested_query(node, stmt):
             continue
         _check_arithmetic(node, resolver)
+    for node in stmt.find_all(exp.DPipe):
+        _stamp_array_concat(node, resolver)
+
+
+def _stamp_array_concat(node: exp.Expression, resolver: _Resolver) -> None:
+    """Mark a ``||`` whose operand is an ARRAY-typed column.
+
+    Postgres treats a NULL array as EMPTY in a concatenation, so
+    `NULL::int[] || 9` is `{9}` — while a NULL of any other type makes the
+    whole `||` NULL. The evaluator sees only values, and a NULL array and a
+    NULL string are the same `None`, so it answered NULL for both. A cast or an
+    `ARRAY[…]` constructor it can read off the node itself; a COLUMN needs the
+    catalog, which is what this pass has."""
+    for side in (node.this, node.expression):
+        col = resolver.column(side) if isinstance(side, exp.Column) else None
+        if col is not None and typemap.is_array_tag(col.type_tag):
+            # Both marks matter: one says this `||` is an array concat at all,
+            # the other says WHICH side is the array — a NULL there is empty,
+            # while a NULL on the element side stays a NULL element.
+            node._secantus_array_concat = True  # noqa: SLF001
+            side._secantus_array_operand = True  # noqa: SLF001
 
 
 def _set_assignments(stmt: exp.Expression) -> set[int]:

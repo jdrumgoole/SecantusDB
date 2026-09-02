@@ -359,7 +359,26 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     if isinstance(node, exp.DPipe):  # || string concatenation
         left, right = evaluate(node.this, scope, ctx), evaluate(node.expression, scope, ctx)
         if left is None or right is None:
-            return None
+            # A NULL ARRAY is EMPTY in a concatenation — `NULL::int[] || 9` is
+            # `{9}` in PG — while a NULL of any other type makes the whole `||`
+            # NULL. Both are `None` here, so the ARRAY-ness has to come from the
+            # node: a cast or an `ARRAY[…]` is readable directly, a column is
+            # stamped by `typecheck._stamp_array_concat`.
+            array_side = (
+                isinstance(left, list)
+                or isinstance(right, list)
+                or getattr(node, "_secantus_array_concat", False)
+                or _is_array_typed_node(node.this)
+                or _is_array_typed_node(node.expression)
+            )
+            if not array_side or (left is None and right is None):
+                return None
+            # A NULL on the ARRAY side is empty; a NULL ELEMENT stays an element,
+            # which is why `NULL::int || '{1}'::int[]` is `{NULL,1}`.
+            if left is None:
+                left = [] if _is_array_operand(node.this) else [None]
+            if right is None:
+                right = [] if _is_array_operand(node.expression) else [None]
         # ``bytea || bytea`` concatenates the raw bytes; anything else is text.
         if isinstance(left, (bytes, bytearray)) and isinstance(right, (bytes, bytearray)):
             return bytes(left) + bytes(right)
@@ -1026,6 +1045,37 @@ def _unary(
     return handler
 
 
+def _eval_trim(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """`TRIM([LEADING|TRAILING|BOTH] [chars] FROM string)`.
+
+    The trim characters and the position were both IGNORED — every spelling ran
+    a plain `str.strip()`, so `trim(both 'x' from 'xxabxx')` answered
+    `'xxabxx'` where PG answers `'ab'`. Silently wrong, and only for the SQL
+    keyword form: `btrim` / `ltrim` / `rtrim` take their characters as an
+    ordinary second argument and were fine.
+
+    The second operand is a SET of characters, not a substring, which is what
+    `str.strip(chars)` already means."""
+    value = evaluate(node.this, scope, ctx)
+    if value is None:
+        return None
+    text = _as_text(value)
+    chars_node = node.args.get("expression")
+    if chars_node is None:
+        chars = " "
+    else:
+        raw = evaluate(chars_node, scope, ctx)
+        if raw is None:
+            return None
+        chars = _as_text(raw)
+    position = str(node.args.get("position") or "BOTH").upper()
+    if position == "LEADING":
+        return text.lstrip(chars)
+    if position == "TRAILING":
+        return text.rstrip(chars)
+    return text.strip(chars)
+
+
 def _eval_round(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     v = typemap.unwrap_numeric(evaluate(node.this, scope, ctx))
     if v is None:
@@ -1059,10 +1109,20 @@ def _eval_substring(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> A
             return None
         return m.group(1) if m.re.groups else m.group(0)
     start = int(start_val) if start_val is not None else 1
-    begin = max(start - 1, 0)  # SQL substring is 1-based
-    if length_node is not None:
-        return text[begin : begin + int(evaluate(length_node, scope, ctx))]
-    return text[begin:]
+    # PG measures the length from the ORIGINAL start, then clips to the string:
+    # `substr('abcdef', -1, 3)` covers positions -1, 0 and 1, so it is `'a'`.
+    # Clamping the start first and THEN counting gave `'abc'`.
+    begin = max(start, 1)
+    if length_node is None:
+        return text[begin - 1 :]
+    length = evaluate(length_node, scope, ctx)
+    if length is None:
+        return None
+    length = int(length)
+    if length < 0:
+        raise errors.SQLError("22011", "negative substring length not allowed")
+    stop = min(start + length, len(text) + 1)
+    return text[begin - 1 : max(stop - 1, begin - 1)]
 
 
 def _looks_like_int(text: str) -> bool:
@@ -1105,6 +1165,23 @@ def _eval_array_prepend(node: exp.Expression, scope: Scope, ctx: ScalarContext) 
     arr = evaluate(node.this, scope, ctx)
     elem = evaluate(node.args.get("expression"), scope, ctx)
     return [elem] + _as_list(arr)
+
+
+def _is_array_typed_node(node: exp.Expression) -> bool:
+    """Whether a node is STATICALLY an array — an `ARRAY[…]` constructor or a
+    cast to an array type. A column needs the catalog and is stamped instead."""
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if isinstance(node, exp.Array):
+        return True
+    if isinstance(node, exp.Cast):
+        return typemap.is_array_tag(typemap.type_tag_for_sql(node.to) or "")
+    return False
+
+
+def _is_array_operand(node: exp.Expression) -> bool:
+    """Whether THIS side of a `||` is the array, rather than an element."""
+    return _is_array_typed_node(node) or getattr(node, "_secantus_array_operand", False)
 
 
 def _eval_array_cat(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
@@ -1411,6 +1488,29 @@ def _eval_trunc(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return v.quantize(decimal.Decimal(1).scaleb(-n), rounding=decimal.ROUND_DOWN)
     factor = 10.0**n
     return math.trunc(v * factor) / factor
+
+
+def _eval_to_hex(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """`to_hex(int)` / `to_hex(bigint)` — was `0A000 function hex() is not
+    supported`, naming a function the user did not write.
+
+    A negative value is rendered as its unsigned two's complement, at the
+    argument's OWN width: `to_hex(-1)` is `ffffffff` but `to_hex((-1)::bigint)`
+    is `ffffffffffffffff`. The width comes from an explicit cast where there is
+    one, otherwise from whether the value fits an `integer` — which is also how
+    Postgres types the literal."""
+    value = typemap.unwrap_numeric(evaluate(node.this, scope, ctx))
+    if value is None:
+        return None
+    number = int(value)
+    inner = node.this
+    while isinstance(inner, exp.Paren):
+        inner = inner.this
+    wide = (isinstance(inner, exp.Cast) and typemap.type_tag_for_sql(inner.to) == "int8") or not (
+        -(2**31) <= number <= 2**31 - 1
+    )
+    bits = 64 if wide else 32
+    return format(number & ((1 << bits) - 1), "x")
 
 
 def _eval_log(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
@@ -2086,7 +2186,7 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
     exp.Lower: _unary(lambda v: v.get("lower") if isinstance(v, dict) else _as_text(v).lower()),
     # ``length()`` — a bytea's byte count, else the string's character length.
     exp.Length: _unary(lambda v: len(v) if isinstance(v, (bytes, bytearray)) else len(_as_text(v))),
-    exp.Trim: _unary(lambda v: _as_text(v).strip()),
+    exp.Trim: lambda n, s, c: _eval_trim(n, s, c),
     # These three carry their FIRST argument in ``node.this``, which the generic
     # `_eval_typed_func` path drops (it reads ``node.expressions`` only) — so
     # they reached `_call_func` with an empty arg list and answered NULL.
@@ -2112,6 +2212,18 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
         [evaluate(x, s, c) for x in (n.this, n.expression, n.args.get("null")) if x is not None],
     ),
     exp.MD5: lambda n, s, c: _plain_scalar("md5", [evaluate(n.this, s, c)]),
+    exp.Hex: lambda n, s, c: _eval_to_hex(n, s, c),
+    # sqlglot renames `make_time` / `make_timestamp` to these typed nodes, so
+    # they never reached the plain-builtin table and reported
+    # `function time_from_parts() is not supported` — a name the user never
+    # wrote. `make_date` keeps its own name and goes through that table.
+    exp.TimeFromParts: lambda n, s, c: _make_datetime(
+        "make_time", [evaluate(n.args.get(k), s, c) for k in ("hour", "min", "sec")]
+    ),
+    exp.TimestampFromParts: lambda n, s, c: _make_datetime(
+        "make_timestamp",
+        [evaluate(n.args.get(k), s, c) for k in ("year", "month", "day", "hour", "min", "sec")],
+    ),
     exp.StartsWith: lambda n, s, c: _plain_scalar(
         "starts_with", [evaluate(n.this, s, c), evaluate(n.expression, s, c)]
     ),
@@ -3754,6 +3866,8 @@ def _plain_scalar(name: str, args: list[Any]) -> Any:
         if not isinstance(d, _Dec):
             d = _Dec(str(d))
         return max(0, -d.as_tuple().exponent)
+    if name in ("make_date", "make_time", "make_timestamp"):
+        return _make_datetime(name, args)
     if name == "div":
         # Integer quotient of two numerics, truncated toward zero — PG returns
         # NUMERIC, not int.
@@ -3766,6 +3880,49 @@ def _plain_scalar(name: str, args: list[Any]) -> Any:
             raise errors.SQLError("22012", "division by zero")
         return _Dec(int(num / den))
     return _UNSUPPORTED
+
+
+def _make_datetime(name: str, args: list[Any]) -> Any:
+    """`make_date` / `make_time` / `make_timestamp` — each was
+    `0A000 function … is not supported`.
+
+    The seconds argument is fractional, so `make_time(10, 30, 45.5)` is
+    `10:30:45.5`. An impossible field is `22008 date field value out of range`
+    with the attempted value spelled out, which is what PG reports rather than
+    a generic parse failure."""
+    if any(a is None for a in args):
+        return None
+    values = [typemap.unwrap_numeric(a) for a in args]
+    try:
+        if name == "make_date":
+            year, month, day = (int(v) for v in values[:3])
+            return _dt.date(year, month, day)
+        seconds = float(values[-1])
+        whole, micros = divmod(round(seconds * 1_000_000), 1_000_000)
+        if name == "make_time":
+            hour, minute = (int(v) for v in values[:2])
+            # `isoformat()` pads the fraction to six digits; PG prints the
+            # shortest form, so `make_time(10, 30, 45.5)` is `10:30:45.5`.
+            rendered = _dt.time(hour, minute, int(whole), int(micros)).isoformat()
+            return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
+        year, month, day, hour, minute = (int(v) for v in values[:5])
+        return _dt.datetime(year, month, day, hour, minute, int(whole), int(micros))
+    except (ValueError, TypeError, OverflowError):
+        if name == "make_time":
+            hh, mm, ss = values[0], values[1], values[2]
+            raise errors.SQLError(
+                "22008",
+                f"time field value out of range: {int(hh):02d}:{int(mm):02d}:{_time_secs(ss)}",
+            ) from None
+        shown = "-".join(f"{int(v):02d}" for v in values[:3])
+        raise errors.SQLError("22008", f"date field value out of range: {shown}") from None
+
+
+def _time_secs(value: Any) -> str:
+    """Seconds as PG spells them in a `make_time` range error: two digits, with
+    a fractional part only when there is one."""
+    seconds = float(value)
+    return f"{seconds:02.0f}" if seconds == int(seconds) else f"{seconds:09.6f}".rstrip("0")
 
 
 #: Sentinel: `_plain_scalar` did not recognise the name (distinct from a
@@ -3788,6 +3945,9 @@ PLAIN_SCALAR_TAGS = {
     "regexp_match": "text[]",
     "regexp_split_to_array": "text[]",
     "string_to_array": "text[]",
+    "make_date": "date",
+    "make_time": "time",
+    "make_timestamp": "timestamp",
 }
 
 

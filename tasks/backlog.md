@@ -7684,6 +7684,48 @@ shared storage engine or building large new protocol subsystems:
       scalars with containers comes back in a non-transitive order. A
       partition of homogeneous containers is correct.
 
+- [x] **RESOLVED (2026-09-02) — nine divergences from a BROAD SWEEP.** Built a
+      corpus of ordinary SQL (strings, patterns, dates, math, booleans, arrays,
+      set ops, CTEs, windows), ran it against both servers and diffed: 54 of 63
+      matched, and the nine that did not were all real. Three were SILENTLY
+      WRONG, which is the argument for sweeping rather than working the filed
+      list:
+      - `trim(both 'x' from 'xxabxx')` answered `'xxabxx'` — the characters AND
+        the position were ignored, every spelling running a bare `.strip()`.
+        Only the SQL keyword form; `btrim` / `ltrim` / `rtrim` were fine.
+      - `substr('abcdef', -1, 3)` answered `'abc'`. PG counts the length from
+        the ORIGINAL start, so positions -1, 0, 1 leave `'a'`. Clamping the
+        start first and then counting is the trap.
+      - `unnest('{1,2,3}'::int[])` handed a driver `'1'`, `'2'`, `'3'` — typed
+        `any`, so the elements went out as text.
+      Plus: `NULL::int[] || 9` answered NULL where PG gives `{9}`, and
+      `to_hex` / `make_date` / `make_time` / `make_timestamp` were missing —
+      two of them reported under a name the user never wrote
+      (`time_from_parts`), because sqlglot renames them.
+
+      **A NULL array is EMPTY in a concatenation while a NULL of any other
+      type makes the whole `||` NULL** — and both are `None` here, so the
+      array-ness has to come from the node. A cast or `ARRAY[…]` is readable
+      directly; a COLUMN is stamped by `typecheck._stamp_array_concat`, which
+      is the pass that has the catalog.
+
+      Pinned by `tests/test_sql_string_array_gaps.py` (45 cases vs PG 14.13).
+      The sweep corpus is worth turning into a standing probe.
+
+- [ ] **OPEN — `date_part()` returns numeric where PG returns float8
+      (2026-09-02).** `date_part('epoch', ts)` is `double precision` in PG;
+      `extract(epoch from ts)` is `numeric`. sqlglot parses BOTH to
+      `exp.Extract`, so the two spellings are indistinguishable at the AST and
+      the type cannot be chosen without the source text. Values agree.
+
+- [ ] **OPEN — two-argument `log(b, x)` returns float8, PG returns numeric
+      (2026-09-02).** `log(2,8)` is `3.0000000000000000` in PG and `3.0` here.
+      The type is easy; the SCALE is not — PG's `log_var` picks it from an
+      ESTIMATE of the result's decimal weight, and six probed cases give 16,
+      15, 15, 9, 16 and 16 decimal places, which no simple rule reproduces
+      (`16 - adjusted(result)` matches only three). Needs a faithful port of
+      `log_var`, not a guess.
+
 - [ ] **OPEN — arithmetic in a WHERE clause is still unchecked (2026-09-02).**
       `SELECT * FROM t WHERE i + 1 > 0` returns rows where PG raises `22003`.
       The predicate lowers to a Mongo `$expr` (`planner._to_agg_expr` /
