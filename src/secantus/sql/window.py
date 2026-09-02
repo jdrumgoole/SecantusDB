@@ -26,12 +26,13 @@ on the order key share the value).
 from __future__ import annotations
 
 import datetime as _dt
+import functools
 from typing import Any
 
 from sqlglot import exp
 
 from secantus.paths import get_path
-from secantus.sql import errors
+from secantus.sql import errors, typemap
 
 # func node -> aggregate name, for the aggregate windows.
 _AGG_WINDOWS: dict[type, str] = {
@@ -99,8 +100,16 @@ def _eval_window(w: exp.Window, docs: list[dict[str, Any]], scope_of: Any, sctx:
     result: dict[int, Any] = {}
     for part in _partitions(docs, partition_by, scope_of, sctx):
         ordered = _order_partition(part, order_terms, scope_of, sctx)
+        # Normalised for the same reason `_null_key` is — and here equality
+        # matters as much as ordering: these keys decide who are PEERS, and
+        # `Decimal128` compares its BID encoding, so `1.0` and `1.00` ranked as
+        # two rows rather than one tie.
         okeys = [
-            tuple(scalar.evaluate(oe, scope_of(d), sctx) for oe, _ in order_terms) for d in ordered
+            tuple(
+                typemap.sort_key_value(scalar.evaluate(oe, scope_of(d), sctx))
+                for oe, _ in order_terms
+            )
+            for d in ordered
         ]
         order_dirs = [d for _, d in order_terms]
         values = _window_values(
@@ -150,7 +159,9 @@ def _order_partition(
 
 
 def _null_key(v: Any) -> tuple[int, Any]:
-    return (v is None, v)
+    # Normalised: a `numeric` value is a `Decimal128`, which has no `<` at all,
+    # so `OVER (ORDER BY <numeric>)` was an internal error.
+    return (v is None, typemap.sort_key_value(v))
 
 
 def _window_values(
@@ -506,17 +517,41 @@ def _agg_window_values(
 
 
 def _reduce(agg: str, values: list[Any], count_star: bool) -> Any:
+    """Reduce one frame's values.
+
+    The arithmetic here is Python's, and the values are as stored — so a
+    `numeric` arrives as a `Decimal128` (no numeric protocol at all, so `+`,
+    `<` and `>` all raise) and an interval as a subdocument. EVERY window
+    aggregate over either type was an `XX000 internal error`; only `count`,
+    which never touches the value, worked."""
+    from secantus.sql import intervals as _intervals
+
     if agg == "count":
         return len(values) if count_star else sum(1 for v in values if v is not None)
     nonnull = [v for v in values if v is not None]
     if not nonnull:
         return None
-    if agg == "sum":
-        return sum(nonnull)
-    if agg == "avg":
-        return sum(nonnull) / len(nonnull)
-    if agg == "min":
-        return min(nonnull)
-    if agg == "max":
-        return max(nonnull)
+    if agg in ("min", "max"):
+        # Compare through the normalised key but return the value as stored, so
+        # an interval keeps its subdocument shape.
+        #
+        # Later wins a tie, which `min()` / `max()` get backwards: PG folds with
+        # `numeric_smaller(a, b) = cmp(a, b) < 0 ? a : b`, so an equal value
+        # REPLACES the running one. It shows up whenever equal numerics carry
+        # different scales — over 2.5, 1.0, 1.00 PG's `min` is `1.00`.
+        keep_when = (lambda c: c < 0) if agg == "min" else (lambda c: c > 0)
+        best = nonnull[0]
+        best_key = typemap.sort_key_value(best)
+        for value in nonnull[1:]:
+            key = typemap.sort_key_value(value)
+            if not keep_when(-1 if best_key < key else (0 if best_key == key else 1)):
+                best, best_key = value, key
+        return best
+    if _intervals.is_interval(nonnull[0]):
+        total = functools.reduce(_intervals.add, nonnull)
+        return total if agg == "sum" else _intervals.mul(total, 1 / len(nonnull))
+    if agg in ("sum", "avg"):
+        vals = [typemap.unwrap_numeric(v) for v in nonnull]
+        total = sum(vals)
+        return total if agg == "sum" else total / len(vals)
     raise errors.feature_not_supported(f"window aggregate {agg} is not supported")

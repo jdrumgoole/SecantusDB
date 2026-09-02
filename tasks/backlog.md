@@ -7430,6 +7430,63 @@ shared storage engine or building large new protocol subsystems:
       Pinned by `tests/test_sql_arith_overflow.py` (59 cases, all measured
       against PG 14.13).
 
+- [x] **RESOLVED (2026-09-02) — `ORDER BY <numeric>` was an XX000.** Not a
+      corner: `SELECT n FROM t ORDER BY n` on any numeric column. `Decimal128`
+      implements no Python numeric protocol, so the sort's `x < y` raised
+      `TypeError`. Same for `money` (also Decimal128) and `interval` (a
+      subdocument).
+
+      **Why a bug this plain survived**: `DISTINCT`, `GROUP BY` and `UNION`
+      delegate their sort to Mongo and were fine, so the surface that looks
+      most like "ORDER BY over numeric" in the test suite never touched the
+      Python path. The paths that did: plain `ORDER BY`, `OVER (ORDER BY …)`,
+      `array_agg(x ORDER BY x)`, `WITHIN GROUP (ORDER BY …)`, and every window
+      aggregate except `count`.
+
+      Decimal128 was ALSO wrong where it did not raise — its `__eq__` compares
+      the BID encoding, so `1.0 != 1.00` and `rank()` made two peers into two
+      ranks. `typemap.sort_key_value` is the single normaliser now (used by
+      `executor._pg_sort`, `_ordered_set_value`, and `window._null_key` /
+      `okeys` / `_reduce`).
+
+      `min` / `max` fold PG's way — `numeric_smaller(a, b) = cmp < 0 ? a : b`,
+      so an EQUAL value replaces the running one and the minimum of
+      2.5, 1.0, 1.00 is `1.00`. Python's `min()` keeps the first and got this
+      backwards.
+
+      Pinned by `tests/test_sql_order_by_unorderable.py` (23 cases vs PG 14.13).
+
+- [ ] **OPEN — an aggregate wrapped in a CAST loses its aggregate handling
+      (2026-09-02).** `array_agg(n ORDER BY n)` sorts; `array_agg(n ORDER BY
+      n)::text` returns INSERTION order — the in-call ORDER BY is silently
+      dropped. `mode() WITHIN GROUP (ORDER BY n)` works; `(mode() WITHIN GROUP
+      (ORDER BY n))::text` is `0A000 unsupported aggregate: MODE()`. Both
+      spellings of the cast (`::text` and `CAST(… AS text)`) do it, so it is
+      the `exp.Cast` wrapper the planner's aggregate recognition does not look
+      through, not the parse. Silently wrong output for the first, a refusal
+      for the second.
+
+- [ ] **OPEN — `ORDER BY` over `jsonb` or a range type is an XX000
+      (2026-09-02).** `'<' not supported between instances of 'dict' and
+      'dict'`. Both ride as subdocuments. PostgreSQL documents a total order
+      for each (jsonb: Object > Array > Boolean > Number > String > Null, then
+      by contents), so this is a real slice, not a coercion — the hook is
+      `typemap.sort_key_value`, which handles Decimal128 and interval today.
+
+- [ ] **OPEN — plain `sum(interval)` answers 0 and `avg(interval)` answers NULL
+      (2026-09-02).** PG gives `3 days` and `1 day 12:00:00`. Silently wrong
+      data, not an error. The WINDOW forms were fixed (they reduce in Python);
+      the plain aggregate goes through Mongo's `$sum`, which sums subdocuments
+      to 0. Needs a post-aggregate for interval-typed columns, like the one
+      `_POST_STAT_FUNCS` already does for variance. `min` / `max` happen to
+      work because Mongo's BSON order agrees.
+
+- [ ] **OPEN — an interval inside an array renders as its subdocument
+      (2026-09-02).** `array_agg(iv)::text` gives
+      `{"{\"interval\": {\"months\": 0, …}}"}` where PG gives
+      `{"1 day","2 days"}`. The array text renderer does not know the interval
+      shape.
+
 - [ ] **OPEN — arithmetic in a WHERE clause is still unchecked (2026-09-02).**
       `SELECT * FROM t WHERE i + 1 > 0` returns rows where PG raises `22003`.
       The predicate lowers to a Mongo `$expr` (`planner._to_agg_expr` /
