@@ -4199,6 +4199,18 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `$lookup` missing only its `as`. The corpus now carries a `NEARLY_VALID` list
   of spec-is-fine-except-for-one-thing shapes (740 total).
 
+- **Rust PG server: `DROP` of anything but a table leaks Rust debug
+  formatting into the client-facing message** — `DROP of Ok(ObjectType) is not
+  supported yet`. Whatever the eventual support, the MESSAGE is a bug on its
+  own: a `{:?}` of a protobuf enum reached the wire. 207 psycopg tests block on
+  the missing feature behind it (`DROP TYPE` / `DROP SCHEMA` / `DROP FUNCTION`).
+- **Rust PG server: `DEALLOCATE <name>` is refused (`0A000`).** `DEALLOCATE ALL`
+  is supported; the named form would need the wire layer's prepared-statement
+  store, and PostgreSQL answers `26000` for a name that does not exist, so
+  accepting it as a no-op would be a wrong answer.
+- **Rust PG server: `1.5::bool` reports `22P02` where PostgreSQL reports
+  `42846`** (`cannot cast type numeric to boolean`). A cast that is not defined
+  at all is a different error class from a value that will not parse.
 - **Rust PG server: multidimensional arrays are refused (`0A000`), not
   answered.** `{{1,2},{3,4}}` plans and compares correctly; only returning one
   to a client is unsupported, because rust-postgres encodes a single dimension
