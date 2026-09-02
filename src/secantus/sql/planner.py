@@ -1771,8 +1771,44 @@ def _where_filter(
     # The pipeline planners don't thread `subctx`; fall back to the one published
     # by `plan_pipeline_select` so WHERE subqueries work there too.
     ctx = subctx or _pipeline_subctx.get()
+    _strip_bpchar_literals(where.this, table)
     rewritten = _rewrite_enum_comparisons(where.this, table, ctx)
     return _expr_to_filter(rewritten, table_resolver(table), ctx)
+
+
+def _strip_bpchar_literals(stmt: exp.Expression, table: TableDef) -> None:
+    """Trim trailing blanks off string literals compared against a ``char(n)``.
+
+    Postgres compares ``bpchar`` blank-insensitively — it strips trailing
+    spaces from BOTH operands, so ``c = 'ab'`` and ``c = 'ab   '`` both match a
+    ``char(5)`` holding ``'ab'``. We store the value unpadded (see
+    ``typemap.pad_bpchar``), which gets the stored side right for free but
+    leaves the literal side padded, so the second form answered false where PG
+    answers true. Trimming the literal makes both sides bare. Idempotent, and
+    deliberately not applied to ``varchar``, which really is blank-sensitive."""
+
+    def bpchar_side(node: exp.Expression) -> bool:
+        if not isinstance(node, exp.Column):
+            return False
+        col = table.column(_column_name(node))
+        return col is not None and col.decl_oid == typemap.BPCHAR_OID
+
+    def trim(node: exp.Expression) -> None:
+        if isinstance(node, exp.Literal) and node.is_string and node.this != node.this.rstrip(" "):
+            node.set("this", node.this.rstrip(" "))
+
+    for cmp_node in stmt.find_all(exp.EQ, exp.NEQ, exp.In, *_CMP_OPS):
+        left = cmp_node.this
+        if isinstance(cmp_node, exp.In):
+            if bpchar_side(left):
+                for item in cmp_node.expressions or []:
+                    trim(item)
+            continue
+        right = cmp_node.expression
+        if bpchar_side(left):
+            trim(right)
+        elif bpchar_side(right):
+            trim(left)
 
 
 def stamp_enum_comparisons(
@@ -1786,6 +1822,7 @@ def stamp_enum_comparisons(
     catalog — so the labels are stamped on the node for it to read. Without
     this `SELECT m > 'ok'` answered by SPELLING while `WHERE m > 'ok'` did
     not, which is a worse state than either being wrong on its own."""
+    _strip_bpchar_literals(stmt, table)
     for cmp_node in stmt.find_all(*_CMP_OPS):
         for side in (cmp_node.this, cmp_node.expression):
             if not isinstance(side, exp.Column):
@@ -12421,6 +12458,17 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     # typed as text and sent the STRING '3' with oid 25 where PG sends 3 as
     # int4 — the first argument whose type we can pin wins, which is what PG's
     # common-type resolution amounts to for the shapes we can decide.
+    # `greatest` / `least` take their arguments' type, exactly as COALESCE does
+    # — typing them text sent `greatest(NULL, 1)` as the STRING '1' under oid
+    # 25 where PG sends 1 as an integer.
+    if isinstance(node, (exp.Greatest, exp.Least)):
+        for part in [node.this, *(node.expressions or [])]:
+            if part is None or isinstance(part, exp.Null):
+                continue
+            with contextlib.suppress(errors.SQLError):
+                tag = _infer_scalar_tag(part, resolve)
+                if tag and tag != "text":
+                    return tag
     if isinstance(node, exp.Coalesce):
         parts = [node.this, *(node.expressions or [])]
         for part in parts:

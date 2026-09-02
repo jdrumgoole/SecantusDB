@@ -8225,6 +8225,16 @@ shared storage engine or building large new protocol subsystems:
   render, not in storage — the scalar evaluator has no access to the declared
   width; and `char(n)[]` elements are not padded.
 
+  The *comparison* half of that same "padding is applied at render" decision was
+  a silently wrong answer and is now fixed (sweep 7): PG compares `bpchar`
+  blank-insensitively — it strips trailing spaces from BOTH operands — so a
+  `char(5)` holding `'ab'` matches `= 'ab'` and `= 'ab   '` alike. Storing
+  unpadded got the stored side right for free, but the literal kept its blanks,
+  so `c = 'ab   '` answered false. `planner._strip_bpchar_literals` trims the
+  literal at both the WHERE and the projection site (the same two sites the enum
+  comparison fix needed). `varchar` is genuinely blank-sensitive and is left
+  alone; `tests/test_sql_sweep_seven.py` pins both halves.
+
 
 - [x] **`::STRING` — WON'T FIX, and here is why.** The crdb type alias parses
   and behaves as `text`, where PG raises `42704 type "string" does not exist`.

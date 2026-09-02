@@ -255,7 +255,14 @@ def from_source(stmt: exp.Select) -> SrfSource | None:
     src = from_node.this
     if isinstance(src, exp.Unnest):
         name, cols = _alias_parts(src.args.get("alias"))
-        return SrfSource(src, bool(src.args.get("offset")), name, cols)
+        # sqlglot hoists an UNNEST's LAST alias column into ``offset`` rather
+        # than leaving it in the alias list, so ``AS t(v, i)`` parses as alias
+        # ``t(v)`` plus offset ``i``. Put it back, or the ordinality column ends
+        # up named "ordinality" and ``SELECT i`` is an unknown column.
+        offset = src.args.get("offset")
+        if isinstance(offset, exp.Expression) and offset.name:
+            cols = [*cols, offset.name]
+        return SrfSource(src, bool(offset), name, cols)
     if isinstance(src, exp.Table) and _is_from_callable(src.this):
         name, cols = _alias_parts(src.args.get("alias"))
         return SrfSource(src.this, bool(src.args.get("ordinality")), name, cols)
