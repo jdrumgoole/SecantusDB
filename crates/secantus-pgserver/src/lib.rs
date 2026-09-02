@@ -226,6 +226,8 @@ fn wire_type(pg_type: &str) -> Type {
         "timestamptz" => Type::TIMESTAMPTZ,
         "timetz" => Type::TIMETZ,
         "interval" => Type::INTERVAL,
+        "json" => Type::JSON,
+        "jsonb" => Type::JSONB,
         "numeric" | "decimal" => Type::NUMERIC,
         // `pg_typeof` answers a `regtype` (2206), not text: a client reading
         // 25 would print the same characters but compare unequal to a regtype.
@@ -1522,6 +1524,16 @@ fn decode_parameter(
                 }
                 .to_bson())
             }
+            // `json` is UTF-8 text on the wire. `jsonb` is the same text
+            // behind a one-byte format version, which is 1 and has been since
+            // the type shipped -- an unknown version means the client is
+            // speaking something this server has never seen, so it refuses
+            // rather than guessing at the payload.
+            Some(114) => Ok(Bson::String(String::from_utf8_lossy(bytes).into_owned())),
+            Some(3802) => match bytes.split_first() {
+                Some((1, rest)) => Ok(Bson::String(String::from_utf8_lossy(rest).into_owned())),
+                _ => Err(unsupported_binary_oid(Some(3802))),
+            },
             Some(1114) if bytes.len() == 8 => Ok(Bson::String(
                 secantus_pgplan::render_timestamp_from_pg_micros(i64::from_be_bytes(
                     bytes[..8].try_into().expect("checked"),
@@ -1567,13 +1579,15 @@ fn decode_parameter(
         // so `array[...] = %s` compared an array to a string and reported
         // "cannot compare" -- 98 failures whose message pointed at comparison
         // when the cause was here, one layer earlier.
-        Some(oid @ (1082 | 1083 | 1114 | 1184 | 1266 | 1186)) => {
+        Some(oid @ (1082 | 1083 | 1114 | 1184 | 1266 | 1186 | 114 | 3802)) => {
             let target = match oid {
                 1082 => "date",
                 1083 => "time",
                 1114 => "timestamp",
                 1184 => "timestamptz",
                 1266 => "timetz",
+                114 => "json",
+                3802 => "jsonb",
                 _ => "interval",
             };
             secantus_pgplan::cast_text_to(&text, target, tz).map_err(|e| PgHandler::err(&e))
@@ -1598,14 +1612,26 @@ fn invalid_text(text: &str, want: &str) -> PgWireError {
 }
 
 fn sniff_text(text: &str) -> Bson {
+    // Only treat it as a number when the number ROUND-TRIPS to the same text.
+    // `01` parses as 1, but it is not how anyone writes 1 -- and a client that
+    // sent `01` for an unspecified parameter may be sending JSON, where `01`
+    // is invalid and must stay invalid. Sniffing must not make a value more
+    // acceptable than the client wrote it.
+    let round_trips = |rendered: String| rendered == text;
     if let Ok(i) = text.parse::<i32>() {
-        return Bson::Int32(i);
+        if round_trips(i.to_string()) {
+            return Bson::Int32(i);
+        }
     }
     if let Ok(i) = text.parse::<i64>() {
-        return Bson::Int64(i);
+        if round_trips(i.to_string()) {
+            return Bson::Int64(i);
+        }
     }
     if let Ok(f) = text.parse::<f64>() {
-        return Bson::Double(f);
+        if round_trips(f.to_string()) {
+            return Bson::Double(f);
+        }
     }
     Bson::String(text.to_string())
 }
