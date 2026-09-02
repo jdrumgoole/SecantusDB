@@ -7913,6 +7913,54 @@ shared storage engine or building large new protocol subsystems:
       inner table's column does not resolve. The ungrouped form works. Needs
       the catalog at that point.
 
+- [x] **RESOLVED (2026-09-02) — a FIFTH sweep (arrays, enums, domains, ranges,
+      DDL): 28 of 36, now 34.** Two silently wrong.
+
+      - **`ALTER TABLE … ADD COLUMN c text DEFAULT 'z'` dropped the DEFAULT
+        entirely.** Existing rows kept NULL (PG backfills) AND a later INSERT
+        omitting the column got NULL too, because the default was never
+        recorded in the catalog — so `NOT NULL DEFAULT 7` left a NOT NULL
+        column holding NULL. The ADD COLUMN path built a `Column` with only
+        name/type/field/pk/nullable; `_column_default` / `_default_expr` /
+        `_decl_identity` already existed for CREATE TABLE and just were not
+        called. **Backfill needs `multi=True`** — the first version updated
+        exactly one row.
+      - **An ENUM comparison answered by SPELLING.** `'happy' > 'ok'` is true
+        for `mood AS ENUM ('sad','ok','happy')` and false as text, so
+        `WHERE m > 'ok'` returned `sad`. SORTING already knew the declared
+        order (`enum_orders`); comparison did not. An enum has a FINITE label
+        set, so a range comparison is exactly a set membership — rewritten to
+        `IN (<labels that satisfy it>)`, which needs no ordinal at query time.
+
+      Three traps in that one:
+      - the enum column's OUTPUT TAG is plain `text`, so the filter builder
+        cannot tell — the enum-ness has to come from the TableDef, which is why
+        the rewrite sits in `_where_filter`;
+      - `_enum_labels_for_column` read only the `_pipeline_subctx` ContextVar,
+        and the single-table planner is PASSED a context but publishes none, so
+        it silently found no labels;
+      - `cmp_node.replace()` does NOTHING when the comparison IS the whole
+        WHERE clause — it has no parent. `WHERE m > 'ok'` is exactly that case.
+
+      Also: `array_positions`, result types for `array_fill` (an array of its
+      value's type) and `range_merge` over `::int4range` CASTS (only the
+      constructor was recognised as a range operand), and `version()` nested in
+      an expression — it worked bare but reported `function current_version()
+      is not supported` once nested.
+
+      Pinned by `tests/test_sql_sweep_five.py` (24 cases vs PG 14.13).
+
+- [ ] **OPEN — enum comparison in a SELECT LIST (2026-09-02).**
+      `SELECT m > 'ok' FROM t` still answers by text order; the WHERE form is
+      fixed. The projection goes through the scalar evaluator, which has no
+      catalog — the same label-set rewrite would work, applied to projection
+      expressions, or the labels could be stamped on the comparison node.
+
+- [ ] **OPEN — `enum_range()` / `enum_first()` / `enum_last()` (2026-09-02).**
+      `0A000`. They need the enum's labels, i.e. the catalog, inside the scalar
+      evaluator; the argument is a `NULL::<enum>` cast, so the type name is on
+      the node.
+
 - [ ] **OPEN — arithmetic in a WHERE clause is still unchecked (2026-09-02).**
       `SELECT * FROM t WHERE i + 1 > 0` returns rows where PG raises `22003`.
       The predicate lowers to a Mongo `$expr` (`planner._to_agg_expr` /
