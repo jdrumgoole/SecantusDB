@@ -7508,19 +7508,30 @@ shared storage engine or building large new protocol subsystems:
       by contents), so this is a real slice, not a coercion — the hook is
       `typemap.sort_key_value`, which handles Decimal128 and interval today.
 
-- [ ] **OPEN — plain `sum(interval)` answers 0 and `avg(interval)` answers NULL
-      (2026-09-02).** PG gives `3 days` and `1 day 12:00:00`. Silently wrong
-      data, not an error. The WINDOW forms were fixed (they reduce in Python);
-      the plain aggregate goes through Mongo's `$sum`, which sums subdocuments
-      to 0. Needs a post-aggregate for interval-typed columns, like the one
-      `_POST_STAT_FUNCS` already does for variance. `min` / `max` happen to
-      work because Mongo's BSON order agrees.
+- [x] **RESOLVED (2026-09-02) — `sum(interval)` answered 0 and
+      `avg(interval)` answered NULL.** Silently wrong data, not an error.
+      Mongo's `$sum` over interval SUBDOCUMENTS is 0 and its `$avg` is NULL.
+      Fixed with a `$push` + Python fold, exactly the shape `_POST_STAT_FUNCS`
+      already used for variance: `interval_sum` / `interval_avg` post-aggregate
+      kinds in `executor._interval_agg_value`.
 
-- [ ] **OPEN — an interval inside an array renders as its subdocument
-      (2026-09-02).** `array_agg(iv)::text` gives
-      `{"{\"interval\": {\"months\": 0, …}}"}` where PG gives
-      `{"1 day","2 days"}`. The array text renderer does not know the interval
-      shape.
+      Six planner sites, not four: the plain aggregate branch in
+      `_grouping_set_branch` / `_plan_group_select` / `_plan_join_group_select`
+      / `_join_grouping_set_branch`, PLUS the two `register_agg` shapes for an
+      aggregate inside a COMPUTED projection (`sum(d)::text`). A probe written
+      with `::text` for readability hits only the second set — **write the
+      probe both ways or a half-fix looks complete.**
+
+      `min` / `max` needed nothing: Mongo's BSON order over the subdocument
+      agrees with duration order.
+
+- [x] **RESOLVED (2026-09-02) — an interval inside an array rendered as its
+      subdocument.** Not the array renderer, which handles the `interval` tag
+      correctly — the ELEMENT TAG reaching it. Two causes: `infer_elem_tag`
+      typed any dict `json`, and the `list::text` branch in `_eval_cast_impl`
+      defaulted every element to a blunt `text` before the smarter branch
+      further down could run. The default now infers from the values; the two
+      shapes carrying real element identity still win.
 
 - [ ] **OPEN — arithmetic in a WHERE clause is still unchecked (2026-09-02).**
       `SELECT * FROM t WHERE i + 1 > 0` returns rows where PG raises `22003`.

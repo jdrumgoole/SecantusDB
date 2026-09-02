@@ -6229,6 +6229,21 @@ def _minmax_body(val: Any, field: str | None, tag: str | None, filter_cond: Any)
     return {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
 
 
+def _is_interval_agg_arg(arg: Any, tag_of: Any) -> bool:
+    """Whether an aggregate's argument is an interval-typed column.
+
+    `tag_of` RAISES for anything that is not a resolvable column — `SUM(-83)`
+    takes a literal — so the failure is swallowed here rather than guarded on
+    the node type, which differs between the single-table shape (a column name)
+    and the join shape (a Column node)."""
+    if arg is None:
+        return False
+    try:
+        return tag_of(arg) == "interval"
+    except errors.SQLError:
+        return False
+
+
 def _accumulator_for(
     func: str, field: str | None, tag: str | None, filter_cond: Any = None
 ) -> tuple[dict[str, Any], str]:
@@ -6791,6 +6806,29 @@ def _grouping_set_branch(
                 post_aggregates.append((fname, "variance", None))
             project[fname] = f"${fname}"
             out_columns.append((fname, tag))
+        elif (
+            agg is not None
+            and agg[0] in ("sum", "avg")
+            and _is_interval_agg_arg(agg[1], table.type_for)
+        ):
+            # Mongo's `$sum` over interval SUBDOCUMENTS answered 0 and its
+            # `$avg` answered NULL — silently wrong data, not an error, where
+            # PG gives `3 days` and `1 day 12:00:00`. Push the values and fold
+            # them in Python, where `intervals.add` is componentwise (PG's
+            # `interval_pl`) and the average carries months into days and days
+            # into micros, which a per-field divide would get wrong.
+            # `min` / `max` need none of this: Mongo's BSON order over the
+            # subdocument happens to agree.
+            func, col, _distinct = agg
+            if fcond is not None:
+                raise errors.feature_not_supported(
+                    f"FILTER (WHERE ...) on {func}(interval) is not supported"
+                )
+            fname = names.fresh(alias or func)
+            accumulators[fname] = {"$push": f"${table.field_for(col)}"}
+            post_aggregates.append((fname, f"interval_{func}", None))
+            project[fname] = f"${fname}"
+            out_columns.append((fname, "interval"))
         elif agg is not None:
             func, col, distinct = agg
             # DISTINCT count/sum/avg → a $addToSet accumulator + a post-$group
@@ -6938,7 +6976,9 @@ def _plan_grouping_sets_window_select(
                 post_aggregates.append((fname, "sorted_array", [(d, nf) for _k, d, nf in terms]))
             else:
                 accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
-            field_tags[fname] = "json"
+            # The same out-tag the top-level projection path computes — pinned
+            # to `json` here, an interval array rendered as its subdocuments.
+            field_tags[fname] = _array_agg_out_tag(arr_arg, table_resolver(table))
             agg_field_names.append(fname)
             return fname
         sa = _string_agg_arg(node)
@@ -6957,6 +6997,16 @@ def _plan_grouping_sets_window_select(
         agg = _aggregate_of(node)
         if agg is None:
             raise errors.feature_not_supported(f"unsupported aggregate: {node.sql()}")
+        # Same interval fold as the plain aggregate path — reached when the
+        # aggregate sits inside a computed projection (`sum(d)::text`). Mongo's
+        # `$sum` over interval subdocuments answers 0 and its `$avg` NULL.
+        if agg[0] in ("sum", "avg") and _is_interval_agg_arg(agg[1], table.type_for):
+            fname = names.fresh(agg[0])
+            accumulators[fname] = {"$push": f"${table.field_for(agg[1])}"}
+            post_aggregates.append((fname, f"interval_{agg[0]}", None))
+            field_tags[fname] = "interval"
+            agg_field_names.append(fname)
+            return fname
         agg = _single_agg_key(node, agg)
         if agg in agg_fields:
             return agg_fields[agg]
@@ -7202,6 +7252,29 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
                 post_aggregates.append((fname, "variance", None))
             project[fname] = f"${fname}"
             out_columns.append((fname, tag))
+        elif (
+            agg is not None
+            and agg[0] in ("sum", "avg")
+            and _is_interval_agg_arg(agg[1], table.type_for)
+        ):
+            # Mongo's `$sum` over interval SUBDOCUMENTS answered 0 and its
+            # `$avg` answered NULL — silently wrong data, not an error, where
+            # PG gives `3 days` and `1 day 12:00:00`. Push the values and fold
+            # them in Python, where `intervals.add` is componentwise (PG's
+            # `interval_pl`) and the average carries months into days and days
+            # into micros, which a per-field divide would get wrong.
+            # `min` / `max` need none of this: Mongo's BSON order over the
+            # subdocument happens to agree.
+            func, col, _distinct = agg
+            if fcond is not None:
+                raise errors.feature_not_supported(
+                    f"FILTER (WHERE ...) on {func}(interval) is not supported"
+                )
+            fname = names.fresh(alias or func)
+            accumulators[fname] = {"$push": f"${table.field_for(col)}"}
+            post_aggregates.append((fname, f"interval_{func}", None))
+            project[fname] = f"${fname}"
+            out_columns.append((fname, "interval"))
         elif agg is not None:
             func, col, distinct = agg
             if distinct and func in _DISTINCT_FUNCS:
@@ -7565,7 +7638,9 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
                 post_aggregates.append((fname, "sorted_array", [(d, nf) for _k, d, nf in terms]))
             else:
                 accumulators[fname] = {"$push": _agg_arg_to_expr(arr_arg, table)}
-            field_tags[fname] = "json"
+            # The same out-tag the top-level projection path computes — pinned
+            # to `json` here, an interval array rendered as its subdocuments.
+            field_tags[fname] = _array_agg_out_tag(arr_arg, table_resolver(table))
             agg_field_names.append(fname)
             return fname
         sa = _string_agg_arg(node)
@@ -7584,6 +7659,16 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
         agg = _aggregate_of(node)
         if agg is None:
             raise errors.feature_not_supported(f"unsupported aggregate: {node.sql()}")
+        # Same interval fold as the plain aggregate path — reached when the
+        # aggregate sits inside a computed projection (`sum(d)::text`). Mongo's
+        # `$sum` over interval subdocuments answers 0 and its `$avg` NULL.
+        if agg[0] in ("sum", "avg") and _is_interval_agg_arg(agg[1], table.type_for):
+            fname = names.fresh(agg[0])
+            accumulators[fname] = {"$push": f"${table.field_for(agg[1])}"}
+            post_aggregates.append((fname, f"interval_{agg[0]}", None))
+            field_tags[fname] = "interval"
+            agg_field_names.append(fname)
+            return fname
         agg = _single_agg_key(node, agg)
         if agg in agg_fields:
             return agg_fields[agg]
@@ -9943,6 +10028,29 @@ def _plan_join_group_select(
                 post_aggregates.append((fname, "variance", None))
             project[fname] = f"${fname}"
             out_columns.append((fname, tag))
+        elif (
+            agg is not None
+            and agg[0] in ("sum", "avg")
+            and _is_interval_agg_arg(agg[1], lambda n: resolve(n)[1])
+        ):
+            # Mongo's `$sum` over interval SUBDOCUMENTS answered 0 and its
+            # `$avg` answered NULL — silently wrong data, not an error, where
+            # PG gives `3 days` and `1 day 12:00:00`. Push the values and fold
+            # them in Python, where `intervals.add` is componentwise (PG's
+            # `interval_pl`) and the average carries months into days and days
+            # into micros, which a per-field divide would get wrong.
+            # `min` / `max` need none of this: Mongo's BSON order over the
+            # subdocument happens to agree.
+            func, arg_node, _distinct = agg
+            if fcond is not None:
+                raise errors.feature_not_supported(
+                    f"FILTER (WHERE ...) on {func}(interval) is not supported"
+                )
+            fname = names.fresh(alias or func)
+            accumulators[fname] = {"$push": f"${resolve(arg_node)[0]}"}
+            post_aggregates.append((fname, f"interval_{func}", None))
+            project[fname] = f"${fname}"
+            out_columns.append((fname, "interval"))
         elif agg is not None:
             func, arg, distinct = agg
             if distinct and func in _DISTINCT_FUNCS:
@@ -10154,6 +10262,29 @@ def _join_grouping_set_branch(
                 post_aggregates.append((fname, "variance", None))
             project[fname] = f"${fname}"
             out_columns.append((fname, tag))
+        elif (
+            agg is not None
+            and agg[0] in ("sum", "avg")
+            and _is_interval_agg_arg(agg[1], lambda n: resolve(n)[1])
+        ):
+            # Mongo's `$sum` over interval SUBDOCUMENTS answered 0 and its
+            # `$avg` answered NULL — silently wrong data, not an error, where
+            # PG gives `3 days` and `1 day 12:00:00`. Push the values and fold
+            # them in Python, where `intervals.add` is componentwise (PG's
+            # `interval_pl`) and the average carries months into days and days
+            # into micros, which a per-field divide would get wrong.
+            # `min` / `max` need none of this: Mongo's BSON order over the
+            # subdocument happens to agree.
+            func, arg_node, _distinct = agg
+            if fcond is not None:
+                raise errors.feature_not_supported(
+                    f"FILTER (WHERE ...) on {func}(interval) is not supported"
+                )
+            fname = names.fresh(alias or func)
+            accumulators[fname] = {"$push": f"${resolve(arg_node)[0]}"}
+            post_aggregates.append((fname, f"interval_{func}", None))
+            project[fname] = f"${fname}"
+            out_columns.append((fname, "interval"))
         elif agg is not None:
             func, arg, distinct = agg
             if distinct and func in _DISTINCT_FUNCS:
@@ -10345,12 +10476,22 @@ def _plan_join_grouping_sets_window_select(
             else:
                 path, _ = resolve(arr_arg)
                 accumulators[fname] = {"$push": f"${path}"}
-            field_tags[fname] = "json"
+            field_tags[fname] = _array_agg_out_tag(arr_arg, resolve)
             agg_field_names.append(fname)
             return fname
         agg = _join_aggregate_of(node)
         if agg is None:
             raise errors.feature_not_supported(f"unsupported aggregate: {node.sql()}")
+        # Same interval fold as the plain aggregate path — reached when the
+        # aggregate sits inside a computed projection (`sum(d)::text`). Mongo's
+        # `$sum` over interval subdocuments answers 0 and its `$avg` NULL.
+        if agg[0] in ("sum", "avg") and _is_interval_agg_arg(agg[1], lambda n: resolve(n)[1]):
+            fname = names.fresh(agg[0])
+            accumulators[fname] = {"$push": f"${resolve(agg[1])[0]}"}
+            post_aggregates.append((fname, f"interval_{agg[0]}", None))
+            field_tags[fname] = "interval"
+            agg_field_names.append(fname)
+            return fname
         func, arg, distinct = agg
         key = _agg_key(func, arg, resolve, distinct)
         if key in agg_fields:
@@ -10529,12 +10670,22 @@ def _plan_join_group_window_select(
             else:
                 path, _ = resolve(arr_arg)
                 accumulators[fname] = {"$push": f"${path}"}
-            field_tags[fname] = "json"
+            field_tags[fname] = _array_agg_out_tag(arr_arg, resolve)
             agg_field_names.append(fname)
             return fname
         agg = _join_aggregate_of(node)
         if agg is None:
             raise errors.feature_not_supported(f"unsupported aggregate: {node.sql()}")
+        # Same interval fold as the plain aggregate path — reached when the
+        # aggregate sits inside a computed projection (`sum(d)::text`). Mongo's
+        # `$sum` over interval subdocuments answers 0 and its `$avg` NULL.
+        if agg[0] in ("sum", "avg") and _is_interval_agg_arg(agg[1], lambda n: resolve(n)[1]):
+            fname = names.fresh(agg[0])
+            accumulators[fname] = {"$push": f"${resolve(agg[1])[0]}"}
+            post_aggregates.append((fname, f"interval_{agg[0]}", None))
+            field_tags[fname] = "interval"
+            agg_field_names.append(fname)
+            return fname
         func, arg, distinct = agg
         key = _agg_key(func, arg, resolve, distinct)
         if key in agg_fields:

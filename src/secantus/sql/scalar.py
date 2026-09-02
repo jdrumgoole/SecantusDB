@@ -3027,7 +3027,12 @@ def _eval_cast_impl(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         inner = node.this
         while isinstance(inner, exp.Paren):
             inner = inner.this
-        elem = "text"
+        # Default to what the VALUES say rather than a blunt `text`: an interval
+        # rides as a subdocument, so `ARRAY[interval '1 day']::text` rendered
+        # each element as our internal `{"interval": {…}}` JSON where PG gives
+        # `{"1 day"}`. The two explicit shapes below still win — they carry
+        # element identity this branch exists to preserve.
+        elem = _array_elem_render_tag(inner, value)
         if isinstance(inner, exp.Cast):
             inner_tag = typemap.type_tag_for_sql(inner.to)
             if typemap.is_array_tag(inner_tag):
