@@ -4287,7 +4287,24 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `$setEquals` each behave differently from their own families, and generalising
   either rule cost 46 shapes before the probe caught it. Probe per operator.
 
-- [ ] **The same probe against the RUST server: 981 of 3,968 (2026-09-02).**
+- [ ] **The same probe against the RUST server: 925 of 3,968 (2026-09-02).**
+  Was 981; `$stdDevPop` / `$stdDevSamp` in EXPRESSION position are now
+  implemented (the `$group` accumulator forms had shipped long ago and the
+  expression forms never did, so all 56 shapes refused valid input).
+
+  **116 of the original 946 defers were valid input being REFUSED** — mongod
+  answers, the Rust server errors. 56 of those were `$stdDev*`; the other 60 are
+  almost all a **Decimal128 operand** reaching a math operator (`$abs`, `$add`,
+  `$acosh`, `$asinh`, `$atan`, `$atan2`, `$ceil`, `$cmp`, …), which the engine
+  declines with comments reading "-> Python" / "defers to the pure oracle" — the
+  exact phrasing this file warns about, and meaningless on a server with no
+  Python behind it. In practice **a collection holding Decimal128 values cannot
+  use most math operators on the Rust server.** `crates/secantus-core/src/
+  decimal.rs` already has `add` / `mul` / `div_int` / `parse` / `to_string`; the
+  transcendental functions would need real decimal math, which is a dependency
+  decision rather than a port.
+
+  Original entry, for the record: **1,376 of 3,968 (2026-09-02).**
   Was 1,376; the parse pass below took out the systematic half. **946 of the
   981 are `Fallback::Defer`** -- the engine declining a bad ARGUMENT rather than
   naming mongod's error, which on the standalone server is "operator not

@@ -691,7 +691,9 @@ fn nelem_result(kind: NElemKind, n: usize, vals: Vec<Bson>) -> R<Vec<Bson>> {
 /// operations that reproduce CPython's `(x - mean) ** 2` / `... ** 0.5` bit-for-bit
 /// (a fuzz seed exposed that `f64::powf(2.0)` can round differently from
 /// multiplication). Sums in document order to match `sum(...)`.
-fn std_dev(values: &[f64], pop: bool) -> Option<f64> {
+/// Shared with the EXPRESSION forms in `expressions.rs`, so the two cannot
+/// answer different numbers for the same values.
+pub(crate) fn std_dev(values: &[f64], pop: bool) -> Option<f64> {
     let n = values.len();
     if n == 0 || (!pop && n < 2) {
         return None;
