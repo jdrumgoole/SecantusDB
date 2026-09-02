@@ -22,6 +22,7 @@ import decimal
 import json
 import math
 import re
+import struct as _struct
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -140,7 +141,7 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
             from secantus.sql import intervals as _intervals
 
             return _intervals.neg(v)
-        return typemap.negate(v)
+        return _check_unary_int_range(node, typemap.negate(v))
     if isinstance(node, exp.Cast):
         return _eval_cast(node, scope, ctx)
     if isinstance(node, exp.Column):
@@ -634,7 +635,7 @@ def _eval_arith(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
             f"operator does not exist: {_pg_operand_type(left)} {op} {_pg_operand_type(right)}",
         )
     try:
-        return _ARITH[type(node)](left, right)
+        result = _ARITH[type(node)](left, right)
     except TypeError:
         # PG answers 42883 for an operator that does not exist for the operand
         # pair (`'a'::text - 1`, `'\x01'::bytea + 1`). Python's TypeError used
@@ -644,6 +645,42 @@ def _eval_arith(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
             "42883",
             f"operator does not exist: {_pg_operand_type(left)} {op} {_pg_operand_type(right)}",
         ) from None
+    return _check_arith_range(node, left, right, result)
+
+
+def _check_arith_range(node: exp.Expression, left: Any, right: Any, result: Any) -> Any:
+    """Reject an arithmetic result Postgres' fixed-width types cannot hold.
+
+    Python's `int` is unbounded and its `float` saturates to `inf`, so both
+    integer and float overflow computed a value SILENTLY here where PG raises
+    22003 — and for integers the wrong value then went out under an oid too
+    narrow to carry it."""
+    # Integer width comes from the planner's stamp (PG's promotion table over
+    # the DECLARED operand types); unstamped shapes are left unchecked rather
+    # than guessed at from the value, which cannot tell int2 from int4.
+    if isinstance(result, int) and not isinstance(result, bool):
+        tag = getattr(node, "_secantus_int_tag", None)
+        if tag is not None:
+            typemap.check_int_range(result, tag)
+        return result
+    if not isinstance(result, float):
+        return result
+    # PG's CHECKFLOATVAL: an infinite result is an error unless an operand was
+    # already infinite, and a zero result is an error unless zero was a legal
+    # answer — `1e308 * 10` overflows, `'inf'::float8 + 1` does not, and
+    # `1e-320 / 1e10` underflows while `1e-320 * 0` is plainly zero. Which
+    # operands make zero legal differs by operator: for `/` only the DIVIDEND.
+    operands = (left, right)
+    floats = [v for v in operands if isinstance(v, float)]
+    if math.isinf(result):
+        if not any(math.isinf(v) for v in floats):
+            raise errors.SQLError("22003", "value out of range: overflow")
+        return result
+    if result == 0.0 and isinstance(node, (exp.Mul, exp.Div)):
+        zero_ok = (left == 0) if isinstance(node, exp.Div) else any(v == 0 for v in operands)
+        if not zero_ok:
+            raise errors.SQLError("22003", "value out of range: underflow")
+    return result
 
 
 #: The SQL spelling of each arithmetic node, for a 42883 message.
@@ -960,13 +997,31 @@ def _variadic(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> list[An
     return [typemap.unwrap_numeric(evaluate(a, scope, ctx)) for a in args]
 
 
-def _unary(fn: Callable[[Any], Any]) -> Callable[[exp.Expression, Scope, ScalarContext], Any]:
+def _check_unary_int_range(node: exp.Expression, result: Any) -> Any:
+    """Reject a unary result the operand's integer type cannot hold.
+
+    Only `abs()` and unary minus can do this, and only at one value each: the
+    integer ranges are asymmetric, so `abs((-2147483648)::int)` has no int4
+    answer. Python's unbounded `int` returned 2147483648 under oid 23 — a value
+    four bytes cannot carry — where PG answers 22003."""
+    tag = getattr(node, "_secantus_int_tag", None)
+    if tag is not None and isinstance(result, int) and not isinstance(result, bool):
+        typemap.check_int_range(result, tag)
+    return result
+
+
+def _unary(
+    fn: Callable[[Any], Any], *, check_int_range: bool = False
+) -> Callable[[exp.Expression, Scope, ScalarContext], Any]:
     def handler(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         # Unwrapped because these are the plain math builtins (sqrt / log10 /
         # sign / trunc / …) and ``math`` rejects a Decimal128 outright. A
         # non-decimal value passes through untouched.
         v = typemap.unwrap_numeric(evaluate(node.this, scope, ctx))
-        return None if v is None else fn(v)
+        if v is None:
+            return None
+        result = fn(v)
+        return _check_unary_int_range(node, result) if check_int_range else result
 
     return handler
 
@@ -2068,7 +2123,7 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
             if n.args.get(k) is not None
         ],
     ),
-    exp.Abs: _unary(abs),
+    exp.Abs: _unary(abs, check_int_range=True),
     exp.Ceil: _unary(lambda v: math.ceil(v)),
     exp.Floor: _unary(lambda v: math.floor(v)),
     exp.Round: _eval_round,
@@ -2410,6 +2465,7 @@ def _cast_scalar(value: Any, tag: str) -> Any:
     if tag in ("float4", "float8"):
         if isinstance(value, bool):
             return value
+        original = value
         if isinstance(value, (int, float, Decimal)):
             value = float(value)
         elif isinstance(value, str):
@@ -2419,13 +2475,7 @@ def _cast_scalar(value: Any, tag: str) -> Any:
                 raise _invalid_input(tag, value) from None
         else:
             return value
-        if tag == "float4":
-            # PG narrows at the cast — the narrowed double is what compares,
-            # stores, and renders (float4out's shortest form needs it).
-            import struct as _st
-
-            return _st.unpack("!f", _st.pack("!f", value))[0]
-        return value
+        return _narrow_float(original, value, tag)
     if tag == "numeric":
         if isinstance(value, bool):
             return value
@@ -2671,6 +2721,84 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         if to_tag in ("int2", "int4", "int8"):
             typemap.check_int_range(out, to_tag)
     return out
+
+
+#: Every spelling of infinity `float8in` accepts, lowercased — these are legal
+#: input, so a cast that lands on infinity from one of them is not an overflow.
+_INFINITY_SPELLINGS = frozenset({"inf", "infinity", "+inf", "+infinity", "-inf", "-infinity"})
+
+
+def _float_input_is_infinite(original: Any) -> bool:
+    """Whether the value BEING CAST already denoted infinity."""
+    if isinstance(original, str):
+        return original.strip().lower() in _INFINITY_SPELLINGS
+    if isinstance(original, Decimal):
+        return original.is_infinite()
+    return isinstance(original, float) and math.isinf(original)
+
+
+def _float_out_of_range(original: Any, tag: str) -> errors.SQLError:
+    """Postgres' out-of-range error for a float cast, in the two spellings it
+    uses. Casting from text or from numeric quotes the INPUT as written —
+    numeric spelled out in plain decimal, text verbatim — while narrowing an
+    existing double (`1e39::float8::float4`) reports the CHECKFLOATVAL form,
+    which names no value at all. Which one you get is decided by the source
+    type, so it is decided here by the Python type carrying it."""
+    if isinstance(original, float):
+        kind = "underflow" if original != 0.0 and abs(original) < 1.0 else "overflow"
+        return errors.SQLError("22003", f"value out of range: {kind}")
+    if isinstance(original, Decimal):
+        shown = format(original, "f")
+    elif isinstance(original, int):
+        shown = str(original)
+    else:
+        shown = str(original).strip()
+    name = typemap.SQL_TYPE_NAME.get(tag, tag)
+    return errors.SQLError("22003", f'"{shown}" is out of range for type {name}')
+
+
+def _narrow_float(original: Any, value: float, tag: str) -> float:
+    """Narrow a parsed double to ``tag``, rejecting what the type cannot hold.
+
+    Python saturates where Postgres errors: `float('1e400')` is `inf` and
+    `struct.pack('!f', 1e39)` raises `OverflowError` — the first quietly
+    answered infinity for `1e400::float8`, the second escaped as an XX000
+    internal error for `1e39::float4`. Both are `22003` in PG. A value that
+    rounds to zero is equally out of range (`1e-46::float4`), which is why the
+    zero check is not merely cosmetic."""
+    if math.isinf(value) and not _float_input_is_infinite(original):
+        raise _float_out_of_range(original, tag)
+    if value == 0.0 and original is not None and not _is_zero_input(original):
+        raise _float_out_of_range(original, tag)
+    if tag != "float4":
+        return value
+    # PG narrows at the cast — the narrowed double is what compares, stores,
+    # and renders (float4out's shortest form needs it).
+    try:
+        narrowed = _struct.unpack("!f", _struct.pack("!f", value))[0]
+    except OverflowError:
+        raise _float_out_of_range(original, tag) from None
+    if math.isinf(narrowed) and not math.isinf(value):
+        raise _float_out_of_range(original, tag)
+    if narrowed == 0.0 and value != 0.0:
+        raise _float_out_of_range(original, tag)
+    return narrowed
+
+
+def _is_zero_input(original: Any) -> bool:
+    """Whether the value being cast was itself zero (so a zero result is right)."""
+    if isinstance(original, str):
+        # Decimal, not float: `float("1e-400")` is 0.0, so asking the float
+        # whether the input was zero said yes and let the underflow through.
+        # The question is whether the TEXT denotes zero, which needs exact
+        # arithmetic to answer.
+        try:
+            return Decimal(original.strip()) == 0
+        except (decimal.InvalidOperation, ValueError):
+            return False
+    if isinstance(original, (int, float, Decimal)):
+        return not (isinstance(original, Decimal) and original.is_nan()) and original == 0
+    return False
 
 
 def _eval_cast_impl(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:

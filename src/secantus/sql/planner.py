@@ -13,6 +13,7 @@ Only the P0 subset is handled; anything outside it raises a
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import dataclasses
 import datetime as _dt
@@ -959,6 +960,22 @@ _ARITH_OPS: dict[type, str] = {
     exp.Mul: "$multiply",
     exp.Div: "$divide",
 }
+
+
+def _prestamp_int_widths(node: exp.Expression, resolve: Resolve) -> None:
+    """Run tag inference purely for its side effect.
+
+    `_infer_scalar_tag` stamps each arithmetic node with its integer result
+    width, and that stamp is what lets the runtime evaluator range-check the
+    value it computes. On the FROM-less path the tag was inferred only AFTER
+    the value had been computed, so `SELECT 2147483647 + 1` still answered
+    2147483648 while the same expression over a table correctly raised 22003.
+
+    Inference errors are swallowed: an expression whose TYPE cannot be worked
+    out still has a value, and this path has never depended on inference
+    succeeding."""
+    with contextlib.suppress(errors.SQLError):
+        _infer_scalar_tag(node, resolve)
 
 
 def _int_division_operands(node: exp.Expression, resolve: Resolve) -> bool:
@@ -3086,6 +3103,7 @@ def plan_constant_select(
         elif (udf := _udf_lookup(target, catalog, db)) is not None:
             # A user-defined function (CREATE FUNCTION) needs storage/catalog, so
             # it goes through the scalar evaluator, not the session-function path.
+            _prestamp_int_widths(target, _const_scope)
             value = scalar.evaluate(target, _const_scope, ctx)
             tag = udf.get("return_tag") or _infer_scalar_tag(target, _const_scope)
             columns.append((alias or _udf_call_name(target), tag, value))
@@ -3098,6 +3116,7 @@ def plan_constant_select(
                     raise
                 # Not a session/info function after all (e.g. a user-declared
                 # range type's constructor) — the full scalar evaluator decides.
+                _prestamp_int_widths(target, _const_scope)
                 value = scalar.evaluate(target, _const_scope, ctx)
                 columns.append(
                     (
@@ -3107,6 +3126,7 @@ def plan_constant_select(
                     )
                 )
         else:
+            _prestamp_int_widths(target, _const_scope)
             value = scalar.evaluate(target, _const_scope, ctx)
             columns.append(
                 (
@@ -11148,7 +11168,9 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     if memo is None:
         token = _tag_memo.set({})
         try:
-            return _infer_scalar_tag(node, resolve)
+            tag = _infer_scalar_tag(node, resolve)
+            _stamp_nested_int_widths(node, resolve)
+            return tag
         finally:
             _tag_memo.reset(token)
     key = (id(node), id(resolve))
@@ -11158,6 +11180,38 @@ def _infer_scalar_tag(node: exp.Expression, resolve: Resolve) -> str:
     tag = _infer_scalar_tag_impl(node, resolve)
     memo[key] = (tag, node, resolve)  # node/resolve refs pin the ids
     return tag
+
+
+#: The arithmetic node types whose integer result width has to be range-checked.
+_ARITH_NODE_TYPES = (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod)
+
+
+def _stamp_nested_int_widths(node: exp.Expression, resolve: Resolve) -> None:
+    """Stamp the integer result width on EVERY arithmetic node in the tree.
+
+    Inferring the top node's tag does not necessarily visit the arithmetic
+    underneath it: a cast reports its TARGET type and never looks down, so
+    `(2147483647 + 1)::bigint` left the inner `+` unstamped and answered
+    2147483648 where PG raises 22003 for the int4 addition regardless of what
+    the result is then cast to. `round()`, `coalesce()` and friends have the
+    same shape.
+
+    Runs inside the memo, so each nested inference is a lookup rather than a
+    re-walk. Errors are per-node and swallowed: one operand whose type cannot
+    be worked out must not stop the rest of the tree being checked."""
+    for arith in node.find_all(*_ARITH_NODE_TYPES):
+        with contextlib.suppress(errors.SQLError):
+            _infer_scalar_tag(arith, resolve)
+    # `abs()` and unary minus overflow at exactly one value — `int4`'s range is
+    # asymmetric, so `abs(-2147483648)` and `-(-2147483648)` have no int4 answer
+    # and PG raises 22003 for both. They take the operand's own width.
+    for unary in node.find_all(exp.Abs, exp.Neg):
+        if unary.this is None:
+            continue
+        with contextlib.suppress(errors.SQLError):
+            tag = _arith_operand_tag(unary.this, resolve)
+            if tag in _INT_TAG_ORDER:
+                unary._secantus_int_tag = tag  # noqa: SLF001
 
 
 def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
@@ -11625,6 +11679,19 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         _rt = _arith_operand_tag(node.expression, resolve) if node.expression is not None else None
         _unified = _unify_numeric_tags([t for t in (_lt, _rt) if t is not None])
         if _unified is not None:
+            # Stamp an INTEGER result width on the node so the runtime evaluator
+            # can range-check what it computes. Python ints are unbounded, so
+            # `i + 1` on an int4 column quietly answered 2147483648 — a value
+            # the int4 oid in the RowDescription cannot carry — where PG answers
+            # `22003 integer out of range`. The width has to come from the
+            # DECLARED operand types, not from the values: `s + 1` on a smallint
+            # is int4 arithmetic in PG (32768 is a correct answer) while
+            # `32767::smallint * 2::smallint` overflows, and the two are
+            # indistinguishable by value alone. `_unify_numeric_tags` already
+            # implements PG's promotion table, so this is the same answer the
+            # RowDescription reports.
+            if _unified in _INT_TAG_ORDER:
+                node._secantus_int_tag = _unified  # noqa: SLF001
             return _unified
         return "numeric"
     if isinstance(node, exp.Abs):

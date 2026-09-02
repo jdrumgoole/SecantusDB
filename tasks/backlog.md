@@ -7393,6 +7393,57 @@ shared storage engine or building large new protocol subsystems:
 
       Pinned by `tests/test_sql_missing_builtins.py`.
 
+- [x] **RESOLVED (2026-09-02) — arithmetic and cast OVERFLOW was silent.**
+      Filed as "arithmetic overflow not detected"; it was worse than the entry
+      said. Python's `int` is unbounded, so `i + 1` on an int4 column answered
+      2147483648 AND SENT IT UNDER OID 23 — the declared type and the value
+      disagreed on the wire. `1e39::float4` was an `XX000`: `struct.pack("!f",
+      …)` raising `OverflowError` onto the wire.
+
+      **The width must come from the DECLARED operand types.** `s + 1` on a
+      smallint is int4 arithmetic in PG (32768 is correct) while
+      `32767::smallint * 2::smallint` overflows — indistinguishable by value.
+      `_unify_numeric_tags` already had PG's promotion table for the
+      RowDescription, so `_infer_scalar_tag` now stamps `_secantus_int_tag` on
+      each arithmetic node and `scalar._check_arith_range` checks it.
+
+      Two traps worth remembering:
+      - **A cast never looks down.** `_infer_scalar_tag` on `(2147483647 +
+        1)::bigint` returns int8 without visiting the `+`, so the inner
+        arithmetic went unstamped. `_stamp_nested_int_widths` walks every
+        arithmetic node in the tree; `coalesce` and `CASE` had the same shape.
+      - **The FROM-less path inferred the tag AFTER computing the value**, so
+        `SELECT 2147483647 + 1` was unchecked while the identical expression
+        over a table raised. `_prestamp_int_widths` runs inference first.
+
+      Floats follow PG's `CHECKFLOATVAL`: infinite is an error unless an
+      operand was infinite, zero is an error unless zero was a legal answer
+      (which operands make it legal differs by operator — for `/` only the
+      dividend). Cast range errors come in PG's two spellings, chosen by the
+      SOURCE type: from numeric/text the input is quoted, from an existing
+      double it is `value out of range: overflow`.
+
+      `_is_zero_input` asks `Decimal`, not `float`: `float("1e-400")` is 0.0,
+      so asking the float whether the input was zero let that underflow
+      through.
+
+      Pinned by `tests/test_sql_arith_overflow.py` (59 cases, all measured
+      against PG 14.13).
+
+- [ ] **OPEN — arithmetic in a WHERE clause is still unchecked (2026-09-02).**
+      `SELECT * FROM t WHERE i + 1 > 0` returns rows where PG raises `22003`.
+      The predicate lowers to a Mongo `$expr` (`planner._to_agg_expr` /
+      `_null_guarded_expr_cmp`) and is evaluated by `secantus/expressions.py`
+      — the operator engine the **MongoDB server shares**. Range-checking there
+      would put PostgreSQL's integer widths into a Mongo operator, which the
+      layer rules forbid, and Mongo's expression language has no way to raise.
+
+      Fixing it properly means a PG-specific `$expr` evaluation path, or
+      refusing to lower integer arithmetic and running the predicate in Python
+      (a real slowdown on a common path for a rare error). Neither is a tweak —
+      size it from a probe before starting. Same three shapes reproduce it:
+      `WHERE i + 1 > 0`, `WHERE i * 2 > 0`, `WHERE 1e308::float8 * 10 > 0`.
+
 - [ ] **OPEN — three builtins deliberately still unsupported (2026-09-02).**
       `numnode()` and `strip()` are tsquery / tsvector full-text functions —
       that surface is not modelled. `hashtext()` is PG's INTERNAL hash: its
