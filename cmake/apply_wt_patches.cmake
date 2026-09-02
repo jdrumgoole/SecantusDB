@@ -51,6 +51,7 @@ set(_patches
     "patch_wt_python.py|${WT_SOURCE_DIR}/lang/python/CMakeLists.txt"
     "patch_wt_helpers.py|${WT_SOURCE_DIR}/cmake/helpers.cmake"
     "patch_wt_musl.py|${WT_SOURCE_DIR}/src/os_posix/os_fs.c"
+    "patch_wt_pyapi.py|${WT_SOURCE_DIR}/lang/python/wiredtiger.i"
 )
 
 foreach(_entry IN LISTS _patches)
