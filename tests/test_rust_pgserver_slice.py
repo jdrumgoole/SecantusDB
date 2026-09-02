@@ -1125,3 +1125,44 @@ def test_an_unknown_literal_takes_the_type_beside_it(home: Path) -> None:
         with pytest.raises(psycopg.Error) as exc:
             cur.execute("select interval '1 day' = '2020-01-01'")
         assert exc.value.diag.sqlstate == "22007"
+
+
+# (sql, argument). Each is bound over BOTH wire formats. The point of these is
+# that a parameter's MEANING must not depend on the format it arrived in, and
+# the two formats are decoded by separate code.
+_TYPED_PARAMS = [
+    ("select array['a','b'] = %s", ["a", "b"]),
+    ("select '1 day'::interval = %s", dt.timedelta(days=1)),
+    ("select '2026-01-01 12:00'::timestamp = %s", dt.datetime(2026, 1, 1, 12, 0)),
+    ("select '2026-01-01'::date = %s", dt.date(2026, 1, 1)),
+    ("select '12:00'::time = %s", dt.time(12, 0)),
+    ("select 1.50::numeric = %s", Decimal("1.5")),
+    ("select array[1.5::numeric] = %s", [Decimal("1.5")]),
+    ("select array['2026-01-01'::date] = %s", [dt.date(2026, 1, 1)]),
+    ("select 'abc' = %s", "abc"),
+    ("select 5 = %s", 5),
+]
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+@pytest.mark.parametrize("sql,arg", _TYPED_PARAMS, ids=lambda v: str(v)[:34])
+def test_typed_parameter_compares_equal_in_both_formats(
+    home: Path, sql: str, arg: object, binary: bool
+) -> None:
+    """A parameter must mean the same thing in either wire format.
+
+    The binary path learned arrays, intervals and timestamps; the text path did
+    not, so those values fell through to a plain string and `array[...] = %s`
+    compared an array against a string. The error said "cannot compare", which
+    pointed at comparison when the cause was one layer earlier, in decoding.
+
+    A client may also leave a parameter's type UNSPECIFIED and let the server
+    infer it — psycopg does this for lists and datetimes — in which case the
+    value arrives as text whatever the format, and is resolved from the operand
+    beside it exactly as a bare literal would be.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.cursor().execute("set timezone to 'UTC'")
+        cur = conn.cursor(binary=binary)
+        cur.execute(sql, (arg,))
+        assert cur.fetchone()[0] is True

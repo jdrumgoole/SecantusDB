@@ -558,6 +558,21 @@ PARAMETERISED = [
     ("SELECT %s::interval", (dt.timedelta(days=1, hours=2, minutes=3, seconds=4),)),
     ("SELECT %s::interval", (dt.timedelta(seconds=-1),)),
     ("SELECT %s::interval", (dt.timedelta(microseconds=500000),)),
+    # A typed value compared against a bound one. psycopg leaves the parameter
+    # type UNSPECIFIED for lists and datetimes and lets the server infer it, so
+    # these exercise the resolution rule rather than a declared oid.
+    ("SELECT array['a','b'] = %s", (["a", "b"],)),
+    # NOT `array[1,2,3] = %s`: psycopg dumps a list of small ints as
+    # `smallint[]`, and PostgreSQL has no `integer[] = smallint[]` operator —
+    # array comparison needs identical element types, with no widening. This
+    # server compares them and answers true. Divergence filed in the backlog.
+    ("SELECT '1 day'::interval = %s", (dt.timedelta(days=1),)),
+    ("SELECT '2026-01-01 12:00'::timestamp = %s", (dt.datetime(2026, 1, 1, 12, 0),)),
+    ("SELECT '2026-01-01'::date = %s", (dt.date(2026, 1, 1),)),
+    ("SELECT '12:00'::time = %s", (dt.time(12, 0),)),
+    ("SELECT 1.50::numeric = %s", (Decimal("1.5"),)),
+    ("SELECT array[1.5::numeric] = %s", ([Decimal("1.5")],)),
+    ("SELECT array['2026-01-01'::date] = %s", ([dt.date(2026, 1, 1)],)),
     # A bound NULL must behave exactly like a literal one.
     ("SELECT id FROM d WHERE n = %s", (None,)),
     ("SELECT id FROM d WHERE n <> %s", (None,)),

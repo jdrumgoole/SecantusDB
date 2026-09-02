@@ -1413,6 +1413,27 @@ fn unsupported_binary_oid(oid: Option<u32>) -> PgWireError {
     )))
 }
 
+/// The element type behind an array oid, for the oids this server knows.
+///
+/// Used by BOTH parameter formats so an array parameter decodes to an array
+/// either way.
+fn element_of_array_oid(oid: u32) -> Option<&'static str> {
+    Some(match oid {
+        1000 => "bool",
+        1005 => "int2",
+        1007 => "int4",
+        1009 => "text",
+        1015 => "varchar",
+        1016 => "int8",
+        1021 => "float4",
+        1022 => "float8",
+        1231 => "numeric",
+        1115 => "timestamp",
+        1182 => "date",
+        _ => return None,
+    })
+}
+
 /// Decode one bound parameter into the value the planner will substitute.
 ///
 /// `None` is SQL NULL. A client may declare a parameter's type as oid 0
@@ -1508,10 +1529,7 @@ fn decode_parameter(
             )),
             // Every array oid this server knows, decoded through the element's
             // own binary decoder rather than a per-type array reader.
-            Some(1000) | Some(1005) | Some(1007) | Some(1009) | Some(1015) | Some(1016)
-            | Some(1021) | Some(1022) | Some(1231) | Some(1182) | Some(1115) => {
-                binary_array(bytes, tz)
-            }
+            Some(oid) if element_of_array_oid(oid).is_some() => binary_array(bytes, tz),
             other => Err(unsupported_binary_oid(other)),
         };
     }
@@ -1540,7 +1558,31 @@ fn decode_parameter(
             text.as_ref(),
             "t" | "true" | "TRUE" | "1" | "y" | "yes" | "on"
         ))),
-        Some(25) | Some(1043) | Some(19) => Ok(Bson::String(text.into_owned())),
+        Some(25) | Some(1043) | Some(19) | Some(1042) => Ok(Bson::String(text.into_owned())),
+        // The TYPED text forms. These reach the same value the BINARY path
+        // produces for the same oid, which is the whole point: a parameter's
+        // meaning cannot depend on the format a client happened to send it in.
+        //
+        // Left out, they fell through to `sniff_text` and became plain strings,
+        // so `array[...] = %s` compared an array to a string and reported
+        // "cannot compare" -- 98 failures whose message pointed at comparison
+        // when the cause was here, one layer earlier.
+        Some(oid @ (1082 | 1083 | 1114 | 1184 | 1266 | 1186)) => {
+            let target = match oid {
+                1082 => "date",
+                1083 => "time",
+                1114 => "timestamp",
+                1184 => "timestamptz",
+                1266 => "timetz",
+                _ => "interval",
+            };
+            secantus_pgplan::cast_text_to(&text, target, tz).map_err(|e| PgHandler::err(&e))
+        }
+        Some(oid) if element_of_array_oid(oid).is_some() => {
+            let element = element_of_array_oid(oid).expect("checked");
+            secantus_pgplan::cast_text_to(&text, &format!("{element}[]"), tz)
+                .map_err(|e| PgHandler::err(&e))
+        }
         // oid 0 = the client left the type to us. PostgreSQL infers from
         // context; sniffing the literal covers the shapes this server plans.
         _ => Ok(sniff_text(&text)),

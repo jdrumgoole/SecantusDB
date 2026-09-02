@@ -708,7 +708,41 @@ PostgreSQL orders it TOTALLY -- NaN equals itself and sorts above infinity.
 
 **Probe: 28 shapes, 0 divergences.**
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388.**
+### 0.24 the text parameter path, and a message that blamed the wrong layer (2026-09-02)
+
+**1386 -> ~1485, +99.**
+
+**The error named comparison; the bug was in decoding.** After 0.23 the residual
+`comparing array with string` (36), `comparing interval with string` (32) and
+`comparing document with string` (30) looked like remaining comparison gaps.
+They were not: the TEXT parameter path had no arms for arrays, intervals or
+timestamps, so those values fell through to `sniff_text` and became plain
+strings. The binary path had learned all of them in 0.20 and the text path never
+did. **A sharpened message localises a symptom, not a cause** -- 0.23's
+diagnostic was still pointing one layer past the defect.
+
+**Both formats now go through the same conversions**, and the array-oid ->
+element-type map is shared between them, so the two cannot drift again. A
+parameter's meaning must not depend on the format a client happened to pick.
+
+**The second half is the resolution rule again.** psycopg leaves the type
+UNSPECIFIED for lists and datetimes and lets the server infer -- so the value
+arrives as text in EITHER format, and must be resolved from the operand beside
+it. 0.22 implemented that for literals and 0.23 extended it to comparison; this
+extends it to `ParamRef`. Three batches to cover one PostgreSQL rule across
+literal / parameter and arithmetic / comparison.
+
+**A divergence found and filed rather than papered over:** psycopg dumps a list
+of small ints as `smallint[]`, and PostgreSQL has NO `integer[] = smallint[]`
+operator -- array operators require identical element types and do not widen -- so
+`array[1,2,3] = %s` is 42883 there and `true` here. Reproducing that needs
+PostgreSQL's operator-resolution table for arrays. The case was removed from the
+differential list (where it had been added asserting OUR answer) and written
+into the backlog.
+
+**Probe: 9 shapes x 2 formats, 0 divergences.**
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485.**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

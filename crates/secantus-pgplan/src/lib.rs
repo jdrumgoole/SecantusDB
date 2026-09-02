@@ -1469,6 +1469,17 @@ pub fn plan_with_session(
     out
 }
 
+/// Cast a TEXT representation to a declared type, with the session zone in
+/// force. The public door onto `cast_value` for the wire layer, which has text
+/// from a client and a declared oid and needs the same value a literal of that
+/// type would produce.
+pub fn cast_text_to(text: &str, target: &str, tz: &TimeZoneSetting) -> Result<Bson> {
+    let previous = PLAN_TIMEZONE.with(|t| t.replace(tz.clone()));
+    let out = cast_value(Bson::String(text.to_string()), target);
+    PLAN_TIMEZONE.with(|t| *t.borrow_mut() = previous);
+    out
+}
+
 fn session_timezone() -> TimeZoneSetting {
     PLAN_TIMEZONE.with(|t| t.borrow().clone())
 }
@@ -2467,13 +2478,21 @@ fn coerce_unknown_operand(
     if !matches!(op, "+" | "-" | "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
         return Ok((lhs, rhs));
     }
-    let bare_string = |n: Option<&Box<pg_query::protobuf::Node>>| {
-        matches!(
-            n.and_then(|x| x.node.as_ref()),
-            Some(N::AConst(c))
-                if matches!(c.val.as_ref(), Some(pg_query::protobuf::a_const::Val::Sval(_)))
-        )
-    };
+    // A bare string literal, or a PARAMETER whose type the client left
+    // unspecified -- PostgreSQL resolves both from context. psycopg sends
+    // lists and datetimes with an unspecified oid and lets the server infer,
+    // so without the ParamRef arm `array[...] = %s` compared an array to the
+    // string the parameter decoded to.
+    let unresolved =
+        |n: Option<&Box<pg_query::protobuf::Node>>| match n.and_then(|x| x.node.as_ref()) {
+            Some(N::AConst(c)) => matches!(
+                c.val.as_ref(),
+                Some(pg_query::protobuf::a_const::Val::Sval(_))
+            ),
+            Some(N::ParamRef(_)) => true,
+            _ => false,
+        };
+    let bare_string = unresolved;
     let l_bare = bare_string(e.lexpr.as_ref());
     let r_bare = bare_string(e.rexpr.as_ref());
     if l_bare == r_bare {

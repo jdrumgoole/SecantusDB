@@ -4217,6 +4217,13 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   scale depends on the operands' weights (`1.5 / 3` is `0.50000000000000000000`,
   twenty places) in a way not yet measured, and emitting a plausible-but-wrong
   number of decimal places would be a wrong answer.
+- **Rust PG server: array comparison does not require matching element types.**
+  PostgreSQL has no `integer[] = smallint[]` operator — array operators need
+  identical element types and do not widen — so `select array[1,2,3] = %s` with
+  a Python list is `42883` there (psycopg dumps small ints as `smallint[]`) and
+  `true` here. Reproducing it needs PostgreSQL's operator-resolution table for
+  arrays, not a comparison fix. Being more permissive, so it accepts queries
+  PostgreSQL rejects rather than answering them differently.
 - **Rust PG server: `json` / `jsonb` and `oid` casts are unsupported**, and
   binary parameters of those oids with them
   (the binary decoder covers `numeric` / `date` / `time` / `timestamp` / arrays;
