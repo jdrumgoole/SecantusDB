@@ -4322,12 +4322,13 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   - ~9 stragglers: `$rand: []`, `$substr*` with an array argument, `$toDouble`
     / `$toLong` / `$toDecimal` of a datetime, `$strcasecmp` of a double.
 
-- [ ] **Decimal128 operands are refused by 38 Rust operators (2026-09-02).**
-  `$abs`, `$add`, `$subtract`, `$multiply`, `$divide`, `$mod`, `$ceil`,
+- [ ] **Decimal128 operands are refused by 33 Rust operators (2026-09-02).**
+  Was 38; `$abs`, `$toBool`, `$toInt`, `$toLong` and `$toDouble` now take them.
+  `$add`, `$subtract`, `$multiply`, `$divide`, `$mod`, `$ceil`,
   `$floor`, `$trunc`, `$round`, `$cmp`, `$gt`, `$gte`, `$lt`, `$lte`, `$pow`,
   `$sqrt`, `$exp`, `$ln`, `$log10`, the six trig and four hyperbolic functions,
-  `$degreesToRadians` / `$radiansToDegrees`, and `$toBool` / `$toDate` /
-  `$toDouble` / `$toInt` / `$toLong`. Each declines with a comment reading
+  `$degreesToRadians` / `$radiansToDegrees`, and `$toDate`. Each declines with a
+  comment reading
   "-> Python" or "defers to the pure oracle" — meaningless here — so **a
   collection holding Decimal128 values cannot use most math operators on the
   Rust server.** mongod answers all 38.
@@ -4338,6 +4339,30 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   comparison consults first. `$gt` / `$lt` / `$cmp`, `sort()` and range queries
   now work on a collection holding decimals — five corpus shapes, but a whole
   capability in practice. What remains is the ARITHMETIC and conversions.
+
+  **Conversions done 2026-09-02**: `$abs`, `$toBool`, `$toInt`, `$toLong` and
+  `$toDouble` now take decimals (70 cross-server shapes verified). What remains
+  is the ARITHMETIC: `$add` / `$subtract` / `$multiply` / `$divide` / `$mod` and
+  the transcendentals.
+
+  **The arithmetic semantics, probed 8.2.11 so the next pass does not re-derive
+  them** — the quantum is load-bearing and several of these defeat a guess:
+
+  | case | mongod |
+  | --- | --- |
+  | `Decimal("2.5") + double 2.0` | `4.50000000000000` — the double's precision enters the quantum |
+  | `Decimal("2.5") * 2` | `5.0`, NOT `5` — trailing zeros are significant |
+  | `Decimal("2.50") + 2` | `4.50` — quantum survives |
+  | `Decimal("2.5") - Decimal("0.5")` | `2.0` |
+  | `1 / 3` | 34 significant digits |
+  | `Infinity + 1` | `Infinity`; `NaN + 1` is `NaN` |
+  | `-Infinity + Infinity` | `NaN` |
+  | `1 / 0` | **error 2** `can't $divide by zero`, not `Infinity` |
+
+  `decimal.rs` has `add` and `mul` (which preserve trailing zeros by design), so
+  `$add` / `$subtract` / `$multiply` look reachable; `$divide` and `$mod` need
+  division, and `Decimal + double` needs the double->decimal quantum rule, which
+  is its own probe.
 
   **Scoped, not guessed** (2026-09-02): `crates/secantus-core/src/decimal.rs`
   represents a value as sign / coefficient / exponent with `add`, `mul`,
