@@ -14,6 +14,7 @@ import operator
 import re
 import threading
 import weakref
+from decimal import Decimal
 from typing import Any
 
 import bson
@@ -2376,6 +2377,22 @@ def _apply_post_aggregates(plan: Any, result: list[dict[str, Any]]) -> list[dict
                 doc[field_name] = _sorted_agg_value(kind, payload, doc.get(field_name))
             elif kind in ("variance", "bit_and", "bit_or", "bit_xor"):
                 doc[field_name] = _stat_bit_value(kind, doc.get(field_name))
+            elif kind == "numeric_stat":
+                func, n_field, sx_field, sx2_field = payload
+                doc[field_name] = typemap.numeric_stat(
+                    func,
+                    int(doc.get(n_field) or 0),
+                    _as_exact(doc.get(sx_field)),
+                    _as_exact(doc.get(sx2_field)),
+                )
+            elif kind == "numeric_avg":
+                n_field, sx_field = payload
+                count = int(doc.get(n_field) or 0)
+                doc[field_name] = (
+                    None
+                    if count == 0
+                    else typemap.numeric_div(_as_exact(doc.get(sx_field)), Decimal(count))
+                )
             elif kind in ("interval_sum", "interval_avg"):
                 doc[field_name] = _interval_agg_value(kind, doc.get(field_name))
             elif kind == "range_agg":
@@ -2385,6 +2402,17 @@ def _apply_post_aggregates(plan: Any, result: list[dict[str, Any]]) -> list[dict
             else:
                 doc[field_name] = _ordered_set_value(kind, payload, doc.get(field_name))
     return result
+
+
+def _as_exact(value: Any) -> Decimal:
+    """A `$sum` result as an exact `Decimal`.
+
+    The accumulator gives back a Python int for integer columns and a
+    `Decimal128` for numeric ones; `str` is the lossless bridge for both (a
+    `Decimal128` has no numeric protocol of its own)."""
+    if value is None:
+        return Decimal(0)
+    return Decimal(str(typemap.unwrap_numeric(value)))
 
 
 def _interval_agg_value(kind: str, values: Any) -> Any:

@@ -6229,19 +6229,107 @@ def _minmax_body(val: Any, field: str | None, tag: str | None, filter_cond: Any)
     return {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
 
 
-def _is_interval_agg_arg(arg: Any, tag_of: Any) -> bool:
-    """Whether an aggregate's argument is an interval-typed column.
+def _agg_arg_tag(arg: Any, tag_of: Any) -> str | None:
+    """An aggregate argument's declared type tag, or None when it has none.
 
     `tag_of` RAISES for anything that is not a resolvable column — `SUM(-83)`
     takes a literal — so the failure is swallowed here rather than guarded on
     the node type, which differs between the single-table shape (a column name)
     and the join shape (a Column node)."""
     if arg is None:
-        return False
+        return None
     try:
-        return tag_of(arg) == "interval"
+        return tag_of(arg)
     except errors.SQLError:
-        return False
+        return None
+
+
+def _is_interval_agg_arg(arg: Any, tag_of: Any) -> bool:
+    """Whether an aggregate's argument is an interval-typed column."""
+    return _agg_arg_tag(arg, tag_of) == "interval"
+
+
+def _is_exact_agg_arg(arg: Any, tag_of: Any) -> bool:
+    """Whether an aggregate's argument is one Postgres finishes exactly."""
+    return _agg_arg_tag(arg, tag_of) in _EXACT_NUMERIC_TAGS
+
+
+#: Every statistical aggregate. Postgres computes all six in NUMERIC arithmetic
+#: for an exact-typed input and answers `numeric`; only a float input gives
+#: `float8`.
+_STAT_FUNCS = frozenset({"stddev", "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop"})
+
+#: Input types Postgres finishes a statistical aggregate exactly for.
+_EXACT_NUMERIC_TAGS = frozenset({"int2", "int4", "int8", "numeric"})
+
+
+def _register_numeric_stat(
+    func: str,
+    val: str,
+    fname: str,
+    accumulators: dict[str, Any],
+    project: dict[str, Any] | None,
+    post_aggregates: list[tuple[str, str, Any]],
+) -> tuple[str, ...]:
+    """Accumulate N / sum(X) / sum(X**2) for an exact-typed statistical
+    aggregate, to be finished in Python by `typemap.numeric_stat`.
+
+    Postgres accumulates those three as numerics and divides at
+    `select_div_scale`'s scale. Mongo's `$stdDevSamp` is a float, and the
+    variances were the SQUARE of that float — so the values lost their last
+    digits (`2.333333333333333` for PG's `2.3333333333333333`) and the type was
+    reported as `float8` where PG says `numeric`.
+
+    `$sum` skips nulls, and the count only counts non-null rows, which is what
+    the sample/population denominators need."""
+    nonnull = {"$ne": [{"$ifNull": [val, None]}, None]}
+    n_f, sx_f, sx2_f = f"{fname}__n", f"{fname}__sx", f"{fname}__sx2"
+    accumulators[n_f] = {"$sum": {"$cond": [nonnull, 1, 0]}}
+    accumulators[sx_f] = {"$sum": val}
+    accumulators[sx2_f] = {"$sum": {"$multiply": [val, val]}}
+    if project is not None:
+        for helper_field in (n_f, sx_f, sx2_f):
+            project[helper_field] = f"${helper_field}"
+    post_aggregates.append((fname, "numeric_stat", (func, n_f, sx_f, sx2_f)))
+    return (n_f, sx_f, sx2_f)
+
+
+def _keep_agg_helpers(
+    helpers: tuple[str, ...], field_tags: dict[str, str], agg_field_names: list[str]
+) -> None:
+    """Make a post-aggregate's accumulator fields survive the `$project`.
+
+    The computed-projection registrars build their projection from
+    `agg_field_names`, so a field not listed there is dropped between the
+    `$group` and the post-aggregate — which then read three missing values and
+    answered NULL for every statistical aggregate."""
+    for name in helpers:
+        field_tags[name] = "numeric"
+        agg_field_names.append(name)
+
+
+def _register_numeric_avg(
+    val: str,
+    fname: str,
+    accumulators: dict[str, Any],
+    project: dict[str, Any] | None,
+    post_aggregates: list[tuple[str, str, Any]],
+) -> tuple[str, ...]:
+    """Accumulate sum(X) and a non-null count for an exact-typed `avg`.
+
+    Postgres divides those two as numerics, so the answer carries
+    `select_div_scale`'s scale — `avg(i)` over 1, 2, 4 is
+    `2.3333333333333333`, and over a single 1 it is `1.00000000000000000000`.
+    Mongo's `$avg` is a float, which was both a different value in the last
+    digit and a value with no scale at all."""
+    n_f, sx_f = f"{fname}__n", f"{fname}__sx"
+    accumulators[n_f] = {"$sum": {"$cond": [{"$ne": [{"$ifNull": [val, None]}, None]}, 1, 0]}}
+    accumulators[sx_f] = {"$sum": val}
+    if project is not None:
+        project[n_f] = f"${n_f}"
+        project[sx_f] = f"${sx_f}"
+    post_aggregates.append((fname, "numeric_avg", (n_f, sx_f)))
+    return (n_f, sx_f)
 
 
 def _accumulator_for(
@@ -6783,7 +6871,24 @@ def _grouping_set_branch(
                 }
                 project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
-        elif agg is not None and agg[0] in (set(_POST_STAT_FUNCS) | _BIT_AGG_FUNCS):
+        elif (
+            agg is not None
+            and agg[0] == "avg"
+            and not agg[2]
+            and fcond is None
+            and _is_exact_agg_arg(agg[1], table.type_for)
+        ):
+            # PG divides sum(X) by the non-null count as NUMERICS, so the
+            # answer carries `select_div_scale`'s scale — `avg(i)` over 1, 2, 4
+            # is `2.3333333333333333` and over a single 1 it is
+            # `1.00000000000000000000`. Mongo's `$avg` is a float: a different
+            # last digit, and no scale at all.
+            fname = names.fresh(alias or "avg")
+            _register_numeric_avg(
+                f"${table.field_for(agg[1])}", fname, accumulators, project, post_aggregates
+            )
+            out_columns.append((fname, "numeric"))
+        elif agg is not None and agg[0] in (_STAT_FUNCS | _BIT_AGG_FUNCS):
             # variance / var_pop (square of stdDev) and bit_and/or/xor (push + Python
             # fold) — a $group accumulator plus a post-aggregate finish that runs
             # over the unioned rows (same field name in every branch).
@@ -6800,11 +6905,21 @@ def _grouping_set_branch(
                 accumulators[fname] = {"$push": val}
                 tag = table.type_for(col) if table.type_for(col) in ("int4", "int8") else "int8"
                 post_aggregates.append((fname, func, None))
-            else:
-                accumulators[fname] = {_POST_STAT_FUNCS[func]: val}
+                project[fname] = f"${fname}"
+            elif table.type_for(col) in _EXACT_NUMERIC_TAGS:
+                _register_numeric_stat(func, val, fname, accumulators, project, post_aggregates)
                 tag = "numeric"
+            elif func in _POST_STAT_FUNCS:
+                # A FLOAT input: PG stays in float8 here, so the old
+                # square-of-stdDev keeps the value and only the TAG was wrong —
+                # it claimed `numeric` for a float8 result.
+                accumulators[fname] = {_POST_STAT_FUNCS[func]: val}
+                tag = "float8"
                 post_aggregates.append((fname, "variance", None))
-            project[fname] = f"${fname}"
+                project[fname] = f"${fname}"
+            else:
+                accumulators[fname], tag = _accumulator_for(func, table.field_for(col), None)
+                project[fname] = f"${fname}"
             out_columns.append((fname, tag))
         elif (
             agg is not None
@@ -7000,6 +7115,38 @@ def _plan_grouping_sets_window_select(
         # Same interval fold as the plain aggregate path — reached when the
         # aggregate sits inside a computed projection (`sum(d)::text`). Mongo's
         # `$sum` over interval subdocuments answers 0 and its `$avg` NULL.
+        # An exact-typed statistical aggregate or `avg` reached through a
+        # COMPUTED projection (`stddev(i)::text`). Without this the values came
+        # from Mongo's float accumulators — and `variance` / `var_pop` were not
+        # supported here at all, because `_accumulator_for` has no post-
+        # aggregate channel to finish them through.
+        if _agg_filter_where(node) is None and not agg[2]:
+            if agg[0] in _STAT_FUNCS and _is_exact_agg_arg(agg[1], table.type_for):
+                fname = names.fresh(agg[0])
+                helpers = _register_numeric_stat(
+                    agg[0],
+                    f"${table.field_for(agg[1])}",
+                    fname,
+                    accumulators,
+                    None,
+                    post_aggregates,
+                )
+                field_tags[fname] = "numeric"
+                # The accumulator fields only survive the caller's `$project`
+                # if they are named here; without that the post-aggregate read
+                # three missing fields and answered NULL.
+                _keep_agg_helpers(helpers, field_tags, agg_field_names)
+                agg_field_names.append(fname)
+                return fname
+            if agg[0] == "avg" and _is_exact_agg_arg(agg[1], table.type_for):
+                fname = names.fresh("avg")
+                helpers = _register_numeric_avg(
+                    f"${table.field_for(agg[1])}", fname, accumulators, None, post_aggregates
+                )
+                field_tags[fname] = "numeric"
+                _keep_agg_helpers(helpers, field_tags, agg_field_names)
+                agg_field_names.append(fname)
+                return fname
         if agg[0] in ("sum", "avg") and _is_interval_agg_arg(agg[1], table.type_for):
             fname = names.fresh(agg[0])
             accumulators[fname] = {"$push": f"${table.field_for(agg[1])}"}
@@ -7230,7 +7377,24 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
                 }
                 project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
-        elif agg is not None and agg[0] in (set(_POST_STAT_FUNCS) | _BIT_AGG_FUNCS):
+        elif (
+            agg is not None
+            and agg[0] == "avg"
+            and not agg[2]
+            and fcond is None
+            and _is_exact_agg_arg(agg[1], table.type_for)
+        ):
+            # PG divides sum(X) by the non-null count as NUMERICS, so the
+            # answer carries `select_div_scale`'s scale — `avg(i)` over 1, 2, 4
+            # is `2.3333333333333333` and over a single 1 it is
+            # `1.00000000000000000000`. Mongo's `$avg` is a float: a different
+            # last digit, and no scale at all.
+            fname = names.fresh(alias or "avg")
+            _register_numeric_avg(
+                f"${table.field_for(agg[1])}", fname, accumulators, project, post_aggregates
+            )
+            out_columns.append((fname, "numeric"))
+        elif agg is not None and agg[0] in (_STAT_FUNCS | _BIT_AGG_FUNCS):
             # variance / var_pop (square of stdDev) and bit_and/or/xor (push +
             # Python fold) — a $group accumulator plus a post-aggregate finish.
             func, col, _distinct = agg
@@ -7246,11 +7410,21 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
                 accumulators[fname] = {"$push": val}
                 tag = table.type_for(col) if table.type_for(col) in ("int4", "int8") else "int8"
                 post_aggregates.append((fname, func, None))
-            else:
-                accumulators[fname] = {_POST_STAT_FUNCS[func]: val}
+                project[fname] = f"${fname}"
+            elif table.type_for(col) in _EXACT_NUMERIC_TAGS:
+                _register_numeric_stat(func, val, fname, accumulators, project, post_aggregates)
                 tag = "numeric"
+            elif func in _POST_STAT_FUNCS:
+                # A FLOAT input: PG stays in float8 here, so the old
+                # square-of-stdDev keeps the value and only the TAG was wrong —
+                # it claimed `numeric` for a float8 result.
+                accumulators[fname] = {_POST_STAT_FUNCS[func]: val}
+                tag = "float8"
                 post_aggregates.append((fname, "variance", None))
-            project[fname] = f"${fname}"
+                project[fname] = f"${fname}"
+            else:
+                accumulators[fname], tag = _accumulator_for(func, table.field_for(col), None)
+                project[fname] = f"${fname}"
             out_columns.append((fname, tag))
         elif (
             agg is not None
@@ -7662,6 +7836,38 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
         # Same interval fold as the plain aggregate path — reached when the
         # aggregate sits inside a computed projection (`sum(d)::text`). Mongo's
         # `$sum` over interval subdocuments answers 0 and its `$avg` NULL.
+        # An exact-typed statistical aggregate or `avg` reached through a
+        # COMPUTED projection (`stddev(i)::text`). Without this the values came
+        # from Mongo's float accumulators — and `variance` / `var_pop` were not
+        # supported here at all, because `_accumulator_for` has no post-
+        # aggregate channel to finish them through.
+        if _agg_filter_where(node) is None and not agg[2]:
+            if agg[0] in _STAT_FUNCS and _is_exact_agg_arg(agg[1], table.type_for):
+                fname = names.fresh(agg[0])
+                helpers = _register_numeric_stat(
+                    agg[0],
+                    f"${table.field_for(agg[1])}",
+                    fname,
+                    accumulators,
+                    None,
+                    post_aggregates,
+                )
+                field_tags[fname] = "numeric"
+                # The accumulator fields only survive the caller's `$project`
+                # if they are named here; without that the post-aggregate read
+                # three missing fields and answered NULL.
+                _keep_agg_helpers(helpers, field_tags, agg_field_names)
+                agg_field_names.append(fname)
+                return fname
+            if agg[0] == "avg" and _is_exact_agg_arg(agg[1], table.type_for):
+                fname = names.fresh("avg")
+                helpers = _register_numeric_avg(
+                    f"${table.field_for(agg[1])}", fname, accumulators, None, post_aggregates
+                )
+                field_tags[fname] = "numeric"
+                _keep_agg_helpers(helpers, field_tags, agg_field_names)
+                agg_field_names.append(fname)
+                return fname
         if agg[0] in ("sum", "avg") and _is_interval_agg_arg(agg[1], table.type_for):
             fname = names.fresh(agg[0])
             accumulators[fname] = {"$push": f"${table.field_for(agg[1])}"}
@@ -10004,7 +10210,24 @@ def _plan_join_group_select(
                 accumulators[fname] = {"$push": _push_filtered(f"${path}", fcond)}
                 project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
-        elif agg is not None and agg[0] in (set(_POST_STAT_FUNCS) | _BIT_AGG_FUNCS):
+        elif (
+            agg is not None
+            and agg[0] == "avg"
+            and not agg[2]
+            and fcond is None
+            and _is_exact_agg_arg(agg[1], lambda n: resolve(n)[1])
+        ):
+            # PG divides sum(X) by the non-null count as NUMERICS, so the
+            # answer carries `select_div_scale`'s scale — `avg(i)` over 1, 2, 4
+            # is `2.3333333333333333` and over a single 1 it is
+            # `1.00000000000000000000`. Mongo's `$avg` is a float: a different
+            # last digit, and no scale at all.
+            fname = names.fresh(alias or "avg")
+            _register_numeric_avg(
+                f"${resolve(agg[1])[0]}", fname, accumulators, project, post_aggregates
+            )
+            out_columns.append((fname, "numeric"))
+        elif agg is not None and agg[0] in (_STAT_FUNCS | _BIT_AGG_FUNCS):
             # variance / var_pop (square of stdDev) and bit_and/or/xor (push +
             # Python fold) — same post-aggregate finish as the single-table path,
             # resolved through the join resolver.
@@ -10022,11 +10245,19 @@ def _plan_join_group_select(
                 accumulators[fname] = {"$push": val}
                 tag = coltag if coltag in ("int4", "int8") else "int8"
                 post_aggregates.append((fname, func, None))
-            else:
-                accumulators[fname] = {_POST_STAT_FUNCS[func]: val}
+                project[fname] = f"${fname}"
+            elif coltag in _EXACT_NUMERIC_TAGS:
+                _register_numeric_stat(func, val, fname, accumulators, project, post_aggregates)
                 tag = "numeric"
+            elif func in _POST_STAT_FUNCS:
+                # A FLOAT input keeps the float8 path; only its TAG was wrong.
+                accumulators[fname] = {_POST_STAT_FUNCS[func]: val}
+                tag = "float8"
                 post_aggregates.append((fname, "variance", None))
-            project[fname] = f"${fname}"
+                project[fname] = f"${fname}"
+            else:
+                accumulators[fname], tag = _accumulator_for(func, path, None)
+                project[fname] = f"${fname}"
             out_columns.append((fname, tag))
         elif (
             agg is not None
@@ -10238,7 +10469,24 @@ def _join_grouping_set_branch(
                 accumulators[fname] = {"$push": _push_filtered(f"${path}", fcond)}
                 project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
-        elif agg is not None and agg[0] in (set(_POST_STAT_FUNCS) | _BIT_AGG_FUNCS):
+        elif (
+            agg is not None
+            and agg[0] == "avg"
+            and not agg[2]
+            and fcond is None
+            and _is_exact_agg_arg(agg[1], lambda n: resolve(n)[1])
+        ):
+            # PG divides sum(X) by the non-null count as NUMERICS, so the
+            # answer carries `select_div_scale`'s scale — `avg(i)` over 1, 2, 4
+            # is `2.3333333333333333` and over a single 1 it is
+            # `1.00000000000000000000`. Mongo's `$avg` is a float: a different
+            # last digit, and no scale at all.
+            fname = names.fresh(alias or "avg")
+            _register_numeric_avg(
+                f"${resolve(agg[1])[0]}", fname, accumulators, project, post_aggregates
+            )
+            out_columns.append((fname, "numeric"))
+        elif agg is not None and agg[0] in (_STAT_FUNCS | _BIT_AGG_FUNCS):
             # variance / var_pop and bit_and/or/xor over the join — a $group
             # accumulator plus a post-aggregate finish (resolved through the join
             # resolver), run over the unioned rows.
@@ -10256,11 +10504,19 @@ def _join_grouping_set_branch(
                 accumulators[fname] = {"$push": val}
                 tag = coltag if coltag in ("int4", "int8") else "int8"
                 post_aggregates.append((fname, func, None))
-            else:
-                accumulators[fname] = {_POST_STAT_FUNCS[func]: val}
+                project[fname] = f"${fname}"
+            elif coltag in _EXACT_NUMERIC_TAGS:
+                _register_numeric_stat(func, val, fname, accumulators, project, post_aggregates)
                 tag = "numeric"
+            elif func in _POST_STAT_FUNCS:
+                # A FLOAT input keeps the float8 path; only its TAG was wrong.
+                accumulators[fname] = {_POST_STAT_FUNCS[func]: val}
+                tag = "float8"
                 post_aggregates.append((fname, "variance", None))
-            project[fname] = f"${fname}"
+                project[fname] = f"${fname}"
+            else:
+                accumulators[fname], tag = _accumulator_for(func, path, None)
+                project[fname] = f"${fname}"
             out_columns.append((fname, tag))
         elif (
             agg is not None
@@ -10485,7 +10741,40 @@ def _plan_join_grouping_sets_window_select(
         # Same interval fold as the plain aggregate path — reached when the
         # aggregate sits inside a computed projection (`sum(d)::text`). Mongo's
         # `$sum` over interval subdocuments answers 0 and its `$avg` NULL.
-        if agg[0] in ("sum", "avg") and _is_interval_agg_arg(agg[1], lambda n: resolve(n)[1]):
+        # An exact-typed statistical aggregate or `avg` reached through a
+        # COMPUTED projection (`stddev(i)::text`). Without this the values came
+        # from Mongo's float accumulators — and `variance` / `var_pop` were not
+        # supported here at all, because `_accumulator_for` has no post-
+        # aggregate channel to finish them through.
+        _tag_of = lambda n: resolve(n)[1]  # noqa: E731
+        if _agg_filter_where(node) is None and not agg[2]:
+            if agg[0] in _STAT_FUNCS and _is_exact_agg_arg(agg[1], _tag_of):
+                fname = names.fresh(agg[0])
+                helpers = _register_numeric_stat(
+                    agg[0],
+                    f"${resolve(agg[1])[0]}",
+                    fname,
+                    accumulators,
+                    None,
+                    post_aggregates,
+                )
+                field_tags[fname] = "numeric"
+                # The accumulator fields only survive the caller's `$project`
+                # if they are named here; without that the post-aggregate read
+                # three missing fields and answered NULL.
+                _keep_agg_helpers(helpers, field_tags, agg_field_names)
+                agg_field_names.append(fname)
+                return fname
+            if agg[0] == "avg" and _is_exact_agg_arg(agg[1], _tag_of):
+                fname = names.fresh("avg")
+                helpers = _register_numeric_avg(
+                    f"${resolve(agg[1])[0]}", fname, accumulators, None, post_aggregates
+                )
+                field_tags[fname] = "numeric"
+                _keep_agg_helpers(helpers, field_tags, agg_field_names)
+                agg_field_names.append(fname)
+                return fname
+        if agg[0] in ("sum", "avg") and _is_interval_agg_arg(agg[1], _tag_of):
             fname = names.fresh(agg[0])
             accumulators[fname] = {"$push": f"${resolve(agg[1])[0]}"}
             post_aggregates.append((fname, f"interval_{agg[0]}", None))
@@ -10679,7 +10968,40 @@ def _plan_join_group_window_select(
         # Same interval fold as the plain aggregate path — reached when the
         # aggregate sits inside a computed projection (`sum(d)::text`). Mongo's
         # `$sum` over interval subdocuments answers 0 and its `$avg` NULL.
-        if agg[0] in ("sum", "avg") and _is_interval_agg_arg(agg[1], lambda n: resolve(n)[1]):
+        # An exact-typed statistical aggregate or `avg` reached through a
+        # COMPUTED projection (`stddev(i)::text`). Without this the values came
+        # from Mongo's float accumulators — and `variance` / `var_pop` were not
+        # supported here at all, because `_accumulator_for` has no post-
+        # aggregate channel to finish them through.
+        _tag_of = lambda n: resolve(n)[1]  # noqa: E731
+        if _agg_filter_where(node) is None and not agg[2]:
+            if agg[0] in _STAT_FUNCS and _is_exact_agg_arg(agg[1], _tag_of):
+                fname = names.fresh(agg[0])
+                helpers = _register_numeric_stat(
+                    agg[0],
+                    f"${resolve(agg[1])[0]}",
+                    fname,
+                    accumulators,
+                    None,
+                    post_aggregates,
+                )
+                field_tags[fname] = "numeric"
+                # The accumulator fields only survive the caller's `$project`
+                # if they are named here; without that the post-aggregate read
+                # three missing fields and answered NULL.
+                _keep_agg_helpers(helpers, field_tags, agg_field_names)
+                agg_field_names.append(fname)
+                return fname
+            if agg[0] == "avg" and _is_exact_agg_arg(agg[1], _tag_of):
+                fname = names.fresh("avg")
+                helpers = _register_numeric_avg(
+                    f"${resolve(agg[1])[0]}", fname, accumulators, None, post_aggregates
+                )
+                field_tags[fname] = "numeric"
+                _keep_agg_helpers(helpers, field_tags, agg_field_names)
+                agg_field_names.append(fname)
+                return fname
+        if agg[0] in ("sum", "avg") and _is_interval_agg_arg(agg[1], _tag_of):
             fname = names.fresh(agg[0])
             accumulators[fname] = {"$push": f"${resolve(agg[1])[0]}"}
             post_aggregates.append((fname, f"interval_{agg[0]}", None))

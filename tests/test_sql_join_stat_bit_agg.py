@@ -59,15 +59,19 @@ def test_join_variance(storage, session):
     _seed(storage, session)
     r = rows(storage, session, f"SELECT c.region, variance(o.amt) AS v {_J}")
     # sample variance of {4,8,2}; a single sample (w) → NULL.
-    assert r[0][0] == "e" and r[0][1] == pytest.approx(statistics.variance([4, 8, 2]))
+    # These come back as `numeric` now, which is what Postgres answers for an
+    # exact-typed input — `pytest.approx` cannot subtract a Decimal from a float.
+    assert r[0][0] == "e" and float(r[0][1]) == pytest.approx(statistics.variance([4, 8, 2]))
     assert r[1] == ("w", None)
 
 
 def test_join_var_pop(storage, session):
     _seed(storage, session)
     r = rows(storage, session, f"SELECT c.region, var_pop(o.amt) AS v {_J}")
-    assert r[0][0] == "e" and r[0][1] == pytest.approx(statistics.pvariance([4, 8, 2]))
-    assert r[1] == ("w", pytest.approx(0.0))
+    # These come back as `numeric` now, which is what Postgres answers for an
+    # exact-typed input — `pytest.approx` cannot subtract a Decimal from a float.
+    assert r[0][0] == "e" and float(r[0][1]) == pytest.approx(statistics.pvariance([4, 8, 2]))
+    assert r[1][0] == "w" and float(r[1][1]) == pytest.approx(0.0)
 
 
 def test_join_bit_and_or_xor(storage, session):
