@@ -27,6 +27,7 @@ import json as _json
 import math as _math
 import re as _re
 import struct as _struct
+from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
 
@@ -757,6 +758,78 @@ def unwrap_numeric(value: Any) -> Any:
     might be a ``numeric`` and does arithmetic on it needs this first.
     """
     return value.to_decimal() if isinstance(value, bson.Decimal128) else value
+
+
+#: Postgres' jsonb btree type order (`Object > Array > Boolean > Number >
+#: String > Null`), as ascending ranks. Measured on 14.13.
+_JSONB_NULL, _JSONB_STR, _JSONB_NUM, _JSONB_BOOL, _JSONB_ARRAY, _JSONB_OBJECT = range(6)
+
+
+def _jsonb_key(value: Any, *, top: bool = False) -> tuple:
+    """One jsonb value as a comparable tuple, in Postgres' btree order.
+
+    The ordering was measured against 14.13 rather than taken from the manual,
+    which is worth saying because a TOP-LEVEL empty array sorts before
+    everything — including `null`. That is not a documented rule but a
+    consequence of storage: a top-level scalar is held as a one-element array,
+    so `[]` is simply the shorter container. Nested, `[]` is an ordinary array
+    and sorts with the others.
+
+    Object pairs are walked in Postgres' STORAGE order — shorter keys first,
+    then bytewise — which is not the insertion order a Python dict preserves.
+    Key strings themselves compare plainly."""
+    if top and isinstance(value, list) and not value:
+        return (-1,)
+    if value is None:
+        return (_JSONB_NULL,)
+    if isinstance(value, bool):
+        return (_JSONB_BOOL, value)
+    if isinstance(value, str):
+        return (_JSONB_STR, value)
+    if isinstance(value, (int, float, Decimal, bson.Decimal128)):
+        return (_JSONB_NUM, Decimal(str(unwrap_numeric(value))))
+    if isinstance(value, list):
+        return (_JSONB_ARRAY, len(value), tuple(_jsonb_key(v) for v in value))
+    if isinstance(value, Mapping):
+        pairs = sorted(value.items(), key=lambda kv: (len(str(kv[0])), str(kv[0])))
+        return (
+            _JSONB_OBJECT,
+            len(pairs),
+            tuple((str(k), _jsonb_key(v)) for k, v in pairs),
+        )
+    return (_JSONB_OBJECT + 1, str(value))
+
+
+def _range_key(value: Mapping) -> tuple:
+    """A range subdocument as a comparable tuple: empty first, then by lower
+    bound (unbounded lowest), then by upper (unbounded highest). Measured on
+    14.13: `empty < (,3) < [0,3) < [1,5) < [1,9) < [1,) < [2,4)`."""
+    if value.get("empty"):
+        return (0,)
+    lower, upper = value.get("lower"), value.get("upper")
+    return (
+        1,
+        (0,) if lower is None else (1, _jsonb_key(lower)),
+        (1,) if upper is None else (0, _jsonb_key(upper)),
+        bool(value.get("lower_inc")),
+        bool(value.get("upper_inc")),
+    )
+
+
+def total_order_key(value: Any) -> tuple:
+    """A tuple that totally orders values Python itself cannot compare.
+
+    Used only as a FALLBACK, when a direct `<` has already raised: a `jsonb`
+    column holds bare Python values, so ordering one was
+    `TypeError: '<' not supported between instances of 'dict' and 'dict'` — an
+    `XX000` to the client. Ranges have the same shape and the same problem.
+
+    Because it only runs where the direct comparison failed, a well-typed
+    column never reaches it, and a schema-on-read column holding genuinely
+    mixed types gets jsonb's type order rather than an internal error."""
+    if isinstance(value, Mapping) and ("empty" in value or ("lower" in value and "upper" in value)):
+        return (0, _range_key(value))
+    return (1, _jsonb_key(value, top=True))
 
 
 def sort_key_value(value: Any) -> Any:

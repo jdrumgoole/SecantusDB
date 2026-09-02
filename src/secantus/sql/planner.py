@@ -218,6 +218,9 @@ class SelectPlan:
     # ORDER BY field paths that are citext columns: the executor folds their string
     # values to lower case before comparing, so the sort is case-insensitive.
     citext_orders: set[str] = field(default_factory=set)
+    # ORDER BY field paths whose column is jsonb or a range — see
+    # `_structured_order_set`.
+    structured_orders: set[str] = field(default_factory=set)
     # ORDER BY field paths carrying an explicit ``COLLATE`` — field path to the
     # collation name. The executor builds a locale-aware key for these.
     collate_orders: dict[str, str] = field(default_factory=dict)
@@ -2727,6 +2730,31 @@ def _citext_order_set(stmt: exp.Expression, table: TableDef) -> set[str]:
     return out
 
 
+def _structured_order_set(stmt: exp.Expression, table: TableDef) -> set[str]:
+    """The ORDER BY field paths whose column holds a STRUCTURED value — `jsonb`
+    or a range type.
+
+    Both ride as bare Python values, so ordering one was
+    `TypeError: '<' not supported between instances of 'dict' and 'dict'` — an
+    `XX000` to the client. The executor puts those fields through
+    `typemap.total_order_key` instead.
+
+    It has to be decided from the COLUMN, not the value: a jsonb string is an
+    ordinary Python `str`, and Python happily compares `False < 1`, so keying
+    only the values that fail to compare gives an order that is not even
+    transitive (`false` landed between two numbers)."""
+    order = stmt.args.get("order")
+    if order is None:
+        return set()
+    out: set[str] = set()
+    for o in order.expressions:
+        if isinstance(o.this, exp.Column):
+            col = table.column(_column_name(o.this))
+            if col is not None and (col.type_tag == "json" or col.type_tag.endswith("range")):
+                out.add(table.field_for(col.name))
+    return out
+
+
 def _enum_order_map(
     stmt: exp.Expression, table: TableDef, subctx: SubqueryCtx | None
 ) -> dict[str, list[str]]:
@@ -3359,6 +3387,7 @@ def plan_select(stmt: exp.Select, table: TableDef, subctx: SubqueryCtx | None = 
         out_columns=_select_out_columns(stmt, table),
         enum_orders=_enum_order_map(stmt, table, subctx),
         citext_orders=_citext_order_set(stmt, table),
+        structured_orders=_structured_order_set(stmt, table),
         collate_orders=collate_orders,
     )
 

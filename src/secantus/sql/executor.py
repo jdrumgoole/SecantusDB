@@ -93,7 +93,17 @@ def _pg_sort(items: list[Any], key_of: Any, specs: list[tuple[int, bool]]) -> No
                 return 1 if nulls_first else -1
             if x == y:
                 continue
-            base = -1 if x < y else 1
+            try:
+                base = -1 if x < y else 1
+            except TypeError:
+                # A `jsonb` column holds bare Python values, so two objects have
+                # no `<` at all and ordering one was an `XX000` internal error.
+                # Only values the fast path could not compare reach here, so a
+                # well-typed column pays nothing.
+                kx, ky = typemap.total_order_key(x), typemap.total_order_key(y)
+                if kx == ky:
+                    continue
+                base = -1 if kx < ky else 1
             return -base if direction == -1 else base
         return 0
 
@@ -106,6 +116,7 @@ def _order_key_fn(
     enum_orders: dict[str, list[str]] | None = None,
     citext_orders: set[str] | None = None,
     collate_orders: dict[str, str] | None = None,
+    structured_orders: set[str] | None = None,
 ) -> Any:
     """Build the ``key_of(doc)`` used by ``_pg_sort`` for a list of ORDER BY field
     paths. An enum-typed order field maps its label value to the label's ordinal in
@@ -120,6 +131,7 @@ def _order_key_fn(
         }
     citext_fields = citext_orders or set()
     collate_fields = collate_orders or {}
+    structured_fields = structured_orders or set()
 
     def key_of(doc: Any) -> tuple:
         out = []
@@ -134,6 +146,12 @@ def _order_key_fn(
                 value = omap.get(value, len(omap))  # unknown label sorts last
             elif field_path in citext_fields and isinstance(value, str):
                 value = value.lower()
+            elif field_path in structured_fields and value is not None:
+                # A jsonb or range column: Postgres' own btree order, keyed off
+                # the COLUMN rather than the value (see
+                # `planner._structured_order_set`). NULL is left alone so the
+                # NULLS FIRST / LAST placement still sees it.
+                value = typemap.total_order_key(value)
             elif field_path in collate_fields and isinstance(value, str):
                 # An explicit `COLLATE "<locale>"`. The three-level key is
                 # computed WITHOUT ICU (`collation.sort_levels`); the two
@@ -1854,6 +1872,7 @@ def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult
             plan.enum_orders,
             getattr(plan, "citext_orders", None),
             getattr(plan, "collate_orders", None),
+            getattr(plan, "structured_orders", None),
         )
         _pg_sort(docs, key_of, [(direction, nf) for _, direction, nf in plan.order])
         if plan.skip:

@@ -7646,25 +7646,43 @@ shared storage engine or building large new protocol subsystems:
       Pinned by `tests/test_sql_numeric_typmod.py` (24 cases vs PG 14.13,
       including the error's DETAIL line).
 
-- [ ] **OPEN — `ORDER BY` over `jsonb` or a range type is an XX000
-      (2026-09-02, sized).** `'<' not supported between instances of 'dict'
-      and 'dict'`. PG's jsonb order, measured on 14.13, is: an EMPTY ARRAY
-      first (a top-level scalar is stored as a 1-element array, so `[]` is
-      shorter than every scalar), then null < string < number < boolean <
-      non-empty array < object; arrays compare length then element-wise;
-      objects compare pair count then key/value pairs walked in STORAGE order,
-      which is `(len(key), key)`, not insertion order.
+- [x] **RESOLVED (2026-09-02) — `ORDER BY <jsonb>` / `<range>` was an XX000.**
+      PG's jsonb order was MEASURED on 14.13, not read from the manual, and the
+      manual would have been misleading: a TOP-LEVEL empty array sorts before
+      everything including `null`, because a top-level scalar is stored as a
+      one-element array and `[]` is simply the shorter container. Nested, `[]`
+      is an ordinary array. Object pairs are walked in storage order
+      (`(len(key), key)`), while key strings themselves compare plainly.
+      Ranges: empty first, then lower (unbounded lowest), then upper (unbounded
+      highest).
 
-      The blocker is not the rule but the PLUMBING: `typemap.sort_key_value`
-      sees only a value, and a jsonb string is indistinguishable from a text
-      one — so the jsonb field paths have to reach `_order_key_fn` the way
-      `citext_orders` / `collate_orders` do. **And note `'null'::jsonb` and SQL
-      NULL are both Python `None` in this engine**, so JSON null cannot sort
-      inside the jsonb order without a representation change.
+      **The first attempt was unsound and worth remembering.** Falling back to
+      a total-order key only when `x < y` RAISES looks free — but Python
+      compares `False < 1` happily, so a mixed jsonb column got a
+      non-transitive order with `false` sitting between two numbers. The key
+      has to be decided from the COLUMN (`planner._structured_order_set`, the
+      `citext_orders` pattern) or, in the window path, once per ORDER BY TERM
+      across the whole partition.
 
-      Beware the probe trap: `SELECT j::text FROM … ORDER BY j` binds `ORDER
-      BY` to the TEXT output column (PG resolves an output name first), which
-      yields ASCII order and looks like a jsonb rule. Use `ORDER BY v.j`.
+      Second trap: `okeys` in `window.py` is BOTH the peer key and the RANGE
+      frame's arithmetic operand. Wrapping it in the sort key's `(is_null,
+      value)` tuple broke ten RANGE-frame tests. Sort keys and peer keys are
+      separate things.
+
+      Pinned by `tests/test_sql_order_by_structured.py` (vs PG 14.13).
+
+- [ ] **OPEN — a JSON null sorts as SQL NULL (2026-09-02).** `'null'::jsonb`
+      and SQL NULL are both Python `None` in this engine, so a JSON null goes
+      to the NULLS FIRST/LAST end rather than into the jsonb order (where PG
+      puts it just above a top-level empty array). Needs a distinct
+      representation for JSON null, which is a storage-format change.
+
+- [ ] **OPEN — `array_agg(x ORDER BY <mixed jsonb>)` orders inconsistently
+      (2026-09-02).** No longer an error, but this path builds its sort key
+      inside the Mongo pipeline (`_sorted_agg_push`), where the column type is
+      not available — so the value-shaped fallback applies and a column mixing
+      scalars with containers comes back in a non-transitive order. A
+      partition of homogeneous containers is correct.
 
 - [ ] **OPEN — arithmetic in a WHERE clause is still unchecked (2026-09-02).**
       `SELECT * FROM t WHERE i + 1 > 0` returns rows where PG raises `22003`.
