@@ -4154,26 +4154,50 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   desugared into a projection, so it answers 51270 even against a collection,
   where every other argument gets the namespace error.
 
-- [ ] **Aggregation stage specs on the RUST server: 219 of 725 (2026-09-02).**
-  Newly visible: the probe compared only the Python server until it grew a
-  `PROBE_SERVER` column, so this surface had never been measured. Roughly the
-  size the Python side started at. Two families:
+- [x] **Aggregation stage specs on the RUST server — DONE 2026-09-02.** 219 of
+  725 → **0**. This surface had never been measured: the probe compared only the
+  Python server until it grew a `PROBE_SERVER` column, and it turned out to be
+  roughly the size the Python side started at.
 
-  - **61 whole-stage defers** (code 2, "not supported by the Rust server") —
-    `$unset`, `$out`, `$merge`, `$set`, `$replaceWith`, `$bucketAuto`,
-    `$documents`, `$facet`. A capability gap, and on the standalone server a
-    defer is an error, so these stages fail outright there.
-  - **~158 message differences**, most of them one root cause: the Rust side
-    renders a BSON value with Rust's `Debug` formatting where mongod has its
-    own —  `Regex { pattern: "a", options: "" }` for `/a/`,
-    `Binary { subtype: Generic, bytes: [122] }` for `BinData(0, 7A)`,
-    `Timestamp { time: 1, increment: 1 }`, `JavaScriptCode("x=1")`, `NaN` for
-    `nan`. `crate::query::bson_value_repr` already exists and is what these
-    sites should be calling. The rest are validation-order differences of the
-    same shape the Python server just fixed.
+  Two of the fixes were WRONG ANSWERS, not messages:
 
-  Fix the renderer first — it is one change covering the largest family, and it
-  will make the remainder legible.
+  - `$out` and `$merge` with an EMPTY target namespace returned `ok` and wrote
+    to a nameless collection — a `$out` that silently did nothing.
+  - `$unionWith: ""` returned the outer documents unchanged, as on the Python
+    server.
+  - `$unset: ""` unset nothing and reported success.
+
+  The rest were three families:
+
+  - **A third value renderer.** `render_stage_value` and `render_value_compact`
+    both ended in `other => format!("{other:?}")`, so every type without an
+    explicit arm reached the client as Rust `Debug` —
+    `Regex { pattern: "a", options: "" }` for `/a/`. And the two are NOT
+    interchangeable: the 40228 / 17053 family QUOTES binary (`BinData(0, "7A")`)
+    and wraps code as `Code("x=1")` where `$limit`'s renders `BinData(0, 7A)`
+    and the code text bare. mongod has three renderings, not two.
+  - **`map_err(|_| Fallback::Defer)`** on seven stage dispatches threw away the
+    real error — the same shape as the storage layer's `map_err(|_|
+    QueryUnsupported)` fixed earlier. The inner functions carried `()` as their
+    error type, so there was nothing to preserve and each stage's validation had
+    to be ported.
+  - **Validation ORDER**, the same rule the Python server adopted: an unknown or
+    specifically-missing field is reported before the generic "requires X and
+    Y", with each stage's own code and wording.
+
+  Two Rust-specific traps worth remembering: `$set` reported its errors as
+  `$addFields` because the two share an implementation and the message was
+  hard-coded to the alias; and Rust match arms do NOT fall through, so an arm
+  that dispatches to a shared helper swallows every case the helper declines —
+  a follow-up arm for the same stage is unreachable.
+
+  **Writing the Rust unit tests found three more divergences the probe could not
+  reach**, which is the "the probe's reach is exactly its case list" lesson
+  again: its corpus was all scalars and a bare `{a: 1}`, so nothing exercised
+  the checks that run AFTER a stage's leading required field is satisfied —
+  `$lookup` / `$graphLookup` with a valid `from` plus an unknown field, and
+  `$lookup` missing only its `as`. The corpus now carries a `NEARLY_VALID` list
+  of spec-is-fine-except-for-one-thing shapes (740 total).
 
 - **Rust PG server: multidimensional arrays are refused (`0A000`), not
   answered.** `{{1,2},{3,4}}` plans and compares correctly; only returning one

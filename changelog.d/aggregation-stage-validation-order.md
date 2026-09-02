@@ -19,4 +19,16 @@ Two were not message differences at all:
 
 #### Changed
 
-- The probe grew a `PROBE_SERVER` column so it measures the **Rust** server too. It had only ever compared the Python one, which is why the Rust server's 219 divergent shapes on the same corpus had never been seen. They are recorded in `tasks/backlog.md` — 61 whole-stage defers and ~158 message differences, most of the latter one root cause (Rust `Debug` value formatting where mongod has its own renderer).
+- The probe grew a `PROBE_SERVER` column so it measures the **Rust** server too. It had only ever compared the Python one, which is why the Rust server was **219 of 725** divergent on the same corpus with nobody the wiser. That is now **0** as well.
+
+#### Fixed — Rust server
+
+Three of them were wrong answers: `$out` and `$merge` with an empty target namespace returned `ok` and wrote to a nameless collection — a `$out` that silently did nothing — and `$unionWith: ""` and `$unset: ""` likewise reported success having done nothing.
+
+The rest were three families:
+
+- **A third value renderer.** Both `render_stage_value` and `render_value_compact` ended in `other => format!("{other:?}")`, so every type without an explicit arm reached the client as Rust `Debug` — `Regex { pattern: "a", options: "" }` where mongod says `/a/`. And the two are not interchangeable: the 40228 / 17053 family quotes binary (`BinData(0, "7A")`) and wraps code as `Code("x=1")` where `$limit`'s renders `BinData(0, 7A)` and the code text bare.
+- **`map_err(|_| Fallback::Defer)`** on seven stage dispatches discarded the real error — the same shape as the storage layer's `map_err(|_| QueryUnsupported)`. On the standalone server that reads as "the *stage* is unsupported" for what is a bad *argument* to a supported one.
+- **Validation order**, the same rule as above, ported stage by stage.
+
+`$set` also reported its errors as `$addFields`, because the two share an implementation and the message was hard-coded to the alias.

@@ -127,11 +127,35 @@ def run(cli, stage):
         )
 
 
+# A spec that is VALID except for one problem. The `BAD` corpus above is all
+# scalars and bare `{a: 1}`, so it never reaches the check that runs AFTER a
+# stage's leading required field is satisfied -- three real divergences hid
+# there ($lookup and $graphLookup with a `from` plus an unknown field, and
+# $lookup missing only its `as`). The probe's reach is exactly its case list.
+NEARLY_VALID: list[tuple[str, dict]] = [
+    ("$lookup", {"from": "c", "as": "x", "zz": 1}),
+    ("$lookup", {"from": "c"}),
+    ("$graphLookup", {"from": "c", "zz": 1}),
+    ("$graphLookup", {"from": "c"}),
+    ("$unionWith", {"coll": "c", "zz": 1}),
+    ("$sample", {"size": 1, "zz": 1}),
+    ("$bucket", {"groupBy": "$_id", "boundaries": [0, 9], "zz": 1}),
+    ("$bucketAuto", {"groupBy": "$_id", "buckets": 2, "zz": 1}),
+    ("$replaceRoot", {"newRoot": "$$ROOT", "zz": 1}),
+    ("$densify", {"field": "n", "range": {"step": 1, "bounds": "full"}, "zz": 1}),
+    ("$fill", {"output": {"n": {"value": 1}}, "zz": 1}),
+    ("$out", {"coll": "c", "zz": 1}),
+    ("$merge", {"into": "c", "zz": 1}),
+    ("$unwind", {"path": "$a", "zz": 1}),
+    ("$group", {"_id": None, "a": 1}),
+]
+
 tot = 0
 rows = []
 bad = collections.Counter()
-for st in STAGES:
-    for arg in BAD:
+cases = [(st, arg) for st in STAGES for arg in BAD] + NEARLY_VALID
+for st, arg in cases:
+    if True:
         tot += 1
         stage = {st: arg}
         expected = run(mon, stage)
