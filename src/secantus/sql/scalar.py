@@ -2020,6 +2020,9 @@ def _fmt_arg(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> str | No
     fmt_node = node.args.get("format") or node.expression
     if fmt_node is None:
         return None
+    raw = getattr(node, "_secantus_raw_format", None)
+    if isinstance(raw, str) and "%" not in raw:
+        return raw
     value = evaluate(fmt_node, scope, ctx) if isinstance(fmt_node, exp.Expression) else fmt_node
     return None if value is None else _as_text(value)
 
@@ -2036,19 +2039,32 @@ def _to_date_from_format(value: Any, fmt: str | None, *, date_only: bool) -> Any
     if fmt is None:
         parsed = _as_datetime(text)
     else:
-        from sqlglot.dialects.postgres import Postgres as _PGD
-        from sqlglot.time import format_time as _fmt_time
+        # The template goes to the same token table the RENDERING side uses,
+        # not through sqlglot's lossy strftime mapping — that mapping knows no
+        # `Mon` / `AM` / `MS` / `IW`, so every one of those templates raised
+        # `22007 invalid input syntax` instead of parsing.
+        from secantus.sql import datetimeformat as _dtformat
 
-        directive = _fmt_time(_recover_pg_format(fmt), _PGD.TIME_MAPPING) or fmt
         try:
-            parsed = _dt.datetime.strptime(text, directive)
-        except ValueError as exc:
+            parsed = _dtformat.parse_datetime(text, _recover_pg_format(fmt))
+        except (ValueError, KeyError, IndexError) as exc:
             raise errors.SQLError(
                 "22007", f'invalid input syntax for type timestamp: "{text}"'
             ) from exc
     if date_only:
         return parsed.date() if isinstance(parsed, _dt.datetime) else parsed
     return parsed
+
+
+def _to_timestamp_tz(parsed: Any, ctx: ScalarContext) -> Any:
+    """``to_timestamp`` returns a **timestamptz**, so the parsed wall clock is
+    an instant in the SESSION zone. It was returned naive, which rendered
+    without the `+00` offset Postgres sends."""
+    if not isinstance(parsed, _dt.datetime) or parsed.tzinfo is not None:
+        return parsed
+    from secantus.sql.datetimes import session_tzinfo
+
+    return parsed.replace(tzinfo=session_tzinfo(getattr(ctx, "session", None)))
 
 
 def _unix_to_timestamp(value: Any) -> Any:
@@ -2149,6 +2165,44 @@ def _no_such_function(node: exp.Expression, scope: Scope, ctx: ScalarContext) ->
     return errors.SQLError("42883", f"function {name}({', '.join(names)}) does not exist")
 
 
+def _install_to_char_raw_format() -> None:
+    """Keep the ORIGINAL ``to_char`` template on the parsed node.
+
+    sqlglot's Postgres dialect part-converts a ``to_char`` format to strftime
+    at PARSE time, and that conversion is lossy in a way no inverse can undo:
+    it maps both ``d`` and ``D`` to ``%u``, so ``'day'`` and ``'ad'`` and
+    ``'Ddth'`` all arrive with their case destroyed and come back out of the
+    inverse mapping as ``'Day'``, ``'aD'``, ``'DDth'``. Postgres matches its
+    template tokens case-SENSITIVELY, so that is three wrong answers.
+
+    Rather than fight the mapping, stash the raw literal on the node (the same
+    stamp idiom the planner uses elsewhere) and leave sqlglot's own conversion
+    exactly as it was, so nothing that reads ``format`` changes behaviour.
+    """
+    from sqlglot.dialects.postgres import Postgres as _PG
+
+    for name in ("TO_CHAR", "TO_DATE", "TO_TIMESTAMP"):
+        original = _PG.Parser.FUNCTIONS.get(name)
+        if original is None or getattr(original, "_secantus_wrapped", False):
+            continue
+
+        def _make(inner: Any) -> Any:
+            def _builder(args: Any, *rest: Any, **kwargs: Any) -> Any:
+                node = inner(args, *rest, **kwargs)
+                raw = args[1] if isinstance(args, (list, tuple)) and len(args) > 1 else None
+                if isinstance(raw, exp.Literal) and raw.is_string:
+                    node._secantus_raw_format = raw.this  # noqa: SLF001
+                return node
+
+            _builder._secantus_wrapped = True  # type: ignore[attr-defined]
+            return _builder
+
+        _PG.Parser.FUNCTIONS[name] = _make(original)
+
+
+_install_to_char_raw_format()
+
+
 def _recover_pg_format(fmt: str) -> str:
     """The ORIGINAL Postgres template behind sqlglot's partial strftime
     conversion — the same inverse mapping `_repair_time_format` uses."""
@@ -2222,45 +2276,21 @@ def _eval_to_char(node: exp.TimeToStr, scope: Scope, ctx: ScalarContext) -> Any:
     ts = _as_datetime(src)
     if not isinstance(ts, _dt.datetime):
         ts = _dt.datetime(ts.year, ts.month, ts.day)
-    # Render the word tokens to LITERAL text first, while the token's own
-    # spelling (which carries the case and padding rules) is still visible.
-    literals: list[str] = []
-    recovered = _recover_pg_format(fmt)
-    if _WORD_TIME_TOKEN_RE.search(recovered):
+    # A naive timestamp renders its timezone tokens against the SESSION zone,
+    # the way Postgres does — `to_char(timestamp '…', 'OF')` under a UTC session
+    # is '+00', not empty.
+    from secantus.sql import datetimeformat as _dtformat
+    from secantus.sql.datetimes import session_tzinfo
 
-        def _stash_word(m: re.Match) -> str:
-            literals.append(_render_word_token(m, ts))
-            return f"\x01{len(literals) - 1}\x01"
-
-        # Forward-map the REST explicitly: `_repair_time_format` only converts
-        # when it finds word tokens itself, and they are gone by now — without
-        # this, `YYYY-MM-DD Day` kept a literal `YYYY-MM-DD`.
-        from sqlglot.dialects.postgres import Postgres as _PGD
-        from sqlglot.time import format_time as _fmt_time
-
-        masked = _WORD_TIME_TOKEN_RE.sub(_stash_word, recovered)
-        fmt = _fmt_time(masked, _PGD.TIME_MAPPING) or masked
-    else:
-        fmt = _repair_time_format(fmt)
-    out, i = [], 0
-    up = fmt.upper()
-    while i < len(fmt):
-        if fmt[i] == "%" and i + 1 < len(fmt):
-            out.append(fmt[i : i + 2])  # already a strftime directive
-            i += 2
-            continue
-        for pat, directive in _PG_WORD_TOKENS:
-            if up.startswith(pat, i):
-                out.append(directive)
-                i += len(pat)
-                break
-        else:
-            out.append(fmt[i])
-            i += 1
-    rendered = ts.strftime("".join(out))
-    for idx, lit in enumerate(literals):
-        rendered = rendered.replace(f"\x01{idx}\x01", lit)
-    return rendered
+    zone = session_tzinfo(getattr(ctx, "session", None))
+    zone_known = ts.tzinfo is not None
+    ts = ts.replace(tzinfo=zone) if ts.tzinfo is None else ts.astimezone(zone)
+    # Prefer the raw template captured at parse time; fall back to the inverse
+    # mapping for a node rebuilt from already-converted SQL (which still holds
+    # strftime directives, so a `%` is the tell).
+    raw = getattr(node, "_secantus_raw_format", None)
+    template = raw if isinstance(raw, str) and "%" not in raw else _recover_pg_format(fmt)
+    return _dtformat.to_char_datetime(ts, template, zone_known=zone_known)
 
 
 def _utcnow(ctx: ScalarContext | None) -> _dt.datetime:
@@ -2393,8 +2423,8 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
     exp.StrToDate: lambda n, s, c: _to_date_from_format(
         evaluate(n.this, s, c), _fmt_arg(n, s, c), date_only=True
     ),
-    exp.StrToTime: lambda n, s, c: _to_date_from_format(
-        evaluate(n.this, s, c), _fmt_arg(n, s, c), date_only=False
+    exp.StrToTime: lambda n, s, c: _to_timestamp_tz(
+        _to_date_from_format(evaluate(n.this, s, c), _fmt_arg(n, s, c), date_only=False), c
     ),
     exp.UnixToTime: lambda n, s, c: _unix_to_timestamp(evaluate(n.this, s, c)),
     exp.StringToArray: lambda n, s, c: _plain_scalar(
