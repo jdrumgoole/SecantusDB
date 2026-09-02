@@ -113,7 +113,12 @@ def test_join_group_by_avg_min_max(storage, session):
         "SELECT c.region, AVG(o.total) AS a, MIN(o.total) AS mn, MAX(o.total) AS mx "
         "FROM orders o JOIN customers c ON o.cust = c._id GROUP BY c.region ORDER BY c.region",
     )
-    assert rows == [("east", pytest.approx(116.6666667), 50, 200), ("west", 30.0, 30, 30)]
+    # These come back as `numeric` now, which is what Postgres answers for an
+    # exact-typed input — `pytest.approx` cannot subtract a Decimal from a float.
+    assert [(r[0], float(r[1]), r[2], r[3]) for r in rows] == [
+        ("east", pytest.approx(116.6666667), 50, 200),
+        ("west", 30.0, 30, 30),
+    ]
 
 
 def test_join_group_array_agg(storage, session):

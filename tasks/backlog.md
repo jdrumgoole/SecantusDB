@@ -7550,6 +7550,48 @@ shared storage engine or building large new protocol subsystems:
       further down could run. The default now infers from the values; the two
       shapes carrying real element identity still win.
 
+- [x] **RESOLVED (2026-09-02) — `avg` / `stddev` / `variance` over exact types
+      answered the wrong TYPE and the wrong digits.** Filed as an "avg /
+      stddev / variance numeric scale" nit; it was a wire-type bug. PG
+      accumulates N, sum(X), sum(X**2) as numerics and finishes in numeric
+      arithmetic, so an exact input gets `numeric`; this engine used Mongo's
+      float `$avg` / `$stdDevSamp` and SQUARED the stddev for the variances, so
+      every one reported `float8` with the last digits wrong.
+
+      The scale rule was already ported — `typemap.numeric_div` implements
+      `select_div_scale` and was probed against 14.13. The missing piece was
+      only ever the exact ACCUMULATION. `typemap.numeric_stat` is the new fold.
+
+      Three things worth keeping:
+      - **PG short-circuits a non-positive numerator to `const_zero`** — a
+        plain `0`, scale 0. Dividing instead answers `0.00000000000000000000`
+        for a constant column, which is what the first version did.
+      - **A post-aggregate's accumulator fields must be named in
+        `agg_field_names`** on the computed-projection path, or the `$project`
+        drops them and the post-aggregate reads three missing values and
+        answers NULL. That turned a working fix into NULL for every stat.
+      - **An existing test asserted `variance(float8)` is `numeric`** and had
+        enshrined the bug. PG says `double precision`. Re-probed and corrected.
+
+      Pinned by `tests/test_sql_numeric_aggregates.py` (66 cases vs PG 14.13).
+
+- [ ] **OPEN — `stddev` / `variance` over a FLOAT input differ in the last bit
+      (2026-09-02).** `stddev(f)` gives 1.5275252316519465 where PG gives
+      1.5275252316519468. PG uses the **Youngs-Cramer** update for float8
+      (`float8_accum`), which is a different rounding path from summing the
+      squares. Matching it needs the values in order, so a `$push` rather than
+      an accumulator — memory-heavy for a last-bit difference. The exact
+      (numeric) path is unaffected and now matches digit for digit.
+
+- [ ] **OPEN — `avg(DISTINCT x)` and an aggregate with FILTER keep the float
+      path (2026-09-02).** `avg(DISTINCT i)::text` gives
+      `2.3333333333333335` for PG's `2.3333333333333333`, and
+      `avg(i) FILTER (WHERE i > 1)::text` is `0A000 unsupported scalar
+      expression`. Both were excluded from the exact-numeric path
+      deliberately: DISTINCT reduces a `$addToSet` and FILTER folds a
+      condition into the accumulator, so neither reaches
+      `_register_numeric_avg` as written.
+
 - [ ] **OPEN — arithmetic in a WHERE clause is still unchecked (2026-09-02).**
       `SELECT * FROM t WHERE i + 1 > 0` returns rows where PG raises `22003`.
       The predicate lowers to a Mongo `$expr` (`planner._to_agg_expr` /

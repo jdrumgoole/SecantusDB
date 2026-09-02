@@ -709,6 +709,46 @@ def numeric_div(left: Decimal, right: Decimal) -> Decimal:
         return q.quantize(Decimal(1).scaleb(-rscale), rounding=_decimal.ROUND_HALF_UP)
 
 
+#: The statistical aggregates that use a SAMPLE denominator (N-1) and answer
+#: NULL for a single row; the rest are population forms with denominator N.
+_SAMPLE_STATS = frozenset({"stddev", "stddev_samp", "variance", "var_samp"})
+
+
+def numeric_stat(kind: str, count: int, sum_x: Decimal, sum_x2: Decimal) -> Decimal | None:
+    """`stddev` / `variance` and their `_samp` / `_pop` forms, computed EXACTLY.
+
+    Postgres accumulates N, sum(X) and sum(X**2) as numerics and finishes in
+    numeric arithmetic, so an integer or numeric input gets an exact numeric
+    answer at `select_div_scale`'s scale. Going through a float — which is what
+    Mongo's `$stdDevSamp` gives, and what squaring its result gave for the
+    variances — lost the last digits AND reported the wrong type: PG answers
+    `numeric` here, not `float8`.
+
+    `numeric_stddev_internal` clamps a negative numerator to zero (roundoff on
+    a constant column) and takes the square root at the division's own scale."""
+    if count == 0:
+        return None
+    sample = kind in _SAMPLE_STATS
+    if sample and count == 1:
+        return None
+    n = Decimal(count)
+    numerator = n * sum_x2 - sum_x * sum_x
+    if numerator <= 0:
+        # PG returns `const_zero` outright rather than dividing — a plain `0`,
+        # scale 0. It matters: over a constant column the division's scale rule
+        # would have answered `0.00000000000000000000`. The clamp also covers a
+        # numerator driven negative by roundoff.
+        return Decimal(0)
+    variance = numeric_div(numerator, n * (n - 1) if sample else n * n)
+    if kind.startswith("var"):
+        return variance
+    rscale = max(0, -variance.as_tuple().exponent)
+    with _decimal.localcontext() as ctx:
+        ctx.prec = rscale + 30
+        root = variance.sqrt()
+    return root.quantize(Decimal(1).scaleb(-rscale), rounding=_decimal.ROUND_HALF_UP)
+
+
 def unwrap_numeric(value: Any) -> Any:
     """A ``Decimal128`` as a plain ``Decimal``; anything else unchanged.
 

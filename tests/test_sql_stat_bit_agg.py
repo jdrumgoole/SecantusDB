@@ -100,8 +100,12 @@ def test_variance_is_sample(t, session):
     )
 
 
-def test_variance_type_numeric(t, session):
-    assert col(t, session, "SELECT variance(x) FROM t").type_tag == "numeric"
+def test_variance_type_follows_the_input(t, session):
+    """`x` is float8, and PG answers `double precision` for a float input — it
+    is only an EXACT input that gets `numeric`. This asserted `numeric` for a
+    value that had been a float all along (re-probed against PG 14.13)."""
+    assert col(t, session, "SELECT variance(x) FROM t").type_tag == "float8"
+    assert col(t, session, "SELECT variance(n) FROM t").type_tag == "numeric"
 
 
 # -- bitwise ------------------------------------------------------------------ #

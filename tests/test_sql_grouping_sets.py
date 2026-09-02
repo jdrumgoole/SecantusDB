@@ -426,9 +426,11 @@ def test_variance_under_rollup(storage, session):
         rows(storage, session, "SELECT region, variance(amt) AS v FROM t GROUP BY ROLLUP(region)")
     )
     assert [r[0] for r in got] == ["e", "w", None]
-    assert got[0][1] == pytest.approx(58.33333333, rel=1e-6)  # var([10,20,5])
-    assert got[1][1] == pytest.approx(112.5)  # var([30,15])
-    assert got[2][1] == pytest.approx(92.5)  # var([10,20,5,30,15])
+    # These come back as `numeric` now, which is what Postgres answers for an
+    # exact-typed input — `pytest.approx` cannot subtract a Decimal from a float.
+    assert float(got[0][1]) == pytest.approx(58.33333333, rel=1e-6)  # var([10,20,5])
+    assert float(got[1][1]) == pytest.approx(112.5)  # var([30,15])
+    assert float(got[2][1]) == pytest.approx(92.5)  # var([10,20,5,30,15])
 
 
 def test_var_pop_and_stddev_under_cube(storage, session):
@@ -439,9 +441,11 @@ def test_var_pop_and_stddev_under_cube(storage, session):
             "SELECT region, var_pop(amt) AS v, stddev(amt) AS s FROM t GROUP BY CUBE(region)",
         )
     )
-    assert got[0][1] == pytest.approx(38.88888889, rel=1e-6)  # pvar([10,20,5])
-    assert got[2][1] == pytest.approx(74.0)  # pvar of all five
-    assert got[0][2] == pytest.approx(7.63762616, rel=1e-6)  # stddev([10,20,5])
+    # These come back as `numeric` now, which is what Postgres answers for an
+    # exact-typed input — `pytest.approx` cannot subtract a Decimal from a float.
+    assert float(got[0][1]) == pytest.approx(38.88888889, rel=1e-6)  # pvar([10,20,5])
+    assert float(got[2][1]) == pytest.approx(74.0)  # pvar of all five
+    assert float(got[0][2]) == pytest.approx(7.63762616, rel=1e-6)  # stddev([10,20,5])
 
 
 def test_bit_aggregates_under_rollup(storage, session):
@@ -468,11 +472,12 @@ def test_variance_and_plain_agg_together_under_rollup(storage, session):
         )
     )
     # _order sorts region ascending, NULL last: e, w, grand total.
-    assert (
-        got[0][0] == "e" and got[0][1] == 35 and got[0][2] == pytest.approx(58.33333333, rel=1e-6)
-    )
-    assert got[1][0] == "w" and got[1][1] == 45 and got[1][2] == pytest.approx(112.5)
-    assert got[2][0] is None and got[2][1] == 80 and got[2][2] == pytest.approx(92.5)
+    # `numeric` now, as PG answers for an exact-typed input — `pytest.approx`
+    # cannot subtract a Decimal from a float.
+    assert got[0][0] == "e" and got[0][1] == 35
+    assert float(got[0][2]) == pytest.approx(58.33333333, rel=1e-6)
+    assert got[1][0] == "w" and got[1][1] == 45 and float(got[1][2]) == pytest.approx(112.5)
+    assert got[2][0] is None and got[2][1] == 80 and float(got[2][2]) == pytest.approx(92.5)
 
 
 def test_variance_over_grouping_sets_join(dim, session):
@@ -482,9 +487,11 @@ def test_variance_over_grouping_sets_join(dim, session):
         "SELECT u.label, variance(t.amt) AS v FROM t JOIN u ON t.region = u.region "
         "GROUP BY ROLLUP(u.label) ORDER BY u.label NULLS LAST",
     )
-    assert got[0][0] == "East" and got[0][1] == pytest.approx(58.33333333, rel=1e-6)
-    assert got[1][0] == "West" and got[1][1] == pytest.approx(112.5)
-    assert got[2][0] is None and got[2][1] == pytest.approx(92.5)
+    # `numeric` now, as PG answers for an exact-typed input — `pytest.approx`
+    # cannot subtract a Decimal from a float.
+    assert got[0][0] == "East" and float(got[0][1]) == pytest.approx(58.33333333, rel=1e-6)
+    assert got[1][0] == "West" and float(got[1][1]) == pytest.approx(112.5)
+    assert got[2][0] is None and float(got[2][1]) == pytest.approx(92.5)
 
 
 def test_bit_xor_over_grouping_sets_join(storage, session):
