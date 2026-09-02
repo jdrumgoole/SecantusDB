@@ -127,7 +127,15 @@ def _evaluate_named(name: str, args: list[Any], session: Session) -> tuple[str, 
     if name == "current_setting":
         if not args:
             raise errors.syntax_error("current_setting() requires a setting name")
-        return ("current_setting", session.get_setting(str(args[0])), "text")
+        # An unknown setting is `42704`, or NULL when `missing_ok` is passed —
+        # both spellings answered the empty string, which reads as a setting
+        # that exists and is blank.
+        setting = str(args[0])
+        if not session.has_setting(setting):
+            if len(args) > 1 and args[1]:
+                return ("current_setting", None, "text")
+            raise errors.SQLError("42704", f'unrecognized configuration parameter "{setting}"')
+        return ("current_setting", session.get_setting(setting), "text")
     if name == "set_config":
         if len(args) < 2:
             raise errors.syntax_error("set_config() requires (name, value, is_local)")

@@ -7986,6 +7986,43 @@ shared storage engine or building large new protocol subsystems:
       evaluator; the argument is a `NULL::<enum>` cast, so the type name is on
       the node.
 
+- [x] **RESOLVED (2026-09-02) — a SIXTH sweep (constraints, identity, time
+      zones, GUCs, string functions): 20 of 33, now 26.**
+
+      **`age()` borrowed from the wrong month.** `age('2021-03-15',
+      '2020-01-20')` answered `1 year 1 mon 23 days`; PG answers 26. When the
+      day difference goes negative the borrow takes the length of the START
+      date's month — not the month before `end`, and not a flat 31. Three
+      readings all fit the first probe, so it took eight cases to
+      discriminate: `age('2020-04-01','2020-01-15')` is 17 days (January's 31,
+      not April's 30) and `age('2020-03-01','2020-02-28')` is 2 (February's 29,
+      not 31). **A single probe would have picked the wrong rule.**
+
+      Two existing tests had recorded the old answer and are corrected.
+
+      Also: `format('%1$s')` positional specifiers (unrecognised, the whole
+      directive was copied through as literal text, so the format string came
+      back unformatted); `current_setting('nope', true)` → NULL and
+      `current_setting('nope')` → 42704, both of which answered the empty
+      string; `parse_ident` / `unistr` / `normalize`; and `localtimestamp`
+      nested in an expression AND in the SESSION's zone rather than the
+      machine's wall clock — a different instant whenever the two differ.
+
+      Pinned by `tests/test_sql_sweep_six.py` (32 cases vs PG 14.13).
+
+- [ ] **OPEN — `AT TIME ZONE` (2026-09-02).** `'2020-06-15 12:00:00'::timestamp
+      AT TIME ZONE 'UTC'` is `0A000 unsupported scalar expression`. A real SQL
+      feature, not a function; sqlglot gives it its own node.
+
+- [ ] **OPEN — `extract(timezone_hour|timezone_minute|timezone …)`
+      (2026-09-02).** `0A000 unsupported extract field`. Reports the SESSION's
+      UTC offset, not the literal's — PG normalises the value to the session
+      zone first.
+
+- [ ] **OPEN — `LIKE ALL(array)` / `LIKE ANY(array)` (2026-09-02).**
+      `0A000 unsupported scalar expression`. The scalar `LIKE` works; the
+      quantified form over an array does not.
+
 - [ ] **OPEN — arithmetic in a WHERE clause is still unchecked (2026-09-02).**
       `SELECT * FROM t WHERE i + 1 > 0` returns rows where PG raises `22003`.
       The predicate lowers to a Mongo `$expr` (`planner._to_agg_expr` /

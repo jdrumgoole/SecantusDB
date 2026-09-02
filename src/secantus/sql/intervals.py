@@ -367,10 +367,13 @@ def age(end: Any, start: Any) -> dict:
         micros += MICROS_PER_DAY
         days -= 1
     if days < 0:
-        # Borrow the length of the month preceding `end`.
-        prev_month = e.month - 1 or 12
-        prev_year = e.year if e.month > 1 else e.year - 1
-        days += calendar.monthrange(prev_year, prev_month)[1]
+        # Borrow the length of the START date's month, which is what Postgres
+        # does — measured across eight cases on 14.13, including the ones that
+        # discriminate it: `age('2020-04-01','2020-01-15')` is `2 mons 17 days`
+        # (January's 31, not April's 30) while `age('2020-03-01','2020-02-28')`
+        # is `2 days` (February's 29, not a flat 31). Borrowing the month
+        # BEFORE `end` gave 15 where PG gives 17.
+        days += calendar.monthrange(s.year, s.month)[1]
         months -= 1
     if months < 0:
         months += 12
