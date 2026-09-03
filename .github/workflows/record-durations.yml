@@ -110,8 +110,8 @@ jobs:
         run: |
           curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
             https://www.mongodb.org/static/pgp/server-8.0.asc \
-            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
-          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
+            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.2 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.2.list
 
       - name: Install toolchain and MongoDB CLI tools (Linux)
         # MUST match the ``test`` job's toolchain exactly. The whole point of a
@@ -122,7 +122,7 @@ jobs:
         if: runner.os == 'Linux'
         uses: ./.github/actions/apt-install
         with:
-          packages: swig liblz4-dev mongodb-mongosh mongodb-database-tools
+          packages: swig liblz4-dev mongodb-mongosh mongodb-database-tools mongodb-org-server
 
       - name: Install swig (Windows)
         if: runner.os == 'Windows'

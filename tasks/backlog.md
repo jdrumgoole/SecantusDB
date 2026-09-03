@@ -4424,7 +4424,7 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   also what makes the slice safe — but the shape is worth grepping for: an
   `Option`-safe accessor followed by a raw slice of the same collection.
 
-### 7.0a Run the differential gate in CI — AGREED, not yet done (2026-09-03)
+### 7.0a Run the differential gate in CI — DONE (2026-09-03)
 
 `tests/test_mongod_differential.py` skips wherever `mongod` is absent, and the
 PR lane (`ubuntu-latest`) installs `mongosh` + database-tools but no server. So
@@ -4447,14 +4447,28 @@ locally. Whether that image still ships one has NOT been re-checked.
 and installs two packages from it; `mongodb-org-server` is close to one line,
 and `PROBED_MONGOD_MAJOR = 8` means an 8.x server runs rather than skips.
 
-**The hazard, and why this is its own PR.** The apt repo is pinned to **8.0**
-while every expectation here was probed on **8.2.1 / 8.2.11**. The gate compares
-only the MAJOR, so 8.0 would run -- and this file has already been bitten by a
-PATCH-level difference (the expected-type list ordering that needed
-`_sort_type_lists`). Turning the gate on against 8.0 risks manufacturing exactly
-the false failures the file's design was built to avoid. **Pin the repo to 8.2**
-so CI measures what the expectations were taken from. Land it alone, so any
-failure it surfaces is unambiguously drift rather than an unrelated change.
+**What shipped.** The three Linux lanes (`test`, `test-durable`,
+`record-durations`) install `mongodb-org-server` and their apt repo moved from
+**8.0 to 8.2**, so CI measures the series the expectations were taken from
+(8.2.11 and 8.2.12 are both in it). No separate step was needed: the suite's
+`addopts` excludes `perf` / `online` / `slow` but not `differential`, and the
+file's mongod fixture is module-scoped.
+
+Two things worth keeping, both found by checking rather than assuming:
+
+- **There is no `server-8.2.asc` key** -- 404 at both `mongodb.org` and
+  `pgp.mongodb.com`. MongoDB signs both series with ONE packaging key, verified
+  by fingerprint: 8.2's `InRelease` is signed by
+  `4B0752C1BCA238C0B4EE14DC41DE058A4E7DCA05`, which is exactly what
+  `server-8.0.asc` serves. A "fix" to a versioned 8.2 URL will 404 the job.
+- The apt repo tracks the latest patch (8.2.12 today) while expectations were
+  probed on 8.2.1 / 8.2.11. That is deliberate -- the file's own comment says a
+  new patch failing means "re-probe the case rather than widening the skip", and
+  the gate is what tells you. **Both were run before landing this**: all 614
+  cases pass against 8.2.11 AND against a fetched 8.2.12, so the patch CI
+  installs today is known-clean rather than assumed. If patch churn ever becomes
+  noise rather than signal, pin `mongodb-org-server=8.2.11` instead of loosening
+  the gate.
 
 ### 7.0 Cache-pressure rollback — CI exercises it now
 

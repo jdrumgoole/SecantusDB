@@ -92,9 +92,13 @@ one site is how it stays fixed.
 
 ## mongod versions differ, and only CI shows it
 
-The gate runs against whatever `mongod` is on `PATH`. **The dev box and the CI
-Windows runner do not agree**, and two cases were caught this way — neither
-reproducible locally, neither a flake:
+The gate runs against whatever `mongod` is on `PATH`. **The dev box and CI do
+not agree**, and two cases were caught that way — neither reproducible locally,
+neither a flake. (Both were found when the `windows-latest` image happened to
+ship its own server. The Linux lanes now install `mongodb-org-server` from the
+8.2 apt repo deliberately, pinned to 8.2 because that is the series every
+expectation was measured against; before that the gate skipped in CI and lived
+only on whichever dev box ran it.)
 
 - **`codeName` for high numeric codes is not stable.** 40415 is
   `Location40415` on 6.0.16 (mongod's fallback for a code with no symbolic

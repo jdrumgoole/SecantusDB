@@ -71,16 +71,23 @@ requires_mongod = pytest.mark.skipif(MONGOD is None, reason="no mongod on PATH")
 #                              IDLUnknownField
 #
 # WHY THE WHOLE FILE, NOT A LIST OF KNOWN-VARIANT CASES. That was tried first.
-# It needs updating by whoever adds a case, and they cannot see the problem: CI
-# installs mongosh and database-tools but NOT mongod, so @requires_mongod skips
-# this file there entirely, and a dev box on another series sees only false
-# failures. In one afternoon three PRs added cases that failed on the wrong
-# series. Gating the file is self-maintaining: a new case needs no thought, and
-# the gate can never claim a divergence it cannot actually judge.
+# It needs updating by whoever adds a case, and they cannot see the problem: a
+# dev box on another series sees only false failures. In one afternoon three
+# PRs added cases that failed on the wrong series. Gating the file is
+# self-maintaining: a new case needs no thought, and the gate can never claim a
+# divergence it cannot actually judge.
 #
 # The cost is real: on another series this file provides no coverage. That is
 # the honest answer -- across majors an exact-match gate has no expectation to
 # assert. Within the major it runs, so drift shows up as a failure.
+#
+# THIS FILE NOW RUNS IN CI. The Linux lanes install `mongodb-org-server` from
+# the 8.2 apt repo, so `@requires_mongod` no longer skips there. Until then the
+# reasoning above ended "CI installs mongosh and database-tools but NOT mongod,
+# so this file skips there entirely" -- which was true, and meant the one gate
+# that compares this project against the real server lived only on whichever
+# dev box happened to run it. The suite's `addopts` excludes `perf` / `online`
+# / `slow` but not `differential`, so it needs no separate step.
 # Gate on the MAJOR only. mongod's error surface is stable within a major, so a
 # mismatch on 8.0 or 8.4 is far more likely to be a real SecantusDB divergence
 # than version drift -- and a loud failure is more useful there than a silent
