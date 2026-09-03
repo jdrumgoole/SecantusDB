@@ -1566,7 +1566,17 @@ def test_randomised_fuzz_parity():
     for _ in range(8000):
         doc = bson.decode(bson.encode(_rand_doc(rng)))
         expr = bson.decode(bson.encode({"e": _rand_expr(rng, 3)}))["e"]
-        rust = _rust_eval(expr, doc)
+        try:
+            rust = _rust_eval(expr, doc)
+        except RustMongoError as exc:
+            # The engine NAMED mongod's error rather than deferring. That is a
+            # third outcome this loop did not have when it was written -- it
+            # only knew "a value" and "deferred" -- and an escaping exception
+            # failed the run rather than comparing anything. The pure engine
+            # must raise exactly the same error.
+            assert_named_error_matches_pure(exc, expr, doc)
+            handled += 1
+            continue
         if rust is None:
             continue
         try:

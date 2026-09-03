@@ -603,7 +603,12 @@ _EXPRESSION_ARITY: dict[str, tuple[int, int]] = {
     "$indexOfBytes": (2, 4),
     "$indexOfCP": (2, 4),
     "$range": (2, 3),
+    # `[value]` or `[value, place]`. An empty or 3-element list is 28667 at
+    # PARSE time, which used to reach the evaluator instead: `{$round: [3,1,2]}`
+    # answered 3 (probed 8.2.11, 2026-09-03).
+    "$round": (1, 2),
     "$slice": (2, 3),
+    "$trunc": (1, 2),
 }
 
 # The date extractors, which accept a bare expression OR a one-element array.
@@ -703,6 +708,39 @@ _DATE_SPEC_ARGUMENTS: dict[str, tuple[frozenset[str], int, str]] = {
 }
 
 
+#: ``op -> (code, uses_parameter_wording, accepted argument names)``.
+#: See the call site for how this was measured.
+_UNKNOWN_ARGUMENT: dict[str, tuple[int, bool, tuple[str, ...]]] = {
+    "$cond": (17083, True, ("if", "then", "else")),
+    "$filter": (28647, True, ("input", "as", "cond", "limit")),
+    "$let": (16875, True, ("vars", "in")),
+    "$map": (16879, True, ("input", "as", "in")),
+    "$convert": (9, False, ("input", "to", "onError", "onNull", "format", "byteOrder")),
+    "$ltrim": (50694, False, ("input", "chars")),
+    "$rtrim": (50694, False, ("input", "chars")),
+    "$trim": (50694, False, ("input", "chars")),
+    "$reduce": (40076, False, ("input", "initialValue", "in")),
+    "$regexFind": (31024, False, ("input", "regex", "options")),
+    "$regexFindAll": (31024, False, ("input", "regex", "options")),
+    "$regexMatch": (31024, False, ("input", "regex", "options")),
+    "$replaceAll": (51750, False, ("input", "find", "replacement")),
+    "$replaceOne": (51750, False, ("input", "find", "replacement")),
+    "$setField": (4161101, False, ("field", "input", "value")),
+    "$sortArray": (2942501, False, ("input", "sortBy")),
+    "$switch": (40067, False, ("branches", "default")),
+    "$zip": (34464, False, ("inputs", "useLongestLength", "defaults")),
+}
+
+#: The `n`-operator family, which shares one code and one sentence.
+_N_OPERATOR_ARGUMENTS = frozenset({"$firstN", "$lastN", "$minN", "$maxN"})
+
+#: ``$median`` / ``$percentile``, which report the IDL's unknown-field wording.
+_IDL_UNKNOWN_FIELD: dict[str, tuple[str, ...]] = {
+    "$median": ("input", "method"),
+    "$percentile": ("input", "p", "method"),
+}
+
+
 def _expression_shape_problem(spec: Any) -> tuple[int, str] | None:
     """The first arity / spec-shape error in `spec`, as mongod parses it.
 
@@ -750,6 +788,33 @@ def _expression_shape_problem(spec: Any) -> tuple[int, str] | None:
                         40539,
                         f"missing 'date' argument to {key}, provided: {key}: {rendered}",
                     )
+            # An unrecognised key in an operator's spec document. TWO sentences
+            # and eighteen codes -- they share nothing, not even within a
+            # wording -- so this is a table, probed one operator at a time
+            # against 8.2.11 (2026-09-03) by feeding each candidate key in turn
+            # and keeping the ones it did not reject.
+            if (known := _UNKNOWN_ARGUMENT.get(key)) is not None and isinstance(value, Mapping):
+                code, parameter_form, names = known
+                for opt in value:
+                    if opt not in names:
+                        return (
+                            code,
+                            f"Unrecognized parameter to {key}: {opt}"
+                            if parameter_form
+                            else f"{key} found an unknown argument: {opt}",
+                        )
+            # The `n`-operator family checks the UNKNOWN key before it checks
+            # for a missing `n`, so `{$firstN: {k: 1}}` is "Unknown argument"
+            # rather than "Missing value for 'n'".
+            if key in _N_OPERATOR_ARGUMENTS and isinstance(value, Mapping):
+                for opt in value:
+                    if opt not in ("input", "n"):
+                        return (5787901, f"Unknown argument for 'n' operator: {opt}")
+            # `$median` / `$percentile` report the IDL's own generic complaint.
+            if (names := _IDL_UNKNOWN_FIELD.get(key)) is not None and isinstance(value, Mapping):
+                for opt in value:
+                    if opt not in names:
+                        return (40415, f"BSON field '{key}.{opt}' is an unknown field.")
             # `$getField`'s two OBJECT-form complaints are parse errors: both
             # fire on an EMPTY collection (probed 8.2.11, 2026-09-02). The bare
             # form's "must evaluate to type String" is not -- that one runs per

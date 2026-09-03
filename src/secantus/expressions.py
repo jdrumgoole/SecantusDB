@@ -602,6 +602,39 @@ class _FractionalIndex(Exception):
     """Signal: a double index arg has a fractional part (mongod rejects it)."""
 
 
+def _range_repr(v: Any) -> str:
+    """How mongod renders the operand in `$range`'s "32-bit integer" complaint.
+
+    NOT the trig rule: `$range` keeps an integer's digits (`1099511627776`)
+    where `$acos` converts to double first and prints `1.09951e+12`. A decimal
+    keeps its own representation in both. Probed 8.2.11 (2026-09-03).
+    """
+    if isinstance(v, bool):
+        return _bson_type_name(v)
+    if isinstance(v, (int, Decimal128)):
+        return str(v)
+    return _fmt_double(v)
+
+
+def _range_int32(v: Any) -> Any:
+    """`_int_index`, but bounded to 32 bits as `$range` requires.
+
+    A long that fits in 64 bits still fails here: `{$range: [2**40, 1]}` is
+    mongod's 34444, where accepting it built a range of a trillion elements.
+    A Decimal128 never represents as a 32-bit int for this purpose.
+    """
+    if isinstance(v, Decimal128):
+        raise _FractionalIndex
+    coerced = _int_index(v)
+    if (
+        isinstance(coerced, int)
+        and not isinstance(coerced, bool)
+        and not (-(2**31) <= coerced <= 2**31 - 1)
+    ):
+        raise _FractionalIndex
+    return coerced
+
+
 def _int_index(v: Any) -> Any:
     """Coerce a numeric aggregation index arg to `int`, mongod-style: an `int`
     passes through, a whole-number `float` becomes `int`, a fractional `float`
@@ -699,7 +732,14 @@ def _op_subtract(arg: Any, ctx: _Ctx) -> Any:
             db = b.to_decimal() if isinstance(b, Decimal128) else Decimal(b)
             return Decimal128(da - db)
         return _int_result(a - b, a, b)
-    raise ExpressionError(f"can't $subtract {_bson_type_name(b)} from {_bson_type_name(a)}")
+
+    # A date is capitalised on the LEFT of "from" and not on the right:
+    # `can't $subtract string from Date` but `can't $subtract date from int`.
+    # Positional, not per-type (probed 8.2.11, 2026-09-03).
+    def _lhs_name(v: Any) -> str:
+        return "Date" if isinstance(v, _dt.datetime) else _bson_type_name(v)
+
+    raise ExpressionError(f"can't $subtract {_bson_type_name(b)} from {_lhs_name(a)}")
 
 
 def _op_multiply(arg: Any, ctx: _Ctx) -> Any:
@@ -1611,18 +1651,25 @@ def _make_trig(name: str, fn: Any, domain: str) -> Any:
         if v is None:
             return None
         x = _trig_coerce(name, v)
-        if domain == "finite" and not math.isfinite(x):
+        # A Decimal128 keeps its OWN representation in the message -- `2.50`
+        # does not become `2.5` -- while everything else goes through `%g`
+        # (probed 8.2.11, 2026-09-03).
+        shown = str(v) if isinstance(v, Decimal128) else _fmt_double(x)
+        # NaN is NOT a domain error: `{$tan: NaN}` answers NaN on mongod, for
+        # all three of sin / cos / tan. Only the infinities are refused, which
+        # is why this cannot be `not math.isfinite(x)`.
+        if domain == "finite" and math.isinf(x):
             raise ExpressionError(
-                f"cannot apply {name} to {_fmt_double(x)}, value must be in (-inf,inf)",
+                f"cannot apply {name} to {shown}, value must be in (-inf,inf)",
                 code=50989,
             )
         if domain in ("unit", "atanh") and not (-1.0 <= x <= 1.0):
             raise ExpressionError(
-                f"cannot apply {name} to {_fmt_double(x)}, value must be in [-1,1]", code=50989
+                f"cannot apply {name} to {shown}, value must be in [-1,1]", code=50989
             )
         if domain == "geq1" and not x >= 1.0:
             raise ExpressionError(
-                f"cannot apply {name} to {_fmt_double(x)}, value must be in [1,inf]", code=50989
+                f"cannot apply {name} to {shown}, value must be in [1,inf]", code=50989
             )
         if domain == "atanh" and abs(x) == 1.0:
             return math.inf if x > 0 else -math.inf
@@ -1654,8 +1701,10 @@ def _op_atan2(arg: Any, ctx: _Ctx) -> Any:
     x = _eval(arg[1], ctx)
     if y is None or x is None:
         return None
+    # A different CODE per position -- 51044 for the first operand, 51045 for
+    # the second (probed 8.2.11, 2026-09-03; both used 51044 here).
     fy = _trig_coerce("$atan2", y, code=51044)
-    fx = _trig_coerce("$atan2", x, code=51044)
+    fx = _trig_coerce("$atan2", x, code=51045)
     if _has_decimal(y, x):
         # One decimal operand is enough: mongod answers a Decimal128 whichever
         # side it is on. Falling through to `math.atan2` narrowed the answer to
@@ -1719,20 +1768,32 @@ def _op_trunc(arg: Any, ctx: _Ctx) -> Any:
 
 
 def _op_merge_objects(arg: Any, ctx: _Ctx) -> Any:
+    from secantus.bsontypes import bson_value_repr_stage
+
     items = arg if isinstance(arg, list) else [arg]
     result: dict[str, Any] = {}
     for item in items:
-        v = _eval(item, ctx)
-        if v is None:
-            continue
-        if not isinstance(v, Mapping):
-            raise ExpressionError(
-                f"$mergeObjects requires object inputs, but input {v} is of type "
-                f"{_bson_type_name(v)}",
-                code=40400,
-                code_name="Location40400",
-            )
-        result.update(v)
+        evaluated = _eval(item, ctx)
+        # An evaluated value that is itself an ARRAY is the operand list, one
+        # level down: `{$mergeObjects: "$docs"}` over `[{a: 1}, {b: 2}]` merges
+        # both, and over `[3, 1, 2]` reports "input 3" rather than naming the
+        # whole array. Only the literal-array form was being split (probed
+        # 8.2.11, 2026-09-03, across five shapes).
+        operands = evaluated if isinstance(evaluated, list) else [evaluated]
+        for v in operands:
+            if v is None:
+                continue
+            if not isinstance(v, Mapping):
+                raise ExpressionError(
+                    # The COMPACT vocabulary -- a double-quoted string, a bare
+                    # ObjectId hex, an ISO date. `f"{v}"` printed `abc` where
+                    # mongod writes `"abc"`.
+                    f"$mergeObjects requires object inputs, but input "
+                    f"{bson_value_repr_stage(v)} is of type {_bson_type_name(v)}",
+                    code=40400,
+                    code_name="Location40400",
+                )
+            result.update(v)
     return result
 
 
@@ -2579,21 +2640,17 @@ def _op_is_array(arg: Any, ctx: _Ctx) -> bool:
 
 
 def _strcasecmp_coerce(v: Any) -> str:
-    """Coerce a `$strcasecmp` operand to a string the way mongod does: null →
-    the empty string, a string stays, and any other value is `$toString`-coerced
-    (numbers → their string form, dates → their string form). A bool is the one
-    type mongod refuses to coerce → Location16007."""
-    if v is None:
-        return ""
-    if isinstance(v, str):
-        return v
-    if isinstance(v, bool):
-        raise ExpressionError(
-            "$strcasecmp only takes strings and numbers, not bool",
-            code=16007,
-            code_name="Location16007",
-        )
-    return _convert_value(v, "string")
+    """Coerce a `$strcasecmp` operand exactly as `$toLower` does.
+
+    ONE rule, not a per-operator one: `coerce_to_string` is what mongod runs
+    here, so a double, date or Decimal128 all render and everything it rejects
+    is `16007 can't convert from BSON type X to String`. This used
+    `$toString`'s conversion instead, which accepts a different SET of types
+    and worded the bool case as "$strcasecmp only takes strings and numbers"
+    -- neither is what mongod says (probed 8.2.11, 2026-09-03, where
+    `{$strcasecmp: [1.5, 1]}` answers 1 and an object is 16007, not 241).
+    """
+    return coerce_to_string(v)
 
 
 def _op_strcasecmp(arg: Any, ctx: _Ctx) -> int:
@@ -2762,7 +2819,14 @@ def _op_array_to_object(arg: Any, ctx: _Ctx) -> Any:
         elif isinstance(entry, list) and len(entry) == 2:
             out[str(entry[0])] = entry[1]
         else:
-            raise ExpressionError("$arrayToObject entries must be {k, v} docs or [k, v] pairs")
+            # mongod names the element's TYPE under its own 40398; this was a
+            # hand-written sentence under the generic 14 (probed 8.2.11,
+            # 2026-09-03).
+            raise ExpressionError(
+                f"Unrecognised input type format for $arrayToObject: {_bson_type_name(entry)}",
+                code=40398,
+                code_name="Location40398",
+            )
     return out
 
 
@@ -2897,7 +2961,10 @@ def _op_substr_cp(arg: Any, ctx: _Ctx) -> Any:
             f"value: {_fmt_double(length)}",
             code=34453,
         ) from None
-    if not isinstance(s, str) or not isinstance(start, int) or not isinstance(length, int):
+    # The first operand is COERCED, not required to be a string: mongod answers
+    # `{$substrCP: [123, 1, 2]}` with "23" (probed 8.2.11, 2026-09-03).
+    s = coerce_to_string(s)
+    if not isinstance(start, int) or not isinstance(length, int):
         raise ExpressionError("$substrCP requires string + ints")
     # Unlike $substrBytes, mongod rejects a negative start *and* a negative
     # length for $substrCP (distinct codes/messages, verbatim).
@@ -3060,7 +3127,9 @@ def _op_substr_bytes(arg: Any, ctx: _Ctx) -> Any:
         start = int(start)
     if isinstance(length, float) and math.isfinite(length):
         length = int(length)
-    if not isinstance(s, str) or not isinstance(start, int) or not isinstance(length, int):
+    # Coerced, not required to be a string -- same rule as `$substrCP`.
+    s = coerce_to_string(s)
+    if not isinstance(start, int) or not isinstance(length, int):
         raise ExpressionError("$substrBytes requires string + ints")
     encoded = s.encode("utf-8")
     n = len(encoded)
@@ -3150,7 +3219,10 @@ def _op_range(arg: Any, ctx: _Ctx) -> Any:
     step = _eval(arg[2], ctx) if len(arg) == 3 else 1
     # Per-arg bool rejection with mongod's exact codes/messages (the step
     # message's "type:bool" missing space is verbatim from mongod).
-    if isinstance(start, bool) or not isinstance(start, (int, float)):
+    # A Decimal128 IS numeric here -- it fails the 32-bit check below, not this
+    # type check, so `{$range: [Decimal128("2.5"), 1]}` is 34444 and not 34443
+    # (probed 8.2.11, 2026-09-03).
+    if isinstance(start, bool) or not isinstance(start, (int, float, Decimal128)):
         raise ExpressionError(
             "$range requires a numeric starting value, found value of type: "
             f"{_bson_type_name(start)}",
@@ -3169,11 +3241,11 @@ def _op_range(arg: Any, ctx: _Ctx) -> Any:
     # A whole-number double is accepted (coerced to int); a fractional one is
     # rejected with mongod's per-arg "32-bit integer" code.
     try:
-        start = _int_index(start)
+        start = _range_int32(start)
     except _FractionalIndex:
         raise ExpressionError(
             "$range requires a starting value that can be represented as a "
-            f"32-bit integer, found value: {_fmt_double(start)}",
+            f"32-bit integer, found value: {_range_repr(start)}",
             code=34444,
         ) from None
     try:

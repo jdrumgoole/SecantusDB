@@ -1075,11 +1075,21 @@ fn arith_nary(arg: &Bson, ctx: &Ctx, mul: bool) -> R {
     if vals.iter().any(is_null) {
         return Ok(Bson::Null);
     }
-    // BSON arithmetic rejects bool (mongod: "$multiply only supports
-    // numeric types, not bool") — Python raises, so defer instead of
-    // folding bools as 0/1 like as_int_like would.
-    if vals.iter().any(|v| matches!(v, Bson::Boolean(_))) {
-        return Err(Fallback::Defer);
+    // BSON arithmetic rejects bool, and every other non-numeric type. mongod
+    // names the FIRST offender for these two; `$add` additionally accepts a
+    // date. Decimal128 is numeric and passes here -- it defers further down for
+    // its own reason, and reporting a type error for it would be wrong.
+    let op = if mul { "$multiply" } else { "$add" };
+    // `$add` accepts a date among its operands; `$multiply` does not. Same
+    // predicate `arith_type_error` uses, spelled the same way round.
+    let dates_ok = !mul;
+    let allowed = |v: &Bson| is_arith_numeric(v) || (dates_ok && matches!(v, Bson::DateTime(_)));
+    if let Some(bad) = vals.iter().find(|v| !allowed(v)) {
+        // `arith_type_error` takes a pair; a numeric stand-in in the first slot
+        // makes it report `bad` as the offender under the n-ary wording.
+        if let Some(fault) = arith_type_error(op, &Bson::Int32(0), bad) {
+            return Err(fault);
+        }
     }
     if !mul && vals.len() == 1 {
         // Python returns a single NUMERIC value unchanged; any other
@@ -1119,6 +1129,91 @@ fn fold_arith(vals: &[Bson], mul: bool) -> R {
     Err(Fallback::Defer)
 }
 
+/// Whether a value is one of mongod's numeric types for arithmetic.
+///
+/// Decimal128 IS numeric -- mongod computes with it, and this engine defers for
+/// a different reason -- so it must not be reported as a type error. A bool is
+/// NOT numeric here, whatever Rust or Python think.
+fn is_arith_numeric(v: &Bson) -> bool {
+    matches!(
+        v,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+    )
+}
+
+/// mongod's refusal of a wrongly-typed arithmetic operand.
+///
+/// SIX shapes across six operators, none interchangeable -- probed 8.2.11
+/// (2026-09-03). `$add` and `$multiply` name the FIRST offender; `$divide` and
+/// `$mod` name BOTH operand types in order; `$subtract` inverts them into
+/// "can't $subtract X from Y" and capitalises `Date` alone; `$atan2` carries a
+/// different CODE per position. Null is checked by the callers first: a null
+/// operand answers null on all six rather than reaching this.
+fn arith_type_error(op: &str, a: &Bson, b: &Bson) -> Option<Fallback> {
+    let dates_ok = matches!(op, "$add" | "$subtract");
+    let ok = |v: &Bson| is_arith_numeric(v) || (dates_ok && matches!(v, Bson::DateTime(_)));
+    if ok(a) && ok(b) {
+        return None;
+    }
+    let name = crate::query::bson_type_name;
+    // `$subtract` capitalises a date on the LEFT of "from" and not on the
+    // right: `can't $subtract string from Date` but `can't $subtract date from
+    // int`. Positional, not per-type -- capitalising both was caught by
+    // `test_arithmetic_date_semantics`, which had the second-operand case.
+    // Probed 8.2.11 (2026-09-03).
+    let sub_lhs = |v: &Bson| {
+        if matches!(v, Bson::DateTime(_)) {
+            "Date"
+        } else {
+            name(v)
+        }
+    };
+    let first_bad = if ok(a) { b } else { a };
+    Some(match op {
+        "$add" => Fallback::mongo(
+            14,
+            format!(
+                "$add only supports numeric or date types, not {}",
+                name(first_bad)
+            ),
+        ),
+        "$multiply" => Fallback::mongo(
+            14,
+            format!(
+                "$multiply only supports numeric types, not {}",
+                name(first_bad)
+            ),
+        ),
+        "$divide" => Fallback::mongo(
+            14,
+            format!(
+                "$divide only supports numeric types, not {} and {}",
+                name(a),
+                name(b)
+            ),
+        ),
+        "$mod" => Fallback::mongo(
+            16611,
+            format!(
+                "$mod only supports numeric types, not {} and {}",
+                name(a),
+                name(b)
+            ),
+        ),
+        "$subtract" => Fallback::mongo(
+            14,
+            format!("can't $subtract {} from {}", name(b), sub_lhs(a)),
+        ),
+        _ => Fallback::mongo(
+            if ok(a) { 51045 } else { 51044 },
+            format!(
+                "$atan2 only supports numeric types, not {}",
+                name(first_bad)
+            ),
+        ),
+    })
+}
+
 fn op_subtract(arg: &Bson, ctx: &Ctx) -> R {
     let vals = eval_args(arg, ctx)?;
     if vals.len() != 2 {
@@ -1127,9 +1222,8 @@ fn op_subtract(arg: &Bson, ctx: &Ctx) -> R {
     if is_null(&vals[0]) || is_null(&vals[1]) {
         return Ok(Bson::Null);
     }
-    // bool is not BSON-numeric (Python raises) -> defer.
-    if matches!(vals[0], Bson::Boolean(_)) || matches!(vals[1], Bson::Boolean(_)) {
-        return Err(Fallback::Defer);
+    if let Some(fault) = arith_type_error("$subtract", &vals[0], &vals[1]) {
+        return Err(fault);
     }
     if let (Some(a), Some(b)) = (as_int_like(&vals[0]), as_int_like(&vals[1])) {
         return Ok(int_result(
@@ -1151,9 +1245,8 @@ fn op_divide(arg: &Bson, ctx: &Ctx) -> R {
     if is_null(&vals[0]) || is_null(&vals[1]) {
         return Ok(Bson::Null);
     }
-    // bool is not BSON-numeric (Python raises) -> defer.
-    if matches!(vals[0], Bson::Boolean(_)) || matches!(vals[1], Bson::Boolean(_)) {
-        return Err(Fallback::Defer);
+    if let Some(fault) = arith_type_error("$divide", &vals[0], &vals[1]) {
+        return Err(fault);
     }
     // Decimal128 division has type-specific semantics -> defer.
     let (Some(a), Some(b)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) else {
@@ -1173,9 +1266,8 @@ fn op_mod(arg: &Bson, ctx: &Ctx) -> R {
     if is_null(&vals[0]) || is_null(&vals[1]) {
         return Ok(Bson::Null);
     }
-    // bool is not BSON-numeric (Python raises) -> defer.
-    if matches!(vals[0], Bson::Boolean(_)) || matches!(vals[1], Bson::Boolean(_)) {
-        return Err(Fallback::Defer);
+    if let Some(fault) = arith_type_error("$mod", &vals[0], &vals[1]) {
+        return Err(fault);
     }
     // mongod truncates toward zero (C's fmod), so the remainder takes the
     // *dividend's* sign: `$mod: [-5, 2]` is -1, not the 1 a flooring `%`
@@ -2090,11 +2182,22 @@ fn op_substr_cp(arg: &Bson, ctx: &Ctx) -> R {
     }
     let s = eval(&a[0], ctx)?;
     if is_null(&s) {
-        return Ok(Bson::String(String::new())); // Python returns "" for null input
+        return Ok(Bson::String(String::new())); // null input -> ""
     }
-    let Bson::String(s) = s else {
-        return Err(Fallback::Defer);
-    };
+    // The first operand is COERCED, not required to be a string: mongod answers
+    // `{$substr: [123, 1, 2]}` with "23". This required a string and deferred,
+    // reporting the operator unsupported (probed 8.2.11, 2026-09-03). The
+    // rejected types are `$toLower`'s, with its 16007.
+    if !is_case_convertible(&s) {
+        return Err(Fallback::mongo(
+            16007,
+            format!(
+                "can't convert from BSON type {} to String",
+                crate::query::bson_type_name(&s)
+            ),
+        ));
+    }
+    let s = coerce_to_string(&s)?;
     let start_v = eval(&a[1], ctx)?;
     let length_v = eval(&a[2], ctx)?;
     // These five refusals used to defer so Python would raise them, which is
@@ -2235,14 +2338,46 @@ fn op_merge_objects(arg: &Bson, ctx: &Ctx) -> R {
     };
     let mut result = Document::new();
     for item in items {
-        match eval(item, ctx)? {
-            Bson::Null => {}
-            Bson::Document(d) => {
-                for (k, v) in d {
-                    result.insert(k, v);
+        // An evaluated value that is itself an ARRAY is the operand list, one
+        // level down: `{$mergeObjects: "$docs"}` over `[{a: 1}, {b: 2}]` merges
+        // both, and over `[3, 1, 2]` reports "input 3" rather than naming the
+        // whole array. Only the literal-array form was being split, so a field
+        // path resolving to an array was treated as a single operand (probed
+        // 8.2.11, 2026-09-03, across five shapes).
+        let evaluated = eval(item, ctx)?;
+        let operands: Vec<Bson> = match evaluated {
+            Bson::Array(a) => a,
+            other => vec![other],
+        };
+        for operand in operands {
+            match operand {
+                Bson::Null => {}
+                Bson::Document(d) => {
+                    for (k, v) in d {
+                        result.insert(k, v);
+                    }
+                }
+                // mongod names the offending VALUE, not just its type, in the
+                // COMPACT vocabulary -- a bare ObjectId hex, an ISO date, a
+                // double-quoted string. `render_value_compact` is the same renderer
+                // `$replaceRoot`'s "Input document:" uses; the shell form
+                // (`ObjectId('...')`, `new Date(...)`) belongs to a different family
+                // of messages. Probed 8.2.11 (2026-09-03).
+                //
+                // An ARRAY argument is the operand LIST, so `{$mergeObjects:
+                // [3, 1, 2]}` reports "input 3" -- the first element -- which is
+                // what iterating `items` already gives.
+                other => {
+                    return Err(Fallback::mongo(
+                        40400,
+                        format!(
+                            "$mergeObjects requires object inputs, but input {} is of type {}",
+                            crate::aggregate::render_value_compact(&other),
+                            crate::query::bson_type_name(&other)
+                        ),
+                    ))
                 }
             }
-            _ => return Err(Fallback::Defer), // Python raises on non-document arg
         }
     }
     Ok(Bson::Document(result))
@@ -2902,26 +3037,84 @@ enum Trig {
     Atanh,
 }
 
+impl Trig {
+    /// The operator name mongod puts in its domain-error message.
+    fn name(self) -> &'static str {
+        match self {
+            Trig::Sin => "$sin",
+            Trig::Cos => "$cos",
+            Trig::Tan => "$tan",
+            Trig::Asin => "$asin",
+            Trig::Acos => "$acos",
+            Trig::Atan => "$atan",
+            Trig::Sinh => "$sinh",
+            Trig::Cosh => "$cosh",
+            Trig::Tanh => "$tanh",
+            Trig::Asinh => "$asinh",
+            Trig::Acosh => "$acosh",
+            Trig::Atanh => "$atanh",
+        }
+    }
+}
+
 /// Unary trig. int/long/double -> Double; null -> null; bool / Decimal128 /
 /// non-numeric -> Python (which raises `Location28765`). Domain / finiteness
 /// violations also defer (Python raises `Location50989`). Mirrors the
 /// `_make_trig` factory in `expressions.py`.
+/// How mongod renders the operand in a `$sin`-family domain error.
+///
+/// Per TYPE, not one form: a `Decimal128` prints its OWN representation, so
+/// `Decimal128("2.50")` stays `2.50` and `Decimal128("2.500000000")` keeps
+/// every zero, while an int / long / double goes through C's `%g`
+/// (`1099511627776` prints as `1.09951e+12`). Probed 8.2.11 (2026-09-03).
+fn trig_operand_repr(value: &Bson, x: f64) -> String {
+    match value {
+        Bson::Decimal128(d) => d.to_string(),
+        _ => format_double_g(x),
+    }
+}
+
 fn op_trig(arg: &Bson, ctx: &Ctx, kind: Trig) -> R {
     use Trig::*;
-    let x = match eval(arg, ctx)? {
+    let value = eval(arg, ctx)?;
+    let x = match &value {
         Bson::Null => return Ok(Bson::Null),
-        Bson::Int32(n) => n as f64,
-        Bson::Int64(n) => n as f64,
-        Bson::Double(d) => d,
-        _ => return Err(Fallback::Defer), // bool / Decimal128 / non-numeric -> Python
+        Bson::Int32(n) => *n as f64,
+        Bson::Int64(n) => *n as f64,
+        Bson::Double(d) => *d,
+        // A decimal is carried as its f64 value for the DOMAIN test only. Out
+        // of range it produces mongod's error below; in range mongod answers a
+        // Decimal128 computed at 34 digits, which this engine does not do, so
+        // that still defers. Getting the error right does not require the
+        // arithmetic.
+        Bson::Decimal128(_) => match decimal_as_f64(&value) {
+            Some(d) => d,
+            None => return Err(Fallback::Defer),
+        },
+        _ => return Err(Fallback::Defer), // bool / non-numeric -> the 28765 guard
     };
-    let bad = match kind {
-        Sin | Cos | Tan => !x.is_finite(),
-        Asin | Acos | Atanh => !(-1.0..=1.0).contains(&x),
-        Acosh => x < 1.0,
-        _ => false, // atan / sinh / cosh / tanh / asinh accept every finite + inf
+    // NaN is NOT a domain error -- `{$tan: NaN}` answers NaN on mongod, for all
+    // three of sin / cos / tan. Only the infinities are refused, which is why
+    // this cannot be `!x.is_finite()` (probed 8.2.11, 2026-09-03; that spelling
+    // rejected NaN, where mongod passes it straight through).
+    let range = match kind {
+        Sin | Cos | Tan if x.is_infinite() => Some("(-inf,inf)"),
+        Asin | Acos | Atanh if !(-1.0..=1.0).contains(&x) => Some("[-1,1]"),
+        Acosh if x < 1.0 => Some("[1,inf]"),
+        _ => None, // atan / sinh / cosh / tanh / asinh accept every finite + inf
     };
-    if bad {
+    if let Some(range) = range {
+        return Err(Fallback::mongo(
+            50989,
+            format!(
+                "cannot apply {} to {}, value must be in {range}",
+                kind.name(),
+                trig_operand_repr(&value, x)
+            ),
+        ));
+    }
+    // In range, but a decimal result needs decimal transcendentals.
+    if matches!(value, Bson::Decimal128(_)) {
         return Err(Fallback::Defer);
     }
     if matches!(kind, Atanh) {
@@ -2974,6 +3167,12 @@ fn op_atan2(arg: &Bson, ctx: &Ctx) -> R {
         Bson::Double(d) => Some(*d),
         _ => None,
     };
+    // A non-numeric operand is named, with a DIFFERENT code per position
+    // (51044 first, 51045 second). A Decimal128 is numeric and falls through to
+    // the defer below, where mongod would answer a decimal.
+    if let Some(fault) = arith_type_error("$atan2", &vals[0], &vals[1]) {
+        return Err(fault);
+    }
     let (Some(y), Some(x)) = (extract(&vals[0]), extract(&vals[1])) else {
         return Err(Fallback::Defer);
     };
@@ -5625,16 +5824,21 @@ fn op_strcasecmp(arg: &Bson, ctx: &Ctx) -> R {
         return Err(Fallback::Defer);
     }
     let to_str = |v: &Bson| -> Result<String, Fallback> {
-        match v {
-            Bson::Null => Ok(String::new()),
-            Bson::String(s) => Ok(s.to_ascii_uppercase()),
-            // mongod $toString-coerces an operand; an integer matches Python's
-            // `str(int)`. Double / date / Decimal128 / bool defer (double string
-            // formatting + bool -> Location16007 are Python's).
-            Bson::Int32(n) => Ok(n.to_string()),
-            Bson::Int64(n) => Ok(n.to_string()),
-            _ => Err(Fallback::Defer),
+        // mongod coerces each operand with the SAME rule `$toLower` uses -- a
+        // double, date or Decimal128 all render, and only the types that rule
+        // rejects are 16007. This listed int and long alone and deferred the
+        // rest, so `{$strcasecmp: [1.5, 1]}` reported `$strcasecmp` unsupported
+        // where mongod answers 1 (probed 8.2.11, 2026-09-03).
+        if !is_case_convertible(v) {
+            return Err(Fallback::mongo(
+                16007,
+                format!(
+                    "can't convert from BSON type {} to String",
+                    crate::query::bson_type_name(v)
+                ),
+            ));
         }
+        coerce_to_string(v).map(|t| t.to_ascii_uppercase())
     };
     let (a, b) = (to_str(&vals[0])?, to_str(&vals[1])?);
     Ok(Bson::Int32(match a.cmp(&b) {
@@ -5681,8 +5885,28 @@ const MAX_RANGE_SIZE: i128 = 100_000;
 ///
 /// The "type:bool" run-together in the STEP message is mongod's own; the
 /// starting and ending messages have the space. Probed 8.2.11, 2026-09-01.
+/// How mongod renders the operand in `$range`'s "32-bit integer" complaint.
+///
+/// NOT the same rule as `trig_operand_repr`, which is the point of having two:
+/// `$range` keeps an integer's digits (`1099511627776`) where `$acos` converts
+/// to double first and prints `1.09951e+12`. A decimal keeps its own
+/// representation in both. Probed 8.2.11 (2026-09-03).
+fn range_operand_repr(b: &Bson) -> String {
+    match b {
+        Bson::Int32(n) => n.to_string(),
+        Bson::Int64(n) => n.to_string(),
+        Bson::Decimal128(d) => d.to_string(),
+        other => format_double_g(as_float_like(other).unwrap_or(f64::NAN)),
+    }
+}
+
 fn range_int(b: &Bson, which: &str, numeric_code: i32, repr_code: i32) -> Result<i64, Fallback> {
-    if matches!(b, Bson::Boolean(_)) || as_float_like(b).is_none() {
+    // A Decimal128 IS numeric here -- it fails the 32-bit check below, not the
+    // type check. `as_float_like` does not cover it, so without this
+    // `{$range: [Decimal128("2.5"), 1]}` reported the wrong code (34443 rather
+    // than 34444).
+    let is_decimal = matches!(b, Bson::Decimal128(_));
+    if matches!(b, Bson::Boolean(_)) || (!is_decimal && as_float_like(b).is_none()) {
         let sep = if numeric_code == 34447 { "" } else { " " };
         return Err(Fallback::mongo(
             numeric_code,
@@ -5692,17 +5916,23 @@ fn range_int(b: &Bson, which: &str, numeric_code: i32, repr_code: i32) -> Result
             ),
         ));
     }
-    match coerce_index(b) {
-        IdxCoerce::Int(i) => Ok(i),
-        _ => Err(Fallback::mongo(
+    let too_wide = || {
+        Err(Fallback::mongo(
             repr_code,
             format!(
                 "$range requires {} {which} value that can be represented as a \
                  32-bit integer, found value: {}",
                 if which == "ending" { "an" } else { "a" },
-                format_double_g(as_float_like(b).unwrap_or(f64::NAN))
+                range_operand_repr(b)
             ),
-        )),
+        ))
+    };
+    match coerce_index(b) {
+        // 32-BIT, not 64: `{$range: [Int64(2**40), 1]}` is this error on mongod,
+        // where accepting the i64 built a range of a trillion elements and
+        // answered `[]`.
+        IdxCoerce::Int(i) if i32::try_from(i).is_ok() => Ok(i),
+        _ => too_wide(),
     }
 }
 
@@ -5872,9 +6102,17 @@ fn op_substr_bytes(arg: &Bson, ctx: &Ctx) -> R {
     if is_null(&s) {
         return Ok(Bson::String(String::new()));
     }
-    let Bson::String(s) = s else {
-        return Err(Fallback::Defer);
-    };
+    // Coerced, not required to be a string -- the same rule `$substrCP` uses.
+    if !is_case_convertible(&s) {
+        return Err(Fallback::mongo(
+            16007,
+            format!(
+                "can't convert from BSON type {} to String",
+                crate::query::bson_type_name(&s)
+            ),
+        ));
+    }
+    let s = coerce_to_string(&s)?;
     let start_v = eval(&a[1], ctx)?;
     let length_v = eval(&a[2], ctx)?;
     if matches!(start_v, Bson::Boolean(_)) || matches!(length_v, Bson::Boolean(_)) {
@@ -6010,7 +6248,17 @@ fn op_array_to_object(arg: &Bson, ctx: &Ctx) -> R {
                 };
                 out.insert(k.clone(), pair[1].clone());
             }
-            _ => return Err(Fallback::Defer),
+            // A element that is neither a `{k, v}` document nor a two-element
+            // pair is named by TYPE -- probed 8.2.11 (2026-09-03).
+            other => {
+                return Err(Fallback::mongo(
+                    40398,
+                    format!(
+                        "Unrecognised input type format for $arrayToObject: {}",
+                        crate::query::bson_type_name(&other)
+                    ),
+                ))
+            }
         }
     }
     Ok(Bson::Document(out))

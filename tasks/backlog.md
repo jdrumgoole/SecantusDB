@@ -4382,7 +4382,7 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   precision and overflow behaviour all differ per operator, so this is 19
   individually-probed operators rather than one change).
 
-  **The per-operator campaign RAN: 908 -> 117 (2026-09-02).** The Rust server's
+  **The per-operator campaign RAN: 908 -> 32 (2026-09-02, second pass 09-03).** The Rust server's
   `agg_expressions` column went from 902 code + 6 message divergences to **117
   code + 0 message**, and the Python server's from 50 + 212 to **28 + 80**.
   Zero wrong VALUES throughout, before and after. What closed it was giving each
@@ -4394,20 +4394,47 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `$toDecimal` of a date. See `changelog.d/rust-operand-error-surface.md` and
   `tests/test_expression_operand_errors.py`.
 
-  **What remains, characterised rather than counted (117 shapes):**
+  **Second pass: 117 -> 32 (2026-09-03).** The two rendering families, the
+  arithmetic type guards, the unknown-argument family and the arity checks all
+  closed. Rust is **32 code + 0 message**; the Python server reached **0 code**
+  (from 50 at the start of the campaign) and 71 message-only.
+
+  **What remains, characterised rather than counted (32 shapes):**
 
   | shapes | area |
   | --- | --- |
-  | 28 | Decimal128 arithmetic and the transcendentals -- the half deliberately left to the decimal engine (the item above) |
-  | ~20 | `$mergeObjects`, which renders the offending VALUE (`input "abc" is of type string`), so it needs mongod's value renderer per type |
-  | ~14 | the trigonometric domain errors (50989 `cannot apply $acos to 1.09951e+12, value must be in [-1,1]`), which need the same `%g` rendering |
-  | ~12 | the arithmetic type guards (`$add` / `$divide` / `$mod` / `$multiply` / `$subtract` / `$atan2`), adjacent to the decimal work |
-  | 4 | `$firstN` / `$lastN` / `$maxN` / `$minN` report `5787906 Missing value for 'n'` where mongod checks the UNKNOWN argument first (`5787901`) |
-  | ~6 | value gaps: `$substr*` of an array is `""`, `$strcasecmp` coerces a number, `$range` and `$round` arity |
+  | 29 | Decimal128 arithmetic and the transcendentals -- the half deliberately left to the decimal engine (the item above). One shape per operator; mongod answers a Decimal128 at 34 digits and this engine has no decimal transcendentals |
+  | 3 | `$toDate` of an UNPARSEABLE string. mongod reports its timelib diagnostic (`Error parsing date string 'abc'; 0: passing a time zone identifier as part of the string is not allowed 'a'`); the parse SUCCESS path ships, and a failure defers rather than inventing a message it would not send |
 
-  The two rendering families are one piece of work, not two: both need mongod's
-  C++ `%g` double form (`3e+09`, not Rust's `3e9`). `format_double_g` already
-  exists in `expressions.rs` and is what `mongo_val_repr` uses.
+  Both are deliberate, and neither is a defer standing in for an ordinary
+  argument complaint any more -- that class is gone.
+
+  **Rules this pass measured that a guess gets wrong**, each now pinned in
+  `tests/test_expression_operand_errors.py`:
+
+  - **NaN is not a domain error.** `{$tan: NaN}` answers NaN on mongod, for all
+    three of sin/cos/tan; only the infinities are refused. Both engines spelled
+    the guard `not isfinite(x)`, which rejects NaN.
+  - **Three value renderings that look like one.** `$acos` converts to double
+    first (`1.09951e+12`); `$range` keeps an integer's digits
+    (`1099511627776`); a Decimal128 keeps its OWN representation in both, so
+    `2.50` does not become `2.5`.
+  - **`$subtract`'s `Date` capitalisation is POSITIONAL**, not per-type:
+    `can't $subtract string from Date` but `can't $subtract date from int`.
+    Capitalising both was caught by `test_arithmetic_date_semantics`, which
+    held the second-operand case -- the old test was right and the new
+    measurement was too, for different positions.
+  - **`$range` checks 32 bits, not 64.** Accepting a long built a range of a
+    trillion elements and answered `[]`.
+  - **`$mergeObjects` flattens an EVALUATED array**: a field path resolving to
+    an array is the operand list, so `{$mergeObjects: "$arr"}` over `[3, 1, 2]`
+    reports "input 3" rather than naming the whole array.
+  - **Eighteen unknown-argument codes share nothing**, not even within a
+    wording. Measured one operator at a time by feeding each candidate key and
+    keeping the ones it did not reject.
+  - **`$atan2` carries a different code per position** (51044 / 51045), and
+    `$divide` / `$mod` name BOTH operand types where `$add` / `$multiply` name
+    only the first.
 
   Original entry, for the record: **1,376 of 3,968 (2026-09-02).**
   Measured for the first time by pointing `agg_expressions.py` at the Rust

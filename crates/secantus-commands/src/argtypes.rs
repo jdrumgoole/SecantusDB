@@ -1339,6 +1339,11 @@ pub fn expression_problem_in_pipeline(
 /// arity. A NON-array argument counts as one.
 const EXPRESSION_ARITY: &[(&str, usize, usize)] = &[
     ("$indexOfArray", 2, 4),
+    // `[value]` or `[value, place]` -- an empty or 3-element list is 28667 at
+    // parse time, which used to reach the evaluator instead: `{$round: [3,1,2]}`
+    // ANSWERED 3 and `{$round: []}` reported a type complaint (probed 8.2.11).
+    ("$round", 1, 2),
+    ("$trunc", 1, 2),
     ("$indexOfBytes", 2, 4),
     ("$indexOfCP", 2, 4),
     ("$range", 2, 3),
@@ -1394,6 +1399,83 @@ const DATE_EXTRACTORS: &[&str] = &[
     "$second",
     "$week",
     "$year",
+];
+
+/// Operators whose spec document rejects an unrecognised key, with the code and
+/// the WORDING each uses.
+///
+/// Two sentences, not one: a handful say "Unrecognized parameter to $op: k" and
+/// the rest "$op found an unknown argument: k". Every code is its own -- they
+/// share nothing, not even within a wording -- so this is a table rather than
+/// one message with a name substituted. Operator names, codes and the accepted
+/// argument list were all probed against 8.2.11 (2026-09-03) by feeding each
+/// candidate key in turn and keeping the ones it did NOT reject.
+///
+/// `true` in the third slot selects the "Unrecognized parameter to" form.
+const UNKNOWN_ARGUMENT: &[(&str, i32, bool, &[&str])] = &[
+    ("$cond", 17083, true, &["if", "then", "else"]),
+    ("$filter", 28647, true, &["input", "as", "cond", "limit"]),
+    ("$let", 16875, true, &["vars", "in"]),
+    ("$map", 16879, true, &["input", "as", "in"]),
+    (
+        "$convert",
+        9,
+        false,
+        &["input", "to", "onError", "onNull", "format", "byteOrder"],
+    ),
+    ("$ltrim", 50694, false, &["input", "chars"]),
+    ("$rtrim", 50694, false, &["input", "chars"]),
+    ("$trim", 50694, false, &["input", "chars"]),
+    ("$reduce", 40076, false, &["input", "initialValue", "in"]),
+    ("$regexFind", 31024, false, &["input", "regex", "options"]),
+    (
+        "$regexFindAll",
+        31024,
+        false,
+        &["input", "regex", "options"],
+    ),
+    ("$regexMatch", 31024, false, &["input", "regex", "options"]),
+    (
+        "$replaceAll",
+        51750,
+        false,
+        &["input", "find", "replacement"],
+    ),
+    (
+        "$replaceOne",
+        51750,
+        false,
+        &["input", "find", "replacement"],
+    ),
+    ("$setField", 4161101, false, &["field", "input", "value"]),
+    ("$sortArray", 2942501, false, &["input", "sortBy"]),
+    ("$switch", 40067, false, &["branches", "default"]),
+    (
+        "$zip",
+        34464,
+        false,
+        &["inputs", "useLongestLength", "defaults"],
+    ),
+];
+
+/// The `n`-operator family, whose spec document takes only known arguments.
+///
+/// mongod checks the UNKNOWN argument before it checks for a missing `n`, so
+/// `{$firstN: {k: 1}}` is "Unknown argument" rather than "Missing value for
+/// 'n'". The `$median` / `$percentile` pair belongs to a different family again
+/// and reports the IDL's own wording. Probed 8.2.11 (2026-09-03).
+const N_OPERATOR_ARGUMENTS: &[(&str, &[&str])] = &[
+    ("$firstN", &["input", "n"]),
+    ("$lastN", &["input", "n"]),
+    ("$minN", &["input", "n"]),
+    ("$maxN", &["input", "n"]),
+];
+
+/// `$median` / `$percentile`: an unrecognised key is the IDL's generic
+/// unknown-field complaint, naming the operator and the key.
+const IDL_UNKNOWN_FIELD: &[(&str, &[&str])] = &[
+    ("$median", &["input", "method"]),
+    ("$percentile", &["input", "p", "method"]),
 ];
 
 /// Accumulator-style expressions whose spec must be a document. Each carries its
@@ -1629,6 +1711,40 @@ pub(crate) fn expression_shape_problem(spec: &Bson) -> Option<(i32, String)> {
                                     format!("Unrecognized argument to {key}: {field}{tail}"),
                                 ));
                             }
+                        }
+                    }
+                }
+                if let Some((_, code, is_parameter, known)) =
+                    UNKNOWN_ARGUMENT.iter().find(|(op, _, _, _)| *op == key)
+                {
+                    if let Bson::Document(spec) = value {
+                        if let Some(bad) = spec.keys().find(|k| !known.contains(&k.as_str())) {
+                            let message = if *is_parameter {
+                                format!("Unrecognized parameter to {key}: {bad}")
+                            } else {
+                                format!("{key} found an unknown argument: {bad}")
+                            };
+                            return Some((*code, message));
+                        }
+                    }
+                }
+                if let Some((_, known)) = N_OPERATOR_ARGUMENTS.iter().find(|(op, _)| *op == key) {
+                    if let Bson::Document(spec) = value {
+                        if let Some(bad) = spec.keys().find(|k| !known.contains(&k.as_str())) {
+                            return Some((
+                                5787901,
+                                format!("Unknown argument for 'n' operator: {bad}"),
+                            ));
+                        }
+                    }
+                }
+                if let Some((_, known)) = IDL_UNKNOWN_FIELD.iter().find(|(op, _)| *op == key) {
+                    if let Bson::Document(spec) = value {
+                        if let Some(bad) = spec.keys().find(|k| !known.contains(&k.as_str())) {
+                            return Some((
+                                40415,
+                                format!("BSON field '{key}.{bad}' is an unknown field."),
+                            ));
                         }
                     }
                 }
