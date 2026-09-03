@@ -1939,6 +1939,15 @@ one; that surface needs no work. What is still open:
       UTF-8-locale PostgreSQL to measure before anything is changed — our
       Unicode-aware answer is right for that server in every case except
       possibly the full-vs-simple ones.
+- [ ] **`date_part` should return float8; we return numeric.** In PostgreSQL 14
+      `EXTRACT` returns `numeric` but `date_part` still returns `double
+      precision` -- for every field, not just `epoch`. The VALUES agree; only
+      the oid differs (1700 vs 701). **Not fixed because the two spellings are
+      indistinguishable in the AST**: sqlglot folds both into `exp.Extract` with
+      the field as a `Var`, and the only difference is that the `EXTRACT`
+      keyword form arrives upper-cased. Keying on case would misread
+      `date_part('YEAR', ...)`, so this wants a real marker set during parsing
+      rather than a heuristic.
 - [ ] **`convert_from` / `convert_to` are absent** (`42883`).
 - [ ] **A set-returning function beside another column in the SELECT list.**
       `SELECT jsonb_array_length(x), jsonb_object_keys(y)` and

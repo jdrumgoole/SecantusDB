@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS d9
+CREATE TABLE d9 (id int PRIMARY KEY, n int DEFAULT 0, s text)

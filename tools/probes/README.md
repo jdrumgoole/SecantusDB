@@ -9,6 +9,35 @@ checked, rather than to prove a known thing stays fixed.
 exploratory front end that feeds it. Anything a probe finds should end up as a
 regression test there or in a dedicated test file.
 
+## The SQL side: `pg_differential.py`
+
+The same idea against **PostgreSQL** instead of mongod, for SecantusDB's PG
+server. It takes a corpus from `pg_corpora/` (a `.setup.sql` plus the statements
+proper) and prints only the disagreements:
+
+    uv run --no-sync python tools/probes/pg_differential.py \
+        tools/probes/pg_corpora/windows.setup.sql \
+        tools/probes/pg_corpora/windows.sql --types
+
+Both servers are driven through the **same `psycopg` connection**, so
+client-side type mapping is identical and every difference is the server's.
+Two rules that the 2026-09-03 sweeps paid for:
+
+- **Do not probe through `run_sql()`.** The embedded API returns the engine's
+  internal values, which the wire converts on the way out — a `numeric(p,s)`
+  cast surfaces as a raw `Decimal128`, a `::date` as a `str`, an interval as a
+  subdocument. Probed directly all three look like divergences; over the wire
+  all three are correct. That was 4 of the first 8 "findings".
+- **Pass `--types`.** A wrong oid under a right value is invisible to a row
+  comparison, and several real bugs were exactly that: `#>` sent jsonb under
+  oid 25, `LIKE ... ESCAPE` sent a boolean as `'t'`, a window `sum(int4)`
+  declared int4 where PG promotes to int8.
+
+**Check `SHOW lc_ctype` before believing a case-mapping difference.** This box's
+PostgreSQL runs the `C` locale and does not case-map non-ASCII at all
+(`upper('é')` is `é`), so several apparent `initcap` / `upper` bugs are locale
+data rather than engine behaviour.
+
 ## Why these live in the repo
 
 The differential tooling that found nine bugs during the 2026-08 audit "lived in
