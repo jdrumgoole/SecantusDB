@@ -60,6 +60,17 @@ numeric at `select_div_scale`'s scale.
   **not** arithmetic's: `int + real` is double precision, but
   `greatest(int, real)` is real.
 
+- **`concat`, `concat_ws` and `format`'s `%s` render a boolean as `t` / `f`.**
+  They go through the type's *output* function, not `::text` — which spells it
+  `true` — so `concat(1, 2.5, true)` answered `12.5true` where PostgreSQL says
+  `12.5t`. Bool is the only type where the two spellings differ.
+- **`format` rejects too few arguments** with `22023` instead of substituting an
+  empty string, positional (`%3$s`) forms included.
+- **`split_part` with an empty delimiter** returns the whole string as field 1;
+  Python's `str.split("")` raises, and the `ValueError` escaped as a confusing
+  `function split_part(unknown) does not exist`. A zero field position is
+  `22023`, as it is there.
+
 #### Added
 
 - **`string_agg` and `array_agg` as window functions**, including under

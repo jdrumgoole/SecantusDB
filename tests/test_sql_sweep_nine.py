@@ -359,6 +359,66 @@ def test_trim_scale_types_as_numeric(store, sess):
 
 
 # --------------------------------------------------------------------------- #
+# concat / format render a boolean the way its OUTPUT function does
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("sql", "want"),
+    [
+        # `true::text` is 'true', but concat goes through the type's output
+        # function, where a boolean is 't'. Only bool differs between the two.
+        ("SELECT concat(true, false)", "tf"),
+        ("SELECT concat_ws('-', true, false)", "t-f"),
+        ("SELECT format('%s', true)", "t"),
+        ("SELECT concat(1, 2.5, true)", "12.5t"),
+        ("SELECT true::text", "true"),
+    ],
+)
+def test_boolean_rendering_in_concat(store, sess, sql, want):
+    assert _rows(store, sql, sess)[0][0] == want
+
+
+def test_format_rejects_too_few_arguments(store, sess):
+    with pytest.raises(errors.SQLError) as exc:
+        _rows(store, "SELECT format('%s %s', 'a')", sess)
+    assert exc.value.sqlstate == "22023"
+
+
+def test_format_rejects_an_out_of_range_positional(store, sess):
+    with pytest.raises(errors.SQLError) as exc:
+        _rows(store, "SELECT format('%3$s', 'a')", sess)
+    assert exc.value.sqlstate == "22023"
+
+
+# --------------------------------------------------------------------------- #
+# split_part
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("sql", "want"),
+    [
+        ("SELECT split_part('a,b,c', ',', -1)", "c"),  # PG 14+: from the end
+        ("SELECT split_part('a,b,c', ',', -2)", "b"),
+        ("SELECT split_part('a,b,c', ',', -9)", ""),
+        # An EMPTY delimiter: Python's str.split("") raises, which escaped as a
+        # confusing "function split_part(unknown) does not exist".
+        ("SELECT split_part('abc', '', 1)", "abc"),
+        ("SELECT split_part('abc', '', 2)", ""),
+    ],
+)
+def test_split_part(store, sess, sql, want):
+    assert _rows(store, sql, sess)[0][0] == want
+
+
+def test_split_part_zero_position(store, sess):
+    with pytest.raises(errors.SQLError) as exc:
+        _rows(store, "SELECT split_part('a,b', ',', 0)", sess)
+    assert exc.value.sqlstate == "22023"
+
+
+# --------------------------------------------------------------------------- #
 # RETURNING
 # --------------------------------------------------------------------------- #
 

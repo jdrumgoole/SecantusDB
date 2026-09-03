@@ -1931,6 +1931,15 @@ one; that surface needs no work. What is still open:
       out of range` -- the negation does not fit int4. The arithmetic operators
       overflow-check (`SELECT a + 1` at int4 max is `22003` on both servers);
       `abs` does not.
+- [ ] **`upper` / `lower` use Python's FULL case mapping, Postgres uses the
+      simple one.** `upper('ß')` is `SS` here and `ß` there. **This one cannot
+      be settled on this box**: its PostgreSQL runs `lc_ctype=C`, which does not
+      case-map non-ASCII AT ALL (`upper('é')` is `é`), so the C-locale answer
+      cannot distinguish "simple mapping" from "no mapping". Needs a
+      UTF-8-locale PostgreSQL to measure before anything is changed — our
+      Unicode-aware answer is right for that server in every case except
+      possibly the full-vs-simple ones.
+- [ ] **`convert_from` / `convert_to` are absent** (`42883`).
 - [ ] **`numeric_send` is absent** (`42883`). One of Postgres' internal
       type-I/O functions; nothing but a driver test is likely to call it.
 - [ ] **An in-call `ORDER BY` inside a window aggregate is dropped.**

@@ -1239,9 +1239,22 @@ def _eval_coalesce(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> An
     return None
 
 
+def _concat_text(v: Any) -> str:
+    """One ``concat`` / ``format('%s')`` argument as text.
+
+    These render through the type's OUTPUT function, where a boolean is ``t`` /
+    ``f`` -- not through ``::text``, which spells it ``true`` / ``false``. The
+    two differ only for bool, and using the cast's spelling made
+    ``concat(1, 2.5, true)`` answer ``12.5true`` where Postgres says ``12.5t``.
+    """
+    if isinstance(v, bool):
+        return "t" if v else "f"
+    return _as_text(v)
+
+
 def _eval_concat(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     # Postgres ``concat`` ignores NULL arguments (renders them as empty).
-    return "".join(_as_text(v) for v in _variadic(node, scope, ctx) if v is not None)
+    return "".join(_concat_text(v) for v in _variadic(node, scope, ctx) if v is not None)
 
 
 def _extremum(pick: Callable[[list[Any]], Any]) -> Callable[..., Any]:
@@ -1295,8 +1308,14 @@ def _eval_split_part(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> 
     idx = evaluate(node.args.get("part_index"), scope, ctx)
     if src is None or delim is None or idx is None:
         return None
-    parts = _as_text(src).split(_as_text(delim))
     n = int(idx)
+    if n == 0:
+        raise errors.SQLError("22023", "field position must not be zero")
+    text, sep = _as_text(src), _as_text(delim)
+    # An EMPTY delimiter splits into nothing -- Python's `str.split("")` raises
+    # ValueError, which escaped as a confusing "function split_part(unknown)
+    # does not exist". Postgres treats the whole string as field 1.
+    parts = text.split(sep) if sep else [text]
     if n < 0:  # Postgres 14+: count from the end
         n = len(parts) + n + 1
     return parts[n - 1] if 1 <= n <= len(parts) else ""
@@ -4272,7 +4291,7 @@ def _plain_scalar(name: str, args: list[Any]) -> Any:
         # (unlike `concat`, which skips them too but has no separator).
         if a is None:
             return None
-        return _as_text(a).join(_as_text(v) for v in args[1:] if v is not None)
+        return _as_text(a).join(_concat_text(v) for v in args[1:] if v is not None)
     if name == "starts_with":
         if a is None or len(args) < 2 or args[1] is None:
             return None
@@ -5064,11 +5083,17 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
                     width = j + 2 - i
                 if spec in "sIL":
                     if explicit is not None:
-                        val = rest[explicit - 1] if 0 < explicit <= len(rest) else None
+                        if not 0 < explicit <= len(rest):
+                            raise errors.SQLError("22023", "too few arguments for format()")
+                        val = rest[explicit - 1]
                     else:
-                        val = rest.pop(0) if rest else None
+                        # Running out mid-format is an ERROR in Postgres, not an
+                        # empty substitution: `format('%s %s', 'a')` is 22023.
+                        if not rest:
+                            raise errors.SQLError("22023", "too few arguments for format()")
+                        val = rest.pop(0)
                     if spec == "s":
-                        out.append("" if val is None else _as_text(val))
+                        out.append("" if val is None else _concat_text(val))
                     elif spec == "I":
                         # %I *is* quote_ident, so it quotes only when it must.
                         # Always quoting made `format('%I', 'tbl')` produce
