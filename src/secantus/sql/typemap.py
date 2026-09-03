@@ -2038,16 +2038,23 @@ def _render_pg_composite(value: dict) -> str:
     double-quoted when empty or containing a comma / paren / quote / backslash /
     whitespace, with internal ``"`` and ``\\`` doubled."""
     parts: list[str] = []
-    for field_val in value.values():
+    # A ``RecordValue`` knows its fields' declared oids. Without them a field is
+    # rendered from its Python value alone, which cannot tell a jsonb string from
+    # a text one: ``jsonb_each('{"b":"x"}')`` gave ``(b,x)`` where PG, rendering
+    # the field AS jsonb, gives ``(b,"x")``.
+    field_tags = [OID_TO_TAG.get(o) for o in getattr(value, "field_oids", ())]
+    for i, field_val in enumerate(value.values()):
         if field_val is None:
             parts.append("")
             continue
+        tag = field_tags[i] if i < len(field_tags) else None
         # A dict-valued field is itself a composite (nested composite type) — render
-        # it recursively as a ``(…)`` record rather than as JSON.
-        if isinstance(field_val, dict):
+        # it recursively as a ``(…)`` record rather than as JSON. A dict under a
+        # json/jsonb oid is a JSON object, so it renders as JSON.
+        if isinstance(field_val, dict) and tag not in ("json", "jsonb"):
             text = _render_pg_composite(field_val)
         else:
-            rendered = to_pg_text(field_val)
+            rendered = to_pg_text(field_val, tag) if tag else to_pg_text(field_val)
             text = rendered.decode("utf-8") if rendered is not None else ""
         if text == "" or any(ch in text for ch in ',()"\\') or any(ch.isspace() for ch in text):
             text = '"' + text.replace("\\", "\\\\").replace('"', '""') + '"'

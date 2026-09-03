@@ -1904,6 +1904,76 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+### 2026-09-03 SQL sweep eight: what it found and did NOT fix
+
+263 statements against PostgreSQL 14.13, both sides driven by the same
+`psycopg` client (`tests/test_sql_sweep_eight.py` pins the fixes). What landed
+is in `changelog.d/sql-sweep-eight.md`. What is still open, measured rather
+than assumed:
+
+- [ ] **JSON `null` is indistinguishable from SQL NULL**, so
+      `jsonb_typeof('null'::jsonb)` answers NULL where PostgreSQL answers the
+      string `'null'`, and so does `jsonb_typeof(v -> 'k')` over a JSON null
+      member. Both representations are Python `None`. The exposure is narrow --
+      the VALUES are right, and `->`, `@>`, `?`, `jsonb_strip_nulls` all agree
+      with PostgreSQL; only `jsonb_typeof` / `json_typeof` can see the
+      difference, because psycopg decodes a jsonb null to `None` anyway. Fixing
+      it means a JSON-null sentinel threaded through the scalar evaluator, the
+      storage round-trip and `typemap`, which is why it was left. Same
+      missing-vs-null shape this file names three times already.
+- [ ] **The two-argument statistical aggregates are absent**: `corr`,
+      `covar_pop`, `covar_samp`, and the whole `regr_*` family (`regr_slope`,
+      `regr_intercept`, `regr_count`, `regr_r2`, `regr_avgx`, `regr_avgy`,
+      `regr_sxx`, `regr_syy`, `regr_sxy`). They answer
+      `0A000 unsupported aggregate`. The framework to build them on exists --
+      `_register_numeric_stat` accumulates N / sum(X) / sum(X**2) and finishes
+      in Python via `post_aggregates` -- but a two-argument aggregate has to be
+      registered at each of the ~6 planning sites (single-table, join,
+      computed-projection, grouped and ungrouped), which is the actual cost.
+      PostgreSQL answers `float8` here, so no exact-numeric machinery is needed.
+- [ ] **`make_interval` does not take NAMED arguments.** `make_interval(days =>
+      3)` is `0A000 unsupported scalar expression: days => 3` -- the `=>`
+      named-argument form is not handled anywhere in the scalar evaluator, so
+      this is not specific to `make_interval`. The positional form
+      `make_interval(0, 1, 0, 2)` fails for the same reason.
+- [ ] **`LATERAL` with no FROM inside it.** `FROM t, LATERAL (SELECT t.id) x`
+      answers `0A000 a LATERAL subquery requires a FROM clause`; PostgreSQL
+      evaluates it per outer row.
+- [ ] **`GROUP BY` does not honour a primary key's functional dependency.**
+      `SELECT id, n FROM t GROUP BY id` is legal in PostgreSQL when `id` is the
+      primary key (every other column is functionally dependent on it); we raise
+      `42803`. Erring toward the error is the safe direction, but it rejects
+      valid SQL.
+- [ ] **`substring(x similar p escape e)`** does not parse (`42601`). The
+      `SIMILAR TO` regex engine that landed in this sweep
+      (`scalar.similar_to_regex`) is what it would be built on -- the SQL
+      spec's `#"` / `"#` capture markers are the missing half.
+- [ ] **`overlaps(a, b, c, d)` as a FUNCTION call** does not parse; only the
+      `(a, b) OVERLAPS (c, d)` operator spelling works. PostgreSQL accepts both.
+- [ ] **`power(numeric, numeric)` returns one digit too many.**
+      `power(2, 0.5)` gives `1.4142135623730951` where PostgreSQL gives
+      `1.414213562373095` -- we finish in a float, PostgreSQL in numeric at
+      `select_div_scale`'s scale. Same root cause class as the statistical
+      aggregates that `typemap.numeric_stat` already fixed.
+- [ ] **`ARRAY[1,2,3][2]` is accepted; PostgreSQL rejects it** (`42601 syntax
+      error at or near "["` -- an array constructor must be parenthesised
+      before it can be subscripted). Lenient in the harmless direction.
+- [ ] **The 42883 message's argument types are approximate.** The new
+      unknown-function error names types from the RUNTIME values, so
+      `nonexistent_fn('a', 1.5)` says `(text, text)` where PostgreSQL says
+      `(unknown, numeric)`. The SQLSTATE and the function name are right, which
+      is what a client keys on.
+
+**Two differences that are NOT bugs, recorded so the next sweep does not
+re-open them.** (a) `initcap('ECOLE')` with an accented E: this box's
+PostgreSQL runs `lc_ctype=C`, which treats a non-ASCII letter as a word
+SEPARATOR and answers `ECole`; our Unicode-aware answer matches a UTF-8-locale
+PostgreSQL. Check `SHOW lc_ctype` before calling a case-mapping difference a
+bug. (b) `GROUP BY GROUPING SETS ((b), ())` ordered by `b NULLS LAST` puts two
+rows with a NULL `b` in an unspecified order; the sweep's apparent divergence
+was a tie, not a difference.
+
+
 ### 2026-09-01: all four were in the RUST server too, and nothing covered it
 
 - [x] **The Rust storage layer had every one of the four defects below**, found
