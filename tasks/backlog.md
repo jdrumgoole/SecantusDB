@@ -1904,6 +1904,34 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+### 2026-09-03: the RUST pgserver on the same functions — grepped, not assumed
+
+CLAUDE.md's standing rule is to grep `crates/` for the same helper whenever a
+fix lands on the Python side, because nothing else will tell you. Done for
+sweeps eight and nine; the Rust pgserver's scalar surface is much smaller, so
+most of what was fixed has no counterpart there at all (no window functions,
+no `quote_ident`, no `trim_scale` / `min_scale`, no `LOCALTIME`). Where there
+IS a counterpart the results were not uniform, which is the point of looking:
+
+- [ ] **`concat` / `concat_ws` render a boolean as `true`** in
+      `crates/secantus-pgplan/src/scalar.rs`'s `text()` — the SAME bug fixed on
+      the Python side, where Postgres renders `t` through the type's output
+      function. One-line fix in `text()`, but note `text()` is shared, so check
+      each caller wants the output-function spelling before changing it.
+- [ ] **`split_part` REJECTS a negative field position** ("field position must
+      be greater than zero"). Postgres 14+ counts from the end, and the Python
+      server has done so for a while — so this is a *different* defect from the
+      one sweep nine fixed there, not the same one. Its empty-delimiter
+      behaviour also differs from both (Rust's `split("")` yields boundary
+      empties rather than the whole string).
+- **`initcap` was already CORRECT in Rust** (it uses `is_alphanumeric`, which is
+      Postgres' word rule) while Python's used `str.title()` and broke words at
+      digits. Worth recording because it is the reverse of the usual direction:
+      the assumption that Python leads and Rust lags is not safe either way.
+
+None of this is fixed here — the session's remit was the Python server — but it
+is measured rather than guessed, and each line names the file to change.
+
 ### 2026-09-03 SQL sweep nine: windows and RETURNING — what is still open
 
 Window functions, DML/`RETURNING` and CTEs probed against PostgreSQL 14.13
