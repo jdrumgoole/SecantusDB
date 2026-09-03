@@ -675,17 +675,45 @@ def _int_result(value: Any, *operands: Any) -> Any:
             return math.inf if value > 0 else -math.inf
 
 
+#: decimal128 arithmetic: 34 digits, and `Inf + -Inf` yields NaN rather than
+#: raising. Python's DEFAULT context is 28 digits and traps `InvalidOperation`,
+#: so a fold that used it silently lost six of decimal128's digits AND turned
+#: `{$add: [Decimal128("-Infinity"), Decimal128("Infinity")]}` into an
+#: `internal server error` reachable from any client (probed 8.2.11,
+#: 2026-09-03; mongod answers NaN).
+_DEC128_ARITH_CTX = _decimal.Context(prec=34, traps=[])
+
+
+def _decimal_arith_operand(v: Any) -> Decimal:
+    """One arithmetic operand as a `Decimal`.
+
+    A double is taken at 15 SIGNIFICANT digits, which is mongod's
+    double→decimal conversion for arithmetic: `{$add: [Decimal128("2.5"), 2.0]}`
+    is `4.50000000000000`, the double's precision entering the quantum.
+    `Decimal(2.0)` gives a bare `2` and answered `4.5`.
+    """
+    if isinstance(v, Decimal128):
+        return v.to_decimal()
+    if isinstance(v, float):
+        if math.isnan(v):
+            return Decimal("NaN")
+        if math.isinf(v):
+            return Decimal("Infinity" if v > 0 else "-Infinity")
+        return Decimal(f"{v:.14e}")
+    return Decimal(v)
+
+
 def _fold_numeric(values: list[Any], *, mul: bool) -> Any:
     """Sum or product over validated numeric operands. Mixing in a
     Decimal128 promotes the whole fold to decimal, like mongod's
-    type-widening; ``Decimal(float)`` keeps the exact binary expansion
-    mongod's double→decimal conversion produces."""
+    type-widening."""
     if any(isinstance(v, Decimal128) for v in values):
-        acc = Decimal(1 if mul else 0)
-        for v in values:
-            d = v.to_decimal() if isinstance(v, Decimal128) else Decimal(v)
-            acc = acc * d if mul else acc + d
-        return Decimal128(acc)
+        with _decimal.localcontext(_DEC128_ARITH_CTX):
+            acc = Decimal(1 if mul else 0)
+            for v in values:
+                d = _decimal_arith_operand(v)
+                acc = acc * d if mul else acc + d
+            return Decimal128(acc)
     acc2: Any = 1 if mul else 0
     for v in values:
         acc2 = acc2 * v if mul else acc2 + v
@@ -1152,7 +1180,11 @@ def _op_to_upper(arg: Any, ctx: _Ctx) -> Any:
 #: nine of them raised a `TypeError` outright because `math` rejects a
 #: `Decimal128`. Both were visible to a caller: `{$sqrt: Decimal128("2.5")}`
 #: answered `internal server error`.
-_DEC128_CTX = _decimal.Context(prec=34)
+#: `traps=[]` deliberately: a trapped `InvalidOperation` escapes the evaluator
+#: and reaches the client as `internal server error`, which is what
+#: `$trunc` / `$round` / `$add` of a decimal infinity each did. decimal128's
+#: own answer for those is a value (NaN or the infinity), never an exception.
+_DEC128_CTX = _decimal.Context(prec=34, traps=[])
 
 
 #: pi to more digits than decimal128 carries, so the conversion below rounds
@@ -1301,6 +1333,10 @@ def _op_round(arg: Any, ctx: _Ctx) -> Any:
     if place is None:
         return None
     if _has_decimal(n):
+        # A non-finite decimal passes straight through -- `quantize` refuses it
+        # by IEEE rule, which reached the client as an internal error.
+        if not n.to_decimal().is_finite():
+            return n
         # Half-to-even, which is what `round` does for floats and what mongod
         # documents for `$round`.
         return _decimal_result(
@@ -1312,6 +1348,16 @@ def _op_round(arg: Any, ctx: _Ctx) -> Any:
     return _int_result(round(n, place), n)
 
 
+def _decimal_is_infinite(v: Any) -> bool:
+    """`$ceil` / `$floor` of a decimal INFINITY is NaN on mongod.
+
+    An asymmetry, measured rather than reasoned: `$trunc` and `$round` pass it
+    through, and a DOUBLE infinity passes through `$ceil` unchanged. Probed
+    8.2.11 (2026-09-03).
+    """
+    return isinstance(v, Decimal128) and v.to_decimal().is_infinite()
+
+
 def _op_floor(arg: Any, ctx: _Ctx) -> Any:
     import math
 
@@ -1320,11 +1366,16 @@ def _op_floor(arg: Any, ctx: _Ctx) -> Any:
         return None
     _require_math_numeric(v, "$floor")
     if _has_decimal(v):
+        if _decimal_is_infinite(v):
+            return Decimal128("NaN")
         return _decimal_result(lambda d: d.to_integral_value(rounding=_decimal.ROUND_FLOOR), v)
     # These operators are type-preserving in mongod: a double in is a double
     # out (`$floor` of 1.5 is 2.0, not 2), an int stays an int. Python's
     # `math.floor` returns an int for either, which changed the BSON type of
     # every double that reached it. Probed 8.2.11.
+    # A non-finite DOUBLE passes through, as in `$ceil` below.
+    if isinstance(v, float) and not math.isfinite(v):
+        return v
     return float(math.floor(v)) if isinstance(v, float) else _int_result(math.floor(v), v)
 
 
@@ -1336,7 +1387,14 @@ def _op_ceil(arg: Any, ctx: _Ctx) -> Any:
         return None
     _require_math_numeric(v, "$ceil")
     if _has_decimal(v):
+        if _decimal_is_infinite(v):
+            return Decimal128("NaN")
         return _decimal_result(lambda d: d.to_integral_value(rounding=_decimal.ROUND_CEILING), v)
+    # A non-finite DOUBLE passes through: `math.ceil(inf)` raises
+    # `OverflowError`, which reached the client as `internal server error`
+    # where mongod answers `inf` (probed 8.2.11, 2026-09-03).
+    if isinstance(v, float) and not math.isfinite(v):
+        return v
     # Type-preserving, as `$floor` above.
     return float(math.ceil(v)) if isinstance(v, float) else _int_result(math.ceil(v), v)
 
@@ -1755,11 +1813,20 @@ def _op_trunc(arg: Any, ctx: _Ctx) -> Any:
     if place is None:
         return None
     if _has_decimal(n):
+        # A non-finite decimal passes straight through, as in `$round`.
+        if not n.to_decimal().is_finite():
+            return n
         # `quantize` at the requested place, truncating toward zero.
         return _decimal_result(
             lambda d: d.quantize(_decimal.Decimal(1).scaleb(-place), rounding=_decimal.ROUND_DOWN),
             n,
         )
+    # A non-finite DOUBLE passes through: `math.trunc` raises `OverflowError`
+    # on an infinity and `ValueError` on NaN, both of which reached the client
+    # as `internal server error` where mongod answers the value (probed 8.2.11,
+    # 2026-09-03). `$ceil` / `$floor` / `$round` all had the same shape.
+    if isinstance(n, float) and not math.isfinite(n):
+        return n
     factor = 10**place
     # Type-preserving, as `$floor` / `$ceil`: dividing by `factor` made every
     # int result a double (`$trunc` of 1 answered 1.0). Probed 8.2.11.

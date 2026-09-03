@@ -1126,7 +1126,44 @@ fn fold_arith(vals: &[Bson], mul: bool) -> R {
         }
         return Ok(Bson::Double(acc));
     }
+    // A Decimal128 among the operands makes the whole fold decimal, at
+    // decimal128 precision throughout. `decimal::add` / `mul` are the same
+    // primitives `$sum` / `$avg` already accumulate with -- they were simply
+    // never wired into the expression path, so `{$add: [Decimal128("2.5"), 1]}`
+    // deferred while `{$sum: ...}` over the same values did not.
+    if vals.iter().any(|v| matches!(v, Bson::Decimal128(_))) {
+        let mut acc = decimal_fold_seed(mul)?;
+        for v in vals {
+            let d = decimal_operand(v)?;
+            acc = if mul {
+                crate::decimal::mul(&acc, &d)
+            } else {
+                crate::decimal::add(&acc, &d)
+            }
+            .ok_or(Fallback::Defer)?;
+        }
+        return crate::decimal::to_bson(&acc).ok_or(Fallback::Defer);
+    }
     Err(Fallback::Defer)
+}
+
+/// The identity element for a decimal fold: `0` for `$add`, `1` for
+/// `$multiply`.
+fn decimal_fold_seed(mul: bool) -> Result<crate::decimal::Dec, Fallback> {
+    crate::decimal::parse(if mul { "1" } else { "0" }).ok_or(Fallback::Defer)
+}
+
+/// One arithmetic operand as a `Dec`.
+///
+/// `from_bson`, NOT `from_bson_accumulator`: mongod has TWO double->decimal
+/// conversions and they differ in the QUANTUM. Arithmetic takes the double at
+/// 15 significant digits, so `{$add: [Decimal128("2.5"), 2.0]}` is
+/// `4.50000000000000` -- the double's precision enters the result. The
+/// accumulator conversion strips to the short form and would answer `4.5`
+/// (probed 8.2.11, 2026-09-03; the first version of this used the accumulator
+/// one because `$sum` does, which is the wrong reason to pick a conversion).
+fn decimal_operand(v: &Bson) -> Result<crate::decimal::Dec, Fallback> {
+    crate::decimal::from_bson(v).ok_or(Fallback::Defer)
 }
 
 /// Whether a value is one of mongod's numeric types for arithmetic.
@@ -1234,7 +1271,15 @@ fn op_subtract(arg: &Bson, ctx: &Ctx) -> R {
     if let (Some(a), Some(b)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) {
         return Ok(Bson::Double(a - b));
     }
-    Err(Fallback::Defer) // datetime/Decimal128 subtraction -> Python
+    // `a - b` is `a + (-b)`, which is mongod's own identity and needs no
+    // separate subtraction routine.
+    if vals.iter().any(|v| matches!(v, Bson::Decimal128(_))) {
+        let a = decimal_operand(&vals[0])?;
+        let b = crate::decimal::neg(&decimal_operand(&vals[1])?);
+        let sum = crate::decimal::add(&a, &b).ok_or(Fallback::Defer)?;
+        return crate::decimal::to_bson(&sum).ok_or(Fallback::Defer);
+    }
+    Err(Fallback::Defer) // datetime subtraction -> Python
 }
 
 fn op_divide(arg: &Bson, ctx: &Ctx) -> R {
@@ -5065,6 +5110,16 @@ fn math_float_named(v: &Bson, op: &str, code: i32) -> Result<f64, Fallback> {
 /// The `$log` / `$pow` type guards, which do NOT use the shared "only supports
 /// numeric types" wording -- each names the argument position instead, with its
 /// own code. Probed 8.2.11.
+/// `math_operand_named`, but a Decimal128 yields its f64 value instead of
+/// deferring -- enough to run mongod's DOMAIN checks, which are exact whatever
+/// the operand's type. The caller defers the computation separately.
+fn math_operand_domain(v: &Bson, message: &str, code: i32) -> Result<f64, Fallback> {
+    if matches!(v, Bson::Decimal128(_)) {
+        return decimal_as_f64(v).ok_or(Fallback::Defer);
+    }
+    math_operand_named(v, message, code)
+}
+
 fn math_operand_named(v: &Bson, message: &str, code: i32) -> Result<f64, Fallback> {
     if matches!(v, Bson::Decimal128(_)) {
         return Err(Fallback::Defer);
@@ -5122,8 +5177,41 @@ fn op_floor_ceil(arg: &Bson, ctx: &Ctx, ceil: bool) -> R {
         // Type-preserving: a double in is a double out (`$ceil` of 1.5 is
         // 2.0, not 2), an int stays an int. Probed 8.2.11.
         Bson::Double(d) => Ok(Bson::Double(if ceil { d.ceil() } else { d.floor() })),
+        // `$ceil` / `$floor` of a decimal INFINITY is NaN on mongod -- not the
+        // infinity `$trunc` / `$round` pass through, and not the `inf` a
+        // DOUBLE infinity gives these same two operators. An asymmetry, and
+        // measured rather than reasoned (probed 8.2.11, 2026-09-03).
+        Bson::Decimal128(d) if is_decimal_infinite(&Bson::Decimal128(d)) => Ok(Bson::Decimal128(
+            "NaN".parse().map_err(|_| Fallback::Defer)?,
+        )),
+        // A decimal rounds to an INTEGER quantum, so `{$ceil:
+        // Decimal128("2.00")}` is `2` and not `2.00` (probed 8.2.11).
+        v @ Bson::Decimal128(_) => decimal_rounded(
+            &v,
+            0,
+            if ceil {
+                crate::decimal::RoundMode::Ceil
+            } else {
+                crate::decimal::RoundMode::Floor
+            },
+        ),
         _ => Err(Fallback::Defer),
     }
+}
+
+/// Whether a Decimal128 is +/-Infinity.
+fn is_decimal_infinite(v: &Bson) -> bool {
+    matches!(
+        crate::decimal::from_bson(v),
+        Some(crate::decimal::Dec::Inf(_))
+    )
+}
+
+/// Round a Decimal128 to `target_exp` and hand back BSON.
+fn decimal_rounded(v: &Bson, target_exp: i32, mode: crate::decimal::RoundMode) -> R {
+    let d = crate::decimal::from_bson(v).ok_or(Fallback::Defer)?;
+    let rounded = crate::decimal::round_to_exp(&d, target_exp, mode).ok_or(Fallback::Defer)?;
+    crate::decimal::to_bson(&rounded).ok_or(Fallback::Defer)
 }
 
 /// Render a number the way these domain-error messages carry it, which is
@@ -5234,8 +5322,13 @@ fn op_log(arg: &Bson, ctx: &Ctx) -> R {
     if is_null(&vals[0]) || is_null(&vals[1]) {
         return Ok(Bson::Null);
     }
-    let n = math_operand_named(&vals[0], "$log's argument must be numeric, not ", 28756)?;
-    let base = math_operand_named(&vals[1], "$log's base must be numeric, not ", 28757)?;
+    // The four checks run in this order on mongod: argument TYPE (28756), base
+    // TYPE (28757), argument DOMAIN (28758), base DOMAIN (28759) -- probed
+    // 8.2.11 (2026-09-03). The domain checks must therefore see a Decimal128
+    // rather than deferring on it, or `{$log: [Decimal128("2.5"), 1]}` reports
+    // the operator unsupported where mongod names the bad base.
+    let n = math_operand_domain(&vals[0], "$log's argument must be numeric, not ", 28756)?;
+    let base = math_operand_domain(&vals[1], "$log's base must be numeric, not ", 28757)?;
     // Out-of-domain args, named rather than deferred (NaN passes through).
     if n <= 0.0 {
         return Err(Fallback::mongo(
@@ -5254,6 +5347,11 @@ fn op_log(arg: &Bson, ctx: &Ctx) -> R {
                 py_num_str(&vals[1])
             ),
         ));
+    }
+    // Only now: a decimal operand needs decimal logarithms, which this engine
+    // does not have. The ERRORS above are exact either way.
+    if vals.iter().any(|v| matches!(v, Bson::Decimal128(_))) {
+        return Err(Fallback::Defer);
     }
     // CPython's math.log(n, base) is log(n)/log(base); same operations -> same
     // result under the shared platform libm.
@@ -5423,7 +5521,10 @@ fn op_round(arg: &Bson, ctx: &Ctx) -> R {
             let factor = 10f64.powi(place);
             Ok(Bson::Double((d * factor).round_ties_even() / factor))
         }
-        _ => Err(Fallback::Defer), // Decimal128 / non-numeric -> Python
+        // The RESULT keeps the requested place as its quantum: `2.567` at
+        // place 2 is `2.57`, and `25` at place -1 is `2E+1`.
+        v @ Bson::Decimal128(_) => decimal_rounded(&v, -place, crate::decimal::RoundMode::HalfEven),
+        _ => Err(Fallback::Defer),
     }
 }
 
@@ -5439,6 +5540,9 @@ fn op_trunc(arg: &Bson, ctx: &Ctx) -> R {
     };
     match n {
         Bson::Null => Ok(Bson::Null),
+        // Toward ZERO at the requested place, keeping it as the quantum:
+        // `2.567` at place 2 is `2.56`, not the `2.57` `$round` gives.
+        Bson::Decimal128(_) => decimal_rounded(&n, -place, crate::decimal::RoundMode::Trunc),
         _ => {
             let nf = math_float(&n)?; // bool / non-numeric -> Python (51081)
             let factor = 10f64.powi(place);

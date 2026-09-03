@@ -69,6 +69,21 @@ impl Dec {
     }
 }
 
+/// `-a`, preserving the coefficient and exponent (and so the quantum).
+///
+/// `$subtract` is `add` with the right operand negated -- mongod's own
+/// identity, and the reason this needs no separate subtraction routine.
+pub fn neg(a: &Dec) -> Dec {
+    match a {
+        Dec::Fin { sign, coeff, exp } => Dec::Fin {
+            sign: -sign,
+            coeff: coeff.clone(),
+            exp: *exp,
+        },
+        other => other.clone(),
+    }
+}
+
 /// Parse a decimal string, preserving trailing zeros and the exponent (and so
 /// the quantum). Accepts the forms `Decimal128`'s `Display` emits plus plain
 /// integers, `NaN`, and `Infinity`.
@@ -287,6 +302,83 @@ fn scale_to(coeff: &[u8], exp: i32, target: i32) -> Vec<u8> {
     out.extend_from_slice(coeff);
     out.extend(std::iter::repeat_n(0u8, pad));
     out
+}
+
+/// Which way a value that falls between two representable ones is moved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RoundMode {
+    /// Toward +infinity (`$ceil`).
+    Ceil,
+    /// Toward -infinity (`$floor`).
+    Floor,
+    /// Toward zero (`$trunc`).
+    Trunc,
+    /// Nearest, ties to even (`$round`). 2.5 -> 2 and 3.5 -> 4.
+    HalfEven,
+}
+
+/// Round `d` so its exponent is at least `target_exp`, in `mode`.
+///
+/// The RESULT keeps `target_exp` as its quantum, which is what makes
+/// `{$round: [Decimal128("2.567"), 2]}` answer `2.57` rather than `2.5700…`
+/// and `{$round: [Decimal128("25"), -1]}` answer `2E+1`. A value already
+/// coarser than the target is returned unchanged -- `{$ceil:
+/// Decimal128("2.00")}` is `2`, not `2.00`, because ceil targets exponent 0
+/// and 2.00 rounds up into it. Probed 8.2.11 (2026-09-03).
+pub fn round_to_exp(d: &Dec, target_exp: i32, mode: RoundMode) -> Option<Dec> {
+    let Dec::Fin { sign, coeff, exp } = d else {
+        // NaN and the infinities pass through every rounding operator.
+        return Some(d.clone());
+    };
+    if *exp >= target_exp {
+        // Already at or COARSER than the target: nothing to drop, but the
+        // result still carries the requested quantum, so pad it out.
+        // `{$round: [Decimal128("2.5"), 2]}` is `2.50`, not `2.5` -- the place
+        // sets the quantum whether or not it changed the value (probed 8.2.11,
+        // 2026-09-03; returning it unchanged was wrong on 40 of 210 shapes).
+        return finish(*sign, scale_to(coeff, *exp, target_exp), target_exp);
+    }
+    let drop = (target_exp - *exp) as usize;
+    let keep = coeff.len().saturating_sub(drop);
+    let dropped_nonzero = coeff[keep.min(coeff.len())..].iter().any(|x| *x != 0);
+    let mut kept: Vec<u8> = coeff[..keep].to_vec();
+    if kept.is_empty() {
+        kept.push(0);
+    }
+    // The digit that decides the rounding sits at index `len - drop`. When
+    // `drop` EXCEEDS the coefficient's length that position is a leading
+    // implicit zero, not `coeff[0]` -- the whole value lies below the target
+    // place. Reading `coeff[0]` there rounded `9.995` to the nearest thousand
+    // as `1E+3` where mongod answers `0E+3`.
+    let deciding = if drop < coeff.len() {
+        coeff[keep]
+    } else if drop == coeff.len() {
+        coeff[0]
+    } else {
+        0
+    };
+    let after_deciding_nonzero = if drop <= coeff.len() {
+        coeff[(keep + 1).min(coeff.len())..].iter().any(|x| *x != 0)
+    } else {
+        // Everything the coefficient holds sits strictly below the deciding
+        // position.
+        coeff.iter().any(|x| *x != 0)
+    };
+    let round_away = match mode {
+        RoundMode::Trunc => false,
+        // Ceil moves away from zero only for a POSITIVE value, floor only for
+        // a negative one -- they are directional, not magnitude-based.
+        RoundMode::Ceil => dropped_nonzero && *sign > 0,
+        RoundMode::Floor => dropped_nonzero && *sign < 0,
+        RoundMode::HalfEven => {
+            let last_odd = kept.last().is_some_and(|x| x % 2 == 1);
+            deciding > 5 || (deciding == 5 && (after_deciding_nonzero || last_odd))
+        }
+    };
+    if round_away {
+        kept = add_mag(&kept, &[1]);
+    }
+    finish(*sign, kept, target_exp)
 }
 
 // ---------------------------------------------------------------------------
