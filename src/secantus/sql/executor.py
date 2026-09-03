@@ -1177,6 +1177,8 @@ def _returning_result(
     table: Any = None,
     storage: Any = None,
     db: str | None = None,
+    catalog: Any = None,
+    session: Any = None,
 ) -> SQLResult:
     """Shape a write statement's ``RETURNING`` rows the same way a SELECT does —
     so the wire layer emits a RowDescription + DataRows ahead of CommandComplete.
@@ -1189,7 +1191,11 @@ def _returning_result(
     if any(expr is not None for _, _, expr in returning):
         from secantus.sql import scalar
 
-        ctx = scalar.ScalarContext(storage=storage, catalog=None, db=db, session=None)
+        # The catalog and session were hardcoded to None, so a RETURNING item
+        # containing a SUBQUERY -- `INSERT ... RETURNING id, (SELECT count(*)
+        # FROM t)` -- reached `_lookup_table_def` with no catalog and raised
+        # AttributeError, which the wire reported as `XX000 internal error`.
+        ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
 
     def cell(doc: dict[str, Any], col: Any, expr: Any) -> Any:
         if expr is None:
@@ -1291,6 +1297,8 @@ def execute_insert(
             plan.table,
             storage,
             db,
+            catalog,
+            session,
         )
     return SQLResult(command_tag=f"INSERT 0 {inserted}", rowcount=inserted)
 
@@ -1813,7 +1821,7 @@ def _execute_insert_on_conflict(
     tag = f"INSERT 0 {affected}"
     if plan.returning is not None:
         return _returning_result(
-            result_docs, plan.returning, tag, affected, plan.table, storage, db
+            result_docs, plan.returning, tag, affected, plan.table, storage, db, catalog, session
         )
     return SQLResult(command_tag=tag, rowcount=affected)
 
@@ -2688,7 +2696,15 @@ def execute_update(
     if plan.returning is not None:
         post = storage.find_matching(db, coll, {"_id": {"$in": ids}}) if ids else []
         return _returning_result(
-            post, plan.returning, f"UPDATE {matched}", matched, plan.table, storage, db
+            post,
+            plan.returning,
+            f"UPDATE {matched}",
+            matched,
+            plan.table,
+            storage,
+            db,
+            catalog,
+            session,
         )
     return SQLResult(command_tag=f"UPDATE {matched}", rowcount=matched)
 
@@ -2840,7 +2856,9 @@ def _execute_update_materialized_body(
 
     n = len(matched)
     if plan.returning is not None:
-        return _returning_result(posts, plan.returning, f"UPDATE {n}", n, table, storage, db)
+        return _returning_result(
+            posts, plan.returning, f"UPDATE {n}", n, table, storage, db, catalog, session
+        )
     return SQLResult(command_tag=f"UPDATE {n}", rowcount=n)
 
 
@@ -3140,5 +3158,7 @@ def execute_delete(
         _enforce_fk_on_parent_delete(victims, plan.table, storage, db, catalog)
     n = storage.delete_matching(db, coll, plan.filter)
     if plan.returning is not None:
-        return _returning_result(victims, plan.returning, f"DELETE {n}", n, plan.table, storage, db)
+        return _returning_result(
+            victims, plan.returning, f"DELETE {n}", n, plan.table, storage, db, catalog, session
+        )
     return SQLResult(command_tag=f"DELETE {n}", rowcount=n)

@@ -121,13 +121,15 @@ class TestWindowAggregates:
         assert _texts(db(f"SELECT {agg}(n) OVER (ORDER BY i) FROM o ORDER BY i")) == want
 
     def test_avg_over_numeric(self, db):
-        # The SCALE still differs from PG (see `tasks/backlog.md`); the values do
-        # not, and this used to raise rather than answer at all.
+        # The scale now matches PG too: a window `avg` over an EXACT input
+        # finishes in numeric at `select_div_scale`'s scale, where it used to
+        # divide as a float and render the quotient's own scale.
+        # (Measured against PostgreSQL 14.13.)
         assert _texts(db("SELECT avg(n) OVER (ORDER BY i) FROM o ORDER BY i")) == [
-            "2.5",
-            "1.75",
-            "1.50",
-            "1.50",
+            "2.5000000000000000",
+            "1.7500000000000000",
+            "1.5000000000000000",
+            "1.5000000000000000",
         ]
 
     def test_sum_over_interval(self, db):

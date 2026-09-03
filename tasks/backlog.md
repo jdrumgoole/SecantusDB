@@ -1904,6 +1904,35 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+### 2026-09-03 SQL sweep nine: windows and RETURNING — what is still open
+
+Window functions, DML/`RETURNING` and CTEs probed against PostgreSQL 14.13
+(`tests/test_sql_sweep_nine.py` pins the fixes; `changelog.d/sql-sweep-nine.md`
+lists them). **CTEs came back clean — 23 of 23**, including `RECURSIVE`,
+`MATERIALIZED` / `NOT MATERIALIZED`, a data-modifying CTE and a self-join over
+one; that surface needs no work. What is still open:
+
+- [ ] **A subquery in `RETURNING` sees the row the statement just wrote.**
+      `INSERT INTO t VALUES (...) RETURNING id, (SELECT count(*) FROM t)`
+      counts the new row; Postgres evaluates the subquery against the
+      *command's* snapshot, which does not include it. (Before this sweep the
+      whole shape crashed with `XX000`, so this is a narrowing, not a
+      regression.) Fixing it needs the pre-write snapshot to still be readable
+      at RETURNING time, which the executor does not currently keep.
+- [ ] **`UPDATE ... RETURNING ... ORDER BY` is accepted.** Postgres has no
+      `ORDER BY` on a data-modifying statement's `RETURNING` and raises `42601`;
+      we sort and return. Lenient in the harmless direction, but it lets through
+      SQL no other server takes.
+- [ ] **`UPDATE ... SET (a, b) = (SELECT x, y ...)`** — the row-SUBQUERY form.
+      The row-constructor forms landed in this sweep; the subquery one cannot
+      use the same expansion (each column would re-run the query) and still
+      answers `0A000`.
+- [ ] **An in-call `ORDER BY` inside a window aggregate is dropped.**
+      `array_agg(v ORDER BY x) OVER (...)` aggregates in frame order rather than
+      the requested one. The argument is unwrapped from its `exp.Order` and the
+      sort keys discarded — the same shape the GROUP BY path handles through
+      `_sorted_agg_push`, not yet wired into `window.py`.
+
 ### 2026-09-03 SQL sweep eight: what it found and did NOT fix
 
 263 statements against PostgreSQL 14.13, both sides driven by the same

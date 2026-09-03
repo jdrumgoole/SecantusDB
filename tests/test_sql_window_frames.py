@@ -49,7 +49,9 @@ def test_ntile_two_buckets(storage, session):
     # 5 rows / 2 buckets: the first bucket gets the extra row (3 + 2).
     res = q(storage, session, "SELECT id, NTILE(2) OVER (ORDER BY id) AS nt FROM t ORDER BY id")
     assert res.rows == [(1, 1), (2, 1), (3, 1), (4, 2), (5, 2)]
-    assert res.columns[1].type_tag == "int8"
+    # `ntile` is the one integer window function Postgres types as int4, not
+    # bigint (`pg_typeof(ntile(2) OVER ...)` is `integer`, measured 14.13).
+    assert res.columns[1].type_tag == "int4"
 
 
 def test_ntile_per_partition(storage, session):
