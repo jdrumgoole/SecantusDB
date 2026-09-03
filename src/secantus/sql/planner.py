@@ -14104,6 +14104,69 @@ _INTERVAL_LITERAL_RE = re.compile(
 )
 
 
+#: ``FORCE_QUOTE`` / ``FORCE_NULL`` / ``FORCE_NOT_NULL`` inside a COPY option
+#: list, each taking a parenthesised column list (``FORCE_QUOTE`` also takes
+#: ``*``). sqlglot cannot parse ANY of them — it raises `Expecting )` on the
+#: whole statement, so this is not a "sqlglot mangles it" workaround like
+#: `_interval_literals_to_casts` but a "sqlglot refuses it" one.
+_COPY_FORCE_RE = re.compile(
+    r",?\s*\b(FORCE_QUOTE|FORCE_NOT_NULL|FORCE_NULL)\b\s*(\*|\(([^)]*)\))",
+    re.IGNORECASE,
+)
+
+
+#: A single-quoted SQL string literal, with '' doubling. The FORCE_* rewrite
+#: must never reach inside one.
+_SQL_STRING_LITERAL_RE = re.compile(r"'(?:[^']|'')*'")
+
+#: The rewrite applies ONLY to a statement that starts with COPY.
+_COPY_STATEMENT_RE = re.compile(r"\s*COPY\b", re.IGNORECASE)
+
+
+def _extract_copy_force_options(sql: str) -> tuple[str, dict[str, object]]:
+    """Strip COPY's ``FORCE_*`` options out of `sql` so sqlglot can parse the
+    rest, returning them separately for the caller to stamp on the AST.
+
+    Returns ``(sql_without_them, {"FORCE_QUOTE": ["s"] | "*", ...})``.
+
+    Two guards, both of which a first version lacked and which turned this into
+    silent DATA CORRUPTION: the rewrite applies only to a statement that starts
+    with ``COPY``, and only OUTSIDE string literals. Without them,
+    ``SELECT 'force_quote (x)'`` parsed as ``SELECT ''`` and
+    ``INSERT INTO t VALUES ('force_not_null (s)')`` stored the empty string —
+    a text rewrite that runs before the parser sees every statement, so
+    anything it matches by accident is changed with no error anywhere.
+    """
+    if not _COPY_STATEMENT_RE.match(sql):
+        return sql, {}
+    found: dict[str, object] = {}
+
+    def take(m: re.Match) -> str:
+        key = m.group(1).upper()
+        if m.group(2) == "*":
+            found[key] = "*"
+        else:
+            cols = [c.strip().strip('"') for c in (m.group(3) or "").split(",")]
+            found[key] = [c for c in cols if c]
+        return ""
+
+    # Rewrite the gaps BETWEEN string literals; copy the literals verbatim.
+    pieces: list[str] = []
+    pos = 0
+    for m in _SQL_STRING_LITERAL_RE.finditer(sql):
+        pieces.append(_COPY_FORCE_RE.sub(take, sql[pos : m.start()]))
+        pieces.append(m.group(0))
+        pos = m.end()
+    pieces.append(_COPY_FORCE_RE.sub(take, sql[pos:]))
+    out = "".join(pieces)
+    if found:
+        # `(FORCE_QUOTE (s))` leaves an empty option list behind, and a leading
+        # comma is left when the stripped option was first: `(, FORMAT CSV)`.
+        out = re.sub(r"\(\s*,\s*", "(", out)
+        out = re.sub(r"\(\s*\)", "", out)
+    return out, found
+
+
 def _interval_literals_to_casts(sql: str) -> str:
     """Rewrite a COMPOUND ``INTERVAL 'literal'`` as ``CAST('literal' AS INTERVAL)``.
 
@@ -14524,6 +14587,11 @@ def _parse_uncached(sql: str) -> list[exp.Expression]:
     # sqlglot TRUNCATES a compound interval literal — see `_interval_literals_to_casts`.
     if "interval" in sql.lower():
         sql = _interval_literals_to_casts(sql)
+    # sqlglot REFUSES COPY's FORCE_* options (a hard ParseError on the whole
+    # statement), so lift them out and re-attach them to the AST below.
+    copy_force: dict[str, object] = {}
+    if "force_" in sql.lower():
+        sql, copy_force = _extract_copy_force_options(sql)
     try:
         try:
             stmts = [
@@ -14554,6 +14622,13 @@ def _parse_uncached(sql: str) -> list[exp.Expression]:
             # style differed.
             for raw in list(s.find_all(exp.RawString)):
                 raw.replace(exp.Literal.string(raw.this))
+        if copy_force:
+            # Re-attach what the pre-pass lifted out. Stored in `args` rather
+            # than as a plain attribute because `parse()` hands back
+            # `stmt.copy()` from its cache, and only `args` survives that.
+            for s in stmts:
+                if isinstance(s, exp.Copy):
+                    s.set("secantus_force", copy_force)
         return stmts
     except (sqlglot.errors.ParseError, sqlglot.errors.TokenError) as exc:
         raise errors.syntax_error(str(exc).splitlines()[0]) from exc

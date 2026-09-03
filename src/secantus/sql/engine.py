@@ -2184,6 +2184,75 @@ class CopyPlan:
     col_oids: list[int] = field(default_factory=list)
     # Raw (unrendered) query-form values, kept for binary COPY OUT.
     query_raw_rows: list | None = None
+    #: CSV ``FORCE_QUOTE`` (COPY TO): a per-column mask parallel to ``columns``.
+    force_quote: list[bool] = field(default_factory=list)
+    #: CSV ``FORCE_NULL`` / ``FORCE_NOT_NULL`` (COPY FROM): column-name sets.
+    force_null: set[str] = field(default_factory=set)
+    force_not_null: set[str] = field(default_factory=set)
+
+
+def _copy_force_options(
+    stmt: exp.Copy, fmt: str, to_stdout: bool, columns: list[str]
+) -> tuple[list[bool], set[str], set[str]]:
+    """Validate COPY's ``FORCE_*`` options and resolve them against `columns`.
+
+    They arrive via ``planner``'s pre-pass (sqlglot cannot parse them), stamped
+    on the statement as ``secantus_force``. Every rule and message here was
+    measured against PostgreSQL 14.13 — note each option is restricted to ONE
+    direction, and they disagree about which:
+
+    * ``FORCE_QUOTE`` is COPY TO only  -> `COPY force quote only available using COPY TO`
+    * ``FORCE_NULL`` / ``FORCE_NOT_NULL`` are COPY FROM only
+    * all three are CSV-only, and an unknown column is 42703.
+    """
+    forced = stmt.args.get("secantus_force") or {}
+    if not forced:
+        return [], set(), set()
+    known = list(columns or [])
+    lowered = {c.lower(): c for c in known}
+
+    def resolve(key: str, names: object) -> set[str]:
+        if fmt != "csv":
+            raise errors.feature_not_supported(
+                f"COPY {key.lower().replace('_', ' ')} available only in CSV mode"
+            )
+        if names == "*":
+            return set(known)
+        out = set()
+        for n in names or []:
+            col = lowered.get(str(n).lower())
+            if col is None:
+                raise errors.SQLError(
+                    "42703",
+                    f'column "{n}" of relation "{_copy_relation_name(stmt)}" does not exist',
+                )
+            out.add(col)
+        return out
+
+    fq, fn, fnn = set(), set(), set()
+    for key, names in forced.items():
+        if key == "FORCE_QUOTE":
+            if not to_stdout:
+                raise errors.feature_not_supported("COPY force quote only available using COPY TO")
+            fq = resolve(key, names)
+        elif key == "FORCE_NULL":
+            if to_stdout:
+                raise errors.feature_not_supported("COPY force null only available using COPY FROM")
+            fn = resolve(key, names)
+        elif key == "FORCE_NOT_NULL":
+            if to_stdout:
+                raise errors.feature_not_supported(
+                    "COPY force not null only available using COPY FROM"
+                )
+            fnn = resolve(key, names)
+    return [c in fq for c in known], fn, fnn
+
+
+def _copy_relation_name(stmt: exp.Copy) -> str:
+    this = stmt.this
+    if isinstance(this, exp.Schema):
+        this = this.this
+    return getattr(this, "name", "") or ""
 
 
 def copy_plan(
@@ -2216,6 +2285,7 @@ def copy_plan(
         columns, query_rows, raw_rows, tags, oids = _copy_query_rows(
             select, storage, db, catalog, session, render_text=(fmt != "binary")
         )
+        fq, fnull, fnotnull = _copy_force_options(stmt, fmt, True, columns)
         return CopyPlan(
             None,
             columns,
@@ -2226,6 +2296,9 @@ def copy_plan(
             header,
             escape=escape,
             quote=quote,
+            force_quote=fq,
+            force_null=fnull,
+            force_not_null=fnotnull,
             query_rows=query_rows,
             query_raw_rows=raw_rows,
             col_tags=tags,
@@ -2256,6 +2329,7 @@ def copy_plan(
             col_oids.append(114)  # plain json: binary form has no version byte
         else:
             col_oids.append(typemap.PG_OID.get(tag, 25))
+    fq, fnull, fnotnull = _copy_force_options(stmt, fmt, to_stdout, columns)
     return CopyPlan(
         table,
         columns,
@@ -2266,6 +2340,9 @@ def copy_plan(
         header,
         escape=escape,
         quote=quote,
+        force_quote=fq,
+        force_null=fnull,
+        force_not_null=fnotnull,
         col_tags=col_tags,
         col_oids=col_oids,
     )
@@ -2394,6 +2471,9 @@ def _copy_options(
             raise errors.SQLError("22023", "COPY escape must be a single one-byte character")
     if header and fmt != "csv":
         raise errors.feature_not_supported("COPY HEADER available only in CSV mode")
+    if fmt == "csv" and (delimiter or ",") == (quote or '"'):
+        # Accepting this produced output that cannot be parsed back.
+        raise errors.SQLError("22023", "COPY delimiter and quote must be different")
     return fmt, delimiter, null, header, escape, quote
 
 
@@ -2406,6 +2486,20 @@ def copy_insert(
 ) -> int:
     """Insert copy-stream rows (lists of string / None cells) into the target,
     coercing each cell to its column type; returns the number of rows inserted."""
+    if plan.force_null or plan.force_not_null:
+        # FORCE_NULL turns a QUOTED empty field into NULL; FORCE_NOT_NULL turns
+        # an UNQUOTED empty field (which CSV would otherwise read as NULL) into
+        # the empty string. The parser has already resolved quoting into
+        # `''` vs `None`, so the two rules are exactly those two swaps.
+        idx_null = [i for i, c in enumerate(plan.columns) if c in plan.force_null]
+        idx_not = [i for i, c in enumerate(plan.columns) if c in plan.force_not_null]
+        for cells in rows:
+            for i in idx_null:
+                if i < len(cells) and cells[i] == "":
+                    cells[i] = None
+            for i in idx_not:
+                if i < len(cells) and cells[i] is None:
+                    cells[i] = ""
     docs = []
     for cells in rows:
         if len(cells) != len(plan.columns):

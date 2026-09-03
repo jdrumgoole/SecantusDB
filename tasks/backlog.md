@@ -12533,3 +12533,27 @@ Three gaps remain:
    than the wrong oid. Fixing it means changing both together.
 3. **`EXPLAIN (FORMAT XML)` and `(FORMAT YAML)` are `0A000`.** A scope
    decision, not a defect; recorded so the next sweep does not re-find it.
+
+## COPY (2026-09-03) — swept, FORCE_* added, one deliberate difference
+
+44 scenarios against PostgreSQL 14.13: text and CSV both directions, HEADER,
+column lists, the query form, NULL markers, custom delimiters, QUOTE/ESCAPE,
+ENCODING, the binary round-trip, the `\.` terminator, missing trailing
+newline, empty input, row-count tags, and the whole error surface. All match.
+
+Added `FORCE_QUOTE` / `FORCE_NULL` / `FORCE_NOT_NULL` (see
+`tests/test_sql_sweep_fifteen.py`) and the `22023` delimiter-equals-quote
+check.
+
+**`COPY ... TO '/path'` stays `0A000`** — PostgreSQL writes a server-side file
+there (as a superuser). That is a deliberate scope decision, not a gap: an
+in-process test server should not write arbitrary paths on the host.
+
+**A note for the next sweep, because it nearly invalidated this one.** The
+first COPY probe reported 33/34 passing and was worthless: psycopg's copy API
+is on the CURSOR, and `conn.copy(...)` raised `AttributeError` identically on
+both servers, which a differential reads as agreement. Twenty of thirty-four
+scenarios were vacuous, hiding five real divergences. Any probe whose
+scenarios can fail CLIENT-side needs to report the exception type and count
+both-sides-non-database-error as vacuous, which
+`scratchpad`'s copy probe now does.

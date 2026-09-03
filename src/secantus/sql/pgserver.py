@@ -1029,7 +1029,11 @@ class SecantusPGServer:
                 )
             chunks += [
                 copyfmt.format_csv(
-                    [row], delimiter=plan.delimiter, null=plan.null, quote=plan.quote or '"'
+                    [row],
+                    delimiter=plan.delimiter,
+                    null=plan.null,
+                    quote=plan.quote or '"',
+                    force_quote=plan.force_quote,
                 )
                 for row in rows
             ]

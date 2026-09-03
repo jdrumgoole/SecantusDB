@@ -189,27 +189,45 @@ def format_csv(
     null: str = "",
     header: list[str] | None = None,
     quote: str = '"',
+    force_quote: list[bool] | None = None,
 ) -> str:
     """Render rows as COPY CSV format. A NULL cell writes ``null`` (unquoted);
     a non-NULL EMPTY string is force-quoted (``""``) so it stays distinct from
     NULL — csv.QUOTE_MINIMAL would write both bare, and PG's COPY CSV output
     quotes the empty string (pgtest copy corpus reads the bytes verbatim).
     Other values are quoted only when they need to be, including a value that
-    would collide with the ``null`` spelling."""
+    would collide with the ``null`` spelling.
 
-    def cell(v: str | None) -> str:
+    ``force_quote`` is a per-column mask (parallel to each row) from COPY's
+    ``FORCE_QUOTE`` option: those columns are quoted even when they need no
+    quoting. A NULL is NOT force-quoted — PostgreSQL still writes the bare null
+    marker there, which is what keeps NULL distinguishable from the empty
+    string under ``FORCE_QUOTE *`` (measured against 14.13). The HEADER line is
+    never force-quoted either."""
+
+    def cell(v: str | None, forced: bool = False) -> str:
         if v is None:
             return null
         s = str(v)
         if s == "":
             return quote * 2
-        if delimiter in s or quote in s or "\n" in s or "\r" in s or (null != "" and s == null):
+        if (
+            forced
+            or delimiter in s
+            or quote in s
+            or "\n" in s
+            or "\r" in s
+            or (null != "" and s == null)
+        ):
             return quote + s.replace(quote, quote * 2) + quote
         return s
+
+    def mask(i: int) -> bool:
+        return bool(force_quote) and i < len(force_quote) and force_quote[i]
 
     lines = []
     if header is not None:
         lines.append(delimiter.join(cell(h) for h in header))
     for row in rows:
-        lines.append(delimiter.join(cell(v) for v in row))
+        lines.append(delimiter.join(cell(v, mask(i)) for i, v in enumerate(row)))
     return "".join(line + "\n" for line in lines)
