@@ -152,6 +152,116 @@ def test_row_is_null(store, sess, sql, want):
     assert _rows(store, sql, sess) == [(want,)]
 
 
+# --------------------------------------------------------------------------- #
+# An aggregate's argument may be a function call
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def ag(store):
+    s = Session(database="t")
+    _rows(store, "CREATE TABLE ag13 (id int PRIMARY KEY, g text, s text, n int)", s)
+    _rows(store, "INSERT INTO ag13 VALUES (1,'a','x',10),(2,'a',NULL,20),(3,'b','y',5)", s)
+    return s
+
+
+@pytest.mark.parametrize(
+    ("sql", "want"),
+    [
+        # All of these answered `0A000 unsupported aggregate argument`: the
+        # lowerer handled columns, literals, comparisons, CASE and arithmetic,
+        # but no function calls at all.
+        ("SELECT sum(coalesce(n,0)) FROM ag13", 35),
+        ("SELECT sum(abs(n)) FROM ag13", 35),
+        ("SELECT max(coalesce(s,'-')) FROM ag13", "y"),
+        ("SELECT min(lower(g)) FROM ag13", "a"),
+        ("SELECT count(coalesce(s,'-')) FROM ag13", 3),
+        ("SELECT string_agg(coalesce(s,'-'), ',' ORDER BY id) FROM ag13", "x,-,y"),
+        ("SELECT string_agg(s || '!', ',' ORDER BY id) FROM ag13", "x!,y!"),
+    ],
+)
+def test_aggregate_over_a_function_call(store, ag, sql, want):
+    assert _rows(store, sql, ag)[0][0] == want
+
+
+@pytest.mark.parametrize(
+    ("sql", "want"),
+    [
+        # Postgres' scalar functions are STRICT — a NULL in is a NULL out.
+        # Mongo's are not: `$toUpper` maps null to '' and `$strLenCP` rejects it
+        # outright (which escaped as XX000), so each needs a guard.
+        ("SELECT array_agg(upper(s) ORDER BY id) FROM ag13", ["X", None, "Y"]),
+        ("SELECT array_agg(length(s) ORDER BY id) FROM ag13", [1, None, 1]),
+        ("SELECT array_agg(coalesce(s,'-') ORDER BY id) FROM ag13", ["x", "-", "y"]),
+    ],
+)
+def test_aggregate_function_argument_is_strict_on_null(store, ag, sql, want):
+    assert _rows(store, sql, ag)[0][0] == want
+
+
+def test_round_is_deliberately_not_lowered(store, ag):
+    # Mongo's `$round` rounds half-to-EVEN where Postgres rounds half away from
+    # zero, so lowering it would answer 4 for `sum(round(x))` over 1.5 and 2.5
+    # where PG says 5 — a silent wrong answer in place of an honest error.
+    with pytest.raises(errors.SQLError) as exc:
+        _rows(store, "SELECT sum(round(n / 4.0)) FROM ag13", ag)
+    assert exc.value.sqlstate == "0A000"
+
+
+def test_grouped_aggregate_over_a_function_call(store, ag):
+    rows = _rows(
+        store,
+        "SELECT g, string_agg(coalesce(s,'-'), ',' ORDER BY id) FROM ag13 GROUP BY g ORDER BY g",
+        ag,
+    )
+    assert rows == [("a", "x,-"), ("b", "y")]
+
+
+# --------------------------------------------------------------------------- #
+# NATURAL JOIN was a cross join
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def nat(store):
+    s = Session(database="t")
+    _rows(store, "CREATE TABLE j14 (id int PRIMARY KEY, g text, n int)", s)
+    _rows(store, "CREATE TABLE k14 (id int PRIMARY KEY, jid int, v int)", s)
+    _rows(store, "INSERT INTO j14 VALUES (1,'a',10),(2,'b',20),(3,'c',NULL)", s)
+    _rows(store, "INSERT INTO k14 VALUES (10,1,100),(11,1,200),(12,2,300)", s)
+    return s
+
+
+def test_natural_join_uses_the_common_column(store, nat):
+    # `id` is the only common column and no j14.id equals a k14.id, so the
+    # answer is empty. It used to be all 9 pairs — the condition was dropped.
+    assert _rows(store, "SELECT count(*) FROM j14 NATURAL JOIN k14", nat) == [(0,)]
+
+
+def test_natural_left_join(store, nat):
+    # This did not merely return the wrong rows — it errored outright with
+    # "LEFT JOIN requires an ON clause".
+    assert _rows(store, "SELECT count(*) FROM j14 NATURAL LEFT JOIN k14", nat) == [(3,)]
+
+
+def test_natural_join_that_does_match(store, nat):
+    rows = _rows(
+        store,
+        "SELECT j.id, k.v FROM j14 j NATURAL JOIN (SELECT jid AS id, v FROM k14) k ORDER BY k.v",
+        nat,
+    )
+    assert rows == [(1, 100), (1, 200), (2, 300)]
+
+
+def test_using_join_still_works(store, nat):
+    # NATURAL desugars to USING, so the existing path must stay intact.
+    assert _rows(store, "SELECT count(*) FROM j14 j JOIN k14 k USING (id)", nat) == [(0,)]
+
+
+def test_cross_join_is_unaffected(store, nat):
+    assert _rows(store, "SELECT count(*) FROM j14 CROSS JOIN k14", nat) == [(9,)]
+
+
 def test_scalar_is_null_is_unchanged(store, sess):
     assert _rows(store, "SELECT NULL IS NULL, NULL IS NOT NULL, 1 IS NOT NULL", sess) == [
         (True, False, True)

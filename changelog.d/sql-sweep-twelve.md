@@ -21,6 +21,13 @@ positive`), so the pipeline emits a match-nothing stage instead.
 `(1,2) < (1,NULL)` raised `42883` naming `integer[]`, the record having been
 compared as an array.
 
+**`NATURAL JOIN` was a cross join.** sqlglot records it as `args["method"]`
+with no `on` and no `using`, and nothing in join planning read it — so the join
+lost its condition entirely and returned every pair. This is precisely the bug
+`desugar_join_using` was written for one step later in the same chain, which is
+now where the fix lives: NATURAL resolves to the common columns, and that
+function turns them into the ON.
+
 #### Fixed
 
 - **`LIMIT 0` returns no rows**, on every path: the plain scan, the aggregation
@@ -34,6 +41,25 @@ compared as an array.
   right, the first pair that decides wins, and a NULL pair reached before then
   makes the whole comparison NULL. `(1,NULL) = (2,3)` is still false, because
   the *first* pair decided it.
+- **`NATURAL JOIN` / `NATURAL LEFT JOIN`** join on the relations' common
+  columns instead of returning every pair (`NATURAL LEFT JOIN` previously
+  errored outright with "LEFT JOIN requires an ON clause"). A NATURAL join with
+  no common column is a cross join in PostgreSQL too, so that case needs no
+  special handling.
+- **An aggregate's argument may be a function call.** `sum(abs(n))`,
+  `string_agg(coalesce(s,'-'), ',' ORDER BY id)` and `array_agg(upper(s))` all
+  answered `0A000 unsupported aggregate argument` — the lowerer handled columns,
+  literals, comparisons, `CASE` and arithmetic, but no function calls at all
+  (14 of 16 probed shapes failed on it). `upper`, `lower`, `abs`, `floor`,
+  `ceil`, `sqrt`, `length`, `coalesce` and `||` now lower to their Mongo
+  operators, each wrapped in a NULL guard because PostgreSQL's scalar functions
+  are *strict* and Mongo's are not — `$toUpper` maps null to the empty string
+  and `$strLenCP` rejects it outright.
+
+  **`round` is deliberately absent** from that table: Mongo's `$round` rounds
+  half-to-even where PostgreSQL rounds half-away-from-zero, so lowering it would
+  make `sum(round(x))` over 1.5 and 2.5 answer 4 instead of 5 — a silent wrong
+  answer in place of an honest "unsupported argument".
 - **`row IS NULL` / `row IS NOT NULL`** are each true only when *every* field
   qualifies — so a row with one NULL is false for **both**. They are not
   negations of each other, and treating them as such made `(1,NULL) IS NOT

@@ -1837,6 +1837,7 @@ def _describe_statement(
         # tables materialize at execution), so derive the shape from the plan.
         try:
             desugared = stmt.copy()
+            planner.desugar_natural_join(desugared, catalog, db)
             planner.desugar_join_using(desugared)
             plan = planner.plan_pipeline_select(desugared, db, catalog, storage, session=session)
             if getattr(plan, "count_star", False):
@@ -2545,6 +2546,9 @@ def _run_statement(
         # to ON, after which the join shape is indistinguishable.
         planner.expand_using_star(stmt, catalog, db)
         planner.expand_table_stars(stmt, catalog, db)
+    # NATURAL resolves to USING, which the next call turns into the ON — both
+    # spellings degraded to a CROSS JOIN without them.
+    planner.desugar_natural_join(stmt, catalog, db)
     planner.desugar_join_using(stmt)
     # Postgres resolves comparison operators during parse analysis, so a
     # cross-category comparison (``text_col = 42``) is a 42883 before any row

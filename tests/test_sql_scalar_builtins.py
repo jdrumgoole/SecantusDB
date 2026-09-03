@@ -192,10 +192,16 @@ class TestAggregateExpressionArguments:
 
     def test_unsupported_argument_names_the_aggregate_not_array_agg(self, agg):
         """The message said "unsupported array_agg argument" for a `min()`
-        call, sending the reader to the wrong function."""
+        call, sending the reader to the wrong function.
+
+        The example was `min(abs(n))` until `abs` became lowerable
+        (`_AGG_FUNC_OPS`); `md5` stands in for "a function with no Mongo
+        operator", which is what this test needs. The assertion is about the
+        MESSAGE, not about which functions happen to be unsupported.
+        """
         from secantus.sql.errors import SQLError
 
         with pytest.raises(SQLError) as ei:
-            agg("SELECT min(abs(n)) FROM ba")
+            agg("SELECT min(md5(b::text)) FROM ba")
         assert "array_agg" not in str(ei.value)
         assert "unsupported aggregate argument" in str(ei.value)
