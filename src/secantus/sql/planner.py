@@ -3034,12 +3034,48 @@ def _emit_pipeline_sort(
     pipeline.append({"$unset": list(companions)})
 
 
-def _limit_skip(stmt: exp.Expression) -> tuple[int, int]:
+def _limit_stages(limit: int) -> list[dict[str, Any]]:
+    """The pipeline stage(s) for a LIMIT.
+
+    Mongo's ``$limit`` REJECTS zero (``54000 the limit must be positive``), so a
+    genuine ``LIMIT 0`` -- which Postgres answers with no rows -- became an error
+    the moment the sentinel fix let a real 0 reach here. A ``$match`` on an
+    impossible predicate is the empty result the stage cannot express.
+    """
+    if limit == 0:
+        return [{"$match": {"$expr": {"$literal": False}}}]
+    return [{"$limit": limit}]
+
+
+def _limit_skip(stmt: exp.Expression) -> tuple[int | None, int]:
+    """``(limit, skip)``, where the limit is **None** when there is no LIMIT.
+
+    It used to be 0, which collides with a real ``LIMIT 0``: every consumer
+    tests the limit for truthiness, so ``LIMIT 0`` -- how a client asks for the
+    column metadata and no rows -- returned the WHOLE table. `None` is the only
+    value that cannot also be a row count.
+
+    ``LIMIT NULL`` and ``LIMIT ALL`` are Postgres' spellings of "no limit" and
+    map to None too; a negative limit is `2201W`.
+    """
     limit_node = stmt.args.get("limit")
     offset_node = stmt.args.get("offset")
-    limit = _const_int(_limit_count(limit_node)) if limit_node is not None else 0
+    limit = _limit_value(limit_node) if limit_node is not None else None
     skip = _const_int(_limit_count(offset_node)) if offset_node is not None else 0
     return limit, skip
+
+
+def _limit_value(node: exp.Expression) -> int | None:
+    """One LIMIT operand: a row count, or None for the no-limit spellings."""
+    count = _limit_count(node)
+    if count is None or isinstance(count, exp.Null):
+        return None  # `LIMIT NULL` / `LIMIT ALL` — no limit
+    if isinstance(count, exp.Var) and str(count.this).upper() == "ALL":
+        return None
+    value = _const_int(count)
+    if value < 0:
+        raise errors.SQLError("2201W", "LIMIT must not be negative")
+    return value
 
 
 def _limit_count(node: exp.Expression) -> exp.Expression:
@@ -3050,8 +3086,13 @@ def _limit_count(node: exp.Expression) -> exp.Expression:
     `expression`. Reading `expression` gave None, and the "unsupported" error
     built from it then raised `AttributeError` on `None.sql()`, so the query
     came back as `XX000` rather than either working or saying why."""
-    count = node.args.get("count") if isinstance(node, exp.Fetch) else None
-    return count if count is not None else node.expression
+    if isinstance(node, exp.Fetch):
+        # `FETCH FIRST ROW ONLY` — the count is OPTIONAL in the standard and
+        # defaults to one; without this the missing count read as "no limit" and
+        # the statement returned every row (and, before that, an XX000).
+        count = node.args.get("count")
+        return count if count is not None else exp.Literal.number(1)
+    return node.expression
 
 
 def _const_int(node: exp.Expression) -> int:
@@ -3361,6 +3402,12 @@ def plan_constant_select(
             identity = typemap.cast_type_identity(target.to)
             if identity is not None:
                 pg_oids[i], typmods[i] = identity
+    # A FROM-less SELECT still honours LIMIT / OFFSET: `SELECT 1 LIMIT 0` is no
+    # rows, and `OFFSET 1` skips the single synthesized one. `emit` already
+    # models "column shape, zero rows" for a false constant WHERE.
+    _limit, _skip = _limit_skip(stmt)
+    if _skip or _limit == 0:
+        emit = False
     return ConstantSelectPlan(columns=columns, emit=emit, pg_oids=pg_oids, typmods=typmods)
 
 
@@ -9159,8 +9206,8 @@ def _lateral_stage(
     limit, skip = _limit_skip(sub)
     if skip:
         sub_pipeline.append({"$skip": skip})
-    if limit:
-        sub_pipeline.append({"$limit": limit})
+    if limit is not None:
+        sub_pipeline.extend(_limit_stages(limit))
 
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
@@ -13235,8 +13282,8 @@ def _append_join_tail(
     limit, skip = _limit_skip(stmt)
     if skip:
         pipeline.append({"$skip": skip})
-    if limit:
-        pipeline.append({"$limit": limit})
+    if limit is not None:
+        pipeline.extend(_limit_stages(limit))
     if hidden:
         pipeline.append({"$project": {**{n: 1 for n in out_names}, "_id": 0}})
 
@@ -13325,8 +13372,8 @@ def _append_sort_limit(
     limit, skip = _limit_skip(stmt)
     if skip:
         pipeline.append({"$skip": skip})
-    if limit:
-        pipeline.append({"$limit": limit})
+    if limit is not None:
+        pipeline.extend(_limit_stages(limit))
 
 
 def _selected_sqls(stmt: exp.Expression) -> set[str]:

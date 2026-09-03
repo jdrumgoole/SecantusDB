@@ -6086,7 +6086,7 @@ def _setop_order_limit(
     limit, skip = planner._limit_skip(stmt)
     if skip:
         rows = rows[skip:]
-    if limit:
+    if limit is not None:
         rows = rows[:limit]
     return rows
 

@@ -1919,11 +1919,15 @@ def execute_select(plan: planner.SelectPlan, storage: Any, db: str) -> SQLResult
         _pg_sort(docs, key_of, [(direction, nf) for _, direction, nf in plan.order])
         if plan.skip:
             docs = docs[plan.skip :]
-        if plan.limit:
+        if plan.limit is not None:
             docs = docs[: plan.limit]
+    elif plan.limit == 0:
+        # `limit=0` means NO LIMIT to the storage layer (Mongo's convention), so
+        # a real `LIMIT 0` must never reach it — it would return the whole table.
+        docs = []
     else:
         docs = storage.find_matching(
-            db, plan.table.collection, plan.filter, skip=plan.skip, limit=plan.limit
+            db, plan.table.collection, plan.filter, skip=plan.skip, limit=plan.limit or 0
         )
     columns = _out_column_descs(plan.out_columns, storage, db, getattr(plan, "table", None))
     rows: list[tuple[Any, ...]] = []
@@ -1985,7 +1989,7 @@ def execute_correlated_select(
         )
     if plan.skip:
         matched = matched[plan.skip :]
-    if plan.limit:
+    if plan.limit is not None:
         matched = matched[: plan.limit]
 
     columns = _out_column_descs(plan.out_columns, storage, db, getattr(plan, "table", None))
@@ -2245,7 +2249,7 @@ def _evaluated_value_rows(
             rows = deduped
     if plan.skip:
         rows = rows[plan.skip :]
-    if plan.limit:
+    if plan.limit is not None:
         rows = rows[: plan.limit]
     return rows
 

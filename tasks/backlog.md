@@ -1904,6 +1904,27 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+### 2026-09-03 SQL sweep twelve: LIMIT and row NULLs — what is still open
+
+LIMIT / OFFSET, row comparison, conditionals and transactions probed against
+PostgreSQL 14.13; `tests/test_sql_sweep_twelve.py` pins the fixes.
+**Transactions came back 40 of 40** — savepoints, the aborted-transaction
+state, isolation levels, READ ONLY and transactional DDL rollback all match, so
+that surface needs no work. What is open:
+
+- [ ] **An aggregate argument cannot be a FUNCTION CALL.**
+      `string_agg(coalesce(s,'-'), ',' ORDER BY id)`,
+      `array_agg(upper(s) ORDER BY id)` and `string_agg(s || 'x', …)` all answer
+      `0A000 unsupported aggregate argument`. Neither `_agg_arg_to_expr` nor
+      `_to_agg_expr` lowers function calls — they handle columns, literals,
+      comparisons, CASE and arithmetic only. A small table mapping the common
+      scalar functions to their Mongo equivalents (`coalesce` -> `$ifNull`,
+      `upper` -> `$toUpper`, `||` -> `$concat`) would cover most real uses.
+- [ ] **`nullif(NULL, 1)` types as `text`**, not the second argument's type.
+      The VALUE is right (NULL); only the oid differs.
+- [ ] **`greatest()` / `least()` with no arguments** raise a sqlglot internal
+      message rather than Postgres' `42601 syntax error at or near ")"`.
+
 ### 2026-09-03 SQL sweep eleven: arrays and sequences — what is still open
 
 Arrays (20/29) and sequences / identity (23/26) probed against PostgreSQL
