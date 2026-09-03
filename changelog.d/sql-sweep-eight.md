@@ -60,6 +60,16 @@ which sorts by a constant, i.e. not at all.
 - **`LIKE ... ESCAPE`** types as `boolean`. The ESCAPE clause wraps the
   predicate in a node that is not itself a boolean class, so adding it to a
   working `LIKE` flipped its column from oid 16 to oid 25 and sent a `'t'`.
+- **A timestamp literal's fractional seconds, at any width.** The support
+  matrix disagreed with itself in both directions and neither half matched
+  PostgreSQL: before Python 3.11 `fromisoformat` accepted *only* 3 or 6
+  fractional digits, so `TIMESTAMP '2020-01-15 10:30:45.5'` — a perfectly good
+  literal — raised on 3.10 while parsing on 3.12; from 3.11 it accepts any
+  width but *truncates* beyond six digits, where PostgreSQL *rounds*
+  (`.1234567` → `.123457`). Normalising the fraction before the parse makes
+  every supported Python answer the same microseconds, and the same ones
+  PostgreSQL does. Only the CI matrix could show this — a local 3.12 run sees
+  neither half.
 - **An unresolvable function name** answers `42883 function f(...) does not
   exist` rather than `0A000 ... is not supported in this context`, which
   claimed the call site was the problem when the name was unreachable

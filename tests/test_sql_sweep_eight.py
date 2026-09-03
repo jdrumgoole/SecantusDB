@@ -409,6 +409,38 @@ def test_date_trunc_milliseconds(store, sess):
 
 
 # --------------------------------------------------------------------------- #
+# Fractional seconds of any width — a Python-VERSION bug the CI matrix found
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("frac", "micros"),
+    [
+        ("5", 500000),
+        ("12", 120000),
+        ("123", 123000),
+        ("1234", 123400),
+        ("12345", 123450),
+        ("123456", 123456),
+        # Postgres stores microseconds and ROUNDS a longer fraction.
+        ("1234567", 123457),
+        ("1234564", 123456),
+    ],
+)
+def test_timestamp_literal_accepts_any_fractional_width(store, sess, frac, micros):
+    # Before 3.11, ``fromisoformat`` accepted ONLY 3 or 6 fractional digits, so
+    # `TIMESTAMP '...45.5'` -- a perfectly good Postgres literal -- parsed on
+    # 3.12 and raised on 3.10. Local runs are 3.12; only the CI matrix showed it.
+    rows = _rows(store, f"SELECT TIMESTAMP '2020-01-15 10:30:45.{frac}'", sess)
+    assert rows[0][0].microsecond == micros
+
+
+def test_timestamptz_literal_fraction_keeps_its_offset(store, sess):
+    rows = _rows(store, "SELECT TIMESTAMPTZ '2020-01-15 10:30:45.5+02:00'", sess)
+    assert rows[0][0].microsecond == 500000
+
+
+# --------------------------------------------------------------------------- #
 # generate_series over date / timestamp bounds
 # --------------------------------------------------------------------------- #
 

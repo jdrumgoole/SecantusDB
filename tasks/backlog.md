@@ -1958,6 +1958,13 @@ than assumed:
 - [ ] **`ARRAY[1,2,3][2]` is accepted; PostgreSQL rejects it** (`42601 syntax
       error at or near "["` -- an array constructor must be parenthesised
       before it can be subscripted). Lenient in the harmless direction.
+- [ ] **A time with a single-digit MINUTE or SECOND does not parse.**
+      `TIMESTAMP '2020-01-15 1:2:3.45'` is `22007`; PostgreSQL reads it as
+      `01:02:03.45`. `datetimes._widen` pads a single-digit *hour* and the date
+      fields but not the minute or second, so the padded string
+      `2020-01-15 01:2:3.45` still fails. Identical on 3.10 and 3.12 — it is a
+      gap in `_widen`, not the Python-version fractional-seconds bug fixed
+      alongside it.
 - [ ] **The 42883 message's argument types are approximate.** The new
       unknown-function error names types from the RUNTIME values, so
       `nonexistent_fn('a', 1.5)` says `(text, text)` where PostgreSQL says

@@ -16,6 +16,7 @@ and time-zone conversion beyond preserving the literal's offset.
 from __future__ import annotations
 
 import datetime as _dt
+import decimal
 import re
 from typing import Any
 
@@ -45,6 +46,42 @@ def datetime_sentinel(v: Any) -> str | None:
 
 #: A bare ``YYYY-MM-DD`` with nothing after it.
 _DATE_ONLY_RE = re.compile(r"^\d{4,}-\d{1,2}-\d{1,2}$")
+
+
+#: The fractional-seconds part of a timestamp, and whatever trails it (an
+#: offset, a zone name, nothing).
+_FRACTION_RE = re.compile(r"(?<=:\d\d)\.(\d+)")
+
+
+def _normalise_fraction(s: str) -> str:
+    """Rewrite a fractional-seconds field to exactly six digits.
+
+    The support matrix disagrees with itself here, in both directions:
+
+    * Before Python 3.11, ``fromisoformat`` accepted **only** 3 or 6 fractional
+      digits, so on 3.10 every other width raised -- and 1, 2, 4, 5 and 7+
+      digits are all valid Postgres timestamp literals. ``TIMESTAMP
+      '2020-01-15 10:30:45.5'`` parsed on 3.12 and failed on 3.10.
+    * From 3.11 it accepts any width but TRUNCATES beyond six digits, where
+      Postgres ROUNDS (``.1234567`` -> ``.123457``, ``.1234564`` ->
+      ``.123456``).
+
+    So this runs BEFORE the fast path rather than in the ``_widen`` fallback:
+    fixing only the 3.10 failure would have left the two versions answering
+    different microseconds for the same literal. Found by the CI matrix,
+    2026-09-03 -- a local 3.12 run cannot see either half.
+    """
+
+    def _fix(m: re.Match[str]) -> str:
+        digits = m.group(1)
+        if len(digits) <= 6:
+            return "." + digits.ljust(6, "0")
+        micros = decimal.Decimal("0." + digits).quantize(
+            decimal.Decimal("0.000001"), rounding=decimal.ROUND_HALF_UP
+        )
+        return "." + f"{micros:.6f}".split(".", 1)[1]
+
+    return _FRACTION_RE.sub(_fix, s, count=1)
 
 
 def _widen(s: str) -> str:
@@ -301,7 +338,10 @@ def parse_iso_datetime(v: Any) -> _dt.datetime:
     own text rendering emits (``+00`` / ``+0000``), a trailing ``Z``, and the
     special value ``epoch``. Try the fast path first, then widen.
     """
-    s = str(v).strip().replace("Z", "+00:00")
+    # Normalised BEFORE the fast path, because the two Pythons in the support
+    # matrix disagree about fractional seconds in opposite directions and
+    # neither matches Postgres (see ``_normalise_fraction``).
+    s = _normalise_fraction(str(v).strip().replace("Z", "+00:00"))
     if s.lower() == "epoch":
         return _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
     if "/" in s:
