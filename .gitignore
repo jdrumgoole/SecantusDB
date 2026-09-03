@@ -97,14 +97,25 @@ website/__pycache__/
 xunit-results/
 
 # WT-linked crate build artifacts from a LOCAL `cargo check`/`build` against the
-# vendored WiredTiger (SECANTUS_WT_INCLUDE/LIB). These crates are excluded from
-# the clean workspace and built only by CI's CMake path (CARGO_TARGET_DIR points
-# elsewhere), so a stray per-crate target/ + Cargo.lock should never be committed.
+# vendored WiredTiger (SECANTUS_WT_INCLUDE/LIB). The per-crate `target/` is a
+# build artifact and stays ignored.
+#
+# The per-crate **`Cargo.lock` is NOT** ignored any more (2026-09-03). The note
+# here used to say these crates are "built only by CI's CMake path", so a stray
+# lock should never be committed -- but `test.yml`'s `rust-storage` job runs
+# `cargo fmt / clippy / test` in each of these directories directly, which makes
+# every one of them its own DEPENDENCY RESOLUTION ROOT. Without a lock they
+# re-resolve on every run, so any upstream publish can break CI on a commit that
+# changed nothing.
+#
+# That is not hypothetical: `tinyvec 1.13.0` shipped a lib that does not compile
+# (`cannot find macro vec`), and of the six WT-linked roots the job builds, the
+# two whose locks were ignored -- this pair -- were exactly the two that broke.
+# The four with a tracked lock were immune, `secantusdb` included, which pulls
+# tinyvec and pins 1.11.0. Committing these two locks makes the set consistent.
 crates/secantus-storage-adapter/target/
-crates/secantus-storage-adapter/Cargo.lock
 crates/secantus-storage/target/
 crates/secantus-server-py/target/
-crates/secantus-server-py/Cargo.lock
 
 # Playwright MCP browser-session artefacts — Claude sessions write them to repo
 # root when capturing screenshots / DOM dumps. Always untracked, never shipped.
