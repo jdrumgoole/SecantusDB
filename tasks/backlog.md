@@ -1904,6 +1904,93 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+### 2026-09-03: the RUST pgserver on the same functions — grepped, not assumed
+
+CLAUDE.md's standing rule is to grep `crates/` for the same helper whenever a
+fix lands on the Python side, because nothing else will tell you. Done for
+sweeps eight and nine; the Rust pgserver's scalar surface is much smaller, so
+most of what was fixed has no counterpart there at all (no window functions,
+no `quote_ident`, no `trim_scale` / `min_scale`, no `LOCALTIME`). Where there
+IS a counterpart the results were not uniform, which is the point of looking:
+
+- [ ] **`concat` / `concat_ws` render a boolean as `true`** in
+      `crates/secantus-pgplan/src/scalar.rs`'s `text()` — the SAME bug fixed on
+      the Python side, where Postgres renders `t` through the type's output
+      function. One-line fix in `text()`, but note `text()` is shared, so check
+      each caller wants the output-function spelling before changing it.
+- [ ] **`split_part` REJECTS a negative field position** ("field position must
+      be greater than zero"). Postgres 14+ counts from the end, and the Python
+      server has done so for a while — so this is a *different* defect from the
+      one sweep nine fixed there, not the same one. Its empty-delimiter
+      behaviour also differs from both (Rust's `split("")` yields boundary
+      empties rather than the whole string).
+- **`initcap` was already CORRECT in Rust** (it uses `is_alphanumeric`, which is
+      Postgres' word rule) while Python's used `str.title()` and broke words at
+      digits. Worth recording because it is the reverse of the usual direction:
+      the assumption that Python leads and Rust lags is not safe either way.
+
+None of this is fixed here — the session's remit was the Python server — but it
+is measured rather than guessed, and each line names the file to change.
+
+### 2026-09-03 SQL sweep nine: windows and RETURNING — what is still open
+
+Window functions, DML/`RETURNING` and CTEs probed against PostgreSQL 14.13
+(`tests/test_sql_sweep_nine.py` pins the fixes; `changelog.d/sql-sweep-nine.md`
+lists them). **CTEs came back clean — 23 of 23**, including `RECURSIVE`,
+`MATERIALIZED` / `NOT MATERIALIZED`, a data-modifying CTE and a self-join over
+one; that surface needs no work. What is still open:
+
+- [ ] **A subquery in `RETURNING` sees the row the statement just wrote.**
+      `INSERT INTO t VALUES (...) RETURNING id, (SELECT count(*) FROM t)`
+      counts the new row; Postgres evaluates the subquery against the
+      *command's* snapshot, which does not include it. (Before this sweep the
+      whole shape crashed with `XX000`, so this is a narrowing, not a
+      regression.) Fixing it needs the pre-write snapshot to still be readable
+      at RETURNING time, which the executor does not currently keep.
+- [ ] **`UPDATE ... RETURNING ... ORDER BY` is accepted.** Postgres has no
+      `ORDER BY` on a data-modifying statement's `RETURNING` and raises `42601`;
+      we sort and return. Lenient in the harmless direction, but it lets through
+      SQL no other server takes.
+- [ ] **`UPDATE ... SET (a, b) = (SELECT x, y ...)`** — the row-SUBQUERY form.
+      The row-constructor forms landed in this sweep; the subquery one cannot
+      use the same expansion (each column would re-run the query) and still
+      answers `0A000`.
+- [ ] **`abs(-2147483648)` answers 2147483648.** Postgres raises `22003 integer
+      out of range` -- the negation does not fit int4. The arithmetic operators
+      overflow-check (`SELECT a + 1` at int4 max is `22003` on both servers);
+      `abs` does not.
+- [ ] **`upper` / `lower` use Python's FULL case mapping, Postgres uses the
+      simple one.** `upper('ß')` is `SS` here and `ß` there. **This one cannot
+      be settled on this box**: its PostgreSQL runs `lc_ctype=C`, which does not
+      case-map non-ASCII AT ALL (`upper('é')` is `é`), so the C-locale answer
+      cannot distinguish "simple mapping" from "no mapping". Needs a
+      UTF-8-locale PostgreSQL to measure before anything is changed — our
+      Unicode-aware answer is right for that server in every case except
+      possibly the full-vs-simple ones.
+- [ ] **`date_part` should return float8; we return numeric.** In PostgreSQL 14
+      `EXTRACT` returns `numeric` but `date_part` still returns `double
+      precision` -- for every field, not just `epoch`. The VALUES agree; only
+      the oid differs (1700 vs 701). **Not fixed because the two spellings are
+      indistinguishable in the AST**: sqlglot folds both into `exp.Extract` with
+      the field as a `Var`, and the only difference is that the `EXTRACT`
+      keyword form arrives upper-cased. Keying on case would misread
+      `date_part('YEAR', ...)`, so this wants a real marker set during parsing
+      rather than a heuristic.
+- [ ] **`convert_from` / `convert_to` are absent** (`42883`).
+- [ ] **A set-returning function beside another column in the SELECT list.**
+      `SELECT jsonb_array_length(x), jsonb_object_keys(y)` and
+      `SELECT regexp_split_to_array(...), regexp_split_to_table(...)` answer
+      `0A000`; Postgres expands the SRF and pairs it with the scalar column.
+      The FROM form and the whole-SELECT-list form both work. The error now
+      names the actual limit rather than claiming the function does not exist.
+- [ ] **`numeric_send` is absent** (`42883`). One of Postgres' internal
+      type-I/O functions; nothing but a driver test is likely to call it.
+- [ ] **An in-call `ORDER BY` inside a window aggregate is dropped.**
+      `array_agg(v ORDER BY x) OVER (...)` aggregates in frame order rather than
+      the requested one. The argument is unwrapped from its `exp.Order` and the
+      sort keys discarded — the same shape the GROUP BY path handles through
+      `_sorted_agg_push`, not yet wired into `window.py`.
+
 ### 2026-09-03 SQL sweep eight: what it found and did NOT fix
 
 263 statements against PostgreSQL 14.13, both sides driven by the same

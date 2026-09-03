@@ -8071,6 +8071,15 @@ def _group_agg_nodes(stmt: exp.Select) -> list[exp.AggFunc]:
     for root in roots:
         for n in root.find_all(exp.AggFunc):
             parent = n.parent
+            # ``agg(...) FILTER (WHERE ...) OVER (...)`` puts an ``exp.Filter``
+            # between the aggregate and its Window, so this guard did not
+            # recognise it as a window aggregate and the query was rejected with
+            # 42803 -- naming a perfectly ordinary column as needing GROUP BY.
+            if isinstance(parent, exp.Filter) and parent.this is n:
+                parent = parent.parent
+                n_in_window = parent.this if isinstance(parent, exp.Window) else None
+                if n_in_window is not None and n_in_window.this is n:
+                    continue
             if isinstance(parent, exp.Window) and parent.this is n:
                 continue  # a window aggregate — resolved over the grouped rows
             if _nested_in_subquery(n, root):
@@ -11882,7 +11891,14 @@ def _date_arith_tag(node: exp.Expression, resolve: Resolve) -> str | None:
             return "timestamp"
         if lt == "time" and rt == "time":
             return "interval"
+        # `time - interval` is a TIME in Postgres (wrapping at midnight), not an
+        # interval — typed as one, `TIME '13:45' - INTERVAL '14 hours'` came back
+        # as a 23:45 *duration* under the interval oid rather than a clock time.
+        if lt == "time" and rt == "interval":
+            return "time"
     elif isinstance(node, exp.Add):
+        if (lt == "time" and rt == "interval") or (rt == "time" and lt == "interval"):
+            return "time"
         if lt == "date" and rt in ints:
             return "date"
         if rt == "date" and lt in ints:
@@ -12072,6 +12088,42 @@ def _arith_operand_tag(node: exp.Expression, resolve: Resolve) -> str | None:
             return "numeric"
     tag = _infer_scalar_tag(node, resolve)
     return tag if tag in _NUMERIC_FAMILY else None
+
+
+#: Postgres' common-type precedence for the numeric family, widest last. Used by
+#: COALESCE / GREATEST / LEAST, whose resolution is NOT arithmetic's: `int + real`
+#: is double precision, but `greatest(int, real)` is real. Measured against 14.13.
+_COMMON_TYPE_ORDER = ["int2", "int4", "int8", "numeric", "float4", "float8"]
+
+
+def _common_numeric_type(tags: list[str]) -> str | None:
+    """The type Postgres resolves a COALESCE / GREATEST / LEAST argument list to,
+    or None when any tag is outside the numeric family.
+
+    All three used to take the FIRST argument's type -- with a comment claiming
+    that "is what PG's common-type resolution amounts to for the shapes we can
+    decide". It is not: `coalesce(1::int, 2.5::numeric)` is numeric, not integer.
+    Declaring int4 and then coercing the numeric result ran `int('2.5')`, so the
+    statement died with a bare Python ValueError that reached the client with NO
+    SQLSTATE at all.
+    """
+    if not tags or any(t not in _COMMON_TYPE_ORDER for t in tags):
+        return None
+    return max(tags, key=_COMMON_TYPE_ORDER.index)
+
+
+def _argument_tags(parts: list[exp.Expression | None], resolve: Resolve) -> list[str]:
+    """Every non-NULL argument's inferred tag, skipping the ones that cannot be
+    decided — the input to :func:`_common_numeric_type`."""
+    tags: list[str] = []
+    for part in parts:
+        if part is None or isinstance(part, exp.Null):
+            continue
+        with contextlib.suppress(errors.SQLError):
+            tag = _infer_scalar_tag(part, resolve)
+            if tag and tag != "text":
+                tags.append(tag)
+    return tags
 
 
 def _unify_numeric_tags(tags: list[str]) -> str | None:
@@ -12480,7 +12532,15 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         if isinstance(node, exp.Neg) and not isinstance(_lit_inner, (exp.Literal, exp.Null)):
             # ``- col`` / ``- expr``: numeric negation keeps its operand's tag
             # (_literal only extracts constants — it must not see a column).
+            #
+            # An INTERVAL is negatable too, and falling through to the "numeric"
+            # default declared `- iv` numeric: the output coercion then fed the
+            # interval SUBDOCUMENT to Decimal and the statement died with a bare
+            # `decimal.ConversionSyntax`, no SQLSTATE at all. `- INTERVAL '1 day'`
+            # was fine because the literal form is typed a few branches above.
             _neg_tag = _infer_scalar_tag(_lit_inner, resolve)
+            if _neg_tag == "interval":
+                return "interval"
             return _neg_tag if _neg_tag in _NUMERIC_FAMILY else "numeric"
         return _infer_value_tag(_literal(node))
     if isinstance(node, exp.Case):
@@ -12508,12 +12568,31 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         return typemap.array_element_tag(base_tag) if typemap.is_array_tag(base_tag) else base_tag
     if isinstance(node, exp.Window):
         func = node.this
-        if isinstance(func, (exp.RowNumber, exp.Rank, exp.DenseRank, exp.Count, exp.Ntile)):
+        # ``agg(...) FILTER (WHERE ...) OVER (...)`` — the FILTER wraps the
+        # aggregate, so without peeling it the window typed as the fallback
+        # `numeric` and a text/array result was coerced on the way out.
+        if isinstance(func, exp.Filter):
+            func = func.this
+        if isinstance(func, exp.GroupConcat):
+            return "text"
+        if isinstance(func, exp.ArrayAgg):
+            inner = func.this.this if isinstance(func.this, exp.Order) else func.this
+            elem = _infer_scalar_tag(inner, resolve) if inner is not None else "text"
+            return f"{elem}[]" if f"{elem}[]" in typemap.PG_OID else "text[]"
+        if isinstance(func, exp.Ntile):
+            return "int4"  # ntile is the one integer window function PG makes int4
+        if isinstance(func, (exp.RowNumber, exp.Rank, exp.DenseRank, exp.Count)):
             return "int8"
-        if isinstance(func, (exp.Avg, exp.CumeDist, exp.PercentRank)):
+        if isinstance(func, (exp.CumeDist, exp.PercentRank)):
             return "float8"
+        # `sum` and `avg` promote in a window exactly as they do in a GROUP BY --
+        # `sum(int4)` is int8, `avg(int4)` is numeric -- but this branch had its
+        # own rules and got both wrong, declaring int4 and float8. The group path
+        # has always used these two helpers.
+        if isinstance(func, (exp.Sum, exp.Avg)) and func.this is not None:
+            inner = _infer_scalar_tag(func.this, resolve)
+            return _sum_tag(inner) if isinstance(func, exp.Sum) else _avg_tag(inner)
         value_funcs = (
-            exp.Sum,
             exp.Min,
             exp.Max,
             exp.Lag,
@@ -12597,15 +12676,22 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     # — typing them text sent `greatest(NULL, 1)` as the STRING '1' under oid
     # 25 where PG sends 1 as an integer.
     if isinstance(node, (exp.Greatest, exp.Least)):
-        for part in [node.this, *(node.expressions or [])]:
-            if part is None or isinstance(part, exp.Null):
-                continue
-            with contextlib.suppress(errors.SQLError):
-                tag = _infer_scalar_tag(part, resolve)
-                if tag and tag != "text":
-                    return tag
+        # ...but unlike COALESCE these UNIFY their arguments rather than taking
+        # the first: `greatest(1, 2.5)` is numeric in Postgres, not integer.
+        # Returning the first tag declared int4 and then the output coercion
+        # ran `int('2.5')`, so the statement died with a bare Python ValueError
+        # that reached the client with NO SQLSTATE at all.
+        tags = _argument_tags([node.this, *(node.expressions or [])], resolve)
+        common = _common_numeric_type(tags)
+        if common is not None:
+            return common
+        if tags:
+            return tags[0]
     if isinstance(node, exp.Coalesce):
         parts = [node.this, *(node.expressions or [])]
+        common = _common_numeric_type(_argument_tags(parts, resolve))
+        if common is not None:
+            return common
         for part in parts:
             if part is None or isinstance(part, exp.Null):
                 continue
@@ -12637,6 +12723,11 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         return "date"
     if getattr(exp, "CurrentTime", None) is not None and isinstance(node, exp.CurrentTime):
         return "timetz"
+    # `LOCALTIME` / `LOCALTIMESTAMP` are the tz-NAIVE twins of the two above.
+    if getattr(exp, "Localtime", None) is not None and isinstance(node, exp.Localtime):
+        return "time"
+    if getattr(exp, "Localtimestamp", None) is not None and isinstance(node, exp.Localtimestamp):
+        return "timestamp"
     # ``date_trunc(unit, src)`` keeps the tz-ness of ``src`` (Postgres:
     # ``date_trunc(text, timestamptz) -> timestamptz``, ``… timestamp) -> timestamp``;
     # a ``date`` argument is cast to naive timestamp). An ``interval`` argument
@@ -13547,6 +13638,110 @@ def _resolve_group_by_ordinals(root: exp.Expression) -> None:
         group.set("expressions", new)
 
 
+def _row_items(node: exp.Expression) -> list[exp.Expression] | None:
+    """The element list of a row constructor, or None when ``node`` is not one.
+
+    All three spellings reach here: ``(a, b)`` is a ``Tuple``, a ONE-element
+    ``(a)`` is a ``Paren`` (sqlglot has nothing to make a tuple of), and
+    ``ROW(a, b)`` is an ``Anonymous`` call.
+    """
+    if isinstance(node, exp.Tuple):
+        return list(node.expressions)
+    if isinstance(node, exp.Paren):
+        return [node.this]
+    if isinstance(node, exp.Anonymous) and str(node.this).upper() == "ROW":
+        return list(node.expressions)
+    return None
+
+
+def _expand_multi_column_set(root: exp.Expression) -> None:
+    """Rewrite ``UPDATE t SET (a, b) = (x, y)`` into ``SET a = x, b = y``.
+
+    sqlglot parses the multi-column form as one ``EQ`` whose sides are both
+    ``Tuple``s, so the assignment walker -- which expects a column on the left --
+    rejected the whole statement with ``0A000 expected a column, got: (a, b)``.
+    The two spellings are equivalent in Postgres whenever the right-hand side is
+    a row constructor, so expanding here needs no planner or executor change.
+
+    A row SUBQUERY right-hand side (``SET (a, b) = (SELECT x, y ...)``) is NOT
+    expandable this way -- each column would re-run the query -- so it is left
+    alone and still reports unsupported.
+    """
+    for upd in root.find_all(exp.Update):
+        exprs = upd.args.get("expressions") or []
+        if not any(isinstance(e, exp.EQ) and _row_items(e.this) is not None for e in exprs):
+            continue
+        out: list[exp.Expression] = []
+        for e in exprs:
+            cols = _row_items(e.this) if isinstance(e, exp.EQ) else None
+            if cols is None:
+                out.append(e)
+                continue
+            vals = _row_items(e.expression)
+            if vals is None:
+                out.append(e)  # a row subquery — not expandable
+                continue
+            if len(cols) != len(vals):
+                raise errors.SQLError("42601", "number of columns does not match number of values")
+            out.extend(
+                exp.EQ(this=c.copy(), expression=v.copy()) for c, v in zip(cols, vals, strict=True)
+            )
+        upd.set("expressions", out)
+
+
+def _merge_named_window(ref: exp.Window, defs: dict[str, exp.Window], seen: frozenset[str]) -> None:
+    """Fold the definition ``ref`` names into ``ref`` itself. See
+    :func:`_resolve_named_windows` for why this exists."""
+    name = ref.args["alias"].name if ref.args.get("alias") else None
+    if name is None:
+        return
+    base = defs.get(name)
+    if base is None:
+        raise errors.SQLError("42704", f'window "{name}" does not exist')
+    if name in seen:
+        raise errors.SQLError("42P20", f'circular reference in window "{name}"')
+    _merge_named_window(base, defs, seen | {name})  # a definition may name another
+    if ref.args.get("order") is not None and base.args.get("order") is not None:
+        raise errors.SQLError("42P20", f'cannot override ORDER BY clause of window "{name}"')
+    if base.args.get("partition_by"):
+        ref.set("partition_by", [p.copy() for p in base.args["partition_by"]])
+    for key in ("order", "spec"):
+        if ref.args.get(key) is None and base.args.get(key) is not None:
+            ref.set(key, base.args[key].copy())
+    ref.set("alias", None)
+
+
+def _resolve_named_windows(root: exp.Expression) -> None:
+    """Inline each ``WINDOW w AS (...)`` definition into the ``OVER w`` nodes
+    that name it.
+
+    sqlglot keeps a named window's definition on the SELECT (``args["windows"]``)
+    and leaves the *reference* as a bare ``alias`` on the ``exp.Window`` node --
+    with no partition_by, no order and no frame. Every consumer downstream reads
+    those three off the node, so a named window was silently evaluated as
+    ``OVER ()``: ``sum(v) OVER w`` with ``w AS (ORDER BY id)`` returned the
+    whole-partition total on every row instead of a running one, and a
+    ``PARTITION BY`` in the definition was dropped just as quietly.
+
+    Resolving here -- beside the ordinal pre-passes, before a planning path is
+    chosen -- means the rest of the engine only ever sees a fully specified
+    window.
+
+    Postgres' composition rules, which this follows: a reference may ADD an
+    ORDER BY and a frame, but may not override the definition's ORDER BY, and
+    never carries its own PARTITION BY. Definitions may chain (``w2 AS (w1
+    ORDER BY x)``), so they are resolved against each other first.
+    """
+    for sel in root.find_all(exp.Select):
+        defs_list = sel.args.get("windows") or []
+        refs = [w for w in sel.find_all(exp.Window) if w.args.get("alias") and w not in defs_list]
+        if not refs:
+            continue  # nothing names a window here (the common case)
+        defs = {d.this.name: d for d in defs_list if isinstance(d.this, exp.Identifier)}
+        for w in refs:
+            _merge_named_window(w, defs, frozenset())
+
+
 def _validate_order_by_ordinals(root: exp.Expression) -> None:
     """Reject an out-of-range ``ORDER BY <n>`` with Postgres' 42P10.
 
@@ -13583,6 +13778,45 @@ _ESTRING_SIMPLE = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
 #: A dollar-quote tag: ``$$`` or ``$tag$`` where the tag starts with a letter /
 #: underscore and may continue with digits (``$A0$``, ``$_0$``) — PG's rule.
 _DOLLAR_TAG_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+
+
+#: ``INTERVAL 'literal'`` — the quoted form, and whatever token follows it (so a
+#: trailing unit keyword, as in ``INTERVAL '1' DAY``, can be left alone).
+_INTERVAL_LITERAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])interval\s*'([^']*)'(\s*[A-Za-z]+)?", re.IGNORECASE
+)
+
+
+def _interval_literals_to_casts(sql: str) -> str:
+    """Rewrite a COMPOUND ``INTERVAL 'literal'`` as ``CAST('literal' AS INTERVAL)``.
+
+    sqlglot parses ``INTERVAL '1 day 3:45:00'`` as ``Interval(this='1',
+    unit=DAY)`` and **discards the rest of the string** -- it round-trips as
+    ``INTERVAL '1 DAY'``, so three hours and forty-five minutes were silently
+    gone before any of this engine's code ran. ``INTERVAL '2 days ago'`` loses
+    its ``ago`` the same way and comes back POSITIVE. It only truncates when the
+    text starts ``<number> <unit>``; a bare ``'3:45:00'`` and a many-worded
+    ``'1 year 2 mons 3 days 04:05:06'`` both survive, which is why this hid.
+
+    Nothing downstream can recover the dropped text, so the repair has to happen
+    on the SQL string -- the same place ``_decode_estrings`` and
+    ``_strip_nested_block_comments`` already patch up sqlglot's parsing. A cast
+    keeps the literal whole and routes it to ``intervals.parse``, which reads
+    every form Postgres accepts.
+
+    Left alone: a two-token literal (which sqlglot parses correctly) and
+    ``INTERVAL '1' DAY``, where the unit sits OUTSIDE the quotes.
+    """
+
+    def _fix(m: re.Match[str]) -> str:
+        body, trailer = m.group(1), m.group(2) or ""
+        if trailer.strip():
+            return m.group(0)  # `INTERVAL '1' DAY` — the unit is outside
+        if len(body.split()) <= 2 and ":" not in body:
+            return m.group(0)  # sqlglot handles the simple pair correctly
+        return f"CAST('{body}' AS INTERVAL)"
+
+    return _INTERVAL_LITERAL_RE.sub(_fix, sql)
 
 
 def _strip_nested_block_comments(sql: str) -> str:
@@ -13970,6 +14204,9 @@ def _parse_uncached(sql: str) -> list[exp.Expression]:
     # PG nests block comments; sqlglot doesn't — strip them when they nest.
     if "/*" in sql:
         sql = _strip_nested_block_comments(sql)
+    # sqlglot TRUNCATES a compound interval literal — see `_interval_literals_to_casts`.
+    if "interval" in sql.lower():
+        sql = _interval_literals_to_casts(sql)
     try:
         try:
             stmts = [
@@ -13992,6 +14229,8 @@ def _parse_uncached(sql: str) -> list[exp.Expression]:
             _fold_unquoted_identifiers(s)
             _resolve_group_by_ordinals(s)
             _validate_order_by_ordinals(s)
+            _resolve_named_windows(s)
+            _expand_multi_column_set(s)
             # Dollar-quoted strings tokenize as RawString — downstream code
             # (scalar, typemap, every literal path) only knows Literal, so
             # normalize in place: the value is identical, only the quoting

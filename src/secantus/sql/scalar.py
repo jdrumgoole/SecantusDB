@@ -1239,9 +1239,22 @@ def _eval_coalesce(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> An
     return None
 
 
+def _concat_text(v: Any) -> str:
+    """One ``concat`` / ``format('%s')`` argument as text.
+
+    These render through the type's OUTPUT function, where a boolean is ``t`` /
+    ``f`` -- not through ``::text``, which spells it ``true`` / ``false``. The
+    two differ only for bool, and using the cast's spelling made
+    ``concat(1, 2.5, true)`` answer ``12.5true`` where Postgres says ``12.5t``.
+    """
+    if isinstance(v, bool):
+        return "t" if v else "f"
+    return _as_text(v)
+
+
 def _eval_concat(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     # Postgres ``concat`` ignores NULL arguments (renders them as empty).
-    return "".join(_as_text(v) for v in _variadic(node, scope, ctx) if v is not None)
+    return "".join(_concat_text(v) for v in _variadic(node, scope, ctx) if v is not None)
 
 
 def _extremum(pick: Callable[[list[Any]], Any]) -> Callable[..., Any]:
@@ -1295,8 +1308,14 @@ def _eval_split_part(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> 
     idx = evaluate(node.args.get("part_index"), scope, ctx)
     if src is None or delim is None or idx is None:
         return None
-    parts = _as_text(src).split(_as_text(delim))
     n = int(idx)
+    if n == 0:
+        raise errors.SQLError("22023", "field position must not be zero")
+    text, sep = _as_text(src), _as_text(delim)
+    # An EMPTY delimiter splits into nothing -- Python's `str.split("")` raises
+    # ValueError, which escaped as a confusing "function split_part(unknown)
+    # does not exist". Postgres treats the whole string as field 1.
+    parts = text.split(sep) if sep else [text]
     if n < 0:  # Postgres 14+: count from the end
         n = len(parts) + n + 1
     return parts[n - 1] if 1 <= n <= len(parts) else ""
@@ -2621,6 +2640,11 @@ for _cls_name, _handler in (
     ("CurrentTimestamp", lambda n, s, c: _utcnow(c)),
     ("CurrentDate", lambda n, s, c: _utcnow(c).date()),
     ("CurrentTime", lambda n, s, c: _fmt_current_time(c)),
+    # `LOCALTIME` / `LOCALTIMESTAMP` are the tz-NAIVE twins of `CURRENT_TIME` /
+    # `CURRENT_TIMESTAMP`; sqlglot gives them their own nodes and neither was
+    # handled, so both answered `42883 function localtime() does not exist`.
+    ("Localtime", lambda n, s, c: _utcnow(c).time()),
+    ("Localtimestamp", lambda n, s, c: _utcnow(c).replace(tzinfo=None)),
     ("Pad", _eval_pad),
     ("Left", _eval_left),
     ("Right", _eval_right),
@@ -2751,6 +2775,7 @@ def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any
         else:
             left = _ranges.canonical(left)
             right = _ranges.canonical(right)
+    left, right = _parse_date_text_against_date(left, right)
     left, right = _promote_date_against_datetime(left, right)
     if (
         isinstance(left, _dt.datetime)
@@ -2845,6 +2870,30 @@ def _pg_type_name(value: Any) -> str:
     if value is None:
         return "unknown"
     return "text"
+
+
+def _parse_date_text_against_date(left: Any, right: Any) -> tuple[Any, Any]:
+    """When one side is a real ``date`` / ``datetime`` and the other is its
+    canonical TEXT, parse the text so the two compare as dates.
+
+    A ``::date`` cast yields the canonical text while ``CURRENT_DATE`` yields a
+    ``datetime.date``, so ``now()::date = CURRENT_DATE`` compared a str with a
+    date and answered FALSE on a day when both plainly named the same one.
+    (Two casts, or two literals, were always fine -- which is why only the
+    mixed shape showed it.)
+    """
+    for a, b, swap in ((left, right, False), (right, left, True)):
+        if isinstance(a, (_dt.date, _dt.datetime)) and isinstance(b, str):
+            from secantus.sql.datetimes import DateTimeError, parse_iso_datetime
+
+            try:
+                parsed: Any = parse_iso_datetime(b)
+            except (DateTimeError, ValueError):
+                return left, right
+            if isinstance(a, _dt.date) and not isinstance(a, _dt.datetime):
+                parsed = parsed.date()
+            return (parsed, a) if swap else (a, parsed)
+    return left, right
 
 
 def _promote_date_against_datetime(left: Any, right: Any) -> tuple[Any, Any]:
@@ -4272,7 +4321,7 @@ def _plain_scalar(name: str, args: list[Any]) -> Any:
         # (unlike `concat`, which skips them too but has no separator).
         if a is None:
             return None
-        return _as_text(a).join(_as_text(v) for v in args[1:] if v is not None)
+        return _as_text(a).join(_concat_text(v) for v in args[1:] if v is not None)
     if name == "starts_with":
         if a is None or len(args) < 2 or args[1] is None:
             return None
@@ -4345,9 +4394,11 @@ def _plain_scalar(name: str, args: list[Any]) -> Any:
         if sentinel is not None and isinstance(a, str) and sentinel(a) is not None:
             return False
         return not (isinstance(a, float) and (a != a or a in (float("inf"), float("-inf"))))
-    if name == "scale":
-        # The COUNT of decimal digits a numeric carries — `scale(1.50)` is 2,
-        # `scale(100)` is 0. Not the same as "digits after stripping zeros".
+    if name in ("scale", "min_scale", "trim_scale"):
+        # `scale` is the COUNT of decimal digits a numeric carries — `scale(1.50)`
+        # is 2, `scale(100)` is 0; not "digits after stripping zeros". `min_scale`
+        # IS that -- the smallest scale that keeps the value exactly -- and
+        # `trim_scale` returns the value re-scaled to it.
         if a is None:
             return None
         from decimal import Decimal as _Dec
@@ -4355,7 +4406,15 @@ def _plain_scalar(name: str, args: list[Any]) -> Any:
         d = a.to_decimal() if isinstance(a, bson.Decimal128) else a
         if not isinstance(d, _Dec):
             d = _Dec(str(d))
-        return max(0, -d.as_tuple().exponent)
+        if name == "scale":
+            return max(0, -d.as_tuple().exponent)
+        trimmed = d.normalize()
+        # `normalize` turns 1500 into 1.5E+3; a negative exponent is the scale,
+        # a positive one means no fractional digits at all.
+        min_scale = max(0, -trimmed.as_tuple().exponent)
+        if name == "min_scale":
+            return min_scale
+        return _Dec(d).quantize(_Dec(1).scaleb(-min_scale)) if min_scale else _Dec(int(d))
     if name in ("make_date", "make_time", "make_timestamp"):
         return _make_datetime(name, args)
     if name == "div":
@@ -4437,6 +4496,8 @@ PLAIN_SCALAR_TAGS = {
     "div": "numeric",
     "isfinite": "bool",
     "scale": "int4",
+    "min_scale": "int4",
+    "trim_scale": "numeric",
     "regexp_match": "text[]",
     "regexp_split_to_array": "text[]",
     "string_to_array": "text[]",
@@ -5052,11 +5113,17 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
                     width = j + 2 - i
                 if spec in "sIL":
                     if explicit is not None:
-                        val = rest[explicit - 1] if 0 < explicit <= len(rest) else None
+                        if not 0 < explicit <= len(rest):
+                            raise errors.SQLError("22023", "too few arguments for format()")
+                        val = rest[explicit - 1]
                     else:
-                        val = rest.pop(0) if rest else None
+                        # Running out mid-format is an ERROR in Postgres, not an
+                        # empty substitution: `format('%s %s', 'a')` is 22023.
+                        if not rest:
+                            raise errors.SQLError("22023", "too few arguments for format()")
+                        val = rest.pop(0)
                     if spec == "s":
-                        out.append("" if val is None else _as_text(val))
+                        out.append("" if val is None else _concat_text(val))
                     elif spec == "I":
                         # %I *is* quote_ident, so it quotes only when it must.
                         # Always quoting made `format('%I', 'tbl')` produce
