@@ -530,6 +530,10 @@ QUERIES = [
     "SELECT '[1,5)'::int4range = '[1,5)'::int4range",
     "SELECT pg_typeof(int4range(1,5))::text",
     "SELECT pg_typeof('[1,2)'::numrange)::text",
+    # A tsrange orders its own bounds, so a sub-millisecond bound has to be
+    # comparable — two timestamp composites had no comparison arm.
+    "SELECT tsrange('2026-01-01 00:00:00.5','2026-01-02')::text",
+    "SELECT '[2026-01-01 00:00:00.5,2026-01-02)'::tsrange::text",
 ]
 
 # (statement, verification query) — the write is compared by its row count AND
@@ -677,6 +681,13 @@ PARAMETERISED = [
     ("SELECT 1.50::numeric = %s", (Decimal("1.5"),)),
     ("SELECT array[1.5::numeric] = %s", ([Decimal("1.5")],)),
     ("SELECT array['2026-01-01'::date] = %s", ([dt.date(2026, 1, 1)],)),
+    # A range constructor whose BOUNDS argument is a parameter. Describe runs
+    # before Bind, so at plan time that argument is NULL — which is an error
+    # for a literal and must not be one for a placeholder.
+    ("SELECT int4range(%s::int4, %s::int4, %s)", (10, 20, "[]")),
+    ("SELECT int4range(%s::int4, %s::int4, %s)", (None, None, "()")),
+    ("SELECT int4range(%s::int4, %s::int4, %s)", (10, None, "[)")),
+    ("SELECT numrange(%s::numeric, %s::numeric, %s)", (Decimal("-100"), Decimal("100.123"), "(]")),
     # A bound NULL must behave exactly like a literal one.
     ("SELECT id FROM d WHERE n = %s", (None,)),
     ("SELECT id FROM d WHERE n <> %s", (None,)),
@@ -763,6 +774,7 @@ ERROR_QUERIES = [
     "SELECT '[5,1)'::int4range",
     "SELECT 'x'::int4range",
     "SELECT int4range(1,5,'x')",
+    "SELECT int4range(1,5,null)",
 ]
 
 

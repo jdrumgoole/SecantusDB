@@ -163,7 +163,7 @@ pub fn from_text(text: &str, type_name: &str) -> Result<Range> {
 
 /// Build from constructor arguments: `int4range(lo, hi)` and its three-argument
 /// form, where the third names the bounds as one of `[]`, `[)`, `(]`, `()`.
-pub fn from_args(args: &[Bson], type_name: &str) -> Result<Range> {
+pub fn from_args(args: &[Bson], type_name: &str, null_flags_is_error: bool) -> Result<Range> {
     let (element, discrete) = range_element(type_name)
         .ok_or_else(|| Error::Unsupported(format!("the {type_name} type")))?;
     if args.is_empty() || args.len() > 3 {
@@ -174,7 +174,24 @@ pub fn from_args(args: &[Bson], type_name: &str) -> Result<Range> {
     let bounds = match args.get(2) {
         Some(Bson::String(s)) => s.clone(),
         None => "[)".to_string(),
-        Some(_) => return Err(bad_range("bounds must be text")),
+        // A NULL flags argument is an error in PostgreSQL -- but at DESCRIBE
+        // time every parameter IS null, because Describe runs before Bind. So
+        // the caller says whether this NULL came from a placeholder (plan it
+        // as an unknown, and let Bind supply the real value) or from a literal
+        // `null` in the query (a real error). Without that split, every
+        // `int4range(%s, %s, %s)` failed at describe with a message about a
+        // malformed literal that named this server's own placeholder text.
+        Some(Bson::Null) if !null_flags_is_error => return Ok(Range::empty()),
+        Some(Bson::Null) => {
+            return Err(Error::DataException(
+                "range constructor flags argument must not be null".to_string(),
+            ))
+        }
+        Some(_) => {
+            return Err(Error::Parse(
+                "range constructor flags argument must be text".to_string(),
+            ))
+        }
     };
     let (lower_inc, upper_inc) = match bounds.as_str() {
         "[]" => (true, true),
@@ -288,5 +305,30 @@ fn step(text: &str, element: &str, by: i64) -> Result<String> {
         other => Err(Error::Unsupported(format!(
             "stepping a {other} range bound"
         ))),
+    }
+}
+
+/// The range type behind an oid, for decoding a bound parameter.
+pub fn range_oid_name(oid: u32) -> Option<&'static str> {
+    Some(match oid {
+        3904 => "int4range",
+        3926 => "int8range",
+        3906 => "numrange",
+        3912 => "daterange",
+        3908 => "tsrange",
+        3910 => "tstzrange",
+        _ => return None,
+    })
+}
+
+/// The oid of a range type's ELEMENT, for decoding its bounds.
+pub fn range_element_oid(type_name: &str) -> u32 {
+    match type_name {
+        "int4range" => 23,
+        "int8range" => 20,
+        "numrange" => 1700,
+        "daterange" => 1082,
+        "tsrange" => 1114,
+        _ => 1184,
     }
 }

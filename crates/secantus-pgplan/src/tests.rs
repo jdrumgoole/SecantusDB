@@ -1591,7 +1591,24 @@ fn range_errors_carry_postgres_classes() {
     let flags = crate::range::from_args(
         &[Bson::Int32(1), Bson::Int32(5), Bson::String("x".into())],
         "int4range",
+        true,
     )
     .expect_err("bad flags");
     assert_eq!(flags.sqlstate(), "42601");
+
+    // A literal NULL for the flags is a data error; the same NULL arriving
+    // from a not-yet-bound parameter is not, because Describe runs before Bind.
+    let null_literal = crate::range::from_args(
+        &[Bson::Int32(1), Bson::Int32(5), Bson::Null],
+        "int4range",
+        true,
+    )
+    .expect_err("null flags");
+    assert_eq!(null_literal.sqlstate(), "22000");
+    assert!(crate::range::from_args(
+        &[Bson::Int32(1), Bson::Int32(5), Bson::Null],
+        "int4range",
+        false,
+    )
+    .is_ok());
 }
