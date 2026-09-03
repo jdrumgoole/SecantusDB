@@ -4518,6 +4518,40 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   to `WriteError` and touching its ~20 construction sites. Worth doing
   deliberately; not worth bolting on, which is why it is still here.
 
+- [ ] **`$inc` / `$mul` int64 overflow DEFERS on the Rust server (3 shapes,
+  2026-09-03).** `{$inc: {a: 1}}` on `a: 2^63-1`, the same at the negative end,
+  and `{$mul: {a: 4}}` on `a: 2^62` all answer
+  `2 BadValue: query uses a construct the Rust server does not support`.
+  mongod (and the Python engine) report
+  `Failed to apply $inc operations to current value ((NumberLong)...) for
+  document {_id: 1}`. The code already matches; only the message does not,
+  because a `Fallback::Defer` has no Python engine behind it on the standalone
+  Rust server and degrades to the generic text. Fix is to return
+  `Fallback::mongo(2, <the real message>)` at the overflow sites in
+  `crates/secantus-core/src/update.rs`, the same shape used for every other
+  refused argument.
+
+- [ ] **`nModified` counts a `$min`/`$max` that declined to write (2 shapes,
+  2026-09-03).** `{$min: {a: 5}}` and `{$min: {a: -Infinity}}` over `a: NaN`
+  both correctly leave the field at NaN on both servers, but the Rust server
+  reports `nModified: 1` where mongod reports `0`. The Rust storage update path increments `modified` for every
+  matched document; the Python one guards it with `if new != doc`.
+
+  **Both cheap fixes are wrong, measured.** A BYTE comparison of the encoded
+  documents was tried and made things worse — `{$inc: {a: 1}}` over `a: NaN`
+  produces byte-identical output and mongod DOES count it modified, so the probe
+  went 6 → 7. A bson VALUE comparison fails the other way: `Bson::Double(NaN)`
+  is unequal to itself, so the `$min` case would still count as modified.
+
+  mongod's actual rule is "did an operator write the field", and Python satisfies
+  it only by ACCIDENT: Python's container equality short-circuits on object
+  identity, so a declined write preserves the value object and compares equal,
+  while `NaN + 1` is a fresh object that compares unequal to itself. Nothing in
+  Rust reproduces that incidentally. The fix is to thread a "wrote something"
+  flag out of `apply_update` — every `set_path` call site in
+  `crates/secantus-core/src/update.rs` — and count on that, which is a change
+  across every operator and is why it is filed rather than guessed at again.
+
 - [ ] **Aggregation expression error surface: 50 codes + 212 messages left
   (2026-09-02).** `tools/probes/agg_expressions.py` had never been reported on;
   running it found **551 wrong codes** across 58 operators on 3,968 cases, now

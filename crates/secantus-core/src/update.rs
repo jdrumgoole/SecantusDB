@@ -851,23 +851,39 @@ fn apply_op(
                 for cpath in expand_path(result, path, filters, pos)? {
                     // A *missing* field is set unconditionally; a present field
                     // (incl. an explicit null, rank 2) is compared by MongoDB's
-                    // BSON cross-type order via `order::bson_lt` — the direct
-                    // `_bson_lt` port, which (unlike the `$sort` comparator)
-                    // needs no transitivity and so covers bool / Decimal128 /
-                    // NaN / Binary / Timestamp / Regex / Min-MaxKey and the
-                    // decoded exotic text types. Only a DBPointer (Python's
-                    // type-name tiebreak) still defers.
+                    // SORT order, which is what `$min` / `$max` follow.
+                    //
+                    // NOT `order::bson_lt`, whose comment used to claim it
+                    // "covers NaN": it keeps IEEE semantics, where every NaN
+                    // comparison is false. mongod's sort order places NaN BELOW
+                    // -Infinity, so `{$min: {a: NaN}}` over `a: 5` sets the
+                    // field — and this left it untouched, a wrong value in a
+                    // WRITE path (probed 8.2.11, 2026-09-03).
+                    //
+                    // The two orders genuinely differ and both are mongod's:
+                    // the RANGE operators exclude NaN entirely, while sorting
+                    // places it first. `sortkey::encode_value` already encodes
+                    // that correctly, so this defers to it rather than
+                    // re-deriving the rule.
                     let should_set = match get_path(result, &cpath) {
                         None => true,
                         Some(current) => {
-                            let lt = if want_less {
-                                crate::order::bson_lt(value, current) // value < current
+                            let (lhs, rhs) = if want_less {
+                                (value, current)
                             } else {
-                                crate::order::bson_lt(current, value) // current < value
+                                (current, value)
                             };
-                            match lt {
-                                Some(l) => l,
-                                None => return Err(Fallback::Defer),
+                            match (
+                                crate::sortkey::encode_value(lhs, None),
+                                crate::sortkey::encode_value(rhs, None),
+                            ) {
+                                (Ok(a), Ok(b)) => a < b,
+                                // Anything the sort key cannot encode falls
+                                // back to the comparison order, as before.
+                                _ => match crate::order::bson_lt(lhs, rhs) {
+                                    Some(l) => l,
+                                    None => return Err(Fallback::Defer),
+                                },
                             }
                         }
                     };

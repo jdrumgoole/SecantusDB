@@ -10,6 +10,17 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from bson import (  # noqa: E402
+    Binary,
+    Code,
+    Decimal128,
+    Int64,
+    MaxKey,
+    MinKey,
+    Regex,
+    Timestamp,
+)
+
 from _servers import probe_targets, report  # noqa: E402
 
 CASES = [
@@ -32,6 +43,55 @@ CASES = [
     ({"a": 5}, {"$min": {"a": 3}}),
     ({"a": 5}, {"$min": {"a": "s"}}),  # cross-type BSON order
     ({"a": 5}, {"$max": {"a": None}}),
+    # ---- non-finite and boundary operands, added 2026-09-03.
+    #
+    # None of these value CLASSES was in this file. The same gap in
+    # `agg_expressions.py` hid thirteen crash-class bugs, and in
+    # `index_result_sets.py` it hid silent data loss through a partial index --
+    # both found the day this block was written. A write path is where a crash
+    # matters most, so these are here rather than left to a read sweep.
+    ({"a": 1}, {"$inc": {"a": float("inf")}}),
+    ({"a": 1}, {"$inc": {"a": float("nan")}}),
+    ({"a": float("inf")}, {"$inc": {"a": 1}}),
+    ({"a": float("inf")}, {"$inc": {"a": float("-inf")}}),
+    ({"a": float("nan")}, {"$inc": {"a": 1}}),
+    ({"a": 1}, {"$mul": {"a": float("inf")}}),
+    ({"a": 0}, {"$mul": {"a": float("inf")}}),
+    ({"a": float("nan")}, {"$mul": {"a": 0}}),
+    ({"a": Decimal128("2.5")}, {"$inc": {"a": 1}}),
+    ({"a": Decimal128("2.5")}, {"$mul": {"a": 2}}),
+    ({"a": 1}, {"$inc": {"a": Decimal128("NaN")}}),
+    ({"a": 1}, {"$inc": {"a": Decimal128("Infinity")}}),
+    # int64 overflow, the width above the int32 case already covered.
+    ({"a": Int64(2**63 - 1)}, {"$inc": {"a": 1}}),
+    ({"a": Int64(-(2**63))}, {"$inc": {"a": -1}}),
+    ({"a": Int64(2**62)}, {"$mul": {"a": 4}}),
+    # $min / $max against the ends of the BSON order and the non-finite values.
+    ({"a": 5}, {"$min": {"a": float("nan")}}),
+    ({"a": float("nan")}, {"$min": {"a": 5}}),
+    # NaN vs the infinities specifically: the sort order ranks NaN below
+    # -Infinity, so `$min` sets it even against the smallest finite bound and
+    # `$max` never chooses it. Measured against mongod 8.2.11 (2026-09-03) --
+    # a dedicated test asserted these against our own servers only, which
+    # proves nothing about mongod.
+    ({"a": float("-inf")}, {"$min": {"a": float("nan")}}),
+    ({"a": float("nan")}, {"$min": {"a": float("-inf")}}),
+    ({"a": float("nan")}, {"$max": {"a": 5}}),
+    ({"a": float("nan")}, {"$max": {"a": float("-inf")}}),
+    ({"a": 5}, {"$max": {"a": float("nan")}}),
+    ({"a": float("inf")}, {"$max": {"a": float("nan")}}),
+    ({"a": 5}, {"$max": {"a": float("inf")}}),
+    ({"a": 5}, {"$min": {"a": MinKey()}}),
+    ({"a": 5}, {"$max": {"a": MaxKey()}}),
+    ({"a": MaxKey()}, {"$min": {"a": 5}}),
+    # $set / $unset of the classes this file never wrote at all.
+    ({"a": 1}, {"$set": {"a": MinKey()}}),
+    ({"a": 1}, {"$set": {"a": float("nan")}}),
+    ({"a": 1}, {"$set": {"a": Decimal128("-0")}}),
+    ({"a": 1}, {"$set": {"a": Binary(b"z")}}),
+    ({"a": 1}, {"$set": {"a": Timestamp(1, 1)}}),
+    ({"a": 1}, {"$set": {"a": Regex("p", "i")}}),
+    ({"a": 1}, {"$set": {"a": Code("x=1")}}),
     # ---- array operators
     ({"a": [1, 2]}, {"$push": {"a": 3}}),
     ({"a": [1, 2]}, {"$push": {"a": {"$each": [3, 4], "$slice": -2}}}),

@@ -2345,6 +2345,23 @@ fn op_implies_bound(qop: &str, qv: &Bson, pop: &str, pv: &Bson) -> bool {
     // used for a query whose matching documents it does not contain, and
     // `find({a: 5, b: "x"})` returned NOTHING. Measured against mongod 8.2.11;
     // the Python server carried the same bug (`storage._op_implies_bound`).
+    // NaN satisfies NO range comparison -- `{b: {$lte: 1.5}}` and even
+    // `{b: {$gte: -Infinity}}` exclude it -- but it IS equal to itself, so
+    // `{b: NaN}` matches. The byte compare cannot see that: NaN's sort key
+    // orders below every number, so this concluded `{b: NaN}` implies
+    // `{b: {$lte: 1.5}}`, used a partial index that does not contain the
+    // document, and `find({b: NaN})` returned NOTHING where a collection scan
+    // and mongod both return it. Silent data loss on BOTH servers; measured
+    // 8.2.11, 2026-09-03.
+    //
+    // The type bracket below does NOT catch it -- NaN is inside the numeric
+    // bracket, and that comment's "within one bracket the byte compare is
+    // exactly right" has this one exception.
+    if pop != "$eq"
+        && (secantus_core::query::is_nan_bson(qv) || secantus_core::query::is_nan_bson(pv))
+    {
+        return false;
+    }
     if pop != "$eq" && type_bracket(&a) != type_bracket(&b) {
         return false;
     }

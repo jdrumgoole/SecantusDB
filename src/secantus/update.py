@@ -245,6 +245,34 @@ def _is_each_modifier(value: Any) -> bool:
     return isinstance(value, Mapping) and "$each" in value
 
 
+def _order_lt(a: Any, b: Any) -> bool:
+    """`a < b` in mongod's BSON SORT order, which is what `$min` / `$max` use.
+
+    NOT `ordering._bson_lt`, which keeps IEEE semantics where every NaN
+    comparison is false. mongod's sort order places NaN BELOW -Infinity, and
+    `$min` / `$max` follow the sort order rather than the comparison one:
+    `{$min: {a: NaN}}` over `a: 5` sets the field to NaN, and over `a: -Infinity`
+    it still does. Both servers left the field untouched -- a wrong value in a
+    WRITE path (probed 8.2.11, 2026-09-03).
+
+    The two semantics genuinely differ and both are mongod's: the RANGE
+    operators exclude NaN entirely (`{$lt: 0}` does not match it, nor does
+    `{$gt: -Infinity}`), while sorting places it first. `sortkey.encode_value`
+    is the sort order and already encodes NaN correctly, so this defers to it
+    rather than re-deriving the rule.
+    """
+    from secantus.sortkey import encode_value
+
+    try:
+        return encode_value(a) < encode_value(b)
+    except Exception:
+        # Anything the sort key cannot encode falls back to the comparison
+        # order, which is what this used before.
+        from secantus.ordering import _bson_lt
+
+        return _bson_lt(a, b)
+
+
 def _apply_push(arr: list[Any], value: Any) -> list[Any]:
     """Apply one `$push` to `arr` (a fresh copy). A plain value is appended; the
     `{$each: [...]}` modifier form appends each element, honouring `$position`
@@ -952,22 +980,17 @@ def _apply_op(
                 _set_path(doc, concrete, _arith_or_overflow("$mul", doc, current, factor, bson_mul))
     elif op == "$min":
         # A missing field is set unconditionally; otherwise compare by MongoDB's
-        # BSON cross-type order (`_bson_lt`), not Python `<` — so a cross-type
-        # pair (e.g. a string vs a number) orders like mongod instead of raising
-        # a TypeError, and an explicit-null current is a real value (rank 2), not
-        # "no current".
-        from secantus.ordering import _bson_lt
-
+        # BSON cross-type order -- so a cross-type pair (e.g. a string vs a
+        # number) orders like mongod instead of raising a TypeError, and an
+        # explicit-null current is a real value (rank 2), not "no current".
         for path, value in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
-                if not has_path(doc, concrete) or _bson_lt(value, get_path(doc, concrete)):
+                if not has_path(doc, concrete) or _order_lt(value, get_path(doc, concrete)):
                     _set_path(doc, concrete, value)
     elif op == "$max":
-        from secantus.ordering import _bson_lt
-
         for path, value in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
-                if not has_path(doc, concrete) or _bson_lt(get_path(doc, concrete), value):
+                if not has_path(doc, concrete) or _order_lt(get_path(doc, concrete), value):
                     _set_path(doc, concrete, value)
     elif op == "$push":
         for path, value in payload.items():
