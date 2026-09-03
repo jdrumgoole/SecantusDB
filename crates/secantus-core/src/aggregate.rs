@@ -550,8 +550,13 @@ pub fn is_constant_expression(expr: &Bson, bound: &[String]) -> bool {
             }
             // `$rand` is non-deterministic; the binding operators take their
             // variable from the input, so `$map` over a literal still does not
-            // fold (probed).
-            if matches!(op.as_str(), "$rand" | "$map" | "$filter" | "$reduce") {
+            // fold (probed). `$getField` never folds either -- not even with a
+            // wholly literal `input` (`{$getField: {field: 0, input: {a: 1}}}`
+            // is an EXECUTOR error on 8.2.11, probed 2026-09-02).
+            if matches!(
+                op.as_str(),
+                "$rand" | "$map" | "$filter" | "$reduce" | "$getField"
+            ) {
                 return false;
             }
             if op == "$let" {
@@ -647,9 +652,13 @@ fn collect_numeric_guard(expr: &Bson, found: &mut Option<(String, i32, Bson)>) {
                 }
                 if let Some((_, code)) = NUMERIC_GUARD.iter().find(|(n, _)| n == k) {
                     // A one-element list is the single argument (`apply_op`
-                    // unwraps it); anything else is the argument itself.
+                    // unwraps it). For `$round` / `$trunc` the list is
+                    // `[input, place]` and the numeric guard is about the
+                    // INPUT: taking the whole array named its type as "array",
+                    // where mongod names the input's ("string" for
+                    // `{$round: ["abc", 1]}`).
                     let arg = match v {
-                        Bson::Array(a) if a.len() == 1 => a[0].clone(),
+                        Bson::Array(a) if !a.is_empty() => a[0].clone(),
                         other => other.clone(),
                     };
                     *found = Some((k.clone(), *code, arg));

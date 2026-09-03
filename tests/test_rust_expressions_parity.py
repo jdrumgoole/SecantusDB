@@ -285,7 +285,8 @@ CURATED = [
     ({"$strLenCP": "hello"}, {}),
     ({"$split": ["a,b,c", ","]}, {}),
     ({"$split": ["$a", "-"]}, {"a": "1-2-3"}),
-    # Invalid $split: Rust defers (None); Python raises 40085/40086/40087/16020.
+    # Invalid $split: both engines now NAME these -- 40085 / 10503900 / 40087 /
+    # 16020 (the second argument's code is not 40086 on 8.2.11).
     ({"$split": ["a,b", ""]}, {}),  # empty sep
     ({"$split": [5, ","]}, {}),  # non-string first
     ({"$split": ["a,b", 5]}, {}),  # non-string second
@@ -1626,16 +1627,24 @@ def test_array_set_typeguard_defers_and_raises(expr, code):
     ],
 )
 def test_string_typeguard_defers_and_raises(expr, code):
-    # Non-string argument to these operators: Rust must defer (raw evaluate None)
-    # so the pure engine raises mongod's exact code. The regex ops previously
-    # silently returned false/null/[] on both engines.
+    """A non-string argument reaches the client as mongod's code either way.
+
+    Rust may DEFER (the pure engine then raises) or NAME the error itself; what
+    must hold is that the client sees `code`. This asserted `raw is None` --
+    pinning the gating DECISION rather than the behaviour -- so it broke the
+    moment these operators learned to name their own error, which is the point
+    of naming them. The regex ops previously returned false/null/[] silently on
+    both engines.
+    """
     doc = bson.decode(bson.encode({"_id": 1}))
     expr = bson.decode(bson.encode({"e": expr}))["e"]
     raw = _rust.evaluate(bson.encode(doc), bson.encode({"e": expr}), bson.encode({}))
-    assert raw is None
+    named = bson.decode(raw).get("err") if raw is not None else None
     with pytest.raises(_pure.ExpressionError) as exc:
         _pure.evaluate(expr, doc)
     assert exc.value.code == code
+    if named is not None:
+        assert (named["code"], named["errmsg"]) == (exc.value.code, str(exc.value))
 
 
 @pytest.mark.parametrize(
@@ -1647,7 +1656,7 @@ def test_string_typeguard_defers_and_raises(expr, code):
         ({"$let": {"vars": {}, "in": "$$x"}}, 17276),
         ({"$switch": {"branches": []}}, 40068),
         ({"$ifNull": [1]}, 1257300),
-        ({"$getField": {"field": 5, "input": {}}}, 5654602),
+        ({"$getField": {"field": 5, "input": {}}}, 3041704),
         ({"$setField": {"field": 5, "input": {}, "value": 1}}, 4161107),
         ({"$sortArray": {"input": [1], "sortBy": "x"}}, 2942507),
         ({"$convert": {"input": 5}}, 9),
@@ -1655,13 +1664,17 @@ def test_string_typeguard_defers_and_raises(expr, code):
     ],
 )
 def test_date_misc_typeguard_defers_and_raises(expr, code):
-    # Date/misc operator error cases: Rust must defer (raw evaluate None) so the
-    # pure engine raises mongod's exact code. $dateToString and $dateDiff missing
-    # endDate were silent accepts.
+    """As above: defer or name it, but the client must see `code` either way.
+
+    `$dateToString` and a `$dateDiff` missing its `endDate` were silent accepts
+    before this existed.
+    """
     doc = bson.decode(bson.encode({"_id": 1}))
     expr = bson.decode(bson.encode({"e": expr}))["e"]
     raw = _rust.evaluate(bson.encode(doc), bson.encode({"e": expr}), bson.encode({}))
-    assert raw is None
+    named = bson.decode(raw).get("err") if raw is not None else None
     with pytest.raises(_pure.ExpressionError) as exc:
         _pure.evaluate(expr, doc)
     assert exc.value.code == code
+    if named is not None:
+        assert (named["code"], named["errmsg"]) == (exc.value.code, str(exc.value))

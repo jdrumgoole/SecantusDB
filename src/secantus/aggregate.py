@@ -722,6 +722,49 @@ def _expression_shape_problem(spec: Any) -> tuple[int, str] | None:
                         f"Expression {key} takes at least {low} arguments, and at most "
                         f"{high}, but {count} were passed in.",
                     )
+            # A document operand is the `{date, timezone}` OPTIONS form -- unless
+            # it is a nested operator expression (`{$year: {$add: [1, 2]}}`),
+            # which is one `$`-key.
+            if (
+                key in _DATE_EXTRACTORS
+                and isinstance(value, Mapping)
+                and not (len(value) == 1 and next(iter(value)).startswith("$"))
+            ):
+                # The unrecognised-key check runs FIRST and reports the first
+                # offender, even when `date` is present and valid; only then
+                # does the missing-`date` check fire. Probed 8.2.11
+                # (2026-09-02) -- both were silently accepted here, so
+                # `{$year: {date: d, k: 1}}` answered the year.
+                for opt in value:
+                    if opt not in ("date", "timezone"):
+                        return (40535, f'unrecognized option to {key}: "{opt}"')
+                if "date" not in value:
+                    # `bson_value_repr`, not the `_stage` form: mongod renders
+                    # the echoed document with INNER SPACES here
+                    # (`{ timezone: "UTC" }`) and WITHOUT them in
+                    # `$replaceRoot`'s "Input document: {n: 1}" -- two message
+                    # families, two renderings, both probed 8.2.11 (2026-09-02).
+                    # An empty document is bare `{}` in both.
+                    rendered = "{}" if not value else bson_value_repr(value)
+                    return (
+                        40539,
+                        f"missing 'date' argument to {key}, provided: {key}: {rendered}",
+                    )
+            # `$getField`'s two OBJECT-form complaints are parse errors: both
+            # fire on an EMPTY collection (probed 8.2.11, 2026-09-02). The bare
+            # form's "must evaluate to type String" is not -- that one runs per
+            # document -- so it stays in the evaluator. A single `$`-key
+            # document is a nested expression, not the options form.
+            if (
+                key == "$getField"
+                and isinstance(value, Mapping)
+                and not (len(value) == 1 and next(iter(value)).startswith("$"))
+            ):
+                for opt in value:
+                    if opt not in ("field", "input"):
+                        return (3041701, f"$getField found an unknown argument: {opt}")
+                if "input" not in value:
+                    return (3041703, "$getField requires 'input' to be specified")
             if key in _DATE_EXTRACTORS and isinstance(value, list) and len(value) != 1:
                 return (
                     40536,
@@ -736,9 +779,16 @@ def _expression_shape_problem(spec: Any) -> tuple[int, str] | None:
             if (code := _OBJECT_SPEC_EXPRESSIONS.get(key)) is not None and not isinstance(
                 value, Mapping
             ):
+                # `bson_value_repr`, not the `_stage` form. mongod renders the
+                # offending value here in its SHELL form -- `ObjectId('...')`,
+                # `new Date(1767323045000)`, `BinData(0, 7A)`, and containers
+                # with inner spaces -- while `$replaceRoot`'s "Input document:"
+                # uses the compact form with none of those. Two message
+                # families, two serializers; probed side by side on 8.2.11
+                # (2026-09-02). One renderer had been standing in for both.
                 return (
                     code,
-                    f"specification must be an object; found {key}: {bson_value_repr_stage(value)}",
+                    f"specification must be an object; found {key}: {bson_value_repr(value)}",
                 )
             found = _expression_shape_problem(value)
             if found:

@@ -2236,7 +2236,7 @@ def test_date_misc_typeguard_codes_via_pymongo(coll) -> None:
         ({"$dateFromString": {"dateString": "$n"}}, 241),
         ({"$switch": {"branches": []}}, 40068),
         ({"$ifNull": ["$n"]}, 1257300),
-        ({"$getField": {"field": "$n", "input": {}}}, 5654602),
+        ({"$getField": {"field": "$n", "input": {}}}, 3041704),
         ({"$dateDiff": {"startDate": "$$NOW"}}, 5166304),
     ]:
         with pytest.raises(OperationFailure) as exc:
@@ -5282,15 +5282,21 @@ def test_aggregation_whole_double_index_accepted(coll) -> None:
 
 
 def test_split_argument_validation_via_pymongo(coll) -> None:
-    """$split: empty separator 40087, non-string first/second 40085/40086, wrong
-    arg count 16020; a null string / separator yields null. mongod 7.0.12-verified."""
+    """$split: empty separator 40087, non-string first/second 40085/10503900,
+    wrong arg count 16020; a null string / separator yields null.
+
+    Re-probed against 8.2.11 (2026-09-02): the SECOND argument's code moved to
+    10503900 while the first kept 40085. The 40086 recorded here was correct for
+    the 7.0.12 this was originally verified against, and survived the 8.x
+    retarget unchecked -- a stale citation, not a regression.
+    """
     from pymongo.errors import OperationFailure
 
     coll.insert_one({"_id": 1})
     for expr, code in [
         ({"$split": ["a,b", ""]}, 40087),
         ({"$split": [5, ","]}, 40085),
-        ({"$split": ["a,b", 5]}, 40086),
+        ({"$split": ["a,b", 5]}, 10503900),
         ({"$split": ["a,b"]}, 16020),
     ]:
         with pytest.raises(OperationFailure) as exc:

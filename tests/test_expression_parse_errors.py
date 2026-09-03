@@ -221,9 +221,22 @@ class TestGetField:
 
     @pytest.mark.parametrize(("arg", "type_name"), [(0, "int"), ([1], "array"), (None, "null")])
     def test_a_bare_non_string_reports_the_FIELD_type(self, arg, type_name):
-        code, text = stage_error({"$getField": arg})
-        assert code == 3041704
-        assert f"requires 'field' to evaluate to type String, but got {type_name}" in text
+        """RUNTIME, not parse time -- so this asserts the evaluator.
+
+        The bare form was listed here as a parse error, which nothing could
+        check: `stage_error` only reached it because the constant-fold pre-pass
+        happened to evaluate the expression and surface its exception. Probed
+        8.2.11 (2026-09-02): on an EMPTY collection `{$getField: 0}` returns no
+        documents and no error, so mongod raises it per document. The two
+        OBJECT-form complaints below really are parse errors -- they do fire on
+        an empty collection -- and stay on `stage_error`.
+        """
+        with pytest.raises(ExpressionError) as excinfo:
+            evaluate({"$getField": arg}, {})
+        assert excinfo.value.code == 3041704
+        assert f"requires 'field' to evaluate to type String, but got {type_name}" in str(
+            excinfo.value
+        )
 
     def test_an_unknown_argument_outranks_everything(self):
         code, text = stage_error({"$getField": {"k": 1}})

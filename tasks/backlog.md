@@ -4382,15 +4382,32 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   precision and overflow behaviour all differ per operator, so this is 19
   individually-probed operators rather than one change).
 
-  Original entry, for the record: **1,376 of 3,968 (2026-09-02).**
-  Was 1,376; the parse pass below took out the systematic half. **946 of the
-  981 are `Fallback::Defer`** -- the engine declining a bad ARGUMENT rather than
-  naming mongod's error, which on the standalone server is "operator not
-  supported" for what is a bad operand. Spread across ~120 operators and driven
-  by the operand TYPE (`Decimal128("2.5")` 110 shapes, `1.5` 72, `"abc"` 69,
-  `""` 69, `1099511627776` 65), so it is a per-operator campaign of the same
-  shape as the `operator_error_surface` one that went 583 -> 0, not another
-  systematic pass. Zero wrong VALUES throughout.
+  **The per-operator campaign RAN: 908 -> 117 (2026-09-02).** The Rust server's
+  `agg_expressions` column went from 902 code + 6 message divergences to **117
+  code + 0 message**, and the Python server's from 50 + 212 to **28 + 80**.
+  Zero wrong VALUES throughout, before and after. What closed it was giving each
+  operator mongod's own sentence instead of a defer -- the date extractors
+  (16006), the `$convert` shorthands (50723 / 241), fourteen type-guarded
+  operators, and the parse-time refusals for `$ifNull` / `$setEquals` / `$rand` /
+  `$getField`. Four capabilities the defers had been hiding also shipped:
+  `$toDate` of a string / ObjectId / Timestamp, and `$toLong` / `$toDouble` /
+  `$toDecimal` of a date. See `changelog.d/rust-operand-error-surface.md` and
+  `tests/test_expression_operand_errors.py`.
+
+  **What remains, characterised rather than counted (117 shapes):**
+
+  | shapes | area |
+  | --- | --- |
+  | 28 | Decimal128 arithmetic and the transcendentals -- the half deliberately left to the decimal engine (the item above) |
+  | ~20 | `$mergeObjects`, which renders the offending VALUE (`input "abc" is of type string`), so it needs mongod's value renderer per type |
+  | ~14 | the trigonometric domain errors (50989 `cannot apply $acos to 1.09951e+12, value must be in [-1,1]`), which need the same `%g` rendering |
+  | ~12 | the arithmetic type guards (`$add` / `$divide` / `$mod` / `$multiply` / `$subtract` / `$atan2`), adjacent to the decimal work |
+  | 4 | `$firstN` / `$lastN` / `$maxN` / `$minN` report `5787906 Missing value for 'n'` where mongod checks the UNKNOWN argument first (`5787901`) |
+  | ~6 | value gaps: `$substr*` of an array is `""`, `$strcasecmp` coerces a number, `$range` and `$round` arity |
+
+  The two rendering families are one piece of work, not two: both need mongod's
+  C++ `%g` double form (`3e+09`, not Rust's `3e9`). `format_double_g` already
+  exists in `expressions.rs` and is what `mongo_val_repr` uses.
 
   Original entry, for the record: **1,376 of 3,968 (2026-09-02).**
   Measured for the first time by pointing `agg_expressions.py` at the Rust
@@ -4406,6 +4423,38 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   next line did not. Fixed with the arity check mongod has (17045), which is
   also what makes the slice safe — but the shape is worth grepping for: an
   `Option`-safe accessor followed by a raw slice of the same collection.
+
+### 7.0a Run the differential gate in CI — AGREED, not yet done (2026-09-03)
+
+`tests/test_mongod_differential.py` skips wherever `mongod` is absent, and the
+PR lane (`ubuntu-latest`) installs `mongosh` + database-tools but no server. So
+the gate that exists to catch error-surface drift runs only on a dev box, and a
+green CI is not evidence for the class of change it covers -- which is exactly
+the class the operand-error campaign above was.
+
+**There is no recorded decision against it.** The comment in the test file
+states the absence as a FACT and then uses it to argue for a different design
+(gate the whole file rather than a list of known-variant cases). Nobody wrote
+down "we chose not to install mongod".
+
+**It has run in CI before and paid for itself.** The entry further down records
+that on 2026-08-29 the `windows-latest` image shipped its own `mongod`, the gate
+ran there, and it failed twice on genuinely version-dependent assertions
+(`codeName` above code 10000; upserted-field ordering). Neither reproduced
+locally. Whether that image still ships one has NOT been re-checked.
+
+**The change is small.** The Linux job already adds the `mongodb-org` apt repo
+and installs two packages from it; `mongodb-org-server` is close to one line,
+and `PROBED_MONGOD_MAJOR = 8` means an 8.x server runs rather than skips.
+
+**The hazard, and why this is its own PR.** The apt repo is pinned to **8.0**
+while every expectation here was probed on **8.2.1 / 8.2.11**. The gate compares
+only the MAJOR, so 8.0 would run -- and this file has already been bitten by a
+PATCH-level difference (the expected-type list ordering that needed
+`_sort_type_lists`). Turning the gate on against 8.0 risks manufacturing exactly
+the false failures the file's design was built to avoid. **Pin the repo to 8.2**
+so CI measures what the expectations were taken from. Land it alone, so any
+failure it surfaces is unambiguously drift rather than an unrelated change.
 
 ### 7.0 Cache-pressure rollback — CI exercises it now
 

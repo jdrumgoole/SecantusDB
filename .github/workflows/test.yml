@@ -1904,6 +1904,7 @@ jobs:
           tests/test_rust_arg_types_sweep.py tests/test_rust_pitr_cross_server.py
           tests/test_getmore_batching.py tests/test_rbac_pipeline.py
           tests/test_rust_server_stress.py tests/test_decimal128_ordering.py
+          tests/test_expression_operand_errors.py
           -o addopts= -p no:cacheprovider -q
 
       - name: Rust-server concurrency invariants (#451 stress suite)

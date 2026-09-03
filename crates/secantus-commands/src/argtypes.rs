@@ -1345,6 +1345,40 @@ const EXPRESSION_ARITY: &[(&str, usize, usize)] = &[
     ("$slice", 2, 3),
 ];
 
+/// Operators mongod rejects at PARSE time for having too few operands, with the
+/// code and the exact sentence each uses. Not one wording: `$ifNull` puts a
+/// comma before "had" and `$setEquals` does not. A non-array operand counts as
+/// one. Probed 8.2.11 (2026-09-02).
+const MIN_OPERANDS: &[(&str, usize, i32, &str)] = &[
+    (
+        "$ifNull",
+        2,
+        1257300,
+        "$ifNull needs at least two arguments, had: {}",
+    ),
+    (
+        "$setEquals",
+        2,
+        17045,
+        "$setEquals needs at least two arguments had: {}",
+    ),
+];
+
+/// The `$convert` shorthands. Each takes exactly one operand, and mongod counts
+/// it at PARSE time: an ARRAY of any length but one is `50723`, while a bare
+/// operand is always a single argument whatever its type. Probed 8.2.11
+/// (2026-09-02) -- `{$toInt: [1]}` is 1, `{$toInt: []}` is "got 0".
+const SINGLE_ARG_CONVERSIONS: &[&str] = &[
+    "$toBool",
+    "$toDate",
+    "$toDecimal",
+    "$toDouble",
+    "$toInt",
+    "$toLong",
+    "$toObjectId",
+    "$toString",
+];
+
 /// The date extractors, which take a bare expression OR a one-element array.
 const DATE_EXTRACTORS: &[&str] = &[
     "$dayOfMonth",
@@ -1459,7 +1493,119 @@ pub(crate) fn expression_shape_problem(spec: &Bson) -> Option<(i32, String)> {
                         ));
                     }
                 }
+                if let Some((_, min, code, template)) =
+                    MIN_OPERANDS.iter().find(|(op, _, _, _)| *op == key)
+                {
+                    let count = match value {
+                        Bson::Array(a) => a.len(),
+                        _ => 1,
+                    };
+                    if count < *min {
+                        return Some((*code, template.replace("{}", &count.to_string())));
+                    }
+                }
+                // `$rand` takes an empty document or an empty array and nothing
+                // else: a scalar is 10065 (a PARAMETER complaint) while a
+                // non-empty array is 3040501 (an ARGUMENT one). Two codes for
+                // what reads as one mistake -- probed 8.2.11 (2026-09-02).
+                if key == "$rand" {
+                    match value {
+                        // An EMPTY document or array is the no-argument call.
+                        Bson::Document(d) if d.is_empty() => {}
+                        Bson::Array(a) if a.is_empty() => {}
+                        // A non-empty one of either is "does not currently
+                        // accept arguments"; a SCALAR is the different
+                        // complaint that it is not an object at all. Probed
+                        // 8.2.11 (2026-09-02) -- `{$rand: {k: 1}}` is 3040501,
+                        // not the 10065 a document-shaped check would give.
+                        Bson::Document(_) | Bson::Array(_) => {
+                            return Some((
+                                3040501,
+                                "$rand does not currently accept arguments".to_string(),
+                            ))
+                        }
+                        _ => {
+                            return Some((
+                                10065,
+                                "invalid parameter: expected an object ($rand)".to_string(),
+                            ))
+                        }
+                    }
+                }
+                if key == "$getField" {
+                    if let Bson::Document(spec) = value {
+                        // A single `$`-key document is a nested EXPRESSION, not
+                        // the options form: `{$getField: {$literal: "$odd"}}` is
+                        // how a literally-dollared field name is written, and
+                        // reading it as options refused `$literal` as an unknown
+                        // argument (probed 8.2.11, 2026-09-02).
+                        let is_operator = spec.len() == 1
+                            && spec.keys().next().is_some_and(|k| k.starts_with('$'));
+                        if let Some(bad) = spec
+                            .keys()
+                            .filter(|_| !is_operator)
+                            .find(|k| !matches!(k.as_str(), "field" | "input"))
+                        {
+                            return Some((
+                                3041701,
+                                format!("$getField found an unknown argument: {bad}"),
+                            ));
+                        }
+                        // Also parse-time: both of `$getField`'s object-form
+                        // complaints fire on an EMPTY collection. The bare
+                        // form's "must evaluate to type String" does not --
+                        // that one runs per document, so it stays in the
+                        // evaluator (probed 8.2.11, 2026-09-02).
+                        if !is_operator && !spec.contains_key("input") {
+                            return Some((
+                                3041703,
+                                "$getField requires 'input' to be specified".to_string(),
+                            ));
+                        }
+                    }
+                }
+                if SINGLE_ARG_CONVERSIONS.contains(&key.as_str()) {
+                    if let Bson::Array(a) = value {
+                        if a.len() != 1 {
+                            return Some((
+                                50723,
+                                format!("{key} requires a single argument, got {}", a.len()),
+                            ));
+                        }
+                    }
+                }
                 if DATE_EXTRACTORS.contains(&key.as_str()) {
+                    // A document operand is the `{date, timezone}` OPTIONS
+                    // form -- unless it is a nested operator expression
+                    // (`{$year: {$add: [1, 2]}}`), which is one `$`-key.
+                    if let Bson::Document(opts) = value {
+                        let is_operator = opts.len() == 1
+                            && opts.keys().next().is_some_and(|k| k.starts_with('$'));
+                        if !is_operator {
+                            // The unrecognised-key check runs FIRST and reports
+                            // the first offender, even when `date` is present
+                            // and valid; only then does the missing-`date`
+                            // check fire. Probed 8.2.11 (2026-09-02).
+                            if let Some(bad) = opts
+                                .keys()
+                                .find(|k| !matches!(k.as_str(), "date" | "timezone"))
+                            {
+                                return Some((
+                                    40535,
+                                    format!("unrecognized option to {key}: \"{bad}\""),
+                                ));
+                            }
+                            if !opts.contains_key("date") {
+                                return Some((
+                                    40539,
+                                    format!(
+                                        "missing 'date' argument to {key}, provided: {key}: {}",
+                                        render_stage_value(value)
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                     if let Bson::Array(a) = value {
                         if a.len() != 1 {
                             return Some((
