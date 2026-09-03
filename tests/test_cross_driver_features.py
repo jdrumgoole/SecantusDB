@@ -170,6 +170,35 @@ def _run(
     return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
 
 
+def _run_provision(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    timeout: float,
+) -> subprocess.CompletedProcess | None:
+    """A toolchain-PROVISIONING subprocess (`npm install`, `bundle install`, a
+    Maven build). Returns ``None`` if it timed out.
+
+    Every `_ensure_*` helper below is documented as returning ``False`` when the
+    toolchain cannot be provisioned -- offline, no registry, a cold cache -- so
+    that the smoke needing it SKIPS. They only ever checked the exit code, while
+    `_run` passes `timeout` straight to `subprocess.run`, which RAISES
+    `TimeoutExpired`. A registry that is merely SLOW therefore failed the build
+    where the helper's own contract says skip: four CI shards went red on
+    `npm install` exceeding 300s, and a rerun cleared three and not the fourth
+    (2026-09-03).
+
+    A timeout here means what a non-zero exit means -- no usable toolchain right
+    now -- so it is reported the same way. Deliberately NOT folded into `_run`:
+    in a test BODY a timeout is a real failure and must stay one.
+    """
+    try:
+        return _run(cmd, cwd=cwd, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+
+
 def _run_mongosh(
     cmd: list[str],
     *,
@@ -236,8 +265,8 @@ def _ensure_node_modules() -> bool:
         # have populated it while we were blocked.
         if (nm / "mongodb").is_dir():
             return True
-        result = _run([_NPM, "install", "--silent"], cwd=_NODE_SMOKE_DIR, timeout=300.0)
-        return result.returncode == 0 and (nm / "mongodb").is_dir()
+        result = _run_provision([_NPM, "install", "--silent"], cwd=_NODE_SMOKE_DIR, timeout=300.0)
+        return result is not None and result.returncode == 0 and (nm / "mongodb").is_dir()
 
 
 def _ensure_ruby_bundle() -> bool:
@@ -254,15 +283,13 @@ def _ensure_ruby_bundle() -> bool:
     env = {**os.environ, "PATH": f"{Path(_RUBY).parent}:{os.environ.get('PATH', '')}"}
 
     def _probe() -> bool:
-        return (
-            _run(
-                [_BUNDLE, "exec", "ruby", "-e", "require 'mongo'"],
-                cwd=_RUBY_SMOKE_DIR,
-                env=env,
-                timeout=30.0,
-            ).returncode
-            == 0
+        probe = _run_provision(
+            [_BUNDLE, "exec", "ruby", "-e", "require 'mongo'"],
+            cwd=_RUBY_SMOKE_DIR,
+            env=env,
+            timeout=30.0,
         )
+        return probe is not None and probe.returncode == 0
 
     if _probe():
         return True
@@ -274,13 +301,13 @@ def _ensure_ruby_bundle() -> bool:
         fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
         if _probe():
             return True
-        result = _run(
+        result = _run_provision(
             [_BUNDLE, "install", "--quiet"],
             cwd=_RUBY_SMOKE_DIR,
             env=env,
             timeout=300.0,
         )
-        return result.returncode == 0 and _probe()
+        return result is not None and result.returncode == 0 and _probe()
 
 
 def _ensure_php_vendor() -> bool:
@@ -298,12 +325,12 @@ def _ensure_php_vendor() -> bool:
         fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
         if nm.is_dir():
             return True
-        result = _run(
+        result = _run_provision(
             [_COMPOSER, "install", "--no-interaction", "--quiet"],
             cwd=_PHP_SMOKE_DIR,
             timeout=300.0,
         )
-        return result.returncode == 0 and nm.is_dir()
+        return result is not None and result.returncode == 0 and nm.is_dir()
 
 
 def _java_smokes_jar_is_fresh() -> bool:
@@ -362,12 +389,12 @@ def _ensure_java_smokes_jar() -> bool:
         # usually have multiple JDKs and Gradle's default scan picks
         # the highest, so we rely on JAVA_HOME / sourceCompatibility=17
         # in build.gradle rather than mandating a toolchain block.
-        result = _run(
+        result = _run_provision(
             [_GRADLE, "smokesJar", "--no-daemon", "-q"],
             cwd=_JAVA_SMOKE_DIR,
             timeout=600.0,
         )
-        return result.returncode == 0 and _JAVA_SMOKES_JAR.is_file()
+        return result is not None and result.returncode == 0 and _JAVA_SMOKES_JAR.is_file()
 
 
 def _run_java_smoke(
@@ -2464,12 +2491,12 @@ def _ensure_rust_bin(bin_name: str) -> bool:
             return True
         # cargo build can take 60–120s on a cold target/. Give it
         # enough room without making the harness hostage to a wedge.
-        result = _run(
+        result = _run_provision(
             [_CARGO, "build", "--release", "--bin", bin_name],
             cwd=_RUST_SMOKE_DIR,
             timeout=300.0,
         )
-        return result.returncode == 0 and target.is_file()
+        return result is not None and result.returncode == 0 and target.is_file()
 
 
 def _run_rust_smoke(
