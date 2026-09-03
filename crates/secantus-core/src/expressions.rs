@@ -3133,9 +3133,7 @@ const HALF_PI_TEXT: &str = "1.570796326794896619231321691639751";
 
 /// A `Decimal128` BSON value from its decimal text.
 fn decimal_from_text(text: &str) -> R {
-    Ok(Bson::Decimal128(
-        text.parse().map_err(|_| Fallback::Defer)?,
-    ))
+    Ok(Bson::Decimal128(text.parse().map_err(|_| Fallback::Defer)?))
 }
 
 fn trig_operand_repr(value: &Bson, x: f64) -> String {
