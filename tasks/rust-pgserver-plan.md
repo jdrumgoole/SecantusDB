@@ -846,7 +846,44 @@ first two were both `22P02` until the probe compared codes.
 **Still open here:** multirange (`int4multirange` etc.), and the range OPERATORS
 (`@>`, `<@`, `&&`), which `test_range.py` exercises heavily.
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692.**
+### 0.28 ranges as parameters -- and a bug 0.27 shipped (2026-09-03)
+
+**1693 -> ~1790, +96.** Two thirds of it was fixing what the previous batch
+broke.
+
+**0.27's probe covered only LITERAL ranges, and the gauge said so within the
+hour.** `malformed range literal: "bounds must be text"` appeared 120 times --
+this server's own internal placeholder string, quoted back at the client as
+though it were the user's input. Every `int4range(%s, %s, %s)` failed.
+
+**The cause is Describe running before Bind.** At plan time every parameter is
+NULL, and a NULL flags argument IS an error in PostgreSQL
+(`int4range(1,5,null)` -> 22000). Rejecting it at describe time rejected every
+parameterised constructor. The two have to be told apart by the AST: a `null`
+WRITTEN in the query is an error, a not-yet-bound `ParamRef` is not. **This is
+the third time this session that Describe-before-Bind has produced a bug** (the
+first typed `$1::int` as varchar, the second typed a NULL result as text) --
+it is worth checking every new plan-time refusal against it.
+
+**+42 from that fix alone**, before any new feature.
+
+**Then binary range parameters (+~50):** the wire form is a flags byte and each
+present bound length-prefixed in the ELEMENT's binary format, so it reuses the
+element decoder rather than needing a range-specific one.
+
+**And a gap underneath both:** a `tsrange` must ORDER its bounds to
+canonicalise, and two timestamp COMPOSITES (the sub-millisecond form) had no
+comparison arm -- so the error said "comparing timestamp range bounds", naming
+ranges for a hole in timestamp comparison. Fixed generally: anything that names
+an instant now compares as one.
+
+**Probe: 12 constructor shapes + 18 value shapes across both formats, 0
+divergences.** The lesson from 0.27 restated: **probe the PARAMETER form as well
+as the literal form.** They are different code paths in this server, and a
+literal-only probe passed everything while the parameter form was broken for
+every single case.
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790.**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

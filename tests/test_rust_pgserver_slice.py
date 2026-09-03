@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 psycopg = pytest.importorskip("psycopg")
+from psycopg.types.range import Range  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 BINARY = REPO / "crates" / "secantus-pgserver" / "target" / "debug" / "secantusd-pg"
@@ -1352,3 +1353,70 @@ def test_range_errors_use_three_different_classes(home: Path) -> None:
             with pytest.raises(psycopg.Error) as exc:
                 cur.execute(f"select {expr}")
             assert exc.value.diag.sqlstate == sqlstate, expr
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+def test_range_constructor_takes_bound_parameters(home: Path, binary: bool) -> None:
+    """`int4range(%s, %s, %s)` must work — including the bounds argument.
+
+    This is a regression test for a describe-time bug. `Describe` runs before
+    `Bind`, so every parameter is NULL when the statement is planned. A NULL
+    bounds argument *is* an error in PostgreSQL, and treating it as one at plan
+    time failed every parameterised range constructor — with a message that
+    quoted this server's own internal placeholder text back at the client.
+
+    The two cases have to be told apart at the AST: a `null` written in the
+    query is an error, a not-yet-bound parameter is not.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor(binary=binary)
+        for args, want in [
+            ((10, 20, "[]"), Range(10, 21, "[)")),
+            ((None, None, "()"), Range(None, None, "()")),
+            ((10, None, "[)"), Range(10, None, "[)")),
+        ]:
+            cur.execute("select int4range(%s::int4, %s::int4, %s)", args)
+            assert cur.fetchone()[0] == want, args
+
+        # A literal null for the flags is still the error PostgreSQL reports.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("select int4range(1,5,null)")
+        assert exc.value.diag.sqlstate == "22000"
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+def test_range_values_bind_in_both_formats(home: Path, binary: bool) -> None:
+    """A range sent as a parameter, in either wire format.
+
+    The binary form is a flags byte and then each present bound in the
+    element's own binary format — so it needs the element decoder, not a
+    range-specific one.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.cursor().execute("set timezone to 'UTC'")
+        cur = conn.cursor(binary=binary)
+        for sql, value in [
+            ("select %s::int4range", Range(10, 20, "[)")),
+            ("select %s::int4range", Range(None, 20, "()")),
+            ("select %s::int4range", Range(10, None, "[)")),
+            ("select %s::int4range", Range(empty=True)),
+            ("select %s::numrange", Range(Decimal("1.5"), Decimal("2.5"), "[]")),
+            ("select %s::daterange", Range(dt.date(2026, 1, 1), dt.date(2026, 1, 5), "[)")),
+        ]:
+            cur.execute(sql, (value,))
+            assert cur.fetchone()[0] == value, value
+
+
+def test_timestamp_range_bounds_with_sub_millisecond_digits(home: Path) -> None:
+    """A `tsrange` has to ORDER its own bounds, which needs them comparable.
+
+    A timestamp carrying sub-millisecond digits is stored as a composite, and
+    two composites had no comparison arm at all — so building the range failed
+    with "comparing timestamp range bounds", a message about ranges for a gap
+    that was really in timestamp comparison.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("set timezone to 'UTC'")
+        cur.execute("select tsrange('2026-01-01 00:00:00.5','2026-01-02')::text")
+        assert cur.fetchone()[0] == '["2026-01-01 00:00:00.5","2026-01-02 00:00:00")'

@@ -1177,7 +1177,11 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         .iter()
                         .map(|a| const_value(a, params))
                         .collect::<Result<Vec<_>>>()?;
-                    let value = range::render(&range::from_args(&args, &name)?);
+                    let literal_flags = !matches!(
+                        f.args.get(2).and_then(|a| a.node.as_ref()),
+                        Some(N::ParamRef(_))
+                    );
+                    let value = range::render(&range::from_args(&args, &name, literal_flags)?);
                     columns.push((
                         if rt.name.is_empty() {
                             name.clone()
@@ -2329,6 +2333,10 @@ fn decimal_to_integer(d: &bson::Decimal128) -> Option<i128> {
 }
 
 /// A value as its PostgreSQL text, which is what `::text` would produce.
+pub fn value_text(v: &Bson) -> String {
+    render_value_text(v)
+}
+
 pub(crate) fn render_value_text(v: &Bson) -> String {
     match cast_value(v.clone(), "text") {
         Ok(Bson::String(s)) => s,
@@ -3090,7 +3098,14 @@ pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering
         (Bson::Boolean(x), Bson::Boolean(y)) => Some(x.cmp(y)),
         // Two instants. Without this a timestamp compared to a timestamp fell
         // through to the numeric path, which has no arm for a BSON date.
-        (Bson::DateTime(x), Bson::DateTime(y)) => Some(x.cmp(y)),
+        //
+        // The composite form counts too: a timestamp carrying sub-millisecond
+        // digits is a Document, and comparing two of those found no arm at all
+        // -- which surfaced as "comparing timestamp range bounds", because a
+        // `tsrange` has to order its own bounds to canonicalise.
+        (a2, b2) if instant_micros(a2).is_some() && instant_micros(b2).is_some() => {
+            Some(instant_micros(a2)?.cmp(&instant_micros(b2)?))
+        }
         // Intervals compare FLATTENED -- 30-day months, 24-hour days -- even
         // though they are stored as three independent parts for arithmetic.
         (Bson::Document(_), Bson::Document(_))
@@ -3471,8 +3486,17 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     .iter()
                     .map(|a| const_value(a, params))
                     .collect::<Result<Vec<_>>>()?;
+                // A literal `null` for the flags is an error; the same NULL
+                // from a not-yet-bound parameter is not, since Describe runs
+                // before Bind.
+                let literal_flags = !matches!(
+                    f.args.get(2).and_then(|a| a.node.as_ref()),
+                    Some(N::ParamRef(_))
+                );
                 return Ok(Bson::String(range::render(&range::from_args(
-                    &args, &name,
+                    &args,
+                    &name,
+                    literal_flags,
                 )?)));
             }
             if scalar::is_scalar(&name) {

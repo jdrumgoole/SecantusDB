@@ -1444,6 +1444,67 @@ fn element_of_array_oid(oid: u32) -> Option<&'static str> {
     })
 }
 
+/// Decode a binary range: a flags byte, then each present bound as a 4-byte
+/// length followed by that many bytes in the element type's binary format.
+///
+/// The flag bits are PostgreSQL's own: 1 empty, 2 lower bound present, 4 upper
+/// bound present, 16 lower inclusive, 32 upper inclusive.
+fn binary_range(
+    bytes: &[u8],
+    type_name: &str,
+    tz: &secantus_pgplan::TimeZoneSetting,
+) -> PgWireResult<Bson> {
+    const EMPTY: u8 = 0x01;
+    const LB_INF: u8 = 0x08;
+    const UB_INF: u8 = 0x10;
+    const LB_INC: u8 = 0x02;
+    const UB_INC: u8 = 0x04;
+    let Some((&flags, mut rest)) = bytes.split_first() else {
+        return Err(unsupported_binary_oid(None));
+    };
+    if flags & EMPTY != 0 {
+        return Ok(Bson::String("empty".to_string()));
+    }
+    let element_oid = secantus_pgplan::range::range_element_oid(type_name);
+    let take_bound = |rest: &mut &[u8]| -> PgWireResult<Option<String>> {
+        if rest.len() < 4 {
+            return Err(unsupported_binary_oid(None));
+        }
+        let len = i32::from_be_bytes(rest[..4].try_into().expect("checked"));
+        *rest = &rest[4..];
+        if len < 0 {
+            return Ok(None);
+        }
+        let n = len as usize;
+        if rest.len() < n {
+            return Err(unsupported_binary_oid(None));
+        }
+        let raw = Bytes::copy_from_slice(&rest[..n]);
+        *rest = &rest[n..];
+        let ty = Type::from_oid(element_oid);
+        let value = decode_parameter(Some(&raw), ty.as_ref(), true, tz)?;
+        Ok(Some(secantus_pgplan::value_text(&value)))
+    };
+    let lower = if flags & LB_INF == 0 {
+        take_bound(&mut rest)?
+    } else {
+        None
+    };
+    let upper = if flags & UB_INF == 0 {
+        take_bound(&mut rest)?
+    } else {
+        None
+    };
+    let literal = format!(
+        "{}{},{}{}",
+        if flags & LB_INC != 0 { '[' } else { '(' },
+        lower.unwrap_or_default(),
+        upper.unwrap_or_default(),
+        if flags & UB_INC != 0 { ']' } else { ')' }
+    );
+    secantus_pgplan::cast_text_to(&literal, type_name, tz).map_err(|e| PgHandler::err(&e))
+}
+
 /// Decode one bound parameter into the value the planner will substitute.
 ///
 /// `None` is SQL NULL. A client may declare a parameter's type as oid 0
@@ -1537,6 +1598,14 @@ fn decode_parameter(
             // the type shipped -- an unknown version means the client is
             // speaking something this server has never seen, so it refuses
             // rather than guessing at the payload.
+            // A range's binary form is a flags byte and then each present
+            // bound as a length-prefixed value in the ELEMENT's binary format.
+            // Decoding to canonical text keeps it on the same path a literal
+            // takes, as with every other type here.
+            Some(oid) if secantus_pgplan::range::range_oid_name(oid).is_some() => {
+                let type_name = secantus_pgplan::range::range_oid_name(oid).expect("checked");
+                binary_range(bytes, type_name, tz)
+            }
             Some(114) => Ok(Bson::String(String::from_utf8_lossy(bytes).into_owned())),
             Some(3802) => match bytes.split_first() {
                 Some((1, rest)) => Ok(Bson::String(String::from_utf8_lossy(rest).into_owned())),
