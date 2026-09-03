@@ -1581,3 +1581,73 @@ def test_repeated_fetch_survives_statement_preparation(home: Path) -> None:
                 assert cur.description is not None, "no row description"
                 seen.extend(r[0] for r in cur.fetchall())
             assert seen == [1, 2, 3, 4, 5, 6, 7, 8]
+
+
+def test_generate_series_is_a_row_source(home: Path) -> None:
+    """`generate_series` in FROM, and everything that composes with it.
+
+    It is a *source* rather than a statement of its own, which is the point:
+    ORDER BY, LIMIT, OFFSET and the aggregates all work on the generated rows
+    without knowing where they came from.
+
+    Two rules worth pinning: counting up towards a smaller stop produces
+    nothing rather than reversing (you need a negative step for that), and a
+    zero step is refused with `22023` — a value that cannot work, which
+    PostgreSQL separates from its generic data-error class.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+
+        cur.execute("select * from generate_series(1,5)")
+        assert [r[0] for r in cur.fetchall()] == [1, 2, 3, 4, 5]
+        assert cur.description[0].name == "generate_series"
+        assert cur.description[0].type_code == 23
+
+        cur.execute("select * from generate_series(1,10,3)")
+        assert [r[0] for r in cur.fetchall()] == [1, 4, 7, 10]
+        cur.execute("select * from generate_series(5,1,-2)")
+        assert [r[0] for r in cur.fetchall()] == [5, 3, 1]
+        # Not reversed — empty.
+        cur.execute("select * from generate_series(5,1)")
+        assert cur.fetchall() == []
+
+        # The alias renames the column; a column alias beats the table one.
+        cur.execute("select * from generate_series(1,3) as g")
+        assert cur.description[0].name == "g"
+        cur.execute("select * from generate_series(1,3) as g(x)")
+        assert cur.description[0].name == "x"
+
+        cur.execute("select * from generate_series(1,3) order by 1 desc")
+        assert [r[0] for r in cur.fetchall()] == [3, 2, 1]
+        cur.execute("select * from generate_series(1,10) limit 2 offset 3")
+        assert [r[0] for r in cur.fetchall()] == [4, 5]
+
+        cur.execute("select count(*) from generate_series(1,100)")
+        assert cur.fetchone()[0] == 100
+        cur.execute("select sum(g) from generate_series(1,10) g")
+        assert cur.fetchone()[0] == 55
+        cur.execute("select min(g), max(g) from generate_series(3,7) g")
+        assert cur.fetchone() == (3, 7)
+
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("select * from generate_series(1,5,0)")
+        assert exc.value.diag.sqlstate == "22023"
+
+
+def test_a_cursor_over_generate_series(home: Path) -> None:
+    """The two features together, which is how the client corpus uses them.
+
+    A cursor needs rows to scroll over, and `generate_series` is the usual way
+    to make them without a table — so cursors could be complete and correct
+    while every test that used one still failed.
+    """
+    with _Server(home) as server, server.connect() as conn, conn.transaction():
+        cur = conn.cursor()
+        cur.execute("declare c cursor for select * from generate_series(1,10)")
+        cur.execute("fetch 3 from c")
+        assert [r[0] for r in cur.fetchall()] == [1, 2, 3]
+        cur.execute("fetch backward 2 from c")
+        assert [r[0] for r in cur.fetchall()] == [2, 1]
+        cur.execute("fetch all from c")
+        assert [r[0] for r in cur.fetchall()] == list(range(2, 11))
+        cur.execute("close c")

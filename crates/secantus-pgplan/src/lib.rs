@@ -56,6 +56,9 @@ pub enum Error {
     /// a crossed range bound here rather than in the invalid-text class, which
     /// is where a malformed LITERAL goes.
     DataException(String),
+    /// A parameter that is the wrong VALUE rather than the wrong shape ->
+    /// 22023. PostgreSQL distinguishes this from the generic data class.
+    InvalidParameter(String),
     /// More than one command where only one is allowed -> 42601.
     ///
     /// PostgreSQL accepts a multi-command string over the SIMPLE query
@@ -80,7 +83,7 @@ impl std::fmt::Display for Error {
             }
             Error::DivisionByZero => write!(f, "division by zero"),
             Error::NumericOutOfRange(m) => write!(f, "{m}"),
-            Error::DataException(m) => write!(f, "{m}"),
+            Error::DataException(m) | Error::InvalidParameter(m) => write!(f, "{m}"),
             Error::MultipleCommands => {
                 write!(
                     f,
@@ -107,6 +110,7 @@ impl Error {
             Error::DivisionByZero => "22012",
             Error::NumericOutOfRange(_) => "22003", // numeric_value_out_of_range
             Error::DataException(_) => "22000",     // data_exception
+            Error::InvalidParameter(_) => "22023",  // invalid_parameter_value
             Error::MultipleCommands => "42601",     // syntax_error, as PostgreSQL reports it
         }
     }
@@ -209,6 +213,12 @@ pub struct OrderKey {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     pub table: String,
+    /// A set-returning function standing in for a table, as in
+    /// `FROM generate_series(1, 5)`. The rows are generated rather than read,
+    /// and everything after the source -- ORDER BY, LIMIT, aggregates -- works
+    /// on them unchanged, which is why this is a SOURCE on the existing
+    /// statement rather than a statement of its own.
+    pub series: Option<Series>,
     /// Output columns in order, as (output name, stored field).
     pub columns: Vec<(String, String)>,
     pub filter: Document,
@@ -216,6 +226,37 @@ pub struct Select {
     /// `None` = no LIMIT. `LIMIT 0` is a real limit, not an absent one.
     pub limit: Option<i64>,
     pub offset: i64,
+}
+
+/// `generate_series(start, stop [, step])`, the only set-returning function
+/// this server has. `step` defaults to 1, may be negative to count down, and
+/// may not be zero -- PostgreSQL answers 22023 for that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Series {
+    pub start: i64,
+    pub stop: i64,
+    pub step: i64,
+    /// The output column's name: `generate_series` unless the FROM item was
+    /// given an alias.
+    pub column: String,
+}
+
+impl Series {
+    pub fn values(&self) -> Vec<i64> {
+        let mut out = Vec::new();
+        if self.step == 0 {
+            return out;
+        }
+        let mut v = self.start;
+        while (self.step > 0 && v <= self.stop) || (self.step < 0 && v >= self.stop) {
+            out.push(v);
+            match v.checked_add(self.step) {
+                Some(next) => v = next,
+                None => break,
+            }
+        }
+        out
+    }
 }
 
 /// The aggregate functions this slice computes exactly.
@@ -271,6 +312,8 @@ pub struct AggOrderKey {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Aggregate {
     pub table: String,
+    /// A generated source in place of a table, as for `Select`.
+    pub series: Option<Series>,
     /// EVERY GROUP BY column as (name, stored field), in declared order --
     /// including ones the SELECT list does not project, because ORDER BY may
     /// still reference them.
@@ -659,6 +702,176 @@ fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
     })
 }
 
+/// A `FROM generate_series(...)` item, if that is what this FROM clause is.
+///
+/// The alias renames the column: `AS g` makes it `g`, and `AS g(x)` makes it
+/// `x` -- the column alias wins over the table one.
+fn series_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Option<Series>> {
+    let Some(N::RangeFunction(rf)) = from.node.as_ref() else {
+        return Ok(None);
+    };
+    // The nesting is a list of lists; the call is the first leaf.
+    let call = rf
+        .functions
+        .iter()
+        .flat_map(|f| match f.node.as_ref() {
+            Some(N::List(l)) => l.items.clone(),
+            _ => vec![f.clone()],
+        })
+        .find_map(|n| match n.node.as_ref() {
+            Some(N::FuncCall(f)) => Some(f.clone()),
+            _ => None,
+        });
+    let Some(call) = call else {
+        return Ok(None);
+    };
+    if func_name(&call).as_deref() != Some("generate_series") {
+        return Ok(None);
+    }
+    let series = series_from_args(&call, params)?;
+    // `AS g(x)` -- the column alias, then the table alias, then the default.
+    let column = rf
+        .alias
+        .as_ref()
+        .map(|a| {
+            a.colnames
+                .iter()
+                .find_map(|c| match c.node.as_ref() {
+                    Some(N::String(st)) => Some(st.sval.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| a.aliasname.clone())
+        })
+        .unwrap_or_else(|| "generate_series".to_string());
+    Ok(Some(Series { column, ..series }))
+}
+
+/// `generate_series(start, stop [, step])` from its arguments.
+fn series_from_args(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Series> {
+    if f.args.len() < 2 || f.args.len() > 3 {
+        return Err(Error::Parse(
+            "function generate_series does not exist with that argument list".into(),
+        ));
+    }
+    let int_at = |i: usize| -> Result<i64> {
+        match const_value(&f.args[i], params)? {
+            Bson::Int32(v) => Ok(i64::from(v)),
+            Bson::Int64(v) => Ok(v),
+            Bson::Double(v) => Ok(v as i64),
+            other => Err(Error::Unsupported(format!(
+                "generate_series over {}",
+                inferred_type(&other)
+            ))),
+        }
+    };
+    let step = if f.args.len() == 3 { int_at(2)? } else { 1 };
+    if step == 0 {
+        // 22023 invalid_parameter_value: the argument is a number of the right
+        // shape whose VALUE cannot work, which PostgreSQL separates from the
+        // generic data class.
+        return Err(Error::InvalidParameter(
+            "step size cannot equal zero".into(),
+        ));
+    }
+    Ok(Series {
+        start: int_at(0)?,
+        stop: int_at(1)?,
+        step,
+        column: "generate_series".to_string(),
+    })
+}
+
+/// A `SELECT` whose source is a generated series.
+///
+/// Only the source differs from an ordinary select, so ORDER BY, LIMIT and
+/// OFFSET are read exactly as they are elsewhere. A WHERE clause is refused
+/// rather than ignored: the filter language here is built against stored
+/// columns, and quietly dropping a predicate would answer with rows the client
+/// asked to exclude.
+fn plan_series_select(
+    s: &pg_query::protobuf::SelectStmt,
+    series: Series,
+    params: &[Bson],
+) -> Result<Statement> {
+    if s.where_clause.is_some() {
+        return Err(Error::Unsupported(
+            "a WHERE clause over generate_series".into(),
+        ));
+    }
+    let mut columns: Vec<(String, String)> = Vec::new();
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            continue;
+        };
+        match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
+            // `*`, or the series column by name -- both mean the one column
+            // there is.
+            Some(N::ColumnRef(_)) | None => {
+                let out = if rt.name.is_empty() {
+                    series.column.clone()
+                } else {
+                    rt.name.clone()
+                };
+                columns.push((out, series.column.clone()));
+            }
+            Some(other) => return Err(Error::Unsupported(disc(other))),
+        }
+    }
+    if columns.is_empty() {
+        columns.push((series.column.clone(), series.column.clone()));
+    }
+    // ORDER BY over the one column there is, by name or by position.
+    let mut order = Vec::new();
+    for item in &s.sort_clause {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return Err(Error::Unsupported("this ORDER BY item".into()));
+        };
+        let ascending = match SortByDir::try_from(sb.sortby_dir) {
+            Ok(SortByDir::SortbyDesc) => false,
+            Ok(SortByDir::SortbyDefault | SortByDir::SortbyAsc) => true,
+            _ => return Err(Error::Unsupported("ORDER BY ... USING".into())),
+        };
+        let nulls = match SortByNulls::try_from(sb.sortby_nulls) {
+            Ok(SortByNulls::SortbyNullsFirst) => Nulls::First,
+            Ok(SortByNulls::SortbyNullsLast) => Nulls::Last,
+            _ if ascending => Nulls::Last,
+            _ => Nulls::First,
+        };
+        order.push(OrderKey {
+            field: series.column.clone(),
+            ascending,
+            nulls,
+        });
+    }
+    let limit = match s.limit_count.as_ref() {
+        None => None,
+        Some(n) => match const_value(n, params)? {
+            Bson::Int32(v) => Some(i64::from(v)),
+            Bson::Int64(v) => Some(v),
+            Bson::Null => None,
+            _ => return Err(Error::Unsupported("this LIMIT".into())),
+        },
+    };
+    let offset = match s.limit_offset.as_ref() {
+        None => 0,
+        Some(n) => match const_value(n, params)? {
+            Bson::Int32(v) => i64::from(v),
+            Bson::Int64(v) => v,
+            Bson::Null => 0,
+            _ => return Err(Error::Unsupported("this OFFSET".into())),
+        },
+    };
+    Ok(Statement::Select(Select {
+        table: String::new(),
+        series: Some(series),
+        columns,
+        filter: Document::new(),
+        order,
+        limit,
+        offset,
+    }))
+}
+
 fn plan_select(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -674,6 +887,10 @@ fn plan_select(
         return Err(Error::Unsupported(
             "a SELECT that is not from one table".into(),
         ));
+    }
+    // A set-returning function stands in for the table.
+    if let Some(series) = series_from_clause(&s.from_clause[0], params)? {
+        return plan_series_select(s, series, params);
     }
     let table = match s.from_clause[0].node.as_ref() {
         Some(N::RangeVar(r)) => r.relname.clone(),
@@ -785,6 +1002,7 @@ fn plan_select(
     };
 
     Ok(Statement::Select(Select {
+        series: None,
         table,
         columns,
         filter,
@@ -816,6 +1034,72 @@ fn plan_aggregate(
     }
     if !s.distinct_clause.is_empty() {
         return Err(Error::Unsupported("DISTINCT with an aggregate".into()));
+    }
+    // An aggregate over a generated source. Only the ungrouped forms are
+    // supported: there is one column, so grouping by it would make each row its
+    // own group, which nothing in the corpus asks for and would be easy to get
+    // subtly wrong.
+    if let Some(series) = series_from_clause(&s.from_clause[0], params)? {
+        if !s.group_clause.is_empty() {
+            return Err(Error::Unsupported("GROUP BY over generate_series".into()));
+        }
+        let mut items = Vec::new();
+        let mut select = Vec::new();
+        for t in &s.target_list {
+            let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+                continue;
+            };
+            let Some(N::FuncCall(f)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) else {
+                return Err(Error::Unsupported(
+                    "a bare column beside an aggregate over generate_series".into(),
+                ));
+            };
+            let name = func_name(f).unwrap_or_default();
+            let func = match name.as_str() {
+                "count" => {
+                    if f.agg_star {
+                        AggFunc::CountStar
+                    } else {
+                        AggFunc::Count
+                    }
+                }
+                "sum" => AggFunc::Sum,
+                "min" => AggFunc::Min,
+                "max" => AggFunc::Max,
+                other => {
+                    return Err(Error::Unsupported(format!("aggregate {other}()")));
+                }
+            };
+            let field = if func == AggFunc::CountStar {
+                None
+            } else {
+                Some(series.column.clone())
+            };
+            let out = if rt.name.is_empty() {
+                name.clone()
+            } else {
+                rt.name.clone()
+            };
+            select.push((out.clone(), OutputCol::Agg(items.len())));
+            items.push(AggItem {
+                func,
+                field,
+                out,
+                // `min`/`max` return the input type, which here is always int4.
+                source_type: Some("int4".to_string()),
+            });
+        }
+        return Ok(Statement::Aggregate(Aggregate {
+            table: String::new(),
+            series: Some(series),
+            group_by: Vec::new(),
+            items,
+            select,
+            filter: Document::new(),
+            order: Vec::new(),
+            limit: None,
+            offset: 0,
+        }));
     }
     let table = match s.from_clause[0].node.as_ref() {
         Some(N::RangeVar(r)) => r.relname.clone(),
@@ -1018,6 +1302,7 @@ fn plan_aggregate(
     };
 
     Ok(Statement::Aggregate(Aggregate {
+        series: None,
         table,
         group_by,
         items,
