@@ -19,6 +19,7 @@ import decimal
 import ipaddress as _ipaddress
 import logging
 import os
+import re
 import struct
 import uuid as _uuid
 from dataclasses import dataclass, field
@@ -1306,6 +1307,28 @@ def _decode_param(raw: bytes | None, fmt: int, oid: int, encoding: str | None = 
     return raw.decode(encoding or "utf-8", "replace")
 
 
+def _rejects_parameters(stmt: object) -> bool:
+    """True for a statement PostgreSQL refuses to bind parameters into.
+
+    Measured against PostgreSQL 14.13 rather than reasoned from the grammar,
+    because the boundary is surprising: ``CREATE TABLE t AS SELECT $1`` is
+    fine (its body is planned) while ``CREATE VIEW v AS SELECT $1`` is not,
+    even though both carry a query. ``CREATE INDEX`` and ``ALTER TABLE``
+    reject; ``DECLARE CURSOR``, ``EXPLAIN`` and every DML statement accept.
+    """
+    if isinstance(stmt, exp.Alter):
+        return True
+    if not isinstance(stmt, exp.Create):
+        return False
+    if str(stmt.args.get("kind") or "").upper() != "TABLE":
+        return True  # VIEW / INDEX / anything else
+    # CREATE TABLE ... AS <query> is planned; a plain column-definition list
+    # (a DEFAULT or CHECK holding the placeholder) is not.
+    return not isinstance(stmt.expression, (exp.Select, exp.SetOperation)) and not isinstance(
+        stmt.this, (exp.Select, exp.SetOperation)
+    )
+
+
 class ExtendedSession:
     def __init__(self, storage: Any, session: Session) -> None:
         self.storage = storage
@@ -1553,6 +1576,22 @@ class ExtendedSession:
 
             typecheck.check_statement(
                 stmt, self.catalog, self.session.database, param_oids=list(oids)
+            )
+        if count and _rejects_parameters(stmt):
+            # PostgreSQL accepts parameters only in statements whose body goes
+            # through the planner. A utility statement's parse analysis never
+            # binds them, so the placeholder resolves against an empty list and
+            # the message is about the PARAMETER, not the syntax.
+            #
+            # The split is measured against 14.13, and it is not the obvious
+            # one: `CREATE TABLE ... AS SELECT $1` is ACCEPTED while `CREATE
+            # VIEW ... AS SELECT $1` is REJECTED, so "has a query body" is the
+            # wrong discriminator and only the statement KIND settles it.
+            # `DECLARE CURSOR` and `EXPLAIN` accept them too. (`SET x = $1` is
+            # a 42601 syntax error rather than this, and is left alone.)
+            first = re.search(r"\$(\d+)", query)
+            raise errors.SQLError(
+                "42P02", f"there is no parameter ${first.group(1) if first else 1}"
             )
         if isinstance(stmt, exp.Copy):
             # PG's parse analysis gives COPY zero parameters — placeholders

@@ -905,6 +905,31 @@ def _declare_cursor(
             f"too many open cursors (limit {MAX_CURSORS_PER_SESSION}); CLOSE some first"
         )
     hold = re.search(r"\bWITH\s+HOLD\b", opts, re.IGNORECASE) is not None
+    # Outside an explicit transaction block a non-holdable cursor would be
+    # discarded the moment the implicit transaction committed, so PostgreSQL
+    # refuses the DECLARE rather than handing back a cursor that cannot be
+    # fetched from. We used to ACCEPT it and then fail the following FETCH with
+    # `34000 cursor "c" does not exist`, which reports the problem one
+    # statement too late and blames the wrong statement. `WITH HOLD` is
+    # deliberately exempt — those survive the commit, and PostgreSQL allows
+    # them here (measured against 14.13; the exemption is the whole reason the
+    # check cannot just be "are we in a transaction").
+    #
+    # Wire sessions only. The rule exists because the wire server's implicit
+    # transaction commits at statement end and takes the cursor with it; the
+    # embedded `run_sql` API has no implicit commit, so a cursor declared there
+    # without a transaction stays usable across calls, and 16 tests in
+    # `test_sql_cursors.py` document exactly that. The two session states are
+    # otherwise INDISTINGUISHABLE — measured: both show `txn_handle=None,
+    # txn_is_implicit=False` at this point — so the flag is the only signal.
+    if (
+        session.on_the_wire
+        and not hold
+        and not (session.txn_handle is not None and not session.txn_is_implicit)
+    ):
+        raise errors.no_active_sql_transaction(
+            "DECLARE CURSOR can only be used in transaction blocks"
+        )
     if re.search(r"\bNO\s+SCROLL\b", opts, re.IGNORECASE):
         scrollable: bool | None = False
     elif re.search(r"\bSCROLL\b", opts, re.IGNORECASE):
@@ -1718,6 +1743,21 @@ def _describe_statement(
         return list(cur.columns) if cur is not None else None
     if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "MOVE":
         return None  # MOVE returns no rows
+    if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "EXPLAIN":
+        # EXPLAIN through the extended protocol — the same protocol violation
+        # the FETCH branch above guards against, and it bites whenever the
+        # explained query carries a parameter, because that is exactly when a
+        # driver stops using the simple protocol. `EXPLAIN SELECT $1::int`
+        # described as NoData and then sent DataRows, which psycopg reports as
+        # `server sent data ("D" message) without prior row description`.
+        #
+        # One text column named `QUERY PLAN`, which is what this server's
+        # Execute emits for every format it supports. PostgreSQL varies the OID
+        # with FORMAT (json -> 114, xml -> 142); we answer 25 for JSON too,
+        # because Execute does, and a Describe that disagrees with its own
+        # Execute is a worse bug than the one it would fix. Recorded in
+        # `tasks/backlog.md`.
+        return [ColumnDesc(name="QUERY PLAN", type_tag="text", pg_oid=25)]
     if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "CALL":
         # A CALL portal describes as its procedure's OUT/INOUT params (a single
         # RowDescription), or NoData when it has none — WITHOUT running the body

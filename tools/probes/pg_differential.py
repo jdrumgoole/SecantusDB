@@ -29,6 +29,21 @@ are reported but do not stop the run) and the corpus proper, one statement per
 line, ``#`` for a comment. Statements run IN ORDER against both servers, so a
 corpus may build on its own writes.
 
+**Parameters exercise a different server path than literals do.** A corpus line
+may carry them after a ``ALSO_SEP`` separator, as a Python list literal::
+
+    SELECT %s::int + 1 ||| [5]
+    SELECT %s ||| [datetime.date(2020, 1, 5)]
+
+Such a line is run THREE ways -- unnamed-portal text params, a server-side
+PREPARED statement (psycopg's ``prepare=True``, which is what an ORM's
+statement cache produces), and BINARY result format -- and each is compared
+separately, so the report names the binding mode that diverged. This matters
+because the extended protocol is what every real driver actually speaks:
+psycopg, JDBC and most ORMs send Bind messages with typed parameters rather
+than the interpolated SQL text that a literal corpus produces. Two real bugs
+here were binary-format-only.
+
 ``SECANTUS_PG_ORACLE_DSN`` overrides the reference server (default: the local
 PostgreSQL that ``tests/pg_oracle.py`` uses).
 
@@ -99,6 +114,57 @@ def _run(cur: object, sql: str, want_types: bool) -> tuple:
         return ("err", f"{code}: {str(exc).splitlines()[0]}", None, [])
 
 
+#: Separates a corpus line's SQL from its Python-literal parameter list.
+PARAM_SEP = "|||"
+
+#: Names a corpus line's parameter literal may use.
+_PARAM_NS = {
+    "datetime": datetime,
+    "decimal": decimal,
+    "date": datetime.date,
+    "time": datetime.time,
+    "Decimal": decimal.Decimal,
+    "None": None,
+    "True": True,
+    "False": False,
+}
+
+
+def _run_params(
+    cur: object, sql: str, args: list, want_types: bool, *, prepare: bool, binary: bool
+) -> tuple:
+    """One parameterised execution. `prepare` forces a server-side prepared
+    statement (an ORM's statement cache); `binary` asks for binary results."""
+    try:
+        cur.execute(sql, args, prepare=prepare, binary=binary)
+        if cur.description is None:
+            return ("ok", [], cur.statusmessage, [])
+        rows = [tuple(_norm(c) for c in r) for r in cur.fetchall()]
+        types = [d.type_code for d in cur.description] if want_types else []
+        return ("ok", rows, cur.statusmessage, types)
+    except Exception as exc:  # noqa: BLE001 — the error IS the observation
+        code = getattr(getattr(exc, "diag", None), "sqlstate", None)
+        return ("err", f"{code}: {str(exc).splitlines()[0]}", None, [])
+
+
+#: (label, prepare, binary) for each binding path a corpus line is run through.
+PARAM_MODES = (("text", False, False), ("prepared", True, False), ("binary", False, True))
+
+
+def _split_params(line: str) -> tuple[str, list | None]:
+    """`("SELECT %s", [5])` for a parameterised corpus line, `(line, None)` for
+    a plain one. A bad literal is reported rather than silently skipped."""
+    if PARAM_SEP not in line:
+        return line, None
+    sql, _, raw = line.partition(PARAM_SEP)
+    try:
+        args = eval(raw.strip(), {"__builtins__": {}}, _PARAM_NS)  # noqa: S307 — dev probe
+    except Exception as exc:  # noqa: BLE001
+        print(f"BAD PARAMS: {line}\n  -> {exc}")
+        return sql.strip(), None
+    return sql.strip(), list(args)
+
+
 def _read(path: str) -> list[str]:
     with open(path) as fh:
         return [ln.rstrip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
@@ -122,42 +188,64 @@ def main(setup_path: str, corpus_path: str, *, types: bool, tags: bool) -> int:
 
     corpus = _read(corpus_path)
     diffs = 0
-    for sql in corpus:
-        want = _run(rcur, sql, types)
-        got = _run(scur, sql, types)
-        rowdiff = (want[0], want[1]) != (got[0], got[1])
-        both_ok = want[0] == got[0] == "ok"
-        tagdiff = tags and both_ok and want[2] != got[2]
-        typediff = types and both_ok and want[3] != got[3]
-        if not (rowdiff or tagdiff or typediff):
-            continue
-        kind = (
-            "ERRDIFF"
-            if want[0] == got[0] == "err"
-            else "SHOULD-ERROR"
-            if want[0] == "err"
-            else "SPURIOUS-ERROR"
-            if got[0] == "err"
-            else "VALUE"
-            if rowdiff
-            else "TYPE"
-            if typediff
-            else "TAG"
+    checks = 0
+    for line in corpus:
+        sql, args = _split_params(line)
+        # A parameterised line is compared once per BINDING MODE, so the report
+        # names which one diverged; a plain line keeps the single comparison.
+        runs = (
+            [
+                (
+                    label,
+                    _run_params(rcur, sql, args, types, prepare=p, binary=b),
+                    _run_params(scur, sql, args, types, prepare=p, binary=b),
+                )
+                for label, p, b in PARAM_MODES
+            ]
+            if args is not None
+            else [("", _run(rcur, sql, types), _run(scur, sql, types))]
         )
-        diffs += 1
-        print(f"--- {kind}\n  SQL: {sql}\n   PG: {want[1]}\n  SEC: {got[1]}")
-        if typediff:
-            print(f"  PGTYPES: {want[3]}\n SECTYPES: {got[3]}")
-        if tagdiff:
-            print(f"  PGTAG: {want[2]}\n SECTAG: {got[2]}")
+        for label, want, got in runs:
+            checks += 1
+            diffs += _report(sql, label, want, got, types=types, tags=tags)
 
-    print(f"\n=== {diffs} divergences out of {len(corpus)}")
+    print(f"\n=== {diffs} divergences out of {checks} checks ({len(corpus)} corpus lines)")
     sec.close()
     ref.close()
     srv.stop()
     store.close()
     shutil.rmtree(store_dir, ignore_errors=True)
     return 1 if diffs else 0
+
+
+def _report(sql: str, label: str, want: tuple, got: tuple, *, types: bool, tags: bool) -> int:
+    """Print one comparison if it diverged; return 1 when it did."""
+    rowdiff = (want[0], want[1]) != (got[0], got[1])
+    both_ok = want[0] == got[0] == "ok"
+    tagdiff = tags and both_ok and want[2] != got[2]
+    typediff = types and both_ok and want[3] != got[3]
+    if not (rowdiff or tagdiff or typediff):
+        return 0
+    kind = (
+        "ERRDIFF"
+        if want[0] == got[0] == "err"
+        else "SHOULD-ERROR"
+        if want[0] == "err"
+        else "SPURIOUS-ERROR"
+        if got[0] == "err"
+        else "VALUE"
+        if rowdiff
+        else "TYPE"
+        if typediff
+        else "TAG"
+    )
+    where = f" [{label}]" if label else ""
+    print(f"--- {kind}{where}\n  SQL: {sql}\n   PG: {want[1]}\n  SEC: {got[1]}")
+    if typediff:
+        print(f"  PGTYPES: {want[3]}\n SECTYPES: {got[3]}")
+    if tagdiff:
+        print(f"  PGTAG: {want[2]}\n SECTAG: {got[2]}")
+    return 1
 
 
 if __name__ == "__main__":

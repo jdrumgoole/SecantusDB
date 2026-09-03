@@ -52,6 +52,14 @@ def program_limit_exceeded(message: str) -> SQLError:
     return SQLError("54000", message)
 
 
+def no_active_sql_transaction(message: str) -> SQLError:
+    """SQLSTATE 25P01 — a statement that requires an explicit transaction block
+    was run outside one. PostgreSQL uses this for a non-holdable ``DECLARE
+    CURSOR``, whose result set would be discarded the instant the implicit
+    transaction committed."""
+    return SQLError("25P01", message)
+
+
 def insufficient_privilege(database: str, action: str) -> SQLError:
     """SQLSTATE 42501 — the connection's roles don't grant the RBAC ``action``
     the statement needs on ``database``. Raised by the per-statement gate in
