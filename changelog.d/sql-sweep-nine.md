@@ -71,10 +71,37 @@ numeric at `select_div_scale`'s scale.
   `function split_part(unknown) does not exist`. A zero field position is
   `22023`, as it is there.
 
+- **A compound `INTERVAL` literal lost everything after its first two tokens.**
+  sqlglot parses `INTERVAL '1 day 3:45:00'` as `Interval(this='1', unit=DAY)`
+  and *discards the rest of the string* — it round-trips as `INTERVAL '1 DAY'`,
+  so three hours and forty-five minutes were gone before any of this engine's
+  code ran, and `INTERVAL '2 days ago'` came back **positive**. It only
+  truncates when the text starts `<number> <unit>`; a bare `'3:45:00'` and a
+  many-worded `'1 year 2 mons 3 days 04:05:06'` both survive, which is why it
+  hid. Compound literals are now rewritten to a cast before parsing, beside the
+  other repairs to sqlglot's parsing.
+- **`INTERVAL '1-2'`** (the ISO year-month form) reached the wire as `XX000`;
+  so did the full `'1-2 3 4:05:06'`, whose bare `3` is the days field rather
+  than a value awaiting a unit.
+- **Negating an interval COLUMN** raised a bare `decimal.ConversionSyntax` with
+  no SQLSTATE: `- col` fell through to a `numeric` default for any non-numeric
+  operand, and the output coercion then fed the interval subdocument to
+  `Decimal`. The literal form was always fine.
+- **`time ± interval` is a `time`**, wrapping at midnight, not an interval —
+  `TIME '13:45' - INTERVAL '14 hours'` came back as a 23:45 *duration* under the
+  interval oid.
+- **A `::date` cast compares equal to `CURRENT_DATE`.** The cast yields the
+  canonical text while `CURRENT_DATE` yields a `datetime.date`, so
+  `now()::date = CURRENT_DATE` answered FALSE on a day when both plainly named
+  the same one. Two casts, or two literals, were always fine.
+
 #### Added
 
 - **`string_agg` and `array_agg` as window functions**, including under
   `FILTER`, with the array typed from its element rather than declared numeric.
+- **`LOCALTIME` and `LOCALTIMESTAMP`**, the tz-naive twins of `CURRENT_TIME` /
+  `CURRENT_TIMESTAMP`; sqlglot gives them their own nodes and neither was
+  handled, so both answered `42883 function localtime() does not exist`.
 - **`min_scale` and `trim_scale`**, beside the `scale` that was already there —
   `scale` is the digits a numeric *carries*, `min_scale` the smallest that keeps
   the value exactly, and `trim_scale` the value re-scaled to it.

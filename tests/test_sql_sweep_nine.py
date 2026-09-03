@@ -419,6 +419,118 @@ def test_split_part_zero_position(store, sess):
 
 
 # --------------------------------------------------------------------------- #
+# Interval literals sqlglot TRUNCATED before this engine ever saw them
+# --------------------------------------------------------------------------- #
+
+
+def _iv(store, sess, sql):
+    """An interval result as ``(months, days, micros)``.
+
+    The embedded API hands back the interval SUBDOCUMENT; only the wire turns it
+    into a `timedelta`.
+    """
+    from secantus.sql import intervals
+
+    return intervals._fields(_rows(store, sql, sess)[0][0])
+
+
+@pytest.mark.parametrize(
+    ("literal", "want"),
+    [
+        # sqlglot parses these as `Interval(this='1', unit=DAY)` and DISCARDS the
+        # rest — the literal round-trips as `INTERVAL '1 DAY'`.
+        ("1 day 3:45:00", (0, 1, 13_500_000_000)),
+        ("1 day 03:45:00", (0, 1, 13_500_000_000)),
+        ("1 day 3:45", (0, 1, 13_500_000_000)),
+        ("2 days 1:00:00", (0, 2, 3_600_000_000)),
+        # ...and `ago` is lost the same way, so this came back POSITIVE.
+        ("2 days ago", (0, -2, 0)),
+        # These two survive whole, which is why the bug hid for so long.
+        ("3:45:00", (0, 0, 13_500_000_000)),
+        ("1 year 2 mons 3 days 04:05:06", (14, 3, 14_706_000_000)),
+    ],
+)
+def test_compound_interval_literals(store, sess, literal, want):
+    assert _iv(store, sess, f"SELECT INTERVAL '{literal}'") == want
+
+
+@pytest.mark.parametrize(
+    ("literal", "months"),
+    [("1-2", 14), ("-1-2", -14), ("0-5", 5)],
+)
+def test_iso_year_month_interval(store, sess, literal, months):
+    # The ISO year-month field was unparsed and reached the wire as XX000.
+    assert _iv(store, sess, f"SELECT INTERVAL '{literal}'") == (months, 0, 0)
+
+
+def test_full_iso_interval(store, sess):
+    # `1-2 3 4:05:06` — the bare `3` is the DAYS field, not a value awaiting a
+    # unit; reading the clock as its unit raised "unsupported interval unit".
+    assert _iv(store, sess, "SELECT INTERVAL '1-2 3 4:05:06'") == (14, 3, 14_706_000_000)
+
+
+def test_interval_with_a_unit_outside_the_quotes_is_untouched(store, sess):
+    assert _iv(store, sess, "SELECT INTERVAL '1' DAY") == (0, 1, 0)
+
+
+def test_negating_an_interval_column(store, sess):
+    # Typed `numeric` by the unary-minus fallback, so the output coercion fed the
+    # interval SUBDOCUMENT to Decimal and raised a bare `decimal.ConversionSyntax`
+    # with no SQLSTATE. The literal form was always fine.
+    _rows(store, "CREATE TABLE iv9 (id int PRIMARY KEY, v interval)", sess)
+    _rows(store, "INSERT INTO iv9 VALUES (1, INTERVAL '1 day')", sess)
+    assert _iv(store, sess, "SELECT -v FROM iv9") == (0, -1, 0)
+
+
+# --------------------------------------------------------------------------- #
+# time ± interval is a TIME, and it wraps
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("expr", "want"),
+    [
+        ("TIME '13:45' + INTERVAL '1 hour'", "14:45:00"),
+        ("TIME '13:45' - INTERVAL '14 hours'", "23:45:00"),  # wraps at midnight
+        ("TIME '23:00' + INTERVAL '2 hours'", "01:00:00"),
+        ("INTERVAL '1 hour' + TIME '13:45'", "14:45:00"),
+    ],
+)
+def test_time_plus_interval(store, sess, expr, want):
+    assert str(_rows(store, f"SELECT {expr}", sess)[0][0]) == want
+
+
+def test_time_plus_interval_types_as_time(store, sess):
+    assert _tags(store, "SELECT TIME '13:45' + INTERVAL '1 hour'", sess) == ["time"]
+
+
+# --------------------------------------------------------------------------- #
+# LOCALTIME / LOCALTIMESTAMP, and a date compared against its own text
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(("expr", "tag"), [("LOCALTIME", "time"), ("LOCALTIMESTAMP", "timestamp")])
+def test_localtime(store, sess, expr, tag):
+    # Both answered `42883 function localtime() does not exist`.
+    assert _rows(store, f"SELECT {expr} IS NOT NULL", sess) == [(True,)]
+    assert _tags(store, f"SELECT {expr}", sess) == [tag]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT LOCALTIMESTAMP::date = CURRENT_DATE",
+        "SELECT now()::date = CURRENT_DATE",
+    ],
+)
+def test_date_cast_compares_equal_to_current_date(store, sess, sql):
+    # A `::date` cast yields the canonical TEXT while CURRENT_DATE yields a
+    # `datetime.date`, so this compared a str with a date and answered FALSE on
+    # a day when both plainly named the same one.
+    assert _rows(store, sql, sess) == [(True,)]
+
+
+# --------------------------------------------------------------------------- #
 # RETURNING
 # --------------------------------------------------------------------------- #
 

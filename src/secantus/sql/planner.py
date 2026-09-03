@@ -11891,7 +11891,14 @@ def _date_arith_tag(node: exp.Expression, resolve: Resolve) -> str | None:
             return "timestamp"
         if lt == "time" and rt == "time":
             return "interval"
+        # `time - interval` is a TIME in Postgres (wrapping at midnight), not an
+        # interval — typed as one, `TIME '13:45' - INTERVAL '14 hours'` came back
+        # as a 23:45 *duration* under the interval oid rather than a clock time.
+        if lt == "time" and rt == "interval":
+            return "time"
     elif isinstance(node, exp.Add):
+        if (lt == "time" and rt == "interval") or (rt == "time" and lt == "interval"):
+            return "time"
         if lt == "date" and rt in ints:
             return "date"
         if rt == "date" and lt in ints:
@@ -12525,7 +12532,15 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         if isinstance(node, exp.Neg) and not isinstance(_lit_inner, (exp.Literal, exp.Null)):
             # ``- col`` / ``- expr``: numeric negation keeps its operand's tag
             # (_literal only extracts constants — it must not see a column).
+            #
+            # An INTERVAL is negatable too, and falling through to the "numeric"
+            # default declared `- iv` numeric: the output coercion then fed the
+            # interval SUBDOCUMENT to Decimal and the statement died with a bare
+            # `decimal.ConversionSyntax`, no SQLSTATE at all. `- INTERVAL '1 day'`
+            # was fine because the literal form is typed a few branches above.
             _neg_tag = _infer_scalar_tag(_lit_inner, resolve)
+            if _neg_tag == "interval":
+                return "interval"
             return _neg_tag if _neg_tag in _NUMERIC_FAMILY else "numeric"
         return _infer_value_tag(_literal(node))
     if isinstance(node, exp.Case):
@@ -12708,6 +12723,11 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         return "date"
     if getattr(exp, "CurrentTime", None) is not None and isinstance(node, exp.CurrentTime):
         return "timetz"
+    # `LOCALTIME` / `LOCALTIMESTAMP` are the tz-NAIVE twins of the two above.
+    if getattr(exp, "Localtime", None) is not None and isinstance(node, exp.Localtime):
+        return "time"
+    if getattr(exp, "Localtimestamp", None) is not None and isinstance(node, exp.Localtimestamp):
+        return "timestamp"
     # ``date_trunc(unit, src)`` keeps the tz-ness of ``src`` (Postgres:
     # ``date_trunc(text, timestamptz) -> timestamptz``, ``… timestamp) -> timestamp``;
     # a ``date`` argument is cast to naive timestamp). An ``interval`` argument
@@ -13760,6 +13780,45 @@ _ESTRING_SIMPLE = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
 _DOLLAR_TAG_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
 
 
+#: ``INTERVAL 'literal'`` — the quoted form, and whatever token follows it (so a
+#: trailing unit keyword, as in ``INTERVAL '1' DAY``, can be left alone).
+_INTERVAL_LITERAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])interval\s*'([^']*)'(\s*[A-Za-z]+)?", re.IGNORECASE
+)
+
+
+def _interval_literals_to_casts(sql: str) -> str:
+    """Rewrite a COMPOUND ``INTERVAL 'literal'`` as ``CAST('literal' AS INTERVAL)``.
+
+    sqlglot parses ``INTERVAL '1 day 3:45:00'`` as ``Interval(this='1',
+    unit=DAY)`` and **discards the rest of the string** -- it round-trips as
+    ``INTERVAL '1 DAY'``, so three hours and forty-five minutes were silently
+    gone before any of this engine's code ran. ``INTERVAL '2 days ago'`` loses
+    its ``ago`` the same way and comes back POSITIVE. It only truncates when the
+    text starts ``<number> <unit>``; a bare ``'3:45:00'`` and a many-worded
+    ``'1 year 2 mons 3 days 04:05:06'`` both survive, which is why this hid.
+
+    Nothing downstream can recover the dropped text, so the repair has to happen
+    on the SQL string -- the same place ``_decode_estrings`` and
+    ``_strip_nested_block_comments`` already patch up sqlglot's parsing. A cast
+    keeps the literal whole and routes it to ``intervals.parse``, which reads
+    every form Postgres accepts.
+
+    Left alone: a two-token literal (which sqlglot parses correctly) and
+    ``INTERVAL '1' DAY``, where the unit sits OUTSIDE the quotes.
+    """
+
+    def _fix(m: re.Match[str]) -> str:
+        body, trailer = m.group(1), m.group(2) or ""
+        if trailer.strip():
+            return m.group(0)  # `INTERVAL '1' DAY` — the unit is outside
+        if len(body.split()) <= 2 and ":" not in body:
+            return m.group(0)  # sqlglot handles the simple pair correctly
+        return f"CAST('{body}' AS INTERVAL)"
+
+    return _INTERVAL_LITERAL_RE.sub(_fix, sql)
+
+
 def _strip_nested_block_comments(sql: str) -> str:
     """Strip block comments when (and only when) any of them NEST.
 
@@ -14145,6 +14204,9 @@ def _parse_uncached(sql: str) -> list[exp.Expression]:
     # PG nests block comments; sqlglot doesn't — strip them when they nest.
     if "/*" in sql:
         sql = _strip_nested_block_comments(sql)
+    # sqlglot TRUNCATES a compound interval literal — see `_interval_literals_to_casts`.
+    if "interval" in sql.lower():
+        sql = _interval_literals_to_casts(sql)
     try:
         try:
             stmts = [

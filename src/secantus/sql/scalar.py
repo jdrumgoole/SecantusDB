@@ -2640,6 +2640,11 @@ for _cls_name, _handler in (
     ("CurrentTimestamp", lambda n, s, c: _utcnow(c)),
     ("CurrentDate", lambda n, s, c: _utcnow(c).date()),
     ("CurrentTime", lambda n, s, c: _fmt_current_time(c)),
+    # `LOCALTIME` / `LOCALTIMESTAMP` are the tz-NAIVE twins of `CURRENT_TIME` /
+    # `CURRENT_TIMESTAMP`; sqlglot gives them their own nodes and neither was
+    # handled, so both answered `42883 function localtime() does not exist`.
+    ("Localtime", lambda n, s, c: _utcnow(c).time()),
+    ("Localtimestamp", lambda n, s, c: _utcnow(c).replace(tzinfo=None)),
     ("Pad", _eval_pad),
     ("Left", _eval_left),
     ("Right", _eval_right),
@@ -2770,6 +2775,7 @@ def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any
         else:
             left = _ranges.canonical(left)
             right = _ranges.canonical(right)
+    left, right = _parse_date_text_against_date(left, right)
     left, right = _promote_date_against_datetime(left, right)
     if (
         isinstance(left, _dt.datetime)
@@ -2864,6 +2870,30 @@ def _pg_type_name(value: Any) -> str:
     if value is None:
         return "unknown"
     return "text"
+
+
+def _parse_date_text_against_date(left: Any, right: Any) -> tuple[Any, Any]:
+    """When one side is a real ``date`` / ``datetime`` and the other is its
+    canonical TEXT, parse the text so the two compare as dates.
+
+    A ``::date`` cast yields the canonical text while ``CURRENT_DATE`` yields a
+    ``datetime.date``, so ``now()::date = CURRENT_DATE`` compared a str with a
+    date and answered FALSE on a day when both plainly named the same one.
+    (Two casts, or two literals, were always fine -- which is why only the
+    mixed shape showed it.)
+    """
+    for a, b, swap in ((left, right, False), (right, left, True)):
+        if isinstance(a, (_dt.date, _dt.datetime)) and isinstance(b, str):
+            from secantus.sql.datetimes import DateTimeError, parse_iso_datetime
+
+            try:
+                parsed: Any = parse_iso_datetime(b)
+            except (DateTimeError, ValueError):
+                return left, right
+            if isinstance(a, _dt.date) and not isinstance(a, _dt.datetime):
+                parsed = parsed.date()
+            return (parsed, a) if swap else (a, parsed)
+    return left, right
 
 
 def _promote_date_against_datetime(left: Any, right: Any) -> tuple[Any, Any]:

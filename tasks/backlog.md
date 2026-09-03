@@ -1940,6 +1940,12 @@ one; that surface needs no work. What is still open:
       Unicode-aware answer is right for that server in every case except
       possibly the full-vs-simple ones.
 - [ ] **`convert_from` / `convert_to` are absent** (`42883`).
+- [ ] **A set-returning function beside another column in the SELECT list.**
+      `SELECT jsonb_array_length(x), jsonb_object_keys(y)` and
+      `SELECT regexp_split_to_array(...), regexp_split_to_table(...)` answer
+      `0A000`; Postgres expands the SRF and pairs it with the scalar column.
+      The FROM form and the whole-SELECT-list form both work. The error now
+      names the actual limit rather than claiming the function does not exist.
 - [ ] **`numeric_send` is absent** (`42883`). One of Postgres' internal
       type-I/O functions; nothing but a driver test is likely to call it.
 - [ ] **An in-call `ORDER BY` inside a window aggregate is dropped.**

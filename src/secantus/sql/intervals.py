@@ -151,6 +151,11 @@ def _parse_time(token: str) -> int | None:
     return sign * total
 
 
+#: The ISO year-month interval field, e.g. `1-2` (one year two months). A
+#: leading `-` negates both halves.
+_YEAR_MONTH_RE = re.compile(r"([+-]?)(\d+)-(\d+)")
+
+
 def parse(text: str) -> dict:
     """Parse an interval literal — the Postgres output form (``1 year 2 mons 3 days
     04:05:06``), a verbose form (``1 year 2 months``), a bare unit term (``90
@@ -167,6 +172,15 @@ def parse(text: str) -> dict:
     i = 0
     while i < len(tokens):
         tok = tokens[i]
+        ym = _YEAR_MONTH_RE.fullmatch(tok)
+        if ym is not None:
+            # The ISO year-month form: `1-2` is 1 year 2 months, `-1-2` negates
+            # BOTH fields. Only valid as a leading token, which is where PG puts
+            # it (`1-2 3 4:05:06`). Unparsed, it reached the wire as XX000.
+            sign = -1 if ym.group(1) == "-" else 1
+            months += sign * (int(ym.group(2)) * 12 + int(ym.group(3)))
+            i += 1
+            continue
         clock = _parse_time(tok)
         if clock is not None:
             micros += clock
@@ -191,6 +205,13 @@ def parse(text: str) -> dict:
             # A bare trailing number is seconds (``'0'`` / ``'30'``), matching
             # Postgres' lenient interval input.
             micros += round(value * MICROS_PER_SECOND)
+            i += 1
+            continue
+        if _parse_time(tokens[i + 1]) is not None or _YEAR_MONTH_RE.fullmatch(tokens[i + 1]):
+            # A bare number followed by a CLOCK is the ISO form's days field:
+            # `1-2 3 4:05:06` is 1 year 2 months, 3 DAYS, 4:05:06. Reading the
+            # clock as this number's unit raised "unsupported interval unit".
+            days += int(value)
             i += 1
             continue
         part = from_unit(value, tokens[i + 1])
