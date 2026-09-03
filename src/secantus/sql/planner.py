@@ -12220,6 +12220,49 @@ def _stamp_nested_int_widths(node: exp.Expression, resolve: Resolve) -> None:
                 unary._secantus_int_tag = tag  # noqa: SLF001
 
 
+def _select_projection_tag(node: exp.Expression, resolve: Resolve) -> str | None:
+    """The type of a sub-SELECT's single projected expression, when it can be
+    decided without the catalog — which covers a VALUES-derived source, where
+    the value is right there in the AST."""
+    inner = node.this if isinstance(node, exp.Subquery) else node
+    if not isinstance(inner, exp.Select) or len(inner.expressions) != 1:
+        return None
+    target = inner.expressions[0]
+    target = target.this if isinstance(target, exp.Alias) else target
+    tag = _scalar_subquery_tag(target, resolve)
+    if tag and tag != "any":
+        return tag
+    if isinstance(target, exp.Column):
+        # A real inner TABLE column adopts that table's declared tag; the
+        # catalog rides the planning `_pipeline_subctx`.
+        _sub = _pipeline_subctx.get()
+        tbl_node = inner.find(exp.Table)
+        if _sub is not None and getattr(_sub, "catalog", None) is not None and tbl_node is not None:
+            try:
+                tdef = _lookup_table_def(
+                    _sub.catalog, _sub.db, tbl_node, getattr(_sub, "storage", None)
+                )
+            except errors.SQLError:
+                tdef = None
+            col = tdef.column(target.name) if tdef is not None else None
+            if col is not None:
+                return col.type_tag
+        # `FROM (VALUES (1), (2)) t(n)` — resolve the column against the VALUES
+        # tuple positionally; the literals carry their own types.
+        values = inner.find(exp.Values)
+        if values is not None and values.expressions:
+            alias = values.parent.args.get("alias") if values.parent is not None else None
+            alias = alias or values.args.get("alias")
+            cols = [c.name for c in (alias.args.get("columns") or [])] if alias else []
+            first = values.expressions[0]
+            cells = first.expressions if isinstance(first, exp.Tuple) else [first]
+            names = cols or [f"column{i + 1}" for i in range(len(cells))]
+            if target.name in names:
+                with contextlib.suppress(errors.SQLError):
+                    return _infer_scalar_tag(cells[names.index(target.name)], resolve)
+    return None
+
+
 def _scalar_subquery_tag(target: exp.Expression, resolve: Resolve) -> str | None:
     """The type of a scalar subquery's single projected expression.
 
@@ -12568,7 +12611,14 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     if isinstance(node, exp.Array):
         # ``array[...]`` types from its first element (Postgres unifies elements;
         # the first drives the array OID here).
-        _etag = _infer_scalar_tag(node.expressions[0], resolve) if node.expressions else "text"
+        _first = node.expressions[0] if node.expressions else None
+        if isinstance(_first, (exp.Select, exp.Subquery)):
+            # `ARRAY(SELECT …)` — the array-SUBQUERY constructor. Typing it from
+            # the Select node itself fell through to text, so an int column came
+            # back as text[].
+            _etag = _select_projection_tag(_first, resolve) or "text"
+        else:
+            _etag = _infer_scalar_tag(_first, resolve) if _first is not None else "text"
         return f"{_etag}[]" if f"{_etag}[]" in typemap.PG_OID else "text[]"
     if isinstance(node, exp.Bracket) and node.expressions:
         # ``arr[i]`` yields the element type; ``arr[lo:hi]`` stays the array type.
@@ -12667,12 +12717,9 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     # resolve the inner table); this covers a computed projection, which needs
     # nothing but the inner node.
     if isinstance(node, exp.Subquery) and isinstance(node.this, exp.Select):
-        _exprs = node.this.expressions
-        if len(_exprs) == 1:
-            _target = _exprs[0].this if isinstance(_exprs[0], exp.Alias) else _exprs[0]
-            _tag = _scalar_subquery_tag(_target, resolve)
-            if _tag and _tag != "any":
-                return _tag
+        _tag = _select_projection_tag(node, resolve)
+        if _tag and _tag != "any":
+            return _tag
     # `power()` and `sign()` return DOUBLE PRECISION in Postgres, not numeric —
     # `power(2, 10)` is `1024.0` (oid 701), and typing it numeric put oid 1700
     # on the wire.

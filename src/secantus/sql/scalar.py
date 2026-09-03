@@ -379,7 +379,17 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     if isinstance(node, exp.Bracket):
         return _eval_bracket(node, scope, ctx)
     if isinstance(node, exp.Array):  # ARRAY[...] constructor -> a Python list
-        return [evaluate(e, scope, ctx) for e in node.expressions]
+        exprs = node.expressions
+        if len(exprs) == 1 and isinstance(exprs[0], (exp.Select, exp.Subquery)):
+            # `ARRAY(SELECT ...)` — the array-SUBQUERY constructor, which collects
+            # the subquery's first column into one array. It parses as an Array
+            # whose single element is the Select, so the list comprehension below
+            # tried to evaluate the Select as a scalar and answered
+            # `42P01 relation "" does not exist`.
+            select = _subquery_select(exprs[0])
+            proj = select.expressions[0]
+            return [evaluate(proj, inner, ctx) for inner in _inner_row_scopes(select, scope, ctx)]
+        return [evaluate(e, scope, ctx) for e in exprs]
     if isinstance(node, exp.Tuple):
         # A parenthesized multi-value tuple ``(a, b, …)`` in a scalar position is
         # an anonymous record constructor — the same shape as ``ROW(a, b, …)``,
@@ -1206,6 +1216,35 @@ def _eval_array_remove(node: exp.Expression, scope: Scope, ctx: ScalarContext) -
     return [v for v in _as_list(arr) if v != elem]
 
 
+def flatten_array(value: Any) -> list[Any]:
+    """Every element of a (possibly multidimensional) array, in row-major order.
+
+    Postgres has no nested-array type -- ``int[][]`` is ONE array with two
+    dimensions -- so every whole-array operation walks it flat. Taking only the
+    top level left the inner lists as elements, and rendering one through
+    ``_as_text`` produced the PYTHON repr: ``array_to_string(ARRAY[[1,2],[3,4]],
+    ',')`` answered ``[1, 2],[3, 4]`` where Postgres says ``1,2,3,4``.
+    """
+    out: list[Any] = []
+    for v in _as_list(value):
+        if isinstance(v, (list, tuple)):
+            out.extend(flatten_array(v))
+        else:
+            out.append(v)
+    return out
+
+
+def _join_array_text(values: list[Any], delim: str, null_str: str | None) -> str:
+    parts = []
+    for v in values:
+        if v is None:
+            if null_str is not None:
+                parts.append(null_str)  # NULL elements omitted unless a null_string is given
+        else:
+            parts.append(_as_text(v))
+    return delim.join(parts)
+
+
 def _eval_array_to_string(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     arr = evaluate(node.this, scope, ctx)
     if arr is None:
@@ -1213,14 +1252,7 @@ def _eval_array_to_string(node: exp.Expression, scope: Scope, ctx: ScalarContext
     delim = _as_text(evaluate(node.args.get("expression"), scope, ctx))
     null_node = node.args.get("null")
     null_str = None if null_node is None else _as_text(evaluate(null_node, scope, ctx))
-    parts = []
-    for v in _as_list(arr):
-        if v is None:
-            if null_str is not None:
-                parts.append(null_str)  # NULL elements omitted unless a null_string is given
-        else:
-            parts.append(_as_text(v))
-    return delim.join(parts)
+    return _join_array_text(flatten_array(arr), delim, null_str)
 
 
 def _eval_nullif(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
@@ -4610,14 +4642,7 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
             return None
         delim = _as_text(args[1]) if len(args) > 1 else ""
         null_str = _as_text(args[2]) if len(args) > 2 and args[2] is not None else None
-        parts = []
-        for v in _as_list(arr):
-            if v is None:
-                if null_str is not None:
-                    parts.append(null_str)
-            else:
-                parts.append(_as_text(v))
-        return delim.join(parts)
+        return _join_array_text(flatten_array(arr), delim, null_str)
     if name == "current_schemas":
         # ``current_schemas(include_implicit)`` — the search path as text[].
         # With true, PG prepends the implicitly-searched pg_catalog. pgjdbc's
@@ -4636,8 +4661,24 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         session = getattr(ctx, "session", None)
         return getattr(session, "user", None) or "postgres"
     if name == "pg_get_serial_sequence":
-        # No serial-sequence resolution surface.
-        return None
+        # ``pg_get_serial_sequence('t', 'col')`` -> the schema-qualified sequence
+        # name a SERIAL / IDENTITY column draws from, or NULL when the column has
+        # none. The column already RECORDS it (`Column.sequence`, which is what
+        # `nextval` and the information_schema view read); this just never
+        # looked, so ORM reflection saw every serial column as plain.
+        if ctx is None or ctx.catalog is None or len(args) < 2:
+            return None
+        tbl, colname = _as_text(args[0]), _as_text(args[1])
+        try:
+            tdef = ctx.catalog.get(ctx.db, tbl.rsplit(".", 1)[-1])
+        except Exception:  # noqa: BLE001 -- unknown relation is NULL, not an error
+            return None
+        col = tdef.column(colname) if tdef is not None else None
+        seq = getattr(col, "sequence", None) if col is not None else None
+        if not seq:
+            return None
+        schema = getattr(ctx.session, "current_schema", None) or "public"
+        return seq if "." in seq else f"{schema}.{seq}"
     if name in ("obj_description", "col_description"):
         # ``obj_description(oid[, 'catalog'])`` / ``col_description(oid,
         # attnum)`` — look the comment up in the derived pg_description rows
@@ -5938,6 +5979,43 @@ def _subquery_select(node: exp.Expression) -> exp.Expression:
     return node.this if isinstance(node, exp.Subquery) else node
 
 
+def _values_source_rows(node: exp.Expression) -> tuple[str | None, list[dict[str, Any]]] | None:
+    """``(alias, rows)`` for a ``FROM (VALUES …) AS t(a, b)`` source, else None.
+
+    Each row is a dict keyed by the alias's column names, or ``column1``,
+    ``column2`` … when the aliases are omitted — Postgres' own default names.
+    """
+    inner = node.this if isinstance(node, (exp.Subquery, exp.Alias)) else node
+    if not isinstance(inner, exp.Values):
+        return None
+    alias_node = node.args.get("alias") if isinstance(node, exp.Subquery) else None
+    alias_node = alias_node or inner.args.get("alias")
+    name = alias_node.this.name if alias_node is not None and alias_node.this else None
+    cols = [c.name for c in (alias_node.args.get("columns") or [])] if alias_node else []
+    rows: list[dict[str, Any]] = []
+    for tup in inner.expressions:
+        vals = tup.expressions if isinstance(tup, exp.Tuple) else [tup]
+        names = cols or [f"column{i + 1}" for i in range(len(vals))]
+        rows.append(dict(zip(names, vals, strict=False)))
+    return name, rows
+
+
+def _values_scope(
+    alias: str | None, row: dict[str, Any], outer: Scope, ctx: ScalarContext
+) -> Scope:
+    """A ``Scope`` over one VALUES row; unknown names fall through to ``outer``.
+
+    The cells are AST nodes, evaluated on reference so an expression in the
+    VALUES list (``(1 + 1)``) works like any other."""
+
+    def resolve(node: exp.Column) -> Any:
+        if (node.table or None) in (None, alias) and node.name in row:
+            return evaluate(row[node.name], outer, ctx)
+        return outer(node)
+
+    return resolve
+
+
 def _inner_row_scopes(select: exp.Expression, outer: Scope, ctx: ScalarContext):
     """Yield a ``Scope`` for each inner-table row that satisfies the subquery's
     WHERE. Correlated references in that WHERE fall through to ``outer``. Shared
@@ -5958,6 +6036,19 @@ def _inner_row_scopes(select: exp.Expression, outer: Scope, ctx: ScalarContext):
             yield outer
         return
     sources = [from_node.this] + [j.this for j in joins]
+    # A VALUES-derived source (``FROM (VALUES (1), (2)) t(n)``) is not a
+    # relation, so `_lookup_inner_table` found nothing and every scalar subquery
+    # over one -- `IN (...)`, `EXISTS`, `ARRAY(...)` and the bare scalar form
+    # alike -- answered `42P01 relation "" does not exist`.
+    if len(sources) == 1:
+        values_rows = _values_source_rows(sources[0])
+        if values_rows is not None:
+            alias, rows = values_rows
+            for row in rows:
+                scope = _values_scope(alias, row, outer, ctx)
+                if where is None or _truthy(evaluate(where.this, scope, ctx)):
+                    yield scope
+            return
     resolved = []
     for table_node in sources:
         tdef = _lookup_inner_table(ctx, table_node)

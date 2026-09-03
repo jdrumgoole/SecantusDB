@@ -2287,6 +2287,14 @@ def _expand_srf(plan: planner.EvaluatedSelectPlan, scope: Any, sctx: Any) -> lis
         val = scalar.evaluate(arr_expr, scope, sctx)
         if kind == "jsonb_object_keys":
             items = list(val.keys()) if isinstance(val, dict) else []
+        elif kind == "unnest":
+            # A multidimensional array is ONE array in Postgres, unnested
+            # row-major; taking only the top level handed the inner lists out as
+            # elements (`srf._unnest_values` is the same rule for the other two
+            # routes into unnest).
+            from secantus.sql import srf as _srf
+
+            items = _srf._unnest_values(val)
         elif isinstance(val, (list, tuple)):
             items = list(val)
         else:

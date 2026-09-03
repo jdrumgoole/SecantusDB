@@ -336,6 +336,28 @@ def _tag_for_value(value: Any) -> str:
 _INT4_MAX = 2**31 - 1
 
 
+def _unnest_values(arr: Any) -> list[Any]:
+    """``unnest(arr)``'s rows.
+
+    Postgres has no nested-array type: ``int[][]`` is ONE array with two
+    dimensions, and ``unnest`` yields its elements in ROW-MAJOR order. Taking
+    only the top level handed the inner lists out as elements, which the int4
+    output coercion then died on with a bare ``invalid literal for int():
+    '{1,2}'`` and no SQLSTATE at all.
+
+    ``unnest`` reaches here by two routes -- the ``exp.Unnest`` node and the
+    Anonymous spelling -- which had separate, identical copies of the old
+    one-level logic; this is the shared one.
+    """
+    from secantus.sql.scalar import flatten_array
+
+    if arr is None:
+        return []
+    if not isinstance(arr, (list, tuple)):
+        return [arr]
+    return flatten_array(arr)
+
+
 def _unnest_elem_tag(arg: Any, values: list[Any]) -> str:
     """The element type of an `unnest(...)` without a FROM.
 
@@ -391,14 +413,14 @@ def _values_and_tag(
     if isinstance(node, (exp.Unnest, exp.Explode)):
         arg = node.expressions[0] if node.expressions else node.this
         arr = ev(arg)
-        values = list(arr) if isinstance(arr, (list, tuple)) else ([] if arr is None else [arr])
+        values = _unnest_values(arr)
         return values, _unnest_elem_tag(arg, values)
     if isinstance(node, exp.Anonymous):
         name = str(node.this).rsplit(".", 1)[-1].lower()
         args = node.expressions
         val = ev(args[0]) if args else None
         if name in ("unnest",):
-            values = list(val) if isinstance(val, (list, tuple)) else ([] if val is None else [val])
+            values = _unnest_values(val)
             return values, _unnest_elem_tag(args[0] if args else None, values)
         if name == "generate_subscripts":
             n = len(val) if isinstance(val, (list, tuple)) else 0
