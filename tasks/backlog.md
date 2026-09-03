@@ -12408,7 +12408,7 @@ distinct problems, triaged from the run logs:
   module's AST rejecting double assignment so the overwrite pattern can't
   recur anywhere.
 
-## `character(n)` blank padding (2026-09-03) — mostly FIXED, three gaps left
+## `character(n)` blank padding (2026-09-03) — mostly FIXED, four gaps left
 
 `char(n)` stores unpadded and pads on the way out (`typemap.blank_pad`); a
 bpchar-to-text conversion strips trailing blanks, so almost every expression
@@ -12429,7 +12429,7 @@ downstream. Fixed, with pinning tests in `tests/test_sql_sweep_thirteen.py`:
   so do not "complete" it by adding string functions on the assumption that
   they behave alike.
 
-Three gaps remain, all recorded rather than guessed:
+Four gaps remain, all recorded rather than guessed:
 
 1. **`array_agg(c)` aggregates the unpadded value** (PostgreSQL gives
    `{"ab   "}`, and types the result `bpchar[]`/1014 where we say `text[]`/
