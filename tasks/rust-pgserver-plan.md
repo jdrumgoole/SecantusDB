@@ -907,7 +907,49 @@ wire formats, 0 divergences on the first run. The previous batch shipped a type
 whose literal form was right in every case and whose parameter form was broken
 in every case, because the probe covered only literals.
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845.**
+### 0.30 cursors (2026-09-03)
+
+**1845 -> ~1848. A small number in front of a complete feature and a
+protocol-level bug**, and the number is explained: the cursor test files are
+blocked behind `generate_series` (96) and `RangeFunction` (54), not behind
+cursors.
+
+**The enum campaign was SIZED first and deferred on evidence.** psycopg's
+`TypeInfo.fetch` needs `pg_type` + `pg_enum`, a LEFT JOIN, a subquery in FROM
+and `array_agg` -- four separate features, all measured as absent. That is a
+campaign, not a batch, and it is now recorded as such rather than re-guessed
+every time it tops the file ranking.
+
+**PostgreSQL's cursor position has two ends beyond the rows.** The cursor sits
+ON a 1-based row, and can also sit at 0 (before the first) or len+1 (after the
+last). Fetching past the end parks it at len+1, so `MOVE BACKWARD 2` afterwards
+lands on the LAST row. A "next index to read" model is off by one exactly
+there -- which is the case anyone tries first.
+
+Three more measured rules: a BACKWARD fetch returns rows NEAREST-FIRST;
+`RELATIVE`/`ABSOLUTE` fetch ONE row where `FORWARD`/`BACKWARD` fetch a run; and
+`FETCH ALL` arrives as `i64::MAX`, so every arithmetic step must saturate --
+adding to it overflowed and killed the connection.
+
+**Two bugs of my own, both found by probing rather than reading:**
+
+* `block_on` inside the sync `execute` HUNG the connection outright. Collecting
+  a row stream needs to await, so DECLARE runs in the async `run` instead --
+  beside transaction control, which is there for the same reason.
+* The command tag must be `FETCH`, not `FETCH 2`: the wire layer appends the
+  row count, so building it here produced `FETCH 2 2`.
+
+**And one that was not cursor-specific at all.** `describe_fields` had no arm
+for `Fetch`, so a PREPARED fetch described ZERO columns -- and psycopg prepares
+any statement it runs six times. A cursor read in a loop worked five times and
+then sent rows with no description: a protocol violation, in the ordinary way
+of using a cursor. **It was invisible to a short probe**; the sequence had to
+be long enough to cross the prepare threshold, which is why bisecting the long
+probe rather than trusting the short one is what found it.
+
+**Probe: 29 cursor operations, 0 divergences.**
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848.**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

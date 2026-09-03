@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bson::{Bson, Document};
 use bytes::Bytes;
-use futures::{stream, Sink, SinkExt, StreamExt};
+use futures::{stream, Sink, SinkExt, StreamExt, TryStreamExt};
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::{Format, Portal};
@@ -29,6 +29,7 @@ use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
+use pgwire::messages::data::DataRow;
 use pgwire::messages::response::CommandComplete;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use secantus_pgcatalog::{TableDef, CATALOG_COLLECTION};
@@ -54,6 +55,26 @@ pub struct PgHandler {
     /// The in-progress `COPY ... FROM STDIN`, if any: target plus the bytes
     /// received so far. Per connection, like PostgreSQL's.
     copy_in: Mutex<Option<CopyInState>>,
+    /// Open cursors, by name. Per connection, as PostgreSQL's are.
+    cursors: Mutex<HashMap<String, CursorState>>,
+}
+
+/// A declared cursor's materialised result.
+///
+/// The rows are collected at DECLARE rather than streamed, because a
+/// PostgreSQL cursor is SCROLLABLE -- `MOVE BACKWARD` and `FETCH ABSOLUTE` both
+/// have to work, and a forward-only stream cannot answer either. The cost is
+/// holding the result in memory, which is the trade this server already makes
+/// everywhere else.
+struct CursorState {
+    schema: Arc<Vec<FieldInfo>>,
+    rows: Vec<DataRow>,
+    /// PostgreSQL's own cursor position: the 1-based row the cursor sits ON,
+    /// with 0 meaning "before the first row" and `len + 1` meaning "after the
+    /// last". Those two extra positions are not decoration -- fetching past
+    /// the end leaves the cursor at `len + 1`, so a later `MOVE BACKWARD 2`
+    /// lands on the LAST row rather than the second-to-last.
+    pos: i64,
 }
 
 struct CopyInState {
@@ -73,6 +94,7 @@ impl PgHandler {
             txn: Mutex::new(None),
             settings: Mutex::new(default_settings()),
             copy_in: Mutex::new(None),
+            cursors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -345,6 +367,110 @@ impl PgHandler {
         Ok(out)
     }
 
+    /// `FETCH` and `MOVE`, which differ only in whether the rows are returned.
+    ///
+    /// Positions follow PostgreSQL's model exactly: the cursor sits ON a
+    /// 1-based row, with 0 before the first and `len + 1` after the last. Two
+    /// consequences that a simpler "next index" model gets wrong:
+    ///
+    /// * fetching past the end leaves the cursor at `len + 1`, so
+    ///   `MOVE BACKWARD 2` afterwards lands on the LAST row;
+    /// * a BACKWARD fetch returns its rows in reverse order, nearest first.
+    fn fetch(
+        &self,
+        name: &str,
+        direction: secantus_pgplan::FetchDirection,
+        count: i64,
+        is_move: bool,
+    ) -> PgWireResult<Vec<Response>> {
+        use secantus_pgplan::FetchDirection as Fd;
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(cursor) = cursors.get_mut(name) else {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "34000".into(), // invalid_cursor_name
+                format!("cursor \"{name}\" does not exist"),
+            ))));
+        };
+        let len = cursor.rows.len() as i64;
+        let pos = cursor.pos;
+
+        // `FETCH ALL` arrives as a count of i64::MAX, so every step saturates.
+        // RELATIVE and ABSOLUTE fetch ONE row -- the n'th from here, or the
+        // n'th from the start -- where FORWARD and BACKWARD fetch a RUN of
+        // them. Treating RELATIVE as a forward run returned every row up to
+        // the target instead of just the target.
+        let single = matches!(direction, Fd::Absolute | Fd::Relative);
+        let (mut wanted, backward) = match direction {
+            Fd::Forward => (count, false),
+            Fd::Backward => (count, true),
+            Fd::Absolute | Fd::Relative => (0, false),
+        };
+        // A negative count reverses the direction it was asked in.
+        let backward = if wanted < 0 {
+            wanted = wanted.saturating_neg();
+            !backward
+        } else {
+            backward
+        };
+
+        let (rows, new_pos): (Vec<DataRow>, i64) = match direction {
+            _ if single => {
+                let target = match direction {
+                    Fd::Relative => pos.saturating_add(count),
+                    // ABSOLUTE counts from the start, and from the END when
+                    // negative: -1 is the last row.
+                    _ if count > 0 => count,
+                    _ if count < 0 => len.saturating_add(count).saturating_add(1),
+                    _ => 0,
+                };
+                let target = target.clamp(0, len + 1);
+                let row = if (1..=len).contains(&target) {
+                    vec![cursor.rows[(target - 1) as usize].clone()]
+                } else {
+                    Vec::new()
+                };
+                (row, target)
+            }
+            _ if backward => {
+                // Rows below the cursor, nearest first.
+                let first = pos - 1;
+                let last = pos.saturating_sub(wanted).max(1);
+                let mut out = Vec::new();
+                let mut i = first.min(len);
+                while i >= last && i >= 1 {
+                    out.push(cursor.rows[(i - 1) as usize].clone());
+                    i -= 1;
+                }
+                (out, pos.saturating_sub(wanted).max(0))
+            }
+            _ => {
+                let first = pos.saturating_add(1);
+                let last = pos.saturating_add(wanted).min(len);
+                let mut out = Vec::new();
+                let mut i = first.max(1);
+                while i <= last {
+                    out.push(cursor.rows[(i - 1) as usize].clone());
+                    i += 1;
+                }
+                (out, pos.saturating_add(wanted).min(len + 1))
+            }
+        };
+
+        cursor.pos = new_pos.clamp(0, len + 1);
+        let n = rows.len();
+        if is_move {
+            return Ok(vec![Response::Execution(Tag::new(&format!("MOVE {n}")))]);
+        }
+        let schema = cursor.schema.clone();
+        drop(cursors);
+        let mut response = QueryResponse::new(schema, stream::iter(rows.into_iter().map(Ok)));
+        // The tag is just `FETCH`: the wire layer appends the row count, so
+        // building `FETCH 2` here produced `FETCH 2 2` on the wire.
+        response.command_tag = "FETCH".to_string();
+        Ok(vec![Response::Query(response)])
+    }
+
     /// The session's `TimeZone` GUC, resolved.
     fn session_timezone(&self) -> secantus_pgplan::TimeZoneSetting {
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
@@ -409,6 +535,43 @@ impl PgHandler {
         // Transaction control is session state, not a storage operation.
         if let Statement::Transaction(control) = stmt {
             return self.transaction_control(control);
+        }
+
+        // DECLARE runs its query NOW and keeps the rows, so the cursor can be
+        // scrolled in both directions later. Collecting a row stream needs to
+        // await, so it happens here in the async path rather than inside
+        // `execute` -- blocking on it there stalled the runtime and hung the
+        // connection outright.
+        if let Statement::DeclareCursor { name, query } = stmt {
+            if self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "25P01".into(), // no_active_sql_transaction
+                    "DECLARE CURSOR can only be used in transaction blocks".into(),
+                ))));
+            }
+            let responses = self.execute(*query, 0)?;
+            let Some(Response::Query(q)) = responses.into_iter().next() else {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "0A000".into(),
+                    "DECLARE CURSOR over this statement is not supported yet".into(),
+                ))));
+            };
+            let schema = q.row_schema.clone();
+            let rows = q.data_rows.try_collect::<Vec<_>>().await?;
+            self.cursors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    name,
+                    CursorState {
+                        schema,
+                        rows,
+                        pos: 0,
+                    },
+                );
+            return Ok(vec![Response::Execution(Tag::new("DECLARE CURSOR"))]);
         }
 
         // Everything else runs INSIDE the open transaction when there is one,
@@ -498,6 +661,8 @@ impl PgHandler {
     fn execute(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
         match stmt {
             Statement::Transaction(_) => unreachable!("handled before execute"),
+            // Handled in `run`, which can await the row stream.
+            Statement::DeclareCursor { .. } => unreachable!("handled before execute"),
             Statement::CreateTable(def) => {
                 if self.lookup(&def.name).is_some() {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -758,6 +923,29 @@ impl PgHandler {
             // nothing here to free: psycopg issues this to reset its own cache
             // and then re-prepares under fresh names. The TAG is the part that
             // matters, and PostgreSQL's is `DEALLOCATE ALL`, not `DEALLOCATE`.
+            Statement::Fetch {
+                name,
+                direction,
+                count,
+                is_move,
+            } => self.fetch(&name, direction, count, is_move),
+
+            Statement::CloseCursor(name) => {
+                let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+                if !name.is_empty() && cursors.remove(&name).is_none() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "34000".into(), // invalid_cursor_name
+                        format!("cursor \"{name}\" does not exist"),
+                    ))));
+                }
+                // `CLOSE ALL` carries an empty name.
+                if name.is_empty() {
+                    cursors.clear();
+                }
+                Ok(vec![Response::Execution(Tag::new("CLOSE CURSOR"))])
+            }
+
             Statement::DeallocateAll => Ok(vec![Response::Execution(Tag::new("DEALLOCATE ALL"))]),
 
             Statement::Set { name, value } => {
@@ -1761,6 +1949,17 @@ impl PgHandler {
         )
         .map_err(|e| Self::err(&e))?;
         Ok(match stmt {
+            // A FETCH describes the CURSOR's columns. Without this arm a
+            // prepared FETCH described zero of them, and psycopg prepares any
+            // statement it runs six times -- so a cursor read in a loop worked
+            // five times and then sent rows the client had no description for.
+            Statement::Fetch { name, .. } => {
+                let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+                match cursors.get(&name) {
+                    Some(cursor) => cursor.schema.as_ref().clone(),
+                    None => Vec::new(),
+                }
+            }
             Statement::Select(sel) => {
                 let def = self
                     .lookup(&sel.table)

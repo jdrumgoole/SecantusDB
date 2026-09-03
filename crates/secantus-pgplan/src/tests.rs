@@ -302,10 +302,10 @@ fn update_and_delete_are_planned() {
 
 #[test]
 fn shapes_sqlglot_mis_parses_reach_us_as_real_statements() {
-    // `DROP TABLE a, b, c` and `BEGIN ...` used to live here too; both now
-    // EXECUTE rather than merely parsing, which is the stronger result.
+    // `DROP TABLE a, b, c`, `BEGIN ...` and `MOVE FORWARD 2 IN c` used to live
+    // here too; all three now EXECUTE rather than merely parsing, which is the
+    // stronger result.
     for sql in [
-        "MOVE FORWARD 2 IN c",
         "LISTEN chan",
         "NOTIFY chan, 'payload'",
         "COPY t FROM stdin WITH (freeze on)",
