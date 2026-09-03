@@ -38,12 +38,14 @@ block is what found them. Keep both: the curated one says which bug came back,
 the random one finds the next.
 """
 
+import datetime
 import os
 import random
 import sys
 import tempfile
 
 import pymongo
+from bson import Decimal128, Int64, MaxKey, MinKey, ObjectId
 
 MONGOD = os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041")
 SERVER = os.environ.get("PROBE_SERVER")
@@ -107,7 +109,45 @@ CURATED = [
     ),
 ]
 
-VALUES = [None, 0, 1, 5, "x", "y", [1, 2], [], {"k": 1}, True]
+#: The population for both the documents and the query values.
+#:
+#: The second block was added 2026-09-03. An index is a SORT-KEY ENCODING, so
+#: the values whose encoding is special are exactly the ones that can make rows
+#: vanish from an indexed query while a collection scan still finds them --
+#: `sortkey` gives NaN and the infinities dedicated bracketing markers, and
+#: MinKey / MaxKey bound the whole BSON order. None of them was in this list,
+#: which is the same gap that hid thirteen crashes in `agg_expressions.py`
+#: until it was widened the same day.
+VALUES = [
+    None,
+    0,
+    1,
+    5,
+    "x",
+    "y",
+    [1, 2],
+    [],
+    {"k": 1},
+    True,
+    # --- values whose sort-key encoding is special -----------------------
+    float("inf"),
+    float("-inf"),
+    float("nan"),
+    # The DECIMAL NaN takes a different path through the NaN gate in
+    # `_op_implies_bound` (`query._is_nan` covers both); mongod returns the row
+    # with and without a partial index for each (measured 8.2.11, 2026-09-03).
+    Decimal128("NaN"),
+    Decimal128("1"),
+    Decimal128("2.5"),
+    # -0.0 compares EQUAL to 0 but is a different encoding.
+    -0.0,
+    MinKey(),
+    MaxKey(),
+    # Ordinary indexed types this list also lacked.
+    ObjectId("64b7f9a2c1d2e3f4a5b6c7d8"),
+    datetime.datetime(2026, 1, 2, 3, 4, 5),
+    Int64(2**40),
+]
 INDEXES = [
     ([("a", 1)], {"sparse": True}),
     ([("a", 1)], {}),
@@ -160,7 +200,7 @@ def main() -> int:
                 print(f"  indexed={indexed}  no-index={bare}  mongod={expected}")
     print(f"--- curated: {bad} of {total} divergent")
 
-    rng = random.Random(20260901)
+    rng = random.Random(int(os.environ.get("PROBE_SEED", "20260901")))
     gen = lambda: rng.choice(  # noqa: E731
         [
             lambda f: {f: rng.choice(VALUES)},
@@ -173,7 +213,7 @@ def main() -> int:
         ]
     )
     rbad = rtotal = 0
-    for trial in range(150):
+    for trial in range(int(os.environ.get("PROBE_TRIALS", "150"))):
         dbn = f"probe_idx_fuzz{trial}"
         mon.drop_database(dbn)
         sec.drop_database(dbn)

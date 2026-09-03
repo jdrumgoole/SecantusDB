@@ -2452,9 +2452,14 @@ fn op_bits(
     Ok(false)
 }
 
-/// A float or Decimal128 NaN. Used only by equality — ordering keeps IEEE
-/// semantics, where NaN is incomparable with everything including itself.
-pub(crate) fn is_nan_bson(b: &Bson) -> bool {
+/// A float or Decimal128 NaN.
+///
+/// Used by equality — ordering keeps IEEE semantics, where NaN is incomparable
+/// with everything including itself — and by `secantus-storage`'s partial-index
+/// implication check, which must refuse any RANGE bound involving a NaN: the
+/// range operators exclude NaN outright while the sort key ranks it below
+/// -Infinity, and taking the sort key for the answer lost rows (2026-09-03).
+pub fn is_nan_bson(b: &Bson) -> bool {
     match b {
         Bson::Double(d) => d.is_nan(),
         // Decimal128's NaN is a bit pattern, not a value we can compare; parse

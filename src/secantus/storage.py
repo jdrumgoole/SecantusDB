@@ -1433,6 +1433,13 @@ def _type_bracket(encoded: bytes) -> int:
     return encoded[0] if encoded else -1
 
 
+def _is_nan_value(v: Any) -> bool:
+    """True for a float or Decimal128 NaN. Shares `query._is_nan`'s rule."""
+    from secantus.query import _is_nan
+
+    return _is_nan(v)
+
+
 def _op_implies_bound(qop: str, qv: Any, pop: str, pv: Any) -> bool:
     """Does a single query constraint ``(qop, qv)`` guarantee the partial
     bound ``(pop, pv)``? Returns ``False`` for any operator pairing it can't
@@ -1451,6 +1458,20 @@ def _op_implies_bound(qop: str, qv: Any, pop: str, pv: Any) -> bool:
     try:
         a, b = encode_value(qv), encode_value(pv)
     except Exception:
+        return False
+    # NaN satisfies NO range comparison -- `{b: {$lte: 1.5}}` and even
+    # `{b: {$gte: -Infinity}}` exclude it -- but it IS equal to itself, so
+    # `{b: NaN}` matches. The byte compare cannot see that: NaN's sort key
+    # orders below every number, so this concluded `{b: NaN}` implies
+    # `{b: {$lte: 1.5}}`, used a partial index that does not contain the
+    # document, and `find({b: NaN})` returned NOTHING where a collection scan
+    # and mongod both return it. Silent data loss on BOTH servers; measured
+    # 8.2.11, 2026-09-03.
+    #
+    # The type bracket below does not catch it -- NaN is INSIDE the numeric
+    # bracket. The comment there says "within one bracket the byte compare is
+    # exactly right", and NaN is the exception to that.
+    if pop != "$eq" and (_is_nan_value(qv) or _is_nan_value(pv)):
         return False
     if pop != "$eq" and _type_bracket(a) != _type_bracket(b):
         return False
