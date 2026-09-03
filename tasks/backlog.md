@@ -12462,3 +12462,44 @@ PostgreSQL form, and `tests/test_sql_composite_type.py` pins it); it is the
 (`jsonb`) where PostgreSQL reports 114 (`json`)**, and **`row_to_json(x)` over
 a derived table alias fails with `42703: column "x" does not exist`** — the
 alias of a sub-SELECT is not resolvable as a whole-row reference.
+
+## Extended query protocol (2026-09-03) — swept, three fixes, three gaps left
+
+The Parse/Bind/Describe/Execute path every real driver speaks, probed with
+`tools/probes/pg_corpora/params.sql` (which the harness now runs three ways per
+line — text parameters, a server-side PREPARED statement, and BINARY result
+format) plus a set of stateful scenarios now living in
+`tests/test_sql_sweep_fourteen.py`.
+
+**The value surface came back clean**: 126 checks over every scalar type
+through Bind, parameters in predicates / select list / `LIMIT` / `RETURNING`,
+and server-side cursors (`fetchmany`, `SCROLL` rewind, parameterised cursor
+queries, death at COMMIT) all matched PostgreSQL 14.13. What diverged was the
+error surface. Fixed:
+
+- **`EXPLAIN` with a parameter violated the wire protocol** — described as
+  NoData, then sent DataRows. Reachable only through the extended protocol, so
+  no literal corpus could have found it.
+- **`DECLARE CURSOR` outside a transaction block was accepted** (PostgreSQL:
+  `25P01`), then the following `FETCH` failed with `34000`, blaming the wrong
+  statement. `WITH HOLD` is exempt, and so is the embedded `run_sql` API — it
+  has no implicit commit, so the cursor stays usable and the rule's rationale
+  does not apply. The two session states are otherwise indistinguishable at the
+  point of the check, so `Session.on_the_wire` carries the distinction.
+- **Parameters in DDL were accepted** (PostgreSQL: `42P02 there is no
+  parameter $1`). The boundary was measured, not reasoned: `CREATE TABLE t AS
+  SELECT $1` is accepted while `CREATE VIEW v AS SELECT $1` is rejected.
+
+Three gaps remain:
+
+1. **`int[] @> $1` accepts a `smallint[]` parameter** where PostgreSQL raises
+   `42883 operator does not exist: integer[] @> smallint[]`. psycopg sends a
+   small-int list as `smallint[]`, and we are more permissive than PostgreSQL
+   about array element types. Being permissive returns a right answer here, so
+   this is an error-surface gap rather than a wrong result.
+2. **`EXPLAIN (FORMAT JSON)` reports oid 25** where PostgreSQL reports 114
+   (`json`). Describe deliberately matches this server's own Execute, which
+   also sends 25 — a Describe that disagrees with its Execute is a worse bug
+   than the wrong oid. Fixing it means changing both together.
+3. **`EXPLAIN (FORMAT XML)` and `(FORMAT YAML)` are `0A000`.** A scope
+   decision, not a defect; recorded so the next sweep does not re-find it.

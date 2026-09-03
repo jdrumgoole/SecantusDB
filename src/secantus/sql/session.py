@@ -374,6 +374,16 @@ class Session:
     database: str = "postgres"
     user: str = "secantus"
     backend_pid: int = 0
+
+    #: True when this session belongs to a wire-protocol connection rather than
+    #: an embedded ``run_sql`` caller. The two differ in one behaviour that
+    #: matters: outside an explicit transaction block the wire server wraps each
+    #: statement in an implicit transaction that COMMITS at statement end, so a
+    #: non-holdable cursor declared there would be discarded before the client
+    #: could fetch from it -- which is why PostgreSQL refuses that DECLARE with
+    #: 25P01. The embedded API has no implicit commit, so a cursor declared
+    #: without a transaction stays usable and the rule does not apply to it.
+    on_the_wire: bool = False
     settings: dict[str, str] = field(default_factory=dict)
     # Server-config GUC defaults (postgresql.conf tier). Sits between the
     # session's ``SET`` overrides and the built-in ``GUC_DEFAULTS``: an explicit

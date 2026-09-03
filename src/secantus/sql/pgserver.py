@@ -455,7 +455,7 @@ class SecantusPGServer:
         if self.require_auth and not self._authenticate(io, user):
             return None
 
-        session = Session(database=db, user=user, backend_pid=backend_pid)
+        session = Session(database=db, user=user, backend_pid=backend_pid, on_the_wire=True)
         # Server-config GUC tier (postgresql.conf equivalent): SET overrides
         # it, RESET falls back to it, SHOW reports it.
         if self.idle_in_transaction_timeout_s > 0:
