@@ -1486,3 +1486,98 @@ def test_multirange_values_bind_in_both_formats(home: Path, binary: bool) -> Non
 
         cur.execute("select int4multirange(%s::int4range)", (Range(1, 5, "[)"),))
         assert cur.fetchone()[0] == Multirange([Range(1, 5, "[)")])
+
+
+def test_cursors_follow_postgres_positions(home: Path) -> None:
+    """DECLARE / FETCH / MOVE / CLOSE, with PostgreSQL's position model.
+
+    The cursor sits *on* a 1-based row, with 0 before the first and ``len + 1``
+    after the last. Those two extra positions are not decoration: fetching past
+    the end leaves the cursor at ``len + 1``, so a later ``MOVE BACKWARD 2``
+    lands on the **last** row rather than the second-to-last. A simpler
+    "index of the next row" model gets that wrong by one.
+
+    Two more rules that only a real server tells you: a BACKWARD fetch returns
+    its rows in reverse order, nearest first; and ``RELATIVE``/``ABSOLUTE``
+    fetch a *single* row — the n-th from here, or the n-th from the start —
+    where ``FORWARD``/``BACKWARD`` fetch a run of them.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int primary key, n int)")
+        conn.execute("insert into t values (1,10),(2,20),(3,30),(4,40),(5,50)")
+        with conn.transaction():
+            cur = conn.cursor()
+            cur.execute("declare c1 cursor for select id, n from t order by id")
+            assert cur.statusmessage == "DECLARE CURSOR"
+
+            cur.execute("fetch 2 from c1")
+            assert cur.fetchall() == [(1, 10), (2, 20)]
+            assert cur.statusmessage == "FETCH 2"
+
+            cur.execute("fetch all from c1")
+            assert cur.fetchall() == [(3, 30), (4, 40), (5, 50)]
+
+            # Past the end: no rows, and the cursor parks *after* the last row.
+            cur.execute("fetch 1 from c1")
+            assert cur.fetchall() == []
+            assert cur.statusmessage == "FETCH 0"
+
+            # ...which is why backing up two lands on the last row, not the
+            # second-to-last.
+            cur.execute("move backward 2 in c1")
+            assert cur.statusmessage == "MOVE 2"
+            cur.execute("fetch 1 from c1")
+            assert cur.fetchall() == [(5, 50)]
+
+            # A backward fetch reads in reverse, nearest first.
+            cur.execute("fetch backward all from c1")
+            assert cur.fetchall() == [(4, 40), (3, 30), (2, 20), (1, 10)]
+
+            # RELATIVE and ABSOLUTE fetch ONE row.
+            cur.execute("fetch absolute 2 from c1")
+            assert cur.fetchall() == [(2, 20)]
+            cur.execute("fetch relative 2 from c1")
+            assert cur.fetchall() == [(4, 40)]
+            # ABSOLUTE counts from the end when negative.
+            cur.execute("fetch absolute -1 from c1")
+            assert cur.fetchall() == [(5, 50)]
+
+            cur.execute("close c1")
+            assert cur.statusmessage == "CLOSE CURSOR"
+
+        # A cursor needs a transaction; outside one it could never be used.
+        with pytest.raises(psycopg.Error) as exc:
+            conn.execute("declare c2 cursor for select 1")
+        assert exc.value.diag.sqlstate == "25P01"
+
+        with pytest.raises(psycopg.Error) as exc:
+            conn.execute("fetch 1 from nosuch")
+        assert exc.value.diag.sqlstate == "34000"
+
+
+def test_repeated_fetch_survives_statement_preparation(home: Path) -> None:
+    """Regression: a FETCH must describe the cursor's columns.
+
+    psycopg prepares any statement it runs more than five times, and a prepared
+    statement is described once and then executed. The describe path had no arm
+    for FETCH, so it reported *zero* columns — and the sixth identical fetch in
+    a loop sent rows the client had no description for, which is a protocol
+    violation rather than a wrong answer ("D message without prior row
+    description").
+
+    Reading a cursor in a loop is the ordinary way to use one, so this affected
+    the normal case and not an edge of it.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int primary key)")
+        conn.execute("insert into t values (1),(2),(3),(4),(5),(6),(7),(8)")
+        with conn.transaction():
+            cur = conn.cursor()
+            cur.execute("declare c1 cursor for select id from t order by id")
+            seen = []
+            # Well past psycopg's prepare threshold of five.
+            for _ in range(8):
+                cur.execute("fetch 1 from c1")
+                assert cur.description is not None, "no row description"
+                seen.extend(r[0] for r in cur.fetchall())
+            assert seen == [1, 2, 3, 4, 5, 6, 7, 8]

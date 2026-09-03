@@ -132,6 +132,25 @@ pub enum Statement {
     },
     /// `RESET name` / `RESET ALL`.
     Reset(String),
+    /// `DECLARE <name> CURSOR FOR <query>`.
+    ///
+    /// The inner query is planned here and executed at DECLARE time, because a
+    /// cursor over a materialised result is scrollable in both directions --
+    /// which PostgreSQL's cursors are, and a forward-only stream would not be.
+    DeclareCursor {
+        name: String,
+        query: Box<Statement>,
+    },
+    /// `FETCH`/`MOVE`. `is_move` discards the rows and reports only the count,
+    /// which is the only difference between the two statements.
+    Fetch {
+        name: String,
+        direction: FetchDirection,
+        count: i64,
+        is_move: bool,
+    },
+    /// `CLOSE <name>`.
+    CloseCursor(String),
     /// `DEALLOCATE ALL`.
     ///
     /// Only the ALL form. The prepared-statement store belongs to the wire
@@ -148,6 +167,17 @@ pub enum Statement {
     Aggregate(Aggregate),
     Update(Update),
     Delete(Delete),
+}
+
+/// Which way a `FETCH` or `MOVE` runs, and from where.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchDirection {
+    Forward,
+    Backward,
+    /// From the start of the result, one-based.
+    Absolute,
+    /// From the current position.
+    Relative,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -430,6 +460,36 @@ pub fn plan_with_params(
         N::DropStmt(d) => plan_drop(&d),
         N::CopyStmt(c) => plan_copy(&c, lookup),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
+        N::DeclareCursorStmt(d) => {
+            let inner = match d.query.as_ref().and_then(|q| q.node.as_ref()) {
+                Some(N::SelectStmt(sel)) => plan_select(sel, lookup, params)?,
+                Some(other) => return Err(Error::Unsupported(disc(other))),
+                None => return Err(Error::Parse("DECLARE CURSOR without a query".into())),
+            };
+            Ok(Statement::DeclareCursor {
+                name: d.portalname.clone(),
+                query: Box::new(inner),
+            })
+        }
+        N::FetchStmt(f) => {
+            use pg_query::protobuf::FetchDirection as Fd;
+            // Named enum, not the raw integer: writing these as numbers is how
+            // this server once turned every AND into an OR.
+            let direction = match Fd::try_from(f.direction) {
+                Ok(Fd::FetchForward) => FetchDirection::Forward,
+                Ok(Fd::FetchBackward) => FetchDirection::Backward,
+                Ok(Fd::FetchAbsolute) => FetchDirection::Absolute,
+                Ok(Fd::FetchRelative) => FetchDirection::Relative,
+                _ => return Err(Error::Unsupported("this FETCH direction".into())),
+            };
+            Ok(Statement::Fetch {
+                name: f.portalname.clone(),
+                direction,
+                count: f.how_many,
+                is_move: f.ismove,
+            })
+        }
+        N::ClosePortalStmt(c) => Ok(Statement::CloseCursor(c.portalname.clone())),
         // `DEALLOCATE ALL` carries no name; `DEALLOCATE x` names one.
         N::DeallocateStmt(d) if d.name.is_empty() => Ok(Statement::DeallocateAll),
         N::DeallocateStmt(_) => Err(Error::Unsupported("DEALLOCATE <name>".into())),
