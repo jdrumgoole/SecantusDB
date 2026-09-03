@@ -546,6 +546,212 @@ class TestGetField:
         )
 
 
+class TestDomainAndValueErrors:
+    """Errors that name the offending VALUE, not just its type.
+
+    Three renderings, and they are not interchangeable -- each was probed
+    against 8.2.11 (2026-09-03):
+
+    * `$acos` converts to double first, so a long prints in C's `%g`
+      (`1.09951e+12`);
+    * `$range` keeps an integer's digits (`1099511627776`);
+    * a `Decimal128` keeps its OWN representation in both, so `2.50` does not
+      become `2.5`.
+    """
+
+    @pytest.mark.parametrize(
+        ("expr", "message"),
+        [
+            ({"$acos": 1.5}, "cannot apply $acos to 1.5, value must be in [-1,1]"),
+            ({"$asin": -1.5}, "cannot apply $asin to -1.5, value must be in [-1,1]"),
+            ({"$atanh": 1.5}, "cannot apply $atanh to 1.5, value must be in [-1,1]"),
+            ({"$acosh": 0}, "cannot apply $acosh to 0, value must be in [1,inf]"),
+            # A long goes through the double, so it prints in %g form.
+            (
+                {"$acos": Int64(2**40)},
+                "cannot apply $acos to 1.09951e+12, value must be in [-1,1]",
+            ),
+            # A decimal keeps every significant zero it was written with.
+            (
+                {"$acos": Decimal128("2.50")},
+                "cannot apply $acos to 2.50, value must be in [-1,1]",
+            ),
+            # The infinities are refused; NaN is not -- see below.
+            (
+                {"$sin": float("inf")},
+                "cannot apply $sin to inf, value must be in (-inf,inf)",
+            ),
+        ],
+    )
+    def test_a_domain_error_names_the_value(self, coll, expr, message):
+        assert _run(coll, expr) == (50989, message)
+
+    @pytest.mark.parametrize("op", ["$sin", "$cos", "$tan"])
+    def test_nan_is_not_a_domain_error(self, coll, op):
+        """`{$tan: NaN}` answers NaN. Spelling the guard `!x.is_finite()`
+        rejected it, which mongod does not."""
+        code, value = _run(coll, {op: float("nan")})
+        assert code == "OK" and value != value  # NaN
+
+    def test_range_keeps_an_integer_whole(self, coll):
+        """A 32-bit check, not 64: accepting the long built a range of a
+        trillion elements and answered `[]`."""
+        assert _run(coll, {"$range": [Int64(2**40), 1]}) == (
+            34444,
+            "$range requires a starting value that can be represented as a "
+            "32-bit integer, found value: 1099511627776",
+        )
+        assert _run(coll, {"$range": [Decimal128("2.50"), 1]})[1].endswith("found value: 2.50")
+
+    def test_mergeobjects_names_the_offending_value(self, coll):
+        assert _run(coll, {"$mergeObjects": "abc"}) == (
+            40400,
+            '$mergeObjects requires object inputs, but input "abc" is of type string',
+        )
+        assert _run(coll, {"$mergeObjects": ObjectId("64b7f9a2c1d2e3f4a5b6c7d8")}) == (
+            40400,
+            "$mergeObjects requires object inputs, but input "
+            "64b7f9a2c1d2e3f4a5b6c7d8 is of type objectId",
+        )
+
+    def test_mergeobjects_flattens_an_evaluated_array(self, coll):
+        """A field path resolving to an array IS the operand list."""
+        coll.insert_one({"_id": 9, "docs": [{"a": 1}, {"b": 2}]})
+        got = list(
+            coll.aggregate(
+                [{"$match": {"_id": 9}}, {"$project": {"z": {"$mergeObjects": "$docs"}}}]
+            )
+        )
+        assert got[0]["z"] == {"a": 1, "b": 2}
+        assert _run(coll, {"$mergeObjects": "$arr"}) == (
+            40400,
+            "$mergeObjects requires object inputs, but input 3 is of type int",
+        )
+
+
+class TestArithmeticTypeGuards:
+    """Six operators, six wordings, none interchangeable."""
+
+    @pytest.mark.parametrize(
+        ("expr", "code", "message"),
+        [
+            ({"$add": ["abc", 1]}, 14, "$add only supports numeric or date types, not string"),
+            ({"$multiply": ["abc", 1]}, 14, "$multiply only supports numeric types, not string"),
+            # These two name BOTH operands, in order.
+            (
+                {"$divide": ["abc", 1]},
+                14,
+                "$divide only supports numeric types, not string and int",
+            ),
+            (
+                {"$mod": [1, "abc"]},
+                16611,
+                "$mod only supports numeric types, not int and string",
+            ),
+            # `$subtract` inverts them into a different sentence entirely.
+            ({"$subtract": ["abc", 1]}, 14, "can't $subtract int from string"),
+            ({"$subtract": [1, "abc"]}, 14, "can't $subtract string from int"),
+            # ...and capitalises `Date` alone. `objectId` keeps its usual name.
+            ({"$subtract": [WHEN, "abc"]}, 14, "can't $subtract string from Date"),
+            # `$atan2` carries a different CODE per position.
+            ({"$atan2": ["abc", 1]}, 51044, "$atan2 only supports numeric types, not string"),
+            ({"$atan2": [1, "abc"]}, 51045, "$atan2 only supports numeric types, not string"),
+        ],
+    )
+    def test_the_wording_is_per_operator(self, coll, expr, code, message):
+        assert _run(coll, expr) == (code, message)
+
+    def test_a_bool_is_not_numeric(self, coll):
+        assert _run(coll, {"$add": [True, 1]})[1].endswith("not bool")
+
+    def test_null_wins_over_the_type_error(self, coll):
+        """A null operand answers null on all six rather than complaining."""
+        for op in ("$add", "$subtract", "$multiply", "$divide", "$mod", "$atan2"):
+            assert _run(coll, {op: [None, "abc"]}) == ("OK", None), op
+
+    def test_a_decimal_is_numeric_and_is_not_reported_here(self, coll):
+        """Decimal128 is a numeric type mongod computes with. Reporting a type
+        error for it would be wrong; this engine defers for its own reason."""
+        assert _run(coll, {"$add": [Decimal128("1.5"), 1]})[0] != 14
+
+
+class TestUnknownSpecArguments:
+    """An unrecognised key in an operator's spec document.
+
+    Two sentences and eighteen codes -- they share nothing, not even within a
+    wording. Probed one operator at a time against 8.2.11 (2026-09-03).
+    """
+
+    @pytest.mark.parametrize(
+        ("op", "code", "parameter_form"),
+        [
+            ("$cond", 17083, True),
+            ("$filter", 28647, True),
+            ("$let", 16875, True),
+            ("$map", 16879, True),
+            ("$convert", 9, False),
+            ("$trim", 50694, False),
+            ("$reduce", 40076, False),
+            ("$regexMatch", 31024, False),
+            ("$replaceAll", 51750, False),
+            ("$setField", 4161101, False),
+            ("$sortArray", 2942501, False),
+            ("$switch", 40067, False),
+            ("$zip", 34464, False),
+        ],
+    )
+    def test_each_operator_has_its_own_code(self, coll, op, code, parameter_form):
+        expected = (
+            f"Unrecognized parameter to {op}: k"
+            if parameter_form
+            else f"{op} found an unknown argument: k"
+        )
+        assert _run(coll, {op: {"k": 1}}) == (code, expected)
+
+    def test_the_n_operators_check_the_unknown_key_first(self, coll):
+        """Before complaining that `n` is missing."""
+        for op in ("$firstN", "$lastN", "$minN", "$maxN"):
+            assert _run(coll, {op: {"k": 1}}) == (
+                5787901,
+                "Unknown argument for 'n' operator: k",
+            ), op
+
+    def test_median_and_percentile_use_the_idl_wording(self, coll):
+        for op in ("$median", "$percentile"):
+            assert _run(coll, {op: {"k": 1}}) == (
+                40415,
+                f"BSON field '{op}.k' is an unknown field.",
+            ), op
+
+
+class TestCoercedStringOperands:
+    """`$substr*` and `$strcasecmp` COERCE their operands rather than
+    requiring a string -- the same rule `$toLower` uses, with its 16007."""
+
+    @pytest.mark.parametrize("op", ["$substr", "$substrBytes", "$substrCP"])
+    def test_a_number_is_coerced(self, coll, op):
+        assert _run(coll, {op: [123, 1, 2]}) == ("OK", "23")
+
+    def test_strcasecmp_coerces_both_sides(self, coll):
+        assert _run(coll, {"$strcasecmp": [1.5, 1]}) == ("OK", 1)
+        assert _run(coll, {"$strcasecmp": [Decimal128("2.5"), 1]}) == ("OK", 1)
+
+    def test_the_types_that_rule_rejects_are_still_16007(self, coll):
+        assert _run(coll, {"$strcasecmp": [{"a": 1}, "a"]}) == (
+            16007,
+            "can't convert from BSON type object to String",
+        )
+
+
+def test_round_and_trunc_are_arity_checked_at_parse_time(coll):
+    """`{$round: [3, 1, 2]}` ANSWERED 3 before this."""
+    for op in ("$round", "$trunc"):
+        assert _run(coll, {op: [3, 1, 2]}) == (
+            28667,
+            f"Expression {op} takes at least 1 arguments, and at most 2, but 3 were passed in.",
+        ), op
+
+
 def test_the_pipeline_wrapper_follows_the_argument(coll):
     """mongod folds a wholly constant expression and says so; one that reads the
     document fails per document under the executor prefix."""
