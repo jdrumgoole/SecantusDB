@@ -61,6 +61,25 @@ def terminate_backend(args: list, session: Session, *, cancel: bool = False) -> 
     return False
 
 
+#: Session functions that are pure reads of session / server state, so they are
+#: safe to evaluate anywhere an expression can appear. Everything with a side
+#: effect (``set_config``, the advisory locks, ``pg_terminate_backend``) stays
+#: off this list and keeps its explicit handling.
+_ANY_CONTEXT_FUNCS = frozenset(
+    {
+        "current_setting",
+        "current_database",
+        "current_schema",
+        "current_query",
+        "version",
+        "pg_is_in_recovery",
+        "inet_server_addr",
+        "inet_server_port",
+        "pg_postmaster_start_time",
+    }
+)
+
+
 def evaluate_scalar_by_name(name: str, args: list, session: Session) -> Any:
     """Session-function dispatch by bare name + evaluated args — the scalar
     evaluator's escape hatch for calls that appear in non-constant contexts."""
@@ -72,6 +91,13 @@ def evaluate_scalar_by_name(name: str, args: list, session: Session) -> Any:
         # Per-row pg_sleep (``select pg_sleep(0.01) from generate_series(…)``)
         # — same cancellation-point semantics as the FROM-less form.
         return _evaluate_named("pg_sleep", args, session)[1]
+    if name in _ANY_CONTEXT_FUNCS:
+        # These were reachable ONLY from `plan_constant_select`, so
+        # `SELECT current_setting('x')` worked while
+        # `SELECT current_setting('x') ~ '…'` -- the same call one level down --
+        # answered `42883 function current_setting(text) does not exist`. A read
+        # of session state is valid wherever an expression is.
+        return _evaluate_named(name, args, session)[1]
     raise errors.feature_not_supported(f"function {name}() is not supported in this context")
 
 

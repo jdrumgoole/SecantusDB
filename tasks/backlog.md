@@ -1904,6 +1904,31 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+### 2026-09-03 SQL sweep ten: DDL and catalog — what is still open
+
+DDL (38/41) and catalog introspection (15/22) probed against PostgreSQL 14.13;
+`tests/test_sql_sweep_ten.py` pins the fixes. **DDL needs little work** — every
+constraint kind enforces, ALTER's add/drop/rename/type/default/not-null paths
+all match, and so do CREATE INDEX / VIEW and their error surface. What is open:
+
+- [ ] **`information_schema.columns` has no `numeric_precision` /
+      `numeric_scale`** (`42703`). ORM reflection reads these to recover a
+      `numeric(p, s)` declaration; without them the scale is invisible.
+- [ ] **`information_schema.table_constraints` omits the CHECK rows Postgres
+      synthesizes for NOT NULL.** We report only the PRIMARY KEY where PG
+      reports two CHECKs beside it.
+- [ ] **`to_regclass` is absent** (`42883`). Common in tooling that probes for a
+      relation's existence without raising.
+- [ ] **`pg_typeof(x::regclass)` answers `text`**, not `regclass` — the regclass
+      cast resolves to the oid but does not carry its type.
+- [ ] **`ANY(...)` over a CATALOG array column** (`i.indkey`) is `0A000
+      unsupported array operand`. The pgjdbc / SQLAlchemy primary-key
+      introspection join uses exactly this shape.
+- [ ] **`has_table_privilege('nosuchuser', 't', 'SELECT')` answers false**;
+      Postgres raises `42704 role "nosuchuser" does not exist`.
+- [ ] **`CREATE OR REPLACE VIEW` may drop columns.** Postgres refuses with
+      `42P16 cannot drop columns from view`; we replace the definition happily.
+
 ### 2026-09-03: the RUST pgserver on the same functions — grepped, not assumed
 
 CLAUDE.md's standing rule is to grep `crates/` for the same helper whenever a

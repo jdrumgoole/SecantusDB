@@ -692,7 +692,7 @@ def _apply_alter_action(
         if col is None:
             if action.args.get("exists"):
                 return
-            raise errors.undefined_column(name)
+            raise errors.undefined_column(name, table.name)
         if col.pk:
             raise errors.feature_not_supported("dropping the PRIMARY KEY column is not supported")
         table.columns = [c for c in table.columns if c.name != name]
