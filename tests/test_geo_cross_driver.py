@@ -69,6 +69,35 @@ def _run(
     return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
 
 
+def _run_provision(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    timeout: float,
+) -> subprocess.CompletedProcess | None:
+    """A toolchain-PROVISIONING subprocess (`npm install`, `bundle install`, a
+    Maven build). Returns ``None`` if it timed out.
+
+    Every `_ensure_*` helper below is documented as returning ``False`` when the
+    toolchain cannot be provisioned -- offline, no registry, a cold cache -- so
+    that the smoke needing it SKIPS. They only ever checked the exit code, while
+    `_run` passes `timeout` straight to `subprocess.run`, which RAISES
+    `TimeoutExpired`. A registry that is merely SLOW therefore failed the build
+    where the helper's own contract says skip: four CI shards went red on
+    `npm install` exceeding 300s, and a rerun cleared three and not the fourth
+    (2026-09-03).
+
+    A timeout here means what a non-zero exit means -- no usable toolchain right
+    now -- so it is reported the same way. Deliberately NOT folded into `_run`:
+    in a test BODY a timeout is a real failure and must stay one.
+    """
+    try:
+        return _run(cmd, cwd=cwd, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+
+
 @pytest.fixture
 def server(wt_home):
     with SecantusDBServer(port=0, storage_path=wt_home) as srv:
@@ -175,8 +204,8 @@ def _ensure_node_modules() -> bool:
         fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
         if (nm / "mongodb").is_dir():
             return True
-        result = _run([_NPM, "install", "--silent"], cwd=_NODE_SMOKE_DIR, timeout=300.0)
-        return result.returncode == 0 and (nm / "mongodb").is_dir()
+        result = _run_provision([_NPM, "install", "--silent"], cwd=_NODE_SMOKE_DIR, timeout=300.0)
+        return result is not None and result.returncode == 0 and (nm / "mongodb").is_dir()
 
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
@@ -273,12 +302,12 @@ def _ensure_java_smokes_jar() -> bool:
         fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
         if _java_smokes_jar_is_fresh():
             return True
-        result = _run(
+        result = _run_provision(
             [_GRADLE, "smokesJar", "--no-daemon", "-q"],
             cwd=_JAVA_SMOKE_DIR,
             timeout=600.0,
         )
-        return result.returncode == 0 and _JAVA_SMOKES_JAR.is_file()
+        return result is not None and result.returncode == 0 and _JAVA_SMOKES_JAR.is_file()
 
 
 @pytest.mark.skipif(_JAVA is None, reason="java not on PATH")
