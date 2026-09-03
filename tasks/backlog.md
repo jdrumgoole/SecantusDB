@@ -4621,13 +4621,25 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
   What is left is a long tail of individually-probed messages, plus:
 
-  - **5 genuine wrong VALUES**, all last-digit `Decimal128` on the
-    transcendental functions (`$acosh` / `$ln` / `$log10` / `$sin` / `$tan` of
-    `Decimal128("2.5")`). This is the documented 34-significant-digit vs
-    `float`'s 17 limitation, not a quick fix — see §2's note on `$abs` / `$ceil`.
-  - **212 message-only** differences. That number went UP as the codes were
-    fixed (123 → 212), which is progress: a shape with the right code and the
-    wrong wording moves from one bucket to the other.
+  - **20 wrong VALUES, every one `Decimal128` (re-measured 2026-09-03 on the
+    WIDENED 6,628-case corpus; the "5" this line used to claim was the
+    3,968-case number).** All the same root cause: the transcendentals are
+    computed in `float` and converted back, which loses both precision and the
+    34-digit quantum — `$cos(Decimal128("-0"))` is
+    `1.000000000000000000000000000000000` on mongod and `1` here, and
+    `$sin(Decimal128("-0"))` is `-0E-40` where we answer `0`. The documented
+    34-significant-digit vs `float`'s 17 limitation, not a quick fix — see §2's
+    note on `$abs` / `$ceil`. Fixing only the SIGN would not close any of them,
+    because the exponent still differs.
+
+    The wrong-value bucket was 24 until the non-decimal ones were fixed
+    (`$type` of a `bson.Code`, and signed zero through
+    `$ceil` / `$floor` / `$trunc` / `$add` / `$avg`).
+  - **148 message-only** differences (2026-09-03; was 212 on the narrower
+    corpus, then 173 on the widened one before the `javascriptWithScope` fix
+    closed 25 of them in one change). This number going UP as codes are fixed is
+    progress: a shape with the right code and the wrong wording moves from one
+    bucket to the other.
 
   Two traps for whoever takes the tail, both paid for already: `$bitNot` and
   `$setEquals` each behave differently from their own families, and generalising
@@ -4649,6 +4661,24 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
     operator** — still open, see below.
   - ~9 stragglers: `$rand: []`, `$substr*` with an array argument, `$toDouble`
     / `$toLong` / `$toDecimal` of a datetime, `$strcasecmp` of a double.
+
+- [ ] **The parity suites compare with a bare `==` in seven of eight files
+  (2026-09-03).** `tests/test_rust_expressions_parity.py` now has a `_same` that
+  treats NaN as equal, distinguishes SIGNED ZEROS, and recurses into arrays and
+  documents, and all sixteen of its assertion sites go through it. The other
+  seven parity files still assert `rust == py` directly.
+
+  This is not theoretical. `-0.0 == 0.0` is True in Python, so the expressions
+  suite ran `$ceil` over a value pool CONTAINING `-0.0`, 5,000 times a run, and
+  passed every time while the pure engine dropped the sign and the Rust engine
+  kept it. The corpus was never the gap — the comparator was, and at twelve of
+  its sixteen sites it was not even being called.
+
+  None of the other seven has a `-0.0` in its corpus, so the blindness there is
+  latent rather than active. Both halves want doing together: lift `_same` to a
+  shared helper, route every site through it, and add signed zero to each
+  corpus. Expect real findings in `update` and `aggregate`, which carry values
+  through write and accumulator paths.
 
 - [ ] **Decimal128 operands are refused by 33 Rust operators (2026-09-02).**
   Was 38; `$abs`, `$toBool`, `$toInt`, `$toLong` and `$toDouble` now take them.

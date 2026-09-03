@@ -54,7 +54,13 @@ def bson_type_name(v: Any) -> str:
         return "decimal"
     # Code before str (subclass), Binary before bytes (subclass).
     if isinstance(v, bson.Code):
-        return "javascript"
+        # A Code CARRYING a scope is BSON type 15, not 13, and mongod names the
+        # two differently on both surfaces that quote a type -- the error text
+        # ($concat only supports strings, not javascriptWithScope) and the
+        # `$type` operator. `query._is_javascript` already drew this line for
+        # the query language; this helper did not, so every error message about
+        # a scoped Code named the wrong type (probed 8.2.11, 2026-09-03).
+        return "javascript" if v.scope is None else "javascriptWithScope"
     if isinstance(v, str):
         return "string"
     if v is None:

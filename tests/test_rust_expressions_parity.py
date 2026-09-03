@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime
 import importlib.util
+import math
 import pathlib
 import random
 import sys
@@ -93,10 +94,30 @@ def assert_named_error_matches_pure(exc, expr, doc=None, vars=None):
 
 
 def _same(a, b):
-    """Equality that treats two NaNs as equal — `nan != nan` would otherwise
-    report a divergence on inputs where both engines correctly answer NaN."""
-    if isinstance(a, float) and isinstance(b, float) and a != a and b != b:
-        return True
+    """Parity equality: NaN equals NaN, signed zeros are DISTINCT, and both
+    rules apply inside nested arrays and documents.
+
+    `-0.0 == 0.0` is True in Python, so a bare `==` is blind to a real,
+    BSON-visible difference: mongod keeps the sign (`$ceil(-0.5)` is `-0.0`),
+    the Rust engine kept it, and the pure engine dropped it. The fuzz below has
+    `-0.0` in its value pool and exercises `$ceil` 5,000 times a run, and every
+    one of those comparisons passed. The corpus was never the gap here -- the
+    comparator was, and it was ALSO not being called: twelve assertion sites
+    used a raw `==` and only four used this function. Both halves fixed
+    2026-09-03, after `agg_expressions.py` reported the divergence against
+    mongod 8.2.11.
+    """
+    if isinstance(a, float) and isinstance(b, float):
+        if a != a and b != b:
+            return True
+        if a == 0.0 and b == 0.0:
+            return math.copysign(1.0, a) == math.copysign(1.0, b)
+    # Recurse: a signed zero nested in an array (`$map`, `$range`, `$slice`) is
+    # just as wrong as a bare one, and `==` on the container hides it.
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b, strict=True))
+    if isinstance(a, dict) and isinstance(b, dict):
+        return list(a) == list(b) and all(_same(a[k], b[k]) for k in a)
     return a == b
 
 
@@ -120,6 +141,27 @@ def _mkdate(ms):
 
 # (expr, doc) pairs over the ported operator core.
 CURATED = [
+    # --- signed zero -------------------------------------------------------
+    # `$add` / `$sum` / `$avg` fold from a ZERO accumulator, so a lone `-0.0`
+    # comes back POSITIVE; `$multiply` folds from ONE and keeps the sign. Both
+    # engines returned `-0.0` from `$add` -- parity was green while both were
+    # wrong -- and `==` could not have seen it anyway (`-0.0 == 0.0`). See
+    # `_same`. Measured against mongod 8.2.11, 2026-09-03.
+    ({"$add": [-0.0]}, {}),
+    ({"$add": [-0.0, 0.0]}, {}),
+    ({"$sum": [-0.0]}, {}),
+    ({"$avg": [-0.0]}, {}),
+    ({"$multiply": [-0.0]}, {}),
+    # A rounding that lands on zero keeps the sign; `$abs` does not.
+    ({"$ceil": -0.5}, {}),
+    ({"$ceil": -0.0}, {}),
+    ({"$floor": -0.0}, {}),
+    ({"$trunc": -0.5}, {}),
+    ({"$trunc": -0.0}, {}),
+    ({"$round": -0.5}, {}),
+    ({"$abs": -0.0}, {}),
+    # Nested, because `==` on the container hid it too.
+    ({"$map": {"input": [-0.5, 0.5], "in": {"$ceil": "$$this"}}}, {}),
     # $sum/$avg/$max/$min as expression operators (MongoDB 5.0+) — Rust must
     # compute the SAME value + numeric width as Python (int32/int64/double).
     ({"$sum": "$arr"}, {"arr": [1, 2, 3]}),  # int32 result
@@ -1043,7 +1085,7 @@ def test_curated_parity(expr, doc):
     if rust is None:
         return
     py = _bson_norm(_pure.evaluate(expr, doc))
-    assert rust == py, f"rust={rust!r} pure={py!r} expr={expr}"
+    assert _same(rust, py), f"rust={rust!r} pure={py!r} expr={expr}"
 
 
 def test_rand_shape_parity():
@@ -1154,7 +1196,7 @@ def test_index_math_fuzz():
             continue
         handled += 1
         py = _pure.evaluate(expr, {})
-        assert rust == py, f"divergence: rust={rust!r} pure={py!r} expr={expr}"
+        assert _same(rust, py), f"divergence: rust={rust!r} pure={py!r} expr={expr}"
     assert handled > 2000, f"expected many handled cases, only {handled}"
     assert named > 100, f"expected many named errors, only {named}"
 
@@ -1191,7 +1233,7 @@ def test_date_extractor_fuzz():
             if rust is None:
                 continue
             py = _pure.evaluate(expr, doc)
-            assert rust == py, f"{op}: rust={rust} pure={py} ms={ms} dt={doc['d']}"
+            assert _same(rust, py), f"{op}: rust={rust} pure={py} ms={ms} dt={doc['d']}"
 
 
 def test_date_from_string_strptime_fuzz():
@@ -1233,7 +1275,7 @@ def test_date_from_string_strptime_fuzz():
         if rust is None:
             continue  # Rust deferred -> Python (compute or raise) handles it
         py = _bson_norm(_pure.evaluate(expr, {}))
-        assert rust == py, f"rust={rust!r} pure={py!r} inp={inp!r} fmt={fmt!r}"
+        assert _same(rust, py), f"rust={rust!r} pure={py!r} inp={inp!r} fmt={fmt!r}"
 
 
 def test_date_arithmetic_fuzz():
@@ -1266,7 +1308,7 @@ def test_date_arithmetic_fuzz():
             py = _pure.evaluate(expr, doc)
         except Exception:
             pytest.fail(f"rust={rust!r} but pure raised; expr={expr} a={d1} b={d2}")
-        assert rust == py, f"rust={rust!r} pure={py!r} expr={expr} a={d1} b={d2}"
+        assert _same(rust, py), f"rust={rust!r} pure={py!r} expr={expr} a={d1} b={d2}"
 
 
 def test_zip_fuzz():
@@ -1290,7 +1332,7 @@ def test_zip_fuzz():
             py = _pure.evaluate(expr, {})
         except Exception:
             pytest.fail(f"rust={rust!r} but pure raised; expr={expr}")
-        assert rust == py, f"rust={rust!r} pure={py!r} expr={expr}"
+        assert _same(rust, py), f"rust={rust!r} pure={py!r} expr={expr}"
 
 
 def test_string_index_fuzz():
@@ -1326,7 +1368,7 @@ def test_string_index_fuzz():
             py = _pure.evaluate(expr, {})
         except Exception:
             pytest.fail(f"rust={rust!r} but pure raised; expr={expr}")
-        assert rust == py, f"rust={rust!r} pure={py!r} expr={expr}"
+        assert _same(rust, py), f"rust={rust!r} pure={py!r} expr={expr}"
 
 
 def test_math_and_range_fuzz():
@@ -1355,7 +1397,7 @@ def test_math_and_range_fuzz():
                 py = _pure.evaluate(expr, {})
             except Exception:
                 pytest.fail(f"{op}: rust={rust!r} but pure raised; v={v!r}")
-            assert rust == py, f"{op}: rust={rust!r} pure={py!r} v={v!r}"
+            assert _same(rust, py), f"{op}: rust={rust!r} pure={py!r} v={v!r}"
         # $range
         lo, hi = rng.randint(-20, 20), rng.randint(-20, 20)
         step = rng.choice([1, 2, 3, -1, -2])
@@ -1366,7 +1408,7 @@ def test_math_and_range_fuzz():
             assert_named_error_matches_pure(exc, expr)
             continue
         if rust is not None:
-            assert rust == _pure.evaluate(expr, {}), f"$range lo={lo} hi={hi} step={step}"
+            assert _same(rust, _pure.evaluate(expr, {})), f"$range lo={lo} hi={hi} step={step}"
 
 
 def test_numeric_string_conversion_parity():
@@ -1512,7 +1554,7 @@ def test_date_format_directive_parity():
             if rust is None:
                 continue
             compared += 1
-            assert rust == _bson_norm(_pure.evaluate(expr, doc)), (
+            assert _same(rust, _bson_norm(_pure.evaluate(expr, doc))), (
                 f"%{ch} on {value.date()}: rust={rust!r}"
             )
     assert compared > 200, f"expected broad coverage, only {compared}"
@@ -1585,7 +1627,7 @@ def test_randomised_fuzz_parity():
             # Rust produced a value where Python raises -> a real divergence.
             pytest.fail(f"rust={rust!r} but pure raised; expr={expr} doc={doc}")
         handled += 1
-        assert rust == py, f"divergence: rust={rust!r} pure={py!r} expr={expr} doc={doc}"
+        assert _same(rust, py), f"divergence: rust={rust!r} pure={py!r} expr={expr} doc={doc}"
     assert handled > 1000, f"expected many handled cases, only {handled}"
 
 
