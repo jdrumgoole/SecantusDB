@@ -4643,6 +4643,28 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   piece. See `changelog.d/rust-decimal-arithmetic-rounding.md` and
   `tests/test_decimal128_arithmetic_rounding.py`.
 
+  **The corpus was WIDENED on 2026-09-03, and the counts below are not
+  comparable to the ones above.** `agg_expressions.py` went from 3,968 cases to
+  6,628 -- it had contained no infinity, no NaN, no signed zero, no numeric
+  boundary, and none of MinKey / MaxKey / Binary / Timestamp / Regex / Code.
+  That immediately surfaced **13 crash-class bugs** (each an `internal server
+  error` reachable from any query) and **6 wrong values on the Rust server**,
+  on a corpus that had swept those operators tens of thousands of times. All
+  are fixed; see `changelog.d/probe-widen-corpus.md`.
+
+  Current: **rust 0 wrong / 91 code / 17 message; python 0 crashes / 24 wrong /
+  31 code / 173 message.** The Python wrong values are the Decimal128
+  transcendental last digit (below) plus `Decimal128("-0")` sign preservation,
+  both newly visible rather than newly broken.
+
+  **A mongod BUG, deliberately not reproduced.** `{$round: [-2147483648, -1]}`
+  answers **positive** `2147483646` -- an exact int32 wrap of the correct
+  `-2147483650`. mongod handles the same overflow three ways: *widened* for a
+  positive int32 (`{$round: [2147483647, -1]}` is Int64 2147483650), *wrapped*
+  for a negative one, and *detected* at int64 width (`51080`). `$trunc` on the
+  same input is correct. Both our servers answer `-2147483650`; reproducing the
+  wrap would mean writing arithmetic known to be wrong to match a defect.
+
   **DECIDED, not scheduled: the Decimal128 transcendentals are NOT ported.**
   Not for want of an implementation -- the Python engine computes them at 60
   digits with hand-rolled Taylor series. It still disagrees with mongod in the

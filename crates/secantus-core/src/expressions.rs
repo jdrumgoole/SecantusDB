@@ -1759,6 +1759,21 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
 /// nothing, and any other value is a single element. Mirrors
 /// `_expr_acc_values`.
 fn expr_acc_values(arg: &Bson, ctx: &Ctx) -> Result<Vec<Bson>, Fallback> {
+    // A ONE-ELEMENT array argument is the single argument, unwrapped before
+    // anything else -- mongod's generic rule for a single-argument operator,
+    // which these reach in expression position. So `{$sum: [[1, 2]]}` sums the
+    // INNER array and answers 3, while `{$sum: [[1], [2]]}` has two operands,
+    // both arrays, both ignored, and answers 0.
+    //
+    // Without the unwrap `{$sum: [[1]]}` answered 0 where mongod answers 1, and
+    // `{$max: [[1]]}` answered `[1]` where mongod answers 1 -- five wrong
+    // VALUES across $sum / $avg / $min / $max / $stdDevPop. Probed 8.2.11
+    // (2026-09-03) across thirteen nestings; a nested array is a shape the
+    // probe corpus did not contain until that day.
+    let arg = match arg {
+        Bson::Array(a) if a.len() == 1 => &a[0],
+        other => other,
+    };
     match eval(arg, ctx)? {
         Bson::Array(a) => Ok(a),
         Bson::Null => Ok(Vec::new()),
@@ -3112,6 +3127,17 @@ impl Trig {
 /// `Decimal128("2.50")` stays `2.50` and `Decimal128("2.500000000")` keeps
 /// every zero, while an int / long / double goes through C's `%g`
 /// (`1099511627776` prints as `1.09951e+12`). Probed 8.2.11 (2026-09-03).
+/// pi/2 at decimal128 precision -- `$atan` of an infinity is exactly this, and
+/// mongod answers all 34 digits.
+const HALF_PI_TEXT: &str = "1.570796326794896619231321691639751";
+
+/// A `Decimal128` BSON value from its decimal text.
+fn decimal_from_text(text: &str) -> R {
+    Ok(Bson::Decimal128(
+        text.parse().map_err(|_| Fallback::Defer)?,
+    ))
+}
+
 fn trig_operand_repr(value: &Bson, x: f64) -> String {
     match value {
         Bson::Decimal128(d) => d.to_string(),
@@ -3142,11 +3168,18 @@ fn op_trig(arg: &Bson, ctx: &Ctx, kind: Trig) -> R {
     // three of sin / cos / tan. Only the infinities are refused, which is why
     // this cannot be `!x.is_finite()` (probed 8.2.11, 2026-09-03; that spelling
     // rejected NaN, where mongod passes it straight through).
-    let range = match kind {
-        Sin | Cos | Tan if x.is_infinite() => Some("(-inf,inf)"),
-        Asin | Acos | Atanh if !(-1.0..=1.0).contains(&x) => Some("[-1,1]"),
-        Acosh if x < 1.0 => Some("[1,inf]"),
-        _ => None, // atan / sinh / cosh / tanh / asinh accept every finite + inf
+    // NaN answers NaN for EVERY trig operator, in both numeric types -- never a
+    // domain error, even for the range-limited ones where `!(-1..=1)` is
+    // trivially true of it. Probed 8.2.11 (2026-09-03) across nine operators.
+    let range = if x.is_nan() {
+        None
+    } else {
+        match kind {
+            Sin | Cos | Tan if x.is_infinite() => Some("(-inf,inf)"),
+            Asin | Acos | Atanh if !(-1.0..=1.0).contains(&x) => Some("[-1,1]"),
+            Acosh if x < 1.0 => Some("[1,inf]"),
+            _ => None, // atan / sinh / cosh / tanh / asinh accept finite + inf
+        }
     };
     if let Some(range) = range {
         return Err(Fallback::mongo(
@@ -3158,8 +3191,31 @@ fn op_trig(arg: &Bson, ctx: &Ctx, kind: Trig) -> R {
             ),
         ));
     }
-    // In range, but a decimal result needs decimal transcendentals.
+    // A NON-FINITE decimal takes the operator's limit, which is a table rather
+    // than a series -- so it can be answered exactly even though this engine
+    // has no decimal transcendentals. NaN answers NaN everywhere; the
+    // infinities that are out of domain never reach here, the check above
+    // having rejected them. Probed 8.2.11 (2026-09-03).
     if matches!(value, Bson::Decimal128(_)) {
+        if x.is_nan() {
+            return decimal_from_text("NaN");
+        }
+        if x.is_infinite() {
+            let positive = x > 0.0;
+            let limit = match kind {
+                Atan if positive => Some(HALF_PI_TEXT),
+                Atan => Some("-1.570796326794896619231321691639751"),
+                Sinh | Asinh if positive => Some("Infinity"),
+                Sinh | Asinh => Some("-Infinity"),
+                Cosh | Acosh => Some("Infinity"),
+                Tanh if positive => Some("1"),
+                Tanh => Some("-1"),
+                _ => None,
+            };
+            if let Some(text) = limit {
+                return decimal_from_text(text);
+            }
+        }
         return Err(Fallback::Defer);
     }
     if matches!(kind, Atanh) {
@@ -4901,6 +4957,13 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
             // long / double: milliseconds since the Unix epoch -> date.
             Bson::Int64(n) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(*n))),
             Bson::Double(d) if d.is_finite() => {
+                // `as i64` SATURATES in Rust, so a double beyond int64 became
+                // year 292278994 instead of overflowing: `{$toDate: 1e308}`
+                // answered a date where mongod reports 241 (probed 8.2.11,
+                // 2026-09-03).
+                if !(i64::MIN as f64..=i64::MAX as f64).contains(d) {
+                    return Conv::Named(overflow_conversion(value));
+                }
                 Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(*d as i64)))
             }
             Bson::Double(d) => Conv::Named(nonfinite_conversion(*d)),
@@ -5496,6 +5559,26 @@ fn round_trunc_args(arg: &Bson, ctx: &Ctx, op: &str) -> Result<(Bson, Option<i32
 // `$round`: round-half-to-even (Python `round`). An int stays an int (unchanged
 // for place >= 0; rounded to the 10^|place| place for place < 0); a double rounds
 // to `place` decimals as a double. Mirrors `expressions._op_round`.
+/// `v` rounded half-to-even at `10^power`, entirely in integers.
+///
+/// `power` is non-negative. Ties go to the even multiple, which is what
+/// `$round` does at every other place.
+fn round_half_even_i128(v: i128, power: i32) -> i128 {
+    let Some(scale) = 10i128.checked_pow(power as u32) else {
+        return 0; // rounding to a place wider than the value: everything drops
+    };
+    let quotient = v / scale;
+    let remainder = (v % scale).abs();
+    let half = scale / 2;
+    let bump = remainder > half || (remainder == half && quotient % 2 != 0);
+    let adjusted = if bump {
+        quotient + if v < 0 { -1 } else { 1 }
+    } else {
+        quotient
+    };
+    adjusted * scale
+}
+
 fn op_round(arg: &Bson, ctx: &Ctx) -> R {
     let (n, place) = round_trunc_args(arg, ctx, "$round")?;
     let Some(place) = place else {
@@ -5509,13 +5592,25 @@ fn op_round(arg: &Bson, ctx: &Ctx) -> R {
             if place >= 0 {
                 return Ok(n);
             }
-            let iv = as_int_like(&n).unwrap() as f64;
-            let scale = 10f64.powi(-place);
-            let wide = is_int64(&n);
-            Ok(int_result(
-                ((iv / scale).round_ties_even() * scale) as i128,
-                wide,
-            ))
+            // INTEGER arithmetic, not f64: `9223372036854775807` does not
+            // survive a round trip through a double, and mongod keeps it
+            // exactly -- `{$round: [Int64(2**63 - 1), -2]}` is
+            // `9223372036854775800` (probed 8.2.11, 2026-09-03).
+            let iv = as_int_like(&n).unwrap();
+            let rounded = round_half_even_i128(iv, -place);
+            // Rounding UP out of int64 is an error on mongod, not a widening
+            // to double: `{$round: [Int64(2**63 - 1), -1]}` needs
+            // 9223372036854775810 and reports 51080 instead.
+            if i64::try_from(rounded).is_err() {
+                return Err(Fallback::mongo(
+                    51080,
+                    format!(
+                        "invalid conversion from Decimal128 result in $round \
+                         resulting from arguments: [{iv}, {place}]"
+                    ),
+                ));
+            }
+            Ok(int_result(rounded, is_int64(&n)))
         }
         Bson::Double(d) => {
             let factor = 10f64.powi(place);
@@ -5544,6 +5639,20 @@ fn op_trunc(arg: &Bson, ctx: &Ctx) -> R {
         // `2.567` at place 2 is `2.56`, not the `2.57` `$round` gives.
         Bson::Decimal128(_) => decimal_rounded(&n, -place, crate::decimal::RoundMode::Trunc),
         _ => {
+            // An INTEGER truncates in integer arithmetic: a double round trip
+            // loses `9223372036854775807`, which mongod keeps exactly.
+            if matches!(n, Bson::Int32(_) | Bson::Int64(_)) {
+                let iv = as_int_like(&n).expect("checked integer above");
+                let kept = if place >= 0 {
+                    iv
+                } else {
+                    match 10i128.checked_pow((-place) as u32) {
+                        Some(scale) => iv - (iv % scale),
+                        None => 0, // truncating to a place wider than the value
+                    }
+                };
+                return Ok(int_result(kept, is_int64(&n)));
+            }
             let nf = math_float(&n)?; // bool / non-numeric -> Python (51081)
             let factor = 10f64.powi(place);
             let truncated = (nf * factor).trunc() / factor;

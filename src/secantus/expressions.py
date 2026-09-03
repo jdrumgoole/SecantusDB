@@ -1345,7 +1345,19 @@ def _op_round(arg: Any, ctx: _Ctx) -> Any:
             ),
             n,
         )
-    return _int_result(round(n, place), n)
+    rounded = round(n, place)
+    # Rounding UP out of int64 is an ERROR on mongod, not a widening to double:
+    # `{$round: [Int64(2**63 - 1), -1]}` needs 9223372036854775810 and reports
+    # 51080. `_int_result` would hand back a float and lose the value silently
+    # (probed 8.2.11, 2026-09-03).
+    if isinstance(n, int) and not isinstance(n, bool) and not (-(2**63) <= rounded < 2**63):
+        raise ExpressionError(
+            "invalid conversion from Decimal128 result in $round resulting from "
+            f"arguments: [{n}, {place}]",
+            code=51080,
+            code_name="Location51080",
+        )
+    return _int_result(rounded, n)
 
 
 def _decimal_is_infinite(v: Any) -> bool:
@@ -1564,7 +1576,44 @@ def _trig_coerce(name: str, v: Any, code: int = 28765) -> float:
 #: for sin / cos / tan / atan, so those are summed here. The series are
 #: evaluated with guard digits and the result handed back at decimal128's 34,
 #: so the rounding happens once, at the end.
-_DEC_TRIG_CTX = _decimal.Context(prec=60)
+#: `traps=[]` for the same reason as `_DEC128_CTX`: a trapped
+#: `InvalidOperation` escapes as `internal server error`. The series below
+#: cannot run on a non-finite operand at all, so those are answered from the
+#: table in `_dec_trig_non_finite` before they reach it.
+_DEC_TRIG_CTX = _decimal.Context(prec=60, traps=[])
+
+#: pi/2 at decimal128 precision -- `$atan` of an infinity is exactly this, and
+#: mongod answers all 34 digits (probed 8.2.11, 2026-09-03).
+_HALF_PI_TEXT = "1.570796326794896619231321691639751"
+
+
+def _dec_trig_non_finite(name: str, v: Decimal128) -> Decimal128 | None:
+    """The limit `name` takes at a non-finite decimal operand, or `None` when
+    the operand is finite and the series should run.
+
+    NaN answers NaN everywhere. The infinities differ per operator, and the
+    ones that are OUT OF DOMAIN (`$sin` / `$cos` / `$tan` / `$asin` / `$acos` /
+    `$atanh`, and `-inf` for `$acosh`) never reach here -- the domain check
+    above rejects them with 50989 first. Probed 8.2.11 (2026-09-03); before
+    this every one of these raised `decimal.InvalidOperation` out of the series
+    and surfaced as `internal server error`.
+    """
+    d = v.to_decimal()
+    if d.is_nan():
+        return Decimal128("NaN")
+    if not d.is_infinite():
+        return None
+    positive = d > 0
+    limits = {
+        "$atan": _HALF_PI_TEXT if positive else "-" + _HALF_PI_TEXT,
+        "$sinh": "Infinity" if positive else "-Infinity",
+        "$cosh": "Infinity",
+        "$tanh": "1" if positive else "-1",
+        "$asinh": "Infinity" if positive else "-Infinity",
+        "$acosh": "Infinity",
+    }
+    text = limits.get(name)
+    return Decimal128(text) if text is not None else None
 
 
 def _dec_series_sin(x: _decimal.Decimal) -> _decimal.Decimal:
@@ -1713,6 +1762,11 @@ def _make_trig(name: str, fn: Any, domain: str) -> Any:
         # does not become `2.5` -- while everything else goes through `%g`
         # (probed 8.2.11, 2026-09-03).
         shown = str(v) if isinstance(v, Decimal128) else _fmt_double(x)
+        # NaN answers NaN for EVERY trig operator -- never a domain error, even
+        # for the range-limited ones where `-1 <= nan <= 1` is trivially false.
+        # Probed 8.2.11 (2026-09-03) across nine operators, both numeric types.
+        if math.isnan(x):
+            return Decimal128("NaN") if isinstance(v, Decimal128) else x
         # NaN is NOT a domain error: `{$tan: NaN}` answers NaN on mongod, for
         # all three of sin / cos / tan. Only the infinities are refused, which
         # is why this cannot be `not math.isfinite(x)`.
@@ -1731,6 +1785,10 @@ def _make_trig(name: str, fn: Any, domain: str) -> Any:
             )
         if domain == "atanh" and abs(x) == 1.0:
             return math.inf if x > 0 else -math.inf
+        if _has_decimal(v):
+            limit = _dec_trig_non_finite(name, v)
+            if limit is not None:
+                return limit
         dec_fn = _DEC_TRIG.get(name)
         if dec_fn is None or not _has_decimal(v):
             try:
@@ -1827,6 +1885,17 @@ def _op_trunc(arg: Any, ctx: _Ctx) -> Any:
     # 2026-09-03). `$ceil` / `$floor` / `$round` all had the same shape.
     if isinstance(n, float) and not math.isfinite(n):
         return n
+    # An INTEGER truncates in integer arithmetic: `n * factor` sends
+    # `9223372036854775807` through a double and loses it, where mongod keeps
+    # it exactly.
+    if isinstance(n, int) and not isinstance(n, bool):
+        scale = 10 ** max(-place, 0)
+        # Toward ZERO, which `n - (n % scale)` does NOT give in Python: `%` here
+        # is floor-based, so `-12345 % 10` is 5 and that expression answers
+        # -12350 where mongod truncates to -12340. Rust's `%` truncates and
+        # needs no such care -- the same line is correct there.
+        magnitude = (abs(n) // scale) * scale
+        return _int_result(-magnitude if n < 0 else magnitude, n)
     factor = 10**place
     # Type-preserving, as `$floor` / `$ceil`: dividing by `factor` made every
     # int result a double (`$trunc` of 1 answered 1.0). Probed 8.2.11.
@@ -4344,6 +4413,16 @@ def _render_number(value: Any) -> str:
     return str(value)
 
 
+def _non_finite_conversion_error(value: float) -> ExpressionError:
+    """mongod names WHICH non-finite value it refused to convert."""
+    which = "NaN" if math.isnan(value) else "infinity"
+    return ExpressionError(
+        f"Attempt to convert {which} value to integer type in $convert with no onError value",
+        code=241,
+        code_name="ConversionFailure",
+    )
+
+
 def _overflow_error(rendered: str | None = None) -> ExpressionError:
     """mongod's overflow message. The value is named only when it is a NUMBER;
     a string overflow goes through :func:`_number_parse_error` instead."""
@@ -4372,9 +4451,30 @@ def _infinity_to_integer_error() -> ExpressionError:
     )
 
 
-def _epoch_millis_to_date(millis: float) -> _dt.datetime:
-    """Epoch milliseconds -> a naive UTC datetime, the way BSON dates decode."""
-    return _dt.datetime.fromtimestamp(millis / 1000.0, tz=_dt.timezone.utc).replace(tzinfo=None)
+def _epoch_millis_to_date(millis: float) -> Any:
+    """Epoch milliseconds -> a naive UTC datetime, the way BSON dates decode.
+
+    A BSON date is any int64 of milliseconds, which reaches well outside
+    Python's `datetime` range: `{$toDate: Int64(2**63 - 1)}` is year 292278994
+    and mongod answers it. `datetime.fromtimestamp` raises `OverflowError`
+    there, which escaped as `internal server error` -- so the out-of-range case
+    returns `DatetimeMS`, pymongo's raw-millis date, which encodes to the same
+    BSON the Rust server already emits (probed 8.2.11, 2026-09-03).
+    """
+    from bson.datetime_ms import DatetimeMS
+
+    # A BSON date holds an int64 of milliseconds and nothing wider, so the
+    # non-finite and out-of-range cases are mongod's ordinary conversion
+    # errors -- the same two messages the int / long targets use.
+    if isinstance(millis, float):
+        if math.isnan(millis) or math.isinf(millis):
+            raise _non_finite_conversion_error(millis)
+        if not (-(2**63) <= millis < 2**63):
+            raise _overflow_error(_fmt_double(millis))
+    try:
+        return _dt.datetime.fromtimestamp(millis / 1000.0, tz=_dt.timezone.utc).replace(tzinfo=None)
+    except (OverflowError, OSError, ValueError):
+        return DatetimeMS(int(millis))
 
 
 def _parse_date_string(value: str) -> _dt.datetime:
@@ -5070,7 +5170,20 @@ def _expr_acc_values(arg: Any, ctx: _Ctx) -> list[Any]:
     """The values an expression-form accumulator (`$sum`/`$avg`/`$max`/`$min`)
     reduces over: an array argument contributes its elements, a missing/absent
     argument contributes nothing, and any other value is a single element.
-    Mirrors mongod's MongoDB-5.0+ expression-accumulator semantics."""
+    Mirrors mongod's MongoDB-5.0+ expression-accumulator semantics.
+
+    A ONE-ELEMENT array argument is the single argument, unwrapped before
+    anything else -- mongod's generic rule for a single-argument operator. So
+    ``{$sum: [[1, 2]]}`` sums the INNER array and answers 3, while
+    ``{$sum: [[1], [2]]}`` has two operands, both arrays, both ignored, and
+    answers 0. Without the unwrap ``{$sum: [[1]]}`` answered 0 where mongod
+    answers 1, and ``{$max: [[1]]}`` answered ``[1]`` where mongod answers 1 --
+    five wrong VALUES across $sum / $avg / $min / $max / $stdDevPop. Probed
+    8.2.11 (2026-09-03); a nested array is a shape the probe corpus did not
+    contain until that day.
+    """
+    if isinstance(arg, list) and len(arg) == 1:
+        arg = arg[0]
     v = _eval(arg, ctx)
     if isinstance(v, list):
         return v

@@ -20,6 +20,7 @@ import contextlib
 
 import pytest
 from bson import Decimal128 as D
+from bson import Int64
 
 from secantus import SecantusDBServer
 
@@ -29,7 +30,9 @@ def _python_client(tmp_path):
     import pymongo
 
     with SecantusDBServer(port=0, storage_path=str(tmp_path)) as srv:
-        client = pymongo.MongoClient(srv.uri, serverSelectionTimeoutMS=5000)
+        client = pymongo.MongoClient(
+            srv.uri, serverSelectionTimeoutMS=5000, datetime_conversion="DATETIME_AUTO"
+        )
         try:
             yield client
         finally:
@@ -45,7 +48,13 @@ def _rust_client(tmp_path):
     try:
         host, port = srv.address
         client = pymongo.MongoClient(
-            host, port, directConnection=True, serverSelectionTimeoutMS=5000
+            host,
+            port,
+            directConnection=True,
+            serverSelectionTimeoutMS=5000,
+            # A BSON date is any int64 of millis; year 292278994 is outside
+            # Python's `datetime` and the default codec refuses to DECODE it.
+            datetime_conversion="DATETIME_AUTO",
         )
         try:
             yield client
@@ -190,6 +199,85 @@ def test_a_non_finite_double_never_reaches_the_client_as_an_error(coll, op, valu
     got = _z(coll, {op: value})
     assert isinstance(got, float)
     assert (got != got) if (value != value) else got == value
+
+
+class TestNonFiniteAndBoundaries:
+    """Value classes the probe corpus did not contain until 2026-09-03.
+
+    Widening it added the infinities, NaN, signed zero, the int32/int64
+    boundaries and the BSON types it had skipped. That immediately surfaced
+    THIRTEEN crash-class bugs (each an `internal server error` reachable from
+    any query) and six wrong values — on a corpus that had run tens of
+    thousands of times without one infinity in it.
+    """
+
+    @pytest.mark.parametrize("op", ["$sin", "$cos", "$tan", "$asin", "$acos", "$atan", "$acosh"])
+    def test_nan_is_never_a_domain_error(self, coll, op):
+        """NaN answers NaN for EVERY trig operator, in both numeric types —
+        never `50989`, even for the range-limited ones where `-1 <= nan <= 1`
+        is trivially false."""
+        got = _z(coll, {op: float("nan")})
+        assert isinstance(got, float) and got != got
+        assert str(_z(coll, {op: D("NaN")})) == "NaN"
+
+    @pytest.mark.parametrize(
+        ("op", "expected"),
+        [
+            ("$atan", "1.570796326794896619231321691639751"),
+            ("$sinh", "Infinity"),
+            ("$cosh", "Infinity"),
+            ("$tanh", "1"),
+            ("$asinh", "Infinity"),
+            ("$acosh", "Infinity"),
+        ],
+    )
+    def test_a_decimal_infinity_takes_the_operator_s_limit(self, coll, op, expected):
+        """The series cannot run on an infinity — it raised
+        `decimal.InvalidOperation` out of the evaluator. `$atan` answers pi/2
+        to all 34 digits, not a float-precision approximation."""
+        assert str(_z(coll, {op: D("Infinity")})) == expected
+
+    def test_the_accumulators_unwrap_a_one_element_array(self, coll):
+        """`{$sum: [[1, 2]]}` sums the INNER array; `{$sum: [[1], [2]]}` has
+        two operands, both arrays, both ignored."""
+        assert _z(coll, {"$sum": [[1, 2]]}) == 3
+        assert _z(coll, {"$sum": [[1], [2]]}) == 0
+        assert _z(coll, {"$max": [[1]]}) == 1
+        assert _z(coll, {"$max": [[1], [2]]}) == [2]
+        assert _z(coll, {"$min": [[3], [1]]}) == [1]
+
+    def test_integer_rounding_does_not_go_through_a_double(self, coll):
+        """`9223372036854775807` does not survive a round trip through f64,
+        and mongod keeps it exactly."""
+        assert _z(coll, {"$trunc": [Int64(2**63 - 1), -2]}) == 9223372036854775800
+        assert _z(coll, {"$round": [Int64(2**63 - 1), -2]}) == 9223372036854775800
+        # Toward ZERO for negatives, which Python's floor-based `%` does not give.
+        assert _z(coll, {"$trunc": [-12345, -1]}) == -12340
+        assert _z(coll, {"$round": [-12345, -1]}) == -12340
+
+    def test_rounding_up_out_of_int64_is_an_error(self, coll):
+        """Not a widening to double: mongod reports 51080."""
+        from pymongo.errors import OperationFailure
+
+        with pytest.raises(OperationFailure) as exc:
+            _z(coll, {"$round": [Int64(2**63 - 1), -1]})
+        assert exc.value.code == 51080
+
+    def test_a_date_beyond_pythons_datetime_range_still_answers(self, coll):
+        """A BSON date is any int64 of milliseconds. Year 292278994 is outside
+        `datetime`, and `fromtimestamp` raised `OverflowError` there."""
+        got = _z(coll, {"$toDate": Int64(2**63 - 1)})
+        assert int(got) == 2**63 - 1
+
+    @pytest.mark.parametrize("value", [1e308, -1e308, float("inf"), float("nan")])
+    def test_a_date_outside_int64_is_a_conversion_error(self, coll, value):
+        """mongod refuses these with 241 rather than saturating — which is what
+        Rust's `as i64` silently did."""
+        from pymongo.errors import OperationFailure
+
+        with pytest.raises(OperationFailure) as exc:
+            _z(coll, {"$toDate": value})
+        assert exc.value.code == 241
 
 
 def test_log_validates_its_base_before_deferring_a_decimal(coll):
