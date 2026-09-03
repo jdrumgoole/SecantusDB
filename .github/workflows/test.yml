@@ -213,12 +213,29 @@ jobs:
         # Registering the repo BEFORE the install step means one ``apt-get
         # update`` covers both it and the Ubuntu indexes — the second update we
         # used to run re-fetched every index for no new information.
+        #
+        # 8.2, not 8.0, because this repo installs a SERVER from it and
+        # `tests/test_mongod_differential.py` took every expectation from
+        # 8.2.1 / 8.2.11. The gate compares only the MAJOR, so 8.0 would run —
+        # but this file has already been bitten by a PATCH-level difference (an
+        # expected-type list whose ORDER changed between 8.2.1 and 8.2.11,
+        # which needed `_sort_type_lists`), so a series the expectations were
+        # never measured against would manufacture exactly the false failures
+        # its design exists to avoid. 8.2.11 and 8.2.12 are both in this repo.
+        #
+        # The KEY is still `server-8.0.asc`: there is no `server-8.2.asc` (404
+        # at both mongodb.org and pgp.mongodb.com). MongoDB signs both series
+        # with one packaging key — verified by fingerprint, 8.2's `InRelease`
+        # is signed by 4B0752C1BCA238C0B4EE14DC41DE058A4E7DCA05, which IS the
+        # key this URL serves. Do not "fix" this to a 8.2 URL that does not
+        # exist; the filename below says `-server` rather than a version so the
+        # two do not have to agree.
         if: runner.os == 'Linux'
         run: |
           curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
             https://www.mongodb.org/static/pgp/server-8.0.asc \
-            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
-          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
+            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.2 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.2.list
 
       - name: Install toolchain and MongoDB CLI tools (Linux)
         # swig (for the vendored WT build) plus mongosh + Database Tools so the
@@ -229,10 +246,18 @@ jobs:
         # intentionally omitted: the mongosh tests skip on win32 by design
         # (PowerShell --eval quoting), leaving only marginal coverage for a
         # slow, flake-prone choco install.
+        #
+        # `mongodb-org-server` is what makes `tests/test_mongod_differential.py`
+        # RUN rather than skip: it gates on `shutil.which("mongod")`, so without
+        # a server the one gate that compares us against the real thing was
+        # dead in CI and lived only on a dev box. It needs no extra step — the
+        # suite's `addopts` excludes `perf`/`online`/`slow` but not
+        # `differential`, and the file's mongod fixture is module-scoped, so it
+        # spawns exactly one server for the whole file.
         if: runner.os == 'Linux'
         uses: ./.github/actions/apt-install
         with:
-          packages: swig liblz4-dev mongodb-mongosh mongodb-database-tools
+          packages: swig liblz4-dev mongodb-mongosh mongodb-database-tools mongodb-org-server
 
       - name: Install toolchain and MongoDB CLI tools (macOS)
         # The macOS half of the step above. Installing mongosh + Database Tools
@@ -886,8 +911,8 @@ jobs:
         run: |
           curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
             https://www.mongodb.org/static/pgp/server-8.0.asc \
-            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
-          echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
+            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.2 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.2.list
 
       - name: Install toolchain and MongoDB CLI tools (Linux)
         # Same rationale as the ``test`` job: without mongosh + Database Tools
@@ -896,7 +921,7 @@ jobs:
         if: runner.os == 'Linux'
         uses: ./.github/actions/apt-install
         with:
-          packages: swig liblz4-dev mongodb-mongosh mongodb-database-tools
+          packages: swig liblz4-dev mongodb-mongosh mongodb-database-tools mongodb-org-server
 
       - name: Install toolchain and MongoDB CLI tools (macOS)
         # macOS half — see the ``test`` job's twin.

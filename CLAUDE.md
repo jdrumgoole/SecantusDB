@@ -26,9 +26,14 @@ The audience is developers who want fast, ephemeral, in-process MongoDB behaviou
   `tests/test_mongod_differential.py` is the gate: it runs every supported
   operation against a real `mongod` and asserts an *exact* match. It gates on
   the **major** (`PROBED_MONGOD_MAJOR`), so any 8.x runs it and only a different
-  major skips — a loud failure beats a silent skip. **CI installs `mongosh` and
-  `mongodb-database-tools` but NOT `mongod`**, so the gate only ever runs on a
-  dev box; run it locally before changing an error message.
+  major skips — a loud failure beats a silent skip. **The Linux CI lanes install
+  `mongodb-org-server` from the 8.2 apt repo, so the gate RUNS in CI** (it used
+  to skip everywhere but a dev box, which meant a green CI was no evidence at
+  all for an error-surface change). It needs no separate step: the suite's
+  `addopts` excludes `perf` / `online` / `slow` but not `differential`. Still
+  run it locally before changing an error message — CI is the backstop, not the
+  first thing you should hear it from. macOS and Windows have no server and
+  still skip.
 
   **"Stable within a major" is a good default and not a guarantee** — two
   measured counterexamples, so probe rather than assume when a difference looks
