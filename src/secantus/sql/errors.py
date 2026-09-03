@@ -107,7 +107,11 @@ def wrong_object_type(name: str, kind: str) -> SQLError:
     return SQLError("42809", f'"{_bare(name)}" is not {article} {noun}')
 
 
-def undefined_column(name: str) -> SQLError:
+def undefined_column(name: str, relation: str | None = None) -> SQLError:
+    """42703. Postgres names the RELATION when it knows it -- ``column "x" of
+    relation "t" does not exist`` -- which is what ALTER TABLE reports."""
+    if relation is not None:
+        return SQLError("42703", f'column "{name}" of relation "{relation}" does not exist')
     return SQLError("42703", f'column "{name}" does not exist')
 
 

@@ -2848,6 +2848,13 @@ _COMPARE_SYMBOL: dict[type, str] = {
 }
 
 
+def _functions_any_context() -> frozenset[str]:
+    """Session functions the scalar evaluator may call in any position."""
+    from secantus.sql import functions as _functions
+
+    return _functions._ANY_CONTEXT_FUNCS
+
+
 def _pg_type_name(value: Any) -> str:
     """A best-effort Postgres type name for a runtime value, for error text."""
     if isinstance(value, bool):
@@ -4225,8 +4232,24 @@ def _has_table_privilege(args: list[Any], ctx: ScalarContext | None) -> Any:
     if table is None or privilege is None or user is None:
         return None
     priv = _as_text(privilege).split("WITH")[0].strip().upper()
-    grantees = {_as_text(user), "PUBLIC", "public"}
-    return ctx.catalog.has_table_privilege(ctx.db, _as_text(table), grantees, priv)
+    who, tbl = _as_text(user), _as_text(table)
+    grantees = {who, "PUBLIC", "public"}
+    if ctx.catalog.has_table_privilege(ctx.db, tbl, grantees, priv):
+        return True
+    # The OWNER holds every privilege implicitly — this only consulted recorded
+    # GRANTs, so `has_table_privilege('t', 'SELECT')` answered FALSE for a table
+    # the caller had just created and could plainly read. Every relation here is
+    # owned by the connecting user (the same assumption `pg_class.relowner`
+    # already reports), and a REVOKE that targets the owner materializes the ACL
+    # and is honoured below.
+    #
+    # Reporting only: the authz gate has its own path and already permits the
+    # owner, which is why the SELECT worked while this said it could not.
+    owner_state = ctx.catalog.owner_privileges(ctx.db, tbl)
+    if owner_state is None:
+        return who == getattr(ctx.session, "user", None)
+    owner, retained = owner_state
+    return who == owner and priv in {p.upper() for p in retained}
 
 
 def _has_column_privilege(args: list[Any], ctx: ScalarContext | None) -> Any:
@@ -5210,8 +5233,8 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         return getattr(ctx.session, "current_schema", None)
     if (
         name in ("pg_terminate_backend", "pg_cancel_backend", "pg_backend_pid", "pg_sleep")
-        and ctx is not None
-    ):
+        or (name in _functions_any_context() and getattr(ctx, "session", None) is not None)
+    ) and ctx is not None:
         # Works in any expression context (``select pg_terminate_backend(pid)
         # from pg_stat_activity where …``, ``select pg_sleep(0.01) from
         # generate_series(…)``), not just the constant path.

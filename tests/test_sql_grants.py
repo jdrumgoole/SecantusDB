@@ -139,8 +139,13 @@ def test_has_table_privilege_three_and_two_arg(storage):
     assert _rows(
         storage, _admin(), "SELECT has_table_privilege('alice', 't', 'SELECT WITH GRANT OPTION')"
     ) == [(True,)]
-    # Two-arg form checks the session user (default 'secantus', no grant).
-    assert _rows(storage, _admin(), "SELECT has_table_privilege('t', 'SELECT')") == [(False,)]
+    # Two-arg form checks the session user — who OWNS `t` here, and an owner
+    # holds every privilege implicitly without any grant. Measured against
+    # PostgreSQL 14.13: create a table, GRANT SELECT to someone else, then ask
+    # `has_table_privilege('t', 'SELECT')` as the creator — it answers true.
+    # (This previously asserted false, on the reasoning that there was "no
+    # grant"; that is not the rule.)
+    assert _rows(storage, _admin(), "SELECT has_table_privilege('t', 'SELECT')") == [(True,)]
 
 
 def test_has_table_privilege_public(storage):

@@ -1915,6 +1915,16 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
     if not isinstance(schema, exp.Schema):
         raise errors.feature_not_supported("CREATE TABLE requires a column list")
     table_name = qualified_table_name(schema.this)
+    # Postgres rejects a duplicate column name at parse-analysis time; we built
+    # the table with both, leaving a relation whose second `id` was unreachable.
+    _seen_names: set[str] = set()
+    for _cd in schema.expressions:
+        if not isinstance(_cd, exp.ColumnDef):
+            continue
+        _n = _cd.this.name
+        if _n in _seen_names:
+            raise errors.SQLError("42701", f'column "{_n}" specified more than once')
+        _seen_names.add(_n)
     columns: list[Column] = []
     seq_plans: list[dict[str, Any]] = []
     pk_seen = False

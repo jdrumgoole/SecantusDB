@@ -1077,6 +1077,15 @@ class Catalog:
             entries.append(item(doc["grantee"], doc.get("privileges", [])))
         return "{" + ",".join(entries) + "}"
 
+    def owner_privileges(self, db: str, table: str) -> tuple[str, list[str]] | None:
+        """``(owner, retained privileges)`` once a GRANT / REVOKE has
+        materialized ``table``'s ACL, else None — meaning untouched, which in
+        Postgres is the owner holding everything implicitly."""
+        state = self._relation_acl_state(db, table)
+        if state is None:
+            return None
+        return state["owner"], list(state.get("owner_privs", ()))
+
     def has_table_privilege(self, db: str, table: str, grantees: set[str], privilege: str) -> bool:
         """Whether any identity in ``grantees`` (a user + its role names, plus
         ``PUBLIC``) holds ``privilege`` on ``table`` via a recorded grant."""
