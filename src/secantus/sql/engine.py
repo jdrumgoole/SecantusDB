@@ -3145,20 +3145,21 @@ def _projection_record_srf_spec(stmt: exp.Select) -> dict | None:
             arg = call.expressions[0] if call.expressions else exp.Null()
             key = arg.sql(dialect="postgres")
             keys.setdefault(key, arg)
-            name = alias or str(call.this).rsplit(".", 1)[-1].lower()
-            plan.append(("record", key, name))
+            fname = str(call.this).rsplit(".", 1)[-1].lower()
+            plan.append(("record", key, alias or fname, fname))
             found = True
             continue
         if isinstance(target, exp.Dot) and isinstance(target.this, exp.Paren):
             call = _record_srf_call(target.this.this)
             if call is not None:
+                fname = str(call.this).rsplit(".", 1)[-1].lower()
                 field = target.expression.name.lower()
-                if field not in ("x", "n"):
+                if field not in srf.record_column_names(fname):
                     return None
                 arg = call.expressions[0] if call.expressions else exp.Null()
                 key = arg.sql(dialect="postgres")
                 keys.setdefault(key, arg)
-                plan.append(("field", key, alias or field, field))
+                plan.append(("field", key, alias or field, field, fname))
                 found = True
                 continue
         if list(
@@ -3254,10 +3255,17 @@ def _run_selectlist_srf(
 
     out_rows: list[tuple] = []
     for row in res.rows:
-        elems: dict[str, list] = {}
-        for k, idx in key_idx.items():
-            v = row[idx]
-            elems[k] = list(v) if isinstance(v, (list, tuple)) else []
+        # One expansion per (function, argument) pair: the record shape is the
+        # FUNCTION's, not the argument's. Expanding every argument as an array
+        # here is what made ``SELECT jsonb_each(obj)`` answer zero rows.
+        elems: dict[tuple[str, str], list[tuple]] = {}
+        for op in plan:
+            if op[0] == "copy":
+                continue
+            fname = op[-1]
+            ekey = (fname, op[1])
+            if ekey not in elems:
+                elems[ekey] = srf.record_rows(fname, row[key_idx[op[1]]])[0]
         height = max((len(v) for v in elems.values()), default=0)
         # PG: an SRF returning zero rows eliminates the input row entirely.
         for i in range(height):
@@ -3265,19 +3273,23 @@ def _run_selectlist_srf(
             for pos, op in enumerate(plan):
                 if op[0] == "copy":
                     cells.append(row[copy_idx[pos]])
+                    continue
+                fname = op[-1]
+                items = elems[(fname, op[1])]
+                names = srf.record_column_names(fname)
+                if i >= len(items):
+                    cells.append(None)
                 elif op[0] == "record":
-                    items = elems[op[1]]
-                    if i < len(items):
-                        cells.append(typemap.RecordValue((("x", items[i]), ("n", i + 1))))
-                    else:
-                        cells.append(None)
+                    # Carry each field's oid: without it the composite renders a
+                    # jsonb field by its Python value, so ``jsonb_each`` on a
+                    # string member gave ``(b,x)`` where PG gives ``(b,"x")``.
+                    rec = typemap.RecordValue(tuple(zip(names, items[i], strict=False)))
+                    rec.field_oids = tuple(
+                        typemap.PG_OID.get(t, 0) for t in srf.record_rows(fname, None)[1]
+                    )
+                    cells.append(rec)
                 else:  # field
-                    items = elems[op[1]]
-                    field = op[3]
-                    if i >= len(items):
-                        cells.append(None)
-                    else:
-                        cells.append(items[i] if field == "x" else i + 1)
+                    cells.append(items[i][names.index(op[3])])
             out_rows.append(tuple(cells))
 
     columns: list[ColumnDesc] = []
@@ -3287,27 +3299,25 @@ def _run_selectlist_srf(
         elif op[0] == "record":
             columns.append(ColumnDesc(op[2], "composite", typemap.PG_OID["composite"]))
         else:
-            name = op[2]
-            if op[3] == "n":
-                columns.append(ColumnDesc(name, "int4", typemap.PG_OID["int4"]))
-            else:
-                # `.x` is the ELEMENT of the array argument, so it types as that
-                # element -- int4 for int[], text for text[], numeric for
-                # numeric[]. It used to report `any` / oid 0, which is not a type
-                # a client can do anything with: psycopg surfaced it as oid 0
-                # where PostgreSQL gives the real element type.
+            name, fname = op[2], op[-1]
+            names = srf.record_column_names(fname)
+            tag = srf.record_rows(fname, None)[1][names.index(op[3])]
+            if tag == "any":
+                # ``_pg_expandarray(...).x`` is the ELEMENT of the array
+                # argument, so it types as that element -- int4 for int[], text
+                # for text[], numeric for numeric[]. It used to report `any` /
+                # oid 0, which is not a type a client can do anything with:
+                # psycopg surfaced it as oid 0 where PostgreSQL gives the real
+                # element type.
                 #
                 # The argument's own column is right there: the query was run
                 # with each SRF call REPLACED BY its array argument, so
                 # `res.columns[key_idx[...]]` already carries the array's tag and
                 # the element tag follows from it.
-                tag = "any"
                 src = res.columns[key_idx[op[1]]].type_tag if op[1] in key_idx else None
                 if src and typemap.is_array_tag(src):
                     tag = typemap.array_element_tag(src)
-                columns.append(
-                    ColumnDesc(name, tag, typemap.PG_OID.get(tag, 0) if tag != "any" else 0)
-                )
+            columns.append(ColumnDesc(name, tag, typemap.PG_OID.get(tag, 0) if tag != "any" else 0))
     _sort_selectlist_srf_rows(spec["stmt"], columns, out_rows)
     return SQLResult(
         command_tag=f"SELECT {len(out_rows)}",

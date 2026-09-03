@@ -476,15 +476,19 @@ def _values_and_tag(
     raise errors.feature_not_supported(f"unsupported set-returning function: {node.sql()}")
 
 
-def _record_values(node: exp.Expression, ctx: Any) -> tuple[list[tuple[Any, Any]], list[str]]:
-    """Rows and per-column type tags for a record SRF (``jsonb_each`` family) —
-    one ``(key, value)`` tuple per object member, key ``text`` and value ``json``
-    (``jsonb_each``) or ``text`` (``jsonb_each_text``)."""
-    from secantus.sql import scalar
+def record_rows(name: str, value: Any) -> tuple[list[tuple], list[str]]:
+    """Rows and per-column type tags for a record SRF applied to one ARGUMENT
+    VALUE, keyed by function name.
 
-    name = str(node.this).rsplit(".", 1)[-1].lower()
-    arg = node.expressions[0] if node.expressions else None
-    value = scalar.evaluate(arg, _empty_scope, ctx) if arg is not None else None
+    Split out of ``_record_values`` so the SELECT-list expansion in
+    ``engine._run_selectlist_srf`` can share it. That path had its own copy of
+    the expansion which assumed the argument was an ARRAY (it was written for
+    ``_pg_expandarray``), so ``SELECT jsonb_each('{"a":1}'::jsonb)`` -- whose
+    argument is an object -- expanded to zero elements and the statement
+    answered NO ROWS where Postgres answers one. A silently empty result is the
+    worst shape a divergence can take, and one function's expansion rule is the
+    only thing that ever separated these two callers.
+    """
     if name == "_pg_expandarray":
         items_list = list(value) if isinstance(value, (list, tuple)) else []
         return [(v, i) for i, v in enumerate(items_list, start=1)], ["any", "int4"]
@@ -501,6 +505,25 @@ def _record_values(node: exp.Expression, ctx: Any) -> tuple[list[tuple[Any, Any]
     if name in ("jsonb_each_text", "json_each_text"):
         return [(k, _jsonb_to_text(v)) for k, v in items], ["text", "text"]
     return [(k, v) for k, v in items], ["text", "json"]
+
+
+def record_column_names(name: str) -> list[str]:
+    """The default column names of a record SRF's row (``key`` / ``value`` for
+    the ``jsonb_each`` family), used to name a composite's fields and to accept
+    ``(srf(x)).<field>`` in a projection."""
+    return _RECORD_SRF_COLUMNS.get(name, ["key", "value"])
+
+
+def _record_values(node: exp.Expression, ctx: Any) -> tuple[list[tuple[Any, Any]], list[str]]:
+    """Rows and per-column type tags for a record SRF (``jsonb_each`` family) —
+    one ``(key, value)`` tuple per object member, key ``text`` and value ``json``
+    (``jsonb_each``) or ``text`` (``jsonb_each_text``)."""
+    from secantus.sql import scalar
+
+    name = str(node.this).rsplit(".", 1)[-1].lower()
+    arg = node.expressions[0] if node.expressions else None
+    value = scalar.evaluate(arg, _empty_scope, ctx) if arg is not None else None
+    return record_rows(name, value)
 
 
 def _jsonb_to_text(v: Any) -> Any:
@@ -640,6 +663,16 @@ def _generate_series_temporal(start: Any, stop: Any, step: Any) -> tuple[list[An
     """``generate_series(ts_start, ts_stop, interval)`` — walk from ``start`` to
     ``stop`` (inclusive) by ``interval``. The interval carries its own sign; the
     walk direction is taken from whether one step moves forward or backward."""
+    # Postgres resolves DATE bounds to the ``timestamptz`` overload and TIMESTAMP
+    # bounds to the plain ``timestamp`` one, so the two spellings differ in the
+    # row TYPE even when the instants agree. Decided BEFORE the coercion below,
+    # which turns a date into a midnight datetime and erases the distinction.
+    date_only = all(_is_date_only(b) for b in (start, stop))
+    # A date / timestamp LITERAL arrives here as its canonical text rather than
+    # as a Python date, so the temporal overload was rejecting its own
+    # arguments: ``generate_series(DATE '2020-01-01', DATE '2020-01-03',
+    # INTERVAL '1 day')`` answered 42883.
+    start, stop = _coerce_temporal_bound(start), _coerce_temporal_bound(stop)
     if not (_is_temporal(start) and _is_temporal(stop)):
         raise errors.SQLError(
             "42883",
@@ -659,8 +692,30 @@ def _generate_series_temporal(start: Any, stop: Any, step: Any) -> tuple[list[An
         if len(out) > _MAX_SERIES_ROWS:
             raise errors.SQLError("54000", "generate_series produced too many rows")
         cur = intervals.to_date(cur, step, 1)
-    tag = "timestamptz" if start_dt.tzinfo is not None else "timestamp"
+    tag = "timestamptz" if (date_only or start_dt.tzinfo is not None) else "timestamp"
     return out, tag
+
+
+def _is_date_only(v: Any) -> bool:
+    """Whether a bound is a DATE rather than a timestamp — a ``date`` object, or
+    the canonical ``YYYY-MM-DD`` text a date literal arrives as."""
+    if isinstance(v, _dt.datetime):
+        return False
+    if isinstance(v, _dt.date):
+        return True
+    return isinstance(v, str) and bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", v.strip()))
+
+
+def _coerce_temporal_bound(v: Any) -> Any:
+    """A date / timestamp bound given as text, parsed; anything else unchanged."""
+    if isinstance(v, str):
+        from secantus.sql.datetimes import parse_iso_datetime
+
+        try:
+            return parse_iso_datetime(v)
+        except Exception:  # noqa: BLE001 -- not a temporal literal; leave it be
+            return v
+    return v
 
 
 def _to_datetime(v: Any) -> _dt.datetime:

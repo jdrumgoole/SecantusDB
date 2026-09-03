@@ -2965,6 +2965,25 @@ def _source_table_attnum(
     return None
 
 
+def _is_qualified_column(node: exp.Expression) -> bool:
+    """Whether ``node`` is a column reference carrying a table qualifier."""
+    return isinstance(node, exp.Column) and bool(node.table)
+
+
+def _selected_output_name(
+    stmt: exp.Select, term: exp.Expression, out_columns: list[tuple[str, str]]
+) -> str | None:
+    """The output column a SELECT-list item matching ``term`` exactly produces,
+    or None when no item does. Select items and ``out_columns`` are 1:1 in order
+    on the pipeline paths, so the index carries across."""
+    target = term.sql()
+    for i, sel in enumerate(stmt.expressions):
+        inner = sel.this if isinstance(sel, exp.Alias) else sel
+        if i < len(out_columns) and inner.sql() == target:
+            return out_columns[i][0]
+    return None
+
+
 def _emit_pipeline_sort(
     pipeline: list[dict[str, Any]],
     terms: list[tuple[str, int, bool]],
@@ -3679,6 +3698,27 @@ def _where_has_text_cast_comparison(node: exp.Expression, table: TableDef | None
     return False
 
 
+#: Comparison classes a quantifier can sit under (mirrors ``scalar._QUANT_CMP``).
+_QUANT_CMP_CLASSES = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)
+
+
+def _has_quantified_subquery(node: exp.Expression) -> bool:
+    """Whether ``node`` contains ``x <op> ANY/ALL (SELECT …)`` — the SET form of
+    a quantified comparison, as opposed to the array form."""
+    for cmp_node in node.find_all(*_QUANT_CMP_CLASSES):
+        for side in (cmp_node.this, cmp_node.expression):
+            inner = None
+            if isinstance(side, (exp.Any, exp.All)):
+                inner = side.this
+            elif isinstance(side, exp.Anonymous) and str(side.this).upper() == "ALL":
+                inner = side.expressions[0] if side.expressions else None
+            while isinstance(inner, exp.Paren):
+                inner = inner.this
+            if isinstance(inner, (exp.Subquery, exp.Select)):
+                return True
+    return False
+
+
 def where_needs_per_row(
     stmt: exp.Select,
     table: TableDef | None = None,
@@ -3717,6 +3757,12 @@ def where_needs_per_row(
         return True
     # A full-text ``@@`` match (``exp.MatchAgainst``) is evaluated per-row too.
     if getattr(exp, "MatchAgainst", None) is not None and node.find(exp.MatchAgainst) is not None:
+        return True
+    # ``x <op> ANY (SELECT …)`` / ``ALL (SELECT …)``. The pushdown lowering only
+    # knows the ARRAY operand, and raised 0A000 on the set form rather than
+    # falling back -- so ``WHERE id = ANY (SELECT …)``, plain SQL, was an error.
+    # The scalar evaluator runs the subquery and applies the three-valued rule.
+    if _has_quantified_subquery(node):
         return True
     if any(_subquery_has_outer_ref(sub) for sub in node.find_all(exp.Select)):
         return True
@@ -5057,21 +5103,77 @@ def _string_agg_arg(node: exp.Expression) -> tuple[exp.Expression, str] | None:
     return inner.this, sep
 
 
+class _AggOrderTerms(list):
+    """An ordered aggregate's sort terms, which also remember whether the call
+    said ``DISTINCT``.
+
+    The flag rides on the list rather than beside it so the dozen planning sites
+    that do ``value_node, terms = _agg_order_spec(arg)`` and then
+    ``[(d, nf) for _k, d, nf in terms]`` need no change — only
+    ``_sorted_agg_push`` reads it, to accumulate with ``$addToSet`` instead of
+    ``$push``. Same shape as ``typemap.TypedList`` / ``RecordValue``."""
+
+    distinct: bool = False
+
+
 def _agg_order_spec(
     value_node: exp.Expression,
 ) -> tuple[exp.Expression, list[tuple[exp.Expression, int, bool]] | None]:
-    """Unwrap an in-call ``ORDER BY`` from an aggregate argument. ``array_agg(x
-    ORDER BY y DESC)`` / ``string_agg(x, sep ORDER BY y)`` parse the argument as an
-    ``exp.Order`` whose ``this`` is the value and ``expressions`` are the sort
-    keys. Returns ``(value_expr, [(key_expr, direction, nulls_first), …])`` — or
-    ``(value_node, None)`` when there is no in-call ORDER BY."""
+    """Unwrap an in-call ``ORDER BY`` (and a ``DISTINCT``) from an aggregate
+    argument. ``array_agg(x ORDER BY y DESC)`` / ``string_agg(x, sep ORDER BY y)``
+    parse the argument as an ``exp.Order`` whose ``this`` is the value and
+    ``expressions`` are the sort keys. Returns
+    ``(value_expr, [(key_expr, direction, nulls_first), …])`` — or
+    ``(value_node, None)`` when there is neither.
+
+    ``array_agg(DISTINCT x)`` is ``array_agg(x ORDER BY x)`` with duplicates
+    removed: Postgres dedupes by SORTING, so the result comes back ascending
+    even with no ORDER BY written. Synthesizing that sort here is what lets the
+    existing ordered-aggregate path serve DISTINCT — before this, the
+    ``exp.Distinct`` node reached ``_agg_arg_to_expr`` and the whole statement
+    failed with "unsupported aggregate argument: DISTINCT x".
+    """
+
+    def _peel_distinct(node: exp.Expression) -> tuple[exp.Expression, bool]:
+        if isinstance(node, exp.Distinct) and len(node.expressions) == 1:
+            return node.expressions[0], True
+        return node, False
+
+    distinct = False
+    # With an ORDER BY the nesting inverts: sqlglot gives ``Order(this=Distinct)``
+    # for ``array_agg(DISTINCT x ORDER BY x)`` but a bare ``Distinct`` for
+    # ``array_agg(DISTINCT x)``. Peel at both depths or the ordered spelling --
+    # the one a user writes when they want a guaranteed order -- keeps failing.
+    if isinstance(value_node, exp.Order):
+        inner, distinct = _peel_distinct(value_node.this)
+        if distinct:
+            value_node = value_node.copy()
+            value_node.set("this", inner)
+    else:
+        value_node, distinct = _peel_distinct(value_node)
     if not isinstance(value_node, exp.Order):
-        return value_node, None
-    terms: list[tuple[exp.Expression, int, bool]] = []
+        if not distinct:
+            return value_node, None
+        # No ORDER BY written: DISTINCT's own dedup sort is ascending, and
+        # Postgres' default for ASC is NULLS LAST.
+        terms = _AggOrderTerms([(value_node, 1, False)])
+        terms.distinct = True
+        return value_node, terms
+    terms = _AggOrderTerms()
     for o in value_node.expressions:  # exp.Ordered
         direction = -1 if o.args.get("desc") else 1
         nulls_first = bool(o.args.get("nulls_first"))
         terms.append((o.this, direction, nulls_first))
+    if distinct:
+        # Postgres requires every ORDER BY expression of a DISTINCT aggregate to
+        # be the argument itself -- it has only the one sort to work with.
+        arg_sql = value_node.this.sql()
+        if any(key.sql() != arg_sql for key, _d, _nf in terms):
+            raise errors.SQLError(
+                "42P10",
+                "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list",
+            )
+        terms.distinct = True
     return value_node.this, terms
 
 
@@ -5118,15 +5220,24 @@ def _sorted_agg_push_value(value_node: exp.Expression, table: TableDef) -> Any:
     return _sorted_agg_key(value_node, table)
 
 
+def _agg_push_op(terms: list[tuple[exp.Expression, int, bool]]) -> str:
+    """``$addToSet`` for a DISTINCT ordered aggregate, else ``$push``."""
+    return "$addToSet" if getattr(terms, "distinct", False) else "$push"
+
+
 def _sorted_agg_push(
     value_node: exp.Expression,
     terms: list[tuple[exp.Expression, int, bool]],
     table: TableDef,
 ) -> dict[str, Any]:
-    """The ``$push`` expression for an ordered aggregate: a ``{v, k}`` pair per row
-    (``v`` the value, ``k`` the list of sort-key values) that the executor sorts."""
+    """The accumulator for an ordered aggregate: a ``{v, k}`` pair per row
+    (``v`` the value, ``k`` the list of sort-key values) that the executor sorts.
+
+    A DISTINCT aggregate accumulates with ``$addToSet`` instead — its sort key
+    IS its argument (``_agg_order_spec`` enforces that), so deduping the pair
+    dedupes the value."""
     return {
-        "$push": {
+        _agg_push_op(terms): {
             # The VALUE needs the sub-millisecond composite as much as the sort
             # key does. Only the key carried it, so `array_agg(t ORDER BY t)`
             # ordered correctly and then returned `.123000` for every row --
@@ -5159,7 +5270,7 @@ def _sorted_agg_push_resolve(
     """``_sorted_agg_push`` for the join path — the value / sort-key expressions
     lower through the join ``resolve`` (via ``_to_agg_expr``) instead of a table."""
     return {
-        "$push": {
+        _agg_push_op(terms): {
             "v": _to_agg_expr(value_node, resolve),
             "k": [_sorted_agg_key_resolve(key, resolve) for key, _dir, _nf in terms],
         }
@@ -8547,9 +8658,18 @@ def _join_resolver(amap: dict[str, tuple[str, TableDef]]) -> Resolve:
     return resolve
 
 
-def _alias_col(node: exp.Expression) -> tuple[str | None, str]:
+def _alias_col(node: exp.Expression) -> tuple[str | None, str] | None:
+    """``(alias, column)`` for a bare column reference, else None.
+
+    Its one caller is a fast-path DETECTOR -- "is this ON a simple equality?" --
+    whose None answer routes the join to the general pipeline form. Raising
+    here instead turned every ON term that is not a bare column into a fatal
+    ``0A000 ON must compare columns``, so ordinary SQL like
+    ``JOIN b ON a.id = b.id - 1`` could not run at all even though the pipeline
+    form lowers arithmetic perfectly well.
+    """
     if not isinstance(node, exp.Column):
-        raise errors.feature_not_supported(f"ON must compare columns: {node.sql()}")
+        return None
     return (node.table or None), node.name
 
 
@@ -8689,6 +8809,10 @@ class _OnTranslator:
         for cls, op in self._OPS.items():
             if isinstance(node, cls):
                 return {op: [self.expr(node.this), self.expr(node.expression)]}
+        # Arithmetic on either side of an ON comparison (``ON a.id = b.id - 1``).
+        arith = _ARITH_OPS.get(type(node))
+        if arith is not None and node.expression is not None:
+            return {arith: [self.expr(node.this), self.expr(node.expression)]}
         raise errors.feature_not_supported(f"unsupported JOIN ON term: {node.sql()}")
 
 
@@ -8701,8 +8825,10 @@ def _on_is_simple_equality(
     if len(conjuncts) != 1 or not isinstance(conjuncts[0], exp.EQ):
         return None
     eq = conjuncts[0]
-    la, lc = _alias_col(eq.this)
-    ra, rc = _alias_col(eq.expression)
+    left, right = _alias_col(eq.this), _alias_col(eq.expression)
+    if left is None or right is None:
+        return None
+    (la, lc), (ra, rc) = left, right
     if la is None or ra is None:
         return None
     if join_alias == la and ra != join_alias and ra in amap:
@@ -11562,6 +11688,9 @@ _BOOL_EXPR_TYPES = (
     exp.ILike,
     exp.RegexpLike,
     exp.RegexpILike,
+    # `SIMILAR TO` — the same 't'-under-oid-25 failure this tuple exists to
+    # prevent, and the reason it is listed the moment the operator works at all.
+    exp.SimilarTo,
     # `IS DISTINCT FROM` / `IS NOT DISTINCT FROM`. Absent here they typed as
     # text, so the value rode the wire as 't'/'f' and the RowDescription said
     # oid 25 where PostgreSQL says 16 — the exact failure this tuple exists to
@@ -12203,10 +12332,16 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         node, resolve
     ):
         return "text"
-    # ``->`` / ``#>`` keep jsonb; ``->>`` / ``#>>`` return text.
-    if isinstance(node, exp.JSONExtractScalar):
+    # ``->`` / ``#>`` keep jsonb; ``->>`` / ``#>>`` return text. The four operators
+    # parse to two UNRELATED pairs of node classes -- ``#>`` is ``JSONBExtract``,
+    # which is not a subclass of ``JSONExtract`` -- so naming only the ``JSON*``
+    # pair here typed ``#>`` as text while the comment claimed otherwise, and the
+    # value went out under oid 25: ``'{"a":{"b":[1,2]}}'::jsonb #> '{a,b}'``
+    # answered the Postgres ARRAY literal ``{1,2}`` instead of the jsonb ``[1,2]``.
+    # ``_JSONB_SCALAR`` / ``_JSONB_CLASSES`` are the tuples that name all four.
+    if isinstance(node, _JSONB_SCALAR):
         return "text"
-    if isinstance(node, exp.JSONExtract):
+    if isinstance(node, _JSONB_CLASSES):
         return "json"
     # ``jsonb || jsonb`` and ``jsonb - key`` answer jsonb. Postgres has no
     # jsonb-to-text concat and no ``x - jsonb``, so ``||`` is jsonb when EITHER
@@ -12482,6 +12617,12 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     # a driver reads ``if row["x"]`` as truthy (SQLAlchemy's duplicates_constraint).
     if isinstance(node, _BOOL_EXPR_TYPES):
         return "bool"
+    # ``x LIKE p ESCAPE c`` / ``x SIMILAR TO p ESCAPE c`` wrap the predicate in an
+    # ``Escape`` node, which is not itself a boolean class -- so adding the
+    # ESCAPE clause to a working LIKE flipped its column from oid 16 to oid 25
+    # and sent the driver a 't'. The clause changes the match, never the type.
+    if isinstance(node, exp.Escape):
+        return _infer_scalar_tag(node.this, resolve)
     # jsonpath predicate operators: ``@?`` (JSONBPathExists) and ``@@``
     # (MatchAgainst) -> bool.
     _jp_names = ("JSONBPathExists", "MatchAgainst")
@@ -12681,6 +12822,10 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
             "json_strip_nulls",
             "jsonb_path_query",
             "jsonb_path_query_array",
+            "jsonb_path_query_first",
+            "jsonb_extract_path",
+            "json_extract_path",
+            "array_to_json",
             "to_jsonb",
             "to_json",
             "row_to_json",
@@ -12690,6 +12835,13 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
             "json_object_agg",
         ):
             return "json"
+        if fname == "trim_array" and node.expressions:
+            # The result is the ARGUMENT's array type -- typing it text sent the
+            # array literal as a string.
+            with contextlib.suppress(errors.SQLError):
+                arg = _infer_scalar_tag(node.expressions[0], resolve)
+                if arg and typemap.is_array_tag(arg):
+                    return arg
         if fname == "array_fill" and node.expressions:
             # `array_fill(v, ARRAY[n])` is an array OF v's type — typing it
             # text sent the array literal as a string.
@@ -12711,6 +12863,8 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
             return "text"
         if fname in ("jsonb_path_exists", "jsonb_path_match"):
             return "bool"
+        if fname in ("jsonb_extract_path_text", "json_extract_path_text"):
+            return "text"
         if fname in ("has_table_privilege", "has_column_privilege"):
             return "bool"
         # Advisory locks (#135): pg_try_* / pg_advisory_unlock* -> bool; the
@@ -12905,11 +13059,18 @@ def _append_join_tail(
         for o in order.expressions:
             direction = -1 if o.args.get("desc") else 1
             name = _column_name(o.this)
-            if name in out_names:
+            # Match a QUALIFIED term against the select list by its full text
+            # first. Two joined tables routinely project same-named columns
+            # (``SELECT a.id, b.id``), and the bare-name lookup below finds the
+            # FIRST of them -- so ``ORDER BY b.id`` silently sorted by ``a.id``,
+            # and in a RIGHT JOIN that also mis-placed the unmatched rows
+            # (their ``a.id`` is NULL).
+            key = _selected_output_name(stmt, o.this, out_columns)
+            if key is None and not _is_qualified_column(o.this) and name in out_names:
                 key = name
-            elif distinct:
-                raise errors.undefined_column(name)
-            else:
+            if key is None:
+                if distinct:
+                    raise errors.undefined_column(name)
                 path, _ = resolve(o.this)
                 key = f"__ord_{len(hidden)}"
                 project[key] = f"${path}"
@@ -12965,7 +13126,12 @@ def _resolve_order_output(
         if not 1 <= idx <= len(out_columns):
             raise errors.SQLError("42P10", f"ORDER BY position {idx} is not in select list")
         return out_columns[idx - 1][0]
-    if not isinstance(node, exp.Column):
+    # A QUALIFIED column is matched against the select list by its full text
+    # before the bare-name fallback below. Two joined tables routinely project
+    # same-named columns -- ``SELECT a.id, b.id`` -- and the fallback returns the
+    # bare ``id``, which is the FIRST of them: ``ORDER BY b.id`` silently sorted
+    # by ``a.id``. Select items and ``out_columns`` are 1:1 in order here.
+    if not isinstance(node, exp.Column) or node.table:
         target = node.sql()
         selects = stmt.expressions
         for i, sel in enumerate(selects):
@@ -13379,6 +13545,36 @@ def _resolve_group_by_ordinals(root: exp.Expression) -> None:
             else:
                 new.append(g)
         group.set("expressions", new)
+
+
+def _validate_order_by_ordinals(root: exp.Expression) -> None:
+    """Reject an out-of-range ``ORDER BY <n>`` with Postgres' 42P10.
+
+    The planning paths that resolve a positional ORDER BY each gate on
+    ``1 <= n <= len(select list)`` and, when it fails, simply leave the literal
+    alone -- which sorts by a constant, i.e. not at all. So ``ORDER BY 99``,
+    ``ORDER BY 0`` and ``ORDER BY -1`` all returned rows in storage order where
+    Postgres refuses the statement. Validated once here, before a path is
+    chosen, so every path inherits it (the GROUP BY sibling above does the
+    same). A NEGATIVE ordinal does not even reach those gates as a Literal --
+    it parses as ``Neg(Literal)`` -- which is why it is unwrapped here.
+    """
+    for sel in root.find_all(exp.Select):
+        order = sel.args.get("order")
+        if order is None or not sel.expressions:
+            continue
+        for o in order.expressions:
+            term = o.this
+            negated = isinstance(term, exp.Neg)
+            if negated:
+                term = term.this
+            if not (isinstance(term, exp.Literal) and not term.is_string):
+                continue
+            if not str(term.this).isdigit():
+                continue
+            i = -int(term.this) if negated else int(term.this)
+            if not 1 <= i <= len(sel.expressions):
+                raise errors.SQLError("42P10", f"ORDER BY position {i} is not in select list")
 
 
 _ESTRING_SIMPLE = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
@@ -13795,6 +13991,7 @@ def _parse_uncached(sql: str) -> list[exp.Expression]:
             _reject_unparenthesised_in(s)
             _fold_unquoted_identifiers(s)
             _resolve_group_by_ordinals(s)
+            _validate_order_by_ordinals(s)
             # Dollar-quoted strings tokenize as RawString — downstream code
             # (scalar, typemap, every literal path) only knows Literal, so
             # normalize in place: the value is identical, only the quoting
