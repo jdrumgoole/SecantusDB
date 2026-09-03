@@ -55,6 +55,8 @@ Two parity tests asserted the Rust engine `raw is None` for these operators — 
 
 `tests/test_ci_runs_rust_server_tests.py` also did its job — the new test file is gated on `importorskip("_secantus_server")`, so it would have run **nowhere** until named in the `storage-engine` job. Now wired in.
 
+And wiring it in immediately found the next thing: a server per test is ~380 WiredTiger stores across this file, which **filled the disk on the Windows runner**. Nothing here needs a private server, so it takes one per engine per module and re-seeds the collection between tests — 192 cases in 1.6s rather than 82s, and two stores rather than 380.
+
 #### Also fixed
 
 `Conv::Failed` was serving three different mongod messages at once — overflow, non-finite, and unsupported-pair — which was invisible while all three deferred. One of its own comments already described a case as "Unsupported conversion" while the code classified it as a failure.

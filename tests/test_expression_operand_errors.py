@@ -75,13 +75,31 @@ def _rust_client(tmp_path):
         srv.stop()
 
 
-@pytest.fixture(params=["python", "rust"])
-def coll(request, tmp_path):
+@pytest.fixture(scope="module", params=["python", "rust"])
+def _client(request, tmp_path_factory):
+    """ONE server per engine for the whole module.
+
+    A server per test stands up ~380 WiredTiger stores across this file, which
+    filled the disk on the Windows CI runner ("No space left on device" out of
+    `__win_file_set_end`). Nothing here needs a private server: every test reads
+    a single seeded document, and `coll` below re-seeds between them.
+    """
     factory = _python_client if request.param == "python" else _rust_client
-    with factory(tmp_path) as client:
-        c = client["operr"]["c"]
-        c.insert_one(dict(DOC))
-        yield c
+    with factory(tmp_path_factory.mktemp("operr")) as client:
+        yield client
+
+
+@pytest.fixture
+def coll(_client):
+    """A freshly seeded collection on the shared server.
+
+    Dropping and re-seeding is what keeps the tests independent now that the
+    server is not: one of them inserts a second document.
+    """
+    c = _client["operr"]["c"]
+    c.drop()
+    c.insert_one(dict(DOC))
+    return c
 
 
 def _run(coll, expr):
