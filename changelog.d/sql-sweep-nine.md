@@ -51,10 +51,22 @@ numeric at `select_div_scale`'s scale.
   was built with `catalog=None`, so resolving the subquery's table raised
   `AttributeError`.
 
+- **`COALESCE`, `GREATEST` and `LEAST` resolve a common type** instead of taking
+  the first argument's. `coalesce(1::int, 2.5::numeric)` declared int4 and then
+  coerced the numeric result with `int('2.5')` — a bare Python `ValueError` that
+  reached the client with *no SQLSTATE at all*. The old code carried a comment
+  claiming first-wins "is what PG's common-type resolution amounts to for the
+  shapes we can decide"; it is not, and a probe says so. Note the precedence is
+  **not** arithmetic's: `int + real` is double precision, but
+  `greatest(int, real)` is real.
+
 #### Added
 
 - **`string_agg` and `array_agg` as window functions**, including under
   `FILTER`, with the array typed from its element rather than declared numeric.
+- **`min_scale` and `trim_scale`**, beside the `scale` that was already there —
+  `scale` is the digits a numeric *carries*, `min_scale` the smallest that keeps
+  the value exactly, and `trim_scale` the value re-scaled to it.
 - **`UPDATE ... SET (a, b) = (x, y)`**, in all three row-constructor spellings
   (`(a, b)`, a one-element `(a)`, and `ROW(...)`), expanded to single-column
   assignments at parse time. An arity mismatch is `42601`. A row *subquery*

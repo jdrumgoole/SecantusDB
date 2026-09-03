@@ -283,6 +283,82 @@ def test_window_avg_is_exact_for_integer_input(store, sess):
 
 
 # --------------------------------------------------------------------------- #
+# COALESCE / GREATEST / LEAST resolve a COMMON type, they do not take the first
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("expr", "tag"),
+    [
+        # Postgres' common-type precedence is NOT arithmetic's: `int + real` is
+        # double precision, but `greatest(int, real)` is real.
+        ("greatest(1::int, 2.5::real)", "float4"),
+        ("greatest(1.0::numeric, 2.5::real)", "float4"),
+        ("greatest(2.5::real, 1.0::numeric)", "float4"),
+        ("greatest(1::int, 2.5::float8)", "float8"),
+        ("greatest(2.5::float8, 1.0::numeric)", "float8"),
+        ("greatest(1::int, 2.5::numeric)", "numeric"),
+        ("greatest(1::int2, 2::int8)", "int8"),
+        ("greatest(1, 2)", "int4"),
+        ("coalesce(1::int, 2.5::real)", "float4"),
+        ("coalesce(1::int, 2.5::numeric)", "numeric"),
+        ("coalesce(1::int2, 2::int8)", "int8"),
+        ("coalesce(NULL, 3)", "int4"),
+    ],
+)
+def test_common_type_resolution(store, sess, expr, tag):
+    assert _tags(store, f"SELECT {expr}", sess) == [tag]
+
+
+@pytest.mark.parametrize(
+    ("sql", "want"),
+    [
+        # Taking the FIRST argument's type declared int4 and then coerced the
+        # numeric result with `int('2.5')` — a bare ValueError that reached the
+        # client with no SQLSTATE at all.
+        ("SELECT greatest(1, 2.5)", [(2.5,)]),
+        ("SELECT least(1, 2.5)", [(1,)]),
+        ("SELECT coalesce(1::int, 2.5::numeric)", [(1,)]),
+        ("SELECT coalesce(NULL::int, 2.5::numeric)", [(2.5,)]),
+    ],
+)
+def test_mixed_numeric_arguments_do_not_crash(store, sess, sql, want):
+    rows = _rows(store, sql, sess)
+    assert [tuple(float(c) for c in r) for r in rows] == [tuple(float(c) for c in w) for w in want]
+
+
+# --------------------------------------------------------------------------- #
+# scale / min_scale / trim_scale
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("expr", "want"),
+    [
+        ("scale(1.230)", 3),  # the digits CARRIED
+        ("min_scale(1.230)", 2),  # ...the smallest that keeps the value
+        ("scale(0.0)", 1),
+        ("min_scale(0.0)", 0),
+        ("min_scale(1500)", 0),
+        ("min_scale(2.00)", 0),
+    ],
+)
+def test_scale_family(store, sess, expr, want):
+    assert _rows(store, f"SELECT {expr}", sess)[0][0] == want
+
+
+@pytest.mark.parametrize(
+    ("expr", "want"), [("trim_scale(1.230)", "1.23"), ("trim_scale(1.200300)", "1.2003")]
+)
+def test_trim_scale(store, sess, expr, want):
+    assert str(_rows(store, f"SELECT {expr}", sess)[0][0]) == want
+
+
+def test_trim_scale_types_as_numeric(store, sess):
+    assert _tags(store, "SELECT trim_scale(1.2)", sess) == ["numeric"]
+
+
+# --------------------------------------------------------------------------- #
 # RETURNING
 # --------------------------------------------------------------------------- #
 

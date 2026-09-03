@@ -12083,6 +12083,42 @@ def _arith_operand_tag(node: exp.Expression, resolve: Resolve) -> str | None:
     return tag if tag in _NUMERIC_FAMILY else None
 
 
+#: Postgres' common-type precedence for the numeric family, widest last. Used by
+#: COALESCE / GREATEST / LEAST, whose resolution is NOT arithmetic's: `int + real`
+#: is double precision, but `greatest(int, real)` is real. Measured against 14.13.
+_COMMON_TYPE_ORDER = ["int2", "int4", "int8", "numeric", "float4", "float8"]
+
+
+def _common_numeric_type(tags: list[str]) -> str | None:
+    """The type Postgres resolves a COALESCE / GREATEST / LEAST argument list to,
+    or None when any tag is outside the numeric family.
+
+    All three used to take the FIRST argument's type -- with a comment claiming
+    that "is what PG's common-type resolution amounts to for the shapes we can
+    decide". It is not: `coalesce(1::int, 2.5::numeric)` is numeric, not integer.
+    Declaring int4 and then coercing the numeric result ran `int('2.5')`, so the
+    statement died with a bare Python ValueError that reached the client with NO
+    SQLSTATE at all.
+    """
+    if not tags or any(t not in _COMMON_TYPE_ORDER for t in tags):
+        return None
+    return max(tags, key=_COMMON_TYPE_ORDER.index)
+
+
+def _argument_tags(parts: list[exp.Expression | None], resolve: Resolve) -> list[str]:
+    """Every non-NULL argument's inferred tag, skipping the ones that cannot be
+    decided — the input to :func:`_common_numeric_type`."""
+    tags: list[str] = []
+    for part in parts:
+        if part is None or isinstance(part, exp.Null):
+            continue
+        with contextlib.suppress(errors.SQLError):
+            tag = _infer_scalar_tag(part, resolve)
+            if tag and tag != "text":
+                tags.append(tag)
+    return tags
+
+
 def _unify_numeric_tags(tags: list[str]) -> str | None:
     """Combine numeric operand tags per Postgres' promotion rules, or None when
     any tag is outside the numeric family (caller decides the fallback)."""
@@ -12625,15 +12661,22 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     # — typing them text sent `greatest(NULL, 1)` as the STRING '1' under oid
     # 25 where PG sends 1 as an integer.
     if isinstance(node, (exp.Greatest, exp.Least)):
-        for part in [node.this, *(node.expressions or [])]:
-            if part is None or isinstance(part, exp.Null):
-                continue
-            with contextlib.suppress(errors.SQLError):
-                tag = _infer_scalar_tag(part, resolve)
-                if tag and tag != "text":
-                    return tag
+        # ...but unlike COALESCE these UNIFY their arguments rather than taking
+        # the first: `greatest(1, 2.5)` is numeric in Postgres, not integer.
+        # Returning the first tag declared int4 and then the output coercion
+        # ran `int('2.5')`, so the statement died with a bare Python ValueError
+        # that reached the client with NO SQLSTATE at all.
+        tags = _argument_tags([node.this, *(node.expressions or [])], resolve)
+        common = _common_numeric_type(tags)
+        if common is not None:
+            return common
+        if tags:
+            return tags[0]
     if isinstance(node, exp.Coalesce):
         parts = [node.this, *(node.expressions or [])]
+        common = _common_numeric_type(_argument_tags(parts, resolve))
+        if common is not None:
+            return common
         for part in parts:
             if part is None or isinstance(part, exp.Null):
                 continue

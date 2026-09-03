@@ -4345,9 +4345,11 @@ def _plain_scalar(name: str, args: list[Any]) -> Any:
         if sentinel is not None and isinstance(a, str) and sentinel(a) is not None:
             return False
         return not (isinstance(a, float) and (a != a or a in (float("inf"), float("-inf"))))
-    if name == "scale":
-        # The COUNT of decimal digits a numeric carries — `scale(1.50)` is 2,
-        # `scale(100)` is 0. Not the same as "digits after stripping zeros".
+    if name in ("scale", "min_scale", "trim_scale"):
+        # `scale` is the COUNT of decimal digits a numeric carries — `scale(1.50)`
+        # is 2, `scale(100)` is 0; not "digits after stripping zeros". `min_scale`
+        # IS that -- the smallest scale that keeps the value exactly -- and
+        # `trim_scale` returns the value re-scaled to it.
         if a is None:
             return None
         from decimal import Decimal as _Dec
@@ -4355,7 +4357,15 @@ def _plain_scalar(name: str, args: list[Any]) -> Any:
         d = a.to_decimal() if isinstance(a, bson.Decimal128) else a
         if not isinstance(d, _Dec):
             d = _Dec(str(d))
-        return max(0, -d.as_tuple().exponent)
+        if name == "scale":
+            return max(0, -d.as_tuple().exponent)
+        trimmed = d.normalize()
+        # `normalize` turns 1500 into 1.5E+3; a negative exponent is the scale,
+        # a positive one means no fractional digits at all.
+        min_scale = max(0, -trimmed.as_tuple().exponent)
+        if name == "min_scale":
+            return min_scale
+        return _Dec(d).quantize(_Dec(1).scaleb(-min_scale)) if min_scale else _Dec(int(d))
     if name in ("make_date", "make_time", "make_timestamp"):
         return _make_datetime(name, args)
     if name == "div":
@@ -4437,6 +4447,8 @@ PLAIN_SCALAR_TAGS = {
     "div": "numeric",
     "isfinite": "bool",
     "scale": "int4",
+    "min_scale": "int4",
+    "trim_scale": "numeric",
     "regexp_match": "text[]",
     "regexp_split_to_array": "text[]",
     "string_to_array": "text[]",

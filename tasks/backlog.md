@@ -1927,6 +1927,12 @@ one; that surface needs no work. What is still open:
       The row-constructor forms landed in this sweep; the subquery one cannot
       use the same expansion (each column would re-run the query) and still
       answers `0A000`.
+- [ ] **`abs(-2147483648)` answers 2147483648.** Postgres raises `22003 integer
+      out of range` -- the negation does not fit int4. The arithmetic operators
+      overflow-check (`SELECT a + 1` at int4 max is `22003` on both servers);
+      `abs` does not.
+- [ ] **`numeric_send` is absent** (`42883`). One of Postgres' internal
+      type-I/O functions; nothing but a driver test is likely to call it.
 - [ ] **An in-call `ORDER BY` inside a window aggregate is dropped.**
       `array_agg(v ORDER BY x) OVER (...)` aggregates in frame order rather than
       the requested one. The argument is unwrapped from its `exp.Order` and the
