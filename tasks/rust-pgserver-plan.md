@@ -883,7 +883,31 @@ as the literal form.** They are different code paths in this server, and a
 literal-only probe passed everything while the parameter form was broken for
 every single case.
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790.**
+### 0.29 multiranges (2026-09-03)
+
+**1789 -> ~1845, +56.** `test_multirange.py` was the second-largest file at 182.
+
+**One normal form: sorted, empties dropped, members that MEET folded together.**
+The last is the rule worth stating precisely, because it is not "overlapping":
+`{[1,5),[5,8)}` collapses to `{[1,8)}` even though the two share no point --
+nothing lies between them. `{[1,5),[6,8)}` stays apart because 5 does. So the
+test is "does the next member start at or before this one ends", and AT the
+meeting point it comes down to the bounds: over a continuous type
+`[1.0,2.0)`+`[2.0,3.0)` join while `[1.0,2.0)`+`(2.0,3.0)` do not.
+
+Members canonicalise BEFORE merging, so `{[1,5]}` is `{[1,6)}` and the merge
+sees the bounds a client would.
+
+**The literal parser splits on brackets, not on commas** -- a range contains
+commas of its own, so a naive split cuts every member in half.
+
+**Probed the PARAMETER form alongside the literal form this time**, which is the
+correction 0.28 forced: 26 literal shapes and 14 parameter shapes across both
+wire formats, 0 divergences on the first run. The previous batch shipped a type
+whose literal form was right in every case and whose parameter form was broken
+in every case, because the probe covered only literals.
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845.**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

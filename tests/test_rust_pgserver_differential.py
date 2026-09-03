@@ -534,6 +534,31 @@ QUERIES = [
     # comparable — two timestamp composites had no comparison arm.
     "SELECT tsrange('2026-01-01 00:00:00.5','2026-01-02')::text",
     "SELECT '[2026-01-01 00:00:00.5,2026-01-02)'::tsrange::text",
+    # --- multiranges: sorted, empties dropped, touching members merged ------
+    "SELECT '{[1,5)}'::int4multirange::text",
+    "SELECT '{[10,20),[1,5)}'::int4multirange::text",
+    "SELECT '{[1,5),[3,8)}'::int4multirange::text",
+    # touching merges; a gap does not
+    "SELECT '{[1,5),[5,8)}'::int4multirange::text",
+    "SELECT '{[1,5),[6,8)}'::int4multirange::text",
+    "SELECT '{[1,2),[2,3),[3,4)}'::int4multirange::text",
+    "SELECT '{[1,5),[2,3)}'::int4multirange::text",
+    "SELECT '{}'::int4multirange::text",
+    "SELECT '{empty}'::int4multirange::text",
+    "SELECT '{[1,5),empty,[10,20)}'::int4multirange::text",
+    "SELECT '{[1,5]}'::int4multirange::text",
+    "SELECT '{(,5)}'::int4multirange::text",
+    "SELECT '{(,5),[10,)}'::int4multirange::text",
+    # a continuous element type has no adjacency by stepping
+    "SELECT '{[1.0,2.0),[2.0,3.0)}'::nummultirange::text",
+    "SELECT '{[1.0,2.0),(2.0,3.0)}'::nummultirange::text",
+    "SELECT '{[2026-01-01,2026-01-05)}'::datemultirange::text",
+    "SELECT int4multirange()::text",
+    "SELECT int4multirange(int4range(1,5))::text",
+    "SELECT int4multirange(int4range(1,5),int4range(10,20))::text",
+    "SELECT int8multirange(int8range(1,5))::text",
+    "SELECT pg_typeof('{}'::int4multirange)::text",
+    "SELECT '{[1,5)}'::int4multirange = '{[1,5)}'::int4multirange",
 ]
 
 # (statement, verification query) — the write is compared by its row count AND
@@ -775,6 +800,9 @@ ERROR_QUERIES = [
     "SELECT 'x'::int4range",
     "SELECT int4range(1,5,'x')",
     "SELECT int4range(1,5,null)",
+    "SELECT '{[1,5)'::int4multirange",
+    "SELECT '{x}'::int4multirange",
+    "SELECT '[1,5)'::int4multirange",
 ]
 
 

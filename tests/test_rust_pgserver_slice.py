@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 psycopg = pytest.importorskip("psycopg")
+from psycopg.types.multirange import Multirange  # noqa: E402
 from psycopg.types.range import Range  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
@@ -1420,3 +1421,68 @@ def test_timestamp_range_bounds_with_sub_millisecond_digits(home: Path) -> None:
         cur.execute("set timezone to 'UTC'")
         cur.execute("select tsrange('2026-01-01 00:00:00.5','2026-01-02')::text")
         assert cur.fetchone()[0] == '["2026-01-01 00:00:00.5","2026-01-02 00:00:00")'
+
+
+def test_multiranges_merge_what_touches(home: Path) -> None:
+    """A multirange is a normalised set: sorted, empties dropped, and any two
+    members that overlap *or merely touch* merged into one.
+
+    Adjacency is the part that is easy to get wrong. `{[1,5),[5,8)}` is
+    `{[1,8)}` because nothing lies between them, while `{[1,5),[6,8)}` stays
+    two members because 5 does — so the test is "does the next one start at or
+    before this one ends", not "do they overlap".
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for expr, want in [
+            ("'{[10,20),[1,5)}'::int4multirange", "{[1,5),[10,20)}"),
+            ("'{[1,5),[3,8)}'::int4multirange", "{[1,8)}"),
+            ("'{[1,5),[5,8)}'::int4multirange", "{[1,8)}"),
+            ("'{[1,5),[6,8)}'::int4multirange", "{[1,5),[6,8)}"),
+            ("'{[1,2),[2,3),[3,4)}'::int4multirange", "{[1,4)}"),
+            ("'{empty}'::int4multirange", "{}"),
+            ("'{[1,5),empty,[10,20)}'::int4multirange", "{[1,5),[10,20)}"),
+            # members canonicalise first
+            ("'{[1,5]}'::int4multirange", "{[1,6)}"),
+            ("'{(,5),[10,)}'::int4multirange", "{(,5),[10,)}"),
+            # a continuous element type has no adjacency by stepping
+            ("'{[1.0,2.0),[2.0,3.0)}'::nummultirange", "{[1.0,3.0)}"),
+            ("'{[1.0,2.0),(2.0,3.0)}'::nummultirange", "{[1.0,2.0),(2.0,3.0)}"),
+            ("int4multirange()", "{}"),
+            ("int4multirange(int4range(1,5),int4range(10,20))", "{[1,5),[10,20)}"),
+        ]:
+            cur.execute(f"select ({expr})::text")
+            assert cur.fetchone()[0] == want, expr
+
+        cur.execute("select '{}'::int4multirange")
+        assert cur.description[0].type_code == 4451  # int4multirange, not text
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+def test_multirange_values_bind_in_both_formats(home: Path, binary: bool) -> None:
+    """A multirange sent as a parameter, in either wire format.
+
+    Probed alongside the literal form deliberately: the previous batch shipped
+    ranges whose literal form was correct in every case and whose parameter
+    form was broken in every case, because the probe only covered literals.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.cursor().execute("set timezone to 'UTC'")
+        cur = conn.cursor(binary=binary)
+        for sql, value in [
+            ("select %s::int4multirange", Multirange([Range(1, 5, "[)")])),
+            (
+                "select %s::int4multirange",
+                Multirange([Range(1, 5, "[)"), Range(10, 20, "[)")]),
+            ),
+            ("select %s::int4multirange", Multirange([])),
+            (
+                "select %s::nummultirange",
+                Multirange([Range(Decimal("1.0"), Decimal("2.0"), "[]")]),
+            ),
+        ]:
+            cur.execute(sql, (value,))
+            assert cur.fetchone()[0] == value, value
+
+        cur.execute("select int4multirange(%s::int4range)", (Range(1, 5, "[)"),))
+        assert cur.fetchone()[0] == Multirange([Range(1, 5, "[)")])

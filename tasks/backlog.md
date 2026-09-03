@@ -4446,12 +4446,10 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `true` here. Reproducing it needs PostgreSQL's operator-resolution table for
   arrays, not a comparison fix. Being more permissive, so it accepts queries
   PostgreSQL rejects rather than answering them differently.
-- **Rust PG server: range OPERATORS and multirange types are unsupported.**
-  The six range types themselves (literals, constructors, casts, canonicalisation)
-  are in; `@>` / `<@` / `&&` / `-|-` and the `int4multirange` family are not.
-  `test_range.py` (238 failures) and `test_multirange.py` (182) exercise both
-  heavily, so this is the largest single item left after the enum/composite
-  campaign.
+- **Rust PG server: range and multirange OPERATORS are unsupported.** Both type
+  families themselves (literals, constructors, casts, canonicalisation, merging,
+  parameters in both wire formats) are in; `@>` / `<@` / `&&` / `-|-` and the
+  multirange set operators are not.
 - **Rust PG server: the `oid` cast is unsupported**, and binary parameters of
   that oid with it
   (the binary decoder covers `numeric` / `date` / `time` / `timestamp` / arrays;

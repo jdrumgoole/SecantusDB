@@ -1612,3 +1612,64 @@ fn range_errors_carry_postgres_classes() {
     )
     .is_ok());
 }
+
+/// A multirange is a NORMALISED set of ranges: empties dropped, the rest
+/// sorted, and any two that overlap **or merely touch** merged into one.
+///
+/// Adjacency is the part that is easy to miss. `{[1,5),[5,8)}` is `{[1,8)}`
+/// because nothing lies between them, while `{[1,5),[6,8)}` stays two members
+/// because 5 does. So the test is "does the next one start at or before this
+/// one ends", not "do they overlap". Every case measured on PostgreSQL 14.
+#[test]
+fn multiranges_merge_what_touches() {
+    let mr = |text: &str, ty: &str| {
+        let members = crate::range::multirange_from_text(text, ty)
+            .unwrap_or_else(|e| panic!("{text}: {e:?}"));
+        crate::range::render_multirange(&members)
+    };
+    for (input, want) in [
+        ("{[1,5)}", "{[1,5)}"),
+        // sorted
+        ("{[10,20),[1,5)}", "{[1,5),[10,20)}"),
+        // overlapping
+        ("{[1,5),[3,8)}", "{[1,8)}"),
+        // touching, so merged
+        ("{[1,5),[5,8)}", "{[1,8)}"),
+        // a gap at 5, so kept apart
+        ("{[1,5),[6,8)}", "{[1,5),[6,8)}"),
+        // chains collapse
+        ("{[1,2),[2,3),[3,4)}", "{[1,4)}"),
+        // wholly contained
+        ("{[1,5),[2,3)}", "{[1,5)}"),
+        // empties are dropped, including all of them
+        ("{}", "{}"),
+        ("{empty}", "{}"),
+        ("{[1,5),empty,[10,20)}", "{[1,5),[10,20)}"),
+        // members canonicalise first, so this is [1,6)
+        ("{[1,5]}", "{[1,6)}"),
+        // infinite bounds
+        ("{(,5)}", "{(,5)}"),
+        ("{(,5),[10,)}", "{(,5),[10,)}"),
+    ] {
+        assert_eq!(mr(input, "int4multirange"), want, "for {input}");
+    }
+    // A CONTINUOUS element type has no adjacency by stepping, so touching
+    // depends entirely on the bounds: `[2.0` closes the gap that `(2.0` leaves.
+    assert_eq!(mr("{[1.0,2.0),[2.0,3.0)}", "nummultirange"), "{[1.0,3.0)}");
+    assert_eq!(
+        mr("{[1.0,2.0),(2.0,3.0)}", "nummultirange"),
+        "{[1.0,2.0),(2.0,3.0)}"
+    );
+}
+
+/// A multirange literal is split on brackets, not on every comma — its members
+/// contain commas of their own.
+#[test]
+fn malformed_multiranges_are_refused() {
+    for bad in ["{[1,5)", "{x}", "[1,5)", "{[1,5)},", "{{}}"] {
+        assert!(
+            crate::range::multirange_from_text(bad, "int4multirange").is_err(),
+            "{bad:?} should not parse"
+        );
+    }
+}

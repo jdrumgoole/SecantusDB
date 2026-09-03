@@ -236,6 +236,12 @@ fn wire_type(pg_type: &str) -> Type {
         "daterange" => Type::DATE_RANGE,
         "tsrange" => Type::TS_RANGE,
         "tstzrange" => Type::TSTZ_RANGE,
+        "int4multirange" => Type::INT4MULTI_RANGE,
+        "int8multirange" => Type::INT8MULTI_RANGE,
+        "nummultirange" => Type::NUMMULTI_RANGE,
+        "datemultirange" => Type::DATEMULTI_RANGE,
+        "tsmultirange" => Type::TSMULTI_RANGE,
+        "tstzmultirange" => Type::TSTZMULTI_RANGE,
         "numeric" | "decimal" => Type::NUMERIC,
         // `pg_typeof` answers a `regtype` (2206), not text: a client reading
         // 25 would print the same characters but compare unequal to a regtype.
