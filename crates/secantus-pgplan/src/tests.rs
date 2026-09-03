@@ -1519,3 +1519,79 @@ fn scalar_builtins_propagate_null() {
         }
     }
 }
+
+/// A range over a DISCRETE element type has exactly one spelling.
+///
+/// PostgreSQL rewrites every bound to `[)`, so `'[1,5]'` is stored and printed
+/// as `[1,6)` and `'(1,5)'` as `[2,5)`. Over a CONTINUOUS type there is no such
+/// rewrite, because there is no "next" number to move a bound to — so
+/// `'[1.0,2.0]'::numrange` stays inclusive.
+///
+/// Getting that split wrong makes two spellings of one range compare unequal.
+#[test]
+fn discrete_ranges_canonicalise_and_continuous_ones_do_not() {
+    let render = |sql: &str, ty: &str| {
+        let r = crate::range::from_text(sql, ty).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        crate::range::render(&r)
+    };
+    // int4range is discrete.
+    assert_eq!(render("[1,5)", "int4range"), "[1,5)");
+    assert_eq!(render("[1,5]", "int4range"), "[1,6)");
+    assert_eq!(render("(1,5)", "int4range"), "[2,5)");
+    assert_eq!(render("(1,5]", "int4range"), "[2,6)");
+    // daterange steps by whole days.
+    assert_eq!(
+        render("[2026-01-01,2026-01-05]", "daterange"),
+        "[2026-01-01,2026-01-06)"
+    );
+    // numrange is continuous: the bounds are left exactly as written.
+    assert_eq!(render("[1.0,2.0]", "numrange"), "[1.0,2.0]");
+    assert_eq!(render("(1.0,2.0)", "numrange"), "(1.0,2.0)");
+    // An infinite bound prints as nothing at all.
+    assert_eq!(render("(,5)", "int4range"), "(,5)");
+    assert_eq!(render("[1,)", "int4range"), "[1,)");
+    assert_eq!(render("(,)", "int4range"), "(,)");
+    // A range that contains nothing IS empty, however it was written.
+    assert_eq!(render("[1,1)", "int4range"), "empty");
+    assert_eq!(render("empty", "int4range"), "empty");
+}
+
+/// Two spellings of one range are the same range, which is what
+/// canonicalisation is for.
+#[test]
+fn equal_ranges_render_identically() {
+    let render = |sql: &str, ty: &str| {
+        crate::range::render(&crate::range::from_text(sql, ty).expect("valid"))
+    };
+    assert_eq!(render("[1,5]", "int4range"), render("[1,6)", "int4range"));
+    assert_eq!(render("(0,5)", "int4range"), render("[1,5)", "int4range"));
+}
+
+/// A bound needs quoting when its text would be ambiguous inside the brackets.
+/// A timestamp always does — it has a space in the middle.
+#[test]
+fn range_bounds_are_quoted_when_ambiguous() {
+    let r = crate::range::from_text("[2026-01-01 00:00:00,2026-01-02 00:00:00)", "tsrange")
+        .expect("valid");
+    assert_eq!(
+        crate::range::render(&r),
+        "[\"2026-01-01 00:00:00\",\"2026-01-02 00:00:00\")"
+    );
+}
+
+/// A crossed bound is a DATA error (22000), while a malformed literal is an
+/// invalid-text one (22P02) and bad bound flags are a syntax error (42601).
+/// Three different classes for three different mistakes.
+#[test]
+fn range_errors_carry_postgres_classes() {
+    let crossed = crate::range::from_text("[5,1)", "int4range").expect_err("crossed");
+    assert_eq!(crossed.sqlstate(), "22000");
+    let malformed = crate::range::from_text("x", "int4range").expect_err("malformed");
+    assert_eq!(malformed.sqlstate(), "22P02");
+    let flags = crate::range::from_args(
+        &[Bson::Int32(1), Bson::Int32(5), Bson::String("x".into())],
+        "int4range",
+    )
+    .expect_err("bad flags");
+    assert_eq!(flags.sqlstate(), "42601");
+}

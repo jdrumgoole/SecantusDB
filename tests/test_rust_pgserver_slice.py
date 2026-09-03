@@ -1289,3 +1289,66 @@ def test_scalar_builtins_report_their_result_type(home: Path) -> None:
         ]:
             cur.execute(f"select {expr}")
             assert cur.description[0].type_code == oid, expr
+
+
+def test_ranges_canonicalise_by_element_type(home: Path) -> None:
+    """A range over a discrete type has exactly one spelling.
+
+    PostgreSQL rewrites every bound of a discrete range to `[)`, so `[1,5]` is
+    stored and printed as `[1,6)`. Over a continuous type there is no such
+    rewrite — there is no "next" number to move the bound to — so
+    `[1.0,2.0]::numrange` stays inclusive.
+
+    The split matters because it is what makes two spellings of one range the
+    same range: `'[1,5]'::int4range = '[1,6)'::int4range` is true.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("set timezone to 'UTC'")
+
+        for expr, want in [
+            ("int4range(1,5)", "[1,5)"),
+            ("int4range(1,5,'[]')", "[1,6)"),
+            ("'(1,5)'::int4range", "[2,5)"),
+            ("'[2026-01-01,2026-01-05]'::daterange", "[2026-01-01,2026-01-06)"),
+            # continuous: left alone
+            ("'[1.0,2.0]'::numrange", "[1.0,2.0]"),
+            # an infinite bound prints as nothing
+            ("int4range(null,5)", "(,5)"),
+            ("'(,)'::int4range", "(,)"),
+            # a range containing nothing is empty however it was written
+            ("int4range(1,1)", "empty"),
+            # a bound with a space in it is quoted
+            (
+                "tsrange('2026-01-01','2026-01-02')",
+                '["2026-01-01 00:00:00","2026-01-02 00:00:00")',
+            ),
+        ]:
+            cur.execute(f"select ({expr})::text")
+            assert cur.fetchone()[0] == want, expr
+
+        cur.execute("select '[1,5]'::int4range = '[1,6)'::int4range")
+        assert cur.fetchone()[0] is True
+
+        cur.execute("select int4range(1,5)")
+        assert cur.description[0].type_code == 3904  # int4range, not text
+
+
+def test_range_errors_use_three_different_classes(home: Path) -> None:
+    """Three different mistakes, three different SQLSTATEs.
+
+    A crossed bound is a data error, a malformed literal an invalid-text one,
+    and bad bound flags a syntax error. Collapsing them onto one code would
+    still refuse the query, and would tell the client the wrong thing about why.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for expr, sqlstate in [
+            ("int4range(5,1)", "22000"),
+            ("'[5,1)'::int4range", "22000"),
+            ("'x'::int4range", "22P02"),
+            ("int4range(1,5,'x')", "42601"),
+        ]:
+            with pytest.raises(psycopg.Error) as exc:
+                cur.execute(f"select {expr}")
+            assert exc.value.diag.sqlstate == sqlstate, expr

@@ -15,6 +15,7 @@ use bson::{doc, Bson, Document};
 use std::str::FromStr;
 
 pub mod json;
+pub mod range;
 pub mod scalar;
 
 use bson::Decimal128;
@@ -51,6 +52,10 @@ pub enum Error {
     DivisionByZero,
     /// Integer overflow -> 22003.
     NumericOutOfRange(String),
+    /// A value that is well-formed but not allowed -> 22000. PostgreSQL puts
+    /// a crossed range bound here rather than in the invalid-text class, which
+    /// is where a malformed LITERAL goes.
+    DataException(String),
     /// More than one command where only one is allowed -> 42601.
     ///
     /// PostgreSQL accepts a multi-command string over the SIMPLE query
@@ -75,6 +80,7 @@ impl std::fmt::Display for Error {
             }
             Error::DivisionByZero => write!(f, "division by zero"),
             Error::NumericOutOfRange(m) => write!(f, "{m}"),
+            Error::DataException(m) => write!(f, "{m}"),
             Error::MultipleCommands => {
                 write!(
                     f,
@@ -100,6 +106,7 @@ impl Error {
             Error::DatetimeFieldOverflow(_) => "22008", // datetime_field_overflow
             Error::DivisionByZero => "22012",
             Error::NumericOutOfRange(_) => "22003", // numeric_value_out_of_range
+            Error::DataException(_) => "22000",     // data_exception
             Error::MultipleCommands => "42601",     // syntax_error, as PostgreSQL reports it
         }
     }
@@ -1007,6 +1014,10 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             Some(pg_query::protobuf::a_const::Val::Boolval(_)) => "bool".to_string(),
             _ => inferred_type(value).to_string(),
         },
+        // `int4range(1,5)` is an `int4range`, not the text it renders as.
+        Some(N::FuncCall(f)) if func_name(f).as_deref().is_some_and(range::is_range_type) => {
+            func_name(f).unwrap_or_default()
+        }
         // These pick one of their arguments, so they report its type.
         Some(N::CoalesceExpr(_)) | Some(N::MinMaxExpr(_)) => inferred_type(value).to_string(),
         Some(N::AExpr(e)) => {
@@ -1113,6 +1124,7 @@ pub fn display_type(internal: &str) -> String {
         "interval" => "interval",
         "json" => "json",
         "jsonb" => "jsonb",
+        t if range::is_range_type(t) => return t.to_string(),
         // A bare NULL literal has no type yet: PostgreSQL calls it `unknown`,
         // and resolves it from context when there is any.
         "unknown" => "unknown",
@@ -1159,6 +1171,24 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 // worked, because only the cast route goes through
                 // `const_value` -- and a probe whose every case carried a cast
                 // would never notice.
+                if range::is_range_type(&name) {
+                    let args = f
+                        .args
+                        .iter()
+                        .map(|a| const_value(a, params))
+                        .collect::<Result<Vec<_>>>()?;
+                    let value = range::render(&range::from_args(&args, &name)?);
+                    columns.push((
+                        if rt.name.is_empty() {
+                            name.clone()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::Value(Bson::String(value)),
+                        name.clone(),
+                    ));
+                    continue;
+                }
                 if scalar::is_scalar(&name) {
                     let args = f
                         .args
@@ -1378,7 +1408,7 @@ pub fn carry_subms(doc: &mut Document, field: &str, value: Bson) -> Bson {
 /// PostgreSQL accepts a bare date (midnight), a `T` separator, and fractional
 /// seconds; it renders `YYYY-MM-DD HH:MM:SS` with the fraction only when
 /// non-zero (probed 14).
-fn parse_timestamp(text: &str) -> Result<i64> {
+pub(crate) fn parse_timestamp(text: &str) -> Result<i64> {
     let t = text.trim();
     let normalised = t.replacen('T', " ", 1);
     let parsed = NaiveDateTime::parse_from_str(&normalised, "%Y-%m-%d %H:%M:%S%.f")
@@ -2298,7 +2328,15 @@ fn decimal_to_integer(d: &bson::Decimal128) -> Option<i128> {
     Some(sign * magnitude)
 }
 
-fn cast_value(value: Bson, target: &str) -> Result<Bson> {
+/// A value as its PostgreSQL text, which is what `::text` would produce.
+pub(crate) fn render_value_text(v: &Bson) -> String {
+    match cast_value(v.clone(), "text") {
+        Ok(Bson::String(s)) => s,
+        _ => String::new(),
+    }
+}
+
+pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     // A NULL survives every cast; only its declared type changes.
     if value == Bson::Null {
         return Ok(Bson::Null);
@@ -2441,6 +2479,10 @@ fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         // `json` VALIDATES and keeps the text it was given -- whitespace, key
         // order and duplicate keys all survive. `jsonb` parses and stores a
         // structure, so it comes back normalised.
+        t if range::is_range_type(t) => {
+            let text = as_text(&value);
+            Ok(Bson::String(range::render(&range::from_text(&text, t)?)))
+        }
         "json" | "jsonb" => {
             let text = as_text(&value);
             let parsed = json::parse(&text).map_err(|_| {
@@ -3422,6 +3464,17 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             return pg_typeof(f, params);
         }
         if let Some(name) = func_name(f) {
+            // `int4range(1,5)` and friends: a constructor named for its type.
+            if range::is_range_type(&name) {
+                let args = f
+                    .args
+                    .iter()
+                    .map(|a| const_value(a, params))
+                    .collect::<Result<Vec<_>>>()?;
+                return Ok(Bson::String(range::render(&range::from_args(
+                    &args, &name,
+                )?)));
+            }
             if scalar::is_scalar(&name) {
                 let args = f
                     .args

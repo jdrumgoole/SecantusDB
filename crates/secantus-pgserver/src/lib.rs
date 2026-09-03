@@ -228,6 +228,14 @@ fn wire_type(pg_type: &str) -> Type {
         "interval" => Type::INTERVAL,
         "json" => Type::JSON,
         "jsonb" => Type::JSONB,
+        // Range types carry their own oids, so a client builds a Range object
+        // rather than handing back the text.
+        "int4range" => Type::INT4_RANGE,
+        "int8range" => Type::INT8_RANGE,
+        "numrange" => Type::NUM_RANGE,
+        "daterange" => Type::DATE_RANGE,
+        "tsrange" => Type::TS_RANGE,
+        "tstzrange" => Type::TSTZ_RANGE,
         "numeric" | "decimal" => Type::NUMERIC,
         // `pg_typeof` answers a `regtype` (2206), not text: a client reading
         // 25 would print the same characters but compare unequal to a regtype.
