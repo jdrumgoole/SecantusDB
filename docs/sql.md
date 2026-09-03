@@ -947,21 +947,59 @@ INSERT INTO items VALUES (1, '19.99'), (2, '$1,250.00');
 SELECT price FROM items WHERE id = 2;      -- $1,250.00
 SELECT price + price FROM items WHERE id = 1;   -- $39.98   (money arithmetic)
 
-SELECT to_char(1234.5, 'FM999,999.99');    -- 1,234.50
-SELECT to_char(1234, 'FM$9,999.99');       -- $1,234.00
-SELECT to_char(-1234.5, 'FM9999.99PR');    -- <1234.50>
+SELECT to_char(1234.5, 'FM999,999.99');    -- 1,234.5   (FM drops trailing zeros)
+SELECT to_char(1234, 'FM$9,999.99');       -- $1,234.    (but keeps the point)
+SELECT to_char(-1234.5, 'FM9999.99PR');    -- <1234.5>
 SELECT to_char(1234.56, '999999.99');      --    1234.56   (padded, non-FM)
+SELECT to_char(42, 'RN');                  --            XLII
 ```
 
 Supported `to_char` patterns: `9` / `0` (digit positions), `.` (decimal point),
 `,` (group separator), `$` / `L` (currency), `S` (anchored sign), `MI` (trailing
-minus), `PR` (angle-bracket negatives), and the `FM` prefix (suppress padding).
+minus), `PR` (angle-bracket negatives), `RN` (Roman numerals), and the `FM`
+prefix (suppress padding). A value too wide for its digit slots prints `#`, as
+Postgres does.
 
 Simplifications vs real Postgres: money is stored with 2-decimal scale and a `$`
-symbol (no locale currency), `to_char` doesn't implement `EEEE` / `RN` / `V` /
-`TH` or non-ASCII locale patterns, and — as for `numeric` — `ORDER BY` on a
-money/decimal *column* relies on the storage engine's sort (the in-memory test
-store can't sort raw `Decimal128`).
+symbol (no locale currency), `to_char` doesn't implement `EEEE` / `V` / a
+*numeric* `TH` or non-ASCII locale patterns, and — as for `numeric` — `ORDER BY`
+on a money/decimal *column* relies on the storage engine's sort (the in-memory
+test store can't sort raw `Decimal128`).
+
+### `to_char` / `to_date` / `to_timestamp` datetime formatting
+
+The datetime templates are parsed directly rather than mapped onto `strftime`,
+so the full Postgres token set works and — as in Postgres — token matching is
+**case-sensitive**:
+
+```sql
+SELECT to_char(TIMESTAMP '2026-09-02 14:07:05', 'FMMonth FMDDth, YYYY');
+                                           -- September 2nd, 2026
+SELECT to_char(TIMESTAMP '2026-09-02 14:07:05', 'Day, DD Mon YYYY HH12:MI AM');
+                                           -- Wednesday, 02 Sep 2026 02:07 PM
+SELECT to_char(TIMESTAMP '2026-09-02 14:07:05', 'IYYY-"W"IW-ID');  -- 2026-W36-3
+SELECT to_char(TIMESTAMP '2026-09-02 14:07:05', 'J');              -- 2461286
+
+SELECT to_date('Sep 2, 2026', 'Mon DD, YYYY');        -- 2026-09-02
+SELECT to_timestamp('2026 33', 'IYYY IW');            -- 2026-08-10 00:00:00+00
+```
+
+Supported: the year tokens (`YYYY`/`YYY`/`YY`/`Y`/`Y,YYY`/`CC`) and their ISO
+counterparts (`IYYY`/`IYY`/`IY`/`I`/`IW`/`ID`/`IDDD`), `MONTH`/`MON`/`RM`/`MM`,
+`DAY`/`DY`/`DDD`/`DD`/`D`/`Q`/`W`/`WW`/`J`, the time tokens
+(`HH`/`HH12`/`HH24`/`MI`/`SS`/`SSSS`/`MS`/`US`/`FF1`–`FF6`), era and meridiem
+(`AD`/`BC`/`AM`/`PM` and their dotted forms), the timezone tokens
+(`TZ`/`TZH`/`TZM`/`OF`), quoted `"literal text"`, the `TH` ordinal suffix, and
+the `FM` / `TM` prefixes — each of which prefixes exactly **one** token.
+
+Every token has an upper-case and a lower-case spelling (the case you write is
+the case you get: `Month` / `MONTH` / `month`), except `OF`, `TZH` and `TZM`,
+which Postgres registers in upper case only. Because matching is case-sensitive,
+`Ddth` is `D` + `d` + `th`, not `DD` + `th` — exactly as Postgres reads it.
+
+One limitation: Postgres defaults a template with no year in it to 1 BC.
+SecantusDB stores datetimes as Python `datetime`, which has no era and a minimum
+year of 1 AD, so a year-less template yields 1 AD instead.
 
 ### Geometric types (`point` / `box` / `circle` / `polygon` / `lseg`)
 
