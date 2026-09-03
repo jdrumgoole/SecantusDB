@@ -24,7 +24,7 @@ import sys
 import tempfile
 
 import pymongo
-from bson import Decimal128, Int64, ObjectId
+from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
 from secantus import SecantusDBServer
 
@@ -38,8 +38,15 @@ WHEN = datetime.datetime(2026, 1, 2, 3, 4, 5)
 #: The seeded document. Field names are short so the case labels stay readable.
 DOC = {"_id": 1, "n": 2, "d": 1.5, "s": "abc", "arr": [3, 1, 2], "o": {"k": 1}, "t": WHEN}
 
-#: One corpus, reused for every operator. Small on purpose: 143 operators times
-#: this times two arities is already ~4k comparisons.
+#: One corpus, reused for every operator. 143 operators times this times two
+#: arities is ~6k comparisons.
+#:
+#: The second block was added 2026-09-03 after five CRASH-CLASS bugs -- each an
+#: `internal server error` reachable from any query -- turned up in a value
+#: class this list did not contain. The corpus had run tens of thousands of
+#: times without one infinity in it, so no amount of re-running could have found
+#: them. A value CLASS that is absent is invisible in exactly the way a passing
+#: test is: it costs nothing and proves nothing.
 VALUES = [
     0,
     1,
@@ -61,7 +68,47 @@ VALUES = [
     "$arr",
     "$o",
     "$nosuch",
+    # --- classes the original list had none of -------------------------
+    # Non-finite, in both numeric types. `math.ceil(inf)` raises
+    # `OverflowError` and `Decimal` traps `InvalidOperation`, so these reach
+    # unguarded code as exceptions rather than values.
+    float("inf"),
+    float("-inf"),
+    float("nan"),
+    Decimal128("Infinity"),
+    Decimal128("NaN"),
+    # Signed zero, which several operators are supposed to preserve.
+    -0.0,
+    Decimal128("-0"),
+    # The boundaries where a width changes: int32 overflow, int64 overflow,
+    # and a double too large for either.
+    2**31 - 1,
+    -(2**31),
+    Int64(2**63 - 1),
+    1e308,
+    # The BSON types the list skipped entirely.
+    MinKey(),
+    MaxKey(),
+    Binary(b"z"),
+    Timestamp(1, 1),
+    Regex("a", "i"),
+    Code("x=1"),
+    # Empty and nested containers, which the flat `[3, 1, 2]` does not reach.
+    {},
+    [[1]],
 ]
+
+#: `datetime_conversion="DATETIME_AUTO"` is required, not a nicety: with the
+#: widened corpus some operators legitimately produce a date outside Python's
+#: `datetime` range (`{$toDate: Int64(2**63 - 1)}` is year 292278994), and the
+#: DEFAULT codec raises `InvalidBSON` while DECODING the reply. That kills the
+#: probe rather than reporting a divergence -- and it kills it identically for
+#: mongod, so it is the client that cannot cope, not either server.
+_CLIENT_OPTS = dict(
+    directConnection=True,
+    serverSelectionTimeoutMS=8000,
+    datetime_conversion="DATETIME_AUTO",
+)
 
 #: Operators whose single argument is conventionally an array of operands, so
 #: the 1-argument form would be meaningless. They still get the 2-arg form.
@@ -108,17 +155,15 @@ def run(cli, dbn, expr):
 def main():
     if SERVER:
         srv = None
-        sec = pymongo.MongoClient(SERVER, directConnection=True, serverSelectionTimeoutMS=8000)
+        sec = pymongo.MongoClient(SERVER, **_CLIENT_OPTS)
         print(f"  server under test: {SERVER}")
     else:
         d = tempfile.mkdtemp()
         srv = SecantusDBServer(port=0, storage_path=d)
         srv.start()
-        sec = pymongo.MongoClient(
-            f"mongodb://{srv.address[0]}:{srv.address[1]}", directConnection=True
-        )
+        sec = pymongo.MongoClient(f"mongodb://{srv.address[0]}:{srv.address[1]}", **_CLIENT_OPTS)
         print("  server under test: embedded Python SecantusDBServer")
-    mon = pymongo.MongoClient(MONGOD, directConnection=True, serverSelectionTimeoutMS=8000)
+    mon = pymongo.MongoClient(MONGOD, **_CLIENT_OPTS)
 
     # One database, seeded once: every case is a read, so they cannot interfere.
     for cli in (mon, sec):

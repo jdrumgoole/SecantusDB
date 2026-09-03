@@ -165,6 +165,4 @@ if __name__ == "__main__":
     if len(args) != 2:
         print(__doc__)
         sys.exit(2)
-    sys.exit(
-        main(args[0], args[1], types="--types" in sys.argv, tags="--tag" in sys.argv)
-    )
+    sys.exit(main(args[0], args[1], types="--types" in sys.argv, tags="--tag" in sys.argv))
