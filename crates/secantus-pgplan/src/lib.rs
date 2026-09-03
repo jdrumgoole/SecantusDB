@@ -1124,7 +1124,7 @@ pub fn display_type(internal: &str) -> String {
         "interval" => "interval",
         "json" => "json",
         "jsonb" => "jsonb",
-        t if range::is_range_type(t) => return t.to_string(),
+        t if range::is_range_type(t) || range::is_multirange_type(t) => return t.to_string(),
         // A bare NULL literal has no type yet: PostgreSQL calls it `unknown`,
         // and resolves it from context when there is any.
         "unknown" => "unknown",
@@ -1171,6 +1171,25 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 // worked, because only the cast route goes through
                 // `const_value` -- and a probe whose every case carried a cast
                 // would never notice.
+                if range::is_multirange_type(&name) {
+                    let args = f
+                        .args
+                        .iter()
+                        .map(|a| const_value(a, params))
+                        .collect::<Result<Vec<_>>>()?;
+                    let value =
+                        range::render_multirange(&range::multirange_from_args(&args, &name)?);
+                    columns.push((
+                        if rt.name.is_empty() {
+                            name.clone()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::Value(Bson::String(value)),
+                        name.clone(),
+                    ));
+                    continue;
+                }
                 if range::is_range_type(&name) {
                     let args = f
                         .args
@@ -2491,6 +2510,12 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             let text = as_text(&value);
             Ok(Bson::String(range::render(&range::from_text(&text, t)?)))
         }
+        t if range::is_multirange_type(t) => {
+            let text = as_text(&value);
+            Ok(Bson::String(range::render_multirange(
+                &range::multirange_from_text(&text, t)?,
+            )))
+        }
         "json" | "jsonb" => {
             let text = as_text(&value);
             let parsed = json::parse(&text).map_err(|_| {
@@ -3479,6 +3504,17 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             return pg_typeof(f, params);
         }
         if let Some(name) = func_name(f) {
+            // `int4multirange(int4range(1,5), ...)`: each argument is a range.
+            if range::is_multirange_type(&name) {
+                let args = f
+                    .args
+                    .iter()
+                    .map(|a| const_value(a, params))
+                    .collect::<Result<Vec<_>>>()?;
+                return Ok(Bson::String(range::render_multirange(
+                    &range::multirange_from_args(&args, &name)?,
+                )));
+            }
             // `int4range(1,5)` and friends: a constructor named for its type.
             if range::is_range_type(&name) {
                 let args = f

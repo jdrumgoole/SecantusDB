@@ -332,3 +332,199 @@ pub fn range_element_oid(type_name: &str) -> u32 {
         _ => 1184,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Multiranges
+// ---------------------------------------------------------------------------
+
+/// The range type a multirange is built from, and the multirange's own oid.
+pub fn multirange_member(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "int4multirange" => "int4range",
+        "int8multirange" => "int8range",
+        "nummultirange" => "numrange",
+        "datemultirange" => "daterange",
+        "tsmultirange" => "tsrange",
+        "tstzmultirange" => "tstzrange",
+        _ => return None,
+    })
+}
+
+pub fn is_multirange_type(name: &str) -> bool {
+    multirange_member(name).is_some()
+}
+
+pub fn multirange_oid_name(oid: u32) -> Option<&'static str> {
+    Some(match oid {
+        4451 => "int4multirange",
+        4536 => "int8multirange",
+        4532 => "nummultirange",
+        4535 => "datemultirange",
+        4533 => "tsmultirange",
+        4534 => "tstzmultirange",
+        _ => return None,
+    })
+}
+
+/// Split `{r1,r2}` into its members. A range contains commas of its own, so the
+/// split has to track brackets and quoting rather than cutting on every comma.
+fn split_members(text: &str) -> Result<Vec<String>> {
+    let t = text.trim();
+    if !t.starts_with('{') || !t.ends_with('}') {
+        return Err(bad_multirange(text));
+    }
+    let body = &t[1..t.len() - 1];
+    if body.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut quoted = false;
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                cur.push(c);
+            }
+            '\\' if quoted => {
+                cur.push(c);
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            '[' | '(' if !quoted => {
+                depth += 1;
+                cur.push(c);
+            }
+            ']' | ')' if !quoted => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' if !quoted && depth == 0 => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    if depth != 0 || quoted {
+        return Err(bad_multirange(text));
+    }
+    out.push(cur);
+    Ok(out)
+}
+
+fn bad_multirange(text: &str) -> Error {
+    Error::InvalidText(format!("malformed multirange literal: \"{}\"", text.trim()))
+}
+
+/// Normalise a set of ranges the way PostgreSQL stores a multirange: empty
+/// members dropped, the rest sorted by lower bound, and any two that OVERLAP
+/// **or merely touch** merged into one.
+///
+/// Adjacency is the part that is easy to miss: `{[1,5),[5,8)}` is `{[1,8)}`,
+/// because nothing lies between them — while `{[1,5),[6,8)}` stays two members,
+/// because 5 does. So the merge test is "does the next one start at or before
+/// this one ends", not "do they overlap".
+pub fn normalise_multirange(mut members: Vec<Range>, member_type: &str) -> Result<Vec<Range>> {
+    let (element, _) = range_element(member_type)
+        .ok_or_else(|| Error::Unsupported(format!("the {member_type} type")))?;
+    members.retain(|r| !r.empty);
+    // An absent lower bound is smaller than any value, so it sorts first.
+    let mut sorted: Vec<Range> = Vec::new();
+    for m in members {
+        let pos = sorted.partition_point(|s| lower_before(s, &m, element).unwrap_or(true));
+        sorted.insert(pos, m);
+    }
+    let mut out: Vec<Range> = Vec::new();
+    for m in sorted {
+        match out.last_mut() {
+            Some(prev) if touches(prev, &m, element)? => {
+                // Keep the further of the two upper ends.
+                if upper_before(prev, &m, element)? {
+                    prev.upper = m.upper.clone();
+                    prev.upper_inc = m.upper_inc;
+                }
+            }
+            _ => out.push(m),
+        }
+    }
+    Ok(out)
+}
+
+fn lower_before(a: &Range, b: &Range, element: &str) -> Result<bool> {
+    Ok(match (&a.lower, &b.lower) {
+        (None, None) => a.lower_inc && !b.lower_inc,
+        (None, Some(_)) => true,
+        (Some(_), None) => false,
+        (Some(x), Some(y)) => match compare_bounds(x, y, element)? {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            // At the same value, the inclusive bound starts first.
+            std::cmp::Ordering::Equal => a.lower_inc && !b.lower_inc,
+        },
+    })
+}
+
+fn upper_before(a: &Range, b: &Range, element: &str) -> Result<bool> {
+    Ok(match (&a.upper, &b.upper) {
+        (None, None) => false,
+        // An absent upper bound reaches further than any value.
+        (None, Some(_)) => false,
+        (Some(_), None) => true,
+        (Some(x), Some(y)) => match compare_bounds(x, y, element)? {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => !a.upper_inc && b.upper_inc,
+        },
+    })
+}
+
+/// Do these two ranges overlap or touch? `a` is known to start no later
+/// than `b`.
+fn touches(a: &Range, b: &Range, element: &str) -> Result<bool> {
+    // `a` runs to infinity, so it reaches everything after it.
+    let Some(a_upper) = &a.upper else {
+        return Ok(true);
+    };
+    // `b` starts at negative infinity, so it reaches back into `a`.
+    let Some(b_lower) = &b.lower else {
+        return Ok(true);
+    };
+    Ok(match compare_bounds(a_upper, b_lower, element)? {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        // They meet at one value. They touch unless BOTH exclude it, which is
+        // what leaves a hole between them.
+        std::cmp::Ordering::Equal => a.upper_inc || b.lower_inc,
+    })
+}
+
+pub fn render_multirange(members: &[Range]) -> String {
+    format!(
+        "{{{}}}",
+        members.iter().map(render).collect::<Vec<_>>().join(",")
+    )
+}
+
+/// A multirange from its literal text.
+pub fn multirange_from_text(text: &str, type_name: &str) -> Result<Vec<Range>> {
+    let member_type = multirange_member(type_name).ok_or_else(|| bad_multirange(text))?;
+    let parts = split_members(text)?;
+    let members = parts
+        .iter()
+        .map(|p| from_text(p, member_type))
+        .collect::<Result<Vec<_>>>()?;
+    normalise_multirange(members, member_type)
+}
+
+/// A multirange from constructor arguments, each of which is already a range.
+pub fn multirange_from_args(args: &[Bson], type_name: &str) -> Result<Vec<Range>> {
+    let member_type = multirange_member(type_name)
+        .ok_or_else(|| Error::Unsupported(format!("the {type_name} type")))?;
+    let members = args
+        .iter()
+        .filter(|a| *a != &Bson::Null)
+        .map(|a| from_text(&crate::render_value_text(a), member_type))
+        .collect::<Result<Vec<_>>>()?;
+    normalise_multirange(members, member_type)
+}
