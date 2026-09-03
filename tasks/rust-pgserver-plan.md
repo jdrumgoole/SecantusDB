@@ -811,7 +811,42 @@ the code does not do.
 
 **Probe: 60 shapes, values AND result oids, 0 divergences.**
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633.**
+### 0.27 range types (2026-09-03)
+
+**1634 -> ~1692, +58.**
+
+**Ranking by ERROR signature had been hiding this.** The blocker list put the
+range constructors at 15 tests each; ranking by FILE put `test_range.py` at 238
+and `test_multirange.py` at 182 -- 420 together, the largest coherent group
+left. The same failure reaches the list under many different messages, so an
+error-signature ranking undercounts anything with more than one way to fail.
+**Rank both ways.**
+
+**The whole design is one split: discrete versus continuous.** PostgreSQL
+rewrites every bound of a DISCRETE range to `[)` -- `[1,5]` becomes `[1,6)`,
+`(1,5)` becomes `[2,5)` -- so that two spellings of one range are one value.
+Over a CONTINUOUS type there is no rewrite, because there is no next value to
+move a bound to. `int4range` / `int8range` / `daterange` are discrete;
+`numrange` / `tsrange` / `tstzrange` are not. Getting it wrong makes
+`'[1,5]'::int4range = '[1,6)'::int4range` answer false.
+
+**Details a real server tells you and reasoning does not:** an absent bound
+prints as NOTHING (`(,5)`, not `(-infinity,5)`); bounds that meet without
+including each other make the range EMPTY, so `int4range(1,1)` is `empty`; and a
+bound is quoted when its text would be ambiguous inside the brackets, which a
+timestamp always is.
+
+**Three mistakes, three SQLSTATE classes**, all of which refuse the query and
+none of which mean the same thing: a crossed bound is `22000` (data), a
+malformed literal `22P02` (invalid text), bad bound flags `42601` (syntax). The
+first two were both `22P02` until the probe compared codes.
+
+**Probe: 32 shapes -- 27 valid, 5 refused -- 0 divergences.**
+
+**Still open here:** multirange (`int4multirange` etc.), and the range OPERATORS
+(`@>`, `<@`, `&&`), which `test_range.py` exercises heavily.
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692.**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

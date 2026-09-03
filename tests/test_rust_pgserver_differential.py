@@ -501,6 +501,35 @@ QUERIES = [
     "SELECT nullif(1,1)",
     "SELECT nullif(1,2)",
     "SELECT upper(null)",
+    # --- ranges: discrete types canonicalise to [), continuous ones do not --
+    "SELECT int4range(1,5)::text",
+    "SELECT int4range(1,5,'[]')::text",
+    "SELECT int4range(1,5,'()')::text",
+    "SELECT '[1,5)'::int4range::text",
+    "SELECT '[1,5]'::int4range::text",
+    "SELECT '(1,5)'::int4range::text",
+    "SELECT '(1,5]'::int4range::text",
+    "SELECT 'empty'::int4range::text",
+    "SELECT int4range(1,1)::text",
+    "SELECT '[1,1)'::int4range::text",
+    "SELECT int4range(null,5)::text",
+    "SELECT int4range(1,null)::text",
+    "SELECT '(,)'::int4range::text",
+    "SELECT int8range(1,5)::text",
+    "SELECT daterange('2026-01-01','2026-01-05')::text",
+    "SELECT '[2026-01-01,2026-01-05]'::daterange::text",
+    # numrange is continuous — the bounds stay exactly as written.
+    "SELECT numrange(1.0,2.0)::text",
+    "SELECT numrange(1,2,'[]')::text",
+    "SELECT '[1.0,2.0]'::numrange::text",
+    "SELECT '[1.0,2.00]'::numrange::text",
+    # A timestamp bound is quoted, because it has a space in it.
+    "SELECT tsrange('2026-01-01','2026-01-02')::text",
+    # Two spellings of one range are equal.
+    "SELECT '[1,5]'::int4range = '[1,6)'::int4range",
+    "SELECT '[1,5)'::int4range = '[1,5)'::int4range",
+    "SELECT pg_typeof(int4range(1,5))::text",
+    "SELECT pg_typeof('[1,2)'::numrange)::text",
 ]
 
 # (statement, verification query) — the write is compared by its row count AND
@@ -729,6 +758,11 @@ ERROR_QUERIES = [
     "SELECT '{bad}'::json",
     "SELECT '[1,]'::json",
     "SELECT '{\"a\":1} x'::json",
+    # Three different mistakes, three different SQLSTATE classes.
+    "SELECT int4range(5,1)",
+    "SELECT '[5,1)'::int4range",
+    "SELECT 'x'::int4range",
+    "SELECT int4range(1,5,'x')",
 ]
 
 
