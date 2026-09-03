@@ -559,6 +559,25 @@ QUERIES = [
     "SELECT int8multirange(int8range(1,5))::text",
     "SELECT pg_typeof('{}'::int4multirange)::text",
     "SELECT '{[1,5)}'::int4multirange = '{[1,5)}'::int4multirange",
+    # --- generate_series as a FROM source ----------------------------------
+    "SELECT * FROM generate_series(1,5)",
+    "SELECT * FROM generate_series(1,10,3)",
+    # counting up towards a smaller stop is EMPTY, not reversed
+    "SELECT * FROM generate_series(5,1)",
+    "SELECT * FROM generate_series(5,1,-2)",
+    "SELECT * FROM generate_series(1,0)",
+    "SELECT * FROM generate_series(3,3)",
+    # the alias renames the column; a column alias beats the table one
+    "SELECT * FROM generate_series(1,3) AS g",
+    "SELECT * FROM generate_series(1,3) AS g(x)",
+    "SELECT g FROM generate_series(1,3) g",
+    "SELECT * FROM generate_series(1,3) ORDER BY 1 DESC",
+    "SELECT * FROM generate_series(1,10) LIMIT 3",
+    "SELECT * FROM generate_series(1,10) OFFSET 7",
+    "SELECT * FROM generate_series(1,10) LIMIT 2 OFFSET 3",
+    "SELECT count(*) FROM generate_series(1,100)",
+    "SELECT sum(g) FROM generate_series(1,10) g",
+    "SELECT min(g), max(g) FROM generate_series(3,7) g",
 ]
 
 # (statement, verification query) — the write is compared by its row count AND
@@ -803,6 +822,7 @@ ERROR_QUERIES = [
     "SELECT '{[1,5)'::int4multirange",
     "SELECT '{x}'::int4multirange",
     "SELECT '[1,5)'::int4multirange",
+    "SELECT * FROM generate_series(1,5,0)",
 ]
 
 

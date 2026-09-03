@@ -949,7 +949,46 @@ probe rather than trusting the short one is what found it.
 
 **Probe: 29 cursor operations, 0 divergences.**
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848.**
+### 0.31 generate_series (2026-09-03)
+
+**~1848 -> ~1870, +22.**
+
+**A FINISHED FEATURE CAN BE UNREACHABLE.** Cursors landed in 0.30 matching
+PostgreSQL on 29 probed operations, and the gauge moved 3 -- because the usual
+way to give a cursor rows to scroll over, without inventing a table, is
+`generate_series`. 0.30 measured that and filed it rather than guessing; this
+batch collects it.
+
+**A SOURCE, not a statement.** `Select` and `Aggregate` grew an optional
+`series` field, so ORDER BY / LIMIT / OFFSET / count / sum / min / max all work
+on generated rows unchanged. The alternative -- a `SelectSeries` statement --
+would have needed every one of those reimplemented.
+
+**Four places needed the source, not one**, and each was found by re-probing
+rather than by reading: the SELECT execution path, the AGGREGATE execution
+path, `describe_fields` for both, and the schema built inside `execute` for the
+aggregate. Three of the four surfaced as `relation "" does not exist` -- the
+empty table name leaking out -- which is a useful shape to recognise: it means
+a code path that still expects a table.
+
+**Two rules that read backwards:** counting up towards a smaller stop is EMPTY,
+not reversed (`generate_series(5,1)` gives nothing; counting down needs a
+negative step); and a zero step is `22023` (invalid_parameter_value), which
+PostgreSQL keeps distinct from the general `22000` data class.
+
+**A stale-binary near miss.** After adding the 22023 error I read `grep -c
+'^error'` as a count of *lines* and moved straight to measuring -- but it was
+2 compile errors, and the gauge ran against the PREVIOUS binary. The +23 it
+reported was fiction. **Check that the build succeeded before believing a
+measurement**, not merely that the command exited.
+
+**A WHERE over a series is REFUSED**, not ignored: the filter language is built
+against stored columns, and dropping a predicate silently would return rows the
+client asked to exclude.
+
+**Probe: 17 shapes, 0 divergences.**
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870.**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

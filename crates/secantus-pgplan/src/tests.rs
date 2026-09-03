@@ -1673,3 +1673,78 @@ fn malformed_multiranges_are_refused() {
         );
     }
 }
+
+/// `generate_series` counts by its step, which may be negative — and a range
+/// that runs the wrong way for its step is EMPTY rather than reversed.
+#[test]
+fn generate_series_counts_by_its_step() {
+    let vals = |start: i64, stop: i64, step: i64| {
+        crate::Series {
+            start,
+            stop,
+            step,
+            column: "generate_series".into(),
+        }
+        .values()
+    };
+    assert_eq!(vals(1, 5, 1), vec![1, 2, 3, 4, 5]);
+    assert_eq!(vals(1, 10, 3), vec![1, 4, 7, 10]);
+    assert_eq!(vals(5, 1, -2), vec![5, 3, 1]);
+    // Counting up towards a smaller stop produces nothing; it does not reverse.
+    assert_eq!(vals(5, 1, 1), Vec::<i64>::new());
+    assert_eq!(vals(1, 0, 1), Vec::<i64>::new());
+    assert_eq!(vals(3, 3, 1), vec![3]);
+    // A zero step never terminates, which is why PostgreSQL refuses it before
+    // it gets this far.
+    assert_eq!(vals(1, 5, 0), Vec::<i64>::new());
+}
+
+/// A zero step is `22023` — the argument is a number of the right shape whose
+/// VALUE cannot work, which PostgreSQL separates from its generic data class.
+#[test]
+fn generate_series_rejects_a_zero_step() {
+    let err = plan("SELECT * FROM generate_series(1,5,0)", &lookup).expect_err("zero step");
+    assert_eq!(err.sqlstate(), "22023");
+    assert_eq!(err.to_string(), "step size cannot equal zero");
+}
+
+/// The FROM item's alias renames the generated column, and a column alias
+/// beats the table one.
+#[test]
+fn a_series_alias_renames_its_column() {
+    let column = |sql: &str| match plan_ok(sql) {
+        Statement::Select(sel) => {
+            let series = sel.series.expect("a series");
+            (series.column, sel.columns)
+        }
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    let (col, out) = column("SELECT * FROM generate_series(1,3)");
+    assert_eq!(col, "generate_series");
+    assert_eq!(
+        out,
+        vec![("generate_series".to_string(), "generate_series".to_string())]
+    );
+
+    let (col, _) = column("SELECT * FROM generate_series(1,3) AS g");
+    assert_eq!(col, "g");
+
+    // `AS g(x)` — the COLUMN alias wins over the table alias.
+    let (col, _) = column("SELECT * FROM generate_series(1,3) AS g(x)");
+    assert_eq!(col, "x");
+}
+
+/// A WHERE clause over a generated source is REFUSED, not ignored.
+///
+/// The filter language here is built against stored columns; quietly dropping
+/// a predicate would answer with rows the client asked to exclude, which is
+/// worse than saying so.
+#[test]
+fn a_where_over_a_series_is_refused() {
+    let err = plan(
+        "SELECT * FROM generate_series(1,5) WHERE generate_series > 2",
+        &lookup,
+    )
+    .expect_err("where over a series");
+    assert_eq!(err.sqlstate(), "0A000");
+}

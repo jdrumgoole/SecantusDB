@@ -4452,10 +4452,11 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   LEFT JOIN, a subquery in FROM, and `array_agg`. `test_enum.py` (197) is the
   largest failing file and stays that way until all four exist. Do not re-scope
   it as a single batch.
-- **Rust PG server: `generate_series` and set-returning functions in FROM
-  (`RangeFunction`) block 150 of the cursor tests** on top of their own counts
-  (43 + 46 globally). Cursors themselves are implemented and match PostgreSQL
-  on 29 probed operations; these are what the cursor FILES are waiting on.
+- **Rust PG server: a WHERE clause over `generate_series` is refused (`0A000`),
+  and it is the only set-returning function.** The filter language is built
+  against stored columns; applying one to generated rows needs an in-memory
+  matcher. `unnest`, `generate_subscripts` and function calls in FROM other than
+  `generate_series` are also unsupported.
 - **Rust PG server: range and multirange OPERATORS are unsupported.** Both type
   families themselves (literals, constructors, casts, canonicalisation, merging,
   parameters in both wire formats) are in; `@>` / `<@` / `&&` / `-|-` and the

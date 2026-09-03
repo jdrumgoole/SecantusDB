@@ -707,21 +707,42 @@ impl PgHandler {
             }
 
             Statement::Select(sel) => {
-                let raw = self
-                    .storage
-                    .find_matching(&self.db, &sel.table, &sel.filter)
-                    .map_err(|e| Self::storage_err("could not read", e))?;
-                let def = self
-                    .lookup(&sel.table)
-                    .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?;
-
-                // Decode once: ORDER BY, OFFSET and LIMIT all need the values,
-                // and re-decoding per comparison would be quadratic.
-                let mut docs: Vec<Document> = raw
-                    .iter()
-                    .map(|b| bson::from_slice(b))
-                    .collect::<Result<_, _>>()
-                    .map_err(|e| Self::storage_err("could not decode a row", e))?;
+                // A generated source stands in for the table. Everything after
+                // this point -- ORDER BY, OFFSET, LIMIT, the encoder -- works
+                // on documents and does not care where they came from, which is
+                // why the series is a SOURCE rather than its own statement.
+                let (mut docs, def): (Vec<Document>, TableDef) = match &sel.series {
+                    Some(series) => {
+                        let column = series.column.clone();
+                        let docs = series
+                            .values()
+                            .into_iter()
+                            .map(|v| {
+                                let mut d = Document::new();
+                                d.insert(column.clone(), Bson::Int32(v as i32));
+                                d
+                            })
+                            .collect();
+                        (docs, series_table_def(series))
+                    }
+                    None => {
+                        let raw = self
+                            .storage
+                            .find_matching(&self.db, &sel.table, &sel.filter)
+                            .map_err(|e| Self::storage_err("could not read", e))?;
+                        let def = self.lookup(&sel.table).ok_or_else(|| {
+                            Self::err(&PlanError::UndefinedTable(sel.table.clone()))
+                        })?;
+                        // Decode once: ORDER BY, OFFSET and LIMIT all need the
+                        // values, and re-decoding per comparison is quadratic.
+                        let docs: Vec<Document> = raw
+                            .iter()
+                            .map(|b| bson::from_slice(b))
+                            .collect::<Result<_, _>>()
+                            .map_err(|e| Self::storage_err("could not decode a row", e))?;
+                        (docs, def)
+                    }
+                };
 
                 if !sel.order.is_empty() {
                     sort_rows(&mut docs, &sel.order);
@@ -1008,15 +1029,30 @@ impl PgHandler {
             }
 
             Statement::Aggregate(agg) => {
-                let raw = self
-                    .storage
-                    .find_matching(&self.db, &agg.table, &agg.filter)
-                    .map_err(|e| Self::storage_err("could not read", e))?;
-                let docs: Vec<Document> = raw
-                    .iter()
-                    .map(|b| bson::from_slice(b))
-                    .collect::<Result<_, _>>()
-                    .map_err(|e| Self::storage_err("could not decode a row", e))?;
+                // A generated source, as for a plain SELECT: the grouping and
+                // accumulation below work on documents and do not care where
+                // they came from.
+                let docs: Vec<Document> = match &agg.series {
+                    Some(series) => series
+                        .values()
+                        .into_iter()
+                        .map(|v| {
+                            let mut d = Document::new();
+                            d.insert(series.column.clone(), Bson::Int32(v as i32));
+                            d
+                        })
+                        .collect(),
+                    None => {
+                        let raw = self
+                            .storage
+                            .find_matching(&self.db, &agg.table, &agg.filter)
+                            .map_err(|e| Self::storage_err("could not read", e))?;
+                        raw.iter()
+                            .map(|b| bson::from_slice(b))
+                            .collect::<Result<_, _>>()
+                            .map_err(|e| Self::storage_err("could not decode a row", e))?
+                    }
+                };
 
                 // Group, preserving first-seen order so output is deterministic
                 // even with no ORDER BY.
@@ -1106,9 +1142,14 @@ impl PgHandler {
                     groups.truncate(max_rows);
                 }
 
-                let def = self
-                    .lookup(&agg.table)
-                    .ok_or_else(|| Self::err(&PlanError::UndefinedTable(agg.table.clone())))?;
+                // A generated source has no table to look up; its one column
+                // is an int4.
+                let def = match &agg.series {
+                    Some(series) => series_table_def(series),
+                    None => self
+                        .lookup(&agg.table)
+                        .ok_or_else(|| Self::err(&PlanError::UndefinedTable(agg.table.clone())))?,
+                };
                 let schema = Arc::new(
                     agg.select
                         .iter()
@@ -1699,6 +1740,19 @@ fn binary_range(
     secantus_pgplan::cast_text_to(&literal, type_name, tz).map_err(|e| PgHandler::err(&e))
 }
 
+/// A one-column table definition standing in for a generated series, so the
+/// row encoder and the describe path can treat it like any other source.
+fn series_table_def(series: &secantus_pgplan::Series) -> TableDef {
+    TableDef {
+        name: "generate_series".to_string(),
+        columns: vec![secantus_pgcatalog::Column::new(
+            &series.column,
+            "int4",
+            false,
+        )],
+    }
+}
+
 /// Decode one bound parameter into the value the planner will substitute.
 ///
 /// `None` is SQL NULL. A client may declare a parameter's type as oid 0
@@ -1960,6 +2014,20 @@ impl PgHandler {
                     None => Vec::new(),
                 }
             }
+            // A generated source describes its one column.
+            Statement::Select(sel) if sel.series.is_some() => sel
+                .columns
+                .iter()
+                .map(|(out, _)| {
+                    FieldInfo::new(
+                        out.clone(),
+                        None,
+                        None,
+                        wire_type("int4"),
+                        FieldFormat::Text,
+                    )
+                })
+                .collect::<Vec<_>>(),
             Statement::Select(sel) => {
                 let def = self
                     .lookup(&sel.table)
@@ -1975,6 +2043,19 @@ impl PgHandler {
                     })
                     .collect()
             }
+            // An aggregate over a generated source has no table to look up, and
+            // no GROUP BY columns -- only the aggregates themselves.
+            Statement::Aggregate(agg) if agg.series.is_some() => agg
+                .select
+                .iter()
+                .map(|(name, col)| {
+                    let ty = match col {
+                        OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
+                        OutputCol::Group(_) => Type::INT4,
+                    };
+                    FieldInfo::new(name.clone(), None, None, ty, FieldFormat::Text)
+                })
+                .collect(),
             Statement::Aggregate(agg) => {
                 let def = self
                     .lookup(&agg.table)
