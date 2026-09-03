@@ -1904,6 +1904,50 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+### 2026-09-03 SQL sweep twelve: LIMIT and row NULLs — what is still open
+
+LIMIT / OFFSET, row comparison, conditionals and transactions probed against
+PostgreSQL 14.13; `tests/test_sql_sweep_twelve.py` pins the fixes.
+**Transactions came back 40 of 40** — savepoints, the aborted-transaction
+state, isolation levels, READ ONLY and transactional DDL rollback all match, so
+that surface needs no work. What is open:
+
+- [ ] **`sum()` over an empty GROUP returns 0; Postgres returns NULL.**
+      `SELECT j.id, sum(k.v) FROM j LEFT JOIN k ON k.jid = j.id GROUP BY j.id`
+      answers 0 for a `j` row with no match, where PG answers NULL — a common
+      reporting query, and silently wrong. **Only `sum` is affected**: `count`
+      is correctly 0, and `avg` / `min` / `max` are correctly NULL, because
+      Mongo's `$sum` is the one accumulator that folds an empty set to zero
+      rather than null. The ungrouped `SELECT sum(n) ... WHERE false` is also
+      already correct.
+
+      The fix is not a one-liner: a Mongo `$group` accumulator is a single
+      operator, so distinguishing "summed nothing" from "summed to zero" needs a
+      COMPANION field (a non-null count) plus a projection that returns NULL
+      when it is zero — the shape `_register_numeric_stat` already uses, which
+      has to be wired at each of the ~6 accumulator registration sites. Worth
+      doing carefully rather than quickly: `sum` is the most-used aggregate on
+      the hot path.
+- [ ] **`NOT IN (<subquery with UNION>)` is `0A000 unsupported subquery`.**
+      `_inner_row_scopes` handles a single SELECT, not a set operation. Note the
+      NULL semantics matter here too: PG's `NOT IN` over a set containing NULL
+      is never true, so the correct answer for the probed case is no rows.
+- [ ] **`round()` inside an aggregate is still `0A000`** — deliberately. The
+      other common scalar functions now lower (`_AGG_FUNC_OPS`), but Mongo's
+      `$round` rounds half-to-EVEN where Postgres rounds half-away-from-zero, so
+      lowering it would make `sum(round(x))` over 1.5 and 2.5 answer 4 rather
+      than 5. It needs a rounding expression the aggregation engine does not
+      have, not a table entry.
+- [ ] **`avg()` over a FUNCTION-CALL argument loses the exact-numeric path.**
+      `avg(coalesce(n,0))` answers `11.666666666666666` where Postgres gives
+      `11.6666666666666667`: `_register_numeric_avg` accumulates N and sum(X)
+      for a bare column only, so a lowered expression falls back to the float
+      divide. The VALUES agree to 15 digits; only the last differs.
+- [ ] **`nullif(NULL, 1)` types as `text`**, not the second argument's type.
+      The VALUE is right (NULL); only the oid differs.
+- [ ] **`greatest()` / `least()` with no arguments** raise a sqlglot internal
+      message rather than Postgres' `42601 syntax error at or near ")"`.
+
 ### 2026-09-03 SQL sweep eleven: arrays and sequences — what is still open
 
 Arrays (20/29) and sequences / identity (23/26) probed against PostgreSQL

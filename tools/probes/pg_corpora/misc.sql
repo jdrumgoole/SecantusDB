@@ -1,0 +1,35 @@
+# --- CASE / conditional edges
+SELECT CASE WHEN n > 1 THEN 'big' WHEN n IS NULL THEN 'null' ELSE 'small' END FROM mi12 ORDER BY id
+SELECT CASE id WHEN 1 THEN 'one' ELSE 'other' END FROM mi12 ORDER BY id
+SELECT CASE WHEN false THEN 1 END
+SELECT pg_typeof(CASE WHEN true THEN 1 ELSE 2.5 END)
+SELECT pg_typeof(CASE WHEN true THEN 1 END)
+SELECT CASE WHEN true THEN NULL ELSE 1 END
+SELECT coalesce(NULL::int, NULL::int)
+SELECT nullif('a','a'), nullif(1,2), nullif(NULL,1)
+SELECT greatest(), least()
+# --- boolean edges
+SELECT true::int, false::int, 1::bool, 'yes'::bool, 'off'::bool
+SELECT true AND NULL IS NULL, (true AND NULL) IS NULL
+SELECT NOT true, NOT false, NOT NULL IS NULL
+SELECT b IS TRUE, b IS NOT TRUE, b IS FALSE, b IS NOT FALSE, b IS UNKNOWN FROM mi12 ORDER BY id
+SELECT bool_and(b), bool_or(b) FROM mi12
+# --- IS DISTINCT / row comparison
+SELECT (1,2) = (1,2), (1,2) < (1,3), (1,NULL) = (1,NULL)
+SELECT (1,2) IS NULL, (NULL,NULL) IS NULL, (1,NULL) IS NULL
+SELECT ROW(1,2) = ROW(1,2)
+SELECT (SELECT 1) IS NULL
+# --- LIMIT / OFFSET edges
+SELECT id FROM mi12 ORDER BY id LIMIT 0
+SELECT id FROM mi12 ORDER BY id LIMIT NULL
+SELECT id FROM mi12 ORDER BY id OFFSET 99
+SELECT id FROM mi12 ORDER BY id LIMIT ALL
+SELECT id FROM mi12 ORDER BY id FETCH FIRST ROW ONLY
+SELECT id FROM mi12 ORDER BY id OFFSET 1 ROW FETCH NEXT 1 ROW ONLY
+SELECT id FROM mi12 ORDER BY id LIMIT -1
+# --- DISTINCT / grouping edges
+SELECT DISTINCT n FROM mi12 ORDER BY n NULLS LAST
+SELECT count(DISTINCT s) FROM mi12
+SELECT s FROM mi12 GROUP BY s ORDER BY s NULLS LAST
+SELECT n IS NULL, count(*) FROM mi12 GROUP BY n IS NULL ORDER BY 1
+SELECT string_agg(coalesce(s,'-'), ',' ORDER BY id) FROM mi12

@@ -3034,12 +3034,48 @@ def _emit_pipeline_sort(
     pipeline.append({"$unset": list(companions)})
 
 
-def _limit_skip(stmt: exp.Expression) -> tuple[int, int]:
+def _limit_stages(limit: int) -> list[dict[str, Any]]:
+    """The pipeline stage(s) for a LIMIT.
+
+    Mongo's ``$limit`` REJECTS zero (``54000 the limit must be positive``), so a
+    genuine ``LIMIT 0`` -- which Postgres answers with no rows -- became an error
+    the moment the sentinel fix let a real 0 reach here. A ``$match`` on an
+    impossible predicate is the empty result the stage cannot express.
+    """
+    if limit == 0:
+        return [{"$match": {"$expr": {"$literal": False}}}]
+    return [{"$limit": limit}]
+
+
+def _limit_skip(stmt: exp.Expression) -> tuple[int | None, int]:
+    """``(limit, skip)``, where the limit is **None** when there is no LIMIT.
+
+    It used to be 0, which collides with a real ``LIMIT 0``: every consumer
+    tests the limit for truthiness, so ``LIMIT 0`` -- how a client asks for the
+    column metadata and no rows -- returned the WHOLE table. `None` is the only
+    value that cannot also be a row count.
+
+    ``LIMIT NULL`` and ``LIMIT ALL`` are Postgres' spellings of "no limit" and
+    map to None too; a negative limit is `2201W`.
+    """
     limit_node = stmt.args.get("limit")
     offset_node = stmt.args.get("offset")
-    limit = _const_int(_limit_count(limit_node)) if limit_node is not None else 0
+    limit = _limit_value(limit_node) if limit_node is not None else None
     skip = _const_int(_limit_count(offset_node)) if offset_node is not None else 0
     return limit, skip
+
+
+def _limit_value(node: exp.Expression) -> int | None:
+    """One LIMIT operand: a row count, or None for the no-limit spellings."""
+    count = _limit_count(node)
+    if count is None or isinstance(count, exp.Null):
+        return None  # `LIMIT NULL` / `LIMIT ALL` — no limit
+    if isinstance(count, exp.Var) and str(count.this).upper() == "ALL":
+        return None
+    value = _const_int(count)
+    if value < 0:
+        raise errors.SQLError("2201W", "LIMIT must not be negative")
+    return value
 
 
 def _limit_count(node: exp.Expression) -> exp.Expression:
@@ -3050,8 +3086,13 @@ def _limit_count(node: exp.Expression) -> exp.Expression:
     `expression`. Reading `expression` gave None, and the "unsupported" error
     built from it then raised `AttributeError` on `None.sql()`, so the query
     came back as `XX000` rather than either working or saying why."""
-    count = node.args.get("count") if isinstance(node, exp.Fetch) else None
-    return count if count is not None else node.expression
+    if isinstance(node, exp.Fetch):
+        # `FETCH FIRST ROW ONLY` — the count is OPTIONAL in the standard and
+        # defaults to one; without this the missing count read as "no limit" and
+        # the statement returned every row (and, before that, an XX000).
+        count = node.args.get("count")
+        return count if count is not None else exp.Literal.number(1)
+    return node.expression
 
 
 def _const_int(node: exp.Expression) -> int:
@@ -3361,6 +3402,12 @@ def plan_constant_select(
             identity = typemap.cast_type_identity(target.to)
             if identity is not None:
                 pg_oids[i], typmods[i] = identity
+    # A FROM-less SELECT still honours LIMIT / OFFSET: `SELECT 1 LIMIT 0` is no
+    # rows, and `OFFSET 1` skips the single synthesized one. `emit` already
+    # models "column shape, zero rows" for a false constant WHERE.
+    _limit, _skip = _limit_skip(stmt)
+    if _skip or _limit == 0:
+        emit = False
     return ConstantSelectPlan(columns=columns, emit=emit, pg_oids=pg_oids, typmods=typmods)
 
 
@@ -5645,11 +5692,73 @@ def _agg_arg_to_expr(node: exp.Expression, table: TableDef) -> Any:
         "pg_get_expr",
     ):
         return {"$literal": None}
+    lowered = _agg_func_to_expr(node, table)
+    if lowered is not None:
+        return lowered
     # Not only array_agg reaches here — sum / min / max / avg / bool_and lower
     # their expression arguments through this helper too, so naming array_agg
     # sent the reader to the wrong function ("unsupported array_agg argument"
     # for a `sum(CASE …)` call).
     raise errors.feature_not_supported(f"unsupported aggregate argument: {node.sql()}")
+
+
+#: SQL scalar functions with a direct Mongo aggregation-operator equivalent, for
+#: lowering an aggregate's ARGUMENT. Each entry is (node class, operator, arity)
+#: where arity `1` passes the single operand and `*` passes the operand list.
+#: Every operator here was checked against `secantus.expressions.evaluate` AND
+#: against PostgreSQL before being listed. `$round` is deliberately ABSENT: it
+#: rounds half-to-even where Postgres rounds half-away-from-zero, so
+#: `sum(round(x))` over 1.5 and 2.5 would answer 4 instead of 5 — a silent wrong
+#: answer in place of an honest "unsupported argument".
+_AGG_FUNC_OPS: dict[type, tuple[str, str]] = {
+    exp.Upper: ("$toUpper", "1"),
+    exp.Lower: ("$toLower", "1"),
+    exp.Abs: ("$abs", "1"),
+    exp.Floor: ("$floor", "1"),
+    exp.Ceil: ("$ceil", "1"),
+    exp.Sqrt: ("$sqrt", "1"),
+    exp.Length: ("$strLenCP", "1"),
+    exp.Coalesce: ("$ifNull", "*"),
+    exp.DPipe: ("$concat", "*"),
+}
+
+
+def _agg_func_to_expr(node: exp.Expression, table: Any) -> Any:
+    """Lower a scalar FUNCTION CALL inside an aggregate to a Mongo expression.
+
+    `sum(abs(n))`, `string_agg(coalesce(s, '-'), ',' ORDER BY id)` and
+    `array_agg(upper(s))` all answered `0A000 unsupported aggregate argument`:
+    the lowerer handled columns, literals, comparisons, CASE and arithmetic, but
+    no function calls at all. 14 of 16 probed shapes failed on it.
+
+    Only functions with a DIRECT operator equivalent are lowered — a partial
+    translation that changed the answer would be worse than the error.
+    """
+    op_arity = _AGG_FUNC_OPS.get(type(node))
+    if op_arity is None:
+        return None
+    op, arity = op_arity
+    if arity == "1":
+        operand = node.this
+        if operand is None:
+            return None
+        # Postgres' scalar functions are STRICT: a NULL input is a NULL result.
+        # Mongo's are not -- `$toUpper` maps null to the empty string and
+        # `$strLenCP` REJECTS it outright (which escaped as XX000) -- so each
+        # one needs the guard rather than the bare operator.
+        inner = _agg_arg_to_expr(operand, table)
+        return {"$cond": [{"$eq": [{"$ifNull": [inner, None]}, None]}, None, {op: inner}]}
+    parts = [node.this, *(node.expressions or [])]
+    if isinstance(node, exp.DPipe):
+        parts = [node.this, node.expression]
+    args = [_agg_arg_to_expr(p, table) for p in parts if p is not None]
+    if len(args) < 2:
+        return None
+    if isinstance(node, exp.DPipe):
+        # Postgres' `||` yields NULL when either side is NULL; Mongo's $concat
+        # does too, so the operands pass straight through.
+        return {op: args}
+    return {op: args}
 
 
 def select_needs_pipeline(stmt: exp.Select) -> bool:
@@ -5750,6 +5859,76 @@ def _join_source_alias(node: exp.Expression | None) -> str | None:
     if isinstance(node, exp.Table):
         return node.alias_or_name or None
     return None
+
+
+def desugar_natural_join(stmt: exp.Expression, catalog: Any, db: str | None) -> None:
+    """Rewrite ``NATURAL JOIN b`` into ``JOIN b USING (<common columns>)``.
+
+    sqlglot records NATURAL as ``args["method"]`` with no ``on`` and no
+    ``using``, and nothing in join planning read it — so a NATURAL JOIN lost its
+    condition entirely and became a CROSS JOIN, returning every pair. Exactly
+    the bug ``desugar_join_using`` below was written for, one step earlier in
+    the same chain: resolve the common column names here, and that function
+    turns them into the ON.
+
+    A NATURAL join with NO common column is a cross join in Postgres too, so the
+    empty case needs no special handling. Unresolvable relations are left alone
+    rather than guessed at — the planner reports them.
+    """
+    if catalog is None:
+        return
+    for select in stmt.find_all(exp.Select):
+        joins = select.args.get("joins") or []
+        if not any(str(j.args.get("method") or "").upper() == "NATURAL" for j in joins):
+            continue
+        prev_node = select.args.get("from_")
+        prev_node = prev_node.this if prev_node is not None else None
+        for jn in joins:
+            right_node = jn.this
+            if str(jn.args.get("method") or "").upper() == "NATURAL":
+                left_cols = _relation_column_names(prev_node, catalog, db)
+                right_cols = _relation_column_names(right_node, catalog, db)
+                if left_cols is not None and right_cols is not None:
+                    common = [c for c in left_cols if c in set(right_cols)]
+                    jn.set("using", [exp.to_identifier(c) for c in common])
+                    jn.set("method", None)
+            prev_node = right_node or prev_node
+
+
+def _relation_column_names(
+    node: exp.Expression | None, catalog: Any, db: str | None
+) -> list | None:
+    """A FROM item's column names in order, or None when they cannot be decided.
+
+    Handles a plain table (from the catalog) and a DERIVED table (from the
+    sub-SELECT's own projection, which is where ``NATURAL JOIN (SELECT jid AS
+    id, v FROM k)`` gets its ``id``). A ``SELECT *`` inside the subquery is not
+    resolved — returning None leaves the join alone rather than joining on a
+    guess.
+    """
+    if node is None:
+        return None
+    inner = node.this if isinstance(node, exp.Alias) else node
+    if isinstance(inner, exp.Subquery):
+        select = inner.this
+        if not isinstance(select, exp.Select):
+            return None
+        names: list[str] = []
+        for e in select.expressions:
+            if isinstance(e, exp.Star) or (isinstance(e, exp.Column) and e.is_star):
+                return None  # an unexpanded star — the shape is not decidable
+            name = e.alias_or_name
+            if not name:
+                return None
+            names.append(name)
+        return names
+    if not isinstance(inner, exp.Table):
+        return None
+    try:
+        tdef = catalog.get(db, qualified_table_name(inner))
+    except Exception:  # noqa: BLE001 -- unresolvable: leave the join alone
+        return None
+    return [c.name for c in tdef.columns] if tdef is not None else None
 
 
 def desugar_join_using(stmt: exp.Expression) -> None:
@@ -9159,8 +9338,8 @@ def _lateral_stage(
     limit, skip = _limit_skip(sub)
     if skip:
         sub_pipeline.append({"$skip": skip})
-    if limit:
-        sub_pipeline.append({"$limit": limit})
+    if limit is not None:
+        sub_pipeline.extend(_limit_stages(limit))
 
     project: dict[str, Any] = {"_id": 0}
     out_columns: list[tuple[str, str]] = []
@@ -13235,8 +13414,8 @@ def _append_join_tail(
     limit, skip = _limit_skip(stmt)
     if skip:
         pipeline.append({"$skip": skip})
-    if limit:
-        pipeline.append({"$limit": limit})
+    if limit is not None:
+        pipeline.extend(_limit_stages(limit))
     if hidden:
         pipeline.append({"$project": {**{n: 1 for n in out_names}, "_id": 0}})
 
@@ -13325,8 +13504,8 @@ def _append_sort_limit(
     limit, skip = _limit_skip(stmt)
     if skip:
         pipeline.append({"$skip": skip})
-    if limit:
-        pipeline.append({"$limit": limit})
+    if limit is not None:
+        pipeline.extend(_limit_stages(limit))
 
 
 def _selected_sqls(stmt: exp.Expression) -> set[str]:

@@ -244,9 +244,24 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     if isinstance(node, exp.Is):
         left = evaluate(node.this, scope, ctx)
         if isinstance(node.expression, exp.Null):
+            fields = _record_fields(left)
+            if fields is not None:
+                # `row IS NULL` is true only when EVERY field is NULL — the row
+                # itself is never the NULL, so testing the record object for
+                # None answered false for `(NULL, NULL)`.
+                return all(f is None for f in fields)
             return left is None
         return left == evaluate(node.expression, scope, ctx)
     if isinstance(node, exp.Not):
+        # `row IS NOT NULL` is NOT the negation of `row IS NULL`: it is true only
+        # when every field is NON-null, so a row with one NULL is false for BOTH.
+        # sqlglot gives `Not(Is(row, Null))`, so without this the negation made
+        # `(1, NULL) IS NOT NULL` true.
+        inner_node = node.this
+        if isinstance(inner_node, exp.Is) and isinstance(inner_node.expression, exp.Null):
+            fields = _record_fields(evaluate(inner_node.this, scope, ctx))
+            if fields is not None:
+                return all(f is not None for f in fields)
         # Three-valued logic: NOT NULL is NULL (a WHERE treats it as
         # not-matched), never TRUE.
         inner = evaluate(node.this, scope, ctx)
@@ -2846,6 +2861,9 @@ def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any
     # Postgres compares records field by field, left to right.
     lrec, rrec = _record_fields(left), _record_fields(right)
     if lrec is not None and rrec is not None:
+        row = _compare_rows(node, lrec, rrec)
+        if row is not _ROW_UNDECIDED:
+            return row
         left, right = lrec, rrec
     if isinstance(node, exp.EQ):
         return left == right
@@ -6215,6 +6233,35 @@ def _eval_between(node: exp.Between, outer: Scope, ctx: ScalarContext) -> Any:
 def _cmp_ge(a: Any, b: Any) -> bool:
     a, b = _unwrap_decimal(a), _unwrap_decimal(b)
     return a >= b
+
+
+#: `_compare_rows` returning this means "no NULL was involved — compare the
+#: field tuples as before".
+_ROW_UNDECIDED = object()
+
+
+def _compare_rows(node: exp.Expression, left: tuple, right: tuple) -> Any:
+    """Postgres' three-valued rule for comparing two ROWS.
+
+    Fields are compared left to right; the FIRST pair that decides the answer
+    wins, and a NULL pair reached before then makes the whole comparison NULL.
+    So `(1, NULL) = (1, NULL)` is NULL (nothing decided it), `(1, NULL) =
+    (2, 3)` is FALSE (the first pair decided it), and `(1, 2) < (1, NULL)` is
+    NULL. Comparing the field tuples directly answered TRUE for the first of
+    those, because Python's `==` treats two Nones as equal.
+    """
+    if len(left) != len(right):
+        return _ROW_UNDECIDED
+    equality = isinstance(node, (exp.EQ, exp.NEQ))
+    for a, b in zip(left, right, strict=True):
+        if a is None or b is None:
+            return None  # undecided by the fields before it, and now unknowable
+        if a == b:
+            continue
+        if equality:
+            return isinstance(node, exp.NEQ)
+        return _ROW_UNDECIDED  # an ordering decided here — let the tuple compare
+    return isinstance(node, exp.EQ) if equality else _ROW_UNDECIDED
 
 
 def _record_fields(value: Any) -> tuple | None:
