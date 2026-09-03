@@ -1396,3 +1396,126 @@ fn malformed_json_is_refused() {
         assert!(crate::json::parse(bad).is_err(), "{bad:?} should not parse");
     }
 }
+
+/// The scalar built-ins, every case measured against PostgreSQL 14.
+///
+/// Types are as much of the answer as values: `length` gives `int4`, `exp`
+/// gives `float8`, `abs` gives back what it was handed. And the two rounding
+/// families disagree — `round` on a `numeric` goes half AWAY FROM ZERO while on
+/// a `float8` it goes half TO EVEN, the same split the integer casts have.
+#[test]
+fn scalar_builtins_match_postgres() {
+    let calc = |sql: &str| match plan_ok(&format!("SELECT ({sql})::text")) {
+        Statement::SelectConstant(sc) => match &sc.columns[0].1 {
+            ConstCol::Value(Bson::String(s)) => s.clone(),
+            ConstCol::Value(Bson::Null) => "NULL".to_string(),
+            other => panic!("{sql} -> {other:?}"),
+        },
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    for (expr, want) in [
+        // strings
+        ("upper('aB')", "AB"),
+        ("lower('Ab')", "ab"),
+        ("initcap('ab cd')", "Ab Cd"),
+        ("btrim('xxaxx','x')", "a"),
+        ("substr('abcdef',2,3)", "bcd"),
+        ("replace('abcabc','b','X')", "aXcaXc"),
+        ("repeat('ab',3)", "ababab"),
+        ("reverse('abc')", "cba"),
+        // A negative count means "all but this many from the other end".
+        ("left('abcde',-2)", "abc"),
+        ("right('abcde',-2)", "cde"),
+        ("split_part('a,b,c',',',2)", "b"),
+        ("md5('a')", "0cc175b9c0f1b6a831c399e269772661"),
+        // `length` counts CHARACTERS and `octet_length` counts BYTES; they
+        // differ the moment the text stops being ASCII.
+        ("length('héllo')", "5"),
+        ("octet_length('héllo')", "6"),
+        ("chr(233)", "é"),
+        ("ascii('é')", "233"),
+        ("strpos('abcabc','c')", "3"),
+        ("strpos('abc','z')", "0"),
+        // `concat` SKIPS nulls rather than propagating them.
+        ("concat('a',null,'b')", "ab"),
+        ("concat_ws('-','a',null,'b')", "a-b"),
+        // numbers
+        ("abs(-5.5)", "5.5"),
+        ("sign(-3)", "-1"),
+        ("ceil(-1.2)", "-1"),
+        ("floor(-1.7)", "-2"),
+        ("trunc(-1.9)", "-1"),
+        ("round(1.234,2)", "1.23"),
+        ("trunc(1.999,2)", "1.99"),
+        ("div(7,3)", "2"),
+        ("mod(-7,3)", "-1"),
+        ("power(2,3)", "8"),
+        ("log(100)", "2"),
+        // numeric rounds half AWAY FROM ZERO...
+        ("round(1.5)", "2"),
+        ("round(2.5)", "3"),
+        ("round(-1.5)", "-2"),
+        // ...and float8 rounds half TO EVEN.
+        ("round(1.5::float8)", "2"),
+        ("round(2.5::float8)", "2"),
+        // conditionals: greatest/least IGNORE nulls, unlike everything else
+        ("greatest(1,2,3)", "3"),
+        ("least(3,2,1)", "1"),
+        ("greatest(1,null)", "1"),
+        ("greatest(null,null)", "NULL"),
+        ("coalesce(null,1)", "1"),
+        ("coalesce(null,null)", "NULL"),
+        ("nullif(1,1)", "NULL"),
+        ("nullif(1,2)", "1"),
+        // `div` is defined on numeric, so integer arguments coerce and the
+        // answer is a numeric — not the int8 the arithmetic suggests.
+        ("div(7,3)", "2"),
+        ("sign(-2.5)", "-1"),
+    ] {
+        assert_eq!(calc(expr), want, "for {expr}");
+    }
+}
+
+/// A built-in's RESULT TYPE is as much of the answer as its value.
+///
+/// `sign` answers `float8` even for an integer argument; `nullif` answers its
+/// LEFT operand's type even when the result is NULL — and a NULL cannot report
+/// a type, so reading it from the value gave `text` where PostgreSQL says
+/// `int4`. A literal carries its type in its own node.
+#[test]
+fn scalar_builtins_report_postgres_result_types() {
+    let ty = |sql: &str| match plan_ok(&format!("SELECT {sql}")) {
+        Statement::SelectConstant(sc) => sc.columns[0].2.clone(),
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    for (expr, want) in [
+        ("length('abc')", "int4"),
+        ("ascii('A')", "int4"),
+        ("upper('a')", "text"),
+        ("md5('a')", "text"),
+        ("exp(1)", "float8"),
+        ("sqrt(4)", "float8"),
+        ("sign(-3)", "float8"),
+        ("div(7,3)", "numeric"),
+        ("starts_with('abc','ab')", "bool"),
+        // NULL results still carry the type of what they came from.
+        ("nullif(1,1)", "int4"),
+        ("nullif(1.5,1.5)", "numeric"),
+        ("nullif('a','a')", "text"),
+    ] {
+        assert_eq!(ty(expr), want, "for {expr}");
+    }
+}
+
+/// A NULL argument gives a NULL answer for the propagating majority.
+#[test]
+fn scalar_builtins_propagate_null() {
+    for expr in ["upper(null)", "length(null)", "abs(null)", "round(null)"] {
+        match plan_ok(&format!("SELECT {expr}")) {
+            Statement::SelectConstant(sc) => {
+                assert_eq!(sc.columns[0].1, ConstCol::Value(Bson::Null), "for {expr}");
+            }
+            other => panic!("wrong statement for {expr}: {other:?}"),
+        }
+    }
+}

@@ -1235,3 +1235,57 @@ def test_malformed_json_is_refused(home: Path) -> None:
             with pytest.raises(psycopg.Error) as exc:
                 cur.execute("select %s::json", (bad,))
             assert exc.value.diag.sqlstate == "22P02", bad
+
+
+def test_scalar_builtins_are_available_bare(home: Path) -> None:
+    """A built-in must work without a cast around it.
+
+    The two routes to a value are not the same code: `select upper('a')::text`
+    goes through the expression evaluator, while a bare `select upper('a')`
+    goes through the target list. Only the first was wired up at first, and a
+    probe whose every case carried a `::text` could not see it — every one of
+    these passed while the bare form raised "function upper() is not supported".
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for expr, want in [
+            ("upper('aB')", "AB"),
+            ("length('héllo')", 5),
+            ("octet_length('héllo')", 6),
+            ("md5('a')", "0cc175b9c0f1b6a831c399e269772661"),
+            ("chr(233)", "é"),
+            ("ascii('é')", 233),
+            ("left('abcde',-2)", "abc"),
+            ("split_part('a,b,c',',',2)", "b"),
+            ("concat('a',null,'b')", "ab"),
+            ("greatest(1,null)", 1),
+            ("coalesce(null,1)", 1),
+            ("nullif(1,2)", 1),
+        ]:
+            cur.execute(f"select {expr}")
+            assert cur.fetchone()[0] == want, expr
+
+
+def test_scalar_builtins_report_their_result_type(home: Path) -> None:
+    """The result TYPE is as much of the answer as the value.
+
+    `sign` answers `float8` even for an integer argument, and `div` answers
+    `numeric` because that is the type it is defined on. `nullif` answers its
+    left operand's type even when the result is NULL — and a NULL cannot report
+    a type, so reading it from the value gave `text` where PostgreSQL gives
+    `int4`.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for expr, oid in [
+            ("length('abc')", 23),
+            ("exp(1)", 701),
+            ("sign(-3)", 701),
+            ("div(7,3)", 1700),
+            ("md5('a')", 25),
+            ("starts_with('abc','ab')", 16),
+            ("nullif(1,1)", 23),
+            ("nullif(1.5,1.5)", 1700),
+        ]:
+            cur.execute(f"select {expr}")
+            assert cur.description[0].type_code == oid, expr
