@@ -739,8 +739,14 @@ def _op_add(arg: Any, ctx: _Ctx) -> Any:
         if isinstance(offset, Decimal128):
             offset = float(offset.to_decimal())
         return dates[0] + _dt.timedelta(milliseconds=offset)
-    if len(values) == 1:
-        return values[0]
+    # NO single-value shortcut. mongod folds into a ZERO accumulator, and
+    # `+0 + -0` is `+0` in IEEE, so `{$add: [-0.0]}` is `0.0` and
+    # `{$add: [Decimal128("-0")]}` is `0` -- returning the lone operand
+    # unchanged handed back the negative zero. `$multiply` folds from ONE and
+    # therefore KEEPS the sign (`{$multiply: [-0.0]}` is `-0.0`); the asymmetry
+    # is mongod's and was measured, not derived (8.2.11, 2026-09-03). The fold
+    # preserves the numeric width for every other single operand -- int stays
+    # int, Int64 stays Int64 -- which was checked against the same probe.
     return _fold_numeric(values, mul=False)
 
 
@@ -1370,6 +1376,25 @@ def _decimal_is_infinite(v: Any) -> bool:
     return isinstance(v, Decimal128) and v.to_decimal().is_infinite()
 
 
+def _keep_signed_zero(result: float, original: float) -> float:
+    """IEEE keeps the SIGN when a rounding lands on zero: `ceil(-0.5)` is `-0.0`,
+    not `0.0`, and so is `trunc(-0.5)` and `floor(-0.0)`.
+
+    Python's `math.ceil` / `floor` / `trunc` return an **int**, which has no
+    signed zero, so `float(math.ceil(-0.5))` is `0.0` and the sign was gone by
+    the time it reached the client. mongod preserves it (probed 8.2.11,
+    2026-09-03, across -0.0 / -0.5 / -1.5 for all three operators).
+
+    Only the zero result needs this -- every other magnitude carries its own
+    sign. `$abs(-0.0)` is `0.0` on mongod and must NOT come through here.
+    """
+    import math
+
+    if result == 0.0 and math.copysign(1.0, original) < 0.0:
+        return -0.0
+    return result
+
+
 def _op_floor(arg: Any, ctx: _Ctx) -> Any:
     import math
 
@@ -1388,7 +1413,9 @@ def _op_floor(arg: Any, ctx: _Ctx) -> Any:
     # A non-finite DOUBLE passes through, as in `$ceil` below.
     if isinstance(v, float) and not math.isfinite(v):
         return v
-    return float(math.floor(v)) if isinstance(v, float) else _int_result(math.floor(v), v)
+    if isinstance(v, float):
+        return _keep_signed_zero(float(math.floor(v)), v)
+    return _int_result(math.floor(v), v)
 
 
 def _op_ceil(arg: Any, ctx: _Ctx) -> Any:
@@ -1408,7 +1435,9 @@ def _op_ceil(arg: Any, ctx: _Ctx) -> Any:
     if isinstance(v, float) and not math.isfinite(v):
         return v
     # Type-preserving, as `$floor` above.
-    return float(math.ceil(v)) if isinstance(v, float) else _int_result(math.ceil(v), v)
+    if isinstance(v, float):
+        return _keep_signed_zero(float(math.ceil(v)), v)
+    return _int_result(math.ceil(v), v)
 
 
 def _op_sqrt(arg: Any, ctx: _Ctx) -> Any:
@@ -1900,7 +1929,9 @@ def _op_trunc(arg: Any, ctx: _Ctx) -> Any:
     # Type-preserving, as `$floor` / `$ceil`: dividing by `factor` made every
     # int result a double (`$trunc` of 1 answered 1.0). Probed 8.2.11.
     truncated = math.trunc(n * factor) / factor
-    return _int_result(int(truncated), n) if isinstance(n, int) else truncated
+    if isinstance(n, int):
+        return _int_result(int(truncated), n)
+    return _keep_signed_zero(truncated, n)
 
 
 def _op_merge_objects(arg: Any, ctx: _Ctx) -> Any:
@@ -2709,40 +2740,23 @@ def _op_ts_increment(arg: Any, ctx: _Ctx) -> Any:
 
 
 def _type_name(v: Any) -> str:
-    """The BSON type string mongod's ``$type`` reports."""
-    from bson import Binary, MaxKey, MinKey, ObjectId, Regex, Timestamp
+    """The BSON type string mongod's ``$type`` reports.
 
-    if v is None:
-        return "null"
-    if isinstance(v, bool):
-        return "bool"
-    if isinstance(v, Int64):
-        return "long"
-    if isinstance(v, int):
-        return "int" if -(2**31) <= v < 2**31 else "long"
-    if isinstance(v, float):
-        return "double"
-    if isinstance(v, Decimal128):
-        return "decimal"
-    if isinstance(v, str):
-        return "string"
-    if isinstance(v, (bytes, Binary)):
-        return "binData"
-    if isinstance(v, ObjectId):
-        return "objectId"
-    if isinstance(v, _dt.datetime):
-        return "date"
-    if isinstance(v, Timestamp):
-        return "timestamp"
-    if isinstance(v, Regex):
-        return "regex"
-    if isinstance(v, MinKey):
-        return "minKey"
-    if isinstance(v, MaxKey):
-        return "maxKey"
-    if isinstance(v, list):
-        return "array"
-    return "object"
+    Delegates to `bsontypes.bson_type_name`, which is the ONE place that names a
+    BSON type. This used to be a fourth partial copy of that vocabulary -- the
+    exact drift `bsontypes` was created to end -- and it had the two bugs a
+    hand-rolled copy gets: it tested ``isinstance(v, str)`` with no ``Code``
+    case, so ``$type`` of a JavaScript value answered ``"string"``, and it had
+    no ``re.Pattern`` case, so a compiled pattern answered ``"object"``.
+
+    The error-message surface and ``$type`` were probed independently against
+    mongod 8.2.11 (2026-09-03) across 21 value classes and name every type
+    identically, ``javascriptWithScope`` included -- so one vocabulary is
+    correct here, not a coincidence worth re-deriving.
+    """
+    from secantus.bsontypes import bson_type_name
+
+    return bson_type_name(v)
 
 
 _TYPE_MISSING = object()
@@ -5214,8 +5228,12 @@ def _op_expr_avg(arg: Any, ctx: _Ctx) -> Any:
     # raised a TypeError against a `Decimal128`, which surfaced as an
     # `internal server error`.
     if _has_decimal(*values):
+        # Start the sum at ZERO, not at the first element: mongod's accumulator
+        # begins at +0, so a lone `Decimal128("-0")` averages to `0` and not
+        # `-0` (probed 8.2.11, 2026-09-03). The float branch below already
+        # started at 0, which is why only the decimal path diverged.
         return _decimal_result(
-            lambda *ds: sum(ds[1:], ds[0]) / _decimal.Decimal(len(values)), *values
+            lambda *ds: sum(ds, _decimal.Decimal(0)) / _decimal.Decimal(len(values)), *values
         )
     total: Any = 0
     for x in values:

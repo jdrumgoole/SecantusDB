@@ -1091,13 +1091,20 @@ fn arith_nary(arg: &Bson, ctx: &Ctx, mul: bool) -> R {
             return Err(fault);
         }
     }
-    if !mul && vals.len() == 1 {
-        // Python returns a single NUMERIC value unchanged; any other
-        // single-arg type now raises there ($add type-checks even one
-        // operand) -> defer.
-        if as_float_like(&vals[0]).is_some() {
-            return Ok(vals[0].clone());
-        }
+    if !mul && vals.len() == 1 && as_float_like(&vals[0]).is_none() {
+        // A single non-numeric operand (a date) is not something `fold_arith`
+        // handles -> defer, as before.
+        //
+        // A single NUMERIC operand deliberately falls THROUGH to the fold now.
+        // This used to return the operand unchanged, justified by "Python
+        // returns a single NUMERIC value unchanged" -- a comment citing the
+        // other engine rather than the server, and both engines were wrong
+        // together, which is why the parity suite was happy. mongod folds into
+        // a ZERO accumulator, and `+0 + -0` is `+0`, so `{$add: [-0.0]}` is
+        // `0.0` and the shortcut handed back `-0.0`. `$multiply` folds from ONE
+        // and so KEEPS the sign; the asymmetry is real (probed 8.2.11,
+        // 2026-09-03). `fold_arith` starts at 0 / 1 already and preserves the
+        // numeric width, so the fold is the whole fix.
         return Err(Fallback::Defer);
     }
     fold_arith(&vals, mul)
