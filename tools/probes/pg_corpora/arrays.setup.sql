@@ -1,0 +1,4 @@
+DROP TABLE IF EXISTS a11
+CREATE TABLE a11 (id int PRIMARY KEY, ia int[], ta text[], m int[][])
+INSERT INTO a11 VALUES (1, ARRAY[1,2,3], ARRAY['a','b'], ARRAY[[1,2],[3,4]])
+INSERT INTO a11 VALUES (2, ARRAY[]::int[], NULL, NULL)

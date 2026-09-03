@@ -1904,6 +1904,39 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+### 2026-09-03 SQL sweep eleven: arrays and sequences — what is still open
+
+Arrays (20/29) and sequences / identity (23/26) probed against PostgreSQL
+14.13; `tests/test_sql_sweep_eleven.py` pins the fixes. **Sequences need little
+work** — nextval / currval / setval (both arities), SERIAL and BIGSERIAL,
+ALTER SEQUENCE RESTART / INCREMENT, DROP, and GENERATED ALWAYS / BY DEFAULT AS
+IDENTITY all match. What is open:
+
+- [ ] **`UPDATE t SET arr[i] = v` is `0A000 expected a column`.** Array element
+      assignment, including the extend-with-NULLs case (`arr[5] = 5` on a
+      3-element array pads index 4 with NULL). sqlglot gives
+      `EQ(Bracket(Column, [Literal]), value)` and converts the subscript to
+      0-based; the SET planner has a `_composite_subfield_target` hook for
+      `SET col.field = v` that this would sit beside, but it needs a new
+      computed-assignment kind rather than a rewrite.
+- [ ] **A multidimensional SLICE is wrong.** `m[1:2][1:1]` over
+      `ARRAY[[1,2],[3,4]]` answers `{{1,2}}` where Postgres gives `{{1},{3}}` —
+      the second subscript is applied to the wrong dimension.
+- [ ] **`unnest(a, b)` (multiple arrays) yields only the first column.**
+      Postgres zips them into one row per position.
+- [ ] **`ARRAY(SELECT col FROM real_table)` types as `text[]`.** The VALUES-
+      sourced form is fixed, and so is the scalar-subquery form over a table;
+      this one loses it because the FROM-less `SELECT ARRAY(...)` runs through
+      `plan_constant_select`, which does not publish the catalog on
+      `_pipeline_subctx`. The VALUES are correct — only the oid is wrong.
+- [ ] **`ta || 'c'` (text[] || unknown) is accepted**; Postgres raises
+      `22P02 malformed array literal: "c"` because the unknown literal is
+      resolved as an ARRAY, not an element.
+- [ ] **`INSERT ... OVERRIDING SYSTEM VALUE` does not parse** (`42601`), so a
+      `GENERATED ALWAYS AS IDENTITY` column cannot be written explicitly.
+- [ ] **`pg_get_serial_sequence` on an unknown relation answers NULL**;
+      Postgres raises `42P01`.
+
 ### 2026-09-03 SQL sweep ten: DDL and catalog — what is still open
 
 DDL (38/41) and catalog introspection (15/22) probed against PostgreSQL 14.13;
