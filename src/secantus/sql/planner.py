@@ -1772,6 +1772,7 @@ def _where_filter(
     # by `plan_pipeline_select` so WHERE subqueries work there too.
     ctx = subctx or _pipeline_subctx.get()
     _strip_bpchar_literals(where.this, table)
+    _pad_bpchar_match_operands(where.this, table)
     rewritten = _rewrite_enum_comparisons(where.this, table, ctx)
     return _expr_to_filter(rewritten, table_resolver(table), ctx)
 
@@ -1811,6 +1812,85 @@ def _strip_bpchar_literals(stmt: exp.Expression, table: TableDef) -> None:
             trim(left)
 
 
+def _pad_bpchar_match_operands(stmt: exp.Expression, table: TableDef) -> None:
+    """Pad a ``char(n)`` column feeding a pattern match to its declared width.
+
+    Unlike ``=``, Postgres' ``LIKE`` / ``ILIKE`` / ``SIMILAR TO`` / ``~`` are
+    NOT blank-insensitive: they match against the type's OUTPUT, which for
+    ``bpchar`` is blank-padded. A ``char(5)`` holding ``'ab'`` therefore does
+    NOT match ``LIKE 'ab'`` — Postgres compares ``'ab   '``. We store the value
+    unpadded (``typemap.blank_pad`` pads on the way out), so the match ran
+    against ``'ab'`` and RETURNED A ROW POSTGRES EXCLUDES — a wrong answer, not
+    a rendering nit.
+
+    The pattern cannot be adjusted instead: ``'ab   ' LIKE 'ab%'`` is true and
+    ``LIKE 'ab_'`` is false, so no rewrite of the pattern reproduces the rule
+    for every shape. Padding the value is the only general form. Probed against
+    PostgreSQL 14.13."""
+
+    def padded(node: exp.Expression) -> exp.Expression | None:
+        """`rpad(col, n)` when `node` is a char(n) column, else None."""
+        if not isinstance(node, exp.Column):
+            return None
+        col = table.column(_column_name(node))
+        if col is None or col.decl_oid != typemap.BPCHAR_OID or col.typmod <= 4:
+            return None
+        return exp.func("rpad", node.copy(), exp.Literal.number(col.typmod - 4))
+
+    for node in stmt.find_all(exp.Like, exp.ILike, exp.SimilarTo, exp.RegexpLike):
+        pad = padded(node.this)
+        if pad is not None:
+            node.set("this", pad)
+    # The same padded form reaches any function that consumes the value through
+    # the TYPE'S OUTPUT FUNCTION rather than as `text` — measured against
+    # PostgreSQL 14.13, not assumed: `octet_length`/`concat`/`concat_ws`/
+    # `format`/`to_json`/`to_jsonb` see `'ab   '` while `length`/`upper`/`md5`/
+    # `left`/`position` see `'ab'`, because a bpchar->text conversion strips.
+    # So this list is deliberately NOT "every string function".
+    for fnode in stmt.find_all(exp.Func):
+        if _output_form_func_name(fnode) is None:
+            continue
+        for i, arg in enumerate(list(fnode.expressions or [])):
+            pad = padded(arg)
+            if pad is not None:
+                fnode.expressions[i] = pad
+        pad_this = padded(fnode.this) if not isinstance(fnode.this, str) else None
+        if pad_this is not None:
+            fnode.set("this", pad_this)
+    # `c::bytea` encodes the padded bytes too (`\x6162202020`, not `\x6162`).
+    for cast in stmt.find_all(exp.Cast):
+        if typemap.type_tag_for_sql(cast.to) != "bytea":
+            continue
+        pad = padded(cast.this)
+        if pad is not None:
+            cast.set("this", pad)
+
+
+#: Functions that receive a ``bpchar`` through its OUTPUT function (blank-padded)
+#: rather than as ``text`` (blank-stripped). Measured, not inferred — see
+#: `_pad_bpchar_match_operands`.
+#: ``array_agg`` belongs here by BEHAVIOUR — Postgres aggregates the padded
+#: form — but is deliberately excluded: the aggregate planner takes a column,
+#: not an expression, so wrapping it raised `0A000 unsupported aggregate
+#: argument: RPAD(c, 5)`. Refusing the query is worse than the unpadded value,
+#: so it keeps the old answer. Recorded in `tasks/backlog.md`.
+_BPCHAR_OUTPUT_FORM_FUNCS = frozenset(
+    {"octet_length", "concat", "concat_ws", "format", "to_json", "to_jsonb"}
+)
+
+
+def _output_form_func_name(node: exp.Func) -> str | None:
+    """The lowercased name of `node` when it is one of the output-form
+    functions, else None. Covers both the typed node classes sqlglot gives
+    some of these (`exp.Concat`, `exp.ArrayAgg`) and the `exp.Anonymous`
+    fallback the rest parse as."""
+    name = node.this if isinstance(node.this, str) else None
+    for candidate in (name, getattr(node, "sql_name", lambda: None)(), type(node).__name__):
+        if candidate and str(candidate).lower() in _BPCHAR_OUTPUT_FORM_FUNCS:
+            return str(candidate).lower()
+    return None
+
+
 def stamp_enum_comparisons(
     stmt: exp.Expression, table: TableDef, subctx: SubqueryCtx | None = None
 ) -> None:
@@ -1823,6 +1903,7 @@ def stamp_enum_comparisons(
     this `SELECT m > 'ok'` answered by SPELLING while `WHERE m > 'ok'` did
     not, which is a worse state than either being wrong on its own."""
     _strip_bpchar_literals(stmt, table)
+    _pad_bpchar_match_operands(stmt, table)
     for cmp_node in stmt.find_all(*_CMP_OPS):
         for side in (cmp_node.this, cmp_node.expression):
             if not isinstance(side, exp.Column):
