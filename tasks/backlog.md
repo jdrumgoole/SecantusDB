@@ -1922,12 +1922,18 @@ that surface needs no work. What is open:
       already correct.
 
       The fix is not a one-liner: a Mongo `$group` accumulator is a single
-      operator, so distinguishing "summed nothing" from "summed to zero" needs a
-      COMPANION field (a non-null count) plus a projection that returns NULL
-      when it is zero — the shape `_register_numeric_stat` already uses, which
-      has to be wired at each of the ~6 accumulator registration sites. Worth
-      doing carefully rather than quickly: `sum` is the most-used aggregate on
-      the hot path.
+      operator, and NONE of them sums-or-nulls, so distinguishing "summed
+      nothing" from "summed to zero" needs a COMPANION field (a non-null count)
+      plus a projection that returns NULL when it is zero — the shape
+      `_register_numeric_stat` already uses.
+
+      **Counted, not estimated (2026-09-03): that is 16 registration sites** —
+      4 calling `_accumulator_for` directly, 5 through `_accumulator`, 5 through
+      `_join_accumulator`, and 2 HAVING-dedup paths that need no companion. So
+      this is a REFACTOR of the accumulator-registration duplication (making
+      `_accumulator_for` return an optional companion spec that one shared
+      helper consumes), not a patch — and it is on the hottest aggregate path.
+      Sized here so the next session does not rediscover the cost mid-change.
 - [ ] **`NOT IN (<subquery with UNION>)` is `0A000 unsupported subquery`.**
       `_inner_row_scopes` handles a single SELECT, not a set operation. Note the
       NULL semantics matter here too: PG's `NOT IN` over a set containing NULL
@@ -12401,3 +12407,58 @@ distinct problems, triaged from the run logs:
   `pytestmark` list, and `tests/test_meta_pytestmark.py` walks every test
   module's AST rejecting double assignment so the overwrite pattern can't
   recur anywhere.
+
+## `character(n)` blank padding (2026-09-03) — mostly FIXED, three gaps left
+
+`char(n)` stores unpadded and pads on the way out (`typemap.blank_pad`); a
+bpchar-to-text conversion strips trailing blanks, so almost every expression
+sees the stripped form. The cast path had been padding eagerly INTO the value,
+which made `::char(n)` disagree with a `char(n)` COLUMN on everything
+downstream. Fixed, with pinning tests in `tests/test_sql_sweep_thirteen.py`:
+
+- the cast truncates and no longer pads (the wire pads);
+- a non-string source is rendered to text and then truncated (`123::char(2)`
+  was `'123'`);
+- `LIKE` / `ILIKE` / `SIMILAR TO` / `~` pad the column, because they match the
+  padded output and were **returning rows PostgreSQL excludes**, in the WHERE
+  pushdown as well as the select list;
+- `octet_length` / `concat` / `concat_ws` / `format` / `to_json` / `to_jsonb`
+  and `::bytea` pad, because they take the value through the type's output
+  function rather than as text. That list is MEASURED against PostgreSQL
+  14.13 — `length` is deliberately outside it while `octet_length` is inside,
+  so do not "complete" it by adding string functions on the assumption that
+  they behave alike.
+
+Three gaps remain, all recorded rather than guessed:
+
+1. **`array_agg(c)` aggregates the unpadded value** (PostgreSQL gives
+   `{"ab   "}`, and types the result `bpchar[]`/1014 where we say `text[]`/
+   1009). It belongs in the output-form set by behaviour, but the aggregate
+   planner takes a COLUMN, not an expression — wrapping it raised `0A000
+   unsupported aggregate argument: RPAD(c, 5)`. Refusing the query is worse
+   than the unpadded value, so it deliberately keeps the old answer. Fixing it
+   means teaching the aggregate path to accept an expression argument.
+2. **The CAST form of the output-form functions is still unpadded** —
+   `octet_length('a'::char(3))` is 1 where PostgreSQL says 3, and likewise
+   `concat('a'::char(3), '|')` and `to_json('a'::char(3))`. The padding rewrite
+   is plan-time and keyed on the CATALOG (`col.decl_oid == BPCHAR_OID`), so a
+   cast expression, which has no catalog column behind it, is invisible to it.
+   The column form — the one that occurs in real queries — is correct.
+3. **A `char(n)` COLUMN inside a record constructor loses its padding** —
+   `SELECT (t, c)::text` gives `(ab,ab)` where PostgreSQL gives
+   `(ab,"ab   ")`. The record path pads a `char(n)` CAST field
+   (`_blank_pad_record_field`), which is all it can see: the scalar layer has
+   no catalog, so a column's declared width is not available there.
+4. **`'a'::char(3) = 'a  '` answers false**, where PostgreSQL says true.
+   `_strip_bpchar_literals` makes the comparison blank-insensitive by trimming
+   the literal, but it too only recognises a bpchar COLUMN, not a cast.
+
+Also unrelated but found by the same sweep: **`record::text` renders the record
+as JSON** — `SELECT ('a'::text, 'd'::char(2))::text` gives
+`{"f1": "a", "f2": "d "}` where PostgreSQL gives `(a,"d ")`. The record's own
+text renderer is right (`typemap.to_pg_text(val, "composite")` produces the
+PostgreSQL form, and `tests/test_sql_composite_type.py` pins it); it is the
+`::text` CAST that does not route to it. **`to_json` reports oid 3802
+(`jsonb`) where PostgreSQL reports 114 (`json`)**, and **`row_to_json(x)` over
+a derived table alias fails with `42703: column "x" does not exist`** — the
+alias of a sub-SELECT is not resolvable as a whole-row reference.

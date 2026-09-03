@@ -274,9 +274,14 @@ def test_length_qualified_char_casts_truncate_and_pad():
 
         # varchar(n) truncates the value; identity is varchar (1043), typmod n+4.
         assert one("SELECT 'bar'::VARCHAR(2)") == ("ba", 1043, 6)
-        # char(n) truncates AND blank-pads to n.
+        # char(n) truncates. It does NOT pad the VALUE: the padding is applied
+        # on the way out, from the bpchar oid + typmod carried here (see
+        # `typemap.blank_pad`), which is the model the column path already
+        # used. `run_sql` is the embedded API and returns the internal value,
+        # so it is the unpadded one; `tests/test_sql_sweep_thirteen.py` pins
+        # the padded form a client actually receives over the wire.
         assert one("SELECT 'bar'::CHAR(2)") == ("ba", 1042, 6)
-        assert one("SELECT 'a'::CHAR(4)") == ("a   ", 1042, 8)
+        assert one("SELECT 'a'::CHAR(4)") == ("a", 1042, 8)
         # Bare text/varchar impose no limit.
         assert one("SELECT 'foobar'::TEXT") == ("foobar", 25, -1)
         assert one("SELECT 'foobar'::VARCHAR") == ("foobar", 1043, -1)

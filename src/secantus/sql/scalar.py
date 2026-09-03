@@ -410,7 +410,7 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         # an anonymous record constructor — the same shape as ``ROW(a, b, …)``,
         # keeping each field's SQL type oid (from the argument AST) for the
         # binary record encoding.
-        vals = [evaluate(e, scope, ctx) for e in node.expressions]
+        vals = [_blank_pad_record_field(e, evaluate(e, scope, ctx)) for e in node.expressions]
         rec = typemap.RecordValue((f"f{i + 1}", v) for i, v in enumerate(vals))
         rec.field_oids = tuple(_row_field_oid(e) for e in node.expressions)
         return rec
@@ -3370,6 +3370,16 @@ def _eval_cast(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
         to_tag = typemap.type_tag_for_sql(node.to) if node.to is not None else None
         if to_tag in ("int2", "int4", "int8"):
             typemap.check_int_range(out, to_tag)
+    # Length-qualified character targets truncate whatever the body produced.
+    # Here for the same reason as the range check above: a `char(n)` target's
+    # type TAG is plain `text`, so a non-string value (`123::char(2)`) is
+    # rendered by one of the several `to_tag == "text"` branches, each of which
+    # returns before the body's own char-length block — `123::char(2)` was
+    # `'123'` where Postgres gives `'12'`.
+    if isinstance(out, str) and node.to is not None:
+        char_len = _char_cast_length(node.to)
+        if char_len is not None:
+            out = out[: char_len[0]]
     return out
 
 
@@ -3900,17 +3910,18 @@ def _eval_cast_impl(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
 
         n = _bitstr.to_int(str(value))
         return float(n) if to_tag in ("float4", "float8") else n
-    # Length-qualified character casts: ``varchar(n)`` / crdb ``STRING(n)``
-    # truncate to n characters; ``char(n)`` / ``bpchar(n)`` also right-pad with
-    # spaces. Bare ``text`` / ``varchar`` impose no limit (helper returns None).
+    # Length-qualified character casts truncate to n characters. ``char(n)``
+    # does NOT blank-pad here: padding is applied on the way OUT
+    # (``typemap.blank_pad``, keyed on the described bpchar oid + typmod),
+    # which is the model the COLUMN path already used. Padding eagerly in the
+    # value made the cast path disagree with the column path on everything
+    # downstream, because Postgres strips trailing blanks on EVERY conversion
+    # of bpchar to text: `'a'::char(3) || '|'` is `'a|'`, not `'a  |'`, and
+    # `length('a'::char(3))` is 1, not 3.
     if isinstance(value, str):
         char_len = _char_cast_length(node.to)
         if char_len is not None:
-            length, blank_padded = char_len
-            out = value[:length]
-            if blank_padded and len(out) < length:
-                out = out.ljust(length)
-            return out
+            return value[: char_len[0]]
     # Concrete scalar targets convert the value (``'1'::int`` -> 1).
     if value is not None and to_tag in (
         "int2",
@@ -4097,6 +4108,33 @@ def _char_cast_length(datatype: exp.DataType | None) -> tuple[int, bool] | None:
     return None
 
 
+def _blank_pad_record_field(expr: exp.Expression, value: Any) -> Any:
+    """Blank-pad a ``char(n)`` field of a record constructor.
+
+    A composite renders each field through that field's type OUTPUT function,
+    which for ``bpchar`` is padded — ``('a'::text, 'd'::char(2))`` renders as
+    ``(a,"d ")``, not ``(a,d)``. Everywhere else a ``char(n)`` cast leaves the
+    value unpadded (the wire pads it on the way out), so the padding has to be
+    put back HERE, where the value is about to become a field rather than a
+    scalar. Probed against PostgreSQL 14.13.
+
+    Only the CAST form is recognised; a ``char(n)`` COLUMN inside a record
+    needs the catalog, which this layer does not have (recorded in
+    `tasks/backlog.md`)."""
+    if not isinstance(value, str):
+        return value
+    inner = expr
+    while isinstance(inner, exp.Paren):
+        inner = inner.this
+    if not isinstance(inner, exp.Cast) or inner.to is None:
+        return value
+    char_len = _char_cast_length(inner.to)
+    if char_len is None:
+        return value
+    length, blank_padded = char_len
+    return value.ljust(length) if blank_padded and len(value) < length else value
+
+
 def _func_name(node: exp.Anonymous) -> str:
     name = node.this if isinstance(node.this, str) else node.name
     return str(name).rsplit(".", 1)[-1].lower()
@@ -4134,7 +4172,10 @@ def _eval_func_impl(node: exp.Anonymous, scope: Scope, ctx: ScalarContext) -> An
         # PG types an untyped literal as unknown (705), an explicit ``::text``
         # as 25, ``::bytea`` as 17, and so on. Reconstructing oids from Python
         # values can't make those distinctions.
-        rec = typemap.RecordValue((f"f{i + 1}", v) for i, v in enumerate(args))
+        padded = [
+            _blank_pad_record_field(a, v) for a, v in zip(node.expressions, args, strict=False)
+        ]
+        rec = typemap.RecordValue((f"f{i + 1}", v) for i, v in enumerate(padded))
         rec.field_oids = tuple(_row_field_oid(a) for a in node.expressions)
         return rec
     result = _call_func(name, args, ctx)
