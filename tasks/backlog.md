@@ -4465,7 +4465,7 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   precision and overflow behaviour all differ per operator, so this is 19
   individually-probed operators rather than one change).
 
-  **The per-operator campaign RAN: 908 -> 32 (2026-09-02, second pass 09-03).** The Rust server's
+  **The per-operator campaign RAN: 908 -> 22 (2026-09-02, further passes 09-03).** The Rust server's
   `agg_expressions` column went from 902 code + 6 message divergences to **117
   code + 0 message**, and the Python server's from 50 + 212 to **28 + 80**.
   Zero wrong VALUES throughout, before and after. What closed it was giving each
@@ -4486,8 +4486,41 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
   | shapes | area |
   | --- | --- |
-  | 29 | Decimal128 arithmetic and the transcendentals -- the half deliberately left to the decimal engine (the item above). One shape per operator; mongod answers a Decimal128 at 34 digits and this engine has no decimal transcendentals |
+  | 19 | Decimal128 TRANSCENDENTALS and division -- see the decision below |
   | 3 | `$toDate` of an UNPARSEABLE string. mongod reports its timelib diagnostic (`Error parsing date string 'abc'; 0: passing a time zone identifier as part of the string is not allowed 'a'`); the parse SUCCESS path ships, and a failure defers rather than inventing a message it would not send |
+
+  **Third pass: 32 -> 22 (2026-09-03).** Decimal128 `$add` / `$subtract` /
+  `$multiply` and the whole rounding family (`$ceil` / `$floor` / `$trunc` /
+  `$round`, with the place argument) now answer on the Rust server. This needed
+  NO new numerics: `decimal.rs` already had `add`, `mul` and `div_int` -- the
+  primitives `$sum` / `$avg` accumulate with -- and they had simply never been
+  wired into the EXPRESSION path. The entry above sized this as "a dependency
+  decision", which is the fifth time an estimate from reading has been wrong in
+  the expensive direction. `decimal::round_to_exp` is the one genuinely new
+  piece. See `changelog.d/rust-decimal-arithmetic-rounding.md` and
+  `tests/test_decimal128_arithmetic_rounding.py`.
+
+  **DECIDED, not scheduled: the Decimal128 transcendentals are NOT ported.**
+  Not for want of an implementation -- the Python engine computes them at 60
+  digits with hand-rolled Taylor series. It still disagrees with mongod in the
+  LAST DIGIT on 5 shapes, and a prior session verified at 80 digits that **our
+  value is the correctly-rounded one and mongod's is 1-2 ulp low**: mongod uses
+  Intel's decimal library, so matching means reproducing that library's
+  rounding rather than computing the right answer.
+
+  The operations that DID land are the ones IEEE 754-2008 defines as
+  *correctly rounded* -- add, subtract, multiply and the rounding family have
+  one right answer, which is exactly why they match exactly. Porting series to
+  Rust would trade 16 LOUD "operator not supported" errors for silent
+  last-digit-wrong values, and this campaign has held wrong values at zero on
+  the Rust server throughout. A loud failure beats a silent one.
+
+  **Still reachable, if someone wants it:** `$divide`, `$mod` and `$sqrt` are
+  also IEEE-correctly-rounded and would match exactly. They need general
+  division on the coefficient vectors (`decimal.rs` has only `div_int`), which
+  is real but bounded numerical work -- and `$divide` over a decimal field is
+  an everyday operation, so the practical value is larger than the 3 corpus
+  shapes suggest.
 
   Both are deliberate, and neither is a defer standing in for an ordinary
   argument complaint any more -- that class is gone.
