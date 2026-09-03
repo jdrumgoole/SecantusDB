@@ -55,6 +55,37 @@ surface is not evidence of anything.
 5. **Promote what you fixed into the gate**, plus the neighbouring behaviour
    that was already right — so the fix cannot over-reach later.
 
+## On the SQL side: drive BOTH servers through the same psycopg client
+
+The Mongo-side rule above ("compare the RAW reply, not the driver wrapper")
+inverts here. The conformance surface is the **wire**, so probe
+`SecantusPGServer` over TCP with the same `psycopg` connection you use for
+PostgreSQL — one `run(cur, sql)` helper, two cursors:
+
+```python
+sec = psycopg.connect(host=host, port=port, dbname="db", user="joe", autocommit=True)
+pg  = psycopg.connect("host=127.0.0.1 port=5432 dbname=postgres user=jdrumgoole", autocommit=True)
+```
+
+Client-side type mapping is then identical on both sides, so any difference is
+the server's. Capture `cur.description` too — a wrong **oid** under a right
+value is invisible to a row comparison, and several real bugs here were exactly
+that (`#>` and `LIKE ... ESCAPE` both sent booleans/jsonb under oid 25).
+
+**Calling `run_sql()` directly instead manufactures false positives.** The
+embedded API returns the engine's internal values, which the wire layer
+converts on the way out: a `numeric(p,s)` cast surfaces as a raw
+`Decimal128(...)` and `'2020-01-01'::date` as a `str`. Probed directly, both
+look like divergences; over the wire both are correct. In the 2026-09-03 sweep
+that was 4 of the first 8 "findings" — chased before the harness was moved to
+the wire.
+
+**Check `SHOW lc_ctype` before calling a case-mapping difference a bug.** This
+box's PostgreSQL runs the **C** locale, which treats a non-ASCII letter as a
+word SEPARATOR: `initcap('ÉCOLE')` is `ÉCole` there and `École` on a UTF-8
+PostgreSQL. Same class as the Swedish-collation note in CLAUDE.md — locale
+data, not engine behaviour.
+
 ## Normalisation: what you must strip, or you get false positives
 
 - **Cluster-time gossip.** SecantusDB advertises a replica set and attaches
@@ -170,6 +201,34 @@ mongod truncates the message with an ellipsis *inside* the quotes, so a
 `"[0-9A-Fa-f]{30,}"` pattern stopped matching and the raw token leaked into the
 comparison. Re-run the same probe against the old server; a difference in the
 *count* between versions is worth suspecting before it is worth reporting.
+
+## The PYTHON version is a reference server too
+
+The matrix is 3.10-3.13 and a local run is one of them, so a stdlib behaviour
+that changed between versions is invisible until CI runs. That is not a
+theoretical hazard: `datetime.fromisoformat` accepted **only** 3 or 6
+fractional digits before 3.11, so `TIMESTAMP '2020-01-15 10:30:45.5'` -- an
+ordinary Postgres literal -- parsed on 3.12 and raised on 3.10 (found 2026-09-03
+by this project's own new test, on the 3.10 shards).
+
+**Two rules, both learned there:**
+
+- **When CI fails on one Python only, get that interpreter and RUN it** --
+  `uv venv --python 3.10 /tmp/py310` takes seconds. If the module is
+  WT-linked, load the pure file directly and skip the package `__init__`:
+
+  ```python
+  for name in ("secantus", "secantus.sql"):
+      m = types.ModuleType(name); m.__path__ = []; sys.modules[name] = m
+  spec = importlib.util.spec_from_file_location(
+      "secantus.sql.datetimes", "src/secantus/sql/datetimes.py")
+  ```
+
+- **Fix the DIVERGENCE, not the failure.** Making 3.10 stop raising would have
+  left the versions quietly disagreeing: from 3.11 `fromisoformat` accepts any
+  width but TRUNCATES past six digits, where Postgres ROUNDS. The failing test
+  cannot see that half -- you only find it by asking what the *other* version
+  answers, and then asking the reference server which of them is right.
 
 ## Size the work from a probe, never from the source
 
