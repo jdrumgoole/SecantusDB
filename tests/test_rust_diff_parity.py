@@ -20,6 +20,8 @@ import bson
 import pytest
 from bson import ObjectId
 
+from parity_compare import same
+
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
 # Stub `secantus` package (with __path__) so diff.py's `from secantus import
@@ -81,7 +83,7 @@ def test_curated_parity(pre, post):
     if rust is None:
         return
     py = _pure.compute_update_description(pre, post)
-    assert rust == py, f"rust={rust} pure={py} pre={pre} post={post}"
+    assert same(rust, py), f"rust={rust} pure={py} pre={pre} post={post}"
 
 
 def _rand_value(rng, depth):
@@ -120,7 +122,7 @@ def test_randomised_fuzz_parity():
             continue
         handled += 1
         py = _pure.compute_update_description(pre, post)
-        assert rust == py, f"divergence: rust={rust} pure={py} pre={pre} post={post}"
+        assert same(rust, py), f"divergence: rust={rust} pure={py} pre={pre} post={post}"
     assert handled > 1000, f"expected many handled cases, only {handled}"
 
 
@@ -136,7 +138,7 @@ def test_apply_parity_curated(pre, post):
     if rust is None:
         return  # fallback to pure Python
     py = _pure.apply_update_description(bson.decode(bson.encode(pre)), diff)
-    assert rust == py, f"apply divergence: rust={rust} pure={py} diff={diff}"
+    assert same(rust, py), f"apply divergence: rust={rust} pure={py} diff={diff}"
 
 
 def test_apply_parity_fuzz():
@@ -153,7 +155,7 @@ def test_apply_parity_fuzz():
             continue
         handled += 1
         py = _pure.apply_update_description(bson.decode(bson.encode(pre)), diff)
-        assert rust == py, f"apply divergence: rust={rust} pure={py} pre={pre} diff={diff}"
+        assert same(rust, py), f"apply divergence: rust={rust} pure={py} pre={pre} diff={diff}"
     assert handled > 1000, f"expected many handled cases, only {handled}"
 
 
@@ -191,4 +193,4 @@ def test_array_operator_parity(pre, post, update):
     if rust is None:
         return
     py = _pure.compute_update_description(pre, post, update)
-    assert rust == py, f"rust={rust} pure={py} pre={pre} post={post} update={update}"
+    assert same(rust, py), f"rust={rust} pure={py} pre={pre} post={post} update={update}"

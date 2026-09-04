@@ -29,6 +29,8 @@ import pytest
 from bson import Decimal128, Int64, ObjectId, Regex
 from bson.code import Code
 
+from parity_compare import same
+
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
 
@@ -108,7 +110,7 @@ def test_collation_parity(doc, query, strength, cl, no):
     if rust is None:
         return  # rust deferred (non-ASCII / numericOrdering) -> shim uses Python
     py = _pure.matches(doc, query, collation=obj)
-    assert rust == py, f"rust={rust} pure={py} q={query} strength={strength}"
+    assert same(rust, py), f"rust={rust} pure={py} q={query} strength={strength}"
 
 
 def test_collation_fuzz():
@@ -130,7 +132,7 @@ def test_collation_fuzz():
         rust = _rust_match(d, q, wire)
         if rust is None:
             continue
-        assert rust == _pure.matches(d, q, collation=obj), f"q={q} wire={wire} doc={d}"
+        assert same(rust, _pure.matches(d, q, collation=obj)), f"q={q} wire={wire} doc={d}"
 
 
 def _rt(value):
@@ -759,7 +761,7 @@ def test_curated_parity(doc, query):
     rust = _rust_match(doc, query)
     py = _pure.matches(doc, query)
     if rust is not None:
-        assert rust == py, f"rust={rust} pure={py} for query={query} doc={doc}"
+        assert same(rust, py), f"rust={rust} pure={py} for query={query} doc={doc}"
 
 
 @pytest.mark.parametrize(
@@ -939,7 +941,7 @@ def test_randomised_fuzz_parity():
             continue  # fallback case — shim would use pure Python
         handled += 1
         py = _pure.matches(doc, query)
-        assert rust == py, f"divergence: rust={rust} pure={py} query={query} doc={doc}"
+        assert same(rust, py), f"divergence: rust={rust} pure={py} query={query} doc={doc}"
     assert handled > 1000, f"expected the Rust matcher to handle many cases, only {handled}"
 
 
@@ -973,7 +975,7 @@ def test_batch_matches_parity():
             continue
         handled += 1
         py = [_pure.matches(d, query) for d in docs]
-        assert rust == py, f"batch divergence: rust={rust} pure={py} query={query} docs={docs}"
+        assert same(rust, py), f"batch divergence: rust={rust} pure={py} query={query} docs={docs}"
     assert handled > 500, f"expected many handled batches, only {handled}"
 
 
@@ -1022,5 +1024,5 @@ def test_regex_fuzz_parity():
             continue
         handled += 1
         py = _pure.matches(doc, query)
-        assert rust == py, f"regex divergence: rust={rust} pure={py} query={query} doc={doc}"
+        assert same(rust, py), f"regex divergence: rust={rust} pure={py} query={query} doc={doc}"
     assert handled > 1000, f"expected many handled regex cases, only {handled}"

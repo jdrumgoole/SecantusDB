@@ -4662,23 +4662,29 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   - ~9 stragglers: `$rand: []`, `$substr*` with an array argument, `$toDouble`
     / `$toLong` / `$toDecimal` of a datetime, `$strcasecmp` of a double.
 
-- [ ] **The parity suites compare with a bare `==` in seven of eight files
-  (2026-09-03).** `tests/test_rust_expressions_parity.py` now has a `_same` that
-  treats NaN as equal, distinguishes SIGNED ZEROS, and recurses into arrays and
-  documents, and all sixteen of its assertion sites go through it. The other
-  seven parity files still assert `rust == py` directly.
+- [x] **The parity suites compared with a bare `==` in seven of eight files —
+  DONE 2026-09-04, and it found a real bug immediately.** `tests/parity_compare.py`
+  now holds the single `same()` (NaN equals NaN, signed zeros distinct, key order
+  compared, recursing into arrays and documents) and all eight suites use it.
 
-  This is not theoretical. `-0.0 == 0.0` is True in Python, so the expressions
-  suite ran `$ceil` over a value pool CONTAINING `-0.0`, 5,000 times a run, and
-  passed every time while the pure engine dropped the sign and the Rust engine
-  kept it. The corpus was never the gap — the comparator was, and at twelve of
-  its sixteen sites it was not even being called.
+  Routing the 39 bare-`==` sites through it surfaced **projected field ORDER
+  being wrong in BOTH engines, differently**: mongod emits document order, the
+  pure engine emitted spec order, and the Rust engine emitted ALPHABETICAL order
+  (its spec trie is a `BTreeMap`). Both fixed; `tests/test_projection_field_order.py`
+  pins the measured order.
 
-  None of the other seven has a `-0.0` in its corpus, so the blindness there is
-  latent rather than active. Both halves want doing together: lift `_same` to a
-  shared helper, route every site through it, and add signed zero to each
-  corpus. Expect real findings in `update` and `aggregate`, which carry values
-  through write and accumulator paths.
+  Two lessons worth keeping:
+
+  - The prediction in this entry was that `update` and `aggregate` would yield
+    the findings, because they carry values through write and accumulator paths.
+    They were clean. The finding was in `projection`, and it was not signed zero
+    at all — it was key order, a dimension the sharpened comparator happened to
+    also cover.
+  - **An alphabetical corpus cannot distinguish "sorted" from "document order".**
+    The Rust bug was invisible to the probe as well as to `==`, because every
+    fuzz document was keyed `a, b, c`. A document keyed `z, a, m` separates them
+    in one case. Any corpus meant to test ordering needs at least one document
+    that is not already sorted.
 
 - [ ] **Decimal128 operands are refused by 33 Rust operators (2026-09-02).**
   Was 38; `$abs`, `$toBool`, `$toInt`, `$toLong` and `$toDouble` now take them.

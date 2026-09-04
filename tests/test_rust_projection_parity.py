@@ -22,6 +22,8 @@ import bson
 import pytest
 from bson import ObjectId
 
+from parity_compare import same
+
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
 
@@ -61,13 +63,27 @@ def _rust_proj(doc, spec, query=None):
     raw = _rust.apply_projection_raw(db, sb)
     if raw is not None:
         assert res is not None, f"raw fast-pathed but apply_projection deferred: spec={spec}"
-        assert bson.decode(raw) == bson.decode(res), (
+        assert same(bson.decode(raw), bson.decode(res)), (
             f"apply_projection_raw != apply_projection doc={doc} spec={spec}"
         )
     return None if res is None else bson.decode(res)
 
 
 CURATED = [
+    # --- field ORDER, which `==` on a dict cannot see --------------------
+    # mongod emits projected fields in the DOCUMENT's order and ignores the
+    # spec's: both specs below answer `{b, c}` over a doc ordered `a, b, c`.
+    # The pure engine emitted spec order until 2026-09-04. Nested levels
+    # follow the sub-document's own order.
+    ({"_id": 5, "a": "s", "b": 4, "c": 8}, {"_id": 0, "c": 1, "b": 1}),
+    ({"_id": 5, "a": "s", "b": 4, "c": 8}, {"_id": 0, "b": 1, "c": 1}),
+    ({"_id": 5, "a": "s", "b": 4, "c": 8}, {"c": 1, "a": 1}),
+    ({"_id": 1, "b": {"y": 1, "x": 2}, "a": 5}, {"b.x": 1, "a": 1}),
+    ({"_id": 1, "b": {"y": 1, "x": 2}, "a": 5}, {"a": 1, "b.x": 1}),
+    ({"_id": 1, "b": {"y": 1, "x": 2}, "a": 5}, {"b.x": 1, "b.y": 1}),
+    # A signed zero, bare and nested.
+    ({"_id": 1, "a": -0.0, "b": 1}, {"a": 1}),
+    ({"_id": 1, "a": [1.0, -0.0]}, {"a": 1}),
     ({"_id": 1, "a": 1, "b": 2, "c": 3}, {"a": 1, "c": 1}),
     ({"_id": 1, "a": 1, "b": 2}, {"a": 1, "_id": 0}),
     ({"_id": 1, "a": 1, "b": 2}, {"b": 0}),
@@ -133,7 +149,7 @@ def test_curated_parity(doc, spec):
     if rust is None:
         return
     py = _pure.apply_projection(doc, spec)
-    assert rust == py, f"rust={rust} pure={py} spec={spec}"
+    assert same(rust, py), f"rust={rust} pure={py} spec={spec}"
 
 
 @pytest.mark.parametrize(
@@ -205,7 +221,7 @@ def test_positional_parity(doc, spec, query):
     if rust is None:
         return
     py = _pure.apply_projection(doc, spec, query)
-    assert rust == py, f"rust={rust} pure={py} spec={spec} query={query}"
+    assert same(rust, py), f"rust={rust} pure={py} spec={spec} query={query}"
 
 
 def _rand_doc(rng):
@@ -249,7 +265,7 @@ def test_randomised_fuzz_parity():
             continue
         handled += 1
         py = _pure.apply_projection(doc, spec)
-        assert rust == py, f"divergence: rust={rust} pure={py} spec={spec} doc={doc}"
+        assert same(rust, py), f"divergence: rust={rust} pure={py} spec={spec} doc={doc}"
     assert handled > 1000, f"expected many handled cases, only {handled}"
 
 
@@ -275,5 +291,5 @@ def test_batch_projection_parity():
             continue
         handled += 1
         py = [_pure.apply_projection(d, spec) for d in docs]
-        assert rust == py, f"batch divergence: rust={rust} pure={py} spec={spec}"
+        assert same(rust, py), f"batch divergence: rust={rust} pure={py} spec={spec}"
     assert handled > 500, f"expected many handled batches, only {handled}"

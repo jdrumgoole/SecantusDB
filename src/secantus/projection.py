@@ -658,11 +658,20 @@ def _include_doc(doc: Mapping[str, Any], tree: Mapping[str, Any]) -> dict[str, A
     dropped), and drops the field entirely when the value is a scalar.
     Numeric segments are field names, never array indexes.
     """
+    # Iterate the DOCUMENT, not the spec. mongod emits projected fields in the
+    # stored document's order and ignores the spec's: `{_id: 0, c: 1, b: 1}`
+    # and `{_id: 0, b: 1, c: 1}` both answer `{b, c}` over a doc ordered
+    # `a, b, c`. This walked `tree` and so emitted SPEC order, which no mongod
+    # produces -- a driver renders that order, and `==` on a dict cannot see it,
+    # which is why the Rust parity suite (whose engine had it right) passed for
+    # as long as it compared with `==`. Nested levels come along for free: the
+    # recursion re-enters here, and `{b.y: 1, b.x: 1}` follows `b`'s own order
+    # too. Probed 8.2.11, 2026-09-04.
     out: dict[str, Any] = {}
-    for key, subtree in tree.items():
-        if key not in doc:
+    for key, val in doc.items():
+        if key not in tree:
             continue
-        val = doc[key]
+        subtree = tree[key]
         if not subtree:
             out[key] = copy.deepcopy(val)
             continue

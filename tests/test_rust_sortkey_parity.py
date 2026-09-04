@@ -27,6 +27,8 @@ import pytest
 from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex
 from bson.timestamp import Timestamp
 
+from parity_compare import same
+
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
 # Load the pure-Python encoder by path (avoid secantus/__init__ -> server ->
@@ -126,14 +128,14 @@ def _curated_values():
 @pytest.mark.parametrize("value", _curated_values())
 def test_curated_value_parity(value):
     v = _roundtrip(value)
-    assert _rust_encode(v) == _pure.encode_value(v)
+    assert same(_rust_encode(v), _pure.encode_value(v))
 
 
 @pytest.mark.parametrize("value", _curated_values())
 def test_curated_directed_parity(value):
     v = _roundtrip(value)
     for direction in (1, -1):
-        assert _rust_encode_directed(v, direction) == _pure.encode_value_directed(v, direction)
+        assert same(_rust_encode_directed(v, direction), _pure.encode_value_directed(v, direction))
 
 
 @pytest.mark.parametrize(
@@ -153,7 +155,7 @@ def test_collation_encoding_parity(s, strength, case_level, numeric_ordering):
     rust = _rust_encode(s, wire)
     if rust is None:
         return  # rust deferred (non-ASCII transform) -> pure Python
-    assert rust == _pure.encode_value(s, collation=obj), f"s={s!r} wire={wire}"
+    assert same(rust, _pure.encode_value(s, collation=obj)), f"s={s!r} wire={wire}"
 
 
 def test_cross_type_numeric_collision_matches_python():
@@ -162,7 +164,7 @@ def test_cross_type_numeric_collision_matches_python():
         rust_keys = {bytes(_rust_encode(_roundtrip(x))) for x in triple}
         py_keys = {bytes(_pure.encode_value(_roundtrip(x))) for x in triple}
         assert len(rust_keys) == 1, "rust keys must collide on equal numeric value"
-        assert rust_keys == py_keys
+        assert same(rust_keys, py_keys)
 
 
 def _random_value(rng: random.Random):
@@ -193,4 +195,4 @@ def test_randomised_fuzz_parity():
         v = _roundtrip(_random_value(rng))
         rust = _rust_encode(v)
         py = _pure.encode_value(v)
-        assert rust == py, f"divergence on {v!r}: rust={rust.hex()} py={py.hex()}"
+        assert same(rust, py), f"divergence on {v!r}: rust={rust.hex()} py={py.hex()}"
