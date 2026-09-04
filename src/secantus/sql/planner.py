@@ -373,8 +373,9 @@ def _literal(node: exp.Expression) -> Any:
         text = _literal(node.expressions[-1]) if node.expressions else None
         if text is None:
             return None
+        cfg = _literal(node.expressions[0]) if len(node.expressions) > 1 else None
         if fname == "to_tsvector":
-            return _fts.to_tsvector(str(text))
+            return _fts.to_tsvector(str(text), str(cfg) if cfg is not None else None)
         if fname == "plainto_tsquery":
             return _fts.plainto_tsquery(str(text))
         if fname == "phraseto_tsquery":
@@ -12723,6 +12724,16 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         return "json"
     if isinstance(node, exp.DPipe) and _has_hstore_operand(node, resolve):
         return "hstore"
+    # ``tsvector || tsvector`` -> tsvector, ``tsquery || tsquery`` -> tsquery.
+    # Without the tag the concatenated value keeps the default `text` tag and,
+    # being a dict internally, reaches the client as JSON rather than
+    # `'brown':2 'quick':1`.
+    if isinstance(node, (exp.DPipe, exp.ArrayOverlaps)):
+        sides = {_infer_scalar_tag(s, resolve) for s in (node.this, node.expression)}
+        if sides == {"tsvector"} and isinstance(node, exp.DPipe):
+            return "tsvector"
+        if sides == {"tsquery"}:
+            return "tsquery"
     # Postgres array operators: ``@>`` / ``<@`` / ``&&`` over an array operand -> bool.
     if isinstance(
         node, (exp.ArrayContainsAll, exp.ArrayContainedBy, exp.ArrayOverlaps)
@@ -13288,15 +13299,28 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
             return "bool"
         if fname == "isempty":
             return "bool"
-        if fname == "to_tsvector":
+        if fname in ("to_tsvector", "strip", "array_to_tsvector", "tsvector_concat"):
             return "tsvector"
         if fname in (
             "to_tsquery",
             "plainto_tsquery",
             "phraseto_tsquery",
             "websearch_to_tsquery",
+            "tsquery_and",
+            "tsquery_or",
+            "tsquery_not",
         ):
             return "tsquery"
+        # Getting these tags wrong is not just a wrong oid: a tsvector / tsquery
+        # is a dict internally, and the default `text` tag sends it through the
+        # JSON renderer, so the client receives `{"tsvector": {...}}` instead of
+        # `'brown' 'quick'`.
+        if fname == "numnode":
+            return "int4"
+        if fname == "querytree":
+            return "text"
+        if fname == "tsvector_to_array":
+            return "text[]"
         if fname in ("ts_rank", "ts_rank_cd"):
             return "float8"
         if fname == "ts_headline":

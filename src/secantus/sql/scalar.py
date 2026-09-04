@@ -150,6 +150,15 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         return _eval_jsonb_nav(node, scope, ctx)
     if isinstance(node, exp.JSONBDeleteAtPath):
         return _eval_jsonb_delete_path(node, scope, ctx)
+    if isinstance(node, exp.ArrayOverlaps):
+        # `&&` over two tsqueries is tsquery AND, not array overlap. Checked
+        # before the array / range / net / geo dispatch below, all of which
+        # would take a tsquery dict for their own operand type.
+        from secantus.sql import fts as _fts
+
+        lhs, rhs = evaluate(node.this, scope, ctx), evaluate(node.expression, scope, ctx)
+        if _fts.is_tsquery(lhs) and _fts.is_tsquery(rhs):
+            return _fts.tsquery_and(lhs, rhs)
     if isinstance(node, (exp.ArrayContainsAll, exp.ArrayContainedBy, exp.ArrayOverlaps)):
         result = _eval_range_op(node, scope, ctx)
         if result is not _NOT_RANGE:
@@ -362,6 +371,17 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         # ``bytea || bytea`` concatenates the raw bytes; anything else is text.
         if isinstance(left, (bytes, bytearray)) and isinstance(right, (bytes, bytearray)):
             return bytes(left) + bytes(right)
+        # ``tsvector || tsvector`` / ``tsquery || tsquery``. Both are dicts
+        # internally, so without this the hstore branch below merged them
+        # right-wins and `to_tsvector('quick') || to_tsvector('brown')`
+        # answered just `'brown'` — half the document silently dropped.
+        from secantus.sql import fts as _fts
+
+        if _fts.is_tsvector(left) and _fts.is_tsvector(right):
+            return _fts.tsvector_concat(left, right)
+        if _fts.is_tsquery(left) and _fts.is_tsquery(right):
+            return _fts.tsquery_or(left, right)
+
         # ``array || array`` / ``array || elem`` concatenates lists.
         if isinstance(left, list) or isinstance(right, list):
             lval = left if isinstance(left, list) else [left]
@@ -2344,6 +2364,22 @@ def _eval_decode(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     return _bytea.decode(text, _as_text(evaluate(fmt, scope, ctx)))
 
 
+def _length_of(v: Any) -> int:
+    """``length(x)`` — characters for text, bytes for a binary, and for a
+    ``tsvector`` the number of DISTINCT LEXEMES.
+
+    The tsvector case is not a nicety: a tsvector is a dict internally, so the
+    generic path stringified it and measured the JSON, answering 45 for a
+    two-lexeme vector."""
+    from secantus.sql import fts as _fts
+
+    if _fts.is_tsvector(v):
+        return _fts.tsvector_length(v)
+    if isinstance(v, (bytes, bytearray)):
+        return len(v)
+    return len(_as_text(v))
+
+
 def _bit_length_of(v: Any) -> Any:
     """``bit_length`` across the three input kinds Postgres accepts."""
     if v is None:
@@ -2564,7 +2600,7 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
     exp.Upper: _unary(lambda v: v.get("upper") if isinstance(v, dict) else _as_text(v).upper()),
     exp.Lower: _unary(lambda v: v.get("lower") if isinstance(v, dict) else _as_text(v).lower()),
     # ``length()`` — a bytea's byte count, else the string's character length.
-    exp.Length: _unary(lambda v: len(v) if isinstance(v, (bytes, bytearray)) else len(_as_text(v))),
+    exp.Length: _unary(_length_of),
     exp.Trim: lambda n, s, c: _eval_trim(n, s, c),
     # These three carry their FIRST argument in ``node.this``, which the generic
     # `_eval_typed_func` path drops (it reads ``node.expressions`` only) — so
@@ -3959,6 +3995,17 @@ def _eval_cast_impl(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     # literal, a JSON value as JSON text, an array as Postgres' array_out
     # literal — so each compares equal to a client-dumped parameter's text.
     if to_tag == "text" and isinstance(value, (dict, list)):
+        # A tsvector / tsquery is a dict internally, so without this it fell
+        # through to the JSON renderer below and `v::text` produced
+        # `{"tsvector": {"fat": [2]}}` where PostgreSQL gives `'fat':2`. Same
+        # shape as the range branch that follows: an internal dict whose TEXT
+        # form is the type's own, not JSON.
+        from secantus.sql import fts as _fts
+
+        if _fts.is_tsvector(value):
+            return _fts.render_tsvector(value)
+        if _fts.is_tsquery(value):
+            return _fts.render_tsquery(value)
         shape = _range_value_shape(value)
         if shape is not None:
             from secantus.sql import ranges as _ranges
@@ -4964,13 +5011,15 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
     ):
         from secantus.sql import fts as _fts
 
-        # A two-argument form passes the text-search config first; we ignore it
-        # (the config is fixed) and read the last argument as the document / query.
+        # A two-argument form passes the text-search config first. Only its
+        # stop-word half is modelled (`simple` keeps them, anything else drops
+        # them); the last argument is the document / query.
         text = args[-1] if args else None
         if text is None:
             return None
+        config = _as_text(args[0]) if len(args) > 1 else None
         if name == "to_tsvector":
-            return _fts.to_tsvector(_as_text(text))
+            return _fts.to_tsvector(_as_text(text), config)
         if name == "plainto_tsquery":
             return _fts.plainto_tsquery(_as_text(text))
         if name == "phraseto_tsquery":
@@ -4978,6 +5027,38 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         if name == "websearch_to_tsquery":
             return _fts.websearch_to_tsquery(_as_text(text))
         return _fts.to_tsquery(_as_text(text))
+    if name in (
+        "strip",
+        "numnode",
+        "querytree",
+        "tsvector_to_array",
+        "array_to_tsvector",
+        "tsvector_concat",
+        "tsquery_and",
+        "tsquery_or",
+        "tsquery_not",
+    ):
+        from secantus.sql import fts as _fts
+
+        a = args[0] if args else None
+        b = args[1] if len(args) > 1 else None
+        if a is None:
+            return None
+        if name == "strip":
+            return _fts.strip_tsvector(a)
+        if name == "numnode":
+            return _fts.numnode(a)
+        if name == "querytree":
+            return _fts.querytree(a)
+        if name == "tsvector_to_array":
+            return _fts.tsvector_to_array(a)
+        if name == "array_to_tsvector":
+            return _fts.array_to_tsvector(a)
+        if name == "tsvector_concat":
+            return _fts.tsvector_concat(a, b)
+        if name == "tsquery_not":
+            return _fts.tsquery_not(a)
+        return (_fts.tsquery_and if name == "tsquery_and" else _fts.tsquery_or)(a, b)
     if name == "ts_headline":
         from secantus.sql import fts as _fts
 
