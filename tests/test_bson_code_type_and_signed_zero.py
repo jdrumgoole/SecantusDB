@@ -24,7 +24,7 @@ import pytest
 from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
 from secantus.bsontypes import bson_type_name
-from secantus.expressions import evaluate
+from secantus.expressions import ExpressionError, evaluate
 
 # (value, the type name mongod reports on BOTH the `$type` and error surfaces)
 TYPE_NAMES = [
@@ -109,3 +109,61 @@ def test_rounding_stays_type_preserving(op):
     """The signed-zero fix must not change the BSON type: an int stays an int."""
     assert evaluate({op: {"$literal": 3}}, {}) == 3
     assert not isinstance(evaluate({op: {"$literal": 3}}, {}), float)
+
+
+# --- the same root cause, in the operators that CONSUME a string -----------
+#
+# Naming a type right (above) and DISPATCHING on it right are different things,
+# and the first fix did not imply the second: `$type` reported `javascript`
+# correctly while `$strLenCP` still measured a Code's source text and the
+# `$to*` family still tried to PARSE it. Both surfaces are pinned here so the
+# next fix cannot be partial again.
+
+CODE = Code("x=1")
+SCOPED = Code("x=1", {})
+
+
+@pytest.mark.parametrize("value", [CODE, SCOPED])
+@pytest.mark.parametrize(
+    ("op", "code"),
+    [("$strLenBytes", 34473), ("$strLenCP", 34471), ("$binarySize", 51276)],
+)
+def test_string_operators_refuse_javascript(op, code, value):
+    """These RETURNED A LENGTH (3, the length of `x=1`) where mongod refuses.
+
+    A wrong value, not a wrong message: `bson.Code` subclasses `str`, so the
+    guard `isinstance(s, str)` admitted it and the error branch that already
+    named the type correctly was simply never reached.
+    """
+    with pytest.raises(ExpressionError) as caught:
+        evaluate({op: {"$literal": value}}, {})
+    assert caught.value.code == code
+    assert bson_type_name(value) in str(caught.value)
+
+
+@pytest.mark.parametrize("value", [CODE, SCOPED])
+@pytest.mark.parametrize(
+    "op", ["$toInt", "$toLong", "$toDouble", "$toDecimal", "$toString", "$toDate", "$toObjectId"]
+)
+def test_conversions_refuse_javascript(op, value):
+    """`241 ConversionFailure`, naming the source type.
+
+    These reported the string PARSER's complaint instead -- `$toInt` said "Did
+    not consume whole string", `$toDate` tried to read `x=1` as a date. The
+    message now derives the type, so a scoped Code says `javascriptWithScope`.
+    """
+    with pytest.raises(ExpressionError) as caught:
+        evaluate({op: {"$literal": value}}, {})
+    assert caught.value.code == 241
+    assert f"Unsupported conversion from {bson_type_name(value)} to " in str(caught.value)
+
+
+@pytest.mark.parametrize("value", [CODE, SCOPED])
+def test_to_bool_of_javascript_is_true_not_a_failure(value):
+    """The measured EXCEPTION to the rule, and the reason the fix is per-arm.
+
+    `$toBool` of a Code is `true` on mongod -- every other target refuses. A
+    uniform "reject Code in $convert" guard would have been simpler, wrong, and
+    would have looked correct against the other seven targets.
+    """
+    assert evaluate({"$toBool": {"$literal": value}}, {}) is True
