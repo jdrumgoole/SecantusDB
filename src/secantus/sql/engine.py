@@ -205,6 +205,11 @@ def is_pubsub_statement(sql: str) -> bool:
     return _PUBSUB_RE.match(sql) is not None
 
 
+#: PostgreSQL's NOTIFY payload cap. 7999 bytes is accepted and 8000 is not
+#: (measured against 14.13), so the limit is exclusive.
+_NOTIFY_PAYLOAD_MAX = 8000
+
+
 def _pubsub_ident(token: str) -> str:
     """Normalise a LISTEN/NOTIFY channel token: a quoted ``"Ch"`` keeps its case;
     an unquoted name is lower-cased (Postgres identifier folding)."""
@@ -237,10 +242,19 @@ def _maybe_pubsub(sql: str, session: Session) -> SQLResult | None:
     # NOTIFY — the payload literal is single-quoted with '' escaping.
     raw = m.group("payload")
     payload = raw[1:-1].replace("''", "'") if raw else ""
+    if len(payload.encode("utf-8")) >= _NOTIFY_PAYLOAD_MAX:
+        raise errors.SQLError("22023", "payload string too long")
     if hub is not None:
         if session.txn_handle is not None:
-            # Inside a transaction block: buffer, deliver at COMMIT.
-            session.pending_notifies.append((channel, payload))
+            # Inside a transaction block: buffer, deliver at COMMIT — and
+            # COLLAPSE an exact repeat. PostgreSQL delivers one event when the
+            # same channel is signalled with an identical payload more than
+            # once in a transaction, so a loop that notifies per row wakes the
+            # listener once, not once per row. Distinct payloads on the same
+            # channel are all delivered, so this is deduplication of the PAIR,
+            # not of the channel.
+            if (channel, payload) not in session.pending_notifies:
+                session.pending_notifies.append((channel, payload))
         else:
             hub.notify(channel, payload, session.backend_pid)
     return SQLResult(command_tag="NOTIFY")
@@ -1966,6 +1980,13 @@ def _describe_statement(
 #: take locks. Shapes here mirror what Execute actually returns.
 _VOLATILE_FN_TAGS = {
     "pg_sleep": "text",
+    # pg_notify HAS A SIDE EFFECT, so leaving it out of this table did not just
+    # cost a wasted call: Describe evaluated it and Execute evaluated it again,
+    # and the listener received the notification TWICE. Only through the
+    # extended protocol — a parameter is what stops a driver using the simple
+    # one — which is why a literal `SELECT pg_notify('c','p')` looked fine.
+    # PostgreSQL describes it as void (2278).
+    "pg_notify": "void",
     "nextval": "int8",
     "setval": "int8",
     "currval": "int8",

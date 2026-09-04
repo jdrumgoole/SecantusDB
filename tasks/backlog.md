@@ -12557,3 +12557,37 @@ scenarios were vacuous, hiding five real divergences. Any probe whose
 scenarios can fail CLIENT-side needs to report the exception type and count
 both-sides-non-database-error as vacuous, which
 `scratchpad`'s copy probe now does.
+
+## LISTEN / NOTIFY (2026-09-04) — swept, three fixes, two gaps left
+
+27 scenarios against PostgreSQL 14.13 with two connections. Delivery semantics
+were already right (cross-connection and self-delivery, payloads, `pg_notify`,
+`UNLISTEN` / `UNLISTEN *`, deferral to COMMIT, discard on ROLLBACK, channel
+case folding with quoted names keeping case, repeated `LISTEN` delivering
+once). Fixed: `pg_notify` double-delivery through the extended protocol,
+duplicate collapse within a transaction, and the 8000-byte payload cap. See
+`tests/test_sql_sweep_sixteen.py`.
+
+Two gaps remain:
+
+1. **`pg_listening_channels()` does not exist** (`42883`). It is a
+   set-returning function, and the SRF path (`srf.record_rows`) takes a
+   pre-evaluated value with no `Session`, so serving it needs session-aware SRF
+   support that does not exist yet. Diagnostic-only, hence recorded rather than
+   built.
+2. **A parameter in `NOTIFY` / `LISTEN` / `UNLISTEN` is not rejected.**
+   PostgreSQL answers `42601 syntax error at or near "$1"` — their grammar has
+   no slot for a parameter (`pg_notify(ch, $1)` is the working spelling).
+   SecantusDB accepts `NOTIFY ch, $1` and answers `42601` with a different
+   message for the other two. A check in the extended-protocol Parse was
+   written and REVERTED: it never fired, because these statements reach
+   `_maybe_pubsub` from the already-substituted SQL text rather than through
+   the path that check sits on. Shipping a guard that does nothing is worse
+   than the gap, so the next attempt should start by finding where a pubsub
+   statement's ORIGINAL text is still available.
+
+**A probe-hygiene note.** A notification queued by an earlier scenario is still
+deliverable, and a `stop_after=1` drain returns it — which reads as the current
+scenario delivering something it never sent. That produced a convincing but
+false "delivers twice" result before the probe drained the listener to empty
+between scenarios. Any LISTEN/NOTIFY probe needs that isolation.

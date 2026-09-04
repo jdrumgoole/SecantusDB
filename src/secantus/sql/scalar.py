@@ -5114,10 +5114,17 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         if ctx is not None and args and args[0] is not None:
             session = ctx.session
             channel, payload = str(args[0]), (_as_text(args[1]) if len(args) > 1 else "")
+            if len(payload.encode("utf-8")) >= 8000:
+                raise errors.SQLError("22023", "payload string too long")
             hub = getattr(session, "notify_hub", None)
             if hub is not None:
                 if session.txn_handle is not None:
-                    session.pending_notifies.append((channel, payload))
+                    # Same collapse rule as the NOTIFY statement: an exact
+                    # repeat of (channel, payload) in one transaction is
+                    # delivered once. The two spellings of the same operation
+                    # had different semantics here.
+                    if (channel, payload) not in session.pending_notifies:
+                        session.pending_notifies.append((channel, payload))
                 else:
                     hub.notify(channel, payload, session.backend_pid)
         return None
