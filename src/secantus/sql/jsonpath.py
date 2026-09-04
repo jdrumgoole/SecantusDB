@@ -149,6 +149,17 @@ class _Parser:
             node = self._predicate()
             self._expect("rparen")
             return node
+        # ``exists(<path>)`` — true when the path matches anything. It takes a
+        # PATH, not a comparison, so it cannot go through the operand/operator/
+        # literal sequence below; `jsonb_path_match(j, 'exists($.a)')` failed
+        # there with "predicate operand must start with '@' or '$'".
+        if tok and tok[0] == "ident" and tok[1].lower() == "exists":
+            nxt = self.tokens[self.i + 1] if self.i + 1 < len(self.tokens) else None
+            if nxt is not None and nxt[0] == "lparen":
+                self.i += 2
+                steps = self._operand_path()
+                self._expect("rparen")
+                return {"kind": "exists", "path": steps}
         left_path = self._operand_path()
         op_tok = self._next()
         if op_tok[0] != "op":
@@ -227,6 +238,8 @@ def _eval_pred(pred: dict, value: Any) -> bool:
         return _eval_pred(pred["left"], value) and _eval_pred(pred["right"], value)
     if kind == "or":
         return _eval_pred(pred["left"], value) or _eval_pred(pred["right"], value)
+    if kind == "exists":
+        return len(_apply_steps([value], pred["path"])) > 0
     # comparison
     matches = _apply_steps([value], pred["path"])
     op, target = pred["op"], pred["value"]
@@ -286,6 +299,8 @@ def _render_pred(p: dict) -> str:
     if kind in ("and", "or"):
         op = "&&" if kind == "and" else "||"
         return f"{_render_pred(p['left'])} {op} {_render_pred(p['right'])}"
+    if kind == "exists":
+        return f"exists(@{_render_steps(p['path'])})"
     val = p["value"]
     if val is None:
         lit = "null"
@@ -301,12 +316,25 @@ def _render_pred(p: dict) -> str:
 
 
 def query(doc: Any, path: str) -> list[Any]:
-    """All values in ``doc`` matched by ``path`` (the SQL ``jsonb_path_query`` set)."""
-    return _apply_steps([doc], _parse(path))
+    """All values in ``doc`` matched by ``path`` (the SQL ``jsonb_path_query`` set).
+
+    A PREDICATE used as a whole path expression (``exists($.a)``, ``$.a == 1``)
+    is not a navigation — it YIELDS ONE BOOLEAN ITEM. That distinction has a
+    surprising consequence worth stating: `jsonb_path_exists(doc,
+    'exists($.zz)')` is TRUE even when `$.zz` is absent, because an item (the
+    boolean `false`) was produced. Measured against PostgreSQL 14.13."""
+    try:
+        steps = _parse(path)
+    except JsonPathError:
+        pred = _Parser(_tokenize(path)).parse_predicate()
+        return [_eval_pred(pred, doc)]
+    return _apply_steps([doc], steps)
 
 
 def exists(doc: Any, path: str) -> bool:
-    """``jsonb_path_exists`` / ``@?`` — does ``path`` match anything in ``doc``?"""
+    """``jsonb_path_exists`` / ``@?`` — does ``path`` produce any item? See
+    `query` for why a predicate path makes this true regardless of the
+    predicate's own value."""
     return len(query(doc, path)) > 0
 
 

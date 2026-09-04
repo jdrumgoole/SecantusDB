@@ -241,6 +241,7 @@ _SCALAR_EVAL_ANON = frozenset(
         "array_dims",
         "array_upper",
         "array_lower",
+        "to_number",
         "to_jsonb",
         "to_json",
         "row_to_json",
