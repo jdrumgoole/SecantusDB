@@ -24,6 +24,8 @@ import bson
 import pytest
 from bson.decimal128 import Decimal128
 
+from parity_compare import same
+
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
 
@@ -64,6 +66,9 @@ def _rust_pipeline(docs, pipeline, vars=None, collation=None):
 
 
 DOCS = [
+    # A signed zero, bare and nested in an array: `-0.0 == 0.0` in Python, so
+    # a bare `==` was blind to any stage that dropped the sign.
+    {"_id": 90, "a": -0.0, "b": "n", "tags": [-0.0, 1]},
     {"_id": 1, "a": 5, "b": "x", "tags": [1, 2]},
     {"_id": 2, "a": 15, "b": "y", "tags": [3]},
     {"_id": 3, "a": 25, "b": "z", "nested": {"k": 9}},
@@ -337,7 +342,7 @@ def test_densify_fuzz():
         except Exception:
             pytest.fail(f"rust={rust} but pure raised; pipeline={pipeline} docs={docs}")
         handled += 1
-        assert rust == py, f"rust={rust} pure={py} pipeline={pipeline} docs={docs}"
+        assert same(rust, py), f"rust={rust} pure={py} pipeline={pipeline} docs={docs}"
     assert handled > 500, f"expected many handled densify pipelines, only {handled}"
 
 
@@ -357,7 +362,7 @@ def test_group_numeric_key_collision():
     rust = _rust_pipeline(docs, pipeline)
     assert rust is not None, "expected the Rust $group to handle numeric-key collision"
     py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
-    assert rust == py, f"rust={rust} pure={py}"
+    assert same(rust, py), f"rust={rust} pure={py}"
 
 
 @pytest.mark.parametrize(
@@ -433,7 +438,7 @@ def test_fill_parity(docs, pipeline):
     rust = _rust_pipeline(docs, pipeline)
     assert rust is not None, f"expected Rust $fill to handle {pipeline}"
     py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
-    assert rust == py, f"rust={rust} pure={py} pipeline={pipeline}"
+    assert same(rust, py), f"rust={rust} pure={py} pipeline={pipeline}"
 
 
 @pytest.mark.parametrize(
@@ -789,7 +794,7 @@ def test_set_window_fields_parity(docs, pipeline):
     rust = _rust_pipeline(docs, pipeline)
     assert rust is not None, f"expected Rust $setWindowFields to handle {pipeline}"
     py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
-    assert rust == py, f"rust={rust} pure={py} pipeline={pipeline}"
+    assert same(rust, py), f"rust={rust} pure={py} pipeline={pipeline}"
 
 
 @pytest.mark.parametrize(
@@ -830,7 +835,7 @@ def test_sort_mixed_types(direction):
     rust = _rust_pipeline(docs, pipeline)
     assert rust is not None, "expected the Rust $sort to handle the mixed-type corpus"
     py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
-    assert rust == py, f"rust={rust} pure={py}"
+    assert same(rust, py), f"rust={rust} pure={py}"
 
 
 @pytest.mark.parametrize(
@@ -850,7 +855,7 @@ def test_group_accumulator_mixed_types(acc):
     rust = _rust_pipeline(docs, pipeline)
     assert rust is not None, f"expected the Rust $group to handle {acc} over mixed types"
     py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
-    assert rust == py, f"rust={rust} pure={py}"
+    assert same(rust, py), f"rust={rust} pure={py}"
 
 
 @pytest.mark.parametrize("pipeline", CURATED)
@@ -861,7 +866,7 @@ def test_curated_parity(pipeline):
     if rust is None:
         return
     py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
-    assert rust == py, f"rust={rust} pure={py} pipeline={pipeline}"
+    assert same(rust, py), f"rust={rust} pure={py} pipeline={pipeline}"
 
 
 _GRANULARITIES = [
@@ -903,7 +908,7 @@ def test_bucket_auto_granularity_fuzz():
         rust = _rust_pipeline(docs_b, pipeline_b)
         assert rust is not None, f"Rust must handle granularity {gran}: {docs}"
         py = _pure.apply_pipeline(docs_b, pipeline_b, _PipelineContext())
-        assert rust == py, f"gran={gran} rust={rust} pure={py} docs={docs} b={nb}"
+        assert same(rust, py), f"gran={gran} rust={rust} pure={py} docs={docs} b={nb}"
         handled += 1
     assert handled == 400
 
@@ -1277,7 +1282,7 @@ def test_pipeline_fuzz(seed):
         except Exception:
             pytest.fail(f"rust={rust} but pure raised; pipeline={pipeline} docs={docs}")
         handled += 1
-        assert rust == py, f"rust={rust} pure={py} pipeline={pipeline} docs={docs}"
+        assert same(rust, py), f"rust={rust} pure={py} pipeline={pipeline} docs={docs}"
     assert handled > 1000, f"expected many handled pipelines, only {handled}"
 
 
@@ -1305,4 +1310,4 @@ def test_decimal_accumulators_match_pure_python(docs, acc):
     got = _rust_pipeline(docs, pipeline)
     assert got is not None, "Rust deferred; decimal accumulation should be native"
     want = _pure.apply_pipeline([dict(d) for d in docs], pipeline, _PipelineContext())
-    assert got == want
+    assert same(got, want)

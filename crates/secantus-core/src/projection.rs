@@ -620,9 +620,23 @@ fn spec_tree(paths: &[&str]) -> SpecTree {
 /// project — possibly to `{}` — and scalar elements drop), and drops
 /// the field entirely on a scalar. Numeric segments are field names.
 fn include_doc(doc: &Document, tree: &SpecTree) -> Document {
+    // Iterate the DOCUMENT, not the trie. mongod emits projected fields in the
+    // stored document's order; `SpecTree` is a `BTreeMap`, so walking it emitted
+    // ALPHABETICAL order. That is not the spec's order either, which is why it
+    // went unnoticed for so long: it coincides with document order for any
+    // corpus whose documents happen to be keyed alphabetically, which the fuzz
+    // here was. Over `{_id, z, a, m}` mongod answers `_id, z, a, m` and this
+    // answered `_id, a, m, z` (probed 8.2.11, 2026-09-04).
+    //
+    // The pure engine was wrong here too, differently -- it emitted SPEC order.
+    // Two engines, two wrong answers, and a parity suite comparing them with
+    // `==`, which ignores key order entirely. `exclude_doc` below needs no such
+    // change: it removes keys from the document in place and so keeps its order.
     let mut out = Document::new();
-    for (key, subtree) in &tree.0 {
-        let Some(val) = doc.get(key) else { continue };
+    for (key, val) in doc {
+        let Some(subtree) = tree.0.get(key) else {
+            continue;
+        };
         if subtree.0.is_empty() {
             out.insert(key.clone(), val.clone());
             continue;

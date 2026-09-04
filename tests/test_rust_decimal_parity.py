@@ -38,6 +38,8 @@ import pytest
 from bson import Int64
 from bson.decimal128 import Decimal128
 
+from parity_compare import same
+
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
 from secantus import aggregate as _agg  # noqa: E402
@@ -126,7 +128,7 @@ def test_update_operator_decimal_fuzz_parity():
             deferred += 1
             continue
         checked += 1
-        assert bson.decode(raw) == _upd.apply_update(dict(doc), update), (
+        assert same(bson.decode(raw), _upd.apply_update(dict(doc), update)), (
             f"divergence: {op} cur={cur!r} operand={operand!r}"
         )
 
@@ -155,7 +157,7 @@ def test_accumulator_decimal_fuzz_parity():
             continue
         checked += 1
         want = _agg.apply_pipeline([dict(d) for d in docs], pipeline, ctx)
-        assert got == want, f"divergence: {acc} vals={vals!r}"
+        assert same(got, want), f"divergence: {acc} vals={vals!r}"
 
     assert checked > 800, f"expected many handled cases, only {checked}"
     assert deferred == 0, f"Rust deferred {deferred} decimal aggregations"
@@ -184,6 +186,6 @@ def test_decimal_conversion_fuzz_parity(op):
         if got is None:
             continue  # strings / exotics still defer; only agreement matters here
         checked += 1
-        assert got == _expr.evaluate(expr, doc), f"divergence: {op} on {v!r}"
+        assert same(got, _expr.evaluate(expr, doc)), f"divergence: {op} on {v!r}"
 
     assert checked > 500, f"expected many handled cases, only {checked}"

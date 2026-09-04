@@ -26,6 +26,8 @@ import pytest
 from bson import Int64, ObjectId
 from bson.decimal128 import Decimal128
 
+from parity_compare import same
+
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
 
@@ -61,6 +63,22 @@ def _rust_apply(doc, update, is_upsert=False):
 # (doc, update, is_upsert). Mirrors tests/test_update.py for the handled ops,
 # plus dotted/array paths, width-sensitive arithmetic, and _id immutability.
 CURATED = [
+    # --- signed zero -------------------------------------------------------
+    # `-0.0 == 0.0` in Python, so a bare `==` could not see these; the
+    # comparator now can. `$inc` folds from a ZERO accumulator (so `-0` comes
+    # back positive) while `$mul` folds from ONE (so it keeps the sign) --
+    # measured against mongod 8.2.11, 2026-09-03/04.
+    ({"a": 5}, {"$set": {"a": -0.0}}, False),
+    ({"a": -0.0}, {"$set": {"b": 1}}, False),
+    ({"a": -0.0}, {"$inc": {"a": 0}}, False),
+    ({"a": 0.0}, {"$inc": {"a": -0.0}}, False),
+    ({"a": -0.0}, {"$mul": {"a": 1}}, False),
+    ({"a": 1.0}, {"$mul": {"a": -0.0}}, False),
+    ({"a": -0.0}, {"$min": {"a": 0.0}}, False),
+    ({"a": -0.0}, {"$max": {"a": 0.0}}, False),
+    # ...and nested in an array, where `==` on the container hid it too.
+    ({"a": [1.0]}, {"$push": {"a": -0.0}}, False),
+    ({"a": []}, {"$addToSet": {"a": -0.0}}, False),
     ({"a": 1}, {"$set": {"b": 2}}, False),
     ({}, {"$set": {"a.b.c": 5}}, False),
     ({"a": 1, "b": 2}, {"$unset": {"b": ""}}, False),
@@ -225,7 +243,7 @@ def test_curated_parity(doc, update, upsert):
     # The Rust update engine now follows mongod's numeric type promotion
     # (int32 < int64 < double < decimal128) exactly like the pure-Python engine,
     # so the BSON int32-vs-int64 subtype must match — compare values directly.
-    assert bson.decode(rust) == py, f"rust={bson.decode(rust)} pure={py} update={update}"
+    assert same(bson.decode(rust), py), f"rust={bson.decode(rust)} pure={py} update={update}"
 
 
 def _rust_apply_with(doc, update, array_filters=None, positional_matches=None, is_upsert=False):
@@ -291,7 +309,9 @@ def test_array_filter_parity(doc, update, af, pos):
     if rust is None:
         return  # fallback — Python handles it
     py = _pure.apply_update(doc, update, array_filters=list(af), positional_matches=dict(pos))
-    assert bson.decode(rust) == py, f"rust={bson.decode(rust)} pure={py} update={update} af={af}"
+    assert same(bson.decode(rust), py), (
+        f"rust={bson.decode(rust)} pure={py} update={update} af={af}"
+    )
 
 
 def _rand_scalar(rng):
@@ -391,7 +411,7 @@ def test_randomised_fuzz_parity():
             continue
         handled += 1
         py = _pure.apply_update(doc, update, is_upsert=upsert)
-        assert bson.decode(rust) == py, (
+        assert same(bson.decode(rust), py), (
             f"divergence: rust={bson.decode(rust)} pure={py} update={update} doc={doc}"
         )
     assert handled > 1000, f"expected many handled cases, only {handled}"
@@ -420,7 +440,7 @@ def test_batch_apply_parity():
             continue
         handled += 1
         py = [_pure.apply_update(d, update, is_upsert=upsert) for d in docs]
-        assert rust == py, f"batch divergence: rust={rust} pure={py} update={update}"
+        assert same(rust, py), f"batch divergence: rust={rust} pure={py} update={update}"
     assert handled > 500, f"expected many handled batches, only {handled}"
 
 
@@ -525,4 +545,4 @@ def test_decimal_arithmetic_matches_pure_python(doc, update):
     update = bson.decode(bson.encode(update))
     raw = _rust_apply(doc, update)
     assert raw is not None, "Rust deferred; decimal arithmetic should be native"
-    assert bson.decode(raw) == _pure.apply_update(dict(doc), update)
+    assert same(bson.decode(raw), _pure.apply_update(dict(doc), update))

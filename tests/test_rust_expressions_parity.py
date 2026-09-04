@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import datetime
 import importlib.util
-import math
 import pathlib
 import random
 import sys
@@ -26,6 +25,8 @@ import types
 import bson
 import pytest
 from bson import Decimal128, Int64, ObjectId, Timestamp
+
+from parity_compare import same as _same
 
 _rust = pytest.importorskip("_secantus_core", reason="Rust core extension not built")
 
@@ -91,34 +92,6 @@ def assert_named_error_matches_pure(exc, expr, doc=None, vars=None):
         f"named-error drift on {expr}: rust=({exc.code}, {exc.errmsg!r}) "
         f"pure=({caught.value.code}, {str(caught.value)!r})"
     )
-
-
-def _same(a, b):
-    """Parity equality: NaN equals NaN, signed zeros are DISTINCT, and both
-    rules apply inside nested arrays and documents.
-
-    `-0.0 == 0.0` is True in Python, so a bare `==` is blind to a real,
-    BSON-visible difference: mongod keeps the sign (`$ceil(-0.5)` is `-0.0`),
-    the Rust engine kept it, and the pure engine dropped it. The fuzz below has
-    `-0.0` in its value pool and exercises `$ceil` 5,000 times a run, and every
-    one of those comparisons passed. The corpus was never the gap here -- the
-    comparator was, and it was ALSO not being called: twelve assertion sites
-    used a raw `==` and only four used this function. Both halves fixed
-    2026-09-03, after `agg_expressions.py` reported the divergence against
-    mongod 8.2.11.
-    """
-    if isinstance(a, float) and isinstance(b, float):
-        if a != a and b != b:
-            return True
-        if a == 0.0 and b == 0.0:
-            return math.copysign(1.0, a) == math.copysign(1.0, b)
-    # Recurse: a signed zero nested in an array (`$map`, `$range`, `$slice`) is
-    # just as wrong as a bare one, and `==` on the container hides it.
-    if isinstance(a, list) and isinstance(b, list):
-        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b, strict=True))
-    if isinstance(a, dict) and isinstance(b, dict):
-        return list(a) == list(b) and all(_same(a[k], b[k]) for k in a)
-    return a == b
 
 
 def _bson_norm(v):
