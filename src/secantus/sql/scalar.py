@@ -5032,12 +5032,12 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         if name == "to_tsvector":
             return _fts.to_tsvector(_as_text(text), config)
         if name == "plainto_tsquery":
-            return _fts.plainto_tsquery(_as_text(text))
+            return _fts.plainto_tsquery(_as_text(text), config)
         if name == "phraseto_tsquery":
-            return _fts.phraseto_tsquery(_as_text(text))
+            return _fts.phraseto_tsquery(_as_text(text), config)
         if name == "websearch_to_tsquery":
-            return _fts.websearch_to_tsquery(_as_text(text))
-        return _fts.to_tsquery(_as_text(text))
+            return _fts.websearch_to_tsquery(_as_text(text), config)
+        return _fts.to_tsquery(_as_text(text), config)
     if name in (
         "strip",
         "numnode",
