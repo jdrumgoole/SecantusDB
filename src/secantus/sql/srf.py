@@ -39,6 +39,13 @@ _NAMED_SRFS = frozenset(
         "json_array_elements_text",
         "jsonb_object_keys",
         "json_object_keys",
+        # A jsonpath can match MANY values (`$.a[*]`, `$.*.b`, a filter). It was
+        # not registered here, so it evaluated as a scalar and yielded only the
+        # first match — `SELECT count(*) FROM jsonb_path_query('{"a":[1,2,3]}',
+        # '$.a[*]')` answered 1 where PostgreSQL answers 3. Rows silently
+        # missing, not a wrong value.
+        "jsonb_path_query",
+        "json_path_query",
         "regexp_split_to_table",
         "regexp_matches",
         "jsonb_each",
@@ -425,6 +432,14 @@ def _values_and_tag(
         if name == "generate_subscripts":
             n = len(val) if isinstance(val, (list, tuple)) else 0
             return list(range(1, n + 1)), "int4"
+        if name in ("jsonb_path_query", "json_path_query"):
+            from secantus.sql import jsonpath as _jsonpath
+
+            path = ev(args[1]) if len(args) > 1 else None
+            if val is None or path is None:
+                return [], "json"
+            doc = _as_json(val)
+            return _jsonpath.query(doc, str(path)), "json"
         if name in ("jsonb_array_elements", "json_array_elements"):
             return _as_json_list(val), "json"
         if name in ("jsonb_array_elements_text", "json_array_elements_text"):

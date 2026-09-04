@@ -434,6 +434,17 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         rec = typemap.RecordValue((f"f{i + 1}", v) for i, v in enumerate(vals))
         rec.field_oids = tuple(_row_field_oid(e) for e in node.expressions)
         return rec
+    if getattr(exp, "ToNumber", None) is not None and isinstance(node, exp.ToNumber):
+        # sqlglot gives `to_number` its OWN node (this + format) rather than an
+        # Anonymous call, so the name-keyed dispatch in `_call_func` never saw
+        # it and every `to_number(...)` answered NULL.
+        from secantus.sql import numformat as _numformat
+
+        val = evaluate(node.this, scope, ctx)
+        fmt = evaluate(node.args.get("format"), scope, ctx)
+        if val is None or fmt is None:
+            return None
+        return _numformat.to_number(_as_text(val), _as_text(fmt))
     if isinstance(node, exp.Interval):  # interval '1 day' (added to / subtracted
         return _eval_interval(node, scope, ctx)  # from a date via _Interval.__radd__)
     if isinstance(node, exp.Collate):
@@ -5252,6 +5263,12 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         from secantus.sql import ranges as _ranges
 
         return _ranges.lower_bound(args[0]) if name == "lower" else _ranges.upper_bound(args[0])
+    if name == "to_number":
+        from secantus.sql import numformat as _numformat
+
+        if not args or args[0] is None or (len(args) > 1 and args[1] is None):
+            return None
+        return _numformat.to_number(_as_text(args[0]), _as_text(args[1]) if len(args) > 1 else "")
     if name in (
         "jsonb_path_query",
         "jsonb_path_query_array",

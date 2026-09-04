@@ -12750,6 +12750,9 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     # ``gen_random_uuid()`` (the dedicated ``exp.Uuid`` node) -> uuid.
     if getattr(exp, "Uuid", None) is not None and isinstance(node, exp.Uuid):
         return "uuid"
+    # ``to_number(text, fmt)`` (its own node, not an Anonymous call) -> numeric.
+    if getattr(exp, "ToNumber", None) is not None and isinstance(node, exp.ToNumber):
+        return "numeric"
     # bytea: ``encode(bytea, fmt)`` -> text; ``decode(text, fmt)`` -> bytea; and
     # ``bytea || bytea`` -> bytea (the dedicated Encode/Decode nodes).
     if getattr(exp, "Encode", None) is not None and isinstance(node, exp.Encode):
@@ -13315,6 +13318,8 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         # is a dict internally, and the default `text` tag sends it through the
         # JSON renderer, so the client receives `{"tsvector": {...}}` instead of
         # `'brown' 'quick'`.
+        if fname == "to_number":
+            return "numeric"
         if fname == "numnode":
             return "int4"
         if fname == "querytree":

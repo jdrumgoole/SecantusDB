@@ -12626,3 +12626,36 @@ reported 23 divergences instead of the real 13, with the wrong diagnosis
 (`to_tsvector` looked broken; it was fine). **A normalising cast in a probe
 puts one code path in front of every assertion.** Compare values directly
 where the client can render them.
+
+## Advisory locks, 2PC, and a scout (2026-09-04)
+
+**Advisory locks are correct** — 15 two-connection scenarios against
+PostgreSQL 14.13 (session and transaction scope, reentrancy needing matching
+unlocks, shared vs exclusive, the two-key form, release on COMMIT and ROLLBACK,
+`pg_advisory_unlock_all`, `pg_locks` columns, negative and int64 keys) all
+match. The lead that prompted this — a batch-10 reading of "zero locks held"
+for `pg_advisory_xact_lock` — was a PROBE ARTIFACT: the call ran in autocommit,
+so the implicit transaction committed and released the lock immediately. No bug.
+
+**Two-phase commit could not be compared.** The local PostgreSQL runs
+`max_prepared_transactions = 0`, so `PREPARE TRANSACTION` answers
+`55000 prepared transactions are disabled`. Comparing needs that setting raised
+and the server restarted — a change to a shared reference server, so it was not
+made. A written 2PC probe exists in the session scratch; re-run it after
+enabling the setting.
+
+Open items from the scout, in descending value:
+
+1. **`LATERAL <srf>(...)` is unsupported** — `FROM t, LATERAL unnest(t.arr) AS
+   x` answers `0A000 unsupported LATERAL source`, and so do the
+   `generate_series` and `jsonb_array_elements` forms. Wrapping the bare call
+   in the `SELECT` it is shorthand for was TRIED AND REVERTED: it clears the
+   first error and lands on the next one (`only a single-table LATERAL subquery
+   … is supported`), because the lateral planner cannot take a FROM-less
+   source. The real fix is in that planner, not in the source rewrite.
+2. **`LATERAL (SELECT <expr from outer>) alias` fails** with `0A000 aggregate
+   without FROM is not supported` — a FROM-less correlated lateral, same root
+   cause as (1). Confirmed present at baseline, not a regression.
+3. **Hypothetical-set aggregates are unsupported** — `rank(2) WITHIN GROUP
+   (ORDER BY id)` is `0A000`. `percentile_cont` / `percentile_disc` / `mode`
+   all work.

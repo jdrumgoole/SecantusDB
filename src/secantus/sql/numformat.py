@@ -18,6 +18,8 @@ from __future__ import annotations
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
+from . import errors
+
 
 class MoneyError(ValueError):
     """A malformed money literal."""
@@ -293,3 +295,45 @@ def _sign_against_digits(body: str, mark: str) -> str:
     padded = " " + body
     first = next((i for i, c in enumerate(padded) if c != " "), len(padded) - 1)
     return prefix + padded[: first - 1] + mark + padded[first:]
+
+
+def to_number(value: Any, fmt: str) -> Decimal:
+    """``to_number(text, format)`` — parse `value` under the format mask.
+
+    PostgreSQL is forgiving here: the mask's decoration (``,`` / ``G`` / ``L``
+    / ``$`` / ``%`` / spaces) is skipped rather than required to line up, and
+    what matters is the digits, the sign and how many decimal places the mask
+    allows. Measured against 14.13:
+
+    * decoration is dropped — ``to_number('1,234.50','9,999.99')`` is 1234.50,
+      ``to_number('$12.34','L99.99')`` is 12.34, ``to_number('12%','99%')``
+      is 12;
+    * the sign may lead (``S``), trail (``MI``: ``'12-'``) or be angle
+      brackets (``PR``: ``'<12>'`` is -12);
+    * excess decimals are TRUNCATED, not rounded — ``to_number('12.345',
+      '99.99')`` is 12.34;
+    * the mask does not pad: ``to_number('12','99.99')`` is 12, not 12.00;
+    * no digits at all is ``22P02``.
+    """
+    text = "" if value is None else str(value)
+    negative = text.strip().startswith("-") or text.strip().endswith("-")
+    if text.strip().startswith("<") and text.strip().endswith(">"):
+        negative = True
+    # The mask's decimal separator is `.` or `D`; count the digit places after
+    # it to know how far to truncate.
+    mask = (fmt or "").upper()
+    sep_at = min((i for i in (mask.find("."), mask.find("D")) if i >= 0), default=-1)
+    places = sum(1 for c in mask[sep_at + 1 :] if c in "09") if sep_at >= 0 else 0
+    digits = "".join(c for c in text if c.isdigit() or c == ".")
+    if not any(c.isdigit() for c in digits):
+        # PostgreSQL reports the residue after the mask has consumed what it
+        # can, which for input with no digits at all is a single space — the
+        # same message for `to_number('abc','999')` and `to_number('','999')`
+        # (both measured against 14.13).
+        raise errors.SQLError("22P02", 'invalid input syntax for type numeric: " "')
+    if "." in digits:
+        whole, _, frac = digits.partition(".")
+        frac = frac.replace(".", "")[:places]
+        digits = f"{whole}.{frac}" if frac else whole
+    out = Decimal(digits)
+    return -out if negative else out
