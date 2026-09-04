@@ -1094,10 +1094,16 @@ def convert_to_string(value: Any) -> Any:
     if value is None or value is MISSING:
         return None
     # `bson.Code` subclasses `str` but mongod refuses to convert one, so it is
-    # rejected here rather than falling into the str branch below.
+    # rejected here rather than falling into the str branch below. The type name
+    # is DERIVED, not hardcoded: a Code carrying a scope is `javascriptWithScope`
+    # and mongod says so (probed 8.2.11, 2026-09-04). This site was fixed for
+    # `$toString` alone at some point, which is why the rest of the conversion
+    # family still parsed a Code as a string until the arms in `_convert_value`
+    # were tightened.
     if isinstance(value, bson.Code):
         raise ExpressionError(
-            "Unsupported conversion from javascript to string in $convert with no onError value",
+            f"Unsupported conversion from {_bson_type_name(value)} to string "
+            f"in $convert with no onError value",
             code=241,
             code_name="ConversionFailure",
         )
@@ -3133,7 +3139,8 @@ def _op_substr_cp(arg: Any, ctx: _Ctx) -> Any:
 
 def _op_str_len_cp(arg: Any, ctx: _Ctx) -> Any:
     s = _eval(arg, ctx)
-    if not isinstance(s, str):
+    # See `$strLenBytes`: a `bson.Code` is not a BSON string.
+    if not is_bson_string(s):
         raise ExpressionError(
             f"$strLenCP requires a string argument, found: {_bson_type_name(s)}",
             code=34471,
@@ -3241,7 +3248,11 @@ def _op_index_of_bytes(arg: Any, ctx: _Ctx) -> Any:
 
 def _op_str_len_bytes(arg: Any, ctx: _Ctx) -> Any:
     s = _eval(arg, ctx)
-    if not isinstance(s, str):
+    # `is_bson_string`, not `isinstance(s, str)`: `bson.Code` subclasses `str`,
+    # so a JavaScript value passed that test and this RETURNED A LENGTH where
+    # mongod refuses the argument (probed 8.2.11, 2026-09-04). The error path
+    # below already named the type correctly -- it was simply never reached.
+    if not is_bson_string(s):
         raise ExpressionError(
             f"$strLenBytes requires a string argument, found: {_bson_type_name(s)}",
             code=34473,
@@ -4540,6 +4551,23 @@ def _parse_date_string(value: str) -> _dt.datetime:
 
 
 def _convert_value(value: Any, target: Any) -> Any:
+    """Convert ``value`` to ``target``, or raise mongod's ConversionFailure.
+
+    The string arms below test `is_bson_string`, NOT `isinstance(value, str)`:
+    `bson.Code` subclasses `str`, so a JavaScript value was reaching the string
+    PARSERS -- `{$toInt: Code("x=1")}` reported "Did not consume whole string"
+    where mongod answers `241 Unsupported conversion from javascript to int`,
+    and `$toDate` tried to parse the source text as a date. With the arms
+    tightened a Code simply falls through to the raise at the end, which already
+    produces mongod's message and picks up `javascriptWithScope` for a scoped
+    one.
+
+    The ``bool`` target is the DELIBERATE exception and keeps its plain
+    `isinstance` test: `{$toBool: Code("x=1")}` is `true` on mongod, not a
+    conversion failure. That asymmetry was measured across all eight targets
+    (8.2.11, 2026-09-04), not assumed -- guarding every target uniformly would
+    have broken the one that works.
+    """
     from bson import ObjectId as _ObjectId
 
     code = _CONVERT_TARGETS.get(target)
@@ -4552,7 +4580,7 @@ def _convert_value(value: Any, target: Any) -> Any:
             return float(value)
         if isinstance(value, Decimal128):
             return float(value.to_decimal())
-        if isinstance(value, str):
+        if is_bson_string(value):
             return _parse_float_string(value)
         if isinstance(value, _dt.datetime):
             return value.timestamp() * 1000.0
@@ -4576,7 +4604,7 @@ def _convert_value(value: Any, target: Any) -> Any:
     elif code == 7:
         if isinstance(value, _ObjectId):
             return value
-        if isinstance(value, str):
+        if is_bson_string(value):
             try:
                 return _ObjectId(value)
             except Exception as exc:
@@ -4637,7 +4665,7 @@ def _convert_value(value: Any, target: Any) -> Any:
             return _epoch_millis_to_date(value)
         elif isinstance(value, Decimal128):
             return _epoch_millis_to_date(float(value.to_decimal()))
-        elif isinstance(value, str):
+        elif is_bson_string(value):
             return _parse_date_string(value)
     elif code in (16, 18):
         # 16 = int32, 18 = int64. Wrap as ``Int64`` for code 18 so the
@@ -4680,7 +4708,7 @@ def _convert_value(value: Any, target: Any) -> Any:
                 # ``1 internal server error``.
                 raise _infinity_to_integer_error()
             return _wrap(int(dec), _render_number(value))
-        if isinstance(value, str):
+        if is_bson_string(value):
             n = _parse_int_string(value)
             if not lo <= n <= hi:
                 # From a STRING, mongod reports the overflow as a parse
@@ -4700,7 +4728,7 @@ def _convert_value(value: Any, target: Any) -> Any:
             from secantus.numerics import decimal_from_double
 
             return Decimal128(decimal_from_double(value))
-        if isinstance(value, str):
+        if is_bson_string(value):
             return _parse_decimal_string(value)
         if isinstance(value, _dt.datetime):
             # Epoch milliseconds, like the long and double targets. `$toInt` of
@@ -5042,7 +5070,9 @@ def _op_binary_size(arg: Any, ctx: _Ctx) -> Any:
     v = _eval(arg, ctx)
     if v is None:
         return None
-    if isinstance(v, str):
+    # See `$strLenBytes`: a `bson.Code` is not a BSON string, and mongod
+    # refuses it here rather than measuring its source text.
+    if is_bson_string(v):
         return len(v.encode("utf-8"))
     if isinstance(v, (bytes, bson.Binary)):
         return len(v)
