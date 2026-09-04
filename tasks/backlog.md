@@ -12591,3 +12591,38 @@ deliverable, and a `stop_after=1` drain returns it — which reads as the curren
 scenario delivering something it never sent. That produced a convincing but
 false "delivers twice" result before the probe drained the listener to empty
 between scenarios. Any LISTEN/NOTIFY probe needs that isolation.
+
+## Full-text search (2026-09-04) — swept, eight fixes, three gaps left
+
+29 shapes against PostgreSQL 14.13; 13 diverged, now 5. Fixed the `::text`
+renderings, `length`, `tsvector ||` (which was returning only its right
+operand), `&&` / `||` on tsquery, the `simple` configuration, and added
+`strip` / `numnode` / `querytree` / `tsvector_to_array` /
+`array_to_tsvector`. See `tests/test_sql_sweep_seventeen.py` and
+`tools/probes/pg_corpora/fts.sql`.
+
+Three gaps remain, all needing more than a patch:
+
+1. **No stemming.** `to_tsvector('english','running runs ran')` is
+   `'ran':3 'running':1 'runs':2` where PostgreSQL gives `'ran':3 'run':1,2`,
+   and `cats` does not match `cat`. This is the largest functional gap in the
+   feature — a query that should match does not — and it needs a Snowball /
+   Porter stemmer per configuration. `fts.py`'s docstring has always said so.
+2. **`setweight` does not exist**, and cannot until the tsvector representation
+   carries a per-lexeme weight (`{lexeme: [pos, …]}` has nowhere to put the
+   `A`/`B`/`C`/`D`). Weighted `ts_rank` has the same blocker.
+3. **`!!` is not tsquery negation.** It parses as `Not(Not(x))` and evaluates
+   as boolean, answering `true` where PostgreSQL answers `!'quick'`. The
+   function form `tsquery_not` works; only the operator spelling does not.
+
+`ts_rank` also returns a different number and type (float8 where PostgreSQL
+says float4) — `fts.py` documents it as a normalised match count rather than
+PostgreSQL's cover-density algorithm.
+
+**A probe-hygiene note, and a costly one.** The first corpus wrote
+`to_tsvector(...)::text` on every line to normalise the output, and that cast
+was itself one of the bugs — so all 27 lines inherited it and the sweep
+reported 23 divergences instead of the real 13, with the wrong diagnosis
+(`to_tsvector` looked broken; it was fine). **A normalising cast in a probe
+puts one code path in front of every assertion.** Compare values directly
+where the client can render them.
