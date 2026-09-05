@@ -92,3 +92,36 @@ def test_a_valid_spec_has_no_parse_time_problem():
         {"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "day"}},
     ):
         assert _expression_shape_problem(spec) is None, spec
+
+
+# --- `$rand` -------------------------------------------------------------
+#
+# 45 shapes, one operator: every wrong argument to `$rand` already produced the
+# right code and the right sentence, and carried the EXECUTOR wrapper where
+# mongod uses the stage's. Both ways of getting it wrong are parse errors.
+
+
+@pytest.mark.parametrize(
+    ("arg", "expected"),
+    [
+        # An EMPTY document or array is the no-argument call and is VALID.
+        # `{$rand: []}` being accepted is the easy one to miss.
+        ({}, None),
+        ([], None),
+        # A non-empty one of either: "does not currently accept arguments".
+        ({"x": 1}, (3040501, "$rand does not currently accept arguments")),
+        ([1], (3040501, "$rand does not currently accept arguments")),
+        ({"$literal": 1}, (3040501, "$rand does not currently accept arguments")),
+        # A SCALAR is a different complaint with a different code -- two codes
+        # for what reads as one mistake, which is why this is not a single
+        # "must be a document" check.
+        (0, (10065, "invalid parameter: expected an object ($rand)")),
+        (1, (10065, "invalid parameter: expected an object ($rand)")),
+        ("s", (10065, "invalid parameter: expected an object ($rand)")),
+        (None, (10065, "invalid parameter: expected an object ($rand)")),
+        (True, (10065, "invalid parameter: expected an object ($rand)")),
+    ],
+)
+def test_rand_argument_problems_are_parse_errors(arg, expected):
+    """Measured against mongod 8.2.11 (2026-09-05) across all ten shapes."""
+    assert _expression_shape_problem({"$rand": arg}) == expected

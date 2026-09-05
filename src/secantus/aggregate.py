@@ -891,6 +891,19 @@ def _expression_shape_problem(spec: Any) -> tuple[int, str] | None:
                     code,
                     f"specification must be an object; found {key}: {bson_value_repr(value)}",
                 )
+            # `$rand` takes no arguments, and BOTH ways of getting that wrong
+            # are parse errors carrying the stage wrapper. Two codes, measured
+            # 8.2.11 (2026-09-05): a non-empty document or array is 3040501,
+            # any scalar is 10065. An EMPTY document or array is valid and
+            # returns a double -- `{$rand: []}` is accepted, which is easy to
+            # miss. The evaluator already produced both codes and both
+            # sentences correctly; only the wrapper was wrong, on 45 shapes.
+            if key == "$rand":
+                if isinstance(value, (Mapping, list)):
+                    if value:
+                        return (3040501, "$rand does not currently accept arguments")
+                else:
+                    return (10065, "invalid parameter: expected an object ($rand)")
             # A required key missing from an operator's spec document. LAST of
             # the per-key checks on purpose: mongod reports an UNRECOGNISED key
             # before a missing required one, so `{$firstN: {k: 1}}` is "Unknown
