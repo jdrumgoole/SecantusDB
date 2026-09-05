@@ -741,6 +741,33 @@ _IDL_UNKNOWN_FIELD: dict[str, tuple[str, ...]] = {
 }
 
 
+#: Operators whose "not enough arguments" complaint has its OWN code and its own
+#: wording, so they cannot ride `_EXPRESSION_ARITY`'s generic sentence. Both are
+#: PARSE errors on mongod and carry the stage wrapper.
+#:
+#: mongod's two wordings are not consistent with each other and both are
+#: reproduced verbatim: `$ifNull` puts a COMMA before `had:` and `$setEquals`
+#: does not (probed 8.2.11, 2026-09-05). `$setDifference` / `$setIsSubset` are
+#: absent on purpose -- they use the generic "takes exactly 2 arguments" (16020)
+#: and already parse correctly.
+_PARSE_TIME_MIN_ARGS: dict[str, tuple[int, int, str]] = {
+    "$ifNull": (2, 1257300, "$ifNull needs at least two arguments, had: {n}"),
+    "$setEquals": (2, 17045, "$setEquals needs at least two arguments had: {n}"),
+}
+
+#: Operator spec documents with a REQUIRED key. Missing it is a parse error, so
+#: it carries the stage wrapper rather than the optimizer's. Codes measured
+#: individually against 8.2.11 (2026-09-05) -- they share nothing.
+_PARSE_TIME_REQUIRED_KEY: dict[str, tuple[str, int, str]] = {
+    "$convert": ("input", 9, "Missing 'input' parameter to $convert"),
+    "$dateDiff": ("startDate", 5166303, "Missing 'startDate' parameter to $dateDiff"),
+    "$firstN": ("n", 5787906, "Missing value for 'n'"),
+    "$lastN": ("n", 5787906, "Missing value for 'n'"),
+    "$maxN": ("n", 5787906, "Missing value for 'n'"),
+    "$minN": ("n", 5787906, "Missing value for 'n'"),
+}
+
+
 def _expression_shape_problem(spec: Any) -> tuple[int, str] | None:
     """The first arity / spec-shape error in `spec`, as mongod parses it.
 
@@ -751,6 +778,15 @@ def _expression_shape_problem(spec: Any) -> tuple[int, str] | None:
     """
     if isinstance(spec, Mapping):
         for key, value in spec.items():
+            # Per-operator minimums, before the generic arity table: these two
+            # carry their own code and wording, and were reaching the EVALUATOR,
+            # which meant the right message under the optimizer's wrapper
+            # instead of the stage's. 76 shapes (probed 8.2.11, 2026-09-05).
+            if (own := _PARSE_TIME_MIN_ARGS.get(key)) is not None:
+                low, code, template = own
+                count = len(value) if isinstance(value, list) else 1
+                if count < low:
+                    return (code, template.format(n=count))
             if (bounds := _EXPRESSION_ARITY.get(key)) is not None:
                 low, high = bounds
                 count = len(value) if isinstance(value, list) else 1
@@ -854,6 +890,30 @@ def _expression_shape_problem(spec: Any) -> tuple[int, str] | None:
                 return (
                     code,
                     f"specification must be an object; found {key}: {bson_value_repr(value)}",
+                )
+            # A required key missing from an operator's spec document. LAST of
+            # the per-key checks on purpose: mongod reports an UNRECOGNISED key
+            # before a missing required one, so `{$firstN: {k: 1}}` is "Unknown
+            # argument for 'n' operator: k" and only `{$firstN: {}}` is "Missing
+            # value for 'n'". Placing this earlier changed the code on SIX shapes
+            # that were already right -- the same ordering the `$getField` and
+            # date-extractor branches above already document. Probed 8.2.11
+            # (2026-09-05).
+            if (req := _PARSE_TIME_REQUIRED_KEY.get(key)) is not None and isinstance(
+                value, Mapping
+            ):
+                needed, code, message = req
+                if needed not in value:
+                    return (code, message)
+            if (
+                key == "$dateFromParts"
+                and isinstance(value, Mapping)
+                and "year" not in value
+                and "isoWeekYear" not in value
+            ):
+                return (
+                    40516,
+                    "$dateFromParts requires either 'year' or 'isoWeekYear' to be present",
                 )
             found = _expression_shape_problem(value)
             if found:
