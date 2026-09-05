@@ -26,7 +26,7 @@ fn plan_ok(sql: &str) -> Statement {
 #[test]
 fn create_table_maps_the_primary_key_onto_id() {
     match plan_ok("CREATE TABLE t (id int PRIMARY KEY, name text, n int)") {
-        Statement::CreateTable(def) => {
+        Statement::CreateTable(def, _) => {
             assert_eq!(def.name, "t");
             assert_eq!(def.columns.len(), 3);
             // libpg_query qualifies built-ins; the catalog stores the bare name.
@@ -496,10 +496,29 @@ fn transaction_statements_are_planned() {
             other => panic!("wrong statement for {sql}: {other:?}"),
         }
     }
-    // Savepoints would need machinery this server does not have; refusing is
-    // honest, silently accepting would lose the semantics a client relies on.
-    let err = plan("SAVEPOINT s1", &lookup).expect_err("savepoint");
-    assert_eq!(err.sqlstate(), "0A000");
+    // Savepoints are planned too -- a nested `conn.transaction()` block in any
+    // client becomes one, and the name has to survive both spellings.
+    for (sql, want) in [
+        ("SAVEPOINT s1", TransactionControl::Savepoint("s1".into())),
+        ("RELEASE s1", TransactionControl::Release("s1".into())),
+        (
+            "RELEASE SAVEPOINT s1",
+            TransactionControl::Release("s1".into()),
+        ),
+        (
+            "ROLLBACK TO s1",
+            TransactionControl::RollbackTo("s1".into()),
+        ),
+        (
+            "ROLLBACK TO SAVEPOINT s1",
+            TransactionControl::RollbackTo("s1".into()),
+        ),
+    ] {
+        match plan_ok(sql) {
+            Statement::Transaction(c) => assert_eq!(c, want, "for {sql}"),
+            other => panic!("wrong statement for {sql}: {other:?}"),
+        }
+    }
 }
 
 /// `SELECT` with no FROM, including the session functions a connecting client
@@ -889,7 +908,7 @@ fn array_comparison_follows_postgres_null_rules() {
 #[test]
 fn array_type_keeps_its_brackets() {
     match plan_ok("CREATE TABLE t (id int PRIMARY KEY, xs int[], names text[])") {
-        Statement::CreateTable(ct) => {
+        Statement::CreateTable(ct, _) => {
             let types: Vec<&str> = ct.columns.iter().map(|c| c.pg_type.as_str()).collect();
             assert_eq!(types, vec!["int4", "int4[]", "text[]"]);
         }
@@ -1881,4 +1900,21 @@ fn a_series_reads_its_bounds_from_parameters() {
         err.to_string(),
         "function generate_series(integer, double precision) does not exist"
     );
+}
+
+/// `CREATE TABLE IF NOT EXISTS` is a NO-OP on an existing table.
+///
+/// The flag has to reach the executor, which is the only place that knows
+/// whether the table is there: a fixture that creates a table if it is missing
+/// used to fail the second time a session ran it.
+#[test]
+fn create_table_carries_if_not_exists() {
+    match plan_ok("CREATE TABLE t (id int)") {
+        Statement::CreateTable(_, if_not_exists) => assert!(!if_not_exists),
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("CREATE TABLE IF NOT EXISTS t (id int)") {
+        Statement::CreateTable(_, if_not_exists) => assert!(if_not_exists),
+        other => panic!("wrong statement: {other:?}"),
+    }
 }

@@ -4548,6 +4548,13 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `generate_series(1, 3, 0.5)` walks by halves there and is refused here. The
   series carries `i64` bounds; a numeric series needs decimal bounds and a
   decimal-valued output column.
+- **Rust PG server: a SAVEPOINT captures whole tables, so its cost is the size
+  of what the block writes.** WiredTiger has no savepoint, so one here is a set
+  of pre-images: the first write to a table after a savepoint copies that
+  table's documents into it. Correct for any size, but a savepoint taken before
+  a write to a large table copies the whole table into memory. Lazy capture is
+  what keeps the common case free (a savepoint nobody writes through costs
+  nothing), and a per-row undo log would be the fix if the cost ever bites.
 - **Rust PG server: range and multirange OPERATORS are unsupported.** Both type
   families themselves (literals, constructors, casts, canonicalisation, merging,
   parameters in both wire formats) are in; `@>` / `<@` / `&&` / `-|-` and the

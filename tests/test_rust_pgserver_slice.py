@@ -13,6 +13,7 @@ excluded from the clean workspace):
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import shutil
 import socket
@@ -2068,3 +2069,120 @@ def test_a_series_takes_its_bounds_as_parameters(home: Path) -> None:
         assert 'invalid input syntax for type integer: "x"' in str(text_err.value)
         with pytest.raises(psycopg.errors.UndefinedFunction):
             cur.execute("select * from generate_series(1, 3::float8)")
+
+
+def test_savepoints_undo_only_what_came_after_them(home: Path) -> None:
+    """SAVEPOINT / RELEASE / ROLLBACK TO, which is how nested blocks are built.
+
+    WiredTiger has no savepoint of its own, so one here is a set of pre-images:
+    before a statement writes a table, every open savepoint that has not yet
+    captured that table captures it. The capture and the restore both have to
+    go through the transaction's own session — a read outside it cannot see the
+    block's uncommitted rows, and a write outside it lands in another snapshot.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create table sp (id int4)")
+
+        cur.execute("begin")
+        cur.execute("insert into sp values (1)")
+        cur.execute("savepoint s1")
+        assert cur.statusmessage == "SAVEPOINT"
+        cur.execute("insert into sp values (2)")
+        cur.execute("rollback to savepoint s1")
+        assert cur.statusmessage == "ROLLBACK"
+        cur.execute("select id from sp order by id")
+        assert [r[0] for r in cur.fetchall()] == [1]
+        # The savepoint stays open, and captures again from what was restored.
+        cur.execute("insert into sp values (3)")
+        cur.execute("rollback to savepoint s1")
+        cur.execute("select id from sp order by id")
+        assert [r[0] for r in cur.fetchall()] == [1]
+        cur.execute("commit")
+
+        # RELEASE keeps the inner writes, and the OUTER savepoint must still be
+        # able to undo them — the released frame's pre-images merge down.
+        cur.execute("delete from sp")
+        cur.execute("begin")
+        cur.execute("insert into sp values (10)")
+        cur.execute("savepoint outer_sp")
+        cur.execute("insert into sp values (20)")
+        cur.execute("savepoint inner_sp")
+        cur.execute("insert into sp values (30)")
+        cur.execute("release savepoint inner_sp")
+        assert cur.statusmessage == "RELEASE"
+        cur.execute("rollback to savepoint outer_sp")
+        cur.execute("select id from sp order by id")
+        assert [r[0] for r in cur.fetchall()] == [10]
+        cur.execute("commit")
+
+        # A DDL statement inside a savepoint is undone with it.
+        cur.execute("begin")
+        cur.execute("savepoint ddl")
+        cur.execute("create table sp2 (id int4)")
+        cur.execute("rollback to savepoint ddl")
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            cur.execute("select * from sp2")
+        cur.execute("rollback")
+
+        # Rolling back to a savepoint un-poisons a failed block.
+        cur.execute("begin")
+        cur.execute("insert into sp values (40)")
+        cur.execute("savepoint ok")
+        with pytest.raises(psycopg.errors.UndefinedColumn):
+            cur.execute("select nosuchcolumn from sp")
+        with pytest.raises(psycopg.errors.InFailedSqlTransaction):
+            cur.execute("select 1")
+        cur.execute("rollback to savepoint ok")
+        cur.execute("select 1")
+        assert cur.fetchone() == (1,)
+        cur.execute("commit")
+        cur.execute("select id from sp order by id")
+        assert [r[0] for r in cur.fetchall()] == [10, 40]
+
+        # The names that do not exist, and the block that is not open.
+        cur.execute("begin")
+        with pytest.raises(psycopg.errors.InvalidSavepointSpecification):
+            cur.execute("rollback to savepoint nope")
+        cur.execute("rollback")
+        for sql in ["savepoint outside", "release outside", "rollback to savepoint outside"]:
+            with pytest.raises(psycopg.errors.NoActiveSqlTransaction):
+                cur.execute(sql)
+
+
+def test_a_nested_psycopg_transaction_block(home: Path) -> None:
+    """The API that actually reaches the savepoint code.
+
+    psycopg turns a nested `conn.transaction()` into a savepoint, so this is
+    the shape a client produces without ever writing the word.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        conn.cursor().execute("create table nested (id int4)")
+        with conn.transaction():
+            conn.cursor().execute("insert into nested values (1)")
+            with contextlib.suppress(ZeroDivisionError), conn.transaction():
+                conn.cursor().execute("insert into nested values (2)")
+                raise ZeroDivisionError("undo the inner block only")
+        cur = conn.cursor()
+        cur.execute("select id from nested order by id")
+        assert [r[0] for r in cur.fetchall()] == [1]
+
+
+def test_create_table_if_not_exists_is_a_no_op(home: Path) -> None:
+    """…on a table that is already there, where a bare CREATE is `42P07`.
+
+    The idiomatic "create it if it is missing" fixture ran twice in one session
+    and failed the second time.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create table if not exists inex (id int4)")
+        cur.execute("insert into inex values (1)")
+        cur.execute("create table if not exists inex (id int4)")
+        assert cur.statusmessage == "CREATE TABLE"
+        # …and it did not empty the table.
+        cur.execute("select count(*) from inex")
+        assert cur.fetchone()[0] == 1
+        with pytest.raises(psycopg.errors.DuplicateTable):
+            cur.execute("create table inex (id int4)")

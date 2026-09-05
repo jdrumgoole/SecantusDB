@@ -92,6 +92,25 @@ pub struct PgHandler {
     /// than a missing feature. Lock-free for the same reason as
     /// `in_transaction`.
     txn_failed: std::sync::atomic::AtomicBool,
+    /// The open savepoints, oldest first.
+    ///
+    /// WiredTiger has no savepoint of its own, so one is a set of PRE-IMAGES:
+    /// before a statement writes a table, every open savepoint that has not
+    /// yet captured that table captures it, and `ROLLBACK TO` puts the
+    /// captured contents back. Capturing lazily is what keeps it affordable --
+    /// a savepoint nobody writes through costs nothing.
+    savepoints: Mutex<Vec<Savepoint>>,
+}
+
+/// One open savepoint and the table contents it can put back.
+struct Savepoint {
+    name: String,
+    /// Table -> its documents when this savepoint was established, or `None`
+    /// when the table did not exist then (so rolling back DROPS it).
+    tables: HashMap<String, Option<Vec<Vec<u8>>>>,
+    /// The uncommitted-DDL map as it was, so a table created after this
+    /// savepoint stops being visible when it is rolled back.
+    uncommitted: HashMap<String, Option<TableDef>>,
 }
 
 /// A declared cursor's materialised result.
@@ -135,6 +154,7 @@ impl PgHandler {
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             binary_results: std::sync::atomic::AtomicBool::new(false),
             txn_failed: std::sync::atomic::AtomicBool::new(false),
+            savepoints: Mutex::new(Vec::new()),
         }
     }
 
@@ -738,6 +758,117 @@ impl PgHandler {
     ///
     /// Only while a transaction is open: outside one the write is already
     /// committed and the catalog is the truth.
+    /// The tables a statement is about to write, so the open savepoints can
+    /// capture them first.
+    ///
+    /// DDL adds the CATALOG collection: a `CREATE TABLE` inside a savepoint
+    /// writes a catalog row, and putting the table's contents back without the
+    /// catalog would leave a table the server still believes in.
+    fn written_tables(stmt: &Statement) -> Vec<String> {
+        let mut out = match stmt {
+            Statement::Insert(i) => vec![i.table.clone()],
+            Statement::Update(u) => vec![u.table.clone()],
+            Statement::Delete(d) => vec![d.table.clone()],
+            Statement::CopyFrom(c) => vec![c.table.clone()],
+            Statement::CreateTable(def, _) => {
+                vec![def.name.clone(), CATALOG_COLLECTION.to_string()]
+            }
+            Statement::DropTable(d) => {
+                let mut v = d.tables.clone();
+                v.push(CATALOG_COLLECTION.to_string());
+                v
+            }
+            _ => Vec::new(),
+        };
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Capture, into every open savepoint that has not got it yet, the contents
+    /// of each table a statement is about to write.
+    ///
+    /// "Has not got it yet" is what makes a savepoint's view the state at its
+    /// ESTABLISHMENT: the first write to a table after the savepoint captures
+    /// the table as it was before that write, and later writes find the entry
+    /// already there and leave it alone.
+    fn capture_for_savepoints(&self, stmt: &Statement) -> PgWireResult<()> {
+        let tables = {
+            let savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
+            if savepoints.is_empty() {
+                return Ok(());
+            }
+            let wanted = Self::written_tables(stmt);
+            // Read what is missing WITHOUT holding the savepoint lock, because
+            // reading goes back through storage.
+            wanted
+                .into_iter()
+                .filter(|t| savepoints.iter().any(|sp| !sp.tables.contains_key(t)))
+                .collect::<Vec<_>>()
+        };
+        let mut captured: Vec<(String, Option<Vec<Vec<u8>>>)> = Vec::new();
+        self.in_open_transaction(|| {
+            for table in tables {
+                // A table that does not exist is captured as `None`, which is not
+                // the same as an empty one: rolling back has to DROP it.
+                let docs = match self.storage.collection_exists(&self.db, &table) {
+                    Ok(true) => Some(
+                        self.storage
+                            .find_matching(&self.db, &table, &Document::new())
+                            .map_err(|e| Self::storage_err("could not read for a savepoint", e))?,
+                    ),
+                    Ok(false) => None,
+                    Err(e) => return Err(Self::storage_err("could not read for a savepoint", e)),
+                };
+                captured.push((table, docs));
+            }
+            Ok(())
+        })?;
+        let mut savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
+        for (table, docs) in captured {
+            for sp in savepoints.iter_mut() {
+                sp.tables
+                    .entry(table.clone())
+                    .or_insert_with(|| docs.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Put one table back to a captured state.
+    fn restore_table(&self, table: &str, docs: Option<&Vec<Vec<u8>>>) -> PgWireResult<()> {
+        let exists = self
+            .storage
+            .collection_exists(&self.db, table)
+            .map_err(|e| Self::storage_err("could not check a table", e))?;
+        match docs {
+            // It did not exist at the savepoint, so rolling back drops it.
+            None => {
+                if exists {
+                    self.storage
+                        .drop_collection(&self.db, table)
+                        .map_err(|e| Self::storage_err("could not drop the table", e))?;
+                }
+            }
+            Some(docs) => {
+                if !exists {
+                    self.storage
+                        .create_collection(&self.db, table)
+                        .map_err(|e| Self::storage_err("could not create the table", e))?;
+                }
+                self.storage
+                    .delete_matching(&self.db, table, &Document::new(), 0, &Document::new(), None)
+                    .map_err(|e| Self::storage_err("could not clear the table", e))?;
+                if !docs.is_empty() {
+                    self.storage
+                        .insert(&self.db, table, docs.clone(), true)
+                        .map_err(|e| Self::storage_err("could not restore the table", e))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn note_uncommitted(&self, name: &str, def: Option<TableDef>) {
         if !self
             .in_transaction
@@ -801,6 +932,10 @@ impl PgHandler {
     }
 
     fn commit_implicit(&self) -> PgWireResult<()> {
+        self.savepoints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         // The block is over either way, so the failed-transaction gate
         // lifts with it. Left set it would refuse every later statement on
         // this connection, forever.
@@ -821,6 +956,10 @@ impl PgHandler {
     }
 
     fn rollback_implicit(&self) -> PgWireResult<()> {
+        self.savepoints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         // The block is over either way, so the failed-transaction gate
         // lifts with it. Left set it would refuse every later statement on
         // this connection, forever.
@@ -854,27 +993,54 @@ impl PgHandler {
             return Ok(vec![Response::EmptyQuery]);
         }
 
-        let stmt = self
-            .plan_in_transaction(sql, params)
+        // The failed-block gate comes BEFORE the planner's answer, because
+        // PostgreSQL's does: in an aborted block `select nosuchcolumn` is
+        // `25P02`, not `42703`. A SYNTAX error is the exception -- the parser
+        // runs first there too, so `selct 1` still answers `42601`.
+        let tz = self.session_timezone();
+        let planned = secantus_pgplan::plan_with_session(sql, &|n| self.lookup(n), params, &tz);
+        if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            let ends_the_block = matches!(
+                &planned,
+                Ok(Statement::Transaction(
+                    TransactionControl::Commit { .. }
+                        | TransactionControl::Rollback { .. }
+                        | TransactionControl::RollbackTo(_)
+                ))
+            );
+            let syntax_error = matches!(&planned, Err(e) if e.sqlstate() == "42601");
+            if !ends_the_block && !syntax_error {
+                return Err(Self::in_failed_transaction());
+            }
+        }
+        let stmt = planned
+            .map_err(|e| Self::err(&e))
             .inspect_err(|_| self.note_failure())?;
 
         // Transaction control is session state, not a storage operation.
-        if let Statement::Transaction(control) = stmt {
-            return self.transaction_control(control);
+        // ROLLBACK TO is exempt from the failed-block gate below, exactly as
+        // COMMIT and ROLLBACK are: rolling back to a savepoint is how a client
+        // RECOVERS from the error that poisoned the block.
+        if let Statement::Transaction(control) = &stmt {
+            return match control {
+                TransactionControl::Savepoint(_)
+                | TransactionControl::Release(_)
+                | TransactionControl::RollbackTo(_) => {
+                    // A savepoint statement that FAILS poisons the block like
+                    // any other: PostgreSQL's `3B001` for an unknown name
+                    // leaves the block aborted, and the next statement gets
+                    // `25P02` rather than its own error.
+                    self.savepoint_control(control)
+                        .inspect_err(|_| self.note_failure())
+                }
+                other => self.transaction_control(other.clone()),
+            };
         }
 
-        // Everything ELSE is refused once the transaction has failed. Only
-        // ending the block clears it, which is why the two arms above come
-        // first.
-        if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".into(),
-                "25P02".into(), // in_failed_sql_transaction
-                "current transaction is aborted, commands ignored until end of \
-                 transaction block"
-                    .into(),
-            ))));
-        }
+        // Before anything writes, the open savepoints capture what it is about
+        // to change -- there is no savepoint in WiredTiger to do it for us.
+        self.capture_for_savepoints(&stmt)
+            .inspect_err(|_| self.note_failure())?;
 
         // DECLARE runs its query NOW and keeps the rows, so the cursor can be
         // scrolled in both directions later. Collecting a row stream needs to
@@ -990,6 +1156,147 @@ impl PgHandler {
         }
     }
 
+    /// Run `f` inside the open user transaction, if there is one.
+    ///
+    /// A savepoint's captures and restores MUST go through the transaction's
+    /// own session: a read outside it cannot see the block's uncommitted rows,
+    /// and a write outside it lands in a different snapshot -- which is why the
+    /// first version of this restored nothing at all while reporting success.
+    fn in_open_transaction<T>(&self, f: impl FnOnce() -> PgWireResult<T>) -> PgWireResult<T> {
+        let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_mut() {
+            Some(handle) => self
+                .storage
+                .with_user_transaction(handle, f)
+                .map_err(|e| Self::storage_err("transaction failed", e))?,
+            None => f(),
+        }
+    }
+
+    /// PostgreSQL's answer to any statement in a block that has already failed.
+    fn in_failed_transaction() -> PgWireError {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "25P02".into(), // in_failed_sql_transaction
+            "current transaction is aborted, commands ignored until end of \
+             transaction block"
+                .into(),
+        )))
+    }
+
+    /// SAVEPOINT / RELEASE / ROLLBACK TO.
+    ///
+    /// All three need an open block: PostgreSQL answers `25P01` outside one,
+    /// and a name that is not open is `3B001`. A repeated name SHADOWS rather
+    /// than replaces, so the search is from the innermost outwards.
+    fn savepoint_control(&self, control: &TransactionControl) -> PgWireResult<Vec<Response>> {
+        let word = match control {
+            TransactionControl::Savepoint(_) => "SAVEPOINT",
+            TransactionControl::Release(_) => "RELEASE SAVEPOINT",
+            _ => "ROLLBACK TO SAVEPOINT",
+        };
+        if !self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "25P01".into(), // no_active_sql_transaction
+                format!("{word} can only be used in transaction blocks"),
+            ))));
+        }
+        let name = match control {
+            TransactionControl::Savepoint(n)
+            | TransactionControl::Release(n)
+            | TransactionControl::RollbackTo(n) => n.clone(),
+            _ => unreachable!("not a savepoint statement"),
+        };
+
+        // The innermost savepoint of that name, since a repeated name shadows.
+        let index = |savepoints: &Vec<Savepoint>| -> Option<usize> {
+            savepoints.iter().rposition(|sp| sp.name == name)
+        };
+        let missing = || -> PgWireError {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "3B001".into(), // invalid_savepoint_specification
+                format!("savepoint \"{name}\" does not exist"),
+            )))
+        };
+
+        match control {
+            TransactionControl::Savepoint(_) => {
+                let uncommitted = self
+                    .uncommitted
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                self.savepoints
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(Savepoint {
+                        name,
+                        tables: HashMap::new(),
+                        uncommitted,
+                    });
+                Ok(vec![Response::Execution(Tag::new("SAVEPOINT"))])
+            }
+            // RELEASE keeps the writes, so nothing is restored -- but the
+            // pre-images captured by the savepoints being destroyed have to
+            // MERGE DOWN into the enclosing one, or an outer ROLLBACK TO would
+            // no longer be able to undo them. The OLDEST capture wins, which is
+            // the one nearest the enclosing savepoint.
+            TransactionControl::Release(_) => {
+                let mut savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
+                let idx = index(&savepoints).ok_or_else(missing)?;
+                let dropped: Vec<Savepoint> = savepoints.split_off(idx);
+                if let Some(outer) = savepoints.last_mut() {
+                    for sp in dropped {
+                        for (table, docs) in sp.tables {
+                            outer.tables.entry(table).or_insert(docs);
+                        }
+                    }
+                }
+                Ok(vec![Response::Execution(Tag::new("RELEASE"))])
+            }
+            _ => {
+                // Restore from the OLDEST capture of each table among this
+                // savepoint and the ones nested inside it: that is the state at
+                // the named savepoint, whichever frame happened to capture it.
+                let (restore, uncommitted) = {
+                    let mut savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
+                    let idx = index(&savepoints).ok_or_else(missing)?;
+                    let uncommitted = savepoints[idx].uncommitted.clone();
+                    let dropped: Vec<Savepoint> = savepoints.split_off(idx + 1);
+                    let mut restore: HashMap<String, Option<Vec<Vec<u8>>>> =
+                        savepoints[idx].tables.clone();
+                    for sp in &dropped {
+                        for (table, docs) in &sp.tables {
+                            restore.entry(table.clone()).or_insert_with(|| docs.clone());
+                        }
+                    }
+                    // The savepoint itself stays open, and starts capturing
+                    // again from the state just restored.
+                    savepoints[idx].tables.clear();
+                    (restore, uncommitted)
+                };
+                self.in_open_transaction(|| {
+                    for (table, docs) in &restore {
+                        self.restore_table(table, docs.as_ref())?;
+                    }
+                    Ok(())
+                })?;
+                *self.uncommitted.lock().unwrap_or_else(|e| e.into_inner()) = uncommitted;
+                // Rolling back to a savepoint UN-POISONS the block: PostgreSQL
+                // lets the session carry on from there, which is the whole
+                // point of the nested-block pattern that uses it.
+                self.txn_failed
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                Ok(vec![Response::Execution(Tag::new("ROLLBACK"))])
+            }
+        }
+    }
+
     /// BEGIN / START TRANSACTION / COMMIT / ROLLBACK, with `AND CHAIN`.
     fn transaction_control(&self, control: TransactionControl) -> PgWireResult<Vec<Response>> {
         let opens = matches!(
@@ -1004,6 +1311,11 @@ impl PgHandler {
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
         }
+        // Every savepoint belongs to the block that is starting or ending.
+        self.savepoints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
         // A COMMIT of a FAILED transaction is a rollback, and PostgreSQL says
         // so in the command tag: `ROLLBACK`, not `COMMIT`. A client that
@@ -1066,6 +1378,13 @@ impl PgHandler {
                 }
                 ("ROLLBACK", chain)
             }
+            // Handled before this, in `run`: they are statements INSIDE a
+            // block rather than ways of starting or ending one.
+            TransactionControl::Savepoint(_)
+            | TransactionControl::Release(_)
+            | TransactionControl::RollbackTo(_) => {
+                unreachable!("savepoint statements are handled by savepoint_control")
+            }
         };
         // `AND CHAIN` ends the block and opens another one immediately, so the
         // connection is still in a transaction when the answer arrives. A
@@ -1092,8 +1411,15 @@ impl PgHandler {
             Statement::Transaction(_) => unreachable!("handled before execute"),
             // Handled in `run`, which can await the row stream.
             Statement::DeclareCursor { .. } => unreachable!("handled before execute"),
-            Statement::CreateTable(def) => {
+            Statement::CreateTable(def, if_not_exists) => {
                 if self.lookup(&def.name).is_some() {
+                    // `IF NOT EXISTS` is a NO-OP on an existing table, tag and
+                    // all -- PostgreSQL only adds a notice. Raising here made
+                    // the idiomatic "create it if it isn't there" fixture fail
+                    // the second time a session ran it.
+                    if if_not_exists {
+                        return Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))]);
+                    }
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
                         "42P07".into(), // duplicate_table

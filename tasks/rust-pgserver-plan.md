@@ -1224,7 +1224,51 @@ measurement was of the previous binary. `scratchpad/pgprobe.sh` now kills by
 PORT, waits for it, and REFUSES TO RUN unless the process it started is the one
 answering.
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181 -> 2219 -> 2256 (0.35 measured +29 on a pre-0.34 base and is not in this line).**
+### 0.38 savepoints (2026-09-05)
+
+**2273 -> 2347, +77 / -3** (the three are the `__del__` unraisable-warning churn
+in the cursor tests). Largest single batch since 0.29.
+
+**Why it was worth doing even though no client writes the word:** every client
+builds a NESTED transaction block out of savepoints, so `with
+conn.transaction():` inside another one failed. 158 of the failures were
+psycopg's own `OutOfOrderTransactionNesting`, not the 79 that named a savepoint.
+
+**Design, ported from the PYTHON SQL layer** (`src/secantus/sql/engine.py`,
+which has had savepoints for a while): WiredTiger has no savepoint, so one is a
+set of PRE-IMAGES. Before a statement writes a table, every open savepoint that
+has not yet captured that table captures it; `ROLLBACK TO` puts the captured
+contents back, `RELEASE` merges the released frame's captures DOWN into the
+enclosing savepoint (oldest wins) so an outer rollback can still undo them.
+Lazy capture is what makes it affordable. **Reading the existing implementation
+first turned a design problem into a port.**
+
+**The bug that ate the most time, and the shape to remember:** the first
+version restored NOTHING while reporting success, because the captures and
+restores went through `self.storage` directly while the block's writes were
+inside the WT user transaction. A read outside the transaction cannot see the
+block's uncommitted rows and a write outside it lands in another snapshot ->
+`in_open_transaction` now wraps both. **Anything that touches storage from
+OUTSIDE the statement path has to be told about the open transaction.**
+
+**A differential lane caught what a standalone probe missed.** The probe ended
+its "unknown savepoint name" scenario with a `ROLLBACK`; the differential
+followed it with another statement, and PostgreSQL answered `25P02` where we
+answered `42703`. Two findings from one line: a FAILED savepoint statement
+poisons the block, and **PostgreSQL's abort check runs BEFORE the planner** --
+in an aborted block `select nosuchcolumn` is `25P02`, not `42703`. A SYNTAX
+error is the exception (`42601` still surfaces), because the parser runs first
+there too.
+
+**Also fixed, found by a psycopg FIXTURE rather than a test:** `CREATE TABLE IF
+NOT EXISTS` raised `42P07` on an existing table. It only surfaced once
+savepoints let the suite get far enough to run that fixture twice -- a
+pre-existing bug that a passing test had been hiding.
+
+**Probes: 22 savepoint shapes, 21 failed-block shapes, 11 status shapes -- 0
+divergences.**
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181 -> 2219 -> 2256 -> 2347 (0.35 measured +29 on a pre-0.34 base and is not in this line).**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the
