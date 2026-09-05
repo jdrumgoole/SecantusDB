@@ -117,6 +117,18 @@ SETUP = [
 ]
 
 QUERIES = [
+    # A numeric NEVER renders in exponent notation, whatever its magnitude --
+    # in the row, through a `::text` cast, or inside an array. Decimal128's own
+    # rendering does, and `1.5e20` came back as `1.5E+20` against PostgreSQL's
+    # `150000000000000000000`; two Decimals that compare equal and are not the
+    # same text.
+    "SELECT 1.5e20::numeric",
+    "SELECT (1.5e20::numeric)::text",
+    "SELECT array[1.5e20::numeric]",
+    "SELECT 2e3::numeric",
+    "SELECT (1e-10::numeric)::text",
+    "SELECT (1.50::numeric)::text",
+    "SELECT array[1.50::numeric, 2e3::numeric]",
     # --- ORDER BY: null placement is the trap --------------------------------
     "SELECT id FROM d ORDER BY n",
     "SELECT id FROM d ORDER BY n DESC",
@@ -877,6 +889,102 @@ def test_error_sqlstate_matches_postgres(
     # not shared refusals, and belong in the backlog rather than here.
     assert theirs != "accepted", f"the oracle accepted {sql}; the case is wrong"
     assert mine == theirs, f"{sql}\n  postgres={theirs}\n  ours    ={mine}"
+
+
+# Queries whose RESULT FORMAT is part of the contract, not just the value.
+#
+# Only the types this server can render exactly in PostgreSQL's binary layout
+# are here: a column outside that set is deliberately described as text even
+# when the client asked for binary (`tasks/backlog.md`), so putting a timestamp
+# in this list would assert the divergence rather than the contract.
+BINARY_RESULT_QUERIES = [
+    "SELECT 1::int2",
+    "SELECT 1::int4",
+    "SELECT 1::int8",
+    "SELECT 1.5::float4",
+    "SELECT 1.5::float8",
+    "SELECT true",
+    "SELECT 'x'::text",
+    "SELECT 'x'::varchar",
+    "SELECT 'x'::name",
+    "SELECT 'x'::bpchar",
+    "SELECT 1.50::numeric",
+    "SELECT (-1.5)::numeric",
+    "SELECT 0.00001::numeric",
+    "SELECT 100000::numeric",
+    "SELECT 12345678901234567890.123::numeric",
+    "SELECT 'NaN'::numeric",
+    # Exponent-shaped decimals: the binary layout has no exponent to carry
+    # them in, so each has to be expanded before it can be cut into groups.
+    "SELECT 1.5e-5::numeric",
+    "SELECT 1.5e20::numeric",
+    "SELECT 1e-10::numeric",
+    "SELECT 0.0::numeric",
+    "SELECT 123456789012345678901234567890::numeric",
+    "SELECT array[1,2,3]::int4[]",
+    "SELECT array[1.5]::float8[]",
+    "SELECT array['a','b']::text[]",
+    "SELECT array[1.50]::numeric[]",
+    "SELECT null::int4",
+    "SELECT null::numeric",
+    "SELECT n FROM d ORDER BY id",
+    "SELECT s FROM d ORDER BY id",
+    "SELECT count(*) FROM d",
+    "SELECT sum(n) FROM d",
+]
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+@pytest.mark.parametrize("sql", BINARY_RESULT_QUERIES, ids=lambda s: s[:52])
+def test_result_format_matches_postgres(
+    sql: str, binary: bool, ours: psycopg.Connection, oracle: psycopg.Connection
+) -> None:
+    """The format the client ASKED for, alongside the value and the type oid.
+
+    The value alone proves nothing here: the server described every column as
+    text and psycopg duly decoded text, so a binary cursor got right answers in
+    the wrong format and no row comparison could see it.
+    """
+    _reset_oracle(oracle)
+
+    def probe(conn: psycopg.Connection) -> tuple:
+        cur = conn.cursor(binary=binary)
+        cur.execute(sql)
+        rows = cur.fetchall()
+        return (int(cur.pgresult.fformat(0)), cur.pgresult.ftype(0), repr(rows))
+
+    theirs, mine = probe(oracle), probe(ours)
+    assert mine == theirs, f"{sql}\n  postgres={theirs}\n  ours    ={mine}"
+
+
+def test_server_cursors_match_postgres(
+    ours: psycopg.Connection, oracle: psycopg.Connection
+) -> None:
+    """A psycopg SERVER cursor, which describes the cursor's portal first.
+
+    PostgreSQL exposes a declared cursor as a portal of the same name, and
+    psycopg describes it before it fetches anything.
+    """
+    _reset_oracle(oracle)
+
+    def probe(conn: psycopg.Connection) -> list:
+        was_autocommit = conn.autocommit
+        conn.autocommit = False
+        try:
+            with conn.cursor("sc") as cur:
+                cur.execute("SELECT id FROM d ORDER BY id")
+                return [
+                    [d.name for d in cur.description],
+                    cur.fetchmany(2),
+                    cur.fetchone(),
+                    cur.fetchall(),
+                ]
+        finally:
+            conn.rollback()
+            conn.autocommit = was_autocommit
+
+    theirs, mine = probe(oracle), probe(ours)
+    assert mine == theirs, f"postgres={theirs}\n  ours    ={mine}"
 
 
 @pytest.mark.parametrize("sql,params", PARAMETERISED, ids=lambda v: str(v)[:52])

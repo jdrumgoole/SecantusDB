@@ -1088,7 +1088,53 @@ decoder gaps. That entry is now exhausted as a source of cheap wins.
 **Probe: 8 select-list shapes and 10 multirange parameter shapes, 0
 divergences.**
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181.**
+### 0.35 binary result columns, and a cursor is a portal (2026-09-05)
+
+**2118 -> 2146 on a same-branch baseline, +29 / -1.** Measured off `main`
+BEFORE the select-list-SRF batch (0.34) landed, so it does not stack with that
+number arithmetically; the two are independent.
+
+**Both fixes were sized from the failure ranking and both came in UNDER it,
+for the same reason: a ranking counts the FIRST error a test hits, not the
+only one.** "Portal not found" was 44 tests; fixing it gained 12, because the
+other 32 go on to hit `transaction_status` or a missing feature. The result
+format was 46; fixing it gained 13. **Read a ranking entry as an UPPER BOUND
+on what one fix can buy, never as the figure.**
+
+**Result format.** Every `FieldInfo` this server built said TEXT, so a cursor
+opened with `binary=True` got text rows -- with the RIGHT VALUES, because the
+format travels per column in the RowDescription and psycopg decoded what it
+was told. Nothing was wrong except the thing the client asked for, which is
+why no row comparison had ever caught it. Now honoured for the types that can
+be encoded exactly (bool, the int and float widths, the string types,
+`numeric`, arrays of those); everything else is still described as text, which
+the client reads correctly. Backlog carries the gap.
+
+The trap worth keeping: a value is encoded from the BSON it is STORED as, and
+the column's DECLARED type is a separate thing. An `int8` column holding a BSON
+`Int32` renders `1` either way in text, but in binary it would put four bytes
+where the client reads eight -- so the binary path encodes through the DECLARED
+type, and the text path was left exactly as it was.
+
+`numeric`'s binary layout is base-10000 groups aligned on the DECIMAL POINT,
+not on the digit string: `0.00001` is one group of `1000` at weight -2, not a
+group straddling the point.
+
+**Server cursors.** PostgreSQL exposes a DECLAREd cursor as a portal of the
+same name, and psycopg describes that portal straight after the DECLARE,
+before any FETCH. Our cursors are not pgwire portals, so pgwire answered
+"portal not found" and every server cursor died on its first row. `on_describe`
+now answers from the cursor of that name.
+
+**Probes: 44 format shapes (both formats) and 5 server-cursor shapes, 0
+divergences** -- written and RUN against PostgreSQL 14 BEFORE either fix, which
+is what made both diagnoses take minutes rather than a reading of the source.
+
+**Next, from the re-ranking:** `transaction_status` reports IDLE where
+PostgreSQL reports INTRANS / INERROR (32 tests, protocol-level, and it is what
+the other 32 cursor tests hit once the describe works).
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181 (0.34; 0.35 measured +29 on a pre-0.34 base).**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

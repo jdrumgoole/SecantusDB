@@ -1543,6 +1543,7 @@ dependencies = [
  "ctrlc",
  "futures",
  "pgwire",
+ "postgres-types",
  "secantus-pgcatalog",
  "secantus-pgplan",
  "secantus-storage",

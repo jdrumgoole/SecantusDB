@@ -1798,3 +1798,23 @@ fn a_set_returning_function_beside_a_column_is_refused() {
     let err = plan("SELECT 1, generate_series(1,3)", &lookup).expect_err("srf beside a column");
     assert_eq!(err.sqlstate(), "0A000");
 }
+
+#[test]
+fn a_numeric_never_renders_in_exponent_notation() {
+    // PostgreSQL's numeric output is always plain; Decimal128's is not, and
+    // the difference reached the wire, `::text` and array elements alike.
+    assert_eq!(plain_numeric_text("1.5E+20"), "150000000000000000000");
+    assert_eq!(plain_numeric_text("2E+3"), "2000");
+    assert_eq!(plain_numeric_text("1E-10"), "0.0000000001");
+    assert_eq!(plain_numeric_text("1.5E-5"), "0.000015");
+    assert_eq!(plain_numeric_text("-1.5E+3"), "-1500");
+    // The scale is part of the value, so a plain rendering is left alone.
+    assert_eq!(plain_numeric_text("1.50"), "1.50");
+    assert_eq!(plain_numeric_text("0"), "0");
+    // Non-finite values carry no exponent to expand.
+    assert_eq!(plain_numeric_text("NaN"), "NaN");
+    assert_eq!(plain_numeric_text("Infinity"), "Infinity");
+    // Anything that is not a decimal at all is passed through untouched
+    // rather than mangled into one.
+    assert_eq!(plain_numeric_text("elephant"), "elephant");
+}

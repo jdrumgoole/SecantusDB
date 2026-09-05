@@ -70,7 +70,7 @@ fn text(v: &Bson) -> String {
         Bson::Int32(i) => i.to_string(),
         Bson::Int64(i) => i.to_string(),
         Bson::Double(d) => d.to_string(),
-        Bson::Decimal128(d) => d.to_string(),
+        Bson::Decimal128(d) => crate::plain_numeric_text(&d.to_string()),
         Bson::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
         other => format!("{other:?}"),
     }

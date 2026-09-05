@@ -15,24 +15,28 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bson::{Bson, Document};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use futures::{stream, Sink, SinkExt, StreamExt, TryStreamExt};
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::{Format, Portal};
-use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::query::{send_describe_response, ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
     CopyCsvOptions, CopyEncoder, CopyResponse, CopyTextOptions, DescribePortalResponse,
     DescribeStatementResponse,
 };
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::stmt::{QueryParser, StoredStatement};
-use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
+use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type, DEFAULT_NAME};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::data::DataRow;
+use pgwire::messages::extendedquery::{Describe, TARGET_TYPE_BYTE_PORTAL};
 use pgwire::messages::response::CommandComplete;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
+use pgwire::types::format::FormatOptions;
+use pgwire::types::ToSqlText;
+use postgres_types::{to_sql_checked, IsNull, ToSql};
 use secantus_pgcatalog::{TableDef, CATALOG_COLLECTION};
 use secantus_pgplan::{
     companion_field, render_array_element_text, render_timestamp, AggFunc, AggItem, ConstCol,
@@ -68,6 +72,16 @@ pub struct PgHandler {
     /// deadlocks the connection. The flag is set and cleared alongside the
     /// handle itself.
     in_transaction: std::sync::atomic::AtomicBool,
+    /// Whether the statement being answered asked for BINARY result columns.
+    ///
+    /// The format is a property of the `Bind` that started the statement, but
+    /// it is needed where the row DESCRIPTION is built, which is several
+    /// layers down and reached from both `Describe` and `Execute`. A
+    /// connection answers one statement at a time, so a flag set at the top of
+    /// each is the whole of the state -- and it is atomic because, like
+    /// `in_transaction`, it is read from inside `execute` while `run` holds
+    /// the mutexes.
+    binary_results: std::sync::atomic::AtomicBool,
 }
 
 /// A declared cursor's materialised result.
@@ -109,7 +123,44 @@ impl PgHandler {
             cursors: Mutex::new(HashMap::new()),
             uncommitted: Mutex::new(HashMap::new()),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
+            binary_results: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// One output column, in the format the current statement asked for.
+    ///
+    /// Every row description goes through here rather than naming a format at
+    /// the call site: the format is per statement, and the DESCRIPTION and the
+    /// ROWS are built in two different places that have to agree, or the
+    /// client decodes binary bytes as text.
+    fn field(&self, name: String, ty: Type) -> FieldInfo {
+        let binary = self
+            .binary_results
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && binary_encodable(&ty);
+        let format = if binary {
+            FieldFormat::Binary
+        } else {
+            FieldFormat::Text
+        };
+        FieldInfo::new(name, None, None, ty, format)
+    }
+
+    /// Remember the result format a `Bind` asked for.
+    ///
+    /// A MIXED request -- some columns binary, some text -- is answered
+    /// entirely in text. PostgreSQL honours it column by column; no client
+    /// this server is measured against sends one, and quietly answering half
+    /// of it in the wrong format would be worse than uniformly answering the
+    /// format the `RowDescription` then reports.
+    fn note_result_format(&self, format: &Format) {
+        let binary = match format {
+            Format::UnifiedText => false,
+            Format::UnifiedBinary => true,
+            Format::Individual(codes) => !codes.is_empty() && codes.iter().all(|c| *c == 1),
+        };
+        self.binary_results
+            .store(binary, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Read one table's catalog entry. Reads it back from storage every time
@@ -330,6 +381,9 @@ impl SimpleQueryHandler for PgHandler {
         // The simple protocol takes any number of commands separated by
         // semicolons and answers with one result each. The extended protocol
         // does not, and still refuses -- see `Error::MultipleCommands`.
+        // The simple protocol carries no `Bind`, so its results are always text.
+        self.binary_results
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let stmts = secantus_pgplan::split_statements(query).map_err(|e| Self::err(&e))?;
         if stmts.len() <= 1 {
             // The one-statement path is left exactly as it was, so the common
@@ -799,7 +853,18 @@ impl PgHandler {
                     "DECLARE CURSOR can only be used in transaction blocks".into(),
                 ))));
             }
-            let responses = self.execute(*query, 0)?;
+            // A cursor's rows are encoded ONCE, at DECLARE, but the FETCHes
+            // that read them are separate statements that may ask for a
+            // different format. Text is the format that every client can read
+            // whatever it asked for, and the cursor's own schema -- reported
+            // by both `Describe` and `FETCH` -- says so.
+            let binary = self
+                .binary_results
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
+            let responses = self.execute(*query, 0);
+            self.binary_results
+                .store(binary, std::sync::atomic::Ordering::Relaxed);
+            let responses = responses?;
             let Some(Response::Query(q)) = responses.into_iter().next() else {
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".into(),
@@ -1038,7 +1103,7 @@ impl PgHandler {
                                 .column(out)
                                 .map(|c| wire_type(&c.pg_type))
                                 .unwrap_or(Type::VARCHAR);
-                            FieldInfo::new(out.clone(), None, None, ty, FieldFormat::Text)
+                            self.field(out.clone(), ty)
                         })
                         .collect::<Vec<_>>(),
                 );
@@ -1047,12 +1112,12 @@ impl PgHandler {
                 let schema_ref = schema.clone();
                 let rows = stream::iter(docs).map(move |d| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
-                    for f in &fields {
+                    for (i, f) in fields.iter().enumerate() {
                         // A timestamp is reassembled from its stored date plus
                         // the hidden companion before it goes on the wire.
                         match timestamp_text(&d, f) {
                             Some(text) => enc.encode_field(&Some(text.as_str()))?,
-                            None => encode_value(&mut enc, d.get(f))?,
+                            None => encode_field_value(&mut enc, &schema_ref[i], d.get(f))?,
                         }
                     }
                     Ok(enc.take_row())
@@ -1242,13 +1307,7 @@ impl PgHandler {
                         format!("unrecognized configuration parameter \"{name}\""),
                     )))
                 })?;
-                let schema = Arc::new(vec![FieldInfo::new(
-                    key,
-                    None,
-                    None,
-                    Type::TEXT,
-                    FieldFormat::Text,
-                )]);
+                let schema = Arc::new(vec![self.field(key, Type::TEXT)]);
                 let schema_ref = schema.clone();
                 let rows = stream::iter(std::iter::once(value)).map(move |v| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
@@ -1319,15 +1378,7 @@ impl PgHandler {
                 let schema = Arc::new(
                     sc.columns
                         .iter()
-                        .map(|(name, _, ty)| {
-                            FieldInfo::new(
-                                name.clone(),
-                                None,
-                                None,
-                                wire_type(ty),
-                                FieldFormat::Text,
-                            )
-                        })
+                        .map(|(name, _, ty)| self.field(name.clone(), wire_type(ty)))
                         .collect::<Vec<_>>(),
                 );
                 let values: Vec<Bson> = sc
@@ -1338,8 +1389,8 @@ impl PgHandler {
                 let schema_ref = schema.clone();
                 let rows = stream::iter(std::iter::once(values)).map(move |vals| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
-                    for v in &vals {
-                        encode_value(&mut enc, Some(v))?;
+                    for (i, v) in vals.iter().enumerate() {
+                        encode_field_value(&mut enc, &schema_ref[i], Some(v))?;
                     }
                     Ok(enc.take_row())
                 });
@@ -1479,7 +1530,7 @@ impl PgHandler {
                                     .unwrap_or(Type::VARCHAR),
                                 OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
                             };
-                            FieldInfo::new(name.clone(), None, None, ty, FieldFormat::Text)
+                            self.field(name.clone(), ty)
                         })
                         .collect::<Vec<_>>(),
                 );
@@ -1488,12 +1539,12 @@ impl PgHandler {
                 let schema_ref = schema.clone();
                 let rows = stream::iter(groups).map(move |(key, vals)| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
-                    for (_, col) in &select {
+                    for (n, (_, col)) in select.iter().enumerate() {
                         let v = match col {
                             OutputCol::Group(i) => key[*i].clone().unwrap_or(Bson::Null),
                             OutputCol::Agg(i) => vals[*i].clone(),
                         };
-                        encode_value(&mut enc, Some(&v))?;
+                        encode_field_value(&mut enc, &schema_ref[n], Some(&v))?;
                     }
                     Ok(enc.take_row())
                 });
@@ -1569,6 +1620,340 @@ fn timestamp_text(doc: &Document, field: &str) -> Option<String> {
 
 /// Encode one stored value as a SQL datum. Absent and explicit null are both
 /// SQL NULL.
+/// The types this server can put on the wire in PostgreSQL's BINARY format.
+///
+/// A column outside this list stays TEXT even when the client asked for
+/// binary. The format travels per column in the `RowDescription`, so the
+/// client still decodes it correctly -- but PostgreSQL honours the request for
+/// every type, and the gap is recorded in `tasks/backlog.md` rather than
+/// hidden.
+fn binary_encodable(ty: &Type) -> bool {
+    const OK: [Type; 20] = [
+        Type::BOOL,
+        Type::INT2,
+        Type::INT4,
+        Type::INT8,
+        Type::FLOAT4,
+        Type::FLOAT8,
+        Type::TEXT,
+        Type::VARCHAR,
+        Type::BPCHAR,
+        Type::NAME,
+        Type::CHAR,
+        Type::NUMERIC,
+        Type::BOOL_ARRAY,
+        Type::INT2_ARRAY,
+        Type::INT4_ARRAY,
+        Type::INT8_ARRAY,
+        Type::FLOAT4_ARRAY,
+        Type::FLOAT8_ARRAY,
+        Type::TEXT_ARRAY,
+        Type::NUMERIC_ARRAY,
+    ];
+    OK.contains(ty)
+}
+
+/// A `numeric` in both wire formats.
+///
+/// The text half is the rendering the rest of the server already produces --
+/// `1.50`, scale and all. The binary half is PostgreSQL's own layout, built
+/// from that same text, because a numeric carries more digits than any float
+/// this could pass through on the way.
+#[derive(Debug)]
+struct PgNumeric(String);
+
+impl ToSqlText for PgNumeric {
+    fn to_sql_text(
+        &self,
+        ty: &Type,
+        out: &mut BytesMut,
+        options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        self.0.as_str().to_sql_text(ty, out, options)
+    }
+}
+
+impl ToSql for PgNumeric {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        let bytes = numeric_binary(&self.0).ok_or_else(
+            || -> Box<dyn std::error::Error + Sync + Send> {
+                format!("cannot render {} as a binary numeric", self.0).into()
+            },
+        )?;
+        out.put_slice(&bytes);
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::NUMERIC
+    }
+
+    to_sql_checked!();
+}
+
+/// PostgreSQL's binary `numeric`: `ndigits`, `weight`, `sign`, `dscale`, then
+/// `ndigits` base-10000 groups, most significant first.
+///
+/// The groups are aligned on the decimal point rather than on the digit
+/// string, which is why both halves are padded to a multiple of four before
+/// being cut up: `0.00001` is one group of `1000` at weight `-2`, not a group
+/// that straddles the point.
+fn numeric_binary(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let header = |ndigits: i16, weight: i16, sign: u16, dscale: u16, out: &mut Vec<u8>| {
+        out.extend_from_slice(&ndigits.to_be_bytes());
+        out.extend_from_slice(&weight.to_be_bytes());
+        out.extend_from_slice(&sign.to_be_bytes());
+        out.extend_from_slice(&dscale.to_be_bytes());
+    };
+    let t = text.trim();
+    // The three non-finite values are a sign word and nothing else.
+    let special = match t {
+        "NaN" | "nan" | "NAN" => Some(0xC000u16),
+        "Infinity" | "inf" | "Inf" => Some(0xD000),
+        "-Infinity" | "-inf" | "-Inf" => Some(0xF000),
+        _ => None,
+    };
+    if let Some(sign) = special {
+        header(0, 0, sign, 0, &mut out);
+        return Some(out);
+    }
+
+    let plain = secantus_pgplan::plain_numeric_text(t);
+    let (sign, body) = match plain.strip_prefix('-') {
+        Some(rest) => (0x4000u16, rest.to_string()),
+        None => (
+            0x0000,
+            plain.strip_prefix('+').unwrap_or(&plain).to_string(),
+        ),
+    };
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (body.as_str(), ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let dscale = u16::try_from(frac_part.len()).ok()?;
+
+    let mut int_padded = String::new();
+    int_padded.push_str(&"0".repeat((4 - int_part.len() % 4) % 4));
+    int_padded.push_str(int_part);
+    let mut frac_padded = String::from(frac_part);
+    frac_padded.push_str(&"0".repeat((4 - frac_part.len() % 4) % 4));
+
+    let mut digits: Vec<i16> = Vec::new();
+    for chunk in int_padded
+        .as_bytes()
+        .chunks(4)
+        .chain(frac_padded.as_bytes().chunks(4))
+    {
+        digits.push(std::str::from_utf8(chunk).ok()?.parse::<i16>().ok()?);
+    }
+    // The weight counts groups BEFORE the point, so it moves as leading empty
+    // groups are dropped; trailing ones just disappear.
+    let mut weight = (int_padded.len() / 4) as i32 - 1;
+    while digits.first() == Some(&0) {
+        digits.remove(0);
+        weight -= 1;
+    }
+    while digits.last() == Some(&0) {
+        digits.pop();
+    }
+    if digits.is_empty() {
+        weight = 0;
+    }
+
+    header(
+        i16::try_from(digits.len()).ok()?,
+        i16::try_from(weight).ok()?,
+        sign,
+        dscale,
+        &mut out,
+    );
+    for d in digits {
+        out.extend_from_slice(&d.to_be_bytes());
+    }
+    Some(out)
+}
+
+/// One value in the BINARY format, encoded against the column's DECLARED type
+/// rather than against the BSON type it happens to be stored as.
+///
+/// That distinction is the whole point: an `int8` column holding a BSON
+/// `Int32` renders as `1` either way in text, but in binary it would put four
+/// bytes where the client reads eight. Text encoding is left exactly as it
+/// was.
+fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWireResult<()> {
+    let v = match v {
+        None | Some(Bson::Null) => return enc.encode_field(&None::<i32>),
+        Some(v) => v,
+    };
+    let bad = |what: &str| -> PgWireError {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_owned(),
+            "22P03".to_owned(), // invalid_binary_representation
+            format!("cannot send {what} as a binary {}", ty.name()),
+        )))
+    };
+    let as_i64 = |v: &Bson| -> Option<i64> {
+        match v {
+            Bson::Int32(x) => Some(i64::from(*x)),
+            Bson::Int64(x) => Some(*x),
+            Bson::Double(x) if x.fract() == 0.0 => Some(*x as i64),
+            _ => None,
+        }
+    };
+    let as_f64 = |v: &Bson| -> Option<f64> {
+        match v {
+            Bson::Int32(x) => Some(f64::from(*x)),
+            Bson::Int64(x) => Some(*x as f64),
+            Bson::Double(x) => Some(*x),
+            Bson::Decimal128(d) => d.to_string().parse().ok(),
+            _ => None,
+        }
+    };
+    let as_numeric = |v: &Bson| -> Option<PgNumeric> {
+        match v {
+            Bson::Decimal128(d) => Some(PgNumeric(secantus_pgplan::plain_numeric_text(
+                &d.to_string(),
+            ))),
+            Bson::Int32(x) => Some(PgNumeric(x.to_string())),
+            Bson::Int64(x) => Some(PgNumeric(x.to_string())),
+            Bson::Double(x) => Some(PgNumeric(x.to_string())),
+            _ => None,
+        }
+    };
+    let as_text = |v: &Bson| -> Option<String> {
+        match v {
+            Bson::String(x) => Some(x.clone()),
+            _ => None,
+        }
+    };
+
+    if *ty == Type::BOOL {
+        let Bson::Boolean(b) = v else {
+            return Err(bad("this value"));
+        };
+        return enc.encode_field(&Some(*b));
+    }
+    if *ty == Type::INT2 {
+        let x = as_i64(v)
+            .and_then(|x| i16::try_from(x).ok())
+            .ok_or_else(|| bad("this value"))?;
+        return enc.encode_field(&Some(x));
+    }
+    if *ty == Type::INT4 {
+        let x = as_i64(v)
+            .and_then(|x| i32::try_from(x).ok())
+            .ok_or_else(|| bad("this value"))?;
+        return enc.encode_field(&Some(x));
+    }
+    if *ty == Type::INT8 {
+        let x = as_i64(v).ok_or_else(|| bad("this value"))?;
+        return enc.encode_field(&Some(x));
+    }
+    if *ty == Type::FLOAT4 {
+        let x = as_f64(v).ok_or_else(|| bad("this value"))? as f32;
+        return enc.encode_field(&Some(x));
+    }
+    if *ty == Type::FLOAT8 {
+        let x = as_f64(v).ok_or_else(|| bad("this value"))?;
+        return enc.encode_field(&Some(x));
+    }
+    if *ty == Type::NUMERIC {
+        let x = as_numeric(v).ok_or_else(|| bad("this value"))?;
+        return enc.encode_field(&Some(x));
+    }
+    if [
+        Type::TEXT,
+        Type::VARCHAR,
+        Type::BPCHAR,
+        Type::NAME,
+        Type::CHAR,
+    ]
+    .contains(ty)
+    {
+        let x = as_text(v).ok_or_else(|| bad("this value"))?;
+        return enc.encode_field(&Some(x));
+    }
+
+    // Arrays: one element type for the whole array, so the element conversion
+    // is chosen once rather than per element.
+    let Bson::Array(items) = v else {
+        return Err(bad("this value"));
+    };
+    if items.iter().any(|x| matches!(x, Bson::Array(_))) {
+        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_owned(),
+            "0A000".to_owned(),
+            "multidimensional arrays are not supported yet".to_owned(),
+        ))));
+    }
+    if *ty == Type::BOOL_ARRAY {
+        let v: Vec<Option<bool>> = items.iter().map(|x| x.as_bool()).collect();
+        return enc.encode_field(&v);
+    }
+    if *ty == Type::INT2_ARRAY {
+        let v: Vec<Option<i16>> = items
+            .iter()
+            .map(|x| as_i64(x).and_then(|n| i16::try_from(n).ok()))
+            .collect();
+        return enc.encode_field(&v);
+    }
+    if *ty == Type::INT4_ARRAY {
+        let v: Vec<Option<i32>> = items
+            .iter()
+            .map(|x| as_i64(x).and_then(|n| i32::try_from(n).ok()))
+            .collect();
+        return enc.encode_field(&v);
+    }
+    if *ty == Type::INT8_ARRAY {
+        let v: Vec<Option<i64>> = items.iter().map(&as_i64).collect();
+        return enc.encode_field(&v);
+    }
+    if *ty == Type::FLOAT4_ARRAY {
+        let v: Vec<Option<f32>> = items.iter().map(|x| as_f64(x).map(|n| n as f32)).collect();
+        return enc.encode_field(&v);
+    }
+    if *ty == Type::FLOAT8_ARRAY {
+        let v: Vec<Option<f64>> = items.iter().map(&as_f64).collect();
+        return enc.encode_field(&v);
+    }
+    if *ty == Type::NUMERIC_ARRAY {
+        let v: Vec<Option<PgNumeric>> = items.iter().map(&as_numeric).collect();
+        return enc.encode_field(&v);
+    }
+    if *ty == Type::TEXT_ARRAY {
+        let v: Vec<Option<String>> = items.iter().map(&as_text).collect();
+        return enc.encode_field(&v);
+    }
+    Err(bad("this value"))
+}
+
+/// One value in whichever format the column was described in.
+fn encode_field_value(
+    enc: &mut DataRowEncoder,
+    field: &FieldInfo,
+    v: Option<&Bson>,
+) -> PgWireResult<()> {
+    if field.format() == FieldFormat::Binary {
+        return encode_binary(enc, field.datatype(), v);
+    }
+    encode_value(enc, v)
+}
+
 fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> {
     // A timestamp CONSTANT never passes through a row, so it arrives here as a
     // BSON date or as the sub-millisecond composite rather than as something
@@ -1591,7 +1976,9 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
         Some(Bson::String(x)) => enc.encode_field(&Some(x.as_str())),
         // Decimal128's rendering already carries the scale (`1.50`, not `1.5`),
         // which is part of a PostgreSQL `numeric` value rather than formatting.
-        Some(Bson::Decimal128(x)) => enc.encode_field(&Some(x.to_string().as_str())),
+        Some(Bson::Decimal128(x)) => enc.encode_field(&Some(
+            secantus_pgplan::plain_numeric_text(&x.to_string()).as_str(),
+        )),
         // An array must be handed over as a TYPED vector, not as pre-rendered
         // text: `encode_field` encodes against the column's declared type, so
         // giving it a `&str` for an `int4[]` field wraps the whole literal as a
@@ -2564,15 +2951,7 @@ impl PgHandler {
             Statement::Select(sel) if sel.series.is_some() => sel
                 .columns
                 .iter()
-                .map(|(out, _)| {
-                    FieldInfo::new(
-                        out.clone(),
-                        None,
-                        None,
-                        wire_type("int4"),
-                        FieldFormat::Text,
-                    )
-                })
+                .map(|(out, _)| self.field(out.clone(), wire_type("int4")))
                 .collect::<Vec<_>>(),
             Statement::Select(sel) => {
                 let def = self
@@ -2585,7 +2964,7 @@ impl PgHandler {
                             .column(out)
                             .map(|c| wire_type(&c.pg_type))
                             .unwrap_or(Type::VARCHAR);
-                        FieldInfo::new(out.clone(), None, None, ty, FieldFormat::Text)
+                        self.field(out.clone(), ty)
                     })
                     .collect()
             }
@@ -2599,7 +2978,7 @@ impl PgHandler {
                         OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
                         OutputCol::Group(_) => Type::INT4,
                     };
-                    FieldInfo::new(name.clone(), None, None, ty, FieldFormat::Text)
+                    self.field(name.clone(), ty)
                 })
                 .collect(),
             Statement::Aggregate(agg) => {
@@ -2616,23 +2995,15 @@ impl PgHandler {
                                 .unwrap_or(Type::VARCHAR),
                             OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
                         };
-                        FieldInfo::new(name.clone(), None, None, ty, FieldFormat::Text)
+                        self.field(name.clone(), ty)
                     })
                     .collect()
             }
-            Statement::Show(name) => vec![FieldInfo::new(
-                canonical_setting(&name),
-                None,
-                None,
-                Type::TEXT,
-                FieldFormat::Text,
-            )],
+            Statement::Show(name) => vec![self.field(canonical_setting(&name), Type::TEXT)],
             Statement::SelectConstant(sc) => sc
                 .columns
                 .iter()
-                .map(|(name, _, ty)| {
-                    FieldInfo::new(name.clone(), None, None, wire_type(ty), FieldFormat::Text)
-                })
+                .map(|(name, _, ty)| self.field(name.clone(), wire_type(ty)))
                 .collect(),
             // CREATE / INSERT / UPDATE / DELETE return no rows.
             _ => Vec::new(),
@@ -2671,6 +3042,38 @@ impl ExtendedQueryHandler for PgHandler {
         Ok(DescribeStatementResponse::new(types, fields))
     }
 
+    /// PostgreSQL exposes a DECLAREd cursor as a PORTAL of the same name, and
+    /// psycopg describes that portal straight after the DECLARE to learn the
+    /// columns -- before it ever sends a `FETCH`. This server's cursors are
+    /// its own, not pgwire portals, so the describe found nothing and every
+    /// server cursor died on its first row with "portal not found".
+    async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if message.target_type == TARGET_TYPE_BYTE_PORTAL {
+            let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
+            // A real portal of that name wins: a cursor only answers for a
+            // name the wire layer does not already know.
+            if pgwire::api::store::PortalStore::get_portal(client.portal_store(), name).is_none() {
+                let fields = self
+                    .cursors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(name)
+                    .map(|c| c.schema.as_ref().clone());
+                if let Some(fields) = fields {
+                    let response = DescribePortalResponse::new(fields);
+                    return send_describe_response(client, &response).await;
+                }
+            }
+        }
+        self._on_describe(client, message).await
+    }
+
     async fn do_describe_portal<C>(
         &self,
         _c: &mut C,
@@ -2682,6 +3085,7 @@ impl ExtendedQueryHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.note_result_format(&target.result_column_format);
         let fields = self.describe_fields(
             &target.statement.statement.sql,
             target.statement.parameter_types.len(),
@@ -2701,6 +3105,7 @@ impl ExtendedQueryHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.note_result_format(&portal.result_column_format);
         let params = self.portal_params(portal)?;
         let mut responses = self
             .run(&portal.statement.statement.sql, &params, max_rows)
