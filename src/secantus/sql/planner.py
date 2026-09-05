@@ -5651,8 +5651,28 @@ _ORDERED_SET_KINDS: dict[type, str] = {
     exp.Mode: "mode",
 }
 
+#: The HYPOTHETICAL-SET aggregates: `f(value) WITHIN GROUP (ORDER BY expr)`
+#: answers what `value` would rank if it were inserted into the group. They
+#: share the ordered-set plumbing (push the ORDER BY values, finish in Python)
+#: but carry a hypothetical VALUE plus the sort direction rather than a
+#: fraction — the direction matters, and is why the payload is not just a
+#: number: `rank(20) ... ORDER BY v` is 2 and `... ORDER BY v DESC` is 3.
+_HYPOTHETICAL_SET_KINDS: dict[type, str] = {
+    cls: name
+    for cls, name in (
+        (getattr(exp, attr, None), name)
+        for attr, name in (
+            ("Rank", "hs_rank"),
+            ("DenseRank", "hs_dense_rank"),
+            ("PercentRank", "hs_percent_rank"),
+            ("CumeDist", "hs_cume_dist"),
+        )
+    )
+    if cls is not None
+}
 
-def _ordered_set_agg(node: exp.Expression) -> tuple[str, float | None, exp.Expression] | None:
+
+def _ordered_set_agg(node: exp.Expression) -> tuple[str, Any, exp.Expression] | None:
     """If ``node`` is an ordered-set aggregate — ``percentile_cont(f)`` /
     ``percentile_disc(f)`` / ``mode() WITHIN GROUP (ORDER BY expr)`` — return
     ``(kind, fraction, order_value_expr)``. ``fraction`` is None for ``mode``.
@@ -5660,7 +5680,8 @@ def _ordered_set_agg(node: exp.Expression) -> tuple[str, float | None, exp.Expre
     inner = node.this if isinstance(node, exp.Alias) else node
     if not isinstance(inner, exp.WithinGroup):
         return None
-    kind = _ORDERED_SET_KINDS.get(type(inner.this))
+    hs_kind = _HYPOTHETICAL_SET_KINDS.get(type(inner.this))
+    kind = hs_kind or _ORDERED_SET_KINDS.get(type(inner.this))
     if kind is None:
         raise errors.feature_not_supported(
             f"unsupported WITHIN GROUP aggregate: {inner.this.sql()}"
@@ -5670,6 +5691,19 @@ def _ordered_set_agg(node: exp.Expression) -> tuple[str, float | None, exp.Expre
     if len(ordered) != 1:
         raise errors.feature_not_supported("WITHIN GROUP requires exactly one ORDER BY expression")
     order_val = ordered[0].this
+    if hs_kind is not None:
+        args = inner.this.expressions or []
+        if len(args) != 1:
+            raise errors.feature_not_supported(
+                "a hypothetical-set aggregate takes one argument per ORDER BY expression"
+            )
+        term = ordered[0]
+        descending = bool(term.args.get("desc"))
+        nulls_first = term.args.get("nulls_first")
+        # PostgreSQL's default is NULLS LAST for ASC and NULLS FIRST for DESC.
+        if nulls_first is None:
+            nulls_first = descending
+        return (hs_kind, (_literal(args[0]), descending, bool(nulls_first)), order_val)
     fraction: float | None = None
     if kind != "mode":
         fraction = float(typemap.unwrap_numeric(_literal(inner.this.this)))
@@ -8087,7 +8121,9 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
             # Collect the ORDER BY values; the executor sorts + computes in Python.
             accumulators[fname] = {"$push": _agg_arg_to_expr(order_val, table)}
             project[fname] = f"${fname}"
-            if kind == "percentile_cont":
+            if kind in ("hs_rank", "hs_dense_rank"):
+                tag = "int8"
+            elif kind in ("hs_percent_rank", "hs_cume_dist") or kind == "percentile_cont":
                 tag = "float8"
             elif isinstance(order_val, exp.Column):
                 tag = table.type_for(order_val.name)

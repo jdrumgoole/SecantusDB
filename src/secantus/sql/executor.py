@@ -2377,6 +2377,60 @@ def _pipeline_input_docs(
     return [d for d in docs if keep(d)], remaining
 
 
+def _hypothetical_set_value(kind: str, payload: Any, values: Any) -> Any:
+    """`rank(v) WITHIN GROUP (ORDER BY expr)` and friends — what `v` would rank
+    if it were inserted into the group.
+
+    Every rule measured against PostgreSQL 14.13:
+
+    * `rank` counts rows sorting strictly BEFORE the hypothetical, plus one;
+      `dense_rank` counts distinct values instead.
+    * `percent_rank` is `(rank - 1) / N`, and `cume_dist` is
+      `(rows sorting at or before it, including itself) / (N + 1)` — note the
+      different denominators, and that cume_dist counts the hypothetical row
+      while percent_rank does not.
+    * NULLs take part in the ordering rather than being skipped, so the sort
+      direction and NULLS placement change the answer: `rank(20) ORDER BY v`
+      is 2 where `ORDER BY v DESC` is 3 on the same data.
+    * On an EMPTY group they are 1, 1, 0.0 and 1.0 — not NULL.
+    """
+    hypothetical, descending, nulls_first = payload
+    rows = list(values or [])
+    n = len(rows)
+
+    def key(v: Any) -> tuple[int, Any]:
+        # (null-bucket, value). The bucket records where NULLs sit in the FINAL
+        # order — 0 first, 2 last — and is therefore absolute; only the value
+        # comparison flips with the direction. Encoding NULLs as an extreme
+        # value and letting the direction flip decide instead gets `DESC` and
+        # `DESC NULLS LAST` exactly backwards, because reversing the comparison
+        # also reverses where the NULLs went.
+        if v is None:
+            return (0 if nulls_first else 2, 0)
+        return (1, typemap.sort_key_value(v))
+
+    hk = key(hypothetical)
+
+    def before(k: tuple[int, Any]) -> bool:
+        if k[0] != hk[0]:
+            return k[0] < hk[0]
+        if k[0] != 1:
+            return False  # both NULL: neither sorts before the other
+        return (k[1] > hk[1]) if descending else (k[1] < hk[1])
+
+    keys = [key(v) for v in rows]
+    rank = 1 + sum(1 for k in keys if before(k))
+    if kind == "hs_rank":
+        return rank
+    if kind == "hs_dense_rank":
+        return 1 + len({k for k in keys if before(k)})
+    if kind == "hs_percent_rank":
+        return 0.0 if n == 0 else (rank - 1) / n
+    # cume_dist: the hypothetical row counts itself, over N + 1.
+    at_or_before = sum(1 for k in keys if before(k) or k == hk)
+    return (at_or_before + 1) / (n + 1)
+
+
 def _ordered_set_value(kind: str, fraction: float | None, values: Any) -> Any:
     """Compute an ordered-set aggregate from the pushed ORDER BY values (NULLs
     dropped, then sorted ascending):
@@ -2484,7 +2538,11 @@ def _apply_post_aggregates(plan: Any, result: list[dict[str, Any]]) -> list[dict
 
                 doc[field_name] = _ranges.make_multirange(doc.get(field_name) or [])
             else:
-                doc[field_name] = _ordered_set_value(kind, payload, doc.get(field_name))
+                doc[field_name] = (
+                    _hypothetical_set_value(kind, payload, doc.get(field_name))
+                    if kind.startswith("hs_")
+                    else _ordered_set_value(kind, payload, doc.get(field_name))
+                )
     return result
 
 
