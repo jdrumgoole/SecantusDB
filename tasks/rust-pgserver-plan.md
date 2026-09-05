@@ -1268,7 +1268,92 @@ pre-existing bug that a passing test had been hiding.
 **Probes: 22 savepoint shapes, 21 failed-block shapes, 11 status shapes -- 0
 divergences.**
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181 -> 2219 -> 2256 -> 2347 (0.35 measured +29 on a pre-0.34 base and is not in this line).**
+### 0.39 the type a parameter was SENT as (2026-09-05)
+
+**2347 -> 2589, +255 / -13.** The largest batch of the campaign. (The 13 are
+`test_leak` object-count tests, which differ by ~2 between two runs of the same
+binary.)
+
+A bound parameter carries a type the CLIENT declared, and this server threw it
+away and re-derived each parameter's meaning from its decoded value. Where the
+two disagree the answers were wrong in ways that PRINT CORRECTLY:
+
+* `pg_typeof(%s)` with a small integer said `integer`; psycopg declared `int2`,
+  so PostgreSQL says `smallint`. 69 tests were on that one line.
+* A parameter with NO declared type has no type to report at all -- PostgreSQL
+  answers `42P18`, this server guessed `text`.
+* A range parameter kept the client's spelling: `int4range(10, 20, '[]') = $1`
+  bound to that very range was FALSE, while both sides printed `[10,21)`.
+
+**The declared types ride a thread-local**, as the session zone already does --
+they are needed deep in the expression walk, and threading them through every
+planner signature would touch every function to reach two of them.
+
+**They have to reach the DESCRIBE path too, and that is where an hour went.**
+The types were arriving (a debug print confirmed `Some(Int2)`), the execute path
+had them, and the client still saw `42P18` -- because psycopg DESCRIBES before
+it executes, and the describe planned the same statement with no types at all.
+**When a fix "does not take" on a statement a client prepares, check the
+describe: it runs first and its error is the one the client sees.**
+
+**Ranges needed two routes, not one.** A range parameter that arrives WITH its
+type now decodes through the same cast a literal takes (it was falling through
+to the untyped sniffer); one that arrives UNTYPED takes its type from the
+operand beside it, read off the EXPRESSION -- a range value is carried as its
+rendered text, so by the time two operands are values there is nothing left to
+tell `'[10,21)'` from any other string.
+
+**A test case written by hand was wrong where the probe was right**:
+`int4range(11, 20, '(]') = Range(10, 20, '(]')` is FALSE on PostgreSQL too
+(`[12,21)` vs `[11,21)`). The probe had the pairing right because it was
+checked against the oracle; the hand-written test was not.
+
+**Probes: 22 `pg_typeof` shapes, 26 range-parameter shapes (both formats) -- 0
+divergences.**
+
+**Standing rule earned three times over: after resolving a KEEP-BOTH rebase
+conflict, run `cargo test -p secantus-pgplan` and `ruff format`.** Concatenating
+the two sides of a conflict is right for files where both sides only APPEND,
+but it drops the blank line or the closing brace between them: twice it left
+`tests.rs` with an unclosed delimiter (which the Python suite cannot see,
+because it does not compile the Rust unit tests) and once it failed CI's
+`ruff format --check` on two missing blank lines.
+
+**Left divergent and recorded:** `pg_typeof` answers `text` rather than
+`regtype`, so the NAME matches but a binary cursor gets the name where
+PostgreSQL sends the four-byte oid.
+
+### 0.39a the numbers in 0.34-0.39 were taken with a BROKEN INVOCATION (2026-09-05)
+
+**Every figure in sections 0.34 through 0.39 is ~152 too low**, and the cause is
+how the gauge was invoked, not anything about the server.
+
+psycopg's `tests/test_typing.py` (125 tests) shells out to a bare `mypy`.
+`pyproject.toml` carries mypy in the dev extras precisely so those tests count,
+and the comment there says why: **`uv run` puts `.venv/bin` on PATH**. Running
+the gauge as `.venv/bin/python -m psycopg_validation.runner` does NOT -- the
+subprocess resolves `mypy` through pyenv, finds nothing, and 119 tests fail with
+`pyenv: mypy: command not found`. `invoke validate-psycopg` runs it through
+`uv run` and they pass.
+
+Measured on the same commit, minutes apart:
+
+| invocation | passed |
+| --- | --- |
+| `.venv/bin/python -m psycopg_validation.runner` | 2589 |
+| `PATH=.venv/bin:$PATH …` (what `uv run` does) | **2741** |
+
+**The DELTAS in those sections still hold** -- both sides of every comparison
+were measured the same way, and the same-branch baselines were taken with the
+same broken invocation. The ABSOLUTE numbers are not comparable with figures
+taken by the invoke task, which is what earlier sections used.
+
+**Rule: run the gauge through `uv run` (or `invoke validate-psycopg`), never
+`.venv/bin/python -m …` directly.** A gauge that shells out to a tool is
+measuring the PATH as much as the server, and the failure looks like 119 server
+failures rather than a missing binary.
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181 -> 2219 -> 2256 -> 2347 -> 2589 (all on the no-mypy scale of 0.39a; the same commit measures 2741 through `uv run`. 0.35 measured +29 on a pre-0.34 base and is not in this line).**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

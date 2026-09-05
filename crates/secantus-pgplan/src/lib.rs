@@ -73,6 +73,9 @@ pub enum Error {
     /// error rather than a gap: the extended protocol has one parameter list
     /// and one row description, which two commands cannot share.
     MultipleCommands,
+    /// A parameter whose type the client did not declare and context cannot
+    /// resolve -> 42P18.
+    IndeterminateDatatype(String),
 }
 
 impl std::fmt::Display for Error {
@@ -91,7 +94,9 @@ impl std::fmt::Display for Error {
             Error::DivisionByZero => write!(f, "division by zero"),
             Error::NumericOutOfRange(m) => write!(f, "{m}"),
             Error::DataException(m) | Error::InvalidParameter(m) => write!(f, "{m}"),
-            Error::InvalidColumnReference(m) | Error::UndefinedFunction(m) => write!(f, "{m}"),
+            Error::InvalidColumnReference(m)
+            | Error::UndefinedFunction(m)
+            | Error::IndeterminateDatatype(m) => write!(f, "{m}"),
             Error::MultipleCommands => {
                 write!(
                     f,
@@ -122,6 +127,7 @@ impl Error {
             Error::InvalidColumnReference(_) => "42P10", // invalid_column_reference
             Error::UndefinedFunction(_) => "42883", // undefined_function
             Error::MultipleCommands => "42601",     // syntax_error, as PostgreSQL reports it
+            Error::IndeterminateDatatype(_) => "42P18", // indeterminate_datatype
         }
     }
 }
@@ -1465,6 +1471,11 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             .map(type_name_of)
             .unwrap_or_else(|| inferred_type(value).to_string()),
         Some(N::AArrayExpr(_)) => inferred_type(value).to_string(),
+        // A PARAMETER's type is the one the client declared, not the one its
+        // decoded value suggests: psycopg sends a small integer as `int2`, and
+        // `pg_typeof` answers `smallint` where the value alone says `integer`.
+        Some(N::ParamRef(p)) => declared_param_type(usize::try_from(p.number).unwrap_or(0))
+            .unwrap_or_else(|| inferred_type(value).to_string()),
         // A LITERAL carries its own type in its node. Reading it from the
         // value works until the value is NULL -- `nullif(1,1)` is NULL, and a
         // NULL types as `text`, so the column came back as oid 25 where
@@ -1550,6 +1561,17 @@ fn pg_typeof(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> 
         ));
     }
     let arg = &f.args[0];
+    // A parameter the client left untyped has no type to report: PostgreSQL
+    // answers `42P18`, not a guess. `pg_typeof(%s)` with a plain string is the
+    // shape that reaches this.
+    if let Some(N::ParamRef(p)) = arg.node.as_ref() {
+        let n = usize::try_from(p.number).unwrap_or(0);
+        if declared_param_type(n).is_none() {
+            return Err(Error::IndeterminateDatatype(format!(
+                "could not determine data type of parameter ${n}"
+            )));
+        }
+    }
     let value = const_value(arg, params)?;
     let internal = if value == Bson::Null && matches!(arg.node.as_ref(), Some(N::AConst(_))) {
         "unknown".to_string()
@@ -2131,6 +2153,9 @@ thread_local! {
     /// installs it, calls the planner, and restores it, with no `await` in
     /// between, so no other task can observe or inherit it. The Python server
     /// arms its `maxTimeMS` deadline the same way.
+    /// The type each `$n` was declared as, when the client declared one.
+    static PLAN_PARAM_TYPES: std::cell::RefCell<Vec<Option<String>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     static PLAN_TIMEZONE: std::cell::RefCell<TimeZoneSetting> =
         const { std::cell::RefCell::new(TimeZoneSetting::Utc) };
 }
@@ -2142,10 +2167,36 @@ pub fn plan_with_session(
     params: &[Bson],
     timezone: &TimeZoneSetting,
 ) -> Result<Statement> {
+    plan_with_session_types(sql, lookup, params, &[], timezone)
+}
+
+/// As `plan_with_session`, and told what type the client DECLARED for each
+/// parameter.
+///
+/// A parameter's declared type is not recoverable from its decoded value:
+/// psycopg sends a small integer as `int2`, and `pg_typeof` has to answer
+/// `smallint` rather than the `integer` the value alone suggests. The types
+/// ride a thread-local for the same reason the session zone does -- they are
+/// needed deep inside the expression walk, and threading them through every
+/// signature would touch every planner function to reach two of them.
+pub fn plan_with_session_types(
+    sql: &str,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+    param_types: &[Option<String>],
+    timezone: &TimeZoneSetting,
+) -> Result<Statement> {
     let previous = PLAN_TIMEZONE.with(|t| t.replace(timezone.clone()));
+    let previous_types = PLAN_PARAM_TYPES.with(|t| t.replace(param_types.to_vec()));
     let out = plan_with_params(sql, lookup, params);
     PLAN_TIMEZONE.with(|t| *t.borrow_mut() = previous);
+    PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous_types);
     out
+}
+
+/// The declared type of `$n`, when the client gave one.
+fn declared_param_type(n: usize) -> Option<String> {
+    PLAN_PARAM_TYPES.with(|t| t.borrow().get(n.checked_sub(1)?).cloned().flatten())
 }
 
 /// Cast a TEXT representation to a declared type, with the session zone in
@@ -3244,6 +3295,24 @@ fn instant_micros(v: &Bson) -> Option<i64> {
 ///
 /// `*` and `/` are excluded on purpose — there PostgreSQL resolves the unknown
 /// to a NUMBER instead, which is why `interval '1 day' * '2'` is two days.
+/// The RANGE type an operand is STATICALLY known to have.
+///
+/// A range value is carried as its rendered text, so by the time two operands
+/// are values there is nothing to tell `'[10,21)'` from any other string. The
+/// EXPRESSION still says it: a range constructor names its type, and so does a
+/// cast. That is enough to resolve an unknown parameter beside it, which is
+/// what PostgreSQL does at analysis time.
+fn static_range_type(n: Option<&pg_query::protobuf::Node>) -> Option<String> {
+    let named = |name: String| {
+        (range::is_range_type(&name) || range::is_multirange_type(&name)).then_some(name)
+    };
+    match n.and_then(|x| x.node.as_ref()) {
+        Some(N::FuncCall(f)) => named(func_name(f)?),
+        Some(N::TypeCast(tc)) => named(type_name_of(tc.type_name.as_ref()?)),
+        _ => None,
+    }
+}
+
 fn coerce_unknown_operand(
     e: &pg_query::protobuf::AExpr,
     lhs: Bson,
@@ -3295,6 +3364,20 @@ fn coerce_unknown_operand(
         }
         _ => None,
     };
+    // A range beside an unknown parameter: `int4range(10, 20, '[]') = $1`.
+    // Both sides are strings by now, so the type has to come from the
+    // expression -- and without it the parameter kept the client's spelling
+    // while the constructor had been canonicalised, so two spellings of one
+    // range compared UNEQUAL while printing identically.
+    let coerced = coerced.or_else(|| {
+        let typed_node = if r_bare {
+            e.lexpr.as_deref()
+        } else {
+            e.rexpr.as_deref()
+        };
+        let name = static_range_type(typed_node)?;
+        cast_value(Bson::String(text.clone()), &name).ok()
+    });
     let Some(coerced) = coerced else {
         return Ok((lhs, rhs));
     };

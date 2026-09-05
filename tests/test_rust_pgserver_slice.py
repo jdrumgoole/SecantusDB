@@ -2186,3 +2186,68 @@ def test_create_table_if_not_exists_is_a_no_op(home: Path) -> None:
         assert cur.fetchone()[0] == 1
         with pytest.raises(psycopg.errors.DuplicateTable):
             cur.execute("create table inex (id int4)")
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+def test_a_range_bound_as_a_parameter_is_the_same_range(home: Path, binary: bool) -> None:
+    """`int4range(10, 20, '[]') = %s` with the same range bound.
+
+    A range over a discrete element type has one true spelling — PostgreSQL
+    rewrites every bound to `[)` — so a parameter that keeps the literal the
+    client wrote compares unequal to the same range written any other way while
+    printing identically. Two routes had to agree: a range parameter that
+    arrives with its type decodes through the cast, and one that arrives
+    untyped takes its type from the operand beside it.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor(binary=binary)
+        for sql, params in [
+            ("select int4range(10, 20, '[]') = %s", (Range(10, 20, "[]"),)),
+            ("select %s = int4range(10, 21, '[)')", (Range(10, 20, "[]"),)),
+            ("select int8range(1, 5, '[]') = %s", (Range(1, 5, "[]"),)),
+            # Both sides canonicalise to `[12,21)`; the exclusive lower bound
+            # moves up as the inclusive upper one does.
+            ("select int4range(11, 20, '(]') = %s", (Range(11, 20, "(]"),)),
+            (
+                "select numrange(1.0, 2.0, '[]') = %s",
+                (Range(Decimal("1.0"), Decimal("2.0"), "[]"),),
+            ),
+            (
+                "select int4multirange(int4range(1, 5, '[]')) = %s",
+                (Multirange([Range(1, 5, "[]")]),),
+            ),
+        ]:
+            cur.execute(sql, params)
+            assert cur.fetchone()[0] is True, sql
+
+
+def test_pg_typeof_reports_the_type_the_client_declared(home: Path) -> None:
+    """…which is not the one the decoded value suggests.
+
+    psycopg sends a small integer as `int2`, so the answer is `smallint` where
+    the value alone says `integer`. A parameter the client left untyped has no
+    type to report at all, and PostgreSQL answers `42P18` rather than guessing.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for params, want in [
+            ((1,), "smallint"),
+            ((40000,), "integer"),
+            ((10**12,), "bigint"),
+            ((1.5,), "double precision"),
+            ((Decimal("1.5"),), "numeric"),
+            ((True,), "boolean"),
+            ((dt.date(2026, 1, 1),), "date"),
+            (([1, 2],), "smallint[]"),
+        ]:
+            cur.execute("select pg_typeof(%s)", params)
+            assert cur.fetchone()[0] == want, params
+
+        for params in [("x",), (None,)]:
+            with pytest.raises(psycopg.errors.IndeterminateDatatype) as err:
+                cur.execute("select pg_typeof(%s)", params)
+            assert "could not determine data type of parameter $1" in str(err.value)
+
+        # A cast gives an untyped parameter a type.
+        cur.execute("select pg_typeof(%s::int4)", ("5",))
+        assert cur.fetchone()[0] == "integer"
