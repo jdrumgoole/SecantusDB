@@ -1023,7 +1023,45 @@ eliminated by measurement and the fourth is not yet known.
 **Probe: 11 output shapes byte-for-byte (including binary) and 3 input shapes,
 0 divergences.**
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933.**
+### 0.33 DDL inside a transaction (2026-09-05)
+
+**~1933 -> ~2117, +184.** The cascade 0.32 filed, chased to its cause.
+
+**Planning read the catalog OUTSIDE the open transaction.** Resolving a table
+name happens at plan time; the catalog is an ordinary table; so an uncommitted
+`CREATE TABLE` was invisible and the next statement said the relation did not
+exist. EXECUTION already ran inside the transaction, which is exactly why this
+hid so well: anything using a PRE-EXISTING table worked perfectly. Only
+create-then-use, uncommitted, failed -- the ordinary shape of a test fixture.
+
+**Two wrong fixes before the right one, both instructive:**
+
+1. Wrapping the PLAN in a second `with_user_transaction` worked for plain
+   statements and DEADLOCKED COPY, which opens its own transaction context.
+   Nesting that call is not safe.
+2. Recording created tables in a per-connection map, but asking `txn` whether a
+   transaction was open -- from inside `execute`, which `run` calls while
+   HOLDING that mutex. Non-reentrant, so it deadlocked the moment it mattered.
+   The working version reads a lock-free `AtomicBool` instead.
+
+**And a third bug underneath, never before reachable:** COPY inside a
+transaction wrote its rows OUTSIDE it, blocking against the transaction's own
+locks and hanging the connection. Nobody had seen it because resolving the
+table failed first whenever a transaction was open. **Fixing one bug exposed a
+worse one that had been hiding behind it.**
+
+**DDL IS NOT TRANSACTIONAL, and that is now filed rather than assumed.** A
+`CREATE TABLE` survives ROLLBACK (with its rows); a `DROP TABLE` stays dropped.
+PostgreSQL rolls back both. Measured in both directions. The tests assert what
+this server actually does and say so; the divergence is in `tasks/backlog.md`
+as a STORAGE-level item, since `create_collection` / `drop_collection` are not
+part of the user transaction.
+
+**Also: `ORDER BY <position>`** -- an ordinal into the SELECT LIST, not the
+table, so `select b, a from t order by 1` orders by `b`; out of range is 42P10.
+Worth +4 on its own and needed by the same fixtures.
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117.**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

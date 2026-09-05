@@ -56,6 +56,8 @@ pub enum Error {
     /// a crossed range bound here rather than in the invalid-text class, which
     /// is where a malformed LITERAL goes.
     DataException(String),
+    /// An ORDER BY position with no such output column -> 42P10.
+    InvalidColumnReference(String),
     /// A parameter that is the wrong VALUE rather than the wrong shape ->
     /// 22023. PostgreSQL distinguishes this from the generic data class.
     InvalidParameter(String),
@@ -84,6 +86,7 @@ impl std::fmt::Display for Error {
             Error::DivisionByZero => write!(f, "division by zero"),
             Error::NumericOutOfRange(m) => write!(f, "{m}"),
             Error::DataException(m) | Error::InvalidParameter(m) => write!(f, "{m}"),
+            Error::InvalidColumnReference(m) => write!(f, "{m}"),
             Error::MultipleCommands => {
                 write!(
                     f,
@@ -111,6 +114,7 @@ impl Error {
             Error::NumericOutOfRange(_) => "22003", // numeric_value_out_of_range
             Error::DataException(_) => "22000",     // data_exception
             Error::InvalidParameter(_) => "22023",  // invalid_parameter_value
+            Error::InvalidColumnReference(_) => "42P10", // invalid_column_reference
             Error::MultipleCommands => "42601",     // syntax_error, as PostgreSQL reports it
         }
     }
@@ -961,23 +965,42 @@ fn plan_select(
         let Some(N::SortBy(sb)) = item.node.as_ref() else {
             return Err(Error::Unsupported("this ORDER BY item".into()));
         };
-        let col = match sb.node.as_ref().and_then(|n| n.node.as_ref()) {
-            Some(N::ColumnRef(c)) => c
-                .fields
-                .first()
-                .and_then(|f| f.node.as_ref())
-                .and_then(|n| match n {
-                    N::String(st) => Some(st.sval.clone()),
-                    _ => None,
-                })
-                .ok_or_else(|| Error::Unsupported("this ORDER BY expression".into()))?,
-            // ORDER BY over an expression, or by output position, needs
-            // machinery this slice does not have. Refuse, never approximate.
+        // `ORDER BY 1` is the FIRST OUTPUT COLUMN, not the constant 1 -- an
+        // ordinal into the select list, which is why it has to be resolved
+        // against `columns` rather than against the table.
+        let field = match sb.node.as_ref().and_then(|n| n.node.as_ref()) {
+            Some(N::AConst(c)) => {
+                let Some(pg_query::protobuf::a_const::Val::Ival(v)) = c.val.as_ref() else {
+                    return Err(Error::Unsupported("ORDER BY over an expression".into()));
+                };
+                let pos = v.ival;
+                let idx = usize::try_from(pos)
+                    .ok()
+                    .filter(|n| *n >= 1 && *n <= columns.len())
+                    .ok_or_else(|| {
+                        Error::InvalidColumnReference(format!(
+                            "ORDER BY position {pos} is not in select list"
+                        ))
+                    })?;
+                columns[idx - 1].1.clone()
+            }
+            Some(N::ColumnRef(c)) => {
+                let col = c
+                    .fields
+                    .first()
+                    .and_then(|f| f.node.as_ref())
+                    .and_then(|n| match n {
+                        N::String(st) => Some(st.sval.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| Error::Unsupported("this ORDER BY expression".into()))?;
+                def.field_of(&col)
+                    .ok_or_else(|| Error::UndefinedColumn(col.clone()))?
+            }
+            // ORDER BY over a computed expression still needs machinery this
+            // slice does not have. Refuse, never approximate.
             _ => return Err(Error::Unsupported("ORDER BY over an expression".into())),
         };
-        let field = def
-            .field_of(&col)
-            .ok_or_else(|| Error::UndefinedColumn(col.clone()))?;
         let ascending = match SortByDir::try_from(sb.sortby_dir) {
             Ok(SortByDir::SortbyDesc) => false,
             Ok(SortByDir::SortbyDefault | SortByDir::SortbyAsc) => true,

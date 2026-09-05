@@ -1750,3 +1750,88 @@ def test_copy_binary_round_trips(home: Path) -> None:
         cur = conn.cursor()
         cur.execute("select id, s, n from b order by id")
         assert cur.fetchall() == [(1, "x", 10), (2, None, None), (3, "", 30)]
+
+
+def test_a_table_created_in_a_transaction_is_visible_to_it(home: Path) -> None:
+    """`CREATE TABLE` then use it, without committing in between.
+
+    Planning resolves table names against the catalog, and the catalog is an
+    ordinary table — so an uncommitted `CREATE TABLE` was invisible to a plain
+    read and the next statement reported that the relation did not exist.
+
+    *Execution* already ran inside the transaction, so selecting from a
+    pre-existing table worked and hid this completely. What it broke was the
+    ordinary shape of a test fixture: create a table, use it, roll back. It
+    accounted for 184 psycopg failures on its own.
+
+    Note what this does NOT claim: that the rollback undoes the CREATE. It does
+    not — DDL is not transactional on this server, which is a real divergence
+    from PostgreSQL and is recorded in `tasks/backlog.md`.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = False
+        cur = conn.cursor()
+
+        cur.execute("create table t (id int primary key, s text)")
+        cur.execute("select id from t")
+        assert cur.fetchall() == []
+
+        cur.execute("insert into t values (1,'x')")
+        cur.execute("select id, s from t")
+        assert cur.fetchall() == [(1, "x")]
+
+        # COPY into it, still uncommitted. Its rows have to be written inside
+        # the transaction like any other write: written outside it, they
+        # blocked against the transaction's own locks and hung the connection —
+        # a deadlock nobody had seen, because resolving the table failed first
+        # whenever a transaction was open.
+        with conn.cursor().copy("copy t from stdin") as cp:
+            cp.write(b"2\ty\n")
+        cur.execute("select count(*) from t")
+        assert cur.fetchone()[0] == 2
+        conn.rollback()
+
+
+def test_a_table_dropped_in_a_transaction_is_hidden_from_it(home: Path) -> None:
+    """The mirror case: a DROP that has not committed must also be seen.
+
+    The catalog row is deleted but not committed, so a plain read still finds
+    it — which would let a statement plan against a table the transaction has
+    already dropped.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int primary key)")
+        conn.autocommit = False
+        cur = conn.cursor()
+        cur.execute("drop table t")
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("select id from t")
+        assert exc.value.diag.sqlstate == "42P01"
+        conn.rollback()
+
+
+def test_order_by_output_position(home: Path) -> None:
+    """`ORDER BY 1` is the first output COLUMN, not the constant 1.
+
+    It is an ordinal into the select list, so it has to be resolved against the
+    output columns rather than against the table — `select b, a from t order by
+    1` orders by `b`. A position with no such column is PostgreSQL's own
+    `42P10`.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int primary key, a int, b text)")
+        conn.execute("insert into t values (1,3,'c'),(2,1,'a'),(3,2,'b')")
+        cur = conn.cursor()
+
+        cur.execute("select a, b from t order by 1")
+        assert cur.fetchall() == [(1, "a"), (2, "b"), (3, "c")]
+        cur.execute("select a, b from t order by 2 desc")
+        assert cur.fetchall() == [(3, "c"), (2, "b"), (1, "a")]
+        # The ordinal follows the select list, not the table.
+        cur.execute("select b, a from t order by 1")
+        assert cur.fetchall() == [("a", 1), ("b", 2), ("c", 3)]
+
+        for bad in ("select a from t order by 5", "select a from t order by 0"):
+            with pytest.raises(psycopg.Error) as exc:
+                cur.execute(bad)
+            assert exc.value.diag.sqlstate == "42P10", bad

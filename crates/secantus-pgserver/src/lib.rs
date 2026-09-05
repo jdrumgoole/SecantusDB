@@ -58,6 +58,16 @@ pub struct PgHandler {
     copy_in: Mutex<Option<CopyInState>>,
     /// Open cursors, by name. Per connection, as PostgreSQL's are.
     cursors: Mutex<HashMap<String, CursorState>>,
+    /// Tables created (`Some`) or dropped (`None`) in the open transaction and
+    /// not yet committed. Cleared when the transaction ends, whichever way.
+    uncommitted: Mutex<HashMap<String, Option<TableDef>>>,
+    /// Whether a transaction is open, as a LOCK-FREE flag.
+    ///
+    /// `txn` cannot answer this from inside `execute`: `run` holds that mutex
+    /// for the whole of execution and it is not reentrant, so asking there
+    /// deadlocks the connection. The flag is set and cleared alongside the
+    /// handle itself.
+    in_transaction: std::sync::atomic::AtomicBool,
 }
 
 /// A declared cursor's materialised result.
@@ -97,6 +107,8 @@ impl PgHandler {
             settings: Mutex::new(default_settings()),
             copy_in: Mutex::new(None),
             cursors: Mutex::new(HashMap::new()),
+            uncommitted: Mutex::new(HashMap::new()),
+            in_transaction: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -104,6 +116,18 @@ impl PgHandler {
     /// rather than caching: the store is shared with the other two servers, so
     /// a cache here would go stale behind our back.
     fn lookup(&self, name: &str) -> Option<TableDef> {
+        // What this transaction has created or dropped, before what is
+        // committed. A `None` here is a tombstone: the table was dropped in
+        // this transaction and must not be found even though its catalog row
+        // is still there.
+        if let Some(pending) = self
+            .uncommitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+        {
+            return pending.clone();
+        }
         let filter = bson::doc! { "_id": name };
         let rows = self
             .storage
@@ -645,6 +669,52 @@ impl PgHandler {
         Ok(rows)
     }
 
+    /// Record a table this transaction created (`Some`) or dropped (`None`).
+    ///
+    /// Only while a transaction is open: outside one the write is already
+    /// committed and the catalog is the truth.
+    fn note_uncommitted(&self, name: &str, def: Option<TableDef>) {
+        if !self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        self.uncommitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string(), def);
+    }
+
+    /// Plan a statement, resolving table names against the catalog PLUS any
+    /// tables created in the open transaction but not yet committed.
+    ///
+    /// Planning reads the catalog, and the catalog is an ordinary table -- so
+    /// an uncommitted `CREATE TABLE` is invisible to a plain read, and this
+    /// failed:
+    ///
+    /// ```text
+    /// BEGIN;
+    /// CREATE TABLE t (...);
+    /// SELECT * FROM t;      -- relation "t" does not exist
+    /// ```
+    ///
+    /// EXECUTION already ran inside the transaction, so selecting from a
+    /// pre-existing table worked and hid this. Any client that creates a table
+    /// and uses it before committing hit it -- the ordinary shape of a test
+    /// fixture, and 195 psycopg failures.
+    ///
+    /// The fix is a per-connection map of what this transaction has created or
+    /// dropped, consulted before the catalog. Wrapping the PLAN in a second
+    /// `with_user_transaction` also worked for plain statements and DEADLOCKED
+    /// COPY, which opens its own transaction context: nesting that call is not
+    /// safe, and this needs no nesting.
+    fn plan_in_transaction(&self, sql: &str, params: &[Bson]) -> PgWireResult<Statement> {
+        let tz = self.session_timezone();
+        secantus_pgplan::plan_with_session(sql, &|n| self.lookup(n), params, &tz)
+            .map_err(|e| Self::err(&e))
+    }
+
     /// The session's `TimeZone` GUC, resolved.
     fn session_timezone(&self) -> secantus_pgplan::TimeZoneSetting {
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
@@ -660,10 +730,18 @@ impl PgHandler {
             .begin_user_transaction()
             .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
         *self.txn.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        self.in_transaction
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
     fn commit_implicit(&self) -> PgWireResult<()> {
+        self.uncommitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.in_transaction
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
             self.storage
                 .commit_user_transaction(&mut handle)
@@ -673,6 +751,12 @@ impl PgHandler {
     }
 
     fn rollback_implicit(&self) -> PgWireResult<()> {
+        self.uncommitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.in_transaction
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
             self.storage
                 .rollback_user_transaction(&mut handle)
@@ -695,16 +779,7 @@ impl PgHandler {
             return Ok(vec![Response::EmptyQuery]);
         }
 
-        // The session's TimeZone is part of what a statement MEANS: the same
-        // `'2026-01-01 12:00'::timestamptz` names a different instant under a
-        // different zone, so it is passed in rather than defaulted.
-        let stmt = secantus_pgplan::plan_with_session(
-            sql,
-            &|n| self.lookup(n),
-            params,
-            &self.session_timezone(),
-        )
-        .map_err(|e| Self::err(&e))?;
+        let stmt = self.plan_in_transaction(sql, params)?;
 
         // Transaction control is session state, not a storage operation.
         if let Statement::Transaction(control) = stmt {
@@ -797,6 +872,14 @@ impl PgHandler {
 
     /// BEGIN / COMMIT / ROLLBACK.
     fn transaction_control(&self, control: TransactionControl) -> PgWireResult<Vec<Response>> {
+        // Whatever the transaction did to the catalog is either committed or
+        // discarded once it ends, so the pending map stops being the truth.
+        if !matches!(control, TransactionControl::Begin) {
+            self.uncommitted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
         let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
         let tag = match control {
             TransactionControl::Begin => {
@@ -806,6 +889,8 @@ impl PgHandler {
                         .begin_user_transaction()
                         .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
                     *guard = Some(handle);
+                    self.in_transaction
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 // A BEGIN inside a transaction is a WARNING in PostgreSQL, not
                 // an error, and the existing transaction continues.
@@ -813,6 +898,8 @@ impl PgHandler {
             }
             TransactionControl::Commit => {
                 if let Some(mut handle) = guard.take() {
+                    self.in_transaction
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
                     self.storage
                         .commit_user_transaction(&mut handle)
                         .map_err(|e| Self::storage_err("could not commit", e))?;
@@ -821,6 +908,8 @@ impl PgHandler {
             }
             TransactionControl::Rollback => {
                 if let Some(mut handle) = guard.take() {
+                    self.in_transaction
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
                     self.storage
                         .rollback_user_transaction(&mut handle)
                         .map_err(|e| Self::storage_err("could not roll back", e))?;
@@ -853,6 +942,9 @@ impl PgHandler {
                 self.storage
                     .insert(&self.db, CATALOG_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the table", e))?;
+                // Remember it for the rest of this transaction: the catalog row
+                // above is not committed yet, so a plain read cannot see it.
+                self.note_uncommitted(&def.name, Some(def.clone()));
                 Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))])
             }
 
@@ -997,6 +1089,9 @@ impl PgHandler {
                             None,
                         )
                         .map_err(|e| Self::storage_err("could not drop the catalog entry", e))?;
+                    // A tombstone: the catalog row is deleted but not
+                    // committed, so a plain read would still find it.
+                    self.note_uncommitted(table, None);
                 }
                 Ok(vec![Response::Execution(Tag::new("DROP TABLE"))])
             }
@@ -2419,13 +2514,9 @@ impl PgHandler {
     /// no values exist yet, and the result SHAPE does not depend on them.
     fn describe_fields(&self, sql: &str, n_params: usize) -> PgWireResult<Vec<FieldInfo>> {
         let params = vec![Bson::Null; n_params];
-        let stmt = secantus_pgplan::plan_with_session(
-            sql,
-            &|n| self.lookup(n),
-            &params,
-            &self.session_timezone(),
-        )
-        .map_err(|e| Self::err(&e))?;
+        // Describe resolves table names too, and against the same uncommitted
+        // catalog -- see `plan_in_transaction`.
+        let stmt = self.plan_in_transaction(sql, &params)?;
         Ok(match stmt {
             // A FETCH describes the CURSOR's columns. Without this arm a
             // prepared FETCH described zero of them, and psycopg prepares any
@@ -2742,10 +2833,22 @@ impl CopyHandler for PgHandler {
 
         let written = docs.len();
         if !docs.is_empty() {
-            let (_, errors) = self
-                .storage
-                .insert(&self.db, &state.table, docs, true)
-                .map_err(|e| Self::storage_err("could not insert COPY rows", e))?;
+            // INSIDE the open transaction, as every other write is. A COPY
+            // whose rows were written outside it blocked against the
+            // transaction's own locks and hung the connection -- which nobody
+            // had seen, because resolving the table failed first whenever a
+            // transaction was open.
+            let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
+            let insert = || self.storage.insert(&self.db, &state.table, docs, true);
+            let (_, errors) = match guard.as_mut() {
+                Some(handle) => self
+                    .storage
+                    .with_user_transaction(handle, insert)
+                    .map_err(|e| Self::storage_err("transaction failed", e))?,
+                None => insert(),
+            }
+            .map_err(|e| Self::storage_err("could not insert COPY rows", e))?;
+            drop(guard);
             if let Some(first) = errors.first() {
                 let def = self
                     .lookup(&state.table)
