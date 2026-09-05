@@ -4555,6 +4555,12 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   a write to a large table copies the whole table into memory. Lazy capture is
   what keeps the common case free (a savepoint nobody writes through costs
   nothing), and a per-row undo log would be the fix if the cost ever bites.
+- **Rust PG server: `pg_typeof` answers `text`, not `regtype`.** The NAME is
+  right and matches PostgreSQL in the text format, but the column's type oid is
+  25 where PostgreSQL says 2206, so a BINARY cursor gets the name where
+  PostgreSQL sends the four-byte oid, and `pg_typeof(x)::regtype` is refused.
+  Implementing `regtype` means a name-to-oid table (the inverse of the one the
+  parameter decoder already has) plus a binary encoder for it.
 - **Rust PG server: range and multirange OPERATORS are unsupported.** Both type
   families themselves (literals, constructors, casts, canonicalisation, merging,
   parameters in both wire formats) are in; `@>` / `<@` / `&&` / `-|-` and the

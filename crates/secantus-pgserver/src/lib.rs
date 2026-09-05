@@ -194,6 +194,29 @@ impl PgHandler {
             .store(binary, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Plan a statement, resolving table names against the catalog PLUS any
+    /// tables created in the open transaction but not yet committed.
+    ///
+    /// Planning reads the catalog, and the catalog is an ordinary table -- so
+    /// an uncommitted `CREATE TABLE` is invisible to a plain read, and this
+    /// failed:
+    ///
+    /// ```text
+    /// BEGIN;
+    /// CREATE TABLE t (...);
+    /// SELECT * FROM t;      -- relation "t" does not exist
+    /// ```
+    ///
+    /// EXECUTION already ran inside the transaction, so selecting from a
+    /// pre-existing table worked and hid this. Any client that creates a table
+    /// and uses it before committing hit it -- the ordinary shape of a test
+    /// fixture, and 195 psycopg failures.
+    ///
+    /// The fix is a per-connection map of what this transaction has created or
+    /// dropped, consulted before the catalog. Wrapping the PLAN in a second
+    /// `with_user_transaction` also worked for plain statements and DEADLOCKED
+    /// COPY, which opens its own transaction context: nesting that call is not
+    /// safe, and this needs no nesting.
     /// Read one table's catalog entry. Reads it back from storage every time
     /// rather than caching: the store is shared with the other two servers, so
     /// a cache here would go stale behind our back.
@@ -329,6 +352,53 @@ fn default_settings() -> HashMap<String, String> {
 }
 
 /// The PostgreSQL type a column's declared type maps onto over the wire.
+/// The planner's INTERNAL name for a wire type, which is the inverse of
+/// `wire_type` for the types a parameter can be declared as.
+///
+/// `None` for a type this server has no name for: the planner then falls back
+/// to the value, which is what it did for every parameter before declared
+/// types reached it.
+fn internal_type_name(ty: &Type) -> Option<String> {
+    Some(
+        match ty.oid() {
+            21 => "int2",
+            23 => "int4",
+            20 => "int8",
+            700 => "float4",
+            701 => "float8",
+            1700 => "numeric",
+            16 => "bool",
+            25 => "text",
+            1043 => "varchar",
+            1042 => "bpchar",
+            19 => "name",
+            1082 => "date",
+            1083 => "time",
+            1114 => "timestamp",
+            1184 => "timestamptz",
+            1266 => "timetz",
+            1186 => "interval",
+            114 => "json",
+            3802 => "jsonb",
+            1005 => "int2[]",
+            1007 => "int4[]",
+            1016 => "int8[]",
+            1021 => "float4[]",
+            1022 => "float8[]",
+            1231 => "numeric[]",
+            1000 => "bool[]",
+            1009 => "text[]",
+            1015 => "varchar[]",
+            oid => {
+                return secantus_pgplan::range::range_oid_name(oid)
+                    .or_else(|| secantus_pgplan::range::multirange_oid_name(oid))
+                    .map(str::to_string)
+            }
+        }
+        .to_string(),
+    )
+}
+
 fn wire_type(pg_type: &str) -> Type {
     match pg_type {
         "int2" => Type::INT2,
@@ -882,35 +952,6 @@ impl PgHandler {
             .insert(name.to_string(), def);
     }
 
-    /// Plan a statement, resolving table names against the catalog PLUS any
-    /// tables created in the open transaction but not yet committed.
-    ///
-    /// Planning reads the catalog, and the catalog is an ordinary table -- so
-    /// an uncommitted `CREATE TABLE` is invisible to a plain read, and this
-    /// failed:
-    ///
-    /// ```text
-    /// BEGIN;
-    /// CREATE TABLE t (...);
-    /// SELECT * FROM t;      -- relation "t" does not exist
-    /// ```
-    ///
-    /// EXECUTION already ran inside the transaction, so selecting from a
-    /// pre-existing table worked and hid this. Any client that creates a table
-    /// and uses it before committing hit it -- the ordinary shape of a test
-    /// fixture, and 195 psycopg failures.
-    ///
-    /// The fix is a per-connection map of what this transaction has created or
-    /// dropped, consulted before the catalog. Wrapping the PLAN in a second
-    /// `with_user_transaction` also worked for plain statements and DEADLOCKED
-    /// COPY, which opens its own transaction context: nesting that call is not
-    /// safe, and this needs no nesting.
-    fn plan_in_transaction(&self, sql: &str, params: &[Bson]) -> PgWireResult<Statement> {
-        let tz = self.session_timezone();
-        secantus_pgplan::plan_with_session(sql, &|n| self.lookup(n), params, &tz)
-            .map_err(|e| Self::err(&e))
-    }
-
     /// The session's `TimeZone` GUC, resolved.
     fn session_timezone(&self) -> secantus_pgplan::TimeZoneSetting {
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
@@ -988,6 +1029,22 @@ impl PgHandler {
         params: &[Bson],
         max_rows: usize,
     ) -> PgWireResult<Vec<Response>> {
+        self.run_typed(query, params, &[], max_rows).await
+    }
+
+    /// As `run`, and told what type the client DECLARED for each parameter.
+    ///
+    /// The declared type is not recoverable from the decoded value -- psycopg
+    /// sends a small integer as `int2` and `pg_typeof` has to say `smallint` --
+    /// so the extended protocol passes it down and the simple protocol, which
+    /// has no `Bind` and therefore no declared types, passes nothing.
+    async fn run_typed(
+        &self,
+        query: &str,
+        params: &[Bson],
+        param_types: &[Option<String>],
+        max_rows: usize,
+    ) -> PgWireResult<Vec<Response>> {
         let sql = query.trim().trim_end_matches(';').trim();
         if sql.is_empty() {
             return Ok(vec![Response::EmptyQuery]);
@@ -998,7 +1055,13 @@ impl PgHandler {
         // `25P02`, not `42703`. A SYNTAX error is the exception -- the parser
         // runs first there too, so `selct 1` still answers `42601`.
         let tz = self.session_timezone();
-        let planned = secantus_pgplan::plan_with_session(sql, &|n| self.lookup(n), params, &tz);
+        let planned = secantus_pgplan::plan_with_session_types(
+            sql,
+            &|n| self.lookup(n),
+            params,
+            param_types,
+            &tz,
+        );
         if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
             let ends_the_block = matches!(
                 &planned,
@@ -3286,6 +3349,21 @@ fn decode_parameter(
             secantus_pgplan::cast_text_to(&text, &format!("{element}[]"), tz)
                 .map_err(|e| PgHandler::err(&e))
         }
+        // A range or multirange sent as TEXT. Without these it fell through to
+        // `sniff_text` and stayed the literal the client wrote, UNCANONICALISED
+        // -- so `int4range(10, 20, '[]') = %s` was FALSE against the same range
+        // bound as a parameter, because the left side had been rewritten to
+        // `[10,21)` and the right side had not. The binary path already went
+        // through the cast; this is the same value by the other route.
+        Some(oid)
+            if secantus_pgplan::range::range_oid_name(oid).is_some()
+                || secantus_pgplan::range::multirange_oid_name(oid).is_some() =>
+        {
+            let target = secantus_pgplan::range::range_oid_name(oid)
+                .or_else(|| secantus_pgplan::range::multirange_oid_name(oid))
+                .expect("checked");
+            secantus_pgplan::cast_text_to(&text, target, tz).map_err(|e| PgHandler::err(&e))
+        }
         // oid 0 = the client left the type to us. PostgreSQL infers from
         // context; sniffing the literal covers the shapes this server plans.
         _ => Ok(sniff_text(&text)),
@@ -3357,11 +3435,27 @@ impl PgHandler {
     ///
     /// Planned against NULL placeholders: `Describe` arrives before `Bind`, so
     /// no values exist yet, and the result SHAPE does not depend on them.
-    fn describe_fields(&self, sql: &str, n_params: usize) -> PgWireResult<Vec<FieldInfo>> {
+    fn describe_fields(
+        &self,
+        sql: &str,
+        n_params: usize,
+        param_types: &[Option<String>],
+    ) -> PgWireResult<Vec<FieldInfo>> {
         let params = vec![Bson::Null; n_params];
         // Describe resolves table names too, and against the same uncommitted
-        // catalog -- see `plan_in_transaction`.
-        let stmt = self.plan_in_transaction(sql, &params)?;
+        // catalog, through `self.lookup`. The DECLARED parameter types
+        // come with it: a describe that did not know them answered `42P18` for
+        // `pg_typeof($1)` before the execute that does know them ever ran, and
+        // the client sees the describe's error.
+        let tz = self.session_timezone();
+        let stmt = secantus_pgplan::plan_with_session_types(
+            sql,
+            &|n| self.lookup(n),
+            &params,
+            param_types,
+            &tz,
+        )
+        .map_err(|e| Self::err(&e))?;
         Ok(match stmt {
             // A FETCH describes the CURSOR's columns. Without this arm a
             // prepared FETCH described zero of them, and psycopg prepares any
@@ -3459,7 +3553,11 @@ impl ExtendedQueryHandler for PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let declared = &target.parameter_types;
-        let fields = self.describe_fields(&target.statement.sql, declared.len())?;
+        let param_types: Vec<Option<String>> = declared
+            .iter()
+            .map(|t| t.as_ref().and_then(internal_type_name))
+            .collect();
+        let fields = self.describe_fields(&target.statement.sql, declared.len(), &param_types)?;
         // An unspecified parameter (`None`) is reported to the client as
         // `unknown`, which is what PostgreSQL does when it cannot infer.
         let types: Vec<Type> = declared
@@ -3513,9 +3611,16 @@ impl ExtendedQueryHandler for PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.note_result_format(&target.result_column_format);
+        let param_types: Vec<Option<String>> = target
+            .statement
+            .parameter_types
+            .iter()
+            .map(|t| t.as_ref().and_then(internal_type_name))
+            .collect();
         let fields = self.describe_fields(
             &target.statement.statement.sql,
             target.statement.parameter_types.len(),
+            &param_types,
         )?;
         Ok(DescribePortalResponse::new(fields))
     }
@@ -3534,8 +3639,19 @@ impl ExtendedQueryHandler for PgHandler {
     {
         self.note_result_format(&portal.result_column_format);
         let params = self.portal_params(portal)?;
+        let param_types: Vec<Option<String>> = portal
+            .statement
+            .parameter_types
+            .iter()
+            .map(|t| t.as_ref().and_then(internal_type_name))
+            .collect();
         let mut responses = self
-            .run(&portal.statement.statement.sql, &params, max_rows)
+            .run_typed(
+                &portal.statement.statement.sql,
+                &params,
+                &param_types,
+                max_rows,
+            )
             .await?;
         // One portal is one statement, so exactly one response.
         Ok(responses.remove(0))

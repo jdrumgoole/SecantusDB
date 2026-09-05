@@ -983,6 +983,93 @@ def test_server_cursors_match_postgres(
     """
 
 
+# `pg_typeof` of a bound parameter, whose type only the client knows, plus the
+# range comparisons that need the same information. Both are here rather than in
+# QUERIES because the answer depends on what psycopg DECLARED for the
+# parameter, which a literal cannot express.
+PARAM_TYPE_QUERIES: list[tuple[str, tuple]] = [
+    ("SELECT pg_typeof(%s)", (1,)),
+    ("SELECT pg_typeof(%s)", (40000,)),
+    ("SELECT pg_typeof(%s)", (10**12,)),
+    ("SELECT pg_typeof(%s)", (1.5,)),
+    ("SELECT pg_typeof(%s)", (Decimal("1.5"),)),
+    ("SELECT pg_typeof(%s)", (True,)),
+    ("SELECT pg_typeof(%s)", (dt.date(2026, 1, 1),)),
+    ("SELECT pg_typeof(%s)", (dt.datetime(2026, 1, 1, 12),)),
+    ("SELECT pg_typeof(%s)", ([1, 2],)),
+    # No declared type, and no context to resolve one from.
+    ("SELECT pg_typeof(%s)", ("x",)),
+    ("SELECT pg_typeof(%s)", (None,)),
+    ("SELECT pg_typeof(%s::int4)", ("5",)),
+]
+
+# The same information, in comparisons rather than in `pg_typeof` — these run in
+# BOTH formats, because a boolean answer is a boolean in either. The
+# `pg_typeof` cases above are text-only: its result type is `regtype`, which
+# renders as the type NAME in text and as the four-byte oid in binary, and this
+# server answers `text` (see `tasks/backlog.md`).
+PARAM_RANGE_QUERIES: list[tuple[str, tuple]] = [
+    ("SELECT int4range(10, 20, '[]') = %s", (Range(10, 20, "[]"),)),
+    ("SELECT %s = int4range(10, 21, '[)')", (Range(10, 20, "[]"),)),
+    ("SELECT int8range(1, 5, '[]') = %s", (Range(1, 5, "[]"),)),
+    ("SELECT numrange(1.0, 2.0, '[]') = %s", (Range(Decimal("1.0"), Decimal("2.0"), "[]"),)),
+    (
+        "SELECT int4multirange(int4range(1, 5, '[]')) = %s",
+        (Multirange([Range(1, 5, "[]")]),),
+    ),
+]
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+@pytest.mark.parametrize("sql,params", PARAM_RANGE_QUERIES, ids=lambda v: str(v)[:52])
+def test_range_parameter_matches_postgres(
+    sql: str,
+    params: tuple,
+    binary: bool,
+    ours: psycopg.Connection,
+    oracle: psycopg.Connection,
+) -> None:
+    """A range bound as a parameter, in both wire formats."""
+    _reset_oracle(oracle)
+
+    def probe(conn: psycopg.Connection) -> object:
+        cur = conn.cursor(binary=binary)
+        try:
+            cur.execute(sql, params)
+        except psycopg.Error as exc:
+            with contextlib.suppress(Exception):
+                conn.rollback()
+            return f"[{exc.diag.sqlstate}] {str(exc).splitlines()[0]}"
+        return repr(cur.fetchall())
+
+    theirs, mine = probe(oracle), probe(ours)
+    assert mine == theirs, f"{sql} {params}\n  postgres={theirs}\n  ours    ={mine}"
+
+
+@pytest.mark.parametrize("sql,params", PARAM_TYPE_QUERIES, ids=lambda v: str(v)[:52])
+def test_parameter_type_matches_postgres(
+    sql: str,
+    params: tuple,
+    ours: psycopg.Connection,
+    oracle: psycopg.Connection,
+) -> None:
+    """The declared type of a parameter, which no literal can stand in for."""
+    _reset_oracle(oracle)
+
+    def probe(conn: psycopg.Connection) -> object:
+        cur = conn.cursor()
+        try:
+            cur.execute(sql, params)
+        except psycopg.Error as exc:
+            with contextlib.suppress(Exception):
+                conn.rollback()
+            return f"[{exc.diag.sqlstate}] {str(exc).splitlines()[0]}"
+        return repr(cur.fetchall())
+
+    theirs, mine = probe(oracle), probe(ours)
+    assert mine == theirs, f"{sql} {params}\n  postgres={theirs}\n  ours    ={mine}"
+
+
 def test_savepoints_match_postgres(ours: psycopg.Connection, oracle: psycopg.Connection) -> None:
     """SAVEPOINT / RELEASE / ROLLBACK TO, against the server that defines them.
 
