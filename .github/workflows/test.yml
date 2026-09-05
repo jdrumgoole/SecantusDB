@@ -1730,6 +1730,37 @@ jobs:
           try { Set-MpPreference -DisableRealtimeMonitoring $true }
           catch { Write-Warning "could not disable Defender real-time scanning: $_" }
 
+      - name: Reclaim disk (Windows)
+        if: runner.os == 'Windows'
+        # This job keeps a WiredTiger home per test for the whole session --
+        # `tests/conftest.py` REFUSES a mid-session delete policy, because one
+        # was tried and raced WT's background threads into a WT_PANIC cascade,
+        # so the homes cannot simply be cleaned up as they finish. The
+        # concurrency suite at the end of this job is the heaviest writer of
+        # them, and it exhausted the runner with "No space left on device" on a
+        # change that added no storage at all (2026-09-05).
+        #
+        # The `test` job already reclaims preinstalled toolchains on LINUX for
+        # exactly this reason; Windows had no equivalent. The Android SDK is the
+        # large safely-removable item -- this job needs MSVC, CMake, Python and
+        # LLVM, and none of those live under it.
+        shell: pwsh
+        run: |
+          foreach ($p in @('C:\Android', 'C:\Program Files (x86)\Android')) {
+            if (Test-Path $p) {
+              Write-Host "removing $p"
+              Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue
+            }
+          }
+
+      - name: Free disk before the storage tests
+        # Reported on EVERY os, before and after (see the paired step at the end
+        # of this job). The Windows exhaustion above was undiagnosable after the
+        # fact because nothing recorded how much space there had been -- the
+        # Linux reclaim prints `df -h`, this job printed nothing.
+        shell: bash
+        run: df -h . || true
+
       - name: Install toolchain (Linux)
         if: runner.os == 'Linux'
         uses: ./.github/actions/apt-install
@@ -1949,6 +1980,15 @@ jobs:
           --with "$(ls dist-storage/*.whl)"
           python -m pytest tests/test_mongo_server_concurrency.py
           -k rust -o addopts= -p no:cacheprovider -q
+
+      - name: Free disk after the storage tests
+        # Paired with the "before" step: the DELTA is the number that sizes any
+        # real fix. Runs even on failure, because the failure mode being
+        # diagnosed here is exhaustion -- a report only on success would never
+        # print on the run that needs it.
+        if: always()
+        shell: bash
+        run: df -h . || true
 
       - name: Build + smoke the standalone secantusd-rs binary (R7)
         # The bin crate links the SAME vendored WiredTiger the wheel build above
