@@ -1061,7 +1061,34 @@ part of the user transaction.
 table, so `select b, a from t order by 1` orders by `b`; out of range is 42P10.
 Worth +4 on its own and needed by the same fixtures.
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117.**
+### 0.34 set-returning functions in the SELECT LIST (2026-09-05)
+
+**2119 -> ~2181, +62.**
+
+**`generate_series` was back at 102 in the ranking after 0.31 implemented it.**
+Not a regression: 0.31 built the `FROM generate_series(...)` form, and the
+corpus mostly writes `select generate_series(1, 10)` -- the function in the
+SELECT LIST, no FROM. **Implementing a feature does not retire its ranking
+entry; check WHICH SHAPE the remaining tests use.**
+
+Planned as a select over a generated source, so it is the same statement the
+FROM form produces and ORDER BY / LIMIT / OFFSET came along unchanged. A SRF
+BESIDE another column (`select 1, generate_series(1,3)`, which repeats the
+constant per row) is refused: it needs the other columns carried into each
+generated row, and nothing in the corpus asks for it.
+
+**Multirange binary parameters (+22)**, finishing 0.29: a count of ranges then
+each one in the RANGE's own binary form, reusing the range decoder rather than
+restating the layout.
+
+**Also confirmed by re-ranking the binary-parameter oids:** what remains there
+(uuid, inet, cidr, bytea, json arrays) is types this server does not have, not
+decoder gaps. That entry is now exhausted as a source of cheap wins.
+
+**Probe: 8 select-list shapes and 10 multirange parameter shapes, 0
+divergences.**
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181.**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

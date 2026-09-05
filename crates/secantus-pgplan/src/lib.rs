@@ -1518,7 +1518,111 @@ pub fn display_type(internal: &str) -> String {
     .to_string()
 }
 
+/// A FROM-less select whose target list is a set-returning function.
+///
+/// Only the single-target form: `select 1, generate_series(1,3)` repeats the
+/// constant across the generated rows, which needs the constants carried into
+/// each row, and nothing in the corpus asks for it. Refusing is better than a
+/// shape that silently drops a column.
+fn plan_select_srf(
+    s: &pg_query::protobuf::SelectStmt,
+    params: &[Bson],
+) -> Result<Option<Statement>> {
+    let srf_targets = s
+        .target_list
+        .iter()
+        .filter(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => matches!(
+                rt.val.as_ref().and_then(|v| v.node.as_ref()),
+                Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("generate_series")
+            ),
+            _ => false,
+        })
+        .count();
+    if srf_targets == 0 {
+        return Ok(None);
+    }
+    if srf_targets > 1 || s.target_list.len() > 1 {
+        return Err(Error::Unsupported(
+            "a set-returning function beside another output column".into(),
+        ));
+    }
+    let Some(N::ResTarget(rt)) = s.target_list[0].node.as_ref() else {
+        return Ok(None);
+    };
+    let Some(N::FuncCall(f)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) else {
+        return Ok(None);
+    };
+    let series = series_from_args(f, params)?;
+    let column = if rt.name.is_empty() {
+        series.column.clone()
+    } else {
+        rt.name.clone()
+    };
+    let series = Series {
+        column: column.clone(),
+        ..series
+    };
+    let mut order = Vec::new();
+    for item in &s.sort_clause {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return Err(Error::Unsupported("this ORDER BY item".into()));
+        };
+        let ascending = match SortByDir::try_from(sb.sortby_dir) {
+            Ok(SortByDir::SortbyDesc) => false,
+            Ok(SortByDir::SortbyDefault | SortByDir::SortbyAsc) => true,
+            _ => return Err(Error::Unsupported("ORDER BY ... USING".into())),
+        };
+        let nulls = match SortByNulls::try_from(sb.sortby_nulls) {
+            Ok(SortByNulls::SortbyNullsFirst) => Nulls::First,
+            Ok(SortByNulls::SortbyNullsLast) => Nulls::Last,
+            _ if ascending => Nulls::Last,
+            _ => Nulls::First,
+        };
+        order.push(OrderKey {
+            field: column.clone(),
+            ascending,
+            nulls,
+        });
+    }
+    let limit = match s.limit_count.as_ref() {
+        None => None,
+        Some(n) => match const_value(n, params)? {
+            Bson::Int32(v) => Some(i64::from(v)),
+            Bson::Int64(v) => Some(v),
+            Bson::Null => None,
+            _ => return Err(Error::Unsupported("this LIMIT".into())),
+        },
+    };
+    let offset = match s.limit_offset.as_ref() {
+        None => 0,
+        Some(n) => match const_value(n, params)? {
+            Bson::Int32(v) => i64::from(v),
+            Bson::Int64(v) => v,
+            Bson::Null => 0,
+            _ => return Err(Error::Unsupported("this OFFSET".into())),
+        },
+    };
+    Ok(Some(Statement::Select(Select {
+        table: String::new(),
+        series: Some(series),
+        columns: vec![(column.clone(), column)],
+        filter: Document::new(),
+        order,
+        limit,
+        offset,
+    })))
+}
+
 fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> Result<Statement> {
+    // A SET-RETURNING function in the target list of a FROM-less select is not
+    // a constant at all: `select generate_series(1,3)` is three ROWS. It is
+    // planned as an ordinary select over a generated source, which is what the
+    // `FROM generate_series(...)` form already produces -- so ORDER BY, LIMIT
+    // and OFFSET keep working without a second implementation.
+    if let Some(stmt) = plan_select_srf(s, params)? {
+        return Ok(stmt);
+    }
     let mut columns: Vec<(String, ConstCol, String)> = Vec::new();
     for t in &s.target_list {
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {

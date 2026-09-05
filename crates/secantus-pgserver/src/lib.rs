@@ -2369,6 +2369,37 @@ fn decode_parameter(
             // bound as a length-prefixed value in the ELEMENT's binary format.
             // Decoding to canonical text keeps it on the same path a literal
             // takes, as with every other type here.
+            // A multirange is a count of ranges, then each one length-prefixed
+            // in the RANGE's own binary form -- so it reuses the range decoder
+            // rather than repeating the flags-and-bounds layout.
+            Some(oid) if secantus_pgplan::range::multirange_oid_name(oid).is_some() => {
+                let type_name = secantus_pgplan::range::multirange_oid_name(oid).expect("checked");
+                let member = secantus_pgplan::range::multirange_member(type_name)
+                    .expect("a multirange has a member type");
+                if bytes.len() < 4 {
+                    return Err(unsupported_binary_oid(Some(oid)));
+                }
+                let count = i32::from_be_bytes(bytes[..4].try_into().expect("checked"));
+                let mut pos = 4usize;
+                let mut members = Vec::new();
+                for _ in 0..count.max(0) {
+                    if pos + 4 > bytes.len() {
+                        return Err(unsupported_binary_oid(Some(oid)));
+                    }
+                    let len = i32::from_be_bytes(bytes[pos..pos + 4].try_into().expect("checked"));
+                    pos += 4;
+                    let n = usize::try_from(len.max(0)).unwrap_or(0);
+                    if pos + n > bytes.len() {
+                        return Err(unsupported_binary_oid(Some(oid)));
+                    }
+                    let text = binary_range(&bytes[pos..pos + n], member, tz)?;
+                    pos += n;
+                    members.push(secantus_pgplan::value_text(&text));
+                }
+                let literal = format!("{{{}}}", members.join(","));
+                secantus_pgplan::cast_text_to(&literal, type_name, tz)
+                    .map_err(|e| PgHandler::err(&e))
+            }
             Some(oid) if secantus_pgplan::range::range_oid_name(oid).is_some() => {
                 let type_name = secantus_pgplan::range::range_oid_name(oid).expect("checked");
                 binary_range(bytes, type_name, tz)

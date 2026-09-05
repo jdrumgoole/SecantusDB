@@ -4508,7 +4508,11 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   and it is the only set-returning function.** The filter language is built
   against stored columns; applying one to generated rows needs an in-memory
   matcher. `unnest`, `generate_subscripts` and function calls in FROM other than
-  `generate_series` are also unsupported.
+  `generate_series` are also unsupported. In the SELECT LIST it now works
+  (`select generate_series(1, 10)`, with alias / ORDER BY / LIMIT / OFFSET), but
+  only as the SOLE target: `select 1, generate_series(1,3)` — which repeats the
+  other columns across the generated rows — is refused, as is more than one
+  set-returning target in one list.
 - **Rust PG server: DDL IS NOT TRANSACTIONAL.** `CREATE TABLE` inside a
   transaction survives a `ROLLBACK` (and so do rows inserted into it);
   `DROP TABLE` inside one stays dropped. PostgreSQL rolls both back. Measured
@@ -4529,8 +4533,10 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   multirange set operators are not.
 - **Rust PG server: the `oid` cast is unsupported**, and binary parameters of
   that oid with it
-  (the binary decoder covers `numeric` / `date` / `time` / `timestamp` / arrays;
-  a type it does not have cannot be decoded into one).
+  (the binary decoder covers `numeric` / `date` / `time` / `timestamp` /
+  arrays / ranges / multiranges; a type it does not have cannot be decoded into
+  one — what remains unhandled there is `uuid` / `inet` / `cidr` / `bytea` /
+  `json`, all of which are missing TYPES, not decoder gaps).
 - **Rust PG server: a multidimensional array sent as a BINARY parameter is
   refused (`0A000`)**, matching the refusal when returning one. Both lift
   together when array wire encoding grows a second dimension.

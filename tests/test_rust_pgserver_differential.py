@@ -24,6 +24,8 @@ from pathlib import Path
 import pytest
 
 psycopg = pytest.importorskip("psycopg")
+from psycopg.types.multirange import Multirange  # noqa: E402
+from psycopg.types.range import Range  # noqa: E402
 
 from tests.test_rust_pgserver_slice import BINARY, _Server  # noqa: E402
 
@@ -578,6 +580,14 @@ QUERIES = [
     "SELECT count(*) FROM generate_series(1,100)",
     "SELECT sum(g) FROM generate_series(1,10) g",
     "SELECT min(g), max(g) FROM generate_series(3,7) g",
+    # --- the same function in the SELECT LIST, with no FROM at all ---------
+    "SELECT generate_series(1,3)",
+    "SELECT generate_series(1,3) AS g",
+    "SELECT generate_series(3,1)",
+    "SELECT generate_series(1,5,2)",
+    "SELECT generate_series(1,3) ORDER BY 1 DESC",
+    "SELECT generate_series(1,10) LIMIT 3",
+    "SELECT generate_series(1,10) OFFSET 7",
 ]
 
 # (statement, verification query) — the write is compared by its row count AND
@@ -706,6 +716,18 @@ PARAMETERISED = [
     ("SELECT %s::int4[]", ([1, None, 3],)),
     ("SELECT %s::text[]", (["a", "b"],)),
     ("SELECT %s::int8[]", ([10**12, 2],)),
+    # Multiranges as bound parameters — psycopg sends these in binary, whose
+    # layout is a range count then each range in the RANGE's own binary form.
+    ("SELECT %s::int4multirange", (Multirange([Range(1, 5, "[)")]),)),
+    (
+        "SELECT %s::int4multirange",
+        (Multirange([Range(1, 5, "[)"), Range(10, 20, "[)")]),),
+    ),
+    ("SELECT %s::int4multirange", (Multirange([]),)),
+    (
+        "SELECT %s::nummultirange",
+        (Multirange([Range(Decimal("1.0"), Decimal("2.0"), "[]")]),),
+    ),
     ("SELECT %s::interval", (dt.timedelta(days=1),)),
     ("SELECT %s::interval", (dt.timedelta(days=1, hours=2, minutes=3, seconds=4),)),
     ("SELECT %s::interval", (dt.timedelta(seconds=-1),)),
