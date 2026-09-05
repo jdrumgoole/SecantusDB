@@ -1412,6 +1412,35 @@ const DATE_EXTRACTORS: &[&str] = &[
 /// candidate key in turn and keeping the ones it did NOT reject.
 ///
 /// `true` in the third slot selects the "Unrecognized parameter to" form.
+/// Operator spec documents with a REQUIRED key. Missing it is a PARSE error, so
+/// it takes the stage's wrapper. Codes measured individually against 8.2.11
+/// (2026-09-05) -- they share nothing, not even within a family.
+///
+/// Checked AFTER the unknown-key tables above, because mongod reports an
+/// unrecognised key before a missing required one: `{$firstN: {k: 1}}` is
+/// "Unknown argument for 'n' operator: k" and only `{$firstN: {}}` is "Missing
+/// value for 'n'". Getting that order wrong changes the CODE on shapes that are
+/// already right -- it did exactly that on the Python side before the order was
+/// corrected (`expressions._expression_shape_problem`).
+const REQUIRED_SPEC_KEY: &[(&str, &str, i32, &str)] = &[
+    (
+        "$convert",
+        "input",
+        9,
+        "Missing 'input' parameter to $convert",
+    ),
+    (
+        "$dateDiff",
+        "startDate",
+        5166303,
+        "Missing 'startDate' parameter to $dateDiff",
+    ),
+    ("$firstN", "n", 5787906, "Missing value for 'n'"),
+    ("$lastN", "n", 5787906, "Missing value for 'n'"),
+    ("$maxN", "n", 5787906, "Missing value for 'n'"),
+    ("$minN", "n", 5787906, "Missing value for 'n'"),
+];
+
 const UNKNOWN_ARGUMENT: &[(&str, i32, bool, &[&str])] = &[
     ("$cond", 17083, true, &["if", "then", "else"]),
     ("$filter", 28647, true, &["input", "as", "cond", "limit"]),
@@ -1757,6 +1786,29 @@ pub(crate) fn expression_shape_problem(spec: &Bson) -> Option<(i32, String)> {
                                 render_stage_value(value)
                             ),
                         ));
+                    }
+                }
+                // Required keys LAST: see `REQUIRED_SPEC_KEY`. Every
+                // unknown-key table above has already had its say.
+                if let Some((_, needed, code, message)) =
+                    REQUIRED_SPEC_KEY.iter().find(|(op, _, _, _)| *op == key)
+                {
+                    if let Bson::Document(spec) = value {
+                        if !spec.contains_key(needed) {
+                            return Some((*code, (*message).to_string()));
+                        }
+                    }
+                }
+                if key == "$dateFromParts" {
+                    if let Bson::Document(spec) = value {
+                        if !spec.contains_key("year") && !spec.contains_key("isoWeekYear") {
+                            return Some((
+                                40516,
+                                "$dateFromParts requires either 'year' or 'isoWeekYear' \
+                                 to be present"
+                                    .to_string(),
+                            ));
+                        }
                     }
                 }
                 if let Some(found) = expression_shape_problem(value) {
@@ -3471,6 +3523,103 @@ mod expression_shape_tests {
             bson::bson!({"$add": [1, 2]}),
         ] {
             assert_eq!(expression_shape_problem(&expr), None, "{expr:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod parse_time_required_keys {
+    use super::*;
+    use bson::{bson, Bson};
+
+    fn probe(expr: Bson) -> Option<(i32, String, String)> {
+        expression_problem_in_pipeline(&[bson!({"$addFields": {"z": expr}})], &[])
+    }
+
+    /// A missing required key is a PARSE error and takes the stage's wrapper.
+    /// Every code and wording is measured mongod output (8.2.11, 2026-09-05).
+    #[test]
+    fn a_missing_required_key_is_a_parse_error() {
+        for (expr, code, message) in [
+            (
+                bson!({"$convert": {"to": "int"}}),
+                9,
+                "Missing 'input' parameter to $convert",
+            ),
+            (
+                bson!({"$dateDiff": {"unit": "day"}}),
+                5166303,
+                "Missing 'startDate' parameter to $dateDiff",
+            ),
+            (
+                bson!({"$firstN": {"input": [1]}}),
+                5787906,
+                "Missing value for 'n'",
+            ),
+            (
+                bson!({"$lastN": {"input": [1]}}),
+                5787906,
+                "Missing value for 'n'",
+            ),
+            (
+                bson!({"$maxN": {"input": [1]}}),
+                5787906,
+                "Missing value for 'n'",
+            ),
+            (
+                bson!({"$minN": {"input": [1]}}),
+                5787906,
+                "Missing value for 'n'",
+            ),
+            (
+                bson!({"$dateFromParts": {"month": 1}}),
+                40516,
+                "$dateFromParts requires either 'year' or 'isoWeekYear' to be present",
+            ),
+        ] {
+            let got = probe(expr.clone());
+            assert_eq!(
+                got,
+                Some((code, message.to_string(), "$addFields".to_string())),
+                "expr={expr:?}"
+            );
+        }
+    }
+
+    /// The ordering rule. mongod reports an UNRECOGNISED key before a MISSING
+    /// required one, and both checks fire on the same document -- only their
+    /// order separates them. Running the missing-key checks first changed the
+    /// code on exactly these shapes when it was tried on the Python side.
+    #[test]
+    fn an_unknown_key_is_reported_before_a_missing_one() {
+        for (expr, code) in [
+            (bson!({"$dateDiff": {"k": 1}}), 5166302),
+            (bson!({"$firstN": {"k": 1}}), 5787901),
+            (bson!({"$lastN": {"k": 1}}), 5787901),
+            (bson!({"$maxN": {"k": 1}}), 5787901),
+            (bson!({"$minN": {"k": 1}}), 5787901),
+            (bson!({"$dateFromParts": {"k": 1}}), 40518),
+        ] {
+            let got = probe(expr.clone());
+            assert_eq!(
+                got.as_ref().map(|(c, _, _)| *c),
+                Some(code),
+                "expr={expr:?}"
+            );
+        }
+    }
+
+    /// The guard against over-matching: a valid spec must fall through to the
+    /// fold path, not be reported as a parse error.
+    #[test]
+    fn a_valid_spec_has_no_parse_time_problem() {
+        for expr in [
+            bson!({"$convert": {"input": "$a", "to": "int"}}),
+            bson!({"$firstN": {"input": [1], "n": 1}}),
+            bson!({"$dateFromParts": {"year": 2026}}),
+            bson!({"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "day"}}),
+        ] {
+            assert_eq!(probe(expr.clone()), None, "expr={expr:?}");
         }
     }
 }
