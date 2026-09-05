@@ -769,12 +769,17 @@ FROM docs WHERE body @@ websearch_to_tsquery('quick')
 ORDER BY rank DESC;                    -- ORDER BY resolves the SELECT-list alias
 ```
 
-Simplifications vs real Postgres: the text-search configuration is fixed
-(English stop-words, **no stemming** — `cats` and `cat` stay distinct), `ts_rank`
-is a monotonic match-count score rather than the cover-density algorithm,
-`ts_headline` returns the whole document (no fragment windowing), and lexeme
-weights (`:A` / `setweight` / weighted `ts_rank`) and GIN/GiST indexes are out
-of scope.
+Stemming is applied: `english` (and the default configuration) run the Porter2
+algorithm, so `cats` matches `cat` — on the query side as well as the document
+side, and prefixes stem too (`running:*` is `'run':*`). `simple` neither stems
+nor drops stop-words.
+
+Simplifications vs real Postgres: the text-search configuration is otherwise
+fixed (one English stop-word list; no other language), `ts_rank` is a monotonic
+match-count score rather than the cover-density algorithm, `ts_headline`
+returns the whole document (no fragment windowing), and lexeme weights
+(`:A` / `setweight` / weighted `ts_rank`) and GIN/GiST indexes are out of
+scope.
 
 ### Network address types (`inet` / `cidr` / `macaddr`)
 
@@ -1917,6 +1922,35 @@ SELECT stddev(x), stddev_pop(x), stddev_samp(x),      -- sample / population std
        bit_and(n), bit_or(n), bit_xor(n)               -- bitwise fold over an int column
 FROM t GROUP BY g;
 ```
+
+The two-argument statistical aggregates are supported too — `corr`,
+`covar_pop`, `covar_samp`, and `regr_avgx` / `regr_avgy` / `regr_count` /
+`regr_intercept` / `regr_r2` / `regr_slope` / `regr_sxx` / `regr_sxy` /
+`regr_syy`. PostgreSQL spells them all `f(Y, X)`, the dependent variable first,
+and a pair contributes only when **both** arguments are non-NULL (so
+`regr_count` can disagree with `count(*)`). `regr_count` is the only one defined
+over an empty input — 0, where the others are NULL.
+
+```sql
+SELECT corr(y, x), regr_slope(y, x), regr_r2(y, x) FROM t;
+```
+
+The hypothetical-set aggregates answer what a value *would* rank if inserted
+into the group:
+
+```sql
+SELECT rank(20) WITHIN GROUP (ORDER BY v) FROM t;   -- also dense_rank,
+                                                    -- percent_rank, cume_dist
+```
+
+The sort direction is part of the answer and NULLs take part in the ordering,
+so `ORDER BY v` and `ORDER BY v DESC` give different results on the same data.
+The multi-column form (one argument per `ORDER BY` expression) is not supported.
+
+`array_agg` keeps NULL elements and returns NULL — not `{}` — for a group that
+contributed no rows, so an unmatched `LEFT JOIN` row aggregates to `{NULL}`.
+`string_agg` differs deliberately: it skips NULLs and returns NULL for a group
+of nothing but NULLs.
 
 `stddev` / `stddev_samp` and `variance` / `var_samp` are the **sample** forms
 (NULL for a single row); `stddev_pop` / `var_pop` are the **population** forms.
