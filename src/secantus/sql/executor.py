@@ -2054,6 +2054,34 @@ def _run_subplan_to_docs(
     raise errors.feature_not_supported("unsupported derived-table plan")
 
 
+def _whole_row_value(node: Any, resolve: Any, doc: dict[str, Any]) -> Any:
+    """A bare relation reference — the `t` in `row_to_json(t)` or `SELECT t
+    FROM t` — as a composite of that relation's columns, or None when `node`
+    is not one.
+
+    Postgres lets a table or sub-select ALIAS stand for the whole row. Without
+    this the name went to the column resolver and answered
+    `42703 column "t" does not exist`, which is what `row_to_json(t) FROM (…) t`
+    — a very common idiom — hit.
+
+    A real column of the same name WINS, which is what PostgreSQL does: given
+    `SELECT t FROM t` where `t` also has a column `t`, the column is meant.
+    """
+    from sqlglot import exp as _exp
+
+    if not isinstance(node, _exp.Column) or node.table:
+        return None
+    table = getattr(resolve, "table", None)
+    if table is None or not getattr(table, "columns", None):
+        return None
+    name = node.name
+    if name != getattr(table, "name", None):
+        return None
+    if any(c.name == name for c in table.columns):
+        return None  # a real column shadows the whole-row reading
+    return typemap.RecordValue((c.name, _subms(doc, c.field)) for c in table.columns)
+
+
 def _expand_lateral(
     docs: list[dict[str, Any]],
     lat: Any,
@@ -2168,6 +2196,9 @@ def _evaluated_value_rows(
             field = win_field.get(id(node))
             if field is not None:
                 return _subms(doc, field)
+            whole = _whole_row_value(node, plan.resolve, doc)
+            if whole is not None:
+                return whole
             path, _ = plan.resolve(node)
             return _subms(doc, path)
 

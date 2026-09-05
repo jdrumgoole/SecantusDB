@@ -12161,12 +12161,51 @@ def _is_simple_projection(node: exp.Expression) -> bool:
     return isinstance(inner, (exp.Column, exp.Star, *_JSONB_CLASSES))
 
 
+def _relation_names(stmt: exp.Select) -> set[str]:
+    """Every table name / alias the statement's FROM and JOINs introduce."""
+    names: set[str] = set()
+    # `stmt.args["from"]` is not reliably populated across sqlglot versions —
+    # it read as None here — so locate the FROM node instead of indexing.
+    sources = [n for n in (stmt.find(exp.From),) if n is not None]
+    sources.extend(stmt.args.get("joins") or [])
+    for src in sources:
+        for tbl in src.find_all(exp.Table):
+            if tbl.alias:
+                names.add(tbl.alias)
+            elif tbl.name:
+                names.add(tbl.name)
+        for sub in src.find_all(exp.Subquery):
+            if sub.alias:
+                names.add(sub.alias)
+    return names
+
+
+def _is_whole_row_reference(e: exp.Expression, relations: set[str]) -> bool:
+    """Whether the projection `e` is a bare relation reference (`SELECT t`)."""
+    inner = e.this if isinstance(e, exp.Alias) else e
+    return (
+        isinstance(inner, exp.Column)
+        and not inner.table
+        and isinstance(inner.this, exp.Identifier)
+        and inner.name in relations
+    )
+
+
 def _stmt_needs_evaluation(stmt: exp.Select) -> bool:
     """Whether a SELECT list / ORDER BY needs Python per-row evaluation
     (set-returning or scalar functions, CASE, scalar subqueries) rather than a
     plain ``$project`` / ``$group``. Aggregates and ``array_agg`` are handled by
     the group/find paths, not per-row eval, so they don't count here."""
+    relations = _relation_names(stmt)
     for e in stmt.expressions:
+        if _is_whole_row_reference(e, relations):
+            # `SELECT t FROM t` projects the whole ROW as a composite, which a
+            # plain `$project` of columns cannot produce — the evaluated path
+            # builds the record instead. Routing here is safe even when a real
+            # column happens to share the relation's name: the evaluated
+            # resolver prefers the column, exactly as PostgreSQL does, so the
+            # only cost of a false positive is the slower path.
+            return True
         if (
             _is_simple_projection(e)
             or _aggregate_of(e) is not None
@@ -12787,6 +12826,20 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     # A literal minted by `rewrite_pg_typeof` is a regtype, not text.
     if node.args.get(_REGTYPE_MARKER):
         return "regtype"
+    # A bare relation reference (`SELECT t FROM t`) is the whole ROW, so it
+    # types as a composite — without this the record built at run time was
+    # described as json and reached the client as `{"id": 1, ...}` rather than
+    # `(1,...)`. Mirrors `executor._whole_row_value`, including that a real
+    # column of the same name wins.
+    if isinstance(node, exp.Column) and not node.table:
+        rel = getattr(resolve, "table", None)
+        cols = getattr(rel, "columns", None) if rel is not None else None
+        if (
+            cols
+            and node.name == getattr(rel, "name", None)
+            and not any(c.name == node.name for c in cols)
+        ):
+            return "composite"
     # Composite field access ``(col).field`` types as the field's declared type.
     composite_tag = _composite_field_tag(node, resolve)
     if composite_tag is not None:

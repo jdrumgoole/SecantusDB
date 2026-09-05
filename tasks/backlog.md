@@ -12849,8 +12849,22 @@ Found by the record/JSON sweep; the two fixes that batch DID make are in
 `tests/test_sql_sweep_twentytwo.py`. Corpus:
 `tools/probes/pg_corpora/json_record.sql`.
 
-**1. A bare relation alias in a value position is `42703`.** All of these
-answer `column "X" does not exist`:
+**1.** ~~A bare relation alias in a value position is `42703`.~~ **FIXED
+2026-09-05** — see `tests/test_sql_sweep_twentyfour.py`. The design sketched
+below is what was built: the evaluated scope builds the record when it sees a
+bare relation name, and `SELECT t FROM t` routes to the evaluated path because
+a plain `$project` of columns cannot produce a composite. A real column of the
+same name wins, as in PostgreSQL.
+
+ONE GAP LEFT: `SELECT t FROM t` reports the generic `RECORD` oid (2249) where
+PostgreSQL reports the table's OWN rowtype oid (a per-table oid minted with the
+table). The field values are right, so this is a type identity rather than a
+wrong answer — psycopg hands back the parsed fields instead of the record's
+text — and closing it means minting and cataloguing per-table rowtype oids.
+
+The original entry, for the record:
+
+All of these answered `column "X" does not exist`:
 
     SELECT row_to_json(t) FROM (SELECT id, a FROM jr) t
     SELECT to_json(r)     FROM (SELECT 1 AS a) r
