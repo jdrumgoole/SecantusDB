@@ -374,14 +374,31 @@ pub struct SelectConstant {
     pub columns: Vec<(String, ConstCol, String)>,
 }
 
-/// `COPY <table> FROM STDIN` or `TO STDOUT`. Text format only.
+/// The three wire formats a COPY can use. They are not interchangeable: text
+/// escapes with backslashes and writes `\N` for NULL, CSV quotes with `"` and
+/// writes NULL as an EMPTY unquoted field (an empty string being `""`), and
+/// binary is length-prefixed values behind a fixed signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CopyFormat {
+    #[default]
+    Text,
+    Csv,
+    Binary,
+}
+
+/// `COPY <table> FROM STDIN` or `TO STDOUT`.
 ///
-/// Both directions share a shape: a table and an optional column list.
+/// Both directions share a shape: a source and an optional column list. The
+/// source is a table, or -- for `TO STDOUT` only -- a query, which PostgreSQL
+/// allows and `FROM STDIN` does not.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CopyFrom {
     pub table: String,
     /// Target columns in order; empty means every column in declared order.
     pub columns: Vec<String>,
+    pub format: CopyFormat,
+    /// `COPY (SELECT ...) TO STDOUT`. Mutually exclusive with `table`.
+    pub query: Option<Box<Statement>>,
 }
 
 /// `DROP TABLE a, b` / `DROP TABLE IF EXISTS a`.
@@ -501,7 +518,7 @@ pub fn plan_with_params(
         N::InsertStmt(i) => plan_insert(&i, lookup, params),
         N::SelectStmt(s) => plan_select(&s, lookup, params),
         N::DropStmt(d) => plan_drop(&d),
-        N::CopyStmt(c) => plan_copy(&c, lookup),
+        N::CopyStmt(c) => plan_copy(&c, lookup, params),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
         N::DeclareCursorStmt(d) => {
             let inner = match d.query.as_ref().and_then(|q| q.node.as_ref()) {
@@ -3572,6 +3589,7 @@ fn guc_function(
 fn plan_copy(
     c: &pg_query::protobuf::CopyStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
 ) -> Result<Statement> {
     if !c.filename.is_empty() {
         // An empty filename means STDIN/STDOUT, the only endpoints supported:
@@ -3580,8 +3598,7 @@ fn plan_copy(
             "COPY to or from a server-side file".into(),
         ));
     }
-    // Only the default text format. A binary or CSV COPY parses differently,
-    // and guessing would corrupt the data rather than fail.
+    let mut format = CopyFormat::Text;
     for opt in &c.options {
         if let Some(N::DefElem(d)) = opt.node.as_ref() {
             let name = d.defname.to_ascii_lowercase();
@@ -3594,7 +3611,9 @@ fn plan_copy(
                     _ => None,
                 });
             match (name.as_str(), value.as_deref()) {
-                ("format", Some("text")) => {}
+                ("format", Some("text")) => format = CopyFormat::Text,
+                ("format", Some("csv")) => format = CopyFormat::Csv,
+                ("format", Some("binary")) => format = CopyFormat::Binary,
                 ("format", other) => {
                     return Err(Error::Unsupported(format!(
                         "COPY ... FORMAT {}",
@@ -3604,6 +3623,25 @@ fn plan_copy(
                 (other, _) => return Err(Error::Unsupported(format!("COPY option {other}"))),
             }
         }
+    }
+    // `COPY (SELECT ...) TO STDOUT`. PostgreSQL allows a query only when
+    // copying OUT -- there is nowhere to put rows copied INTO one.
+    if c.relation.is_none() {
+        let Some(N::SelectStmt(sel)) = c.query.as_ref().and_then(|q| q.node.as_ref()) else {
+            return Err(Error::Unsupported("COPY without a table".into()));
+        };
+        if c.is_from {
+            return Err(Error::Parse(
+                "COPY FROM not supported with a query source".into(),
+            ));
+        }
+        let inner = plan_select(sel, lookup, params)?;
+        return Ok(Statement::CopyTo(CopyFrom {
+            table: String::new(),
+            columns: Vec::new(),
+            format,
+            query: Some(Box::new(inner)),
+        }));
     }
     let table = c
         .relation
@@ -3623,7 +3661,12 @@ fn plan_copy(
         }
         columns.push(name);
     }
-    let spec = CopyFrom { table, columns };
+    let spec = CopyFrom {
+        table,
+        columns,
+        format,
+        query: None,
+    };
     Ok(if c.is_from {
         Statement::CopyFrom(spec)
     } else {

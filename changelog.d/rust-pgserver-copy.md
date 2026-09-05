@@ -12,10 +12,8 @@ between fields. Data also arrives in chunks whose boundaries fall wherever the
 client's buffer happened to end, including halfway through a row, so nothing can
 be parsed until the client says it has finished sending.
 
-`COPY TO STDOUT` is still refused. That one is blocked by the wire-protocol
-library rather than by anything here: it emits the header that begins a copy-out
-but offers no way to send the rows that should follow. Refusing plainly is
-better than starting a transfer that cannot be completed.
+`COPY TO STDOUT` was still refused when this was written; it landed shortly
+afterwards, along with the CSV and binary formats — see the companion entry.
 
 #### Added
 

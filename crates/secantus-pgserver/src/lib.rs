@@ -22,7 +22,8 @@ use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
-    CopyEncoder, CopyResponse, CopyTextOptions, DescribePortalResponse, DescribeStatementResponse,
+    CopyCsvOptions, CopyEncoder, CopyResponse, CopyTextOptions, DescribePortalResponse,
+    DescribeStatementResponse,
 };
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::stmt::{QueryParser, StoredStatement};
@@ -78,6 +79,7 @@ struct CursorState {
 }
 
 struct CopyInState {
+    format: secantus_pgplan::CopyFormat,
     table: String,
     /// Stored field per target column, in the order the data supplies them.
     fields: Vec<String>,
@@ -471,6 +473,178 @@ impl PgHandler {
         Ok(vec![Response::Query(response)])
     }
 
+    /// The output columns of a `COPY (query) TO STDOUT`, from the same code
+    /// that describes the query anywhere else.
+    fn copy_query_fields(&self, inner: &Statement) -> PgWireResult<Vec<FieldInfo>> {
+        match inner {
+            // `COPY (SELECT 1) TO STDOUT` -- a query with no FROM at all.
+            Statement::SelectConstant(sc) => Ok(sc
+                .columns
+                .iter()
+                .map(|(name, _, ty)| {
+                    FieldInfo::new(name.clone(), None, None, wire_type(ty), FieldFormat::Text)
+                })
+                .collect()),
+            Statement::Select(sel) => match &sel.series {
+                Some(_) => Ok(sel
+                    .columns
+                    .iter()
+                    .map(|(out, _)| {
+                        FieldInfo::new(out.clone(), None, None, Type::INT4, FieldFormat::Text)
+                    })
+                    .collect()),
+                None => {
+                    let def = self
+                        .lookup(&sel.table)
+                        .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?;
+                    Ok(sel
+                        .columns
+                        .iter()
+                        .map(|(out, _)| {
+                            let ty = def
+                                .column(out)
+                                .map(|c| wire_type(&c.pg_type))
+                                .unwrap_or(Type::VARCHAR);
+                            FieldInfo::new(out.clone(), None, None, ty, FieldFormat::Text)
+                        })
+                        .collect())
+                }
+            },
+            _ => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "0A000".into(),
+                "COPY over this statement is not supported yet".into(),
+            )))),
+        }
+    }
+
+    /// The rows of a `COPY (query) TO STDOUT`, in output-column order.
+    fn copy_query_rows(&self, inner: &Statement) -> PgWireResult<Vec<Vec<Option<Bson>>>> {
+        if let Statement::SelectConstant(sc) = inner {
+            let mut row = Vec::with_capacity(sc.columns.len());
+            for (_, col, _) in &sc.columns {
+                row.push(Some(self.resolve_const_col(col)?));
+            }
+            return Ok(vec![row]);
+        }
+        let Statement::Select(sel) = inner else {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "0A000".into(),
+                "COPY over this statement is not supported yet".into(),
+            ))));
+        };
+        let mut docs: Vec<Document> = match &sel.series {
+            Some(series) => series
+                .values()
+                .into_iter()
+                .map(|v| {
+                    let mut d = Document::new();
+                    d.insert(series.column.clone(), Bson::Int32(v as i32));
+                    d
+                })
+                .collect(),
+            None => {
+                let raw = self
+                    .storage
+                    .find_matching(&self.db, &sel.table, &sel.filter)
+                    .map_err(|e| Self::storage_err("could not read", e))?;
+                raw.iter()
+                    .map(|b| bson::from_slice(b))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| Self::storage_err("could not decode a row", e))?
+            }
+        };
+        if !sel.order.is_empty() {
+            sort_rows(&mut docs, &sel.order);
+        }
+        if sel.offset > 0 {
+            let skip = usize::try_from(sel.offset).unwrap_or(usize::MAX);
+            docs = docs.into_iter().skip(skip).collect();
+        }
+        if let Some(limit) = sel.limit {
+            let take = usize::try_from(limit).unwrap_or(0);
+            docs.truncate(take);
+        }
+        Ok(docs
+            .iter()
+            .map(|d| {
+                sel.columns
+                    .iter()
+                    .map(|(_, field)| d.get(field).cloned())
+                    .collect()
+            })
+            .collect())
+    }
+
+    /// Parse a binary COPY payload: an 11-byte signature, flags and a header
+    /// extension, then per row a field count and each field length-prefixed in
+    /// its own binary format, then a `-1` count as the trailer.
+    ///
+    /// The per-field decoding is the same code that decodes a bound binary
+    /// parameter -- the bytes on the wire are the same, so a second
+    /// implementation could only drift from the first.
+    fn parse_binary_copy(
+        &self,
+        buffer: &[u8],
+        types: &[String],
+    ) -> PgWireResult<Vec<Vec<Option<Bson>>>> {
+        const SIGNATURE: &[u8] = b"PGCOPY\n\xff\r\n\0";
+        let bad = || {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "22P04".into(), // bad_copy_file_format
+                "invalid binary COPY data".into(),
+            )))
+        };
+        if buffer.len() < 19 || &buffer[..SIGNATURE.len()] != SIGNATURE {
+            return Err(bad());
+        }
+        let be32 = |b: &[u8], i: usize| -> Option<i32> {
+            b.get(i..i + 4)
+                .map(|s| i32::from_be_bytes(s.try_into().expect("4 bytes")))
+        };
+        // Skip the signature, the flags, and any header extension.
+        let ext = be32(buffer, 15).ok_or_else(bad)?;
+        let mut pos = 19 + usize::try_from(ext.max(0)).unwrap_or(0);
+        let tz = self.session_timezone();
+        let mut rows = Vec::new();
+        loop {
+            let count = buffer
+                .get(pos..pos + 2)
+                .map(|s| i16::from_be_bytes(s.try_into().expect("2 bytes")))
+                .ok_or_else(bad)?;
+            pos += 2;
+            // `-1` is the trailer; anything after it is ignored, as PostgreSQL
+            // ignores it.
+            if count < 0 {
+                break;
+            }
+            let mut row = Vec::with_capacity(count as usize);
+            for i in 0..count as usize {
+                let len = be32(buffer, pos).ok_or_else(bad)?;
+                pos += 4;
+                if len < 0 {
+                    row.push(None);
+                    continue;
+                }
+                let n = len as usize;
+                let raw = buffer.get(pos..pos + n).ok_or_else(bad)?;
+                pos += n;
+                let ty = types.get(i).map(String::as_str).unwrap_or("text");
+                let value = decode_parameter(
+                    Some(&Bytes::copy_from_slice(raw)),
+                    Some(&wire_type(ty)),
+                    true,
+                    &tz,
+                )?;
+                row.push(Some(value));
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
     /// The session's `TimeZone` GUC, resolved.
     fn session_timezone(&self) -> secantus_pgplan::TimeZoneSetting {
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
@@ -841,77 +1015,126 @@ impl PgHandler {
                 };
                 let n = cols.len();
                 *self.copy_in.lock().unwrap_or_else(|e| e.into_inner()) = Some(CopyInState {
+                    format: cf.format,
                     table: cf.table.clone(),
                     fields: cols.iter().map(|c| c.field()).collect(),
                     types: cols.iter().map(|c| c.pg_type.clone()).collect(),
                     buffer: Vec::new(),
                 });
-                // format 0 = text, and every column is text-formatted.
-                // The stream is the COPY OUT direction; an IN response has none.
+                // The format code must match what the client will send: 1 for
+                // binary, 0 for the textual formats.
+                let code = if cf.format == secantus_pgplan::CopyFormat::Binary {
+                    1
+                } else {
+                    0
+                };
                 Ok(vec![Response::CopyIn(CopyResponse::new(
-                    0,
+                    code,
                     n,
                     futures::stream::empty(),
                 ))])
             }
 
             Statement::CopyTo(ct) => {
-                let def = self
-                    .lookup(&ct.table)
-                    .ok_or_else(|| Self::err(&PlanError::UndefinedTable(ct.table.clone())))?;
-                let cols: Vec<&secantus_pgcatalog::Column> = if ct.columns.is_empty() {
-                    def.columns.iter().collect()
-                } else {
-                    ct.columns
-                        .iter()
-                        .map(|n| def.column(n).expect("planner checked"))
-                        .collect()
-                };
-                let schema = Arc::new(
-                    cols.iter()
-                        .map(|c| {
-                            FieldInfo::new(
-                                c.name.clone(),
-                                None,
-                                None,
-                                wire_type(&c.pg_type),
-                                FieldFormat::Text,
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                );
-                let fields: Vec<String> = cols.iter().map(|c| c.field()).collect();
-
-                let raw = self
-                    .storage
-                    .find_matching(&self.db, &ct.table, &Document::new())
-                    .map_err(|e| Self::storage_err("could not read", e))?;
-                let docs: Vec<Document> = raw
-                    .iter()
-                    .map(|b| bson::from_slice(b))
-                    .collect::<Result<_, _>>()
-                    .map_err(|e| Self::storage_err("could not decode a row", e))?;
-
-                // The text encoder writes PostgreSQL's own escaping -- `\N`
-                // for NULL, and escaped tabs/newlines -- so this round-trips
-                // through the COPY FROM path above.
-                let mut encoder = CopyEncoder::new_text(schema.clone(), CopyTextOptions::default());
-                let n = schema.len();
-                let data = stream::iter(docs).map(move |d| {
-                    for f in &fields {
-                        match d.get(f) {
-                            Some(Bson::Int32(v)) => encoder.encode_field(&Some(*v))?,
-                            Some(Bson::Int64(v)) => encoder.encode_field(&Some(*v))?,
-                            Some(Bson::Double(v)) => encoder.encode_field(&Some(*v))?,
-                            Some(Bson::Boolean(v)) => encoder.encode_field(&Some(*v))?,
-                            Some(Bson::String(v)) => encoder.encode_field(&Some(v.as_str()))?,
-                            _ => encoder.encode_field(&None::<i32>)?,
-                        }
+                use secantus_pgplan::CopyFormat;
+                // A query source reuses the ordinary SELECT path: run it, take
+                // its schema and rows, and encode those. Rebuilding the read
+                // here would be a second implementation of SELECT that could
+                // disagree with the first.
+                let (schema, rows): (Arc<Vec<FieldInfo>>, Vec<Vec<Option<Bson>>>) = match ct
+                    .query
+                    .as_deref()
+                {
+                    Some(inner) => {
+                        let fields = self.copy_query_fields(inner)?;
+                        let values = self.copy_query_rows(inner)?;
+                        (Arc::new(fields), values)
                     }
-                    Ok(encoder.take_copy())
+                    None => {
+                        let def = self.lookup(&ct.table).ok_or_else(|| {
+                            Self::err(&PlanError::UndefinedTable(ct.table.clone()))
+                        })?;
+                        let cols: Vec<&secantus_pgcatalog::Column> = if ct.columns.is_empty() {
+                            def.columns.iter().collect()
+                        } else {
+                            ct.columns
+                                .iter()
+                                .map(|n| def.column(n).expect("planner checked"))
+                                .collect()
+                        };
+                        let schema = Arc::new(
+                            cols.iter()
+                                .map(|c| {
+                                    FieldInfo::new(
+                                        c.name.clone(),
+                                        None,
+                                        None,
+                                        wire_type(&c.pg_type),
+                                        FieldFormat::Text,
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        );
+                        let fields: Vec<String> = cols.iter().map(|c| c.field()).collect();
+                        let raw = self
+                            .storage
+                            .find_matching(&self.db, &ct.table, &Document::new())
+                            .map_err(|e| Self::storage_err("could not read", e))?;
+                        let docs: Vec<Document> = raw
+                            .iter()
+                            .map(|b| bson::from_slice(b))
+                            .collect::<Result<_, _>>()
+                            .map_err(|e| Self::storage_err("could not decode a row", e))?;
+                        let values = docs
+                            .iter()
+                            .map(|d| fields.iter().map(|f| d.get(f).cloned()).collect::<Vec<_>>())
+                            .collect();
+                        (schema, values)
+                    }
+                };
+
+                let n = schema.len();
+                // Each format escapes differently, so the encoder is chosen
+                // rather than the text one patched: text writes `\N` for NULL
+                // and escapes tabs, CSV quotes and writes NULL as an EMPTY
+                // field, binary is length-prefixed behind a fixed signature.
+                let mut encoder = match ct.format {
+                    CopyFormat::Text => {
+                        CopyEncoder::new_text(schema.clone(), CopyTextOptions::default())
+                    }
+                    CopyFormat::Csv => {
+                        CopyEncoder::new_csv(schema.clone(), CopyCsvOptions::default())
+                    }
+                    CopyFormat::Binary => CopyEncoder::new_binary(schema.clone()),
+                };
+                let format = ct.format;
+                let data = stream::iter(rows).map(move |row| {
+                    // The two TEXTUAL formats are written here rather than
+                    // through the encoder. Its null handling asks the value
+                    // whether it is null, and an `Option` of the wrong type
+                    // answered "not null" with no bytes -- so every NULL came
+                    // out as an empty field instead of `\N`, which is exactly
+                    // the distinction COPY text exists to preserve. The rules
+                    // are short and were measured; binary keeps the encoder,
+                    // where the per-type byte layout is the hard part.
+                    match format {
+                        CopyFormat::Binary => {
+                            for v in &row {
+                                copy_encode_field(&mut encoder, v.as_ref())?;
+                            }
+                            Ok(encoder.take_copy())
+                        }
+                        _ => Ok(CopyData::new(copy_text_row(&row, format))),
+                    }
                 });
-                // format 0 = text.
-                Ok(vec![Response::CopyOut(CopyResponse::new(0, n, data))])
+                // The response's format code must match: 1 for binary, 0 for
+                // the two textual ones.
+                let code = if ct.format == CopyFormat::Binary {
+                    1
+                } else {
+                    0
+                };
+                Ok(vec![Response::CopyOut(CopyResponse::new(code, n, data))])
             }
 
             Statement::Show(name) => {
@@ -1753,6 +1976,207 @@ fn series_table_def(series: &secantus_pgplan::Series) -> TableDef {
     }
 }
 
+/// Parse COPY text or CSV input into rows of optional fields, where `None` is
+/// that format's NULL.
+///
+/// The two formats disagree about exactly one thing that matters here, and it
+/// is the same thing they disagree about on output: TEXT spells NULL `\N` and
+/// an empty field is an empty string, while CSV spells NULL as an unquoted
+/// empty field and an empty string as `""`. A parser that treated an empty CSV
+/// field as an empty string would silently turn every NULL into one.
+fn copy_parse_text(text: &str, format: secantus_pgplan::CopyFormat) -> Vec<Vec<Option<String>>> {
+    use secantus_pgplan::CopyFormat;
+    if format == CopyFormat::Csv {
+        return copy_parse_csv(text);
+    }
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        // A trailing newline leaves an empty final line, and `\.` is the
+        // end-of-data marker from the historical protocol.
+        if line.is_empty() || line == "\\." {
+            continue;
+        }
+        rows.push(
+            line.split('\t')
+                .map(|f| {
+                    if f == "\\N" {
+                        None
+                    } else {
+                        Some(unescape_copy_text(f))
+                    }
+                })
+                .collect(),
+        );
+    }
+    rows
+}
+
+fn unescape_copy_text(field: &str) -> String {
+    let mut out = String::new();
+    let mut chars = field.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// CSV, where a newline inside quotes is DATA rather than a row separator --
+/// so the rows cannot be found by splitting on newlines first.
+fn copy_parse_csv(text: &str) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    let mut row: Vec<Option<String>> = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut was_quoted = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if quoted {
+            if c == '"' {
+                // A doubled quote is one literal quote.
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    quoted = false;
+                }
+            } else {
+                field.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                quoted = true;
+                was_quoted = true;
+            }
+            ',' => {
+                row.push(csv_field(&field, was_quoted));
+                field.clear();
+                was_quoted = false;
+            }
+            '\n' => {
+                row.push(csv_field(&field, was_quoted));
+                field.clear();
+                was_quoted = false;
+                rows.push(std::mem::take(&mut row));
+            }
+            '\r' => {}
+            _ => field.push(c),
+        }
+    }
+    if !field.is_empty() || was_quoted || !row.is_empty() {
+        row.push(csv_field(&field, was_quoted));
+        rows.push(row);
+    }
+    rows
+}
+
+/// An UNQUOTED empty CSV field is NULL; a quoted one is the empty string.
+fn csv_field(text: &str, was_quoted: bool) -> Option<String> {
+    if text.is_empty() && !was_quoted {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+/// One COPY row in PostgreSQL's text or CSV format.
+///
+/// The formats differ in more than the delimiter, and the differences are
+/// exactly where NULL lives:
+///
+/// * TEXT writes `\N` for NULL and escapes newline, tab, carriage return and
+///   backslash. An empty string is an empty field.
+/// * CSV writes NULL as an EMPTY unquoted field, and therefore has to quote the
+///   empty STRING as `""` to keep the two apart. A value is also quoted when it
+///   contains the delimiter, a quote or a newline, and an embedded quote is
+///   doubled.
+///
+/// All of it measured against PostgreSQL 14.
+fn copy_text_row(row: &[Option<Bson>], format: secantus_pgplan::CopyFormat) -> bytes::Bytes {
+    use secantus_pgplan::CopyFormat;
+    let csv = format == CopyFormat::Csv;
+    let mut out = String::new();
+    for (i, value) in row.iter().enumerate() {
+        if i > 0 {
+            out.push(if csv { ',' } else { '\t' });
+        }
+        let text = match value {
+            None | Some(Bson::Null) => {
+                if !csv {
+                    out.push_str("\\N");
+                }
+                // CSV's null is the empty field, so there is nothing to write.
+                continue;
+            }
+            Some(Bson::String(v)) => v.clone(),
+            Some(other) => secantus_pgplan::value_text(other),
+        };
+        if csv {
+            let needs_quote =
+                text.is_empty() || text.chars().any(|c| matches!(c, ',' | '"' | '\n' | '\r'));
+            if needs_quote {
+                out.push('"');
+                for c in text.chars() {
+                    if c == '"' {
+                        out.push('"');
+                    }
+                    out.push(c);
+                }
+                out.push('"');
+            } else {
+                out.push_str(&text);
+            }
+        } else {
+            for c in text.chars() {
+                match c {
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    '\\' => out.push_str("\\\\"),
+                    _ => out.push(c),
+                }
+            }
+        }
+    }
+    out.push('\n');
+    bytes::Bytes::from(out.into_bytes())
+}
+
+/// One COPY field, in whichever format the encoder was built for.
+fn copy_encode_field(encoder: &mut CopyEncoder, v: Option<&Bson>) -> PgWireResult<()> {
+    match v {
+        // FIRST: `Some(other)` below would otherwise catch `Some(Bson::Null)`
+        // and render it as text, which in binary wrote a zero-length field
+        // where PostgreSQL writes a length of -1 -- an empty string where the
+        // client expected NULL. Match arms are tried in order, and the
+        // catch-all has to come after every case it must not swallow.
+        None | Some(Bson::Null) => encoder.encode_field(&None::<&str>),
+        Some(Bson::Int32(x)) => encoder.encode_field(&Some(*x)),
+        Some(Bson::Int64(x)) => encoder.encode_field(&Some(*x)),
+        Some(Bson::Double(x)) => encoder.encode_field(&Some(*x)),
+        Some(Bson::Boolean(x)) => encoder.encode_field(&Some(*x)),
+        Some(Bson::String(x)) => encoder.encode_field(&Some(x.as_str())),
+        // Everything else goes as its PostgreSQL text, which is what the
+        // ordinary row path does too.
+        Some(other) => {
+            let text = secantus_pgplan::value_text(other);
+            encoder.encode_field(&Some(text.as_str()))
+        }
+    }
+}
+
 /// Decode one bound parameter into the value the planner will substitute.
 ///
 /// `None` is SQL NULL. A client may declare a parameter's type as oid 0
@@ -2260,22 +2684,41 @@ impl CopyHandler for PgHandler {
             None => return Ok(()),
         };
 
-        let text = String::from_utf8(state.buffer).map_err(|_| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".into(),
-                "22021".into(), // character_not_in_repertoire
-                "COPY data is not valid UTF-8".into(),
-            )))
-        })?;
+        use secantus_pgplan::CopyFormat;
+        // Every format is parsed into the same shape -- rows of optional
+        // values, where `None` is that format's NULL -- so the insert below is
+        // written once.
+        let rows: Vec<Vec<Option<Bson>>> = match state.format {
+            CopyFormat::Binary => self.parse_binary_copy(&state.buffer, &state.types)?,
+            format => {
+                let text = String::from_utf8(state.buffer.clone()).map_err(|_| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "22021".into(), // character_not_in_repertoire
+                        "COPY data is not valid UTF-8".into(),
+                    )))
+                })?;
+                let parsed = copy_parse_text(&text, format);
+                let mut out = Vec::with_capacity(parsed.len());
+                for raw in parsed {
+                    let mut row = Vec::with_capacity(raw.len());
+                    for (i, value) in raw.into_iter().enumerate() {
+                        row.push(match value {
+                            None => None,
+                            Some(text) => {
+                                let ty = state.types.get(i).map(String::as_str).unwrap_or("text");
+                                Some(copy_field(&text, ty)?)
+                            }
+                        });
+                    }
+                    out.push(row);
+                }
+                out
+            }
+        };
 
         let mut docs = Vec::new();
-        for line in text.split('\n') {
-            // A trailing newline leaves an empty final line, and `\.` is the
-            // end-of-data marker from the historical protocol.
-            if line.is_empty() || line == "\\." {
-                continue;
-            }
-            let raw: Vec<&str> = line.split('\t').collect();
+        for raw in rows {
             if raw.len() != state.fields.len() {
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".into(),
@@ -2288,8 +2731,8 @@ impl CopyHandler for PgHandler {
                 ))));
             }
             let mut doc = Document::new();
-            for ((field, ty), value) in state.fields.iter().zip(&state.types).zip(raw) {
-                doc.insert(field.clone(), copy_field(value, ty)?);
+            for (field, value) in state.fields.iter().zip(raw) {
+                doc.insert(field.clone(), value.unwrap_or(Bson::Null));
             }
             docs.push(
                 bson::to_vec(&doc)

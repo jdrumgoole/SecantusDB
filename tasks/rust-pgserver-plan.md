@@ -988,7 +988,42 @@ client asked to exclude.
 
 **Probe: 17 shapes, 0 divergences.**
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870.**
+### 0.32 COPY in every format (2026-09-05)
+
+**~1870 -> ~1933, +63.**
+
+**Every bug in this batch was NULL versus empty string.** The three formats
+spell NULL differently -- text `\N`, CSV an UNQUOTED empty field (so the empty
+STRING must be quoted `""`), binary a length of -1 (empty string is length 0) --
+and each distinction broke at least once. The failure is always silent, and it
+round-trips within one format while corrupting across formats.
+
+**The binary one had an ordinary cause worth repeating:** a catch-all match arm
+sat ABOVE the NULL arm and swallowed it, rendering NULL as text and writing a
+zero-length field. Arms are tried in order; a catch-all must come after every
+case it must not absorb.
+
+**pgwire's encoder could not be used for the textual formats.** It decides
+nullness by asking the value, and an `Option` of the wrong type answered "not
+null" with no bytes -- so NULL came out empty. The rules are short and already
+probed, so text and CSV are written here; binary keeps the encoder, where the
+per-type byte layout is the hard part.
+
+**+63, and 72 of it came from `copy (select 1) to stdout`** -- a query with no
+FROM, which clients use to check how a server reports a BAD query. Refusing it
+failed a whole file that was not about COPY. `COPY (query)` reuses the ordinary
+select path, so ordering, limits and a generated series all work inside a COPY.
+
+**The remaining COPY failures are NOT COPY.** 195 are a cascading
+`relation "copy_in" does not exist`. `serial`, range and multirange columns were
+each checked directly and all work, so the fixture is failing for some other
+reason -- filed rather than guessed at, because three plausible causes were
+eliminated by measurement and the fourth is not yet known.
+
+**Probe: 11 output shapes byte-for-byte (including binary) and 3 input shapes,
+0 divergences.**
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933.**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

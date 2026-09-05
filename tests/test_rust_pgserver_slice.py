@@ -1651,3 +1651,102 @@ def test_a_cursor_over_generate_series(home: Path) -> None:
         cur.execute("fetch all from c")
         assert [r[0] for r in cur.fetchall()] == list(range(2, 11))
         cur.execute("close c")
+
+
+def test_copy_out_formats_keep_null_and_empty_apart(home: Path) -> None:
+    """COPY's three formats differ mainly in how they spell NULL.
+
+    * text writes ``\\N`` for NULL; an empty string is an empty field.
+    * CSV writes NULL as an *unquoted* empty field, and therefore has to quote
+      the empty string as ``""`` to keep the two apart.
+    * binary writes a length of −1 for NULL, where an empty string is length 0.
+
+    Every one of those distinctions was broken at some point in writing this,
+    and each broke the same way: NULL and empty string became indistinguishable.
+    In binary the cause was match-arm order — a catch-all above the NULL arm
+    swallowed it and rendered it as text, which is length 0.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table cp (id int primary key, s text)")
+        conn.execute("insert into cp values (1,'plain'),(2,'has,comma'),(5,NULL),(6,'')")
+
+        with conn.cursor().copy("copy cp to stdout") as cp:
+            assert b"".join(cp) == b"1\tplain\n2\thas,comma\n5\t\\N\n6\t\n"
+
+        with conn.cursor().copy("copy cp to stdout with (format csv)") as cp:
+            assert b"".join(cp) == b'1,plain\n2,"has,comma"\n5,\n6,""\n'
+
+        with conn.cursor().copy("copy cp to stdout with (format binary)") as cp:
+            blob = b"".join(cp)
+        assert blob.startswith(b"PGCOPY\n\xff\r\n\x00")
+        # NULL is a length of -1, not a zero-length value.
+        assert b"\xff\xff\xff\xff" in blob
+        assert blob.endswith(b"\xff\xff")
+
+
+def test_copy_out_from_a_query(home: Path) -> None:
+    """`COPY (query) TO STDOUT`, including a query with no FROM at all.
+
+    `copy (select 1) to stdout` is the shape clients use to check that a bad
+    query is reported properly, so refusing it failed a whole file's worth of
+    tests that had nothing to do with COPY.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table cp (id int primary key, s text)")
+        conn.execute("insert into cp values (1,'a'),(2,'b'),(3,'c')")
+
+        with conn.cursor().copy("copy (select id from cp order by id) to stdout") as cp:
+            assert b"".join(cp) == b"1\n2\n3\n"
+        with conn.cursor().copy("copy (select id from cp order by id limit 2) to stdout") as cp:
+            assert b"".join(cp) == b"1\n2\n"
+        # A generated source works too, since COPY reuses the SELECT path.
+        with conn.cursor().copy("copy (select * from generate_series(1,3)) to stdout") as cp:
+            assert b"".join(cp) == b"1\n2\n3\n"
+        # No FROM at all.
+        with conn.cursor().copy("copy (select 1) to stdout") as cp:
+            assert b"".join(cp) == b"1\n"
+
+
+@pytest.mark.parametrize(
+    "fmt,data",
+    [
+        ("", b"1\tplain\n2\thas,comma\n5\t\\N\n6\t\n"),
+        ("with (format csv)", b'1,plain\n2,"has,comma"\n5,\n6,""\n'),
+    ],
+    ids=["text", "csv"],
+)
+def test_copy_in_formats(home: Path, fmt: str, data: bytes) -> None:
+    """COPY FROM in both textual formats, with the NULL rules reversed.
+
+    The CSV parser cannot find rows by splitting on newlines first: a newline
+    inside quotes is data.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int primary key, s text)")
+        with conn.cursor().copy(f"copy t from stdin {fmt}") as cp:
+            cp.write(data)
+        cur = conn.cursor()
+        cur.execute("select id, s from t order by id")
+        assert cur.fetchall() == [(1, "plain"), (2, "has,comma"), (5, None), (6, "")]
+
+
+def test_copy_binary_round_trips(home: Path) -> None:
+    """Binary out and back in, through NULL and empty-string values.
+
+    The input side reuses the same per-type decoder as a bound binary
+    parameter — the bytes on the wire are identical, so a second
+    implementation could only drift from the first.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table a (id int primary key, s text, n int)")
+        conn.execute("insert into a values (1,'x',10),(2,NULL,NULL),(3,'',30)")
+        conn.execute("create table b (id int primary key, s text, n int)")
+
+        with conn.cursor().copy("copy a to stdout with (format binary)") as cp:
+            blob = b"".join(cp)
+        with conn.cursor().copy("copy b from stdin with (format binary)") as cp:
+            cp.write(blob)
+
+        cur = conn.cursor()
+        cur.execute("select id, s, n from b order by id")
+        assert cur.fetchall() == [(1, "x", 10), (2, None, None), (3, "", 30)]
