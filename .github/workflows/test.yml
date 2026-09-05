@@ -1730,6 +1730,61 @@ jobs:
           try { Set-MpPreference -DisableRealtimeMonitoring $true }
           catch { Write-Warning "could not disable Defender real-time scanning: $_" }
 
+      - name: Reclaim disk (Windows)
+        if: runner.os == 'Windows'
+        # This job keeps a WiredTiger home per test for the whole session --
+        # `tests/conftest.py` REFUSES a mid-session delete policy, because one
+        # was tried and raced WT's background threads into a WT_PANIC cascade,
+        # so the homes cannot simply be cleaned up as they finish. The
+        # concurrency suite at the end of this job is the heaviest writer of
+        # them, and it exhausted the runner with "No space left on device" on a
+        # change that added no storage at all (2026-09-05).
+        #
+        # The `test` job already reclaims preinstalled toolchains on LINUX for
+        # exactly this reason; Windows had no equivalent. The Android SDK is the
+        # large safely-removable item -- this job needs MSVC, CMake, Python and
+        # LLVM, and none of those live under it.
+        shell: pwsh
+        run: |
+          foreach ($p in @('C:\Android', 'C:\Program Files (x86)\Android')) {
+            if (Test-Path $p) {
+              Write-Host "removing $p"
+              Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue
+            }
+          }
+
+      - name: Put the test temp dir on the big drive (Windows)
+        if: runner.os == 'Windows'
+        # THE actual fix. Python's `tempfile` reads TMP/TEMP, which on this
+        # image default to `C:\Users\runneradmin\AppData\Local\Temp` -- a
+        # SMALL drive. `RUNNER_TEMP` is `D:\a\_temp`, and D: has ~147 GB free
+        # and sat idle while C: filled up. `tests/conftest.py` keeps a
+        # WiredTiger home per test for the whole session by design (deleting one
+        # mid-session races WT's background threads into a WT_PANIC cascade), so
+        # the suite genuinely needs the room -- it just needs it on the drive
+        # that has it.
+        #
+        # Measured, not assumed: the run before this step existed reported D: at
+        # 3.1G used of 150G while the job died with "No space left on device" on
+        # C:. That is the whole bug.
+        shell: bash
+        run: |
+          printf 'TMP=%s\nTEMP=%s\nTMPDIR=%s\n' \
+            "$RUNNER_TEMP" "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Free disk before the storage tests
+        # Report the drive the tests will actually WRITE to, which is not
+        # necessarily the one the checkout is on: `df -h .` measures the
+        # workspace (D: on Windows) and would have shown 147 GB free on the run
+        # that died of a full C:. Reported before and after (paired step at the
+        # end of this job) so the DELTA sizes the suite's real appetite.
+        shell: bash
+        run: |
+          python -c "import tempfile; print(tempfile.gettempdir())" > /tmp/tdir 2>/dev/null ||
+            echo "${TMP:-.}" > /tmp/tdir
+          echo "test temp dir: $(cat /tmp/tdir)"
+          df -h "$(cat /tmp/tdir)" || df -h . || true
+
       - name: Install toolchain (Linux)
         if: runner.os == 'Linux'
         uses: ./.github/actions/apt-install
@@ -1949,6 +2004,18 @@ jobs:
           --with "$(ls dist-storage/*.whl)"
           python -m pytest tests/test_mongo_server_concurrency.py
           -k rust -o addopts= -p no:cacheprovider -q
+
+      - name: Free disk after the storage tests
+        # Paired with the "before" step: the DELTA is what the suite actually
+        # costs. Runs even on failure, because the failure being diagnosed here
+        # is exhaustion -- a report only on success never prints on the run that
+        # needs it.
+        if: always()
+        shell: bash
+        run: |
+          t=$(cat /tmp/tdir 2>/dev/null || echo .)
+          echo "test temp dir: $t"
+          df -h "$t" || df -h . || true
 
       - name: Build + smoke the standalone secantusd-rs binary (R7)
         # The bin crate links the SAME vendored WiredTiger the wheel build above
