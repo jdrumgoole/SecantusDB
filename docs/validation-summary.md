@@ -1,6 +1,6 @@
 # Cross-Driver Conformance Summary
 
-Generated 2026-08-28 — SecantusDB 0.6.0b16. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 13 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
+Generated 2026-08-31 — SecantusDB 0.6.0b16. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 13 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
 
 **Failures split into two columns**: *Failed* counts tests that actually need a fix on SecantusDB; *Expected* counts tests with a documented reason for failing (driver-side cascade, out-of-scope feature, single-node-topology assumption, known intermittent flake). The expected list lives in `validation_summary/expected_failures.py` and each entry carries a rationale. Adjusted pass rate = passes ÷ (passes + actual failures).
 
@@ -8,26 +8,26 @@ Generated 2026-08-28 — SecantusDB 0.6.0b16. Each per-driver gauge runs the dri
 
 | Driver | Language | Driver version | Tests run | Passed | Failed | Expected | Skipped | Pass rate | Adjusted |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| `pymongo` | Python | `f2103a95870a` | 1501 | 1021 | 0 | 5 | 475 | 99.5% | 100.0% |
-| `pymongo (async)` | Python | `f2103a95870a` | 1423 | 926 | 0 | 6 | 491 | 99.4% | 100.0% |
-| `mongo-java-driver` | Java | `cb45be6bb147` | 900 | 445 | 1 | 1 | 453 | 99.6% | 99.8% |
-| `mongo-kotlin-driver` | Kotlin | `cb45be6bb147` | 538 | 294 | 0 | 0 | 244 | 100.0% | 100.0% |
-| `mongo-go-driver` | Go | `fd85a834c40e` | 453 | 401 | 0 | 0 | 52 | 100.0% | 100.0% |
-| `mongo-node-driver` | Node.js | `7e53685952f2` | 364 | 358 | 0 | 1 | 5 | 99.7% | 100.0% |
+| `pymongo` | Python | `f2103a95870a` | 1501 | 1072 | 0 | 5 | 424 | 99.5% | 100.0% |
+| `pymongo (async)` | Python | `f2103a95870a` | 1423 | 977 | 0 | 6 | 440 | 99.4% | 100.0% |
+| `mongo-java-driver` | Java | `cb45be6bb147` | 900 | 494 | 0 | 1 | 405 | 99.8% | 100.0% |
+| `mongo-kotlin-driver` | Kotlin | `cb45be6bb147` | 538 | 340 | 0 | 0 | 198 | 100.0% | 100.0% |
+| `mongo-go-driver` | Go | `fd85a834c40e` | 476 | 409 | 30 | 0 | 37 | 93.2% | 93.2% |
+| `mongo-node-driver` | Node.js | `7e53685952f2` | 364 | 357 | 0 | 1 | 6 | 99.7% | 100.0% |
 | `mongo-ruby-driver` | Ruby | `f68d676643c1` | 283 | 258 | 0 | 1 | 24 | 99.6% | 100.0% |
-| `mongo-rust-driver` | Rust | `12dd49bf18bb` | 105 | 105 | 0 | 0 | 0 | 100.0% | 100.0% |
-| `mongo-php-library` | PHP | `12e56461166d` | 2221 | 2184 | 0 | 0 | 37 | 100.0% | 100.0% |
-| `mongo-php-driver` | PHP | `e81b318a33dc` | 270 | 247 | 0 | 0 | 23 | 100.0% | 100.0% |
-| `mongo-c-driver` | C | `57dba9c04991` | 841 | 763 | 0 | 6 | 72 | 99.2% | 100.0% |
+| `mongo-rust-driver` | Rust | `12dd49bf18bb` | 106 | 103 | 3 | 0 | 0 | 97.2% | 97.2% |
+| `mongo-php-library` | PHP | `12e56461166d` | 2221 | 2184 | 1 | 0 | 36 | 100.0% | 100.0% |
+| `mongo-php-driver` | PHP | `e81b318a33dc` | 270 | 248 | 0 | 0 | 22 | 100.0% | 100.0% |
+| `mongo-c-driver` | C | `57dba9c04991` | 841 | 780 | 5 | 6 | 50 | 98.6% | 99.4% |
 | `mongo-cxx-driver` | C++ | `24852b68a3d1` | 899 | 890 | 0 | 0 | 9 | 100.0% | 100.0% |
-| `mongo-csharp-driver` | C# | `8297e62d7f2b` | 228 | 202 | 0 | 0 | 26 | 100.0% | 100.0% |
-| **All drivers** | — | — | **10026** | **8094** | **1** | **20** | **1911** | **99.7%** | **100.0%** |
+| `mongo-csharp-driver` | C# | `8297e62d7f2b` | 228 | 209 | 19 | 0 | 0 | 91.7% | 91.7% |
+| **All drivers** | — | — | **10050** | **8321** | **58** | **20** | **1651** | **99.1%** | **99.3%** |
 
 ## Per-driver scope
 
 - **`pymongo`** — curated server-touching pytest paths under vendor/pymongo-tests/test/.
 - **`pymongo (async)`** — AsyncMongoClient suite under vendor/pymongo-tests/test/asynchronous/.
-- **`mongo-java-driver`** — 21 of 112 driver-sync functional classes (bson codec unit tests excluded — they don't touch the server).
+- **`mongo-java-driver`** — driver-sync functional integration tests.
 - **`mongo-kotlin-driver`** — driver-kotlin-sync integrationTest (ships in the mongo-java-driver monorepo).
 - **`mongo-go-driver`** — vendor/mongo-go-driver/internal/integration/....
 - **`mongo-node-driver`** — curated test/integration/ spec set.

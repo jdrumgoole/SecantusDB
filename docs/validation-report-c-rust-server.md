@@ -1,6 +1,6 @@
 # mongo-c-driver Validation Report
 
-Generated 2026-08-28 — SecantusDB 0.6.0b16 vs mongo-c-driver 57dba9c (`vendor/mongo-c-driver/`).
+Generated 2026-08-31 — SecantusDB 0.6.0b16 vs mongo-c-driver 57dba9c (`vendor/mongo-c-driver/`).
 
 Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** driver (`libmongoc`) is the lowest-level official client — and (with the Go and PHP-extension gauges) one of the strictest wire-protocol checks.
 
@@ -10,7 +10,7 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 |---|---:|---:|---:|---:|---:|
 | `/BulkOperation` | 93 | 0 | 10 | 103 | 100.0% |
 | `/Client` | 96 | 6 | 19 | 121 | 94.1% |
-| `/Collection` | 146 | 0 | 11 | 157 | 100.0% |
+| `/Collection` | 145 | 0 | 12 | 157 | 100.0% |
 | `/Cursor` | 70 | 0 | 0 | 70 | 100.0% |
 | `/Database` | 19 | 0 | 0 | 19 | 100.0% |
 | `/ReadConcern` | 6 | 0 | 0 | 6 | 100.0% |
@@ -21,14 +21,14 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | `/change_streams` | 4 | 0 | 0 | 4 | 100.0% |
 | `/collection-management` | 5 | 0 | 0 | 5 | 100.0% |
 | `/command_monitoring` | 34 | 0 | 1 | 35 | 100.0% |
-| `/crud` | 160 | 0 | 12 | 172 | 100.0% |
-| `/find_and_modify` | 9 | 0 | 0 | 9 | 100.0% |
+| `/crud` | 166 | 5 | 1 | 172 | 97.1% |
+| `/find_and_modify` | 8 | 1 | 0 | 9 | 88.9% |
 | `/gridfs` | 10 | 0 | 1 | 11 | 100.0% |
 | `/gridfs_old` | 32 | 0 | 2 | 34 | 100.0% |
 | `/long_namespace` | 8 | 0 | 1 | 9 | 100.0% |
-| **Overall** | **750** | **6** | **59** | **815** | **99.2%** |
+| **Overall** | **754** | **12** | **49** | **815** | **98.4%** |
 
-## Failures (6)
+## Failures (12)
 
 First 30 failed tests for triage:
 
@@ -39,6 +39,12 @@ First 30 failed tests for triage:
 /Client/select_server/pooled
 /Client/select_server/err/single
 /Client/select_server/err/pooled
+/find_and_modify/hint
+/crud/prose_test_7
+/crud/prose_test_8
+/crud/prose_test_9
+/crud/unified/find-comment
+/crud/unified/client-bulkWrite-errors
 ```
 
 ## How this is generated
