@@ -12798,9 +12798,12 @@ Open items from the scout, in descending value:
 2. **`LATERAL (SELECT <expr from outer>) alias` fails** with `0A000 aggregate
    without FROM is not supported` — a FROM-less correlated lateral, same root
    cause as (1). Confirmed present at baseline, not a regression.
-3. **Hypothetical-set aggregates are unsupported** — `rank(2) WITHIN GROUP
-   (ORDER BY id)`, and likewise `dense_rank` / `percent_rank` / `cume_dist`,
-   are `0A000`. `percentile_cont` / `percentile_disc` / `mode` all work.
+3. ~~Hypothetical-set aggregates are unsupported.~~ **FIXED 2026-09-05** —
+   `rank` / `dense_rank` / `percent_rank` / `cume_dist` in their
+   `WITHIN GROUP` form now work for a single ORDER BY column, direction and
+   NULLS placement included (`tests/test_sql_sweep_twentythree.py`). The
+   MULTI-COLUMN form (one argument per ORDER BY expression) is still `0A000`,
+   refused rather than approximated.
 4. **`FILTER (WHERE ...)` on a statistical aggregate is `0A000`** — the twelve
    `corr` / `covar_*` / `regr_*` functions added 2026-09-05 work everywhere
    else (GROUP BY, HAVING, empty input, single pair, degenerate variance), but
