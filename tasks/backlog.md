@@ -4566,31 +4566,27 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
   19 of the 21 are fixed. The remaining 2 are recorded below.
 
-- [ ] **The Rust server never emits the STAGE wrapper (2026-09-05).** mongod has
-  three wrappers for a failing expression in an `$addFields` / `$project` /
-  `$set`: `Invalid $addFields :: caused by ::` for a PARSE error, `Failed to
-  optimize pipeline :: caused by ::` for a constant-fold failure, and
-  `Executor error during aggregate command on namespace: … :: caused by ::` for
-  a runtime one. `wrap_pipeline_error` in `crates/secantus-commands/src/aggregate.rs`
-  knows only the last two -- `grep -c 'Invalid \$'` over that file and
-  `crates/secantus-core/src/aggregate.rs` is **0**.
+- [x] **The Rust server's parse-time classifier was missing the required-key
+  specs — DONE 2026-09-05. The entry this replaces was WRONG.**
 
-  The Python server had the same defect and it was worth **83 shapes** on
-  `agg_expressions.py`: the message BODY was byte-identical to mongod's and only
-  the prefix was wrong, so nothing that compared codes could see it. 76 of the 83
-  were two operators (`$ifNull`, `$setEquals`) whose arity errors reached the
-  evaluator instead of the parser.
+  It claimed the Rust server "never emits the stage wrapper at all" on the
+  strength of `grep -c 'Invalid \$'` returning 0. That grep covered two files.
+  The machinery was already there — `argtypes::wrap_expression_problem`,
+  `EXPR_WRAPPING_STAGES`, and a parse-time scanner (`expression_problem_in_pipeline`)
+  that already handled `$ifNull` and `$setEquals`, i.e. **76 of the 83 shapes**
+  the Python fix was worth.
 
-  Porting it means (a) a third arm on `wrap_pipeline_error` and (b) the
-  parse-time classification -- `aggregate._expression_shape_problem`, with the
-  two tables added alongside it. **Mind the ordering**: mongod reports an
-  UNRECOGNISED key before a MISSING required one, and getting that backwards
-  changed the code on six shapes that were already right (see
-  `tests/test_expression_parse_time_wrappers.py`, which pins it).
+  Running the scanner instead of grepping it (a throwaway `#[test]` in
+  `secantus-commands`, which is a clean-workspace crate and needs no
+  WiredTiger) showed the real gap in one command: the four required-key
+  families answered `None`. That is now `REQUIRED_SPEC_KEY` plus the
+  `$dateFromParts` year check, ordered after the unknown-key tables.
 
-  Not measured on the Rust server directly -- a fresh worktree has no
-  `vendor/wiredtiger`, so the standalone binary could not be built here. The
-  claim above is from reading `wrap_pipeline_error`, so **probe before sizing**.
+  The lesson is the one this file already states and I did not follow: **a
+  count from a partial grep is not a measurement.** The entry overstated the
+  work by an order of magnitude and would have sent the next session to port
+  something already ported. Sizing from a `#[test]` took about a minute and
+  needed none of the WiredTiger build the entry said was blocking.
 
 - [ ] **The Rust update path has no parse-time / execution-time distinction
   (2 shapes, 2026-09-02).** mongod wraps an EXECUTION-time update failure as
