@@ -4527,6 +4527,14 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   What DOES work as of 2026-09-05: a table created or dropped in a transaction
   is correctly VISIBLE (or hidden) to later statements in that same
   transaction, which is what 184 psycopg failures were waiting on.
+- **Rust PG server: SAVEPOINTs are refused (`0A000`), and that now costs more
+  than it did.** `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` need nested
+  transactions in the storage layer; emulating them would silently lose the
+  semantics a client is relying on, so they are refused. Since the transaction
+  STATUS became correct (2026-09-05), psycopg reaches for a savepoint whenever
+  a `conn.transaction()` block nests inside an open transaction -- which it can
+  now see -- so tests that used to pass by never noticing the outer transaction
+  fail here instead. It is the next blocker in `test_transaction.py`.
 - **Rust PG server: range and multirange OPERATORS are unsupported.** Both type
   families themselves (literals, constructors, casts, canonicalisation, merging,
   parameters in both wire formats) are in; `@>` / `<@` / `&&` / `-|-` and the

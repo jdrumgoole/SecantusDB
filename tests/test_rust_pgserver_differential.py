@@ -965,6 +965,19 @@ def test_server_cursors_match_postgres(
     PostgreSQL exposes a declared cursor as a portal of the same name, and
     psycopg describes it before it fetches anything.
     """
+
+
+def test_transaction_status_matches_postgres(
+    ours: psycopg.Connection, oracle: psycopg.Connection
+) -> None:
+    """The status that rides on every `ReadyForQuery`, and the failed block.
+
+    Nothing in a row comparison can see this: the status is reported after each
+    statement rather than selected, so a server can report IDLE inside a
+    transaction indefinitely without a single query answering differently.
+    """
+    from psycopg.pq import TransactionStatus
+
     _reset_oracle(oracle)
 
     def probe(conn: psycopg.Connection) -> list:
@@ -982,6 +995,50 @@ def test_server_cursors_match_postgres(
         finally:
             conn.rollback()
             conn.autocommit = was_autocommit
+        conn.autocommit = True
+        out: list = []
+
+        def st() -> str:
+            return TransactionStatus(conn.info.transaction_status).name
+
+        def attempt(sql: str, params: tuple = ()) -> str:
+            try:
+                conn.cursor().execute(sql, params)
+            except psycopg.Error as exc:
+                return exc.diag.sqlstate or "?"
+            return "ok"
+
+        cur = conn.cursor()
+        try:
+            cur.execute("DROP TABLE IF EXISTS ft")
+            cur.execute("CREATE TABLE ft (id int4)")
+            out.append(("idle", st()))
+            cur.execute("BEGIN")
+            out.append(("in a transaction", st()))
+            cur.execute("INSERT INTO ft VALUES (1)")
+            out.append(("the error", attempt("SELECT nosuchcolumn FROM ft")))
+            out.append(("after the error", st()))
+            out.append(("a select after it", attempt("SELECT 1")))
+            out.append(("an insert after it", attempt("INSERT INTO ft VALUES (2)")))
+            out.append(("a parameterised one", attempt("SELECT %s", (1,))))
+            cur.execute("COMMIT")
+            out.append(("the tag of that commit", cur.statusmessage))
+            out.append(("after it", st()))
+            cur.execute("SELECT count(*) FROM ft")
+            out.append(("rows that survived", cur.fetchone()[0]))
+            out.append(("an error outside a transaction", attempt("SELECT nosuchcolumn FROM ft")))
+            out.append(("still idle", st()))
+            cur.execute("BEGIN")
+            cur.execute("INSERT INTO ft VALUES (3)")
+            cur.execute("COMMIT")
+            out.append(("the tag of a clean commit", cur.statusmessage))
+            cur.execute("SELECT count(*) FROM ft")
+            out.append(("rows after it", cur.fetchone()[0]))
+        finally:
+            with contextlib.suppress(Exception):
+                conn.cursor().execute("DROP TABLE IF EXISTS ft")
+            conn.autocommit = was_autocommit
+        return out
 
     theirs, mine = probe(oracle), probe(ours)
     assert mine == theirs, f"postgres={theirs}\n  ours    ={mine}"

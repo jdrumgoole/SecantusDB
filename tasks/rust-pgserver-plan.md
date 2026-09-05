@@ -1134,7 +1134,64 @@ is what made both diagnoses take minutes rather than a reading of the source.
 PostgreSQL reports INTRANS / INERROR (32 tests, protocol-level, and it is what
 the other 32 cursor tests hit once the describe works).
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181 (0.34; 0.35 measured +29 on a pre-0.34 base).**
+### 0.36 the transaction status, and a failed block that refuses (2026-09-05)
+
+**2181 -> 2219, +51 / -12.**
+
+Every connection reported IDLE whatever the transaction state, because the
+status that rides on `ReadyForQuery` is computed by pgwire from the RESPONSE
+VARIANT and this server answered `Response::Execution` for BEGIN / COMMIT /
+ROLLBACK. `TransactionStart` / `TransactionEnd` is the whole fix for the status
+itself -- pgwire already tracks the transitions, including the error state.
+
+The half that was a WRONG ANSWER rather than a cosmetic one: PostgreSQL aborts a
+block at the first error and refuses everything after it (`25P02`) until the
+block ends, and a `COMMIT` there is a rollback whose TAG says `ROLLBACK`. This
+server carried on executing, so a client that shrugged off a mid-transaction
+error committed work PostgreSQL would have discarded.
+
+**The first measurement of this batch was -11, and the cause was mine.** The
+implicit transaction around a multi-statement simple query cleared
+`in_transaction` but not the new failed flag, so one failed batch refused every
+later statement on that connection FOREVER -- 47 of the losses were psycopg
+FIXTURES failing at setup. Clearing it in `commit_implicit` / `rollback_implicit`
+turned -11 into +38. **A new piece of session state has to be cleared on every
+path that ends the session's transaction, not just the one that reads well.**
+
+**A same-branch baseline is what caught it.** `main` had moved (0.34 merged, plus
+two other PRs), so the previous run's 2181 was not a baseline for this branch;
+measuring the branch WITH and WITHOUT the change, minutes apart, is the only
+comparison that means anything.
+
+**A correct status makes every OTHER gap more expensive.** Two
+`test_transaction.py` tests that used to pass now fail on SAVEPOINT: psycopg
+reaches for one when a `conn.transaction()` block nests inside an open
+transaction, which it could not see before. That is PostgreSQL's own behaviour
+and the right trade, but it means an unsupported statement inside a block now
+poisons the rest of the block. Savepoints are the next blocker there
+(`tasks/backlog.md`).
+
+**Also fixed while in there:** `START TRANSACTION` answered with `BEGIN`'s
+command tag, and `AND CHAIN` left the connection IDLE instead of opening the
+next block -- a chained client's next statements were autocommitted one by one.
+
+**Probes: 11 status shapes, 18 failed-block shapes (including whether the rows
+SURVIVE), 5 chain/spelling shapes -- 0 divergences.**
+
+**A WT_PANIC that was the HARNESS, not the server.** The ad-hoc probe pattern
+used one fixed storage path and started each run with
+`pkill …; rm -rf /tmp/probe-pg-home; mkdir …`. `pkill` returns when the SIGNAL
+IS DELIVERED, not when the process has finished closing WiredTiger -- so the
+`rm -rf` deleted `WiredTigerHS.wt` out from under a server that was still
+checkpointing, and it panicked: *"the checkpoint failed, the system must
+restart"*, the exact shape of a real storage bug. What identified it was the
+FIRST line of the log (`file-size: stat: No such file or directory`) and the
+fact that the current server was listed by `lsof` as healthy on its port
+throughout. `scratchpad/pgprobe.sh` now gives every probe run its own `mktemp`
+directory and waits for the port to be free. **A harness that can manufacture a
+storage panic will eventually hide a real one.**
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181 -> 2219 (0.35 measured +29 on a pre-0.34 base and is not in this line).**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

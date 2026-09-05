@@ -468,13 +468,28 @@ fn an_unbound_parameter_is_42p02() {
 fn transaction_statements_are_planned() {
     for (sql, want) in [
         ("BEGIN", TransactionControl::Begin),
-        ("START TRANSACTION", TransactionControl::Begin),
+        // `START TRANSACTION` is `BEGIN` with a different command tag, so it
+        // is a different variant rather than the same one.
+        ("START TRANSACTION", TransactionControl::Start),
         (
             "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
             TransactionControl::Begin,
         ),
-        ("COMMIT", TransactionControl::Commit),
-        ("ROLLBACK", TransactionControl::Rollback),
+        ("COMMIT", TransactionControl::Commit { chain: false }),
+        ("ROLLBACK", TransactionControl::Rollback { chain: false }),
+        // `AND CHAIN` ends the block and opens another, which the executor
+        // cannot know unless the planner carries it.
+        (
+            "COMMIT AND CHAIN",
+            TransactionControl::Commit { chain: true },
+        ),
+        (
+            "ROLLBACK AND CHAIN",
+            TransactionControl::Rollback { chain: true },
+        ),
+        // Two spellings PostgreSQL treats as COMMIT and ROLLBACK outright.
+        ("END", TransactionControl::Commit { chain: false }),
+        ("ABORT", TransactionControl::Rollback { chain: false }),
     ] {
         match plan_ok(sql) {
             Statement::Transaction(c) => assert_eq!(c, want, "for {sql}"),
