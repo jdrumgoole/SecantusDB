@@ -212,8 +212,13 @@ def test_phrase_distance():
 
 
 def test_phrase_render():
-    assert fts.render_tsquery(fts.to_tsquery("a <-> b")) == "'a' <-> 'b'"
-    assert fts.render_tsquery(fts.to_tsquery("a <3> b")) == "'a' <3> 'b'"
+    # `simple`, because under `english` the lexeme `a` is a STOP-WORD and is
+    # pruned — `to_tsquery('english','a <-> b')` really is `'b'` in PostgreSQL.
+    # This test is about rendering, so it uses the configuration that keeps
+    # both terms; the stop-word behaviour is pinned in
+    # `test_sql_sweep_nineteen.py`.
+    assert fts.render_tsquery(fts.to_tsquery("a <-> b", "simple")) == "'a' <-> 'b'"
+    assert fts.render_tsquery(fts.to_tsquery("a <3> b", "simple")) == "'a' <3> 'b'"
 
 
 def test_phraseto_tsquery():

@@ -376,13 +376,14 @@ def _literal(node: exp.Expression) -> Any:
         cfg = _literal(node.expressions[0]) if len(node.expressions) > 1 else None
         if fname == "to_tsvector":
             return _fts.to_tsvector(str(text), str(cfg) if cfg is not None else None)
+        cfgs = str(cfg) if cfg is not None else None
         if fname == "plainto_tsquery":
-            return _fts.plainto_tsquery(str(text))
+            return _fts.plainto_tsquery(str(text), cfgs)
         if fname == "phraseto_tsquery":
-            return _fts.phraseto_tsquery(str(text))
+            return _fts.phraseto_tsquery(str(text), cfgs)
         if fname == "websearch_to_tsquery":
-            return _fts.websearch_to_tsquery(str(text))
-        return _fts.to_tsquery(str(text))
+            return _fts.websearch_to_tsquery(str(text), cfgs)
+        return _fts.to_tsquery(str(text), cfgs)
     if isinstance(node, exp.Anonymous) and str(node.this).lower() == "to_regtype":
         # ``to_regtype('name')`` resolves a type name to its OID (NULL if unknown).
         # SQLAlchemy's psycopg dialect probes ``t.oid = to_regtype('hstore')`` at

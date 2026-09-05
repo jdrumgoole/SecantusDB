@@ -12609,11 +12609,13 @@ operand), `&&` / `||` on tsquery, the `simple` configuration, and added
 
 Three gaps remain, all needing more than a patch:
 
-1. **No stemming.** `to_tsvector('english','running runs ran')` is
-   `'ran':3 'running':1 'runs':2` where PostgreSQL gives `'ran':3 'run':1,2`,
-   and `cats` does not match `cat`. This is the largest functional gap in the
-   feature — a query that should match does not — and it needs a Snowball /
-   Porter stemmer per configuration. `fts.py`'s docstring has always said so.
+1. ~~No stemming.~~ **FIXED 2026-09-05** — `secantus.sql.snowball` implements
+   Porter2, pinned against 6,094 words stemmed by PostgreSQL itself
+   (`tests/data/english_stems.txt`, exact match on every one). Both sides stem,
+   prefixes included, and `to_tsquery` now drops stop-words. Two rules were got
+   wrong first and are pinned: step 1a exempts `us` as well as `ss` (248 words),
+   and step 4 takes the longest matching suffix and applies its condition ONCE
+   rather than falling through to a shorter one.
 2. **`setweight` does not exist**, and cannot until the tsvector representation
    carries a per-lexeme weight (`{lexeme: [pos, …]}` has nowhere to put the
    `A`/`B`/`C`/`D`). Weighted `ts_rank` has the same blocker.
