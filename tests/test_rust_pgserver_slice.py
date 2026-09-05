@@ -1835,3 +1835,61 @@ def test_order_by_output_position(home: Path) -> None:
             with pytest.raises(psycopg.Error) as exc:
                 cur.execute(bad)
             assert exc.value.diag.sqlstate == "42P10", bad
+
+
+def test_generate_series_in_the_select_list(home: Path) -> None:
+    """`select generate_series(1,3)` is three rows, not one.
+
+    A set-returning function in the target list of a FROM-less query expands
+    into rows, so it is planned as a select over a generated source — the same
+    shape `FROM generate_series(...)` produces. Clients reach for this form
+    constantly to make rows without a table, and a server cursor over it was
+    the single biggest use in psycopg's suite.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("select generate_series(1,3)")
+        assert [r[0] for r in cur.fetchall()] == [1, 2, 3]
+        assert cur.description[0].name == "generate_series"
+
+        cur.execute("select generate_series(1,3) as g")
+        assert cur.description[0].name == "g"
+        # Counting up towards a smaller stop is still empty, not reversed.
+        cur.execute("select generate_series(3,1)")
+        assert cur.fetchall() == []
+        cur.execute("select generate_series(1,10) order by 1 desc limit 3")
+        assert [r[0] for r in cur.fetchall()] == [10, 9, 8]
+
+        # A server cursor over it, which is how the corpus uses the pair.
+        with conn.transaction():
+            cur.execute("declare c cursor for select generate_series(1,5)")
+            cur.execute("fetch 2 from c")
+            assert [r[0] for r in cur.fetchall()] == [1, 2]
+            cur.execute("close c")
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+def test_multiranges_bind_in_binary_too(home: Path, binary: bool) -> None:
+    """A multirange sent as a bound parameter in either format.
+
+    The binary layout is a count of ranges followed by each one length-prefixed
+    in the *range's* own binary form, so it reuses the range decoder rather
+    than repeating the flags-and-bounds layout.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.cursor().execute("set timezone to 'UTC'")
+        cur = conn.cursor(binary=binary)
+        for sql, value in [
+            ("select %s::int4multirange", Multirange([Range(1, 5, "[)")])),
+            (
+                "select %s::int4multirange",
+                Multirange([Range(1, 5, "[)"), Range(10, 20, "[)")]),
+            ),
+            ("select %s::int4multirange", Multirange([])),
+            (
+                "select %s::nummultirange",
+                Multirange([Range(Decimal("1.0"), Decimal("2.0"), "[]")]),
+            ),
+        ]:
+            cur.execute(sql, (value,))
+            assert cur.fetchone()[0] == value, value

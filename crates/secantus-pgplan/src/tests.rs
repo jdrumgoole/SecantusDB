@@ -1748,3 +1748,53 @@ fn a_where_over_a_series_is_refused() {
     .expect_err("where over a series");
     assert_eq!(err.sqlstate(), "0A000");
 }
+
+/// A set-returning function in the SELECT LIST of a FROM-less query is not a
+/// constant: `select generate_series(1,3)` is three ROWS.
+///
+/// It is planned as an ordinary select over a generated source — the same shape
+/// `FROM generate_series(...)` produces — so ORDER BY, LIMIT and OFFSET keep
+/// working without a second implementation of any of them.
+#[test]
+fn a_set_returning_function_in_the_select_list_makes_rows() {
+    match plan_ok("SELECT generate_series(1,3)") {
+        Statement::Select(sel) => {
+            let series = sel.series.expect("a series");
+            assert_eq!(series.values(), vec![1, 2, 3]);
+            assert_eq!(series.column, "generate_series");
+            assert_eq!(
+                sel.columns,
+                vec![("generate_series".to_string(), "generate_series".to_string())]
+            );
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    // The alias renames the output column.
+    match plan_ok("SELECT generate_series(1,3) AS g") {
+        Statement::Select(sel) => {
+            assert_eq!(sel.series.expect("a series").column, "g");
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    // ORDER BY and LIMIT come along.
+    match plan_ok("SELECT generate_series(1,10) ORDER BY 1 DESC LIMIT 3") {
+        Statement::Select(sel) => {
+            assert_eq!(sel.limit, Some(3));
+            assert_eq!(sel.order.len(), 1);
+            assert!(!sel.order[0].ascending);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+/// A set-returning function BESIDE another output column is refused.
+///
+/// `select 1, generate_series(1,3)` repeats the constant across the generated
+/// rows, which needs the constants carried into each row. Nothing in the corpus
+/// asks for it, and a shape that silently dropped a column would be worse than
+/// saying so.
+#[test]
+fn a_set_returning_function_beside_a_column_is_refused() {
+    let err = plan("SELECT 1, generate_series(1,3)", &lookup).expect_err("srf beside a column");
+    assert_eq!(err.sqlstate(), "0A000");
+}
