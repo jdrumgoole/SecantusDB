@@ -1753,13 +1753,37 @@ jobs:
             }
           }
 
-      - name: Free disk before the storage tests
-        # Reported on EVERY os, before and after (see the paired step at the end
-        # of this job). The Windows exhaustion above was undiagnosable after the
-        # fact because nothing recorded how much space there had been -- the
-        # Linux reclaim prints `df -h`, this job printed nothing.
+      - name: Put the test temp dir on the big drive (Windows)
+        if: runner.os == 'Windows'
+        # THE actual fix. Python's `tempfile` reads TMP/TEMP, which on this
+        # image default to `C:\Users\runneradmin\AppData\Local\Temp` -- a
+        # SMALL drive. `RUNNER_TEMP` is `D:\a\_temp`, and D: has ~147 GB free
+        # and sat idle while C: filled up. `tests/conftest.py` keeps a
+        # WiredTiger home per test for the whole session by design (deleting one
+        # mid-session races WT's background threads into a WT_PANIC cascade), so
+        # the suite genuinely needs the room -- it just needs it on the drive
+        # that has it.
+        #
+        # Measured, not assumed: the run before this step existed reported D: at
+        # 3.1G used of 150G while the job died with "No space left on device" on
+        # C:. That is the whole bug.
         shell: bash
-        run: df -h . || true
+        run: |
+          printf 'TMP=%s\nTEMP=%s\nTMPDIR=%s\n' \
+            "$RUNNER_TEMP" "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Free disk before the storage tests
+        # Report the drive the tests will actually WRITE to, which is not
+        # necessarily the one the checkout is on: `df -h .` measures the
+        # workspace (D: on Windows) and would have shown 147 GB free on the run
+        # that died of a full C:. Reported before and after (paired step at the
+        # end of this job) so the DELTA sizes the suite's real appetite.
+        shell: bash
+        run: |
+          python -c "import tempfile; print(tempfile.gettempdir())" > /tmp/tdir 2>/dev/null ||
+            echo "${TMP:-.}" > /tmp/tdir
+          echo "test temp dir: $(cat /tmp/tdir)"
+          df -h "$(cat /tmp/tdir)" || df -h . || true
 
       - name: Install toolchain (Linux)
         if: runner.os == 'Linux'
@@ -1982,13 +2006,16 @@ jobs:
           -k rust -o addopts= -p no:cacheprovider -q
 
       - name: Free disk after the storage tests
-        # Paired with the "before" step: the DELTA is the number that sizes any
-        # real fix. Runs even on failure, because the failure mode being
-        # diagnosed here is exhaustion -- a report only on success would never
-        # print on the run that needs it.
+        # Paired with the "before" step: the DELTA is what the suite actually
+        # costs. Runs even on failure, because the failure being diagnosed here
+        # is exhaustion -- a report only on success never prints on the run that
+        # needs it.
         if: always()
         shell: bash
-        run: df -h . || true
+        run: |
+          t=$(cat /tmp/tdir 2>/dev/null || echo .)
+          echo "test temp dir: $t"
+          df -h "$t" || df -h . || true
 
       - name: Build + smoke the standalone secantusd-rs binary (R7)
         # The bin crate links the SAME vendored WiredTiger the wheel build above

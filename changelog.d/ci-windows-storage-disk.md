@@ -1,34 +1,39 @@
-### The Windows storage-engine job ran out of disk, and nothing recorded how close it was
+### The Windows storage-engine job filled a small drive while a 147 GB one sat idle
 
 `storage-engine (windows-latest)` failed with `No space left on device` and
-`WinError 112` on a change that added no storage at all. It is the second
-Windows disk exhaustion on this job.
+`WinError 112` on a change that added no storage at all — the second Windows
+disk exhaustion on this job.
 
-The obvious fix is not available: `tests/conftest.py` **refuses** a
+The suite genuinely needs the room. `tests/conftest.py` **refuses** a
 `tmp_path_retention_policy` that deletes a passed test's directory mid-session,
 because one was tried and raced WiredTiger's background threads into a
-`WT_PANIC` cascade. Every test's WiredTiger home therefore stays on disk for the
-whole session by design, and the concurrency suite at the end of this job is the
-heaviest writer of them.
+`WT_PANIC` cascade, so every test's WiredTiger home stays on disk for the whole
+session by design. Both engines already ship `prealloc=false`, the lever that
+tripwire names, and Rust's larger `file_max` is a documented production-throughput
+choice — none of that is the problem.
 
-Both engines already ship the lever that tripwire names (`prealloc=false`), and
-Rust's larger `file_max` is deliberate and documented for production throughput,
-so neither is something to quietly change.
+**The problem was which drive it needed the room on.** Python's `tempfile` reads
+`TMP`/`TEMP`, which on this image default to
+`C:\Users\runneradmin\AppData\Local\Temp`. `RUNNER_TEMP` is `D:\a\_temp`,
+and D: has ~147 GB free. The job filled C: while D: sat at 3 GB used of 150.
 
-What was missing was **any measurement**. The `test` job prints `df -h` around
-its Linux reclaim; this job printed nothing, so the failure could not be sized
-after the fact — there is no record of how much space there was or how much the
-run used.
+That was found by adding the reporting first — and the first version of that
+reporting was itself wrong, running `df -h .`, which measures the *workspace*
+drive (D: on Windows) and would cheerfully have shown 147 GB free on the run
+that died of a full C:. It now reports the directory the tests actually write
+to.
 
-This adds the mitigation Linux already has, and the instrumentation to size a
-real fix if the mitigation is not enough. It does **not** reduce what the suite
-consumes; the delta the next run prints is what would tell us whether that is
-needed.
+#### Fixed
+
+- `.github/workflows/test.yml`, `storage-engine` job: `TMP` / `TEMP` / `TMPDIR`
+  point at `RUNNER_TEMP` on Windows, so the per-test WiredTiger homes land on
+  the drive with the space.
 
 #### Changed
 
-- `.github/workflows/test.yml`, `storage-engine` job: reclaim the Android SDK on
-  Windows (MSVC / CMake / Python / LLVM all live elsewhere), and report free
-  space before and after the storage tests. The "after" report is `if: always()`,
-  because a report that only runs on success never prints on the run that needs
-  it.
+- Reclaim the Android SDK on Windows, mirroring the reclaim the `test` job
+  already has on Linux (MSVC / CMake / Python / LLVM all live elsewhere).
+- Report free space for the **test temp directory** before and after the storage
+  tests, so the delta sizes the suite's real appetite. The "after" step is
+  `if: always()`, because a report that runs only on success never prints on the
+  run that needs it.
