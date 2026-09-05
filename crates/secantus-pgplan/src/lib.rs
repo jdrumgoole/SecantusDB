@@ -337,8 +337,17 @@ pub struct Aggregate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionControl {
     Begin,
-    Commit,
-    Rollback,
+    /// `START TRANSACTION`, which does exactly what `BEGIN` does and differs
+    /// only in the command tag it answers with.
+    Start,
+    /// `chain` is `AND CHAIN`: the block ends and another opens immediately,
+    /// so the connection is still in a transaction afterwards.
+    Commit {
+        chain: bool,
+    },
+    Rollback {
+        chain: bool,
+    },
 }
 
 /// `SELECT <items>` with no FROM: one row, computed without touching storage.
@@ -561,14 +570,21 @@ pub fn plan_with_params(
         N::TransactionStmt(t) => {
             // Named enum, not the wire integer -- twice bitten already.
             match TransactionStmtKind::try_from(t.kind) {
-                Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart) => {
+                Ok(TransactionStmtKind::TransStmtBegin) => {
                     Ok(Statement::Transaction(TransactionControl::Begin))
                 }
+                Ok(TransactionStmtKind::TransStmtStart) => {
+                    Ok(Statement::Transaction(TransactionControl::Start))
+                }
                 Ok(TransactionStmtKind::TransStmtCommit) => {
-                    Ok(Statement::Transaction(TransactionControl::Commit))
+                    Ok(Statement::Transaction(TransactionControl::Commit {
+                        chain: t.chain,
+                    }))
                 }
                 Ok(TransactionStmtKind::TransStmtRollback) => {
-                    Ok(Statement::Transaction(TransactionControl::Rollback))
+                    Ok(Statement::Transaction(TransactionControl::Rollback {
+                        chain: t.chain,
+                    }))
                 }
                 Ok(other) => Err(Error::Unsupported(format!("{other:?}"))),
                 Err(_) => Err(Error::Unsupported("this transaction statement".into())),

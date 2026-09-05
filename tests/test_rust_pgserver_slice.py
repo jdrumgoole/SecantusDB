@@ -1978,3 +1978,58 @@ def test_a_server_cursor_describes_its_portal(home: Path) -> None:
         with conn.cursor("c2") as cur:
             cur.execute("select * from generate_series(1, 3) as n")
             assert list(cur) == [(1,), (2,), (3,)]
+
+
+def test_a_failed_transaction_refuses_everything_until_it_ends(home: Path) -> None:
+    """PostgreSQL's failed-transaction block, which this server had no notion of.
+
+    An error inside a transaction aborts the block: every later statement is
+    refused with `25P02` until the block ends, and a `COMMIT` there is a
+    rollback that says so in its tag. Without this a client that shrugged off a
+    mid-transaction error went on writing and committed work PostgreSQL would
+    have discarded.
+    """
+    from psycopg.pq import TransactionStatus
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create table ft (id int4)")
+
+        cur.execute("begin")
+        assert TransactionStatus(conn.info.transaction_status).name == "INTRANS"
+        cur.execute("insert into ft values (1)")
+        with pytest.raises(psycopg.errors.UndefinedColumn):
+            cur.execute("select nosuchcolumn")
+        assert TransactionStatus(conn.info.transaction_status).name == "INERROR"
+
+        # Every shape, including the parameterised one — a separate protocol
+        # path that would otherwise sail past the gate.
+        for sql, params in [
+            ("select 1", ()),
+            ("insert into ft values (2)", ()),
+            ("select %s", (1,)),
+            ("set timezone to 'UTC'", ()),
+        ]:
+            with pytest.raises(psycopg.errors.InFailedSqlTransaction):
+                cur.execute(sql, params)
+
+        cur.execute("commit")
+        assert cur.statusmessage == "ROLLBACK"
+        assert TransactionStatus(conn.info.transaction_status).name == "IDLE"
+        cur.execute("select count(*) from ft")
+        assert cur.fetchone()[0] == 0
+
+        # An error OUTSIDE a transaction leaves the session usable.
+        with pytest.raises(psycopg.errors.UndefinedColumn):
+            cur.execute("select nosuchcolumn")
+        assert TransactionStatus(conn.info.transaction_status).name == "IDLE"
+        cur.execute("select 1")
+        assert cur.fetchone() == (1,)
+
+        # …and a clean transaction still commits, with its own tag.
+        cur.execute("begin")
+        cur.execute("insert into ft values (3)")
+        cur.execute("commit")
+        assert cur.statusmessage == "COMMIT"
+        cur.execute("select count(*) from ft")
+        assert cur.fetchone()[0] == 1

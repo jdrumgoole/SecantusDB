@@ -82,6 +82,16 @@ pub struct PgHandler {
     /// `in_transaction`, it is read from inside `execute` while `run` holds
     /// the mutexes.
     binary_results: std::sync::atomic::AtomicBool,
+    /// Whether the open transaction has FAILED.
+    ///
+    /// PostgreSQL refuses every statement after an error inside a transaction
+    /// block until the block ends -- `25P02`, "current transaction is aborted"
+    /// -- and turns a `COMMIT` there into a rollback. Without that, a client
+    /// that shrugged off a mid-transaction error went on writing and COMMITTED
+    /// work PostgreSQL would have discarded, which is a wrong answer rather
+    /// than a missing feature. Lock-free for the same reason as
+    /// `in_transaction`.
+    txn_failed: std::sync::atomic::AtomicBool,
 }
 
 /// A declared cursor's materialised result.
@@ -124,6 +134,7 @@ impl PgHandler {
             uncommitted: Mutex::new(HashMap::new()),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             binary_results: std::sync::atomic::AtomicBool::new(false),
+            txn_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -790,6 +801,11 @@ impl PgHandler {
     }
 
     fn commit_implicit(&self) -> PgWireResult<()> {
+        // The block is over either way, so the failed-transaction gate
+        // lifts with it. Left set it would refuse every later statement on
+        // this connection, forever.
+        self.txn_failed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.uncommitted
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -805,6 +821,11 @@ impl PgHandler {
     }
 
     fn rollback_implicit(&self) -> PgWireResult<()> {
+        // The block is over either way, so the failed-transaction gate
+        // lifts with it. Left set it would refuse every later statement on
+        // this connection, forever.
+        self.txn_failed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.uncommitted
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -833,11 +854,26 @@ impl PgHandler {
             return Ok(vec![Response::EmptyQuery]);
         }
 
-        let stmt = self.plan_in_transaction(sql, params)?;
+        let stmt = self
+            .plan_in_transaction(sql, params)
+            .inspect_err(|_| self.note_failure())?;
 
         // Transaction control is session state, not a storage operation.
         if let Statement::Transaction(control) = stmt {
             return self.transaction_control(control);
+        }
+
+        // Everything ELSE is refused once the transaction has failed. Only
+        // ending the block clears it, which is why the two arms above come
+        // first.
+        if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "25P02".into(), // in_failed_sql_transaction
+                "current transaction is aborted, commands ignored until end of \
+                 transaction block"
+                    .into(),
+            ))));
         }
 
         // DECLARE runs its query NOW and keeps the rows, so the cursor can be
@@ -891,12 +927,31 @@ impl PgHandler {
         // Everything else runs INSIDE the open transaction when there is one,
         // so a later ROLLBACK really discards it.
         let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_mut() {
+        let out = match guard.as_mut() {
             Some(handle) => self
                 .storage
                 .with_user_transaction(handle, || self.execute(stmt, max_rows))
-                .map_err(|e| Self::storage_err("transaction failed", e))?,
+                .map_err(|e| Self::storage_err("transaction failed", e))
+                .and_then(|r| r),
             None => self.execute(stmt, max_rows),
+        };
+        if out.is_err() {
+            self.note_failure();
+        }
+        out
+    }
+
+    /// Mark the open transaction failed, if there is one.
+    ///
+    /// Outside a transaction an error changes nothing: PostgreSQL's own
+    /// transition preserves the idle state, and the next statement runs.
+    fn note_failure(&self) {
+        if self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.txn_failed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -935,33 +990,63 @@ impl PgHandler {
         }
     }
 
-    /// BEGIN / COMMIT / ROLLBACK.
+    /// BEGIN / START TRANSACTION / COMMIT / ROLLBACK, with `AND CHAIN`.
     fn transaction_control(&self, control: TransactionControl) -> PgWireResult<Vec<Response>> {
+        let opens = matches!(
+            control,
+            TransactionControl::Begin | TransactionControl::Start
+        );
         // Whatever the transaction did to the catalog is either committed or
         // discarded once it ends, so the pending map stops being the truth.
-        if !matches!(control, TransactionControl::Begin) {
+        if !opens {
             self.uncommitted
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
         }
         let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
-        let tag = match control {
-            TransactionControl::Begin => {
-                if guard.is_none() {
-                    let handle = self
-                        .storage
-                        .begin_user_transaction()
-                        .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
-                    *guard = Some(handle);
-                    self.in_transaction
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                // A BEGIN inside a transaction is a WARNING in PostgreSQL, not
-                // an error, and the existing transaction continues.
-                "BEGIN"
+        // A COMMIT of a FAILED transaction is a rollback, and PostgreSQL says
+        // so in the command tag: `ROLLBACK`, not `COMMIT`. A client that
+        // believed a `COMMIT` tag would think discarded work had landed.
+        let failed = self
+            .txn_failed
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        let control = match control {
+            TransactionControl::Commit { chain } if failed => {
+                TransactionControl::Rollback { chain }
             }
-            TransactionControl::Commit => {
+            other => other,
+        };
+
+        let begin = |guard: &mut Option<UserTransactionHandle>| -> PgWireResult<()> {
+            if guard.is_none() {
+                let handle = self
+                    .storage
+                    .begin_user_transaction()
+                    .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
+                *guard = Some(handle);
+                self.in_transaction
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.txn_failed
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(())
+        };
+
+        let (tag, chain) = match control {
+            // A BEGIN inside a transaction is a WARNING in PostgreSQL, not an
+            // error, and the existing transaction continues.
+            TransactionControl::Begin => {
+                begin(&mut guard)?;
+                ("BEGIN", false)
+            }
+            // Same statement, different word: the tag is what a client reads
+            // back, and `START TRANSACTION` answers with its own.
+            TransactionControl::Start => {
+                begin(&mut guard)?;
+                ("START TRANSACTION", false)
+            }
+            TransactionControl::Commit { chain } => {
                 if let Some(mut handle) = guard.take() {
                     self.in_transaction
                         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -969,9 +1054,9 @@ impl PgHandler {
                         .commit_user_transaction(&mut handle)
                         .map_err(|e| Self::storage_err("could not commit", e))?;
                 }
-                "COMMIT"
+                ("COMMIT", chain)
             }
-            TransactionControl::Rollback => {
+            TransactionControl::Rollback { chain } => {
                 if let Some(mut handle) = guard.take() {
                     self.in_transaction
                         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -979,10 +1064,26 @@ impl PgHandler {
                         .rollback_user_transaction(&mut handle)
                         .map_err(|e| Self::storage_err("could not roll back", e))?;
                 }
-                "ROLLBACK"
+                ("ROLLBACK", chain)
             }
         };
-        Ok(vec![Response::Execution(Tag::new(tag))])
+        // `AND CHAIN` ends the block and opens another one immediately, so the
+        // connection is still in a transaction when the answer arrives. A
+        // client that chained and was left IDLE would have its next statements
+        // autocommitted one by one.
+        if chain {
+            begin(&mut guard)?;
+        }
+
+        // Not `Execution`: pgwire tracks the transaction status that rides on
+        // every `ReadyForQuery` from these two responses, and a plain
+        // execution tag left every connection reporting IDLE -- inside a
+        // transaction, and after an error inside one.
+        Ok(vec![if opens || chain {
+            Response::TransactionStart(Tag::new(tag))
+        } else {
+            Response::TransactionEnd(Tag::new(tag))
+        }])
     }
 
     /// Execute one planned statement against storage.
