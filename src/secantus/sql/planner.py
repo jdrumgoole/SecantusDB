@@ -5504,25 +5504,40 @@ def _push_filtered(value_expr: Any, fcond: Any, *, wrap: bool = False) -> Any:
     pushes ``None`` (dropped by the paired projection / reduce). ``wrap=True`` boxes
     the value as ``{"v": …}`` so a *matching* NULL survives the drop (Postgres
     ``array_agg`` keeps NULLs; ``string_agg`` / ``jsonb_object_agg`` skip them, so
-    they push the bare value and let ``None`` double as "absent")."""
+    they push the bare value and let ``None`` double as "absent").
+
+    ``wrap`` also marks the NULL-KEEPING aggregates for a second reason: their
+    pushed value is wrapped in ``$ifNull`` so a MISSING field contributes an
+    explicit null element. ``$push`` of a missing field pushes NOTHING, so an
+    unmatched outer-join row produced ``{}`` where Postgres gives ``{NULL}`` —
+    and, worse, left the pushed array unable to tell "no rows" from "one row
+    with no value", which is what the empty-to-NULL rule below needs."""
+    kept = {"$ifNull": [value_expr, None]} if wrap else value_expr
     if fcond is None:
-        return value_expr
-    return {"$cond": [fcond, ({"v": value_expr} if wrap else value_expr), None]}
+        return kept
+    return {"$cond": [fcond, ({"v": kept} if wrap else kept), None]}
 
 
 def _array_agg_project(fname: str, fcond: Any) -> Any:
-    """The projection for an ``array_agg`` field. Without a FILTER the pushed array
-    is emitted as-is; with one, drop the ``None`` sentinels and unbox the ``{v}``
-    wrappers (so matching NULLs are preserved)."""
-    if fcond is None:
-        return f"${fname}"
-    return {
-        "$map": {
-            "input": {"$filter": {"input": f"${fname}", "as": "e", "cond": {"$ne": ["$$e", None]}}},
-            "as": "e",
-            "in": "$$e.v",
+    """The projection for an ``array_agg`` field.
+
+    With a FILTER, drop the ``None`` sentinels and unbox the ``{v}`` wrappers
+    (so matching NULLs are preserved). Either way an EMPTY result becomes NULL:
+    Postgres' `array_agg` over zero contributing rows is NULL, not `{}` — and
+    a caller cannot tell the two apart afterwards, since `{}` is also a legal
+    value. The `$ifNull` on the push side is what makes this safe: a row that
+    contributed a null still leaves an element behind, so only a genuinely
+    empty group reaches here empty."""
+    src: Any = f"${fname}"
+    if fcond is not None:
+        src = {
+            "$map": {
+                "input": {"$filter": {"input": src, "as": "e", "cond": {"$ne": ["$$e", None]}}},
+                "as": "e",
+                "in": "$$e.v",
+            }
         }
-    }
+    return {"$cond": [{"$eq": [{"$size": {"$ifNull": [src, []]}}, 0]}, None, src]}
 
 
 def _jsonb_object_agg_project(fname: str, fcond: Any) -> Any:
@@ -11039,7 +11054,17 @@ def _plan_join_group_select(
                 path, _ = resolve(arr_arg)
                 accumulators[fname] = {"$push": _push_filtered(f"${path}", fcond, wrap=True)}
                 project[fname] = _array_agg_project(fname, fcond)
-            out_columns.append((fname, "json"))
+            # A true `array_agg` types as its ELEMENT's array type; only the
+            # json_agg / jsonb_agg spellings that share this branch are json.
+            # These two join sites hardcoded "json", so `array_agg(k.v)` over a
+            # join reported jsonb where the same call over one table reported
+            # int[].
+            out_columns.append(
+                (
+                    fname,
+                    _array_agg_out_tag(arr_arg, resolve) if _is_true_array_agg(e) else "json",
+                )
+            )
         elif oagg is not None:
             fname = names.fresh(alias or "jsonb_object_agg")
             kpath, _ = resolve(oagg[0])
@@ -11298,7 +11323,17 @@ def _join_grouping_set_branch(
                 path, _ = resolve(arr_arg)
                 accumulators[fname] = {"$push": _push_filtered(f"${path}", fcond, wrap=True)}
                 project[fname] = _array_agg_project(fname, fcond)
-            out_columns.append((fname, "json"))
+            # A true `array_agg` types as its ELEMENT's array type; only the
+            # json_agg / jsonb_agg spellings that share this branch are json.
+            # These two join sites hardcoded "json", so `array_agg(k.v)` over a
+            # join reported jsonb where the same call over one table reported
+            # int[].
+            out_columns.append(
+                (
+                    fname,
+                    _array_agg_out_tag(arr_arg, resolve) if _is_true_array_agg(e) else "json",
+                )
+            )
         elif oagg is not None:
             fname = names.fresh(alias or "jsonb_object_agg")
             kpath, _ = resolve(oagg[0])

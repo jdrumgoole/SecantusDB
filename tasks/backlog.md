@@ -12859,8 +12859,12 @@ Open items from the scout, in descending value:
 Found alongside the `sum` guard fix and deliberately left, because a half-fix
 here trades one wrong answer for another:
 
-1. **`array_agg` returns `{}` where PostgreSQL returns NULL** (zero
-   contributing rows) **and `{}` where PostgreSQL returns `{NULL}`** (one
+1. ~~**`array_agg` returns `{}` where PostgreSQL returns NULL**~~ **FIXED
+   2026-09-05** — both halves landed together as the entry required, and the
+   join-path element type was fixed with them
+   (`tests/test_sql_sweep_twentyfive.py`). The original note, for the record:
+   `array_agg` returned `{}` where PostgreSQL returns NULL (zero
+   contributing rows) and `{}` where PostgreSQL returns `{NULL}` (one
    unmatched outer-join row). Both halves must land together: `$push` of a
    MISSING field pushes nothing, so the pushed array cannot distinguish "no
    rows" from "one row with no value" — wrapping the pushed value in `$ifNull`
