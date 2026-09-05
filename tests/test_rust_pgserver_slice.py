@@ -1893,3 +1893,88 @@ def test_multiranges_bind_in_binary_too(home: Path, binary: bool) -> None:
         ]:
             cur.execute(sql, (value,))
             assert cur.fetchone()[0] == value, value
+
+
+@pytest.mark.parametrize(
+    ("sql", "want"),
+    [
+        ("select 1::int2", 1),
+        ("select 1::int4", 1),
+        ("select 1::int8", 1),
+        ("select 1.5::float4", 1.5),
+        ("select 1.5::float8", 1.5),
+        ("select true", True),
+        ("select 'x'::text", "x"),
+        ("select 'x'::varchar", "x"),
+        ("select 1.50::numeric", Decimal("1.50")),
+        ("select (-1.5)::numeric", Decimal("-1.5")),
+        ("select 0.00001::numeric", Decimal("0.00001")),
+        ("select 100000::numeric", Decimal("100000")),
+        ("select 12345678901234567890.123::numeric", Decimal("12345678901234567890.123")),
+        ("select 'NaN'::numeric", Decimal("NaN")),
+        ("select array[1,2,3]::int4[]", [1, 2, 3]),
+        ("select array['a','b']::text[]", ["a", "b"]),
+        ("select array[1.50]::numeric[]", [Decimal("1.50")]),
+        ("select null::int4", None),
+        ("select null::numeric", None),
+    ],
+)
+def test_binary_result_columns(home: Path, sql: str, want: object) -> None:
+    """A cursor that asks for BINARY results is answered in binary.
+
+    The values were always right -- the server described every column as text
+    and the client duly decoded text -- so this asserts the FORMAT as well as
+    the value, which is the only way the divergence shows up at all.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        for binary in (False, True):
+            cur = conn.cursor(binary=binary)
+            cur.execute(sql)
+            got = cur.fetchone()[0]
+            assert cur.pgresult.fformat(0) == int(binary), sql
+            if isinstance(want, float):
+                assert got == pytest.approx(want)
+            elif isinstance(want, Decimal) and want.is_nan():
+                assert got.is_nan()
+            else:
+                assert got == want
+
+
+def test_a_type_without_a_binary_encoding_stays_text(home: Path) -> None:
+    """A column this server cannot render in binary is described as text.
+
+    PostgreSQL honours the request for every type. This one honours it for the
+    types it can encode exactly and describes the rest as text, which the
+    client reads correctly because the format travels per column -- the gap is
+    in `tasks/backlog.md`, not hidden behind a wrong answer.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.cursor().execute("set timezone to 'UTC'")
+        cur = conn.cursor(binary=True)
+        cur.execute("select '2026-01-01 12:00'::timestamp")
+        assert cur.pgresult.fformat(0) == 0
+        assert cur.fetchone()[0] == dt.datetime(2026, 1, 1, 12, 0)
+
+
+def test_a_server_cursor_describes_its_portal(home: Path) -> None:
+    """psycopg's server cursors, which describe the cursor's PORTAL.
+
+    PostgreSQL exposes a declared cursor as a portal of the same name, and
+    psycopg describes it straight after the DECLARE -- before any FETCH -- to
+    learn the columns. Without an answer for that describe every server cursor
+    failed on its first row.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        # A server cursor needs a transaction to declare into, which the
+        # autocommit connection the other tests use does not have.
+        conn.autocommit = False
+        with conn.cursor("c1") as cur:
+            cur.execute("select * from generate_series(1, 5) as n")
+            assert [d.name for d in cur.description] == ["n"]
+            assert cur.fetchmany(2) == [(1,), (2,)]
+            assert cur.fetchone() == (3,)
+            assert cur.fetchall() == [(4,), (5,)]
+        conn.rollback()
+        with conn.cursor("c2") as cur:
+            cur.execute("select * from generate_series(1, 3) as n")
+            assert list(cur) == [(1,), (2,), (3,)]

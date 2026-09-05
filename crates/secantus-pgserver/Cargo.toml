@@ -27,6 +27,9 @@ secantus-storage = { path = "../secantus-storage" }
 # WiredTiger close entirely -- which loses acknowledged writes.
 ctrlc = { version = "3", features = ["termination"] }
 bytes = "1.12.1"
+# The trait pgwire encodes BINARY values through -- same version as its own,
+# or the `ToSql` we implement is a different trait from the one it calls.
+postgres-types = "0.2.14"
 
 [[bin]]
 name = "secantusd-pg"

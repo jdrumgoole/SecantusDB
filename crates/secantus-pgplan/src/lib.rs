@@ -2698,6 +2698,61 @@ pub fn parse_numeric(text: &str) -> Result<Decimal128> {
 /// backslash or whitespace -- or one that is empty, or that spells `NULL` --
 /// must be quoted, or reading the array back would split it in the wrong place
 /// or turn a literal `"NULL"` string into a null.
+/// A `numeric` rendered the way PostgreSQL renders one: PLAIN, never in
+/// exponent notation.
+///
+/// `Decimal128`'s own rendering keeps the scale (`1.50`, not `1.5`), which is
+/// part of a numeric's value and must survive -- but it also falls back to
+/// `E` notation for large and small magnitudes, and PostgreSQL never does:
+/// `1.5e20::numeric` is `150000000000000000000` there and was `1.5E+20` here,
+/// in the row, in a `::text` cast and inside an array. A value the client
+/// cannot tell from the right one only by luck of `Decimal` comparing equal.
+///
+/// The non-finite renderings (`NaN`, `Infinity`) carry no exponent and pass
+/// through untouched.
+pub fn plain_numeric_text(text: &str) -> String {
+    let Some(epos) = text.find(['e', 'E']) else {
+        return text.to_string();
+    };
+    let (mantissa, exp) = text.split_at(epos);
+    let Ok(exp) = exp[1..].parse::<i32>() else {
+        return text.to_string();
+    };
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", mantissa.strip_prefix('+').unwrap_or(mantissa)),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i.to_string(), f.to_string()),
+        None => (mantissa.to_string(), String::new()),
+    };
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return text.to_string();
+    }
+    let mut digits = format!("{int_part}{frac_part}");
+    // Where the point sits, counted from the left of the digit string.
+    let mut point = int_part.len() as i32 + exp;
+    if point <= 0 {
+        // Padding on the left puts the point just after the digits added,
+        // which is position 1 whatever it was before.
+        digits = format!("{}{digits}", "0".repeat((1 - point) as usize));
+        point = 1;
+    }
+    while (digits.len() as i32) < point {
+        digits.push('0');
+    }
+    let (i, f) = digits.split_at(point as usize);
+    if f.is_empty() {
+        format!("{sign}{i}")
+    } else {
+        format!("{sign}{i}.{f}")
+    }
+}
+
 pub fn render_array_element_text(v: &Bson) -> String {
     render_array_element(v)
 }
@@ -2709,7 +2764,7 @@ fn render_array_element(v: &Bson) -> String {
         Bson::Int32(i) => return i.to_string(),
         Bson::Int64(i) => return i.to_string(),
         Bson::Double(d) => return d.to_string(),
-        Bson::Decimal128(d) => return d.to_string(),
+        Bson::Decimal128(d) => return plain_numeric_text(&d.to_string()),
         Bson::Boolean(b) => return (if *b { "t" } else { "f" }).to_string(),
         Bson::Array(items) => return render_array(items),
         other => format!("{other:?}"),
@@ -2882,8 +2937,10 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             }
         }
         Bson::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
-        // Decimal128's own rendering keeps the scale (`1.50`, not `1.5`).
-        Bson::Decimal128(d) => d.to_string(),
+        // Decimal128's own rendering keeps the scale (`1.50`, not `1.5`), and
+        // the expansion drops its exponent notation, which PostgreSQL's
+        // numeric output never uses.
+        Bson::Decimal128(d) => plain_numeric_text(&d.to_string()),
         Bson::Document(_) if Interval::from_bson(v).is_some() => {
             render_interval(&Interval::from_bson(v).expect("checked"))
         }

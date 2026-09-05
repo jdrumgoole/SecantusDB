@@ -4537,6 +4537,25 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   arrays / ranges / multiranges; a type it does not have cannot be decoded into
   one — what remains unhandled there is `uuid` / `inet` / `cidr` / `bytea` /
   `json`, all of which are missing TYPES, not decoder gaps).
+- **Rust PG server: a result column is only sent in the BINARY format when its
+  type is one this server can encode exactly.** `bool`, `int2`/`int4`/`int8`,
+  `float4`/`float8`, `text`/`varchar`/`bpchar`/`name`/`char`, `numeric` and
+  arrays of those honour the client's request; every other type is described as
+  TEXT even when binary was asked for. PostgreSQL honours the request for every
+  type. The client still reads the value correctly — the format travels per
+  column in the `RowDescription` — so this is a fidelity gap, not a wrong
+  answer, and the missing half is `date` / `time` / `timestamp` / `timestamptz`
+  / `interval` / ranges / multiranges / `json`, each needing its own binary
+  encoder.
+
+  A MIXED request (some columns binary, some text in one `Bind`) is answered
+  entirely in text. No measured client sends one.
+- **Rust PG server: a cursor's rows are encoded at DECLARE, in TEXT, whatever
+  format the FETCH asks for.** psycopg's `conn.cursor(name, binary=True)`
+  therefore reads text (correctly — the format is described per column, and the
+  cursor's schema is the one both `Describe` and `FETCH` report). Making it
+  honour the FETCH's format means keeping the cursor's rows as VALUES and
+  encoding per fetch, rather than materialising `DataRow`s once.
 - **Rust PG server: a multidimensional array sent as a BINARY parameter is
   refused (`0A000`)**, matching the refusal when returning one. Both lift
   together when array wire encoding grows a second dimension.
