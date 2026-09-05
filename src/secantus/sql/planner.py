@@ -7080,9 +7080,19 @@ def _guard_sum_null(
     """Postgres' SUM over zero non-null contributing values is NULL; Mongo's
     ``$sum`` yields 0. Pair the sum with a non-null contribution counter and
     rewrite the output to NULL when nothing contributed (``value`` is the raw
-    aggregation expression the sum reads, before any FILTER folding)."""
+    aggregation expression the sum reads, before any FILTER folding).
+
+    The counter must collapse MISSING into NULL before comparing, exactly as
+    ``COUNT(col)`` does. An unmatched outer-join row carries no key at all for
+    the non-driving side, and under mongod's missing-vs-null rule a bare
+    ``$ne: [<missing>, null]`` is TRUE — so the guard counted a contribution
+    that never happened and kept the 0. That is why
+    ``SELECT j.id, sum(k.v) FROM j LEFT JOIN k ON k.jid = j.id GROUP BY j.id``
+    answered 0 for an unmatched row while the same shape over a row whose value
+    was genuinely NULL answered NULL correctly: only the MISSING case slipped
+    through."""
     nn = names.fresh(f"{fname}__nn")
-    matched = {"$ne": [value, None]}
+    matched = {"$ne": [{"$ifNull": [value, None]}, None]}
     cond = {"$and": [filter_cond, matched]} if filter_cond is not None else matched
     accumulators[nn] = {"$sum": {"$cond": [cond, 1, 0]}}
     reductions[fname] = {"$cond": [{"$gt": [f"${nn}", 0]}, f"${fname}", None]}
@@ -8768,6 +8778,16 @@ def _having_to_match(
         if agg not in agg_fields:
             fname = f"__having_{len(agg_fields)}"
             accumulators[fname] = acc
+            if func == "sum":
+                # HAVING needs the same NULL guard the select list gets, or
+                # `HAVING sum(x) IS NULL` can never be true — the accumulator
+                # answers 0 for a group that contributed nothing.
+                value = (
+                    f"${table.field_for(col)}"
+                    if col is not None
+                    else _agg_arg_to_expr(_agg_expr_arg(term), table)
+                )
+                _guard_sum_null(fname, value, fcond, names, accumulators, reductions)
             agg_fields[agg] = fname
         return agg_fields[agg], tag
 
@@ -11817,6 +11837,17 @@ def _join_having_to_match(
         if key not in agg_fields:
             fname = f"__having_{len(agg_fields)}"
             accumulators[fname] = acc
+            if func == "sum" and arg is not None and names is not None and reductions is not None:
+                # Same NULL guard the join select list gets: without it
+                # `HAVING sum(k.v) IS NULL` is never true, because the
+                # accumulator answers 0 for a group that contributed nothing.
+                stripped = _strip_identity_wrappers(arg)
+                value = (
+                    f"${resolve(stripped)[0]}"
+                    if _is_field_node(stripped)
+                    else _to_agg_expr(stripped, resolve)
+                )
+                _guard_sum_null(fname, value, fcond, names, accumulators, reductions)
             agg_fields[key] = fname
         return agg_fields[key], tag
 

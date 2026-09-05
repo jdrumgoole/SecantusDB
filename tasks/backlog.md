@@ -1912,28 +1912,30 @@ PostgreSQL 14.13; `tests/test_sql_sweep_twelve.py` pins the fixes.
 state, isolation levels, READ ONLY and transactional DDL rollback all match, so
 that surface needs no work. What is open:
 
-- [ ] **`sum()` over an empty GROUP returns 0; Postgres returns NULL.**
-      `SELECT j.id, sum(k.v) FROM j LEFT JOIN k ON k.jid = j.id GROUP BY j.id`
-      answers 0 for a `j` row with no match, where PG answers NULL — a common
-      reporting query, and silently wrong. **Only `sum` is affected**: `count`
-      is correctly 0, and `avg` / `min` / `max` are correctly NULL, because
-      Mongo's `$sum` is the one accumulator that folds an empty set to zero
-      rather than null. The ungrouped `SELECT sum(n) ... WHERE false` is also
-      already correct.
+- [x] ~~**`sum()` over an empty GROUP returns 0.**~~ **FIXED 2026-09-05.**
+      The estimate in this entry was WRONG, twice over, and the correction is
+      worth more than the item was: it was filed as a 16-site refactor needing
+      a companion counter wired at every accumulator registration. The
+      companion mechanism ALREADY EXISTED (`_guard_sum_null`) and was already
+      wired at six sites.
 
-      The fix is not a one-liner: a Mongo `$group` accumulator is a single
-      operator, and NONE of them sums-or-nulls, so distinguishing "summed
-      nothing" from "summed to zero" needs a COMPANION field (a non-null count)
-      plus a projection that returns NULL when it is zero — the shape
-      `_register_numeric_stat` already uses.
+      The actual defect was ONE LINE inside that guard: it counted
+      contributions with a bare `$ne: [value, null]`, which under mongod's
+      missing-vs-null rule is TRUE for a MISSING field. An unmatched
+      outer-join row has no key at all for the non-driving side, so the guard
+      counted a contribution that never happened and kept the 0. Collapsing
+      missing into null (`$ifNull`, exactly what `COUNT(col)` does — its
+      comment describes this same trap) fixes every shape. That is also why
+      the bug looked so oddly specific: a group holding a genuinely NULL value
+      was always right, and only the no-matching-row case was wrong.
 
-      **Counted, not estimated (2026-09-03): that is 16 registration sites** —
-      4 calling `_accumulator_for` directly, 5 through `_accumulator`, 5 through
-      `_join_accumulator`, and 2 HAVING-dedup paths that need no companion. So
-      this is a REFACTOR of the accumulator-registration duplication (making
-      `_accumulator_for` return an optional companion spec that one shared
-      helper consumes), not a patch — and it is on the hottest aggregate path.
-      Sized here so the next session does not rediscover the cost mid-change.
+      Plus two `HAVING` paths that never called the guard — the ones this
+      entry dismissed as "needing no companion". Without it
+      `HAVING sum(x) IS NULL` can never be true.
+
+      **The lesson is the one CLAUDE.md already states**: this entry was sized
+      by reading code, and reading found a refactor where running found a
+      one-line fix. Reproduce first.
 - [ ] **`NOT IN (<subquery with UNION>)` is `0A000 unsupported subquery`.**
       `_inner_row_scopes` handles a single SELECT, not a set operation. Note the
       NULL semantics matter here too: PG's `NOT IN` over a set containing NULL
@@ -12667,3 +12669,24 @@ Open items from the scout, in descending value:
 3. **Hypothetical-set aggregates are unsupported** — `rank(2) WITHIN GROUP
    (ORDER BY id)` is `0A000`. `percentile_cont` / `percentile_disc` / `mode`
    all work.
+
+## `array_agg` and `string_agg` over an unmatched outer-join row (2026-09-05)
+
+Found alongside the `sum` guard fix and deliberately left, because a half-fix
+here trades one wrong answer for another:
+
+1. **`array_agg` returns `{}` where PostgreSQL returns NULL** (zero
+   contributing rows) **and `{}` where PostgreSQL returns `{NULL}`** (one
+   unmatched outer-join row). Both halves must land together: `$push` of a
+   MISSING field pushes nothing, so the pushed array cannot distinguish "no
+   rows" from "one row with no value" — wrapping the pushed value in `$ifNull`
+   fixes that, and only then can an empty array be mapped to NULL in
+   `_array_agg_project`. Doing just the projection half would turn the
+   unmatched-row case from `{}` into NULL, where PostgreSQL wants `{NULL}`.
+   Note the `$push` sites are shared with `string_agg` / `jsonb_agg` /
+   `range_agg`, whose NULL rules differ, so the wrap must be per-aggregate.
+   `array_agg` also reports oid 3802 (jsonb) where PostgreSQL reports the
+   element array type (1007 for `int[]`).
+2. **`string_agg(<expression>, ',')` over a join is `0A000 expected a column`**
+   — the join HAVING/select path takes a column, not an expression, for
+   `string_agg`. The single-table path accepts one.
