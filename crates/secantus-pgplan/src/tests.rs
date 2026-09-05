@@ -1833,3 +1833,52 @@ fn a_numeric_never_renders_in_exponent_notation() {
     // rather than mangled into one.
     assert_eq!(plain_numeric_text("elephant"), "elephant");
 }
+
+/// The bounds of a series arrive as PARAMETERS far more often than as
+/// literals, and an untyped parameter arrives as TEXT.
+///
+/// Every answer here was taken from PostgreSQL 14: a text bound is read as an
+/// integer, a NULL bound makes an EMPTY series rather than an error, and a
+/// `float8` bound matches no overload there -- this server used to truncate
+/// one, which is a wrong answer where a real server refuses.
+#[test]
+fn a_series_reads_its_bounds_from_parameters() {
+    let series = |params: &[Bson]| -> Series {
+        match plan_with_params("SELECT * FROM generate_series(1, $1)", &lookup, params) {
+            Ok(Statement::Select(sel)) => sel.series.expect("a series"),
+            other => panic!("wrong statement: {other:?}"),
+        }
+    };
+    assert_eq!(
+        series(&[Bson::String("4".into())]).values(),
+        vec![1, 2, 3, 4]
+    );
+    // Whitespace around a bound is accepted, as PostgreSQL's integer parser is.
+    assert_eq!(
+        series(&[Bson::String(" 3 ".into())]).values(),
+        vec![1, 2, 3]
+    );
+    // A NULL bound: zero rows, not an error.
+    assert!(series(&[Bson::Null]).values().is_empty());
+
+    let err = plan_with_params(
+        "SELECT * FROM generate_series(1, $1)",
+        &lookup,
+        &[Bson::String("x".into())],
+    )
+    .expect_err("not an integer");
+    assert_eq!(err.sqlstate(), "22P02");
+    assert_eq!(
+        err.to_string(),
+        "invalid input syntax for type integer: \"x\""
+    );
+
+    // There is no `generate_series(int, float8)` in PostgreSQL.
+    let err = plan("SELECT * FROM generate_series(1, 3::float8)", &lookup)
+        .expect_err("no float8 overload");
+    assert_eq!(err.sqlstate(), "42883");
+    assert_eq!(
+        err.to_string(),
+        "function generate_series(integer, double precision) does not exist"
+    );
+}
