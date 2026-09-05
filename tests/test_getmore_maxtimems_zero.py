@@ -98,7 +98,20 @@ def test_explicit_zero_does_not_pick_up_a_later_event(server):
 
 
 def test_absent_max_time_ms_still_waits_and_delivers(server):
-    """The blocking path must keep working: no maxTimeMS means wait for an event."""
+    """The blocking path must keep working: no maxTimeMS means wait for an event.
+
+    The two halves of that are asserted SEPARATELY, because tying them together
+    made this test depend on a race it cannot win reliably. It used to insert
+    after 150 ms and assert that ONE getMore came back with the event -- which
+    holds only while the insert lands inside the server's 1 s default wait. On a
+    loaded runner the inserting thread can be scheduled later than that, the
+    window closes empty, and the assert fails with ``[] == ['insert']``. Seen on
+    macOS CI (2026-09-05) and reproduced here by delaying the insert past 1 s.
+
+    Delivering the event on the NEXT getMore is correct behaviour, not a bug, so
+    the fix is to stop asserting which window it arrives in -- while keeping the
+    blocking property that the single window was implicitly standing in for.
+    """
     client = pymongo.MongoClient(
         f"mongodb://127.0.0.1:{server.port}",
         directConnection=True,
@@ -109,6 +122,22 @@ def test_absent_max_time_ms_still_waits_and_delivers(server):
         db.create_collection("c")
         cid = _open_change_stream(db, "c")
 
+        # (1) IT WAITS. With nothing pending, an absent maxTimeMS must block
+        #     rather than poll once and return -- the inverse of the explicit
+        #     zero pinned above. Deliberately not a tight bound: the point is to
+        #     tell "waited" from "returned instantly", and `maxTimeMS: 0` in the
+        #     first test returns in well under 400 ms.
+        started = time.perf_counter()
+        idle = db.command({"getMore": cid, "collection": "c"})
+        idle_ms = (time.perf_counter() - started) * 1000
+        assert idle["cursor"]["nextBatch"] == []
+        assert idle_ms >= 500, (
+            f"an absent maxTimeMS returned after {idle_ms:.0f}ms; it must WAIT, "
+            "not poll once like an explicit maxTimeMS: 0"
+        )
+
+        # (2) IT DELIVERS. An insert issued while a getMore is blocking comes
+        #     back -- in that window or, on a slow box, the one after it.
         def insert_later():
             time.sleep(0.15)
             db["c"].insert_one({"x": 1})
@@ -116,8 +145,11 @@ def test_absent_max_time_ms_still_waits_and_delivers(server):
         thread = threading.Thread(target=insert_later)
         thread.start()
         try:
-            reply = db.command({"getMore": cid, "collection": "c"})
-            batch = reply["cursor"]["nextBatch"]
+            deadline = time.monotonic() + 20
+            batch: list = []
+            while not batch and time.monotonic() < deadline:
+                reply = db.command({"getMore": cid, "collection": "c"})
+                batch = reply["cursor"]["nextBatch"]
             assert [e["operationType"] for e in batch] == ["insert"]
         finally:
             thread.join(timeout=5)
