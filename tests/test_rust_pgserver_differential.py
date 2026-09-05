@@ -117,6 +117,11 @@ SETUP = [
 ]
 
 QUERIES = [
+    # A series' bounds, which clients write as parameters far more often than
+    # as literals; the parameterised shapes are in PARAMETERISED below.
+    "SELECT * FROM generate_series(1, null)",
+    "SELECT * FROM generate_series(null::int4, 3)",
+    "SELECT * FROM generate_series(1, 10, null)",
     # A numeric NEVER renders in exponent notation, whatever its magnitude --
     # in the row, through a `::text` cast, or inside an array. Decimal128's own
     # rendering does, and `1.5e20` came back as `1.5E+20` against PostgreSQL's
@@ -697,6 +702,11 @@ def test_query_matches_postgres(
 # server implemented that path it answered "OK" with zero rows, which is a wrong
 # answer rather than a missing feature, and no literal-SQL case could catch it.
 PARAMETERISED = [
+    ("SELECT * FROM generate_series(1, %s)", (4,)),
+    ("SELECT * FROM generate_series(%s, 10, %s)", (1, 3)),
+    ("SELECT generate_series(1, %s)", (3,)),
+    ("SELECT * FROM generate_series(1, %s)", (None,)),
+    ("SELECT * FROM generate_series(1, %s) ORDER BY 1 DESC LIMIT 2", (5,)),
     ("SELECT id FROM d WHERE n > %s", (1,)),
     ("SELECT id FROM d WHERE n = %s", (3,)),
     ("SELECT id FROM d WHERE n <> %s", (1,)),
@@ -857,6 +867,9 @@ ERROR_QUERIES = [
     "SELECT '{x}'::int4multirange",
     "SELECT '[1,5)'::int4multirange",
     "SELECT * FROM generate_series(1,5,0)",
+    # No `generate_series(int, float8)` overload exists; this server used to
+    # truncate the bound and answer rows.
+    "SELECT * FROM generate_series(1, 3::float8)",
 ]
 
 

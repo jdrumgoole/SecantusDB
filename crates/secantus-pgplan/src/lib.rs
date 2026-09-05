@@ -61,6 +61,11 @@ pub enum Error {
     /// A parameter that is the wrong VALUE rather than the wrong shape ->
     /// 22023. PostgreSQL distinguishes this from the generic data class.
     InvalidParameter(String),
+    /// A function call whose ARGUMENT TYPES match no overload -> 42883.
+    ///
+    /// Distinct from `Unsupported`: PostgreSQL has no such function either, so
+    /// this is the answer a real server gives rather than a gap in this one.
+    UndefinedFunction(String),
     /// More than one command where only one is allowed -> 42601.
     ///
     /// PostgreSQL accepts a multi-command string over the SIMPLE query
@@ -86,7 +91,7 @@ impl std::fmt::Display for Error {
             Error::DivisionByZero => write!(f, "division by zero"),
             Error::NumericOutOfRange(m) => write!(f, "{m}"),
             Error::DataException(m) | Error::InvalidParameter(m) => write!(f, "{m}"),
-            Error::InvalidColumnReference(m) => write!(f, "{m}"),
+            Error::InvalidColumnReference(m) | Error::UndefinedFunction(m) => write!(f, "{m}"),
             Error::MultipleCommands => {
                 write!(
                     f,
@@ -115,6 +120,7 @@ impl Error {
             Error::DataException(_) => "22000",     // data_exception
             Error::InvalidParameter(_) => "22023",  // invalid_parameter_value
             Error::InvalidColumnReference(_) => "42P10", // invalid_column_reference
+            Error::UndefinedFunction(_) => "42883", // undefined_function
             Error::MultipleCommands => "42601",     // syntax_error, as PostgreSQL reports it
         }
     }
@@ -790,19 +796,40 @@ fn series_from_args(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result
             "function generate_series does not exist with that argument list".into(),
         ));
     }
-    let int_at = |i: usize| -> Result<i64> {
+    // `None` is a NULL argument, which is not an error: PostgreSQL answers a
+    // series with any NULL bound with ZERO ROWS.
+    let int_at = |i: usize| -> Result<Option<i64>> {
         match const_value(&f.args[i], params)? {
-            Bson::Int32(v) => Ok(i64::from(v)),
-            Bson::Int64(v) => Ok(v),
-            Bson::Double(v) => Ok(v as i64),
+            Bson::Null => Ok(None),
+            Bson::Int32(v) => Ok(Some(i64::from(v))),
+            Bson::Int64(v) => Ok(Some(v)),
+            // A bound parameter sent with no type arrives as TEXT, and
+            // PostgreSQL resolves it against the function's own signature --
+            // `generate_series(1, $1)` reads `$1` as an integer. Refusing it
+            // made every parameterised series fail, which is how clients
+            // overwhelmingly write one.
+            Bson::String(text) => text.trim().parse::<i64>().map(Some).map_err(|_| {
+                Error::InvalidText(format!("invalid input syntax for type integer: \"{text}\""))
+            }),
+            // There is no `generate_series(int, float8)` in PostgreSQL, and
+            // this server used to truncate one instead -- a wrong answer where
+            // a real server refuses. (The `numeric` overload DOES exist; that
+            // one is a gap, and says so.)
+            Bson::Double(_) => Err(Error::UndefinedFunction(
+                "function generate_series(integer, double precision) does not exist".into(),
+            )),
             other => Err(Error::Unsupported(format!(
                 "generate_series over {}",
                 inferred_type(&other)
             ))),
         }
     };
-    let step = if f.args.len() == 3 { int_at(2)? } else { 1 };
-    if step == 0 {
+    let step = if f.args.len() == 3 {
+        int_at(2)?
+    } else {
+        Some(1)
+    };
+    if step == Some(0) {
         // 22023 invalid_parameter_value: the argument is a number of the right
         // shape whose VALUE cannot work, which PostgreSQL separates from the
         // generic data class.
@@ -810,12 +837,23 @@ fn series_from_args(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result
             "step size cannot equal zero".into(),
         ));
     }
-    Ok(Series {
-        start: int_at(0)?,
-        stop: int_at(1)?,
-        step,
-        column: "generate_series".to_string(),
-    })
+    let (start, stop) = (int_at(0)?, int_at(1)?);
+    match (start, stop, step) {
+        (Some(start), Some(stop), Some(step)) => Ok(Series {
+            start,
+            stop,
+            step,
+            column: "generate_series".to_string(),
+        }),
+        // A NULL bound: an EMPTY series rather than an error, spelled as a
+        // range that generates nothing.
+        _ => Ok(Series {
+            start: 1,
+            stop: 0,
+            step: 1,
+            column: "generate_series".to_string(),
+        }),
+    }
 }
 
 /// A `SELECT` whose source is a generated series.

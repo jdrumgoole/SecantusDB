@@ -2033,3 +2033,38 @@ def test_a_failed_transaction_refuses_everything_until_it_ends(home: Path) -> No
         assert cur.statusmessage == "COMMIT"
         cur.execute("select count(*) from ft")
         assert cur.fetchone()[0] == 1
+
+
+def test_a_series_takes_its_bounds_as_parameters(home: Path) -> None:
+    """`generate_series(1, %s)` — the way clients actually write one.
+
+    An untyped bound parameter arrives as text, and PostgreSQL resolves it
+    against the function's own signature. Refusing it made every parameterised
+    series fail, which is most of them.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("select * from generate_series(1, %s)", (4,))
+        assert [r[0] for r in cur.fetchall()] == [1, 2, 3, 4]
+        cur.execute("select * from generate_series(%s, 10, %s)", (1, 3))
+        assert [r[0] for r in cur.fetchall()] == [1, 4, 7, 10]
+        cur.execute("select generate_series(1, %s)", (3,))
+        assert [r[0] for r in cur.fetchall()] == [1, 2, 3]
+        cur.execute("select * from generate_series(1, %s) order by 1 desc limit 2", (5,))
+        assert [r[0] for r in cur.fetchall()] == [5, 4]
+
+        # A NULL bound is an EMPTY series, not an error.
+        for sql, params in [
+            ("select * from generate_series(1, %s)", (None,)),
+            ("select * from generate_series(1, null)", ()),
+            ("select * from generate_series(1, 10, null)", ()),
+        ]:
+            cur.execute(sql, params)
+            assert cur.fetchall() == [], sql
+
+        # A bound that is not an integer, and one whose type has no overload.
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as text_err:
+            cur.execute("select * from generate_series(1, %s)", ("x",))
+        assert 'invalid input syntax for type integer: "x"' in str(text_err.value)
+        with pytest.raises(psycopg.errors.UndefinedFunction):
+            cur.execute("select * from generate_series(1, 3::float8)")

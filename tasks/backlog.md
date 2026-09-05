@@ -4535,6 +4535,19 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   a `conn.transaction()` block nests inside an open transaction -- which it can
   now see -- so tests that used to pass by never noticing the outer transaction
   fail here instead. It is the next blocker in `test_transaction.py`.
+- **Rust PG server: `generate_series` with EVERY bound a small-int parameter is
+  accepted where PostgreSQL refuses it as ambiguous.** `generate_series(%s, %s,
+  %s)` with `(1, 10, 3)` sends three `int2`s, and PostgreSQL answers `42725`
+  *"function generate_series(smallint, smallint, smallint) is not unique"* --
+  it cannot choose between the int4 / int8 / numeric overloads. This server
+  answers rows. Matching it needs the parameters' DECLARED OIDS threaded into
+  the planner, which today sees only decoded values; every other argument shape
+  matches (19-case probe, 2026-09-05).
+- **Rust PG server: `generate_series` over `numeric` is refused (`0A000`).**
+  PostgreSQL has a `generate_series(numeric, numeric [, numeric])` overload, so
+  `generate_series(1, 3, 0.5)` walks by halves there and is refused here. The
+  series carries `i64` bounds; a numeric series needs decimal bounds and a
+  decimal-valued output column.
 - **Rust PG server: range and multirange OPERATORS are unsupported.** Both type
   families themselves (literals, constructors, casts, canonicalisation, merging,
   parameters in both wire formats) are in; `@>` / `<@` / `&&` / `-|-` and the

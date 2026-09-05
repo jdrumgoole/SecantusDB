@@ -1191,7 +1191,40 @@ throughout. `scratchpad/pgprobe.sh` now gives every probe run its own `mktemp`
 directory and waits for the port to be free. **A harness that can manufacture a
 storage panic will eventually hide a real one.**
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181 -> 2219 (0.35 measured +29 on a pre-0.34 base and is not in this line).**
+### 0.37 a series whose bounds are parameters (2026-09-05)
+
+**2233 -> 2256, +28 / -5** (the five are the `__del__` unraisable-warning churn
+in the cursor tests, which flips between runs on identical code).
+
+`generate_series(1, $1)` was refused with *"generate_series over text is not
+supported yet"*. An untyped bound parameter arrives as TEXT and PostgreSQL
+resolves it against the function's SIGNATURE; this server checked the decoded
+BSON type and gave up. **A ranking entry that names a TYPE (`over text`) is
+usually about where the value CAME FROM, not about what the user wrote** -- no
+client sends a text series bound on purpose.
+
+Two more from the same 19-shape probe:
+
+* A NULL bound is an EMPTY result on PostgreSQL, not an error.
+* `generate_series(1, 3::float8)` matches NO overload there (`42883`) and this
+  server TRUNCATED the bound and answered rows -- more permissive than the
+  oracle, which is the same class of wrong answer as any other. Fixed by
+  refusing, which needed a new `UndefinedFunction` error class.
+
+**Left divergent, both recorded:** all-`int2`-parameter bounds
+(`generate_series(%s,%s,%s)`), which PostgreSQL refuses as AMBIGUOUS (`42725`)
+and needs parameter OIDS in the planner to reproduce; and the `numeric`
+overload, which needs decimal bounds.
+
+**Two harness traps in one sitting, both of which produced a confident wrong
+answer:** the probe pattern reused a fixed storage path (see the WT_PANIC note
+in 0.36), and then the FIRST run of the fixed probe reported 19 divergences of
+19 -- because an older server was still listening on the port, so every
+measurement was of the previous binary. `scratchpad/pgprobe.sh` now kills by
+PORT, waits for it, and REFUSES TO RUN unless the process it started is the one
+answering.
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181 -> 2219 -> 2256 (0.35 measured +29 on a pre-0.34 base and is not in this line).**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the
