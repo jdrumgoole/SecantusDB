@@ -335,7 +335,9 @@ The standing gate is
 finds something belongs there, or the next session re-finds it.
 
 **Estimates from READING code have been unreliable; estimates from RUNNING it
-have not.** Four cases now, every one wrong in the expensive direction:
+have not.** Six cases now, and note the estimate can be wrong in EITHER
+direction — the first four all overstated the work, the last two show it cuts
+both ways:
 
 - `_pg_expandarray(...).x` was called a planner slice and advised against — the
   inference already existed, and a wider bug sat one level above it.
@@ -347,10 +349,30 @@ have not.** Four cases now, every one wrong in the expensive direction:
 - The missing-vs-null fix was sized as "a sentinel in `expressions.py`, which
   touches every operator". The sentinel already existed; only the comparison
   operators failed to use it.
+- **`sum()` over an empty GROUP was filed as a 16-site refactor** — a companion
+  counter to be wired at every accumulator registration. The count was made by
+  reading the call sites, and written into the backlog as "counted, not
+  estimated". The companion mechanism ALREADY EXISTED and was already wired at
+  six sites; the defect was ONE LINE inside it (a bare `$ne: [x, null]` that is
+  true for a MISSING field), plus two HAVING paths the entry had explicitly
+  dismissed as not needing it. Fixed 2026-09-05.
+- **`LATERAL <srf>` was sized as a source rewrite** — wrap the bare call in the
+  `SELECT` it is shorthand for. That was tried, twice. It clears the first
+  error and lands on the next; the real blocker is that NO planner can derive
+  the output shape of a FROM-less set-returning projection, and the element
+  type has to come from the outer column's declared array type. Still open, now
+  with a real map in `tasks/backlog.md`.
 
 So: **reproduce an item before working it, and size it from a probe.** A
 fixture that is unlucky in one dimension can turn a narrow bug into what looks
-like a week of work.
+like a week of work — and a plausible-looking site count can turn a one-line
+fix into a refactor nobody starts.
+
+**A "counted, not estimated" note in the backlog is still a reading, not a
+measurement.** Both entries above carried confident sizing written by a
+previous session. Re-derive from a probe anyway; the cost of re-measuring is
+minutes, and the cost of trusting the number was, in one case, an item left
+untouched for two days because it looked too expensive to start.
 
 **Three bug shapes recur often enough to grep for.** Each has produced multiple
 real defects:
@@ -380,6 +402,40 @@ seconds; only the oracle says which side to move. Use both.
 missing `_secantus_core` silently uncollects ~1700 parity tests and still exits
 0. Compare the count against the last known-good run before trusting it — that
 is the only thing that catches it.
+
+## Probes lie in specific, repeatable ways
+
+Every finding here comes from a differential probe, so a probe that is quietly
+broken is worse than no probe: it produces a number that looks like evidence.
+Four distinct failures in one 2026-09 campaign, each of which produced a
+confident and WRONG conclusion before it was caught:
+
+- **A client-side error looks like agreement.** psycopg's COPY API is on the
+  CURSOR, so `conn.copy(...)` raised `AttributeError` — identically on both
+  servers, which the differential read as a match. Twenty of thirty-four
+  scenarios were vacuous and the run reported 33/34 passing, hiding five real
+  divergences. **Report the exception TYPE alongside the SQLSTATE, and count a
+  both-sides-non-database-error as VACUOUS.**
+- **A normalising cast puts one code path in front of every assertion.** A
+  full-text corpus wrote `to_tsvector(...)::text` on every line to make the
+  output comparable — and that cast was itself one of the bugs, so all 27 lines
+  inherited it. Reported 23 divergences; the real count was 13, with the
+  opposite diagnosis (`to_tsvector` looked broken and was fine). **Compare
+  values directly wherever the client can render them.**
+- **State bleeds between scenarios.** A notification queued by an earlier
+  LISTEN/NOTIFY scenario is still deliverable, and a `stop_after=1` drain
+  returns it — reading as the current scenario delivering something it never
+  sent. That produced a convincing false "delivers twice". **Reset to empty
+  between scenarios, not just between runs.**
+- **The probe's own SQL can be the bug.** `pg_advisory_xact_lock` reported zero
+  locks held, which was filed as a lead and chased in a later batch. The call
+  had run in autocommit, so the implicit transaction committed and released the
+  lock immediately — correct behaviour, wrong probe.
+
+The cheap defence for all four: **give every probe a SELF-CHECK scenario that
+must pass on the reference server, and abort the run if it does not.** That is
+what caught `max_prepared_transactions = 0` before a whole 2PC sweep was
+written up as divergences.
 
 ## CI is load-bearing — failures are serious bugs, not flakes
 
