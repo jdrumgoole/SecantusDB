@@ -11,11 +11,15 @@ Prefix (``cat:*``) and phrase (``foo <-> bar`` / ``foo <N> bar``) queries are
 supported (positions are tracked in the tsvector), as are ``phraseto_tsquery``
 and ``ts_headline``.
 
-Simplifications vs real Postgres: the text-search configuration is fixed
-(English stop-words, **no stemming** — ``cats`` and ``cat`` stay distinct), and
-``ts_rank`` is a simple normalised match count rather than the cover-density
-algorithm. Lexeme weights (``:A`` / ``setweight`` / weighted ``ts_rank``) are out
-of scope (the tsvector stores no per-lexeme weight).
+Stemming IS applied: ``english`` (and the default) run the Porter2 algorithm
+from ``secantus.sql.snowball``, so ``cats`` matches ``cat``, on the query side
+as well as the document side. ``simple`` neither stems nor drops stop-words.
+
+Simplifications vs real Postgres: the text-search configuration is otherwise
+fixed (one English stop-word list; no other language), and ``ts_rank`` is a
+simple normalised match count rather than the cover-density algorithm. Lexeme
+weights (``:A`` / ``setweight`` / weighted ``ts_rank``) are out of scope (the
+tsvector stores no per-lexeme weight).
 """
 
 from __future__ import annotations
