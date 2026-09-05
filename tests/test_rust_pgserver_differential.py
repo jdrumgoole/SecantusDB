@@ -870,6 +870,9 @@ ERROR_QUERIES = [
     # No `generate_series(int, float8)` overload exists; this server used to
     # truncate the bound and answer rows.
     "SELECT * FROM generate_series(1, 3::float8)",
+    # A bare CREATE of an existing table; the IF NOT EXISTS form is a no-op and
+    # is covered in the slice tests, which can create the table first.
+    "CREATE TABLE d (id int4)",
 ]
 
 
@@ -978,6 +981,65 @@ def test_server_cursors_match_postgres(
     PostgreSQL exposes a declared cursor as a portal of the same name, and
     psycopg describes it before it fetches anything.
     """
+
+
+def test_savepoints_match_postgres(ours: psycopg.Connection, oracle: psycopg.Connection) -> None:
+    """SAVEPOINT / RELEASE / ROLLBACK TO, against the server that defines them.
+
+    A savepoint here is a set of pre-images rather than anything the storage
+    engine knows about, so what has to be checked is the DATA either side of a
+    rollback, not just the tags and the SQLSTATEs.
+    """
+    _reset_oracle(oracle)
+
+    def probe(conn: psycopg.Connection) -> list:
+        was_autocommit = conn.autocommit
+        conn.autocommit = True
+        out: list = []
+
+        def attempt(sql: str) -> str:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql)
+            except psycopg.Error as exc:
+                return f"[{exc.diag.sqlstate}]"
+            return f"ok ({cur.statusmessage})"
+
+        cur = conn.cursor()
+        try:
+            cur.execute("DROP TABLE IF EXISTS sp")
+            cur.execute("CREATE TABLE sp (id int4)")
+            cur.execute("BEGIN")
+            cur.execute("INSERT INTO sp VALUES (1)")
+            out.append(("savepoint", attempt("SAVEPOINT s1")))
+            cur.execute("INSERT INTO sp VALUES (2)")
+            out.append(("rollback to", attempt("ROLLBACK TO SAVEPOINT s1")))
+            cur.execute("SELECT id FROM sp ORDER BY id")
+            out.append(("rows", cur.fetchall()))
+            cur.execute("INSERT INTO sp VALUES (3)")
+            cur.execute("SAVEPOINT s2")
+            cur.execute("INSERT INTO sp VALUES (4)")
+            out.append(("release", attempt("RELEASE SAVEPOINT s2")))
+            out.append(("rolling back to the outer one", attempt("ROLLBACK TO SAVEPOINT s1")))
+            cur.execute("SELECT id FROM sp ORDER BY id")
+            out.append(("rows after that", cur.fetchall()))
+            out.append(("a name that is gone", attempt("ROLLBACK TO SAVEPOINT s2")))
+            out.append(("the error", attempt("SELECT nosuchcolumn FROM sp")))
+            out.append(("while poisoned", attempt("SELECT 1")))
+            out.append(("rollback to", attempt("ROLLBACK TO SAVEPOINT s1")))
+            out.append(("after that", attempt("SELECT 1")))
+            cur.execute("COMMIT")
+            cur.execute("SELECT id FROM sp ORDER BY id")
+            out.append(("rows after commit", cur.fetchall()))
+            out.append(("savepoint outside a block", attempt("SAVEPOINT nope")))
+        finally:
+            with contextlib.suppress(Exception):
+                conn.cursor().execute("DROP TABLE IF EXISTS sp")
+            conn.autocommit = was_autocommit
+        return out
+
+    theirs, mine = probe(oracle), probe(ours)
+    assert mine == theirs, f"postgres={theirs}\n  ours    ={mine}"
 
 
 def test_transaction_status_matches_postgres(

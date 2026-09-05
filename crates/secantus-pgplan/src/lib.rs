@@ -131,7 +131,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// What the server should do with one statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    CreateTable(TableDef),
+    /// `CREATE TABLE`, and whether it was written `IF NOT EXISTS` -- which is
+    /// a NO-OP on an existing table rather than the `42P07` a bare one gets.
+    CreateTable(TableDef, bool),
     Insert(Insert),
     Select(Select),
     SelectConstant(SelectConstant),
@@ -337,10 +339,10 @@ pub struct Aggregate {
     pub offset: i64,
 }
 
-/// Transaction control. Savepoints and prepared transactions are deliberately
-/// absent -- they need machinery this server does not have, and pretending
-/// would silently lose the semantics a client is relying on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Transaction control. Prepared transactions (two-phase commit) are
+/// deliberately absent -- they need machinery this server does not have, and
+/// pretending would silently lose the semantics a client is relying on.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionControl {
     Begin,
     /// `START TRANSACTION`, which does exactly what `BEGIN` does and differs
@@ -354,6 +356,13 @@ pub enum TransactionControl {
     Rollback {
         chain: bool,
     },
+    /// `SAVEPOINT <name>`: a point inside the block to come back to.
+    Savepoint(String),
+    /// `RELEASE [SAVEPOINT] <name>`: destroy it, KEEPING its writes.
+    Release(String),
+    /// `ROLLBACK TO [SAVEPOINT] <name>`: undo everything written since it, and
+    /// leave the savepoint itself open.
+    RollbackTo(String),
 }
 
 /// `SELECT <items>` with no FROM: one row, computed without touching storage.
@@ -592,6 +601,17 @@ pub fn plan_with_params(
                         chain: t.chain,
                     }))
                 }
+                // A nested `conn.transaction()` block in any client becomes a
+                // savepoint, so these are not an exotic corner.
+                Ok(TransactionStmtKind::TransStmtSavepoint) => Ok(Statement::Transaction(
+                    TransactionControl::Savepoint(t.savepoint_name.clone()),
+                )),
+                Ok(TransactionStmtKind::TransStmtRelease) => Ok(Statement::Transaction(
+                    TransactionControl::Release(t.savepoint_name.clone()),
+                )),
+                Ok(TransactionStmtKind::TransStmtRollbackTo) => Ok(Statement::Transaction(
+                    TransactionControl::RollbackTo(t.savepoint_name.clone()),
+                )),
                 Ok(other) => Err(Error::Unsupported(format!("{other:?}"))),
                 Err(_) => Err(Error::Unsupported("this transaction statement".into())),
             }
@@ -667,7 +687,10 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
         // silently store only one of them.
         return Err(Error::Unsupported("a composite PRIMARY KEY".into()));
     }
-    Ok(Statement::CreateTable(TableDef::new(&table, columns)))
+    Ok(Statement::CreateTable(
+        TableDef::new(&table, columns),
+        c.if_not_exists,
+    ))
 }
 
 fn plan_insert(
