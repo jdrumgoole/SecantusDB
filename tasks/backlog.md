@@ -12740,8 +12740,25 @@ Open items from the scout, in descending value:
    without FROM is not supported` — a FROM-less correlated lateral, same root
    cause as (1). Confirmed present at baseline, not a regression.
 3. **Hypothetical-set aggregates are unsupported** — `rank(2) WITHIN GROUP
-   (ORDER BY id)` is `0A000`. `percentile_cont` / `percentile_disc` / `mode`
-   all work.
+   (ORDER BY id)`, and likewise `dense_rank` / `percent_rank` / `cume_dist`,
+   are `0A000`. `percentile_cont` / `percentile_disc` / `mode` all work.
+4. **`FILTER (WHERE ...)` on a statistical aggregate is `0A000`** — the twelve
+   `corr` / `covar_*` / `regr_*` functions added 2026-09-05 work everywhere
+   else (GROUP BY, HAVING, empty input, single pair, degenerate variance), but
+   `corr(y, x) FILTER (WHERE ...)` reports `unsupported scalar expression`.
+   `_register_regr_stat` already ACCEPTS a filter condition and folds it into
+   the both-non-null gate correctly; what is missing is upstream. The
+   FILTER-wrapped node never reaches either registration site — the
+   computed-projection registrar replaces the inner aggregate and leaves the
+   bare `exp.Filter` behind for the scalar evaluator, and adding a check on
+   the whole projection in the plain select-list path did NOT fire either, so
+   the gate is earlier than both. Start by finding what decides a
+   FILTER-wrapped `exp.Corr` is not an aggregate.
+5. **`var_pop` / `var_samp` / `variance` over `float8` lose the last digits** —
+   `1.2500000000000002` where PostgreSQL says `1.25`. Pre-existing and
+   unrelated to the statistical aggregates above (confirmed against baseline);
+   the exact-numeric path in `_register_numeric_stat` covers the `numeric`
+   case, not `float8`.
 
 ## `array_agg` and `string_agg` over an unmatched outer-join row (2026-09-05)
 

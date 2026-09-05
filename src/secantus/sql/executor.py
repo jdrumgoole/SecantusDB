@@ -2458,6 +2458,17 @@ def _apply_post_aggregates(plan: Any, result: list[dict[str, Any]]) -> list[dict
                     _as_exact(doc.get(sx_field)),
                     _as_exact(doc.get(sx2_field)),
                 )
+            elif kind == "regr_stat":
+                func, n_field, sx_f, sy_f, sxx_f, syy_f, sxy_f = payload
+                doc[field_name] = typemap.regr_stat(
+                    func,
+                    int(doc.get(n_field) or 0),
+                    float(doc.get(sx_f) or 0),
+                    float(doc.get(sy_f) or 0),
+                    float(doc.get(sxx_f) or 0),
+                    float(doc.get(syy_f) or 0),
+                    float(doc.get(sxy_f) or 0),
+                )
             elif kind == "numeric_avg":
                 n_field, sx_field = payload
                 count = int(doc.get(n_field) or 0)
