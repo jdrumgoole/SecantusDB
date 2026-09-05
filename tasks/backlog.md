@@ -4557,6 +4557,32 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
   19 of the 21 are fixed. The remaining 2 are recorded below.
 
+- [ ] **The Rust server never emits the STAGE wrapper (2026-09-05).** mongod has
+  three wrappers for a failing expression in an `$addFields` / `$project` /
+  `$set`: `Invalid $addFields :: caused by ::` for a PARSE error, `Failed to
+  optimize pipeline :: caused by ::` for a constant-fold failure, and
+  `Executor error during aggregate command on namespace: … :: caused by ::` for
+  a runtime one. `wrap_pipeline_error` in `crates/secantus-commands/src/aggregate.rs`
+  knows only the last two -- `grep -c 'Invalid \$'` over that file and
+  `crates/secantus-core/src/aggregate.rs` is **0**.
+
+  The Python server had the same defect and it was worth **83 shapes** on
+  `agg_expressions.py`: the message BODY was byte-identical to mongod's and only
+  the prefix was wrong, so nothing that compared codes could see it. 76 of the 83
+  were two operators (`$ifNull`, `$setEquals`) whose arity errors reached the
+  evaluator instead of the parser.
+
+  Porting it means (a) a third arm on `wrap_pipeline_error` and (b) the
+  parse-time classification -- `aggregate._expression_shape_problem`, with the
+  two tables added alongside it. **Mind the ordering**: mongod reports an
+  UNRECOGNISED key before a MISSING required one, and getting that backwards
+  changed the code on six shapes that were already right (see
+  `tests/test_expression_parse_time_wrappers.py`, which pins it).
+
+  Not measured on the Rust server directly -- a fresh worktree has no
+  `vendor/wiredtiger`, so the standalone binary could not be built here. The
+  claim above is from reading `wrap_pipeline_error`, so **probe before sizing**.
+
 - [ ] **The Rust update path has no parse-time / execution-time distinction
   (2 shapes, 2026-09-02).** mongod wraps an EXECUTION-time update failure as
   `Plan executor error during update :: caused by :: <message>` and reports a

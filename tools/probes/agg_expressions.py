@@ -215,4 +215,9 @@ def main():
     return 1 if (value_diffs or code_diffs or msg_diffs) else 0
 
 
-sys.exit(main())
+# Guarded so the corpus above can be IMPORTED without running the sweep.
+# Without this, `import agg_expressions` ran the whole probe and then exited
+# the importing process -- which is how an attempt to reuse `cases()` from a
+# focused harness turned into a full probe run (2026-09-05).
+if __name__ == "__main__":
+    sys.exit(main())
