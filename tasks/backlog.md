@@ -12805,3 +12805,47 @@ here trades one wrong answer for another:
 2. **`string_agg(<expression>, ',')` over a join is `0A000 expected a column`**
    — the join HAVING/select path takes a column, not an expression, for
    `string_agg`. The single-table path accepts one.
+
+## Whole-row references and the json / jsonb identity (2026-09-05)
+
+Found by the record/JSON sweep; the two fixes that batch DID make are in
+`tests/test_sql_sweep_twentytwo.py`. Corpus:
+`tools/probes/pg_corpora/json_record.sql`.
+
+**1. A bare relation alias in a value position is `42703`.** All of these
+answer `column "X" does not exist`:
+
+    SELECT row_to_json(t) FROM (SELECT id, a FROM jr) t
+    SELECT to_json(r)     FROM (SELECT 1 AS a) r
+    SELECT row_to_json(jr) FROM jr
+    SELECT jr             FROM jr
+    SELECT (jr.*)::text   FROM jr
+
+`row_to_json(t)` over a derived table is a very common idiom, so this is the
+highest-value item in this area. **Sized by looking, not guessing:** the
+blocker is that `Resolve` returns ONE document field path (`table_resolver`
+gives `(field, tag)`), and a whole-row reference is not a path — it is a
+synthetic composite of every column in that relation. The tractable design is
+a projection stage that BUILDS the record into a fresh field (`{col: $col,
+...}`) and then resolves the reference to that field, after which the existing
+`RecordValue` machinery renders and `row_to_json` consumes it unchanged. That
+means touching projection construction in the simple-select, derived-table and
+evaluated plan shapes — a feature, not a patch.
+
+**2. `json` and `jsonb` share one type tag.** `typemap.PG_OID["json"]` is 3802
+(jsonb). A declared `json` COLUMN already reports 114 correctly (there is a
+`json_plain` flag for that), so the machinery half-exists; what is missing:
+
+- every json-returning FUNCTION reports 3802 — `to_json`, `json_build_object`,
+  `json_build_array`, `json_object`, `array_to_json`, `json_agg`,
+  `json_object_agg`, `row_to_json`, `json_strip_nulls`;
+- `pg_typeof(json_col)` says `jsonb`;
+- `json_col::text` normalises whitespace (`{"k": 1}`) where PostgreSQL replays
+  the ORIGINAL text (`{"k":1}`) — `json` stores the text it was given and only
+  `jsonb` normalises. That last one is a storage-representation change, not a
+  tag change, and is the deep part.
+
+**3. `jsonb` does not normalise key order.** `'{"b":1,"a":2}'::jsonb` keeps
+input order where PostgreSQL sorts keys (shorter first, then bytewise). Note
+`json` is CORRECT to keep the input order — only `jsonb` sorts, so a fix must
+not apply to both.

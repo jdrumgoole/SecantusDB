@@ -2605,6 +2605,17 @@ def _pg_initcap(text: str) -> str:
     return "".join(out)
 
 
+def _eval_json_strip_nulls(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``json_strip_nulls(x)`` — remove OBJECT keys whose value is null,
+    recursively. Array elements are left alone: PostgreSQL answers
+    ``[1,null,2]`` for ``json_strip_nulls('[1,null,2]')``, because only a key
+    can be absent."""
+    value = evaluate(node.this, scope, ctx)
+    if value is None:
+        return None
+    return _jsonb_strip_nulls(_as_jsonb_arg(value))
+
+
 _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], Any]] = {
     # ``upper`` / ``lower`` are overloaded: a range operand yields its bound, any
     # other operand is the string case-shift.
@@ -2764,6 +2775,10 @@ for _cls_name, _handler in (
     ("Decode", _eval_decode),
     # ``xmlelement`` has a dedicated node (name in ``this``, args in ``expressions``).
     ("XMLElement", _eval_xmlelement),
+    # sqlglot gives `json_strip_nulls` its own node while `jsonb_strip_nulls`
+    # stays an Anonymous call, so the name-keyed dispatch served one spelling
+    # and the other silently answered NULL for every input.
+    ("JSONStripNulls", _eval_json_strip_nulls),
 ):
     _cls = getattr(exp, _cls_name, None)
     if _cls is not None:
@@ -4017,6 +4032,14 @@ def _eval_cast_impl(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
             return _fts.render_tsvector(value)
         if _fts.is_tsquery(value):
             return _fts.render_tsquery(value)
+        if isinstance(value, typemap.RecordValue):
+            # A composite is a dict internally, so without this it fell through
+            # to the JSON renderer and `('a', 1)::text` produced
+            # `{"f1": "a", "f2": 1}` where PostgreSQL gives `(a,1)`. The record
+            # renderer already existed and is what the WIRE uses; only the cast
+            # did not route to it.
+            rendered = typemap.to_pg_text(value, "composite")
+            return rendered.decode() if isinstance(rendered, bytes) else rendered
         shape = _range_value_shape(value)
         if shape is not None:
             from secantus.sql import ranges as _ranges
