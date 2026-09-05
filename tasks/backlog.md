@@ -12691,11 +12691,48 @@ Open items from the scout, in descending value:
 
 1. **`LATERAL <srf>(...)` is unsupported** — `FROM t, LATERAL unnest(t.arr) AS
    x` answers `0A000 unsupported LATERAL source`, and so do the
-   `generate_series` and `jsonb_array_elements` forms. Wrapping the bare call
-   in the `SELECT` it is shorthand for was TRIED AND REVERTED: it clears the
-   first error and lands on the next one (`only a single-table LATERAL subquery
-   … is supported`), because the lateral planner cannot take a FROM-less
-   source. The real fix is in that planner, not in the source rewrite.
+   `generate_series` / `jsonb_array_elements` / `regexp_split_to_table` forms.
+   Corpus: `tools/probes/pg_corpora/lateral_srf.sql` (9 shapes).
+
+   **Attempted properly on 2026-09-05 and REVERTED at the end.** The work got
+   4 of the 9 shapes returning correct VALUES, but with the wrong column TYPE
+   (`text` where PostgreSQL says `int`), and a silent type divergence is worse
+   than the honest `0A000` — so it went back. What that attempt established,
+   so the next one starts from here rather than rediscovering it:
+
+   - **The EXECUTOR is already ready.** `_expand_lateral` runs the inner query
+     per outer row through `engine.run_inner_select`, and that entry point
+     already evaluates a FROM-less SELECT whose projection is a set-returning
+     function — measured for `unnest`, `generate_series`,
+     `jsonb_array_elements`, `jsonb_array_elements_text` and
+     `regexp_split_to_table`. Nothing in the executor needs changing.
+   - **Four planner changes are needed, and three of them are known-good.**
+     (a) normalise a bare SRF call into the `SELECT <srf> AS <alias>` it is
+     shorthand for — and build the `exp.Alias` DIRECTLY, because
+     `exp.alias_()` sets the alias ON an `exp.Unnest` instead of wrapping it,
+     so the column comes out named `unnest`;
+     (b) treat a FROM-less source as "rich" in `_lateral_is_rich` so it takes
+     the nested-loop path (there is no collection to lower a `$lookup`
+     against);
+     (c) `_lateral_literal` must keep a LIST as an `exp.Array` and a DICT as a
+     jsonb cast — its string fallthrough turned an `int[]` outer value into
+     the literal text `'[1, 2, 3]'`, which `unnest` then returned as ONE row
+     holding that string. The table-subquery laterals never hit this because
+     they only ever substitute scalar join keys.
+   - **The unsolved piece is the SHAPE.** `_plan_rich_lateral` derives output
+     columns by planning the subquery with correlations replaced by NULL, and
+     `plan_pipeline_select` cannot take a FROM-less SELECT.
+     `plan_constant_select` cannot either — it evaluates the projection as a
+     SCALAR, and an SRF reaching the scalar evaluator is a deliberate `0A000`.
+     Running it through `run_inner_select` DOES give the right column NAMES,
+     but `unnest(NULL)` yields zero rows and the tag comes back `any` → text.
+     Getting the element type needs the outer column's declared array type,
+     which means threading the outer resolver / TableDef into
+     `_plan_rich_lateral`. **That is the actual work.**
+   - Two shapes stay out of reach even then: `count(*)` over a lateral hits
+     the pre-existing "rich LATERAL only in a plain SELECT" restriction, and
+     a `WHERE` over the lateral's output column needs the residual filter to
+     run after expansion.
 2. **`LATERAL (SELECT <expr from outer>) alias` fails** with `0A000 aggregate
    without FROM is not supported` — a FROM-less correlated lateral, same root
    cause as (1). Confirmed present at baseline, not a regression.
