@@ -4509,13 +4509,20 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   against stored columns; applying one to generated rows needs an in-memory
   matcher. `unnest`, `generate_subscripts` and function calls in FROM other than
   `generate_series` are also unsupported.
-- **Rust PG server: the psycopg COPY fixture table is not being created — 195
-  failures cascade from `relation "copy_in" does not exist`.** COPY itself is
-  complete (text / CSV / binary, both directions, plus `COPY (query)`, all probed
-  byte-for-byte against PG 14). Three plausible causes were checked directly and
-  eliminated: `serial` / `bigserial` columns, range columns and multirange
-  columns all create fine. The remaining cause is unknown; start by running
-  psycopg's `ensure_table` sequence by hand rather than by reading.
+- **Rust PG server: DDL IS NOT TRANSACTIONAL.** `CREATE TABLE` inside a
+  transaction survives a `ROLLBACK` (and so do rows inserted into it);
+  `DROP TABLE` inside one stays dropped. PostgreSQL rolls both back. Measured
+  2026-09-05 against PG 14, both directions.
+
+  This is a correctness divergence, not a missing feature: a client that rolls
+  back after creating a table is left with a table it believes does not exist.
+  Fixing it needs transactional schema operations in the storage layer —
+  `create_collection` / `drop_collection` are not part of the user transaction
+  — so it is a storage-level change rather than a pgserver one.
+
+  What DOES work as of 2026-09-05: a table created or dropped in a transaction
+  is correctly VISIBLE (or hidden) to later statements in that same
+  transaction, which is what 184 psycopg failures were waiting on.
 - **Rust PG server: range and multirange OPERATORS are unsupported.** Both type
   families themselves (literals, constructors, casts, canonicalisation, merging,
   parameters in both wire formats) are in; `@>` / `<@` / `&&` / `-|-` and the
