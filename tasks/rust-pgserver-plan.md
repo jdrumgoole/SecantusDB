@@ -1323,7 +1323,37 @@ because it does not compile the Rust unit tests) and once it failed CI's
 `regtype`, so the NAME matches but a binary cursor gets the name where
 PostgreSQL sends the four-byte oid.
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181 -> 2219 -> 2256 -> 2347 -> 2589 (0.35 measured +29 on a pre-0.34 base and is not in this line).**
+### 0.39a the numbers in 0.34-0.39 were taken with a BROKEN INVOCATION (2026-09-05)
+
+**Every figure in sections 0.34 through 0.39 is ~152 too low**, and the cause is
+how the gauge was invoked, not anything about the server.
+
+psycopg's `tests/test_typing.py` (125 tests) shells out to a bare `mypy`.
+`pyproject.toml` carries mypy in the dev extras precisely so those tests count,
+and the comment there says why: **`uv run` puts `.venv/bin` on PATH**. Running
+the gauge as `.venv/bin/python -m psycopg_validation.runner` does NOT -- the
+subprocess resolves `mypy` through pyenv, finds nothing, and 119 tests fail with
+`pyenv: mypy: command not found`. `invoke validate-psycopg` runs it through
+`uv run` and they pass.
+
+Measured on the same commit, minutes apart:
+
+| invocation | passed |
+| --- | --- |
+| `.venv/bin/python -m psycopg_validation.runner` | 2589 |
+| `PATH=.venv/bin:$PATH …` (what `uv run` does) | **2741** |
+
+**The DELTAS in those sections still hold** -- both sides of every comparison
+were measured the same way, and the same-branch baselines were taken with the
+same broken invocation. The ABSOLUTE numbers are not comparable with figures
+taken by the invoke task, which is what earlier sections used.
+
+**Rule: run the gauge through `uv run` (or `invoke validate-psycopg`), never
+`.venv/bin/python -m …` directly.** A gauge that shells out to a tool is
+measuring the PATH as much as the server, and the failure looks like 119 server
+failures rather than a missing binary.
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181 -> 2219 -> 2256 -> 2347 -> 2589 (all on the no-mypy scale of 0.39a; the same commit measures 2741 through `uv run`. 0.35 measured +29 on a pre-0.34 base and is not in this line).**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the
