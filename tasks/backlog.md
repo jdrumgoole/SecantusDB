@@ -4654,6 +4654,38 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   something already ported. Sizing from a `#[test]` took about a minute and
   needed none of the WiredTiger build the entry said was blocking.
 
+- [ ] **SILENT DATA LOSS in the RUST STORAGE write path — `$set` of `-0.0`
+  over `0.0` is dropped (2026-09-05).** The Python side of this is FIXED
+  (PR #1317); `crates/secantus-storage/src/lib.rs` still has the bare guard.
+
+  ```rust
+  if new != doc {          // ~line 10649, the update path
+  ```
+
+  Rust's `Document` equality compares a `Bson::Double` with `f64 ==`, where
+  `0.0 == -0.0` is **true** — so the write is skipped, `nModified` is 0, no
+  oplog entry is emitted, and a read-back gives the OLD zero. The value the
+  caller asked to store is never stored. mongod stores it and reports the
+  update (probed 8.2.11, 2026-09-05). The same guard also drops a numeric TYPE
+  change (`int 0` -> `double -0.0`, and `int 1` -> `double 1.0`).
+
+  **Nothing will tell you this is broken.** The parity suites pin the pure
+  engines, not the storage layer; the Python fix and its 17 regression tests do
+  not touch this file. It was found only by grepping
+  `crates/secantus-storage/` for the helper after the Python fix landed — the
+  discipline this file's §7 header already prescribes and which is easy to
+  skip.
+
+  **The fix** mirrors `storage._doc_changed`: a difference in the ENCODED BSON
+  also counts as a change. `secantus-core::diff` already has the predicate
+  (`same_stored_value` / `same_encoding`, added by #1317) — make it `pub` and
+  call it, rather than writing a third copy.
+
+  Deliberately NOT attempted at session close on 2026-09-05: this crate links
+  WiredTiger and is excluded from the clean workspace, so it cannot be built or
+  tested in a fresh worktree, and an unverified change to a storage engine's
+  write path is worse than a filed one. The `rust-storage` CI job does build it.
+
 - [ ] **The Rust update path has no parse-time / execution-time distinction
   (2 shapes, 2026-09-02).** mongod wraps an EXECUTION-time update failure as
   `Plan executor error during update :: caused by :: <message>` and reports a

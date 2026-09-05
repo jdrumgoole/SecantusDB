@@ -52,7 +52,13 @@ fn eval_or_missing(expr: &Bson, doc: &Document, vars: &Document) -> R<Option<Bso
     eval(expr, doc, vars).map(Some)
 }
 
-/// Canonical, hashable group-key — mirrors `_hashable` + Python dict equality.
+/// Canonical, hashable group-key.
+///
+/// Matches mongod's bucketing, which `_hashable` on the Python side also
+/// implements: `1 == 1.0 == true` share a bucket, and so does every NaN. The
+/// note that used to head this type described it as mirroring "Python dict
+/// equality" -- which is where the NaN bug came from, since Python dicts key a
+/// NaN by identity and mongod does not.
 /// Also used by `$densify` for partition keys (same dict semantics).
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum GKey {
@@ -63,10 +69,20 @@ pub enum GKey {
     Oid([u8; 12]),
     Doc(Vec<(String, GKey)>), // sorted by field name
     Arr(Vec<GKey>),
+    /// Every NaN, of any numeric type, buckets together.
+    ///
+    /// mongod groups two `NaN`s into ONE bucket, and merges a double NaN with
+    /// a `Decimal128` NaN into that same bucket (probed 8.2.11, 2026-09-05).
+    /// This used to `Err(())` and defer, on the grounds that "NaN never equals
+    /// itself in a dict probe" -- true of Python, and the reason the pure
+    /// engine put every NaN in its own bucket until it was fixed. Deferring
+    /// also meant the STANDALONE Rust server, which has no Python behind a
+    /// defer, could not group a NaN at all.
+    Nan,
 }
 
 /// Canonicalise a key value, or `Err(())` for a type we don't bucket faithfully
-/// (Decimal128, NaN, Binary/Timestamp/Regex/Min/MaxKey, exotic).
+/// (non-NaN Decimal128, Binary/Timestamp/Regex/Min/MaxKey, exotic).
 pub fn gkey(v: &Bson) -> R<GKey> {
     match v {
         Bson::Null => Ok(GKey::Null),
@@ -74,10 +90,13 @@ pub fn gkey(v: &Bson) -> R<GKey> {
             numeric::classify(&Bson::Int32(i32::from(*b))).unwrap(),
         )),
         Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => match numeric::classify(v) {
-            Some(NumVal::Nan) => Err(()), // NaN never equals itself in a dict probe -> defer
+            Some(NumVal::Nan) => Ok(GKey::Nan),
             Some(n) => Ok(GKey::Num(n)),
             None => Err(()),
         },
+        // A Decimal128 NaN joins the SAME bucket as a double NaN; every other
+        // decimal still defers, which is a separate gap.
+        Bson::Decimal128(_) if matches!(numeric::classify(v), Some(NumVal::Nan)) => Ok(GKey::Nan),
         Bson::String(s) => Ok(GKey::Str(s.clone())),
         Bson::DateTime(d) => Ok(GKey::Date(d.timestamp_millis())),
         Bson::ObjectId(o) => Ok(GKey::Oid(o.bytes())),

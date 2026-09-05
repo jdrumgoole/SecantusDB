@@ -387,6 +387,25 @@ real defects:
   *and* is right; the malignant form cites the other engine, or asserts a
   mongod rule that a probe contradicts. One such comment was trusted enough to
   write a test from, and the test failed against the real server.
+- **Python's `==` or `hash()` standing in for a BSON semantic** (5 instances,
+  all found 2026-09-05 from one question). They disagree in exactly three
+  places: **NaN**, **signed zero**, and **bool-vs-int**. The codebase already
+  guarded the third — `ordering.bson_equal` exists because `True == 1` swallowed
+  an oplog entry — and the first two were unguarded, which cost:
+  a partial index that returned NOTHING for `find({b: NaN})`; `$min`/`$max`
+  ranking NaN by IEEE instead of sort order; a `$set` of `-0.0` over `0.0`
+  silently NOT STORED (`if new != doc`); a change-stream `updateDescription`
+  blind to signed zero and to a numeric type change; and `$group` giving every
+  NaN its own bucket (`hash(nan)` is 0 but `nan != nan`, so a dict keys it by
+  identity).
+
+  Two of those were silent data loss. Grep for `!= doc`, `== post`, `hash(`,
+  and any dict/set keyed on a document value. **Note that equality and CHANGE
+  DETECTION are different questions** and mongod answers them differently:
+  `{$eq: [0.0, -0.0]}` is true and `find({a: -0.0})` matches a stored `0.0`,
+  while the same pair counts as a change — so one predicate cannot serve both
+  (`ordering.bson_same_stored_value` is the change-detection twin).
+
 - **Missing conflated with null** (3 instances). `get_path` returns `None` for
   both; `has_path` is what distinguishes them. mongod's rule differs by
   language — the *query* language treats them alike (`{a: null}` matches a
