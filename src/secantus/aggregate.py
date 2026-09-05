@@ -2924,6 +2924,15 @@ def _accumulate(
     handler(bucket, field, arg, doc, vars)
 
 
+def _is_nan_key(value: Any) -> bool:
+    """A float or Decimal128 NaN, which mongod groups as ONE key."""
+    if isinstance(value, float):
+        return value != value
+    if isinstance(value, Decimal128):
+        return value.to_decimal().is_nan()
+    return False
+
+
 def _hashable(value: Any) -> Any:
     """A hashable stand-in for a ``$group`` bucket key.
 
@@ -2944,10 +2953,25 @@ def _hashable(value: Any) -> Any:
     return _hashable_scalar(value)
 
 
+#: The one bucket key every NaN maps to.
+#:
+#: A float NaN IS hashable (``hash(nan)`` is 0) but compares unequal to itself,
+#: so returning it unchanged gave every NaN its own ``$group`` bucket:
+#: two documents with ``a: NaN`` grouped as two buckets of 1 where mongod
+#: reports one of 2. mongod also merges a float NaN with a ``Decimal128`` NaN
+#: (probed 8.2.11, 2026-09-05), so both map here.
+_NAN_KEY = ("\x00nan",)
+
+
 def _hashable_scalar(value: Any) -> Any:
     """``value`` itself when hashable, else a type-tagged surrogate."""
     if isinstance(value, Code):
         return ("\x00code", str(value), _hashable(value.scope) if value.scope else None)
+    # Before the plain-hashable path below: NaN is hashable and would otherwise
+    # be returned as itself. Nested NaNs come through `_hashable`'s container
+    # recursion, so `{a: [NaN]}` and `{a: {k: NaN}}` group correctly too.
+    if _is_nan_key(value):
+        return _NAN_KEY
     try:
         hash(value)
     except TypeError:
