@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+import bson
 from bson import Binary, Code, Decimal128, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
 from secantus.bsontypes import regex_options_string
@@ -137,6 +138,43 @@ def bson_equal(a: Any, b: Any) -> bool:
     if isinstance(a, bool) != isinstance(b, bool):
         return False
     return bool(a == b)
+
+
+def bson_same_stored_value(a: Any, b: Any) -> bool:
+    """Would storing ``b`` where ``a`` is leave the document unchanged?
+
+    The CHANGE-DETECTION twin of `bson_equal`, and deliberately not the same
+    predicate. mongod answers the two questions differently for a signed zero:
+
+    * equality says they are the SAME -- ``{$eq: [0.0, -0.0]}`` is true,
+      ``$cmp`` is 0, and ``find({a: -0.0})`` matches a stored ``0.0``;
+    * change detection says they are DIFFERENT -- ``{$set: {a: -0.0}}`` over
+      ``a: 0.0`` writes, reports ``modifiedCount: 1``, and puts the field in a
+      change stream's ``updatedFields``.
+
+    Both probed against 8.2.11 (2026-09-05). Folding this into `bson_equal`
+    would have been the tempting one-line fix and would have broken `$eq` and
+    query matching -- one predicate cannot serve both questions.
+
+    The tiebreak is the ENCODED bytes, which distinguish the two zeros and also
+    catch a numeric TYPE change that ``==`` hides (an ``int`` ``0`` and a
+    ``float`` ``-0.0`` compare equal in Python).
+    """
+    if not bson_equal(a, b):
+        return False
+    try:
+        return bson.encode({"v": a}) == bson.encode({"v": b})
+    except Exception:
+        # Not encodable as-is (a bare list, say). Fall back to a recursive
+        # walk, which reaches a signed zero nested inside a container just as
+        # the encoding would.
+        if isinstance(a, list) and isinstance(b, list):
+            return len(a) == len(b) and all(
+                bson_same_stored_value(x, y) for x, y in zip(a, b, strict=True)
+            )
+        if isinstance(a, Mapping) and isinstance(b, Mapping):
+            return list(a) == list(b) and all(bson_same_stored_value(a[k], b[k]) for k in a)
+        return True
 
 
 def _regex_sort_key(r: Regex) -> tuple[Any, str]:

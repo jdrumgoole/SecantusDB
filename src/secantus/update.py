@@ -245,6 +245,18 @@ def _is_each_modifier(value: Any) -> bool:
     return isinstance(value, Mapping) and "$each" in value
 
 
+def _is_zero_number(v: Any) -> bool:
+    """A double or Decimal128 zero, of either sign (not an int -- see `$mul`)."""
+    from bson import Decimal128 as _Decimal128
+
+    if isinstance(v, float):
+        return v == 0.0
+    if isinstance(v, _Decimal128):
+        d = v.to_decimal()
+        return d.is_finite() and d == 0
+    return False
+
+
 def _order_lt(a: Any, b: Any) -> bool:
     """`a < b` in mongod's BSON SORT order, which is what `$min` / `$max` use.
 
@@ -977,7 +989,23 @@ def _apply_op(
                             f"of non-numeric type {_bson_type_name(current)}",
                             code=14,
                         )
-                _set_path(doc, concrete, _arith_or_overflow("$mul", doc, current, factor, bson_mul))
+                product = _arith_or_overflow("$mul", doc, current, factor, bson_mul)
+                # A stored DOUBLE zero keeps its own sign: mongod's `$mul`
+                # leaves `0.0` as `0.0` and `-0.0` as `-0.0` whatever the
+                # multiplier, where IEEE would flip it (`0.0 * -1` is `-0.0`).
+                # Measured across 8 shapes on 8.2.11 (2026-09-05): negative,
+                # positive, zero and non-finite multipliers. A non-zero RESULT
+                # (`0.0 * inf` is NaN) still writes, and an INT zero promotes
+                # and follows IEEE, so the rule is narrow -- stored double zero,
+                # zero result.
+                #
+                # This surfaced only once the write guard stopped treating
+                # `-0.0` and `0.0` as equal: the wrong product was previously
+                # computed and then silently dropped by that same comparison,
+                # so two bugs were cancelling.
+                if _is_zero_number(current) and _is_zero_number(product):
+                    product = current
+                _set_path(doc, concrete, product)
     elif op == "$min":
         # A missing field is set unconditionally; otherwise compare by MongoDB's
         # BSON cross-type order -- so a cross-type pair (e.g. a string vs a

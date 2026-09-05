@@ -396,6 +396,18 @@ fn arith(current: &Bson, operand: &Bson, mul: bool) -> R<Bson> {
 /// only `Null` deferred, which meant a bool reached `arith` and silently
 /// incremented (Python treats `bool` as an `int` subclass) — the parity suite
 /// caught the divergence the moment the Python side started refusing.
+/// A double or Decimal128 zero, of either sign. NOT an int -- an int zero
+/// promotes under a double multiplier and then follows IEEE (see `$mul`).
+fn is_zero_number(v: &Bson) -> bool {
+    match v {
+        Bson::Double(d) => *d == 0.0,
+        Bson::Decimal128(_) => crate::decimal::from_bson(v)
+            .map(|d| d.is_zero())
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn current_or_zero(result: &Document, path: &str) -> R<Bson> {
     match get_path(result, path) {
         None => Ok(Bson::Int32(0)),
@@ -613,7 +625,19 @@ fn apply_op(
             for (path, factor) in payload {
                 for cpath in expand_path(result, path, filters, pos)? {
                     let cur = current_or_zero(result, &cpath)?;
-                    let new = arith(&cur, factor, true)?;
+                    let mut new = arith(&cur, factor, true)?;
+                    // A stored DOUBLE or DECIMAL zero keeps its own sign:
+                    // mongod's `$mul` leaves `0.0` as `0.0` and `-0.0` as
+                    // `-0.0` whatever the multiplier, where IEEE would flip it
+                    // (`0.0 * -1` is `-0.0`). Measured across 15 shapes on
+                    // 8.2.11 (2026-09-05): negative, positive, zero and
+                    // non-finite multipliers, over double / int / int64 /
+                    // decimal. A non-zero RESULT (`0.0 * inf` is NaN) still
+                    // writes, and an INT zero promotes and follows IEEE, so the
+                    // rule is narrow -- stored zero, zero result.
+                    if is_zero_number(&cur) && is_zero_number(&new) {
+                        new = cur.clone();
+                    }
                     set_path(result, &cpath, new)?;
                 }
             }

@@ -50,6 +50,47 @@ fn eq(a: &Bson, b: &Bson) -> R<bool> {
     expressions::py_eq(a, b)
 }
 
+/// Would storing `b` where `a` is leave the document unchanged?
+///
+/// The CHANGE-DETECTION twin of `eq`, and deliberately not the same predicate.
+/// mongod answers the two questions differently:
+///
+/// * EQUALITY calls them the same -- `{$eq: [0.0, -0.0]}` is true, `$cmp` is 0,
+///   and `find({a: -0.0})` matches a stored `0.0`;
+/// * CHANGE detection does not -- `{$set: {a: -0.0}}` over `a: 0.0` writes and
+///   puts the field in a change stream's `updatedFields`, and so does a numeric
+///   TYPE change: `int 1` -> `double 1.0` reports `{a: 1.0}` with
+///   `nModified: 1`.
+///
+/// Both probed against 8.2.11 (2026-09-05). Folding this into `eq` would have
+/// been the tempting one-line fix and would have broken `$eq` and query
+/// matching -- one predicate cannot serve both questions.
+fn same_stored_value(a: &Bson, b: &Bson) -> R<bool> {
+    if !eq(a, b)? {
+        return Ok(false);
+    }
+    Ok(same_encoding(a, b))
+}
+
+/// Do two `eq`-equal values encode to the same BSON? Distinguishes a signed
+/// zero (by bit pattern) and a numeric type change (by variant), recursing so
+/// that either nested in an array or a subdocument counts just the same.
+fn same_encoding(a: &Bson, b: &Bson) -> bool {
+    match (a, b) {
+        (Bson::Double(x), Bson::Double(y)) => x.to_bits() == y.to_bits(),
+        (Bson::Array(x), Bson::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| same_encoding(p, q))
+        }
+        (Bson::Document(x), Bson::Document(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|((k1, v1), (k2, v2))| k1 == k2 && same_encoding(v1, v2))
+        }
+        _ => std::mem::discriminant(a) == std::mem::discriminant(b),
+    }
+}
+
 fn child_path(path: &str, key: &str) -> String {
     if path.is_empty() {
         key.to_string()
@@ -88,7 +129,7 @@ fn walk(pre: &Bson, post: &Bson, path: &str, segments: &[Bson], acc: &mut Acc) -
     match (pre, post) {
         (Bson::Document(a), Bson::Document(b)) => walk_docs(a, b, path, segments, acc),
         (Bson::Array(a), Bson::Array(b)) => {
-            if eq(pre, post)? {
+            if same_stored_value(pre, post)? {
                 return Ok(());
             }
             // mongod reports an array by the OPERATION that changed it, not by
@@ -145,7 +186,7 @@ fn walk(pre: &Bson, post: &Bson, path: &str, segments: &[Bson], acc: &mut Acc) -
             Ok(())
         }
         _ => {
-            if !eq(pre, post)? {
+            if !same_stored_value(pre, post)? {
                 acc.updated.insert(path.to_string(), post.clone());
                 record_ambiguous(path, segments, acc);
             }
@@ -336,9 +377,36 @@ mod tests {
     }
 
     #[test]
-    fn numeric_bridge_no_change() {
-        // 1 == 1.0 -> no update emitted.
+    fn a_numeric_type_change_is_a_change() {
+        // This asserted the OPPOSITE, justified by `1 == 1.0 -> no update
+        // emitted` -- Python's equality rule, cited instead of the server's.
+        // mongod reports the change: `{$set: {a: 1.0}}` over a stored `int` 1
+        // answers `updatedFields: {a: 1.0}` with `nModified: 1` and stores a
+        // double. The consumer of a change stream was never told the field's
+        // TYPE had changed (probed 8.2.11, 2026-09-05).
         let out = d(doc! {"a": 1}, doc! {"a": 1.0});
+        assert_eq!(out.get_document("updatedFields").unwrap(), &doc! {"a": 1.0});
+    }
+
+    #[test]
+    fn a_signed_zero_flip_is_a_change() {
+        // Same rule, the other shape it was blind to: `0.0` and `-0.0` are
+        // EQUAL for `$eq` and for query matching, and DIFFERENT for change
+        // detection. Both measured on 8.2.11 (2026-09-05).
+        let out = d(doc! {"a": 0.0}, doc! {"a": -0.0});
+        assert_eq!(
+            out.get_document("updatedFields").unwrap(),
+            &doc! {"a": -0.0}
+        );
+        // ...including nested in an array, which the fast path used to skip.
+        let nested = d(doc! {"a": [0.0]}, doc! {"a": [-0.0]});
+        assert!(!nested.get_document("updatedFields").unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unchanged_value_is_still_no_change() {
+        // The guard against over-reporting: same value, same type, no entry.
+        let out = d(doc! {"a": 1.0, "b": "x"}, doc! {"a": 1.0, "b": "x"});
         assert!(out.get_document("updatedFields").unwrap().is_empty());
     }
 
