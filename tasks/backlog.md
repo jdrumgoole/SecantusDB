@@ -12727,7 +12727,7 @@ scenario delivering something it never sent. That produced a convincing but
 false "delivers twice" result before the probe drained the listener to empty
 between scenarios. Any LISTEN/NOTIFY probe needs that isolation.
 
-## Full-text search (2026-09-04) — swept, eight fixes, three gaps left
+## Full-text search (2026-09-04) — swept; stemming FIXED 2026-09-05, two gaps left
 
 29 shapes against PostgreSQL 14.13; 13 diverged, now 5. Fixed the `::text`
 renderings, `length`, `tsvector ||` (which was returning only its right
@@ -12854,7 +12854,7 @@ Open items from the scout, in descending value:
    the exact-numeric path in `_register_numeric_stat` covers the `numeric`
    case, not `float8`.
 
-## `array_agg` and `string_agg` over an unmatched outer-join row (2026-09-05)
+## `array_agg` over an unmatched outer-join row — FIXED 2026-09-05 (`string_agg` item still open)
 
 Found alongside the `sum` guard fix and deliberately left, because a half-fix
 here trades one wrong answer for another:
