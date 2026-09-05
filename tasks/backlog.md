@@ -4509,6 +4509,13 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   against stored columns; applying one to generated rows needs an in-memory
   matcher. `unnest`, `generate_subscripts` and function calls in FROM other than
   `generate_series` are also unsupported.
+- **Rust PG server: the psycopg COPY fixture table is not being created — 195
+  failures cascade from `relation "copy_in" does not exist`.** COPY itself is
+  complete (text / CSV / binary, both directions, plus `COPY (query)`, all probed
+  byte-for-byte against PG 14). Three plausible causes were checked directly and
+  eliminated: `serial` / `bigserial` columns, range columns and multirange
+  columns all create fine. The remaining cause is unknown; start by running
+  psycopg's `ensure_table` sequence by hand rather than by reading.
 - **Rust PG server: range and multirange OPERATORS are unsupported.** Both type
   families themselves (literals, constructors, casts, canonicalisation, merging,
   parameters in both wire formats) are in; `@>` / `<@` / `&&` / `-|-` and the
