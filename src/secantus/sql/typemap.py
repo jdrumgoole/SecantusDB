@@ -2158,3 +2158,57 @@ def _render_pg_array(items: Any, elem_tag: str) -> str:
         else:
             parts.append(text)
     return "{" + delim.join(parts) + "}"
+
+
+def regr_stat(func: str, n: int, sx: float, sy: float, sxx: float, syy: float, sxy: float) -> Any:
+    """Finish a two-argument statistical aggregate from its six sums.
+
+    Every rule here was measured against PostgreSQL 14.13, including the ones
+    that resist derivation:
+
+    * `regr_count` is the ONLY one defined over an empty input — it is 0 where
+      the others are NULL.
+    * `covar_samp` needs two pairs, not one.
+    * `corr` is NULL when EITHER `sxx` or `syy` is zero (no variation to
+      correlate), but **`regr_r2` is 1.0 when `syy` is zero** and only NULL
+      when `sxx` is — a constant Y is perfectly "explained", a constant X
+      explains nothing. Those two differ, and guessing gets one of them wrong.
+    """
+    if func == "regr_count":
+        return n
+    if n == 0:
+        return None
+    avgx, avgy = sx / n, sy / n
+    # The centred sums of squares and cross-products.
+    cxx = sxx - sx * sx / n
+    cyy = syy - sy * sy / n
+    cxy = sxy - sx * sy / n
+    if func == "regr_avgx":
+        return avgx
+    if func == "regr_avgy":
+        return avgy
+    if func == "regr_sxx":
+        return cxx
+    if func == "regr_syy":
+        return cyy
+    if func == "regr_sxy":
+        return cxy
+    if func == "covar_pop":
+        return cxy / n
+    if func == "covar_samp":
+        return None if n < 2 else cxy / (n - 1)
+    if func == "corr":
+        return None if cxx == 0 or cyy == 0 else cxy / _math.sqrt(cxx * cyy)
+    if func == "regr_slope":
+        return None if cxx == 0 else cxy / cxx
+    if func == "regr_intercept":
+        return None if cxx == 0 else avgy - (cxy / cxx) * avgx
+    if func == "regr_r2":
+        if cxx == 0:
+            return None
+        if cyy == 0:
+            return 1.0
+        return (cxy * cxy) / (cxx * cyy)
+    from secantus.sql import errors as _errors
+
+    raise _errors.feature_not_supported(f"unsupported statistical aggregate: {func}")

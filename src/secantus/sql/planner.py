@@ -5243,6 +5243,63 @@ def _string_agg_arg(node: exp.Expression) -> tuple[exp.Expression, str] | None:
     return inner.this, sep
 
 
+#: sqlglot gives each two-argument statistical aggregate its OWN node class
+#: (not an `Anonymous` call), all with the same `this` / `expression` shape.
+#: Built by lookup so a sqlglot version missing one of them degrades to "this
+#: aggregate is unsupported" rather than an AttributeError at import.
+_REGR_AGG_NODES = {
+    cls: name
+    for cls, name in (
+        (getattr(exp, attr, None), name)
+        for attr, name in (
+            ("Corr", "corr"),
+            ("CovarPop", "covar_pop"),
+            ("CovarSamp", "covar_samp"),
+            ("RegrAvgx", "regr_avgx"),
+            ("RegrAvgy", "regr_avgy"),
+            ("RegrCount", "regr_count"),
+            ("RegrIntercept", "regr_intercept"),
+            ("RegrR2", "regr_r2"),
+            ("RegrSlope", "regr_slope"),
+            ("RegrSxx", "regr_sxx"),
+            ("RegrSxy", "regr_sxy"),
+            ("RegrSyy", "regr_syy"),
+        )
+    )
+    if cls is not None
+}
+
+
+def _regr_filter_cond(node: exp.Expression, table: Any) -> Any:
+    """The lowered `FILTER (WHERE ...)` condition on a statistical aggregate,
+    or None."""
+    where = _agg_filter_where(node)
+    return _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
+
+
+def _regr_agg_args(node: exp.Expression) -> tuple[str, exp.Expression, exp.Expression] | None:
+    """If `node` is one of the two-argument statistical aggregates, return
+    ``(func, y_expr, x_expr)``.
+
+    Postgres spells them all `f(Y, X)` — the DEPENDENT variable FIRST, which is
+    the opposite of what the names suggest: `regr_slope(y, x)` is the slope of
+    y on x. Getting the order backwards silently returns the reciprocal."""
+    inner = node.this if isinstance(node, exp.Alias) else node
+    if isinstance(inner, exp.Filter):
+        inner = inner.this
+    for cls, fname in _REGR_AGG_NODES.items():
+        if isinstance(inner, cls):
+            y_node, x_node = inner.this, inner.args.get("expression")
+            if y_node is None or x_node is None:
+                return None
+            return (fname, y_node, x_node)
+    if isinstance(inner, exp.Anonymous):
+        fname = (inner.this if isinstance(inner.this, str) else inner.name).lower()
+        if fname in REGR_AGGREGATES and len(inner.expressions) == 2:
+            return (fname, inner.expressions[0], inner.expressions[1])
+    return None
+
+
 class _AggOrderTerms(list):
     """An ordered aggregate's sort terms, which also remember whether the call
     said ``DISTINCT``.
@@ -6893,6 +6950,76 @@ def _register_numeric_stat(
     return (n_f, sx_f, sx2_f)
 
 
+#: The two-argument statistical aggregates, all `f(Y, X)`. Every one is derived
+#: from the same six sums, so they share one accumulator set and differ only in
+#: the finishing arithmetic. `regr_count` is int8; the rest are float8.
+REGR_AGGREGATES = frozenset(
+    {
+        "corr",
+        "covar_pop",
+        "covar_samp",
+        "regr_avgx",
+        "regr_avgy",
+        "regr_count",
+        "regr_intercept",
+        "regr_r2",
+        "regr_slope",
+        "regr_sxx",
+        "regr_sxy",
+        "regr_syy",
+    }
+)
+
+
+def _register_regr_stat(
+    func: str,
+    yval: Any,
+    xval: Any,
+    fname: str,
+    accumulators: dict[str, Any],
+    project: dict[str, Any] | None,
+    post_aggregates: list[tuple[str, str, Any]],
+    filter_cond: Any = None,
+) -> tuple[str, ...]:
+    """Accumulate the six sums every two-argument statistical aggregate needs,
+    to be finished in Python by `typemap.regr_stat`.
+
+    A PAIR contributes only when BOTH arguments are non-null — that is what
+    makes `regr_count` 4 rather than 5 over a five-row table with one NULL x,
+    and it has to gate every sum, not just the count, or the means would be
+    taken over a different population than the count reports."""
+    both: Any = {
+        "$and": [
+            {"$ne": [{"$ifNull": [yval, None]}, None]},
+            {"$ne": [{"$ifNull": [xval, None]}, None]},
+        ]
+    }
+    if filter_cond is not None:
+        # `agg(...) FILTER (WHERE cond)`: a non-matching row contributes to
+        # nothing, the count included — so the filter joins the both-non-null
+        # test rather than being applied to the sums afterwards.
+        both = {"$and": [filter_cond, both]}
+
+    def paired(expr: Any) -> Any:
+        return {"$cond": [both, expr, 0]}
+
+    n_f = f"{fname}__n"
+    sx_f, sy_f = f"{fname}__sx", f"{fname}__sy"
+    sxx_f, syy_f, sxy_f = f"{fname}__sxx", f"{fname}__syy", f"{fname}__sxy"
+    accumulators[n_f] = {"$sum": {"$cond": [both, 1, 0]}}
+    accumulators[sx_f] = {"$sum": paired(xval)}
+    accumulators[sy_f] = {"$sum": paired(yval)}
+    accumulators[sxx_f] = {"$sum": paired({"$multiply": [xval, xval]})}
+    accumulators[syy_f] = {"$sum": paired({"$multiply": [yval, yval]})}
+    accumulators[sxy_f] = {"$sum": paired({"$multiply": [xval, yval]})}
+    helpers = (n_f, sx_f, sy_f, sxx_f, syy_f, sxy_f)
+    if project is not None:
+        for helper_field in helpers:
+            project[helper_field] = f"${helper_field}"
+    post_aggregates.append((fname, "regr_stat", (func, *helpers)))
+    return helpers
+
+
 def _keep_agg_helpers(
     helpers: tuple[str, ...], field_tags: dict[str, str], agg_field_names: list[str]
 ) -> None:
@@ -7712,6 +7839,24 @@ def _plan_grouping_sets_window_select(
             )
             agg_field_names.append(fname)
             return fname
+        regr = _regr_agg_args(node)
+        if regr is not None:
+            rfunc, y_node, x_node = regr
+            fname = names.fresh(rfunc)
+            helpers = _register_regr_stat(
+                rfunc,
+                _agg_arg_to_expr(y_node, table),
+                _agg_arg_to_expr(x_node, table),
+                fname,
+                accumulators,
+                None,
+                post_aggregates,
+                _regr_filter_cond(node, table),
+            )
+            _keep_agg_helpers(helpers, field_tags, agg_field_names)
+            field_tags[fname] = "int8" if rfunc == "regr_count" else "float8"
+            agg_field_names.append(fname)
+            return fname
         sa = _string_agg_arg(node)
         if sa is not None:
             # A function-wrapped ``string_agg`` (``decode(string_agg(…),
@@ -8447,6 +8592,24 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
                 if _is_true_array_agg(node)
                 else "json"
             )
+            agg_field_names.append(fname)
+            return fname
+        regr = _regr_agg_args(node)
+        if regr is not None:
+            rfunc, y_node, x_node = regr
+            fname = names.fresh(rfunc)
+            helpers = _register_regr_stat(
+                rfunc,
+                _agg_arg_to_expr(y_node, table),
+                _agg_arg_to_expr(x_node, table),
+                fname,
+                accumulators,
+                None,
+                post_aggregates,
+                _regr_filter_cond(node, table),
+            )
+            _keep_agg_helpers(helpers, field_tags, agg_field_names)
+            field_tags[fname] = "int8" if rfunc == "regr_count" else "float8"
             agg_field_names.append(fname)
             return fname
         sa = _string_agg_arg(node)
