@@ -42,7 +42,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from secantus.ordering import bson_equal
+from secantus.ordering import bson_same_stored_value
 from secantus.paths import get_path, set_path, unset_path
 
 #: Operators whose effect on an array mongod reports element-wise, provided
@@ -152,7 +152,10 @@ def _walk(
                 )
         return
     if isinstance(pre, list) and isinstance(post, list):
-        if pre == post:
+        # `bson_same_stored_value` recurses, so this fast path sees a signed
+        # zero nested in the array. A bare `pre == post` did not, and
+        # `[0.0]` -> `[-0.0]` returned here with an EMPTY `updatedFields`.
+        if bson_same_stored_value(pre, post):
             return
         # mongod reports an array by the OPERATION that changed it, not by
         # diffing the values -- see this module's docstring. Only an append or
@@ -217,7 +220,13 @@ def _walk(
     # BSON equality, not Python's: `True == 1` is true in Python, so a field
     # changing from `true` to `1` produced NO oplog entry at all -- a change a
     # change-stream consumer never saw. The two are different BSON types.
-    if not bson_equal(pre, post):
+    # `bson_same_stored_value`, not `bson_equal`: mongod's EQUALITY calls
+    # `0.0` and `-0.0` the same value while its CHANGE detection does not, and
+    # this is the change-detection side. With `bson_equal` here a `$set` of
+    # `-0.0` over `0.0` produced an EMPTY `updatedFields` -- the consumer was
+    # told the document was updated and never told which field (probed 8.2.11,
+    # 2026-09-05).
+    if not bson_same_stored_value(pre, post):
         updated[path] = post
         _record_ambiguous(path, segments, disambiguated)
 

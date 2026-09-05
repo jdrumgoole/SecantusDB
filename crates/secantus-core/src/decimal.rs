@@ -64,7 +64,10 @@ pub enum Dec {
 }
 
 impl Dec {
-    fn is_zero(&self) -> bool {
+    /// A FINITE zero of either sign. `Dec::Fin` in the pattern is the finite
+    /// check -- a NaN or an infinity never matches. Public because `$mul`'s
+    /// stored-zero rule needs it (see `update::is_zero_number`).
+    pub fn is_zero(&self) -> bool {
         matches!(self, Dec::Fin { coeff, .. } if coeff.iter().all(|d| *d == 0))
     }
 }

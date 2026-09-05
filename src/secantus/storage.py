@@ -1440,6 +1440,38 @@ def _is_nan_value(v: Any) -> bool:
     return _is_nan(v)
 
 
+def _doc_changed(new: Any, old: Any) -> bool:
+    """Did an update actually change the document?
+
+    NOT a bare ``new != old``. Python's ``==`` treats ``-0.0`` and ``0.0`` as
+    equal -- and an ``int`` ``0`` as equal to a ``float`` ``-0.0`` -- so
+    ``{$set: {a: -0.0}}`` over ``a: 0.0`` compared EQUAL, the write was skipped,
+    and the value the caller asked to store was silently not stored:
+    ``modifiedCount: 0``, no change-stream event, and a read-back of ``0.0``.
+    mongod stores it and reports the update (probed 8.2.11, 2026-09-05).
+
+    So a difference in the ENCODED BSON also counts as a change. That catches
+    both shapes with one rule -- signed zero and a numeric type change -- since
+    BSON encodes each distinctly.
+
+    The two comparisons are complementary and BOTH are needed. Bytes alone
+    would call two NaNs equal, and `!=` alone cannot see a signed zero. Note
+    that this does not make the pair a model of mongod's `nModified`: that rule
+    is per-OPERATOR (`$set` of a NaN over the same NaN is 0 while `$inc: 1` on
+    it is 1, with a byte-identical `000000000000f87f` stored either way), and is
+    tracked separately in `tasks/backlog.md`. This function fixes only the case
+    where the document genuinely differs and the write was dropped.
+    """
+    if new != old:
+        return True
+    try:
+        return bson.encode(new) != bson.encode(old)
+    except Exception:
+        # Anything BSON cannot encode is not something we can compare this way;
+        # `==` already said they match.
+        return False
+
+
 def _op_implies_bound(qop: str, qv: Any, pop: str, pv: Any) -> bool:
     """Does a single query constraint ``(qop, qv)`` guarantee the partial
     bound ``(pop, pv)``? Returns ``False`` for any operator pairing it can't
@@ -5962,7 +5994,7 @@ class Storage:
                     positional_matches=pos,
                     let=let,
                 )
-                if new != doc:
+                if _doc_changed(new, doc):
                     # ``validationLevel: "moderate"`` exempts a document that
                     # ALREADY failed the validator before this update — the level
                     # exists so a validator can be added to a collection with
@@ -6128,7 +6160,7 @@ class Storage:
                     positional_matches=pos,
                     let=let,
                 )
-                if new != doc:
+                if _doc_changed(new, doc):
                     # Document-validator check: collection-level
                     # ``validator`` (set via ``create`` / ``collMod``)
                     # rejects updates whose result fails the predicate.
