@@ -117,6 +117,11 @@ SETUP = [
 ]
 
 QUERIES = [
+    # A top-level JOIN in a plain select -- RangeInfo.fetch's shape.
+    "SELECT t.typname, r.rngsubtype FROM pg_type t"
+    " JOIN pg_range r ON r.rngtypid = t.oid ORDER BY r.rngsubtype",
+    "SELECT rngtypid, rngsubtype FROM pg_range ORDER BY rngtypid",
+    "SELECT t.typname FROM pg_type t LEFT JOIN pg_range r ON r.rngtypid = t.oid WHERE t.oid = 25",
     # Scalar calls, constant and over columns; PostgreSQL replaces only the
     # FIRST match unless `g` is given, which is not most regex libraries'
     # default.

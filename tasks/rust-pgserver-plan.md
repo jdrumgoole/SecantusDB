@@ -1618,7 +1618,25 @@ encoding applied on the way out.
 **Probe: EnumInfo.fetch verified live for an enum and a non-enum; pg_enum and
 the join shapes 0-divergence.**
 
-### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)
+### 0.46 RangeInfo.fetch: pg_range and a plain-select join (2026-09-06)
+
+**3161 -> 3167.** Small, and mostly reuse: `RangeInfo.fetch`'s query is the
+same `pg_type` JOIN the enum work built -- except it is a PLAIN top-level join,
+no aggregate wrapper. So the `JoinSelect` source moved onto `Select` as well as
+`Aggregate` (`plan_join_plain_select` wraps it, the executor's Select arm
+materialises it through the same `join_docs`), and `pg_range` joined the
+virtual catalog: six rows from `range_element` + `oid_of_name`, so the table
+and the range casts read one source.
+
+**A JOIN comes in two syntactic homes** -- inside a subquery under an aggregate
+(EnumInfo) and at the top of a plain select (RangeInfo) -- and the executor's
+`join_docs` serves both; only the PLANNER wrapper differs. Worth remembering
+before assuming a feature is one shape.
+
+**Probe: pg_range's 6 rows and RangeInfo.fetch for four range types, plus a
+plain-join + LEFT-JOIN-miss shape -- 0 divergences.**
+
+### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)
 
 The 207 `test_enum.py` failures all die in one SESSION fixture (`ensure_enum`:
 `drop type if exists X; create type X as enum (...)`), so nothing is known yet
