@@ -1353,7 +1353,72 @@ taken by the invoke task, which is what earlier sections used.
 measuring the PATH as much as the server, and the failure looks like 119 server
 failures rather than a missing binary.
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181 -> 2219 -> 2256 -> 2347 -> 2589 (all on the no-mypy scale of 0.39a; the same commit measures 2741 through `uv run`. 0.35 measured +29 on a pre-0.34 base and is not in this line).**
+### 0.40 an array takes its type from its ELEMENTS (2026-09-05)
+
+**2739 -> 2886, +169 / -22** (all 22 are `test_leak` churn), on the CANONICAL
+scale of 0.39a -- this and everything after it is measured through `uv run`.
+
+`array[%s::float4]` came back as an array of STRINGS, as did every array built
+over a parameter. The values were computed correctly and DESCRIBED wrongly: the
+array's type was read off the values, and **the describe pass sees no values at
+all** -- every parameter is NULL there -- so it settled on `text[]`, and the
+client decoded floats as text because the row description is what it believes.
+Same lesson as 0.39, one layer up: **anything typed from a VALUE is wrong on
+the describe path.**
+
+The type now comes from the elements' EXPRESSIONS. Mixed numerics widen in
+PostgreSQL's order -- **measured, not assumed**: `int2 < int4 < int8 < numeric
+< float4 < float8`, so `array[1, 1.5]` is `numeric[]` and `array[1::float4,
+1.5]` is `float4[]` (the float wins over the numeric). A bare NULL literal
+contributes no type.
+
+**Getting the type right exposed the next bug in the same path**: `array[1,
+1.5]` then returned `[Decimal('1'), None]`, because the text encoder chose its
+element conversion from the FIRST element rather than from the column's type.
+Arrays now go through the typed encoder in text as well as binary.
+
+**A one-word fix worth 34 tests:** `array_element` treated any element starting
+with `{` as a nested array, including a QUOTED one, so `'{"{"}'::text[]`
+answered "malformed array literal". `{` is an ordinary member of any corpus
+that walks the ASCII range, so it failed every text-array round-trip.
+
+**Also:** arrays of date / time / timestamp / interval / json had no wire type
+and were described as `varchar`.
+
+**And a SILENT DATA LOSS found by widening the probe's alphabet from 1..60 to
+1..256:** `array_element` trimmed with Rust's `str::trim`, which strips U+0085
+and U+00A0. PostgreSQL keeps them, so an unquoted element that was one of those
+two characters came back as the EMPTY STRING -- a character in, nothing out,
+and invisible to any test whose alphabet is ASCII. `trim_matches(char::
+is_ascii_whitespace)` is the fix. **When a corpus test disagrees on a few
+elements out of hundreds, diff the ELEMENTS rather than reading the assertion:
+the two that differed named the bug immediately.**
+
+**And a SILENT DATA LOSS found by widening the probe's alphabet from 1..60 to
+1..256:** `array_element` trimmed with Rust's `str::trim`, which strips U+0085
+and U+00A0. PostgreSQL keeps them, so an unquoted element that was one of those
+two characters came back as the EMPTY STRING -- a character in, nothing out,
+invisible to any test whose alphabet is ASCII. `trim_matches(char::is_ascii_
+whitespace)` is the fix. **When a corpus test disagrees on a few elements out
+of hundreds, DIFF THE ELEMENTS rather than reading the assertion**: the two
+that differed named the bug immediately.
+
+**Probe: 80 array shapes across both formats -- 0 divergences.**
+
+**Killing a gauge run leaves psycopg's SEGFAULT SENTINEL behind.** Their
+`conftest.pytest_sessionstart` sets `.pytest_cache/v/segfault` at session start
+and clears it at the end, so an interrupted run makes the NEXT one refuse
+everything with an `INTERNALERROR` and *"Previous run resulted in segfault! Not
+running any test"* -- which reads like a catastrophic regression and is a stale
+file. `rm vendor/psycopg/.pytest_cache/v/segfault`.
+
+**Do not run the gauge and the full pytest suite at the same time.** Tried it
+here to save wall-clock: load average hit 8, and the gauge -- normally 90
+seconds -- was at 59% after FORTY MINUTES, because its per-test timeout is 20s
+and everything was starved. Same failure mode CLAUDE.md records for
+`validate-all --jobs 8`, on one machine with two jobs.
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181 -> 2219 -> 2256 -> 2347 -> 2589 | 2739 -> 2886 (everything before the bar is on the no-mypy scale of 0.39a; the same commit measures 2741 through `uv run`. 0.35 measured +29 on a pre-0.34 base and is not in this line).**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

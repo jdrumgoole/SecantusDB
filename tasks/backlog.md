@@ -4592,7 +4592,14 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   encoding per fetch, rather than materialising `DataRow`s once.
 - **Rust PG server: a multidimensional array sent as a BINARY parameter is
   refused (`0A000`)**, matching the refusal when returning one. Both lift
-  together when array wire encoding grows a second dimension.
+  together when array wire encoding grows a second dimension. The array LITERAL
+  parser handles nesting (`'{{1,2},{3,4}}'` parses); it is the wire encoding
+  and `rust-postgres`'s single-dimension `ToSql` that stop at one dimension.
+- **Rust PG server: an array of MIXED non-numeric types keeps the
+  value-derived type where PostgreSQL coerces and often errors.** `array[1,
+  'a']` is `22P02` on PostgreSQL (the unknown literal is coerced to `integer`
+  and fails); here it answers a text array. Mixed NUMERIC types are handled --
+  they widen in PostgreSQL's order (2026-09-05 probe).
 - **Rust PG server: `DROP` of anything but a table leaks Rust debug
   formatting into the client-facing message** — `DROP of Ok(ObjectType) is not
   supported yet`. Whatever the eventual support, the MESSAGE is a bug on its

@@ -1470,7 +1470,50 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             .as_ref()
             .map(type_name_of)
             .unwrap_or_else(|| inferred_type(value).to_string()),
-        Some(N::AArrayExpr(_)) => inferred_type(value).to_string(),
+        // An array's type comes from its ELEMENTS' static types, not from the
+        // values it happens to hold. The describe path plans with no values at
+        // all -- every parameter is NULL there -- so an array typed from its
+        // values described `array[$1::float4]` as `text[]`, and the client
+        // decoded floats as text because the row description is what it
+        // believes.
+        Some(N::AArrayExpr(a)) => {
+            let items = match value {
+                Bson::Array(items) => items.as_slice(),
+                _ => &[],
+            };
+            let mut common: Option<String> = None;
+            for (i, element) in a.elements.iter().enumerate() {
+                let value = items.get(i).unwrap_or(&Bson::Null);
+                // An UNTYPED parameter contributes nothing: PostgreSQL takes
+                // the type from the elements that have one.
+                if matches!(element.node.as_ref(), Some(N::ParamRef(p))
+                    if declared_param_type(usize::try_from(p.number).unwrap_or(0)).is_none())
+                {
+                    continue;
+                }
+                // A bare NULL literal contributes nothing either: `array[null,
+                // 1]` is `int4[]` on PostgreSQL.
+                if matches!(element.node.as_ref(), Some(N::AConst(c)) if c.isnull) {
+                    continue;
+                }
+                let t = static_type(element, value);
+                match &common {
+                    None => common = Some(t),
+                    Some(existing) if *existing == t => {}
+                    Some(existing) => match wider_numeric(existing, &t) {
+                        Some(wider) => common = Some(wider),
+                        // A mix this server has no rule for. The value-derived
+                        // answer is what it had before, and PostgreSQL would
+                        // coerce the unknown side rather than widen.
+                        None => return inferred_type(value).to_string(),
+                    },
+                }
+            }
+            match common {
+                Some(t) => format!("{t}[]"),
+                None => inferred_type(value).to_string(),
+            }
+        }
         // A PARAMETER's type is the one the client declared, not the one its
         // decoded value suggests: psycopg sends a small integer as `int2`, and
         // `pg_typeof` answers `smallint` where the value alone says `integer`.
@@ -1529,6 +1572,19 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
 }
 
 /// The PostgreSQL type a constant value carries when nothing declares one.
+/// The wider of two NUMERIC types, in PostgreSQL's own order.
+///
+/// Measured, not assumed: `array[1, 1.5]` is `numeric[]`, `array[1::float4,
+/// 1.5]` is `float4[]` (the float wins over the numeric), and `array[1::float4,
+/// 1::float8]` is `float8[]`. `None` for anything that is not two numerics,
+/// which is a mix this server does not resolve.
+fn wider_numeric(a: &str, b: &str) -> Option<String> {
+    const LADDER: [&str; 6] = ["int2", "int4", "int8", "numeric", "float4", "float8"];
+    let rank = |t: &str| LADDER.iter().position(|x| *x == t);
+    let (ra, rb) = (rank(a)?, rank(b)?);
+    Some(LADDER[ra.max(rb)].to_string())
+}
+
 fn inferred_type(v: &Bson) -> &'static str {
     match v {
         Bson::Int32(_) => "int4",
@@ -2977,12 +3033,21 @@ fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
 }
 
 fn array_element(raw: &str, was_quoted: bool, element_type: &str) -> Result<Bson> {
-    let trimmed = raw.trim();
+    // ASCII whitespace only. Rust's `trim` also strips U+0085 and U+00A0,
+    // which PostgreSQL keeps -- so a text array carrying either of them (any
+    // corpus that walks the byte range does) round-tripped them to the EMPTY
+    // STRING. Silent data loss, and invisible in any test whose alphabet is
+    // ASCII.
+    let trimmed = raw.trim_matches(|c: char| c.is_ascii_whitespace());
     // An UNQUOTED `NULL` is the null element; a quoted one is the string.
     if !was_quoted && trimmed.eq_ignore_ascii_case("null") {
         return Ok(Bson::Null);
     }
-    if trimmed.starts_with('{') {
+    // Only an UNQUOTED `{` opens a nested array. A quoted one is the string
+    // `{`, and treating it as a sub-array made `'{"{"}'::text[]` -- an ordinary
+    // element in any corpus that walks the ASCII range -- answer "malformed
+    // array literal" for the element rather than returning it.
+    if !was_quoted && trimmed.starts_with('{') {
         return parse_array(trimmed, element_type);
     }
     let text = if was_quoted { raw } else { trimmed };
