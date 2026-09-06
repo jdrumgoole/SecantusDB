@@ -19,6 +19,9 @@ async-trait = "0.1"
 futures = "0.3"
 pgwire = { version = "0.40", default-features = false, features = ["server-api"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+# The pure query engine, for filtering VIRTUAL tables' computed rows --
+# storage filters real tables, but a virtual row never reaches storage.
+secantus-core = { path = "../secantus-core" }
 secantus-pgcatalog = { path = "../secantus-pgcatalog" }
 secantus-pgplan = { path = "../secantus-pgplan" }
 secantus-storage = { path = "../secantus-storage" }

@@ -15,6 +15,7 @@ use bson::{doc, Bson, Document};
 use std::str::FromStr;
 
 pub mod json;
+pub mod pgtypes;
 pub mod range;
 pub mod scalar;
 
@@ -76,6 +77,8 @@ pub enum Error {
     /// A parameter whose type the client did not declare and context cannot
     /// resolve -> 42P18.
     IndeterminateDatatype(String),
+    /// A named object (a type, mostly) that does not exist -> 42704.
+    UndefinedObject(String),
 }
 
 impl std::fmt::Display for Error {
@@ -96,7 +99,8 @@ impl std::fmt::Display for Error {
             Error::DataException(m) | Error::InvalidParameter(m) => write!(f, "{m}"),
             Error::InvalidColumnReference(m)
             | Error::UndefinedFunction(m)
-            | Error::IndeterminateDatatype(m) => write!(f, "{m}"),
+            | Error::IndeterminateDatatype(m)
+            | Error::UndefinedObject(m) => write!(f, "{m}"),
             Error::MultipleCommands => {
                 write!(
                     f,
@@ -128,6 +132,7 @@ impl Error {
             Error::UndefinedFunction(_) => "42883", // undefined_function
             Error::MultipleCommands => "42601",     // syntax_error, as PostgreSQL reports it
             Error::IndeterminateDatatype(_) => "42P18", // indeterminate_datatype
+            Error::UndefinedObject(_) => "42704",   // undefined_object
         }
     }
 }
@@ -239,6 +244,10 @@ pub struct Select {
     pub series: Option<Series>,
     /// Output columns in order, as (output name, stored field).
     pub columns: Vec<(String, String)>,
+    /// A cast to apply to each output column, parallel to `columns`. `None`
+    /// almost everywhere; carries `col::regtype::text` and friends, which is
+    /// how a client's type-discovery query reads the catalog.
+    pub casts: Vec<Option<String>>,
     pub filter: Document,
     pub order: Vec<OrderKey>,
     /// `None` = no LIMIT. `LIMIT 0` is a real limit, not an absent one.
@@ -969,11 +978,48 @@ fn plan_series_select(
         table: String::new(),
         series: Some(series),
         columns,
+        casts: Vec::new(),
         filter: Document::new(),
         order,
         limit,
         offset,
     }))
+}
+
+/// The column NAME in a ColumnRef, with any table qualification stripped.
+///
+/// `t.oid` arrives as two fields; only one table can be in FROM here, so any
+/// qualifier names it (or its alias) and the trailing part is the column.
+fn column_ref_name(c: &pg_query::protobuf::ColumnRef) -> Option<String> {
+    let last = c.fields.last().and_then(|f| f.node.as_ref());
+    match last {
+        Some(N::String(st)) => Some(st.sval.clone()),
+        _ => None,
+    }
+}
+
+/// A chain of casts over a single column: `oid::regtype::text` is the column
+/// `oid` with `["regtype", "text"]` applied outward. Anything that is not a
+/// cast-of-(cast-of-...)-column is refused here and handled by the caller.
+fn cast_chain_over_column(tc: &pg_query::protobuf::TypeCast) -> Result<(String, Vec<String>)> {
+    let ty = tc
+        .type_name
+        .as_ref()
+        .map(type_name_of)
+        .ok_or_else(|| Error::Parse("cast with no type".into()))?;
+    match tc.arg.as_ref().and_then(|a| a.node.as_ref()) {
+        Some(N::ColumnRef(c)) => {
+            let name =
+                column_ref_name(c).ok_or_else(|| Error::Unsupported("this cast target".into()))?;
+            Ok((name, vec![ty]))
+        }
+        Some(N::TypeCast(inner)) => {
+            let (name, mut chain) = cast_chain_over_column(inner)?;
+            chain.push(ty);
+            Ok((name, chain))
+        }
+        _ => Err(Error::Unsupported("a cast over this expression".into())),
+    }
 }
 
 fn plan_select(
@@ -1004,6 +1050,7 @@ fn plan_select(
     let def = lookup(&table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
 
     let mut columns: Vec<(String, String)> = Vec::new();
+    let mut casts: Vec<Option<String>> = Vec::new();
     for t in &s.target_list {
         let rt = match t.node.as_ref() {
             Some(N::ResTarget(rt)) => rt,
@@ -1011,18 +1058,35 @@ fn plan_select(
             None => continue,
         };
         match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
+            // `col::type [AS out]` -- a cast of a column, which is how a
+            // client's type-discovery query reads the catalog
+            // (`oid::regtype::text AS regtype`). Chained casts flatten into
+            // the last one applied to the innermost column.
+            Some(N::TypeCast(tc)) => {
+                let (col_name, chain) = cast_chain_over_column(tc)?;
+                let field = def
+                    .field_of(&col_name)
+                    .ok_or_else(|| Error::UndefinedColumn(col_name.clone()))?;
+                let out = if rt.name.is_empty() {
+                    chain.last().cloned().unwrap_or_else(|| col_name.clone())
+                } else {
+                    rt.name.clone()
+                };
+                columns.push((out, field));
+                casts.push(Some(chain.join("::")));
+                continue;
+            }
             Some(N::ColumnRef(c)) => {
                 let first = c.fields.first().and_then(|f| f.node.as_ref());
                 if matches!(first, Some(N::AStar(_))) {
                     for col in &def.columns {
                         columns.push((col.name.clone(), col.field()));
+                        casts.push(None);
                     }
                     continue;
                 }
-                let name = match first {
-                    Some(N::String(st)) => st.sval.clone(),
-                    _ => return Err(Error::Unsupported("this target".into())),
-                };
+                let name =
+                    column_ref_name(c).ok_or_else(|| Error::Unsupported("this target".into()))?;
                 let field = def
                     .field_of(&name)
                     .ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
@@ -1032,6 +1096,7 @@ fn plan_select(
                     rt.name.clone()
                 };
                 columns.push((out, field));
+                casts.push(None);
             }
             Some(other) => return Err(Error::Unsupported(disc(other))),
             None => return Err(Error::Unsupported("an empty target".into())),
@@ -1068,14 +1133,7 @@ fn plan_select(
                 columns[idx - 1].1.clone()
             }
             Some(N::ColumnRef(c)) => {
-                let col = c
-                    .fields
-                    .first()
-                    .and_then(|f| f.node.as_ref())
-                    .and_then(|n| match n {
-                        N::String(st) => Some(st.sval.clone()),
-                        _ => None,
-                    })
+                let col = column_ref_name(c)
                     .ok_or_else(|| Error::Unsupported("this ORDER BY expression".into()))?;
                 def.field_of(&col)
                     .ok_or_else(|| Error::UndefinedColumn(col.clone()))?
@@ -1128,6 +1186,7 @@ fn plan_select(
         series: None,
         table,
         columns,
+        casts,
         filter,
         order,
         limit,
@@ -1530,6 +1589,9 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             Some(pg_query::protobuf::a_const::Val::Boolval(_)) => "bool".to_string(),
             _ => inferred_type(value).to_string(),
         },
+        Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("to_regtype") => {
+            "regtype".to_string()
+        }
         // `int4range(1,5)` is an `int4range`, not the text it renders as.
         Some(N::FuncCall(f)) if func_name(f).as_deref().is_some_and(range::is_range_type) => {
             func_name(f).unwrap_or_default()
@@ -1552,6 +1614,21 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                 };
             }
             let op = operator_name(e).unwrap_or("");
+            // A json operator's result type comes from the operator and the
+            // LEFT operand: `->` keeps the json flavour, `->>` is text, `?` is
+            // a boolean.
+            if matches!(
+                op,
+                "->" | "->>" | "#>" | "#>>" | "?" | "?|" | "?&" | "@>" | "<@"
+            ) {
+                if let Some(target) = static_json_type(e.lexpr.as_deref(), &Bson::Null) {
+                    return match op {
+                        "->" | "#>" => target,
+                        "->>" | "#>>" => "text".to_string(),
+                        _ => "bool".to_string(),
+                    };
+                }
+            }
             match op {
                 "||" => "text".to_string(),
                 "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" => "bool".to_string(),
@@ -1762,6 +1839,7 @@ fn plan_select_srf(
         table: String::new(),
         series: Some(series),
         columns: vec![(column.clone(), column)],
+        casts: Vec::new(),
         filter: Document::new(),
         order,
         limit,
@@ -1806,6 +1884,21 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             rt.name.clone()
                         },
                         ConstCol::Value(pg_typeof(f, params)?),
+                        "regtype".to_string(),
+                    ));
+                    continue;
+                }
+                // `to_regtype` in a bare target list, same shape as above; the
+                // value itself is computed by `const_value`, which is also
+                // what evaluates it inside a WHERE clause.
+                if name == "to_regtype" {
+                    columns.push((
+                        if rt.name.is_empty() {
+                            "to_regtype".to_string()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::Value(const_value(rt.val.as_ref().expect("checked"), params)?),
                         "regtype".to_string(),
                     ));
                     continue;
@@ -2031,6 +2124,44 @@ pub fn companion_field(field: &str) -> String {
 /// can skip it.
 pub fn is_companion_field(name: &str) -> bool {
     name.starts_with(SUBMS_PREFIX)
+}
+
+/// The key of the one-field document a `regtype` VALUE is carried as.
+///
+/// A regtype is an oid that RENDERS as the type's display name -- two facts no
+/// single scalar holds. `select to_regtype('text')` prints `text` under oid
+/// 2206, while `where t.oid = to_regtype('text')` compares 25. The document
+/// keeps the oid; the render helpers below produce the name.
+pub const REGTYPE_KEY: &str = "__regtype_oid";
+
+pub(crate) fn regtype_value(oid: i64) -> Bson {
+    let mut d = Document::new();
+    d.insert(REGTYPE_KEY, Bson::Int64(oid));
+    Bson::Document(d)
+}
+
+/// The oid inside a regtype value, or `None` for any other value.
+pub fn regtype_oid(v: &Bson) -> Option<i64> {
+    match v {
+        Bson::Document(d) if d.len() == 1 => d.get_i64(REGTYPE_KEY).ok(),
+        _ => None,
+    }
+}
+
+/// The display rendering of a regtype value: `integer`, not `int4`, exactly as
+/// `::regtype::text` prints on PostgreSQL. An ARRAY type renders as its
+/// element's display name plus `[]`.
+pub fn regtype_text(oid: i64) -> String {
+    if let Some(name) = pgtypes::name_of_oid(oid) {
+        return display_type(name);
+    }
+    if let Some((name, _, _)) = pgtypes::BUILTIN_TYPES
+        .iter()
+        .find(|(_, _, arr)| *arr == oid)
+    {
+        return format!("{}[]", display_type(name));
+    }
+    oid.to_string()
 }
 
 /// Keys of the composite `cast_value` returns for a timestamp that carries
@@ -2259,6 +2390,15 @@ fn declared_param_type(n: usize) -> Option<String> {
 /// force. The public door onto `cast_value` for the wire layer, which has text
 /// from a client and a declared oid and needs the same value a literal of that
 /// type would produce.
+/// As `cast_text_to`, for a VALUE that is already typed -- the wire layer's
+/// door onto per-column cast chains (`oid::regtype::text`).
+pub fn cast_value_with_tz(value: Bson, target: &str, tz: &TimeZoneSetting) -> Result<Bson> {
+    let previous = PLAN_TIMEZONE.with(|t| t.replace(tz.clone()));
+    let out = cast_value(value, target);
+    PLAN_TIMEZONE.with(|t| *t.borrow_mut() = previous);
+    out
+}
+
 pub fn cast_text_to(text: &str, target: &str, tz: &TimeZoneSetting) -> Result<Bson> {
     let previous = PLAN_TIMEZONE.with(|t| t.replace(tz.clone()));
     let out = cast_value(Bson::String(text.to_string()), target);
@@ -3105,6 +3245,71 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     if value == Bson::Null {
         return Ok(Bson::Null);
     }
+    // A regtype value casts onward by its two natures: to text as its display
+    // NAME, to any integer type as its OID.
+    if let Some(oid) = regtype_oid(&value) {
+        return match target {
+            "regtype" => Ok(value),
+            "text" | "varchar" | "name" | "bpchar" => Ok(Bson::String(regtype_text(oid))),
+            "int4" | "int8" | "oid" | "integer" | "int" | "bigint" => Ok(Bson::Int64(oid)),
+            _ => Err(Error::Unsupported(format!("a regtype cast to {target}"))),
+        };
+    }
+    // `oid` is an UNSIGNED 32-bit integer: a negative literal wraps
+    // (`(-1)::oid` is 4294967295), a value past 2^32-1 is out of range, and a
+    // non-numeric string is invalid text. All measured on PG 14.
+    if target == "oid" {
+        let out_of_range = || Error::NumericOutOfRange("OID out of range".into());
+        let from_i64 = |v: i64| -> Result<Bson> {
+            if !(-(1i64 << 31)..(1i64 << 32)).contains(&v) {
+                return Err(out_of_range());
+            }
+            Ok(Bson::Int64(v.rem_euclid(1i64 << 32)))
+        };
+        return match value {
+            Bson::Int32(v) => from_i64(i64::from(v)),
+            Bson::Int64(v) => from_i64(v),
+            // A literal past i32 arrives as a decimal; whole ones are still
+            // oids (`4294967295::oid`), and anything past 2^32-1 is the same
+            // out-of-range PostgreSQL reports.
+            Bson::Double(v) if v.fract() == 0.0 => from_i64(v as i64),
+            Bson::Decimal128(d) => match d.to_string().parse::<i64>() {
+                Ok(v) => from_i64(v),
+                Err(_) => Err(out_of_range()),
+            },
+            Bson::String(text) => match text.trim().parse::<i64>() {
+                Ok(v) if (0..(1i64 << 32)).contains(&v) => Ok(Bson::Int64(v)),
+                Ok(_) => Err(out_of_range()),
+                Err(_) => Err(Error::InvalidText(format!(
+                    "invalid input syntax for type oid: \"{}\"",
+                    text.trim()
+                ))),
+            },
+            other => Err(Error::Unsupported(format!(
+                "a cast of {} to oid",
+                bson_kind(&other)
+            ))),
+        };
+    }
+    if target == "regtype" {
+        return match value {
+            Bson::Int32(oid) => Ok(regtype_value(i64::from(oid))),
+            Bson::Int64(oid) => Ok(regtype_value(oid)),
+            // `'text'::regtype` -- unlike `to_regtype`, an unknown NAME is an
+            // error here, which is why psycopg prefers the function.
+            Bson::String(name) => match pgtypes::oid_of_name(&name) {
+                Some(oid) => Ok(regtype_value(oid)),
+                None => Err(Error::UndefinedObject(format!(
+                    "type \"{}\" does not exist",
+                    name.trim()
+                ))),
+            },
+            other => Err(Error::Unsupported(format!(
+                "a cast of {} to regtype",
+                bson_kind(&other)
+            ))),
+        };
+    }
     let as_text = |v: &Bson| match v {
         Bson::String(s) => s.clone(),
         // A timestamp renders as PostgreSQL renders it, not as a debug dump.
@@ -3237,11 +3442,6 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             _ => Err(bad("boolean", &value)),
         },
         "text" | "varchar" | "bpchar" | "char" | "name" => Ok(Bson::String(as_text(&value))),
-        // `'int4'::regtype` is the TYPE named by the text, printed the way
-        // PostgreSQL prints it -- so `int4` and `integer` both come back as
-        // `integer`. Only the naming is reproduced here; a regtype is really an
-        // oid, and this server has no `pg_type` to resolve one against.
-        "regtype" => Ok(Bson::String(display_type(as_text(&value).trim()))),
         // `json` VALIDATES and keeps the text it was given -- whitespace, key
         // order and duplicate keys all survive. `jsonb` parses and stores a
         // structure, so it comes back normalised.
@@ -3376,6 +3576,104 @@ fn static_range_type(n: Option<&pg_query::protobuf::Node>) -> Option<String> {
         Some(N::TypeCast(tc)) => named(type_name_of(tc.type_name.as_ref()?)),
         _ => None,
     }
+}
+
+/// The JSON operators: `->`, `->>`, `#>`, `#>>` and `?`.
+///
+/// A json value is carried as its TEXT, so by the time two operands are values
+/// there is nothing to tell `{"a": 1}` from any other string -- the left
+/// operand's static type is what says this is a json operator at all, exactly
+/// as it does for ranges.
+///
+/// Every lookup that does not apply answers SQL NULL rather than an error: a
+/// missing key, an index past the end, a name against an array. That is
+/// PostgreSQL's rule and the reason these operators are usable at all.
+fn json_operator(op: &str, target: &str, lhs: &Bson, rhs: &Bson) -> Result<Bson> {
+    let text = value_text(lhs);
+    let parsed = json::parse(&text).map_err(|_| {
+        Error::InvalidText(format!(
+            "invalid input syntax for type {target}: \"{}\"",
+            text.trim()
+        ))
+    })?;
+    // `#>` and `#>>` take a PATH; the others take one key.
+    let steps: Vec<String> = if op.starts_with('#') && op != "#" {
+        match rhs {
+            Bson::Array(items) => items.iter().map(value_text).collect(),
+            // A path given as its text form, which is how an unknown-typed
+            // parameter arrives.
+            other => match cast_value(other.clone(), "text[]")? {
+                Bson::Array(items) => items.iter().map(value_text).collect(),
+                _ => return Err(Error::Unsupported(format!("a {op} path of this shape"))),
+            },
+        }
+    } else {
+        vec![value_text(rhs)]
+    };
+
+    if op == "?" {
+        return Ok(Bson::Boolean(json::contains_key(&parsed, &steps[0])));
+    }
+    // `?|` is ANY of the keys, `?&` is ALL of them.
+    if op == "?|" || op == "?&" {
+        let keys: Vec<String> = match rhs {
+            Bson::Array(items) => items.iter().map(value_text).collect(),
+            other => match cast_value(other.clone(), "text[]")? {
+                Bson::Array(items) => items.iter().map(value_text).collect(),
+                _ => return Err(Error::Unsupported(format!("a {op} key list of this shape"))),
+            },
+        };
+        let mut hits = keys.iter().map(|k| json::contains_key(&parsed, k));
+        return Ok(Bson::Boolean(if op == "?|" {
+            hits.any(|x| x)
+        } else {
+            hits.all(|x| x)
+        }));
+    }
+    // Containment compares by VALUE, so key order and whitespace do not count.
+    if op == "@>" || op == "<@" {
+        let other = value_text(rhs);
+        let other = json::parse(&other).map_err(|_| {
+            Error::InvalidText(format!(
+                "invalid input syntax for type {target}: \"{}\"",
+                other.trim()
+            ))
+        })?;
+        return Ok(Bson::Boolean(if op == "@>" {
+            json::contains(&parsed, &other)
+        } else {
+            json::contains(&other, &parsed)
+        }));
+    }
+    let mut current = Some(&parsed);
+    for step in &steps {
+        current = current.and_then(|v| json::member(v, step));
+    }
+    let Some(found) = current else {
+        return Ok(Bson::Null);
+    };
+    // `->` and `#>` answer a json DOCUMENT; `->>` and `#>>` answer text, in
+    // which a json string loses its quotes and a json null becomes SQL NULL.
+    if op == "->" || op == "#>" {
+        return Ok(Bson::String(if target == "jsonb" {
+            json::render_jsonb(found)
+        } else {
+            json::render_json(found)
+        }));
+    }
+    Ok(match json::as_sql_text(found) {
+        Some(text) => Bson::String(text),
+        None => Bson::Null,
+    })
+}
+
+/// The json type an operand is statically known to have, for the operators
+/// above. `None` means this is not a json operand and `->` is something else
+/// (or nothing this server knows).
+fn static_json_type(n: Option<&pg_query::protobuf::Node>, value: &Bson) -> Option<String> {
+    let n = n?;
+    let t = static_type(n, value);
+    (t == "json" || t == "jsonb").then_some(t)
 }
 
 fn coerce_unknown_operand(
@@ -3796,7 +4094,7 @@ fn bson_kind(v: &Bson) -> &'static str {
 ///
 /// PostgreSQL gives NaN a place in a TOTAL order, unlike IEEE: NaN equals
 /// itself and sorts ABOVE every number, infinity included. Probed on PG 14.
-fn compare_decimal_text(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+pub(crate) fn compare_decimal_text(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
     let rank = |t: &str| -> Option<i32> {
         let u = t.trim().to_ascii_lowercase();
@@ -3892,6 +4190,17 @@ pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering
             Some(x.len().cmp(&y.len()))
         }
         (Bson::Boolean(x), Bson::Boolean(y)) => Some(x.cmp(y)),
+        // A regtype compares as its OID: `where t.oid = to_regtype('text')`.
+        (a2, b2) if regtype_oid(a2).is_some() || regtype_oid(b2).is_some() => {
+            let num = |v: &Bson| -> Option<i64> {
+                regtype_oid(v).or(match v {
+                    Bson::Int32(x) => Some(i64::from(*x)),
+                    Bson::Int64(x) => Some(*x),
+                    _ => None,
+                })
+            };
+            Some(num(a2)?.cmp(&num(b2)?))
+        }
         // Two instants. Without this a timestamp compared to a timestamp fell
         // through to the numeric path, which has no arm for a BSON date.
         //
@@ -4300,6 +4609,23 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         if func_name(f).as_deref() == Some("pg_typeof") {
             return pg_typeof(f, params);
         }
+        // `to_regtype(name)` resolves a type name to its oid, and NULL --
+        // rather than an error -- for a name it does not know. That NULL is
+        // the whole reason clients use it over the `::regtype` cast.
+        if func_name(f).as_deref() == Some("to_regtype") {
+            if f.args.len() != 1 {
+                return Err(Error::Parse(
+                    "function to_regtype() requires exactly one argument".into(),
+                ));
+            }
+            return Ok(match const_value(&f.args[0], params)? {
+                Bson::String(name) => match pgtypes::oid_of_name(&name) {
+                    Some(oid) => regtype_value(oid),
+                    None => Bson::Null,
+                },
+                _ => Bson::Null,
+            });
+        }
         if let Some(name) = func_name(f) {
             // `int4multirange(int4range(1,5), ...)`: each argument is a range.
             if range::is_multirange_type(&name) {
@@ -4419,6 +4745,19 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 _ => return Err(Error::Unsupported(format!("unary {op}"))),
             },
         };
+        // The JSON operators need the left operand's STATIC type, which the
+        // values no longer carry.
+        if matches!(
+            op.as_str(),
+            "->" | "->>" | "#>" | "#>>" | "?" | "?|" | "?&" | "@>" | "<@"
+        ) {
+            if let Some(target) = static_json_type(e.lexpr.as_deref(), &lhs) {
+                if lhs == Bson::Null || rhs == Bson::Null {
+                    return Ok(Bson::Null);
+                }
+                return json_operator(&op, &target, &lhs, &rhs);
+            }
+        }
         // A bare UNKNOWN literal takes the type of the operand beside it,
         // which decides both the parse and the error.
         let (lhs, rhs) = coerce_unknown_operand(e, lhs, rhs, &op)?;
@@ -4609,15 +4948,9 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     let op = operator_name(e)?;
 
     let col = match e.lexpr.as_ref().and_then(|l| l.node.as_ref()) {
-        Some(N::ColumnRef(c)) => c
-            .fields
-            .first()
-            .and_then(|f| f.node.as_ref())
-            .and_then(|n| match n {
-                N::String(s) => Some(s.sval.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| Error::Unsupported("this column reference".into()))?,
+        Some(N::ColumnRef(c)) => {
+            column_ref_name(c).ok_or_else(|| Error::Unsupported("this column reference".into()))?
+        }
         Some(other) => return Err(Error::Unsupported(disc(other))),
         None => return Err(Error::Parse("no left operand".into())),
     };
@@ -4641,6 +4974,11 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     if value == Bson::Null {
         return Ok(match_nothing());
     }
+    // A regtype value filters by its OID -- the stored column is a number.
+    let value = match regtype_oid(&value) {
+        Some(oid) => Bson::Int64(oid),
+        None => value,
+    };
 
     let mongo_op = match op {
         // `=` and the range operators are already NULL-correct: MQL brackets by

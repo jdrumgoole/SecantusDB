@@ -4651,12 +4651,26 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   a write to a large table copies the whole table into memory. Lazy capture is
   what keeps the common case free (a savepoint nobody writes through costs
   nothing), and a per-row undo log would be the fix if the cost ever bites.
-- **Rust PG server: `pg_typeof` answers `text`, not `regtype`.** The NAME is
-  right and matches PostgreSQL in the text format, but the column's type oid is
-  25 where PostgreSQL says 2206, so a BINARY cursor gets the name where
-  PostgreSQL sends the four-byte oid, and `pg_typeof(x)::regtype` is refused.
-  Implementing `regtype` means a name-to-oid table (the inverse of the one the
-  parameter decoder already has) plus a binary encoder for it.
+- **Rust PG server: a scalar function OVER A COLUMN in a table select list is
+  refused, and the refusal comes out as a GROUPING error.** psycopg's
+  `test_prepared.py` reads `regexp_replace(statement, ...) as statement FROM
+  pg_prepared_statements` (20 tests); `has_aggregate` treats the unknown call
+  as an aggregate, routes to the aggregate planner, and the user sees `column
+  "name" must appear in the GROUP BY clause` -- wrong error for a real gap.
+  Computed columns over table reads exist now for CAST CHAINS (`casts` on
+  `Select`); widening them to scalar calls is the natural next step.
+- **Rust PG server: `pg_type` is 37 builtin rows and nothing else.** No user
+  types (the enum campaign needs `pg_enum` and CREATE TYPE), no `typtype` /
+  `typnamespace` / `typrelid` columns, and `pg_prepared_statements` is always
+  empty (the statement store lives in pgwire's portal layer, which the executor
+  cannot see). The Python server's `sql/virtual.py` (3.5k lines) is the
+  reference for how far this eventually goes.
+- **Rust PG server: `pg_typeof` still answers a display-name STRING under oid
+  2206, and no regtype has a BINARY encoding.** `regtype` itself is real now
+  (2026-09-06: prints as the name, compares as the oid, casts both ways), but
+  `pg_typeof`'s value is a plain string -- `pg_typeof(x)::int4` answers an
+  error where PostgreSQL answers the oid -- and a binary-format cursor reading
+  any regtype column gets text bytes where PostgreSQL sends the 4-byte oid.
 - **Rust PG server: range and multirange OPERATORS are unsupported.** Both type
   families themselves (literals, constructors, casts, canonicalisation, merging,
   parameters in both wire formats) are in; `@>` / `<@` / `&&` / `-|-` and the

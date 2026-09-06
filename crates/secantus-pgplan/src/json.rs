@@ -346,3 +346,136 @@ fn normalise_number(text: &str) -> String {
         format!("{sign}{whole}.{frac}")
     }
 }
+
+/// Render a `json` value the way the `json` type does: the ORIGINAL text of
+/// the value, not the normalised `jsonb` form.
+///
+/// `json` preserves whitespace, key order and duplicate keys; `jsonb` does
+/// not. Both operators below hand back a document that has been through the
+/// parser, so this is the closest a re-render gets -- key ORDER survives
+/// (the parser keeps it), whitespace does not.
+pub fn render_json(v: &Json) -> String {
+    let mut out = String::new();
+    write_json(v, &mut out);
+    out
+}
+
+fn write_json(v: &Json, out: &mut String) {
+    match v {
+        Json::Null => out.push_str("null"),
+        Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Json::Number(text) => out.push_str(text),
+        Json::Str(s) => write_json_string(s, out),
+        Json::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_json(item, out);
+            }
+            out.push(']');
+        }
+        Json::Object(pairs) => {
+            out.push('{');
+            for (i, (k, v)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_json_string(k, out);
+                out.push_str(": ");
+                write_json(v, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// One step of `->` / `#>`: a member by NAME, or an array element by INDEX.
+///
+/// A negative index counts from the end (`-1` is the last element), which is
+/// PostgreSQL's rule and not most JSON libraries'. Anything that does not
+/// apply -- a name against an array, an index against an object, an index past
+/// the end -- is `None`, which the operators answer as SQL NULL rather than an
+/// error.
+pub fn member<'a>(value: &'a Json, key: &str) -> Option<&'a Json> {
+    match value {
+        Json::Object(pairs) => pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+        Json::Array(items) => {
+            let index: i64 = key.parse().ok()?;
+            let index = if index < 0 {
+                items.len().checked_sub(index.unsigned_abs() as usize)?
+            } else {
+                index as usize
+            };
+            items.get(index)
+        }
+        _ => None,
+    }
+}
+
+/// The `->>` reading of a value: a JSON string is its CONTENT, a JSON null is
+/// SQL NULL, and everything else is its JSON text.
+pub fn as_sql_text(value: &Json) -> Option<String> {
+    match value {
+        Json::Null => None,
+        Json::Str(s) => Some(s.clone()),
+        other => Some(render_json(other)),
+    }
+}
+
+/// `jsonb ? key` -- an object has that KEY, an array contains that STRING, and
+/// a scalar string IS that string.
+pub fn contains_key(value: &Json, key: &str) -> bool {
+    match value {
+        Json::Object(pairs) => pairs.iter().any(|(k, _)| k == key),
+        Json::Array(items) => items.iter().any(|i| matches!(i, Json::Str(s) if s == key)),
+        Json::Str(s) => s == key,
+        _ => false,
+    }
+}
+
+/// `jsonb @> jsonb` -- containment, PostgreSQL's rules.
+///
+/// An object contains another when it has every one of its pairs; an array
+/// contains another when it has every one of its elements; and a top-level
+/// array contains a bare SCALAR that is one of its elements, which is the rule
+/// people forget. Comparison is by VALUE, so key order and whitespace do not
+/// matter.
+pub fn contains(haystack: &Json, needle: &Json) -> bool {
+    match (haystack, needle) {
+        (Json::Object(hay), Json::Object(need)) => need
+            .iter()
+            .all(|(k, nv)| hay.iter().any(|(hk, hv)| hk == k && contains(hv, nv))),
+        (Json::Array(hay), Json::Array(need)) => {
+            need.iter().all(|nv| hay.iter().any(|hv| contains(hv, nv)))
+        }
+        // An array contains a scalar it holds.
+        (Json::Array(hay), needle) => hay.iter().any(|hv| equal(hv, needle)),
+        (a, b) => equal(a, b),
+    }
+}
+
+/// Value equality, which for numbers is NUMERIC equality rather than text: the
+/// parser keeps a number's original text, so `1` and `1.0` differ as strings
+/// and are the same number.
+pub fn equal(a: &Json, b: &Json) -> bool {
+    match (a, b) {
+        // NUMERIC equality, not text: `jsonb` keeps a number's scale, so `1.0`
+        // and `1` render differently and are the same number -- which is what
+        // `@>` compares.
+        (Json::Number(x), Json::Number(y)) => {
+            crate::compare_decimal_text(&normalise_number(x), &normalise_number(y))
+                == Some(std::cmp::Ordering::Equal)
+        }
+        (Json::Array(x), Json::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| equal(a, b))
+        }
+        (Json::Object(x), Json::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.iter().any(|(k2, v2)| k == k2 && equal(v, v2)))
+        }
+        _ => a == b,
+    }
+}
