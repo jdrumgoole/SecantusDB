@@ -523,6 +523,15 @@ fn op_matches(
         "$gt" => cmp_op(values, arg, coll, |o| o == Ordering::Greater),
         // `$gte`/`$lte: null` match null + missing (like `$eq: null`); a plain
         // BSON-order compare against null would spuriously match everything.
+        // A NaN bound: mongod's comparison order treats NaN as EQUAL to NaN --
+        // which is why `find({x: NaN})` matches -- so an INCLUSIVE bound matches
+        // it and a strict one (`$gt` / `$lt`, above and below) does not. IEEE
+        // makes every NaN comparison false, so `cmp_op` answered nothing for all
+        // four and `{x: {$gte: NaN}}` skipped the document holding the NaN
+        // (probed 8.2.11, 2026-09-06). Same shape as the NaN gate on partial
+        // indexes: NaN is inside the numeric bracket, and mongod's two orders
+        // disagree about it.
+        "$gte" | "$lte" if is_nan_bound(arg) => eq_with_array(values, arg, coll),
         "$gte" if matches!(arg, Bson::Null) => eq_with_array(values, arg, coll),
         "$gte" => cmp_op(values, arg, coll, |o| o != Ordering::Less),
         "$lt" => cmp_op(values, arg, coll, |o| o == Ordering::Less),
@@ -1036,6 +1045,22 @@ fn truthy(arg: &Bson) -> Result<bool, Fallback> {
 
 // --- $type --------------------------------------------------------------
 
+/// A NaN range bound, `f64` or `Decimal128` — the one numeric value the
+/// comparison operators cannot rank, because IEEE says every comparison with it
+/// is false. Mirrors `secantus.query._is_nan`.
+fn is_nan_bound(v: &Bson) -> bool {
+    match v {
+        Bson::Double(d) => d.is_nan(),
+        Bson::Decimal128(d) => {
+            // `Decimal128` has no NaN predicate; its string form is the
+            // canonical one bson-rust renders.
+            let s = d.to_string();
+            s.eq_ignore_ascii_case("nan") || s.eq_ignore_ascii_case("-nan")
+        }
+        _ => false,
+    }
+}
+
 fn matches_type(v: &Bson, spec: &Bson) -> bool {
     let alias: Option<&str> = match spec {
         Bson::String(s) => Some(s.as_str()),
@@ -1064,6 +1089,24 @@ fn matches_type(v: &Bson, spec: &Bson) -> bool {
         || is(&["int"], &[16], matches!(v, Bson::Int32(_)))
         || is(&["long"], &[18], matches!(v, Bson::Int64(_)))
         || is(&["decimal"], &[19], matches!(v, Bson::Decimal128(_)))
+        // These eight were absent, so `$type` silently answered "no match" for
+        // a value it should have found: `{x: {$type: "javascript"}}`,
+        // `"minKey"` and `"maxKey"` each returned NOTHING where mongod returns
+        // the document (measured 8.2.11, 2026-09-06). `type_spec_valid` above
+        // already ACCEPTED every one of these aliases, which is what made the
+        // gap invisible -- the argument parsed, the match just never fired.
+        || is(&["undefined"], &[6], matches!(v, Bson::Undefined))
+        || is(&["dbPointer"], &[12], matches!(v, Bson::DbPointer(_)))
+        || is(&["javascript"], &[13], matches!(v, Bson::JavaScriptCode(_)))
+        || is(&["symbol"], &[14], matches!(v, Bson::Symbol(_)))
+        || is(
+            &["javascriptWithScope"],
+            &[15],
+            matches!(v, Bson::JavaScriptCodeWithScope(_)),
+        )
+        || is(&["timestamp"], &[17], matches!(v, Bson::Timestamp(_)))
+        || is(&["minKey"], &[-1], matches!(v, Bson::MinKey))
+        || is(&["maxKey"], &[127], matches!(v, Bson::MaxKey))
         || is(
             &["number"],
             &[],
@@ -2474,6 +2517,59 @@ pub fn is_nan_bson(b: &Bson) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A NaN range bound. mongod treats NaN as EQUAL to NaN in its comparison
+    /// order, so an INCLUSIVE bound matches it and a strict one does not
+    /// (probed 8.2.11, 2026-09-06). IEEE makes every NaN comparison false, so
+    /// all four used to answer nothing.
+    #[test]
+    fn a_nan_range_bound_is_recognised() {
+        assert!(super::is_nan_bound(&Bson::Double(f64::NAN)));
+        assert!(!super::is_nan_bound(&Bson::Double(5.0)));
+        assert!(!super::is_nan_bound(&Bson::Double(f64::INFINITY)));
+        assert!(!super::is_nan_bound(&Bson::Int32(5)));
+        assert!(!super::is_nan_bound(&Bson::String("NaN".into())));
+        let dnan: bson::Decimal128 = "NaN".parse().expect("a Decimal128 NaN");
+        assert!(super::is_nan_bound(&Bson::Decimal128(dnan)));
+        let d5: bson::Decimal128 = "5".parse().expect("a Decimal128 five");
+        assert!(!super::is_nan_bound(&Bson::Decimal128(d5)));
+    }
+
+    /// `$type` accepted all 22 aliases and then matched nothing for eight of
+    /// them, so a query naming one silently returned no documents.
+    #[test]
+    fn matches_type_covers_every_alias_it_accepts() {
+        let cases: [(Bson, &str, i64); 6] = [
+            (Bson::JavaScriptCode("f".into()), "javascript", 13),
+            (Bson::MinKey, "minKey", -1),
+            (Bson::MaxKey, "maxKey", 127),
+            (
+                Bson::Timestamp(bson::Timestamp {
+                    time: 1,
+                    increment: 1,
+                }),
+                "timestamp",
+                17,
+            ),
+            (Bson::Undefined, "undefined", 6),
+            (Bson::Symbol("s".into()), "symbol", 14),
+        ];
+        for (value, alias, code) in cases {
+            assert!(
+                super::matches_type(&value, &Bson::String(alias.to_string())),
+                "$type {alias} must match {value:?}"
+            );
+            assert!(
+                super::matches_type(&value, &Bson::Int32(code as i32)),
+                "$type {code} must match {value:?}"
+            );
+            // ...and must NOT match an unrelated value.
+            assert!(!matches_type(
+                &Bson::Int32(5),
+                &Bson::String(alias.to_string())
+            ));
+        }
+    }
+
     use super::*;
     use bson::doc;
 

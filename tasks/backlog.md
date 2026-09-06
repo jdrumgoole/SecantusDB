@@ -1904,6 +1904,102 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+### 2026-09-06 READ-PATH sweep: 385 cases, and what is still open
+
+A differential sweep of `find` filters, projections and sorts against mongod
+8.2.11, comparing full RESULT SETS rather than counts. 27 divergences on the
+Python server, 20 on the Rust one; **13 fixed** (NaN range bounds, Decimal128
+against the infinities, `$all`'s numeric bridge, NaN's sort position, BinData
+length-first order, and eight missing `$type` aliases — see
+`tests/test_read_path_numeric_compare.py`). The rest are below, all measured,
+all still open. Probe: `scratchpad/readsweep.py` + `readsweep_lib.py`.
+
+**Two methodology notes first, because both nearly produced false findings.**
+
+- **mongod's order among EQUAL sort keys is storage order, not a rule.** The
+  same query over the same documents inserted in a different order gives a
+  different sequence — three insertion orders, three answers. The first run of
+  this sweep reported six sort divergences of which four were that artifact.
+  Every sort case now carries an `_id` tiebreak. Do not assert a tie sequence.
+- **A client-side error looks like agreement.** `Binary(b"\x00", 4)` is subtype
+  UUID with the wrong length, and *pymongo* rejects it while decoding — the same
+  exception from both servers, which a naive comparison reads as a match. The
+  skill's rule applies: report the exception TYPE, and treat a
+  both-sides-non-database-error as vacuous.
+
+#### Still open, both servers
+
+- [ ] **A range bound of `MinKey` / `MaxKey` omits documents whose field is
+  MISSING (4 shapes).** `{x: {$gt: MinKey()}}` and `{x: {$gte: MinKey()}}` on
+  mongod return every document INCLUDING one with no `x` at all; ours omit it.
+  Same for `$lt` / `$lte` against `MaxKey`. An explicit `null` IS returned by
+  both, so this is the "missing conflated with null" shape inverted: for these
+  bounds a missing field must behave like `null`, and does not.
+
+- [ ] **`$elemMatch` with an operator expression descends into NESTED arrays
+  (2 shapes).** `{x: {$elemMatch: {$gt: 1}}}` over `x: [[5]]` and
+  `x: [1, [2, [3]]]` matches on both servers; mongod matches neither — an
+  element that is itself an array is not descended into. Conversely
+  `{x: {$elemMatch: {}}}` matches `[[5]]` and `[1,[2,[3]]]` on mongod and
+  neither on ours, so the empty-criteria form has the opposite gap.
+
+- [ ] **A dotted POSITIONAL path descends one array level too far (2 shapes).**
+  `{"x.0": 5}` matches `x: [[5]]` on both servers; mongod matches only
+  `x: [5]`. `{"x.1": 2}` matches `x: [1, [2, [3]]]` here and not there. The
+  index is being applied after an implicit array descent rather than to the
+  array itself.
+
+- [ ] **Sorting by a dotted path does not descend into arrays (2 shapes).**
+  For `sort: {"x.y": 1}` mongod ranks `x: [{y: 1}]` and `x: [{y: 5}, {y: 6}]`
+  among the documents that HAVE an `x.y` (by 1 and by 5, its minimum); both
+  servers rank them with the documents that have none. Wrong order is wrong
+  results once `limit` is involved.
+
+- [ ] **`sort: {"x.0": 1}` ranks an array element against documents wrongly
+  (1 shape).** mongod puts `x: [[5]]` (whose `x.0` is the ARRAY `[5]`) after
+  `x: [{y: 5}, …]` (whose `x.0` is a DOCUMENT), matching BSON's Object &lt; Array
+  rank; ours puts it before.
+
+- [ ] **Computed projections (2 shapes).** `{lit: {$literal: 7}}` and
+  `{dbl: {$multiply: ["$x", 2]}}` — mongod evaluates them per document (and
+  errors 14 on a bool operand for the second). The Rust server answers
+  `2 BadValue: projection is not supported by the Rust server`; the Python
+  server diverges on the shape of the result. A feature gap on Rust, not a
+  wrong answer.
+
+#### Still open, RUST server only
+
+- [ ] **A DESCENDING sort over strings reverses every PREFIX chain.** The
+  clearest read-path defect the sweep found, and it is not just the empty
+  string:
+
+  ```
+  values  ["", "a", "ab", "abc", "b"]      sort {x: -1}
+  mongod  ["b", "abc", "ab", "a", ""]
+  rust    ["", "b", "a", "ab", "abc"]
+  ```
+
+  Root cause: `sortkey::escape` appends no terminator, so a string's key is a
+  strict PREFIX of any string extending it, and `encode_value_directed`
+  implements descending by INVERTING the bytes — which does not reverse a prefix
+  relationship. Ascending is correct; only descending is affected. Binary is
+  unaffected (its encoding is not prefix-ambiguous), and the Python server is
+  correct on the same corpus.
+
+  **A descending INDEX gives the same wrong order**, so it is at least
+  self-consistent — but the fix is an on-disk format change: making the encoding
+  prefix-free means a terminator after the escaped payload, which changes every
+  existing index entry. That needs the `entryFormat` bump and open-time refusal
+  the sharded-store change used, and both servers' rank tables kept in step (see
+  the `sortkey-rank-is-on-disk` note). Deliberately not bolted onto the
+  2026-09-06 read-path batch for that reason.
+
+- [ ] **`$expr` with `$gt` over a mixed-type collection defers.** `{$expr:
+  {$gt: ["$x", 1]}}` answers `2 BadValue: query uses a construct the Rust server
+  does not support` where mongod returns 20 documents. The server refuses rather
+  than answering wrongly, so it is a feature gap; the Python server is correct.
+
+
 ### 2026-09-03 SQL sweep twelve: LIMIT and row NULLs — what is still open
 
 LIMIT / OFFSET, row comparison, conditionals and transactions probed against

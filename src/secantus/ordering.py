@@ -10,6 +10,7 @@ ordering out — the same layering as ``query`` / ``update`` / ``expressions``.
 from __future__ import annotations
 
 import datetime as _dt
+import math
 from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -81,6 +82,22 @@ def _bson_type_rank(value: Any) -> float:
     if isinstance(value, MaxKey):
         return 13
     return 5
+
+
+def _is_nan_value(v: Any) -> bool:
+    """A NaN, `float` or `Decimal128` — the one numeric value the comparison
+    operators below cannot rank, because IEEE says every comparison with it is
+    false."""
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, float):
+        return math.isnan(v)
+    if isinstance(v, Decimal128):
+        try:
+            return v.to_decimal().is_nan()
+        except (InvalidOperation, ValueError):
+            return False
+    return False
 
 
 class _SortKey:
@@ -201,6 +218,17 @@ def _bson_lt(a: Any, b: Any) -> bool:
         return ra < rb
     if a is None or b is None:
         return False
+    # NaN sorts BELOW every other number, `-Infinity` included, and orders
+    # EQUAL to another NaN. Neither falls out of the comparisons below: IEEE
+    # makes every NaN comparison false, so `_bson_lt` answered False in both
+    # directions and the sort treated a NaN as equal to whatever it happened to
+    # be next to, leaving it wherever the algorithm put it -- between 5.5 and
+    # Infinity in a measured case. mongod places it first among the numbers
+    # (probed 8.2.11, 2026-09-06), which is also what `sortkey.encode_value`
+    # already encodes for the index path; this is the in-memory twin of that.
+    a_nan, b_nan = _is_nan_value(a), _is_nan_value(b)
+    if a_nan or b_nan:
+        return a_nan and not b_nan
     if isinstance(a, Decimal128) or isinstance(b, Decimal128):
         try:
             ad = _to_decimal(a)
@@ -230,6 +258,14 @@ def _bson_lt(a: Any, b: Any) -> bool:
     # `"Regex" < "Regex"` -- i.e. EQUAL -- and `$max` over regexes never moved.
     if isinstance(a, Regex) and isinstance(b, Regex):
         return _regex_sort_key(a) < _regex_sort_key(b)
+    # BinData orders by LENGTH first, then by the bytes -- so `b"\x02"` sorts
+    # BEFORE `b"\x01\x02"`, which a lexicographic compare gets backwards
+    # (measured 8.2.11, 2026-09-06; the Rust server already had this right).
+    # `Binary` subclasses `bytes`, so it fell to the native `<` below.
+    if isinstance(a, (bytes, bytearray)) and isinstance(b, (bytes, bytearray)):
+        if len(a) != len(b):
+            return len(a) < len(b)
+        return bytes(a) < bytes(b)
     # Arrays: lexicographic, element-by-element. Same TypeError trap
     # as the dict case for arrays-of-mixed-types.
     if isinstance(a, list) and isinstance(b, list):

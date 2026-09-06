@@ -682,6 +682,33 @@ def _is_nan(v: Any) -> bool:
 _RANGE_OPS = frozenset({"$gt", "$gte", "$lt", "$lte"})
 
 
+def _is_nan(v: Any) -> bool:
+    """A NaN bound, `float` or `Decimal128`.
+
+    mongod's comparison order treats NaN as EQUAL to NaN -- which is why
+    `find({x: NaN})` matches -- so an INCLUSIVE range bound matches it and a
+    strict one does not (probed 8.2.11, 2026-09-06)::
+
+        {x: {$gte: NaN}}  ->  the NaN document
+        {x: {$lte: NaN}}  ->  the NaN document
+        {x: {$gt:  NaN}}  ->  nothing
+        {x: {$lt:  NaN}}  ->  nothing
+
+    Both servers answered nothing for all four, because IEEE says every NaN
+    comparison is false. Same shape as the NaN gate on partial indexes that
+    `CLAUDE.md` records: NaN sits inside the numeric bracket, and the two
+    orders mongod maintains disagree about it.
+    """
+    if isinstance(v, float):
+        return math.isnan(v)
+    if isinstance(v, Decimal128):
+        try:
+            return v.to_decimal().is_nan()
+        except (InvalidOperation, ValueError):
+            return False
+    return False
+
+
 def _op_matches(
     values: list[Any],
     op: str,
@@ -714,12 +741,16 @@ def _op_matches(
         # null match nothing (a value is never strictly above/below null).
         if arg is None:
             return _eq_with_array(values, None, collation)
+        if _is_nan(arg):
+            return _eq_with_array(values, arg, collation)
         return _cmp(values, arg, lambda a, b: a >= b, collation)
     if op == "$lt":
         return _cmp(values, arg, lambda a, b: a < b, collation)
     if op == "$lte":
         if arg is None:
             return _eq_with_array(values, None, collation)
+        if _is_nan(arg):
+            return _eq_with_array(values, arg, collation)
         return _cmp(values, arg, lambda a, b: a <= b, collation)
     if op == "$in":
         _validate_in_arg("$in", arg)
@@ -1242,7 +1273,14 @@ def _coerce_numeric(a: Any, b: Any) -> tuple[Any, Any]:
             return Decimal(int(v))
 
         ad, bd = _to_dec(a), _to_dec(b)
-        if ad is not None and bd is not None and ad.is_finite() and bd.is_finite():
+        # `is_finite()` excludes NaN *and* the infinities, and only NaN needs
+        # excluding. `Decimal` orders +/-Infinity correctly, so bailing out on
+        # them left `float > Decimal128` to raise `TypeError`, which
+        # `_try_cmp` swallows into a silent no-match: `{x: {$gt: Decimal128("5")}}`
+        # skipped a document holding `Infinity`, and `{x: {$lt: Infinity}}`
+        # skipped one holding `Decimal128("5")` (measured against mongod
+        # 8.2.11, 2026-09-06 -- six range shapes plus `$all`).
+        if ad is not None and bd is not None and not ad.is_nan() and not bd.is_nan():
             return ad, bd
     return a, b
 
@@ -1656,7 +1694,14 @@ def _op_all(values: list[Any], required: Any) -> bool:
             if isinstance(elem, str):
                 return r.search(elem) is not None
             return False
-        return elem == r
+        # The same numeric-bridging equality `$eq` uses, not a bare `==`:
+        # mongod treats int / long / double / Decimal128 as one type for
+        # equality (and keeps bool distinct), so `{x: {$all: [5]}}` matches a
+        # document holding `Decimal128("5")`. `==` does not, and silently
+        # dropped that document (measured 8.2.11, 2026-09-06). `$eq` on the same
+        # value already agreed with mongod, which is what made the gap look like
+        # a `$all` quirk rather than a missing bridge.
+        return _eq_numeric_aware(elem, r)
 
     def _required_satisfied(v: Any, r: Any) -> bool:
         # A `{$elemMatch: {...}}` clause requires *some* element of the array to
