@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from bson import Decimal128, Int64, ObjectId
+from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Timestamp
 from pymongo import MongoClient
 from pymongo.database import Database
 
@@ -277,6 +277,93 @@ def _agg_err(db: Database, pipeline: list) -> str:
             if msg.startswith(wrapper):
                 msg = msg[len(wrapper) :]
         return f"{exc.code}: {msg}"
+
+
+# The 2026-09-06 read-path sweep's corpus, trimmed to the values that actually
+# separated the servers from mongod: NaN, the infinities, a Decimal128, a
+# BinData pair whose length and bytes disagree about order, and the BSON types
+# `$type` accepted as aliases but could never match.
+READPATH = [
+    {"_id": 1, "x": 0},
+    {"_id": 2, "x": 5},
+    {"_id": 3, "x": Int64(5)},
+    {"_id": 4, "x": Decimal128("5")},
+    {"_id": 5, "x": 5.5},
+    {"_id": 6, "x": float("nan")},
+    {"_id": 7, "x": float("inf")},
+    {"_id": 8, "x": float("-inf")},
+    {"_id": 9, "x": None},
+    {"_id": 10},
+    {"_id": 11, "x": [5]},
+]
+
+READPATH_TYPES = [
+    {"_id": 1, "x": Code("f")},
+    {"_id": 2, "x": MinKey()},
+    {"_id": 3, "x": MaxKey()},
+    {"_id": 4, "x": Timestamp(1, 1)},
+    {"_id": 5, "x": 5},
+    {"_id": 6, "x": "s"},
+]
+
+READPATH_BINARY = [
+    {"_id": 1, "x": Binary(b"")},
+    {"_id": 2, "x": Binary(b"\x02")},
+    {"_id": 3, "x": Binary(b"\x01\x02")},
+    {"_id": 4, "x": Binary(b"\x01")},
+]
+
+
+def _ids(db, filt):
+    return sorted(d["_id"] for d in db.c.find(filt))
+
+
+def _sorted_ids(db, spec):
+    """Every sort carries an `_id` tiebreak: mongod's order among EQUAL keys is
+    storage order, not a rule (three insertion orders gave three answers when
+    probed 8.2.11, 2026-09-06), so a tie sequence must never be asserted."""
+    return [d["_id"] for d in db.c.find({}).sort([*spec, ("_id", 1)])]
+
+
+READPATH_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    # A NaN range bound: mongod's order calls NaN equal to NaN, so an INCLUSIVE
+    # bound matches it and a strict one does not. Both servers answered nothing
+    # for all four.
+    ("nan-gte-matches-nan", READPATH, lambda db: _ids(db, {"x": {"$gte": float("nan")}})),
+    ("nan-lte-matches-nan", READPATH, lambda db: _ids(db, {"x": {"$lte": float("nan")}})),
+    ("nan-gt-matches-nothing", READPATH, lambda db: _ids(db, {"x": {"$gt": float("nan")}})),
+    ("nan-lt-matches-nothing", READPATH, lambda db: _ids(db, {"x": {"$lt": float("nan")}})),
+    ("nan-eq-still-reaches-it", READPATH, lambda db: _ids(db, {"x": float("nan")})),
+    # ...and an ordinary bound must not pick the NaN up.
+    ("nan-not-in-gte-5", READPATH, lambda db: _ids(db, {"x": {"$gte": 5}})),
+    ("nan-not-in-lte-5", READPATH, lambda db: _ids(db, {"x": {"$lte": 5}})),
+    # Decimal128 against the infinities: the numeric bridge bailed on any
+    # non-finite operand, leaving `float > Decimal128` to raise and be swallowed.
+    ("dec-gt-picks-up-inf", READPATH, lambda db: _ids(db, {"x": {"$gt": Decimal128("5")}})),
+    ("dec-lt-picks-up-neg-inf", READPATH, lambda db: _ids(db, {"x": {"$lt": Decimal128("5")}})),
+    ("lt-inf-picks-up-dec", READPATH, lambda db: _ids(db, {"x": {"$lt": float("inf")}})),
+    ("gt-neg-inf-picks-up-dec", READPATH, lambda db: _ids(db, {"x": {"$gt": float("-inf")}})),
+    # `$all` bridges the numeric types, as `$eq` does.
+    ("all-bridges-decimal", READPATH, lambda db: _ids(db, {"x": {"$all": [5]}})),
+    # NaN's place in the sort order: below every other number.
+    ("nan-sorts-below-numbers", READPATH, lambda db: _sorted_ids(db, [("x", 1)])),
+    ("nan-sorts-below-numbers-desc", READPATH, lambda db: _sorted_ids(db, [("x", -1)])),
+    # BinData: length first, then bytes.
+    ("bindata-sorts-by-length", READPATH_BINARY, lambda db: _sorted_ids(db, [("x", 1)])),
+    # `$type` aliases the Rust table accepted but never matched.
+    ("type-javascript", READPATH_TYPES, lambda db: _ids(db, {"x": {"$type": "javascript"}})),
+    ("type-minkey", READPATH_TYPES, lambda db: _ids(db, {"x": {"$type": "minKey"}})),
+    ("type-maxkey", READPATH_TYPES, lambda db: _ids(db, {"x": {"$type": "maxKey"}})),
+    ("type-timestamp", READPATH_TYPES, lambda db: _ids(db, {"x": {"$type": "timestamp"}})),
+    ("type-code-13", READPATH_TYPES, lambda db: _ids(db, {"x": {"$type": 13}})),
+    ("type-code-minus-1", READPATH_TYPES, lambda db: _ids(db, {"x": {"$type": -1}})),
+    ("type-code-127", READPATH_TYPES, lambda db: _ids(db, {"x": {"$type": 127}})),
+    # ...and the neighbouring behaviour that was already right, so the fix
+    # cannot over-reach.
+    ("type-int-unchanged", READPATH_TYPES, lambda db: _ids(db, {"x": {"$type": "int"}})),
+    ("type-string-unchanged", READPATH_TYPES, lambda db: _ids(db, {"x": {"$type": "string"}})),
+    ("type-number-includes-nan", READPATH, lambda db: _ids(db, {"x": {"$type": "number"}})),
+]
 
 
 QUERY_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
@@ -2635,6 +2722,7 @@ UPDATE_OVERFLOW_CASES: list[tuple[str, list[dict], Callable[[Database], object]]
 
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
+    + [("readpath", c) for c in READPATH_CASES]
     + [("update", c) for c in UPDATE_CASES]
     + [("fam", c) for c in FAM_CASES]
     + [("updatecmd", c) for c in UPDATE_CMD_CASES]
