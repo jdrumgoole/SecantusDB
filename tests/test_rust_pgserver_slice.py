@@ -2676,3 +2676,31 @@ def test_a_plain_select_over_a_join(home: Path) -> None:
             "left join pg_range r on r.rngtypid = t.oid where t.oid = 25"
         )
         assert cur.fetchall() == [("text", None)]
+
+
+def test_schema_ddl(home: Path) -> None:
+    """CREATE SCHEMA / DROP SCHEMA, and a schema-qualified table.
+
+    A duplicate is 42P06 (distinct from a table's 42P07 and a type's 42710), a
+    missing DROP is 3F000, and CASCADE is accepted. Qualified names already
+    resolve by their last part, so a table in a schema works once the schema
+    DDL is allowed.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create schema testschema")
+        assert cur.statusmessage == "CREATE SCHEMA"
+        with pytest.raises(psycopg.errors.DuplicateSchema):
+            cur.execute("create schema testschema")
+        cur.execute("create schema if not exists testschema")
+        cur.execute("drop schema if exists testschema cascade")
+        with pytest.raises(psycopg.errors.InvalidSchemaName):
+            cur.execute("drop schema testschema")
+        cur.execute("drop schema if exists never")
+
+        cur.execute("create schema s2")
+        cur.execute("create table s2.t (id int4)")
+        cur.execute("insert into s2.t values (1)")
+        cur.execute("select id from s2.t")
+        assert cur.fetchall() == [(1,)]
+        cur.execute("drop schema s2 cascade")

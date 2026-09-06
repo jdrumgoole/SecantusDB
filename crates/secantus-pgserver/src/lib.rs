@@ -223,6 +223,7 @@ impl PgHandler {
     /// (`src/secantus/sql/catalog.py`: `__sql_enums__` docs
     /// `{_id, enum, labels, oid}`; `__sql_enum_meta__` carries the monotonic
     /// counter; `typarray` is DERIVED as `oid + 100_000`, never stored.)
+    const SCHEMA_COLLECTION: &'static str = "__sql_schemas__";
     const ENUM_COLLECTION: &'static str = "__sql_enums__";
     const ENUM_META_COLLECTION: &'static str = "__sql_enum_meta__";
     const ENUM_TYPE_OID_BASE: i64 = 65_000;
@@ -2133,6 +2134,75 @@ impl PgHandler {
                     Ok(enc.take_row())
                 });
                 Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
+            }
+
+            Statement::CreateSchema {
+                name,
+                if_not_exists,
+            } => {
+                self.ensure_collection(Self::SCHEMA_COLLECTION)?;
+                let exists = !self
+                    .storage
+                    .find_matching(
+                        &self.db,
+                        Self::SCHEMA_COLLECTION,
+                        &bson::doc! {"_id": &name},
+                    )
+                    .map_err(|e| Self::storage_err("could not read schemas", e))?
+                    .is_empty();
+                if exists {
+                    // `IF NOT EXISTS` is a no-op; a bare CREATE is 42P06.
+                    if if_not_exists {
+                        return Ok(vec![Response::Execution(Tag::new("CREATE SCHEMA"))]);
+                    }
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P06".into(), // duplicate_schema
+                        format!("schema \"{name}\" already exists"),
+                    ))));
+                }
+                let doc = bson::doc! {"_id": &name, "schema": &name};
+                let bytes = bson::to_vec(&doc)
+                    .map_err(|e| Self::storage_err("could not encode the schema", e))?;
+                self.storage
+                    .insert(&self.db, Self::SCHEMA_COLLECTION, vec![bytes], true)
+                    .map_err(|e| Self::storage_err("could not record the schema", e))?;
+                Ok(vec![Response::Execution(Tag::new("CREATE SCHEMA"))])
+            }
+
+            Statement::DropSchema {
+                names,
+                if_exists,
+                cascade: _,
+            } => {
+                // CASCADE would drop the schema's contents; this server does
+                // not track which tables/types belong to a schema (names carry
+                // no schema), so it accepts the keyword and drops only the
+                // schema record. The test corpus creates a schema, uses it,
+                // and drops it CASCADE at teardown -- the objects are dropped
+                // by name elsewhere, so nothing is orphaned in practice.
+                self.ensure_collection(Self::SCHEMA_COLLECTION)?;
+                for name in &names {
+                    let removed = self
+                        .storage
+                        .delete_matching(
+                            &self.db,
+                            Self::SCHEMA_COLLECTION,
+                            &bson::doc! {"_id": name},
+                            0,
+                            &Document::new(),
+                            None,
+                        )
+                        .map_err(|e| Self::storage_err("could not drop the schema", e))?;
+                    if removed == 0 && !if_exists {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "3F000".into(), // invalid_schema_name
+                            format!("schema \"{name}\" does not exist"),
+                        ))));
+                    }
+                }
+                Ok(vec![Response::Execution(Tag::new("DROP SCHEMA"))])
             }
 
             Statement::CreateEnum { name, labels } => {

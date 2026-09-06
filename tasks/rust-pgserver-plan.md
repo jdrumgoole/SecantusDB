@@ -1636,7 +1636,42 @@ before assuming a feature is one shape.
 **Probe: pg_range's 6 rows and RangeInfo.fetch for four range types, plus a
 plain-join + LEFT-JOIN-miss shape -- 0 divergences.**
 
-### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)
+### 0.47 CREATE SCHEMA (2026-09-07)
+
+**+29 direct, but it UNBLOCKS the composite-type tests** -- most of the 71
+`CreateSchemaStmt` failures are in `test_composite.py`, which creates a schema
+AND a composite; the schema half works now, the composite half is 0.48. Same
+`__sql_schemas__` `{_id, schema}` contract as the Python server. Qualified
+names already resolved by last-part, so the table/type ops needed nothing.
+Errors measured: 42P06 duplicate, 3F000 missing, CASCADE accepted (no
+object-to-schema tracking -- names carry no schema).
+
+### Next: composite types (0.48, scoped 2026-09-07)
+
+The single biggest remaining cluster after schema (21 `CompositeTypeStmt` +
+most of the composite-schema tests). Three parts, in order:
+
+1. **DDL + catalog.** `CREATE TYPE name AS (field type, ...)` / `DROP TYPE`.
+   Python contract (`src/secantus/sql/catalog.py`): `__sql_composites__` docs
+   with the ordered `(field, type_tag)` list and a minted oid (base 67000,
+   typarray +100_000), same mint mechanism as enums.
+2. **pg_attribute + typrelid.** `CompositeInfo.fetch` reads a composite's
+   fields through `pg_type.typrelid -> pg_attribute (attname, atttypid,
+   attnum)`. Both are new virtual tables; typrelid is the composite's own oid
+   in this model (no separate pg_class row needed for the query).
+3. **A join whose RIGHT arm is an aggregate subquery.** This is the escalation:
+   `CompositeInfo.fetch` is `pg_type LEFT JOIN (SELECT attrelid,
+   array_agg(attname), array_agg(atttypid) FROM (pg_attribute JOIN pg_type
+   ...) GROUP BY attrelid) a ON a.attrelid = t.typrelid`. Today `JoinSelect`
+   joins two BASE tables; here one side is a grouped subquery. `join_docs`
+   would need a side that is itself a materialised aggregate -- either
+   generalise a join arm to "any materialisable source" or special-case the
+   one-level nesting the query uses. Probe the exact shape before choosing.
+
+Then composite VALUES (`ROW(...)::testcomp`, field access) -- the `RowExpr`
+cluster (19) is adjacent.
+
+### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)
 
 The 207 `test_enum.py` failures all die in one SESSION fixture (`ensure_enum`:
 `drop type if exists X; create type X as enum (...)`), so nothing is known yet
