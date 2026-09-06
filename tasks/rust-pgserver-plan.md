@@ -1418,7 +1418,100 @@ seconds -- was at 59% after FORTY MINUTES, because its per-test timeout is 20s
 and everything was starved. Same failure mode CLAUDE.md records for
 `validate-all --jobs 8`, on one machine with two jobs.
 
-**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181 -> 2219 -> 2256 -> 2347 -> 2589 | 2739 -> 2886 (everything before the bar is on the no-mypy scale of 0.39a; the same commit measures 2741 through `uv run`. 0.35 measured +29 on a pre-0.34 base and is not in this line).**
+### 0.41 reaching into a json document (2026-09-06)
+
+**2739 -> 2764, +48 / -25** measured against `main` WITHOUT the array batch
+(0.40), which was still an open PR when this branch was cut. The 25 are
+`test_leak` churn.
+
+The server could parse json, store it, cast it and hand it back WHOLE, and
+could not reach inside it: `'{"a": 1}'::json ->> 'a'` was `0A000`. All the
+navigation and key operators now work -- `->` / `->>` by name or index, `#>` /
+`#>>` down a path, `?` / `?|` / `?&`, and `@>` / `<@`.
+
+**Same mechanism as the range parameters in 0.39:** a json value is carried as
+its TEXT, so two operands are two strings by the time the evaluator sees them.
+The LEFT OPERAND'S STATIC TYPE is what makes these json operators at all --
+which also gives the result type (`->` keeps the flavour, `->>` is text, the
+key tests are boolean), and makes chaining work: `(j -> 'a') ->> 'b'` needs the
+inner result to still be json.
+
+Rules worth writing down, all measured:
+
+* A negative index counts from the END (`-1` is the last element).
+* A lookup that does not apply -- missing key, index past the end, a name
+  against an array, any key against a scalar -- is SQL NULL, not an error.
+* `->>` reads a json string WITHOUT its quotes, and a json `null` becomes SQL
+  NULL rather than the text `null`.
+* Containment compares by VALUE: key order and whitespace do not count, and
+  neither does a number's SCALE -- `{"a": 1.0}` contains `{"a": 1}`. That last
+  one was the only case out of 40 the first implementation got wrong, because
+  the parser keeps a number's original text.
+* A top-level array contains a bare scalar it holds (`'[1,2,3]' @> '2'`).
+
+**A baseline taken from the wrong branch reads as a 169-test REGRESSION.** The
+first diff of this batch compared it against the array batch's run -- an
+unmerged branch this one is not based on -- and every array fix showed as a
+loss. **A same-branch baseline means the branch you are ON, not the newest
+number you have.**
+
+**Probe: 40 json operator shapes -- 0 divergences.**
+
+### 0.42 a catalog to ask about types (2026-09-06)
+
+**+53 on top of 0.41** (measured 2793 on the json branch, which predates the
+array batch; the two stack on merge). 26 of the 53 are `test_typeinfo.py` --
+psycopg's own `TypeInfo.fetch` now works UNMODIFIED, which is the gateway the
+enum / composite / custom-range registration features were all waiting behind.
+
+**The one query needed five missing things at once**: the `pg_type` table,
+`to_regtype()`, the `regtype` cast, a TABLE ALIAS, and a CAST OF A COLUMN in a
+table select list (`oid::regtype::text AS regtype`). Any four of the five and
+type discovery still fails wholesale -- which is why its 40-test block never
+shrank incrementally.
+
+Design notes worth keeping:
+
+* **`pg_type` is a virtual table**: a `TableDef` plus rows COMPUTED on read
+  from `pgtypes::BUILTIN_TYPES`, the same catalog `to_regtype` and the
+  `regtype` render use -- one source, so they cannot disagree. The executor
+  sources virtual rows in the Select AND Aggregate arms; the aggregate one was
+  nearly missed, and `count(*) from pg_type` answered 0 by falling through to
+  storage and finding no collection. The right SHAPE and the wrong NUMBER,
+  flagged by no error -- the probe caught it.
+* **A `regtype` value has two natures no scalar holds**: prints as the display
+  name, compares as the oid. Carried as a one-field document
+  (`REGTYPE_KEY`), unwrapped by the comparison, the filter lowerer, the casts
+  and the encoder. Same pattern as the interval and the composite timestamp.
+* **Cast chains over columns** (`col::a::b`) ride the Select statement as a
+  `casts` vec parallel to `columns`; the described type is the LAST cast in
+  the chain, and the describe path and the executor share that rule or the
+  client decodes rows against the wrong oid.
+* Qualified column names (`t.oid`) resolve by taking the LAST field of the
+  ColumnRef -- with one table in FROM, any qualifier can only name it.
+
+**A stale venv reappeared mid-batch, wearing a new disguise**: 3 parity-test
+failures in the full suite, reading exactly like a cross-session breakage on
+`main`. `git log` showed the fix had landed in BOTH `src/secantus/diff.py` and
+`crates/secantus-core/src/diff.rs` -- the venv's `_secantus_core` extension was
+simply stale, because a plain `pytest` run had followed a `git pull` without
+`./inv sync`. The CLAUDE.md rule exists; the lesson is that the failure it
+prevents LOOKS LIKE someone else's regression, not like a build problem.
+
+**The `oid` TYPE rode along** (+25, offset in the same run by `__del__`
+GC-timing churn in the cursor tests): unsigned 32-bit with PostgreSQL's own
+edges, all measured -- `(-1)::oid` WRAPS to 4294967295, a value past 2^32-1 is
+`22003 "OID out of range"` (not wrapped), `'x'::oid` is 22P02, and the binary
+format is the 4-byte unsigned form (`u32` IS the oid type in rust-postgres's
+encoder). One trap: a literal past i32 arrives from the parser as a
+DECIMAL128, so the cast needs a decimal arm or `4294967295::oid` -- the exact
+value psycopg's bounds test uses -- fails on the type of its own literal.
+
+**Probe: the 9-shape pg_type stack and 24 oid shapes (both formats), 0
+divergences; `TypeInfo.fetch` verified against a live server for text / int4 /
+integer / jsonb / an unknown name.**
+
+**Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181 -> 2219 -> 2256 -> 2347 -> 2589 | 2739 -> 2886 (everything before the bar is on the no-mypy scale of 0.39a; 0.41/0.42 measured +48/+53 on a pre-0.40 base and stack on merge; 0.35 measured +29 on a pre-0.34 base and is not in this line).**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel
 pgserver PRs: that `main` scores 946 on its own and 982 with this batch, so the

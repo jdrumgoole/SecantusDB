@@ -217,10 +217,70 @@ impl PgHandler {
     /// `with_user_transaction` also worked for plain statements and DEADLOCKED
     /// COPY, which opens its own transaction context: nesting that call is not
     /// safe, and this needs no nesting.
+    /// The virtual catalog tables: a definition and rows COMPUTED on read,
+    /// nothing stored. `pg_type` is what psycopg's `TypeInfo.fetch` reads to
+    /// learn a type's oid and array oid; `pg_prepared_statements` is what its
+    /// pipeline tests count (empty here -- the statement store lives in the
+    /// wire layer and holds nothing a client named).
+    fn virtual_table(name: &str) -> Option<TableDef> {
+        match name {
+            "pg_type" => Some(TableDef::new(
+                "pg_type",
+                vec![
+                    secantus_pgcatalog::Column::new("typname", "name", false),
+                    secantus_pgcatalog::Column::new("oid", "int8", false),
+                    secantus_pgcatalog::Column::new("typarray", "int8", false),
+                    secantus_pgcatalog::Column::new("typdelim", "text", false),
+                ],
+            )),
+            "pg_prepared_statements" => Some(TableDef::new(
+                "pg_prepared_statements",
+                vec![
+                    secantus_pgcatalog::Column::new("name", "text", false),
+                    secantus_pgcatalog::Column::new("statement", "text", false),
+                    secantus_pgcatalog::Column::new("prepare_time", "timestamptz", false),
+                    secantus_pgcatalog::Column::new("parameter_types", "text", false),
+                ],
+            )),
+            _ => None,
+        }
+    }
+
+    /// The rows of one virtual table, already filtered.
+    fn virtual_rows(name: &str, filter: &Document) -> Option<Vec<Document>> {
+        let def = Self::virtual_table(name)?;
+        let rows: Vec<Document> = match name {
+            "pg_type" => secantus_pgplan::pgtypes::BUILTIN_TYPES
+                .iter()
+                .map(|(typname, oid, typarray)| {
+                    let mut d = Document::new();
+                    d.insert(def.field_of("typname").expect("column"), *typname);
+                    d.insert(def.field_of("oid").expect("column"), Bson::Int64(*oid));
+                    d.insert(
+                        def.field_of("typarray").expect("column"),
+                        Bson::Int64(*typarray),
+                    );
+                    d.insert(def.field_of("typdelim").expect("column"), ",");
+                    d
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let empty = Document::new();
+        Some(
+            rows.into_iter()
+                .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
+                .collect(),
+        )
+    }
+
     /// Read one table's catalog entry. Reads it back from storage every time
     /// rather than caching: the store is shared with the other two servers, so
     /// a cache here would go stale behind our back.
     fn lookup(&self, name: &str) -> Option<TableDef> {
+        if let Some(def) = Self::virtual_table(name) {
+            return Some(def);
+        }
         // What this transaction has created or dropped, before what is
         // committed. A `None` here is a tombstone: the table was dropped in
         // this transaction and must not be found even though its catalog row
@@ -446,6 +506,9 @@ fn wire_type(pg_type: &str) -> Type {
         // `pg_typeof` answers a `regtype` (2206), not text: a client reading
         // 25 would print the same characters but compare unequal to a regtype.
         "regtype" => Type::REGTYPE,
+        // A real oid column type: psycopg's numeric tests read the oid back
+        // and check `ftype(0) == 26`.
+        "oid" => Type::OID,
         // Array oids are their own types (int4[] is 1007, not 23).
         "int4[]" | "int[]" | "integer[]" => Type::INT4_ARRAY,
         "int8[]" | "bigint[]" => Type::INT8_ARRAY,
@@ -1559,6 +1622,10 @@ impl PgHandler {
                             .collect();
                         (docs, series_table_def(series))
                     }
+                    None if Self::virtual_table(&sel.table).is_some() => {
+                        let docs = Self::virtual_rows(&sel.table, &sel.filter).expect("checked");
+                        (docs, Self::virtual_table(&sel.table).expect("checked"))
+                    }
                     None => {
                         let raw = self
                             .storage
@@ -1601,21 +1668,43 @@ impl PgHandler {
                 let schema = Arc::new(
                     sel.columns
                         .iter()
-                        .map(|(out, _)| {
-                            let ty = def
-                                .column(out)
-                                .map(|c| wire_type(&c.pg_type))
-                                .unwrap_or(Type::VARCHAR);
+                        .enumerate()
+                        .map(|(i, (out, field))| {
+                            // A cast changes the column's TYPE: the last cast in
+                            // the chain is what the client reads back.
+                            let ty = match sel.casts.get(i).and_then(|c| c.as_deref()) {
+                                Some(chain) => {
+                                    wire_type(chain.rsplit("::").next().unwrap_or(chain))
+                                }
+                                None => def
+                                    .column(field)
+                                    .or_else(|| def.column(out))
+                                    .map(|c| wire_type(&c.pg_type))
+                                    .unwrap_or(Type::VARCHAR),
+                            };
                             self.field(out.clone(), ty)
                         })
                         .collect::<Vec<_>>(),
                 );
 
                 let fields: Vec<String> = sel.columns.iter().map(|(_, f)| f.clone()).collect();
+                let casts = sel.casts.clone();
+                let tz = self.session_timezone();
                 let schema_ref = schema.clone();
                 let rows = stream::iter(docs).map(move |d| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
                     for (i, f) in fields.iter().enumerate() {
+                        // A cast chain is applied per row, innermost first --
+                        // `oid::regtype::text` turns 25 into `text`.
+                        if let Some(chain) = casts.get(i).and_then(|c| c.as_deref()) {
+                            let mut v = d.get(f).cloned().unwrap_or(Bson::Null);
+                            for target in chain.split("::") {
+                                v = secantus_pgplan::cast_value_with_tz(v, target, &tz)
+                                    .map_err(|e| PgHandler::err(&e))?;
+                            }
+                            encode_field_value(&mut enc, &schema_ref[i], Some(&v))?;
+                            continue;
+                        }
                         // A timestamp is reassembled from its stored date plus
                         // the hidden companion before it goes on the wire.
                         match timestamp_text(&d, f) {
@@ -1914,6 +2003,13 @@ impl PgHandler {
                             d
                         })
                         .collect(),
+                    // A virtual table's rows are computed, not read: without
+                    // this arm `count(*) from pg_type` fell through to storage,
+                    // found no such collection, and answered 0 -- the right
+                    // shape and the wrong number, which no error would flag.
+                    None if Self::virtual_table(&agg.table).is_some() => {
+                        Self::virtual_rows(&agg.table, &agg.filter).expect("checked")
+                    }
                     None => {
                         let raw = self
                             .storage
@@ -2131,7 +2227,8 @@ fn timestamp_text(doc: &Document, field: &str) -> Option<String> {
 /// every type, and the gap is recorded in `tasks/backlog.md` rather than
 /// hidden.
 fn binary_encodable(ty: &Type) -> bool {
-    const OK: [Type; 20] = [
+    const OK: [Type; 21] = [
+        Type::OID,
         Type::BOOL,
         Type::INT2,
         Type::INT4,
@@ -2367,6 +2464,13 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         let x = as_i64(v).ok_or_else(|| bad("this value"))?;
         return enc.encode_field(&Some(x));
     }
+    if *ty == Type::OID {
+        // `u32` IS the oid type in rust-postgres's encoder.
+        let x = as_i64(v)
+            .and_then(|x| u32::try_from(x).ok())
+            .ok_or_else(|| bad("this value"))?;
+        return enc.encode_field(&Some(x));
+    }
     if *ty == Type::FLOAT4 {
         let x = as_f64(v).ok_or_else(|| bad("this value"))? as f32;
         return enc.encode_field(&Some(x));
@@ -2494,6 +2598,10 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
         // An interval is three parts in a document; the wire wants its text.
         if let Some(text) = secantus_pgplan::interval_value_text(value) {
             return enc.encode_field(&Some(text.as_str()));
+        }
+        // A regtype is an oid in a document; the wire wants its display name.
+        if let Some(oid) = secantus_pgplan::regtype_oid(value) {
+            return enc.encode_field(&Some(secantus_pgplan::regtype_text(oid).as_str()));
         }
     }
     match v {
@@ -3229,6 +3337,11 @@ fn decode_parameter(
                 bytes[..4].try_into().expect("checked"),
             )))),
             Some(16) if bytes.len() == 1 => Ok(Bson::Boolean(bytes[0] != 0)),
+            // An oid is a 4-byte UNSIGNED integer; through i64 so the value
+            // survives the top bit.
+            Some(26) if bytes.len() == 4 => Ok(Bson::Int64(i64::from(u32::from_be_bytes(
+                bytes[..4].try_into().expect("checked"),
+            )))),
             Some(25) | Some(1043) | Some(19) | Some(1042) => {
                 Ok(Bson::String(String::from_utf8_lossy(bytes).into_owned()))
             }
@@ -3354,6 +3467,13 @@ fn decode_parameter(
             .parse::<i64>()
             .map(Bson::Int64)
             .map_err(|_| invalid_text(&text, "bigint")),
+        Some(26) => text
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|v| (0..(1i64 << 32)).contains(v))
+            .map(Bson::Int64)
+            .ok_or_else(|| invalid_text(&text, "oid")),
         Some(700) | Some(701) => text
             .parse::<f64>()
             .map(Bson::Double)
@@ -3526,11 +3646,20 @@ impl PgHandler {
                     .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?;
                 sel.columns
                     .iter()
-                    .map(|(out, _)| {
-                        let ty = def
-                            .column(out)
-                            .map(|c| wire_type(&c.pg_type))
-                            .unwrap_or(Type::VARCHAR);
+                    .enumerate()
+                    .map(|(i, (out, field))| {
+                        // A cast changes the described type: the LAST cast in
+                        // the chain is what the client reads back. The describe
+                        // and the executor share this rule or the client
+                        // decodes rows against the wrong oid.
+                        let ty = match sel.casts.get(i).and_then(|c| c.as_deref()) {
+                            Some(chain) => wire_type(chain.rsplit("::").next().unwrap_or(chain)),
+                            None => def
+                                .column(field)
+                                .or_else(|| def.column(out))
+                                .map(|c| wire_type(&c.pg_type))
+                                .unwrap_or(Type::VARCHAR),
+                        };
                         self.field(out.clone(), ty)
                     })
                     .collect()

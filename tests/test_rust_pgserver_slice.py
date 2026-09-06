@@ -2332,3 +2332,154 @@ def test_an_array_of_dates_is_described_as_one(home: Path) -> None:
         cur.execute("select array['2026-01-01 12:00'::timestamp]")
         assert cur.fetchone()[0] == [dt.datetime(2026, 1, 1, 12)]
         assert cur.pgresult.ftype(0) == 1115
+
+
+def test_the_json_navigation_operators(home: Path) -> None:
+    """`->`, `->>`, `#>`, `#>>` over json and jsonb.
+
+    A json value is carried as its text, so by the time two operands are values
+    there is nothing to tell `{"a": 1}` from any other string — the left
+    operand's static type is what makes these json operators at all. Every
+    lookup that does not apply is SQL NULL rather than an error, which is
+    PostgreSQL's rule and the reason they are usable.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for sql, want in [
+            ("""select '{"a": 1}'::json ->> 'a'""", "1"),
+            ("""select '{"a": 1}'::jsonb ->> 'a'""", "1"),
+            ("""select '{"a": "x"}'::json ->> 'a'""", "x"),
+            ("""select '{"a": "x"}'::json -> 'a'""", "x"),
+            ("select '[1,2]'::json ->> 1", "2"),
+            # A negative index counts from the end, which is PostgreSQL's rule.
+            ("select '[1,2]'::json ->> -1", "2"),
+            # Missing, out of range, or the wrong shape: NULL, not an error.
+            ("""select '{"a": 1}'::json ->> 'zz'""", None),
+            ("select '[1,2]'::json -> 5", None),
+            ("""select '"str"'::json ->> 'a'""", None),
+            # A json null reads back as SQL NULL through `->>`.
+            ("""select '{"a": null}'::json ->> 'a'""", None),
+            ("""select '{"a":{"b":2}}'::json #>> '{a,b}'""", "2"),
+            ("""select ('{"a":{"b":2}}'::json -> 'a') ->> 'b'""", "2"),
+        ]:
+            cur.execute(sql)
+            assert cur.fetchone()[0] == want, sql
+
+        # `->` keeps the json flavour, `->>` is text, the key tests are bool.
+        for sql, oid in [
+            ("""select '{"a": 1}'::json -> 'a'""", 114),
+            ("""select '{"a": 1}'::jsonb -> 'a'""", 3802),
+            ("""select '{"a": 1}'::json ->> 'a'""", 25),
+            ("""select '{"a": 1}'::jsonb ? 'a'""", 16),
+        ]:
+            cur.execute(sql)
+            cur.fetchone()
+            assert cur.pgresult.ftype(0) == oid, sql
+
+
+def test_the_json_key_and_containment_operators(home: Path) -> None:
+    """`?`, `?|`, `?&`, `@>` and `<@`.
+
+    Containment compares by VALUE, so key order and whitespace do not count —
+    and neither does a number's scale, which is why `{"a": 1.0}` contains
+    `{"a": 1}`.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for sql, want in [
+            ("""select '{"a": 1}'::jsonb ? 'a'""", True),
+            ("""select '{"a": 1}'::jsonb ? 'z'""", False),
+            ("""select '["a","b"]'::jsonb ? 'a'""", True),
+            ("""select '{"a": 1}'::jsonb ?| array['a','z']""", True),
+            ("""select '{"a": 1}'::jsonb ?& array['a','z']""", False),
+            ("""select '{"a": 1, "b": 2}'::jsonb ?& array['a','b']""", True),
+            ("""select '{"a": 1, "b": 2}'::jsonb @> '{"a": 1}'""", True),
+            ("""select '{"a": 1}'::jsonb @> '{"a": 2}'""", False),
+            ("""select '{"a": 1}'::jsonb <@ '{"a": 1, "b": 2}'""", True),
+            ("select '[1,2,3]'::jsonb @> '[1,3]'", True),
+            # A top-level array contains a bare scalar it holds.
+            ("select '[1,2,3]'::jsonb @> '2'", True),
+            # …and a number's scale is not part of its value.
+            ("""select '{"a": 1.0}'::jsonb @> '{"a": 1}'""", True),
+        ]:
+            cur.execute(sql)
+            assert cur.fetchone()[0] is want, sql
+
+
+def test_type_discovery_through_pg_type(home: Path) -> None:
+    """psycopg's own `TypeInfo.fetch`, unmodified, against the virtual catalog.
+
+    The query it sends needs five things at once: the `pg_type` table, the
+    `to_regtype()` function, the `regtype` cast chain in the select list
+    (`oid::regtype::text`), a table alias (`FROM pg_type t ... WHERE t.oid`),
+    and column aliases. Any one missing and type discovery fails wholesale.
+    """
+    from psycopg.types import TypeInfo
+
+    with _Server(home) as server, server.connect() as conn:
+        info = TypeInfo.fetch(conn, "text")
+        assert (info.name, info.oid, info.array_oid) == ("text", 25, 1009)
+        # Both spellings resolve, exactly as PostgreSQL's own catalog does.
+        assert TypeInfo.fetch(conn, "integer").oid == 23
+        assert TypeInfo.fetch(conn, "int4").oid == 23
+        assert TypeInfo.fetch(conn, "jsonb").array_oid == 3807
+        # An unknown name is None, not an error — to_regtype's whole point.
+        assert TypeInfo.fetch(conn, "nope") is None
+        # A QUOTED identifier resolves too, case-sensitively.
+        from psycopg import sql as _sql
+
+        assert TypeInfo.fetch(conn, _sql.Identifier("text")).oid == 25
+        assert TypeInfo.fetch(conn, _sql.Identifier("TEXT")) is None
+
+        cur = conn.cursor()
+        cur.execute("select to_regtype('text')")
+        assert cur.fetchone()[0] == "text"
+        assert cur.pgresult.ftype(0) == 2206  # regtype
+        cur.execute("select to_regtype('nope')")
+        assert cur.fetchone()[0] is None
+        # A regtype casts onward by its two natures: name as text, oid as int.
+        cur.execute("select to_regtype('integer')::text")
+        assert cur.fetchone()[0] == "integer"
+        cur.execute("select to_regtype('integer')::int4")
+        assert cur.fetchone()[0] == 23
+        # `::regtype` of an unknown name is an ERROR, unlike to_regtype.
+        with pytest.raises(psycopg.errors.UndefinedObject):
+            cur.execute("select 'nope'::regtype")
+
+        # The catalog rows themselves, filtered and aliased.
+        cur.execute("select typname from pg_type where oid = 25")
+        assert cur.fetchone()[0] == "text"
+        cur.execute("select count(*) from pg_prepared_statements where name != ''")
+        assert cur.fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+def test_the_oid_type(home: Path, binary: bool) -> None:
+    """`oid` is an unsigned 32-bit integer with its own type oid.
+
+    A negative literal wraps (`(-1)::oid` is 4294967295), a value past 2^32-1
+    is out of range, and a non-numeric string is invalid text — all measured on
+    PostgreSQL 14. The binary encoding is the 4-byte unsigned form.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor(binary=binary)
+        for sql, params, want in [
+            ("select 0::oid", (), 0),
+            ("select '25'::oid", (), 25),
+            ("select 4294967295::oid", (), 4294967295),
+            ("select (-1)::oid", (), 4294967295),
+            ("select %s::oid", ("0",), 0),
+            ("select %s::oid", (25,), 25),
+            ("select 25::oid::int4", (), 25),
+            ("select 25::oid::text", (), "25"),
+        ]:
+            cur.execute(sql, params)
+            assert cur.fetchone()[0] == want, sql
+        cur.execute("select 25::oid")
+        cur.fetchone()
+        assert cur.pgresult.ftype(0) == 26
+
+        with pytest.raises(psycopg.errors.NumericValueOutOfRange):
+            cur.execute("select 4294967296::oid")
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation):
+            cur.execute("select 'x'::oid")

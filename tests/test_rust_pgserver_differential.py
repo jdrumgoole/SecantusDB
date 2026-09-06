@@ -135,6 +135,28 @@ QUERIES = [
     # A QUOTED brace is the string, not the start of a nested array.
     """SELECT '{"{"}'::text[]""",
     """SELECT '{"a,b","q x"}'::text[]""",
+    # The virtual `pg_type` catalog, to_regtype and the regtype cast -- what
+    # psycopg's TypeInfo.fetch is made of. The count is over a fixed oid list
+    # rather than the whole table, whose size differs by server version.
+    "SELECT 0::oid",
+    "SELECT '25'::oid",
+    "SELECT 4294967295::oid",
+    "SELECT (-1)::oid",
+    "SELECT 25::oid::int4",
+    "SELECT 25::oid::text",
+    "SELECT to_regtype('text')",
+    "SELECT to_regtype('\"text\"')",
+    "SELECT to_regtype('\"TEXT\"')",
+    "SELECT to_regtype('integer')",
+    "SELECT to_regtype('nope')",
+    "SELECT to_regtype('text')::text",
+    "SELECT to_regtype('integer')::int4",
+    "SELECT 25::regtype::text",
+    "SELECT 1043::regtype::text",
+    "SELECT typname, oid, typarray, typdelim FROM pg_type WHERE oid = 25",
+    "SELECT typname FROM pg_type t WHERE t.oid = to_regtype('jsonb')",
+    "SELECT count(*) FROM pg_type WHERE oid IN (16, 25, 23, 3802)",
+    "SELECT oid::regtype::text FROM pg_type WHERE oid = 23",
     # A series' bounds, which clients write as parameters far more often than
     # as literals; the parameterised shapes are in PARAMETERISED below.
     "SELECT * FROM generate_series(1, null)",
@@ -736,6 +758,11 @@ PARAMETERISED = [
     ("SELECT %s::name[]", ([chr(i) for i in range(1, 256)],)),
     ("SELECT * FROM generate_series(%s, 10, %s)", (1, 3)),
     ("SELECT generate_series(1, %s)", (3,)),
+    # A json operand whose type comes from a cast on the parameter, and a path
+    # given as a text array.
+    ("SELECT %s::json ->> 'a'", ('{"a": 1}',)),
+    ("SELECT %s::jsonb -> 'a'", ('{"a": [1,2]}',)),
+    ("""SELECT '{"a":{"b":2}}'::json #>> %s""", (["a", "b"],)),
     ("SELECT * FROM generate_series(1, %s)", (None,)),
     ("SELECT * FROM generate_series(1, %s) ORDER BY 1 DESC LIMIT 2", (5,)),
     ("SELECT id FROM d WHERE n > %s", (1,)),
@@ -892,6 +919,8 @@ ERROR_QUERIES = [
     "SELECT int4range(5,1)",
     "SELECT '[5,1)'::int4range",
     "SELECT 'x'::int4range",
+    "SELECT 'x'::oid",
+    "SELECT 4294967296::oid",
     "SELECT int4range(1,5,'x')",
     "SELECT int4range(1,5,null)",
     "SELECT '{[1,5)'::int4multirange",

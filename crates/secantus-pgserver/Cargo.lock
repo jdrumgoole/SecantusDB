@@ -1544,6 +1544,7 @@ dependencies = [
  "futures",
  "pgwire",
  "postgres-types",
+ "secantus-core",
  "secantus-pgcatalog",
  "secantus-pgplan",
  "secantus-storage",
