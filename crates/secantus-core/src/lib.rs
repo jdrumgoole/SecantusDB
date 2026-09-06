@@ -50,6 +50,10 @@ mod windowfields;
 // private — its `set_path` / `unset_path` use deliberate `Result<_, ()>` "defer"
 // signals that shouldn't become public API (clippy::result_unit_err).
 pub use paths::{get_path, get_path_values, has_path};
+// mongod's two double renderings, needed by the command layer's stage
+// echo as well as by this crate's value messages. The module stays
+// private; only the two formatters are public.
+pub use numeric::{format_double_g, format_double_spec};
 
 // Re-export the `$group` field-reference pushdown (only) so the command layer
 // can decode just the top-level fields a `$group` reads from wide documents

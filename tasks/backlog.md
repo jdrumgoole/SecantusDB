@@ -5178,6 +5178,57 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
     in one case. Any corpus meant to test ordering needs at least one document
     that is not already sorted.
 
+- [ ] **Decimal128 special values in the transcendental family — the measured
+  matrix, so the next pass does not re-derive it (2026-09-07).** Re-measured
+  against the RUST SERVER (not the engine): `tools/probes/agg_expressions.py`
+  reports **0 wrong values / 88 code / 1 message** on 6,628 cases, and 47 of
+  the 88 are *valid input the Rust server refuses* — mongod answers, we say
+  "not supported by the Rust server". 45 of those 47 are this family.
+
+  `math_float_named` in `crates/secantus-core/src/expressions.rs` defers on
+  ANY `Bson::Decimal128`, which is the single gate. The **special** values need
+  no 34-digit decimal math at all — they are constants or errors — so they are
+  separable from the genuinely hard finite cases. Measured on 8.2.11:
+
+  | op | NaN | Infinity | -Infinity | 0 | -0 |
+  | --- | --- | --- | --- | --- | --- |
+  | `$sqrt` | `NaN` | `Infinity` | **E28714** | `0` | `-0` |
+  | `$exp` | `NaN` | `Infinity` | `0` | `1` | `1` |
+  | `$ln` | **double `nan`** | `Infinity` | E28766 | E28766 | E28766 |
+  | `$log10` | **double `nan`** | `Infinity` | E28761 | E28761 | E28761 |
+  | `$degreesToRadians` | `NaN` | `Infinity` | `-Infinity` | `0E-35` | `-0E-35` |
+  | `$radiansToDegrees` | `NaN` | `Infinity` | `-Infinity` | `0E-32` | `-0E-32` |
+  | `$sin` | `NaN` | E50989 | E50989 | `0` | `-0` |
+  | `$cos` | `NaN` | E50989 | E50989 | `1.000…000` (34 digits) | same |
+  | `$tan` | `NaN` | E50989 | E50989 | `0E-40` | `-0E-40` |
+  | `$asin` | `NaN` | E50989 | E50989 | `0E-40` | `-0E-40` |
+  | `$acos` | `NaN` | E50989 | E50989 | `1.5707963…` (34 digits) | same |
+  | `$atan` | `NaN` | `1.5707963…` | `-1.5707963…` | `0` | `-0` |
+  | `$sinh` | `NaN` | `Infinity` | `-Infinity` | `0E-40` | `-0E-40` |
+  | `$cosh` | `NaN` | `Infinity` | `Infinity` | `1.000…000` | same |
+  | `$tanh` | `NaN` | `1` | `-1` | `0` | `-0` |
+  | `$asinh` | `NaN` | `Infinity` | `-Infinity` | `0E-6176` | `-0E-6176` |
+  | `$acosh` | `NaN` | `Infinity` | E50989 | E50989 | E50989 |
+  | `$atanh` | `NaN` | E50989 | E50989 | `0E-6176` | `-0E-6176` |
+  | `$abs` | `NaN` | `Infinity` | `Infinity` | `0` | `0` |
+  | `$trunc` | `NaN` | `Infinity` | `-Infinity` | `0` | `-0` |
+  | `$ceil` | `NaN` | **`NaN`** | **`NaN`** | `0` | `-0` |
+  | `$floor` | `NaN` | **`NaN`** | **`NaN`** | `0` | `-0` |
+
+  Four rows defeat a guess and are the reason this is a table rather than a
+  rule: `$ceil` / `$floor` of a Decimal **infinity** are `NaN`; `$ln` / `$log10`
+  of a Decimal NaN come back as a **double** `nan`, not a Decimal one;
+  `$cosh(-Infinity)` is `+Infinity`; and `$abs(-0)` is `0` while `$trunc(-0)` is
+  `-0`.
+
+  The ZERO column mostly needs a per-operator QUANTUM (`0E-35`, `0E-40`,
+  `0E-6176`, the 34-digit `1.000…`), which is a constant per operator and so
+  also table-able — but the finite cases (`Decimal("2.5")` through any of these)
+  need real decimal transcendentals and remain the open dependency question
+  below. The PYTHON server answers the finite cases but gets the last digit and
+  the `-0` sign wrong on 19 shapes, which is the same family from the other
+  side.
+
 - [ ] **Decimal128 operands are refused by 33 Rust operators (2026-09-02).**
   Was 38; `$abs`, `$toBool`, `$toInt`, `$toLong` and `$toDouble` now take them.
   `$add`, `$subtract`, `$multiply`, `$divide`, `$mod`, `$ceil`,

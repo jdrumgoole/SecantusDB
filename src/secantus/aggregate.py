@@ -4844,9 +4844,12 @@ def _stage_graph_lookup(
     # spec in mongod's document rendering -- spaced inside the braces, unlike
     # the value renderer's compact form (probed 8.2.11).
     if "from" not in spec:
-        rendered = bson_value_repr_stage(dict(spec))
-        if rendered != "{}":
-            rendered = "{ " + rendered[1:-1] + " }"
+        # The SPEC vocabulary, not the value renderer: mongod echoes the stage's
+        # own specification here, so a double keeps its round-trip form
+        # (`startWith: -0.0`, not the value form's `-0`). `bson_value_repr`
+        # already spaces the braces, which is why the manual re-spacing that
+        # stood here is gone.
+        rendered = bson_value_repr(dict(spec))
         raise AggregateError(
             f"missing 'from' option to $graphLookup stage specification: {rendered}",
             code=9,

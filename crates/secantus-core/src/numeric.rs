@@ -537,3 +537,95 @@ mod fast_path_tests {
         assert_eq!(fast_cmp_numberish(&dec, &Bson::Int32(1)), None);
     }
 }
+
+/// A double as mongod echoes it in a VALUE error -- C's `%g`, precision 6.
+///
+/// mongod has **two** double renderings and they are not interchangeable
+/// (measured against 8.2.11, 2026-09-07):
+///
+/// * the VALUE form, this one (`mongo::Value::toString`), prints `-0`, `-1`,
+///   `1.23457e+06`, `-2.14748e+09`, `0.000123457`;
+/// * the SPEC form, [`format_double_spec`], echoes a stage's own specification
+///   back in the shortest round-trip form, keeping a whole double's `.0`:
+///   `-0.0`, `-1.0`, `1234567.0`, `-2147483648.0`.
+///
+/// Rust has no `%g`, so this reproduces it: format in `%e` style at `P-1`
+/// fractional digits to learn the exponent AFTER rounding, then choose `%f` or
+/// `%e` the way C does and strip the trailing zeros a bare `%g` drops.
+///
+/// The previous rendering was `d as i64` when the double was integral, which
+/// lost the sign of `-0.0` (printing `0`) and SATURATED for anything past
+/// `i64::MAX` -- `1e308` came back as `9223372036854775807`, a flatly wrong
+/// number in an error message shown to the user.
+pub fn format_double_g(v: f64) -> String {
+    if v.is_nan() {
+        return "nan".to_string();
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
+    format_double_precision(v, 6)
+}
+
+/// C's `%g` at an arbitrary precision. Rust has no `%g`, so this reproduces it:
+/// format in `%e` style at `precision - 1` fractional digits to learn the
+/// exponent AFTER rounding, then choose `%f` or `%e` the way C does and strip
+/// the trailing zeros a bare `%g` drops.
+fn format_double_precision(v: f64, precision: i32) -> String {
+    let sci = format!("{:.*e}", (precision - 1) as usize, v);
+    let (mantissa, exp_text) = sci
+        .split_once('e')
+        .expect("Rust {:e} always emits an exponent");
+    let exp: i32 = exp_text
+        .parse()
+        .expect("Rust {:e} always emits an integer exponent");
+    if !(-4..precision).contains(&exp) {
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!(
+            "{}e{}{:02}",
+            strip_trailing_zeros(mantissa),
+            sign,
+            exp.abs()
+        )
+    } else {
+        let decimals = (precision - 1 - exp).max(0) as usize;
+        strip_trailing_zeros(&format!("{v:.decimals$}"))
+    }
+}
+
+/// A double as mongod echoes it when reflecting a stage's own SPECIFICATION:
+/// the shortest round-trip form, with a whole double keeping its `.0`.
+///
+/// `format!("{d:.1}")` was used for the integral case, which expands `1e308`
+/// into its full 309-digit decimal value.
+pub fn format_double_spec(v: f64) -> String {
+    if v.is_nan() {
+        return "nan".to_string();
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
+    // `%.16g`, with a `.0` appended when that leaves no `.` or `e`.
+    //
+    // This was first written as the shortest ROUND-TRIP form, which agrees for
+    // every ordinary value. The two part company at the bottom of the range,
+    // where the shortest string that round-trips is shorter than sixteen
+    // significant digits: mongod echoes `1e-308` as `9.999999999999999e-309`
+    // and `5e-324` as `4.940656458412465e-324`. The differential gate caught
+    // it; the unit tests could not, having been written from the same wrong
+    // assumption as the code.
+    let rendered = format_double_precision(v, 16);
+    if rendered.contains(['.', 'e']) {
+        rendered
+    } else {
+        format!("{rendered}.0")
+    }
+}
+
+fn strip_trailing_zeros(text: &str) -> String {
+    if !text.contains('.') {
+        return text.to_string();
+    }
+    let trimmed = text.trim_end_matches('0');
+    trimmed.strip_suffix('.').unwrap_or(trimmed).to_string()
+}

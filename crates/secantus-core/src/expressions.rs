@@ -5349,8 +5349,11 @@ fn op_ln(arg: &Bson, ctx: &Ctx) -> R {
                 Err(Fallback::mongo(
                     28766,
                     format!(
+                        // mongod renders the operand as a DOUBLE here, in
+                        // its VALUE form -- an Int32 `-2147483648` comes back
+                        // as `-2.14748e+09`, not as itself.
                         "$ln's argument must be a positive number, but is {}",
-                        py_num_str(&v)
+                        crate::format_double_g(f)
                     ),
                 ))
             } else {
@@ -5371,7 +5374,7 @@ fn op_log10(arg: &Bson, ctx: &Ctx) -> R {
                     28761,
                     format!(
                         "$log10's argument must be a positive number, but is {}",
-                        py_num_str(&v)
+                        crate::format_double_g(f)
                     ),
                 ))
             } else {
@@ -5405,7 +5408,7 @@ fn op_log(arg: &Bson, ctx: &Ctx) -> R {
             28758,
             format!(
                 "$log's argument must be a positive number, but is {}",
-                py_num_str(&vals[0])
+                crate::format_double_g(n)
             ),
         ));
     }

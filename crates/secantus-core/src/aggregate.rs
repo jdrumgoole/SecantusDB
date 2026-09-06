@@ -295,15 +295,10 @@ pub fn render_value_compact(v: &Bson) -> String {
         Bson::String(s) => format!("\"{s}\""),
         Bson::Int32(n) => n.to_string(),
         Bson::Int64(n) => n.to_string(),
-        Bson::Double(d) => {
-            if d.is_nan() {
-                "nan".to_string()
-            } else if d.fract() == 0.0 && d.is_finite() {
-                format!("{}", *d as i64)
-            } else {
-                d.to_string()
-            }
-        }
+        // C's `%g`, precision 6 -- mongod's VALUE rendering. The `as i64` cast
+        // that stood here lost the sign of `-0.0` and saturated for anything
+        // past `i64::MAX`, so `1e308` printed `9223372036854775807`.
+        Bson::Double(d) => crate::format_double_g(*d),
         Bson::Decimal128(d) => d.to_string(),
         Bson::ObjectId(oid) => oid.to_hex(),
         // mongod always renders exactly three fractional digits and a `Z`.
