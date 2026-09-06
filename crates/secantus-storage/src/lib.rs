@@ -2499,7 +2499,33 @@ fn multi_sort_spec(sort: Option<&Document>) -> Option<Vec<(String, i32)>> {
 /// Byte key for an in-memory sort. **Not an index entry** — the only two callers
 /// are the post-fetch sorts below, so the empty-array special case here never
 /// reaches disk and the persisted rank scheme is untouched.
-fn sort_key(doc: &Document, spec: &[(String, i32)], coll: Option<&Collation>) -> Result<Vec<u8>> {
+/// Per-field sort-key parts for `doc`, each ASCENDING-encoded.
+///
+/// Direction is applied when the parts are COMPARED (`compare_sort_keys`), not
+/// by inverting the bytes. Inverting is how a descending column is stored in
+/// the B-tree, where the physical byte order has to be the sort order — but it
+/// is wrong for an in-memory sort, because **inversion does not reverse a
+/// PREFIX relationship**. `encode_value` gives `""` a key that is a strict
+/// prefix of `"a"`'s, which is right ascending (shorter sorts first) and stays
+/// "first" after inversion, so a descending sort put `""` at the FRONT. It was
+/// not only the empty string: every prefix chain came out ascending inside the
+/// descending result (measured against mongod 8.2.11, 2026-09-06):
+///
+/// ```text
+/// values  ["", "a", "ab", "abc", "b"]   sort {x: -1}
+/// mongod  ["b", "abc", "ab", "a", ""]
+/// before  ["", "b", "a", "ab", "abc"]
+/// ```
+///
+/// Comparing ascending encodings and negating avoids the problem entirely:
+/// prefix-shorter-first is exactly right ascending, and its reverse is exactly
+/// right descending. Nothing here is persisted, so the flat single-key form
+/// (which needed the inversion) buys nothing.
+fn sort_key(
+    doc: &Document,
+    spec: &[(String, i32)],
+    coll: Option<&Collation>,
+) -> Result<Vec<Vec<u8>>> {
     let mut parts = Vec::with_capacity(spec.len());
     for (f, d) in spec {
         let v = get_path(doc, f).cloned().unwrap_or(Bson::Null);
@@ -2510,27 +2536,31 @@ fn sort_key(doc: &Document, spec: &[(String, i32)], coll: Option<&Collation>) ->
         // order. Mirrors `ordering.py::_array_sort_value`.
         let v = order::array_sort_value(v, *d < 0).ok_or(StorageError::UnsupportedValue)?;
         // An empty array has no representative element; mongod sorts it between
-        // MinKey and Null. The persisted rank bytes cannot express that, so emit a
-        // key just above bare MinKey — inverted for a descending column, matching
-        // `encode_value_directed`'s own convention.
+        // MinKey and Null. The rank bytes cannot express that, so emit a key just
+        // above bare MinKey. No direction fix-up is needed now that the
+        // comparator owns direction.
         if matches!(v, Bson::Undefined) {
-            let bytes = if *d < 0 {
-                vec![0xFF - RANK_MINKEY, 0x00]
-            } else {
-                vec![RANK_MINKEY, 0xFF]
-            };
-            parts.push(bytes);
+            parts.push(vec![RANK_MINKEY, 0xFF]);
             continue;
         }
         // Collation-aware sort: a strength/caseLevel collation folds string keys
         // before encoding. A collation the encoder can't reproduce (non-ASCII /
         // numericOrdering) surfaces as UnsupportedValue → command BadValue.
-        parts.push(
-            sortkey::encode_value_directed(&v, *d, coll)
-                .map_err(|_| StorageError::UnsupportedValue)?,
-        );
+        parts.push(sortkey::encode_value(&v, coll).map_err(|_| StorageError::UnsupportedValue)?);
     }
-    Ok(compound_join(&parts))
+    Ok(parts)
+}
+
+/// Compare two `sort_key` part lists under `spec`'s per-field directions.
+fn compare_sort_keys(a: &[Vec<u8>], b: &[Vec<u8>], spec: &[(String, i32)]) -> std::cmp::Ordering {
+    for (i, (_, d)) in spec.iter().enumerate() {
+        let ord = a[i].cmp(&b[i]);
+        let ord = if *d < 0 { ord.reverse() } else { ord };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 /// Build an `IxScan` plan, setting `direction` to `"backward"` when the sort
@@ -5026,11 +5056,11 @@ impl Storage {
                     out.reverse();
                 }
             } else if let Some(spec) = multi_sort_spec(sort) {
-                let mut keyed: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(out.len());
+                let mut keyed: Vec<(Vec<Vec<u8>>, Vec<u8>)> = Vec::with_capacity(out.len());
                 for (d, blob) in out {
                     keyed.push((sort_key(&d, &spec, coll_opt)?, blob));
                 }
-                keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                keyed.sort_by(|a, b| compare_sort_keys(&a.0, &b.0, &spec));
                 return Ok(keyed.into_iter().map(|(_, b)| b).collect());
             }
         }
@@ -9966,12 +9996,12 @@ impl Storage {
                 // documents only (the filter already discarded the rest). Decorate
                 // -sort-undecorate on the byte-sortable compound key (collation-
                 // folded when a collation is active).
-                let mut keyed: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(out.len());
+                let mut keyed: Vec<(Vec<Vec<u8>>, Vec<u8>)> = Vec::with_capacity(out.len());
                 for blob in out {
                     let d = decode_doc(&blob)?;
                     keyed.push((sort_key(&d, &spec, coll_opt)?, blob));
                 }
-                keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                keyed.sort_by(|a, b| compare_sort_keys(&a.0, &b.0, &spec));
                 return Ok(keyed.into_iter().map(|(_, b)| b).collect());
             }
         }
@@ -14139,6 +14169,86 @@ mod tests {
         packed.extend_from_slice(b"an-id-key");
         let (_esc, rid) = unpack_entry(&packed);
         assert_eq!(rid, None);
+    }
+
+    /// A DESCENDING sort must reverse a PREFIX chain, which the old
+    /// invert-the-bytes key could not: `""`'s key is a strict prefix of
+    /// `"a"`'s, and a shorter byte string sorts first both before and after
+    /// inversion. So `["", "a", "ab", "abc", "b"]` sorted descending came back
+    /// `["", "b", "a", "ab", "abc"]` -- every prefix chain ascending, inside a
+    /// descending result (measured against mongod 8.2.11, 2026-09-06).
+    #[test]
+    fn descending_sort_reverses_a_prefix_chain() {
+        let spec = vec![("x".to_string(), -1)];
+        let docs: Vec<Document> = ["", "a", "ab", "abc", "b"]
+            .iter()
+            .map(|s| doc! {"x": *s})
+            .collect();
+        let mut keyed: Vec<(Vec<Vec<u8>>, &str)> = docs
+            .iter()
+            .zip(["", "a", "ab", "abc", "b"])
+            .map(|(d, label)| (sort_key(d, &spec, None).unwrap(), label))
+            .collect();
+        keyed.sort_by(|a, b| compare_sort_keys(&a.0, &b.0, &spec));
+        assert_eq!(
+            keyed.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            vec!["b", "abc", "ab", "a", ""]
+        );
+    }
+
+    #[test]
+    fn ascending_sort_is_unchanged_by_the_comparator() {
+        let spec = vec![("x".to_string(), 1)];
+        let labels = ["", "a", "ab", "abc", "b"];
+        let mut keyed: Vec<(Vec<Vec<u8>>, &str)> = labels
+            .iter()
+            .map(|s| (sort_key(&doc! {"x": *s}, &spec, None).unwrap(), *s))
+            .collect();
+        keyed.sort_by(|a, b| compare_sort_keys(&a.0, &b.0, &spec));
+        assert_eq!(keyed.iter().map(|(_, l)| *l).collect::<Vec<_>>(), labels);
+    }
+
+    /// Direction is per FIELD, so a mixed compound sort must reverse only the
+    /// columns that ask for it.
+    #[test]
+    fn compare_sort_keys_applies_direction_per_field() {
+        type Row<'a> = (Vec<Vec<u8>>, (&'a str, &'a str));
+        let spec = vec![("a".to_string(), 1), ("b".to_string(), -1)];
+        let mut rows: Vec<Row<'_>> = [("x", ""), ("x", "z"), ("w", "")]
+            .iter()
+            .map(|(a, b)| {
+                (
+                    sort_key(&doc! {"a": *a, "b": *b}, &spec, None).unwrap(),
+                    (*a, *b),
+                )
+            })
+            .collect();
+        rows.sort_by(|l, r| compare_sort_keys(&l.0, &r.0, &spec));
+        // `a` ascending, then `b` descending -- and `""` must come LAST in `b`.
+        assert_eq!(
+            rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+            vec![("w", ""), ("x", "z"), ("x", "")]
+        );
+    }
+
+    /// An empty array still sorts between MinKey and Null, and the comparator
+    /// (not a hand-inverted byte pattern) now supplies the direction.
+    #[test]
+    fn an_empty_array_keeps_its_place_in_both_directions() {
+        for (dir, want) in [(1, vec!["[]", "null", "s"]), (-1, vec!["s", "null", "[]"])] {
+            let spec = vec![("x".to_string(), dir)];
+            let rows: Vec<(Document, &str)> = vec![
+                (doc! {"x": []}, "[]"),
+                (doc! {"x": Bson::Null}, "null"),
+                (doc! {"x": "s"}, "s"),
+            ];
+            let mut keyed: Vec<(Vec<Vec<u8>>, &str)> = rows
+                .iter()
+                .map(|(d, l)| (sort_key(d, &spec, None).unwrap(), *l))
+                .collect();
+            keyed.sort_by(|a, b| compare_sort_keys(&a.0, &b.0, &spec));
+            assert_eq!(keyed.iter().map(|(_, l)| *l).collect::<Vec<_>>(), want);
+        }
     }
 
     #[test]

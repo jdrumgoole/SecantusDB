@@ -745,11 +745,16 @@ fn bound_cmp(
         let Some(dval) = secantus_core::get_path(doc, field) else {
             return Ok(None);
         };
+        // ASCENDING encodings compared and then negated, never the INVERTED
+        // bytes: inversion does not reverse a PREFIX relationship, so `""`
+        // (whose key is a strict prefix of every string's) compared as the
+        // LARGEST value on a descending column. See `storage::sort_key`.
         let enc = |v: &Bson| {
-            secantus_core::sortkey::encode_value_directed(v, dir, None)
+            secantus_core::sortkey::encode_value(v, None)
                 .map_err(|_| CommandError::new(2, "BadValue", "min/max value not comparable"))
         };
-        match enc(dval)?.cmp(&enc(bval)?) {
+        let ord = enc(dval)?.cmp(&enc(bval)?);
+        match if dir < 0 { ord.reverse() } else { ord } {
             Ordering::Equal => continue,
             other => return Ok(Some(other)),
         }

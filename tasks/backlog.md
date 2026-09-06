@@ -1969,30 +1969,47 @@ all still open. Probe: `scratchpad/readsweep.py` + `readsweep_lib.py`.
 
 #### Still open, RUST server only
 
-- [ ] **A DESCENDING sort over strings reverses every PREFIX chain.** The
-  clearest read-path defect the sweep found, and it is not just the empty
-  string:
+- [x] **RESOLVED (2026-09-06): the descending sort that put every prefix chain
+  in ascending order.** `sort({x: -1})` over `["", "a", "ab", "abc", "b"]` came
+  back `["", "b", "a", "ab", "abc"]` from the Rust server; mongod answers
+  `["b", "abc", "ab", "a", ""]`.
 
-  ```
-  values  ["", "a", "ab", "abc", "b"]      sort {x: -1}
-  mongod  ["b", "abc", "ab", "a", ""]
-  rust    ["", "b", "a", "ab", "abc"]
-  ```
+  A descending column is stored in the B-tree by INVERTING its key bytes — the
+  only way to express a direction where the engine sorts by raw bytes. The Rust
+  server reused that for an in-memory sort key, and inversion is not a
+  descending comparator: it does not reverse a PREFIX relationship, and `""`
+  encodes to a strict prefix of `"a"`'s key. Fixed by applying direction when
+  the keys are COMPARED (`storage::compare_sort_keys`) instead of by inverting
+  them — prefix-shorter-first is exactly right ascending, and its reverse is
+  exactly right descending. Same flaw, same fix, in `find.rs`'s `min`/`max`
+  cursor-bound comparison.
 
-  Root cause: `sortkey::escape` appends no terminator, so a string's key is a
-  strict PREFIX of any string extending it, and `encode_value_directed`
-  implements descending by INVERTING the bytes — which does not reverse a prefix
-  relationship. Ascending is correct; only descending is affected. Binary is
-  unaffected (its encoding is not prefix-ambiguous), and the Python server is
-  correct on the same corpus.
+  **This entry predicted the wrong fix, and the correction is the reusable
+  part.** It said the fix "is an on-disk format change… that needs the
+  `entryFormat` bump and open-time refusal the sharded-store change used". It
+  needs none of that. The persisted encoding is untouched, because ORDERING and
+  PLACEMENT are separate problems: only the B-tree needs the bytes themselves to
+  carry the direction, and nothing was reading ordering off those bytes that a
+  comparator could not do instead. Measured after the fix — a descending index
+  returns the same order as no index, and twelve range/equality shapes return
+  the same documents with and without one.
 
-  **A descending INDEX gives the same wrong order**, so it is at least
-  self-consistent — but the fix is an on-disk format change: making the encoding
-  prefix-free means a terminator after the escaped payload, which changes every
-  existing index entry. That needs the `entryFormat` bump and open-time refusal
-  the sharded-store change used, and both servers' rank tables kept in step (see
-  the `sortkey-rank-is-on-disk` note). Deliberately not bolted onto the
-  2026-09-06 read-path batch for that reason.
+  The prediction came from correctly diagnosing the ROOT CAUSE (a
+  prefix-ambiguous encoding) and then assuming the fix had to be at the same
+  layer. Sizing a fix from where the bug IS, rather than from what the caller
+  actually NEEDS, is the same reading-not-running error this file records
+  elsewhere.
+
+  The Python server was never affected — its in-memory sort goes through
+  `ordering.sort_docs`, not the encoder — but it shares `encode_value_directed`,
+  whose docstring on both servers now says it is for B-tree placement only.
+  Pinned by `tests/test_rust_descending_sort.py` (7 tests over the wire, 4 of
+  which fail against the pre-fix binary) and four `secantus-storage` unit tests.
+
+  **Still open, and unrelated to the prefix bug:** the `sort: x desc` case in
+  the read-path sweep now differs only on `[[5]]` versus `[1, [2, [3]]]` — an
+  array-versus-array comparison, which belongs to the array-descent family
+  above.
 
 - [ ] **`$expr` with `$gt` over a mixed-type collection defers.** `{$expr:
   {$gt: ["$x", 1]}}` answers `2 BadValue: query uses a construct the Rust server

@@ -326,6 +326,21 @@ pub fn invert_bytes(b: &[u8]) -> Vec<u8> {
 }
 
 /// `encode_value`, bytes inverted when `direction == -1`.
+/// **Only for physical B-tree placement — never for comparison.**
+///
+/// Inverting the bytes gives a descending column the right ORDER inside the
+/// index, where the storage engine sorts by raw bytes and there is nowhere to
+/// put a direction. It is not a general descending comparator, because
+/// **inversion does not reverse a PREFIX relationship**: `""` encodes to a
+/// strict prefix of `"a"`'s key, and a shorter byte string sorts first both
+/// before and after inversion. Sorting documents by these keys therefore put
+/// every prefix chain in ASCENDING order inside a descending result (measured
+/// against mongod 8.2.11, 2026-09-06 — `["", "a", "ab", "abc", "b"]` sorted
+/// descending came back `["", "b", "a", "ab", "abc"]`).
+///
+/// To ORDER values, compare `encode_value` outputs and negate for a descending
+/// column — prefix-shorter-first is exactly right ascending, and its reverse is
+/// exactly right descending. `storage::sort_key` / `compare_sort_keys` do that.
 pub fn encode_value_directed(
     v: &Bson,
     direction: i32,
