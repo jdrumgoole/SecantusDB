@@ -4791,10 +4791,24 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   reading any regtype column (including `pg_typeof`, which answers a real
   regtype as of 2026-09-06) gets text bytes where PostgreSQL sends the 4-byte
   oid. The text format matches; only the binary encoder is missing.
-- **Rust PG server: `RangeInfo.fetch` needs `pg_range` and a JOIN.** psycopg's
-  range registration query joins `pg_type` to `pg_range` on `rngtypid`;
-  neither the table nor any JOIN exists here. `TypeInfo.fetch` (no join)
-  works.
+- **Rust PG server: a passthrough `select %s` of an enum parameter reports the
+  wrong output oid.** `test_enum_dumper` binds an enum MEMBER (psycopg's dumper
+  declares the enum's oid, e.g. 65000) with no cast; the output column of
+  `select $1` should echo that declared oid so psycopg's registered loader
+  fires and maps `'ONE'` back to `<IntTestEnum.ONE>`. We report the value's
+  inferred type (text, 25), so the loader never fires -- ~36 `test_enum`
+  tests. The chain: `internal_type_name` drops an unknown (enum) param oid, so
+  the declared type is lost before the passthrough column can echo it. The
+  CAST form (`select %s::mood`) already reports the enum oid and passes.
+- **Rust PG server: a non-ASCII enum label under a non-UTF-8 client_encoding
+  is not re-encoded on output.** `set client_encoding to latin1` then reading
+  an enum whose label is `Xà` returns UTF-8 bytes where the client expects
+  latin1. The join / array_agg / EnumInfo machinery all work; this is output
+  encoding.
+- **Rust PG server: `RangeInfo.fetch` needs `pg_range`, which does not exist.**
+  The JOIN and FROM-subquery it needs now work (enum slice 3, 2026-09-06); only
+  the `pg_range` virtual table (`rngtypid`, `rngsubtype`) is missing. A small
+  slice on top of the join machinery.
 - **Rust PG server: range and multirange OPERATORS are unsupported.** Both type
   families themselves (literals, constructors, casts, canonicalisation, merging,
   parameters in both wire formats) are in; `@>` / `<@` / `&&` / `-|-` and the

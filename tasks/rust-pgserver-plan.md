@@ -1583,7 +1583,42 @@ Notes with teeth:
 * `'nope'::mood` is 22P02 with PostgreSQL's own wording; a duplicate CREATE
   TYPE is 42710 (not a table's 42P07); DROP of a missing type 42704.
 
-### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)
+### 0.45 enum slice 3: EnumInfo.fetch, the join, array_agg (2026-09-06)
+
+**3048 -> 3161.** `EnumInfo.fetch` works unmodified, and the enum file drops to
+45 failing. The 131-test `RangeSubselect` wall is gone.
+
+Built to the FROM-subquery + LEFT JOIN + array_agg + GROUP BY shape the query
+needs, and no wider: a two-table join with one ON equality, an optional
+single-column WHERE and one ORDER BY. **A JOIN half-supported quietly returns
+wrong rows, so everything outside that shape is refused** rather than guessed.
+The joined subquery is an aggregate SOURCE (`Aggregate.join`), materialised by
+a nested loop over two catalog tables (dozens of rows) whose ON/WHERE compare
+numerically across int widths and unwrap a regtype to its oid -- because
+`t.oid = to_regtype(...)` is the shape every caller sends.
+
+`array_agg` keeps NULLs in group order -- a LEFT-JOIN miss is `[None]`, which
+is exactly how `EnumInfo` tells a non-enum from an enum with no labels. The
+sort is NULLS LAST ascending, PostgreSQL's default, which those misses rely on.
+
+Enum VALUES needed both wire formats: a label's binary form is its UTF-8 (a
+Kind::Enum column is `binary_encodable` and rides the text arm), and an
+unspecified-oid parameter carrying a label decodes as the label -- an enum's
+raw oid arrives from pgwire's `Type::from_oid` as `None`, so the
+unknown-oid arm handles it by trying UTF-8. Enum ARRAYS report the derived
+typarray (oid + 100_000) rather than varchar.
+
+**Still failing (45), filed):** psycopg's `register_enum` maps a label back to
+a Python MEMBER by keying a loader on the type oid; the column reports the
+right oid, but the mapping needs the loader to fire, which is a client-side
+registration detail this has not chased yet (`'ONE'` vs `<IntTestEnum.ONE>`,
+36 tests). And a non-ASCII label under a non-UTF-8 client_encoding needs the
+encoding applied on the way out.
+
+**Probe: EnumInfo.fetch verified live for an enum and a non-enum; pg_enum and
+the join shapes 0-divergence.**
+
+### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)
 
 The 207 `test_enum.py` failures all die in one SESSION fixture (`ensure_enum`:
 `drop type if exists X; create type X as enum (...)`), so nothing is known yet

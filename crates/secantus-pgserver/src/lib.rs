@@ -240,6 +240,23 @@ impl PgHandler {
     /// registered.
     fn user_wire_type(&self, pg_type: &str) -> Option<Type> {
         let enums = self.enums().ok()?;
+        // An enum ARRAY: `inttestenum[]` reports the type's typarray oid
+        // (derived, oid + 100_000), so a client that registered the array
+        // decodes it rather than reading varchar.
+        if let Some(element) = pg_type.strip_suffix("[]") {
+            let (name, oid, _) = enums.iter().find(|(n, _, _)| n == element)?;
+            return Some(Type::new(
+                format!("_{name}"),
+                u32::try_from(*oid + Self::USER_TYPE_ARRAY_OID_OFFSET).ok()?,
+                postgres_types::Kind::Array(Type::new(
+                    name.clone(),
+                    u32::try_from(*oid).ok()?,
+                    postgres_types::Kind::Enum(Vec::new()),
+                    "public".to_string(),
+                )),
+                "public".to_string(),
+            ));
+        }
         let (name, oid, _) = enums.iter().find(|(n, _, _)| n == pg_type)?;
         Some(Type::new(
             name.clone(),
@@ -247,6 +264,186 @@ impl PgHandler {
             postgres_types::Kind::Enum(Vec::new()),
             "public".to_string(),
         ))
+    }
+
+    /// One table's rows as documents, virtual or stored, unfiltered.
+    fn table_docs(&self, table: &str) -> PgWireResult<Vec<Document>> {
+        if let Some(docs) = self.virtual_rows(table, &Document::new()) {
+            return Ok(docs);
+        }
+        let raw = self
+            .storage
+            .find_matching(&self.db, table, &Document::new())
+            .map_err(|e| Self::storage_err("could not read", e))?;
+        raw.iter()
+            .map(|b| {
+                bson::from_slice(b).map_err(|e| Self::storage_err("could not decode a row", e))
+            })
+            .collect()
+    }
+
+    /// Materialise a joined subquery's rows, keyed by its OUTPUT names.
+    ///
+    /// Nested-loop over two materialised sides -- the catalog tables this
+    /// exists for are dozens of rows. The ON and WHERE equalities compare
+    /// NUMERICALLY across int widths and unwrap a regtype to its oid, because
+    /// `t.oid = to_regtype(...)` is the shape every caller sends.
+    fn join_docs(&self, join: &secantus_pgplan::JoinSelect) -> PgWireResult<Vec<Document>> {
+        let eq = |a: &Bson, b: &Bson| -> bool {
+            let num = |v: &Bson| -> Option<i64> {
+                secantus_pgplan::regtype_oid(v).or(match v {
+                    Bson::Int32(x) => Some(i64::from(*x)),
+                    Bson::Int64(x) => Some(*x),
+                    _ => None,
+                })
+            };
+            match (num(a), num(b)) {
+                (Some(x), Some(y)) => x == y,
+                _ => a == b,
+            }
+        };
+        let field_of = |table: &str, col: &str| -> PgWireResult<String> {
+            self.lookup(table)
+                .and_then(|def| def.field_of(col))
+                .ok_or_else(|| Self::err(&PlanError::UndefinedColumn(col.to_string())))
+        };
+
+        let mut left_rows = self.table_docs(&join.left.0)?;
+        let right_rows = self.table_docs(&join.right.0)?;
+
+        // The WHERE equality binds to whichever side its alias names; applying
+        // it to the LEFT before the join is both correct and what keeps the
+        // nested loop trivial.
+        if let Some((alias, col, value)) = &join.filter {
+            let (side_table, on_left) = if *alias == join.left.1 {
+                (&join.left.0, true)
+            } else {
+                (&join.right.0, false)
+            };
+            let field = field_of(side_table, col)?;
+            let keep = |d: &Document| d.get(&field).map(|v| eq(v, value)).unwrap_or(false);
+            if on_left {
+                left_rows.retain(keep);
+            } else {
+                // A right-side WHERE under a LEFT JOIN changes which rows can
+                // match rather than which left rows survive; nothing measured
+                // sends one, so refuse instead of guessing.
+                return Err(Self::err(&PlanError::Unsupported(
+                    "a WHERE on the right side of a LEFT JOIN".into(),
+                )));
+            }
+        }
+
+        // The ON columns, resolved to each side's stored field.
+        let (l_on, r_on) = {
+            let (a, b) = (&join.on.0, &join.on.1);
+            if a.0 == join.left.1 {
+                (
+                    field_of(&join.left.0, &a.1)?,
+                    field_of(&join.right.0, &b.1)?,
+                )
+            } else {
+                (
+                    field_of(&join.left.0, &b.1)?,
+                    field_of(&join.right.0, &a.1)?,
+                )
+            }
+        };
+
+        let tz = self.session_timezone();
+        let mut out = Vec::new();
+        for l in &left_rows {
+            let matches: Vec<&Document> = right_rows
+                .iter()
+                .filter(|r| match (l.get(&l_on), r.get(&r_on)) {
+                    (Some(a), Some(b)) => eq(a, b),
+                    _ => false,
+                })
+                .collect();
+            let rights: Vec<Option<&Document>> = if matches.is_empty() {
+                if join.left_join {
+                    vec![None]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                matches.into_iter().map(Some).collect()
+            };
+            for r in rights {
+                let mut doc = Document::new();
+                for (i, (out_name, alias, col)) in join.columns.iter().enumerate() {
+                    let value = if *alias == join.left.1
+                        || (*alias != join.right.1
+                            && self
+                                .lookup(&join.left.0)
+                                .is_some_and(|d| d.column(col).is_some()))
+                    {
+                        let f = field_of(&join.left.0, col)?;
+                        l.get(&f).cloned().unwrap_or(Bson::Null)
+                    } else {
+                        match r {
+                            Some(r) => {
+                                let f = field_of(&join.right.0, col)?;
+                                r.get(&f).cloned().unwrap_or(Bson::Null)
+                            }
+                            None => Bson::Null,
+                        }
+                    };
+                    let value = match join.exprs.get(i).and_then(|e| e.as_ref()) {
+                        Some(expr) if value != Bson::Null => {
+                            secantus_pgplan::apply_column_expr(expr, value, &tz)
+                                .map_err(|e| PgHandler::err(&e))?
+                        }
+                        _ => value,
+                    };
+                    doc.insert(out_name.clone(), value);
+                }
+                // The ORDER BY column rides along under a reserved name even
+                // when not projected -- `ORDER BY e.enumsortorder` sorts a
+                // projection that does not include it.
+                if let Some((alias, col, _)) = &join.order {
+                    let value = if *alias == join.left.1 {
+                        let f = field_of(&join.left.0, col)?;
+                        l.get(&f).cloned().unwrap_or(Bson::Null)
+                    } else {
+                        match r {
+                            Some(r) => {
+                                let f = field_of(&join.right.0, col)?;
+                                r.get(&f).cloned().unwrap_or(Bson::Null)
+                            }
+                            None => Bson::Null,
+                        }
+                    };
+                    doc.insert("__join_order", value);
+                }
+                out.push(doc);
+            }
+        }
+
+        if let Some((_, _, ascending)) = &join.order {
+            // PostgreSQL sorts NULLS LAST ascending / FIRST descending, which
+            // the LEFT-JOIN misses rely on.
+            let key = |d: &Document| d.get("__join_order").cloned().unwrap_or(Bson::Null);
+            out.sort_by(|a, b| {
+                let (ka, kb) = (key(a), key(b));
+                let ord = match (&ka, &kb) {
+                    (Bson::Null, Bson::Null) => std::cmp::Ordering::Equal,
+                    (Bson::Null, _) => std::cmp::Ordering::Greater,
+                    (_, Bson::Null) => std::cmp::Ordering::Less,
+                    _ => secantus_pgplan::compare_values(&ka, &kb)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                };
+                if *ascending {
+                    ord
+                } else {
+                    ord.reverse()
+                }
+            });
+            for d in &mut out {
+                d.remove("__join_order");
+            }
+        }
+        Ok(out)
     }
 
     /// Make sure a catalog collection exists before writing to it: a delete or
@@ -358,6 +555,14 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("typdelim", "text", false),
                 ],
             )),
+            "pg_enum" => Some(TableDef::new(
+                "pg_enum",
+                vec![
+                    secantus_pgcatalog::Column::new("enumtypid", "oid", false),
+                    secantus_pgcatalog::Column::new("enumsortorder", "float4", false),
+                    secantus_pgcatalog::Column::new("enumlabel", "name", false),
+                ],
+            )),
             "pg_prepared_statements" => Some(TableDef::new(
                 "pg_prepared_statements",
                 vec![
@@ -402,6 +607,23 @@ impl PgHandler {
                     );
                     d.insert(def.field_of("typdelim").expect("column"), ",");
                     rows.push(d);
+                }
+                rows
+            }
+            // One row per label, in declared order; sortorder starts at 1.
+            "pg_enum" => {
+                let mut rows = Vec::new();
+                for (_, oid, labels) in self.enums().ok()? {
+                    for (i, label) in labels.iter().enumerate() {
+                        let mut d = Document::new();
+                        d.insert(def.field_of("enumtypid").expect("column"), Bson::Int64(oid));
+                        d.insert(
+                            def.field_of("enumsortorder").expect("column"),
+                            Bson::Double((i + 1) as f64),
+                        );
+                        d.insert(def.field_of("enumlabel").expect("column"), label.as_str());
+                        rows.push(d);
+                    }
                 }
                 rows
             }
@@ -2210,6 +2432,10 @@ impl PgHandler {
                     // this arm `count(*) from pg_type` fell through to storage,
                     // found no such collection, and answered 0 -- the right
                     // shape and the wrong number, which no error would flag.
+                    // A joined subquery's rows, already keyed by output name.
+                    _ if agg.join.is_some() => {
+                        self.join_docs(agg.join.as_ref().expect("checked"))?
+                    }
                     None if Self::virtual_table(&agg.table).is_some() => {
                         self.virtual_rows(&agg.table, &agg.filter).expect("checked")
                     }
@@ -2315,9 +2541,15 @@ impl PgHandler {
 
                 // A generated source has no table to look up; its one column
                 // is an int4.
-                let def = match &agg.series {
-                    Some(series) => series_table_def(series),
-                    None => self
+                let def = match (&agg.series, &agg.join) {
+                    (Some(series), _) => series_table_def(series),
+                    // A join's output def: each projected column with its
+                    // source (or cast) type.
+                    (None, Some(join)) => {
+                        secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
+                            .map_err(|e| Self::err(&e))?
+                    }
+                    (None, None) => self
                         .lookup(&agg.table)
                         .ok_or_else(|| Self::err(&PlanError::UndefinedTable(agg.table.clone())))?,
                 };
@@ -2453,6 +2685,9 @@ fn binary_encodable(ty: &Type) -> bool {
         Type::TEXT_ARRAY,
         Type::NUMERIC_ARRAY,
     ];
+    if matches!(ty.kind(), postgres_types::Kind::Enum(_)) {
+        return true;
+    }
     OK.contains(ty)
 }
 
@@ -2686,6 +2921,8 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         let x = as_numeric(v).ok_or_else(|| bad("this value"))?;
         return enc.encode_field(&Some(x));
     }
+    // A user ENUM's binary format is its label's UTF-8 -- the same bytes as
+    // text -- so it rides the text-family arm.
     if [
         Type::TEXT,
         Type::VARCHAR,
@@ -2694,6 +2931,7 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         Type::CHAR,
     ]
     .contains(ty)
+        || matches!(ty.kind(), postgres_types::Kind::Enum(_))
     {
         let x = as_text(v).ok_or_else(|| bad("this value"))?;
         return enc.encode_field(&Some(x));
@@ -2883,6 +3121,11 @@ fn aggregate_wire_type(item: &AggItem) -> Type {
             .as_deref()
             .map(wire_type)
             .unwrap_or(Type::VARCHAR),
+        AggFunc::ArrayAgg => item
+            .source_type
+            .as_deref()
+            .map(|t| wire_type(&format!("{t}[]")))
+            .unwrap_or(Type::TEXT_ARRAY),
     }
 }
 
@@ -2907,6 +3150,14 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
     match item.func {
         AggFunc::CountStar => Bson::Int64(rows.len() as i64),
         AggFunc::Count => Bson::Int64(values.len() as i64),
+        // Group order, NULLs INCLUDED -- a LEFT-JOIN miss surfaces as `[None]`
+        // rather than `[]`, which is what psycopg's EnumInfo distinguishes a
+        // non-enum by.
+        AggFunc::ArrayAgg => Bson::Array(
+            rows.iter()
+                .map(|d| d.get(field).cloned().unwrap_or(Bson::Null))
+                .collect(),
+        ),
         AggFunc::Sum => {
             if values.is_empty() {
                 return Bson::Null;
@@ -3662,7 +3913,16 @@ fn decode_parameter(
             // Every array oid this server knows, decoded through the element's
             // own binary decoder rather than a per-type array reader.
             Some(oid) if element_of_array_oid(oid).is_some() => binary_array(bytes, tz),
-            other => Err(unsupported_binary_oid(other)),
+            // An oid this server has no decoder for is a USER type -- the
+            // known builtins all matched above. A user ENUM's binary format is
+            // its label's UTF-8, so valid UTF-8 decodes as the label; anything
+            // else is still a refusal. (pgwire resolves the Parse message's
+            // oids through `Type::from_oid`, so an enum's raw oid arrives here
+            // as `None` -- both cases take this arm.)
+            other => match std::str::from_utf8(bytes) {
+                Ok(text) => Ok(Bson::String(text.to_string())),
+                Err(_) => Err(unsupported_binary_oid(other)),
+            },
         };
     }
 
@@ -3888,9 +4148,13 @@ impl PgHandler {
                 })
                 .collect(),
             Statement::Aggregate(agg) => {
-                let def = self
-                    .lookup(&agg.table)
-                    .ok_or_else(|| Self::err(&PlanError::UndefinedTable(agg.table.clone())))?;
+                let def = match &agg.join {
+                    Some(join) => secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
+                        .map_err(|e| Self::err(&e))?,
+                    None => self
+                        .lookup(&agg.table)
+                        .ok_or_else(|| Self::err(&PlanError::UndefinedTable(agg.table.clone())))?,
+                };
                 agg.select
                     .iter()
                     .map(|(name, col)| {
