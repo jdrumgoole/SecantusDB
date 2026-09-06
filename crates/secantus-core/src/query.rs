@@ -861,7 +861,22 @@ fn cmp_op(
     descend: bool,
 ) -> R {
     for v in values {
-        let Some(val) = v else { continue };
+        // An ABSENT field compares as NULL, which is what mongod's query
+        // language treats it as. It used to be skipped outright, so
+        // `{x: {$gt: MinKey()}}` and `{x: {$lt: MaxKey()}}` -- the two bounds
+        // that DO compare against every type -- left out every document with no
+        // `x` at all, where mongod returns them (probed 8.2.11, 2026-09-06;
+        // four shapes, both servers).
+        //
+        // Safe for the ordinary bounds because the type bracketing already
+        // excludes null from them: `{x: {$gt: 3}}` compares null against a
+        // number, the brackets differ, and the document is dropped exactly as
+        // before. Only a MinKey / MaxKey bound escapes the bracketing, and
+        // those are precisely the two that should see it.
+        let val = match v {
+            Some(val) => *val,
+            None => &Bson::Null,
+        };
         // Whole-value compare. For a scalar `val` this is the ordinary compare.
         // For an array `val`: against a *scalar* bound `compare_values` returns
         // None (Python's `[..] < 2` raises -> no match), so this is harmless; but
@@ -2561,6 +2576,61 @@ pub fn is_nan_bson(b: &Bson) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A MinKey / MaxKey bound compares against every type, an ABSENT field
+    /// included -- mongod's query language treats a missing field as null,
+    /// which ranks above MinKey and below MaxKey. The comparison skipped an
+    /// absent field outright, so those two bounds dropped every document with
+    /// no such field (probed 8.2.11, 2026-09-06).
+    #[test]
+    fn a_minkey_or_maxkey_bound_reaches_an_absent_field() {
+        let empty = Document::new();
+        let absent = doc! {"_id": 1i32};
+        for (q, want) in [
+            (doc! {"x": {"$gt": Bson::MinKey}}, true),
+            (doc! {"x": {"$gte": Bson::MinKey}}, true),
+            (doc! {"x": {"$lt": Bson::MaxKey}}, true),
+            (doc! {"x": {"$lte": Bson::MaxKey}}, true),
+            // The empty directions stay empty.
+            (doc! {"x": {"$lt": Bson::MinKey}}, false),
+            (doc! {"x": {"$gt": Bson::MaxKey}}, false),
+        ] {
+            assert_eq!(
+                matches(&absent, &q, &empty, None).unwrap(),
+                want,
+                "absent field vs {q:?}"
+            );
+        }
+    }
+
+    /// ...and an ORDINARY bound still must not reach it. That is what makes the
+    /// change safe: the range operators are TYPE-BRACKETED, so comparing an
+    /// absent field as null puts it in the null bracket, which every bound but
+    /// MinKey / MaxKey excludes.
+    #[test]
+    fn an_ordinary_bound_still_excludes_an_absent_field() {
+        let empty = Document::new();
+        let absent = doc! {"_id": 1i32};
+        for q in [
+            doc! {"x": {"$gt": 3i32}},
+            doc! {"x": {"$gte": 3i32}},
+            doc! {"x": {"$lt": 3i32}},
+            doc! {"x": {"$lte": 3i32}},
+            doc! {"x": {"$gt": "a"}},
+            doc! {"x": {"$lt": "z"}},
+            // `$gt` / `$lt` null match nothing, as before.
+            doc! {"x": {"$gt": Bson::Null}},
+            doc! {"x": {"$lt": Bson::Null}},
+        ] {
+            assert!(
+                !matches(&absent, &q, &empty, None).unwrap(),
+                "absent field must not match {q:?}"
+            );
+        }
+        // `$gte` / `$lte` null DO match it -- their own rule, unchanged.
+        assert!(matches(&absent, &doc! {"x": {"$gte": Bson::Null}}, &empty, None).unwrap());
+        assert!(matches(&absent, &doc! {"x": {"$lte": Bson::Null}}, &empty, None).unwrap());
+    }
+
     /// `$elemMatch` traverses an array ONCE. The operator form used to look
     /// inside an element that was itself an array, and the criteria form could
     /// not reach an array element at all. Probed 8.2.11 (2026-09-06).
