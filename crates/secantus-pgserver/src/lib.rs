@@ -523,6 +523,12 @@ fn wire_type(pg_type: &str) -> Type {
         // array of dates was described as `varchar`, so a client read back
         // strings where PostgreSQL hands it dates.
         "date[]" => Type::DATE_ARRAY,
+        "int4range[]" => Type::INT4_RANGE_ARRAY,
+        "int8range[]" => Type::INT8_RANGE_ARRAY,
+        "numrange[]" => Type::NUM_RANGE_ARRAY,
+        "daterange[]" => Type::DATE_RANGE_ARRAY,
+        "tsrange[]" => Type::TS_RANGE_ARRAY,
+        "tstzrange[]" => Type::TSTZ_RANGE_ARRAY,
         "time[]" => Type::TIME_ARRAY,
         "timestamp[]" => Type::TIMESTAMP_ARRAY,
         "timestamptz[]" => Type::TIMESTAMPTZ_ARRAY,
@@ -1670,12 +1676,11 @@ impl PgHandler {
                         .iter()
                         .enumerate()
                         .map(|(i, (out, field))| {
-                            // A cast changes the column's TYPE: the last cast in
-                            // the chain is what the client reads back.
-                            let ty = match sel.casts.get(i).and_then(|c| c.as_deref()) {
-                                Some(chain) => {
-                                    wire_type(chain.rsplit("::").next().unwrap_or(chain))
-                                }
+                            // A computed column's TYPE comes from its
+                            // expression -- the last cast, or the call's fixed
+                            // result type.
+                            let ty = match sel.casts.get(i).and_then(|c| c.as_ref()) {
+                                Some(expr) => wire_type(secantus_pgplan::column_expr_type(expr)),
                                 None => def
                                     .column(field)
                                     .or_else(|| def.column(out))
@@ -1694,14 +1699,12 @@ impl PgHandler {
                 let rows = stream::iter(docs).map(move |d| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
                     for (i, f) in fields.iter().enumerate() {
-                        // A cast chain is applied per row, innermost first --
-                        // `oid::regtype::text` turns 25 into `text`.
-                        if let Some(chain) = casts.get(i).and_then(|c| c.as_deref()) {
-                            let mut v = d.get(f).cloned().unwrap_or(Bson::Null);
-                            for target in chain.split("::") {
-                                v = secantus_pgplan::cast_value_with_tz(v, target, &tz)
-                                    .map_err(|e| PgHandler::err(&e))?;
-                            }
+                        // A computed column is applied per row -- the cast
+                        // chain or the scalar call the planner recorded.
+                        if let Some(expr) = casts.get(i).and_then(|c| c.as_ref()) {
+                            let v = d.get(f).cloned().unwrap_or(Bson::Null);
+                            let v = secantus_pgplan::apply_column_expr(expr, v, &tz)
+                                .map_err(|e| PgHandler::err(&e))?;
                             encode_field_value(&mut enc, &schema_ref[i], Some(&v))?;
                             continue;
                         }
@@ -3024,6 +3027,12 @@ fn element_of_array_oid(oid: u32) -> Option<&'static str> {
         3807 => "jsonb",
         1014 => "bpchar",
         1003 => "name",
+        3905 => "int4range",
+        3927 => "int8range",
+        3907 => "numrange",
+        3913 => "daterange",
+        3909 => "tsrange",
+        3911 => "tstzrange",
         _ => return None,
     })
 }
@@ -3648,12 +3657,12 @@ impl PgHandler {
                     .iter()
                     .enumerate()
                     .map(|(i, (out, field))| {
-                        // A cast changes the described type: the LAST cast in
-                        // the chain is what the client reads back. The describe
-                        // and the executor share this rule or the client
-                        // decodes rows against the wrong oid.
-                        let ty = match sel.casts.get(i).and_then(|c| c.as_deref()) {
-                            Some(chain) => wire_type(chain.rsplit("::").next().unwrap_or(chain)),
+                        // A computed column's described type comes from its
+                        // expression; the describe and the executor share this
+                        // rule or the client decodes rows against the wrong
+                        // oid.
+                        let ty = match sel.casts.get(i).and_then(|c| c.as_ref()) {
+                            Some(expr) => wire_type(secantus_pgplan::column_expr_type(expr)),
                             None => def
                                 .column(field)
                                 .or_else(|| def.column(out))

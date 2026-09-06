@@ -6,6 +6,10 @@ description = "PostgreSQL parse trees lowered to MQL for the SecantusDB PostgreS
 license = "Apache-2.0"
 
 [dependencies]
+# `regexp_replace` -- linear-time, which covers the POSIX-ARE subset any
+# measured client sends.
+regex = "1"
+
 bson = "2"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 # The IANA tz database, for `timestamptz`: PostgreSQL interprets a zone-less

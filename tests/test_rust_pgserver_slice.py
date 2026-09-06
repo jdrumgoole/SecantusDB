@@ -2483,3 +2483,80 @@ def test_the_oid_type(home: Path, binary: bool) -> None:
             cur.execute("select 4294967296::oid")
         with pytest.raises(psycopg.errors.InvalidTextRepresentation):
             cur.execute("select 'x'::oid")
+
+
+def test_a_scalar_call_over_a_column(home: Path) -> None:
+    """`regexp_replace(col, ...)` and friends in a table select list.
+
+    The value is computed per row by the executor; the TYPE is fixed at plan
+    time, because the describe pass sees no rows and has to name the column's
+    type anyway. Routing any function call to the aggregate planner used to
+    surface this as a GROUPING error — the wrong error for a plain gap.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create table sc (id int4, s text)")
+        cur.execute("insert into sc values (1, 'Hello'), (2, 'prepare _pg3_7 as x'), (3, null)")
+        cur.execute("select upper(s) from sc order by id")
+        assert [r[0] for r in cur.fetchall()] == ["HELLO", "PREPARE _PG3_7 AS X", None]
+        cur.execute("select length(s) from sc order by id")
+        assert [r[0] for r in cur.fetchall()] == [5, 19, None]
+        cur.execute(
+            "select regexp_replace(s, 'prepare _pg3_\\d+ as ', '', 'i') as statement"
+            " from sc order by id"
+        )
+        assert [r[0] for r in cur.fetchall()] == ["Hello", "x", None]
+
+
+def test_regexp_replace(home: Path) -> None:
+    """PostgreSQL's rules: FIRST match unless `g`, `\\1` groups, `i` flag."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for sql, want in [
+            ("select regexp_replace('aaa', 'a', 'b')", "baa"),
+            ("select regexp_replace('aaa', 'a', 'b', 'g')", "bbb"),
+            ("select regexp_replace('Hello World', 'o', '0', 'gi')", "Hell0 W0rld"),
+            ("select regexp_replace('abc123', '(\\d+)', '<\\1>')", "abc<123>"),
+            ("select regexp_replace('a$b', '\\$', 'S')", "aSb"),
+        ]:
+            cur.execute(sql)
+            assert cur.fetchone()[0] == want, sql
+        with pytest.raises(psycopg.errors.InvalidRegularExpression):
+            cur.execute("select regexp_replace('x', '[', 'y')")
+        # A NULL setting name reads back as NULL, not an error.
+        cur.execute("select current_setting(%s)", (None,))
+        assert cur.fetchone()[0] is None
+
+
+def test_pg_typeof_answers_a_real_regtype(home: Path) -> None:
+    """`pg_typeof(x)::oid` reads the oid, `::text` the name.
+
+    The old string answer could only render; psycopg's wrapper tests read
+    `pg_typeof(%s)::oid` for every numeric wrapper, and a display name is not
+    a number.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for sql, params, want in [
+            ("select pg_typeof(%s)::oid", (1,), 21),
+            ("select pg_typeof(%s)::oid", (1.5,), 701),
+            ("select pg_typeof(%s)::oid", (Decimal("1"),), 1700),
+            ("select pg_typeof(%s)::oid", ([1, 2],), 1005),
+            ("select pg_typeof(%s)::text", (1,), "smallint"),
+            ("select pg_typeof(1)", (), "integer"),
+        ]:
+            cur.execute(sql, params)
+            assert cur.fetchone()[0] == want, sql
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+def test_a_range_array_carries_its_own_oid(home: Path, binary: bool) -> None:
+    """`int4range[]` is 3905, not varchar — a client builds Range objects."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor(binary=binary)
+        cur.execute("""select '{"[1,5)"}'::int4range[]""")
+        assert cur.fetchone()[0] == [Range(1, 5, "[)")]
+        assert cur.pgresult.ftype(0) == 3905
+        cur.execute("select array['[1,5)'::int4range]")
+        assert cur.fetchone()[0] == [Range(1, 5, "[)")]
+        assert cur.pgresult.ftype(0) == 3905

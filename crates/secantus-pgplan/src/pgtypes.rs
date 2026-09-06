@@ -61,6 +61,14 @@ pub fn oid_of_name(name: &str) -> Option<i64> {
             .find(|(t, _, _)| *t == inner)
             .map(|(_, oid, _)| *oid);
     }
+    // An ARRAY name resolves to the element's typarray oid.
+    if let Some(element) = trimmed.strip_suffix("[]") {
+        let element_oid = oid_of_name(element)?;
+        return BUILTIN_TYPES
+            .iter()
+            .find(|(_, o, _)| *o == element_oid)
+            .map(|(_, _, arr)| *arr);
+    }
     let n = trimmed.to_ascii_lowercase();
     let internal = match n.as_str() {
         "integer" | "int" => "int4",

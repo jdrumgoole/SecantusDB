@@ -117,6 +117,17 @@ SETUP = [
 ]
 
 QUERIES = [
+    # Scalar calls, constant and over columns; PostgreSQL replaces only the
+    # FIRST match unless `g` is given, which is not most regex libraries'
+    # default.
+    "SELECT regexp_replace('aaa', 'a', 'b')",
+    "SELECT regexp_replace('aaa', 'a', 'b', 'g')",
+    "SELECT regexp_replace('Hello World', 'o', '0', 'gi')",
+    "SELECT regexp_replace('abc123', '(\\d+)', '<\\1>')",
+    "SELECT regexp_replace(s, 'l+', 'L') FROM d ORDER BY id",
+    "SELECT upper(s) FROM d ORDER BY id",
+    "SELECT length(s) FROM d ORDER BY id",
+    "SELECT current_setting(NULL)",
     # An array's TYPE comes from its elements, and the mixed-numeric cases
     # widen in PostgreSQL's own order (int2 < int4 < int8 < numeric < float4 <
     # float8). A NULL literal contributes no type.
@@ -920,6 +931,7 @@ ERROR_QUERIES = [
     "SELECT '[5,1)'::int4range",
     "SELECT 'x'::int4range",
     "SELECT 'x'::oid",
+    "SELECT regexp_replace('x', '[', 'y')",
     "SELECT 4294967296::oid",
     "SELECT int4range(1,5,'x')",
     "SELECT int4range(1,5,null)",
@@ -1061,6 +1073,10 @@ PARAM_TYPE_QUERIES: list[tuple[str, tuple]] = [
     ("SELECT pg_typeof(%s)", ("x",)),
     ("SELECT pg_typeof(%s)", (None,)),
     ("SELECT pg_typeof(%s::int4)", ("5",)),
+    # …and the regtype it answers casts onward by both its natures.
+    ("SELECT pg_typeof(%s)::oid", (1,)),
+    ("SELECT pg_typeof(%s)::oid", (1.5,)),
+    ("SELECT pg_typeof(%s)::text", ([1, 2],)),
 ]
 
 # The same information, in comparisons rather than in `pg_typeof` — these run in

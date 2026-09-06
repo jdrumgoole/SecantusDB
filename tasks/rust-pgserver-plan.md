@@ -1511,6 +1511,72 @@ value psycopg's bounds test uses -- fails on the type of its own literal.
 divergences; `TypeInfo.fetch` verified against a live server for text / int4 /
 integer / jsonb / an unknown name.**
 
+### 0.43 a function of a column, and the error that hid the gap (2026-09-06)
+
+**2963 -> 2968 net (+28 / -23, the churn being the cursor `__del__` class), on
+the fully stacked branch.** Small by count and structural by content: computed
+columns over table reads now cover SCALAR CALLS, not just cast chains.
+
+**The router bug is the part worth remembering.** `has_aggregate` treated ANY
+FuncCall target as an aggregate, so `regexp_replace(col, ...)` was sent to the
+aggregate planner and its refusal surfaced as `column "name" must appear in the
+GROUP BY clause` -- a GROUPING error for what was a plain unsupported target.
+**When a failure's error class makes no sense for the query, suspect the
+ROUTER, not the handler**: the message came from machinery the statement should
+never have reached.
+
+`ColumnExpr` generalises the `casts` field: `Casts(Vec<String>)` or `Call {
+name, args, result_type }` with the column's position marked by None among
+constant args. `result_type` is fixed at plan time because the DESCRIBE pass
+sees no rows -- third instance of that lesson (0.39 pg_typeof, 0.40 arrays).
+
+`regexp_replace` notes, all measured: PostgreSQL replaces only the FIRST match
+unless `g`; `\1` group references (the regex crate's `${1}`, and a literal
+`$` in the replacement must be doubled or the crate reads it as a group);
+`2201B` for a malformed pattern -- its own class, not 22P02. The linear-time
+`regex` crate covers the POSIX-ARE subset the corpus sends. Left divergent:
+PG's bad-pattern MESSAGE names the specific defect ("brackets [] not
+balanced"); ours names the pattern.
+
+**Probe: 12 shapes, 1 divergence (that message detail).**
+
+**Two follow-ons closed from the fresh ranking, both this campaign's own
+residue.** `pg_typeof` answered a display-name STRING, so `pg_typeof(%s)::oid`
+-- psycopg's wrapper tests, 33 failures -- tried to parse `smallint` as a
+number; it now answers a real regtype value (the 0.42 representation), and the
+backlog entry for it closes. And a range ARRAY was described as `varchar`
+because `wire_type` had no arm for it -- after 0.40's typed array encoder that
+PROMOTED from a value quirk to a hard `cannot send this value as a binary
+varchar` error. Both probes 0-divergence, both formats.
+
+**A fix can change the SHAPE of downstream failures without changing their
+count**: the range-array gap predated 0.40, but 0.40 turned it from a wrong
+oid into a hard error, which is what pushed it up the ranking.
+
+### Next: the enum campaign, scoped (2026-09-06)
+
+The 207 `test_enum.py` failures all die in one SESSION fixture (`ensure_enum`:
+`drop type if exists X; create type X as enum (...)`), so nothing is known yet
+about the per-test failures underneath. The backlog's standing instruction
+holds: do NOT take it as one batch. The SHARED-STORE contract to honour is the
+Python server's (`src/secantus/sql/catalog.py`):
+
+* `__sql_enums__` docs: `{_id: name, enum: name, labels: [...], oid: minted}`.
+* `__sql_enum_meta__`: `{_id: "oid_counter", next: N}`; base 65000; minting is
+  read-counter-else `max(base+len-1, *taken)+1`, then rewrite `next = oid+1`.
+  Monotonic and never reused -- positional minting renumbers types under a
+  client that registered loaders by oid.
+* `typarray = oid + 100_000`, DERIVED, never stored. Reporting a real typarray
+  is load-bearing: psycopg keys array registrations on it, and 0 pops the
+  global unknown-oid fallback loader.
+
+Slice 1 (fixture-unblocking): CREATE TYPE ... AS ENUM + DROP TYPE [IF EXISTS]
+against those collections; enums in the `pg_type` virtual rows and
+`to_regtype`. Slice 2: `pg_enum` virtual table + enum VALUES (`'a'::mood`,
+enum columns, comparisons in label order). Slice 3: `EnumInfo.fetch`'s query
+-- FROM-subquery + LEFT JOIN + `array_agg` + GROUP BY, which is its own
+planner feature and also what `RangeInfo.fetch` waits on.
+
 **Trajectory: 694 -> 746 -> 853 -> 899 -> 900 -> 904 -> 945 -> 965 -> 984 -> 1043 -> 1215 -> 1295 -> 1372 -> 1388 -> 1485 -> 1615 -> 1633 -> 1692 -> 1790 -> 1845 -> 1848 -> 1870 -> 1933 -> 2117 -> 2181 -> 2219 -> 2256 -> 2347 -> 2589 | 2739 -> 2886 (everything before the bar is on the no-mypy scale of 0.39a; 0.41/0.42 measured +48/+53 on a pre-0.40 base and stack on merge; 0.35 measured +29 on a pre-0.34 base and is not in this line).**
 
 **Re-measured after rebasing onto a `main` that had gained seven parallel

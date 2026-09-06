@@ -4682,12 +4682,14 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   empty (the statement store lives in pgwire's portal layer, which the executor
   cannot see). The Python server's `sql/virtual.py` (3.5k lines) is the
   reference for how far this eventually goes.
-- **Rust PG server: `pg_typeof` still answers a display-name STRING under oid
-  2206, and no regtype has a BINARY encoding.** `regtype` itself is real now
-  (2026-09-06: prints as the name, compares as the oid, casts both ways), but
-  `pg_typeof`'s value is a plain string -- `pg_typeof(x)::int4` answers an
-  error where PostgreSQL answers the oid -- and a binary-format cursor reading
-  any regtype column gets text bytes where PostgreSQL sends the 4-byte oid.
+- **Rust PG server: no regtype has a BINARY encoding.** A binary-format cursor
+  reading any regtype column (including `pg_typeof`, which answers a real
+  regtype as of 2026-09-06) gets text bytes where PostgreSQL sends the 4-byte
+  oid. The text format matches; only the binary encoder is missing.
+- **Rust PG server: `RangeInfo.fetch` needs `pg_range` and a JOIN.** psycopg's
+  range registration query joins `pg_type` to `pg_range` on `rngtypid`;
+  neither the table nor any JOIN exists here. `TypeInfo.fetch` (no join)
+  works.
 - **Rust PG server: range and multirange OPERATORS are unsupported.** Both type
   families themselves (literals, constructors, casts, canonicalisation, merging,
   parameters in both wire formats) are in; `@>` / `<@` / `&&` / `-|-` and the

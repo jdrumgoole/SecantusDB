@@ -1030,13 +1030,20 @@ fn pg_typeof_reports_display_names() {
     ] {
         match plan_ok(sql) {
             Statement::SelectConstant(sc) => {
-                assert_eq!(
-                    sc.columns[0].1,
-                    ConstCol::Value(Bson::String(want.to_string())),
-                    "for {sql}"
-                );
-                // A regtype, not text: a client reading oid 25 would print the
-                // same characters but compare unequal to a regtype.
+                // A regtype VALUE now, rendered to its display name -- a plain
+                // string could not also answer `::oid`. A type the catalog
+                // cannot number (`unknown`) is still carried as its name.
+                let rendered = match &sc.columns[0].1 {
+                    ConstCol::Value(v) => match regtype_oid(v) {
+                        Some(oid) => regtype_text(oid),
+                        None => match v {
+                            Bson::String(s) => s.clone(),
+                            other => panic!("unexpected value for {sql}: {other:?}"),
+                        },
+                    },
+                    other => panic!("not a value for {sql}: {other:?}"),
+                };
+                assert_eq!(rendered, want, "for {sql}");
                 assert_eq!(sc.columns[0].2, "regtype", "for {sql}");
             }
             other => panic!("wrong statement for {sql}: {other:?}"),
