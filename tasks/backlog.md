@@ -4715,35 +4715,68 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   A REPLACEMENT is exempt: `replace_one({_id: 1}, {"": 1})` really does store an
   empty field name on mongod, so only operator paths are validated.
 
-- [ ] **mongod 8.x decides operator-vs-replacement form by the FIRST key, and
-  both servers get the replacement half wrong (2 shapes, 2026-09-06).** Measured
-  against 8.2.11 while fixing the entry above:
+- [x] **RESOLVED (2026-09-06): the operator-vs-replacement form decision.**
+  mongod reads the **first key alone**, so `{z: 2, $set: {a: 1}}` is a
+  replacement containing a `$`-prefixed field — `DollarPrefixedFieldName` (52) —
+  not an operator update. Both servers asked `any(k.startswith("$"))` and
+  answered `9 Unknown modifier: z`. Nine shapes measured, all now matching.
+
+  **The timing was the part the original entry did not know.** The operator-form
+  9 is PARSE-time (reported with no match and on an upsert); the replacement-form
+  52 is EXECUTION-time and fires only on a real replacement:
 
   ```
-  {$set: {a: 1}, z: 2}   mongod:  9 Unknown modifier: z …          both servers: same
-  {z: 2, $set: {a: 1}}   mongod: 52 Plan executor error during update :: caused
-                                    by :: The dollar ($) prefixed field '$set'
-                                    in '$set' is not allowed in the context of
-                                    an update's replacement document. Consider
-                                    using an aggregation pipeline with
-                                    $replaceWith.
-                         both servers:  9 Unknown modifier: z …
+  {z: 2, $set: {a: 1}}  matches      -> 52, wrapped
+                        no match     -> ok, n=0            (was: error)
+                        upsert       -> inserts {_id, z, $set} verbatim (was: error)
   ```
 
-  So mongod does not ask "does this mix operators and fields"; it takes the
-  FIRST key as deciding the form, and then complains in that form's vocabulary —
-  a `$`-prefixed key inside a replacement is `DollarPrefixedFieldName` (52),
-  wrapped as an execution-time error. Both servers instead use
-  `any(k.startswith("$"))` to pick the form and answer 9 either way.
+  So both servers were failing a legitimate no-match update and refusing a
+  legitimate upsert. `is_operator_form` is now one shared predicate on each
+  server (`secantus.update` / `secantus_core::update`), and the storage upsert
+  path stops re-sorting a REPLACEMENT upsert's fields — that had put the
+  `$`-prefixed key ahead of the plain one.
 
-  **The comment on the Python `_unknown_modifier` helper says "probed 6.0.16"**,
-  which is exactly the staleness hazard CLAUDE.md warns about: the message it
-  records is still right for the operator-form half and wrong for the other.
-  Deliberately NOT folded into the 2026-09-06 batch — it changes which FORM an
-  update is parsed as, which reaches replacement handling and `_id` immutability,
-  and it deserves its own probe of the whole `DollarPrefixedFieldName` family
-  (nested `$`-keys in a replacement, `$`-keys in an inserted document, and
-  whether 52 is really execution-time or just rendered that way).
+  **Only the TOP level is restricted, and that half was already right.** mongod
+  8.x stores `{a: {$bad: 1}}`, `{a: [{$bad: 1}]}` and a literal dotted key
+  `{"a.b": 1}` verbatim, and `insert` accepts all of them. Now pinned in
+  `tests/test_update_replacement_form.py` (25 tests) and five Rust unit tests.
+
+  **Reachability note:** pymongo's `update_one` helper refuses a bare-first
+  document client-side ("update only works with $ operators"), so this shape
+  reaches a server only through the raw `update` command — which is how the
+  other drivers send it, and how the tests drive it.
+
+- [ ] **The RUST server does not sort an operator-upsert's update-added fields
+  (2026-09-06).** BSON field order is on the wire and drivers compare raw bytes
+  (mongo-php-library's codec tests do), so this is a real difference:
+
+  ```
+  q {_id: 5}  u {$set: {z: 1, a: 2}}     mongod: [_id, a, z]
+                                         rust:   [_id, z, a]     <- update order
+                                         python: [_id, a, z]     OK
+  ```
+
+  The Python server has `storage._order_upserted_doc` for exactly this; the Rust
+  storage upsert path (`crates/secantus-storage/src/lib.rs`, the
+  `matched == 0 && upsert` branch) has no equivalent and inserts in update order.
+  A straight port of the "update-added fields sorted by name" half is the fix.
+
+  **Do NOT also port the query-seeded half — it is not reproducible.** mongod
+  emits the query-seeded fields in an internal order that is neither source order
+  nor alphabetical, and is stable for a key SET regardless of the order it was
+  written in (measured 8.2.11, 2026-09-06):
+
+  ```
+  q {m:1, c:2, z:3}  $set {b:4, y:5}   -> [_id, m, c, z, b, y]
+  q {z:1, m:2, c:3}  $set {y:4, b:5}   -> [_id, m, c, z, b, y]   same order!
+  ```
+
+  That is a hash order, in the class this project does not reproduce. Python's
+  `_order_upserted_doc` sorts them alphabetically, which is a defensible
+  approximation and should be left alone; its docstring's "probed 6.0.16" claim
+  about that half is not what 8.2.11 does, and the comment at the `sorted(filter)`
+  seed site says the same thing and is equally stale.
 
 - [ ] **`nModified` counts a `$min`/`$max` that declined to write (2 shapes,
   2026-09-03).** `{$min: {a: 5}}` and `{$min: {a: -Infinity}}` over `a: NaN`

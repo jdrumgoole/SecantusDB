@@ -55,7 +55,7 @@ from secantus.sortkey import (
     encode_value,
     encode_value_directed,
 )
-from secantus.update import apply_update, find_positional_matches
+from secantus.update import apply_update, find_positional_matches, is_operator_form
 
 _GEO_2DSPHERE = "2dsphere"
 _GEO_2D = "2d"
@@ -6279,7 +6279,14 @@ class Storage:
                 new = apply_update(seed, update, is_upsert=True, array_filters=array_filters)
                 if "_id" not in new:
                     new["_id"] = bson.ObjectId()
-                new = _order_upserted_doc(new, seeded)
+                # Only an OPERATOR upsert gets mongod's synthesised field order. A
+                # REPLACEMENT upsert inserts the document the client sent, in
+                # the client's own order with `_id` first -- `apply_update`
+                # already did that, and re-sorting it here put a `$`-prefixed
+                # key ahead of a plain one (probed 8.2.11, 2026-09-06:
+                # `{z: 2, $set: {a: 1}}` upserts `{_id, z, $set}`).
+                if not isinstance(update, list) and is_operator_form(update):
+                    new = _order_upserted_doc(new, seeded)
                 if validator is not None and not matches(new, validator):
                     raise DocumentValidationError(new.get("_id"))
                 upserted_id = new["_id"]

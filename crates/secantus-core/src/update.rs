@@ -1103,7 +1103,7 @@ pub fn apply_update_with(
         }
         None => {}
     }
-    let has_op = update.keys().any(|k| k.starts_with('$'));
+    let has_op = is_operator_form(update);
     if has_op {
         if !update.keys().all(|k| k.starts_with('$')) {
             return Err(Fallback::Defer); // mixing operators with fields -> Python raises
@@ -1124,6 +1124,18 @@ pub fn apply_update_with(
         }
         Ok(result)
     } else {
+        // A `$`-prefixed TOP-LEVEL key in a replacement is mongod's
+        // `DollarPrefixedFieldName` (52), and it is an EXECUTION-time error, not
+        // a parse-time one: with no matching document the statement is a silent
+        // no-op (`n: 0`), and an UPSERT inserts the document verbatim, `$`-key
+        // and all (probed 8.2.11, 2026-09-06). So it fires only on a real
+        // replacement, which `is_upsert` distinguishes -- the upsert path calls
+        // us with the seed document it is about to insert.
+        if !is_upsert {
+            if let Some(field) = replacement_dollar_field(update) {
+                return Err(Fallback::mongo(52, replacement_dollar_error(field)).exec());
+            }
+        }
         // Replacement-style: the update is the new doc, with _id preserved.
         let mut new = update.clone();
         if let Some(orig) = doc.get("_id") {
@@ -1167,6 +1179,46 @@ pub fn conflicting_update_paths(update: &Document) -> Option<(String, String)> {
         Some(UpdatePathFault::Conflict { offending, at }) => Some((offending, at)),
         _ => None,
     }
+}
+
+/// Is this an operator update, or a replacement document?
+///
+/// mongod decides on the **first key alone** (probed 8.2.11, 2026-09-06), and
+/// then complains in that form's vocabulary:
+///
+/// ```text
+/// {$set: {a: 1}, z: 2}   ->  9  Unknown modifier: z
+/// {z: 2, $set: {a: 1}}   -> 52  The dollar ($) prefixed field '$set' ... is not
+///                               allowed in the context of an update's
+///                               replacement document.
+/// ```
+///
+/// This used to ask `keys().any(|k| k.starts_with('$'))`, which made the second
+/// one an operator update too and answered 9 for it. An empty update is a
+/// replacement (of nothing), which is how `{}` reduces a document to its `_id`.
+pub fn is_operator_form(update: &Document) -> bool {
+    update.keys().next().is_some_and(|k| k.starts_with('$'))
+}
+
+/// The FIRST top-level `$`-prefixed key of a replacement document.
+///
+/// Only the TOP level: mongod 8.x stores `{a: {$bad: 1}}` and `{a: [{$bad: 1}]}`
+/// happily, and stores a dotted key like `{"a.b": 1}` literally too. Probed
+/// 8.2.11 (2026-09-06).
+pub fn replacement_dollar_field(update: &Document) -> Option<&str> {
+    update
+        .keys()
+        .find(|k| k.starts_with('$'))
+        .map(String::as_str)
+}
+
+/// mongod's `DollarPrefixedFieldName` (52) message for a replacement document.
+pub fn replacement_dollar_error(field: &str) -> String {
+    format!(
+        "The dollar ($) prefixed field '{field}' in '{field}' is not allowed in the \
+         context of an update's replacement document. Consider using an aggregation \
+         pipeline with $replaceWith."
+    )
 }
 
 /// What is wrong with an update's operator paths, if anything.
@@ -1244,8 +1296,11 @@ pub fn update_spec_error(update: &Document) -> Option<(i32, String)> {
 /// match. That is the "user-supplied path used as a dict key" shape
 /// `CLAUDE.md` calls out.
 pub fn update_path_fault(update: &Document) -> Option<UpdatePathFault> {
-    if !update.keys().any(|k| k.starts_with('$')) {
-        return None; // replacement-style: its fields are data, not paths
+    if !is_operator_form(update) {
+        // A replacement's fields are DATA, not paths -- including any
+        // `$`-prefixed one, whose refusal is execution-time (see
+        // `replacement_dollar_field`), not parse-time.
+        return None;
     }
     let mut seen: Vec<Vec<String>> = Vec::new();
     for (op, payload) in update.iter() {
@@ -1592,6 +1647,106 @@ fn addtoset_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
 
 #[cfg(test)]
 mod tests {
+    // --- the operator-vs-replacement form decision. mongod takes the FIRST
+    // key alone and then complains in that form's vocabulary (probed 8.2.11,
+    // 2026-09-06). ---
+
+    #[test]
+    fn the_first_key_decides_the_form() {
+        for (update, operator_form) in [
+            (doc! {"$set": {"a": 1i32}}, true),
+            (doc! {"$set": {"a": 1i32}, "z": 2i32}, true),
+            (doc! {"z": 2i32, "$set": {"a": 1i32}}, false),
+            (doc! {"y": 1i32, "z": 2i32, "$set": {"a": 1i32}}, false),
+            (doc! {"_id": 1i32, "$set": {"a": 1i32}}, false),
+            (doc! {"a.b": 1i32, "$set": {"a": 1i32}}, false),
+            (doc! {"a": 9i32}, false),
+            // An empty update is a replacement of nothing -- that is how `{}`
+            // reduces a stored document to its `_id`.
+            (Document::new(), false),
+        ] {
+            assert_eq!(
+                super::is_operator_form(&update),
+                operator_form,
+                "{update:?}"
+            );
+        }
+    }
+
+    /// A replacement's `$`-prefixed TOP-LEVEL key is `DollarPrefixedFieldName`
+    /// (52), and the FIRST such key is the one mongod names.
+    #[test]
+    fn a_dollar_key_in_a_replacement_is_refused() {
+        for (update, named) in [
+            (doc! {"z": 2i32, "$set": {"a": 1i32}}, "$set"),
+            (doc! {"z": 2i32, "$weird": 3i32}, "$weird"),
+            (doc! {"z": 1i32, "$aaa": 1i32, "$bbb": 2i32}, "$aaa"),
+            (doc! {"z": 1i32, "$aaa": 1i32, "y": 2i32}, "$aaa"),
+            (doc! {"_id": 1i32, "$set": {"a": 1i32}}, "$set"),
+        ] {
+            let err = super::apply_update(&doc! {"_id": 1i32, "a": 0i32}, &update, false)
+                .expect_err("a $-prefixed replacement key is refused");
+            assert_eq!(
+                err.as_mongo(),
+                Some((52, super::replacement_dollar_error(named).as_str())),
+                "{update:?}"
+            );
+            assert!(err.is_exec(), "mongod wraps this one: {update:?}");
+        }
+    }
+
+    /// Only the TOP level: mongod 8.x stores a nested `$`-key, and a literal
+    /// dotted key, verbatim.
+    #[test]
+    fn only_the_top_level_of_a_replacement_is_restricted() {
+        for update in [
+            doc! {"a": {"$bad": 1i32}},
+            doc! {"a": {"b": {"$bad": 1i32}}},
+            doc! {"a": [{"$bad": 1i32}]},
+            doc! {"a.b": 1i32},
+            doc! {"a": 9i32},
+        ] {
+            let out = super::apply_update(&doc! {"_id": 1i32, "a": 0i32}, &update, false)
+                .unwrap_or_else(|e| panic!("{update:?} must be stored, got {e:?}"));
+            let mut want = doc! {"_id": 1i32};
+            for (k, v) in update.iter() {
+                want.insert(k.clone(), v.clone());
+            }
+            assert_eq!(out, want, "{update:?}");
+        }
+    }
+
+    /// The 52 is EXECUTION-time, so the upsert-insert path must not raise it --
+    /// mongod inserts the document verbatim, `$`-key and all.
+    #[test]
+    fn an_upsert_inserts_the_replacement_verbatim() {
+        let out = super::apply_update(
+            &doc! {"_id": 99i32},
+            &doc! {"z": 2i32, "$set": {"a": 1i32}},
+            true,
+        )
+        .expect("the upsert-insert path does not apply the replacement check");
+        assert_eq!(out, doc! {"_id": 99i32, "z": 2i32, "$set": {"a": 1i32}});
+        // Field order is mongod's: `_id` first, then the document as sent.
+        assert_eq!(out.keys().collect::<Vec<_>>(), vec!["_id", "z", "$set"]);
+    }
+
+    /// The operator-form complaint stays a PARSE error: it is reported with no
+    /// matching document and on an upsert, unlike the replacement-form 52.
+    #[test]
+    fn operator_form_still_names_the_first_bare_key() {
+        assert_eq!(
+            super::update_spec_error(&doc! {"$set": {"a": 1i32}, "y": 1i32, "z": 2i32})
+                .map(|(c, m)| (c, m.contains("Unknown modifier: y"))),
+            Some((9, true))
+        );
+        // A replacement is not a spec error at all -- its refusal comes later.
+        assert_eq!(
+            super::update_spec_error(&doc! {"z": 2i32, "$set": {"a": 1i32}}),
+            None
+        );
+    }
+
     // --- update_spec_error: the three parse faults and their ORDER. Every
     // verdict measured against mongod 8.2.11 (2026-09-06). ---
 
