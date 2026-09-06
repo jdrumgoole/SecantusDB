@@ -155,6 +155,16 @@ pub enum Statement {
     SelectConstant(SelectConstant),
     Transaction(TransactionControl),
     DropTable(DropTable),
+    /// `CREATE TYPE <name> AS ENUM (<labels>)`.
+    CreateEnum {
+        name: String,
+        labels: Vec<String>,
+    },
+    /// `DROP TYPE [IF EXISTS] <names>`.
+    DropType {
+        names: Vec<String>,
+        if_exists: bool,
+    },
     /// `SHOW name` -- one row, one text column named canonically.
     Show(String),
     /// `SET name = value`.
@@ -584,6 +594,28 @@ pub fn plan_with_params(
         N::InsertStmt(i) => plan_insert(&i, lookup, params),
         N::SelectStmt(s) => plan_select(&s, lookup, params),
         N::DropStmt(d) => plan_drop(&d),
+        // `CREATE TYPE ... AS ENUM`. The name may be schema-qualified; with no
+        // schema support the last part is the name, same rule as columns.
+        N::CreateEnumStmt(e) => {
+            let name = e
+                .type_name
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    N::String(s) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .next_back()
+                .ok_or_else(|| Error::Parse("CREATE TYPE without a name".into()))?;
+            let labels = e
+                .vals
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    N::String(s) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect();
+            Ok(Statement::CreateEnum { name, labels })
+        }
         N::CopyStmt(c) => plan_copy(&c, lookup, params),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
         N::DeclareCursorStmt(d) => {
@@ -1792,10 +1824,12 @@ fn pg_typeof(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> 
     // oid and `::text` the name, and a bare read renders the name -- the
     // string alone could only do the last. A type the catalog cannot number
     // (`unknown`, mostly) still answers its name as text.
-    Ok(match pgtypes::oid_of_name(&internal) {
-        Some(oid) => regtype_value(oid),
-        None => Bson::String(display_type(&internal)),
-    })
+    Ok(
+        match pgtypes::oid_of_name(&internal).or_else(|| user_type_oid(&internal)) {
+            Some(oid) => regtype_value(oid),
+            None => Bson::String(display_type(&internal)),
+        },
+    )
 }
 
 /// PostgreSQL's DISPLAY name for a type, which is not its internal name.
@@ -2262,6 +2296,16 @@ pub fn regtype_text(oid: i64) -> String {
     {
         return format!("{}[]", display_type(name));
     }
+    if let Some(name) = user_type_name(oid) {
+        // A name that is not plain lower-case renders QUOTED -- PostgreSQL's
+        // regtype output rule, measured: `"CamelCase"`, but `mood`.
+        let plain = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            && !name.chars().next().is_some_and(|c| c.is_ascii_digit());
+        return if plain { name } else { format!("\"{name}\"") };
+    }
     oid.to_string()
 }
 
@@ -2444,6 +2488,11 @@ thread_local! {
     /// The type each `$n` was declared as, when the client declared one.
     static PLAN_PARAM_TYPES: std::cell::RefCell<Vec<Option<String>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// User-defined types (enums, today): `(name, oid)`, set by the wire
+    /// layer per statement from the shared store. The planner is pure; the
+    /// catalog is not, so the catalog comes TO the planner.
+    static PLAN_USER_TYPES: std::cell::RefCell<Vec<(String, i64, Vec<String>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     static PLAN_TIMEZONE: std::cell::RefCell<TimeZoneSetting> =
         const { std::cell::RefCell::new(TimeZoneSetting::Utc) };
 }
@@ -2480,6 +2529,65 @@ pub fn plan_with_session_types(
     PLAN_TIMEZONE.with(|t| *t.borrow_mut() = previous);
     PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous_types);
     out
+}
+
+/// Install the user-defined types for the statements that follow on this
+/// thread. The wire layer reads them from the shared store per statement.
+pub fn set_user_types(types: Vec<(String, i64, Vec<String>)>) {
+    PLAN_USER_TYPES.with(|t| *t.borrow_mut() = types);
+}
+
+/// A user type's oid by name, quoted or bare -- the bare form FOLDS, exactly
+/// as `oid_of_name` does for builtins.
+fn user_type_oid(name: &str) -> Option<i64> {
+    let trimmed = name.trim();
+    let (target, fold) = match trimmed.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        Some(inner) => (inner.to_string(), false),
+        None => (trimmed.to_ascii_lowercase(), true),
+    };
+    PLAN_USER_TYPES.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(n, _, _)| {
+                if fold {
+                    n.to_ascii_lowercase() == target
+                } else {
+                    *n == target
+                }
+            })
+            .map(|(_, oid, _)| *oid)
+    })
+}
+
+/// A user ENUM's `(oid, labels)` by name, same folding rule.
+fn user_enum(name: &str) -> Option<(i64, Vec<String>)> {
+    let trimmed = name.trim();
+    let (target, fold) = match trimmed.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        Some(inner) => (inner.to_string(), false),
+        None => (trimmed.to_ascii_lowercase(), true),
+    };
+    PLAN_USER_TYPES.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(n, _, _)| {
+                if fold {
+                    n.to_ascii_lowercase() == target
+                } else {
+                    *n == target
+                }
+            })
+            .map(|(_, oid, labels)| (*oid, labels.clone()))
+    })
+}
+
+/// A user type's NAME by oid -- the reverse door, for rendering a regtype.
+fn user_type_name(oid: i64) -> Option<String> {
+    PLAN_USER_TYPES.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(_, o, _)| *o == oid)
+            .map(|(n, _, _)| n.clone())
+    })
 }
 
 /// The declared type of `$n`, when the client gave one.
@@ -3494,19 +3602,41 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             ))),
         };
     }
+    // `'sad'::mood` -- an enum VALUE. The value stays its label text (which
+    // is also how the store carries it); only membership is checked, and the
+    // failure is 22P02 with PostgreSQL's own wording.
+    if let Some((_, labels)) = user_enum(target) {
+        return match value {
+            Bson::String(label) => {
+                if labels.contains(&label) {
+                    Ok(Bson::String(label))
+                } else {
+                    Err(Error::InvalidText(format!(
+                        "invalid input value for enum {target}: \"{label}\""
+                    )))
+                }
+            }
+            other => Err(Error::Unsupported(format!(
+                "a cast of {} to {target}",
+                bson_kind(&other)
+            ))),
+        };
+    }
     if target == "regtype" {
         return match value {
             Bson::Int32(oid) => Ok(regtype_value(i64::from(oid))),
             Bson::Int64(oid) => Ok(regtype_value(oid)),
             // `'text'::regtype` -- unlike `to_regtype`, an unknown NAME is an
             // error here, which is why psycopg prefers the function.
-            Bson::String(name) => match pgtypes::oid_of_name(&name) {
-                Some(oid) => Ok(regtype_value(oid)),
-                None => Err(Error::UndefinedObject(format!(
-                    "type \"{}\" does not exist",
-                    name.trim()
-                ))),
-            },
+            Bson::String(name) => {
+                match pgtypes::oid_of_name(&name).or_else(|| user_type_oid(&name)) {
+                    Some(oid) => Ok(regtype_value(oid)),
+                    None => Err(Error::UndefinedObject(format!(
+                        "type \"{}\" does not exist",
+                        name.trim()
+                    ))),
+                }
+            }
             other => Err(Error::Unsupported(format!(
                 "a cast of {} to regtype",
                 bson_kind(&other)
@@ -4635,11 +4765,42 @@ fn plan_set(v: &pg_query::protobuf::VariableSetStmt) -> Result<Statement> {
 }
 
 fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
+    // `DROP TYPE`: the object is a TypeName, not a List of name parts.
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectType) {
+        let mut names = Vec::new();
+        for obj in &d.objects {
+            let Some(N::TypeName(tn)) = obj.node.as_ref() else {
+                return Err(Error::Unsupported("this DROP TYPE target".into()));
+            };
+            let name = tn
+                .names
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    N::String(s) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .next_back()
+                .ok_or_else(|| Error::Parse("DROP TYPE without a name".into()))?;
+            names.push(name);
+        }
+        return Ok(Statement::DropType {
+            names,
+            if_exists: d.missing_ok,
+        });
+    }
     if ObjectType::try_from(d.remove_type) != Ok(ObjectType::ObjectTable) {
-        return Err(Error::Unsupported(format!(
-            "DROP of {:?}",
-            ObjectType::try_from(d.remove_type)
-        )));
+        // Named, not `{:?}`: the debug form of a protobuf enum leaked to the
+        // wire here for as long as DROP knew only tables.
+        let what = match ObjectType::try_from(d.remove_type) {
+            Ok(ObjectType::ObjectSchema) => "a schema",
+            Ok(ObjectType::ObjectIndex) => "an index",
+            Ok(ObjectType::ObjectView) => "a view",
+            Ok(ObjectType::ObjectSequence) => "a sequence",
+            Ok(ObjectType::ObjectFunction) => "a function",
+            Ok(ObjectType::ObjectDomain) => "a domain",
+            _ => "this object kind",
+        };
+        return Err(Error::Unsupported(format!("DROP of {what}")));
     }
     // CASCADE would have to chase dependants; refuse rather than silently
     // behave as RESTRICT. DropBehavior: Restrict = 1, Cascade = 2.
@@ -4831,10 +4992,12 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 ));
             }
             return Ok(match const_value(&f.args[0], params)? {
-                Bson::String(name) => match pgtypes::oid_of_name(&name) {
-                    Some(oid) => regtype_value(oid),
-                    None => Bson::Null,
-                },
+                Bson::String(name) => {
+                    match pgtypes::oid_of_name(&name).or_else(|| user_type_oid(&name)) {
+                        Some(oid) => regtype_value(oid),
+                        None => Bson::Null,
+                    }
+                }
                 _ => Bson::Null,
             });
         }

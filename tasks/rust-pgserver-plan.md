@@ -1553,7 +1553,37 @@ varchar` error. Both probes 0-divergence, both formats.
 count**: the range-array gap predated 0.40, but 0.40 turned it from a wrong
 oid into a hard error, which is what pushed it up the ranking.
 
-### Next: the enum campaign, scoped (2026-09-06)
+### 0.44 enum slices 1 and 2: the DDL, the catalog, the values (2026-09-06)
+
+**3005 -> 3048, and the errors column 287 -> 91.** The 207 `test_enum.py`
+failures collapse to 154, and 131 of those now hang on ONE thing:
+`RangeSubselect` -- the FROM-subquery in `EnumInfo.fetch`'s query (with the
+LEFT JOIN and `array_agg` behind it). Slice 3 is the next biggest single item
+on the whole board.
+
+Built exactly to the shared-store contract scoped below, and verified in the
+strongest way available: an enum created by the RUST server resolves on the
+PYTHON server under the SAME oid, and a type minted by Python next continues
+the sequence (`rust_oid + 1`) -- the cross-server test drives both servers
+over one home directory.
+
+Notes with teeth:
+
+* **A write to a catalog collection nobody created is a WiredTiger ENOENT,
+  not a no-op.** Reads tolerate the absence (empty), writes must
+  `ensure_collection` first -- the probe's first run failed on exactly this,
+  as `[XX000] could not drop the type: WiredTiger error 2`.
+* **The planner stays pure by having the catalog come TO it**: a
+  `PLAN_USER_TYPES` thread-local `(name, oid, labels)`, installed per
+  statement from the store (the OTHER server may have written since the last
+  statement). Same pattern as the timezone and the declared parameter types.
+* An enum COLUMN needs a custom `Type::new(name, oid, Kind::Enum, schema)` --
+  psycopg matches the oid against what `EnumInfo` registered, so `wire_type`'s
+  static table cannot answer it.
+* `'nope'::mood` is 22P02 with PostgreSQL's own wording; a duplicate CREATE
+  TYPE is 42710 (not a table's 42P07); DROP of a missing type 42704.
+
+### Next: the enum campaign, scoped (2026-09-06)### Next: the enum campaign, scoped (2026-09-06)
 
 The 207 `test_enum.py` failures all die in one SESSION fixture (`ensure_enum`:
 `drop type if exists X; create type X as enum (...)`), so nothing is known yet
