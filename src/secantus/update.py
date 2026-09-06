@@ -429,9 +429,11 @@ def validate_update_doc(update: Any) -> None:
     """
     if isinstance(update, list) or not isinstance(update, Mapping):
         return
-    keys = list(update)
-    if not any(k.startswith("$") for k in keys):
-        return  # replacement-style update
+    if not is_operator_form(update):
+        # A replacement's fields are DATA, not paths -- including any
+        # `$`-prefixed one, whose refusal is execution-time (see
+        # `_replacement_dollar_field`), not parse-time.
+        return
     # A bare field among the operators is NOT checked up front: mongod reaches
     # it in document order like everything else, so `{$set: {"": 1}, z: 2}` is
     # the empty path (56) and `{$set: {a: 1}, z: 2}` is `Unknown modifier: z`
@@ -457,6 +459,40 @@ def apply_update_batch(
     array-filter / positional updates are applied per doc the same way.
     """
     return [apply_update(d, update, is_upsert=is_upsert) for d in docs]
+
+
+def is_operator_form(update: Mapping[str, Any]) -> bool:
+    """Is this an operator update, or a replacement document?
+
+    mongod decides on the **first key alone** (probed 8.2.11, 2026-09-06), and
+    then complains in that form's vocabulary::
+
+        {$set: {a: 1}, z: 2}   ->  9  Unknown modifier: z
+        {z: 2, $set: {a: 1}}   -> 52  The dollar ($) prefixed field '$set' ...
+                                      is not allowed in the context of an
+                                      update's replacement document.
+
+    We used to ask ``any(k.startswith("$"))``, which made the second one an
+    operator update too and answered 9 for it. An empty update is a
+    replacement (of nothing), which is how ``{}`` reduces a document to its
+    ``_id``.
+    """
+    for key in update:
+        return key.startswith("$")
+    return False
+
+
+def _replacement_dollar_field(update: Mapping[str, Any]) -> str | None:
+    """The FIRST top-level ``$``-prefixed key of a replacement document.
+
+    Only the TOP level: mongod 8.x stores ``{a: {$bad: 1}}`` and
+    ``{a: [{$bad: 1}]}`` happily, and stores a dotted key like ``{"a.b": 1}``
+    literally too. Probed 8.2.11 (2026-09-06).
+    """
+    for key in update:
+        if key.startswith("$"):
+            return key
+    return None
 
 
 def _validate_update_paths(update: Mapping[str, Any]) -> tuple[str, str] | None:
@@ -565,7 +601,7 @@ def apply_update(
         # see below.
         return _apply_pipeline_update(doc, update, let=let)
     keys = list(update.keys())
-    has_op = any(k.startswith("$") for k in keys)
+    has_op = is_operator_form(update)
     _validate_array_filters(array_filters or [], update)
     filter_map = _index_array_filters(array_filters or [])
     pos = dict(positional_matches) if positional_matches else {}
@@ -602,6 +638,22 @@ def apply_update(
     # on a falsy update and return the document untouched, which silently kept
     # every field the client had asked to drop. (An empty *pipeline*, ``[]``, is
     # the genuine no-op; it returns above.)
+    # A `$`-prefixed TOP-LEVEL key in a replacement is mongod's
+    # `DollarPrefixedFieldName` (52) -- and it is an EXECUTION-time error, not a
+    # parse-time one: with no matching document the statement is a silent no-op
+    # (`n: 0`), and an UPSERT inserts the document verbatim, `$`-key and all
+    # (probed 8.2.11, 2026-09-06). So this fires only on a real replacement,
+    # which `is_upsert` distinguishes -- the upsert path calls us with the seed
+    # document it is about to insert.
+    if not is_upsert:
+        dollar = _replacement_dollar_field(update)
+        if dollar is not None:
+            raise _exec_error(
+                f"The dollar ($) prefixed field '{dollar}' in '{dollar}' is not allowed "
+                "in the context of an update's replacement document. Consider using an "
+                "aggregation pipeline with $replaceWith.",
+                code=52,
+            )
     new = copy.deepcopy(dict(update))
     if "_id" in doc:
         if "_id" in new and new["_id"] != doc["_id"]:
