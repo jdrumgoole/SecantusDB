@@ -10144,7 +10144,10 @@ impl Storage {
         // (`find_positional_matches`), `$[]`/`$[ident]` from `array_filters`.
         // `let_vars` are visible to `$expr` in the filter (command `let`);
         // `coll_opt` forces a collation-aware COLLSCAN match.
-        let is_replacement = !update.keys().any(|k| k.starts_with('$'));
+        // `is_operator_form`, not `any(starts_with('$'))`: mongod decides the form
+        // on the FIRST key alone, so `{z: 2, $set: {..}}` is a replacement. The
+        // engine was moved to that rule; this copy had been left behind.
+        let is_replacement = !secantus_core::update::is_operator_form(update);
         // Resolve `$currentDate` to a concrete clock value once per operation (so
         // a multi-update stamps every matched doc with the same time), keeping the
         // deterministic core engine free of the clock.
@@ -10763,12 +10766,30 @@ impl Storage {
                     let mut seed = Document::new();
                     for (k, v) in filter {
                         if !k.starts_with('$') && !is_op_doc(v) {
-                            seed.insert(k.clone(), v.clone());
+                            // A DOTTED equality names a nested path, and mongod
+                            // builds the nesting: `{"a.b.c": 5}` upserts
+                            // `{a: {b: {c: 5}}}`. A plain `insert` stored a
+                            // literal key with dots in it — a document mongod
+                            // cannot produce, which then does not match the very
+                            // query that created it, so the SAME upsert run twice
+                            // inserted TWO documents (measured 8.2.11,
+                            // 2026-09-06). The Python side has had `set_path`
+                            // here since it hit the same bug.
+                            secantus_core::update::set_document_path(&mut seed, k, v.clone())
+                                .map_err(query_fault)?;
                         }
                     }
+                    let seeded: Vec<String> = seed.keys().cloned().collect();
                     let mut new = transform(&seed, true)?;
                     if !new.contains_key("_id") {
                         new.insert("_id", Bson::ObjectId(ObjectId::new()));
+                    }
+                    // mongod's field order for an upserted document -- see
+                    // `order_upserted_doc`. Only an OPERATOR upsert gets it; a
+                    // REPLACEMENT upsert inserts the document the client sent,
+                    // in the client's own order.
+                    if !is_replacement {
+                        new = order_upserted_doc(new, &seeded);
                     }
                     // Validator on an upsert-inserted document, too.
                     if let Some(v) = validator {
@@ -12649,6 +12670,46 @@ fn uuid_binary(bytes: &[u8]) -> Bson {
     })
 }
 
+/// mongod's field order for an UPSERTED document: `_id` first, then the fields
+/// seeded from the query's equalities, then whatever the update added, sorted by
+/// name. `seeded` is the query-derived top-level key list. Port of
+/// `secantus.storage._order_upserted_doc`, which the Rust upsert path never had
+/// — it inserted in seed-then-update order, so `{$set: {z: 1, a: 2}}` came out
+/// `[_id, .., z, a]` where mongod gives `[_id, .., a, z]`. BSON field order is on
+/// the wire and drivers compare raw bytes (mongo-php-library's codec tests do).
+///
+/// **Only the update-added half is reproducible.** mongod's order for the
+/// query-seeded fields is an internal hash order: it is not source order, not
+/// alphabetical, and it VARIES BETWEEN RUNS for identical input (measured
+/// 8.2.11, 2026-09-06 — the same query gave `[z, c, m]` on one run and
+/// `[m, c, z]` on the next three). Sorting them is the approximation the Python
+/// server already makes, and matching it is what keeps the two servers
+/// byte-identical to each other.
+fn order_upserted_doc(new: Document, seeded: &[String]) -> Document {
+    let mut from_query: Vec<&String> = Vec::new();
+    let mut from_update: Vec<&String> = Vec::new();
+    for k in new.keys() {
+        if k == "_id" {
+            continue;
+        }
+        if seeded.iter().any(|s| s == k) {
+            from_query.push(k);
+        } else {
+            from_update.push(k);
+        }
+    }
+    from_query.sort();
+    from_update.sort();
+    let mut ordered = Document::new();
+    if let Some(id) = new.get("_id") {
+        ordered.insert("_id".to_string(), id.clone());
+    }
+    for k in from_query.into_iter().chain(from_update) {
+        ordered.insert(k.clone(), new.get(k).expect("key came from `new`").clone());
+    }
+    ordered
+}
+
 /// An empty options document (`{}`) as BSON bytes — the collections-table value.
 fn empty_options() -> Vec<u8> {
     encode_doc(&Document::new()).expect("encoding an empty document cannot fail")
@@ -13138,6 +13199,154 @@ mod tests {
         assert!(
             decode_doc(assigned).unwrap().get_object_id("_id").is_ok(),
             "missing _id must be assigned an ObjectId"
+        );
+    }
+
+    /// An upsert seeded from a DOTTED equality must build the nesting.
+    ///
+    /// This was a real data bug: the seed did `insert("a.b", v)`, storing a
+    /// document with a literal dotted key -- one mongod cannot produce, and one
+    /// that does NOT match the query that created it. So the same upsert run
+    /// twice inserted TWO documents, silently, where mongod matches the first
+    /// and inserts nothing (measured 8.2.11, 2026-09-06). The idempotent upsert
+    /// is the canonical use of the feature, so this broke it outright.
+    ///
+    /// The Python server has used `set_path` here since it hit the same bug;
+    /// this is the "user-supplied path used as a dict key" shape `CLAUDE.md`
+    /// names.
+    #[test]
+    fn a_dotted_upsert_key_builds_the_nesting_and_stays_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+
+        let cases: Vec<(Document, Document)> = vec![
+            (doc! {"a.b": 5i32}, doc! {"a": {"b": 5i32}}),
+            (doc! {"a.b.c": 5i32}, doc! {"a": {"b": {"c": 5i32}}}),
+            (
+                doc! {"a.b": 1i32, "a.c": 2i32},
+                doc! {"a": {"b": 1i32, "c": 2i32}},
+            ),
+        ];
+        for (i, (filter, want_nested)) in cases.into_iter().enumerate() {
+            let coll = format!("c{i}");
+            let upsert = |s: &Storage| {
+                s.update_matching(
+                    "db",
+                    &coll,
+                    &filter,
+                    &doc! {"$set": {"z": 1i32}},
+                    false,
+                    true,
+                    &[],
+                    &Document::new(),
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap()
+            };
+            upsert(&s);
+            let all = s.scan_collection("db", &coll).unwrap();
+            assert_eq!(
+                all.len(),
+                1,
+                "{filter:?}: one document after the first upsert"
+            );
+            let stored = decode_doc(&all[0]).unwrap();
+            for (k, v) in want_nested.iter() {
+                assert_eq!(stored.get(k), Some(v), "{filter:?} stored {stored:?}");
+            }
+            assert!(
+                !stored.keys().any(|k| k.contains('.')),
+                "{filter:?} stored a literal dotted key: {stored:?}"
+            );
+
+            // The whole point: the upserted document matches the query that
+            // created it, so running the same upsert again inserts nothing.
+            upsert(&s);
+            let all = s.scan_collection("db", &coll).unwrap();
+            assert_eq!(
+                all.len(),
+                1,
+                "{filter:?}: re-running the same upsert must not insert a second document"
+            );
+        }
+    }
+
+    /// mongod's field order for an upserted document -- see `order_upserted_doc`.
+    /// The Rust upsert path had no ordering at all and emitted seed-then-update
+    /// order, so `{$set: {z: 1, a: 2}}` came out `[_id, .., z, a]`.
+    #[test]
+    fn an_operator_upsert_sorts_the_fields_the_update_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.update_matching(
+            "db",
+            "c",
+            &doc! {"c": 1i32},
+            &doc! {"$set": {"z": 2i32, "a": 3i32}},
+            false,
+            true,
+            &[],
+            &Document::new(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let all = s.scan_collection("db", "c").unwrap();
+        let stored = decode_doc(&all[0]).unwrap();
+        assert_eq!(
+            stored.keys().collect::<Vec<_>>(),
+            vec!["_id", "c", "a", "z"],
+            "got {stored:?}"
+        );
+    }
+
+    /// A REPLACEMENT upsert is not reordered: it inserts the document the client
+    /// sent, in the client's own order with `_id` first.
+    #[test]
+    fn a_replacement_upsert_keeps_the_documents_own_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.update_matching(
+            "db",
+            "c",
+            &doc! {"_id": 9i32},
+            &doc! {"z": 1i32, "a": 2i32},
+            false,
+            true,
+            &[],
+            &Document::new(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let all = s.scan_collection("db", "c").unwrap();
+        let stored = decode_doc(&all[0]).unwrap();
+        assert_eq!(
+            stored.keys().collect::<Vec<_>>(),
+            vec!["_id", "z", "a"],
+            "got {stored:?}"
+        );
+    }
+
+    #[test]
+    fn order_upserted_doc_sorts_each_half_independently() {
+        let new = doc! {"z": 1i32, "m": 2i32, "b": 3i32, "_id": 9i32, "y": 4i32};
+        let seeded = vec!["z".to_string(), "m".to_string()];
+        assert_eq!(
+            super::order_upserted_doc(new, &seeded)
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["_id", "m", "z", "b", "y"]
         );
     }
 
