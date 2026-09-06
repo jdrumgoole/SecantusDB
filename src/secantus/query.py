@@ -499,9 +499,19 @@ def _field_matches(
     collation: Collation | None = None,
     *,
     field: str = "",
+    descend: bool = True,
 ) -> bool:
+    """Match a condition against a field's candidate values.
+
+    ``descend=False`` suppresses the implicit one-level array traversal every
+    operator applies. mongod traverses an array ONCE per path step, and
+    ``$elemMatch`` has already spent that step choosing the element -- so inside
+    it the element is a terminal value. Without this, ``{$elemMatch: {$gt: 1}}``
+    looked *into* an element that was itself an array and matched ``[[5]]``,
+    which mongod does not (probed 8.2.11, 2026-09-06).
+    """
     if isinstance(condition, Regex):
-        return _op_regex(values, condition.pattern, condition.flags)
+        return _op_regex(values, condition.pattern, condition.flags, descend=descend)
     if isinstance(condition, Mapping) and condition and all(k.startswith("$") for k in condition):
         # Sibling-modifier ops: keys that aren't standalone operators but
         # tune another operator in the same condition dict. ``$options``
@@ -522,7 +532,7 @@ def _field_matches(
                 continue
             if op == "$regex":
                 _validate_regex_pattern(arg)
-                if not _op_regex(values, arg, condition.get("$options", "")):
+                if not _op_regex(values, arg, condition.get("$options", ""), descend=descend):
                     return False
             elif op in ("$near", "$nearSphere") and has_near:
                 # Pass the WHOLE condition dict so the parser can read
@@ -534,10 +544,10 @@ def _field_matches(
                     siblings=condition,
                 ):
                     return False
-            elif not _op_matches(values, op, arg, collation, field=field):
+            elif not _op_matches(values, op, arg, collation, field=field, descend=descend):
                 return False
         return True
-    return _eq_with_array(values, condition, collation)
+    return _eq_with_array(values, condition, collation, descend=descend)
 
 
 def _validate_not_arg(arg: Any) -> None:
@@ -578,17 +588,27 @@ def _validate_in_arg(op: str, arg: Any) -> None:
 
 
 def _in_candidate_matches(
-    values: list[Any], candidate: Any, collation: Collation | None = None
+    values: list[Any],
+    candidate: Any,
+    collation: Collation | None = None,
+    *,
+    descend: bool = True,
 ) -> bool:
     """A single `$in` / `$nin` candidate: a regex candidate matches string values
     by pattern (mongod semantics — the old bare-equality path silently matched
     nothing); everything else is array-aware, collation-aware equality."""
     if isinstance(candidate, Regex):
-        return _op_regex(values, candidate.pattern, candidate.flags)
-    return _eq_with_array(values, candidate, collation)
+        return _op_regex(values, candidate.pattern, candidate.flags, descend=descend)
+    return _eq_with_array(values, candidate, collation, descend=descend)
 
 
-def _eq_with_array(values: list[Any], expected: Any, collation: Collation | None = None) -> bool:
+def _eq_with_array(
+    values: list[Any],
+    expected: Any,
+    collation: Collation | None = None,
+    *,
+    descend: bool = True,
+) -> bool:
     for v in values:
         if v is MISSING:
             if expected is None:
@@ -596,7 +616,11 @@ def _eq_with_array(values: list[Any], expected: Any, collation: Collation | None
             continue
         if _eq_numeric_aware(v, expected, collation):
             return True
-        if isinstance(v, list) and any(_eq_numeric_aware(e, expected, collation) for e in v):
+        if (
+            descend
+            and isinstance(v, list)
+            and any(_eq_numeric_aware(e, expected, collation) for e in v)
+        ):
             return True
     return False
 
@@ -716,6 +740,7 @@ def _op_matches(
     collation: Collation | None = None,
     *,
     field: str = "",
+    descend: bool = True,
 ) -> bool:
     # mongod rejects this at parse time rather than matching nothing (probed
     # 8.2.11, 2026-09-01). Answering an empty result set instead hid a
@@ -730,34 +755,40 @@ def _op_matches(
     if isinstance(arg, Regex) and op == "$ne":
         raise QueryError("Can't have regex as arg to $ne.", code=2, code_name="BadValue")
     if op == "$eq":
-        return _eq_with_array(values, arg, collation)
+        return _eq_with_array(values, arg, collation, descend=descend)
     if op == "$ne":
-        return not _eq_with_array(values, arg, collation)
+        return not _eq_with_array(values, arg, collation, descend=descend)
     if op == "$gt":
-        return _cmp(values, arg, lambda a, b: a > b, collation)
+        return _cmp(values, arg, lambda a, b: a > b, collation, descend=descend)
     if op == "$gte":
         # `$gte: null` (like `$lte: null`) matches null and missing — the same
         # set as `$eq: null` — because null only orders equal to null. `$gt`/`$lt`
         # null match nothing (a value is never strictly above/below null).
         if arg is None:
-            return _eq_with_array(values, None, collation)
+            return _eq_with_array(values, None, collation, descend=descend)
         if _is_nan(arg):
-            return _eq_with_array(values, arg, collation)
-        return _cmp(values, arg, lambda a, b: a >= b, collation)
+            return _eq_with_array(values, arg, collation, descend=descend)
+        return _cmp(values, arg, lambda a, b: a >= b, collation, descend=descend)
     if op == "$lt":
-        return _cmp(values, arg, lambda a, b: a < b, collation)
+        return _cmp(values, arg, lambda a, b: a < b, collation, descend=descend)
     if op == "$lte":
         if arg is None:
-            return _eq_with_array(values, None, collation)
+            return _eq_with_array(values, None, collation, descend=descend)
         if _is_nan(arg):
-            return _eq_with_array(values, arg, collation)
-        return _cmp(values, arg, lambda a, b: a <= b, collation)
+            return _eq_with_array(values, arg, collation, descend=descend)
+        return _cmp(values, arg, lambda a, b: a <= b, collation, descend=descend)
     if op == "$in":
         _validate_in_arg("$in", arg)
-        return any(_in_candidate_matches(values, candidate, collation) for candidate in arg)
+        return any(
+            _in_candidate_matches(values, candidate, collation, descend=descend)
+            for candidate in arg
+        )
     if op == "$nin":
         _validate_in_arg("$nin", arg)
-        return not any(_in_candidate_matches(values, candidate, collation) for candidate in arg)
+        return not any(
+            _in_candidate_matches(values, candidate, collation, descend=descend)
+            for candidate in arg
+        )
     if op == "$exists":
         # mongod uses its own truthiness for the argument (only false / 0 / null
         # are falsy — an empty string / array / document is truthy), NOT Python's.
@@ -765,13 +796,13 @@ def _op_matches(
         return present == _truthy(arg)
     if op == "$not":
         _validate_not_arg(arg)
-        return not _field_matches(values, arg, collation)
+        return not _field_matches(values, arg, collation, descend=descend)
     if op == "$type":
-        return _op_type(values, arg, field)
+        return _op_type(values, arg, field, descend=descend)
     if op == "$size":
         return _op_size(values, arg)
     if op == "$all":
-        return _op_all(values, arg)
+        return _op_all(values, arg, descend=descend)
     if op == "$mod":
         return _op_mod(values, arg)
     if op == "$elemMatch":
@@ -779,13 +810,13 @@ def _op_matches(
             raise QueryError("$elemMatch needs an Object")
         return _op_elem_match(values, arg)
     if op == "$bitsAllSet":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) == m, op, field)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) == m, op, field, descend=descend)
     if op == "$bitsAnySet":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) != 0, op, field)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) != 0, op, field, descend=descend)
     if op == "$bitsAllClear":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) == 0, op, field)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) == 0, op, field, descend=descend)
     if op == "$bitsAnyClear":
-        return _op_bitwise(values, arg, lambda v, m: (v & m) != m, op, field)
+        return _op_bitwise(values, arg, lambda v, m: (v & m) != m, op, field, descend=descend)
     if op == "$geoWithin":
         return _op_geo_within(values, arg)
     if op == "$geoIntersects":
@@ -1110,7 +1141,13 @@ def _resolve_bitmask(arg: Any, op: str, field: str = "") -> int:
 
 
 def _op_bitwise(
-    values: list[Any], arg: Any, predicate: Callable[[int, int], bool], op: str, field: str = ""
+    values: list[Any],
+    arg: Any,
+    predicate: Callable[[int, int], bool],
+    op: str,
+    field: str = "",
+    *,
+    descend: bool = True,
 ) -> bool:
     mask = _resolve_bitmask(arg, op, field)
     for v in values:
@@ -1120,7 +1157,7 @@ def _op_bitwise(
         # An ARRAY field is matched element-wise, one level deep -- the same
         # multikey rule the comparison operators follow. Without it a document
         # holding `[1, 4]` was skipped entirely.
-        if isinstance(v, list):
+        if descend and isinstance(v, list):
             for elem in v:
                 source = bit_source(elem)
                 if source is not None and predicate(source, mask):
@@ -1133,13 +1170,15 @@ def _cmp(
     target: Any,
     op: Callable[[Any, Any], bool],
     collation: Collation | None = None,
+    *,
+    descend: bool = True,
 ) -> bool:
     for v in values:
         if v is MISSING:
             continue
         if _try_cmp(v, target, op, collation):
             return True
-        if isinstance(v, list):
+        if descend and isinstance(v, list):
             for elem in v:
                 if _try_cmp(elem, target, op, collation):
                     return True
@@ -1348,7 +1387,7 @@ def _validate_regex_pattern(pattern: Any) -> None:
         raise QueryError("$regex has to be a string")
 
 
-def _op_regex(values: list[Any], pattern: Any, options: Any) -> bool:
+def _op_regex(values: list[Any], pattern: Any, options: Any, *, descend: bool = True) -> bool:
     flags = _re_flags(options)
     if isinstance(pattern, Regex):
         regex_pattern = pattern.pattern
@@ -1387,8 +1426,10 @@ def _op_regex(values: list[Any], pattern: Any, options: Any) -> bool:
             continue
         if _regex_matches_value(v, compiled, query_regex):
             return True
-        if isinstance(v, list) and any(
-            _regex_matches_value(elem, compiled, query_regex) for elem in v
+        if (
+            descend
+            and isinstance(v, list)
+            and any(_regex_matches_value(elem, compiled, query_regex) for elem in v)
         ):
             return True
     return False
@@ -1617,7 +1658,7 @@ def _validate_type_arg(t: Any) -> None:
     )
 
 
-def _op_type(values: list[Any], type_spec: Any, field: str = "") -> bool:
+def _op_type(values: list[Any], type_spec: Any, field: str = "", *, descend: bool = True) -> bool:
     types = type_spec if isinstance(type_spec, list) else [type_spec]
     if isinstance(type_spec, list) and not type_spec:
         # An empty alias list is a parse error, not "matches nothing" -- probed
@@ -1630,7 +1671,7 @@ def _op_type(values: list[Any], type_spec: Any, field: str = "") -> bool:
             continue
         if any(_matches_type(v, t) for t in types):
             return True
-        if isinstance(v, list):
+        if descend and isinstance(v, list):
             for elem in v:
                 if any(_matches_type(elem, t) for t in types):
                     return True
@@ -1660,7 +1701,7 @@ def _op_size(values: list[Any], size: Any) -> bool:
     return any(isinstance(v, list) and len(v) == n for v in values)
 
 
-def _op_all(values: list[Any], required: Any) -> bool:
+def _op_all(values: list[Any], required: Any, *, descend: bool = True) -> bool:
     if not isinstance(required, list):
         raise QueryError("$all needs an array")
 
@@ -1712,7 +1753,7 @@ def _op_all(values: list[Any], required: Any) -> bool:
         # a one-element array for `$all`, verified against mongod 7.0.12).
         if isinstance(r, Mapping) and list(r.keys()) == ["$elemMatch"]:
             return isinstance(v, list) and _op_elem_match([v], r["$elemMatch"])
-        if isinstance(v, list):
+        if descend and isinstance(v, list):
             return any(_elem_matches_required(elem, r) for elem in v)
         return _elem_matches_required(v, r)
 
@@ -1779,6 +1820,25 @@ def _try_mod(v: Any, div: int, remainder: Any) -> bool:
 
 
 def _op_elem_match(values: list[Any], condition: Any) -> bool:
+    """``$elemMatch``: some element of the array satisfies the condition.
+
+    mongod traverses an array ONCE per path step, and ``$elemMatch`` spends that
+    step choosing the element -- so the element is a terminal value and nothing
+    below descends into it again. Both forms got that wrong in opposite
+    directions (probed 8.2.11, 2026-09-06):
+
+    * the OPERATOR form (``{$gt: 1}``) matched through an element that was
+      itself an array, so ``[[5]]`` and ``[1, [2, [3]]]`` matched
+      ``{$elemMatch: {$gt: 1}}`` and mongod matches neither. ``descend=False``
+      is the fix.
+    * the CRITERIA form (``{y: 5}``) considered only ``Mapping`` elements, so
+      ``{$elemMatch: {}}`` -- which imposes no field requirement -- missed every
+      document whose array holds an ARRAY element. mongod returns those.
+
+    An array element under a NON-empty criteria still cannot match: an array has
+    no fields for the criteria to name, and mongod excludes it (``[[{y: 5}]]``
+    does not match ``{$elemMatch: {y: 5}}``).
+    """
     if not isinstance(condition, Mapping):
         return False
     is_scalar_form = bool(condition) and all(k.startswith("$") for k in condition)
@@ -1787,8 +1847,13 @@ def _op_elem_match(values: list[Any], condition: Any) -> bool:
             continue
         for elem in v:
             if is_scalar_form:
-                if _field_matches([elem], condition):
+                if _field_matches([elem], condition, descend=False):
                     return True
-            elif isinstance(elem, Mapping) and matches(elem, condition):
+            elif isinstance(elem, Mapping):
+                if matches(elem, condition):
+                    return True
+            elif isinstance(elem, list) and not condition:
+                # An empty criteria imposes nothing, so an array element
+                # satisfies it as readily as a subdocument does.
                 return True
     return False

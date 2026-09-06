@@ -1936,24 +1936,56 @@ all still open. Probe: `scratchpad/readsweep.py` + `readsweep_lib.py`.
   both, so this is the "missing conflated with null" shape inverted: for these
   bounds a missing field must behave like `null`, and does not.
 
-- [ ] **`$elemMatch` with an operator expression descends into NESTED arrays
-  (2 shapes).** `{x: {$elemMatch: {$gt: 1}}}` over `x: [[5]]` and
-  `x: [1, [2, [3]]]` matches on both servers; mongod matches neither — an
-  element that is itself an array is not descended into. Conversely
-  `{x: {$elemMatch: {}}}` matches `[[5]]` and `[1,[2,[3]]]` on mongod and
-  neither on ours, so the empty-criteria form has the opposite gap.
+- [x] **RESOLVED (2026-09-06): `$elemMatch` traversed an array twice.** Both
+  forms, both servers. mongod traverses ONCE per path step and `$elemMatch`
+  spends that step choosing the element, so the element is terminal: the
+  operator form no longer matches through an element that is itself an array,
+  and the criteria form now reaches array elements when the criteria names no
+  field. One `descend` flag threaded through the operator dispatch covers every
+  operator `$elemMatch` can carry, rather than each growing a special case.
 
-- [ ] **A dotted POSITIONAL path descends one array level too far (2 shapes).**
-  `{"x.0": 5}` matches `x: [[5]]` on both servers; mongod matches only
-  `x: [5]`. `{"x.1": 2}` matches `x: [1, [2, [3]]]` here and not there. The
-  index is being applied after an implicit array descent rather than to the
-  array itself.
+  **THREE operators had to be reached individually, and each was a separate miss
+  in the first version of the fix** — they recurse or iterate the array
+  themselves rather than going through the gated helpers: `$in` has its own
+  candidate path, `$not` re-enters the field matcher (so a descended match got
+  INVERTED, excluding documents mongod returns), and `$all` walks the array.
+  `$in` was caught by writing the test; `$not` and `$all` by probing the operator
+  list before believing the fix was done, rather than assuming the flag had
+  reached everything. `$size` and a nested `$elemMatch` were already correct. Two expectations in that test were also *derived* rather than measured
+  and one of them was wrong (`{$elemMatch: {$lt: 3}}`); both were replaced with
+  mongod's answers. Pinned by `tests/test_elemmatch_array_descent.py` (19 tests)
+  and two `secantus-core` unit tests, including the ordinary one-level descent
+  OUTSIDE `$elemMatch` so the flag cannot over-reach.
+
+  The rule this established, worth reusing for the two entries below: **implicit
+  array traversal happens once per path step**, and whatever consumes the step
+  (an `$elemMatch`, a positional index) leaves a terminal value behind.
+
+- [ ] **A dotted POSITIONAL path descends one array level too far (3 shapes).**
+  `{"x.0": 5}` matches `x: [[5]]` and `x: [[5, 6]]` on both servers; mongod
+  matches only `x: [5]`, `x: [5, 6]` and `x: {"0": 5}` (the literal key).
+  `{"x.1": 2}` matches `x: [1, [2, [3]]]` here and not there, and
+  `{"x.0": {y: 5}}` matches `x: [[{y: 5}]]` here and not there.
+
+  **Same rule as the resolved `$elemMatch` entry above**: a positional index
+  CONSUMES the path step's array traversal, so the value it selects is terminal
+  and equality must not descend into it again. The fix therefore looks like the
+  `$elemMatch` one — the resolver has to tell the matcher that the step was
+  spent — but it lives in path resolution (`paths.get_path_values`), which the
+  INDEX layer also uses, so it needs its own pass and its own check that an
+  index still cannot change the answer. Corpus and measured expectations:
+  `scratchpad/arraylib.py` + `probe_array.py`.
 
 - [ ] **Sorting by a dotted path does not descend into arrays (2 shapes).**
   For `sort: {"x.y": 1}` mongod ranks `x: [{y: 1}]` and `x: [{y: 5}, {y: 6}]`
   among the documents that HAVE an `x.y` (by 1 and by 5, its minimum); both
   servers rank them with the documents that have none. Wrong order is wrong
   results once `limit` is involved.
+
+  The same one-step rule bounds it: mongod descends ONE array level for the
+  sort key too, so `x: [[{y: 5}]]` has NO `x.y` and sorts with the missing
+  group — which is where both servers already put it, for the wrong reason.
+  Measured against 8.2.11 (2026-09-06); corpus as above.
 
 - [ ] **`sort: {"x.0": 1}` ranks an array element against documents wrongly
   (1 shape).** mongod puts `x: [[5]]` (whose `x.0` is the ARRAY `[5]`) after
