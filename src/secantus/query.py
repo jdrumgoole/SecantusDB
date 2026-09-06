@@ -1175,7 +1175,19 @@ def _cmp(
 ) -> bool:
     for v in values:
         if v is MISSING:
-            continue
+            # An absent field compares as NULL, which is what mongod's query
+            # language treats it as. It used to be skipped outright, so
+            # `{x: {$gt: MinKey()}}` and `{x: {$lt: MaxKey()}}` -- the two
+            # bounds that DO compare against every type -- left out every
+            # document with no `x` at all, where mongod returns them (probed
+            # 8.2.11, 2026-09-06; four shapes, both servers).
+            #
+            # Safe for the ordinary bounds because `_same_type_bracket` already
+            # excludes null from them: `{x: {$gt: 3}}` compares null against a
+            # number, the brackets differ, and the document is dropped exactly
+            # as before. Only a MinKey / MaxKey bound escapes the bracketing,
+            # and those are precisely the two that should see it.
+            v = None
         if _try_cmp(v, target, op, collation):
             return True
         if descend and isinstance(v, list):
