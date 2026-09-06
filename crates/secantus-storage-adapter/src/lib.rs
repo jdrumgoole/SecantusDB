@@ -834,6 +834,7 @@ fn map_err(e: WtError) -> StorageError {
         WtError::DuplicateId => StorageError::WriteError {
             code: 11000,
             errmsg: "E11000 duplicate key error".to_string(),
+            exec: false,
         },
         // A lost WT_ROLLBACK race → mongod's WriteConflict (112). Routed
         // command-level by the write handlers so the txn envelope labels it.
@@ -846,6 +847,7 @@ fn map_err(e: WtError) -> StorageError {
             code: 313,
             errmsg: "Transaction is too large and will not fit in the storage engine cache"
                 .to_string(),
+            exec: false,
         },
         // An over-limit document → mongod's BSONObjectTooLarge (10334).
         WtError::DocumentTooLarge(size) => StorageError::WriteError {
@@ -853,51 +855,66 @@ fn map_err(e: WtError) -> StorageError {
             errmsg: format!(
                 "object to insert too large. size in bytes: {size}, max size: 16777216"
             ),
+            exec: false,
         },
         // Post-apply validator failure → mongod's DocumentValidationFailure (121).
         WtError::DocumentValidationFailure => StorageError::WriteError {
             code: 121,
             errmsg: "Document failed validation".to_string(),
+            exec: false,
         },
         // An update that would change `_id` → mongod's ImmutableField (66).
         WtError::ImmutableField => StorageError::WriteError {
             code: 66,
             errmsg: "Performing an update on the path '_id' would modify the immutable field '_id'"
                 .to_string(),
+            exec: true,
         },
         // Bad hint / unsupported query construct → BadValue (2), the same code
         // the Python server surfaces for these at the command layer.
-        WtError::BadHint(m) => StorageError::WriteError { code: 2, errmsg: m },
+        WtError::BadHint(m) => StorageError::WriteError {
+            code: 2,
+            errmsg: m,
+            exec: false,
+        },
         // A named refusal (non-numeric $inc/$mul) → mongod's TypeMismatch (14),
         // not the generic BadValue the plain defer would produce.
         WtError::UpdateTypeMismatch(m) => StorageError::WriteError {
             code: 14,
             errmsg: m,
+            exec: true,
         },
         // Overlapping operator paths → mongod's ConflictingUpdateOperators (40).
         WtError::UpdatePathConflict(m) => StorageError::WriteError {
             code: 40,
             errmsg: m,
+            exec: false,
         },
         // Creating a field under a non-document → mongod's PathNotViable (28).
         WtError::UpdatePathNotViable(m) => StorageError::WriteError {
             code: 28,
             errmsg: m,
+            exec: true,
         },
         WtError::QueryUnsupported => StorageError::WriteError {
             code: 2,
             errmsg: "query uses a construct the Rust server does not support".to_string(),
+            exec: false,
         },
         // The engine named mongod's error; pass it through rather than
         // reporting an unsupported construct.
-        WtError::QueryError { code, errmsg } => StorageError::WriteError { code, errmsg },
+        WtError::QueryError { code, errmsg, exec } => {
+            StorageError::WriteError { code, errmsg, exec }
+        }
         WtError::UnsupportedId => StorageError::WriteError {
             code: 2,
             errmsg: "_id is of a type the Rust server does not support".to_string(),
+            exec: false,
         },
         WtError::UnsupportedValue => StorageError::WriteError {
             code: 2,
             errmsg: "an indexed value is of a type the Rust server does not support".to_string(),
+            exec: false,
         },
         // Index-create / change-stream faults don't arise on the CRUD path, but
         // map them to a command-level internal error if they ever surface here.
@@ -907,14 +924,17 @@ fn map_err(e: WtError) -> StorageError {
         WtError::IndexOptionsConflict(m) => StorageError::WriteError {
             code: 85,
             errmsg: m,
+            exec: false,
         },
         WtError::IndexKeySpecsConflict(m) => StorageError::WriteError {
             code: 86,
             errmsg: m,
+            exec: false,
         },
         WtError::CreateIndexUnsupported(m) => StorageError::WriteError {
             code: 67,
             errmsg: m,
+            exec: false,
         },
         // Change-stream faults don't arise on the CRUD path; map to internal.
         WtError::ChangeStreamFatal(m) | WtError::Internal(m) => StorageError::Internal(m),

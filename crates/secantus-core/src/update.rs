@@ -657,7 +657,8 @@ fn apply_op(
                                     crate::query::bson_type_name(&other),
                                     render_doc_id(result)
                                 ),
-                            ));
+                            )
+                            .exec());
                         }
                     };
                     push_apply(&mut a, value)?;
@@ -709,7 +710,8 @@ fn apply_op(
                                     "Path '{cpath}' contains an element of non-array type '{}'",
                                     crate::query::bson_type_name(v)
                                 ),
-                            ));
+                            )
+                            .exec());
                         }
                     }
                     if let Some(Bson::Array(a)) = get_path(result, &cpath) {
@@ -849,7 +851,8 @@ fn apply_op(
                                     ),
                                     crate::query::bson_type_name(other)
                                 ),
-                            ));
+                            )
+                            .exec());
                         }
                     };
                     for (bit_op, mask) in &parsed {
@@ -948,7 +951,8 @@ fn apply_op(
                                      '{cpath}' has non-array type {}",
                                     crate::query::bson_type_name(&other)
                                 ),
-                            ));
+                            )
+                            .exec());
                         }
                     };
                     for item in &items {
@@ -989,7 +993,8 @@ fn apply_op(
                             return Err(Fallback::mongo(
                                 2,
                                 "Cannot apply $pull to a non-array value",
-                            ));
+                            )
+                            .exec());
                         }
                         None => {}
                     }
@@ -1027,7 +1032,8 @@ fn apply_op(
                             return Err(Fallback::mongo(
                                 2,
                                 "Cannot apply $pull to a non-array value",
-                            ));
+                            )
+                            .exec());
                         }
                         None => {}
                     }
@@ -1239,6 +1245,82 @@ pub fn arith_type_error(doc: &Document, update: &Document) -> Option<String> {
     None
 }
 
+/// The exact mongod error for an `$inc` / `$mul` that overflows int64, or
+/// `None` if this update fails for some other reason.
+///
+/// Same "re-run a narrower check" shape as [`arith_type_error`], and for the
+/// same reason: the overflow is discovered deep inside `arith`, which knows
+/// neither the operator name nor the document's `_id`, and mongod's message
+/// names both. Without this the site could only `Fallback::Defer`, and a defer
+/// on the standalone Rust server has no Python behind it -- so five real
+/// overflow shapes told the client
+/// `query uses a construct the Rust server does not support`, i.e. that the
+/// server cannot do `$inc`, when it can and it was the RESULT that did not fit.
+///
+/// mongod fails the write here rather than widening to a double the way the
+/// *aggregation* operators do. Message verbatim from a mongod 8.2.11 probe
+/// (2026-09-06) -- `Failed to apply $inc operations to current value
+/// ((NumberLong)9223372036854775807) for document {_id: 1}` -- and identical to
+/// `secantus.update._arith_or_overflow`'s.
+pub fn arith_overflow_error(doc: &Document, update: &Document) -> Option<String> {
+    for (op, payload) in update.iter() {
+        let mul = match op.as_str() {
+            "$inc" => false,
+            "$mul" => true,
+            _ => continue,
+        };
+        let Bson::Document(fields) = payload else {
+            continue;
+        };
+        for (path, operand) in fields.iter() {
+            // Positional / arrayFilter paths expand per document; leave those to
+            // the normal defer rather than guess at the concrete path.
+            if path.contains("$[") || path.contains(".$") {
+                continue;
+            }
+            // A missing field is an implicit int 0, which cannot overflow.
+            let Some(current) = get_path(doc, path) else {
+                continue;
+            };
+            // Decimal128 has its own (much wider) domain and its own path in
+            // `arith`; only the integral one can overflow into this message.
+            if matches!(current, Bson::Decimal128(_)) || matches!(operand, Bson::Decimal128(_)) {
+                continue;
+            }
+            let (Some(a), Some(b)) = (as_int_like(current), as_int_like(operand)) else {
+                continue;
+            };
+            let r = if mul {
+                a.checked_mul(b)
+            } else {
+                a.checked_add(b)
+            };
+            let wide = is_int64(current) || is_int64(operand);
+            // `None` from either step is the overflow: past i128 (unreachable
+            // from two BSON integers, but cheap to be exact about) or past the
+            // int64 the result must be encoded into.
+            if r.is_none() || int_promoted_to_bson(r.unwrap(), wide).is_none() {
+                return Some(format!(
+                    "Failed to apply {op} operations to current value ({}) for document {}",
+                    render_arith_operand(current),
+                    render_doc_id(doc)
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The type-tagged rendering mongod puts in an overflow message:
+/// `(NumberLong)9223372036854775807`. Only a long can reach it -- an int32 that
+/// outgrows its width widens to long rather than overflowing.
+fn render_arith_operand(v: &Bson) -> String {
+    match v {
+        Bson::Int64(n) => format!("(NumberLong){n}"),
+        _ => render_scalar(v),
+    }
+}
+
 /// The exact mongod error for an update that would create a field under a
 /// non-document, or `None` if this update fails for some other reason.
 ///
@@ -1381,6 +1463,108 @@ fn addtoset_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
 
 #[cfg(test)]
 mod tests {
+    // --- arith_overflow_error: messages verbatim from a mongod 8.2.11 probe
+    // (2026-09-06). Before this the overflow could only defer, and the client
+    // was told the server could not do `$inc`. ---
+
+    #[test]
+    fn arith_overflow_error_names_the_operator_value_and_document() {
+        use bson::Bson;
+        let max = doc! {"_id": 1, "n": Bson::Int64(i64::MAX)};
+        assert_eq!(
+            super::arith_overflow_error(&max, &doc! {"$inc": {"n": 1}}).unwrap(),
+            "Failed to apply $inc operations to current value \
+             ((NumberLong)9223372036854775807) for document {_id: 1}"
+        );
+        let min = doc! {"_id": 1, "n": Bson::Int64(i64::MIN)};
+        assert_eq!(
+            super::arith_overflow_error(&min, &doc! {"$inc": {"n": -1}}).unwrap(),
+            "Failed to apply $inc operations to current value \
+             ((NumberLong)-9223372036854775808) for document {_id: 1}"
+        );
+        let big = doc! {"_id": 1, "n": Bson::Int64(1i64 << 62)};
+        assert_eq!(
+            super::arith_overflow_error(&big, &doc! {"$mul": {"n": 4}}).unwrap(),
+            "Failed to apply $mul operations to current value \
+             ((NumberLong)4611686018427387904) for document {_id: 1}"
+        );
+        // Two int64 operands that each fit but whose sum does not.
+        assert_eq!(
+            super::arith_overflow_error(&big, &doc! {"$inc": {"n": Bson::Int64(1i64 << 62)}})
+                .unwrap(),
+            "Failed to apply $inc operations to current value \
+             ((NumberLong)4611686018427387904) for document {_id: 1}"
+        );
+        // The document's `_id`, not the field, and rendered in mongod's form.
+        let sid = doc! {"_id": "abc", "n": Bson::Int64(i64::MAX)};
+        assert_eq!(
+            super::arith_overflow_error(&sid, &doc! {"$inc": {"n": 1}}).unwrap(),
+            "Failed to apply $inc operations to current value \
+             ((NumberLong)9223372036854775807) for document {_id: \"abc\"}"
+        );
+    }
+
+    #[test]
+    fn arith_overflow_error_is_none_when_nothing_overflows() {
+        use bson::Bson;
+        let doc = doc! {"_id": 1, "n": Bson::Int64(1), "s": "x"};
+        // Fits.
+        assert!(super::arith_overflow_error(&doc, &doc! {"$inc": {"n": 1}}).is_none());
+        // A missing field is an implicit 0 and cannot overflow.
+        assert!(super::arith_overflow_error(&doc, &doc! {"$inc": {"absent": 1}}).is_none());
+        // A non-numeric field is `arith_type_error`'s business, not this one.
+        assert!(super::arith_overflow_error(&doc, &doc! {"$inc": {"s": 1}}).is_none());
+        // Not an arithmetic operator at all.
+        assert!(super::arith_overflow_error(&doc, &doc! {"$set": {"n": 1}}).is_none());
+        // A double saturates to infinity rather than failing the write.
+        let d = doc! {"_id": 1, "n": f64::MAX};
+        assert!(super::arith_overflow_error(&d, &doc! {"$mul": {"n": 2.0}}).is_none());
+    }
+
+    // --- the parse-vs-execution classification mongod wraps on. Every verdict
+    // below was measured against mongod 8.2.11 (2026-09-06): the wrapped ones
+    // come back under `Plan executor error during update :: caused by ::` and
+    // the bare ones do not. ---
+
+    #[test]
+    fn execution_time_update_errors_are_marked_exec() {
+        for (doc, update) in [
+            (doc! {"_id": 1, "a": 1}, doc! {"$push": {"a": 2}}),
+            (doc! {"_id": 1, "a": 1}, doc! {"$pull": {"a": 2}}),
+            (doc! {"_id": 1, "a": 1}, doc! {"$pullAll": {"a": [2]}}),
+            (doc! {"_id": 1, "a": 1}, doc! {"$addToSet": {"a": 2}}),
+            (doc! {"_id": 1, "a": 1}, doc! {"$pop": {"a": 1}}),
+            (doc! {"_id": 1, "a": "s"}, doc! {"$bit": {"a": {"and": 1}}}),
+        ] {
+            let err = super::apply_update(&doc, &update, false)
+                .expect_err("these all fail against the stored document");
+            assert!(
+                err.is_exec(),
+                "{update:?} over {doc:?} must be marked execution-time, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_time_update_errors_are_not_marked_exec() {
+        for (doc, update) in [
+            (doc! {"_id": 1, "a": 1}, doc! {"$pop": {"a": 5}}),
+            (doc! {"_id": 1, "a": 1}, doc! {"$rename": {"a": "a"}}),
+            (doc! {"_id": 1, "a": 1}, doc! {"$bit": {"a": 5}}),
+            (
+                doc! {"_id": 1, "a": [1]},
+                doc! {"$addToSet": {"a": {"$each": 5}}},
+            ),
+        ] {
+            let err = super::apply_update(&doc, &update, false)
+                .expect_err("these all fail on the update spec");
+            assert!(
+                !err.is_exec(),
+                "{update:?} over {doc:?} must stay bare, got {err:?}"
+            );
+        }
+    }
+
     // --- arith_type_error: messages verbatim from a mongod 6.0.16 probe ---
 
     #[test]

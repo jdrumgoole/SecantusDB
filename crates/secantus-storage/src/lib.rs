@@ -1453,6 +1453,11 @@ pub enum StorageError {
     QueryError {
         code: i32,
         errmsg: String,
+        /// Whether this is an EXECUTION-time update error, which mongod wraps in
+        /// `Plan executor error during <command> :: caused by ::`. See
+        /// `secantus_core::fallback::Fallback::Mongo::exec`; the adapter carries
+        /// it to the command layer, which knows the command name to interpolate.
+        exec: bool,
     },
     /// A multi-document transaction's buffered write volume exceeded the
     /// cache-derived dirty budget (see `Storage::txn_dirty_limit`). Raised
@@ -1491,6 +1496,7 @@ pub(crate) fn query_fault(fault: secantus_core::fallback::Fallback) -> StorageEr
         Some((code, errmsg)) => StorageError::QueryError {
             code,
             errmsg: errmsg.to_string(),
+            exec: fault.is_exec(),
         },
         None => StorageError::QueryUnsupported,
     }
@@ -1749,6 +1755,7 @@ fn resolve_current_date(update: &Document) -> Result<Document> {
                     return Err(StorageError::QueryError {
                         code: 2,
                         errmsg: format!("Unrecognized $currentDate option: {bad}"),
+                        exec: false,
                     });
                 }
                 match o.get_str("$type") {
@@ -1760,6 +1767,7 @@ fn resolve_current_date(update: &Document) -> Result<Document> {
                             errmsg: "The '$type' string field is required to be 'date' or \
                                      'timestamp': {$currentDate: {field : {$type: 'date'}}}"
                                 .to_string(),
+                            exec: false,
                         });
                     }
                 }
@@ -1772,6 +1780,7 @@ fn resolve_current_date(update: &Document) -> Result<Document> {
                          ('true') or a $type expression ({{$type: 'timestamp/date'}}).",
                         secantus_core::query::bson_type_name(other)
                     ),
+                    exec: false,
                 });
             }
         };
@@ -10173,6 +10182,7 @@ impl Storage {
                             return StorageError::QueryError {
                                 code,
                                 errmsg: errmsg.to_string(),
+                                exec: fault.is_exec(),
                             };
                         }
                         // The three below are recovered by RE-RUNNING a
@@ -10186,8 +10196,19 @@ impl Storage {
                             // Creating through a non-document -> mongod's code 28.
                             return StorageError::UpdatePathNotViable(m);
                         }
-                        match secantus_core::update::arith_type_error(doc, update) {
-                            Some(m) => StorageError::UpdateTypeMismatch(m),
+                        if let Some(m) = secantus_core::update::arith_type_error(doc, update) {
+                            // A non-numeric field / operand -> mongod's code 14.
+                            return StorageError::UpdateTypeMismatch(m);
+                        }
+                        match secantus_core::update::arith_overflow_error(doc, update) {
+                            // An $inc / $mul past int64 -> mongod's code 2. Not a
+                            // "construct we don't support": the server does $inc,
+                            // it was the RESULT that did not fit.
+                            Some(m) => StorageError::QueryError {
+                                code: 2,
+                                errmsg: m,
+                                exec: true,
+                            },
                             None => StorageError::QueryUnsupported,
                         }
                     })
@@ -10506,7 +10527,10 @@ impl Storage {
             let doc = decode_doc(&blob)?;
             matched += 1;
             let new = transform(&doc, false)?;
-            if new == doc {
+            // `doc_changed`, not `new == doc`: `Bson::Double`'s `f64 ==` calls
+            // `-0.0` equal to `0.0`, so a bare compare skipped the write and
+            // silently kept the OLD zero. See `secantus_core::diff::doc_changed`.
+            if !secantus_core::diff::doc_changed(&new, &doc) {
                 continue;
             }
             if let Some(v) = validator {
@@ -10646,7 +10670,8 @@ impl Storage {
                         // it) skips the full-document clone.
                         post_image = Some(new.clone());
                     }
-                    if new != doc {
+                    // `doc_changed`, not `new != doc` -- see the sibling site above.
+                    if secantus_core::diff::doc_changed(&new, &doc) {
                         // Collection validator on the post-apply doc (mongod rejects an
                         // update that would leave a document failing validation). A
                         // validator the query engine can't evaluate is treated as
@@ -13114,6 +13139,117 @@ mod tests {
             decode_doc(assigned).unwrap().get_object_id("_id").is_ok(),
             "missing _id must be assigned an ObjectId"
         );
+    }
+
+    /// A `$set` whose only difference is the SIGN OF A ZERO must be stored.
+    ///
+    /// This was silent data loss: the write guard compared `new != doc`, and
+    /// `Bson::Double`'s `f64 ==` calls `0.0` equal to `-0.0`, so the write was
+    /// skipped, `nModified` was 0, no oplog entry was emitted, and a read-back
+    /// returned the OLD zero. The value the caller asked to store was never
+    /// stored. mongod stores it and reports `nModified: 1` (probed 8.2.11,
+    /// 2026-09-06); the Python server was fixed in #1317 and this crate kept
+    /// the bare guard, which nothing covered -- the parity suites pin the pure
+    /// engines, not storage.
+    #[test]
+    fn signed_zero_update_is_stored_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+
+        // `(seed, update, expected stored value)` -- every one of these is a
+        // change mongod stores and counts.
+        let cases: Vec<(Document, Document, Bson)> = vec![
+            (
+                doc! {"_id": 1i32, "a": 0.0},
+                doc! {"$set": {"a": -0.0}},
+                Bson::Double(-0.0),
+            ),
+            (
+                doc! {"_id": 2i32, "a": -0.0},
+                doc! {"$set": {"a": 0.0}},
+                Bson::Double(0.0),
+            ),
+            (
+                doc! {"_id": 3i32, "a": {"b": 0.0}},
+                doc! {"$set": {"a.b": -0.0}},
+                Bson::Document(doc! {"b": -0.0}),
+            ),
+            (
+                doc! {"_id": 4i32, "a": [0.0]},
+                doc! {"$set": {"a.0": -0.0}},
+                Bson::Array(vec![Bson::Double(-0.0)]),
+            ),
+        ];
+
+        for (seed, update, expected) in cases {
+            let id = seed.get("_id").unwrap().clone();
+            s.insert("db", "c", vec![bson::to_vec(&seed).unwrap()], true)
+                .unwrap();
+            let out = s
+                .update_matching(
+                    "db",
+                    "c",
+                    &doc! {"_id": id.clone()},
+                    &update,
+                    false,
+                    false,
+                    &[],
+                    &Document::new(),
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(
+                out.modified, 1,
+                "{update:?} over {seed:?} must report one modified"
+            );
+            let stored = decode_doc(&s.find_by_id("db", "c", &id).unwrap().unwrap()).unwrap();
+            let got = stored.get("a").unwrap();
+            // Compare the ENCODED bytes: `assert_eq!` on `Bson::Double` would
+            // pass on the very value confusion this test exists to catch.
+            assert_eq!(
+                bson::to_vec(&doc! {"v": got}).unwrap(),
+                bson::to_vec(&doc! {"v": &expected}).unwrap(),
+                "{update:?} over {seed:?} stored {got:?}, want {expected:?}"
+            );
+        }
+    }
+
+    /// The other half: a genuinely-unchanged document must still be skipped, or
+    /// every no-op update would write and report `nModified: 1`.
+    #[test]
+    fn identical_update_still_reports_nothing_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.insert(
+            "db",
+            "c",
+            vec![bson::to_vec(&doc! {"_id": 1i32, "a": 0.0}).unwrap()],
+            true,
+        )
+        .unwrap();
+        let out = s
+            .update_matching(
+                "db",
+                "c",
+                &doc! {"_id": 1i32},
+                &doc! {"$set": {"a": 0.0}},
+                false,
+                false,
+                &[],
+                &Document::new(),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(out.matched, 1);
+        assert_eq!(out.modified, 0, "a no-op update must not count as modified");
     }
 
     /// An index must never change which documents a query returns. Each case

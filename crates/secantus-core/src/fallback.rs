@@ -42,6 +42,15 @@ pub enum Fallback {
         code: i32,
         message: String,
         folded: Option<bool>,
+        /// Whether this is an EXECUTION-time update error -- one discoverable
+        /// only while applying the update to a particular stored document, as
+        /// opposed to a parse error readable from the update spec alone.
+        /// mongod wraps exactly these in
+        /// `Plan executor error during <command> :: caused by ::` and leaves
+        /// parse errors bare (probed 8.2.11, 2026-09-06, for both `update` and
+        /// `findAndModify`); the command layer reads this to decide. Mirrors
+        /// `secantus.update.UpdateError.exec_error`.
+        exec: bool,
     },
 }
 
@@ -53,7 +62,22 @@ impl Fallback {
             code,
             message: message.into(),
             folded: None,
+            exec: false,
         }
+    }
+
+    /// Mark this as an execution-time update error, so the command layer adds
+    /// mongod's `Plan executor error during <command> :: caused by ::` wrapper.
+    pub fn exec(mut self) -> Self {
+        if let Fallback::Mongo { exec, .. } = &mut self {
+            *exec = true;
+        }
+        self
+    }
+
+    /// Whether this error belongs under mongod's update-executor wrapper.
+    pub fn is_exec(&self) -> bool {
+        matches!(self, Fallback::Mongo { exec: true, .. })
     }
 
     /// Stamp which pipeline wrapper this error belongs under.
