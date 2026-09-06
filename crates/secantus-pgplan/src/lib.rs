@@ -257,6 +257,11 @@ pub struct Select {
     /// on them unchanged, which is why this is a SOURCE on the existing
     /// statement rather than a statement of its own.
     pub series: Option<Series>,
+    /// A top-level two-table JOIN standing in for a table, as in
+    /// `SELECT ... FROM pg_type t JOIN pg_range r ON ...` -- the plain-select
+    /// form of the source `Aggregate` also carries. `RangeInfo.fetch` sends
+    /// exactly this. Columns then reference the join's OUTPUT names.
+    pub join: Option<Box<JoinSelect>>,
     /// Output columns in order, as (output name, stored field).
     pub columns: Vec<(String, String)>,
     /// A computed expression per output column, parallel to `columns`. `None`
@@ -1078,6 +1083,7 @@ fn plan_series_select(
     Ok(Statement::Select(Select {
         table: String::new(),
         series: Some(series),
+        join: None,
         columns,
         casts: Vec::new(),
         filter: Document::new(),
@@ -1142,6 +1148,12 @@ fn plan_select(
     // A set-returning function stands in for the table.
     if let Some(series) = series_from_clause(&s.from_clause[0], params)? {
         return plan_series_select(s, series, params);
+    }
+    // A top-level JOIN stands in for the table -- `FROM a JOIN b ON ...` in a
+    // plain (non-aggregate) select, which is `RangeInfo.fetch`'s shape.
+    if matches!(s.from_clause[0].node.as_ref(), Some(N::JoinExpr(_))) {
+        let join = plan_join_select(s, lookup, params)?;
+        return plan_join_plain_select(s, join, lookup, params);
     }
     let table = match s.from_clause[0].node.as_ref() {
         Some(N::RangeVar(r)) => r.relname.clone(),
@@ -1330,6 +1342,7 @@ fn plan_select(
 
     Ok(Statement::Select(Select {
         series: None,
+        join: None,
         table,
         columns,
         casts,
@@ -1449,6 +1462,53 @@ fn plan_aggregate(
     let def = lookup(&table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
 
     finish_aggregate(s, table, None, def, params)
+}
+
+/// A plain (non-aggregate) SELECT whose source is a top-level JOIN. The join
+/// already carries the projected columns, the WHERE and the ORDER BY (the
+/// executor's `join_docs` sorts by it), so this just wraps them in a `Select`
+/// that projects the join's OUTPUT names in order.
+fn plan_join_plain_select(
+    s: &pg_query::protobuf::SelectStmt,
+    join: JoinSelect,
+    _lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Statement> {
+    let columns: Vec<(String, String)> = join
+        .columns
+        .iter()
+        .map(|(out, _, _)| (out.clone(), out.clone()))
+        .collect();
+    let casts = vec![None; columns.len()];
+    let limit = match s.limit_count.as_ref() {
+        None => None,
+        Some(n) => match const_value(n, params)? {
+            Bson::Int32(v) => Some(i64::from(v)),
+            Bson::Int64(v) => Some(v),
+            Bson::Null => None,
+            _ => return Err(Error::Unsupported("this LIMIT".into())),
+        },
+    };
+    let offset = match s.limit_offset.as_ref() {
+        None => 0,
+        Some(n) => match const_value(n, params)? {
+            Bson::Int32(v) => i64::from(v),
+            Bson::Int64(v) => v,
+            Bson::Null => 0,
+            _ => return Err(Error::Unsupported("this OFFSET".into())),
+        },
+    };
+    Ok(Statement::Select(Select {
+        table: String::new(),
+        series: None,
+        join: Some(Box::new(join)),
+        columns,
+        casts,
+        filter: Document::new(),
+        order: Vec::new(),
+        limit,
+        offset,
+    }))
 }
 
 /// Plan the inner select of a joined subquery: two tables, one ON equality,
@@ -2241,6 +2301,7 @@ fn plan_select_srf(
     Ok(Some(Statement::Select(Select {
         table: String::new(),
         series: Some(series),
+        join: None,
         columns: vec![(column.clone(), column)],
         casts: Vec::new(),
         filter: Document::new(),

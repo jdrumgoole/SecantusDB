@@ -2624,3 +2624,55 @@ def test_an_enum_created_by_one_server_is_the_other_servers_too(home: Path) -> N
         cur.execute("select typname, oid from pg_type where oid >= 65000 order by oid")
         rows = cur.fetchall()
         assert rows == [("rustmood", rust_oid), ("pymood", rust_oid + 1)]
+
+
+def test_range_info_fetch(home: Path) -> None:
+    """psycopg's RangeInfo.fetch — pg_range joined to pg_type in a PLAIN select.
+
+    Unlike EnumInfo's aggregate-over-subquery, this is a top-level JOIN with no
+    grouping, so it exercises the join source on `Select` rather than
+    `Aggregate`. `pg_range` pairs each builtin range with its element oid, from
+    the same catalog the range casts read.
+    """
+    from psycopg.types.range import RangeInfo
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("select rngtypid, rngsubtype from pg_range order by rngtypid")
+        assert cur.fetchall() == [
+            (3904, 23),
+            (3906, 1700),
+            (3908, 1114),
+            (3910, 1184),
+            (3912, 1082),
+            (3926, 20),
+        ]
+        for name, oid, sub in [
+            ("int4range", 3904, 23),
+            ("numrange", 3906, 1700),
+            ("tstzrange", 3910, 1184),
+            ("daterange", 3912, 1082),
+        ]:
+            info = RangeInfo.fetch(conn, name)
+            assert (info.name, info.oid, info.subtype_oid) == (name, oid, sub), name
+
+
+def test_a_plain_select_over_a_join(home: Path) -> None:
+    """A top-level two-table JOIN outside any aggregate.
+
+    The join source lives on `Select` as well as `Aggregate`; this is the
+    non-grouped path RangeInfo.fetch takes.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "select t.typname, r.rngsubtype from pg_type t "
+            "join pg_range r on r.rngtypid = t.oid order by r.rngsubtype limit 2"
+        )
+        assert cur.fetchall() == [("int8range", 20), ("int4range", 23)]
+        # A LEFT JOIN miss over the same tables yields the NULL side.
+        cur.execute(
+            "select t.typname, r.rngsubtype from pg_type t "
+            "left join pg_range r on r.rngtypid = t.oid where t.oid = 25"
+        )
+        assert cur.fetchall() == [("text", None)]

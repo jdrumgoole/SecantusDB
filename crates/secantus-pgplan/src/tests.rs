@@ -137,7 +137,12 @@ fn select_renames_through_an_alias() {
 #[test]
 fn unsupported_and_undefined_carry_postgres_sqlstates() {
     let cases: Vec<(&str, &str)> = vec![
-        ("SELECT * FROM t JOIN u ON t.id = u.id", "0A000"),
+        // A JOIN is planned now (enum/range info work); a missing side is
+        // the same 42P01 PostgreSQL gives, not the old blanket 0A000.
+        ("SELECT a FROM t JOIN u ON t.id = u.id", "42P01"),
+        // A JOIN shape the planner does not reduce to two-table/one-ON is
+        // still refused rather than half-run.
+        ("SELECT a FROM t JOIN u ON t.id > u.id", "42P01"),
         ("SELECT * FROM t WHERE n LIKE 'x'", "0A000"),
         ("SELECT nope FROM t", "42703"),
         ("SELECT * FROM t WHERE nope = 1", "42703"),

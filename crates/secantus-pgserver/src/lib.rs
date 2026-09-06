@@ -555,6 +555,13 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("typdelim", "text", false),
                 ],
             )),
+            "pg_range" => Some(TableDef::new(
+                "pg_range",
+                vec![
+                    secantus_pgcatalog::Column::new("rngtypid", "oid", false),
+                    secantus_pgcatalog::Column::new("rngsubtype", "oid", false),
+                ],
+            )),
             "pg_enum" => Some(TableDef::new(
                 "pg_enum",
                 vec![
@@ -606,6 +613,42 @@ impl PgHandler {
                         Bson::Int64(oid + Self::USER_TYPE_ARRAY_OID_OFFSET),
                     );
                     d.insert(def.field_of("typdelim").expect("column"), ",");
+                    rows.push(d);
+                }
+                rows
+            }
+            // One row per builtin range type: (range oid, element oid). The
+            // element name comes from `range_element`, so this and the range
+            // casts cannot disagree about what a range is OVER.
+            "pg_range" => {
+                let ranges = [
+                    "int4range",
+                    "int8range",
+                    "numrange",
+                    "daterange",
+                    "tsrange",
+                    "tstzrange",
+                ];
+                let mut rows = Vec::new();
+                for name in ranges {
+                    let Some(rngtypid) = secantus_pgplan::pgtypes::oid_of_name(name) else {
+                        continue;
+                    };
+                    let element = secantus_pgplan::range::range_element(name)
+                        .map(|(e, _)| e)
+                        .unwrap_or("");
+                    let Some(rngsubtype) = secantus_pgplan::pgtypes::oid_of_name(element) else {
+                        continue;
+                    };
+                    let mut d = Document::new();
+                    d.insert(
+                        def.field_of("rngtypid").expect("column"),
+                        Bson::Int64(rngtypid),
+                    );
+                    d.insert(
+                        def.field_of("rngsubtype").expect("column"),
+                        Bson::Int64(rngsubtype),
+                    );
                     rows.push(d);
                 }
                 rows
@@ -1978,8 +2021,16 @@ impl PgHandler {
                 // this point -- ORDER BY, OFFSET, LIMIT, the encoder -- works
                 // on documents and does not care where they came from, which is
                 // why the series is a SOURCE rather than its own statement.
-                let (mut docs, def): (Vec<Document>, TableDef) = match &sel.series {
-                    Some(series) => {
+                let (mut docs, def): (Vec<Document>, TableDef) = match (&sel.series, &sel.join) {
+                    // A top-level JOIN source: materialise it, treat its
+                    // output columns as the table.
+                    (_, Some(join)) => {
+                        let docs = self.join_docs(join)?;
+                        let def = secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
+                            .map_err(|e| Self::err(&e))?;
+                        (docs, def)
+                    }
+                    (Some(series), _) => {
                         let column = series.column.clone();
                         let docs = series
                             .values()
@@ -1992,11 +2043,11 @@ impl PgHandler {
                             .collect();
                         (docs, series_table_def(series))
                     }
-                    None if Self::virtual_table(&sel.table).is_some() => {
+                    (None, _) if Self::virtual_table(&sel.table).is_some() => {
                         let docs = self.virtual_rows(&sel.table, &sel.filter).expect("checked");
                         (docs, Self::virtual_table(&sel.table).expect("checked"))
                     }
-                    None => {
+                    (None, _) => {
                         let raw = self
                             .storage
                             .find_matching(&self.db, &sel.table, &sel.filter)
@@ -4111,9 +4162,13 @@ impl PgHandler {
                 .map(|(out, _)| self.field(out.clone(), wire_type("int4")))
                 .collect::<Vec<_>>(),
             Statement::Select(sel) => {
-                let def = self
-                    .lookup(&sel.table)
-                    .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?;
+                let def = match &sel.join {
+                    Some(join) => secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
+                        .map_err(|e| Self::err(&e))?,
+                    None => self
+                        .lookup(&sel.table)
+                        .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?,
+                };
                 sel.columns
                     .iter()
                     .enumerate()

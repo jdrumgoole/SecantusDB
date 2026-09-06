@@ -4825,10 +4825,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   an enum whose label is `Xà` returns UTF-8 bytes where the client expects
   latin1. The join / array_agg / EnumInfo machinery all work; this is output
   encoding.
-- **Rust PG server: `RangeInfo.fetch` needs `pg_range`, which does not exist.**
-  The JOIN and FROM-subquery it needs now work (enum slice 3, 2026-09-06); only
-  the `pg_range` virtual table (`rngtypid`, `rngsubtype`) is missing. A small
-  slice on top of the join machinery.
 - **Rust PG server: range and multirange OPERATORS are unsupported.** Both type
   families themselves (literals, constructors, casts, canonicalisation, merging,
   parameters in both wire formats) are in; `@>` / `<@` / `&&` / `-|-` and the
