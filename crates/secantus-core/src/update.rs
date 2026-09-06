@@ -1196,6 +1196,49 @@ pub fn set_document_path(doc: &mut Document, path: &str, value: Bson) -> R<()> {
     paths::set_path(doc, path, value).map_err(|()| Fallback::Defer)
 }
 
+/// Did an `$inc` / `$mul` write a NaN into `new`?
+///
+/// The half of mongod's `nModified` rule the stored bytes cannot show. mongod
+/// counts an arithmetic write whose result is a NaN as a modification even
+/// though the bytes are unchanged, and does NOT count an operator that declined
+/// to write (probed 8.2.11, 2026-09-06):
+///
+/// ```text
+/// {$inc: {a: 1}}   over a: NaN   -> nModified 1   (wrote a fresh NaN)
+/// {$inc: {a: 0}}   over a: NaN   -> nModified 1   (same)
+/// {$min: {a: 5}}   over a: NaN   -> nModified 0   ($min declined; NaN is smaller)
+/// {$set: {a: NaN}} over a: NaN   -> nModified 0   ($set wrote an equal value)
+/// {$inc: {a: 0}}   over a: 1     -> nModified 0   (wrote, but nothing changed)
+/// ```
+///
+/// So the discriminator is exactly "an arithmetic operator produced a NaN".
+/// Everything else is visible in the encoded document and is
+/// `diff::doc_changed`'s business.
+///
+/// Takes the POST-image because the result already sits there -- the caller has
+/// it, and re-deriving the arithmetic would be a second implementation of it.
+/// Positional / arrayFilter paths are skipped: they expand per document and
+/// this is a narrow tiebreak, so it errs toward "no" and leaves the byte
+/// comparison to decide. Mirrors `secantus.update.arith_wrote_nan`.
+pub fn arith_wrote_nan(new: &Document, update: &Document) -> bool {
+    for op in ["$inc", "$mul"] {
+        let Some(Bson::Document(fields)) = update.get(op) else {
+            continue;
+        };
+        for path in fields.keys() {
+            if path.contains("$[") || path.contains(".$") {
+                continue;
+            }
+            if let Some(Bson::Double(d)) = get_path(new, path) {
+                if d.is_nan() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Is this an operator update, or a replacement document?
 ///
 /// mongod decides on the **first key alone** (probed 8.2.11, 2026-09-06), and
@@ -1662,6 +1705,44 @@ fn addtoset_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
 
 #[cfg(test)]
 mod tests {
+    /// The half of mongod's `nModified` rule the stored bytes cannot show.
+    /// Every one of these has a byte-identical before and after image.
+    #[test]
+    fn arith_wrote_nan_only_fires_for_an_arithmetic_nan() {
+        assert!(super::arith_wrote_nan(
+            &doc! {"a": f64::NAN},
+            &doc! {"$inc": {"a": 1i32}}
+        ));
+        assert!(super::arith_wrote_nan(
+            &doc! {"a": f64::NAN},
+            &doc! {"$mul": {"a": 2i32}}
+        ));
+        // Not arithmetic: `$set` wrote an equal value, `$min` declined to write.
+        assert!(!super::arith_wrote_nan(
+            &doc! {"a": f64::NAN},
+            &doc! {"$set": {"a": f64::NAN}}
+        ));
+        assert!(!super::arith_wrote_nan(
+            &doc! {"a": f64::NAN},
+            &doc! {"$min": {"a": 5i32}}
+        ));
+        // Arithmetic, but the result is not a NaN.
+        assert!(!super::arith_wrote_nan(
+            &doc! {"a": 1i32},
+            &doc! {"$inc": {"a": 0i32}}
+        ));
+        // Another field's NaN is not this operator's doing.
+        assert!(!super::arith_wrote_nan(
+            &doc! {"a": 1i32, "b": f64::NAN},
+            &doc! {"$inc": {"a": 0i32}}
+        ));
+        // A positional path is skipped -- the byte comparison decides there.
+        assert!(!super::arith_wrote_nan(
+            &doc! {"a": [f64::NAN]},
+            &doc! {"$inc": {"a.$[]": 1i32}}
+        ));
+    }
+
     // --- the operator-vs-replacement form decision. mongod takes the FIRST
     // key alone and then complains in that form's vocabulary (probed 8.2.11,
     // 2026-09-06). ---

@@ -10530,10 +10530,11 @@ impl Storage {
             let doc = decode_doc(&blob)?;
             matched += 1;
             let new = transform(&doc, false)?;
-            // `doc_changed`, not `new == doc`: `Bson::Double`'s `f64 ==` calls
-            // `-0.0` equal to `0.0`, so a bare compare skipped the write and
-            // silently kept the OLD zero. See `secantus_core::diff::doc_changed`.
-            if !secantus_core::diff::doc_changed(&new, &doc) {
+            // The encoded bytes decide, plus mongod's one rule they cannot show:
+            // an arithmetic write whose result is a NaN counts as a
+            // modification, while an operator that DECLINED to write does not.
+            // See `secantus_core::diff::doc_changed` and `update::arith_wrote_nan`.
+            if !doc_was_modified(&new, &doc, update_spec) {
                 continue;
             }
             if let Some(v) = validator {
@@ -10673,8 +10674,8 @@ impl Storage {
                         // it) skips the full-document clone.
                         post_image = Some(new.clone());
                     }
-                    // `doc_changed`, not `new != doc` -- see the sibling site above.
-                    if secantus_core::diff::doc_changed(&new, &doc) {
+                    // See the sibling site above.
+                    if doc_was_modified(&new, &doc, update_spec) {
                         // Collection validator on the post-apply doc (mongod rejects an
                         // update that would leave a document failing validation). A
                         // validator the query engine can't evaluate is treated as
@@ -12668,6 +12669,27 @@ fn uuid_binary(bytes: &[u8]) -> Bson {
         subtype: BinarySubtype::Uuid,
         bytes: bytes.to_vec(),
     })
+}
+
+/// Did this update modify the document, by mongod's rule?
+///
+/// Two halves, because mongod's `nModified` is not a pure document comparison:
+///
+/// * the encoded BSON differs (`diff::doc_changed`) -- which sees a signed zero
+///   and a numeric type change, and does NOT fire on a document that merely
+///   contains a NaN; and
+/// * an arithmetic operator wrote a NaN (`update::arith_wrote_nan`) -- which
+///   mongod counts even though the bytes are identical, and which distinguishes
+///   `{$inc: {a: 1}}` over `a: NaN` (modified) from `{$min: {a: 5}}` over the
+///   same document (not modified, because `$min` declined to write).
+///
+/// `update_spec` is `None` for a pipeline update; mongod diffs those by value,
+/// so the byte comparison alone is the rule there.
+fn doc_was_modified(new: &Document, old: &Document, update_spec: Option<&Document>) -> bool {
+    if secantus_core::diff::doc_changed(new, old) {
+        return true;
+    }
+    update_spec.is_some_and(|u| secantus_core::update::arith_wrote_nan(new, u))
 }
 
 /// mongod's field order for an UPSERTED document: `_id` first, then the fields

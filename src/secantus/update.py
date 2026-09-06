@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import math
 import re
 from collections.abc import Mapping
 from typing import Any
@@ -459,6 +460,50 @@ def apply_update_batch(
     array-filter / positional updates are applied per doc the same way.
     """
     return [apply_update(d, update, is_upsert=is_upsert) for d in docs]
+
+
+def arith_wrote_nan(new: Mapping[str, Any], update: Any) -> bool:
+    """Did an ``$inc`` / ``$mul`` write a NaN into ``new``?
+
+    The half of mongod's ``nModified`` rule that the stored bytes cannot show.
+    mongod counts an arithmetic write whose result is a NaN as a modification
+    even though the bytes are unchanged, and does NOT count an operator that
+    declined to write (probed 8.2.11, 2026-09-06)::
+
+        {$inc: {a: 1}}  over a: NaN   -> nModified 1   (wrote a fresh NaN)
+        {$inc: {a: 0}}  over a: NaN   -> nModified 1   (same)
+        {$min: {a: 5}}  over a: NaN   -> nModified 0   ($min declined; NaN is smaller)
+        {$set: {a: NaN}} over a: NaN  -> nModified 0   ($set writes an equal value)
+        {$inc: {a: 0}}  over a: 1     -> nModified 0   (wrote, but nothing changed)
+
+    So the discriminator is exactly "an arithmetic operator produced a NaN".
+    Everything else is visible in the encoded document and is
+    :func:`secantus.storage._doc_changed`'s business.
+
+    Takes the POST-image because that is where the result already sits -- the
+    caller has it, and re-deriving the arithmetic here would be a second
+    implementation of it. Positional / arrayFilter paths are skipped: they
+    expand per document and this is a narrow tiebreak, so it errs toward "no",
+    leaving the byte comparison to decide.
+    """
+    if not isinstance(update, Mapping):
+        # A PIPELINE update (a list). mongod diffs those by value, so there is
+        # no per-operator half to answer and the byte comparison is the rule.
+        # Reaching `.get` on a list raised, which the command layer surfaced as
+        # an InternalError -- caught by the mongod differential gate's
+        # `fam-empty-pipeline-is-a-no-op` case.
+        return False
+    for op in ("$inc", "$mul"):
+        payload = update.get(op)
+        if not isinstance(payload, Mapping):
+            continue
+        for path in payload:
+            if "$[" in path or ".$" in path:
+                continue
+            value = get_path(new, path)
+            if isinstance(value, float) and math.isnan(value):
+                return True
+    return False
 
 
 def is_operator_form(update: Mapping[str, Any]) -> bool:
