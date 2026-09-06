@@ -1530,6 +1530,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "pg_query",
+ "regex",
  "secantus-pgcatalog",
 ]
 

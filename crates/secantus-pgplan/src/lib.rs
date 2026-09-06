@@ -79,6 +79,9 @@ pub enum Error {
     IndeterminateDatatype(String),
     /// A named object (a type, mostly) that does not exist -> 42704.
     UndefinedObject(String),
+    /// A malformed regular expression -> 2201B. Its own class, not 22P02: the
+    /// PATTERN is broken, not the value being matched.
+    InvalidRegex(String),
 }
 
 impl std::fmt::Display for Error {
@@ -100,7 +103,8 @@ impl std::fmt::Display for Error {
             Error::InvalidColumnReference(m)
             | Error::UndefinedFunction(m)
             | Error::IndeterminateDatatype(m)
-            | Error::UndefinedObject(m) => write!(f, "{m}"),
+            | Error::UndefinedObject(m)
+            | Error::InvalidRegex(m) => write!(f, "{m}"),
             Error::MultipleCommands => {
                 write!(
                     f,
@@ -133,6 +137,7 @@ impl Error {
             Error::MultipleCommands => "42601",     // syntax_error, as PostgreSQL reports it
             Error::IndeterminateDatatype(_) => "42P18", // indeterminate_datatype
             Error::UndefinedObject(_) => "42704",   // undefined_object
+            Error::InvalidRegex(_) => "2201B",      // invalid_regular_expression
         }
     }
 }
@@ -244,10 +249,11 @@ pub struct Select {
     pub series: Option<Series>,
     /// Output columns in order, as (output name, stored field).
     pub columns: Vec<(String, String)>,
-    /// A cast to apply to each output column, parallel to `columns`. `None`
-    /// almost everywhere; carries `col::regtype::text` and friends, which is
-    /// how a client's type-discovery query reads the catalog.
-    pub casts: Vec<Option<String>>,
+    /// A computed expression per output column, parallel to `columns`. `None`
+    /// almost everywhere; carries `col::regtype::text` and
+    /// `regexp_replace(col, ...)` -- the shapes catalog-reading clients put in
+    /// a select list.
+    pub casts: Vec<Option<ColumnExpr>>,
     pub filter: Document,
     pub order: Vec<OrderKey>,
     /// `None` = no LIMIT. `LIMIT 0` is a real limit, not an absent one.
@@ -385,6 +391,23 @@ pub enum TransactionControl {
 /// Clients lean on this constantly -- psycopg, pgjdbc and pgx all probe
 /// `version()` and friends during connection setup -- so a server that cannot
 /// answer it is unusable by real drivers even if every table query works.
+/// A computed output column of a TABLE select: the stored value, transformed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnExpr {
+    /// A chain of casts, innermost first: `oid::regtype::text` is
+    /// `["regtype", "text"]`.
+    Casts(Vec<String>),
+    /// A scalar call with the COLUMN somewhere among constant arguments --
+    /// `regexp_replace(statement, 'pat', '', 'i')`. `None` marks the column's
+    /// position; `result_type` is fixed at plan time so the DESCRIBE pass,
+    /// which never sees a row, can still name the column's type.
+    Call {
+        name: String,
+        args: Vec<Option<Bson>>,
+        result_type: String,
+    },
+}
+
 /// One column of a FROM-less SELECT.
 ///
 /// The session-setting variants are resolved at EXECUTION rather than during
@@ -774,11 +797,20 @@ fn plan_insert(
 
 /// Does this target list contain an aggregate call?
 fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
+    // Only the names the aggregate planner actually handles. Any-FuncCall
+    // routed a scalar call over a column (`regexp_replace(col, ...)`) into the
+    // aggregate planner, whose refusal came out as a GROUPING error -- the
+    // wrong error for what was a plain unsupported target.
+    const AGGREGATES: &[&str] = &["count", "sum", "avg", "min", "max"];
     s.target_list.iter().any(|t| {
         matches!(
             t.node.as_ref(),
             Some(N::ResTarget(rt))
-                if matches!(rt.val.as_ref().and_then(|v| v.node.as_ref()), Some(N::FuncCall(_)))
+                if matches!(
+                    rt.val.as_ref().and_then(|v| v.node.as_ref()),
+                    Some(N::FuncCall(f))
+                        if func_name(f).as_deref().is_some_and(|n| AGGREGATES.contains(&n))
+                )
         )
     })
 }
@@ -1050,7 +1082,7 @@ fn plan_select(
     let def = lookup(&table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
 
     let mut columns: Vec<(String, String)> = Vec::new();
-    let mut casts: Vec<Option<String>> = Vec::new();
+    let mut casts: Vec<Option<ColumnExpr>> = Vec::new();
     for t in &s.target_list {
         let rt = match t.node.as_ref() {
             Some(N::ResTarget(rt)) => rt,
@@ -1073,7 +1105,52 @@ fn plan_select(
                     rt.name.clone()
                 };
                 columns.push((out, field));
-                casts.push(Some(chain.join("::")));
+                casts.push(Some(ColumnExpr::Casts(chain)));
+                continue;
+            }
+            // `regexp_replace(statement, 'pat', '', 'i') AS statement` -- a
+            // scalar call with the column among constant arguments. The value
+            // is computed per row by the executor; the TYPE is fixed here so
+            // the describe pass, which sees no rows, still names it.
+            Some(N::FuncCall(f))
+                if func_name(f)
+                    .as_deref()
+                    .is_some_and(|n| scalar::is_scalar(n) || n == "regexp_replace") =>
+            {
+                let name = func_name(f).expect("checked");
+                let mut args: Vec<Option<Bson>> = Vec::new();
+                let mut column: Option<String> = None;
+                for a in &f.args {
+                    if let Some(N::ColumnRef(c)) = a.node.as_ref() {
+                        if column.is_some() {
+                            return Err(Error::Unsupported(
+                                "a scalar call over two columns".into(),
+                            ));
+                        }
+                        let col = column_ref_name(c)
+                            .ok_or_else(|| Error::Unsupported("this call target".into()))?;
+                        column = Some(col);
+                        args.push(None);
+                        continue;
+                    }
+                    args.push(Some(const_value(a, params)?));
+                }
+                let column =
+                    column.ok_or_else(|| Error::Unsupported("a call with no column".into()))?;
+                let field = def
+                    .field_of(&column)
+                    .ok_or_else(|| Error::UndefinedColumn(column.clone()))?;
+                let out = if rt.name.is_empty() {
+                    name.clone()
+                } else {
+                    rt.name.clone()
+                };
+                columns.push((out, field));
+                casts.push(Some(ColumnExpr::Call {
+                    result_type: scalar::static_result_type(&name).to_string(),
+                    name,
+                    args,
+                }));
                 continue;
             }
             Some(N::ColumnRef(c)) => {
@@ -1711,7 +1788,14 @@ fn pg_typeof(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> 
     } else {
         static_type(arg, &value)
     };
-    Ok(Bson::String(display_type(&internal)))
+    // A REGTYPE value, not its display text: `pg_typeof(x)::oid` reads the
+    // oid and `::text` the name, and a bare read renders the name -- the
+    // string alone could only do the last. A type the catalog cannot number
+    // (`unknown`, mostly) still answers its name as text.
+    Ok(match pgtypes::oid_of_name(&internal) {
+        Some(oid) => regtype_value(oid),
+        None => Bson::String(display_type(&internal)),
+    })
 }
 
 /// PostgreSQL's DISPLAY name for a type, which is not its internal name.
@@ -1969,6 +2053,23 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         ));
                         continue;
                     }
+                }
+                if name == "regexp_replace" {
+                    let args = f
+                        .args
+                        .iter()
+                        .map(|a| const_value(a, params))
+                        .collect::<Result<Vec<_>>>()?;
+                    columns.push((
+                        if rt.name.is_empty() {
+                            "regexp_replace".to_string()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::Value(regexp_replace(&args)?),
+                        "text".to_string(),
+                    ));
+                    continue;
                 }
                 if let Some(col) = guc_function(&name, f, params)? {
                     let out_name = name.clone();
@@ -2390,6 +2491,108 @@ fn declared_param_type(n: usize) -> Option<String> {
 /// force. The public door onto `cast_value` for the wire layer, which has text
 /// from a client and a declared oid and needs the same value a literal of that
 /// type would produce.
+/// `regexp_replace(source, pattern, replacement [, flags])`.
+///
+/// The pattern language is POSIX ARE; the `regex` crate covers the subset any
+/// measured client sends (`\d`, classes, anchors, alternation). Flags: `i`
+/// case-insensitive, `g` replace ALL occurrences -- without `g` PostgreSQL
+/// replaces only the FIRST, which is not most regex libraries' default.
+fn regexp_replace(args: &[Bson]) -> Result<Bson> {
+    if !(3..=4).contains(&args.len()) {
+        return Err(Error::UndefinedFunction(
+            "function regexp_replace() does not exist with that argument list".into(),
+        ));
+    }
+    if args.contains(&Bson::Null) {
+        return Ok(Bson::Null);
+    }
+    let text = |v: &Bson| match v {
+        Bson::String(s) => Ok(s.clone()),
+        other => Err(Error::Unsupported(format!(
+            "a {} argument to regexp_replace()",
+            bson_kind(other)
+        ))),
+    };
+    let source = text(&args[0])?;
+    let pattern = text(&args[1])?;
+    let replacement = text(&args[2])?;
+    let flags = args.get(3).map(&text).transpose()?.unwrap_or_default();
+    let mut builder = String::new();
+    if flags.contains('i') {
+        builder.push_str("(?i)");
+    }
+    builder.push_str(&pattern);
+    let re = regex::Regex::new(&builder)
+        .map_err(|_| Error::InvalidRegex(format!("invalid regular expression: \"{pattern}\"")))?;
+    // PostgreSQL's `\1` group references are the regex crate's `${1}`.
+    let replacement = {
+        let mut out = String::new();
+        let mut chars = replacement.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.peek() {
+                    Some(d) if d.is_ascii_digit() => {
+                        out.push_str("${");
+                        out.push(*d);
+                        out.push('}');
+                        chars.next();
+                        continue;
+                    }
+                    Some('\\') => {
+                        out.push('\\');
+                        chars.next();
+                        continue;
+                    }
+                    _ => {}
+                }
+            } else if c == '$' {
+                out.push_str("$$");
+                continue;
+            }
+            out.push(c);
+        }
+        out
+    };
+    Ok(Bson::String(if flags.contains('g') {
+        re.replace_all(&source, replacement.as_str()).into_owned()
+    } else {
+        re.replace(&source, replacement.as_str()).into_owned()
+    }))
+}
+
+/// Apply one computed-column expression to a row's stored value. The wire
+/// layer's door: the executor holds rows and this holds the evaluators.
+pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -> Result<Bson> {
+    match expr {
+        ColumnExpr::Casts(chain) => {
+            let mut v = value;
+            for target in chain {
+                v = cast_value_with_tz(v, target, tz)?;
+            }
+            Ok(v)
+        }
+        ColumnExpr::Call { name, args, .. } => {
+            let filled: Vec<Bson> = args
+                .iter()
+                .map(|a| a.clone().unwrap_or_else(|| value.clone()))
+                .collect();
+            if name == "regexp_replace" {
+                return regexp_replace(&filled);
+            }
+            scalar::call(name, &filled)
+                .unwrap_or_else(|| Err(Error::Unsupported(format!("function {name}()"))))
+        }
+    }
+}
+
+/// The type a ColumnExpr's column reads back as.
+pub fn column_expr_type(expr: &ColumnExpr) -> &str {
+    match expr {
+        ColumnExpr::Casts(chain) => chain.last().map(String::as_str).unwrap_or("text"),
+        ColumnExpr::Call { result_type, .. } => result_type,
+    }
+}
+
 /// As `cast_text_to`, for a VALUE that is already typed -- the wire layer's
 /// door onto per-column cast chains (`oid::regtype::text`).
 pub fn cast_value_with_tz(value: Bson, target: &str, tz: &TimeZoneSetting) -> Result<Bson> {
@@ -4284,6 +4487,15 @@ fn guc_function(
         }
     };
     match name {
+        // A NULL setting name answers NULL, not an error -- psycopg's own
+        // tests pass one through a parameter.
+        "current_setting"
+            if !f.args.is_empty()
+                && f.args.len() <= 2
+                && const_value(&f.args[0], params)? == Bson::Null =>
+        {
+            Ok(Some(ConstCol::Value(Bson::Null)))
+        }
         "current_setting" if !f.args.is_empty() && f.args.len() <= 2 => {
             let missing_ok = if f.args.len() == 2 {
                 matches!(const_value(&f.args[1], params)?, Bson::Boolean(true))
@@ -4667,6 +4879,14 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 if let Some(result) = scalar::call(&name, &args) {
                     return result;
                 }
+            }
+            if name == "regexp_replace" {
+                let args = f
+                    .args
+                    .iter()
+                    .map(|a| const_value(a, params))
+                    .collect::<Result<Vec<_>>>()?;
+                return regexp_replace(&args);
             }
         }
     }

@@ -641,3 +641,18 @@ fn md5_hex(data: &[u8]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect()
 }
+
+/// The RESULT type of a scalar, for the describe pass -- which sees no value
+/// to infer from. The string functions answer text; the numeric ones vary by
+/// input and fall back to text only when unknown, which is also what an
+/// untyped output column defaults to.
+pub fn static_result_type(name: &str) -> &'static str {
+    match name {
+        "length" | "char_length" | "character_length" | "octet_length" | "bit_length"
+        | "strpos" | "position" | "ascii" => "int4",
+        "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "mod" | "div" => "numeric",
+        "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" | "sign" => "float8",
+        "starts_with" => "bool",
+        _ => "text",
+    }
+}
