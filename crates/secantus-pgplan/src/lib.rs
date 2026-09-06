@@ -316,6 +316,9 @@ pub enum AggFunc {
     Sum,
     Min,
     Max,
+    /// `array_agg(col)` -- every value in group order, NULLs INCLUDED, which
+    /// is how a LEFT-JOIN miss surfaces as `[None]` rather than `[]`.
+    ArrayAgg,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -357,6 +360,11 @@ pub struct Aggregate {
     pub table: String,
     /// A generated source in place of a table, as for `Select`.
     pub series: Option<Series>,
+    /// A JOINED source in place of a table: `FROM (SELECT ... FROM a JOIN b
+    /// ON ...) x`, which is how psycopg's type-registration queries read the
+    /// catalog. The rows are materialised by the executor and then grouped
+    /// exactly as a table's would be.
+    pub join: Option<Box<JoinSelect>>,
     /// EVERY GROUP BY column as (name, stored field), in declared order --
     /// including ones the SELECT list does not project, because ORDER BY may
     /// still reference them.
@@ -368,6 +376,35 @@ pub struct Aggregate {
     pub order: Vec<AggOrderKey>,
     pub limit: Option<i64>,
     pub offset: i64,
+}
+
+/// A column reference as `(alias, column)`.
+type QualifiedColumn = (String, Vec<String>);
+
+/// A two-table join, projected: the subset every measured catalog query uses.
+///
+/// One equality in ON, an optional single-column equality filter, an optional
+/// single-column ORDER BY. Anything else in a JOIN is still refused -- a JOIN
+/// half-supported quietly returns wrong rows, which is worse.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinSelect {
+    /// (table, alias) for each side.
+    pub left: (String, String),
+    pub right: (String, String),
+    /// LEFT OUTER when true, INNER when false.
+    pub left_join: bool,
+    /// The ON equality: (alias, column) on each side, either order.
+    pub on: ((String, String), (String, String)),
+    /// Output columns: (output name, side alias, column).
+    pub columns: Vec<(String, String, String)>,
+    /// A computed expression per output column (cast chains, mostly:
+    /// `t.oid::regtype::text AS regtype`), parallel to `columns`.
+    pub exprs: Vec<Option<ColumnExpr>>,
+    /// A WHERE equality against one side's column, already evaluated.
+    pub filter: Option<(String, String, Bson)>,
+    /// ORDER BY one column: (alias, column, ascending). PostgreSQL sorts NULLS
+    /// LAST ascending, which a LEFT JOIN's misses rely on.
+    pub order: Option<(String, String, bool)>,
 }
 
 /// Transaction control. Prepared transactions (two-phase commit) are
@@ -833,7 +870,7 @@ fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
     // routed a scalar call over a column (`regexp_replace(col, ...)`) into the
     // aggregate planner, whose refusal came out as a GROUPING error -- the
     // wrong error for what was a plain unsupported target.
-    const AGGREGATES: &[&str] = &["count", "sum", "avg", "min", "max"];
+    const AGGREGATES: &[&str] = &["count", "sum", "avg", "min", "max", "array_agg"];
     s.target_list.iter().any(|t| {
         matches!(
             t.node.as_ref(),
@@ -1323,6 +1360,17 @@ fn plan_aggregate(
     if s.having_clause.is_some() {
         return Err(Error::Unsupported("HAVING".into()));
     }
+    // `FROM (SELECT ... FROM a JOIN b ON ...) x` -- the joined subquery every
+    // psycopg type-registration query is built on.
+    if let Some(N::RangeSubselect(rs)) = s.from_clause[0].node.as_ref() {
+        let inner = match rs.subquery.as_ref().and_then(|q| q.node.as_ref()) {
+            Some(N::SelectStmt(inner)) => inner,
+            _ => return Err(Error::Unsupported("this subquery".into())),
+        };
+        let join = plan_join_select(inner, lookup, params)?;
+        let def = join_output_def(&join, lookup)?;
+        return finish_aggregate(s, String::new(), Some(Box::new(join)), def, params);
+    }
     if !s.distinct_clause.is_empty() {
         return Err(Error::Unsupported("DISTINCT with an aggregate".into()));
     }
@@ -1383,6 +1431,7 @@ fn plan_aggregate(
         return Ok(Statement::Aggregate(Aggregate {
             table: String::new(),
             series: Some(series),
+            join: None,
             group_by: Vec::new(),
             items,
             select,
@@ -1399,6 +1448,240 @@ fn plan_aggregate(
     };
     let def = lookup(&table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
 
+    finish_aggregate(s, table, None, def, params)
+}
+
+/// Plan the inner select of a joined subquery: two tables, one ON equality,
+/// projected columns (casts allowed), an optional WHERE equality and one
+/// ORDER BY column. Everything else is refused -- a half-supported JOIN
+/// quietly returns wrong rows.
+fn plan_join_select(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<JoinSelect> {
+    use pg_query::protobuf::JoinType;
+    if s.from_clause.len() != 1 {
+        return Err(Error::Unsupported("this subquery's FROM".into()));
+    }
+    let Some(N::JoinExpr(j)) = s.from_clause[0].node.as_ref() else {
+        return Err(Error::Unsupported("a subquery without a JOIN".into()));
+    };
+    let left_join = match JoinType::try_from(j.jointype) {
+        Ok(JoinType::JoinLeft) => true,
+        Ok(JoinType::JoinInner) => false,
+        _ => return Err(Error::Unsupported("this JOIN kind".into())),
+    };
+    let side = |n: Option<&pg_query::protobuf::Node>| -> Result<(String, String)> {
+        match n.and_then(|x| x.node.as_ref()) {
+            Some(N::RangeVar(r)) => {
+                let alias = r
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .unwrap_or_else(|| r.relname.clone());
+                Ok((r.relname.clone(), alias))
+            }
+            _ => Err(Error::Unsupported("this JOIN side".into())),
+        }
+    };
+    let left = side(j.larg.as_deref())?;
+    let right = side(j.rarg.as_deref())?;
+    for (table, _) in [&left, &right] {
+        lookup(table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
+    }
+
+    // ON a.x = b.y, either order.
+    let qualified = |n: Option<&pg_query::protobuf::Node>| -> Option<(String, String)> {
+        match n.and_then(|x| x.node.as_ref()) {
+            Some(N::ColumnRef(c)) if c.fields.len() == 2 => {
+                let part = |i: usize| match c.fields[i].node.as_ref() {
+                    Some(N::String(st)) => Some(st.sval.clone()),
+                    _ => None,
+                };
+                Some((part(0)?, part(1)?))
+            }
+            _ => None,
+        }
+    };
+    let on = match j.quals.as_ref().and_then(|q| q.node.as_ref()) {
+        Some(N::AExpr(e)) if operator_name(e) == Ok("=") => {
+            let l = qualified(e.lexpr.as_deref())
+                .ok_or_else(|| Error::Unsupported("this ON clause".into()))?;
+            let r = qualified(e.rexpr.as_deref())
+                .ok_or_else(|| Error::Unsupported("this ON clause".into()))?;
+            (l, r)
+        }
+        _ => return Err(Error::Unsupported("this ON clause".into())),
+    };
+
+    // Projected columns: `alias.col [AS out]`, or a cast chain over one.
+    let mut columns = Vec::new();
+    let mut exprs = Vec::new();
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return Err(Error::Unsupported("this subquery target".into()));
+        };
+        match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
+            Some(N::ColumnRef(c)) => {
+                let (alias, col) = qualified(rt.val.as_deref())
+                    .or_else(|| {
+                        // Unqualified: resolve later against either side; carry
+                        // an empty alias.
+                        column_ref_name(c).map(|n| (String::new(), n))
+                    })
+                    .ok_or_else(|| Error::Unsupported("this subquery target".into()))?;
+                let out = if rt.name.is_empty() {
+                    col.clone()
+                } else {
+                    rt.name.clone()
+                };
+                columns.push((out, alias, col));
+                exprs.push(None);
+            }
+            Some(N::TypeCast(tc)) => {
+                // `t.oid::regtype::text AS regtype` -- the cast chain rides
+                // beside the column, same as a plain select's.
+                let (col_name, chain) = cast_chain_over_column_qualified(tc)?;
+                let out = if rt.name.is_empty() {
+                    chain
+                        .1
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| col_name.1.clone())
+                } else {
+                    rt.name.clone()
+                };
+                columns.push((out, col_name.0, col_name.1));
+                exprs.push(Some(ColumnExpr::Casts(chain.1)));
+            }
+            _ => return Err(Error::Unsupported("this subquery target".into())),
+        }
+    }
+
+    // WHERE alias.col = <constant>, evaluated now.
+    let filter = match s.where_clause.as_ref().and_then(|w| w.node.as_ref()) {
+        None => None,
+        Some(N::AExpr(e)) if operator_name(e) == Ok("=") => {
+            let (alias, col) = qualified(e.lexpr.as_deref())
+                .ok_or_else(|| Error::Unsupported("this subquery WHERE".into()))?;
+            let value = const_value(
+                e.rexpr
+                    .as_ref()
+                    .ok_or_else(|| Error::Parse("no right operand".into()))?,
+                params,
+            )?;
+            Some((alias, col, value))
+        }
+        _ => return Err(Error::Unsupported("this subquery WHERE".into())),
+    };
+
+    // ORDER BY one column.
+    let order = match s.sort_clause.len() {
+        0 => None,
+        1 => {
+            let Some(N::SortBy(sb)) = s.sort_clause[0].node.as_ref() else {
+                return Err(Error::Unsupported("this subquery ORDER BY".into()));
+            };
+            let (alias, col) = qualified(sb.node.as_deref())
+                .ok_or_else(|| Error::Unsupported("this subquery ORDER BY".into()))?;
+            let ascending = !matches!(
+                pg_query::protobuf::SortByDir::try_from(sb.sortby_dir),
+                Ok(pg_query::protobuf::SortByDir::SortbyDesc)
+            );
+            Some((alias, col, ascending))
+        }
+        _ => return Err(Error::Unsupported("this subquery ORDER BY".into())),
+    };
+
+    Ok(JoinSelect {
+        left,
+        right,
+        left_join,
+        on,
+        columns,
+        exprs,
+        filter,
+        order,
+    })
+}
+
+/// A cast chain whose innermost target is a QUALIFIED column.
+fn cast_chain_over_column_qualified(
+    tc: &pg_query::protobuf::TypeCast,
+) -> Result<((String, String), QualifiedColumn)> {
+    let ty = tc
+        .type_name
+        .as_ref()
+        .map(type_name_of)
+        .ok_or_else(|| Error::Parse("cast with no type".into()))?;
+    match tc.arg.as_ref().and_then(|a| a.node.as_ref()) {
+        Some(N::ColumnRef(c)) if c.fields.len() == 2 => {
+            let part = |i: usize| match c.fields[i].node.as_ref() {
+                Some(N::String(st)) => Some(st.sval.clone()),
+                _ => None,
+            };
+            let alias = part(0).ok_or_else(|| Error::Unsupported("this cast target".into()))?;
+            let col = part(1).ok_or_else(|| Error::Unsupported("this cast target".into()))?;
+            Ok(((alias, col), (String::new(), vec![ty])))
+        }
+        Some(N::TypeCast(inner)) => {
+            let (who, (name, mut chain)) = cast_chain_over_column_qualified(inner)?;
+            chain.push(ty);
+            Ok((who, (name, chain)))
+        }
+        _ => Err(Error::Unsupported("a cast over this expression".into())),
+    }
+}
+
+/// A TableDef standing in for a join's OUTPUT: each projected column with the
+/// type its source column (or its last cast) gives it, so the aggregate tail
+/// resolves GROUP BY names and types against it unchanged.
+pub fn join_output_def(
+    join: &JoinSelect,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<TableDef> {
+    let left_def =
+        lookup(&join.left.0).ok_or_else(|| Error::UndefinedTable(join.left.0.clone()))?;
+    let right_def =
+        lookup(&join.right.0).ok_or_else(|| Error::UndefinedTable(join.right.0.clone()))?;
+    let mut columns = Vec::new();
+    for (i, (out, alias, col)) in join.columns.iter().enumerate() {
+        let ty = match join.exprs.get(i).and_then(|e| e.as_ref()) {
+            Some(expr) => column_expr_type(expr).to_string(),
+            None => {
+                let side_def = if *alias == join.left.1 {
+                    &left_def
+                } else if *alias == join.right.1 {
+                    &right_def
+                } else {
+                    // Unqualified: whichever side has it.
+                    if left_def.column(col).is_some() {
+                        &left_def
+                    } else {
+                        &right_def
+                    }
+                };
+                side_def
+                    .column(col)
+                    .map(|c| c.pg_type.clone())
+                    .ok_or_else(|| Error::UndefinedColumn(col.clone()))?
+            }
+        };
+        columns.push(Column::new(out, &ty, false));
+    }
+    Ok(TableDef::new("", columns))
+}
+
+/// The shared tail of `plan_aggregate`, over whichever SOURCE the FROM named:
+/// a table, or a joined subquery whose output columns stand in for one.
+fn finish_aggregate(
+    s: &pg_query::protobuf::SelectStmt,
+    table: String,
+    join: Option<Box<JoinSelect>>,
+    def: TableDef,
+    params: &[Bson],
+) -> Result<Statement> {
     // GROUP BY columns, in declared order.
     let mut group_by: Vec<(String, String)> = Vec::new();
     for g in &s.group_clause {
@@ -1451,6 +1734,7 @@ fn plan_aggregate(
                         "sum" => AggFunc::Sum,
                         "min" => AggFunc::Min,
                         "max" => AggFunc::Max,
+                        "array_agg" => AggFunc::ArrayAgg,
                         // `avg` returns PostgreSQL `numeric` with its own scale
                         // rules; approximating it would be a wrong answer.
                         other => return Err(Error::Unsupported(format!("aggregate {other}()"))),
@@ -1594,6 +1878,7 @@ fn plan_aggregate(
 
     Ok(Statement::Aggregate(Aggregate {
         series: None,
+        join,
         table,
         group_by,
         items,
@@ -4496,6 +4781,11 @@ pub(crate) fn compare_decimal_text(a: &str, b: &str) -> Option<std::cmp::Orderin
             pad(&af).cmp(&pad(&bf))
         });
     Some(if an { magnitude.reverse() } else { magnitude })
+}
+
+/// The public door onto `compare_constants` for the wire layer's join sort.
+pub fn compare_values(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
+    compare_constants(a, b)
 }
 
 pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
