@@ -91,14 +91,26 @@ def test_elem_match_non_document_argument_raises() -> None:
 
 
 def test_id_only_truthy_spec_is_inclusion() -> None:
-    """{"_id": 1} (and any non-zero value) is an inclusion projection:
-    only _id survives. Oracle-pinned against real mongod."""
+    """{"_id": 1} (and any non-zero NUMBER or bool) is an inclusion projection:
+    only _id survives. Measured against mongod 8.2.11 (2026-09-06)."""
     doc = {"_id": 7, "a": 1, "b": 2}
     assert apply_projection(doc, {"_id": 1}) == {"_id": 7}
     assert apply_projection(doc, {"_id": True}) == {"_id": 7}
-    # mongod treats None and "" as include, not drop.
-    assert apply_projection(doc, {"_id": None}) == {"_id": 7}
-    assert apply_projection(doc, {"_id": ""}) == {"_id": 7}
+
+
+def test_id_none_and_empty_string_are_literals_not_flags() -> None:
+    """``{_id: None}`` and ``{_id: ""}`` REPLACE ``_id`` with that constant.
+
+    This test used to assert they were includes -- ``{_id: 7}`` -- under a
+    comment reading "mongod treats None and '' as include, not drop" and a
+    docstring saying "Oracle-pinned against real mongod". Nothing in this file
+    can reach a real mongod, so the claim had never been checked; running it
+    against 8.2.11 returns the constant. Only a BSON *number* or *bool* is a
+    flag -- see ``_is_flag_value``.
+    """
+    doc = {"_id": 7, "a": 1, "b": 2}
+    assert apply_projection(doc, {"_id": None}) == {"_id": None}
+    assert apply_projection(doc, {"_id": ""}) == {"_id": ""}
 
 
 def test_id_only_falsy_spec_is_exclusion() -> None:
