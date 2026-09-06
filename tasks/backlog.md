@@ -4747,36 +4747,38 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   reaches a server only through the raw `update` command — which is how the
   other drivers send it, and how the tests drive it.
 
-- [ ] **The RUST server does not sort an operator-upsert's update-added fields
-  (2026-09-06).** BSON field order is on the wire and drivers compare raw bytes
-  (mongo-php-library's codec tests do), so this is a real difference:
+- [x] **RESOLVED (2026-09-06): the Rust upsert stored a literal dotted key, and
+  the same upsert run twice inserted TWO documents.** Filed as an ordering nit;
+  probing it found a data bug sitting underneath, which is the more important
+  half.
 
-  ```
-  q {_id: 5}  u {$set: {z: 1, a: 2}}     mongod: [_id, a, z]
-                                         rust:   [_id, z, a]     <- update order
-                                         python: [_id, a, z]     OK
-  ```
+  The seed did `seed.insert("a.b", v)`, so
+  `update({"a.b": 5}, {$set: {z: 1}}, upsert)` stored `{"a.b": 5, "z": 1}` — a
+  document mongod cannot produce, and one that does NOT match the query that
+  created it, so the next identical upsert inserted a second document. Idempotent
+  upsert, silently broken, no error. mongod stores `{a: {b: 5}}` and matches it
+  (measured 8.2.11, 2026-09-06). The Python side has used `set_path` here since
+  it hit the same bug; this is the THIRD instance of "user-supplied path used as
+  a dict key" in this file's list of recurring shapes.
 
-  The Python server has `storage._order_upserted_doc` for exactly this; the Rust
-  storage upsert path (`crates/secantus-storage/src/lib.rs`, the
-  `matched == 0 && upsert` branch) has no equivalent and inserts in update order.
-  A straight port of the "update-added fields sorted by name" half is the fix.
+  The ordering half landed too: `order_upserted_doc` is ported, so an operator
+  upsert emits `_id`, the query-seeded fields, then the update-added ones sorted
+  by name, and a replacement upsert keeps its own order. A leftover
+  `any(k.starts_with('$'))` form test in the storage oplog path (which #1327
+  missed) now uses the shared `is_operator_form`.
 
-  **Do NOT also port the query-seeded half — it is not reproducible.** mongod
-  emits the query-seeded fields in an internal order that is neither source order
-  nor alphabetical, and is stable for a key SET regardless of the order it was
-  written in (measured 8.2.11, 2026-09-06):
+  Pinned by `tests/test_rust_upsert_fidelity.py` (11 tests over the wire, 10 of
+  which fail against the pre-fix binary) and four `secantus-storage` unit tests.
 
-  ```
-  q {m:1, c:2, z:3}  $set {b:4, y:5}   -> [_id, m, c, z, b, y]
-  q {z:1, m:2, c:3}  $set {y:4, b:5}   -> [_id, m, c, z, b, y]   same order!
-  ```
-
-  That is a hash order, in the class this project does not reproduce. Python's
-  `_order_upserted_doc` sorts them alphabetically, which is a defensible
-  approximation and should be left alone; its docstring's "probed 6.0.16" claim
-  about that half is not what 8.2.11 does, and the comment at the `sorted(filter)`
-  seed site says the same thing and is equally stale.
+  **Correction to what this entry used to claim.** It said mongod's query-seeded
+  order was "stable for a key SET regardless of the order it was written in".
+  That was an artifact of sampling ONE run: re-running the identical probe four
+  times gave `[z, c, m]` once and `[m, c, z]` three times. It is not stable
+  across runs at all, which settles it as non-reproducible rather than merely
+  awkward — both servers sort those fields, and that is the right call. The
+  update-added half IS deterministic (sorted) and is what got ported. The lesson
+  is the one this file already states: a conclusion drawn from a single run of a
+  probe is not a measurement.
 
 - [ ] **`nModified` counts a `$min`/`$max` that declined to write (2 shapes,
   2026-09-03).** `{$min: {a: 5}}` and `{$min: {a: -Infinity}}` over `a: NaN`

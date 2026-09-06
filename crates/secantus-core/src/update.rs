@@ -1181,6 +1181,21 @@ pub fn conflicting_update_paths(update: &Document) -> Option<(String, String)> {
     }
 }
 
+/// Set `value` at a dotted `path`, creating the intermediate documents.
+///
+/// The public face of `paths::set_path`, which the storage layer needs when it
+/// seeds an upsert from the filter's equalities: mongod builds the nesting, so
+/// `{"a.b.c": 5}` seeds `{a: {b: {c: 5}}}` and NOT a literal dotted key. A
+/// literal one is a document mongod cannot produce, and it does not match the
+/// query that created it -- which made the same upsert, run twice, insert two
+/// documents.
+///
+/// Returns `Fallback::Defer` for a path the pure engine will not build (only
+/// the list-growth cap), rather than `paths`' bare `Result<(), ()>`.
+pub fn set_document_path(doc: &mut Document, path: &str, value: Bson) -> R<()> {
+    paths::set_path(doc, path, value).map_err(|()| Fallback::Defer)
+}
+
 /// Is this an operator update, or a replacement document?
 ///
 /// mongod decides on the **first key alone** (probed 8.2.11, 2026-09-06), and
