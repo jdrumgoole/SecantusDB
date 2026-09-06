@@ -378,9 +378,26 @@ fn field_matches(
     coll: Option<&Collation>,
     field: &str,
 ) -> R {
+    field_matches_descend(values, cond, coll, field, true)
+}
+
+/// [`field_matches`] with the implicit one-level array traversal switchable.
+///
+/// mongod traverses an array ONCE per path step, and `$elemMatch` spends that
+/// step choosing the element -- so inside it the element is a terminal value
+/// and nothing below descends into it again. With `descend = true` this is
+/// exactly `field_matches`; `op_elem_match` is the only caller that passes
+/// `false`. Mirrors `secantus.query._field_matches(..., descend=)`.
+fn field_matches_descend(
+    values: &[Option<&Bson>],
+    cond: &Bson,
+    coll: Option<&Collation>,
+    field: &str,
+    descend: bool,
+) -> R {
     match cond {
         // A bare BSON regex literal: `{field: /pat/flags}` matches as a pattern.
-        Bson::RegularExpression(_) => op_regex(values, cond, None),
+        Bson::RegularExpression(_) => op_regex(values, cond, None, descend),
         Bson::Document(d) if is_operator_dict(d) => {
             // Validate the $regex/$options pair up front (mongod parse-time),
             // before any operator can short-circuit the match — mirrors the pure
@@ -397,7 +414,7 @@ fn field_matches(
                     // `$options` is a sibling modifier of `$regex`, validated above.
                     "$options" => continue,
                     "$regex" => {
-                        if !op_regex(values, arg, d.get("$options"))? {
+                        if !op_regex(values, arg, d.get("$options"), descend)? {
                             return Ok(false);
                         }
                     }
@@ -431,7 +448,7 @@ fn field_matches(
                         }
                     }
                     _ => {
-                        if !op_matches(values, op, arg, coll, field)? {
+                        if !op_matches(values, op, arg, coll, field, descend)? {
                             return Ok(false);
                         }
                     }
@@ -439,7 +456,7 @@ fn field_matches(
             }
             Ok(true)
         }
-        _ => eq_with_array(values, cond, coll),
+        _ => eq_with_array(values, cond, coll, descend),
     }
 }
 
@@ -448,7 +465,7 @@ fn field_matches(
 /// values). `pattern` is a `String` or a BSON `RegularExpression`; `options`
 /// is the optional sibling `$options` string. A non-string pattern/options, or
 /// a pattern neither regex engine can compile, signals `Fallback`.
-fn op_regex(values: &[Option<&Bson>], pattern: &Bson, options: Option<&Bson>) -> R {
+fn op_regex(values: &[Option<&Bson>], pattern: &Bson, options: Option<&Bson>, descend: bool) -> R {
     // mongod takes a string or a BSON regex and nothing else.
     if !matches!(pattern, Bson::String(_) | Bson::RegularExpression(_)) {
         return Err(Fallback::mongo(2, "$regex has to be a string"));
@@ -486,7 +503,7 @@ fn op_regex(values: &[Option<&Bson>], pattern: &Bson, options: Option<&Bson>) ->
         if hit(v) {
             return Ok(true);
         }
-        if let Bson::Array(arr) = v {
+        if let (true, Bson::Array(arr)) = (descend, v) {
             if arr.iter().any(&hit) {
                 return Ok(true);
             }
@@ -501,6 +518,7 @@ fn op_matches(
     arg: &Bson,
     coll: Option<&Collation>,
     field: &str,
+    descend: bool,
 ) -> R {
     // mongod rejects a regex bound on a non-equality predicate at PARSE time
     // (probed 8.2.11, 2026-09-01) -- a regex is only meaningful under equality,
@@ -518,9 +536,9 @@ fn op_matches(
         }
     }
     match op {
-        "$eq" => eq_with_array(values, arg, coll),
-        "$ne" => Ok(!eq_with_array(values, arg, coll)?),
-        "$gt" => cmp_op(values, arg, coll, |o| o == Ordering::Greater),
+        "$eq" => eq_with_array(values, arg, coll, descend),
+        "$ne" => Ok(!eq_with_array(values, arg, coll, descend)?),
+        "$gt" => cmp_op(values, arg, coll, |o| o == Ordering::Greater, descend),
         // `$gte`/`$lte: null` match null + missing (like `$eq: null`); a plain
         // BSON-order compare against null would spuriously match everything.
         // A NaN bound: mongod's comparison order treats NaN as EQUAL to NaN --
@@ -531,19 +549,19 @@ fn op_matches(
         // (probed 8.2.11, 2026-09-06). Same shape as the NaN gate on partial
         // indexes: NaN is inside the numeric bracket, and mongod's two orders
         // disagree about it.
-        "$gte" | "$lte" if is_nan_bound(arg) => eq_with_array(values, arg, coll),
-        "$gte" if matches!(arg, Bson::Null) => eq_with_array(values, arg, coll),
-        "$gte" => cmp_op(values, arg, coll, |o| o != Ordering::Less),
-        "$lt" => cmp_op(values, arg, coll, |o| o == Ordering::Less),
-        "$lte" if matches!(arg, Bson::Null) => eq_with_array(values, arg, coll),
-        "$lte" => cmp_op(values, arg, coll, |o| o != Ordering::Greater),
+        "$gte" | "$lte" if is_nan_bound(arg) => eq_with_array(values, arg, coll, descend),
+        "$gte" if matches!(arg, Bson::Null) => eq_with_array(values, arg, coll, descend),
+        "$gte" => cmp_op(values, arg, coll, |o| o != Ordering::Less, descend),
+        "$lt" => cmp_op(values, arg, coll, |o| o == Ordering::Less, descend),
+        "$lte" if matches!(arg, Bson::Null) => eq_with_array(values, arg, coll, descend),
+        "$lte" => cmp_op(values, arg, coll, |o| o != Ordering::Greater, descend),
         "$in" => {
             let Some(arr) = arg.as_array() else {
                 return Err(Fallback::mongo(2, "$in needs an array"));
             };
             in_elements_ok(arr)?;
             for cand in arr {
-                if in_candidate_matches(values, cand, coll)? {
+                if in_candidate_matches(values, cand, coll, descend)? {
                     return Ok(true);
                 }
             }
@@ -555,7 +573,7 @@ fn op_matches(
             };
             in_elements_ok(arr)?;
             for cand in arr {
-                if in_candidate_matches(values, cand, coll)? {
+                if in_candidate_matches(values, cand, coll, descend)? {
                     return Ok(false);
                 }
             }
@@ -592,11 +610,11 @@ fn op_matches(
                     ));
                 }
             }
-            Ok(!field_matches(values, arg, coll, field)?)
+            Ok(!field_matches_descend(values, arg, coll, field, descend)?)
         }
-        "$type" => op_type(values, arg, field),
+        "$type" => op_type(values, arg, field, descend),
         "$size" => op_size(values, arg),
-        "$all" => op_all(values, arg, field),
+        "$all" => op_all(values, arg, field, descend),
         "$elemMatch" => {
             if !matches!(arg, Bson::Document(_)) {
                 return Err(Fallback::mongo(2, "$elemMatch needs an Object"));
@@ -605,10 +623,10 @@ fn op_matches(
         }
         "$mod" => op_mod(values, arg),
         // all mask bits SET / any SET / all CLEAR / any CLEAR.
-        "$bitsAllSet" => op_bits(values, arg, |b| b, true, op, field),
-        "$bitsAnySet" => op_bits(values, arg, |b| b, false, op, field),
-        "$bitsAllClear" => op_bits(values, arg, |b| !b, true, op, field),
-        "$bitsAnyClear" => op_bits(values, arg, |b| !b, false, op, field),
+        "$bitsAllSet" => op_bits(values, arg, |b| b, true, op, field, descend),
+        "$bitsAnySet" => op_bits(values, arg, |b| b, false, op, field, descend),
+        "$bitsAllClear" => op_bits(values, arg, |b| !b, true, op, field, descend),
+        "$bitsAnyClear" => op_bits(values, arg, |b| !b, false, op, field, descend),
         "$geoWithin" => crate::geo::op_geo_within(values, arg),
         "$geoIntersects" => crate::geo::op_geo_intersects(values, arg),
         // The legacy 2d *sibling* `$maxDistance`/`$minDistance` form is handled in
@@ -654,15 +672,25 @@ fn in_elements_ok(arr: &[Bson]) -> Result<(), Fallback> {
     Ok(())
 }
 
-fn in_candidate_matches(values: &[Option<&Bson>], cand: &Bson, coll: Option<&Collation>) -> R {
+fn in_candidate_matches(
+    values: &[Option<&Bson>],
+    cand: &Bson,
+    coll: Option<&Collation>,
+    descend: bool,
+) -> R {
     if matches!(cand, Bson::RegularExpression(_)) {
-        op_regex(values, cand, None)
+        op_regex(values, cand, None, descend)
     } else {
-        eq_with_array(values, cand, coll)
+        eq_with_array(values, cand, coll, descend)
     }
 }
 
-fn eq_with_array(values: &[Option<&Bson>], expected: &Bson, coll: Option<&Collation>) -> R {
+fn eq_with_array(
+    values: &[Option<&Bson>],
+    expected: &Bson,
+    coll: Option<&Collation>,
+    descend: bool,
+) -> R {
     for v in values {
         match v {
             None => {
@@ -674,7 +702,7 @@ fn eq_with_array(values: &[Option<&Bson>], expected: &Bson, coll: Option<&Collat
                 if eq_scalar(val, expected, coll)? {
                     return Ok(true);
                 }
-                if let Bson::Array(arr) = val {
+                if let (true, Bson::Array(arr)) = (descend, val) {
                     for e in arr {
                         if eq_scalar(e, expected, coll)? {
                             return Ok(true);
@@ -830,6 +858,7 @@ fn cmp_op(
     target: &Bson,
     coll: Option<&Collation>,
     pred: fn(Ordering) -> bool,
+    descend: bool,
 ) -> R {
     for v in values {
         let Some(val) = v else { continue };
@@ -843,7 +872,7 @@ fn cmp_op(
                 return Ok(true);
             }
         }
-        if let Bson::Array(arr) = val {
+        if let (true, Bson::Array(arr)) = (descend, val) {
             // Multikey field: also match if any *element* satisfies the bound
             // (a scalar-bound query against an array-valued field). The
             // whole-array compare above covers the array-bound case.
@@ -1970,7 +1999,7 @@ fn format_g(d: f64) -> String {
     }
 }
 
-fn op_type(values: &[Option<&Bson>], spec: &Bson, field: &str) -> R {
+fn op_type(values: &[Option<&Bson>], spec: &Bson, field: &str, descend: bool) -> R {
     // spec is a single alias/code or an array of them. A non-alias/code spec
     // element (e.g. a float code) is pathological -> Python.
     let specs: Vec<&Bson> = match spec {
@@ -1992,7 +2021,7 @@ fn op_type(values: &[Option<&Bson>], spec: &Bson, field: &str) -> R {
         if specs.iter().any(|s| matches_type(val, s)) {
             return Ok(true);
         }
-        if let Bson::Array(arr) = val {
+        if let (true, Bson::Array(arr)) = (descend, val) {
             for e in arr {
                 if specs.iter().any(|s| matches_type(e, s)) {
                     return Ok(true);
@@ -2009,7 +2038,7 @@ fn op_type(values: &[Option<&Bson>], spec: &Bson, field: &str) -> R {
 /// element. Element equality uses Python `==` (`expressions::py_eq` — numeric
 /// bridge + bool-as-int), matching `secantus.query._op_all`. Regex elements
 /// (which Python matches as patterns) defer to Python.
-fn op_all(values: &[Option<&Bson>], required: &Bson, field: &str) -> R {
+fn op_all(values: &[Option<&Bson>], required: &Bson, field: &str, descend: bool) -> R {
     let field_name = field;
     let Bson::Array(required) = required else {
         return Err(Fallback::mongo(2, "$all needs an array"));
@@ -2038,9 +2067,11 @@ fn op_all(values: &[Option<&Bson>], required: &Bson, field: &str) -> R {
         let Some(field) = v else { continue };
         // The elements to match each required clause against: the array's own
         // elements, or the scalar itself as a single element.
-        let elems: &[Bson] = match field {
-            Bson::Array(arr) => arr,
-            scalar => std::slice::from_ref(scalar),
+        let elems: &[Bson] = match (descend, field) {
+            (true, Bson::Array(arr)) => arr,
+            // `descend = false`: the value IS the single element to match --
+            // inside `$elemMatch` the array step is already spent.
+            (_, scalar) => std::slice::from_ref(scalar),
         };
         let is_array = matches!(field, Bson::Array(_));
         let mut all_present = true;
@@ -2067,7 +2098,7 @@ fn op_all(values: &[Option<&Bson>], required: &Bson, field: &str) -> R {
             let mut found = false;
             for e in elems {
                 let matched = match r {
-                    Bson::RegularExpression(_) => op_regex(&[Some(e)], r, None)?,
+                    Bson::RegularExpression(_) => op_regex(&[Some(e)], r, None, true)?,
                     _ => expressions::py_eq(e, r)?,
                 };
                 if matched {
@@ -2138,8 +2169,13 @@ fn op_elem_match(values: &[Option<&Bson>], cond: &Bson, field: &str) -> R {
         let Some(Bson::Array(arr)) = v else { continue };
         for elem in arr {
             if scalar_form {
-                // Python's $elemMatch passes no collation to the inner match.
-                if field_matches(&[Some(elem)], cond, None, field)? {
+                // `descend = false`: the element is a TERMINAL value here.
+                // mongod traverses an array once per path step and `$elemMatch`
+                // already spent it, so `{$elemMatch: {$gt: 1}}` must not look
+                // inside an element that is itself an array. It did, and matched
+                // `[[5]]` and `[1, [2, [3]]]`, which mongod matches neither
+                // (probed 8.2.11, 2026-09-06). No collation, as on the Python side.
+                if field_matches_descend(&[Some(elem)], cond, None, field, false)? {
                     return Ok(true);
                 }
             } else if let Bson::Document(ed) = elem {
@@ -2147,6 +2183,13 @@ fn op_elem_match(values: &[Option<&Bson>], cond: &Bson, field: &str) -> R {
                 if matches(ed, condd, &Document::new(), None)? {
                     return Ok(true);
                 }
+            } else if matches!(elem, Bson::Array(_)) && condd.is_empty() {
+                // An empty criteria imposes no field requirement, so an ARRAY
+                // element satisfies it as readily as a subdocument does --
+                // `{$elemMatch: {}}` returns those documents on mongod and this
+                // considered only documents. A NON-empty criteria still cannot
+                // match an array: it has no fields to name.
+                return Ok(true);
             }
         }
     }
@@ -2462,6 +2505,7 @@ fn op_bits(
     all: bool,
     op: &str,
     field: &str,
+    descend: bool,
 ) -> R {
     let mask = resolve_bitmask(arg, op, field)?;
     let positions = mask.set_positions();
@@ -2482,7 +2526,7 @@ fn op_bits(
         // An ARRAY field matches element-wise, one level deep -- the multikey
         // rule every other operator follows. Without it a document holding
         // `[1, 4]` was skipped entirely.
-        if let Bson::Array(arr) = val {
+        if let (true, Bson::Array(arr)) = (descend, val) {
             for elem in arr {
                 if let Some(bits) = bit_source(elem) {
                     if test(&bits) {
@@ -2517,6 +2561,56 @@ pub fn is_nan_bson(b: &Bson) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// `$elemMatch` traverses an array ONCE. The operator form used to look
+    /// inside an element that was itself an array, and the criteria form could
+    /// not reach an array element at all. Probed 8.2.11 (2026-09-06).
+    #[test]
+    fn elem_match_treats_the_element_as_terminal() {
+        let nested = doc! {"x": [[5]]};
+        let flat = doc! {"x": [5]};
+        let ragged = doc! {"x": [1, [2, [3]]]};
+        let empty = Document::new();
+
+        let q = |c: bson::Bson| doc! {"x": {"$elemMatch": c}};
+        // The OPERATOR form: an array element is not > 1, so a nested array
+        // must not match through it.
+        for d in [&nested, &ragged] {
+            assert!(
+                !matches(d, &q(bson::bson!({"$gt": 1})), &empty, None).unwrap(),
+                "{d:?} must not match $elemMatch {{$gt: 1}}"
+            );
+        }
+        assert!(matches(&flat, &q(bson::bson!({"$gt": 1})), &empty, None).unwrap());
+        // ...but `$type` still sees the element as the array it is.
+        assert!(matches(&nested, &q(bson::bson!({"$type": "array"})), &empty, None).unwrap());
+        assert!(!matches(&flat, &q(bson::bson!({"$type": "array"})), &empty, None).unwrap());
+
+        // The CRITERIA form: an empty criteria asks nothing, so an array
+        // element satisfies it; a named field cannot.
+        assert!(matches(&nested, &q(bson::bson!({})), &empty, None).unwrap());
+        assert!(!matches(&flat, &q(bson::bson!({})), &empty, None).unwrap());
+        let arr_of_doc = doc! {"x": [[{"y": 5}]]};
+        assert!(matches(&arr_of_doc, &q(bson::bson!({})), &empty, None).unwrap());
+        assert!(
+            !matches(&arr_of_doc, &q(bson::bson!({"y": 5})), &empty, None).unwrap(),
+            "an ARRAY element has no field `y` for the criteria to name"
+        );
+        let doc_elem = doc! {"x": [{"y": 5}]};
+        assert!(matches(&doc_elem, &q(bson::bson!({"y": 5})), &empty, None).unwrap());
+    }
+
+    /// The one-level descent OUTSIDE `$elemMatch` is untouched -- the flag
+    /// defaults on, and a plain field predicate still traverses.
+    #[test]
+    fn the_ordinary_one_level_descent_is_unchanged() {
+        let empty = Document::new();
+        let d = doc! {"x": [5]};
+        assert!(matches(&d, &doc! {"x": 5}, &empty, None).unwrap());
+        assert!(matches(&d, &doc! {"x": {"$gt": 4}}, &empty, None).unwrap());
+        assert!(matches(&d, &doc! {"x": {"$in": [5]}}, &empty, None).unwrap());
+        assert!(matches(&d, &doc! {"x": {"$type": "number"}}, &empty, None).unwrap());
+    }
+
     /// A NaN range bound. mongod treats NaN as EQUAL to NaN in its comparison
     /// order, so an INCLUSIVE bound matches it and a strict one does not
     /// (probed 8.2.11, 2026-09-06). IEEE makes every NaN comparison false, so
