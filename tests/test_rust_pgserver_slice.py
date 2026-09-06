@@ -2251,3 +2251,84 @@ def test_pg_typeof_reports_the_type_the_client_declared(home: Path) -> None:
         # A cast gives an untyped parameter a type.
         cur.execute("select pg_typeof(%s::int4)", ("5",))
         assert cur.fetchone()[0] == "integer"
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+def test_an_array_takes_its_type_from_its_elements(home: Path, binary: bool) -> None:
+    """…not from the values it happens to hold.
+
+    The describe pass sees no values at all — every parameter is NULL there —
+    so an array typed from its values described `array[%s::float4]` as
+    `text[]`, and the client decoded floats as text because the row description
+    is what it believes.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor(binary=binary)
+        for sql, params, want, oid in [
+            ("select array[1,2]", (), [1, 2], 1007),
+            ("select array[1::int2]", (), [1], 1005),
+            ("select array[1::int8]", (), [1], 1016),
+            ("select array[1::float4]", (), [1.0], 1021),
+            ("select array[true]", (), [True], 1000),
+            ("select array['a'::text]", (), ["a"], 1009),
+            ("select array[%s::float4]", ("42",), [42.0], 1021),
+            ("select array[%s::int8]", (5,), [5], 1016),
+            ("select array[%s]", (5,), [5], 1005),
+            # Mixed numerics widen, in PostgreSQL's own order.
+            ("select array[1, 1.5]", (), [Decimal("1"), Decimal("1.5")], 1231),
+            ("select array[1::float4, 1.5]", (), [1.0, 1.5], 1021),
+            ("select array[1::int8, 1::int2]", (), [1, 1], 1016),
+            # A bare NULL contributes no type.
+            ("select array[null, 1]", (), [None, 1], 1007),
+        ]:
+            cur.execute(sql, params)
+            assert cur.fetchone()[0] == want, sql
+            assert cur.pgresult.ftype(0) == oid, sql
+
+
+def test_a_quoted_brace_is_a_string_not_a_nested_array(home: Path) -> None:
+    """`'{"{"}'::text[]` is one element whose text is a brace.
+
+    Only an UNQUOTED `{` opens a sub-array. Treating a quoted one as a nested
+    array answered "malformed array literal" for the element — and `{` is an
+    ordinary member of any corpus that walks the ASCII range, so it failed
+    every round-trip test of a text array.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for sql, params, want in [
+            ("select %s::text[]", (["{"],), ["{"]),
+            ("select %s::text[]", (["}"],), ["}"]),
+            ("select %s::text[]", (["{1,2}"],), ["{1,2}"]),
+            ("""select '{"{"}'::text[]""", (), ["{"]),
+            ("select %s::varchar[]", (["{"],), ["{"]),
+            (
+                "select %s::text[]",
+                ([chr(i) for i in range(1, 128)],),
+                [chr(i) for i in range(1, 128)],
+            ),
+            # U+0085 and U+00A0 are whitespace to Rust and NOT to PostgreSQL,
+            # so trimming an element with `str::trim` returned the empty string
+            # for both — a character in, nothing out, and invisible to any test
+            # whose alphabet is ASCII.
+            ("select %s::text[]", (["\u0085", "\u00a0"],), ["\u0085", "\u00a0"]),
+            (
+                "select %s::text[]",
+                ([chr(i) for i in range(1, 256)],),
+                [chr(i) for i in range(1, 256)],
+            ),
+        ]:
+            cur.execute(sql, params)
+            assert cur.fetchone()[0] == want, sql
+
+
+def test_an_array_of_dates_is_described_as_one(home: Path) -> None:
+    """A date array was described as `varchar`, so a client read back strings."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("select array['2026-01-01'::date]")
+        assert cur.fetchone()[0] == [dt.date(2026, 1, 1)]
+        assert cur.pgresult.ftype(0) == 1182
+        cur.execute("select array['2026-01-01 12:00'::timestamp]")
+        assert cur.fetchone()[0] == [dt.datetime(2026, 1, 1, 12)]
+        assert cur.pgresult.ftype(0) == 1115

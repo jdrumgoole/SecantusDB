@@ -456,6 +456,19 @@ fn wire_type(pg_type: &str) -> Type {
         "numeric[]" | "decimal[]" => Type::NUMERIC_ARRAY,
         "text[]" => Type::TEXT_ARRAY,
         "varchar[]" => Type::VARCHAR_ARRAY,
+        // The rest of the array types this server can NAME. Without these an
+        // array of dates was described as `varchar`, so a client read back
+        // strings where PostgreSQL hands it dates.
+        "date[]" => Type::DATE_ARRAY,
+        "time[]" => Type::TIME_ARRAY,
+        "timestamp[]" => Type::TIMESTAMP_ARRAY,
+        "timestamptz[]" => Type::TIMESTAMPTZ_ARRAY,
+        "timetz[]" => Type::TIMETZ_ARRAY,
+        "interval[]" => Type::INTERVAL_ARRAY,
+        "json[]" => Type::JSON_ARRAY,
+        "jsonb[]" => Type::JSONB_ARRAY,
+        "bpchar[]" | "char[]" | "character[]" => Type::BPCHAR_ARRAY,
+        "name[]" => Type::NAME_ARRAY,
         // Everything else renders as text for now; P4 owns the real type map.
         _ => Type::VARCHAR,
     }
@@ -2441,6 +2454,31 @@ fn encode_field_value(
     if field.format() == FieldFormat::Binary {
         return encode_binary(enc, field.datatype(), v);
     }
+    // An ARRAY goes through the typed encoder in text too, because the element
+    // conversion has to come from the COLUMN's type rather than from the first
+    // element's: `array[1, 1.5]` is a `numeric[]` whose first element is an
+    // integer, and reading the type off that element turned the decimal into a
+    // NULL.
+    if let (Some(Bson::Array(items)), Some(element)) =
+        (v, element_of_array_oid(field.datatype().oid()))
+    {
+        if binary_encodable(field.datatype()) {
+            return encode_binary(enc, field.datatype(), v);
+        }
+        // A date, timestamp or interval array: those are carried as canonical
+        // TEXT here, so the elements go out as the strings they already are.
+        // (`encode_binary` refuses them on purpose -- their BINARY layouts are
+        // not implemented, and this arm only runs for a text column.)
+        let _ = element;
+        let rendered: Vec<Option<String>> = items
+            .iter()
+            .map(|x| match x {
+                Bson::Null => None,
+                other => Some(secantus_pgplan::value_text(other)),
+            })
+            .collect();
+        return enc.encode_field(&rendered);
+    }
     encode_value(enc, v)
 }
 
@@ -2870,6 +2908,14 @@ fn element_of_array_oid(oid: u32) -> Option<&'static str> {
         1231 => "numeric",
         1115 => "timestamp",
         1182 => "date",
+        1183 => "time",
+        1185 => "timestamptz",
+        1270 => "timetz",
+        1187 => "interval",
+        199 => "json",
+        3807 => "jsonb",
+        1014 => "bpchar",
+        1003 => "name",
         _ => return None,
     })
 }

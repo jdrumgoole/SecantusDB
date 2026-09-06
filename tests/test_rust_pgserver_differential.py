@@ -117,6 +117,24 @@ SETUP = [
 ]
 
 QUERIES = [
+    # An array's TYPE comes from its elements, and the mixed-numeric cases
+    # widen in PostgreSQL's own order (int2 < int4 < int8 < numeric < float4 <
+    # float8). A NULL literal contributes no type.
+    "SELECT array[1::int2]",
+    "SELECT array[1::int8]",
+    "SELECT array[1::float4]",
+    "SELECT array[1, 1.5]",
+    "SELECT array[1::int8, 1.5]",
+    "SELECT array[1::float4, 1.5]",
+    "SELECT array[1.5::numeric, 1::float4]",
+    "SELECT array[1::float4, 1::float8]",
+    "SELECT array[1::int8, 1::int2]",
+    "SELECT array[null, 1]",
+    "SELECT array['2026-01-01'::date]",
+    "SELECT array['2026-01-01 12:00'::timestamp]",
+    # A QUOTED brace is the string, not the start of a nested array.
+    """SELECT '{"{"}'::text[]""",
+    """SELECT '{"a,b","q x"}'::text[]""",
     # A series' bounds, which clients write as parameters far more often than
     # as literals; the parameterised shapes are in PARAMETERISED below.
     "SELECT * FROM generate_series(1, null)",
@@ -703,6 +721,19 @@ def test_query_matches_postgres(
 # answer rather than a missing feature, and no literal-SQL case could catch it.
 PARAMETERISED = [
     ("SELECT * FROM generate_series(1, %s)", (4,)),
+    # An array constructor over a PARAMETER: the describe pass has no value to
+    # read a type off, so this is where a value-derived array type went wrong.
+    ("SELECT array[%s::float4]", ("42",)),
+    ("SELECT array[%s::int8]", (5,)),
+    ("SELECT array[%s]", (5,)),
+    ("SELECT array[%s::float4, 1::float4]", ("42",)),
+    ("SELECT %s::text[]", (["{"],)),
+    ("SELECT %s::text[]", (["}", "{1,2}", "a,b", "", "NULL", None],)),
+    ("SELECT %s::varchar[]", (["{"],)),
+    # Every byte, twice over: U+0085 and U+00A0 are whitespace to Rust and not
+    # to PostgreSQL, and were being trimmed out of an element entirely.
+    ("SELECT %s::text[]", ([chr(i) for i in range(1, 256)],)),
+    ("SELECT %s::name[]", ([chr(i) for i in range(1, 256)],)),
     ("SELECT * FROM generate_series(%s, 10, %s)", (1, 3)),
     ("SELECT generate_series(1, %s)", (3,)),
     ("SELECT * FROM generate_series(1, %s)", (None,)),
