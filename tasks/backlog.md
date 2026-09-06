@@ -4688,22 +4688,62 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   the compiler enumerates every site it misses. Under three hours end to end,
   including the probes.
 
-- [ ] **Both servers report `{$set: {"": 1}}` as a success (2026-09-06).**
-  mongod answers `56 An empty update path is not valid.`; the Python server and
-  the Rust server both accept it and report `ok: 1`. Found while sweeping the
-  update error surface for the wrapper work above — it is the one shape in that
-  17-case sweep where BOTH servers diverge from mongod on the code, not just on
-  the message. The Rust engine already raises exactly this error for `$rename`
-  (`crates/secantus-core/src/update.rs`, the `Fallback::mongo(56, …)` site), so
-  the message exists and only the `$set` / general-path gate is missing.
+- [x] **RESOLVED (2026-09-06): empty update paths, and the ORDER of the three
+  parse checks.** The two entries that stood here (`{$set: {"": 1}}` reported as
+  a success; `$addToSet`'s `$each` answering 2 where mongod answers 14) are
+  fixed on BOTH servers, and the first was much wider than filed — a sweep of
+  ten operators found **twenty** shapes, half of them silently storing a
+  document with an empty field name, which is the "user-supplied path used as a
+  dict key" shape this file's §"three bug shapes" already names.
 
-- [ ] **`$addToSet` with a non-array `$each` answers 2, mongod answers 14
-  (2026-09-06).** `{$addToSet: {a: {$each: 5}}}` -> mongod
-  `14 The argument to $each in $addToSet must be an array but it was of type
-  int`; both servers send the identical message under code **2**. Message
-  already matches, so this is a one-constant change on each side
-  (`crates/secantus-core/src/update.rs` and `src/secantus/update.py`). Same
-  sweep as the entry above.
+  mongod distinguishes two messages (`An empty update path is not valid.` for a
+  wholly empty path; `The update path 'a.' contains an empty field name, which
+  is not allowed.` for an empty component), applies both to every operator and
+  to both ends of a `$rename`, and treats them as PARSE errors — reported even
+  when the filter matches nothing, and never under the executor wrapper.
+
+  **The ordering turned out to be the load-bearing part.** mongod validates a
+  spec in ONE walk in document order — operator name, then each path for
+  emptiness, then for a conflict — and reports the first offender. Both servers
+  ran those as separate passes, so an unknown modifier anywhere preempted an
+  empty path or a conflict that mongod reports first. Six discriminating pairs
+  are pinned in `tests/test_update_empty_paths.py` and in
+  `update::tests::the_first_parse_fault_in_document_order_wins`. The Rust
+  command layer's private `KNOWN_UPDATE_OPS` copy is gone; `crud.rs` delegates
+  to `secantus_core::update::update_spec_error`, the shared walk.
+
+  A REPLACEMENT is exempt: `replace_one({_id: 1}, {"": 1})` really does store an
+  empty field name on mongod, so only operator paths are validated.
+
+- [ ] **mongod 8.x decides operator-vs-replacement form by the FIRST key, and
+  both servers get the replacement half wrong (2 shapes, 2026-09-06).** Measured
+  against 8.2.11 while fixing the entry above:
+
+  ```
+  {$set: {a: 1}, z: 2}   mongod:  9 Unknown modifier: z …          both servers: same
+  {z: 2, $set: {a: 1}}   mongod: 52 Plan executor error during update :: caused
+                                    by :: The dollar ($) prefixed field '$set'
+                                    in '$set' is not allowed in the context of
+                                    an update's replacement document. Consider
+                                    using an aggregation pipeline with
+                                    $replaceWith.
+                         both servers:  9 Unknown modifier: z …
+  ```
+
+  So mongod does not ask "does this mix operators and fields"; it takes the
+  FIRST key as deciding the form, and then complains in that form's vocabulary —
+  a `$`-prefixed key inside a replacement is `DollarPrefixedFieldName` (52),
+  wrapped as an execution-time error. Both servers instead use
+  `any(k.startswith("$"))` to pick the form and answer 9 either way.
+
+  **The comment on the Python `_unknown_modifier` helper says "probed 6.0.16"**,
+  which is exactly the staleness hazard CLAUDE.md warns about: the message it
+  records is still right for the operator-form half and wrong for the other.
+  Deliberately NOT folded into the 2026-09-06 batch — it changes which FORM an
+  update is parsed as, which reaches replacement handling and `_id` immutability,
+  and it deserves its own probe of the whole `DollarPrefixedFieldName` family
+  (nested `$`-keys in a replacement, `$`-keys in an inserted document, and
+  whether 52 is really execution-time or just rendered that way).
 
 - [ ] **`nModified` counts a `$min`/`$max` that declined to write (2 shapes,
   2026-09-03).** `{$min: {a: 5}}` and `{$min: {a: -Infinity}}` over `a: NaN`

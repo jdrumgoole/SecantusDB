@@ -449,7 +449,21 @@ fn push_apply(arr: &mut Vec<Bson>, value: &Bson) -> R<()> {
     }
     let each = match m.get("$each") {
         Some(Bson::Array(a)) => a,
-        _ => return Err(Fallback::Defer),
+        // mongod names the type here, and words it differently from the
+        // `$addToSet` sibling above: `$push` keeps the colon before the type and
+        // answers code 2 where `$addToSet` answers 14. Both verbatim from an
+        // 8.2.11 probe (2026-09-06). This used to defer, which on the standalone
+        // Rust server told the client the server could not do `$push`.
+        Some(v) => {
+            return Err(Fallback::mongo(
+                2,
+                format!(
+                    "The argument to $each in $push must be an array but it was of type: {}",
+                    crate::query::bson_type_name(v)
+                ),
+            ));
+        }
+        None => return Err(Fallback::Defer),
     };
     match m.get("$position") {
         None => arr.extend(each.iter().cloned()),
@@ -928,7 +942,7 @@ fn apply_op(
                         Some(Bson::Array(a)) => a.clone(),
                         other => {
                             return Err(Fallback::mongo(
-                                2,
+                                14,
                                 format!(
                                     "The argument to $each in $addToSet must be an array but \
                                      it was of type {}",
@@ -1076,8 +1090,18 @@ pub fn apply_update_with(
     // (code 40) rather than applied. Defer so the Python engine raises the exact
     // error; the Rust server names it via `path_conflict_error` (it has no
     // Python to fall back to).
-    if conflicting_update_paths(update).is_some() {
-        return Err(Fallback::Defer);
+    match update_path_fault(update) {
+        // A path conflict still defers: the Python engine raises the exact
+        // error, and on the Rust server `path_conflict_error` recovers it in
+        // the storage layer. The other two name themselves -- a defer has no
+        // Python behind it there. All are PARSE errors, so they stay bare (no
+        // executor wrapper).
+        Some(UpdatePathFault::Conflict { .. }) => return Err(Fallback::Defer),
+        Some(_) => {
+            let (code, message) = update_spec_error(update).expect("a fault was just observed");
+            return Err(Fallback::mongo(code, message));
+        }
+        None => {}
     }
     let has_op = update.keys().any(|k| k.starts_with('$'));
     if has_op {
@@ -1139,8 +1163,99 @@ pub fn apply_update_with(
 /// `$rename` claims BOTH ends -- it writes one and removes the other -- except
 /// when they are equal, which mongod reports with its own dedicated error.
 pub fn conflicting_update_paths(update: &Document) -> Option<(String, String)> {
+    match update_path_fault(update) {
+        Some(UpdatePathFault::Conflict { offending, at }) => Some((offending, at)),
+        _ => None,
+    }
+}
+
+/// What is wrong with an update's operator paths, if anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdatePathFault {
+    /// A path is empty, or has an empty component. mongod's `EmptyFieldName`
+    /// (56), carrying the message it uses for this shape.
+    Empty(String),
+    /// Two operators target overlapping paths -- mongod's code 40.
+    Conflict { offending: String, at: String },
+    /// A top-level key that is not an update modifier mongod knows -- either an
+    /// unrecognised `$`-operator or a bare field among the operators. mongod
+    /// has ONE message for both and names the offending key without a `$` for
+    /// the bare one. Its `FailedToParse` (9).
+    UnknownModifier(String),
+}
+
+/// Update modifiers mongod accepts. Mirrors `secantus.update._KNOWN_UPDATE_OPS`
+/// and the `KNOWN_UPDATE_OPS` the command crate used to keep privately.
+pub const KNOWN_UPDATE_OPS: [&str; 15] = [
+    "$set",
+    "$setOnInsert",
+    "$unset",
+    "$currentDate",
+    "$inc",
+    "$mul",
+    "$min",
+    "$max",
+    "$push",
+    "$addToSet",
+    "$pull",
+    "$pullAll",
+    "$pop",
+    "$rename",
+    "$bit",
+];
+
+/// The `(code, message)` mongod answers for a malformed update SPEC, or `None`
+/// if the spec's operators and paths are well formed. The parse-time half of
+/// update validation: mongod reports every one of these even when the filter
+/// matches nothing (probed 8.2.11, 2026-09-06), so the command layer runs it
+/// before going near a document.
+pub fn update_spec_error(update: &Document) -> Option<(i32, String)> {
+    match update_path_fault(update)? {
+        UpdatePathFault::UnknownModifier(k) => Some((
+            9,
+            format!(
+                "Unknown modifier: {k}. Expected a valid update modifier or \
+                 pipeline-style update specified as an array"
+            ),
+        )),
+        UpdatePathFault::Empty(message) => Some((56, message)),
+        UpdatePathFault::Conflict { offending, at } => Some((
+            40,
+            format!("Updating the path '{offending}' would create a conflict at '{at}'"),
+        )),
+    }
+}
+
+/// The FIRST thing wrong with an update's operator paths, in document order.
+///
+/// The empty-path and conflict checks share one walk because mongod interleaves
+/// them and the first offender wins (probed 8.2.11, 2026-09-06):
+///
+/// ```text
+/// {$inc: {"": 1},  $set: {a: 1, "a.b": 1}}   -> 56, the empty path
+/// {$set: {a: 1, "a.b": 1},  $inc: {"": 1}}   -> 40, the conflict
+/// ```
+///
+/// Running emptiness as a separate earlier pass answers 56 for both.
+///
+/// The empty-path half is new in 2026-09: before it, BOTH servers accepted
+/// `{$set: {"": 1}}` and stored a document with an empty field name -- one
+/// mongod cannot produce, and which the query that created it then fails to
+/// match. That is the "user-supplied path used as a dict key" shape
+/// `CLAUDE.md` calls out.
+pub fn update_path_fault(update: &Document) -> Option<UpdatePathFault> {
+    if !update.keys().any(|k| k.starts_with('$')) {
+        return None; // replacement-style: its fields are data, not paths
+    }
     let mut seen: Vec<Vec<String>> = Vec::new();
     for (op, payload) in update.iter() {
+        // The operator's NAME is checked before its paths, and a bare field
+        // among the operators is reached in document order like anything else:
+        // `{$nope: {a: 1}, $set: {"": 1}}` is 9 and `{$set: {"": 1}, z: 2}` is
+        // 56. Checking names in a pass of their own gets the second one wrong.
+        if !op.starts_with('$') || !KNOWN_UPDATE_OPS.contains(&op.as_str()) {
+            return Some(UpdatePathFault::UnknownModifier(op.clone()));
+        }
         let Bson::Document(fields) = payload else {
             continue;
         };
@@ -1160,7 +1275,18 @@ pub fn conflicting_update_paths(update: &Document) -> Option<(String, String)> {
             // conflict.
             let mut claimed: Vec<Vec<String>> = Vec::new();
             for path in paths {
+                if path.is_empty() {
+                    return Some(UpdatePathFault::Empty(
+                        "An empty update path is not valid.".to_string(),
+                    ));
+                }
                 let parts: Vec<String> = path.split('.').map(str::to_string).collect();
+                if parts.iter().any(String::is_empty) {
+                    return Some(UpdatePathFault::Empty(format!(
+                        "The update path '{path}' contains an empty field name, \
+                         which is not allowed."
+                    )));
+                }
                 for prev in &seen {
                     let n = parts.len().min(prev.len());
                     if parts[..n] == prev[..n] {
@@ -1169,7 +1295,10 @@ pub fn conflicting_update_paths(update: &Document) -> Option<(String, String)> {
                         } else {
                             parts.join(".")
                         };
-                        return Some((path, shorter));
+                        return Some(UpdatePathFault::Conflict {
+                            offending: path,
+                            at: shorter,
+                        });
                     }
                 }
                 claimed.push(parts);
@@ -1463,6 +1592,184 @@ fn addtoset_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
 
 #[cfg(test)]
 mod tests {
+    // --- update_spec_error: the three parse faults and their ORDER. Every
+    // verdict measured against mongod 8.2.11 (2026-09-06). ---
+
+    #[test]
+    fn an_empty_update_path_is_rejected_for_every_operator() {
+        for (op, value) in [
+            ("$set", Bson::Int32(1)),
+            ("$unset", Bson::String(String::new())),
+            ("$inc", Bson::Int32(1)),
+            ("$mul", Bson::Int32(1)),
+            ("$min", Bson::Int32(1)),
+            ("$max", Bson::Int32(1)),
+            ("$push", Bson::Int32(1)),
+            ("$addToSet", Bson::Int32(1)),
+            ("$pop", Bson::Int32(1)),
+            ("$bit", Bson::Document(doc! {"and": 1i32})),
+        ] {
+            let update = doc! {op: {"": value}};
+            assert_eq!(
+                super::update_spec_error(&update),
+                Some((56, "An empty update path is not valid.".to_string())),
+                "{op} with an empty path"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_path_component_is_named_wherever_it_sits() {
+        for path in ["a.", ".a", "a..b", "a.b.", ".", ".."] {
+            let update = doc! {"$set": {path: 1i32}};
+            assert_eq!(
+                super::update_spec_error(&update),
+                Some((
+                    56,
+                    format!(
+                        "The update path '{path}' contains an empty field name, \
+                         which is not allowed."
+                    )
+                )),
+                "path {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_validates_both_of_its_ends() {
+        assert_eq!(
+            super::update_spec_error(&doc! {"$rename": {"a": "b."}})
+                .unwrap()
+                .0,
+            56
+        );
+        assert_eq!(
+            super::update_spec_error(&doc! {"$rename": {"a.": "b"}})
+                .unwrap()
+                .0,
+            56
+        );
+        assert_eq!(
+            super::update_spec_error(&doc! {"$rename": {"": "b"}}),
+            Some((56, "An empty update path is not valid.".to_string()))
+        );
+    }
+
+    /// The three parse checks share ONE document-order walk, and the first
+    /// offender wins. Each pair below is the same two faults in both orders;
+    /// running any check as a separate earlier pass gets one of them backwards.
+    #[test]
+    fn the_first_parse_fault_in_document_order_wins() {
+        let cases: [(Document, i32); 6] = [
+            (
+                doc! {"$inc": {"": 1i32}, "$set": {"a": 1i32, "a.b": 1i32}},
+                56,
+            ),
+            (
+                doc! {"$set": {"a": 1i32, "a.b": 1i32}, "$inc": {"": 1i32}},
+                40,
+            ),
+            (doc! {"$nope": {"a": 1i32}, "$set": {"": 1i32}}, 9),
+            (doc! {"$set": {"": 1i32}, "$nope": {"a": 1i32}}, 56),
+            (
+                doc! {"$nope": {"x": 1i32}, "$set": {"a": 1i32, "a.b": 1i32}},
+                9,
+            ),
+            (
+                doc! {"$set": {"a": 1i32, "a.b": 1i32}, "$nope": {"x": 1i32}},
+                40,
+            ),
+        ];
+        for (update, code) in cases {
+            assert_eq!(
+                super::update_spec_error(&update).map(|(c, _)| c),
+                Some(code),
+                "{update:?}"
+            );
+        }
+    }
+
+    /// A bare field among the operators is reached in order like anything else,
+    /// so an empty path ahead of it still wins.
+    #[test]
+    fn a_bare_field_among_operators_is_an_unknown_modifier() {
+        assert_eq!(
+            super::update_spec_error(&doc! {"$set": {"a": 1i32}, "z": 2i32}),
+            Some((
+                9,
+                "Unknown modifier: z. Expected a valid update modifier or \
+                 pipeline-style update specified as an array"
+                    .to_string()
+            ))
+        );
+        assert_eq!(
+            super::update_spec_error(&doc! {"$set": {"": 1i32}, "z": 2i32}).map(|(c, _)| c),
+            Some(56)
+        );
+    }
+
+    /// A REPLACEMENT is data, not paths -- mongod really does store an empty
+    /// field name for `replace_one({_id: 1}, {"": 1})`, so the walk must not
+    /// touch it.
+    #[test]
+    fn a_replacement_document_is_not_path_validated() {
+        assert_eq!(super::update_spec_error(&doc! {"": 1i32}), None);
+        assert_eq!(
+            super::update_spec_error(&doc! {"a": 1i32, "b.c": 2i32}),
+            None
+        );
+        let out = super::apply_update(&doc! {"_id": 1i32, "a": 1i32}, &doc! {"": 1i32}, false)
+            .expect("a replacement with an empty field name is allowed");
+        assert_eq!(out, doc! {"_id": 1i32, "": 1i32});
+    }
+
+    #[test]
+    fn a_well_formed_update_has_no_spec_error() {
+        assert_eq!(
+            super::update_spec_error(&doc! {"$set": {"a.b": 1i32}}),
+            None
+        );
+        assert_eq!(
+            super::update_spec_error(&doc! {"$set": {"a": 1i32}, "$inc": {"b": 1i32}}),
+            None
+        );
+    }
+
+    /// `$each` type errors: mongod words the two operators differently AND
+    /// gives them different codes -- `$push` keeps the colon and answers 2,
+    /// `$addToSet` drops it and answers 14. Verbatim from 8.2.11.
+    #[test]
+    fn each_type_errors_keep_mongods_two_wordings() {
+        let err = super::apply_update(
+            &doc! {"_id": 1i32, "a": [1i32]},
+            &doc! {"$push": {"a": {"$each": 5i32}}},
+            false,
+        )
+        .expect_err("a non-array $each is refused");
+        assert_eq!(
+            err.as_mongo(),
+            Some((
+                2,
+                "The argument to $each in $push must be an array but it was of type: int"
+            ))
+        );
+
+        let err = super::apply_update(
+            &doc! {"_id": 1i32, "a": [1i32]},
+            &doc! {"$addToSet": {"a": {"$each": "x"}}},
+            false,
+        )
+        .expect_err("a non-array $each is refused");
+        assert_eq!(
+            err.as_mongo(),
+            Some((
+                14,
+                "The argument to $each in $addToSet must be an array but it was of type string"
+            ))
+        );
+    }
+
     // --- arith_overflow_error: messages verbatim from a mongod 8.2.11 probe
     // (2026-09-06). Before this the overflow could only defer, and the client
     // was told the server could not do `$inc`. ---

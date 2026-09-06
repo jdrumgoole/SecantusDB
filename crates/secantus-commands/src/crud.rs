@@ -616,46 +616,19 @@ const PIPELINE_UPDATE_STAGES: [&str; 6] = [
     "$replaceWith",
 ];
 
-/// Update modifiers mongod accepts (`secantus.update._KNOWN_UPDATE_OPS`). A
-/// top-level `$`-key outside this set is an "Unknown modifier" parse error.
-const KNOWN_UPDATE_OPS: [&str; 15] = [
-    "$set",
-    "$setOnInsert",
-    "$unset",
-    "$currentDate",
-    "$inc",
-    "$mul",
-    "$min",
-    "$max",
-    "$push",
-    "$addToSet",
-    "$pull",
-    "$pullAll",
-    "$pop",
-    "$rename",
-    "$bit",
-];
-
 /// Parse-time check of an operator-form update document, mirroring
-/// `secantus.update.validate_update_doc`: `Some(errmsg)` for an unknown modifier
-/// or a mix of operators and replacement fields, else `None` (a pure replacement
-/// or a valid operator update). Surfaces as a `FailedToParse` (9) write error.
-fn unsupported_update_modifier(u: &Document) -> Option<String> {
-    if !u.keys().any(|k| k.starts_with('$')) {
-        return None; // replacement-style update
-    }
-    // mongod has ONE complaint for both shapes -- an unrecognised `$`-operator
-    // and a document mixing operators with replacement fields -- and for the
-    // mixed one it names the bare field, no `$`: `Unknown modifier: z`.
-    // Probed 6.0.16.
-    u.keys()
-        .find(|k| !k.starts_with('$') || !KNOWN_UPDATE_OPS.contains(&k.as_str()))
-        .map(|k| {
-            format!(
-                "Unknown modifier: {k}. Expected a valid update modifier or \
-                 pipeline-style update specified as an array"
-            )
-        })
+/// `secantus.update.validate_update_doc`: `Some((code, errmsg))` for an unknown
+/// modifier (9), an empty update path (56), or a path conflict (40), else `None`
+/// (a pure replacement or a valid operator update).
+///
+/// This used to check ONLY the operator names, from a private copy of the
+/// modifier list, and the caller hard-coded code 9. mongod interleaves all three
+/// checks in one document-order walk and the first offender wins -- so a spec
+/// with both an unknown modifier and an empty path answers whichever comes
+/// first. `secantus_core::update::update_spec_error` is that walk, shared with
+/// the engine so the two cannot drift.
+fn update_spec_error(u: &Document) -> Option<(i32, String)> {
+    secantus_core::update::update_spec_error(u)
 }
 
 /// `update` — batch update, one entry per `{q, u, multi?, upsert?}` spec. Ports
@@ -906,9 +879,9 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // mongod errors even against an empty / no-match collection, where the
         // apply-time engine would never run. Pipeline-form `u` is validated below.
         if !matches!(spec.get("u"), Some(Bson::Array(_))) {
-            if let Some(errmsg) = unsupported_update_modifier(&doc_field(spec, "u")) {
+            if let Some((code, errmsg)) = update_spec_error(&doc_field(spec, "u")) {
                 write_errors.push(Bson::Document(doc! {
-                    "index": index as i32, "code": 9, "errmsg": errmsg,
+                    "index": index as i32, "code": code, "errmsg": errmsg,
                 }));
                 if ordered {
                     break;

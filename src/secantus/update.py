@@ -411,22 +411,38 @@ def _unknown_modifier(name: str) -> UpdateError:
 
 
 def validate_update_doc(update: Any) -> None:
-    """Parse-time validation of an update document's top-level operators.
+    """Parse-time validation of an update document's operators and paths.
 
-    Raises ``UpdateError`` for an unknown modifier or a mix of operators
-    and replacement fields. Does NOT apply the update (so positional /
-    arrayFilter operators don't need a match context here). Pipeline
-    (list) updates and pure replacements are accepted — their own
-    validation happens elsewhere.
+    Raises ``UpdateError`` for an unknown modifier, a mix of operators and
+    replacement fields, an empty update path, or a path conflict. Does NOT
+    apply the update (so positional / arrayFilter operators don't need a match
+    context here). Pipeline (list) updates and pure replacements are accepted —
+    their own validation happens elsewhere.
+
+    All of these are genuinely parse-time on mongod: it reports every one even
+    when the filter matches NOTHING (probed 8.2.11, 2026-09-06), which is why
+    they belong here and not only in ``apply_update``. It also decides between
+    them by document order — see ``_validate_update_paths``, which does the one
+    interleaved walk this delegates to. This used to check only the operator
+    names, in a pass of its own, so an unknown modifier ANYWHERE preempted an
+    empty path or a conflict that mongod reports first.
     """
     if isinstance(update, list) or not isinstance(update, Mapping):
         return
     keys = list(update)
     if not any(k.startswith("$") for k in keys):
         return  # replacement-style update
-    for op in keys:
-        if not op.startswith("$") or op not in _KNOWN_UPDATE_OPS:
-            raise _unknown_modifier(op)
+    # A bare field among the operators is NOT checked up front: mongod reaches
+    # it in document order like everything else, so `{$set: {"": 1}, z: 2}` is
+    # the empty path (56) and `{$set: {a: 1}, z: 2}` is `Unknown modifier: z`
+    # (9). `_validate_update_paths` names a non-`$` key as it walks.
+    conflict = _validate_update_paths(update)
+    if conflict is not None:
+        offending, at = conflict
+        raise UpdateError(
+            f"Updating the path '{offending}' would create a conflict at '{at}'",
+            code=40,
+        )
 
 
 def apply_update_batch(
@@ -443,8 +459,22 @@ def apply_update_batch(
     return [apply_update(d, update, is_upsert=is_upsert) for d in docs]
 
 
-def _conflicting_update_paths(update: Mapping[str, Any]) -> tuple[str, str] | None:
-    """``(offending_path, conflict_point)`` if two operators target the same path.
+def _validate_update_paths(update: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Walk every operator path once, raising on an empty one and returning
+    ``(offending_path, conflict_point)`` if two operators target the same path.
+
+    THREE checks share this walk -- the operator NAME, then each of its paths
+    for emptiness, then for a conflict -- because mongod interleaves all three
+    and the FIRST offender in document order wins (probed 8.2.11, 2026-09-06)::
+
+        {$inc: {"": 1},  $set: {a: 1, a.b: 1}}   -> 56, the empty path
+        {$set: {a: 1, a.b: 1},  $inc: {"": 1}}   -> 40, the conflict
+        {$nope: {a: 1}, $set: {"": 1}}           ->  9, the unknown modifier
+        {$set: {"": 1}, $nope: {a: 1}}           -> 56, the empty path
+        {$nope: {x: 1}, $set: {a: 1, a.b: 1}}    ->  9, the unknown modifier
+        {$set: {a: 1, a.b: 1}, $nope: {x: 1}}    -> 40, the conflict
+
+    Any of them as a separate earlier pass gets one of those pairs backwards.
 
     mongod rejects an update whose operators touch paths where one is EQUAL TO or
     a PREFIX OF another -- ``{$set: {a: 2}, $inc: {a.b: 1}}`` cannot be applied
@@ -469,6 +499,11 @@ def _conflicting_update_paths(update: Mapping[str, Any]) -> tuple[str, str] | No
     """
     seen: list[tuple[str, tuple[str, ...]]] = []
     for op, payload in update.items():
+        # The operator's NAME is checked before its paths: mongod reaches
+        # `$nope` in `{$nope: {a: 1}, $set: {"": 1}}` first and reports 9, but
+        # reports 56 when the two are the other way round.
+        if not op.startswith("$") or op not in _KNOWN_UPDATE_OPS:
+            raise _unknown_modifier(op)
         if not isinstance(payload, Mapping):
             continue
         for field in payload:
@@ -488,7 +523,21 @@ def _conflicting_update_paths(update: Mapping[str, Any]) -> tuple[str, str] | No
             # same path", code 2), not the code-40 conflict.
             claimed = []
             for path in paths:
+                # mongod rejects an empty path before it considers conflicts,
+                # with two distinct messages (probed 8.2.11, uniform across
+                # $set / $unset / $inc / $mul / $min / $max / $push / $addToSet
+                # / $pop / $bit and both ends of a $rename). Without this both
+                # servers ACCEPTED `{$set: {"": 1}}` and stored a document with
+                # an empty field name -- one mongod cannot produce.
+                if path == "":
+                    raise UpdateError("An empty update path is not valid.", code=56)
                 parts = tuple(path.split("."))
+                if "" in parts:
+                    raise UpdateError(
+                        f"The update path '{path}' contains an empty field name, "
+                        "which is not allowed.",
+                        code=56,
+                    )
                 for prev_path, prev_parts in seen:
                     if prev_parts == parts:
                         return path, prev_path
@@ -523,7 +572,7 @@ def apply_update(
     if has_op:
         if not all(k.startswith("$") for k in keys):
             raise _unknown_modifier(next(k for k in keys if not k.startswith("$")))
-        conflict = _conflicting_update_paths(update)
+        conflict = _validate_update_paths(update)
         if conflict is not None:
             offending, at = conflict
             raise UpdateError(
@@ -1054,12 +1103,15 @@ def _apply_op(
                 to_add = value["$each"] if _is_each_modifier(value) else [value]
                 if _is_each_modifier(value) and not isinstance(value["$each"], list):
                     # `$addToSet` words this differently from `$push`: it names
-                    # itself, and omits the colon before the type. mongod's own
-                    # inconsistency, reproduced verbatim.
+                    # itself, omits the colon before the type, AND answers a
+                    # different code -- 14 where `$push` answers 2. mongod's own
+                    # inconsistency, reproduced verbatim; the code was measured
+                    # against 8.2.11 (2026-09-06) and used to be 2 here, copied
+                    # from its `$push` sibling.
                     raise UpdateError(
                         "The argument to $each in $addToSet must be an array but "
                         f"it was of type {_bson_type_name(value['$each'])}",
-                        code=2,
+                        code=14,
                     )
                 for elem in to_add:
                     # `elem not in arr` uses Python `==`, which compares dicts
