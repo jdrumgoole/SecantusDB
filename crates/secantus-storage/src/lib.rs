@@ -2528,13 +2528,13 @@ fn sort_key(
 ) -> Result<Vec<Vec<u8>>> {
     let mut parts = Vec::with_capacity(spec.len());
     for (f, d) in spec {
-        let v = get_path(doc, f).cloned().unwrap_or(Bson::Null);
-        // mongod sorts an array-valued field by one representative element: its
-        // minimum ascending, its maximum descending. Comparing whole arrays put
-        // every array after every scalar and disagreed with our own index path,
-        // where a multikey index's per-element entries already produced mongod's
-        // order. Mirrors `ordering.py::_array_sort_value`.
-        let v = order::array_sort_value(v, *d < 0).ok_or(StorageError::UnsupportedValue)?;
+        // `sort_field_value` resolves the path AND picks the representative
+        // element (mongod sorts an array-valued field by its minimum ascending,
+        // its maximum descending). Applying `array_sort_value` again here
+        // descended a second time and put `x: [[5]]` among the NUMBERS instead
+        // of the arrays -- caught by re-measuring `sort {x: 1}` against the
+        // pre-change binary rather than assuming only the dotted case moved.
+        let v = sort_field_value(doc, f, *d < 0);
         // An empty array has no representative element; mongod sorts it between
         // MinKey and Null. The rank bytes cannot express that, so emit a key just
         // above bare MinKey. No direction fix-up is needed now that the
@@ -2549,6 +2549,69 @@ fn sort_key(
         parts.push(sortkey::encode_value(&v, coll).map_err(|_| StorageError::UnsupportedValue)?);
     }
     Ok(parts)
+}
+
+/// The value a document sorts by for one field of the sort spec.
+///
+/// Resolved with `get_path_values`, which walks a dotted path THROUGH an array
+/// exactly one level, rather than `get_path`, which does not walk one at all.
+/// mongod ranks `x: [{y: 1}]` among the documents that HAVE an `x.y` -- by 1 --
+/// and both servers ranked it with those that have none, so a
+/// `sort({"x.y": 1})` over array-of-subdocument data came back in the wrong
+/// order. Wrong order is wrong RESULTS as soon as a `limit` is involved
+/// (probed 8.2.11, 2026-09-06).
+///
+/// One level, not any: `x: [[{y: 5}]]` has no `x.y` on mongod either, and
+/// `get_path_values` already stops there. Using it also makes the in-memory
+/// sort agree with the INDEX path, which generates its multikey entries from
+/// the same resolver -- an index must change speed, never results.
+///
+/// A path yielding several values (`x: [{y: 5}, {y: 6}]`) sorts by the
+/// representative element the direction asks for, the same rule
+/// `order::array_sort_value` applies within one array value.
+///
+/// Mirrors `ordering._sort_value`.
+fn sort_field_value(doc: &Document, field: &str, reverse: bool) -> Bson {
+    let (values, _descended) = get_path_values(doc, field);
+    if values.is_empty() {
+        // Absent: `get_path` returned `None` here before and this still ranks
+        // with null.
+        return Bson::Null;
+    }
+    let mut best: Option<Vec<u8>> = None;
+    let mut best_val = Bson::Null;
+    for v in values {
+        let Some(rep) = order::array_sort_value(v.clone(), reverse) else {
+            continue;
+        };
+        // Compare candidates on the ASCENDING encoding and pick the max for a
+        // descending column -- never the inverted bytes, which do not reverse a
+        // prefix relationship (see `encode_value_directed`).
+        let Ok(enc) = sortkey::encode_value(&rep, None) else {
+            // Unencodable: fall back to the first candidate rather than drop
+            // the document from the sort.
+            if best.is_none() {
+                best_val = rep;
+                best = Some(Vec::new());
+            }
+            continue;
+        };
+        let better = match &best {
+            None => true,
+            Some(b) => {
+                if reverse {
+                    enc > *b
+                } else {
+                    enc < *b
+                }
+            }
+        };
+        if better {
+            best = Some(enc);
+            best_val = rep;
+        }
+    }
+    best_val
 }
 
 /// Compare two `sort_key` part lists under `spec`'s per-field directions.
@@ -14169,6 +14232,61 @@ mod tests {
         packed.extend_from_slice(b"an-id-key");
         let (_esc, rid) = unpack_entry(&packed);
         assert_eq!(rid, None);
+    }
+
+    /// A dotted sort key walks ONE array level. `x: [{y: 1}]` HAS an `x.y` and
+    /// must rank among the documents that do; `x: [[{y: 5}]]` does not, because
+    /// that is two levels — mongod agrees on both (probed 8.2.11, 2026-09-06).
+    /// The sort used `get_path`, which walks none.
+    #[test]
+    fn a_dotted_sort_key_walks_one_array_level() {
+        let cases: [(Document, Option<i32>); 5] = [
+            (doc! {"x": [{"y": 1i32}]}, Some(1)),
+            (doc! {"x": {"y": 1i32}}, Some(1)),
+            // Several values: ascending takes the minimum.
+            (doc! {"x": [{"y": 5i32}, {"y": 1i32}]}, Some(1)),
+            // Two levels is not one: absent.
+            (doc! {"x": [[{"y": 5i32}]]}, None),
+            (doc! {"x": [5i32]}, None),
+        ];
+        for (d, want) in cases {
+            let got = sort_field_value(&d, "x.y", false);
+            match want {
+                Some(n) => assert_eq!(got, Bson::Int32(n), "{d:?}"),
+                None => assert_eq!(got, Bson::Null, "{d:?} has no x.y"),
+            }
+        }
+        // Descending takes the maximum of the several values.
+        assert_eq!(
+            sort_field_value(&doc! {"x": [{"y": 5i32}, {"y": 1i32}]}, "x.y", true),
+            Bson::Int32(5)
+        );
+    }
+
+    /// The regression this fix nearly shipped: the representative-element rule
+    /// was briefly applied TWICE, which resolved `x: [[5]]` to the number 5
+    /// instead of the array `[5]` and moved it out of the array group in an
+    /// UNDOTTED sort.
+    #[test]
+    fn an_undotted_sort_key_descends_exactly_once() {
+        assert_eq!(
+            sort_field_value(&doc! {"x": [[5i32]]}, "x", false),
+            Bson::Array(vec![Bson::Int32(5)]),
+            "one level: the representative element is the inner ARRAY"
+        );
+        assert_eq!(
+            sort_field_value(&doc! {"x": [5i32]}, "x", false),
+            Bson::Int32(5)
+        );
+        assert_eq!(
+            sort_field_value(&doc! {"x": 5i32}, "x", false),
+            Bson::Int32(5)
+        );
+        // Descending picks the maximum element, as before.
+        assert_eq!(
+            sort_field_value(&doc! {"x": [1i32, 9i32]}, "x", true),
+            Bson::Int32(9)
+        );
     }
 
     /// A DESCENDING sort must reverse a PREFIX chain, which the old
