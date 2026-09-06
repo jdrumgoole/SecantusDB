@@ -346,7 +346,26 @@ def invert_bytes(b: bytes) -> bytes:
 
 
 def encode_value_directed(value: Any, direction: int = 1, *, collation: Any = None) -> bytes:
-    """Like ``encode_value`` but inverts bytes when ``direction == -1``."""
+    """Like ``encode_value`` but inverts bytes when ``direction == -1``.
+
+    **Only for physical B-tree placement -- never for comparison.**
+
+    Inverting gives a descending column the right ORDER inside the index, where
+    the storage engine sorts by raw bytes and there is nowhere to put a
+    direction. It is not a general descending comparator, because **inversion
+    does not reverse a PREFIX relationship**: ``""`` encodes to a strict prefix
+    of ``"a"``'s key, and a shorter byte string sorts first both before and
+    after inversion. The Rust server sorted documents by these keys and put
+    every prefix chain in ASCENDING order inside a descending result --
+    ``["", "a", "ab", "abc", "b"]`` sorted descending came back
+    ``["", "b", "a", "ab", "abc"]`` (measured against mongod 8.2.11,
+    2026-09-06). This server was unaffected only because its in-memory sort
+    goes through ``ordering.sort_docs`` instead.
+
+    To ORDER values, compare ``encode_value`` outputs and negate for a
+    descending column: prefix-shorter-first is exactly right ascending, and its
+    reverse is exactly right descending.
+    """
     e = encode_value(value, collation=collation)
     return invert_bytes(e) if direction == -1 else e
 

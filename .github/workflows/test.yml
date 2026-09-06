@@ -1989,6 +1989,7 @@ jobs:
           tests/test_nan_ordering_and_partial_index.py
           tests/test_rust_update_write_fidelity.py
           tests/test_rust_upsert_fidelity.py
+          tests/test_rust_descending_sort.py
           -o addopts= -p no:cacheprovider -q
 
       - name: Rust-server concurrency invariants (#451 stress suite)
