@@ -483,6 +483,21 @@ pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document
     }
 
     let id_spec: Option<&Bson> = spec_main.iter().find(|(k, _)| *k == "_id").map(|(_, v)| *v);
+
+    // A non-numeric `_id` spec value is a LITERAL, not a flag: mongod 8.2.11
+    // answers `{_id: null}` with `{_id: null}` and `{_id: ""}` with `{_id: ""}`,
+    // replacing the stored value. Both engines used to return the STORED `_id`
+    // here, and the parity suite pinned them to each other while they agreed on
+    // the wrong answer. Computed projections live only in the Python engine, so
+    // hand any such spec back rather than reproducing them.
+    if let Some(v) = id_spec {
+        if !matches!(
+            v,
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Boolean(_)
+        ) {
+            return Err(Fallback::Defer);
+        }
+    }
     let non_id: Vec<(&str, &Bson)> = spec_main
         .iter()
         .copied()
@@ -491,9 +506,11 @@ pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document
 
     if non_id.is_empty() {
         // The spec is at most an `_id` entry plus `$slice` modifiers.
-        // mongod's rules (oracle-pinned, mirrored in projection.py):
-        //   * non-zero `_id` (incl. null and "") => INCLUSION: only `_id`
-        //     plus any $slice'd fields survive;
+        // mongod's rules (mirrored in projection.py):
+        //   * non-zero NUMBER / bool `_id` => INCLUSION: only `_id` plus any
+        //     $slice'd fields survive. (`null` and `""` are literals, not
+        //     flags -- they defer above. The comment that stood here said
+        //     they were includes; measured 8.2.11, they are not.)
         //   * numeric zero / false => whole doc minus `_id`;
         //   * no `_id` key => whole doc ($slice applied in place).
         if let Some(id_v) = id_spec {

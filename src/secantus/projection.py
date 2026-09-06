@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import copy
+import datetime as _dt
 from collections.abc import Mapping
 from typing import Any
+
+import bson
+from bson import Decimal128
 
 from secantus.expressions import _bson_type_name
 from secantus.paths import get_path, has_path, set_path
@@ -353,6 +357,7 @@ class _ProjectionPlan:
         "value_pred",
         "non_id",
         "meta_fields",
+        "computed_specs",
     )
 
     def __init__(self) -> None:
@@ -369,6 +374,7 @@ class _ProjectionPlan:
         self.value_pred: Any = None
         self.non_id: dict[str, Any] = {}
         self.meta_fields: dict[str, str] = {}
+        self.computed_specs: dict[str, Any] = {}
 
 
 def apply_projection(
@@ -388,6 +394,11 @@ def compile_projection(
     has_sort: bool = True,
 ) -> _ProjectionPlan:
     plan = _ProjectionPlan()
+
+    # A plain sub-document is a SUB-PROJECTION, classified per leaf -- see
+    # `_flatten_projection_spec`. Everything below therefore works on dotted
+    # leaves, which is also the form `_spec_tree` already builds trees from.
+    spec = _flatten_projection_spec(spec)
 
     # ``$meta`` projections validate at parse time (Location17308 for an unknown
     # argument, Location40218 for ``textScore`` without a ``$text`` query).
@@ -418,13 +429,29 @@ def compile_projection(
     slice_specs: dict[str, Any] = plan.slice_specs
     positional_specs: dict[str, Any] = {}
     spec_main: dict[str, Any] = plan.spec_main
+    computed_specs: dict[str, Any] = plan.computed_specs
+    # (key, value, kind) in SPEC ORDER. mongod reports the FIRST offending leaf
+    # when a computed field meets an exclusion, and which of the three errors it
+    # raises depends on that leaf's kind -- so the order has to be kept.
+    ordered: list[tuple[str, Any, str]] = []
     for k, v in spec.items():
         if _is_slice_spec(v):
             _validate_slice_arg(v["$slice"])
             slice_specs[k] = v["$slice"]
         elif _is_positional_key(k):
             positional_specs[k] = v
+        elif _is_computed_spec(v):
+            # A computed field is evaluated per document and, like `$slice`,
+            # does not vote in the inclusion/exclusion mode detection -- but it
+            # does FORCE inclusion (checked below).
+            computed_specs[k] = v
+            ordered.append((k, v, "expr" if isinstance(v, Mapping) else "literal"))
         else:
+            if isinstance(v, Decimal128):
+                # A Decimal128 flag: normalise to an int so every downstream
+                # truthiness test (all of which use `bool`) sees a number.
+                v = 1 if _flag_truthy(v) else 0
+            ordered.append((k, v, "elemmatch" if _is_elem_match_spec(v) else "flag"))
             if _is_elem_match_spec(v) and not isinstance(v["$elemMatch"], Mapping):
                 # mongod: the $elemMatch projection argument must be an object.
                 raise ProjectionError(
@@ -466,11 +493,33 @@ def compile_projection(
 
     non_id = {k: v for k, v in spec_main.items() if k != "_id"}
     plan.non_id = non_id
+    if computed_specs:
+        # A computed field makes the projection an INCLUSION, and mongod refuses
+        # to mix one with an exclusion (measured 8.2.11, 2026-09-06). Checked
+        # here, once the `_id`-only and positional shapes above have returned,
+        # so a `{_id: 0}` alongside a computed field is still the ordinary
+        # "inclusion, without _id" and not a mix.
+        excluded = [k for k, v in non_id.items() if not _is_elem_match_spec(v) and not bool(v)]
+        if excluded:
+            _raise_exclusion_mix(ordered)
+        plan.kind = "inclusion"
+        # A computed `_id` REPLACES the stored one and lands at the END of the
+        # document (`{_id: "$b", a: 1}` -> `{a: …, _id: …}`), so the body must
+        # not emit it first.
+        plan.include_id = "_id" not in computed_specs and bool(spec_main.get("_id", 1))
+        plan.elem_match_paths = {p for p, v in non_id.items() if _is_elem_match_spec(v)}
+        plain_paths = [p for p in non_id if p not in plan.elem_match_paths]
+        plan.plain_tree = _spec_tree(plain_paths) if plain_paths else None
+        return plan
     if not non_id:
         # The spec is at most an ``_id`` entry plus ``$slice`` modifiers.
         # mongod's rules (oracle-pinned against a real mongod):
-        #   * non-zero ``_id`` (incl. None and "") => INCLUSION: only
-        #     ``_id`` plus any $slice'd fields survive;
+        #   * non-zero numeric / bool ``_id`` => INCLUSION: only ``_id`` plus
+        #     any $slice'd fields survive. (``{_id: None}`` and ``{_id: ""}``
+        #     never reach here -- they are LITERALS, and mongod returns
+        #     ``{_id: null}`` / ``{_id: ""}``. A comment and a test here both
+        #     claimed they were "include", oracle-pinned; neither had ever been
+        #     run against a server. Measured 8.2.11, 2026-09-06.)
         #   * numeric zero / False => whole doc minus ``_id``;
         #   * no ``_id`` key => whole doc ($slice applied in place).
         if "_id" in spec_main and spec_main["_id"] != 0:
@@ -494,6 +543,43 @@ def compile_projection(
     return plan
 
 
+def _raise_exclusion_mix(ordered: list[tuple[str, Any, str]]) -> None:
+    """A computed field in an exclusion projection. mongod has THREE errors here
+    and picks by the first offending leaf in spec order (all measured 8.2.11,
+    2026-09-06):
+
+    ``{a: 0, n: 1}``            -> 31253 ``Cannot do inclusion on field n …``
+    ``{a: 0, n: "plain"}``      -> 31310 ``Cannot use an expression n: "plain" …``
+    ``{a: 0, n: {$literal: 1}}`` -> 31252 ``Cannot use expression other than $meta …``
+
+    Reversing the last two in the spec swaps which code comes back, which is the
+    only reason this walks the leaves instead of testing a set.
+    """
+    for key, value, kind in ordered:
+        if key == "_id":
+            continue
+        if kind == "flag" and not bool(value):
+            continue
+        name = _leaf_name(key)
+        if kind in ("flag", "elemmatch"):
+            raise ProjectionError(
+                f"Cannot do inclusion on field {name} in exclusion projection",
+                code=31253,
+                code_name="Location31253",
+            )
+        if kind == "expr":
+            raise ProjectionError(
+                "Cannot use expression other than $meta in exclusion projection",
+                code=31252,
+                code_name="Location31252",
+            )
+        raise ProjectionError(
+            f"Cannot use an expression {name}: {_render_literal(value)} in an exclusion projection",
+            code=31310,
+            code_name="Location31310",
+        )
+
+
 def apply_projection_plan(
     doc: dict[str, Any],
     plan: _ProjectionPlan,
@@ -507,9 +593,48 @@ def apply_projection_plan(
     supply is OMITTED from the output, which is also what mongod does for
     ``indexKey`` when the plan is a collection scan.
     """
+    out = _apply_projection_body(doc, plan)
+    if plan.computed_specs:
+        out = _with_computed(out, doc, plan)
     if plan.meta_fields:
-        return _with_meta(_apply_projection_body(doc, plan), plan, meta)
-    return _apply_projection_body(doc, plan)
+        return _with_meta(out, plan, meta)
+    return out
+
+
+def _with_computed(
+    result: dict[str, Any],
+    doc: Mapping[str, Any],
+    plan: _ProjectionPlan,
+) -> dict[str, Any]:
+    """Evaluate the projection's expression-valued fields against ``doc``.
+
+    Two rules that look alike and are not (both measured against mongod 8.2.11,
+    2026-09-04..06):
+
+    * a bare field REFERENCE that resolves to nothing OMITS the output field --
+      ``{n: "$absent"}`` gives ``{_id: 1}``, with no ``n`` at all;
+    * an EXPRESSION over a missing field yields **null** --
+      ``{n: {$add: ["$absent", 1]}}`` gives ``{_id: 1, n: null}``.
+
+    So "the value is missing" and "the expression produced nothing" are the same
+    thing only for the bare reference. A dotted output key builds the nesting,
+    which is why this goes through ``set_path`` rather than assigning a key with
+    a dot in it -- the shape `CLAUDE.md` warns about.
+    """
+    from secantus.expressions import MISSING as _EXPR_MISSING
+    from secantus.expressions import evaluate_or_missing
+    from secantus.paths import set_path
+
+    for key, expr in plan.computed_specs.items():
+        # `evaluate_or_missing` is the FIELD-VALUE evaluator: a bare path that
+        # resolves to nothing comes back MISSING, where the ordinary evaluator
+        # would give null. That is the whole distinction above.
+        value = evaluate_or_missing(expr, doc)
+        if value is _EXPR_MISSING:
+            # The bare-reference case: leave the field out entirely.
+            continue
+        set_path(result, key, value)
+    return result
 
 
 def _with_meta(
@@ -726,6 +851,151 @@ def _first_match(doc: dict[str, Any], path: str, sub_filter: Mapping[str, Any]) 
         elif matches({"_": elem}, {"_": sub_filter}):
             return elem
     return _MISSING
+
+
+_PROJECTION_OPERATORS = frozenset({"$slice", "$elemMatch", "$meta"})
+
+
+def _is_flag_value(value: Any) -> bool:
+    """Is this projection value an include/exclude FLAG rather than a value?
+
+    Measured against mongod 8.2.11 (2026-09-06) by projecting one of each BSON
+    type: **only a number or a bool is a flag.** ``Decimal128("1.5")`` includes
+    and ``Decimal128("0")`` excludes, so the test is "is it a BSON number", not
+    "is it a Python int/float" -- `Decimal128` is neither. Everything else --
+    string, null, array, date, ObjectId, BinData, regex, Timestamp, MinKey,
+    MaxKey, Code -- is a *literal constant* that replaces the field on every
+    document.
+    """
+    return isinstance(value, (bool, int, float, Decimal128))
+
+
+def _flag_truthy(value: Any) -> bool:
+    """Truthiness of a flag value. ``bool(Decimal128("0"))`` is ``True`` (it is
+    an object), so the zero test has to go through the decimal itself."""
+    if isinstance(value, Decimal128):
+        dec = value.to_decimal()
+        return not (dec == 0 and not dec.is_nan())
+    return bool(value)
+
+
+def _is_computed_spec(value: Any) -> bool:
+    """Is this (already flattened) projection value an EXPRESSION?
+
+    Every rule was measured against mongod 8.2.11 (2026-09-06) rather than
+    reasoned about:
+
+    * a **string** is an expression -- ``"$a"`` is a field path and ``"plain"``
+      a *literal constant* on every document. Neither is a flag. So is ``null``,
+      an array, and every non-numeric scalar (see ``_is_flag_value``).
+    * an operator **document** (first key ``$``-prefixed) is an expression,
+      except the three projection operators, which have their own handling.
+      ``{$literal: 0}`` and ``{$literal: false}`` are expressions yielding 0 and
+      false -- NOT exclusions.
+
+    A plain sub-document never reaches here: ``_flatten_projection_spec`` has
+    already split it into dotted leaves, because mongod classifies a
+    sub-document PER LEAF -- ``{o: {p: 1, z: "$b"}}`` includes ``o.p`` *and*
+    computes ``o.z``.
+    """
+    if _is_flag_value(value):
+        return False
+    if isinstance(value, Mapping):
+        first = next(iter(value), None)
+        return (
+            isinstance(first, str) and first.startswith("$") and first not in _PROJECTION_OPERATORS
+        )
+    return True
+
+
+def _leaf_name(path: str) -> str:
+    """mongod names the LEAF in a projection error, not the dotted path:
+    ``{a: 0, o: {p: {q: "$b"}}}`` reports ``q``, not ``o.p.q``."""
+    return path.rsplit(".", 1)[-1]
+
+
+def _render_literal(value: Any) -> str:
+    """mongod's rendering of a literal inside its Location31310 message.
+
+    Measured one type at a time against 8.2.11 (2026-09-06); this is a BSON
+    debug string, not JSON -- note the spaces inside a non-empty array, the
+    unquoted document keys, and ``new Date(<millis>)``.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, bson.ObjectId):
+        return f"ObjectId('{value}')"
+    if isinstance(value, bson.Binary):
+        return f"BinData({value.subtype}, {value.hex()})"
+    if isinstance(value, bson.Regex):
+        return f"/{value.pattern}/{_regex_flag_string(value.flags)}"
+    if isinstance(value, _dt.datetime):
+        epoch = _dt.datetime(1970, 1, 1, tzinfo=value.tzinfo)
+        return f"new Date({int((value - epoch).total_seconds() * 1000)})"
+    if isinstance(value, bson.Timestamp):
+        return f"Timestamp({value.time}, {value.inc})"
+    if isinstance(value, bson.MinKey):
+        return "MinKey"
+    if isinstance(value, bson.MaxKey):
+        return "MaxKey"
+    if isinstance(value, bson.Code):
+        return str(value)
+    if isinstance(value, str):
+        return '"' + value + '"'
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return "[]"
+        return "[ " + ", ".join(_render_literal(v) for v in value) + " ]"
+    if isinstance(value, Mapping):
+        if not value:
+            return "{}"
+        return "{ " + ", ".join(f"{k}: {_render_literal(v)}" for k, v in value.items()) + " }"
+    return str(value)
+
+
+def _regex_flag_string(flags: int) -> str:
+    import re as _re
+
+    out = ""
+    for char, bit in (("i", _re.I), ("m", _re.M), ("x", _re.X), ("s", _re.S)):
+        if flags & bit:
+            out += char
+    return out
+
+
+def _flatten_projection_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """Split plain sub-documents into dotted leaves, preserving spec order.
+
+    mongod treats ``{o: {p: 1, z: "$b"}}`` as the two independent leaves
+    ``o.p: 1`` and ``o.z: "$b"`` -- it returns ``{o: {p: <stored>, z: <computed>}}``
+    -- so a sub-document cannot be classified as a whole. Flattening also makes
+    the error messages right: mongod names the LEAF field, and an empty
+    sub-document at any depth is its own error.
+    """
+    out: dict[str, Any] = {}
+    for key, value in spec.items():
+        _flatten_entry(key, value, out)
+    return out
+
+
+def _flatten_entry(key: str, value: Any, out: dict[str, Any]) -> None:
+    if isinstance(value, Mapping):
+        if not value:
+            raise ProjectionError(
+                f"Invalid empty sub-projection: {_leaf_name(key)}",
+                code=51270,
+                code_name="Location51270",
+            )
+        first = next(iter(value))
+        if isinstance(first, str) and first.startswith("$"):
+            out[key] = value
+            return
+        for sub_key, sub_value in value.items():
+            _flatten_entry(f"{key}.{sub_key}", sub_value, out)
+        return
+    out[key] = value
 
 
 def _detect_inclusion(spec: Mapping[str, Any]) -> bool:

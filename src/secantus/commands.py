@@ -2548,6 +2548,20 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         return {"ok": 0.0, "errmsg": str(exc), "code": 51174, "codeName": "Location51174"}
     except QueryError as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": exc.code, "codeName": exc.code_name}
+    except ExpressionError as exc:
+        # A COMPUTED projection is evaluated per document, so a bad operand is
+        # an execution-time failure and mongod wraps it with the command and
+        # namespace: `Executor error during find command: <db>.<coll> :: caused
+        # by :: The argument to $size must be an array…` (probed 8.2.11,
+        # 2026-09-06). The wrapper names both, so only this layer can add it.
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"Executor error during find command: {ctx.db_name}.{coll} :: caused by :: {exc}"
+            ),
+            "code": exc.code or 2,
+            "codeName": exc.code_name or "BadValue",
+        }
     # ``returnKey`` replaces each result with just the keys of the index that
     # serves the query (filter + sort): the index's key-pattern fields, plus
     # the sort fields (mongod serves a sort from an index — the ``_id`` order

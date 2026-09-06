@@ -2039,40 +2039,60 @@ all still open. Probe: `scratchpad/readsweep.py` + `readsweep_lib.py`.
   own check that an index still cannot change the answer. Corpus and measured
   expectations: `scratchpad/probe_pos.py` + `probe_pos2.py`.
 
-- [ ] **Computed projections are UNIMPLEMENTED, and the Python server drops the
-  fields SILENTLY (11 shapes, measured 2026-09-06).** The entry that stood here
-  called this "a feature gap on Rust, not a wrong answer" and put the Python
-  server's behaviour as "diverges on the shape of the result". Both halves were
-  wrong, and the Python half is the serious one:
+- [x] **RESOLVED (2026-09-06) on the PYTHON server: computed projections are
+  evaluated, not silently dropped.** `find({}, {n: {$literal: 7}})` returned
+  documents with no `n` and reported `ok: 1` — the client asked for a field, was
+  told the query succeeded, and got documents without it.
 
-  ```
-  find({}, {lit: {$literal: 7}})
-    mongod   [{_id: 1, lit: 7}, ...]
-    python   [{_id: 1}, ...]                 <- field silently ABSENT, ok:1
-    rust     2 BadValue "projection is not supported by the Rust server"
-  ```
+  Every classification rule was measured against 8.2.11, and the ones that were
+  *reasoned about first* were all wrong:
 
-  The Rust server's honest refusal is the BETTER of the two behaviours by this
-  project's own rule (wire-protocol fidelity over feature completeness); the
-  Python server tells the client the query succeeded and returns documents
-  missing the field that was asked for. Eleven shapes behave this way:
-  `$literal`, `$multiply`, `$add`, `$concat`, `$cond`, `$size`, `$toUpper`, a
-  bare field reference, a nested computed subdocument, a computed field
-  alongside an inclusion, and one with `_id: 0`.
+  - **only a BSON NUMBER or BOOL is an include/exclude flag.** A string, `null`,
+    an array, a date, an ObjectId, BinData, a regex, a Timestamp, MinKey/MaxKey
+    are all *literal constants* that replace the field on every document.
+    `Decimal128("1.5")` includes and `Decimal128("0")` excludes — `bool()` of
+    either is `True` in Python, so the naive test gets it exactly backwards.
+  - **a plain sub-document is a SUB-PROJECTION, classified per leaf.**
+    `{o: {p: 1, z: "$b"}}` returns the STORED `o.p` and the computed `o.z`.
+    The spec is now flattened to dotted leaves up front, which is also what
+    makes the error messages name the leaf the way mongod does.
+  - **a computed `_id` replaces the stored one and moves to the END** —
+    `{_id: "$b", a: 1}` gives `{a: …, _id: …}`.
+  - a bare field REFERENCE that resolves to nothing OMITS the output field,
+    while an EXPRESSION over a missing field yields null; an evaluation failure
+    is an EXECUTION error carrying the namespace (`$size` on a non-array is
+    `Executor error during find command: <ns> :: caused by :: …`, code 17124).
+  - **three different errors** for a computed field in an exclusion projection,
+    picked by the first offending leaf in SPEC ORDER: `31253` for an inclusion
+    flag, `31310` (with the value rendered as a BSON debug string) for a
+    literal, `31252` for an operator expression. Swapping two fields in the
+    spec swaps the code, which is why the check walks the leaves.
+  - an empty sub-document is `51270 Invalid empty sub-projection: <leaf>`.
 
-  **Two semantics worth having before implementing** (both measured, both easy
-  to get wrong):
+  `secantus-core`'s projection engine carried the same wrong `_id` rule with
+  the same comment, so `test_rust_projection_parity.py` was green the whole
+  time — the two engines agreed with each other on the wrong answer, and it
+  only turned red once the Python side was corrected. It now DEFERS a
+  non-numeric `_id` spec value.
 
-  - a bare field REFERENCE that is missing OMITS the output field
-    (`{copy: "$a"}` on a document with no `a` gives `{_id: 3}`), while an
-    EXPRESSION over a missing field yields **null** (`{$multiply: ["$a", 2]}`
-    gives `{_id: 3, dbl: null}`);
-  - `$size` on a non-array is an ERROR, not null — `17124`, wrapped as
-    `Executor error during find command`.
+  A pre-existing test asserted `{_id: None}` and `{_id: ""}` were *includes*,
+  under a docstring reading "Oracle-pinned against real mongod". Nothing in that
+  file can reach a mongod, so the claim had never been run; the server returns
+  the constant. Corrected in place — the CLAUDE.md "a test can pin an unverified
+  claim just as easily as a comment can" shape, found for the third time.
 
-  Both servers already have the expression evaluator this needs, so the work is
-  routing an expression-valued projection entry through it and making the
-  projection inclusion-mode. Corpus: `scratchpad/probe_proj.py`.
+  Pinned by `tests/test_computed_projection.py`; all 55 expectations re-asserted
+  against the live 8.2.11 at 0 mismatches.
+
+- [ ] **The RUST server still refuses computed projections.** It answers
+  `2 BadValue: projection is not supported by the Rust server` for every shape
+  above. Left as-is deliberately: refusing is the better behaviour when the
+  feature is absent, and the two servers are now honest-refusal versus correct
+  rather than honest-refusal versus silently wrong. The semantics to implement
+  are the ones in the resolved entry above, all measured; `secantus-core` has
+  the expression evaluator and the projection plan, so the work mirrors
+  `secantus.projection`'s `_flatten_projection_spec` / `_is_flag_value` /
+  `_raise_exclusion_mix` / `_with_computed`.
 
 - [x] **RESOLVED (2026-09-06): the descending sort that put every prefix chain
   in ascending order.** `sort({x: -1})` over `["", "a", "ab", "abc", "b"]` came
