@@ -217,6 +217,131 @@ impl PgHandler {
     /// `with_user_transaction` also worked for plain statements and DEADLOCKED
     /// COPY, which opens its own transaction context: nesting that call is not
     /// safe, and this needs no nesting.
+    /// The enum catalog, in the PYTHON SERVER'S representation -- the two
+    /// servers share one store, so these collection names, doc shapes and the
+    /// oid-minting rule are a CONTRACT, not an implementation choice.
+    /// (`src/secantus/sql/catalog.py`: `__sql_enums__` docs
+    /// `{_id, enum, labels, oid}`; `__sql_enum_meta__` carries the monotonic
+    /// counter; `typarray` is DERIVED as `oid + 100_000`, never stored.)
+    const ENUM_COLLECTION: &'static str = "__sql_enums__";
+    const ENUM_META_COLLECTION: &'static str = "__sql_enum_meta__";
+    const ENUM_TYPE_OID_BASE: i64 = 65_000;
+    const USER_TYPE_ARRAY_OID_OFFSET: i64 = 100_000;
+
+    /// Hand the planner this database's user types, fresh from the store --
+    /// which the other server may have written to since the last statement.
+    fn install_user_types(&self) {
+        let types = self.enums().unwrap_or_default();
+        secantus_pgplan::set_user_types(types);
+    }
+
+    /// The wire type for a column whose type is a USER enum: pgwire's `Type`
+    /// takes a custom oid, and psycopg matches it against what EnumInfo
+    /// registered.
+    fn user_wire_type(&self, pg_type: &str) -> Option<Type> {
+        let enums = self.enums().ok()?;
+        let (name, oid, _) = enums.iter().find(|(n, _, _)| n == pg_type)?;
+        Some(Type::new(
+            name.clone(),
+            u32::try_from(*oid).ok()?,
+            postgres_types::Kind::Enum(Vec::new()),
+            "public".to_string(),
+        ))
+    }
+
+    /// Make sure a catalog collection exists before writing to it: a delete or
+    /// insert against a collection nobody created yet is a WiredTiger ENOENT,
+    /// not a no-op. Reads tolerate the absence; writes must not.
+    fn ensure_collection(&self, coll: &str) -> PgWireResult<()> {
+        let exists = self
+            .storage
+            .collection_exists(&self.db, coll)
+            .map_err(|e| Self::storage_err("could not check a catalog collection", e))?;
+        if !exists {
+            self.storage
+                .create_collection(&self.db, coll)
+                .map_err(|e| Self::storage_err("could not create a catalog collection", e))?;
+        }
+        Ok(())
+    }
+
+    /// Every enum type: `(name, oid, labels)`, name-sorted for stable output.
+    fn enums(&self) -> PgWireResult<Vec<(String, i64, Vec<String>)>> {
+        let raw = self
+            .storage
+            .find_matching(&self.db, Self::ENUM_COLLECTION, &Document::new())
+            .map_err(|e| Self::storage_err("could not read the enum catalog", e))?;
+        let mut out = Vec::new();
+        for bytes in raw {
+            let d: Document = bson::from_slice(&bytes)
+                .map_err(|e| Self::storage_err("could not decode an enum", e))?;
+            let name = d.get_str("enum").unwrap_or_default().to_string();
+            let oid = d
+                .get_i64("oid")
+                .or_else(|_| d.get_i32("oid").map(i64::from))
+                .unwrap_or(0);
+            let labels = d
+                .get_array("labels")
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push((name, oid, labels));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Mint the next enum oid, exactly as the Python server does: read the
+    /// counter, else start above everything already taken; rewrite the counter
+    /// as `next = oid + 1`. Monotonic and never reused -- positional minting
+    /// would renumber types under a client that registered loaders by oid.
+    fn mint_enum_oid(&self) -> PgWireResult<i64> {
+        let counter = self
+            .storage
+            .find_matching(
+                &self.db,
+                Self::ENUM_META_COLLECTION,
+                &bson::doc! {"_id": "oid_counter"},
+            )
+            .map_err(|e| Self::storage_err("could not read the oid counter", e))?;
+        let oid = if let Some(bytes) = counter.first() {
+            let d: Document = bson::from_slice(bytes)
+                .map_err(|e| Self::storage_err("could not decode the oid counter", e))?;
+            d.get_i64("next")
+                .or_else(|_| d.get_i32("next").map(i64::from))
+                .unwrap_or(Self::ENUM_TYPE_OID_BASE)
+        } else {
+            let existing = self.enums()?;
+            match existing.iter().map(|(_, o, _)| *o).max() {
+                Some(taken) => {
+                    (Self::ENUM_TYPE_OID_BASE + existing.len() as i64 - 1).max(taken) + 1
+                }
+                None => Self::ENUM_TYPE_OID_BASE,
+            }
+        };
+        self.storage
+            .delete_matching(
+                &self.db,
+                Self::ENUM_META_COLLECTION,
+                &bson::doc! {"_id": "oid_counter"},
+                0,
+                &Document::new(),
+                None,
+            )
+            .map_err(|e| Self::storage_err("could not advance the oid counter", e))?;
+        let doc = bson::doc! {"_id": "oid_counter", "next": oid + 1};
+        let bytes = bson::to_vec(&doc)
+            .map_err(|e| Self::storage_err("could not encode the oid counter", e))?;
+        self.storage
+            .insert(&self.db, Self::ENUM_META_COLLECTION, vec![bytes], true)
+            .map_err(|e| Self::storage_err("could not advance the oid counter", e))?;
+        Ok(oid)
+    }
+
     /// The virtual catalog tables: a definition and rows COMPUTED on read,
     /// nothing stored. `pg_type` is what psycopg's `TypeInfo.fetch` reads to
     /// learn a type's oid and array oid; `pg_prepared_statements` is what its
@@ -247,23 +372,39 @@ impl PgHandler {
     }
 
     /// The rows of one virtual table, already filtered.
-    fn virtual_rows(name: &str, filter: &Document) -> Option<Vec<Document>> {
+    fn virtual_rows(&self, name: &str, filter: &Document) -> Option<Vec<Document>> {
         let def = Self::virtual_table(name)?;
         let rows: Vec<Document> = match name {
-            "pg_type" => secantus_pgplan::pgtypes::BUILTIN_TYPES
-                .iter()
-                .map(|(typname, oid, typarray)| {
+            "pg_type" => {
+                let mut rows: Vec<Document> = secantus_pgplan::pgtypes::BUILTIN_TYPES
+                    .iter()
+                    .map(|(typname, oid, typarray)| {
+                        let mut d = Document::new();
+                        d.insert(def.field_of("typname").expect("column"), *typname);
+                        d.insert(def.field_of("oid").expect("column"), Bson::Int64(*oid));
+                        d.insert(
+                            def.field_of("typarray").expect("column"),
+                            Bson::Int64(*typarray),
+                        );
+                        d.insert(def.field_of("typdelim").expect("column"), ",");
+                        d
+                    })
+                    .collect();
+                // User enums ride along, their typarray DERIVED as
+                // oid + 100_000 -- the shared-store rule, never stored.
+                for (name, oid, _) in self.enums().ok()? {
                     let mut d = Document::new();
-                    d.insert(def.field_of("typname").expect("column"), *typname);
-                    d.insert(def.field_of("oid").expect("column"), Bson::Int64(*oid));
+                    d.insert(def.field_of("typname").expect("column"), name);
+                    d.insert(def.field_of("oid").expect("column"), Bson::Int64(oid));
                     d.insert(
                         def.field_of("typarray").expect("column"),
-                        Bson::Int64(*typarray),
+                        Bson::Int64(oid + Self::USER_TYPE_ARRAY_OID_OFFSET),
                     );
                     d.insert(def.field_of("typdelim").expect("column"), ",");
-                    d
-                })
-                .collect(),
+                    rows.push(d);
+                }
+                rows
+            }
             _ => Vec::new(),
         };
         let empty = Document::new();
@@ -1137,6 +1278,7 @@ impl PgHandler {
         // `25P02`, not `42703`. A SYNTAX error is the exception -- the parser
         // runs first there too, so `selct 1` still answers `42601`.
         let tz = self.session_timezone();
+        self.install_user_types();
         let planned = secantus_pgplan::plan_with_session_types(
             sql,
             &|n| self.lookup(n),
@@ -1629,7 +1771,7 @@ impl PgHandler {
                         (docs, series_table_def(series))
                     }
                     None if Self::virtual_table(&sel.table).is_some() => {
-                        let docs = Self::virtual_rows(&sel.table, &sel.filter).expect("checked");
+                        let docs = self.virtual_rows(&sel.table, &sel.filter).expect("checked");
                         (docs, Self::virtual_table(&sel.table).expect("checked"))
                     }
                     None => {
@@ -1718,6 +1860,61 @@ impl PgHandler {
                     Ok(enc.take_row())
                 });
                 Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
+            }
+
+            Statement::CreateEnum { name, labels } => {
+                // A duplicate name is 42710, distinct from a table's 42P07 --
+                // and checked against BUILTINS too: `create type text ...` is
+                // the same refusal on PostgreSQL.
+                let exists = self.enums()?.iter().any(|(n, _, _)| *n == name)
+                    || secantus_pgplan::pgtypes::oid_of_name(&name).is_some();
+                if exists {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42710".into(), // duplicate_object
+                        format!("type \"{name}\" already exists"),
+                    ))));
+                }
+                self.ensure_collection(Self::ENUM_COLLECTION)?;
+                self.ensure_collection(Self::ENUM_META_COLLECTION)?;
+                let oid = self.mint_enum_oid()?;
+                let doc = bson::doc! {
+                    "_id": &name,
+                    "enum": &name,
+                    "labels": labels,
+                    "oid": oid,
+                };
+                let bytes = bson::to_vec(&doc)
+                    .map_err(|e| Self::storage_err("could not encode the type", e))?;
+                self.storage
+                    .insert(&self.db, Self::ENUM_COLLECTION, vec![bytes], true)
+                    .map_err(|e| Self::storage_err("could not record the type", e))?;
+                Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
+            }
+
+            Statement::DropType { names, if_exists } => {
+                self.ensure_collection(Self::ENUM_COLLECTION)?;
+                for name in &names {
+                    let removed = self
+                        .storage
+                        .delete_matching(
+                            &self.db,
+                            Self::ENUM_COLLECTION,
+                            &bson::doc! {"_id": name},
+                            0,
+                            &Document::new(),
+                            None,
+                        )
+                        .map_err(|e| Self::storage_err("could not drop the type", e))?;
+                    if removed == 0 && !if_exists {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "42704".into(), // undefined_object
+                            format!("type \"{name}\" does not exist"),
+                        ))));
+                    }
+                }
+                Ok(vec![Response::Execution(Tag::new("DROP TYPE"))])
             }
 
             Statement::DropTable(drop) => {
@@ -1973,7 +2170,10 @@ impl PgHandler {
                 let schema = Arc::new(
                     sc.columns
                         .iter()
-                        .map(|(name, _, ty)| self.field(name.clone(), wire_type(ty)))
+                        .map(|(name, _, ty)| {
+                            let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
+                            self.field(name.clone(), wire)
+                        })
                         .collect::<Vec<_>>(),
                 );
                 let values: Vec<Bson> = sc
@@ -2011,7 +2211,7 @@ impl PgHandler {
                     // found no such collection, and answered 0 -- the right
                     // shape and the wrong number, which no error would flag.
                     None if Self::virtual_table(&agg.table).is_some() => {
-                        Self::virtual_rows(&agg.table, &agg.filter).expect("checked")
+                        self.virtual_rows(&agg.table, &agg.filter).expect("checked")
                     }
                     None => {
                         let raw = self
@@ -3623,6 +3823,7 @@ impl PgHandler {
         // `pg_typeof($1)` before the execute that does know them ever ran, and
         // the client sees the describe's error.
         let tz = self.session_timezone();
+        self.install_user_types();
         let stmt = secantus_pgplan::plan_with_session_types(
             sql,
             &|n| self.lookup(n),
@@ -3708,7 +3909,10 @@ impl PgHandler {
             Statement::SelectConstant(sc) => sc
                 .columns
                 .iter()
-                .map(|(name, _, ty)| self.field(name.clone(), wire_type(ty)))
+                .map(|(name, _, ty)| {
+                    let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
+                    self.field(name.clone(), wire)
+                })
                 .collect(),
             // CREATE / INSERT / UPDATE / DELETE return no rows.
             _ => Vec::new(),

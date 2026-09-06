@@ -2560,3 +2560,67 @@ def test_a_range_array_carries_its_own_oid(home: Path, binary: bool) -> None:
         cur.execute("select array['[1,5)'::int4range]")
         assert cur.fetchone()[0] == [Range(1, 5, "[)")]
         assert cur.pgresult.ftype(0) == 3905
+
+
+def test_enum_ddl_and_the_catalog(home: Path) -> None:
+    """CREATE TYPE ... AS ENUM / DROP TYPE, and the catalog reads behind them.
+
+    The 207 test_enum failures all die in one session fixture running exactly
+    this DDL, so nothing past it was measurable until it worked. A duplicate
+    name is 42710 (distinct from a table's 42P07), a missing one 42704, and a
+    case-sensitive name renders QUOTED through regtype — all measured.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create type mood as enum ('sad','ok','happy')")
+        assert cur.statusmessage == "CREATE TYPE"
+        with pytest.raises(psycopg.errors.DuplicateObject):
+            cur.execute("create type mood as enum ('x')")
+        # The fixture's exact multi-statement shape.
+        cur.execute("drop type if exists mood;\ncreate type mood as enum ('sad','ok');")
+
+        cur.execute("select to_regtype('mood')::text")
+        assert cur.fetchone()[0] == "mood"
+        cur.execute("select typname, typarray from pg_type where oid = to_regtype('mood')")
+        name, typarray = cur.fetchone()
+        assert name == "mood"
+        # typarray is DERIVED as oid + 100_000 — the shared-store rule.
+        cur.execute("select oid from pg_type where typname = 'mood'")
+        assert typarray == cur.fetchone()[0] + 100_000
+
+        cur.execute("drop type mood")
+        with pytest.raises(psycopg.errors.UndefinedObject):
+            cur.execute("drop type mood")
+        cur.execute("select to_regtype('mood')")
+        assert cur.fetchone()[0] is None
+
+        # A case-sensitive name, which the CamelCaseEnum fixture uses.
+        cur.execute("create type \"CamelCase\" as enum ('x')")
+        cur.execute("""select to_regtype('"CamelCase"')::text""")
+        assert cur.fetchone()[0] == '"CamelCase"'
+        cur.execute('drop type "CamelCase"')
+
+
+def test_an_enum_created_by_one_server_is_the_other_servers_too(home: Path) -> None:
+    """The enum catalog is a SHARED-STORE contract, not an implementation.
+
+    The Rust server writes the Python server's representation — `__sql_enums__`
+    docs with monotonically minted oids — so an enum created on one side must
+    resolve on the other, with the SAME oid.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create type rustmood as enum ('a','b')")
+        cur.execute("select oid from pg_type where typname = 'rustmood'")
+        rust_oid = cur.fetchone()[0]
+
+    # Python opens the same store and sees the type under the same oid…
+    assert _python_sql(home, "SELECT to_regtype('rustmood')::oid") == [(rust_oid,)]
+    # …and a type Python creates next mints the NEXT oid, not a reused one.
+    _python_sql(home, "CREATE TYPE pymood AS ENUM ('x')")
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("select typname, oid from pg_type where oid >= 65000 order by oid")
+        rows = cur.fetchall()
+        assert rows == [("rustmood", rust_oid), ("pymood", rust_oid + 1)]

@@ -1146,6 +1146,41 @@ def test_parameter_type_matches_postgres(
     assert mine == theirs, f"{sql} {params}\n  postgres={theirs}\n  ours    ={mine}"
 
 
+def test_enum_ddl_matches_postgres(ours: psycopg.Connection, oracle: psycopg.Connection) -> None:
+    """CREATE TYPE ... AS ENUM / DROP TYPE and the catalog reads behind them."""
+    _reset_oracle(oracle)
+
+    def probe(conn: psycopg.Connection) -> list:
+        out: list = []
+        cur = conn.cursor()
+
+        def attempt(sql: str) -> str:
+            try:
+                cur.execute(sql)
+            except psycopg.Error as exc:
+                with contextlib.suppress(Exception):
+                    conn.rollback()
+                return f"[{exc.diag.sqlstate}]"
+            return f"ok ({cur.statusmessage})"
+
+        attempt("DROP TYPE IF EXISTS dmood")
+        out.append(("create", attempt("CREATE TYPE dmood AS ENUM ('sad','ok')")))
+        out.append(("duplicate", attempt("CREATE TYPE dmood AS ENUM ('x')")))
+        cur.execute("SELECT to_regtype('dmood')::text")
+        out.append(("regtype", cur.fetchone()[0]))
+        cur.execute("SELECT typname FROM pg_type WHERE oid = to_regtype('dmood')")
+        out.append(("pg_type row", cur.fetchall()))
+        out.append(("drop", attempt("DROP TYPE dmood")))
+        out.append(("drop again", attempt("DROP TYPE dmood")))
+        out.append(("drop if exists", attempt("DROP TYPE IF EXISTS dmood")))
+        cur.execute("SELECT to_regtype('dmood')")
+        out.append(("gone", cur.fetchone()[0]))
+        return out
+
+    theirs, mine = probe(oracle), probe(ours)
+    assert mine == theirs, f"postgres={theirs}\n  ours    ={mine}"
+
+
 def test_savepoints_match_postgres(ours: psycopg.Connection, oracle: psycopg.Connection) -> None:
     """SAVEPOINT / RELEASE / ROLLBACK TO, against the server that defines them.
 
