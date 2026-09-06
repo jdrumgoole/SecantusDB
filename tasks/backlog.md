@@ -1961,36 +1961,42 @@ all still open. Probe: `scratchpad/readsweep.py` + `readsweep_lib.py`.
   array traversal happens once per path step**, and whatever consumes the step
   (an `$elemMatch`, a positional index) leaves a terminal value behind.
 
-- [ ] **A dotted POSITIONAL path descends one array level too far (3 shapes).**
-  `{"x.0": 5}` matches `x: [[5]]` and `x: [[5, 6]]` on both servers; mongod
-  matches only `x: [5]`, `x: [5, 6]` and `x: {"0": 5}` (the literal key).
-  `{"x.1": 2}` matches `x: [1, [2, [3]]]` here and not there, and
-  `{"x.0": {y: 5}}` matches `x: [[{y: 5}]]` here and not there.
+- [ ] **A dotted POSITIONAL component is AMBIGUOUS, and we implement only half
+  of it (2026-09-06, rules fully measured).** `{"x.0": 5}` and
+  `sort({"x.0": 1})`. mongod tries a numeric component BOTH ways — as an array
+  index and as a literal field name — and the two readings differ in whether
+  equality then descends:
 
-  **Same rule as the resolved `$elemMatch` entry above**: a positional index
-  CONSUMES the path step's array traversal, so the value it selects is terminal
-  and equality must not descend into it again. The fix therefore looks like the
-  `$elemMatch` one — the resolver has to tell the matcher that the step was
-  spent — but it lives in path resolution (`paths.get_path_values`), which the
-  INDEX layer also uses, so it needs its own pass and its own check that an
-  index still cannot change the answer. Corpus and measured expectations:
-  `scratchpad/arraylib.py` + `probe_array.py`.
+  ```
+  doc                     mongod {x.0: 5}   why
+  {x: [5]}                match             index 0 -> 5
+  {x: [[5]]}              NO match          index 0 -> [5]; no descent after an INDEX
+  {x: {"0": 5}}           match             literal key "0"
+  {x: [{"0": 5}]}         match             descend one level, then literal key "0"
+  {x: {"0": [5]}}         match             literal key, then equality DOES descend
+  {x: [5, 6]}             match             index 0 -> 5
+  ```
 
-- [ ] **Sorting by a dotted path does not descend into arrays (2 shapes).**
-  For `sort: {"x.y": 1}` mongod ranks `x: [{y: 1}]` and `x: [{y: 5}, {y: 6}]`
-  among the documents that HAVE an `x.y` (by 1 and by 5, its minimum); both
-  servers rank them with the documents that have none. Wrong order is wrong
-  results once `limit` is involved.
+  So: an index consumes the step and leaves a terminal value; a field-name
+  reading does not. Our resolver takes the union of both readings but then
+  descends for both, so `[[5]]` and `[[5, 6]]` match where mongod does not.
 
-  The same one-step rule bounds it: mongod descends ONE array level for the
-  sort key too, so `x: [[{y: 5}]]` has NO `x.y` and sorts with the missing
-  group — which is where both servers already put it, for the wrong reason.
-  Measured against 8.2.11 (2026-09-06); corpus as above.
+  **And a SORT over a document where both readings apply is an ERROR**, which
+  neither server produces:
 
-- [ ] **`sort: {"x.0": 1}` ranks an array element against documents wrongly
-  (1 shape).** mongod puts `x: [[5]]` (whose `x.0` is the ARRAY `[5]`) after
-  `x: [{y: 5}, …]` (whose `x.0` is a DOCUMENT), matching BSON's Object &lt; Array
-  rank; ours puts it before.
+  ```
+  x: [{"0": 5}]     find {x.0: 5}      -> matches (mongod tolerates it)
+                    sort {x.0: 1}      -> 16746 Location16746
+       "Ambiguous field name found in array (do not use numeric field names in
+        embedded elements in an array), field: '0' for array: { 0: { 0: 5 } }"
+  ```
+
+  Three pieces of work, in order of value: the no-descent-after-an-index rule
+  (3 matching shapes), the sort ordering that follows from it, and the 16746
+  ambiguity error. `paths.get_path_values` would have to report WHICH reading
+  produced each value, which the index layer also consumes — so this needs its
+  own check that an index still cannot change the answer. Corpus and measured
+  expectations: `scratchpad/probe_pos.py` + `probe_pos2.py`.
 
 - [ ] **Computed projections (2 shapes).** `{lit: {$literal: 7}}` and
   `{dbl: {$multiply: ["$x", 2]}}` — mongod evaluates them per document (and

@@ -19,7 +19,7 @@ import bson
 from bson import Binary, Code, Decimal128, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
 from secantus.bsontypes import regex_options_string
-from secantus.paths import get_path
+from secantus.paths import get_path_values
 
 
 def _to_decimal(value: Any) -> Decimal:
@@ -310,14 +310,42 @@ def sort_docs(
         return docs
     fields = [(f, int(d) == -1) for f, d in sort_spec.items()]
     # Single sort over a precomputed tuple key rather than N stable passes:
-    # one pass through Timsort, get_path called once per field per doc.
+    # one pass through Timsort, the path resolved once per field per doc.
     return sorted(
         docs,
         key=lambda d: tuple(
-            _SortKey(_array_sort_value(get_path(d, f), rev), reverse=rev, collation=collation)
-            for f, rev in fields
+            _SortKey(_sort_value(d, f, rev), reverse=rev, collation=collation) for f, rev in fields
         ),
     )
+
+
+def _sort_value(doc: Any, field: str, reverse: bool) -> Any:
+    """The value a document sorts by for one field of the sort spec.
+
+    Resolved with ``paths.get_path_values``, which walks a dotted path THROUGH
+    an array exactly one level, rather than ``get_path``, which does not walk
+    one at all. mongod ranks ``x: [{y: 1}]`` among the documents that HAVE an
+    ``x.y`` -- by 1 -- and both servers ranked it with those that have none, so
+    a ``sort({"x.y": 1})`` over array-of-subdocument data came back in the wrong
+    order. Wrong order is wrong RESULTS as soon as a ``limit`` is involved
+    (probed 8.2.11, 2026-09-06).
+
+    One level, not any: ``x: [[{y: 5}]]`` has no ``x.y`` on mongod either, and
+    `get_path_values` already stops there. Using it also makes the in-memory
+    sort agree with the INDEX path, which generates its multikey entries from
+    the same resolver -- an index must change speed, never results.
+
+    A path yielding several values (``x: [{y: 5}, {y: 6}]``) sorts by the
+    representative element the direction asks for, the same rule
+    :func:`_array_sort_value` applies within one array value.
+    """
+    values, _descended = get_path_values(doc, field)
+    if not values:
+        # Absent: `get_path` returned None here before and still should, so a
+        # missing path keeps ranking with null.
+        return None
+    keyed = [_SortKey(_array_sort_value(v, reverse)) for v in values]
+    return (max(keyed) if reverse else min(keyed)).val
 
 
 def _array_sort_value(v: Any, reverse: bool) -> Any:
