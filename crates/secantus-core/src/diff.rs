@@ -87,36 +87,39 @@ pub(crate) fn same_encoding(a: &Bson, b: &Bson) -> bool {
                     .zip(y.iter())
                     .all(|((k1, v1), (k2, v2))| k1 == k2 && same_encoding(v1, v2))
         }
-        _ => std::mem::discriminant(a) == std::mem::discriminant(b),
+        // Values, not discriminants. This used to be
+        // `discriminant(a) == discriminant(b)`, which is only sound behind
+        // `eq` (it would call `"x"` and `"y"` the same). `doc_changed` calls
+        // this standalone, so it compares properly; `Bson`'s `==` is exact for
+        // every variant the arms above do not already special-case.
+        _ => a == b,
     }
 }
 
-/// Did an update actually change the document? The storage layer's write guard.
+/// Did an update actually change the STORED BYTES of the document?
 ///
-/// NOT a bare `new != old`. `Bson::Double`'s `PartialEq` is `f64 ==`, where
-/// `0.0 == -0.0` is **true** -- so `{$set: {a: -0.0}}` over `a: 0.0` compared
-/// equal, the write was skipped, `nModified` was 0, no oplog entry was emitted,
-/// and a read-back gave the OLD zero. The value the caller asked to store was
-/// never stored. mongod stores it and reports the update (probed 8.2.11,
-/// 2026-09-06, against both this server and the Python one).
+/// The encoding is the whole rule, and each of the two cheaper tests it
+/// replaces got a different case wrong:
 ///
-/// So a difference in the ENCODED BSON also counts as a change -- the same rule
-/// `secantus.storage._doc_changed` applies on the Python server, and reusing
-/// `same_encoding` keeps it one predicate rather than a third copy.
+/// * `new != old` alone cannot see a signed zero. `Bson::Double`'s `f64 ==`
+///   calls `-0.0` equal to `0.0`, so `{$set: {a: -0.0}}` over `a: 0.0` skipped
+///   the write and silently kept the old zero (fixed 2026-09-05).
+/// * `new != old` alone also fires on a document that merely CONTAINS a NaN,
+///   because `NaN != NaN`. Nothing was written, yet the document was rewritten
+///   and an oplog entry emitted -- a phantom write and a phantom change-stream
+///   event. `{$unset: {absent: ""}}` on any document holding a NaN reported
+///   `nModified: 1` (measured 8.2.11, 2026-09-06).
 ///
-/// Both comparisons are needed and they are complementary: encoding alone would
-/// call two NaNs equal, and `!=` alone cannot see a signed zero. This is NOT a
-/// model of mongod's `nModified`, which is per-OPERATOR (`$set` of a NaN over
-/// the same NaN is 0 while `$inc: 1` on it is 1, with byte-identical output
-/// either way) -- both servers report 1 for the first and that gap is tracked
-/// separately in `tasks/backlog.md`. This predicate fixes only the case where
-/// the document genuinely differs and the write was dropped.
+/// The encoding gets both right: a signed zero encodes differently, and two
+/// NaNs with the same bits encode the same.
+///
+/// The encoding is not all of mongod's `nModified` rule, though. mongod also
+/// counts an ARITHMETIC write whose result is a NaN -- `{$inc: {a: 1}}` over
+/// `a: NaN` reports 1 with byte-identical output, while `{$min: {a: 5}}` over
+/// the same document reports 0 because `$min` declined to write. That half is
+/// invisible in the bytes, so it is a separate, narrow check:
+/// `update::arith_wrote_nan`, which the callers apply alongside this one.
 pub fn doc_changed(new: &Document, old: &Document) -> bool {
-    if new != old {
-        return true;
-    }
-    // `==` already matched, so any remaining difference is one BSON encodes and
-    // `f64 ==` hides: a signed zero, nested at any depth.
     !(new.len() == old.len()
         && new
             .iter()
@@ -390,6 +393,48 @@ mod tests {
         compute_update_description(&pre, &post).expect("should not fall back")
     }
 
+    /// A document that merely CONTAINS a NaN has not changed. The old guard
+    /// asked `new != old`, and `NaN != NaN`, so an update that touched nothing
+    /// rewrote the document and emitted an oplog entry -- a phantom write.
+    #[test]
+    fn doc_changed_ignores_an_untouched_nan() {
+        assert!(!doc_changed(
+            &doc! {"a": f64::NAN, "b": 1i32},
+            &doc! {"a": f64::NAN, "b": 1i32}
+        ));
+        assert!(!doc_changed(
+            &doc! {"a": {"n": f64::NAN}},
+            &doc! {"a": {"n": f64::NAN}}
+        ));
+        assert!(!doc_changed(
+            &doc! {"a": [f64::NAN]},
+            &doc! {"a": [f64::NAN]}
+        ));
+    }
+
+    /// `same_encoding`'s catch-all used to compare DISCRIMINANTS, which is only
+    /// sound behind `eq`. `doc_changed` calls it standalone now, so an ordinary
+    /// difference must still register.
+    #[test]
+    fn doc_changed_sees_ordinary_differences() {
+        assert!(doc_changed(&doc! {"a": "x"}, &doc! {"a": "y"}));
+        assert!(doc_changed(&doc! {"a": 1i32}, &doc! {"a": 2i32}));
+        assert!(doc_changed(&doc! {"a": 1i32}, &doc! {"b": 1i32}));
+        assert!(doc_changed(&doc! {"a": 1i32}, &doc! {"a": 1i32, "b": 2i32}));
+        assert!(doc_changed(
+            &doc! {"a": [1i32, 2i32]},
+            &doc! {"a": [1i32, 3i32]}
+        ));
+        assert!(doc_changed(
+            &doc! {"a": {"b": "x"}},
+            &doc! {"a": {"b": "y"}}
+        ));
+        assert!(!doc_changed(
+            &doc! {"a": 1i32, "b": "x"},
+            &doc! {"a": 1i32, "b": "x"}
+        ));
+    }
+
     /// A signed zero is a CHANGE even though `==` calls the documents equal.
     /// Before this predicate the storage layer's `new != doc` guard skipped the
     /// write entirely and the caller's `-0.0` was silently never stored.
@@ -436,13 +481,21 @@ mod tests {
         assert!(!doc_changed(&Document::new(), &Document::new()));
     }
 
-    /// NaN is reported as a change by `!=` (`f64` NaN is unequal to itself) and
-    /// the encoding tiebreak must not quietly reverse that -- doing so would
-    /// make `{$inc: {a: 1}}` over `a: NaN`, which mongod counts as modified,
-    /// report 0. Both servers agree here; see the module docs.
+    /// This used to assert the OPPOSITE, on the reasoning that `!=` reports a
+    /// NaN as a change and the encoding tiebreak "must not quietly reverse
+    /// that", or `{$inc: {a: 1}}` over `a: NaN` -- which mongod counts as
+    /// modified -- would report 0.
+    ///
+    /// The premise was right and the conclusion was wrong. Keeping `!=` bought
+    /// that one case by making EVERY update on a document containing a NaN look
+    /// like a change, including ones that touched nothing at all, which is a
+    /// phantom write and a phantom change-stream event (measured 8.2.11,
+    /// 2026-09-06). The `$inc`-over-NaN case is real but it is a per-OPERATOR
+    /// rule, and it belongs in a per-operator check: `update::arith_wrote_nan`.
+    /// Two rules, each answering the question it can actually answer.
     #[test]
-    fn doc_changed_leaves_nan_reporting_alone() {
-        assert!(doc_changed(&doc! {"a": f64::NAN}, &doc! {"a": f64::NAN}));
+    fn doc_changed_does_not_report_an_untouched_nan() {
+        assert!(!doc_changed(&doc! {"a": f64::NAN}, &doc! {"a": f64::NAN}));
     }
 
     #[test]

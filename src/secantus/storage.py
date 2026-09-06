@@ -55,7 +55,12 @@ from secantus.sortkey import (
     encode_value,
     encode_value_directed,
 )
-from secantus.update import apply_update, find_positional_matches, is_operator_form
+from secantus.update import (
+    apply_update,
+    arith_wrote_nan,
+    find_positional_matches,
+    is_operator_form,
+)
 
 _GEO_2DSPHERE = "2dsphere"
 _GEO_2D = "2d"
@@ -1441,35 +1446,42 @@ def _is_nan_value(v: Any) -> bool:
 
 
 def _doc_changed(new: Any, old: Any) -> bool:
-    """Did an update actually change the document?
+    """Did an update actually change the STORED BYTES of the document?
 
-    NOT a bare ``new != old``. Python's ``==`` treats ``-0.0`` and ``0.0`` as
-    equal -- and an ``int`` ``0`` as equal to a ``float`` ``-0.0`` -- so
-    ``{$set: {a: -0.0}}`` over ``a: 0.0`` compared EQUAL, the write was skipped,
-    and the value the caller asked to store was silently not stored:
-    ``modifiedCount: 0``, no change-stream event, and a read-back of ``0.0``.
-    mongod stores it and reports the update (probed 8.2.11, 2026-09-05).
+    The ENCODED BSON is the whole rule, and each of the two cheaper tests it
+    replaces got a different case wrong:
 
-    So a difference in the ENCODED BSON also counts as a change. That catches
-    both shapes with one rule -- signed zero and a numeric type change -- since
-    BSON encodes each distinctly.
+    * ``new != old`` alone cannot see a signed zero. Python's ``==`` calls
+      ``-0.0`` equal to ``0.0``, so ``{$set: {a: -0.0}}`` over ``a: 0.0``
+      compared equal, the write was skipped, and the value the caller asked to
+      store was silently not stored (fixed 2026-09-05).
+    * ``new != old`` alone also fires on a document that merely CONTAINS a NaN,
+      because ``nan != nan``. Nothing was written, yet the document was
+      rewritten and an oplog entry emitted -- a phantom write. On the Python
+      server this was hidden by an accident: container equality short-circuits
+      on object identity, so an untouched value compared equal. The Rust server
+      has no such accident and reported ``nModified: 1`` for an ``$unset`` of a
+      MISSING field on any document holding a NaN (measured 8.2.11,
+      2026-09-06). Relying on that accident was never safe.
 
-    The two comparisons are complementary and BOTH are needed. Bytes alone
-    would call two NaNs equal, and `!=` alone cannot see a signed zero. Note
-    that this does not make the pair a model of mongod's `nModified`: that rule
-    is per-OPERATOR (`$set` of a NaN over the same NaN is 0 while `$inc: 1` on
-    it is 1, with a byte-identical `000000000000f87f` stored either way), and is
-    tracked separately in `tasks/backlog.md`. This function fixes only the case
-    where the document genuinely differs and the write was dropped.
+    Bytes get both right: a signed zero encodes differently, and two NaNs with
+    the same bits encode the same.
+
+    Bytes alone are not all of mongod's ``nModified`` rule, though. mongod also
+    counts an ARITHMETIC write whose result is a NaN -- ``{$inc: {a: 1}}`` over
+    ``a: NaN`` reports 1 with byte-identical output, while ``{$min: {a: 5}}``
+    over the same document reports 0 because ``$min`` declined to write. That
+    half cannot be seen in the bytes at all, so it is a separate, narrow check:
+    :func:`secantus.update.arith_wrote_nan`, which the callers apply alongside
+    this one.
     """
-    if new != old:
-        return True
     try:
         return bson.encode(new) != bson.encode(old)
     except Exception:
-        # Anything BSON cannot encode is not something we can compare this way;
-        # `==` already said they match.
-        return False
+        # Anything BSON cannot encode is not something we can compare this way.
+        # Fall back to the value comparison and treat "cannot tell" as CHANGED,
+        # so an uncomparable document is written rather than silently dropped.
+        return new != old or type(new) is not type(old)
 
 
 def _op_implies_bound(qop: str, qv: Any, pop: str, pv: Any) -> bool:
@@ -5994,7 +6006,7 @@ class Storage:
                     positional_matches=pos,
                     let=let,
                 )
-                if _doc_changed(new, doc):
+                if _doc_changed(new, doc) or arith_wrote_nan(new, update):
                     # ``validationLevel: "moderate"`` exempts a document that
                     # ALREADY failed the validator before this update — the level
                     # exists so a validator can be added to a collection with
@@ -6160,7 +6172,7 @@ class Storage:
                     positional_matches=pos,
                     let=let,
                 )
-                if _doc_changed(new, doc):
+                if _doc_changed(new, doc) or arith_wrote_nan(new, update):
                     # Document-validator check: collection-level
                     # ``validator`` (set via ``create`` / ``collMod``)
                     # rejects updates whose result fails the predicate.

@@ -4780,37 +4780,59 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   is the one this file already states: a conclusion drawn from a single run of a
   probe is not a measurement.
 
-- [ ] **`nModified` counts a `$min`/`$max` that declined to write (2 shapes,
-  2026-09-03).** `{$min: {a: 5}}` and `{$min: {a: -Infinity}}` over `a: NaN`
-  both correctly leave the field at NaN on both servers, but the Rust server
-  reports `nModified: 1` where mongod reports `0`.
+- [x] **RESOLVED (2026-09-06): `nModified` on NaN documents — and the PHANTOM
+  WRITE underneath it.** Filed as 2 shapes (`$min`/`$max` declining over a NaN).
+  Probing it found the write guard itself was the problem, and the blast radius
+  was far wider: `new != doc` fires whenever the document contains a NaN
+  ANYWHERE, because `NaN != NaN`. So an update that touched nothing at all —
+  `$unset` of a missing field, `$rename` of a missing source, `$pull` that
+  matched nothing, and the same with the NaN nested in a subdocument or inside
+  an array — rewrote the document, emitted an oplog entry and delivered a
+  change-stream event. The counter was the symptom; the phantom write was the
+  defect. 11 shapes on the Rust server.
 
-  **Correction (2026-09-06): the diagnosis in the sentence that stood here was
-  wrong.** It said "the Rust storage update path increments `modified` for every
-  matched document; the Python one guards it with `if new != doc`". Both servers
-  guard it — a genuine no-op (`{$set: {a: 0.0}}` over `a: 0.0`) reports
-  `nModified: 0` on the Rust server, measured. What differs is the guard's
-  verdict on NaN: Rust's `f64 ==` says two NaNs are unequal, so a `$min` that
-  declined to write still looks changed. The rest of this entry — that mongod's
-  rule is per-OPERATOR and neither a byte nor a value comparison reproduces it —
-  stands, and it is why the signed-zero fix in the resolved entry above
-  deliberately did NOT touch this: `doc_changed` keeps `!=` as its primary test
-  precisely so the NaN reporting is unchanged.
+  The Python server was shielded by an ACCIDENT this file already flagged as
+  accidental: container equality short-circuits on object identity, so an
+  untouched value compares equal. That is gone from both servers now — both
+  compare the encoded BSON, which sees a signed zero and a numeric type change
+  (the 2026-09-05 fix, preserved) and treats two identical NaNs as identical.
 
-  **Both cheap fixes are wrong, measured.** A BYTE comparison of the encoded
-  documents was tried and made things worse — `{$inc: {a: 1}}` over `a: NaN`
-  produces byte-identical output and mongod DOES count it modified, so the probe
-  went 6 → 7. A bson VALUE comparison fails the other way: `Bson::Double(NaN)`
-  is unequal to itself, so the `$min` case would still count as modified.
+  **The per-operator half is real and is now its own check.** These five have
+  byte-identical before and after images, so no document comparison separates
+  them (measured 8.2.11, 2026-09-06):
 
-  mongod's actual rule is "did an operator write the field", and Python satisfies
-  it only by ACCIDENT: Python's container equality short-circuits on object
-  identity, so a declined write preserves the value object and compares equal,
-  while `NaN + 1` is a fresh object that compares unequal to itself. Nothing in
-  Rust reproduces that incidentally. The fix is to thread a "wrote something"
-  flag out of `apply_update` — every `set_path` call site in
-  `crates/secantus-core/src/update.rs` — and count on that, which is a change
-  across every operator and is why it is filed rather than guessed at again.
+  ```
+  {$inc: {a: 1}}   over a: NaN   -> 1   (wrote a fresh NaN)
+  {$inc: {a: 0}}   over a: NaN   -> 1   (same)
+  {$mul: {a: 2}}   over a: NaN   -> 1   (same)
+  {$set: {a: NaN}} over a: NaN   -> 0   ($set wrote an equal value)
+  {$min: {a: 5}}   over a: NaN   -> 0   ($min declined; NaN sorts lowest)
+  {$inc: {a: 0}}   over a: 1     -> 0   (wrote, but nothing changed)
+  ```
+
+  The discriminator is exactly "an arithmetic operator produced a NaN" —
+  `update.arith_wrote_nan` / `secantus_core::update::arith_wrote_nan`, applied
+  alongside the byte comparison. **This entry's own diagnosis was wrong:** it
+  said mongod's rule is "did an operator write the field". `{$inc: {a: 0}}` over
+  `a: 1` writes and reports 0, so it is not. It is "the bytes changed, OR an
+  arithmetic operator produced a NaN".
+
+  Both earlier attempts recorded here as failures are subsumed rather than
+  contradicted: a byte comparison alone does lose the `$inc`-over-NaN cases, and
+  a BSON value comparison alone does lose them the other way. Neither was wrong;
+  both were incomplete, because one predicate cannot answer a per-operator
+  question.
+
+  58 shapes across four probes, both servers now identical to mongod on all of
+  them. Pinned by `tests/test_update_nmodified_nan.py` (30 tests, including
+  change-stream assertions that no event is emitted) and Rust unit tests in
+  `diff.rs` and `update.rs`.
+
+  One earlier test had to be inverted: `doc_changed_leaves_nan_reporting_alone`
+  asserted that a NaN pair reports as changed, on the reasoning that not doing
+  so would break `$inc` over NaN. The premise was right and the conclusion was
+  wrong — keeping it bought that one case at the price of every no-op update on
+  a NaN document.
 
 - [ ] **Aggregation expression error surface: 50 codes + 212 messages left
   (2026-09-02).** `tools/probes/agg_expressions.py` had never been reported on;
