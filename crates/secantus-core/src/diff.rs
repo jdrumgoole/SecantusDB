@@ -75,7 +75,7 @@ fn same_stored_value(a: &Bson, b: &Bson) -> R<bool> {
 /// Do two `eq`-equal values encode to the same BSON? Distinguishes a signed
 /// zero (by bit pattern) and a numeric type change (by variant), recursing so
 /// that either nested in an array or a subdocument counts just the same.
-fn same_encoding(a: &Bson, b: &Bson) -> bool {
+pub(crate) fn same_encoding(a: &Bson, b: &Bson) -> bool {
     match (a, b) {
         (Bson::Double(x), Bson::Double(y)) => x.to_bits() == y.to_bits(),
         (Bson::Array(x), Bson::Array(y)) => {
@@ -89,6 +89,39 @@ fn same_encoding(a: &Bson, b: &Bson) -> bool {
         }
         _ => std::mem::discriminant(a) == std::mem::discriminant(b),
     }
+}
+
+/// Did an update actually change the document? The storage layer's write guard.
+///
+/// NOT a bare `new != old`. `Bson::Double`'s `PartialEq` is `f64 ==`, where
+/// `0.0 == -0.0` is **true** -- so `{$set: {a: -0.0}}` over `a: 0.0` compared
+/// equal, the write was skipped, `nModified` was 0, no oplog entry was emitted,
+/// and a read-back gave the OLD zero. The value the caller asked to store was
+/// never stored. mongod stores it and reports the update (probed 8.2.11,
+/// 2026-09-06, against both this server and the Python one).
+///
+/// So a difference in the ENCODED BSON also counts as a change -- the same rule
+/// `secantus.storage._doc_changed` applies on the Python server, and reusing
+/// `same_encoding` keeps it one predicate rather than a third copy.
+///
+/// Both comparisons are needed and they are complementary: encoding alone would
+/// call two NaNs equal, and `!=` alone cannot see a signed zero. This is NOT a
+/// model of mongod's `nModified`, which is per-OPERATOR (`$set` of a NaN over
+/// the same NaN is 0 while `$inc: 1` on it is 1, with byte-identical output
+/// either way) -- both servers report 1 for the first and that gap is tracked
+/// separately in `tasks/backlog.md`. This predicate fixes only the case where
+/// the document genuinely differs and the write was dropped.
+pub fn doc_changed(new: &Document, old: &Document) -> bool {
+    if new != old {
+        return true;
+    }
+    // `==` already matched, so any remaining difference is one BSON encodes and
+    // `f64 ==` hides: a signed zero, nested at any depth.
+    !(new.len() == old.len()
+        && new
+            .iter()
+            .zip(old.iter())
+            .all(|((k1, v1), (k2, v2))| k1 == k2 && same_encoding(v1, v2)))
 }
 
 fn child_path(path: &str, key: &str) -> String {
@@ -355,6 +388,61 @@ mod tests {
 
     fn d(pre: Document, post: Document) -> Document {
         compute_update_description(&pre, &post).expect("should not fall back")
+    }
+
+    /// A signed zero is a CHANGE even though `==` calls the documents equal.
+    /// Before this predicate the storage layer's `new != doc` guard skipped the
+    /// write entirely and the caller's `-0.0` was silently never stored.
+    #[test]
+    fn doc_changed_sees_a_signed_zero() {
+        assert!(doc_changed(&doc! {"a": -0.0}, &doc! {"a": 0.0}));
+        assert!(doc_changed(&doc! {"a": 0.0}, &doc! {"a": -0.0}));
+        // Nested at any depth, and inside an array.
+        assert!(doc_changed(
+            &doc! {"a": {"b": -0.0}},
+            &doc! {"a": {"b": 0.0}}
+        ));
+        assert!(doc_changed(
+            &doc! {"a": [1i32, -0.0]},
+            &doc! {"a": [1i32, 0.0]}
+        ));
+        // A second, genuinely-unchanged field must not mask the changed one.
+        assert!(doc_changed(
+            &doc! {"a": -0.0, "b": 1i32},
+            &doc! {"a": 0.0, "b": 1i32}
+        ));
+    }
+
+    /// A numeric TYPE change is a change too -- `Bson`'s variant-aware `==`
+    /// already catches this one, but it is the other half of what mongod
+    /// reports as modified, so pin it.
+    #[test]
+    fn doc_changed_sees_a_numeric_type_change() {
+        assert!(doc_changed(&doc! {"a": 0.0}, &doc! {"a": 0i32}));
+        assert!(doc_changed(&doc! {"a": 1.0}, &doc! {"a": 1i32}));
+        assert!(doc_changed(&doc! {"a": 1i64}, &doc! {"a": 1i32}));
+    }
+
+    /// The negative side: an identical document is not a change, or every
+    /// no-op update would write and report `nModified: 1`.
+    #[test]
+    fn doc_changed_is_false_for_an_identical_document() {
+        assert!(!doc_changed(&doc! {"a": 0.0}, &doc! {"a": 0.0}));
+        assert!(!doc_changed(&doc! {"a": -0.0}, &doc! {"a": -0.0}));
+        assert!(!doc_changed(
+            &doc! {"a": {"b": [1i32, "x"]}},
+            &doc! {"a": {"b": [1i32, "x"]}}
+        ));
+        assert!(!doc_changed(&Document::new(), &Document::new()));
+    }
+
+    /// NaN is reported as a change by `!=` (`f64` NaN is unequal to itself) and
+    /// the encoding tiebreak must not quietly reverse that -- doing so would
+    /// make `{$inc: {a: 1}}` over `a: NaN`, which mongod counts as modified,
+    /// report 0. Both servers agree here; see the module docs.
+    #[test]
+    fn doc_changed_leaves_nan_reporting_alone() {
+        assert!(doc_changed(&doc! {"a": f64::NAN}, &doc! {"a": f64::NAN}));
     }
 
     #[test]

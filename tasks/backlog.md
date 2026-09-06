@@ -4654,78 +4654,73 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   something already ported. Sizing from a `#[test]` took about a minute and
   needed none of the WiredTiger build the entry said was blocking.
 
-- [ ] **SILENT DATA LOSS in the RUST STORAGE write path — `$set` of `-0.0`
-  over `0.0` is dropped (2026-09-05).** The Python side of this is FIXED
-  (PR #1317); `crates/secantus-storage/src/lib.rs` still has the bare guard.
+- [x] **RESOLVED (2026-09-06): the three Rust update-write defects, all
+  measured against mongod 8.2.11 and all fixed in one batch.** The entries that
+  stood here were the signed-zero SILENT DATA LOSS in the Rust storage write
+  path, the `$inc` / `$mul` int64 overflow that could only defer, and the
+  missing parse-vs-execution error wrapper. `crates/secantus-storage` now
+  guards its two write sites with `secantus_core::diff::doc_changed` (which
+  falls back to the encoded BSON when `==` matches, the same rule
+  `storage._doc_changed` applies on the Python server); the overflow reports
+  mongod's real message via a new `update::arith_overflow_error`, the same
+  "re-run a narrower check" shape `arith_type_error` already used; and
+  `Fallback::Mongo` carries an `exec` bit that `StorageError` and the adapter
+  thread to the command layer, which interpolates the command name into
+  `Plan executor error during <command> :: caused by ::`.
 
-  ```rust
-  if new != doc {          // ~line 10649, the update path
-  ```
+  Pinned by `tests/test_rust_update_write_fidelity.py` (33 tests over the wire,
+  28 of which fail against the pre-fix binary) plus Rust unit tests in
+  `diff.rs`, `update.rs`, `util.rs` and `secantus-storage`.
 
-  Rust's `Document` equality compares a `Bson::Double` with `f64 ==`, where
-  `0.0 == -0.0` is **true** — so the write is skipped, `nModified` is 0, no
-  oplog entry is emitted, and a read-back gives the OLD zero. The value the
-  caller asked to store is never stored. mongod stores it and reports the
-  update (probed 8.2.11, 2026-09-05). The same guard also drops a numeric TYPE
-  change (`int 0` -> `double -0.0`, and `int 1` -> `double 1.0`).
+  **Two things the old entries got wrong, both from reading rather than
+  running.** The data-loss entry said the bare guard "also drops a numeric TYPE
+  change (`int 0` -> `double -0.0`, and `int 1` -> `double 1.0`)". It does not:
+  Rust's `Bson` equality is variant-aware, so those already worked, and only the
+  signed zero was ever dropped — the claim was inherited from the Python bug,
+  where `==` really does hide a type change. The overflow entry said 3 shapes;
+  a probe found 5 (`$inc` at both int64 ends, `$mul` past it, two int64 operands
+  summing past it, and `$mul: 2` on the max).
 
-  **Nothing will tell you this is broken.** The parity suites pin the pure
-  engines, not the storage layer; the Python fix and its 17 regression tests do
-  not touch this file. It was found only by grepping
-  `crates/secantus-storage/` for the helper after the Python fix landed — the
-  discipline this file's §7 header already prescribes and which is easy to
-  skip.
+  The execution-vs-parse split was also cheaper than the entry's scoping
+  ("adding a field to `WriteError` and touching its ~20 construction sites").
+  The site count was right — 21 — but 12 of them are one mechanical arm each in
+  a single adapter file, `WriteError` is destructured in exactly two places, and
+  the compiler enumerates every site it misses. Under three hours end to end,
+  including the probes.
 
-  **The fix** mirrors `storage._doc_changed`: a difference in the ENCODED BSON
-  also counts as a change. `secantus-core::diff` already has the predicate
-  (`same_stored_value` / `same_encoding`, added by #1317) — make it `pub` and
-  call it, rather than writing a third copy.
+- [ ] **Both servers report `{$set: {"": 1}}` as a success (2026-09-06).**
+  mongod answers `56 An empty update path is not valid.`; the Python server and
+  the Rust server both accept it and report `ok: 1`. Found while sweeping the
+  update error surface for the wrapper work above — it is the one shape in that
+  17-case sweep where BOTH servers diverge from mongod on the code, not just on
+  the message. The Rust engine already raises exactly this error for `$rename`
+  (`crates/secantus-core/src/update.rs`, the `Fallback::mongo(56, …)` site), so
+  the message exists and only the `$set` / general-path gate is missing.
 
-  Deliberately NOT attempted at session close on 2026-09-05: this crate links
-  WiredTiger and is excluded from the clean workspace, so it cannot be built or
-  tested in a fresh worktree, and an unverified change to a storage engine's
-  write path is worse than a filed one. The `rust-storage` CI job does build it.
-
-- [ ] **The Rust update path has no parse-time / execution-time distinction
-  (2 shapes, 2026-09-02).** mongod wraps an EXECUTION-time update failure as
-  `Plan executor error during update :: caused by :: <message>` and reports a
-  parse-time one bare; the Rust server sends every one bare. Code and message
-  body already match — `$inc` on a string and `$push` on a non-array are the two
-  the corpus reaches.
-
-  The Python engine carries this as `UpdateError.exec_error`, set at 14 sites.
-  Rust needs the same bit threaded from the engine through to
-  `util::write_error`, because the wrapper names the COMMAND (`update` vs
-  `findAndModify` vs a pipeline update) and so cannot be baked into the engine's
-  message.
-
-  **Scoped 2026-09-02, and it is wider than it looks.** `Fallback::Mongo` takes
-  the flag cheaply — only two sites construct it with all fields, the rest
-  destructure with `..`. The cost is downstream: `secantus-storage-adapter`
-  flattens BOTH `WtError::UpdateTypeMismatch` and `WtError::QueryError` into
-  `StorageError::WriteError { code, errmsg }`, so the distinction is already
-  lost by the time the command layer sees it. Carrying it means adding a field
-  to `WriteError` and touching its ~20 construction sites. Worth doing
-  deliberately; not worth bolting on, which is why it is still here.
-
-- [ ] **`$inc` / `$mul` int64 overflow DEFERS on the Rust server (3 shapes,
-  2026-09-03).** `{$inc: {a: 1}}` on `a: 2^63-1`, the same at the negative end,
-  and `{$mul: {a: 4}}` on `a: 2^62` all answer
-  `2 BadValue: query uses a construct the Rust server does not support`.
-  mongod (and the Python engine) report
-  `Failed to apply $inc operations to current value ((NumberLong)...) for
-  document {_id: 1}`. The code already matches; only the message does not,
-  because a `Fallback::Defer` has no Python engine behind it on the standalone
-  Rust server and degrades to the generic text. Fix is to return
-  `Fallback::mongo(2, <the real message>)` at the overflow sites in
-  `crates/secantus-core/src/update.rs`, the same shape used for every other
-  refused argument.
+- [ ] **`$addToSet` with a non-array `$each` answers 2, mongod answers 14
+  (2026-09-06).** `{$addToSet: {a: {$each: 5}}}` -> mongod
+  `14 The argument to $each in $addToSet must be an array but it was of type
+  int`; both servers send the identical message under code **2**. Message
+  already matches, so this is a one-constant change on each side
+  (`crates/secantus-core/src/update.rs` and `src/secantus/update.py`). Same
+  sweep as the entry above.
 
 - [ ] **`nModified` counts a `$min`/`$max` that declined to write (2 shapes,
   2026-09-03).** `{$min: {a: 5}}` and `{$min: {a: -Infinity}}` over `a: NaN`
   both correctly leave the field at NaN on both servers, but the Rust server
-  reports `nModified: 1` where mongod reports `0`. The Rust storage update path increments `modified` for every
-  matched document; the Python one guards it with `if new != doc`.
+  reports `nModified: 1` where mongod reports `0`.
+
+  **Correction (2026-09-06): the diagnosis in the sentence that stood here was
+  wrong.** It said "the Rust storage update path increments `modified` for every
+  matched document; the Python one guards it with `if new != doc`". Both servers
+  guard it — a genuine no-op (`{$set: {a: 0.0}}` over `a: 0.0`) reports
+  `nModified: 0` on the Rust server, measured. What differs is the guard's
+  verdict on NaN: Rust's `f64 ==` says two NaNs are unequal, so a `$min` that
+  declined to write still looks changed. The rest of this entry — that mongod's
+  rule is per-OPERATOR and neither a byte nor a value comparison reproduces it —
+  stands, and it is why the signed-zero fix in the resolved entry above
+  deliberately did NOT touch this: `doc_changed` keeps `!=` as its primary test
+  precisely so the NaN reporting is unchanged.
 
   **Both cheap fixes are wrong, measured.** A BYTE comparison of the encoded
   documents was tried and made things worse — `{$inc: {a: 1}}` over `a: NaN`

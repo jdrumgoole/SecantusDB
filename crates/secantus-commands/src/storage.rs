@@ -67,7 +67,19 @@ pub enum StorageError {
     /// A per-operation failure the adapter has already mapped to a mongod error
     /// `code` (e.g. a bad filter → `2`, an immutable `_id` → `66`). Becomes a
     /// per-op `writeError`; the batch continues (unordered) or stops (ordered).
-    WriteError { code: i32, errmsg: String },
+    WriteError {
+        code: i32,
+        errmsg: String,
+        /// Whether mongod reports this one under its update-executor wrapper,
+        /// `Plan executor error during <command> :: caused by ::`. True for the
+        /// errors discoverable only while applying an update to a particular
+        /// stored document (a `$push` onto a non-array, an `$inc` overflow, an
+        /// `_id` change); false for parse errors readable from the update spec
+        /// alone (an unknown modifier, a path conflict). Probed 8.2.11
+        /// (2026-09-06) for both `update` and `findAndModify`. The command
+        /// handlers apply the wrapper because only they know the command name.
+        exec: bool,
+    },
     /// An unexpected internal failure — surfaces as a command-level
     /// `InternalError` (`code: 1`), not a per-op write error.
     Internal(String),
@@ -311,6 +323,7 @@ pub trait Storage: Send + Sync {
         Err(StorageError::WriteError {
             code: 2,
             errmsg: "pipeline-form updates are not supported by this storage backend".into(),
+            exec: false,
         })
     }
 

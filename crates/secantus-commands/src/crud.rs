@@ -493,7 +493,7 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // label and drivers retry the transaction.
             Err(e @ StorageError::WriteConflict) => return Ok(command_error(e).into_reply()),
             Err(e) => {
-                write_errors.push(Bson::Document(write_error(index, e)));
+                write_errors.push(Bson::Document(write_error(index, e, "delete")));
                 if ordered {
                     break;
                 }
@@ -1003,7 +1003,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // label and drivers retry the transaction.
             Err(e @ StorageError::WriteConflict) => return Ok(command_error(e).into_reply()),
             Err(e) => {
-                write_errors.push(Bson::Document(write_error(index, e)));
+                write_errors.push(Bson::Document(write_error(index, e, "update")));
                 if ordered {
                     break;
                 }

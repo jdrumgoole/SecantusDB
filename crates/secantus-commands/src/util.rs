@@ -221,9 +221,31 @@ pub(crate) fn encode_docs(docs: Vec<Document>) -> Result<Vec<Vec<u8>>, CommandEr
         .collect()
 }
 
+/// mongod's wrapper for an EXECUTION-time update error.
+///
+/// mongod reports the update errors that depend on the stored document -- a
+/// `$push` onto a non-array, an `$inc` past int64, an `_id` change -- as
+/// `Plan executor error during <command> :: caused by :: <message>`, and leaves
+/// the parse errors readable from the update spec alone (an unknown modifier, a
+/// path conflict, a `$rename` onto itself) bare. Probed 8.2.11 (2026-09-06)
+/// across ten wrapped and seven bare shapes, for both `update` and
+/// `findAndModify`.
+///
+/// The wrapper names the COMMAND, so it cannot be baked into the engine's
+/// message; the engine sets `exec` and the handler supplies the name. Mirrors
+/// the two sites in `secantus.commands` that do the same on the Python server.
+pub(crate) fn exec_wrapped(errmsg: String, exec: bool, command: &str) -> String {
+    if exec {
+        format!("Plan executor error during {command} :: caused by :: {errmsg}")
+    } else {
+        errmsg
+    }
+}
+
 /// Shape a per-operation `writeError` document from a pre-classified storage
-/// error (used by `delete`; `update` will reuse it).
-pub(crate) fn write_error(index: usize, err: StorageError) -> Document {
+/// error. `command` is the mongod command name for the executor wrapper (see
+/// [`exec_wrapped`]) -- `"update"` or `"delete"`.
+pub(crate) fn write_error(index: usize, err: StorageError, command: &str) -> Document {
     match err {
         StorageError::DuplicateKey(info) => {
             let mut e = doc! { "index": index as i32, "code": 11000, "errmsg": info.errmsg };
@@ -235,7 +257,8 @@ pub(crate) fn write_error(index: usize, err: StorageError) -> Document {
             }
             e
         }
-        StorageError::WriteError { code, errmsg } => {
+        StorageError::WriteError { code, errmsg, exec } => {
+            let errmsg = exec_wrapped(errmsg, exec, command);
             doc! { "index": index as i32, "code": code, "errmsg": errmsg }
         }
         // Internal is handled by callers (command-level error); shouldn't reach
@@ -252,13 +275,23 @@ pub(crate) fn write_error(index: usize, err: StorageError) -> Document {
 }
 
 /// Map a storage error to a command-level `CommandError` (for non-batch
-/// commands like `count` / `find`).
+/// commands like `count` / `find`). Read commands never carry an
+/// execution-time update error, so this drops the flag; `findAndModify`, which
+/// does, goes through [`command_error_during`].
 pub(crate) fn command_error(err: StorageError) -> CommandError {
+    command_error_during(err, "")
+}
+
+/// [`command_error`] with the command name for mongod's executor wrapper --
+/// `findAndModify` is the one non-batch command that applies an update.
+pub(crate) fn command_error_during(err: StorageError, command: &str) -> CommandError {
     match err {
         StorageError::Internal(msg) => CommandError::new(1, "InternalError", msg),
-        StorageError::WriteError { code, errmsg } => {
-            CommandError::new(code, code_name_for(code), errmsg)
-        }
+        StorageError::WriteError { code, errmsg, exec } => CommandError::new(
+            code,
+            code_name_for(code),
+            exec_wrapped(errmsg, exec, command),
+        ),
         StorageError::DuplicateKey(info) => CommandError::new(11000, "DuplicateKey", info.errmsg),
         StorageError::WriteConflict => CommandError::new(
             112,
@@ -302,6 +335,31 @@ mod tests {
     use super::as_i64;
     use bson::Bson;
     use std::str::FromStr;
+
+    /// mongod wraps an EXECUTION-time update error and leaves a parse error
+    /// bare, and the wrapper names the command. Probed 8.2.11 (2026-09-06).
+    #[test]
+    fn exec_wrapped_applies_mongods_executor_prefix() {
+        assert_eq!(
+            super::exec_wrapped(
+                "Cannot apply $pull to a non-array value".into(),
+                true,
+                "update"
+            ),
+            "Plan executor error during update :: caused by :: \
+             Cannot apply $pull to a non-array value"
+        );
+        // The command name is interpolated -- `findAndModify` reports its own.
+        assert_eq!(
+            super::exec_wrapped("boom".into(), true, "findAndModify"),
+            "Plan executor error during findAndModify :: caused by :: boom"
+        );
+        // A parse error stays exactly as the engine wrote it.
+        assert_eq!(
+            super::exec_wrapped("An empty update path is not valid.".into(), false, "update"),
+            "An empty update path is not valid."
+        );
+    }
 
     #[test]
     fn as_i64_coerces_numeric_types_incl_decimal128() {

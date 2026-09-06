@@ -23,7 +23,9 @@
 use bson::{doc, Bson, Document};
 
 use crate::argtypes;
-use crate::util::{bool_field, collation_of, command_error, doc_field, resolve_let_vars};
+use crate::util::{
+    bool_field, collation_of, command_error, command_error_during, doc_field, resolve_let_vars,
+};
 use crate::{CommandContext, CommandError, HandlerResult, StorageError};
 
 /// `findAndModify` / `findandmodify`.
@@ -517,6 +519,6 @@ fn storage_err_reply(e: StorageError) -> Document {
             }
             r
         }
-        other => command_error(other).into_reply(),
+        other => command_error_during(other, "findAndModify").into_reply(),
     }
 }

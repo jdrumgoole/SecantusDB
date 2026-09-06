@@ -215,6 +215,7 @@ fn eval(expr: &Bson, ctx: &Ctx) -> R {
                             code,
                             message,
                             folded: None,
+                            exec,
                         } => Fallback::Mongo {
                             code,
                             message,
@@ -222,6 +223,7 @@ fn eval(expr: &Bson, ctx: &Ctx) -> R {
                                 val,
                                 &ctx.vars.keys().cloned().collect::<Vec<_>>(),
                             )),
+                            exec,
                         },
                         other => other,
                     });
