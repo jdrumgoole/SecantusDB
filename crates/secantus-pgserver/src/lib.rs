@@ -60,6 +60,12 @@ pub struct PgHandler {
     txn: Mutex<Option<UserTransactionHandle>>,
     /// Session settings (GUCs), per connection as PostgreSQL's are.
     settings: Mutex<HashMap<String, String>>,
+    /// GUC changes to report to the client via `ParameterStatus` after the
+    /// current query, for the variables PostgreSQL marks GUC_REPORT (TimeZone,
+    /// DateStyle, ...). libpq / psycopg track the session `TimeZone` from these
+    /// and re-express a `timestamptz` in it -- without the report a stored
+    /// instant displays in the client's stale (startup) zone.
+    pending_params: Mutex<Vec<(String, String)>>,
     /// The in-progress `COPY ... FROM STDIN`, if any: target plus the bytes
     /// received so far. Per connection, like PostgreSQL's.
     copy_in: Mutex<Option<CopyInState>>,
@@ -151,6 +157,7 @@ impl PgHandler {
             db: db.to_string(),
             txn: Mutex::new(None),
             settings: Mutex::new(default_settings()),
+            pending_params: Mutex::new(Vec::new()),
             copy_in: Mutex::new(None),
             cursors: Mutex::new(HashMap::new()),
             uncommitted: Mutex::new(HashMap::new()),
@@ -1158,7 +1165,8 @@ impl NoopStartupHandler for PgHandler {
 impl SimpleQueryHandler for PgHandler {
     async fn do_query<C>(&self, _c: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
-        C: ClientInfo + Unpin + Send + Sync,
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         // The simple protocol takes any number of commands separated by
         // semicolons and answers with one result each. The extended protocol
@@ -1167,12 +1175,14 @@ impl SimpleQueryHandler for PgHandler {
         self.binary_results
             .store(false, std::sync::atomic::Ordering::Relaxed);
         let stmts = secantus_pgplan::split_statements(query).map_err(|e| Self::err(&e))?;
-        if stmts.len() <= 1 {
-            // The one-statement path is left exactly as it was, so the common
-            // case cannot be changed by the batching logic below.
-            return self.run(query, &[], 0).await;
-        }
-        self.run_batch(&stmts).await
+        let out = if stmts.len() <= 1 {
+            self.run(query, &[], 0).await
+        } else {
+            self.run_batch(&stmts).await
+        };
+        // Report any GUC change (TimeZone, ...) so the client tracks it.
+        self.report_pending_params(_c).await?;
+        out
     }
 }
 
@@ -1634,6 +1644,52 @@ impl PgHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(name.to_string(), def);
+    }
+
+    /// Queue a `ParameterStatus` report if this GUC is one PostgreSQL reports
+    /// (GUC_REPORT). Sent to the client after the query completes.
+    fn note_reportable_guc(&self, key: &str, value: &str) {
+        const REPORTED: [&str; 8] = [
+            "TimeZone",
+            "DateStyle",
+            "IntervalStyle",
+            "client_encoding",
+            "standard_conforming_strings",
+            "application_name",
+            "server_encoding",
+            "integer_datetimes",
+        ];
+        if REPORTED.contains(&key) {
+            self.pending_params
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((key.to_string(), value.to_string()));
+        }
+    }
+
+    /// Send a `ParameterStatus` for each GUC change queued by
+    /// `note_reportable_guc`. PostgreSQL reports these (TimeZone, DateStyle,
+    /// ...) so the client can interpret values -- psycopg re-expresses a
+    /// timestamptz in the session `TimeZone` it learns here.
+    async fn report_pending_params<C>(&self, client: &mut C) -> PgWireResult<()>
+    where
+        C: Sink<PgWireBackendMessage> + Unpin,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let pending: Vec<(String, String)> = std::mem::take(
+            &mut self
+                .pending_params
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for (name, value) in pending {
+            client
+                .feed(PgWireBackendMessage::ParameterStatus(
+                    pgwire::messages::startup::ParameterStatus::new(name, value),
+                ))
+                .await?;
+        }
+        Ok(())
     }
 
     /// The session's `TimeZone` GUC, resolved.
@@ -2155,6 +2211,11 @@ impl PgHandler {
 
     /// Execute one planned statement against storage.
     fn execute(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
+        // A timestamptz renders in the SESSION zone; capture it once here and
+        // thread it into the row encoder explicitly. A thread-local does not
+        // work: pgwire may encode the DataRows lazily on another async worker
+        // thread, where a thread-local set here would not be visible.
+        let row_tz = self.session_timezone();
         match stmt {
             Statement::Transaction(_) => unreachable!("handled before execute"),
             // Handled in `run`, which can await the row stream.
@@ -2319,14 +2380,24 @@ impl PgHandler {
                             let v = d.get(f).cloned().unwrap_or(Bson::Null);
                             let v = secantus_pgplan::apply_column_expr(expr, v, &tz)
                                 .map_err(|e| PgHandler::err(&e))?;
-                            encode_field_value(&mut enc, &schema_ref[i], Some(&v))?;
+                            encode_field_value(&mut enc, &schema_ref[i], Some(&v), &row_tz)?;
                             continue;
                         }
-                        // A timestamp is reassembled from its stored date plus
-                        // the hidden companion before it goes on the wire.
-                        match timestamp_text(&d, f) {
+                        // A stored timestamp/timestamptz is reassembled from its
+                        // date plus the hidden `__us_` companion. Both are a UTC
+                        // instant; a `timestamp` renders naively, a `timestamptz`
+                        // renders in the SESSION zone. A special value (infinity)
+                        // is a String and falls to encode_field_value.
+                        let reassembled = if *schema_ref[i].datatype() == Type::TIMESTAMPTZ {
+                            timestamptz_text(&d, f, &row_tz)
+                        } else {
+                            timestamp_text(&d, f)
+                        };
+                        match reassembled {
                             Some(text) => enc.encode_field(&Some(text.as_str()))?,
-                            None => encode_field_value(&mut enc, &schema_ref[i], d.get(f))?,
+                            None => {
+                                encode_field_value(&mut enc, &schema_ref[i], d.get(f), &row_tz)?
+                            }
                         }
                     }
                     Ok(enc.take_row())
@@ -2736,8 +2807,11 @@ impl PgHandler {
             Statement::DeallocateAll => Ok(vec![Response::Execution(Tag::new("DEALLOCATE ALL"))]),
 
             Statement::Set { name, value } => {
+                let key = canonical_setting(&name);
                 let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-                settings.insert(canonical_setting(&name), value);
+                settings.insert(key.clone(), value.clone());
+                drop(settings);
+                self.note_reportable_guc(&key, &value);
                 Ok(vec![Response::Execution(Tag::new("SET"))])
             }
 
@@ -2752,7 +2826,10 @@ impl PgHandler {
                     // must see the default, not an error.
                     match default_settings().get(&key) {
                         Some(d) => {
-                            settings.insert(key, d.clone());
+                            settings.insert(key.clone(), d.clone());
+                            let d = d.clone();
+                            drop(settings);
+                            self.note_reportable_guc(&key, &d);
                         }
                         None => {
                             settings.remove(&key);
@@ -2782,7 +2859,7 @@ impl PgHandler {
                 let rows = stream::iter(std::iter::once(values)).map(move |vals| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
                     for (i, v) in vals.iter().enumerate() {
-                        encode_field_value(&mut enc, &schema_ref[i], Some(v))?;
+                        encode_field_value(&mut enc, &schema_ref[i], Some(v), &row_tz)?;
                     }
                     Ok(enc.take_row())
                 });
@@ -2956,7 +3033,7 @@ impl PgHandler {
                             OutputCol::Group(i) => key[*i].clone().unwrap_or(Bson::Null),
                             OutputCol::Agg(i) => vals[*i].clone(),
                         };
-                        encode_field_value(&mut enc, &schema_ref[n], Some(&v))?;
+                        encode_field_value(&mut enc, &schema_ref[n], Some(&v), &row_tz)?;
                     }
                     Ok(enc.take_row())
                 });
@@ -3028,6 +3105,28 @@ fn timestamp_text(doc: &Document, field: &str) -> Option<String> {
         _ => 0,
     };
     Some(render_timestamp(ms * 1000 + rem))
+}
+
+/// A stored `timestamptz` COLUMN value: the same date + `__us_` companion a
+/// `timestamp` uses (the stored form is a UTC INSTANT), but rendered in the
+/// SESSION zone rather than naively. A special value (infinity / wide / BC) is
+/// stored as a String and is not handled here -- it falls to
+/// `encode_field_value`, which passes the String through verbatim.
+fn timestamptz_text(
+    doc: &Document,
+    field: &str,
+    tz: &secantus_pgplan::TimeZoneSetting,
+) -> Option<String> {
+    let ms = match doc.get(field) {
+        Some(Bson::DateTime(d)) => d.timestamp_millis(),
+        _ => return None,
+    };
+    let rem = match doc.get(companion_field(field)) {
+        Some(Bson::Int32(v)) if (1..1000).contains(v) => i64::from(*v),
+        Some(Bson::Int64(v)) if (1..1000).contains(v) => *v,
+        _ => 0,
+    };
+    Some(secantus_pgplan::render_timestamptz(ms * 1000 + rem, tz))
 }
 
 /// Encode one stored value as a SQL datum. Absent and explicit null are both
@@ -3389,6 +3488,7 @@ fn encode_field_value(
     enc: &mut DataRowEncoder,
     field: &FieldInfo,
     v: Option<&Bson>,
+    tz: &secantus_pgplan::TimeZoneSetting,
 ) -> PgWireResult<()> {
     if field.format() == FieldFormat::Binary {
         return encode_binary(enc, field.datatype(), v);
@@ -3426,6 +3526,21 @@ fn encode_field_value(
             })
             .collect();
         return enc.encode_field(&rendered);
+    }
+    // A timestamptz value is a stored UTC INSTANT; it renders in the SESSION
+    // zone, which the type-blind `encode_value` (naive `timestamp_value_text`)
+    // cannot do -- so render it here, where the FIELD type is known. A special
+    // value (infinity / wide / BC) arrives as a String and goes out verbatim.
+    if *field.datatype() == Type::TIMESTAMPTZ {
+        match v {
+            None | Some(Bson::Null) => return enc.encode_field(&None::<&str>),
+            Some(Bson::String(s)) => return enc.encode_field(&Some(s.as_str())),
+            Some(value) => {
+                if let Some(text) = secantus_pgplan::timestamptz_value_text(value, tz) {
+                    return enc.encode_field(&Some(text.as_str()));
+                }
+            }
+        }
     }
     encode_value(enc, v)
 }
@@ -4907,6 +5022,8 @@ impl ExtendedQueryHandler for PgHandler {
                 max_rows,
             )
             .await?;
+        // Report any GUC change (TimeZone, DateStyle, ...) the statement made.
+        self.report_pending_params(_c).await?;
         // One portal is one statement, so exactly one response.
         Ok(responses.remove(0))
     }

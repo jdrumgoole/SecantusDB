@@ -820,19 +820,6 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
         match el.node.as_ref() {
             Some(N::ColumnDef(cd)) => {
                 let ty = cd.type_name.as_ref().map(type_name_of).unwrap_or_default();
-                // `timestamptz` works as a cast, literal and bound value but
-                // NOT as a column: it is stored as canonical text, and a
-                // timestamptz renders in the SESSION zone, so the stored text
-                // is right only for the session that wrote it. A row written
-                // under UTC then read under Europe/Rome came back with UTC's
-                // wall clock and UTC's offset -- a wrong answer no client could
-                // detect. Refuse until the stored form is an instant rather
-                // than a rendering of one. `timetz` is DIFFERENT: its offset is
-                // literal, not session-relative (`12:34:56+02` renders the same
-                // under any zone), so the canonical text is a safe column.
-                if ty == "timestamptz" {
-                    return Err(Error::Unsupported(format!("a {ty} column")));
-                }
                 let pk = cd.constraints.iter().any(|c| {
                     matches!(c.node.as_ref(), Some(N::Constraint(k))
                         if k.contype == pg_query::protobuf::ConstrType::ConstrPrimary as i32)
@@ -3379,8 +3366,18 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
     match expr {
         ColumnExpr::Casts(chain) => {
             let mut v = value;
+            let mut prev: Option<&str> = None;
             for target in chain {
+                // timestamptz -> text renders the instant in the session zone.
+                if target == "text" && prev == Some("timestamptz") {
+                    if let Some(t) = timestamptz_value_text(&v, tz) {
+                        v = Bson::String(t);
+                        prev = Some(target);
+                        continue;
+                    }
+                }
                 v = cast_value_with_tz(v, target, tz)?;
+                prev = Some(target);
             }
             Ok(v)
         }
@@ -3962,6 +3959,26 @@ pub fn render_timestamp_from_pg_micros(micros: i64) -> String {
 /// touches a row, so it reached the wire as a composite document that the
 /// encoder had no arm for — and `select '2026-01-01 12:00'::timestamp`
 /// answered NULL while the same value through a column answered correctly.
+/// Render a stored timestamptz INSTANT (a `Bson::DateTime` or the sub-ms
+/// composite) as PostgreSQL renders it in the SESSION zone. The wire layer
+/// calls this for a column / expression of type `timestamptz` (oid 1184); the
+/// naive `timestamp_value_text` is for `timestamp` (1114).
+pub fn timestamptz_value_text(v: &Bson, tz: &TimeZoneSetting) -> Option<String> {
+    let micros = match v {
+        Bson::DateTime(d) => d.timestamp_millis() * 1000,
+        Bson::Document(doc) if doc.contains_key(COMPOSITE_DATE) => {
+            let ms = match doc.get(COMPOSITE_DATE) {
+                Some(Bson::DateTime(d)) => d.timestamp_millis(),
+                _ => return None,
+            };
+            let us = doc.get(COMPOSITE_US).and_then(|v| v.as_i32()).unwrap_or(0);
+            ms * 1000 + i64::from(us)
+        }
+        _ => return None,
+    };
+    Some(render_timestamptz(micros, tz))
+}
+
 pub fn timestamp_value_text(v: &Bson) -> Option<String> {
     match v {
         Bson::DateTime(d) => Some(render_timestamp(d.timestamp_millis() * 1000)),
@@ -4584,14 +4601,21 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         // storing session-relative text in a row would be a wrong answer for
         // every other session that read it).
         "timestamptz" | "timestamp with time zone" => {
+            // A timestamptz is stored as a UTC INSTANT (the same carrier as
+            // `timestamp`) and rendered in the session zone on the way out --
+            // storing session-rendered text would be a wrong answer for any
+            // other session. infinity / wide-year / BC stay text.
             if let Some(text) = special_timestamp_text(&as_text(&value)) {
                 return Ok(Bson::String(text));
             }
-            let tz = session_timezone();
-            Ok(Bson::String(render_timestamptz(
-                parse_timestamptz(&as_text(&value), &tz)?,
-                &tz,
-            )))
+            let micros = parse_timestamptz(&as_text(&value), &session_timezone())?;
+            let (ms, rem) = split_subms(micros);
+            let date = Bson::DateTime(bson::DateTime::from_millis(ms));
+            Ok(if rem == 0 {
+                date
+            } else {
+                Bson::Document(doc! { COMPOSITE_DATE: date, COMPOSITE_US: rem })
+            })
         }
         "timetz" | "time with time zone" => Ok(Bson::String(parse_timetz(
             &as_text(&value),
@@ -5861,6 +5885,14 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             .ok_or_else(|| Error::Parse("cast with no operand".into()))?;
         let value = const_value(arg, params)?;
         let target = tc.type_name.as_ref().map(type_name_of).unwrap_or_default();
+        // Casting a timestamptz INSTANT to text renders it in the session zone
+        // (the instant alone cannot say it is a timestamptz, so the source cast
+        // decides). PLAN_TIMEZONE is set during planning, where this evaluates.
+        if target == "text" && static_type(arg, &value) == "timestamptz" {
+            if let Some(t) = timestamptz_value_text(&value, &session_timezone()) {
+                return Ok(Bson::String(t));
+            }
+        }
         return cast_value(value, &target);
     }
     if let Some(N::FuncCall(f)) = node.node.as_ref() {
