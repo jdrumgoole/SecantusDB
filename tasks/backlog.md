@@ -4853,6 +4853,24 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
      tests at risk**, so this is the risky middle batch; guard with the full
      differential run.
   3. **`coalesce(a.fnames, '{}')`** — a LEFT-JOIN miss yields NULL → empty array.
+
+  **Refined 2026-09-08 (3rd probe, no code — three forks have now confirmed this is a
+  campaign, not a slice):** NO bounded subset clears any composite gauge test (all need
+  full CompositeInfo.fetch), so do NOT ship a partial that touches the shared join
+  filter/executor for zero gauge gain. Corrections to the map: piece 1 is TWO sub-issues
+  — (1a) even a SINGLE-predicate `WHERE t.oid=$1` fails `0A000 a WHERE on the right side
+  of a LEFT JOIN` (the column is on the join's RIGHT side); (1b) the multi-predicate
+  `AND attnum>0 AND NOT attisdropped` fails `this subquery WHERE`. Both live in
+  `plan_join_select`'s `JoinSelect.filter` (`Option<(String,String,Bson)>`, ~lib.rs:437),
+  which must become a Vec of predicates (`=` on EITHER side, `>`, `NOT <bool>`). Piece 2
+  (`side()` ~lib.rs:1616 accepting `N::RangeSubselect`) needs `JoinSelect.left`/`right`
+  (today `(table,alias)`, lib.rs:425) to allow a subquery side AND `join_docs`/`table_docs`
+  to RECURSIVELY EXECUTE the aggregate sub-plan and materialise its rows — a side enum +
+  recursive sub-plan execution, with the 800+ differential join tests at risk (full
+  differential is a mandatory guard). Piece 3 (coalesce miss → `{}`) small, last. This is
+  a dedicated focused effort with repeated full-differential validation, best done in a
+  session with the context budget for the JoinSelect refactor — not an incremental-PR
+  sequence and not safe to rush.
   Composite VALUE round-trip (register_composite of a value) is a SEPARATE later
   piece after fetch works.
 
