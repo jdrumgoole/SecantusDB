@@ -1446,6 +1446,56 @@ def _op_ceil(arg: Any, ctx: _Ctx) -> Any:
     return _int_result(math.ceil(v), v)
 
 
+def _math_domain_float(value: Any) -> float | None:
+    """The float a math operator's DOMAIN check should use — decimals included.
+
+    mongod applies these checks by VALUE, whatever the numeric type, but the
+    guards here tested ``isinstance(v, (int, float))`` and a ``Decimal128``
+    is neither. So every negative decimal skipped the check and fell into the
+    decimal path: ``$ln(Decimal128("-1"))`` returned ``NaN`` and
+    ``$ln(Decimal128("0"))`` returned ``-Infinity``, where mongod raises
+    ``28766`` for both. A wrong ANSWER, not just a missing error.
+    """
+    if isinstance(value, Decimal128):
+        return float(value.to_decimal())
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _decimal_special_float(value: Any) -> float | None:
+    """The float behind a ``Decimal128`` that is NaN or ±Infinity, else ``None``.
+
+    mongod applies a math operator's DOMAIN check to a decimal exactly as to a
+    double, but the guards here tested ``isinstance(v, (int, float))`` only, so
+    a ``Decimal128`` slipped past them into the decimal path and came back
+    ``NaN``: ``$ln(Decimal128("-Infinity"))`` returned ``NaN`` where mongod
+    raises ``28766``, and ``$sqrt(Decimal128("-Infinity"))`` returned ``NaN``
+    where mongod raises ``28714``.
+
+    A FINITE decimal deliberately returns ``None`` -- it keeps the existing
+    decimal path, which carries real precision.
+    """
+    if not isinstance(value, Decimal128):
+        return None
+    dec = value.to_decimal()
+    if dec.is_nan():
+        return float("nan")
+    if dec.is_infinite():
+        return float(dec)
+    return None
+
+
+def _decimal_from_special(value: float) -> Decimal128:
+    """``Decimal128`` carrying a non-finite float -- mongod keeps the argument's
+    type through these operators, so a decimal in gives a decimal out."""
+    if value != value:
+        return Decimal128("NaN")
+    return Decimal128("Infinity" if value > 0 else "-Infinity")
+
+
 def _op_sqrt(arg: Any, ctx: _Ctx) -> Any:
     import math
 
@@ -1453,8 +1503,10 @@ def _op_sqrt(arg: Any, ctx: _Ctx) -> Any:
     if v is None:
         return None
     _require_math_numeric(v, "$sqrt")
-    # mongod's domain error (probed 7.0.12): Location28714, not a null result.
-    if isinstance(v, (int, float)) and v < 0:
+    # mongod's domain error: Location28714, not a null result. Applied by VALUE,
+    # so a negative DECIMAL raises it too (measured 8.2.11).
+    domain = _math_domain_float(v)
+    if domain is not None and domain < 0:
         raise ExpressionError(
             # No ", but is <v>" suffix -- $sqrt is the one operator in this
             # family that omits it, where $ln / $log10 keep it (probed 8.2.11).
@@ -1462,6 +1514,9 @@ def _op_sqrt(arg: Any, ctx: _Ctx) -> Any:
             code=28714,
             code_name="Location28714",
         )
+    special = _decimal_special_float(v)
+    if special is not None:
+        return _decimal_from_special(special)
     if _has_decimal(v):
         return _decimal_result(lambda d: d.sqrt(), v)
     return math.sqrt(v)
@@ -1522,12 +1577,24 @@ def _op_ln(arg: Any, ctx: _Ctx) -> Any:
         return None
     _require_math_numeric(v, "$ln")
     # mongod's domain error (probed 7.0.12): Location28766, not a null result.
-    if isinstance(v, (int, float)) and v <= 0:
+    # Applied by VALUE: a non-positive DECIMAL raises this too. NaN is not
+    # non-positive, so it falls through to the special handling below.
+    domain = _math_domain_float(v)
+    if domain is not None and domain <= 0:
         raise ExpressionError(
-            f"$ln's argument must be a positive number, but is {fmt_double_value(float(v))}",
+            f"$ln's argument must be a positive number, but is {fmt_double_value(domain)}",
             code=28766,
             code_name="Location28766",
         )
+    special = _decimal_special_float(v)
+    if special is not None:
+        if special != special:
+            # mongod answers a DOUBLE nan for $ln of a Decimal NaN -- the one
+            # place in this family where the argument's type is NOT kept.
+            return float("nan")
+        # Only +Infinity can reach here: -Infinity and every non-positive
+        # value were refused by the domain check above.
+        return _decimal_from_special(special)
     if _has_decimal(v):
         return _decimal_result(lambda d: d.ln(), v)
     return math.log(v)
@@ -1581,12 +1648,24 @@ def _op_log10(arg: Any, ctx: _Ctx) -> Any:
         return None
     _require_math_numeric(v, "$log10")
     # mongod's domain error (probed 7.0.12): Location28761, not a null result.
-    if isinstance(v, (int, float)) and v <= 0:
+    # Applied by VALUE: a non-positive DECIMAL raises this too. NaN is not
+    # non-positive, so it falls through to the special handling below.
+    domain = _math_domain_float(v)
+    if domain is not None and domain <= 0:
         raise ExpressionError(
-            f"$log10's argument must be a positive number, but is {fmt_double_value(float(v))}",
+            f"$log10's argument must be a positive number, but is {fmt_double_value(domain)}",
             code=28761,
             code_name="Location28761",
         )
+    special = _decimal_special_float(v)
+    if special is not None:
+        if special != special:
+            # mongod answers a DOUBLE nan for $log10 of a Decimal NaN -- the one
+            # place in this family where the argument's type is NOT kept.
+            return float("nan")
+        # Only +Infinity can reach here: -Infinity and every non-positive
+        # value were refused by the domain check above.
+        return _decimal_from_special(special)
     if _has_decimal(v):
         return _decimal_result(lambda d: d.log10(), v)
     return math.log10(v)
