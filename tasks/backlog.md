@@ -5407,8 +5407,36 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   five known-standing ones. The python server's headline number moves 99.53% ->
   99.61% by removing a harness artifact, not by changing behaviour.
 
-- [ ] **STILL OPEN: `Decimal128` FINITE operands in the transcendentals.** The
-  Rust engine defers `$sqrt(Decimal128("2.5"))` and the rest of the family;
+- [x] **RESOLVED (2026-09-07): `$avg` gave a WRONG NUMBER above 2**53, and a
+  decimal ZERO got the wrong quantum — on BOTH servers.** Found by triaging the
+  "Decimal128 finite transcendentals" family by MEASUREMENT rather than by its
+  label: of the 35 shapes where mongod answered and the Rust engine deferred,
+  19 genuinely needed 34-digit math and **16 did not**.
+
+  `$avg`: mongod converts the integer TOTAL to a double and THEN divides. The
+  Python server did exact integer division, so
+  `$avg: [2**53+1, 2**53+3, 2**53+5]` was `9007199254740996.0` where mongod
+  says `9007199254740994.0` — correctly rounded over the exact quotient, a
+  BETTER answer and the wrong one. The Rust engine deferred above 2**53 with a
+  comment reading "defer to Python int/int divide": it was deferring TO that
+  wrong answer, and the comment justified it by the other engine rather than by
+  the oracle.
+
+  Decimal zeros: a constant, no series needed. `$tan(0)` is `0E-40`,
+  `$asinh(0)` is `0E-6176`, `$cos(0)` is 1 to 34 places, and the ODD functions
+  carry `-0` through while the EVEN ones drop it. Rust deferred; Python ran its
+  series and returned bare `0` / `1`, lost the sign of `-0`, and used its own
+  quantum (`0E-50` where mongod says `0E-35`). Note `Decimal128("0") ==
+  Decimal128("0E-40")` compares equal as a VALUE, so a test using `==` would
+  pass on the wrong answer — the tests assert the TEXT.
+
+  Pinned by `tests/test_decimal128_zero_and_avg.py` (90 tests, both engines,
+  table generated FROM mongod) and the `deczero` / `avgdiv` gate groups.
+
+- [ ] **STILL OPEN: `Decimal128` FINITE operands in the transcendentals — now
+  the ONLY thing left in this family (19 shapes, re-measured 2026-09-07 after
+  the zero and `$avg` work above).** The Rust engine defers
+  `$acosh(Decimal128("2.5"))` and the rest;
   mongod answers `1.581138830084189665999446772216359`. This is the genuine
   dependency question — 34-significant-digit decimal transcendentals — and the
   ZERO column of the matrix below needs a per-operator QUANTUM (`0E-35`,

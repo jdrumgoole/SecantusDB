@@ -1850,12 +1850,18 @@ fn op_expr_avg(arg: &Bson, ctx: &Ctx) -> R {
         return Ok(Bson::Null);
     }
     let tf = match total {
-        crate::group::Num::Int { v, .. } => {
-            if v.unsigned_abs() > (1u128 << 53) {
-                return Err(Fallback::Defer); // precision: defer to Python int/int divide
-            }
-            v as f64
-        }
+        // mongod converts the integer TOTAL to a double and THEN divides -- it
+        // does not do an exact integer division, so `v as f64` is not a
+        // precision compromise, it is the behaviour.
+        //
+        // This used to defer above 2^53 with the comment "defer to Python
+        // int/int divide". That deferred to a WRONG answer: Python's `int /
+        // int` is correctly rounded over the exact quotient, which differs from
+        // mongod once the total passes 2^53 --
+        // `$avg: [2**53+1, 2**53+3, 2**53+5]` is `9007199254740994.0` on
+        // mongod and `…996.0` exactly. Both engines are fixed; measured
+        // 8.2.11, 2026-09-07.
+        crate::group::Num::Int { v, .. } => v as f64,
         crate::group::Num::Float(f) => f,
         // Stay in the decimal domain — an f64 divide would narrow the type and
         // drop digits.
@@ -3078,6 +3084,18 @@ fn op_deg_rad(arg: &Bson, ctx: &Ctx, to_rad: bool) -> R {
     if let Some(f) = decimal_special_f64(&value) {
         return Ok(decimal_special_bson(f));
     }
+    // A decimal ZERO answers a constant with the conversion's own QUANTUM --
+    // `0E-35` one way and `0E-32` the other -- and the sign survives. Measured
+    // 8.2.11, 2026-09-07; no decimal arithmetic involved.
+    if matches!(value, Bson::Decimal128(_)) && decimal_as_f64(&value) == Some(0.0) {
+        let negative = decimal_is_negative_zero(&value);
+        return decimal_from_text(match (to_rad, negative) {
+            (true, false) => "0E-35",
+            (true, true) => "-0E-35",
+            (false, false) => "0E-32",
+            (false, true) => "-0E-32",
+        });
+    }
     let x = match value {
         Bson::Null => return Ok(Bson::Null),
         Bson::Int32(n) => n as f64,
@@ -3229,6 +3247,30 @@ fn op_trig(arg: &Bson, ctx: &Ctx, kind: Trig) -> R {
             if let Some(text) = limit {
                 return decimal_from_text(text);
             }
+        }
+        // A decimal ZERO answers a CONSTANT -- no 34-digit arithmetic needed,
+        // which is what separates it from every other finite decimal here. The
+        // per-operator QUANTUM is load-bearing and unguessable (`$tan` gives
+        // `0E-40`, `$asinh` gives `0E-6176`, `$cos` gives 1 to 34 places), and
+        // so is the sign rule: the ODD functions carry `-0` through, the EVEN
+        // ones drop it. Every cell measured against 8.2.11, 2026-09-07.
+        if x == 0.0 {
+            let negative = decimal_is_negative_zero(&value);
+            let text = match (kind, negative) {
+                (Sin, false) | (Atan, false) | (Tanh, false) => "0",
+                (Sin, true) | (Atan, true) | (Tanh, true) => "-0",
+                (Tan, false) | (Asin, false) | (Sinh, false) => "0E-40",
+                (Tan, true) | (Asin, true) | (Sinh, true) => "-0E-40",
+                (Asinh, false) | (Atanh, false) => "0E-6176",
+                (Asinh, true) | (Atanh, true) => "-0E-6176",
+                // Even functions: the sign of the zero does not survive.
+                (Cos, _) | (Cosh, _) => "1.000000000000000000000000000000000",
+                (Acos, _) => HALF_PI_TEXT,
+                // `$acosh` of zero is a domain error, handled by the range
+                // check above; it never reaches here.
+                (Acosh, _) => return Err(Fallback::Defer),
+            };
+            return decimal_from_text(text);
         }
         return Err(Fallback::Defer);
     }
@@ -4729,6 +4771,12 @@ fn decimal_zero_bson() -> Bson {
         .unwrap_or(Bson::Double(0.0))
 }
 
+/// Whether a `Decimal128` is NEGATIVE zero. `f64` loses the distinction the
+/// moment it is compared (`-0.0 == 0.0`), so this reads the decimal's own text.
+fn decimal_is_negative_zero(v: &Bson) -> bool {
+    matches!(v, Bson::Decimal128(d) if d.to_string().starts_with('-'))
+}
+
 /// Whether a `Decimal128` is zero -- of EITHER sign, since `$toBool` of
 /// `Decimal128("-0")` is false.
 fn decimal_is_zero(v: &Bson) -> bool {
@@ -5372,6 +5420,16 @@ fn op_sqrt(arg: &Bson, ctx: &Ctx) -> R {
                 if f.is_nan() || f.is_infinite() {
                     return Ok(decimal_special_bson(f));
                 }
+                // `sqrt(+-0)` is that zero, sign and all -- a constant, so it
+                // needs none of the 34-digit arithmetic the other finite
+                // decimals do. Measured 8.2.11, 2026-09-07.
+                if f == 0.0 {
+                    return decimal_from_text(if decimal_is_negative_zero(&v) {
+                        "-0"
+                    } else {
+                        "0"
+                    });
+                }
                 return Err(Fallback::Defer);
             }
             let f = math_float_named(&v, "$sqrt", 28765)?;
@@ -5405,6 +5463,11 @@ fn op_exp(arg: &Bson, ctx: &Ctx) -> R {
                 } else {
                     decimal_zero_bson()
                 });
+            }
+            // `exp(+-0)` is Decimal `1` -- an EVEN-like case, the sign of the
+            // zero does not survive. Measured 8.2.11, 2026-09-07.
+            if matches!(v, Bson::Decimal128(_)) && decimal_as_f64(&v) == Some(0.0) {
+                return decimal_from_text("1");
             }
             Ok(Bson::Double(math_float_named(&v, "$exp", 28765)?.exp()))
         }
