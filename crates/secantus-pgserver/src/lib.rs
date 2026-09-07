@@ -965,6 +965,15 @@ fn default_settings() -> HashMap<String, String> {
         ("standard_conforming_strings", "on"),
         ("integer_datetimes", "on"),
         ("transaction_read_only", "off"),
+        // Transaction GUCs psycopg reads to learn the connection's defaults.
+        // This server runs one un-prepared transaction at a time at READ
+        // COMMITTED, so these are the fixed values a real single-node server
+        // reports; `max_prepared_transactions` is 0 because 2PC is not offered.
+        ("max_prepared_transactions", "0"),
+        ("transaction_isolation", "read committed"),
+        ("default_transaction_isolation", "read committed"),
+        ("transaction_deferrable", "off"),
+        ("default_transaction_read_only", "off"),
         ("search_path", "\"$user\", public"),
         ("application_name", ""),
         ("server_encoding", "UTF8"),
