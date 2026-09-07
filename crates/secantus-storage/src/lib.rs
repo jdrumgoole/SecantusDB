@@ -11352,8 +11352,17 @@ impl Storage {
                         return Ok(ResolvedHint::Named(name));
                     }
                 }
+                // `{spec:?}` was Rust's `Debug` on a `Document`, which leaked
+                // the RUST TYPE NAMES to the client:
+                // `hint Document({"nope": Int32(1)}) does not correspond…`.
+                // Neither `Document(` nor `Int32(` means anything to a MongoDB
+                // client. mongod's own text here is a planner diagnostic this
+                // project deliberately does not reproduce (see the note at the
+                // command layer), but naming the hint should still name the
+                // VALUE.
                 Err(StorageError::BadHint(format!(
-                    "hint {spec:?} does not correspond to an existing index"
+                    "hint {} does not correspond to an existing index",
+                    secantus_core::aggregate::render_value_compact(&Bson::Document(spec.clone()))
                 )))
             }
         }

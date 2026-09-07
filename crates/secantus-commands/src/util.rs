@@ -89,11 +89,22 @@ pub(crate) fn validate_write_hint(
         return Ok(());
     }
     // mongod renders its whole query plan here; we name the hint. The CODE
-    // matches, the text does not — see `tasks/backlog.md`.
+    // matches, the text does not — a deliberate difference, see
+    // `tasks/backlog.md` (8.2.11 returns a planner diagnostic, and the project
+    // asserts the rejection rather than the text).
+    //
+    // `{hint:?}` was Rust's `Debug` on a `Bson`, which leaked the RUST TYPE
+    // NAME to the client: a bad string hint came back as
+    // `hint String("x") does not correspond…`. `String(…)` means nothing to a
+    // MongoDB client, and the Python server says `'x'` for the same input.
+    let rendered = match hint {
+        Bson::String(s) => format!("\"{s}\""),
+        other => secantus_core::aggregate::render_value_compact(other),
+    };
     Err(CommandError::new(
         2,
         "BadValue",
-        format!("hint {hint:?} does not correspond to an existing index"),
+        format!("hint {rendered} does not correspond to an existing index"),
     ))
 }
 
