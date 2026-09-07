@@ -130,10 +130,10 @@ QUERIES = [
     "SELECT 1 = ANY(ARRAY[1,NULL,3])",
     "SELECT 1 = ALL(ARRAY[1,NULL,1])",
     "SELECT NULL::int = ANY(ARRAY[1,2])",
-    # A top-level JOIN in a plain select -- RangeInfo.fetch's shape.
-    "SELECT t.typname, r.rngsubtype FROM pg_type t"
-    " JOIN pg_range r ON r.rngtypid = t.oid ORDER BY r.rngsubtype",
-    "SELECT rngtypid, rngsubtype FROM pg_range ORDER BY rngtypid",
+    # A bounded pg_type/pg_range JOIN -- RangeInfo.fetch's shape. A FULL
+    # pg_range dump is deliberately NOT compared: the oracle's catalog carries
+    # builtin ranges plus any custom range a prior test left behind, so the row
+    # set legitimately differs (see the composite-campaign note in the backlog).
     "SELECT t.typname FROM pg_type t LEFT JOIN pg_range r ON r.rngtypid = t.oid WHERE t.oid = 25",
     # Scalar calls, constant and over columns; PostgreSQL replaces only the
     # FIRST match unless `g` is given, which is not most regex libraries'

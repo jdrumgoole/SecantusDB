@@ -161,6 +161,14 @@ pub fn from_text(text: &str, type_name: &str) -> Result<Range> {
     canonicalise(parsed, element, discrete, type_name)
 }
 
+/// Parse a range literal for a KNOWN element type (a custom range's subtype),
+/// canonicalising only when `discrete` (a custom range has no canonical
+/// function, so callers pass `false`).
+pub fn from_text_element(text: &str, element: &str, discrete: bool) -> Result<Range> {
+    let parsed = parse_literal(text)?;
+    canonicalise(parsed, element, discrete, element)
+}
+
 /// Build from constructor arguments: `int4range(lo, hi)` and its three-argument
 /// form, where the third names the bounds as one of `[]`, `[)`, `(]`, `()`.
 pub fn from_args(args: &[Bson], type_name: &str, null_flags_is_error: bool) -> Result<Range> {

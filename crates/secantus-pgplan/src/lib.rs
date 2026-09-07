@@ -182,6 +182,11 @@ pub enum Statement {
         /// (field name, field type name), in declared order.
         fields: Vec<(String, String)>,
     },
+    /// `CREATE TYPE <name> AS RANGE (subtype = <type>)` -- a custom range type.
+    CreateRange {
+        name: String,
+        subtype: String,
+    },
     /// `DROP SCHEMA [IF EXISTS] <names> [CASCADE]`.
     DropSchema {
         names: Vec<String>,
@@ -706,6 +711,31 @@ pub fn plan_with_params(
                 .collect();
             Ok(Statement::CreateEnum { name, labels })
         }
+        // `CREATE TYPE name AS RANGE (subtype = T)` -- a custom range type.
+        N::CreateRangeStmt(r) => {
+            let name = r
+                .type_name
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    N::String(s) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .next_back()
+                .ok_or_else(|| Error::Parse("CREATE TYPE without a name".into()))?;
+            // The subtype is a DefElem `subtype = <type>`; its arg is a TypeName.
+            let subtype = r
+                .params
+                .iter()
+                .find_map(|p| match p.node.as_ref()? {
+                    N::DefElem(d) if d.defname.eq_ignore_ascii_case("subtype") => {
+                        d.arg.as_ref().map(|a| type_name_of_node(a))
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .ok_or_else(|| Error::Unsupported("a RANGE type without a subtype".into()))?;
+            Ok(Statement::CreateRange { name, subtype })
+        }
         N::CopyStmt(c) => plan_copy(&c, lookup, params),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
         N::DeclareCursorStmt(d) => {
@@ -792,6 +822,20 @@ fn type_name_of(t: &pg_query::protobuf::TypeName) -> String {
         base
     } else {
         format!("{base}[]")
+    }
+}
+
+/// The type name inside a DefElem arg (`subtype = int4`): a `TypeName` node,
+/// or a bare String/TypeName-list. Returns the bare PostgreSQL name.
+fn type_name_of_node(node: &pg_query::protobuf::Node) -> Option<String> {
+    match node.node.as_ref()? {
+        N::TypeName(tn) => Some(type_name(&tn.names)),
+        N::String(s) => Some(s.sval.clone()),
+        N::List(l) => l.items.iter().rev().find_map(|n| match n.node.as_ref()? {
+            N::String(s) => Some(s.sval.clone()),
+            _ => None,
+        }),
+        _ => None,
     }
 }
 
@@ -3229,6 +3273,41 @@ pub fn set_user_types(types: Vec<(String, i64, Vec<String>)>) {
     PLAN_USER_TYPES.with(|t| *t.borrow_mut() = types);
 }
 
+thread_local! {
+    /// Custom range types: (range name -> subtype element name), installed per
+    /// statement by the wire layer, so a `'[1,5)'::myrange` cast resolves its
+    /// element without a per-call lookup.
+    static PLAN_USER_RANGES: std::cell::RefCell<Vec<(String, String, i64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Custom range types: `(range name, subtype element, oid)`.
+pub fn set_user_ranges(ranges: Vec<(String, String, i64)>) {
+    PLAN_USER_RANGES.with(|t| *t.borrow_mut() = ranges);
+}
+
+/// The subtype element of a custom range type by name, if one is registered.
+pub fn user_range_subtype(name: &str) -> Option<String> {
+    let n = name.trim();
+    PLAN_USER_RANGES.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(rn, _, _)| rn == n)
+            .map(|(_, sub, _)| sub.clone())
+    })
+}
+
+/// A custom range type's oid by name, for regtype resolution.
+fn user_range_oid(name: &str) -> Option<i64> {
+    let n = name.trim().trim_matches('"');
+    PLAN_USER_RANGES.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(rn, _, _)| rn == n || rn.eq_ignore_ascii_case(n))
+            .map(|(_, _, oid)| *oid)
+    })
+}
+
 /// A user type's oid by name, quoted or bare -- the bare form FOLDS, exactly
 /// as `oid_of_name` does for builtins.
 fn user_type_oid(name: &str) -> Option<i64> {
@@ -3237,18 +3316,20 @@ fn user_type_oid(name: &str) -> Option<i64> {
         Some(inner) => (inner.to_string(), false),
         None => (trimmed.to_ascii_lowercase(), true),
     };
-    PLAN_USER_TYPES.with(|t| {
-        t.borrow()
-            .iter()
-            .find(|(n, _, _)| {
-                if fold {
-                    n.to_ascii_lowercase() == target
-                } else {
-                    *n == target
-                }
-            })
-            .map(|(_, oid, _)| *oid)
-    })
+    PLAN_USER_TYPES
+        .with(|t| {
+            t.borrow()
+                .iter()
+                .find(|(n, _, _)| {
+                    if fold {
+                        n.to_ascii_lowercase() == target
+                    } else {
+                        *n == target
+                    }
+                })
+                .map(|(_, oid, _)| *oid)
+        })
+        .or_else(|| user_range_oid(name))
 }
 
 /// A user ENUM's `(oid, labels)` by name, same folding rule.
@@ -4564,6 +4645,17 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         t if range::is_range_type(t) => {
             let text = as_text(&value);
             Ok(Bson::String(range::render(&range::from_text(&text, t)?)))
+        }
+        // A custom `CREATE TYPE ... AS RANGE`: resolve its subtype element and
+        // parse/render like the builtin range over that element, but WITHOUT
+        // canonicalisation -- a user range has no canonical function, so
+        // `[1,4]` stays `[1,4]` (verified against PostgreSQL).
+        t if user_range_subtype(t).is_some() => {
+            let element = user_range_subtype(t).expect("checked");
+            let text = as_text(&value);
+            Ok(Bson::String(range::render(&range::from_text_element(
+                &text, &element, false,
+            )?)))
         }
         t if range::is_multirange_type(t) => {
             let text = as_text(&value);
