@@ -1919,6 +1919,16 @@ These are explicit non-goals. Don't add them without a reason.
 - ~~Tailable / awaitData cursors~~ — implemented for change streams (see "In scope" in `CLAUDE.md`) **and** for plain capped collections + `local.oplog.rs` (`commands._find_tailable` / `_find_tailable_oplog`, blocking `getMore` on the oplog condition variable). The producer re-applies the find filter (with `let` vars + collation) to follow-up inserts, advances its watermark by **RecordId** (insertion order — the same order capped eviction uses; an `id_key` watermark dropped and redelivered docs when `_id`s weren't monotonic), and raises `CappedPositionLost` (136) on rollover.
 
 ## 5. Known bugs and edge cases to watch
+- [ ] **OPEN — RUST pgserver range family, remaining gaps (measured 2026-09-07).**
+  The scalar range/multirange BINARY wire codec is correct (typed empty /
+  unbounded / populated values round-trip against real PG; the psycopg cases
+  that error do so on real PG too, as `08P01`). `ARRAY`-of-multirange typing was
+  fixed (its own array oids 6150/6151/6152/6153/6155/6157, both formats). Still
+  open in `tests/types/test_range.py` / `test_multirange.py`: `CREATE TYPE ... AS
+  RANGE` (custom range types — `CreateRangeStmt`, the largest cluster), and the
+  array-of-range element `=` comparison (`comparing string with array using =`),
+  which is the general string-vs-array operator gap, not a range-specific one.
+
 
 ### 2026-09-06 READ-PATH sweep: 385 cases, and what is still open
 

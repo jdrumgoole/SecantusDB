@@ -1112,6 +1112,19 @@ fn wire_type(pg_type: &str) -> Type {
         "daterange[]" => Type::DATE_RANGE_ARRAY,
         "tsrange[]" => Type::TS_RANGE_ARRAY,
         "tstzrange[]" => Type::TSTZ_RANGE_ARRAY,
+        // Multirange arrays. Without these an `int4multirange[]` fell through to
+        // varchar, which is binary_encodable -- so a binary result stayed binary
+        // and encode_binary refused the array value, and a text result carried
+        // the varchar oid so the client handed back a string instead of parsing
+        // it into Multirange objects. Their own array oids keep them, like range
+        // arrays, on the text-format path the row description already downgrades
+        // a non-binary-encodable type onto.
+        "int4multirange[]" => Type::INT4MULTI_RANGE_ARRAY,
+        "int8multirange[]" => Type::INT8MULTI_RANGE_ARRAY,
+        "nummultirange[]" => Type::NUMMULTI_RANGE_ARRAY,
+        "datemultirange[]" => Type::DATEMULTI_RANGE_ARRAY,
+        "tsmultirange[]" => Type::TSMULTI_RANGE_ARRAY,
+        "tstzmultirange[]" => Type::TSTZMULTI_RANGE_ARRAY,
         "time[]" => Type::TIME_ARRAY,
         "timestamp[]" => Type::TIMESTAMP_ARRAY,
         "timestamptz[]" => Type::TIMESTAMPTZ_ARRAY,
@@ -3863,6 +3876,12 @@ fn element_of_array_oid(oid: u32) -> Option<&'static str> {
         3913 => "daterange",
         3909 => "tsrange",
         3911 => "tstzrange",
+        6150 => "int4multirange",
+        6151 => "nummultirange",
+        6152 => "tsmultirange",
+        6153 => "tstzmultirange",
+        6155 => "datemultirange",
+        6157 => "int8multirange",
         _ => return None,
     })
 }

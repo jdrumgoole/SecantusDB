@@ -651,6 +651,11 @@ QUERIES = [
     "SELECT '[1,5)'::int4range = '[1,5)'::int4range",
     "SELECT pg_typeof(int4range(1,5))::text",
     "SELECT pg_typeof('[1,2)'::numrange)::text",
+    # An ARRAY of multiranges reports the multirange's array type, not
+    # varchar -- so a client parses it into Multirange objects.
+    "SELECT pg_typeof(ARRAY['{[1,5)}'::int4multirange])::text",
+    "SELECT (ARRAY['{[1,5)}'::int4multirange, '{}'::int4multirange])::text",
+    "SELECT (ARRAY['{[1.5,2.5)}'::nummultirange])::text",
     # A tsrange orders its own bounds, so a sub-millisecond bound has to be
     # comparable — two timestamp composites had no comparison arm.
     "SELECT tsrange('2026-01-01 00:00:00.5','2026-01-02')::text",
