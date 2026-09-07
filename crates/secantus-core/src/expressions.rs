@@ -3071,7 +3071,14 @@ fn op_bson_size(arg: &Bson, ctx: &Ctx) -> R {
 /// `$degreesToRadians` (`to_rad`) / `$radiansToDegrees`. Non-numeric / bool
 /// defers (Python raises). Decimal128 defers to the pure oracle.
 fn op_deg_rad(arg: &Bson, ctx: &Ctx, to_rad: bool) -> R {
-    let x = match eval(arg, ctx)? {
+    let value = eval(arg, ctx)?;
+    // A NaN / +-Infinity decimal keeps its TYPE through the conversion and
+    // needs no decimal math: mongod answers `Decimal128("-Infinity")` for
+    // `$degreesToRadians(Decimal128("-Infinity"))`. A finite decimal defers.
+    if let Some(f) = decimal_special_f64(&value) {
+        return Ok(decimal_special_bson(f));
+    }
+    let x = match value {
         Bson::Null => return Ok(Bson::Null),
         Bson::Int32(n) => n as f64,
         Bson::Int64(n) => n as f64,
@@ -4682,6 +4689,46 @@ fn decimal_as_f64(v: &Bson) -> Option<f64> {
     }
 }
 
+/// The `f64` behind a `Decimal128` that is NaN or ±Infinity, or `None` for a
+/// FINITE decimal.
+///
+/// The special values carry no precision, so an operator can answer them with
+/// ordinary `f64` arithmetic and hand back a `Decimal128` -- no 34-digit
+/// decimal math needed. A finite decimal still defers: `$sqrt(Decimal("2.5"))`
+/// is `1.581138830084189665999446772216359` on mongod and reproducing that
+/// needs real decimal transcendentals.
+fn decimal_special_f64(v: &Bson) -> Option<f64> {
+    let f = decimal_as_f64(v)?;
+    (f.is_nan() || f.is_infinite()).then_some(f)
+}
+
+/// `Decimal128("NaN")` / `("Infinity")` / `("-Infinity")` for a non-finite `f64`.
+///
+/// mongod keeps the argument's type through these operators, so a decimal in
+/// gives a decimal out -- `$sqrt(Decimal128("Infinity"))` is
+/// `Decimal128("Infinity")`, not the double.
+fn decimal_special_bson(f: f64) -> Bson {
+    use std::str::FromStr;
+    let text = if f.is_nan() {
+        "NaN"
+    } else if f > 0.0 {
+        "Infinity"
+    } else {
+        "-Infinity"
+    };
+    bson::Decimal128::from_str(text)
+        .map(Bson::Decimal128)
+        .unwrap_or(Bson::Double(f))
+}
+
+/// `Decimal128("0")` -- what `$exp` of a Decimal `-Infinity` answers.
+fn decimal_zero_bson() -> Bson {
+    use std::str::FromStr;
+    bson::Decimal128::from_str("0")
+        .map(Bson::Decimal128)
+        .unwrap_or(Bson::Double(0.0))
+}
+
 /// Whether a `Decimal128` is zero -- of EITHER sign, since `$toBool` of
 /// `Decimal128("-0")` is false.
 fn decimal_is_zero(v: &Bson) -> bool {
@@ -5311,6 +5358,22 @@ fn op_sqrt(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         v => {
+            // The DOMAIN check applies by VALUE, so a negative DECIMAL raises
+            // it too -- finite or not. A special decimal then answers without
+            // decimal math, keeping its type; a finite one still defers,
+            // because its result carries real precision.
+            if let Some(f) = decimal_as_f64(&v) {
+                if f < 0.0 {
+                    return Err(Fallback::mongo(
+                        28714,
+                        "$sqrt's argument must be greater than or equal to 0",
+                    ));
+                }
+                if f.is_nan() || f.is_infinite() {
+                    return Ok(decimal_special_bson(f));
+                }
+                return Err(Fallback::Defer);
+            }
             let f = math_float_named(&v, "$sqrt", 28765)?;
             // NaN passes through as sqrt(nan) = nan; a negative argument is a
             // domain error mongod names, and `$sqrt` is the one operator in
@@ -5333,7 +5396,18 @@ fn op_sqrt(arg: &Bson, ctx: &Ctx) -> R {
 fn op_exp(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
-        v => Ok(Bson::Double(math_float_named(&v, "$exp", 28765)?.exp())),
+        v => {
+            // `exp(-Infinity)` is Decimal `0`, not `-Infinity`, so this goes
+            // through `f64::exp` rather than returning the argument.
+            if let Some(f) = decimal_special_f64(&v) {
+                return Ok(if f.is_nan() || f.is_infinite() && f > 0.0 {
+                    decimal_special_bson(f)
+                } else {
+                    decimal_zero_bson()
+                });
+            }
+            Ok(Bson::Double(math_float_named(&v, "$exp", 28765)?.exp()))
+        }
     }
 }
 
@@ -5344,6 +5418,29 @@ fn op_ln(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         v => {
+            // The DOMAIN check applies by VALUE, so a non-positive DECIMAL
+            // raises it too -- `Decimal128("-1")` and `("0")` included, where
+            // this used to fall through and answer NaN / -Infinity. NaN is not
+            // non-positive, and mongod answers a DOUBLE nan for $ln of a
+            // Decimal NaN -- the one place here that does not keep the type.
+            if let Some(df) = decimal_as_f64(&v) {
+                if df.is_nan() {
+                    return Ok(Bson::Double(f64::NAN));
+                }
+                if df <= 0.0 {
+                    return Err(Fallback::mongo(
+                        28766,
+                        format!(
+                            "$ln's argument must be a positive number, but is {}",
+                            crate::format_double_g(df)
+                        ),
+                    ));
+                }
+                if df.is_infinite() {
+                    return Ok(decimal_special_bson(df));
+                }
+                return Err(Fallback::Defer);
+            }
             let f = math_float_named(&v, "$ln", 28765)?;
             if f <= 0.0 {
                 Err(Fallback::mongo(
@@ -5367,6 +5464,29 @@ fn op_log10(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         v => {
+            // The DOMAIN check applies by VALUE, so a non-positive DECIMAL
+            // raises it too -- `Decimal128("-1")` and `("0")` included, where
+            // this used to fall through and answer NaN / -Infinity. NaN is not
+            // non-positive, and mongod answers a DOUBLE nan for $log10 of a
+            // Decimal NaN -- the one place here that does not keep the type.
+            if let Some(df) = decimal_as_f64(&v) {
+                if df.is_nan() {
+                    return Ok(Bson::Double(f64::NAN));
+                }
+                if df <= 0.0 {
+                    return Err(Fallback::mongo(
+                        28761,
+                        format!(
+                            "$log10's argument must be a positive number, but is {}",
+                            crate::format_double_g(df)
+                        ),
+                    ));
+                }
+                if df.is_infinite() {
+                    return Ok(decimal_special_bson(df));
+                }
+                return Err(Fallback::Defer);
+            }
             let f = math_float_named(&v, "$log10", 28765)?;
             // NaN passes through as log10(nan) = nan.
             if f <= 0.0 {

@@ -5178,56 +5178,43 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
     in one case. Any corpus meant to test ordering needs at least one document
     that is not already sorted.
 
-- [ ] **Decimal128 special values in the transcendental family — the measured
-  matrix, so the next pass does not re-derive it (2026-09-07).** Re-measured
-  against the RUST SERVER (not the engine): `tools/probes/agg_expressions.py`
-  reports **0 wrong values / 88 code / 1 message** on 6,628 cases, and 47 of
-  the 88 are *valid input the Rust server refuses* — mongod answers, we say
-  "not supported by the Rust server". 45 of those 47 are this family.
+- [x] **RESOLVED (2026-09-07): `Decimal128` NaN / ±Infinity now answer in the
+  math operators, on BOTH servers.** 18 shapes across six operators (`$sqrt`,
+  `$exp`, `$ln`, `$log10`, `$degreesToRadians`, `$radiansToDegrees`) deferred on
+  the Rust engine — which on the Rust server is
+  `2 BadValue: ... not supported by the Rust server` — and the Python engine
+  answered five of them WRONG. The special values carry no precision, so they
+  needed none of the 34-digit decimal math the finite cases do; that is what
+  made them separable.
 
-  `math_float_named` in `crates/secantus-core/src/expressions.rs` defers on
-  ANY `Bson::Decimal128`, which is the single gate. The **special** values need
-  no 34-digit decimal math at all — they are constants or errors — so they are
-  separable from the genuinely hard finite cases. Measured on 8.2.11:
+  The backlog entry that stood here framed this as one 45-shape family. It is
+  not: the trig, hyperbolic and rounding families ALREADY handled the specials,
+  and only six operators were affected. Reproducing first turned "45 shapes
+  needing decimal transcendentals" into "18 shapes needing a lookup" — the sixth
+  time an estimate taken from reading has been wrong in the expensive direction.
 
-  | op | NaN | Infinity | -Infinity | 0 | -0 |
-  | --- | --- | --- | --- | --- | --- |
-  | `$sqrt` | `NaN` | `Infinity` | **E28714** | `0` | `-0` |
-  | `$exp` | `NaN` | `Infinity` | `0` | `1` | `1` |
-  | `$ln` | **double `nan`** | `Infinity` | E28766 | E28766 | E28766 |
-  | `$log10` | **double `nan`** | `Infinity` | E28761 | E28761 | E28761 |
-  | `$degreesToRadians` | `NaN` | `Infinity` | `-Infinity` | `0E-35` | `-0E-35` |
-  | `$radiansToDegrees` | `NaN` | `Infinity` | `-Infinity` | `0E-32` | `-0E-32` |
-  | `$sin` | `NaN` | E50989 | E50989 | `0` | `-0` |
-  | `$cos` | `NaN` | E50989 | E50989 | `1.000…000` (34 digits) | same |
-  | `$tan` | `NaN` | E50989 | E50989 | `0E-40` | `-0E-40` |
-  | `$asin` | `NaN` | E50989 | E50989 | `0E-40` | `-0E-40` |
-  | `$acos` | `NaN` | E50989 | E50989 | `1.5707963…` (34 digits) | same |
-  | `$atan` | `NaN` | `1.5707963…` | `-1.5707963…` | `0` | `-0` |
-  | `$sinh` | `NaN` | `Infinity` | `-Infinity` | `0E-40` | `-0E-40` |
-  | `$cosh` | `NaN` | `Infinity` | `Infinity` | `1.000…000` | same |
-  | `$tanh` | `NaN` | `1` | `-1` | `0` | `-0` |
-  | `$asinh` | `NaN` | `Infinity` | `-Infinity` | `0E-6176` | `-0E-6176` |
-  | `$acosh` | `NaN` | `Infinity` | E50989 | E50989 | E50989 |
-  | `$atanh` | `NaN` | E50989 | E50989 | `0E-6176` | `-0E-6176` |
-  | `$abs` | `NaN` | `Infinity` | `Infinity` | `0` | `0` |
-  | `$trunc` | `NaN` | `Infinity` | `-Infinity` | `0` | `-0` |
-  | `$ceil` | `NaN` | **`NaN`** | **`NaN`** | `0` | `-0` |
-  | `$floor` | `NaN` | **`NaN`** | **`NaN`** | `0` | `-0` |
+  Python's bug was one shape repeated: the domain guards tested
+  `isinstance(v, (int, float))`, so a `Decimal128` slipped past them into the
+  decimal path and returned `NaN` where mongod raises.
 
-  Four rows defeat a guess and are the reason this is a table rather than a
-  rule: `$ceil` / `$floor` of a Decimal **infinity** are `NaN`; `$ln` / `$log10`
-  of a Decimal NaN come back as a **double** `nan`, not a Decimal one;
-  `$cosh(-Infinity)` is `+Infinity`; and `$abs(-0)` is `0` while `$trunc(-0)` is
-  `-0`.
+  **The parity suite was green the whole time** — neither engine's corpus had
+  these shapes, so the two were pinned to each other while one deferred and the
+  other answered wrongly. Pinned now by
+  `tests/test_decimal128_special_values.py` (133 tests, both engines, the table
+  generated FROM mongod) and by the `decspecial` group in the differential gate.
 
-  The ZERO column mostly needs a per-operator QUANTUM (`0E-35`, `0E-40`,
-  `0E-6176`, the 34-digit `1.000…`), which is a constant per operator and so
-  also table-able — but the finite cases (`Decimal("2.5")` through any of these)
-  need real decimal transcendentals and remain the open dependency question
-  below. The PYTHON server answers the finite cases but gets the last digit and
-  the `-0` sign wrong on 19 shapes, which is the same family from the other
-  side.
+- [ ] **STILL OPEN: `Decimal128` FINITE operands in the transcendentals.** The
+  Rust engine defers `$sqrt(Decimal128("2.5"))` and the rest of the family;
+  mongod answers `1.581138830084189665999446772216359`. This is the genuine
+  dependency question — 34-significant-digit decimal transcendentals — and the
+  ZERO column of the matrix below needs a per-operator QUANTUM (`0E-35`,
+  `0E-40`, `0E-6176`, the 34-digit `1.000…`) which is a constant per operator
+  and so is table-able if someone wants a cheaper partial win. The PYTHON
+  server answers these but gets the last digit and the `-0` sign wrong on 19
+  shapes, which is the same family from the other side.
+
+  The measured special-value matrix that used to sit here is now redundant —
+  the behaviour is pinned by the tests named above; read those for the rules.
 
 - [ ] **Decimal128 operands are refused by 33 Rust operators (2026-09-02).**
   Was 38; `$abs`, `$toBool`, `$toInt`, `$toLong` and `$toDouble` now take them.

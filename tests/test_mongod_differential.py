@@ -2795,6 +2795,65 @@ DBLRENDER_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = (
     + [(f"spec-graphlookup-{name}", ONE, _graph_lookup(v)) for name, v in _DOUBLES]
 )
 
+
+def _unary(op: str, value: object) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(db, [{"$project": {"_id": 0, "r": {op: value}}}])
+
+
+# `Decimal128` NaN / +-Infinity through the math operators. These carry no
+# precision, so they are answerable without 34-digit decimal math -- which is
+# what separates them from a FINITE decimal, still deferred on the Rust server.
+#
+# Four of these defeat a guess, which is why the whole cross-product is pinned
+# rather than a rule: `$ceil`/`$floor` of a Decimal INFINITY are NaN;
+# `$ln`/`$log10` of a Decimal NaN come back as a DOUBLE nan; `$cosh(-Infinity)`
+# is +Infinity; and `$abs(-0)` is `0` while `$trunc(-0)` is `-0`.
+#
+# The Python engine's domain guards tested `isinstance(v, (int, float))`, so a
+# decimal slipped past them and answered NaN where mongod raises. Measured
+# 8.2.11, 2026-09-07.
+_DECIMAL_MATH_OPS = [
+    "$sqrt",
+    "$exp",
+    "$ln",
+    "$log10",
+    "$degreesToRadians",
+    "$radiansToDegrees",
+    "$sin",
+    "$cos",
+    "$tan",
+    "$asin",
+    "$acos",
+    "$atan",
+    "$sinh",
+    "$cosh",
+    "$tanh",
+    "$asinh",
+    "$acosh",
+    "$atanh",
+    "$abs",
+    "$trunc",
+    "$ceil",
+    "$floor",
+]
+_DECIMAL_SPECIALS = [
+    ("nan", Decimal128("NaN")),
+    ("inf", Decimal128("Infinity")),
+    ("neginf", Decimal128("-Infinity")),
+    # The zero and negative FINITE decimals: mongod's domain checks apply by
+    # VALUE, and the guards here tested `isinstance(v, (int, float))`, so these
+    # skipped them and answered `NaN` / `-Infinity` instead of raising.
+    ("negzero", Decimal128("-0")),
+    ("zero", Decimal128("0")),
+    ("negone", Decimal128("-1")),
+]
+
+DECIMAL_SPECIAL_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    (f"{op[1:]}-{name}", ONE, _unary(op, value))
+    for op in _DECIMAL_MATH_OPS
+    for name, value in _DECIMAL_SPECIALS
+]
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("readpath", c) for c in READPATH_CASES]
@@ -2821,6 +2880,7 @@ ALL_CASES = (
     + [("strconv", c) for c in STRCONV_CASES]
     + [("updovf", c) for c in UPDATE_OVERFLOW_CASES]
     + [("dblrender", c) for c in DBLRENDER_CASES]
+    + [("decspecial", c) for c in DECIMAL_SPECIAL_CASES]
 )
 
 
