@@ -275,6 +275,22 @@ QUERIES = [
     "SELECT '2026-09-01'::date::text",
     "SELECT '2026-9-1'::date::text",
     "SELECT '20260901'::date::text",
+    # PostgreSQL's date/timestamp domain is wider than a Python date: infinity,
+    # epoch, years past 9999 and BC all render as canonical text and must match.
+    "SELECT 'infinity'::date::text",
+    "SELECT '-infinity'::date::text",
+    "SELECT 'infinity'::timestamp::text",
+    "SELECT '-infinity'::timestamp::text",
+    "SELECT 'epoch'::timestamp::text",
+    "SELECT '10000-01-01'::date::text",
+    "SELECT '12345-06-07'::date::text",
+    "SELECT '10000-01-01 12:00'::timestamp::text",
+    "SELECT '0100-06-15 BC'::date::text",
+    # Leap-aware day validity holds for wide/BC years too: 10000 is a leap
+    # year (div by 400) and 1 BC is astronomical year 0 (also leap).
+    "SELECT '10000-02-29'::date::text",
+    "SELECT '0001-02-29 BC'::date::text",
+    "SELECT '1000-01-01 12:00 BC'::timestamp::text",
     "SELECT '12:34:56'::time::text",
     "SELECT '12:34'::time::text",
     "SELECT '12:34:56.5'::time::text",
@@ -926,6 +942,15 @@ ERROR_QUERIES = [
     "SELECT 'x'::numeric",
     "SELECT 'x'::int",
     "SELECT '2026-13-01'::date",
+    # A wide-year date with an impossible field is 22008; a non-date is 22007.
+    "SELECT '12345-13-01'::date",
+    "SELECT 'notadate'::date",
+    "SELECT 'notadate'::timestamp",
+    # An impossible day is 22008 even in a wide/BC year (12345 and 3 BC are
+    # not leap years); April never has 31 days.
+    "SELECT '12345-02-29'::date",
+    "SELECT '0004-02-29 BC'::date",
+    "SELECT '12345-04-31'::date",
     "SELECT nosuchcolumn FROM d",
     "SELECT * FROM nosuchtable",
     "SELECT '{bad}'::json",

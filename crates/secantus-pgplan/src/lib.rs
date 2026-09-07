@@ -2572,6 +2572,19 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
 /// exist -- `2026-02-30` -- is `22008`, a different code.
 fn parse_date(text: &str) -> Result<String> {
     let t = text.trim();
+    // PostgreSQL's DATE domain is far wider than a Python `date` (or chrono's
+    // common range): `infinity` / `-infinity` are valid values, so are years
+    // past 9999 and BC. mongod-side we do not compute on these -- we store the
+    // CANONICAL TEXT and let the client's loader decide what it can hold (a
+    // Python date raises "date too large", which is what psycopg's overflow
+    // tests assert). So accept the shapes chrono cannot and pass them through.
+    let lower = t.to_ascii_lowercase();
+    if lower == "infinity" || lower == "+infinity" {
+        return Ok("infinity".to_string());
+    }
+    if lower == "-infinity" {
+        return Ok("-infinity".to_string());
+    }
     let parsed = if t.len() == 8 && t.chars().all(|c| c.is_ascii_digit()) {
         NaiveDate::parse_from_str(t, "%Y%m%d")
     } else {
@@ -2579,18 +2592,175 @@ fn parse_date(text: &str) -> Result<String> {
     };
     match parsed {
         Ok(d) => Ok(d.format("%Y-%m-%d").to_string()),
-        Err(_) => {
-            // Distinguish "not a date at all" from "a date that cannot exist".
-            let numeric_shape = t
-                .split(['-', '/'])
-                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
-            Err(if numeric_shape {
-                Error::DatetimeFieldOverflow(format!("date/time field value out of range: \"{t}\""))
-            } else {
-                Error::InvalidDatetimeFormat(format!("invalid input syntax for type date: \"{t}\""))
-            })
-        }
+        // A `YYYY-MM-DD` shape chrono rejected only for its YEAR magnitude
+        // (PostgreSQL allows year > 9999 and BC) is passed through as canonical
+        // text; the client's loader is what ultimately rejects an unrepresentable
+        // value. A BAD FIELD (month 13, day 40) is 22008, and a non-date is 22007.
+        Err(_) => match classify_wide_date(t) {
+            WideDate::Valid => Ok(canonical_wide_date(t)),
+            WideDate::FieldOutOfRange => Err(Error::DatetimeFieldOverflow(format!(
+                "date/time field value out of range: \"{t}\""
+            ))),
+            WideDate::NotADate => Err(Error::InvalidDatetimeFormat(format!(
+                "invalid input syntax for type date: \"{t}\""
+            ))),
+        },
     }
+}
+
+/// The canonical text of a timestamp literal PostgreSQL accepts but a Python
+/// datetime cannot hold: `infinity` / `-infinity`, a year past 9999, or BC.
+/// `None` for an ordinary timestamp (which flows through the micros path). We
+/// store these as their TEXT and let the client's loader raise, exactly as for
+/// out-of-range dates.
+fn special_timestamp_text(t: &str) -> Option<String> {
+    let trimmed = t.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "infinity" || lower == "+infinity" {
+        return Some("infinity".to_string());
+    }
+    if lower == "-infinity" {
+        return Some("-infinity".to_string());
+    }
+    let date_part = trimmed.split([' ', 'T']).next().unwrap_or(trimmed);
+    // BC is ALWAYS beyond a Python datetime's proleptic range, whatever the
+    // year magnitude, so a `... BC` literal is always kept as text.
+    if lower.ends_with(" bc") {
+        // classify_wide_date needs the era, so hand it the date part WITH `BC`.
+        let date_bc = format!("{date_part} BC");
+        return matches!(classify_wide_date(&date_bc), WideDate::Valid)
+            .then(|| canonical_wide_timestamp(trimmed));
+    }
+    // A wide year (> 9999) chrono cannot parse: keep the text.
+    if matches!(classify_wide_date(date_part), WideDate::Valid)
+        && NaiveDate::parse_from_str(date_part.trim_start_matches('-'), "%Y-%m-%d").is_err()
+    {
+        return Some(canonical_wide_timestamp(trimmed));
+    }
+    None
+}
+
+/// Canonicalise a wide/BC timestamp literal to PostgreSQL's rendered text.
+/// PostgreSQL keeps the (wide/BC) date as given but always renders the time as
+/// `HH:MM:SS` (seconds appended, `00:00:00` when absent), then re-attaches the
+/// ` BC` era. The tz-offset a *timestamptz* would carry is deliberately not
+/// computed here (see tasks/backlog.md) -- this is the no-offset form.
+fn canonical_wide_timestamp(t: &str) -> String {
+    let trimmed = t.trim();
+    let (body, bc) = match trimmed
+        .strip_suffix(" BC")
+        .or_else(|| trimmed.strip_suffix(" bc"))
+    {
+        Some(b) => (b.trim_end(), true),
+        None => (trimmed, false),
+    };
+    let (date, time) = match body.find([' ', 'T']) {
+        Some(i) => (&body[..i], body[i + 1..].trim()),
+        None => (body, ""),
+    };
+    let time = if time.is_empty() {
+        "00:00:00".to_string()
+    } else if time.matches(':').count() == 1 {
+        format!("{time}:00")
+    } else {
+        time.to_string()
+    };
+    let mut out = format!("{date} {time}");
+    if bc {
+        out.push_str(" BC");
+    }
+    out
+}
+
+enum WideDate {
+    /// A well-formed date whose year is simply out of chrono's range.
+    Valid,
+    /// The right shape but an impossible month/day.
+    FieldOutOfRange,
+    /// Not a date at all.
+    NotADate,
+}
+
+/// Classify a date literal chrono could not parse: a wide/BC year (pass
+/// through), a bad field (22008), or not a date (22007).
+fn classify_wide_date(t: &str) -> WideDate {
+    let (body, bc) = match t.strip_suffix(" BC").or_else(|| t.strip_suffix(" bc")) {
+        Some(b) => (b.trim_end(), true),
+        None => (t, false),
+    };
+    let digits = body.trim_start_matches('-');
+    let parts: Vec<&str> = digits.split('-').collect();
+    let numeric3 = parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    if numeric3 {
+        let year = parts[0].parse::<i64>().unwrap_or(0);
+        let month = parts[1].parse::<u32>().unwrap_or(0);
+        let day = parts[2].parse::<u32>().unwrap_or(0);
+        // Only a genuinely WIDE (year > 9999) or BC date is a passthrough
+        // candidate: a NORMAL-year date reached this arm because chrono already
+        // rejected it, which makes it a real bad field (`2026-02-30` is 22008,
+        // never text). For a wide/BC one chrono cannot help, so validate the
+        // day against the proleptic-Gregorian calendar ourselves -- PostgreSQL
+        // does (`12345-02-29` is out of range, `0001-02-29 BC` is not).
+        if bc || year > 9999 {
+            // 1 BC is astronomical year 0, 2 BC is -1, ...
+            let astro = if bc { 1 - year } else { year };
+            return if gregorian_day_valid(astro, month, day) {
+                WideDate::Valid
+            } else {
+                WideDate::FieldOutOfRange
+            };
+        }
+        return WideDate::FieldOutOfRange;
+    }
+    // Not a wide/BC date and not the 3-number shape: a numeric-shaped value is
+    // a bad field (22008), anything else is not a date at all (22007).
+    let numeric_shape = t
+        .split(['-', '/'])
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    if numeric_shape {
+        WideDate::FieldOutOfRange
+    } else {
+        WideDate::NotADate
+    }
+}
+
+/// Is `day` a real day of `month` in proleptic-Gregorian `year` (astronomical,
+/// so 1 BC = 0)? Leap years follow the standard divisibility rule, which Rust's
+/// truncating `%` gets right for negative years too (-3 % 4 != 0).
+fn gregorian_day_valid(year: i64, month: u32, day: u32) -> bool {
+    if !(1..=12).contains(&month) || day == 0 {
+        return false;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let dim = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+    };
+    day <= dim
+}
+
+/// The canonical rendering of a wide/BC date: PostgreSQL zero-pads the year to
+/// at least four digits and keeps a ` BC` suffix.
+fn canonical_wide_date(t: &str) -> String {
+    let (body, bc) = match t.strip_suffix(" BC").or_else(|| t.strip_suffix(" bc")) {
+        Some(b) => (b.trim(), true),
+        None => (t, false),
+    };
+    let mut out = body.to_string();
+    if bc {
+        out.push_str(" BC");
+    }
+    out
 }
 
 /// Parse a `time` literal and render it as PostgreSQL does.
@@ -4206,6 +4376,9 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         // storing session-relative text in a row would be a wrong answer for
         // every other session that read it).
         "timestamptz" | "timestamp with time zone" => {
+            if let Some(text) = special_timestamp_text(&as_text(&value)) {
+                return Ok(Bson::String(text));
+            }
             let tz = session_timezone();
             Ok(Bson::String(render_timestamptz(
                 parse_timestamptz(&as_text(&value), &tz)?,
@@ -4219,6 +4392,16 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         // A timestamp becomes a BSON date plus, when it carries microseconds,
         // a composite the assignment path unwraps into the hidden companion.
         "timestamp" => {
+            // `epoch` is the one special INPUT value that is constant; `now` /
+            // `today` etc. depend on the clock and are filed rather than guessed.
+            if as_text(&value).trim().eq_ignore_ascii_case("epoch") {
+                return cast_value(Bson::String("1970-01-01 00:00:00".into()), "timestamp");
+            }
+            // infinity / wide-year / BC: keep the text, let the client's
+            // loader decide -- the micros path cannot hold them.
+            if let Some(text) = special_timestamp_text(&as_text(&value)) {
+                return Ok(Bson::String(text));
+            }
             let micros = parse_timestamp(&as_text(&value))?;
             let (ms, rem) = split_subms(micros);
             let date = Bson::DateTime(bson::DateTime::from_millis(ms));

@@ -1234,6 +1234,22 @@ Specific items that were left out of the slice that introduced their feature are
   same batch: `rust-pgserver-date-time` was an active branch when this was
   written and owns that surface.
 
+- [ ] **OPEN — RUST pgserver: a wide-year / BC `timestamptz` is not rendered
+  with its tz offset (noted 2026-09-07).** `rust-pgserver-timestamp` added
+  pass-through for PostgreSQL's out-of-Python-range date/timestamp values
+  (`infinity` / `-infinity`, years > 9999, BC, and the `epoch` keyword), and
+  canonicalises a wide/BC *plain* `timestamp` to `HH:MM:SS` text. `infinity`
+  is tz-independent and correct for `timestamptz` too, but a wide/BC
+  `timestamptz` still returns the no-offset form: PG renders
+  `'10000-01-01 12:00'::timestamptz::text` as `10000-01-01 12:00:00+00` and a
+  BC one with a full historical LMT offset (`... -00:01:15 BC` under GB), which
+  needs real session-tz math this batch did not attempt. Only `::timestamp`
+  shapes are in the differential lane; the `::timestamptz` wide/BC offset is
+  unproven. `special_timestamp_text` / `canonical_wide_timestamp` in
+  `secantus-pgplan/src/lib.rs` are where it would land. Also NOT handled: the
+  clock-dependent input keywords `now` / `today` / `tomorrow` / `yesterday`
+  (only the constant `epoch` is).
+
 - [ ] **OPEN — `test_tls_against_rust_server` flakes on the Windows runner
   (first seen 2026-08-29, PR #1089).** `storage-engine (windows-latest)` failed
   ONE of 86 tests with `ServerSelectionTimeoutError: No servers found yet,
