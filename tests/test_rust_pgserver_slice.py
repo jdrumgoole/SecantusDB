@@ -3124,3 +3124,44 @@ def test_timestamptz_columns_render_in_session_zone(home: Path) -> None:
         cur.execute("select t from ts")
         assert cur.description[0].type_code == 1114
         assert cur.fetchone()[0] == _dt.datetime(2026, 1, 1, 12, 0)
+
+
+def test_custom_range_types(home: Path) -> None:
+    """`CREATE TYPE ... AS RANGE (subtype = ...)` — a user range type.
+
+    A user range has no canonical function, so `[1,4]` stays `[1,4]` (unlike the
+    builtin int4range, which canonicalises to `[1,5)`). The type resolves as a
+    regtype, casts parse/render over its subtype, RangeInfo.fetch finds its
+    subtype via `pg_type JOIN pg_range`, and DROP TYPE removes it.
+    """
+    from psycopg.types.range import RangeInfo
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TYPE myr AS RANGE (subtype = int4)")
+        cur.execute("SELECT '[1,5)'::myr::text")
+        assert cur.fetchone()[0] == "[1,5)"
+        # No canonicalisation for a user range.
+        cur.execute("SELECT '[1,4]'::myr::text")
+        assert cur.fetchone()[0] == "[1,4]"
+        cur.execute("SELECT 'empty'::myr::text")
+        assert cur.fetchone()[0] == "empty"
+        cur.execute("SELECT '(,5)'::myr::text")
+        assert cur.fetchone()[0] == "(,5)"
+
+        # RangeInfo.fetch resolves the subtype (compare the type NAME, since the
+        # subtype oid is stable but the range oid is minted).
+        info = RangeInfo.fetch(conn, "myr")
+        cur.execute("SELECT %s::regtype::text", (info.subtype_oid,))
+        assert cur.fetchone()[0] == "integer"
+
+        # A numeric-subtype range too.
+        cur.execute("CREATE TYPE mynr AS RANGE (subtype = numeric)")
+        cur.execute("SELECT '[1.5,3.5)'::mynr::text")
+        assert cur.fetchone()[0] == "[1.5,3.5)"
+
+        # DROP removes it: the regtype no longer resolves.
+        cur.execute("DROP TYPE myr")
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("SELECT 'myr'::regtype")
+        assert exc.value.diag.sqlstate == "42704"

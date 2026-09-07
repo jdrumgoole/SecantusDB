@@ -1925,10 +1925,11 @@ These are explicit non-goals. Don't add them without a reason.
   unbounded / populated values round-trip against real PG; the psycopg cases
   that error do so on real PG too, as `08P01`). `ARRAY`-of-multirange typing was
   fixed (its own array oids 6150/6151/6152/6153/6155/6157, both formats). Still
-  open in `tests/types/test_range.py` / `test_multirange.py`: `CREATE TYPE ... AS
-  RANGE` (custom range types — `CreateRangeStmt`, the largest cluster), and the
-  array-of-range element `=` comparison (`comparing string with array using =`),
-  which is the general string-vs-array operator gap, not a range-specific one.
+  open in `tests/types/test_range.py` / `test_multirange.py`: the array-of-range
+  element `=` comparison (`comparing string with array using =`), which is the
+  general string-vs-array operator gap, not a range-specific one, and multirange
+  OF a custom range. (`CREATE TYPE ... AS RANGE` custom range types shipped
+  2026-09-07 — DDL, casts, comparison, and `RangeInfo.fetch`.)
 
 
 ### 2026-09-06 READ-PATH sweep: 385 cases, and what is still open

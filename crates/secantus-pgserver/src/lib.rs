@@ -239,6 +239,8 @@ impl PgHandler {
     const ENUM_COLLECTION: &'static str = "__sql_enums__";
     const ENUM_META_COLLECTION: &'static str = "__sql_enum_meta__";
     const ENUM_TYPE_OID_BASE: i64 = 65_000;
+    const RANGE_COLLECTION: &'static str = "__sql_ranges__";
+    const RANGE_TYPE_OID_BASE: i64 = 69_000;
     const USER_TYPE_ARRAY_OID_OFFSET: i64 = 100_000;
 
     /// Hand the planner this database's user types, fresh from the store --
@@ -251,6 +253,15 @@ impl PgHandler {
             types.push((name, oid, Vec::new()));
         }
         secantus_pgplan::set_user_types(types);
+        // Custom ranges resolve their subtype at cast time and their oid for
+        // regtype -- but they are NOT enums, so they stay OUT of set_user_types.
+        let ranges: Vec<(String, String, i64)> = self
+            .ranges()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, oid, subtype)| (name, subtype, oid))
+            .collect();
+        secantus_pgplan::set_user_ranges(ranges);
     }
 
     /// The wire type for a column whose type is a USER enum: pgwire's `Type`
@@ -520,6 +531,39 @@ impl PgHandler {
         Ok(out)
     }
 
+    /// The `__sql_ranges__` catalog: a doc `{range, oid, subtype}` per custom
+    /// range type. `subtype` is the element type name (e.g. `int4`).
+    fn ranges(&self) -> PgWireResult<Vec<(String, i64, String)>> {
+        let raw = self
+            .storage
+            .find_matching(&self.db, Self::RANGE_COLLECTION, &Document::new())
+            .map_err(|e| Self::storage_err("could not read the range catalog", e))?;
+        let mut out = Vec::new();
+        for bytes in raw {
+            let d: Document = bson::from_slice(&bytes)
+                .map_err(|e| Self::storage_err("could not decode a range", e))?;
+            let name = d.get_str("range").unwrap_or_default().to_string();
+            let oid = d
+                .get_i64("oid")
+                .or_else(|_| d.get_i32("oid").map(i64::from))
+                .unwrap_or(0);
+            let subtype = d.get_str("subtype").unwrap_or_default().to_string();
+            out.push((name, oid, subtype));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Mint the next range-type oid -- the enum minting rule, base 69000.
+    fn mint_range_oid(&self) -> PgWireResult<i64> {
+        let existing = self.ranges()?;
+        let oid = match existing.iter().map(|(_, o, _)| *o).max() {
+            Some(taken) => (Self::RANGE_TYPE_OID_BASE + existing.len() as i64 - 1).max(taken) + 1,
+            None => Self::RANGE_TYPE_OID_BASE,
+        };
+        Ok(oid)
+    }
+
     /// Mint the next composite oid -- the enum minting rule, own counter and
     /// base 67000, monotonic and never reused.
     fn mint_composite_oid(&self) -> PgWireResult<i64> {
@@ -751,6 +795,19 @@ impl PgHandler {
                     }
                     rows.push(d);
                 }
+                // Custom range types: their own oid, typarray derived, typrelid 0.
+                for (name, oid, _) in self.ranges().ok()? {
+                    let mut d = Document::new();
+                    d.insert(def.field_of("typname").expect("column"), name);
+                    d.insert(def.field_of("oid").expect("column"), Bson::Int64(oid));
+                    d.insert(
+                        def.field_of("typarray").expect("column"),
+                        Bson::Int64(oid + Self::USER_TYPE_ARRAY_OID_OFFSET),
+                    );
+                    d.insert(def.field_of("typdelim").expect("column"), ",");
+                    d.insert(def.field_of("typrelid").expect("column"), Bson::Int64(0));
+                    rows.push(d);
+                }
                 rows
             }
             // One row per builtin range type: (range oid, element oid). The
@@ -781,6 +838,19 @@ impl PgHandler {
                         def.field_of("rngtypid").expect("column"),
                         Bson::Int64(rngtypid),
                     );
+                    d.insert(
+                        def.field_of("rngsubtype").expect("column"),
+                        Bson::Int64(rngsubtype),
+                    );
+                    rows.push(d);
+                }
+                // Custom range types: (range oid, subtype oid).
+                for (_, oid, subtype) in self.ranges().ok()? {
+                    let Some(rngsubtype) = secantus_pgplan::pgtypes::oid_of_name(&subtype) else {
+                        continue;
+                    };
+                    let mut d = Document::new();
+                    d.insert(def.field_of("rngtypid").expect("column"), Bson::Int64(oid));
                     d.insert(
                         def.field_of("rngsubtype").expect("column"),
                         Bson::Int64(rngsubtype),
@@ -2515,6 +2585,34 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
             }
 
+            Statement::CreateRange { name, subtype } => {
+                let taken = self.ranges()?.iter().any(|(n, _, _)| *n == name)
+                    || self.composites()?.iter().any(|(n, _, _)| *n == name)
+                    || self.enums()?.iter().any(|(n, _, _)| *n == name)
+                    || secantus_pgplan::pgtypes::oid_of_name(&name).is_some();
+                if taken {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42710".into(),
+                        format!("type \"{name}\" already exists"),
+                    ))));
+                }
+                self.ensure_collection(Self::RANGE_COLLECTION)?;
+                let oid = self.mint_range_oid()?;
+                let doc = bson::doc! {
+                    "_id": &name,
+                    "range": &name,
+                    "subtype": &subtype,
+                    "oid": oid,
+                };
+                let bytes = bson::to_vec(&doc)
+                    .map_err(|e| Self::storage_err("could not encode the type", e))?;
+                self.storage
+                    .insert(&self.db, Self::RANGE_COLLECTION, vec![bytes], true)
+                    .map_err(|e| Self::storage_err("could not record the type", e))?;
+                Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
+            }
+
             Statement::CreateEnum { name, labels } => {
                 // A duplicate name is 42710, distinct from a table's 42P07 --
                 // and checked against BUILTINS too: `create type text ...` is
@@ -2548,6 +2646,7 @@ impl PgHandler {
             Statement::DropType { names, if_exists } => {
                 self.ensure_collection(Self::ENUM_COLLECTION)?;
                 self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
+                self.ensure_collection(Self::RANGE_COLLECTION)?;
                 for name in &names {
                     let filter = bson::doc! {"_id": name};
                     let from_enum = self
@@ -2572,7 +2671,18 @@ impl PgHandler {
                             None,
                         )
                         .map_err(|e| Self::storage_err("could not drop the type", e))?;
-                    let removed = from_enum + from_comp;
+                    let from_range = self
+                        .storage
+                        .delete_matching(
+                            &self.db,
+                            Self::RANGE_COLLECTION,
+                            &filter,
+                            0,
+                            &Document::new(),
+                            None,
+                        )
+                        .map_err(|e| Self::storage_err("could not drop the type", e))?;
+                    let removed = from_enum + from_comp + from_range;
                     if removed == 0 && !if_exists {
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
