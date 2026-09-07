@@ -5473,61 +5473,90 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   Pinned by `tests/test_decimal128_zero_and_avg.py` (90 tests, both engines,
   table generated FROM mongod) and the `deczero` / `avgdiv` gate groups.
 
-- [ ] **OPEN, and it is a WRONG ANSWER not a message: a case-insensitive query
-  or sort over ANY non-ASCII text is a hard ERROR on the RUST server
-  (measured 2026-09-07).** `tools/probes/collation_order.py` was the one
-  Rust-aware probe never swept against the Rust server. Sweeping it found two
-  things.
+- [x] **RESOLVED (2026-09-07): collated ORDER on the RUST server — a
+  case-insensitive query over non-ASCII no longer ERRORS, and collated sorting
+  is implemented.** `tools/probes/collation_order.py` was the one Rust-aware
+  probe never swept against the Rust server; sweeping it found both.
 
-  **(a) Strength 1 or 2 over non-ASCII errors outright.**
+  **The error.** `find().sort(...).collation({strength: 1})` over any non-ASCII
+  character — `á`, `ß`, `日` alike — answered
+  `2 BadValue: an indexed value is of a type the Rust server does not support`,
+  on match filters as well as sorts. `normalize_index_bytes` had
+  `if !s.is_ascii() { return None }`, and a defer has no Python behind it on
+  the Rust server. It now folds properly: NFKD, drop combining marks, full case
+  fold. **`to_lowercase` is NOT enough** — folding maps `ß` to `ss`, and mongod
+  sorts `["ß","s","t"]` as `["s","ß","t"]`, which only comes out right if `ß`
+  compares as `ss`.
 
-      find().sort("v", 1).collation({locale: "en", strength: 1})
-        over ["a", "A", "á", "B", "b"]
-          mongod  ['a', 'A', 'á', 'B', 'b']
-          python  ['a', 'A', 'á', 'B', 'b']     (matches)
-          rust    2 BadValue: an indexed value is of a type the Rust
-                  server does not support
+  **The ordering.** `collation.py`'s `sort_levels` is ported to
+  `collation::sort_level_bytes` as a byte-comparable three-level key: the
+  measured `MARK_ORDER` table (acute before grave — NOT codepoint order),
+  `backwards` reversal, `caseFirst` flip, `numericOrdering` digit runs.
 
-  Not just accents — `ß` and `日` (CJK) trigger it too. It hits a MATCH filter
-  as well as a sort (`find({v: "á"}).collation(...)`); a bare
-  `find().collation(...)` with neither is fine. Strength 3 is fine. So the
-  break is exactly "case- or accent-insensitive + any non-ASCII character",
-  which is the most common collation use over any non-English text.
+  Result: **0 unexpected divergences of 19** on the probe (the 2 remaining are
+  the documented Swedish / Danish locale gaps needing CLDR), and **0 of 64** on
+  a wider three-way sweep across every collation option shape.
 
-  Root cause is one line in `crates/secantus-core/src/collation.rs`
-  (`normalize_index_bytes`):
+  **There were TWO defer sites, not one.** Fixing `normalize_index_bytes` left
+  the query path (`normalize`, behind `collation::equal` / `compare`) still
+  bailing, so collated equality and range queries on non-ASCII text kept
+  answering `2 BadValue: query uses a construct the Rust server does not
+  support` after the sort was fixed. Caught by the new test file, not by
+  reading. Both now share one fold helper.
 
-      if !s.is_ascii() {
-          return None; // accent/case transform on non-ASCII -> defer
-      }
+  **NO on-disk change, and the `entryFormat` bump this entry previously called
+  for is NOT needed** — that was over-cautious and is corrected here. Only ONE
+  call site passes a collation to the index encoder and it is the in-memory
+  sort-key builder; index entries encode with `None`. That is now structural
+  rather than incidental: `sortkey::encode_value` stays the single-level INDEX
+  encoder (byte-identical to Python's, which is what the other server reads
+  back) and the three-level ordering key moved to a new `encode_sort_value`.
+  Collapsing the two roles into one function is what broke
+  `test_collation_encoding_parity` — the same name means index bytes in Python
+  and had come to mean the sort key in Rust. Verified by the probe's own
+  invariant: index and non-index results agree on every case.
 
-  `sortkey::encode_value` turns that `None` into `UnsupportedValue`, and the
-  storage adapter maps it to the BadValue above. The DEFER is correct on the
-  Python server, where the pure engine picks it up; on the RUST server there is
-  no Python behind a defer, so it reaches the client as an error. Same shape as
-  the other defer-is-an-error findings.
+  **Mark filtering must use the predicate Python uses, PER SITE** — three
+  different sets, and the difference is measurable. `_strip_accents` filters
+  general category `Mn`; `sort_levels` filters on a nonzero canonical combining
+  class; `unicode_normalization::char::is_combining_mark` is neither, being true
+  for all of `M*`. Using the last for the accent strip dropped a Devanagari
+  vowel sign (U+093E, `Mc`) that the Python engine keeps. Adds direct
+  `unicode-normalization` and `unicode-properties` dependencies to
+  `secantus-core`; both were already in the lock tree transitively.
 
-  **(b) Collated ORDER is not implemented on the Rust server at all.** 9 of the
-  19 probe cases sort by codepoint where mongod applies the collation
-  (`['a','az','b','á','ä']` for mongod's `['a','á','ä','az','b']`), covering
-  accents, `strength: 3` case order, `caseFirst`, `numericOrdering`,
-  `backwards` and the `de` locale. The Python server is 0 unexpected
-  divergences on the same 19 (2 known locale gaps needing ICU). `collation.py`'s
-  three-level `sort_levels` is the reference.
+- [ ] **OPEN: the PYTHON server orders LIGATURES wrongly under a collation
+  (found 2026-09-07 while porting `sort_levels` to Rust).** 5 of 64 shapes in
+  the three-way sweep; mongod and the Rust server agree, the Python server does
+  not:
 
-  **Two blockers make this a DECISION, not just a port**, and both are why it is
-  filed rather than fixed:
+      ["ﬁ", "fi", "fj"]  sorted with any collation
+          mongod  ['fi', 'ﬁ', 'fj']
+          rust    ['fi', 'ﬁ', 'fj']
+          python  ['ﬁ', 'fi', 'fj']
 
-  1. **A dependency.** Case folding could use std `str::to_lowercase` (Unicode
-     aware, no new crate), but accent stripping needs NFD decomposition —
-     `unicode-normalization` or similar. `secantus-core` has no such dependency
-     today. Same class of question as the Decimal128 transcendentals.
-  2. **On-disk index encoding.** `normalize_index_bytes` feeds
-     `sortkey::encode_value`, which writes INDEX ENTRIES. A collated strength-1
-     index over non-ASCII builds today and stores codepoint-ordered keys (a
-     hinted find returns `['a','b','á']`), so changing the normalisation changes
-     stored keys — read `[[sortkey-rank-is-on-disk]]`: change both servers and
-     bump `entryFormat`, or an index silently changes the sort answer.
+  `sort_levels` decomposes with **NFD**, which does not split a COMPATIBILITY
+  ligature, so `ﬁ` stays one base character while the primary level case-folds
+  it to two:
+
+      'ﬁ'   key = ('fi', ((),),    (0,))
+      'fi'  key = ('fi', ((), ()), (0, 0))
+
+  The primaries tie and the secondary then compares a ONE-group tuple against a
+  TWO-group one, so `((),) < ((),())` puts the ligature first.
+
+  **Not fixed here because the obvious fixes are unmeasured.** Switching
+  `sort_levels` to NFKD makes the two keys IDENTICAL, which is also not
+  mongod's answer — mongod separates them, so it has a further tiebreak.
+  Adding an ICU-style identical level would supply one, but it would also break
+  the strength-1 ties where mongod preserves INPUT order (`["a","A","á"]` at
+  strength 1). Someone should measure what mongod actually does with equal
+  primaries before choosing.
+
+  Worth noting honestly: the Rust side matches mongod here by an ARTIFACT of
+  how the byte encoding interleaves its level separators, not because it models
+  a quaternary level. It is right on all 64 measured shapes and the mechanism
+  is not principled; a future change to the separator layout could move it.
 
 - [ ] **STILL OPEN: `Decimal128` FINITE operands in the transcendentals — now
   the ONLY thing left in this family (19 shapes, re-measured 2026-09-07 after

@@ -1192,6 +1192,8 @@ dependencies = [
  "geo",
  "rand",
  "regex",
+ "unicode-normalization",
+ "unicode-properties",
 ]
 
 [[package]]

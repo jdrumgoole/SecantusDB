@@ -27,6 +27,11 @@ geo = "0.28"
 # backtrack; it's tried first for every pattern. Patterns it can't compile
 # (backreferences / lookaround) fall back to `fancy-regex` below.
 regex = "1"
+# NFKD decomposition for accent-insensitive collation (strength 1). Already in
+# the lock tree transitively, so this is a direct edge rather than a new crate.
+# `char::is_combining_mark` is the `category == Mn` test `collation.py` uses.
+unicode-normalization = "0.1"
+unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
 # Backtracking regex with lookaround + backreference support (Python `re`-style),
 # used only when the linear `regex` engine above can't compile a pattern — e.g.
 # the negative-lookahead `^(?!system\.)` pymongo emits for listCollections name

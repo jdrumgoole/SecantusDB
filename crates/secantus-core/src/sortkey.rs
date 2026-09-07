@@ -253,12 +253,21 @@ pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, Unsup
         }
         Bson::String(s) => {
             out.push(RANK_STRING);
-            let bytes = match coll {
-                Some(c) => collation::normalize_index_bytes(s, c)
-                    .ok_or_else(|| UnsupportedValue("collation defers to Python".into()))?,
-                None => s.as_bytes().to_vec(),
-            };
-            out.extend(escape(&bytes));
+            // The single-level INDEX fold, byte-identical to Python's
+            // `_encode_string` -> `normalize_for_index_bytes`. Ordering under a
+            // collation is a DIFFERENT key -- see `encode_sort_value` below --
+            // because the fold answers "equal under this collation?" and cannot
+            // order two strings differing only in an accent. Keeping both roles
+            // in this one function is what broke `test_collation_encoding_parity`:
+            // `encode_value(collation=)` means index bytes in Python and had
+            // come to mean the sort key here.
+            match coll {
+                Some(c) => out
+                    .extend(escape(&collation::normalize_index_bytes(s, c).ok_or(
+                        UnsupportedValue("collation cannot be reproduced".into()),
+                    )?)),
+                None => out.extend(escape(s.as_bytes())),
+            }
         }
         // A collation has nothing to say about JavaScript, so it is deliberately
         // not applied here (mongod compares code text directly). A with-scope
@@ -341,6 +350,27 @@ pub fn invert_bytes(b: &[u8]) -> Vec<u8> {
 /// To ORDER values, compare `encode_value` outputs and negate for a descending
 /// column — prefix-shorter-first is exactly right ascending, and its reverse is
 /// exactly right descending. `storage::sort_key` / `compare_sort_keys` do that.
+/// Sort-ordering key for a value under `coll` — the three-level collation key
+/// for strings (primary base letters / secondary accent marks / tertiary case),
+/// and `encode_value` for everything else.
+///
+/// Separate from `encode_value` on purpose. `encode_value` is the INDEX
+/// encoder: its bytes go in the entries table on disk and must stay
+/// byte-identical to Python's. This one is only ever compared in memory within
+/// a single sort, so it is free to carry the extra levels that mongod orders by
+/// and that the single-level fold provably cannot express.
+pub fn encode_sort_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, UnsupportedValue> {
+    match (v, coll) {
+        (Bson::String(s), Some(c)) => {
+            let mut out = Vec::new();
+            out.push(RANK_STRING);
+            out.extend(escape(&collation::sort_level_bytes(s, c)));
+            Ok(out)
+        }
+        _ => encode_value(v, coll),
+    }
+}
+
 pub fn encode_value_directed(
     v: &Bson,
     direction: i32,
