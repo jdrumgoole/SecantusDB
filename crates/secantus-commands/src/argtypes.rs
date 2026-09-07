@@ -811,16 +811,9 @@ pub(crate) fn render_stage_value(v: &Bson) -> String {
         Bson::Boolean(b) => b.to_string(),
         Bson::Int32(n) => n.to_string(),
         Bson::Int64(n) => n.to_string(),
-        Bson::Double(d) => {
-            if d.is_nan() {
-                // mongod renders it lower-case; Rust's `to_string` gives `NaN`.
-                "nan".to_string()
-            } else if d.fract() == 0.0 {
-                format!("{d:.1}")
-            } else {
-                d.to_string()
-            }
-        }
+        // The SPEC rendering: shortest round-trip, a whole double keeping `.0`.
+        // `{d:.1}` expanded `1e308` into its full 309-digit decimal value.
+        Bson::Double(d) => secantus_core::format_double_spec(*d),
         Bson::Null => "null".to_string(),
         // Without this a decimal rendered as its debug form,
         // `Decimal128(0f00...)`, instead of `1.5`.

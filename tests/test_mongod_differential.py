@@ -2720,6 +2720,81 @@ UPDATE_OVERFLOW_CASES: list[tuple[str, list[dict], Callable[[Database], object]]
 ]
 
 
+def _merge_obj(value: object) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(db, [{"$project": {"_id": 0, "r": {"$mergeObjects": value}}}])
+
+
+def _ln(value: object) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(db, [{"$project": {"_id": 0, "r": {"$ln": value}}}])
+
+
+def _first_n(value: object) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(db, [{"$addFields": {"x": {"$firstN": value}}}])
+
+
+def _graph_lookup(value: object) -> Callable[[Database], object]:
+    return lambda db: _agg_err_full(
+        db,
+        [
+            {
+                "$graphLookup": {
+                    "startWith": value,
+                    "connectFromField": "a",
+                    "connectToField": "b",
+                    "as": "c",
+                }
+            }
+        ],
+    )
+
+
+# mongod has TWO renderings for a double inside an error message and they are
+# not interchangeable (measured 8.2.11, 2026-09-07):
+#
+#   VALUE form (`Value::toString`) -- C's `%g`, precision 6:
+#       -0.0 -> `-0`, -1.0 -> `-1`, 1234567.0 -> `1.23457e+06`
+#   SPEC form (a stage's echoed specification) -- shortest round-trip, a whole
+#   double keeping its `.0`:
+#       -0.0 -> `-0.0`, -1.0 -> `-1.0`, 1234567.0 -> `1234567.0`
+#
+# One renderer served both, so every VALUE message rendered a double the SPEC
+# way. Switching the shared renderer is NOT the fix on its own: it corrects
+# `$mergeObjects` / `$replaceRoot` / `$ln` and silently breaks `$graphLookup`,
+# which is a SPEC echo that happened to share the function. Both vocabularies
+# are pinned here for that reason -- a future simplification that collapses
+# them fails on one side or the other.
+_DOUBLES = [
+    ("neg-zero", -0.0),
+    ("neg-one", -1.0),
+    ("whole", 100.0),
+    ("six-digits", 123456.0),
+    ("seven-digits", 1234567.0),
+    ("int32-min", -2147483648.0),
+    ("huge", 1e308),
+    # The bottom of the range, where the SPEC form stops agreeing with the
+    # shortest round-trip form: mongod prints the double's actual value to 16
+    # significant digits, so `1e-308` echoes as `9.999999999999999e-309`. Both
+    # servers rendered the round-trip form until this gate said otherwise.
+    ("tiny", 1e-308),
+    ("denormal-min", 5e-324),
+    ("denormal", 1e-310),
+    ("normal-min", 2.2250738585072014e-308),
+    ("small-exp", 1e-5),
+    ("many-decimals", 0.000123456789),
+    ("pi", 3.14159265358979),
+]
+
+DBLRENDER_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = (
+    [(f"value-mergeobjects-{name}", ONE, _merge_obj(v)) for name, v in _DOUBLES]
+    + [(f"value-replaceroot-{name}", ONE, _rr({"$literal": v})) for name, v in _DOUBLES]
+    # `$ln` renders its operand as a DOUBLE whatever its BSON type, so the
+    # Int32 case below comes back as `-2.14748e+09` rather than as itself.
+    + [(f"value-ln-{name}", ONE, _ln(v)) for name, v in _DOUBLES if v <= 0]
+    + [("value-ln-int32", ONE, _ln(-2147483648))]
+    + [(f"spec-firstn-{name}", ONE, _first_n(v)) for name, v in _DOUBLES]
+    + [(f"spec-graphlookup-{name}", ONE, _graph_lookup(v)) for name, v in _DOUBLES]
+)
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("readpath", c) for c in READPATH_CASES]
@@ -2745,6 +2820,7 @@ ALL_CASES = (
     + [("numtype", c) for c in NUMTYPE_CASES]
     + [("strconv", c) for c in STRCONV_CASES]
     + [("updovf", c) for c in UPDATE_OVERFLOW_CASES]
+    + [("dblrender", c) for c in DBLRENDER_CASES]
 )
 
 

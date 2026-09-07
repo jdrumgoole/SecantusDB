@@ -14,7 +14,7 @@ from typing import Any
 import bson
 from bson import Decimal128, Int64, ObjectId, Timestamp
 
-from secantus.bsontypes import is_bson_string
+from secantus.bsontypes import fmt_double_value, is_bson_string
 from secantus.numerics import IntegerOverflowError, bson_int_width
 from secantus.ordering import bson_equal as _bson_equal
 from secantus.paths import get_path
@@ -1524,7 +1524,7 @@ def _op_ln(arg: Any, ctx: _Ctx) -> Any:
     # mongod's domain error (probed 7.0.12): Location28766, not a null result.
     if isinstance(v, (int, float)) and v <= 0:
         raise ExpressionError(
-            f"$ln's argument must be a positive number, but is {v}",
+            f"$ln's argument must be a positive number, but is {fmt_double_value(float(v))}",
             code=28766,
             code_name="Location28766",
         )
@@ -1558,7 +1558,7 @@ def _op_log(arg: Any, ctx: _Ctx) -> Any:
     # mongod's domain errors (probed 7.0.12): Location28758 / 28759.
     if isinstance(n, (int, float)) and n <= 0:
         raise ExpressionError(
-            f"$log's argument must be a positive number, but is {n}",
+            f"$log's argument must be a positive number, but is {fmt_double_value(float(n))}",
             code=28758,
             code_name="Location28758",
         )
@@ -1583,7 +1583,7 @@ def _op_log10(arg: Any, ctx: _Ctx) -> Any:
     # mongod's domain error (probed 7.0.12): Location28761, not a null result.
     if isinstance(v, (int, float)) and v <= 0:
         raise ExpressionError(
-            f"$log10's argument must be a positive number, but is {v}",
+            f"$log10's argument must be a positive number, but is {fmt_double_value(float(v))}",
             code=28761,
             code_name="Location28761",
         )

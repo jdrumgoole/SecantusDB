@@ -201,17 +201,53 @@ def fmt_double_g(value: float) -> str:
 
 
 def fmt_double_parse(value: float) -> str:
-    """A double as mongod echoes it in a query / update PARSE error: the
-    shortest round-trip form, keeping a whole double's ``.0``.
+    """A double as mongod echoes it when reflecting a stage's own SPECIFICATION.
 
-    ``-1.0`` stays ``-1.0`` (``%g`` would say ``-1``) and ``1e16`` stays
-    ``1e+16``, which is exactly Python's ``repr``.
+    ``%.16g``, with a ``.0`` appended when that leaves no ``.`` or ``e`` -- so
+    ``-1.0`` stays ``-1.0`` (the VALUE form, :func:`fmt_double_value`, says
+    ``-1``) and ``1e16`` stays ``1e+16``.
+
+    This used to be ``repr``, described here as "the shortest round-trip form",
+    and the two agree for every ordinary value -- which is why it stood. They
+    part company at the bottom of the range, where the shortest form that
+    round-trips is SHORTER than sixteen significant digits: mongod echoes
+    ``1e-308`` as ``9.999999999999999e-309`` and ``5e-324`` as
+    ``4.940656458412465e-324``, because it prints the double's actual value to
+    16 digits rather than the shortest string that parses back to it. Caught by
+    the differential gate, not by the unit tests, which had been written from
+    the same wrong assumption as the code (measured 8.2.11, 2026-09-07; the
+    rule matches on 38 values including the denormals).
     """
     if value != value:
         return "nan"
     if value in (float("inf"), float("-inf")):
         return "inf" if value > 0 else "-inf"
-    return repr(value)
+    rendered = f"{value:.16g}"
+    return rendered if ("." in rendered or "e" in rendered) else rendered + ".0"
+
+
+def fmt_double_value(value: float) -> str:
+    """A double as mongod echoes it in a VALUE error -- C's ``%g``, precision 6.
+
+    mongod has **two** double renderings and they are not interchangeable
+    (measured against 8.2.11, 2026-09-07):
+
+    * the VALUE form, this one -- ``mongo::Value::toString`` -- prints
+      ``-0``, ``-1``, ``1.23457e+06``, ``-2.14748e+09``, ``0.000123457``;
+    * the SPEC form, :func:`fmt_double_parse`, echoes a stage's own
+      specification back in the shortest round-trip form and keeps a whole
+      double's ``.0``: ``-0.0``, ``-1.0``, ``1234567.0``, ``-2147483648.0``.
+
+    One renderer used to serve both, so every VALUE message rendered a double
+    the SPEC way -- ``$mergeObjects``, ``$replaceRoot``, ``$ln``, ``$log10``.
+    Python's ``:g`` IS C's ``%g``; verified against mongod on 37 values at zero
+    mismatches, so this deliberately does not hand-roll the algorithm.
+    """
+    if value != value:
+        return "nan"
+    if value in (float("inf"), float("-inf")):
+        return "inf" if value > 0 else "-inf"
+    return f"{value:g}"
 
 
 def is_bson_string(value: Any) -> bool:
@@ -241,12 +277,22 @@ def bson_value_repr_stage(value: Any) -> str:
         objectId    ObjectId('507f…')         507f…
         date        new Date(1577923200000)   2020-01-02T00:00:00.000Z
         javascript  x=1                       Code("x=1")
+        double      -1.0                      -1
 
-    Everything else -- strings, numbers, bools, null, regex, MinKey / MaxKey,
+    The DOUBLE row was added 2026-09-07 and is the one that had been wrong in
+    both engines: this family is C's ``%g`` (:func:`fmt_double_value`) and the
+    query family is the shortest round-trip form (:func:`fmt_double_parse`).
+
+    Everything else -- strings, ints, bools, null, regex, MinKey / MaxKey,
     Timestamp, Decimal128 -- is identical, which is what makes the difference
     easy to miss: reusing :func:`bson_value_repr` here fixes the types a
-    probe happens to cover and quietly breaks the six above.
+    probe happens to cover and quietly breaks the seven above.
     """
+    if isinstance(value, float):
+        # The VALUE form, not `bson_value_repr`'s SPEC form -- see
+        # `fmt_double_value`. Falling through to it printed `-0.0` where mongod
+        # writes `-0` and `1234567.0` where it writes `1.23457e+06`.
+        return fmt_double_value(value)
     if isinstance(value, Code):
         return f'Code("{value}")'
     if isinstance(value, ObjectId):
