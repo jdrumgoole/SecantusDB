@@ -3090,6 +3090,18 @@ pub fn carry_subms(doc: &mut Document, field: &str, value: Bson) -> Bson {
 pub(crate) fn parse_timestamp(text: &str) -> Result<i64> {
     let t = text.trim();
     let normalised = t.replacen('T', " ", 1);
+    // A `timestamp` (WITHOUT time zone) accepts a trailing offset and DROPS it,
+    // keeping the wall-clock reading -- PostgreSQL does this, and psycopg dumps
+    // a tz-aware datetime that can land here with a `+02` / `-05:30` /
+    // `-01:02:03` suffix. The offset lives in the TIME portion (after the space
+    // that follows the date), so the date's own `-` separators are untouched.
+    let normalised = match normalised.find(' ') {
+        Some(sp) => match normalised[sp + 1..].find(['+', '-']) {
+            Some(pos) => normalised[..sp + 1 + pos].trim_end().to_string(),
+            None => normalised,
+        },
+        None => normalised,
+    };
     let parsed = NaiveDateTime::parse_from_str(&normalised, "%Y-%m-%d %H:%M:%S%.f")
         .or_else(|_| NaiveDateTime::parse_from_str(&normalised, "%Y-%m-%d %H:%M"))
         .or_else(|_| {

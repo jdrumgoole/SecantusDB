@@ -284,6 +284,11 @@ QUERIES = [
     "SELECT '2026-09-01 12:34:56.000'::timestamp::text",
     "SELECT '2026-09-01'::timestamp::text",
     "SELECT '2026-09-01T12:34:56'::timestamp::text",
+    # A `timestamp` (no tz) accepts a trailing offset and DROPS it,
+    # keeping the wall clock -- psycopg dumps a tz-aware datetime here.
+    "SELECT '2000-01-01 03:02:03+02'::timestamp::text",
+    "SELECT '2000-01-01 03:02:03-05:30'::timestamp::text",
+    "SELECT '2000-01-01 03:02:03-01:02:03'::timestamp::text",
     "SELECT NULL::timestamp",
     "SELECT '2026-09-01'::date::text",
     "SELECT '2026-9-1'::date::text",
