@@ -490,12 +490,22 @@ fn project_value(
         Some(spec) if !spec.is_empty() => {
             secantus_core::projection::apply_projection(&value, spec, q)
                 .map(Bson::Document)
-                .map_err(|_| {
-                    CommandError::new(
-                        2,
-                        "BadValue",
-                        "projection is not supported by the Rust server",
-                    )
+                .map_err(|f| {
+                    // A Fallback carrying a mongod code is a real server error
+                    // (51270 empty sub-projection, 31254 mix) and is surfaced
+                    // verbatim; only a bare Defer becomes the generic refusal.
+                    // Same treatment as `find` -- these two share the engine, so
+                    // a projection fix in one is a fix in both.
+                    match f.as_mongo() {
+                        Some((code, msg)) => {
+                            CommandError::new(code, crate::util::error_code_name(code), msg)
+                        }
+                        None => CommandError::new(
+                            2,
+                            "BadValue",
+                            "projection is not supported by the Rust server",
+                        ),
+                    }
                 })
         }
         _ => Ok(Bson::Document(value)),

@@ -838,7 +838,14 @@ fn projection_mix_error(spec: &Document) -> Option<CommandError> {
             Bson::Int32(0) | Bson::Int64(0) | Bson::Boolean(false) => Some(false),
             Bson::Int32(_) | Bson::Int64(_) | Bson::Boolean(true) => Some(true),
             Bson::Double(d) => Some(*d != 0.0),
-            _ => None, // operator spec ($slice / $elemMatch) — neutral
+            // A COMPUTED field (`"$a"`, `{$add: [...]}`, a literal constant)
+            // forces INCLUSION mode, so a companion `b: 0` is the 31254 mix.
+            // Measured against mongod 8.2.11 (2026-09-07):
+            //   {x: {$add: ["$a", 1]}, b: 0}
+            //     -> Cannot do exclusion on field b in inclusion projection
+            // The three projection operators stay neutral.
+            _ if secantus_core::projection::is_computed_spec(v) => Some(true),
+            _ => None, // operator spec ($slice / $elemMatch / $meta) — neutral
         }
     };
     let mut mode: Option<bool> = None;
@@ -953,12 +960,22 @@ fn project_to_docs(
                     format!("failed to decode document: {e}"),
                 )
             })?;
-            secantus_core::projection::apply_projection(&d, spec, query).map_err(|_| {
-                CommandError::new(
-                    2,
-                    "BadValue",
-                    "projection is not supported by the Rust server",
-                )
+            secantus_core::projection::apply_projection(&d, spec, query).map_err(|f| {
+                // A Fallback carrying a mongod code is a real server error
+                // (e.g. 51270 empty sub-projection, 31254 mix) and must be
+                // surfaced verbatim -- flattening it to BadValue lost both the
+                // code and the message. Only a bare Defer, which has no Python
+                // behind it here, becomes the generic refusal.
+                match f.as_mongo() {
+                    Some((code, msg)) => {
+                        CommandError::new(code, crate::util::error_code_name(code), msg)
+                    }
+                    None => CommandError::new(
+                        2,
+                        "BadValue",
+                        "projection is not supported by the Rust server",
+                    ),
+                }
             })
         })
         .collect()
