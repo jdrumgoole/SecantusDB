@@ -62,6 +62,10 @@ const SCALAR_NAMES: &[&str] = &[
     "div",
     "greatest",
     "least",
+    "get_byte",
+    "set_byte",
+    "encode",
+    "decode",
 ];
 
 fn text(v: &Bson) -> String {
@@ -182,15 +186,47 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         // the moment the text is not ASCII.
         "length" | "char_length" | "character_length" => {
             need(1)?;
+            // `length(bytea)` is a BYTE count, not a character count.
+            if let Bson::Binary(b) = &arg(0) {
+                return Ok(Bson::Int32(b.bytes.len() as i32));
+            }
             Ok(Bson::Int32(s(0).chars().count() as i32))
         }
         "octet_length" => {
             need(1)?;
+            if let Bson::Binary(b) = &arg(0) {
+                return Ok(Bson::Int32(b.bytes.len() as i32));
+            }
             Ok(Bson::Int32(s(0).len() as i32))
         }
         "bit_length" => {
             need(1)?;
+            if let Bson::Binary(b) = &arg(0) {
+                return Ok(Bson::Int32((b.bytes.len() * 8) as i32));
+            }
             Ok(Bson::Int32((s(0).len() * 8) as i32))
+        }
+        "get_byte" => {
+            need(2)?;
+            let bytes = crate::bytea::parse(&arg(0))?;
+            let n = as_i64(&arg(1)).ok_or_else(|| wrong_args(name))?;
+            crate::bytea::get_byte(&bytes, n).map(Bson::Int32)
+        }
+        "set_byte" => {
+            need(3)?;
+            let bytes = crate::bytea::parse(&arg(0))?;
+            let n = as_i64(&arg(1)).ok_or_else(|| wrong_args(name))?;
+            let v = as_i64(&arg(2)).ok_or_else(|| wrong_args(name))?;
+            crate::bytea::set_byte(&bytes, n, v).map(crate::bytea::to_binary)
+        }
+        "encode" => {
+            need(2)?;
+            let bytes = crate::bytea::parse(&arg(0))?;
+            crate::bytea::encode(&bytes, &s(1)).map(Bson::String)
+        }
+        "decode" => {
+            need(2)?;
+            crate::bytea::decode(&s(0), &s(1)).map(crate::bytea::to_binary)
         }
         "btrim" | "trim" | "ltrim" | "rtrim" => {
             if args.is_empty() || args.len() > 2 {
@@ -649,10 +685,11 @@ fn md5_hex(data: &[u8]) -> String {
 pub fn static_result_type(name: &str) -> &'static str {
     match name {
         "length" | "char_length" | "character_length" | "octet_length" | "bit_length"
-        | "strpos" | "position" | "ascii" => "int4",
+        | "strpos" | "position" | "ascii" | "get_byte" => "int4",
         "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "mod" | "div" => "numeric",
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" | "sign" => "float8",
         "starts_with" => "bool",
+        "set_byte" | "decode" => "bytea",
         _ => "text",
     }
 }
