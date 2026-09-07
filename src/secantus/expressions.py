@@ -1701,6 +1701,48 @@ _DEC_TRIG_CTX = _decimal.Context(prec=60, traps=[])
 _HALF_PI_TEXT = "1.570796326794896619231321691639751"
 
 
+#: What a decimal ZERO answers, per operator, as ``(+0, -0)`` text.
+#:
+#: These are CONSTANTS -- no series has to run -- and both the per-operator
+#: QUANTUM and the sign rule are unguessable, so every cell was generated from
+#: mongod 8.2.11 on 2026-09-07 rather than derived. ``$tan`` answers ``0E-40``
+#: and ``$asinh`` answers ``0E-6176``; the ODD functions carry ``-0`` through
+#: and the EVEN ones drop it.
+#:
+#: The decimal series computed these itself and got them wrong: it returned a
+#: bare ``0`` where mongod carries a quantum (``$tan``, ``$asin``, ``$sinh``,
+#: ``$asinh``, ``$atanh``), a bare ``1`` where mongod writes 34 digits
+#: (``$cos``, ``$cosh``), and it dropped the sign of ``-0`` entirely
+#: (``$sin``, ``$atan``, ``$tanh``).
+_DEC_TRIG_ZERO: dict[str, tuple[str, str]] = {
+    "$sin": ("0", "-0"),
+    "$cos": ("1.000000000000000000000000000000000",) * 2,
+    "$tan": ("0E-40", "-0E-40"),
+    "$asin": ("0E-40", "-0E-40"),
+    "$acos": (_HALF_PI_TEXT,) * 2,
+    "$atan": ("0", "-0"),
+    "$sinh": ("0E-40", "-0E-40"),
+    "$cosh": ("1.000000000000000000000000000000000",) * 2,
+    "$tanh": ("0", "-0"),
+    "$asinh": ("0E-6176", "-0E-6176"),
+    "$atanh": ("0E-6176", "-0E-6176"),
+}
+
+
+def _dec_trig_zero(name: str, v: Decimal128) -> Decimal128 | None:
+    """The constant `name` answers at a decimal zero, or ``None``.
+
+    ``$acosh`` of zero is a domain error and is rejected before this runs.
+    """
+    pair = _DEC_TRIG_ZERO.get(name)
+    if pair is None:
+        return None
+    d = v.to_decimal()
+    if d.is_nan() or d.is_infinite() or d != 0:
+        return None
+    return Decimal128(pair[1] if str(v).startswith("-") else pair[0])
+
+
 def _dec_trig_non_finite(name: str, v: Decimal128) -> Decimal128 | None:
     """The limit `name` takes at a non-finite decimal operand, or `None` when
     the operand is finite and the series should run.
@@ -1903,6 +1945,9 @@ def _make_trig(name: str, fn: Any, domain: str) -> Any:
             limit = _dec_trig_non_finite(name, v)
             if limit is not None:
                 return limit
+            zero = _dec_trig_zero(name, v)
+            if zero is not None:
+                return zero
         dec_fn = _DEC_TRIG.get(name)
         if dec_fn is None or not _has_decimal(v):
             try:
@@ -5176,11 +5221,31 @@ def _op_bson_size(arg: Any, ctx: _Ctx) -> Any:
     return len(bson.encode(dict(v)))
 
 
+def _dec_conversion_zero(v: Any, positive: str, negative: str) -> Decimal128 | None:
+    """A decimal ZERO through an angle conversion: a constant with the
+    conversion's own QUANTUM, and the sign survives.
+
+    The decimal multiply computed `0E-50` where mongod answers `0E-35`
+    (degrees->radians) and `0E-32` (radians->degrees) — right value, wrong
+    exponent, which `Decimal128.__str__` shows and a client comparing text
+    sees. Measured 8.2.11, 2026-09-07.
+    """
+    if not isinstance(v, Decimal128):
+        return None
+    d = v.to_decimal()
+    if d.is_nan() or d.is_infinite() or d != 0:
+        return None
+    return Decimal128(negative if str(v).startswith("-") else positive)
+
+
 def _op_degrees_to_radians(arg: Any, ctx: _Ctx) -> Any:
     v = _eval(arg, ctx)
     if v is None:
         return None
     _require_math_numeric(v, "$degreesToRadians")
+    zero = _dec_conversion_zero(v, "0E-35", "-0E-35")
+    if zero is not None:
+        return zero
     if _has_decimal(v):
         return _decimal_result(lambda d: d * _PI / _decimal.Decimal(180), v)
     # `x * (pi/180)`, not `x * pi / 180`: mongod multiplies by a single
@@ -5194,6 +5259,9 @@ def _op_radians_to_degrees(arg: Any, ctx: _Ctx) -> Any:
     if v is None:
         return None
     _require_math_numeric(v, "$radiansToDegrees")
+    zero = _dec_conversion_zero(v, "0E-32", "-0E-32")
+    if zero is not None:
+        return zero
     if _has_decimal(v):
         return _decimal_result(lambda d: d * _decimal.Decimal(180) / _PI, v)
     # One precomputed constant, as `$degreesToRadians` above.
@@ -5347,6 +5415,20 @@ def _op_expr_avg(arg: Any, ctx: _Ctx) -> Any:
     total: Any = 0
     for x in values:
         total += x
+    if isinstance(total, int) and not isinstance(total, bool):
+        # mongod converts the integer TOTAL to a double and then divides; it
+        # does NOT do an exact integer division. The two agree until the total
+        # passes 2**53, and then they do not:
+        #
+        #   $avg: [2**53+1, 2**53+3, 2**53+5]
+        #       mongod  9007199254740994.0        (float(sum) / n)
+        #       here    9007199254740996.0        (sum / n, correctly rounded)
+        #
+        # Python's `int / int` is correctly rounded over the exact quotient,
+        # which is a BETTER answer and the wrong one -- the conformance target
+        # is mongod's arithmetic, not the most accurate arithmetic. Measured
+        # 8.2.11, 2026-09-07.
+        return float(total) / len(values)
     return total / len(values)
 
 

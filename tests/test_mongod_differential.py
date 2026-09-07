@@ -2848,6 +2848,45 @@ _DECIMAL_SPECIALS = [
     ("negone", Decimal128("-1")),
 ]
 
+# A decimal ZERO answers a CONSTANT in this family -- no series runs -- and both
+# the per-operator QUANTUM (`$tan` -> `0E-40`, `$asinh` -> `0E-6176`, `$cos` ->
+# 1 to 34 places) and the sign rule (ODD functions keep `-0`, EVEN ones drop it)
+# are unguessable. Both engines were wrong here: Rust deferred, and Python's
+# decimal series returned bare `0` / `1` and lost the sign. Measured 8.2.11,
+# 2026-09-07.
+#
+# `_agg_err_full` compares the RENDERED reply, so the quantum is part of the
+# assertion -- `Decimal128("0") == Decimal128("0E-40")` compares equal as a
+# VALUE and would have hidden exactly what these cases are about.
+DECIMAL_ZERO_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    (f"{op[1:]}-{name}", ONE, _unary(op, value))
+    for op in _DECIMAL_MATH_OPS
+    for name, value in (("zero", Decimal128("0")), ("negzero", Decimal128("-0")))
+]
+
+# mongod converts an integer TOTAL to a double and THEN divides. Above 2**53
+# that is NOT the exact quotient, and the Python server used to give the exact
+# one -- a better answer and the wrong one.
+AVG_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    (
+        f"avg-{name}",
+        ONE,
+        (
+            lambda vals: (
+                lambda db: _agg_err_full(
+                    db, [{"$project": {"_id": 0, "r": {"$avg": [Int64(v) for v in vals]}}}]
+                )
+            )
+        )(values),
+    )
+    for name, values in (
+        ("past-2-53", [2**53 + 1, 2**53 + 3, 2**53 + 5]),
+        ("straddling", [9007199254740993, 1, 1]),
+        ("int64-max", [2**63 - 1]),
+        ("small", [1, 2]),
+    )
+]
+
 DECIMAL_SPECIAL_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     (f"{op[1:]}-{name}", ONE, _unary(op, value))
     for op in _DECIMAL_MATH_OPS
@@ -2881,6 +2920,8 @@ ALL_CASES = (
     + [("updovf", c) for c in UPDATE_OVERFLOW_CASES]
     + [("dblrender", c) for c in DBLRENDER_CASES]
     + [("decspecial", c) for c in DECIMAL_SPECIAL_CASES]
+    + [("deczero", c) for c in DECIMAL_ZERO_CASES]
+    + [("avgdiv", c) for c in AVG_CASES]
 )
 
 
