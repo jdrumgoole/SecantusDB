@@ -1937,7 +1937,9 @@ These are explicit non-goals. Don't add them without a reason.
   open in `tests/types/test_range.py` / `test_multirange.py`: the array-of-range
   element `=` comparison (`comparing string with array using =`), which is the
   general string-vs-array operator gap, not a range-specific one, and multirange
-  OF a custom range. (`CREATE TYPE ... AS RANGE` custom range types shipped
+  OF a custom range.
+
+  **`'{...}' = <range/multirange array param>` (36, `test_dump_builtin_array_wrapper`) is a 2-piece campaign with a FIDELITY TRAP (mapped 2026-09-08, no code):** a naive text compare passes the 36 target tests (they use non-canonicalizing `empty`/`(,)`) but is WRONG for canonicalizing ranges — `'{"[1,4]"}' = [Int4Range(1,5,'[)')]` is TRUE on PG (both canonicalize to `[1,5)`), a plain string compare gives FALSE. Build in order, each verified against a canonicalizing case: (1) range/multirange-ARRAY param decode must parse each element through the canonicalizing `::int4range[]` parser (`range::from_text_element`) so the decoded array holds canonical text, not psycopg's raw spelling; (2) `coerce_unknown_operand` (lib.rs:~4987) must fire for a bare `'{...}'` literal vs an array VALUE — it currently bails at the both-unresolved `l_bare == r_bare` guard, then errors at the scalar-vs-array XOR (~5271); cast the literal to `{element}[]` via the canonicalizing `::range[]` path. Then both sides are canonical text arrays and the existing `compare_constants` array arm is correct. (`CREATE TYPE ... AS RANGE` custom range types shipped
   2026-09-07 — DDL, casts, comparison, and `RangeInfo.fetch`.)
 
 
