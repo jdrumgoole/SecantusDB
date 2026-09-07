@@ -1003,6 +1003,8 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             16 => "bool",
             25 => "text",
             17 => "bytea",
+            869 => "inet",
+            650 => "cidr",
             1043 => "varchar",
             1042 => "bpchar",
             19 => "name",
@@ -1047,6 +1049,8 @@ fn wire_type(pg_type: &str) -> Type {
         // comparison never notices, but pgjdbc and pgx do.
         "text" => Type::TEXT,
         "bytea" => Type::BYTEA,
+        "inet" => Type::INET,
+        "cidr" => Type::CIDR,
         "varchar" | "character varying" => Type::VARCHAR,
         "bpchar" | "char" | "character" => Type::BPCHAR,
         "name" => Type::NAME,
@@ -3234,6 +3238,14 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         };
         return enc.encode_field(&b.bytes);
     }
+    if *ty == Type::INET || *ty == Type::CIDR {
+        let Bson::String(text) = v else {
+            return Err(bad("this value"));
+        };
+        let wire = secantus_pgplan::net::to_wire(text, *ty == Type::CIDR)
+            .ok_or_else(|| bad("this value"))?;
+        return enc.encode_field(&wire);
+    }
     if *ty == Type::BOOL {
         let Bson::Boolean(b) = v else {
             return Err(bad("this value"));
@@ -3352,6 +3364,15 @@ fn encode_field_value(
 ) -> PgWireResult<()> {
     if field.format() == FieldFormat::Binary {
         return encode_binary(enc, field.datatype(), v);
+    }
+    // An inet/cidr COLUMN in TEXT format uses inet_out/cidr_out: inet drops a
+    // full-host mask (`/32`, `/128`), cidr keeps it. (A `::text` cast is type
+    // `text`, not 869/650, so it never reaches here -- it keeps its mask.)
+    if matches!(field.datatype().oid(), 869 | 650) {
+        if let Some(Bson::String(text)) = v {
+            let out = secantus_pgplan::net::text_out(text, field.datatype().oid() == 650);
+            return enc.encode_field(&Some(out));
+        }
     }
     // An ARRAY goes through the typed encoder in text too, because the element
     // conversion has to come from the COLUMN's type rather than from the first
@@ -4165,6 +4186,15 @@ fn decode_parameter(
             }
             // `bytea` is raw bytes on the wire -- stored verbatim as Binary.
             Some(17) => Ok(secantus_pgplan::bytea::to_binary(bytes.to_vec())),
+            // inet / cidr: PostgreSQL's [family,bits,is_cidr,nb,addr] layout,
+            // decoded back to the canonical addr/masklen text the store holds.
+            Some(869) | Some(650) => secantus_pgplan::net::from_wire(bytes)
+                .map(Bson::String)
+                .ok_or_else(|| {
+                    PgHandler::err(&secantus_pgplan::Error::InvalidText(
+                        "invalid binary inet/cidr value".into(),
+                    ))
+                }),
             // These decode to their CANONICAL TEXT so a binary parameter takes
             // exactly the same path through the planner as a text one -- the
             // text path already turns each of these into the right value, and
@@ -4320,6 +4350,12 @@ fn decode_parameter(
         Some(25) | Some(1043) | Some(19) | Some(1042) => Ok(Bson::String(text.into_owned())),
         Some(17) => secantus_pgplan::bytea::parse_text(&text)
             .map(secantus_pgplan::bytea::to_binary)
+            .map_err(|e| PgHandler::err(&e)),
+        Some(869) => secantus_pgplan::net::normalize_inet(&text)
+            .map(Bson::String)
+            .map_err(|e| PgHandler::err(&e)),
+        Some(650) => secantus_pgplan::net::normalize_cidr(&text)
+            .map(Bson::String)
             .map_err(|e| PgHandler::err(&e)),
         // The TYPED text forms. These reach the same value the BINARY path
         // produces for the same oid, which is the whole point: a parameter's

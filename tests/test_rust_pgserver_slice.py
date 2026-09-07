@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import ipaddress
 import shutil
 import socket
 import subprocess
@@ -1093,6 +1094,49 @@ def test_bytea_type_and_functions(home: Path) -> None:
         with pytest.raises(psycopg.Error) as exc:
             cur.execute("select get_byte('\\x0102'::bytea, 5)")
         assert exc.value.diag.sqlstate == "2202E"
+
+
+def test_inet_and_cidr_columns(home: Path) -> None:
+    """`inet` (oid 869) and `cidr` (oid 650) as real column types.
+
+    Stored as canonical `addr/masklen` text (the Python server's form, one
+    shared store) and sent in the BINARY wire format psycopg uses for these
+    oids, so a `/32` host comes back as an `IPv4Address` while a shorter prefix
+    is an `IPv4Interface` -- the same distinction PostgreSQL makes. `cidr` is
+    strict: host bits below the netmask are rejected.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create table n (id int primary key, a inet, b cidr)")
+        cur.execute(
+            "insert into n values (1, '1.2.3.4', '10.0.0.0/8'),"
+            " (2, '2001:db8::1/64', '2001:db8::/32'), (3, '1.2.3.4/24', '192.168.1.0/24')"
+        )
+        cur.execute("select a, b from n order by id")
+        rows = cur.fetchall()
+        assert rows[0] == (ipaddress.ip_address("1.2.3.4"), ipaddress.ip_network("10.0.0.0/8"))
+        assert rows[1] == (
+            ipaddress.ip_interface("2001:db8::1/64"),
+            ipaddress.ip_network("2001:db8::/32"),
+        )
+        assert rows[2] == (
+            ipaddress.ip_interface("1.2.3.4/24"),
+            ipaddress.ip_network("192.168.1.0/24"),
+        )
+        assert [c.type_code for c in cur.description] == [869, 650]
+
+        # The `::text` cast is network_show -- it always keeps the mask, even a
+        # full-host /32, unlike inet_out (which the column read above drops).
+        cur.execute("select '1.2.3.4'::inet::text")
+        assert cur.fetchone()[0] == "1.2.3.4/32"
+
+        # A malformed address, and a cidr with host bits set, are both 22P02.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("select 'notanip'::inet")
+        assert exc.value.diag.sqlstate == "22P02"
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("select '10.1.2.3/8'::cidr")
+        assert exc.value.diag.sqlstate == "22P02"
 
 
 def test_interval_keeps_three_independent_parts(home: Path) -> None:

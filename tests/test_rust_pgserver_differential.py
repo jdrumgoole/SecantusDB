@@ -304,6 +304,15 @@ QUERIES = [
     "SELECT '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid::text",
     "SELECT 'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid::text",
     "SELECT 'a0eebc99-9c0b4ef8-bb6d-6bb9bd380a11'::uuid::text",
+    # inet keeps its mask under the ::text cast (network_show); cidr is
+    # strict and IPv6 is compressed to canonical form.
+    "SELECT '1.2.3.4'::inet::text",
+    "SELECT '1.2.3.4/24'::inet::text",
+    "SELECT '10.0.0.0/8'::cidr::text",
+    "SELECT '2001:0db8:0000:0000:0000:0000:0000:0001'::inet::text",
+    "SELECT '2001:db8::/32'::cidr::text",
+    "SELECT NULL::inet",
+    "SELECT NULL::cidr",
     "SELECT NULL::uuid",
     # bytea: hex and escape input, byte functions, encode/decode, concat.
     "SELECT '\\x0102ff'::bytea::text",
@@ -975,6 +984,10 @@ ERROR_QUERIES = [
     # Malformed uuids are 22P02: not a uuid, too short, a hyphen off the
     # group boundaries, and a non-hex digit.
     "SELECT 'not-a-uuid'::uuid",
+    # A malformed address is 22P02; a cidr with host bits set is too.
+    "SELECT 'notanip'::inet",
+    "SELECT '10.1.2.3/8'::cidr",
+    "SELECT '1.2.3.4/33'::inet",
     "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1'::uuid",
     "SELECT 'a0-eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid",
     "SELECT 'g0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid",
