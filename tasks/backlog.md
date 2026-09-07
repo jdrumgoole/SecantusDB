@@ -5350,33 +5350,24 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `serverStatus.secantus` — a silently-ignored `SECANTUS_GAUGE_SERVER` gives
   two identical runs that read as agreement.
 
-- [ ] **The pymongo gauge runs the two servers against DIFFERENT `bson`
-  versions, so their numbers are not strictly comparable (2026-09-07).**
-  Measured while sweeping the Rust server: rust mode imports
-  `vendor/pymongo-tests/bson`, python mode imports **site-packages** `bson`
-  (from the installed pymongo). The cause is import ORDER, not configuration —
-  in python mode `pymongo_validation/plugin.py` does
-  `from secantus import SecantusDBServer` at `pytest_load_initial_conftests`,
-  and `secantus` imports `bson` before `vendor/pymongo-tests` reaches
-  `sys.path`, so the name binds to site-packages. In rust mode
-  `_secantus_server` is a compiled extension that never imports Python `bson`,
-  so `bson` resolves later to the vendored copy.
+- [x] **RESOLVED (2026-09-07): the pymongo gauge ran the two servers against
+  DIFFERENT `bson` versions.** rust mode loaded `vendor/pymongo-tests/bson`,
+  python mode loaded **site-packages** `bson` — while BOTH loaded the vendored
+  `pymongo`, so python mode was running a mixed 4.17.0 / 4.18.0 pair. The cause
+  was import ORDER: `_start_server("python")` imports `secantus` (and so `bson`)
+  before pytest inserts the vendored tree into `sys.path`, and rust mode never
+  imports Python `bson` at that moment because `_secantus_server` is a compiled
+  extension.
 
-  It moved exactly ONE result on 2026-09-07 —
-  `test_default_exports::test_bson` fails on python and passes on rust, because
-  the vendored `bson` takes `Generator` from `typing` (which the test skips) and
-  site-packages `bson` takes it from `collections.abc` (which it does not). So
-  the python server currently shows one EXTRA failure that is not a server
-  defect at all.
+  It produced a phantom SERVER difference — `test_default_exports::test_bson`
+  failed on python and passed on rust, over `Generator` coming from `typing`
+  vs `collections.abc` in the two `bson` copies.
 
-  Worth fixing because the gauge is the project's headline compatibility
-  number and a cross-server comparison is exactly what it gets used for; a
-  one-test artifact today is a systematically wrong comparison tomorrow. The
-  fix is to put `vendor/pymongo-tests` on `sys.path` before the plugin imports
-  `secantus`, or to import the server lazily.
-
-  Same family as the "probes lie in specific, repeatable ways" entries: a
-  harness difference that reads as a server difference.
+  The plugin now prepends `vendor/pymongo-tests` to `sys.path` in
+  `pytest_load_initial_conftests`, before the server import. Measured after:
+  **rust 1277/5 and python 1277/5, with byte-identical failure lists** — the
+  five known-standing ones. The python server's headline number moves 99.53% ->
+  99.61% by removing a harness artifact, not by changing behaviour.
 
 - [ ] **STILL OPEN: `Decimal128` FINITE operands in the transcendentals.** The
   Rust engine defers `$sqrt(Decimal128("2.5"))` and the rest of the family;
