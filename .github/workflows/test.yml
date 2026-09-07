@@ -2143,7 +2143,12 @@ jobs:
         run: |
           WT="$PWD/$(ls -d build/*/wt-build | head -1)"
           export SECANTUS_WT_INCLUDE="$WT/include" SECANTUS_WT_LIB="$WT"
-          export LIBCLANG_PATH="$(llvm-config --libdir 2>/dev/null || echo /usr/lib/llvm-14/lib)"
+          # bindgen needs libclang; find it wherever the runner's LLVM put it
+          # (Ubuntu noble ships LLVM 18, not a fixed version -- do not hardcode).
+          lc="$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)"
+          test -n "$lc" || { echo "libclang not found" >&2; exit 1; }
+          export LIBCLANG_PATH="$(dirname "$lc")"
+          echo "LIBCLANG_PATH=$LIBCLANG_PATH"
           (cd crates/secantus-pgserver && cargo build --bin secantusd-pg)
           test -x crates/secantus-pgserver/target/debug/secantusd-pg
 
