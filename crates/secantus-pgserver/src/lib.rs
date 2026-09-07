@@ -1014,6 +1014,7 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             1184 => "timestamptz",
             1266 => "timetz",
             2950 => "uuid",
+            2249 => "record",
             1186 => "interval",
             114 => "json",
             3802 => "jsonb",
@@ -1068,6 +1069,8 @@ fn wire_type(pg_type: &str) -> Type {
         // Its own oid (2950): a client reading it builds a UUID object rather
         // than handing back the canonical text.
         "uuid" => Type::UUID,
+        // An anonymous record (`ROW(...)`): oid 2249, rendered as `(...)` text.
+        "record" => Type::RECORD,
         "interval" => Type::INTERVAL,
         "json" => Type::JSON,
         "jsonb" => Type::JSONB,
@@ -3443,6 +3446,10 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
         // A regtype is an oid in a document; the wire wants its display name.
         if let Some(oid) = secantus_pgplan::regtype_oid(value) {
             return enc.encode_field(&Some(secantus_pgplan::regtype_text(oid).as_str()));
+        }
+        // A record is a tagged field list; the wire wants its `(...)` text.
+        if let Some(text) = secantus_pgplan::record_value_text(value) {
+            return enc.encode_field(&Some(text.as_str()));
         }
     }
     match v {
