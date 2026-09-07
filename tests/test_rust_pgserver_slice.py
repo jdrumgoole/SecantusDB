@@ -833,13 +833,10 @@ def test_arrays_round_trip_with_their_own_oids(home: Path) -> None:
         cur.execute("SELECT xs, names FROM a WHERE id = 1")
         assert cur.fetchone() == ([1, 2], ["x", "y"])
 
-        # A nested array is refused, not flattened. rust-postgres encodes one
-        # dimension only, and the flattening it produced turned `{{1,2},{3,4}}`
-        # into two elements whose text was `{1,2}` and `{3,4}` — indistinguish-
-        # able, at the client, from a real answer.
-        with pytest.raises(psycopg.Error) as exc:
-            cur.execute("SELECT '{{1,2},{3,4}}'::int[]")
-        assert exc.value.diag.sqlstate == "0A000"
+        # A nested array round-trips as a nested list (multidimensional arrays
+        # are carried over the wire now — see test_multidimensional_arrays).
+        cur.execute("SELECT '{{1,2},{3,4}}'::int[]")
+        assert cur.fetchone()[0] == [[1, 2], [3, 4]]
 
 
 def test_simple_query_runs_a_batch_in_one_implicit_transaction(home: Path) -> None:
@@ -2851,6 +2848,63 @@ def test_enum_ddl_and_the_catalog(home: Path) -> None:
         cur.execute("""select to_regtype('"CamelCase"')::text""")
         assert cur.fetchone()[0] == '"CamelCase"'
         cur.execute('drop type "CamelCase"')
+
+
+def test_enum_column_reports_its_own_oid(home: Path) -> None:
+    """An enum COLUMN is described with the enum's own oid, not varchar.
+
+    psycopg reads that oid to decide whether to apply a registered enum loader:
+    with the enum's oid it hands back the Python enum MEMBER, with varchar
+    (1043) a bare string. The label is stored and returned verbatim -- including
+    a non-ASCII one -- so the case-fold tests turn on the oid, not the bytes.
+    """
+    import enum as _enum
+
+    from psycopg.types.enum import EnumInfo, register_enum
+
+    class Mood(_enum.Enum):
+        sad = "sad"
+        ok = "ok"
+        happy = "happy"
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create type mood as enum ('sad','ok','happy')")
+        cur.execute("create table t (id int, m mood, ms mood[])")
+        cur.execute("insert into t values (1, 'ok', array['sad','happy']::mood[])")
+
+        # Register the loader, then read through a FRESH cursor. (psycopg binds a
+        # cursor's transformer on use, so a cursor that ran the DDL keeps the
+        # default loaders; a new cursor picks up the registered enum loader --
+        # true against real PostgreSQL too, not a server difference.) With the
+        # loader in place the value comes back as the enum MEMBER, scalar and
+        # array, and the row description still reports the enum's own minted oid
+        # (not varchar 1043) beside an untouched int column.
+        register_enum(EnumInfo.fetch(conn, "mood"), conn, Mood)
+        rc = conn.cursor()
+        rc.execute("select id, m, ms from t")
+        id_val, m, ms = rc.fetchone()
+        id_oid, m_oid, _ = (d.type_code for d in rc.description)
+        assert id_val == 1
+        assert m is Mood.ok
+        assert ms == [Mood.sad, Mood.happy]
+        assert id_oid == 23
+        assert m_oid != 1043
+        rc.execute("select oid from pg_type where typname = 'mood'")
+        assert m_oid == rc.fetchone()[0]
+
+        # ::text stays a plain string (oid 25), unaffected by the loader.
+        rc.execute("select m::text from t")
+        assert rc.fetchone()[0] == "ok"
+        assert rc.description[0].type_code == 25
+
+        # A non-ASCII label is returned VERBATIM (no case fold), which is what
+        # the loader maps on.
+        cur.execute("create type e as enum ('Xà','sad')")
+        cur.execute("create table t2 (m e)")
+        cur.execute("insert into t2 values ('Xà')")
+        cur.execute("select m::text from t2")
+        assert cur.fetchone()[0] == "Xà"
 
 
 def test_an_enum_created_by_one_server_is_the_other_servers_too(home: Path) -> None:

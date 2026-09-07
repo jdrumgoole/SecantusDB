@@ -1360,7 +1360,10 @@ impl PgHandler {
                         .map(|(out, _)| {
                             let ty = def
                                 .column(out)
-                                .map(|c| wire_type(&c.pg_type))
+                                .map(|c| {
+                                    self.user_wire_type(&c.pg_type)
+                                        .unwrap_or_else(|| wire_type(&c.pg_type))
+                                })
                                 .unwrap_or(Type::VARCHAR);
                             FieldInfo::new(out.clone(), None, None, ty, FieldFormat::Text)
                         })
@@ -2289,7 +2292,10 @@ impl PgHandler {
                                 None => def
                                     .column(field)
                                     .or_else(|| def.column(out))
-                                    .map(|c| wire_type(&c.pg_type))
+                                    .map(|c| {
+                                        self.user_wire_type(&c.pg_type)
+                                            .unwrap_or_else(|| wire_type(&c.pg_type))
+                                    })
                                     .unwrap_or(Type::VARCHAR),
                             };
                             self.field(out.clone(), ty)
@@ -2608,7 +2614,8 @@ impl PgHandler {
                                         c.name.clone(),
                                         None,
                                         None,
-                                        wire_type(&c.pg_type),
+                                        self.user_wire_type(&c.pg_type)
+                                            .unwrap_or_else(|| wire_type(&c.pg_type)),
                                         FieldFormat::Text,
                                     )
                                 })
@@ -2925,7 +2932,10 @@ impl PgHandler {
                             let ty = match col {
                                 OutputCol::Group(i) => def
                                     .column(&agg.group_by[*i].0)
-                                    .map(|c| wire_type(&c.pg_type))
+                                    .map(|c| {
+                                        self.user_wire_type(&c.pg_type)
+                                            .unwrap_or_else(|| wire_type(&c.pg_type))
+                                    })
                                     .unwrap_or(Type::VARCHAR),
                                 OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
                             };
@@ -4706,7 +4716,10 @@ impl PgHandler {
                             None => def
                                 .column(field)
                                 .or_else(|| def.column(out))
-                                .map(|c| wire_type(&c.pg_type))
+                                .map(|c| {
+                                    self.user_wire_type(&c.pg_type)
+                                        .unwrap_or_else(|| wire_type(&c.pg_type))
+                                })
                                 .unwrap_or(Type::VARCHAR),
                         };
                         self.field(out.clone(), ty)
@@ -4740,7 +4753,10 @@ impl PgHandler {
                         let ty = match col {
                             OutputCol::Group(i) => def
                                 .column(&agg.group_by[*i].0)
-                                .map(|c| wire_type(&c.pg_type))
+                                .map(|c| {
+                                    self.user_wire_type(&c.pg_type)
+                                        .unwrap_or_else(|| wire_type(&c.pg_type))
+                                })
                                 .unwrap_or(Type::VARCHAR),
                             OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
                         };
