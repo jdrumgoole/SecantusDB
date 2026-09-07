@@ -696,11 +696,9 @@ def test_uuid_and_timetz_columns(home: Path) -> None:
             cur.execute("SELECT 'not-a-uuid'::uuid")
         assert exc.value.diag.sqlstate == "22P02"
 
-        # timestamptz as a column is still refused (its stored text would be
-        # session-relative); 0A000 feature-not-supported.
-        with pytest.raises(psycopg.Error) as exc:
-            cur.execute("CREATE TABLE bad (id int, t timestamptz)")
-        assert exc.value.diag.sqlstate == "0A000"
+        # timestamptz IS a column now (stored as a UTC instant, rendered in the
+        # session zone); see test_timestamptz_columns_render_in_session_zone.
+        cur.execute("CREATE TABLE tstz_ok (id int, t timestamptz)")
 
 
 def test_timestamp_sub_millisecond_invariant(home: Path) -> None:
@@ -1087,38 +1085,22 @@ def test_regtype_names_a_type(home: Path) -> None:
             assert cur.fetchone()[0] == want
 
 
-def test_timestamptz_columns_are_refused_not_silently_wrong(home: Path) -> None:
-    """A `timestamptz` COLUMN is refused, because storing one would be wrong.
+def test_timetz_columns_are_session_independent(home: Path) -> None:
+    """A `timetz` column stores its LITERAL offset, stable under any zone.
 
-    `timestamptz` is kept as canonical text here, the way `date` and `time`
-    already are — but a timestamptz *renders in the session's zone*, so that
-    text is only correct for the session that wrote it. Before this refusal, a
-    row written under UTC read back as `12:00:00+00` under `Europe/Rome`, where
-    PostgreSQL answers `13:00:00+01`: the right instant printed in the wrong
-    zone, which no client could detect.
-
-    The type still works everywhere it is a value rather than storage.
-    `timetz` is DIFFERENT and IS a valid column: its offset is literal, not
-    session-relative, so its canonical text is stable under any zone.
+    Unlike `timestamptz` (whose instant renders in the session zone -- see
+    `test_timestamptz_columns_render_in_session_zone`), a `timetz` offset is
+    literal: `12:34:56+02` reads back the same under any `SET timezone`, so its
+    canonical text is a safe column.
     """
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
-        with pytest.raises(psycopg.Error) as exc:
-            cur.execute("create table t (id int primary key, ts timestamptz)")
-        assert exc.value.diag.sqlstate == "0A000"
-
-        # A plain `timestamp` column is unaffected, and the tz types still work
-        # as casts and bound values.
-        cur.execute("create table v (id int primary key, ts timestamp)")
-        cur.execute("select '2026-01-01 12:00'::timestamptz::text")
-        assert cur.fetchone()[0] == "2026-01-01 12:00:00+00"
-
-        # `timetz` IS allowed as a column -- its offset is literal, so the
-        # canonical text is session-independent and safe to store.
         cur.execute("create table u (id int primary key, tt timetz)")
         cur.execute("insert into u values (1, '12:34:56+02')")
-        cur.execute("select tt::text from u")
-        assert cur.fetchone()[0] == "12:34:56+02"
+        for zone in ("UTC", "Asia/Tokyo"):
+            cur.execute(f"set timezone = '{zone}'")
+            cur.execute("select tt::text from u")
+            assert cur.fetchone()[0] == "12:34:56+02", zone
 
 
 def test_bytea_type_and_functions(home: Path) -> None:
@@ -3096,3 +3078,49 @@ def test_row_expressions_are_records(home: Path) -> None:
 
         cur.execute("SELECT pg_typeof(ROW(1, 2))::text")
         assert cur.fetchone()[0] == "record"
+
+
+def test_timestamptz_columns_render_in_session_zone(home: Path) -> None:
+    """A `timestamptz` column stores a UTC INSTANT and renders in the session zone.
+
+    The stored value is the same instant regardless of `SET timezone`; only its
+    rendering moves. This needs the server to (a) store an instant, not
+    session-rendered text, and (b) report the `TimeZone` GUC via ParameterStatus
+    so psycopg re-expresses the instant in the session zone. A plain `timestamp`
+    column stays naive (oid 1114).
+    """
+    import datetime as _dt
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create table tz (id int primary key, t timestamptz)")
+        cur.execute("insert into tz values (1, '2026-01-01 12:00:00+00')")
+        cur.execute("insert into tz values (2, '2026-06-15 08:30:00.123456-04')")
+        cur.execute("select t from tz where id = 1")
+        assert cur.description[0].type_code == 1184
+
+        # The same instant, rendered in three different session zones.
+        expected = {
+            "UTC": "2026-01-01T12:00:00+00:00",
+            "Asia/Tokyo": "2026-01-01T21:00:00+09:00",
+            "America/New_York": "2026-01-01T07:00:00-05:00",
+        }
+        for zone, iso in expected.items():
+            cur.execute(f"set timezone = '{zone}'")
+            cur.execute("select t from tz where id = 1")
+            assert cur.fetchone()[0].isoformat() == iso, zone
+
+        # Sub-millisecond precision survives the instant round-trip.
+        cur.execute("set timezone = 'UTC'")
+        cur.execute("select t from tz where id = 2")
+        assert cur.fetchone()[0] == _dt.datetime(
+            2026, 6, 15, 12, 30, 0, 123456, tzinfo=_dt.timezone.utc
+        )
+
+        # A plain `timestamp` column is unaffected -- naive, oid 1114.
+        cur.execute("create table ts (id int primary key, t timestamp)")
+        cur.execute("insert into ts values (1, '2026-01-01 12:00')")
+        cur.execute("set timezone = 'Asia/Tokyo'")
+        cur.execute("select t from ts")
+        assert cur.description[0].type_code == 1114
+        assert cur.fetchone()[0] == _dt.datetime(2026, 1, 1, 12, 0)

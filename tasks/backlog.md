@@ -4738,17 +4738,17 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `$lookup` missing only its `as`. The corpus now carries a `NEARLY_VALID` list
   of spec-is-fine-except-for-one-thing shapes (740 total).
 
-- **Rust PG server: a `timestamptz` COLUMN is refused (`0A000`)**, though the
-  type works as a cast, literal and bound parameter. It is stored as canonical
-  TEXT (as `date` and `time` already are), and a timestamptz renders in the
-  SESSION zone — so the stored text is right only for the session that wrote it.
-  This was found as a WRONG ANSWER, not designed as a refusal: a row written
-  under UTC read back as `12:00:00+00` under `Europe/Rome`, where PostgreSQL
-  answers `13:00:00+01` — the right instant printed in the wrong zone,
-  undetectable by any client. Needs an instant-valued stored form, plus a read
-  path that knows the column's declared type, before it can be allowed.
-  (`timetz` shipped 2026-09-07 — its offset is LITERAL, not session-relative, so
-  `12:34:56+02` renders the same under any zone and the canonical text is safe.)
+- **RESOLVED (2026-09-07): `timestamptz` COLUMNS ship.** Stored as a UTC INSTANT
+  (the same date + `__us_` companion a `timestamp` uses) and rendered in the
+  SESSION zone on the way out — so the same stored instant reads back correctly
+  under any `SET timezone` (verified 0-divergence across UTC / Asia/Tokyo /
+  America/New_York). This needed three things: the `::timestamptz` cast stores
+  the instant not session-text; the encoder renders a `timestamptz` column /
+  expression tz-aware (`timestamptz_text` / `timestamptz_value_text`); and the
+  server now emits a `ParameterStatus('TimeZone', ...)` on `SET` (and the other
+  GUC_REPORT vars — DateStyle, client_encoding, ...), because psycopg
+  re-expresses a timestamptz in the session zone it learns from that report.
+  (`timetz` shipped earlier — its offset is literal, not session-relative.)
 - **RESOLVED (2026-09-07) for dates and plain timestamps: `'infinity'` /
   `'-infinity'`, BC-era and wide-year (> 9999) dates, and `'epoch'` now parse**
   (`#1348`) — stored as canonical text and passed through, with leap-aware
