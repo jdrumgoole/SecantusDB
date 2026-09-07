@@ -4767,12 +4767,43 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `true` here. Reproducing it needs PostgreSQL's operator-resolution table for
   arrays, not a comparison fix. Being more permissive, so it accepts queries
   PostgreSQL rejects rather than answering them differently.
-- **Rust PG server: user-defined types (enum, composite) are a CAMPAIGN, not a
-  slice — sized 2026-09-03.** psycopg's `TypeInfo.fetch` issues one query
-  needing FOUR absent features: the `pg_type` / `pg_enum` catalog tables, a
-  LEFT JOIN, a subquery in FROM, and `array_agg`. `test_enum.py` (197) is the
-  largest failing file and stays that way until all four exist. Do not re-scope
-  it as a single batch.
+- **Rust PG server: composite-type introspection (`CompositeInfo.fetch`) is a
+  CAMPAIGN, not a slice — remapped 2026-09-07.** ENUM introspection now WORKS:
+  `TypeInfo.fetch` and `EnumInfo.fetch` both succeed, and an enum column reports
+  its own oid (#1364), so `register_enum` round-trips — the earlier "four
+  features" framing was stale for enums. What remains blocked is COMPOSITE,
+  behind psycopg's `CompositeInfo.fetch` query, which currently dies at
+  `0A000 this JOIN side is not supported`. The exact query (captured 2026-09-07):
+
+  ```sql
+  SELECT t.typname AS name, t.oid AS oid, t.typarray AS array_oid,
+         t.oid::regtype::text AS regtype,
+         coalesce(a.fnames, '{}') AS field_names,
+         coalesce(a.ftypes, '{}') AS field_types
+  FROM pg_type t
+  LEFT JOIN (
+      SELECT attrelid, array_agg(attname) AS fnames, array_agg(atttypid) AS ftypes
+      FROM (
+          SELECT a.attrelid, a.attname, a.atttypid
+          FROM pg_attribute a JOIN pg_type t ON t.typrelid = a.attrelid
+          WHERE t.oid = $regtype AND a.attnum > 0 AND NOT a.attisdropped
+          ORDER BY a.attnum
+      ) x
+      GROUP BY attrelid
+  ) a ON a.attrelid = t.typrelid
+  WHERE t.oid = $regtype
+  ```
+
+  It needs, none of which exist as a JOIN side today: (1) a LEFT JOIN whose RHS
+  is a SUBQUERY (not a table) — this is the exact node that raises `this JOIN
+  side`; (2) a nested subquery in FROM (`FROM (SELECT ...) x`); (3) a JOIN
+  inside that subquery (`pg_attribute a JOIN pg_type t ON t.typrelid =
+  a.attrelid`); (4) `array_agg` over the grouped rows; (5) LEFT-JOIN semantics
+  so a fieldless composite still returns its row via `coalesce`. The catalog
+  side already exists (`pg_type` / `pg_attribute` virtual tables from #1344, and
+  `pg_attribute` carries composites). Decompose into: subquery-as-join-side
+  first (unblocks the shape), then the aggregate-subquery materialisation.
+  `test_composite.py` (78) is gated on this. Do NOT re-scope as one batch.
 - **Rust PG server: a WHERE clause over `generate_series` is refused (`0A000`),
   and it is the only set-returning function.** The filter language is built
   against stored columns; applying one to generated rows needs an in-memory
