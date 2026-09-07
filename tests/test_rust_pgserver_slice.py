@@ -2704,3 +2704,55 @@ def test_schema_ddl(home: Path) -> None:
         cur.execute("select id from s2.t")
         assert cur.fetchall() == [(1,)]
         cur.execute("drop schema s2 cascade")
+
+
+def test_composite_type_ddl_and_catalog(home: Path) -> None:
+    """CREATE TYPE ... AS (fields), DROP TYPE, and the catalog reads behind it.
+
+    The DDL and the catalog (pg_type / to_regtype / regtype / pg_attribute) are
+    the foundation CompositeInfo.fetch reads; the fetch query's nested-subquery
+    join is a separate slice. A duplicate name is 42710 across composites,
+    enums and builtins alike.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create type testcomp as (foo text, bar int8, baz float8)")
+        assert cur.statusmessage == "CREATE TYPE"
+        with pytest.raises(psycopg.errors.DuplicateObject):
+            cur.execute("create type testcomp as (x int4)")
+
+        cur.execute("select typname, typrelid from pg_type where typname = 'testcomp'")
+        name, typrelid = cur.fetchone()
+        assert name == "testcomp"
+        cur.execute("select oid from pg_type where typname = 'testcomp'")
+        assert typrelid == cur.fetchone()[0]  # typrelid == its own oid
+        cur.execute("select to_regtype('testcomp')::text")
+        assert cur.fetchone()[0] == "testcomp"
+
+        # pg_attribute exposes the fields, 1-based, with the element oids.
+        cur.execute(
+            "select attname, atttypid, attnum from pg_attribute"
+            " where attrelid = to_regtype('testcomp') and attnum > 0"
+            " and attisdropped = false order by attnum"
+        )
+        assert cur.fetchall() == [("foo", 25, 1), ("bar", 20, 2), ("baz", 701, 3)]
+
+        cur.execute("drop type testcomp")
+        cur.execute("select to_regtype('testcomp')")
+        assert cur.fetchone()[0] is None
+
+
+def test_a_composite_created_by_one_server_is_the_others_too(home: Path) -> None:
+    """The composite catalog is a shared-store contract, minted like enums."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create type rustcomp as (a int4, b text)")
+        cur.execute("select oid from pg_type where typname = 'rustcomp'")
+        oid = cur.fetchone()[0]
+        assert oid >= 67000
+    assert _python_sql(home, "SELECT to_regtype('rustcomp')::oid") == [(oid,)]
+    _python_sql(home, "CREATE TYPE pycomp AS (c int8)")
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("select attname from pg_attribute where attrelid = to_regtype('pycomp')")
+        assert cur.fetchall() == [("c",)]

@@ -170,6 +170,12 @@ pub enum Statement {
         name: String,
         if_not_exists: bool,
     },
+    /// `CREATE TYPE <name> AS (<field type>, ...)` -- a composite type.
+    CreateComposite {
+        name: String,
+        /// (field name, field type name), in declared order.
+        fields: Vec<(String, String)>,
+    },
     /// `DROP SCHEMA [IF EXISTS] <names> [CASCADE]`.
     DropSchema {
         names: Vec<String>,
@@ -651,6 +657,27 @@ pub fn plan_with_params(
             name: c.schemaname.clone(),
             if_not_exists: c.if_not_exists,
         }),
+        // `CREATE TYPE name AS (field type, ...)` -- a composite type.
+        N::CompositeTypeStmt(ct) => {
+            let name = ct
+                .typevar
+                .as_ref()
+                .map(|r| r.relname.clone())
+                .ok_or_else(|| Error::Parse("CREATE TYPE without a name".into()))?;
+            let mut fields = Vec::new();
+            for col in &ct.coldeflist {
+                let Some(N::ColumnDef(cd)) = col.node.as_ref() else {
+                    return Err(Error::Unsupported("this composite field".into()));
+                };
+                let ty = cd
+                    .type_name
+                    .as_ref()
+                    .map(type_name_of)
+                    .ok_or_else(|| Error::Parse("composite field without a type".into()))?;
+                fields.push((cd.colname.clone(), ty));
+            }
+            Ok(Statement::CreateComposite { name, fields })
+        }
         // `CREATE TYPE ... AS ENUM`. The name may be schema-qualified; with no
         // schema support the last part is the name, same rule as columns.
         N::CreateEnumStmt(e) => {
