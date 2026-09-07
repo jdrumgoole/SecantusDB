@@ -1609,6 +1609,35 @@ def test_multiranges_merge_what_touches(home: Path) -> None:
 
 
 @pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+def test_multirange_arrays_report_their_element_type(home: Path, binary: bool) -> None:
+    """An ARRAY of multiranges is typed as the multirange's array oid, not text.
+
+    Range arrays already reported their element type; multirange arrays fell
+    through to varchar. That broke BOTH formats: in text the client read back a
+    bare string instead of parsing into Multirange objects, and in binary a
+    varchar column stays on the binary path, where the array value could not be
+    sent as a binary varchar at all. Their own array oids keep them on the
+    text-format path a non-binary-encodable type is already downgraded onto.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor(binary=binary)
+        cur.execute(
+            "SELECT ARRAY['{[1,5)}'::int4multirange, '{}'::int4multirange, '{(,)}'::int4multirange]"
+        )
+        rows = cur.fetchall()
+        assert rows == [
+            (
+                [
+                    Multirange([Range(1, 5, "[)")]),
+                    Multirange([]),
+                    Multirange([Range(None, None, "()")]),
+                ],
+            )
+        ]
+        assert cur.description[0].type_code == 6150  # int4multirange[], not varchar
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
 def test_multirange_values_bind_in_both_formats(home: Path, binary: bool) -> None:
     """A multirange sent as a parameter, in either wire format.
 
