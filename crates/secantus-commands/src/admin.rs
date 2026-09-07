@@ -448,39 +448,101 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
     let canonical = secantus_core::canonical_match(&Bson::Document(filter.clone()));
     let winning_plan = if is_ixscan {
-        let index_name = plan.get_str("indexName").unwrap_or("");
-        let mut input_stage = doc! {
-            "stage": "IXSCAN",
-            "indexName": index_name,
-            "keyPattern": plan.get_document("keyPattern").cloned().unwrap_or_default(),
-            "direction": plan.get_str("direction").unwrap_or("forward"),
-            // mongod always reports whether the scanned index is multikey;
-            // planners (Compass, aggregation optimisers) read it to decide
-            // what the index can be trusted for.
-            "isMultiKey": plan.get_bool("multikey").unwrap_or(false),
-        };
-        // mongod flags an IXSCAN over a partial index with `isPartial`.
-        if !coll.is_empty() {
-            let is_partial = storage
+        let index_name = plan.get_str("indexName").unwrap_or("").to_string();
+        let key_pattern = plan.get_document("keyPattern").cloned().unwrap_or_default();
+        let multikey = plan.get_bool("multikey").unwrap_or(false);
+        // The index's own options, for the flags mongod reports on every
+        // IXSCAN. An index we cannot find reports the defaults rather than
+        // omitting the keys -- a client testing for `isUnique` finds it either
+        // way, which is what mongod does.
+        let index_spec = if coll.is_empty() {
+            Document::new()
+        } else {
+            storage
                 .list_indexes(&ctx.db_name, &coll)
-                .map(|ixs| {
-                    ixs.iter().any(|ix| {
-                        ix.get_str("name").ok() == Some(index_name)
-                            && ix.contains_key("partialFilterExpression")
-                    })
+                .ok()
+                .and_then(|ixs| {
+                    ixs.into_iter()
+                        .find(|ix| ix.get_str("name").ok() == Some(index_name.as_str()))
                 })
-                .unwrap_or(false);
-            if is_partial {
-                input_stage.insert("isPartial", true);
+                .unwrap_or_default()
+        };
+        // mongod's IXSCAN key ORDER, verbatim -- drivers and Compass read the
+        // node positionally in places, so a reordered document is a needless
+        // difference. `multiKeyPaths` names, per indexed field, the array paths
+        // that made the index multikey; we do not track WHICH path did, so a
+        // non-multikey index reports the empty list mongod reports and a
+        // multikey one reports the field itself.
+        let mut multikey_paths = Document::new();
+        for field in key_pattern.keys() {
+            multikey_paths.insert(
+                field.clone(),
+                Bson::Array(if multikey {
+                    vec![Bson::String(field.clone())]
+                } else {
+                    vec![]
+                }),
+            );
+        }
+        let input_stage = doc! {
+            "stage": "IXSCAN",
+            "keyPattern": key_pattern.clone(),
+            "indexName": index_name.as_str(),
+            "isMultiKey": multikey,
+            "multiKeyPaths": multikey_paths,
+            "isUnique": index_spec.get_bool("unique").unwrap_or(false),
+            "isSparse": index_spec.get_bool("sparse").unwrap_or(false),
+            "isPartial": index_spec.contains_key("partialFilterExpression"),
+            "indexVersion": index_spec.get_i32("v").unwrap_or(2),
+            "direction": plan.get_str("direction").unwrap_or("forward"),
+        };
+        // The FETCH stage carries only the RESIDUAL filter -- the predicate the
+        // index bounds did not already satisfy -- and mongod OMITS the key
+        // entirely when the bounds cover the whole filter. That is how a reader
+        // tells a fully-index-served query from one that re-checks documents,
+        // so echoing the whole filter here erased the distinction.
+        let mut residual = Document::new();
+        for (k, v) in filter.iter() {
+            if !key_pattern.contains_key(k) {
+                residual.insert(k.clone(), v.clone());
             }
         }
-        doc! {
-            "stage": "FETCH",
-            "filter": filter.clone(),
-            "inputStage": input_stage,
+        let mut fetch = doc! { "stage": "FETCH" };
+        if !residual.is_empty() {
+            fetch.insert(
+                "filter",
+                Bson::Document(secantus_core::canonical_match(&Bson::Document(residual))),
+            );
         }
+        fetch.insert("inputStage", Bson::Document(input_stage));
+        fetch
     } else {
-        doc! { "stage": "COLLSCAN", "filter": Bson::Document(canonical.clone()) }
+        let mut collscan = doc! { "stage": "COLLSCAN" };
+        if !canonical.is_empty() {
+            collscan.insert("filter", Bson::Document(canonical.clone()));
+        }
+        // A `$natural: -1` hint is the only thing that walks the collection
+        // backwards; every other collection scan is forward.
+        let backward = match hint {
+            Some(Bson::Document(d)) => match d.get("$natural") {
+                Some(Bson::Int32(n)) => *n == -1,
+                Some(Bson::Int64(n)) => *n == -1,
+                Some(Bson::Double(n)) => *n == -1.0,
+                _ => false,
+            },
+            _ => false,
+        };
+        collscan.insert("direction", if backward { "backward" } else { "forward" });
+        collscan
+    };
+    // `isCached` sits on the OUTERMOST plan node only (the plan cache is a
+    // whole-plan property) and is its FIRST key. We never cache plans.
+    let winning_plan = {
+        let mut outer = doc! { "isCached": false };
+        for (k, v) in winning_plan.iter() {
+            outer.insert(k.clone(), v.clone());
+        }
+        outer
     };
     let query_planner = doc! {
         "namespace": &ns,

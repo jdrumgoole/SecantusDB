@@ -134,3 +134,113 @@ def test_the_normalisation_actually_happens(dbs) -> None:
     assert _parsed_query(rust_db, {"a": {"$gt": 1}, "b": 2}) == {
         "$and": [{"b": {"$eq": 2}}, {"a": {"$gt": 1}}]
     }
+
+
+# --------------------------------------------------------------------------
+# `winningPlan`'s plan-node FIELDS.
+#
+# mongod reports a fixed set of keys on each plan node, and a client reads them
+# to answer real questions: `isUnique` / `isSparse` / `isPartial` say what the
+# index can be trusted for, `multiKeyPaths` says which fields made it multikey,
+# and a `FETCH` that carries no `filter` is the signal that the index bounds
+# covered the whole predicate. The Rust server emitted four of the nine IXSCAN
+# keys, echoed the WHOLE filter on `FETCH` (erasing that signal), omitted
+# `direction` from `COLLSCAN`, and never set `isCached`.
+#
+# Still open and filed: the SORT / SKIP / LIMIT / PROJECTION stage tree, which
+# needs `sorted_by_index` plumbed through `ExplainPlan`.
+# --------------------------------------------------------------------------
+
+IXSCAN_KEYS = [
+    "stage",
+    "keyPattern",
+    "indexName",
+    "isMultiKey",
+    "multiKeyPaths",
+    "isUnique",
+    "isSparse",
+    "isPartial",
+    "indexVersion",
+    "direction",
+]
+
+
+@pytest.fixture
+def indexed(dbs):
+    rust_db, py_db = dbs
+    for db in (rust_db, py_db):
+        db.c.create_index([("a", 1)], name="a_1")
+        db.c.create_index([("b", 1)], name="b_uniq", unique=True)
+        db.c.create_index([("s", 1)], name="s_sparse", sparse=True)
+    return rust_db, py_db
+
+
+def _winning(db, body: dict):
+    reply = db.command({"explain": {"find": "c", **body}, "verbosity": "queryPlanner"})
+    return reply["queryPlanner"]["winningPlan"]
+
+
+def test_ixscan_carries_mongods_keys_in_mongods_order(indexed) -> None:
+    rust_db, _ = indexed
+    plan = _winning(rust_db, {"filter": {"a": 7}, "hint": "a_1"})
+    assert list(plan["inputStage"]) == IXSCAN_KEYS
+
+
+@pytest.mark.parametrize(
+    "hint,key,expected",
+    [
+        ("b_uniq", "isUnique", True),
+        ("a_1", "isUnique", False),
+        ("s_sparse", "isSparse", True),
+        ("a_1", "isSparse", False),
+        ("a_1", "isPartial", False),
+        ("a_1", "indexVersion", 2),
+    ],
+)
+def test_ixscan_index_flags(indexed, hint: str, key: str, expected: object) -> None:
+    rust_db, _ = indexed
+    plan = _winning(rust_db, {"filter": {"a": 7}, "hint": hint})
+    assert plan["inputStage"][key] == expected
+
+
+def test_fetch_omits_the_filter_when_the_bounds_cover_it(indexed) -> None:
+    """A `FETCH` with no `filter` is how a reader tells a fully-index-served
+    query from one that re-checks documents. Echoing the whole filter there
+    erased the distinction."""
+    rust_db, _ = indexed
+    covered = _winning(rust_db, {"filter": {"a": 7}, "hint": "a_1"})
+    assert "filter" not in covered
+    residual = _winning(rust_db, {"filter": {"a": 7, "other": 1}, "hint": "a_1"})
+    assert residual["filter"] == {"other": {"$eq": 1}}
+
+
+def test_collscan_reports_direction_and_omits_an_empty_filter(dbs) -> None:
+    rust_db, _ = dbs
+    plain = _winning(rust_db, {"filter": {}})
+    assert plain["direction"] == "forward"
+    assert "filter" not in plain
+    backward = _winning(rust_db, {"filter": {}, "hint": {"$natural": -1}})
+    assert backward["direction"] == "backward"
+
+
+def test_is_cached_is_the_first_key_of_the_outermost_node(dbs) -> None:
+    """`isCached` is a whole-plan property, so it sits on the OUTERMOST node
+    only — and it is that node's first key."""
+    rust_db, _ = dbs
+    plan = _winning(rust_db, {"filter": {"a": 1}})
+    assert next(iter(plan)) == "isCached"
+    assert plan["isCached"] is False
+
+
+def test_plan_nodes_agree_with_the_python_server(indexed) -> None:
+    """The two servers must build the same node, key for key."""
+    rust_db, py_db = indexed
+    for body in (
+        {"filter": {"a": 7}, "hint": "a_1"},
+        {"filter": {"b": "7"}, "hint": "b_uniq"},
+        {"filter": {"s": 7}, "hint": "s_sparse"},
+        {"filter": {"a": 7, "other": 1}, "hint": "a_1"},
+        {"filter": {}},
+        {"filter": {"nope": 1}},
+    ):
+        assert _winning(rust_db, body) == _winning(py_db, body), body
