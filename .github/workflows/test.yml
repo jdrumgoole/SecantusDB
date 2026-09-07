@@ -1991,6 +1991,7 @@ jobs:
           tests/test_rust_upsert_fidelity.py
           tests/test_rust_descending_sort.py
           tests/test_rust_computed_projection.py
+          tests/test_rust_collation_order.py
           tests/test_rust_explain_parsed_query.py
           tests/test_rust_hint_error_message.py
           -o addopts= -p no:cacheprovider -q

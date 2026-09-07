@@ -1400,6 +1400,7 @@ dependencies = [
  "geo",
  "rand",
  "regex",
+ "unicode-normalization",
 ]
 
 [[package]]

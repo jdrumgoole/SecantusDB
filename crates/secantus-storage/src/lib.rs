@@ -2553,7 +2553,10 @@ fn sort_key(
         // Collation-aware sort: a strength/caseLevel collation folds string keys
         // before encoding. A collation the encoder can't reproduce (non-ASCII /
         // numericOrdering) surfaces as UnsupportedValue → command BadValue.
-        parts.push(sortkey::encode_value(&v, coll).map_err(|_| StorageError::UnsupportedValue)?);
+        // The ORDERING key, not the index key: this is the sort path.
+        parts.push(
+            sortkey::encode_sort_value(&v, coll).map_err(|_| StorageError::UnsupportedValue)?,
+        );
     }
     Ok(parts)
 }

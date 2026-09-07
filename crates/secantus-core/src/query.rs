@@ -3001,6 +3001,8 @@ mod tests {
         let coll = Collation {
             strength: 2,
             case_level: false,
+            case_first_upper: false,
+            backwards: false,
             numeric_ordering: false,
         };
         assert!(matches(
@@ -3010,14 +3012,16 @@ mod tests {
             Some(&coll)
         )
         .unwrap());
-        // non-ASCII under a case-insensitive collation defers to Python
+        // non-ASCII under a case-insensitive collation used to defer, which on
+        // this server is an ERROR, not a fallback -- it surfaced as
+        // `2 BadValue` for ordinary accented input. mongod 8.2.11 matches.
         assert!(matches(
             &doc! {"n": "café"},
             &doc! {"n": "CAFÉ"},
             &Document::new(),
             Some(&coll)
         )
-        .is_err());
+        .unwrap());
     }
 
     #[test]

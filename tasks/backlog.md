@@ -5473,6 +5473,91 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   Pinned by `tests/test_decimal128_zero_and_avg.py` (90 tests, both engines,
   table generated FROM mongod) and the `deczero` / `avgdiv` gate groups.
 
+- [x] **RESOLVED (2026-09-07): collated ORDER on the RUST server — a
+  case-insensitive query over non-ASCII no longer ERRORS, and collated sorting
+  is implemented.** `tools/probes/collation_order.py` was the one Rust-aware
+  probe never swept against the Rust server; sweeping it found both.
+
+  **The error.** `find().sort(...).collation({strength: 1})` over any non-ASCII
+  character — `á`, `ß`, `日` alike — answered
+  `2 BadValue: an indexed value is of a type the Rust server does not support`,
+  on match filters as well as sorts. `normalize_index_bytes` had
+  `if !s.is_ascii() { return None }`, and a defer has no Python behind it on
+  the Rust server. It now folds properly: NFKD, drop combining marks, full case
+  fold. **`to_lowercase` is NOT enough** — folding maps `ß` to `ss`, and mongod
+  sorts `["ß","s","t"]` as `["s","ß","t"]`, which only comes out right if `ß`
+  compares as `ss`.
+
+  **The ordering.** `collation.py`'s `sort_levels` is ported to
+  `collation::sort_level_bytes` as a byte-comparable three-level key: the
+  measured `MARK_ORDER` table (acute before grave — NOT codepoint order),
+  `backwards` reversal, `caseFirst` flip, `numericOrdering` digit runs.
+
+  Result: **0 unexpected divergences of 19** on the probe (the 2 remaining are
+  the documented Swedish / Danish locale gaps needing CLDR), and **0 of 64** on
+  a wider three-way sweep across every collation option shape.
+
+  **There were TWO defer sites, not one.** Fixing `normalize_index_bytes` left
+  the query path (`normalize`, behind `collation::equal` / `compare`) still
+  bailing, so collated equality and range queries on non-ASCII text kept
+  answering `2 BadValue: query uses a construct the Rust server does not
+  support` after the sort was fixed. Caught by the new test file, not by
+  reading. Both now share one fold helper.
+
+  **NO on-disk change, and the `entryFormat` bump this entry previously called
+  for is NOT needed** — that was over-cautious and is corrected here. Only ONE
+  call site passes a collation to the index encoder and it is the in-memory
+  sort-key builder; index entries encode with `None`. That is now structural
+  rather than incidental: `sortkey::encode_value` stays the single-level INDEX
+  encoder (byte-identical to Python's, which is what the other server reads
+  back) and the three-level ordering key moved to a new `encode_sort_value`.
+  Collapsing the two roles into one function is what broke
+  `test_collation_encoding_parity` — the same name means index bytes in Python
+  and had come to mean the sort key in Rust. Verified by the probe's own
+  invariant: index and non-index results agree on every case.
+
+  **Mark filtering must use the predicate Python uses, PER SITE** — three
+  different sets, and the difference is measurable. `_strip_accents` filters
+  general category `Mn`; `sort_levels` filters on a nonzero canonical combining
+  class; `unicode_normalization::char::is_combining_mark` is neither, being true
+  for all of `M*`. Using the last for the accent strip dropped a Devanagari
+  vowel sign (U+093E, `Mc`) that the Python engine keeps. Adds direct
+  `unicode-normalization` and `unicode-properties` dependencies to
+  `secantus-core`; both were already in the lock tree transitively.
+
+- [ ] **OPEN: the PYTHON server orders LIGATURES wrongly under a collation
+  (found 2026-09-07 while porting `sort_levels` to Rust).** 5 of 64 shapes in
+  the three-way sweep; mongod and the Rust server agree, the Python server does
+  not:
+
+      ["ﬁ", "fi", "fj"]  sorted with any collation
+          mongod  ['fi', 'ﬁ', 'fj']
+          rust    ['fi', 'ﬁ', 'fj']
+          python  ['ﬁ', 'fi', 'fj']
+
+  `sort_levels` decomposes with **NFD**, which does not split a COMPATIBILITY
+  ligature, so `ﬁ` stays one base character while the primary level case-folds
+  it to two:
+
+      'ﬁ'   key = ('fi', ((),),    (0,))
+      'fi'  key = ('fi', ((), ()), (0, 0))
+
+  The primaries tie and the secondary then compares a ONE-group tuple against a
+  TWO-group one, so `((),) < ((),())` puts the ligature first.
+
+  **Not fixed here because the obvious fixes are unmeasured.** Switching
+  `sort_levels` to NFKD makes the two keys IDENTICAL, which is also not
+  mongod's answer — mongod separates them, so it has a further tiebreak.
+  Adding an ICU-style identical level would supply one, but it would also break
+  the strength-1 ties where mongod preserves INPUT order (`["a","A","á"]` at
+  strength 1). Someone should measure what mongod actually does with equal
+  primaries before choosing.
+
+  Worth noting honestly: the Rust side matches mongod here by an ARTIFACT of
+  how the byte encoding interleaves its level separators, not because it models
+  a quaternary level. It is right on all 64 measured shapes and the mechanism
+  is not principled; a future change to the separator layout could move it.
+
 - [ ] **STILL OPEN: `Decimal128` FINITE operands in the transcendentals — now
   the ONLY thing left in this family (19 shapes, re-measured 2026-09-07 after
   the zero and `$avg` work above).** The Rust engine defers
