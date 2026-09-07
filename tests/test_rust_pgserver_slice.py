@@ -3165,3 +3165,38 @@ def test_custom_range_types(home: Path) -> None:
         with pytest.raises(psycopg.Error) as exc:
             cur.execute("SELECT 'myr'::regtype")
         assert exc.value.diag.sqlstate == "42704"
+
+
+def test_binary_array_params_bytea_inet_uuid(home: Path) -> None:
+    """bytea[] / inet[] / cidr[] / uuid[] round-trip as BINARY params and columns.
+
+    psycopg sends these as binary array parameters (oids 1001 / 651 / 1041 /
+    2951) and reads array columns back in binary; the element decode reuses the
+    scalar bytea / inet / cidr / uuid decoders, and the array types report their
+    own oid rather than falling through to varchar.
+    """
+    import ipaddress
+    import uuid as _uuid
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create table arr (b bytea[], u uuid[], n inet[])")
+        u1 = _uuid.UUID("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
+        cur.execute(
+            "insert into arr values (%b, %b, %b)",
+            (
+                [b"\x01", b"\x02\xff"],
+                [u1],
+                [ipaddress.ip_interface("10.0.0.1/8")],
+            ),
+        )
+        for binary in (False, True):
+            c = conn.cursor(binary=binary)
+            c.execute("select b, u, n from arr")
+            b, u, n = c.fetchone()
+            assert b == [b"\x01", b"\x02\xff"], binary
+            assert u == [u1], binary
+            assert n == [ipaddress.ip_interface("10.0.0.1/8")], binary
+        # The array column reports its own element-array oid, not varchar.
+        cur.execute("select b from arr")
+        assert cur.description[0].type_code == 1001  # bytea[]

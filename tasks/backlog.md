@@ -1920,6 +1920,15 @@ These are explicit non-goals. Don't add them without a reason.
 - ~~Tailable / awaitData cursors~~ — implemented for change streams (see "In scope" in `CLAUDE.md`) **and** for plain capped collections + `local.oplog.rs` (`commands._find_tailable` / `_find_tailable_oplog`, blocking `getMore` on the oplog condition variable). The producer re-applies the find filter (with `let` vars + collation) to follow-up inserts, advances its watermark by **RecordId** (insertion order — the same order capped eviction uses; an `id_key` watermark dropped and redelivered docs when `_id`s weren't monotonic), and raises `CappedPositionLost` (136) on rollover.
 
 ## 5. Known bugs and edge cases to watch
+
+- **Rust PG server: an `inet[]` / `cidr[]` cast to TEXT keeps a max-length
+  mask** (`{127.0.0.1/32}`) where PostgreSQL's `inet_out` drops it
+  (`{127.0.0.1}`). The array text renderer (`render_array_element`) is
+  type-blind, so it cannot apply the `net::text_out` rule the scalar column
+  path uses. The inet/cidr COLUMN round-trip and binary-array params are
+  unaffected (0-divergence); only the explicit `::text` cast of an array
+  diverges. Needs element-type threading into `render_array`. (2026-09-07)
+
 - [ ] **OPEN — RUST pgserver range family, remaining gaps (measured 2026-09-07).**
   The scalar range/multirange BINARY wire codec is correct (typed empty /
   unbounded / populated values round-trip against real PG; the psycopg cases
