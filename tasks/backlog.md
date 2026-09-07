@@ -4853,9 +4853,17 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   that oid with it
   (the binary decoder covers `numeric` / `date` / `time` / `timestamp` /
   arrays / ranges / multiranges; a type it does not have cannot be decoded into
-  one — what remains unhandled there is `inet` / `cidr` / `json`,
-  all of which are missing TYPES, not decoder gaps; `uuid` shipped 2026-09-07
-  as a text-valued type, so its BINARY parameter form is the remaining gap).
+  one — what remains unhandled there is `json`, a missing TYPE not a decoder
+  gap; `uuid` shipped 2026-09-07 as a text-valued type, so its BINARY parameter
+  form is the remaining gap. `inet` / `cidr` shipped 2026-09-07 WITH their
+  binary parameter + result form).
+- [ ] **Rust PG server: the inet/cidr scalar FUNCTIONS are not implemented**
+  (noted 2026-09-07, when the inet/cidr TYPES + binary wire shipped). The
+  Python server's `src/secantus/sql/net.py` has `host` / `masklen` / `network`
+  / `netmask` / `broadcast` / `abbrev` / `family` / `contains` (`>>`) /
+  `overlaps` (`&&`); none are ported to the Rust `scalar.rs` yet. Add only what
+  the psycopg gauge exercises — probe first. The type itself (cast, column,
+  `::text`, binary parameter + result) is done and gauged at 0 divergences.
 - **Rust PG server: a result column is only sent in the BINARY format when its
   type is one this server can encode exactly.** `bool`, `int2`/`int4`/`int8`,
   `float4`/`float8`, `text`/`varchar`/`bpchar`/`name`/`char`, `numeric` and

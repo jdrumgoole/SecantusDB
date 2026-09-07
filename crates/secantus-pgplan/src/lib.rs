@@ -16,6 +16,7 @@ use std::str::FromStr;
 
 pub mod bytea;
 pub mod json;
+pub mod net;
 pub mod pgtypes;
 pub mod range;
 pub mod scalar;
@@ -4444,6 +4445,8 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             })
         }
         "time" => Ok(Bson::String(parse_time(&as_text(&value))?)),
+        "inet" => Ok(Bson::String(net::normalize_inet(&as_text(&value))?)),
+        "cidr" => Ok(Bson::String(net::normalize_cidr(&as_text(&value))?)),
         "bytea" => {
             let bytes = bytea::parse(&value)?;
             Ok(bytea::to_binary(bytes))
