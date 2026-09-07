@@ -81,8 +81,10 @@ fn doc_list(py: Python<'_>, docs: Vec<Vec<u8>>) -> Vec<Py<PyBytes>> {
     docs.into_iter().map(|b| bytes(py, b)).collect()
 }
 
-/// Encode an `ExplainPlan` as a `{kind, index_name?, key_pattern?, direction?}`
-/// document (the command layer shapes it into MongoDB's `winningPlan`).
+/// Encode an `ExplainPlan` as a
+/// `{kind, index_name?, key_pattern?, direction?, sorted_by_index?}` document
+/// (the command layer shapes it into MongoDB's `winningPlan`). The key names
+/// are the PYTHON plan's, which is what this binding feeds.
 fn explain_to_doc(plan: ExplainPlan) -> Document {
     let mut d = Document::new();
     match plan {
@@ -93,11 +95,15 @@ fn explain_to_doc(plan: ExplainPlan) -> Document {
             index_name,
             key_pattern,
             direction,
+            sorted_by_index,
         } => {
             d.insert("kind", "IXSCAN");
             d.insert("index_name", index_name);
             d.insert("key_pattern", Bson::Document(key_pattern));
             d.insert("direction", direction);
+            // `explain` reads this to decide whether to report a blocking
+            // `SORT` stage; the Python plan carries it under this name.
+            d.insert("sorted_by_index", sorted_by_index);
         }
     }
     d
