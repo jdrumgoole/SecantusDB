@@ -4871,6 +4871,29 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   a dedicated focused effort with repeated full-differential validation, best done in a
   session with the context budget for the JoinSelect refactor — not an incremental-PR
   sequence and not safe to rush.
+
+  **EXECUTION-READY PATH (4th probe, 2026-09-08 — traced planner + executor + caller):**
+  - Piece 1 (`plan_join_select` pgplan ~1560; `join_docs` pgserver ~346): `JoinSelect.filter:
+    Option<(String,String,Bson)>` → `Vec<Predicate{alias,col,op(=|>|>=|<|<=|is_not_true),value}>`.
+    In `plan_join_select` walk an AND of AExprs (today one `=`) + handle `NOT <boolcol>`
+    (BoolExpr/rhs-less AExpr). In `join_docs` apply each predicate to left/right rows by
+    alias (loop already does this for the one equality). Inner nested join is INNER so
+    right-side predicates are safe.
+  - Piece 2 (crux): `side()` (pgplan ~1616) returns `(String,String)` → a `JoinSide` enum
+    `{ Table(String,String) | Sub(Box<sub-plan>, alias) }`; accept `N::RangeSubselect` by
+    recursively planning its inner SelectStmt (`plan_select`/`plan_aggregate`). MATERIALIZE
+    IN THE CALLER `execute()` (pgserver ~2365, already runs aggregates/selects): before
+    `join_docs`, execute any `Sub` side to `Vec<Document>` keyed by its output column names
+    and pass pre-materialized rows into a `join_docs` variant (so the `join_docs` HELPER
+    need not call back into the executor). `join_output_def` must derive the def from a
+    `Sub` side's columns.
+  - Piece 3 (small): the outer LEFT-JOIN miss must yield NULL (not absent) for the aggregate
+    columns so the existing `coalesce` scalar handling turns it into `{}`.
+  - Guards (mandatory, in order): oracle 0-divergence on CompositeInfo.fetch (2-field /
+    1-field / varied-type / nested-composite); then FULL `test_rust_pgserver_differential.py`
+    (800+, the piece-2 risk) green; then full slice (204). Repeated 14-min differential runs
+    make this a dedicated session's work, confirmed unshippable as a single autonomous pass
+    by four probes.
   Composite VALUE round-trip (register_composite of a value) is a SEPARATE later
   piece after fetch works.
 
