@@ -5203,6 +5203,43 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `tests/test_decimal128_special_values.py` (133 tests, both engines, the table
   generated FROM mongod) and by the `decspecial` group in the differential gate.
 
+- [x] **RESOLVED (2026-09-07): the RUST server's `explain` echoed the filter as
+  sent instead of mongod's NORMALISED match expression.** 44 of the 56 shapes in
+  `tools/probes/explain_shapes.py` diverged; the Python server matched all 56,
+  because only it had `secantus.explain.canonical_match`.
+  `secantus-core::explain` is the port; the Rust server is now 0 of 56. Pinned
+  by `tests/test_rust_explain_parsed_query.py` (36 cases, registered in the
+  storage-engine CI lane).
+
+- [ ] **OPEN: the Rust server's `explain` `winningPlan` plan-node FIELDS.**
+  Measured 2026-09-07 with the Rust server built from `main`:
+
+  | server | parsedQuery | winningPlan |
+  | --- | --- | --- |
+  | python | 0 of 56 | 7 of 25 |
+  | rust (before) | 44 of 56 | 25 of 25 |
+  | rust (now) | **0 of 56** | 25 of 25 |
+
+  Python's 7 are its documented FLOOR, not a defect: four are `indexBounds`
+  (which this project deliberately does not reproduce, along with
+  `rejectedPlans` and the IDHACK / EXPRESS_IXSCAN / COUNT_SCAN / DISTINCT_SCAN
+  executors) and three are a genuine cost-model difference where mongod picks an
+  IXSCAN and we pick COLLSCAN + SORT — identical documents, different plan.
+
+  What the Rust server is missing, from the probe output:
+
+  - `COLLSCAN` needs `direction` and `isCached`, and must OMIT `filter` when
+    there is none (it currently emits an empty one);
+  - `IXSCAN` needs `indexVersion`, `isPartial`, `isSparse`, `isUnique` and
+    `multiKeyPaths` alongside the four it has;
+  - `FETCH` must carry only the RESIDUAL filter and omit the key when the
+    bounds cover the predicate;
+  - the `SORT` / `SKIP` / `LIMIT` / `PROJECTION_SIMPLE`|`PROJECTION_DEFAULT`
+    stage tree (`secantus.explain.build_stage_tree`) is not built at all.
+
+  The Python implementations are the reference for every one of these; the work
+  is plumbing the index metadata the Rust explain path does not currently carry.
+
 - [ ] **STILL OPEN: `Decimal128` FINITE operands in the transcendentals.** The
   Rust engine defers `$sqrt(Decimal128("2.5"))` and the rest of the family;
   mongod answers `1.581138830084189665999446772216359`. This is the genuine
