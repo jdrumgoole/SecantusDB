@@ -2150,6 +2150,65 @@ all still open. Probe: `scratchpad/readsweep.py` + `readsweep_lib.py`.
   command, per the standing rule, found it carried the same refusal. Pinned by
   `tests/test_rust_computed_projection.py`. A projection error carrying a mongod
   code is now surfaced verbatim rather than flattened to `BadValue`.
+- [x] **RESOLVED (2026-09-07): expression operators on the RUST server answered
+  a VALUE where mongod rejects the expression for a missing required argument.**
+  `{$regexMatch: {}}` returned `false`; `{$filter: {}}`, `{$trim: {}}`,
+  `{$reduce: {}}`, `{$map: {}}` and `{$dateAdd: {}}` returned `null` — 25 cases
+  answering something a caller can branch on. Another 32 answered the generic
+  `2 BadValue ... not supported by the Rust server`, blaming the operator for a
+  bad argument.
+
+  Root cause is the missing-vs-null conflation: required fields were read with
+  the optional-field helper, which reports an absent key as null. Only an ABSENT
+  key is an error — `{$trim: {input: null}}` is legal and yields null — so the
+  check tests key PRESENCE.
+
+  Two rules that a guess would get wrong, both measured on 8.2.11:
+  **an UNKNOWN argument outranks a missing one** (`{$trim: {k: 1}}` is 50694,
+  even with `input` also absent), and **the stage decides the wrapper** —
+  `Invalid <stage> :: caused by ::` for `$addFields` / `$project` / `$set`, BARE
+  inside `$match`'s `$expr`. The first was caught by the corpus after a version
+  with the precedence backwards traded 20 fixed cases for 20 broken ones at an
+  unchanged total, which is exactly the failure a raw count hides.
+
+  57 required-field cases at 0 divergences; the 6,628-case expression corpus
+  improves 58 -> 38 different-code, 0 wrong values, no regressions. Pinned by
+  `tests/test_rust_required_expression_args.py` and
+  `scratchpad/reqfields.py`.
+
+- [ ] **OPEN: `$group` on the RUST server DISCARDS every mongod-named error and
+  answers the generic refusal (found 2026-09-07 while fixing the required-field
+  validation below).** `crates/secantus-core/src/group.rs` types its whole
+  module as `Result<T, ()>` — the error is thrown away at the boundary
+  (`expressions::evaluate(...).map_err(|_| ())`), so the command layer's
+  `fault.as_mongo()` check finds nothing to report and falls through to
+  `2 BadValue: aggregation pipeline uses a stage or operator not supported by
+  the Rust server`.
+
+  This is NOT specific to the required-field work; it loses errors that were
+  already named correctly everywhere else:
+
+      {$group: {_id: null, x: {$first: {$ln: 0}}}}
+        mongod  28766 Failed to optimize pipeline :: caused by ::
+                      $ln's argument must be a positive number ...
+        rust    2     aggregation pipeline uses a stage or operator not
+                      supported by the Rust server
+
+      {$group: {_id: null, x: {$first: {$trim: {}}}}}
+        mongod  50695 $trim requires an 'input' field        (BARE — no wrapper)
+        rust    2     ...not supported by the Rust server
+
+  The same expressions report correctly through `$addFields` / `$project` /
+  `$set` (wrapped as `Invalid <stage> :: caused by ::`) and through `$match`'s
+  `$expr` (bare), so the gap is the `$group` path alone.
+
+  **Size is a COUNT, not an estimate** (and CLAUDE.md is right that counts read
+  off the source have misled before — re-derive it): `group.rs` is 1,898 lines
+  with 57 `Err(())`, 16 `ok_or(())` and 8 `map_err(|_| ())`. Changing
+  `type R<T> = Result<T, ()>` to carry `Fallback` makes the 8 `map_err` sites
+  disappear, but each of the other 73 has to decide what mongod actually says
+  there — which is the real work, and needs probing per site rather than a
+  mechanical substitution.
 
 - [x] **RESOLVED (2026-09-06): the descending sort that put every prefix chain
   in ascending order.** `sort({x: -1})` over `["", "a", "ab", "abc", "b"]` came
