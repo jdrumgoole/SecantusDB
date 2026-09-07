@@ -327,6 +327,13 @@ QUERIES = [
     "SELECT encode('\\x00017f80ff'::bytea, 'escape')",
     "SELECT decode('AQL/', 'base64')::text",
     "SELECT ('\\x0102'::bytea || '\\xff'::bytea)::text",
+    # bytea compares by unsigned byte value, lexicographically; a prefix
+    # sorts before the longer value.
+    "SELECT '\\x01'::bytea = '\\x01'::bytea",
+    "SELECT '\\x01'::bytea < '\\x02'::bytea",
+    "SELECT '\\xff'::bytea > '\\x01'::bytea",
+    "SELECT '\\x01'::bytea < '\\x0102'::bytea",
+    "SELECT '\\x0102'::bytea <> '\\x0103'::bytea",
     "SELECT '1'::int",
     "SELECT 1::text",
     "SELECT '1.5'::float8",
