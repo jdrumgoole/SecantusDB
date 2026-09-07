@@ -254,7 +254,7 @@ jobs:
 
       - name: Set up JDK
         if: matrix.driver.name == 'java' || matrix.driver.name == 'kotlin' || matrix.driver.name == 'java-rust-server' || matrix.driver.name == 'kotlin-rust-server' || startsWith(matrix.driver.name, 'pgjdbc')
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95  # v5
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c  # v5
         with:
           distribution: temurin
           java-version: "21"
