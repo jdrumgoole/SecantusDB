@@ -2056,7 +2056,7 @@ jobs:
     # macOS cells would break). A separate job also keeps the main matrix's
     # timings untouched.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       UV_PYTHON: "3.10"
       # The suites read this (tests/pg_oracle.py); without it they fall back to
@@ -2093,7 +2093,7 @@ jobs:
       - name: Install toolchain
         uses: ./.github/actions/apt-install
         with:
-          packages: swig liblz4-dev
+          packages: swig liblz4-dev clang libclang-dev
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
@@ -2133,6 +2133,25 @@ jobs:
       - name: Sync dependencies
         run: uv sync --extra dev --extra admin
 
+      # Build the standalone Rust PostgreSQL server. Without it BOTH
+      # tests/test_rust_pgserver_slice.py and tests/test_rust_pgserver_differential.py
+      # skip (they gate on `secantusd-pg` existing), so a pgserver regression
+      # reached `main` under green CI once already (#1363). This is the only
+      # lane that runs them.
+      - name: Build secantusd-pg
+        shell: bash
+        run: |
+          WT="$PWD/$(ls -d build/*/wt-build | head -1)"
+          export SECANTUS_WT_INCLUDE="$WT/include" SECANTUS_WT_LIB="$WT"
+          # bindgen needs libclang; find it wherever the runner's LLVM put it
+          # (Ubuntu noble ships LLVM 18, not a fixed version -- do not hardcode).
+          lc="$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)"
+          test -n "$lc" || { echo "libclang not found" >&2; exit 1; }
+          export LIBCLANG_PATH="$(dirname "$lc")"
+          echo "LIBCLANG_PATH=$LIBCLANG_PATH"
+          (cd crates/secantus-pgserver && cargo build --bin secantusd-pg)
+          test -x crates/secantus-pgserver/target/debug/secantusd-pg
+
       - name: Verify the reference server is reachable
         # Fail CLOSED. The whole point of this job is that these suites stop
         # skipping, and a skip is invisible in a green pytest summary — so
@@ -2155,6 +2174,15 @@ jobs:
         shell: bash
         run: |
           files=$(grep -rl '^import pg_oracle' tests/ | sort | tr '\n' ' ')
+          # Add the Rust pgserver SLICE suite explicitly (it does not import
+          # pg_oracle, so grep misses it). It needs only the binary, runs in a
+          # few minutes, and is deterministic -- and it is the suite that has
+          # pre-existing tests a shared-code change can silently break (that is
+          # exactly how #1363 left `main` red under green CI). The DIFFERENTIAL
+          # suite (~800 tests doing DDL against one shared postgres) is too slow
+          # to fit this lane's budget and is already run locally against a real
+          # PostgreSQL before every pgserver change lands, so it stays local.
+          files="$files tests/test_rust_pgserver_slice.py"
           echo "oracle suites: $files"
           test -n "$files"
           PYTHONPATH=tests uv run python -m pytest $files -q -n auto \
