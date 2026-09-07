@@ -814,15 +814,17 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
         match el.node.as_ref() {
             Some(N::ColumnDef(cd)) => {
                 let ty = cd.type_name.as_ref().map(type_name_of).unwrap_or_default();
-                // `timestamptz` / `timetz` work as casts, literals and bound
-                // values, but NOT as a column: they are stored as canonical
-                // text, and a timestamptz renders in the SESSION zone, so the
-                // stored text is right only for the session that wrote it. A
-                // row written under UTC then read under Europe/Rome came back
-                // with UTC's wall clock and UTC's offset -- a wrong answer no
-                // client could detect. Refuse until the stored form is an
-                // instant rather than a rendering of one.
-                if matches!(ty.as_str(), "timestamptz" | "timetz") {
+                // `timestamptz` works as a cast, literal and bound value but
+                // NOT as a column: it is stored as canonical text, and a
+                // timestamptz renders in the SESSION zone, so the stored text
+                // is right only for the session that wrote it. A row written
+                // under UTC then read under Europe/Rome came back with UTC's
+                // wall clock and UTC's offset -- a wrong answer no client could
+                // detect. Refuse until the stored form is an instant rather
+                // than a rendering of one. `timetz` is DIFFERENT: its offset is
+                // literal, not session-relative (`12:34:56+02` renders the same
+                // under any zone), so the canonical text is a safe column.
+                if ty == "timestamptz" {
                     return Err(Error::Unsupported(format!("a {ty} column")));
                 }
                 let pk = cd.constraints.iter().any(|c| {
@@ -4412,8 +4414,51 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             })
         }
         "time" => Ok(Bson::String(parse_time(&as_text(&value))?)),
+        "uuid" => {
+            let text = as_text(&value);
+            parse_uuid(&text).map(Bson::String).ok_or_else(|| {
+                Error::InvalidText(format!("invalid input syntax for type uuid: \"{text}\""))
+            })
+        }
         other => Err(Error::Unsupported(format!("a cast to {other}"))),
     }
+}
+
+/// Parse a UUID the way PostgreSQL's `uuid_in` does and return its canonical
+/// lowercase `8-4-4-4-12` text. Optional surrounding braces, and a hyphen is
+/// tolerated only at the four standard group boundaries (after 8, 12, 16 and
+/// 20 hex digits); a hyphen anywhere else, any non-hex character, whitespace,
+/// or a count other than 32 hex digits is rejected (`22P02`).
+fn parse_uuid(s: &str) -> Option<String> {
+    let inner = match (s.strip_prefix('{'), s.strip_suffix('}')) {
+        (Some(_), Some(_)) => &s[1..s.len() - 1],
+        (None, None) => s,
+        _ => return None,
+    };
+    let mut hex = String::with_capacity(32);
+    for ch in inner.chars() {
+        if ch == '-' {
+            if matches!(hex.len(), 8 | 12 | 16 | 20) {
+                continue;
+            }
+            return None;
+        }
+        if !ch.is_ascii_hexdigit() || hex.len() == 32 {
+            return None;
+        }
+        hex.push(ch.to_ascii_lowercase());
+    }
+    if hex.len() != 32 {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
 }
 
 /// Evaluate a constant expression: arithmetic, concatenation, comparison.

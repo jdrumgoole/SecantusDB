@@ -4727,19 +4727,23 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `$lookup` missing only its `as`. The corpus now carries a `NEARLY_VALID` list
   of spec-is-fine-except-for-one-thing shapes (740 total).
 
-- **Rust PG server: a `timestamptz` / `timetz` COLUMN is refused (`0A000`)**,
-  though the types work as casts, literals and bound parameters. They are stored
-  as canonical TEXT (as `date` and `time` already are), and a timestamptz renders
-  in the SESSION zone — so the stored text is right only for the session that
-  wrote it. This was found as a WRONG ANSWER, not designed as a refusal: a row
-  written under UTC read back as `12:00:00+00` under `Europe/Rome`, where
-  PostgreSQL answers `13:00:00+01` — the right instant printed in the wrong zone,
-  undetectable by any client. Refusing cost zero gauge tests. Needs an
-  instant-valued stored form, plus a read path that knows the column's declared
-  type, before columns can be allowed.
-- **Rust PG server: `'infinity'` / `'-infinity'` timestamps and dates (60
-  psycopg tests), BC-era dates (30), and `'epoch'` (6) do not parse.** These
-  need sentinel values that survive the whole pipeline rather than a parse fix.
+- **Rust PG server: a `timestamptz` COLUMN is refused (`0A000`)**, though the
+  type works as a cast, literal and bound parameter. It is stored as canonical
+  TEXT (as `date` and `time` already are), and a timestamptz renders in the
+  SESSION zone — so the stored text is right only for the session that wrote it.
+  This was found as a WRONG ANSWER, not designed as a refusal: a row written
+  under UTC read back as `12:00:00+00` under `Europe/Rome`, where PostgreSQL
+  answers `13:00:00+01` — the right instant printed in the wrong zone,
+  undetectable by any client. Needs an instant-valued stored form, plus a read
+  path that knows the column's declared type, before it can be allowed.
+  (`timetz` shipped 2026-09-07 — its offset is LITERAL, not session-relative, so
+  `12:34:56+02` renders the same under any zone and the canonical text is safe.)
+- **RESOLVED (2026-09-07) for dates and plain timestamps: `'infinity'` /
+  `'-infinity'`, BC-era and wide-year (> 9999) dates, and `'epoch'` now parse**
+  (`#1348`) — stored as canonical text and passed through, with leap-aware
+  day validation. STILL OPEN: a wide/BC `timestamptz` is not rendered with its
+  session-tz offset (`infinity` is correct for it), and the clock-dependent
+  input keywords `now` / `today` / `tomorrow` / `yesterday` are not handled.
 - **Rust PG server: `numeric` DIVISION is refused (`0A000`).** Add, subtract and
   multiply are exact with PostgreSQL's measured scale rules; division's result
   scale depends on the operands' weights (`1.5 / 3` is `0.50000000000000000000`,
@@ -4849,8 +4853,9 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   that oid with it
   (the binary decoder covers `numeric` / `date` / `time` / `timestamp` /
   arrays / ranges / multiranges; a type it does not have cannot be decoded into
-  one — what remains unhandled there is `uuid` / `inet` / `cidr` / `bytea` /
-  `json`, all of which are missing TYPES, not decoder gaps).
+  one — what remains unhandled there is `inet` / `cidr` / `bytea` / `json`,
+  all of which are missing TYPES, not decoder gaps; `uuid` shipped 2026-09-07
+  as a text-valued type, so its BINARY parameter form is the remaining gap).
 - **Rust PG server: a result column is only sent in the BINARY format when its
   type is one this server can encode exactly.** `bool`, `int2`/`int4`/`int8`,
   `float4`/`float8`, `text`/`varchar`/`bpchar`/`name`/`char`, `numeric` and
