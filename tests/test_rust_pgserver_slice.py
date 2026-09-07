@@ -455,6 +455,18 @@ def test_session_settings(home: Path) -> None:
         assert cur.fetchone()[0] == "ISO, MDY"
         assert cur.description[0].name == "DateStyle"
 
+        # Transaction GUCs psycopg reads to learn the connection's defaults.
+        # A single-node server with no 2PC reports these fixed values.
+        for name, want in (
+            ("max_prepared_transactions", "0"),
+            ("transaction_isolation", "read committed"),
+            ("default_transaction_isolation", "read committed"),
+            ("transaction_deferrable", "off"),
+            ("default_transaction_read_only", "off"),
+        ):
+            cur.execute(f"SHOW {name}")
+            assert cur.fetchone()[0] == want, name
+
         cur.execute("SET my.x = '7'")
         assert cur.statusmessage == "SET"
         cur.execute("SELECT current_setting('my.x')")
