@@ -31,6 +31,7 @@ from secantus.expressions import (
     _object_keys_problem,
     _ranged_arity_problem,
     _set_eq,
+    check_required_fields,
     evaluate,
     evaluate_or_missing,
     is_constant_expression,
@@ -297,6 +298,22 @@ _EXPR_SPEC_STAGES = frozenset({"$redact", "$replaceWith", "$sortByCount"})
 _EXPR_MAP_STAGES = frozenset({"$project", "$addFields", "$set", "$group"})
 
 
+def _missing_required_field_problem(op: str, arg: Any) -> tuple[int, str] | None:
+    """A required argument the operator's document form omits.
+
+    mongod checks this at PARSE time like the arity and shape rules above, so it
+    carries the STAGE wrapper (`Invalid $addFields :: caused by ::`) rather than
+    the optimizer's. Reported here so both live in one traversal; the evaluator
+    keeps its own copy of the check for the paths that reach it directly
+    (`$group`, a bare `evaluate()` call), where mongod sends the message bare.
+    """
+    try:
+        check_required_fields(op, arg)
+    except ExpressionError as exc:
+        return (exc.code, str(exc))
+    return None
+
+
 def _expression_problem(expr: Any, bound: frozenset[str]) -> tuple[int, str] | None:
     """The first problem in ``expr`` that mongod reports at PARSE time.
 
@@ -334,6 +351,7 @@ def _expression_problem(expr: Any, bound: frozenset[str]) -> tuple[int, str] | N
             or _ranged_arity_problem(op, arg)
             or _object_arg_problem(op, arg)
             or _object_keys_problem(op, arg)
+            or _missing_required_field_problem(op, arg)
         )
         if found:
             return found

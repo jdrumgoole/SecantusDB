@@ -2171,10 +2171,16 @@ all still open. Probe: `scratchpad/readsweep.py` + `readsweep_lib.py`.
   with the precedence backwards traded 20 fixed cases for 20 broken ones at an
   unchanged total, which is exactly the failure a raw count hides.
 
-  57 required-field cases at 0 divergences; the 6,628-case expression corpus
+  **BOTH servers had this, and the PYTHON one was worse** -- 31 of its 57 cases
+  silently wrong against the Rust server's 25. It surfaced only because fixing
+  Rust turned `test_rust_expressions_parity::test_zip_fuzz` RED: parity is
+  equally satisfied by both engines being wrong, and here they had been. Fixed
+  in both; the Python side reports through `aggregate.py`'s existing parse-time
+  scanner, which already carried mongod's `Invalid $<stage>` wrapper.
+
+  Both servers now 0 divergences of 57; the 6,628-case expression corpus
   improves 58 -> 38 different-code, 0 wrong values, no regressions. Pinned by
-  `tests/test_rust_required_expression_args.py` and
-  `scratchpad/reqfields.py`.
+  `tests/test_rust_required_expression_args.py` and `scratchpad/reqfields.py`.
 
 - [ ] **OPEN: `$group` on the RUST server DISCARDS every mongod-named error and
   answers the generic refusal (found 2026-09-07 while fixing the required-field

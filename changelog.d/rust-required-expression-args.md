@@ -1,10 +1,15 @@
-### The Rust server answered a value where mongod rejects the expression
+### BOTH servers answered a value where mongod rejects the expression
 
 `{$regexMatch: {}}` returned **`false`**. `{$filter: {}}` returned `null`. So did
-`{$trim: {}}`, `{$reduce: {}}`, `{$map: {}}` and `{$dateAdd: {}}` — twenty-five
-cases in all where an operator was missing a REQUIRED argument and the server
-answered a value a caller can branch on, from an expression mongod refuses to
-run at all.
+`{$trim: {}}`, `{$reduce: {}}`, `{$map: {}}` and `{$dateAdd: {}}` — cases where an
+operator was missing a REQUIRED argument and the server answered a value a caller
+can branch on, from an expression mongod refuses to run at all.
+
+**Both servers had it**, and the PYTHON one was worse: 31 of its 57 cases were
+silently wrong against the Rust server's 25. That only came to light because the
+Rust fix turned the parity suite red — parity is equally satisfied by both
+engines being wrong, and here they had been. The fix moves both to mongod's
+answer rather than moving either to the other.
 
 The cause is the missing-vs-null conflation `CLAUDE.md` catalogues: the
 operators read their required fields with the evaluator's optional-field helper,
@@ -39,9 +44,11 @@ Rust server`, which blamed the operator when the argument was at fault.
 
 #### Measured
 
-57 required-field cases at **0 divergences** (from 57, twenty-five of them
-silently wrong), and the 6,628-case expression corpus improves from 58
-different-code divergences to **38**, with 0 wrong values and no regressions.
+Both servers at **0 divergences of 57** — from 57 with 25 silently wrong (Rust)
+and 57 with 31 silently wrong (Python). The 6,628-case expression corpus improves
+from 58 different-code divergences to **38**, with 0 wrong values and no
+regressions. Parity: 730 tests, and the `$zip` fuzz now asserts that a named
+error matches between engines rather than tripping over one.
 
 #### Fixed
 
@@ -51,6 +58,9 @@ different-code divergences to **38**, with 0 wrong values and no regressions.
   bypasses `apply_op`) validates too.
 - `secantus-commands`: `validate_stage_expr_args` applies mongod's per-stage
   wrapper at parse time.
+- `secantus` (the PYTHON server): the same table in `expressions.py`, reported
+  through `aggregate.py`'s existing parse-time scanner so it picks up the
+  `Invalid $<stage> :: caused by ::` wrapper that machinery already knew about.
 
 #### Known gap
 

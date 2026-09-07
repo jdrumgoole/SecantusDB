@@ -135,6 +135,11 @@ def _eval_field_value(expr: Any, ctx: _Ctx) -> Any:
         op, arg = next(iter(expr.items()))
         propagating = _MISSING_PROPAGATING.get(op)
         if propagating is not None:
+            # This dispatch bypasses `_apply_op`, so it bypassed its
+            # required-field validation with it: `{$cond: {}}` reached
+            # `_op_cond`, found no `if`, and answered a VALUE for an expression
+            # mongod rejects.
+            check_required_fields(op, arg)
             return propagating(arg, ctx, _eval_field_value)
     return _eval(expr, ctx)
 
@@ -492,6 +497,148 @@ def _arity_problem(op: str, arg: Any) -> tuple[int, str] | None:
     )
 
 
+# mongod's missing-required-argument errors for the document-form operators.
+#
+# Measured against mongod 8.2.11 on 2026-09-07 by starting from a VALID argument
+# document and dropping one field at a time (57 cases). Every code and wording is
+# a measurement -- they are not derivable from a pattern, which is why this is a
+# table: ``$filter`` says "Missing 'input' parameter to $filter" (28648) where
+# ``$reduce`` says "$reduce requires 'input' to be specified" (40077).
+#
+# MISSING is not NULL, and the distinction is the whole point:
+# ``{$trim: {input: None}}`` is LEGAL and yields null, and
+# ``{$regexMatch: {input: None, regex: "a"}}`` is legal and yields false. Only an
+# ABSENT key is an error, so this checks key presence and never the value.
+# Reading a missing field as null is what made 31 of those 57 cases answer a
+# wrong VALUE instead of erroring.
+_REQUIRED_FIELDS: dict[str, tuple[tuple[str, int, str], ...]] = {
+    "$trim": (("input", 50695, "$trim requires an 'input' field"),),
+    "$ltrim": (("input", 50695, "$ltrim requires an 'input' field"),),
+    "$rtrim": (("input", 50695, "$rtrim requires an 'input' field"),),
+    "$regexFind": (
+        ("input", 31022, "$regexFind requires 'input' parameter"),
+        ("regex", 31023, "$regexFind requires 'regex' parameter"),
+    ),
+    "$regexFindAll": (
+        ("input", 31022, "$regexFindAll requires 'input' parameter"),
+        ("regex", 31023, "$regexFindAll requires 'regex' parameter"),
+    ),
+    "$regexMatch": (
+        ("input", 31022, "$regexMatch requires 'input' parameter"),
+        ("regex", 31023, "$regexMatch requires 'regex' parameter"),
+    ),
+    "$reduce": (
+        ("input", 40077, "$reduce requires 'input' to be specified"),
+        ("initialValue", 40078, "$reduce requires 'initialValue' to be specified"),
+        ("in", 40079, "$reduce requires 'in' to be specified"),
+    ),
+    "$filter": (
+        ("input", 28648, "Missing 'input' parameter to $filter"),
+        ("cond", 28650, "Missing 'cond' parameter to $filter"),
+    ),
+    "$map": (
+        ("input", 16880, "Missing 'input' parameter to $map"),
+        ("in", 16882, "Missing 'in' parameter to $map"),
+    ),
+    "$replaceAll": (
+        ("input", 51749, "$replaceAll requires 'input' to be specified"),
+        ("find", 51748, "$replaceAll requires 'find' to be specified"),
+        ("replacement", 51747, "$replaceAll requires 'replacement' to be specified"),
+    ),
+    "$replaceOne": (
+        ("input", 51749, "$replaceOne requires 'input' to be specified"),
+        ("find", 51748, "$replaceOne requires 'find' to be specified"),
+        ("replacement", 51747, "$replaceOne requires 'replacement' to be specified"),
+    ),
+    "$setField": (
+        ("field", 4161102, "$setField requires 'field' to be specified"),
+        ("input", 4161109, "$setField requires 'input' to be specified"),
+        ("value", 4161103, "$setField requires 'value' to be specified"),
+    ),
+    "$sortArray": (
+        ("input", 2942502, "$sortArray requires 'input' to be specified"),
+        ("sortBy", 2942503, "$sortArray requires 'sortBy' to be specified"),
+    ),
+    "$dateToString": (("date", 18628, "Missing 'date' parameter to $dateToString"),),
+    "$cond": (
+        ("if", 17080, "Missing 'if' parameter to $cond"),
+        ("then", 17081, "Missing 'then' parameter to $cond"),
+        ("else", 17082, "Missing 'else' parameter to $cond"),
+    ),
+    "$let": (
+        ("vars", 16876, "Missing 'vars' parameter to $let"),
+        ("in", 16877, "Missing 'in' parameter to $let"),
+    ),
+}
+
+# Required field must also be a NON-EMPTY array; mongod gives the same code for
+# "absent" and "present but empty".
+_REQUIRED_NON_EMPTY: dict[str, tuple[str, int, str]] = {
+    "$switch": ("branches", 40068, "$switch requires at least one branch"),
+    "$zip": ("inputs", 34465, "$zip requires at least one input array"),
+}
+
+# ``$dateAdd`` / ``$dateSubtract`` name all three fields in ONE message whichever
+# is missing, so they cannot use the per-field table.
+_DATE_ARITH_FIELDS = ("startDate", "unit", "amount")
+
+# The keys each operator ACCEPTS. Used only as a GATE, never to raise: mongod
+# reports an UNKNOWN argument in preference to a missing required one --
+# ``{$trim: {k: 1}}`` is 50694, and so is ``{$trim: {input: "a", k: 1}}``. The
+# operator implementations already emit those, so the required-field check stands
+# aside whenever a key is unrecognised.
+_ALLOWED_FIELDS: dict[str, frozenset[str]] = {
+    "$trim": frozenset({"input", "chars"}),
+    "$ltrim": frozenset({"input", "chars"}),
+    "$rtrim": frozenset({"input", "chars"}),
+    "$regexFind": frozenset({"input", "regex", "options"}),
+    "$regexFindAll": frozenset({"input", "regex", "options"}),
+    "$regexMatch": frozenset({"input", "regex", "options"}),
+    "$reduce": frozenset({"input", "initialValue", "in"}),
+    "$filter": frozenset({"input", "cond", "as", "limit"}),
+    "$map": frozenset({"input", "as", "in"}),
+    "$replaceAll": frozenset({"input", "find", "replacement"}),
+    "$replaceOne": frozenset({"input", "find", "replacement"}),
+    "$setField": frozenset({"field", "input", "value"}),
+    "$sortArray": frozenset({"input", "sortBy"}),
+    "$dateToString": frozenset({"date", "format", "timezone", "onNull"}),
+    "$cond": frozenset({"if", "then", "else"}),
+    "$let": frozenset({"vars", "in"}),
+    "$switch": frozenset({"branches", "default"}),
+    "$zip": frozenset({"inputs", "useLongestLength", "defaults"}),
+    "$dateAdd": frozenset({"startDate", "unit", "amount", "timezone"}),
+    "$dateSubtract": frozenset({"startDate", "unit", "amount", "timezone"}),
+}
+
+
+def check_required_fields(op: str, arg: Any) -> None:
+    """Raise mongod's error when ``arg`` omits a field ``op`` requires.
+
+    A no-op for every operator not in the tables, and for a non-document
+    argument (the array / scalar forms are a different parse).
+    """
+    if not isinstance(arg, Mapping):
+        return
+    allowed = _ALLOWED_FIELDS.get(op)
+    if allowed is not None and not all(k in allowed for k in arg):
+        return  # an unrecognised key outranks a missing one; its own check owns it
+    for name, code, message in _REQUIRED_FIELDS.get(op, ()):
+        if name not in arg:
+            raise ExpressionError(message, code=code, code_name=f"Location{code}")
+    non_empty = _REQUIRED_NON_EMPTY.get(op)
+    if non_empty is not None:
+        name, code, message = non_empty
+        value = arg.get(name)
+        if name not in arg or (isinstance(value, list) and not value):
+            raise ExpressionError(message, code=code, code_name=f"Location{code}")
+    if op in ("$dateAdd", "$dateSubtract") and any(f not in arg for f in _DATE_ARITH_FIELDS):
+        raise ExpressionError(
+            f"{op} requires startDate, unit, and amount to be present",
+            code=5166402,
+            code_name="Location5166402",
+        )
+
+
 def _apply_op(op: str, arg: Any, ctx: _Ctx) -> Any:
     if op == "$literal":
         return arg
@@ -520,6 +667,9 @@ def _apply_op(op: str, arg: Any, ctx: _Ctx) -> Any:
     handler = _OPS.get(op)
     if handler is None:
         raise UnknownExpressionOperatorError(op)
+    # mongod validates an argument document's required fields BEFORE evaluating
+    # anything, so a missing field is an error even when the rest would not run.
+    check_required_fields(op, arg)
     return handler(arg, ctx)
 
 
