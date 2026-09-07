@@ -4805,6 +4805,27 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   first (unblocks the shape), then the aggregate-subquery materialisation.
   `test_composite.py` (78) is gated on this. Do NOT re-scope as one batch.
 
+  **Precise 3-gap decomposition (probed 2026-09-07, no code written):** the
+  catalog is ready (`pg_type` gives the composite oid + typrelid; `pg_attribute`
+  exposes `(attrelid=typrelid, attname, atttypid, attnum, attisdropped)`;
+  `array_agg` + GROUP BY + subquery-in-FROM + aggregate-over-a-subquery-join all
+  exist). Three planner extensions remain, build as SEPARATE batches in order:
+  1. **Multi-predicate subquery WHERE** — the inner `WHERE t.oid=$1 AND
+     a.attnum>0 AND NOT a.attisdropped` fails `0A000 this subquery WHERE is not
+     supported yet`; `JoinSelect.filter` carries only ONE `(alias,col,value)`
+     equality, needs an AND of equality + `>` + `NOT <bool>`. Independently
+     useful; lowest risk; do first.
+  2. **Subquery as a JOIN side** — `pg_type t LEFT JOIN (SELECT …) a` fails
+     `0A000 this JOIN side` (`plan_join_select`'s `side()` at lib.rs:~1582 takes
+     only `N::RangeVar`, not `N::RangeSubselect`). Requires changing
+     `JoinSelect.left`/`right` from `(table, alias)` to allow a materialised
+     subquery side + updating `join_docs`/`table_docs` — **800+ differential join
+     tests at risk**, so this is the risky middle batch; guard with the full
+     differential run.
+  3. **`coalesce(a.fnames, '{}')`** — a LEFT-JOIN miss yields NULL → empty array.
+  Composite VALUE round-trip (register_composite of a value) is a SEPARATE later
+  piece after fetch works.
+
 - **Rust PG server: record FUNCTIONS and field access are deferred (2026-09-07).**
   `ROW(...)` / `(a, b, ...)` construction, the `::text` render, and the
   `=`/`<>`/`<`/`<=`/`>`/`>=` record comparison operators all work now (oid 2249,
