@@ -4804,6 +4804,13 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `pg_attribute` carries composites). Decompose into: subquery-as-join-side
   first (unblocks the shape), then the aggregate-subquery materialisation.
   `test_composite.py` (78) is gated on this. Do NOT re-scope as one batch.
+
+- **Rust PG server: record FUNCTIONS and field access are deferred (2026-09-07).**
+  `ROW(...)` / `(a, b, ...)` construction, the `::text` render, and the
+  `=`/`<>`/`<`/`<=`/`>`/`>=` record comparison operators all work now (oid 2249,
+  psycopg decodes to a tuple). Still unimplemented: `row_to_json(...)` and other
+  record-consuming functions, NAMED composite construction (`ROW(...)::mytype`
+  beyond a bare-record no-op), and field access `(ROW(1,2)).f1`.
 - **Rust PG server: a WHERE clause over `generate_series` is refused (`0A000`),
   and it is the only set-returning function.** The filter language is built
   against stored columns; applying one to generated rows needs an in-memory

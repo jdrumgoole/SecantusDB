@@ -3062,3 +3062,37 @@ def test_a_composite_created_by_one_server_is_the_others_too(home: Path) -> None
         cur = conn.cursor()
         cur.execute("select attname from pg_attribute where attrelid = to_regtype('pycomp')")
         assert cur.fetchall() == [("c",)]
+
+
+def test_row_expressions_are_records(home: Path) -> None:
+    """`ROW(...)` / `(a, b, ...)` build an anonymous record (oid 2249).
+
+    psycopg decodes a record's text form to a tuple of strings. The text render
+    follows PostgreSQL's composite rules -- a NULL field is empty, a field with
+    a comma/quote/space is double-quoted, and a bool prints `t`/`f` -- and
+    record comparison is three-valued (a NULL field before a decision is NULL).
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT ROW(1, 'a', true)")
+        assert cur.fetchone()[0] == ("1", "a", "t")
+        assert cur.description[0].type_code == 2249
+
+        cur.execute("SELECT (1, 'a')")
+        assert cur.fetchone()[0] == ("1", "a")
+
+        # Text render with quoting and NULL-as-empty.
+        cur.execute("SELECT ROW('a,b', 'c')::text, ROW(1, NULL, 3)::text, ROW('')::text")
+        assert cur.fetchone() == ('("a,b",c)', "(1,,3)", '("")')
+
+        # Comparison, including three-valued NULL.
+        cur.execute("SELECT ROW(1, 2) = ROW(1, 2), ROW(1, 2) < ROW(1, 3)")
+        assert cur.fetchone() == (True, True)
+        cur.execute("SELECT ROW(1, NULL) = ROW(1, NULL), ROW(1, 2) < ROW(1, NULL)")
+        assert cur.fetchone() == (None, None)
+        # A decided inequality wins over a later NULL (= examines every pair).
+        cur.execute("SELECT ROW(1, NULL, 3) = ROW(1, 2, 4)")
+        assert cur.fetchone()[0] is False
+
+        cur.execute("SELECT pg_typeof(ROW(1, 2))::text")
+        assert cur.fetchone()[0] == "record"

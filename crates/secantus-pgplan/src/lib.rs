@@ -2105,6 +2105,7 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             func_name(f).unwrap_or_default()
         }
         // These pick one of their arguments, so they report its type.
+        Some(N::RowExpr(_)) => "record".to_string(),
         Some(N::CoalesceExpr(_)) | Some(N::MinMaxExpr(_)) => inferred_type(value).to_string(),
         Some(N::AExpr(e)) => {
             // `NULLIF` is an operator node whose operator is `=`, but it
@@ -2559,6 +2560,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 | N::TypeCast(_)
                 | N::AExpr(_)
                 | N::AArrayExpr(_)
+                | N::RowExpr(_)
                 | N::CoalesceExpr(_)
                 | N::MinMaxExpr(_)),
             ) => {
@@ -2857,6 +2859,125 @@ pub(crate) fn regtype_value(oid: i64) -> Bson {
     let mut d = Document::new();
     d.insert(REGTYPE_KEY, Bson::Int64(oid));
     Bson::Document(d)
+}
+
+/// The tag key of an anonymous record value.
+pub const RECORD_KEY: &str = "__record";
+
+/// An anonymous record (`ROW(...)` / `(a, b, ...)`): an ORDERED field list,
+/// tagged so it is distinct from an array (`{...}`) and from any other
+/// document. Rendered as `(a,b,...)` and reported as oid 2249.
+pub(crate) fn record_value(fields: Vec<Bson>) -> Bson {
+    let mut d = Document::new();
+    d.insert(RECORD_KEY, Bson::Array(fields));
+    Bson::Document(d)
+}
+
+/// The field list inside a record value, or `None` for any other value.
+pub(crate) fn record_fields(v: &Bson) -> Option<&Vec<Bson>> {
+    match v {
+        Bson::Document(d) if d.len() == 1 => match d.get(RECORD_KEY) {
+            Some(Bson::Array(items)) => Some(items),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A record's PostgreSQL text: `(f1,f2,...)`. A NULL field is empty; a field is
+/// double-quoted (with `"`->`""` and `\`->`\\`) when it is empty or contains
+/// a comma, parenthesis, quote, backslash or whitespace.
+pub(crate) fn record_text(fields: &[Bson]) -> String {
+    let mut out = String::from("(");
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        if *f == Bson::Null {
+            continue;
+        }
+        // A record field uses the type's OUTPUT function, not its `::text`
+        // cast: a bool prints `t`/`f` inside a record, not `true`/`false`.
+        let field = match f {
+            Bson::Boolean(b) => (if *b { "t" } else { "f" }).to_string(),
+            _ => render_value_text(f),
+        };
+        let needs_quote = field.is_empty()
+            || field
+                .chars()
+                .any(|c| matches!(c, ',' | '(' | ')' | '"' | '\\') || c.is_whitespace());
+        if needs_quote {
+            out.push('"');
+            for c in field.chars() {
+                if c == '"' || c == '\\' {
+                    out.push(c);
+                }
+                out.push(c);
+            }
+            out.push('"');
+        } else {
+            out.push_str(&field);
+        }
+    }
+    out.push(')');
+    out
+}
+
+/// Compare two records with PostgreSQL's three-valued rules, which DIFFER by
+/// operator: `=`/`<>` examine every pair (a non-null unequal pair decides,
+/// else a null makes the result null), while the ordering operators
+/// short-circuit left to right (a null in an earlier field is null overall).
+fn record_compare(op: &str, a: &[Bson], b: &[Bson]) -> Result<Bson> {
+    use std::cmp::Ordering;
+    let cmp_pair = |x: &Bson, y: &Bson| -> Result<Ordering> {
+        compare_constants(x, y).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "comparing {} with {} using {op}",
+                bson_kind(x),
+                bson_kind(y)
+            ))
+        })
+    };
+    if matches!(op, "=" | "<>" | "!=") {
+        let mut saw_null = false;
+        for (x, y) in a.iter().zip(b.iter()) {
+            if *x == Bson::Null || *y == Bson::Null {
+                saw_null = true;
+                continue;
+            }
+            if cmp_pair(x, y)? != Ordering::Equal {
+                return Ok(Bson::Boolean(op != "="));
+            }
+        }
+        if a.len() != b.len() {
+            return Ok(Bson::Boolean(op != "="));
+        }
+        if saw_null {
+            return Ok(Bson::Null);
+        }
+        return Ok(Bson::Boolean(op == "="));
+    }
+    for (x, y) in a.iter().zip(b.iter()) {
+        if *x == Bson::Null || *y == Bson::Null {
+            return Ok(Bson::Null);
+        }
+        match cmp_pair(x, y)? {
+            Ordering::Equal => continue,
+            ord => return Ok(Bson::Boolean(decide_ord(op, ord))),
+        }
+    }
+    Ok(Bson::Boolean(decide_ord(op, a.len().cmp(&b.len()))))
+}
+
+fn decide_ord(op: &str, ord: std::cmp::Ordering) -> bool {
+    use std::cmp::Ordering::{Greater, Less};
+    match op {
+        "<" => ord == Less,
+        "<=" => ord != Greater,
+        ">" => ord == Greater,
+        ">=" => ord != Less,
+        _ => false,
+    }
 }
 
 /// The oid inside a regtype value, or `None` for any other value.
@@ -4154,6 +4275,12 @@ pub fn value_text(v: &Bson) -> String {
     render_value_text(v)
 }
 
+/// The `(...)` text of an anonymous record value, or `None` for any other
+/// value -- the wire layer renders a record in the text format through this.
+pub fn record_value_text(v: &Bson) -> Option<String> {
+    record_fields(v).map(|f| record_text(f))
+}
+
 pub(crate) fn render_value_text(v: &Bson) -> String {
     match cast_value(v.clone(), "text") {
         Ok(Bson::String(s)) => s,
@@ -4185,6 +4312,15 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             "text" | "varchar" | "name" | "bpchar" => Ok(Bson::String(regtype_text(oid))),
             "int4" | "int8" | "oid" | "integer" | "int" | "bigint" => Ok(Bson::Int64(oid)),
             _ => Err(Error::Unsupported(format!("a regtype cast to {target}"))),
+        };
+    }
+    // An anonymous record renders to text as `(f1,f2,...)`; a cast to record is
+    // a no-op. Other targets are not defined for a bare record.
+    if let Some(fields) = record_fields(&value) {
+        return match target {
+            "text" | "varchar" | "bpchar" | "name" => Ok(Bson::String(record_text(fields))),
+            "record" => Ok(record_value(fields.clone())),
+            _ => Err(Error::Unsupported(format!("a record cast to {target}"))),
         };
     }
     // `oid` is an UNSIGNED 32-bit integer: a negative literal wraps
@@ -4978,6 +5114,11 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     }
 
     if matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+        // Two records compare field by field with PostgreSQL's three-valued
+        // rules (see record_compare).
+        if let (Some(a), Some(b)) = (record_fields(&lhs), record_fields(&rhs)) {
+            return record_compare(op, a, b);
+        }
         // A scalar compared to an ARRAY with no ANY/ALL is an operator
         // PostgreSQL does not have (`text = text[]` is 42883). Array = array is
         // a real element-wise operator and stays; only a scalar/array MISMATCH
@@ -5939,6 +6080,16 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 Some(a_const::Val::Boolval(b)) => Ok(Bson::Boolean(b.boolval)),
                 _ => Err(Error::Unsupported("this constant".into())),
             }
+        }
+        // `ROW(...)` and the bare `(a, b, ...)` parenthesised list build an
+        // anonymous record; each field is any constant expression.
+        Some(N::RowExpr(r)) => {
+            let fields = r
+                .args
+                .iter()
+                .map(|a| const_value(a, params))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(record_value(fields))
         }
         Some(other) => Err(Error::Unsupported(disc(other))),
         None => Err(Error::Parse("empty constant".into())),
