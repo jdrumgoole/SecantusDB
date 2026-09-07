@@ -4600,6 +4600,15 @@ fn decode_parameter(
             }
             // `bytea` is raw bytes on the wire -- stored verbatim as Binary.
             Some(17) => Ok(secantus_pgplan::bytea::to_binary(bytes.to_vec())),
+            // `uuid` is 16 raw bytes on the wire -> canonical lowercase text
+            // (the same value the text path stores).
+            Some(2950) => secantus_pgplan::uuid_from_wire(bytes)
+                .map(Bson::String)
+                .ok_or_else(|| {
+                    PgHandler::err(&secantus_pgplan::Error::InvalidText(
+                        "invalid binary uuid value".into(),
+                    ))
+                }),
             // inet / cidr: PostgreSQL's [family,bits,is_cidr,nb,addr] layout,
             // decoded back to the canonical addr/masklen text the store holds.
             Some(869) | Some(650) => secantus_pgplan::net::from_wire(bytes)

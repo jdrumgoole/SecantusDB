@@ -4764,6 +4764,22 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     }
 }
 
+/// A UUID from its 16-byte BINARY wire form -> canonical lowercase text.
+pub fn uuid_from_wire(bytes: &[u8]) -> Option<String> {
+    if bytes.len() != 16 {
+        return None;
+    }
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
+}
+
 /// Parse a UUID the way PostgreSQL's `uuid_in` does and return its canonical
 /// lowercase `8-4-4-4-12` text. Optional surrounding braces, and a hyphen is
 /// tolerated only at the four standard group boundaries (after 8, 12, 16 and
