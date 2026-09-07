@@ -2073,6 +2073,10 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                 }
             }
             match common {
+                // A multidimensional array keeps the SAME array type -- a 2-D
+                // int array is `int4[]` (oid 1007), not `int4[][]` (which is no
+                // type name at all and fell back to varchar).
+                Some(t) if t.ends_with("[]") => t,
                 Some(t) => format!("{t}[]"),
                 None => inferred_type(value).to_string(),
             }
@@ -4008,6 +4012,27 @@ pub fn render_array(items: &[Bson]) -> String {
 ///
 /// Handles quoting and nesting; a malformed literal is `22P02`, matching what
 /// PostgreSQL answers for text that is not a valid array.
+/// PostgreSQL requires a multidimensional array to be RECTANGULAR: every
+/// sibling sub-array shares one length, and an element is never a mix of array
+/// and scalar. Returns false for a ragged or mixed nesting.
+fn array_rectangular(items: &[Bson]) -> bool {
+    let subs: Vec<&Vec<Bson>> = items
+        .iter()
+        .filter_map(|x| match x {
+            Bson::Array(a) => Some(a),
+            _ => None,
+        })
+        .collect();
+    if subs.is_empty() {
+        return true; // a flat row of scalars
+    }
+    if subs.len() != items.len() {
+        return false; // a mix of array and scalar elements
+    }
+    let len0 = subs[0].len();
+    subs.iter().all(|a| a.len() == len0) && subs.iter().all(|a| array_rectangular(a))
+}
+
 fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
     let t = text.trim();
     if !t.starts_with('{') || !t.ends_with('}') {
@@ -4060,6 +4085,11 @@ fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
         )));
     }
     items.push(array_element(&cur, was_quoted, element_type)?);
+    if !array_rectangular(&items) {
+        return Err(Error::InvalidText(format!(
+            "malformed array literal: \"{t}\""
+        )));
+    }
     Ok(Bson::Array(items))
 }
 
@@ -4322,7 +4352,16 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
                 Bson::Array(items) => Ok(Bson::Array(
                     items
                         .iter()
-                        .map(|v| cast_value(v.clone(), element))
+                        .map(|v| {
+                            // A multidimensional array: an element that is
+                            // itself an array casts to the SAME array type
+                            // (recurse), not to the scalar element type.
+                            if matches!(v, Bson::Array(_)) {
+                                cast_value(v.clone(), t)
+                            } else {
+                                cast_value(v.clone(), element)
+                            }
+                        })
                         .collect::<Result<Vec<_>>>()?,
                 )),
                 Bson::String(text) => parse_array(text, element),
@@ -5789,6 +5828,12 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             .iter()
             .map(|e| const_value(e, params))
             .collect::<Result<Vec<_>>>()?;
+        if !array_rectangular(&items) {
+            return Err(Error::ArraySubscript(
+                "multidimensional arrays must have array expressions with matching dimensions"
+                    .into(),
+            ));
+        }
         return Ok(Bson::Array(items));
     }
     if let Some(N::AExpr(e)) = node.node.as_ref() {

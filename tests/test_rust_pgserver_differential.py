@@ -429,6 +429,13 @@ QUERIES = [
     # written by analogy with the scalar path.
     "SELECT ARRAY[1,2,3]::int[]",
     "SELECT ARRAY['a','b']::text[]",
+    # Multidimensional arrays: nested constructors and text literals
+    # reconstruct the nested value with the array oid (1007), not varchar.
+    "SELECT ARRAY[[1,2],[3,4]]",
+    "SELECT ARRAY[[[1,2]],[[3,4]]]",
+    "SELECT ARRAY[[1,NULL],[3,4]]::int[]",
+    "SELECT '{{1,2},{3,4}}'::int[]",
+    "SELECT ARRAY[['a','b'],['c','d']]",
     "SELECT '{}'::text[]",
     "SELECT '{1,2,3}'::int[]",
     "SELECT '{foo,\"bar baz\",qux}'::text[]",
