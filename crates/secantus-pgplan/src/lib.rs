@@ -5165,6 +5165,9 @@ pub fn compare_values(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
 pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Bson::String(x), Bson::String(y)) => Some(x.cmp(y)),
+        // `bytea` orders by UNSIGNED byte value, lexicographically -- exactly
+        // what `Vec<u8>` gives -- so `'\\x01' < '\\x02'` and a prefix sorts first.
+        (Bson::Binary(x), Bson::Binary(y)) => Some(x.bytes.cmp(&y.bytes)),
         // PostgreSQL orders arrays element by element, and when one is a
         // prefix of the other the shorter one sorts first.
         (Bson::Array(x), Bson::Array(y)) => {
