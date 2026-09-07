@@ -5305,6 +5305,60 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   form — its own measurement campaign, for an error message whose code is
   already right.
 
+- [x] **The RUST server was swept for CHANGE STREAMS and matches mongod
+  (2026-09-07): 0 of 41 cases diverge, field order included.** This surface had
+  never been measured against the Rust server, and it is the one CLAUDE.md
+  singles out as having sat outside every differential run until someone stood
+  up a replica set — at which point 14 of 41 diverged immediately. It is clean
+  now: `tools/probes/change_streams.py` with `PROBE_MONGOD` on a real
+  `--replSet` mongod 8.2.11 and `PROBE_SERVER` on an embedded Rust server.
+
+  **The first run reported 41 of 41 diverging and was a HARNESS artifact.**
+  `RustServer`'s `replica_set_name` defaults to `None`, so the server does not
+  advertise `setName` in `hello` and every case came back with the same
+  `40573 The $changeStream stage is only supported on replica sets`. A UNIFORM
+  error across every case is the tell — construct the handle as
+  `RustServer(port=0, storage_path=…, replica_set_name="secantus")` and verify
+  `hello().setName` before believing any number from this probe.
+
+- [x] **The pymongo conformance gauge was run against the RUST server
+  (2026-09-07): 1277 passed / 5 failed, 99.61%.** The Python server on the same
+  corpus is 1276 / 6, 99.53%. **No test fails on rust that does not also fail on
+  python** — the Rust server's failure set is exactly the five known-standing
+  ones (`test_index_hashed`, `test_index_text`, `test_where`, all out of scope;
+  `test_maxtime_ms_message` / `test_to_list_csot_applied`, pymongo's
+  client-side CSOT formatting). Verify the selector took effect by reading
+  `serverStatus.secantus` — a silently-ignored `SECANTUS_GAUGE_SERVER` gives
+  two identical runs that read as agreement.
+
+- [ ] **The pymongo gauge runs the two servers against DIFFERENT `bson`
+  versions, so their numbers are not strictly comparable (2026-09-07).**
+  Measured while sweeping the Rust server: rust mode imports
+  `vendor/pymongo-tests/bson`, python mode imports **site-packages** `bson`
+  (from the installed pymongo). The cause is import ORDER, not configuration —
+  in python mode `pymongo_validation/plugin.py` does
+  `from secantus import SecantusDBServer` at `pytest_load_initial_conftests`,
+  and `secantus` imports `bson` before `vendor/pymongo-tests` reaches
+  `sys.path`, so the name binds to site-packages. In rust mode
+  `_secantus_server` is a compiled extension that never imports Python `bson`,
+  so `bson` resolves later to the vendored copy.
+
+  It moved exactly ONE result on 2026-09-07 —
+  `test_default_exports::test_bson` fails on python and passes on rust, because
+  the vendored `bson` takes `Generator` from `typing` (which the test skips) and
+  site-packages `bson` takes it from `collections.abc` (which it does not). So
+  the python server currently shows one EXTRA failure that is not a server
+  defect at all.
+
+  Worth fixing because the gauge is the project's headline compatibility
+  number and a cross-server comparison is exactly what it gets used for; a
+  one-test artifact today is a systematically wrong comparison tomorrow. The
+  fix is to put `vendor/pymongo-tests` on `sys.path` before the plugin imports
+  `secantus`, or to import the server lazily.
+
+  Same family as the "probes lie in specific, repeatable ways" entries: a
+  harness difference that reads as a server difference.
+
 - [ ] **STILL OPEN: `Decimal128` FINITE operands in the transcendentals.** The
   Rust engine defers `$sqrt(Decimal128("2.5"))` and the rest of the family;
   mongod answers `1.581138830084189665999446772216359`. This is the genuine
