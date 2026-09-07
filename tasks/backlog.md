@@ -5217,34 +5217,38 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   by `tests/test_rust_explain_parsed_query.py` (36 cases, registered in the
   storage-engine CI lane).
 
-- [ ] **OPEN: the Rust server's `explain` `winningPlan` plan-node FIELDS.**
-  Measured 2026-09-07 with the Rust server built from `main`:
+- [x] **RESOLVED (2026-09-07): the Rust server's `explain` plan-node FIELDS.**
+  `IXSCAN` now carries mongod's nine keys in mongod's order (`keyPattern`,
+  `indexName`, `isMultiKey`, `multiKeyPaths`, `isUnique`, `isSparse`,
+  `isPartial`, `indexVersion`, `direction`), `FETCH` carries only the RESIDUAL
+  filter and omits the key when the bounds cover the predicate, `COLLSCAN`
+  reports `direction` and omits an empty `filter`, and `isCached` leads the
+  outermost node. The IXSCAN node is now identical to the Python server's;
+  `winningPlan` went 25 of 25 divergent to 22 of 25. Pinned by
+  `tests/test_rust_explain_parsed_query.py`.
 
-  | server | parsedQuery | winningPlan |
+- [ ] **OPEN: the Rust server does not build the `explain` STAGE TREE.** The
+  remaining 22 of 25 are all this. mongod wraps the scan in the stages that
+  describe the query, and the Rust server reports the bare scan node:
+
+  | query | mongod | rust |
   | --- | --- | --- |
-  | python | 0 of 56 | 7 of 25 |
-  | rust (before) | 44 of 56 | 25 of 25 |
-  | rust (now) | **0 of 56** | 25 of 25 |
+  | `limit: 3` | `LIMIT` → `COLLSCAN` | `COLLSCAN` |
+  | `skip: 3` | `SKIP` → `COLLSCAN` | `COLLSCAN` |
+  | `limit: 3, skip: 2` | `LIMIT` → `SKIP` → `COLLSCAN` | `COLLSCAN` |
+  | `projection: {a: 1}` | `PROJECTION_SIMPLE` → `COLLSCAN` | `COLLSCAN` |
+  | `sort: {zzz: 1}` | `SORT` → `COLLSCAN` | `COLLSCAN` |
 
-  Python's 7 are its documented FLOOR, not a defect: four are `indexBounds`
-  (which this project deliberately does not reproduce, along with
-  `rejectedPlans` and the IDHACK / EXPRESS_IXSCAN / COUNT_SCAN / DISTINCT_SCAN
-  executors) and three are a genuine cost-model difference where mongod picks an
-  IXSCAN and we pick COLLSCAN + SORT — identical documents, different plan.
-
-  What the Rust server is missing, from the probe output:
-
-  - `COLLSCAN` needs `direction` and `isCached`, and must OMIT `filter` when
-    there is none (it currently emits an empty one);
-  - `IXSCAN` needs `indexVersion`, `isPartial`, `isSparse`, `isUnique` and
-    `multiKeyPaths` alongside the four it has;
-  - `FETCH` must carry only the RESIDUAL filter and omit the key when the
-    bounds cover the predicate;
-  - the `SORT` / `SKIP` / `LIMIT` / `PROJECTION_SIMPLE`|`PROJECTION_DEFAULT`
-    stage tree (`secantus.explain.build_stage_tree`) is not built at all.
-
-  The Python implementations are the reference for every one of these; the work
-  is plumbing the index metadata the Rust explain path does not currently carry.
+  `secantus.explain.build_stage_tree` is the reference and the nesting rules are
+  measured there (a blocking `SORT` ABSORBS the limit as `limitAmount`, counting
+  the skipped documents; `SKIP` sits above the scan; the projection above the
+  skip; an unabsorbed `LIMIT` outermost). The skip / limit / projection half
+  needs nothing new — they are all on the inner command. **The blocking-`SORT`
+  half needs a `sorted_by_index` flag, which `ExplainPlan::IxScan` does not
+  carry**: adding it means touching the enum in `crates/secantus-storage`,
+  `make_ixscan_plan`, and the `explain_plan` in `secantus-storage-adapter`.
+  The four remaining IXSCAN cases are `indexBounds`, which this project
+  deliberately does not reproduce, and are the Python server's floor too.
 
 - [ ] **STILL OPEN: `Decimal128` FINITE operands in the transcendentals.** The
   Rust engine defers `$sqrt(Decimal128("2.5"))` and the rest of the family;
