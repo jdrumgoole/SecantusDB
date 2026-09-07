@@ -54,7 +54,7 @@ pub use paths::{get_path, get_path_values, has_path};
 // mongod's two double renderings, needed by the command layer's stage
 // echo as well as by this crate's value messages. The module stays
 // private; only the two formatters are public.
-pub use explain::canonical_match;
+pub use explain::{build_stage_tree, canonical_match};
 pub use numeric::{format_double_g, format_double_spec};
 
 // Re-export the `$group` field-reference pushdown (only) so the command layer

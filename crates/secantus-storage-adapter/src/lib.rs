@@ -502,8 +502,10 @@ impl CmdStorage for StorageAdapter {
                 index_name,
                 key_pattern,
                 direction,
+                sorted_by_index,
             } => {
                 d.insert("kind", "IXSCAN");
+                d.insert("sortedByIndex", sorted_by_index);
                 d.insert(
                     "multikey",
                     self.inner.index_is_multikey(db, coll, &index_name),

@@ -66,6 +66,8 @@ fn ixscan(name: &str, dir: &str) -> ExplainPlan {
         index_name: name.to_string(),
         key_pattern: doc! {},
         direction: dir.to_string(),
+        // Not what this helper is about; `plan_dir` compares name + direction.
+        sorted_by_index: false,
     }
 }
 
@@ -329,6 +331,9 @@ fn explain_ixscan_key_pattern_shape() {
                 index_name: "a_1".into(),
                 key_pattern: doc! {"a": 1},
                 direction: "forward".into(),
+                // `a_1`'s leading field IS the sort field, so the walk already
+                // comes out in order and `explain` reports no blocking SORT.
+                sorted_by_index: true,
             }
         );
         let _ = ixscan("a_1", "forward"); // keep helper referenced

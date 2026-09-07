@@ -244,3 +244,89 @@ def test_plan_nodes_agree_with_the_python_server(indexed) -> None:
         {"filter": {"nope": 1}},
     ):
         assert _winning(rust_db, body) == _winning(py_db, body), body
+
+
+# --------------------------------------------------------------------------
+# The STAGE TREE.
+#
+# mongod wraps the scan in the stages that describe the rest of the query, and
+# the Rust server reported the bare scan node -- so `{filter: …, limit: 3}` came
+# back as a plain `COLLSCAN` where mongod reports a `LIMIT` above one. The most
+# useful consequence of getting this right: a client asking "is my sort served
+# by an index?" reads the answer off the presence of a blocking `SORT`, which
+# is the question `explain` is usually run to answer.
+#
+# The nesting is mongod's own and is NOT the order the command's fields are
+# written in (measured 8.2.11): a blocking `SORT` sits directly above the scan
+# and ABSORBS the limit; `SKIP` above that; the projection above the skip; an
+# unabsorbed `LIMIT` outermost.
+# --------------------------------------------------------------------------
+
+
+def _stages(plan: dict) -> list[str]:
+    out = []
+    node = plan
+    while isinstance(node, dict) and "stage" in node:
+        out.append(node["stage"])
+        node = node.get("inputStage")
+    return out
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ({"filter": {"nope": 1}}, ["COLLSCAN"]),
+        ({"filter": {"nope": 1}, "limit": 3}, ["LIMIT", "COLLSCAN"]),
+        ({"filter": {"nope": 1}, "skip": 3}, ["SKIP", "COLLSCAN"]),
+        ({"filter": {"nope": 1}, "limit": 3, "skip": 2}, ["LIMIT", "SKIP", "COLLSCAN"]),
+        ({"filter": {"nope": 1}, "projection": {"a": 1}}, ["PROJECTION_SIMPLE", "COLLSCAN"]),
+        ({"filter": {"nope": 1}, "projection": {"a.b": 1}}, ["PROJECTION_DEFAULT", "COLLSCAN"]),
+        ({"filter": {"nope": 1}, "sort": {"zzz": 1}}, ["SORT", "COLLSCAN"]),
+        # A blocking SORT absorbs the limit, so no separate LIMIT appears.
+        ({"filter": {"nope": 1}, "sort": {"zzz": 1}, "limit": 3}, ["SORT", "COLLSCAN"]),
+    ],
+)
+def test_the_stage_tree_is_mongods(dbs, body: dict, expected: list[str]) -> None:
+    rust_db, _ = dbs
+    assert _stages(_winning(rust_db, body)) == expected
+
+
+def test_a_blocking_sort_absorbs_the_limit_and_counts_the_skip(dbs) -> None:
+    """`limitAmount` on the SORT is `limit + skip`: the sort has to retain
+    everything the skip will later discard."""
+    rust_db, _ = dbs
+    plan = _winning(rust_db, {"filter": {"nope": 1}, "sort": {"zzz": 1}, "limit": 3, "skip": 2})
+    # SKIP sits ABOVE the sort, so the sort is not the outermost stage.
+    assert _stages(plan) == ["SKIP", "SORT", "COLLSCAN"]
+    sort_stage = plan["inputStage"]
+    assert sort_stage["limitAmount"] == 5
+    assert sort_stage["memLimit"] == 104857600
+    assert sort_stage["sortPattern"] == {"zzz": 1}
+    assert "LIMIT" not in _stages(plan)
+
+
+def test_a_sort_served_by_an_index_has_no_blocking_sort(indexed) -> None:
+    """The question `explain` is usually run to answer: an index that can serve
+    the sort means no blocking SORT stage."""
+    rust_db, py_db = indexed
+    served = _winning(rust_db, {"filter": {}, "sort": {"a": 1}, "hint": "a_1"})
+    assert "SORT" not in _stages(served)
+    unserved = _winning(rust_db, {"filter": {"nope": 1}, "sort": {"zzz": 1}})
+    assert _stages(unserved)[0] == "SORT"
+    # ...and the two servers agree about which is which.
+    assert _stages(served) == _stages(
+        _winning(py_db, {"filter": {}, "sort": {"a": 1}, "hint": "a_1"})
+    )
+
+
+def test_stage_trees_agree_with_the_python_server(dbs) -> None:
+    rust_db, py_db = dbs
+    for body in (
+        {"filter": {"nope": 1}, "limit": 3},
+        {"filter": {"nope": 1}, "skip": 3},
+        {"filter": {"nope": 1}, "limit": 3, "skip": 2},
+        {"filter": {"nope": 1}, "projection": {"a": 1}},
+        {"filter": {"nope": 1}, "sort": {"zzz": 1}},
+        {"filter": {"nope": 1}, "sort": {"zzz": 1}, "limit": 3, "skip": 2},
+    ):
+        assert _winning(rust_db, body) == _winning(py_db, body), body
