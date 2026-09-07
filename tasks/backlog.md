@@ -4854,6 +4854,12 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   cursor's schema is the one both `Describe` and `FETCH` report). Making it
   honour the FETCH's format means keeping the cursor's rows as VALUES and
   encoding per fetch, rather than materialising `DataRow`s once.
+- **Rust PG server: a bare boolean column in WHERE is unsupported (`0A000`
+  ColumnRef).** `WHERE attisdropped` and `WHERE NOT attisdropped` are how
+  PostgreSQL filters a bool column; `attisdropped = false` works. Needed by
+  `CompositeInfo.fetch`'s inner subquery (`AND NOT a.attisdropped`). lower_where
+  handles comparisons and BoolExpr(AND/OR/NOT of comparisons) but not a bare
+  ColumnRef or `NOT <ColumnRef>` as a truth test.
 - **Rust PG server: a multidimensional array sent as a BINARY parameter is
   refused (`0A000`)**, matching the refusal when returning one. Both lift
   together when array wire encoding grows a second dimension. The array LITERAL

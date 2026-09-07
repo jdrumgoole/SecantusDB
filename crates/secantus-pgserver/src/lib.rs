@@ -44,6 +44,9 @@ use secantus_pgplan::{
 };
 use secantus_storage::{Storage, UserTransactionHandle};
 
+/// A composite type's fields: `(field name, field type name)`, in order.
+type CompositeFields = Vec<(String, String)>;
+
 /// One database's worth of SQL over a shared `Storage`.
 pub struct PgHandler {
     storage: Arc<Storage>,
@@ -224,6 +227,8 @@ impl PgHandler {
     /// `{_id, enum, labels, oid}`; `__sql_enum_meta__` carries the monotonic
     /// counter; `typarray` is DERIVED as `oid + 100_000`, never stored.)
     const SCHEMA_COLLECTION: &'static str = "__sql_schemas__";
+    const COMPOSITE_COLLECTION: &'static str = "__sql_composites__";
+    const COMPOSITE_TYPE_OID_BASE: i64 = 67_000;
     const ENUM_COLLECTION: &'static str = "__sql_enums__";
     const ENUM_META_COLLECTION: &'static str = "__sql_enum_meta__";
     const ENUM_TYPE_OID_BASE: i64 = 65_000;
@@ -232,7 +237,12 @@ impl PgHandler {
     /// Hand the planner this database's user types, fresh from the store --
     /// which the other server may have written to since the last statement.
     fn install_user_types(&self) {
-        let types = self.enums().unwrap_or_default();
+        let mut types = self.enums().unwrap_or_default();
+        // Composites resolve by name too; they have no labels, so an empty
+        // label list stands in.
+        for (name, oid, _) in self.composites().unwrap_or_default() {
+            types.push((name, oid, Vec::new()));
+        }
         secantus_pgplan::set_user_types(types);
     }
 
@@ -463,6 +473,92 @@ impl PgHandler {
         Ok(())
     }
 
+    /// Every composite type: `(name, oid, [(field, type_name)])`, name-sorted.
+    /// The Python server's `__sql_composites__` shape: a doc `{composite, oid,
+    /// fields: [[name, tag, sub], ...]}`, where `tag` is the field's SQL type
+    /// name and `sub` is a nested composite's fields (unused here).
+    fn composites(&self) -> PgWireResult<Vec<(String, i64, CompositeFields)>> {
+        let raw = self
+            .storage
+            .find_matching(&self.db, Self::COMPOSITE_COLLECTION, &Document::new())
+            .map_err(|e| Self::storage_err("could not read the composite catalog", e))?;
+        let mut out = Vec::new();
+        for bytes in raw {
+            let d: Document = bson::from_slice(&bytes)
+                .map_err(|e| Self::storage_err("could not decode a composite", e))?;
+            let name = d.get_str("composite").unwrap_or_default().to_string();
+            let oid = d
+                .get_i64("oid")
+                .or_else(|_| d.get_i32("oid").map(i64::from))
+                .unwrap_or(0);
+            let fields = d
+                .get_array("fields")
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|f| match f {
+                            Bson::Array(pair) => {
+                                let n = pair.first()?.as_str()?.to_string();
+                                let t = pair.get(1)?.as_str()?.to_string();
+                                Some((n, t))
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push((name, oid, fields));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Mint the next composite oid -- the enum minting rule, own counter and
+    /// base 67000, monotonic and never reused.
+    fn mint_composite_oid(&self) -> PgWireResult<i64> {
+        let key = "composite_oid_counter";
+        let counter = self
+            .storage
+            .find_matching(
+                &self.db,
+                Self::ENUM_META_COLLECTION,
+                &bson::doc! {"_id": key},
+            )
+            .map_err(|e| Self::storage_err("could not read the oid counter", e))?;
+        let oid = if let Some(bytes) = counter.first() {
+            let d: Document = bson::from_slice(bytes)
+                .map_err(|e| Self::storage_err("could not decode the oid counter", e))?;
+            d.get_i64("next")
+                .or_else(|_| d.get_i32("next").map(i64::from))
+                .unwrap_or(Self::COMPOSITE_TYPE_OID_BASE)
+        } else {
+            let existing = self.composites()?;
+            match existing.iter().map(|(_, o, _)| *o).max() {
+                Some(taken) => {
+                    (Self::COMPOSITE_TYPE_OID_BASE + existing.len() as i64 - 1).max(taken) + 1
+                }
+                None => Self::COMPOSITE_TYPE_OID_BASE,
+            }
+        };
+        self.storage
+            .delete_matching(
+                &self.db,
+                Self::ENUM_META_COLLECTION,
+                &bson::doc! {"_id": key},
+                0,
+                &Document::new(),
+                None,
+            )
+            .map_err(|e| Self::storage_err("could not advance the oid counter", e))?;
+        let doc = bson::doc! {"_id": key, "next": oid + 1};
+        let bytes = bson::to_vec(&doc)
+            .map_err(|e| Self::storage_err("could not encode the oid counter", e))?;
+        self.storage
+            .insert(&self.db, Self::ENUM_META_COLLECTION, vec![bytes], true)
+            .map_err(|e| Self::storage_err("could not advance the oid counter", e))?;
+        Ok(oid)
+    }
+
     /// Every enum type: `(name, oid, labels)`, name-sorted for stable output.
     fn enums(&self) -> PgWireResult<Vec<(String, i64, Vec<String>)>> {
         let raw = self
@@ -554,6 +650,19 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("oid", "int8", false),
                     secantus_pgcatalog::Column::new("typarray", "int8", false),
                     secantus_pgcatalog::Column::new("typdelim", "text", false),
+                    // A composite's row type: its own oid here, 0 otherwise.
+                    // `pg_attribute` keys a composite's fields on it.
+                    secantus_pgcatalog::Column::new("typrelid", "oid", false),
+                ],
+            )),
+            "pg_attribute" => Some(TableDef::new(
+                "pg_attribute",
+                vec![
+                    secantus_pgcatalog::Column::new("attrelid", "oid", false),
+                    secantus_pgcatalog::Column::new("attname", "name", false),
+                    secantus_pgcatalog::Column::new("atttypid", "oid", false),
+                    secantus_pgcatalog::Column::new("attnum", "int2", false),
+                    secantus_pgcatalog::Column::new("attisdropped", "bool", false),
                 ],
             )),
             "pg_range" => Some(TableDef::new(
@@ -600,6 +709,7 @@ impl PgHandler {
                             Bson::Int64(*typarray),
                         );
                         d.insert(def.field_of("typdelim").expect("column"), ",");
+                        d.insert(def.field_of("typrelid").expect("column"), Bson::Int64(0));
                         d
                     })
                     .collect();
@@ -614,6 +724,24 @@ impl PgHandler {
                         Bson::Int64(oid + Self::USER_TYPE_ARRAY_OID_OFFSET),
                     );
                     d.insert(def.field_of("typdelim").expect("column"), ",");
+                    d.insert(def.field_of("typrelid").expect("column"), Bson::Int64(0));
+                    rows.push(d);
+                }
+                // Composites likewise. `typrelid` is the composite's OWN oid
+                // here -- pg_attribute keys its fields on it, and this query
+                // needs no separate pg_class row.
+                for (name, oid, _) in self.composites().ok()? {
+                    let mut d = Document::new();
+                    d.insert(def.field_of("typname").expect("column"), name);
+                    d.insert(def.field_of("oid").expect("column"), Bson::Int64(oid));
+                    d.insert(
+                        def.field_of("typarray").expect("column"),
+                        Bson::Int64(oid + Self::USER_TYPE_ARRAY_OID_OFFSET),
+                    );
+                    d.insert(def.field_of("typdelim").expect("column"), ",");
+                    if let Some(f) = def.field_of("typrelid") {
+                        d.insert(f, Bson::Int64(oid));
+                    }
                     rows.push(d);
                 }
                 rows
@@ -651,6 +779,35 @@ impl PgHandler {
                         Bson::Int64(rngsubtype),
                     );
                     rows.push(d);
+                }
+                rows
+            }
+            // One row per composite field: attrelid = the composite's oid,
+            // attnum 1-based, atttypid = the field type's oid.
+            "pg_attribute" => {
+                let mut rows = Vec::new();
+                for (_, oid, fields) in self.composites().ok()? {
+                    for (i, (fname, ftype)) in fields.iter().enumerate() {
+                        let Some(atttypid) = secantus_pgplan::pgtypes::oid_of_name(ftype) else {
+                            continue;
+                        };
+                        let mut d = Document::new();
+                        d.insert(def.field_of("attrelid").expect("column"), Bson::Int64(oid));
+                        d.insert(def.field_of("attname").expect("column"), fname.as_str());
+                        d.insert(
+                            def.field_of("atttypid").expect("column"),
+                            Bson::Int64(atttypid),
+                        );
+                        d.insert(
+                            def.field_of("attnum").expect("column"),
+                            Bson::Int32((i + 1) as i32),
+                        );
+                        d.insert(
+                            def.field_of("attisdropped").expect("column"),
+                            Bson::Boolean(false),
+                        );
+                        rows.push(d);
+                    }
                 }
                 rows
             }
@@ -2205,6 +2362,47 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("DROP SCHEMA"))])
             }
 
+            Statement::CreateComposite { name, fields } => {
+                // Same shape as CREATE TYPE AS ENUM: a duplicate name (against
+                // composites, enums and builtins) is 42710.
+                let taken = self.composites()?.iter().any(|(n, _, _)| *n == name)
+                    || self.enums()?.iter().any(|(n, _, _)| *n == name)
+                    || secantus_pgplan::pgtypes::oid_of_name(&name).is_some();
+                if taken {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42710".into(),
+                        format!("type \"{name}\" already exists"),
+                    ))));
+                }
+                self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
+                self.ensure_collection(Self::ENUM_META_COLLECTION)?;
+                let oid = self.mint_composite_oid()?;
+                // Fields as the Python server writes them: [name, tag, null].
+                let field_docs: Vec<Bson> = fields
+                    .iter()
+                    .map(|(n, t)| {
+                        Bson::Array(vec![
+                            Bson::String(n.clone()),
+                            Bson::String(t.clone()),
+                            Bson::Null,
+                        ])
+                    })
+                    .collect();
+                let doc = bson::doc! {
+                    "_id": &name,
+                    "composite": &name,
+                    "fields": field_docs,
+                    "oid": oid,
+                };
+                let bytes = bson::to_vec(&doc)
+                    .map_err(|e| Self::storage_err("could not encode the type", e))?;
+                self.storage
+                    .insert(&self.db, Self::COMPOSITE_COLLECTION, vec![bytes], true)
+                    .map_err(|e| Self::storage_err("could not record the type", e))?;
+                Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
+            }
+
             Statement::CreateEnum { name, labels } => {
                 // A duplicate name is 42710, distinct from a table's 42P07 --
                 // and checked against BUILTINS too: `create type text ...` is
@@ -2237,18 +2435,32 @@ impl PgHandler {
 
             Statement::DropType { names, if_exists } => {
                 self.ensure_collection(Self::ENUM_COLLECTION)?;
+                self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
                 for name in &names {
-                    let removed = self
+                    let filter = bson::doc! {"_id": name};
+                    let from_enum = self
                         .storage
                         .delete_matching(
                             &self.db,
                             Self::ENUM_COLLECTION,
-                            &bson::doc! {"_id": name},
+                            &filter,
                             0,
                             &Document::new(),
                             None,
                         )
                         .map_err(|e| Self::storage_err("could not drop the type", e))?;
+                    let from_comp = self
+                        .storage
+                        .delete_matching(
+                            &self.db,
+                            Self::COMPOSITE_COLLECTION,
+                            &filter,
+                            0,
+                            &Document::new(),
+                            None,
+                        )
+                        .map_err(|e| Self::storage_err("could not drop the type", e))?;
+                    let removed = from_enum + from_comp;
                     if removed == 0 && !if_exists {
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),

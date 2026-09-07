@@ -1646,6 +1646,24 @@ names already resolved by last-part, so the table/type ops needed nothing.
 Errors measured: 42P06 duplicate, 3F000 missing, CASCADE accepted (no
 object-to-schema tracking -- names carry no schema).
 
+### 0.48 composite types: DDL, catalog, pg_attribute (2026-09-07)
+
+**Gauge-neutral on its own** (+0 composite tests -- they all need
+`CompositeInfo.fetch`, whose join is part 3, still open), but the complete,
+tested FOUNDATION the fetch reads: `CREATE TYPE name AS (fields)` / `DROP TYPE`
+writing `__sql_composites__` (`{composite, oid, fields:[[name,tag,null]]}`,
+mint base 67000, the enum rule), composites in `pg_type` / `to_regtype` /
+`regtype` with `typrelid` = their own oid, and a `pg_attribute` virtual table
+keying fields on that oid. All catalog reads 0-divergence vs the oracle; the
+cross-server test confirms Rust and Python mint the same oids.
+
+**Part 3, the escalation, still open:** `CompositeInfo.fetch` is a plain select
+`pg_type LEFT JOIN (aggregate-over-a-join subquery) ON a.attrelid =
+t.typrelid`. A JOIN side that is itself a materialised subquery is the new
+capability; `plan_join_select` refuses a non-RangeVar side today
+(`this JOIN side is not supported yet`). Also needs `WHERE NOT boolcol`
+(the inner subquery's `AND NOT a.attisdropped`) -- filed in backlog.
+
 ### Next: composite types (0.48, scoped 2026-09-07)
 
 The single biggest remaining cluster after schema (21 `CompositeTypeStmt` +
