@@ -446,6 +446,7 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
 
+    let canonical = secantus_core::canonical_match(&Bson::Document(filter.clone()));
     let winning_plan = if is_ixscan {
         let index_name = plan.get_str("indexName").unwrap_or("");
         let mut input_stage = doc! {
@@ -479,12 +480,18 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "inputStage": input_stage,
         }
     } else {
-        doc! { "stage": "COLLSCAN", "filter": filter.clone() }
+        doc! { "stage": "COLLSCAN", "filter": Bson::Document(canonical.clone()) }
     };
     let query_planner = doc! {
         "namespace": &ns,
         "indexFilterSet": false,
-        "parsedQuery": filter.clone(),
+        // mongod echoes the NORMALISED match expression here, not the filter as
+        // sent -- bare equality grows an explicit `$eq`, several fields become
+        // a rank-sorted `$and`, `$ne` becomes `$not`/`$eq`, and so on. Echoing
+        // the raw filter diverged on 44 of the 56 shapes in
+        // `tools/probes/explain_shapes.py` while the Python server matched all
+        // 56, because only it had this normalisation.
+        "parsedQuery": Bson::Document(canonical.clone()),
         "winningPlan": winning_plan,
         "rejectedPlans": [],
     };
