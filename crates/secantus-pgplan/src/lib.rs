@@ -165,6 +165,17 @@ pub enum Statement {
         names: Vec<String>,
         if_exists: bool,
     },
+    /// `CREATE SCHEMA [IF NOT EXISTS] <name>`.
+    CreateSchema {
+        name: String,
+        if_not_exists: bool,
+    },
+    /// `DROP SCHEMA [IF EXISTS] <names> [CASCADE]`.
+    DropSchema {
+        names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
     /// `SHOW name` -- one row, one text column named canonically.
     Show(String),
     /// `SET name = value`.
@@ -636,6 +647,10 @@ pub fn plan_with_params(
         N::InsertStmt(i) => plan_insert(&i, lookup, params),
         N::SelectStmt(s) => plan_select(&s, lookup, params),
         N::DropStmt(d) => plan_drop(&d),
+        N::CreateSchemaStmt(c) => Ok(Statement::CreateSchema {
+            name: c.schemaname.clone(),
+            if_not_exists: c.if_not_exists,
+        }),
         // `CREATE TYPE ... AS ENUM`. The name may be schema-qualified; with no
         // schema support the last part is the name, same rule as columns.
         N::CreateEnumStmt(e) => {
@@ -5116,6 +5131,33 @@ fn plan_set(v: &pg_query::protobuf::VariableSetStmt) -> Result<Statement> {
 }
 
 fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
+    // `DROP SCHEMA`: the object is a bare String / one-element List.
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectSchema) {
+        let mut names = Vec::new();
+        for obj in &d.objects {
+            match obj.node.as_ref() {
+                Some(N::String(st)) => names.push(st.sval.clone()),
+                Some(N::List(l)) => {
+                    let name = l
+                        .items
+                        .iter()
+                        .filter_map(|n| match n.node.as_ref()? {
+                            N::String(st) => Some(st.sval.clone()),
+                            _ => None,
+                        })
+                        .next_back()
+                        .ok_or_else(|| Error::Parse("DROP SCHEMA without a name".into()))?;
+                    names.push(name);
+                }
+                _ => return Err(Error::Unsupported("this DROP SCHEMA target".into())),
+            }
+        }
+        return Ok(Statement::DropSchema {
+            names,
+            if_exists: d.missing_ok,
+            cascade: DropBehavior::try_from(d.behavior) == Ok(DropBehavior::DropCascade),
+        });
+    }
     // `DROP TYPE`: the object is a TypeName, not a List of name parts.
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectType) {
         let mut names = Vec::new();
