@@ -77,6 +77,7 @@ import os
 import shutil
 import sys
 import tempfile
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -122,8 +123,50 @@ def per_worker_servers() -> bool:
     return os.environ.get("SECANTUS_GAUGE_PER_WORKER", "") not in ("", "0")
 
 
+def _prepend_vendored_tests_to_syspath() -> None:
+    """Put `vendor/pymongo-tests` on `sys.path` BEFORE anything imports `bson`.
+
+    The gauge is supposed to measure two servers against ONE client library, and
+    it was not doing that. `pymongo` always resolved to the vendored tree (pytest
+    inserts the rootdir of the collected test files), but `bson` did not:
+
+        python mode   pymongo -> vendor/pymongo-tests/pymongo   (4.17.0)
+                      bson    -> site-packages/bson             (4.18.0)  <-- MIXED
+        rust mode     pymongo -> vendor/pymongo-tests/pymongo
+                      bson    -> vendor/pymongo-tests/bson
+
+    The split is import ORDER, not configuration. `_start_server("python")` does
+    `from secantus import SecantusDBServer`, and `secantus` imports `bson` — at
+    a point BEFORE pytest has inserted the vendored tree, so the name binds to
+    site-packages and stays bound. Rust mode never imports Python `bson` at that
+    moment (`_secantus_server` is a compiled extension), so `bson` resolves
+    later, to the vendored copy.
+
+    Measured 2026-09-07: it made `test_default_exports::test_bson` fail on the
+    python server and pass on the rust one — a phantom server difference that is
+    really a client-library difference. Vendored `bson` takes `Generator` from
+    `typing` (which that test skips) and site-packages `bson` takes it from
+    `collections.abc` (which it does not).
+
+    Inserting the path here — the earliest hook the gauge controls — makes both
+    modes use the vendored `bson`/`pymongo` pair, so the two servers' numbers are
+    comparable.
+    """
+    vendored = Path(__file__).resolve().parent.parent / "vendor" / "pymongo-tests"
+    if not vendored.is_dir():
+        # A checkout without the submodule: the run will fail later on its own
+        # terms, and silently guessing a path would be worse.
+        return
+    entry = str(vendored)
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
+
+
 def pytest_load_initial_conftests(early_config: Any, parser: Any, args: Any) -> None:
     # MUST run before pymongo's conftest is imported — see module docstring.
+    # The path insertion MUST come before `_start_server`, which imports
+    # `secantus` (and so `bson`) in python mode — see the helper's docstring.
+    _prepend_vendored_tests_to_syspath()
     global _server, _storage_dir, _address
     worker = os.environ.get("PYTEST_XDIST_WORKER")
     if worker and not per_worker_servers():
