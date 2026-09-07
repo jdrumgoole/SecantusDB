@@ -117,6 +117,19 @@ SETUP = [
 ]
 
 QUERIES = [
+    # scalar <op> ANY/ALL(array): three-valued, empty ANY is false / empty
+    # ALL is true, a NULL element or NULL scalar yields NULL.
+    "SELECT 'x' = ANY(ARRAY['x','y'])",
+    "SELECT 1 = ANY(ARRAY[1,2,3])",
+    "SELECT 0 < ALL(ARRAY[1,2,3])",
+    "SELECT 5 <> ALL(ARRAY[1,2,3])",
+    "SELECT 2 >= ANY(ARRAY[1,5])",
+    "SELECT 1 = ANY(ARRAY[]::int[])",
+    "SELECT 1 = ALL(ARRAY[]::int[])",
+    "SELECT 9 = ANY(ARRAY[1,NULL,3])",
+    "SELECT 1 = ANY(ARRAY[1,NULL,3])",
+    "SELECT 1 = ALL(ARRAY[1,NULL,1])",
+    "SELECT NULL::int = ANY(ARRAY[1,2])",
     # A top-level JOIN in a plain select -- RangeInfo.fetch's shape.
     "SELECT t.typname, r.rngsubtype FROM pg_type t"
     " JOIN pg_range r ON r.rngtypid = t.oid ORDER BY r.rngsubtype",
@@ -974,6 +987,8 @@ def test_timezone_query_matches_postgres(
 # and a wrong error code are both divergences, and only the first shows up in a
 # row comparison — these would pass a `_rows` test by raising on both sides.
 ERROR_QUERIES = [
+    # A scalar compared to an ARRAY with no ANY/ALL is 42883 (no such operator).
+    "SELECT 'x'::text = ARRAY['x','y']",
     # Beside an interval a bare unknown literal coerces to an INTERVAL, so this
     # is a bad interval rather than date arithmetic.
     "SELECT ('2020-01-01' + interval '1 day')::text",

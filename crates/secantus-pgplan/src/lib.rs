@@ -4939,6 +4939,17 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     }
 
     if matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+        // A scalar compared to an ARRAY with no ANY/ALL is an operator
+        // PostgreSQL does not have (`text = text[]` is 42883). Array = array is
+        // a real element-wise operator and stays; only a scalar/array MISMATCH
+        // is the undefined one.
+        if matches!(&lhs, Bson::Array(_)) ^ matches!(&rhs, Bson::Array(_)) {
+            return Err(Error::UndefinedFunction(format!(
+                "operator does not exist: {} {op} {}",
+                inferred_type(&lhs),
+                inferred_type(&rhs)
+            )));
+        }
         let ord = compare_constants(&lhs, &rhs).ok_or_else(|| {
             // Name the OPERAND TYPES. "comparing these operands" was the second
             // largest failure signature on the psycopg gauge and said nothing
@@ -5803,6 +5814,24 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 },
             );
         }
+        if matches!(
+            AExprKind::try_from(e.kind),
+            Ok(AExprKind::AexprOpAny | AExprKind::AexprOpAll)
+        ) {
+            let is_any = AExprKind::try_from(e.kind) == Ok(AExprKind::AexprOpAny);
+            let op = operator_name(e)?.to_string();
+            let lhs = match e.lexpr.as_ref() {
+                Some(l) => const_value(l, params)?,
+                None => return Err(Error::Parse("ANY/ALL with no left operand".into())),
+            };
+            let rhs = const_value(
+                e.rexpr
+                    .as_ref()
+                    .ok_or_else(|| Error::Parse("ANY/ALL with no array operand".into()))?,
+                params,
+            )?;
+            return eval_scalar_array_const(&op, lhs, rhs, is_any);
+        }
         if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp) {
             return Err(Error::Unsupported("this operator form".into()));
         }
@@ -6016,6 +6045,8 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     // returned the complement). Same mistake as the BoolExpr one below.
     match AExprKind::try_from(e.kind) {
         Ok(AExprKind::AexprIn) => return lower_in(e, def, params),
+        Ok(AExprKind::AexprOpAny) => return lower_scalar_array(e, def, params, true),
+        Ok(AExprKind::AexprOpAll) => return lower_scalar_array(e, def, params, false),
         Ok(AExprKind::AexprBetween | AExprKind::AexprNotBetween) => {
             return lower_between(e, def, params)
         }
@@ -6050,6 +6081,23 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     // `$1` -- the parameterised tests found it, but the literal was wrong too.
     if value == Bson::Null {
         return Ok(match_nothing());
+    }
+    // A SCALAR column compared to an ARRAY with no ANY/ALL is an operator
+    // PostgreSQL does not have (`text = text[]` is 42883). An array COLUMN
+    // compared to an array is a real element-wise operator and is left alone.
+    if let Bson::Array(_) = &value {
+        let coltype = def
+            .columns
+            .iter()
+            .find(|c| c.name == col)
+            .map(|c| c.pg_type.as_str());
+        if !coltype.map(|t| t.ends_with("[]")).unwrap_or(false) {
+            return Err(Error::UndefinedFunction(format!(
+                "operator does not exist: {} {op} {}",
+                coltype.unwrap_or("text"),
+                inferred_type(&value)
+            )));
+        }
     }
     // A regtype value filters by its OID -- the stored column is a number.
     let value = match regtype_oid(&value) {
@@ -6089,6 +6137,162 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
 /// `n NOT IN (1)` does NOT return a row whose `n` is NULL (because `NULL <> 1`
 /// is NULL, not true), and `n NOT IN (1, NULL)` returns nothing at all. MQL's
 /// `$nin` would match a null on both counts, so the guard is explicit.
+/// PostgreSQL coerces an UNKNOWN-typed operand of `ANY`/`ALL` to the array
+/// type of the other side. psycopg sends a bare `= ANY(%s)` array parameter
+/// without a type, so it arrives as the array literal TEXT `{a,b}`; parse it
+/// into a real array using the scalar side's element type. A non-`{...}` value
+/// (a properly typed array, or a genuine scalar) is returned unchanged.
+fn coerce_any_array(rhs: Bson, element_type: &str) -> Bson {
+    if let Bson::String(s) = &rhs {
+        if s.starts_with('{') {
+            if let Ok(arr) = parse_array(s, element_type) {
+                return arr;
+            }
+        }
+    }
+    rhs
+}
+
+/// The MQL comparison operator for a SQL scalar comparison operator.
+fn op_to_mql(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "=" => "$eq",
+        "<>" | "!=" => "$ne",
+        "<" => "$lt",
+        "<=" => "$lte",
+        ">" => "$gt",
+        ">=" => "$gte",
+        _ => return None,
+    })
+}
+
+/// `scalar <op> ANY(array)` / `scalar <op> ALL(array)` as a constant.
+///
+/// Three-valued, matching PostgreSQL: a NULL scalar is NULL; `ANY` is TRUE on
+/// the first match, else NULL if any element (or comparison) was NULL, else
+/// FALSE (an empty array is FALSE); `ALL` is FALSE on the first mismatch, else
+/// NULL if any element was NULL, else TRUE (an empty array is TRUE).
+fn eval_scalar_array_const(op: &str, lhs: Bson, rhs: Bson, is_any: bool) -> Result<Bson> {
+    if lhs == Bson::Null {
+        return Ok(Bson::Null);
+    }
+    let rhs = coerce_any_array(rhs, inferred_type(&lhs));
+    let elems = match rhs {
+        Bson::Array(v) => v,
+        Bson::Null => return Ok(Bson::Null),
+        other => {
+            return Err(Error::UndefinedFunction(format!(
+                "operator does not exist: {} {op} {}",
+                inferred_type(&lhs),
+                inferred_type(&other)
+            )))
+        }
+    };
+    let mut any_null = false;
+    for el in elems {
+        if el == Bson::Null {
+            any_null = true;
+            continue;
+        }
+        match eval_binary(op, lhs.clone(), el)? {
+            Bson::Boolean(true) if is_any => return Ok(Bson::Boolean(true)),
+            Bson::Boolean(false) if !is_any => return Ok(Bson::Boolean(false)),
+            Bson::Null => any_null = true,
+            _ => {}
+        }
+    }
+    Ok(if any_null {
+        Bson::Null
+    } else {
+        Bson::Boolean(!is_any)
+    })
+}
+
+/// `col <op> ANY(array)` / `col <op> ALL(array)` as a WHERE filter.
+///
+/// NULL-correct for row filtering: a NULL array element can never make `ANY`
+/// true, and makes `ALL` unsatisfiable; a NULL column value satisfies none of
+/// these scalar comparisons, so a `$ne`-based clause carries an explicit
+/// not-null guard (MQL `$ne` would otherwise match a missing/null field).
+fn lower_scalar_array(
+    e: &AExpr,
+    def: &TableDef,
+    params: &[Bson],
+    is_any: bool,
+) -> Result<Document> {
+    let field = column_field(e.lexpr.as_deref(), def)?;
+    let op = operator_name(e)?.to_string();
+    let mql = op_to_mql(&op).ok_or_else(|| Error::Unsupported(format!("{op} ANY/ALL")))?;
+    let rhs = const_value(
+        e.rexpr
+            .as_ref()
+            .ok_or_else(|| Error::Parse("ANY/ALL with no array operand".into()))?,
+        params,
+    )?;
+    let elem_type = def
+        .columns
+        .iter()
+        .find(|c| c.name == field)
+        .map(|c| c.pg_type.as_str())
+        .unwrap_or("text");
+    let rhs = coerce_any_array(rhs, elem_type);
+    let elems = match rhs {
+        Bson::Array(v) => v,
+        // A NULL array (a genuine NULL operand, or an unbound parameter at
+        // DESCRIBE time before Bind) matches nothing: `x = ANY(NULL)` is NULL.
+        Bson::Null => return Ok(match_nothing()),
+        _ => return Err(Error::Unsupported("this ANY/ALL operand".into())),
+    };
+    let mut nonnull = Vec::new();
+    let mut saw_null = false;
+    for el in elems {
+        if el == Bson::Null {
+            saw_null = true;
+        } else {
+            nonnull.push(el);
+        }
+    }
+    if is_any {
+        // ANY: a NULL element cannot help; an empty (or all-NULL) array matches
+        // nothing.
+        if nonnull.is_empty() {
+            return Ok(match_nothing());
+        }
+        if op == "=" {
+            // Index-friendly and NULL-correct: `$in` excludes a NULL column.
+            return Ok(doc! { &field: { "$in": nonnull } });
+        }
+        let clauses: Vec<Document> = nonnull
+            .into_iter()
+            .map(|v| doc! { &field: { mql: v } })
+            .collect();
+        return Ok(doc! { "$and": [
+            doc! { "$or": clauses },
+            doc! { &field: { "$ne": Bson::Null } },
+        ]});
+    }
+    // ALL: a NULL element makes it unsatisfiable; an empty array is vacuously
+    // true (every row, including a NULL column).
+    if saw_null {
+        return Ok(match_nothing());
+    }
+    if nonnull.is_empty() {
+        return Ok(Document::new());
+    }
+    if op == "<>" {
+        return Ok(doc! { "$and": [
+            doc! { &field: { "$nin": nonnull } },
+            doc! { &field: { "$ne": Bson::Null } },
+        ]});
+    }
+    let mut arms: Vec<Document> = nonnull
+        .into_iter()
+        .map(|v| doc! { &field: { mql: v } })
+        .collect();
+    arms.push(doc! { &field: { "$ne": Bson::Null } });
+    Ok(doc! { "$and": arms })
+}
+
 fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     let negated = in_is_negated(e);
     let field = column_field(e.lexpr.as_deref(), def)?;
