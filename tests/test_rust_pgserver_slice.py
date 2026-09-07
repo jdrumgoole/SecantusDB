@@ -441,6 +441,41 @@ def test_constant_expressions_match_postgres(home: Path) -> None:
         assert exc.value.diag.sqlstate == "22012"
 
 
+def test_scalar_array_any_all(home: Path) -> None:
+    """`col <op> ANY(%s)` / `ALL(%s)` with an array parameter.
+
+    This is how psycopg renders an IN-list, so the WHERE + array-parameter form
+    is the one that matters. An untyped array parameter arrives as the array
+    literal text and is coerced to the column's element type, and a scalar
+    compared to an array with no ANY/ALL is 42883.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE aa (id int PRIMARY KEY, s text)")
+        cur.execute("INSERT INTO aa VALUES (1,'x'),(2,'y'),(3,'z')")
+
+        cur.execute("SELECT id FROM aa WHERE id = ANY(%s) ORDER BY id", ([1, 3],))
+        assert cur.fetchall() == [(1,), (3,)]
+        # An untyped TEXT array parameter is coerced from its literal text.
+        cur.execute("SELECT id FROM aa WHERE s = ANY(%s) ORDER BY id", (["x", "z"],))
+        assert cur.fetchall() == [(1,), (3,)]
+        cur.execute("SELECT id FROM aa WHERE id <> ALL(%s) ORDER BY id", ([2],))
+        assert cur.fetchall() == [(1,), (3,)]
+        # Empty array: ANY matches nothing, ALL matches everything.
+        cur.execute("SELECT id FROM aa WHERE id = ANY(%s)", ([],))
+        assert cur.fetchall() == []
+        cur.execute("SELECT id FROM aa WHERE id <> ALL(%s) ORDER BY id", ([],))
+        assert cur.fetchall() == [(1,), (2,), (3,)]
+        # A NULL array matches nothing.
+        cur.execute("SELECT id FROM aa WHERE id = ANY(%s)", (None,))
+        assert cur.fetchall() == []
+
+        # A scalar compared to an array with no ANY/ALL is 42883.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("SELECT id FROM aa WHERE s = ARRAY['x']")
+        assert exc.value.diag.sqlstate == "42883"
+
+
 def test_session_settings(home: Path) -> None:
     """SET / SHOW / RESET and the GUC functions.
 
