@@ -417,3 +417,95 @@ pub fn canonical_match(filter: &Bson) -> Document {
         Bson::Array(expanded.into_iter().map(Bson::Document).collect()),
     )
 }
+
+/// mongod's blocking-sort memory budget, reported verbatim as the `SORT`
+/// stage's `memLimit` (`internalQueryMaxBlockingSortMemoryUsageBytes`, 100 MiB
+/// — the default, which is also what `serverParameters` reports).
+pub const SORT_MEM_LIMIT_BYTES: i64 = 104_857_600;
+
+/// `PROJECTION_SIMPLE` or `PROJECTION_DEFAULT` for this spec.
+///
+/// mongod uses the fast path only for a flat inclusion / exclusion list; a
+/// dotted path or any operator (`$elemMatch` / `$slice` / a computed
+/// expression) drops it to the general one. Probed 8.2.11.
+fn projection_stage_name(projection: &Document) -> &'static str {
+    for (field, value) in projection.iter() {
+        if field.contains('.') || matches!(value, Bson::Document(_) | Bson::Array(_)) {
+            return "PROJECTION_DEFAULT";
+        }
+    }
+    "PROJECTION_SIMPLE"
+}
+
+/// Wrap the scan node `base` in mongod's query-shape stages.
+///
+/// The nesting is mongod's, measured on 8.2.11 — it is not the order the
+/// command's fields are written in:
+///
+/// * a sort the index cannot serve becomes a blocking `SORT` directly above the
+///   scan, and it ABSORBS the limit (as `limitAmount`, counting the skipped
+///   documents), so no separate `LIMIT` stage appears;
+/// * `SKIP` sits above the scan (or above the `SORT`);
+/// * the projection sits above the skip;
+/// * a `LIMIT` not absorbed by a sort is the OUTERMOST stage, above the
+///   projection.
+///
+/// A port of `secantus.explain.build_stage_tree`. The Rust server reported the
+/// bare scan node, so `{filter: …, limit: 3}` came back as a `COLLSCAN` where
+/// mongod reports a `LIMIT` above one.
+pub fn build_stage_tree(
+    base: Document,
+    sort: Option<&Document>,
+    sort_served_by_index: bool,
+    projection: Option<&Document>,
+    skip: i64,
+    limit: i64,
+) -> Document {
+    let mut node = base;
+    let skip_n = skip.max(0);
+    // A negative `limit` is the driver's "single batch" flag, not a smaller
+    // limit; mongod reports its magnitude.
+    let limit_n = limit.abs();
+
+    let blocking_sort = sort.is_some_and(|s| !s.is_empty()) && !sort_served_by_index;
+    let mut absorbed = false;
+    if blocking_sort {
+        let mut sort_stage = Document::new();
+        sort_stage.insert("stage", "SORT");
+        sort_stage.insert(
+            "sortPattern",
+            Bson::Document(sort.cloned().unwrap_or_default()),
+        );
+        sort_stage.insert("memLimit", SORT_MEM_LIMIT_BYTES);
+        if limit_n > 0 {
+            // The sort must retain everything the skip will later discard.
+            sort_stage.insert("limitAmount", limit_n + skip_n);
+            absorbed = true;
+        }
+        sort_stage.insert("type", "simple");
+        sort_stage.insert("inputStage", Bson::Document(node));
+        node = sort_stage;
+    }
+    if skip_n > 0 {
+        let mut skip_stage = Document::new();
+        skip_stage.insert("stage", "SKIP");
+        skip_stage.insert("skipAmount", skip_n);
+        skip_stage.insert("inputStage", Bson::Document(node));
+        node = skip_stage;
+    }
+    if let Some(proj) = projection.filter(|p| !p.is_empty()) {
+        let mut proj_stage = Document::new();
+        proj_stage.insert("stage", projection_stage_name(proj));
+        proj_stage.insert("transformBy", Bson::Document(proj.clone()));
+        proj_stage.insert("inputStage", Bson::Document(node));
+        node = proj_stage;
+    }
+    if limit_n > 0 && !absorbed {
+        let mut limit_stage = Document::new();
+        limit_stage.insert("stage", "LIMIT");
+        limit_stage.insert("limitAmount", limit_n);
+        limit_stage.insert("inputStage", Bson::Document(node));
+        node = limit_stage;
+    }
+    node
+}

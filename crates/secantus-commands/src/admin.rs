@@ -535,6 +535,29 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         collscan.insert("direction", if backward { "backward" } else { "forward" });
         collscan
     };
+    // mongod wraps the scan in the stages that describe the rest of the query.
+    // Only `find` is done here: `count` and `distinct` use a different
+    // vocabulary (`COUNT` / `COUNT_SCAN` / `DISTINCT_SCAN`) that has not been
+    // measured, and inventing stages for them would be worse than the flat node
+    // they get today.
+    let winning_plan = if cmd_name == "find" {
+        let as_i64 = |v: Option<&Bson>| match v {
+            Some(Bson::Int32(n)) => i64::from(*n),
+            Some(Bson::Int64(n)) => *n,
+            Some(Bson::Double(n)) => *n as i64,
+            _ => 0,
+        };
+        secantus_core::build_stage_tree(
+            winning_plan,
+            sort,
+            plan.get_bool("sortedByIndex").unwrap_or(false),
+            inner.get("projection").and_then(Bson::as_document),
+            as_i64(inner.get("skip")),
+            as_i64(inner.get("limit")),
+        )
+    } else {
+        winning_plan
+    };
     // `isCached` sits on the OUTERMOST plan node only (the plan cache is a
     // whole-plan property) and is its FIRST key. We never cache plans.
     let winning_plan = {

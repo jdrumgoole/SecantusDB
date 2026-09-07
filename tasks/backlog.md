@@ -5227,28 +5227,33 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `winningPlan` went 25 of 25 divergent to 22 of 25. Pinned by
   `tests/test_rust_explain_parsed_query.py`.
 
-- [ ] **OPEN: the Rust server does not build the `explain` STAGE TREE.** The
-  remaining 22 of 25 are all this. mongod wraps the scan in the stages that
-  describe the query, and the Rust server reports the bare scan node:
+- [x] **RESOLVED (2026-09-07): the Rust server builds mongod's `explain` STAGE
+  TREE, and `explain` is now at PARITY with the Python server.** `SORT` /
+  `SKIP` / `LIMIT` / `PROJECTION_SIMPLE`|`PROJECTION_DEFAULT` are built for
+  `find`, in mongod's nesting (a blocking `SORT` above the scan absorbing the
+  limit as `limit + skip`; `SKIP` above that; the projection above the skip; an
+  unabsorbed `LIMIT` outermost). Deciding whether a sort needs a blocking stage
+  took a `sorted_by_index` flag that `ExplainPlan::IxScan` did not carry; it is
+  now set at every construction site and surfaced by the storage adapter.
 
-  | query | mongod | rust |
+  Final state of `tools/probes/explain_shapes.py`, both servers against
+  mongod 8.2.11:
+
+  | server | parsedQuery | winningPlan |
   | --- | --- | --- |
-  | `limit: 3` | `LIMIT` → `COLLSCAN` | `COLLSCAN` |
-  | `skip: 3` | `SKIP` → `COLLSCAN` | `COLLSCAN` |
-  | `limit: 3, skip: 2` | `LIMIT` → `SKIP` → `COLLSCAN` | `COLLSCAN` |
-  | `projection: {a: 1}` | `PROJECTION_SIMPLE` → `COLLSCAN` | `COLLSCAN` |
-  | `sort: {zzz: 1}` | `SORT` → `COLLSCAN` | `COLLSCAN` |
+  | python | 0 of 56 | 7 of 25 |
+  | rust (session start) | 44 of 56 | 25 of 25 |
+  | rust (now) | **0 of 56** | **7 of 25** |
 
-  `secantus.explain.build_stage_tree` is the reference and the nesting rules are
-  measured there (a blocking `SORT` ABSORBS the limit as `limitAmount`, counting
-  the skipped documents; `SKIP` sits above the scan; the projection above the
-  skip; an unabsorbed `LIMIT` outermost). The skip / limit / projection half
-  needs nothing new — they are all on the inner command. **The blocking-`SORT`
-  half needs a `sorted_by_index` flag, which `ExplainPlan::IxScan` does not
-  carry**: adding it means touching the enum in `crates/secantus-storage`,
-  `make_ixscan_plan`, and the `explain_plan` in `secantus-storage-adapter`.
-  The four remaining IXSCAN cases are `indexBounds`, which this project
-  deliberately does not reproduce, and are the Python server's floor too.
+  The two servers' residual lists are IDENTICAL, and they are the documented
+  floor rather than defects: four `indexBounds` (deliberately not reproduced,
+  with `rejectedPlans` and the IDHACK / EXPRESS_IXSCAN / COUNT_SCAN /
+  DISTINCT_SCAN executors) and three where mongod picks an IXSCAN and we pick
+  COLLSCAN + SORT — identical documents, a different cost model.
+
+  Pinned by `tests/test_rust_explain_parsed_query.py` (58 cases), which checks
+  the stage nesting, the sort-absorbs-limit rule, the served-vs-blocking sort
+  distinction, and cross-server agreement.
 
 - [ ] **STILL OPEN: `Decimal128` FINITE operands in the transcendentals.** The
   Rust engine defers `$sqrt(Decimal128("2.5"))` and the rest of the family;

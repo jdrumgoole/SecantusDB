@@ -1045,6 +1045,13 @@ pub enum ExplainPlan {
         index_name: String,
         key_pattern: Document,
         direction: String,
+        /// Whether the index walk already comes out in the requested sort
+        /// order -- true only when the index's LEADING field is the one being
+        /// sorted on (or when a compound index matches the whole sort spec).
+        /// `explain` reads it to decide whether to report a blocking `SORT`
+        /// stage, which is the question a client runs explain to answer.
+        /// Mirrors `storage.explain_plan`'s `sorted_by_index`.
+        sorted_by_index: bool,
     },
 }
 
@@ -2643,10 +2650,15 @@ fn make_ixscan_plan(
             }
         }
     }
+    // The walk comes out in sort order only when the index's LEADING field is
+    // the one being sorted on -- mirrors `_candidates_from_hint`'s
+    // `in_sort_order`.
+    let leading = key_spec.keys().next().map(String::as_str);
     ExplainPlan::IxScan {
         index_name: name,
         key_pattern: key_spec.clone(),
         direction: direction.to_string(),
+        sorted_by_index: sort_field.is_some() && sort_field == leading,
     }
 }
 
@@ -11237,6 +11249,7 @@ impl Storage {
                         index_name: ID_INDEX_NAME.to_string(),
                         key_pattern: kp,
                         direction: direction.to_string(),
+                        sorted_by_index: sort_field == Some("_id"),
                     })
                 }
                 ResolvedHint::Named(name) => match self.key_spec_for(&session, db, coll, &name)? {
@@ -11268,6 +11281,10 @@ impl Storage {
                                 index_name: name,
                                 key_pattern: key_spec,
                                 direction: if reverse { "backward" } else { "forward" }.to_string(),
+                                // The whole point of this branch: the compound
+                                // key spec matches (or fully inverts) the sort,
+                                // so the walk IS the sort.
+                                sorted_by_index: true,
                             });
                         }
                     }
