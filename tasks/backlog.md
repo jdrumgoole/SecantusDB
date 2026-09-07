@@ -5271,6 +5271,35 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   the stage nesting, the sort-absorbs-limit rule, the served-vs-blocking sort
   distinction, and cross-server agreement.
 
+- [x] **RESOLVED (2026-09-07): the Rust server leaked RUST TYPE NAMES into the
+  bad-hint error.** `hint String("x") does not correspond to an existing index`
+  from the command layer (`update` / `delete` / `findAndModify`) and
+  `hint Document({"nope": Int32(1)}) …` from the storage layer — Rust's `Debug`
+  on a `Bson`. Both now name the value. Pinned by
+  `tests/test_rust_hint_error_message.py`, registered in the storage-engine CI
+  lane.
+
+- [ ] **NOT A DEFECT, recorded so it is not re-investigated: the six
+  message-only bad-hint divergences in `tools/probes/arg_types_messages.py` are
+  DELIBERATE, and BOTH servers have them.** Measured 2026-09-07: python 6,
+  rust 6, and they are the same six. mongod answers a bad hint with a
+  multi-line planner diagnostic —
+
+      error processing query: ns=<db>.c
+      Tree: $and
+      Sort: {}
+      Proj: {}
+       planner returned error :: caused by :: hint provided does not
+       correspond to an existing index
+
+  — where both servers name the hint. The CODE matches. The wording moved
+  between 6.0.16 and 8.2.11, and `commands.py` already records the decision:
+  "assert the rejection rather than the text". Reproducing it would mean
+  rendering mongod's `MatchExpression` DEBUG string (`Tree: $and …`), a THIRD
+  rendering vocabulary distinct from `parsedQuery`'s JSON and from the value
+  form — its own measurement campaign, for an error message whose code is
+  already right.
+
 - [ ] **STILL OPEN: `Decimal128` FINITE operands in the transcendentals.** The
   Rust engine defers `$sqrt(Decimal128("2.5"))` and the rest of the family;
   mongod answers `1.581138830084189665999446772216359`. This is the genuine
