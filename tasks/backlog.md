@@ -2112,15 +2112,33 @@ all still open. Probe: `scratchpad/readsweep.py` + `readsweep_lib.py`.
   Pinned by `tests/test_computed_projection.py`; all 55 expectations re-asserted
   against the live 8.2.11 at 0 mismatches.
 
-- [ ] **The RUST server still refuses computed projections.** It answers
-  `2 BadValue: projection is not supported by the Rust server` for every shape
-  above. Left as-is deliberately: refusing is the better behaviour when the
-  feature is absent, and the two servers are now honest-refusal versus correct
-  rather than honest-refusal versus silently wrong. The semantics to implement
-  are the ones in the resolved entry above, all measured; `secantus-core` has
-  the expression evaluator and the projection plan, so the work mirrors
-  `secantus.projection`'s `_flatten_projection_spec` / `_is_flag_value` /
-  `_raise_exclusion_mix` / `_with_computed`.
+- [x] **RESOLVED (2026-09-07): the RUST server refused every computed
+  projection.** `find` and `findAndModify` answered `2 BadValue: projection is
+  not supported by the Rust server` for any projection value that was an
+  EXPRESSION rather than an include/exclude flag -- operator expressions, a bare
+  rename `{x: "$a"}`, a string/null/array literal, and a `Decimal128` flag
+  alike. The engine deferred those shapes, and a defer has no Python behind it
+  here.
+
+  This entry called the refusal deliberate ("honest-refusal versus correct").
+  That was a reasonable position while the feature was absent, but the semantics
+  were already measured and the evaluator already existed, so it was cheaper to
+  build than the entry implied -- the port is `is_flag_value` /
+  `is_computed_spec` / `flatten_projection_spec` / `with_computed` in
+  `secantus-core/src/projection.rs`.
+
+  Semantics worth restating because they are counter-intuitive and measured:
+  only a NUMBER or a BOOL is a flag (so `{x: "plain"}` is a literal and
+  `{$literal: 0}` yields 0, not an exclusion); a `Decimal128` is a BSON number
+  and therefore a flag; a sub-document is classified PER LEAF; a bare reference
+  to a missing field OMITS the key while an expression over one yields NULL; a
+  computed field forces inclusion mode, making a companion `b: 0` the 31254 mix.
+
+  Sweep: 42 shapes at 0 divergences against mongod 8.2.11 (raw `find` reply,
+  FIELD ORDER included), plus 7 on `findAndModify` -- probing the sibling
+  command, per the standing rule, found it carried the same refusal. Pinned by
+  `tests/test_rust_computed_projection.py`. A projection error carrying a mongod
+  code is now surfaced verbatim rather than flattened to `BadValue`.
 
 - [x] **RESOLVED (2026-09-06): the descending sort that put every prefix chain
   in ascending order.** `sort({x: -1})` over `["", "a", "ab", "abc", "b"]` came

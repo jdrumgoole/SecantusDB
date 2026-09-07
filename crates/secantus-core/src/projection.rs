@@ -138,6 +138,18 @@ fn spec_truthy(v: &Bson) -> R<bool> {
         Bson::Int64(n) => Ok(*n != 0),
         Bson::Boolean(b) => Ok(*b),
         Bson::Double(d) => Ok(*d != 0.0),
+        // A `Decimal128` is a BSON number, so mongod treats it as a FLAG:
+        // `Decimal128("1.5")` includes and `Decimal128("0")` excludes (measured
+        // 8.2.11, 2026-09-07). This used to fall through to the defer arm, which
+        // on the Rust server is an error rather than a fallback. Rendering to
+        // text and parsing keeps every zero spelling (`0`, `0.00`, `-0`, `0E+3`)
+        // falsy; `NaN` parses to NaN, which is `!= 0.0`, so it includes -- the
+        // same answer Python's `_flag_truthy` gives via its explicit NaN test.
+        Bson::Decimal128(d) => Ok(d
+            .to_string()
+            .parse::<f64>()
+            .map(|f| f != 0.0)
+            .unwrap_or(true)),
         _ => Err(Fallback::Defer),
     }
 }
@@ -147,6 +159,7 @@ fn spec_truthy(v: &Bson) -> R<bool> {
 fn is_drop_id(v: &Bson) -> bool {
     matches!(v, Bson::Int32(0) | Bson::Int64(0) | Bson::Boolean(false))
         || matches!(v, Bson::Double(d) if *d == 0.0)
+        || matches!(v, Bson::Decimal128(_) if !flag_truthy(v))
 }
 
 fn as_slice_int(v: &Bson) -> Option<i64> {
@@ -409,6 +422,121 @@ fn set(doc: &mut Document, path: &str, value: Bson) -> R<()> {
     paths::set_path(doc, path, value).map_err(|_| Fallback::Defer)
 }
 
+/// Is this projection value an include/exclude FLAG rather than a value?
+///
+/// Measured against mongod 8.2.11 (2026-09-07) by projecting one of each BSON
+/// type: **only a number or a bool is a flag.** `Decimal128("1.5")` includes and
+/// `Decimal128("0")` excludes, so the test is "is it a BSON number", not "is it
+/// an integer". Everything else -- string, null, array, date, ObjectId, BinData,
+/// regex, Timestamp, MinKey, MaxKey, Code -- is a *literal constant* that
+/// replaces the field on every document. Mirrors `projection.py::_is_flag_value`.
+pub fn is_flag_value(v: &Bson) -> bool {
+    matches!(
+        v,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Boolean(_) | Bson::Decimal128(_)
+    )
+}
+
+/// Truthiness of a flag value. A `Decimal128` needs its own zero test -- it is
+/// an object, so a plain "is it falsy" check calls every decimal truthy.
+/// NaN is NOT zero, so it includes. Mirrors `projection.py::_flag_truthy`.
+fn flag_truthy(v: &Bson) -> bool {
+    spec_truthy(v).unwrap_or(true)
+}
+
+/// Is this (already flattened) projection value an EXPRESSION?
+///
+/// Every rule measured against mongod 8.2.11 (2026-09-07):
+///
+/// * a **string** is an expression -- `"$a"` is a field path and `"plain"` a
+///   literal constant on every document. Neither is a flag.
+/// * an operator **document** (first key `$`-prefixed) is an expression, except
+///   the three projection operators, which have their own handling. Note
+///   `{$literal: 0}` yields the value 0 -- it is NOT an exclusion.
+/// * every other non-flag value (null, array, date, ...) is a literal constant.
+///
+/// A plain sub-document never reaches here: `flatten_projection_spec` has
+/// already split it into dotted leaves, because mongod classifies a
+/// sub-document PER LEAF -- `{o: {p: 1, z: "$b"}}` includes `o.p` *and*
+/// computes `o.z`. Mirrors `projection.py::_is_computed_spec`.
+pub fn is_computed_spec(v: &Bson) -> bool {
+    if is_flag_value(v) {
+        return false;
+    }
+    match v {
+        Bson::Document(d) => {
+            // $slice / $elemMatch / $meta have their own handling upstream.
+            slice_spec(v).is_none()
+                && elem_match_spec(v).is_none()
+                && meta_spec(v).is_none()
+                && d.keys().next().map(|k| k.starts_with('$')).unwrap_or(false)
+        }
+        _ => true,
+    }
+}
+
+/// Split plain sub-documents into dotted leaves, preserving spec order.
+///
+/// mongod treats `{o: {p: 1, z: "$b"}}` as the two independent leaves `o.p: 1`
+/// and `o.z: "$b"`, returning `{o: {p: <stored>, z: <computed>}}` -- so a
+/// sub-document cannot be classified as a whole. An empty sub-document at any
+/// depth is its own error (51270). Mirrors
+/// `projection.py::_flatten_projection_spec`.
+fn flatten_projection_spec(spec: &Document) -> R<Vec<(String, Bson)>> {
+    let mut out: Vec<(String, Bson)> = Vec::new();
+    for (k, v) in spec {
+        flatten_entry(k, v, &mut out)?;
+    }
+    Ok(out)
+}
+
+fn flatten_entry(key: &str, value: &Bson, out: &mut Vec<(String, Bson)>) -> R<()> {
+    if let Bson::Document(d) = value {
+        if d.is_empty() {
+            let leaf = key.rsplit('.').next().unwrap_or(key);
+            return Err(Fallback::mongo(
+                51270,
+                format!("Invalid empty sub-projection: {leaf}"),
+            ));
+        }
+        let first_is_op = d.keys().next().map(|k| k.starts_with('$')).unwrap_or(false);
+        if first_is_op {
+            out.push((key.to_string(), value.clone()));
+            return Ok(());
+        }
+        for (sub_key, sub_value) in d {
+            flatten_entry(&format!("{key}.{sub_key}"), sub_value, out)?;
+        }
+        return Ok(());
+    }
+    out.push((key.to_string(), value.clone()));
+    Ok(())
+}
+
+/// Evaluate the projection's expression-valued fields against `doc`.
+///
+/// Two rules that look alike and are not (both measured against mongod 8.2.11):
+///
+/// * a bare field REFERENCE that resolves to nothing OMITS the output field --
+///   `{n: "$absent"}` gives `{_id: 1}`, with no `n` at all;
+/// * an EXPRESSION over a missing field yields **null** --
+///   `{n: {$add: ["$absent", 1]}}` gives `{_id: 1, n: null}`.
+///
+/// `evaluate_or_missing` is the field-value evaluator that draws exactly that
+/// line. A dotted output key builds the nesting via `set`, never a key with a
+/// literal dot in it. Mirrors `projection.py::_with_computed`.
+fn with_computed(result: &mut Document, doc: &Document, computed: &[(String, Bson)]) -> R<()> {
+    let vars = Document::new();
+    for (key, expr) in computed {
+        let value = crate::expressions::evaluate_or_missing(doc, expr, &vars)?;
+        if matches!(value, Bson::Undefined) {
+            continue; // the bare-reference case: leave the field out entirely
+        }
+        set(result, key, value)?;
+    }
+    Ok(())
+}
+
 /// Apply a projection spec to a document. `Err(Fallback::Defer)` => defer to the
 /// pure-Python `apply_projection` (which also raises the mixed-mode error).
 pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document>) -> R<Document> {
@@ -440,6 +568,63 @@ pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document
             }
         }
         return apply_projection(doc, &stripped, query);
+    }
+
+    // COMPUTED fields (`{x: "$a"}`, `{x: {$add: [...]}}`, a literal constant).
+    // These are flattened first because mongod classifies a plain sub-document
+    // PER LEAF, then split out of the flag set: they never participate in
+    // inclusion/exclusion detection, they FORCE inclusion mode, and they are
+    // evaluated after the flag projection has produced its result.
+    //
+    // Positional (`arr.$`) keeps its own path below and is left alone here.
+    if !spec.keys().any(|k| k.ends_with(".$")) {
+        let flattened = flatten_projection_spec(spec)?;
+        if flattened.iter().any(|(_, v)| is_computed_spec(v)) {
+            let mut flags = Document::new();
+            let mut computed: Vec<(String, Bson)> = Vec::new();
+            for (k, v) in flattened {
+                if is_computed_spec(&v) {
+                    computed.push((k, v));
+                } else {
+                    flags.insert(k, v);
+                }
+            }
+            // A computed field forces INCLUSION mode, so a companion exclusion
+            // is the mix mongod rejects with Location31254. `_id: 0` is the one
+            // exclusion that is always legal.
+            for (k, v) in &flags {
+                if k != "_id" && is_flag_value(v) && !flag_truthy(v) {
+                    return Err(Fallback::mongo(
+                        31254,
+                        format!("Cannot do exclusion on field {k} in inclusion projection"),
+                    ));
+                }
+            }
+            // The flag half is an ordinary inclusion projection. With no
+            // NON-`_id` flags left it degenerates to `_id` only, which is
+            // mongod's answer for a computed-only spec -- and `_id: 0` there
+            // means "drop `_id` from an inclusion", NOT "exclusion projection".
+            // Passing `{_id: 0}` down as a spec of its own read as the latter
+            // and returned the whole document.
+            let has_non_id_flag = flags.keys().any(|k| k != "_id");
+            let mut result = if !has_non_id_flag {
+                let mut only_id = Document::new();
+                let keep_id = flags
+                    .get("_id")
+                    .map(|v| !is_flag_value(v) || flag_truthy(v))
+                    .unwrap_or(true);
+                if keep_id {
+                    if let Some(id) = doc.get("_id") {
+                        only_id.insert("_id".to_string(), id.clone());
+                    }
+                }
+                only_id
+            } else {
+                apply_projection(doc, &flags, query)?
+            };
+            with_computed(&mut result, doc, &computed)?;
+            return Ok(result);
+        }
     }
 
     // Separate $slice specs (neutral modifiers) and positional (`arr.$`) keys from
@@ -864,5 +1049,97 @@ mod tests {
         assert_eq!(meta_spec(&bson::bson!({"a": 1})), None);
         assert!(META_KEYWORDS.contains(&"textScore"));
         assert!(!META_KEYWORDS.contains(&"bogus"));
+    }
+}
+
+#[cfg(test)]
+mod computed_projection_tests {
+    use super::apply_projection;
+    use bson::{doc, Bson};
+
+    fn src() -> bson::Document {
+        doc! {"_id": 1, "a": 2, "b": 3, "s": "hi", "n": {"p": 1, "q": 2}, "arr": [1, 2, 3]}
+    }
+
+    /// Every expectation here was MEASURED against mongod 8.2.11 on 2026-09-07,
+    /// not derived from the pure engine -- parity with Python would be equally
+    /// satisfied by both being wrong.
+    #[test]
+    fn matches_mongod() {
+        let cases: Vec<(bson::Document, bson::Document)> = vec![
+            (doc! {"x": {"$literal": 5}}, doc! {"_id": 1, "x": 5}),
+            (doc! {"x": {"$add": ["$a", "$b"]}}, doc! {"_id": 1, "x": 5}),
+            (
+                doc! {"x": {"$concat": ["$s", "!"]}},
+                doc! {"_id": 1, "x": "hi!"},
+            ),
+            (doc! {"x": "$a"}, doc! {"_id": 1, "x": 2}),
+            (doc! {"x": "$n.p"}, doc! {"_id": 1, "x": 1}),
+            (
+                doc! {"x": {"$add": ["$a", 1]}, "b": 1},
+                doc! {"_id": 1, "b": 3, "x": 3},
+            ),
+            (doc! {"_id": 0, "x": {"$literal": 7}}, doc! {"x": 7}),
+            (
+                doc! {"o.x": {"$literal": 9}},
+                doc! {"_id": 1, "o": {"x": 9}},
+            ),
+            (doc! {"_id": {"$literal": 99}}, doc! {"_id": 99}),
+            // A bare reference to a missing field OMITS the key entirely...
+            (doc! {"x": "$nope"}, doc! {"_id": 1}),
+            // ...while an EXPRESSION over a missing field yields null.
+            (
+                doc! {"x": {"$add": ["$nope", 1]}},
+                doc! {"_id": 1, "x": Bson::Null},
+            ),
+            // A sub-document is classified PER LEAF.
+            (
+                doc! {"o": {"x": {"$literal": 3}}},
+                doc! {"_id": 1, "o": {"x": 3}},
+            ),
+            (doc! {"x": {"$size": "$arr"}}, doc! {"_id": 1, "x": 3}),
+        ];
+        for (spec, want) in cases {
+            let got = apply_projection(&src(), &spec, None)
+                .unwrap_or_else(|e| panic!("spec {spec:?} failed: {e:?}"));
+            assert_eq!(got, want, "spec {spec:?}");
+            // Field ORDER is behaviour, and `==` on a Document ignores it.
+            assert_eq!(
+                got.keys().collect::<Vec<_>>(),
+                want.keys().collect::<Vec<_>>(),
+                "field order for spec {spec:?}"
+            );
+        }
+    }
+
+    /// `{x: false}` is a FLAG, not a literal -- it excludes a field that is not
+    /// there, so the whole document survives. mongod 8.2.11.
+    #[test]
+    fn false_is_a_flag_not_a_literal() {
+        let got = apply_projection(&src(), &doc! {"x": false}, None).unwrap();
+        assert_eq!(got, src());
+    }
+
+    /// A computed field forces inclusion mode, so a companion exclusion is the
+    /// mix mongod rejects with Location31254.
+    #[test]
+    fn computed_plus_exclusion_is_31254() {
+        let err = apply_projection(&src(), &doc! {"x": {"$add": ["$a", 1]}, "b": 0}, None)
+            .expect_err("expected the mix to be rejected");
+        let (code, msg) = err.as_mongo().expect("should carry mongod's code");
+        assert_eq!(code, 31254);
+        assert_eq!(
+            msg,
+            "Cannot do exclusion on field b in inclusion projection"
+        );
+    }
+
+    /// An empty sub-projection is its own error at any depth.
+    #[test]
+    fn empty_sub_projection_is_51270() {
+        let err = apply_projection(&src(), &doc! {"o": {}}, None).expect_err("expected an error");
+        let (code, msg) = err.as_mongo().expect("should carry mongod's code");
+        assert_eq!(code, 51270);
+        assert_eq!(msg, "Invalid empty sub-projection: o");
     }
 }
