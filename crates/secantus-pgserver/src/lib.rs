@@ -1104,6 +1104,10 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             1000 => "bool[]",
             1009 => "text[]",
             1015 => "varchar[]",
+            1001 => "bytea[]",
+            1041 => "inet[]",
+            651 => "cidr[]",
+            2951 => "uuid[]",
             oid => {
                 return secantus_pgplan::range::range_oid_name(oid)
                     .or_else(|| secantus_pgplan::range::multirange_oid_name(oid))
@@ -1212,6 +1216,16 @@ fn wire_type(pg_type: &str) -> Type {
         "interval[]" => Type::INTERVAL_ARRAY,
         "json[]" => Type::JSON_ARRAY,
         "jsonb[]" => Type::JSONB_ARRAY,
+        // Arrays of the text-stored types. Without these they fell through to
+        // varchar -- a binary array result then hit the binary-varchar encoder
+        // ("cannot send this value as a binary varchar"), and a text result
+        // carried the varchar oid so the client returned strings instead of
+        // parsing bytes / addresses / UUIDs. Their own array oids keep them on
+        // the text array path the row description downgrades non-binary types to.
+        "bytea[]" => Type::BYTEA_ARRAY,
+        "inet[]" => Type::INET_ARRAY,
+        "cidr[]" => Type::CIDR_ARRAY,
+        "uuid[]" => Type::UUID_ARRAY,
         "bpchar[]" | "char[]" | "character[]" => Type::BPCHAR_ARRAY,
         "name[]" => Type::NAME_ARRAY,
         // Everything else renders as text for now; P4 owns the real type map.
@@ -4277,6 +4291,10 @@ fn element_of_array_oid(oid: u32) -> Option<&'static str> {
         6153 => "tstzmultirange",
         6155 => "datemultirange",
         6157 => "int8multirange",
+        1001 => "bytea",
+        1041 => "inet",
+        651 => "cidr",
+        2951 => "uuid",
         _ => return None,
     })
 }

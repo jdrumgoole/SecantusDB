@@ -4217,6 +4217,9 @@ fn render_array_element(v: &Bson) -> String {
         Bson::Decimal128(d) => return plain_numeric_text(&d.to_string()),
         Bson::Boolean(b) => return (if *b { "t" } else { "f" }).to_string(),
         Bson::Array(items) => return render_array(items),
+        // A bytea element renders as its `\x…` hex, then the array-quoting
+        // below wraps and escapes it (`"\\x01"`), matching PostgreSQL.
+        Bson::Binary(b) => bytea::render_hex(&b.bytes),
         other => format!("{other:?}"),
     };
     let needs_quotes = raw.is_empty()
