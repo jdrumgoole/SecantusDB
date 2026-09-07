@@ -1001,6 +1001,7 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             1114 => "timestamp",
             1184 => "timestamptz",
             1266 => "timetz",
+            2950 => "uuid",
             1186 => "interval",
             114 => "json",
             3802 => "jsonb",
@@ -1049,6 +1050,9 @@ fn wire_type(pg_type: &str) -> Type {
         // where 1114 builds a naive one from the same characters.
         "timestamptz" => Type::TIMESTAMPTZ,
         "timetz" => Type::TIMETZ,
+        // Its own oid (2950): a client reading it builds a UUID object rather
+        // than handing back the canonical text.
+        "uuid" => Type::UUID,
         "interval" => Type::INTERVAL,
         "json" => Type::JSON,
         "jsonb" => Type::JSONB,

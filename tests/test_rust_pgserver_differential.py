@@ -297,6 +297,14 @@ QUERIES = [
     "SELECT '12:34:56.000'::time::text",
     "SELECT NULL::date",
     "SELECT NULL::time",
+    # uuid canonicalises to lowercase 8-4-4-4-12 from upper / braces /
+    # no-hyphen / partial-hyphen spellings, all reading back as oid 2950.
+    "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::text",
+    "SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid::text",
+    "SELECT '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}'::uuid::text",
+    "SELECT 'a0eebc999c0b4ef8bb6d6bb9bd380a11'::uuid::text",
+    "SELECT 'a0eebc99-9c0b4ef8-bb6d-6bb9bd380a11'::uuid::text",
+    "SELECT NULL::uuid",
     "SELECT '1'::int",
     "SELECT 1::text",
     "SELECT '1.5'::float8",
@@ -951,6 +959,12 @@ ERROR_QUERIES = [
     "SELECT '12345-02-29'::date",
     "SELECT '0004-02-29 BC'::date",
     "SELECT '12345-04-31'::date",
+    # Malformed uuids are 22P02: not a uuid, too short, a hyphen off the
+    # group boundaries, and a non-hex digit.
+    "SELECT 'not-a-uuid'::uuid",
+    "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1'::uuid",
+    "SELECT 'a0-eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid",
+    "SELECT 'g0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid",
     "SELECT nosuchcolumn FROM d",
     "SELECT * FROM nosuchtable",
     "SELECT '{bad}'::json",

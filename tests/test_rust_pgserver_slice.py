@@ -19,6 +19,7 @@ import shutil
 import socket
 import subprocess
 import time
+import uuid
 from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
@@ -574,6 +575,47 @@ def test_date_and_time_columns(home: Path) -> None:
         assert exc.value.diag.sqlstate == "22008"
 
 
+def test_uuid_and_timetz_columns(home: Path) -> None:
+    """`uuid` and `timetz` as real column types.
+
+    A uuid canonicalises to lowercase 8-4-4-4-12 from any accepted spelling and
+    reports oid 2950, so psycopg hands back a `uuid.UUID`. A timetz keeps its
+    LITERAL offset -- it is not session-relative the way timestamptz is -- so
+    the canonical text is a safe column; it reports oid 1266.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE u (id int PRIMARY KEY, x uuid, t timetz)")
+        cur.execute(
+            "INSERT INTO u VALUES (1, 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', '12:34:56+02')"
+        )
+        cur.execute("SELECT x, t FROM u")
+        plus_two = dt.timezone(dt.timedelta(hours=2))
+        assert cur.fetchall() == [
+            (
+                uuid.UUID("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),
+                dt.time(12, 34, 56, tzinfo=plus_two),
+            ),
+        ]
+        assert [c.type_code for c in cur.description] == [2950, 1266]
+
+        # A no-hyphen spelling stores the same canonical value.
+        cur.execute("INSERT INTO u VALUES (2, 'a0eebc999c0b4ef8bb6d6bb9bd380a11', '08:00-05')")
+        cur.execute("SELECT x::text FROM u WHERE id = 2")
+        assert cur.fetchall() == [("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",)]
+
+        # A malformed uuid is 22P02.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("SELECT 'not-a-uuid'::uuid")
+        assert exc.value.diag.sqlstate == "22P02"
+
+        # timestamptz as a column is still refused (its stored text would be
+        # session-relative); 0A000 feature-not-supported.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("CREATE TABLE bad (id int, t timestamptz)")
+        assert exc.value.diag.sqlstate == "0A000"
+
+
 def test_timestamp_sub_millisecond_invariant(home: Path) -> None:
     """Timestamps keep microseconds BSON cannot hold, via a hidden companion.
 
@@ -972,22 +1014,27 @@ def test_timestamptz_columns_are_refused_not_silently_wrong(home: Path) -> None:
     zone, which no client could detect.
 
     The type still works everywhere it is a value rather than storage.
+    `timetz` is DIFFERENT and IS a valid column: its offset is literal, not
+    session-relative, so its canonical text is stable under any zone.
     """
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
-        for ddl in (
-            "create table t (id int primary key, ts timestamptz)",
-            "create table u (id int primary key, tt timetz)",
-        ):
-            with pytest.raises(psycopg.Error) as exc:
-                cur.execute(ddl)
-            assert exc.value.diag.sqlstate == "0A000"
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("create table t (id int primary key, ts timestamptz)")
+        assert exc.value.diag.sqlstate == "0A000"
 
         # A plain `timestamp` column is unaffected, and the tz types still work
         # as casts and bound values.
         cur.execute("create table v (id int primary key, ts timestamp)")
         cur.execute("select '2026-01-01 12:00'::timestamptz::text")
         assert cur.fetchone()[0] == "2026-01-01 12:00:00+00"
+
+        # `timetz` IS allowed as a column -- its offset is literal, so the
+        # canonical text is session-independent and safe to store.
+        cur.execute("create table u (id int primary key, tt timetz)")
+        cur.execute("insert into u values (1, '12:34:56+02')")
+        cur.execute("select tt::text from u")
+        assert cur.fetchone()[0] == "12:34:56+02"
 
 
 def test_interval_keeps_three_independent_parts(home: Path) -> None:
