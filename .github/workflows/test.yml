@@ -2174,10 +2174,15 @@ jobs:
         shell: bash
         run: |
           files=$(grep -rl '^import pg_oracle' tests/ | sort | tr '\n' ' ')
-          # The two Rust pgserver suites do not import pg_oracle (the differential
-          # reads SECANTUS_PG_ORACLE_DSN directly, the slice needs only the
-          # binary), so grep misses them -- add them explicitly.
-          files="$files tests/test_rust_pgserver_slice.py tests/test_rust_pgserver_differential.py"
+          # Add the Rust pgserver SLICE suite explicitly (it does not import
+          # pg_oracle, so grep misses it). It needs only the binary, runs in a
+          # few minutes, and is deterministic -- and it is the suite that has
+          # pre-existing tests a shared-code change can silently break (that is
+          # exactly how #1363 left `main` red under green CI). The DIFFERENTIAL
+          # suite (~800 tests doing DDL against one shared postgres) is too slow
+          # to fit this lane's budget and is already run locally against a real
+          # PostgreSQL before every pgserver change lands, so it stays local.
+          files="$files tests/test_rust_pgserver_slice.py"
           echo "oracle suites: $files"
           test -n "$files"
           PYTHONPATH=tests uv run python -m pytest $files -q -n auto \
