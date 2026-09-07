@@ -579,7 +579,6 @@ These commands accept the request and return a wire-valid response, but the resp
 
 ## 2. Stopgaps (functional but with significant limitations)
 
-- [ ] **OPEN — RUST pgserver: multidimensional array CONSTRUCTION is refused (`0A000`, noted 2026-09-07).** `ARRAY[[1,2],[3,4]]` errors, though a multidim array renders to `::text` correctly. Separate from the `ANY`/`ALL` operators (landed 2026-09-07: `col <op> ANY/ALL(array)` in SELECT and WHERE, three-valued, with untyped-array-parameter coercion and scalar-vs-array `42883`).
 
 These work end-to-end but cut corners.
 

@@ -3321,12 +3321,14 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
     let Bson::Array(items) = v else {
         return Err(bad("this value"));
     };
+    // A multidimensional array: hand-build its binary wire form (postgres_types
+    // has no ToSql for one) and emit it verbatim through RawField.
     if items.iter().any(|x| matches!(x, Bson::Array(_))) {
-        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".to_owned(),
-            "0A000".to_owned(),
-            "multidimensional arrays are not supported yet".to_owned(),
-        ))));
+        let elem_name = element_of_array_oid(ty.oid()).ok_or_else(|| bad("this value"))?;
+        let elem = wire_type(elem_name);
+        let binary = array_binary(items, &elem).ok_or_else(|| bad("this value"))?;
+        let text = secantus_pgplan::value_text(v);
+        return enc.encode_field(&RawField { binary, text });
     }
     if *ty == Type::BOOL_ARRAY {
         let v: Vec<Option<bool>> = items.iter().map(|x| x.as_bool()).collect();
@@ -3454,12 +3456,11 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
         // `{3,4}` -- a wrong answer that a client cannot tell from a real one.
         // Guessing the client's format code to smuggle the literal through as
         // text would be the same trade in a less visible place.
+        // A multidimensional array in the TEXT format: `value_text` already
+        // renders the nesting as `{{1,2},{3,4}}`, which the client parses.
         Some(Bson::Array(items)) if items.iter().any(|x| matches!(x, Bson::Array(_))) => {
-            Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "0A000".to_owned(),
-                "multidimensional arrays are not supported yet".to_owned(),
-            ))))
+            let text = secantus_pgplan::value_text(&Bson::Array(items.clone()));
+            enc.encode_field(&Some(text))
         }
         Some(Bson::Array(items)) => match items.first() {
             Some(Bson::Int32(_)) => {
@@ -3843,6 +3844,162 @@ fn unsupported_binary_oid(oid: Option<u32>) -> PgWireError {
         "0A000".into(),
         format!("binary parameters of type oid {oid:?} are not supported yet"),
     )))
+}
+
+/// A pre-serialized field carrying BOTH wire forms of a value `postgres_types`
+/// has no `ToSql` for -- a MULTIDIMENSIONAL array. A binary-encodable array
+/// column reaches `encode_binary` in EITHER format (psycopg reads arrays as
+/// text by default, binary on request), so both are built up front and
+/// `encode_field` picks the one the field was described in.
+#[derive(Debug)]
+struct RawField {
+    binary: Vec<u8>,
+    text: String,
+}
+
+impl ToSql for RawField {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.put_slice(&self.binary);
+        Ok(IsNull::No)
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+
+    to_sql_checked!();
+}
+
+impl ToSqlText for RawField {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        // Write the array text (`{{1,2},{3,4}}`) verbatim -- `str`'s own
+        // ToSqlText re-quotes it against the array type and corrupts it.
+        out.put_slice(self.text.as_bytes());
+        Ok(IsNull::No)
+    }
+}
+
+/// Raw bytes of ONE scalar element in `elem`'s binary wire format (no length
+/// prefix). Mirrors the single-value arms of `encode_binary`; returns `None`
+/// for an element type whose binary layout this server does not emit.
+fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
+    let int = |v: &Bson| -> Option<i64> {
+        match v {
+            Bson::Int32(x) => Some(i64::from(*x)),
+            Bson::Int64(x) => Some(*x),
+            Bson::Double(x) if x.fract() == 0.0 => Some(*x as i64),
+            _ => None,
+        }
+    };
+    let float = |v: &Bson| -> Option<f64> {
+        match v {
+            Bson::Int32(x) => Some(f64::from(*x)),
+            Bson::Int64(x) => Some(*x as f64),
+            Bson::Double(x) => Some(*x),
+            Bson::Decimal128(d) => d.to_string().parse().ok(),
+            _ => None,
+        }
+    };
+    match elem.oid() {
+        16 => match v {
+            Bson::Boolean(b) => Some(vec![u8::from(*b)]),
+            _ => None,
+        },
+        21 => Some(i16::try_from(int(v)?).ok()?.to_be_bytes().to_vec()),
+        23 => Some(i32::try_from(int(v)?).ok()?.to_be_bytes().to_vec()),
+        20 => Some(int(v)?.to_be_bytes().to_vec()),
+        26 => Some(u32::try_from(int(v)?).ok()?.to_be_bytes().to_vec()),
+        700 => Some((float(v)? as f32).to_be_bytes().to_vec()),
+        701 => Some(float(v)?.to_be_bytes().to_vec()),
+        1700 => {
+            let text = match v {
+                Bson::Decimal128(d) => secantus_pgplan::plain_numeric_text(&d.to_string()),
+                Bson::Int32(x) => x.to_string(),
+                Bson::Int64(x) => x.to_string(),
+                Bson::Double(x) => x.to_string(),
+                _ => return None,
+            };
+            numeric_binary(&text)
+        }
+        // text family: the value's UTF-8, verbatim.
+        25 | 1043 | 1042 | 19 | 18 => match v {
+            Bson::String(x) => Some(x.clone().into_bytes()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Build the PostgreSQL binary wire form of a (possibly multidimensional)
+/// array: `ndims`, `hasnull`, element oid, then per-dimension `[length][lbound]`,
+/// then every leaf in ROW-MAJOR order as `[len][bytes]` (`len = -1` for NULL).
+/// `None` if a leaf's element type has no binary encoder, or the nesting is
+/// ragged (mongod's stored values are rectangular, so this is a guard).
+fn array_binary(items: &[Bson], elem: &Type) -> Option<Vec<u8>> {
+    // Dimension sizes: walk the first-element chain down to the leaves.
+    let mut dims: Vec<usize> = Vec::new();
+    let mut level: &[Bson] = items;
+    loop {
+        dims.push(level.len());
+        match level.first() {
+            Some(Bson::Array(inner)) => level = inner,
+            _ => break,
+        }
+    }
+    let ndims = dims.len();
+    let mut flat: Vec<Option<Vec<u8>>> = Vec::new();
+    fn walk(
+        items: &[Bson],
+        depth: usize,
+        ndims: usize,
+        elem: &Type,
+        flat: &mut Vec<Option<Vec<u8>>>,
+    ) -> Option<()> {
+        for it in items {
+            if depth + 1 < ndims {
+                match it {
+                    Bson::Array(inner) => walk(inner, depth + 1, ndims, elem, flat)?,
+                    _ => return None,
+                }
+            } else {
+                match it {
+                    Bson::Null => flat.push(None),
+                    other => flat.push(Some(element_binary(other, elem)?)),
+                }
+            }
+        }
+        Some(())
+    }
+    walk(items, 0, ndims, elem, &mut flat)?;
+
+    let hasnull = flat.iter().any(Option::is_none);
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&(ndims as i32).to_be_bytes());
+    out.extend_from_slice(&i32::from(hasnull).to_be_bytes());
+    out.extend_from_slice(&(elem.oid() as i32).to_be_bytes());
+    for d in &dims {
+        out.extend_from_slice(&(*d as i32).to_be_bytes());
+        out.extend_from_slice(&1i32.to_be_bytes()); // lower bound is 1
+    }
+    for leaf in &flat {
+        match leaf {
+            None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(bytes) => {
+                out.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                out.extend_from_slice(bytes);
+            }
+        }
+    }
+    Some(out)
 }
 
 /// The element type behind an array oid, for the oids this server knows.

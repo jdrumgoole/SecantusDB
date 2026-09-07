@@ -623,6 +623,45 @@ def test_date_and_time_columns(home: Path) -> None:
         assert exc.value.diag.sqlstate == "22008"
 
 
+def test_multidimensional_arrays(home: Path) -> None:
+    """Multidimensional arrays over the wire, in both formats.
+
+    The values already STORE and text-render; the gap was RETURNING a nested
+    array to the client. `int[]` is binary-encodable, so a 2-D column reaches
+    the binary encoder in whichever format the cursor asked for -- text (the
+    psycopg default) or binary -- and both must reconstruct `[[1, 2], [3, 4]]`.
+    A ragged literal is rejected exactly as PostgreSQL rejects it.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE m (id int PRIMARY KEY, a int[], t text[])")
+        cur.execute("INSERT INTO m VALUES (1, '{{1,2},{3,4}}', '{{a,b},{c,d}}')")
+        for binary in (False, True):
+            c = conn.cursor(binary=binary)
+            c.execute("SELECT a, t FROM m WHERE id = 1")
+            assert c.fetchone() == ([[1, 2], [3, 4]], [["a", "b"], ["c", "d"]]), binary
+            assert [d.type_code for d in c.description] == [1007, 1009]
+
+        cur.execute("SELECT ARRAY[[1, 2], [3, 4]]")
+        assert cur.fetchone()[0] == [[1, 2], [3, 4]]
+        assert cur.description[0].type_code == 1007
+
+        cur.execute("SELECT ARRAY[[[1, 2]], [[3, 4]]]")
+        assert cur.fetchone()[0] == [[[1, 2]], [[3, 4]]]
+        cur.execute("SELECT ARRAY[[1, NULL], [3, 4]]::int[]")
+        assert cur.fetchone()[0] == [[1, None], [3, 4]]
+        cur.execute("INSERT INTO m VALUES (2, %s, NULL)", ([[5, 6], [7, 8]],))
+        cur.execute("SELECT a FROM m WHERE id = 2")
+        assert cur.fetchone()[0] == [[5, 6], [7, 8]]
+
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("SELECT ARRAY[[1, 2], [3]]")
+        assert exc.value.diag.sqlstate == "2202E"
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("SELECT '{{1,2},{3}}'::int[]")
+        assert exc.value.diag.sqlstate == "22P02"
+
+
 def test_uuid_and_timetz_columns(home: Path) -> None:
     """`uuid` and `timetz` as real column types.
 
