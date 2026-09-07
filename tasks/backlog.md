@@ -5473,6 +5473,62 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   Pinned by `tests/test_decimal128_zero_and_avg.py` (90 tests, both engines,
   table generated FROM mongod) and the `deczero` / `avgdiv` gate groups.
 
+- [ ] **OPEN, and it is a WRONG ANSWER not a message: a case-insensitive query
+  or sort over ANY non-ASCII text is a hard ERROR on the RUST server
+  (measured 2026-09-07).** `tools/probes/collation_order.py` was the one
+  Rust-aware probe never swept against the Rust server. Sweeping it found two
+  things.
+
+  **(a) Strength 1 or 2 over non-ASCII errors outright.**
+
+      find().sort("v", 1).collation({locale: "en", strength: 1})
+        over ["a", "A", "á", "B", "b"]
+          mongod  ['a', 'A', 'á', 'B', 'b']
+          python  ['a', 'A', 'á', 'B', 'b']     (matches)
+          rust    2 BadValue: an indexed value is of a type the Rust
+                  server does not support
+
+  Not just accents — `ß` and `日` (CJK) trigger it too. It hits a MATCH filter
+  as well as a sort (`find({v: "á"}).collation(...)`); a bare
+  `find().collation(...)` with neither is fine. Strength 3 is fine. So the
+  break is exactly "case- or accent-insensitive + any non-ASCII character",
+  which is the most common collation use over any non-English text.
+
+  Root cause is one line in `crates/secantus-core/src/collation.rs`
+  (`normalize_index_bytes`):
+
+      if !s.is_ascii() {
+          return None; // accent/case transform on non-ASCII -> defer
+      }
+
+  `sortkey::encode_value` turns that `None` into `UnsupportedValue`, and the
+  storage adapter maps it to the BadValue above. The DEFER is correct on the
+  Python server, where the pure engine picks it up; on the RUST server there is
+  no Python behind a defer, so it reaches the client as an error. Same shape as
+  the other defer-is-an-error findings.
+
+  **(b) Collated ORDER is not implemented on the Rust server at all.** 9 of the
+  19 probe cases sort by codepoint where mongod applies the collation
+  (`['a','az','b','á','ä']` for mongod's `['a','á','ä','az','b']`), covering
+  accents, `strength: 3` case order, `caseFirst`, `numericOrdering`,
+  `backwards` and the `de` locale. The Python server is 0 unexpected
+  divergences on the same 19 (2 known locale gaps needing ICU). `collation.py`'s
+  three-level `sort_levels` is the reference.
+
+  **Two blockers make this a DECISION, not just a port**, and both are why it is
+  filed rather than fixed:
+
+  1. **A dependency.** Case folding could use std `str::to_lowercase` (Unicode
+     aware, no new crate), but accent stripping needs NFD decomposition —
+     `unicode-normalization` or similar. `secantus-core` has no such dependency
+     today. Same class of question as the Decimal128 transcendentals.
+  2. **On-disk index encoding.** `normalize_index_bytes` feeds
+     `sortkey::encode_value`, which writes INDEX ENTRIES. A collated strength-1
+     index over non-ASCII builds today and stores codepoint-ordered keys (a
+     hinted find returns `['a','b','á']`), so changing the normalisation changes
+     stored keys — read `[[sortkey-rank-is-on-disk]]`: change both servers and
+     bump `entryFormat`, or an index silently changes the sort answer.
+
 - [ ] **STILL OPEN: `Decimal128` FINITE operands in the transcendentals — now
   the ONLY thing left in this family (19 shapes, re-measured 2026-09-07 after
   the zero and `$avg` work above).** The Rust engine defers
