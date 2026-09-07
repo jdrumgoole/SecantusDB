@@ -1719,16 +1719,12 @@ impl PgHandler {
     /// Queue a `ParameterStatus` report if this GUC is one PostgreSQL reports
     /// (GUC_REPORT). Sent to the client after the query completes.
     fn note_reportable_guc(&self, key: &str, value: &str) {
-        const REPORTED: [&str; 8] = [
-            "TimeZone",
-            "DateStyle",
-            "IntervalStyle",
-            "client_encoding",
-            "standard_conforming_strings",
-            "application_name",
-            "server_encoding",
-            "integer_datetimes",
-        ];
+        // ONLY TimeZone: it is the one GUC whose change we actually honour in
+        // output (a timestamptz renders in it). Reporting a GUC we do NOT honour
+        // -- e.g. DateStyle, which we always render ISO regardless -- makes the
+        // client switch its parser to a style our output never uses, which broke
+        // 231 datetime tests. Report what we obey, nothing more.
+        const REPORTED: [&str; 1] = ["TimeZone"];
         if REPORTED.contains(&key) {
             self.pending_params
                 .lock()
