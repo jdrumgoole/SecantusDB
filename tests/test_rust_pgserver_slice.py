@@ -1049,6 +1049,52 @@ def test_timestamptz_columns_are_refused_not_silently_wrong(home: Path) -> None:
         assert cur.fetchone()[0] == "12:34:56+02"
 
 
+def test_bytea_type_and_functions(home: Path) -> None:
+    """`bytea` as a real type: literals, a column, and the byte functions.
+
+    Stored as a `bson.Binary` (the representation the Python server uses, since
+    both share one store), reported with oid 17 so psycopg hands back `bytes`,
+    and rendered to text as the `\\x…` hex PostgreSQL emits. psycopg sends and
+    reads a bytea in the BINARY wire format by default, so the round-trip
+    exercises both the binary parameter decoder and the binary result encoder.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        # Hex and escape input both parse; output is always hex.
+        cur.execute("select '\\x0102ff'::bytea::text")
+        assert cur.fetchone()[0] == "\\x0102ff"
+        cur.execute("select 'ab\\001c'::bytea::text")
+        assert cur.fetchone()[0] == "\\x61620163"
+
+        # A real column, round-tripped through the binary wire format.
+        cur.execute("create table b (id int primary key, v bytea)")
+        cur.execute("insert into b values (1, %s)", (b"\xca\xfe\x00\x01",))
+        cur.execute("select v from b")
+        row = cur.fetchone()
+        assert bytes(row[0]) == b"\xca\xfe\x00\x01"
+        assert cur.description[0].type_code == 17
+
+        # The byte functions.
+        cur.execute("select length('\\x0102ff'::bytea), get_byte('\\x0102ff'::bytea, 2)")
+        assert cur.fetchone() == (3, 255)
+        cur.execute("select set_byte('\\x0102ff'::bytea, 1, 64)::text")
+        assert cur.fetchone()[0] == "\\x0140ff"
+        cur.execute("select encode('\\x0102ff'::bytea, 'base64')")
+        assert cur.fetchone()[0] == "AQL/"
+        cur.execute("select decode('AQL/', 'base64')::text")
+        assert cur.fetchone()[0] == "\\x0102ff"
+        cur.execute("select ('\\x0102'::bytea || '\\xff'::bytea)::text")
+        assert cur.fetchone()[0] == "\\x0102ff"
+
+        # Malformed input and an out-of-range index are distinct SQLSTATEs.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("select '\\xZZ'::bytea")
+        assert exc.value.diag.sqlstate == "22023"
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("select get_byte('\\x0102'::bytea, 5)")
+        assert exc.value.diag.sqlstate == "2202E"
+
+
 def test_interval_keeps_three_independent_parts(home: Path) -> None:
     """An interval is months, days and microseconds — separately.
 

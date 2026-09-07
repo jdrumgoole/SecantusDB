@@ -14,6 +14,7 @@
 use bson::{doc, Bson, Document};
 use std::str::FromStr;
 
+pub mod bytea;
 pub mod json;
 pub mod pgtypes;
 pub mod range;
@@ -82,6 +83,8 @@ pub enum Error {
     /// A malformed regular expression -> 2201B. Its own class, not 22P02: the
     /// PATTERN is broken, not the value being matched.
     InvalidRegex(String),
+    /// A byte/array index out of range -> 2202E (array_subscript_error).
+    ArraySubscript(String),
 }
 
 impl std::fmt::Display for Error {
@@ -104,7 +107,8 @@ impl std::fmt::Display for Error {
             | Error::UndefinedFunction(m)
             | Error::IndeterminateDatatype(m)
             | Error::UndefinedObject(m)
-            | Error::InvalidRegex(m) => write!(f, "{m}"),
+            | Error::InvalidRegex(m)
+            | Error::ArraySubscript(m) => write!(f, "{m}"),
             Error::MultipleCommands => {
                 write!(
                     f,
@@ -138,6 +142,7 @@ impl Error {
             Error::IndeterminateDatatype(_) => "42P18", // indeterminate_datatype
             Error::UndefinedObject(_) => "42704",   // undefined_object
             Error::InvalidRegex(_) => "2201B",      // invalid_regular_expression
+            Error::ArraySubscript(_) => "2202E",    // array_subscript_error
         }
     }
 }
@@ -2128,7 +2133,21 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                 }
             }
             match op {
-                "||" => "text".to_string(),
+                // `||` is text concatenation EXCEPT bytea||bytea, which is
+                // bytea: type it from the operands so a bare (uncast) concat
+                // reports oid 17 rather than 25.
+                "||" => {
+                    let side = |n: Option<&pg_query::protobuf::Node>| {
+                        n.map(|node| static_type(node, &Bson::Null))
+                    };
+                    if side(e.lexpr.as_deref()).as_deref() == Some("bytea")
+                        || side(e.rexpr.as_deref()).as_deref() == Some("bytea")
+                    {
+                        "bytea".to_string()
+                    } else {
+                        "text".to_string()
+                    }
+                }
                 "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" => "bool".to_string(),
                 // Arithmetic keeps the value's type when it computed one, and
                 // falls back to int4 for the NULL-placeholder case, which is
@@ -4116,6 +4135,17 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     if value == Bson::Null {
         return Ok(Bson::Null);
     }
+    // A stored `bytea` (Bson::Binary) renders to text as its `\x…` hex form and
+    // is a no-op cast to itself; other targets fall through to the usual error.
+    if let Bson::Binary(b) = &value {
+        match target {
+            "text" | "varchar" | "bpchar" | "name" => {
+                return Ok(Bson::String(bytea::render_hex(&b.bytes)))
+            }
+            "bytea" => return Ok(value.clone()),
+            _ => {}
+        }
+    }
     // A regtype value casts onward by its two natures: to text as its display
     // NAME, to any integer type as its OID.
     if let Some(oid) = regtype_oid(&value) {
@@ -4414,6 +4444,10 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             })
         }
         "time" => Ok(Bson::String(parse_time(&as_text(&value))?)),
+        "bytea" => {
+            let bytes = bytea::parse(&value)?;
+            Ok(bytea::to_binary(bytes))
+        }
         "uuid" => {
             let text = as_text(&value);
             parse_uuid(&text).map(Bson::String).ok_or_else(|| {
@@ -4817,6 +4851,12 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     }
 
     if op == "||" {
+        // `bytea || bytea` is BYTE concatenation, not text.
+        if let (Bson::Binary(a), Bson::Binary(b)) = (&lhs, &rhs) {
+            let mut bytes = a.bytes.clone();
+            bytes.extend_from_slice(&b.bytes);
+            return Ok(bytea::to_binary(bytes));
+        }
         let text = |v: &Bson| match v {
             Bson::String(s) => s.clone(),
             Bson::Int32(i) => i.to_string(),

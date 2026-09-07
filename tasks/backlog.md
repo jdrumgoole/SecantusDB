@@ -4853,7 +4853,7 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   that oid with it
   (the binary decoder covers `numeric` / `date` / `time` / `timestamp` /
   arrays / ranges / multiranges; a type it does not have cannot be decoded into
-  one — what remains unhandled there is `inet` / `cidr` / `bytea` / `json`,
+  one — what remains unhandled there is `inet` / `cidr` / `json`,
   all of which are missing TYPES, not decoder gaps; `uuid` shipped 2026-09-07
   as a text-valued type, so its BINARY parameter form is the remaining gap).
 - **Rust PG server: a result column is only sent in the BINARY format when its

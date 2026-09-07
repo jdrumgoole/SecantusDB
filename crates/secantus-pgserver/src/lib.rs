@@ -1002,6 +1002,7 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             1700 => "numeric",
             16 => "bool",
             25 => "text",
+            17 => "bytea",
             1043 => "varchar",
             1042 => "bpchar",
             19 => "name",
@@ -1045,6 +1046,7 @@ fn wire_type(pg_type: &str) -> Type {
         // and clients read the oid: psycopg decodes both to `str` so a value
         // comparison never notices, but pgjdbc and pgx do.
         "text" => Type::TEXT,
+        "bytea" => Type::BYTEA,
         "varchar" | "character varying" => Type::VARCHAR,
         "bpchar" | "char" | "character" => Type::BPCHAR,
         "name" => Type::NAME,
@@ -3226,6 +3228,12 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         }
     };
 
+    if *ty == Type::BYTEA {
+        let Bson::Binary(b) = v else {
+            return Err(bad("this value"));
+        };
+        return enc.encode_field(&b.bytes);
+    }
     if *ty == Type::BOOL {
         let Bson::Boolean(b) = v else {
             return Err(bad("this value"));
@@ -3451,6 +3459,10 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
                 enc.encode_field(&v)
             }
         },
+        // A `bytea` renders as its `\x…` hex text in the text format.
+        Some(Bson::Binary(b)) => {
+            enc.encode_field(&Some(secantus_pgplan::bytea::render_hex(&b.bytes).as_str()))
+        }
         _ => enc.encode_field(&None::<i32>),
     }
 }
@@ -4151,6 +4163,8 @@ fn decode_parameter(
             Some(25) | Some(1043) | Some(19) | Some(1042) => {
                 Ok(Bson::String(String::from_utf8_lossy(bytes).into_owned()))
             }
+            // `bytea` is raw bytes on the wire -- stored verbatim as Binary.
+            Some(17) => Ok(secantus_pgplan::bytea::to_binary(bytes.to_vec())),
             // These decode to their CANONICAL TEXT so a binary parameter takes
             // exactly the same path through the planner as a text one -- the
             // text path already turns each of these into the right value, and
@@ -4304,6 +4318,9 @@ fn decode_parameter(
             "t" | "true" | "TRUE" | "1" | "y" | "yes" | "on"
         ))),
         Some(25) | Some(1043) | Some(19) | Some(1042) => Ok(Bson::String(text.into_owned())),
+        Some(17) => secantus_pgplan::bytea::parse_text(&text)
+            .map(secantus_pgplan::bytea::to_binary)
+            .map_err(|e| PgHandler::err(&e)),
         // The TYPED text forms. These reach the same value the BINARY path
         // produces for the same oid, which is the whole point: a parameter's
         // meaning cannot depend on the format a client happened to send it in.
