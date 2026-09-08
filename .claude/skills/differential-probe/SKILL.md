@@ -302,8 +302,23 @@ it fixed.**
 The Rust parity suites pin the two engines to each other, so they are equally
 satisfied by **both being wrong** — which has happened (`$bucket` empty
 buckets, `$densify` on null, `$stdDev*` on non-numeric). Parity catches drift
-within seconds of a change; only the oracle says which side to move. Use both:
-after changing an engine, run the oracle probe *and* `pytest -k parity`.
+within seconds of a change; only the reference server says which side to move.
+Use both: after changing an engine, run the reference probe *and*
+`pytest -k parity`.
+
+**Each server's exemplar is the real product, never the other SecantusDB
+server**: `mongod` for both MongoDB servers, PostgreSQL for both PG servers. So
+when you are establishing what a server SHOULD answer, leave the sibling
+implementation out of the comparison entirely.
+
+A hand-written engine-vs-engine sweep is the same trap as the parity suite, with
+nothing to warn you. On 2026-09-08 a Rust-vs-Python sweep of the decimal
+transcendentals reported **"0 divergent of 384"** and that was reported as
+evidence the Rust server was right. It was not: the sweep had been used to
+*choose* the Rust server's behaviour, so agreement was circular — and three
+shapes where both engines differed from `mongod` were invisible to it. A
+`mongod`-only sweep found them at once. **Quote divergence counts against the
+real product; a count against the sibling server is not evidence.**
 
 ## Before you trust a green suite
 

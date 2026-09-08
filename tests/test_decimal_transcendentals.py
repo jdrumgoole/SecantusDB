@@ -147,6 +147,26 @@ def test_asinh_of_a_tiny_argument_keeps_every_digit():
     assert str(engine("$asinh", "1E-15")) == "9.999999999999999999999999999998333E-16"
 
 
+def test_asinh_follows_mongods_underflow_to_zero():
+    """Below `1E-4966` mongod's own implementation underflows to a bare `0`.
+
+    Not `0E-6176` -- that is what it answers for an exact zero -- and not the
+    mathematically correct value, which is what this returned when it was
+    written to agree with the other engine rather than with mongod. The
+    threshold was bisected against 8.2.11 on 2026-09-08.
+
+    mongod's answers just ABOVE the threshold are progressively wrong too
+    (`$asinh(1E-4965)` is `1.295…E-4965` where the true value is `1E-4965`);
+    that band is a breakdown in its implementation and is not reproduced here.
+    """
+    assert str(engine("$asinh", "1E-6176")) == "0"
+    assert str(engine("$asinh", "-1E-6176")) == "-0"
+    assert str(engine("$asinh", "1E-6100")) == "0"
+    assert str(engine("$asinh", "1E-4966")) == "0"
+    # Still the value one exponent above the threshold.
+    assert str(engine("$asinh", "1E-4000")) == "1.000000000000000000000000000000000E-4000"
+
+
 @pytest.mark.parametrize(
     "op,value,expected",
     [

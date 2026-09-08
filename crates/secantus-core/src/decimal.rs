@@ -1730,6 +1730,19 @@ pub fn asinh(a: &Dec) -> Option<Dec> {
             // Scaling the precision with the exponent instead would mean 6000-digit
             // series arithmetic at the bottom of the format.
             if let Some(adj) = hp_adjusted(&x) {
+                // mongod's own implementation UNDERFLOWS below `1E-4966` and
+                // answers a bare `0` (`-0` for a negative argument) -- note
+                // that is not the `0E-6176` it gives for an exact zero.
+                // Bisected against 8.2.11, 2026-09-08. Answering the
+                // mathematically correct value here instead was a divergence
+                // this server should not invent: mongod is the exemplar.
+                if adj <= -4966 {
+                    return Some(Dec::Fin {
+                        sign: if neg { -1 } else { 1 },
+                        coeff: vec![0],
+                        exp: 0,
+                    });
+                }
                 if adj <= -18 {
                     let Dec::Fin { coeff, exp, .. } = &x else {
                         return None;
@@ -1881,6 +1894,73 @@ mod transcendental_tests {
         );
     }
 
+    /// Every case measured from mongod 8.2.11 on 2026-09-08.
+    #[test]
+    fn div_matches_mongod() {
+        for (x, y, want) in [
+            // The ideal exponent is what makes these differ from each other.
+            ("2.5", "1", "2.5"),
+            ("10", "4", "2.5"),
+            ("1", "8", "0.125"),
+            ("100", "10", "10"),
+            ("2.50", "1.0", "2.5"),
+            ("7", "2", "3.5"),
+            ("0", "5", "0"),
+            ("-0", "5", "-0"),
+            // Inexact: 34 significant digits.
+            ("1", "3", "0.3333333333333333333333333333333333"),
+            ("1", "7", "0.1428571428571428571428571428571429"),
+            ("2", "3", "0.6666666666666666666666666666666667"),
+        ] {
+            let got = s(div(&parse(x).unwrap(), &parse(y).unwrap()));
+            assert_eq!(got, want, "{x} / {y}");
+        }
+        // Range and specials.
+        assert_eq!(
+            s(to_bson_str(div(
+                &parse("1E+6144").unwrap(),
+                &parse("1E-10").unwrap()
+            ))),
+            "Infinity"
+        );
+        assert_eq!(
+            s(to_bson_str(div(
+                &parse("1E-6176").unwrap(),
+                &parse("10").unwrap()
+            ))),
+            "0E-6176"
+        );
+        assert_eq!(s(div(&parse("1").unwrap(), &Dec::Inf(1))), "0E-6176");
+        assert_eq!(s(div(&Dec::Inf(1), &parse("2").unwrap())), "Infinity");
+        assert_eq!(s(div(&Dec::Nan, &parse("2").unwrap())), "NaN");
+        assert!(div(&parse("1").unwrap(), &parse("0").unwrap()).is_none());
+    }
+
+    #[test]
+    fn rem_matches_mongod() {
+        for (x, y, want) in [
+            ("2.5", "1", "0.5"),
+            ("10", "3", "1"),
+            ("-10", "3", "-1"),
+            ("10", "-3", "1"),
+            // The quantum is min(e1, e2), so this is `0.0` and not `0`.
+            ("7.5", "2.5", "0.0"),
+            // Exact over 6145 digits, which a float route cannot reach.
+            ("1E+6144", "7", "1"),
+        ] {
+            let got = s(rem(&parse(x).unwrap(), &parse(y).unwrap()));
+            assert_eq!(got, want, "{x} % {y}");
+        }
+        assert_eq!(s(rem(&Dec::Inf(1), &parse("2").unwrap())), "NaN");
+        assert_eq!(s(rem(&parse("5").unwrap(), &Dec::Inf(1))), "5");
+        assert!(rem(&parse("2.5").unwrap(), &parse("0").unwrap()).is_none());
+    }
+
+    /// A `Dec` through the decimal128 clamp, as the wire would see it.
+    fn to_bson_str(d: Option<Dec>) -> Option<Dec> {
+        d.map(|x| clamp(&x))
+    }
+
     #[test]
     fn specials_pass_through() {
         assert_eq!(s(asinh(&Dec::Nan)), "NaN");
@@ -1890,4 +1970,159 @@ mod transcendental_tests {
         assert!(ln(&parse("0").unwrap()).is_none());
         assert!(ln(&parse("-1").unwrap()).is_none());
     }
+}
+
+/// Integer `a / b` and `a % b` over digit magnitudes, both exact.
+fn int_divmod_mag(a: &[u8], b: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let den = strip_leading(b);
+    let mut quot: Vec<u8> = Vec::with_capacity(a.len());
+    let mut rem: Vec<u8> = vec![0];
+    for d in a {
+        // rem = rem * 10 + d
+        if rem == [0] {
+            rem[0] = *d;
+        } else {
+            rem.push(*d);
+        }
+        let mut q = 0u8;
+        while cmp_mag(&rem, den) != std::cmp::Ordering::Less {
+            rem = strip_leading(&sub_mag(&rem, den)).to_vec();
+            q += 1;
+        }
+        quot.push(q);
+    }
+    (strip_leading(&quot).to_vec(), strip_leading(&rem).to_vec())
+}
+
+/// `a / b` at decimal128 precision, with the decimal spec's IDEAL EXPONENT.
+///
+/// The ideal exponent of a quotient is `e1 - e2`, and an EXACT result is
+/// expressed as close to it as its digits allow -- which is why
+/// `100 / 10` is `10` and not `1E+1`, `2.50 / 1.0` is `2.5`, and `1 / 8` is
+/// `0.125` (it cannot reach the ideal `0`, so it stops at `-3`). An inexact
+/// result is 34 significant digits, round-half-even. Every case measured
+/// against 8.2.11, 2026-09-08.
+///
+/// `None` when the divisor is zero -- the caller raises mongod's error, whose
+/// code differs per operator.
+pub fn div(a: &Dec, b: &Dec) -> Option<Dec> {
+    use Dec::*;
+    match (a, b) {
+        (Nan, _) | (_, Nan) => return Some(Nan),
+        (Inf(_), Inf(_)) => return Some(Nan),
+        (Inf(x), Fin { sign, .. }) => return Some(Inf(x * sign)),
+        // A finite over an infinity is a ZERO at the minimum quantum, not a
+        // bare `0`: mongod answers `0E-6176`.
+        (Fin { sign, .. }, Inf(y)) => {
+            return Some(Fin {
+                sign: sign * y,
+                coeff: vec![0],
+                exp: MIN_EXP,
+            });
+        }
+        _ => {}
+    }
+    let (
+        Fin {
+            sign: s1,
+            coeff: c1,
+            exp: e1,
+        },
+        Fin {
+            sign: s2,
+            coeff: c2,
+            exp: e2,
+        },
+    ) = (a, b)
+    else {
+        return Some(Nan);
+    };
+    if strip_leading(c2).iter().all(|d| *d == 0) {
+        return None; // division by zero -- the caller names it
+    }
+    let sign = s1 * s2;
+    let ideal = e1.checked_sub(*e2)?;
+    if strip_leading(c1).iter().all(|d| *d == 0) {
+        return Some(Fin {
+            sign,
+            coeff: vec![0],
+            exp: ideal,
+        });
+    }
+    let q = hp_div(a, b, 80);
+    let rounded = hp_round_34(&q, 80)?;
+    let Fin {
+        coeff: qc, exp: qe, ..
+    } = &rounded
+    else {
+        return None;
+    };
+    // EXACT means the rounded quotient multiplied back reproduces the dividend
+    // exactly -- checked, not inferred from the guard digits.
+    let back = mul_mag(qc, c2);
+    let lhs_exp = qe + e2;
+    let exact = {
+        let target = lhs_exp.min(*e1);
+        cmp_mag(
+            &scale_to(&back, lhs_exp, target),
+            &scale_to(c1, *e1, target),
+        ) == std::cmp::Ordering::Equal
+    };
+    let (mut coeff, mut exp) = (strip_leading(qc).to_vec(), *qe);
+    if exact {
+        while exp < ideal && coeff.len() > 1 && *coeff.last().unwrap() == 0 {
+            coeff.pop();
+            exp += 1;
+        }
+        while exp > ideal && coeff.len() < MAX_DIGITS {
+            coeff.push(0);
+            exp -= 1;
+        }
+    }
+    Some(Fin { sign, coeff, exp })
+}
+
+/// `a % b`, with mongod's sign and quantum rules.
+///
+/// The sign follows the DIVIDEND (`-10 % 3` is `-1`, `10 % -3` is `1`) and the
+/// exponent is `min(e1, e2)`, so `7.5 % 2.5` is `0.0` rather than `0`. Computed
+/// as an exact integer remainder over the aligned coefficients, which keeps
+/// `1E+6144 % 7` exact where a float route has nothing left to divide.
+///
+/// `None` when the divisor is zero.
+pub fn rem(a: &Dec, b: &Dec) -> Option<Dec> {
+    use Dec::*;
+    match (a, b) {
+        (Nan, _) | (_, Nan) => return Some(Nan),
+        // An infinite DIVIDEND has no remainder; an infinite divisor leaves the
+        // dividend untouched (`5 % Infinity` is `5`).
+        (Inf(_), _) => return Some(Nan),
+        (other, Inf(_)) => return Some(other.clone()),
+        _ => {}
+    }
+    let (
+        Fin {
+            sign: s1,
+            coeff: c1,
+            exp: e1,
+        },
+        Fin {
+            coeff: c2, exp: e2, ..
+        },
+    ) = (a, b)
+    else {
+        return Some(Nan);
+    };
+    if strip_leading(c2).iter().all(|d| *d == 0) {
+        return None;
+    }
+    let target = (*e1).min(*e2);
+    let x = scale_to(c1, *e1, target);
+    let y = scale_to(c2, *e2, target);
+    let (_, r) = int_divmod_mag(&x, &y);
+    Some(Fin {
+        sign: *s1,
+        coeff: if r.is_empty() { vec![0] } else { r },
+        exp: target,
+    })
 }

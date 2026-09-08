@@ -48,6 +48,41 @@ The audience is developers who want fast, ephemeral, in-process MongoDB behaviou
   were not re-verified — they record when something was measured, not what the
   server does now. Re-probe before relying on one.
 - **`pymongo` is the conformance target.** Behaviour is "correct" when a `pymongo` client cannot tell SecantusDB apart from a real `mongod` for the operations it supports. When in doubt, write a test that runs the same code against `pymongo` → SecantusDB and `pymongo` → real MongoDB and assert the responses match.
+- **Every server's exemplar is the REAL product it imitates, never another
+  SecantusDB server.** This is one rule with two halves, and it applies to each
+  server independently:
+
+  | server | exemplar |
+  | --- | --- |
+  | the Rust MongoDB server | **`mongod`** |
+  | the Python MongoDB server | **`mongod`** |
+  | the Rust PG server | **PostgreSQL** |
+  | the Python PG server | **PostgreSQL** |
+
+  So: when you want to know what the **Rust MongoDB server** should answer,
+  probe `mongod` — *not* the Python server, and not `secantus.expressions`.
+  When you want to know what the **Rust PG server** should answer, probe
+  PostgreSQL — not the Python PG server. The other implementation is never the
+  authority, however convenient it is to reach.
+
+  **Comparing two SecantusDB servers to each other is a DRIFT detector, not a
+  correctness check.** It tells you the two moved apart; it never tells you
+  which one is right, and it is silent when both are wrong together. When they
+  disagree, probe the real product and move whichever side that says is wrong —
+  do not reason about which looks more correct.
+
+  This was learned the expensive way on 2026-09-08. A Rust-vs-Python comparison
+  of `$asinh` showed a disagreement, the Python answer looked mathematically
+  right, and the RUST side was changed to match it — moving the Rust server
+  *away* from `mongod`, which underflows to a bare `0` below `1E-4966`. The
+  engine-vs-engine sweep then reported "0 divergent of 384" and was cited as
+  evidence of correctness; a Rust-vs-`mongod`-only sweep of 1,298 cases found
+  the three shapes it had been blind to. **Report divergence counts against the
+  real product, never against the other SecantusDB server.**
+
+  A deliberate divergence from the exemplar is Joe's call, and stays as narrow
+  as what he actually authorised — a decision about last-digit rounding does not
+  license returning a different answer.
 - **Wire-protocol fidelity over feature completeness.** Prefer returning a faithful "command not supported" error over a half-implemented feature that silently diverges from real server behaviour.
 - **Ease of use for the beginning programmer:** starting a server in a test should be one or two lines, with no external processes to manage.
 
@@ -229,12 +264,18 @@ engines.
   Python server reverts to pure-Python, and `_secantus_core` is kept **only as the
   parity-test vehicle**. Don't build new in-process selection surface; build the
   Rust server (`tasks/rust-server-plan.md` §4, R1–R8).
-- **Parity suites stay (the operator oracle).** Each Rust engine is pinned
-  byte-for-byte to its pure-Python counterpart by a `tests/test_rust_*_parity.py`
-  suite (curated corpus + randomised fuzz); the Rust side returns a "defer to
-  Python" signal for constructs it can't reproduce exactly (regex → Python `re`,
-  collation, Decimal128 edges, non-ASCII case, etc.). When porting/widening a Rust
-  engine, **extend the parity suite first**; never let the two engines drift.
+- **Parity suites stay (a DRIFT detector, not an oracle).** Each Rust engine is
+  pinned byte-for-byte to its pure-Python counterpart by a
+  `tests/test_rust_*_parity.py` suite (curated corpus + randomised fuzz); the
+  Rust side returns a "defer to Python" signal for constructs it can't reproduce
+  exactly (regex → Python `re`, collation, Decimal128 edges, non-ASCII case,
+  etc.). When porting/widening a Rust engine, **extend the parity suite first**;
+  never let the two engines drift.
+
+  **But the Python engine is NOT the Rust server's exemplar** — `mongod` is (see
+  "Design constraints" above). These suites say the two engines moved apart;
+  they never say which one to move. A parity failure is a prompt to probe
+  `mongod`, not a licence to make Rust agree with Python.
 - **The parity suites do NOT cover the STORAGE layer** — they pin `query` /
   `update` / `expressions` / `projection` / `sortkey` / `diff` / `aggregate`,
   the pure engines. `secantus-storage` has its own port of the index helpers
@@ -415,7 +456,16 @@ real defects:
 **Parity is not correctness.** The Rust parity suites pin the two engines to
 each other, so they are equally satisfied by both being wrong — that has
 happened (`$bucket`, `$densify`, `$stdDev*`). Parity catches drift within
-seconds; only the oracle says which side to move. Use both.
+seconds; only the reference server says which side to move. Use both.
+
+**And a parity comparison run by hand is the same trap, with nothing to warn
+you.** On 2026-09-08 a Rust-vs-Python sweep of the decimal transcendentals
+reported "0 divergent of 384" and that number was reported as evidence the Rust
+server was right. It was not: the sweep had been used to CHOOSE the Rust
+server's behaviour, so agreement was guaranteed and meaningless, and three
+shapes where both engines differed from `mongod` were invisible to it. The
+`mongod`-only sweep found them immediately. **When you are establishing what is
+correct, leave the other SecantusDB server out of the comparison entirely.**
 
 **A green suite number means nothing without its baseline.** A worktree venv
 missing `_secantus_core` silently uncollects ~1700 parity tests and still exits

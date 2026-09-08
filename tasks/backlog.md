@@ -5546,7 +5546,45 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `$setEquals` each behave differently from their own families, and generalising
   either rule cost 46 shapes before the probe caught it. Probe per operator.
 
-- [ ] **The same probe against the RUST server: 925 of 3,968 (2026-09-02).**
+- [x] **RESOLVED 2026-09-08 — the expression corpus is down to 16 different
+  codes from 28, and 0 wrong values that are not deliberate.** Re-run of
+  `tools/probes/agg_expressions.py` (6,628 cases) against the Rust server after
+  the decimal work. Fixed in one batch, on BOTH engines:
+
+  - `$dateFromString` / `$dateToParts` / `$dateTrunc` / `$dateDiff` answered
+    NULL for a missing required parameter — a wrong VALUE, not a wrong message.
+  - `$getField` named the wrong missing field (mongod checks `field` before
+    `input`).
+  - `$divide` by a decimal zero raised `decimal.DivisionByZero` OUT of the
+    Python evaluator: `b == 0` is FALSE for `Decimal128("0")`, the
+    Python-`==`-for-a-BSON-semantic shape again.
+  - `$mod` of `1E+6144` by `7` answered `NaN` (quotient needs 6,145 digits), and
+    `$mod` by zero used 16610 where a decimal operand makes it 5733415.
+  - `$toDate` of `1.5` built a datetime with 1500 MICROSECONDS — a value BSON
+    cannot hold — where mongod truncates to 1ms. Both the double and decimal
+    paths.
+  - `$divide` / `$mod` / binData conversions / `$toDecimal` of the non-finite
+    doubles were refused on the Rust server and now work.
+
+  binData is worth remembering: `$toInt` / `$toLong` REINTERPRET the bytes as a
+  LITTLE-endian integer (`BinData(0, "01020304")` is `67305985`), `$toDouble`
+  reinterprets 4 bytes as an IEEE single and 8 as a double, and `$toString` is
+  base64. Nothing is parsed.
+
+  Pinned by `tests/test_expression_conversions_and_arith.py` (55 cases).
+
+  **What is left in that corpus is 16 shapes in three groups, none of them a
+  plain bug:** 12 are the trig / hyperbolic / `$pow` decimal family awaiting the
+  same decision as the entry above; 2 are `$median` / `$percentile`, which the
+  Rust server does not implement at all; 2 are `$toLower` / `$toUpper` of a
+  `Timestamp`, which mongod renders through a legacy `asctime`-like path in
+  LOCAL time (`Timestamp(1, 1)` prints `jan  1 01:00:01:1` on a UTC+1 host), so
+  reproducing it would bake this box's timezone into the answer — measure it on
+  a `TZ=UTC` server before implementing. Note `$toString` of a `Timestamp` is a
+  241 on mongod, so those two accept a type `$toString` refuses.
+
+- [ ] **SUPERSEDED by the entry above — the same probe against the RUST server:
+  925 of 3,968 (2026-09-02).**
   Was 981; `$stdDevPop` / `$stdDevSamp` in EXPRESSION position are now
   implemented (the `$group` accumulator forms had shipped long ago and the
   expression forms never did, so all 56 shapes refused valid input).
@@ -6059,8 +6097,28 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
     argument unreduced and made the Taylor series overrun its term cap for any
     `x` above ~1000.
 
-  Pinned by `tests/test_decimal_transcendentals.py` (83 cases, which computes
+  Pinned by `tests/test_decimal_transcendentals.py` (84 cases, which computes
   its own 250-digit reference and self-checks it) and 6 Rust unit tests.
+
+  **Correction, same day: the authorised divergence is LAST-DIGIT ONLY, and one
+  change overstepped it.** `$asinh` of a decimal below `1E-4966` was made to
+  return the mathematically correct value because the two ENGINES were compared
+  to each other and the Python one looked right. mongod underflows to a bare
+  `0` there (not the `0E-6176` it gives for an exact zero), so that was a
+  self-invented divergence on 3 shapes. Both servers now follow mongod.
+
+  A Rust-vs-mongod-only sweep of 1,298 cases is the check that found it: **36
+  divergent, of which 34 are last-digit and 2 are equal-value-different-quantum
+  (`$log10` of `1E+10`), and 0 are anything larger.** The Rust-vs-Python sweep
+  reported 0 divergent over the same ground and was blind to all three, because
+  both engines were wrong together. **The Rust server's exemplar is mongod;
+  engine agreement is a drift detector, never a correctness signal.**
+
+  mongod's `$asinh` degrades from about `1E-4955` down to the cliff
+  (`1E-4965` is 30% off), and that band is NOT reproduced -- reproducing it
+  would mean reproducing its error accumulation. Likewise `$log10` of a power of
+  ten is exact here and merely usually exact on mongod: `$log10(1E+5)` is
+  `5.000000000000000000000000000000001` on 8.2.11.
 
 - [ ] **The other decimal transcendentals still refuse (2026-09-08).** The six
   trig and the remaining hyperbolics (`$sin`, `$cos`, `$tan`, `$asin`, `$acos`,
