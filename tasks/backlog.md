@@ -4858,21 +4858,21 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `true` here. Reproducing it needs PostgreSQL's operator-resolution table for
   arrays, not a comparison fix. Being more permissive, so it accepts queries
   PostgreSQL rejects rather than answering them differently.
-- **Rust PG server: schema-qualified composite type names are NOT namespaced —
-  BLOCKS the whole psycopg composite cluster (probed 2026-09-08).** psycopg's
-  session-scoped `testcomp` fixture (tests/types/test_composite.py) runs
-  `create type testschema.testcomp as (...)` alongside a bare `create type
-  testcomp`. The Rust server resolves a qualified type name by its LAST part
-  (like tables), so `testschema.testcomp` collides with `testcomp` and the
-  CREATE fails `42710 type "testcomp" already exists`. Because the fixture is
-  `scope="session"`, that one failure cascades to ~38 ERRORed composite tests —
-  the single highest-leverage composite fix. Root cause: `plan_create`'s
-  composite arm reads only `ct.typevar.relname` and drops
-  `ct.typevar.schemaname`, and the composite catalog keys on the bare name. A
-  real fix needs schema-namespaced composite storage + resolution: capture the
-  schema, key the catalog on `(schema, name)`, and make `to_regtype('a.b')`,
-  `oid::regtype::text` (renders `testschema.testcomp`), and the pg_type/
-  pg_namespace reads schema-aware. Probe: `scratchpad/probe_fixture.py`.
+- **Rust PG server: DDL is NOT visible within its own open transaction —
+  blocks psycopg's schema-qualified TypeInfo tests + likely more (probed
+  2026-09-08).** With autocommit off, `create type testschema.testtype`
+  followed by `select to_regtype('testschema.testtype')` in the SAME
+  transaction returns NULL — and so does the bare `to_regtype('testtype')`, so
+  this is NOT schema-specific: an uncommitted CREATE TYPE (and almost certainly
+  CREATE TABLE / CREATE SCHEMA / etc.) is invisible to later statements on the
+  same connection until commit. The oracle resolves it. `install_user_types`
+  (and the catalog reads generally) see committed store state, not the
+  connection's uncommitted writes. This fails
+  `tests/test_typeinfo.py::test_fetch_by_schema_qualified_string` (sync+async,
+  both params) and is a broad correctness gap for any test that creates a type
+  and uses it before committing. Probe: connect with `autocommit=False`, CREATE
+  then to_regtype. Fixing it needs the catalog reads to layer the open
+  transaction's pending DDL over the committed store.
 
 - **Rust PG server: composite VALUE round-trip (`register_composite` of a value)
   is the remaining composite piece (2026-09-08).** `CompositeInfo.fetch` now
@@ -4881,11 +4881,19 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   per column) matches the oracle at zero divergences, including a nested
   composite field and a base type's empty-array result (shipped: aggregate
   subquery join side, `oid[]` column type, coalesce-as-target, coalesce-on-miss
-  empty array, user-type field-oid resolution in `pg_attribute`). What remains
-  is registering and round-tripping a composite VALUE: encoding/decoding a
-  `ROW(...)`-shaped composite datum on the wire so `register_composite`'s dumper
-  and loader work end-to-end. Scope that from a probe (psycopg
-  `register_composite` + an insert/select of a composite column) before starting.
+  empty array, user-type field-oid resolution in `pg_attribute`). **Schema-
+  qualified composite naming also shipped** — `CREATE TYPE s.t` is a distinct
+  type from a bare `t`, `to_regtype` resolves bare / `schema.name` / quoted
+  `"schema"."name"` forms, and DROP is schema-aware — so psycopg's session-
+  scoped `testcomp` fixture (which creates `testschema.testcomp` beside
+  `testcomp`) no longer cascades and `test_fetch_info` / `test_fetch_info_async`
+  pass. What remains is registering and round-tripping a composite VALUE:
+  encoding/decoding a `ROW(...)`-shaped composite datum on the wire so
+  `register_composite`'s dumper and loader work end-to-end (this is the bulk of
+  the ~54 still-failing composite tests — `test_dump_*` / `test_load_*`). Scope
+  that from a probe (psycopg `register_composite` + an insert/select of a
+  composite column) before starting. NOTE the schema-qualified TypeInfo tests
+  additionally need in-transaction DDL visibility (separate backlog item above).
 
 - **Rust PG server: record FUNCTIONS and field access are deferred (2026-09-07).**
   `ROW(...)` / `(a, b, ...)` construction, the `::text` render, and the

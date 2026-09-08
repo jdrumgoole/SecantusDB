@@ -2988,6 +2988,60 @@ def test_composite_info_fetch(home: Path) -> None:
         assert list(base.field_types) == []
 
 
+def test_schema_qualified_composite_is_distinct(home: Path) -> None:
+    """`create type s.t` is a DISTINCT type from a bare `t`.
+
+    psycopg's composite test fixture creates `testschema.testcomp` beside a bare
+    `testcomp`; a server that resolves a qualified type name to its last part
+    collides them and the CREATE fails 42710, which -- the fixture being
+    session-scoped -- cascades to every composite test. Here the two coexist,
+    each fetches its OWN fields, and `to_regtype` resolves each name (bare,
+    `schema.name`, and the quoted `"schema"."name"` a `sql.Identifier` renders)
+    to the right oid. The bare name resolves only the public type; the schema
+    name resolves only the schema-qualified one; `typname` stays unqualified.
+    """
+    from psycopg import sql
+    from psycopg.types.composite import CompositeInfo
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        # The whole fixture as one multi-statement simple query, as psycopg sends it.
+        cur.execute(
+            "create schema if not exists testschema;"
+            " create type testcomp as (foo text, bar int8, baz float8);"
+            " create type testschema.testcomp as (foo text, bar int8, qux bool);"
+        )
+
+        pub = CompositeInfo.fetch(conn, "testcomp")
+        sch = CompositeInfo.fetch(conn, "testschema.testcomp")
+        assert pub.name == "testcomp" and sch.name == "testcomp"  # typname is bare
+        assert pub.oid != sch.oid  # distinct types
+        assert list(pub.field_names) == ["foo", "bar", "baz"]
+        assert list(sch.field_names) == ["foo", "bar", "qux"]
+        assert list(pub.field_types) == [25, 20, 701]  # text, int8, float8
+        assert list(sch.field_types) == [25, 20, 16]  # text, int8, bool
+
+        # A quoted schema-qualified reference (what sql.Identifier renders) also
+        # resolves to the schema-qualified type.
+        ident = CompositeInfo.fetch(conn, sql.Identifier("testschema", "testcomp"))
+        assert ident.oid == sch.oid
+
+        # to_regtype: the bare name is the public type; the schema name is the
+        # other; a bare name never reaches the schema-qualified type.
+        cur.execute("select to_regtype('testcomp')::oid, to_regtype('testschema.testcomp')::oid")
+        pub_oid, sch_oid = cur.fetchone()
+        assert pub_oid == pub.oid
+        assert sch_oid == sch.oid
+        assert pub_oid != sch_oid
+
+        # DROP is schema-aware: dropping the qualified type leaves the bare one.
+        cur.execute("drop type testschema.testcomp")
+        cur.execute("select to_regtype('testschema.testcomp'), to_regtype('testcomp')::oid")
+        gone, still = cur.fetchone()
+        assert gone is None
+        assert still == pub.oid
+
+
 def test_a_plain_select_over_a_join(home: Path) -> None:
     """A top-level two-table JOIN outside any aggregate.
 

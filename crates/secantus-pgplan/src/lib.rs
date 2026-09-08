@@ -179,6 +179,10 @@ pub enum Statement {
     /// `CREATE TYPE <name> AS (<field type>, ...)` -- a composite type.
     CreateComposite {
         name: String,
+        /// The schema qualifier (`CREATE TYPE s.t AS (...)`), or `None` for an
+        /// unqualified name, which lands in `public`. Two composites with the
+        /// same bare name in different schemas are distinct types.
+        schema: Option<String>,
         /// (field name, field type name), in declared order.
         fields: Vec<(String, String)>,
     },
@@ -705,11 +709,16 @@ pub fn plan_with_params(
         }),
         // `CREATE TYPE name AS (field type, ...)` -- a composite type.
         N::CompositeTypeStmt(ct) => {
-            let name = ct
+            let typevar = ct
                 .typevar
                 .as_ref()
-                .map(|r| r.relname.clone())
                 .ok_or_else(|| Error::Parse("CREATE TYPE without a name".into()))?;
+            let name = typevar.relname.clone();
+            let schema = if typevar.schemaname.is_empty() {
+                None
+            } else {
+                Some(typevar.schemaname.clone())
+            };
             let mut fields = Vec::new();
             for col in &ct.coldeflist {
                 let Some(N::ColumnDef(cd)) = col.node.as_ref() else {
@@ -722,7 +731,11 @@ pub fn plan_with_params(
                     .ok_or_else(|| Error::Parse("composite field without a type".into()))?;
                 fields.push((cd.colname.clone(), ty));
             }
-            Ok(Statement::CreateComposite { name, fields })
+            Ok(Statement::CreateComposite {
+                name,
+                schema,
+                fields,
+            })
         }
         // `CREATE TYPE ... AS ENUM`. The name may be schema-qualified; with no
         // schema support the last part is the name, same rule as columns.
@@ -3245,14 +3258,27 @@ pub fn regtype_text(oid: i64) -> String {
         return format!("{}[]", display_type(name));
     }
     if let Some(name) = user_type_name(oid) {
-        // A name that is not plain lower-case renders QUOTED -- PostgreSQL's
-        // regtype output rule, measured: `"CamelCase"`, but `mood`.
-        let plain = !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-            && !name.chars().next().is_some_and(|c| c.is_ascii_digit());
-        return if plain { name } else { format!("\"{name}\"") };
+        // PostgreSQL renders a regtype per IDENTIFIER PART: a schema-qualified
+        // `testschema.testcomp` prints unquoted as `schema.name` (each part
+        // quoted only when it is not a plain lower-case identifier -- measured:
+        // `"CamelCase"`, but `mood`), NOT as one quoted `"schema.name"`.
+        let quote_part = |part: &str| -> String {
+            let plain = !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                && !part.chars().next().is_some_and(|c| c.is_ascii_digit());
+            if plain {
+                part.to_string()
+            } else {
+                format!("\"{part}\"")
+            }
+        };
+        return name
+            .split('.')
+            .map(quote_part)
+            .collect::<Vec<_>>()
+            .join(".");
     }
     oid.to_string()
 }
@@ -3534,23 +3560,57 @@ fn user_range_oid(name: &str) -> Option<i64> {
 
 /// A user type's oid by name, quoted or bare -- the bare form FOLDS, exactly
 /// as `oid_of_name` does for builtins.
+/// One identifier part of a possibly-qualified type reference: a quoted part
+/// keeps its case, an unquoted part folds to lower (PostgreSQL's rule).
+fn normalize_ident_part(part: &str) -> String {
+    let p = part.trim();
+    match p.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        Some(inner) => inner.replace("\"\"", "\""),
+        None => p.to_ascii_lowercase(),
+    }
+}
+
+/// Canonicalise a type reference to the resolution key composites register
+/// under: a bare `name` (unqualified, or explicitly `public`) or `schema.name`.
+/// Handles quoted parts (`"testschema"."testcomp"`, from `sql.Identifier`) and
+/// splits on a dot only outside quotes.
+fn canonical_type_ref(name: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = name.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                if in_quotes && chars.peek() == Some(&'"') {
+                    cur.push('"');
+                    cur.push('"');
+                    chars.next();
+                } else {
+                    cur.push('"');
+                    in_quotes = !in_quotes;
+                }
+            }
+            '.' if !in_quotes => parts.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    parts.push(cur);
+    let norm: Vec<String> = parts.iter().map(|p| normalize_ident_part(p)).collect();
+    match norm.as_slice() {
+        [schema, name] if schema == "public" => name.clone(),
+        [schema, name] => format!("{schema}.{name}"),
+        _ => norm.join("."),
+    }
+}
+
 fn user_type_oid(name: &str) -> Option<i64> {
-    let trimmed = name.trim();
-    let (target, fold) = match trimmed.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
-        Some(inner) => (inner.to_string(), false),
-        None => (trimmed.to_ascii_lowercase(), true),
-    };
+    let target = canonical_type_ref(name);
     PLAN_USER_TYPES
         .with(|t| {
             t.borrow()
                 .iter()
-                .find(|(n, _, _)| {
-                    if fold {
-                        n.to_ascii_lowercase() == target
-                    } else {
-                        *n == target
-                    }
-                })
+                .find(|(n, _, _)| *n == target)
                 .map(|(_, oid, _)| *oid)
         })
         .or_else(|| user_range_oid(name))
@@ -6030,15 +6090,23 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
             let Some(N::TypeName(tn)) = obj.node.as_ref() else {
                 return Err(Error::Unsupported("this DROP TYPE target".into()));
             };
-            let name = tn
+            // Keep the qualifier: `testschema.t` drops the composite keyed on
+            // `testschema.t`, distinct from a bare `t`. `public.t` normalises to
+            // bare `t`, which is how an unqualified composite is stored.
+            let parts: Vec<String> = tn
                 .names
                 .iter()
                 .filter_map(|n| match n.node.as_ref()? {
                     N::String(s) => Some(s.sval.clone()),
                     _ => None,
                 })
-                .next_back()
-                .ok_or_else(|| Error::Parse("DROP TYPE without a name".into()))?;
+                .collect();
+            let name = match parts.as_slice() {
+                [] => return Err(Error::Parse("DROP TYPE without a name".into())),
+                [bare] => bare.clone(),
+                [schema, bare] if schema == "public" => bare.clone(),
+                _ => parts.join("."),
+            };
             names.push(name);
         }
         return Ok(Statement::DropType {
