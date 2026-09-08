@@ -4858,135 +4858,34 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `true` here. Reproducing it needs PostgreSQL's operator-resolution table for
   arrays, not a comparison fix. Being more permissive, so it accepts queries
   PostgreSQL rejects rather than answering them differently.
-- **Rust PG server: composite-type introspection (`CompositeInfo.fetch`) is a
-  CAMPAIGN, not a slice — remapped 2026-09-07.** ENUM introspection now WORKS:
-  `TypeInfo.fetch` and `EnumInfo.fetch` both succeed, and an enum column reports
-  its own oid (#1364), so `register_enum` round-trips — the earlier "four
-  features" framing was stale for enums. What remains blocked is COMPOSITE,
-  behind psycopg's `CompositeInfo.fetch` query, which currently dies at
-  `0A000 this JOIN side is not supported`. The exact query (captured 2026-09-07):
+- **Rust PG server: schema-qualified composite type names are NOT namespaced —
+  BLOCKS the whole psycopg composite cluster (probed 2026-09-08).** psycopg's
+  session-scoped `testcomp` fixture (tests/types/test_composite.py) runs
+  `create type testschema.testcomp as (...)` alongside a bare `create type
+  testcomp`. The Rust server resolves a qualified type name by its LAST part
+  (like tables), so `testschema.testcomp` collides with `testcomp` and the
+  CREATE fails `42710 type "testcomp" already exists`. Because the fixture is
+  `scope="session"`, that one failure cascades to ~38 ERRORed composite tests —
+  the single highest-leverage composite fix. Root cause: `plan_create`'s
+  composite arm reads only `ct.typevar.relname` and drops
+  `ct.typevar.schemaname`, and the composite catalog keys on the bare name. A
+  real fix needs schema-namespaced composite storage + resolution: capture the
+  schema, key the catalog on `(schema, name)`, and make `to_regtype('a.b')`,
+  `oid::regtype::text` (renders `testschema.testcomp`), and the pg_type/
+  pg_namespace reads schema-aware. Probe: `scratchpad/probe_fixture.py`.
 
-  ```sql
-  SELECT t.typname AS name, t.oid AS oid, t.typarray AS array_oid,
-         t.oid::regtype::text AS regtype,
-         coalesce(a.fnames, '{}') AS field_names,
-         coalesce(a.ftypes, '{}') AS field_types
-  FROM pg_type t
-  LEFT JOIN (
-      SELECT attrelid, array_agg(attname) AS fnames, array_agg(atttypid) AS ftypes
-      FROM (
-          SELECT a.attrelid, a.attname, a.atttypid
-          FROM pg_attribute a JOIN pg_type t ON t.typrelid = a.attrelid
-          WHERE t.oid = $regtype AND a.attnum > 0 AND NOT a.attisdropped
-          ORDER BY a.attnum
-      ) x
-      GROUP BY attrelid
-  ) a ON a.attrelid = t.typrelid
-  WHERE t.oid = $regtype
-  ```
-
-  It needs, none of which exist as a JOIN side today: (1) a LEFT JOIN whose RHS
-  is a SUBQUERY (not a table) — this is the exact node that raises `this JOIN
-  side`; (2) a nested subquery in FROM (`FROM (SELECT ...) x`); (3) a JOIN
-  inside that subquery (`pg_attribute a JOIN pg_type t ON t.typrelid =
-  a.attrelid`); (4) `array_agg` over the grouped rows; (5) LEFT-JOIN semantics
-  so a fieldless composite still returns its row via `coalesce`. The catalog
-  side already exists (`pg_type` / `pg_attribute` virtual tables from #1344, and
-  `pg_attribute` carries composites). Decompose into: subquery-as-join-side
-  first (unblocks the shape), then the aggregate-subquery materialisation.
-  `test_composite.py` (78) is gated on this. Do NOT re-scope as one batch.
-
-  **Precise 3-gap decomposition (probed 2026-09-07, no code written):** the
-  catalog is ready (`pg_type` gives the composite oid + typrelid; `pg_attribute`
-  exposes `(attrelid=typrelid, attname, atttypid, attnum, attisdropped)`;
-  `array_agg` + GROUP BY + subquery-in-FROM + aggregate-over-a-subquery-join all
-  exist). Three planner extensions remain, build as SEPARATE batches in order:
-  1. **Multi-predicate subquery WHERE** — the inner `WHERE t.oid=$1 AND
-     a.attnum>0 AND NOT a.attisdropped` fails `0A000 this subquery WHERE is not
-     supported yet`; `JoinSelect.filter` carries only ONE `(alias,col,value)`
-     equality, needs an AND of equality + `>` + `NOT <bool>`. Independently
-     useful; lowest risk; do first.
-  2. **Subquery as a JOIN side** — `pg_type t LEFT JOIN (SELECT …) a` fails
-     `0A000 this JOIN side` (`plan_join_select`'s `side()` at lib.rs:~1582 takes
-     only `N::RangeVar`, not `N::RangeSubselect`). Requires changing
-     `JoinSelect.left`/`right` from `(table, alias)` to allow a materialised
-     subquery side + updating `join_docs`/`table_docs` — **800+ differential join
-     tests at risk**, so this is the risky middle batch; guard with the full
-     differential run.
-  3. **`coalesce(a.fnames, '{}')`** — a LEFT-JOIN miss yields NULL → empty array.
-
-  **Refined 2026-09-08 (3rd probe, no code — three forks have now confirmed this is a
-  campaign, not a slice):** NO bounded subset clears any composite gauge test (all need
-  full CompositeInfo.fetch), so do NOT ship a partial that touches the shared join
-  filter/executor for zero gauge gain. Corrections to the map: piece 1 is TWO sub-issues
-  — (1a) even a SINGLE-predicate `WHERE t.oid=$1` fails `0A000 a WHERE on the right side
-  of a LEFT JOIN` (the column is on the join's RIGHT side); (1b) the multi-predicate
-  `AND attnum>0 AND NOT attisdropped` fails `this subquery WHERE`. Both live in
-  `plan_join_select`'s `JoinSelect.filter` (`Option<(String,String,Bson)>`, ~lib.rs:437),
-  which must become a Vec of predicates (`=` on EITHER side, `>`, `NOT <bool>`). Piece 2
-  (`side()` ~lib.rs:1616 accepting `N::RangeSubselect`) needs `JoinSelect.left`/`right`
-  (today `(table,alias)`, lib.rs:425) to allow a subquery side AND `join_docs`/`table_docs`
-  to RECURSIVELY EXECUTE the aggregate sub-plan and materialise its rows — a side enum +
-  recursive sub-plan execution, with the 800+ differential join tests at risk (full
-  differential is a mandatory guard). Piece 3 (coalesce miss → `{}`) small, last. This is
-  a dedicated focused effort with repeated full-differential validation, best done in a
-  session with the context budget for the JoinSelect refactor — not an incremental-PR
-  sequence and not safe to rush.
-
-  **EXECUTION-READY PATH (4th probe, 2026-09-08 — traced planner + executor + caller):**
-  - Piece 1 — **LANDED 2026-09-08** (multi-predicate JOIN WHERE: `JoinSelect.filter`
-    is now `Vec<JoinPred>`, ops `=`/`>`/`>=`/`<`/`<=`/`NOT <bool>` on either side,
-    validated 0-regression across 1029 tests). Original note:
-  - Piece 1 (`plan_join_select` pgplan ~1560; `join_docs` pgserver ~346): `JoinSelect.filter:
-    Option<(String,String,Bson)>` → `Vec<Predicate{alias,col,op(=|>|>=|<|<=|is_not_true),value}>`.
-    In `plan_join_select` walk an AND of AExprs (today one `=`) + handle `NOT <boolcol>`
-    (BoolExpr/rhs-less AExpr). In `join_docs` apply each predicate to left/right rows by
-    alias (loop already does this for the one equality). Inner nested join is INNER so
-    right-side predicates are safe.
-  - Piece 2 (crux): `side()` (pgplan ~1616) returns `(String,String)` → a `JoinSide` enum
-    `{ Table(String,String) | Sub(Box<sub-plan>, alias) }`; accept `N::RangeSubselect` by
-    recursively planning its inner SelectStmt (`plan_select`/`plan_aggregate`). MATERIALIZE
-    IN THE CALLER `execute()` (pgserver ~2365, already runs aggregates/selects): before
-    `join_docs`, execute any `Sub` side to `Vec<Document>` keyed by its output column names
-    and pass pre-materialized rows into a `join_docs` variant (so the `join_docs` HELPER
-    need not call back into the executor). `join_output_def` must derive the def from a
-    `Sub` side's columns.
-  - Piece 3 (small): the outer LEFT-JOIN miss must yield NULL (not absent) for the aggregate
-    columns so the existing `coalesce` scalar handling turns it into `{}`.
-  - Guards (mandatory, in order): oracle 0-divergence on CompositeInfo.fetch (2-field /
-    1-field / varied-type / nested-composite); then FULL `test_rust_pgserver_differential.py`
-    (800+, the piece-2 risk) green; then full slice (204). Repeated 14-min differential runs
-    make this a dedicated session's work, confirmed unshippable as a single autonomous pass
-    by four probes.
-  **PIECE 1 LANDED (#1383, 2026-09-08):** JoinSelect.filter is now a Vec<JoinPred> (JoinOp{Eq,Gt,Ge,Lt,Le,NotTrue}); multi-predicate + right-side (INNER) + NOT<bool> join WHERE works; full differential green (1029). Remaining: pieces 2+3.
-
-  **KEYSTONE for piece 2 (5th probe, 2026-09-08 — resolve FIRST):** join_output_def (pgplan) runs at DESCRIBE time and must return each join side's output schema. For a Sub-aggregate side it must derive the aggregate's output column TYPES — but that logic lives ONLY in the executor (crates/secantus-pgserver/src/lib.rs ~3008 & ~5016: OutputCol::Agg(i) -> aggregate_wire_type(&agg.items[i]); OutputCol::Group(i) -> group column type from the source def). pgplan has neither. So BEFORE the join-side work, add a pgplan aggregate_output_def(agg, source_def) -> TableDef porting aggregate_wire_type's rules + group-column typing (types as pg_type-name strings in pgplan; executor maps to wire types). THEN piece 2 is mechanical: additive struct (left/right stay (String,String); add left_sub/right_sub: Option<Box<Statement>>), side() accepts N::RangeSubselect (recursively plan inner), execute() materialises the sub-plan before a join_docs_with(left_rows,right_rows) variant. Piece 3: LEFT-JOIN miss -> NULL -> existing coalesce -> {}. Guard: full differential (800+) each step.
-  **COMPLETE 4-LAYER MAP (6th probe, 2026-09-08 — fully traced end-to-end, execution-ready).**
-  Oracle facts: `array_agg(attname)`→`name[]`, `array_agg(atttypid)`→`oid[]`, group key `attrelid`→`oid`.
-  L1 KEYSTONE — pgplan `aggregate_output_def(agg, source_def) -> TableDef` returning pg_type-NAME
-     strings: count/sum→int8, min/max→item.source_type, array_agg→`{source_type}[]` (all already
-     name strings on AggItem), Group(i)→`source_def.column(group_by[i].0).pg_type`. (executor's
-     `aggregate_wire_type` @ pgserver:3780 + group typing @ :3150 are the reference). Mechanical.
-  L2 SUBQUERY JOIN SIDE (additive) — JoinSelect (pgplan:423) keep left/right (String,String), add
-     left_sub/right_sub: Option<Box<Statement>> (Sub side: .0="", .1=alias, _sub=Some). side()
-     (pgplan:1711) accepts N::RangeSubselect (recursively plan_select inner). join_output_def
-     (pgplan:1866) + lookup loop (pgplan:1725) branch on a Sub side (use aggregate_output_def, skip
-     table lookup). Executor: extract `aggregate_rows(&self, agg) -> Vec<Document>` from the
-     Statement::Aggregate arm (pgserver:3008-3178); refactor join_docs -> join_docs_with(join,
-     left_rows, right_rows) (Sub side uses pre-materialised rows; field_of is identity — rows keyed
-     by output names); execute() (pgserver:2384) materialises each Sub side before the call.
-  L3 COALESCE AS A JOIN TARGET (the layer earlier blueprints missed) — the outer projects
-     `coalesce(a.fnames,'{}')` (FuncCall). plan_join_select's target parser (~pgserver:1762) only
-     accepts ColumnRef+TypeCast; parse a FuncCall into the existing ColumnExpr::Call (pgplan:508;
-     builder @ pgplan:1335; apply_column_expr @ pgplan:3562 already evaluates it).
-  L4 COALESCE ON MISS — a LEFT-JOIN miss must yield NULL (join_docs's existing None=>Bson::Null on
-     the right already does this once L2 is wired) so L3's coalesce gives `{}` (base types w/ no attrs).
-  ~300-400 lines across both crates; guard = full differential (800+) each step. Six probes all
-  judged this a dedicated focused session, not a single autonomous pass.
-
-
-  Composite VALUE round-trip (register_composite of a value) is a SEPARATE later
-  piece after fetch works.
+- **Rust PG server: composite VALUE round-trip (`register_composite` of a value)
+  is the remaining composite piece (2026-09-08).** `CompositeInfo.fetch` now
+  WORKS — the 4-layer catalog query (`pg_type LEFT JOIN (SELECT array_agg(...)
+  FROM (pg_attribute JOIN pg_type) GROUP BY attrelid)` with `coalesce(..., '{}')`
+  per column) matches the oracle at zero divergences, including a nested
+  composite field and a base type's empty-array result (shipped: aggregate
+  subquery join side, `oid[]` column type, coalesce-as-target, coalesce-on-miss
+  empty array, user-type field-oid resolution in `pg_attribute`). What remains
+  is registering and round-tripping a composite VALUE: encoding/decoding a
+  `ROW(...)`-shaped composite datum on the wire so `register_composite`'s dumper
+  and loader work end-to-end. Scope that from a probe (psycopg
+  `register_composite` + an insert/select of a composite column) before starting.
 
 - **Rust PG server: record FUNCTIONS and field access are deferred (2026-09-07).**
   `ROW(...)` / `(a, b, ...)` construction, the `::text` render, and the

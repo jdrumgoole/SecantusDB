@@ -2945,6 +2945,49 @@ def test_range_info_fetch(home: Path) -> None:
             assert (info.name, info.oid, info.subtype_oid) == (name, oid, sub), name
 
 
+def test_composite_info_fetch(home: Path) -> None:
+    """psycopg's CompositeInfo.fetch — the 4-layer query behind composite types.
+
+    `pg_type LEFT JOIN (SELECT array_agg(...) FROM (join) GROUP BY ...)` with a
+    `coalesce(..., '{}')` per aggregate column. It exercises every composite
+    layer at once: a subquery join side materialised from an aggregate, an
+    `oid[]` array column (`array_agg(atttypid)`), coalesce projected as a target
+    (a real empty array on a miss), and a base type (no fields) surviving the
+    LEFT JOIN as two empty arrays. A field whose type is itself a composite
+    resolves its own minted oid.
+    """
+    from psycopg.types.composite import CompositeInfo
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create type ci_two as (a int, b text)")
+        cur.execute("create type ci_varied as (i int, t text, d float8, ts timestamptz, f bool)")
+        cur.execute("create type ci_nested as (x int, sub ci_two)")
+        cur.execute("select oid from pg_type where typname = 'ci_two'")
+        ci_two_oid = cur.fetchone()[0]
+
+        two = CompositeInfo.fetch(conn, "ci_two")
+        assert two.name == "ci_two"
+        assert list(two.field_names) == ["a", "b"]
+        assert list(two.field_types) == [23, 25]  # int4, text -- an oid[], parsed
+
+        varied = CompositeInfo.fetch(conn, "ci_varied")
+        assert list(varied.field_names) == ["i", "t", "d", "ts", "f"]
+        assert list(varied.field_types) == [23, 25, 701, 1184, 16]
+
+        # A field whose type is itself a composite carries that type's own oid.
+        nested = CompositeInfo.fetch(conn, "ci_nested")
+        assert list(nested.field_names) == ["x", "sub"]
+        assert list(nested.field_types) == [23, ci_two_oid]
+
+        # A base type (no fields) survives the LEFT JOIN: coalesce turns the
+        # unmatched NULL side into two EMPTY arrays, not None and not "{}".
+        base = CompositeInfo.fetch(conn, "int4")
+        assert base.name == "int4"
+        assert list(base.field_names) == []
+        assert list(base.field_types) == []
+
+
 def test_a_plain_select_over_a_join(home: Path) -> None:
     """A top-level two-table JOIN outside any aggregate.
 

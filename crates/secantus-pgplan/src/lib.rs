@@ -462,6 +462,12 @@ pub struct JoinSelect {
     /// ORDER BY one column: (alias, column, ascending). PostgreSQL sorts NULLS
     /// LAST ascending, which a LEFT JOIN's misses rely on.
     pub order: Option<(String, String, bool)>,
+    /// When a side is a SUBQUERY rather than a table (`... JOIN (SELECT ...) a`),
+    /// its planned sub-statement; the executor materialises its rows. `None`
+    /// for a plain table side, whose rows come from `table_docs(left.0)`. A Sub
+    /// side carries `""` as its table name and the alias as `.1`.
+    pub left_sub: Option<Box<Statement>>,
+    pub right_sub: Option<Box<Statement>>,
 }
 
 /// Transaction control. Prepared transactions (two-phase commit) are
@@ -510,6 +516,11 @@ pub enum ColumnExpr {
         args: Vec<Option<Bson>>,
         result_type: String,
     },
+    /// `coalesce(col, <fallback>...)` -- its own SQL node, not a scalar call.
+    /// `None` marks the column's argument position; the first non-NULL argument
+    /// wins. Used for a join target like `coalesce(a.fnames, '{}')`, where a
+    /// LEFT-JOIN miss makes the column NULL and the fallback stands in.
+    Coalesce { args: Vec<Option<Bson>> },
 }
 
 /// One column of a FROM-less SELECT.
@@ -1708,7 +1719,8 @@ fn plan_join_select(
         Ok(JoinType::JoinInner) => false,
         _ => return Err(Error::Unsupported("this JOIN kind".into())),
     };
-    let side = |n: Option<&pg_query::protobuf::Node>| -> Result<(String, String)> {
+    #[allow(clippy::type_complexity)]
+    let side = |n: Option<&pg_query::protobuf::Node>| -> Result<((String, String), Option<Box<Statement>>)> {
         match n.and_then(|x| x.node.as_ref()) {
             Some(N::RangeVar(r)) => {
                 let alias = r
@@ -1716,15 +1728,34 @@ fn plan_join_select(
                     .as_ref()
                     .map(|a| a.aliasname.clone())
                     .unwrap_or_else(|| r.relname.clone());
-                Ok((r.relname.clone(), alias))
+                Ok(((r.relname.clone(), alias), None))
+            }
+            // A subquery side: `... JOIN (SELECT ...) a`. Plan it recursively;
+            // the executor materialises its rows. Carries `""` as its table.
+            Some(N::RangeSubselect(rs)) => {
+                let inner = match rs.subquery.as_ref().and_then(|q| q.node.as_ref()) {
+                    Some(N::SelectStmt(inner)) => inner,
+                    _ => return Err(Error::Unsupported("this JOIN subquery".into())),
+                };
+                let alias = rs
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .ok_or_else(|| Error::Unsupported("a JOIN subquery without an alias".into()))?;
+                let stmt = plan_select(inner, lookup, params)?;
+                Ok(((String::new(), alias), Some(Box::new(stmt))))
             }
             _ => Err(Error::Unsupported("this JOIN side".into())),
         }
     };
-    let left = side(j.larg.as_deref())?;
-    let right = side(j.rarg.as_deref())?;
-    for (table, _) in [&left, &right] {
-        lookup(table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
+    let (left, left_sub) = side(j.larg.as_deref())?;
+    let (right, right_sub) = side(j.rarg.as_deref())?;
+    // Only a TABLE side needs a catalog lookup; a subquery side is planned.
+    if left_sub.is_none() {
+        lookup(&left.0).ok_or_else(|| Error::UndefinedTable(left.0.clone()))?;
+    }
+    if right_sub.is_none() {
+        lookup(&right.0).ok_or_else(|| Error::UndefinedTable(right.0.clone()))?;
     }
 
     // ON a.x = b.y, either order.
@@ -1791,6 +1822,43 @@ fn plan_join_select(
                 columns.push((out, col_name.0, col_name.1));
                 exprs.push(Some(ColumnExpr::Casts(chain.1)));
             }
+            // `coalesce(a.col, <fallback>) AS out` -- one column argument, the
+            // rest constants. A LEFT-JOIN miss makes the column NULL and the
+            // fallback stands in (`coalesce(a.fnames, '{}')`).
+            Some(N::CoalesceExpr(ce)) => {
+                let mut args: Vec<Option<Bson>> = Vec::new();
+                let mut column: Option<(String, String)> = None;
+                for a in &ce.args {
+                    if let Some((alias, col)) = qualified(Some(a)) {
+                        if column.is_some() {
+                            return Err(Error::Unsupported("a coalesce over two columns".into()));
+                        }
+                        column = Some((alias, col));
+                        args.push(None);
+                    } else {
+                        // A bare `'{}'` fallback is an empty ARRAY -- the column
+                        // it backstops is array-typed in every shape we plan
+                        // (`coalesce(array_agg(...), '{}')`). Store it as a real
+                        // empty array so a LEFT-JOIN miss encodes as an array,
+                        // not the text `"{}"` (which a binary array reader on the
+                        // client rejects as a malformed buffer).
+                        let cv = match const_value(a, params)? {
+                            Bson::String(ref s) if s.trim() == "{}" => Bson::Array(Vec::new()),
+                            other => other,
+                        };
+                        args.push(Some(cv));
+                    }
+                }
+                let (alias, col) =
+                    column.ok_or_else(|| Error::Unsupported("a coalesce with no column".into()))?;
+                let out = if rt.name.is_empty() {
+                    "coalesce".to_string()
+                } else {
+                    rt.name.clone()
+                };
+                columns.push((out, alias, col));
+                exprs.push(Some(ColumnExpr::Coalesce { args }));
+            }
             _ => return Err(Error::Unsupported("this subquery target".into())),
         }
     }
@@ -1829,6 +1897,8 @@ fn plan_join_select(
         exprs,
         filter,
         order,
+        left_sub,
+        right_sub,
     })
 }
 
@@ -1863,30 +1933,87 @@ fn cast_chain_over_column_qualified(
 /// A TableDef standing in for a join's OUTPUT: each projected column with the
 /// type its source column (or its last cast) gives it, so the aggregate tail
 /// resolves GROUP BY names and types against it unchanged.
+/// The OUTPUT schema of an aggregate, derived WITHOUT executing it, so a join
+/// with an aggregate subquery side can be typed at Describe time. A `count` /
+/// `sum` is `int8`, `min` / `max` keep the input type, `array_agg` is the input
+/// type's array; a group column takes its type from the aggregate's source.
+pub fn aggregate_output_def(
+    agg: &Aggregate,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<TableDef> {
+    let source_def = if let Some(join) = &agg.join {
+        join_output_def(join, lookup)?
+    } else if !agg.table.is_empty() {
+        lookup(&agg.table).ok_or_else(|| Error::UndefinedTable(agg.table.clone()))?
+    } else {
+        TableDef::new("", Vec::new())
+    };
+    let mut columns = Vec::new();
+    for (out, col) in &agg.select {
+        let ty = match col {
+            OutputCol::Group(i) => source_def
+                .column(&agg.group_by[*i].0)
+                .map(|c| c.pg_type.clone())
+                .unwrap_or_else(|| "text".to_string()),
+            OutputCol::Agg(i) => {
+                let item = &agg.items[*i];
+                match item.func {
+                    AggFunc::CountStar | AggFunc::Count | AggFunc::Sum => "int8".to_string(),
+                    AggFunc::Min | AggFunc::Max => item
+                        .source_type
+                        .clone()
+                        .unwrap_or_else(|| "text".to_string()),
+                    AggFunc::ArrayAgg => {
+                        format!("{}[]", item.source_type.as_deref().unwrap_or("text"))
+                    }
+                }
+            }
+        };
+        columns.push(Column::new(out, &ty, false));
+    }
+    Ok(TableDef::new("", columns))
+}
+
+/// The output def of a planned join SIDE that is a subquery (`... JOIN (SELECT
+/// ...) a`). Only an aggregate subquery is reproduced -- that is the shape
+/// psycopg's `CompositeInfo.fetch` uses -- so anything else is refused.
+fn sub_plan_def(stmt: &Statement, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Result<TableDef> {
+    match stmt {
+        Statement::Aggregate(agg) => aggregate_output_def(agg, lookup),
+        _ => Err(Error::Unsupported("this JOIN subquery shape".into())),
+    }
+}
+
 pub fn join_output_def(
     join: &JoinSelect,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Result<TableDef> {
-    let left_def =
-        lookup(&join.left.0).ok_or_else(|| Error::UndefinedTable(join.left.0.clone()))?;
-    let right_def =
-        lookup(&join.right.0).ok_or_else(|| Error::UndefinedTable(join.right.0.clone()))?;
+    let left_def = match &join.left_sub {
+        Some(stmt) => sub_plan_def(stmt, lookup)?,
+        None => lookup(&join.left.0).ok_or_else(|| Error::UndefinedTable(join.left.0.clone()))?,
+    };
+    let right_def = match &join.right_sub {
+        Some(stmt) => sub_plan_def(stmt, lookup)?,
+        None => lookup(&join.right.0).ok_or_else(|| Error::UndefinedTable(join.right.0.clone()))?,
+    };
     let mut columns = Vec::new();
     for (i, (out, alias, col)) in join.columns.iter().enumerate() {
-        let ty = match join.exprs.get(i).and_then(|e| e.as_ref()) {
-            Some(expr) => column_expr_type(expr).to_string(),
-            None => {
+        // A coalesce keeps its column's type, so it resolves against the side
+        // like a plain column; a cast chain / scalar call uses its fixed type.
+        let expr = join.exprs.get(i).and_then(|e| e.as_ref());
+        let ty = match expr {
+            Some(ColumnExpr::Casts(_)) | Some(ColumnExpr::Call { .. }) => {
+                column_expr_type(expr.expect("some")).to_string()
+            }
+            _ => {
                 let side_def = if *alias == join.left.1 {
                     &left_def
                 } else if *alias == join.right.1 {
                     &right_def
+                } else if left_def.column(col).is_some() {
+                    &left_def
                 } else {
-                    // Unqualified: whichever side has it.
-                    if left_def.column(col).is_some() {
-                        &left_def
-                    } else {
-                        &right_def
-                    }
+                    &right_def
                 };
                 side_def
                     .column(col)
@@ -3570,6 +3697,17 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
             scalar::call(name, &filled)
                 .unwrap_or_else(|| Err(Error::Unsupported(format!("function {name}()"))))
         }
+        ColumnExpr::Coalesce { args } => {
+            // The column position (`None`) takes the row's value; the first
+            // non-NULL argument in order wins, else NULL.
+            for a in args {
+                let v = a.clone().unwrap_or_else(|| value.clone());
+                if v != Bson::Null {
+                    return Ok(v);
+                }
+            }
+            Ok(Bson::Null)
+        }
     }
 }
 
@@ -3578,6 +3716,9 @@ pub fn column_expr_type(expr: &ColumnExpr) -> &str {
     match expr {
         ColumnExpr::Casts(chain) => chain.last().map(String::as_str).unwrap_or("text"),
         ColumnExpr::Call { result_type, .. } => result_type,
+        // A coalesce keeps its column's type; join_output_def resolves that
+        // from the side column, so this fallback is not used for typing.
+        ColumnExpr::Coalesce { .. } => "text",
     }
 }
 
