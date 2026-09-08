@@ -11,7 +11,8 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicI32};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use bson::{Bson, Document};
@@ -41,6 +42,19 @@ use secantus_pgplan::{
     TransactionModes,
 };
 use secantus_storage::{Storage, UserTransactionHandle};
+
+/// Process-wide map of every live backend's PID to its "please terminate"
+/// flag.
+///
+/// `pg_terminate_backend(pid)` on ANOTHER connection sets that connection's
+/// flag; the target notices at the top of its next statement and ends with a
+/// `57P01`, exactly as a real backend torn down by an administrator would.
+/// One handler per connection registers here at startup and deregisters on
+/// drop, so a stale PID is never signalled.
+fn backend_registry() -> &'static Mutex<HashMap<i32, Arc<AtomicBool>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<i32, Arc<AtomicBool>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// A composite type's fields: `(field name, field type name)`, in order.
 type CompositeFields = Vec<(String, String)>;
@@ -132,6 +146,16 @@ pub struct PgHandler {
     /// rows stream is drained, and re-encodes them in the FETCH's format. `None`
     /// except during a DECLARE, so a plain SELECT pays only a cheap flag check.
     cursor_capture: std::sync::Arc<Mutex<Option<CapturedRows>>>,
+    /// This connection's backend PID, as pgwire assigned it during startup.
+    ///
+    /// `pg_backend_pid()` returns it, and `pg_terminate_backend(pid)` compares
+    /// against it to recognise a self-termination. Set once in `post_startup`;
+    /// `0` before that, which no real PID collides with.
+    backend_pid: AtomicI32,
+    /// This connection's entry in [`backend_registry`]: another backend's
+    /// `pg_terminate_backend` sets it, and `run_typed` checks it before every
+    /// statement so the connection ends with a `57P01`.
+    terminate: Arc<AtomicBool>,
 }
 
 /// A user type created (`Some(doc)`) or dropped (`None`) in the open
@@ -219,6 +243,8 @@ impl PgHandler {
             txn_failed: std::sync::atomic::AtomicBool::new(false),
             savepoints: Mutex::new(Vec::new()),
             cursor_capture: std::sync::Arc::new(Mutex::new(None)),
+            backend_pid: AtomicI32::new(0),
+            terminate: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1914,7 +1940,31 @@ impl NoopStartupHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // pgwire has assigned and already sent the BackendKeyData PID by now;
+        // record it so `pg_backend_pid()` / `pg_terminate_backend()` can see
+        // it, and register this connection so another backend can terminate it.
+        let (pid, _) = _c.pid_and_secret_key();
+        self.backend_pid
+            .store(pid, std::sync::atomic::Ordering::Relaxed);
+        backend_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pid, self.terminate.clone());
         Ok(())
+    }
+}
+
+impl Drop for PgHandler {
+    fn drop(&mut self) {
+        // Deregister so the map never signals a PID this connection has left
+        // behind. `0` means startup never ran, so there is nothing to remove.
+        let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        if pid != 0 {
+            backend_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&pid);
+        }
     }
 }
 
@@ -1931,7 +1981,15 @@ impl SimpleQueryHandler for PgHandler {
         // The simple protocol carries no `Bind`, so its results are always text.
         self.binary_results
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        let stmts = secantus_pgplan::split_statements(query).map_err(|e| Self::err(&e))?;
+        // A syntax error caught while splitting (`meh`) is where a simple-query
+        // statement fails BEFORE `run_typed` ever sees it -- and inside a
+        // transaction PostgreSQL poisons the block on it exactly as on any
+        // other error, so the next statement gets `25P02`. Recording it here
+        // is the simple-protocol twin of the `Describe` note in
+        // `describe_fields`.
+        let stmts = secantus_pgplan::split_statements(query)
+            .map_err(|e| Self::err(&e))
+            .inspect_err(|_| self.note_failure())?;
         let out = if stmts.len() <= 1 {
             self.run(query, &[], 0).await
         } else {
@@ -1939,6 +1997,25 @@ impl SimpleQueryHandler for PgHandler {
         };
         // Report any GUC change (TimeZone, ...) so the client tracks it.
         self.report_pending_params(_c).await?;
+        // A FATAL error (`pg_terminate_backend` on this backend) ends the
+        // connection. pgwire's own error path would send a `ReadyForQuery`
+        // after the `ErrorResponse` and leave the socket open, so the client
+        // never learns it is gone. A real backend sends the `ErrorResponse`
+        // and closes, with NO `ReadyForQuery` -- do that here, in the simple
+        // protocol, where the client would otherwise think the connection is
+        // still usable. (The extended protocol's `Sync` handshake already
+        // surfaces the close, so it needs nothing.)
+        if matches!(&out, Err(PgWireError::UserError(info)) if info.severity == "FATAL") {
+            if let Err(out) = out {
+                let info: ErrorInfo = out.into();
+                let _ = _c
+                    .send(PgWireBackendMessage::ErrorResponse(info.into()))
+                    .await;
+                let _ = SinkExt::close(_c).await;
+                return Ok(vec![]);
+            }
+            unreachable!("matched Err above");
+        }
         out
     }
 }
@@ -2645,6 +2722,15 @@ impl PgHandler {
         param_types: &[Option<String>],
         max_rows: usize,
     ) -> PgWireResult<Vec<Response>> {
+        // Another backend may have terminated this one while it was idle. Real
+        // PostgreSQL tears the connection down asynchronously; here the target
+        // notices at its next statement -- COMMIT and ROLLBACK included, since
+        // a terminated backend cannot honour them either -- and ends with a
+        // FATAL 57P01 that closes the socket.
+        if self.terminate.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(Self::admin_shutdown());
+        }
+
         let sql = query.trim().trim_end_matches(';').trim();
         if sql.is_empty() {
             return Ok(vec![Response::EmptyQuery]);
@@ -2862,6 +2948,44 @@ impl PgHandler {
                 settings.insert(canonical_setting(name), text.clone());
                 Ok(Bson::String(text))
             }
+            ConstCol::BackendPid => Ok(Bson::Int32(
+                self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+            )),
+            ConstCol::TerminateBackend(inner) => {
+                let target = match self.resolve_const_col(inner)? {
+                    Bson::Int32(i) => i64::from(i),
+                    Bson::Int64(i) => i,
+                    Bson::Double(d) => d as i64,
+                    Bson::Null => {
+                        // `pg_terminate_backend(NULL)` is NULL in PostgreSQL.
+                        return Ok(Bson::Null);
+                    }
+                    other => {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "22023".into(), // invalid_parameter_value
+                            format!("pg_terminate_backend() PID must be an integer, not {other}"),
+                        ))));
+                    }
+                };
+                let my_pid = i64::from(self.backend_pid.load(std::sync::atomic::Ordering::Relaxed));
+                if target == my_pid {
+                    // Terminating our own backend: the CURRENT statement is the
+                    // one that dies, so raise the FATAL now rather than arming
+                    // the flag for a next statement that will never come.
+                    return Err(Self::admin_shutdown());
+                }
+                // Another backend: arm its flag if it is live. PostgreSQL
+                // returns true when the signal was sent, false otherwise.
+                let target = i32::try_from(target).unwrap_or(0);
+                let armed = backend_registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&target)
+                    .map(|flag| flag.store(true, std::sync::atomic::Ordering::Relaxed))
+                    .is_some();
+                Ok(Bson::Boolean(armed))
+            }
         }
     }
 
@@ -2890,6 +3014,19 @@ impl PgHandler {
             "current transaction is aborted, commands ignored until end of \
              transaction block"
                 .into(),
+        )))
+    }
+
+    /// The `57P01` a backend sends as it is torn down by `pg_terminate_backend`.
+    ///
+    /// Severity is `FATAL`, which is what makes pgwire close the socket after
+    /// the `ErrorResponse` (see `is_fatal`) -- so the client sees the same
+    /// `AdminShutdown` + disconnect a real terminated backend produces.
+    fn admin_shutdown() -> PgWireError {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "FATAL".into(),
+            "57P01".into(), // admin_shutdown
+            "terminating connection due to administrator command".into(),
         )))
     }
 
@@ -6188,7 +6325,15 @@ impl PgHandler {
             param_types,
             &tz,
         )
-        .map_err(|e| Self::err(&e))?;
+        .map_err(|e| Self::err(&e))
+        // psycopg learns a statement's columns with a `Describe` sent straight
+        // after `Parse`, BEFORE any `Bind`/`Execute`. When the statement is
+        // bad (`meh`), that Describe is where planning fails -- and inside a
+        // transaction PostgreSQL treats the failure like any other, poisoning
+        // the block so the next statement gets `25P02`. Without noting it here
+        // the failure went unrecorded and the aborted block kept accepting
+        // commands.
+        .inspect_err(|_| self.note_failure())?;
         Ok(match stmt {
             // A FETCH describes the CURSOR's columns. Without this arm a
             // prepared FETCH described zero of them, and psycopg prepares any
