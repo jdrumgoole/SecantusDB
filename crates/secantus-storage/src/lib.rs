@@ -10307,7 +10307,8 @@ impl Storage {
                             // Creating through a non-document -> mongod's code 28.
                             return StorageError::UpdatePathNotViable(m);
                         }
-                        if let Some((m, exec)) = secantus_core::update::arith_type_error(doc, update)
+                        if let Some((m, exec)) =
+                            secantus_core::update::arith_type_error(doc, update)
                         {
                             // A non-numeric field / operand -> mongod's code 14.
                             // `exec` says which of mongod's two wrappers applies.
