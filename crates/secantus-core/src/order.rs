@@ -140,6 +140,29 @@ pub fn is_sortable(v: &Bson) -> bool {
     }
 }
 
+/// Whether [`cmp`] can order this value -- the gate for the comparison
+/// OPERATORS, which is wider than [`is_sortable`].
+///
+/// `is_sortable` is deliberately narrow: it guards the SORT engines, where a
+/// type without a transitive same-type arm would corrupt an ordering. The
+/// comparison operators need no transitivity -- one pair, one answer -- and
+/// mongod compares every BSON type by its canonical rank. Gating them on
+/// `is_sortable` made `{$gt: [BinData(...), 0]}` a `2 query uses a construct
+/// the Rust server does not support`, and one Binary / Timestamp / Regex /
+/// Code / MinKey / MaxKey / NaN document broke the whole `$expr` query.
+/// Measured against 8.2.11 on 2026-09-08: 120 of 399 comparison cells diverged.
+///
+/// Only `DbPointer` is excluded, matching [`bson_lt`]: its tiebreak is a
+/// type-name comparison nobody has measured.
+pub fn is_comparable(v: &Bson) -> bool {
+    match v {
+        Bson::DbPointer(_) => false,
+        Bson::Document(d) => d.values().all(is_comparable),
+        Bson::Array(a) => a.iter().all(is_comparable),
+        _ => true,
+    }
+}
+
 /// Total BSON sort comparison. Assumes both operands passed `is_sortable`.
 pub fn cmp(a: &Bson, b: &Bson) -> Ordering {
     let (ra, rb) = (type_rank(a), type_rank(b));
@@ -168,8 +191,20 @@ pub fn cmp(a: &Bson, b: &Bson) -> Ordering {
         }
         (Bson::Document(x), Bson::Document(y)) => doc_cmp(x, y),
         (Bson::Array(x), Bson::Array(y)) => array_cmp(x, y),
-        // Rank 3: the unified numeric type. NaN is unordered -> Python's `<` is
-        // False both ways -> Equal (stable).
+        (Bson::JavaScriptCode(x), Bson::JavaScriptCode(y)) => x.cmp(y),
+        (Bson::JavaScriptCodeWithScope(x), Bson::JavaScriptCodeWithScope(y)) => x.code.cmp(&y.code),
+        // Rank 3: the unified numeric type. NaN sorts BELOW every other number
+        // -- `{$cmp: [NaN, 0]}` is -1 on mongod, and the storage sort already
+        // places it there. It used to fall through to the numeric arm below and
+        // compare EQUAL to everything, which is Python's `<`-is-false-both-ways
+        // and not mongod's order.
+        _ if crate::query::is_nan_bson(a) || crate::query::is_nan_bson(b) => {
+            match (crate::query::is_nan_bson(a), crate::query::is_nan_bson(b)) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Less,
+                _ => Ordering::Greater,
+            }
+        }
         _ => {
             if let Some(r) = numeric::fast_cmp(a, b) {
                 return r.unwrap_or(Ordering::Equal);
@@ -362,8 +397,35 @@ mod tests {
     }
 
     #[test]
-    fn nan_is_equal_not_deferred() {
-        assert_eq!(cmp(&b(bson!(f64::NAN)), &b(bson!(5))), Ordering::Equal);
+    fn nan_sorts_below_every_other_number() {
+        // `{$cmp: [NaN, 5]}` is -1 on mongod 8.2.11, and this project's own
+        // storage sort already places NaN between null and the other numbers.
+        // This asserted `Equal` -- Python's `<`-is-false-both-ways -- pinning an
+        // implementation choice that contradicted both. Re-measured 2026-09-08.
+        assert_eq!(cmp(&b(bson!(f64::NAN)), &b(bson!(5))), Ordering::Less);
+        assert_eq!(cmp(&b(bson!(5)), &b(bson!(f64::NAN))), Ordering::Greater);
+        assert_eq!(
+            cmp(&b(bson!(f64::NAN)), &b(bson!(f64::NAN))),
+            Ordering::Equal
+        );
+        assert_eq!(
+            cmp(&b(bson!(f64::NAN)), &b(bson!(f64::NEG_INFINITY))),
+            Ordering::Less
+        );
+    }
+
+    /// The comparison OPERATORS accept every type `cmp` ranks, which is wider
+    /// than the sort engines' `is_sortable`.
+    #[test]
+    fn comparable_is_wider_than_sortable() {
+        assert!(is_comparable(&b(bson!(f64::NAN))));
+        assert!(is_comparable(&Bson::MinKey));
+        assert!(is_comparable(&Bson::MaxKey));
+        assert!(is_comparable(&Bson::Timestamp(bson::Timestamp {
+            time: 1,
+            increment: 1
+        })));
+        assert!(!is_sortable(&b(bson!(f64::NAN))));
     }
 
     #[test]
