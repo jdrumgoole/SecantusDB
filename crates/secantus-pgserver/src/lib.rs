@@ -4828,8 +4828,10 @@ fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
 /// every type, and the gap is recorded in `tasks/backlog.md` rather than
 /// hidden.
 fn binary_encodable(ty: &Type) -> bool {
-    const OK: [Type; 21] = [
+    const OK: [Type; 23] = [
         Type::OID,
+        Type::JSON,
+        Type::JSONB,
         Type::BOOL,
         Type::INT2,
         Type::INT4,
@@ -5107,6 +5109,13 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         let text = secantus_pgplan::value_text(v);
         return enc.encode_field(&RawField { binary, text });
     }
+    // json's binary form is its text verbatim; jsonb's is a one-byte format
+    // version (`1`) followed by the same text (PostgreSQL 16 `jsonb_send`).
+    if *ty == Type::JSON || *ty == Type::JSONB {
+        let text = as_text(v).ok_or_else(|| bad("this value"))?;
+        let binary = json_binary(&text, ty == &Type::JSONB);
+        return enc.encode_field(&RawField { binary, text });
+    }
     if *ty == Type::BYTEA {
         let Bson::Binary(b) = v else {
             return Err(bad("this value"));
@@ -5329,10 +5338,11 @@ fn encode_typed_row(
 /// bytes (array braces, separators, escapes) are all ASCII and unchanged across
 /// LATIN1 / LATIN9, so only the character content moves. In BINARY format that
 /// is true only for a scalar text-family value, whose whole payload IS the
-/// string bytes; a binary array or record interleaves big-endian length words
-/// that a blanket transcode would corrupt, so those keep the internal UTF-8
-/// bytes (correct for ASCII; non-ASCII in a binary array under LATIN1 / LATIN9
-/// is deferred -- see `tasks/backlog.md`).
+/// string bytes -- json too, and jsonb, whose only non-text byte is the `1`
+/// version prefix that a Latin transcode leaves alone; a binary array or record
+/// interleaves big-endian length words that a blanket transcode would corrupt,
+/// so those keep the internal UTF-8 bytes (correct for ASCII; non-ASCII in a
+/// binary array under LATIN1 / LATIN9 is deferred -- see `tasks/backlog.md`).
 fn field_may_carry_text(field: &FieldInfo) -> bool {
     match field.format() {
         FieldFormat::Text => true,
@@ -5340,7 +5350,13 @@ fn field_may_carry_text(field: &FieldInfo) -> bool {
             let ty = field.datatype();
             matches!(
                 *ty,
-                Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::CHAR
+                Type::TEXT
+                    | Type::VARCHAR
+                    | Type::BPCHAR
+                    | Type::NAME
+                    | Type::CHAR
+                    | Type::JSON
+                    | Type::JSONB
             ) || matches!(ty.kind(), postgres_types::Kind::Enum(_))
         }
     }
@@ -6095,8 +6111,24 @@ fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
             Bson::Binary(b) => Some(b.bytes.clone()),
             _ => None,
         },
+        // json / jsonb: see `json_binary`.
+        114 | 3802 => match v {
+            Bson::String(x) => Some(json_binary(x, elem.oid() == 3802)),
+            _ => None,
+        },
         _ => None,
     }
+}
+
+/// The binary wire form of a json (`text` verbatim) or jsonb (a `1` version
+/// byte, then the text) value -- PostgreSQL 16's `json_send` / `jsonb_send`.
+fn json_binary(text: &str, jsonb: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 1);
+    if jsonb {
+        out.push(1);
+    }
+    out.extend_from_slice(text.as_bytes());
+    out
 }
 
 /// The PostgreSQL binary record wire format: an int32 field count, then per
@@ -6699,11 +6731,15 @@ fn decode_parameter(
                 }
                 .to_bson())
             }
-            // `json` is UTF-8 text on the wire. `jsonb` is the same text
-            // behind a one-byte format version, which is 1 and has been since
-            // the type shipped -- an unknown version means the client is
-            // speaking something this server has never seen, so it refuses
-            // rather than guessing at the payload.
+            // `json` is text on the wire, in the client encoding. `jsonb` is
+            // the same text behind a one-byte format version, which is 1 and
+            // has been since the type shipped -- an unknown version means the
+            // client is speaking something this server has never seen, so it
+            // refuses rather than guessing at the payload. Both then take the
+            // cast a text-format parameter takes, so the value is validated
+            // and (for jsonb) normalised the same way whichever format it
+            // arrived in: a binary `Jsonb("\u00e0")` used to keep psycopg's
+            // ASCII escape where the text one was stored as the character.
             // A range's binary form is a flags byte and then each present
             // bound as a length-prefixed value in the ELEMENT's binary format.
             // Decoding to canonical text keeps it on the same path a literal
@@ -6743,9 +6779,13 @@ fn decode_parameter(
                 let type_name = secantus_pgplan::range::range_oid_name(oid).expect("checked");
                 binary_range(bytes, type_name, tz)
             }
-            Some(114) => Ok(Bson::String(String::from_utf8_lossy(bytes).into_owned())),
+            Some(114) => secantus_pgplan::cast_text_to(&encoding::decode(cenc, bytes), "json", tz)
+                .map_err(|e| PgHandler::err(&e)),
             Some(3802) => match bytes.split_first() {
-                Some((1, rest)) => Ok(Bson::String(String::from_utf8_lossy(rest).into_owned())),
+                Some((1, rest)) => {
+                    secantus_pgplan::cast_text_to(&encoding::decode(cenc, rest), "jsonb", tz)
+                        .map_err(|e| PgHandler::err(&e))
+                }
                 _ => Err(unsupported_binary_oid(Some(3802))),
             },
             Some(1114) if bytes.len() == 8 => Ok(Bson::String(

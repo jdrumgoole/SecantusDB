@@ -606,9 +606,7 @@ def test_client_encoding_transcodes_both_directions(home: Path) -> None:
                 "client_encoding=bogus",
                 connect_timeout=10,
             )
-        assert 'FATAL:  invalid value for parameter "client_encoding": "bogus"' in str(
-            exc.value
-        )
+        assert 'FATAL:  invalid value for parameter "client_encoding": "bogus"' in str(exc.value)
 
 
 def test_session_settings(home: Path) -> None:
@@ -1796,6 +1794,54 @@ def test_json_preserves_and_jsonb_normalises(home: Path) -> None:
         assert cur.description[0].type_code == 114
         cur.execute("select '{}'::jsonb")
         assert cur.description[0].type_code == 3802
+
+
+def test_json_binary_wire_form(home: Path) -> None:
+    """json and jsonb have a binary wire form, and it follows `client_encoding`.
+
+    PostgreSQL's `json_send` is the text verbatim and `jsonb_send` prefixes a
+    one-byte format version (`1`); both are transcoded to the session encoding
+    like any text. Before this the server had no binary codec for either, so a
+    binary-format `COPY TO` of a json column failed with 22P03 -- and did so
+    AFTER CopyOutResponse, which psycopg reports as "cannot mix COPY with other
+    operations" (measured against PostgreSQL 16, byte-identical below).
+    """
+    with _Server(home) as server, server.connect() as conn:
+        for jtype, prefix in (("json", b""), ("jsonb", b"\x01")):
+            payload = prefix + b'{"a": "\xc3\xa9"}'
+            cur = conn.cursor(binary=True)
+            cur.execute(f"""select '{{"a": "\u00e9"}}'::{jtype}""")
+            assert cur.pgresult.get_value(0, 0) == payload
+            assert cur.fetchone()[0] == {"a": "\u00e9"}
+
+            with conn.cursor().copy(
+                f"""copy (select '{{"a": "\u00e9"}}'::{jtype}) to stdout (format binary)"""
+            ) as cp:
+                rows = [bytes(r) for r in cp]
+            # signature (11) + flags (4) + extension length (4), then the row:
+            # field count (2) + length (4) + payload.
+            assert rows[0][19:] == b"\x00\x01" + len(payload).to_bytes(4, "big") + payload
+            assert rows[1] == b"\xff\xff"
+
+        # A binary-format PARAMETER takes the same cast as a text one, so a
+        # jsonb sent as psycopg's ASCII-escaped dump is normalised to the
+        # character (it used to be stored escaped, and compared unequal).
+        from psycopg.types.json import Jsonb
+
+        cur = conn.cursor()
+        cur.execute(
+            """select %b::text, %b::text = '"\u00e0\u20ac"'::jsonb::text""",
+            (Jsonb("\u00e0\u20ac"), Jsonb("\u00e0\u20ac")),
+        )
+        assert cur.fetchone() == ('"\u00e0\u20ac"', True)
+
+        # (Only the wire bytes: psycopg's json loader decodes as UTF-8 whatever
+        # the session encoding, and fails the same way against PostgreSQL.)
+        conn.execute("set client_encoding to latin1")
+        for jtype, prefix in (("json", b""), ("jsonb", b"\x01")):
+            cur = conn.cursor(binary=True)
+            cur.execute(f"""select '{{"a": "\u00e9"}}'::{jtype}""")
+            assert cur.pgresult.get_value(0, 0) == prefix + b'{"a": "\xe9"}'
 
 
 def test_jsonb_numbers_are_numerics(home: Path) -> None:

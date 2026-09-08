@@ -58,3 +58,12 @@ one fails the connection with PostgreSQL's FATAL `22023`.
   `FieldInfo` / `FieldDescription` gain `name_raw` so a handler can send a
   column name in a non-UTF-8 client encoding. The `cursor` example is updated
   for the earlier `parameter_oids` patch.
+- `crates/secantus-pgserver/src/lib.rs`: `json` and `jsonb` gain their
+  PostgreSQL binary wire form (the text verbatim; jsonb behind its one-byte
+  format version), transcoded to the client encoding like text. Before this a
+  binary-format `COPY ... TO STDOUT` of a json column failed with `22P03`
+  after the CopyOutResponse had gone out, which psycopg reported as "you
+  cannot mix COPY with other operations". A binary-format json / jsonb
+  PARAMETER now takes the same cast as a text one, so a jsonb sent as
+  psycopg's ASCII-escaped dump is normalised to the character rather than
+  stored escaped.
