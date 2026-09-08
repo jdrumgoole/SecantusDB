@@ -472,13 +472,23 @@ fn an_unbound_parameter_is_42p02() {
 #[test]
 fn transaction_statements_are_planned() {
     for (sql, want) in [
-        ("BEGIN", TransactionControl::Begin),
+        ("BEGIN", TransactionControl::Begin(TransactionModes::default())),
         // `START TRANSACTION` is `BEGIN` with a different command tag, so it
         // is a different variant rather than the same one.
-        ("START TRANSACTION", TransactionControl::Start),
+        (
+            "START TRANSACTION",
+            TransactionControl::Start(TransactionModes::default()),
+        ),
+        // The transaction characteristics are parsed onto the variant: the
+        // isolation level and read-write mode were named, the deferrable mode
+        // was not (so it stays `None` and inherits the session default).
         (
             "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-            TransactionControl::Begin,
+            TransactionControl::Begin(TransactionModes {
+                isolation: Some("serializable".into()),
+                read_only: Some(false),
+                deferrable: None,
+            }),
         ),
         ("COMMIT", TransactionControl::Commit { chain: false }),
         ("ROLLBACK", TransactionControl::Rollback { chain: false }),
@@ -523,6 +533,47 @@ fn transaction_statements_are_planned() {
             Statement::Transaction(c) => assert_eq!(c, want, "for {sql}"),
             other => panic!("wrong statement for {sql}: {other:?}"),
         }
+    }
+}
+
+/// `SET TRANSACTION` and `SET SESSION CHARACTERISTICS AS TRANSACTION` are both
+/// VAR_SET_MULTI in the parse tree, distinguished only by name; each carries the
+/// characteristics as its own statement so the executor can tell "this block"
+/// from "the session default".
+#[test]
+fn set_transaction_characteristics_are_planned() {
+    match plan_ok("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY") {
+        Statement::SetTransaction(m) => assert_eq!(
+            m,
+            TransactionModes {
+                isolation: Some("repeatable read".into()),
+                read_only: Some(true),
+                deferrable: None,
+            }
+        ),
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE") {
+        Statement::SetSessionCharacteristics(m) => assert_eq!(
+            m,
+            TransactionModes {
+                isolation: Some("serializable".into()),
+                read_only: None,
+                deferrable: None,
+            }
+        ),
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE NOT DEFERRABLE") {
+        Statement::SetSessionCharacteristics(m) => assert_eq!(
+            m,
+            TransactionModes {
+                isolation: None,
+                read_only: Some(false),
+                deferrable: Some(false),
+            }
+        ),
+        other => panic!("wrong statement: {other:?}"),
     }
 }
 

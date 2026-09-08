@@ -41,6 +41,7 @@ use secantus_pgcatalog::{TableDef, CATALOG_COLLECTION};
 use secantus_pgplan::{
     companion_field, render_array_element_text, render_timestamp, AggFunc, AggItem, ConstCol,
     Error as PlanError, Nulls, OrderKey, OutputCol, Statement, TransactionControl,
+    TransactionModes,
 };
 use secantus_storage::{Storage, UserTransactionHandle};
 
@@ -1632,6 +1633,7 @@ fn default_settings() -> HashMap<String, String> {
         ("default_transaction_isolation", "read committed"),
         ("transaction_deferrable", "off"),
         ("default_transaction_read_only", "off"),
+        ("default_transaction_deferrable", "off"),
         ("search_path", "\"$user\", public"),
         ("application_name", ""),
         ("server_encoding", "UTF8"),
@@ -2849,10 +2851,58 @@ impl PgHandler {
     }
 
     /// BEGIN / START TRANSACTION / COMMIT / ROLLBACK, with `AND CHAIN`.
+    /// Apply the transaction characteristics of a `BEGIN` / `START TRANSACTION`
+    /// to the `transaction_*` GUCs for the life of the block.
+    ///
+    /// PostgreSQL resets `transaction_*` to the session `default_transaction_*`
+    /// when a block opens, then overlays whatever modes the statement named. So
+    /// a bare `BEGIN` reflects the defaults, and `BEGIN ISOLATION LEVEL
+    /// SERIALIZABLE` reflects `serializable` for the isolation and the defaults
+    /// for the rest. This server is single-node and does not enforce isolation;
+    /// it only reflects what was requested so a client reading
+    /// `current_setting('transaction_isolation')` sees its own choice.
+    fn apply_transaction_modes_on_begin(&self, modes: &TransactionModes) {
+        let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let default_of = |settings: &HashMap<String, String>, key: &str| -> String {
+            settings.get(key).cloned().unwrap_or_default()
+        };
+        let isolation = modes
+            .isolation
+            .clone()
+            .unwrap_or_else(|| default_of(&settings, "default_transaction_isolation"));
+        let read_only = match modes.read_only {
+            Some(v) => if v { "on" } else { "off" }.to_string(),
+            None => default_of(&settings, "default_transaction_read_only"),
+        };
+        let deferrable = match modes.deferrable {
+            Some(v) => if v { "on" } else { "off" }.to_string(),
+            None => default_of(&settings, "default_transaction_deferrable"),
+        };
+        settings.insert("transaction_isolation".into(), isolation);
+        settings.insert("transaction_read_only".into(), read_only);
+        settings.insert("transaction_deferrable".into(), deferrable);
+    }
+
+    /// Reset the `transaction_*` GUCs to the session `default_transaction_*`
+    /// when a block ends, so a subsequent standalone `current_setting` reads the
+    /// defaults rather than the last block's overrides -- exactly what real
+    /// PostgreSQL reports after a `COMMIT` / `ROLLBACK`.
+    fn reset_transaction_gucs(&self) {
+        let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        for (tx, def) in [
+            ("transaction_isolation", "default_transaction_isolation"),
+            ("transaction_read_only", "default_transaction_read_only"),
+            ("transaction_deferrable", "default_transaction_deferrable"),
+        ] {
+            let value = settings.get(def).cloned().unwrap_or_default();
+            settings.insert(tx.into(), value);
+        }
+    }
+
     fn transaction_control(&self, control: TransactionControl) -> PgWireResult<Vec<Response>> {
         let opens = matches!(
             control,
-            TransactionControl::Begin | TransactionControl::Start
+            TransactionControl::Begin(_) | TransactionControl::Start(_)
         );
         // Whatever the transaction did to the catalog is either committed or
         // discarded once it ends, so the pending map stops being the truth.
@@ -2903,17 +2953,20 @@ impl PgHandler {
         let (tag, chain) = match control {
             // A BEGIN inside a transaction is a WARNING in PostgreSQL, not an
             // error, and the existing transaction continues.
-            TransactionControl::Begin => {
+            TransactionControl::Begin(modes) => {
                 begin(&mut guard)?;
+                self.apply_transaction_modes_on_begin(&modes);
                 ("BEGIN", false)
             }
             // Same statement, different word: the tag is what a client reads
             // back, and `START TRANSACTION` answers with its own.
-            TransactionControl::Start => {
+            TransactionControl::Start(modes) => {
                 begin(&mut guard)?;
+                self.apply_transaction_modes_on_begin(&modes);
                 ("START TRANSACTION", false)
             }
             TransactionControl::Commit { chain } => {
+                self.reset_transaction_gucs();
                 if let Some(mut handle) = guard.take() {
                     self.in_transaction
                         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2924,6 +2977,7 @@ impl PgHandler {
                 ("COMMIT", chain)
             }
             TransactionControl::Rollback { chain } => {
+                self.reset_transaction_gucs();
                 if let Some(mut handle) = guard.take() {
                     self.in_transaction
                         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -3693,6 +3747,67 @@ impl PgHandler {
                 settings.insert(key.clone(), value.clone());
                 drop(settings);
                 self.note_reportable_guc(&key, &value);
+                Ok(vec![Response::Execution(Tag::new("SET"))])
+            }
+
+            // `SET TRANSACTION <modes>` sets the CURRENT block's
+            // characteristics. Outside an explicit block PostgreSQL warns and
+            // does nothing, so we only apply the modes when a transaction is
+            // open; either way the command tag is `SET`.
+            Statement::SetTransaction(modes) => {
+                if self
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(iso) = &modes.isolation {
+                        settings.insert("transaction_isolation".into(), iso.clone());
+                    }
+                    if let Some(ro) = modes.read_only {
+                        settings.insert(
+                            "transaction_read_only".into(),
+                            if ro { "on" } else { "off" }.into(),
+                        );
+                    }
+                    if let Some(df) = modes.deferrable {
+                        settings.insert(
+                            "transaction_deferrable".into(),
+                            if df { "on" } else { "off" }.into(),
+                        );
+                    }
+                }
+                Ok(vec![Response::Execution(Tag::new("SET"))])
+            }
+
+            // `SET SESSION CHARACTERISTICS AS TRANSACTION <modes>` sets the
+            // session DEFAULT. When no explicit block is open, the next
+            // implicit statement inherits it, so the `transaction_*` GUCs move
+            // in lockstep -- which is what a client reads back immediately.
+            Statement::SetSessionCharacteristics(modes) => {
+                let in_txn = self
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(iso) = &modes.isolation {
+                    settings.insert("default_transaction_isolation".into(), iso.clone());
+                    if !in_txn {
+                        settings.insert("transaction_isolation".into(), iso.clone());
+                    }
+                }
+                if let Some(ro) = modes.read_only {
+                    let v = if ro { "on" } else { "off" };
+                    settings.insert("default_transaction_read_only".into(), v.into());
+                    if !in_txn {
+                        settings.insert("transaction_read_only".into(), v.into());
+                    }
+                }
+                if let Some(df) = modes.deferrable {
+                    let v = if df { "on" } else { "off" };
+                    settings.insert("default_transaction_deferrable".into(), v.into());
+                    if !in_txn {
+                        settings.insert("transaction_deferrable".into(), v.into());
+                    }
+                }
                 Ok(vec![Response::Execution(Tag::new("SET"))])
             }
 

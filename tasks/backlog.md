@@ -450,6 +450,23 @@ for a follow-up:
     a bare `AExpr` (`1/n`) in the COPY source query are unsupported SQL, not COPY
     bugs.
 
+**Rust pgserver transaction characteristics — LANDED 2026-09-08 (psycopg's
+`vendor/psycopg/tests/test_connection.py::test_set_transaction_param_*`, oracle
+PostgreSQL 14; 16 → 0 failures).** The Rust server now parses the transaction
+characteristics on `BEGIN` / `START TRANSACTION`, `SET TRANSACTION`, and
+`SET SESSION CHARACTERISTICS AS TRANSACTION`, reflects them in the
+`transaction_*` / `default_transaction_*` GUCs, and reverts on commit / rollback
+— matching PG 14. Isolation is accepted-and-reported, **not enforced** (single
+node runs on WiredTiger's one snapshot level), the same documented divergence
+the Python SQL server carries in the isolation-level entry above; that is scope,
+not a deferral. Companion fix: `set_config($1, $2, false)` folds a NULL name to
+NULL during a DESCRIBE so a fully-parameterised call round-trips over the
+extended protocol. One minor fidelity gap intentionally left: `SET TRANSACTION`
+issued OUTSIDE an explicit block is a silent no-op here, where PG emits a
+`WARNING: SET TRANSACTION can only be used in transaction blocks` — psycopg
+never triggers it (it only tacks the modes onto `BEGIN`), and the server has no
+notice-emission seam on that path, so the warning is omitted.
+
 **Rust server errors where Python defers — MEASURED 2026-08-26, and the five
 entries describing it are largely stale.** A three-way probe of 45
 query / update / aggregate constructs against the standalone `secantusd-rs`
