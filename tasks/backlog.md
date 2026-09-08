@@ -4958,6 +4958,10 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
     (800+, the piece-2 risk) green; then full slice (204). Repeated 14-min differential runs
     make this a dedicated session's work, confirmed unshippable as a single autonomous pass
     by four probes.
+  **PIECE 1 LANDED (#1383, 2026-09-08):** JoinSelect.filter is now a Vec<JoinPred> (JoinOp{Eq,Gt,Ge,Lt,Le,NotTrue}); multi-predicate + right-side (INNER) + NOT<bool> join WHERE works; full differential green (1029). Remaining: pieces 2+3.
+
+  **KEYSTONE for piece 2 (5th probe, 2026-09-08 — resolve FIRST):** join_output_def (pgplan) runs at DESCRIBE time and must return each join side's output schema. For a Sub-aggregate side it must derive the aggregate's output column TYPES — but that logic lives ONLY in the executor (crates/secantus-pgserver/src/lib.rs ~3008 & ~5016: OutputCol::Agg(i) -> aggregate_wire_type(&agg.items[i]); OutputCol::Group(i) -> group column type from the source def). pgplan has neither. So BEFORE the join-side work, add a pgplan aggregate_output_def(agg, source_def) -> TableDef porting aggregate_wire_type's rules + group-column typing (types as pg_type-name strings in pgplan; executor maps to wire types). THEN piece 2 is mechanical: additive struct (left/right stay (String,String); add left_sub/right_sub: Option<Box<Statement>>), side() accepts N::RangeSubselect (recursively plan inner), execute() materialises the sub-plan before a join_docs_with(left_rows,right_rows) variant. Piece 3: LEFT-JOIN miss -> NULL -> existing coalesce -> {}. Guard: full differential (800+) each step.
+
   Composite VALUE round-trip (register_composite of a value) is a SEPARATE later
   piece after fetch works.
 
