@@ -82,10 +82,10 @@ class _Server:
                 self.proc.kill()
                 self.proc.wait(timeout=10)
 
-    def connect(self) -> psycopg.Connection:
+    def connect(self, *, autocommit: bool = True) -> psycopg.Connection:
         return psycopg.connect(
             f"host=127.0.0.1 port={self.port} dbname=postgres user=test",
-            autocommit=True,
+            autocommit=autocommit,
             connect_timeout=10,
         )
 
@@ -3313,3 +3313,101 @@ def test_join_multi_predicate_where(home: Path) -> None:
             "WHERE t.oid = 3904 AND r.rngsubtype > 0"
         )
         assert cur.fetchall() == [("int4range",)]
+
+
+def test_user_types_are_visible_in_the_transaction_that_creates_them(home: Path) -> None:
+    """A type created in a transaction is visible to later statements in it.
+
+    Planning reads the type catalog OUTSIDE the open transaction (wrapping that
+    read in the transaction deadlocks COPY), so an uncommitted CREATE TYPE was
+    invisible and `CREATE TYPE t ...; SELECT 't'::regtype` in one transaction
+    failed with 42704 -- every psycopg composite/enum/range fixture, whose conn
+    is non-autocommit, hit it. An overlay consulted before the committed
+    catalog fixes it, exactly as the table one does.
+    """
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TYPE ictx AS (a int, b text)")
+        cur.execute("SELECT 'ictx'::regtype::text")
+        assert cur.fetchone() == ("ictx",)
+        cur.execute("CREATE TYPE ienum AS ENUM ('a', 'b')")
+        cur.execute("SELECT 'ienum'::regtype::text")
+        assert cur.fetchone() == ("ienum",)
+        cur.execute("SELECT 'a'::ienum::text")
+        assert cur.fetchone() == ("a",)
+        cur.execute("CREATE TYPE irange AS RANGE (subtype = int4)")
+        # The range RESOLVES in the transaction (no 42704). Its regtype text
+        # renders the oid rather than the name -- a separate, pre-existing gap
+        # that shows in autocommit too, tracked in the backlog -- so this
+        # asserts only that the cast succeeds.
+        cur.execute("SELECT 'irange'::regtype::text")
+        assert cur.fetchone() is not None
+        conn.commit()
+
+
+def test_fetch_info_works_in_the_creating_transaction(home: Path) -> None:
+    """psycopg's `*.fetch` helpers find a type created in the same transaction.
+
+    This is the shape every composite/enum/range gauge fixture uses: on a
+    non-autocommit connection, CREATE TYPE then `CompositeInfo.fetch` -- which
+    returned None (`TypeError: no info passed`) while the type was invisible.
+    """
+    from psycopg.types.composite import CompositeInfo
+    from psycopg.types.enum import EnumInfo
+    from psycopg.types.range import RangeInfo
+
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TYPE ficomp AS (a int, b text)")
+        info = CompositeInfo.fetch(conn, "ficomp")
+        assert info is not None
+        assert info.name == "ficomp"
+        assert info.field_names == ("a", "b")
+        cur.execute("CREATE TYPE fienum AS ENUM ('x', 'y')")
+        einfo = EnumInfo.fetch(conn, "fienum")
+        assert einfo is not None
+        assert einfo.name == "fienum"
+        assert einfo.labels == ["x", "y"]
+        cur.execute("CREATE TYPE firange AS RANGE (subtype = int4)")
+        rinfo = RangeInfo.fetch(conn, "firange")
+        assert rinfo is not None
+        assert rinfo.name == "firange"
+        assert rinfo.subtype_oid == 23
+        conn.rollback()
+
+
+def test_rollback_discards_a_type_created_in_the_transaction(home: Path) -> None:
+    """ROLLBACK removes an uncommitted CREATE TYPE, COMMIT keeps it."""
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TYPE rb AS (x int)")
+        cur.execute("SELECT 'rb'::regtype::text")
+        assert cur.fetchone() == ("rb",)
+        conn.rollback()
+        with pytest.raises(psycopg.errors.UndefinedObject):
+            cur.execute("SELECT 'rb'::regtype::text")
+        conn.rollback()
+        # Committed this time, it persists into the next transaction.
+        cur.execute("CREATE TYPE kept AS (x int)")
+        conn.commit()
+        cur.execute("SELECT 'kept'::regtype::text")
+        assert cur.fetchone() == ("kept",)
+        conn.commit()
+
+
+def test_savepoint_rollback_discards_a_type_created_after_it(home: Path) -> None:
+    """ROLLBACK TO undoes a CREATE TYPE issued after the savepoint."""
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        cur = conn.cursor()
+        cur.execute("SAVEPOINT s1")
+        cur.execute("CREATE TYPE sp AS (x int)")
+        cur.execute("SELECT 'sp'::regtype::text")
+        assert cur.fetchone() == ("sp",)
+        cur.execute("ROLLBACK TO SAVEPOINT s1")
+        with pytest.raises(psycopg.errors.UndefinedObject):
+            cur.execute("SELECT 'sp'::regtype::text")
+        conn.rollback()
+        # The rolled-back savepoint's type never persists.
+        with pytest.raises(psycopg.errors.UndefinedObject):
+            cur.execute("SELECT 'sp'::regtype::text")
+        conn.rollback()

@@ -4858,21 +4858,36 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `true` here. Reproducing it needs PostgreSQL's operator-resolution table for
   arrays, not a comparison fix. Being more permissive, so it accepts queries
   PostgreSQL rejects rather than answering them differently.
-- **Rust PG server: DDL is NOT visible within its own open transaction —
-  blocks psycopg's schema-qualified TypeInfo tests + likely more (probed
-  2026-09-08).** With autocommit off, `create type testschema.testtype`
-  followed by `select to_regtype('testschema.testtype')` in the SAME
-  transaction returns NULL — and so does the bare `to_regtype('testtype')`, so
-  this is NOT schema-specific: an uncommitted CREATE TYPE (and almost certainly
-  CREATE TABLE / CREATE SCHEMA / etc.) is invisible to later statements on the
-  same connection until commit. The oracle resolves it. `install_user_types`
-  (and the catalog reads generally) see committed store state, not the
-  connection's uncommitted writes. This fails
-  `tests/test_typeinfo.py::test_fetch_by_schema_qualified_string` (sync+async,
-  both params) and is a broad correctness gap for any test that creates a type
-  and uses it before committing. Probe: connect with `autocommit=False`, CREATE
-  then to_regtype. Fixing it needs the catalog reads to layer the open
-  transaction's pending DDL over the committed store.
+- **Rust PG server: user-type DDL is now visible within its own open
+  transaction — FIXED (2026-09-08).** An uncommitted `CREATE`/`DROP TYPE`
+  (composite, enum, range) is now visible to later statements in the same
+  transaction: `to_regtype`, value casts, and psycopg's
+  `CompositeInfo`/`EnumInfo`/`RangeInfo` `.fetch` all resolve the type before
+  commit; `ROLLBACK`/`ROLLBACK TO` discard it and `COMMIT` persists it. The fix
+  mirrors the TABLE `uncommitted` overlay — a per-connection map of the
+  transaction's pending type creates/drops (`uncommitted_types`), consulted by
+  `type_catalog_docs` before the committed catalog, snapshotted by savepoints,
+  and reverted by savepoint pre-images so a rolled-back create cannot survive a
+  later commit. Wrapping the catalog read in `with_user_transaction` was
+  rejected because it deadlocks COPY (same reason the table fix rejected it).
+  NOTE the item's speculation that CREATE TABLE was also broken was wrong —
+  CREATE TABLE in-txn already worked via the existing table overlay; only TYPES
+  lacked one. Slice tests:
+  `test_user_types_are_visible_in_the_transaction_that_creates_them`,
+  `test_fetch_info_works_in_the_creating_transaction`,
+  `test_rollback_discards_a_type_created_in_the_transaction`,
+  `test_savepoint_rollback_discards_a_type_created_after_it`.
+
+- **Rust PG server: `regtype::text` of a CUSTOM RANGE renders the oid, not the
+  name (probed 2026-09-08, autocommit AND in-txn).** `CREATE TYPE r AS RANGE
+  (subtype = int4); SELECT 'r'::regtype::text` returns the oid string (e.g.
+  `69000`) where the oracle returns `r`. The range resolves (no 42704) — its
+  oid is found — but the regtype→name reverse map does not cover custom ranges,
+  so the `::text` render falls back to the oid number. Composites and enums
+  render their name correctly; only ranges miss. This is NOT a visibility bug
+  (it shows in autocommit too). Fix: extend the oid→typename reverse lookup
+  that `regtype::text` uses to consult `ranges()` (it already consults
+  composites/enums). Probe: `scratchpad/committed_type_probe.py`.
 
 - **Rust PG server: composite VALUE round-trip (`register_composite` of a value)
   is the remaining composite piece (2026-09-08).** `CompositeInfo.fetch` now
