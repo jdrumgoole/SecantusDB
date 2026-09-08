@@ -4817,10 +4817,20 @@ def _parse_date_string(value: str) -> _dt.datetime:
     and the general wording mongod uses for a string it cannot start to read.
     """
     text = value.strip()
-    if not text:
+    if not value:
         raise ExpressionError(
             # The character in mongod's message is a literal NUL, not a space.
             f"Error parsing date string '{value}'; 0: Empty string '\x00'",
+            code=241,
+            code_name="ConversionFailure",
+        )
+    if not text:
+        # WHITESPACE-ONLY is not empty for mongod: `''` is "Empty string" but
+        # `'  '` is the incomplete-string message (measured 8.2.11, 2026-09-08).
+        # Testing the STRIPPED text conflated them and gave `'  '` the empty
+        # message.
+        raise ExpressionError(
+            f'an incomplete date/time string has been found, with elements missing: "{value}"',
             code=241,
             code_name="ConversionFailure",
         )

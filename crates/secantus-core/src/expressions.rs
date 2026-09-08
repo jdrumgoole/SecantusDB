@@ -4211,6 +4211,28 @@ fn render_date_at(millis: i64, fmt: &str, offset_ms: i64) -> Result<String, Fall
 /// `±HH:MM` offset (`utc = wall - offset`). Fractional seconds / other shapes →
 /// `None` (defer).
 fn parse_iso(s: &str) -> Option<i128> {
+    // A FRACTIONAL second is truncated to milliseconds and then removed, so the
+    // exact-length checks below still see the plain forms. mongod takes 1..n
+    // digits and keeps three: `.1` is 100 ms, `.1234567` is 123 (measured
+    // 8.2.11, 2026-09-08). Without this, every ISO timestamp carrying
+    // milliseconds -- the ordinary form for a BSON date -- failed to parse.
+    if let Some(dot) = s.find('.') {
+        let digits: String = s[dot + 1..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if !digits.is_empty() {
+            let millis: i128 = digits
+                .chars()
+                .chain("000".chars())
+                .take(3)
+                .collect::<String>()
+                .parse()
+                .ok()?;
+            let stripped = format!("{}{}", &s[..dot], &s[dot + 1 + digits.len()..]);
+            return parse_iso(&stripped).map(|ms| ms + millis);
+        }
+    }
     if let Some(base) = s.strip_suffix('Z') {
         // A `Z` designator only follows a full datetime.
         return if base.len() == 19 {
@@ -4224,6 +4246,13 @@ fn parse_iso(s: &str) -> Option<i128> {
         let (base, tz) = s.split_at(19);
         let off_min = parse_offset(tz)?;
         return parse_naive(base).map(|ms| ms - off_min as i128 * 60_000);
+    }
+    // `YYYY-MM` is the first of that month for mongod (`2020-01` is
+    // 2020-01-01T00:00:00Z, measured 8.2.11). A bare `YYYY` is NOT -- it answers
+    // the incomplete-string error -- so only the 7-character form is widened.
+    // Mirrors `secantus.expressions._parse_date_string`.
+    if s.len() == 7 && s.as_bytes()[4] == b'-' {
+        return parse_naive(&format!("{s}-01"));
     }
     parse_naive(s)
 }
@@ -5498,19 +5527,56 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
             },
             // A date STRING is a supported conversion that mongod parses, so it
             // must not be reported as an unsupported PAIR -- `{$toDate:
-            // "2026-01-02"}` is an everyday call and mongod answers it. What we
-            // cannot yet reproduce is mongod's timelib parse DIAGNOSTIC
-            // ("Error parsing date string 'abc'; 0: ..."), so an unparseable
-            // string still defers rather than claiming a message it would not
-            // send. See `tasks/backlog.md`.
+            // "2026-01-02"}` is an everyday call and mongod answers it.
+            //
+            // A FAILED parse now carries mongod's code (241) and, for the two
+            // shapes whose text is reproducible, its exact message. It used to
+            // return `Conv::Failed`, which on this server surfaces as
+            // "aggregation pipeline uses a stage or operator not supported" --
+            // false, because `$toDate` IS supported and the STRING was at
+            // fault, and a different code (2) from mongod's.
+            //
+            // The per-position timelib diagnostic ("Error parsing date string
+            // 'abc'; 0: passing a time zone identifier ...") is still NOT
+            // reproduced -- it needs timelib's own scanner, its timezone
+            // abbreviation tables and its per-position error accumulation. This
+            // matches `secantus.expressions._parse_date_string`, so the two
+            // servers agree; the shared gap is documented in `tasks/backlog.md`.
             Bson::String(text) => match parse_iso(text) {
                 Some(ms) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(ms as i64))),
-                None => Conv::Failed,
+                None => Conv::Named(date_string_parse_error(text)),
             },
             _ => Conv::Unsupported,
         },
         _ => Conv::Unsupported,
     }
+}
+
+/// mongod's `241 ConversionFailure` for a string `$toDate` cannot parse.
+///
+/// Two shapes are reproducible exactly and are measured on 8.2.11 (2026-09-08):
+/// an EMPTY string names a literal NUL, and everything else that reaches here
+/// gets the incomplete-string text. WHITESPACE-ONLY is *not* empty -- `''` is
+/// "Empty string" but `'  '` is the incomplete message -- so this tests the raw
+/// value, not a trimmed one.
+///
+/// mongod says more than this for a string its scanner got partway through
+/// (`'abc'` names the offending character and position). That needs timelib
+/// itself; inventing a position here would look authoritative and be wrong.
+fn date_string_parse_error(text: &str) -> Fallback {
+    if text.is_empty() {
+        return Fallback::mongo(
+            241,
+            // A literal NUL, not a space -- mongod's own byte.
+            format!("Error parsing date string '{text}'; 0: Empty string '\0'"),
+        );
+    }
+    Fallback::mongo(
+        241,
+        format!(
+            r#"an incomplete date/time string has been found, with elements missing: "{text}""#
+        ),
+    )
 }
 
 fn wrap_int(n: i128, code: i32) -> Conv {
