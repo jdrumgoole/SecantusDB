@@ -4961,6 +4961,29 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   **PIECE 1 LANDED (#1383, 2026-09-08):** JoinSelect.filter is now a Vec<JoinPred> (JoinOp{Eq,Gt,Ge,Lt,Le,NotTrue}); multi-predicate + right-side (INNER) + NOT<bool> join WHERE works; full differential green (1029). Remaining: pieces 2+3.
 
   **KEYSTONE for piece 2 (5th probe, 2026-09-08 — resolve FIRST):** join_output_def (pgplan) runs at DESCRIBE time and must return each join side's output schema. For a Sub-aggregate side it must derive the aggregate's output column TYPES — but that logic lives ONLY in the executor (crates/secantus-pgserver/src/lib.rs ~3008 & ~5016: OutputCol::Agg(i) -> aggregate_wire_type(&agg.items[i]); OutputCol::Group(i) -> group column type from the source def). pgplan has neither. So BEFORE the join-side work, add a pgplan aggregate_output_def(agg, source_def) -> TableDef porting aggregate_wire_type's rules + group-column typing (types as pg_type-name strings in pgplan; executor maps to wire types). THEN piece 2 is mechanical: additive struct (left/right stay (String,String); add left_sub/right_sub: Option<Box<Statement>>), side() accepts N::RangeSubselect (recursively plan inner), execute() materialises the sub-plan before a join_docs_with(left_rows,right_rows) variant. Piece 3: LEFT-JOIN miss -> NULL -> existing coalesce -> {}. Guard: full differential (800+) each step.
+  **COMPLETE 4-LAYER MAP (6th probe, 2026-09-08 — fully traced end-to-end, execution-ready).**
+  Oracle facts: `array_agg(attname)`→`name[]`, `array_agg(atttypid)`→`oid[]`, group key `attrelid`→`oid`.
+  L1 KEYSTONE — pgplan `aggregate_output_def(agg, source_def) -> TableDef` returning pg_type-NAME
+     strings: count/sum→int8, min/max→item.source_type, array_agg→`{source_type}[]` (all already
+     name strings on AggItem), Group(i)→`source_def.column(group_by[i].0).pg_type`. (executor's
+     `aggregate_wire_type` @ pgserver:3780 + group typing @ :3150 are the reference). Mechanical.
+  L2 SUBQUERY JOIN SIDE (additive) — JoinSelect (pgplan:423) keep left/right (String,String), add
+     left_sub/right_sub: Option<Box<Statement>> (Sub side: .0="", .1=alias, _sub=Some). side()
+     (pgplan:1711) accepts N::RangeSubselect (recursively plan_select inner). join_output_def
+     (pgplan:1866) + lookup loop (pgplan:1725) branch on a Sub side (use aggregate_output_def, skip
+     table lookup). Executor: extract `aggregate_rows(&self, agg) -> Vec<Document>` from the
+     Statement::Aggregate arm (pgserver:3008-3178); refactor join_docs -> join_docs_with(join,
+     left_rows, right_rows) (Sub side uses pre-materialised rows; field_of is identity — rows keyed
+     by output names); execute() (pgserver:2384) materialises each Sub side before the call.
+  L3 COALESCE AS A JOIN TARGET (the layer earlier blueprints missed) — the outer projects
+     `coalesce(a.fnames,'{}')` (FuncCall). plan_join_select's target parser (~pgserver:1762) only
+     accepts ColumnRef+TypeCast; parse a FuncCall into the existing ColumnExpr::Call (pgplan:508;
+     builder @ pgplan:1335; apply_column_expr @ pgplan:3562 already evaluates it).
+  L4 COALESCE ON MISS — a LEFT-JOIN miss must yield NULL (join_docs's existing None=>Bson::Null on
+     the right already does this once L2 is wired) so L3's coalesce gives `{}` (base types w/ no attrs).
+  ~300-400 lines across both crates; guard = full differential (800+) each step. Six probes all
+  judged this a dedicated focused session, not a single autonomous pass.
+
 
   Composite VALUE round-trip (register_composite of a value) is a SEPARATE later
   piece after fetch works.
