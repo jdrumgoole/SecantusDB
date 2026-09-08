@@ -866,6 +866,62 @@ def test_date_and_time_columns(home: Path) -> None:
         assert exc.value.diag.sqlstate == "22008"
 
 
+def test_datetime_arithmetic_and_special_values(home: Path) -> None:
+    """`date + int`, `timestamp + interval`, `interval + interval`, the `epoch`
+    literal, and the `24:00` end-of-day time.
+
+    The result-type OIDs matter as much as the values: psycopg picks its loader
+    from the DESCRIBED column type, so `timestamp + interval` must describe as
+    1114 (not text/int), `interval + interval` as 1186, and `date + int` as
+    1082. An out-of-range arithmetic result is rendered in PostgreSQL's own text
+    (a year past 9999, or the `BC` era) so the CLIENT's loader is what rejects
+    it -- exactly what psycopg's overflow tests assert. `24:00:00` is a valid
+    `time` PostgreSQL renders back verbatim; a Python `time` cannot hold it, so
+    the loader raises on the way in.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+
+        # epoch special literal on date / timestamp / timestamptz.
+        cur.execute("SELECT 'epoch'::date")
+        assert cur.fetchone()[0] == dt.date(1970, 1, 1)
+        assert cur.description[0].type_code == 1082
+        cur.execute("SELECT 'epoch'::date + 1")
+        assert cur.fetchone()[0] == dt.date(1970, 1, 2)
+        assert cur.description[0].type_code == 1082
+
+        # date arithmetic types and values.
+        cur.execute("SELECT '2000-01-01'::date + 5")
+        assert cur.fetchone()[0] == dt.date(2000, 1, 6)
+        cur.execute("SELECT '2000-01-01'::date - '1999-01-01'::date")
+        assert cur.fetchone()[0] == 365
+        assert cur.description[0].type_code == 23
+
+        # timestamp + interval describes as timestamp (1114); interval + interval
+        # as interval (1186). The value-type alone would have said text.
+        cur.execute("SELECT '2000-01-01 00:00:00'::timestamp + '1s'::interval")
+        assert cur.fetchone()[0] == dt.datetime(2000, 1, 1, 0, 0, 1)
+        assert cur.description[0].type_code == 1114
+        cur.execute("SELECT '1 day'::interval + '1s'::interval")
+        assert cur.fetchone()[0] == dt.timedelta(days=1, seconds=1)
+        assert cur.description[0].type_code == 1186
+
+        # 24:00:00 is a valid time value PostgreSQL renders verbatim; a Python
+        # time cannot hold it, so psycopg's loader raises DataError.
+        cur.execute("SELECT '24:00'::time::text")
+        assert cur.fetchone()[0] == "24:00:00"
+        with pytest.raises(psycopg.DataError):
+            cur.execute("SELECT '24:00'::time")
+            cur.fetchone()
+
+        # An out-of-range date arithmetic result renders in PG text the client
+        # cannot load -- year past 9999 and the BC era.
+        cur.execute("SELECT ('9999-12-31'::date + 1)::text")
+        assert cur.fetchone()[0] == "10000-01-01"
+        cur.execute("SELECT ('0001-01-01'::date + -1)::text")
+        assert cur.fetchone()[0] == "0001-12-31 BC"
+
+
 def test_multidimensional_arrays(home: Path) -> None:
     """Multidimensional arrays over the wire, in both formats.
 

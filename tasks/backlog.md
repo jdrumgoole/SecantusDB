@@ -1387,24 +1387,24 @@ Specific items that were left out of the slice that introduced their feature are
   clock-dependent input keywords `now` / `today` / `tomorrow` / `yesterday`
   (only the constant `epoch` is).
 
-- [ ] **OPEN — RUST pgserver: separate `test_datetime.py` edges still fail
-  (noted 2026-09-08; ~44 remaining after DateStyle text rendering landed).**
-  DateStyle-honouring output (the `datestyle-rendering` batch) fixed the 12
-  `test_overflow_message[timestamptz-*]` cases and reports `DateStyle` again;
-  `test_dump_datetimetz` is green. `test_datetime.py` still has ~44 failures in
-  areas untouched by that work, each its own decode / message-fidelity gap:
-  the timestamp/date arithmetic behind `test_load_date_overflow` /
-  `test_load_datetime_overflow` (`operator + on these operands is not supported
-  yet`); `'epoch'::date` behind `test_dump_date_datestyle` /
-  `test_dump_datetimetz_datestyle`; overflow-message wording for
-  `test_load_interval_overflow` and the binary overflow loaders; named-zone
-  LOADING (`test_load_datetimetz_tz[Europe/Rome ...]` — a result timestamptz
-  built against a DST-carrying named zone) and `test_max_with_timezone`; and the
-  `24:00` boundary time (`test_load_time_24` / `test_load_timetz_24`). NOTE: a
-  date/timestamp ARRAY under a non-ISO DateStyle still renders its elements in
-  ISO (the array text path does not thread the style yet) — no failing test
-  exercises it today, but it is a known divergence. Measured against a real
-  PG 14 before working any of them.
+- [ ] **OPEN — RUST pgserver: named-zone `timestamptz` LOADING needs an IANA
+  time-zone database (noted 2026-09-08; 6 `test_datetime.py` failures remain).**
+  The `pgserver-dtfeat` batch closed 38 of the 44 remaining `test_datetime.py`
+  failures — datetime arithmetic (`date +/- int`, `date - date`, `timestamp +
+  interval`, `interval + interval`, `interval * n`) now evaluates AND is typed
+  from its operands so the result column is described with the right OID at
+  DESCRIBE time; `'epoch'` is accepted on `date` / `timestamptz`; `24:00:00` is
+  a valid end-of-day `time`; and out-of-range arithmetic renders in PG text (a
+  wide year, the `BC` era) so the client's loader is what rejects it. The 6
+  that remain are all `test_load_datetimetz_tz[Europe/Rome ...]`: building a
+  result `timestamptz` in a DST-carrying NAMED zone (`set timezone to
+  'Europe/Rome'`) requires resolving the zone's offset at the value's instant,
+  which needs a real IANA tz database (`chrono-tz` is already a dep, so this is
+  tractable but its own slice — thread the session's named zone through
+  `render_timestamptz` / the `TimeZoneSetting`). NOTE: a date/timestamp ARRAY
+  under a non-ISO DateStyle still renders its elements in ISO (the array text
+  path does not thread the style yet) — no failing test exercises it today, but
+  it is a known divergence. Measured against a real PG 14.
 
 - [ ] **OPEN — RUST pgserver column metadata (`typmod` / `typlen`): landed
   for constant SELECTs, deferred for table columns and computed expressions
