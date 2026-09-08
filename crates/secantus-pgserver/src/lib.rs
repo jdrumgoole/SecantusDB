@@ -159,6 +159,14 @@ struct CursorState {
     /// the end leaves the cursor at `len + 1`, so a later `MOVE BACKWARD 2`
     /// lands on the LAST row rather than the second-to-last.
     pos: i64,
+    /// The `pg_cursors` catalog columns for this open cursor. Reported by a
+    /// `SELECT ... FROM pg_cursors`, which psycopg's server cursor issues to
+    /// check whether a cursor it is about to close still exists.
+    statement: String,
+    is_holdable: bool,
+    is_binary: bool,
+    is_scrollable: bool,
+    creation_time: bson::DateTime,
 }
 
 struct CopyInState {
@@ -307,11 +315,7 @@ impl PgHandler {
         let ranges: Vec<(String, String, i64)> = ranges_with_schema
             .iter()
             .map(|(schema, name, oid, subtype)| {
-                (
-                    Self::type_resolution(schema, name),
-                    subtype.clone(),
-                    *oid,
-                )
+                (Self::type_resolution(schema, name), subtype.clone(), *oid)
             })
             .collect();
         secantus_pgplan::set_user_ranges(ranges);
@@ -1221,6 +1225,22 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("parameter_types", "text", false),
                 ],
             )),
+            // The open cursors of THIS connection, in PostgreSQL's column order.
+            // psycopg's server cursor reads it (`SELECT 1 FROM pg_cursors WHERE
+            // name = ...`) to check a cursor exists before closing one it did
+            // not declare, and the suite queries it directly to prove a cursor
+            // is gone after close.
+            "pg_cursors" => Some(TableDef::new(
+                "pg_cursors",
+                vec![
+                    secantus_pgcatalog::Column::new("name", "text", false),
+                    secantus_pgcatalog::Column::new("statement", "text", false),
+                    secantus_pgcatalog::Column::new("is_holdable", "bool", false),
+                    secantus_pgcatalog::Column::new("is_binary", "bool", false),
+                    secantus_pgcatalog::Column::new("is_scrollable", "bool", false),
+                    secantus_pgcatalog::Column::new("creation_time", "timestamptz", false),
+                ],
+            )),
             _ => None,
         }
     }
@@ -1419,6 +1439,38 @@ impl PgHandler {
                     }
                 }
                 rows
+            }
+            // One row per open cursor on this connection.
+            "pg_cursors" => {
+                let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+                cursors
+                    .iter()
+                    .map(|(name, c)| {
+                        let mut d = Document::new();
+                        d.insert(def.field_of("name").expect("column"), name.as_str());
+                        d.insert(
+                            def.field_of("statement").expect("column"),
+                            c.statement.as_str(),
+                        );
+                        d.insert(
+                            def.field_of("is_holdable").expect("column"),
+                            Bson::Boolean(c.is_holdable),
+                        );
+                        d.insert(
+                            def.field_of("is_binary").expect("column"),
+                            Bson::Boolean(c.is_binary),
+                        );
+                        d.insert(
+                            def.field_of("is_scrollable").expect("column"),
+                            Bson::Boolean(c.is_scrollable),
+                        );
+                        d.insert(
+                            def.field_of("creation_time").expect("column"),
+                            Bson::DateTime(c.creation_time),
+                        );
+                        d
+                    })
+                    .collect()
             }
             _ => Vec::new(),
         };
@@ -2486,7 +2538,15 @@ impl PgHandler {
         // await, so it happens here in the async path rather than inside
         // `execute` -- blocking on it there stalled the runtime and hung the
         // connection outright.
-        if let Statement::DeclareCursor { name, query } = stmt {
+        if let Statement::DeclareCursor {
+            name,
+            query,
+            statement,
+            scrollable,
+            holdable,
+            binary: is_binary_cursor,
+        } = stmt
+        {
             if self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".into(),
@@ -2524,6 +2584,11 @@ impl PgHandler {
                         schema,
                         rows,
                         pos: 0,
+                        statement,
+                        is_holdable: holdable,
+                        is_binary: is_binary_cursor,
+                        is_scrollable: scrollable,
+                        creation_time: bson::DateTime::now(),
                     },
                 );
             return Ok(vec![Response::Execution(Tag::new("DECLARE CURSOR"))]);

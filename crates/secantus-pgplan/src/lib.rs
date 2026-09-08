@@ -227,6 +227,15 @@ pub enum Statement {
     DeclareCursor {
         name: String,
         query: Box<Statement>,
+        /// The deparsed inner query, for the `pg_cursors` catalog view's
+        /// `statement` column. Not re-executed -- only reported.
+        statement: String,
+        /// Declared cursor options, surfaced by `pg_cursors`. A cursor declared
+        /// `NO SCROLL` reports `is_scrollable = false`; anything else is
+        /// scrollable here, since every cursor is materialised.
+        scrollable: bool,
+        holdable: bool,
+        binary: bool,
     },
     /// `FETCH`/`MOVE`. `is_move` discards the rows and reports only the count,
     /// which is the only difference between the two statements.
@@ -538,6 +547,13 @@ pub enum ColumnExpr {
     /// wins. Used for a join target like `coalesce(a.fnames, '{}')`, where a
     /// LEFT-JOIN miss makes the column NULL and the fallback stands in.
     Coalesce { args: Vec<Option<Bson>> },
+    /// A literal in the select list -- `SELECT 1 FROM t`. The value is the same
+    /// for every row and ignores the row entirely; `result_type` fixes the
+    /// column's type for the DESCRIBE pass. `SELECT 1 FROM pg_cursors WHERE
+    /// name = ...` is how psycopg's server cursor probes for a cursor's
+    /// existence, and `SELECT 1 FROM generate_series(...)` is how the suite
+    /// counts rows.
+    Const { value: Bson, result_type: String },
 }
 
 /// One column of a FROM-less SELECT.
@@ -812,14 +828,29 @@ pub fn plan_with_params(
         N::CopyStmt(c) => plan_copy(&c, lookup, params),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
         N::DeclareCursorStmt(d) => {
-            let inner = match d.query.as_ref().and_then(|q| q.node.as_ref()) {
+            let inner_node = d.query.as_ref().and_then(|q| q.node.as_ref());
+            let inner = match inner_node {
                 Some(N::SelectStmt(sel)) => plan_select(sel, lookup, params)?,
                 Some(other) => return Err(Error::Unsupported(disc(other))),
                 None => return Err(Error::Parse("DECLARE CURSOR without a query".into())),
             };
+            // PostgreSQL's cursor-option bitmask (`nodes/parsenodes.h`).
+            const CURSOR_OPT_BINARY: i32 = 0x0001;
+            const CURSOR_OPT_NO_SCROLL: i32 = 0x0004;
+            const CURSOR_OPT_HOLD: i32 = 0x0020;
+            // Deparse the inner query for `pg_cursors.statement`. Best-effort:
+            // an un-deparsable node leaves the column empty rather than failing
+            // the DECLARE, which no client reads that column to check.
+            let statement = inner_node
+                .and_then(|n| n.deparse().ok())
+                .unwrap_or_default();
             Ok(Statement::DeclareCursor {
                 name: d.portalname.clone(),
                 query: Box::new(inner),
+                statement,
+                scrollable: (d.options & CURSOR_OPT_NO_SCROLL) == 0,
+                holdable: (d.options & CURSOR_OPT_HOLD) != 0,
+                binary: (d.options & CURSOR_OPT_BINARY) != 0,
             })
         }
         N::FetchStmt(f) => {
@@ -1222,6 +1253,7 @@ fn plan_series_select(
         ));
     }
     let mut columns: Vec<(String, String)> = Vec::new();
+    let mut casts: Vec<Option<ColumnExpr>> = Vec::new();
     for t in &s.target_list {
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
             continue;
@@ -1236,12 +1268,28 @@ fn plan_series_select(
                     rt.name.clone()
                 };
                 columns.push((out, series.column.clone()));
+                casts.push(None);
+            }
+            // `SELECT 1 FROM generate_series(...)` -- a literal per row, which
+            // is how the suite counts a series' rows without reading its value.
+            Some(N::AConst(_)) => {
+                let val = rt.val.as_ref().expect("ResTarget has a val for AConst");
+                let value = const_value(val, params)?;
+                let out = if rt.name.is_empty() {
+                    "?column?".to_string()
+                } else {
+                    rt.name.clone()
+                };
+                let result_type = const_col_type(&value).to_string();
+                columns.push((out.clone(), out));
+                casts.push(Some(ColumnExpr::Const { value, result_type }));
             }
             Some(other) => return Err(Error::Unsupported(disc(other))),
         }
     }
     if columns.is_empty() {
         columns.push((series.column.clone(), series.column.clone()));
+        casts.push(None);
     }
     // ORDER BY over the one column there is, by name or by position.
     let mut order = Vec::new();
@@ -1289,7 +1337,7 @@ fn plan_series_select(
         series: Some(series),
         join: None,
         columns,
-        casts: Vec::new(),
+        casts,
         filter: Document::new(),
         order,
         limit,
@@ -1459,6 +1507,23 @@ fn plan_select(
                 };
                 columns.push((out, field));
                 casts.push(None);
+            }
+            // `SELECT 1 FROM t` -- a literal in the select list. The value is
+            // the same for every row; `?column?` is PostgreSQL's name for an
+            // unaliased constant. The stored "field" is unused (the Const
+            // expression ignores the row) but must be a real column name so the
+            // encoder's `d.get(f)` is harmless -- the output name serves.
+            Some(N::AConst(_)) => {
+                let val = rt.val.as_ref().expect("ResTarget has a val for AConst");
+                let value = const_value(val, params)?;
+                let out = if rt.name.is_empty() {
+                    "?column?".to_string()
+                } else {
+                    rt.name.clone()
+                };
+                let result_type = const_col_type(&value).to_string();
+                columns.push((out.clone(), out));
+                casts.push(Some(ColumnExpr::Const { value, result_type }));
             }
             Some(other) => return Err(Error::Unsupported(disc(other))),
             None => return Err(Error::Unsupported("an empty target".into())),
@@ -4138,6 +4203,8 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
             }
             Ok(Bson::Null)
         }
+        // A literal ignores the row and returns its constant.
+        ColumnExpr::Const { value, .. } => Ok(value.clone()),
     }
 }
 
@@ -4149,6 +4216,18 @@ pub fn column_expr_type(expr: &ColumnExpr) -> &str {
         // A coalesce keeps its column's type; join_output_def resolves that
         // from the side column, so this fallback is not used for typing.
         ColumnExpr::Coalesce { .. } => "text",
+        ColumnExpr::Const { result_type, .. } => result_type,
+    }
+}
+
+/// The PostgreSQL type name a literal select-list constant reports.
+fn const_col_type(v: &Bson) -> &'static str {
+    match v {
+        Bson::Boolean(_) => "bool",
+        Bson::Int32(_) => "int4",
+        Bson::Int64(_) => "int8",
+        Bson::Double(_) => "float8",
+        _ => "text",
     }
 }
 
