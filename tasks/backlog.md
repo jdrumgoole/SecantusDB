@@ -5950,13 +5950,55 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   Pinned by `tests/test_rust_decimal_extremes.py` (91 cases) and
   `tests/test_decimal128_extremes.py` (58).
 
-- [ ] **`$exp` of a mid-range finite decimal still refuses on the Rust server
-  (2026-09-08).** The only cell left on the 364-case grid above: `$exp(1)` is
-  `2.718281828459045235360287471352662` on mongod and a `BadValue` here. The
-  two decided regions (`|x| >= 1E+5`, `|x| <= 1E-40`) are answered; the middle
-  needs a decimal exponential series. The Python engine answers all of them
-  (stdlib `decimal.exp()`), so this is a Rust-only gap. Same series would give
-  `ln`, and `ln` plus the `sqrt` already built gives `$asinh`.
+- [x] **RESOLVED 2026-09-08 — `$ln` / `$log10` / `$exp` / `$asinh` compute on a
+  finite decimal, correctly rounded.** A pure-Rust high-precision layer
+  (`hp_mul` / `hp_add` / `hp_div` / `hp_sqrt` in `decimal.rs`) plus `ln` by
+  argument reduction onto an `atanh` series, `exp` onto a power of ten and a
+  Taylor series, and `log10` from `ln` with an exact short-circuit for powers of
+  ten. Rounding is VERIFIED, not assumed: the working precision widens
+  80 → 140 → 260 digits until the guard digits decide the 34th.
+
+  Measured over 290 (operator, input) pairs: **correctly rounded on 290, zero
+  errors**, and the two engines agree on 384 of 384.
+
+  **This is a DELIBERATE divergence from mongod, chosen by Joe on 2026-09-08.**
+  The same 290 pairs put mongod at 231 correctly rounded — it carries Intel
+  RDFP's last-digit error on the rest — so these operators now differ from
+  8.2.11 by one ULP on roughly a fifth of finite inputs. Per operator, mongod
+  agrees with the correctly-rounded value on `$ln` 67/76, `$log10` 56/76,
+  `$exp` 55/62, `$asinh` 61/76. Matching mongod exactly still needs RDFP linked;
+  that option is unchanged and unchosen.
+
+  **Two earlier claims in this entry were wrong and are corrected here:**
+  - "`$sqrt` and `$asinh` are correctly-rounded decimal on 8 of 8" — `$asinh` is
+    61 of 76 on a wider corpus. The 8-point sample was too small to see it.
+    (`$sqrt` really is exact: IEEE 754 REQUIRES correct rounding for square
+    root, which is why it landed at 0 divergences of 75.)
+  - mongod's `$log10` is not merely imprecise, it is sometimes plainly wrong:
+    `$log10(Decimal128("1E+5"))` is `5.000000000000000000000000000000001`.
+
+  Two bugs found on the way, both silent wrong values, both fixed:
+  - `$asinh` of a small argument. `ln(x + sqrt(x^2+1))` cancels to `1 + x`, so
+    at ANY fixed precision the answer collapses — the Rust server returned `0`
+    for `1E-100` and the Python engine had eleven digits of error at `1E-10`.
+  - `hp_div` aborted before producing a digit when the divisor was much wider
+    than the dividend, returning ZERO for `x / ln(10)`. That left `exp`'s
+    argument unreduced and made the Taylor series overrun its term cap for any
+    `x` above ~1000.
+
+  Pinned by `tests/test_decimal_transcendentals.py` (83 cases, which computes
+  its own 250-digit reference and self-checks it) and 6 Rust unit tests.
+
+- [ ] **The other decimal transcendentals still refuse (2026-09-08).** The six
+  trig and the remaining hyperbolics (`$sin`, `$cos`, `$tan`, `$asin`, `$acos`,
+  `$atan`, `$sinh`, `$cosh`, `$tanh`, `$acosh`, `$atanh`) still decline a finite
+  non-zero decimal on the Rust server. The machinery above would serve them —
+  `sin` / `cos` need argument reduction modulo pi at working precision, which is
+  the only genuinely new piece — but each carries the same
+  correctly-rounded-versus-mongod trade-off, and only the four above were
+  authorised. Note `src/secantus/expressions.py`'s `_DEC_TRIG` deliberately
+  computes at 34 digits THROUGHOUT to track mongod's own error; `$asinh` is now
+  the one exception, and any decision here should say which rule wins.
 
 - [ ] **Decimal128 operands are refused by some Rust operators.** Shrinking:
   `$abs`, `$toBool`, `$toInt`, `$toLong`, `$toDouble`, and now `$sqrt`,

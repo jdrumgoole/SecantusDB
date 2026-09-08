@@ -2144,11 +2144,35 @@ def _dec_atan2(y: _decimal.Decimal, x: _decimal.Decimal) -> _decimal.Decimal:
         return _DEC128_CTX.plus(result)
 
 
+def _dec_asinh(d: _decimal.Decimal) -> _decimal.Decimal:
+    """``asinh(x) = ln(x + sqrt(x^2 + 1))``, at a precision the CANCELLATION can
+    afford.
+
+    This is the one entry in the table below that cannot be computed at 34
+    digits. For a small ``x`` the sum is ``1 + x + O(x^2)``, so forming it at
+    decimal128 precision throws away one digit of ``x`` for every order of
+    magnitude it sits below 1 -- ``asinh(Decimal128("1E-10"))`` came back
+    ``9.999999999999999999983333333334583E-11`` where the true value is
+    ``…333333E-11``, eleven digits of error, and ``1E-34`` had none left at
+    all. The working precision therefore grows with the argument's exponent and
+    the result is rounded once, at the end.
+
+    Correct rounding here is a DELIBERATE divergence from mongod, which carries
+    Intel RDFP's own last-digit error (it answers ``…334E-11`` above): asked
+    for and recorded in `tasks/backlog.md`. The rest of the table keeps its
+    34-digit arithmetic, which reproduces mongod more closely.
+    """
+    guard = 60 + max(0, -d.adjusted()) if d != 0 else 60
+    with _decimal.localcontext(_decimal.Context(prec=guard, traps=[])):
+        wide = (abs(d) + (d * d + 1).sqrt()).ln()
+    return _DEC128_CTX.plus(-wide if d.is_signed() else wide)
+
+
 _DEC_TRIG: dict[str, Any] = {
     "$sinh": lambda d: (d.exp() - (-d).exp()) / 2,
     "$cosh": lambda d: (d.exp() + (-d).exp()) / 2,
     "$tanh": lambda d: (d.exp() - (-d).exp()) / (d.exp() + (-d).exp()),
-    "$asinh": lambda d: (d + (d * d + 1).sqrt()).ln(),
+    "$asinh": lambda d: _dec_asinh(d),
     "$acosh": lambda d: (d + (d * d - 1).sqrt()).ln(),
     "$atanh": lambda d: ((1 + d) / (1 - d)).ln() / 2,
     # Without these six a Decimal128 operand fell through to the double path,
