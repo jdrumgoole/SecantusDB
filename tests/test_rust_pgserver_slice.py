@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import decimal as dc
 import ipaddress
 import shutil
 import socket
@@ -779,6 +780,58 @@ def test_copy_to_stdout_round_trips(home: Path) -> None:
             cp.write(out)
         cur.execute("SELECT id, s, n FROM cp ORDER BY id")
         assert cur.fetchall() == [(1, "a", 10), (2, None, 20), (3, "has\ttab", 30)]
+
+
+def test_copy_binary_round_trips_scalar_types(home: Path) -> None:
+    """`COPY ... TO STDOUT (FORMAT BINARY)` then `FROM STDIN (FORMAT BINARY)`.
+
+    The per-field binary layout is PostgreSQL's own -- fixed-width for the
+    numeric and temporal types, length-prefixed raw bytes for `bytea`, the
+    element format for arrays. Producing it goes through the same `encode_binary`
+    codec the SELECT binary path uses, so a round-trip that survives here proves
+    both directions agree on the wire form for every scalar the tests exercise.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "CREATE TABLE cb ("
+            "a smallint, b integer, c bigint, d real, e double precision, "
+            "f boolean, g text, h numeric, i date, j time, "
+            "k timestamp, l bytea, m int4[])"
+        )
+        cur.execute(
+            "INSERT INTO cb VALUES "
+            "(1, 2, 9000000000, 1.5, 3.25, true, 'hi', 42.50, "
+            "'2026-01-15', '12:34:56.5', '2026-01-15 12:34:56.123456', "
+            "'\\x0001ff'::bytea, '{1,2,3}'::int4[])"
+        )
+        cur.execute("INSERT INTO cb VALUES (" + ", ".join(["NULL"] * 13) + ")")
+
+        with cur.copy("COPY cb TO STDOUT (FORMAT BINARY)") as cp:
+            blob = b"".join(cp)
+
+        cur.execute("DELETE FROM cb")
+        with cur.copy("COPY cb FROM STDIN (FORMAT BINARY)") as cp:
+            cp.write(blob)
+
+        cur.execute("SELECT a,b,c,d,e,f,g,h,i,j,k,l,m FROM cb ORDER BY b NULLS LAST")
+        rows = cur.fetchall()
+        assert rows[0] == (
+            1,
+            2,
+            9000000000,
+            1.5,
+            3.25,
+            True,
+            "hi",
+            dc.Decimal("42.50"),
+            dt.date(2026, 1, 15),
+            dt.time(12, 34, 56, 500000),
+            dt.datetime(2026, 1, 15, 12, 34, 56, 123456),
+            b"\x00\x01\xff",
+            [1, 2, 3],
+        )
+        assert rows[1] == (None,) * 13
 
 
 def test_date_and_time_columns(home: Path) -> None:

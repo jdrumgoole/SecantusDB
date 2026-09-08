@@ -21,10 +21,7 @@ use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{send_describe_response, ExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::results::{
-    CopyCsvOptions, CopyEncoder, CopyResponse, CopyTextOptions, DescribePortalResponse,
-    DescribeStatementResponse,
-};
+use pgwire::api::results::{CopyResponse, DescribePortalResponse, DescribeStatementResponse};
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type, DEFAULT_NAME};
@@ -3595,89 +3592,120 @@ impl PgHandler {
                 // its schema and rows, and encode those. Rebuilding the read
                 // here would be a second implementation of SELECT that could
                 // disagree with the first.
-                let (schema, rows): (Arc<Vec<FieldInfo>>, Vec<Vec<Option<Bson>>>) = match ct
-                    .query
-                    .as_deref()
-                {
-                    Some(inner) => {
-                        let fields = self.copy_query_fields(inner)?;
-                        let values = self.copy_query_rows(inner)?;
-                        (Arc::new(fields), values)
-                    }
-                    None => {
-                        let def = self.lookup(&ct.table).ok_or_else(|| {
-                            Self::err(&PlanError::UndefinedTable(ct.table.clone()))
-                        })?;
-                        let cols: Vec<&secantus_pgcatalog::Column> = if ct.columns.is_empty() {
-                            def.columns.iter().collect()
-                        } else {
-                            ct.columns
+                let (schema, rows): (Arc<Vec<FieldInfo>>, Vec<Vec<Option<Bson>>>) =
+                    match ct.query.as_deref() {
+                        Some(inner) => {
+                            let fields = self.copy_query_fields(inner)?;
+                            let values = self.copy_query_rows(inner)?;
+                            (Arc::new(fields), values)
+                        }
+                        None => {
+                            let def = self.lookup(&ct.table).ok_or_else(|| {
+                                Self::err(&PlanError::UndefinedTable(ct.table.clone()))
+                            })?;
+                            let cols: Vec<&secantus_pgcatalog::Column> = if ct.columns.is_empty() {
+                                def.columns.iter().collect()
+                            } else {
+                                ct.columns
+                                    .iter()
+                                    .map(|n| def.column(n).expect("planner checked"))
+                                    .collect()
+                            };
+                            let schema = Arc::new(
+                                cols.iter()
+                                    .map(|c| {
+                                        FieldInfo::new(
+                                            c.name.clone(),
+                                            None,
+                                            None,
+                                            self.user_wire_type(&c.pg_type)
+                                                .unwrap_or_else(|| wire_type(&c.pg_type)),
+                                            FieldFormat::Text,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>(),
+                            );
+                            let fields: Vec<String> = cols.iter().map(|c| c.field()).collect();
+                            let raw = self
+                                .storage
+                                .find_matching(&self.db, &ct.table, &Document::new())
+                                .map_err(|e| Self::storage_err("could not read", e))?;
+                            let docs: Vec<Document> = raw
                                 .iter()
-                                .map(|n| def.column(n).expect("planner checked"))
-                                .collect()
-                        };
-                        let schema = Arc::new(
-                            cols.iter()
-                                .map(|c| {
-                                    FieldInfo::new(
-                                        c.name.clone(),
-                                        None,
-                                        None,
-                                        self.user_wire_type(&c.pg_type)
-                                            .unwrap_or_else(|| wire_type(&c.pg_type)),
-                                        FieldFormat::Text,
-                                    )
+                                .map(|b| bson::from_slice(b))
+                                .collect::<Result<_, _>>()
+                                .map_err(|e| Self::storage_err("could not decode a row", e))?;
+                            let types: Vec<Type> =
+                                schema.iter().map(|fi| fi.datatype().clone()).collect();
+                            let values = docs
+                                .iter()
+                                .map(|d| {
+                                    fields
+                                        .iter()
+                                        .zip(types.iter())
+                                        .map(|(f, ty)| copy_reassemble(d, f, ty))
+                                        .collect::<Vec<_>>()
                                 })
-                                .collect::<Vec<_>>(),
-                        );
-                        let fields: Vec<String> = cols.iter().map(|c| c.field()).collect();
-                        let raw = self
-                            .storage
-                            .find_matching(&self.db, &ct.table, &Document::new())
-                            .map_err(|e| Self::storage_err("could not read", e))?;
-                        let docs: Vec<Document> = raw
-                            .iter()
-                            .map(|b| bson::from_slice(b))
-                            .collect::<Result<_, _>>()
-                            .map_err(|e| Self::storage_err("could not decode a row", e))?;
-                        let values = docs
-                            .iter()
-                            .map(|d| fields.iter().map(|f| d.get(f).cloned()).collect::<Vec<_>>())
-                            .collect();
-                        (schema, values)
-                    }
-                };
+                                .collect();
+                            (schema, values)
+                        }
+                    };
 
                 let n = schema.len();
-                // Each format escapes differently, so the encoder is chosen
-                // rather than the text one patched: text writes `\N` for NULL
-                // and escapes tabs, CSV quotes and writes NULL as an EMPTY
-                // field, binary is length-prefixed behind a fixed signature.
-                let mut encoder = match ct.format {
-                    CopyFormat::Text => {
-                        CopyEncoder::new_text(schema.clone(), CopyTextOptions::default())
-                    }
-                    CopyFormat::Csv => {
-                        CopyEncoder::new_csv(schema.clone(), CopyCsvOptions::default())
-                    }
-                    CopyFormat::Binary => CopyEncoder::new_binary(schema.clone()),
-                };
                 let format = ct.format;
+                // The binary format encodes each field through the SAME codec
+                // the SELECT binary path uses (`encode_binary`), so the two can
+                // never drift: a `DataRowEncoder` over a binary-format schema
+                // produces exactly the `[i32 len][bytes]` layout a binary COPY
+                // field wants. The header (fixed signature + flags + extension)
+                // rides the first row; the field count precedes every row; the
+                // trailer is appended by `CopyResponse::new` for format 1.
+                let bin_schema: Arc<Vec<FieldInfo>> = if format == CopyFormat::Binary {
+                    Arc::new(
+                        schema
+                            .iter()
+                            .map(|f| {
+                                FieldInfo::new(
+                                    f.name().to_string(),
+                                    None,
+                                    None,
+                                    f.datatype().clone(),
+                                    FieldFormat::Binary,
+                                )
+                            })
+                            .collect(),
+                    )
+                } else {
+                    schema.clone()
+                };
+                let mut header_written = false;
                 let data = stream::iter(rows).map(move |row| {
                     // The two TEXTUAL formats are written here rather than
-                    // through the encoder. Its null handling asks the value
+                    // through an encoder. Their null handling asks the value
                     // whether it is null, and an `Option` of the wrong type
                     // answered "not null" with no bytes -- so every NULL came
                     // out as an empty field instead of `\N`, which is exactly
                     // the distinction COPY text exists to preserve. The rules
-                    // are short and were measured; binary keeps the encoder,
-                    // where the per-type byte layout is the hard part.
+                    // are short and were measured; binary goes through the
+                    // shared codec, where the per-type byte layout is the hard
+                    // part.
                     match format {
                         CopyFormat::Binary => {
-                            for v in &row {
-                                copy_encode_field(&mut encoder, v.as_ref())?;
+                            let mut enc = DataRowEncoder::new(bin_schema.clone());
+                            for (i, v) in row.iter().enumerate() {
+                                encode_binary(&mut enc, bin_schema[i].datatype(), v.as_ref())?;
                             }
-                            Ok(encoder.take_copy())
+                            let dr = enc.take_row();
+                            let mut buf = BytesMut::with_capacity(dr.data.len() + 21);
+                            if !header_written {
+                                buf.put_slice(b"PGCOPY\n\xff\r\n\x00");
+                                buf.put_i32(0); // flags (no OIDs)
+                                buf.put_i32(0); // header extension length
+                                header_written = true;
+                            }
+                            buf.put_i16(n as i16);
+                            buf.extend_from_slice(&dr.data);
+                            Ok(CopyData::new(buf.freeze()))
                         }
                         _ => Ok(CopyData::new(copy_text_row(&row, format))),
                     }
@@ -4029,6 +4057,33 @@ fn timestamptz_text(
     Some(secantus_pgplan::render_timestamptz(ms * 1000 + rem, tz))
 }
 
+/// A stored value for a COPY row, with a timestamp/timestamptz column's hidden
+/// sub-millisecond companion (`__us_<field>`) folded back into the composite
+/// carrier the encoders understand.
+///
+/// The SELECT row path reassembles the same way (`timestamp_text` /
+/// `timestamptz_text`); COPY reads the raw document, so without this it would
+/// hand the encoder a millisecond-truncated `DateTime` and lose the last three
+/// digits of a `.ffffff` timestamp. Every other column is its value verbatim.
+fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
+    if matches!(*ty, Type::TIMESTAMP | Type::TIMESTAMPTZ) {
+        if let Some(Bson::DateTime(dt)) = d.get(field) {
+            let rem = match d.get(companion_field(field)) {
+                Some(Bson::Int32(v)) if (1..1000).contains(v) => i64::from(*v),
+                Some(Bson::Int64(v)) if (1..1000).contains(v) => *v,
+                _ => 0,
+            };
+            if rem != 0 {
+                let mut doc = Document::new();
+                doc.insert(secantus_pgplan::COMPOSITE_DATE, Bson::DateTime(*dt));
+                doc.insert(secantus_pgplan::COMPOSITE_US, Bson::Int32(rem as i32));
+                return Some(Bson::Document(doc));
+            }
+        }
+    }
+    d.get(field).cloned()
+}
+
 /// Encode one stored value as a SQL datum. Absent and explicit null are both
 /// SQL NULL.
 /// The types this server can put on the wire in PostgreSQL's BINARY format.
@@ -4311,6 +4366,27 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
     if *ty == Type::NUMERIC {
         let x = as_numeric(v).ok_or_else(|| bad("this value"))?;
         return enc.encode_field(&Some(x));
+    }
+    // date / time / timestamp binary are fixed-width integers: `date` is an i32
+    // day count, `time`/`timestamp`/`timestamptz` an i64 microsecond count.
+    // `i32`/`i64`'s `to_sql` writes those big-endian ignoring the column type,
+    // so the integer IS the field -- the conversion from the stored value is
+    // the whole job, and it lives in `secantus_pgplan` beside the inverse
+    // render functions the FROM-side decoder already uses.
+    if *ty == Type::DATE {
+        let text = as_text(v).ok_or_else(|| bad("this value"))?;
+        let days = secantus_pgplan::date_to_pg_days(&text).ok_or_else(|| bad("this value"))?;
+        return enc.encode_field(&Some(days));
+    }
+    if *ty == Type::TIME {
+        let text = as_text(v).ok_or_else(|| bad("this value"))?;
+        let micros = secantus_pgplan::time_to_pg_micros(&text).ok_or_else(|| bad("this value"))?;
+        return enc.encode_field(&Some(micros));
+    }
+    if *ty == Type::TIMESTAMP || *ty == Type::TIMESTAMPTZ {
+        let micros =
+            secantus_pgplan::timestamp_bson_to_pg_micros(v).ok_or_else(|| bad("this value"))?;
+        return enc.encode_field(&Some(micros));
     }
     // A user ENUM's binary format is its label's UTF-8 -- the same bytes as
     // text -- so it rides the text-family arm.
@@ -5393,29 +5469,6 @@ fn copy_text_row(row: &[Option<Bson>], format: secantus_pgplan::CopyFormat) -> b
     }
     out.push('\n');
     bytes::Bytes::from(out.into_bytes())
-}
-
-/// One COPY field, in whichever format the encoder was built for.
-fn copy_encode_field(encoder: &mut CopyEncoder, v: Option<&Bson>) -> PgWireResult<()> {
-    match v {
-        // FIRST: `Some(other)` below would otherwise catch `Some(Bson::Null)`
-        // and render it as text, which in binary wrote a zero-length field
-        // where PostgreSQL writes a length of -1 -- an empty string where the
-        // client expected NULL. Match arms are tried in order, and the
-        // catch-all has to come after every case it must not swallow.
-        None | Some(Bson::Null) => encoder.encode_field(&None::<&str>),
-        Some(Bson::Int32(x)) => encoder.encode_field(&Some(*x)),
-        Some(Bson::Int64(x)) => encoder.encode_field(&Some(*x)),
-        Some(Bson::Double(x)) => encoder.encode_field(&Some(*x)),
-        Some(Bson::Boolean(x)) => encoder.encode_field(&Some(*x)),
-        Some(Bson::String(x)) => encoder.encode_field(&Some(x.as_str())),
-        // Everything else goes as its PostgreSQL text, which is what the
-        // ordinary row path does too.
-        Some(other) => {
-            let text = secantus_pgplan::value_text(other);
-            encoder.encode_field(&Some(text.as_str()))
-        }
-    }
 }
 
 /// Decode one bound parameter into the value the planner will substitute.
