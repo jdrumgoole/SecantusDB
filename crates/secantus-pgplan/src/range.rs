@@ -345,6 +345,25 @@ pub fn range_element_oid(type_name: &str) -> u32 {
 // Multiranges
 // ---------------------------------------------------------------------------
 
+/// The name PostgreSQL auto-creates for the multirange companion of a range
+/// type. PostgreSQL's rule (`makeMultirangeTypeName`): replace the FIRST
+/// occurrence of the substring `range` with `multirange`; if the range name
+/// contains no `range`, append `_multirange`. So `testrange` -> `testmultirange`,
+/// `int4range` -> `int4multirange`, `rangetest` -> `multirangetest`, and
+/// `foo` -> `foo_multirange`. Measured against PostgreSQL 14.
+pub fn multirange_name_for(range: &str) -> String {
+    match range.find("range") {
+        Some(idx) => {
+            let mut s = String::with_capacity(range.len() + 5);
+            s.push_str(&range[..idx]);
+            s.push_str("multirange");
+            s.push_str(&range[idx + "range".len()..]);
+            s
+        }
+        None => format!("{range}_multirange"),
+    }
+}
+
 /// The range type a multirange is built from, and the multirange's own oid.
 pub fn multirange_member(name: &str) -> Option<&'static str> {
     Some(match name {

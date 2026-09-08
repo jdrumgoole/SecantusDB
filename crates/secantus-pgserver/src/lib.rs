@@ -264,6 +264,11 @@ impl PgHandler {
     const RANGE_COLLECTION: &'static str = "__sql_ranges__";
     const RANGE_TYPE_OID_BASE: i64 = 69_000;
     const USER_TYPE_ARRAY_OID_OFFSET: i64 = 100_000;
+    /// A custom range's auto-created multirange type gets `range_oid + this`,
+    /// and the multirange's own array type `multirange_oid + array offset`.
+    /// Range oids live in the 69_000 band, their arrays at +100_000, so
+    /// +200_000 (multirange) and +300_000 (multirange array) never collide.
+    const MULTIRANGE_TYPE_OID_OFFSET: i64 = 200_000;
 
     /// Hand the planner this database's user types, fresh from the store --
     /// which the other server may have written to since the last statement.
@@ -298,13 +303,33 @@ impl PgHandler {
         // A schema-qualified range resolves as `schema.name`, so
         // `to_regtype('testschema.testrange')` reaches it and a bare
         // `to_regtype('testrange')` reaches only the public one.
-        let ranges: Vec<(String, String, i64)> = self
-            .ranges_with_schema()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(schema, name, oid, subtype)| (Self::type_resolution(&schema, &name), subtype, oid))
+        let ranges_with_schema = self.ranges_with_schema().unwrap_or_default();
+        let ranges: Vec<(String, String, i64)> = ranges_with_schema
+            .iter()
+            .map(|(schema, name, oid, subtype)| {
+                (
+                    Self::type_resolution(schema, name),
+                    subtype.clone(),
+                    *oid,
+                )
+            })
             .collect();
         secantus_pgplan::set_user_ranges(ranges);
+        // Every custom range carries an auto-created multirange companion.
+        // Its resolution name is the range's multirange name (bare in public,
+        // else schema-qualified), so `to_regtype('testmultirange')` and the
+        // schema-qualified form both reach it -- exactly like the range.
+        let multiranges: Vec<(String, i64)> = ranges_with_schema
+            .iter()
+            .map(|(schema, name, oid, _)| {
+                let mr_name = secantus_pgplan::range::multirange_name_for(name);
+                (
+                    Self::type_resolution(schema, &mr_name),
+                    oid + Self::MULTIRANGE_TYPE_OID_OFFSET,
+                )
+            })
+            .collect();
+        secantus_pgplan::set_user_multiranges(multiranges);
     }
 
     /// The name a user type resolves under: its bare name in `public` (on the
@@ -1172,6 +1197,11 @@ impl PgHandler {
                 vec![
                     secantus_pgcatalog::Column::new("rngtypid", "oid", false),
                     secantus_pgcatalog::Column::new("rngsubtype", "oid", false),
+                    // The oid of the range's auto-created multirange companion.
+                    // psycopg's `MultirangeInfo.fetch` joins pg_type to pg_range
+                    // ON `t.oid = r.rngmultitypid`, so this must be present and
+                    // point at the multirange's `pg_type` row.
+                    secantus_pgcatalog::Column::new("rngmultitypid", "oid", false),
                 ],
             )),
             "pg_enum" => Some(TableDef::new(
@@ -1247,9 +1277,14 @@ impl PgHandler {
                     rows.push(d);
                 }
                 // Custom range types: their own oid, typarray derived, typrelid 0.
+                // Each also has an auto-created MULTIRANGE companion row: its
+                // typname is the multirange name (bare, like the range's), its
+                // oid is range_oid + offset, its typarray derived from that.
+                // psycopg's MultirangeInfo.fetch reads this row after resolving
+                // `to_regtype('<mrname>')` and joining pg_range.rngmultitypid.
                 for (name, oid, _) in self.ranges().ok()? {
                     let mut d = Document::new();
-                    d.insert(def.field_of("typname").expect("column"), name);
+                    d.insert(def.field_of("typname").expect("column"), name.clone());
                     d.insert(def.field_of("oid").expect("column"), Bson::Int64(oid));
                     d.insert(
                         def.field_of("typarray").expect("column"),
@@ -1258,6 +1293,21 @@ impl PgHandler {
                     d.insert(def.field_of("typdelim").expect("column"), ",");
                     d.insert(def.field_of("typrelid").expect("column"), Bson::Int64(0));
                     rows.push(d);
+
+                    let mr_oid = oid + Self::MULTIRANGE_TYPE_OID_OFFSET;
+                    let mut mr = Document::new();
+                    mr.insert(
+                        def.field_of("typname").expect("column"),
+                        secantus_pgplan::range::multirange_name_for(&name),
+                    );
+                    mr.insert(def.field_of("oid").expect("column"), Bson::Int64(mr_oid));
+                    mr.insert(
+                        def.field_of("typarray").expect("column"),
+                        Bson::Int64(mr_oid + Self::USER_TYPE_ARRAY_OID_OFFSET),
+                    );
+                    mr.insert(def.field_of("typdelim").expect("column"), ",");
+                    mr.insert(def.field_of("typrelid").expect("column"), Bson::Int64(0));
+                    rows.push(mr);
                 }
                 rows
             }
@@ -1284,6 +1334,12 @@ impl PgHandler {
                     let Some(rngsubtype) = secantus_pgplan::pgtypes::oid_of_name(element) else {
                         continue;
                     };
+                    // The builtin multirange companion (int4range ->
+                    // int4multirange, etc.), so a client can join here for it.
+                    let rngmultitypid = secantus_pgplan::pgtypes::oid_of_name(
+                        &secantus_pgplan::range::multirange_name_for(name),
+                    )
+                    .unwrap_or(0);
                     let mut d = Document::new();
                     d.insert(
                         def.field_of("rngtypid").expect("column"),
@@ -1293,9 +1349,13 @@ impl PgHandler {
                         def.field_of("rngsubtype").expect("column"),
                         Bson::Int64(rngsubtype),
                     );
+                    d.insert(
+                        def.field_of("rngmultitypid").expect("column"),
+                        Bson::Int64(rngmultitypid),
+                    );
                     rows.push(d);
                 }
-                // Custom range types: (range oid, subtype oid).
+                // Custom range types: (range oid, subtype oid, multirange oid).
                 for (_, oid, subtype) in self.ranges().ok()? {
                     let Some(rngsubtype) = secantus_pgplan::pgtypes::oid_of_name(&subtype) else {
                         continue;
@@ -1305,6 +1365,10 @@ impl PgHandler {
                     d.insert(
                         def.field_of("rngsubtype").expect("column"),
                         Bson::Int64(rngsubtype),
+                    );
+                    d.insert(
+                        def.field_of("rngmultitypid").expect("column"),
+                        Bson::Int64(oid + Self::MULTIRANGE_TYPE_OID_OFFSET),
                     );
                     rows.push(d);
                 }

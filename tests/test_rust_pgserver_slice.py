@@ -3115,6 +3115,87 @@ def test_schema_qualified_range_is_distinct(home: Path) -> None:
         assert still == pub.oid
 
 
+def test_custom_multirange_fetch_info(home: Path) -> None:
+    """`MultirangeInfo.fetch` resolves a custom range's auto-created multirange.
+
+    `CREATE TYPE testrange AS RANGE (...)` gives PostgreSQL a companion
+    multirange type named by substituting `multirange` for the first `range`
+    in the name (`testrange` -> `testmultirange`). psycopg's `MultirangeInfo.fetch`
+    resolves that name with `to_regtype`, then joins `pg_type` to `pg_range` on
+    `t.oid = r.rngmultitypid` -- so all three must exist: a resolvable multirange
+    oid, a `pg_type` row under it (with its own array oid), and a `pg_range` row
+    whose `rngmultitypid` points back at it, carrying the range's subtype. The
+    schema-qualified range's multirange resolves distinctly, exactly like the
+    range itself; `typname` stays the bare `testmultirange`, as in PostgreSQL.
+    """
+    from psycopg import sql
+    from psycopg.types.multirange import MultirangeInfo
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "create schema if not exists testschema;"
+            ' create type testrange as range (subtype = text, collation = "C");'
+            " create type testschema.testrange as range (subtype = float8);"
+        )
+        text_oid = conn.adapters.types["text"].oid
+        float8_oid = conn.adapters.types["float8"].oid
+
+        # The four forms psycopg's own test_fetch_info exercises: bare name,
+        # schema.name, and each as a sql.Identifier.
+        for name, subtype_oid in [
+            ("testmultirange", text_oid),
+            ("testschema.testmultirange", float8_oid),
+            (sql.Identifier("testmultirange"), text_oid),
+            (sql.Identifier("testschema", "testmultirange"), float8_oid),
+        ]:
+            info = MultirangeInfo.fetch(conn, name)
+            assert info is not None, name
+            assert info.name == "testmultirange"  # typname is bare
+            assert info.oid > 0
+            assert info.oid != info.array_oid > 0
+            assert info.subtype_oid == subtype_oid
+
+        # An unknown name resolves to None, not an error.
+        assert MultirangeInfo.fetch(conn, "nosuchmultirange") is None
+
+
+def test_schema_qualified_multirange_is_distinct(home: Path) -> None:
+    """A public range's multirange and a `schema.` range's multirange differ.
+
+    Both custom ranges yield a multirange whose bare `typname` is
+    `testmultirange`, but they are distinct types with distinct oids and
+    subtypes -- `to_regtype('testmultirange')` reaches only the public one and
+    `to_regtype('testschema.testmultirange')` only the schema one, mirroring the
+    range distinctness #1391 established.
+    """
+    from psycopg.types.multirange import MultirangeInfo
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "create schema if not exists testschema;"
+            " create type testrange as range (subtype = text);"
+            " create type testschema.testrange as range (subtype = float8);"
+        )
+        pub = MultirangeInfo.fetch(conn, "testmultirange")
+        sch = MultirangeInfo.fetch(conn, "testschema.testmultirange")
+        assert pub.name == "testmultirange" and sch.name == "testmultirange"
+        assert pub.oid != sch.oid
+        assert pub.subtype_oid == conn.adapters.types["text"].oid
+        assert sch.subtype_oid == conn.adapters.types["float8"].oid
+
+        # to_regtype resolution keeps the two apart; a bare name never reaches
+        # the schema-qualified multirange.
+        cur.execute(
+            "select to_regtype('testmultirange')::oid, to_regtype('testschema.testmultirange')::oid"
+        )
+        pub_oid, sch_oid = cur.fetchone()
+        assert pub_oid == pub.oid
+        assert sch_oid == sch.oid
+        assert pub_oid != sch_oid
+
+
 def test_a_plain_select_over_a_join(home: Path) -> None:
     """A top-level two-table JOIN outside any aggregate.
 
