@@ -2275,13 +2275,23 @@ all still open. Probe: `scratchpad/readsweep.py` + `readsweep_lib.py`.
   check `git diff origin/main -- tasks/backlog.md` for removed lines you did not
   intend. The same mistake then recurred once while repairing it.
 
-- [ ] **`sort: {"x.0": 1}` ranks an array element against documents wrongly
-  (1 shape).** mongod puts `x: [[5]]` (whose `x.0` is the ARRAY `[5]`) after
-  `x: [{y: 5}, …]` (whose `x.0` is a DOCUMENT), matching BSON's Object &lt; Array
-  rank; ours puts it before. Part of the positional-component family below.
+- [ ] **OPEN, and this entry was WRONG until 2026-09-08 — `sort: {"x.0": 1}`
+  over an AMBIGUOUS positional path.** The claim above was that mongod ranks
+  `x: [[5]]` after `x: [{y: 5}]` and "ours puts it before". **Not reproducible**:
+  five isolated subsets, including that exact pair, agree on mongod, the Rust
+  server and the Python one.
 
-- [ ] **A dotted POSITIONAL component is AMBIGUOUS, and we implement only half
-  of it (2026-09-06, rules fully measured).** `{"x.0": 5}` and
+  What actually happens: `{x: [{"0": 5}]}` is the one document where BOTH
+  readings of `x.0` resolve -- the index gives `{"0": 5}`, the field name gives
+  `5` -- and sorting by `x.0` over a collection containing it is
+  **`16746 Ambiguous field name`** on mongod. Both servers sort it happily. One
+  shape; measured 8.2.11, 2026-09-08.
+
+- [x] **RESOLVED 2026-09-08 (see the positional-path entry above) — a dotted
+  POSITIONAL component is AMBIGUOUS, and we implemented only half of it
+  (2026-09-06, rules fully measured).** The MATCH half is fixed on both servers
+  and pinned by `tests/test_positional_path_matching.py`; the SORT half is the
+  `16746` entry above. `{"x.0": 5}` and
   `sort({"x.0": 1})`. mongod tries a numeric component BOTH ways — as an array
   index and as a literal field name — and the two readings differ in whether
   equality then descends:
@@ -2492,11 +2502,6 @@ all still open. Probe: `scratchpad/readsweep.py` + `readsweep_lib.py`.
   the read-path sweep now differs only on `[[5]]` versus `[1, [2, [3]]]` — an
   array-versus-array comparison, which belongs to the array-descent family
   above.
-
-- [ ] **`$expr` with `$gt` over a mixed-type collection defers.** `{$expr:
-  {$gt: ["$x", 1]}}` answers `2 BadValue: query uses a construct the Rust server
-  does not support` where mongod returns 20 documents. The server refuses rather
-  than answering wrongly, so it is a feature gap; the Python server is correct.
 
 
 ### 2026-09-03 SQL sweep twelve: LIMIT and row NULLs — what is still open
@@ -6320,8 +6325,8 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   the Rust server -- the `$expr` comparison family above, and the positional
   path bug above. Worth re-running after any change to `query.rs`.
 
-- [ ] **OPEN — new probe: UPDATE operators compared on the resulting DOCUMENT
-  (2026-09-08).** `tools/probes/update_operators.py` compares update ERRORS;
+- [x] **RESOLVED 2026-09-08 — UPDATE operators compared on the resulting
+  DOCUMENT.** `tools/probes/update_operators.py` compares update ERRORS;
   nothing compared the document a successful update produces, which is where a
   silently wrong WRITE hides. A sweep of 31 updates x 17 seed value classes
   (527 cells) against mongod 8.2.11 found **30 divergent**, in four families.
@@ -6347,8 +6352,75 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
     over `{v: null}` no-ops on the Python server where mongod and the Rust
     server both raise `14 Path 'v' contains an element of non-array type`.
 
-  Every message and code above is measured; the harness is `/tmp`-local and
-  should be promoted into `tools/probes/` when this is worked.
+  All 527 cells now agree across mongod, the Rust server and the Python engine.
+
+  **Most of it was ONE shape: missing conflated with null.**
+  `get_path(doc, path, default=None)` returns `None` for an absent field AND for
+  a present null, so `$push` / `$addToSet` / `$bit` all read a null as an
+  absence and wrote over it. The Rust side spelled it out --
+  `None | Some(Bson::Null) => Vec::new()` -- so it was deliberate and wrong
+  rather than accidental. `$bit`'s Python path had its own variant,
+  `get_path(..., default=0) or 0`, which folded a null, a `-0.0` and an empty
+  array all into the integer 0.
+
+  `$pull`'s scalar criterion was routed through the QUERY engine, which adds
+  implicit array traversal -- the same membership-after-nesting family as the
+  positional path entry above. An operator or regex criterion genuinely does
+  traverse, so only the scalar branch changed.
+
+  Pinned by `tests/test_update_write_fidelity_types.py` (33 cases).
+
+  `findAndModify` over the same corpus is 0 of 160 -- the fixes reach it
+  through the shared update path, and it introduces nothing of its own.
+
+- [ ] **OPEN — `$rename` into an ARRAY ELEMENT is refused by mongod and
+  accepted by both servers (measured 2026-09-08).** Four shapes, all code 2 or
+  28 on 8.2.11 and all succeeding here:
+
+  | update over `{v: [{a: 1}, {a: 2}]}` | mongod |
+  | --- | --- |
+  | `{$rename: {"v.0.a": "v.0.b"}}` | `2 The source field cannot be an array element, 'v.0.a' ...` |
+  | `{$rename: {"v.$[].a": "v.$[].b"}}` | `2 The source field for $rename may not be dynamic: v.$[].a` |
+  | `{$rename: {"v.a": "v.b"}}` | `28 cannot use the part (v of v.a) to traverse the element (...)` |
+  | `{$rename: {"v.0.0.a": "v.0.0.b"}}` (nested) | `2 The source field cannot be an array element ...` |
+
+  **`tests/test_crud.py::test_rename_with_positional_via_pymongo` asserts the
+  `$[]` case SUCCEEDS** and produces `[{b: 1}, {b: 2}]` -- pinning behaviour
+  mongod refuses outright. It was written from what this server did, not from a
+  probe. Fix the servers and the test together; until then the static-path
+  traverse check added on 2026-09-08 deliberately skips any path containing
+  `$`, so it does not half-implement this.
+
+  The codebase already has `_rename_traverses_array` and two "cannot be an array
+  element" messages, so part of the machinery exists -- check what it covers
+  before writing more.
+
+- [ ] **OPEN — new probe: UPSERT SEEDING, 24 of 120 divergent (2026-09-08).**
+  When an upsert inserts, mongod seeds the new document from the QUERY. Both
+  servers seed only bare equality, so five query forms lose their fields
+  entirely -- a silently wrong WRITE, since the inserted document is missing a
+  field mongod would have included:
+
+  | query | mongod seeds | both servers |
+  | --- | --- | --- |
+  | `{a: {$eq: 1}}` | `a: 1` | nothing |
+  | `{a: {$in: [1]}}` (ONE element) | `a: 1` | nothing |
+  | `{a: {$all: [1]}}` (ONE element) | `a: 1` | nothing |
+  | `{$and: [{a: 1}, {b: 2}]}` | `a: 1, b: 2` | nothing |
+  | `{$or: [{a: 1}]}` (ONE branch) | `a: 1` | nothing |
+
+  A multi-element `$in` and a range operator seed nothing on mongod either, so
+  the rule is "clauses that IMPLY a single equality" -- the same
+  implication question `_query_implies_partial` answers for partial indexes,
+  and worth checking whether that helper can be reused.
+
+  **Also measured, and NOT understood: the seeded field ORDER.** For a query
+  `{a: 1, b: 2}` mongod emits `b, a`; for `{a: 1, b: 2, c: 3}` it emits
+  `b, a, c`. Stable across five runs and identical for every update operator
+  tried, so it is not noise -- but it is neither the query's order nor sorted,
+  and no rule is apparent from three data points. CLAUDE.md's own note records
+  that this ordering CHANGED between 6.0.16 (sorted) and newer servers, so
+  measure a wider set of key names before pinning anything.
 
 - [ ] **The other decimal transcendentals still refuse (2026-09-08).** The six
   trig and the remaining hyperbolics (`$sin`, `$cos`, `$tan`, `$asin`, `$acos`,

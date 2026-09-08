@@ -601,6 +601,39 @@ fn push_sort(arr: &mut [Bson], spec: &Bson) -> R<()> {
 /// sub-document match against the element (a scalar element never matches); a
 /// scalar criterion is BSON-aware equality. Mirrors `_pull_matches`. A construct
 /// the query engine can't evaluate exactly (regex / collation edge) defers.
+/// mongod's `28` for a dotted path whose intermediate is not a document.
+///
+/// `{$rename: {"v.k": "v.j"}}` over any non-document `v` -- a scalar, an array,
+/// a string, or a NULL -- is
+/// `cannot use the part (v of v.k) to traverse the element ({v: 1})`. Both
+/// servers silently no-opped, so an invalid update reported success. Measured
+/// 8.2.11, 2026-09-08.
+fn traverse_problem(doc: &Document, path: &str) -> Option<Fallback> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut in_doc = doc;
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        // An ABSENT component is a no-op, not an error.
+        let current = in_doc.get(*part)?;
+        match current {
+            Bson::Document(d) => in_doc = d,
+            other => {
+                return Some(
+                    Fallback::mongo(
+                        28,
+                        format!(
+                            "cannot use the part ({part} of {path}) to traverse the \
+                             element ({{{part}: {}}})",
+                            crate::query::bson_value_repr(other)
+                        ),
+                    )
+                    .exec(),
+                );
+            }
+        }
+    }
+    None
+}
+
 fn pull_matches(element: &Bson, criterion: &Bson) -> R<bool> {
     match criterion {
         Bson::Document(c) if !c.is_empty() && c.keys().all(|k| k.starts_with('$')) => {
@@ -612,11 +645,18 @@ fn pull_matches(element: &Bson, criterion: &Bson) -> R<bool> {
             Bson::Document(ed) => crate::query::matches(ed, c, &Document::new(), None),
             _ => Ok(false),
         },
-        _ => {
+        // A REGEX criterion traverses, like the operator form above.
+        Bson::RegularExpression(_) => {
             let d = doc! { "__e": element.clone() };
             let q = doc! { "__e": criterion.clone() };
             crate::query::matches(&d, &q, &Document::new(), None)
         }
+        // Every other scalar is EXACT equality against the element -- no
+        // implicit array traversal, so `{$pull: {v: 1}}` leaves `{v: [[1, 2]]}`
+        // untouched even though `1` is inside the element. Routing this through
+        // the query engine gave it membership and silently emptied arrays of
+        // arrays (measured 8.2.11, 2026-09-08).
+        _ => crate::query::eq_scalar(element, criterion, None),
     }
 }
 
@@ -677,7 +717,12 @@ fn apply_op(
             for (path, value) in payload {
                 for cpath in expand_path(result, path, filters, pos)? {
                     let mut a = match get_path(result, &cpath).cloned() {
-                        None | Some(Bson::Null) => Vec::new(),
+                        // MISSING and NULL are different: mongod creates the array
+                        // for an absent field and REFUSES a present null. Folding
+                        // them together silently replaced the null with a
+                        // one-element array -- a wrong WRITE, not a missing error
+                        // (measured 8.2.11, 2026-09-08).
+                        None => Vec::new(),
                         Some(Bson::Array(a)) => a,
                         Some(other) => {
                             return Err(Fallback::mongo(
@@ -813,6 +858,15 @@ fn apply_op(
                 if rename_traverses_array(result, old) || rename_traverses_array(result, new) {
                     return Err(Fallback::Defer); // array element -> Python raises 2
                 }
+                // A source path that cannot be TRAVERSED is an error, not a
+                // silent skip -- `has_path` cannot tell "absent" from "blocked
+                // by a non-document".
+                // Only for a STATIC path -- see the note on the Python side.
+                if !old.contains('$') {
+                    if let Some(problem) = traverse_problem(result, old) {
+                        return Err(problem);
+                    }
+                }
                 if has_path(result, old) {
                     let value = get_path(result, old).unwrap().clone();
                     unset_path(result, old);
@@ -881,7 +935,9 @@ fn apply_op(
                 }
                 for cpath in expand_path(result, path, filters, pos)? {
                     let mut cur = match get_path(result, &cpath) {
-                        None | Some(Bson::Null) => 0i64,
+                        // An ABSENT field starts at 0; a present NULL is
+                        // non-integral and mongod refuses it.
+                        None => 0i64,
                         Some(Bson::Int32(n)) => *n as i64,
                         Some(Bson::Int64(n)) => *n,
                         Some(other) => {
@@ -985,7 +1041,8 @@ fn apply_op(
                 };
                 for cpath in expand_path(result, path, filters, pos)? {
                     let mut a = match get_path(result, &cpath).cloned() {
-                        None | Some(Bson::Null) => Vec::new(),
+                        // As `$push` above: a present null is a non-array.
+                        None => Vec::new(),
                         Some(Bson::Array(a)) => a,
                         Some(other) => {
                             return Err(Fallback::mongo(
