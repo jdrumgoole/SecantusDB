@@ -1332,7 +1332,10 @@ fn ord_op(arg: &Bson, ctx: &Ctx, pred: fn(Ordering) -> bool) -> R {
     // answered false: `{$gt: ["abc", 1]}` is true on mongod, a string sorting
     // after a number, and `{$lt: [null, 1]}` likewise. Justifying behaviour by
     // the other engine rather than by the reference server, again.
-    if !crate::order::is_sortable(&a) || !crate::order::is_sortable(&b) {
+    // `is_comparable`, NOT `is_sortable`: the narrow predicate guards the sort
+    // engines, and gating a single comparison on it made every Binary /
+    // Timestamp / Regex / Code / MinKey / MaxKey / NaN operand a BadValue.
+    if !crate::order::is_comparable(&a) || !crate::order::is_comparable(&b) {
         return Err(Fallback::Defer);
     }
     Ok(Bson::Boolean(pred(crate::order::cmp(&a, &b))))
@@ -3510,7 +3513,7 @@ fn op_cmp(arg: &Bson, ctx: &Ctx) -> R {
         }
     }
     let vals = eval_args(arg, ctx)?;
-    if vals.len() != 2 || !vals.iter().all(crate::order::is_sortable) {
+    if vals.len() != 2 || !vals.iter().all(crate::order::is_comparable) {
         return Err(Fallback::Defer);
     }
     Ok(Bson::Int32(match crate::order::cmp(&vals[0], &vals[1]) {

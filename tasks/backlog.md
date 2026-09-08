@@ -6215,6 +6215,56 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
   Pinned by `tests/test_accumulator_spec_errors.py` (45 cases).
 
+- [x] **RESOLVED 2026-09-08 — the comparison operators refused seven BSON types
+  on the Rust server.** `$cmp` / `$gt` / `$gte` / `$lt` / `$lte` / `$eq` / `$ne`
+  and `$expr` were gated on `order::is_sortable`, which guards the SORT engines
+  and deliberately excludes NaN, Binary, Timestamp, Regex, JavaScript and
+  Min/MaxKey. A single comparison needs no transitivity, so the gate was simply
+  the wrong predicate: **one `BinData` document made an entire `$expr` query
+  answer `2 ... not supported`.** 120 of 399 cells diverged; now 0, via a new
+  `order::is_comparable`.
+
+  Two things found underneath it:
+  - **`order::cmp` ranked NaN EQUAL to every other number.** mongod puts it
+    below them and the storage sort already did, so the comparison operators
+    disagreed with this project's own sort. A unit test pinned the `Equal`
+    behaviour, asserting Python's `<`-is-false-both-ways rather than a
+    measurement.
+  - `cmp` had no same-type arm for JavaScript code, which fell through to the
+    numeric branch and compared equal.
+
+  Pinned by `tests/test_comparison_operand_types.py` (46 cases, registered in
+  `test.yml`).
+
+- [ ] **OPEN — a numeric path component after an array is wrong in BOTH
+  directions, on BOTH servers (measured 2026-09-08).** mongod reads `v.0` over
+  an array-valued `v` as EITHER the element at index 0 OR the field named `"0"`
+  in each element, and having consumed the index positionally it does NOT then
+  re-apply implicit array traversal. Both servers do the opposite on each count:
+
+  | filter | document | mongod | both servers |
+  | --- | --- | --- | --- |
+  | `{v.0: 1}` | `{v: [[1, 2]]}` | no match | **matches** |
+  | `{v.0: 2}` | `{v: [[1, 2]]}` | no match | **matches** |
+  | `{v.0.0: 1}` | `{v: [[[1]]]}` | no match | **matches** |
+  | `{v.0: 9}` | `{v: [{"0": 9}]}` | **matches** | no match |
+
+  So a query can both return documents mongod would not AND miss ones it would
+  — silently, with no error. Found by the query result-set sweep described in
+  the entry below; it is the only cell that sweep still reports.
+
+  The fix is in the path walker (`secantus/query.py` and
+  `crates/secantus-core/src/query.rs`), which is shared by every operator, so it
+  wants its own slice and a full re-run of the 266-case sweep.
+
+- [x] **RESOLVED 2026-09-08 — new probe: query RESULT SETS.** Every existing
+  probe covered expressions, stages, errors or INDEXED lookups; none compared
+  which documents an unindexed filter matches. A sweep of 266 filters (query
+  operators x 25 argument value classes, plus `$type` / dotted paths / logical
+  operators) over a 36-document corpus of value classes found 2 divergences on
+  the Rust server -- the `$expr` comparison family above, and the positional
+  path bug above. Worth re-running after any change to `query.rs`.
+
 - [ ] **The other decimal transcendentals still refuse (2026-09-08).** The six
   trig and the remaining hyperbolics (`$sin`, `$cos`, `$tan`, `$asin`, `$acos`,
   `$atan`, `$sinh`, `$cosh`, `$tanh`, `$acosh`, `$atanh`) still decline a finite
