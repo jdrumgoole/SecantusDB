@@ -2731,9 +2731,7 @@ fn plan_values_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
             width = items.len();
             types = vec![String::new(); width];
         } else if items.len() != width {
-            return Err(Error::Unsupported(
-                "VALUES rows of differing widths".into(),
-            ));
+            return Err(Error::Unsupported("VALUES rows of differing widths".into()));
         }
         let mut row = Vec::with_capacity(items.len());
         for (i, item) in items.iter().enumerate() {
@@ -2755,7 +2753,11 @@ fn plan_values_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         }
     }
     let names = (1..=width).map(|i| format!("column{i}")).collect();
-    Ok(Statement::ValuesConstant(ValuesConstant { names, types, rows }))
+    Ok(Statement::ValuesConstant(ValuesConstant {
+        names,
+        types,
+        rows,
+    }))
 }
 
 fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> Result<Statement> {
