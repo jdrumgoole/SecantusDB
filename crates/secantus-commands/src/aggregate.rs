@@ -107,6 +107,12 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Err(e) = validate_stage_names(&pipeline) {
         return Ok(e.into_reply());
     }
+    // A missing REQUIRED argument is a parse error too, and mongod names the
+    // stage the same way. Must precede the check below, which only knows about
+    // unknown operator names.
+    if let Err(e) = validate_stage_expr_args(&pipeline) {
+        return Ok(e.into_reply());
+    }
     // A genuinely unknown expression operator inside a `$project` spec is
     // mongod's stage-specific Location31325, not the generic BadValue the
     // engine fallback produces. Parse-time, like the stage-name check.
@@ -500,6 +506,37 @@ fn recognized_stage(name: &str) -> bool {
 /// is skipped, so it is never mislabeled. `first_unknown_expr_operator`
 /// recurses through nested documents/arrays and flags only a truly-unknown
 /// `$`-operator — a recognised-but-deferred operator still defers to Python.
+/// Reject an operator argument document that omits a required field, at PARSE
+/// time and with mongod's stage wrapper.
+///
+/// mongod validates a stage's expressions before reading any document, and
+/// wraps what it finds as `Invalid $addFields :: caused by :: <message>` --
+/// also for `$project` and `$set`. The SAME error inside `$group`, `$match`'s
+/// `$expr` or `$redact` is reported BARE (measured 8.2.11, 2026-09-07), which
+/// is why only these three stages are walked here; the evaluator carries the
+/// same check for every other context and produces the bare form.
+fn validate_stage_expr_args(pipeline: &[Bson]) -> Result<(), CommandError> {
+    const WRAPPED_STAGES: [&str; 3] = ["$addFields", "$project", "$set"];
+    for stage in pipeline {
+        let Some(d) = stage.as_document() else {
+            continue;
+        };
+        for name in WRAPPED_STAGES {
+            let Some(spec) = d.get(name) else { continue };
+            if let Err(f) = secantus_core::expressions::validate_expression_args(spec) {
+                if let Some((code, message)) = f.as_mongo() {
+                    return Err(CommandError::new(
+                        code,
+                        crate::util::error_code_name(code),
+                        format!("Invalid {name} :: caused by :: {message}"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_project_exprs(pipeline: &[Bson]) -> Result<(), CommandError> {
     const PROJECTION_ONLY_OPS: [&str; 3] = ["$slice", "$elemMatch", "$meta"];
     for stage in pipeline {
@@ -926,8 +963,15 @@ fn core_run(
         // reply below, which told the client the server could not do `$round`
         // when in fact `$round` is fine and 1.5 is not a precision.
         if let Some((code, errmsg)) = fault.as_mongo() {
-            let folded = fault.folded();
-            let errmsg = wrap_pipeline_error(errmsg.to_string(), folded, ns);
+            // A PARSE error is sent bare here. The projection-style stages get
+            // `Invalid $<stage> :: caused by ::` from `validate_stage_expr_args`
+            // before execution, so anything reaching this point is inside
+            // `$group` / `$expr` / `$redact`, where mongod adds no wrapper.
+            let errmsg = if fault.is_bare() {
+                errmsg.to_string()
+            } else {
+                wrap_pipeline_error(errmsg.to_string(), fault.folded(), ns)
+            };
             return CommandError::new(code, crate::util::error_code_name(code), errmsg);
         }
         if let Some(docs) = saved {

@@ -21,7 +21,7 @@
 //! A range window with a fixed-duration time `unit` (`week`/`day`/`hour`/
 //! `minute`/`second`/`millisecond`) offsets against a date sortBy's epoch millis.
 //!
-//! Defers (`Err(())` → Python) on: range windows or `$derivative` / `$integral`
+//! Defers (`Err(Fallback::Defer)` → Python) on: range windows or `$derivative` / `$integral`
 //! with a variable-length `unit` (`month`/`quarter`/`year`), a non-ascending /
 //! multi-field / non-numeric sortBy, a `unit` without a date sortBy, any
 //! unsupported accumulator, a non-document/empty `output`, an unsortable
@@ -34,9 +34,14 @@ use std::collections::HashMap;
 
 use bson::{Bson, Document};
 
+use crate::fallback::Fallback;
 use crate::{expressions, group, order, paths};
 
-type R<T> = Result<T, ()>;
+/// Carries `Fallback` rather than `()` so an error the expression engine NAMED
+/// survives to the client instead of being flattened into the generic
+/// "not supported by the Rust server". `Fallback::Defer` is the same
+/// "cannot reproduce this" signal the unit `()` used to be.
+type R<T> = Result<T, Fallback>;
 
 const RANK_FUNCS: [&str; 3] = ["$rank", "$denseRank", "$documentNumber"];
 /// Ops whose output is a per-slot vector precomputed once over the sorted
@@ -59,27 +64,27 @@ pub fn set_window_fields_stage(
     docs: Vec<Document>,
     vars: &Document,
 ) -> R<Vec<Document>> {
-    let spec = spec.as_document().ok_or(())?;
+    let spec = spec.as_document().ok_or(Fallback::Defer)?;
     let partition_by = spec.get("partitionBy");
     let sort_by = match spec.get("sortBy") {
         None => None,
         Some(Bson::Document(d)) => Some(d),
-        Some(_) => return Err(()),
+        Some(_) => return Err(Fallback::Defer),
     };
     let output = spec
         .get("output")
         .and_then(Bson::as_document)
         .filter(|o| !o.is_empty())
-        .ok_or(())?;
+        .ok_or(Fallback::Defer)?;
 
     // Compile the output fields: each is `{<$accumulator>: arg, window?: {...}}`.
     let mut compiled: Vec<OutField> = Vec::new();
     for (field, field_spec) in output {
-        let fs = field_spec.as_document().ok_or(())?;
+        let fs = field_spec.as_document().ok_or(Fallback::Defer)?;
         let window = match fs.get("window") {
             None => None,
             Some(Bson::Document(w)) => Some(w),
-            Some(_) => return Err(()),
+            Some(_) => return Err(Fallback::Defer),
         };
         // The accumulator is the single `$`-prefixed key (the optional `window`
         // key is the only other key mongod allows here).
@@ -89,11 +94,11 @@ pub fn set_window_fields_stage(
                 continue;
             }
             if acc.is_some() {
-                return Err(()); // more than one accumulator
+                return Err(Fallback::Defer); // more than one accumulator
             }
             acc = Some((k, v));
         }
-        let (op, arg) = acc.ok_or(())?;
+        let (op, arg) = acc.ok_or(Fallback::Defer)?;
         let op = op.as_str();
         if RANK_FUNCS.contains(&op) {
             // Rank functions take no argument and no window; `$rank`/`$denseRank`
@@ -101,26 +106,26 @@ pub fn set_window_fields_stage(
             let arg_empty =
                 matches!(arg, Bson::Null) || matches!(arg, Bson::Document(d) if d.is_empty());
             if !arg_empty || window.is_some() {
-                return Err(());
+                return Err(Fallback::Defer);
             }
             if (op == "$rank" || op == "$denseRank") && sort_by.is_none() {
-                return Err(());
+                return Err(Fallback::Defer);
             }
         } else if op == "$shift" {
             // Position-based (like the rank funcs): requires a sortBy, no window,
             // and an `{output, by: <int>, default?}` spec.
-            let spec = arg.as_document().ok_or(())?;
+            let spec = arg.as_document().ok_or(Fallback::Defer)?;
             if window.is_some() || sort_by.is_none() || !spec.contains_key("output") {
-                return Err(());
+                return Err(Fallback::Defer);
             }
             if !matches!(spec.get("by"), Some(Bson::Int32(_)) | Some(Bson::Int64(_))) {
-                return Err(());
+                return Err(Fallback::Defer);
             }
         } else if op == "$expMovingAvg" {
             // Prefix accumulation: requires a sortBy, no window, `{input, N|alpha}`.
-            let spec = arg.as_document().ok_or(())?;
+            let spec = arg.as_document().ok_or(Fallback::Defer)?;
             if window.is_some() || sort_by.is_none() || !spec.contains_key("input") {
-                return Err(());
+                return Err(Fallback::Defer);
             }
             ema_alpha(spec)?; // validates exactly-one-of N/alpha and their ranges
         } else if op == "$locf" || op == "$linearFill" {
@@ -128,20 +133,20 @@ pub fn set_window_fields_stage(
             // No window; requires a sortBy ($linearFill also a numeric x-axis,
             // checked when the vector is built).
             if window.is_some() || sort_by.is_none() {
-                return Err(());
+                return Err(Fallback::Defer);
             }
         } else if op == "$derivative" || op == "$integral" {
             // Window operators over the sortBy value (x) and input (y). Requires a
             // sortBy; a time `unit` scales the x-axis against a date sortBy
             // (validated in `ts_window_value` where the partition values are known).
-            let spec = arg.as_document().ok_or(())?;
+            let spec = arg.as_document().ok_or(Fallback::Defer)?;
             if sort_by.is_none() || !spec.contains_key("input") {
-                return Err(());
+                return Err(Fallback::Defer);
             }
         } else if op == "$mergeObjects" {
             // $mergeObjects is a $group-only accumulator; mongod rejects it as a
             // window function (FailedToParse) — defer so Python raises the code.
-            return Err(());
+            return Err(Fallback::Defer);
         } else {
             group::new_acc(op)?; // reject unsupported accumulator (incl. time-series) → defer
         }
@@ -167,12 +172,12 @@ pub fn set_window_fields_stage(
     let mut key_index: HashMap<Vec<u8>, usize> = HashMap::new();
     for (i, doc) in docs.iter().enumerate() {
         let key_val = match partition_by {
-            Some(by) => expressions::evaluate(doc, by, vars).map_err(|_| ())?,
+            Some(by) => expressions::evaluate(doc, by, vars)?,
             None => Bson::Null,
         };
         let mut wrap = Document::new();
         wrap.insert("k", key_val);
-        let key = bson::to_vec(&wrap).map_err(|_| ())?;
+        let key = bson::to_vec(&wrap).map_err(|_| Fallback::Defer)?;
         let idx = *key_index.entry(key).or_insert_with(|| {
             partitions.push(Vec::new());
             partitions.len() - 1
@@ -234,7 +239,13 @@ pub fn set_window_fields_stage(
                 } else if PREFIX_OPS.contains(&c.op) {
                     prefix_vecs[ci].as_ref().unwrap()[pos].clone()
                 } else if c.op == "$shift" {
-                    shift_value(c.arg.as_document().ok_or(())?, pos, &slots, &docs, vars)?
+                    shift_value(
+                        c.arg.as_document().ok_or(Fallback::Defer)?,
+                        pos,
+                        &slots,
+                        &docs,
+                        vars,
+                    )?
                 } else if c.op == "$derivative" || c.op == "$integral" {
                     let (low, high) = if c.window.is_some_and(|w| w.contains_key("range")) {
                         range_window_bounds(
@@ -249,7 +260,7 @@ pub fn set_window_fields_stage(
                     };
                     ts_window_value(
                         c.op,
-                        c.arg.as_document().ok_or(())?,
+                        c.arg.as_document().ok_or(Fallback::Defer)?,
                         low,
                         high,
                         &slots,
@@ -278,7 +289,8 @@ pub fn set_window_fields_stage(
                     }
                     group::finalize_window_value(acc)?
                 };
-                paths::set_path(&mut out_docs[orig_i], c.field, value).map_err(|_| ())?;
+                paths::set_path(&mut out_docs[orig_i], c.field, value)
+                    .map_err(|_| Fallback::Defer)?;
             }
         }
     }
@@ -303,7 +315,7 @@ fn sorted_slots(part: &[usize], docs: &[Document], sort_by: Option<&Document>) -
             .iter()
             .any(|&i| !order::is_sortable(&field_value(&docs[i], f)))
         {
-            return Err(()); // order::cmp's precondition
+            return Err(Fallback::Defer); // order::cmp's precondition
         }
     }
     for (field, desc) in fields.iter().rev() {
@@ -382,7 +394,7 @@ fn window_bounds(slot: usize, n: usize, window: Option<&Document>) -> R<(i64, i6
     let bounds = match window.and_then(|w| w.get("documents")) {
         None => return Ok((0, last)),
         Some(Bson::Array(b)) if b.len() == 2 => b,
-        Some(_) => return Err(()),
+        Some(_) => return Err(Fallback::Defer),
     };
     let resolve = |b: &Bson, is_lower: bool| -> R<i64> {
         match b {
@@ -390,7 +402,7 @@ fn window_bounds(slot: usize, n: usize, window: Option<&Document>) -> R<(i64, i6
             Bson::String(s) if s == "current" => Ok(slot as i64),
             Bson::Int32(i) => Ok(slot as i64 + *i as i64),
             Bson::Int64(i) => Ok(slot as i64 + *i),
-            _ => Err(()), // bool / non-int / other string → Python raises
+            _ => Err(Fallback::Defer), // bool / non-int / other string → Python raises
         }
     };
     let low = resolve(&bounds[0], true)?.max(0);
@@ -411,14 +423,14 @@ fn shift_value(
     let by = match spec.get("by") {
         Some(Bson::Int32(n)) => *n as i64,
         Some(Bson::Int64(n)) => *n,
-        _ => return Err(()),
+        _ => return Err(Fallback::Defer),
     };
-    let output = spec.get("output").ok_or(())?;
+    let output = spec.get("output").ok_or(Fallback::Defer)?;
     let idx = pos as i64 + by;
     if idx >= 0 && (idx as usize) < slots.len() {
-        expressions::evaluate(&docs[slots[idx as usize]], output, vars).map_err(|_| ())
+        expressions::evaluate(&docs[slots[idx as usize]], output, vars)
     } else if let Some(default) = spec.get("default") {
-        expressions::evaluate(&docs[slots[pos]], default, vars).map_err(|_| ())
+        expressions::evaluate(&docs[slots[pos]], default, vars)
     } else {
         Ok(Bson::Null)
     }
@@ -448,20 +460,20 @@ fn ts_window_value(
     let xs: &[f64] = match spec.get("unit") {
         Some(Bson::String(u)) => {
             // `unit` requires a date sortBy; scale its millis into the unit.
-            let unit_ms = window_unit_ms(u).ok_or(())? as f64;
-            let dates = range_dates.ok_or(())?;
+            let unit_ms = window_unit_ms(u).ok_or(Fallback::Defer)? as f64;
+            let dates = range_dates.ok_or(Fallback::Defer)?;
             scaled = dates.iter().map(|ms| ms / unit_ms).collect();
             &scaled
         }
-        Some(_) => return Err(()), // non-string unit → defer
-        None => range_vals.ok_or(())?,
+        Some(_) => return Err(Fallback::Defer), // non-string unit → defer
+        None => range_vals.ok_or(Fallback::Defer)?,
     };
-    let input = spec.get("input").ok_or(())?;
+    let input = spec.get("input").ok_or(Fallback::Defer)?;
     let mut pts: Vec<(f64, f64)> = Vec::new();
     for s in low..=high {
         let s = s as usize;
-        let y = as_number(&expressions::evaluate(&docs[slots[s]], input, vars).map_err(|_| ())?)
-            .ok_or(())?;
+        let y = as_number(&expressions::evaluate(&docs[slots[s]], input, vars)?)
+            .ok_or(Fallback::Defer)?;
         pts.push((xs[s], y));
     }
     if op == "$derivative" {
@@ -486,24 +498,24 @@ fn ts_window_value(
 }
 
 /// `$expMovingAvg` smoothing factor: `2/(N+1)` from a positive-int `N`, or a
-/// given `alpha` in (0, 1). Exactly one must be present, else `Err(())` (defer).
+/// given `alpha` in (0, 1). Exactly one must be present, else `Err(Fallback::Defer)` (defer).
 fn ema_alpha(spec: &Document) -> R<f64> {
     let has_n = spec.contains_key("N");
     let has_alpha = spec.contains_key("alpha");
     if has_n == has_alpha {
-        return Err(());
+        return Err(Fallback::Defer);
     }
     if has_n {
         let n = match spec.get("N") {
             Some(Bson::Int32(n)) if *n >= 1 => *n as f64,
             Some(Bson::Int64(n)) if *n >= 1 => *n as f64,
-            _ => return Err(()),
+            _ => return Err(Fallback::Defer),
         };
         Ok(2.0 / (n + 1.0))
     } else {
         match spec.get("alpha") {
             Some(Bson::Double(a)) if *a > 0.0 && *a < 1.0 => Ok(*a),
-            _ => Err(()), // int alpha can't be in (0,1); non-number defers
+            _ => Err(Fallback::Defer), // int alpha can't be in (0,1); non-number defers
         }
     }
 }
@@ -513,12 +525,12 @@ fn ema_alpha(spec: &Document) -> R<f64> {
 /// ema[i-1]*(1-alpha)`. Same IEEE-double ops as the oracle → bit-for-bit match.
 fn ema_values(slots: &[usize], docs: &[Document], spec: &Document, vars: &Document) -> R<Vec<f64>> {
     let alpha = ema_alpha(spec)?;
-    let input = spec.get("input").ok_or(())?;
+    let input = spec.get("input").ok_or(Fallback::Defer)?;
     let mut out = Vec::with_capacity(slots.len());
     let mut prev: Option<f64> = None;
     for &i in slots {
-        let v = expressions::evaluate(&docs[i], input, vars).map_err(|_| ())?;
-        let x = as_number(&v).ok_or(())?; // non-numeric input -> defer
+        let v = expressions::evaluate(&docs[i], input, vars)?;
+        let x = as_number(&v).ok_or(Fallback::Defer)?; // non-numeric input -> defer
         let ema = match prev {
             None => x,
             Some(p) => x * alpha + p * (1.0 - alpha),
@@ -541,13 +553,17 @@ fn window_vector(
     vars: &Document,
 ) -> R<Vec<Bson>> {
     match op {
-        "$expMovingAvg" => Ok(ema_values(slots, docs, arg.as_document().ok_or(())?, vars)?
-            .into_iter()
-            .map(Bson::Double)
-            .collect()),
+        "$expMovingAvg" => {
+            Ok(
+                ema_values(slots, docs, arg.as_document().ok_or(Fallback::Defer)?, vars)?
+                    .into_iter()
+                    .map(Bson::Double)
+                    .collect(),
+            )
+        }
         "$locf" => locf_values(slots, docs, arg, vars),
         "$linearFill" => linear_fill_values(slots, docs, arg, range_vals, vars),
-        _ => Err(()),
+        _ => Err(Fallback::Defer),
     }
 }
 
@@ -557,7 +573,7 @@ fn locf_values(slots: &[usize], docs: &[Document], expr: &Bson, vars: &Document)
     let mut out = Vec::with_capacity(slots.len());
     let mut last: Option<Bson> = None;
     for &i in slots {
-        let v = expressions::evaluate(&docs[i], expr, vars).map_err(|_| ())?;
+        let v = expressions::evaluate(&docs[i], expr, vars)?;
         if matches!(v, Bson::Null) {
             out.push(last.clone().unwrap_or(Bson::Null));
         } else {
@@ -579,10 +595,10 @@ fn linear_fill_values(
     range_vals: Option<&[f64]>,
     vars: &Document,
 ) -> R<Vec<Bson>> {
-    let xs = range_vals.ok_or(())?;
+    let xs = range_vals.ok_or(Fallback::Defer)?;
     let vals: Vec<Bson> = slots
         .iter()
-        .map(|&i| expressions::evaluate(&docs[i], expr, vars).map_err(|_| ()))
+        .map(|&i| expressions::evaluate(&docs[i], expr, vars))
         .collect::<R<Vec<_>>>()?;
     let mut out = vals.clone();
     let anchors: Vec<usize> = vals
@@ -594,10 +610,10 @@ fn linear_fill_values(
     for w in anchors.windows(2) {
         let (a, b) = (w[0], w[1]);
         let (x0, x1) = (xs[a], xs[b]);
-        let y0 = as_number(&vals[a]).ok_or(())?;
-        let y1 = as_number(&vals[b]).ok_or(())?;
+        let y0 = as_number(&vals[a]).ok_or(Fallback::Defer)?;
+        let y1 = as_number(&vals[b]).ok_or(Fallback::Defer)?;
         if x1 == x0 {
-            return Err(());
+            return Err(Fallback::Defer);
         }
         for i in (a + 1)..b {
             out[i] = Bson::Double(y0 + (y1 - y0) * ((xs[i] - x0) / (x1 - x0)));
@@ -701,27 +717,32 @@ fn range_window_bounds(
     let (unit_ms, vals): (f64, &[f64]) = match window.get("unit") {
         Some(Bson::String(u)) => {
             // `unit` requires a date sortBy.
-            (window_unit_ms(u).ok_or(())? as f64, range_dates.ok_or(())?)
+            (
+                window_unit_ms(u).ok_or(Fallback::Defer)? as f64,
+                range_dates.ok_or(Fallback::Defer)?,
+            )
         }
-        Some(_) => return Err(()), // non-string unit → defer
+        Some(_) => return Err(Fallback::Defer), // non-string unit → defer
         None => {
             // A date sortBy requires a `unit`.
             if range_dates.is_some() {
-                return Err(());
+                return Err(Fallback::Defer);
             }
-            (1.0, range_vals.ok_or(())?)
+            (1.0, range_vals.ok_or(Fallback::Defer)?)
         }
     };
     let bounds = match window.get("range") {
         Some(Bson::Array(b)) if b.len() == 2 => b,
-        _ => return Err(()),
+        _ => return Err(Fallback::Defer),
     };
     let cur = vals[slot];
     let edge = |b: &Bson| -> R<Option<f64>> {
         match b {
             Bson::String(s) if s == "unbounded" => Ok(None),
             Bson::String(s) if s == "current" => Ok(Some(cur)),
-            _ => as_number(b).map(|x| Some(cur + x * unit_ms)).ok_or(()),
+            _ => as_number(b)
+                .map(|x| Some(cur + x * unit_ms))
+                .ok_or(Fallback::Defer),
         }
     };
     let lo = edge(&bounds[0])?;

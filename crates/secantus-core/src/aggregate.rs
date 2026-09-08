@@ -144,19 +144,15 @@ fn apply_stage(
         }),
         "$sort" => sort_stage(docs, spec),
         "$unwind" => unwind_stage(docs, spec),
-        "$group" => group::group_stage(spec, &docs, vars).map_err(|_| Fallback::Defer),
-        "$sortByCount" => {
-            group::sort_by_count_stage(spec, &docs, vars).map_err(|_| Fallback::Defer)
-        }
-        "$bucket" => group::bucket_stage(spec, &docs, vars).map_err(|_| Fallback::Defer),
-        "$bucketAuto" => group::bucket_auto_stage(spec, &docs, vars).map_err(|_| Fallback::Defer),
+        "$group" => group::group_stage(spec, &docs, vars),
+        "$sortByCount" => group::sort_by_count_stage(spec, &docs, vars),
+        "$bucket" => group::bucket_stage(spec, &docs, vars),
+        "$bucketAuto" => group::bucket_auto_stage(spec, &docs, vars),
         "$redact" => redact_stage(spec, docs, vars),
         "$facet" => facet_stage(spec, docs, vars, coll),
-        "$densify" => densify::densify_stage(spec, &docs).map_err(|_| Fallback::Defer),
-        "$fill" => fill::fill_stage(spec, docs, vars).map_err(|_| Fallback::Defer),
-        "$setWindowFields" => {
-            windowfields::set_window_fields_stage(spec, docs, vars).map_err(|_| Fallback::Defer)
-        }
+        "$densify" => densify::densify_stage(spec, &docs),
+        "$fill" => fill::fill_stage(spec, docs, vars),
+        "$setWindowFields" => windowfields::set_window_fields_stage(spec, docs, vars),
         // storage-backed ($lookup/$geoNear/$out/$merge) / $sample / … -> Python.
         _ => Err(Fallback::Defer),
     }

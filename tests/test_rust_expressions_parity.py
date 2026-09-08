@@ -1298,7 +1298,15 @@ def test_zip_fuzz():
         if rng.random() < 0.4:
             spec["defaults"] = [rng.randint(-1, -1) for _ in inputs]
         expr = bson.decode(bson.encode({"e": {"$zip": spec}}))["e"]
-        rust = _rust_eval(expr, {})
+        # The generator can produce `inputs: []`, which mongod rejects with
+        # 34465 -- both engines now name that error, where they used to answer
+        # an empty array. A named error is a parity result like any other: the
+        # pure engine must raise exactly the same code and message.
+        try:
+            rust = _rust_eval(expr, {})
+        except RustMongoError as exc:
+            assert_named_error_matches_pure(exc, expr, {})
+            continue
         if rust is None:
             continue
         try:

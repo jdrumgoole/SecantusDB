@@ -210,23 +210,7 @@ fn eval(expr: &Bson, ctx: &Ctx) -> R {
                     // and is still an executor error (probed 8.2.11). Only the
                     // innermost frame decides -- an outer one finds it already
                     // set and leaves it.
-                    return apply_op(key, val, ctx).map_err(|fault| match fault {
-                        Fallback::Mongo {
-                            code,
-                            message,
-                            folded: None,
-                            exec,
-                        } => Fallback::Mongo {
-                            code,
-                            message,
-                            folded: Some(crate::aggregate::is_constant_expression(
-                                val,
-                                &ctx.vars.keys().cloned().collect::<Vec<_>>(),
-                            )),
-                            exec,
-                        },
-                        other => other,
-                    });
+                    return apply_op(key, val, ctx).map_err(|f| stamp_folded(f, val, ctx));
                 }
             }
             // A document *literal*. Each member is in field-value position, so
@@ -255,6 +239,35 @@ fn eval(expr: &Bson, ctx: &Ctx) -> R {
 /// value of a projected/added field it is *missing* and the key is omitted.
 /// Keeping the two distinct is why this isn't folded into `eval`.
 /// Mirrors `expressions.py::_eval_field_value`.
+/// Stamp the constant-folding verdict on an error that has not decided one.
+///
+/// mongod folds a wholly constant expression at optimization time and reports
+/// it under a different wrapper, and the verdict follows the offending
+/// SUB-expression: `{$log: ["$n", 1]}` has a constant base and is still an
+/// executor error (probed 8.2.11). Only the innermost frame decides -- an outer
+/// one finds it already set and leaves it.
+fn stamp_folded(fault: Fallback, arg: &Bson, ctx: &Ctx) -> Fallback {
+    match fault {
+        Fallback::Mongo {
+            code,
+            message,
+            folded: None,
+            exec,
+            bare,
+        } => Fallback::Mongo {
+            code,
+            message,
+            folded: Some(crate::aggregate::is_constant_expression(
+                arg,
+                &ctx.vars.keys().cloned().collect::<Vec<_>>(),
+            )),
+            exec,
+            bare,
+        },
+        other => other,
+    }
+}
+
 fn eval_field_value(expr: &Bson, ctx: &Ctx) -> R {
     if let Bson::String(s) = expr {
         if !s.starts_with("$$") {
@@ -282,6 +295,14 @@ fn eval_field_value(expr: &Bson, ctx: &Ctx) -> R {
     if let Bson::Document(d) = expr {
         if d.len() == 1 {
             if let Some((op, arg)) = d.iter().next() {
+                // These four bypass `apply_op`, so they bypassed its
+                // required-field validation with it: `{$cond: {}}` reached
+                // `op_cond`, found no `if`, and deferred -- a generic
+                // "not supported" reply for an expression mongod rejects with a
+                // specific code. Validate here too, on the same table.
+                if matches!(op.as_str(), "$cond" | "$switch" | "$let" | "$ifNull") {
+                    check_required_fields(op, arg).map_err(|f| stamp_folded(f, arg, ctx))?;
+                }
                 match op.as_str() {
                     "$cond" => return op_cond(arg, ctx, eval_field_value),
                     "$switch" => return op_switch(arg, ctx, eval_field_value),
@@ -344,6 +365,315 @@ fn is_null(b: &Bson) -> bool {
     matches!(b, Bson::Null)
 }
 
+/// Validate every operator document inside a stage spec, the way mongod does at
+/// PARSE time -- before any document is read.
+///
+/// Where this runs decides the message the client sees. mongod wraps a parse
+/// error from a projection-style stage as
+/// `Invalid $addFields :: caused by :: <message>` (also `$project` / `$set`),
+/// and leaves the same error BARE inside `$group`, `$match`'s `$expr` and
+/// `$redact` -- measured 8.2.11, 2026-09-07. So the caller supplies the wrapper
+/// and only the projection-style stages pass one.
+pub fn validate_expression_args(expr: &Bson) -> Result<(), Fallback> {
+    match expr {
+        Bson::Document(d) => {
+            for (key, val) in d {
+                if key.starts_with('$') {
+                    check_required_fields(key, val)?;
+                }
+                validate_expression_args(val)?;
+            }
+            Ok(())
+        }
+        Bson::Array(a) => {
+            for e in a {
+                validate_expression_args(e)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The keys each operator ACCEPTS -- required ones plus optional ones.
+///
+/// Used only as a GATE, never to produce an error. mongod reports an UNKNOWN
+/// argument in preference to a missing required one: `{$trim: {k: 1}}` is
+/// `50694 $trim found an unknown argument: k`, not the missing-`input` error,
+/// and so is `{$trim: {input: "a", k: 1}}` (measured 8.2.11, 2026-09-07). The
+/// per-operator implementations already emit those unknown-argument errors
+/// correctly, so the required-field check simply stands aside whenever a key is
+/// not recognised and lets them run.
+///
+/// Being CONSERVATIVE here is safe in one direction only: omitting a legitimate
+/// optional key merely skips the required-field check for documents that use
+/// it, which is the old behaviour. Listing a key mongod would reject is what
+/// would be wrong, so the corpus sweep is the check on this table.
+const ALLOWED_FIELDS: &[(&str, &[&str])] = &[
+    ("$trim", &["input", "chars"]),
+    ("$ltrim", &["input", "chars"]),
+    ("$rtrim", &["input", "chars"]),
+    ("$regexFind", &["input", "regex", "options"]),
+    ("$regexFindAll", &["input", "regex", "options"]),
+    ("$regexMatch", &["input", "regex", "options"]),
+    ("$reduce", &["input", "initialValue", "in"]),
+    ("$filter", &["input", "cond", "as", "limit"]),
+    ("$map", &["input", "as", "in"]),
+    ("$replaceAll", &["input", "find", "replacement"]),
+    ("$replaceOne", &["input", "find", "replacement"]),
+    ("$setField", &["field", "input", "value"]),
+    ("$sortArray", &["input", "sortBy"]),
+    ("$dateToString", &["date", "format", "timezone", "onNull"]),
+    ("$cond", &["if", "then", "else"]),
+    ("$let", &["vars", "in"]),
+    ("$switch", &["branches", "default"]),
+    ("$zip", &["inputs", "useLongestLength", "defaults"]),
+    ("$dateAdd", &["startDate", "unit", "amount", "timezone"]),
+    (
+        "$dateSubtract",
+        &["startDate", "unit", "amount", "timezone"],
+    ),
+];
+
+/// Whether every key in `d` is one `op` recognises. `false` means some other
+/// check owns the error, so the required-field check must stand aside.
+fn all_fields_recognised(op: &str, d: &Document) -> bool {
+    match ALLOWED_FIELDS.iter().find(|(name, _)| *name == op) {
+        Some((_, allowed)) => d.keys().all(|k| allowed.contains(&k.as_str())),
+        None => true,
+    }
+}
+
+/// mongod's missing-required-argument errors for the document-form operators.
+///
+/// Measured against mongod 8.2.11 on 2026-09-07 by starting from a VALID
+/// argument document and dropping one field at a time (57 cases). Every code
+/// and every wording here is a measurement -- they are emphatically not
+/// derivable from a pattern, which is the whole reason this is a table:
+/// `$filter` says "Missing 'input' parameter to $filter" (28648) while
+/// `$reduce` says "$reduce requires 'input' to be specified" (40077), and
+/// `$replaceAll`'s three fields descend 51749 / 51748 / 51747 as you read them
+/// left to right.
+///
+/// MISSING is not NULL here, and the distinction is load-bearing:
+/// `{$trim: {input: null}}` is LEGAL and yields null, and
+/// `{$regexMatch: {input: null, regex: "a"}}` is legal and yields false. Only an
+/// ABSENT key is an error, so this checks key presence and never the value.
+/// Reading a missing field as null is exactly what made 25 of those 57 cases
+/// answer a wrong VALUE instead of erroring.
+type RequiredField = (&'static str, i32, &'static str);
+const REQUIRED_FIELDS: &[(&str, &[RequiredField])] = &[
+    (
+        "$trim",
+        &[("input", 50695, "$trim requires an 'input' field")],
+    ),
+    (
+        "$ltrim",
+        &[("input", 50695, "$ltrim requires an 'input' field")],
+    ),
+    (
+        "$rtrim",
+        &[("input", 50695, "$rtrim requires an 'input' field")],
+    ),
+    (
+        "$regexFind",
+        &[
+            ("input", 31022, "$regexFind requires 'input' parameter"),
+            ("regex", 31023, "$regexFind requires 'regex' parameter"),
+        ],
+    ),
+    (
+        "$regexFindAll",
+        &[
+            ("input", 31022, "$regexFindAll requires 'input' parameter"),
+            ("regex", 31023, "$regexFindAll requires 'regex' parameter"),
+        ],
+    ),
+    (
+        "$regexMatch",
+        &[
+            ("input", 31022, "$regexMatch requires 'input' parameter"),
+            ("regex", 31023, "$regexMatch requires 'regex' parameter"),
+        ],
+    ),
+    (
+        "$reduce",
+        &[
+            ("input", 40077, "$reduce requires 'input' to be specified"),
+            (
+                "initialValue",
+                40078,
+                "$reduce requires 'initialValue' to be specified",
+            ),
+            ("in", 40079, "$reduce requires 'in' to be specified"),
+        ],
+    ),
+    (
+        "$filter",
+        &[
+            ("input", 28648, "Missing 'input' parameter to $filter"),
+            ("cond", 28650, "Missing 'cond' parameter to $filter"),
+        ],
+    ),
+    (
+        "$map",
+        &[
+            ("input", 16880, "Missing 'input' parameter to $map"),
+            ("in", 16882, "Missing 'in' parameter to $map"),
+        ],
+    ),
+    (
+        "$replaceAll",
+        &[
+            (
+                "input",
+                51749,
+                "$replaceAll requires 'input' to be specified",
+            ),
+            ("find", 51748, "$replaceAll requires 'find' to be specified"),
+            (
+                "replacement",
+                51747,
+                "$replaceAll requires 'replacement' to be specified",
+            ),
+        ],
+    ),
+    (
+        "$replaceOne",
+        &[
+            (
+                "input",
+                51749,
+                "$replaceOne requires 'input' to be specified",
+            ),
+            ("find", 51748, "$replaceOne requires 'find' to be specified"),
+            (
+                "replacement",
+                51747,
+                "$replaceOne requires 'replacement' to be specified",
+            ),
+        ],
+    ),
+    (
+        "$setField",
+        &[
+            (
+                "field",
+                4161102,
+                "$setField requires 'field' to be specified",
+            ),
+            (
+                "input",
+                4161109,
+                "$setField requires 'input' to be specified",
+            ),
+            (
+                "value",
+                4161103,
+                "$setField requires 'value' to be specified",
+            ),
+        ],
+    ),
+    (
+        "$sortArray",
+        &[
+            (
+                "input",
+                2942502,
+                "$sortArray requires 'input' to be specified",
+            ),
+            (
+                "sortBy",
+                2942503,
+                "$sortArray requires 'sortBy' to be specified",
+            ),
+        ],
+    ),
+    (
+        "$dateToString",
+        &[("date", 18628, "Missing 'date' parameter to $dateToString")],
+    ),
+    (
+        "$cond",
+        &[
+            ("if", 17080, "Missing 'if' parameter to $cond"),
+            ("then", 17081, "Missing 'then' parameter to $cond"),
+            ("else", 17082, "Missing 'else' parameter to $cond"),
+        ],
+    ),
+    (
+        "$let",
+        &[
+            ("vars", 16876, "Missing 'vars' parameter to $let"),
+            ("in", 16877, "Missing 'in' parameter to $let"),
+        ],
+    ),
+];
+
+/// `$dateAdd` / `$dateSubtract` name all three fields in ONE message whichever
+/// is missing, so they cannot use the per-field table above.
+const DATE_ARITH_FIELDS: &[&str] = &["startDate", "unit", "amount"];
+
+/// Operators whose required field must also be a NON-EMPTY array -- mongod
+/// gives the same code for "absent" and "present but empty".
+const REQUIRED_NON_EMPTY: &[(&str, &str, i32, &str)] = &[
+    (
+        "$switch",
+        "branches",
+        40068,
+        "$switch requires at least one branch",
+    ),
+    (
+        "$zip",
+        "inputs",
+        34465,
+        "$zip requires at least one input array",
+    ),
+];
+
+/// Reject an operator argument document that omits a required field, with
+/// mongod's own code and message. `Ok(())` when nothing is missing -- including
+/// for every operator not named in the tables, which are unaffected.
+pub fn check_required_fields(op: &str, arg: &Bson) -> Result<(), Fallback> {
+    let Bson::Document(d) = arg else {
+        return Ok(()); // array / scalar forms are a different parse
+    };
+    // An unrecognised key outranks a missing required one on mongod, and the
+    // operator implementations already report it, so stand aside.
+    if !all_fields_recognised(op, d) {
+        return Ok(());
+    }
+    if let Some((_, fields)) = REQUIRED_FIELDS.iter().find(|(name, _)| *name == op) {
+        for (field, code, message) in *fields {
+            if !d.contains_key(*field) {
+                return Err(Fallback::mongo(*code, *message).bare());
+            }
+        }
+    }
+    if let Some((_, field, code, message)) =
+        REQUIRED_NON_EMPTY.iter().find(|(name, ..)| *name == op)
+    {
+        let empty = match d.get(*field) {
+            None => true,
+            Some(Bson::Array(a)) => a.is_empty(),
+            Some(_) => false,
+        };
+        if empty {
+            return Err(Fallback::mongo(*code, *message).bare());
+        }
+    }
+    if matches!(op, "$dateAdd" | "$dateSubtract")
+        && DATE_ARITH_FIELDS.iter().any(|f| !d.contains_key(*f))
+    {
+        return Err(Fallback::mongo(
+            5166402,
+            format!("{op} requires startDate, unit, and amount to be present"),
+        )
+        .bare());
+    }
+    Ok(())
+}
+
 fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
     // mongod's expression parser treats `{$op: [x]}` as ONE argument for the
     // single-argument operators, unwrapping the list. Passing the list through
@@ -358,6 +688,10 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         }
         other => other,
     };
+    // mongod validates the argument document's required fields BEFORE
+    // evaluating anything, so a missing field is an error even when the rest of
+    // the expression would not have run.
+    check_required_fields(op, arg)?;
     match op {
         "$literal" => Ok(arg.clone()),
         // $eq/$ne use Python `==` (total: null==null is true, different types
@@ -1307,7 +1641,12 @@ fn op_divide(arg: &Bson, ctx: &Ctx) -> R {
         return Err(Fallback::Defer);
     };
     if b == 0.0 {
-        return Err(Fallback::Defer); // Python raises "can't $divide by zero" (code 2)
+        // mongod's own text and code, measured 8.2.11 (2026-09-08). This used to
+        // DEFER, justified by a comment citing what "Python raises" -- and a
+        // defer has no Python behind it on this server, so dividing by zero
+        // answered "the Rust server does not support this operator", blaming
+        // `$divide` for a bad operand.
+        return Err(Fallback::mongo(2, "can't $divide by zero"));
     }
     Ok(Bson::Double(a / b)) // Python `/` is always float division
 }
@@ -1329,13 +1668,17 @@ fn op_mod(arg: &Bson, ctx: &Ctx) -> R {
     // is why this needs no sign fixup. Probed 8.2.11.
     if let (Some(a), Some(b)) = (as_int_like(&vals[0]), as_int_like(&vals[1])) {
         if b == 0 {
-            return Err(Fallback::Defer); // Python raises "can't $mod by zero" (16610)
+            // mongod's own text and code, measured 8.2.11. Same defer-cited-by-
+            // the-other-engine shape as `$divide` above.
+            return Err(Fallback::mongo(16610, "can't $mod by zero"));
         }
         return Ok(int_result(a % b, is_int64(&vals[0]) || is_int64(&vals[1])));
     }
     if let (Some(a), Some(b)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) {
         if b == 0.0 {
-            return Err(Fallback::Defer); // Python raises "can't $mod by zero" (16610)
+            // mongod's own text and code, measured 8.2.11. Same defer-cited-by-
+            // the-other-engine shape as `$divide` above.
+            return Err(Fallback::mongo(16610, "can't $mod by zero"));
         }
         return Ok(Bson::Double(a % b));
     }
@@ -1369,13 +1712,63 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
     }
     let arr = eval(&pair[0], ctx)?;
     let idx = eval(&pair[1], ctx)?;
-    if matches!(idx, Bson::Boolean(_)) {
-        return Err(Fallback::mongo(
-            28690,
-            "$arrayElemAt's second argument must be a numeric value, but is bool",
-        ));
-    }
-    let i = match coerce_index(&idx) {
+    // `coerce_index` is shared with `$slice` / `$substr`, whose rules were
+    // measured separately, so `$arrayElemAt`'s two extra rules live here:
+    // a DECIMAL index is accepted (`NumberDecimal("1")` is element 1), and
+    // "representable as a 32-bit integer" is enforced, so a WHOLE number outside
+    // int32 is 28691 rather than an out-of-range index. Both measured on 8.2.11
+    // (2026-09-08); `1e40` used to come back as a missing field.
+    let not_32bit_decimal = |v: &Bson| {
+        let rendered = match v {
+            Bson::Decimal128(d) => d
+                .to_string()
+                .parse::<f64>()
+                .map(format_double_g)
+                .unwrap_or_else(|_| d.to_string()),
+            other => format_double_g(as_float_like(other).unwrap_or(f64::NAN)),
+        };
+        Fallback::mongo(
+            28691,
+            format!(
+                "$arrayElemAt's second argument must be representable as a \
+                 32-bit integer: {rendered}"
+            ),
+        )
+    };
+    let not_32bit = |v: &Bson| {
+        Fallback::mongo(
+            28691,
+            format!(
+                "$arrayElemAt's second argument must be representable as a \
+                 32-bit integer: {}",
+                format_double_g(as_float_like(v).unwrap_or(f64::NAN))
+            ),
+        )
+    };
+    // `as_float_like` does not cover `Decimal128`, so it answered NaN and every
+    // decimal took the error path. Rendering to text and parsing is how the rest
+    // of this module reads a decimal as a float.
+    let decimal_as_f64 = |d: &bson::Decimal128| d.to_string().parse::<f64>().ok();
+    let decimal_index = match &idx {
+        Bson::Decimal128(d) => match decimal_as_f64(d) {
+            Some(f)
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && (i32::MIN as f64..=i32::MAX as f64).contains(&f) =>
+            {
+                Some(f as i64)
+            }
+            _ => return Err(not_32bit_decimal(&idx)),
+        },
+        _ => None,
+    };
+    let i = match decimal_index
+        .map(IdxCoerce::Int)
+        .unwrap_or_else(|| coerce_index(&idx))
+    {
+        IdxCoerce::Int(i) if !(i32::MIN as i64..=i32::MAX as i64).contains(&i) => {
+            return Err(not_32bit(&idx));
+        }
         IdxCoerce::Int(i) => i as i128,
         IdxCoerce::Fractional => {
             return Err(Fallback::mongo(
@@ -1387,7 +1780,24 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
                 ),
             ));
         }
-        IdxCoerce::NotNumber => return Ok(Bson::Null),
+        IdxCoerce::NotNumber => {
+            // NULL and a MISSING field really are null here, but every other
+            // non-numeric is mongod's 28690, naming the type -- measured across
+            // 13 BSON types on 8.2.11 (2026-09-08). This arm used to answer
+            // `null` for all of them, so `{$arrayElemAt: [[1, 2], "x"]}` was a
+            // silent WRONG VALUE rather than an error. `bool` had its own check
+            // above, which is why only that one type behaved.
+            if matches!(idx, Bson::Null | Bson::Undefined) {
+                return Ok(Bson::Null);
+            }
+            return Err(Fallback::mongo(
+                28690,
+                format!(
+                    "$arrayElemAt's second argument must be a numeric value, but is {}",
+                    crate::query::bson_type_name(&idx)
+                ),
+            ));
+        }
     };
     let a = match &arr {
         Bson::Array(a) => a,

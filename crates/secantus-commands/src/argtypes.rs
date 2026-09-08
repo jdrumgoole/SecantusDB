@@ -2047,12 +2047,6 @@ pub fn stage_spec_error(pipeline: &[Bson]) -> Option<(i32, String)> {
                 ))
             }
             "$group" => stage_group_problem(spec),
-            "$sortByCount" if matches!(spec, Bson::Document(_)) => Some((
-                40147,
-                "the sortByCount field must be defined as a $-prefixed path or an \
-                 expression inside an object"
-                    .to_string(),
-            )),
             "$geoNear" if matches!(spec, Bson::Document(d) if !d.contains_key("near")) => {
                 Some((5860400, "$geoNear requires a 'near' argument".to_string()))
             }
@@ -2126,13 +2120,23 @@ pub fn stage_spec_error(pipeline: &[Bson]) -> Option<(i32, String)> {
                      expression inside an object"
                         .to_string(),
                 )),
-                Bson::Document(d) if d.is_empty() => Some((
-                    40147,
-                    "the sortByCount field must be defined as a $-prefixed path or an \
-                     expression inside an object"
-                        .to_string(),
-                )),
-                Bson::Document(_) => None,
+                // A document is an EXPRESSION only when its first key is
+                // `$`-prefixed. `{a: 1}` and `{a: {$add: [...]}}` are literal
+                // documents and get 40147, the same as `{}` -- measured 8.2.11
+                // (2026-09-08). An unconditional arm above used to reject EVERY
+                // document with 40147, which shadowed this one and made valid
+                // expressions like `{$add: ["$n", 1]}` unusable; removing it
+                // then let the literal documents through to the engine, which
+                // deferred. Both halves of the rule are needed.
+                Bson::Document(d) => match d.keys().next() {
+                    Some(k) if k.starts_with('$') => None,
+                    _ => Some((
+                        40147,
+                        "the sortByCount field must be defined as a $-prefixed path or an \
+                         expression inside an object"
+                            .to_string(),
+                    )),
+                },
                 _ => Some((
                     40149,
                     "the sortByCount field must be specified as a string or as an object"

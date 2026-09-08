@@ -2150,6 +2150,67 @@ all still open. Probe: `scratchpad/readsweep.py` + `readsweep_lib.py`.
   command, per the standing rule, found it carried the same refusal. Pinned by
   `tests/test_rust_computed_projection.py`. A projection error carrying a mongod
   code is now surfaced verbatim rather than flattened to `BadValue`.
+- [x] **RESOLVED (2026-09-07): expression operators on the RUST server answered
+  a VALUE where mongod rejects the expression for a missing required argument.**
+  `{$regexMatch: {}}` returned `false`; `{$filter: {}}`, `{$trim: {}}`,
+  `{$reduce: {}}`, `{$map: {}}` and `{$dateAdd: {}}` returned `null` — 25 cases
+  answering something a caller can branch on. Another 32 answered the generic
+  `2 BadValue ... not supported by the Rust server`, blaming the operator for a
+  bad argument.
+
+  Root cause is the missing-vs-null conflation: required fields were read with
+  the optional-field helper, which reports an absent key as null. Only an ABSENT
+  key is an error — `{$trim: {input: null}}` is legal and yields null — so the
+  check tests key PRESENCE.
+
+  Two rules that a guess would get wrong, both measured on 8.2.11:
+  **an UNKNOWN argument outranks a missing one** (`{$trim: {k: 1}}` is 50694,
+  even with `input` also absent), and **the stage decides the wrapper** —
+  `Invalid <stage> :: caused by ::` for `$addFields` / `$project` / `$set`, BARE
+  inside `$match`'s `$expr`. The first was caught by the corpus after a version
+  with the precedence backwards traded 20 fixed cases for 20 broken ones at an
+  unchanged total, which is exactly the failure a raw count hides.
+
+  **BOTH servers had this, and the PYTHON one was worse** -- 31 of its 57 cases
+  silently wrong against the Rust server's 25. It surfaced only because fixing
+  Rust turned `test_rust_expressions_parity::test_zip_fuzz` RED: parity is
+  equally satisfied by both engines being wrong, and here they had been. Fixed
+  in both; the Python side reports through `aggregate.py`'s existing parse-time
+  scanner, which already carried mongod's `Invalid $<stage>` wrapper.
+
+  Both servers now 0 divergences of 57; the 6,628-case expression corpus
+  improves 58 -> 38 different-code, 0 wrong values, no regressions. Pinned by
+  `tests/test_rust_required_expression_args.py` and `scratchpad/reqfields.py`.
+
+- [x] **RESOLVED (2026-09-08): `$group` and friends DISCARDED every mongod-named
+  error; three neighbouring defects found with it.** `group.rs`, `fill.rs`,
+  `densify.rs` and `windowfields.rs` typed their errors as `Result<T, ()>`, so a
+  named error was thrown away at the module boundary
+  (`{$group: {_id: null, x: {$first: {$ln: 0}}}}` lost mongod's 28766) and the
+  client got the generic refusal.
+
+  **The site count in the previous version of this entry was misleading** -- 57
+  `Err(())` + 16 `ok_or(())` + 8 `map_err`, "each needing its own probe". It did
+  not: `Fallback::Defer` means exactly what the unit `()` meant, so all 81 sites
+  converted mechanically and only the BOUNDARIES needed thought. Another case of
+  a count read off the source overstating the work.
+
+  Probing outward from it found three more, all measured on 8.2.11:
+  - **`$sortByCount` rejected every expression** -- an unconditional early match
+    arm answered 40147 for any document, shadowing a later arm 70 lines below
+    that already had mongod's three codes right.
+  - **`$arrayElemAt` answered `null` for a non-numeric index** (silent WRONG
+    VALUE, on BOTH servers): only `bool` was checked. 0 divergences of 19 index
+    shapes now, including `Decimal128` (was rejected) and the int32 range rule
+    (`1e40` is 28691, not a missing field).
+  - **`$divide` / `$mod` by zero deferred**, each with a comment citing what
+    "Python raises" -- the anti-pattern this file catalogues, and wrong here
+    because a defer has no Python behind it.
+
+  A parse error is reported BARE inside `$group` / `$expr` / `$redact` and
+  wrapped `Invalid $<stage>` in the projection-style stages; `Fallback::bare()`
+  carries that distinction. Pinned by
+  `tests/test_rust_pipeline_error_fidelity.py` (38 tests).
 
 - [x] **RESOLVED (2026-09-06): the descending sort that put every prefix chain
   in ascending order.** `sort({x: -1})` over `["", "a", "ab", "abc", "b"]` came
