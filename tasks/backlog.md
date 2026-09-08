@@ -4858,6 +4858,22 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `true` here. Reproducing it needs PostgreSQL's operator-resolution table for
   arrays, not a comparison fix. Being more permissive, so it accepts queries
   PostgreSQL rejects rather than answering them differently.
+- **Rust PG server: schema-qualified composite type names are NOT namespaced —
+  BLOCKS the whole psycopg composite cluster (probed 2026-09-08).** psycopg's
+  session-scoped `testcomp` fixture (tests/types/test_composite.py) runs
+  `create type testschema.testcomp as (...)` alongside a bare `create type
+  testcomp`. The Rust server resolves a qualified type name by its LAST part
+  (like tables), so `testschema.testcomp` collides with `testcomp` and the
+  CREATE fails `42710 type "testcomp" already exists`. Because the fixture is
+  `scope="session"`, that one failure cascades to ~38 ERRORed composite tests —
+  the single highest-leverage composite fix. Root cause: `plan_create`'s
+  composite arm reads only `ct.typevar.relname` and drops
+  `ct.typevar.schemaname`, and the composite catalog keys on the bare name. A
+  real fix needs schema-namespaced composite storage + resolution: capture the
+  schema, key the catalog on `(schema, name)`, and make `to_regtype('a.b')`,
+  `oid::regtype::text` (renders `testschema.testcomp`), and the pg_type/
+  pg_namespace reads schema-aware. Probe: `scratchpad/probe_fixture.py`.
+
 - **Rust PG server: composite VALUE round-trip (`register_composite` of a value)
   is the remaining composite piece (2026-09-08).** `CompositeInfo.fetch` now
   WORKS — the 4-layer catalog query (`pg_type LEFT JOIN (SELECT array_agg(...)
