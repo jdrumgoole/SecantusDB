@@ -2717,6 +2717,19 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                 // falls back to int4 for the NULL-placeholder case, which is
                 // what PostgreSQL reports for `1 + NULL`.
                 _ => {
+                    // Datetime arithmetic (`date + int`, `timestamp + interval`,
+                    // `interval * n`, ...) types from the OPERANDS, so the result
+                    // column is described correctly even at DESCRIBE time when
+                    // every value is NULL -- which is when psycopg picks its
+                    // result loader. Without this a `timestamp + interval` was
+                    // described as `int4`/`text` and the client decoded it wrong.
+                    if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+                        let lt = static_type(l, &Bson::Null);
+                        let rt = static_type(r, &Bson::Null);
+                        if let Some(t) = datetime_arith_type(op, &lt, &rt) {
+                            return t.to_string();
+                        }
+                    }
                     if *value == Bson::Null {
                         "int4".to_string()
                     } else {
@@ -2730,6 +2743,68 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
 }
 
 /// The PostgreSQL type a constant value carries when nothing declares one.
+/// The result type of a datetime `+`/`-`/`*`/`/` from its two operand types, or
+/// `None` when this is not a datetime-arithmetic combination.
+///
+/// Static, computed from the operand TYPES (not values), so it holds at DESCRIBE
+/// time when every value is NULL -- which is exactly when the type matters,
+/// because psycopg picks its result loader from the described column type. Every
+/// operand-type spelling libpg_query can produce (`timestamptz` and `timestamp
+/// with time zone`, etc.) is folded first.
+fn datetime_arith_type(op: &str, lt: &str, rt: &str) -> Option<&'static str> {
+    let norm = |t: &str| -> &'static str {
+        match t {
+            "int2" | "int4" | "int8" | "smallint" | "integer" | "int" | "bigint" => "int",
+            "numeric" | "decimal" | "float4" | "float8" | "real" | "double precision"
+            | "double" => "num",
+            "date" => "date",
+            "time" | "time without time zone" => "time",
+            "timetz" | "time with time zone" => "timetz",
+            "timestamp" | "timestamp without time zone" => "timestamp",
+            "timestamptz" | "timestamp with time zone" => "timestamptz",
+            "interval" => "interval",
+            _ => "other",
+        }
+    };
+    let (l, r) = (norm(lt), norm(rt));
+    let num = |x: &str| x == "int" || x == "num";
+    match op {
+        "+" => match (l, r) {
+            ("date", "int") | ("int", "date") => Some("date"),
+            ("date", "interval") | ("interval", "date") => Some("timestamp"),
+            ("timestamp", "interval") | ("interval", "timestamp") => Some("timestamp"),
+            ("timestamptz", "interval") | ("interval", "timestamptz") => Some("timestamptz"),
+            ("time", "interval") | ("interval", "time") => Some("time"),
+            ("timetz", "interval") | ("interval", "timetz") => Some("timetz"),
+            ("interval", "interval") => Some("interval"),
+            _ => None,
+        },
+        "-" => match (l, r) {
+            ("date", "int") => Some("date"),
+            ("date", "date") => Some("int4"),
+            ("date", "interval") => Some("timestamp"),
+            ("timestamp", "interval") => Some("timestamp"),
+            ("timestamp", "timestamp") => Some("interval"),
+            ("timestamptz", "interval") => Some("timestamptz"),
+            ("timestamptz", "timestamptz") => Some("interval"),
+            ("time", "interval") => Some("time"),
+            ("time", "time") => Some("interval"),
+            ("timetz", "interval") => Some("timetz"),
+            ("interval", "interval") => Some("interval"),
+            _ => None,
+        },
+        "*" => match (l, r) {
+            ("interval", x) | (x, "interval") if num(x) => Some("interval"),
+            _ => None,
+        },
+        "/" => match (l, r) {
+            ("interval", x) if num(x) => Some("interval"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// The wider of two NUMERIC types, in PostgreSQL's own order.
 ///
 /// Measured, not assumed: `array[1, 1.5]` is `numeric[]`, `array[1::float4,
@@ -3336,6 +3411,12 @@ fn parse_date(text: &str) -> Result<String> {
     if lower == "-infinity" {
         return Ok("-infinity".to_string());
     }
+    // `epoch` is the one special INPUT value that is a constant (`now` / `today`
+    // depend on the clock and are filed rather than guessed), mirroring the
+    // `timestamp` cast arm.
+    if lower == "epoch" {
+        return Ok("1970-01-01".to_string());
+    }
     let parsed = if t.len() == 8 && t.chars().all(|c| c.is_ascii_digit()) {
         NaiveDate::parse_from_str(t, "%Y%m%d")
     } else {
@@ -3356,6 +3437,21 @@ fn parse_date(text: &str) -> Result<String> {
                 "invalid input syntax for type date: \"{t}\""
             ))),
         },
+    }
+}
+
+/// Render a `NaiveDate` in PostgreSQL's ISO `date` text, including the eras a
+/// Python `date` cannot hold: a proleptic year <= 0 becomes `NNNN-MM-DD BC`
+/// (year 0 is 1 BC), and a year past 9999 keeps its full width (`10000-01-01`).
+/// The client's loader is what rejects the values it cannot represent -- which
+/// is exactly what psycopg's date-overflow tests assert.
+fn render_date_pg(d: NaiveDate) -> String {
+    use chrono::Datelike;
+    let (y, m, day) = (d.year(), d.month(), d.day());
+    if y >= 1 {
+        format!("{y:04}-{m:02}-{day:02}")
+    } else {
+        format!("{:04}-{m:02}-{day:02} BC", 1 - y)
     }
 }
 
@@ -3521,6 +3617,14 @@ fn canonical_wide_date(t: &str) -> String {
 /// `22008`, not a parse error.
 fn parse_time(text: &str) -> Result<String> {
     let t = text.trim();
+    // PostgreSQL accepts `24:00:00` as a valid `time` (the end-of-day instant),
+    // rendering it back as `24:00:00`. chrono has no hour 24, so accept the
+    // exact all-zero forms here -- `24:00`, `24:00:00`, `24:00:00.000` -- and
+    // reject `24:00:01` / `24:00:00.1` as out of range, matching PG. A Python
+    // `time` cannot hold it either, so psycopg's loader raises on the way back.
+    if is_end_of_day_time(t) {
+        return Ok("24:00:00".to_string());
+    }
     let parsed = NaiveTime::parse_from_str(t, "%H:%M:%S%.f")
         .or_else(|_| NaiveTime::parse_from_str(t, "%H:%M"));
     let time = match parsed {
@@ -3544,6 +3648,31 @@ fn parse_time(text: &str) -> Result<String> {
         let frac = format!("{micros:06}");
         format!("{}.{}", time.format("%H:%M:%S"), frac.trim_end_matches('0'))
     })
+}
+
+/// Whether `t` is PostgreSQL's special end-of-day `time` value: hour 24 with
+/// every finer field zero (`24:00`, `24:00:00`, `24:00:00.000000`). `24:00:01`
+/// or a non-zero fraction is out of range, not this.
+fn is_end_of_day_time(t: &str) -> bool {
+    let (clock, frac) = match t.split_once('.') {
+        Some((c, f)) => (c, Some(f)),
+        None => (t, None),
+    };
+    if let Some(f) = frac {
+        if f.is_empty() || !f.chars().all(|c| c == '0') {
+            return false;
+        }
+    }
+    let mut parts = clock.split(':');
+    let (Some(h), min, sec, extra) = (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if extra.is_some() || h != "24" {
+        return false;
+    }
+    // Minutes must be present and zero; seconds, if present, zero.
+    matches!(min, Some("00") | Some("0")) && matches!(sec, None | Some("00") | Some("0"))
 }
 
 /// The hidden field carrying a timestamp's sub-millisecond remainder.
@@ -6088,6 +6217,11 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         // storing session-relative text in a row would be a wrong answer for
         // every other session that read it).
         "timestamptz" | "timestamp with time zone" => {
+            // `epoch` is the one constant special INPUT value -- the UTC instant
+            // 0 -- the same case the `timestamp` arm handles.
+            if as_text(&value).trim().eq_ignore_ascii_case("epoch") {
+                return Ok(Bson::DateTime(bson::DateTime::from_millis(0)));
+            }
             // A timestamptz is stored as a UTC INSTANT (the same carrier as
             // `timestamp`) and rendered in the session zone on the way out --
             // storing session-rendered text would be a wrong answer for any
@@ -6599,6 +6733,43 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
                 }
             }
             _ => {}
+        }
+
+        // `date +/- int` and `date - date`. A date is carried as `YYYY-MM-DD`
+        // text; only an ORDINARY date (not infinity / a wide-year or BC text
+        // the client can never hold) takes part, and only against an INTEGER,
+        // so an ambiguous string never lands here. The result is rendered in
+        // PostgreSQL's own text -- including the BC era and years past 9999 --
+        // and typed `date` (or `int4` for date-date) by `static_type`, so the
+        // client's loader is what rejects an unrepresentable result.
+        let as_int = |v: &Bson| match v {
+            Bson::Int32(i) => Some(i64::from(*i)),
+            Bson::Int64(i) => Some(*i),
+            _ => None,
+        };
+        let as_ymd = |v: &Bson| match v {
+            Bson::String(s) => NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok(),
+            _ => None,
+        };
+        if let (Some(d), Some(n)) = (as_ymd(&lhs), as_int(&rhs)) {
+            let out = d
+                .checked_add_signed(chrono::Duration::days(sign * n))
+                .ok_or_else(|| Error::DatetimeFieldOverflow("date out of range".to_string()))?;
+            return Ok(Bson::String(render_date_pg(out)));
+        }
+        if op == "+" {
+            if let (Some(n), Some(d)) = (as_int(&lhs), as_ymd(&rhs)) {
+                let out = d
+                    .checked_add_signed(chrono::Duration::days(n))
+                    .ok_or_else(|| Error::DatetimeFieldOverflow("date out of range".to_string()))?;
+                return Ok(Bson::String(render_date_pg(out)));
+            }
+        }
+        if op == "-" {
+            if let (Some(a), Some(b)) = (as_ymd(&lhs), as_ymd(&rhs)) {
+                let days = a.signed_duration_since(b).num_days();
+                return Ok(Bson::Int32(days as i32));
+            }
         }
     }
 

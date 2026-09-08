@@ -1986,3 +1986,64 @@ fn create_table_carries_if_not_exists() {
         other => panic!("wrong statement: {other:?}"),
     }
 }
+
+#[test]
+fn end_of_day_time_is_accepted_and_rendered_verbatim() {
+    // PostgreSQL accepts 24:00:00 as a valid `time` and renders it back
+    // verbatim; only the all-zero forms qualify.
+    for input in ["24:00", "24:00:00", "24:00:00.000000"] {
+        assert_eq!(
+            super::parse_time(input).expect("valid"),
+            "24:00:00",
+            "{input}"
+        );
+    }
+    // Anything past the end-of-day instant is out of range.
+    for input in ["24:00:01", "24:00:00.1", "24:01", "25:00"] {
+        assert!(super::parse_time(input).is_err(), "{input}");
+    }
+}
+
+#[test]
+fn epoch_literal_parses_on_date() {
+    assert_eq!(super::parse_date("epoch").expect("valid"), "1970-01-01");
+    assert_eq!(super::parse_date("EPOCH").expect("valid"), "1970-01-01");
+}
+
+#[test]
+fn date_pg_text_covers_bc_and_wide_years() {
+    use chrono::NaiveDate;
+    assert_eq!(
+        super::render_date_pg(NaiveDate::from_ymd_opt(2000, 1, 6).unwrap()),
+        "2000-01-06"
+    );
+    // Year 0 in the proleptic calendar is 1 BC in PostgreSQL's rendering.
+    assert_eq!(
+        super::render_date_pg(NaiveDate::from_ymd_opt(0, 12, 31).unwrap()),
+        "0001-12-31 BC"
+    );
+    assert_eq!(
+        super::render_date_pg(NaiveDate::from_ymd_opt(10000, 1, 1).unwrap()),
+        "10000-01-01"
+    );
+}
+
+#[test]
+fn datetime_arith_type_maps_the_operand_combinations() {
+    let t = |op, l, r| super::datetime_arith_type(op, l, r);
+    assert_eq!(t("+", "date", "int4"), Some("date"));
+    assert_eq!(t("+", "int4", "date"), Some("date"));
+    assert_eq!(t("-", "date", "date"), Some("int4"));
+    assert_eq!(t("+", "timestamp", "interval"), Some("timestamp"));
+    assert_eq!(t("+", "timestamptz", "interval"), Some("timestamptz"));
+    assert_eq!(t("+", "interval", "interval"), Some("interval"));
+    assert_eq!(t("*", "interval", "int4"), Some("interval"));
+    assert_eq!(t("*", "numeric", "interval"), Some("interval"));
+    assert_eq!(
+        t("+", "timestamp with time zone", "interval"),
+        Some("timestamptz")
+    );
+    // Not a datetime combination.
+    assert_eq!(t("+", "int4", "int4"), None);
+    assert_eq!(t("/", "int4", "interval"), None);
+}
