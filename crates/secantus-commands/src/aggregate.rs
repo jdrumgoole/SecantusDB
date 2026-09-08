@@ -963,8 +963,15 @@ fn core_run(
         // reply below, which told the client the server could not do `$round`
         // when in fact `$round` is fine and 1.5 is not a precision.
         if let Some((code, errmsg)) = fault.as_mongo() {
-            let folded = fault.folded();
-            let errmsg = wrap_pipeline_error(errmsg.to_string(), folded, ns);
+            // A PARSE error is sent bare here. The projection-style stages get
+            // `Invalid $<stage> :: caused by ::` from `validate_stage_expr_args`
+            // before execution, so anything reaching this point is inside
+            // `$group` / `$expr` / `$redact`, where mongod adds no wrapper.
+            let errmsg = if fault.is_bare() {
+                errmsg.to_string()
+            } else {
+                wrap_pipeline_error(errmsg.to_string(), fault.folded(), ns)
+            };
             return CommandError::new(code, crate::util::error_code_name(code), errmsg);
         }
         if let Some(docs) = saved {

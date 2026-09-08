@@ -51,6 +51,15 @@ pub enum Fallback {
         /// `findAndModify`); the command layer reads this to decide. Mirrors
         /// `secantus.update.UpdateError.exec_error`.
         exec: bool,
+        /// Whether mongod sends this message with NO pipeline wrapper at all.
+        /// A PARSE error (a missing required argument, say) is reported bare
+        /// inside `$group`, `$match`'s `$expr` and `$redact` -- measured 8.2.11,
+        /// 2026-09-08 -- where the projection-style stages get
+        /// `Invalid $<stage> :: caused by ::` applied at parse time instead.
+        /// Without this such an error picked up the optimizer's
+        /// "Failed to optimize pipeline" prefix, because a constant expression
+        /// folds and the fold verdict was the only thing being asked.
+        bare: bool,
     },
 }
 
@@ -63,7 +72,21 @@ impl Fallback {
             message: message.into(),
             folded: None,
             exec: false,
+            bare: false,
         }
+    }
+
+    /// Mark this as an error mongod reports with no pipeline wrapper.
+    pub fn bare(mut self) -> Self {
+        if let Fallback::Mongo { bare, .. } = &mut self {
+            *bare = true;
+        }
+        self
+    }
+
+    /// Whether this error is sent without any pipeline wrapper.
+    pub fn is_bare(&self) -> bool {
+        matches!(self, Fallback::Mongo { bare: true, .. })
     }
 
     /// Mark this as an execution-time update error, so the command layer adds

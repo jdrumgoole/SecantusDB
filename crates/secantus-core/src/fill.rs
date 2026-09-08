@@ -2,7 +2,7 @@
 //! interpolation — per partition, optionally sorted. A storage-free transform
 //! (it only touches the input docs), a bounded port of `aggregate._stage_fill`.
 //!
-//! Defers (`Err(())` → Python) on any shape Python rejects (bad output/method,
+//! Defers (`Err(Fallback::Defer)` → Python) on any shape Python rejects (bad output/method,
 //! both partition forms, `sortBy` non-doc, `method` without `sortBy`), on a
 //! non-numeric/non-date value under `linear`, and on a `partitionBy` expression
 //! the evaluator can't reproduce.
@@ -11,9 +11,14 @@ use std::collections::HashMap;
 
 use bson::{Bson, Document};
 
+use crate::fallback::Fallback;
 use crate::{expressions, order, paths};
 
-type R<T> = Result<T, ()>;
+/// Carries `Fallback` rather than `()` so an error the expression engine NAMED
+/// survives to the client instead of being flattened into the generic
+/// "not supported by the Rust server". `Fallback::Defer` is the same
+/// "cannot reproduce this" signal the unit `()` used to be.
+type R<T> = Result<T, Fallback>;
 
 enum Filler {
     Value(String, Bson),
@@ -44,22 +49,22 @@ fn field_value(doc: &Document, field: &str) -> Bson {
 }
 
 pub fn fill_stage(spec: &Bson, docs: Vec<Document>, vars: &Document) -> R<Vec<Document>> {
-    let spec = spec.as_document().ok_or(())?;
+    let spec = spec.as_document().ok_or(Fallback::Defer)?;
     let output = spec
         .get("output")
         .and_then(Bson::as_document)
         .filter(|o| !o.is_empty())
-        .ok_or(())?;
+        .ok_or(Fallback::Defer)?;
     let mut fillers: Vec<Filler> = Vec::new();
     for (field, action) in output {
-        let action = action.as_document().ok_or(())?;
+        let action = action.as_document().ok_or(Fallback::Defer)?;
         if let Some(v) = action.get("value") {
             fillers.push(Filler::Value(field.clone(), v.clone()));
         } else {
             match action.get("method").and_then(Bson::as_str) {
                 Some("locf") => fillers.push(Filler::Locf(field.clone())),
                 Some("linear") => fillers.push(Filler::Linear(field.clone())),
-                _ => return Err(()),
+                _ => return Err(Fallback::Defer),
             }
         }
     }
@@ -68,22 +73,22 @@ pub fn fill_stage(spec: &Bson, docs: Vec<Document>, vars: &Document) -> R<Vec<Do
     let sort_by = match spec.get("sortBy") {
         None => None,
         Some(Bson::Document(d)) => Some(d),
-        Some(_) => return Err(()),
+        Some(_) => return Err(Fallback::Defer),
     };
     if has_method && sort_by.is_none() {
-        return Err(());
+        return Err(Fallback::Defer);
     }
     // `partitionBy` and `partitionByFields` are mutually exclusive.
     let part_by = spec.get("partitionBy");
     let part_fields: Option<Vec<String>> = match spec.get("partitionByFields") {
         None => None,
-        Some(_) if part_by.is_some() => return Err(()),
+        Some(_) if part_by.is_some() => return Err(Fallback::Defer),
         Some(Bson::Array(a)) => Some(
             a.iter()
-                .map(|f| f.as_str().map(str::to_string).ok_or(()))
+                .map(|f| f.as_str().map(str::to_string).ok_or(Fallback::Defer))
                 .collect::<R<Vec<_>>>()?,
         ),
-        Some(_) => return Err(()),
+        Some(_) => return Err(Fallback::Defer),
     };
 
     // Partition, preserving partition-discovery order.
@@ -109,14 +114,14 @@ pub fn fill_stage(spec: &Bson, docs: Vec<Document>, vars: &Document) -> R<Vec<Do
                 Filler::Value(field, expr) => {
                     for d in group.iter_mut() {
                         if !is_filled(d, field) {
-                            let v = expressions::evaluate(d, expr, vars).map_err(|_| ())?;
-                            paths::set_path(d, field, v).map_err(|_| ())?;
+                            let v = expressions::evaluate(d, expr, vars)?;
+                            paths::set_path(d, field, v).map_err(|_| Fallback::Defer)?;
                         }
                     }
                 }
                 Filler::Locf(field) => apply_locf(group, field),
                 Filler::Linear(field) => {
-                    apply_linear(group, field, sort_field.as_deref().ok_or(())?)?
+                    apply_linear(group, field, sort_field.as_deref().ok_or(Fallback::Defer)?)?
                 }
             }
         }
@@ -140,13 +145,13 @@ fn partition_key(
         }
         Bson::Document(d)
     } else if let Some(by) = by {
-        expressions::evaluate(doc, by, vars).map_err(|_| ())?
+        expressions::evaluate(doc, by, vars)?
     } else {
         Bson::Null
     };
     let mut wrap = Document::new();
     wrap.insert("k", key_val);
-    bson::to_vec(&wrap).map_err(|_| ())
+    bson::to_vec(&wrap).map_err(|_| Fallback::Defer)
 }
 
 /// Stable multi-field sort by `sortBy` (BSON order, like `$sort` / `_SortKey`):
@@ -158,7 +163,7 @@ fn sort_partition(part: &mut [Document], sort_by: &Document) -> R<()> {
         .collect();
     for (f, _) in &fields {
         if part.iter().any(|d| !order::is_sortable(&field_value(d, f))) {
-            return Err(()); // order::cmp's precondition
+            return Err(Fallback::Defer); // order::cmp's precondition
         }
     }
     for (field, desc) in fields.iter().rev() {
@@ -199,16 +204,16 @@ fn apply_linear(part: &mut [Document], field: &str, sort_field: &str) -> R<()> {
         .collect();
     for w in anchors.windows(2) {
         let (lo, hi) = (w[0], w[1]);
-        let (x0, _) = as_interp(&field_value(&part[lo], sort_field)).ok_or(())?;
-        let (x1, _) = as_interp(&field_value(&part[hi], sort_field)).ok_or(())?;
-        let (y0, d0) = as_interp(&field_value(&part[lo], field)).ok_or(())?;
-        let (y1, d1) = as_interp(&field_value(&part[hi], field)).ok_or(())?;
+        let (x0, _) = as_interp(&field_value(&part[lo], sort_field)).ok_or(Fallback::Defer)?;
+        let (x1, _) = as_interp(&field_value(&part[hi], sort_field)).ok_or(Fallback::Defer)?;
+        let (y0, d0) = as_interp(&field_value(&part[lo], field)).ok_or(Fallback::Defer)?;
+        let (y1, d1) = as_interp(&field_value(&part[hi], field)).ok_or(Fallback::Defer)?;
         if x1 == x0 {
-            return Err(()); // coincident sort keys → undefined slope
+            return Err(Fallback::Defer); // coincident sort keys → undefined slope
         }
         let is_date = d0 && d1;
         for d in &mut part[lo + 1..hi] {
-            let (x, _) = as_interp(&field_value(d, sort_field)).ok_or(())?;
+            let (x, _) = as_interp(&field_value(d, sort_field)).ok_or(Fallback::Defer)?;
             let frac = (x - x0) / (x1 - x0);
             let y = y0 + (y1 - y0) * frac;
             let val = if is_date {
@@ -216,7 +221,7 @@ fn apply_linear(part: &mut [Document], field: &str, sort_field: &str) -> R<()> {
             } else {
                 Bson::Double(y)
             };
-            paths::set_path(d, field, val).map_err(|_| ())?;
+            paths::set_path(d, field, val).map_err(|_| Fallback::Defer)?;
         }
     }
     Ok(())

@@ -791,11 +791,29 @@ def _int_index(v: Any) -> Any:
     raises `_FractionalIndex` (the caller turns it into the operator's exact
     error code). Any other type is returned unchanged for the caller's own
     non-numeric handling. `bool` must be rejected by the caller first."""
+    # "Representable as a 32-bit integer" is the actual rule, so a WHOLE number
+    # outside int32 raises too -- `1e40` is 28691 on mongod, not an out-of-range
+    # index (measured 8.2.11, 2026-09-08).
+    if isinstance(v, Decimal128):
+        # mongod accepts a decimal index -- `{$arrayElemAt: [[10, 20], NumberDecimal("1")]}`
+        # is 20 -- and this returned the `Decimal128` unchanged, which the caller
+        # then read as "not an int" and answered null.
+        dec = v.to_decimal()
+        if dec != dec.to_integral_value() or not _fits_int32(dec):
+            raise _FractionalIndex
+        return int(dec)
     if isinstance(v, float):
-        if v.is_integer():
-            return int(v)
-        raise _FractionalIndex
+        if not v.is_integer() or not _fits_int32(v):
+            raise _FractionalIndex
+        return int(v)
     return v
+
+
+def _fits_int32(v: Any) -> bool:
+    try:
+        return -(2**31) <= int(v) <= 2**31 - 1
+    except (ValueError, OverflowError):
+        return False
 
 
 def _int_result(value: Any, *operands: Any) -> Any:
@@ -4183,17 +4201,27 @@ def _op_array_elem_at(arg: Any, ctx: _Ctx) -> Any:
     arr_expr, idx_expr = arg
     arr = _eval(arr_expr, ctx)
     idx = _eval(idx_expr, ctx)
-    if isinstance(idx, bool):
+    # NULL and a MISSING field really are null here, but every other non-numeric
+    # is mongod's 28690, naming the type -- measured across 13 BSON types on
+    # 8.2.11 (2026-09-08). Only `bool` used to be checked, so
+    # `{$arrayElemAt: [[1, 2], "x"]}` was a silent WRONG VALUE (null) rather than
+    # an error. `isinstance(True, int)` is why bool needs testing first.
+    if idx is not None and idx is not MISSING and not _is_numeric(idx):
         raise ExpressionError(
-            "$arrayElemAt's second argument must be a numeric value, but is bool",
+            "$arrayElemAt's second argument must be a numeric value, but is "
+            f"{_bson_type_name(idx)}",
             code=28690,
         )
     try:
         idx = _int_index(idx)
     except _FractionalIndex:
+        # A `Decimal128` renders the same way a double does here
+        # (`1.5`, `1e+40` -- measured 8.2.11), and `_fmt_double` cannot format
+        # one, so convert before rendering.
+        raw = float(idx.to_decimal()) if isinstance(idx, Decimal128) else idx
         raise ExpressionError(
             "$arrayElemAt's second argument must be representable as a 32-bit "
-            f"integer: {_fmt_double(idx)}",
+            f"integer: {_fmt_double(raw)}",
             code=28691,
         ) from None
     _reject_non_array(

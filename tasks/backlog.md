@@ -2182,39 +2182,35 @@ all still open. Probe: `scratchpad/readsweep.py` + `readsweep_lib.py`.
   improves 58 -> 38 different-code, 0 wrong values, no regressions. Pinned by
   `tests/test_rust_required_expression_args.py` and `scratchpad/reqfields.py`.
 
-- [ ] **OPEN: `$group` on the RUST server DISCARDS every mongod-named error and
-  answers the generic refusal (found 2026-09-07 while fixing the required-field
-  validation below).** `crates/secantus-core/src/group.rs` types its whole
-  module as `Result<T, ()>` — the error is thrown away at the boundary
-  (`expressions::evaluate(...).map_err(|_| ())`), so the command layer's
-  `fault.as_mongo()` check finds nothing to report and falls through to
-  `2 BadValue: aggregation pipeline uses a stage or operator not supported by
-  the Rust server`.
+- [x] **RESOLVED (2026-09-08): `$group` and friends DISCARDED every mongod-named
+  error; three neighbouring defects found with it.** `group.rs`, `fill.rs`,
+  `densify.rs` and `windowfields.rs` typed their errors as `Result<T, ()>`, so a
+  named error was thrown away at the module boundary
+  (`{$group: {_id: null, x: {$first: {$ln: 0}}}}` lost mongod's 28766) and the
+  client got the generic refusal.
 
-  This is NOT specific to the required-field work; it loses errors that were
-  already named correctly everywhere else:
+  **The site count in the previous version of this entry was misleading** -- 57
+  `Err(())` + 16 `ok_or(())` + 8 `map_err`, "each needing its own probe". It did
+  not: `Fallback::Defer` means exactly what the unit `()` meant, so all 81 sites
+  converted mechanically and only the BOUNDARIES needed thought. Another case of
+  a count read off the source overstating the work.
 
-      {$group: {_id: null, x: {$first: {$ln: 0}}}}
-        mongod  28766 Failed to optimize pipeline :: caused by ::
-                      $ln's argument must be a positive number ...
-        rust    2     aggregation pipeline uses a stage or operator not
-                      supported by the Rust server
+  Probing outward from it found three more, all measured on 8.2.11:
+  - **`$sortByCount` rejected every expression** -- an unconditional early match
+    arm answered 40147 for any document, shadowing a later arm 70 lines below
+    that already had mongod's three codes right.
+  - **`$arrayElemAt` answered `null` for a non-numeric index** (silent WRONG
+    VALUE, on BOTH servers): only `bool` was checked. 0 divergences of 19 index
+    shapes now, including `Decimal128` (was rejected) and the int32 range rule
+    (`1e40` is 28691, not a missing field).
+  - **`$divide` / `$mod` by zero deferred**, each with a comment citing what
+    "Python raises" -- the anti-pattern this file catalogues, and wrong here
+    because a defer has no Python behind it.
 
-      {$group: {_id: null, x: {$first: {$trim: {}}}}}
-        mongod  50695 $trim requires an 'input' field        (BARE — no wrapper)
-        rust    2     ...not supported by the Rust server
-
-  The same expressions report correctly through `$addFields` / `$project` /
-  `$set` (wrapped as `Invalid <stage> :: caused by ::`) and through `$match`'s
-  `$expr` (bare), so the gap is the `$group` path alone.
-
-  **Size is a COUNT, not an estimate** (and CLAUDE.md is right that counts read
-  off the source have misled before — re-derive it): `group.rs` is 1,898 lines
-  with 57 `Err(())`, 16 `ok_or(())` and 8 `map_err(|_| ())`. Changing
-  `type R<T> = Result<T, ()>` to carry `Fallback` makes the 8 `map_err` sites
-  disappear, but each of the other 73 has to decide what mongod actually says
-  there — which is the real work, and needs probing per site rather than a
-  mechanical substitution.
+  A parse error is reported BARE inside `$group` / `$expr` / `$redact` and
+  wrapped `Invalid $<stage>` in the projection-style stages; `Fallback::bare()`
+  carries that distinction. Pinned by
+  `tests/test_rust_pipeline_error_fidelity.py` (38 tests).
 
 - [x] **RESOLVED (2026-09-06): the descending sort that put every prefix chain
   in ascending order.** `sort({x: -1})` over `["", "a", "ab", "abc", "b"]` came

@@ -2047,12 +2047,6 @@ pub fn stage_spec_error(pipeline: &[Bson]) -> Option<(i32, String)> {
                 ))
             }
             "$group" => stage_group_problem(spec),
-            "$sortByCount" if matches!(spec, Bson::Document(_)) => Some((
-                40147,
-                "the sortByCount field must be defined as a $-prefixed path or an \
-                 expression inside an object"
-                    .to_string(),
-            )),
             "$geoNear" if matches!(spec, Bson::Document(d) if !d.contains_key("near")) => {
                 Some((5860400, "$geoNear requires a 'near' argument".to_string()))
             }

@@ -253,6 +253,7 @@ fn stamp_folded(fault: Fallback, arg: &Bson, ctx: &Ctx) -> Fallback {
             message,
             folded: None,
             exec,
+            bare,
         } => Fallback::Mongo {
             code,
             message,
@@ -261,6 +262,7 @@ fn stamp_folded(fault: Fallback, arg: &Bson, ctx: &Ctx) -> Fallback {
                 &ctx.vars.keys().cloned().collect::<Vec<_>>(),
             )),
             exec,
+            bare,
         },
         other => other,
     }
@@ -644,7 +646,7 @@ pub fn check_required_fields(op: &str, arg: &Bson) -> Result<(), Fallback> {
     if let Some((_, fields)) = REQUIRED_FIELDS.iter().find(|(name, _)| *name == op) {
         for (field, code, message) in *fields {
             if !d.contains_key(*field) {
-                return Err(Fallback::mongo(*code, *message));
+                return Err(Fallback::mongo(*code, *message).bare());
             }
         }
     }
@@ -657,7 +659,7 @@ pub fn check_required_fields(op: &str, arg: &Bson) -> Result<(), Fallback> {
             Some(_) => false,
         };
         if empty {
-            return Err(Fallback::mongo(*code, *message));
+            return Err(Fallback::mongo(*code, *message).bare());
         }
     }
     if matches!(op, "$dateAdd" | "$dateSubtract")
@@ -666,7 +668,8 @@ pub fn check_required_fields(op: &str, arg: &Bson) -> Result<(), Fallback> {
         return Err(Fallback::mongo(
             5166402,
             format!("{op} requires startDate, unit, and amount to be present"),
-        ));
+        )
+        .bare());
     }
     Ok(())
 }
@@ -1638,7 +1641,12 @@ fn op_divide(arg: &Bson, ctx: &Ctx) -> R {
         return Err(Fallback::Defer);
     };
     if b == 0.0 {
-        return Err(Fallback::Defer); // Python raises "can't $divide by zero" (code 2)
+        // mongod's own text and code, measured 8.2.11 (2026-09-08). This used to
+        // DEFER, justified by a comment citing what "Python raises" -- and a
+        // defer has no Python behind it on this server, so dividing by zero
+        // answered "the Rust server does not support this operator", blaming
+        // `$divide` for a bad operand.
+        return Err(Fallback::mongo(2, "can't $divide by zero"));
     }
     Ok(Bson::Double(a / b)) // Python `/` is always float division
 }
@@ -1660,13 +1668,17 @@ fn op_mod(arg: &Bson, ctx: &Ctx) -> R {
     // is why this needs no sign fixup. Probed 8.2.11.
     if let (Some(a), Some(b)) = (as_int_like(&vals[0]), as_int_like(&vals[1])) {
         if b == 0 {
-            return Err(Fallback::Defer); // Python raises "can't $mod by zero" (16610)
+            // mongod's own text and code, measured 8.2.11. Same defer-cited-by-
+            // the-other-engine shape as `$divide` above.
+            return Err(Fallback::mongo(16610, "can't $mod by zero"));
         }
         return Ok(int_result(a % b, is_int64(&vals[0]) || is_int64(&vals[1])));
     }
     if let (Some(a), Some(b)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) {
         if b == 0.0 {
-            return Err(Fallback::Defer); // Python raises "can't $mod by zero" (16610)
+            // mongod's own text and code, measured 8.2.11. Same defer-cited-by-
+            // the-other-engine shape as `$divide` above.
+            return Err(Fallback::mongo(16610, "can't $mod by zero"));
         }
         return Ok(Bson::Double(a % b));
     }
@@ -1700,13 +1712,63 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
     }
     let arr = eval(&pair[0], ctx)?;
     let idx = eval(&pair[1], ctx)?;
-    if matches!(idx, Bson::Boolean(_)) {
-        return Err(Fallback::mongo(
-            28690,
-            "$arrayElemAt's second argument must be a numeric value, but is bool",
-        ));
-    }
-    let i = match coerce_index(&idx) {
+    // `coerce_index` is shared with `$slice` / `$substr`, whose rules were
+    // measured separately, so `$arrayElemAt`'s two extra rules live here:
+    // a DECIMAL index is accepted (`NumberDecimal("1")` is element 1), and
+    // "representable as a 32-bit integer" is enforced, so a WHOLE number outside
+    // int32 is 28691 rather than an out-of-range index. Both measured on 8.2.11
+    // (2026-09-08); `1e40` used to come back as a missing field.
+    let not_32bit_decimal = |v: &Bson| {
+        let rendered = match v {
+            Bson::Decimal128(d) => d
+                .to_string()
+                .parse::<f64>()
+                .map(format_double_g)
+                .unwrap_or_else(|_| d.to_string()),
+            other => format_double_g(as_float_like(other).unwrap_or(f64::NAN)),
+        };
+        Fallback::mongo(
+            28691,
+            format!(
+                "$arrayElemAt's second argument must be representable as a \
+                 32-bit integer: {rendered}"
+            ),
+        )
+    };
+    let not_32bit = |v: &Bson| {
+        Fallback::mongo(
+            28691,
+            format!(
+                "$arrayElemAt's second argument must be representable as a \
+                 32-bit integer: {}",
+                format_double_g(as_float_like(v).unwrap_or(f64::NAN))
+            ),
+        )
+    };
+    // `as_float_like` does not cover `Decimal128`, so it answered NaN and every
+    // decimal took the error path. Rendering to text and parsing is how the rest
+    // of this module reads a decimal as a float.
+    let decimal_as_f64 = |d: &bson::Decimal128| d.to_string().parse::<f64>().ok();
+    let decimal_index = match &idx {
+        Bson::Decimal128(d) => match decimal_as_f64(d) {
+            Some(f)
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && (i32::MIN as f64..=i32::MAX as f64).contains(&f) =>
+            {
+                Some(f as i64)
+            }
+            _ => return Err(not_32bit_decimal(&idx)),
+        },
+        _ => None,
+    };
+    let i = match decimal_index
+        .map(IdxCoerce::Int)
+        .unwrap_or_else(|| coerce_index(&idx))
+    {
+        IdxCoerce::Int(i) if !(i32::MIN as i64..=i32::MAX as i64).contains(&i) => {
+            return Err(not_32bit(&idx));
+        }
         IdxCoerce::Int(i) => i as i128,
         IdxCoerce::Fractional => {
             return Err(Fallback::mongo(
@@ -1718,7 +1780,24 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
                 ),
             ));
         }
-        IdxCoerce::NotNumber => return Ok(Bson::Null),
+        IdxCoerce::NotNumber => {
+            // NULL and a MISSING field really are null here, but every other
+            // non-numeric is mongod's 28690, naming the type -- measured across
+            // 13 BSON types on 8.2.11 (2026-09-08). This arm used to answer
+            // `null` for all of them, so `{$arrayElemAt: [[1, 2], "x"]}` was a
+            // silent WRONG VALUE rather than an error. `bool` had its own check
+            // above, which is why only that one type behaved.
+            if matches!(idx, Bson::Null | Bson::Undefined) {
+                return Ok(Bson::Null);
+            }
+            return Err(Fallback::mongo(
+                28690,
+                format!(
+                    "$arrayElemAt's second argument must be a numeric value, but is {}",
+                    crate::query::bson_type_name(&idx)
+                ),
+            ));
+        }
     };
     let a = match &arr {
         Bson::Array(a) => a,

@@ -22,11 +22,16 @@ use std::collections::{HashMap, HashSet};
 
 use bson::{Bson, Document};
 
+use crate::fallback::Fallback;
 use crate::group::{gkey, GKey};
 use crate::numeric::{self, int_to_bson, NumVal};
 use crate::paths;
 
-type R<T> = Result<T, ()>;
+/// Carries `Fallback` rather than `()` so an error the expression engine NAMED
+/// survives to the client instead of being flattened into the generic
+/// "not supported by the Rust server". `Fallback::Defer` is the same
+/// "cannot reproduce this" signal the unit `()` used to be.
+type R<T> = Result<T, Fallback>;
 
 /// Defensive cap so a pathological "full"-bounds range can't OOM / hang the
 /// extension; we defer to Python rather than emit more than this.
@@ -86,37 +91,37 @@ fn canon_to_bson(n: Num) -> R<Bson> {
         other => other,
     };
     match n {
-        Num::Int(i) => int_to_bson(i).ok_or(()),
+        Num::Int(i) => int_to_bson(i).ok_or(Fallback::Defer),
         Num::Float(f) => Ok(Bson::Double(f)),
     }
 }
 
 pub fn densify_stage(spec: &Bson, docs: &[Document]) -> R<Vec<Document>> {
     let Bson::Document(s) = spec else {
-        return Err(());
+        return Err(Fallback::Defer);
     };
     let Some(Bson::String(field)) = s.get("field") else {
-        return Err(());
+        return Err(Fallback::Defer);
     };
     let Some(Bson::Document(range_spec)) = s.get("range") else {
-        return Err(());
+        return Err(Fallback::Defer);
     };
     // `unit` present (and not null) -> date densify -> defer.
     if range_spec
         .get("unit")
         .is_some_and(|u| !matches!(u, Bson::Null))
     {
-        return Err(());
+        return Err(Fallback::Defer);
     }
     // A bool step is "wrong type" (Python raises 14) — don't let num_of coerce it.
     if matches!(range_spec.get("step"), Some(Bson::Boolean(_))) {
-        return Err(());
+        return Err(Fallback::Defer);
     }
     let Some(step) = range_spec.get("step").and_then(num_of) else {
-        return Err(());
+        return Err(Fallback::Defer);
     };
     if cmp(step, Num::Int(0)) != Some(Ordering::Greater) {
-        return Err(()); // step must be > 0 (Python raises 5733401)
+        return Err(Fallback::Defer); // step must be > 0 (Python raises 5733401)
     }
 
     // bounds: the string "full"/"partition", or a strictly-ascending two-element
@@ -126,26 +131,26 @@ pub fn densify_stage(spec: &Bson, docs: &[Document]) -> R<Vec<Document>> {
         Some(Bson::String(s)) if s == "full" || s == "partition" => None,
         Some(Bson::Array(a)) if a.len() == 2 => {
             if a.iter().any(|b| matches!(b, Bson::Boolean(_))) {
-                return Err(()); // bool bounds element -> Python 5733402
+                return Err(Fallback::Defer); // bool bounds element -> Python 5733402
             }
             match (num_of(&a[0]), num_of(&a[1])) {
                 (Some(lo), Some(hi)) => {
                     if cmp(lo, hi) != Some(Ordering::Less) {
-                        return Err(()); // not strictly ascending -> Python 5733402
+                        return Err(Fallback::Defer); // not strictly ascending -> Python 5733402
                     }
                     Some((lo, hi))
                 }
-                _ => return Err(()), // non-numeric (date/other) bounds -> Python
+                _ => return Err(Fallback::Defer), // non-numeric (date/other) bounds -> Python
             }
         }
-        _ => return Err(()), // bad string / wrong-length array / other type -> Python
+        _ => return Err(Fallback::Defer), // bad string / wrong-length array / other type -> Python
     };
 
     // 1M filler cap on explicit numeric bounds (Python raises -> defer).
     if let Some((lo, hi)) = bounds_pair {
         let stepf = to_f64(step);
         if stepf != 0.0 && (to_f64(hi) - to_f64(lo)) / stepf > MAX_FILLERS as f64 {
-            return Err(());
+            return Err(Fallback::Defer);
         }
     }
 
@@ -156,12 +161,12 @@ pub fn densify_stage(spec: &Bson, docs: &[Document]) -> R<Vec<Document>> {
             for x in a {
                 match x {
                     Bson::String(f) => v.push(f.as_str()),
-                    _ => return Err(()),
+                    _ => return Err(Fallback::Defer),
                 }
             }
             v
         }
-        Some(_) => return Err(()),
+        Some(_) => return Err(Fallback::Defer),
     };
 
     // Partition the docs (insertion-ordered), keyed like Python's dict.
@@ -209,7 +214,7 @@ pub fn densify_stage(spec: &Bson, docs: &[Document]) -> R<Vec<Document>> {
                 None | Some(Bson::Null) => out.push((*d).clone()),
                 Some(v) => match num_of(v) {
                     Some(num) => keyed.push((num, d)),
-                    None => return Err(()), // non-numeric/date -> Python raises 5733201
+                    None => return Err(Fallback::Defer), // non-numeric/date -> Python raises 5733201
                 },
             }
         }
@@ -238,7 +243,7 @@ fn partition_key(doc: &Document, fields: &[&str]) -> R<Vec<GKey>> {
     let mut key = Vec::with_capacity(fields.len());
     for f in fields {
         let v = paths::get_path(doc, f).cloned().unwrap_or(Bson::Null);
-        key.push(gkey(&v).map_err(|_| ())?);
+        key.push(gkey(&v).map_err(|_| Fallback::Defer)?);
     }
     Ok(key)
 }
@@ -248,7 +253,7 @@ fn fill_range(field: &str, lo: Num, hi: Num, step: Num, carry: &Document) -> R<V
     let mut cursor = lo;
     while cmp(cursor, hi) == Some(Ordering::Less) {
         if out.len() >= MAX_FILLERS {
-            return Err(());
+            return Err(Fallback::Defer);
         }
         let mut filler = carry.clone();
         filler.insert(field.to_string(), canon_to_bson(cursor)?);
@@ -273,7 +278,7 @@ fn densify_partition(
     let mut next = iter.next();
     while cmp(cursor, hi) == Some(Ordering::Less) {
         if out.len() >= MAX_FILLERS {
-            return Err(());
+            return Err(Fallback::Defer);
         }
         if let Some((nval, ndoc)) = next {
             if numeric::eq(&numval(*nval), &numval(cursor)) {
