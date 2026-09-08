@@ -248,9 +248,17 @@ impl PgHandler {
     fn install_user_types(&self) {
         let mut types = self.enums().unwrap_or_default();
         // Composites resolve by name too; they have no labels, so an empty
-        // label list stands in.
-        for (name, oid, _) in self.composites().unwrap_or_default() {
-            types.push((name, oid, Vec::new()));
+        // label list stands in. A `public` composite resolves by its bare name
+        // (public is on the default search_path); a schema-qualified one
+        // resolves only as `schema.name`, so `to_regtype('testschema.t')` finds
+        // it while `to_regtype('t')` does not (matching PostgreSQL).
+        for (schema, name, oid, _) in self.composites_with_schema().unwrap_or_default() {
+            let resolution = if schema == "public" {
+                name
+            } else {
+                format!("{schema}.{name}")
+            };
+            types.push((resolution, oid, Vec::new()));
         }
         secantus_pgplan::set_user_types(types);
         // Custom ranges resolve their subtype at cast time and their oid for
@@ -753,6 +761,48 @@ impl PgHandler {
                 })
                 .unwrap_or_default();
             out.push((name, oid, fields));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Every composite as `(schema, bare_name, oid, fields)`. `schema` defaults
+    /// to `public` for a composite stored before schema qualification (no
+    /// `schema` field), so the bare-name resolution is unchanged for those.
+    /// `pg_type.typname` and `pg_attribute` still use the BARE name; only
+    /// duplicate-checking and `to_regtype` resolution consult the schema.
+    fn composites_with_schema(&self) -> PgWireResult<Vec<(String, String, i64, CompositeFields)>> {
+        let raw = self
+            .storage
+            .find_matching(&self.db, Self::COMPOSITE_COLLECTION, &Document::new())
+            .map_err(|e| Self::storage_err("could not read the composite catalog", e))?;
+        let mut out = Vec::new();
+        for bytes in raw {
+            let d: Document = bson::from_slice(&bytes)
+                .map_err(|e| Self::storage_err("could not decode a composite", e))?;
+            let name = d.get_str("composite").unwrap_or_default().to_string();
+            let schema = d.get_str("schema").unwrap_or("public").to_string();
+            let oid = d
+                .get_i64("oid")
+                .or_else(|_| d.get_i32("oid").map(i64::from))
+                .unwrap_or(0);
+            let fields = d
+                .get_array("fields")
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|f| match f {
+                            Bson::Array(pair) => {
+                                let n = pair.first()?.as_str()?.to_string();
+                                let t = pair.get(1)?.as_str()?.to_string();
+                                Some((n, t))
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push((schema, name, oid, fields));
         }
         out.sort();
         Ok(out)
@@ -2822,12 +2872,27 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("DROP SCHEMA"))])
             }
 
-            Statement::CreateComposite { name, fields } => {
-                // Same shape as CREATE TYPE AS ENUM: a duplicate name (against
-                // composites, enums and builtins) is 42710.
-                let taken = self.composites()?.iter().any(|(n, _, _)| *n == name)
-                    || self.enums()?.iter().any(|(n, _, _)| *n == name)
-                    || secantus_pgplan::pgtypes::oid_of_name(&name).is_some();
+            Statement::CreateComposite {
+                name,
+                schema,
+                fields,
+            } => {
+                // A schema-qualified name (`CREATE TYPE s.t`) is a distinct type
+                // from a bare `t`; unqualified lands in `public`. A duplicate is
+                // 42710, checked per (schema, name): a composite collides only
+                // with another composite in the same schema, and an unqualified
+                // name additionally collides with an enum or builtin (those live
+                // in the default search_path).
+                let schema_name = schema.clone().unwrap_or_else(|| "public".to_string());
+                let composite_dup = self
+                    .composites_with_schema()?
+                    .iter()
+                    .any(|(s, n, _, _)| *s == schema_name && *n == name);
+                let unqualified = schema.is_none();
+                let taken = composite_dup
+                    || (unqualified
+                        && (self.enums()?.iter().any(|(n, _, _)| *n == name)
+                            || secantus_pgplan::pgtypes::oid_of_name(&name).is_some()));
                 if taken {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -2849,9 +2914,18 @@ impl PgHandler {
                         ])
                     })
                     .collect();
+                // `_id` is keyed on (schema, name) so a bare `t` and a
+                // `schema.t` do not collide; `composite` stays the BARE name
+                // (pg_type.typname is unqualified, as in PostgreSQL).
+                let id_key = if unqualified {
+                    name.clone()
+                } else {
+                    format!("{schema_name}.{name}")
+                };
                 let doc = bson::doc! {
-                    "_id": &name,
+                    "_id": &id_key,
                     "composite": &name,
+                    "schema": &schema_name,
                     "fields": field_docs,
                     "oid": oid,
                 };
