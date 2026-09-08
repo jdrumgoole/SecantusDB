@@ -3360,6 +3360,82 @@ def test_composite_info_fetch(home: Path) -> None:
         assert list(base.field_types) == []
 
 
+def test_composite_binary_result(home: Path) -> None:
+    """A composite result column in a BINARY cursor comes back typed.
+
+    psycopg's binary composite loader reads the record wire format -- an int32
+    field count, then per field an int32 oid, an int32 length and the bytes --
+    and decodes each field by its declared oid. A text cursor renders `(...)`;
+    a binary one must send the same values byte-for-byte as PostgreSQL, so the
+    float field arrives a float and not the string a text record would carry.
+    """
+    from psycopg.types.composite import CompositeInfo, register_composite
+
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create type bc as (foo text, bar int8, baz float8)")
+        info = CompositeInfo.fetch(conn, "bc")
+        register_composite(info, conn)
+
+        cur = conn.cursor(binary=True)
+        res = cur.execute("select row('hi', 10, 20)::bc").fetchone()[0]
+        assert res.foo == "hi"
+        assert res.bar == 10
+        assert res.baz == 20.0
+        assert isinstance(res.baz, float)
+
+
+def test_composite_array_load_text_and_binary(home: Path) -> None:
+    """`array[<composite>]` reports the composite's ARRAY oid, so the client
+    parses it as a one-element array of composites rather than a bare string.
+
+    Before the fix the column was described as varchar, so the array text
+    `{"(hi,10,30)"}` was handed back as a 17-character string. Both wire formats
+    now round-trip the array, in a text cursor and a binary one.
+    """
+    from psycopg.types.composite import CompositeInfo, register_composite
+
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create type bc2 as (foo text, bar int8, baz float8)")
+        info = CompositeInfo.fetch(conn, "bc2")
+        register_composite(info, conn)
+
+        for binary in (False, True):
+            cur = conn.cursor(binary=binary)
+            res = cur.execute("select array[row('hi', 10, 30)::bc2]").fetchone()[0]
+            assert len(res) == 1
+            assert res[0].foo == "hi"
+            assert res[0].baz == 30.0
+            assert isinstance(res[0].baz, float)
+
+
+def test_composite_recursive_load(home: Path) -> None:
+    """A composite whose field is itself a composite round-trips, scalar and in
+    an array, in both wire formats -- the nested field is encoded as its own
+    record (binary) or quoted `(...)` text (text)."""
+    from psycopg.types.composite import CompositeInfo, register_composite
+
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create type rc_inner as (foo text, bar int8, baz float8)")
+        conn.execute("create type rc_outer as (qux int8, quux rc_inner)")
+        register_composite(CompositeInfo.fetch(conn, "rc_inner"), conn)
+        register_composite(CompositeInfo.fetch(conn, "rc_outer"), conn)
+
+        for binary in (False, True):
+            cur = conn.cursor(binary=binary)
+            res = cur.execute("select row(42, row('hi', 10, 20)::rc_inner)::rc_outer").fetchone()[0]
+            assert res.qux == 42
+            assert res.quux.foo == "hi"
+            assert res.quux.baz == 20.0
+            assert isinstance(res.quux.baz, float)
+
+            res = cur.execute(
+                "select array[row(42, row('hi', 10, 30)::rc_inner)::rc_outer]"
+            ).fetchone()[0]
+            assert len(res) == 1
+            assert res[0].quux.baz == 30.0
+            assert isinstance(res[0].quux.baz, float)
+
+
 def test_schema_qualified_composite_is_distinct(home: Path) -> None:
     """`create type s.t` is a DISTINCT type from a bare `t`.
 
