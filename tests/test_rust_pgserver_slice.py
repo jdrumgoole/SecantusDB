@@ -55,23 +55,37 @@ class _Server:
         self.proc: subprocess.Popen[str] | None = None
 
     def __enter__(self) -> _Server:
-        self.proc = subprocess.Popen(
-            [str(BINARY), str(self.home), f"127.0.0.1:{self.port}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            if self.proc.poll() is not None:
-                out = self.proc.stdout.read() if self.proc.stdout else ""
-                raise RuntimeError(f"secantusd-pg exited: {out}")
-            try:
-                with socket.create_connection(("127.0.0.1", self.port), timeout=0.25):
-                    return self
-            except OSError:
-                time.sleep(0.05)
-        raise RuntimeError("secantusd-pg did not start")
+        # `_free_port()` reports a port the OS *had* free, but closes its probe
+        # socket before the child binds -- so under `-n auto` a parallel worker
+        # can claim the same port in the gap, and the child then exits with
+        # "address already in use". That is the ONLY early exit worth retrying
+        # (with a fresh port); any other early exit is a genuine startup crash
+        # and must surface, not be masked. See the port-race note in CLAUDE.md.
+        last_out = ""
+        for _ in range(5):
+            self.proc = subprocess.Popen(
+                [str(BINARY), str(self.home), f"127.0.0.1:{self.port}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if self.proc.poll() is not None:
+                    last_out = self.proc.stdout.read() if self.proc.stdout else ""
+                    break
+                try:
+                    with socket.create_connection(("127.0.0.1", self.port), timeout=0.25):
+                        return self
+                except OSError:
+                    time.sleep(0.05)
+            else:
+                raise RuntimeError("secantusd-pg did not start")
+            if "address" in last_out.lower() and "use" in last_out.lower():
+                self.port = _free_port()
+                continue
+            raise RuntimeError(f"secantusd-pg exited: {last_out}")
+        raise RuntimeError(f"secantusd-pg could not bind a free port: {last_out}")
 
     def __exit__(self, *exc: object) -> None:
         if self.proc is not None:
