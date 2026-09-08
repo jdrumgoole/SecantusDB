@@ -1282,7 +1282,7 @@ Specific items that were left out of the slice that introduced their feature are
   clock-dependent input keywords `now` / `today` / `tomorrow` / `yesterday`
   (only the constant `epoch` is).
 
-- [ ] **PARTIAL — RUST pgserver column metadata (`typmod` / `typlen`): landed
+- [ ] **OPEN — RUST pgserver column metadata (`typmod` / `typlen`): landed
   for constant SELECTs, deferred for table columns and computed expressions
   (measured 2026-09-08 against PostgreSQL 16, PR for `pgserver-column`).** The
   `RowDescription` now sends a real per-type `typlen` (`type_size`) for every
