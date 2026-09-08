@@ -74,6 +74,17 @@ pub struct PgHandler {
     /// Tables created (`Some`) or dropped (`None`) in the open transaction and
     /// not yet committed. Cleared when the transaction ends, whichever way.
     uncommitted: Mutex<HashMap<String, Option<TableDef>>>,
+    /// User TYPES created or dropped in the open transaction but not yet
+    /// committed -- the type analogue of `uncommitted`. Planning reads the
+    /// type catalog (`to_regtype`, a column's declared type), and an
+    /// uncommitted `CREATE TYPE` is invisible to a plain read, so
+    /// `CREATE TYPE t ...; SELECT 't'::regtype` in one transaction failed.
+    /// Wrapping the catalog read in `with_user_transaction` deadlocks COPY
+    /// (see `plan_with_session_types`), so this mirrors tables: an overlay
+    /// consulted on top of the committed catalog, cleared when the
+    /// transaction ends and snapshotted by savepoints. Keyed by the catalog
+    /// collection and the doc's `_id`; a `None` value is a drop tombstone.
+    uncommitted_types: Mutex<UncommittedTypes>,
     /// Whether a transaction is open, as a LOCK-FREE flag.
     ///
     /// `txn` cannot answer this from inside `execute`: `run` holds that mutex
@@ -111,6 +122,11 @@ pub struct PgHandler {
     savepoints: Mutex<Vec<Savepoint>>,
 }
 
+/// A user type created (`Some(doc)`) or dropped (`None`) in the open
+/// transaction, overlaid on the committed catalog. Keyed by
+/// `(catalog collection, doc _id)`.
+type UncommittedTypes = HashMap<(&'static str, String), Option<Document>>;
+
 /// One open savepoint and the table contents it can put back.
 struct Savepoint {
     name: String,
@@ -120,6 +136,9 @@ struct Savepoint {
     /// The uncommitted-DDL map as it was, so a table created after this
     /// savepoint stops being visible when it is rolled back.
     uncommitted: HashMap<String, Option<TableDef>>,
+    /// The uncommitted-TYPE overlay as it was, so a type created after this
+    /// savepoint stops being visible when it is rolled back.
+    uncommitted_types: UncommittedTypes,
 }
 
 /// A declared cursor's materialised result.
@@ -161,6 +180,7 @@ impl PgHandler {
             copy_in: Mutex::new(None),
             cursors: Mutex::new(HashMap::new()),
             uncommitted: Mutex::new(HashMap::new()),
+            uncommitted_types: Mutex::new(HashMap::new()),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             binary_results: std::sync::atomic::AtomicBool::new(false),
             txn_failed: std::sync::atomic::AtomicBool::new(false),
@@ -726,19 +746,71 @@ impl PgHandler {
         Ok(())
     }
 
+    /// Every doc in one type-catalog collection, with this transaction's
+    /// uncommitted creates/drops overlaid on the committed rows. Keyed by
+    /// `_id`, so an uncommitted create shadows (and a tombstone hides) the
+    /// committed row of the same name. This is what makes `CREATE TYPE t;
+    /// SELECT 't'::regtype` in one transaction resolve `t`, since planning
+    /// reads the catalog OUTSIDE the transaction and a plain read misses the
+    /// uncommitted write.
+    fn type_catalog_docs(&self, collection: &'static str) -> PgWireResult<Vec<Document>> {
+        let raw = self
+            .storage
+            .find_matching(&self.db, collection, &Document::new())
+            .map_err(|e| Self::storage_err("could not read the type catalog", e))?;
+        let mut by_id: std::collections::BTreeMap<String, Document> =
+            std::collections::BTreeMap::new();
+        for bytes in raw {
+            let d: Document = bson::from_slice(&bytes)
+                .map_err(|e| Self::storage_err("could not decode a type", e))?;
+            let id = d.get_str("_id").unwrap_or_default().to_string();
+            by_id.insert(id, d);
+        }
+        let overlay = self
+            .uncommitted_types
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for ((coll, id), doc) in overlay.iter() {
+            if *coll != collection {
+                continue;
+            }
+            match doc {
+                Some(d) => {
+                    by_id.insert(id.clone(), d.clone());
+                }
+                None => {
+                    by_id.remove(id);
+                }
+            }
+        }
+        Ok(by_id.into_values().collect())
+    }
+
+    /// Record that the open transaction created (`Some(doc)`) or dropped
+    /// (`None`) a user type in `collection`, so later statements in the SAME
+    /// transaction see it before it is committed. A no-op outside a
+    /// transaction: an autocommit statement's write is committed at once and
+    /// a plain read already finds it.
+    fn note_uncommitted_type(&self, collection: &'static str, id: &str, doc: Option<Document>) {
+        if !self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        self.uncommitted_types
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((collection, id.to_string()), doc);
+    }
+
     /// Every composite type: `(name, oid, [(field, type_name)])`, name-sorted.
     /// The Python server's `__sql_composites__` shape: a doc `{composite, oid,
     /// fields: [[name, tag, sub], ...]}`, where `tag` is the field's SQL type
     /// name and `sub` is a nested composite's fields (unused here).
     fn composites(&self) -> PgWireResult<Vec<(String, i64, CompositeFields)>> {
-        let raw = self
-            .storage
-            .find_matching(&self.db, Self::COMPOSITE_COLLECTION, &Document::new())
-            .map_err(|e| Self::storage_err("could not read the composite catalog", e))?;
         let mut out = Vec::new();
-        for bytes in raw {
-            let d: Document = bson::from_slice(&bytes)
-                .map_err(|e| Self::storage_err("could not decode a composite", e))?;
+        for d in self.type_catalog_docs(Self::COMPOSITE_COLLECTION)? {
             let name = d.get_str("composite").unwrap_or_default().to_string();
             let oid = d
                 .get_i64("oid")
@@ -772,14 +844,8 @@ impl PgHandler {
     /// `pg_type.typname` and `pg_attribute` still use the BARE name; only
     /// duplicate-checking and `to_regtype` resolution consult the schema.
     fn composites_with_schema(&self) -> PgWireResult<Vec<(String, String, i64, CompositeFields)>> {
-        let raw = self
-            .storage
-            .find_matching(&self.db, Self::COMPOSITE_COLLECTION, &Document::new())
-            .map_err(|e| Self::storage_err("could not read the composite catalog", e))?;
         let mut out = Vec::new();
-        for bytes in raw {
-            let d: Document = bson::from_slice(&bytes)
-                .map_err(|e| Self::storage_err("could not decode a composite", e))?;
+        for d in self.type_catalog_docs(Self::COMPOSITE_COLLECTION)? {
             let name = d.get_str("composite").unwrap_or_default().to_string();
             let schema = d.get_str("schema").unwrap_or("public").to_string();
             let oid = d
@@ -811,14 +877,8 @@ impl PgHandler {
     /// The `__sql_ranges__` catalog: a doc `{range, oid, subtype}` per custom
     /// range type. `subtype` is the element type name (e.g. `int4`).
     fn ranges(&self) -> PgWireResult<Vec<(String, i64, String)>> {
-        let raw = self
-            .storage
-            .find_matching(&self.db, Self::RANGE_COLLECTION, &Document::new())
-            .map_err(|e| Self::storage_err("could not read the range catalog", e))?;
         let mut out = Vec::new();
-        for bytes in raw {
-            let d: Document = bson::from_slice(&bytes)
-                .map_err(|e| Self::storage_err("could not decode a range", e))?;
+        for d in self.type_catalog_docs(Self::RANGE_COLLECTION)? {
             let name = d.get_str("range").unwrap_or_default().to_string();
             let oid = d
                 .get_i64("oid")
@@ -915,14 +975,8 @@ impl PgHandler {
 
     /// Every enum type: `(name, oid, labels)`, name-sorted for stable output.
     fn enums(&self) -> PgWireResult<Vec<(String, i64, Vec<String>)>> {
-        let raw = self
-            .storage
-            .find_matching(&self.db, Self::ENUM_COLLECTION, &Document::new())
-            .map_err(|e| Self::storage_err("could not read the enum catalog", e))?;
         let mut out = Vec::new();
-        for bytes in raw {
-            let d: Document = bson::from_slice(&bytes)
-                .map_err(|e| Self::storage_err("could not decode an enum", e))?;
+        for d in self.type_catalog_docs(Self::ENUM_COLLECTION)? {
             let name = d.get_str("enum").unwrap_or_default().to_string();
             let oid = d
                 .get_i64("oid")
@@ -1933,6 +1987,18 @@ impl PgHandler {
                 v.push(CATALOG_COLLECTION.to_string());
                 v
             }
+            // CREATE/DROP TYPE writes a type-catalog row; a `ROLLBACK TO`
+            // before it has to put that catalog back, exactly as a table's
+            // does. The overlay hides the type from planning; the pre-image
+            // is what stops a later COMMIT from resurrecting it.
+            Statement::CreateComposite { .. } => vec![Self::COMPOSITE_COLLECTION.to_string()],
+            Statement::CreateEnum { .. } => vec![Self::ENUM_COLLECTION.to_string()],
+            Statement::CreateRange { .. } => vec![Self::RANGE_COLLECTION.to_string()],
+            Statement::DropType { .. } => vec![
+                Self::ENUM_COLLECTION.to_string(),
+                Self::COMPOSITE_COLLECTION.to_string(),
+                Self::RANGE_COLLECTION.to_string(),
+            ],
             _ => Vec::new(),
         };
         out.sort();
@@ -2113,6 +2179,10 @@ impl PgHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.uncommitted_types
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.in_transaction
             .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -2134,6 +2204,10 @@ impl PgHandler {
         self.txn_failed
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.uncommitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.uncommitted_types
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -2422,6 +2496,11 @@ impl PgHandler {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
+                let uncommitted_types = self
+                    .uncommitted_types
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 self.savepoints
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -2429,6 +2508,7 @@ impl PgHandler {
                         name,
                         tables: HashMap::new(),
                         uncommitted,
+                        uncommitted_types,
                     });
                 Ok(vec![Response::Execution(Tag::new("SAVEPOINT"))])
             }
@@ -2454,10 +2534,11 @@ impl PgHandler {
                 // Restore from the OLDEST capture of each table among this
                 // savepoint and the ones nested inside it: that is the state at
                 // the named savepoint, whichever frame happened to capture it.
-                let (restore, uncommitted) = {
+                let (restore, uncommitted, uncommitted_types) = {
                     let mut savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
                     let idx = index(&savepoints).ok_or_else(missing)?;
                     let uncommitted = savepoints[idx].uncommitted.clone();
+                    let uncommitted_types = savepoints[idx].uncommitted_types.clone();
                     let dropped: Vec<Savepoint> = savepoints.split_off(idx + 1);
                     let mut restore: HashMap<String, Option<Vec<Vec<u8>>>> =
                         savepoints[idx].tables.clone();
@@ -2469,7 +2550,7 @@ impl PgHandler {
                     // The savepoint itself stays open, and starts capturing
                     // again from the state just restored.
                     savepoints[idx].tables.clear();
-                    (restore, uncommitted)
+                    (restore, uncommitted, uncommitted_types)
                 };
                 self.in_open_transaction(|| {
                     for (table, docs) in &restore {
@@ -2478,6 +2559,10 @@ impl PgHandler {
                     Ok(())
                 })?;
                 *self.uncommitted.lock().unwrap_or_else(|e| e.into_inner()) = uncommitted;
+                *self
+                    .uncommitted_types
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = uncommitted_types;
                 // Rolling back to a savepoint UN-POISONS the block: PostgreSQL
                 // lets the session carry on from there, which is the whole
                 // point of the nested-block pattern that uses it.
@@ -2498,6 +2583,10 @@ impl PgHandler {
         // discarded once it ends, so the pending map stops being the truth.
         if !opens {
             self.uncommitted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            self.uncommitted_types
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
@@ -2934,6 +3023,7 @@ impl PgHandler {
                 self.storage
                     .insert(&self.db, Self::COMPOSITE_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the type", e))?;
+                self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, &id_key, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
             }
 
@@ -2962,6 +3052,7 @@ impl PgHandler {
                 self.storage
                     .insert(&self.db, Self::RANGE_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the type", e))?;
+                self.note_uncommitted_type(Self::RANGE_COLLECTION, &name, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
             }
 
@@ -2992,6 +3083,7 @@ impl PgHandler {
                 self.storage
                     .insert(&self.db, Self::ENUM_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the type", e))?;
+                self.note_uncommitted_type(Self::ENUM_COLLECTION, &name, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
             }
 
@@ -3034,6 +3126,21 @@ impl PgHandler {
                             None,
                         )
                         .map_err(|e| Self::storage_err("could not drop the type", e))?;
+                    // Hide the dropped type from later statements in this same
+                    // transaction: the deletes above landed in the transaction
+                    // session, but planning reads the catalog OUTSIDE it and
+                    // would still find a committed row. A tombstone per
+                    // collection that had a row removed does for DROP what the
+                    // create notes do for CREATE.
+                    if from_enum > 0 {
+                        self.note_uncommitted_type(Self::ENUM_COLLECTION, name, None);
+                    }
+                    if from_comp > 0 {
+                        self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, name, None);
+                    }
+                    if from_range > 0 {
+                        self.note_uncommitted_type(Self::RANGE_COLLECTION, name, None);
+                    }
                     let removed = from_enum + from_comp + from_range;
                     if removed == 0 && !if_exists {
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
