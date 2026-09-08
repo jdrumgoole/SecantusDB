@@ -4912,13 +4912,37 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `"schema"."name"` forms, and DROP is schema-aware — so psycopg's session-
   scoped `testcomp` fixture (which creates `testschema.testcomp` beside
   `testcomp`) no longer cascades and `test_fetch_info` / `test_fetch_info_async`
-  pass. What remains is registering and round-tripping a composite VALUE:
-  encoding/decoding a `ROW(...)`-shaped composite datum on the wire so
-  `register_composite`'s dumper and loader work end-to-end (this is the bulk of
-  the ~54 still-failing composite tests — `test_dump_*` / `test_load_*`). Scope
-  that from a probe (psycopg `register_composite` + an insert/select of a
-  composite column) before starting. NOTE the schema-qualified TypeInfo tests
-  additionally need in-transaction DDL visibility (separate backlog item above).
+  pass. **The scalar composite VALUE round-trip now SHIPPED (2026-09-08):** a
+  `'(1,x)'::testcomp` text cast and a `row(1,'x')::testcomp` record cast both
+  parse into a composite (record-shaped) value whose result column carries the
+  composite's own oid, so `register_composite`'s loader fires; a composite param
+  cast on the wire (`%s::testcomp`) and INSERT/SELECT through a composite column
+  round-trip; field escaping (NULL / empty / comma / quote / backslash / parens /
+  whitespace, all 255 chars) matches the oracle at zero divergences; and an array
+  of composites renders each element as its `(...)` text (was leaking Rust's
+  `{:?}` debug form). Measured on the psycopg composite gauge: **25→45 of 79
+  passing.** What REMAINS (each a separable follow-on; the composite oid is
+  dropped by pgwire's `Type::from_oid` before `parse_sql`, so all the param-side
+  items need the raw Parse oid plumbed through):
+  - **Composite BINARY wire format** — psycopg's binary composite dumper/loader
+    (`fmt_in`/`fmt_out = BINARY`). The largest chunk, ~19 gauge tests. We always
+    send composites as TEXT (loads survive because pgwire honours the per-column
+    format); the binary DUMP (decode) and binary LOAD (encode) are unimplemented.
+  - **Composite param typed with its oid** (`row(...)::t = %s` with a
+    registered-dumper obj, no explicit cast) — decode a param whose declared oid
+    is a composite oid into a record; surfaces as `comparing document with string
+    using =`.
+  - **`pg_typeof($1)` / field access `($1).bar` of a composite param** — needs
+    the composite oid → name at Describe (else `IndeterminateDatatype: could not
+    determine data type of parameter $N`) plus composite field access (tracked in
+    the record-functions item below).
+  - **Array of composites as a typed value** — the array element TEXT is correct,
+    but the result column reports a generic array, so the per-element composite
+    loader does not fire (`test_load_composite` array half).
+  - **Nested / recursive composite load** (`testcomp2` with a composite field)
+    and a **range-typed composite field**.
+  NOTE the schema-qualified TypeInfo tests additionally need in-transaction DDL
+  visibility (separate backlog item above).
 
 - **Rust PG server: record FUNCTIONS and field access are deferred (2026-09-07).**
   `ROW(...)` / `(a, b, ...)` construction, the `::text` render, and the
