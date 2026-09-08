@@ -1998,6 +1998,7 @@ jobs:
           tests/test_rust_todate_parse_failure.py
           tests/test_rust_explain_parsed_query.py
           tests/test_rust_hint_error_message.py
+          tests/test_rust_decimal_extremes.py
           -o addopts= -p no:cacheprovider -q
 
       - name: Rust-server concurrency invariants (#451 stress suite)

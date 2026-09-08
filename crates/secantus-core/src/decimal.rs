@@ -621,10 +621,125 @@ pub fn from_bson_accumulator(b: &Bson) -> Option<Dec> {
 /// Back to BSON. `None` when the value falls outside what decimal128 can hold
 /// (extreme exponents) — the caller defers rather than inventing a result.
 pub fn to_bson(d: &Dec) -> Option<Bson> {
-    to_string(d)
+    to_string(&clamp(d))
         .parse::<bson::Decimal128>()
         .ok()
         .map(Bson::Decimal128)
+}
+
+/// `|a|` against `|b|`, exactly and at any width.
+///
+/// Neither operand is rounded, so this separates values that a 34-digit
+/// subtraction would collapse -- which is what the `f64` normal-range boundary
+/// needs. `None` when either side is NaN.
+pub fn cmp_abs(a: &Dec, b: &Dec) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let rank = |d: &Dec| match d {
+        Dec::Nan => 2,
+        Dec::Inf(_) => 1,
+        Dec::Fin { .. } => 0,
+    };
+    if rank(a) == 2 || rank(b) == 2 {
+        return None;
+    }
+    match rank(a).cmp(&rank(b)) {
+        Ordering::Equal => {}
+        other => return Some(other),
+    }
+    let (
+        Dec::Fin {
+            coeff: ca, exp: ea, ..
+        },
+        Dec::Fin {
+            coeff: cb, exp: eb, ..
+        },
+    ) = (a, b)
+    else {
+        return Some(Ordering::Equal); // both infinite
+    };
+    let (ma, mb) = (strip_leading(ca), strip_leading(cb));
+    let (za, zb) = (ma.iter().all(|d| *d == 0), mb.iter().all(|d| *d == 0));
+    if za || zb {
+        return Some(match (za, zb) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Less,
+            _ => Ordering::Greater,
+        });
+    }
+    // Compare the exponent of the LEADING digit first; only equal magnitudes
+    // need the digits aligned.
+    let (adj_a, adj_b) = (ea + ma.len() as i32 - 1, eb + mb.len() as i32 - 1);
+    match adj_a.cmp(&adj_b) {
+        Ordering::Equal => {}
+        other => return Some(other),
+    }
+    let width = ma.len().max(mb.len());
+    let pad = |m: &[u8]| {
+        let mut v = m.to_vec();
+        v.resize(width, 0);
+        v
+    };
+    Some(cmp_mag(&pad(ma), &pad(mb)))
+}
+
+/// decimal128's smallest exponent -- the quantum of a subnormal.
+const MIN_EXP: i32 = -6176;
+/// decimal128's largest exponent, for a single-digit coefficient.
+const MAX_EXP: i32 = 6111;
+/// The exponent of the LEADING digit above which the value overflows.
+const MAX_ADJUSTED: i32 = 6144;
+
+/// A `Dec` brought inside decimal128's exponent range.
+///
+/// The arbitrary-precision `Dec` can hold values the format cannot, and
+/// `bson::Decimal128`'s parser REFUSES those rather than clamping -- so
+/// `$radiansToDegrees(Decimal128("1E-6176"))`, whose exact product is
+/// `5.729577951308232087679815481410517E-6175`, came back as `None` and the
+/// Rust server answered a `BadValue` where mongod answers `5.7E-6175`. The two
+/// rules are the format's own:
+///
+/// - past the top, the result is `+-Infinity` (mongod: `1E+6144` radians in
+///   degrees is `Infinity`);
+/// - past the bottom, the coefficient is ROUNDED to the minimum quantum, which
+///   is where subnormals come from -- `5.7E-6175` keeps two digits of the 34,
+///   and a value small enough rounds all the way to `0E-6176`.
+///
+/// Measured against 8.2.11, 2026-09-07.
+fn clamp(d: &Dec) -> Dec {
+    let Dec::Fin { sign, coeff, exp } = d else {
+        return d.clone();
+    };
+    let mag = strip_leading(coeff);
+    if mag.iter().all(|x| *x == 0) {
+        // A zero carries no digits to trade, so only its quantum is clamped.
+        return Dec::Fin {
+            sign: *sign,
+            coeff: vec![0],
+            exp: (*exp).clamp(MIN_EXP, MAX_EXP),
+        };
+    }
+    if *exp + mag.len() as i32 - 1 > MAX_ADJUSTED {
+        return Dec::Inf(*sign);
+    }
+    if *exp > MAX_EXP {
+        // Room to spare below: shift digits out of the exponent into the
+        // coefficient. The overflow test above bounds the result at 34 digits.
+        let mut c = mag.to_vec();
+        c.extend(std::iter::repeat_n(0u8, (*exp - MAX_EXP) as usize));
+        return Dec::Fin {
+            sign: *sign,
+            coeff: c,
+            exp: MAX_EXP,
+        };
+    }
+    if *exp < MIN_EXP {
+        return round_to_exp(d, MIN_EXP, RoundMode::HalfEven).unwrap_or(Dec::Fin {
+            sign: *sign,
+            coeff: vec![0],
+            exp: MIN_EXP,
+        });
+    }
+    d.clone()
 }
 
 /// The integer part of a finite decimal, truncated TOWARD ZERO, when it fits in
@@ -834,5 +949,262 @@ mod tests {
         assert!(add(&tiny, &d("9.949442263900951E+25")).is_some());
         // Both ends of decimal128's exponent range at once.
         assert!(add(&d("1E+6111"), &d("1E-6176")).is_some());
+    }
+}
+
+// --- square root ---------------------------------------------------------
+
+/// `floor(sqrt(n))` and its remainder, both exact, by the digit-by-digit
+/// ("long division") square-root algorithm.
+///
+/// At each step the next root digit `d` is the largest with
+/// `(20*root + d) * d <= remainder`, which needs only comparison, subtraction
+/// and multiplication by a single digit -- so it works directly on the
+/// most-significant-first digit vectors this module uses, with no big-integer
+/// division. `n` is padded to an even length so it can be consumed in pairs.
+fn isqrt_mag(n: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut digits = Vec::with_capacity(n.len() + 1);
+    if n.len() % 2 == 1 {
+        digits.push(0);
+    }
+    digits.extend_from_slice(n);
+
+    let mut root: Vec<u8> = Vec::with_capacity(digits.len() / 2);
+    let mut rem: Vec<u8> = Vec::new();
+    for pair in digits.chunks(2) {
+        // rem = rem * 100 + pair
+        rem.push(pair[0]);
+        rem.push(pair[1]);
+        let r = strip_leading(&rem).to_vec();
+        rem = r;
+
+        // twenty_root = root * 20
+        let twenty_root = mul_mag(&root, &[2, 0]);
+        let mut best = 0u8;
+        let mut best_prod: Vec<u8> = vec![0];
+        for d in 1..=9u8 {
+            let cand = add_mag(&twenty_root, &[d]);
+            let prod = mul_mag(&cand, &[d]);
+            if cmp_mag(&prod, &rem) == std::cmp::Ordering::Greater {
+                break;
+            }
+            best = d;
+            best_prod = prod;
+        }
+        rem = strip_leading(&sub_mag(&rem, &best_prod)).to_vec();
+        root.push(best);
+    }
+    (strip_leading(&root).to_vec(), strip_leading(&rem).to_vec())
+}
+
+/// The decimal square root, correctly rounded to 34 significant digits.
+///
+/// `None` for a NEGATIVE operand (including `-Infinity`), which mongod rejects
+/// with `28714 $sqrt's argument must be greater than or equal to 0` -- the
+/// caller raises it, so this stays free of error text.
+///
+/// Two rules, both measured against mongod 8.2.11 (2026-09-08):
+///
+/// * **Correct rounding.** IEEE 754 requires it for square root (unlike the
+///   transcendentals, where mongod's own answer is 1-2 ULP off the true value --
+///   see `tools/probes/decimal_transcendental_rule.py`). The digit-by-digit
+///   root is EXACT, so a single guard digit plus the "is the remainder zero"
+///   sticky bit decides the rounding with no error analysis.
+/// * **The IDEAL EXPONENT.** `$sqrt` is not always 34 digits: an exact result is
+///   expressed at exponent `floor(e/2)`, which is why `sqrt(4)` is `2`,
+///   `sqrt(0.25)` is `0.5`, `sqrt(100)` is `10` and `sqrt(0.00)` is `0.0` rather
+///   than any of them padded out. An inexact result keeps the full 34.
+pub fn sqrt(a: &Dec) -> Option<Dec> {
+    match a {
+        Dec::Nan => Some(Dec::Nan),
+        Dec::Inf(1) => Some(Dec::Inf(1)),
+        Dec::Inf(_) => None, // -Infinity is out of domain
+        Dec::Fin { sign, coeff, exp } => {
+            let mag = strip_leading(coeff);
+            let is_zero = mag.iter().all(|d| *d == 0);
+            if *sign < 0 && !is_zero {
+                return None;
+            }
+            let ideal = exp.div_euclid(2);
+            if is_zero {
+                // sqrt(±0) is ±0 at the ideal exponent, sign preserved.
+                return Some(Dec::Fin {
+                    sign: *sign,
+                    coeff: vec![0],
+                    exp: ideal,
+                });
+            }
+
+            // Scale so the exact integer root lands on 35 digits: one guard
+            // digit past decimal128's 34. `n = coeff * 10^k` must have 69 or 70
+            // digits, and `e - k` must be EVEN so the result exponent
+            // `f = (e - k) / 2` is an integer -- both `k` candidates are
+            // available, so parity is always satisfiable.
+            let nc = mag.len();
+            let mut k = 69usize.saturating_sub(nc);
+            if (exp - k as i32) % 2 != 0 {
+                k += 1;
+            }
+            let mut n = mag.to_vec();
+            n.extend(std::iter::repeat_n(0u8, k));
+            let f = (exp - k as i32) / 2;
+
+            let (root, rem) = isqrt_mag(&n);
+            // "Exact" means representable: the integer root is exact AND the
+            // guard digits about to be dropped are zeros. The root is 35 digits
+            // by construction, so a 35-significant-digit root is inexact for
+            // decimal128 even when the remainder is zero.
+            let exact = (rem.is_empty() || rem.iter().all(|d| *d == 0))
+                && root[MAX_DIGITS.min(root.len())..].iter().all(|d| *d == 0);
+
+            // Round the 35-digit root to 34: the dropped digit is the guard and
+            // a non-zero remainder is the sticky bit, so a tie only stays a tie
+            // when the root is exact.
+            let (coeff, exp2) = if root.len() > MAX_DIGITS {
+                let keep = MAX_DIGITS;
+                let dropped = root.len() - keep;
+                let mut kept = root[..keep].to_vec();
+                let guard = root[keep];
+                let rem_nonzero = !(rem.is_empty() || rem.iter().all(|d| *d == 0));
+                let sticky = root[keep + 1..].iter().any(|d| *d != 0) || rem_nonzero;
+                let last_odd = kept.last().is_some_and(|d| d % 2 == 1);
+                let mut bump = dropped as i32;
+                if guard > 5 || (guard == 5 && (sticky || last_odd)) {
+                    kept = add_mag(&kept, &[1]);
+                    if kept.len() > keep {
+                        kept.truncate(keep);
+                        bump += 1;
+                    }
+                }
+                (kept, f + bump)
+            } else {
+                (root.clone(), f)
+            };
+
+            // An EXACT result is expressed at the ideal exponent: strip trailing
+            // zeros up to it, and pad back down to it when there is room.
+            let (coeff, exp2) = if exact {
+                let mut c = coeff;
+                let mut e = exp2;
+                while e < ideal && c.len() > 1 && *c.last().unwrap() == 0 {
+                    c.pop();
+                    e += 1;
+                }
+                while e > ideal && c.len() < MAX_DIGITS {
+                    c.push(0);
+                    e -= 1;
+                }
+                (c, e)
+            } else {
+                (coeff, exp2)
+            };
+
+            Some(Dec::Fin {
+                sign: 1,
+                coeff: strip_leading(&coeff).to_vec(),
+                exp: exp2,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod sqrt_tests {
+    use super::{parse, sqrt, to_string};
+
+    /// Every expectation is mongod 8.2.11's own answer, measured 2026-09-08.
+    /// The exact cases pin the IDEAL-EXPONENT rule -- `sqrt(4)` is `2`, not
+    /// `2.000...` -- which is the half a naive 34-digit implementation gets
+    /// wrong.
+    #[test]
+    fn matches_mongod() {
+        let cases = [
+            ("0", "0"),
+            ("0.00", "0.0"),
+            ("1", "1"),
+            ("4", "2"),
+            ("100", "10"),
+            ("0.25", "0.5"),
+            ("1E+10", "1E+5"),
+            ("1E-10", "0.00001"),
+            ("1E-6176", "1E-3088"),
+            ("2", "1.414213562373095048801688724209698"),
+            ("2.5", "1.581138830084189665999446772216359"),
+            ("0.5", "0.7071067811865475244008443621048490"),
+            ("1.25", "1.118033988749894848204586834365638"),
+            ("3", "1.732050807568877293527446341505872"),
+            ("7.125", "2.669269563007827802702880991398928"),
+            ("0.001", "0.03162277660168379331998893544432719"),
+            ("1E+6111", "3.162277660168379331998893544432719E+3055"),
+            (
+                "9.999999999999999999999999999999999E+6144",
+                "3.162277660168379331998893544432718E+3072",
+            ),
+        ];
+        for (input, want) in cases {
+            let got = sqrt(&parse(input).unwrap()).unwrap();
+            assert_eq!(to_string(&got), want, "sqrt({input})");
+        }
+    }
+
+    /// A negative operand is out of domain; the caller turns `None` into
+    /// mongod's 28714. `-0` is NOT negative here -- mongod answers `-0`.
+    #[test]
+    fn negative_is_out_of_domain() {
+        assert!(sqrt(&parse("-1").unwrap()).is_none());
+        assert!(sqrt(&parse("-2.5").unwrap()).is_none());
+        assert!(sqrt(&parse("-Infinity").unwrap()).is_none());
+        assert_eq!(to_string(&sqrt(&parse("-0").unwrap()).unwrap()), "-0");
+    }
+
+    #[test]
+    fn nan_and_infinity_pass_through() {
+        assert_eq!(to_string(&sqrt(&parse("NaN").unwrap()).unwrap()), "NaN");
+        assert_eq!(
+            to_string(&sqrt(&parse("Infinity").unwrap()).unwrap()),
+            "Infinity"
+        );
+    }
+
+    /// Squaring the result must reproduce the input whenever the root is exact.
+    #[test]
+    fn exact_roots_round_trip() {
+        for n in ["1", "4", "9", "16", "100", "0.25", "0.0001", "625"] {
+            let r = sqrt(&parse(n).unwrap()).unwrap();
+            let sq = super::mul(&r, &r).unwrap();
+            let (a, b) = (
+                to_string(&sq).parse::<f64>().unwrap(),
+                n.parse::<f64>().unwrap(),
+            );
+            assert!((a - b).abs() < 1e-12, "sqrt({n})^2 = {a}, want {b}");
+        }
+    }
+}
+
+/// `x` rounded to an INTEGER quantum, or `None` when the integral value needs
+/// more than decimal128's 34 digits.
+///
+/// This is the decimal spec's `quantize`, and the `None` is its Invalid
+/// Operation: `$floor` / `$ceil` of `Decimal128("1E+34")` is `NaN` on mongod,
+/// not the value. `$trunc` / `$round` deliberately do NOT share it -- they
+/// answer `1.000000000000000000000000000000000E+34` for the same input
+/// (measured 8.2.11, 2026-09-07), so the rule belongs here and not in
+/// `round_to_exp`.
+pub fn quantize_integral(d: &Dec, mode: RoundMode) -> Option<Dec> {
+    let Dec::Fin { coeff, exp, .. } = d else {
+        return Some(d.clone());
+    };
+    // `adjusted` is the exponent of the leading digit, so `>= MAX_DIGITS` means
+    // the value alone already needs 35 or more integer digits.
+    let mag = strip_leading(coeff);
+    if !mag.iter().all(|x| *x == 0) && *exp + mag.len() as i32 > MAX_DIGITS as i32 {
+        return None;
+    }
+    let r = round_to_exp(d, 0, mode)?;
+    // Rounding AWAY can carry into a 35th digit -- `$ceil` of
+    // `9999999999999999999999999999999999.5` -- which overflows the same way.
+    match &r {
+        Dec::Fin { coeff, exp, .. } if *exp > 0 && !coeff.iter().all(|x| *x == 0) => None,
+        _ => Some(r),
     }
 }
