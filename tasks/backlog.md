@@ -6655,7 +6655,7 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   **any regex**, `$all`, structural/compound equality (array/doc operands),
   bool-as-int comparison, exotic BSON types. Parity pinned by
   `tests/test_rust_query_parity.py` (curated + 6000-case fuzz).
-- [ ] **OPEN — Widen the Rust query matcher (Rust server)** — the matcher backs the
+- [x] **RESOLVED (2026-09-08): Widen the Rust query matcher (Rust server)** — the matcher backs the
   Rust server directly; there is no Python fallback in that path, so an unported
   construct surfaces as `BadValue`. **Done:** `$all` (element equality via
   `expressions::py_eq`, **regex elements via `op_regex`**, and — fixed 2026-07-17
@@ -6691,12 +6691,13 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   `query::compare_values` compares JS code / symbol / with-scope code as text and
   no-matches DBPointer / undefined itself (the 2026-07-13 cross-type range slice),
   so a top-level exotic scalar under a range op resolves on the Rust server without
-  a Python round-trip. **Still deferred where faithful:** an exotic-text value
-  *under a collation* (ICU folding), a **DBPointer nested inside an array/document**
-  being range-compared (`order::bson_lt` → `None`, Python's type-*name* tiebreak),
-  and a **Decimal128-valued `$mod` field on the Rust server** (`int(Decimal)` is
-  exact to 34 digits, which an `f64` truncation can't reproduce — the standing
-  Decimal128 precision-parity deferral; the Python engine handles it).
+  a Python round-trip. **The three "still deferred where faithful" residuals were RE-MEASURED on
+  2026-09-08 and all THREE match mongod 8.2.11 now** — an exotic-text value under
+  a collation, an exotic type range-compared inside an array, and a
+  Decimal128-valued `$mod` field on the Rust server: 0 divergences of 6 shapes.
+  The collated case is covered by the collation work in #1373; the other two were
+  already handled and the entry had simply gone stale. Do not re-derive the
+  deferral from this text — re-measure.
   **`$size` argument validation fixed** (2026-07-17, same R8 triage): a
   negative `$size` now errors (was a silent no-match), a bool is rejected (was
   accepted as 1), and an integer-valued float `2.0` is accepted as `2` (was
@@ -6717,8 +6718,27 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   and every error condition (so the exact `UpdateError`/`PathError` is raised by
   Python). Parity pinned by `tests/test_rust_update_parity.py` (curated +
   6000-case fuzz).
-- [ ] **Widen the Rust update operators (Rust server)** — remaining defers where
-  faithful. **`$inc`/`$mul` non-number operand fixed** (2026-07-18, found by the
+- [x] **RESOLVED (2026-09-08): Widen the Rust update operators (Rust server).**
+  The "standing update error-code gap" this entry recorded is closed: the update
+  error surface measures **0 divergences of 13 shapes** against mongod 8.2.11.
+
+  Two things were wrong, both measured rather than reasoned:
+  - **`$inc` / `$mul` with a non-numeric OPERAND carried a wrapper mongod does
+    not send.** mongod has two shapes for the same code 14 and wraps only one: a
+    bad *operand* is readable from the update spec alone and comes back BARE,
+    while a bad stored *field* is document-dependent and is wrapped
+    `Plan executor error during update :: caused by ::`. `arith_type_error` now
+    returns `(message, exec)` and the storage layer threads it, instead of
+    hard-coding `exec: true`.
+  - **`$position` / `$slice` / `$bit` with a bool argument answered the generic
+    refusal.** The guards existed and the code (2) was right; they just
+    deferred. Note `$position` and `$slice` are worded DIFFERENTLY by mongod
+    ("not of type:" vs "but was given type:"), so each is measured, not shared.
+
+  Pinned by `tests/test_rust_update_error_surface.py`. Historical detail of the
+  earlier closures follows.
+
+  Remaining defers where faithful. **`$inc`/`$mul` non-number operand fixed** (2026-07-18, found by the
   R8 update-op triage): both servers wrongly COMPUTED with a bool operand
   (`5 + True = 6`, `5 * False = 0` — the recurring `bool`-is-`int` root cause)
   and Python raw-raised `ValueError`/`TypeError` on a string/null operand.

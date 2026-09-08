@@ -1994,6 +1994,7 @@ jobs:
           tests/test_rust_collation_order.py
           tests/test_rust_required_expression_args.py
           tests/test_rust_pipeline_error_fidelity.py
+          tests/test_rust_update_error_surface.py
           tests/test_rust_explain_parsed_query.py
           tests/test_rust_hint_error_message.py
           -o addopts= -p no:cacheprovider -q

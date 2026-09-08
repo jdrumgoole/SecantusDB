@@ -469,9 +469,17 @@ fn push_apply(arr: &mut Vec<Bson>, value: &Bson) -> R<()> {
         None => arr.extend(each.iter().cloned()),
         Some(p) => {
             // A bool $position is a parse error in mongod (code 2), not index 1
-            // — `as_int_like` would coerce it, so guard first.
+            // -- `as_int_like` would coerce it, so guard first. mongod's own
+            // text, measured 8.2.11 (2026-09-08); this used to DEFER, which on
+            // this server is the generic "does not support" refusal.
             if matches!(p, Bson::Boolean(_)) {
-                return Err(Fallback::Defer);
+                return Err(Fallback::mongo(
+                    2,
+                    format!(
+                        "The value for $position must be an integer value, not of type: {}",
+                        crate::query::bson_type_name(p)
+                    ),
+                ));
             }
             let n = as_int_like(p).ok_or(Fallback::Defer)?;
             let idx = if n >= 0 {
@@ -490,8 +498,17 @@ fn push_apply(arr: &mut Vec<Bson>, value: &Bson) -> R<()> {
     }
     if let Some(s) = m.get("$slice") {
         // A bool $slice is a parse error in mongod (code 2), not "keep 1".
+        // mongod words this DIFFERENTLY from `$position` above -- "but was given
+        // type:" rather than "not of type:" -- which is why both are measured
+        // rather than shared (8.2.11, 2026-09-08).
         if matches!(s, Bson::Boolean(_)) {
-            return Err(Fallback::Defer);
+            return Err(Fallback::mongo(
+                2,
+                format!(
+                    "The value for $slice must be an integer value but was given type: {}",
+                    crate::query::bson_type_name(s)
+                ),
+            ));
         }
         let n = as_int_like(s).ok_or(Fallback::Defer)?;
         if n == 0 {
@@ -845,7 +862,20 @@ fn apply_op(
                     let mask = match mask_b {
                         Bson::Int32(n) => *n as i64,
                         Bson::Int64(n) => *n,
-                        _ => return Err(Fallback::Defer), // non-integer mask -> Python raises
+                        // mongod names the type in quotes and echoes the whole
+                        // `{op: value}` pair; its unbalanced brace is its own.
+                        // Measured 8.2.11 (2026-09-08) -- this deferred before.
+                        _ => {
+                            return Err(Fallback::mongo(
+                                2,
+                                format!(
+                                    "The $bit modifier field must be an Integer(32/64 bit); \
+                                     a '{}' is not supported here: {{{op_s}: {}}}",
+                                    crate::query::bson_type_name(mask_b),
+                                    crate::query::bson_value_repr(mask_b)
+                                ),
+                            ));
+                        }
                     };
                     parsed.push((op_s, mask));
                 }
@@ -1445,7 +1475,15 @@ pub fn path_conflict_error(update: &Document) -> Option<String> {
 /// * non-numeric operand — `Cannot increment with non-numeric argument: {n: "x"}`
 /// * non-numeric field   — `Cannot apply $inc to a value of non-numeric type.
 ///   {_id: 1} has the field 'n' of non-numeric type string`
-pub fn arith_type_error(doc: &Document, update: &Document) -> Option<String> {
+///
+/// Returns `(message, exec)`. `exec` distinguishes mongod's two wrappers, and
+/// the distinction is measured (8.2.11, 2026-09-08): a bad OPERAND is readable
+/// from the update spec alone and is reported BARE, while a bad stored FIELD is
+/// discoverable only against a document and is wrapped
+/// `Plan executor error during <command> :: caused by ::`. Both were being
+/// reported as execution-time, so the operand form carried a wrapper mongod
+/// does not send.
+pub fn arith_type_error(doc: &Document, update: &Document) -> Option<(String, bool)> {
     for (op, payload) in update.iter() {
         let verb = match op.as_str() {
             "$inc" => "increment",
@@ -1459,9 +1497,12 @@ pub fn arith_type_error(doc: &Document, update: &Document) -> Option<String> {
             // mongod validates the whole update before touching a document, so
             // the operand check fires first and wins over the field check.
             if !is_arith_numeric(operand) {
-                return Some(format!(
-                    "Cannot {verb} with non-numeric argument: {{{path}: {}}}",
-                    render_scalar(operand)
+                return Some((
+                    format!(
+                        "Cannot {verb} with non-numeric argument: {{{path}: {}}}",
+                        render_scalar(operand)
+                    ),
+                    false, // readable from the spec -> mongod sends it bare
                 ));
             }
             // Positional / arrayFilter paths expand per document; leave those to
@@ -1474,11 +1515,14 @@ pub fn arith_type_error(doc: &Document, update: &Document) -> Option<String> {
             if let Some(current) = get_path(doc, path) {
                 if !is_arith_numeric(current) {
                     let leaf = path.rsplit('.').next().unwrap_or(path);
-                    return Some(format!(
-                        "Cannot apply {op} to a value of non-numeric type. \
-                         {} has the field '{leaf}' of non-numeric type {}",
-                        render_doc_id(doc),
-                        query::bson_type_name(current)
+                    return Some((
+                        format!(
+                            "Cannot apply {op} to a value of non-numeric type. \
+                             {} has the field '{leaf}' of non-numeric type {}",
+                            render_doc_id(doc),
+                            query::bson_type_name(current)
+                        ),
+                        true, // depends on the stored document -> wrapped
                     ));
                 }
             }
@@ -2125,42 +2169,68 @@ mod tests {
 
     // --- arith_type_error: messages verbatim from a mongod 6.0.16 probe ---
 
+    /// A bad stored FIELD is document-dependent, so `exec` is true and mongod
+    /// wraps it `Plan executor error during update :: caused by ::`.
     #[test]
     fn arith_type_error_names_a_non_numeric_field() {
         let doc = doc! {"_id": 1, "n": "x"};
         assert_eq!(
             super::arith_type_error(&doc, &doc! {"$inc": {"n": 1}}).unwrap(),
-            "Cannot apply $inc to a value of non-numeric type. \
-             {_id: 1} has the field 'n' of non-numeric type string"
+            (
+                "Cannot apply $inc to a value of non-numeric type. \
+                 {_id: 1} has the field 'n' of non-numeric type string"
+                    .to_string(),
+                true
+            )
         );
         assert_eq!(
             super::arith_type_error(&doc! {"_id": 1, "n": Bson::Null}, &doc! {"$inc": {"n": 1}})
                 .unwrap(),
-            "Cannot apply $inc to a value of non-numeric type. \
-             {_id: 1} has the field 'n' of non-numeric type null"
+            (
+                "Cannot apply $inc to a value of non-numeric type. \
+                 {_id: 1} has the field 'n' of non-numeric type null"
+                    .to_string(),
+                true
+            )
         );
         assert_eq!(
             super::arith_type_error(&doc, &doc! {"$mul": {"n": 2}}).unwrap(),
-            "Cannot apply $mul to a value of non-numeric type. \
-             {_id: 1} has the field 'n' of non-numeric type string"
+            (
+                "Cannot apply $mul to a value of non-numeric type. \
+                 {_id: 1} has the field 'n' of non-numeric type string"
+                    .to_string(),
+                true
+            )
         );
     }
 
+    /// A bad OPERAND is readable from the update spec alone, so `exec` is false
+    /// and mongod sends the message BARE. Measured 8.2.11 (2026-09-08); both
+    /// shapes used to be reported as execution-time.
     #[test]
     fn arith_type_error_names_a_non_numeric_operand() {
         let doc = doc! {"_id": 1, "n": 1};
         assert_eq!(
             super::arith_type_error(&doc, &doc! {"$inc": {"n": "x"}}).unwrap(),
-            "Cannot increment with non-numeric argument: {n: \"x\"}"
+            (
+                "Cannot increment with non-numeric argument: {n: \"x\"}".to_string(),
+                false
+            )
         );
         // Bool is not numeric for mongod even though it coerces elsewhere.
         assert_eq!(
             super::arith_type_error(&doc, &doc! {"$inc": {"n": true}}).unwrap(),
-            "Cannot increment with non-numeric argument: {n: true}"
+            (
+                "Cannot increment with non-numeric argument: {n: true}".to_string(),
+                false
+            )
         );
         assert_eq!(
             super::arith_type_error(&doc, &doc! {"$mul": {"n": "x"}}).unwrap(),
-            "Cannot multiply with non-numeric argument: {n: \"x\"}"
+            (
+                "Cannot multiply with non-numeric argument: {n: \"x\"}".to_string(),
+                false
+            )
         );
     }
 
@@ -2188,14 +2258,16 @@ mod tests {
         // The braces hold the doc's `_id`, not the incremented field — the bug
         // that made our message unlike any real server's.
         let oid: bson::oid::ObjectId = "60a0b0c0d0e0f00102030405".parse().unwrap();
-        let msg = super::arith_type_error(&doc! {"_id": oid, "n": "x"}, &doc! {"$inc": {"n": 1}})
-            .unwrap();
+        let (msg, exec) =
+            super::arith_type_error(&doc! {"_id": oid, "n": "x"}, &doc! {"$inc": {"n": 1}})
+                .unwrap();
         assert!(
             msg.contains("{_id: ObjectId('60a0b0c0d0e0f00102030405')}"),
             "got: {msg}"
         );
+        assert!(exec, "a stored-field mismatch is document-dependent");
         // Dotted path reports the leaf field name.
-        let msg = super::arith_type_error(
+        let (msg, _) = super::arith_type_error(
             &doc! {"_id": 1, "a": {"b": "x"}},
             &doc! {"$inc": {"a.b": 1}},
         )
